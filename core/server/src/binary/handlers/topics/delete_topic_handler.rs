@@ -43,7 +43,7 @@ impl ServerCommandHandler for DeleteTopic {
         self,
         sender: &mut SenderKind,
         _length: u32,
-        session: &Rc<Session>,
+        session: &Session,
         shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
         // TODO: There is a correctness bug,

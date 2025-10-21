@@ -42,7 +42,7 @@ impl ServerCommandHandler for DeleteConsumerGroup {
         self,
         sender: &mut SenderKind,
         _length: u32,
-        session: &Rc<Session>,
+        session: &Session,
         shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
@@ -68,7 +68,7 @@ impl ServerCommandHandler for DeleteConsumerGroup {
         // Get members from the deleted consumer group and make them leave
         let slab = cg.members().inner().shared_get();
         for (_, member) in slab.iter() {
-            if let Err(err) = shard.client_manager.borrow_mut().leave_consumer_group(
+            if let Err(err) = shard.client_manager.leave_consumer_group(
                 member.client_id,
                 stream_id_usize,
                 topic_id_usize,

@@ -36,13 +36,12 @@ impl ServerCommandHandler for Ping {
         self,
         sender: &mut SenderKind,
         _length: u32,
-        session: &Rc<Session>,
+        session: &Session,
         shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
-        if let Some(client) = shard
+        if let Some(mut client) = shard
             .client_manager
-            .borrow_mut()
             .try_get_client_mut(session.client_id)
         {
             let now = IggyTimestamp::now();

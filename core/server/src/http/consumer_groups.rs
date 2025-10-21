@@ -261,7 +261,6 @@ async fn delete_consumer_group(
                 .shard
                 .shard()
                 .client_manager
-                .borrow_mut()
                 .leave_consumer_group(member.client_id, stream_id_usize, topic_id_usize, cg_id)
             {
                 tracing::warn!(

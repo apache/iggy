@@ -219,7 +219,6 @@ impl IggyShard {
 
         // Clean up consumer groups from ClientManager for this topic
         self.client_manager
-            .borrow_mut()
             .delete_consumer_groups_for_topic(numeric_stream_id, topic_id_numeric);
 
         // Remove all partition entries from shards_table for this topic

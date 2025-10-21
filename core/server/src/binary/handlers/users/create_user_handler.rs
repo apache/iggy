@@ -48,7 +48,7 @@ impl ServerCommandHandler for CreateUser {
         self,
         sender: &mut SenderKind,
         _length: u32,
-        session: &Rc<Session>,
+        session: &Session,
         shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
         shard_debug!(shard.id, "session: {session}, command: {self}");

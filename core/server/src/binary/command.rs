@@ -132,7 +132,7 @@ pub trait ServerCommandHandler {
         self,
         sender: &mut SenderKind,
         length: u32,
-        session: &Rc<Session>,
+        session: &Session,
         shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError>;
 }

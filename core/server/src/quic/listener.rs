@@ -21,7 +21,6 @@ use crate::binary::sender::SenderKind;
 use crate::server_error::ConnectionError;
 use crate::shard::IggyShard;
 use crate::shard::task_registry::ShutdownToken;
-use crate::shard::transmission::event::ShardEvent;
 use crate::streaming::session::Session;
 use crate::{shard_debug, shard_info};
 use anyhow::anyhow;
@@ -95,7 +94,7 @@ async fn handle_connection(
 ) -> Result<(), ConnectionError> {
     let address = connection.remote_address();
     info!("Client has connected: {address}");
-    let session = shard.add_client(&address, TransportProtocol::Quic);
+    let session = Rc::new(shard.add_client(&address, TransportProtocol::Quic));
 
     let client_id = session.client_id;
     shard_debug!(
@@ -106,19 +105,10 @@ async fn handle_connection(
         address
     );
 
-    // Add session to active sessions and broadcast to all shards
-    shard.add_active_session(session.clone());
-    let event = ShardEvent::NewSession {
-        address,
-        transport: TransportProtocol::Quic,
-    };
-
-    // TODO(hubcio): unused?
-    let _responses = shard.broadcast_event_to_all_shards(event).await;
-
     let conn_stop_receiver = shard.task_registry.add_connection(client_id);
 
     loop {
+        let shard = shard.clone();
         futures::select! {
             // Check for shutdown signal
             _ = conn_stop_receiver.recv().fuse() => {
@@ -126,14 +116,14 @@ async fn handle_connection(
                 break;
             }
             // Accept new connection
-            stream_result = accept_stream(&connection, &shard, client_id).fuse() => {
+            stream_result = accept_stream(&connection, shard.clone(), client_id).fuse() => {
                 match stream_result? {
                     Some(stream) => {
                         let shard_clone = shard.clone();
-                        let session_clone = session.clone();
+                        let session_rc = session.clone();
 
                         shard.task_registry.spawn_connection(async move {
-                            if let Err(err) = handle_stream(stream, shard_clone, session_clone).await {
+                            if let Err(err) = handle_stream(stream, shard_clone, &session_rc).await {
                                 error!("Error when handling QUIC stream: {:?}", err)
                             }
                         });
@@ -144,6 +134,7 @@ async fn handle_connection(
         }
     }
 
+    shard.delete_client(client_id);
     shard.task_registry.remove_connection(&client_id);
     info!("QUIC connection {} closed", client_id);
     Ok(())
@@ -153,18 +144,16 @@ type BiStream = (SendStream, RecvStream);
 
 async fn accept_stream(
     connection: &Connection,
-    shard: &Rc<IggyShard>,
-    client_id: u32,
+    _shard: Rc<IggyShard>,
+    _client_id: u32,
 ) -> Result<Option<BiStream>, ConnectionError> {
     match connection.accept_bi().await {
         Err(compio_quic::ConnectionError::ApplicationClosed { .. }) => {
             info!("Connection closed");
-            shard.delete_client(client_id);
             Ok(None)
         }
         Err(error) => {
             error!("Error when handling QUIC stream: {:?}", error);
-            shard.delete_client(client_id);
             Err(error.into())
         }
         Ok(stream) => Ok(Some(stream)),
@@ -174,7 +163,7 @@ async fn accept_stream(
 async fn handle_stream(
     stream: BiStream,
     shard: Rc<IggyShard>,
-    session: Rc<Session>,
+    session: &Session,
 ) -> anyhow::Result<()> {
     let (send_stream, mut recv_stream) = stream;
 

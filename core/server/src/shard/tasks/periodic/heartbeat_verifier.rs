@@ -49,10 +49,7 @@ async fn verify_heartbeats(shard: Rc<IggyShard>) -> Result<(), IggyError> {
     let interval = IggyDuration::from(period);
     let max_interval = IggyDuration::from((MAX_THRESHOLD * interval.as_micros() as f64) as u64);
 
-    let clients = {
-        let client_manager = shard.client_manager.borrow();
-        client_manager.get_clients()
-    };
+    let clients = shard.client_manager.get_clients();
 
     let now = IggyTimestamp::now();
     let heartbeat_to = IggyTimestamp::from(now.as_micros() - max_interval.as_micros());

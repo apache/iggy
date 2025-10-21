@@ -121,9 +121,7 @@ pub struct IggyShard {
 
     pub(crate) encryptor: Option<EncryptorKind>,
     pub(crate) config: ServerConfig,
-    //TODO: This could be shared.
-    pub(crate) client_manager: RefCell<ClientManager>,
-    pub(crate) active_sessions: RefCell<Vec<Rc<Session>>>,
+    pub(crate) client_manager: ClientManager,
     pub(crate) permissioner: RefCell<Permissioner>,
     pub(crate) users: Users,
     pub(crate) metrics: Metrics,
@@ -635,20 +633,6 @@ impl IggyShard {
 
     pub(crate) async fn handle_event(&self, event: ShardEvent) -> Result<(), IggyError> {
         match event {
-            ShardEvent::LoginUser {
-                client_id,
-                username,
-                password,
-            } => self.login_user_event(client_id, &username, &password),
-            ShardEvent::LoginWithPersonalAccessToken { client_id, token } => {
-                self.login_user_pat_event(&token, client_id)?;
-                Ok(())
-            }
-            ShardEvent::NewSession { address, transport } => {
-                let session = self.add_client(&address, transport);
-                self.add_active_session(session);
-                Ok(())
-            }
             ShardEvent::DeletedPartitions2 {
                 stream_id,
                 topic_id,
@@ -696,12 +680,6 @@ impl IggyShard {
             }
             ShardEvent::DeletedUser { user_id } => {
                 self.delete_user_bypass_auth(&user_id)?;
-                Ok(())
-            }
-            ShardEvent::LogoutUser { client_id } => {
-                let sessions = self.active_sessions.borrow();
-                let session = sessions.iter().find(|s| s.client_id == client_id).unwrap();
-                self.logout_user(session)?;
                 Ok(())
             }
             ShardEvent::ChangedPassword {
@@ -777,11 +755,6 @@ impl IggyShard {
                 let stream = self.delete_stream2_bypass_auth(&stream_id);
                 assert_eq!(stream.id(), id);
 
-                // Clean up consumer groups from ClientManager for this stream
-                self.client_manager
-                    .borrow_mut()
-                    .delete_consumer_groups_for_stream(id);
-
                 Ok(())
             }
             ShardEvent::CreatedTopic2 { stream_id, topic } => {
@@ -806,16 +779,6 @@ impl IggyShard {
             } => {
                 let topic = self.delete_topic_bypass_auth2(&stream_id, &topic_id);
                 assert_eq!(topic.id(), id);
-
-                // Clean up consumer groups from ClientManager for this topic using helper functions
-                let stream_id_usize = self.streams2.with_stream_by_id(
-                    &stream_id,
-                    crate::streaming::streams::helpers::get_stream_id(),
-                );
-                self.client_manager
-                    .borrow_mut()
-                    .delete_consumer_groups_for_topic(stream_id_usize, id);
-
                 Ok(())
             }
             ShardEvent::UpdatedTopic2 {
@@ -857,97 +820,6 @@ impl IggyShard {
                 let cg = self.delete_consumer_group_bypass_auth2(&stream_id, &topic_id, &group_id);
                 assert_eq!(cg.id(), id);
 
-                // Remove all consumer group members from ClientManager using helper functions
-                let stream_id_usize = self.streams2.with_stream_by_id(
-                    &stream_id,
-                    crate::streaming::streams::helpers::get_stream_id(),
-                );
-                let topic_id_usize = self.streams2.with_topic_by_id(
-                    &stream_id,
-                    &topic_id,
-                    crate::streaming::topics::helpers::get_topic_id(),
-                );
-
-                // Get members from the deleted consumer group and make them leave
-                let slab = cg.members().inner().shared_get();
-                for (_, member) in slab.iter() {
-                    if let Err(err) = self.client_manager.borrow_mut().leave_consumer_group(
-                        member.client_id,
-                        stream_id_usize,
-                        topic_id_usize,
-                        id,
-                    ) {
-                        tracing::warn!(
-                            "Shard {} (error: {err}) - failed to make client leave consumer group for client ID: {}, group ID: {}",
-                            self.id,
-                            member.client_id,
-                            id
-                        );
-                    }
-                }
-
-                Ok(())
-            }
-            ShardEvent::JoinedConsumerGroup {
-                client_id,
-                stream_id,
-                topic_id,
-                group_id,
-            } => {
-                // Convert Identifiers to usizes for ClientManager using helper functions
-                let stream_id_usize = self.streams2.with_stream_by_id(
-                    &stream_id,
-                    crate::streaming::streams::helpers::get_stream_id(),
-                );
-                let topic_id_usize = self.streams2.with_topic_by_id(
-                    &stream_id,
-                    &topic_id,
-                    crate::streaming::topics::helpers::get_topic_id(),
-                );
-                let group_id_usize = self.streams2.with_consumer_group_by_id(
-                    &stream_id,
-                    &topic_id,
-                    &group_id,
-                    crate::streaming::topics::helpers::get_consumer_group_id(),
-                );
-
-                self.client_manager.borrow_mut().join_consumer_group(
-                    client_id,
-                    stream_id_usize,
-                    topic_id_usize,
-                    group_id_usize,
-                )?;
-                Ok(())
-            }
-            ShardEvent::LeftConsumerGroup {
-                client_id,
-                stream_id,
-                topic_id,
-                group_id,
-            } => {
-                // Convert Identifiers to usizes for ClientManager using helper functions
-                let stream_id_usize = self.streams2.with_stream_by_id(
-                    &stream_id,
-                    crate::streaming::streams::helpers::get_stream_id(),
-                );
-                let topic_id_usize = self.streams2.with_topic_by_id(
-                    &stream_id,
-                    &topic_id,
-                    crate::streaming::topics::helpers::get_topic_id(),
-                );
-                let group_id_usize = self.streams2.with_consumer_group_by_id(
-                    &stream_id,
-                    &topic_id,
-                    &group_id,
-                    crate::streaming::topics::helpers::get_consumer_group_id(),
-                );
-
-                self.client_manager.borrow_mut().leave_consumer_group(
-                    client_id,
-                    stream_id_usize,
-                    topic_id_usize,
-                    group_id_usize,
-                )?;
                 Ok(())
             }
             ShardEvent::DeletedSegments {
@@ -973,11 +845,6 @@ impl IggyShard {
             } => {
                 self.flush_unsaved_buffer_base(&stream_id, &topic_id, partition_id, fsync)
                     .await?;
-                Ok(())
-            }
-            ShardEvent::ClientDisconnected { client_id, user_id } => {
-                self.delete_client(client_id);
-                self.remove_active_session(user_id);
                 Ok(())
             }
         }
@@ -1094,10 +961,6 @@ impl IggyShard {
         }
     }
 
-    pub fn add_active_session(&self, session: Rc<Session>) {
-        self.active_sessions.borrow_mut().push(session);
-    }
-
     fn find_shard(&self, namespace: &IggyNamespace) -> Option<&Shard> {
         self.shards_table.get(namespace).map(|shard_info| {
             self.shards
@@ -1155,20 +1018,6 @@ impl IggyShard {
     ) {
         for (ns, shard_info) in records {
             self.shards_table.insert(ns, shard_info);
-        }
-    }
-
-    pub fn remove_active_session(&self, user_id: u32) {
-        let mut active_sessions = self.active_sessions.borrow_mut();
-        let pos = active_sessions
-            .iter()
-            .position(|s| s.get_user_id() == user_id);
-        if let Some(pos) = pos {
-            active_sessions.remove(pos);
-        } else {
-            error!(
-                "{COMPONENT} - failed to remove active session for user ID: {user_id}, session not found."
-            );
         }
     }
 

@@ -145,16 +145,8 @@ async fn accept_loop(
                         let transport = TransportProtocol::Tcp;
                         let session = shard_clone.add_client(&address, transport);
                         shard_info!(shard.id, "Added {} client with session: {} for IP address: {}", transport, session, address);
-                        //TODO: Those can be shared with other shards.
-                        shard_clone.add_active_session(session.clone());
-                        // Broadcast session to all shards.
-                        let event = ShardEvent::NewSession { address, transport };
-                        if let Err(err) = shard_clone.broadcast_event_to_all_shards(event).await {
-                            shard_error!(shard.id, "Failed to broadcast NewSession: {:?}", err);
-                        }
 
                         let client_id = session.client_id;
-                        let user_id = session.get_user_id();
                         shard_info!(shard.id, "Created new session: {}", session);
                         let mut sender = SenderKind::get_tcp_sender(stream);
 
@@ -165,14 +157,10 @@ async fn accept_loop(
                         let registry_clone = registry.clone();
                         registry.spawn_connection(async move {
                             if let Err(error) = handle_connection(&session, &mut sender, &shard_for_conn, conn_stop_receiver).await {
-                                shard_for_conn.delete_client(session.client_id);
                                 handle_error(error);
                             }
                             registry_clone.remove_connection(&client_id);
-                            let event = ShardEvent::ClientDisconnected { client_id, user_id };
-                            if let Err(err) = shard_for_conn.broadcast_event_to_all_shards(event).await {
-                                shard_error!(shard_for_conn.id, "Failed to broadcast ClientDisconnected: {:?}", err);
-                            }
+                            shard_for_conn.delete_client(session.client_id);
 
                             if let Err(error) = sender.shutdown().await {
                                 shard_error!(shard.id, "Failed to shutdown TCP stream for client: {}, address: {}. {}", client_id, address, error);

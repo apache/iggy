@@ -186,7 +186,7 @@ impl IggyShard {
         self.permissioner
             .borrow_mut()
             .delete_permissions_for_user(user_u32_id);
-        self.client_manager.borrow_mut()
+        self.client_manager
             .delete_clients_for_user(user_u32_id)
             .with_error_context(|error| {
                 format!(
@@ -373,21 +373,6 @@ impl IggyShard {
         })?
     }
 
-    pub fn login_user_event(
-        &self,
-        client_id: u32,
-        username: &str,
-        password: &str,
-    ) -> Result<(), IggyError> {
-        let active_sessions = self.active_sessions.borrow();
-        let session = active_sessions
-            .iter()
-            .find(|s| s.client_id == client_id)
-            .unwrap_or_else(|| panic!("At this point session for {}, should exist.", client_id));
-        self.login_user_with_credentials(username, Some(password), Some(session))?;
-        Ok(())
-    }
-
     pub fn login_user(
         &self,
         username: &str,
@@ -441,8 +426,7 @@ impl IggyShard {
         }
 
         session.set_user_id(user.id);
-        let mut client_manager = self.client_manager.borrow_mut();
-        client_manager
+        self.client_manager
             .set_user_id(session.client_id, user.id)
             .with_error_context(|error| {
                 format!(
@@ -462,8 +446,7 @@ impl IggyShard {
 
     fn logout_user_base(&self, client_id: u32) -> Result<(), IggyError> {
         if client_id > 0 {
-            let mut client_manager = self.client_manager.borrow_mut();
-            client_manager.clear_user_id(client_id)?;
+            self.client_manager.clear_user_id(client_id)?;
         }
         Ok(())
     }

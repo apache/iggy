@@ -33,7 +33,7 @@ use tracing::{debug, error, info};
 const INITIAL_BYTES_LENGTH: usize = 4;
 
 pub(crate) async fn handle_connection(
-    session: &Rc<Session>,
+    session: &Session,
     sender: &mut SenderKind,
     shard: &Rc<IggyShard>,
     stop_receiver: Receiver<()>,

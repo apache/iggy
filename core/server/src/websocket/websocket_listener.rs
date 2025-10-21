@@ -120,13 +120,6 @@ async fn accept_loop(
 
                                     let session = shard_clone.add_client(&remote_addr, TransportProtocol::WebSocket);
                                     let client_id = session.client_id;
-                                    shard_clone.add_active_session(session.clone());
-
-                                    let event = ShardEvent::NewSession {
-                                        address: remote_addr,
-                                        transport: TransportProtocol::WebSocket,
-                                    };
-                                    let _ = shard_clone.broadcast_event_to_all_shards(event).await;
 
                                     let sender = WebSocketSender::new(websocket);
                                     let mut sender_kind = SenderKind::get_websocket_sender(sender);
@@ -135,6 +128,7 @@ async fn accept_loop(
                                     if let Err(error) = handle_connection(&session, &mut sender_kind, &shard_clone, client_stop_receiver).await {
                                         handle_error(error);
                                     }
+                                    shard_clone.delete_client(session.client_id);
                                     registry_clone.remove_connection(&client_id);
 
                                     match sender_kind.shutdown().await {

@@ -97,14 +97,6 @@ pub enum ShardEvent {
     DeletedUser {
         user_id: Identifier,
     },
-    LoginUser {
-        client_id: u32,
-        username: String,
-        password: String,
-    },
-    LogoutUser {
-        client_id: u32,
-    },
     UpdatedUser {
         user_id: Identifier,
         username: Option<String>,
@@ -122,35 +114,11 @@ pub enum ShardEvent {
         user_id: u32,
         name: String,
     },
-    LoginWithPersonalAccessToken {
-        client_id: u32,
-        token: String,
-    },
     DeletedSegments {
         stream_id: Identifier,
         topic_id: Identifier,
         partition_id: usize,
         segments_count: u32,
-    },
-    NewSession {
-        address: SocketAddr,
-        transport: TransportProtocol,
-    },
-    ClientDisconnected {
-        client_id: u32,
-        user_id: u32,
-    },
-    JoinedConsumerGroup {
-        client_id: u32,
-        stream_id: Identifier,
-        topic_id: Identifier,
-        group_id: Identifier,
-    },
-    LeftConsumerGroup {
-        client_id: u32,
-        stream_id: Identifier,
-        topic_id: Identifier,
-        group_id: Identifier,
     },
     AddressBound {
         protocol: TransportProtocol,

@@ -21,7 +21,6 @@ use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
 use crate::binary::{handlers::users::COMPONENT, sender::SenderKind};
 use crate::shard::IggyShard;
-use crate::shard::transmission::event::ShardEvent;
 use crate::streaming::session::Session;
 use crate::{shard_info, shard_warn};
 use anyhow::Result;
@@ -41,7 +40,7 @@ impl ServerCommandHandler for LoginUser {
         self,
         sender: &mut SenderKind,
         _length: u32,
-        session: &Rc<Session>,
+        session: &Session,
         shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
         if shard.is_shutting_down() {
@@ -68,13 +67,6 @@ impl ServerCommandHandler for LoginUser {
             username,
             user.id
         );
-        let event = ShardEvent::LoginUser {
-            client_id: session.client_id,
-            username,
-            password,
-        };
-        // Broadcast the event to all shards.
-        shard.broadcast_event_to_all_shards(event).await?;
 
         let identity_info = mapper::map_identity_info(user.id);
         sender.send_ok_response(&identity_info).await?;

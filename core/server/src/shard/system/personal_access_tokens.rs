@@ -165,16 +165,6 @@ impl IggyShard {
         Ok(())
     }
 
-    pub fn login_user_pat_event(&self, token: &str, client_id: u32) -> Result<(), IggyError> {
-        let active_sessions = self.active_sessions.borrow();
-        let session = active_sessions
-            .iter()
-            .find(|s| s.client_id == client_id)
-            .unwrap_or_else(|| panic!("At this point session for {}, should exist.", client_id));
-        self.login_with_personal_access_token(token, Some(session))?;
-        Ok(())
-    }
-
     pub fn login_with_personal_access_token(
         &self,
         token: &str,

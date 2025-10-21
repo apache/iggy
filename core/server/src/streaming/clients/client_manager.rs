@@ -17,24 +17,40 @@
  */
 
 use crate::streaming::session::Session;
-use crate::streaming::utils::hash;
-use ahash::AHashMap;
+use crate::streaming::utils::{hash, ptr::EternalPtr};
+use dashmap::DashMap;
 use iggy_common::IggyError;
 use iggy_common::IggyTimestamp;
 use iggy_common::TransportProtocol;
 use iggy_common::UserId;
 use std::net::SocketAddr;
-use std::rc::Rc;
 
-#[derive(Debug, Default)]
 pub struct ClientManager {
-    clients: AHashMap<u32, Client>,
+    clients: EternalPtr<DashMap<u32, Client>>,
+}
+
+impl Clone for ClientManager {
+    fn clone(&self) -> Self {
+        Self {
+            clients: self.clients.clone(),
+        }
+    }
+}
+
+impl Default for ClientManager {
+    fn default() -> Self {
+        let clients = Box::new(DashMap::new());
+        let clients = Box::leak(clients);
+        Self {
+            clients: clients.into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct Client {
     pub user_id: Option<u32>,
-    pub session: Rc<Session>,
+    pub session: Session,
     pub transport: TransportProtocol,
     pub consumer_groups: Vec<ConsumerGroup>,
     pub last_heartbeat: IggyTimestamp,
@@ -48,13 +64,9 @@ pub struct ConsumerGroup {
 }
 
 impl ClientManager {
-    pub fn add_client(
-        &mut self,
-        address: &SocketAddr,
-        transport: TransportProtocol,
-    ) -> Rc<Session> {
+    pub fn add_client(&self, address: &SocketAddr, transport: TransportProtocol) -> Session {
         let client_id = hash::calculate_32(address.to_string().as_bytes());
-        let session = Rc::new(Session::from_client_id(client_id, *address));
+        let session = Session::from_client_id(client_id, *address);
         let client = Client {
             user_id: None,
             session: session.clone(),
@@ -66,68 +78,62 @@ impl ClientManager {
         session
     }
 
-    pub fn set_user_id(&mut self, client_id: u32, user_id: UserId) -> Result<(), IggyError> {
-        let client = self.clients.get_mut(&client_id);
-        if client.is_none() {
-            return Err(IggyError::ClientNotFound(client_id));
-        }
-
-        let client = client.unwrap();
-        client.user_id = Some(user_id);
+    pub fn set_user_id(&self, client_id: u32, user_id: UserId) -> Result<(), IggyError> {
+        self.clients.get_mut(&client_id)
+            .ok_or(IggyError::ClientNotFound(client_id))?
+            .user_id = Some(user_id);
         Ok(())
     }
 
-    pub fn clear_user_id(&mut self, client_id: u32) -> Result<(), IggyError> {
-        let client = self.clients.get_mut(&client_id);
-        if client.is_none() {
-            return Err(IggyError::ClientNotFound(client_id));
-        }
-
-        let client = client.unwrap();
-        client.user_id = None;
+    pub fn clear_user_id(&self, client_id: u32) -> Result<(), IggyError> {
+        self.clients.get_mut(&client_id)
+            .ok_or(IggyError::ClientNotFound(client_id))?
+            .user_id = None;
         Ok(())
     }
 
     pub fn try_get_client(&self, client_id: u32) -> Option<Client> {
-        self.clients.get(&client_id).cloned()
+        self.clients.get(&client_id).map(|c| c.clone())
     }
 
-    pub fn try_get_client_mut(&mut self, client_id: u32) -> Option<&mut Client> {
+    pub fn try_get_client_mut(&'_ self, client_id: u32) -> Option<dashmap::mapref::one::RefMut<'_, u32, Client>> {
         self.clients.get_mut(&client_id)
     }
 
     pub fn get_clients(&self) -> Vec<Client> {
-        self.clients.values().cloned().collect()
+        self.clients.iter().map(|entry| entry.value().clone()).collect()
     }
 
-    pub fn delete_clients_for_user(&mut self, user_id: UserId) -> Result<(), IggyError> {
-        let mut clients_to_remove = Vec::new();
-        for client in self.clients.values() {
-            if let Some(client_user_id) = client.user_id
-                && client_user_id == user_id
-            {
-                clients_to_remove.push(client.session.client_id);
-            }
-        }
+    pub fn delete_clients_for_user(&self, user_id: UserId) -> Result<(), IggyError> {
+        let clients_to_remove: Vec<u32> = self.clients
+            .iter()
+            .filter(|entry| entry.value().user_id == Some(user_id))
+            .map(|entry| *entry.key())
+            .collect();
 
         for client_id in clients_to_remove {
             self.clients.remove(&client_id);
         }
-
         Ok(())
     }
 
-    pub fn delete_client(&mut self, client_id: u32) -> Option<Client> {
-        if let Some(client) = self.clients.remove(&client_id) {
-            client.session.clear_user_id();
-            Some(client)
-        } else {
-            None
-        }
+    pub fn delete_client(&self, client_id: u32) -> Option<Client> {
+        self.clients.remove(&client_id).map(|(_, client)| client)
+    }
+
+    pub fn get_client_count(&self) -> usize {
+        self.clients.len()
+    }
+
+    pub fn heartbeat(&mut self, client_id: u32) -> Result<(), IggyError> {
+        let mut client = self.clients.get_mut(&client_id)
+            .ok_or(IggyError::ClientNotFound(client_id))?;
+        client.last_heartbeat = IggyTimestamp::now();
+        Ok(())
     }
 
     pub fn join_consumer_group(
-        &mut self,
+        &self,
         client_id: u32,
         stream_id: usize,
         topic_id: usize,
@@ -136,12 +142,10 @@ impl ClientManager {
         let stream_id = stream_id as u32;
         let topic_id = topic_id as u32;
         let group_id = group_id as u32;
-        let client = self.clients.get_mut(&client_id);
-        if client.is_none() {
-            return Err(IggyError::ClientNotFound(client_id));
-        }
+        
+        let mut client = self.clients.get_mut(&client_id)
+            .ok_or(IggyError::ClientNotFound(client_id))?;
 
-        let client = client.unwrap();
         if client.consumer_groups.iter().any(|consumer_group| {
             consumer_group.group_id == group_id
                 && consumer_group.topic_id == topic_id
@@ -159,7 +163,7 @@ impl ClientManager {
     }
 
     pub fn leave_consumer_group(
-        &mut self,
+        &self,
         client_id: u32,
         stream_id: usize,
         topic_id: usize,
@@ -168,28 +172,26 @@ impl ClientManager {
         let stream_id = stream_id as u32;
         let topic_id = topic_id as u32;
         let consumer_group_id = consumer_group_id as u32;
-        let client = self.clients.get_mut(&client_id);
-        if client.is_none() {
-            return Err(IggyError::ClientNotFound(client_id));
-        }
-        let client = client.unwrap();
-        for (index, consumer_group) in client.consumer_groups.iter().enumerate() {
-            if consumer_group.stream_id == stream_id
+        
+        let mut client = self.clients.get_mut(&client_id)
+            .ok_or(IggyError::ClientNotFound(client_id))?;
+        
+        if let Some(index) = client.consumer_groups.iter().position(|consumer_group| {
+            consumer_group.stream_id == stream_id
                 && consumer_group.topic_id == topic_id
                 && consumer_group.group_id == consumer_group_id
-            {
-                client.consumer_groups.remove(index);
-                return Ok(());
-            }
+        }) {
+            client.consumer_groups.remove(index);
         }
         Ok(())
     }
 
-    pub fn delete_consumer_group(&mut self, stream_id: usize, topic_id: usize, group_id: usize) {
+    pub fn delete_consumer_group(&self, stream_id: usize, topic_id: usize, group_id: usize) {
         let stream_id = stream_id as u32;
         let topic_id = topic_id as u32;
         let group_id = group_id as u32;
-        for client in self.clients.values_mut() {
+        
+        for mut client in self.clients.iter_mut() {
             client.consumer_groups.retain(|consumer_group| {
                 !(consumer_group.stream_id == stream_id
                     && consumer_group.topic_id == topic_id
@@ -198,47 +200,24 @@ impl ClientManager {
         }
     }
 
-    pub fn delete_consumer_groups_for_stream(&mut self, stream_id: usize) {
+    pub fn delete_consumer_groups_for_stream(&self, stream_id: usize) {
         let stream_id = stream_id as u32;
-        for client in self.clients.values_mut() {
-            let indexes_to_remove = client
-                .consumer_groups
-                .iter()
-                .enumerate()
-                .filter_map(|(index, consumer_group)| {
-                    if consumer_group.stream_id == stream_id {
-                        Some(index)
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Vec<_>>();
-            for index in indexes_to_remove {
-                client.consumer_groups.remove(index);
-            }
+        
+        for mut client in self.clients.iter_mut() {
+            client.consumer_groups.retain(|consumer_group| {
+                consumer_group.stream_id != stream_id
+            });
         }
     }
 
-    pub fn delete_consumer_groups_for_topic(&mut self, stream_id: usize, topic_id: usize) {
+    pub fn delete_consumer_groups_for_topic(&self, stream_id: usize, topic_id: usize) {
         let stream_id = stream_id as u32;
         let topic_id = topic_id as u32;
-        for client in self.clients.values_mut() {
-            let indexes_to_remove = client
-                .consumer_groups
-                .iter()
-                .enumerate()
-                .filter_map(|(index, consumer_group)| {
-                    if consumer_group.stream_id == stream_id && consumer_group.topic_id == topic_id
-                    {
-                        Some(index)
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Vec<_>>();
-            for index in indexes_to_remove {
-                client.consumer_groups.remove(index);
-            }
+        
+        for mut client in self.clients.iter_mut() {
+            client.consumer_groups.retain(|consumer_group| {
+                !(consumer_group.stream_id == stream_id && consumer_group.topic_id == topic_id)
+            });
         }
     }
 }

@@ -161,7 +161,7 @@ impl IggyShard {
         );
 
         // Clean up ClientManager state
-        self.client_manager.borrow_mut().delete_consumer_group(
+        self.client_manager.delete_consumer_group(
             stream_id_value,
             topic_id_value,
             group_id_value,
@@ -216,7 +216,7 @@ impl IggyShard {
             topics::helpers::get_consumer_group_id(),
         );
 
-        self.client_manager.borrow_mut().join_consumer_group(
+        self.client_manager.join_consumer_group(
             session.client_id,
             stream_id_value,
             topic_id_value,
@@ -276,7 +276,7 @@ impl IggyShard {
             topics::helpers::get_consumer_group_id(),
         );
 
-        self.client_manager.borrow_mut().leave_consumer_group(
+        self.client_manager.leave_consumer_group(
             session.client_id,
             stream_id_value,
             topic_id_value,
@@ -306,7 +306,7 @@ impl IggyShard {
             topics::helpers::get_consumer_group_id(),
         );
 
-        self.client_manager.borrow_mut().leave_consumer_group(
+        self.client_manager.leave_consumer_group(
             client_id,
             stream_id_value,
             topic_id_value,

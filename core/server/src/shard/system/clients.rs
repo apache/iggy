@@ -24,13 +24,11 @@ use error_set::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::{Identifier, TransportProtocol};
 use std::net::SocketAddr;
-use std::rc::Rc;
 use tracing::{error, info};
 
 impl IggyShard {
-    pub fn add_client(&self, address: &SocketAddr, transport: TransportProtocol) -> Rc<Session> {
-        let mut client_manager = self.client_manager.borrow_mut();
-        let session = client_manager.add_client(address, transport);
+    pub fn add_client(&self, address: &SocketAddr, transport: TransportProtocol) -> Session {
+        let session = self.client_manager.add_client(address, transport);
         self.metrics.increment_clients(1);
         session
     }
@@ -39,8 +37,7 @@ impl IggyShard {
         let consumer_groups: Vec<(u32, u32, u32)>;
 
         {
-            let mut client_manager = self.client_manager.borrow_mut();
-            let client = client_manager.delete_client(client_id);
+            let client = self.client_manager.delete_client(client_id);
             if client.is_none() {
                 error!("Client with ID: {client_id} was not found in the client manager.",);
                 return;
@@ -86,7 +83,7 @@ impl IggyShard {
                 )
             })?;
 
-        Ok(self.client_manager.borrow().try_get_client(client_id))
+        Ok(self.client_manager.try_get_client(client_id))
     }
 
     pub fn get_clients(&self, session: &Session) -> Result<Vec<Client>, IggyError> {
@@ -101,6 +98,6 @@ impl IggyShard {
                 )
             })?;
 
-        Ok(self.client_manager.borrow().get_clients())
+        Ok(self.client_manager.get_clients())
     }
 }

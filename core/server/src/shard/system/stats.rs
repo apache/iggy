@@ -44,7 +44,7 @@ impl IggyShard {
             let total_cpu_usage = sys.global_cpu_usage();
             let total_memory = sys.total_memory().into();
             let available_memory = sys.available_memory().into();
-            let clients_count = self.client_manager.borrow().get_clients().len() as u32;
+            let clients_count = self.client_manager.get_clients().len() as u32;
             let hostname = sysinfo::System::host_name().unwrap_or("unknown_hostname".to_string());
             let os_name = sysinfo::System::name().unwrap_or("unknown_os_name".to_string());
             let os_version =

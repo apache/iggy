@@ -1,4 +1,3 @@
-use crate::shard::transmission::event::ShardEvent;
 /* Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -40,7 +39,7 @@ impl ServerCommandHandler for LoginWithPersonalAccessToken {
         self,
         sender: &mut SenderKind,
         _length: u32,
-        session: &Rc<Session>,
+        session: &Session,
         shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
@@ -56,11 +55,6 @@ impl ServerCommandHandler for LoginWithPersonalAccessToken {
                     "{COMPONENT} (error: {error}) - failed to login with personal access token: {redacted_token}, session: {session}",
                 )
             })?;
-        let event = ShardEvent::LoginWithPersonalAccessToken {
-            token: self.token,
-            client_id: session.client_id,
-        };
-        shard.broadcast_event_to_all_shards(event).await?;
         let identity_info = mapper::map_identity_info(user.id);
         sender.send_ok_response(&identity_info).await?;
         Ok(())

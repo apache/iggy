@@ -37,7 +37,7 @@ impl ServerCommandHandler for GetMe {
         self,
         sender: &mut SenderKind,
         _length: u32,
-        session: &Rc<Session>,
+        session: &Session,
         shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
         let Some(client) = shard

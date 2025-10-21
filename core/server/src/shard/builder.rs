@@ -160,7 +160,6 @@ impl IggyShardBuilder {
             task_registry,
             permissioner: Default::default(),
             client_manager: Default::default(),
-            active_sessions: Default::default(),
         }
     }
 }
