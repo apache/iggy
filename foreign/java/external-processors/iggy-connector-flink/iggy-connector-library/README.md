@@ -65,7 +65,7 @@ cd iggy-connector-flink
 
 When Spark connector is added, common code may be extracted to a separate `iggy-connector-common` module. The current structure keeps Flink-first implementation simple while maintaining clear package boundaries for future refactoring.
 
-See [connector_library_placement_deliberation.md](../../../../../../../iggy-my-work/connector_library_placement_deliberation.md) for architectural decisions.
+See [connector_library_placement_deliberation](https://github.com/apache/iggy/discussions/2236#discussioncomment-14702253) for architectural decisions.
 
 ## License
 
