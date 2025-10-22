@@ -48,6 +48,9 @@ impl ServerCommandHandler for DeletePartitions {
         let stream_id = self.stream_id.clone();
         let topic_id = self.topic_id.clone();
 
+        // Acquire partition lock to serialize filesystem operations
+        let _partition_guard = shard.fs_locks.partition_lock.lock().await;
+
         let deleted_partition_ids = shard
             .delete_partitions2(
                 session,

@@ -27,6 +27,7 @@ pub mod transmission;
 use self::tasks::{continuous, periodic};
 use crate::{
     configs::server::ServerConfig,
+    io::fs_locks::FsLocks,
     shard::{
         namespace::{IggyFullNamespace, IggyNamespace},
         task_registry::TaskRegistry,
@@ -65,7 +66,7 @@ use transmission::connector::{Receiver, ShardConnector, StopReceiver};
 
 pub const COMPONENT: &str = "SHARD";
 pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
-pub const BROADCAST_TIMEOUT: Duration = Duration::from_secs(60);
+pub const BROADCAST_TIMEOUT: Duration = Duration::from_secs(500);
 
 pub(crate) struct Shard {
     id: u16,
@@ -119,6 +120,7 @@ pub struct IggyShard {
     pub(crate) shards_table: EternalPtr<DashMap<IggyNamespace, ShardInfo>>,
     pub(crate) state: FileState,
 
+    pub(crate) fs_locks: FsLocks,
     pub(crate) encryptor: Option<EncryptorKind>,
     pub(crate) config: ServerConfig,
     pub(crate) client_manager: ClientManager,
@@ -525,6 +527,9 @@ impl IggyShard {
                     ),
                 );
 
+                // Acquire stream lock to serialize filesystem operations
+                let _stream_guard = self.fs_locks.stream_lock.lock().await;
+
                 let stream = self.create_stream2(&session, name.clone()).await?;
                 let created_stream_id = stream.id();
 
@@ -556,6 +561,9 @@ impl IggyShard {
                         0,
                     ),
                 );
+
+                // Acquire topic lock to serialize filesystem operations
+                let _topic_guard = self.fs_locks.topic_lock.lock().await;
 
                 let topic = self
                     .create_topic2(

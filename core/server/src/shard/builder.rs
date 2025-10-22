@@ -143,6 +143,7 @@ impl IggyShardBuilder {
             shards_table,
             streams2: streams, // TODO: Fixme
             users,
+            fs_locks: Default::default(),
             encryptor,
             config,
             _version: version,

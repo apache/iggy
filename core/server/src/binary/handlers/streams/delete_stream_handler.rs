@@ -49,6 +49,9 @@ impl ServerCommandHandler for DeleteStream {
         debug!("session: {session}, command: {self}");
         let stream_id = self.stream_id.clone();
 
+        // Acquire stream lock to serialize filesystem operations
+        let _stream_guard = shard.fs_locks.stream_lock.lock().await;
+
         let stream2 = shard
             .delete_stream2(session, &self.stream_id)
             .await

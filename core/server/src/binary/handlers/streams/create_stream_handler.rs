@@ -69,6 +69,9 @@ impl ServerCommandHandler for CreateStream {
                 if let ShardMessage::Request(ShardRequest { payload, .. }) = message
                     && let ShardRequestPayload::CreateStream { name, .. } = payload
                 {
+                    // Acquire stream lock to serialize filesystem operations
+                    let _stream_guard = shard.fs_locks.stream_lock.lock().await;
+                    
                     let stream = shard.create_stream2(session, name).await?;
                     let created_stream_id = stream.id();
 

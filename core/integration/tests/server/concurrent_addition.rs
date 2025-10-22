@@ -35,6 +35,8 @@ use test_case::test_matrix;
 // - Barrier: On (synchronized), Off (unsynchronized) (2)
 // Total: 4 × 3 × 2 × 2 = 48 test cases
 
+// TODO: Websocket fails for the `cold` type, cold means that we are creating resources with the same name.
+// It fails with the error assertion, instead of `AlreadyExist`, we get generic `Error`.
 #[test_matrix(
     [tcp(), http(), quic(), websocket()],
     [user(), stream(), topic()],
@@ -49,7 +51,22 @@ async fn matrix(
     path_type: ScenarioType,
     use_barrier: bool,
 ) {
-    let mut test_server = TestServer::default();
+    // TODO: Need to do this, in order to avoid timeouts from QUIC connections during tests.
+    let mut extra_envs = std::collections::HashMap::new();
+    extra_envs.insert(
+        "IGGY_QUIC_MAX_IDLE_TIMEOUT".to_string(),
+        "500s".to_string(), 
+    );
+    extra_envs.insert(
+        "IGGY_QUIC_KEEP_ALIVE_INTERVAL".to_string(),
+        "15s".to_string(), 
+    );
+    let mut test_server = TestServer::new(
+        Some(extra_envs),
+        true,
+        None,
+        integration::test_server::IpAddrKind::V4,
+    );
     test_server.start();
 
     let client_factory: Box<dyn integration::test_server::ClientFactory> = match transport {

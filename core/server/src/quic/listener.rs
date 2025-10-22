@@ -153,7 +153,7 @@ async fn accept_stream(
             Ok(None)
         }
         Err(error) => {
-            error!("Error when handling QUIC stream: {:?}", error);
+            error!("Error when accepting QUIC connection: {:?}", error);
             Err(error.into())
         }
         Ok(stream) => Ok(Some(stream)),
