@@ -26,6 +26,9 @@ public class Envelope
     public const string OrderConfirmedType = "order_confirmed";
     public const string OrderRejectedType = "order_rejected";
 
+    public string MessageType { get; }
+    public string Payload { get; }
+
     public Envelope(string messageType, ISerializableMessage payload)
     {
         MessageType = messageType;
@@ -38,9 +41,6 @@ public class Envelope
         MessageType = messageType;
         Payload = payload;
     }
-
-    public string MessageType { get; }
-    public string Payload { get; }
 
     public string ToJson()
     {
@@ -76,11 +76,7 @@ public record OrderCreated(
     }
 }
 
-public record OrderConfirmed(
-    ulong OrderId,
-    double Price,
-    DateTimeOffset Timestamp
-) : ISerializableMessage
+public record OrderConfirmed(ulong OrderId, double Price, DateTimeOffset Timestamp) : ISerializableMessage
 {
     public string MessageType => Envelope.OrderConfirmedType;
 
@@ -95,11 +91,7 @@ public record OrderConfirmed(
     }
 }
 
-public record OrderRejected(
-    ulong OrderId,
-    DateTimeOffset Timestamp,
-    string Reason
-) : ISerializableMessage
+public record OrderRejected(ulong OrderId, DateTimeOffset Timestamp, string Reason) : ISerializableMessage
 {
     public string MessageType => Envelope.OrderRejectedType;
 

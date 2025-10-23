@@ -26,7 +26,7 @@ namespace Iggy_SDK.Examples.NewSdk.Producer;
 
 public static class Utils
 {
-    private const uint BATCHES_LIMIT = 5;
+    private const uint BatchesLimit = 5;
 
     public static async Task ProduceMessages(IggyPublisher publisher, ILogger logger)
     {
@@ -44,10 +44,10 @@ public static class Utils
 
         while (true)
         {
-            if (sentBatches == BATCHES_LIMIT)
+            if (sentBatches == BatchesLimit)
             {
                 logger.LogInformation(
-                    "Sent {SentBatches} batches of messages, exiting.",
+                    "Sent {SentBatches} batches of messages, exiting",
                     sentBatches
                 );
                 return;
@@ -74,7 +74,7 @@ public static class Utils
             await publisher.SendMessages(messages.ToArray());
 
             sentBatches++;
-            logger.LogInformation("Sent messages: {Messages}.", serializableMessages);
+            logger.LogInformation("Sent messages: {Messages}", serializableMessages);
 
             await Task.Delay(interval);
         }
