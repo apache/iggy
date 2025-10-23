@@ -25,17 +25,23 @@ use std::cell::RefCell;
 use sysinfo::{Pid, ProcessesToUpdate, System as SysinfoSystem};
 
 thread_local! {
-    static SYSINFO: RefCell<SysinfoSystem> = {
-        let mut sys = SysinfoSystem::new_all();
-        sys.refresh_all();
-        RefCell::new(sys)
-    };
+    static SYSINFO: RefCell<Option<SysinfoSystem>> = const { RefCell::new(None) };
 }
 
 impl IggyShard {
     pub async fn get_stats(&self) -> Result<Stats, IggyError> {
-        SYSINFO.with(|sysinfo| {
-            let mut sys = sysinfo.borrow_mut();
+        assert_eq!(self.id, 0, "GetStats should only be called on shard0");
+
+        SYSINFO.with(|sysinfo_cell| {
+            let mut sysinfo_opt = sysinfo_cell.borrow_mut();
+
+            if sysinfo_opt.is_none() {
+                let mut sys = SysinfoSystem::new_all();
+                sys.refresh_all();
+                *sysinfo_opt = Some(sys);
+            }
+
+            let sys = sysinfo_opt.as_mut().unwrap();
             let process_id = std::process::id();
             sys.refresh_cpu_all();
             sys.refresh_memory();
@@ -86,8 +92,6 @@ impl IggyShard {
                 stats.read_bytes = disk_usage.total_read_bytes.into();
                 stats.written_bytes = disk_usage.total_written_bytes.into();
             }
-
-            drop(sys);
 
             self.streams2.with_components(|stream_components| {
                 let (stream_roots, stream_stats) = stream_components.into_components();

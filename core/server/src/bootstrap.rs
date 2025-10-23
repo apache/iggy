@@ -234,7 +234,7 @@ pub fn create_shard_connections(
 
     // Create connectors with sequential IDs (0, 1, 2, ...) regardless of CPU core numbers
     let connectors: Vec<ShardConnector<ShardFrame>> = (0..shards_count)
-        .map(|idx| ShardConnector::new(idx as u16, shards_count))
+        .map(|idx| ShardConnector::new(idx as u16))
         .collect();
 
     let shutdown_handles = connectors

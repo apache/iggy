@@ -161,11 +161,8 @@ impl IggyShard {
         );
 
         // Clean up ClientManager state
-        self.client_manager.delete_consumer_group(
-            stream_id_value,
-            topic_id_value,
-            group_id_value,
-        );
+        self.client_manager
+            .delete_consumer_group(stream_id_value, topic_id_value, group_id_value);
 
         cg
     }

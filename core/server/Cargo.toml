@@ -112,7 +112,6 @@ serde = { workspace = true }
 serde_with = { workspace = true }
 static-toml = "1.3.0"
 slab = "0.4.10"
-sharded_queue = "2.0.1"
 strum = { workspace = true }
 sysinfo = { workspace = true }
 tempfile = { workspace = true }

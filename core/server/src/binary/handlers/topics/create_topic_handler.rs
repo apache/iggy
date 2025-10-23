@@ -87,7 +87,7 @@ impl ServerCommandHandler for CreateTopic {
                 {
                     // Acquire topic lock to serialize filesystem operations
                     let _topic_guard = shard.fs_locks.topic_lock.lock().await;
-                    
+
                     let topic = shard
                         .create_topic2(
                             session,

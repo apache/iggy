@@ -15,19 +15,14 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-use futures::{Stream, task::AtomicWaker};
-use sharded_queue::ShardedQueue;
-use std::{
-    sync::{Arc, atomic::AtomicUsize},
-    task::Poll,
-};
 
 pub type StopSender = async_channel::Sender<()>;
 pub type StopReceiver = async_channel::Receiver<()>;
 
+/// Inter-shard communication channel
 pub struct ShardConnector<T> {
     pub id: u16,
-    pub sender: Sender<T>,
+    pub sender: flume::Sender<T>,
     pub receiver: Receiver<T>,
     pub stop_receiver: StopReceiver,
     pub stop_sender: StopSender,
@@ -45,138 +40,46 @@ impl<T> Clone for ShardConnector<T> {
     }
 }
 
-// TODO(numinex) - replace async_channel with some other form of one shot async channel.
-// !!!!!IMPORTANT!!!! the one shot channel Sender/Receiver has to be Cloneable!!!!!
 impl<T> ShardConnector<T> {
-    pub fn new(id: u16, max_concurrent_thread_count: usize) -> Self {
-        let channel = Arc::new(ShardedChannel::new(max_concurrent_thread_count));
-        let (sender, receiver) = channel.unbounded();
+    /// Creates a new shard connector with unbounded capacity.
+    pub fn new(id: u16) -> Self {
+        let (sender, receiver) = flume::unbounded();
         let (stop_sender, stop_receiver) = async_channel::bounded(1);
         Self {
             id,
-            receiver,
             sender,
+            receiver: Receiver::new(receiver),
             stop_receiver,
             stop_sender,
         }
     }
 
+    /// Sends a message to this shard.
+    ///
+    /// For unbounded channels, this operation is infallible and never blocks.
     pub fn send(&self, data: T) {
-        self.sender.send(data);
+        let _ = self.sender.send(data);
     }
 }
 
+/// Wrapper around flume's Receiver that provides Clone capability.
+///
+/// This wraps the flume receiver to allow cloning while still providing
+/// access to the underlying receiver for direct use.
 pub struct Receiver<T> {
-    channel: Arc<ShardedChannel<T>>,
+    pub inner: flume::Receiver<T>,
+}
+
+impl<T> Receiver<T> {
+    fn new(receiver: flume::Receiver<T>) -> Self {
+        Self { inner: receiver }
+    }
 }
 
 impl<T> Clone for Receiver<T> {
     fn clone(&self) -> Self {
         Self {
-            channel: self.channel.clone(),
+            inner: self.inner.clone(),
         }
-    }
-}
-
-pub struct Sender<T> {
-    channel: Arc<ShardedChannel<T>>,
-}
-
-impl<T> Clone for Sender<T> {
-    fn clone(&self) -> Self {
-        Self {
-            channel: self.channel.clone(),
-        }
-    }
-}
-
-impl<T> Sender<T> {
-    pub fn send(&self, data: T) {
-        self.channel
-            .task_queue
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.channel.queue.push_back(data);
-        self.channel.waker.wake();
-    }
-}
-
-pub struct ShardedChannel<T> {
-    queue: ShardedQueue<T>,
-    task_queue: AtomicUsize,
-    waker: AtomicWaker,
-}
-
-impl<T> ShardedChannel<T> {
-    pub fn new(max_concurrent_thread_count: usize) -> Self {
-        let waker = AtomicWaker::new();
-
-        Self {
-            queue: ShardedQueue::new(max_concurrent_thread_count),
-            task_queue: AtomicUsize::new(0),
-            waker,
-        }
-    }
-}
-
-impl<T> Drop for ShardedChannel<T> {
-    fn drop(&mut self) {
-        // TODO(hubcio): Leak the waker to prevent thread affinity violations.
-        //
-        // At this point, I don't have idea how to handle this other way.
-        //
-        // The waker may contain a Waker that was registered on a different thread
-        // (a shard thread), but Drop is being called on the main thread during cleanup.
-        // We cannot safely drop the Waker on a different thread, so we must leak it.
-        // This is acceptable during shutdown as the process is terminating anyway.
-        if let Some(waker) = self.waker.take() {
-            std::mem::forget(waker);
-        }
-    }
-}
-
-pub trait ShardedChannelsSplit<T> {
-    fn unbounded(&self) -> (Sender<T>, Receiver<T>);
-
-    fn sender(&self) -> Sender<T>;
-}
-
-impl<T> ShardedChannelsSplit<T> for Arc<ShardedChannel<T>> {
-    fn unbounded(&self) -> (Sender<T>, Receiver<T>) {
-        let tx = self.sender();
-        let rx = Receiver {
-            channel: Arc::clone(self),
-        };
-
-        (tx, rx)
-    }
-
-    fn sender(&self) -> Sender<T> {
-        Sender {
-            channel: Arc::clone(self),
-        }
-    }
-}
-
-impl<T> Stream for Receiver<T> {
-    type Item = T;
-    fn poll_next(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
-        let old = self
-            .channel
-            .task_queue
-            .load(std::sync::atomic::Ordering::Relaxed);
-        if old == 0 {
-            self.channel.waker.register(cx.waker());
-            return Poll::Pending;
-        }
-
-        assert!(old > 0);
-        self.channel
-            .task_queue
-            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-        let item = self.channel.queue.pop_front_or_spin_wait_item();
-        Poll::Ready(Some(item))
     }
 }

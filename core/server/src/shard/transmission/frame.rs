@@ -16,7 +16,7 @@
  * under the License.
  */
 use async_channel::Sender;
-use iggy_common::IggyError;
+use iggy_common::{IggyError, Stats};
 
 use crate::{
     binary::handlers::messages::poll_messages_handler::IggyPollMetadata,
@@ -36,6 +36,7 @@ pub enum ShardResponse {
     CreateStreamResponse(stream2::Stream),
     CreateTopicResponse(topic2::Topic),
     CreateUserResponse(User),
+    GetStatsResponse(Stats),
     ErrorResponse(IggyError),
 }
 

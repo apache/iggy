@@ -257,12 +257,12 @@ async fn delete_consumer_group(
         // Get members from the deleted consumer group and make them leave
         let slab = consumer_group.members().inner().shared_get();
         for (_, member) in slab.iter() {
-            if let Err(err) = state
-                .shard
-                .shard()
-                .client_manager
-                .leave_consumer_group(member.client_id, stream_id_usize, topic_id_usize, cg_id)
-            {
+            if let Err(err) = state.shard.shard().client_manager.leave_consumer_group(
+                member.client_id,
+                stream_id_usize,
+                topic_id_usize,
+                cg_id,
+            ) {
                 tracing::warn!(
                     "{COMPONENT} (error: {err}) - failed to make client leave consumer group for client ID: {}, group ID: {}",
                     member.client_id,

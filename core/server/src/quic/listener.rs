@@ -190,7 +190,7 @@ async fn handle_stream(
 
     trace!("Received a QUIC command: {command}, payload size: {length}");
 
-    match command.handle(&mut sender, length, &session, &shard).await {
+    match command.handle(&mut sender, length, session, &shard).await {
         Ok(_) => {
             trace!(
                 "Command was handled successfully, session: {:?}. QUIC response was sent.",

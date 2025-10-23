@@ -59,7 +59,7 @@ pub async fn run(client: &IggyClient) {
         .send_messages(
             &Identifier::named(stream_name).unwrap(),
             &Identifier::named(topic_name).unwrap(),
-            &Partitioning::partition_id(1),
+            &Partitioning::partition_id(0),
             &mut messages,
         )
         .await

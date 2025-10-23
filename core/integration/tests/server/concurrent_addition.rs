@@ -53,13 +53,10 @@ async fn matrix(
 ) {
     // TODO: Need to do this, in order to avoid timeouts from QUIC connections during tests.
     let mut extra_envs = std::collections::HashMap::new();
-    extra_envs.insert(
-        "IGGY_QUIC_MAX_IDLE_TIMEOUT".to_string(),
-        "500s".to_string(), 
-    );
+    extra_envs.insert("IGGY_QUIC_MAX_IDLE_TIMEOUT".to_string(), "500s".to_string());
     extra_envs.insert(
         "IGGY_QUIC_KEEP_ALIVE_INTERVAL".to_string(),
-        "15s".to_string(), 
+        "15s".to_string(),
     );
     let mut test_server = TestServer::new(
         Some(extra_envs),

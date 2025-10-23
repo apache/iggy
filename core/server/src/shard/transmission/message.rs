@@ -98,6 +98,9 @@ pub enum ShardRequestPayload {
         status: UserStatus,
         permissions: Option<Permissions>,
     },
+    GetStats {
+        user_id: u32,
+    },
 }
 
 impl From<ShardRequest> for ShardMessage {

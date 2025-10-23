@@ -22,10 +22,14 @@ use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
 use crate::binary::sender::SenderKind;
 use crate::shard::IggyShard;
+use crate::shard::transmission::frame::ShardResponse;
+use crate::shard::transmission::message::{
+    ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult,
+};
 use crate::streaming::session::Session;
 use error_set::ErrContext;
-use iggy_common::IggyError;
 use iggy_common::get_stats::GetStats;
+use iggy_common::{Identifier, IggyError};
 use std::rc::Rc;
 use tracing::debug;
 
@@ -43,11 +47,41 @@ impl ServerCommandHandler for GetStats {
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
 
-        let stats = shard.get_stats().await.with_error_context(|error| {
-            format!("{COMPONENT} (error: {error}) - failed to get stats, session: {session}")
-        })?;
-        let bytes = mapper::map_stats(&stats);
-        sender.send_ok_response(&bytes).await?;
+        // Route GetStats to shard0 only
+        let request = ShardRequest {
+            stream_id: Identifier::default(),
+            topic_id: Identifier::default(),
+            partition_id: 0,
+            payload: ShardRequestPayload::GetStats {
+                user_id: session.get_user_id(),
+            },
+        };
+
+        let message = ShardMessage::Request(request);
+        match shard.send_request_to_shard_or_recoil(None, message).await? {
+            ShardSendRequestResult::Recoil(_) => {
+                let stats = shard.get_stats().await.with_error_context(|error| {
+                    format!(
+                        "{COMPONENT} (error: {error}) - failed to get stats, session: {session}"
+                    )
+                })?;
+                let bytes = mapper::map_stats(&stats);
+                sender.send_ok_response(&bytes).await?;
+            }
+            ShardSendRequestResult::Response(response) => match response {
+                ShardResponse::GetStatsResponse(stats) => {
+                    let bytes = mapper::map_stats(&stats);
+                    sender.send_ok_response(&bytes).await?;
+                }
+                ShardResponse::ErrorResponse(err) => {
+                    return Err(err);
+                }
+                _ => unreachable!(
+                    "Expected a GetStatsResponse inside of GetStats handler, impossible state"
+                ),
+            },
+        }
+
         Ok(())
     }
 }

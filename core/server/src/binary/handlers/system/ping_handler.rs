@@ -40,10 +40,7 @@ impl ServerCommandHandler for Ping {
         shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
-        if let Some(mut client) = shard
-            .client_manager
-            .try_get_client_mut(session.client_id)
-        {
+        if let Some(mut client) = shard.client_manager.try_get_client_mut(session.client_id) {
             let now = IggyTimestamp::now();
             client.last_heartbeat = now;
             debug!("Updated last heartbeat to: {now} for session: {session}");

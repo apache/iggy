@@ -18,9 +18,9 @@
 
 use crate::binary::sender::SenderKind;
 use crate::configs::websocket::WebSocketConfig;
-use crate::shard::transmission::event::ShardEvent;
 use crate::shard::IggyShard;
 use crate::shard::task_registry::ShutdownToken;
+use crate::shard::transmission::event::ShardEvent;
 use crate::websocket::connection_handler::{handle_connection, handle_error};
 use crate::{shard_debug, shard_error, shard_info, shard_warn};
 use compio::net::TcpListener;
@@ -95,7 +95,19 @@ pub async fn start(
         protocol: TransportProtocol::WebSocket,
         address: local_addr,
     };
-    shard.handle_event(event).await.ok();
+
+    if shard.id == 0 {
+        // Store bound address locally first
+        shard.websocket_bound_address.set(Some(local_addr));
+
+        if addr.port() == 0 {
+            // Broadcast to other shards for SO_REUSEPORT binding
+            shard.broadcast_event_to_all_shards(event).await?;
+        }
+    } else {
+        // Non-shard0 just handles the event locally
+        shard.handle_event(event).await.ok();
+    }
 
     // Ensure rustls crypto provider is installed
     if rustls::crypto::CryptoProvider::get_default().is_none()

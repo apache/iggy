@@ -258,7 +258,7 @@ mod tests {
             Arc::new(PersisterKind::File(FilePersister)),
             None,
         );
-        let connections = vec![ShardConnector::new(0, 1)];
+        let connections = vec![ShardConnector::new(0)];
 
         let builder = IggyShard::builder();
         let shard = builder

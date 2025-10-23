@@ -52,10 +52,10 @@ impl ServerCommandHandler for DeleteTopic {
         // we end up in a state where the topic is deleted from the disk, but during state recreation it would be recreated,
         // without it's segments.
         debug!("session: {session}, command: {self}");
-        
+
         // Acquire topic lock to serialize filesystem operations
         let _topic_guard = shard.fs_locks.topic_lock.lock().await;
-        
+
         let topic = shard
             .delete_topic2(session, &self.stream_id, &self.topic_id)
             .await?;
