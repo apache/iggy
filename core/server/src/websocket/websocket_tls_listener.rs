@@ -22,7 +22,6 @@ use crate::shard::IggyShard;
 use crate::shard::task_registry::ShutdownToken;
 use crate::shard::transmission::event::ShardEvent;
 use crate::websocket::connection_handler::{handle_connection, handle_error};
-use crate::{shard_debug, shard_error, shard_info, shard_warn};
 use compio::net::TcpListener;
 use compio_net::TcpOpts;
 use compio_tls::TlsAcceptor;
@@ -37,7 +36,7 @@ use std::io::BufReader;
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::sync::Arc;
-use tracing::{error, info, trace};
+use tracing::{debug, error, info, trace, warn};
 
 async fn create_listener(addr: SocketAddr) -> Result<TcpListener, std::io::Error> {
     // Required by the thread-per-core model...
@@ -63,18 +62,11 @@ pub async fn start(
         .map_err(|_| IggyError::InvalidConfiguration)?;
 
     if shard.id != 0 && addr.port() == 0 {
-        shard_info!(
-            shard.id,
-            "Waiting for WebSocket TLS address from shard 0..."
-        );
+        info!("Waiting for WebSocket TLS address from shard 0...");
         loop {
             if let Some(bound_addr) = shard.websocket_bound_address.get() {
                 addr = bound_addr;
-                shard_info!(
-                    shard.id,
-                    "Received WebSocket TLS address from shard 0: {}",
-                    addr
-                );
+                info!("Received WebSocket TLS address from shard 0: {}", addr);
                 break;
             }
             compio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -113,8 +105,7 @@ pub async fn start(
     if rustls::crypto::CryptoProvider::get_default().is_none()
         && let Err(e) = rustls::crypto::ring::default_provider().install_default()
     {
-        shard_warn!(
-            shard.id,
+        warn!(
             "Failed to install rustls crypto provider: {:?}. This may be normal if another thread installed it first.",
             e
         );
@@ -126,18 +117,13 @@ pub async fn start(
     let tls_config = &shard.config.tcp.tls;
     let (certs, key) =
         if tls_config.self_signed && !std::path::Path::new(&tls_config.cert_file).exists() {
-            shard_info!(
-                shard.id,
-                "Generating self-signed certificate for WebSocket TLS server"
-            );
+            info!("Generating self-signed certificate for WebSocket TLS server");
             generate_self_signed_cert()
                 .unwrap_or_else(|e| panic!("Failed to generate self-signed certificate: {e}"))
         } else {
-            shard_info!(
-                shard.id,
+            info!(
                 "Loading certificates from cert_file: {}, key_file: {}",
-                tls_config.cert_file,
-                tls_config.key_file
+                tls_config.cert_file, tls_config.key_file
             );
             load_certificates(&tls_config.cert_file, &tls_config.key_file)
                 .unwrap_or_else(|e| panic!("Failed to load certificates: {e}"))
@@ -150,25 +136,19 @@ pub async fn start(
 
     let acceptor = TlsAcceptor::from(Arc::new(server_config));
 
-    shard_info!(
-        shard.id,
+    info!(
         "{} has started on: wss://{}",
-        "WebSocket TLS Server",
-        local_addr
+        "WebSocket TLS Server", local_addr
     );
     let ws_config = config.to_tungstenite_config();
-    shard_info!(
-        shard.id,
+    info!(
         "WebSocket TLS config: max_message_size: {:?}, max_frame_size: {:?}, accept_unmasked_frames: {}",
-        config.max_message_size,
-        config.max_frame_size,
-        config.accept_unmasked_frames
+        config.max_message_size, config.max_frame_size, config.accept_unmasked_frames
     );
 
     let result = accept_loop(listener, acceptor, ws_config, shard.clone(), shutdown).await;
 
-    shard_info!(
-        shard.id,
+    info!(
         "WebSocket TLS listener task exiting with result: {:?}",
         result
     );
@@ -183,10 +163,7 @@ async fn accept_loop(
     shard: Rc<IggyShard>,
     shutdown: ShutdownToken,
 ) -> Result<(), IggyError> {
-    shard_info!(
-        shard.id,
-        "WebSocket TLS accept loop started, waiting for connections..."
-    );
+    info!("WebSocket TLS accept loop started, waiting for connections...");
 
     loop {
         let shard = shard.clone();
@@ -195,17 +172,17 @@ async fn accept_loop(
 
         futures::select! {
             _ = shutdown.wait().fuse() => {
-                shard_debug!(shard.id, "WebSocket TLS Server received shutdown signal, no longer accepting connections");
+                debug!("WebSocket TLS Server received shutdown signal, no longer accepting connections");
                 break;
             }
             result = accept_future.fuse() => {
                 match result {
                     Ok((tcp_stream, remote_addr)) => {
                         if shard.is_shutting_down() {
-                            shard_info!(shard.id, "Rejecting new WebSocket TLS connection from {} during shutdown", remote_addr);
+                            info!("Rejecting new WebSocket TLS connection from {} during shutdown", remote_addr);
                             continue;
                         }
-                        shard_info!(shard.id, "Accepted new TCP connection for WebSocket TLS handshake from: {}", remote_addr);
+                        info!("Accepted new TCP connection for WebSocket TLS handshake from: {}", remote_addr);
 
                         let shard_clone = shard.clone();
                         let  ws_config_clone = ws_config;
@@ -215,7 +192,7 @@ async fn accept_loop(
                         registry.spawn_connection(async move {
                             match acceptor.accept(tcp_stream).await {
                                 Ok(tls_stream) => {
-                                    shard_info!(shard_clone.id, "TLS handshake successful for {}, performing WebSocket upgrade...", remote_addr);
+                                    info!("TLS handshake successful for {}, performing WebSocket upgrade...", remote_addr);
 
                                     match accept_async_with_config(tls_stream, Some(ws_config_clone)).await {
                                         Ok(websocket) => {
@@ -236,12 +213,12 @@ async fn accept_loop(
 
                                             match sender_kind.shutdown().await {
                                                 Ok(_) => {
-                                                    shard_info!(shard_clone.id, "Successfully closed WebSocket TLS stream for client: {}, address: {}.", client_id, remote_addr);
+                                                    info!("Successfully closed WebSocket TLS stream for client: {}, address: {}.", client_id, remote_addr);
                                                 }
                                                 Err(_) => {
                                                     // shutdown failures during client disconnect are expected and normal
                                                     // real errors would have been caught earlier in handle_connection
-                                                    shard_debug!(shard_clone.id, "WebSocket TLS shutdown completed with error for client: {} (likely client already disconnected)", client_id);
+                                                    debug!("WebSocket TLS shutdown completed with error for client: {} (likely client already disconnected)", client_id);
                                                 }
                                             }
                                         }
@@ -257,14 +234,14 @@ async fn accept_loop(
                         });
                     }
                     Err(error) => {
-                        shard_error!(shard.id, "Failed to accept WebSocket TLS connection: {}", error);
+                        error!("Failed to accept WebSocket TLS connection: {}", error);
                     }
                 }
             }
         }
     }
 
-    shard_info!(shard.id, "WebSocket TLS Server listener has stopped");
+    info!("WebSocket TLS Server listener has stopped");
     Ok(())
 }
 

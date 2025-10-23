@@ -22,7 +22,6 @@ use crate::shard::IggyShard;
 use crate::shard::task_registry::ShutdownToken;
 use crate::shard::transmission::event::ShardEvent;
 use crate::tcp::connection_handler::{handle_connection, handle_error};
-use crate::{shard_error, shard_info, shard_warn};
 use compio::net::{TcpListener, TcpOpts};
 use compio_tls::TlsAcceptor;
 use error_set::ErrContext;
@@ -36,7 +35,7 @@ use std::net::SocketAddr;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::trace;
+use tracing::{error, info, trace, warn};
 
 pub(crate) async fn start(
     server_name: &'static str,
@@ -46,11 +45,11 @@ pub(crate) async fn start(
     shutdown: ShutdownToken,
 ) -> Result<(), IggyError> {
     if shard.id != 0 && addr.port() == 0 {
-        shard_info!(shard.id, "Waiting for TCP address from shard 0...");
+        info!("Waiting for TCP address from shard 0...");
         loop {
             if let Some(bound_addr) = shard.tcp_bound_address.get() {
                 addr = bound_addr;
-                shard_info!(shard.id, "Received TCP address: {}", addr);
+                info!("Received TCP address: {}", addr);
                 break;
             }
             compio::time::sleep(Duration::from_millis(50)).await;
@@ -65,7 +64,7 @@ pub(crate) async fn start(
         })?;
 
     let actual_addr = listener.local_addr().map_err(|_e| {
-        shard_error!(shard.id, "Failed to get local address: {_e}");
+        error!("Failed to get local address: {_e}");
         IggyError::CannotBindToSocket(addr.to_string())
     })?;
 
@@ -87,8 +86,7 @@ pub(crate) async fn start(
     if rustls::crypto::CryptoProvider::get_default().is_none()
         && let Err(e) = rustls::crypto::ring::default_provider().install_default()
     {
-        shard_warn!(
-            shard.id,
+        warn!(
             "Failed to install rustls crypto provider: {:?}. This may be normal if another thread installed it first.",
             e
         );
@@ -100,18 +98,13 @@ pub(crate) async fn start(
     let tls_config = &shard.config.tcp.tls;
     let (certs, key) =
         if tls_config.self_signed && !std::path::Path::new(&tls_config.cert_file).exists() {
-            shard_info!(
-                shard.id,
-                "Generating self-signed certificate for TCP TLS server"
-            );
+            info!("Generating self-signed certificate for TCP TLS server");
             generate_self_signed_cert()
                 .unwrap_or_else(|e| panic!("Failed to generate self-signed certificate: {e}"))
         } else {
-            shard_info!(
-                shard.id,
+            info!(
                 "Loading certificates from cert_file: {}, key_file: {}",
-                tls_config.cert_file,
-                tls_config.key_file
+                tls_config.cert_file, tls_config.key_file
             );
             load_certificates(&tls_config.cert_file, &tls_config.key_file)
                 .unwrap_or_else(|e| panic!("Failed to load certificates: {e}"))
@@ -124,12 +117,7 @@ pub(crate) async fn start(
 
     let acceptor = TlsAcceptor::from(Arc::new(server_config));
 
-    shard_info!(
-        shard.id,
-        "{} server has started on: {:?}",
-        server_name,
-        actual_addr
-    );
+    info!("{} server has started on: {:?}", server_name, actual_addr);
 
     accept_loop(server_name, listener, acceptor, shard, shutdown).await
 }
@@ -177,17 +165,17 @@ async fn accept_loop(
         let accept_future = listener.accept();
         futures::select! {
             _ = shutdown.wait().fuse() => {
-                shard_info!(shard.id, "{} received shutdown signal, no longer accepting connections", server_name);
+                info!("{} received shutdown signal, no longer accepting connections", server_name);
                 break;
             }
             result = accept_future.fuse() => {
                 match result {
                     Ok((stream, address)) => {
                         if shard.is_shutting_down() {
-                            shard_info!(shard.id, "Rejecting new TLS connection from {} during shutdown", address);
+                            info!("Rejecting new TLS connection from {} during shutdown", address);
                             continue;
                         }
-                        shard_info!(shard.id, "Accepted new TCP connection for TLS handshake: {}", address);
+                        info!("Accepted new TCP connection for TLS handshake: {}", address);
                         let shard_clone = shard.clone();
                         let acceptor = acceptor.clone();
 
@@ -198,13 +186,13 @@ async fn accept_loop(
                             match acceptor.accept(stream).await {
                                 Ok(tls_stream) => {
                                     // TLS handshake successful, now create session
-                                    shard_info!(shard_clone.id, "TLS handshake successful, adding TCP client: {}", address);
+                                    info!("TLS handshake successful, adding TCP client: {}", address);
                                     let transport = TransportProtocol::Tcp;
                                     let session = shard_clone.add_client(&address, transport);
-                                    shard_info!(shard_clone.id, "Added {} client with session: {} for IP address: {}", transport, session, address);
+                                    info!("Added {} client with session: {} for IP address: {}", transport, session, address);
 
                                     let client_id = session.client_id;
-                                    shard_info!(shard_clone.id, "Created new session: {}", session);
+                                    info!("Created new session: {}", session);
 
                                     let conn_stop_receiver = registry_clone.add_connection(client_id);
                                     let shard_for_conn = shard_clone.clone();
@@ -216,19 +204,19 @@ async fn accept_loop(
                                     registry_clone.remove_connection(&client_id);
 
                                     if let Err(error) = sender.shutdown().await {
-                                        shard_error!(shard.id, "Failed to shutdown TCP TLS stream for client: {}, address: {}. {}", client_id, address, error);
+                                        error!("Failed to shutdown TCP TLS stream for client: {}, address: {}. {}", client_id, address, error);
                                     } else {
-                                        shard_info!(shard.id, "Successfully closed TCP TLS stream for client: {}, address: {}.", client_id, address);
+                                        info!("Successfully closed TCP TLS stream for client: {}, address: {}.", client_id, address);
                                     }
                                 }
                                 Err(e) => {
-                                    shard_error!(shard_clone.id, "Failed to accept TLS connection from '{}': {}", address, e);
+                                    error!("Failed to accept TLS connection from '{}': {}", address, e);
                                     // No session was created, so no cleanup needed
                                 }
                             }
                         });
                     }
-                    Err(error) => shard_error!(shard.id, "Unable to accept TCP TLS socket. {}", error),
+                    Err(error) => error!("Unable to accept TCP TLS socket. {}", error),
                 }
             }
         }

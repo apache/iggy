@@ -24,13 +24,13 @@ use crate::binary::{handlers::users::COMPONENT, sender::SenderKind};
 
 use crate::shard::IggyShard;
 use crate::shard::transmission::event::ShardEvent;
-use crate::shard_info;
 use crate::state::command::EntryCommand;
 use crate::streaming::session::Session;
 use anyhow::Result;
 use error_set::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::update_user::UpdateUser;
+use tracing::info;
 use tracing::{debug, instrument};
 
 impl ServerCommandHandler for UpdateUser {
@@ -62,12 +62,7 @@ impl ServerCommandHandler for UpdateUser {
                     )
                 })?;
 
-        shard_info!(
-            shard.id,
-            "Updated user: {} with ID: {}.",
-            user.username,
-            user.id
-        );
+        info!("Updated user: {} with ID: {}.", user.username, user.id);
 
         let event = ShardEvent::UpdatedUser {
             user_id: self.user_id.clone(),

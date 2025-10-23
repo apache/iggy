@@ -1,4 +1,3 @@
-use crate::shard_trace;
 use crate::slab::streams::Streams;
 use crate::slab::topics;
 use crate::slab::traits_ext::{EntityMarker, InsertCell, IntoComponents, IntoComponentsById};
@@ -16,14 +15,14 @@ pub struct TopicAuxilary {
 }
 
 impl TopicAuxilary {
-    pub fn get_next_partition_id(&self, shard_id: u16, upperbound: usize) -> usize {
+    pub fn get_next_partition_id(&self, upperbound: usize) -> usize {
         let mut partition_id = self.current_partition_id.fetch_add(1, Ordering::AcqRel);
         if partition_id >= upperbound {
             partition_id = 0;
             self.current_partition_id
                 .swap(partition_id + 1, Ordering::Release);
         }
-        shard_trace!(shard_id, "Next partition ID: {}", partition_id);
+        tracing::trace!("Next partition ID: {}", partition_id);
         partition_id
     }
 }

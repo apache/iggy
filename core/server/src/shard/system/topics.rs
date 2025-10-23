@@ -18,7 +18,6 @@
 
 use super::COMPONENT;
 use crate::shard::IggyShard;
-use crate::shard_info;
 use crate::slab::traits_ext::{EntityComponentSystem, EntityMarker, InsertCell, IntoComponents};
 use crate::streaming::session::Session;
 use crate::streaming::topics::storage2::{create_topic_file_hierarchy, delete_topic_from_disk};
@@ -27,6 +26,7 @@ use crate::streaming::{partitions, streams, topics};
 use error_set::ErrContext;
 use iggy_common::{CompressionAlgorithm, Identifier, IggyError, IggyExpiry, MaxTopicSize};
 use std::str::FromStr;
+use tracing::info;
 
 impl IggyShard {
     #[allow(clippy::too_many_arguments)]
@@ -67,7 +67,7 @@ impl IggyShard {
             .streams2
             .with_stream_by_id(stream_id, |(_, stats)| stats.clone());
         let message_expiry = config.resolve_message_expiry(message_expiry);
-        shard_info!(self.id, "Topic message expiry: {}", message_expiry);
+        info!("Topic message expiry: {}", message_expiry);
         let max_topic_size = config.resolve_max_topic_size(max_topic_size)?;
         let topic = topic2::create_and_insert_topics_mem(
             &self.streams2,
@@ -82,8 +82,7 @@ impl IggyShard {
         self.metrics.increment_topics(1);
 
         // Create file hierarchy for the topic.
-        create_topic_file_hierarchy(self.id, numeric_stream_id, topic.id(), &self.config.system)
-            .await?;
+        create_topic_file_hierarchy(numeric_stream_id, topic.id(), &self.config.system).await?;
         Ok(topic)
     }
 
@@ -242,8 +241,7 @@ impl IggyShard {
         let parent = topic.stats().parent().clone();
         // We need to borrow topic as mutable, as we are extracting partitions out of it, in order to close them.
         let (messages_count, size_bytes, segments_count) =
-            delete_topic_from_disk(self.id, numeric_stream_id, &mut topic, &self.config.system)
-                .await?;
+            delete_topic_from_disk(numeric_stream_id, &mut topic, &self.config.system).await?;
         parent.decrement_messages_count(messages_count);
         parent.decrement_size_bytes(size_bytes);
         parent.decrement_segments_count(segments_count);

@@ -20,9 +20,9 @@ use crate::shard::IggyShard;
 use crate::shard::task_registry::ShutdownToken;
 use crate::websocket::websocket_listener;
 use crate::websocket::websocket_tls_listener;
-use crate::{shard_error, shard_info};
 use iggy_common::IggyError;
 use std::rc::Rc;
+use tracing::{error, info};
 
 pub async fn spawn_websocket_server(
     shard: Rc<IggyShard>,
@@ -31,7 +31,7 @@ pub async fn spawn_websocket_server(
     let config = shard.config.websocket.clone();
 
     if !config.enabled {
-        shard_info!(shard.id, "WebSocket server is disabled.");
+        info!("WebSocket server is disabled.");
         return Ok(());
     }
 
@@ -41,12 +41,9 @@ pub async fn spawn_websocket_server(
         "WebSocket"
     };
 
-    shard_info!(
-        shard.id,
+    info!(
         "Starting {} server on: {} for shard: {}...",
-        server_name,
-        config.address,
-        shard.id
+        server_name, config.address, shard.id
     );
 
     let result = match config.tls.enabled {
@@ -55,11 +52,7 @@ pub async fn spawn_websocket_server(
     };
 
     if let Err(error) = result {
-        shard_error!(
-            shard.id,
-            "{} server has failed to start, error: {error}",
-            server_name
-        );
+        error!("{} server has failed to start, error: {error}", server_name);
         return Err(error);
     }
 

@@ -23,7 +23,6 @@ use crate::shard::task_registry::ShutdownToken;
 use crate::shard::transmission::event::ShardEvent;
 use crate::websocket::connection_handler::{handle_connection, handle_error};
 use crate::websocket::websocket_sender::WebSocketSender;
-use crate::{shard_debug, shard_error, shard_info};
 use compio::net::TcpListener;
 use compio_net::TcpOpts;
 use compio_ws::accept_async_with_config;
@@ -33,7 +32,7 @@ use iggy_common::IggyError;
 use iggy_common::TransportProtocol;
 use std::net::SocketAddr;
 use std::rc::Rc;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 async fn create_listener(addr: SocketAddr) -> Result<TcpListener, std::io::Error> {
     // Required by the thread-per-core model...
@@ -59,15 +58,11 @@ pub async fn start(
         .map_err(|_| IggyError::InvalidConfiguration)?;
 
     if shard.id != 0 && addr.port() == 0 {
-        shard_info!(shard.id, "Waiting for WebSocket address from shard 0...");
+        info!("Waiting for WebSocket address from shard 0...");
         loop {
             if let Some(bound_addr) = shard.websocket_bound_address.get() {
                 addr = bound_addr;
-                shard_info!(
-                    shard.id,
-                    "Received WebSocket address from shard 0: {}",
-                    addr
-                );
+                info!("Received WebSocket address from shard 0: {}", addr);
                 break;
             }
             // Small delay to prevent busy waiting
@@ -83,12 +78,7 @@ pub async fn start(
         .map_err(|_| IggyError::CannotBindToSocket(addr.to_string()))?;
 
     let local_addr = listener.local_addr().unwrap();
-    shard_info!(
-        shard.id,
-        "{} has started on: ws://{}",
-        "WebSocket Server",
-        local_addr
-    );
+    info!("{} has started on: ws://{}", "WebSocket Server", local_addr);
 
     // Notify shard about the bound address
     let event = ShardEvent::AddressBound {
@@ -110,12 +100,9 @@ pub async fn start(
     }
 
     let ws_config = config.to_tungstenite_config();
-    shard_info!(
-        shard.id,
+    info!(
         "WebSocket config: max_message_size: {:?}, max_frame_size: {:?}, accept_unmasked_frames: {}",
-        config.max_message_size,
-        config.max_frame_size,
-        config.accept_unmasked_frames
+        config.max_message_size, config.max_frame_size, config.accept_unmasked_frames
     );
 
     accept_loop(listener, Some(ws_config), shard, shutdown).await
@@ -133,17 +120,17 @@ async fn accept_loop(
 
         futures::select! {
             _ = shutdown.wait().fuse() => {
-                shard_debug!(shard.id, "WebSocket Server received shutdown signal, no longer accepting connections");
+                debug!("WebSocket Server received shutdown signal, no longer accepting connections");
                 break;
             }
             result = accept_future.fuse() => {
                 match result {
                     Ok((tcp_stream, remote_addr)) => {
                         if shard.is_shutting_down() {
-                            shard_info!(shard.id, "Rejecting new WebSocket connection from {} during shutdown", remote_addr);
+                            info!("Rejecting new WebSocket connection from {} during shutdown", remote_addr);
                             continue;
                         }
-                        shard_info!(shard.id, "Accepted new WebSocket connection from: {}", remote_addr);
+                        info!("Accepted new WebSocket connection from: {}", remote_addr);
 
                         let shard_clone = shard.clone();
                         let ws_config_clone = ws_config;
@@ -170,12 +157,12 @@ async fn accept_loop(
 
                                     match sender_kind.shutdown().await {
                                         Ok(_) => {
-                                            shard_info!(shard_clone.id, "Successfully closed WebSocket stream for client: {}, address: {}.", client_id, remote_addr);
+                                            info!("Successfully closed WebSocket stream for client: {}, address: {}.", client_id, remote_addr);
                                         }
                                         Err(_) => {
                                             // shutdown failures during client disconnect are expected and normal
                                             // real errors would have been caught earlier in handle_connection
-                                            shard_debug!(shard_clone.id, "WebSocket shutdown completed with error for client: {} (likely client already disconnected)", client_id);
+                                            debug!("WebSocket shutdown completed with error for client: {} (likely client already disconnected)", client_id);
                                         }
                                     }
                                 }
@@ -186,13 +173,13 @@ async fn accept_loop(
                         });
                     }
                     Err(error) => {
-                        shard_error!(shard.id, "Failed to accept WebSocket connection: {}", error);
+                        error!("Failed to accept WebSocket connection: {}", error);
                     }
                 }
             }
         }
     }
 
-    shard_info!(shard.id, "WebSocket Server listener has stopped");
+    info!("WebSocket Server listener has stopped");
     Ok(())
 }
