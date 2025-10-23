@@ -28,7 +28,8 @@ use bytes::{BufMut, Bytes, BytesMut};
 use iggy_binary_protocol::{BinaryClient, BinaryTransport, PersonalAccessTokenClient, UserClient};
 use iggy_common::{
     AutoLogin, ClientState, Command, ConnectionString, Credentials, DiagnosticEvent, IggyDuration,
-    IggyError, IggyTimestamp, WebSocketClientConfig, WebSocketConnectionStringOptions,
+    IggyError, IggyErrorDiscriminants, IggyTimestamp, WebSocketClientConfig,
+    WebSocketConnectionStringOptions,
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -543,15 +544,27 @@ impl WebSocketClient {
         );
 
         if status != 0 {
-            if length > 0 {
-                let mut error_buffer = vec![0u8; length];
-                stream.read(&mut error_buffer).await?;
-                let _error_message = String::from_utf8(error_buffer).unwrap_or_default();
-                // FIXME: add error message
-                return Err(IggyError::Error);
+            // TEMP: See https://github.com/apache/iggy/pull/604 for context.
+            if status == IggyErrorDiscriminants::TopicNameAlreadyExists as u32
+                || status == IggyErrorDiscriminants::StreamNameAlreadyExists as u32
+                || status == IggyErrorDiscriminants::UserAlreadyExists as u32
+                || status == IggyErrorDiscriminants::PersonalAccessTokenAlreadyExists as u32
+                || status == IggyErrorDiscriminants::ConsumerGroupNameAlreadyExists as u32
+            {
+                debug!(
+                    "Received a server resource already exists response: {} ({})",
+                    status,
+                    IggyError::from_code_as_string(status)
+                )
+            } else {
+                error!(
+                    "Received an invalid response with status: {} ({}).",
+                    status,
+                    IggyError::from_code_as_string(status),
+                );
             }
-            // FIXME: add error message
-            return Err(IggyError::Error);
+
+            return Err(IggyError::from_code(status));
         }
 
         if length == 0 {
