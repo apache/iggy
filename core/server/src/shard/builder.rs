@@ -25,7 +25,10 @@ use crate::{
     shard::{Shard, ShardInfo, namespace::IggyNamespace},
     slab::{streams::Streams, users::Users},
     state::file::FileState,
-    streaming::{diagnostics::metrics::Metrics, utils::ptr::EternalPtr},
+    streaming::{
+        clients::client_manager::ClientManager, diagnostics::metrics::Metrics,
+        utils::ptr::EternalPtr,
+    },
     versioning::SemanticVersion,
 };
 use dashmap::DashMap;
@@ -39,6 +42,7 @@ pub struct IggyShardBuilder {
     shards_table: Option<EternalPtr<DashMap<IggyNamespace, ShardInfo>>>,
     state: Option<FileState>,
     users: Option<Users>,
+    client_manager: Option<ClientManager>,
     connections: Option<Vec<ShardConnector<ShardFrame>>>,
     config: Option<ServerConfig>,
     encryptor: Option<EncryptorKind>,
@@ -67,6 +71,11 @@ impl IggyShardBuilder {
         shards_table: EternalPtr<DashMap<IggyNamespace, ShardInfo>>,
     ) -> Self {
         self.shards_table = Some(shards_table);
+        self
+    }
+
+    pub fn clients_manager(mut self, client_manager: ClientManager) -> Self {
+        self.client_manager = Some(client_manager);
         self
     }
 
@@ -110,6 +119,7 @@ impl IggyShardBuilder {
         let config = self.config.unwrap();
         let connections = self.connections.unwrap();
         let encryptor = self.encryptor;
+        let client_manager = self.client_manager.unwrap();
         let version = self.version.unwrap();
         let (_, stop_receiver, frame_receiver) = connections
             .iter()
@@ -160,7 +170,7 @@ impl IggyShardBuilder {
             config_writer_receiver,
             task_registry,
             permissioner: Default::default(),
-            client_manager: Default::default(),
+            client_manager,
         }
     }
 }

@@ -29,20 +29,16 @@ pub struct ClientManager {
     clients: EternalPtr<DashMap<u32, Client>>,
 }
 
+impl ClientManager {
+    pub fn new(clients: EternalPtr<DashMap<u32, Client>>) -> Self {
+        Self { clients }
+    }
+}
+
 impl Clone for ClientManager {
     fn clone(&self) -> Self {
         Self {
             clients: self.clients.clone(),
-        }
-    }
-}
-
-impl Default for ClientManager {
-    fn default() -> Self {
-        let clients = Box::new(DashMap::new());
-        let clients = Box::leak(clients);
-        Self {
-            clients: clients.into(),
         }
     }
 }

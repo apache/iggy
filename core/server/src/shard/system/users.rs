@@ -424,7 +424,6 @@ impl IggyShard {
             );
             self.logout_user(session)?;
         }
-
         session.set_user_id(user.id);
         self.client_manager
             .set_user_id(session.client_id, user.id)

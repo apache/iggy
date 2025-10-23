@@ -159,9 +159,9 @@ async fn accept_loop(
                             if let Err(error) = handle_connection(&session, &mut sender, &shard_for_conn, conn_stop_receiver).await {
                                 handle_error(error);
                             }
+
                             registry_clone.remove_connection(&client_id);
                             shard_for_conn.delete_client(session.client_id);
-
                             if let Err(error) = sender.shutdown().await {
                                 shard_error!(shard.id, "Failed to shutdown TCP stream for client: {}, address: {}. {}", client_id, address, error);
                             } else {

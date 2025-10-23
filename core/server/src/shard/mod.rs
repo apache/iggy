@@ -388,6 +388,7 @@ impl IggyShard {
                             |(_, _, _, offset, .., log)| {
                                 *log = loaded_log;
                                 let current_offset = log.active_segment().end_offset;
+                                tracing::warn!("loaded current_offset: {}", current_offset);
                                 offset.store(current_offset, Ordering::Relaxed);
                             },
                         );

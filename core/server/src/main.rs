@@ -49,6 +49,7 @@ use server::slab::traits_ext::{
 };
 use server::state::file::FileState;
 use server::state::system::SystemState;
+use server::streaming::clients::client_manager::{Client, ClientManager};
 use server::streaming::diagnostics::metrics::Metrics;
 use server::streaming::storage::SystemStorage;
 use server::streaming::utils::MemoryPool;
@@ -255,6 +256,11 @@ async fn main() -> Result<(), ServerError> {
     let shards_table = Box::leak(shards_table);
     let shards_table: EternalPtr<DashMap<IggyNamespace, ShardInfo>> = shards_table.into();
 
+    let client_manager = Box::new(DashMap::new());
+    let client_manager = Box::leak(client_manager);
+    let client_manager: EternalPtr<DashMap<u32, Client>> = client_manager.into();
+    let client_manager = ClientManager::new(client_manager);
+
     streams.with_components(|components| {
         let (root, ..) = components.into_components();
         for (_, stream) in root.iter() {
@@ -297,6 +303,7 @@ async fn main() -> Result<(), ServerError> {
             state_persister,
             encryptor.clone(),
         );
+        let client_manager = client_manager.clone();
 
         // TODO: Explore decoupling the `Log` from `Partition` entity.
         // Ergh... I knew this will backfire to include `Log` as part of the `Partition` entity,
@@ -335,6 +342,7 @@ async fn main() -> Result<(), ServerError> {
                         .users(users)
                         .shards_table(shards_table)
                         .connections(connections)
+                        .clients_manager(client_manager)
                         .config(config)
                         .encryptor(encryptor)
                         .version(current_version)
