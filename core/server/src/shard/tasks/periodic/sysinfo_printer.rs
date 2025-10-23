@@ -42,6 +42,18 @@ pub fn spawn_sysinfo_printer(shard: Rc<IggyShard>) {
         .spawn();
 }
 
+fn get_open_file_descriptors() -> Option<usize> {
+    #[cfg(target_os = "linux")]
+    {
+        let pid = std::process::id();
+        let fd_path = format!("/proc/{}/fd", pid);
+        if let Ok(entries) = std::fs::read_dir(&fd_path) {
+            return Some(entries.count());
+        }
+    }
+    None
+}
+
 async fn print_sysinfo(shard: Rc<IggyShard>) -> Result<(), IggyError> {
     trace!("Printing system information...");
 
@@ -57,8 +69,14 @@ async fn print_sysinfo(shard: Rc<IggyShard>) -> Result<(), IggyError> {
         / stats.total_memory.as_bytes_u64() as f64)
         * 100f64;
 
+    let open_files_info = if let Some(open_files) = get_open_file_descriptors() {
+        format!(", OpenFDs: {}", open_files)
+    } else {
+        String::new()
+    };
+
     info!(
-        "CPU: {:.2}%/{:.2}% (IggyUsage/Total), Mem: {:.2}%/{}/{}/{} (Free/IggyUsage/TotalUsed/Total), Clients: {}, Messages: {}, Read: {}, Written: {}",
+        "CPU: {:.2}%/{:.2}% (IggyUsage/Total), Mem: {:.2}%/{}/{}/{} (Free/IggyUsage/TotalUsed/Total), Clients: {}, Messages: {}, Read: {}, Written: {}{}",
         stats.cpu_usage,
         stats.total_cpu_usage,
         free_memory_percent,
@@ -69,6 +87,7 @@ async fn print_sysinfo(shard: Rc<IggyShard>) -> Result<(), IggyError> {
         stats.messages_count.human_count_bare().to_string(),
         stats.read_bytes,
         stats.written_bytes,
+        open_files_info,
     );
 
     Ok(())

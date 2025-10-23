@@ -7,7 +7,6 @@ use std::{
 
 use crate::{
     configs::{cache_indexes::CacheIndexesConfig, system::SystemConfig},
-    shard_trace,
     slab::{
         partitions::{self, Partitions},
         traits_ext::{
@@ -166,7 +165,6 @@ pub fn delete_consumer_offset(
 }
 
 pub fn persist_consumer_offset_to_disk(
-    shard_id: u16,
     id: usize,
 ) -> impl AsyncFnOnce(ComponentsById<PartitionRef>) -> Result<(), IggyError> {
     async move |(.., offsets, _, _)| {
@@ -175,12 +173,11 @@ pub fn persist_consumer_offset_to_disk(
             .get(&id)
             .expect("persist_consumer_offset_to_disk: offset not found");
         let offset = item.offset.load(Ordering::Relaxed);
-        storage2::persist_offset(shard_id, &item.path, offset).await
+        storage2::persist_offset(&item.path, offset).await
     }
 }
 
 pub fn delete_consumer_offset_from_disk(
-    shard_id: u16,
     id: usize,
 ) -> impl AsyncFnOnce(ComponentsById<PartitionRef>) -> Result<(), IggyError> {
     async move |(.., offsets, _, _)| {
@@ -189,7 +186,7 @@ pub fn delete_consumer_offset_from_disk(
             .get(&id)
             .expect("delete_consumer_offset_from_disk: offset not found");
         let path = &item.path;
-        storage2::delete_persisted_offset(shard_id, path).await
+        storage2::delete_persisted_offset(path).await
     }
 }
 
@@ -227,7 +224,6 @@ pub fn delete_consumer_group_member_offset(
 }
 
 pub fn persist_consumer_group_member_offset_to_disk(
-    shard_id: u16,
     id: usize,
 ) -> impl AsyncFnOnce(ComponentsById<PartitionRef>) -> Result<(), IggyError> {
     async move |(.., offsets, _)| {
@@ -236,12 +232,11 @@ pub fn persist_consumer_group_member_offset_to_disk(
             .get(&id)
             .expect("persist_consumer_group_member_offset_to_disk: offset not found");
         let offset = item.offset.load(Ordering::Relaxed);
-        storage2::persist_offset(shard_id, &item.path, offset).await
+        storage2::persist_offset(&item.path, offset).await
     }
 }
 
 pub fn delete_consumer_group_member_offset_from_disk(
-    shard_id: u16,
     id: usize,
 ) -> impl AsyncFnOnce(ComponentsById<PartitionRef>) -> Result<(), IggyError> {
     async move |(.., offsets, _)| {
@@ -250,7 +245,7 @@ pub fn delete_consumer_group_member_offset_from_disk(
             .get(&id)
             .expect("delete_consumer_group_member_offset_from_disk: offset not found");
         let path = &item.path;
-        storage2::delete_persisted_offset(shard_id, path).await
+        storage2::delete_persisted_offset(path).await
     }
 }
 
@@ -367,7 +362,6 @@ pub fn get_segment_start_offset_and_deduplicator()
 }
 
 pub fn append_to_journal(
-    shard_id: u16,
     current_offset: u64,
     batch: IggyMessagesBatchMut,
 ) -> impl FnOnce(ComponentsById<PartitionRefMut>) -> Result<(u32, u32), IggyError> {
@@ -387,7 +381,7 @@ pub fn append_to_journal(
         segment.end_timestamp = batch.last_timestamp().unwrap();
         segment.end_offset = batch.last_offset().unwrap();
 
-        let (journal_messages_count, journal_size) = log.journal_mut().append(shard_id, batch)?;
+        let (journal_messages_count, journal_size) = log.journal_mut().append(batch)?;
 
         let last_offset = if batch_messages_count == 0 {
             current_offset
@@ -448,7 +442,6 @@ pub fn persist_reason(
 }
 
 pub fn persist_batch(
-    shard_id: u16,
     stream_id: &Identifier,
     topic_id: &Identifier,
     partition_id: usize,
@@ -456,8 +449,7 @@ pub fn persist_batch(
     reason: String,
 ) -> impl AsyncFnOnce(ComponentsById<PartitionRef>) -> Result<(IggyByteSize, u32), IggyError> {
     async move |(.., log)| {
-        shard_trace!(
-            shard_id,
+        tracing::trace!(
             "Persisting messages on disk for stream ID: {}, topic ID: {}, partition ID: {} because {}...",
             stream_id,
             topic_id,
@@ -496,8 +488,7 @@ pub fn persist_batch(
                 format!("Failed to save index of {len} indexes to {segment}. {error}",)
             })?;
 
-        shard_trace!(
-            shard_id,
+        tracing::trace!(
             "Persisted {} messages on disk for stream ID: {}, topic ID: {}, for partition with ID: {}, total bytes written: {}.",
             batch_count,
             stream_id,

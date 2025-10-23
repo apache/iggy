@@ -108,7 +108,7 @@ pub async fn should_be_successful() {
         contents
     };
 
-    assert!(contents.trim().contains("INFO ThreadId"));
+    assert!(contents.trim().contains("INFO shard-"));
 }
 
 #[tokio::test]

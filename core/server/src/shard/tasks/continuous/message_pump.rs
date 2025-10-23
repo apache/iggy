@@ -19,9 +19,9 @@
 use crate::shard::IggyShard;
 use crate::shard::task_registry::ShutdownToken;
 use crate::shard::transmission::frame::ShardFrame;
-use crate::{shard_debug, shard_info};
 use futures::FutureExt;
 use std::rc::Rc;
+use tracing::{debug, info};
 
 pub fn spawn_message_pump(shard: Rc<IggyShard>) {
     let shard_clone = shard.clone();
@@ -38,11 +38,11 @@ async fn message_pump(
     shutdown: ShutdownToken,
 ) -> Result<(), iggy_common::IggyError> {
     let Some(messages_receiver) = shard.messages_receiver.take() else {
-        shard_info!(shard.id, "Message receiver already taken; pump not started");
+        info!("Message receiver already taken; pump not started");
         return Ok(());
     };
 
-    shard_info!(shard.id, "Starting message passing task");
+    info!("Starting message passing task");
 
     // Get the inner flume receiver directly
     let receiver = messages_receiver.inner;
@@ -50,7 +50,7 @@ async fn message_pump(
     loop {
         futures::select! {
             _ = shutdown.wait().fuse() => {
-                shard_debug!(shard.id, "Message receiver shutting down");
+                debug!("Message receiver shutting down");
                 break;
             }
             frame = receiver.recv_async().fuse() => {
@@ -63,7 +63,7 @@ async fn message_pump(
                         }
                     }
                     Err(_) => {
-                        shard_debug!(shard.id, "Message receiver closed; exiting pump");
+                        debug!("Message receiver closed; exiting pump");
                         break;
                     }
                 }

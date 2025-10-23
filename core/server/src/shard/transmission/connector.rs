@@ -16,6 +16,13 @@
  * under the License.
  */
 
+use super::{
+    frame::{ShardFrame, ShardResponse},
+    message::ShardMessage,
+};
+use iggy_common::IggyError;
+use tracing::error;
+
 pub type StopSender = async_channel::Sender<()>;
 pub type StopReceiver = async_channel::Receiver<()>;
 
@@ -59,6 +66,21 @@ impl<T> ShardConnector<T> {
     /// For unbounded channels, this operation is infallible and never blocks.
     pub fn send(&self, data: T) {
         let _ = self.sender.send(data);
+    }
+}
+
+impl ShardConnector<ShardFrame> {
+    /// Sends a request and waits for a response.
+    /// This implements the request-response pattern for inter-shard communication.
+    pub async fn send_request(&self, message: ShardMessage) -> Result<ShardResponse, IggyError> {
+        let (sender, receiver) = async_channel::bounded(1);
+        // Note: sender needs to be passed to ShardFrame to keep the channel open
+        self.send(ShardFrame::new(message, Some(sender)));
+
+        receiver.recv().await.map_err(|err| {
+            error!("Failed to receive response from shard {}: {err}", self.id);
+            IggyError::ShardCommunicationError
+        })
     }
 }
 

@@ -46,7 +46,6 @@ error_set!(
         #[display("Invalid configuration")]
         InvalidConfiguration,
 
-
         #[display("Cache config validation failure")]
         CacheConfigValidationFailure,
     };

@@ -82,7 +82,11 @@ impl IggyShard {
                 drop(msg_writer);
                 drop(index_writer);
                 compio::fs::remove_file(&path).await.map_err(|e| {
-                    tracing::error!("Failed to delete segment file at path: {}, err: {}", path, e);
+                    tracing::error!(
+                        "Failed to delete segment file at path: {}, err: {}",
+                        path,
+                        e
+                    );
                     IggyError::CannotDeleteFile
                 })?;
             } else {
@@ -94,7 +98,11 @@ impl IggyShard {
                     start_offset,
                 );
                 compio::fs::remove_file(&path).await.map_err(|e| {
-                    tracing::error!("Failed to delete segment file at path: {}, err: {}", path, e);
+                    tracing::error!(
+                        "Failed to delete segment file at path: {}, err: {}",
+                        path,
+                        e
+                    );
                     IggyError::CannotDeleteFile
                 })?;
             }

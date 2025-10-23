@@ -18,11 +18,11 @@
 
 use crate::shard::IggyShard;
 use crate::shard::task_registry::ShutdownToken;
-use crate::shard_info;
 use crate::tcp::{tcp_listener, tcp_tls_listener};
 use iggy_common::IggyError;
 use std::net::SocketAddr;
 use std::rc::Rc;
+use tracing::info;
 
 /// Starts the TCP server.
 pub async fn spawn_tcp_server(
@@ -41,7 +41,7 @@ pub async fn spawn_tcp_server(
         .address
         .parse()
         .expect("Failed to parse TCP address");
-    shard_info!(shard.id, "Initializing {} server...", server_name);
+    info!("Initializing {} server...", server_name);
 
     match shard.config.tcp.tls.enabled {
         true => {

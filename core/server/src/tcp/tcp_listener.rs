@@ -23,7 +23,6 @@ use crate::shard::IggyShard;
 use crate::shard::task_registry::ShutdownToken;
 use crate::shard::transmission::event::ShardEvent;
 use crate::tcp::connection_handler::{handle_connection, handle_error};
-use crate::{shard_debug, shard_error, shard_info};
 use compio::net::{TcpListener, TcpOpts};
 use error_set::ErrContext;
 use futures::FutureExt;
@@ -31,6 +30,7 @@ use iggy_common::{IggyError, TransportProtocol};
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::time::Duration;
+use tracing::{debug, error, info};
 
 async fn create_listener(
     addr: SocketAddr,
@@ -71,11 +71,11 @@ pub async fn start(
     shutdown: ShutdownToken,
 ) -> Result<(), IggyError> {
     if shard.id != 0 && addr.port() == 0 {
-        shard_info!(shard.id, "Waiting for TCP address from shard 0...");
+        info!("Waiting for TCP address from shard 0...");
         loop {
             if let Some(bound_addr) = shard.tcp_bound_address.get() {
                 addr = bound_addr;
-                shard_info!(shard.id, "Received TCP address: {}", addr);
+                info!("Received TCP address: {}", addr);
                 break;
             }
             compio::time::sleep(Duration::from_millis(50)).await;
@@ -89,15 +89,10 @@ pub async fn start(
             format!("Failed to bind {server_name} server to address: {addr}, {err}")
         })?;
     let actual_addr = listener.local_addr().map_err(|e| {
-        shard_error!(shard.id, "Failed to get local address: {}", e);
+        error!("Failed to get local address: {}", e);
         IggyError::CannotBindToSocket(addr.to_string())
     })?;
-    shard_info!(
-        shard.id,
-        "{} server has started on: {:?}",
-        server_name,
-        actual_addr
-    );
+    info!("{} server has started on: {:?}", server_name, actual_addr);
 
     if shard.id == 0 {
         // Store bound address locally
@@ -130,24 +125,24 @@ async fn accept_loop(
         let accept_future = listener.accept();
         futures::select! {
             _ = shutdown.wait().fuse() => {
-                shard_debug!(shard.id, "{} received shutdown signal, no longer accepting connections", server_name);
+                debug!("{} received shutdown signal, no longer accepting connections", server_name);
                 break;
             }
             result = accept_future.fuse() => {
                 match result {
                     Ok((stream, address)) => {
                         if shard.is_shutting_down() {
-                            shard_info!(shard.id, "Rejecting new connection from {} during shutdown", address);
+                            info!("Rejecting new connection from {} during shutdown", address);
                             continue;
                         }
                         let shard_clone = shard.clone();
-                        shard_info!(shard.id, "Accepted new TCP connection: {}", address);
+                        info!("Accepted new TCP connection: {}", address);
                         let transport = TransportProtocol::Tcp;
                         let session = shard_clone.add_client(&address, transport);
-                        shard_info!(shard.id, "Added {} client with session: {} for IP address: {}", transport, session, address);
+                        info!("Added {} client with session: {} for IP address: {}", transport, session, address);
 
                         let client_id = session.client_id;
-                        shard_info!(shard.id, "Created new session: {}", session);
+                        info!("Created new session: {}", session);
                         let mut sender = SenderKind::get_tcp_sender(stream);
 
                         let conn_stop_receiver = shard.task_registry.add_connection(client_id);
@@ -163,13 +158,13 @@ async fn accept_loop(
                             registry_clone.remove_connection(&client_id);
                             shard_for_conn.delete_client(session.client_id);
                             if let Err(error) = sender.shutdown().await {
-                                shard_error!(shard.id, "Failed to shutdown TCP stream for client: {}, address: {}. {}", client_id, address, error);
+                                error!("Failed to shutdown TCP stream for client: {}, address: {}. {}", client_id, address, error);
                             } else {
-                                shard_info!(shard.id, "Successfully closed TCP stream for client: {}, address: {}.", client_id, address);
+                                info!("Successfully closed TCP stream for client: {}, address: {}.", client_id, address);
                             }
                         });
                     }
-                    Err(error) => shard_error!(shard.id, "Unable to accept TCP socket. {}", error),
+                    Err(error) => error!("Unable to accept TCP socket. {}", error),
                 }
             }
         }

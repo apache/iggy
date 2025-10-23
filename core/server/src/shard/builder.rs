@@ -18,11 +18,11 @@
 
 use super::{
     IggyShard, TaskRegistry, transmission::connector::ShardConnector,
-    transmission::frame::ShardFrame,
+    transmission::frame::ShardFrame, transmission::id::ShardId,
 };
 use crate::{
     configs::server::ServerConfig,
-    shard::{Shard, ShardInfo, namespace::IggyNamespace},
+    shard::namespace::IggyNamespace,
     slab::{streams::Streams, users::Users},
     state::file::FileState,
     streaming::{
@@ -39,7 +39,7 @@ use std::{cell::Cell, rc::Rc, sync::atomic::AtomicBool};
 pub struct IggyShardBuilder {
     id: Option<u16>,
     streams: Option<Streams>,
-    shards_table: Option<EternalPtr<DashMap<IggyNamespace, ShardInfo>>>,
+    shards_table: Option<EternalPtr<DashMap<IggyNamespace, ShardId>>>,
     state: Option<FileState>,
     users: Option<Users>,
     client_manager: Option<ClientManager>,
@@ -68,7 +68,7 @@ impl IggyShardBuilder {
 
     pub fn shards_table(
         mut self,
-        shards_table: EternalPtr<DashMap<IggyNamespace, ShardInfo>>,
+        shards_table: EternalPtr<DashMap<IggyNamespace, ShardId>>,
     ) -> Self {
         self.shards_table = Some(shards_table);
         self
@@ -133,7 +133,7 @@ impl IggyShardBuilder {
             })
             .next()
             .expect("Failed to find connection with the specified ID");
-        let shards = connections.into_iter().map(Shard::new).collect();
+        let shards = connections;
 
         // Initialize metrics
         let metrics = self.metrics.unwrap_or_else(Metrics::init);

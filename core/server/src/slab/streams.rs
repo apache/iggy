@@ -1,12 +1,10 @@
 use crate::shard::task_registry::TaskRegistry;
-use crate::shard_trace;
 use crate::streaming::partitions as streaming_partitions;
 use crate::streaming::stats::StreamStats;
 use crate::{
     binary::handlers::messages::poll_messages_handler::IggyPollMetadata,
     configs::{cache_indexes::CacheIndexesConfig, system::SystemConfig},
     shard::{namespace::IggyFullNamespace, system::messages::PollingArgs},
-    shard_info,
     slab::{
         Keyed,
         consumer_groups::ConsumerGroups,
@@ -48,7 +46,7 @@ use std::{
     rc::Rc,
     sync::{Arc, atomic::Ordering},
 };
-use tracing::{error, trace};
+use tracing::error;
 
 const CAPACITY: usize = 1024;
 pub type ContainerId = usize;
@@ -166,7 +164,6 @@ impl MainOps for Streams {
 
     async fn append_messages(
         &self,
-        shard_id: u16,
         config: &SystemConfig,
         registry: &Rc<TaskRegistry>,
         ns: &Self::Namespace,
@@ -208,7 +205,7 @@ impl MainOps for Streams {
             stream_id,
             topic_id,
             partition_id,
-            streaming_partitions::helpers::append_to_journal(shard_id, current_offset, input),
+            streaming_partitions::helpers::append_to_journal(current_offset, input),
         )?;
 
         let unsaved_messages_count_exceeded =
@@ -242,19 +239,12 @@ impl MainOps for Streams {
             );
 
             let _batch_count = self
-                .persist_messages(shard_id, stream_id, topic_id, partition_id, &reason, config)
+                .persist_messages(stream_id, topic_id, partition_id, &reason, config)
                 .await?;
 
             if is_full {
-                self.handle_full_segment(
-                    shard_id,
-                    registry,
-                    stream_id,
-                    topic_id,
-                    partition_id,
-                    config,
-                )
-                .await?;
+                self.handle_full_segment(registry, stream_id, topic_id, partition_id, config)
+                    .await?;
             }
         }
         Ok(())
@@ -296,9 +286,10 @@ impl MainOps for Streams {
             PollingKind::Timestamp => {
                 let timestamp = IggyTimestamp::from(value);
                 let timestamp_ts = timestamp.as_micros();
-                trace!(
+                tracing::trace!(
                     "Getting {count} messages by timestamp: {} for partition: {}...",
-                    timestamp_ts, partition_id
+                    timestamp_ts,
+                    partition_id
                 );
 
                 let batches = self
@@ -389,9 +380,11 @@ impl MainOps for Streams {
                 } else {
                     let consumer_offset = consumer_offset.unwrap();
                     let offset = consumer_offset + 1;
-                    trace!(
+                    tracing::trace!(
                         "Getting next messages for consumer id: {} for partition: {} from offset: {}...",
-                        consumer_id, partition_id, offset
+                        consumer_id,
+                        partition_id,
+                        offset
                     );
                     let batches = self
                         .get_messages_by_offset(stream_id, topic_id, partition_id, offset, count)
@@ -1097,7 +1090,6 @@ impl Streams {
 
     pub async fn handle_full_segment(
         &self,
-        shard_id: u16,
         registry: &Rc<TaskRegistry>,
         stream_id: &Identifier,
         topic_id: &Identifier,
@@ -1167,8 +1159,7 @@ impl Streams {
                 )
             });
 
-        shard_info!(
-            shard_id,
+        tracing::info!(
             "Closed segment for stream: {}, topic: {} with start offset: {}, end offset: {}, size: {} for partition with ID: {}.",
             stream_id,
             topic_id,
@@ -1205,7 +1196,6 @@ impl Streams {
 
     pub async fn persist_messages(
         &self,
-        shard_id: u16,
         stream_id: &Identifier,
         topic_id: &Identifier,
         partition_id: usize,
@@ -1226,8 +1216,7 @@ impl Streams {
             streaming_partitions::helpers::commit_journal(),
         );
 
-        shard_trace!(
-            shard_id,
+        tracing::trace!(
             "Persisting messages on disk for stream ID: {}, topic ID: {}, partition ID: {} because {}...",
             stream_id,
             topic_id,
@@ -1236,7 +1225,7 @@ impl Streams {
         );
 
         let batch_count = self
-            .persist_messages_to_disk(shard_id, stream_id, topic_id, partition_id, batches, config)
+            .persist_messages_to_disk(stream_id, topic_id, partition_id, batches, config)
             .await?;
 
         Ok(batch_count)
@@ -1244,7 +1233,6 @@ impl Streams {
 
     pub async fn persist_messages_to_disk(
         &self,
-        shard_id: u16,
         stream_id: &Identifier,
         topic_id: &Identifier,
         partition_id: usize,
@@ -1310,8 +1298,7 @@ impl Streams {
                 format!("Failed to save index of {indexes_len} indexes to stream ID: {stream_id}, topic ID: {topic_id} {partition_id}. {error}",)
             })?;
 
-        shard_trace!(
-            shard_id,
+        tracing::trace!(
             "Persisted {} messages on disk for stream ID: {}, topic ID: {}, for partition with ID: {}, total bytes written: {}.",
             batch_count,
             stream_id,
@@ -1379,7 +1366,6 @@ impl Streams {
     #[allow(clippy::too_many_arguments)]
     pub async fn auto_commit_consumer_offset(
         &self,
-        shard_id: u16,
         config: &SystemConfig,
         stream_id: &Identifier,
         topic_id: &Identifier,
@@ -1392,9 +1378,13 @@ impl Streams {
         let numeric_topic_id =
             self.with_topic_by_id(stream_id, topic_id, topics::helpers::get_topic_id());
 
-        trace!(
+        tracing::trace!(
             "Last offset: {} will be automatically stored for {}, stream: {}, topic: {}, partition: {}",
-            offset, consumer, numeric_stream_id, numeric_topic_id, partition_id
+            offset,
+            consumer,
+            numeric_stream_id,
+            numeric_topic_id,
+            partition_id
         );
 
         match consumer {
@@ -1418,12 +1408,7 @@ impl Streams {
                         (offset_value, path)
                     },
                 );
-                crate::streaming::partitions::storage2::persist_offset(
-                    shard_id,
-                    &path,
-                    offset_value,
-                )
-                .await?;
+                crate::streaming::partitions::storage2::persist_offset(&path, offset_value).await?;
             }
             PollingConsumer::ConsumerGroup(cg_id, _) => {
                 let (offset_value, path) = self.with_partition_by_id(
@@ -1445,12 +1430,7 @@ impl Streams {
                         (offset_value, path)
                     },
                 );
-                crate::streaming::partitions::storage2::persist_offset(
-                    shard_id,
-                    &path,
-                    offset_value,
-                )
-                .await?;
+                crate::streaming::partitions::storage2::persist_offset(&path, offset_value).await?;
             }
         }
 

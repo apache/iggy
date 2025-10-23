@@ -20,10 +20,12 @@ use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHa
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::{handlers::partitions::COMPONENT, sender::SenderKind};
 
+use crate::shard::IggyShard;
 use crate::shard::namespace::IggyNamespace;
 use crate::shard::transmission::frame::ShardResponse;
-use crate::shard::transmission::message::{ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult};
-use crate::shard::IggyShard;
+use crate::shard::transmission::message::{
+    ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult,
+};
 use crate::state::command::EntryCommand;
 use crate::streaming;
 use crate::streaming::session::Session;
@@ -48,7 +50,7 @@ impl ServerCommandHandler for DeleteSegments {
         shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
-        
+
         let stream_id = self.stream_id.clone();
         let topic_id = self.topic_id.clone();
         let partition_id = self.partition_id as usize;
@@ -75,7 +77,7 @@ impl ServerCommandHandler for DeleteSegments {
         let payload = ShardRequestPayload::DeleteSegments { segments_count };
         let request = ShardRequest::new(stream_id.clone(), topic_id.clone(), partition_id, payload);
         let message = ShardMessage::Request(request);
-        
+
         match shard
             .send_request_to_shard_or_recoil(Some(&namespace), message)
             .await?
@@ -120,7 +122,7 @@ impl ServerCommandHandler for DeleteSegments {
                     "{COMPONENT} (error: {error}) - failed to apply 'delete segments' command for partition with ID: {partition_id} in topic with ID: {topic_id} in stream with ID: {stream_id}, session: {session}",
                 )
             })?;
-        
+
         sender.send_empty_ok_response().await?;
         Ok(())
     }

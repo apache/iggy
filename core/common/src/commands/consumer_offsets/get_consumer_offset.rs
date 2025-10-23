@@ -177,7 +177,8 @@ mod tests {
         let topic_id = Identifier::from_bytes(bytes.slice(position..)).unwrap();
         position += topic_id.get_size_bytes().as_bytes_usize();
         let has_partition_id = bytes[position];
-        let partition_id = u32::from_le_bytes(bytes[position + 1..position + 5].try_into().unwrap());
+        let partition_id =
+            u32::from_le_bytes(bytes[position + 1..position + 5].try_into().unwrap());
         let partition_id = if has_partition_id == 1 {
             Some(partition_id)
         } else {

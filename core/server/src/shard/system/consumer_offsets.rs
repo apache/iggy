@@ -284,7 +284,7 @@ impl IggyShard {
                         (offset, path)
                     },
                 );
-                partitions::storage2::persist_offset(self.id, &path, offset_value).await
+                partitions::storage2::persist_offset(&path, offset_value).await
             }
             PollingConsumer::ConsumerGroup(_, id) => {
                 let (offset_value, path) = self.streams2.with_partition_by_id(
@@ -301,13 +301,13 @@ impl IggyShard {
                         (offset, path)
                     },
                 );
-                partitions::storage2::persist_offset(self.id, &path, offset_value).await
+                partitions::storage2::persist_offset(&path, offset_value).await
             }
         }
     }
 
     pub async fn delete_consumer_offset_from_disk(&self, path: &str) -> Result<(), IggyError> {
-        partitions::storage2::delete_persisted_offset(self.id, path).await
+        partitions::storage2::delete_persisted_offset(path).await
     }
 
     pub fn store_consumer_offset_bypass_auth(

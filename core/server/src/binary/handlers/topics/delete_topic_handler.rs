@@ -22,7 +22,6 @@ use crate::binary::{handlers::topics::COMPONENT, sender::SenderKind};
 
 use crate::shard::IggyShard;
 use crate::shard::transmission::event::ShardEvent;
-use crate::shard_info;
 use crate::state::command::EntryCommand;
 use crate::streaming::session::Session;
 use crate::streaming::streams;
@@ -31,6 +30,7 @@ use error_set::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::delete_topic::DeleteTopic;
 use std::rc::Rc;
+use tracing::info;
 use tracing::{debug, instrument};
 
 impl ServerCommandHandler for DeleteTopic {
@@ -63,8 +63,7 @@ impl ServerCommandHandler for DeleteTopic {
             .streams2
             .with_stream_by_id(&self.stream_id, streams::helpers::get_stream_id());
         let topic_id = topic.root().id();
-        shard_info!(
-            shard.id,
+        info!(
             "Deleted topic with name: {}, ID: {} in stream with ID: {}",
             topic.root().name(),
             topic_id,

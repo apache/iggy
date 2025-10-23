@@ -43,7 +43,8 @@ use server::log::logger::Logging;
 use server::server_error::ServerError;
 use server::shard::namespace::IggyNamespace;
 use server::shard::system::info::SystemInfo;
-use server::shard::{IggyShard, ShardInfo, calculate_shard_assignment};
+use server::shard::transmission::id::ShardId;
+use server::shard::{IggyShard, calculate_shard_assignment};
 use server::slab::traits_ext::{
     EntityComponentSystem, EntityComponentSystemMutCell, IntoComponents,
 };
@@ -55,7 +56,6 @@ use server::streaming::storage::SystemStorage;
 use server::streaming::utils::MemoryPool;
 use server::streaming::utils::ptr::EternalPtr;
 use server::versioning::SemanticVersion;
-use server::{map_toggle_str, shard_info};
 use std::collections::HashSet;
 use std::rc::Rc;
 use std::str::FromStr;
@@ -193,7 +193,10 @@ async fn main() -> Result<(), ServerError> {
     // EIGHTH DISCRETE LOADING STEP.
     info!(
         "Server-side encryption is {}.",
-        map_toggle_str(config.system.encryption.enabled)
+        match config.system.encryption.enabled {
+            true => "enabled",
+            false => "disabled",
+        }
     );
     let encryptor: Option<EncryptorKind> = match config.system.encryption.enabled {
         true => Some(EncryptorKind::Aes256Gcm(
@@ -254,7 +257,7 @@ async fn main() -> Result<(), ServerError> {
     // Shared resources bootstrap.
     let shards_table = Box::new(DashMap::with_capacity(SHARDS_TABLE_CAPACITY));
     let shards_table = Box::leak(shards_table);
-    let shards_table: EternalPtr<DashMap<IggyNamespace, ShardInfo>> = shards_table.into();
+    let shards_table: EternalPtr<DashMap<IggyNamespace, ShardId>> = shards_table.into();
 
     let client_manager = Box::new(DashMap::new());
     let client_manager = Box::leak(client_manager);
@@ -274,9 +277,11 @@ async fn main() -> Result<(), ServerError> {
                             let topic_id = topic.id();
                             let partition_id = partition.id();
                             let ns = IggyNamespace::new(stream_id, topic_id, partition_id);
-                            let shard_id = calculate_shard_assignment(&ns, shards_set.len() as u32);
-                            let shard_info = ShardInfo::new(shard_id);
-                            shards_table.insert(ns, shard_info);
+                            let shard_id = ShardId::new(calculate_shard_assignment(
+                                &ns,
+                                shards_set.len() as u32,
+                            ));
+                            shards_table.insert(ns, shard_id);
                         }
                     });
                 }
@@ -353,7 +358,7 @@ async fn main() -> Result<(), ServerError> {
                     if let Err(e) = shard.run().await {
                         error!("Failed to run shard-{id}: {e}");
                     }
-                    shard_info!(shard.id, "Run completed");
+                    info!("Run completed");
                 })
             })
             .unwrap_or_else(|e| panic!("Failed to spawn thread for shard-{id}: {e}"));

@@ -79,7 +79,7 @@ impl IggyShard {
                     |(root, auxilary, ..)| match partitioning.kind {
                         PartitioningKind::Balanced => {
                             let upperbound = root.partitions().len();
-                            Ok(auxilary.get_next_partition_id(self.id, upperbound))
+                            Ok(auxilary.get_next_partition_id(upperbound))
                         }
                         PartitioningKind::PartitionId => Ok(u32::from_le_bytes(
                             partitioning.value[..partitioning.length as usize]
@@ -90,7 +90,6 @@ impl IggyShard {
                             let upperbound = root.partitions().len();
                             Ok(
                                 topics::helpers::calculate_partition_id_by_messages_key_hash(
-                                    self.id,
                                     upperbound,
                                     &partitioning.value,
                                 ),
@@ -122,13 +121,7 @@ impl IggyShard {
                     let batch = self.maybe_encrypt_messages(batch)?;
                     let messages_count = batch.count();
                     self.streams2
-                        .append_messages(
-                            self.id,
-                            &self.config.system,
-                            &self.task_registry,
-                            &ns,
-                            batch,
-                        )
+                        .append_messages(&self.config.system, &self.task_registry, &ns, batch)
                         .await?;
                     self.metrics.increment_messages(messages_count as u64);
                     Ok(())
@@ -238,7 +231,6 @@ impl IggyShard {
                             .expect("Batch set should have at least one batch");
                         self.streams2
                             .auto_commit_consumer_offset(
-                                self.id,
                                 &self.config.system,
                                 stream_id,
                                 topic_id,
@@ -355,7 +347,6 @@ impl IggyShard {
 
         self.streams2
             .persist_messages_to_disk(
-                self.id,
                 stream_id,
                 topic_id,
                 partition_id,

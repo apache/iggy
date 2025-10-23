@@ -26,7 +26,6 @@ use crate::shard::transmission::frame::ShardResponse;
 use crate::shard::transmission::message::{
     ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult,
 };
-use crate::shard_debug;
 use crate::state::command::EntryCommand;
 use crate::state::models::CreateUserWithId;
 use crate::streaming::session::Session;
@@ -36,6 +35,7 @@ use error_set::ErrContext;
 use iggy_common::create_user::CreateUser;
 use iggy_common::{Identifier, IggyError};
 use std::rc::Rc;
+use tracing::debug;
 use tracing::instrument;
 
 impl ServerCommandHandler for CreateUser {
@@ -51,7 +51,7 @@ impl ServerCommandHandler for CreateUser {
         session: &Session,
         shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
-        shard_debug!(shard.id, "session: {session}, command: {self}");
+        debug!("session: {session}, command: {self}");
 
         let request = ShardRequest {
             stream_id: Identifier::default(),

@@ -24,13 +24,13 @@ use crate::binary::{handlers::users::COMPONENT, sender::SenderKind};
 
 use crate::shard::IggyShard;
 use crate::shard::transmission::event::ShardEvent;
-use crate::shard_info;
 use crate::state::command::EntryCommand;
 use crate::streaming::session::Session;
 use anyhow::Result;
 use error_set::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::delete_user::DeleteUser;
+use tracing::info;
 use tracing::{debug, instrument};
 
 impl ServerCommandHandler for DeleteUser {
@@ -48,7 +48,7 @@ impl ServerCommandHandler for DeleteUser {
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
 
-        shard_info!(shard.id, "Deleting user with ID: {}...", self.user_id);
+        info!("Deleting user with ID: {}...", self.user_id);
         let user = shard
                 .delete_user(session, &self.user_id)
                 .with_error_context(|error| {
@@ -58,12 +58,7 @@ impl ServerCommandHandler for DeleteUser {
                     )
                 })?;
 
-        shard_info!(
-            shard.id,
-            "Deleted user: {} with ID: {}.",
-            user.username,
-            user.id
-        );
+        info!("Deleted user: {} with ID: {}.", user.username, user.id);
         let event = ShardEvent::DeletedUser {
             user_id: self.user_id.clone(),
         };

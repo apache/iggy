@@ -1,7 +1,6 @@
 use std::sync::{Arc, atomic::Ordering};
 
 use crate::{
-    shard_trace,
     slab::{
         Keyed,
         consumer_groups::{self, ConsumerGroups},
@@ -65,14 +64,12 @@ pub fn get_max_topic_size() -> impl FnOnce(ComponentsById<TopicRef>) -> MaxTopic
 }
 
 pub fn calculate_partition_id_by_messages_key_hash(
-    shard_id: u16,
     upperbound: usize,
     messages_key: &[u8],
 ) -> usize {
     let messages_key_hash = hash::calculate_32(messages_key) as usize;
     let partition_id = messages_key_hash % upperbound;
-    shard_trace!(
-        shard_id,
+    tracing::trace!(
         "Calculated partition ID: {} for messages key: {:?}, hash: {}",
         partition_id,
         messages_key,
@@ -134,30 +131,23 @@ pub fn delete_consumer_group(
     }
 }
 
-pub fn join_consumer_group(
-    shard_id: u16,
-    client_id: u32,
-) -> impl FnOnce(ComponentsById<ConsumerGroupRefMut>) {
+pub fn join_consumer_group(client_id: u32) -> impl FnOnce(ComponentsById<ConsumerGroupRefMut>) {
     move |(root, members)| {
         let partitions = root.partitions();
         let id = root.id();
-        add_member(shard_id, id, members, partitions, client_id);
+        add_member(id, members, partitions, client_id);
     }
 }
 
-pub fn leave_consumer_group(
-    shard_id: u16,
-    client_id: u32,
-) -> impl FnOnce(ComponentsById<ConsumerGroupRefMut>) {
+pub fn leave_consumer_group(client_id: u32) -> impl FnOnce(ComponentsById<ConsumerGroupRefMut>) {
     move |(root, members)| {
         let partitions = root.partitions();
         let id = root.id();
-        delete_member(shard_id, id, client_id, members, partitions);
+        delete_member(id, client_id, members, partitions);
     }
 }
 
 pub fn rebalance_consumer_group(
-    shard_id: u16,
     partition_ids: &[usize],
 ) -> impl FnOnce(ComponentsById<TopicRefMut>) {
     move |(mut root, ..)| {
@@ -170,7 +160,7 @@ pub fn rebalance_consumer_group(
                     let id = consumer_group_root.id();
                     members.inner_mut().rcu(|existing_members| {
                         let mut new_members = mimic_members(existing_members);
-                        assign_partitions_to_members(shard_id, id, &mut new_members, partition_ids);
+                        assign_partitions_to_members(id, &mut new_members, partition_ids);
                         new_members
                     });
                 }
@@ -230,23 +220,16 @@ pub fn get_current_partition_id_unchecked(
     }
 }
 
-fn add_member(
-    shard_id: u16,
-    id: usize,
-    members: &mut ConsumerGroupMembers,
-    partitions: &[usize],
-    client_id: u32,
-) {
+fn add_member(id: usize, members: &mut ConsumerGroupMembers, partitions: &[usize], client_id: u32) {
     members.inner_mut().rcu(move |members| {
         let mut members = mimic_members(members);
         Member::new(client_id).insert_into(&mut members);
-        assign_partitions_to_members(shard_id, id, &mut members, partitions);
+        assign_partitions_to_members(id, &mut members, partitions);
         members
     });
 }
 
 fn delete_member(
-    shard_id: u16,
     id: usize,
     client_id: u32,
     members: &mut ConsumerGroupMembers,
@@ -265,17 +248,12 @@ fn delete_member(
             entry.id = idx;
             true
         });
-        assign_partitions_to_members(shard_id, id, &mut members, partitions);
+        assign_partitions_to_members(id, &mut members, partitions);
         members
     });
 }
 
-fn assign_partitions_to_members(
-    shard_id: u16,
-    id: usize,
-    members: &mut Slab<Member>,
-    partitions: &[usize],
-) {
+fn assign_partitions_to_members(id: usize, members: &mut Slab<Member>, partitions: &[usize]) {
     members
         .iter_mut()
         .for_each(|(_, member)| member.partitions.clear());
@@ -288,8 +266,7 @@ fn assign_partitions_to_members(
         let position = idx % count;
         let member = &mut members[position];
         member.partitions.push(*partition);
-        shard_trace!(
-            shard_id,
+        tracing::trace!(
             "Assigned partition ID: {} to member with ID: {} in consumer group: {}",
             partition,
             member.id,

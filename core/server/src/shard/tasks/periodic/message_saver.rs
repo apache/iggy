@@ -17,7 +17,6 @@
  */
 
 use crate::shard::IggyShard;
-use crate::shard_info;
 use iggy_common::{Identifier, IggyError};
 use std::rc::Rc;
 use tracing::{error, info, trace};
@@ -58,7 +57,6 @@ async fn save_messages(shard: Rc<IggyShard>) -> Result<(), IggyError> {
         match shard
             .streams2
             .persist_messages(
-                shard.id,
                 &stream_id,
                 &topic_id,
                 partition_id,
@@ -80,11 +78,7 @@ async fn save_messages(shard: Rc<IggyShard>) -> Result<(), IggyError> {
     }
 
     if total_saved_messages > 0 {
-        shard_info!(
-            shard.id,
-            "Saved {} buffered messages on disk.",
-            total_saved_messages
-        );
+        info!("Saved {} buffered messages on disk.", total_saved_messages);
     }
     Ok(())
 }

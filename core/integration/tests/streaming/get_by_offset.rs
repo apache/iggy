@@ -196,7 +196,7 @@ async fn test_get_messages_by_offset(
         let batch = IggyMessagesBatchMut::from_messages(messages_slice_to_append, messages_size);
         assert_eq!(batch.count(), batch_len);
         streams
-            .append_messages(shard_id as u16, &config, &task_registry, &namespace, batch)
+            .append_messages(&config, &task_registry, &namespace, batch)
             .await
             .unwrap();
 

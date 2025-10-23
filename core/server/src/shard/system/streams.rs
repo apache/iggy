@@ -44,7 +44,7 @@ impl IggyShard {
         }
         let stream = stream2::create_and_insert_stream_mem(&self.streams2, name);
         self.metrics.increment_streams(1);
-        create_stream_file_hierarchy(self.id, stream.id(), &self.config.system).await?;
+        create_stream_file_hierarchy(stream.id(), &self.config.system).await?;
         Ok(stream)
     }
 
@@ -169,7 +169,7 @@ impl IggyShard {
             self.remove_shard_table_record(&ns);
         }
 
-        delete_stream_from_disk(self.id, &mut stream, &self.config.system).await?;
+        delete_stream_from_disk(&mut stream, &self.config.system).await?;
         Ok(stream)
     }
 

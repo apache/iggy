@@ -1,13 +1,12 @@
 use crate::slab::traits_ext::{DeleteCell, EntityComponentSystem, EntityMarker, IntoComponents};
 use crate::streaming::streams::stream2;
 use crate::streaming::topics::storage2::delete_topic_from_disk;
-use crate::{configs::system::SystemConfig, io::fs_utils::remove_dir_all, shard_info};
+use crate::{configs::system::SystemConfig, io::fs_utils::remove_dir_all};
 use compio::fs::create_dir_all;
 use iggy_common::IggyError;
 use std::path::Path;
 
 pub async fn create_stream_file_hierarchy(
-    shard_id: u16,
     id: usize,
     config: &SystemConfig,
 ) -> Result<(), IggyError> {
@@ -20,12 +19,11 @@ pub async fn create_stream_file_hierarchy(
         ));
     }
 
-    shard_info!(shard_id, "Saved stream with ID: {}.", id);
+    tracing::info!("Saved stream with ID: {}.", id);
     Ok(())
 }
 
 pub async fn delete_stream_from_disk(
-    shard_id: u16,
     stream: &mut stream2::Stream,
     config: &SystemConfig,
 ) -> Result<(), IggyError> {
@@ -44,16 +42,12 @@ pub async fn delete_stream_from_disk(
     // Delete all topics from the stream.
     for id in ids {
         let mut topic = stream.root_mut().topics_mut().delete(id);
-        delete_topic_from_disk(shard_id, stream_id, &mut topic, config).await?;
+        delete_topic_from_disk(stream_id, &mut topic, config).await?;
     }
 
     remove_dir_all(&stream_path)
         .await
         .map_err(|_| IggyError::CannotDeleteStreamDirectory(stream_id as u32))?;
-    shard_info!(
-        shard_id,
-        "Deleted stream files for stream with ID: {}.",
-        stream_id
-    );
+    tracing::info!("Deleted stream files for stream with ID: {}.", stream_id);
     Ok(())
 }

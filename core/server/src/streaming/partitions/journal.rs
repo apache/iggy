@@ -1,7 +1,4 @@
-use crate::{
-    shard_trace,
-    streaming::segments::{IggyMessagesBatchMut, IggyMessagesBatchSet},
-};
+use crate::streaming::segments::{IggyMessagesBatchMut, IggyMessagesBatchSet};
 use iggy_common::{IggyByteSize, IggyError};
 use std::fmt::Debug;
 
@@ -39,10 +36,9 @@ impl Journal for MemoryMessageJournal {
     type Inner = Inner;
     type AppendResult = Result<(u32, u32), IggyError>;
 
-    fn append(&mut self, shard_id: u16, entry: Self::Entry) -> Self::AppendResult {
+    fn append(&mut self, entry: Self::Entry) -> Self::AppendResult {
         let batch_messages_count = entry.count();
-        shard_trace!(
-            shard_id,
+        tracing::trace!(
             "Coalescing batch with base_offset: {}, current_offset: {}, self.messages_count: {}, batch.count: {}",
             self.inner.base_offset,
             self.inner.current_offset,
@@ -104,8 +100,7 @@ pub trait Journal {
 
     fn init(&mut self, inner: Self::Inner);
 
-    // Temporarely include the `shard_id` parameter, until we make it into a struct that is stored in TLS.
-    fn append(&mut self, shard_id: u16, entry: Self::Entry) -> Self::AppendResult;
+    fn append(&mut self, entry: Self::Entry) -> Self::AppendResult;
 
     fn get<U>(&self, filter: impl FnOnce(&Self::Container) -> U) -> U;
 

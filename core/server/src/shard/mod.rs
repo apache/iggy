@@ -17,43 +17,42 @@ inner() * or more contributor license agreements.  See the NOTICE file
  */
 
 pub mod builder;
-pub mod logging;
 pub mod namespace;
 pub mod system;
 pub mod task_registry;
 pub mod tasks;
 pub mod transmission;
 
+mod communication;
+mod handlers;
+
+// Re-export for backwards compatibility
+pub use communication::calculate_shard_assignment;
+
 use self::tasks::{continuous, periodic};
 use crate::{
     configs::server::ServerConfig,
     io::fs_locks::FsLocks,
     shard::{
-        namespace::{IggyFullNamespace, IggyNamespace},
+        namespace::IggyNamespace,
         task_registry::TaskRegistry,
         transmission::{
             event::ShardEvent,
             frame::{ShardFrame, ShardResponse},
-            message::{ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult},
+            message::ShardMessage,
         },
     },
-    shard_error, shard_info, shard_warn,
     slab::{streams::Streams, traits_ext::EntityMarker, users::Users},
     state::file::FileState,
     streaming::{
         clients::client_manager::ClientManager, diagnostics::metrics::Metrics, session::Session,
-        traits::MainOps, users::permissioner::Permissioner, utils::ptr::EternalPtr,
+        users::permissioner::Permissioner, utils::ptr::EternalPtr,
     },
     versioning::SemanticVersion,
 };
 use builder::IggyShardBuilder;
-use compio::io::AsyncWriteAtExt;
 use dashmap::DashMap;
-use error_set::ErrContext;
-use futures::future::join_all;
-use hash32::{Hasher, Murmur3Hasher};
-use iggy_common::{EncryptorKind, Identifier, IggyError, TransportProtocol};
-use std::hash::Hasher as _;
+use iggy_common::{EncryptorKind, Identifier, IggyError};
 use std::{
     cell::{Cell, RefCell},
     net::SocketAddr,
@@ -61,64 +60,23 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
-use tracing::{debug, error, instrument};
-use transmission::connector::{Receiver, ShardConnector, StopReceiver};
+use tracing::{debug, error, info, instrument};
+use transmission::{
+    connector::{Receiver, ShardConnector, StopReceiver},
+    id::ShardId,
+};
 
 pub const COMPONENT: &str = "SHARD";
 pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 pub const BROADCAST_TIMEOUT: Duration = Duration::from_secs(500);
 
-pub(crate) struct Shard {
-    id: u16,
-    connection: ShardConnector<ShardFrame>,
-}
-
-impl Shard {
-    pub fn new(connection: ShardConnector<ShardFrame>) -> Self {
-        Self {
-            id: connection.id,
-            connection,
-        }
-    }
-
-    pub async fn send_request(&self, message: ShardMessage) -> Result<ShardResponse, IggyError> {
-        let (sender, receiver) = async_channel::bounded(1);
-        let _ = self
-            .connection
-            .sender
-            .send(ShardFrame::new(message, Some(sender.clone()))); // Apparently sender needs to be cloned, otherwise channel will close...
-        //TODO: Fixme
-        let response = receiver.recv().await.map_err(|err| {
-            error!("Failed to receive response from shard: {err}");
-            IggyError::ShardCommunicationError
-        })?;
-        Ok(response)
-    }
-}
-
-// TODO: Maybe pad to cache line size?
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub struct ShardInfo {
-    pub id: u16,
-}
-
-impl ShardInfo {
-    pub fn new(id: u16) -> Self {
-        Self { id }
-    }
-
-    pub fn id(&self) -> u16 {
-        self.id
-    }
-}
-
 pub struct IggyShard {
     pub id: u16,
-    shards: Vec<Shard>,
+    shards: Vec<ShardConnector<ShardFrame>>,
     _version: SemanticVersion,
 
     pub(crate) streams2: Streams,
-    pub(crate) shards_table: EternalPtr<DashMap<IggyNamespace, ShardInfo>>,
+    pub(crate) shards_table: EternalPtr<DashMap<IggyNamespace, ShardId>>,
     pub(crate) state: FileState,
 
     pub(crate) fs_locks: FsLocks,
@@ -161,7 +119,7 @@ impl IggyShard {
                 || self.config.http.enabled
                 || self.config.websocket.enabled)
         {
-            self.spawn_config_writer_task();
+            tasks::oneshot::spawn_config_writer_task(self);
         }
 
         if self.config.tcp.enabled {
@@ -201,119 +159,10 @@ impl IggyShard {
         }
     }
 
-    fn spawn_config_writer_task(self: &Rc<Self>) {
-        let shard = self.clone();
-        let tcp_enabled = self.config.tcp.enabled;
-        let quic_enabled = self.config.quic.enabled;
-        let http_enabled = self.config.http.enabled;
-        let websocket_enabled = self.config.websocket.enabled;
-
-        let notify_receiver = shard.config_writer_receiver.clone();
-
-        self.task_registry
-            .oneshot("config_writer")
-            .critical(false)
-            .run(move |_shutdown| async move {
-                // Wait for notifications until all servers have bound
-                loop {
-                    notify_receiver
-                        .recv()
-                        .await
-                        .map_err(|_| IggyError::CannotWriteToFile)
-                        .with_error_context(|_| {
-                            "config_writer: notification channel closed before all servers bound"
-                        })?;
-
-                    let tcp_ready = !tcp_enabled || shard.tcp_bound_address.get().is_some();
-                    let quic_ready = !quic_enabled || shard.quic_bound_address.get().is_some();
-                    let http_ready = !http_enabled || shard.http_bound_address.get().is_some();
-                    let websocket_ready =
-                        !websocket_enabled || shard.websocket_bound_address.get().is_some();
-
-                    if tcp_ready && quic_ready && http_ready && websocket_ready {
-                        break;
-                    }
-                }
-
-                let mut current_config = shard.config.clone();
-
-                let tcp_addr = shard.tcp_bound_address.get();
-                let quic_addr = shard.quic_bound_address.get();
-                let http_addr = shard.http_bound_address.get();
-                let websocket_addr = shard.websocket_bound_address.get();
-
-                shard_info!(
-                    shard.id,
-                    "Config writer: TCP addr = {:?}, QUIC addr = {:?}, HTTP addr = {:?}, WebSocket addr = {:?}",
-                    tcp_addr,
-                    quic_addr,
-                    http_addr,
-                    websocket_addr
-                );
-
-                if let Some(tcp_addr) = tcp_addr {
-                    current_config.tcp.address = tcp_addr.to_string();
-                }
-
-                if let Some(quic_addr) = quic_addr {
-                    current_config.quic.address = quic_addr.to_string();
-                }
-
-                if let Some(http_addr) = http_addr {
-                    current_config.http.address = http_addr.to_string();
-                }
-
-                if let Some(websocket_addr) = websocket_addr {
-                    current_config.websocket.address = websocket_addr.to_string();
-                }
-
-                let runtime_path = current_config.system.get_runtime_path();
-                let config_path = format!("{runtime_path}/current_config.toml");
-                let content = toml::to_string(&current_config)
-                    .map_err(|_| IggyError::CannotWriteToFile)
-                    .with_error_context(|_| "config_writer: cannot serialize current_config")?;
-
-                let mut file = compio::fs::OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .open(&config_path)
-                    .await
-                    .map_err(|_| IggyError::CannotWriteToFile)
-                    .with_error_context(|_| {
-                        format!("config_writer: failed to open current config at {config_path}")
-                    })?;
-
-                file.write_all_at(content.into_bytes(), 0)
-                    .await
-                    .0
-                    .map_err(|_| IggyError::CannotWriteToFile)
-                    .with_error_context(|_| {
-                        format!("config_writer: failed to write current config to {config_path}")
-                    })?;
-
-                file.sync_all()
-                    .await
-                    .map_err(|_| IggyError::CannotWriteToFile)
-                    .with_error_context(|_| {
-                        format!("config_writer: failed to fsync current config to {config_path}")
-                    })?;
-
-                shard_info!(
-                    shard.id,
-                    "Current config written and synced to: {} with all bound addresses",
-                    config_path
-                );
-
-                Ok(())
-            })
-            .spawn();
-    }
-
     pub async fn run(self: &Rc<Self>) -> Result<(), IggyError> {
         let now: Instant = Instant::now();
 
-        shard_info!(self.id, "Starting...");
+        info!("Starting...");
         self.init().await?;
 
         // TODO: Fixme
@@ -324,19 +173,19 @@ impl IggyShard {
         let stop_receiver = self.get_stop_receiver();
         let shard_for_shutdown = self.clone();
 
-        // Spawn shutdown handler - only this task consumes the stop signal
+        // Spawn shutdown handler
         compio::runtime::spawn(async move {
             let _ = stop_receiver.recv().await;
             let shutdown_success = shard_for_shutdown.trigger_shutdown().await;
             if !shutdown_success {
-                shard_error!(shard_for_shutdown.id, "shutdown timed out");
+                error!("shutdown timed out");
             }
             let _ = shutdown_complete_tx.send(()).await;
         })
         .detach();
 
         let elapsed = now.elapsed();
-        shard_info!(self.id, "Initialized in {} ms.", elapsed.as_millis());
+        info!("Initialized in {} ms.", elapsed.as_millis());
 
         shutdown_complete_rx.recv().await.ok();
         Ok(())
@@ -345,19 +194,16 @@ impl IggyShard {
     async fn load_segments(&self) -> Result<(), IggyError> {
         use crate::bootstrap::load_segments;
         for shard_entry in self.shards_table.iter() {
-            let (namespace, shard_info) = shard_entry.pair();
+            let (namespace, shard_id) = shard_entry.pair();
 
-            if shard_info.id == self.id {
+            if **shard_id == self.id {
                 let stream_id = namespace.stream_id();
-                let topic_id = namespace.topic_id();
+                let topic_id: usize = namespace.topic_id();
                 let partition_id = namespace.partition_id();
 
-                shard_info!(
-                    self.id,
+                info!(
                     "Loading segments for stream: {}, topic: {}, partition: {}",
-                    stream_id,
-                    topic_id,
-                    partition_id
+                    stream_id, topic_id, partition_id
                 );
 
                 let partition_path =
@@ -391,22 +237,15 @@ impl IggyShard {
                                 offset.store(current_offset, Ordering::Relaxed);
                             },
                         );
-                        shard_info!(
-                            self.id,
+                        info!(
                             "Successfully loaded segments for stream: {}, topic: {}, partition: {}",
-                            stream_id,
-                            topic_id,
-                            partition_id
+                            stream_id, topic_id, partition_id
                         );
                     }
                     Err(e) => {
-                        shard_error!(
-                            self.id,
+                        error!(
                             "Failed to load segments for stream: {}, topic: {}, partition: {}: {}",
-                            stream_id,
-                            topic_id,
-                            partition_id,
-                            e
+                            stream_id, topic_id, partition_id, e
                         );
                         return Err(e);
                     }
@@ -424,7 +263,7 @@ impl IggyShard {
             .borrow_mut()
             .init(&users_list.iter().collect::<Vec<_>>());
         self.metrics.increment_users(users_count as u32);
-        shard_info!(self.id, "Initialized {} user(s).", users_count);
+        info!("Initialized {} user(s).", users_count);
         Ok(())
     }
 
@@ -452,573 +291,11 @@ impl IggyShard {
     }
 
     pub async fn handle_shard_message(&self, message: ShardMessage) -> Option<ShardResponse> {
-        match message {
-            ShardMessage::Request(request) => match self.handle_request(request).await {
-                Ok(response) => Some(response),
-                Err(err) => Some(ShardResponse::ErrorResponse(err)),
-            },
-            ShardMessage::Event(event) => match self.handle_event(event).await {
-                Ok(_) => Some(ShardResponse::Event),
-                Err(err) => Some(ShardResponse::ErrorResponse(err)),
-            },
-        }
-    }
-
-    async fn handle_request(&self, request: ShardRequest) -> Result<ShardResponse, IggyError> {
-        let stream_id = request.stream_id;
-        let topic_id = request.topic_id;
-        let partition_id = request.partition_id;
-        match request.payload {
-            ShardRequestPayload::SendMessages { batch } => {
-                let ns = IggyFullNamespace::new(stream_id, topic_id, partition_id);
-                let batch = self.maybe_encrypt_messages(batch)?;
-                let messages_count = batch.count();
-                self.streams2
-                    .append_messages(
-                        self.id,
-                        &self.config.system,
-                        &self.task_registry,
-                        &ns,
-                        batch,
-                    )
-                    .await?;
-                self.metrics.increment_messages(messages_count as u64);
-                Ok(ShardResponse::SendMessages)
-            }
-            ShardRequestPayload::PollMessages { args, consumer } => {
-                let auto_commit = args.auto_commit;
-                let ns = IggyFullNamespace::new(stream_id, topic_id, partition_id);
-                let (metadata, batches) = self.streams2.poll_messages(&ns, consumer, args).await?;
-
-                if auto_commit && !batches.is_empty() {
-                    let offset = batches
-                        .last_offset()
-                        .expect("Batch set should have at least one batch");
-                    self.streams2
-                        .auto_commit_consumer_offset(
-                            self.id,
-                            &self.config.system,
-                            ns.stream_id(),
-                            ns.topic_id(),
-                            partition_id,
-                            consumer,
-                            offset,
-                        )
-                        .await?;
-                }
-                Ok(ShardResponse::PollMessages((metadata, batches)))
-            }
-            ShardRequestPayload::FlushUnsavedBuffer { fsync } => {
-                self.flush_unsaved_buffer_base(&stream_id, &topic_id, partition_id, fsync)
-                    .await?;
-                Ok(ShardResponse::FlushUnsavedBuffer)
-            }
-            ShardRequestPayload::DeleteSegments { segments_count } => {
-                self.delete_segments_base(&stream_id, &topic_id, partition_id, segments_count)
-                    .await?;
-                Ok(ShardResponse::DeleteSegments)
-            }
-            ShardRequestPayload::CreateStream { user_id, name } => {
-                assert_eq!(self.id, 0, "CreateStream should only be handled by shard0");
-
-                let session = Session::stateless(
-                    user_id,
-                    std::net::SocketAddr::new(
-                        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-                        0,
-                    ),
-                );
-
-                // Acquire stream lock to serialize filesystem operations
-                let _stream_guard = self.fs_locks.stream_lock.lock().await;
-
-                let stream = self.create_stream2(&session, name.clone()).await?;
-                let created_stream_id = stream.id();
-
-                let event = ShardEvent::CreatedStream2 {
-                    id: created_stream_id,
-                    stream: stream.clone(),
-                };
-
-                self.broadcast_event_to_all_shards(event).await?;
-
-                Ok(ShardResponse::CreateStreamResponse(stream))
-            }
-            ShardRequestPayload::CreateTopic {
-                user_id,
-                stream_id,
-                name,
-                partitions_count,
-                message_expiry,
-                compression_algorithm,
-                max_topic_size,
-                replication_factor,
-            } => {
-                assert_eq!(self.id, 0, "CreateTopic should only be handled by shard0");
-
-                let session = Session::stateless(
-                    user_id,
-                    std::net::SocketAddr::new(
-                        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-                        0,
-                    ),
-                );
-
-                // Acquire topic lock to serialize filesystem operations
-                let _topic_guard = self.fs_locks.topic_lock.lock().await;
-
-                let topic = self
-                    .create_topic2(
-                        &session,
-                        &stream_id,
-                        name.clone(),
-                        message_expiry,
-                        compression_algorithm,
-                        max_topic_size,
-                        replication_factor,
-                    )
-                    .await?;
-
-                let topic_id = topic.id();
-
-                let event = ShardEvent::CreatedTopic2 {
-                    stream_id: stream_id.clone(),
-                    topic: topic.clone(),
-                };
-                self.broadcast_event_to_all_shards(event).await?;
-
-                let partitions = self
-                    .create_partitions2(
-                        &session,
-                        &stream_id,
-                        &Identifier::numeric(topic_id as u32).unwrap(),
-                        partitions_count,
-                    )
-                    .await?;
-
-                let event = ShardEvent::CreatedPartitions2 {
-                    stream_id: stream_id.clone(),
-                    topic_id: Identifier::numeric(topic_id as u32).unwrap(),
-                    partitions,
-                };
-                self.broadcast_event_to_all_shards(event).await?;
-
-                Ok(ShardResponse::CreateTopicResponse(topic))
-            }
-            ShardRequestPayload::CreateUser {
-                user_id,
-                username,
-                password,
-                status,
-                permissions,
-            } => {
-                assert_eq!(self.id, 0, "CreateUser should only be handled by shard0");
-
-                let session = Session::stateless(
-                    user_id,
-                    std::net::SocketAddr::new(
-                        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-                        0,
-                    ),
-                );
-
-                let user =
-                    self.create_user(&session, &username, &password, status, permissions.clone())?;
-
-                let created_user_id = user.id;
-
-                let event = ShardEvent::CreatedUser {
-                    user_id: created_user_id,
-                    username: username.clone(),
-                    password: password.clone(),
-                    status,
-                    permissions: permissions.clone(),
-                };
-                self.broadcast_event_to_all_shards(event).await?;
-
-                Ok(ShardResponse::CreateUserResponse(user))
-            }
-            ShardRequestPayload::GetStats { .. } => {
-                assert_eq!(self.id, 0, "GetStats should only be handled by shard0");
-                let stats = self.get_stats().await?;
-                Ok(ShardResponse::GetStatsResponse(stats))
-            }
-        }
+        handlers::handle_shard_message(self, message).await
     }
 
     pub(crate) async fn handle_event(&self, event: ShardEvent) -> Result<(), IggyError> {
-        match event {
-            ShardEvent::DeletedPartitions2 {
-                stream_id,
-                topic_id,
-                partitions_count,
-                partition_ids,
-            } => {
-                self.delete_partitions2_bypass_auth(
-                    &stream_id,
-                    &topic_id,
-                    partitions_count,
-                    partition_ids,
-                )?;
-                Ok(())
-            }
-            ShardEvent::UpdatedStream2 { stream_id, name } => {
-                self.update_stream2_bypass_auth(&stream_id, &name)?;
-                Ok(())
-            }
-            ShardEvent::PurgedStream2 { stream_id } => {
-                self.purge_stream2_bypass_auth(&stream_id).await?;
-                Ok(())
-            }
-            ShardEvent::PurgedTopic {
-                stream_id,
-                topic_id,
-            } => {
-                self.purge_topic2_bypass_auth(&stream_id, &topic_id).await?;
-                Ok(())
-            }
-            ShardEvent::CreatedUser {
-                user_id,
-                username,
-                password,
-                status,
-                permissions,
-            } => {
-                self.create_user_bypass_auth(
-                    user_id,
-                    &username,
-                    &password,
-                    status,
-                    permissions.clone(),
-                )?;
-                Ok(())
-            }
-            ShardEvent::DeletedUser { user_id } => {
-                self.delete_user_bypass_auth(&user_id)?;
-                Ok(())
-            }
-            ShardEvent::ChangedPassword {
-                user_id,
-                current_password,
-                new_password,
-            } => {
-                self.change_password_bypass_auth(&user_id, &current_password, &new_password)?;
-                Ok(())
-            }
-            ShardEvent::CreatedPersonalAccessToken {
-                personal_access_token,
-            } => {
-                self.create_personal_access_token_bypass_auth(personal_access_token.to_owned())?;
-                Ok(())
-            }
-            ShardEvent::DeletedPersonalAccessToken { user_id, name } => {
-                self.delete_personal_access_token_bypass_auth(user_id, &name)?;
-                Ok(())
-            }
-            ShardEvent::UpdatedUser {
-                user_id,
-                username,
-                status,
-            } => {
-                self.update_user_bypass_auth(&user_id, username.to_owned(), status)?;
-                Ok(())
-            }
-            ShardEvent::UpdatedPermissions {
-                user_id,
-                permissions,
-            } => {
-                self.update_permissions_bypass_auth(&user_id, permissions.to_owned())?;
-                Ok(())
-            }
-            ShardEvent::AddressBound { protocol, address } => {
-                shard_info!(
-                    self.id,
-                    "Received AddressBound event for {:?} with address: {}",
-                    protocol,
-                    address
-                );
-                match protocol {
-                    TransportProtocol::Tcp => {
-                        self.tcp_bound_address.set(Some(address));
-                        // Notify config writer that a server has bound
-                        let _ = self.config_writer_notify.try_send(());
-                    }
-                    TransportProtocol::Quic => {
-                        self.quic_bound_address.set(Some(address));
-                        // Notify config writer that a server has bound
-                        let _ = self.config_writer_notify.try_send(());
-                    }
-                    TransportProtocol::Http => {
-                        self.http_bound_address.set(Some(address));
-                        // Notify config writer that a server has bound
-                        let _ = self.config_writer_notify.try_send(());
-                    }
-                    TransportProtocol::WebSocket => {
-                        self.websocket_bound_address.set(Some(address));
-                        // Notify config writer that a server has bound
-                        let _ = self.config_writer_notify.try_send(());
-                    }
-                }
-                Ok(())
-            }
-            ShardEvent::CreatedStream2 { id, stream } => {
-                let stream_id = self.create_stream2_bypass_auth(stream);
-                assert_eq!(stream_id, id);
-                Ok(())
-            }
-            ShardEvent::DeletedStream2 { id, stream_id } => {
-                let stream = self.delete_stream2_bypass_auth(&stream_id);
-                assert_eq!(stream.id(), id);
-
-                Ok(())
-            }
-            ShardEvent::CreatedTopic2 { stream_id, topic } => {
-                let topic_id_from_event = topic.id();
-                let topic_id = self.create_topic2_bypass_auth(&stream_id, topic.clone());
-                assert_eq!(topic_id, topic_id_from_event);
-                Ok(())
-            }
-            ShardEvent::CreatedPartitions2 {
-                stream_id,
-                topic_id,
-                partitions,
-            } => {
-                self.create_partitions2_bypass_auth(&stream_id, &topic_id, partitions)
-                    .await?;
-                Ok(())
-            }
-            ShardEvent::DeletedTopic2 {
-                id,
-                stream_id,
-                topic_id,
-            } => {
-                let topic = self.delete_topic_bypass_auth2(&stream_id, &topic_id);
-                assert_eq!(topic.id(), id);
-                Ok(())
-            }
-            ShardEvent::UpdatedTopic2 {
-                stream_id,
-                topic_id,
-                name,
-                message_expiry,
-                compression_algorithm,
-                max_topic_size,
-                replication_factor,
-            } => {
-                self.update_topic_bypass_auth2(
-                    &stream_id,
-                    &topic_id,
-                    name.clone(),
-                    message_expiry,
-                    compression_algorithm,
-                    max_topic_size,
-                    replication_factor,
-                )?;
-                Ok(())
-            }
-            ShardEvent::CreatedConsumerGroup2 {
-                stream_id,
-                topic_id,
-                cg,
-            } => {
-                let cg_id = cg.id();
-                let id = self.create_consumer_group_bypass_auth2(&stream_id, &topic_id, cg);
-                assert_eq!(id, cg_id);
-                Ok(())
-            }
-            ShardEvent::DeletedConsumerGroup2 {
-                id,
-                stream_id,
-                topic_id,
-                group_id,
-            } => {
-                let cg = self.delete_consumer_group_bypass_auth2(&stream_id, &topic_id, &group_id);
-                assert_eq!(cg.id(), id);
-
-                Ok(())
-            }
-            ShardEvent::FlushUnsavedBuffer {
-                stream_id,
-                topic_id,
-                partition_id,
-                fsync,
-            } => {
-                self.flush_unsaved_buffer_base(&stream_id, &topic_id, partition_id, fsync)
-                    .await?;
-                Ok(())
-            }
-        }
-    }
-
-    pub async fn send_request_to_shard_or_recoil(
-        &self,
-        namespace: Option<&IggyNamespace>,
-        message: ShardMessage,
-    ) -> Result<ShardSendRequestResult, IggyError> {
-        if let Some(ns) = namespace {
-            if let Some(shard) = self.find_shard(ns) {
-                if shard.id == self.id {
-                    return Ok(ShardSendRequestResult::Recoil(message));
-                }
-
-                let response = match shard.send_request(message).await {
-                    Ok(response) => response,
-                    Err(err) => {
-                        error!(
-                            "{COMPONENT} - failed to send request to shard with ID: {}, error: {err}",
-                            shard.id
-                        );
-                        return Err(err);
-                    }
-                };
-                Ok(ShardSendRequestResult::Response(response))
-            } else {
-                Err(IggyError::ShardNotFound(
-                    ns.stream_id(),
-                    ns.topic_id(),
-                    ns.partition_id(),
-                ))
-            }
-        } else {
-            if self.id == 0 {
-                return Ok(ShardSendRequestResult::Recoil(message));
-            }
-
-            let shard0 = &self.shards[0];
-            let response = match shard0.send_request(message).await {
-                Ok(response) => response,
-                Err(err) => {
-                    error!("{COMPONENT} - failed to send admin request to shard0, error: {err}");
-                    return Err(err);
-                }
-            };
-            Ok(ShardSendRequestResult::Response(response))
-        }
-    }
-
-    pub async fn broadcast_event_to_all_shards(&self, event: ShardEvent) -> Result<(), IggyError> {
-        if self.is_shutting_down() {
-            shard_info!(
-                self.id,
-                "Skipping broadcast during shutdown for event: {}",
-                event
-            );
-            return Ok(());
-        }
-
-        let event_type = event.to_string();
-        let futures = self
-            .shards
-            .iter()
-            .filter(|s| s.id != self.id)
-            .map(|shard| {
-                let event = event.clone();
-                let conn = shard.connection.clone();
-                let shard_id = shard.id;
-                let self_id = self.id;
-                let event_type = event_type.clone();
-
-                async move {
-                    let (sender, receiver) = async_channel::bounded(1);
-                    conn.send(ShardFrame::new(ShardMessage::Event(event), Some(sender)));
-
-                    match compio::time::timeout(BROADCAST_TIMEOUT, receiver.recv()).await {
-                        Ok(Ok(_)) => Ok(()),
-                        Ok(Err(e)) => {
-                            shard_warn!(
-                                self_id,
-                                "Broadcast to shard {} failed for event {}: channel error: {}",
-                                shard_id, event_type, e
-                            );
-                            Err(())
-                        }
-                        Err(e) => {
-                            shard_warn!(
-                                self_id,
-                                "Broadcast to shard {} failed for event {}: timeout waiting for response after {:?}, elapsed: {:?}",
-                                shard_id, event_type,
-                                BROADCAST_TIMEOUT,
-                                e
-                            );
-                            Err(())
-                        }
-                    }
-                }
-            })
-            .collect::<Vec<_>>();
-
-        if futures.is_empty() {
-            return Ok(());
-        }
-
-        let results = join_all(futures).await;
-        let has_failures = results.iter().any(|r| r.is_err());
-
-        if has_failures {
-            Err(IggyError::ShardCommunicationError)
-        } else {
-            Ok(())
-        }
-    }
-
-    fn find_shard(&self, namespace: &IggyNamespace) -> Option<&Shard> {
-        self.shards_table.get(namespace).map(|shard_info| {
-            self.shards
-                .iter()
-                .find(|shard| shard.id == shard_info.id)
-                .expect("Shard not found in the shards table.")
-        })
-    }
-
-    pub fn find_shard_table_record(&self, namespace: &IggyNamespace) -> Option<ShardInfo> {
-        self.shards_table.get(namespace).map(|entry| *entry)
-    }
-
-    pub fn remove_shard_table_record(&self, namespace: &IggyNamespace) -> ShardInfo {
-        self.shards_table
-            .remove(namespace)
-            .map(|(_, shard_info)| shard_info)
-            .expect("remove_shard_table_record: namespace not found")
-    }
-
-    pub fn remove_shard_table_records(
-        &self,
-        namespaces: &[IggyNamespace],
-    ) -> Vec<(IggyNamespace, ShardInfo)> {
-        namespaces
-            .iter()
-            .map(|ns| {
-                let (ns, shard_info) = self.shards_table.remove(ns).unwrap();
-                (ns, shard_info)
-            })
-            .collect()
-    }
-
-    pub fn insert_shard_table_record(&self, ns: IggyNamespace, shard_info: ShardInfo) {
-        self.shards_table.insert(ns, shard_info);
-    }
-
-    pub fn get_current_shard_namespaces(&self) -> Vec<IggyNamespace> {
-        self.shards_table
-            .iter()
-            .filter_map(|entry| {
-                let (ns, shard_info) = entry.pair();
-                if shard_info.id == self.id {
-                    Some(*ns)
-                } else {
-                    None
-                }
-            })
-            .collect()
-    }
-
-    pub fn insert_shard_table_records(
-        &self,
-        records: impl IntoIterator<Item = (IggyNamespace, ShardInfo)>,
-    ) {
-        for (ns, shard_info) in records {
-            self.shards_table.insert(ns, shard_info);
-        }
+        handlers::handle_event(self, event).await
     }
 
     pub fn ensure_authenticated(&self, session: &Session) -> Result<(), IggyError> {
@@ -1034,10 +311,4 @@ impl IggyShard {
             Err(IggyError::Unauthenticated)
         }
     }
-}
-
-pub fn calculate_shard_assignment(ns: &IggyNamespace, upperbound: u32) -> u16 {
-    let mut hasher = Murmur3Hasher::default();
-    hasher.write_u64(ns.inner());
-    (hasher.finish32() % upperbound) as u16
 }

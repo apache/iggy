@@ -16,8 +16,28 @@
  * under the License.
  */
 
-pub mod connector;
-pub mod event;
-pub mod frame;
-pub mod id;
-pub mod message;
+use std::ops::Deref;
+
+// TODO: Maybe pad to cache line size?
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct ShardId {
+    id: u16,
+}
+
+impl ShardId {
+    pub fn new(id: u16) -> Self {
+        Self { id }
+    }
+
+    pub fn id(&self) -> u16 {
+        self.id
+    }
+}
+
+impl Deref for ShardId {
+    type Target = u16;
+
+    fn deref(&self) -> &Self::Target {
+        &self.id
+    }
+}

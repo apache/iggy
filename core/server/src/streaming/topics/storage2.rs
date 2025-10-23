@@ -5,13 +5,11 @@ use std::path::Path;
 use crate::{
     configs::system::SystemConfig,
     io::fs_utils::remove_dir_all,
-    shard_info,
     slab::traits_ext::{Delete, EntityComponentSystem, EntityMarker, IntoComponents},
     streaming::{partitions::storage2::delete_partitions_from_disk, topics::topic2},
 };
 
 pub async fn create_topic_file_hierarchy(
-    shard_id: u16,
     stream_id: usize,
     topic_id: usize,
     config: &SystemConfig,
@@ -23,8 +21,7 @@ pub async fn create_topic_file_hierarchy(
             topic_id, stream_id, topic_path,
         ));
     }
-    shard_info!(
-        shard_id,
+    tracing::info!(
         "Saved topic with ID: {}. for stream with ID: {}",
         topic_id,
         stream_id
@@ -39,7 +36,6 @@ pub async fn create_topic_file_hierarchy(
 }
 
 pub async fn delete_topic_from_disk(
-    shard_id: u16,
     stream_id: usize,
     topic: &mut topic2::Topic,
     config: &SystemConfig,
@@ -62,7 +58,7 @@ pub async fn delete_topic_from_disk(
         let partition = partitions.delete(id);
         let (root, stats, _, _, _, _, _log) = partition.into_components();
         let partition_id = root.id();
-        delete_partitions_from_disk(shard_id, stream_id, topic_id, partition_id, config).await?;
+        delete_partitions_from_disk(stream_id, topic_id, partition_id, config).await?;
         messages_count += stats.messages_count_inconsistent();
         size_bytes += stats.size_bytes_inconsistent();
         segments_count += stats.segments_count_inconsistent();
@@ -71,8 +67,7 @@ pub async fn delete_topic_from_disk(
     remove_dir_all(&topic_path).await.map_err(|_| {
         IggyError::CannotDeleteTopicDirectory(topic_id as u32, stream_id as u32, topic_path)
     })?;
-    shard_info!(
-        shard_id,
+    tracing::info!(
         "Deleted topic files for topic with ID: {} in stream with ID: {}.",
         topic_id,
         stream_id
