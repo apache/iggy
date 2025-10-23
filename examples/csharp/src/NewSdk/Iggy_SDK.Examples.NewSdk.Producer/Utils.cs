@@ -32,7 +32,7 @@ public static class Utils
     {
         var interval = TimeSpan.FromMilliseconds(500);
         logger.LogInformation(
-            "Messages will be sent to stream: {StreamId}, topic: {TopicId}} with interval {Interval}.",
+            "Messages will be sent to stream: {StreamId}, topic: {TopicId} with interval {Interval}",
             publisher.StreamId,
             publisher.TopicId,
             interval
