@@ -30,6 +30,7 @@ pub mod stream_size_validation_scenario;
 pub mod system_scenario;
 pub mod tcp_tls_scenario;
 pub mod user_scenario;
+pub mod websocket_tls_scenario;
 
 use iggy::prelude::*;
 use integration::test_server::{ClientFactory, delete_user};

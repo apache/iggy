@@ -114,6 +114,30 @@ impl WebSocketClientConfigBuilder {
         self
     }
 
+    /// Sets whether to use TLS when connecting to the server.
+    pub fn with_tls_enabled(mut self, tls_enabled: bool) -> Self {
+        self.config.tls_enabled = tls_enabled;
+        self
+    }
+
+    /// Sets the domain to use for TLS when connecting to the server.
+    pub fn with_tls_domain(mut self, tls_domain: String) -> Self {
+        self.config.tls_domain = tls_domain;
+        self
+    }
+
+    /// Sets the path to the CA file for TLS.
+    pub fn with_tls_ca_file(mut self, tls_ca_file: String) -> Self {
+        self.config.tls_ca_file = Some(tls_ca_file);
+        self
+    }
+
+    /// Sets whether to validate the TLS certificate.
+    pub fn with_tls_validate_certificate(mut self, tls_validate_certificate: bool) -> Self {
+        self.config.tls_validate_certificate = tls_validate_certificate;
+        self
+    }
+
     /// Builds the WebSocket client configuration.
     pub fn build(self) -> Result<WebSocketClientConfig, IggyError> {
         let addr = self.config.server_address.trim();
