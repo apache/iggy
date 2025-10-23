@@ -64,9 +64,8 @@ runs:
         dotnet build foreign/csharp/Iggy_SDK.sln --no-restore /p:EnforceCodeStyleInBuild=true /p:TreatWarningsAsErrors=false
         dotnet build examples/csharp/Iggy_SDK.Examples.sln --no-restore /p:EnforceCodeStyleInBuild=true /p:TreatWarningsAsErrors=false
 
-        # TODO: make format check blocking (requires dotnet-format tool)
-        dotnet format examples/csharp/Iggy_SDK.Examples.sln --verify-no-changes --verbosity diagnostic || true
-        dotnet format foreign/csharp/Iggy_SDK.sln --verify-no-changes --verbosity diagnostic || true
+        dotnet format examples/csharp/Iggy_SDK.Examples.sln --verify-no-changes --verbosity diagnostic
+        dotnet format foreign/csharp/Iggy_SDK.sln --verify-no-changes --verbosity diagnostic
 
       shell: bash
 

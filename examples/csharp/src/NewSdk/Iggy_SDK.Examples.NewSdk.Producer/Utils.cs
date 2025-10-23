@@ -26,13 +26,13 @@ namespace Iggy_SDK.Examples.NewSdk.Producer;
 
 public static class Utils
 {
-    private const uint BATCHES_LIMIT = 5;
+    private const uint BatchesLimit = 5;
 
     public static async Task ProduceMessages(IggyPublisher publisher, ILogger logger)
     {
         var interval = TimeSpan.FromMilliseconds(500);
         logger.LogInformation(
-            "Messages will be sent to stream: {StreamId}, topic: {TopicId}} with interval {Interval}.",
+            "Messages will be sent to stream: {StreamId}, topic: {TopicId} with interval {Interval}",
             publisher.StreamId,
             publisher.TopicId,
             interval
@@ -44,10 +44,10 @@ public static class Utils
 
         while (true)
         {
-            if (sentBatches == BATCHES_LIMIT)
+            if (sentBatches == BatchesLimit)
             {
                 logger.LogInformation(
-                    "Sent {SentBatches} batches of messages, exiting.",
+                    "Sent {SentBatches} batches of messages, exiting",
                     sentBatches
                 );
                 return;
@@ -74,7 +74,7 @@ public static class Utils
             await publisher.SendMessages(messages.ToArray());
 
             sentBatches++;
-            logger.LogInformation("Sent messages: {Messages}.", serializableMessages);
+            logger.LogInformation("Sent messages: {Messages}", serializableMessages);
 
             await Task.Delay(interval);
         }
