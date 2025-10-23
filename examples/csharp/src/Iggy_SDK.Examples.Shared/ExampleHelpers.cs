@@ -30,11 +30,8 @@ public static class ExampleHelpers
         CancellationToken token = default
     )
     {
-        try
-        {
-            await client.GetStreamByIdAsync(streamId, token);
-        }
-        catch (InvalidResponseException)
+        var stream = await client.GetStreamByIdAsync(streamId, token);
+        if(stream == null)
         {
             await client.CreateStreamAsync(streamName, token: token);
         }
@@ -49,11 +46,8 @@ public static class ExampleHelpers
         CancellationToken cancellationToken = default
     )
     {
-        try
-        {
-            await client.GetTopicByIdAsync(streamId, topicId, cancellationToken);
-        }
-        catch (InvalidResponseException)
+        var topic = await client.GetTopicByIdAsync(streamId, topicId, cancellationToken);
+        if(topic == null)
         {
             await client.CreateTopicAsync(
                 streamId,

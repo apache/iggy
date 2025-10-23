@@ -28,7 +28,7 @@ public interface IIggyConsumerGroup
         CancellationToken token = default);
 
     Task<ConsumerGroupResponse?> CreateConsumerGroupAsync(Identifier streamId, Identifier topicId, string name,
-        uint? groupId, CancellationToken token = default);
+        uint? groupId = null, CancellationToken token = default);
 
     Task DeleteConsumerGroupAsync(Identifier streamId, Identifier topicId, Identifier groupId,
         CancellationToken token = default);

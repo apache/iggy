@@ -15,18 +15,14 @@
 // // specific language governing permissions and limitations
 // // under the License.
 
-using System.Text;
 using Apache.Iggy.Contracts;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
 using Apache.Iggy.Headers;
 using Apache.Iggy.Kinds;
-using Apache.Iggy.Messages;
 using Apache.Iggy.Tests.Integrations.Fixtures;
 using Apache.Iggy.Tests.Integrations.Helpers;
-using Apache.Iggy.Tests.Integrations.Models;
 using Shouldly;
-using Partitioning = Apache.Iggy.Kinds.Partitioning;
 
 namespace Apache.Iggy.Tests.Integrations;
 
@@ -37,59 +33,6 @@ public class FetchMessagesTests
 
 
     [Test]
-    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
-    public async Task PollMessagesTMessage_WithNoHeaders_Should_PollMessages_Successfully(Protocol protocol)
-    {
-        PolledMessages<DummyMessage> response = await Fixture.Clients[protocol].PollMessagesAsync(
-            new MessageFetchRequest
-            {
-                Count = 10,
-                AutoCommit = true,
-                Consumer = Consumer.New(1),
-                PartitionId = 1,
-                PollingStrategy = PollingStrategy.Next(),
-                StreamId = Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-                TopicId = Identifier.String(Fixture.TopicDummyRequest.Name)
-            }, DummyMessage.DeserializeDummyMessage);
-
-        response.Messages.Count.ShouldBe(10);
-        response.PartitionId.ShouldBe(1);
-        response.CurrentOffset.ShouldBe(19u);
-        uint offset = 0;
-        foreach (MessageResponse<DummyMessage> responseMessage in response.Messages)
-        {
-            responseMessage.UserHeaders.ShouldBeNull();
-            responseMessage.Message.Text.ShouldNotBeNullOrEmpty();
-            responseMessage.Message.Text.ShouldContain("Dummy message");
-            responseMessage.Header.Checksum.ShouldNotBe(0u);
-            responseMessage.Header.Id.ShouldNotBe(0u);
-            responseMessage.Header.Offset.ShouldBe(offset++);
-            responseMessage.Header.PayloadLength.ShouldNotBe(0);
-            responseMessage.Header.UserHeadersLength.ShouldBe(0);
-        }
-    }
-
-    [Test]
-    [DependsOn(nameof(PollMessagesTMessage_WithNoHeaders_Should_PollMessages_Successfully))]
-    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
-    public async Task PollMessagesTMessage_Should_Throw_InvalidResponse(Protocol protocol)
-    {
-        var invalidFetchRequest = new MessageFetchRequest
-        {
-            Count = 10,
-            AutoCommit = true,
-            Consumer = Consumer.New(1),
-            PartitionId = 1,
-            PollingStrategy = PollingStrategy.Next(),
-            StreamId = Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-            TopicId = Identifier.Numeric(2137)
-        };
-        await Should.ThrowAsync<InvalidResponseException>(() =>
-            Fixture.Clients[protocol].PollMessagesAsync(invalidFetchRequest, DummyMessage.DeserializeDummyMessage));
-    }
-
-    [Test]
-    [DependsOn(nameof(PollMessagesTMessage_Should_Throw_InvalidResponse))]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task PollMessages_WithNoHeaders_Should_PollMessages_Successfully(Protocol protocol)
     {
@@ -119,7 +62,7 @@ public class FetchMessagesTests
     [Test]
     [DependsOn(nameof(PollMessages_WithNoHeaders_Should_PollMessages_Successfully))]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
-    public async Task PollMessages_Should_Throw_InvalidResponse(Protocol protocol)
+    public async Task PollMessages_InvalidTopic_Should_Throw_InvalidResponse(Protocol protocol)
     {
         var invalidFetchRequest = new MessageFetchRequest
         {
@@ -137,7 +80,7 @@ public class FetchMessagesTests
     }
 
     [Test]
-    [DependsOn(nameof(PollMessages_Should_Throw_InvalidResponse))]
+    [DependsOn(nameof(PollMessages_InvalidTopic_Should_Throw_InvalidResponse))]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task PollMessages_WithHeaders_Should_PollMessages_Successfully(Protocol protocol)
     {
@@ -149,7 +92,7 @@ public class FetchMessagesTests
             PartitionId = 1,
             PollingStrategy = PollingStrategy.Next(),
             StreamId = Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-            TopicId = Identifier.String(Fixture.HeadersTopicRequest.Name)
+            TopicId = Identifier.String(Fixture.TopicHeadersRequest.Name)
         };
 
 
@@ -164,69 +107,5 @@ public class FetchMessagesTests
             responseMessage.UserHeaders[HeaderKey.New("header1")].ToString().ShouldBe("value1");
             responseMessage.UserHeaders[HeaderKey.New("header2")].ToInt32().ShouldBeGreaterThan(0);
         }
-    }
-
-    [Test]
-    [DependsOn(nameof(PollMessages_WithHeaders_Should_PollMessages_Successfully))]
-    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
-    public async Task PollMessagesTMessage_WithHeaders_Should_PollMessages_Successfully(Protocol protocol)
-    {
-        var headersMessageFetchRequest = new MessageFetchRequest
-        {
-            Count = 10,
-            AutoCommit = true,
-            Consumer = Consumer.New(1),
-            PartitionId = 1,
-            PollingStrategy = PollingStrategy.Next(),
-            StreamId = Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-            TopicId = Identifier.String(Fixture.TopicDummyHeaderRequest.Name)
-        };
-
-        PolledMessages<DummyMessage> response = await Fixture.Clients[protocol]
-            .PollMessagesAsync(headersMessageFetchRequest, DummyMessage.DeserializeDummyMessage);
-        response.Messages.Count.ShouldBe(10);
-        response.PartitionId.ShouldBe(1);
-        response.CurrentOffset.ShouldBe(19u);
-        foreach (MessageResponse<DummyMessage> responseMessage in response.Messages)
-        {
-            responseMessage.UserHeaders.ShouldNotBeNull();
-            responseMessage.UserHeaders.Count.ShouldBe(2);
-            responseMessage.UserHeaders[HeaderKey.New("header1")].ToString().ShouldBe("value1");
-            responseMessage.UserHeaders[HeaderKey.New("header2")].ToInt32().ShouldBeGreaterThan(0);
-        }
-    }
-
-    [Test]
-    [DependsOn(nameof(PollMessagesTMessage_WithHeaders_Should_PollMessages_Successfully))]
-    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
-    public async Task PollMessagesMessage_WithEncryptor_Should_PollMessages_Successfully(Protocol protocol)
-    {
-        await Fixture.Clients[protocol].SendMessagesAsync(Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-            Identifier.String(Fixture.TopicRequest.Name), Partitioning.None(),
-            [new Message(Guid.NewGuid(), "Test message"u8.ToArray())], bytes =>
-            {
-                Array.Reverse(bytes);
-                return bytes;
-            });
-
-        var messageFetchRequest = new MessageFetchRequest
-        {
-            Count = 1,
-            AutoCommit = true,
-            Consumer = Consumer.New(1),
-            PartitionId = 1,
-            PollingStrategy = PollingStrategy.Last(),
-            StreamId = Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-            TopicId = Identifier.String(Fixture.TopicRequest.Name)
-        };
-
-        var response = await Fixture.Clients[protocol].PollMessagesAsync(messageFetchRequest, bytes =>
-        {
-            Array.Reverse(bytes);
-            return bytes;
-        }, CancellationToken.None);
-
-        response.Messages.Count.ShouldBe(1);
-        Encoding.UTF8.GetString(response.Messages[0].Payload).ShouldBe("Test message");
     }
 }

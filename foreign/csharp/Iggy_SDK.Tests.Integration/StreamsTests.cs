@@ -109,33 +109,22 @@ public class StreamsTests
             topicRequest2.Name, topicRequest2.PartitionsCount, messageExpiry: topicRequest2.MessageExpiry,
             topicId: topicRequest2.TopicId);
 
+        await Fixture.Clients[protocol].SendMessagesAsync(Identifier.Numeric(StreamId.GetWithProtocol(protocol)),
+            Identifier.String(topicRequest1.Name), Partitioning.None(),
+            [
+                new Message(Guid.NewGuid(), "Test message 1"u8.ToArray()),
+                new Message(Guid.NewGuid(), "Test message 2"u8.ToArray()),
+                new Message(Guid.NewGuid(), "Test message 3"u8.ToArray())
+            ]);
 
-        await Fixture.Clients[protocol].SendMessagesAsync(new MessageSendRequest
-        {
-            Partitioning = Partitioning.None(),
-            StreamId = Identifier.Numeric(StreamId.GetWithProtocol(protocol)),
-            TopicId = Identifier.String(topicRequest1.Name),
-            Messages = new List<Message>
-            {
-                new(Guid.NewGuid(), "Test message 1"u8.ToArray()),
-                new(Guid.NewGuid(), "Test message 2"u8.ToArray()),
-                new(Guid.NewGuid(), "Test message 3"u8.ToArray())
-            }
-        });
 
-        await Fixture.Clients[protocol].SendMessagesAsync(new MessageSendRequest
-        {
-            Partitioning = Partitioning.None(),
-            StreamId = Identifier.Numeric(StreamId.GetWithProtocol(protocol)),
-            TopicId = Identifier.String(topicRequest2.Name),
-            Messages = new List<Message>
-            {
-                new(Guid.NewGuid(), "Test message 4"u8.ToArray()),
-                new(Guid.NewGuid(), "Test message 5"u8.ToArray()),
-                new(Guid.NewGuid(), "Test message 6"u8.ToArray()),
-                new(Guid.NewGuid(), "Test message 7"u8.ToArray())
-            }
-        });
+        await Fixture.Clients[protocol].SendMessagesAsync(Identifier.Numeric(StreamId.GetWithProtocol(protocol)),
+            Identifier.String(topicRequest2.Name), Partitioning.None(), [
+                new Message(Guid.NewGuid(), "Test message 4"u8.ToArray()),
+                new Message(Guid.NewGuid(), "Test message 5"u8.ToArray()),
+                new Message(Guid.NewGuid(), "Test message 6"u8.ToArray()),
+                new Message(Guid.NewGuid(), "Test message 7"u8.ToArray())
+            ]);
 
         var response = await Fixture.Clients[protocol]
             .GetStreamByIdAsync(Identifier.Numeric(StreamId.GetWithProtocol(protocol)));
@@ -220,8 +209,10 @@ public class StreamsTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task GetStreamById_AfterDelete_Should_Throw_InvalidResponse(Protocol protocol)
     {
-        await Should.ThrowAsync<InvalidResponseException>(() =>
-            Fixture.Clients[protocol].GetStreamByIdAsync(Identifier.Numeric(StreamId.GetWithProtocol(protocol))));
+        var stream = await Fixture.Clients[protocol]
+            .GetStreamByIdAsync(Identifier.Numeric(StreamId.GetWithProtocol(protocol)));
+
+        stream.ShouldBeNull();
     }
 
     [Test]

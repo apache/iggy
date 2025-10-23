@@ -15,28 +15,22 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using System.Buffers.Binary;
 using System.Net;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
-using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
-using System.Threading.Channels;
-using Apache.Iggy.Configuration;
 using Apache.Iggy.Contracts;
 using Apache.Iggy.Contracts.Auth;
 using Apache.Iggy.Contracts.Http;
 using Apache.Iggy.Contracts.Http.Auth;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
-using Apache.Iggy.Headers;
 using Apache.Iggy.Kinds;
 using Apache.Iggy.Messages;
-using Apache.Iggy.MessagesDispatcher;
 using Apache.Iggy.StringHandlers;
-using Microsoft.Extensions.Logging;
+using Partitioning = Apache.Iggy.Kinds.Partitioning;
 
 namespace Apache.Iggy.IggyClient.Implementations;
 
@@ -44,26 +38,16 @@ public class HttpMessageStream : IIggyClient
 {
     private const string Context = "csharp-sdk";
 
-    private readonly Channel<MessageSendRequest>? _channel;
     private readonly HttpClient _httpClient;
 
     //TODO - create mechanism for refreshing jwt token
     //TODO - replace the HttpClient with IHttpClientFactory, when implementing support for ASP.NET Core DI
     //TODO - the error handling pattern is pretty ugly, look into moving it into an extension method
     private readonly JsonSerializerOptions _jsonSerializerOptions;
-    private readonly ILogger<HttpMessageStream> _logger;
-    private readonly IMessageInvoker? _messageInvoker;
-    private readonly MessagePollingSettings _messagePollingSettings;
 
-    internal HttpMessageStream(HttpClient httpClient, Channel<MessageSendRequest>? channel,
-        MessagePollingSettings messagePollingSettings, ILoggerFactory loggerFactory,
-        IMessageInvoker? messageInvoker = null)
+    internal HttpMessageStream(HttpClient httpClient)
     {
         _httpClient = httpClient;
-        _channel = channel;
-        _messagePollingSettings = messagePollingSettings;
-        _messageInvoker = messageInvoker;
-        _logger = loggerFactory.CreateLogger<HttpMessageStream>();
 
         _jsonSerializerOptions = new JsonSerializerOptions
         {
@@ -244,69 +228,28 @@ public class HttpMessageStream : IIggyClient
         return null;
     }
 
-    public async Task SendMessagesAsync(MessageSendRequest request,
-        Func<byte[], byte[]>? encryptor = null,
+    public async Task SendMessagesAsync(Identifier streamId, Identifier topicId, Partitioning partitioning,
+        IList<Message> messages,
         CancellationToken token = default)
     {
-        if (encryptor is not null)
+        var request = new MessageSendRequest
         {
-            for (var i = 0; i < request.Messages.Count; i++)
-            {
-                request.Messages[i] = request.Messages[i] with { Payload = encryptor(request.Messages[i].Payload) };
-            }
-        }
-
-        if (_messageInvoker is not null)
-        {
-            await _messageInvoker.SendMessagesAsync(request, token);
-            return;
-        }
-
-        await _channel!.Writer.WriteAsync(request, token);
-    }
-
-    public async Task SendMessagesAsync<TMessage>(MessageSendRequest<TMessage> request,
-        Func<TMessage, byte[]> serializer,
-        Func<byte[], byte[]>? encryptor = null, Dictionary<HeaderKey, HeaderValue>? headers = null,
-        CancellationToken token = default)
-    {
-        IList<TMessage> messages = request.Messages;
-        //TODO - maybe get rid of this closure ?
-        var sendRequest = new MessageSendRequest
-        {
-            StreamId = request.StreamId,
-            TopicId = request.TopicId,
-            Partitioning = request.Partitioning,
-            Messages = messages.Select(message =>
-            {
-                return new Message
-                {
-                    // TODO: message id
-                    Header = new MessageHeader { Id = 0 },
-                    UserHeaders = headers,
-                    Payload = encryptor is not null ? encryptor(serializer(message)) : serializer(message)
-                };
-            }).ToArray()
+            StreamId = streamId,
+            TopicId = topicId,
+            Partitioning = partitioning,
+            Messages = messages
         };
+        var json = JsonSerializer.Serialize(request, _jsonSerializerOptions);
+        var data = new StringContent(json, Encoding.UTF8, "application/json");
 
-        if (_messageInvoker is not null)
+        var response = await _httpClient.PostAsync($"/streams/{request.StreamId}/topics/{request.TopicId}/messages",
+            data,
+            token);
+
+        if (!response.IsSuccessStatusCode)
         {
-            try
-            {
-                await _messageInvoker.SendMessagesAsync(sendRequest, token);
-            }
-            catch
-            {
-                var partId = BinaryPrimitives.ReadInt32LittleEndian(sendRequest.Partitioning.Value);
-                _logger.LogError(
-                    "Error encountered while sending messages - Stream ID:{StreamId}, Topic ID:{TopicId}, Partition ID: {PartitionId}",
-                    sendRequest.StreamId, sendRequest.TopicId, partId);
-            }
-
-            return;
+            await HandleResponseAsync(response);
         }
-
-        await _channel!.Writer.WriteAsync(sendRequest, token);
     }
 
     public async Task FlushUnsavedBufferAsync(Identifier streamId, Identifier topicId, uint partitionId, bool fsync,
@@ -318,135 +261,29 @@ public class HttpMessageStream : IIggyClient
 
         if (!response.IsSuccessStatusCode)
         {
-            await HandleResponseAsync(response);
+            await HandleResponseAsync(response, true);
         }
     }
 
-    public async Task<PolledMessages> PollMessagesAsync(MessageFetchRequest request,
-        Func<byte[], byte[]>? decryptor = null,
-        CancellationToken token = default)
+    public async Task<PolledMessages> PollMessagesAsync(Identifier streamId, Identifier topicId, uint? partitionId,
+        Consumer consumer,
+        PollingStrategy pollingStrategy, uint count, bool autoCommit, CancellationToken token = default)
     {
-        var url = CreateUrl(
-            $"/streams/{request.StreamId}/topics/{request.TopicId}/messages?consumer_id={request.Consumer.Id}" +
-            $"&partition_id={request.PartitionId}&kind={request.PollingStrategy.Kind}&value={request.PollingStrategy.Value}&count={request.Count}&auto_commit={request.AutoCommit}");
+        var partitionIdParam = partitionId.HasValue ? $"&partition_id={partitionId.Value}" : string.Empty;
+        var url = CreateUrl($"/streams/{streamId}/topics/{topicId}/messages?consumer_id={consumer.Id}" +
+                            $"{partitionIdParam}&kind={pollingStrategy.Kind}&value={pollingStrategy.Value}&count={count}&auto_commit={autoCommit}");
 
         var response = await _httpClient.GetAsync(url, token);
         if (response.IsSuccessStatusCode)
         {
             var pollMessages = await response.Content.ReadFromJsonAsync<PolledMessages>(_jsonSerializerOptions, token)
                                ?? PolledMessages.Empty;
-
-            if (decryptor is null)
-            {
-                return pollMessages;
-            }
-
-            foreach (var message in pollMessages.Messages)
-            {
-                message.Payload = decryptor(message.Payload);
-            }
 
             return pollMessages;
         }
 
-        await HandleResponseAsync(response);
+        await HandleResponseAsync(response, true);
         return PolledMessages.Empty;
-    }
-
-    public async Task<PolledMessages<TMessage>> PollMessagesAsync<TMessage>(MessageFetchRequest request,
-        Func<byte[], TMessage> deserializer, Func<byte[], byte[]>? decryptor = null,
-        CancellationToken token = default)
-    {
-        var url = CreateUrl(
-            $"/streams/{request.StreamId}/topics/{request.TopicId}/messages?consumer_id={request.Consumer.Id}" +
-            $"&partition_id={request.PartitionId}&kind={request.PollingStrategy.Kind}&value={request.PollingStrategy.Value}&count={request.Count}&auto_commit={request.AutoCommit}");
-
-        var response = await _httpClient.GetAsync(url, token);
-        if (response.IsSuccessStatusCode)
-        {
-            var pollMessages = await response.Content.ReadFromJsonAsync<PolledMessages>(_jsonSerializerOptions, token)
-                               ?? PolledMessages.Empty;
-
-            var messages = new List<MessageResponse<TMessage>>();
-            foreach (var message in pollMessages.Messages)
-            {
-                if (decryptor is not null)
-                {
-                    message.Payload = decryptor(message.Payload);
-                }
-
-                messages.Add(new MessageResponse<TMessage>
-                {
-                    Message = deserializer(message.Payload),
-                    Header = message.Header,
-                    UserHeaders = message.UserHeaders
-                });
-            }
-
-            return new PolledMessages<TMessage>
-            {
-                PartitionId = pollMessages.PartitionId,
-                CurrentOffset = pollMessages.CurrentOffset,
-                Messages = messages
-            };
-        }
-
-        await HandleResponseAsync(response);
-        return PolledMessages<TMessage>.Empty;
-    }
-
-    public async IAsyncEnumerable<MessageResponse<TMessage>> PollMessagesAsync<TMessage>(PollMessagesRequest request,
-        Func<byte[], TMessage> deserializer, Func<byte[], byte[]>? decryptor = null,
-        [EnumeratorCancellation] CancellationToken token = default)
-    {
-        var channel = Channel.CreateUnbounded<MessageResponse<TMessage>>();
-        var autoCommit = _messagePollingSettings.StoreOffsetStrategy switch
-        {
-            StoreOffset.Never => false,
-            StoreOffset.WhenMessagesAreReceived => true,
-            StoreOffset.AfterProcessingEachMessage => false,
-            _ => throw new ArgumentOutOfRangeException()
-        };
-        var fetchRequest = new MessageFetchRequest
-        {
-            Consumer = request.Consumer,
-            StreamId = request.StreamId,
-            TopicId = request.TopicId,
-            AutoCommit = autoCommit,
-            Count = request.Count,
-            PartitionId = request.PartitionId,
-            PollingStrategy = request.PollingStrategy
-        };
-
-
-        _ = StartPollingMessagesAsync(fetchRequest, deserializer, _messagePollingSettings.Interval, channel.Writer,
-            decryptor, token);
-        await foreach (MessageResponse<TMessage> messageResponse in channel.Reader.ReadAllAsync(token))
-        {
-            yield return messageResponse;
-
-            var currentOffset = messageResponse.Header.Offset;
-            if (_messagePollingSettings.StoreOffsetStrategy is StoreOffset.AfterProcessingEachMessage)
-            {
-                try
-                {
-                    await StoreOffsetAsync(request.Consumer, request.StreamId, request.TopicId, currentOffset,
-                        request.PartitionId, token);
-                }
-                catch
-                {
-                    _logger.LogError(
-                        "Error encountered while saving offset information - Offset: {Offset}, Stream ID: {StreamId}, Topic ID: {TopicId}, Partition ID: {PartitionId}",
-                        currentOffset, request.StreamId, request.TopicId, request.PartitionId);
-                }
-            }
-
-            if (request.PollingStrategy.Kind is MessagePolling.Offset)
-            {
-                //TODO - check with profiler whether this doesn't cause a lot of allocations
-                request.PollingStrategy = PollingStrategy.Offset(currentOffset + 1);
-            }
-        }
     }
 
     public async Task StoreOffsetAsync(Consumer consumer, Identifier streamId, Identifier topicId, ulong offset,
@@ -467,8 +304,9 @@ public class HttpMessageStream : IIggyClient
     public async Task<OffsetResponse?> GetOffsetAsync(Consumer consumer, Identifier streamId, Identifier topicId,
         uint? partitionId, CancellationToken token = default)
     {
+        var partitionIdParam = partitionId.HasValue ? $"&partition_id={partitionId.Value}" : string.Empty;
         var response = await _httpClient.GetAsync($"/streams/{streamId}/topics/{topicId}/" +
-                                                  $"consumer-offsets?consumer_id={consumer.Id}&partition_id={partitionId}",
+                                                  $"consumer-offsets?consumer_id={consumer.Id}{partitionIdParam}",
             token);
         if (response.IsSuccessStatusCode)
         {
@@ -482,8 +320,9 @@ public class HttpMessageStream : IIggyClient
     public async Task DeleteOffsetAsync(Consumer consumer, Identifier streamId, Identifier topicId, uint? partitionId,
         CancellationToken token = default)
     {
+        var partitionIdParam = partitionId.HasValue ? $"?partition_id={partitionId.Value}" : string.Empty;
         var response = await _httpClient.DeleteAsync(
-            $"/streams/{streamId}/topics/{topicId}/consumer-offsets/{consumer}?partition_id={partitionId}", token);
+            $"/streams/{streamId}/topics/{topicId}/consumer-offsets/{consumer}{partitionIdParam}", token);
         await HandleResponseAsync(response);
     }
 
@@ -728,7 +567,7 @@ public class HttpMessageStream : IIggyClient
 
     public async Task<AuthResponse?> LoginUser(string userName, string password, CancellationToken token = default)
     {
-        // TODO: get version 
+        // TODO: get version
         var json = JsonSerializer.Serialize(new LoginUserRequest(userName, password, "", Context),
             _jsonSerializerOptions);
 
@@ -834,42 +673,16 @@ public class HttpMessageStream : IIggyClient
         return null;
     }
 
-    private async Task StartPollingMessagesAsync<TMessage>(MessageFetchRequest request,
-        Func<byte[], TMessage> deserializer, TimeSpan interval, ChannelWriter<MessageResponse<TMessage>> writer,
-        Func<byte[], byte[]>? decryptor = null,
-        CancellationToken token = default)
+    public void Dispose()
     {
-        var timer = new PeriodicTimer(interval);
-        while (await timer.WaitForNextTickAsync(token) || token.IsCancellationRequested)
-        {
-            try
-            {
-                PolledMessages<TMessage> fetchResponse
-                    = await PollMessagesAsync(request, deserializer, decryptor, token);
-                if (fetchResponse.Messages.Count == 0)
-                {
-                    continue;
-                }
-
-                foreach (MessageResponse<TMessage> messageResponse in fetchResponse.Messages)
-                {
-                    await writer.WriteAsync(messageResponse, token);
-                }
-            }
-            catch (Exception e)
-            {
-                _logger.LogError(e,
-                    "Error encountered while polling messages - Stream ID: {StreamId}, Topic ID: {TopicId}, Partition ID: {PartitionId}",
-                    request.StreamId, request.TopicId, request.PartitionId);
-            }
-        }
-
-        writer.Complete();
     }
 
-    private static async Task HandleResponseAsync(HttpResponseMessage response)
+    private static async Task HandleResponseAsync(HttpResponseMessage response, bool shouldThrowOnGetNotFound = false)
     {
-        if ((int)response.StatusCode > 300 && (int)response.StatusCode < 500)
+        if ((int)response.StatusCode > 300
+            && (int)response.StatusCode < 500
+            && !(response.RequestMessage!.Method == HttpMethod.Get && response.StatusCode == HttpStatusCode.NotFound &&
+                 !shouldThrowOnGetNotFound))
         {
             var err = await response.Content.ReadAsStringAsync();
             throw new InvalidResponseException(err);

@@ -17,6 +17,7 @@
 
 using Apache.Iggy;
 using Apache.Iggy.Benchmarks;
+using Apache.Iggy.Configuration;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Factory;
 using Apache.Iggy.IggyClient;
@@ -38,27 +39,22 @@ var loggerFactory = LoggerFactory.Create(builder =>
 
 for (var i = 0; i < producerCount; i++)
 {
-    var bus = MessageStreamFactory.CreateMessageStream(options =>
+    var bus = IggyClientFactory.CreateClient(new IggyClientConfigurator()
     {
-        options.BaseAdress = "127.0.0.1:8090";
-        options.Protocol = Protocol.Tcp;
-        options.MessageBatchingSettings = x =>
-        {
-            x.Enabled = false;
-            x.MaxMessagesPerBatch = 1000;
-            x.Interval = TimeSpan.Zero;
-        };
+        BaseAddress = "127.0.0.1:8090",
+        Protocol = Protocol.Tcp,
+        LoggerFactory = loggerFactory,
 #if OS_LINUX
-        options.ReceiveBufferSize = Int32.MaxValue;
-        options.SendBufferSize = Int32.MaxValue;
+        ReceiveBufferSize = Int32.MaxValue,
+        SendBufferSize = Int32.MaxValue,
 #elif OS_WINDOWS
-        options.ReceiveBufferSize = int.MaxValue;
-        options.SendBufferSize = int.MaxValue;
+        ReceiveBufferSize = int.MaxValue,
+        SendBufferSize = int.MaxValue,
 #elif OS_MAC
-		options.ReceiveBufferSize = 7280*1024;
-		options.SendBufferSize = 7280*1024;
+		ReceiveBufferSize = 7280*1024,
+		SendBufferSize = 7280*1024,
 #endif
-    }, loggerFactory);
+    });
 
     await bus.LoginUser("iggy", "iggy");
     clients[i] = bus;

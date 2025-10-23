@@ -16,6 +16,7 @@
 // // under the License.
 
 using System.Text;
+using Apache.Iggy.Configuration;
 using Apache.Iggy.Contracts;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Factory;
@@ -42,12 +43,11 @@ public class BasicMessagingOperationsSteps
     [Given(@"I have a running Iggy server")]
     public async Task GivenIHaveARunningIggyServer()
     {
-        _context.IggyClient = MessageStreamFactory.CreateMessageStream(configurator =>
+        _context.IggyClient = IggyClientFactory.CreateClient(new IggyClientConfigurator()
         {
-            configurator.BaseAdress = _context.TcpUrl;
-            configurator.Protocol = Protocol.Tcp;
-            configurator.MessageBatchingSettings = settings => { settings.Enabled = false; };
-        }, NullLoggerFactory.Instance);
+            BaseAddress = _context.TcpUrl,
+            Protocol = Protocol.Tcp
+        });
 
         await _context.IggyClient.PingAsync();
     }
@@ -127,17 +127,12 @@ public class BasicMessagingOperationsSteps
     public async Task WhenISendMessagesToStreamTopicPartition(int messageCount, int streamId, int topicId,
         int partitionId)
     {
-        List<Message> messages = Enumerable.Range(1, messageCount)
+        Message[] messages = Enumerable.Range(1, messageCount)
             .Select(i => new Message(1, Encoding.UTF8.GetBytes($"Test message {i}")))
-            .ToList();
+            .ToArray();
 
-        await _context.IggyClient.SendMessagesAsync(new MessageSendRequest
-        {
-            StreamId = Identifier.Numeric(streamId),
-            TopicId = Identifier.Numeric(topicId),
-            Partitioning = Partitioning.PartitionId(partitionId),
-            Messages = messages
-        });
+        await _context.IggyClient.SendMessagesAsync(Identifier.Numeric(streamId), Identifier.Numeric(topicId),
+            Partitioning.PartitionId(partitionId), messages);
 
         _context.LastSendMessage = messages[^1];
     }
@@ -203,8 +198,8 @@ public class BasicMessagingOperationsSteps
         lastPolled.ShouldNotBeNull();
         _context.LastSendMessage.ShouldNotBeNull();
 
-        lastPolled.Header.Id.ShouldBe(_context.LastSendMessage.Value.Header.Id);
-        lastPolled.Payload.ShouldBe(_context.LastSendMessage.Value.Payload);
+        lastPolled.Header.Id.ShouldBe(_context.LastSendMessage.Header.Id);
+        lastPolled.Payload.ShouldBe(_context.LastSendMessage.Payload);
     }
 }
 

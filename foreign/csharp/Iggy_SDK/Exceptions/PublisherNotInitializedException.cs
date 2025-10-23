@@ -15,17 +15,21 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Apache.Iggy.Enums;
+namespace Apache.Iggy.Exceptions;
 
-namespace Apache.Iggy.Configuration;
-
-public interface IMessageStreamConfigurator
+public sealed class PublisherNotInitializedException : InvalidOperationException
 {
-    string BaseAdress { get; set; }
-    Protocol Protocol { get; set; }
-    Action<MessageBatchingSettings> MessageBatchingSettings { get; set; }
-    Action<MessagePollingSettings> MessagePollingSettings { get; set; }
-    Action<TlsSettings> TlsSettings { get; set; }
-    int ReceiveBufferSize { get; set; }
-    int SendBufferSize { get; set; }
+    public PublisherNotInitializedException()
+        : base("Publisher must be initialized before sending messages. Call InitAsync() first.")
+    {
+    }
+
+    public PublisherNotInitializedException(string message) : base(message)
+    {
+    }
+
+    public PublisherNotInitializedException(string message, Exception innerException)
+        : base(message, innerException)
+    {
+    }
 }

@@ -21,6 +21,7 @@ using Apache.Iggy.Factory;
 using Apache.Iggy.IggyClient;
 using DotNet.Testcontainers.Builders;
 using DotNet.Testcontainers.Containers;
+using DotNet.Testcontainers.Images;
 using Microsoft.Extensions.Logging.Abstractions;
 using TUnit.Core.Interfaces;
 using TUnit.Core.Logging;
@@ -35,6 +36,10 @@ public class IggyServerFixture : IAsyncInitializer, IAsyncDisposable
         .WithOutputConsumer(Consume.RedirectStdoutAndStderrToConsole())
         .WithWaitStrategy(Wait.ForUnixContainer().UntilInternalTcpPortIsAvailable(8090))
         .WithName($"{Guid.NewGuid()}")
+        .WithEnvironment("IGGY_ROOT_USERNAME", "iggy")
+        .WithEnvironment("IGGY_ROOT_PASSWORD", "iggy")
+        .WithEnvironment("IGGY_TCP_ADDRESS", "0.0.0.0:8090")
+        .WithEnvironment("IGGY_HTTP_ADDRESS", "0.0.0.0:3000")
         //.WithEnvironment("IGGY_SYSTEM_LOGGING_LEVEL", "trace")
         //.WithEnvironment("RUST_LOG", "trace")
         .WithCleanUp(true)
@@ -90,7 +95,6 @@ public class IggyServerFixture : IAsyncInitializer, IAsyncDisposable
         var client = CreateClient(Protocol.Tcp);
 
         await client.LoginUser(userName, password);
-        ;
 
         return client;
     }
@@ -125,13 +129,11 @@ public class IggyServerFixture : IAsyncInitializer, IAsyncDisposable
                 : $"http://{_iggyServerHost}:3000";
         }
 
-        return MessageStreamFactory.CreateMessageStream(options =>
+        return IggyClientFactory.CreateClient(new IggyClientConfigurator()
         {
-            options.BaseAdress = address;
-            options.Protocol = protocol;
-            options.MessageBatchingSettings = BatchingSettings;
-            options.MessagePollingSettings = PollingSettings;
-        }, NullLoggerFactory.Instance);
+            BaseAddress = address,
+            Protocol = protocol
+        });
     }
 
     public static IEnumerable<Func<Protocol>> ProtocolData()

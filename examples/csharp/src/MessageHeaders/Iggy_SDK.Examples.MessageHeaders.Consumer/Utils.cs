@@ -47,7 +47,7 @@ public static class Utils
         );
 
         var offset = 0ul;
-        var messagesPerBatch = 10;
+        uint messagesPerBatch = 10;
         var consumedBatches = 0;
         var consumer = Apache.Iggy.Kinds.Consumer.New(1);
         while (true)
@@ -133,14 +133,20 @@ public static class Utils
 
         argumentName = argumentName ?? throw new ArgumentNullException(argumentName);
         if (argumentName != "--tcp-server-address")
+        {
             throw new FormatException(
                 $"Invalid argument {argumentName}! Usage: --tcp-server-address <server-address>"
             );
+        }
+
         tcpServerAddr = tcpServerAddr ?? throw new ArgumentNullException(tcpServerAddr);
         if (!IPEndPoint.TryParse(tcpServerAddr, out _))
+        {
             throw new FormatException(
                 $"Invalid server address {tcpServerAddr}! Usage: --tcp-server-address <server-address>"
             );
+        }
+
         logger.LogInformation("Using server address: {TcpServerAddr}", tcpServerAddr);
         return tcpServerAddr;
     }

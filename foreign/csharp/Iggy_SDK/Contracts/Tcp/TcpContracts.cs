@@ -365,7 +365,7 @@ internal static class TcpContracts
 
     internal static void GetMessages(Span<byte> bytes, Consumer consumer, Identifier streamId, Identifier topicId,
         PollingStrategy pollingStrategy,
-        int count, bool autoCommit, uint? partitionId)
+        uint count, bool autoCommit, uint? partitionId)
     {
         bytes[0] = GetConsumerTypeByte(consumer.Type);
         bytes.WriteBytesFromIdentifier(consumer.Id, 1);
@@ -375,7 +375,7 @@ internal static class TcpContracts
         BinaryPrimitives.WriteUInt32LittleEndian(bytes[position..(position + 4)], partitionId ?? 0);
         bytes[position + 4] = GetPollingStrategyByte(pollingStrategy.Kind);
         BinaryPrimitives.WriteUInt64LittleEndian(bytes[(position + 5)..(position + 13)], pollingStrategy.Value);
-        BinaryPrimitives.WriteInt32LittleEndian(bytes[(position + 13)..(position + 17)], count);
+        BinaryPrimitives.WriteUInt32LittleEndian(bytes[(position + 13)..(position + 17)], count);
 
         bytes[position + 17] = autoCommit ? (byte)1 : (byte)0;
     }
@@ -805,7 +805,7 @@ internal static class TcpContracts
         bytes.WriteBytesFromIdentifier(consumer.Id, 1);
         var position = 1 + consumer.Id.Length + 2;
         bytes.WriteBytesFromStreamAndTopicIdentifiers(streamId, topicId, position);
-        position = 7 + 2 + streamId.Length + 2 + topicId.Length;
+        position += 2 + streamId.Length + 2 + topicId.Length;
         BinaryPrimitives.WriteUInt32LittleEndian(bytes[position..(position + 4)], partitionId ?? 0);
         return bytes.ToArray();
     }

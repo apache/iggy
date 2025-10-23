@@ -15,12 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Apache.Iggy.Contracts;
+namespace Apache.Iggy.Exceptions;
 
-namespace Apache.Iggy.MessagesDispatcher;
-
-internal interface IMessageInvoker
+public sealed class IggyInvalidStatusCodeException : Exception
 {
-    internal Task SendMessagesAsync(MessageSendRequest request,
-        CancellationToken token = default);
+    public int StatusCode { get; init; }
+
+    internal IggyInvalidStatusCodeException(int statusCode, string message) : base(message)
+    {
+        StatusCode = statusCode;
+    }
 }

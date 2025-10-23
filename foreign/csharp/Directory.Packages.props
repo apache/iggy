@@ -9,17 +9,17 @@
         <PackageVersion Include="FluentAssertions" Version="6.12.0" />
         <PackageVersion Include="Microsoft.Extensions.Logging" Version="8.0.1" />
         <PackageVersion Include="Microsoft.Extensions.Logging.Console" Version="8.0.1" />
-        <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
-        <PackageVersion Include="Microsoft.Testing.Extensions.CodeCoverage" Version="17.14.2" />
-        <PackageVersion Include="Microsoft.Testing.Extensions.TrxReport" Version="1.8.4" />
+        <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="18.0.0" />
+        <PackageVersion Include="Microsoft.Testing.Extensions.CodeCoverage" Version="18.0.4" />
+        <PackageVersion Include="Microsoft.Testing.Extensions.TrxReport" Version="1.9.0" />
         <PackageVersion Include="Moq" Version="4.20.72" />
-        <PackageVersion Include="Reqnroll.xUnit" Version="3.0.3" />
+        <PackageVersion Include="Reqnroll.xUnit" Version="3.1.2" />
         <PackageVersion Include="Shouldly" Version="4.3.0" />
         <PackageVersion Include="System.IO.Hashing" Version="8.0.0" />
         <PackageVersion Include="Testcontainers" Version="4.7.0" />
-        <PackageVersion Include="TUnit" Version="0.58.3" />
+        <PackageVersion Include="TUnit" Version="0.70.0" />
         <PackageVersion Include="xunit" Version="2.9.3" />
-        <PackageVersion Include="xunit.runner.visualstudio" Version="3.1.4">
+        <PackageVersion Include="xunit.runner.visualstudio" Version="3.1.5">
             <PrivateAssets>all</PrivateAssets>
             <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
         </PackageVersion>
