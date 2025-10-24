@@ -196,7 +196,7 @@ impl IggyShard {
             stream_id,
             topic_id,
             group_id,
-            topics::helpers::join_consumer_group(self.id, client_id),
+            topics::helpers::join_consumer_group(client_id),
         );
 
         // Update ClientManager state
@@ -256,7 +256,7 @@ impl IggyShard {
             stream_id,
             topic_id,
             group_id,
-            topics::helpers::leave_consumer_group(self.id, session.client_id),
+            topics::helpers::leave_consumer_group(session.client_id),
         );
 
         // Update ClientManager state

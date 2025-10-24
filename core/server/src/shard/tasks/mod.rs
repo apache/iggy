@@ -17,4 +17,5 @@
  */
 
 pub mod continuous;
+pub mod oneshot;
 pub mod periodic;

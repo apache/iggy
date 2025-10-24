@@ -14,7 +14,6 @@ pub trait MainOps {
 
     fn append_messages(
         &self,
-        shard_id: u16,
         config: &SystemConfig,
         registry: &Rc<TaskRegistry>,
         ns: &Self::Namespace,

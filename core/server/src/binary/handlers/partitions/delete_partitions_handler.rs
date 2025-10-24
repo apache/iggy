@@ -75,10 +75,7 @@ impl ServerCommandHandler for DeletePartitions {
         shard.streams2.with_topic_by_id_mut(
             &self.stream_id,
             &self.topic_id,
-            crate::streaming::topics::helpers::rebalance_consumer_group(
-                shard.id,
-                &remaining_partition_ids,
-            ),
+            crate::streaming::topics::helpers::rebalance_consumer_group(&remaining_partition_ids),
         );
 
         shard

@@ -44,7 +44,7 @@ impl IggyShard {
         }
         let stream = stream2::create_and_insert_stream_mem(&self.streams2, name);
         self.metrics.increment_streams(1);
-        create_stream_file_hierarchy(self.id, stream.id(), &self.config.system).await?;
+        create_stream_file_hierarchy(stream.id(), &self.config.system).await?;
         Ok(stream)
     }
 
@@ -169,7 +169,7 @@ impl IggyShard {
             self.remove_shard_table_record(&ns);
         }
 
-        delete_stream_from_disk(self.id, &mut stream, &self.config.system).await?;
+        delete_stream_from_disk(&mut stream, &self.config.system).await?;
         Ok(stream)
     }
 
@@ -224,8 +224,8 @@ impl IggyShard {
 mod tests {
     use super::*;
     use crate::configs::server::ServerConfig;
-    use crate::shard::ShardInfo;
     use crate::shard::transmission::connector::ShardConnector;
+    use crate::shard::transmission::id::ShardId;
     use crate::slab::streams::Streams;
     use crate::slab::users::Users;
     use crate::state::file::FileState;
@@ -249,7 +249,7 @@ mod tests {
         let streams = Streams::default();
         let shards_table = Box::new(DashMap::new());
         let shards_table = Box::leak(shards_table);
-        let shards_table: EternalPtr<DashMap<crate::shard::namespace::IggyNamespace, ShardInfo>> =
+        let shards_table: EternalPtr<DashMap<crate::shard::namespace::IggyNamespace, ShardId>> =
             shards_table.into();
         let users = Users::new();
         let state = FileState::new(

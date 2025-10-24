@@ -385,7 +385,7 @@ impl Logging {
     }
 
     fn get_log_format() -> Format {
-        Format::default().with_thread_ids(true)
+        Format::default().with_thread_names(true)
     }
 
     fn _install_log_rotation_handler(&self) {

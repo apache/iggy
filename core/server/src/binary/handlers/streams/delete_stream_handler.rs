@@ -22,7 +22,6 @@ use crate::binary::{handlers::streams::COMPONENT, sender::SenderKind};
 
 use crate::shard::IggyShard;
 use crate::shard::transmission::event::ShardEvent;
-use crate::shard_info;
 use crate::slab::traits_ext::EntityMarker;
 use crate::state::command::EntryCommand;
 use crate::streaming::session::Session;
@@ -31,6 +30,7 @@ use error_set::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::delete_stream::DeleteStream;
 use std::rc::Rc;
+use tracing::info;
 use tracing::{debug, instrument};
 
 impl ServerCommandHandler for DeleteStream {
@@ -58,8 +58,7 @@ impl ServerCommandHandler for DeleteStream {
             .with_error_context(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to delete stream2 with ID: {stream_id}, session: {session}")
             })?;
-        shard_info!(
-            shard.id,
+        info!(
             "Deleted stream with name: {}, ID: {}",
             stream2.root().name(),
             stream2.id()

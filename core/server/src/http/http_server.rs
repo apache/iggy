@@ -27,6 +27,7 @@ use crate::http::*;
 use crate::shard::IggyShard;
 use crate::shard::task_registry::ShutdownToken;
 use crate::shard::tasks::periodic::spawn_jwt_token_cleaner;
+use crate::shard::transmission::event::ShardEvent;
 use crate::streaming::persistence::persister::PersisterKind;
 use axum::extract::DefaultBodyLimit;
 use axum::extract::connect_info::Connected;
@@ -35,6 +36,7 @@ use axum::{Router, middleware};
 use axum_server::tls_rustls::RustlsConfig;
 use compio_net::TcpListener;
 use iggy_common::IggyError;
+use iggy_common::TransportProtocol;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -124,8 +126,6 @@ pub async fn start_http_server(
         info!("Started {api_name} on: {address}");
 
         // Notify shard about the bound address
-        use crate::shard::transmission::event::ShardEvent;
-        use iggy_common::TransportProtocol;
         let event = ShardEvent::AddressBound {
             protocol: TransportProtocol::Http,
             address,

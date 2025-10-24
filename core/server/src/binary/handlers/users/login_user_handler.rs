@@ -22,13 +22,12 @@ use crate::binary::mapper;
 use crate::binary::{handlers::users::COMPONENT, sender::SenderKind};
 use crate::shard::IggyShard;
 use crate::streaming::session::Session;
-use crate::{shard_info, shard_warn};
 use anyhow::Result;
 use error_set::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::login_user::LoginUser;
 use std::rc::Rc;
-use tracing::{debug, instrument};
+use tracing::{debug, info, instrument, warn};
 
 impl ServerCommandHandler for LoginUser {
     fn code(&self) -> u32 {
@@ -44,7 +43,7 @@ impl ServerCommandHandler for LoginUser {
         shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
         if shard.is_shutting_down() {
-            shard_warn!(shard.id, "Rejecting login request during shutdown");
+            warn!("Rejecting login request during shutdown");
             return Err(IggyError::Disconnected);
         }
 
@@ -52,7 +51,7 @@ impl ServerCommandHandler for LoginUser {
         let LoginUser {
             username, password, ..
         } = self;
-        shard_info!(shard.id, "Logging in user: {} ...", &username);
+        info!("Logging in user: {} ...", &username);
         let user = shard
             .login_user(&username, &password, Some(session))
             .with_error_context(|error| {
@@ -61,12 +60,7 @@ impl ServerCommandHandler for LoginUser {
                     username
                 )
             })?;
-        shard_info!(
-            shard.id,
-            "Logged in user: {} with ID: {}.",
-            username,
-            user.id
-        );
+        info!("Logged in user: {} with ID: {}.", username, user.id);
 
         let identity_info = mapper::map_identity_info(user.id);
         sender.send_ok_response(&identity_info).await?;

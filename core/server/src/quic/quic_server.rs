@@ -22,7 +22,6 @@ use crate::server_error::QuicError;
 use crate::shard::IggyShard;
 use crate::shard::task_registry::ShutdownToken;
 use crate::shard::transmission::event::ShardEvent;
-use crate::shard_info;
 use anyhow::Result;
 use compio_quic::{
     Endpoint, EndpointConfig, IdleTimeout, ServerBuilder, ServerConfig, TransportConfig, VarInt,
@@ -35,6 +34,7 @@ use std::io::BufReader;
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::sync::Arc;
+use tracing::info;
 use tracing::{error, trace, warn};
 
 /// Starts the QUIC server.
@@ -64,22 +64,20 @@ pub async fn spawn_quic_server(
     })?;
 
     if shard.id != 0 && addr.port() == 0 {
-        shard_info!(shard.id, "Waiting for QUIC address from shard 0...");
+        info!("Waiting for QUIC address from shard 0...");
         loop {
             if let Some(bound_addr) = shard.quic_bound_address.get() {
                 addr = bound_addr;
-                shard_info!(shard.id, "Received QUIC address: {}", addr);
+                info!("Received QUIC address: {}", addr);
                 break;
             }
             compio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
     }
 
-    shard_info!(
-        shard.id,
+    info!(
         "Initializing Iggy QUIC server on shard {} for address {}",
-        shard.id,
-        addr
+        shard.id, addr
     );
 
     let server_config = configure_quic(&config).map_err(|e| {
@@ -116,11 +114,7 @@ pub async fn spawn_quic_server(
         iggy_common::IggyError::CannotBindToSocket(addr.to_string())
     })?;
 
-    shard_info!(
-        shard.id,
-        "Iggy QUIC server has started on: {:?}",
-        actual_addr
-    );
+    info!("Iggy QUIC server has started on: {:?}", actual_addr);
 
     if shard.id == 0 {
         // Store bound address locally

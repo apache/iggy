@@ -23,12 +23,12 @@ use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::{handlers::users::COMPONENT, sender::SenderKind};
 
 use crate::shard::IggyShard;
-use crate::shard_info;
 use crate::streaming::session::Session;
 use anyhow::Result;
 use error_set::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::logout_user::LogoutUser;
+use tracing::info;
 use tracing::{debug, instrument};
 
 impl ServerCommandHandler for LogoutUser {
@@ -45,19 +45,11 @@ impl ServerCommandHandler for LogoutUser {
         shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
-        shard_info!(
-            shard.id,
-            "Logging out user with ID: {}...",
-            session.get_user_id()
-        );
+        info!("Logging out user with ID: {}...", session.get_user_id());
         shard.logout_user(session).with_error_context(|error| {
             format!("{COMPONENT} (error: {error}) - failed to logout user, session: {session}")
         })?;
-        shard_info!(
-            shard.id,
-            "Logged out user with ID: {}.",
-            session.get_user_id()
-        );
+        info!("Logged out user with ID: {}.", session.get_user_id());
         session.clear_user_id();
         sender.send_empty_ok_response().await?;
         Ok(())

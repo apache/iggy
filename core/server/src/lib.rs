@@ -47,10 +47,3 @@ pub mod websocket;
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const IGGY_ROOT_USERNAME_ENV: &str = "IGGY_ROOT_USERNAME";
 pub const IGGY_ROOT_PASSWORD_ENV: &str = "IGGY_ROOT_PASSWORD";
-
-pub fn map_toggle_str<'a>(enabled: bool) -> &'a str {
-    match enabled {
-        true => "enabled",
-        false => "disabled",
-    }
-}

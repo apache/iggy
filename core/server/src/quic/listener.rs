@@ -22,14 +22,13 @@ use crate::server_error::ConnectionError;
 use crate::shard::IggyShard;
 use crate::shard::task_registry::ShutdownToken;
 use crate::streaming::session::Session;
-use crate::{shard_debug, shard_info};
 use anyhow::anyhow;
 use compio_quic::{Connection, Endpoint, RecvStream, SendStream};
 use futures::FutureExt;
 use iggy_common::IggyError;
 use iggy_common::TransportProtocol;
 use std::rc::Rc;
-use tracing::{error, info, trace};
+use tracing::{debug, error, info, trace};
 
 const INITIAL_BYTES_LENGTH: usize = 4;
 
@@ -43,7 +42,7 @@ pub async fn start(
 
         futures::select! {
             _ = shutdown.wait().fuse() => {
-                shard_debug!(shard.id, "QUIC listener received shutdown signal, no longer accepting connections");
+                debug!( "QUIC listener received shutdown signal, no longer accepting connections");
                 break;
             }
             incoming_conn = accept_future.fuse() => {
@@ -52,7 +51,7 @@ pub async fn start(
                         let remote_addr = incoming_conn.remote_address();
 
                         if shard.is_shutting_down() {
-                            shard_info!(shard.id, "Rejecting new QUIC connection from {} during shutdown", remote_addr);
+                            info!( "Rejecting new QUIC connection from {} during shutdown", remote_addr);
                             continue;
                         }
 
@@ -97,8 +96,7 @@ async fn handle_connection(
     let session = Rc::new(shard.add_client(&address, TransportProtocol::Quic));
 
     let client_id = session.client_id;
-    shard_debug!(
-        shard.id,
+    debug!(
         "Added {} client with session: {} for IP address: {}",
         TransportProtocol::Quic,
         session,
