@@ -43,7 +43,7 @@ impl TcpTlsConnectionStream {
 #[async_trait]
 impl ConnectionStream for TcpTlsConnectionStream {
     async fn read(&mut self, buf: &mut [u8]) -> Result<usize, IggyError> {
-        self.stream.read(buf).await.map_err(|error| {
+        self.stream.read_exact(buf).await.map_err(|error| {
             error!(
                 "Failed to read data by client: {} from the TCP TLS connection: {error}",
                 self.client_address

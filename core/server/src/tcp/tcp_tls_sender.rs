@@ -38,15 +38,36 @@ impl Sender for TcpTlsSender {
     }
 
     async fn send_empty_ok_response(&mut self) -> Result<(), IggyError> {
-        sender::send_empty_ok_response(&mut self.stream).await
+        sender::send_empty_ok_response(&mut self.stream).await?;
+        self.stream
+            .flush()
+            .await
+            .with_error_context(|e| {
+                format!("failed to flush TCP stream after sending response: {e}")
+            })
+            .map_err(|_| IggyError::TcpError)
     }
 
     async fn send_ok_response(&mut self, payload: &[u8]) -> Result<(), IggyError> {
-        sender::send_ok_response(&mut self.stream, payload).await
+        sender::send_ok_response(&mut self.stream, payload).await?;
+        self.stream
+            .flush()
+            .await
+            .with_error_context(|e| {
+                format!("failed to flush TCP stream after sending response: {e}")
+            })
+            .map_err(|_| IggyError::TcpError)
     }
 
     async fn send_error_response(&mut self, error: IggyError) -> Result<(), IggyError> {
-        sender::send_error_response(&mut self.stream, error).await
+        sender::send_error_response(&mut self.stream, error).await?;
+        self.stream
+            .flush()
+            .await
+            .with_error_context(|e| {
+                format!("failed to flush TCP stream after sending response: {e}")
+            })
+            .map_err(|_| IggyError::TcpError)
     }
 
     async fn shutdown(&mut self) -> Result<(), ServerError> {
@@ -64,6 +85,13 @@ impl Sender for TcpTlsSender {
         length: &[u8],
         slices: Vec<PooledBuffer>,
     ) -> Result<(), IggyError> {
-        sender::send_ok_response_vectored(&mut self.stream, length, slices).await
+        sender::send_ok_response_vectored(&mut self.stream, length, slices).await?;
+        self.stream
+            .flush()
+            .await
+            .with_error_context(|e| {
+                format!("failed to flush TCP stream after sending response: {e}")
+            })
+            .map_err(|_| IggyError::TcpError)
     }
 }
