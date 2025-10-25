@@ -4,6 +4,7 @@
   const bubble = createBubbler();
   import type { HTMLInputTypeAttribute } from 'svelte/elements';
   import { twMerge } from 'tailwind-merge';
+  import { v4 as uuidv4 } from 'uuid';
 
   interface Props {
     errorMessage?: string;
@@ -20,7 +21,7 @@
 
   let {
     errorMessage = undefined,
-    id = crypto.randomUUID(),
+    id = uuidv4(),
     label = undefined,
     name,
     options,

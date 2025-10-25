@@ -7,7 +7,7 @@
         <TargetFramework>net8.0</TargetFramework>
         <AssemblyName>Apache.Iggy</AssemblyName>
         <RootNamespace>Apache.Iggy</RootNamespace>
-        <PackageVersion>0.6.0-edge.1</PackageVersion>
+        <PackageVersion>0.6.0-edge.2</PackageVersion>
     </PropertyGroup>
 
     <PropertyGroup>
@@ -35,17 +35,14 @@
         <None Include="../LICENSE" Pack="true" PackagePath="">
             <Link>Properties/LICENSE</Link>
         </None>
+        <None Include="../DEPENDENCIES.md">
+            <Link>Properties\DEPENDENCIES.md</Link>
+        </None>
     </ItemGroup>
 
     <ItemGroup>
         <PackageReference Include="Microsoft.Extensions.Logging" />
         <PackageReference Include="System.IO.Hashing" />
-    </ItemGroup>
-
-    <ItemGroup>
-        <Content Include="..\DEPENDENCIES.md">
-            <Link>Properties\DEPENDENCIES.md</Link>
-        </Content>
     </ItemGroup>
 
     <ItemGroup>

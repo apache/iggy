@@ -28,6 +28,7 @@ import {
   autoUpdate
 } from '@floating-ui/dom';
 import { writable } from 'svelte/store';
+import { v4 as uuidv4 } from 'uuid';
 
 const openId = writable<string | null>(null);
 
@@ -46,7 +47,7 @@ export function tooltip(
   const tooltip = node.querySelector('.tooltip') as HTMLElement;
 
   if (!tooltip || !trigger) return;
-  const id = crypto.randomUUID();
+  const id = uuidv4();
 
   let cleanup: VoidFunction | undefined;
 

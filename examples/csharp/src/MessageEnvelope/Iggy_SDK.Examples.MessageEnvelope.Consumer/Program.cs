@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using Apache.Iggy.Configuration;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Factory;
 using Iggy_SDK.Examples.MessageEnvelope.Consumer;
@@ -23,14 +24,12 @@ using Microsoft.Extensions.Logging;
 var loggerFactory = LoggerFactory.Create(b => { b.AddConsole(); });
 var logger = loggerFactory.CreateLogger<Program>();
 
-var client = MessageStreamFactory.CreateMessageStream(
-    opt =>
-    {
-        opt.BaseAdress = Utils.GetTcpServerAddr(args, logger);
-        opt.Protocol = Protocol.Tcp;
-    },
-    loggerFactory
-);
+var client = IggyClientFactory.CreateClient(new IggyClientConfigurator()
+{
+    BaseAddress = Utils.GetTcpServerAddr(args, logger),
+    Protocol = Protocol.Tcp,
+    LoggerFactory = loggerFactory
+});
 
 await client.LoginUser("iggy", "iggy");
 

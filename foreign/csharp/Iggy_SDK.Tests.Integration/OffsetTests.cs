@@ -17,6 +17,7 @@
 
 using Apache.Iggy.Enums;
 using Apache.Iggy.Kinds;
+using Apache.Iggy.Tests.Integrations.Attributes;
 using Apache.Iggy.Tests.Integrations.Fixtures;
 using Apache.Iggy.Tests.Integrations.Helpers;
 using Shouldly;
@@ -96,5 +97,22 @@ public class OffsetTests
         offset.StoredOffset.ShouldBe(SetOffset);
         offset.PartitionId.ShouldBe(1);
         offset.CurrentOffset.ShouldBe(3u);
+    }
+
+    [Test]
+    [SkipHttp]
+    [DependsOn(nameof(GetOffset_ConsumerGroup_ByName_Should_GetOffset_Successfully))]
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task DeleteOffset_ConsumerGroup_Should_DeleteOffset_Successfully(Protocol protocol)
+    {
+        await Fixture.Clients[protocol].DeleteOffsetAsync(Consumer.Group("test_consumer_group"),
+            Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)), Identifier.String(Fixture.TopicRequest.Name),
+            1);
+
+        var offset = await Fixture.Clients[protocol].GetOffsetAsync(Consumer.Group("test_consumer_group"),
+            Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)), Identifier.String(Fixture.TopicRequest.Name),
+            1);
+
+        offset.ShouldBeNull();
     }
 }

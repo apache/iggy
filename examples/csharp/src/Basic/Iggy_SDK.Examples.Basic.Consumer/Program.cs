@@ -17,6 +17,7 @@
 
 using System.Text;
 using Apache.Iggy;
+using Apache.Iggy.Configuration;
 using Apache.Iggy.Factory;
 using Apache.Iggy.Kinds;
 using Iggy_SDK.Examples.Basic.Consumer;
@@ -35,14 +36,12 @@ logger.LogInformation(
     settings.Protocol
 );
 
-var client = MessageStreamFactory.CreateMessageStream(
-    opt =>
-    {
-        opt.BaseAdress = settings.BaseAddress;
-        opt.Protocol = settings.Protocol;
-    },
-    loggerFactory
-);
+var client = IggyClientFactory.CreateClient(new IggyClientConfigurator()
+{
+    BaseAddress = settings.BaseAddress,
+    Protocol = settings.Protocol,
+    LoggerFactory = loggerFactory
+});
 
 await client.LoginUser(settings.Username, settings.Password);
 
