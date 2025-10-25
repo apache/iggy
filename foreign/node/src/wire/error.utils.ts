@@ -25,3 +25,24 @@ export const responseError = (cmdCode: number, errCode: number) => new Error(
   `command: { code: ${cmdCode}, name: ${translateCommandCode(cmdCode)} } ` +
   `error: {code: ${errCode}, message: ${translateErrorCode(errCode)} }`
 );
+
+export class DeserializeError extends Error {
+  constructor(message: string, cause?: Record<string , unknown>) {
+    super(message, cause);
+    this.name = "DeserializeError";
+    Object.setPrototypeOf(this, DeserializeError.prototype);
+  }
+}
+
+export const deserializeError = (
+  name: string,
+  position: number,
+  buffer_size: number,
+  lookup?: number,
+  read?: Record<string, unknown>
+) => {
+  throw new DeserializeError(
+    `cannot deserialize ${name}: buffer too small`,
+    { cause: { position, buffer_size, lookup, read } }
+  );
+}
