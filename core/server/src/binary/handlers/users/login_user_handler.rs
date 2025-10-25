@@ -23,7 +23,7 @@ use crate::binary::{handlers::users::COMPONENT, sender::SenderKind};
 use crate::streaming::session::Session;
 use crate::streaming::systems::system::SharedSystem;
 use anyhow::Result;
-use error_set::ErrContext;
+use err_trail::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::login_user::LoginUser;
 use tracing::{debug, instrument};
@@ -46,7 +46,7 @@ impl ServerCommandHandler for LoginUser {
         let user = system
             .login_user(&self.username, &self.password, Some(session))
             .await
-            .with_error_context(|error| {
+            .with_error(|error| {
                 format!(
                     "{COMPONENT} (error: {error}) - failed to login user with name: {}, session: {session}",
                     self.username

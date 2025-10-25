@@ -23,7 +23,7 @@ use crate::state::command::EntryCommand;
 use crate::streaming::session::Session;
 use crate::streaming::systems::system::SharedSystem;
 use anyhow::Result;
-use error_set::ErrContext;
+use err_trail::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::update_topic::UpdateTopic;
 use tracing::{debug, instrument};
@@ -57,7 +57,7 @@ impl ServerCommandHandler for UpdateTopic {
                     self.replication_factor,
                 )
                 .await
-                .with_error_context(|error| format!(
+                .with_error(|error| format!(
                     "{COMPONENT} (error: {error}) - failed to update topic with id: {}, stream_id: {}, session: {session}",
                     self.topic_id, self.stream_id
                 ))?;
@@ -72,7 +72,7 @@ impl ServerCommandHandler for UpdateTopic {
             .state
             .apply(session.get_user_id(), &EntryCommand::UpdateTopic(self))
             .await
-            .with_error_context(|error| format!(
+            .with_error(|error| format!(
                 "{COMPONENT} (error: {error}) - failed to apply update topic with id: {topic_id}, stream_id: {stream_id}, session: {session}"
             ))?;
         sender.send_empty_ok_response().await?;

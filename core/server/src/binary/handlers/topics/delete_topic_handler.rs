@@ -23,7 +23,7 @@ use crate::state::command::EntryCommand;
 use crate::streaming::session::Session;
 use crate::streaming::systems::system::SharedSystem;
 use anyhow::Result;
-use error_set::ErrContext;
+use err_trail::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::delete_topic::DeleteTopic;
 use tracing::{debug, instrument};
@@ -49,7 +49,7 @@ impl ServerCommandHandler for DeleteTopic {
         system
                 .delete_topic(session, &self.stream_id, &self.topic_id)
                 .await
-                .with_error_context(|error| format!(
+                .with_error(|error| format!(
                     "{COMPONENT} (error: {error}) - failed to delete topic with ID: {topic_id} in stream with ID: {stream_id}, session: {session}",
                 ))?;
 
@@ -58,7 +58,7 @@ impl ServerCommandHandler for DeleteTopic {
             .state
             .apply(session.get_user_id(), &EntryCommand::DeleteTopic(self))
             .await
-            .with_error_context(|error| format!(
+            .with_error(|error| format!(
                 "{COMPONENT} (error: {error}) - failed to apply delete topic with ID: {topic_id} in stream with ID: {stream_id}, session: {session}",
             ))?;
         sender.send_empty_ok_response().await?;

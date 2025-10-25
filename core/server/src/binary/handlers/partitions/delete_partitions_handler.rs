@@ -23,7 +23,7 @@ use crate::state::command::EntryCommand;
 use crate::streaming::session::Session;
 use crate::streaming::systems::system::SharedSystem;
 use anyhow::Result;
-use error_set::ErrContext;
+use err_trail::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::delete_partitions::DeletePartitions;
 use tracing::{debug, instrument};
@@ -54,7 +54,7 @@ impl ServerCommandHandler for DeletePartitions {
                 self.partitions_count,
             )
             .await
-            .with_error_context(|error| {
+            .with_error(|error| {
                 format!(
                     "{COMPONENT} (error: {error}) - failed to delete partitions for topic with ID: {topic_id} in stream with ID: {stream_id}, session: {session}",
                 )
@@ -68,7 +68,7 @@ impl ServerCommandHandler for DeletePartitions {
             &EntryCommand::DeletePartitions(self),
         )
         .await
-        .with_error_context(|error| {
+        .with_error(|error| {
             format!(
                 "{COMPONENT} (error: {error}) - failed to apply delete partitions for stream_id: {stream_id}, topic_id: {topic_id}, session: {session}"
             )

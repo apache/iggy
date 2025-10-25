@@ -22,9 +22,9 @@ use std::array::TryFromSliceError;
 use tokio::io;
 
 error_set!(
-    ServerError = ConfigError || ArchiverError || ConnectionError || LogError || CompatError || QuicError;
+    ServerError := ConfigError || ArchiverError || ConnectionError || LogError || CompatError || QuicError
 
-    IoError = {
+    IoError := {
         #[display("IO error")]
         IoError(io::Error),
 
@@ -33,9 +33,9 @@ error_set!(
 
         #[display("Read to end error")]
         ReadToEndError(ReadToEndError)
-    };
+    }
 
-    ConfigError = {
+    ConfigError := {
         #[display("Invalid configuration provider: {}", provider_type)]
         InvalidConfigurationProvider { provider_type: String },
 
@@ -47,9 +47,9 @@ error_set!(
 
         #[display("Cache config validation failure")]
         CacheConfigValidationFailure,
-    };
+    }
 
-    ArchiverError = {
+    ArchiverError := {
         #[display("File to archive not found: {}", file_path)]
         FileToArchiveNotFound { file_path: String },
 
@@ -61,14 +61,14 @@ error_set!(
 
         #[display("Cannot archive file: {}", file_path)]
         CannotArchiveFile { file_path: String },
-    } || IoError;
+    } || IoError
 
-    ConnectionError = {
+    ConnectionError := {
         #[display("Connection error")]
         QuicConnectionError(QuicConnectionError),
-    } || IoError || CommonError;
+    } || IoError || CommonError
 
-    LogError = {
+    LogError := {
         #[display("Logging filter reload failure")]
         FilterReloadFailure,
 
@@ -77,22 +77,22 @@ error_set!(
 
         #[display("Logging file reload failure")]
         FileReloadFailure,
-    };
+    }
 
-    CompatError = {
+    CompatError := {
         #[display("Index migration error")]
         IndexMigrationError,
-    } || IoError || CommonError;
+    } || IoError || CommonError
 
-    CommonError = {
+    CommonError := {
         #[display("Try from slice error")]
         TryFromSliceError(TryFromSliceError),
 
         #[display("SDK error")]
         SdkError(iggy_common::IggyError),
-    };
+    }
 
-    QuicError = {
+    QuicError := {
         #[display("Cert load error")]
         CertLoadError,
         #[display("Cert generation error")]
@@ -101,5 +101,5 @@ error_set!(
         ConfigCreationError,
         #[display("Transport config error")]
         TransportConfigError,
-    };
+    }
 );

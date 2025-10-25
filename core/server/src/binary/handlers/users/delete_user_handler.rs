@@ -23,7 +23,7 @@ use crate::state::command::EntryCommand;
 use crate::streaming::session::Session;
 use crate::streaming::systems::system::SharedSystem;
 use anyhow::Result;
-use error_set::ErrContext;
+use err_trail::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::delete_user::DeleteUser;
 use tracing::{debug, instrument};
@@ -47,7 +47,7 @@ impl ServerCommandHandler for DeleteUser {
         system
                 .delete_user(session, &self.user_id)
                 .await
-                .with_error_context(|error| {
+                .with_error(|error| {
                     format!(
                         "{COMPONENT} (error: {error}) - failed to delete user with ID: {}, session: {session}",
                         self.user_id
@@ -60,7 +60,7 @@ impl ServerCommandHandler for DeleteUser {
             .state
             .apply(session.get_user_id(), &EntryCommand::DeleteUser(self))
             .await
-            .with_error_context(|error| {
+            .with_error(|error| {
                 format!(
                     "{COMPONENT} (error: {error}) - failed to apply delete user with ID: {user_id}, session: {session}",
                 )
