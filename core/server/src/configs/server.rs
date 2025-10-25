@@ -26,7 +26,7 @@ use crate::configs::system::SystemConfig;
 use crate::configs::tcp::TcpConfig;
 use crate::server_error::ConfigError;
 use derive_more::Display;
-use error_set::ErrContext;
+use err_trail::ErrContext;
 use figment::Metadata;
 use figment::Profile;
 use figment::Provider;
@@ -222,13 +222,10 @@ impl ConfigProviderKind {
 
 impl ServerConfig {
     pub async fn load(config_provider: ConfigProviderKind) -> Result<Self, ConfigError> {
-        let server_config = config_provider
-            .load_config()
-            .await
-            .with_error_context(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to load config provider config")
-            })?;
-        server_config.validate().with_error_context(|error| {
+        let server_config = config_provider.load_config().await.with_error(|error| {
+            format!("{COMPONENT} (error: {error}) - failed to load config provider config")
+        })?;
+        server_config.validate().with_error(|error| {
             format!("{COMPONENT} (error: {error}) - failed to validate server config")
         })?;
         Ok(server_config)

@@ -23,7 +23,7 @@ use crate::binary::mapper;
 use crate::binary::sender::SenderKind;
 use crate::streaming::session::Session;
 use crate::streaming::systems::system::SharedSystem;
-use error_set::ErrContext;
+use err_trail::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::get_me::GetMe;
 use iggy_common::locking::IggySharedMutFn;
@@ -44,7 +44,7 @@ impl ServerCommandHandler for GetMe {
         let Some(client) = system
             .get_client(session, session.client_id)
             .await
-            .with_error_context(|error| {
+            .with_error(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to get current client for session: {session}")
             })?
         else {

@@ -19,7 +19,7 @@
 use crate::streaming::segments::{IggyIndexesMut, IggyMessagesBatchMut};
 use crate::streaming::utils::PooledBuffer;
 use bytes::BytesMut;
-use error_set::ErrContext;
+use err_trail::ErrContext;
 use iggy_common::IggyError;
 use std::{fs::File as StdFile, os::unix::prelude::FileExt};
 use std::{
@@ -51,7 +51,7 @@ impl MessagesReader {
             .read(true)
             .open(file_path)
             .await
-            .with_error_context(|error| {
+            .with_error(|error| {
                 format!("Failed to open messages file: {file_path}, error: {error}")
             })
             .map_err(|_| IggyError::CannotReadFile)?;
@@ -65,7 +65,7 @@ impl MessagesReader {
                 0, // 0 means the entire file
                 nix::fcntl::PosixFadviseAdvice::POSIX_FADV_SEQUENTIAL,
             )
-            .with_info_context(|error| {
+            .with_info(|error| {
                 format!(
                     "Failed to set sequential access pattern on messages file: {file_path}. {error}"
                 )

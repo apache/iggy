@@ -18,7 +18,7 @@
 use crate::streaming::session::Session;
 use crate::streaming::systems::COMPONENT;
 use crate::streaming::systems::system::System;
-use error_set::ErrContext;
+use err_trail::ErrContext;
 use iggy_common::Identifier;
 use iggy_common::IggyError;
 use iggy_common::locking::IggySharedMutFn;
@@ -36,13 +36,13 @@ impl System {
         self.ensure_authenticated(session)?;
 
         {
-            let topic = self.find_topic(session, stream_id, topic_id).with_error_context(|error| format!("{COMPONENT} (error: {error}) - topic not found for stream_id: {stream_id}, topic_id: {topic_id}"))?;
+            let topic = self.find_topic(session, stream_id, topic_id).with_error(|error| format!("{COMPONENT} (error: {error}) - topic not found for stream_id: {stream_id}, topic_id: {topic_id}"))?;
 
             self.permissioner.delete_segments(
                 session.get_user_id(),
                 topic.stream_id,
                 topic.topic_id,
-            ).with_error_context(|error| format!(
+            ).with_error(|error| format!(
                 "{COMPONENT} (error: {error}) - permission denied to delete segments for user {} on Stream ID: {}, Topic ID: {}",
                 session.get_user_id(),
                 topic.stream_id,
@@ -53,7 +53,7 @@ impl System {
         let topic = self
             .get_stream_mut(stream_id)?
             .get_topic_mut(topic_id)
-            .with_error_context(|error| {
+            .with_error(|error| {
                 format!(
                     "{COMPONENT} (error: {error}) - failed to get mutable reference to stream with ID: {stream_id}"
                     )

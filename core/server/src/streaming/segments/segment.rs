@@ -21,7 +21,7 @@ use super::messages::*;
 use super::messages_accumulator::MessagesAccumulator;
 use crate::configs::system::SystemConfig;
 use crate::streaming::segments::*;
-use error_set::ErrContext;
+use err_trail::ErrContext;
 use iggy_common::INDEX_SIZE;
 use iggy_common::IggyByteSize;
 use iggy_common::IggyError;
@@ -150,7 +150,7 @@ impl Segment {
             .unwrap()
             .load_all_indexes_from_disk()
             .await
-            .with_error_context(|error| format!("Failed to load indexes for {self}. {error}"))
+            .with_error(|error| format!("Failed to load indexes for {self}. {error}"))
             .map_err(|_| IggyError::CannotReadFile)?;
 
         let last_index_offset = if self.indexes.is_empty() {
@@ -338,16 +338,12 @@ impl Segment {
             self.shutdown_writing().await;
         }
 
-        let _ = remove_file(&self.messages_path)
-            .await
-            .with_error_context(|error| {
-                format!("Failed to delete log file: {}. {error}", self.messages_path)
-            });
-        let _ = remove_file(&self.index_path)
-            .await
-            .with_error_context(|error| {
-                format!("Failed to delete index file: {}. {error}", self.index_path)
-            });
+        let _ = remove_file(&self.messages_path).await.with_error(|error| {
+            format!("Failed to delete log file: {}. {error}", self.messages_path)
+        });
+        let _ = remove_file(&self.index_path).await.with_error(|error| {
+            format!("Failed to delete index file: {}. {error}", self.index_path)
+        });
 
         let segment_size_bytes = segment_size.as_bytes_u64();
         self.size_of_parent_stream

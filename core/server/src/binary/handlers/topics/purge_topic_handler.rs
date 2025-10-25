@@ -23,7 +23,7 @@ use crate::state::command::EntryCommand;
 use crate::streaming::session::Session;
 use crate::streaming::systems::system::SharedSystem;
 use anyhow::Result;
-use error_set::ErrContext;
+use err_trail::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::purge_topic::PurgeTopic;
 use tracing::{debug, instrument};
@@ -46,7 +46,7 @@ impl ServerCommandHandler for PurgeTopic {
         system
             .purge_topic(session, &self.stream_id, &self.topic_id)
             .await
-            .with_error_context(|error| {
+            .with_error(|error| {
                 format!(
                     "{COMPONENT} (error: {error}) - failed to purge topic with id: {}, stream_id: {}",
                     self.topic_id, self.stream_id
@@ -59,7 +59,7 @@ impl ServerCommandHandler for PurgeTopic {
             .state
             .apply(session.get_user_id(), &EntryCommand::PurgeTopic(self))
             .await
-            .with_error_context(|error| {
+            .with_error(|error| {
                 format!(
                 "{COMPONENT} (error: {error}) - failed to apply purge topic with id: {topic_id}, stream_id: {stream_id}",
             )

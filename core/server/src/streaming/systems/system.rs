@@ -35,7 +35,7 @@ use crate::streaming::users::permissioner::Permissioner;
 use crate::streaming::users::user::User;
 use crate::versioning::SemanticVersion;
 use ahash::AHashMap;
-use error_set::ErrContext;
+use err_trail::ErrContext;
 use iggy_common::locking::IggySharedMut;
 use iggy_common::locking::IggySharedMutFn;
 use iggy_common::{Aes256GcmEncryptor, EncryptorKind, IggyError, UserId};
@@ -221,28 +221,22 @@ impl System {
             self.config.get_system_path()
         );
 
-        let state_entries = self.state.init().await.with_error_context(|error| {
+        let state_entries = self.state.init().await.with_error(|error| {
             format!("{COMPONENT} (error: {error}) - failed to initialize state entries")
         })?;
-        let system_state = SystemState::init(state_entries)
-            .await
-            .with_error_context(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to initialize system state")
-            })?;
-        let now = Instant::now();
-        self.load_version().await.with_error_context(|error| {
-            format!("{COMPONENT} (error: {error}) - failed to load version")
+        let system_state = SystemState::init(state_entries).await.with_error(|error| {
+            format!("{COMPONENT} (error: {error}) - failed to initialize system state")
         })?;
+        let now = Instant::now();
+        self.load_version()
+            .await
+            .with_error(|error| format!("{COMPONENT} (error: {error}) - failed to load version"))?;
         self.load_users(system_state.users.into_values().collect())
             .await
-            .with_error_context(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to load users")
-            })?;
+            .with_error(|error| format!("{COMPONENT} (error: {error}) - failed to load users"))?;
         self.load_streams(system_state.streams.into_values().collect())
             .await
-            .with_error_context(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to load streams")
-            })?;
+            .with_error(|error| format!("{COMPONENT} (error: {error}) - failed to load streams"))?;
         if let Some(archiver) = self.archiver.as_ref() {
             archiver
                 .init()

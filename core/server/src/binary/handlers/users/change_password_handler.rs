@@ -24,7 +24,7 @@ use crate::streaming::session::Session;
 use crate::streaming::systems::system::SharedSystem;
 use crate::streaming::utils::crypto;
 use anyhow::Result;
-use error_set::ErrContext;
+use err_trail::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::change_password::ChangePassword;
 use tracing::{debug, instrument};
@@ -53,7 +53,7 @@ impl ServerCommandHandler for ChangePassword {
                     &self.new_password,
                 )
                 .await
-                .with_error_context(|error| {
+                .with_error(|error| {
                     format!(
                         "{COMPONENT} (error: {error}) - failed to change password for user_id: {}, session: {session}",
                         self.user_id
@@ -73,7 +73,7 @@ impl ServerCommandHandler for ChangePassword {
                 }),
             )
             .await
-            .with_error_context(|error| {
+            .with_error(|error| {
                 format!(
                     "{COMPONENT} (error: {error}) - failed to apply change password for user_id: {}, session: {session}",
                     self.user_id

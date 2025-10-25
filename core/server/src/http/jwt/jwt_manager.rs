@@ -22,7 +22,7 @@ use crate::http::jwt::json_web_token::{GeneratedToken, JwtClaims, RevokedAccessT
 use crate::http::jwt::storage::TokenStorage;
 use crate::streaming::persistence::persister::PersisterKind;
 use ahash::AHashMap;
-use error_set::ErrContext;
+use err_trail::ErrContext;
 use iggy_common::IggyDuration;
 use iggy_common::IggyError;
 use iggy_common::IggyExpiry;
@@ -92,7 +92,7 @@ impl JwtManager {
             audience: config.audience.clone(),
             access_token_expiry: config.access_token_expiry,
             not_before: config.not_before,
-            key: config.get_encoding_key().with_error_context(|error| {
+            key: config.get_encoding_key().with_error(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to get encoding key")
             })?,
             algorithm,
@@ -101,7 +101,7 @@ impl JwtManager {
             valid_audiences: config.valid_audiences.clone(),
             valid_issuers: config.valid_issuers.clone(),
             clock_skew: config.clock_skew,
-            key: config.get_decoding_key().with_error_context(|error| {
+            key: config.get_decoding_key().with_error(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to get decoding key")
             })?,
         };
@@ -155,7 +155,7 @@ impl JwtManager {
         self.tokens_storage
             .delete_revoked_access_tokens(&tokens_to_delete)
             .await
-            .with_error_context(|error| {
+            .with_error(|error| {
                 format!(
                     "{COMPONENT} (error: {error}) - failed to delete revoked access tokens, IDs {tokens_to_delete:?}"
                 )
@@ -229,7 +229,7 @@ impl JwtManager {
                 expiry,
             })
             .await
-            .with_error_context(|error| {
+            .with_error(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to save revoked access token: {id}")
             })?;
         self.generate(jwt_claims.claims.sub)
@@ -276,7 +276,7 @@ impl JwtManager {
                 expiry,
             })
             .await
-            .with_error_context(|error| {
+            .with_error(|error| {
                 format!(
                     "{COMPONENT} (error: {error}) - failed to save revoked access token: {token_id}"
                 )

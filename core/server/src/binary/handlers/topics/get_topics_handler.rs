@@ -24,7 +24,7 @@ use crate::binary::sender::SenderKind;
 use crate::streaming::session::Session;
 use crate::streaming::systems::system::SharedSystem;
 use anyhow::Result;
-use error_set::ErrContext;
+use err_trail::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::get_topics::GetTopics;
 use tracing::debug;
@@ -45,7 +45,7 @@ impl ServerCommandHandler for GetTopics {
         let system = system.read().await;
         let topics = system
             .find_topics(session, &self.stream_id)
-            .with_error_context(|error| {
+            .with_error(|error| {
                 format!(
                     "{COMPONENT} (error: {error}) - failed to find topics, stream_id: {}, session: {session}",
                     self.stream_id

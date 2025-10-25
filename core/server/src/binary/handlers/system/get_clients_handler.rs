@@ -23,7 +23,7 @@ use crate::binary::mapper;
 use crate::binary::sender::SenderKind;
 use crate::streaming::session::Session;
 use crate::streaming::systems::system::SharedSystem;
-use error_set::ErrContext;
+use err_trail::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::get_clients::GetClients;
 use tracing::debug;
@@ -43,12 +43,9 @@ impl ServerCommandHandler for GetClients {
         debug!("session: {session}, command: {self}");
 
         let system = system.read().await;
-        let clients = system
-            .get_clients(session)
-            .await
-            .with_error_context(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to get clients, session: {session}")
-            })?;
+        let clients = system.get_clients(session).await.with_error(|error| {
+            format!("{COMPONENT} (error: {error}) - failed to get clients, session: {session}")
+        })?;
         let clients = mapper::map_clients(&clients).await;
         sender.send_ok_response(&clients).await?;
         Ok(())

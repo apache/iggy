@@ -23,7 +23,7 @@ use crate::binary::mapper;
 use crate::binary::sender::SenderKind;
 use crate::streaming::session::Session;
 use crate::streaming::systems::system::SharedSystem;
-use error_set::ErrContext;
+use err_trail::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::get_personal_access_tokens::GetPersonalAccessTokens;
 use tracing::debug;
@@ -45,7 +45,7 @@ impl ServerCommandHandler for GetPersonalAccessTokens {
         let personal_access_tokens = system
             .get_personal_access_tokens(session)
             .await
-            .with_error_context(|error| {
+            .with_error(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to get personal access tokens with session: {session}")
             })?;
         let personal_access_tokens = mapper::map_personal_access_tokens(&personal_access_tokens);

@@ -24,7 +24,7 @@ use std::net::SocketAddr;
 /// - `auto_login`: Default is AutoLogin::Disabled.
 /// - `reconnection`: Default is enabled unlimited retries and 1 second interval.
 /// - `tls_enabled`: Default is false.
-/// - `tls_domain`: Default is "localhost".
+/// - `tls_domain`: Default is "" (auto-detected from server_address).
 /// - `tls_ca_file`: Default is None.
 #[derive(Debug, Default)]
 pub struct TcpClientConfigBuilder {
@@ -72,6 +72,7 @@ impl TcpClientConfigBuilder {
     }
 
     /// Sets the domain to use for TLS when connecting to the server.
+    /// If not set or empty, the hostname/IP will be automatically extracted from server_address.
     pub fn with_tls_domain(mut self, tls_domain: String) -> Self {
         self.config.tls_domain = tls_domain;
         self

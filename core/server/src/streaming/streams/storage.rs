@@ -22,7 +22,7 @@ use crate::streaming::streams::COMPONENT;
 use crate::streaming::streams::stream::Stream;
 use crate::streaming::topics::topic::Topic;
 use ahash::AHashSet;
-use error_set::ErrContext;
+use err_trail::ErrContext;
 use futures::future::join_all;
 use iggy_common::IggyError;
 use std::path::Path;
@@ -126,7 +126,7 @@ impl StreamStorage for FileStreamStorage {
                         stream.storage.clone(),
                     )
                     .await;
-                    topic.persist().await.with_error_context(|error| {
+                    topic.persist().await.with_error(|error| {
                         format!("{COMPONENT} (error: {error}) - failed to persist topic: {topic}")
                     })?;
                     unloaded_topics.push(topic);

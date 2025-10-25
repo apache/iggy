@@ -23,7 +23,7 @@ use crate::binary::sender::SenderKind;
 use crate::streaming::session::Session;
 use crate::streaming::systems::system::SharedSystem;
 use anyhow::Result;
-use error_set::ErrContext;
+use err_trail::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::store_consumer_offset::StoreConsumerOffset;
 use tracing::debug;
@@ -52,7 +52,7 @@ impl ServerCommandHandler for StoreConsumerOffset {
                 self.offset,
             )
             .await
-            .with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to store consumer offset for stream_id: {}, topic_id: {}, partition_id: {:?}, offset: {}, session: {}",
+            .with_error(|error| format!("{COMPONENT} (error: {error}) - failed to store consumer offset for stream_id: {}, topic_id: {}, partition_id: {:?}, offset: {}, session: {}",
                 self.stream_id, self.topic_id, self.partition_id, self.offset, session
             ))?;
         sender.send_empty_ok_response().await?;

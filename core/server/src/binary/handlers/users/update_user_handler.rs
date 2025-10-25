@@ -23,7 +23,7 @@ use crate::state::command::EntryCommand;
 use crate::streaming::session::Session;
 use crate::streaming::systems::system::SharedSystem;
 use anyhow::Result;
-use error_set::ErrContext;
+use err_trail::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::update_user::UpdateUser;
 use tracing::{debug, instrument};
@@ -52,7 +52,7 @@ impl ServerCommandHandler for UpdateUser {
                     self.status,
                 )
                 .await
-                .with_error_context(|error| {
+                .with_error(|error| {
                     format!(
                         "{COMPONENT} (error: {error}) - failed to update user with user_id: {}, session: {session}",
                         self.user_id
@@ -66,7 +66,7 @@ impl ServerCommandHandler for UpdateUser {
             .state
             .apply(session.get_user_id(), &EntryCommand::UpdateUser(self))
             .await
-            .with_error_context(|error| {
+            .with_error(|error| {
                 format!(
                     "{COMPONENT} (error: {error}) - failed to apply update user with user_id: {user_id}, session: {session}"
                 )

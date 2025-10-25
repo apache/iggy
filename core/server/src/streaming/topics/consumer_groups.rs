@@ -19,7 +19,7 @@
 use crate::streaming::topics::COMPONENT;
 use crate::streaming::topics::consumer_group::ConsumerGroup;
 use crate::streaming::topics::topic::Topic;
-use error_set::ErrContext;
+use err_trail::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::locking::IggySharedMutFn;
 use iggy_common::{IdKind, Identifier};
@@ -154,7 +154,7 @@ impl Topic {
     ) -> Result<RwLock<ConsumerGroup>, IggyError> {
         let group_id;
         {
-            let consumer_group = self.get_consumer_group(id).with_error_context(|error| {
+            let consumer_group = self.get_consumer_group(id).with_error(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to get consumer group with id: {id}")
             })?;
             let consumer_group = consumer_group.read().await;
@@ -200,8 +200,10 @@ impl Topic {
         group_id: &Identifier,
         member_id: u32,
     ) -> Result<(), IggyError> {
-        let consumer_group = self.get_consumer_group(group_id).with_error_context(|error| {
-            format!("{COMPONENT} (error: {error}) - failed to get consumer group with id: {group_id}")
+        let consumer_group = self.get_consumer_group(group_id).with_error(|error| {
+            format!(
+                "{COMPONENT} (error: {error}) - failed to get consumer group with id: {group_id}"
+            )
         })?;
         let mut consumer_group = consumer_group.write().await;
         consumer_group.add_member(member_id).await;
@@ -217,8 +219,10 @@ impl Topic {
         group_id: &Identifier,
         member_id: u32,
     ) -> Result<(), IggyError> {
-        let consumer_group = self.get_consumer_group(group_id).with_error_context(|error| {
-            format!("{COMPONENT} (error: {error}) - failed to get consumer group with id: {group_id}")
+        let consumer_group = self.get_consumer_group(group_id).with_error(|error| {
+            format!(
+                "{COMPONENT} (error: {error}) - failed to get consumer group with id: {group_id}"
+            )
         })?;
         let mut consumer_group = consumer_group.write().await;
         consumer_group.delete_member(member_id).await;
