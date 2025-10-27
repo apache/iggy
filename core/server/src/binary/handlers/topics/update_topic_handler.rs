@@ -47,7 +47,7 @@ impl ServerCommandHandler for UpdateTopic {
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
         let name_changed = !self.name.is_empty();
-        shard.update_topic2(
+        shard.update_topic(
             session,
             &self.stream_id,
             &self.topic_id,
@@ -63,17 +63,17 @@ impl ServerCommandHandler for UpdateTopic {
         } else {
             self.topic_id.clone()
         };
-        self.message_expiry = shard.streams2.with_topic_by_id(
+        self.message_expiry = shard.streams.with_topic_by_id(
             &self.stream_id,
             &topic_id,
             topics::helpers::get_message_expiry(),
         );
-        self.max_topic_size = shard.streams2.with_topic_by_id(
+        self.max_topic_size = shard.streams.with_topic_by_id(
             &self.stream_id,
             &topic_id,
             topics::helpers::get_max_topic_size(),
         );
-        let event = ShardEvent::UpdatedTopic2 {
+        let event = ShardEvent::UpdatedTopic {
             stream_id: self.stream_id.clone(),
             topic_id: self.topic_id.clone(),
             name: self.name.clone(),

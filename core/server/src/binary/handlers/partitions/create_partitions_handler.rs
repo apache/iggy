@@ -52,7 +52,7 @@ impl ServerCommandHandler for CreatePartitions {
         let _partition_guard = shard.fs_locks.partition_lock.lock().await;
 
         let partitions = shard
-            .create_partitions2(
+            .create_partitions(
                 session,
                 &self.stream_id,
                 &self.topic_id,
@@ -60,23 +60,23 @@ impl ServerCommandHandler for CreatePartitions {
             )
             .await?;
         let partition_ids = partitions.iter().map(|p| p.id()).collect::<Vec<_>>();
-        let event = ShardEvent::CreatedPartitions2 {
+        let event = ShardEvent::CreatedPartitions {
             stream_id: self.stream_id.clone(),
             topic_id: self.topic_id.clone(),
             partitions,
         };
         shard.broadcast_event_to_all_shards(event).await?;
 
-        shard.streams2.with_topic_by_id_mut(
+        shard.streams.with_topic_by_id_mut(
             &self.stream_id,
             &self.topic_id,
             topics::helpers::rebalance_consumer_group(&partition_ids),
         );
 
         let stream_id = shard
-            .streams2
+            .streams
             .with_stream_by_id(&self.stream_id, streams::helpers::get_stream_id());
-        let topic_id = shard.streams2.with_topic_by_id(
+        let topic_id = shard.streams.with_topic_by_id(
             &self.stream_id,
             &self.topic_id,
             topics::helpers::get_topic_id(),

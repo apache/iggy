@@ -22,7 +22,7 @@ use crate::{
     binary::handlers::messages::poll_messages_handler::IggyPollMetadata,
     shard::transmission::message::ShardMessage,
     streaming::{
-        segments::IggyMessagesBatchSet, streams::stream2, topics::topic2, users::user::User,
+        segments::IggyMessagesBatchSet, streams::stream, topics::topic, users::user::User,
     },
 };
 
@@ -34,8 +34,8 @@ pub enum ShardResponse {
     FlushUnsavedBuffer,
     DeleteSegments,
     Event,
-    CreateStreamResponse(stream2::Stream),
-    CreateTopicResponse(topic2::Topic),
+    CreateStreamResponse(stream::Stream),
+    CreateTopicResponse(topic::Topic),
     CreateUserResponse(User),
     GetStatsResponse(Stats),
     ErrorResponse(IggyError),

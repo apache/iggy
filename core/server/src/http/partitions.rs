@@ -58,7 +58,7 @@ async fn create_partitions(
     command.validate()?;
 
     let session = Session::stateless(identity.user_id, identity.ip_address);
-    let partitions = SendWrapper::new(state.shard.shard().create_partitions2(
+    let partitions = SendWrapper::new(state.shard.shard().create_partitions(
         &session,
         &command.stream_id,
         &command.topic_id,
@@ -69,7 +69,7 @@ async fn create_partitions(
     let broadcast_future = SendWrapper::new(async {
         let shard = state.shard.shard();
 
-        let event = ShardEvent::CreatedPartitions2 {
+        let event = ShardEvent::CreatedPartitions {
             stream_id: command.stream_id.clone(),
             topic_id: command.topic_id.clone(),
             partitions,
@@ -112,7 +112,7 @@ async fn delete_partitions(
 
     let session = Session::stateless(identity.user_id, identity.ip_address);
     let deleted_partition_ids = {
-        let delete_future = SendWrapper::new(state.shard.shard().delete_partitions2(
+        let delete_future = SendWrapper::new(state.shard.shard().delete_partitions(
             &session,
             &query.stream_id,
             &query.topic_id,
@@ -129,7 +129,7 @@ async fn delete_partitions(
     // Send event for partition deletion
     {
         let broadcast_future = SendWrapper::new(async {
-            let event = ShardEvent::DeletedPartitions2 {
+            let event = ShardEvent::DeletedPartitions {
                 stream_id: query.stream_id.clone(),
                 topic_id: query.topic_id.clone(),
                 partitions_count: query.partitions_count,

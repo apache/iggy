@@ -104,7 +104,7 @@ async fn should_be_initialized_based_on_state_entries() {
         partitions_count: 2,
     };
 
-    let delete_stream2 = DeleteStream {
+    let delete_stream = DeleteStream {
         stream_id: stream2_id.try_into().unwrap(),
     };
 
@@ -192,7 +192,7 @@ async fn should_be_initialized_based_on_state_entries() {
         .await
         .unwrap();
     state
-        .apply(user_id, &EntryCommand::DeleteStream(delete_stream2))
+        .apply(user_id, &EntryCommand::DeleteStream(delete_stream))
         .await
         .unwrap();
     state

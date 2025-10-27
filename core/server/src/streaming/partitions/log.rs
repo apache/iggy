@@ -1,6 +1,6 @@
 use crate::streaming::{
     partitions::journal::Journal,
-    segments::{IggyIndexesMut, Segment2, storage::Storage},
+    segments::{IggyIndexesMut, Segment, storage::Storage},
 };
 use iggy_common::INDEX_SIZE;
 use ringbuffer::AllocRingBuffer;
@@ -19,7 +19,7 @@ where
     // A background task uses this to identify and close file descriptors for unused segments.
     _access_map: AllocRingBuffer<usize>,
     _cache: (),
-    segments: Vec<Segment2>,
+    segments: Vec<Segment>,
     indexes: Vec<Option<IggyIndexesMut>>,
     storage: Vec<Storage>,
 }
@@ -48,11 +48,11 @@ where
         !self.segments.is_empty()
     }
 
-    pub fn segments(&self) -> &Vec<Segment2> {
+    pub fn segments(&self) -> &Vec<Segment> {
         &self.segments
     }
 
-    pub fn segments_mut(&mut self) -> &mut Vec<Segment2> {
+    pub fn segments_mut(&mut self) -> &mut Vec<Segment> {
         &mut self.segments
     }
 
@@ -64,13 +64,13 @@ where
         &self.storage
     }
 
-    pub fn active_segment(&self) -> &Segment2 {
+    pub fn active_segment(&self) -> &Segment {
         self.segments
             .last()
             .expect("active segment called on empty log")
     }
 
-    pub fn active_segment_mut(&mut self) -> &mut Segment2 {
+    pub fn active_segment_mut(&mut self) -> &mut Segment {
         self.segments
             .last_mut()
             .expect("active segment called on empty log")
@@ -129,7 +129,7 @@ where
         }
     }
 
-    pub fn add_persisted_segment(&mut self, segment: Segment2, storage: Storage) {
+    pub fn add_persisted_segment(&mut self, segment: Segment, storage: Storage) {
         self.segments.push(segment);
         self.storage.push(storage);
         self.indexes.push(None);

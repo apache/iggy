@@ -55,7 +55,7 @@ async fn save_messages(shard: Rc<IggyShard>) -> Result<(), IggyError> {
         let partition_id = ns.partition_id();
 
         match shard
-            .streams2
+            .streams
             .persist_messages(
                 &stream_id,
                 &topic_id,
@@ -103,7 +103,7 @@ async fn fsync_all_segments_on_shutdown(shard: Rc<IggyShard>, result: Result<(),
         let partition_id = ns.partition_id();
 
         match shard
-            .streams2
+            .streams
             .fsync_all_messages(&stream_id, &topic_id, partition_id)
             .await
         {

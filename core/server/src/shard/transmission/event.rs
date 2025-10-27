@@ -1,10 +1,10 @@
 use crate::streaming::{
-    partitions::partition2,
+    partitions::partition,
     personal_access_tokens::personal_access_token::PersonalAccessToken,
-    streams::stream2,
+    streams::stream,
     topics::{
-        consumer_group2::{self},
-        topic2,
+        consumer_group::{self},
+        topic,
     },
 };
 use iggy_common::{
@@ -24,48 +24,48 @@ pub enum ShardEvent {
         partition_id: usize,
         fsync: bool,
     },
-    CreatedStream2 {
+    CreatedStream {
         id: usize,
-        stream: stream2::Stream,
+        stream: stream::Stream,
     },
-    DeletedStream2 {
+    DeletedStream {
         id: usize,
         stream_id: Identifier,
     },
-    UpdatedStream2 {
+    UpdatedStream {
         stream_id: Identifier,
         name: String,
     },
-    PurgedStream2 {
+    PurgedStream {
         stream_id: Identifier,
     },
-    CreatedPartitions2 {
+    CreatedPartitions {
         stream_id: Identifier,
         topic_id: Identifier,
-        partitions: Vec<partition2::Partition>,
+        partitions: Vec<partition::Partition>,
     },
-    DeletedPartitions2 {
+    DeletedPartitions {
         stream_id: Identifier,
         topic_id: Identifier,
         partitions_count: u32,
         partition_ids: Vec<usize>,
     },
-    CreatedTopic2 {
+    CreatedTopic {
         stream_id: Identifier,
-        topic: topic2::Topic,
+        topic: topic::Topic,
     },
-    CreatedConsumerGroup2 {
+    CreatedConsumerGroup {
         stream_id: Identifier,
         topic_id: Identifier,
-        cg: consumer_group2::ConsumerGroup,
+        cg: consumer_group::ConsumerGroup,
     },
-    DeletedConsumerGroup2 {
+    DeletedConsumerGroup {
         id: usize,
         stream_id: Identifier,
         topic_id: Identifier,
         group_id: Identifier,
     },
-    UpdatedTopic2 {
+    UpdatedTopic {
         stream_id: Identifier,
         topic_id: Identifier,
         name: String,
@@ -78,7 +78,7 @@ pub enum ShardEvent {
         stream_id: Identifier,
         topic_id: Identifier,
     },
-    DeletedTopic2 {
+    DeletedTopic {
         id: usize,
         stream_id: Identifier,
         topic_id: Identifier,

@@ -83,9 +83,9 @@ async fn get_topic(
     let numeric_stream_id = state
         .shard
         .shard()
-        .streams2
+        .streams
         .with_stream_by_id(&identity_stream_id, streams::helpers::get_stream_id());
-    let numeric_topic_id = state.shard.shard().streams2.with_topic_by_id(
+    let numeric_topic_id = state.shard.shard().streams.with_topic_by_id(
         &identity_stream_id,
         &identity_topic_id,
         topics::helpers::get_topic_id(),
@@ -103,7 +103,7 @@ async fn get_topic(
         })?;
 
     // Get topic details using the new API
-    let topic_details = state.shard.shard().streams2.with_topic_by_id(
+    let topic_details = state.shard.shard().streams.with_topic_by_id(
         &identity_stream_id,
         &identity_topic_id,
         |(root, _, stats)| crate::http::mapper::map_topic_details(&root, &stats),
@@ -128,7 +128,7 @@ async fn get_topics(
     let numeric_stream_id = state
         .shard
         .shard()
-        .streams2
+        .streams
         .with_stream_by_id(&stream_id, streams::helpers::get_stream_id());
 
     state.shard.shard()
@@ -146,7 +146,7 @@ async fn get_topics(
     let topics = state
         .shard
         .shard()
-        .streams2
+        .streams
         .with_topics(&stream_id, |topics| {
             topics.with_components(|topics| {
                 let (roots, _, stats) = topics.into_components();
@@ -171,7 +171,7 @@ async fn create_topic(
     let session = SendWrapper::new(Session::stateless(identity.user_id, identity.ip_address));
 
     let topic = {
-        let future = SendWrapper::new(state.shard.shard().create_topic2(
+        let future = SendWrapper::new(state.shard.shard().create_topic(
             &session,
             &command.stream_id,
             command.name.clone(),
@@ -198,7 +198,7 @@ async fn create_topic(
 
         let shard = state.shard.shard();
 
-        let event = ShardEvent::CreatedTopic2 {
+        let event = ShardEvent::CreatedTopic {
             stream_id: command.stream_id.clone(),
             topic,
         };
@@ -206,7 +206,7 @@ async fn create_topic(
 
         // Create partitions
         let partitions = shard
-            .create_partitions2(
+            .create_partitions(
                 &session,
                 &command.stream_id,
                 &Identifier::numeric(topic_id as u32).unwrap(),
@@ -214,7 +214,7 @@ async fn create_topic(
             )
             .await?;
 
-        let event = ShardEvent::CreatedPartitions2 {
+        let event = ShardEvent::CreatedPartitions {
             stream_id: command.stream_id.clone(),
             topic_id: Identifier::numeric(topic_id as u32).unwrap(),
             partitions,
@@ -234,7 +234,7 @@ async fn create_topic(
     // Create response using the same approach as binary handler
     let response = {
         let topic_identifier = Identifier::numeric(topic_id as u32).unwrap();
-        let topic_response = state.shard.shard().streams2.with_topic_by_id(
+        let topic_response = state.shard.shard().streams.with_topic_by_id(
             &command.stream_id,
             &topic_identifier,
             |(root, _, stats)| {
@@ -283,7 +283,7 @@ async fn update_topic(
     let session = Session::stateless(identity.user_id, identity.ip_address);
 
     let name_changed = !command.name.is_empty();
-    state.shard.shard().update_topic2(
+    state.shard.shard().update_topic(
         &session,
         &command.stream_id,
         &command.topic_id,
@@ -306,7 +306,7 @@ async fn update_topic(
     };
 
     // Get the updated values from the topic
-    let (message_expiry, max_topic_size) = state.shard.shard().streams2.with_topic_by_id(
+    let (message_expiry, max_topic_size) = state.shard.shard().streams.with_topic_by_id(
         &command.stream_id,
         &topic_id,
         |(root, _, _)| (root.message_expiry(), root.max_topic_size()),
@@ -316,7 +316,7 @@ async fn update_topic(
     {
         let broadcast_future = SendWrapper::new(async {
             use crate::shard::transmission::event::ShardEvent;
-            let event = ShardEvent::UpdatedTopic2 {
+            let event = ShardEvent::UpdatedTopic {
                 stream_id: command.stream_id.clone(),
                 topic_id: command.topic_id.clone(),
                 name: command.name.clone(),
@@ -364,7 +364,7 @@ async fn delete_topic(
     let session = Session::stateless(identity.user_id, identity.ip_address);
 
     let topic = {
-        let future = SendWrapper::new(state.shard.shard().delete_topic2(
+        let future = SendWrapper::new(state.shard.shard().delete_topic(
             &session,
             &identifier_stream_id,
             &identifier_topic_id,
@@ -382,7 +382,7 @@ async fn delete_topic(
     {
         let broadcast_future = SendWrapper::new(async {
             use crate::shard::transmission::event::ShardEvent;
-            let event = ShardEvent::DeletedTopic2 {
+            let event = ShardEvent::DeletedTopic {
                 id: topic_id_numeric,
                 stream_id: identifier_stream_id.clone(),
                 topic_id: identifier_topic_id.clone(),
@@ -429,7 +429,7 @@ async fn purge_topic(
     let session = Session::stateless(identity.user_id, identity.ip_address);
 
     {
-        let future = SendWrapper::new(state.shard.shard().purge_topic2(
+        let future = SendWrapper::new(state.shard.shard().purge_topic(
             &session,
             &identifier_stream_id,
             &identifier_topic_id,

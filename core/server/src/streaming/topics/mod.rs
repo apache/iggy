@@ -16,9 +16,9 @@
  * under the License.
  */
 
-pub mod consumer_group2;
+pub mod consumer_group;
 pub mod helpers;
-pub mod storage2;
-pub mod topic2;
+pub mod storage;
+pub mod topic;
 
 pub const COMPONENT: &str = "STREAMING_TOPICS";

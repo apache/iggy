@@ -17,7 +17,7 @@
  */
 
 pub mod helpers;
-pub mod storage2;
-pub mod stream2;
+pub mod storage;
+pub mod stream;
 
 pub const COMPONENT: &str = "STREAMING_STREAMS";

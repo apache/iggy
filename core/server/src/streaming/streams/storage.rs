@@ -1,6 +1,6 @@
 use crate::slab::traits_ext::{DeleteCell, EntityComponentSystem, EntityMarker, IntoComponents};
-use crate::streaming::streams::stream2;
-use crate::streaming::topics::storage2::delete_topic_from_disk;
+use crate::streaming::streams::stream;
+use crate::streaming::topics::storage::delete_topic_from_disk;
 use crate::{configs::system::SystemConfig, io::fs_utils::remove_dir_all};
 use compio::fs::create_dir_all;
 use iggy_common::IggyError;
@@ -24,7 +24,7 @@ pub async fn create_stream_file_hierarchy(
 }
 
 pub async fn delete_stream_from_disk(
-    stream: &mut stream2::Stream,
+    stream: &mut stream::Stream,
     config: &SystemConfig,
 ) -> Result<(), IggyError> {
     let stream_id = stream.id();

@@ -8,7 +8,7 @@ use crate::{
         partitions::{
             journal::MemoryMessageJournal,
             log::SegmentedLog,
-            partition2::{
+            partition::{
                 self, ConsumerGroupOffsets, ConsumerOffsets, Partition, PartitionRef,
                 PartitionRefMut,
             },
@@ -25,7 +25,7 @@ pub type ContainerId = usize;
 
 #[derive(Debug)]
 pub struct Partitions {
-    root: Slab<partition2::PartitionRoot>,
+    root: Slab<partition::PartitionRoot>,
     stats: Slab<Arc<PartitionStats>>,
     message_deduplicator: Slab<Option<Arc<MessageDeduplicator>>>,
     offset: Slab<Arc<AtomicU64>>,

@@ -72,17 +72,17 @@ impl ServerCommandHandler for CreateStream {
                     // Acquire stream lock to serialize filesystem operations
                     let _stream_guard = shard.fs_locks.stream_lock.lock().await;
 
-                    let stream = shard.create_stream2(session, name).await?;
+                    let stream = shard.create_stream(session, name).await?;
                     let created_stream_id = stream.id();
 
-                    let event = ShardEvent::CreatedStream2 {
+                    let event = ShardEvent::CreatedStream {
                         id: created_stream_id,
                         stream: stream.clone(),
                     };
                     shard.broadcast_event_to_all_shards(event).await?;
 
                     let response = shard
-                        .streams2
+                        .streams
                         .with_components_by_id(created_stream_id, |(root, stats)| {
                             mapper::map_stream(&root, &stats)
                         });

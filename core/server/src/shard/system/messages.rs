@@ -48,11 +48,11 @@ impl IggyShard {
         self.ensure_topic_exists(&stream_id, &topic_id)?;
 
         let numeric_stream_id = self
-            .streams2
+            .streams
             .with_stream_by_id(&stream_id, streams::helpers::get_stream_id());
 
         let numeric_topic_id =
-            self.streams2
+            self.streams
                 .with_topic_by_id(&stream_id, &topic_id, topics::helpers::get_topic_id());
 
         // Validate permissions for given user on stream and topic.
@@ -72,7 +72,7 @@ impl IggyShard {
         }
 
         let partition_id =
-            self.streams2
+            self.streams
                 .with_topic_by_id(
                     &stream_id,
                     &topic_id,
@@ -120,7 +120,7 @@ impl IggyShard {
                     // Encrypt messages if encryptor is enabled in configuration.
                     let batch = self.maybe_encrypt_messages(batch)?;
                     let messages_count = batch.count();
-                    self.streams2
+                    self.streams
                         .append_messages(&self.config.system, &self.task_registry, &ns, batch)
                         .await?;
                     self.metrics.increment_messages(messages_count as u64);
@@ -157,10 +157,10 @@ impl IggyShard {
         self.ensure_topic_exists(&stream_id, &topic_id)?;
 
         let numeric_stream_id = self
-            .streams2
+            .streams
             .with_stream_by_id(&stream_id, streams::helpers::get_stream_id());
         let numeric_topic_id =
-            self.streams2
+            self.streams
                 .with_topic_by_id(&stream_id, &topic_id, topics::helpers::get_topic_id());
 
         self.permissioner
@@ -187,7 +187,7 @@ impl IggyShard {
 
         self.ensure_partition_exists(&stream_id, &topic_id, partition_id)?;
 
-        let current_offset = self.streams2.with_partition_by_id(
+        let current_offset = self.streams.with_partition_by_id(
             &stream_id,
             &topic_id,
             partition_id,
@@ -221,7 +221,7 @@ impl IggyShard {
                     let ns = IggyFullNamespace::new(stream_id, topic_id, partition_id);
                     let auto_commit = args.auto_commit;
                     let (metadata, batches) =
-                        self.streams2.poll_messages(&ns, consumer, args).await?;
+                        self.streams.poll_messages(&ns, consumer, args).await?;
                     let stream_id = ns.stream_id();
                     let topic_id = ns.topic_id();
 
@@ -229,7 +229,7 @@ impl IggyShard {
                         let offset = batches
                             .last_offset()
                             .expect("Batch set should have at least one batch");
-                        self.streams2
+                        self.streams
                             .auto_commit_consumer_offset(
                                 &self.config.system,
                                 stream_id,
@@ -276,11 +276,11 @@ impl IggyShard {
         self.ensure_partition_exists(&stream_id, &topic_id, partition_id)?;
 
         let numeric_stream_id = self
-            .streams2
+            .streams
             .with_stream_by_id(&stream_id, streams::helpers::get_stream_id());
 
         let numeric_topic_id =
-            self.streams2
+            self.streams
                 .with_topic_by_id(&stream_id, &topic_id, topics::helpers::get_topic_id());
 
         // Validate permissions for given user on stream and topic.
@@ -338,14 +338,14 @@ impl IggyShard {
         partition_id: usize,
         fsync: bool,
     ) -> Result<(), IggyError> {
-        let batches = self.streams2.with_partition_by_id_mut(
+        let batches = self.streams.with_partition_by_id_mut(
             stream_id,
             topic_id,
             partition_id,
             partitions::helpers::commit_journal(),
         );
 
-        self.streams2
+        self.streams
             .persist_messages_to_disk(
                 stream_id,
                 topic_id,
@@ -357,7 +357,7 @@ impl IggyShard {
 
         // Ensure all data is flushed to disk before returning
         if fsync {
-            self.streams2
+            self.streams
                 .fsync_all_messages(stream_id, topic_id, partition_id)
                 .await?;
         }

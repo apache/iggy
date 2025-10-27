@@ -20,8 +20,8 @@ pub mod consumer_offset;
 pub mod helpers;
 pub mod journal;
 pub mod log;
-pub mod partition2;
+pub mod partition;
 pub mod segments;
-pub mod storage2;
+pub mod storage;
 
 pub const COMPONENT: &str = "STREAMING_PARTITIONS";

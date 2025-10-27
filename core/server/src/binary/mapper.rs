@@ -21,12 +21,12 @@ use std::sync::{Arc, atomic::AtomicU64};
 use crate::slab::Keyed;
 use crate::slab::traits_ext::{EntityComponentSystem, IntoComponents};
 use crate::streaming::clients::client_manager::Client;
-use crate::streaming::partitions::partition2::PartitionRoot;
+use crate::streaming::partitions::partition::PartitionRoot;
 use crate::streaming::personal_access_tokens::personal_access_token::PersonalAccessToken;
 use crate::streaming::stats::{PartitionStats, StreamStats, TopicStats};
-use crate::streaming::streams::stream2;
-use crate::streaming::topics::consumer_group2::{ConsumerGroupMembers, ConsumerGroupRoot, Member};
-use crate::streaming::topics::topic2::{self, TopicRoot};
+use crate::streaming::streams::stream;
+use crate::streaming::topics::consumer_group::{ConsumerGroupMembers, ConsumerGroupRoot, Member};
+use crate::streaming::topics::topic::{self, TopicRoot};
 use crate::streaming::users::user::User;
 use arcshift::SharedGetGuard;
 use bytes::{BufMut, Bytes, BytesMut};
@@ -152,7 +152,7 @@ pub fn map_personal_access_tokens(personal_access_tokens: Vec<PersonalAccessToke
     bytes.freeze()
 }
 
-pub fn map_streams(roots: &Slab<stream2::StreamRoot>, stats: &Slab<Arc<StreamStats>>) -> Bytes {
+pub fn map_streams(roots: &Slab<stream::StreamRoot>, stats: &Slab<Arc<StreamStats>>) -> Bytes {
     let mut bytes = BytesMut::new();
     for (root, stat) in roots
         .iter()
@@ -164,7 +164,7 @@ pub fn map_streams(roots: &Slab<stream2::StreamRoot>, stats: &Slab<Arc<StreamSta
     bytes.freeze()
 }
 
-pub fn map_stream(root: &stream2::StreamRoot, stats: &StreamStats) -> Bytes {
+pub fn map_stream(root: &stream::StreamRoot, stats: &StreamStats) -> Bytes {
     let mut bytes = BytesMut::new();
     extend_stream(root, stats, &mut bytes);
     root.topics().with_components(|topics| {
@@ -192,7 +192,7 @@ pub fn map_topics(roots: &Slab<TopicRoot>, stats: &Slab<Arc<TopicStats>>) -> Byt
     bytes.freeze()
 }
 
-pub fn map_topic(root: &topic2::TopicRoot, stats: &TopicStats) -> Bytes {
+pub fn map_topic(root: &topic::TopicRoot, stats: &TopicStats) -> Bytes {
     let mut bytes = BytesMut::new();
     extend_topic(root, stats, &mut bytes);
     root.partitions().with_components(|partitions| {
@@ -241,7 +241,7 @@ pub fn map_consumer_groups(
     bytes.freeze()
 }
 
-fn extend_stream(root: &stream2::StreamRoot, stats: &StreamStats, bytes: &mut BytesMut) {
+fn extend_stream(root: &stream::StreamRoot, stats: &StreamStats, bytes: &mut BytesMut) {
     bytes.put_u32_le(root.id() as u32);
     bytes.put_u64_le(root.created_at().into());
     bytes.put_u32_le(root.topics_count() as u32);

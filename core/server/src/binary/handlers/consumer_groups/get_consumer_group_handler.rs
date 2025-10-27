@@ -44,13 +44,13 @@ impl ServerCommandHandler for GetConsumerGroup {
         debug!("session: {session}, command: {self}");
         shard.ensure_authenticated(session)?;
         shard.ensure_consumer_group_exists(&self.stream_id, &self.topic_id, &self.group_id)?;
-        let numeric_topic_id = shard.streams2.with_topic_by_id(
+        let numeric_topic_id = shard.streams.with_topic_by_id(
             &self.stream_id,
             &self.topic_id,
             topics::helpers::get_topic_id(),
         );
         let numeric_stream_id = shard
-            .streams2
+            .streams
             .with_stream_by_id(&self.stream_id, streams::helpers::get_stream_id());
         shard.permissioner.borrow().get_consumer_group(
             session.get_user_id(),
@@ -58,7 +58,7 @@ impl ServerCommandHandler for GetConsumerGroup {
             numeric_topic_id,
         )?;
 
-        let consumer_group = shard.streams2.with_consumer_group_by_id(
+        let consumer_group = shard.streams.with_consumer_group_by_id(
             &self.stream_id,
             &self.topic_id,
             &self.group_id,

@@ -20,8 +20,8 @@ use super::COMPONENT;
 use crate::shard::IggyShard;
 use crate::slab::traits_ext::{EntityComponentSystem, EntityMarker, InsertCell, IntoComponents};
 use crate::streaming::session::Session;
-use crate::streaming::topics::storage2::{create_topic_file_hierarchy, delete_topic_from_disk};
-use crate::streaming::topics::topic2::{self};
+use crate::streaming::topics::storage::{create_topic_file_hierarchy, delete_topic_from_disk};
+use crate::streaming::topics::topic::{self};
 use crate::streaming::{partitions, streams, topics};
 use error_set::ErrContext;
 use iggy_common::{CompressionAlgorithm, Identifier, IggyError, IggyExpiry, MaxTopicSize};
@@ -30,7 +30,7 @@ use tracing::info;
 
 impl IggyShard {
     #[allow(clippy::too_many_arguments)]
-    pub async fn create_topic2(
+    pub async fn create_topic(
         &self,
         session: &Session,
         stream_id: &Identifier,
@@ -39,10 +39,10 @@ impl IggyShard {
         compression: CompressionAlgorithm,
         max_topic_size: MaxTopicSize,
         replication_factor: Option<u8>,
-    ) -> Result<topic2::Topic, IggyError> {
+    ) -> Result<topic::Topic, IggyError> {
         self.ensure_authenticated(session)?;
         self.ensure_stream_exists(stream_id)?;
-        let numeric_stream_id = self.streams2.get_index(stream_id);
+        let numeric_stream_id = self.streams.get_index(stream_id);
         {
             self.permissioner
             .borrow()
@@ -54,7 +54,7 @@ impl IggyShard {
                     )
                 })?;
         }
-        let exists = self.streams2.with_topics(
+        let exists = self.streams.with_topics(
             stream_id,
             topics::helpers::exists(&Identifier::from_str(&name).unwrap()),
         );
@@ -64,13 +64,13 @@ impl IggyShard {
 
         let config = &self.config.system;
         let parent_stats = self
-            .streams2
+            .streams
             .with_stream_by_id(stream_id, |(_, stats)| stats.clone());
         let message_expiry = config.resolve_message_expiry(message_expiry);
         info!("Topic message expiry: {}", message_expiry);
         let max_topic_size = config.resolve_max_topic_size(max_topic_size)?;
-        let topic = topic2::create_and_insert_topics_mem(
-            &self.streams2,
+        let topic = topic::create_and_insert_topics_mem(
+            &self.streams,
             stream_id,
             name,
             replication_factor.unwrap_or(1),
@@ -86,13 +86,13 @@ impl IggyShard {
         Ok(topic)
     }
 
-    pub fn create_topic2_bypass_auth(&self, stream_id: &Identifier, topic: topic2::Topic) -> usize {
-        self.streams2
+    pub fn create_topic_bypass_auth(&self, stream_id: &Identifier, topic: topic::Topic) -> usize {
+        self.streams
             .with_topics(stream_id, |topics| topics.insert(topic))
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn update_topic2(
+    pub fn update_topic(
         &self,
         session: &Session,
         stream_id: &Identifier,
@@ -106,13 +106,11 @@ impl IggyShard {
         self.ensure_authenticated(session)?;
         self.ensure_topic_exists(stream_id, topic_id)?;
         {
-            let topic_id_val = self.streams2.with_topic_by_id(
-                stream_id,
-                topic_id,
-                topics::helpers::get_topic_id(),
-            );
+            let topic_id_val =
+                self.streams
+                    .with_topic_by_id(stream_id, topic_id, topics::helpers::get_topic_id());
             let stream_id_val = self
-                .streams2
+                .streams
                 .with_stream_by_id(stream_id, streams::helpers::get_stream_id());
             self.permissioner.borrow().update_topic(
                 session.get_user_id(),
@@ -128,7 +126,7 @@ impl IggyShard {
             })?;
         }
 
-        self.update_topic_base2(
+        self.update_topic_base(
             stream_id,
             topic_id,
             name,
@@ -141,7 +139,7 @@ impl IggyShard {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn update_topic_bypass_auth2(
+    pub fn update_topic_bypass_auth(
         &self,
         stream_id: &Identifier,
         topic_id: &Identifier,
@@ -151,7 +149,7 @@ impl IggyShard {
         max_topic_size: MaxTopicSize,
         replication_factor: Option<u8>,
     ) -> Result<(), IggyError> {
-        self.update_topic_base2(
+        self.update_topic_base(
             stream_id,
             topic_id,
             name,
@@ -164,7 +162,7 @@ impl IggyShard {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn update_topic_base2(
+    pub fn update_topic_base(
         &self,
         stream_id: &Identifier,
         topic_id: &Identifier,
@@ -182,27 +180,27 @@ impl IggyShard {
             replication_factor,
         );
         let (old_name, new_name) =
-            self.streams2
+            self.streams
                 .with_topic_by_id_mut(stream_id, topic_id, update_topic_closure);
         if old_name != new_name {
             let rename_closure = topics::helpers::rename_index(&old_name, new_name);
-            self.streams2.with_topics(stream_id, rename_closure);
+            self.streams.with_topics(stream_id, rename_closure);
         }
     }
 
-    pub async fn delete_topic2(
+    pub async fn delete_topic(
         &self,
         session: &Session,
         stream_id: &Identifier,
         topic_id: &Identifier,
-    ) -> Result<topic2::Topic, IggyError> {
+    ) -> Result<topic::Topic, IggyError> {
         self.ensure_authenticated(session)?;
         self.ensure_topic_exists(stream_id, topic_id)?;
         let numeric_topic_id =
-            self.streams2
+            self.streams
                 .with_topic_by_id(stream_id, topic_id, topics::helpers::get_topic_id());
         let numeric_stream_id = self
-            .streams2
+            .streams
             .with_stream_by_id(stream_id, streams::helpers::get_stream_id());
         self.permissioner
             .borrow()
@@ -213,7 +211,7 @@ impl IggyShard {
                         session.get_user_id(),
                     )
                 })?;
-        let mut topic = self.delete_topic_base2(stream_id, topic_id);
+        let mut topic = self.delete_topic_base(stream_id, topic_id);
         let topic_id_numeric = topic.id();
 
         // Clean up consumer groups from ClientManager for this topic
@@ -249,24 +247,20 @@ impl IggyShard {
         Ok(topic)
     }
 
-    pub fn delete_topic_bypass_auth2(
+    pub fn delete_topic_bypass_auth(
         &self,
         stream_id: &Identifier,
         topic_id: &Identifier,
-    ) -> topic2::Topic {
-        self.delete_topic_base2(stream_id, topic_id)
+    ) -> topic::Topic {
+        self.delete_topic_base(stream_id, topic_id)
     }
 
-    pub fn delete_topic_base2(
-        &self,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-    ) -> topic2::Topic {
-        self.streams2
+    pub fn delete_topic_base(&self, stream_id: &Identifier, topic_id: &Identifier) -> topic::Topic {
+        self.streams
             .with_topics(stream_id, topics::helpers::delete_topic(topic_id))
     }
 
-    pub async fn purge_topic2(
+    pub async fn purge_topic(
         &self,
         session: &Session,
         stream_id: &Identifier,
@@ -275,13 +269,11 @@ impl IggyShard {
         self.ensure_authenticated(session)?;
         self.ensure_topic_exists(stream_id, topic_id)?;
         {
-            let topic_id = self.streams2.with_topic_by_id(
-                stream_id,
-                topic_id,
-                topics::helpers::get_topic_id(),
-            );
+            let topic_id =
+                self.streams
+                    .with_topic_by_id(stream_id, topic_id, topics::helpers::get_topic_id());
             let stream_id = self
-                .streams2
+                .streams
                 .with_stream_by_id(stream_id, streams::helpers::get_stream_id());
             self.permissioner.borrow().purge_topic(
                 session.get_user_id(),
@@ -295,7 +287,7 @@ impl IggyShard {
             })?;
         }
 
-        let (consumer_offset_paths, consumer_group_offset_paths) = self.streams2.with_partitions(
+        let (consumer_offset_paths, consumer_group_offset_paths) = self.streams.with_partitions(
             stream_id,
             topic_id,
             partitions::helpers::purge_consumer_offsets(),
@@ -307,26 +299,26 @@ impl IggyShard {
             self.delete_consumer_offset_from_disk(&path).await?;
         }
 
-        self.purge_topic_base2(stream_id, topic_id).await?;
+        self.purge_topic_base(stream_id, topic_id).await?;
         Ok(())
     }
 
-    pub async fn purge_topic2_bypass_auth(
+    pub async fn purge_topic_bypass_auth(
         &self,
         stream_id: &Identifier,
         topic_id: &Identifier,
     ) -> Result<(), IggyError> {
-        self.purge_topic_base2(stream_id, topic_id).await?;
+        self.purge_topic_base(stream_id, topic_id).await?;
         Ok(())
     }
 
-    async fn purge_topic_base2(
+    async fn purge_topic_base(
         &self,
         stream_id: &Identifier,
         topic_id: &Identifier,
     ) -> Result<(), IggyError> {
         let part_ids = self
-            .streams2
+            .streams
             .with_partitions(stream_id, topic_id, |partitions| {
                 partitions.with_components(|components| {
                     let (roots, ..) = components.into_components();
@@ -334,7 +326,7 @@ impl IggyShard {
                 })
             });
 
-        self.streams2.with_partitions(
+        self.streams.with_partitions(
             stream_id,
             topic_id,
             partitions::helpers::purge_partitions_mem(),
@@ -346,7 +338,7 @@ impl IggyShard {
         }
 
         // Zero out topic stats after purging all partitions
-        self.streams2
+        self.streams
             .with_topic_by_id(stream_id, topic_id, |(_root, _aux, stats)| {
                 stats.zero_out_all();
             });

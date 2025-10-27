@@ -13,10 +13,10 @@ use crate::{
     streaming::{
         stats::TopicStats,
         topics::{
-            consumer_group2::{
+            consumer_group::{
                 self, ConsumerGroupMembers, ConsumerGroupRef, ConsumerGroupRefMut, Member,
             },
-            topic2::{Topic, TopicRef, TopicRefMut, TopicRoot},
+            topic::{Topic, TopicRef, TopicRefMut, TopicRoot},
         },
         utils::hash,
     },
@@ -122,7 +122,7 @@ pub fn get_consumer_group_id()
 
 pub fn delete_consumer_group(
     group_id: &Identifier,
-) -> impl FnOnce(&mut ConsumerGroups) -> consumer_group2::ConsumerGroup {
+) -> impl FnOnce(&mut ConsumerGroups) -> consumer_group::ConsumerGroup {
     |container| {
         let id = container.get_index(group_id);
         let group = container.delete(id);

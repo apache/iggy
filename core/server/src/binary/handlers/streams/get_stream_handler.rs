@@ -47,7 +47,7 @@ impl ServerCommandHandler for GetStream {
         shard.ensure_authenticated(session)?;
         shard.ensure_stream_exists(&self.stream_id)?;
         let stream_id = shard
-            .streams2
+            .streams
             .with_stream_by_id(&self.stream_id, streams::helpers::get_stream_id());
         shard
             .permissioner
@@ -61,7 +61,7 @@ impl ServerCommandHandler for GetStream {
                 )
             })?;
         let response = shard
-            .streams2
+            .streams
             .with_components_by_id(stream_id, |(root, stats)| mapper::map_stream(&root, &stats));
         sender.send_ok_response(&response).await?;
         Ok(())

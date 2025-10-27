@@ -24,10 +24,10 @@ use crate::shard::transmission::id::ShardId;
 use crate::slab::traits_ext::EntityMarker;
 use crate::slab::traits_ext::IntoComponents;
 use crate::streaming::partitions;
-use crate::streaming::partitions::partition2;
-use crate::streaming::partitions::storage2::create_partition_file_hierarchy;
-use crate::streaming::partitions::storage2::delete_partitions_from_disk;
-use crate::streaming::segments::Segment2;
+use crate::streaming::partitions::partition;
+use crate::streaming::partitions::storage::create_partition_file_hierarchy;
+use crate::streaming::partitions::storage::delete_partitions_from_disk;
+use crate::streaming::segments::Segment;
 use crate::streaming::segments::storage::create_segment_storage;
 use crate::streaming::session::Session;
 use crate::streaming::streams;
@@ -62,20 +62,20 @@ impl IggyShard {
         })
     }
 
-    pub async fn create_partitions2(
+    pub async fn create_partitions(
         &self,
         session: &Session,
         stream_id: &Identifier,
         topic_id: &Identifier,
         partitions_count: u32,
-    ) -> Result<Vec<partition2::Partition>, IggyError> {
+    ) -> Result<Vec<partition::Partition>, IggyError> {
         self.ensure_authenticated(session)?;
         self.ensure_topic_exists(stream_id, topic_id)?;
         let numeric_stream_id = self
-            .streams2
+            .streams
             .with_stream_by_id(stream_id, streams::helpers::get_stream_id());
         let numeric_topic_id =
-            self.streams2
+            self.streams
                 .with_topic_by_id(stream_id, topic_id, topics::helpers::get_topic_id());
 
         // Claude garbage, rework this.
@@ -86,10 +86,10 @@ impl IggyShard {
             "create",
         )?;
         let parent_stats =
-            self.streams2
+            self.streams
                 .with_topic_by_id(stream_id, topic_id, topics::helpers::get_stats());
-        let partitions = partition2::create_and_insert_partitions_mem(
-            &self.streams2,
+        let partitions = partition::create_and_insert_partitions_mem(
+            &self.streams,
             stream_id,
             topic_id,
             parent_stats,
@@ -129,10 +129,10 @@ impl IggyShard {
         partition_id: usize,
     ) -> Result<(), IggyError> {
         let numeric_stream_id = self
-            .streams2
+            .streams
             .with_stream_by_id(stream_id, streams::helpers::get_stream_id());
         let numeric_topic_id =
-            self.streams2
+            self.streams
                 .with_topic_by_id(stream_id, topic_id, topics::helpers::get_topic_id());
 
         let start_offset = 0;
@@ -141,17 +141,17 @@ impl IggyShard {
             partition_id, numeric_topic_id, numeric_stream_id, start_offset
         );
 
-        let segment = Segment2::new(
+        let segment = Segment::new(
             start_offset,
             self.config.system.segment.size,
             self.config.system.segment.message_expiry,
         );
 
         let numeric_stream_id = self
-            .streams2
+            .streams
             .with_stream_by_id(stream_id, streams::helpers::get_stream_id());
         let numeric_topic_id =
-            self.streams2
+            self.streams
                 .with_topic_by_id(stream_id, topic_id, topics::helpers::get_topic_id());
 
         let messages_size = 0;
@@ -167,7 +167,7 @@ impl IggyShard {
         )
         .await?;
 
-        self.streams2
+        self.streams
             .with_partition_by_id_mut(stream_id, topic_id, partition_id, |(.., log)| {
                 log.add_persisted_segment(segment, storage);
             });
@@ -179,22 +179,22 @@ impl IggyShard {
         Ok(())
     }
 
-    pub async fn create_partitions2_bypass_auth(
+    pub async fn create_partitions_bypass_auth(
         &self,
         stream_id: &Identifier,
         topic_id: &Identifier,
-        partitions: Vec<partition2::Partition>,
+        partitions: Vec<partition::Partition>,
     ) -> Result<(), IggyError> {
         let numeric_stream_id = self
-            .streams2
+            .streams
             .with_stream_by_id(stream_id, streams::helpers::get_stream_id());
         let numeric_topic_id =
-            self.streams2
+            self.streams
                 .with_topic_by_id(stream_id, topic_id, topics::helpers::get_topic_id());
         let shards_count = self.get_available_shards_count();
         for partition in partitions {
             let actual_id = partition.id();
-            let id = self.streams2.with_partitions_mut(
+            let id = self.streams.with_partitions_mut(
                 stream_id,
                 topic_id,
                 partitions::helpers::insert_partition(partition),
@@ -214,7 +214,7 @@ impl IggyShard {
         Ok(())
     }
 
-    pub async fn delete_partitions2(
+    pub async fn delete_partitions(
         &self,
         session: &Session,
         stream_id: &Identifier,
@@ -225,10 +225,10 @@ impl IggyShard {
         self.ensure_partitions_exist(stream_id, topic_id, partitions_count)?;
 
         let numeric_stream_id = self
-            .streams2
+            .streams
             .with_stream_by_id(stream_id, streams::helpers::get_stream_id());
         let numeric_topic_id =
-            self.streams2
+            self.streams
                 .with_topic_by_id(stream_id, topic_id, topics::helpers::get_topic_id());
 
         self.validate_partition_permissions(
@@ -238,12 +238,12 @@ impl IggyShard {
             "delete",
         )?;
 
-        let partitions = self.delete_partitions_base2(stream_id, topic_id, partitions_count);
+        let partitions = self.delete_partitions_base(stream_id, topic_id, partitions_count);
         let parent = partitions
             .first()
             .map(|p| p.stats().parent().clone())
             .expect("delete_partitions: no partitions to deletion");
-        // Reassign the partitions count as it could get clamped by the `delete_partitions_base2` method.
+        // Reassign the partitions count as it could get clamped by the `delete_partitions_base` method.
 
         let mut deleted_ids = Vec::with_capacity(partitions.len());
         let mut total_messages_count = 0;
@@ -286,20 +286,20 @@ impl IggyShard {
         delete_partitions_from_disk(stream_id, topic_id, partition_id, &self.config.system).await
     }
 
-    fn delete_partitions_base2(
+    fn delete_partitions_base(
         &self,
         stream_id: &Identifier,
         topic_id: &Identifier,
         partitions_count: u32,
-    ) -> Vec<partition2::Partition> {
-        self.streams2.with_partitions_mut(
+    ) -> Vec<partition::Partition> {
+        self.streams.with_partitions_mut(
             stream_id,
             topic_id,
             partitions::helpers::delete_partitions(partitions_count),
         )
     }
 
-    pub fn delete_partitions2_bypass_auth(
+    pub fn delete_partitions_bypass_auth(
         &self,
         stream_id: &Identifier,
         topic_id: &Identifier,
@@ -312,7 +312,7 @@ impl IggyShard {
             return Err(IggyError::InvalidPartitionsCount);
         }
 
-        let partitions = self.delete_partitions_base2(stream_id, topic_id, partitions_count);
+        let partitions = self.delete_partitions_base(stream_id, topic_id, partitions_count);
         for (deleted_partition_id, actual_deleted_partition_id) in partitions
             .iter()
             .map(|p| p.id())
@@ -320,7 +320,7 @@ impl IggyShard {
         {
             assert_eq!(
                 deleted_partition_id, actual_deleted_partition_id,
-                "delete_partitions2_bypass_auth: partition mismatch ID"
+                "delete_partitions_bypass_auth: partition mismatch ID"
             );
         }
         Ok(())

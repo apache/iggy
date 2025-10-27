@@ -19,7 +19,6 @@
 use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::{handlers::streams::COMPONENT, sender::SenderKind};
-
 use crate::shard::IggyShard;
 use crate::shard::transmission::event::ShardEvent;
 use crate::slab::traits_ext::EntityMarker;
@@ -52,20 +51,20 @@ impl ServerCommandHandler for DeleteStream {
         // Acquire stream lock to serialize filesystem operations
         let _stream_guard = shard.fs_locks.stream_lock.lock().await;
 
-        let stream2 = shard
-            .delete_stream2(session, &self.stream_id)
+        let stream = shard
+            .delete_stream(session, &self.stream_id)
             .await
             .with_error_context(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to delete stream2 with ID: {stream_id}, session: {session}")
+                format!("{COMPONENT} (error: {error}) - failed to delete stream with ID: {stream_id}, session: {session}")
             })?;
         info!(
             "Deleted stream with name: {}, ID: {}",
-            stream2.root().name(),
-            stream2.id()
+            stream.root().name(),
+            stream.id()
         );
 
-        let event = ShardEvent::DeletedStream2 {
-            id: stream2.id(),
+        let event = ShardEvent::DeletedStream {
+            id: stream.id(),
             stream_id: self.stream_id.clone(),
         };
         shard.broadcast_event_to_all_shards(event).await?;

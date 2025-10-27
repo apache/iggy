@@ -18,13 +18,13 @@
 
 mod indexes;
 mod messages;
-mod segment2;
+mod segment;
 mod types;
 
 pub mod storage;
 
 pub use indexes::IggyIndexesMut;
-pub use segment2::Segment2;
+pub use segment::Segment;
 pub use types::IggyMessageHeaderViewMut;
 pub use types::IggyMessageViewMut;
 pub use types::IggyMessagesBatchMut;

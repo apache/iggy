@@ -89,7 +89,7 @@ impl ServerCommandHandler for CreateTopic {
                     let _topic_guard = shard.fs_locks.topic_lock.lock().await;
 
                     let topic = shard
-                        .create_topic2(
+                        .create_topic(
                             session,
                             &stream_id,
                             name,
@@ -103,25 +103,25 @@ impl ServerCommandHandler for CreateTopic {
                     self.max_topic_size = topic.root().max_topic_size();
 
                     let stream_id_num = shard
-                        .streams2
+                        .streams
                         .with_stream_by_id(&stream_id, streams::helpers::get_stream_id());
                     let topic_id = topic.id();
 
-                    let event = ShardEvent::CreatedTopic2 {
+                    let event = ShardEvent::CreatedTopic {
                         stream_id: stream_id.clone(),
                         topic,
                     };
 
                     shard.broadcast_event_to_all_shards(event).await?;
                     let partitions = shard
-                        .create_partitions2(
+                        .create_partitions(
                             session,
                             &stream_id,
                             &Identifier::numeric(topic_id as u32).unwrap(),
                             partitions_count,
                         )
                         .await?;
-                    let event = ShardEvent::CreatedPartitions2 {
+                    let event = ShardEvent::CreatedPartitions {
                         stream_id: stream_id.clone(),
                         topic_id: Identifier::numeric(topic_id as u32).unwrap(),
                         partitions,
@@ -129,7 +129,7 @@ impl ServerCommandHandler for CreateTopic {
 
                     shard.broadcast_event_to_all_shards(event).await?;
 
-                    let response = shard.streams2.with_topic_by_id(
+                    let response = shard.streams.with_topic_by_id(
                         &stream_id,
                         &Identifier::numeric(topic_id as u32).unwrap(),
                         |(root, _, stats)| mapper::map_topic(&root, &stats),
@@ -160,10 +160,10 @@ impl ServerCommandHandler for CreateTopic {
                     self.max_topic_size = topic.root().max_topic_size();
 
                     let stream_id = shard
-                        .streams2
+                        .streams
                         .with_stream_by_id(&self.stream_id, streams::helpers::get_stream_id());
 
-                    let response = shard.streams2.with_topic_by_id(
+                    let response = shard.streams.with_topic_by_id(
                         &self.stream_id,
                         &Identifier::numeric(topic_id as u32).unwrap(),
                         |(root, _, stats)| mapper::map_topic(&root, &stats),

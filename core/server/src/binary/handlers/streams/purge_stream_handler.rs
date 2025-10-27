@@ -48,11 +48,11 @@ impl ServerCommandHandler for PurgeStream {
         let stream_id = self.stream_id.clone();
 
         shard
-            .purge_stream2(session, &self.stream_id).await
+            .purge_stream(session, &self.stream_id).await
             .with_error_context(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to purge stream2 with id: {stream_id}, session: {session}")
+                format!("{COMPONENT} (error: {error}) - failed to purge stream with id: {stream_id}, session: {session}")
             })?;
-        let event = ShardEvent::PurgedStream2 {
+        let event = ShardEvent::PurgedStream {
             stream_id: self.stream_id.clone(),
         };
         shard.broadcast_event_to_all_shards(event).await?;

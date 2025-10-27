@@ -10,7 +10,7 @@ use crate::{
 
 impl IggyShard {
     pub fn ensure_stream_exists(&self, stream_id: &Identifier) -> Result<(), IggyError> {
-        if !self.streams2.exists(stream_id) {
+        if !self.streams.exists(stream_id) {
             return Err(IggyError::StreamIdNotFound(stream_id.clone()));
         }
         Ok(())
@@ -23,7 +23,7 @@ impl IggyShard {
     ) -> Result<(), IggyError> {
         self.ensure_stream_exists(stream_id)?;
         let exists = self
-            .streams2
+            .streams
             .with_topics(stream_id, topics::helpers::exists(topic_id));
         if !exists {
             return Err(IggyError::TopicIdNotFound(
@@ -42,7 +42,7 @@ impl IggyShard {
     ) -> Result<(), IggyError> {
         self.ensure_stream_exists(stream_id)?;
         self.ensure_topic_exists(stream_id, topic_id)?;
-        let exists = self.streams2.with_topic_by_id(
+        let exists = self.streams.with_topic_by_id(
             stream_id,
             topic_id,
             topics::helpers::cg_exists(group_id),
@@ -64,7 +64,7 @@ impl IggyShard {
     ) -> Result<(), IggyError> {
         self.ensure_topic_exists(stream_id, topic_id)?;
         let actual_partitions_count =
-            self.streams2
+            self.streams
                 .with_partitions(stream_id, topic_id, |partitions| partitions.len());
 
         if partitions_count > actual_partitions_count as u32 {
@@ -82,7 +82,7 @@ impl IggyShard {
     ) -> Result<(), IggyError> {
         self.ensure_topic_exists(stream_id, topic_id)?;
         let partition_exists = self
-            .streams2
+            .streams
             .with_topic_by_id(stream_id, topic_id, |(root, ..)| {
                 root.partitions().exists(partition_id)
             });
@@ -116,13 +116,13 @@ impl IggyShard {
                 ))
             }
             ConsumerKind::ConsumerGroup => {
-                let cg_id = self.streams2.with_consumer_group_by_id(
+                let cg_id = self.streams.with_consumer_group_by_id(
                     stream_id,
                     topic_id,
                     &consumer.id,
                     topics::helpers::get_consumer_group_id(),
                 );
-                let member_id = self.streams2.with_consumer_group_by_id(
+                let member_id = self.streams.with_consumer_group_by_id(
                     stream_id,
                     topic_id,
                     &consumer.id,
@@ -136,14 +136,14 @@ impl IggyShard {
                 }
 
                 let partition_id = if calculate_partition_id {
-                    self.streams2.with_consumer_group_by_id(
+                    self.streams.with_consumer_group_by_id(
                         stream_id,
                         topic_id,
                         &consumer.id,
                         topics::helpers::calculate_partition_id_unchecked(member_id),
                     )
                 } else {
-                    self.streams2.with_consumer_group_by_id(
+                    self.streams.with_consumer_group_by_id(
                         stream_id,
                         topic_id,
                         &consumer.id,

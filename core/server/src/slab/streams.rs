@@ -19,20 +19,20 @@ use crate::{
     streaming::{
         partitions::{
             journal::Journal,
-            partition2::{PartitionRef, PartitionRefMut},
+            partition::{PartitionRef, PartitionRefMut},
         },
         polling_consumer::PollingConsumer,
         segments::{
-            IggyMessagesBatchMut, IggyMessagesBatchSet, Segment2, storage::create_segment_storage,
+            IggyMessagesBatchMut, IggyMessagesBatchSet, Segment, storage::create_segment_storage,
         },
         streams::{
             self,
-            stream2::{self, StreamRef, StreamRefMut},
+            stream::{self, StreamRef, StreamRefMut},
         },
         topics::{
             self,
-            consumer_group2::{ConsumerGroupRef, ConsumerGroupRefMut},
-            topic2::{TopicRef, TopicRefMut},
+            consumer_group::{ConsumerGroupRef, ConsumerGroupRefMut},
+            topic::{TopicRef, TopicRefMut},
         },
         traits::MainOps,
     },
@@ -53,8 +53,8 @@ pub type ContainerId = usize;
 
 #[derive(Debug, Clone)]
 pub struct Streams {
-    index: RefCell<AHashMap<<stream2::StreamRoot as Keyed>::Key, ContainerId>>,
-    root: RefCell<Slab<stream2::StreamRoot>>,
+    index: RefCell<AHashMap<<stream::StreamRoot as Keyed>::Key, ContainerId>>,
+    root: RefCell<Slab<stream::StreamRoot>>,
     stats: RefCell<Slab<Arc<StreamStats>>>,
 }
 
@@ -68,25 +68,25 @@ impl Default for Streams {
     }
 }
 
-impl<'a> From<&'a Streams> for stream2::StreamRef<'a> {
+impl<'a> From<&'a Streams> for stream::StreamRef<'a> {
     fn from(value: &'a Streams) -> Self {
         let root = value.root.borrow();
         let stats = value.stats.borrow();
-        stream2::StreamRef::new(root, stats)
+        stream::StreamRef::new(root, stats)
     }
 }
 
-impl<'a> From<&'a Streams> for stream2::StreamRefMut<'a> {
+impl<'a> From<&'a Streams> for stream::StreamRefMut<'a> {
     fn from(value: &'a Streams) -> Self {
         let root = value.root.borrow_mut();
         let stats = value.stats.borrow_mut();
-        stream2::StreamRefMut::new(root, stats)
+        stream::StreamRefMut::new(root, stats)
     }
 }
 
 impl InsertCell for Streams {
     type Idx = ContainerId;
-    type Item = stream2::Stream;
+    type Item = stream::Stream;
 
     fn insert(&self, item: Self::Item) -> Self::Idx {
         let (root, stats) = item.into_components();
@@ -110,7 +110,7 @@ impl InsertCell for Streams {
 
 impl DeleteCell for Streams {
     type Idx = ContainerId;
-    type Item = stream2::Stream;
+    type Item = stream::Stream;
 
     fn delete(&self, id: Self::Idx) -> Self::Item {
         let mut root_container = self.root.borrow_mut();
@@ -126,14 +126,14 @@ impl DeleteCell for Streams {
             .remove(key)
             .expect("stream_delete: key not found in index");
 
-        stream2::Stream::new_with_components(root, stats)
+        stream::Stream::new_with_components(root, stats)
     }
 }
 
 impl EntityComponentSystem<InteriorMutability> for Streams {
     type Idx = ContainerId;
-    type Entity = stream2::Stream;
-    type EntityComponents<'a> = stream2::StreamRef<'a>;
+    type Entity = stream::Stream;
+    type EntityComponents<'a> = stream::StreamRef<'a>;
 
     fn with_components<O, F>(&self, f: F) -> O
     where
@@ -144,7 +144,7 @@ impl EntityComponentSystem<InteriorMutability> for Streams {
 }
 
 impl EntityComponentSystemMutCell for Streams {
-    type EntityComponentsMut<'a> = stream2::StreamRefMut<'a>;
+    type EntityComponentsMut<'a> = stream::StreamRefMut<'a>;
 
     fn with_components_mut<O, F>(&self, f: F) -> O
     where
@@ -427,7 +427,7 @@ impl Streams {
 
     pub fn with_index<T>(
         &self,
-        f: impl FnOnce(&AHashMap<<stream2::StreamRoot as Keyed>::Key, usize>) -> T,
+        f: impl FnOnce(&AHashMap<<stream::StreamRoot as Keyed>::Key, usize>) -> T,
     ) -> T {
         let index = self.index.borrow();
         f(&index)
@@ -435,7 +435,7 @@ impl Streams {
 
     pub fn with_index_mut<T>(
         &self,
-        f: impl FnOnce(&mut AHashMap<<stream2::StreamRoot as Keyed>::Key, usize>) -> T,
+        f: impl FnOnce(&mut AHashMap<<stream::StreamRoot as Keyed>::Key, usize>) -> T,
     ) -> T {
         let mut index = self.index.borrow_mut();
         f(&mut index)
@@ -1171,7 +1171,7 @@ impl Streams {
 
         let messages_size = 0;
         let indexes_size = 0;
-        let segment = Segment2::new(
+        let segment = Segment::new(
             end_offset + 1,
             config.segment.size,
             config.segment.message_expiry,
@@ -1408,7 +1408,7 @@ impl Streams {
                         (offset_value, path)
                     },
                 );
-                crate::streaming::partitions::storage2::persist_offset(&path, offset_value).await?;
+                crate::streaming::partitions::storage::persist_offset(&path, offset_value).await?;
             }
             PollingConsumer::ConsumerGroup(cg_id, _) => {
                 let (offset_value, path) = self.with_partition_by_id(
@@ -1430,7 +1430,7 @@ impl Streams {
                         (offset_value, path)
                     },
                 );
-                crate::streaming::partitions::storage2::persist_offset(&path, offset_value).await?;
+                crate::streaming::partitions::storage::persist_offset(&path, offset_value).await?;
             }
         }
 

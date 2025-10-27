@@ -45,7 +45,7 @@ impl ServerCommandHandler for GetTopic {
         shard.ensure_authenticated(session)?;
         shard.ensure_topic_exists(&self.stream_id, &self.topic_id)?;
         let numeric_stream_id = shard
-            .streams2
+            .streams
             .with_stream_by_id(&self.stream_id, streams::helpers::get_stream_id());
         shard.permissioner.borrow().get_topic(
             session.get_user_id(),
@@ -59,7 +59,7 @@ impl ServerCommandHandler for GetTopic {
 
         let response =
             shard
-                .streams2
+                .streams
                 .with_topic_by_id(&self.stream_id, &self.topic_id, |(root, _, stats)| {
                     mapper::map_topic(&root, &stats)
                 });

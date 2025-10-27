@@ -47,12 +47,12 @@ impl ServerCommandHandler for UpdateStream {
         debug!("session: {session}, command: {self}");
         let stream_id = self.stream_id.clone();
         shard
-        .update_stream2(session, &self.stream_id, self.name.clone())
+        .update_stream(session, &self.stream_id, self.name.clone())
         .with_error_context(|error| {
-            format!("{COMPONENT} (error: {error}) - failed to update stream2 with id: {stream_id}, session: {session}")
+            format!("{COMPONENT} (error: {error}) - failed to update stream with id: {stream_id}, session: {session}")
         })?;
 
-        let event = ShardEvent::UpdatedStream2 {
+        let event = ShardEvent::UpdatedStream {
             stream_id: self.stream_id.clone(),
             name: self.name.clone(),
         };

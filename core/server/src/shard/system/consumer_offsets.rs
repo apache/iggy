@@ -38,13 +38,11 @@ impl IggyShard {
         self.ensure_authenticated(session)?;
         self.ensure_topic_exists(stream_id, topic_id)?;
         {
-            let topic_id = self.streams2.with_topic_by_id(
-                stream_id,
-                topic_id,
-                topics::helpers::get_topic_id(),
-            );
+            let topic_id =
+                self.streams
+                    .with_topic_by_id(stream_id, topic_id, topics::helpers::get_topic_id());
             let stream_id = self
-                .streams2
+                .streams
                 .with_stream_by_id(stream_id, streams::helpers::get_stream_id());
             self.permissioner.borrow().store_consumer_offset(
                 session.get_user_id(),
@@ -91,13 +89,11 @@ impl IggyShard {
         self.ensure_authenticated(session)?;
         self.ensure_topic_exists(stream_id, topic_id)?;
         {
-            let topic_id = self.streams2.with_topic_by_id(
-                stream_id,
-                topic_id,
-                topics::helpers::get_topic_id(),
-            );
+            let topic_id =
+                self.streams
+                    .with_topic_by_id(stream_id, topic_id, topics::helpers::get_topic_id());
             let stream_id = self
-                .streams2
+                .streams
                 .with_stream_by_id(stream_id, streams::helpers::get_stream_id());
             self.permissioner.borrow().get_consumer_offset(
                 session.get_user_id(),
@@ -122,13 +118,13 @@ impl IggyShard {
         };
 
         let offset = match polling_consumer {
-            PollingConsumer::Consumer(id, _) => self.streams2.with_partition_by_id(
+            PollingConsumer::Consumer(id, _) => self.streams.with_partition_by_id(
                 stream_id,
                 topic_id,
                 partition_id,
                 partitions::helpers::get_consumer_offset(id),
             ),
-            PollingConsumer::ConsumerGroup(_, id) => self.streams2.with_partition_by_id(
+            PollingConsumer::ConsumerGroup(_, id) => self.streams.with_partition_by_id(
                 stream_id,
                 topic_id,
                 partition_id,
@@ -149,13 +145,11 @@ impl IggyShard {
         self.ensure_authenticated(session)?;
         self.ensure_topic_exists(stream_id, topic_id)?;
         {
-            let topic_id = self.streams2.with_topic_by_id(
-                stream_id,
-                topic_id,
-                topics::helpers::get_topic_id(),
-            );
+            let topic_id =
+                self.streams
+                    .with_topic_by_id(stream_id, topic_id, topics::helpers::get_topic_id());
             let stream_id = self
-                .streams2
+                .streams
                 .with_stream_by_id(stream_id, streams::helpers::get_stream_id());
             self.permissioner.borrow().delete_consumer_offset(
                 session.get_user_id(),
@@ -194,15 +188,15 @@ impl IggyShard {
         offset: u64,
     ) {
         let stream_id_num = self
-            .streams2
+            .streams
             .with_stream_by_id(stream_id, streams::helpers::get_stream_id());
         let topic_id_num =
-            self.streams2
+            self.streams
                 .with_topic_by_id(stream_id, topic_id, topics::helpers::get_topic_id());
 
         match polling_consumer {
             PollingConsumer::Consumer(id, _) => {
-                self.streams2.with_partition_by_id(
+                self.streams.with_partition_by_id(
                     stream_id,
                     topic_id,
                     partition_id,
@@ -217,7 +211,7 @@ impl IggyShard {
                 );
             }
             PollingConsumer::ConsumerGroup(_, id) => {
-                self.streams2.with_partition_by_id(
+                self.streams.with_partition_by_id(
                     stream_id,
                     topic_id,
                     partition_id,
@@ -243,7 +237,7 @@ impl IggyShard {
     ) -> Result<String, IggyError> {
         match polling_consumer {
             PollingConsumer::Consumer(id, _) => {
-                self.streams2
+                self.streams
                     .with_partition_by_id(stream_id, topic_id, partition_id, partitions::helpers::delete_consumer_offset(*id)).with_error_context(|error| {
                         format!(
                             "{COMPONENT} (error: {error}) - failed to delete consumer offset for consumer with ID: {id} in topic with ID: {topic_id} and stream with ID: {stream_id}",
@@ -251,7 +245,7 @@ impl IggyShard {
                     })
             }
             PollingConsumer::ConsumerGroup(_, id) => {
-                self.streams2
+                self.streams
                     .with_partition_by_id(stream_id, topic_id, partition_id, partitions::helpers::delete_consumer_group_member_offset(*id)).with_error_context(|error| {
                         format!(
                             "{COMPONENT} (error: {error}) - failed to delete consumer group member offset for member with ID: {id} in topic with ID: {topic_id} and stream with ID: {stream_id}",
@@ -270,7 +264,7 @@ impl IggyShard {
     ) -> Result<(), IggyError> {
         match polling_consumer {
             PollingConsumer::Consumer(id, _) => {
-                let (offset_value, path) = self.streams2.with_partition_by_id(
+                let (offset_value, path) = self.streams.with_partition_by_id(
                     stream_id,
                     topic_id,
                     partition_id,
@@ -284,10 +278,10 @@ impl IggyShard {
                         (offset, path)
                     },
                 );
-                partitions::storage2::persist_offset(&path, offset_value).await
+                partitions::storage::persist_offset(&path, offset_value).await
             }
             PollingConsumer::ConsumerGroup(_, id) => {
-                let (offset_value, path) = self.streams2.with_partition_by_id(
+                let (offset_value, path) = self.streams.with_partition_by_id(
                     stream_id,
                     topic_id,
                     partition_id,
@@ -301,13 +295,13 @@ impl IggyShard {
                         (offset, path)
                     },
                 );
-                partitions::storage2::persist_offset(&path, offset_value).await
+                partitions::storage::persist_offset(&path, offset_value).await
             }
         }
     }
 
     pub async fn delete_consumer_offset_from_disk(&self, path: &str) -> Result<(), IggyError> {
-        partitions::storage2::delete_persisted_offset(path).await
+        partitions::storage::delete_persisted_offset(path).await
     }
 
     pub fn store_consumer_offset_bypass_auth(

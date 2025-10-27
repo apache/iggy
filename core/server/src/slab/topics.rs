@@ -17,8 +17,8 @@ use crate::{
     streaming::{
         stats::TopicStats,
         topics::{
-            consumer_group2::{ConsumerGroupRef, ConsumerGroupRefMut},
-            topic2::{self, TopicRef, TopicRefMut},
+            consumer_group::{ConsumerGroupRef, ConsumerGroupRefMut},
+            topic::{self, TopicRef, TopicRefMut},
         },
     },
 };
@@ -28,15 +28,15 @@ pub type ContainerId = usize;
 
 #[derive(Debug, Clone)]
 pub struct Topics {
-    index: RefCell<AHashMap<<topic2::TopicRoot as Keyed>::Key, ContainerId>>,
-    root: RefCell<Slab<topic2::TopicRoot>>,
-    auxilaries: RefCell<Slab<topic2::TopicAuxilary>>,
+    index: RefCell<AHashMap<<topic::TopicRoot as Keyed>::Key, ContainerId>>,
+    root: RefCell<Slab<topic::TopicRoot>>,
+    auxilaries: RefCell<Slab<topic::TopicAuxilary>>,
     stats: RefCell<Slab<Arc<TopicStats>>>,
 }
 
 impl InsertCell for Topics {
     type Idx = ContainerId;
-    type Item = topic2::Topic;
+    type Item = topic::Topic;
 
     fn insert(&self, item: Self::Item) -> Self::Idx {
         let (root, auxilary, stats) = item.into_components();
@@ -66,7 +66,7 @@ impl InsertCell for Topics {
 
 impl DeleteCell for Topics {
     type Idx = ContainerId;
-    type Item = topic2::Topic;
+    type Item = topic::Topic;
 
     fn delete(&self, id: Self::Idx) -> Self::Item {
         let mut root_container = self.root.borrow_mut();
@@ -84,25 +84,25 @@ impl DeleteCell for Topics {
             .remove(key)
             .expect("topic_delete: key not found in index");
 
-        topic2::Topic::new_with_components(root, auxilary, stats)
+        topic::Topic::new_with_components(root, auxilary, stats)
     }
 }
 
-impl<'a> From<&'a Topics> for topic2::TopicRef<'a> {
+impl<'a> From<&'a Topics> for topic::TopicRef<'a> {
     fn from(value: &'a Topics) -> Self {
         let root = value.root.borrow();
         let auxilary = value.auxilaries.borrow();
         let stats = value.stats.borrow();
-        topic2::TopicRef::new(root, auxilary, stats)
+        topic::TopicRef::new(root, auxilary, stats)
     }
 }
 
-impl<'a> From<&'a Topics> for topic2::TopicRefMut<'a> {
+impl<'a> From<&'a Topics> for topic::TopicRefMut<'a> {
     fn from(value: &'a Topics) -> Self {
         let root = value.root.borrow_mut();
         let auxilary = value.auxilaries.borrow_mut();
         let stats = value.stats.borrow_mut();
-        topic2::TopicRefMut::new(root, auxilary, stats)
+        topic::TopicRefMut::new(root, auxilary, stats)
     }
 }
 
@@ -119,8 +119,8 @@ impl Default for Topics {
 
 impl EntityComponentSystem<InteriorMutability> for Topics {
     type Idx = ContainerId;
-    type Entity = topic2::Topic;
-    type EntityComponents<'a> = topic2::TopicRef<'a>;
+    type Entity = topic::Topic;
+    type EntityComponents<'a> = topic::TopicRef<'a>;
 
     fn with_components<O, F>(&self, f: F) -> O
     where
@@ -131,7 +131,7 @@ impl EntityComponentSystem<InteriorMutability> for Topics {
 }
 
 impl EntityComponentSystemMutCell for Topics {
-    type EntityComponentsMut<'a> = topic2::TopicRefMut<'a>;
+    type EntityComponentsMut<'a> = topic::TopicRefMut<'a>;
 
     fn with_components_mut<O, F>(&self, f: F) -> O
     where
@@ -175,7 +175,7 @@ impl Topics {
 
     pub fn with_index<T>(
         &self,
-        f: impl FnOnce(&AHashMap<<topic2::TopicRoot as Keyed>::Key, usize>) -> T,
+        f: impl FnOnce(&AHashMap<<topic::TopicRoot as Keyed>::Key, usize>) -> T,
     ) -> T {
         let index = self.index.borrow();
         f(&index)
@@ -183,7 +183,7 @@ impl Topics {
 
     pub fn with_index_mut<T>(
         &self,
-        f: impl FnOnce(&mut AHashMap<<topic2::TopicRoot as Keyed>::Key, usize>) -> T,
+        f: impl FnOnce(&mut AHashMap<<topic::TopicRoot as Keyed>::Key, usize>) -> T,
     ) -> T {
         let mut index = self.index.borrow_mut();
         f(&mut index)

@@ -93,7 +93,7 @@ impl IggyShard {
                 stats.written_bytes = disk_usage.total_written_bytes.into();
             }
 
-            self.streams2.with_components(|stream_components| {
+            self.streams.with_components(|stream_components| {
                 let (stream_roots, stream_stats) = stream_components.into_components();
                 // Iterate through all streams
                 for (stream_id, stream_root) in stream_roots.iter() {

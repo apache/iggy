@@ -63,10 +63,10 @@ impl ServerCommandHandler for DeleteSegments {
 
         // Get numeric IDs for namespace
         let numeric_stream_id = shard
-            .streams2
+            .streams
             .with_stream_by_id(&stream_id, streaming::streams::helpers::get_stream_id());
 
-        let numeric_topic_id = shard.streams2.with_topic_by_id(
+        let numeric_topic_id = shard.streams.with_topic_by_id(
             &stream_id,
             &topic_id,
             streaming::topics::helpers::get_topic_id(),

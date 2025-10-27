@@ -57,10 +57,10 @@ impl ServerCommandHandler for DeleteTopic {
         let _topic_guard = shard.fs_locks.topic_lock.lock().await;
 
         let topic = shard
-            .delete_topic2(session, &self.stream_id, &self.topic_id)
+            .delete_topic(session, &self.stream_id, &self.topic_id)
             .await?;
         let stream_id = shard
-            .streams2
+            .streams
             .with_stream_by_id(&self.stream_id, streams::helpers::get_stream_id());
         let topic_id = topic.root().id();
         info!(
@@ -70,7 +70,7 @@ impl ServerCommandHandler for DeleteTopic {
             stream_id
         );
 
-        let event = ShardEvent::DeletedTopic2 {
+        let event = ShardEvent::DeletedTopic {
             id: topic_id,
             stream_id: self.stream_id.clone(),
             topic_id: self.topic_id.clone(),

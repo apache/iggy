@@ -4,8 +4,8 @@ use crate::{
         traits_ext::ComponentsById,
     },
     streaming::{
-        streams::stream2::StreamRef,
-        topics::topic2::{TopicRef, TopicRefMut},
+        streams::stream::StreamRef,
+        topics::topic::{TopicRef, TopicRefMut},
     },
 };
 

@@ -75,7 +75,7 @@ pub struct IggyShard {
     shards: Vec<ShardConnector<ShardFrame>>,
     _version: SemanticVersion,
 
-    pub(crate) streams2: Streams,
+    pub(crate) streams: Streams,
     pub(crate) shards_table: EternalPtr<DashMap<IggyNamespace, ShardId>>,
     pub(crate) state: FileState,
 
@@ -210,7 +210,7 @@ impl IggyShard {
                     self.config
                         .system
                         .get_partition_path(stream_id, topic_id, partition_id);
-                let stats = self.streams2.with_partition_by_id(
+                let stats = self.streams.with_partition_by_id(
                     &Identifier::numeric(stream_id as u32).unwrap(),
                     &Identifier::numeric(topic_id as u32).unwrap(),
                     partition_id,
@@ -227,7 +227,7 @@ impl IggyShard {
                 .await
                 {
                     Ok(loaded_log) => {
-                        self.streams2.with_partition_by_id_mut(
+                        self.streams.with_partition_by_id_mut(
                             &Identifier::numeric(stream_id as u32).unwrap(),
                             &Identifier::numeric(topic_id as u32).unwrap(),
                             partition_id,

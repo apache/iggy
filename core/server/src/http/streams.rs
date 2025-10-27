@@ -64,7 +64,7 @@ async fn get_stream(
         state
             .shard
             .shard()
-            .streams2
+            .streams
             .with_stream_by_id(&stream_id, |(root, stats)| {
                 crate::http::mapper::map_stream_details(&root, &stats)
             })
@@ -77,7 +77,7 @@ async fn get_stream(
 async fn get_streams(State(state): State<Arc<AppState>>) -> Result<Json<Vec<Stream>>, CustomError> {
     // Use direct slab access for thread-safe streams retrieval
     let streams = SendWrapper::new(|| {
-        state.shard.shard().streams2.with_components(|stream_ref| {
+        state.shard.shard().streams.with_components(|stream_ref| {
             let (roots, stats) = stream_ref.into_components();
             crate::http::mapper::map_streams_from_slabs(&roots, &stats)
         })
@@ -115,7 +115,7 @@ async fn create_stream(
         // Send event for stream creation - inlined from wrapper
         {
             use crate::shard::transmission::event::ShardEvent;
-            let event = ShardEvent::CreatedStream2 {
+            let event = ShardEvent::CreatedStream {
                 id: created_stream_id,
                 stream,
             };
@@ -148,7 +148,7 @@ async fn create_stream(
             state
                 .shard
                 .shard()
-                .streams2
+                .streams
                 .with_components_by_id(created_stream_id, |(root, stats)| {
                     crate::http::mapper::map_stream_details(&root, &stats)
                 })
@@ -188,7 +188,7 @@ async fn update_stream(
         {
             let broadcast_future = SendWrapper::new(async {
                 use crate::shard::transmission::event::ShardEvent;
-                let event = ShardEvent::UpdatedStream2 {
+                let event = ShardEvent::UpdatedStream {
                     stream_id: command.stream_id.clone(),
                     name: command.name.clone(),
                 };
@@ -232,7 +232,7 @@ async fn delete_stream(
                 state
                     .shard
                     .shard()
-                    .delete_stream2(&session, &identifier_stream_id),
+                    .delete_stream(&session, &identifier_stream_id),
             );
             future.await
         }
@@ -246,7 +246,7 @@ async fn delete_stream(
         {
             let broadcast_future = SendWrapper::new(async {
                 use crate::shard::transmission::event::ShardEvent;
-                let event = ShardEvent::DeletedStream2 {
+                let event = ShardEvent::DeletedStream {
                     id: stream_id_numeric,
                     stream_id: identifier_stream_id.clone(),
                 };
@@ -302,7 +302,7 @@ async fn purge_stream(
         {
             let broadcast_future = SendWrapper::new(async {
                 use crate::shard::transmission::event::ShardEvent;
-                let event = ShardEvent::PurgedStream2 {
+                let event = ShardEvent::PurgedStream {
                     stream_id: identifier_stream_id.clone(),
                 };
                 let _responses = state

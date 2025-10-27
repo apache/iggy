@@ -52,14 +52,14 @@ impl ServerCommandHandler for DeletePartitions {
         let _partition_guard = shard.fs_locks.partition_lock.lock().await;
 
         let deleted_partition_ids = shard
-            .delete_partitions2(
+            .delete_partitions(
                 session,
                 &self.stream_id,
                 &self.topic_id,
                 self.partitions_count,
             )
             .await?;
-        let event = ShardEvent::DeletedPartitions2 {
+        let event = ShardEvent::DeletedPartitions {
             stream_id: self.stream_id.clone(),
             topic_id: self.topic_id.clone(),
             partitions_count: self.partitions_count,
@@ -67,12 +67,12 @@ impl ServerCommandHandler for DeletePartitions {
         };
         shard.broadcast_event_to_all_shards(event).await?;
 
-        let remaining_partition_ids = shard.streams2.with_topic_by_id(
+        let remaining_partition_ids = shard.streams.with_topic_by_id(
             &self.stream_id,
             &self.topic_id,
             crate::streaming::topics::helpers::get_partition_ids(),
         );
-        shard.streams2.with_topic_by_id_mut(
+        shard.streams.with_topic_by_id_mut(
             &self.stream_id,
             &self.topic_id,
             crate::streaming::topics::helpers::rebalance_consumer_group(&remaining_partition_ids),

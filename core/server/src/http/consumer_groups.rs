@@ -72,12 +72,12 @@ async fn get_consumer_group(
         &identifier_group_id,
     )?;
 
-    let numeric_topic_id = state.shard.shard().streams2.with_topic_by_id(
+    let numeric_topic_id = state.shard.shard().streams.with_topic_by_id(
         &identifier_stream_id,
         &identifier_topic_id,
         crate::streaming::topics::helpers::get_topic_id(),
     );
-    let numeric_stream_id = state.shard.shard().streams2.with_stream_by_id(
+    let numeric_stream_id = state.shard.shard().streams.with_stream_by_id(
         &identifier_stream_id,
         crate::streaming::streams::helpers::get_stream_id(),
     );
@@ -89,7 +89,7 @@ async fn get_consumer_group(
         .borrow()
         .get_consumer_group(session.get_user_id(), numeric_stream_id, numeric_topic_id)?;
 
-    let consumer_group = state.shard.shard().streams2.with_consumer_group_by_id(
+    let consumer_group = state.shard.shard().streams.with_consumer_group_by_id(
         &identifier_stream_id,
         &identifier_topic_id,
         &identifier_group_id,
@@ -116,12 +116,12 @@ async fn get_consumer_groups(
         .shard()
         .ensure_topic_exists(&identifier_stream_id, &identifier_topic_id)?;
 
-    let numeric_topic_id = state.shard.shard().streams2.with_topic_by_id(
+    let numeric_topic_id = state.shard.shard().streams.with_topic_by_id(
         &identifier_stream_id,
         &identifier_topic_id,
         crate::streaming::topics::helpers::get_topic_id(),
     );
-    let numeric_stream_id = state.shard.shard().streams2.with_stream_by_id(
+    let numeric_stream_id = state.shard.shard().streams.with_stream_by_id(
         &identifier_stream_id,
         crate::streaming::streams::helpers::get_stream_id(),
     );
@@ -133,7 +133,7 @@ async fn get_consumer_groups(
         .borrow()
         .get_consumer_groups(session.get_user_id(), numeric_stream_id, numeric_topic_id)?;
 
-    let consumer_groups = state.shard.shard().streams2.with_consumer_groups(
+    let consumer_groups = state.shard.shard().streams.with_consumer_groups(
         &identifier_stream_id,
         &identifier_topic_id,
         |cgs| {
@@ -162,7 +162,7 @@ async fn create_consumer_group(
     let session = Session::stateless(identity.user_id, identity.ip_address);
 
     // Create consumer group using the new API
-    let consumer_group = state.shard.shard().create_consumer_group2(
+    let consumer_group = state.shard.shard().create_consumer_group(
         &session,
         &command.stream_id,
         &command.topic_id,
@@ -176,7 +176,7 @@ async fn create_consumer_group(
     {
         let broadcast_future = SendWrapper::new(async {
             use crate::shard::transmission::event::ShardEvent;
-            let event = ShardEvent::CreatedConsumerGroup2 {
+            let event = ShardEvent::CreatedConsumerGroup {
                 stream_id: command.stream_id.clone(),
                 topic_id: command.topic_id.clone(),
                 cg: consumer_group.clone(),
@@ -192,7 +192,7 @@ async fn create_consumer_group(
 
     // Get the created consumer group details
     let group_id_identifier = Identifier::numeric(group_id as u32).unwrap();
-    let consumer_group_details = state.shard.shard().streams2.with_consumer_group_by_id(
+    let consumer_group_details = state.shard.shard().streams.with_consumer_group_by_id(
         &command.stream_id,
         &command.topic_id,
         &group_id_identifier,
@@ -232,7 +232,7 @@ async fn delete_consumer_group(
         let session = Session::stateless(identity.user_id, identity.ip_address);
 
         // Delete using the new API
-        let consumer_group = state.shard.shard().delete_consumer_group2(
+        let consumer_group = state.shard.shard().delete_consumer_group(
             &session,
             &identifier_stream_id,
             &identifier_topic_id,
@@ -243,11 +243,11 @@ async fn delete_consumer_group(
         let cg_id = consumer_group.id();
 
         // Remove all consumer group members from ClientManager
-        let stream_id_usize = state.shard.shard().streams2.with_stream_by_id(
+        let stream_id_usize = state.shard.shard().streams.with_stream_by_id(
             &identifier_stream_id,
             crate::streaming::streams::helpers::get_stream_id(),
         );
-        let topic_id_usize = state.shard.shard().streams2.with_topic_by_id(
+        let topic_id_usize = state.shard.shard().streams.with_topic_by_id(
             &identifier_stream_id,
             &identifier_topic_id,
             crate::streaming::topics::helpers::get_topic_id(),
@@ -275,7 +275,7 @@ async fn delete_consumer_group(
         {
             let broadcast_future = SendWrapper::new(async {
                 use crate::shard::transmission::event::ShardEvent;
-                let event = ShardEvent::DeletedConsumerGroup2 {
+                let event = ShardEvent::DeletedConsumerGroup {
                     id: cg_id,
                     stream_id: identifier_stream_id.clone(),
                     topic_id: identifier_topic_id.clone(),

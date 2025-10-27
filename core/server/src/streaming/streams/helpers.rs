@@ -6,7 +6,7 @@ use crate::{
     },
     streaming::{
         partitions,
-        streams::stream2::{StreamRef, StreamRefMut},
+        streams::stream::{StreamRef, StreamRefMut},
     },
 };
 use iggy_common::Identifier;

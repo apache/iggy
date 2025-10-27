@@ -2,7 +2,7 @@ use iggy_common::{IggyByteSize, IggyExpiry, IggyTimestamp};
 use std::fmt::Display;
 
 #[derive(Default, Debug, Clone)]
-pub struct Segment2 {
+pub struct Segment {
     pub sealed: bool,
     pub message_expiry: IggyExpiry,
     pub start_timestamp: u64,
@@ -13,11 +13,11 @@ pub struct Segment2 {
     pub max_size: IggyByteSize, // u64
 }
 
-impl Display for Segment2 {
+impl Display for Segment {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Segment2 {{ sealed: {}, max_size_bytes: {}, message_expiry: {:?}, start_timestamp: {}, end_timestamp: {}, start_offset: {}, end_offset: {}, size: {} }}",
+            "Segment {{ sealed: {}, max_size_bytes: {}, message_expiry: {:?}, start_timestamp: {}, end_timestamp: {}, start_offset: {}, end_offset: {}, size: {} }}",
             self.sealed,
             self.max_size,
             self.message_expiry,
@@ -30,8 +30,8 @@ impl Display for Segment2 {
     }
 }
 
-impl Segment2 {
-    /// Creates a new Segment2 with the specified parameters
+impl Segment {
+    /// Creates a new Segment with the specified parameters
     pub fn new(
         start_offset: u64,
         max_size_bytes: IggyByteSize,

@@ -43,7 +43,7 @@ async fn handle_request(
             let batch = shard.maybe_encrypt_messages(batch)?;
             let messages_count = batch.count();
             shard
-                .streams2
+                .streams
                 .append_messages(&shard.config.system, &shard.task_registry, &ns, batch)
                 .await?;
             shard.metrics.increment_messages(messages_count as u64);
@@ -52,14 +52,14 @@ async fn handle_request(
         ShardRequestPayload::PollMessages { args, consumer } => {
             let auto_commit = args.auto_commit;
             let ns = IggyFullNamespace::new(stream_id, topic_id, partition_id);
-            let (metadata, batches) = shard.streams2.poll_messages(&ns, consumer, args).await?;
+            let (metadata, batches) = shard.streams.poll_messages(&ns, consumer, args).await?;
 
             if auto_commit && !batches.is_empty() {
                 let offset = batches
                     .last_offset()
                     .expect("Batch set should have at least one batch");
                 shard
-                    .streams2
+                    .streams
                     .auto_commit_consumer_offset(
                         &shard.config.system,
                         ns.stream_id(),
@@ -95,10 +95,10 @@ async fn handle_request(
             // Acquire stream lock to serialize filesystem operations
             let _stream_guard = shard.fs_locks.stream_lock.lock().await;
 
-            let stream = shard.create_stream2(&session, name.clone()).await?;
+            let stream = shard.create_stream(&session, name.clone()).await?;
             let created_stream_id = stream.id();
 
-            let event = ShardEvent::CreatedStream2 {
+            let event = ShardEvent::CreatedStream {
                 id: created_stream_id,
                 stream: stream.clone(),
             };
@@ -128,7 +128,7 @@ async fn handle_request(
             let _topic_guard = shard.fs_locks.topic_lock.lock().await;
 
             let topic = shard
-                .create_topic2(
+                .create_topic(
                     &session,
                     &stream_id,
                     name.clone(),
@@ -141,14 +141,14 @@ async fn handle_request(
 
             let topic_id = topic.id();
 
-            let event = ShardEvent::CreatedTopic2 {
+            let event = ShardEvent::CreatedTopic {
                 stream_id: stream_id.clone(),
                 topic: topic.clone(),
             };
             shard.broadcast_event_to_all_shards(event).await?;
 
             let partitions = shard
-                .create_partitions2(
+                .create_partitions(
                     &session,
                     &stream_id,
                     &Identifier::numeric(topic_id as u32).unwrap(),
@@ -156,7 +156,7 @@ async fn handle_request(
                 )
                 .await?;
 
-            let event = ShardEvent::CreatedPartitions2 {
+            let event = ShardEvent::CreatedPartitions {
                 stream_id: stream_id.clone(),
                 topic_id: Identifier::numeric(topic_id as u32).unwrap(),
                 partitions,
@@ -205,13 +205,13 @@ async fn handle_request(
 
 pub(crate) async fn handle_event(shard: &IggyShard, event: ShardEvent) -> Result<(), IggyError> {
     match event {
-        ShardEvent::DeletedPartitions2 {
+        ShardEvent::DeletedPartitions {
             stream_id,
             topic_id,
             partitions_count,
             partition_ids,
         } => {
-            shard.delete_partitions2_bypass_auth(
+            shard.delete_partitions_bypass_auth(
                 &stream_id,
                 &topic_id,
                 partitions_count,
@@ -219,21 +219,19 @@ pub(crate) async fn handle_event(shard: &IggyShard, event: ShardEvent) -> Result
             )?;
             Ok(())
         }
-        ShardEvent::UpdatedStream2 { stream_id, name } => {
-            shard.update_stream2_bypass_auth(&stream_id, &name)?;
+        ShardEvent::UpdatedStream { stream_id, name } => {
+            shard.update_stream_bypass_auth(&stream_id, &name)?;
             Ok(())
         }
-        ShardEvent::PurgedStream2 { stream_id } => {
-            shard.purge_stream2_bypass_auth(&stream_id).await?;
+        ShardEvent::PurgedStream { stream_id } => {
+            shard.purge_stream_bypass_auth(&stream_id).await?;
             Ok(())
         }
         ShardEvent::PurgedTopic {
             stream_id,
             topic_id,
         } => {
-            shard
-                .purge_topic2_bypass_auth(&stream_id, &topic_id)
-                .await?;
+            shard.purge_topic_bypass_auth(&stream_id, &topic_id).await?;
             Ok(())
         }
         ShardEvent::CreatedUser {
@@ -314,43 +312,43 @@ pub(crate) async fn handle_event(shard: &IggyShard, event: ShardEvent) -> Result
             }
             Ok(())
         }
-        ShardEvent::CreatedStream2 { id, stream } => {
-            let stream_id = shard.create_stream2_bypass_auth(stream);
+        ShardEvent::CreatedStream { id, stream } => {
+            let stream_id = shard.create_stream_bypass_auth(stream);
             assert_eq!(stream_id, id);
             Ok(())
         }
-        ShardEvent::DeletedStream2 { id, stream_id } => {
-            let stream = shard.delete_stream2_bypass_auth(&stream_id);
+        ShardEvent::DeletedStream { id, stream_id } => {
+            let stream = shard.delete_stream_bypass_auth(&stream_id);
             assert_eq!(stream.id(), id);
 
             Ok(())
         }
-        ShardEvent::CreatedTopic2 { stream_id, topic } => {
+        ShardEvent::CreatedTopic { stream_id, topic } => {
             let topic_id_from_event = topic.id();
-            let topic_id = shard.create_topic2_bypass_auth(&stream_id, topic.clone());
+            let topic_id = shard.create_topic_bypass_auth(&stream_id, topic.clone());
             assert_eq!(topic_id, topic_id_from_event);
             Ok(())
         }
-        ShardEvent::CreatedPartitions2 {
+        ShardEvent::CreatedPartitions {
             stream_id,
             topic_id,
             partitions,
         } => {
             shard
-                .create_partitions2_bypass_auth(&stream_id, &topic_id, partitions)
+                .create_partitions_bypass_auth(&stream_id, &topic_id, partitions)
                 .await?;
             Ok(())
         }
-        ShardEvent::DeletedTopic2 {
+        ShardEvent::DeletedTopic {
             id,
             stream_id,
             topic_id,
         } => {
-            let topic = shard.delete_topic_bypass_auth2(&stream_id, &topic_id);
+            let topic = shard.delete_topic_bypass_auth(&stream_id, &topic_id);
             assert_eq!(topic.id(), id);
             Ok(())
         }
-        ShardEvent::UpdatedTopic2 {
+        ShardEvent::UpdatedTopic {
             stream_id,
             topic_id,
             name,
@@ -359,7 +357,7 @@ pub(crate) async fn handle_event(shard: &IggyShard, event: ShardEvent) -> Result
             max_topic_size,
             replication_factor,
         } => {
-            shard.update_topic_bypass_auth2(
+            shard.update_topic_bypass_auth(
                 &stream_id,
                 &topic_id,
                 name.clone(),
@@ -370,23 +368,23 @@ pub(crate) async fn handle_event(shard: &IggyShard, event: ShardEvent) -> Result
             )?;
             Ok(())
         }
-        ShardEvent::CreatedConsumerGroup2 {
+        ShardEvent::CreatedConsumerGroup {
             stream_id,
             topic_id,
             cg,
         } => {
             let cg_id = cg.id();
-            let id = shard.create_consumer_group_bypass_auth2(&stream_id, &topic_id, cg);
+            let id = shard.create_consumer_group_bypass_auth(&stream_id, &topic_id, cg);
             assert_eq!(id, cg_id);
             Ok(())
         }
-        ShardEvent::DeletedConsumerGroup2 {
+        ShardEvent::DeletedConsumerGroup {
             id,
             stream_id,
             topic_id,
             group_id,
         } => {
-            let cg = shard.delete_consumer_group_bypass_auth2(&stream_id, &topic_id, &group_id);
+            let cg = shard.delete_consumer_group_bypass_auth(&stream_id, &topic_id, &group_id);
             assert_eq!(cg.id(), id);
 
             Ok(())

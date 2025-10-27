@@ -108,7 +108,7 @@ impl HttpSafeShard {
         session: &Session,
         stream_id: &Identifier,
     ) -> Result<(), IggyError> {
-        let future = SendWrapper::new(self.shard().delete_stream2(session, stream_id));
+        let future = SendWrapper::new(self.shard().delete_stream(session, stream_id));
         future.await?;
         Ok(())
     }
@@ -119,7 +119,7 @@ impl HttpSafeShard {
         stream_id: &Identifier,
         name: String,
     ) -> Result<(), IggyError> {
-        self.shard().update_stream2(session, stream_id, name)
+        self.shard().update_stream(session, stream_id, name)
     }
 
     pub async fn purge_stream(
@@ -127,7 +127,7 @@ impl HttpSafeShard {
         session: &Session,
         stream_id: &Identifier,
     ) -> Result<(), IggyError> {
-        let future = SendWrapper::new(self.shard().purge_stream2(session, stream_id));
+        let future = SendWrapper::new(self.shard().purge_stream(session, stream_id));
         future.await
     }
 
@@ -135,8 +135,8 @@ impl HttpSafeShard {
         &self,
         session: &Session,
         name: String,
-    ) -> Result<crate::streaming::streams::stream2::Stream, IggyError> {
-        let future = SendWrapper::new(self.shard().create_stream2(session, name));
+    ) -> Result<crate::streaming::streams::stream::Stream, IggyError> {
+        let future = SendWrapper::new(self.shard().create_stream(session, name));
         future.await
     }
 

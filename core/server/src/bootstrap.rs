@@ -27,16 +27,16 @@ use crate::{
     streaming::{
         partitions::{
             consumer_offset::ConsumerOffset, helpers::create_message_deduplicator,
-            journal::MemoryMessageJournal, log::SegmentedLog, partition2,
-            storage2::load_consumer_offsets,
+            journal::MemoryMessageJournal, log::SegmentedLog, partition,
+            storage::load_consumer_offsets,
         },
         persistence::persister::{FilePersister, FileWithSyncPersister, PersisterKind},
         personal_access_tokens::personal_access_token::PersonalAccessToken,
-        segments::{Segment2, storage::Storage},
+        segments::{Segment, storage::Storage},
         stats::{PartitionStats, StreamStats, TopicStats},
         storage::SystemStorage,
-        streams::stream2,
-        topics::{consumer_group2, topic2},
+        streams::stream,
+        topics::{consumer_group, topic},
         users::user::User,
         utils::{crypto, file::overwrite},
     },
@@ -73,7 +73,7 @@ pub async fn load_streams(
         );
         let stream_id = id;
         let stats = Arc::new(StreamStats::default());
-        let stream = stream2::Stream::new(name.clone(), stats.clone(), created_at);
+        let stream = stream::Stream::new(name.clone(), stats.clone(), created_at);
         let new_id = streams.insert(stream);
         assert_eq!(
             new_id, stream_id as usize,
@@ -106,7 +106,7 @@ pub async fn load_streams(
             let parent_stats = stats.clone();
             let stats = Arc::new(TopicStats::new(parent_stats));
             let topic_id = streams.with_components_by_id_mut(stream_id as usize, |(mut root, ..)| {
-                let topic = topic2::Topic::new(
+                let topic = topic::Topic::new(
                     name.clone(),
                     stats.clone(),
                     created_at,
@@ -180,7 +180,7 @@ pub async fn load_streams(
                     root.topics()
                         .with_components_by_id_mut(topic_id, |(mut root, ..)| {
                             let id = cg_state.id;
-                            let cg = consumer_group2::ConsumerGroup::new(cg_state.name.clone(), Default::default(), partition_ids.clone());
+                            let cg = consumer_group::ConsumerGroup::new(cg_state.name.clone(), Default::default(), partition_ids.clone());
                             let new_id = root.consumer_groups_mut().insert(cg);
                             assert_eq!(
                                 new_id, id as usize,
@@ -508,7 +508,7 @@ pub async fn load_segments(
             )
         };
 
-        let mut segment = Segment2::new(
+        let mut segment = Segment::new(
             start_offset,
             config.segment.size,
             config.segment.message_expiry,
@@ -629,7 +629,7 @@ async fn load_partition(
     topic_id: usize,
     partition_state: crate::state::system::PartitionState,
     parent_stats: Arc<TopicStats>,
-) -> Result<partition2::Partition, IggyError> {
+) -> Result<partition::Partition, IggyError> {
     let stats = Arc::new(PartitionStats::new(parent_stats));
     let partition_id = partition_state.id;
 
@@ -689,7 +689,7 @@ async fn load_partition(
     );
 
     let log = Default::default();
-    let partition = partition2::Partition::new(
+    let partition = partition::Partition::new(
         partition_state.created_at,
         should_increment_offset,
         stats,

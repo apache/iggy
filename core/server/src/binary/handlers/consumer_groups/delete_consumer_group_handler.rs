@@ -46,7 +46,7 @@ impl ServerCommandHandler for DeleteConsumerGroup {
         shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
-        let cg = shard.delete_consumer_group2(session, &self.stream_id, &self.topic_id, &self.group_id).with_error_context(|error| {
+        let cg = shard.delete_consumer_group(session, &self.stream_id, &self.topic_id, &self.group_id).with_error_context(|error| {
             format!(
                 "{COMPONENT} (error: {error}) - failed to delete consumer group with ID: {} for topic with ID: {} in stream with ID: {} for session: {}",
                 self.group_id, self.topic_id, self.stream_id, session
@@ -55,11 +55,11 @@ impl ServerCommandHandler for DeleteConsumerGroup {
         let cg_id = cg.id();
 
         // Remove all consumer group members from ClientManager using helper functions to resolve identifiers
-        let stream_id_usize = shard.streams2.with_stream_by_id(
+        let stream_id_usize = shard.streams.with_stream_by_id(
             &self.stream_id,
             crate::streaming::streams::helpers::get_stream_id(),
         );
-        let topic_id_usize = shard.streams2.with_topic_by_id(
+        let topic_id_usize = shard.streams.with_topic_by_id(
             &self.stream_id,
             &self.topic_id,
             crate::streaming::topics::helpers::get_topic_id(),
@@ -82,7 +82,7 @@ impl ServerCommandHandler for DeleteConsumerGroup {
             }
         }
 
-        let event = ShardEvent::DeletedConsumerGroup2 {
+        let event = ShardEvent::DeletedConsumerGroup {
             id: cg_id,
             stream_id: self.stream_id.clone(),
             topic_id: self.topic_id.clone(),

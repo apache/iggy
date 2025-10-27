@@ -22,8 +22,8 @@ use crate::slab::traits_ext::{EntityComponentSystem, IntoComponents};
 use crate::streaming::clients::client_manager::Client;
 use crate::streaming::personal_access_tokens::personal_access_token::PersonalAccessToken;
 use crate::streaming::stats::TopicStats;
-use crate::streaming::topics::consumer_group2::{ConsumerGroupMembers, ConsumerGroupRoot};
-use crate::streaming::topics::topic2::TopicRoot;
+use crate::streaming::topics::consumer_group::{ConsumerGroupMembers, ConsumerGroupRoot};
+use crate::streaming::topics::topic::TopicRoot;
 use crate::streaming::users::user::User;
 use iggy_common::{ConsumerGroupDetails, ConsumerGroupInfo, ConsumerGroupMember, IggyByteSize};
 use iggy_common::{IdentityInfo, PersonalAccessTokenInfo, TokenInfo, TopicDetails};
@@ -258,7 +258,7 @@ pub fn map_generated_access_token_to_identity_info(token: GeneratedToken) -> Ide
 
 /// Map StreamRoot and StreamStats to StreamDetails for HTTP responses
 pub fn map_stream_details(
-    root: &crate::streaming::streams::stream2::StreamRoot,
+    root: &crate::streaming::streams::stream::StreamRoot,
     stats: &crate::streaming::stats::StreamStats,
 ) -> iggy_common::StreamDetails {
     // Get topics using the new slab-based API
@@ -293,7 +293,7 @@ pub fn map_stream_details(
 
 /// Map StreamRoot and StreamStats to Stream for HTTP responses
 pub fn map_stream(
-    root: &crate::streaming::streams::stream2::StreamRoot,
+    root: &crate::streaming::streams::stream::StreamRoot,
     stats: &crate::streaming::stats::StreamStats,
 ) -> iggy_common::Stream {
     iggy_common::Stream {
@@ -308,7 +308,7 @@ pub fn map_stream(
 
 /// Map multiple streams from slabs
 pub fn map_streams_from_slabs(
-    roots: &slab::Slab<crate::streaming::streams::stream2::StreamRoot>,
+    roots: &slab::Slab<crate::streaming::streams::stream::StreamRoot>,
     stats: &slab::Slab<Arc<crate::streaming::stats::StreamStats>>,
 ) -> Vec<iggy_common::Stream> {
     let mut streams = Vec::new();

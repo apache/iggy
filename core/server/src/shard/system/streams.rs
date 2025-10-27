@@ -20,44 +20,44 @@ use super::COMPONENT;
 use crate::shard::IggyShard;
 use crate::slab::traits_ext::{DeleteCell, EntityMarker, InsertCell};
 use crate::streaming::session::Session;
-use crate::streaming::streams::storage2::{create_stream_file_hierarchy, delete_stream_from_disk};
-use crate::streaming::streams::{self, stream2};
+use crate::streaming::streams::storage::{create_stream_file_hierarchy, delete_stream_from_disk};
+use crate::streaming::streams::{self, stream};
 use error_set::ErrContext;
 use iggy_common::{Identifier, IggyError};
 
 impl IggyShard {
-    pub async fn create_stream2(
+    pub async fn create_stream(
         &self,
         session: &Session,
         name: String,
-    ) -> Result<stream2::Stream, IggyError> {
+    ) -> Result<stream::Stream, IggyError> {
         self.ensure_authenticated(session)?;
         self.permissioner
             .borrow()
             .create_stream(session.get_user_id())?;
         let exists = self
-            .streams2
+            .streams
             .exists(&Identifier::from_str_value(&name).unwrap());
 
         if exists {
             return Err(IggyError::StreamNameAlreadyExists(name));
         }
-        let stream = stream2::create_and_insert_stream_mem(&self.streams2, name);
+        let stream = stream::create_and_insert_stream_mem(&self.streams, name);
         self.metrics.increment_streams(1);
         create_stream_file_hierarchy(stream.id(), &self.config.system).await?;
         Ok(stream)
     }
 
-    pub fn create_stream2_bypass_auth(&self, stream: stream2::Stream) -> usize {
-        self.streams2.insert(stream)
+    pub fn create_stream_bypass_auth(&self, stream: stream::Stream) -> usize {
+        self.streams.insert(stream)
     }
 
-    pub fn update_stream2_bypass_auth(&self, id: &Identifier, name: &str) -> Result<(), IggyError> {
-        self.update_stream2_base(id, name.to_string())?;
+    pub fn update_stream_bypass_auth(&self, id: &Identifier, name: &str) -> Result<(), IggyError> {
+        self.update_stream_base(id, name.to_string())?;
         Ok(())
     }
 
-    pub fn update_stream2(
+    pub fn update_stream(
         &self,
         session: &Session,
         stream_id: &Identifier,
@@ -66,7 +66,7 @@ impl IggyShard {
         self.ensure_authenticated(session)?;
         self.ensure_stream_exists(stream_id)?;
         let id = self
-            .streams2
+            .streams
             .with_stream_by_id(stream_id, streams::helpers::get_stream_id());
 
         self.permissioner
@@ -79,25 +79,25 @@ impl IggyShard {
                     stream_id
                 )
             })?;
-        self.update_stream2_base(stream_id, name)?;
+        self.update_stream_base(stream_id, name)?;
         Ok(())
     }
 
-    fn update_stream2_base(&self, id: &Identifier, name: String) -> Result<(), IggyError> {
+    fn update_stream_base(&self, id: &Identifier, name: String) -> Result<(), IggyError> {
         let old_name = self
-            .streams2
+            .streams
             .with_stream_by_id(id, streams::helpers::get_stream_name());
 
         if old_name == name {
             return Ok(());
         }
-        if self.streams2.with_index(|index| index.contains_key(&name)) {
+        if self.streams.with_index(|index| index.contains_key(&name)) {
             return Err(IggyError::StreamNameAlreadyExists(name.to_string()));
         }
 
-        self.streams2
+        self.streams
             .with_stream_by_id_mut(id, streams::helpers::update_stream_name(name.clone()));
-        self.streams2.with_index_mut(|index| {
+        self.streams.with_index_mut(|index| {
             // Rename the key inside of hashmap
             let idx = index.remove(&old_name).expect("Rename key: key not found");
             index.insert(name, idx);
@@ -105,13 +105,13 @@ impl IggyShard {
         Ok(())
     }
 
-    pub fn delete_stream2_bypass_auth(&self, id: &Identifier) -> stream2::Stream {
-        self.delete_stream2_base(id)
+    pub fn delete_stream_bypass_auth(&self, id: &Identifier) -> stream::Stream {
+        self.delete_stream_base(id)
     }
 
-    fn delete_stream2_base(&self, id: &Identifier) -> stream2::Stream {
-        let stream_index = self.streams2.get_index(id);
-        let stream = self.streams2.delete(stream_index);
+    fn delete_stream_base(&self, id: &Identifier) -> stream::Stream {
+        let stream_index = self.streams.get_index(id);
+        let stream = self.streams.delete(stream_index);
         let stats = stream.stats();
 
         self.metrics.decrement_streams(1);
@@ -124,15 +124,15 @@ impl IggyShard {
         stream
     }
 
-    pub async fn delete_stream2(
+    pub async fn delete_stream(
         &self,
         session: &Session,
         id: &Identifier,
-    ) -> Result<stream2::Stream, IggyError> {
+    ) -> Result<stream::Stream, IggyError> {
         self.ensure_authenticated(session)?;
         self.ensure_stream_exists(id)?;
         let stream_id = self
-            .streams2
+            .streams
             .with_stream_by_id(id, streams::helpers::get_stream_id());
         self.permissioner
             .borrow()
@@ -144,7 +144,7 @@ impl IggyShard {
                     stream_id,
                 )
             })?;
-        let mut stream = self.delete_stream2_base(id);
+        let mut stream = self.delete_stream_base(id);
         let stream_id_usize = stream.id();
 
         // Clean up consumer groups from ClientManager for this stream
@@ -173,7 +173,7 @@ impl IggyShard {
         Ok(stream)
     }
 
-    pub async fn purge_stream2(
+    pub async fn purge_stream(
         &self,
         session: &Session,
         stream_id: &Identifier,
@@ -182,7 +182,7 @@ impl IggyShard {
         self.ensure_stream_exists(stream_id)?;
         {
             let get_stream_id = crate::streaming::streams::helpers::get_stream_id();
-            let stream_id = self.streams2.with_stream_by_id(stream_id, get_stream_id);
+            let stream_id = self.streams.with_stream_by_id(stream_id, get_stream_id);
             self.permissioner
                 .borrow()
                 .purge_stream(session.get_user_id(), stream_id)
@@ -195,24 +195,24 @@ impl IggyShard {
             })?;
         }
 
-        self.purge_stream2_base(stream_id).await
+        self.purge_stream_base(stream_id).await
     }
 
-    pub async fn purge_stream2_bypass_auth(&self, stream_id: &Identifier) -> Result<(), IggyError> {
-        self.purge_stream2_base(stream_id).await?;
+    pub async fn purge_stream_bypass_auth(&self, stream_id: &Identifier) -> Result<(), IggyError> {
+        self.purge_stream_base(stream_id).await?;
         Ok(())
     }
 
-    async fn purge_stream2_base(&self, stream_id: &Identifier) -> Result<(), IggyError> {
+    async fn purge_stream_base(&self, stream_id: &Identifier) -> Result<(), IggyError> {
         // Get all topic IDs in the stream
         let topic_ids = self
-            .streams2
+            .streams
             .with_stream_by_id(stream_id, streams::helpers::get_topic_ids());
 
         // Purge each topic in the stream using bypass auth
         for topic_id in topic_ids {
             let topic_identifier = Identifier::numeric(topic_id as u32).unwrap();
-            self.purge_topic2_bypass_auth(stream_id, &topic_identifier)
+            self.purge_topic_bypass_auth(stream_id, &topic_identifier)
                 .await?;
         }
 

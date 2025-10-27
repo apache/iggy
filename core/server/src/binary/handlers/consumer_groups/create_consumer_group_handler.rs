@@ -48,7 +48,7 @@ impl ServerCommandHandler for CreateConsumerGroup {
         shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
-        let cg = shard.create_consumer_group2(
+        let cg = shard.create_consumer_group(
             session,
             &self.stream_id,
             &self.topic_id,
@@ -56,7 +56,7 @@ impl ServerCommandHandler for CreateConsumerGroup {
         )?;
         let cg_id = cg.id();
 
-        let event = ShardEvent::CreatedConsumerGroup2 {
+        let event = ShardEvent::CreatedConsumerGroup {
             stream_id: self.stream_id.clone(),
             topic_id: self.topic_id.clone(),
             cg,
@@ -80,7 +80,7 @@ impl ServerCommandHandler for CreateConsumerGroup {
                     "{COMPONENT} (error: {error}) - failed to apply create consumer group for stream_id: {stream_id}, topic_id: {topic_id}, group_id: {cg_id}, session: {session}"
                 )
             })?;
-        let response = shard.streams2.with_consumer_group_by_id(
+        let response = shard.streams.with_consumer_group_by_id(
             &stream_id,
             &topic_id,
             &Identifier::numeric(cg_id as u32).unwrap(),

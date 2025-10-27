@@ -25,8 +25,8 @@ use crate::streaming::partitions;
 use crate::streaming::session::Session;
 use crate::streaming::streams;
 use crate::streaming::topics;
-use crate::streaming::topics::consumer_group2;
-use crate::streaming::topics::consumer_group2::MEMBERS_CAPACITY;
+use crate::streaming::topics::consumer_group;
+use crate::streaming::topics::consumer_group::MEMBERS_CAPACITY;
 use arcshift::ArcShift;
 use error_set::ErrContext;
 use iggy_common::Identifier;
@@ -34,23 +34,21 @@ use iggy_common::IggyError;
 use slab::Slab;
 
 impl IggyShard {
-    pub fn create_consumer_group2(
+    pub fn create_consumer_group(
         &self,
         session: &Session,
         stream_id: &Identifier,
         topic_id: &Identifier,
         name: String,
-    ) -> Result<consumer_group2::ConsumerGroup, IggyError> {
+    ) -> Result<consumer_group::ConsumerGroup, IggyError> {
         self.ensure_authenticated(session)?;
         self.ensure_topic_exists(stream_id, topic_id)?;
         {
-            let topic_id = self.streams2.with_topic_by_id(
-                stream_id,
-                topic_id,
-                topics::helpers::get_topic_id(),
-            );
+            let topic_id =
+                self.streams
+                    .with_topic_by_id(stream_id, topic_id, topics::helpers::get_topic_id());
             let stream_id = self
-                .streams2
+                .streams
                 .with_stream_by_id(stream_id, streams::helpers::get_stream_id());
             self.permissioner.borrow().create_consumer_group(
                 session.get_user_id(),
@@ -67,12 +65,12 @@ impl IggyShard {
         stream_id: &Identifier,
         topic_id: &Identifier,
         name: String,
-    ) -> consumer_group2::ConsumerGroup {
-        let partitions = self.streams2.with_topics(stream_id, |topics| {
+    ) -> consumer_group::ConsumerGroup {
+        let partitions = self.streams.with_topics(stream_id, |topics| {
             topics.with_partitions(topic_id, partitions::helpers::get_partition_ids())
         });
         let members = ArcShift::new(Slab::with_capacity(MEMBERS_CAPACITY));
-        let mut cg = consumer_group2::ConsumerGroup::new(name, members, partitions);
+        let mut cg = consumer_group::ConsumerGroup::new(name, members, partitions);
         let id = self.insert_consumer_group_mem(stream_id, topic_id, cg.clone());
         cg.update_id(id);
         cg
@@ -82,38 +80,36 @@ impl IggyShard {
         &self,
         stream_id: &Identifier,
         topic_id: &Identifier,
-        cg: consumer_group2::ConsumerGroup,
+        cg: consumer_group::ConsumerGroup,
     ) -> consumer_groups::ContainerId {
-        self.streams2
+        self.streams
             .with_consumer_groups_mut(stream_id, topic_id, |container| container.insert(cg))
     }
 
-    pub fn create_consumer_group_bypass_auth2(
+    pub fn create_consumer_group_bypass_auth(
         &self,
         stream_id: &Identifier,
         topic_id: &Identifier,
-        cg: consumer_group2::ConsumerGroup,
+        cg: consumer_group::ConsumerGroup,
     ) -> usize {
         self.insert_consumer_group_mem(stream_id, topic_id, cg)
     }
 
-    pub fn delete_consumer_group2(
+    pub fn delete_consumer_group(
         &self,
         session: &Session,
         stream_id: &Identifier,
         topic_id: &Identifier,
         group_id: &Identifier,
-    ) -> Result<consumer_group2::ConsumerGroup, IggyError> {
+    ) -> Result<consumer_group::ConsumerGroup, IggyError> {
         self.ensure_authenticated(session)?;
         self.ensure_consumer_group_exists(stream_id, topic_id, group_id)?;
         {
-            let topic_id = self.streams2.with_topic_by_id(
-                stream_id,
-                topic_id,
-                topics::helpers::get_topic_id(),
-            );
+            let topic_id =
+                self.streams
+                    .with_topic_by_id(stream_id, topic_id, topics::helpers::get_topic_id());
             let stream_id = self
-                .streams2
+                .streams
                 .with_stream_by_id(stream_id, streams::helpers::get_stream_id());
             self.permissioner.borrow().delete_consumer_group(
                 session.get_user_id(),
@@ -121,40 +117,40 @@ impl IggyShard {
                 topic_id,
             ).with_error_context(|error| format!("{COMPONENT} (error: {error}) - permission denied to delete consumer group for user {} on stream ID: {}, topic ID: {}", session.get_user_id(), stream_id, topic_id))?;
         }
-        let cg = self.delete_consumer_group_base2(stream_id, topic_id, group_id);
+        let cg = self.delete_consumer_group_base(stream_id, topic_id, group_id);
         Ok(cg)
     }
 
-    pub fn delete_consumer_group_bypass_auth2(
+    pub fn delete_consumer_group_bypass_auth(
         &self,
         stream_id: &Identifier,
         topic_id: &Identifier,
         group_id: &Identifier,
-    ) -> consumer_group2::ConsumerGroup {
-        self.delete_consumer_group_base2(stream_id, topic_id, group_id)
+    ) -> consumer_group::ConsumerGroup {
+        self.delete_consumer_group_base(stream_id, topic_id, group_id)
     }
 
-    fn delete_consumer_group_base2(
+    fn delete_consumer_group_base(
         &self,
         stream_id: &Identifier,
         topic_id: &Identifier,
         group_id: &Identifier,
-    ) -> consumer_group2::ConsumerGroup {
+    ) -> consumer_group::ConsumerGroup {
         // Get numeric IDs before deletion for ClientManager cleanup
         let stream_id_value = self
-            .streams2
+            .streams
             .with_stream_by_id(stream_id, streams::helpers::get_stream_id());
         let topic_id_value =
-            self.streams2
+            self.streams
                 .with_topic_by_id(stream_id, topic_id, topics::helpers::get_topic_id());
-        let group_id_value = self.streams2.with_consumer_group_by_id(
+        let group_id_value = self.streams.with_consumer_group_by_id(
             stream_id,
             topic_id,
             group_id,
             topics::helpers::get_consumer_group_id(),
         );
 
-        let cg = self.streams2.with_consumer_groups_mut(
+        let cg = self.streams.with_consumer_groups_mut(
             stream_id,
             topic_id,
             topics::helpers::delete_consumer_group(group_id),
@@ -177,13 +173,11 @@ impl IggyShard {
         self.ensure_authenticated(session)?;
         self.ensure_consumer_group_exists(stream_id, topic_id, group_id)?;
         {
-            let topic_id = self.streams2.with_topic_by_id(
-                stream_id,
-                topic_id,
-                topics::helpers::get_topic_id(),
-            );
+            let topic_id =
+                self.streams
+                    .with_topic_by_id(stream_id, topic_id, topics::helpers::get_topic_id());
             let stream_id = self
-                .streams2
+                .streams
                 .with_stream_by_id(stream_id, streams::helpers::get_stream_id());
             self.permissioner.borrow().join_consumer_group(
                 session.get_user_id(),
@@ -192,7 +186,7 @@ impl IggyShard {
             ).with_error_context(|error| format!("{COMPONENT} (error: {error}) - permission denied to join consumer group for user {} on stream ID: {}, topic ID: {}", session.get_user_id(), stream_id, topic_id))?;
         }
         let client_id = session.client_id;
-        self.streams2.with_consumer_group_by_id_mut(
+        self.streams.with_consumer_group_by_id_mut(
             stream_id,
             topic_id,
             group_id,
@@ -201,12 +195,12 @@ impl IggyShard {
 
         // Update ClientManager state
         let stream_id_value = self
-            .streams2
+            .streams
             .with_stream_by_id(stream_id, streams::helpers::get_stream_id());
         let topic_id_value =
-            self.streams2
+            self.streams
                 .with_topic_by_id(stream_id, topic_id, topics::helpers::get_topic_id());
-        let group_id_value = self.streams2.with_consumer_group_by_id(
+        let group_id_value = self.streams.with_consumer_group_by_id(
             stream_id,
             topic_id,
             group_id,
@@ -238,13 +232,11 @@ impl IggyShard {
         self.ensure_authenticated(session)?;
         self.ensure_consumer_group_exists(stream_id, topic_id, group_id)?;
         {
-            let topic_id = self.streams2.with_topic_by_id(
-                stream_id,
-                topic_id,
-                topics::helpers::get_topic_id(),
-            );
+            let topic_id =
+                self.streams
+                    .with_topic_by_id(stream_id, topic_id, topics::helpers::get_topic_id());
             let stream_id = self
-                .streams2
+                .streams
                 .with_stream_by_id(stream_id, streams::helpers::get_stream_id());
             self.permissioner.borrow().leave_consumer_group(
                 session.get_user_id(),
@@ -252,7 +244,7 @@ impl IggyShard {
                 topic_id,
             ).with_error_context(|error| format!("{COMPONENT} (error: {error}) - permission denied to leave consumer group for user {} on stream ID: {}, topic ID: {}", session.get_user_id(), stream_id, topic_id))?;
         }
-        self.streams2.with_consumer_group_by_id_mut(
+        self.streams.with_consumer_group_by_id_mut(
             stream_id,
             topic_id,
             group_id,
@@ -261,12 +253,12 @@ impl IggyShard {
 
         // Update ClientManager state
         let stream_id_value = self
-            .streams2
+            .streams
             .with_stream_by_id(stream_id, streams::helpers::get_stream_id());
         let topic_id_value =
-            self.streams2
+            self.streams
                 .with_topic_by_id(stream_id, topic_id, topics::helpers::get_topic_id());
-        let group_id_value = self.streams2.with_consumer_group_by_id(
+        let group_id_value = self.streams.with_consumer_group_by_id(
             stream_id,
             topic_id,
             group_id,
@@ -291,12 +283,12 @@ impl IggyShard {
     ) -> Result<(), IggyError> {
         // Update ClientManager state
         let stream_id_value = self
-            .streams2
+            .streams
             .with_stream_by_id(stream_id, streams::helpers::get_stream_id());
         let topic_id_value =
-            self.streams2
+            self.streams
                 .with_topic_by_id(stream_id, topic_id, topics::helpers::get_topic_id());
-        let group_id_value = self.streams2.with_consumer_group_by_id(
+        let group_id_value = self.streams.with_consumer_group_by_id(
             stream_id,
             topic_id,
             group_id,

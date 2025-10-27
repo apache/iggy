@@ -6,7 +6,7 @@ use crate::{
             Insert, IntoComponents,
         },
     },
-    streaming::topics::consumer_group2::{self, ConsumerGroupRef, ConsumerGroupRefMut},
+    streaming::topics::consumer_group::{self, ConsumerGroupRef, ConsumerGroupRefMut},
 };
 use ahash::AHashMap;
 use iggy_common::Identifier;
@@ -17,14 +17,14 @@ pub type ContainerId = usize;
 
 #[derive(Debug, Clone)]
 pub struct ConsumerGroups {
-    index: AHashMap<<consumer_group2::ConsumerGroupRoot as Keyed>::Key, usize>,
-    members: Slab<consumer_group2::ConsumerGroupMembers>,
-    root: Slab<consumer_group2::ConsumerGroupRoot>,
+    index: AHashMap<<consumer_group::ConsumerGroupRoot as Keyed>::Key, usize>,
+    members: Slab<consumer_group::ConsumerGroupMembers>,
+    root: Slab<consumer_group::ConsumerGroupRoot>,
 }
 
 impl Insert for ConsumerGroups {
     type Idx = consumer_groups::ContainerId;
-    type Item = consumer_group2::ConsumerGroup;
+    type Item = consumer_group::ConsumerGroup;
 
     fn insert(&mut self, item: Self::Item) -> Self::Idx {
         let (root, members) = item.into_components();
@@ -45,7 +45,7 @@ impl Insert for ConsumerGroups {
 
 impl Delete for ConsumerGroups {
     type Idx = consumer_groups::ContainerId;
-    type Item = consumer_group2::ConsumerGroup;
+    type Item = consumer_group::ConsumerGroup;
 
     fn delete(&mut self, id: Self::Idx) -> Self::Item {
         let root = self.root.remove(id);
@@ -53,27 +53,27 @@ impl Delete for ConsumerGroups {
         self.index
             .remove(root.key())
             .expect("consumer_group_delete: key not found");
-        consumer_group2::ConsumerGroup::new_with_components(root, members)
+        consumer_group::ConsumerGroup::new_with_components(root, members)
     }
 }
 
 //TODO: those from impls could use a macro aswell.
-impl<'a> From<&'a ConsumerGroups> for consumer_group2::ConsumerGroupRef<'a> {
+impl<'a> From<&'a ConsumerGroups> for consumer_group::ConsumerGroupRef<'a> {
     fn from(value: &'a ConsumerGroups) -> Self {
-        consumer_group2::ConsumerGroupRef::new(&value.root, &value.members)
+        consumer_group::ConsumerGroupRef::new(&value.root, &value.members)
     }
 }
 
-impl<'a> From<&'a mut ConsumerGroups> for consumer_group2::ConsumerGroupRefMut<'a> {
+impl<'a> From<&'a mut ConsumerGroups> for consumer_group::ConsumerGroupRefMut<'a> {
     fn from(value: &'a mut ConsumerGroups) -> Self {
-        consumer_group2::ConsumerGroupRefMut::new(&mut value.root, &mut value.members)
+        consumer_group::ConsumerGroupRefMut::new(&mut value.root, &mut value.members)
     }
 }
 
 impl EntityComponentSystem<Borrow> for ConsumerGroups {
     type Idx = consumer_groups::ContainerId;
-    type Entity = consumer_group2::ConsumerGroup;
-    type EntityComponents<'a> = consumer_group2::ConsumerGroupRef<'a>;
+    type Entity = consumer_group::ConsumerGroup;
+    type EntityComponents<'a> = consumer_group::ConsumerGroupRef<'a>;
 
     fn with_components<O, F>(&self, f: F) -> O
     where
@@ -84,7 +84,7 @@ impl EntityComponentSystem<Borrow> for ConsumerGroups {
 }
 
 impl EntityComponentSystemMut for ConsumerGroups {
-    type EntityComponentsMut<'a> = consumer_group2::ConsumerGroupRefMut<'a>;
+    type EntityComponentsMut<'a> = consumer_group::ConsumerGroupRefMut<'a>;
 
     fn with_components_mut<O, F>(&mut self, f: F) -> O
     where

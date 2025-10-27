@@ -23,10 +23,10 @@ use server::{
     slab::{streams::Streams, traits_ext::EntityMarker},
     streaming::{
         self,
-        partitions::{partition2, storage2::create_partition_file_hierarchy},
-        segments::{Segment2, storage::create_segment_storage},
-        streams::{storage2::create_stream_file_hierarchy, stream2},
-        topics::{storage2::create_topic_file_hierarchy, topic2},
+        partitions::{partition, storage::create_partition_file_hierarchy},
+        segments::{Segment, storage::create_segment_storage},
+        streams::{storage::create_stream_file_hierarchy, stream},
+        topics::{storage::create_topic_file_hierarchy, topic},
     },
 };
 use std::rc::Rc;
@@ -56,7 +56,7 @@ async fn bootstrap_test_environment(
 
     let streams = Streams::default();
     // Create stream together with its dirs
-    let stream = stream2::create_and_insert_stream_mem(&streams, stream_name);
+    let stream = stream::create_and_insert_stream_mem(&streams, stream_name);
     create_stream_file_hierarchy(stream.id(), config).await?;
     // Create topic together with its dirs
     let stream_id = Identifier::numeric(stream.id() as u32).unwrap();
@@ -64,7 +64,7 @@ async fn bootstrap_test_environment(
     let message_expiry = config.resolve_message_expiry(topic_expiry);
     let max_topic_size = config.resolve_max_topic_size(topic_size)?;
 
-    let topic = topic2::create_and_insert_topics_mem(
+    let topic = topic::create_and_insert_topics_mem(
         &streams,
         &stream_id,
         topic_name,
@@ -82,7 +82,7 @@ async fn bootstrap_test_environment(
         &topic_id,
         streaming::topics::helpers::get_stats(),
     );
-    let partitions = partition2::create_and_insert_partitions_mem(
+    let partitions = partition::create_and_insert_partitions_mem(
         &streams,
         &stream_id,
         &topic_id,
@@ -95,7 +95,7 @@ async fn bootstrap_test_environment(
 
         // Open the log
         let start_offset = 0;
-        let segment = Segment2::new(
+        let segment = Segment::new(
             start_offset,
             config.segment.size,
             config.segment.message_expiry,

@@ -46,14 +46,14 @@ impl ServerCommandHandler for GetTopics {
         shard.ensure_authenticated(session)?;
         shard.ensure_stream_exists(&self.stream_id)?;
         let numeric_stream_id = shard
-            .streams2
+            .streams
             .with_stream_by_id(&self.stream_id, streams::helpers::get_stream_id());
         shard
             .permissioner
             .borrow()
             .get_topics(session.get_user_id(), numeric_stream_id)?;
 
-        let response = shard.streams2.with_topics(&self.stream_id, |topics| {
+        let response = shard.streams.with_topics(&self.stream_id, |topics| {
             topics.with_components(|topics| {
                 let (roots, _, stats) = topics.into_components();
                 mapper::map_topics(&roots, &stats)

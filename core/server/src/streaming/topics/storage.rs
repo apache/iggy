@@ -6,7 +6,7 @@ use crate::{
     configs::system::SystemConfig,
     io::fs_utils::remove_dir_all,
     slab::traits_ext::{Delete, EntityComponentSystem, EntityMarker, IntoComponents},
-    streaming::{partitions::storage2::delete_partitions_from_disk, topics::topic2},
+    streaming::{partitions::storage::delete_partitions_from_disk, topics::topic},
 };
 
 pub async fn create_topic_file_hierarchy(
@@ -37,7 +37,7 @@ pub async fn create_topic_file_hierarchy(
 
 pub async fn delete_topic_from_disk(
     stream_id: usize,
-    topic: &mut topic2::Topic,
+    topic: &mut topic::Topic,
     config: &SystemConfig,
 ) -> Result<(u64, u64, u32), IggyError> {
     let topic_path = config.get_topic_path(stream_id, topic.id());

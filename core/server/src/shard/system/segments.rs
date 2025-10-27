@@ -39,7 +39,7 @@ impl IggyShard {
         partition_id: usize,
         segments_count: u32,
     ) -> Result<(), IggyError> {
-        let (segments, storages, stats) = self.streams2.with_partition_by_id_mut(
+        let (segments, storages, stats) = self.streams.with_partition_by_id_mut(
             stream_id,
             topic_id,
             partition_id,
@@ -62,9 +62,9 @@ impl IggyShard {
             },
         );
         let numeric_stream_id = self
-            .streams2
+            .streams
             .with_stream_by_id(stream_id, streaming::streams::helpers::get_stream_id());
-        let numeric_topic_id = self.streams2.with_topic_by_id(
+        let numeric_topic_id = self.streams.with_topic_by_id(
             stream_id,
             topic_id,
             streaming::topics::helpers::get_topic_id(),
