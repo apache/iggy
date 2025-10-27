@@ -113,7 +113,7 @@ mimalloc = "0.1"
 mockall = "0.13.1"
 nonzero_lit = "0.1.2"
 once_cell = "1.21.3"
-passterm = "=2.0.1"
+passterm = "=2.0.5"
 postcard = { version = "1.1.3", features = ["alloc"] }
 predicates = "3.1.3"
 quinn = "0.11.9"
