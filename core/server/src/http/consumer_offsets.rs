@@ -25,7 +25,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{delete, get};
 use axum::{Extension, Json, Router};
-use error_set::ErrContext;
+use err_trail::ErrContext;
 use iggy_common::Consumer;
 use iggy_common::ConsumerOffsetInfo;
 use iggy_common::Identifier;
@@ -100,7 +100,7 @@ async fn store_consumer_offset(
             command.0.offset,
         )
         .await
-        .with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to store consumer offset, stream ID: {}, topic ID: {}, partition ID: {:?}", stream_id, topic_id, command.0.partition_id))?;
+        .with_error(|error| format!("{COMPONENT} (error: {error}) - failed to store consumer offset, stream ID: {}, topic ID: {}, partition ID: {:?}", stream_id, topic_id, command.0.partition_id))?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -121,6 +121,6 @@ async fn delete_consumer_offset(
             query.partition_id,
         )
         .await
-        .with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to delete consumer offset, stream ID: {}, topic ID: {}, partition ID: {:?}", stream_id, topic_id, query.partition_id))?;
+        .with_error(|error| format!("{COMPONENT} (error: {error}) - failed to delete consumer offset, stream ID: {}, topic ID: {}, partition ID: {:?}", stream_id, topic_id, query.partition_id))?;
     Ok(StatusCode::NO_CONTENT)
 }

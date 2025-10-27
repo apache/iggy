@@ -23,7 +23,7 @@ use crate::binary::sender::SenderKind;
 use crate::streaming::session::Session;
 use crate::streaming::systems::system::SharedSystem;
 use anyhow::Result;
-use error_set::ErrContext;
+use err_trail::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::delete_consumer_offset::DeleteConsumerOffset;
 use tracing::debug;
@@ -51,7 +51,7 @@ impl ServerCommandHandler for DeleteConsumerOffset {
                 self.partition_id,
             )
             .await
-            .with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to delete consumer offset for topic with ID: {} in stream with ID: {} partition ID: {:#?}, session: {}",
+            .with_error(|error| format!("{COMPONENT} (error: {error}) - failed to delete consumer offset for topic with ID: {} in stream with ID: {} partition ID: {:#?}, session: {}",
                 self.topic_id, self.stream_id, self.partition_id, session
             ))?;
         sender.send_empty_ok_response().await?;

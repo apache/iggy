@@ -26,7 +26,7 @@ use crate::streaming::session::Session;
 use crate::streaming::systems::system::SharedSystem;
 use crate::streaming::utils::crypto;
 use anyhow::Result;
-use error_set::ErrContext;
+use err_trail::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::create_user::CreateUser;
 use tracing::{debug, instrument};
@@ -56,7 +56,7 @@ impl ServerCommandHandler for CreateUser {
                     self.permissions.clone(),
                 )
                 .await
-                .with_error_context(|error| {
+                .with_error(|error| {
                     format!(
                         "{COMPONENT} (error: {error}) - failed to create user with name: {}, session: {session}",
                         self.username
@@ -82,7 +82,7 @@ impl ServerCommandHandler for CreateUser {
             }),
         )
             .await
-            .with_error_context(|error| {
+            .with_error(|error| {
                 format!(
                     "{COMPONENT} (error: {error}) - failed to apply create user with name: {}, session: {session}",
                     self.username

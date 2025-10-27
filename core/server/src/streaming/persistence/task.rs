@@ -18,7 +18,7 @@
 
 use crate::streaming::persistence::COMPONENT;
 use bytes::Bytes;
-use error_set::ErrContext;
+use err_trail::ErrContext;
 use flume::{Receiver, Sender, unbounded};
 use iggy_common::IggyError;
 use std::{sync::Arc, time::Duration};
@@ -106,7 +106,7 @@ impl LogPersisterTask {
             sender
                 .send_async(data)
                 .await
-                .with_error_context(|error| {
+                .with_error(|error| {
                     format!("{COMPONENT} (error: {error}) - failed to send data to async channel")
                 })
                 .map_err(|_| IggyError::CannotSaveMessagesToSegment)

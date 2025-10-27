@@ -25,7 +25,7 @@ use crate::state::models::CreateTopicWithId;
 use crate::streaming::session::Session;
 use crate::streaming::systems::system::SharedSystem;
 use anyhow::Result;
-use error_set::ErrContext;
+use err_trail::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::create_topic::CreateTopic;
 use tracing::{debug, instrument};
@@ -60,7 +60,7 @@ impl ServerCommandHandler for CreateTopic {
                     self.replication_factor,
                 )
                 .await
-                .with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to create topic for stream_id: {stream_id}, topic_id: {topic_id:?}"
+                .with_error(|error| format!("{COMPONENT} (error: {error}) - failed to create topic for stream_id: {stream_id}, topic_id: {topic_id:?}"
                 ))?;
         self.message_expiry = topic.message_expiry;
         self.max_topic_size = topic.max_topic_size;
@@ -74,7 +74,7 @@ impl ServerCommandHandler for CreateTopic {
                 topic_id,
                 command: self
             }))            .await
-            .with_error_context(|error| {
+            .with_error(|error| {
                 format!(
                 "{COMPONENT} (error: {error}) - failed to apply create topic for stream_id: {stream_id}, topic_id: {topic_id:?}"
             )

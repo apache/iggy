@@ -23,7 +23,7 @@ use crate::streaming::topics::COMPONENT;
 use crate::streaming::topics::topic::Topic;
 use crate::streaming::utils::hash;
 use ahash::AHashMap;
-use error_set::ErrContext;
+use err_trail::ErrContext;
 use iggy_common::locking::IggySharedMutFn;
 use iggy_common::{Confirmation, IggyTimestamp, PollingStrategy};
 use iggy_common::{IggyError, IggyExpiry, Partitioning, PartitioningKind, PollingKind};
@@ -64,7 +64,7 @@ impl Topic {
                 partition
                     .get_messages_by_timestamp(value.into(), count)
                     .await
-                    .with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to get messages by timestamp: {value}, count: {count}"))
+                    .with_error(|error| format!("{COMPONENT} (error: {error}) - failed to get messages by timestamp: {value}, count: {count}"))
                                 }
             PollingKind::First => partition.get_first_messages(count).await,
             PollingKind::Last => partition.get_last_messages(count).await,
@@ -147,7 +147,7 @@ impl Topic {
             .await
             .append_messages(messages, confirmation)
             .await
-            .with_error_context(|error| {
+            .with_error(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to append messages")
             })?;
 

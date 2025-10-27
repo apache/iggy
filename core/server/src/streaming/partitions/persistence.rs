@@ -19,7 +19,7 @@
 use crate::state::system::PartitionState;
 use crate::streaming::partitions::COMPONENT;
 use crate::streaming::partitions::partition::Partition;
-use error_set::ErrContext;
+use err_trail::ErrContext;
 use iggy_common::IggyError;
 use std::path::Path;
 use std::sync::atomic::Ordering;
@@ -39,7 +39,7 @@ impl Partition {
 
     pub async fn delete(&mut self) -> Result<(), IggyError> {
         for segment in &mut self.segments {
-            segment.delete().await.with_error_context(|error| {
+            segment.delete().await.with_error(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to delete segment: {segment}",)
             })?;
             self.segments_count_of_parent_stream
@@ -56,7 +56,7 @@ impl Partition {
         self.consumer_group_offsets.clear();
 
         for segment in &mut self.segments {
-            segment.delete().await.with_error_context(|error| {
+            segment.delete().await.with_error(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to delete segment: {segment}",)
             })?;
             self.segments_count_of_parent_stream
@@ -67,19 +67,19 @@ impl Partition {
             .partition
             .delete_consumer_offsets(&self.consumer_offsets_path)
             .await
-            .with_error_context(|error| {
+            .with_error(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to delete consumer offsets in partition: {self}")
             })?;
         self.storage
             .partition
             .delete_consumer_offsets(&self.consumer_group_offsets_path)
             .await
-            .with_error_context(|error| {
+            .with_error(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to delete consumer offsets in partition: {self}")
             })?;
         self.add_persisted_segment(0)
             .await
-            .with_error_context(|error| {
+            .with_error(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to add persisted segment in partition: {self}",)
             })?;
 

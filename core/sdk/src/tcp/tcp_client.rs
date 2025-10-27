@@ -388,7 +388,17 @@ impl TcpClient {
                     .with_no_client_auth()
             };
             let connector = TlsConnector::from(Arc::new(config));
-            let tls_domain = self.config.tls_domain.to_owned();
+            let tls_domain = if self.config.tls_domain.is_empty() {
+                // Extract hostname/IP from server_address when tls_domain is not specified
+                self.config
+                    .server_address
+                    .split(':')
+                    .next()
+                    .unwrap_or(&self.config.server_address)
+                    .to_string()
+            } else {
+                self.config.tls_domain.to_owned()
+            };
             let domain = ServerName::try_from(tls_domain).map_err(|error| {
                 error!("Failed to create a server name from the domain. {error}",);
                 IggyError::InvalidTlsDomain

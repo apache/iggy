@@ -20,7 +20,7 @@ use crate::streaming::partitions::COMPONENT;
 use crate::streaming::partitions::partition::Partition;
 use crate::streaming::polling_consumer::PollingConsumer;
 use crate::streaming::segments::*;
-use error_set::ErrContext;
+use err_trail::ErrContext;
 use iggy_common::{Confirmation, IggyError, IggyTimestamp, Sizeable};
 use std::sync::atomic::Ordering;
 use tracing::trace;
@@ -159,7 +159,7 @@ impl Partition {
             let messages = segment
             .get_messages_by_offset(current_offset, remaining_count)
             .await
-            .with_error_context(|error| {
+            .with_error(|error| {
                 format!(
                     "{COMPONENT} (error: {error}) - failed to get messages from segment, segment: {segment}, \
                      offset: {current_offset}, count: {remaining_count}"
@@ -202,7 +202,7 @@ impl Partition {
             let messages = segment
                 .get_messages_by_timestamp(timestamp, remaining_count)
                 .await
-                .with_error_context(|error| {
+                .with_error(|error| {
                     format!(
                         "{COMPONENT} (error: {error}) - failed to get messages from segment by timestamp, \
                          segment: {segment}, timestamp: {timestamp}, count: {remaining_count}"
@@ -241,7 +241,7 @@ impl Partition {
                 "Current segment is closed, creating new segment with start offset: {} for partition with ID: {}...",
                 start_offset, self.partition_id
             );
-            self.add_persisted_segment(start_offset).await.with_error_context(|error| format!(
+            self.add_persisted_segment(start_offset).await.with_error(|error| format!(
                     "{COMPONENT} (error: {error}) - failed to add persisted segment, partition: {self}, start offset: {start_offset}",
                 ))?
         }
@@ -259,7 +259,7 @@ impl Partition {
         last_segment
             .append_batch(current_offset, batch, self.message_deduplicator.as_ref())
                  .await
-                 .with_error_context(|error| {
+                 .with_error(|error| {
                      format!(
                          "{COMPONENT} (error: {error}) - failed to append batch into last segment: {last_segment}",
                      )
@@ -316,7 +316,7 @@ impl Partition {
                 }
             );
 
-            last_segment.persist_messages(confirmation).await.with_error_context(|error| {
+            last_segment.persist_messages(confirmation).await.with_error(|error| {
                 format!(
                     "{COMPONENT} (error: {error}) - failed to persist messages, partition id: {}, start offset: {}",
                     self.partition_id, last_segment.start_offset()
@@ -346,7 +346,7 @@ impl Partition {
             self.partition_id
         );
 
-        last_segment.persist_messages(None).await.with_error_context(|error| {
+        last_segment.persist_messages(None).await.with_error(|error| {
             format!(
                 "{COMPONENT} (error: {error}) - failed to persist messages, partition id: {}, start offset: {}",
                 self.partition_id, last_segment.start_offset()

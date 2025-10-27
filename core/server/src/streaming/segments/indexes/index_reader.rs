@@ -19,7 +19,7 @@
 use super::IggyIndexesMut;
 use crate::streaming::utils::PooledBuffer;
 use bytes::BytesMut;
-use error_set::ErrContext;
+use err_trail::ErrContext;
 use iggy_common::{INDEX_SIZE, IggyError, IggyIndex, IggyIndexView};
 use std::{
     fs::File as StdFile,
@@ -49,7 +49,7 @@ impl IndexReader {
             .read(true)
             .open(file_path)
             .await
-            .with_error_context(|error| format!("Failed to open index file: {file_path}. {error}"))
+            .with_error(|error| format!("Failed to open index file: {file_path}. {error}"))
             .map_err(|_| IggyError::CannotReadFile)?;
 
         trace!(

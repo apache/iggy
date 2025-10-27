@@ -29,7 +29,7 @@ use crate::configs::server::{PersonalAccessTokenConfig, ServerConfig};
 use crate::configs::system::SegmentConfig;
 use crate::server_error::ConfigError;
 use crate::streaming::segments::*;
-use error_set::ErrContext;
+use err_trail::ErrContext;
 use iggy_common::CompressionAlgorithm;
 use iggy_common::IggyExpiry;
 use iggy_common::MaxTopicSize;
@@ -38,34 +38,24 @@ use tracing::error;
 
 impl Validatable<ConfigError> for ServerConfig {
     fn validate(&self) -> Result<(), ConfigError> {
-        self.system
-            .memory_pool
-            .validate()
-            .with_error_context(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to validate memory pool config")
-            })?;
-        self.data_maintenance
-            .validate()
-            .with_error_context(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to validate data maintenance config")
-            })?;
-        self.personal_access_token
-            .validate()
-            .with_error_context(|error| {
-                format!(
-                    "{COMPONENT} (error: {error}) - failed to validate personal access token config"
-                )
-            })?;
-        self.system.segment.validate().with_error_context(|error| {
+        self.system.memory_pool.validate().with_error(|error| {
+            format!("{COMPONENT} (error: {error}) - failed to validate memory pool config")
+        })?;
+        self.data_maintenance.validate().with_error(|error| {
+            format!("{COMPONENT} (error: {error}) - failed to validate data maintenance config")
+        })?;
+        self.personal_access_token.validate().with_error(|error| {
+            format!(
+                "{COMPONENT} (error: {error}) - failed to validate personal access token config"
+            )
+        })?;
+        self.system.segment.validate().with_error(|error| {
             format!("{COMPONENT} (error: {error}) - failed to validate segment config")
         })?;
-        self.system
-            .compression
-            .validate()
-            .with_error_context(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to validate compression config")
-            })?;
-        self.telemetry.validate().with_error_context(|error| {
+        self.system.compression.validate().with_error(|error| {
+            format!("{COMPONENT} (error: {error}) - failed to validate compression config")
+        })?;
+        self.telemetry.validate().with_error(|error| {
             format!("{COMPONENT} (error: {error}) - failed to validate telemetry config")
         })?;
 
@@ -206,13 +196,13 @@ impl Validatable<ConfigError> for MessageSaverConfig {
 
 impl Validatable<ConfigError> for DataMaintenanceConfig {
     fn validate(&self) -> Result<(), ConfigError> {
-        self.archiver.validate().with_error_context(|error| {
+        self.archiver.validate().with_error(|error| {
             format!("{COMPONENT} (error: {error}) - failed to validate archiver config")
         })?;
-        self.messages.validate().with_error_context(|error| {
+        self.messages.validate().with_error(|error| {
             format!("{COMPONENT} (error: {error}) - failed to validate messages maintenance config")
         })?;
-        self.state.validate().with_error_context(|error| {
+        self.state.validate().with_error(|error| {
             format!("{COMPONENT} (error: {error}) - failed to validate state maintenance config")
         })?;
         Ok(())

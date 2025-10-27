@@ -18,7 +18,7 @@
 
 use super::PersisterTask;
 use crate::streaming::segments::{IggyMessagesBatchSet, messages::write_batch};
-use error_set::ErrContext;
+use err_trail::ErrContext;
 use iggy_common::{Confirmation, IggyByteSize, IggyError};
 use std::sync::{
     Arc,
@@ -61,14 +61,14 @@ impl MessagesWriter {
             .map_err(|_| IggyError::CannotReadFile)?;
 
         if file_exists {
-            let _ = file.sync_all().await.with_error_context(|error| {
+            let _ = file.sync_all().await.with_error(|error| {
                 format!("Failed to fsync messages file after creation: {file_path}, error: {error}")
             });
 
             let actual_messages_size = file
                 .metadata()
                 .await
-                .with_error_context(|error| {
+                .with_error(|error| {
                     format!("Failed to get metadata of messages file: {file_path}, error: {error}")
                 })
                 .map_err(|_| IggyError::CannotReadFileMetadata)?
@@ -122,7 +122,7 @@ impl MessagesWriter {
                 if let Some(ref mut file) = self.file {
                     write_batch(file, &self.file_path, batch_set)
                         .await
-                        .with_error_context(|error| {
+                        .with_error(|error| {
                             format!(
                                 "Failed to write batch to messages file: {}. {error}",
                                 self.file_path
@@ -164,7 +164,7 @@ impl MessagesWriter {
         if let Some(file) = self.file.as_ref() {
             file.sync_all()
                 .await
-                .with_error_context(|error| {
+                .with_error(|error| {
                     format!("Failed to fsync messages file: {}. {error}", self.file_path)
                 })
                 .map_err(|_| IggyError::CannotWriteToFile)?;

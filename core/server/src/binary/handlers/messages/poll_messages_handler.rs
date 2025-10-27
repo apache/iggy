@@ -24,7 +24,7 @@ use crate::streaming::session::Session;
 use crate::streaming::systems::messages::PollingArgs;
 use crate::streaming::systems::system::SharedSystem;
 use anyhow::Result;
-use error_set::ErrContext;
+use err_trail::ErrContext;
 use iggy_common::{IggyError, PollMessages};
 use std::io::IoSlice;
 use tracing::{debug, trace};
@@ -69,7 +69,7 @@ impl ServerCommandHandler for PollMessages {
                 PollingArgs::new(self.strategy, self.count, self.auto_commit),
             )
             .await
-            .with_error_context(|error| format!(
+            .with_error(|error| format!(
                 "{COMPONENT} (error: {error}) - failed to poll messages for consumer: {}, stream_id: {}, topic_id: {}, partition_id: {:?}, session: {session}.",
                 self.consumer, self.stream_id, self.topic_id, self.partition_id
             ))?;

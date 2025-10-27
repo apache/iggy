@@ -18,7 +18,7 @@
 
 use super::{IggyIndexesMut, IggyMessagesBatchMut, IggyMessagesBatchSet};
 use crate::streaming::segments::segment::Segment;
-use error_set::ErrContext;
+use err_trail::ErrContext;
 use iggy_common::{IggyByteSize, IggyError};
 use std::sync::atomic::Ordering;
 use tracing::trace;
@@ -81,7 +81,7 @@ impl Segment {
         let messages_from_disk = IggyMessagesBatchSet::from(self
             .load_messages_from_disk_by_timestamp(timestamp, count)
             .await
-            .with_error_context(|error| {
+            .with_error(|error| {
                 format!(
                     "{COMPONENT} (error: {error}) - failed to load messages from disk by timestamp, stream ID: {}, topic ID: {}, partition ID: {}, timestamp: {timestamp}",
                     self.stream_id, self.topic_id, self.partition_id
@@ -164,7 +164,7 @@ impl Segment {
             let disk_messages = self
             .load_messages_from_disk_by_offset(offset, disk_count)
             .await
-            .with_error_context(|error| {
+            .with_error(|error| {
                 format!(
                     "STREAMING_SEGMENT (error: {error}) - failed to load messages from disk, stream ID: {}, topic ID: {}, partition ID: {}, start offset: {offset}, count: {disk_count}",
                     self.stream_id, self.topic_id, self.partition_id
@@ -225,9 +225,7 @@ impl Segment {
             .unwrap()
             .load_all_message_ids_from_disk(indexes, messages_count)
             .await
-            .with_error_context(|error| {
-                format!("Failed to load message IDs, error: {error} for {self}")
-            })?;
+            .with_error(|error| format!("Failed to load message IDs, error: {error} for {self}"))?;
 
         trace!(
             "Loaded {} message IDs from log file: {}",
@@ -257,7 +255,7 @@ impl Segment {
                 .await?;
 
             for batch in messages_batch.iter() {
-                batch.validate_checksums().with_error_context(|error| {
+                batch.validate_checksums().with_error(|error| {
                     format!("Failed to validate message checksum, error: {error} for {self}")
                 })?;
                 processed_count += batch.count();
@@ -329,13 +327,13 @@ impl Segment {
             .expect("Messages reader not initialized")
             .load_messages_from_disk(indexes_to_read)
             .await
-            .with_error_context(|error| {
+            .with_error(|error| {
                 format!("Failed to load messages from segment file: {self}. {error}")
             })?;
 
         batch
             .validate_checksums_and_offsets(start_offset)
-            .with_error_context(|error| {
+            .with_error(|error| {
                 format!(
                     "Failed to validate messages read from disk! error: {error}, file: {}",
                     self.messages_path
@@ -375,7 +373,7 @@ impl Segment {
             .expect("Messages reader not initialized")
             .load_messages_from_disk(indexes_to_read)
             .await
-            .with_error_context(|error| {
+            .with_error(|error| {
                 format!("Failed to load messages from segment file by timestamp: {self}. {error}")
             })
     }

@@ -28,7 +28,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::{delete, get};
 use axum::{Extension, Json, Router};
-use error_set::ErrContext;
+use err_trail::ErrContext;
 use iggy_common::Identifier;
 use iggy_common::Validatable;
 use iggy_common::create_topic::CreateTopic;
@@ -91,7 +91,7 @@ async fn get_topics(
             &Session::stateless(identity.user_id, identity.ip_address),
             &stream_id,
         )
-        .with_error_context(|error| {
+        .with_error(|error| {
             format!(
                 "{COMPONENT} (error: {error}) - failed to find topics for stream with ID: {stream_id}"
             )
@@ -124,7 +124,7 @@ async fn create_topic(
             command.replication_factor,
         )
         .await
-        .with_error_context(|error| {
+        .with_error(|error| {
             format!("{COMPONENT} (error: {error}) - failed to create topic, stream ID: {stream_id}")
         })?;
     command.message_expiry = topic.message_expiry;
@@ -140,7 +140,7 @@ async fn create_topic(
             command
         }))
         .await
-        .with_error_context(|error| {
+        .with_error(|error| {
             format!(
                 "{COMPONENT} (error: {error}) - failed to apply create topic, stream ID: {stream_id}",
             )
@@ -172,7 +172,7 @@ async fn update_topic(
                 command.replication_factor,
             )
             .await
-            .with_error_context(|error| {
+            .with_error(|error| {
                 format!(
                     "{COMPONENT} (error: {error}) - failed to update topic, stream ID: {stream_id}, topic ID: {topic_id}"
                 )
@@ -185,7 +185,7 @@ async fn update_topic(
         .state
         .apply(identity.user_id, &EntryCommand::UpdateTopic(command))
         .await
-        .with_error_context(|error| {
+        .with_error(|error| {
             format!(
                 "{COMPONENT} (error: {error}) - failed to apply update topic, stream ID: {stream_id}, topic ID: {topic_id}"
             )
@@ -210,7 +210,7 @@ async fn delete_topic(
                 &identifier_topic_id,
             )
             .await
-            .with_error_context(|error| {
+            .with_error(|error| {
                 format!(
                     "{COMPONENT} (error: {error}) - failed to delete topic with ID: {topic_id} in stream with ID: {stream_id}",
                 )
@@ -227,7 +227,7 @@ async fn delete_topic(
             }),
         )
         .await
-        .with_error_context(|error| {
+        .with_error(|error| {
             format!(
                 "{COMPONENT} (error: {error}) - failed to apply delete topic, stream ID: {stream_id}, topic ID: {topic_id}"
             )
@@ -251,7 +251,7 @@ async fn purge_topic(
             &identifier_topic_id,
         )
         .await
-        .with_error_context(|error| {
+        .with_error(|error| {
             format!(
                 "{COMPONENT} (error: {error}) - failed to purge topic, stream ID: {stream_id}, topic ID: {topic_id}"
             )
@@ -266,7 +266,7 @@ async fn purge_topic(
             }),
         )
         .await
-        .with_error_context(|error| {
+        .with_error(|error| {
             format!(
                 "{COMPONENT} (error: {error}) - failed to apply purge topic, stream ID: {stream_id}, topic ID: {topic_id}"
             )

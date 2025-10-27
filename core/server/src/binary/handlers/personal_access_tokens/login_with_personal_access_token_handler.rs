@@ -23,7 +23,7 @@ use crate::binary::{handlers::personal_access_tokens::COMPONENT, sender::SenderK
 use crate::streaming::session::Session;
 use crate::streaming::systems::system::SharedSystem;
 use anyhow::Result;
-use error_set::ErrContext;
+use err_trail::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::login_with_personal_access_token::LoginWithPersonalAccessToken;
 use tracing::{debug, instrument};
@@ -46,7 +46,7 @@ impl ServerCommandHandler for LoginWithPersonalAccessToken {
         let user = system
             .login_with_personal_access_token(&self.token, Some(session))
             .await
-            .with_error_context(|error| {
+            .with_error(|error| {
                 let redacted_token = if self.token.len() > 4 {
                     format!("{}****", &self.token[..4])
                 } else {

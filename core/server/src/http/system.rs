@@ -31,7 +31,7 @@ use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use bytes::Bytes;
 use chrono::Local;
-use error_set::ErrContext;
+use err_trail::ErrContext;
 use iggy_common::Stats;
 use iggy_common::Validatable;
 use iggy_common::get_snapshot::GetSnapshot;
@@ -65,9 +65,10 @@ async fn get_metrics(State(state): State<Arc<AppState>>) -> Result<String, Custo
 
 async fn get_stats(State(state): State<Arc<AppState>>) -> Result<Json<Stats>, CustomError> {
     let system = state.system.read().await;
-    let stats = system.get_stats().await.with_error_context(|error| {
-        format!("{COMPONENT} (error: {error}) - failed to get stats")
-    })?;
+    let stats = system
+        .get_stats()
+        .await
+        .with_error(|error| format!("{COMPONENT} (error: {error}) - failed to get stats"))?;
     Ok(Json(stats))
 }
 
@@ -78,7 +79,7 @@ async fn get_cluster_metadata(
     let system = state.system.read().await;
     let cluster_metadata = system
         .get_cluster_metadata(&Session::stateless(identity.user_id, identity.ip_address))
-        .with_error_context(|error| {
+        .with_error(|error| {
             format!(
                 "{COMPONENT} (error: {error}) - failed to get cluster metadata, user ID: {}",
                 identity.user_id
@@ -99,7 +100,7 @@ async fn get_client(
             client_id,
         )
         .await
-        .with_error_context(|error| {
+        .with_error(|error| {
             format!(
                 "{COMPONENT} (error: {error}) - failed to get client, user ID: {}",
                 identity.user_id
@@ -125,7 +126,7 @@ async fn get_clients(
     let clients = system
         .get_clients(&Session::stateless(identity.user_id, identity.ip_address))
         .await
-        .with_error_context(|error| {
+        .with_error(|error| {
             format!(
                 "{COMPONENT} (error: {error}) - failed to get clients, user ID: {}",
                 identity.user_id

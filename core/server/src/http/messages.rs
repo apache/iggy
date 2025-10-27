@@ -28,7 +28,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::get;
 use axum::{Extension, Json, Router};
-use error_set::ErrContext;
+use err_trail::ErrContext;
 use iggy_common::Identifier;
 use iggy_common::IggyMessagesBatch;
 use iggy_common::Validatable;
@@ -71,7 +71,7 @@ async fn poll_messages(
             PollingArgs::new(query.0.strategy, query.0.count, query.0.auto_commit),
         )
         .await
-        .with_error_context(|error| {
+        .with_error(|error| {
             format!(
                 "{COMPONENT} (error: {error}) - failed to poll messages, stream ID: {}, topic ID: {}, partition ID: {:?}",
                 stream_id, topic_id, query.0.partition_id
@@ -108,7 +108,7 @@ async fn send_messages(
             None,
         )
         .await
-        .with_error_context(|error| {
+        .with_error(|error| {
             format!(
                 "{COMPONENT} (error: {error}) - failed to append messages, stream ID: {stream_id}, topic ID: {topic_id}"
             )

@@ -21,7 +21,7 @@ use crate::streaming::session::Session;
 use crate::streaming::systems::COMPONENT;
 use crate::streaming::systems::system::System;
 use crate::streaming::users::user::User;
-use error_set::ErrContext;
+use err_trail::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::IggyExpiry;
 use iggy_common::IggyTimestamp;
@@ -34,11 +34,9 @@ impl System {
     ) -> Result<Vec<PersonalAccessToken>, IggyError> {
         self.ensure_authenticated(session)?;
         let user_id = session.get_user_id();
-        let user = self
-            .get_user(&user_id.try_into()?)
-            .with_error_context(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to get user with id: {user_id}")
-            })?;
+        let user = self.get_user(&user_id.try_into()?).with_error(|error| {
+            format!("{COMPONENT} (error: {error}) - failed to get user with id: {user_id}")
+        })?;
         info!("Loading personal access tokens for user with ID: {user_id}...",);
         let personal_access_tokens: Vec<_> = user
             .personal_access_tokens
@@ -63,7 +61,7 @@ impl System {
         let user_id = session.get_user_id();
         let identifier = user_id.try_into()?;
         {
-            let user = self.get_user(&identifier).with_error_context(|error| {
+            let user = self.get_user(&identifier).with_error(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to get user with id: {user_id}")
             })?;
             let max_token_per_user = self.personal_access_token.max_tokens_per_user;
@@ -78,7 +76,7 @@ impl System {
             }
         }
 
-        let user = self.get_user(&identifier).with_error_context(|error| {
+        let user = self.get_user(&identifier).with_error(|error| {
             format!("{COMPONENT} (error: {error}) - failed to get mutable reference to the user with id: {user_id}")
         })?;
 
@@ -112,7 +110,7 @@ impl System {
         let user_id = session.get_user_id();
         let user = self
             .get_user_mut(&user_id.try_into()?)
-            .with_error_context(|error| {
+            .with_error(|error| {
                 format!(
                     "{COMPONENT} (error: {error}) - failed to get mutable reference to the user with id: {user_id}"
                 )
@@ -173,7 +171,7 @@ impl System {
 
         let user = self
             .get_user(&personal_access_token.user_id.try_into()?)
-            .with_error_context(|error| {
+            .with_error(|error| {
                 format!(
                     "{COMPONENT} (error: {error}) - failed to get user with id: {}",
                     personal_access_token.user_id
