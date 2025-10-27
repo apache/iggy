@@ -271,12 +271,18 @@ pub fn get_segment_range_by_offset(
     offset: u64,
 ) -> impl FnOnce(ComponentsById<PartitionRef>) -> std::ops::Range<usize> {
     move |(.., log)| {
-        let start = log
-            .segments()
+        let segments = log.segments();
+
+        if segments.is_empty() {
+            return 0..0;
+        }
+
+        let start = segments
             .iter()
             .rposition(|segment| segment.start_offset <= offset)
-            .expect("get_segment_range_by_offset: start segment not found");
-        let end = log.segments().len();
+            .unwrap_or(0);
+
+        let end = segments.len();
         start..end
     }
 }
@@ -285,15 +291,20 @@ pub fn get_segment_range_by_timestamp(
     timestamp: u64,
 ) -> impl FnOnce(ComponentsById<PartitionRef>) -> Result<std::ops::Range<usize>, IggyError> {
     move |(.., log)| -> Result<std::ops::Range<usize>, IggyError> {
-        let start = log
-            .segments()
+        let segments = log.segments();
+
+        if segments.is_empty() {
+            return Ok(0..0);
+        }
+
+        let start = segments
             .iter()
             .enumerate()
             .filter(|(_, segment)| segment.end_timestamp >= timestamp)
             .map(|(index, _)| index)
             .next()
             .ok_or(IggyError::TimestampOutOfRange(timestamp))?;
-        let end = log.segments().len();
+        let end = segments.len();
         Ok(start..end)
     }
 }
