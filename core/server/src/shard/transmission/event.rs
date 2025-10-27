@@ -114,12 +114,6 @@ pub enum ShardEvent {
         user_id: u32,
         name: String,
     },
-    DeletedSegments {
-        stream_id: Identifier,
-        topic_id: Identifier,
-        partition_id: usize,
-        segments_count: u32,
-    },
     AddressBound {
         protocol: TransportProtocol,
         address: SocketAddr,

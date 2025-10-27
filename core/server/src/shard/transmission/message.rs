@@ -101,6 +101,9 @@ pub enum ShardRequestPayload {
     GetStats {
         user_id: u32,
     },
+    DeleteSegments {
+        segments_count: u32,
+    },
 }
 
 impl From<ShardRequest> for ShardMessage {

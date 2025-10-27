@@ -388,7 +388,6 @@ impl IggyShard {
                             |(_, _, _, offset, .., log)| {
                                 *log = loaded_log;
                                 let current_offset = log.active_segment().end_offset;
-                                tracing::warn!("loaded current_offset: {}", current_offset);
                                 offset.store(current_offset, Ordering::Relaxed);
                             },
                         );
@@ -513,6 +512,11 @@ impl IggyShard {
                 self.flush_unsaved_buffer_base(&stream_id, &topic_id, partition_id, fsync)
                     .await?;
                 Ok(ShardResponse::FlushUnsavedBuffer)
+            }
+            ShardRequestPayload::DeleteSegments { segments_count } => {
+                self.delete_segments_base(&stream_id, &topic_id, partition_id, segments_count)
+                    .await?;
+                Ok(ShardResponse::DeleteSegments)
             }
             ShardRequestPayload::CreateStream { user_id, name } => {
                 assert_eq!(self.id, 0, "CreateStream should only be handled by shard0");
@@ -831,21 +835,6 @@ impl IggyShard {
                 let cg = self.delete_consumer_group_bypass_auth2(&stream_id, &topic_id, &group_id);
                 assert_eq!(cg.id(), id);
 
-                Ok(())
-            }
-            ShardEvent::DeletedSegments {
-                stream_id,
-                topic_id,
-                partition_id,
-                segments_count,
-            } => {
-                self.delete_segments_bypass_auth(
-                    &stream_id,
-                    &topic_id,
-                    partition_id,
-                    segments_count,
-                )
-                .await?;
                 Ok(())
             }
             ShardEvent::FlushUnsavedBuffer {

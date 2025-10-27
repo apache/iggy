@@ -22,7 +22,7 @@ use bytes::Bytes;
 use iggy::clients::client::IggyClient;
 use iggy::prelude::*;
 
-const PARTITION_ID: u32 = 1;
+const PARTITION_ID: u32 = 0;
 const STREAM_NAME: &str = "test-stream-producer";
 const TOPIC_NAME: &str = "test-topic-producer";
 const PARTITIONS_COUNT: u32 = 3;

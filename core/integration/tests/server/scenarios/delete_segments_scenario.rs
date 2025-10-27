@@ -20,11 +20,9 @@ use iggy::prelude::*;
 use integration::test_server::{ClientFactory, TestServer};
 use std::fs::{DirEntry, read_dir};
 
-const STREAM_ID: u32 = 1;
 const STREAM_NAME: &str = "test_stream";
-const TOPIC_ID: u32 = 1;
 const TOPIC_NAME: &str = "test_topic";
-const PARTITION_ID: u32 = 1;
+const PARTITION_ID: u32 = 0;
 const LOG_EXTENSION: &str = "log";
 
 pub async fn run(client_factory: &dyn ClientFactory, test_server: &TestServer) {
@@ -36,13 +34,14 @@ pub async fn run(client_factory: &dyn ClientFactory, test_server: &TestServer) {
         .await
         .unwrap();
 
-    client.create_stream(STREAM_NAME).await.unwrap();
+    let stream = client.create_stream(STREAM_NAME).await.unwrap();
+    let stream_id = stream.id;
 
-    client
+    let topic = client
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
             TOPIC_NAME,
-            PARTITION_ID,
+            1,
             CompressionAlgorithm::None,
             None,
             IggyExpiry::NeverExpire,
@@ -50,6 +49,7 @@ pub async fn run(client_factory: &dyn ClientFactory, test_server: &TestServer) {
         )
         .await
         .unwrap();
+    let topic_id = topic.id;
 
     // Send 5 large messages to create multiple segments
     let large_payload = "A".repeat(1024 * 1024);
@@ -79,7 +79,7 @@ pub async fn run(client_factory: &dyn ClientFactory, test_server: &TestServer) {
     // Check initial segment count on filesystem
     let data_path = test_server.get_local_data_path();
     let partition_path =
-        format!("{data_path}/streams/{STREAM_ID}/topics/{TOPIC_ID}/partitions/{PARTITION_ID}");
+        format!("{data_path}/streams/{stream_id}/topics/{topic_id}/partitions/{PARTITION_ID}");
 
     let initial_segments = get_segment_paths_for_partition(&partition_path);
     println!(

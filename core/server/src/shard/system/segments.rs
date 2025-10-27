@@ -17,7 +17,6 @@ use crate::streaming;
  * specific language governing permissions and limitations
  * under the License.
  */
-use crate::streaming::session::Session;
 use iggy_common::Identifier;
 use iggy_common::IggyError;
 
@@ -82,20 +81,20 @@ impl IggyShard {
                 let path = msg_writer.path();
                 drop(msg_writer);
                 drop(index_writer);
-                compio::fs::remove_file(&path).await.map_err(|_| {
-                    tracing::error!("Failed to delete segment file at path: {}", path);
+                compio::fs::remove_file(&path).await.map_err(|e| {
+                    tracing::error!("Failed to delete segment file at path: {}, err: {}", path, e);
                     IggyError::CannotDeleteFile
                 })?;
             } else {
                 let start_offset = segment.start_offset;
-                let path = self.config.system.get_segment_path(
+                let path = self.config.system.get_messages_file_path(
                     numeric_stream_id,
                     numeric_topic_id,
                     partition_id,
                     start_offset,
                 );
-                compio::fs::remove_file(&path).await.map_err(|_| {
-                    tracing::error!("Failed to delete segment file at path: {}", path);
+                compio::fs::remove_file(&path).await.map_err(|e| {
+                    tracing::error!("Failed to delete segment file at path: {}, err: {}", path, e);
                     IggyError::CannotDeleteFile
                 })?;
             }
@@ -104,20 +103,5 @@ impl IggyShard {
         // TODO: Tech debt. make the increment seg count be part of init_log.
         stats.increment_segments_count(1);
         Ok(())
-    }
-
-    pub async fn delete_segments(
-        &self,
-        session: &Session,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-        partition_id: usize,
-        segments_count: u32,
-    ) -> Result<(), IggyError> {
-        // Assert authentication.
-        self.ensure_authenticated(session)?;
-        self.ensure_topic_exists(stream_id, topic_id)?;
-        self.delete_segments_base(stream_id, topic_id, partition_id, segments_count)
-            .await
     }
 }

@@ -32,6 +32,7 @@ pub enum ShardResponse {
     PollMessages((IggyPollMetadata, IggyMessagesBatchSet)),
     SendMessages,
     FlushUnsavedBuffer,
+    DeleteSegments,
     Event,
     CreateStreamResponse(stream2::Stream),
     CreateTopicResponse(topic2::Topic),
