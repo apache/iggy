@@ -43,7 +43,17 @@ services:
     ports:
       - "8081:8081"  # Web UI
       - "6123:6123"  # RPC
-    command: jobmanager
+    user: root  # Start as root to fix permissions
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        # Create checkpoint/savepoint directories with correct permissions
+        mkdir -p /tmp/flink-checkpoints /tmp/flink-savepoints
+        chown -R flink:flink /tmp/flink-checkpoints /tmp/flink-savepoints
+        chmod -R 755 /tmp/flink-checkpoints /tmp/flink-savepoints
+        # Switch to flink user and run jobmanager
+        exec gosu flink /docker-entrypoint.sh jobmanager
     environment:
       - IGGY_SERVER=iggy:8090
       - |
@@ -79,7 +89,17 @@ services:
   taskmanager:
     image: flink:2.1.0-scala_2.12-java21
     container_name: flink-taskmanager
-    command: taskmanager
+    user: root  # Start as root to fix permissions
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        # Create checkpoint/savepoint directories with correct permissions
+        mkdir -p /tmp/flink-checkpoints /tmp/flink-savepoints
+        chown -R flink:flink /tmp/flink-checkpoints /tmp/flink-savepoints
+        chmod -R 755 /tmp/flink-checkpoints /tmp/flink-savepoints
+        # Switch to flink user and run taskmanager
+        exec gosu flink /docker-entrypoint.sh taskmanager
     environment:
       - IGGY_SERVER=iggy:8090
       - |

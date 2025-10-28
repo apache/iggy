@@ -31,14 +31,14 @@
 
 # Get authentication token
 
-  TOKEN=$(curl -s -X POST <http://localhost:3000/users/login> \
+  TOKEN=$(curl -s -X POST http://localhost:3000/users/login \
     -H "Content-Type: application/json" \
     -d '{"username":"iggy","password":"iggy"}' | \
     grep -o '"token":"[^"]*"' | cut -d'"' -f4)
 
 # Send test messages (base64 encoded payloads)
 
-  curl -s -X POST "<http://localhost:3000/streams/3/topics/1/messages>" \
+  curl -s -X POST "http://localhost:3000/streams/3/topics/1/messages" \
     -H "Content-Type: application/json" \
     -H "Authorization: Bearer $TOKEN" \
     -d '{"partitioning":{"kind":"balanced","value":""},"messages":[{"payload":"aGVsbG8gd29ybGQgaGVsbG8gZmxpbms="}]}'
