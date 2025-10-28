@@ -29,26 +29,28 @@
 
   5. Send Test Messages to Iggy
 
-  # Get authentication token
-  TOKEN=$(curl -s -X POST http://localhost:3000/users/login \
+# Get authentication token
+
+  TOKEN=$(curl -s -X POST <http://localhost:3000/users/login> \
     -H "Content-Type: application/json" \
     -d '{"username":"iggy","password":"iggy"}' | \
     grep -o '"token":"[^"]*"' | cut -d'"' -f4)
 
-  # Send test messages (base64 encoded payloads)
-  curl -s -X POST "http://localhost:3000/streams/3/topics/1/messages" \
+# Send test messages (base64 encoded payloads)
+
+  curl -s -X POST "<http://localhost:3000/streams/3/topics/1/messages>" \
     -H "Content-Type: application/json" \
     -H "Authorization: Bearer $TOKEN" \
     -d '{"partitioning":{"kind":"balanced","value":""},"messages":[{"payload":"aGVsbG8gd29ybGQgaGVsbG8gZmxpbms="}]}'
   echo "✓ Sent: hello world hello flink"
 
-  curl -s -X POST "http://localhost:3000/streams/3/topics/1/messages" \
+  curl -s -X POST "<http://localhost:3000/streams/3/topics/1/messages>" \
     -H "Content-Type: application/json" \
     -H "Authorization: Bearer $TOKEN" \
     -d '{"partitioning":{"kind":"balanced","value":""},"messages":[{"payload":"YXBhY2hlIGZsaW5rIGNvbm5lY3RvciBmb3IgaWdneQ=="}]}'
   echo "✓ Sent: apache flink connector for iggy"
 
-  curl -s -X POST "http://localhost:3000/streams/3/topics/1/messages" \
+  curl -s -X POST "<http://localhost:3000/streams/3/topics/1/messages>" \
     -H "Content-Type: application/json" \
     -H "Authorization: Bearer $TOKEN" \
     -d '{"partitioning":{"kind":"balanced","value":""},"messages":[{"payload":"c3RyZWFtaW5nIGRhdGEgcHJvY2Vzc2luZyB3aXRoIGZsaW5r"}]}'
@@ -70,26 +72,28 @@
 
   7. Check Output Topic for Word Counts
 
-  # Get fresh token
-  TOKEN=$(curl -s -X POST http://localhost:3000/users/login \
+# Get fresh token
+
+  TOKEN=$(curl -s -X POST <http://localhost:3000/users/login> \
     -H "Content-Type: application/json" \
     -d '{"username":"iggy","password":"iggy"}' | \
     grep -o '"token":"[^"]*"' | cut -d'"' -f4)
 
-  # Check word-counts stream status
-  curl -s "http://localhost:3000/streams/word-counts" \
+# Check word-counts stream status
+
+  curl -s "<http://localhost:3000/streams/word-counts>" \
     -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
 
   Look for messages_count - it should show the number of word count results.
 
   8. Monitor via Web UIs
 
-  - Flink Web UI: http://localhost:8081
-    - View job details, metrics, task managers
-    - Check "Records Sent" and "Records Received" counters
-  - Iggy Web UI: http://localhost:3000
-    - Monitor stream/topic stats
-    - View consumer groups
+- Flink Web UI: <http://localhost:8081>
+  - View job details, metrics, task managers
+  - Check "Records Sent" and "Records Received" counters
+- Iggy Web UI: <http://localhost:3000>
+  - Monitor stream/topic stats
+  - View consumer groups
 
   9. Useful Monitoring Commands
 
@@ -111,7 +115,8 @@
 
   Verify no infinite message loop:
 
-  # Wait 10 seconds and check record counts haven't exploded
+# Wait 10 seconds and check record counts haven't exploded
+
   sleep 10
   docker logs flink-taskmanager --tail 20 | grep "messagesCount"
 
@@ -119,10 +124,12 @@
 
   10. Stop/Cancel Job (if needed)
 
-  # List jobs to get JobID
+# List jobs to get JobID
+
   docker exec flink-jobmanager flink list
 
-  # Cancel job
+# Cancel job
+
   docker exec flink-jobmanager flink cancel <JOB_ID>
 
   11. Clean Up (when done)
@@ -141,37 +148,40 @@
   echo "=== WordCount Job Test ==="
   echo ""
 
-  # Get token
+# Get token
+
   echo "1. Authenticating..."
-  TOKEN=$(curl -s -X POST http://localhost:3000/users/login \
+  TOKEN=$(curl -s -X POST <http://localhost:3000/users/login> \
     -H "Content-Type: application/json" \
     -d '{"username":"iggy","password":"iggy"}' | \
     grep -o '"token":"[^"]*"' | cut -d'"' -f4)
   echo "✓ Authenticated"
   echo ""
 
-  # Send messages
+# Send messages
+
   echo "2. Sending test messages..."
-  curl -s -X POST "http://localhost:3000/streams/3/topics/1/messages" \
+  curl -s -X POST "<http://localhost:3000/streams/3/topics/1/messages>" \
     -H "Content-Type: application/json" \
     -H "Authorization: Bearer $TOKEN" \
     -d '{"partitioning":{"kind":"balanced","value":""},"messages":[{"payload":"aGVsbG8gd29ybGQgaGVsbG8gZmxpbms="}]}' > /dev/null
   echo "✓ Message 1 sent"
 
-  curl -s -X POST "http://localhost:3000/streams/3/topics/1/messages" \
+  curl -s -X POST "<http://localhost:3000/streams/3/topics/1/messages>" \
     -H "Content-Type: application/json" \
     -H "Authorization: Bearer $TOKEN" \
     -d '{"partitioning":{"kind":"balanced","value":""},"messages":[{"payload":"YXBhY2hlIGZsaW5rIGNvbm5lY3RvciBmb3IgaWdneQ=="}]}' > /dev/null
   echo "✓ Message 2 sent"
 
-  curl -s -X POST "http://localhost:3000/streams/3/topics/1/messages" \
+  curl -s -X POST "<http://localhost:3000/streams/3/topics/1/messages>" \
     -H "Content-Type: application/json" \
     -H "Authorization: Bearer $TOKEN" \
     -d '{"partitioning":{"kind":"balanced","value":""},"messages":[{"payload":"c3RyZWFtaW5nIGRhdGEgcHJvY2Vzc2luZyB3aXRoIGZsaW5r"}]}' > /dev/null
   echo "✓ Message 3 sent"
   echo ""
 
-  # Wait and check
+# Wait and check
+
   echo "3. Waiting for processing (10s)..."
   sleep 10
   echo ""

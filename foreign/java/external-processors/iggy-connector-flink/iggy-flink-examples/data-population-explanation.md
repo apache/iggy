@@ -1,20 +1,21 @@
  break down this Iggy HTTP API message payload:
 
-  curl -s -X POST "http://localhost:3000/streams/3/topics/1/messages" \
+  curl -s -X POST "<http://localhost:3000/streams/3/topics/1/messages>" \
     -H "Content-Type: application/json" \
     -H "Authorization: Bearer $TOKEN" \
     -d '{"partitioning":{"kind":"balanced","value":""},"messages":[{"payload":"c3RyZWFtaW5nIGRhdGEgcHJvY2Vzc2luZyB3aXRoIGZsaW5r"}]}'
 
   URL Breakdown
 
-  http://localhost:3000/streams/3/topics/1/messages
+  <http://localhost:3000/streams/3/topics/1/messages>
                                  │         │
                                  │         └─ Topic ID: 1 (named "lines")
                                  └─────────── Stream ID: 3 (named "text-input")
 
   You can use either numeric IDs or names:
-  - /streams/3/topics/1/messages ← numeric IDs
-  - /streams/text-input/topics/lines/messages ← names
+
+- /streams/3/topics/1/messages ← numeric IDs
+- /streams/text-input/topics/lines/messages ← names
 
   JSON Payload Structure
 
@@ -44,23 +45,26 @@
   "balanced" (Round-robin distribution)
 
   {"kind": "balanced", "value": ""}
-  - Distributes messages evenly across all partitions
-  - value must be empty string
+
+- Distributes messages evenly across all partitions
+- value must be empty string
 
   "partition_id" (Direct partition assignment)
 
   {"kind": "partition_id", "value": "AQ=="}  // Partition 1 (base64 encoded)
-  - Send to a specific partition
-  - value must be the partition ID encoded in base64
-  - Example: Partition 1 → \x01 → base64 → "AQ=="
-  - Example: Partition 2 → \x02 → base64 → "Ag=="
+
+- Send to a specific partition
+- value must be the partition ID encoded in base64
+- Example: Partition 1 → \x01 → base64 → "AQ=="
+- Example: Partition 2 → \x02 → base64 → "Ag=="
 
   "messages_key" (Hash-based partitioning)
 
   {"kind": "messages_key", "value": "dXNlcjEyMw=="}  // "user123" in base64
-  - Messages with the same key go to the same partition
-  - value is the key encoded in base64
-  - Ensures ordering for messages with the same key
+
+- Messages with the same key go to the same partition
+- value is the key encoded in base64
+- Ensures ordering for messages with the same key
 
   2. messages Array
 
@@ -89,7 +93,8 @@
   Let me decode this:
 
   echo "c3RyZWFtaW5nIGRhdGEgcHJvY2Vzc2luZyB3aXRoIGZsaW5r" | base64 -d
-  # Output: streaming data processing with flink
+
+# Output: streaming data processing with flink
 
   Why Base64?
 
@@ -101,30 +106,35 @@
 
   For text messages:
 
-  # Encode text to base64
-  echo -n "hello world" | base64
-  # Output: aGVsbG8gd29ybGQ=
+# Encode text to base64
 
-  # Use in curl
-  curl -X POST "http://localhost:3000/streams/3/topics/1/messages" \
+  echo -n "hello world" | base64
+
+# Output: aGVsbG8gd29ybGQ=
+
+# Use in curl
+
+  curl -X POST "<http://localhost:3000/streams/3/topics/1/messages>" \
     -H "Authorization: Bearer $TOKEN" \
     -d '{"partitioning":{"kind":"balanced","value":""},"messages":[{"payload":"aGVsbG8gd29ybGQ="}]}'
 
   For binary data:
 
-  # Encode a file to base64
+# Encode a file to base64
+
   cat image.png | base64 > image.b64
 
-  # Use the base64 string in your JSON payload
+# Use the base64 string in your JSON payload
 
   Complete Examples
 
   Example 1: Simple text message
 
-  # Original text: "hello world"
-  # Base64: aGVsbG8gd29ybGQ=
+# Original text: "hello world"
 
-  curl -X POST "http://localhost:3000/streams/3/topics/1/messages" \
+# Base64: aGVsbG8gd29ybGQ=
+
+  curl -X POST "<http://localhost:3000/streams/3/topics/1/messages>" \
     -H "Content-Type: application/json" \
     -H "Authorization: Bearer $TOKEN" \
     -d '{
@@ -134,7 +144,7 @@
 
   Example 2: Multiple messages
 
-  curl -X POST "http://localhost:3000/streams/3/topics/1/messages" \
+  curl -X POST "<http://localhost:3000/streams/3/topics/1/messages>" \
     -H "Content-Type: application/json" \
     -H "Authorization: Bearer $TOKEN" \
     -d '{
@@ -147,7 +157,7 @@
 
   Example 3: With message ID and headers
 
-  curl -X POST "http://localhost:3000/streams/3/topics/1/messages" \
+  curl -X POST "<http://localhost:3000/streams/3/topics/1/messages>" \
     -H "Content-Type: application/json" \
     -H "Authorization: Bearer $TOKEN" \
     -d '{
@@ -164,11 +174,13 @@
 
   Example 4: Partition-specific
 
-  # Send to partition 1
-  # Partition ID 1 as bytes: [0x01]
-  # Base64 encoded: "AQ=="
+# Send to partition 1
 
-  curl -X POST "http://localhost:3000/streams/3/topics/1/messages" \
+# Partition ID 1 as bytes: [0x01]
+
+# Base64 encoded: "AQ=="
+
+  curl -X POST "<http://localhost:3000/streams/3/topics/1/messages>" \
     -H "Content-Type: application/json" \
     -H "Authorization: Bearer $TOKEN" \
     -d '{
@@ -205,4 +217,5 @@
 
   Usage:
   ./encode-message.sh "hello world"
-  # Shows you the base64 and complete curl command
+
+# Shows you the base64 and complete curl command
