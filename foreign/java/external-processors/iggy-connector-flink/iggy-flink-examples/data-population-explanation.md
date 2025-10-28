@@ -1,6 +1,7 @@
 # Break Down Iggy HTTP API Message Payload
 
 ## Example curl Command
+
 ```bash
 curl -s -X POST "http://localhost:3000/streams/3/topics/1/messages" \
   -H "Content-Type: application/json" \
@@ -9,6 +10,7 @@ curl -s -X POST "http://localhost:3000/streams/3/topics/1/messages" \
 ```
 
 ## URL Breakdown
+
 ```text
 http://localhost:3000/streams/3/topics/1/messages
                                │         │
@@ -22,6 +24,7 @@ You can use either numeric IDs or names:
 - `/streams/text-input/topics/lines/messages` ← names
 
 ## JSON Payload Structure
+
 ```json
 {
   "partitioning": {
@@ -39,6 +42,7 @@ You can use either numeric IDs or names:
 ## 1. partitioning Object
 
 Determines which partition the message goes to:
+
 ```json
 {
   "kind": "balanced",
@@ -49,6 +53,7 @@ Determines which partition the message goes to:
 Available partitioning strategies:
 
 ### "balanced" (Round-robin distribution)
+
 ```json
 {"kind": "balanced", "value": ""}
 ```
@@ -57,6 +62,7 @@ Available partitioning strategies:
 - `value` must be empty string
 
 ### "partition_id" (Direct partition assignment)
+
 ```json
 {"kind": "partition_id", "value": "AQ=="}
 ```
@@ -69,6 +75,7 @@ Partition 1 (base64 encoded)
 - Example: Partition 2 → `\x02` → base64 → `"Ag=="`
 
 ### "messages_key" (Hash-based partitioning)
+
 ```json
 {"kind": "messages_key", "value": "dXNlcjEyMw=="}
 ```
@@ -82,6 +89,7 @@ Partition 1 (base64 encoded)
 ## 2. messages Array
 
 Array of messages to send (can batch multiple messages):
+
 ```json
 {
   "messages": [
@@ -109,11 +117,13 @@ Field descriptions:
 ## 3. payload Field (BASE64 ENCODED)
 
 This is the actual message content, but it MUST be base64 encoded.
+
 ```json
 "payload": "c3RyZWFtaW5nIGRhdGEgcHJvY2Vzc2luZyB3aXRoIGZsaW5r"
 ```
 
 Let me decode this:
+
 ```bash
 echo "c3RyZWFtaW5nIGRhdGEgcHJvY2Vzc2luZyB3aXRoIGZsaW5r" | base64 -d
 ```
@@ -131,6 +141,7 @@ Output: `streaming data processing with flink`
 ### For text messages
 
 Encode text to base64:
+
 ```bash
 echo -n "hello world" | base64
 ```
@@ -138,6 +149,7 @@ echo -n "hello world" | base64
 Output: `aGVsbG8gd29ybGQ=`
 
 Use in curl:
+
 ```bash
 curl -X POST "http://localhost:3000/streams/3/topics/1/messages" \
   -H "Authorization: Bearer $TOKEN" \
@@ -147,6 +159,7 @@ curl -X POST "http://localhost:3000/streams/3/topics/1/messages" \
 ### For binary data
 
 Encode a file to base64:
+
 ```bash
 cat image.png | base64 > image.b64
 ```
@@ -159,6 +172,7 @@ Use the base64 string in your JSON payload.
 
 Original text: "hello world"  
 Base64: `aGVsbG8gd29ybGQ=`
+
 ```bash
 curl -X POST "http://localhost:3000/streams/3/topics/1/messages" \
   -H "Content-Type: application/json" \
@@ -170,6 +184,7 @@ curl -X POST "http://localhost:3000/streams/3/topics/1/messages" \
 ```
 
 ### Example 2: Multiple messages
+
 ```bash
 curl -X POST "http://localhost:3000/streams/3/topics/1/messages" \
   -H "Content-Type: application/json" \
@@ -186,6 +201,7 @@ curl -X POST "http://localhost:3000/streams/3/topics/1/messages" \
 Note: Payloads decode to "hello world" and "hello flink"
 
 ### Example 3: With message ID and headers
+
 ```bash
 curl -X POST "http://localhost:3000/streams/3/topics/1/messages" \
   -H "Content-Type: application/json" \
@@ -209,6 +225,7 @@ Send to partition 1:
 
 - Partition ID 1 as bytes: `[0x01]`
 - Base64 encoded: `"AQ=="`
+
 ```bash
 curl -X POST "http://localhost:3000/streams/3/topics/1/messages" \
   -H "Content-Type: application/json" \
@@ -226,6 +243,7 @@ When your Flink job reads this message:
 1. IggySource polls messages from Iggy
 2. Receives raw bytes (Iggy automatically decodes base64)
 3. StringDeserializationSchema converts bytes to String:
+
 ```java
 public String deserialize(byte[] data, RecordMetadata metadata) {
     return new String(data, charset);  // Converts bytes to "hello world"
@@ -237,6 +255,7 @@ public String deserialize(byte[] data, RecordMetadata metadata) {
 ## Helper Script for Encoding
 
 Save this as `encode-message.sh`:
+
 ```bash
 #!/bin/bash
 TEXT="$1"
@@ -252,6 +271,7 @@ echo "  -d '{\"partitioning\":{\"kind\":\"balanced\",\"value\":\"\"},\"messages\
 ```
 
 Usage:
+
 ```bash
 ./encode-message.sh "hello world"
 ```
