@@ -19,7 +19,7 @@
 name = "server"
 version = "0.5.0"
 edition = "2024"
-build = "src/build.rs"
+build = "build.rs"
 license = "Apache-2.0"
 
 [package.metadata.cargo-udeps.ignore]
