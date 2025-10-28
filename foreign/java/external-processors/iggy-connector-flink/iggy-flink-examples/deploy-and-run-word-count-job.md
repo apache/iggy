@@ -1,4 +1,4 @@
-⏺ Here's a complete step-by-step guide to redeploy, test, and monitor the WordCountJob:
+# Here's a complete step-by-step guide to redeploy, test, and monitor the WordCountJob
 
   1. Build the Project
 
@@ -202,5 +202,5 @@
   Make it executable and run:
   chmod +x test-word-count.sh
   ./test-word-count.sh
-  
+
   <!-- markdownlint-enable MD034 -->
