@@ -191,4 +191,3 @@
   Make it executable and run:
   chmod +x test-word-count.sh
   ./test-word-count.sh
-  

@@ -225,7 +225,7 @@ services:
           -d '{"topic_id": 1, "name": "results", "partitions_count": 4, "compression_algorithm": "none", "message_expiry": 0, "max_topic_size": 10737418240}' || true
 
         echo "Stream and topic creation completed!"
-    
+
 networks:
   flink-iggy-network:
     driver: bridge
