@@ -241,16 +241,16 @@ curl -X POST "http://localhost:3000/streams/3/topics/1/messages" \
 When your Flink job reads this message:
 
 1. IggySource polls messages from Iggy
-2. Receives raw bytes (Iggy automatically decodes base64)
-3. StringDeserializationSchema converts bytes to String:
+1. Receives raw bytes (Iggy automatically decodes base64)
+1. StringDeserializationSchema converts bytes to String:
 
-```java
-public String deserialize(byte[] data, RecordMetadata metadata) {
-    return new String(data, charset);  // Converts bytes to "hello world"
-}
-```
+   ```java
+   public String deserialize(byte[] data, RecordMetadata metadata) {
+       return new String(data, charset);  // Converts bytes to "hello world"
+   }
+   ```
 
-4. Your Flink job processes the text: "hello world"
+1. Your Flink job processes the text: "hello world"
 
 ## Helper Script for Encoding
 

@@ -1,206 +1,258 @@
 # Here's a complete step-by-step guide to redeploy, test, and monitor the WordCountJob
 
-  1. Build the Project
+1. Build the Project
 
-  cd $IGGY_HOME/foreign/java
-  ./gradlew :iggy-flink-examples:shadowJar --console=plain
+   ```bash
+   cd $IGGY_HOME/foreign/java
+   ./gradlew :iggy-flink-examples:shadowJar --console=plain
+   ```
 
-  2. Start Docker Compose (if not already running)
+1. Start Docker Compose (if not already running)
 
-  cd $IGGY_HOME/foreign/java/external-processors/iggy-connector-flink
-  docker-compose up -d
+   ```bash
+   cd $IGGY_HOME/foreign/java/external-processors/iggy-connector-flink
+   docker-compose up -d
+   ```
 
-  Wait for services to be healthy (~30 seconds):
-  sleep 30
+   Wait for services to be healthy (~30 seconds):
 
-  3. Submit the Job to Flink
+   ```bash
+   sleep 30
+   ```
 
-  docker exec flink-jobmanager flink run -d \
-    -c org.apache.iggy.flink.example.WordCountJob \
-    /opt/flink/usrlib/flink-iggy-examples.jar
+1. Submit the Job to Flink
 
-  Note the JobID that's returned (e.g., Job has been submitted with JobID abc123...)
+   ```bash
+   docker exec flink-jobmanager flink run -d \
+     -c org.apache.iggy.flink.example.WordCountJob \
+     /opt/flink/usrlib/flink-iggy-examples.jar
+   ```
 
-  4. Verify Job is Running
+   Note the JobID that's returned (e.g., Job has been submitted with JobID abc123...)
 
-  docker exec flink-jobmanager flink list
+1. Verify Job is Running
 
-  You should see your job with status RUNNING.
+   ```bash
+   docker exec flink-jobmanager flink list
+   ```
 
-  5. Send Test Messages to Iggy
+   You should see your job with status RUNNING.
 
-# Get authentication token
+1. Send Test Messages to Iggy
+
+## Get authentication token
+
 <!-- markdownlint-disable MD034 -->
 
-  TOKEN=$(curl -s -X POST http://localhost:3000/users/login \
-    -H "Content-Type: application/json" \
-    -d '{"username":"iggy","password":"iggy"}' | \
-    grep -o '"token":"[^"]*"' | cut -d'"' -f4)
+```bash
+TOKEN=$(curl -s -X POST http://localhost:3000/users/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"iggy","password":"iggy"}' | \
+  grep -o '"token":"[^"]*"' | cut -d'"' -f4)
+```
 
-# Send test messages (base64 encoded payloads)
+## Send test messages (base64 encoded payloads)
 
-  curl -s -X POST "http://localhost:3000/streams/3/topics/1/messages" \
-    -H "Content-Type: application/json" \
-    -H "Authorization: Bearer $TOKEN" \
-    -d '{"partitioning":{"kind":"balanced","value":""},"messages":[{"payload":"aGVsbG8gd29ybGQgaGVsbG8gZmxpbms="}]}'
-  echo "✓ Sent: hello world hello flink"
+```bash
+curl -s -X POST "http://localhost:3000/streams/3/topics/1/messages" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"partitioning":{"kind":"balanced","value":""},"messages":[{"payload":"aGVsbG8gd29ybGQgaGVsbG8gZmxpbms="}]}'
+echo "✓ Sent: hello world hello flink"
 
-  curl -s -X POST "<http://localhost:3000/streams/3/topics/1/messages>" \
-    -H "Content-Type: application/json" \
-    -H "Authorization: Bearer $TOKEN" \
-    -d '{"partitioning":{"kind":"balanced","value":""},"messages":[{"payload":"YXBhY2hlIGZsaW5rIGNvbm5lY3RvciBmb3IgaWdneQ=="}]}'
-  echo "✓ Sent: apache flink connector for iggy"
+curl -s -X POST "http://localhost:3000/streams/3/topics/1/messages" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"partitioning":{"kind":"balanced","value":""},"messages":[{"payload":"YXBhY2hlIGZsaW5rIGNvbm5lY3RvciBmb3IgaWdneQ=="}]}'
+echo "✓ Sent: apache flink connector for iggy"
 
-  curl -s -X POST "http://localhost:3000/streams/3/topics/1/messages" \
-    -H "Content-Type: application/json" \
-    -H "Authorization: Bearer $TOKEN" \
-    -d '{"partitioning":{"kind":"balanced","value":""},"messages":[{"payload":"c3RyZWFtaW5nIGRhdGEgcHJvY2Vzc2luZyB3aXRoIGZsaW5r"}]}'
-  echo "✓ Sent: streaming data processing with flink"
+curl -s -X POST "http://localhost:3000/streams/3/topics/1/messages" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"partitioning":{"kind":"balanced","value":""},"messages":[{"payload":"c3RyZWFtaW5nIGRhdGEgcHJvY2Vzc2luZyB3aXRoIGZsaW5r"}]}'
+echo "✓ Sent: streaming data processing with flink"
+```
 
-  6. Monitor Job Processing
+1. Monitor Job Processing
 
-  Check TaskManager logs for message processing:
+   Check TaskManager logs for message processing:
 
-  docker logs flink-taskmanager --tail 50 | grep -E "Deserialized message"
+   ```bash
+   docker logs flink-taskmanager --tail 50 | grep -E "Deserialized message"
+   ```
 
-  You should see messages being deserialized.
+   You should see messages being deserialized.
 
-  Check offset advancement (ensure no infinite loop):
+   Check offset advancement (ensure no infinite loop):
 
-  docker logs flink-taskmanager --tail 30 | grep -E "currentOffset"
+   ```bash
+   docker logs flink-taskmanager --tail 30 | grep -E "currentOffset"
+   ```
 
-  The offset should advance and stay at the new position (not reset).
+   The offset should advance and stay at the new position (not reset).
 
-  7. Check Output Topic for Word Counts
+1. Check Output Topic for Word Counts
 
-# Get fresh token
+## Get fresh token
 
-  TOKEN=$(curl -s -X POST http://localhost:3000/users/login \
-    -H "Content-Type: application/json" \
-    -d '{"username":"iggy","password":"iggy"}' | \
-    grep -o '"token":"[^"]*"' | cut -d'"' -f4)
+```bash
+TOKEN=$(curl -s -X POST http://localhost:3000/users/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"iggy","password":"iggy"}' | \
+  grep -o '"token":"[^"]*"' | cut -d'"' -f4)
+```
 
-# Check word-counts stream status
+## Check word-counts stream status
 
-  curl -s "http://localhost:3000/streams/word-counts" \
-    -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```bash
+curl -s "http://localhost:3000/streams/word-counts" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
 
-  Look for messages_count - it should show the number of word count results.
+Look for messages_count - it should show the number of word count results.
 
-  8. Monitor via Web UIs
+1. Monitor via Web UIs
 
-- Flink Web UI: <http://localhost:8081>
-  - View job details, metrics, task managers
-  - Check "Records Sent" and "Records Received" counters
-- Iggy Web UI: <http://localhost:3000>
-  - Monitor stream/topic stats
-  - View consumer groups
+   - Flink Web UI: <http://localhost:8081>
+     - View job details, metrics, task managers
+     - Check "Records Sent" and "Records Received" counters
+   - Iggy Web UI: <http://localhost:3000>
+     - Monitor stream/topic stats
+     - View consumer groups
 
-  9. Useful Monitoring Commands
+1. Useful Monitoring Commands
 
-  Check job is still running:
+   Check job is still running:
 
-  docker exec flink-jobmanager flink list
+   ```bash
+   docker exec flink-jobmanager flink list
+   ```
 
-  View JobManager logs:
+   View JobManager logs:
 
-  docker logs flink-jobmanager --tail 100
+   ```bash
+   docker logs flink-jobmanager --tail 100
+   ```
 
-  View TaskManager logs:
+   View TaskManager logs:
 
-  docker logs flink-taskmanager --tail 100
+   ```bash
+   docker logs flink-taskmanager --tail 100
+   ```
 
-  Check Iggy server logs:
+   Check Iggy server logs:
 
-  docker logs iggy-server --tail 100
+   ```bash
+   docker logs iggy-server --tail 100
+   ```
 
-  Verify no infinite message loop:
+   Verify no infinite message loop:
 
-# Wait 10 seconds and check record counts haven't exploded
+## Wait 10 seconds and check record counts haven't exploded
 
-  sleep 10
-  docker logs flink-taskmanager --tail 20 | grep "messagesCount"
+```bash
+sleep 10
+docker logs flink-taskmanager --tail 20 | grep "messagesCount"
+```
 
-  The messagesCount should be reasonable (0 when no new messages, or small numbers matching what you sent).
+The messagesCount should be reasonable (0 when no new messages, or small numbers matching what you sent).
 
-  10. Stop/Cancel Job (if needed)
+1. Stop/Cancel Job (if needed)
 
-# List jobs to get JobID
+## List jobs to get JobID
 
-  docker exec flink-jobmanager flink list
+```bash
+docker exec flink-jobmanager flink list
+```
 
-# Cancel job
+## Cancel job
 
-  docker exec flink-jobmanager flink cancel <JOB_ID>
+```bash
+docker exec flink-jobmanager flink cancel <JOB_ID>
+```
 
-  11. Clean Up (when done)
+1. Clean Up (when done)
 
-  cd $IGGY_HOME/foreign/java/external-processors/iggy-connector-flink
-  docker-compose down -v  # -v removes volumes (full cleanup)
+   ```bash
+   cd $IGGY_HOME/foreign/java/external-processors/iggy-connector-flink
+   docker-compose down -v  # -v removes volumes (full cleanup)
+   ```
 
-  ---
-  Quick Test Script
+---
 
-  Save this as test-word-count.sh:
+## Quick Test Script
 
-  #!/bin/bash
-  set -e
+Save this as test-word-count.sh:
 
-  echo "=== WordCount Job Test ==="
-  echo ""
+```bash
+#!/bin/bash
+set -e
 
-# Get token
+echo "=== WordCount Job Test ==="
+echo ""
+```
 
-  echo "1. Authenticating..."
-  TOKEN=$(curl -s -X POST http://localhost:3000/users/login \
-    -H "Content-Type: application/json" \
-    -d '{"username":"iggy","password":"iggy"}' | \
-    grep -o '"token":"[^"]*"' | cut -d'"' -f4)
-  echo "✓ Authenticated"
-  echo ""
+## Get token
 
-# Send messages
+```bash
+echo "1. Authenticating..."
+TOKEN=$(curl -s -X POST http://localhost:3000/users/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"iggy","password":"iggy"}' | \
+  grep -o '"token":"[^"]*"' | cut -d'"' -f4)
+echo "✓ Authenticated"
+echo ""
+```
 
-  echo "2. Sending test messages..."
-  curl -s -X POST "http://localhost:3000/streams/3/topics/1/messages" \
-    -H "Content-Type: application/json" \
-    -H "Authorization: Bearer $TOKEN" \
-    -d '{"partitioning":{"kind":"balanced","value":""},"messages":[{"payload":"aGVsbG8gd29ybGQgaGVsbG8gZmxpbms="}]}' > /dev/null
-  echo "✓ Message 1 sent"
+## Send messages
 
-  curl -s -X POST "http://localhost:3000/streams/3/topics/1/messages" \
-    -H "Content-Type: application/json" \
-    -H "Authorization: Bearer $TOKEN" \
-    -d '{"partitioning":{"kind":"balanced","value":""},"messages":[{"payload":"YXBhY2hlIGZsaW5rIGNvbm5lY3RvciBmb3IgaWdneQ=="}]}' > /dev/null
-  echo "✓ Message 2 sent"
+```bash
+echo "2. Sending test messages..."
+curl -s -X POST "http://localhost:3000/streams/3/topics/1/messages" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"partitioning":{"kind":"balanced","value":""},"messages":[{"payload":"aGVsbG8gd29ybGQgaGVsbG8gZmxpbms="}]}' > /dev/null
+echo "✓ Message 1 sent"
 
-  curl -s -X POST "http://localhost:3000/streams/3/topics/1/messages" \
-    -H "Content-Type: application/json" \
-    -H "Authorization: Bearer $TOKEN" \
-    -d '{"partitioning":{"kind":"balanced","value":""},"messages":[{"payload":"c3RyZWFtaW5nIGRhdGEgcHJvY2Vzc2luZyB3aXRoIGZsaW5r"}]}' > /dev/null
-  echo "✓ Message 3 sent"
-  echo ""
+curl -s -X POST "http://localhost:3000/streams/3/topics/1/messages" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"partitioning":{"kind":"balanced","value":""},"messages":[{"payload":"YXBhY2hlIGZsaW5rIGNvbm5lY3RvciBmb3IgaWdneQ=="}]}' > /dev/null
+echo "✓ Message 2 sent"
 
-# Wait and check
+curl -s -X POST "http://localhost:3000/streams/3/topics/1/messages" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"partitioning":{"kind":"balanced","value":""},"messages":[{"payload":"c3RyZWFtaW5nIGRhdGEgcHJvY2Vzc2luZyB3aXRoIGZsaW5r"}]}' > /dev/null
+echo "✓ Message 3 sent"
+echo ""
+```
 
-  echo "3. Waiting for processing (10s)..."
-  sleep 10
-  echo ""
+## Wait and check
 
-  echo "4. Checking word counts output..."
-  WORD_COUNTS=$(curl -s "http://localhost:3000/streams/word-counts" \
-    -H "Authorization: Bearer $TOKEN" | python3 -c "import json,sys; data=json.load(sys.stdin); print(f\"Messages: {data['messages_count']}, Size: {data['size']}\")")
-  echo "Output topic: $WORD_COUNTS"
-  echo ""
+```bash
+echo "3. Waiting for processing (10s)..."
+sleep 10
+echo ""
 
-  echo "5. Recent processing logs:"
-  docker logs flink-taskmanager --since 30s 2>&1 | grep "Deserialized message" | tail -5
-  echo ""
+echo "4. Checking word counts output..."
+WORD_COUNTS=$(curl -s "http://localhost:3000/streams/word-counts" \
+  -H "Authorization: Bearer $TOKEN" | python3 -c "import json,sys; data=json.load(sys.stdin); print(f\"Messages: {data['messages_count']}, Size: {data['size']}\")")
+echo "Output topic: $WORD_COUNTS"
+echo ""
 
-  echo "✓ Test complete!"
+echo "5. Recent processing logs:"
+docker logs flink-taskmanager --since 30s 2>&1 | grep "Deserialized message" | tail -5
+echo ""
 
-  Make it executable and run:
-  chmod +x test-word-count.sh
-  ./test-word-count.sh
+echo "✓ Test complete!"
+```
 
-  <!-- markdownlint-enable MD034 -->
+Make it executable and run:
+
+```bash
+chmod +x test-word-count.sh
+./test-word-count.sh
+```
+
+<!-- markdownlint-enable MD034 -->
