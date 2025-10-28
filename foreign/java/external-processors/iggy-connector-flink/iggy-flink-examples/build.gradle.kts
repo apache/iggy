@@ -80,9 +80,9 @@ tasks.shadowJar {
 }
 
 java {
-    // Target Java 21 for compatibility with Flink Docker image
-    sourceCompatibility = JavaVersion.VERSION_21
-    targetCompatibility = JavaVersion.VERSION_21
+    // Target Java 17 for CI compatibility (Java 21 Flink Docker can run Java 17 bytecode)
+    sourceCompatibility = JavaVersion.VERSION_17
+    targetCompatibility = JavaVersion.VERSION_17
 }
 
 tasks.withType<JavaCompile> {
