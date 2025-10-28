@@ -33,9 +33,9 @@ repositories {
 }
 
 java {
-    // Target Java 21 for compatibility with Flink Docker image
-    sourceCompatibility = JavaVersion.VERSION_21
-    targetCompatibility = JavaVersion.VERSION_21
+    // Keep Java 17 for SDK compatibility with broader ecosystem
+    sourceCompatibility = JavaVersion.VERSION_17
+    targetCompatibility = JavaVersion.VERSION_17
 
     withJavadocJar()
     withSourcesJar()

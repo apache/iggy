@@ -30,6 +30,7 @@
   5. Send Test Messages to Iggy
 
 # Get authentication token
+<!-- markdownlint-disable MD034 -->
 
   TOKEN=$(curl -s -X POST http://localhost:3000/users/login \
     -H "Content-Type: application/json" \
@@ -50,7 +51,7 @@
     -d '{"partitioning":{"kind":"balanced","value":""},"messages":[{"payload":"YXBhY2hlIGZsaW5rIGNvbm5lY3RvciBmb3IgaWdneQ=="}]}'
   echo "✓ Sent: apache flink connector for iggy"
 
-  curl -s -X POST "<http://localhost:3000/streams/3/topics/1/messages>" \
+  curl -s -X POST "http://localhost:3000/streams/3/topics/1/messages" \
     -H "Content-Type: application/json" \
     -H "Authorization: Bearer $TOKEN" \
     -d '{"partitioning":{"kind":"balanced","value":""},"messages":[{"payload":"c3RyZWFtaW5nIGRhdGEgcHJvY2Vzc2luZyB3aXRoIGZsaW5r"}]}'
@@ -74,14 +75,14 @@
 
 # Get fresh token
 
-  TOKEN=$(curl -s -X POST <http://localhost:3000/users/login> \
+  TOKEN=$(curl -s -X POST http://localhost:3000/users/login \
     -H "Content-Type: application/json" \
     -d '{"username":"iggy","password":"iggy"}' | \
     grep -o '"token":"[^"]*"' | cut -d'"' -f4)
 
 # Check word-counts stream status
 
-  curl -s "<http://localhost:3000/streams/word-counts>" \
+  curl -s "http://localhost:3000/streams/word-counts" \
     -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
 
   Look for messages_count - it should show the number of word count results.
@@ -151,7 +152,7 @@
 # Get token
 
   echo "1. Authenticating..."
-  TOKEN=$(curl -s -X POST <http://localhost:3000/users/login> \
+  TOKEN=$(curl -s -X POST http://localhost:3000/users/login \
     -H "Content-Type: application/json" \
     -d '{"username":"iggy","password":"iggy"}' | \
     grep -o '"token":"[^"]*"' | cut -d'"' -f4)
@@ -161,19 +162,19 @@
 # Send messages
 
   echo "2. Sending test messages..."
-  curl -s -X POST "<http://localhost:3000/streams/3/topics/1/messages>" \
+  curl -s -X POST "http://localhost:3000/streams/3/topics/1/messages" \
     -H "Content-Type: application/json" \
     -H "Authorization: Bearer $TOKEN" \
     -d '{"partitioning":{"kind":"balanced","value":""},"messages":[{"payload":"aGVsbG8gd29ybGQgaGVsbG8gZmxpbms="}]}' > /dev/null
   echo "✓ Message 1 sent"
 
-  curl -s -X POST "<http://localhost:3000/streams/3/topics/1/messages>" \
+  curl -s -X POST "http://localhost:3000/streams/3/topics/1/messages" \
     -H "Content-Type: application/json" \
     -H "Authorization: Bearer $TOKEN" \
     -d '{"partitioning":{"kind":"balanced","value":""},"messages":[{"payload":"YXBhY2hlIGZsaW5rIGNvbm5lY3RvciBmb3IgaWdneQ=="}]}' > /dev/null
   echo "✓ Message 2 sent"
 
-  curl -s -X POST "<http://localhost:3000/streams/3/topics/1/messages>" \
+  curl -s -X POST "http://localhost:3000/streams/3/topics/1/messages" \
     -H "Content-Type: application/json" \
     -H "Authorization: Bearer $TOKEN" \
     -d '{"partitioning":{"kind":"balanced","value":""},"messages":[{"payload":"c3RyZWFtaW5nIGRhdGEgcHJvY2Vzc2luZyB3aXRoIGZsaW5r"}]}' > /dev/null
@@ -201,3 +202,5 @@
   Make it executable and run:
   chmod +x test-word-count.sh
   ./test-word-count.sh
+  
+  <!-- markdownlint-enable MD034 -->
