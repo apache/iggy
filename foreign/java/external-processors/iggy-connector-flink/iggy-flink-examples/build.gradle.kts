@@ -65,6 +65,9 @@ dependencies {
 
 tasks.withType<Test> {
     useJUnitPlatform()
+    // Exclude integration tests that require a running Iggy server
+    // These should be run separately with: ./gradlew integrationTest
+    exclude("**/AsyncTcp*Test.class", "**/SendTextDataTest.class")
 }
 
 tasks.shadowJar {
