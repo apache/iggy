@@ -31,7 +31,7 @@ public static class ExampleHelpers
     )
     {
         var stream = await client.GetStreamByIdAsync(streamId, token);
-        if(stream == null)
+        if (stream == null)
         {
             await client.CreateStreamAsync(streamName, token: token);
         }
@@ -47,7 +47,7 @@ public static class ExampleHelpers
     )
     {
         var topic = await client.GetTopicByIdAsync(streamId, topicId, cancellationToken);
-        if(topic == null)
+        if (topic == null)
         {
             await client.CreateTopicAsync(
                 streamId,

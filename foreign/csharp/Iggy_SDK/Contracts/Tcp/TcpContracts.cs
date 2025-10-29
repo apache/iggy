@@ -749,7 +749,7 @@ internal static class TcpContracts
         bytes.WriteBytesFromIdentifier(consumer.Id, 1);
         var position = 1 + consumer.Id.Length + 2;
         bytes.WriteBytesFromStreamAndTopicIdentifiers(streamId, topicId, position);
-        position += + 2 + streamId.Length + 2 + topicId.Length;
+        position += +2 + streamId.Length + 2 + topicId.Length;
         BinaryPrimitives.WriteUInt32LittleEndian(bytes[position..(position + 4)], partitionId ?? 0);
         return bytes.ToArray();
     }
