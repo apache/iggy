@@ -24,7 +24,7 @@ use crate::streaming::topics::consumer_group::ConsumerGroup;
 use crate::streaming::topics::topic::Topic;
 use ahash::AHashSet;
 use anyhow::Context;
-use error_set::ErrContext;
+use err_trail::ErrContext;
 use futures::future::join_all;
 use iggy_common::IggyError;
 use iggy_common::locking::IggySharedMut;
@@ -155,7 +155,7 @@ impl TopicStorage for FileTopicStorage {
                         partition_state.created_at,
                     )
                     .await;
-                    partition.persist().await.with_error_context(|error| {
+                    partition.persist().await.with_error(|error| {
                         format!(
                             "{COMPONENT} (error: {error}) - failed to persist partition: {partition}"
                         )
@@ -249,7 +249,7 @@ impl TopicStorage for FileTopicStorage {
         );
         for (_, partition) in topic.partitions.iter() {
             let mut partition = partition.write().await;
-            partition.persist().await.with_error_context(|error| {
+            partition.persist().await.with_error(|error| {
                 format!(
                     "{COMPONENT} (error: {error}) - failed to persist partition, topic: {topic}"
                 )

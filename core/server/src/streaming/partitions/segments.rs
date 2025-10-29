@@ -21,7 +21,7 @@ use std::sync::atomic::Ordering;
 use crate::streaming::partitions::COMPONENT;
 use crate::streaming::partitions::partition::Partition;
 use crate::streaming::segments::*;
-use error_set::ErrContext;
+use err_trail::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::IggyTimestamp;
 use tracing::info;
@@ -88,7 +88,7 @@ impl Partition {
             self.messages_count.clone(),
             true,
         );
-        new_segment.persist().await.with_error_context(|error| {
+        new_segment.persist().await.with_error(|error| {
             format!("{COMPONENT} (error: {error}) - failed to persist new segment: {new_segment}",)
         })?;
         self.segments.push(new_segment);
@@ -107,7 +107,7 @@ impl Partition {
             }
 
             let segment = segment.unwrap();
-            segment.delete().await.with_error_context(|error| {
+            segment.delete().await.with_error(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to delete segment: {segment}",)
             })?;
 

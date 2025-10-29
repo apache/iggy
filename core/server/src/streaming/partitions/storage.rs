@@ -25,7 +25,7 @@ use crate::streaming::persistence::persister::PersisterKind;
 use crate::streaming::segments::*;
 use crate::streaming::storage::PartitionStorage;
 use crate::streaming::utils::file;
-use error_set::ErrContext;
+use err_trail::ErrContext;
 use iggy_common::ConsumerKind;
 use iggy_common::IggyError;
 use std::path::Path;
@@ -64,7 +64,7 @@ impl PartitionStorage for FilePartitionStorage {
         let dir_entries = fs::read_dir(&partition.partition_path).await;
         if fs::read_dir(&partition.partition_path)
                 .await
-                .with_error_context(|error| format!(
+                .with_error(|error| format!(
                     "{COMPONENT} (error: {error}) - failed to read partition with ID: {} for stream with ID: {} and topic with ID: {} and path: {}.",
                     partition.partition_id, partition.stream_id, partition.topic_id, partition.partition_path,
                 )).is_err()
@@ -155,7 +155,7 @@ impl PartitionStorage for FilePartitionStorage {
                 tokio::fs::remove_file(&time_index_path).await.unwrap();
             }
 
-            segment.load_from_disk().await.with_error_context(|error| {
+            segment.load_from_disk().await.with_error(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to load segment: {segment}",)
             })?;
 
@@ -187,7 +187,7 @@ impl PartitionStorage for FilePartitionStorage {
                     partition.partition_id,
                     segment.start_offset()
                 );
-                let message_ids = segment.load_message_ids(max_entries).await.with_error_context(|error| {
+                let message_ids = segment.load_message_ids(max_entries).await.with_error(|error| {
                     format!("{COMPONENT} (error: {error}) - failed to load message ids, segment: {segment}",)
                 })?;
                 for message_id in message_ids {
@@ -240,7 +240,7 @@ impl PartitionStorage for FilePartitionStorage {
         partition
             .load_consumer_offsets()
             .await
-            .with_error_context(|error| {
+            .with_error(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to load consumer offsets, partition: {partition}",)
             })?;
         info!(
@@ -316,7 +316,7 @@ impl PartitionStorage for FilePartitionStorage {
         }
 
         for segment in partition.get_segments_mut() {
-            segment.persist().await.with_error_context(|error| {
+            segment.persist().await.with_error(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to persist segment: {segment}",)
             })?;
         }
@@ -393,7 +393,7 @@ impl PartitionStorage for FilePartitionStorage {
         self.persister
             .overwrite(path, &offset.to_le_bytes())
             .await
-            .with_error_context(|error| format!(
+            .with_error(|error| format!(
                 "{COMPONENT} (error: {error}) - failed to overwrite consumer offset with value: {offset}, path: {path}",
             ))?;
         trace!("Stored consumer offset value: {}, path: {}", offset, path);
@@ -441,7 +441,7 @@ impl PartitionStorage for FilePartitionStorage {
             let consumer_id = consumer_id.unwrap();
             let mut file = file::open(&path)
                 .await
-                .with_error_context(|error| {
+                .with_error(|error| {
                     format!(
                         "{COMPONENT} (error: {error}) - failed to open offset file, path: {path}"
                     )
@@ -450,7 +450,7 @@ impl PartitionStorage for FilePartitionStorage {
             let offset = file
                 .read_u64_le()
                 .await
-                .with_error_context(|error| {
+                .with_error(|error| {
                     format!("{COMPONENT} (error: {error}) - failed to read consumer offset from file, path: {path}")
                 })
                 .map_err(|_| IggyError::CannotReadFile)?;

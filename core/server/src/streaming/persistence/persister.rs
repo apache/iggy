@@ -18,7 +18,7 @@
 
 use crate::streaming::persistence::COMPONENT;
 use crate::streaming::utils::file;
-use error_set::ErrContext;
+use err_trail::ErrContext;
 use iggy_common::IggyError;
 use std::fmt::Debug;
 use std::future::Future;
@@ -90,13 +90,13 @@ impl Persister for FilePersister {
     async fn append(&self, path: &str, bytes: &[u8]) -> Result<(), IggyError> {
         let mut file = file::append(path)
             .await
-            .with_error_context(|error| {
+            .with_error(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to append to file: {path}")
             })
             .map_err(|_| IggyError::CannotAppendToFile)?;
         file.write_all(bytes)
             .await
-            .with_error_context(|error| {
+            .with_error(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to write data to file: {path}")
             })
             .map_err(|_| IggyError::CannotWriteToFile)?;
@@ -106,13 +106,13 @@ impl Persister for FilePersister {
     async fn overwrite(&self, path: &str, bytes: &[u8]) -> Result<(), IggyError> {
         let mut file = file::overwrite(path)
             .await
-            .with_error_context(|error| {
+            .with_error(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to overwrite file: {path}")
             })
             .map_err(|_| IggyError::CannotOverwriteFile)?;
         file.write_all(bytes)
             .await
-            .with_error_context(|error| {
+            .with_error(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to write data to file: {path}")
             })
             .map_err(|_| IggyError::CannotWriteToFile)?;
@@ -122,7 +122,7 @@ impl Persister for FilePersister {
     async fn delete(&self, path: &str) -> Result<(), IggyError> {
         fs::remove_file(path)
             .await
-            .with_error_context(|error| {
+            .with_error(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to delete file: {path}")
             })
             .map_err(|_| IggyError::CannotDeleteFile)?;
@@ -134,19 +134,19 @@ impl Persister for FileWithSyncPersister {
     async fn append(&self, path: &str, bytes: &[u8]) -> Result<(), IggyError> {
         let mut file = file::append(path)
             .await
-            .with_error_context(|error| {
+            .with_error(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to append to file: {path}")
             })
             .map_err(|_| IggyError::CannotAppendToFile)?;
         file.write_all(bytes)
             .await
-            .with_error_context(|error| {
+            .with_error(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to write data to file: {path}")
             })
             .map_err(|_| IggyError::CannotWriteToFile)?;
         file.sync_all()
             .await
-            .with_error_context(|error| {
+            .with_error(|error| {
                 format!(
                     "{COMPONENT} (error: {error}) - failed to sync file after appending: {path}"
                 )
@@ -158,19 +158,19 @@ impl Persister for FileWithSyncPersister {
     async fn overwrite(&self, path: &str, bytes: &[u8]) -> Result<(), IggyError> {
         let mut file = file::overwrite(path)
             .await
-            .with_error_context(|error| {
+            .with_error(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to overwrite file: {path}")
             })
             .map_err(|_| IggyError::CannotOverwriteFile)?;
         file.write_all(bytes)
             .await
-            .with_error_context(|error| {
+            .with_error(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to write data to file: {path}")
             })
             .map_err(|_| IggyError::CannotWriteToFile)?;
         file.sync_all()
             .await
-            .with_error_context(|error| {
+            .with_error(|error| {
                 format!(
                     "{COMPONENT} (error: {error}) - failed to sync file after overwriting: {path}"
                 )
@@ -182,7 +182,7 @@ impl Persister for FileWithSyncPersister {
     async fn delete(&self, path: &str) -> Result<(), IggyError> {
         fs::remove_file(path)
             .await
-            .with_error_context(|error| {
+            .with_error(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to delete file: {path}")
             })
             .map_err(|_| IggyError::CannotDeleteFile)?;

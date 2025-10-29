@@ -17,6 +17,7 @@
 
 pub(crate) mod byte_size;
 pub(crate) mod checksum;
+#[allow(deprecated)]
 pub(crate) mod crypto;
 pub(crate) mod duration;
 pub(crate) mod expiry;

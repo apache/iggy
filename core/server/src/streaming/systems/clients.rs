@@ -20,7 +20,7 @@ use crate::streaming::clients::client_manager::Client;
 use crate::streaming::session::Session;
 use crate::streaming::systems::COMPONENT;
 use crate::streaming::systems::system::System;
-use error_set::ErrContext;
+use err_trail::ErrContext;
 use iggy_common::Identifier;
 use iggy_common::IggyError;
 use iggy_common::TransportProtocol;
@@ -89,7 +89,7 @@ impl System {
         self.ensure_authenticated(session)?;
         self.permissioner
             .get_client(session.get_user_id())
-            .with_error_context(|error| {
+            .with_error(|error| {
                 format!(
                     "{COMPONENT} (error: {error}) - permission denied to get client with ID: {client_id} by user ID: {}",
                     session.get_user_id()
@@ -107,7 +107,7 @@ impl System {
         self.ensure_authenticated(session)?;
         self.permissioner
             .get_clients(session.get_user_id())
-            .with_error_context(|error| {
+            .with_error(|error| {
                 format!(
                     "{COMPONENT} (error: {error}) - failed to get clients by user ID {}",
                     session.get_user_id()

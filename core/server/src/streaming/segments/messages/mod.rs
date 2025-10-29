@@ -21,7 +21,7 @@ mod messages_writer;
 mod persister_task;
 
 use super::IggyMessagesBatchSet;
-use error_set::ErrContext;
+use err_trail::ErrContext;
 use iggy_common::IggyError;
 use std::io::IoSlice;
 use tokio::{fs::File, io::AsyncWriteExt};
@@ -45,7 +45,7 @@ async fn write_batch(
         let bytes_written = file
             .write_vectored(slices)
             .await
-            .with_error_context(|error| {
+            .with_error(|error| {
                 format!("Failed to write messages to file: {file_path}, error: {error}",)
             })
             .map_err(|_| IggyError::CannotWriteToFile)?;
