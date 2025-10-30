@@ -96,7 +96,7 @@ compio-quic = { git = "https://github.com/compio-rs/compio.git", rev = "fe4243f0
 compio-tls = { git = "https://github.com/compio-rs/compio.git", rev = "fe4243f0b6811ebc325afd081c9b087b4d9817be", features = [
     "rustls",
 ] }
-compio-ws = { git = "https://github.com/krishvishal/compio-ws", features = [
+compio-ws = { git = "https://github.com/krishvishal/compio-ws", rev = "2b42d376308e77ba673c9ef60ee159994f6a243e", features = [
     "rustls",
 ] }
 console-subscriber = "0.4.1"
