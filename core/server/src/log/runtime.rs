@@ -1,5 +1,6 @@
 use futures::{Stream, StreamExt, channel::mpsc};
 use opentelemetry_sdk::runtime::{Runtime, RuntimeChannel, TrySend};
+use send_wrapper::SendWrapper;
 use std::{pin::Pin, time::Duration};
 
 #[derive(Clone)]
@@ -17,7 +18,7 @@ impl Runtime for CompioRuntime {
     }
 
     fn delay(&self, duration: Duration) -> impl Future<Output = ()> + Send + 'static {
-        compio::time::sleep(duration)
+        SendWrapper::new(compio::time::sleep(duration))
     }
 }
 
