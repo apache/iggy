@@ -1,0 +1,11 @@
+FROM flink:2.1.0-scala_2.12-java21
+
+# Set up directories for checkpoints and savepoints
+RUN mkdir -p /tmp/flink-checkpoints /tmp/flink-savepoints && \
+    chown -R flink:flink /tmp/flink-checkpoints /tmp/flink-savepoints && \
+    chmod -R 755 /tmp/flink-checkpoints /tmp/flink-savepoints
+
+USER flink
+
+# Default command (can be overridden)
+CMD ["jobmanager"]

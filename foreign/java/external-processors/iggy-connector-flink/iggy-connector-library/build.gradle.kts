@@ -31,6 +31,10 @@ repositories {
 }
 
 java {
+    // Target Java 17 for CI compatibility (Java 21 Flink Docker can run Java 17 bytecode)
+    sourceCompatibility = JavaVersion.VERSION_17
+    targetCompatibility = JavaVersion.VERSION_17
+
     withJavadocJar()
     withSourcesJar()
 }
@@ -40,7 +44,7 @@ checkstyle {
     configFile = file("../../../dev-support/checkstyle/checkstyle.xml")
 }
 
-val flinkVersion = "1.18.0"
+val flinkVersion = "2.1.0"
 val iggyVersion = "0.5.0-SNAPSHOT"
 
 dependencies {
@@ -53,6 +57,7 @@ dependencies {
 
     // Serialization support
     implementation("com.fasterxml.jackson.core:jackson-databind:2.18.0")
+    implementation("com.fasterxml.jackson.datatype:jackson-datatype-jsr310:2.18.0")
 
     // Logging
     compileOnly("org.slf4j:slf4j-api:2.0.16")
