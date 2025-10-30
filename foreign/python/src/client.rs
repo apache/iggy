@@ -148,7 +148,7 @@ impl IggyClient {
         let inner = self.inner.clone();
         future_into_py(py, async move {
             inner
-                .create_stream(&name, stream_id)
+                .create_stream(&name)
                 .await
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{e:?}")))?;
             Ok(())
@@ -211,7 +211,6 @@ impl IggyClient {
                     partitions_count,
                     compression_algorithm,
                     replication_factor,
-                    topic_id,
                     IggyExpiry::NeverExpire,
                     MaxTopicSize::ServerDefault,
                 )
