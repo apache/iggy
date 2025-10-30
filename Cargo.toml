@@ -83,29 +83,25 @@ chrono = { version = "0.4.42", features = ["serde"] }
 clap = { version = "4.5.50", features = ["derive", "wrap_help"] }
 colored = "3.0.0"
 comfy-table = "7.2.1"
-compio = { git = "https://github.com/compio-rs/compio.git", rev = "fe4243f0b6811ebc325afd081c9b087b4d9817be", features = [
+compio = { version = "0.16.0", features = [
     "runtime",
     "macros",
     "io-uring",
     "time",
     "rustls",
 ] }
-compio-io = { git = "https://github.com/compio-rs/compio.git", rev = "fe4243f0b6811ebc325afd081c9b087b4d9817be" }
-compio-net = { git = "https://github.com/compio-rs/compio.git", rev = "fe4243f0b6811ebc325afd081c9b087b4d9817be" }
-compio-quic = { git = "https://github.com/compio-rs/compio.git", rev = "fe4243f0b6811ebc325afd081c9b087b4d9817be" }
-compio-tls = { git = "https://github.com/compio-rs/compio.git", rev = "fe4243f0b6811ebc325afd081c9b087b4d9817be", features = [
-    "rustls",
-] }
-compio-ws = { git = "https://github.com/krishvishal/compio-ws", rev = "2b42d376308e77ba673c9ef60ee159994f6a243e", features = [
+compio-io = "0.8.1"
+compio-net = "0.9.0"
+compio-quic = "0.5.1"
+compio-tls = { version = "0.7.0", features = ["rustls"] }
+compio-ws = { git = "https://github.com/krishvishal/compio-ws", rev = "dc7a460be0de0eacb14b1b37cd62c44014dcd08a", features = [
     "rustls",
 ] }
 console-subscriber = "0.4.1"
 crc32fast = "1.5.0"
 crossbeam = "0.8.4"
-cyper = { git = "https://github.com/krishvishal/cyper.git", rev = "cd75e266df6ab0a9b9474eb7dda1735650d17db6", features = [
-    "rustls",
-], default-features = false }
-cyper-axum = { git = "https://github.com/krishvishal/cyper", rev = "cd75e266df6ab0a9b9474eb7dda1735650d17db6" }
+cyper = { version = "0.5.0", features = ["rustls"], default-features = false }
+cyper-axum = { version = "0.5.0" }
 dashmap = "6.1.0"
 derive-new = "0.7.0"
 derive_builder = "0.20.2"
