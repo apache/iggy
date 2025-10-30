@@ -60,7 +60,7 @@ async_zip = { version = "0.0.18", features = [
     "deflate",
     "zstd",
 ] }
-axum = "0.8.4"
+axum = "0.8.6"
 axum-server = { version = "0.7.2", features = ["tls-rustls"] }
 base64 = "0.22.1"
 bench-dashboard-frontend = { path = "core/bench/dashboard/frontend" }
@@ -70,7 +70,7 @@ bench-report = { path = "core/bench/report" }
 bench-runner = { path = "core/bench/runner" }
 bincode = { version = "2.0.1", features = ["serde"] }
 blake3 = "1.8.2"
-bon = "3.7.2"
+bon = "3.8.1"
 byte-unit = { version = "5.1.6", default-features = false, features = [
     "serde",
     "byte",
@@ -79,7 +79,7 @@ byte-unit = { version = "5.1.6", default-features = false, features = [
 bytes = "1.10.1"
 charming = "0.6.0"
 chrono = { version = "0.4.42", features = ["serde"] }
-clap = { version = "4.5.48", features = ["derive", "wrap_help"] }
+clap = { version = "4.5.50", features = ["derive", "wrap_help"] }
 colored = "3.0.0"
 comfy-table = "7.2.1"
 console-subscriber = "0.4.1"
@@ -118,8 +118,8 @@ postcard = { version = "1.1.3", features = ["alloc"] }
 predicates = "3.1.3"
 quinn = "0.11.9"
 rand = "0.9.2"
-regex = "1.11.2"
-reqwest = { version = "0.12.23", default-features = false, features = [
+regex = "1.12.2"
+reqwest = { version = "0.12.24", default-features = false, features = [
     "json",
     "rustls-tls",
 ] }
@@ -129,24 +129,24 @@ rust-s3 = { version = "0.37.0", default-features = false, features = [
     "tokio-rustls-tls",
     "tags",
 ] }
-rustls = { version = "0.23.32", features = ["ring"] }
-serde = { version = "1.0.226", features = ["derive", "rc"] }
+rustls = { version = "0.23.34", features = ["ring"] }
+serde = { version = "1.0.228", features = ["derive", "rc"] }
 serde_json = "1.0.145"
-serde_with = { version = "3.14.1", features = ["base64", "macros"] }
+serde_with = { version = "3.15.1", features = ["base64", "macros"] }
 serde_yaml_ng = "0.10.0"
 serial_test = "3.2.0"
 server = { path = "core/server" }
-simd-json = { version = "0.16.0", features = ["serde_impl"] }
+simd-json = { version = "0.17.0", features = ["serde_impl"] }
 strum = { version = "0.27.2", features = ["derive"] }
 strum_macros = "0.27.2"
-sysinfo = "0.37.0"
+sysinfo = "0.37.2"
 tempfile = "3.23.0"
 test-case = "3.3.1"
-thiserror = "2.0.16"
-tokio = { version = "1.47.1", features = ["full"] }
-tokio-rustls = "0.26.3"
+thiserror = "2.0.17"
+tokio = { version = "1.48.0", features = ["full"] }
+tokio-rustls = "0.26.4"
 tokio-util = { version = "0.7.16", features = ["compat"] }
-toml = "0.9.7"
+toml = "0.9.8"
 tower-http = { version = "0.6.6", features = [
     "add-extension",
     "cors",
@@ -168,8 +168,8 @@ uuid = { version = "1.18.1", features = [
     "serde",
     "zerocopy",
 ] }
-webpki-roots = "1.0.2"
-zip = "5.1.1"
+webpki-roots = "1.0.3"
+zip = "6.0.0"
 
 [profile.release]
 lto = true

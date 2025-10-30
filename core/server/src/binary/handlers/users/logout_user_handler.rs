@@ -22,7 +22,7 @@ use crate::binary::{handlers::users::COMPONENT, sender::SenderKind};
 use crate::streaming::session::Session;
 use crate::streaming::systems::system::SharedSystem;
 use anyhow::Result;
-use error_set::ErrContext;
+use err_trail::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::logout_user::LogoutUser;
 use tracing::{debug, instrument};
@@ -42,12 +42,9 @@ impl ServerCommandHandler for LogoutUser {
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
         let system = system.read().await;
-        system
-            .logout_user(session)
-            .await
-            .with_error_context(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to logout user, session: {session}")
-            })?;
+        system.logout_user(session).await.with_error(|error| {
+            format!("{COMPONENT} (error: {error}) - failed to logout user, session: {session}")
+        })?;
         session.clear_user_id();
         sender.send_empty_ok_response().await?;
         Ok(())

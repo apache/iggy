@@ -25,7 +25,7 @@ use crate::state::models::CreateConsumerGroupWithId;
 use crate::streaming::session::Session;
 use crate::streaming::systems::system::SharedSystem;
 use anyhow::Result;
-use error_set::ErrContext;
+use err_trail::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::create_consumer_group::CreateConsumerGroup;
 use tracing::{debug, instrument};
@@ -55,7 +55,7 @@ impl ServerCommandHandler for CreateConsumerGroup {
                     &self.name,
                 )
                 .await
-                .with_error_context(|error| {
+                .with_error(|error| {
                     format!(
                         "{COMPONENT} (error: {error}) - failed to create consumer group for stream_id: {}, topic_id: {}, group_id: {:?}, session: {session}",
                         self.stream_id, self.topic_id, self.group_id
@@ -80,7 +80,7 @@ impl ServerCommandHandler for CreateConsumerGroup {
             }),
         )
             .await
-            .with_error_context(|error| {
+            .with_error(|error| {
                 format!(
                     "{COMPONENT} (error: {error}) - failed to apply create consumer group for stream_id: {stream_id}, topic_id: {topic_id}, group_id: {group_id:?}, session: {session}"
                 )

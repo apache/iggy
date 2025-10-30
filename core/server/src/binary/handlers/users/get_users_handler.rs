@@ -23,7 +23,7 @@ use crate::binary::mapper;
 use crate::binary::sender::SenderKind;
 use crate::streaming::session::Session;
 use crate::streaming::systems::system::SharedSystem;
-use error_set::ErrContext;
+use err_trail::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::get_users::GetUsers;
 use tracing::debug;
@@ -42,12 +42,9 @@ impl ServerCommandHandler for GetUsers {
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
         let system = system.read().await;
-        let users = system
-            .get_users(session)
-            .await
-            .with_error_context(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to get users, session: {session}")
-            })?;
+        let users = system.get_users(session).await.with_error(|error| {
+            format!("{COMPONENT} (error: {error}) - failed to get users, session: {session}")
+        })?;
         let users = mapper::map_users(&users);
         sender.send_ok_response(&users).await?;
         Ok(())

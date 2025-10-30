@@ -22,7 +22,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::Result;
-use error_set::ErrContext;
+use err_trail::ErrContext;
 use quinn::{Endpoint, IdleTimeout, VarInt};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tracing::info;
@@ -57,7 +57,7 @@ fn configure_quic(config: QuicConfig) -> Result<quinn::ServerConfig, QuicError> 
     };
 
     let mut server_config = quinn::ServerConfig::with_single_cert(certificate, key)
-        .with_error_context(|error| {
+        .with_error(|error| {
             format!("{COMPONENT} (error: {error}) - failed to create server config")
         })
         .map_err(|_| QuicError::ConfigCreationError)?;
@@ -66,17 +66,13 @@ fn configure_quic(config: QuicConfig) -> Result<quinn::ServerConfig, QuicError> 
     transport.send_window(config.send_window.as_bytes_u64());
     transport.receive_window(
         VarInt::try_from(config.receive_window.as_bytes_u64())
-            .with_error_context(|error| {
-                format!("{COMPONENT} (error: {error}) - invalid receive window")
-            })
+            .with_error(|error| format!("{COMPONENT} (error: {error}) - invalid receive window"))
             .map_err(|_| QuicError::TransportConfigError)?,
     );
     transport.datagram_send_buffer_size(config.datagram_send_buffer_size.as_bytes_u64() as usize);
     transport.max_concurrent_bidi_streams(
         VarInt::try_from(config.max_concurrent_bidi_streams)
-            .with_error_context(|error| {
-                format!("{COMPONENT} (error: {error}) - invalid bidi stream limit")
-            })
+            .with_error(|error| format!("{COMPONENT} (error: {error}) - invalid bidi stream limit"))
             .map_err(|_| QuicError::TransportConfigError)?,
     );
     if !config.keep_alive_interval.is_zero() {
@@ -84,9 +80,7 @@ fn configure_quic(config: QuicConfig) -> Result<quinn::ServerConfig, QuicError> 
     }
     if !config.max_idle_timeout.is_zero() {
         let max_idle_timeout = IdleTimeout::try_from(config.max_idle_timeout.get_duration())
-            .with_error_context(|error| {
-                format!("{COMPONENT} (error: {error}) - invalid idle timeout")
-            })
+            .with_error(|error| format!("{COMPONENT} (error: {error}) - invalid idle timeout"))
             .map_err(|_| QuicError::TransportConfigError)?;
         transport.max_idle_timeout(Some(max_idle_timeout));
     }
@@ -98,7 +92,7 @@ fn configure_quic(config: QuicConfig) -> Result<quinn::ServerConfig, QuicError> 
 fn generate_self_signed_cert<'a>() -> Result<(Vec<CertificateDer<'a>>, PrivateKeyDer<'a>), QuicError>
 {
     iggy_common::generate_self_signed_certificate("localhost")
-        .with_error_context(|error| {
+        .with_error(|error| {
             format!("{COMPONENT} (error: {error}) - failed to generate self-signed certificate")
         })
         .map_err(|_| QuicError::CertGenerationError)
@@ -110,7 +104,7 @@ fn load_certificates(
 ) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), QuicError> {
     let mut cert_chain_reader = BufReader::new(
         File::open(cert_file)
-            .with_error_context(|error| {
+            .with_error(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to open cert file: {cert_file}")
             })
             .map_err(|_| QuicError::CertLoadError)?,
@@ -120,7 +114,7 @@ fn load_certificates(
         .collect();
     let mut key_reader = BufReader::new(
         File::open(key_file)
-            .with_error_context(|error| {
+            .with_error(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to open key file: {key_file}")
             })
             .map_err(|_| QuicError::CertLoadError)?,
@@ -129,9 +123,7 @@ fn load_certificates(
         .filter(|key| key.is_ok())
         .map(|key| PrivateKeyDer::try_from(key.unwrap().secret_pkcs1_der().to_vec()))
         .collect::<Result<Vec<_>, _>>()
-        .with_error_context(|error| {
-            format!("{COMPONENT} (error: {error}) - failed to parse private key")
-        })
+        .with_error(|error| format!("{COMPONENT} (error: {error}) - failed to parse private key"))
         .map_err(|_| QuicError::CertLoadError)?;
     let key = keys.remove(0);
     Ok((certs, key))
