@@ -79,7 +79,7 @@ class TestStreamOperations:
         stream = await iggy_client.get_stream(unique_stream_name)
         assert stream is not None
         assert stream.name == unique_stream_name
-        assert stream.id > 0
+        assert stream.id >= 0
 
     @pytest.mark.asyncio
     async def test_list_streams(self, iggy_client: IggyClient, unique_stream_name):
@@ -91,6 +91,7 @@ class TestStreamOperations:
         stream = await iggy_client.get_stream(unique_stream_name)
         assert stream is not None
         assert stream.name == unique_stream_name
+
         assert stream.id > 0
         assert stream.topics_count == 0  # New stream has no topics
 
@@ -125,7 +126,7 @@ class TestTopicOperations:
         topic = await iggy_client.get_topic(stream_name, topic_name)
         assert topic is not None
         assert topic.name == topic_name
-        assert topic.id > 0
+        assert topic.id >= 0
         assert topic.partitions_count == 2
 
     @pytest.mark.asyncio
@@ -144,7 +145,7 @@ class TestTopicOperations:
         topic = await iggy_client.get_topic(stream_name, topic_name)
         assert topic is not None
         assert topic.name == topic_name
-        assert topic.id > 0
+        assert topic.id >= 0
         assert topic.partitions_count == 1
 
 
@@ -158,7 +159,7 @@ class TestMessageOperations:
         return {
             "stream": f"msg-stream-{unique_id}",
             "topic": f"msg-topic-{unique_id}",
-            "partition_id": 1,
+            "partition_id": 0,
             "messages": [f"Test message {i} - {unique_id}" for i in range(1, 4)],
         }
 
@@ -303,7 +304,7 @@ class TestPollingStrategies:
         return {
             "stream": f"poll-stream-{unique_id}",
             "topic": f"poll-topic-{unique_id}",
-            "partition_id": 1,
+            "partition_id": 0,
             "messages": [f"Polling test {i} - {unique_id}" for i in range(5)],
         }
 
@@ -427,7 +428,7 @@ class TestConsumerGroup:
             "consumer": f"consumer-group-consumer-{unique_id}",
             "stream": f"consumer-group-stream-{unique_id}",
             "topic": f"consumer-group-topic-{unique_id}",
-            "partition_id": 1,
+            "partition_id": 0,
             "messages": [f"Consumer group test {i} - {unique_id}" for i in range(5)],
         }
 
