@@ -20,7 +20,7 @@ ARG ALPINE_VERSION=3.22
 
 FROM --platform=$BUILDPLATFORM lukemathwalker/cargo-chef:latest-rust-${RUST_VERSION}-alpine AS chef
 WORKDIR /app
-RUN apk add --no-cache musl-dev pkgconfig openssl-dev openssl-libs-static
+RUN apk add --no-cache musl-dev pkgconfig
 
 FROM --platform=$BUILDPLATFORM chef AS planner
 COPY . .
