@@ -67,9 +67,14 @@ def no_streams_in_system(context):
 
 @when(parsers.parse('I create a stream with name {stream_name}'))
 def create_stream(context, stream_name):
-    """Create a stream with specified name"""
+    """Create a stream with specified name"""    
     async def _create():
-        stream = await context.client.create_stream(name=stream_name)
+        await context.client.create_stream(name=stream_name)
+        
+        stream = await context.client.get_stream(stream_name)
+        if stream is None:
+            raise RuntimeError(f"Stream {stream_name} was not found after creation")
+        
         context.last_stream_id = stream.id
         context.last_stream_name = stream_name
 
@@ -101,11 +106,16 @@ def verify_stream_properties(context, stream_name):
 def create_topic(context, topic_name, stream_id, partitions):
     """Create a topic with specified parameters"""
     async def _create():
-        topic = await context.client.create_topic(
+        await context.client.create_topic(
             stream=stream_id,
             name=topic_name,
             partitions_count=partitions
         )
+        
+        topic = await context.client.get_topic(stream_id, topic_name)
+        if topic is None:
+            raise RuntimeError(f"Topic {topic_name} was not found after creation")
+        
         context.last_topic_id = topic.id
         context.last_topic_name = topic_name
         context.last_topic_partitions = partitions
