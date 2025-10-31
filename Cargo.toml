@@ -93,8 +93,10 @@ compio = { version = "0.16.0", features = [
 compio-io = "0.8.1"
 compio-net = "0.9.0"
 compio-quic = "0.5.1"
-compio-tls = { version = "0.7.0", features = ["rustls"] }
-compio-ws = { git = "https://github.com/krishvishal/compio-ws", rev = "dc7a460be0de0eacb14b1b37cd62c44014dcd08a", features = [
+compio-tls = { version = "0.7.0", features = [
+    "rustls",
+], default-features = false }
+compio-ws = { git = "https://github.com/krishvishal/compio-ws", rev = "59b1322676689474d9dfbafbd8de6dc96222fb18", features = [
     "rustls",
 ] }
 console-subscriber = "0.4.1"

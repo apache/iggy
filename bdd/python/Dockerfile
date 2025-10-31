@@ -25,8 +25,6 @@ RUN apt-get update && \
     python3-dev \
     python3-pip \
     build-essential \
-    pkg-config \
-    libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Configure pip to allow system-wide installations in Docker
