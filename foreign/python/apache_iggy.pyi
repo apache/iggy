@@ -245,9 +245,7 @@ class IggyClient:
 
         Returns Ok(()) on successful connection or a PyRuntimeError on failure.
         """
-    def create_stream(
-        self, name: builtins.str
-    ) -> collections.abc.Awaitable[None]:
+    def create_stream(self, name: builtins.str) -> collections.abc.Awaitable[None]:
         r"""
         Creates a new stream with the provided name.
 
