@@ -48,9 +48,9 @@ public class FetchMessagesFixture : IAsyncInitializer
 
             await client.Value.CreateStreamAsync(streamId.GetString());
             await client.Value.CreateTopicAsync(streamId, TopicRequest.Name,
-                TopicRequest.PartitionsCount, topicId: TopicRequest.TopicId);
+                TopicRequest.PartitionsCount);
             await client.Value.CreateTopicAsync(streamId, TopicHeadersRequest.Name,
-                TopicHeadersRequest.PartitionsCount, topicId: TopicHeadersRequest.TopicId);
+                TopicHeadersRequest.PartitionsCount);
 
             await client.Value.SendMessagesAsync(streamId, Identifier.String(TopicRequest.Name), Partitioning.None(),
                 CreateMessagesWithoutHeader(MessageCount));

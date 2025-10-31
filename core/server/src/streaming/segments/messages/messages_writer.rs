@@ -16,28 +16,27 @@
  * under the License.
  */
 
-use super::PersisterTask;
 use crate::streaming::segments::{IggyMessagesBatchSet, messages::write_batch};
+use compio::fs::{File, OpenOptions};
 use err_trail::ErrContext;
-use iggy_common::{Confirmation, IggyByteSize, IggyError};
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
+use iggy_common::{IggyByteSize, IggyError};
+use std::{
+    rc::Rc,
+    sync::atomic::{AtomicU64, Ordering},
 };
-use tokio::fs::{File, OpenOptions};
-use tracing::{error, trace};
+use tracing::trace;
 
 /// A dedicated struct for writing to the messages file.
 #[derive(Debug)]
 pub struct MessagesWriter {
     file_path: String,
-    /// Holds the file for synchronous writes; when asynchronous persistence is enabled, this will be None.
-    file: Option<File>,
-    /// When set, asynchronous writes are handled by this persister task.
-    persister_task: Option<PersisterTask>,
-    messages_size_bytes: Arc<AtomicU64>,
+    file: File,
+    messages_size_bytes: Rc<AtomicU64>,
     fsync: bool,
 }
+
+// Safety: We are guaranteeing that MessagesWriter will never be used from multiple threads
+unsafe impl Send for MessagesWriter {}
 
 impl MessagesWriter {
     /// Opens the messages file in write mode.
@@ -47,17 +46,16 @@ impl MessagesWriter {
     /// Otherwise, the file is retained in `self.file` for synchronous writes.
     pub async fn new(
         file_path: &str,
-        messages_size_bytes: Arc<AtomicU64>,
+        messages_size_bytes: Rc<AtomicU64>,
         fsync: bool,
-        server_confirmation: Confirmation,
         file_exists: bool,
     ) -> Result<Self, IggyError> {
         let file = OpenOptions::new()
-            .write(true)
             .create(true)
-            .append(true)
+            .write(true)
             .open(file_path)
             .await
+            .with_error(|err| format!("Failed to open messages file: {file_path}, error: {err}"))
             .map_err(|_| IggyError::CannotReadFile)?;
 
         if file_exists {
@@ -74,7 +72,7 @@ impl MessagesWriter {
                 .map_err(|_| IggyError::CannotReadFileMetadata)?
                 .len();
 
-            messages_size_bytes.store(actual_messages_size, Ordering::Release);
+            messages_size_bytes.store(actual_messages_size, Ordering::Relaxed);
         }
 
         trace!(
@@ -82,23 +80,10 @@ impl MessagesWriter {
             messages_size_bytes.load(Ordering::Acquire)
         );
 
-        let (file, persister_task) = match server_confirmation {
-            Confirmation::NoWait => {
-                let persister = PersisterTask::new(
-                    file,
-                    file_path.to_string(),
-                    fsync,
-                    messages_size_bytes.clone(),
-                );
-                (None, Some(persister))
-            }
-            Confirmation::Wait => (Some(file), None),
-        };
-
+        let file = file;
         Ok(Self {
             file_path: file_path.to_string(),
             file,
-            persister_task,
             messages_size_bytes,
             fsync,
         })
@@ -106,9 +91,8 @@ impl MessagesWriter {
 
     /// Append a batch of messages to the messages file.
     pub async fn save_batch_set(
-        &mut self,
+        &self,
         batch_set: IggyMessagesBatchSet,
-        confirmation: Confirmation,
     ) -> Result<IggyByteSize, IggyError> {
         let messages_size = batch_set.size();
         let messages_count = batch_set.count();
@@ -117,65 +101,43 @@ impl MessagesWriter {
             "Saving batch set of size {messages_size} bytes ({containers_count} containers, {messages_count} messages) to messages file: {}",
             self.file_path
         );
-        match confirmation {
-            Confirmation::Wait => {
-                if let Some(ref mut file) = self.file {
-                    write_batch(file, &self.file_path, batch_set)
-                        .await
-                        .with_error(|error| {
-                            format!(
-                                "Failed to write batch to messages file: {}. {error}",
-                                self.file_path
-                            )
-                        })
-                        .map_err(|_| IggyError::CannotWriteToFile)?;
-                } else {
-                    error!("File handle is not available for synchronous write.");
-                    return Err(IggyError::CannotWriteToFile);
-                }
-
-                if self.fsync {
-                    let _ = self.fsync().await;
-                }
-
-                self.messages_size_bytes
-                    .fetch_add(messages_size as u64, Ordering::Release);
-                trace!(
-                    "Written batch set of size {messages_size} bytes ({containers_count} containers, {messages_count} messages) to disk messages file: {}",
+        let position = self.messages_size_bytes.load(Ordering::Relaxed);
+        let file = &self.file;
+        write_batch(file, position, batch_set)
+            .await
+            .with_error(|error| {
+                format!(
+                    "Failed to write batch to messages file: {}. {error}",
                     self.file_path
-                );
-            }
-            Confirmation::NoWait => {
-                if let Some(task) = &self.persister_task {
-                    task.persist(batch_set).await;
-                } else {
-                    panic!(
-                        "Confirmation::NoWait is used, but MessagesPersisterTask is not set for messages file: {}",
-                        self.file_path
-                    );
-                }
-            }
+                )
+            })?;
+
+        if self.fsync {
+            let _ = self.fsync().await;
         }
+
+        self.messages_size_bytes
+            .fetch_add(messages_size as u64, Ordering::Release);
+        trace!(
+            "Written batch set of size {messages_size} bytes ({containers_count} containers, {messages_count} messages) to disk messages file: {}",
+            self.file_path
+        );
 
         Ok(IggyByteSize::from(messages_size as u64))
     }
 
-    pub async fn fsync(&self) -> Result<(), IggyError> {
-        if let Some(file) = self.file.as_ref() {
-            file.sync_all()
-                .await
-                .with_error(|error| {
-                    format!("Failed to fsync messages file: {}. {error}", self.file_path)
-                })
-                .map_err(|_| IggyError::CannotWriteToFile)?;
-        }
-
-        Ok(())
+    pub fn path(&self) -> String {
+        self.file_path.clone()
     }
 
-    pub async fn shutdown_persister_task(self) {
-        if let Some(task) = self.persister_task {
-            task.shutdown().await;
-        }
+    pub async fn fsync(&self) -> Result<(), IggyError> {
+        self.file
+            .sync_all()
+            .await
+            .with_error(|error| {
+                format!("Failed to fsync messages file: {}. {error}", self.file_path)
+            })
+            .map_err(|_| IggyError::CannotWriteToFile)?;
+        Ok(())
     }
 }

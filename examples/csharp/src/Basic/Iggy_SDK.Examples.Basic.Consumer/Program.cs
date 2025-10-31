@@ -49,7 +49,7 @@ logger.LogInformation("Basic consumer has logged on successfully");
 
 var streamId = Identifier.String(settings.StreamName);
 var topicId = Identifier.String(settings.TopicName);
-var partitionId = 1u;
+var partitionId = 0u;
 var consumerId = 1;
 
 await ExampleHelpers.EnsureStreamExists(client, streamId, settings.StreamName);

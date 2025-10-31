@@ -16,10 +16,10 @@
  * under the License.
  */
 
+use compio_quic::{ConnectionError as QuicConnectionError, ReadError, WriteError};
 use error_set::error_set;
-use quinn::{ConnectionError as QuicConnectionError, ReadToEndError, WriteError};
 use std::array::TryFromSliceError;
-use tokio::io;
+use std::io;
 
 error_set!(
     ServerError := ConfigError || ArchiverError || ConnectionError || LogError || CompatError || QuicError
@@ -31,8 +31,8 @@ error_set!(
         #[display("Write error")]
         WriteError(WriteError),
 
-        #[display("Read to end error")]
-        ReadToEndError(ReadToEndError)
+        #[display("Read error")]
+        ReadToEndError(ReadError)
     }
 
     ConfigError := {
@@ -58,6 +58,9 @@ error_set!(
 
         #[display("Invalid S3 credentials")]
         InvalidS3Credentials,
+
+        #[display("HTTP request error: {0}")]
+        CyperError(cyper::Error),
 
         #[display("Cannot archive file: {}", file_path)]
         CannotArchiveFile { file_path: String },

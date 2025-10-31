@@ -42,7 +42,7 @@ pub struct Args {
     #[arg(long, default_value = "example-topic")]
     pub topic_id: String,
 
-    #[arg(long, default_value = "1")]
+    #[arg(long, default_value = "0")]
     pub partition_id: u32,
 
     #[arg(long, default_value = "1")]
@@ -54,7 +54,7 @@ pub struct Args {
     #[arg(long, default_value = "1")]
     pub consumer_kind: u8,
 
-    #[arg(long, default_value = "1")]
+    #[arg(long, default_value = "0")]
     pub consumer_id: u32,
 
     #[arg(long, default_value = "false")]
@@ -161,6 +161,36 @@ pub struct Args {
 
     #[arg(long, default_value = "5s")]
     pub quic_heartbeat_interval: String,
+
+    #[arg(long, default_value = "127.0.0.1:8092")]
+    pub websocket_server_address: String,
+
+    #[arg(long, default_value = "true")]
+    pub websocket_reconnection_enabled: bool,
+
+    #[arg(long)]
+    pub websocket_reconnection_max_retries: Option<u32>,
+
+    #[arg(long, default_value = "1s")]
+    pub websocket_reconnection_interval: String,
+
+    #[arg(long, default_value = "5s")]
+    pub websocket_reconnection_reestablish_after: String,
+
+    #[arg(long, default_value = "5s")]
+    pub websocket_heartbeat_interval: String,
+
+    #[arg(long, default_value = "false")]
+    pub websocket_tls_enabled: bool,
+
+    #[arg(long, default_value = "localhost")]
+    pub websocket_tls_domain: String,
+
+    #[arg(long, default_value = "false")]
+    pub websocket_tls_ca_file: Option<String>,
+
+    #[arg(long, default_value = "false")]
+    pub websocket_tls_validate_certificate: bool,
 }
 
 impl Args {
@@ -223,6 +253,16 @@ impl Default for Args {
             quic_max_idle_timeout: 10000,
             quic_validate_certificate: false,
             quic_heartbeat_interval: "5s".to_string(),
+            websocket_server_address: "127.0.0.1:8092".to_string(),
+            websocket_reconnection_enabled: true,
+            websocket_reconnection_max_retries: None,
+            websocket_reconnection_interval: "1s".to_string(),
+            websocket_reconnection_reestablish_after: "5s".to_string(),
+            websocket_heartbeat_interval: "5s".to_string(),
+            websocket_tls_enabled: false,
+            websocket_tls_domain: "localhost".to_string(),
+            websocket_tls_ca_file: None,
+            websocket_tls_validate_certificate: false,
         }
     }
 }
@@ -320,6 +360,18 @@ impl Args {
             quic_max_idle_timeout: self.quic_max_idle_timeout,
             quic_validate_certificate: self.quic_validate_certificate,
             quic_heartbeat_interval: self.quic_heartbeat_interval.clone(),
+            websocket_server_address: self.websocket_server_address.clone(),
+            websocket_reconnection_enabled: self.websocket_reconnection_enabled,
+            websocket_reconnection_max_retries: self.websocket_reconnection_max_retries,
+            websocket_reconnection_interval: self.websocket_reconnection_interval.clone(),
+            websocket_reconnection_reestablish_after: self
+                .websocket_reconnection_reestablish_after
+                .clone(),
+            websocket_heartbeat_interval: self.websocket_heartbeat_interval.clone(),
+            websocket_tls_enabled: self.websocket_tls_enabled,
+            websocket_tls_domain: self.websocket_tls_domain.clone(),
+            websocket_tls_ca_file: self.websocket_tls_ca_file.clone(),
+            websocket_tls_validate_certificate: self.websocket_tls_validate_certificate,
         }
     }
 

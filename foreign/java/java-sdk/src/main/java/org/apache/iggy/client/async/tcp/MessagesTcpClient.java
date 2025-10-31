@@ -22,6 +22,7 @@ package org.apache.iggy.client.async.tcp;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import org.apache.iggy.client.async.MessagesClient;
+import org.apache.iggy.client.blocking.tcp.BytesSerializer;
 import org.apache.iggy.client.blocking.tcp.CommandCode;
 import org.apache.iggy.consumergroup.Consumer;
 import org.apache.iggy.identifier.StreamId;
@@ -70,7 +71,7 @@ public class MessagesTcpClient implements MessagesClient {
         var topicBytes = toBytes(topicId);
         payload.writeBytes(topicBytes);
 
-        payload.writeIntLE(partitionId.orElse(0L).intValue());
+        payload.writeBytes(toBytes(partitionId));
 
         var strategyBytes = toBytes(strategy);
         payload.writeBytes(strategyBytes);
@@ -81,13 +82,13 @@ public class MessagesTcpClient implements MessagesClient {
 
         // Send async request and transform response
         return connection.sendAsync(CommandCode.Messages.POLL.getValue(), payload)
-            .thenApply(response -> {
-                try {
-                    return AsyncBytesDeserializer.readPolledMessages(response);
-                } finally {
-                    response.release();
-                }
-            });
+                .thenApply(response -> {
+                    try {
+                        return AsyncBytesDeserializer.readPolledMessages(response);
+                    } finally {
+                        response.release();
+                    }
+                });
     }
 
     @Override
@@ -129,9 +130,9 @@ public class MessagesTcpClient implements MessagesClient {
 
         // Send async request (no response data expected for send)
         return connection.sendAsync(CommandCode.Messages.SEND.getValue(), payload)
-            .thenAccept(response -> {
-                // Response received, messages sent successfully
-                response.release(); // Release the buffer
-            });
+                .thenAccept(response -> {
+                    // Response received, messages sent successfully
+                    response.release(); // Release the buffer
+                });
     }
 }

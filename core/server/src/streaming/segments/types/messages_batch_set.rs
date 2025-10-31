@@ -212,14 +212,6 @@ impl IggyMessagesBatchSet {
         if self.is_empty() || count == 0 {
             return Self::empty();
         }
-        tracing::trace!(
-            "Getting {} messages from batch set, start offset {}, end offset calculated {}, end offset real {}, messages count {}...",
-            count,
-            start_offset,
-            start_offset + count as u64 - 1,
-            self.last_offset().unwrap_or(0),
-            self.count()
-        );
 
         let mut result = Self::with_capacity(self.containers_count());
         let mut remaining_count = count;

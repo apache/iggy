@@ -103,14 +103,14 @@ public class IggyPublisherBuilder<T> : IggyPublisherBuilder
             Config.LoggerFactory?.CreateLogger<IggyPublisher<T>>() ??
             NullLoggerFactory.Instance.CreateLogger<IggyPublisher<T>>());
 
-        if (_onBackgroundError != null)
+        if (OnBackgroundError != null)
         {
-            publisher.OnBackgroundError += _onBackgroundError;
+            publisher.OnBackgroundError += OnBackgroundError;
         }
 
-        if (_onMessageBatchFailed != null)
+        if (OnMessageBatchFailed != null)
         {
-            publisher.OnMessageBatchFailed += _onMessageBatchFailed;
+            publisher.OnMessageBatchFailed += OnMessageBatchFailed;
         }
 
         return publisher;

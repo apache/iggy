@@ -57,8 +57,10 @@ rustls = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true }
 tokio-rustls = { workspace = true }
+tokio-tungstenite = { workspace = true }
 tracing = { workspace = true }
 trait-variant = { workspace = true }
+tungstenite = { workspace = true }
 webpki-roots = { workspace = true }
 
 [dev-dependencies]

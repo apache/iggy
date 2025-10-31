@@ -29,6 +29,7 @@ use iggy_common::{
 };
 use lending_iterator::prelude::*;
 use std::ops::{Deref, Index};
+use std::sync::Arc;
 use tracing::{error, warn};
 
 /// A container for mutable messages that are being prepared for persistence.
@@ -144,7 +145,7 @@ impl IggyMessagesBatchMut {
         start_offset: u64,
         base_offset: u64,
         current_position: u32,
-        deduplicator: Option<&MessageDeduplicator>,
+        deduplicator: Option<&Arc<MessageDeduplicator>>,
     ) {
         let messages_count = self.count();
         if messages_count == 0 {
@@ -262,6 +263,10 @@ impl IggyMessagesBatchMut {
         let messages = std::mem::take(&mut self.messages);
 
         (indexes, messages)
+    }
+
+    pub fn take_messages(&mut self) -> PooledBuffer {
+        std::mem::take(&mut self.messages)
     }
 
     /// Take the indexes from the batch

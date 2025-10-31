@@ -19,41 +19,40 @@
 use crate::streaming::segments::{IggyIndexesMut, IggyMessagesBatchMut};
 use crate::streaming::utils::PooledBuffer;
 use bytes::BytesMut;
+use compio::buf::{IntoInner, IoBuf};
+use compio::fs::{File, OpenOptions};
+use compio::io::AsyncReadAtExt;
 use err_trail::ErrContext;
 use iggy_common::IggyError;
-use std::{fs::File as StdFile, os::unix::prelude::FileExt};
+use std::rc::Rc;
 use std::{
     io::ErrorKind,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::atomic::{AtomicU64, Ordering},
 };
-use tokio::fs::OpenOptions;
-use tokio::task::spawn_blocking;
 use tracing::{error, trace};
 
 /// A dedicated struct for reading from the messages file.
 #[derive(Debug)]
 pub struct MessagesReader {
     file_path: String,
-    file: Arc<StdFile>,
-    messages_size_bytes: Arc<AtomicU64>,
+    file: File,
+    messages_size_bytes: Rc<AtomicU64>,
 }
+
+// Safety: We are guaranteeing that MessagesReader will never be used from multiple threads
+unsafe impl Send for MessagesReader {}
 
 impl MessagesReader {
     /// Opens the messages file in read mode.
     pub async fn new(
         file_path: &str,
-        messages_size_bytes: Arc<AtomicU64>,
+        messages_size_bytes: Rc<AtomicU64>,
     ) -> Result<Self, IggyError> {
         let file = OpenOptions::new()
             .read(true)
             .open(file_path)
             .await
-            .with_error(|error| {
-                format!("Failed to open messages file: {file_path}, error: {error}")
-            })
+            .with_error(|error| format!("Failed to open messages file: {file_path}. {error}"))
             .map_err(|_| IggyError::CannotReadFile)?;
 
         // posix_fadvise() doesn't exist on MacOS
@@ -72,14 +71,15 @@ impl MessagesReader {
             });
         }
 
+        let size_bytes = messages_size_bytes.load(Ordering::Relaxed);
         trace!(
             "Opened messages file for reading: {file_path}, size: {}",
-            messages_size_bytes.load(Ordering::Acquire)
+            size_bytes
         );
 
         Ok(Self {
             file_path: file_path.to_string(),
-            file: Arc::new(file.into_std().await),
+            file,
             messages_size_bytes,
         })
     }
@@ -177,20 +177,23 @@ impl MessagesReader {
         len: u32,
         use_pool: bool,
     ) -> Result<PooledBuffer, std::io::Error> {
-        let file = self.file.clone();
-        spawn_blocking(move || {
-            if use_pool {
-                let mut buf = PooledBuffer::with_capacity(len as usize);
-                unsafe { buf.set_len(len as usize) };
-                file.read_exact_at(&mut buf, offset as u64)?;
-                Ok(buf)
-            } else {
-                let mut buf = BytesMut::with_capacity(len as usize);
-                unsafe { buf.set_len(len as usize) };
-                file.read_exact_at(&mut buf, offset as u64)?;
-                Ok(PooledBuffer::from_existing(buf))
-            }
-        })
-        .await?
+        if use_pool {
+            let buf = PooledBuffer::with_capacity(len as usize);
+            let len = len as usize;
+            let (result, buf) = self
+                .file
+                .read_exact_at(buf.slice(..len), offset as u64)
+                .await
+                .into();
+            let buf = buf.into_inner();
+            result?;
+            Ok(buf)
+        } else {
+            let mut buf = BytesMut::with_capacity(len as usize);
+            unsafe { buf.set_len(len as usize) };
+            let (result, buf) = self.file.read_exact_at(buf, offset as u64).await.into();
+            result?;
+            Ok(PooledBuffer::from_existing(buf))
+        }
     }
 }

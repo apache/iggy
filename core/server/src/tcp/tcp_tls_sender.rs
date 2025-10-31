@@ -17,13 +17,15 @@
  */
 
 use crate::binary::sender::Sender;
+use crate::streaming::utils::PooledBuffer;
 use crate::tcp::COMPONENT;
 use crate::{server_error::ServerError, tcp::sender};
+use compio::buf::IoBufMut;
+use compio::io::AsyncWrite;
+use compio::net::TcpStream;
+use compio_tls::TlsStream;
 use err_trail::ErrContext;
 use iggy_common::IggyError;
-use tokio::io::AsyncWriteExt;
-use tokio::net::TcpStream;
-use tokio_rustls::server::TlsStream;
 
 #[derive(Debug)]
 pub struct TcpTlsSender {
@@ -31,20 +33,35 @@ pub struct TcpTlsSender {
 }
 
 impl Sender for TcpTlsSender {
-    async fn read(&mut self, buffer: &mut [u8]) -> Result<usize, IggyError> {
+    async fn read<B: IoBufMut>(&mut self, buffer: B) -> (Result<(), IggyError>, B) {
         sender::read(&mut self.stream, buffer).await
     }
 
     async fn send_empty_ok_response(&mut self) -> Result<(), IggyError> {
-        sender::send_empty_ok_response(&mut self.stream).await
+        sender::send_empty_ok_response(&mut self.stream).await?;
+        self.stream
+            .flush()
+            .await
+            .with_error(|e| format!("failed to flush TCP stream after sending response: {e}"))
+            .map_err(|_| IggyError::TcpError)
     }
 
     async fn send_ok_response(&mut self, payload: &[u8]) -> Result<(), IggyError> {
-        sender::send_ok_response(&mut self.stream, payload).await
+        sender::send_ok_response(&mut self.stream, payload).await?;
+        self.stream
+            .flush()
+            .await
+            .with_error(|e| format!("failed to flush TCP stream after sending response: {e}"))
+            .map_err(|_| IggyError::TcpError)
     }
 
     async fn send_error_response(&mut self, error: IggyError) -> Result<(), IggyError> {
-        sender::send_error_response(&mut self.stream, error).await
+        sender::send_error_response(&mut self.stream, error).await?;
+        self.stream
+            .flush()
+            .await
+            .with_error(|e| format!("failed to flush TCP stream after sending response: {e}"))
+            .map_err(|_| IggyError::TcpError)
     }
 
     async fn shutdown(&mut self) -> Result<(), ServerError> {
@@ -60,8 +77,13 @@ impl Sender for TcpTlsSender {
     async fn send_ok_response_vectored(
         &mut self,
         length: &[u8],
-        slices: Vec<std::io::IoSlice<'_>>,
+        slices: Vec<PooledBuffer>,
     ) -> Result<(), IggyError> {
-        sender::send_ok_response_vectored(&mut self.stream, length, slices).await
+        sender::send_ok_response_vectored(&mut self.stream, length, slices).await?;
+        self.stream
+            .flush()
+            .await
+            .with_error(|e| format!("failed to flush TCP stream after sending response: {e}"))
+            .map_err(|_| IggyError::TcpError)
     }
 }

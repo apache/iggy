@@ -32,6 +32,7 @@ assert_cmd = "2.0.17"
 async-trait = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
+compio = { workspace = true }
 ctor = "0.6.0"
 derive_more = { workspace = true }
 env_logger = { workspace = true }

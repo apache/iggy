@@ -16,12 +16,14 @@
  * under the License.
  */
 
+use std::rc::Rc;
+
 use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
 use crate::binary::sender::SenderKind;
+use crate::shard::IggyShard;
 use crate::streaming::session::Session;
-use crate::streaming::systems::system::SharedSystem;
 use iggy_common::IggyError;
 use iggy_common::get_user::GetUser;
 use tracing::debug;
@@ -36,11 +38,10 @@ impl ServerCommandHandler for GetUser {
         sender: &mut SenderKind,
         _length: u32,
         session: &Session,
-        system: &SharedSystem,
+        shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
-        let system = system.read().await;
-        let Ok(user) = system.find_user(session, &self.user_id) else {
+        let Ok(user) = shard.find_user(session, &self.user_id) else {
             sender.send_empty_ok_response().await?;
             return Ok(());
         };
@@ -49,7 +50,7 @@ impl ServerCommandHandler for GetUser {
             return Ok(());
         };
 
-        let bytes = mapper::map_user(user);
+        let bytes = mapper::map_user(&user);
         sender.send_ok_response(&bytes).await?;
         Ok(())
     }

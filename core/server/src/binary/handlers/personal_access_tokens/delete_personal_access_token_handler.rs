@@ -19,13 +19,14 @@
 use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::{handlers::personal_access_tokens::COMPONENT, sender::SenderKind};
+use crate::shard::IggyShard;
 use crate::state::command::EntryCommand;
 use crate::streaming::session::Session;
-use crate::streaming::systems::system::SharedSystem;
 use anyhow::Result;
 use err_trail::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::delete_personal_access_token::DeletePersonalAccessToken;
+use std::rc::Rc;
 use tracing::{debug, instrument};
 
 impl ServerCommandHandler for DeletePersonalAccessToken {
@@ -39,21 +40,25 @@ impl ServerCommandHandler for DeletePersonalAccessToken {
         sender: &mut SenderKind,
         _length: u32,
         session: &Session,
-        system: &SharedSystem,
+        shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
         let token_name = self.name.clone();
 
-        let mut system = system.write().await;
-        system
+        shard
                 .delete_personal_access_token(session, &self.name)
-                .await
                 .with_error(|error| {format!(
                     "{COMPONENT} (error: {error}) - failed to delete personal access token with name: {token_name}, session: {session}"
                 )})?;
 
-        let system = system.downgrade();
-        system
+        // Broadcast the event to other shards
+        let event = crate::shard::transmission::event::ShardEvent::DeletedPersonalAccessToken {
+            user_id: session.get_user_id(),
+            name: self.name.clone(),
+        };
+        shard.broadcast_event_to_all_shards(event).await?;
+
+        shard
             .state
             .apply(
                 session.get_user_id(),

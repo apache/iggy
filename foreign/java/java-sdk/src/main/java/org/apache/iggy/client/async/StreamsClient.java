@@ -37,7 +37,7 @@ public interface StreamsClient {
 
     CompletableFuture<List<StreamBase>> getStreamsAsync();
 
-    CompletableFuture<StreamDetails> createStreamAsync(Optional<Long> streamId, String name);
+    CompletableFuture<StreamDetails> createStreamAsync(String name);
 
     default CompletableFuture<Void> updateStreamAsync(Long streamId, String name) {
         return updateStreamAsync(StreamId.of(streamId), name);

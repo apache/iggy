@@ -25,6 +25,7 @@ use crate::http::shared::AppState;
 use crate::state::command::EntryCommand;
 use crate::state::models::CreateUserWithId;
 use crate::streaming::session::Session;
+use crate::streaming::users::user::User;
 use crate::streaming::utils::crypto;
 use ::iggy_common::change_password::ChangePassword;
 use ::iggy_common::create_user::CreateUser;
@@ -35,12 +36,13 @@ use ::iggy_common::update_user::UpdateUser;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::{delete, get, post, put};
-use axum::{Extension, Json, Router};
+use axum::{Extension, Json, Router, debug_handler};
 use err_trail::ErrContext;
 use iggy_common::Identifier;
 use iggy_common::IdentityInfo;
 use iggy_common::Validatable;
 use iggy_common::{UserInfo, UserInfoDetails};
+use send_wrapper::SendWrapper;
 use serde::Deserialize;
 use std::sync::Arc;
 use tracing::instrument;
@@ -60,14 +62,14 @@ pub fn router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
+#[debug_handler]
 async fn get_user(
     State(state): State<Arc<AppState>>,
     Extension(identity): Extension<Identity>,
     Path(user_id): Path<String>,
 ) -> Result<Json<UserInfoDetails>, CustomError> {
     let identifier_user_id = Identifier::from_str_value(&user_id)?;
-    let system = state.system.read().await;
-    let Ok(user) = system.find_user(
+    let Ok(user) = state.shard.shard().find_user(
         &Session::stateless(identity.user_id, identity.ip_address),
         &identifier_user_id,
     ) else {
@@ -77,28 +79,34 @@ async fn get_user(
         return Err(CustomError::ResourceNotFound);
     };
 
-    let user = mapper::map_user(user);
+    let user = mapper::map_user(&user);
     Ok(Json(user))
 }
 
+#[debug_handler]
 async fn get_users(
     State(state): State<Arc<AppState>>,
     Extension(identity): Extension<Identity>,
 ) -> Result<Json<Vec<UserInfo>>, CustomError> {
-    let system = state.system.read().await;
-    let users = system
-        .get_users(&Session::stateless(identity.user_id, identity.ip_address))
-        .await
-        .with_error(|error| {
-            format!(
-                "{COMPONENT} (error: {error}) - failed to get users, user ID: {}",
-                identity.user_id
-            )
-        })?;
-    let users = mapper::map_users(&users);
+    let session = SendWrapper::new(Session::stateless(identity.user_id, identity.ip_address));
+
+    let users = {
+        let future = SendWrapper::new(state.shard.shard().get_users(&session));
+        future.await
+    }
+    .with_error(|error| {
+        format!(
+            "{COMPONENT} (error: {error}) - failed to get users, user ID: {}",
+            identity.user_id
+        )
+    })?;
+
+    let user_refs: Vec<&User> = users.iter().collect();
+    let users = mapper::map_users(&user_refs);
     Ok(Json(users))
 }
 
+#[debug_handler]
 #[instrument(skip_all, name = "trace_create_user", fields(iggy_user_id = identity.user_id))]
 async fn create_user(
     State(state): State<Arc<AppState>>,
@@ -107,52 +115,78 @@ async fn create_user(
 ) -> Result<Json<UserInfoDetails>, CustomError> {
     command.validate()?;
 
-    let mut system = state.system.write().await;
-    let user = system
+    let session = SendWrapper::new(Session::stateless(identity.user_id, identity.ip_address));
+
+    let user = state
+        .shard
+        .shard()
         .create_user(
-            &Session::stateless(identity.user_id, identity.ip_address),
+            &session,
             &command.username,
             &command.password,
             command.status,
             command.permissions.clone(),
         )
-        .await
         .with_error(|error| {
             format!(
                 "{COMPONENT} (error: {error}) - failed to create user, username: {}",
                 command.username
             )
         })?;
-    let user_id = user.id;
-    let response = Json(mapper::map_user(user));
 
-    // For the security of the system, we hash the password before storing it in metadata.
-    let system = system.downgrade();
-    system
-        .state
-        .apply(
-            identity.user_id,
-            &EntryCommand::CreateUser(CreateUserWithId {
+    let user_id = user.id;
+    let response = Json(mapper::map_user(&user));
+
+    // Send event for user creation
+    {
+        let broadcast_future = SendWrapper::new(async {
+            use crate::shard::transmission::event::ShardEvent;
+            let event = ShardEvent::CreatedUser {
                 user_id,
-                command: CreateUser {
-                    username: command.username.to_owned(),
-                    password: crypto::hash_password(&command.password),
-                    status: command.status,
-                    permissions: command.permissions.clone(),
-                },
-            }),
-        )
-        .await
-        .with_error(|error| {
+                username: command.username.to_owned(),
+                password: command.password.to_owned(),
+                status: command.status,
+                permissions: command.permissions.clone(),
+            };
+            let _responses = state
+                .shard
+                .shard()
+                .broadcast_event_to_all_shards(event)
+                .await;
+        });
+        broadcast_future.await;
+    }
+
+    {
+        let username = command.username.clone();
+        let entry_command = EntryCommand::CreateUser(CreateUserWithId {
+            user_id,
+            command: CreateUser {
+                username: command.username.to_owned(),
+                password: crypto::hash_password(&command.password),
+                status: command.status,
+                permissions: command.permissions.clone(),
+            },
+        });
+        let future = SendWrapper::new(
+            state
+                .shard
+                .shard()
+                .state
+                .apply(identity.user_id, &entry_command),
+        );
+        future.await.with_error(|error| {
             format!(
                 "{COMPONENT} (error: {error}) - failed to apply create user, username: {}",
-                command.username
+                username
             )
         })?;
+    }
 
     Ok(response)
 }
 
+#[debug_handler]
 #[instrument(skip_all, name = "trace_update_user", fields(iggy_user_id = identity.user_id, iggy_updated_user_id = user_id))]
 async fn update_user(
     State(state): State<Arc<AppState>>,
@@ -163,32 +197,61 @@ async fn update_user(
     command.user_id = Identifier::from_str_value(&user_id)?;
     command.validate()?;
 
-    let mut system = state.system.write().await;
-    system
+    let session = Session::stateless(identity.user_id, identity.ip_address);
+
+    state
+        .shard
+        .shard()
         .update_user(
-            &Session::stateless(identity.user_id, identity.ip_address),
+            &session,
             &command.user_id,
             command.username.clone(),
             command.status,
         )
-        .await
         .with_error(|error| {
             format!("{COMPONENT} (error: {error}) - failed to update user, user ID: {user_id}")
         })?;
 
-    let system = system.downgrade();
-    system
-        .state
-        .apply(identity.user_id, &EntryCommand::UpdateUser(command))
-        .await
-        .with_error(|error| {
+    // Send event for user update
+    {
+        let broadcast_future = SendWrapper::new(async {
+            use crate::shard::transmission::event::ShardEvent;
+            let event = ShardEvent::UpdatedUser {
+                user_id: command.user_id.clone(),
+                username: command.username.clone(),
+                status: command.status,
+            };
+            let _responses = state
+                .shard
+                .shard()
+                .broadcast_event_to_all_shards(event)
+                .await;
+        });
+        broadcast_future.await;
+    }
+
+    {
+        let username = command.username.clone();
+        let entry_command = EntryCommand::UpdateUser(command);
+        let future = SendWrapper::new(
+            state
+                .shard
+                .shard()
+                .state
+                .apply(identity.user_id, &entry_command),
+        );
+        future.await.with_error(|error| {
             format!(
-                "{COMPONENT} (error: {error}) - failed to apply update user, user ID: {user_id}"
+                "{COMPONENT} (error: {error}) - failed to apply update user, username: {}",
+                username.unwrap()
             )
         })?;
+    }
+
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[debug_handler]
 #[instrument(skip_all, name = "trace_update_permissions", fields(iggy_user_id = identity.user_id, iggy_updated_user_id = user_id))]
 async fn update_permissions(
     State(state): State<Arc<AppState>>,
@@ -199,33 +262,54 @@ async fn update_permissions(
     command.user_id = Identifier::from_str_value(&user_id)?;
     command.validate()?;
 
-    let mut system = state.system.write().await;
-    system
-        .update_permissions(
-            &Session::stateless(identity.user_id, identity.ip_address),
-            &command.user_id,
-            command.permissions.clone(),
-        )
-        .await
+    let session = Session::stateless(identity.user_id, identity.ip_address);
+    state
+        .shard
+        .shard()
+        .update_permissions(&session, &command.user_id, command.permissions.clone())
         .with_error(|error| {
             format!(
                 "{COMPONENT} (error: {error}) - failed to update permissions, user ID: {user_id}"
             )
         })?;
 
-    let system = system.downgrade();
-    system
-        .state
-        .apply(identity.user_id, &EntryCommand::UpdatePermissions(command))
-        .await
-        .with_error(|error| {
+    // Send event for permissions update
+    {
+        let broadcast_future = SendWrapper::new(async {
+            use crate::shard::transmission::event::ShardEvent;
+            let event = ShardEvent::UpdatedPermissions {
+                user_id: command.user_id.clone(),
+                permissions: command.permissions.clone(),
+            };
+            let _responses = state
+                .shard
+                .shard()
+                .broadcast_event_to_all_shards(event)
+                .await;
+        });
+        broadcast_future.await;
+    }
+
+    {
+        let entry_command = EntryCommand::UpdatePermissions(command);
+        let future = SendWrapper::new(
+            state
+                .shard
+                .shard()
+                .state
+                .apply(identity.user_id, &entry_command),
+        );
+        future.await.with_error(|error| {
             format!(
                 "{COMPONENT} (error: {error}) - failed to apply update permissions, user ID: {user_id}"
             )
         })?;
+    }
+
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[debug_handler]
 #[instrument(skip_all, name = "trace_change_password", fields(iggy_user_id = identity.user_id, iggy_updated_user_id = user_id))]
 async fn change_password(
     State(state): State<Arc<AppState>>,
@@ -236,40 +320,58 @@ async fn change_password(
     command.user_id = Identifier::from_str_value(&user_id)?;
     command.validate()?;
 
-    let mut system = state.system.write().await;
-    system
+    let session = Session::stateless(identity.user_id, identity.ip_address);
+    state
+        .shard
+        .shard()
         .change_password(
-            &Session::stateless(identity.user_id, identity.ip_address),
+            &session,
             &command.user_id,
             &command.current_password,
             &command.new_password,
         )
-        .await
         .with_error(|error| {
             format!("{COMPONENT} (error: {error}) - failed to change password, user ID: {user_id}")
         })?;
 
-    // For the security of the system, we hash the password before storing it in metadata.
-    let system = system.downgrade();
-    system
-        .state
-        .apply(
-            identity.user_id,
-            &EntryCommand::ChangePassword(ChangePassword {
-                user_id: command.user_id,
-                current_password: "".into(),
-                new_password: crypto::hash_password(&command.new_password),
-            }),
-        )
-        .await
-        .with_error(|error| {
+    // Send event for password change
+    {
+        let broadcast_future = SendWrapper::new(async {
+            use crate::shard::transmission::event::ShardEvent;
+            let event = ShardEvent::ChangedPassword {
+                user_id: command.user_id.clone(),
+                current_password: command.current_password.clone(),
+                new_password: command.new_password.clone(),
+            };
+            let _responses = state
+                .shard
+                .shard()
+                .broadcast_event_to_all_shards(event)
+                .await;
+        });
+        broadcast_future.await;
+    }
+
+    {
+        let entry_command = EntryCommand::ChangePassword(command);
+        let future = SendWrapper::new(
+            state
+                .shard
+                .shard()
+                .state
+                .apply(identity.user_id, &entry_command),
+        );
+        future.await.with_error(|error| {
             format!(
                 "{COMPONENT} (error: {error}) - failed to apply change password, user ID: {user_id}"
             )
         })?;
+    }
+
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[debug_handler]
 #[instrument(skip_all, name = "trace_delete_user", fields(iggy_user_id = identity.user_id, iggy_deleted_user_id = user_id))]
 async fn delete_user(
     State(state): State<Arc<AppState>>,
@@ -278,43 +380,62 @@ async fn delete_user(
 ) -> Result<StatusCode, CustomError> {
     let identifier_user_id = Identifier::from_str_value(&user_id)?;
 
-    let mut system = state.system.write().await;
-    system
-        .delete_user(
-            &Session::stateless(identity.user_id, identity.ip_address),
-            &identifier_user_id,
-        )
-        .await
+    let session = Session::stateless(identity.user_id, identity.ip_address);
+
+    state
+        .shard
+        .shard()
+        .delete_user(&session, &identifier_user_id)
         .with_error(|error| {
             format!("{COMPONENT} (error: {error}) - failed to delete user with ID: {user_id}")
         })?;
 
-    let system = system.downgrade();
-    system
-        .state
-        .apply(
-            identity.user_id,
-            &EntryCommand::DeleteUser(DeleteUser {
-                user_id: identifier_user_id,
-            }),
-        )
-        .await
-        .with_error(|error| {
+    // Send event for user deletion
+    {
+        let broadcast_future = SendWrapper::new(async {
+            use crate::shard::transmission::event::ShardEvent;
+            let event = ShardEvent::DeletedUser {
+                user_id: identifier_user_id.clone(),
+            };
+            let _responses = state
+                .shard
+                .shard()
+                .broadcast_event_to_all_shards(event)
+                .await;
+        });
+        broadcast_future.await;
+    }
+
+    {
+        let entry_command = EntryCommand::DeleteUser(DeleteUser {
+            user_id: identifier_user_id,
+        });
+        let future = SendWrapper::new(
+            state
+                .shard
+                .shard()
+                .state
+                .apply(identity.user_id, &entry_command),
+        );
+        future.await.with_error(|error| {
             format!("{COMPONENT} (error: {error}) - failed to apply delete user with ID: {user_id}")
         })?;
+    }
+
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[debug_handler]
 #[instrument(skip_all, name = "trace_login_user")]
 async fn login_user(
     State(state): State<Arc<AppState>>,
     Json(command): Json<LoginUser>,
 ) -> Result<Json<IdentityInfo>, CustomError> {
     command.validate()?;
-    let system = state.system.read().await;
-    let user = system
+    let user = state
+        .shard
+        .shard()
         .login_user(&command.username, &command.password, None)
-        .await
         .with_error(|error| {
             format!(
                 "{COMPONENT} (error: {error}) - failed to login, username: {}",
@@ -325,43 +446,56 @@ async fn login_user(
     Ok(Json(map_generated_access_token_to_identity_info(tokens)))
 }
 
+#[debug_handler]
 #[instrument(skip_all, name = "trace_logout_user", fields(iggy_user_id = identity.user_id))]
 async fn logout_user(
     State(state): State<Arc<AppState>>,
     Extension(identity): Extension<Identity>,
 ) -> Result<StatusCode, CustomError> {
-    let system = state.system.read().await;
-    system
-        .logout_user(&Session::stateless(identity.user_id, identity.ip_address))
-        .await
+    let session = Session::stateless(identity.user_id, identity.ip_address);
+    state
+        .shard
+        .shard()
+        .logout_user(&session)
         .with_error(|error| {
             format!(
                 "{COMPONENT} (error: {error}) - failed to logout, user ID: {}",
                 identity.user_id
             )
         })?;
-    state
-        .jwt_manager
-        .revoke_token(&identity.token_id, identity.token_expiry)
-        .await
-        .with_error(|error| {
+
+    {
+        let revoke_token_future = SendWrapper::new(
+            state
+                .jwt_manager
+                .revoke_token(&identity.token_id, identity.token_expiry),
+        );
+
+        revoke_token_future.await.with_error(|error| {
             format!(
                 "{COMPONENT} (error: {error}) - failed to revoke token, user ID: {}",
                 identity.user_id
             )
         })?;
+    }
+
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[debug_handler]
 async fn refresh_token(
     State(state): State<Arc<AppState>>,
     Json(command): Json<RefreshToken>,
 ) -> Result<Json<IdentityInfo>, CustomError> {
-    let token = state
-        .jwt_manager
-        .refresh_token(&command.token)
-        .await
-        .with_error(|error| format!("{COMPONENT} (error: {error}) - failed to refresh token"))?;
+    let token = {
+        let refresh_token_future =
+            SendWrapper::new(state.jwt_manager.refresh_token(&command.token));
+
+        refresh_token_future
+            .await
+            .with_error(|error| format!("{COMPONENT} (error: {error}) - failed to refresh token"))?
+    };
+
     Ok(Json(map_generated_access_token_to_identity_info(token)))
 }
 

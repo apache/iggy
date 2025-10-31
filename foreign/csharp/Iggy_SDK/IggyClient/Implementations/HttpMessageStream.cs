@@ -56,10 +56,9 @@ public class HttpMessageStream : IIggyClient
         };
     }
 
-    public async Task<StreamResponse?> CreateStreamAsync(string name, uint? streamId = null,
-        CancellationToken token = default)
+    public async Task<StreamResponse?> CreateStreamAsync(string name, CancellationToken token = default)
     {
-        var json = JsonSerializer.Serialize(new CreateStreamRequest(streamId, name), _jsonSerializerOptions);
+        var json = JsonSerializer.Serialize(new CreateStreamRequest(name), _jsonSerializerOptions);
 
         var data = new StringContent(json, Encoding.UTF8, "application/json");
 
@@ -134,8 +133,8 @@ public class HttpMessageStream : IIggyClient
     }
 
     public async Task<TopicResponse?> CreateTopicAsync(Identifier streamId, string name, uint partitionsCount,
-        CompressionAlgorithm compressionAlgorithm = CompressionAlgorithm.None,
-        uint? topicId = null, byte? replicationFactor = null, ulong messageExpiry = 0, ulong maxTopicSize = 0,
+        CompressionAlgorithm compressionAlgorithm = CompressionAlgorithm.None, byte? replicationFactor = null,
+        ulong messageExpiry = 0, ulong maxTopicSize = 0,
         CancellationToken token = default)
     {
         var json = JsonSerializer.Serialize(new CreateTopicRequest
@@ -146,7 +145,6 @@ public class HttpMessageStream : IIggyClient
             MessageExpiry = messageExpiry,
             PartitionsCount = partitionsCount,
             ReplicationFactor = replicationFactor,
-            TopicId = topicId
         }, _jsonSerializerOptions);
         var data = new StringContent(json, Encoding.UTF8, "application/json");
 
@@ -358,9 +356,9 @@ public class HttpMessageStream : IIggyClient
     }
 
     public async Task<ConsumerGroupResponse?> CreateConsumerGroupAsync(Identifier streamId, Identifier topicId,
-        string name, uint? groupId, CancellationToken token = default)
+        string name, CancellationToken token = default)
     {
-        var json = JsonSerializer.Serialize(new CreateConsumerGroupRequest(name, groupId), _jsonSerializerOptions);
+        var json = JsonSerializer.Serialize(new CreateConsumerGroupRequest(name), _jsonSerializerOptions);
 
         var data = new StringContent(json, Encoding.UTF8, "application/json");
 

@@ -28,15 +28,15 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, header};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
-use axum::{Extension, Json, Router};
+use axum::{Extension, Json, Router, debug_handler};
 use bytes::Bytes;
 use chrono::Local;
 use err_trail::ErrContext;
 use iggy_common::Stats;
 use iggy_common::Validatable;
 use iggy_common::get_snapshot::GetSnapshot;
-use iggy_common::locking::IggySharedMutFn;
 use iggy_common::{ClientInfo, ClientInfoDetails, ClusterMetadata};
+use send_wrapper::SendWrapper;
 use std::sync::Arc;
 
 const NAME: &str = "Iggy API";
@@ -58,15 +58,16 @@ pub fn router(state: Arc<AppState>, metrics_config: &HttpMetricsConfig) -> Route
     router.with_state(state)
 }
 
+#[debug_handler]
 async fn get_metrics(State(state): State<Arc<AppState>>) -> Result<String, CustomError> {
-    let system = state.system.read().await;
-    Ok(system.metrics.get_formatted_output())
+    let metrics_formatted_output = state.shard.shard().metrics.get_formatted_output();
+    Ok(metrics_formatted_output)
 }
 
+#[debug_handler]
 async fn get_stats(State(state): State<Arc<AppState>>) -> Result<Json<Stats>, CustomError> {
-    let system = state.system.read().await;
-    let stats = system
-        .get_stats()
+    let stats_future = SendWrapper::new(state.shard.shard().get_stats());
+    let stats = stats_future
         .await
         .with_error(|error| format!("{COMPONENT} (error: {error}) - failed to get stats"))?;
     Ok(Json(stats))
@@ -76,15 +77,14 @@ async fn get_cluster_metadata(
     State(state): State<Arc<AppState>>,
     Extension(identity): Extension<Identity>,
 ) -> Result<Json<ClusterMetadata>, CustomError> {
-    let system = state.system.read().await;
-    let cluster_metadata = system
-        .get_cluster_metadata(&Session::stateless(identity.user_id, identity.ip_address))
-        .with_error(|error| {
-            format!(
-                "{COMPONENT} (error: {error}) - failed to get cluster metadata, user ID: {}",
-                identity.user_id
-            )
-        })?;
+    let shard = state.shard.shard();
+    let session = Session::stateless(identity.user_id, identity.ip_address);
+    let cluster_metadata = shard.get_cluster_metadata(&session).with_error(|error| {
+        format!(
+            "{COMPONENT} (error: {error}) - failed to get cluster metadata, user ID: {}",
+            identity.user_id
+        )
+    })?;
     Ok(Json(cluster_metadata))
 }
 
@@ -93,13 +93,13 @@ async fn get_client(
     Extension(identity): Extension<Identity>,
     Path(client_id): Path<u32>,
 ) -> Result<Json<ClientInfoDetails>, CustomError> {
-    let system = state.system.read().await;
-    let Ok(client) = system
+    let Ok(client) = state
+        .shard
+        .shard()
         .get_client(
             &Session::stateless(identity.user_id, identity.ip_address),
             client_id,
         )
-        .await
         .with_error(|error| {
             format!(
                 "{COMPONENT} (error: {error}) - failed to get client, user ID: {}",
@@ -113,29 +113,30 @@ async fn get_client(
         return Err(CustomError::ResourceNotFound);
     };
 
-    let client = client.read().await;
     let client = mapper::map_client(&client);
     Ok(Json(client))
 }
 
+#[debug_handler]
 async fn get_clients(
     State(state): State<Arc<AppState>>,
     Extension(identity): Extension<Identity>,
 ) -> Result<Json<Vec<ClientInfo>>, CustomError> {
-    let system = state.system.read().await;
-    let clients = system
+    let clients = state
+        .shard
+        .shard()
         .get_clients(&Session::stateless(identity.user_id, identity.ip_address))
-        .await
         .with_error(|error| {
             format!(
                 "{COMPONENT} (error: {error}) - failed to get clients, user ID: {}",
                 identity.user_id
             )
         })?;
-    let clients = mapper::map_clients(&clients).await;
+    let clients = mapper::map_clients(&clients);
     Ok(Json(clients))
 }
 
+#[debug_handler]
 async fn get_snapshot(
     State(state): State<Arc<AppState>>,
     Extension(identity): Extension<Identity>,
@@ -144,11 +145,15 @@ async fn get_snapshot(
     command.validate()?;
 
     let session = Session::stateless(identity.user_id, identity.ip_address);
-    let system = state.system.read().await;
+    let snapshot_future = SendWrapper::new(state.shard.shard().get_snapshot(
+        &session,
+        command.compression,
+        &command.snapshot_types,
+    ));
 
-    let snapshot = system
-        .get_snapshot(&session, command.compression, &command.snapshot_types)
-        .await?;
+    let snapshot = snapshot_future
+        .await
+        .with_error(|error| format!("{COMPONENT} (error: {error}) - failed to get snapshot"))?;
 
     let zip_data = Bytes::from(snapshot.0);
     let filename = format!("iggy_snapshot_{}.zip", Local::now().format("%Y%m%d_%H%M%S"));

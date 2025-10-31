@@ -18,9 +18,9 @@
 
 use crate::configs::quic::{QuicCertificateConfig, QuicConfig};
 use crate::configs::server::{
-    ArchiverConfig, DataMaintenanceConfig, DiskArchiverConfig, HeartbeatConfig,
-    MessagesMaintenanceConfig, S3ArchiverConfig, StateMaintenanceConfig, TelemetryConfig,
-    TelemetryLogsConfig, TelemetryTracesConfig,
+    DataMaintenanceConfig, DiskArchiverConfig, HeartbeatConfig, MessagesMaintenanceConfig,
+    S3ArchiverConfig, StateMaintenanceConfig, TelemetryConfig, TelemetryLogsConfig,
+    TelemetryTracesConfig,
 };
 use crate::configs::system::MessageDeduplicationConfig;
 use crate::configs::{
@@ -139,26 +139,8 @@ impl Display for DataMaintenanceConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ archiver: {}, messages: {}, state: {} }}",
-            self.archiver, self.messages, self.state
-        )
-    }
-}
-
-impl Display for ArchiverConfig {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        let disk = self
-            .disk
-            .as_ref()
-            .map_or("none".to_string(), |disk| disk.to_string());
-        let s3 = self
-            .s3
-            .as_ref()
-            .map_or("none".to_string(), |s3| s3.to_string());
-        write!(
-            f,
-            "{{ enabled: {}, kind: {}, disk: {disk}, s3: {s3} }}",
-            self.enabled, self.kind,
+            "{{ messages: {}, state: {} }}",
+            self.messages, self.state
         )
     }
 }
@@ -289,12 +271,8 @@ impl Display for SegmentConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ size_bytes: {}, cache_indexes: {}, message_expiry: {}, archive_expired: {}, server_confirmation: {} }}",
-            self.size,
-            self.cache_indexes,
-            self.message_expiry,
-            self.archive_expired,
-            self.server_confirmation,
+            "{{ size_bytes: {}, cache_indexes: {}, message_expiry: {}, archive_expired: {} }}",
+            self.size, self.cache_indexes, self.message_expiry, self.archive_expired,
         )
     }
 }

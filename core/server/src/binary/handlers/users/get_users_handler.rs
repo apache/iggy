@@ -16,13 +16,15 @@
  * under the License.
  */
 
+use std::rc::Rc;
+
 use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
 use crate::binary::handlers::users::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
 use crate::binary::sender::SenderKind;
+use crate::shard::IggyShard;
 use crate::streaming::session::Session;
-use crate::streaming::systems::system::SharedSystem;
 use err_trail::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::get_users::GetUsers;
@@ -38,14 +40,13 @@ impl ServerCommandHandler for GetUsers {
         sender: &mut SenderKind,
         _length: u32,
         session: &Session,
-        system: &SharedSystem,
+        shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
-        let system = system.read().await;
-        let users = system.get_users(session).await.with_error(|error| {
+        let users = shard.get_users(session).await.with_error(|error| {
             format!("{COMPONENT} (error: {error}) - failed to get users, session: {session}")
         })?;
-        let users = mapper::map_users(&users);
+        let users = mapper::map_users(users);
         sender.send_ok_response(&users).await?;
         Ok(())
     }

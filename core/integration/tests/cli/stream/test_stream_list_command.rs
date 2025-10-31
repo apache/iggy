@@ -27,18 +27,13 @@ use predicates::str::{contains, starts_with};
 use serial_test::parallel;
 
 struct TestStreamListCmd {
-    stream_id: u32,
     name: String,
     output: OutputFormat,
 }
 
 impl TestStreamListCmd {
-    fn new(stream_id: u32, name: String, output: OutputFormat) -> Self {
-        Self {
-            stream_id,
-            name,
-            output,
-        }
+    fn new(name: String, output: OutputFormat) -> Self {
+        Self { name, output }
     }
 
     fn to_args(&self) -> Vec<&str> {
@@ -49,7 +44,7 @@ impl TestStreamListCmd {
 #[async_trait]
 impl IggyCmdTestCase for TestStreamListCmd {
     async fn prepare_server_state(&mut self, client: &dyn Client) {
-        let stream = client.create_stream(&self.name, Some(self.stream_id)).await;
+        let stream = client.create_stream(&self.name).await;
         assert!(stream.is_ok());
     }
 
@@ -82,21 +77,18 @@ pub async fn should_be_successful() {
     iggy_cmd_test.setup().await;
     iggy_cmd_test
         .execute_test(TestStreamListCmd::new(
-            1,
             String::from("prod"),
             OutputFormat::Default,
         ))
         .await;
     iggy_cmd_test
         .execute_test(TestStreamListCmd::new(
-            2,
             String::from("testing"),
             OutputFormat::List,
         ))
         .await;
     iggy_cmd_test
         .execute_test(TestStreamListCmd::new(
-            3,
             String::from("misc"),
             OutputFormat::Table,
         ))

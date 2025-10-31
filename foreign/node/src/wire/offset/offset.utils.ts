@@ -65,15 +65,24 @@ export const serializeGetOffset = (
   partitionId?: number
 ) => {
 
-  if (consumer.kind === ConsumerKind.Single && (!partitionId || partitionId < 1))
-    throw new Error('getOffset error: partitionId must be > 0 for single consumer kind');
+  if (consumer.kind === ConsumerKind.Single && (partitionId === undefined || partitionId === null))
+    throw new Error('getOffset error: partitionId must be provided for single consumer kind');
 
   const streamIdentifier = serializeIdentifier(streamId);
   const topicIdentifier = serializeIdentifier(topicId);
   const consumerIdentifier = serializeIdentifier(consumer.id);
 
   const b1 = uint8ToBuf(consumer.kind);
-  const b2 = uint32ToBuf(partitionId || 0);
+
+  // Encode partition_id with a flag byte: 1 = Some, 0 = None
+  const b2 = Buffer.allocUnsafe(5);
+  if (partitionId !== undefined && partitionId !== null) {
+    b2.writeUInt8(1, 0); // Flag byte: partition_id is Some
+    b2.writeUInt32LE(partitionId, 1);
+  } else {
+    b2.writeUInt8(0, 0); // Flag byte: partition_id is None
+    b2.writeUInt32LE(0, 1); // Padding
+  }
 
   return Buffer.concat([
     b1,

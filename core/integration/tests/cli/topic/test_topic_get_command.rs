@@ -74,19 +74,16 @@ impl TestTopicGetCmd {
 #[async_trait]
 impl IggyCmdTestCase for TestTopicGetCmd {
     async fn prepare_server_state(&mut self, client: &dyn Client) {
-        let stream = client
-            .create_stream(&self.stream_name, Some(self.stream_id))
-            .await;
+        let stream = client.create_stream(&self.stream_name).await;
         assert!(stream.is_ok());
 
         let topic = client
             .create_topic(
-                &self.stream_id.try_into().unwrap(),
+                &self.stream_name.clone().try_into().unwrap(),
                 &self.topic_name,
                 1,
                 Default::default(),
                 None,
-                Some(self.topic_id),
                 IggyExpiry::NeverExpire,
                 MaxTopicSize::ServerDefault,
             )
@@ -119,7 +116,7 @@ impl IggyCmdTestCase for TestTopicGetCmd {
         command_state
             .success()
             .stdout(starts_with(start_message))
-            .stdout(contains(format!("Topic id            | {}", self.topic_id)))
+            .stdout(contains("Topic id            | 0"))
             .stdout(contains(format!(
                 "Topic name          | {}",
                 self.topic_name
@@ -134,14 +131,14 @@ impl IggyCmdTestCase for TestTopicGetCmd {
     async fn verify_server_state(&self, client: &dyn Client) {
         let topic = client
             .delete_topic(
-                &self.stream_id.try_into().unwrap(),
-                &self.topic_id.try_into().unwrap(),
+                &self.stream_name.clone().try_into().unwrap(),
+                &self.topic_name.clone().try_into().unwrap(),
             )
             .await;
         assert!(topic.is_ok());
 
         let stream = client
-            .delete_stream(&self.stream_id.try_into().unwrap())
+            .delete_stream(&self.stream_name.clone().try_into().unwrap())
             .await;
         assert!(stream.is_ok());
     }
@@ -155,19 +152,19 @@ pub async fn should_be_successful() {
     iggy_cmd_test.setup().await;
     iggy_cmd_test
         .execute_test(TestTopicGetCmd::new(
-            1,
+            0,
             String::from("main"),
-            1,
+            0,
             String::from("sync"),
-            TestStreamId::Numeric,
-            TestTopicId::Numeric,
+            TestStreamId::Named,
+            TestTopicId::Named,
         ))
         .await;
     iggy_cmd_test
         .execute_test(TestTopicGetCmd::new(
-            2,
+            1,
             String::from("customer"),
-            4,
+            3,
             String::from("probe"),
             TestStreamId::Named,
             TestTopicId::Named,
@@ -175,22 +172,22 @@ pub async fn should_be_successful() {
         .await;
     iggy_cmd_test
         .execute_test(TestTopicGetCmd::new(
-            2,
+            1,
             String::from("development"),
-            3,
+            2,
             String::from("testing"),
-            TestStreamId::Numeric,
+            TestStreamId::Named,
             TestTopicId::Named,
         ))
         .await;
     iggy_cmd_test
         .execute_test(TestTopicGetCmd::new(
-            7,
+            6,
             String::from("other"),
-            2,
+            1,
             String::from("topic"),
             TestStreamId::Named,
-            TestTopicId::Numeric,
+            TestTopicId::Named,
         ))
         .await;
 }

@@ -20,11 +20,12 @@ use prometheus_client::encoding::text::encode;
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::registry::Registry;
+use std::sync::Arc;
 use tracing::error;
 
-#[derive(Debug)]
-pub(crate) struct Metrics {
-    registry: Registry,
+#[derive(Debug, Clone)]
+pub struct Metrics {
+    registry: Arc<Registry>,
     http_requests: Counter,
     streams: Gauge,
     topics: Gauge,
@@ -37,38 +38,46 @@ pub(crate) struct Metrics {
 
 impl Metrics {
     pub fn init() -> Self {
-        let mut metrics = Metrics {
-            registry: <Registry>::default(),
-            http_requests: Counter::default(),
-            streams: Gauge::default(),
-            topics: Gauge::default(),
-            partitions: Gauge::default(),
-            segments: Gauge::default(),
-            messages: Gauge::default(),
-            users: Gauge::default(),
-            clients: Gauge::default(),
-        };
+        let mut registry = Registry::default();
 
-        metrics.register_counter("http_requests", metrics.http_requests.clone());
-        metrics.register_gauge("streams", metrics.streams.clone());
-        metrics.register_gauge("topics", metrics.topics.clone());
-        metrics.register_gauge("partitions", metrics.partitions.clone());
-        metrics.register_gauge("segments", metrics.segments.clone());
-        metrics.register_gauge("messages", metrics.messages.clone());
-        metrics.register_gauge("users", metrics.users.clone());
-        metrics.register_gauge("clients", metrics.clients.clone());
+        let http_requests = Counter::default();
+        let streams = Gauge::default();
+        let topics = Gauge::default();
+        let partitions = Gauge::default();
+        let segments = Gauge::default();
+        let messages = Gauge::default();
+        let users = Gauge::default();
+        let clients = Gauge::default();
 
-        metrics
-    }
+        registry.register(
+            "http_requests",
+            "total count of http_requests",
+            http_requests.clone(),
+        );
+        registry.register("streams", "total count of streams", streams.clone());
+        registry.register("topics", "total count of topics", topics.clone());
+        registry.register(
+            "partitions",
+            "total count of partitions",
+            partitions.clone(),
+        );
+        registry.register("segments", "total count of segments", segments.clone());
+        registry.register("messages", "total count of messages", messages.clone());
+        registry.register("users", "total count of users", users.clone());
+        registry.register("clients", "total count of clients", clients.clone());
 
-    fn register_counter(&mut self, name: &str, counter: Counter) {
-        self.registry
-            .register(name, format!("total count of {name}"), counter)
-    }
-
-    fn register_gauge(&mut self, name: &str, gauge: Gauge) {
-        self.registry
-            .register(name, format!("total count of {name}"), gauge)
+        let registry = registry.into();
+        Self {
+            registry,
+            http_requests,
+            streams,
+            topics,
+            partitions,
+            segments,
+            messages,
+            users,
+            clients,
+        }
     }
 
     pub fn get_formatted_output(&self) -> String {

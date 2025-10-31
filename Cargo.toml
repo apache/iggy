@@ -50,6 +50,7 @@ ahash = { version = "0.8.12", features = ["serde"] }
 anyhow = "1.0.100"
 argon2 = "0.5.3"
 async-broadcast = "0.7.2"
+async-channel = "2.3.1"
 async-dropper = { version = "0.3.1", features = ["tokio", "simple"] }
 async-trait = "0.1.89"
 async_zip = { version = "0.0.18", features = [
@@ -60,7 +61,7 @@ async_zip = { version = "0.0.18", features = [
     "deflate",
     "zstd",
 ] }
-axum = "0.8.6"
+axum = { version = "0.8.6", features = ["macros"] }
 axum-server = { version = "0.7.2", features = ["tls-rustls"] }
 base64 = "0.22.1"
 bench-dashboard-frontend = { path = "core/bench/dashboard/frontend" }
@@ -82,9 +83,27 @@ chrono = { version = "0.4.42", features = ["serde"] }
 clap = { version = "4.5.50", features = ["derive", "wrap_help"] }
 colored = "3.0.0"
 comfy-table = "7.2.1"
+compio = { version = "0.16.0", features = [
+    "runtime",
+    "macros",
+    "io-uring",
+    "time",
+    "rustls",
+] }
+compio-io = "0.8.1"
+compio-net = "0.9.0"
+compio-quic = "0.5.1"
+compio-tls = { version = "0.7.0", features = [
+    "rustls",
+], default-features = false }
+compio-ws = { git = "https://github.com/krishvishal/compio-ws", rev = "59b1322676689474d9dfbafbd8de6dc96222fb18", features = [
+    "rustls",
+] }
 console-subscriber = "0.4.1"
 crc32fast = "1.5.0"
 crossbeam = "0.8.4"
+cyper = { version = "0.5.0", features = ["rustls"], default-features = false }
+cyper-axum = { version = "0.5.0" }
 dashmap = "6.1.0"
 derive-new = "0.7.0"
 derive_builder = "0.20.2"
@@ -145,6 +164,7 @@ test-case = "3.3.1"
 thiserror = "2.0.17"
 tokio = { version = "1.48.0", features = ["full"] }
 tokio-rustls = "0.26.4"
+tokio-tungstenite = { version = "0.27", features = ["rustls-tls-webpki-roots"] }
 tokio-util = { version = "0.7.16", features = ["compat"] }
 toml = "0.9.8"
 tower-http = { version = "0.6.6", features = [
@@ -160,6 +180,7 @@ tracing-subscriber = { version = "0.3.20", default-features = false, features = 
     "ansi",
 ] }
 trait-variant = "0.1.2"
+tungstenite = "0.27.0"
 twox-hash = { version = "2.1.2", features = ["xxhash32"] }
 uuid = { version = "1.18.1", features = [
     "v4",

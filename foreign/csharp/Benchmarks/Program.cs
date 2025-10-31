@@ -64,10 +64,9 @@ try
 {
     for (uint i = 0; i < producerCount; i++)
     {
-        await clients[0].CreateStreamAsync($"Test bench stream_{i}", startingStreamId + i);
+        await clients[0].CreateStreamAsync($"Test bench stream_{i}");
 
         await clients[0].CreateTopicAsync(Identifier.Numeric(startingStreamId + i),
-            topicId: topicId,
             name: $"Test bench topic_{i}",
             compressionAlgorithm: CompressionAlgorithm.None,
             messageExpiry: 0,

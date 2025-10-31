@@ -19,6 +19,7 @@
 use crate::VERSION;
 use crate::configs::server::{TelemetryConfig, TelemetryTransport};
 use crate::configs::system::LoggingConfig;
+use crate::log::runtime::CompioRuntime;
 use crate::server_error::LogError;
 use opentelemetry::KeyValue;
 use opentelemetry::global;
@@ -28,7 +29,6 @@ use opentelemetry_otlp::{WithExportConfig, WithHttpConfig};
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::logs::log_processor_with_async_runtime;
 use opentelemetry_sdk::propagation::TraceContextPropagator;
-use opentelemetry_sdk::runtime;
 use opentelemetry_sdk::trace::span_processor_with_async_runtime;
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -217,7 +217,7 @@ impl Logging {
                     .with_log_processor(
                         log_processor_with_async_runtime::BatchLogProcessor::builder(
                             log_exporter,
-                            runtime::Tokio,
+                            CompioRuntime,
                         )
                         .build(),
                     )
@@ -249,7 +249,7 @@ impl Logging {
                     .with_span_processor(
                         span_processor_with_async_runtime::BatchSpanProcessor::builder(
                             trace_exporter,
-                            runtime::Tokio,
+                            CompioRuntime,
                         )
                         .build(),
                     )
@@ -385,7 +385,7 @@ impl Logging {
     }
 
     fn get_log_format() -> Format {
-        Format::default().with_thread_ids(true)
+        Format::default().with_thread_names(true)
     }
 
     fn _install_log_rotation_handler(&self) {

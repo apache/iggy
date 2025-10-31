@@ -898,7 +898,7 @@ fn map_to_client_info(
             .map_err(|_| IggyError::InvalidNumberEncoding)?,
     );
     let user_id = match user_id {
-        0 => None,
+        u32::MAX => None,
         _ => Some(user_id),
     };
 

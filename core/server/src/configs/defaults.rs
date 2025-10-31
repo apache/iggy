@@ -16,18 +16,18 @@
  * under the License.
  */
 
+use super::sharding::ShardingConfig;
 use super::system::MemoryPoolConfig;
 use super::tcp::TcpSocketConfig;
 use crate::configs::cluster::{ClusterConfig, ClusterNodeConfig, NodeConfig};
 use crate::configs::http::{
     HttpConfig, HttpCorsConfig, HttpJwtConfig, HttpMetricsConfig, HttpTlsConfig,
 };
-use crate::configs::quic::{QuicCertificateConfig, QuicConfig};
+use crate::configs::quic::{QuicCertificateConfig, QuicConfig, QuicSocketConfig};
 use crate::configs::server::{
-    ArchiverConfig, DataMaintenanceConfig, HeartbeatConfig, MessageSaverConfig,
-    MessagesMaintenanceConfig, PersonalAccessTokenCleanerConfig, PersonalAccessTokenConfig,
-    ServerConfig, StateMaintenanceConfig, TelemetryConfig, TelemetryLogsConfig,
-    TelemetryTracesConfig,
+    DataMaintenanceConfig, HeartbeatConfig, MessageSaverConfig, MessagesMaintenanceConfig,
+    PersonalAccessTokenCleanerConfig, PersonalAccessTokenConfig, ServerConfig,
+    StateMaintenanceConfig, TelemetryConfig, TelemetryLogsConfig, TelemetryTracesConfig,
 };
 use crate::configs::system::{
     BackupConfig, CompatibilityConfig, CompressionConfig, EncryptionConfig, LoggingConfig,
@@ -35,10 +35,9 @@ use crate::configs::system::{
     StateConfig, StreamConfig, SystemConfig, TopicConfig,
 };
 use crate::configs::tcp::{TcpConfig, TcpTlsConfig};
+use crate::configs::websocket::{WebSocketConfig, WebSocketTlsConfig};
 use iggy_common::IggyByteSize;
 use iggy_common::IggyDuration;
-use iggy_common::TransportProtocol;
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -57,25 +56,10 @@ impl Default for ServerConfig {
             system: Arc::new(SystemConfig::default()),
             quic: QuicConfig::default(),
             tcp: TcpConfig::default(),
+            websocket: WebSocketConfig::default(),
             http: HttpConfig::default(),
             telemetry: TelemetryConfig::default(),
             cluster: ClusterConfig::default(),
-        }
-    }
-}
-
-impl Default for ArchiverConfig {
-    fn default() -> ArchiverConfig {
-        ArchiverConfig {
-            enabled: false,
-            kind: SERVER_CONFIG
-                .data_maintenance
-                .archiver
-                .kind
-                .parse()
-                .unwrap(),
-            disk: None,
-            s3: None,
         }
     }
 }
@@ -127,6 +111,18 @@ impl Default for QuicConfig {
             keep_alive_interval: SERVER_CONFIG.quic.keep_alive_interval.parse().unwrap(),
             max_idle_timeout: SERVER_CONFIG.quic.max_idle_timeout.parse().unwrap(),
             certificate: QuicCertificateConfig::default(),
+            socket: QuicSocketConfig::default(),
+        }
+    }
+}
+
+impl Default for QuicSocketConfig {
+    fn default() -> QuicSocketConfig {
+        QuicSocketConfig {
+            override_defaults: SERVER_CONFIG.quic.socket.override_defaults,
+            recv_buffer_size: SERVER_CONFIG.quic.socket.recv_buffer_size.parse().unwrap(),
+            send_buffer_size: SERVER_CONFIG.quic.socket.send_buffer_size.parse().unwrap(),
+            keepalive: SERVER_CONFIG.quic.socket.keepalive,
         }
     }
 }
@@ -173,6 +169,33 @@ impl Default for TcpSocketConfig {
             keepalive: false,
             nodelay: false,
             linger: IggyDuration::new(Duration::new(0, 0)),
+        }
+    }
+}
+
+impl Default for WebSocketConfig {
+    fn default() -> WebSocketConfig {
+        WebSocketConfig {
+            enabled: SERVER_CONFIG.websocket.enabled,
+            address: SERVER_CONFIG.websocket.address.parse().unwrap(),
+            read_buffer_size: None,
+            write_buffer_size: None,
+            max_write_buffer_size: None,
+            max_message_size: None,
+            max_frame_size: None,
+            accept_unmasked_frames: false,
+            tls: WebSocketTlsConfig::default(),
+        }
+    }
+}
+
+impl Default for WebSocketTlsConfig {
+    fn default() -> WebSocketTlsConfig {
+        WebSocketTlsConfig {
+            enabled: SERVER_CONFIG.websocket.tls.enabled,
+            self_signed: SERVER_CONFIG.websocket.tls.self_signed,
+            cert_file: SERVER_CONFIG.websocket.tls.cert_file.parse().unwrap(),
+            key_file: SERVER_CONFIG.websocket.tls.key_file.parse().unwrap(),
         }
     }
 }
@@ -328,6 +351,7 @@ impl Default for SystemConfig {
             message_deduplication: MessageDeduplicationConfig::default(),
             recovery: RecoveryConfig::default(),
             memory_pool: MemoryPoolConfig::default(),
+            sharding: ShardingConfig::default(),
         }
     }
 }
@@ -455,12 +479,6 @@ impl Default for SegmentConfig {
             cache_indexes: SERVER_CONFIG.system.segment.cache_indexes.parse().unwrap(),
             message_expiry: SERVER_CONFIG.system.segment.message_expiry.parse().unwrap(),
             archive_expired: SERVER_CONFIG.system.segment.archive_expired,
-            server_confirmation: SERVER_CONFIG
-                .system
-                .segment
-                .server_confirmation
-                .parse()
-                .unwrap(),
         }
     }
 }
@@ -544,7 +562,7 @@ impl Default for ClusterConfig {
             enabled: SERVER_CONFIG.cluster.enabled,
             id: SERVER_CONFIG.cluster.id as u32,
             name: SERVER_CONFIG.cluster.name.parse().unwrap(),
-            transport: TransportProtocol::from_str(SERVER_CONFIG.cluster.transport).unwrap(),
+            transport: SERVER_CONFIG.cluster.transport.parse().unwrap(),
             node: NodeConfig::default(),
             nodes: vec![
                 ClusterNodeConfig {

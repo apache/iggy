@@ -20,17 +20,19 @@ use crate::http::COMPONENT;
 use crate::http::error::CustomError;
 use crate::http::jwt::json_web_token::Identity;
 use crate::http::shared::AppState;
+use crate::shard::transmission::event::ShardEvent;
 use crate::state::command::EntryCommand;
 use crate::streaming::session::Session;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::post;
-use axum::{Extension, Json, Router};
+use axum::{Extension, Json, Router, debug_handler};
 use err_trail::ErrContext;
 use iggy_common::Identifier;
 use iggy_common::Validatable;
 use iggy_common::create_partitions::CreatePartitions;
 use iggy_common::delete_partitions::DeletePartitions;
+use send_wrapper::SendWrapper;
 use std::sync::Arc;
 use tracing::instrument;
 
@@ -43,6 +45,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
+#[debug_handler]
 #[instrument(skip_all, name = "trace_create_partitions", fields(iggy_user_id = identity.user_id, iggy_stream_id = stream_id, iggy_topic_id = topic_id))]
 async fn create_partitions(
     State(state): State<Arc<AppState>>,
@@ -54,34 +57,49 @@ async fn create_partitions(
     command.topic_id = Identifier::from_str_value(&topic_id)?;
     command.validate()?;
 
-    let mut system = state.system.write().await;
-    system
-            .create_partitions(
-                &Session::stateless(identity.user_id, identity.ip_address),
-                &command.stream_id,
-                &command.topic_id,
-                command.partitions_count,
-            )
-            .await
+    let _parititon_guard = state.shard.shard().fs_locks.partition_lock.lock().await;
+    let session = Session::stateless(identity.user_id, identity.ip_address);
+    let partitions = SendWrapper::new(state.shard.shard().create_partitions(
+        &session,
+        &command.stream_id,
+        &command.topic_id,
+        command.partitions_count,
+    ))
+    .await?;
+
+    let broadcast_future = SendWrapper::new(async {
+        let shard = state.shard.shard();
+
+        let event = ShardEvent::CreatedPartitions {
+            stream_id: command.stream_id.clone(),
+            topic_id: command.topic_id.clone(),
+            partitions,
+        };
+        let _responses = shard.broadcast_event_to_all_shards(event).await;
+        Ok::<(), CustomError>(())
+    });
+
+    broadcast_future.await
             .with_error(|error| {
                 format!(
-                    "{COMPONENT} (error: {error}) - failed to create partitions, stream ID: {stream_id}, topic ID: {topic_id}"
+                    "{COMPONENT} (error: {error}) - failed to broadcast partition events, stream ID: {stream_id}, topic ID: {topic_id}"
                 )
             })?;
+    let command = EntryCommand::CreatePartitions(command);
+    let state_future =
+        SendWrapper::new(state.shard.shard().state.apply(identity.user_id, &command));
 
-    let system = system.downgrade();
-    system
-        .state
-        .apply(identity.user_id, &EntryCommand::CreatePartitions(command))
-        .await
+    state_future.await
         .with_error(|error| {
             format!(
                 "{COMPONENT} (error: {error}) - failed to apply create partitions, stream ID: {stream_id}, topic ID: {topic_id}"
             )
         })?;
+
     Ok(StatusCode::CREATED)
 }
 
+#[debug_handler]
 #[instrument(skip_all, name = "trace_delete_partitions", fields(iggy_user_id = identity.user_id, iggy_stream_id = stream_id, iggy_topic_id = topic_id))]
 async fn delete_partitions(
     State(state): State<Arc<AppState>>,
@@ -93,37 +111,54 @@ async fn delete_partitions(
     query.topic_id = Identifier::from_str_value(&topic_id)?;
     query.validate()?;
 
-    let mut system = state.system.write().await;
-    system
-            .delete_partitions(
-                &Session::stateless(identity.user_id, identity.ip_address),
-                &query.stream_id.clone(),
-                &query.topic_id.clone(),
-                query.partitions_count,
-            )
-            .await
-            .with_error(|error| {
-                format!(
-                    "{COMPONENT} (error: {error}) - failed to delete partitions for topic with ID: {stream_id} in stream with ID: {topic_id}"
-                )
-            })?;
+    let session = Session::stateless(identity.user_id, identity.ip_address);
+    let deleted_partition_ids = {
+        let delete_future = SendWrapper::new(state.shard.shard().delete_partitions(
+            &session,
+            &query.stream_id,
+            &query.topic_id,
+            query.partitions_count,
+        ));
 
-    let system = system.downgrade();
-    system
-        .state
-        .apply(
-            identity.user_id,
-            &EntryCommand::DeletePartitions(DeletePartitions {
+        delete_future.await.with_error(|error| {
+            format!(
+                "{COMPONENT} (error: {error}) - failed to delete partitions for topic with ID: {topic_id} in stream with ID: {stream_id}"
+            )
+        })?
+    };
+
+    // Send event for partition deletion
+    {
+        let broadcast_future = SendWrapper::new(async {
+            let event = ShardEvent::DeletedPartitions {
                 stream_id: query.stream_id.clone(),
                 topic_id: query.topic_id.clone(),
                 partitions_count: query.partitions_count,
-            }),
-        )
-        .await
+                partition_ids: deleted_partition_ids,
+            };
+            let _responses = state
+                .shard
+                .shard()
+                .broadcast_event_to_all_shards(event)
+                .await;
+        });
+        broadcast_future.await;
+    }
+
+    let command = EntryCommand::DeletePartitions(DeletePartitions {
+        stream_id: query.stream_id.clone(),
+        topic_id: query.topic_id.clone(),
+        partitions_count: query.partitions_count,
+    });
+    let state_future =
+        SendWrapper::new(state.shard.shard().state.apply(identity.user_id, &command));
+
+    state_future.await
         .with_error(|error| {
             format!(
                 "{COMPONENT} (error: {error}) - failed to apply delete partitions, stream ID: {stream_id}, topic ID: {topic_id}"
             )
         })?;
+
     Ok(StatusCode::NO_CONTENT)
 }

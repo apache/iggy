@@ -16,19 +16,22 @@
  * under the License.
  */
 
+use std::sync::{Arc, atomic::AtomicU64};
+
+use crate::slab::Keyed;
+use crate::slab::traits_ext::{EntityComponentSystem, IntoComponents};
 use crate::streaming::clients::client_manager::Client;
-use crate::streaming::partitions::partition::Partition;
+use crate::streaming::partitions::partition::PartitionRoot;
 use crate::streaming::personal_access_tokens::personal_access_token::PersonalAccessToken;
-use crate::streaming::streams::stream::Stream;
-use crate::streaming::topics::consumer_group::ConsumerGroup;
-use crate::streaming::topics::topic::Topic;
+use crate::streaming::stats::{PartitionStats, StreamStats, TopicStats};
+use crate::streaming::streams::stream;
+use crate::streaming::topics::consumer_group::{ConsumerGroupMembers, ConsumerGroupRoot, Member};
+use crate::streaming::topics::topic::{self, TopicRoot};
 use crate::streaming::users::user::User;
+use arcshift::SharedGetGuard;
 use bytes::{BufMut, Bytes, BytesMut};
-use iggy_common::locking::{IggySharedMut, IggySharedMutFn};
-use iggy_common::{
-    BytesSerializable, ConsumerOffsetInfo, Sizeable, Stats, TransportProtocol, UserId,
-};
-use tokio::sync::RwLock;
+use iggy_common::{BytesSerializable, ConsumerOffsetInfo, Stats, TransportProtocol, UserId};
+use slab::Slab;
 
 pub fn map_stats(stats: &Stats) -> Bytes {
     let mut bytes = BytesMut::with_capacity(104);
@@ -97,11 +100,10 @@ pub fn map_client(client: &Client) -> Bytes {
     bytes.freeze()
 }
 
-pub async fn map_clients(clients: &[IggySharedMut<Client>]) -> Bytes {
+pub async fn map_clients(clients: Vec<Client>) -> Bytes {
     let mut bytes = BytesMut::new();
-    for client in clients {
-        let client = client.read().await;
-        extend_client(&client, &mut bytes);
+    for client in clients.iter() {
+        extend_client(client, &mut bytes);
     }
     bytes.freeze()
 }
@@ -121,9 +123,9 @@ pub fn map_user(user: &User) -> Bytes {
     bytes.freeze()
 }
 
-pub fn map_users(users: &[&User]) -> Bytes {
+pub fn map_users(users: Vec<User>) -> Bytes {
     let mut bytes = BytesMut::new();
-    for user in users {
+    for user in users.iter() {
         extend_user(user, &mut bytes);
     }
     bytes.freeze()
@@ -142,122 +144,161 @@ pub fn map_raw_pat(token: &str) -> Bytes {
     bytes.freeze()
 }
 
-pub fn map_personal_access_tokens(personal_access_tokens: &[PersonalAccessToken]) -> Bytes {
+pub fn map_personal_access_tokens(personal_access_tokens: Vec<PersonalAccessToken>) -> Bytes {
     let mut bytes = BytesMut::new();
-    for personal_access_token in personal_access_tokens {
+    for personal_access_token in personal_access_tokens.iter() {
         extend_pat(personal_access_token, &mut bytes);
     }
     bytes.freeze()
 }
 
-pub fn map_stream(stream: &Stream) -> Bytes {
+pub fn map_streams(roots: &Slab<stream::StreamRoot>, stats: &Slab<Arc<StreamStats>>) -> Bytes {
     let mut bytes = BytesMut::new();
-    extend_stream(stream, &mut bytes);
-    for topic in stream.get_topics() {
-        extend_topic(topic, &mut bytes);
+    for (root, stat) in roots
+        .iter()
+        .map(|(_, val)| val)
+        .zip(stats.iter().map(|(_, val)| val))
+    {
+        extend_stream(root, stat, &mut bytes);
     }
     bytes.freeze()
 }
 
-pub fn map_streams(streams: &[&Stream]) -> Bytes {
+pub fn map_stream(root: &stream::StreamRoot, stats: &StreamStats) -> Bytes {
     let mut bytes = BytesMut::new();
-    for stream in streams {
-        extend_stream(stream, &mut bytes);
+    extend_stream(root, stats, &mut bytes);
+    root.topics().with_components(|topics| {
+        let (roots, _, stats, ..) = topics.into_components();
+        for (root, stat) in roots
+            .iter()
+            .map(|(_, val)| val)
+            .zip(stats.iter().map(|(_, val)| val))
+        {
+            extend_topic(root, stat, &mut bytes);
+        }
+    });
+    bytes.freeze()
+}
+
+pub fn map_topics(roots: &Slab<TopicRoot>, stats: &Slab<Arc<TopicStats>>) -> Bytes {
+    let mut bytes = BytesMut::new();
+    for (root, stat) in roots
+        .iter()
+        .map(|(_, val)| val)
+        .zip(stats.iter().map(|(_, val)| val))
+    {
+        extend_topic(root, stat, &mut bytes);
     }
     bytes.freeze()
 }
 
-pub fn map_topics(topics: &[&Topic]) -> Bytes {
+pub fn map_topic(root: &topic::TopicRoot, stats: &TopicStats) -> Bytes {
     let mut bytes = BytesMut::new();
-    for topic in topics {
-        extend_topic(topic, &mut bytes);
-    }
+    extend_topic(root, stats, &mut bytes);
+    root.partitions().with_components(|partitions| {
+        let (roots, stats, _, offsets, _, _, _) = partitions.into_components();
+        for (root, stat, offset) in roots
+            .iter()
+            .map(|(_, val)| val)
+            .zip(stats.iter().map(|(_, val)| val))
+            .zip(offsets.iter().map(|(_, val)| val))
+            .map(|((root, stat), offset)| (root, stat, offset))
+        {
+            extend_partition(root, stat, offset, &mut bytes);
+        }
+    });
+
     bytes.freeze()
 }
 
-pub async fn map_topic(topic: &Topic) -> Bytes {
+pub fn map_consumer_group(root: &ConsumerGroupRoot, members: &ConsumerGroupMembers) -> Bytes {
     let mut bytes = BytesMut::new();
-    extend_topic(topic, &mut bytes);
-    for partition in topic.get_partitions() {
-        let partition = partition.read().await;
-        extend_partition(&partition, &mut bytes);
-    }
-    bytes.freeze()
-}
+    let members = members.inner().shared_get();
+    extend_consumer_group(root, &members, &mut bytes);
 
-pub async fn map_consumer_group(consumer_group: &ConsumerGroup) -> Bytes {
-    let mut bytes = BytesMut::new();
-    extend_consumer_group(consumer_group, &mut bytes);
-    let members = consumer_group.get_members();
-    for member in members {
-        let member = member.read().await;
-        bytes.put_u32_le(member.id);
-        let partitions = member.get_partitions();
-        bytes.put_u32_le(partitions.len() as u32);
-        for partition in partitions {
-            bytes.put_u32_le(partition);
+    for (_, member) in members.iter() {
+        bytes.put_u32_le(member.id as u32);
+        bytes.put_u32_le(member.partitions.len() as u32);
+        for partition in &member.partitions {
+            bytes.put_u32_le(*partition as u32);
         }
     }
     bytes.freeze()
 }
 
-pub async fn map_consumer_groups(consumer_groups: &[&RwLock<ConsumerGroup>]) -> Bytes {
+pub fn map_consumer_groups(
+    roots: &Slab<ConsumerGroupRoot>,
+    members: &Slab<ConsumerGroupMembers>,
+) -> Bytes {
     let mut bytes = BytesMut::new();
-    for consumer_group in consumer_groups {
-        let consumer_group = consumer_group.read().await;
-        extend_consumer_group(&consumer_group, &mut bytes);
+    for (root, member) in roots
+        .iter()
+        .map(|(_, val)| val)
+        .zip(members.iter().map(|(_, val)| val.inner().shared_get()))
+    {
+        extend_consumer_group(root, &member, &mut bytes);
     }
     bytes.freeze()
 }
 
-fn extend_stream(stream: &Stream, bytes: &mut BytesMut) {
-    bytes.put_u32_le(stream.stream_id);
-    bytes.put_u64_le(stream.created_at.into());
-    bytes.put_u32_le(stream.get_topics().len() as u32);
-    bytes.put_u64_le(stream.get_size().as_bytes_u64());
-    bytes.put_u64_le(stream.get_messages_count());
-    bytes.put_u8(stream.name.len() as u8);
-    bytes.put_slice(stream.name.as_bytes());
+fn extend_stream(root: &stream::StreamRoot, stats: &StreamStats, bytes: &mut BytesMut) {
+    bytes.put_u32_le(root.id() as u32);
+    bytes.put_u64_le(root.created_at().into());
+    bytes.put_u32_le(root.topics_count() as u32);
+    bytes.put_u64_le(stats.size_bytes_inconsistent());
+    bytes.put_u64_le(stats.messages_count_inconsistent());
+    bytes.put_u8(root.name().len() as u8);
+    bytes.put_slice(root.name().as_bytes());
 }
 
-fn extend_topic(topic: &Topic, bytes: &mut BytesMut) {
-    bytes.put_u32_le(topic.topic_id);
-    bytes.put_u64_le(topic.created_at.into());
-    bytes.put_u32_le(topic.get_partitions().len() as u32);
-    bytes.put_u64_le(topic.message_expiry.into());
-    bytes.put_u8(topic.compression_algorithm.as_code());
-    bytes.put_u64_le(topic.max_topic_size.into());
-    bytes.put_u8(topic.replication_factor);
-    bytes.put_u64_le(topic.get_size_bytes().as_bytes_u64());
-    bytes.put_u64_le(topic.get_messages_count());
-    bytes.put_u8(topic.name.len() as u8);
-    bytes.put_slice(topic.name.as_bytes());
+fn extend_topic(root: &TopicRoot, stats: &TopicStats, bytes: &mut BytesMut) {
+    bytes.put_u32_le(root.id() as u32);
+    bytes.put_u64_le(root.created_at().into());
+    bytes.put_u32_le(root.partitions().len() as u32);
+    bytes.put_u64_le(root.message_expiry().into());
+    bytes.put_u8(root.compression_algorithm().as_code());
+    bytes.put_u64_le(root.max_topic_size().into());
+    bytes.put_u8(root.replication_factor());
+    bytes.put_u64_le(stats.size_bytes_inconsistent());
+    bytes.put_u64_le(stats.messages_count_inconsistent());
+    bytes.put_u8(root.name().len() as u8);
+    bytes.put_slice(root.name().as_bytes());
 }
 
-fn extend_partition(partition: &Partition, bytes: &mut BytesMut) {
-    bytes.put_u32_le(partition.partition_id);
-    bytes.put_u64_le(partition.created_at.into());
-    bytes.put_u32_le(partition.get_segments().len() as u32);
-    bytes.put_u64_le(partition.current_offset);
-    bytes.put_u64_le(partition.get_size_bytes().as_bytes_u64());
-    bytes.put_u64_le(partition.get_messages_count());
+fn extend_partition(
+    root: &PartitionRoot,
+    stats: &PartitionStats,
+    offset: &Arc<AtomicU64>,
+    bytes: &mut BytesMut,
+) {
+    bytes.put_u32_le(root.id() as u32);
+    bytes.put_u64_le(root.created_at().into());
+    bytes.put_u32_le(stats.segments_count_inconsistent());
+    bytes.put_u64_le(offset.load(std::sync::atomic::Ordering::Relaxed));
+    bytes.put_u64_le(stats.size_bytes_inconsistent());
+    bytes.put_u64_le(stats.messages_count_inconsistent());
 }
 
-fn extend_consumer_group(consumer_group: &ConsumerGroup, bytes: &mut BytesMut) {
-    bytes.put_u32_le(consumer_group.group_id);
-    bytes.put_u32_le(consumer_group.partitions_count);
-    bytes.put_u32_le(consumer_group.get_members().len() as u32);
-    bytes.put_u8(consumer_group.name.len() as u8);
-    bytes.put_slice(consumer_group.name.as_bytes());
+fn extend_consumer_group(
+    root: &ConsumerGroupRoot,
+    members: &SharedGetGuard<'_, Slab<Member>>,
+    bytes: &mut BytesMut,
+) {
+    bytes.put_u32_le(root.id() as u32);
+    bytes.put_u32_le(root.partitions().len() as u32);
+    bytes.put_u32_le(members.len() as u32);
+    bytes.put_u8(root.key().len() as u8);
+    bytes.put_slice(root.key().as_bytes());
 }
 
 fn extend_client(client: &Client, bytes: &mut BytesMut) {
     bytes.put_u32_le(client.session.client_id);
-    bytes.put_u32_le(client.user_id.unwrap_or(0));
+    bytes.put_u32_le(client.user_id.unwrap_or(u32::MAX));
     let transport: u8 = match client.transport {
         TransportProtocol::Tcp => 1,
         TransportProtocol::Quic => 2,
         TransportProtocol::Http => 3,
+        TransportProtocol::WebSocket => 4,
     };
     bytes.put_u8(transport);
     let address = client.session.ip_address.to_string();

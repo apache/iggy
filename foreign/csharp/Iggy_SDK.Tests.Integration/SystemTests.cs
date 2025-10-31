@@ -55,11 +55,15 @@ public class SystemTests
     {
         IReadOnlyList<ClientResponse> clients = await Fixture.Clients[protocol].GetClientsAsync();
 
+        var client = Fixture.IggyServerFixture.CreateClient(Protocol.Tcp, protocol);
+        await client.LoginUser("iggy", "iggy");
+        var clientInfo = await client.GetMeAsync();
+        clientInfo.ShouldNotBeNull();
+
         clients.Count.ShouldBeGreaterThanOrEqualTo(Fixture.TotalClientsCount);
-        var id = clients.First(x => x.UserId != null).ClientId;
-        var response = await Fixture.Clients[protocol].GetClientByIdAsync(id);
+        var response = await Fixture.Clients[protocol].GetClientByIdAsync(clientInfo.ClientId);
         response.ShouldNotBeNull();
-        response.ClientId.ShouldBe(id);
+        response.ClientId.ShouldBe(clientInfo.ClientId);
         response.UserId.ShouldNotBeNull();
         response.UserId.Value.ShouldBeGreaterThanOrEqualTo(0u);
         response.Address.ShouldNotBeNullOrEmpty();
@@ -77,7 +81,7 @@ public class SystemTests
         var me = await Fixture.Clients[protocol].GetMeAsync();
         me.ShouldNotBeNull();
         me.ClientId.ShouldNotBe(0u);
-        me.UserId.ShouldBe(1u);
+        me.UserId.ShouldBe(0u);
         me.Address.ShouldNotBeNullOrEmpty();
         me.Transport.ShouldBe(Protocol.Tcp);
     }
@@ -104,20 +108,20 @@ public class SystemTests
 
         var consumerGroup
             = await client.CreateConsumerGroupAsync(Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-                Identifier.Numeric(1), "test_consumer_group", 1);
+                Identifier.String("test_topic"), "test_consumer_group");
         await client.JoinConsumerGroupAsync(Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-            Identifier.Numeric(1), Identifier.Numeric(1));
+            Identifier.String("test_topic"), Identifier.String("test_consumer_group"));
         var me = await client.GetMeAsync();
 
         var response = await Fixture.Clients[protocol].GetClientByIdAsync(me!.ClientId);
         response.ShouldNotBeNull();
-        response.UserId.ShouldBe(1u);
+        response.UserId.ShouldBe(0u);
         response.Address.ShouldNotBeNullOrEmpty();
         response.Transport.ShouldBe(Protocol.Tcp);
         response.ConsumerGroupsCount.ShouldBe(1);
         response.ConsumerGroups.ShouldNotBeEmpty();
         response.ConsumerGroups.ShouldContain(x => x.GroupId == consumerGroup!.Id);
-        response.ConsumerGroups.ShouldContain(x => x.TopicId == 1);
+        response.ConsumerGroups.ShouldContain(x => x.TopicId == 0);
         response.ConsumerGroups.ShouldContain(x => x.StreamId == stream!.Id);
     }
 
@@ -128,12 +132,12 @@ public class SystemTests
     public async Task GetStats_Should_ReturnValidResponse(Protocol protocol)
     {
         await Fixture.Clients[protocol].SendMessagesAsync(Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-            Identifier.Numeric(1), Partitioning.None(), [new Message(Guid.NewGuid(), "Test message"u8.ToArray())]);
+            Identifier.Numeric(0), Partitioning.None(), [new Message(Guid.NewGuid(), "Test message"u8.ToArray())]);
 
         await Fixture.Clients[protocol].PollMessagesAsync(new MessageFetchRequest
         {
             StreamId = Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-            TopicId = Identifier.Numeric(1),
+            TopicId = Identifier.Numeric(0),
             AutoCommit = true,
             Consumer = Consumer.New(1),
             Count = 1,

@@ -26,12 +26,17 @@ pub async fn receive_and_validate(
     length: u32,
 ) -> Result<ServerCommand, IggyError> {
     let mut buffer = BytesMut::with_capacity(length as usize);
-    if length > 0 {
-        unsafe {
-            buffer.set_len(length as usize);
-        }
-        sender.read(&mut buffer).await?;
+    unsafe {
+        buffer.set_len(length as usize);
     }
+    let buffer = if length == 0 {
+        buffer
+    } else {
+        let (result, buffer) = sender.read(buffer).await;
+        result?;
+        buffer
+    };
+
     let command = ServerCommand::from_code_and_payload(code, buffer.freeze())?;
     command.validate()?;
     Ok(command)

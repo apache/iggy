@@ -21,11 +21,12 @@ use crate::binary::handlers::personal_access_tokens::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
 use crate::binary::sender::SenderKind;
+use crate::shard::IggyShard;
 use crate::streaming::session::Session;
-use crate::streaming::systems::system::SharedSystem;
 use err_trail::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::get_personal_access_tokens::GetPersonalAccessTokens;
+use std::rc::Rc;
 use tracing::debug;
 
 impl ServerCommandHandler for GetPersonalAccessTokens {
@@ -38,17 +39,15 @@ impl ServerCommandHandler for GetPersonalAccessTokens {
         sender: &mut SenderKind,
         _length: u32,
         session: &Session,
-        system: &SharedSystem,
+        shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
-        let system = system.read().await;
-        let personal_access_tokens = system
+        let personal_access_tokens = shard
             .get_personal_access_tokens(session)
-            .await
             .with_error(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to get personal access tokens with session: {session}")
             })?;
-        let personal_access_tokens = mapper::map_personal_access_tokens(&personal_access_tokens);
+        let personal_access_tokens = mapper::map_personal_access_tokens(personal_access_tokens);
         sender.send_ok_response(&personal_access_tokens).await?;
         Ok(())
     }

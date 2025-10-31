@@ -19,13 +19,14 @@
 use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::{handlers::topics::COMPONENT, sender::SenderKind};
+use crate::shard::IggyShard;
 use crate::state::command::EntryCommand;
 use crate::streaming::session::Session;
-use crate::streaming::systems::system::SharedSystem;
 use anyhow::Result;
 use err_trail::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::purge_topic::PurgeTopic;
+use std::rc::Rc;
 use tracing::{debug, instrument};
 
 impl ServerCommandHandler for PurgeTopic {
@@ -39,11 +40,13 @@ impl ServerCommandHandler for PurgeTopic {
         sender: &mut SenderKind,
         _length: u32,
         session: &Session,
-        system: &SharedSystem,
+        shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
-        let system = system.read().await;
-        system
+        let topic_id = self.topic_id.clone();
+        let stream_id = self.stream_id.clone();
+
+        shard
             .purge_topic(session, &self.stream_id, &self.topic_id)
             .await
             .with_error(|error| {
@@ -53,9 +56,13 @@ impl ServerCommandHandler for PurgeTopic {
                 )
             })?;
 
-        let topic_id = self.topic_id.clone();
-        let stream_id = self.stream_id.clone();
-        system
+        let event = crate::shard::transmission::event::ShardEvent::PurgedTopic {
+            stream_id: self.stream_id.clone(),
+            topic_id: self.topic_id.clone(),
+        };
+        shard.broadcast_event_to_all_shards(event).await?;
+
+        shard
             .state
             .apply(session.get_user_id(), &EntryCommand::PurgeTopic(self))
             .await

@@ -19,13 +19,21 @@
 use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::{handlers::streams::COMPONENT, sender::SenderKind};
+use crate::shard::IggyShard;
+use crate::shard::transmission::event::ShardEvent;
+use crate::shard::transmission::frame::ShardResponse;
+use crate::shard::transmission::message::{
+    ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult,
+};
+use crate::slab::traits_ext::EntityMarker;
 use crate::state::command::EntryCommand;
 use crate::streaming::session::Session;
-use crate::streaming::systems::system::SharedSystem;
 use anyhow::Result;
 use err_trail::ErrContext;
-use iggy_common::IggyError;
 use iggy_common::delete_stream::DeleteStream;
+use iggy_common::{Identifier, IggyError};
+use std::rc::Rc;
+use tracing::info;
 use tracing::{debug, instrument};
 
 impl ServerCommandHandler for DeleteStream {
@@ -39,28 +47,78 @@ impl ServerCommandHandler for DeleteStream {
         sender: &mut SenderKind,
         _length: u32,
         session: &Session,
-        system: &SharedSystem,
+        shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
         let stream_id = self.stream_id.clone();
+        let request = ShardRequest {
+            stream_id: Identifier::default(),
+            topic_id: Identifier::default(),
+            partition_id: 0,
+            payload: ShardRequestPayload::DeleteStream {
+                user_id: session.get_user_id(),
+                stream_id: self.stream_id,
+            },
+        };
 
-        let mut system = system.write().await;
-        system
-                .delete_stream(session, &self.stream_id)
-                .await
-                .with_error(|error| {
-                    format!("{COMPONENT} (error: {error}) - failed to delete stream with ID: {stream_id}, session: {session}")
-                })?;
+        let message = ShardMessage::Request(request);
+        match shard.send_request_to_shard_or_recoil(None, message).await? {
+            ShardSendRequestResult::Recoil(message) => {
+                if let ShardMessage::Request(ShardRequest { payload, .. }) = message
+                    && let ShardRequestPayload::DeleteStream { stream_id, .. } = payload
+                {
+                    // Acquire stream lock to serialize filesystem operations
+                    let _stream_guard = shard.fs_locks.stream_lock.lock().await;
+                    let stream = shard
+                            .delete_stream(session, &stream_id)
+                            .await
+                            .with_error(|error| {
+                                format!("{COMPONENT} (error: {error}) - failed to delete stream with ID: {stream_id}, session: {session}")
+                            })?;
+                    info!(
+                        "Deleted stream with name: {}, ID: {}",
+                        stream.root().name(),
+                        stream.id()
+                    );
 
-        let system = system.downgrade();
-        system
-            .state
-            .apply(session.get_user_id(), &EntryCommand::DeleteStream(self))
-            .await
-            .with_error(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to apply delete stream with ID: {stream_id}, session: {session}")
-            })?;
-        sender.send_empty_ok_response().await?;
+                    let event = ShardEvent::DeletedStream {
+                        id: stream.id(),
+                        stream_id: stream_id.clone(),
+                    };
+                    shard.broadcast_event_to_all_shards(event).await?;
+
+                    shard
+                        .state
+                        .apply(session.get_user_id(), &EntryCommand::DeleteStream(DeleteStream { stream_id: stream_id.clone() }))
+                        .await
+                        .with_error(|error| {
+                            format!("{COMPONENT} (error: {error}) - failed to apply delete stream with ID: {stream_id}, session: {session}")
+                        })?;
+                    sender.send_empty_ok_response().await?;
+                }
+            }
+            ShardSendRequestResult::Response(response) => match response {
+                ShardResponse::DeleteStreamResponse(stream) => {
+                    shard
+                        .state
+                        .apply(session.get_user_id(), &EntryCommand::DeleteStream(DeleteStream { stream_id: (stream.id() as u32).try_into().unwrap() }))
+                        .await
+                        .with_error(|error| {
+                            format!("{COMPONENT} (error: {error}) - failed to apply delete stream with ID: {stream_id}, session: {session}")
+                        })?;
+                    sender.send_empty_ok_response().await?;
+                }
+                ShardResponse::ErrorResponse(err) => {
+                    return Err(err);
+                }
+                _ => {
+                    unreachable!(
+                        "Expected a DeleteStreamResponse inside of DeleteStream handler, impossible state"
+                    );
+                }
+            },
+        }
+
         Ok(())
     }
 }

@@ -28,8 +28,8 @@ use iggy_common::IggyError;
 use iggy_common::IggyExpiry;
 use iggy_common::IggyTimestamp;
 use iggy_common::UserId;
-use iggy_common::locking::IggySharedMut;
-use iggy_common::locking::IggySharedMutFn;
+use iggy_common::locking::IggyRwLock;
+use iggy_common::locking::IggyRwLockFn;
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, TokenData, Validation, encode};
 use std::sync::Arc;
 use tracing::{debug, error, info};
@@ -54,7 +54,7 @@ pub struct JwtManager {
     issuer: IssuerOptions,
     validator: ValidatorOptions,
     tokens_storage: TokenStorage,
-    revoked_tokens: IggySharedMut<AHashMap<String, u64>>,
+    revoked_tokens: IggyRwLock<AHashMap<String, u64>>,
     validations: AHashMap<Algorithm, Validation>,
 }
 
@@ -77,7 +77,7 @@ impl JwtManager {
             issuer,
             validator,
             tokens_storage: TokenStorage::new(persister, path),
-            revoked_tokens: IggySharedMut::new(AHashMap::new()),
+            revoked_tokens: IggyRwLock::new(AHashMap::new()),
         })
     }
 

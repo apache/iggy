@@ -26,7 +26,6 @@ license = "Apache-2.0"
 normal = ["tracing-appender"]
 
 [package.metadata.cargo-machete]
-ignored = ["rust-s3"]
 
 [[bin]]
 name = "iggy-server"
@@ -34,14 +33,15 @@ path = "src/main.rs"
 
 [features]
 default = ["mimalloc"]
-tokio-console = ["dep:console-subscriber", "tokio/tracing"]
 disable-mimalloc = []
 mimalloc = ["dep:mimalloc"]
 
 [dependencies]
 ahash = { workspace = true }
 anyhow = { workspace = true }
+arcshift = "0.4.0"
 argon2 = { workspace = true }
+async-channel = { workspace = true }
 async_zip = { workspace = true }
 axum = { workspace = true }
 axum-server = { workspace = true }
@@ -50,8 +50,15 @@ blake3 = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
-console-subscriber = { workspace = true, optional = true }
+compio = { workspace = true }
+compio-net = { workspace = true }
+compio-quic = { workspace = true }
+compio-tls = { workspace = true }
+compio-ws = { workspace = true }
 crossbeam = { workspace = true }
+ctrlc = { version = "3.4", features = ["termination"] }
+cyper = { workspace = true }
+cyper-axum = { workspace = true }
 dashmap = { workspace = true }
 derive_more = { workspace = true }
 dotenvy = { workspace = true }
@@ -62,9 +69,10 @@ figlet-rs = { workspace = true }
 figment = { workspace = true }
 flume = { workspace = true }
 futures = { workspace = true }
+hash32 = "1.0.0"
 human-repr = { workspace = true }
 iggy_common = { workspace = true }
-jsonwebtoken = { version = "10.1.0", features = ["rust_crypto"] }
+jsonwebtoken = "9.3.1"
 lending-iterator = "0.1.7"
 mimalloc = { workspace = true, optional = true }
 moka = { version = "0.12.11", features = ["future"] }
@@ -79,42 +87,41 @@ opentelemetry-otlp = { version = "0.31.0", features = [
     "http",
     "http-proto",
     "reqwest-client",
-    "tokio",
 ] }
 opentelemetry-semantic-conventions = "0.31.0"
 opentelemetry_sdk = { version = "0.31.0", features = [
-    "rt-tokio",
     "logs",
     "trace",
-    "tokio",
     "experimental_async_runtime",
     "experimental_logs_batch_log_processor_with_async_runtime",
     "experimental_trace_batch_span_processor_with_async_runtime",
 ] }
+papaya = "0.2.3"
 prometheus-client = "0.24.0"
-quinn = { workspace = true }
 rand = { workspace = true }
 reqwest = { workspace = true, features = ["rustls-tls-no-provider"] }
 ring = "0.17.14"
-rust-s3 = { workspace = true }
+ringbuffer = "0.16.0"
 rustls = { workspace = true }
 rustls-pemfile = "2.2.0"
+send_wrapper = "0.6.0"
 serde = { workspace = true }
 serde_with = { workspace = true }
+slab = "0.4.10"
+socket2 = "0.6.0"
 static-toml = "1.3.0"
 strum = { workspace = true }
 sysinfo = { workspace = true }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true }
-tokio-rustls = { workspace = true }
-tokio-util = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
 toml = { workspace = true }
 tower-http = { workspace = true }
 tracing = { workspace = true }
 tracing-appender = { workspace = true }
 tracing-opentelemetry = "0.32.0"
 tracing-subscriber = { workspace = true }
+tungstenite = { workspace = true }
 twox-hash = { workspace = true }
 ulid = "1.2.1"
 uuid = { workspace = true }
@@ -129,5 +136,4 @@ vergen-git2 = { version = "1.0.7", features = [
 ] }
 
 [dev-dependencies]
-mockall = { workspace = true }
 serial_test = { workspace = true }

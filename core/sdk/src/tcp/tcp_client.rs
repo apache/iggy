@@ -208,13 +208,10 @@ impl TcpClient {
     ) -> Result<Bytes, IggyError> {
         if status != 0 {
             // TEMP: See https://github.com/apache/iggy/pull/604 for context.
-            if status == IggyErrorDiscriminants::TopicIdAlreadyExists as u32
-                || status == IggyErrorDiscriminants::TopicNameAlreadyExists as u32
-                || status == IggyErrorDiscriminants::StreamIdAlreadyExists as u32
+            if status == IggyErrorDiscriminants::TopicNameAlreadyExists as u32
                 || status == IggyErrorDiscriminants::StreamNameAlreadyExists as u32
                 || status == IggyErrorDiscriminants::UserAlreadyExists as u32
                 || status == IggyErrorDiscriminants::PersonalAccessTokenAlreadyExists as u32
-                || status == IggyErrorDiscriminants::ConsumerGroupIdAlreadyExists as u32
                 || status == IggyErrorDiscriminants::ConsumerGroupNameAlreadyExists as u32
             {
                 tracing::debug!(

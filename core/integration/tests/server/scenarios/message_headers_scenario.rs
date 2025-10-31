@@ -17,8 +17,7 @@
  */
 
 use crate::server::scenarios::{
-    MESSAGES_COUNT, PARTITION_ID, PARTITIONS_COUNT, STREAM_ID, STREAM_NAME, TOPIC_ID, TOPIC_NAME,
-    cleanup, create_client,
+    MESSAGES_COUNT, PARTITION_ID, PARTITIONS_COUNT, STREAM_NAME, TOPIC_NAME, cleanup, create_client,
 };
 use bytes::Bytes;
 use iggy::prelude::*;
@@ -49,8 +48,8 @@ pub async fn run(client_factory: &dyn ClientFactory) {
 
     client
         .send_messages(
-            &Identifier::numeric(STREAM_ID).unwrap(),
-            &Identifier::numeric(TOPIC_ID).unwrap(),
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
             &Partitioning::partition_id(PARTITION_ID),
             &mut messages,
         )
@@ -61,8 +60,8 @@ pub async fn run(client_factory: &dyn ClientFactory) {
     let consumer = Consumer::default();
     let polled_messages = client
         .poll_messages(
-            &Identifier::numeric(STREAM_ID).unwrap(),
-            &Identifier::numeric(TOPIC_ID).unwrap(),
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
             Some(PARTITION_ID),
             &consumer,
             &PollingStrategy::offset(0),
@@ -108,20 +107,16 @@ pub async fn run(client_factory: &dyn ClientFactory) {
 
 async fn init_system(client: &IggyClient) {
     // 1. Create the stream
-    client
-        .create_stream(STREAM_NAME, Some(STREAM_ID))
-        .await
-        .unwrap();
+    client.create_stream(STREAM_NAME).await.unwrap();
 
     // 2. Create the topic
     client
         .create_topic(
-            &Identifier::numeric(STREAM_ID).unwrap(),
+            &Identifier::named(STREAM_NAME).unwrap(),
             TOPIC_NAME,
             PARTITIONS_COUNT,
             CompressionAlgorithm::default(),
             None,
-            Some(TOPIC_ID),
             IggyExpiry::NeverExpire,
             MaxTopicSize::ServerDefault,
         )

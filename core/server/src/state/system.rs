@@ -16,6 +16,9 @@
  * under the License.
  */
 
+use crate::bootstrap::create_root_user;
+use crate::state::file::FileState;
+use crate::state::models::CreateUserWithId;
 use crate::state::{COMPONENT, EntryCommand, StateEntry};
 use crate::streaming::personal_access_tokens::personal_access_token::PersonalAccessToken;
 use ahash::AHashMap;
@@ -25,30 +28,39 @@ use iggy_common::IggyError;
 use iggy_common::IggyExpiry;
 use iggy_common::IggyTimestamp;
 use iggy_common::MaxTopicSize;
+use iggy_common::create_user::CreateUser;
+use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
 use iggy_common::{IdKind, Identifier, Permissions, UserStatus};
+use std::collections::BTreeMap;
 use std::fmt::Display;
-use tracing::{debug, info};
+use tracing::{debug, error, info};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SystemState {
-    pub streams: AHashMap<u32, StreamState>,
+    pub streams: BTreeMap<u32, StreamState>,
     pub users: AHashMap<u32, UserState>,
 }
 
-#[derive(Debug)]
+impl SystemState {
+    pub fn decompose(self) -> (BTreeMap<u32, StreamState>, AHashMap<u32, UserState>) {
+        (self.streams, self.users)
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct StreamState {
     pub id: u32,
     pub name: String,
     pub created_at: IggyTimestamp,
-    pub topics: AHashMap<u32, TopicState>,
+    pub topics: BTreeMap<u32, TopicState>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TopicState {
     pub id: u32,
     pub name: String,
-    pub partitions: AHashMap<u32, PartitionState>,
-    pub consumer_groups: AHashMap<u32, ConsumerGroupState>,
+    pub partitions: BTreeMap<u32, PartitionState>,
+    pub consumer_groups: BTreeMap<u32, ConsumerGroupState>,
     pub compression_algorithm: CompressionAlgorithm,
     pub message_expiry: IggyExpiry,
     pub max_topic_size: MaxTopicSize,
@@ -56,20 +68,20 @@ pub struct TopicState {
     pub created_at: IggyTimestamp,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PartitionState {
     pub id: u32,
     pub created_at: IggyTimestamp,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PersonalAccessTokenState {
     pub name: String,
     pub token_hash: String,
     pub expiry_at: Option<IggyTimestamp>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct UserState {
     pub id: u32,
     pub username: String,
@@ -80,15 +92,65 @@ pub struct UserState {
     pub personal_access_tokens: AHashMap<String, PersonalAccessTokenState>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ConsumerGroupState {
     pub id: u32,
     pub name: String,
 }
 
 impl SystemState {
+    pub async fn load(state: FileState) -> Result<Self, IggyError> {
+        let mut state_entries = state.init().await.with_error(|error| {
+            format!("{COMPONENT} (error: {error}) - failed to initialize state entries")
+        })?;
+
+        // Create root user if does not exist.
+        let root_exists = state_entries
+            .iter()
+            .any(|entry| {
+                entry
+                    .command()
+                    .map(|command| matches!(command, EntryCommand::CreateUser(payload) if payload.user_id == DEFAULT_ROOT_USER_ID))
+                    .unwrap_or_else(|err| {
+                        error!("Failed to check if root user exists: {err}");
+                        false
+                    })
+            });
+
+        if !root_exists {
+            info!("No users found, creating the root user...");
+            let root = create_root_user();
+            let command = CreateUser {
+                username: root.username.clone(),
+                password: root.password.clone(),
+                status: root.status,
+                permissions: root.permissions.clone(),
+            };
+            state
+                .apply(0, &EntryCommand::CreateUser(CreateUserWithId {
+                    user_id: root.id,
+                    command
+                }))
+                .await
+                .with_error(|error| {
+                    format!(
+                        "{COMPONENT} (error: {error}) - failed to apply create user command, username: {}",
+                        root.username
+                    )
+                })?;
+            state_entries = state.init().await.with_error(|error| {
+                format!("{COMPONENT} (error: {error}) - failed to initialize state entries")
+            })?;
+        }
+
+        let system_state = Self::init(state_entries).await.with_error(|error| {
+            format!("{COMPONENT} (error: {error}) - failed to initialize system state")
+        })?;
+        Ok(system_state)
+    }
+
     pub async fn init(entries: Vec<StateEntry>) -> Result<Self, IggyError> {
-        let mut streams = AHashMap::new();
+        let mut streams = BTreeMap::new();
         let mut users = AHashMap::new();
         for entry in entries {
             debug!("Processing state entry: {entry}",);
@@ -104,7 +166,7 @@ impl SystemState {
                     let stream = StreamState {
                         id: stream_id,
                         name: command.name.clone(),
-                        topics: AHashMap::new(),
+                        topics: BTreeMap::new(),
                         created_at: entry.timestamp,
                     };
                     streams.insert(stream.id, stream);
@@ -137,15 +199,15 @@ impl SystemState {
                     let topic = TopicState {
                         id: topic_id,
                         name: command.name,
-                        consumer_groups: AHashMap::new(),
+                        consumer_groups: BTreeMap::new(),
                         compression_algorithm: command.compression_algorithm,
                         message_expiry: command.message_expiry,
                         max_topic_size: command.max_topic_size,
                         replication_factor: command.replication_factor,
                         created_at: entry.timestamp,
                         partitions: if command.partitions_count > 0 {
-                            let mut partitions = AHashMap::new();
-                            for i in 1..=command.partitions_count {
+                            let mut partitions = BTreeMap::new();
+                            for i in 0..command.partitions_count {
                                 partitions.insert(
                                     i,
                                     PartitionState {
@@ -156,7 +218,7 @@ impl SystemState {
                             }
                             partitions
                         } else {
-                            AHashMap::new()
+                            BTreeMap::new()
                         },
                     };
                     stream.topics.insert(topic.id, topic);
@@ -415,7 +477,7 @@ impl SystemState {
     }
 }
 
-fn find_stream_id(streams: &AHashMap<u32, StreamState>, stream_id: &Identifier) -> u32 {
+fn find_stream_id(streams: &BTreeMap<u32, StreamState>, stream_id: &Identifier) -> u32 {
     match stream_id.kind {
         IdKind::Numeric => stream_id
             .get_u32_value()
@@ -433,7 +495,7 @@ fn find_stream_id(streams: &AHashMap<u32, StreamState>, stream_id: &Identifier) 
     }
 }
 
-fn find_topic_id(topics: &AHashMap<u32, TopicState>, topic_id: &Identifier) -> u32 {
+fn find_topic_id(topics: &BTreeMap<u32, TopicState>, topic_id: &Identifier) -> u32 {
     match topic_id.kind {
         IdKind::Numeric => topic_id
             .get_u32_value()
@@ -452,7 +514,7 @@ fn find_topic_id(topics: &AHashMap<u32, TopicState>, topic_id: &Identifier) -> u
 }
 
 fn find_consumer_group_id(
-    groups: &AHashMap<u32, ConsumerGroupState>,
+    groups: &BTreeMap<u32, ConsumerGroupState>,
     group_id: &Identifier,
 ) -> u32 {
     match group_id.kind {

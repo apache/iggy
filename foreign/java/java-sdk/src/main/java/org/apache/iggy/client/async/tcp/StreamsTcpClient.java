@@ -48,11 +48,10 @@ public class StreamsTcpClient implements StreamsClient {
     }
 
     @Override
-    public CompletableFuture<StreamDetails> createStreamAsync(Optional<Long> streamId, String name) {
-        var payloadSize = 4 + 1 + name.length();
+    public CompletableFuture<StreamDetails> createStreamAsync(String name) {
+        var payloadSize = 1 + name.length();
         var payload = Unpooled.buffer(payloadSize);
 
-        payload.writeIntLE(streamId.orElse(0L).intValue());
         payload.writeBytes(nameToBytes(name));
 
         return connection.sendAsync(CommandCode.Stream.CREATE.getValue(), payload)

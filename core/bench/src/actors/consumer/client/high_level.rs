@@ -101,18 +101,17 @@ impl ConsumerClient for HighLevelConsumerClient {
 
 impl BenchmarkInit for HighLevelConsumerClient {
     async fn setup(&mut self) -> Result<(), IggyError> {
-        let topic_id = 1;
+        let topic_id_str = "topic-1";
         let client = self.client_factory.create_client().await;
         let client = IggyClient::create(client, None, None);
         login_root(&client).await;
 
         let stream_id_str = self.config.stream_id.to_string();
-        let topic_id_str = topic_id.to_string();
 
         let mut consumer = if let Some(cg_id) = self.config.consumer_group_id {
             let consumer_group_name = format!("cg_{cg_id}");
             client
-                .consumer_group(&consumer_group_name, &stream_id_str, &topic_id_str)?
+                .consumer_group(&consumer_group_name, &stream_id_str, topic_id_str)?
                 .batch_length(self.config.messages_per_batch.get())
                 .auto_commit(AutoCommit::When(AutoCommitWhen::PollingMessages))
                 .create_consumer_group_if_not_exists()
@@ -126,8 +125,8 @@ impl BenchmarkInit for HighLevelConsumerClient {
                 .consumer(
                     &format!("hl_consumer_{}", self.config.consumer_id),
                     &stream_id_str,
-                    &topic_id_str,
-                    1,
+                    topic_id_str,
+                    0,
                 )?
                 .polling_strategy(PollingStrategy::offset(0))
                 .batch_length(self.config.messages_per_batch.get())

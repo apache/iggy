@@ -26,9 +26,9 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Registry};
 
-const STREAM_ID: u32 = 1;
-const TOPIC_ID: u32 = 1;
-const PARTITION_ID: u32 = 1;
+const STREAM_ID: u32 = 0;
+const TOPIC_ID: u32 = 0;
+const PARTITION_ID: u32 = 0;
 const BATCHES_LIMIT: u32 = 5;
 
 #[tokio::main]

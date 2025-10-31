@@ -89,7 +89,7 @@ impl ConsumerClient for LowLevelConsumerClient {
         if polled.messages.is_empty() {
             return Ok(None);
         }
-        let message_count = u32::try_from(polled.messages.len()).unwrap();
+        let messages_count = polled.messages.len() as u64;
         let latency = if self.config.origin_timestamp_latency_calculation {
             let now = IggyTimestamp::now().as_micros();
             Duration::from_micros(now - polled.messages[0].header.origin_timestamp)
@@ -100,10 +100,13 @@ impl ConsumerClient for LowLevelConsumerClient {
         let user_bytes = batch_user_size_bytes(&polled);
         let total_bytes = batch_total_size_bytes(&polled);
 
-        self.offset += polled.messages.len() as u64;
+        self.offset += messages_count;
+        if self.polling_strategy.kind == PollingKind::Offset {
+            self.polling_strategy.value += messages_count;
+        }
 
         Ok(Some(BatchMetrics {
-            messages: message_count,
+            messages: messages_count.try_into().unwrap(),
             user_data_bytes: user_bytes,
             total_bytes,
             latency,
@@ -113,15 +116,15 @@ impl ConsumerClient for LowLevelConsumerClient {
 
 impl BenchmarkInit for LowLevelConsumerClient {
     async fn setup(&mut self) -> Result<(), IggyError> {
-        let topic_id = 1u32;
-        let default_partition_id = 1u32;
+        let topic_id_str = "topic-1";
+        let default_partition_id = 0u32;
 
         let client = self.client_factory.create_client().await;
         let client = IggyClient::create(client, None, None);
         login_root(&client).await;
 
-        let stream_id = self.config.stream_id.try_into().unwrap();
-        let topic_id = topic_id.try_into().unwrap();
+        let stream_id: Identifier = self.config.stream_id.as_str().try_into().unwrap();
+        let topic_id = topic_id_str.try_into().unwrap();
         let partition_id = if self.config.consumer_group_id.is_some() {
             None
         } else {

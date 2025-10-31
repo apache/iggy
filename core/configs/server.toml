@@ -53,7 +53,7 @@ archiver_enabled = false
 cleaner_enabled = false
 
 # Interval for running the message archiver and cleaner.
-interval = "1 m"
+interval = "35s"
 
 [data_maintenance.state]
 # Enables or disables the archiver process for state log.
@@ -270,6 +270,20 @@ cert_file = "core/certs/iggy_cert.pem"
 
 # Path to the QUIC TLS key file.
 key_file = "core/certs/iggy_key.pem"
+
+# Configuration for the QUIC socket
+[quic.socket]
+# Whether to override the OS-default socket parameters
+override_defaults = false
+
+# SO_RCVBUF: maximum size of the receive buffer, can be clamped by the OS
+recv_buffer_size = "64 KB"
+
+# SO_SNDBUF: maximum size of the send buffer, can be clamped by the OS
+send_buffer_size = "64 KB"
+
+# SO_KEEPALIVE: whether to regularly send a keepalive packet maintaining the connection
+keepalive = false
 
 # Message cleaner configuration.
 [message_cleaner]
@@ -577,3 +591,23 @@ address = "127.0.0.1:8090"
 id = 2
 name = "iggy-node-2"
 address = "127.0.0.1:8091"
+
+# Sharding configuration
+[system.sharding]
+# CPU allocation - controls the number of shards and their CPU affinity.
+# Possible values:
+# - "all": Use all available CPU cores (default)
+# - numeric value (e.g. 4): Use 4 shards (4 threads pinned to cores 0, 1, 2, 3)
+# - range (e.g. "5..8"): Use 3 shards with affinity to cores 5, 6, 7
+cpu_allocation = "all"
+
+[websocket]
+
+enabled = true
+address = "0.0.0.0:8092"
+
+[websocket.tls]
+enabled = false
+self_signed = true
+cert_file = "core/certs/iggy_cert.pem"
+key_file = "core/certs/iggy_key.pem"

@@ -55,7 +55,6 @@ class TopicsHttpClient implements TopicsClient {
 
     @Override
     public TopicDetails createTopic(StreamId streamId,
-                                    Optional<Long> topicId,
                                     Long partitionsCount,
                                     CompressionAlgorithm compressionAlgorithm,
                                     BigInteger messageExpiry,
@@ -63,8 +62,7 @@ class TopicsHttpClient implements TopicsClient {
                                     Optional<Short> replicationFactor,
                                     String name) {
         var request = httpClient.preparePostRequest(STREAMS + "/" + streamId + TOPICS,
-                new CreateTopic(topicId,
-                        partitionsCount,
+                new CreateTopic(partitionsCount,
                         compressionAlgorithm,
                         messageExpiry,
                         maxTopicSize,
@@ -94,7 +92,6 @@ class TopicsHttpClient implements TopicsClient {
     }
 
     record CreateTopic(
-            Optional<Long> topicId,
             Long partitionsCount,
             CompressionAlgorithm compressionAlgorithm,
             BigInteger messageExpiry,

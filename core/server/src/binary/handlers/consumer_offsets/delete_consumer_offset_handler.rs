@@ -20,12 +20,13 @@ use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHa
 use crate::binary::handlers::consumer_offsets::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::sender::SenderKind;
+use crate::shard::IggyShard;
 use crate::streaming::session::Session;
-use crate::streaming::systems::system::SharedSystem;
 use anyhow::Result;
 use err_trail::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::delete_consumer_offset::DeleteConsumerOffset;
+use std::rc::Rc;
 use tracing::debug;
 
 impl ServerCommandHandler for DeleteConsumerOffset {
@@ -38,11 +39,10 @@ impl ServerCommandHandler for DeleteConsumerOffset {
         sender: &mut SenderKind,
         _length: u32,
         session: &Session,
-        system: &SharedSystem,
+        shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
-        let system = system.read().await;
-        system
+        shard
             .delete_consumer_offset(
                 session,
                 self.consumer,

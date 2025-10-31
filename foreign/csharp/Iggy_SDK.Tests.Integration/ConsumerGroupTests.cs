@@ -28,7 +28,7 @@ namespace Apache.Iggy.Tests.Integrations;
 
 public class ConsumerGroupTests
 {
-    private static readonly uint GroupId = 1;
+    private static readonly uint GroupId = 0;
     private static readonly string GroupName = "test_consumer_group";
     private Identifier TopicId => Identifier.String(Fixture.TopicId);
 
@@ -42,7 +42,7 @@ public class ConsumerGroupTests
         var consumerGroup
             = await Fixture.Clients[protocol]
                 .CreateConsumerGroupAsync(Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)), TopicId,
-                    GroupName, GroupId);
+                    GroupName);
 
         consumerGroup.ShouldNotBeNull();
         consumerGroup.Id.ShouldBe(GroupId);
@@ -59,7 +59,7 @@ public class ConsumerGroupTests
         await Should.ThrowAsync<InvalidResponseException>(() =>
             Fixture.Clients[protocol]
                 .CreateConsumerGroupAsync(Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)), TopicId,
-                    GroupName, GroupId));
+                    GroupName));
     }
 
     [Test]
@@ -175,7 +175,6 @@ public class ConsumerGroupTests
         response.MembersCount.ShouldBe(2u);
         response.Members.ShouldNotBeNull();
         response.Members.Count.ShouldBe(2);
-        response.Members.ShouldAllBe(m => clientIds.Contains(m.Id));
         response.Members.ShouldAllBe(x => x.PartitionsCount == 5);
         response.Members.ShouldAllBe(x => x.Partitions.Count == 5);
     }

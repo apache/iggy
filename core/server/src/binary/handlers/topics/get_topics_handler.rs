@@ -17,16 +17,17 @@
  */
 
 use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
-use crate::binary::handlers::topics::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
 use crate::binary::sender::SenderKind;
+use crate::shard::IggyShard;
+use crate::slab::traits_ext::{EntityComponentSystem, IntoComponents};
 use crate::streaming::session::Session;
-use crate::streaming::systems::system::SharedSystem;
+use crate::streaming::streams;
 use anyhow::Result;
-use err_trail::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::get_topics::GetTopics;
+use std::rc::Rc;
 use tracing::debug;
 
 impl ServerCommandHandler for GetTopics {
@@ -39,19 +40,25 @@ impl ServerCommandHandler for GetTopics {
         sender: &mut SenderKind,
         _length: u32,
         session: &Session,
-        system: &SharedSystem,
+        shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
-        let system = system.read().await;
-        let topics = system
-            .find_topics(session, &self.stream_id)
-            .with_error(|error| {
-                format!(
-                    "{COMPONENT} (error: {error}) - failed to find topics, stream_id: {}, session: {session}",
-                    self.stream_id
-                )
-            })?;
-        let response = mapper::map_topics(&topics);
+        shard.ensure_authenticated(session)?;
+        shard.ensure_stream_exists(&self.stream_id)?;
+        let numeric_stream_id = shard
+            .streams
+            .with_stream_by_id(&self.stream_id, streams::helpers::get_stream_id());
+        shard
+            .permissioner
+            .borrow()
+            .get_topics(session.get_user_id(), numeric_stream_id)?;
+
+        let response = shard.streams.with_topics(&self.stream_id, |topics| {
+            topics.with_components(|topics| {
+                let (roots, _, stats) = topics.into_components();
+                mapper::map_topics(&roots, &stats)
+            })
+        });
         sender.send_ok_response(&response).await?;
         Ok(())
     }

@@ -19,13 +19,21 @@
 use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::{handlers::partitions::COMPONENT, sender::SenderKind};
+
+use crate::shard::IggyShard;
+use crate::shard::namespace::IggyNamespace;
+use crate::shard::transmission::frame::ShardResponse;
+use crate::shard::transmission::message::{
+    ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult,
+};
 use crate::state::command::EntryCommand;
+use crate::streaming;
 use crate::streaming::session::Session;
-use crate::streaming::systems::system::SharedSystem;
 use anyhow::Result;
 use err_trail::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::delete_segments::DeleteSegments;
+use std::rc::Rc;
 use tracing::{debug, instrument};
 
 impl ServerCommandHandler for DeleteSegments {
@@ -39,31 +47,70 @@ impl ServerCommandHandler for DeleteSegments {
         sender: &mut SenderKind,
         _length: u32,
         session: &Session,
-        system: &SharedSystem,
+        shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
+
         let stream_id = self.stream_id.clone();
         let topic_id = self.topic_id.clone();
-        let partition_id = self.partition_id;
+        let partition_id = self.partition_id as usize;
+        let segments_count = self.segments_count;
 
-        let mut system = system.write().await;
-        system
-            .delete_segments(
-                session,
-                &self.stream_id,
-                &self.topic_id,
-                self.partition_id,
-                self.segments_count,
-            )
-            .await
-            .with_error(|error| {
-                format!(
-                    "{COMPONENT} (error: {error}) - failed to delete segments for topic with ID: {topic_id} in stream with ID: {stream_id}, session: {session}",
-                )
-            })?;
+        // Ensure authentication and topic exists
+        shard.ensure_authenticated(session)?;
+        shard.ensure_topic_exists(&stream_id, &topic_id)?;
+        shard.ensure_partition_exists(&stream_id, &topic_id, partition_id)?;
 
-        let system = system.downgrade();
-        system
+        // Get numeric IDs for namespace
+        let numeric_stream_id = shard
+            .streams
+            .with_stream_by_id(&stream_id, streaming::streams::helpers::get_stream_id());
+
+        let numeric_topic_id = shard.streams.with_topic_by_id(
+            &stream_id,
+            &topic_id,
+            streaming::topics::helpers::get_topic_id(),
+        );
+
+        // Route request to the correct shard
+        let namespace = IggyNamespace::new(numeric_stream_id, numeric_topic_id, partition_id);
+        let payload = ShardRequestPayload::DeleteSegments { segments_count };
+        let request = ShardRequest::new(stream_id.clone(), topic_id.clone(), partition_id, payload);
+        let message = ShardMessage::Request(request);
+
+        match shard
+            .send_request_to_shard_or_recoil(Some(&namespace), message)
+            .await?
+        {
+            ShardSendRequestResult::Recoil(message) => {
+                if let ShardMessage::Request(crate::shard::transmission::message::ShardRequest {
+                    stream_id,
+                    topic_id,
+                    partition_id,
+                    payload,
+                }) = message
+                    && let ShardRequestPayload::DeleteSegments { segments_count } = payload
+                {
+                    shard
+                        .delete_segments_base(&stream_id, &topic_id, partition_id, segments_count)
+                        .await
+                        .with_error(|error| {
+                            format!(
+                                "{COMPONENT} (error: {error}) - failed to delete segments for topic with ID: {topic_id} in stream with ID: {stream_id}, session: {session}",
+                            )
+                        })?;
+                } else {
+                    return Err(IggyError::InvalidCommand);
+                }
+            }
+            ShardSendRequestResult::Response(response) => {
+                if !matches!(response, ShardResponse::DeleteSegments) {
+                    return Err(IggyError::InvalidCommand);
+                }
+            }
+        }
+
+        shard
             .state
             .apply(
                 session.get_user_id(),
@@ -75,6 +122,7 @@ impl ServerCommandHandler for DeleteSegments {
                     "{COMPONENT} (error: {error}) - failed to apply 'delete segments' command for partition with ID: {partition_id} in topic with ID: {topic_id} in stream with ID: {stream_id}, session: {session}",
                 )
             })?;
+
         sender.send_empty_ok_response().await?;
         Ok(())
     }

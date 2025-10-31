@@ -17,11 +17,14 @@
  */
 
 use crate::binary::sender::Sender;
+use crate::streaming::utils::PooledBuffer;
 use crate::tcp::COMPONENT;
 use crate::{server_error::ServerError, tcp::sender};
+use compio::buf::IoBufMut;
+use compio::io::AsyncWrite;
+use compio::net::TcpStream;
 use err_trail::ErrContext;
 use iggy_common::IggyError;
-use tokio::{io::AsyncWriteExt, net::TcpStream};
 
 #[derive(Debug)]
 pub struct TcpSender {
@@ -29,7 +32,7 @@ pub struct TcpSender {
 }
 
 impl Sender for TcpSender {
-    async fn read(&mut self, buffer: &mut [u8]) -> Result<usize, IggyError> {
+    async fn read<B: IoBufMut>(&mut self, buffer: B) -> (Result<(), IggyError>, B) {
         sender::read(&mut self.stream, buffer).await
     }
 
@@ -58,7 +61,7 @@ impl Sender for TcpSender {
     async fn send_ok_response_vectored(
         &mut self,
         length: &[u8],
-        slices: Vec<std::io::IoSlice<'_>>,
+        slices: Vec<PooledBuffer>,
     ) -> Result<(), IggyError> {
         sender::send_ok_response_vectored(&mut self.stream, length, slices).await
     }

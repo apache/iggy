@@ -33,8 +33,8 @@ namespace Apache.Iggy.Publishers;
 /// </summary>
 public class IggyPublisherBuilder
 {
-    protected EventHandler<PublisherErrorEventArgs>? _onBackgroundError;
-    protected EventHandler<MessageBatchFailedEventArgs>? _onMessageBatchFailed;
+    protected EventHandler<PublisherErrorEventArgs>? OnBackgroundError;
+    protected EventHandler<MessageBatchFailedEventArgs>? OnMessageBatchFailed;
 
     /// <summary>
     ///     Gets or sets the publisher configuration.
@@ -195,9 +195,9 @@ public class IggyPublisherBuilder
     /// </summary>
     /// <param name="handler">The event handler to invoke when background errors occur.</param>
     /// <returns>The builder instance for method chaining.</returns>
-    public IggyPublisherBuilder OnBackgroundError(EventHandler<PublisherErrorEventArgs> handler)
+    public IggyPublisherBuilder SubscribeOnBackgroundError(EventHandler<PublisherErrorEventArgs> handler)
     {
-        _onBackgroundError = handler;
+        OnBackgroundError = handler;
         return this;
     }
 
@@ -207,9 +207,9 @@ public class IggyPublisherBuilder
     /// </summary>
     /// <param name="handler">The event handler to invoke when message batches fail to send.</param>
     /// <returns>The builder instance for method chaining.</returns>
-    public IggyPublisherBuilder OnMessageBatchFailed(EventHandler<MessageBatchFailedEventArgs> handler)
+    public IggyPublisherBuilder SubscribeOnMessageBatchFailed(EventHandler<MessageBatchFailedEventArgs> handler)
     {
-        _onMessageBatchFailed = handler;
+        OnMessageBatchFailed = handler;
         return this;
     }
 
@@ -295,14 +295,14 @@ public class IggyPublisherBuilder
             Config.LoggerFactory?.CreateLogger<IggyPublisher>() ??
             NullLoggerFactory.Instance.CreateLogger<IggyPublisher>());
 
-        if (_onBackgroundError != null)
+        if (OnBackgroundError != null)
         {
-            publisher.OnBackgroundError += _onBackgroundError;
+            publisher.OnBackgroundError += OnBackgroundError;
         }
 
-        if (_onMessageBatchFailed != null)
+        if (OnMessageBatchFailed != null)
         {
-            publisher.OnMessageBatchFailed += _onMessageBatchFailed;
+            publisher.OnMessageBatchFailed += OnMessageBatchFailed;
         }
 
         return publisher;

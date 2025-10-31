@@ -17,16 +17,17 @@
  */
 
 use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
-use crate::binary::handlers::consumer_groups::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
 use crate::binary::sender::SenderKind;
+use crate::shard::IggyShard;
+use crate::slab::traits_ext::{EntityComponentSystem, IntoComponents};
 use crate::streaming::session::Session;
-use crate::streaming::systems::system::SharedSystem;
+use crate::streaming::{streams, topics};
 use anyhow::Result;
-use err_trail::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::get_consumer_groups::GetConsumerGroups;
+use std::rc::Rc;
 use tracing::debug;
 
 impl ServerCommandHandler for GetConsumerGroups {
@@ -39,19 +40,34 @@ impl ServerCommandHandler for GetConsumerGroups {
         sender: &mut SenderKind,
         _length: u32,
         session: &Session,
-        system: &SharedSystem,
+        shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
-        let system = system.read().await;
-        let consumer_groups = system
-            .get_consumer_groups(session, &self.stream_id, &self.topic_id)
-            .with_error(|error| {
-                format!(
-                    "{COMPONENT} (error: {error}) - failed on getting consumer groups for stream_id: {}, topic_id: {}, session: {}",
-                    self.stream_id, self.topic_id, session
-                )
-            })?;
-        let consumer_groups = mapper::map_consumer_groups(&consumer_groups).await;
+        shard.ensure_authenticated(session)?;
+        shard.ensure_topic_exists(&self.stream_id, &self.topic_id)?;
+        let numeric_topic_id = shard.streams.with_topic_by_id(
+            &self.stream_id,
+            &self.topic_id,
+            topics::helpers::get_topic_id(),
+        );
+        let numeric_stream_id = shard
+            .streams
+            .with_stream_by_id(&self.stream_id, streams::helpers::get_stream_id());
+        shard.permissioner.borrow().get_consumer_groups(
+            session.get_user_id(),
+            numeric_stream_id,
+            numeric_topic_id,
+        )?;
+
+        let consumer_groups =
+            shard
+                .streams
+                .with_consumer_groups(&self.stream_id, &self.topic_id, |cgs| {
+                    cgs.with_components(|cgs| {
+                        let (roots, members) = cgs.into_components();
+                        mapper::map_consumer_groups(roots, members)
+                    })
+                });
         sender.send_ok_response(&consumer_groups).await?;
         Ok(())
     }

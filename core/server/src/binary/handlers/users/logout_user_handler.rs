@@ -16,15 +16,19 @@
  * under the License.
  */
 
+use std::rc::Rc;
+
 use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::{handlers::users::COMPONENT, sender::SenderKind};
+
+use crate::shard::IggyShard;
 use crate::streaming::session::Session;
-use crate::streaming::systems::system::SharedSystem;
 use anyhow::Result;
 use err_trail::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::logout_user::LogoutUser;
+use tracing::info;
 use tracing::{debug, instrument};
 
 impl ServerCommandHandler for LogoutUser {
@@ -38,13 +42,14 @@ impl ServerCommandHandler for LogoutUser {
         sender: &mut SenderKind,
         _length: u32,
         session: &Session,
-        system: &SharedSystem,
+        shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
-        let system = system.read().await;
-        system.logout_user(session).await.with_error(|error| {
+        info!("Logging out user with ID: {}...", session.get_user_id());
+        shard.logout_user(session).with_error(|error| {
             format!("{COMPONENT} (error: {error}) - failed to logout user, session: {session}")
         })?;
+        info!("Logged out user with ID: {}.", session.get_user_id());
         session.clear_user_id();
         sender.send_empty_ok_response().await?;
         Ok(())

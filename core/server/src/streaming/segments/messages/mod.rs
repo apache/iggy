@@ -18,42 +18,29 @@
 
 mod messages_reader;
 mod messages_writer;
-mod persister_task;
 
 use super::IggyMessagesBatchSet;
-use err_trail::ErrContext;
+use compio::{fs::File, io::AsyncWriteAtExt};
 use iggy_common::IggyError;
-use std::io::IoSlice;
-use tokio::{fs::File, io::AsyncWriteExt};
 
 pub use messages_reader::MessagesReader;
 pub use messages_writer::MessagesWriter;
-pub use persister_task::PersisterTask;
 
 /// Vectored write a batches of messages to file
 async fn write_batch(
-    file: &mut File,
-    file_path: &str,
-    batches: IggyMessagesBatchSet,
+    file: &File,
+    position: u64,
+    mut batches: IggyMessagesBatchSet,
 ) -> Result<usize, IggyError> {
-    let mut slices: Vec<IoSlice> = batches.iter().map(|b| IoSlice::new(b)).collect();
-
-    let slices = &mut slices.as_mut_slice();
-    let mut total_written = 0;
-
-    while !slices.is_empty() {
-        let bytes_written = file
-            .write_vectored(slices)
-            .await
-            .with_error(|error| {
-                format!("Failed to write messages to file: {file_path}, error: {error}",)
-            })
-            .map_err(|_| IggyError::CannotWriteToFile)?;
-
-        total_written += bytes_written;
-
-        IoSlice::advance_slices(slices, bytes_written);
-    }
-
+    let total_written = batches.iter().map(|b| b.size() as usize).sum();
+    let batches = batches
+        .iter_mut()
+        .map(|b| b.take_messages())
+        .collect::<Vec<_>>();
+    let (result, _) = (&*file)
+        .write_vectored_all_at(batches, position)
+        .await
+        .into();
+    result.map_err(|_| IggyError::CannotWriteToFile)?;
     Ok(total_written)
 }

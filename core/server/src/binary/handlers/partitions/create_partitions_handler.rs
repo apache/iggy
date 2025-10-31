@@ -19,13 +19,18 @@
 use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::{handlers::partitions::COMPONENT, sender::SenderKind};
+
+use crate::shard::IggyShard;
+use crate::shard::transmission::event::ShardEvent;
+use crate::slab::traits_ext::EntityMarker;
 use crate::state::command::EntryCommand;
 use crate::streaming::session::Session;
-use crate::streaming::systems::system::SharedSystem;
+use crate::streaming::{streams, topics};
 use anyhow::Result;
 use err_trail::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::create_partitions::CreatePartitions;
+use std::rc::Rc;
 use tracing::{debug, instrument};
 
 impl ServerCommandHandler for CreatePartitions {
@@ -39,31 +44,44 @@ impl ServerCommandHandler for CreatePartitions {
         sender: &mut SenderKind,
         _length: u32,
         session: &Session,
-        system: &SharedSystem,
+        shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
 
-        let mut system = system.write().await;
-        system
+        // Acquire partition lock to serialize filesystem operations
+        let _partition_guard = shard.fs_locks.partition_lock.lock().await;
+
+        let partitions = shard
             .create_partitions(
                 session,
                 &self.stream_id,
                 &self.topic_id,
                 self.partitions_count,
             )
-            .await
-            .with_error(|error| {
-                format!(
-                    "{COMPONENT} (error: {error}) - failed to create partitions for stream_id: {}, topic_id: {}, session: {}",
-                    self.stream_id, self.topic_id, session
-                )
-            })?;
+            .await?;
+        let partition_ids = partitions.iter().map(|p| p.id()).collect::<Vec<_>>();
+        let event = ShardEvent::CreatedPartitions {
+            stream_id: self.stream_id.clone(),
+            topic_id: self.topic_id.clone(),
+            partitions,
+        };
+        shard.broadcast_event_to_all_shards(event).await?;
 
-        let system = system.downgrade();
-        let stream_id = self.stream_id.clone();
-        let topic_id = self.topic_id.clone();
+        shard.streams.with_topic_by_id_mut(
+            &self.stream_id,
+            &self.topic_id,
+            topics::helpers::rebalance_consumer_group(&partition_ids),
+        );
 
-        system
+        let stream_id = shard
+            .streams
+            .with_stream_by_id(&self.stream_id, streams::helpers::get_stream_id());
+        let topic_id = shard.streams.with_topic_by_id(
+            &self.stream_id,
+            &self.topic_id,
+            topics::helpers::get_topic_id(),
+        );
+        shard
         .state
         .apply(
             session.get_user_id(),

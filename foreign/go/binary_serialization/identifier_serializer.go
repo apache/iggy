@@ -44,3 +44,11 @@ func SerializeIdentifiers(identifiers ...iggcon.Identifier) []byte {
 
 	return bytes
 }
+
+func SerializePartitioning(partitioning iggcon.Partitioning) []byte {
+	bytes := make([]byte, 2+partitioning.Length)
+	bytes[0] = byte(partitioning.Kind)
+	bytes[1] = byte(partitioning.Length)
+	copy(bytes[2:], partitioning.Value)
+	return bytes
+}

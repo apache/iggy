@@ -20,15 +20,17 @@ use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHa
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
 use crate::binary::{handlers::personal_access_tokens::COMPONENT, sender::SenderKind};
+
+use crate::shard::IggyShard;
+use crate::shard::transmission::event::ShardEvent;
 use crate::state::command::EntryCommand;
 use crate::state::models::CreatePersonalAccessTokenWithHash;
-use crate::streaming::personal_access_tokens::personal_access_token::PersonalAccessToken;
 use crate::streaming::session::Session;
-use crate::streaming::systems::system::SharedSystem;
 use anyhow::Result;
 use err_trail::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::create_personal_access_token::CreatePersonalAccessToken;
+use std::rc::Rc;
 use tracing::{debug, instrument};
 
 impl ServerCommandHandler for CreatePersonalAccessToken {
@@ -42,14 +44,12 @@ impl ServerCommandHandler for CreatePersonalAccessToken {
         sender: &mut SenderKind,
         _length: u32,
         session: &Session,
-        system: &SharedSystem,
+        shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
 
-        let system = system.write().await;
-        let token = system
+        let (personal_access_token, token) = shard
                 .create_personal_access_token(session, &self.name, self.expiry)
-                .await
                 .with_error(|error| {
                     format!(
                         "{COMPONENT} (error: {error}) - failed to create personal access token with name: {}, session: {session}",
@@ -57,10 +57,13 @@ impl ServerCommandHandler for CreatePersonalAccessToken {
                     )
                 })?;
         let bytes = mapper::map_raw_pat(&token);
-        let token_hash = PersonalAccessToken::hash_token(&token);
+        let hash = personal_access_token.token.to_string();
+        let event = ShardEvent::CreatedPersonalAccessToken {
+            personal_access_token: personal_access_token.clone(),
+        };
+        shard.broadcast_event_to_all_shards(event).await?;
 
-        let system = system.downgrade();
-        system
+        shard
             .state
             .apply(
                 session.get_user_id(),
@@ -69,7 +72,7 @@ impl ServerCommandHandler for CreatePersonalAccessToken {
                         name: self.name.to_owned(),
                         expiry: self.expiry,
                     },
-                    hash: token_hash,
+                    hash,
                 }),
             )
             .await

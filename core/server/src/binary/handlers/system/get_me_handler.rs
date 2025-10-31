@@ -21,12 +21,12 @@ use crate::binary::handlers::system::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
 use crate::binary::sender::SenderKind;
+use crate::shard::IggyShard;
 use crate::streaming::session::Session;
-use crate::streaming::systems::system::SharedSystem;
 use err_trail::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::get_me::GetMe;
-use iggy_common::locking::IggySharedMutFn;
+use std::rc::Rc;
 
 impl ServerCommandHandler for GetMe {
     fn code(&self) -> u32 {
@@ -38,12 +38,10 @@ impl ServerCommandHandler for GetMe {
         sender: &mut SenderKind,
         _length: u32,
         session: &Session,
-        system: &SharedSystem,
+        shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
-        let system = system.read().await;
-        let Some(client) = system
+        let Some(client) = shard
             .get_client(session, session.client_id)
-            .await
             .with_error(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to get current client for session: {session}")
             })?
@@ -51,7 +49,6 @@ impl ServerCommandHandler for GetMe {
             return Err(IggyError::ClientNotFound(session.client_id));
         };
 
-        let client = client.read().await;
         let bytes = mapper::map_client(&client);
 
         sender.send_ok_response(&bytes).await?;

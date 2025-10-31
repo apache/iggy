@@ -17,11 +17,12 @@
  */
 
 use crate::state::command::EntryCommand;
-use crate::state::{COMPONENT, State, StateEntry};
+use crate::state::{COMPONENT, StateEntry};
 use crate::streaming::persistence::persister::PersisterKind;
 use crate::streaming::utils::file;
 use crate::versioning::SemanticVersion;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+use compio::io::AsyncReadExt;
 use err_trail::ErrContext;
 use iggy_common::BytesSerializable;
 use iggy_common::EncryptorKind;
@@ -32,10 +33,9 @@ use std::fmt::Debug;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use tokio::io::{AsyncReadExt, BufReader};
 use tracing::{debug, error, info};
 
-pub const BUF_READER_CAPACITY_BYTES: usize = 512 * 1000;
+pub const BUF_CURSOR_CAPACITY_BYTES: usize = 512 * 1000;
 const FILE_STATE_PARSE_ERROR: &str = "STATE - failed to parse file state";
 
 #[derive(Debug)]
@@ -47,7 +47,7 @@ pub struct FileState {
     version: u32,
     path: String,
     persister: Arc<PersisterKind>,
-    encryptor: Option<Arc<EncryptorKind>>,
+    encryptor: Option<EncryptorKind>,
 }
 
 impl FileState {
@@ -55,7 +55,7 @@ impl FileState {
         path: &str,
         version: &SemanticVersion,
         persister: Arc<PersisterKind>,
-        encryptor: Option<Arc<EncryptorKind>>,
+        encryptor: Option<EncryptorKind>,
     ) -> Self {
         Self {
             current_index: AtomicU64::new(0),
@@ -80,22 +80,9 @@ impl FileState {
     pub fn term(&self) -> u64 {
         self.term.load(Ordering::SeqCst)
     }
-}
 
-impl State for FileState {
-    async fn init(&self) -> Result<Vec<StateEntry>, IggyError> {
-        if !Path::new(&self.path).exists() {
-            info!("State file does not exist, creating a new one");
-            self.persister
-                .overwrite(&self.path, &[])
-                .await
-                .with_error(|error| {
-                    format!(
-                        "{COMPONENT} (error: {error}) - failed to overwrite state file, path: {}",
-                        self.path
-                    )
-                })?;
-        }
+    pub async fn init(&self) -> Result<Vec<StateEntry>, IggyError> {
+        assert!(Path::new(&self.path).exists());
 
         let entries = self
             .load_entries()
@@ -113,7 +100,7 @@ impl State for FileState {
         Ok(entries)
     }
 
-    async fn load_entries(&self) -> Result<Vec<StateEntry>, IggyError> {
+    pub async fn load_entries(&self) -> Result<Vec<StateEntry>, IggyError> {
         if !Path::new(&self.path).exists() {
             return Err(IggyError::StateFileNotFound);
         }
@@ -138,6 +125,7 @@ impl State for FileState {
             })
             .map_err(|_| IggyError::CannotReadFileMetadata)?
             .len();
+
         if file_size == 0 {
             info!("State file is empty");
             return Ok(Vec::new());
@@ -149,17 +137,18 @@ impl State for FileState {
         );
         let mut entries = Vec::new();
         let mut total_size: u64 = 0;
-        let mut reader = BufReader::with_capacity(BUF_READER_CAPACITY_BYTES, file);
+        let mut cursor = std::io::Cursor::new(file);
         let mut current_index = 0;
         let mut entries_count = 0;
         loop {
-            let index = reader
+            let index = cursor
                 .read_u64_le()
                 .await
                 .with_error(|error| format!("{FILE_STATE_PARSE_ERROR} index. {error}"))
                 .map_err(|_| IggyError::InvalidNumberEncoding)?;
             total_size += 8;
-            if entries_count > 0 && index != current_index + 1 {
+            // Greater than one, because one of the entries after a fresh reboot is the default root user.
+            if entries_count > 1 && index != current_index + 1 {
                 error!(
                     "State file is corrupted, expected index: {}, got: {}",
                     current_index + 1,
@@ -170,51 +159,51 @@ impl State for FileState {
 
             current_index = index;
             entries_count += 1;
-            let term = reader
+            let term = cursor
                 .read_u64_le()
                 .await
                 .with_error(|error| format!("{FILE_STATE_PARSE_ERROR} term. {error}"))
                 .map_err(|_| IggyError::InvalidNumberEncoding)?;
             total_size += 8;
-            let leader_id = reader
+            let leader_id = cursor
                 .read_u32_le()
                 .await
                 .with_error(|error| format!("{FILE_STATE_PARSE_ERROR} leader_id. {error}"))
                 .map_err(|_| IggyError::InvalidNumberEncoding)?;
             total_size += 4;
-            let version = reader
+            let version = cursor
                 .read_u32_le()
                 .await
                 .with_error(|error| format!("{FILE_STATE_PARSE_ERROR} version. {error}"))
                 .map_err(|_| IggyError::InvalidNumberEncoding)?;
             total_size += 4;
-            let flags = reader
+            let flags = cursor
                 .read_u64_le()
                 .await
                 .with_error(|error| format!("{FILE_STATE_PARSE_ERROR} flags. {error}"))
                 .map_err(|_| IggyError::InvalidNumberEncoding)?;
             total_size += 8;
             let timestamp = IggyTimestamp::from(
-                reader
+                cursor
                     .read_u64_le()
                     .await
                     .with_error(|error| format!("{FILE_STATE_PARSE_ERROR} timestamp. {error}"))
                     .map_err(|_| IggyError::InvalidNumberEncoding)?,
             );
             total_size += 8;
-            let user_id = reader
+            let user_id = cursor
                 .read_u32_le()
                 .await
                 .with_error(|error| format!("{FILE_STATE_PARSE_ERROR} user_id. {error}"))
                 .map_err(|_| IggyError::InvalidNumberEncoding)?;
             total_size += 4;
-            let checksum = reader
+            let checksum = cursor
                 .read_u32_le()
                 .await
                 .with_error(|error| format!("{FILE_STATE_PARSE_ERROR} checksum. {error}"))
                 .map_err(|_| IggyError::InvalidNumberEncoding)?;
             total_size += 4;
-            let context_length = reader
+            let context_length = cursor
                 .read_u32_le()
                 .await
                 .with_error(|error| {
@@ -225,19 +214,20 @@ impl State for FileState {
             total_size += 4;
             let mut context = BytesMut::with_capacity(context_length);
             context.put_bytes(0, context_length);
-            reader
-                .read_exact(&mut context)
-                .await
+            let (result, context) = cursor.read_exact(context).await.into();
+
+            result
+                .with_error(|error| format!("{FILE_STATE_PARSE_ERROR} code. {error}"))
                 .map_err(|_| IggyError::CannotReadFile)?;
             let context = context.freeze();
             total_size += context_length as u64;
-            let code = reader
+            let code = cursor
                 .read_u32_le()
                 .await
                 .with_error(|error| format!("{FILE_STATE_PARSE_ERROR} code. {error}"))
                 .map_err(|_| IggyError::InvalidNumberEncoding)?;
             total_size += 4;
-            let mut command_length = reader
+            let mut command_length = cursor
                 .read_u32_le()
                 .await
                 .with_error(|error| format!("{FILE_STATE_PARSE_ERROR} command_length. {error}"))
@@ -246,9 +236,9 @@ impl State for FileState {
             total_size += 4;
             let mut command = BytesMut::with_capacity(command_length);
             command.put_bytes(0, command_length);
-            reader
-                .read_exact(&mut command)
-                .await
+            let (result, command) = cursor.read_exact(command).await.into();
+            result
+                .with_error(|error| format!("{FILE_STATE_PARSE_ERROR} command. {error}"))
                 .map_err(|_| IggyError::CannotReadFile)?;
             total_size += command_length as u64;
             let command_payload;
@@ -302,7 +292,7 @@ impl State for FileState {
         Ok(entries)
     }
 
-    async fn apply(&self, user_id: u32, command: &EntryCommand) -> Result<(), IggyError> {
+    pub async fn apply(&self, user_id: u32, command: &EntryCommand) -> Result<(), IggyError> {
         debug!("Applying state entry with command: {command}, user ID: {user_id}");
         let timestamp = IggyTimestamp::now();
         let index = if self.entries_count.load(Ordering::SeqCst) == 0 {
@@ -361,15 +351,16 @@ impl State for FileState {
             command,
         );
         let bytes = entry.to_bytes();
+        let len = bytes.len();
         self.entries_count.fetch_add(1, Ordering::SeqCst);
         self.persister
-            .append(&self.path, &bytes)
+            .append(&self.path, bytes)
             .await
             .with_error(|error| {
                 format!(
                     "{COMPONENT} (error: {error}) - failed to append state entry data to file, path: {}, data size: {}",
                     self.path,
-                    bytes.len()
+                    len
                 )
             })?;
         debug!("Applied state entry: {entry}");

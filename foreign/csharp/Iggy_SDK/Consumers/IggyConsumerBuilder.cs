@@ -31,7 +31,7 @@ namespace Apache.Iggy.Consumers;
 /// </summary>
 public class IggyConsumerBuilder
 {
-    protected EventHandler<ConsumerErrorEventArgs>? _onPollingError;
+    protected EventHandler<ConsumerErrorEventArgs>? OnPollingError;
     internal IggyConsumerConfig Config { get; set; } = new();
     internal IIggyClient? IggyClient { get; set; }
 
@@ -211,9 +211,9 @@ public class IggyConsumerBuilder
     /// </summary>
     /// <param name="handler">The event handler to handle polling errors.</param>
     /// <returns>The current instance of <see cref="IggyConsumerBuilder" /> to allow method chaining.</returns>
-    public IggyConsumerBuilder OnPollingError(EventHandler<ConsumerErrorEventArgs> handler)
+    public IggyConsumerBuilder SubscribeOnPollingError(EventHandler<ConsumerErrorEventArgs> handler)
     {
-        _onPollingError = handler;
+        OnPollingError = handler;
         return this;
     }
 
@@ -242,9 +242,9 @@ public class IggyConsumerBuilder
             Config.LoggerFactory?.CreateLogger<IggyConsumer>() ??
             NullLoggerFactory.Instance.CreateLogger<IggyConsumer>());
 
-        if (_onPollingError != null)
+        if (OnPollingError != null)
         {
-            consumer.OnPollingError += _onPollingError;
+            consumer.OnPollingError += OnPollingError;
         }
 
         return consumer;

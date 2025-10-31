@@ -20,6 +20,7 @@
 package org.apache.iggy.client.blocking.tcp;
 
 import io.netty.buffer.Unpooled;
+import org.apache.iggy.client.async.tcp.AsyncBytesSerializer;
 import org.apache.iggy.client.blocking.MessagesClient;
 import org.apache.iggy.consumergroup.Consumer;
 import org.apache.iggy.identifier.StreamId;
@@ -45,7 +46,7 @@ class MessagesTcpClient implements MessagesClient {
         var payload = toBytes(consumer);
         payload.writeBytes(toBytes(streamId));
         payload.writeBytes(toBytes(topicId));
-        payload.writeIntLE(partitionId.orElse(0L).intValue());
+        payload.writeBytes(toBytes(partitionId));
         payload.writeBytes(toBytes(strategy));
         payload.writeIntLE(count.intValue());
         payload.writeByte(autoCommit ? 1 : 0);

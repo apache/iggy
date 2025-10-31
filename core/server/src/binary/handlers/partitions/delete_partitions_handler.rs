@@ -19,13 +19,16 @@
 use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::{handlers::partitions::COMPONENT, sender::SenderKind};
+
+use crate::shard::IggyShard;
+use crate::shard::transmission::event::ShardEvent;
 use crate::state::command::EntryCommand;
 use crate::streaming::session::Session;
-use crate::streaming::systems::system::SharedSystem;
 use anyhow::Result;
 use err_trail::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::delete_partitions::DeletePartitions;
+use std::rc::Rc;
 use tracing::{debug, instrument};
 
 impl ServerCommandHandler for DeletePartitions {
@@ -39,29 +42,43 @@ impl ServerCommandHandler for DeletePartitions {
         sender: &mut SenderKind,
         _length: u32,
         session: &Session,
-        system: &SharedSystem,
+        shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
         let stream_id = self.stream_id.clone();
         let topic_id = self.topic_id.clone();
 
-        let mut system = system.write().await;
-        system
+        // Acquire partition lock to serialize filesystem operations
+        let _partition_guard = shard.fs_locks.partition_lock.lock().await;
+
+        let deleted_partition_ids = shard
             .delete_partitions(
                 session,
                 &self.stream_id,
                 &self.topic_id,
                 self.partitions_count,
             )
-            .await
-            .with_error(|error| {
-                format!(
-                    "{COMPONENT} (error: {error}) - failed to delete partitions for topic with ID: {topic_id} in stream with ID: {stream_id}, session: {session}",
-                )
-            })?;
+            .await?;
+        let event = ShardEvent::DeletedPartitions {
+            stream_id: self.stream_id.clone(),
+            topic_id: self.topic_id.clone(),
+            partitions_count: self.partitions_count,
+            partition_ids: deleted_partition_ids,
+        };
+        shard.broadcast_event_to_all_shards(event).await?;
 
-        let system = system.downgrade();
-        system
+        let remaining_partition_ids = shard.streams.with_topic_by_id(
+            &self.stream_id,
+            &self.topic_id,
+            crate::streaming::topics::helpers::get_partition_ids(),
+        );
+        shard.streams.with_topic_by_id_mut(
+            &self.stream_id,
+            &self.topic_id,
+            crate::streaming::topics::helpers::rebalance_consumer_group(&remaining_partition_ids),
+        );
+
+        shard
         .state
         .apply(
             session.get_user_id(),

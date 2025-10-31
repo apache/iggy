@@ -193,7 +193,7 @@ pub async fn should_be_successful() {
                 vec![String::from("3")],
                 Some(Permissions {
                     global: GlobalPermissions::default(),
-                    streams: Some(AHashMap::from([(3u32, StreamPermissions::default())])),
+                    streams: Some(AHashMap::from([(3usize, StreamPermissions::default())])),
                 }),
             ),
         ))
@@ -209,7 +209,7 @@ pub async fn should_be_successful() {
                 Some(Permissions {
                     global: GlobalPermissions::default(),
                     streams: Some(AHashMap::from([(
-                        1u32,
+                        1usize,
                         StreamPermissions {
                             topics: Some(AHashMap::from([(
                                 1,
@@ -249,7 +249,7 @@ pub async fn should_be_successful() {
                         send_messages: false,
                     },
                     streams: Some(AHashMap::from([(
-                        2u32,
+                        2usize,
                         StreamPermissions {
                             topics: Some(AHashMap::from([(
                                 1,

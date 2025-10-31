@@ -20,11 +20,13 @@ use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHa
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
 use crate::binary::sender::SenderKind;
+use crate::shard::IggyShard;
 use crate::streaming::session::Session;
-use crate::streaming::systems::system::SharedSystem;
+use crate::streaming::streams;
 use anyhow::Result;
 use iggy_common::IggyError;
 use iggy_common::get_topic::GetTopic;
+use std::rc::Rc;
 use tracing::debug;
 
 impl ServerCommandHandler for GetTopic {
@@ -37,22 +39,46 @@ impl ServerCommandHandler for GetTopic {
         sender: &mut SenderKind,
         _length: u32,
         session: &Session,
-        system: &SharedSystem,
+        shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
-        let system = system.read().await;
-        let Ok(topic) = system.try_find_topic(session, &self.stream_id, &self.topic_id) else {
+        shard.ensure_authenticated(session)?;
+        let exists = shard
+            .ensure_topic_exists(&self.stream_id, &self.topic_id)
+            .is_ok();
+        if !exists {
             sender.send_empty_ok_response().await?;
             return Ok(());
-        };
+        }
 
-        let Some(topic) = topic else {
+        let numeric_stream_id = shard
+            .streams
+            .with_stream_by_id(&self.stream_id, streams::helpers::get_stream_id());
+        let has_permission = shard
+            .permissioner
+            .borrow()
+            .get_topic(
+                session.get_user_id(),
+                numeric_stream_id,
+                self.topic_id
+                    .get_u32_value()
+                    .unwrap_or(0)
+                    .try_into()
+                    .unwrap(),
+            )
+            .is_ok();
+        if !has_permission {
             sender.send_empty_ok_response().await?;
             return Ok(());
-        };
+        }
 
-        let topic = mapper::map_topic(topic).await;
-        sender.send_ok_response(&topic).await?;
+        let response =
+            shard
+                .streams
+                .with_topic_by_id(&self.stream_id, &self.topic_id, |(root, _, stats)| {
+                    mapper::map_topic(&root, &stats)
+                });
+        sender.send_ok_response(&response).await?;
         Ok(())
     }
 }

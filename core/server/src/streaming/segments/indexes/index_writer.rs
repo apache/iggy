@@ -16,40 +16,41 @@
  * under the License.
  */
 
+use compio::fs::File;
+use compio::fs::OpenOptions;
+use compio::io::AsyncWriteAtExt;
 use err_trail::ErrContext;
 use iggy_common::INDEX_SIZE;
 use iggy_common::IggyError;
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
-};
-use tokio::{
-    fs::{File, OpenOptions},
-    io::AsyncWriteExt,
-};
+use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::trace;
+
+use crate::streaming::utils::PooledBuffer;
 
 /// A dedicated struct for writing to the index file.
 #[derive(Debug)]
 pub struct IndexWriter {
     file_path: String,
     file: File,
-    index_size_bytes: Arc<AtomicU64>,
+    index_size_bytes: Rc<AtomicU64>,
     fsync: bool,
 }
+
+// Safety: We are guaranteeing that IndexWriter will never be used from multiple threads
+unsafe impl Send for IndexWriter {}
 
 impl IndexWriter {
     /// Opens the index file in write mode.
     pub async fn new(
         file_path: &str,
-        index_size_bytes: Arc<AtomicU64>,
+        index_size_bytes: Rc<AtomicU64>,
         fsync: bool,
         file_exists: bool,
     ) -> Result<Self, IggyError> {
         let file = OpenOptions::new()
-            .write(true)
-            .append(true)
             .create(true)
+            .write(true)
             .open(file_path)
             .await
             .with_error(|error| format!("Failed to open index file: {file_path}. {error}"))
@@ -69,13 +70,11 @@ impl IndexWriter {
                 .map_err(|_| IggyError::CannotReadFileMetadata)?
                 .len();
 
-            index_size_bytes.store(actual_index_size, Ordering::Release);
+            index_size_bytes.store(actual_index_size, Ordering::Relaxed);
         }
 
-        trace!(
-            "Opened index file for writing: {file_path}, size: {}",
-            index_size_bytes.load(Ordering::Acquire)
-        );
+        let size = index_size_bytes.load(Ordering::Relaxed);
+        trace!("Opened index file for writing: {file_path}, size: {}", size);
 
         Ok(Self {
             file_path: file_path.to_string(),
@@ -86,16 +85,20 @@ impl IndexWriter {
     }
 
     /// Appends multiple index buffer to the index file in a single operation.
-    pub async fn save_indexes(&mut self, indexes: &[u8]) -> Result<(), IggyError> {
+    pub async fn save_indexes(&self, indexes: PooledBuffer) -> Result<(), IggyError> {
         if indexes.is_empty() {
             return Ok(());
         }
 
         let count = indexes.len() / INDEX_SIZE;
+        let len = indexes.len();
 
-        self.file
-            .write_all(indexes)
+        let position = self.index_size_bytes.load(Ordering::Relaxed);
+        let file = &self.file;
+        (&*file)
+            .write_all_at(indexes, position)
             .await
+            .0
             .with_error(|error| {
                 format!(
                     "Failed to write {} indexes to file: {}. {error}",
@@ -105,7 +108,7 @@ impl IndexWriter {
             .map_err(|_| IggyError::CannotSaveIndexToSegment)?;
 
         self.index_size_bytes
-            .fetch_add(indexes.len() as u64, Ordering::Release);
+            .fetch_add(len as u64, Ordering::Release);
 
         if self.fsync {
             let _ = self.fsync().await;

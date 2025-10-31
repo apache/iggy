@@ -19,11 +19,11 @@
 extern crate sysinfo;
 
 use super::server::{
-    ArchiverConfig, DataMaintenanceConfig, MessageSaverConfig, MessagesMaintenanceConfig,
-    StateMaintenanceConfig, TelemetryConfig,
+    DataMaintenanceConfig, MessageSaverConfig, MessagesMaintenanceConfig, StateMaintenanceConfig,
+    TelemetryConfig,
 };
+use super::sharding::{CpuAllocation, ShardingConfig};
 use super::system::{CompressionConfig, MemoryPoolConfig, PartitionConfig};
-use crate::archiver::ArchiverKindType;
 use crate::configs::COMPONENT;
 use crate::configs::server::{PersonalAccessTokenConfig, ServerConfig};
 use crate::configs::system::SegmentConfig;
@@ -34,6 +34,7 @@ use iggy_common::CompressionAlgorithm;
 use iggy_common::IggyExpiry;
 use iggy_common::MaxTopicSize;
 use iggy_common::Validatable;
+use std::thread::available_parallelism;
 use tracing::error;
 
 impl Validatable<ConfigError> for ServerConfig {
@@ -57,6 +58,9 @@ impl Validatable<ConfigError> for ServerConfig {
         })?;
         self.telemetry.validate().with_error(|error| {
             format!("{COMPONENT} (error: {error}) - failed to validate telemetry config")
+        })?;
+        self.system.sharding.validate().with_error(|error| {
+            format!("{COMPONENT} (error: {error}) - failed to validate sharding config")
         })?;
 
         let topic_size = match self.system.topic.max_size {
@@ -196,9 +200,6 @@ impl Validatable<ConfigError> for MessageSaverConfig {
 
 impl Validatable<ConfigError> for DataMaintenanceConfig {
     fn validate(&self) -> Result<(), ConfigError> {
-        self.archiver.validate().with_error(|error| {
-            format!("{COMPONENT} (error: {error}) - failed to validate archiver config")
-        })?;
         self.messages.validate().with_error(|error| {
             format!("{COMPONENT} (error: {error}) - failed to validate messages maintenance config")
         })?;
@@ -206,57 +207,6 @@ impl Validatable<ConfigError> for DataMaintenanceConfig {
             format!("{COMPONENT} (error: {error}) - failed to validate state maintenance config")
         })?;
         Ok(())
-    }
-}
-
-impl Validatable<ConfigError> for ArchiverConfig {
-    fn validate(&self) -> Result<(), ConfigError> {
-        if !self.enabled {
-            return Ok(());
-        }
-
-        match self.kind {
-            ArchiverKindType::Disk => {
-                if self.disk.is_none() {
-                    return Err(ConfigError::InvalidConfiguration);
-                }
-
-                let disk = self.disk.as_ref().unwrap();
-                if disk.path.is_empty() {
-                    return Err(ConfigError::InvalidConfiguration);
-                }
-                Ok(())
-            }
-            ArchiverKindType::S3 => {
-                if self.s3.is_none() {
-                    return Err(ConfigError::InvalidConfiguration);
-                }
-
-                let s3 = self.s3.as_ref().unwrap();
-                if s3.key_id.is_empty() {
-                    return Err(ConfigError::InvalidConfiguration);
-                }
-
-                if s3.key_secret.is_empty() {
-                    return Err(ConfigError::InvalidConfiguration);
-                }
-
-                if s3.endpoint.is_none() && s3.region.is_none() {
-                    return Err(ConfigError::InvalidConfiguration);
-                }
-
-                if s3.endpoint.as_deref().unwrap_or_default().is_empty()
-                    && s3.region.as_deref().unwrap_or_default().is_empty()
-                {
-                    return Err(ConfigError::InvalidConfiguration);
-                }
-
-                if s3.bucket.is_empty() {
-                    return Err(ConfigError::InvalidConfiguration);
-                }
-                Ok(())
-            }
-        }
     }
 }
 
@@ -344,5 +294,45 @@ impl Validatable<ConfigError> for MemoryPoolConfig {
         }
 
         Ok(())
+    }
+}
+
+impl Validatable<ConfigError> for ShardingConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        let available_cpus = available_parallelism()
+            .expect("Failed to get number of CPU cores")
+            .get();
+
+        match &self.cpu_allocation {
+            CpuAllocation::All => Ok(()),
+            CpuAllocation::Count(count) => {
+                if *count == 0 {
+                    eprintln!("Invalid sharding configuration: cpu_allocation count cannot be 0");
+                    return Err(ConfigError::InvalidConfiguration);
+                }
+                if *count > available_cpus {
+                    eprintln!(
+                        "Invalid sharding configuration: cpu_allocation count {count} exceeds available CPU cores {available_cpus}"
+                    );
+                    return Err(ConfigError::InvalidConfiguration);
+                }
+                Ok(())
+            }
+            CpuAllocation::Range(start, end) => {
+                if start >= end {
+                    eprintln!(
+                        "Invalid sharding configuration: cpu_allocation range {start}..{end} is invalid (start must be less than end)"
+                    );
+                    return Err(ConfigError::InvalidConfiguration);
+                }
+                if *end > available_cpus {
+                    eprintln!(
+                        "Invalid sharding configuration: cpu_allocation range {start}..{end} exceeds available CPU cores (max: {available_cpus})"
+                    );
+                    return Err(ConfigError::InvalidConfiguration);
+                }
+                Ok(())
+            }
+        }
     }
 }

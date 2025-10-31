@@ -216,7 +216,7 @@ public partial class IggyConsumer : IAsyncDisposable
             {
                 LogCreatingConsumerGroup(_consumerGroupName, _config.StreamId, _config.TopicId);
 
-                var createdGroup = await TryCreateConsumerGroupAsync(_consumerGroupName, _config.Consumer.Id, ct);
+                var createdGroup = await TryCreateConsumerGroupAsync(_consumerGroupName, ct);
 
                 if (createdGroup)
                 {
@@ -249,13 +249,12 @@ public partial class IggyConsumer : IAsyncDisposable
     ///     Attempts to create a consumer group, handling the case where it already exists
     /// </summary>
     /// <returns>True if the group was created or already exists, false on error</returns>
-    private async Task<bool> TryCreateConsumerGroupAsync(string groupName, Identifier groupId, CancellationToken ct)
+    private async Task<bool> TryCreateConsumerGroupAsync(string groupName, CancellationToken ct)
     {
         try
         {
-            uint? id = groupId.Kind == IdKind.Numeric ? groupId.GetUInt32() : null;
             await _client.CreateConsumerGroupAsync(_config.StreamId, _config.TopicId,
-                groupName, id, ct);
+                groupName, ct);
         }
         catch (IggyInvalidStatusCodeException ex)
         {

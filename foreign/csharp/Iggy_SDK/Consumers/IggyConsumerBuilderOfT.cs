@@ -108,9 +108,9 @@ public class IggyConsumerBuilder<T> : IggyConsumerBuilder
             Config.LoggerFactory?.CreateLogger<IggyConsumer<T>>() ??
             NullLoggerFactory.Instance.CreateLogger<IggyConsumer<T>>());
 
-        if (_onPollingError != null)
+        if (OnPollingError != null)
         {
-            consumer.OnPollingError += _onPollingError;
+            consumer.OnPollingError += OnPollingError;
         }
 
         return consumer;

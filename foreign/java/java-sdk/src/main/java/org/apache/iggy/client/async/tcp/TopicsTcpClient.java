@@ -87,7 +87,6 @@ public class TopicsTcpClient implements TopicsClient {
     @Override
     public CompletableFuture<TopicDetails> createTopicAsync(
             StreamId streamId,
-            Optional<Long> topicId,
             Long partitionsCount,
             CompressionAlgorithm compressionAlgorithm,
             BigInteger messageExpiry,
@@ -96,10 +95,9 @@ public class TopicsTcpClient implements TopicsClient {
             String name) {
 
         var streamIdBytes = toBytes(streamId);
-        var payload = Unpooled.buffer(27 + streamIdBytes.readableBytes() + name.length());
+        var payload = Unpooled.buffer(23 + streamIdBytes.readableBytes() + name.length());
 
         payload.writeBytes(streamIdBytes);
-        payload.writeIntLE(topicId.orElse(0L).intValue());
         payload.writeIntLE(partitionsCount.intValue());
         payload.writeByte(compressionAlgorithm.asCode());
         payload.writeBytes(toBytesAsU64(messageExpiry));

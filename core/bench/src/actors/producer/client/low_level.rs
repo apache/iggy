@@ -49,7 +49,7 @@ impl LowLevelProducerClient {
             client: None,
             stream_id: Identifier::default(),
             topic_id: Identifier::default(),
-            partitioning: Partitioning::partition_id(1),
+            partitioning: Partitioning::partition_id(0),
         }
     }
 }
@@ -87,7 +87,7 @@ impl ProducerClient for LowLevelProducerClient {
 
 impl BenchmarkInit for LowLevelProducerClient {
     async fn setup(&mut self) -> Result<(), IggyError> {
-        let default_partition_id = 1;
+        let default_partition_id = 0u32;
         let partitions = self.config.partitions;
 
         let client = self.client_factory.create_client().await;
@@ -102,8 +102,8 @@ impl BenchmarkInit for LowLevelProducerClient {
 
         self.client = Some(client);
         self.partitioning = partitioning;
-        self.stream_id = self.config.stream_id.try_into()?;
-        self.topic_id = Identifier::numeric(1)?;
+        self.stream_id = self.config.stream_id.as_str().try_into()?;
+        self.topic_id = Identifier::from_str_value("topic-1")?;
         Ok(())
     }
 }

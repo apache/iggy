@@ -16,7 +16,6 @@
  * under the License.
  */
 
-use iggy_common::TransportProtocol;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -24,7 +23,7 @@ pub struct ClusterConfig {
     pub enabled: bool,
     pub name: String,
     pub id: u32,
-    pub transport: TransportProtocol,
+    pub transport: String,
     pub node: NodeConfig,
     pub nodes: Vec<ClusterNodeConfig>,
 }

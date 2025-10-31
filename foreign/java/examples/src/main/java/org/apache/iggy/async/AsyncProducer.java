@@ -23,17 +23,13 @@ import org.apache.iggy.client.async.tcp.AsyncIggyTcpClient;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
 import org.apache.iggy.message.Message;
-import org.apache.iggy.message.MessageId;
 import org.apache.iggy.message.Partitioning;
-import org.apache.iggy.message.UuidMessageId;
 import org.apache.iggy.topic.CompressionAlgorithm;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
-import java.util.ArrayList;
-import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -101,7 +97,7 @@ public class AsyncProducer {
             .thenCompose(stream -> {
                 if (stream.isEmpty()) {
                     logger.info("Creating stream: {}", STREAM_NAME);
-                    return client.streams().createStreamAsync(Optional.empty(), STREAM_NAME)
+                    return client.streams().createStreamAsync(STREAM_NAME)
                         .thenAccept(created -> logger.info("Stream created: {}", created.name()));
                 } else {
                     logger.info("Stream exists: {}", STREAM_NAME);
@@ -120,8 +116,7 @@ public class AsyncProducer {
                     logger.info("Creating topic: {}", TOPIC_NAME);
                     return client.topics().createTopicAsync(
                         StreamId.of(STREAM_NAME),
-                        Optional.empty(),
-                        1L,  // 1 partition
+                            1L,  // 1 partition
                         CompressionAlgorithm.None,
                         BigInteger.ZERO,
                         BigInteger.ZERO,

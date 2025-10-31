@@ -42,6 +42,7 @@ bytes = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
 comfy-table = { workspace = true }
+compio-ws = { workspace = true }
 crc32fast = { workspace = true }
 derive_more = { workspace = true }
 fast-async-mutex = { version = "0.6.7", optional = true }

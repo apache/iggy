@@ -16,45 +16,24 @@
  * under the License.
  */
 
-use crate::IGGY_ROOT_PASSWORD_ENV;
-use crate::archiver::ArchiverKindType;
 use crate::configs::COMPONENT;
 use crate::configs::cluster::ClusterConfig;
+use crate::configs::config_provider::ConfigProviderKind;
 use crate::configs::http::HttpConfig;
 use crate::configs::quic::QuicConfig;
 use crate::configs::system::SystemConfig;
 use crate::configs::tcp::TcpConfig;
+use crate::configs::websocket::WebSocketConfig;
 use crate::server_error::ConfigError;
 use derive_more::Display;
 use err_trail::ErrContext;
-use figment::Metadata;
-use figment::Profile;
-use figment::Provider;
-use figment::providers::Format;
-use figment::providers::Toml;
-use figment::value::Dict;
-use iggy_common::ConfigProvider;
-use iggy_common::CustomEnvProvider;
-use iggy_common::FileConfigProvider;
 use iggy_common::IggyDuration;
 use iggy_common::Validatable;
 use serde::{Deserialize, Serialize};
 use serde_with::DisplayFromStr;
 use serde_with::serde_as;
-use std::env;
 use std::str::FromStr;
 use std::sync::Arc;
-
-const DEFAULT_CONFIG_PROVIDER: &str = "file";
-const DEFAULT_CONFIG_PATH: &str = "core/configs/server.toml";
-const SECRET_KEYS: [&str; 6] = [
-    IGGY_ROOT_PASSWORD_ENV,
-    "IGGY_DATA_MAINTENANCE_ARCHIVER_S3_KEY_SECRET",
-    "IGGY_HTTP_JWT_ENCODING_SECRET",
-    "IGGY_HTTP_JWT_DECODING_SECRET",
-    "IGGY_TCP_TLS_PASSWORD",
-    "IGGY_SYSTEM_ENCRYPTION_KEY",
-];
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ServerConfig {
@@ -66,6 +45,7 @@ pub struct ServerConfig {
     pub quic: QuicConfig,
     pub tcp: TcpConfig,
     pub http: HttpConfig,
+    pub websocket: WebSocketConfig,
     pub telemetry: TelemetryConfig,
     pub cluster: ClusterConfig,
 }
@@ -73,17 +53,8 @@ pub struct ServerConfig {
 #[serde_as]
 #[derive(Debug, Default, Deserialize, Serialize, Clone)]
 pub struct DataMaintenanceConfig {
-    pub archiver: ArchiverConfig,
     pub messages: MessagesMaintenanceConfig,
     pub state: StateMaintenanceConfig,
-}
-
-#[derive(Debug, Deserialize, Serialize, Clone)]
-pub struct ArchiverConfig {
-    pub enabled: bool,
-    pub kind: ArchiverKindType,
-    pub disk: Option<DiskArchiverConfig>,
-    pub s3: Option<S3ArchiverConfig>,
 }
 
 #[serde_as]
@@ -190,38 +161,8 @@ impl FromStr for TelemetryTransport {
     }
 }
 
-pub fn resolve(config_provider_type: &str) -> Result<ConfigProviderKind, ConfigError> {
-    match config_provider_type {
-        DEFAULT_CONFIG_PROVIDER => {
-            let path =
-                env::var("IGGY_CONFIG_PATH").unwrap_or_else(|_| DEFAULT_CONFIG_PATH.to_string());
-            Ok(ConfigProviderKind::File(
-                ServerConfig::file_config_provider(path),
-            ))
-        }
-        _ => Err(ConfigError::InvalidConfigurationProvider {
-            provider_type: config_provider_type.to_string(),
-        }),
-    }
-}
-
-pub enum ConfigProviderKind {
-    File(FileConfigProvider<ServerEnvProvider>),
-}
-
-impl ConfigProviderKind {
-    pub async fn load_config(self) -> Result<ServerConfig, ConfigError> {
-        match self {
-            Self::File(p) => p
-                .load_config()
-                .await
-                .map_err(|_| ConfigError::CannotLoadConfiguration),
-        }
-    }
-}
-
 impl ServerConfig {
-    pub async fn load(config_provider: ConfigProviderKind) -> Result<Self, ConfigError> {
+    pub async fn load(config_provider: &ConfigProviderKind) -> Result<ServerConfig, ConfigError> {
         let server_config = config_provider.load_config().await.with_error(|error| {
             format!("{COMPONENT} (error: {error}) - failed to load config provider config")
         })?;
@@ -229,40 +170,5 @@ impl ServerConfig {
             format!("{COMPONENT} (error: {error}) - failed to validate server config")
         })?;
         Ok(server_config)
-    }
-
-    pub fn file_config_provider(path: String) -> FileConfigProvider<ServerEnvProvider> {
-        let default_config = Toml::string(include_str!("../../../configs/server.toml"));
-        FileConfigProvider::new(
-            path,
-            ServerEnvProvider::default(),
-            true,
-            Some(default_config),
-        )
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct ServerEnvProvider {
-    provider: CustomEnvProvider<ServerConfig>,
-}
-
-impl Default for ServerEnvProvider {
-    fn default() -> Self {
-        Self {
-            provider: CustomEnvProvider::new("IGGY_", &SECRET_KEYS),
-        }
-    }
-}
-
-impl Provider for ServerEnvProvider {
-    fn metadata(&self) -> Metadata {
-        Metadata::named("iggy-server-config")
-    }
-
-    fn data(&self) -> Result<figment::value::Map<Profile, Dict>, figment::Error> {
-        self.provider.deserialize().map_err(|_| {
-            figment::Error::from("Cannot deserialize environment variables for server config")
-        })
     }
 }

@@ -20,13 +20,14 @@ use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHa
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
 use crate::binary::{handlers::users::COMPONENT, sender::SenderKind};
+use crate::shard::IggyShard;
 use crate::streaming::session::Session;
-use crate::streaming::systems::system::SharedSystem;
 use anyhow::Result;
 use err_trail::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::login_user::LoginUser;
-use tracing::{debug, instrument};
+use std::rc::Rc;
+use tracing::{debug, info, instrument, warn};
 
 impl ServerCommandHandler for LoginUser {
     fn code(&self) -> u32 {
@@ -39,19 +40,28 @@ impl ServerCommandHandler for LoginUser {
         sender: &mut SenderKind,
         _length: u32,
         session: &Session,
-        system: &SharedSystem,
+        shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
+        if shard.is_shutting_down() {
+            warn!("Rejecting login request during shutdown");
+            return Err(IggyError::Disconnected);
+        }
+
         debug!("session: {session}, command: {self}");
-        let system = system.read().await;
-        let user = system
-            .login_user(&self.username, &self.password, Some(session))
-            .await
+        let LoginUser {
+            username, password, ..
+        } = self;
+        info!("Logging in user: {} ...", &username);
+        let user = shard
+            .login_user(&username, &password, Some(session))
             .with_error(|error| {
                 format!(
                     "{COMPONENT} (error: {error}) - failed to login user with name: {}, session: {session}",
-                    self.username
+                    username
                 )
             })?;
+        info!("Logged in user: {} with ID: {}.", username, user.id);
+
         let identity_info = mapper::map_identity_info(user.id);
         sender.send_ok_response(&identity_info).await?;
         Ok(())

@@ -17,16 +17,15 @@
  */
 
 use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
-use crate::binary::handlers::messages::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::sender::SenderKind;
+use crate::shard::IggyShard;
+use crate::shard::system::messages::PollingArgs;
 use crate::streaming::session::Session;
-use crate::streaming::systems::messages::PollingArgs;
-use crate::streaming::systems::system::SharedSystem;
+use crate::streaming::utils::PooledBuffer;
 use anyhow::Result;
-use err_trail::ErrContext;
 use iggy_common::{IggyError, PollMessages};
-use std::io::IoSlice;
+use std::rc::Rc;
 use tracing::{debug, trace};
 
 #[derive(Debug)]
@@ -54,26 +53,33 @@ impl ServerCommandHandler for PollMessages {
         sender: &mut SenderKind,
         _length: u32,
         session: &Session,
-        system: &SharedSystem,
+        shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
+        let PollMessages {
+            consumer,
+            partition_id,
+            strategy,
+            count,
+            auto_commit,
+            stream_id,
+            topic_id,
+        } = self;
+        let args = PollingArgs::new(strategy, count, auto_commit);
 
-        let system = system.read().await;
-        let (metadata, messages) = system
+        let user_id = session.get_user_id();
+        let client_id = session.client_id;
+        let (metadata, mut batch) = shard
             .poll_messages(
-                session,
-                &self.consumer,
-                &self.stream_id,
-                &self.topic_id,
-                self.partition_id,
-                PollingArgs::new(self.strategy, self.count, self.auto_commit),
+                client_id,
+                user_id,
+                stream_id,
+                topic_id,
+                consumer,
+                partition_id,
+                args,
             )
-            .await
-            .with_error(|error| format!(
-                "{COMPONENT} (error: {error}) - failed to poll messages for consumer: {}, stream_id: {}, topic_id: {}, partition_id: {:?}, session: {session}.",
-                self.consumer, self.stream_id, self.topic_id, self.partition_id
-            ))?;
-        drop(system);
+            .await?;
 
         // Collect all chunks first into a Vec to extend their lifetimes.
         // This ensures the Bytes (in reality Arc<[u8]>) references from each IggyMessagesBatch stay alive
@@ -81,28 +87,30 @@ impl ServerCommandHandler for PollMessages {
         // long enough" errors while optimizing transmission by using larger chunks.
 
         // 4 bytes for partition_id + 8 bytes for current_offset + 4 bytes for messages_count + size of all batches.
-        let response_length = 4 + 8 + 4 + messages.size();
+        let response_length = 4 + 8 + 4 + batch.size();
         let response_length_bytes = response_length.to_le_bytes();
 
-        let partition_id = metadata.partition_id.to_le_bytes();
-        let current_offset = metadata.current_offset.to_le_bytes();
-        let count = messages.count().to_le_bytes();
+        let mut bufs = Vec::with_capacity(batch.containers_count() + 5);
+        let mut partition_id_buf = PooledBuffer::with_capacity(4);
+        let mut current_offset_buf = PooledBuffer::with_capacity(8);
+        let mut count_buf = PooledBuffer::with_capacity(4);
+        partition_id_buf.put_u32_le(metadata.partition_id);
+        current_offset_buf.put_u64_le(metadata.current_offset);
+        count_buf.put_u32_le(batch.count());
 
-        let mut io_slices = Vec::with_capacity(messages.containers_count() + 3);
-        io_slices.push(IoSlice::new(&partition_id));
-        io_slices.push(IoSlice::new(&current_offset));
-        io_slices.push(IoSlice::new(&count));
+        bufs.push(partition_id_buf);
+        bufs.push(current_offset_buf);
+        bufs.push(count_buf);
 
-        io_slices.extend(messages.iter().map(|m| IoSlice::new(m)));
-
+        batch.iter_mut().for_each(|m| bufs.push(m.take_messages()));
         trace!(
             "Sending {} messages to client ({} bytes) to client",
-            messages.count(),
+            batch.count(),
             response_length
         );
 
         sender
-            .send_ok_response_vectored(&response_length_bytes, io_slices)
+            .send_ok_response_vectored(&response_length_bytes, bufs)
             .await?;
         Ok(())
     }

@@ -16,16 +16,21 @@
  * under the License.
  */
 
+use std::rc::Rc;
+
 use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::{handlers::users::COMPONENT, sender::SenderKind};
+
+use crate::shard::IggyShard;
+use crate::shard::transmission::event::ShardEvent;
 use crate::state::command::EntryCommand;
 use crate::streaming::session::Session;
-use crate::streaming::systems::system::SharedSystem;
 use anyhow::Result;
 use err_trail::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::update_permissions::UpdatePermissions;
+use tracing::info;
 use tracing::{debug, instrument};
 
 impl ServerCommandHandler for UpdatePermissions {
@@ -39,20 +44,23 @@ impl ServerCommandHandler for UpdatePermissions {
         sender: &mut SenderKind,
         _length: u32,
         session: &Session,
-        system: &SharedSystem,
+        shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
 
-        let mut system = system.write().await;
-        system
+        shard
                 .update_permissions(session, &self.user_id, self.permissions.clone())
-                .await
                 .with_error(|error| format!("{COMPONENT} (error: {error}) - failed to update permissions for user_id: {}, session: {session}",
                     self.user_id
                 ))?;
+        info!("Updated permissions for user with ID: {}.", self.user_id);
+        let event = ShardEvent::UpdatedPermissions {
+            user_id: self.user_id.clone(),
+            permissions: self.permissions.clone(),
+        };
+        shard.broadcast_event_to_all_shards(event).await?;
 
-        let system = system.downgrade();
-        system
+        shard
             .state
             .apply(
                 session.get_user_id(),

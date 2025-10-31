@@ -18,6 +18,7 @@
 
 use super::memory_pool::{BytesMutExt, memory_pool};
 use bytes::{Buf, BufMut, BytesMut};
+use compio::buf::{IoBuf, IoBufMut, SetBufInit};
 use std::ops::{Deref, DerefMut};
 
 #[derive(Debug)]
@@ -41,11 +42,15 @@ impl PooledBuffer {
     ///
     /// * `capacity` - The capacity of the buffer
     pub fn with_capacity(capacity: usize) -> Self {
-        let buffer = memory_pool().acquire_buffer(capacity);
+        let (buffer, was_pool_allocated) = memory_pool().acquire_buffer(capacity);
         let original_capacity = buffer.capacity();
-        let original_bucket_idx = memory_pool().best_fit(original_capacity);
+        let original_bucket_idx = if was_pool_allocated {
+            memory_pool().best_fit(original_capacity)
+        } else {
+            None
+        };
         Self {
-            from_pool: true,
+            from_pool: was_pool_allocated,
             original_capacity,
             original_bucket_idx,
             inner: buffer,
@@ -185,7 +190,7 @@ impl Drop for PooledBuffer {
     fn drop(&mut self) {
         if self.from_pool {
             let buf = std::mem::take(&mut self.inner);
-            buf.return_to_pool(self.original_capacity);
+            buf.return_to_pool(self.original_capacity, true);
         }
     }
 }
@@ -213,5 +218,35 @@ impl Buf for PooledBuffer {
 
     fn chunks_vectored<'t>(&'t self, dst: &mut [std::io::IoSlice<'t>]) -> usize {
         self.inner.chunks_vectored(dst)
+    }
+}
+
+impl SetBufInit for PooledBuffer {
+    unsafe fn set_buf_init(&mut self, len: usize) {
+        if self.inner.len() <= len {
+            unsafe {
+                self.inner.set_len(len);
+            }
+        }
+    }
+}
+
+unsafe impl IoBufMut for PooledBuffer {
+    fn as_buf_mut_ptr(&mut self) -> *mut u8 {
+        self.inner.as_mut_ptr()
+    }
+}
+
+unsafe impl IoBuf for PooledBuffer {
+    fn as_buf_ptr(&self) -> *const u8 {
+        self.inner.as_buf_ptr()
+    }
+
+    fn buf_len(&self) -> usize {
+        self.inner.len()
+    }
+
+    fn buf_capacity(&self) -> usize {
+        self.inner.capacity()
     }
 }

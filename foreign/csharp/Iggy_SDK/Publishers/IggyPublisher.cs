@@ -207,11 +207,11 @@ public partial class IggyPublisher : IAsyncDisposable
 
         if (_config.StreamId.Kind is IdKind.String)
         {
-            await _client.CreateStreamAsync(_config.StreamId.GetString(), null, ct);
+            await _client.CreateStreamAsync(_config.StreamId.GetString(), ct);
         }
         else
         {
-            await _client.CreateStreamAsync(_config.StreamName, _config.StreamId.GetUInt32(), ct);
+            await _client.CreateStreamAsync(_config.StreamName, ct);
         }
 
         LogStreamCreated(_config.StreamId);
@@ -241,13 +241,13 @@ public partial class IggyPublisher : IAsyncDisposable
         if (_config.TopicId.Kind is IdKind.String)
         {
             await _client.CreateTopicAsync(_config.StreamId, _config.TopicId.GetString(),
-                _config.TopicPartitionsCount, _config.TopicCompressionAlgorithm, null,
-                _config.TopicReplicationFactor, _config.TopicMessageExpiry, _config.TopicMaxTopicSize, ct);
+                _config.TopicPartitionsCount, _config.TopicCompressionAlgorithm, _config.TopicReplicationFactor,
+                _config.TopicMessageExpiry, _config.TopicMaxTopicSize, ct);
         }
         else
         {
             await _client.CreateTopicAsync(_config.StreamId, _config.TopicName, _config.TopicPartitionsCount,
-                _config.TopicCompressionAlgorithm, _config.TopicId.GetUInt32(), _config.TopicReplicationFactor,
+                _config.TopicCompressionAlgorithm, _config.TopicReplicationFactor,
                 _config.TopicMessageExpiry, _config.TopicMaxTopicSize, ct);
         }
 

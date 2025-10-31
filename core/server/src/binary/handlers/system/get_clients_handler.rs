@@ -21,11 +21,12 @@ use crate::binary::handlers::system::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
 use crate::binary::sender::SenderKind;
+use crate::shard::IggyShard;
 use crate::streaming::session::Session;
-use crate::streaming::systems::system::SharedSystem;
 use err_trail::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::get_clients::GetClients;
+use std::rc::Rc;
 use tracing::debug;
 
 impl ServerCommandHandler for GetClients {
@@ -38,15 +39,14 @@ impl ServerCommandHandler for GetClients {
         sender: &mut SenderKind,
         _length: u32,
         session: &Session,
-        system: &SharedSystem,
+        shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
 
-        let system = system.read().await;
-        let clients = system.get_clients(session).await.with_error(|error| {
+        let clients = shard.get_clients(session).with_error(|error| {
             format!("{COMPONENT} (error: {error}) - failed to get clients, session: {session}")
         })?;
-        let clients = mapper::map_clients(&clients).await;
+        let clients = mapper::map_clients(clients).await;
         sender.send_ok_response(&clients).await?;
         Ok(())
     }

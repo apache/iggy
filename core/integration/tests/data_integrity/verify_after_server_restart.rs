@@ -28,10 +28,6 @@ use serial_test::parallel;
 use std::{collections::HashMap, str::FromStr};
 use test_case::test_matrix;
 
-/*
- * Helper functions for test matrix parameters
- */
-
 fn cache_open_segment() -> &'static str {
     "open_segment"
 }
@@ -46,7 +42,7 @@ fn cache_none() -> &'static str {
 
 // TODO(numminex) - Move the message generation method from benchmark run to a special method.
 #[test_matrix(
-    [cache_open_segment(), cache_all(), cache_none()]
+    [cache_all(), cache_open_segment(), cache_none()]
 )]
 #[tokio::test]
 #[parallel]
@@ -85,17 +81,6 @@ async fn should_fill_data_and_verify_after_restart(cache_setting: &'static str) 
         amount_of_data_to_process,
     );
 
-    let default_bench_stream_identifiers: [Identifier; 8] = [
-        Identifier::numeric(3000001).unwrap(),
-        Identifier::numeric(3000002).unwrap(),
-        Identifier::numeric(3000003).unwrap(),
-        Identifier::numeric(3000004).unwrap(),
-        Identifier::numeric(3000005).unwrap(),
-        Identifier::numeric(3000006).unwrap(),
-        Identifier::numeric(3000007).unwrap(),
-        Identifier::numeric(3000008).unwrap(),
-    ];
-
     // 4. Connect and login to newly started server
     let client = TcpClientFactory {
         server_addr,
@@ -103,12 +88,15 @@ async fn should_fill_data_and_verify_after_restart(cache_setting: &'static str) 
     }
     .create_client()
     .await;
+
     let client = IggyClient::create(client, None, None);
     login_root(&client).await;
-    let topic_id = Identifier::numeric(1).unwrap();
-    for stream_id in default_bench_stream_identifiers {
+
+    let topic_id = Identifier::numeric(0).unwrap();
+    for i in 0..7 {
+        let stream_id = Identifier::numeric(i).unwrap();
         client
-            .flush_unsaved_buffer(&stream_id, &topic_id, 1, false)
+            .flush_unsaved_buffer(&stream_id, &topic_id, 0, true)
             .await
             .unwrap();
     }
@@ -133,7 +121,50 @@ async fn should_fill_data_and_verify_after_restart(cache_setting: &'static str) 
     test_server.start();
     let server_addr = test_server.get_raw_tcp_addr().unwrap();
 
-    // 8. Run send bench again to add more data
+    // 8. Verify stats are preserved after restart (before adding more data)
+    let client_after_restart = IggyClient::create(
+        TcpClientFactory {
+            server_addr: server_addr.clone(),
+            ..Default::default()
+        }
+        .create_client()
+        .await,
+        None,
+        None,
+    );
+    login_root(&client_after_restart).await;
+
+    let stats_after_restart = client_after_restart.get_stats().await.unwrap();
+    assert_eq!(
+        expected_messages_count, stats_after_restart.messages_count,
+        "Messages count should be preserved after restart (before: {}, after: {})",
+        expected_messages_count, stats_after_restart.messages_count
+    );
+    assert_eq!(
+        expected_messages_size_bytes.as_bytes_usize(),
+        stats_after_restart.messages_size_bytes.as_bytes_usize(),
+        "Messages size bytes should be preserved after restart (before: {}, after: {})",
+        expected_messages_size_bytes.as_bytes_usize(),
+        stats_after_restart.messages_size_bytes.as_bytes_usize()
+    );
+    assert_eq!(
+        expected_streams_count, stats_after_restart.streams_count,
+        "Streams count should be preserved after restart"
+    );
+    assert_eq!(
+        expected_topics_count, stats_after_restart.topics_count,
+        "Topics count should be preserved after restart"
+    );
+    assert_eq!(
+        expected_partitions_count, stats_after_restart.partitions_count,
+        "Partitions count should be preserved after restart"
+    );
+    assert_eq!(
+        expected_segments_count, stats_after_restart.segments_count,
+        "Segments count should be preserved after restart"
+    );
+
+    // 9. Run send bench again to add more data
     run_bench_and_wait_for_finish(
         &server_addr,
         &TransportProtocol::Tcp,
@@ -141,15 +172,16 @@ async fn should_fill_data_and_verify_after_restart(cache_setting: &'static str) 
         amount_of_data_to_process,
     );
 
-    // 9. Run poll bench again to check if all data is still there
+    // 10. Run poll bench again to check if all data is still there
     run_bench_and_wait_for_finish(
         &server_addr,
         &TransportProtocol::Tcp,
         "pinned-consumer",
         IggyByteSize::from(amount_of_data_to_process.as_bytes_u64() * 2),
     );
+    drop(client_after_restart);
 
-    // 10. Connect and login to newly started server
+    // 11. Connect and login to newly started server
     let client = IggyClient::create(
         TcpClientFactory {
             server_addr: server_addr.clone(),
@@ -162,7 +194,17 @@ async fn should_fill_data_and_verify_after_restart(cache_setting: &'static str) 
     );
     login_root(&client).await;
 
-    // 11. Save stats from the second server (should have double the data)
+    // 12. Flush unsaved buffer
+    let topic_id = Identifier::numeric(0).unwrap();
+    for i in 0..7 {
+        let stream_id = Identifier::numeric(i).unwrap();
+        client
+            .flush_unsaved_buffer(&stream_id, &topic_id, 0, true)
+            .await
+            .unwrap();
+    }
+
+    // 13. Save stats from the second server (should have double the data)
     let stats = client.get_stats().await.unwrap();
     let actual_messages_size_bytes = stats.messages_size_bytes;
     let actual_streams_count = stats.streams_count;
@@ -173,7 +215,7 @@ async fn should_fill_data_and_verify_after_restart(cache_setting: &'static str) 
     let actual_clients_count = stats.clients_count;
     let actual_consumer_groups_count = stats.consumer_groups_count;
 
-    // 12. Compare stats (expecting double the messages/size after second bench run)
+    // 14. Compare stats (expecting double the messages/size after second bench run)
     assert_eq!(
         expected_messages_size_bytes.as_bytes_usize() * 2,
         actual_messages_size_bytes.as_bytes_usize(),
@@ -206,7 +248,7 @@ async fn should_fill_data_and_verify_after_restart(cache_setting: &'static str) 
         "Consumer groups count"
     );
 
-    // 13. Run poll bench to check if all data (10MB total) is still there
+    // 15. Run poll bench to check if all data (10MB total) is still there
     run_bench_and_wait_for_finish(
         &server_addr,
         &TransportProtocol::Tcp,
@@ -214,6 +256,6 @@ async fn should_fill_data_and_verify_after_restart(cache_setting: &'static str) 
         IggyByteSize::from(amount_of_data_to_process.as_bytes_u64() * 2),
     );
 
-    // 14. Manual cleanup
+    // 16. Manual cleanup
     std::fs::remove_dir_all(local_data_path).unwrap();
 }

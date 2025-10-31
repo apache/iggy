@@ -37,14 +37,16 @@ public interface TopicsClient {
 
     /**
      * Gets topic details by stream ID and topic ID.
+     *
      * @param streamId The stream identifier
-     * @param topicId The topic identifier
+     * @param topicId  The topic identifier
      * @return CompletableFuture with Optional TopicDetails
      */
     CompletableFuture<Optional<TopicDetails>> getTopicAsync(StreamId streamId, TopicId topicId);
 
     /**
      * Gets all topics in a stream.
+     *
      * @param streamId The stream identifier
      * @return CompletableFuture with list of Topics
      */
@@ -52,19 +54,18 @@ public interface TopicsClient {
 
     /**
      * Creates a new topic.
-     * @param streamId The stream identifier
-     * @param topicId Optional topic ID (auto-generated if empty)
-     * @param partitionsCount Number of partitions
+     *
+     * @param streamId             The stream identifier
+     * @param partitionsCount      Number of partitions
      * @param compressionAlgorithm Compression algorithm to use
-     * @param messageExpiry Message expiry time in microseconds
-     * @param maxTopicSize Maximum topic size in bytes
-     * @param replicationFactor Optional replication factor
-     * @param name Topic name
+     * @param messageExpiry        Message expiry time in microseconds
+     * @param maxTopicSize         Maximum topic size in bytes
+     * @param replicationFactor    Optional replication factor
+     * @param name                 Topic name
      * @return CompletableFuture with created TopicDetails
      */
     CompletableFuture<TopicDetails> createTopicAsync(
             StreamId streamId,
-            Optional<Long> topicId,
             Long partitionsCount,
             CompressionAlgorithm compressionAlgorithm,
             BigInteger messageExpiry,
@@ -74,13 +75,14 @@ public interface TopicsClient {
 
     /**
      * Updates an existing topic.
-     * @param streamId The stream identifier
-     * @param topicId The topic identifier
+     *
+     * @param streamId             The stream identifier
+     * @param topicId              The topic identifier
      * @param compressionAlgorithm Compression algorithm to use
-     * @param messageExpiry Message expiry time in microseconds
-     * @param maxTopicSize Maximum topic size in bytes
-     * @param replicationFactor Optional replication factor
-     * @param name Topic name
+     * @param messageExpiry        Message expiry time in microseconds
+     * @param maxTopicSize         Maximum topic size in bytes
+     * @param replicationFactor    Optional replication factor
+     * @param name                 Topic name
      * @return CompletableFuture that completes when update is done
      */
     CompletableFuture<Void> updateTopicAsync(
@@ -94,8 +96,9 @@ public interface TopicsClient {
 
     /**
      * Deletes a topic.
+     *
      * @param streamId The stream identifier
-     * @param topicId The topic identifier
+     * @param topicId  The topic identifier
      * @return CompletableFuture that completes when deletion is done
      */
     CompletableFuture<Void> deleteTopicAsync(StreamId streamId, TopicId topicId);

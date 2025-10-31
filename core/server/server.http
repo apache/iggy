@@ -18,7 +18,7 @@
 @url = http://localhost:3000
 @stream_id = 1
 @topic_id = 1
-@partition_id = 1
+@partition_id = 0
 @consumer_group_id = 1
 @consumer_id = 1
 @client_id = 1

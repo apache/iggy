@@ -19,7 +19,7 @@
 use crate::prelude::IggyClient;
 use async_trait::async_trait;
 use iggy_binary_protocol::UserClient;
-use iggy_common::locking::IggySharedMutFn;
+use iggy_common::locking::IggyRwLockFn;
 use iggy_common::{
     Identifier, IdentityInfo, IggyError, Permissions, UserInfo, UserInfoDetails, UserStatus,
 };

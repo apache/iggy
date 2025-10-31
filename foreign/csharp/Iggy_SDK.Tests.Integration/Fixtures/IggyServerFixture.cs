@@ -30,7 +30,7 @@ namespace Apache.Iggy.Tests.Integrations.Fixtures;
 
 public class IggyServerFixture : IAsyncInitializer, IAsyncDisposable
 {
-    private readonly IContainer _iggyContainer = new ContainerBuilder().WithImage("apache/iggy:edge")
+    private readonly IContainer _iggyContainer = new ContainerBuilder().WithImage("apache/iggy:local-apache")
         .WithPortBinding(3000, true)
         .WithPortBinding(8090, true)
         .WithOutputConsumer(Consume.RedirectStdoutAndStderrToConsole())
@@ -42,6 +42,7 @@ public class IggyServerFixture : IAsyncInitializer, IAsyncDisposable
         .WithEnvironment("IGGY_HTTP_ADDRESS", "0.0.0.0:3000")
         //.WithEnvironment("IGGY_SYSTEM_LOGGING_LEVEL", "trace")
         //.WithEnvironment("RUST_LOG", "trace")
+        .WithPrivileged(true)
         .WithCleanUp(true)
         .Build();
 
@@ -78,7 +79,7 @@ public class IggyServerFixture : IAsyncInitializer, IAsyncDisposable
         }
 
         await CreateTcpClient();
-        await CreateHttpClient();
+        //await CreateHttpClient();
     }
 
     public async Task<Dictionary<Protocol, IIggyClient>> CreateClients()

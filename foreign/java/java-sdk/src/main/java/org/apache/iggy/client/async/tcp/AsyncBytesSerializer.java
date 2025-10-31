@@ -31,6 +31,7 @@ import org.apache.iggy.message.PollingStrategy;
 
 import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
+import java.util.Optional;
 
 /**
  * Async version of BytesSerializer for the async package.
@@ -43,6 +44,7 @@ public final class AsyncBytesSerializer {
 
     /**
      * Serializes a Consumer to bytes.
+     *
      * @param consumer The consumer to serialize (can be null)
      * @return ByteBuf containing the serialized consumer
      */
@@ -61,6 +63,7 @@ public final class AsyncBytesSerializer {
 
     /**
      * Serializes an Identifier to bytes.
+     *
      * @param identifier The identifier to serialize
      * @return ByteBuf containing the serialized identifier
      */
@@ -84,6 +87,7 @@ public final class AsyncBytesSerializer {
 
     /**
      * Serializes a String to bytes with length prefix.
+     *
      * @param str The string to serialize
      * @return ByteBuf containing the serialized string
      */
@@ -96,6 +100,7 @@ public final class AsyncBytesSerializer {
 
     /**
      * Serializes a Partitioning to bytes.
+     *
      * @param partitioning The partitioning to serialize
      * @return ByteBuf containing the serialized partitioning
      */
@@ -109,6 +114,7 @@ public final class AsyncBytesSerializer {
 
     /**
      * Serializes a Message to bytes.
+     *
      * @param message The message to serialize
      * @return ByteBuf containing the serialized message
      */
@@ -121,6 +127,7 @@ public final class AsyncBytesSerializer {
 
     /**
      * Serializes a MessageHeader to bytes.
+     *
      * @param header The message header to serialize
      * @return ByteBuf containing the serialized header
      */
@@ -139,6 +146,7 @@ public final class AsyncBytesSerializer {
 
     /**
      * Serializes a PollingStrategy to bytes.
+     *
      * @param strategy The polling strategy to serialize
      * @return ByteBuf containing the serialized strategy
      */
@@ -149,8 +157,21 @@ public final class AsyncBytesSerializer {
         return buffer;
     }
 
+    static ByteBuf toBytes(Optional<Long> optionalLong) {
+        var buffer = Unpooled.buffer(5);
+        if (optionalLong.isPresent()) {
+            buffer.writeByte(1);
+            buffer.writeIntLE(optionalLong.get().intValue());
+        } else {
+            buffer.writeByte(0);
+            buffer.writeIntLE(0);
+        }
+        return buffer;
+    }
+
     /**
      * Converts a BigInteger to bytes as unsigned 64-bit integer.
+     *
      * @param value The BigInteger value to convert
      * @return ByteBuf containing the value as 8 bytes in little-endian format
      */
@@ -177,6 +198,7 @@ public final class AsyncBytesSerializer {
 
     /**
      * Converts a name string to bytes with length prefix.
+     *
      * @param name The name string to convert
      * @return ByteBuf containing the serialized name
      */
@@ -189,6 +211,7 @@ public final class AsyncBytesSerializer {
 
     /**
      * Converts a BigInteger to bytes as unsigned 128-bit integer.
+     *
      * @param value The BigInteger value to convert
      * @return ByteBuf containing the value as 16 bytes in little-endian format
      */

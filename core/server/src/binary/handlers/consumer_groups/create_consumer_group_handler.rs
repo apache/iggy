@@ -20,14 +20,18 @@ use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHa
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
 use crate::binary::{handlers::consumer_groups::COMPONENT, sender::SenderKind};
+
+use crate::shard::IggyShard;
+use crate::shard::transmission::event::ShardEvent;
+use crate::slab::traits_ext::EntityMarker;
 use crate::state::command::EntryCommand;
 use crate::state::models::CreateConsumerGroupWithId;
 use crate::streaming::session::Session;
-use crate::streaming::systems::system::SharedSystem;
 use anyhow::Result;
 use err_trail::ErrContext;
-use iggy_common::IggyError;
 use iggy_common::create_consumer_group::CreateConsumerGroup;
+use iggy_common::{Identifier, IggyError};
+use std::rc::Rc;
 use tracing::{debug, instrument};
 
 impl ServerCommandHandler for CreateConsumerGroup {
@@ -41,50 +45,47 @@ impl ServerCommandHandler for CreateConsumerGroup {
         sender: &mut SenderKind,
         _length: u32,
         session: &Session,
-        system: &SharedSystem,
+        shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
+        let cg = shard.create_consumer_group(
+            session,
+            &self.stream_id,
+            &self.topic_id,
+            self.name.clone(),
+        )?;
+        let cg_id = cg.id();
 
-        let mut system = system.write().await;
-        let consumer_group = system
-                .create_consumer_group(
-                    session,
-                    &self.stream_id,
-                    &self.topic_id,
-                    self.group_id,
-                    &self.name,
-                )
-                .await
-                .with_error(|error| {
-                    format!(
-                        "{COMPONENT} (error: {error}) - failed to create consumer group for stream_id: {}, topic_id: {}, group_id: {:?}, session: {session}",
-                        self.stream_id, self.topic_id, self.group_id
-                    )
-                })?;
-        let consumer_group = consumer_group.read().await;
-        let group_id = consumer_group.group_id;
-        let response = mapper::map_consumer_group(&consumer_group).await;
-        drop(consumer_group);
+        let event = ShardEvent::CreatedConsumerGroup {
+            stream_id: self.stream_id.clone(),
+            topic_id: self.topic_id.clone(),
+            cg,
+        };
+        shard.broadcast_event_to_all_shards(event).await?;
 
-        let system = system.downgrade();
         let stream_id = self.stream_id.clone();
         let topic_id = self.topic_id.clone();
-
-        system
+        shard
             .state
         .apply(
             session.get_user_id(),
            &EntryCommand::CreateConsumerGroup(CreateConsumerGroupWithId {
-                group_id,
+                group_id: cg_id as u32,
                 command: self
             }),
         )
             .await
             .with_error(|error| {
                 format!(
-                    "{COMPONENT} (error: {error}) - failed to apply create consumer group for stream_id: {stream_id}, topic_id: {topic_id}, group_id: {group_id:?}, session: {session}"
+                    "{COMPONENT} (error: {error}) - failed to apply create consumer group for stream_id: {stream_id}, topic_id: {topic_id}, group_id: {cg_id}, session: {session}"
                 )
             })?;
+        let response = shard.streams.with_consumer_group_by_id(
+            &stream_id,
+            &topic_id,
+            &Identifier::numeric(cg_id as u32).unwrap(),
+            |(root, members)| mapper::map_consumer_group(root, members),
+        );
         sender.send_ok_response(&response).await?;
         Ok(())
     }

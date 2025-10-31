@@ -16,6 +16,15 @@
  * under the License.
  */
 
+use assert_cmd::prelude::CommandCargoExt;
+use async_trait::async_trait;
+use derive_more::Display;
+use futures::executor::block_on;
+use iggy::prelude::UserStatus::Active;
+use iggy::prelude::*;
+use iggy_common::TransportProtocol;
+use rand::Rng;
+use server::configs::config_provider::{ConfigProvider, FileConfigProvider};
 use std::collections::HashMap;
 use std::fs;
 use std::fs::{File, OpenOptions};
@@ -23,17 +32,8 @@ use std::io::Write;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::thread::{panicking, sleep};
+use std::thread::{available_parallelism, panicking, sleep};
 use std::time::Duration;
-
-use assert_cmd::prelude::CommandCargoExt;
-use async_trait::async_trait;
-use derive_more::Display;
-use futures::executor::block_on;
-use iggy::prelude::UserStatus::Active;
-use iggy::prelude::*;
-use iggy_common::{ConfigProvider, TransportProtocol};
-use server::configs::server::ServerConfig;
 use uuid::Uuid;
 
 pub const SYSTEM_PATH_ENV_VAR: &str = "IGGY_SYSTEM_PATH";
@@ -59,7 +59,6 @@ pub trait ClientFactory: Sync + Send {
     fn transport(&self) -> TransportProtocol;
     fn server_addr(&self) -> String;
 }
-
 #[derive(Display, Debug)]
 enum ServerProtocolAddr {
     #[display("RAW_TCP:{_0}")]
@@ -70,6 +69,9 @@ enum ServerProtocolAddr {
 
     #[display("QUIC_UDP:{_0}")]
     QuicUdp(SocketAddr),
+
+    #[display("WEBSOCKET:{_0}")]
+    WebSocket(SocketAddr),
 }
 
 #[derive(Debug)]
@@ -97,6 +99,28 @@ impl TestServer {
                 envs.insert(key, value);
             }
         }
+
+        // Randomly select 4 CPU cores to reduce interference between parallel tests
+        let cpu_allocation = match available_parallelism() {
+            Ok(parallelism) => {
+                let available_cpus = parallelism.get();
+                if available_cpus >= 4 {
+                    let mut rng = rand::thread_rng();
+                    let max_start = available_cpus - 4;
+                    let start = rng.gen_range(0..=max_start);
+                    let end = start + 4;
+                    format!("{}..{}", start, end)
+                } else {
+                    "all".to_string()
+                }
+            }
+            Err(_) => "0..4".to_string(),
+        };
+
+        envs.insert(
+            "IGGY_SYSTEM_SHARDING_CPU_ALLOCATION".to_string(),
+            cpu_allocation,
+        );
 
         if ip_kind == IpAddrKind::V6 {
             envs.insert(IPV6_ENV_VAR.to_string(), "true".to_string());
@@ -277,6 +301,7 @@ impl TestServer {
             ServerProtocolAddr::QuicUdp(addr),
             ServerProtocolAddr::RawTcp(addr),
             ServerProtocolAddr::HttpTcp(addr),
+            ServerProtocolAddr::WebSocket(addr),
         ]
     }
 
@@ -286,6 +311,7 @@ impl TestServer {
             ServerProtocolAddr::QuicUdp(addr),
             ServerProtocolAddr::RawTcp(addr),
             ServerProtocolAddr::HttpTcp(addr),
+            ServerProtocolAddr::WebSocket(addr),
         ]
     }
 
@@ -301,6 +327,9 @@ impl TestServer {
                 ServerProtocolAddr::QuicUdp(addr) => {
                     ("IGGY_QUIC_ADDRESS".to_string(), addr.to_string())
                 }
+                ServerProtocolAddr::WebSocket(addr) => {
+                    ("IGGY_WEBSOCKET_ADDRESS".to_string(), addr.to_string())
+                }
             };
 
             self.envs.entry(key.0).or_insert(key.1);
@@ -309,11 +338,13 @@ impl TestServer {
 
     fn wait_until_server_has_bound(&mut self) {
         let config_path = format!("{}/runtime/current_config.toml", self.local_data_path);
+        let file_config_provider = FileConfigProvider::new(config_path.clone());
+
         let max_attempts = (MAX_PORT_WAIT_DURATION_S * 1000) / SLEEP_INTERVAL_MS;
         self.server_addrs.clear();
 
         let config = block_on(async {
-            let mut loaded_config: Option<ServerConfig> = None;
+            let mut loaded_config = None;
 
             for _ in 0..max_attempts {
                 if !Path::new(&config_path).exists() {
@@ -325,11 +356,48 @@ impl TestServer {
                     sleep(Duration::from_millis(SLEEP_INTERVAL_MS));
                     continue;
                 }
-                match ServerConfig::file_config_provider(config_path.clone())
-                    .load_config()
-                    .await
-                {
+                match file_config_provider.load_config().await {
                     Ok(config) => {
+                        // Verify config contains fresh addresses, not stale defaults
+                        // Default ports: TCP=8090, HTTP=3000, QUIC=8080, WebSocket=8092
+                        let tcp_port: u16 = config
+                            .tcp
+                            .address
+                            .split(':')
+                            .nth(1)
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(0);
+                        let http_port: u16 = config
+                            .http
+                            .address
+                            .split(':')
+                            .nth(1)
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(0);
+                        let quic_port: u16 = config
+                            .quic
+                            .address
+                            .split(':')
+                            .nth(1)
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(0);
+                        let websocket_port: u16 = config
+                            .websocket
+                            .address
+                            .split(':')
+                            .nth(1)
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(0);
+
+                        if tcp_port == 8090
+                            || http_port == 3000
+                            || quic_port == 8080
+                            || websocket_port == 8092
+                        {
+                            sleep(Duration::from_millis(SLEEP_INTERVAL_MS));
+                            continue;
+                        }
+
                         loaded_config = Some(config);
                         break;
                     }
@@ -340,17 +408,41 @@ impl TestServer {
         });
 
         if let Some(config) = config {
-            self.server_addrs.push(ServerProtocolAddr::QuicUdp(
-                config.quic.address.parse().unwrap(),
-            ));
+            // Only validate and add enabled protocols
+            if config.quic.enabled {
+                let quic_addr: SocketAddr = config.quic.address.parse().unwrap();
+                if quic_addr.port() == 0 {
+                    panic!("Quic address port is 0!");
+                }
+                self.server_addrs
+                    .push(ServerProtocolAddr::QuicUdp(quic_addr));
+            }
 
-            self.server_addrs.push(ServerProtocolAddr::RawTcp(
-                config.tcp.address.parse().unwrap(),
-            ));
+            if config.tcp.enabled {
+                let tcp_addr: SocketAddr = config.tcp.address.parse().unwrap();
+                if tcp_addr.port() == 0 {
+                    panic!("Tcp address port is 0!");
+                }
+                self.server_addrs.push(ServerProtocolAddr::RawTcp(tcp_addr));
+            }
 
-            self.server_addrs.push(ServerProtocolAddr::HttpTcp(
-                config.http.address.parse().unwrap(),
-            ));
+            if config.http.enabled {
+                let http_addr: SocketAddr = config.http.address.parse().unwrap();
+                if http_addr.port() == 0 {
+                    panic!("Http address port is 0!");
+                }
+                self.server_addrs
+                    .push(ServerProtocolAddr::HttpTcp(http_addr));
+            }
+
+            if config.websocket.enabled {
+                let websocket_addr: SocketAddr = config.websocket.address.parse().unwrap();
+                if websocket_addr.port() == 0 {
+                    panic!("WebSocket address port is 0!");
+                }
+                self.server_addrs
+                    .push(ServerProtocolAddr::WebSocket(websocket_addr));
+            }
         } else {
             panic!(
                 "Failed to load config from file {config_path} in {MAX_PORT_WAIT_DURATION_S} s!"
@@ -428,6 +520,15 @@ impl TestServer {
         } else {
             None
         }
+    }
+
+    pub fn get_websocket_addr(&self) -> Option<String> {
+        for server_protocol_addr in &self.server_addrs {
+            if let ServerProtocolAddr::WebSocket(a) = server_protocol_addr {
+                return Some(a.to_string());
+            }
+        }
+        None
     }
 }
 

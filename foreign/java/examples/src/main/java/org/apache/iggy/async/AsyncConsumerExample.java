@@ -26,7 +26,6 @@ import org.apache.iggy.identifier.TopicId;
 import org.apache.iggy.identifier.ConsumerId;
 import org.apache.iggy.consumergroup.Consumer;
 import org.apache.iggy.consumergroup.ConsumerGroupDetails;
-import org.apache.iggy.message.PolledMessages;
 import org.apache.iggy.message.PollingStrategy;
 import org.apache.iggy.stream.StreamDetails;
 import org.apache.iggy.topic.CompressionAlgorithm;
@@ -36,7 +35,6 @@ import org.slf4j.LoggerFactory;
 
 import java.math.BigInteger;
 import java.util.Optional;
-import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 
 import static java.util.Optional.empty;
@@ -71,7 +69,7 @@ public class AsyncConsumerExample {
         // Create stream if needed
         Optional<StreamDetails> stream = blockingClient.streams().getStream(STREAM_ID);
         if (!stream.isPresent()) {
-            blockingClient.streams().createStream(empty(), STREAM_NAME);
+            blockingClient.streams().createStream(STREAM_NAME);
             log.info("Created stream: {}", STREAM_NAME);
         }
 
@@ -80,8 +78,7 @@ public class AsyncConsumerExample {
         if (!topic.isPresent()) {
             blockingClient.topics().createTopic(
                 STREAM_ID,
-                empty(),
-                1L,
+                    1L,
                 CompressionAlgorithm.None,
                 BigInteger.ZERO,
                 BigInteger.ZERO,
@@ -95,7 +92,7 @@ public class AsyncConsumerExample {
         Optional<ConsumerGroupDetails> group = blockingClient.consumerGroups()
             .getConsumerGroup(STREAM_ID, TOPIC_ID, GROUP_ID);
         if (!group.isPresent()) {
-            blockingClient.consumerGroups().createConsumerGroup(STREAM_ID, TOPIC_ID, empty(), GROUP_NAME);
+            blockingClient.consumerGroups().createConsumerGroup(STREAM_ID, TOPIC_ID, GROUP_NAME);
             log.info("Created consumer group: {}", GROUP_NAME);
         }
 

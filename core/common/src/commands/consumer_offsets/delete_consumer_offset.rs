@@ -54,7 +54,7 @@ impl Default for DeleteConsumerOffset {
             consumer: Consumer::default(),
             stream_id: Identifier::default(),
             topic_id: Identifier::default(),
-            partition_id: Some(1),
+            partition_id: Some(0),
         }
     }
 }

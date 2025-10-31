@@ -16,21 +16,12 @@
  * under the License.
  */
 
-use std::sync::atomic::Ordering;
-
-use crate::streaming::partitions::COMPONENT;
-use crate::streaming::partitions::partition::Partition;
-use crate::streaming::segments::*;
-use err_trail::ErrContext;
-use iggy_common::IggyError;
-use iggy_common::IggyTimestamp;
-use tracing::info;
-
 pub struct DeletedSegment {
     pub end_offset: u64,
     pub messages_count: u32,
 }
 
+/*
 impl Partition {
     pub fn get_segments_count(&self) -> u32 {
         self.segments.len() as u32
@@ -88,7 +79,7 @@ impl Partition {
             self.messages_count.clone(),
             true,
         );
-        new_segment.persist().await.with_error(|error| {
+        new_segment.open().await.with_error(|error| {
             format!("{COMPONENT} (error: {error}) - failed to persist new segment: {new_segment}",)
         })?;
         self.segments.push(new_segment);
@@ -129,3 +120,5 @@ impl Partition {
         Ok(deleted_segment)
     }
 }
+
+*/

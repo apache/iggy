@@ -51,7 +51,7 @@ public class IggyConsumerTests
                 Consumer.New(1))
             .WithPollingStrategy(PollingStrategy.Next())
             .WithBatchSize(10)
-            .WithPartitionId(1)
+            .WithPartitionId(0)
             .Build();
 
         await Should.NotThrowAsync(() => consumer.InitAsync());
@@ -668,7 +668,7 @@ public class IggyConsumerTests
             .WithBatchSize(10)
             .WithPartitionId(999)
             .WithAutoCommitMode(AutoCommitMode.Disabled)
-            .OnPollingError((sender, args) =>
+            .SubscribeOnPollingError((sender, args) =>
             {
                 errorFired = true;
                 capturedError = args.Exception;
@@ -677,7 +677,7 @@ public class IggyConsumerTests
 
         await consumer.InitAsync();
 
-        var cts = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+        var cts = new CancellationTokenSource(TimeSpan.FromSeconds(1));
 
         try
         {
@@ -815,7 +815,7 @@ public class IggyConsumerTests
         await client.CreateStreamAsync(streamId);
         await client.CreateTopicAsync(Identifier.String(streamId), topicId, partitionsCount);
 
-        for (uint partitionId = 1; partitionId <= partitionsCount; partitionId++)
+        for (uint partitionId = 0; partitionId < partitionsCount; partitionId++)
         {
             var messages = new List<Message>();
             for (var i = 0; i < messagesPerPartition; i++)

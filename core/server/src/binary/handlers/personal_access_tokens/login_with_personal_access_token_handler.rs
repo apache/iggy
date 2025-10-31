@@ -15,13 +15,14 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+use crate::shard::IggyShard;
+use std::rc::Rc;
 
 use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
 use crate::binary::{handlers::personal_access_tokens::COMPONENT, sender::SenderKind};
 use crate::streaming::session::Session;
-use crate::streaming::systems::system::SharedSystem;
 use anyhow::Result;
 use err_trail::ErrContext;
 use iggy_common::IggyError;
@@ -39,13 +40,11 @@ impl ServerCommandHandler for LoginWithPersonalAccessToken {
         sender: &mut SenderKind,
         _length: u32,
         session: &Session,
-        system: &SharedSystem,
+        shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
-        let system = system.read().await;
-        let user = system
+        let user = shard
             .login_with_personal_access_token(&self.token, Some(session))
-            .await
             .with_error(|error| {
                 let redacted_token = if self.token.len() > 4 {
                     format!("{}****", &self.token[..4])
