@@ -46,7 +46,7 @@ export const ensureConsumerGroupAndJoin = (c: ClientProvider) =>
     groupName = `ensure-cgroup-${streamId}-${topicId}-${groupId}`
   ) {
     const group = await ensureConsumerGroup(c)(streamId, topicId, groupId, groupName);
-    await joinGroup(c)({ streamId, topicId, groupId });
+    await joinGroup(c)({ streamId, topicId, groupId: group.id });
     return group;
   };
 
