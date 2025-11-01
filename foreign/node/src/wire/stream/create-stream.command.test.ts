@@ -27,14 +27,13 @@ describe('CreateStream', () => {
   describe('serialize', () => {
 
     const s1 = {
-      streamId: 1,
       name: 'test-stream'
     };
     
-    it('serialize 1 numeric id & 1 name into buffer', () => {
+    it('serialize 1 name into buffer', () => {
       assert.deepEqual(
         CREATE_STREAM.serialize(s1).length,
-        4 + 1 + s1.name.length
+        1 + s1.name.length
       );
     });
 
