@@ -22,19 +22,19 @@ import { PollingStrategy, singleConsumerStream, Consumer } from '../index.js';
 import { open } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { getClient } from './utils.js';
-import type { PollMessagesResponse } from '../wire/index.js';
+import type { Id, PollMessagesResponse } from '../wire/index.js';
 
 
 export const topicToFile = async (
   filepath: string,
-  streamId: number,
-  topicId: number,
-  partitionId = 1
+  streamName: string,
+  topicName: string,
+  partitionId = 0
 ) => {
   const cli = getClient();
   const fd = await open(filepath, 'w+');
 
-  const t = await cli.topic.get({ streamId, topicId });
+  const t = await cli.topic.get({ streamId: streamName, topicId: topicName });
   console.log('TOPIC/GET', t);
 
   // reset consumer offset 
@@ -50,8 +50,8 @@ export const topicToFile = async (
   const dStart = Date.now();
   const consumer = singleConsumerStream(cli._config);
   const stream = await consumer({
-    streamId,
-    topicId,
+    streamId: streamName,
+    topicId: topicName,
     partitionId,
     pollingStrategy: PollingStrategy.Next,
     count: 1,
@@ -91,8 +91,8 @@ if (argz.length < 3 || ['-h', '--help', '?'].includes(argz[0])) {
 }
 
 const filepath = resolve(rPath);
-const streamId = parseInt(streamIdStr);
-const topicId = parseInt(topicIdStr);
+const streamId = streamIdStr;
+const topicId = topicIdStr;
 
 console.log('running with params:', { filepath, streamId, topicId });
 
