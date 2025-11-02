@@ -188,7 +188,6 @@ export class IggyConnection extends EventEmitter {
       }
 
       // Read the header
-      const status = data.readUInt32LE(offset);
       const responseSize = data.readUInt32LE(offset + 4);
       const totalSize = 8 + responseSize;
 

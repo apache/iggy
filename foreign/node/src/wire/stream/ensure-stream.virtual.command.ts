@@ -24,15 +24,8 @@ import { getStream } from './get-stream.command.js';
 
 
 export const ensureStream = (c: ClientProvider) =>
-  async function ensureStream(
-    streamId: number,
-    streamName = `ensure-stream-${streamId}`
-  ) {
-    const stream = await getStream(c)({ streamId });
+  async function ensureStream(streamName: string) {
+    const stream = await getStream(c)({ streamId: streamName });
     return stream === null ?
-      createStream(c)({
-        streamId,
-        name: streamName,
-      }) :
-      true;
+      createStream(c)({ name: streamName }) : stream;
   };

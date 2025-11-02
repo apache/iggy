@@ -26,12 +26,13 @@ describe('e2e -> stream', async () => {
 
   const c = getTestClient();
   
-  const streamId = 164;
   const name = 'e2e-tcp-stream';
   const name2 = `${name}-updated`;
 
-  const STREAM = await c.stream.create({ streamId, name });
-  assert.ok(STREAM);
+  it('e2e -> stream::create', async () => {
+    const stream = await c.stream.create({ name });
+    assert.ok(stream);
+  });
 
   it('e2e -> stream::list', async () => {
     const streams = await c.stream.list();
@@ -39,24 +40,24 @@ describe('e2e -> stream', async () => {
   });
 
   it('e2e -> stream::get', async () => {
-    const stream = await c.stream.get({ streamId: STREAM.id });
+    const stream = await c.stream.get({ streamId: name });
     assert.ok(stream);
   });
 
   it('e2e -> stream::update', async () => {
     const stream = await c.stream.update({
-      streamId: STREAM.id,
+      streamId: name,
       name: name2
     });
     assert.ok(stream);
   });
 
   it('e2e -> stream::purge', async () => {
-    assert.ok(await c.stream.purge({ streamId: STREAM.id }));
+    assert.ok(await c.stream.purge({ streamId: name2 }));
   });
 
   it('e2e -> stream::delete', async () => {
-    assert.ok(await c.stream.delete({ streamId: STREAM.id }));
+    assert.ok(await c.stream.delete({ streamId: name2 }));
   });
 
   it('e2e -> stream::cleanup', async () => {

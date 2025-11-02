@@ -27,7 +27,6 @@ import { deserializeConsumerGroup, type ConsumerGroup } from './group.utils.js';
 export type CreateGroup = {
   streamId: Id,
   topicId: Id,
-  groupId?: number, // Optional - auto-assigned by server if not provided
   name: string,
 };
 

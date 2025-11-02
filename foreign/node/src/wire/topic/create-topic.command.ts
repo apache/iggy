@@ -32,7 +32,6 @@ import {
 
 export type CreateTopic = {
   streamId: Id,
-  topicId?: number, // Optional - auto-assigned by server if not provided
   name: string,
   partitionCount: number,
   compressionAlgorithm: CompressionAlgorithmT,

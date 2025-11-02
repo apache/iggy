@@ -43,12 +43,14 @@ describe('e2e -> consumer-stream', async () => {
 
   const c = new Client(opt);
 
-  const groupId = 12;
+  const groupName = 'cgtest-12';
+  const streamName = `e2e-stream-consumer-stream`;
+  const topicName = 'test-topic-stream-cg';
 
-  const STREAM = await c.stream.create({ name: `e2e-stream-consumer-stream` })
-  const TOPIC = await c.topic.create({
-    streamId: STREAM.id,
-    name: 'test-topic-stream-cg',
+  await c.stream.create({ name: streamName });
+  await c.topic.create({
+    streamId: streamName,
+    name: topicName,
     partitionCount: 3,
     compressionAlgorithm: 1
   });
@@ -58,7 +60,7 @@ describe('e2e -> consumer-stream', async () => {
   it('e2e -> consumer-stream::send-messages', async () => {
     for (let i = 0; i < ct; i += 100) {
       await sendSomeMessages(c.clientProvider)(
-        STREAM.id, TOPIC.id, Partitioning.MessageKey(`k-${i % 300}`)
+        streamName, topicName, Partitioning.MessageKey(`k-${i % 300}`)
       );
     }
   });
@@ -66,9 +68,9 @@ describe('e2e -> consumer-stream', async () => {
   it('e2e -> consumer-stream::poll-stream', async () => {
     // POLL MESSAGE
     const pollReq = {
-      groupId,
-      streamId: STREAM.id,
-      topicId: TOPIC.id,
+      groupName,
+      streamId: streamName,
+      topicId: topicName,
       pollingStrategy: PollingStrategy.Next,
       count: 100,
       interval: 500
@@ -103,7 +105,7 @@ describe('e2e -> consumer-stream', async () => {
     });
 
     after(async () => {
-      assert.ok(await c.stream.delete({ streamId: STREAM.id }));
+      assert.ok(await c.stream.delete({ streamId: streamName }));
       assert.ok(await c.session.logout());
       await c.destroy();
     });

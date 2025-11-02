@@ -35,44 +35,55 @@ describe('e2e -> consumer-group', async () => {
     credentials: { username: 'iggy', password: 'iggy' }
   });
 
-  const stream = {
-    name: 'e2e-consumer-group-stream'
-  };
+  const streamName = 'e2e-consumer-group-stream-543';
+  const topicName = 'e2e-consumer-group-topic-543';
+  const groupName = 'e2e-cg-cg-1';
 
   let payloadLength = 0;
 
-  const STREAM = await c.stream.create(stream);
-  
+  await c.stream.create({ name: streamName });
+
   const topic = {
-    streamId: STREAM.id,
-    name: 'e2e-consumer-group-topic',
+    streamId: streamName,
+    name: topicName,
     partitionCount: 3,
     compressionAlgorithm: 1
   };
 
-  const TOPIC = await c.topic.create(topic);
-  
-  const group = { streamId: STREAM.id, topicId: TOPIC.id, name: 'e2e-cg-1' };
+  await c.topic.create(topic);
 
-    const GROUP = await c.group.create(group);
+  const group = {
+    streamId: streamName, topicId: topicName, name: groupName
+  };
+
+  it('e2e -> consumer-group::create', async () => {
+    const g = await c.group.create(group);
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    const { id, ...rest } = g;
     assert.deepEqual(
-      GROUP, { id: 0, name: 'e2e-cg-1', partitionsCount: 3, membersCount: 0 }
+      rest, { name: groupName, partitionsCount: 3, membersCount: 0 }
     );
+  });
 
   it('e2e -> consumer-group::get', async () => {
     const gg = await c.group.get({
-      streamId: STREAM.id, topicId: TOPIC.id, groupId: GROUP.id
+      streamId: streamName, topicId: topicName, groupId: groupName
     });
+    assert.ok(gg);
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    const { id, ...rest } = gg;
     assert.deepEqual(
-      gg, { id: GROUP.id, name: 'e2e-cg-1', partitionsCount: 3, membersCount: 0 }
+      rest, { name: groupName, partitionsCount: 3, membersCount: 0 }
     );
   });
 
   it('e2e -> consumer-group::list', async () => {
-    const lg = await c.group.list({ streamId: STREAM.id, topicId: TOPIC.id });
+    const lg = await c.group.list({ streamId: streamName, topicId: topicName });
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    const [{ id, ...rest }] = lg;
     assert.deepEqual(
-      lg,
-      [{ id: GROUP.id, name: 'e2e-cg-1', partitionsCount: 3, membersCount: 0 }]
+      [rest],
+      [{ name: groupName, partitionsCount: 3, membersCount: 0 }]
     );
   });
 
@@ -81,8 +92,8 @@ describe('e2e -> consumer-group', async () => {
     const mn = 200;
     for (let i = 0; i <= ct; i += mn) {
       assert.ok(await c.message.send({
-        streamId: STREAM.id,
-        topicId: TOPIC.id,
+        streamId: streamName,
+        topicId: topicName,
         messages: generateMessages(mn),
         partition: Partitioning.MessageKey(`key-${ i % 300 }`)
       }));
@@ -92,47 +103,47 @@ describe('e2e -> consumer-group', async () => {
 
   it('e2e -> consumer-group::join', async () => {
     assert.ok(await c.group.join({
-      streamId: STREAM.id, topicId: TOPIC.id, groupId: GROUP.id
+      streamId: streamName, topicId: topicName, groupId: groupName
     }));
   });
 
-  // it('e2e -> consumer-group::poll', async () => {
-  //   const pollReq = {
-  //     streamId: STREAM.id,
-  //     topicId: TOPIC.id,
-  //     consumer: Consumer.Group(GROUP.id),
-  //     partitionId: 0,
-  //     pollingStrategy: PollingStrategy.Next,
-  //     count: 100,
-  //     autocommit: true
-  //   };
-  //   let ct = 0;
-  //   while (ct < payloadLength) {
-  //     const { messages, ...resp } = await c.message.poll(pollReq);
-  //     // console.log('POLL', messages.length, 'R/C', resp.count, messages, resp, ct);
-  //     assert.equal(messages.length, resp.count);
-  //     ct += messages.length;
-  //   }
-  //   assert.equal(ct, payloadLength);
+  it('e2e -> consumer-group::poll', async () => {
+    const pollReq = {
+      streamId: streamName,
+      topicId: topicName,
+      consumer: Consumer.Group(groupName),
+      partitionId: 0,
+      pollingStrategy: PollingStrategy.Next,
+      count: 100,
+      autocommit: true
+    };
+    let ct = 0;
+    while (ct < payloadLength) {
+      const { messages, ...resp } = await c.message.poll(pollReq);
+      // console.log('POLL', messages.length, 'R/C', resp.count, messages, resp, ct);
+      assert.equal(messages.length, resp.count);
+      ct += messages.length;
+    }
+    assert.equal(ct, payloadLength);
 
-  //   const { count } = await c.message.poll(pollReq);
-  //   assert.equal(count, 0);
-  // });
+    const { count } = await c.message.poll(pollReq);
+    assert.equal(count, 0);
+  });
 
   it('e2e -> consumer-group::leave', async () => {
     assert.ok(await c.group.leave({
-      streamId: STREAM.id, topicId: TOPIC.id, groupId: GROUP.id
+      streamId: streamName, topicId: topicName, groupId: groupName
     }));
   });
 
   it('e2e -> consumer-group::delete', async () => {
     assert.ok(await c.group.delete({
-      streamId: STREAM.id, topicId: TOPIC.id, groupId: GROUP.id
+      streamId: streamName, topicId: topicName, groupId: groupName
     }));
   });
 
   after(async () => {
-    assert.ok(await c.stream.delete({ streamId: STREAM.id }));
+    assert.ok(await c.stream.delete({ streamId: streamName }));
     assert.ok(await c.session.logout());
     c.destroy();
   });
