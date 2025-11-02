@@ -29,27 +29,22 @@ describe('e2e -> message', async () => {
 
   const c = getTestClient();
 
-  // const streamId = 934;
-  // const topicId = 832;
-  const partitionId = 1;
+  const streamName = 'e2e-stream-934';
+  const topicName = 'e2e-topic-832';
+  const partitionId = 0;
 
-  const stream = {
-    name: 'e2e-send-message-stream'
-  };
-
-
-  const STREAM = await c.stream.create(stream);
+  await c.stream.create({ name: streamName });
   const topic = {
-    streamId: STREAM.id,
-    name: 'e2e-send-message-topic',
+    streamId: streamName,
+    name: topicName,
     partitionCount: 1,
     compressionAlgorithm: 1
   };
-  const TOPIC = await c.topic.create(topic);
+  await c.topic.create(topic);
 
   const msg = {
-    streamId: STREAM.id,
-    topicId: TOPIC.id,
+    streamId: streamName,
+    topicId: topicName,
     messages: generateMessages(6),
     partition: Partitioning.PartitionId(partitionId)
   };
@@ -60,8 +55,8 @@ describe('e2e -> message', async () => {
 
   it('e2e -> message::poll/last', async () => {
     const pollReq = {
-      streamId: STREAM.id,
-      topicId: TOPIC.id,
+      streamId: streamName,
+      topicId: topicName,
       consumer: Consumer.Single,
       partitionId,
       pollingStrategy: PollingStrategy.Last,
@@ -75,8 +70,8 @@ describe('e2e -> message', async () => {
 
   it('e2e -> message::poll/first', async () => {
     const pollReq = {
-      streamId: STREAM.id,
-      topicId: TOPIC.id,
+      streamId: streamName,
+      topicId: topicName,
       consumer: Consumer.Single,
       partitionId,
       pollingStrategy: PollingStrategy.First,
@@ -90,8 +85,8 @@ describe('e2e -> message', async () => {
 
   it('e2e -> message::poll/next', async () => {
     const pollReq = {
-      streamId: STREAM.id,
-      topicId: TOPIC.id,
+      streamId: streamName,
+      topicId: topicName,
       consumer: Consumer.Single,
       partitionId,
       pollingStrategy: PollingStrategy.Next,
@@ -105,8 +100,8 @@ describe('e2e -> message', async () => {
 
   it('e2e -> message::poll/next+commit', async () => {
     const pollReq = {
-      streamId: STREAM.id,
-      topicId: TOPIC.id,
+      streamId: streamName,
+      topicId: topicName,
       consumer: Consumer.Single,
       partitionId,
       pollingStrategy: PollingStrategy.Next,
@@ -123,7 +118,7 @@ describe('e2e -> message', async () => {
   });
 
   it('e2e -> message::cleanup', async () => {
-    assert.ok(await c.stream.delete({ streamId: STREAM.id }));
+    assert.ok(await c.stream.delete({ streamId: streamName }));
     assert.ok(await c.session.logout());
   });
 

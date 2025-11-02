@@ -112,7 +112,7 @@ describe('e2e -> consumer-group', async () => {
       streamId: streamName,
       topicId: topicName,
       consumer: Consumer.Group(groupName),
-      partitionId: 0,
+      partitionId: null,
       pollingStrategy: PollingStrategy.Next,
       count: 100,
       autocommit: true

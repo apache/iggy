@@ -124,7 +124,7 @@ export const groupConsumerStream = (config: ClientConfig) =>
       streamId,
       topicId,
       consumer: Consumer.Group(groupName),
-      partitionId: 0,
+      partitionId: null,
       pollingStrategy,
       count,
       autocommit
