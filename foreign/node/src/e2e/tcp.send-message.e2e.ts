@@ -117,6 +117,53 @@ describe('e2e -> message', async () => {
     assert.equal(r2.messages.length, 0)
   });
 
+  it('e2e -> message::getOffset', async () => {
+    const offset = await c.offset.get({
+      streamId: streamName,
+      topicId: topicName,
+      consumer: Consumer.Single,
+      partitionId
+    });
+    assert.deepEqual(offset, { partitionId: 0, currentOffset: 5n, storedOffset: 5n });
+  });
+
+  it('e2e -> message::deleteOffset', async () => {
+    const r = await c.offset.delete({
+      streamId: streamName,
+      topicId: topicName,
+      consumer: Consumer.Single,
+      partitionId
+    });
+    assert.ok(r);
+
+    const offset = await c.offset.get({
+      streamId: streamName,
+      topicId: topicName,
+      consumer: Consumer.Single,
+      partitionId
+    });
+    assert.equal(offset, null);
+  });
+
+  it('e2e -> message::storeOffset', async () => {
+    const r = await c.offset.store({
+      streamId: streamName,
+      topicId: topicName,
+      consumer: Consumer.Single,
+      partitionId,
+      offset: 2n
+    });
+    assert.ok(r);
+
+    const offset = await c.offset.get({
+      streamId: streamName,
+      topicId: topicName,
+      consumer: Consumer.Single,
+      partitionId
+    });
+    assert.deepEqual(offset, { partitionId: 0, currentOffset: 5n, storedOffset: 2n });
+  });
+
   it('e2e -> message::cleanup', async () => {
     assert.ok(await c.stream.delete({ streamId: streamName }));
     assert.ok(await c.session.logout());
@@ -125,4 +172,5 @@ describe('e2e -> message', async () => {
   after(() => {
     c.destroy();
   });
+
 });

@@ -40,10 +40,12 @@ export const topicToFile = async (
   // reset consumer offset
   try {
     const offset = await cli.offset.get({
-      streamId, topicId, partitionId, consumer: Consumer.Single
+      streamId: streamName, topicId: topicName, partitionId, consumer: Consumer.Single
     });
     if (offset)
-      await cli.offset.delete({ streamId, topicId, partitionId, consumer: Consumer.Single });
+      await cli.offset.delete({
+        streamId: streamName, topicId: topicName, partitionId, consumer: Consumer.Single
+      });
     // eslint-disable-next-line @typescript-eslint/no-unused-vars
   } catch (err) {}
 
