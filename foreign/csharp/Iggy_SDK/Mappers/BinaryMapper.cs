@@ -226,12 +226,12 @@ internal static class BinaryMapper
         var readBytes = 4 + 8 + 1 + 1 + usernameLength;
 
         return (new UserResponse
-            {
-                Id = id,
-                CreatedAt = createdAt,
-                Status = userStatus,
-                Username = username
-            },
+        {
+            Id = id,
+            CreatedAt = createdAt,
+            Status = userStatus,
+            Username = username
+        },
             readBytes);
     }
 
@@ -870,11 +870,11 @@ internal static class BinaryMapper
         }
 
         return (new ConsumerGroupMember
-            {
-                Id = id,
-                PartitionsCount = partitionsCount,
-                Partitions = partitions
-            },
+        {
+            Id = id,
+            PartitionsCount = partitionsCount,
+            Partitions = partitions
+        },
             8 + partitionsCount * 4);
     }
 

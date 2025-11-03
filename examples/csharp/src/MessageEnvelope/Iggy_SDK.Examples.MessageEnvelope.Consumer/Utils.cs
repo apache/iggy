@@ -100,18 +100,18 @@ public static class Utils
 
         switch (envelope.MessageType)
         {
-            case Envelope.OrderCreatedType:
+            case Envelope.ORDER_CREATED_TYPE:
                 var orderCreated = JsonSerializer.Deserialize<OrderCreated>(envelope.Payload) ??
                                    throw new Exception("Could not deserialize order_created.");
                 logger.LogInformation("{OrderCreated}", orderCreated);
                 break;
 
-            case Envelope.OrderConfirmedType:
+            case Envelope.ORDER_CONFIRMED_TYPE:
                 var orderConfirmed = JsonSerializer.Deserialize<OrderConfirmed>(envelope.Payload) ??
                                      throw new Exception("Could not deserialize order_confirmed.");
                 logger.LogInformation("{OrderConfirmed}", orderConfirmed);
                 break;
-            case Envelope.OrderRejectedType:
+            case Envelope.ORDER_REJECTED_TYPE:
                 var orderRejected = JsonSerializer.Deserialize<OrderRejected>(envelope.Payload) ??
                                     throw new Exception("Could not deserialize order_rejected.");
                 logger.LogInformation("{OrderRejected}", orderRejected);

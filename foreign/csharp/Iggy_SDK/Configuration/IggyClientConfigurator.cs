@@ -29,4 +29,4 @@ public sealed class IggyClientConfigurator
     public int SendBufferSize { get; set; } = 4096;
     public TlsSettings TlsSettings { get; set; } = new();
     public ILoggerFactory LoggerFactory { get; set; } = NullLoggerFactory.Instance;
-} 
+}
