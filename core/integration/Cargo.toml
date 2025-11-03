@@ -28,11 +28,11 @@ ci-qemu = []
 
 [dependencies]
 ahash = { workspace = true }
-assert_cmd = "2.0.17"
+assert_cmd = "2.1.1"
 async-trait = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
-ctor = "0.6.0"
+ctor = "0.6.1"
 derive_more = { workspace = true }
 env_logger = { workspace = true }
 futures = { workspace = true }
