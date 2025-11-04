@@ -38,7 +38,6 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
-import java.util.concurrent.CompletableFuture;
 import java.util.zip.CRC32;
 import java.util.zip.Checksum;
 
@@ -160,15 +159,13 @@ public class IggySinkWriter<T> implements SinkWriter<T> {
             // Determine partitioning
             Partitioning partitioning = determinePartitioning();
 
-            // Send messages to Iggy (HTTP with async wrapper)
+            // Send messages to Iggy via HTTP
             StreamId stream = parseStreamId(streamId);
             TopicId topic = parseTopicId(topicId);
 
             LOGGER.debug("IggySinkWriter: Sending {} messages with partitioning={}",
                     messages.size(), partitioning);
-            CompletableFuture.runAsync(() -> {
-                httpClient.messages().sendMessages(stream, topic, partitioning, messages);
-            }).join();
+            httpClient.messages().sendMessages(stream, topic, partitioning, messages);
 
             totalWritten += buffer.size();
             LOGGER.debug("IggySinkWriter: Successfully sent {} messages. Total written: {}",
