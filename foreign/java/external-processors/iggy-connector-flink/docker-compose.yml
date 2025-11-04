@@ -225,41 +225,41 @@ services:
           -d '{"name": "flink-word-counter"}' || true
 
         # MultiStreamJoinJob streams
-        echo "Creating 'user-activities' stream (ID: 5)..."
+        echo "Creating 'user-activities' stream..."
         curl -s -X POST http://iggy:3000/streams \
           -H "Content-Type: application/json" \
           -H "Authorization: Bearer $$TOKEN" \
-          -d '{"stream_id": 5, "name": "user-activities"}' || true
+          -d '{"name": "user-activities"}' || true
 
-        echo "Creating 'events' topic (ID: 1) in 'user-activities' stream..."
-        curl -s -X POST http://iggy:3000/streams/5/topics \
+        echo "Creating 'events' topic in 'user-activities' stream..."
+        curl -s -X POST http://iggy:3000/streams/user-activities/topics \
           -H "Content-Type: application/json" \
           -H "Authorization: Bearer $$TOKEN" \
-          -d '{"topic_id": 1, "name": "events", "partitions_count": 4, "compression_algorithm": "none", "message_expiry": 0, "max_topic_size": 10737418240}' || true
+          -d '{"name": "events", "partitions_count": 4, "compression_algorithm": "none", "message_expiry": 0, "max_topic_size": 10737418240}' || true
 
-        echo "Creating 'user-profiles' stream (ID: 6)..."
+        echo "Creating 'user-profiles' stream..."
         curl -s -X POST http://iggy:3000/streams \
           -H "Content-Type: application/json" \
           -H "Authorization: Bearer $$TOKEN" \
-          -d '{"stream_id": 6, "name": "user-profiles"}' || true
+          -d '{"name": "user-profiles"}' || true
 
-        echo "Creating 'updates' topic (ID: 1) in 'user-profiles' stream..."
-        curl -s -X POST http://iggy:3000/streams/6/topics \
+        echo "Creating 'updates' topic in 'user-profiles' stream..."
+        curl -s -X POST http://iggy:3000/streams/user-profiles/topics \
           -H "Content-Type: application/json" \
           -H "Authorization: Bearer $$TOKEN" \
-          -d '{"topic_id": 1, "name": "updates", "partitions_count": 2, "compression_algorithm": "none", "message_expiry": 0, "max_topic_size": 10737418240}' || true
+          -d '{"name": "updates", "partitions_count": 2, "compression_algorithm": "none", "message_expiry": 0, "max_topic_size": 10737418240}' || true
 
-        echo "Creating 'enriched-activities' stream (ID: 7)..."
+        echo "Creating 'enriched-activities' stream..."
         curl -s -X POST http://iggy:3000/streams \
           -H "Content-Type: application/json" \
           -H "Authorization: Bearer $$TOKEN" \
-          -d '{"stream_id": 7, "name": "enriched-activities"}' || true
+          -d '{"name": "enriched-activities"}' || true
 
-        echo "Creating 'results' topic (ID: 1) in 'enriched-activities' stream..."
-        curl -s -X POST http://iggy:3000/streams/7/topics \
+        echo "Creating 'results' topic in 'enriched-activities' stream..."
+        curl -s -X POST http://iggy:3000/streams/enriched-activities/topics \
           -H "Content-Type: application/json" \
           -H "Authorization: Bearer $$TOKEN" \
-          -d '{"topic_id": 1, "name": "results", "partitions_count": 4, "compression_algorithm": "none", "message_expiry": 0, "max_topic_size": 10737418240}' || true
+          -d '{"name": "results", "partitions_count": 4, "compression_algorithm": "none", "message_expiry": 0, "max_topic_size": 10737418240}' || true
 
         echo "Stream and topic creation completed!"
 
