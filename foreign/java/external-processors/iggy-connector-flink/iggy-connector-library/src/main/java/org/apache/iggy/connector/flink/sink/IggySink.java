@@ -123,25 +123,21 @@ public class IggySink<T> implements Sink<T>, Serializable {
      */
     private IggyHttpClient createHttpClient() {
         try {
-            // Build HTTP URL from server address
+            // Build HTTP URL from server address using URI for proper parsing
             String serverAddress = connectionConfig.getServerAddress();
-            String httpUrl;
 
-            // If serverAddress already has http:// or https://, use it as is
-            if (serverAddress.startsWith("http://") || serverAddress.startsWith("https://")) {
-                httpUrl = serverAddress;
-            } else {
-                // Extract host and replace TCP port 8090 with HTTP port 3000
-                String host;
-                if (serverAddress.contains(":")) {
-                    // Extract just the host part (before the port)
-                    host = serverAddress.substring(0, serverAddress.indexOf(":"));
-                } else {
-                    host = serverAddress;
-                }
-                // HTTP server runs on port 3000
-                httpUrl = "http://" + host + ":3000";
+            // Parse server address to extract host
+            java.net.URI uri = serverAddress.contains("://")
+                ? new java.net.URI(serverAddress)
+                : new java.net.URI("tcp://" + serverAddress);
+
+            String host = uri.getHost();
+            if (host == null) {
+                throw new IllegalArgumentException("Cannot extract host from: " + serverAddress);
             }
+
+            // Build HTTP URL with port 3000 (Iggy HTTP API default port)
+            String httpUrl = "http://" + host + ":3000";
 
             // Create HTTP client
             IggyHttpClient httpClient = new IggyHttpClient(httpUrl);
@@ -154,6 +150,9 @@ public class IggySink<T> implements Sink<T>, Serializable {
 
             return httpClient;
 
+        } catch (java.net.URISyntaxException e) {
+            throw new RuntimeException("Invalid server address format: "
+                + connectionConfig.getServerAddress(), e);
         } catch (RuntimeException e) {
             throw new RuntimeException("Failed to create HTTP Iggy client", e);
         }
