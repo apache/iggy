@@ -154,7 +154,7 @@ public class IggySink<T> implements Sink<T>, Serializable {
 
             return httpClient;
 
-        } catch (Exception e) {
+        } catch (RuntimeException e) {
             throw new RuntimeException("Failed to create HTTP Iggy client", e);
         }
     }
