@@ -194,35 +194,35 @@ services:
           -d '{"name": "critical", "partitions_count": 4, "compression_algorithm": "none", "message_expiry": 0, "max_topic_size": 10737418240}' || true
 
         # WordCountJob streams
-        echo "Creating 'text-input' stream (ID: 3)..."
+        echo "Creating 'text-input' stream..."
         curl -s -X POST http://iggy:3000/streams \
           -H "Content-Type: application/json" \
           -H "Authorization: Bearer $$TOKEN" \
-          -d '{"stream_id": 3, "name": "text-input"}' || true
+          -d '{"name": "text-input"}' || true
 
-        echo "Creating 'lines' topic (ID: 1) in 'text-input' stream..."
-        curl -s -X POST http://iggy:3000/streams/3/topics \
+        echo "Creating 'lines' topic in 'text-input' stream..."
+        curl -s -X POST http://iggy:3000/streams/text-input/topics \
           -H "Content-Type: application/json" \
           -H "Authorization: Bearer $$TOKEN" \
-          -d '{"topic_id": 1, "name": "lines", "partitions_count": 2, "compression_algorithm": "none", "message_expiry": 0, "max_topic_size": 10737418240}' || true
+          -d '{"name": "lines", "partitions_count": 2, "compression_algorithm": "none", "message_expiry": 0, "max_topic_size": 10737418240}' || true
 
-        echo "Creating 'word-counts' stream (ID: 4)..."
+        echo "Creating 'word-counts' stream..."
         curl -s -X POST http://iggy:3000/streams \
           -H "Content-Type: application/json" \
           -H "Authorization: Bearer $$TOKEN" \
-          -d '{"stream_id": 4, "name": "word-counts"}' || true
+          -d '{"name": "word-counts"}' || true
 
-        echo "Creating 'results' topic (ID: 1) in 'word-counts' stream..."
-        curl -s -X POST http://iggy:3000/streams/4/topics \
+        echo "Creating 'results' topic in 'word-counts' stream..."
+        curl -s -X POST http://iggy:3000/streams/word-counts/topics \
           -H "Content-Type: application/json" \
           -H "Authorization: Bearer $$TOKEN" \
-          -d '{"topic_id": 1, "name": "results", "partitions_count": 2, "compression_algorithm": "none", "message_expiry": 0, "max_topic_size": 10737418240}' || true
+          -d '{"name": "results", "partitions_count": 2, "compression_algorithm": "none", "message_expiry": 0, "max_topic_size": 10737418240}' || true
 
-        echo "Creating consumer group 'flink-word-counter' (ID: 1) for text-input/lines..."
-        curl -s -X POST http://iggy:3000/streams/3/topics/1/consumer-groups \
+        echo "Creating consumer group 'flink-word-counter' for text-input/lines..."
+        curl -s -X POST http://iggy:3000/streams/text-input/topics/lines/consumer-groups \
           -H "Content-Type: application/json" \
           -H "Authorization: Bearer $$TOKEN" \
-          -d '{"group_id": 1, "name": "flink-word-counter"}' || true
+          -d '{"name": "flink-word-counter"}' || true
 
         # MultiStreamJoinJob streams
         echo "Creating 'user-activities' stream (ID: 5)..."
