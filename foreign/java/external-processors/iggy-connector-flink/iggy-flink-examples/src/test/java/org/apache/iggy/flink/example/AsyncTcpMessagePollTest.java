@@ -51,7 +51,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * - Topic 'lines' exists with at least 2 partitions
  *
  * Run docker-compose first:
- * cd /Users/chiradip/codes/iggy-fork-2/iggy/foreign/java/external-processors/iggy-connector-flink
+ * cd $IGGY_ROOT/foreign/java/external-processors/iggy-connector-flink
  * docker-compose up -d
  */
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
