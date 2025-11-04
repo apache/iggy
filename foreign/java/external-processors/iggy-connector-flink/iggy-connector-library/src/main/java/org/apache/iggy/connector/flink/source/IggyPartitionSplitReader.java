@@ -200,8 +200,8 @@ public class IggyPartitionSplitReader<T> {
 
         } catch (IOException e) {
             // Log warning and skip this message (can be made configurable)
-            System.err.println("Failed to deserialize message at offset "
-                    + message.header().offset() + ": " + e.getMessage());
+            LOGGER.warn("Failed to deserialize message at offset {}: {}",
+                    message.header().offset(), e.getMessage(), e);
             return null;
         }
     }
