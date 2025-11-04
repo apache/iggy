@@ -40,7 +40,7 @@ import java.util.concurrent.CompletableFuture;
  */
 public class IggySourceReader<T> implements SourceReader<T, IggySourceSplit> {
 
-	private static final Logger LOGGER = LoggerFactory.getLogger(IggyPartitionSplitReader.class);
+	private static final Logger LOGGER = LoggerFactory.getLogger(IggySourceReader.class);
 
     private final SourceReaderContext context;
     private final AsyncIggyTcpClient asyncClient;
@@ -185,7 +185,7 @@ public class IggySourceReader<T> implements SourceReader<T, IggySourceSplit> {
                 asyncClient.close().join();
             } catch (RuntimeException e) {
                 // Log but don't throw - we're in cleanup phase
-                LOG.error("Error closing async Iggy client: " + e.getMessage());
+                LOGGER.error("Error closing async Iggy client: " + e.getMessage());
             }
         }
     }
