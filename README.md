@@ -235,11 +235,15 @@ Start the server:
 
 `cargo run --bin iggy-server`
 
+All the data used by the server will be persisted under the `local_data` directory by default, unless specified differently in the configuration (see `system.path` in `server.toml`).
+
 One can use default root credentials with optional `--with-default-root-credentials`.
 This flag is equivalent to setting `IGGY_ROOT_USERNAME=iggy` and `IGGY_ROOT_PASSWORD=iggy`, plus
 it should only be used for development and testing.
 
 `cargo run --bin iggy-server -- --with-default-root-credentials`
+
+Root credentials are only set on the first server startup when the data directory doesn't exist yet. Once the server has been started and persisted data exists, the existing root credentials will be reused, and the `--with-default-root-credentials` flag or environment variables will have no effect. To reset credentials, delete the data directory.
 
 For configuration options and detailed help:
 
