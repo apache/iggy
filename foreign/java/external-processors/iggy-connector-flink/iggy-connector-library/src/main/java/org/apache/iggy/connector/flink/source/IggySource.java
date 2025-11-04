@@ -174,7 +174,7 @@ public class IggySource<T> implements Source<T, IggySourceSplit, IggySourceEnume
             if (serverAddress.contains(":")) {
                 String[] parts = serverAddress.split(":");
                 host = parts[0];
-                port = Integer.parseInteger(parts[1]);
+                port = Integer.parseInt(parts[1]);
             } else {
                 host = serverAddress;
             }
