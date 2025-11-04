@@ -28,6 +28,9 @@ import org.apache.iggy.client.async.tcp.AsyncIggyTcpClient;
 import org.apache.iggy.consumergroup.Consumer;
 import org.apache.iggy.connector.serialization.DeserializationSchema;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
 
@@ -36,6 +39,8 @@ import java.util.concurrent.CompletableFuture;
  * Manages multiple partition split readers and coordinates reading from them.
  */
 public class IggySourceReader<T> implements SourceReader<T, IggySourceSplit> {
+
+	private static final Logger LOGGER = LoggerFactory.getLogger(IggyPartitionSplitReader.class);
 
     private final SourceReaderContext context;
     private final AsyncIggyTcpClient asyncClient;
@@ -178,9 +183,9 @@ public class IggySourceReader<T> implements SourceReader<T, IggySourceSplit> {
         if (asyncClient != null) {
             try {
                 asyncClient.close().join();
-            } catch (Exception e) {
+            } catch (RuntimeException e) {
                 // Log but don't throw - we're in cleanup phase
-                System.err.println("Error closing async Iggy client: " + e.getMessage());
+                LOG.error("Error closing async Iggy client: " + e.getMessage());
             }
         }
     }
