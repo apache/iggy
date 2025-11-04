@@ -19,6 +19,9 @@
 
 package org.apache.iggy.connector.serialization;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.SerializationFeature;
@@ -35,6 +38,8 @@ import java.util.function.Function;
  * @param <T> the type to serialize from
  */
 public class JsonSerializationSchema<T> implements SerializationSchema<T> {
+	
+	private static final Logger LOG = LoggerFactory.getLogger(JsonSerializationSchema.class);
 
     private static final long serialVersionUID = 1L;
 
@@ -115,8 +120,9 @@ public class JsonSerializationSchema<T> implements SerializationSchema<T> {
             try {
                 Integer key = partitionKeyExtractor.apply(element);
                 return Optional.ofNullable(key);
-            } catch (Exception e) {
+            } catch (RuntimeException e) {
                 // Log and return empty if extraction fails
+				LOG.warn("Failed to extract partitionKey: {}", e.getMessage());
                 return Optional.empty();
             }
         }
