@@ -127,13 +127,13 @@ public class IggySinkWriter<T> implements SinkWriter<T> {
 
     @Override
     public void write(T element, Context context) throws IOException {
-        LOGGER.info("IggySinkWriter.write() called - element: {}, buffer size: {}",
+        LOGGER.debug("IggySinkWriter.write() called - element: {}, buffer size: {}",
                 element, buffer.size());
         buffer.add(element);
 
         // Flush if batch size reached or flush interval exceeded
         if (buffer.size() >= batchSize || shouldFlushByTime()) {
-            LOGGER.info("IggySinkWriter: Flushing buffer of size {}", buffer.size());
+            LOGGER.debug("IggySinkWriter: Flushing buffer of size {}", buffer.size());
             flush(false);
         }
     }
@@ -145,7 +145,7 @@ public class IggySinkWriter<T> implements SinkWriter<T> {
             return;
         }
 
-        LOGGER.info("IggySinkWriter.flush() - flushing {} messages to stream={}, topic={}",
+        LOGGER.debug("IggySinkWriter.flush() - flushing {} messages to stream={}, topic={}",
             buffer.size(), streamId, topicId);
 
         try {
@@ -164,14 +164,14 @@ public class IggySinkWriter<T> implements SinkWriter<T> {
             StreamId stream = parseStreamId(streamId);
             TopicId topic = parseTopicId(topicId);
 
-            LOGGER.info("IggySinkWriter: Sending {} messages with partitioning={}",
+            LOGGER.debug("IggySinkWriter: Sending {} messages with partitioning={}",
                     messages.size(), partitioning);
             CompletableFuture.runAsync(() -> {
                 httpClient.messages().sendMessages(stream, topic, partitioning, messages);
             }).join();
 
             totalWritten += buffer.size();
-            LOGGER.info("IggySinkWriter: Successfully sent {} messages. Total written: {}",
+            LOGGER.debug("IggySinkWriter: Successfully sent {} messages. Total written: {}",
                     buffer.size(), totalWritten);
 
             // Clear buffer and update flush time
