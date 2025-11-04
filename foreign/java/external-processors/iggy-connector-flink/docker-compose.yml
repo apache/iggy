@@ -169,29 +169,29 @@ services:
         echo "Creating streams and topics for examples..."
 
         # StreamTransformJob streams
-        echo "Creating 'sensors' stream (ID: 1)..."
+        echo "Creating 'sensors' stream..."
         curl -s -X POST http://iggy:3000/streams \
           -H "Content-Type: application/json" \
           -H "Authorization: Bearer $$TOKEN" \
-          -d '{"stream_id": 1, "name": "sensors"}' || true
+          -d '{"name": "sensors"}' || true
 
-        echo "Creating 'readings' topic (ID: 1) in 'sensors' stream..."
-        curl -s -X POST http://iggy:3000/streams/1/topics \
+        echo "Creating 'readings' topic in 'sensors' stream..."
+        curl -s -X POST http://iggy:3000/streams/sensors/topics \
           -H "Content-Type: application/json" \
           -H "Authorization: Bearer $$TOKEN" \
-          -d '{"topic_id": 1, "name": "readings", "partitions_count": 4, "compression_algorithm": "none", "message_expiry": 0, "max_topic_size": 10737418240}' || true
+          -d '{"name": "readings", "partitions_count": 4, "compression_algorithm": "none", "message_expiry": 0, "max_topic_size": 10737418240}' || true
 
-        echo "Creating 'alerts' stream (ID: 2)..."
+        echo "Creating 'alerts' stream..."
         curl -s -X POST http://iggy:3000/streams \
           -H "Content-Type: application/json" \
           -H "Authorization: Bearer $$TOKEN" \
-          -d '{"stream_id": 2, "name": "alerts"}' || true
+          -d '{"name": "alerts"}' || true
 
-        echo "Creating 'critical' topic (ID: 1) in 'alerts' stream..."
-        curl -s -X POST http://iggy:3000/streams/2/topics \
+        echo "Creating 'critical' topic in 'alerts' stream..."
+        curl -s -X POST http://iggy:3000/streams/alerts/topics \
           -H "Content-Type: application/json" \
           -H "Authorization: Bearer $$TOKEN" \
-          -d '{"topic_id": 1, "name": "critical", "partitions_count": 4, "compression_algorithm": "none", "message_expiry": 0, "max_topic_size": 10737418240}' || true
+          -d '{"name": "critical", "partitions_count": 4, "compression_algorithm": "none", "message_expiry": 0, "max_topic_size": 10737418240}' || true
 
         # WordCountJob streams
         echo "Creating 'text-input' stream (ID: 3)..."
