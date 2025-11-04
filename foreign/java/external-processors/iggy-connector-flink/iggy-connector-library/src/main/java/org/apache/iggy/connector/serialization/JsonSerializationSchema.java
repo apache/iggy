@@ -38,7 +38,7 @@ import java.util.function.Function;
  * @param <T> the type to serialize from
  */
 public class JsonSerializationSchema<T> implements SerializationSchema<T> {
-	
+
 	private static final Logger LOG = LoggerFactory.getLogger(JsonSerializationSchema.class);
 
     private static final long serialVersionUID = 1L;
