@@ -94,7 +94,7 @@ pub struct Args {
     ///
     /// When this flag is set, the root user will be created with username 'iggy'
     /// and password 'iggy' if it doesn't exist. If the root user already exists,
-    /// this flag has no effect and a warning will be printed.
+    /// this flag has no effect.
     ///
     /// This flag is equivalent to setting IGGY_ROOT_USERNAME=iggy and IGGY_ROOT_PASSWORD=iggy,
     /// but environment variables take precedence over this flag.

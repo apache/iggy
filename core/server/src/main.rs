@@ -103,7 +103,8 @@ async fn main() -> Result<(), ServerError> {
                 }
             }
             info!(
-                "Using default root credentials (username: iggy, password: iggy) - FOR DEVELOPMENT ONLY!"
+                "Using default root credentials (username: iggy, password: iggy) - FOR DEVELOPMENT ONLY! \
+                If root user already exists, existing credentials will be reused."
             );
         } else {
             warn!(
