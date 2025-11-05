@@ -84,7 +84,7 @@ export class CommandResponseStream extends EventEmitter {
     if (!this.isAuthenticated && !UNLOGGED_COMMAND_CODE.includes(command))
       await this.authenticate(this.options.credentials);
 
-    return new Promise(async (resolve, reject) => {
+    return new Promise((resolve, reject) => {
       if (last)
         this._execQueue.push({ command, payload, resolve, reject });
       else
