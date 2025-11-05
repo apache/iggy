@@ -33,6 +33,10 @@ repositories {
 }
 
 java {
+    // Keep Java 17 for SDK compatibility with broader ecosystem
+    sourceCompatibility = JavaVersion.VERSION_17
+    targetCompatibility = JavaVersion.VERSION_17
+
     withJavadocJar()
     withSourcesJar()
 }
