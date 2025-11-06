@@ -15,16 +15,35 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Apache.Iggy.Contracts;
+namespace Apache.Iggy.Contracts;
 
-namespace Apache.Iggy.IggyClient;
-
-public interface IIggySystem
+/// <summary>
+///     Current status of a node
+/// </summary>
+public enum ClusterNodeStatus : byte
 {
-    Task<IReadOnlyList<ClientResponse>> GetClientsAsync(CancellationToken token = default);
-    Task<ClientResponse?> GetClientByIdAsync(uint clientId, CancellationToken token = default);
-    Task<ClientResponse?> GetMeAsync(CancellationToken token = default);
-    Task<StatsResponse?> GetStatsAsync(CancellationToken token = default);
-    Task<ClusterMetadata?> GetClusterMetadataAsync(CancellationToken token = default);
-    Task PingAsync(CancellationToken token = default);
+    /// <summary>
+    ///     Node is healthy and responsive
+    /// </summary>
+    Healthy = 0,
+
+    /// <summary>
+    ///     Node is starting up
+    /// </summary>
+    Starting = 1,
+
+    /// <summary>
+    ///     Node is shutting down
+    /// </summary>
+    Stopping = 2,
+
+    /// <summary>
+    ///     Node is unreachable
+    /// </summary>
+    Unreachable = 3,
+
+    /// <summary>
+    ///     Node is in maintenance mode
+    /// </summary>
+    Maintenance = 4
 }

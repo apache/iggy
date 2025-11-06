@@ -17,6 +17,7 @@
 
 using System.Buffers;
 using System.Buffers.Binary;
+using System.Reflection.PortableExecutable;
 using System.Text;
 using Apache.Iggy.Contracts;
 using Apache.Iggy.Contracts.Auth;
@@ -894,5 +895,67 @@ internal static class BinaryMapper
             MembersCount = membersCount,
             PartitionsCount = partitionsCount
         }, 13 + name.Length);
+    }
+
+    internal static ClusterMetadata MapClusterMetadata(ReadOnlySpan<byte> payload)
+    {
+        var nameLength = BinaryPrimitives.ReadUInt32LittleEndian(payload[..4]);
+        var clusterName = Encoding.UTF8.GetString(payload[4..(4 + (int)nameLength)]);
+        var position = 4 + (int)nameLength;
+        
+        var clusterId =  BinaryPrimitives.ReadUInt32LittleEndian(payload[position..(position + 4)]);
+        position += 4;
+        
+        var protocol = (Protocol)payload[position];
+        position += 1;
+
+        var nodesCount = BinaryPrimitives.ReadUInt32LittleEndian(payload[position..(position + 4)]);
+        position += 4;
+
+        var nodes = new ClusterNode[nodesCount];
+        for (var i = 0; i < nodesCount; i++)
+        {
+            var node = MapClusterNode(payload[position..]);
+            nodes[i] = node;
+            position += node.GetSize();
+        }
+
+        return new ClusterMetadata()
+        {
+            Id = clusterId,
+            Name = clusterName,
+            Transport = protocol,
+            Nodes = nodes
+        };
+    }
+
+    private static ClusterNode MapClusterNode(ReadOnlySpan<byte> payload)
+    {
+        var id = BinaryPrimitives.ReadUInt32LittleEndian(payload[..4]);
+        var position = 4;
+
+        var nameLength = BinaryPrimitives.ReadUInt32LittleEndian(payload[position..(position + 4)]);
+        position += 4;
+        
+        var name = Encoding.UTF8.GetString(payload[position..(position + (int)nameLength)]);
+        position += (int)nameLength;
+        
+        var addressLength = BinaryPrimitives.ReadUInt32LittleEndian(payload[position..(position + 4)]);
+        position += 4;
+        
+        var address = Encoding.UTF8.GetString(payload[position..(position + (int)addressLength)]);
+        position += (int)addressLength;
+        
+        var role = (ClusterNodeRole)payload[position++];
+        var status = (ClusterNodeStatus)payload[position];
+
+        return new ClusterNode()
+        {
+            Id = id,
+            Name = name,
+            Address = address,
+            Role = role,
+            Status = status
+        };
     }
 }

@@ -442,6 +442,27 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
 
         return BinaryMapper.MapStats(responseBuffer);
     }
+    
+    /// <summary>
+    /// Get cluster metadata
+    /// </summary>
+    /// <param name="token"></param>
+    /// <returns>Cluster information</returns>
+    public async Task<ClusterMetadata?> GetClusterMetadataAsync(CancellationToken token = default)
+    {
+        var message = Array.Empty<byte>();
+        var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
+        TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.GET_CLUSTER_METADATA_CODE);
+
+        var responseBuffer = await SendWithResponseAsync(payload, token);
+
+        if (responseBuffer.Length == 0)
+        {
+            return null;
+        }
+
+        return BinaryMapper.MapClusterMetadata(responseBuffer);
+    }
 
     public async Task PingAsync(CancellationToken token = default)
     {

@@ -15,16 +15,32 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Apache.Iggy.Contracts;
+using Apache.Iggy.Enums;
 
-namespace Apache.Iggy.IggyClient;
+namespace Apache.Iggy.Contracts;
 
-public interface IIggySystem
+/// <summary>
+///     Represents metadata of all nodes in the cluster
+/// </summary>
+public class ClusterMetadata
 {
-    Task<IReadOnlyList<ClientResponse>> GetClientsAsync(CancellationToken token = default);
-    Task<ClientResponse?> GetClientByIdAsync(uint clientId, CancellationToken token = default);
-    Task<ClientResponse?> GetMeAsync(CancellationToken token = default);
-    Task<StatsResponse?> GetStatsAsync(CancellationToken token = default);
-    Task<ClusterMetadata?> GetClusterMetadataAsync(CancellationToken token = default);
-    Task PingAsync(CancellationToken token = default);
+    /// <summary>
+    ///     Name of the cluster
+    /// </summary>
+    public required string Name { get; set; }
+
+    /// <summary>
+    ///     Unique identifier of the cluster
+    /// </summary>
+    public required uint Id { get; set; }
+
+    /// <summary>
+    ///     Transport used for cluster communication
+    /// </summary>
+    public required Protocol Transport { get; set; }
+
+    /// <summary>
+    ///     List of all nodes in the cluster
+    /// </summary>
+    public required ClusterNode[] Nodes { get; set; } = [];
 }

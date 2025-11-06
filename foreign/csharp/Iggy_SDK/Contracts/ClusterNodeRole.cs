@@ -15,16 +15,20 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Apache.Iggy.Contracts;
+namespace Apache.Iggy.Contracts;
 
-namespace Apache.Iggy.IggyClient;
-
-public interface IIggySystem
+/// <summary>
+///     Node role within the cluster
+/// </summary>
+public enum ClusterNodeRole : byte
 {
-    Task<IReadOnlyList<ClientResponse>> GetClientsAsync(CancellationToken token = default);
-    Task<ClientResponse?> GetClientByIdAsync(uint clientId, CancellationToken token = default);
-    Task<ClientResponse?> GetMeAsync(CancellationToken token = default);
-    Task<StatsResponse?> GetStatsAsync(CancellationToken token = default);
-    Task<ClusterMetadata?> GetClusterMetadataAsync(CancellationToken token = default);
-    Task PingAsync(CancellationToken token = default);
+    /// <summary>
+    ///     Primary/Leader node - handles all writes
+    /// </summary>
+    Leader = 0,
+
+    /// <summary>
+    ///     Follower/Secondary node - read replica
+    /// </summary>
+    Follower = 1
 }

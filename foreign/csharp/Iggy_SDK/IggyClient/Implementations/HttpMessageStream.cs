@@ -397,6 +397,24 @@ public class HttpMessageStream : IIggyClient
         await HandleResponseAsync(response);
         return null;
     }
+    
+    /// <summary>
+    /// Get cluster metadata
+    /// </summary>
+    /// <param name="token"></param>
+    /// <returns>Cluster information</returns>
+    public async Task<ClusterMetadata?> GetClusterMetadataAsync(CancellationToken token = default)
+    {
+        var response = await _httpClient.GetAsync("/cluster/metadata", token);
+        if (response.IsSuccessStatusCode)
+        {
+            return await response.Content.ReadFromJsonAsync<ClusterMetadata>(_jsonSerializerOptions, token);
+        }
+
+        await HandleResponseAsync(response);
+
+        return null;
+    }
 
     public async Task PingAsync(CancellationToken token = default)
     {
