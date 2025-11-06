@@ -135,7 +135,7 @@ spec:
                 port:
                   number: {{ $svcPort }}
               {{- else }}
-              serviceName: {{ $fullName }}
+              serviceName: {{ $fullName }}-ui
               servicePort: {{ $svcPort }}
               {{- end }}
           {{- end }}
