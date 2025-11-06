@@ -24,9 +24,9 @@ use crate::configs::http::{
 };
 use crate::configs::quic::{QuicCertificateConfig, QuicConfig};
 use crate::configs::server::{
-    ArchiverConfig, DataMaintenanceConfig, HeartbeatConfig, MessageSaverConfig,
+    ArchiverConfig, DataMaintenanceConfig, DiskArchiverConfig, HeartbeatConfig, MessageSaverConfig,
     MessagesMaintenanceConfig, PersonalAccessTokenCleanerConfig, PersonalAccessTokenConfig,
-    ServerConfig, StateMaintenanceConfig, TelemetryConfig, TelemetryLogsConfig,
+    S3ArchiverConfig, ServerConfig, StateMaintenanceConfig, TelemetryConfig, TelemetryLogsConfig,
     TelemetryTracesConfig,
 };
 use crate::configs::system::{
@@ -74,8 +74,8 @@ impl Default for ArchiverConfig {
                 .kind
                 .parse()
                 .unwrap(),
-            disk: None,
-            s3: None,
+            disk: Some(DiskArchiverConfig::default()),
+            s3: Some(S3ArchiverConfig::default()),
         }
     }
 }
@@ -566,6 +566,73 @@ impl Default for NodeConfig {
     fn default() -> NodeConfig {
         NodeConfig {
             id: SERVER_CONFIG.cluster.node.id as u32,
+        }
+    }
+}
+
+impl Default for S3ArchiverConfig {
+    fn default() -> S3ArchiverConfig {
+        S3ArchiverConfig {
+            bucket: SERVER_CONFIG
+                .data_maintenance
+                .archiver
+                .s_3
+                .bucket
+                .parse()
+                .unwrap(),
+            region: Some(
+                SERVER_CONFIG
+                    .data_maintenance
+                    .archiver
+                    .s_3
+                    .region
+                    .parse()
+                    .unwrap(),
+            ),
+            key_id: SERVER_CONFIG
+                .data_maintenance
+                .archiver
+                .s_3
+                .key_id
+                .parse()
+                .unwrap(),
+            key_secret: SERVER_CONFIG
+                .data_maintenance
+                .archiver
+                .s_3
+                .key_secret
+                .parse()
+                .unwrap(),
+            endpoint: Some(
+                SERVER_CONFIG
+                    .data_maintenance
+                    .archiver
+                    .s_3
+                    .endpoint
+                    .parse()
+                    .unwrap(),
+            ),
+            tmp_upload_dir: SERVER_CONFIG
+                .data_maintenance
+                .archiver
+                .s_3
+                .tmp_upload_dir
+                .parse()
+                .unwrap(),
+        }
+    }
+}
+
+impl Default for DiskArchiverConfig {
+    fn default() -> DiskArchiverConfig {
+        DiskArchiverConfig {
+            path: SERVER_CONFIG
+                .data_maintenance
+                .archiver
+                .disk
+                .path
+                .parse()
+                .unwrap(),
         }
     }
 }
