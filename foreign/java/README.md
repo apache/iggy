@@ -25,3 +25,56 @@ You can find examples for
 simple [consumer](https://github.com/apache/iggy/blob/master/foreign/java/examples/simple-consumer/src/main/java/org/apache/iggy/SimpleConsumer.java)
 and [producer](https://github.com/apache/iggy/blob/master/foreign/java/examples/simple-producer/src/main/java/org/apache/iggy/SimpleProducer.java)
 in the repository.
+
+### Auto Consumer Group (New Feature)
+
+The Java SDK now includes support for automatic consumer group management with built-in rebalancing capabilities. This feature simplifies the process of managing consumer groups by automatically handling:
+
+- Heartbeat management
+- Partition rebalancing
+- Automatic join/leave operations
+- Callbacks for partition assignment changes
+
+Example usage:
+
+```java
+// Configure consumer group
+ConsumerGroupConfig config = ConsumerGroupConfig.builder()
+    .sessionTimeout(Duration.ofSeconds(30))
+    .heartbeatInterval(Duration.ofSeconds(10))
+    .rebalanceStrategy(RebalanceStrategy.ROUND_ROBIN)
+    .autoCommit(true)
+    .autoCommitInterval(Duration.ofSeconds(5))
+    .onPartitionsAssigned(partitions -> {
+        System.out.println("Assigned partitions: " + partitions);
+        // Initialize partition state
+    })
+    .onPartitionsRevoked(partitions -> {
+        System.out.println("Revoked partitions: " + partitions);
+        // Cleanup partition state
+    })
+    .build();
+
+// Create and initialize consumer group
+AutoConsumerGroup consumerGroup = client.consumerGroup()
+    .stream("my-stream")
+    .topic("my-topic")
+    .groupName("my-consumer-group")
+    .config(config)
+    .build();
+
+try {
+    consumerGroup.init();
+    
+    // Consume messages
+    while (running) {
+        var messages = consumerGroup.poll(Duration.ofSeconds(1));
+        for (var message : messages.messages()) {
+            System.out.println("Received message: " + new String(message.payload()));
+            // Process message
+        }
+    }
+} finally {
+    consumerGroup.close();  // Automatically leaves the consumer group
+}
+```
