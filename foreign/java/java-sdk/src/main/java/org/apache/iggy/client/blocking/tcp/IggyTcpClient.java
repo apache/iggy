@@ -29,6 +29,7 @@ import org.apache.iggy.client.blocking.StreamsClient;
 import org.apache.iggy.client.blocking.SystemClient;
 import org.apache.iggy.client.blocking.TopicsClient;
 import org.apache.iggy.client.blocking.UsersClient;
+import org.apache.iggy.consumergroup.auto.AutoConsumerGroup;
 
 public class IggyTcpClient implements IggyBaseClient {
 
@@ -101,4 +102,12 @@ public class IggyTcpClient implements IggyBaseClient {
         return personalAccessTokensClient;
     }
 
+    /**
+     * Creates a new AutoConsumerGroup builder.
+     *
+     * @return a new AutoConsumerGroup builder
+     */
+    public AutoConsumerGroup.Builder consumerGroup() {
+        return AutoConsumerGroup.builder().client(this);
+    }
 }
