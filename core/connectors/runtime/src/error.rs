@@ -46,6 +46,8 @@ pub enum RuntimeError {
     SourceNotFound(String),
     #[error("Cannot convert configuration")]
     CannotConvertConfiguration,
+    #[error("IO operation failed with error: {0:?}")]
+    IoError(#[from] std::io::Error),
 }
 
 impl RuntimeError {

@@ -14,7 +14,7 @@ To start the connector runtime, simply run `cargo run --bin iggy-connectors`.
 
 The [docker image](https://hub.docker.com/r/apache/iggy-connect) is available, and can be fetched via `docker pull apache/iggy-connect`.
 
-The minimal viable configuration requires at least the Iggy credentials, to create 2 separate instances of producer & consumer connections and the state directory path where source connectors can store their optional state.
+The minimal viable configuration requires at least the Iggy credentials to create 2 separate instances of producer & consumer connections, the state directory path where source connectors can store their optional state, and the `connectors.config_dir` setting that specifies the directory containing individual connector configuration files.
 
 ```toml
 [iggy]
@@ -25,11 +25,14 @@ token = "" # Personal Access Token (PAT) can be used instead of username and pas
 
 [state]
 path = "local_state"
+
+[connectors]
+config_dir = "path/to/connectors"
 ```
 
-All the other config sections start either with `sources` or `sinks` depending on the connector type.
+Each connector (source or sink) is configured in its own separate file within the directory specified by `connectors.config_dir`. If `config_dir` is empty or the directory doesn't exist, no connectors will be loaded.
 
-Keep in mind that either of `toml`, `yaml`, or `json` formats are supported for the configuration file. The path to the configuration can be overriden by `IGGY_CONNECTORS_CONFIG_PATH` environment variable. Each configuration section can be also additionally updated by using the following convention `IGGY_CONNECTORS_SECTION_NAME.KEY_NAME` e.g. `IGGY_CONNECTORS_IGGY_USERNAME` and so on.
+The path to the configuration can be overridden by `IGGY_CONNECTORS_CONFIG_PATH` environment variable. Each configuration section can be also additionally updated by using the following convention `IGGY_CONNECTORS_SECTION_NAME.KEY_NAME` e.g. `IGGY_CONNECTORS_IGGY_USERNAME` and so on.
 
 ## HTTP API
 
