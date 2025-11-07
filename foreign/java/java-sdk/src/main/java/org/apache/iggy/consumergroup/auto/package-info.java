@@ -17,36 +17,7 @@
  * under the License.
  */
 
-package org.apache.iggy.client.blocking;
-
-import org.apache.iggy.consumergroup.auto.AutoConsumerGroup;
-
-public interface IggyBaseClient {
-
-    SystemClient system();
-
-    StreamsClient streams();
-
-    UsersClient users();
-
-    TopicsClient topics();
-
-    PartitionsClient partitions();
-
-    ConsumerGroupsClient consumerGroups();
-
-    ConsumerOffsetsClient consumerOffsets();
-
-    MessagesClient messages();
-
-    PersonalAccessTokensClient personalAccessTokens();
-
-    /**
-     * Creates a new AutoConsumerGroup builder.
-     *
-     * @return a new AutoConsumerGroup builder
-     */
-    default AutoConsumerGroup.Builder consumerGroup() {
-        throw new UnsupportedOperationException("AutoConsumerGroup not supported by this client implementation");
-    }
-}
+/**
+ * Provides classes for automatic consumer group management with auto-rebalancing capabilities.
+ */
+package org.apache.iggy.consumergroup.auto;

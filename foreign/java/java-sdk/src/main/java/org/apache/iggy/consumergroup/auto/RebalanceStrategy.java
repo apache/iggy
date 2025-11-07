@@ -17,36 +17,14 @@
  * under the License.
  */
 
-package org.apache.iggy.client.blocking;
+package org.apache.iggy.consumergroup.auto;
 
-import org.apache.iggy.consumergroup.auto.AutoConsumerGroup;
-
-public interface IggyBaseClient {
-
-    SystemClient system();
-
-    StreamsClient streams();
-
-    UsersClient users();
-
-    TopicsClient topics();
-
-    PartitionsClient partitions();
-
-    ConsumerGroupsClient consumerGroups();
-
-    ConsumerOffsetsClient consumerOffsets();
-
-    MessagesClient messages();
-
-    PersonalAccessTokensClient personalAccessTokens();
-
+/**
+ * Strategy for rebalancing partitions among consumer group members.
+ */
+public enum RebalanceStrategy {
     /**
-     * Creates a new AutoConsumerGroup builder.
-     *
-     * @return a new AutoConsumerGroup builder
+     * Round-robin strategy for distributing partitions among consumers.
      */
-    default AutoConsumerGroup.Builder consumerGroup() {
-        throw new UnsupportedOperationException("AutoConsumerGroup not supported by this client implementation");
-    }
+    ROUND_ROBIN
 }
