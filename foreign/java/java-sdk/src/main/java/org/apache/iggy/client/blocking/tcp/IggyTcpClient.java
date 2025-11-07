@@ -142,15 +142,6 @@ public class IggyTcpClient implements IggyBaseClient {
     }
 
     /**
-     * Creates a new AutoConsumerGroup builder.
-     *
-     * @return a new AutoConsumerGroup builder
-     */
-    public AutoConsumerGroup.Builder consumerGroup() {
-        return AutoConsumerGroup.builder().client(this);
-    }
-
-    /**
      * Builder for creating configured IggyTcpClient instances.
      */
     public static class Builder {
