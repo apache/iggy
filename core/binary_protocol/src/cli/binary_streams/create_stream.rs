@@ -36,7 +36,7 @@ impl CreateStreamCmd {
 
     fn get_stream_id_info(&self) -> String {
         match self.create_stream.stream_id {
-            Some(stream_id) => format!("ID: {}", stream_id),
+            Some(stream_id) => format!("ID: {stream_id}"),
             None => "ID auto incremented".to_string(),
         }
     }

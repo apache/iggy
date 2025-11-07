@@ -9,7 +9,7 @@
     </PropertyGroup>
 
     <ItemGroup>
-      <ProjectReference Include="..\Iggy_SDK\Iggy_SDK.csproj" />
+        <ProjectReference Include="..\Iggy_SDK\Iggy_SDK.csproj" />
     </ItemGroup>
 
 </Project>

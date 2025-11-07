@@ -13,7 +13,7 @@
 <ModalBase {closeModal} title="Edit user permissions">
   <div class="h-[300px] flex flex-col">
     <!-- <div class="flex justify-end gap-3 mt-auto">
-              <Button variant="text" class="w-2/5" on:click={closeModal}>Cancel</Button>
+              <Button variant="text" class="w-2/5" onclick={closeModal}>Cancel</Button>
               <Button type="submit" variant="contained" class="w-2/5">Save</Button>
             </div> -->
   </div>

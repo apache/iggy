@@ -16,11 +16,14 @@
  * under the License.
  */
 
+use crate::client_wrappers::client_wrapper::ClientWrapper;
 use bytes::Bytes;
 use dashmap::DashMap;
 use futures::Stream;
 use futures_util::{FutureExt, StreamExt};
-use iggy_binary_protocol::Client;
+use iggy_binary_protocol::{
+    Client, ConsumerGroupClient, ConsumerOffsetClient, MessageClient, StreamClient, TopicClient,
+};
 use iggy_common::locking::{IggySharedMut, IggySharedMutFn};
 use iggy_common::{
     Consumer, ConsumerKind, DiagnosticEvent, EncryptorKind, IdKind, Identifier, IggyDuration,
@@ -93,7 +96,7 @@ unsafe impl Sync for IggyConsumer {}
 pub struct IggyConsumer {
     initialized: bool,
     can_poll: Arc<AtomicBool>,
-    client: IggySharedMut<Box<dyn Client>>,
+    client: IggySharedMut<ClientWrapper>,
     consumer_name: String,
     consumer: Arc<Consumer>,
     is_consumer_group: bool,
@@ -129,7 +132,7 @@ pub struct IggyConsumer {
 impl IggyConsumer {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        client: IggySharedMut<Box<dyn Client>>,
+        client: IggySharedMut<ClientWrapper>,
         consumer_name: String,
         consumer: Consumer,
         stream_id: Identifier,
@@ -405,7 +408,7 @@ impl IggyConsumer {
 
     #[allow(clippy::too_many_arguments)]
     async fn store_consumer_offset(
-        client: &IggySharedMut<Box<dyn Client>>,
+        client: &IggySharedMut<ClientWrapper>,
         consumer: &Consumer,
         stream_id: &Identifier,
         topic_id: &Identifier,
@@ -767,6 +770,14 @@ impl IggyConsumer {
         }
 
         let now: u64 = IggyTimestamp::now().into();
+        if now < last_sent_at {
+            warn!(
+                "Returned monotonic time went backwards, now < last_sent_at: ({now} < {last_sent_at})"
+            );
+            sleep(Duration::from_micros(interval)).await;
+            return;
+        }
+
         let elapsed = now - last_sent_at;
         if elapsed >= interval {
             trace!("No need to wait before polling messages. {now} - {last_sent_at} = {elapsed}");
@@ -781,7 +792,7 @@ impl IggyConsumer {
     }
 
     async fn initialize_consumer_group(
-        client: IggySharedMut<Box<dyn Client>>,
+        client: IggySharedMut<ClientWrapper>,
         create_consumer_group_if_not_exists: bool,
         stream_id: Arc<Identifier>,
         topic_id: Arc<Identifier>,
@@ -936,13 +947,12 @@ impl Stream for IggyConsumer {
                         if let Some(ref encryptor) = self.encryptor {
                             for message in &mut polled_messages.messages {
                                 let payload = encryptor.decrypt(&message.payload);
-                                if payload.is_err() {
+                                if let Err(error) = payload {
                                     self.poll_future = None;
                                     error!(
                                         "Failed to decrypt the message payload at offset: {}, partition ID: {}",
                                         message.header.offset, partition_id
                                     );
-                                    let error = payload.unwrap_err();
                                     return Poll::Ready(Some(Err(error)));
                                 }
 

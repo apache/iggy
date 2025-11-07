@@ -17,23 +17,24 @@
 
 using System.Text.Json;
 using System.Text.Json.Serialization;
-using Apache.Iggy.JsonConfiguration;
 
 namespace Apache.Iggy.Shared;
 
 public sealed class Envelope
 {
-    private JsonSerializerOptions _jsonSerializerOptions = new();
+    private readonly JsonSerializerOptions _jsonSerializerOptions = new();
+
+    [JsonPropertyName("message_type")]
+    public string MessageType { get; set; } = "";
+
+    [JsonPropertyName("payload")]
+    public string Payload { get; set; } = "";
 
     public Envelope()
     {
-        _jsonSerializerOptions.PropertyNamingPolicy = new ToSnakeCaseNamingPolicy();
+        _jsonSerializerOptions.PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower;
         _jsonSerializerOptions.WriteIndented = true;
     }
-
-    [JsonPropertyName("message_type")] public string MessageType { get; set; } = "";
-
-    [JsonPropertyName("payload")] public string Payload { get; set; } = "";
 
     public Envelope New<T>(string messageType, T payload) where T : ISerializableMessage
     {

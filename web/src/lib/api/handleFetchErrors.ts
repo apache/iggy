@@ -70,8 +70,8 @@ export const handleFetchErrors = async (
     404: () => {
       console.log(`handleErrorStatus: 404 ${response.url}`);
       error(404, {
-                message: 'Not Found'
-              });
+        message: 'Not Found'
+      });
     }
   };
 
@@ -81,6 +81,6 @@ export const handleFetchErrors = async (
   console.log(`handleErrorStatus: 500 ${response.url}`);
 
   error(500, {
-        message: 'handleErrorStatus: Internal server error'
-      });
+    message: 'handleErrorStatus: Internal server error'
+  });
 };

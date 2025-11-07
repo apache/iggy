@@ -17,7 +17,6 @@
 
 namespace Apache.Iggy.Enums;
 
-
 //By offset (using the indexes)
 //By timestamp (using the time indexes)
 //First/Last N messages

@@ -20,20 +20,30 @@
 plugins {
     id("java-library")
     id("maven-publish")
+    id("signing")
     id("org.jreleaser") version ("1.14.0")
     id("checkstyle")
 }
 
 group = "org.apache.iggy"
-version = "0.2.0-SNAPSHOT"
+version = "0.5.0-SNAPSHOT"
 
 repositories {
     mavenCentral()
 }
 
 java {
+    // Keep Java 17 for SDK compatibility with broader ecosystem
+    sourceCompatibility = JavaVersion.VERSION_17
+    targetCompatibility = JavaVersion.VERSION_17
+
     withJavadocJar()
     withSourcesJar()
+}
+
+signing {
+    useGpgCmd()
+    sign(publishing.publications)
 }
 
 checkstyle {
@@ -42,10 +52,10 @@ checkstyle {
 }
 
 dependencies {
-    implementation("org.apache.httpcomponents.client5:httpclient5:5.4")
+    implementation("org.apache.httpcomponents.client5:httpclient5:5.4.3")
     implementation("com.fasterxml.jackson.core:jackson-databind:2.18.0")
     implementation("com.fasterxml.jackson.datatype:jackson-datatype-jdk8:2.18.0")
-    implementation("org.apache.commons:commons-lang3:3.17.0")
+    implementation("org.apache.commons:commons-lang3:3.18.0")
     implementation("org.slf4j:slf4j-api:2.0.16")
     implementation("com.google.code.findbugs:jsr305:3.0.2")
     implementation("io.projectreactor:reactor-core:3.6.11")
@@ -68,8 +78,8 @@ publishing {
     publications {
         create<MavenPublication>("maven") {
             groupId = "org.apache.iggy"
-            artifactId = "iggy-java-sdk"
-            version = "0.2.0-SNAPSHOT"
+            artifactId = "iggy"
+            version = "0.5.0-SNAPSHOT"
 
             from(components["java"])
 
@@ -109,9 +119,8 @@ publishing {
             url = uri(if ((version as String).endsWith("SNAPSHOT")) snapshotsRepoUrl else releasesRepoUrl)
 
             credentials {
-                // Assumes 'apacheUserName' and 'apachePassWord' are available as properties
-                username = System.getenv("secrets.NEXUS_USER")
-                password = System.getenv("secrets.NEXUS_PASSWORD")
+                username = System.getenv("NEXUS_USER")
+                password = System.getenv("NEXUS_PASSWORD")
             }
         }
     }

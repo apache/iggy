@@ -2,8 +2,9 @@
   import { goto } from '$app/navigation';
   import { typedRoute } from '$lib/types/appRoutes';
   import { onMount } from 'svelte';
+  import { resolve } from '$app/paths';
 
   onMount(() => {
-    goto(typedRoute('/dashboard/streams'));
+    goto(resolve(typedRoute('/dashboard/streams')));
   });
 </script>

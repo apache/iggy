@@ -18,12 +18,12 @@
 package tcp
 
 import (
-	binaryserialization "github.com/iggy-rs/iggy-go-client/binary_serialization"
-	. "github.com/iggy-rs/iggy-go-client/contracts"
+	binaryserialization "github.com/apache/iggy/foreign/go/binary_serialization"
+	iggcon "github.com/apache/iggy/foreign/go/contracts"
 )
 
-func (tms *IggyTcpClient) GetClients() ([]ClientResponse, error) {
-	buffer, err := tms.sendAndFetchResponse([]byte{}, GetClientsCode)
+func (tms *IggyTcpClient) GetClients() ([]iggcon.ClientInfo, error) {
+	buffer, err := tms.sendAndFetchResponse([]byte{}, iggcon.GetClientsCode)
 	if err != nil {
 		return nil, err
 	}
@@ -31,9 +31,9 @@ func (tms *IggyTcpClient) GetClients() ([]ClientResponse, error) {
 	return binaryserialization.DeserializeClients(buffer)
 }
 
-func (tms *IggyTcpClient) GetClientById(clientId int) (*ClientResponse, error) {
-	message := binaryserialization.SerializeInt(clientId)
-	buffer, err := tms.sendAndFetchResponse(message, GetClientCode)
+func (tms *IggyTcpClient) GetClient(clientId uint32) (*iggcon.ClientInfoDetails, error) {
+	message := binaryserialization.SerializeUint32(clientId)
+	buffer, err := tms.sendAndFetchResponse(message, iggcon.GetClientCode)
 	if err != nil {
 		return nil, err
 	}

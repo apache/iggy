@@ -27,7 +27,7 @@ use crate::args::{
     personal_access_token::PersonalAccessTokenAction, stream::StreamAction, topic::TopicAction,
 };
 use crate::credentials::IggyCredentials;
-use crate::error::IggyCmdError;
+use crate::error::{CmdToolError, IggyCmdError};
 use crate::logging::Logging;
 use args::context::ContextAction;
 use args::message::MessageAction;
@@ -307,6 +307,7 @@ fn get_command(
                 get_args.stream_id.clone(),
                 get_args.topic_id.clone(),
                 get_args.partition_id,
+                get_args.kind,
             )),
             ConsumerOffsetAction::Set(set_args) => Box::new(SetConsumerOffsetCmd::new(
                 set_args.consumer_id.clone(),
@@ -314,6 +315,7 @@ fn get_command(
                 set_args.topic_id.clone(),
                 set_args.partition_id,
                 set_args.offset,
+                set_args.kind,
             )),
         },
         Command::Context(command) => match command {
@@ -368,9 +370,15 @@ async fn main() -> Result<(), IggyCmdError> {
 
     let encryptor = match iggy_args.encryption_key.is_empty() {
         true => None,
-        false => Some(Arc::new(EncryptorKind::Aes256Gcm(
-            Aes256GcmEncryptor::from_base64_key(&iggy_args.encryption_key).unwrap(),
-        ))),
+        false => {
+            let encryption_key = Aes256GcmEncryptor::from_base64_key(&iggy_args.encryption_key)
+                .map_err(|_| {
+                    <IggyCmdError as Into<anyhow::Error>>::into(IggyCmdError::CmdToolError(
+                        CmdToolError::InvalidEncryptionKey,
+                    ))
+                })?;
+            Some(Arc::new(EncryptorKind::Aes256Gcm(encryption_key)))
+        }
     };
     let client_provider_config = Arc::new(ClientProviderConfig::from_args_set_autologin(
         iggy_args.clone(),

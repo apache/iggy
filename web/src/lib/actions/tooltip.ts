@@ -28,6 +28,7 @@ import {
   autoUpdate
 } from '@floating-ui/dom';
 import { writable } from 'svelte/store';
+import { v4 as uuidv4 } from 'uuid';
 
 const openId = writable<string | null>(null);
 
@@ -46,12 +47,12 @@ export function tooltip(
   const tooltip = node.querySelector('.tooltip') as HTMLElement;
 
   if (!tooltip || !trigger) return;
-  const id = crypto.randomUUID();
+  const id = uuidv4();
 
   let cleanup: VoidFunction | undefined;
 
   const unsub = openId.subscribe((val) => (val === id ? showTooltip() : hideTooltip()));
-  const openTooltip = () => openId.set(id);
+
   const closeTooltip = () => openId.set(null);
   const toggleOpen = () => openId.update((val) => (val === id ? null : id));
 
@@ -150,7 +151,7 @@ export function tooltip(
     ['mouseenter', showTooltip],
     ['mouseleave', hideTooltip],
     ['focus', showTooltip],
-    ['blur', hideTooltip]
+    ['blur-sm', hideTooltip]
   ] as const;
 
   if (!clickable) {

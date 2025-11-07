@@ -48,7 +48,7 @@ const NAME: &str = "Iggy";
 /// It requires a valid server address.
 #[derive(Debug)]
 pub struct TcpClient {
-    pub(crate) stream: Mutex<Option<ConnectionStreamKind>>,
+    pub(crate) stream: Arc<Mutex<Option<ConnectionStreamKind>>>,
     pub(crate) config: Arc<TcpClientConfig>,
     pub(crate) state: Mutex<ClientState>,
     client_address: Mutex<Option<SocketAddr>>,
@@ -178,6 +178,7 @@ impl TcpClient {
         }))
     }
 
+    /// Create a new TCP client from the provided connection string.
     pub fn from_connection_string(connection_string: &str) -> Result<Self, IggyError> {
         if ConnectionStringUtils::parse_protocol(connection_string)? != TransportProtocol::Tcp {
             return Err(IggyError::InvalidConnectionString);
@@ -193,7 +194,7 @@ impl TcpClient {
         Ok(Self {
             config,
             client_address: Mutex::new(None),
-            stream: Mutex::new(None),
+            stream: Arc::new(Mutex::new(None)),
             state: Mutex::new(ClientState::Disconnected),
             events: broadcast(1000),
             connected_at: Mutex::new(None),
@@ -201,7 +202,6 @@ impl TcpClient {
     }
 
     async fn handle_response(
-        &self,
         status: u32,
         length: u32,
         stream: &mut ConnectionStreamKind,
@@ -349,38 +349,56 @@ impl TcpClient {
                 break;
             }
 
-            let mut root_cert_store = rustls::RootCertStore::empty();
-            if let Some(certificate_path) = &self.config.tls_ca_file {
-                for cert in CertificateDer::pem_file_iter(certificate_path).map_err(|error| {
-                    error!("Failed to read the CA file: {certificate_path}. {error}",);
-                    IggyError::InvalidTlsCertificatePath
-                })? {
-                    let certificate = cert.map_err(|error| {
-                        error!(
-                            "Failed to read a certificate from the CA file: {certificate_path}. {error}",
-                        );
-                        IggyError::InvalidTlsCertificate
-                    })?;
-                    root_cert_store.add(certificate).map_err(|error| {
-                        error!(
-                            "Failed to add a certificate to the root certificate store. {error}",
-                        );
-                        IggyError::InvalidTlsCertificate
-                    })?;
-                }
-            } else {
-                root_cert_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-            }
+            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
-            let config = rustls::ClientConfig::builder()
-                .with_root_certificates(root_cert_store)
-                .with_no_client_auth();
+            let config = if self.config.tls_validate_certificate {
+                let mut root_cert_store = rustls::RootCertStore::empty();
+                if let Some(certificate_path) = &self.config.tls_ca_file {
+                    for cert in
+                        CertificateDer::pem_file_iter(certificate_path).map_err(|error| {
+                            error!("Failed to read the CA file: {certificate_path}. {error}",);
+                            IggyError::InvalidTlsCertificatePath
+                        })?
+                    {
+                        let certificate = cert.map_err(|error| {
+                            error!(
+                                "Failed to read a certificate from the CA file: {certificate_path}. {error}",
+                            );
+                            IggyError::InvalidTlsCertificate
+                        })?;
+                        root_cert_store.add(certificate).map_err(|error| {
+                            error!(
+                                "Failed to add a certificate to the root certificate store. {error}",
+                            );
+                            IggyError::InvalidTlsCertificate
+                        })?;
+                    }
+                } else {
+                    root_cert_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+                }
+
+                rustls::ClientConfig::builder()
+                    .with_root_certificates(root_cert_store)
+                    .with_no_client_auth()
+            } else {
+                use crate::tcp::tcp_tls_verifier::NoServerVerification;
+                rustls::ClientConfig::builder()
+                    .dangerous()
+                    .with_custom_certificate_verifier(Arc::new(NoServerVerification))
+                    .with_no_client_auth()
+            };
             let connector = TlsConnector::from(Arc::new(config));
-            let stream = TcpStream::connect(client_address).await.map_err(|error| {
-                error!("Failed to establish TCP connection to the server: {error}",);
-                IggyError::CannotEstablishConnection
-            })?;
-            let tls_domain = self.config.tls_domain.to_owned();
+            let tls_domain = if self.config.tls_domain.is_empty() {
+                // Extract hostname/IP from server_address when tls_domain is not specified
+                self.config
+                    .server_address
+                    .split(':')
+                    .next()
+                    .unwrap_or(&self.config.server_address)
+                    .to_string()
+            } else {
+                self.config.tls_domain.to_owned()
+            };
             let domain = ServerName::try_from(tls_domain).map_err(|error| {
                 error!("Failed to create a server name from the domain. {error}",);
                 IggyError::InvalidTlsDomain
@@ -481,45 +499,54 @@ impl TcpClient {
             _ => {}
         }
 
-        let mut stream = self.stream.lock().await;
-        if let Some(stream) = stream.as_mut() {
-            let payload_length = payload.len() + REQUEST_INITIAL_BYTES_LENGTH;
-            trace!("Sending a TCP request of size {payload_length} with code: {code}");
-            stream.write(&(payload_length as u32).to_le_bytes()).await?;
-            stream.write(&code.to_le_bytes()).await?;
-            stream.write(&payload).await?;
-            stream.flush().await?;
-            trace!("Sent a TCP request with code: {code}, waiting for a response...");
-            let mut response_buffer = [0u8; RESPONSE_INITIAL_BYTES_LENGTH];
-            let read_bytes = stream.read(&mut response_buffer).await.map_err(|error| {
-                error!(
-                    "Failed to read response for TCP request with code: {code}: {error}",
-                    code = code,
-                    error = error
-                );
-                IggyError::Disconnected
-            })?;
+        let stream = self.stream.clone();
+        // SAFETY: we run code holding the `stream` lock in a task so we can't be cancelled while holding the lock.
+        tokio::spawn(async move {
+            let mut stream = stream.lock().await;
+            if let Some(stream) = stream.as_mut() {
+                let payload_length = payload.len() + REQUEST_INITIAL_BYTES_LENGTH;
+                trace!("Sending a TCP request of size {payload_length} with code: {code}");
+                stream.write(&(payload_length as u32).to_le_bytes()).await?;
+                stream.write(&code.to_le_bytes()).await?;
+                stream.write(&payload).await?;
+                stream.flush().await?;
+                trace!("Sent a TCP request with code: {code}, waiting for a response...");
+                let mut response_buffer = [0u8; RESPONSE_INITIAL_BYTES_LENGTH];
+                let read_bytes = stream.read(&mut response_buffer).await.map_err(|error| {
+                    error!(
+                        "Failed to read response for TCP request with code: {code}: {error}",
+                        code = code,
+                        error = error
+                    );
+                    IggyError::Disconnected
+                })?;
 
-            if read_bytes != RESPONSE_INITIAL_BYTES_LENGTH {
-                error!("Received an invalid or empty response.");
-                return Err(IggyError::EmptyResponse);
+                if read_bytes != RESPONSE_INITIAL_BYTES_LENGTH {
+                    error!("Received an invalid or empty response.");
+                    return Err(IggyError::EmptyResponse);
+                }
+
+                let status = u32::from_le_bytes(
+                    response_buffer[..4]
+                        .try_into()
+                        .map_err(|_| IggyError::InvalidNumberEncoding)?,
+                );
+                let length = u32::from_le_bytes(
+                    response_buffer[4..]
+                        .try_into()
+                        .map_err(|_| IggyError::InvalidNumberEncoding)?,
+                );
+                return TcpClient::handle_response(status, length, stream).await;
             }
 
-            let status = u32::from_le_bytes(
-                response_buffer[..4]
-                    .try_into()
-                    .map_err(|_| IggyError::InvalidNumberEncoding)?,
-            );
-            let length = u32::from_le_bytes(
-                response_buffer[4..]
-                    .try_into()
-                    .map_err(|_| IggyError::InvalidNumberEncoding)?,
-            );
-            return self.handle_response(status, length, stream).await;
-        }
-
-        error!("Cannot send data. Client is not connected.");
-        Err(IggyError::NotConnected)
+            error!("Cannot send data. Client is not connected.");
+            Err(IggyError::NotConnected)
+        })
+        .await
+        .map_err(|e| {
+            error!("Task execution failed during TCP request: {}", e);
+            IggyError::TcpError
+        })?
     }
 
     async fn get_client_address_value(&self) -> String {

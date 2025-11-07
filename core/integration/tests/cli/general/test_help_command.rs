@@ -61,7 +61,7 @@ Options:
       --encryption-key <ENCRYPTION_KEY>
           Optional encryption key for the message payload used by the client
 {CLAP_INDENT}
-          [default: ]
+          (default: none)
 
       --credentials-username <CREDENTIALS_USERNAME>
           Optional username for initial login

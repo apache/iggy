@@ -29,7 +29,7 @@ use crate::configs::server::{PersonalAccessTokenConfig, ServerConfig};
 use crate::configs::system::SegmentConfig;
 use crate::server_error::ConfigError;
 use crate::streaming::segments::*;
-use error_set::ErrContext;
+use err_trail::ErrContext;
 use iggy_common::CompressionAlgorithm;
 use iggy_common::IggyExpiry;
 use iggy_common::MaxTopicSize;
@@ -38,34 +38,24 @@ use tracing::error;
 
 impl Validatable<ConfigError> for ServerConfig {
     fn validate(&self) -> Result<(), ConfigError> {
-        self.system
-            .memory_pool
-            .validate()
-            .with_error_context(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to validate memory pool config")
-            })?;
-        self.data_maintenance
-            .validate()
-            .with_error_context(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to validate data maintenance config")
-            })?;
-        self.personal_access_token
-            .validate()
-            .with_error_context(|error| {
-                format!(
-                    "{COMPONENT} (error: {error}) - failed to validate personal access token config"
-                )
-            })?;
-        self.system.segment.validate().with_error_context(|error| {
+        self.system.memory_pool.validate().with_error(|error| {
+            format!("{COMPONENT} (error: {error}) - failed to validate memory pool config")
+        })?;
+        self.data_maintenance.validate().with_error(|error| {
+            format!("{COMPONENT} (error: {error}) - failed to validate data maintenance config")
+        })?;
+        self.personal_access_token.validate().with_error(|error| {
+            format!(
+                "{COMPONENT} (error: {error}) - failed to validate personal access token config"
+            )
+        })?;
+        self.system.segment.validate().with_error(|error| {
             format!("{COMPONENT} (error: {error}) - failed to validate segment config")
         })?;
-        self.system
-            .compression
-            .validate()
-            .with_error_context(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to validate compression config")
-            })?;
-        self.telemetry.validate().with_error_context(|error| {
+        self.system.compression.validate().with_error(|error| {
+            format!("{COMPONENT} (error: {error}) - failed to validate compression config")
+        })?;
+        self.telemetry.validate().with_error(|error| {
             format!("{COMPONENT} (error: {error}) - failed to validate telemetry config")
         })?;
 
@@ -79,10 +69,10 @@ impl Validatable<ConfigError> for ServerConfig {
             return Err(ConfigError::InvalidConfiguration);
         }
 
-        if self.http.enabled {
-            if let IggyExpiry::ServerDefault = self.http.jwt.access_token_expiry {
-                return Err(ConfigError::InvalidConfiguration);
-            }
+        if self.http.enabled
+            && let IggyExpiry::ServerDefault = self.http.jwt.access_token_expiry
+        {
+            return Err(ConfigError::InvalidConfiguration);
         }
 
         if topic_size < self.system.segment.size.as_bytes_u64() {
@@ -99,8 +89,7 @@ impl Validatable<ConfigError> for CompressionConfig {
         if *compression_alg != CompressionAlgorithm::None {
             // TODO(numinex): Change this message once server side compression is fully developed.
             println!(
-                "Server started with server-side compression enabled, using algorithm: {}, this feature is not implemented yet!",
-                compression_alg
+                "Server started with server-side compression enabled, using algorithm: {compression_alg}, this feature is not implemented yet!"
             );
         }
 
@@ -140,7 +129,7 @@ impl Validatable<ConfigError> for PartitionConfig {
             return Err(ConfigError::InvalidConfiguration);
         }
 
-        if self.messages_required_to_save % 32 != 0 {
+        if !self.messages_required_to_save.is_multiple_of(32) {
             eprintln!(
                 "Configured system.partition.messages_required_to_save {} is not a multiple of 32",
                 self.messages_required_to_save
@@ -156,7 +145,11 @@ impl Validatable<ConfigError> for PartitionConfig {
             return Err(ConfigError::InvalidConfiguration);
         }
 
-        if self.size_of_messages_required_to_save.as_bytes_u64() % 512 != 0 {
+        if !self
+            .size_of_messages_required_to_save
+            .as_bytes_u64()
+            .is_multiple_of(512)
+        {
             eprintln!(
                 "Configured system.partition.size_of_messages_required_to_save {} is not a multiple of 512 B",
                 self.size_of_messages_required_to_save
@@ -179,7 +172,7 @@ impl Validatable<ConfigError> for SegmentConfig {
             return Err(ConfigError::InvalidConfiguration);
         }
 
-        if self.size.as_bytes_u64() % 512 != 0 {
+        if !self.size.as_bytes_u64().is_multiple_of(512) {
             eprintln!(
                 "Configured system.segment.size {} B is not a multiple of 512 B",
                 self.size.as_bytes_u64()
@@ -203,13 +196,13 @@ impl Validatable<ConfigError> for MessageSaverConfig {
 
 impl Validatable<ConfigError> for DataMaintenanceConfig {
     fn validate(&self) -> Result<(), ConfigError> {
-        self.archiver.validate().with_error_context(|error| {
+        self.archiver.validate().with_error(|error| {
             format!("{COMPONENT} (error: {error}) - failed to validate archiver config")
         })?;
-        self.messages.validate().with_error_context(|error| {
+        self.messages.validate().with_error(|error| {
             format!("{COMPONENT} (error: {error}) - failed to validate messages maintenance config")
         })?;
-        self.state.validate().with_error_context(|error| {
+        self.state.validate().with_error(|error| {
             format!("{COMPONENT} (error: {error}) - failed to validate state maintenance config")
         })?;
         Ok(())
@@ -325,7 +318,7 @@ impl Validatable<ConfigError> for MemoryPoolConfig {
             return Err(ConfigError::InvalidConfiguration);
         }
 
-        if self.enabled && self.size.as_bytes_u64() % DEFAULT_PAGE_SIZE != 0 {
+        if self.enabled && !self.size.as_bytes_u64().is_multiple_of(DEFAULT_PAGE_SIZE) {
             error!(
                 "Configured system.memory_pool.size {} B is not a multiple of default page size {} B",
                 self.size.as_bytes_u64(),

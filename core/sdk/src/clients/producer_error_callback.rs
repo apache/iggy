@@ -52,7 +52,7 @@ impl ErrorCallback for LogErrorCallback {
             let partitioning = ctx
                 .partitioning
                 .as_ref()
-                .map(|p| format!("{:?}", p))
+                .map(|p| format!("{p:?}"))
                 .unwrap_or_else(|| "None".to_string());
 
             error!(

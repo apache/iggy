@@ -17,12 +17,7 @@
  * under the License.
  */
 
-import { statsMapper } from '$lib/domain/Stats';
-import { streamDetailsMapper } from '$lib/domain/StreamDetails';
 // import { apiClient } from '$lib/utils/apiClient';
-
-import { streamMapper, type Stream } from './domain/Stream';
-import { topicDetailsMapper } from './domain/TopicDetails';
 
 const apiClient = async () => {};
 

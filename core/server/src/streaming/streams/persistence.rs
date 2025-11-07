@@ -19,7 +19,7 @@
 use crate::state::system::StreamState;
 use crate::streaming::streams::COMPONENT;
 use crate::streaming::streams::stream::Stream;
-use error_set::ErrContext;
+use err_trail::ErrContext;
 use iggy_common::IggyError;
 
 impl Stream {
@@ -29,39 +29,31 @@ impl Stream {
         storage.stream
             .load(self, state)
             .await
-            .with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to load stream with state, state ID: {state_id}, stream: {self}"))
+            .with_error(|error| format!("{COMPONENT} (error: {error}) - failed to load stream with state, state ID: {state_id}, stream: {self}"))
     }
 
     pub async fn persist(&self) -> Result<(), IggyError> {
-        self.storage
-            .stream
-            .save(self)
-            .await
-            .with_error_context(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to persist stream: {self}")
-            })
+        self.storage.stream.save(self).await.with_error(|error| {
+            format!("{COMPONENT} (error: {error}) - failed to persist stream: {self}")
+        })
     }
 
     pub async fn delete(&self) -> Result<(), IggyError> {
         for topic in self.get_topics() {
-            topic.delete().await.with_error_context(|error| {
+            topic.delete().await.with_error(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to delete topic in stream: {self}")
             })?;
         }
 
-        self.storage
-            .stream
-            .delete(self)
-            .await
-            .with_error_context(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to delete stream: {self}")
-            })
+        self.storage.stream.delete(self).await.with_error(|error| {
+            format!("{COMPONENT} (error: {error}) - failed to delete stream: {self}")
+        })
     }
 
     pub async fn persist_messages(&self) -> Result<usize, IggyError> {
         let mut saved_messages_number = 0;
         for topic in self.get_topics() {
-            saved_messages_number += topic.persist_messages().await.with_error_context(|error| {
+            saved_messages_number += topic.persist_messages().await.with_error(|error| {
                 format!(
                     "{COMPONENT} (error: {error}) - failed to persist messages for topic: {topic} in stream: {self}"
                 )
@@ -73,7 +65,7 @@ impl Stream {
 
     pub async fn purge(&self) -> Result<(), IggyError> {
         for topic in self.get_topics() {
-            topic.purge().await.with_error_context(|error| {
+            topic.purge().await.with_error(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to purge topic: {topic} in stream: {self}")
             })?;
         }

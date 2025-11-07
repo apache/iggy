@@ -19,11 +19,11 @@
 use crate::binary::sender::Sender;
 use crate::tcp::COMPONENT;
 use crate::{server_error::ServerError, tcp::sender};
-use error_set::ErrContext;
+use err_trail::ErrContext;
 use iggy_common::IggyError;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
-use tokio_native_tls::TlsStream;
+use tokio_rustls::server::TlsStream;
 
 #[derive(Debug)]
 pub struct TcpTlsSender {
@@ -51,7 +51,7 @@ impl Sender for TcpTlsSender {
         self.stream
             .shutdown()
             .await
-            .with_error_context(|error| {
+            .with_error(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to shutdown TCP TLS stream")
             })
             .map_err(ServerError::IoError)

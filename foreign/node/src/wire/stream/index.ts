@@ -24,3 +24,4 @@ export * from './get-stream.command.js';
 export * from './get-streams.command.js';
 export * from './purge-stream.command.js';
 export * from './update-stream.command.js';
+export * from './ensure-stream.virtual.command.js';

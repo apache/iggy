@@ -20,9 +20,11 @@
 
 import type { CommandResponse } from '../../client/client.type.js';
 import { wrapCommand } from '../command.utils.js';
+import { COMMAND_CODE } from '../command.code.js';
 import { deserializeUser, type User, type UserStatus } from './user.utils.js';
 import { uint8ToBuf, uint32ToBuf, boolToBuf } from '../number.utils.js';
 import { serializePermissions, type UserPermissions } from './permissions.utils.js';
+
 
 export type CreateUser = {
   username: string,
@@ -32,7 +34,7 @@ export type CreateUser = {
 };
 
 export const CREATE_USER = {
-  code: 33,
+  code: COMMAND_CODE.CreateUser,
 
   serialize: ({ username, password, status, permissions }: CreateUser) => {
     const bUsername = Buffer.from(username);
@@ -60,5 +62,6 @@ export const CREATE_USER = {
 
   deserialize: (r: CommandResponse) => deserializeUser(r.data)
 };
+
 
 export const createUser = wrapCommand<CreateUser, User>(CREATE_USER);

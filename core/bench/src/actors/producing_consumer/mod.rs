@@ -17,5 +17,5 @@
  */
 
 pub mod benchmark_producing_consumer;
-
+pub mod typed_banchmark_producing_consumer;
 pub use benchmark_producing_consumer::BenchmarkProducingConsumer;

@@ -79,7 +79,7 @@ impl TestTopicCreateCmd {
 
         if let Some(topic_id) = self.topic_id {
             args.push("-t".to_string());
-            args.push(format!("{}", topic_id));
+            args.push(format!("{topic_id}"));
         };
 
         match self.using_identifier {
@@ -122,7 +122,7 @@ impl IggyCmdTestCase for TestTopicCreateCmd {
         };
         let partitions_count = self.partitions_count;
         let topic_id = match self.topic_id {
-            Some(topic_id) => format!("ID: {}", topic_id),
+            Some(topic_id) => format!("ID: {topic_id}"),
             None => "ID auto incremented".to_string(),
         };
         let topic_name = &self.topic_name;
@@ -350,14 +350,10 @@ Arguments:
   [MESSAGE_EXPIRY]...      Message expiry time in human-readable format like "unlimited" or "15days 2min 2s" [default: server_default]
 
 Options:
-  -t, --topic-id <TOPIC_ID>
-          Topic ID to create
-  -m, --max-topic-size <MAX_TOPIC_SIZE>
-          Max topic size in human-readable format like "unlimited" or "15GB" [default: server_default]
-  -r, --replication-factor <REPLICATION_FACTOR>
-          Replication factor for the topic [default: 1]
-  -h, --help
-          Print help (see more with '--help')
+  -t, --topic-id <TOPIC_ID>                      Topic ID to create
+  -m, --max-topic-size <MAX_TOPIC_SIZE>          Max topic size in human-readable format like "unlimited" or "15GB" [default: server_default]
+  -r, --replication-factor <REPLICATION_FACTOR>  Replication factor for the topic [default: 1]
+  -h, --help                                     Print help (see more with '--help')
 "#,
             ),
         ))

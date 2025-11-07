@@ -596,7 +596,7 @@ impl<'de> Deserialize<'de> for IggyMessage {
                             let payload_str: String = map.next_value()?;
                             use base64::{Engine as _, engine::general_purpose::STANDARD};
                             let decoded = STANDARD.decode(payload_str.as_bytes()).map_err(|e| {
-                                de::Error::custom(format!("Failed to decode base64: {}", e))
+                                de::Error::custom(format!("Failed to decode base64: {e}"))
                             })?;
                             payload = Some(Bytes::from(decoded));
                         }
@@ -757,7 +757,7 @@ mod tests {
                 panic!("Original user_headers_map() returned None");
             }
             Err(e) => {
-                panic!("Error getting original user_headers_map: {:?}", e);
+                panic!("Error getting original user_headers_map: {e:?}");
             }
         };
 
@@ -767,7 +767,7 @@ mod tests {
                 panic!("Deserialized user_headers_map() returned None");
             }
             Err(e) => {
-                panic!("Error getting deserialized user_headers_map: {:?}", e);
+                panic!("Error getting deserialized user_headers_map: {e:?}");
             }
         };
 

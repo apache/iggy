@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+<!doctype html>
 <!--
  Licensed to the Apache Software Foundation (ASF) under one
  or more contributor license agreements.  See the NOTICE file
@@ -19,36 +19,42 @@
 -->
 
 <html>
-
-<head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta http-equiv="X-UA-Compatible" content="ie=edge">
-    <meta http-equiv="Content-Security-Policy" content="default-src 'self' https://benchmarks.iggy.rs;
-    connect-src 'self' https://benchmarks.iggy.rs;
+    <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <meta http-equiv="X-UA-Compatible" content="ie=edge" />
+        <meta
+            http-equiv="Content-Security-Policy"
+            content="default-src 'self' https://benchmarks.iggy.apache.org;
+    connect-src 'self' https://benchmarks.iggy.apache.org;
     script-src 'self' 'unsafe-inline' 'unsafe-eval' https://cdn.jsdelivr.net;
     script-src-elem 'self' 'unsafe-inline' https://cdn.jsdelivr.net;
     style-src 'self' 'unsafe-inline';
-    img-src 'self' data:;">
-    <base href="/">
-    <title>Apache Iggy Benchmarks Dashboard</title>
-    <link data-trunk rel="copy-dir" href="assets" />
-    <link data-trunk rel="rust" data-wasm-opt="z" />
-    <link data-trunk rel="css" href="assets/style.css" />
-    <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/echarts-gl@2.0.9/dist/echarts-gl.min.js"></script>
-    <script async src="https://www.googletagmanager.com/gtag/js?id=G-0972B5SEN0"></script>
-    <script>
-        window.dataLayer = window.dataLayer || [];
-        function gtag() { dataLayer.push(arguments); }
-        gtag('js', new Date());
+    img-src 'self' data:;"
+        />
+        <base href="/" />
+        <title>Apache Iggy Benchmarks Dashboard</title>
+        <link data-trunk rel="copy-dir" href="assets" />
+        <link data-trunk rel="rust" data-wasm-opt="z" />
+        <link data-trunk rel="css" href="assets/style.css" />
+        <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js"></script>
+        <script src="https://cdn.jsdelivr.net/npm/echarts-gl@2.0.9/dist/echarts-gl.min.js"></script>
+        <script
+            async
+            src="https://www.googletagmanager.com/gtag/js?id=G-0972B5SEN0"
+        ></script>
+        <script>
+            window.dataLayer = window.dataLayer || [];
+            function gtag() {
+                dataLayer.push(arguments);
+            }
+            gtag("js", new Date());
 
-        gtag('config', 'G-0972B5SEN0');
-    </script>
-</head>
+            gtag("config", "G-0972B5SEN0");
+        </script>
+    </head>
 
-<body>
-    <div id="app"></div>
-</body>
-
+    <body>
+        <div id="app"></div>
+    </body>
 </html>

@@ -11,15 +11,15 @@ Official Java client SDK for [Apache Iggy](https://iggy.apache.org) message stre
 
 The client currently supports HTTP and TCP protocols with blocking implementation.
 
-### Adding the client to your project
+## Adding the client to your project
 
 Add dependency to `pom.xml` or `build.gradle` file.
 
 You can find the latest version in Maven Central repository:
 
-https://central.sonatype.com/artifact/org.apache.iggy/iggy-java-sdk
+<https://central.sonatype.com/artifact/org.apache.iggy/iggy-java-sdk>
 
-### Implement consumer and producer
+## Implement consumer and producer
 
 You can find examples for
 simple [consumer](https://github.com/apache/iggy/blob/master/foreign/java/examples/simple-consumer/src/main/java/org/apache/iggy/SimpleConsumer.java)

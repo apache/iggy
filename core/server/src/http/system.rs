@@ -31,12 +31,12 @@ use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use bytes::Bytes;
 use chrono::Local;
-use error_set::ErrContext;
+use err_trail::ErrContext;
 use iggy_common::Stats;
 use iggy_common::Validatable;
 use iggy_common::get_snapshot::GetSnapshot;
 use iggy_common::locking::IggySharedMutFn;
-use iggy_common::{ClientInfo, ClientInfoDetails};
+use iggy_common::{ClientInfo, ClientInfoDetails, ClusterMetadata};
 use std::sync::Arc;
 
 const NAME: &str = "Iggy API";
@@ -47,6 +47,7 @@ pub fn router(state: Arc<AppState>, metrics_config: &HttpMetricsConfig) -> Route
         .route("/", get(|| async { NAME }))
         .route("/ping", get(|| async { PONG }))
         .route("/stats", get(get_stats))
+        .route("/cluster/metadata", get(get_cluster_metadata))
         .route("/clients", get(get_clients))
         .route("/clients/{client_id}", get(get_client))
         .route("/snapshot", post(get_snapshot));
@@ -64,10 +65,27 @@ async fn get_metrics(State(state): State<Arc<AppState>>) -> Result<String, Custo
 
 async fn get_stats(State(state): State<Arc<AppState>>) -> Result<Json<Stats>, CustomError> {
     let system = state.system.read().await;
-    let stats = system.get_stats().await.with_error_context(|error| {
-        format!("{COMPONENT} (error: {error}) - failed to get stats")
-    })?;
+    let stats = system
+        .get_stats()
+        .await
+        .with_error(|error| format!("{COMPONENT} (error: {error}) - failed to get stats"))?;
     Ok(Json(stats))
+}
+
+async fn get_cluster_metadata(
+    State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<Identity>,
+) -> Result<Json<ClusterMetadata>, CustomError> {
+    let system = state.system.read().await;
+    let cluster_metadata = system
+        .get_cluster_metadata(&Session::stateless(identity.user_id, identity.ip_address))
+        .with_error(|error| {
+            format!(
+                "{COMPONENT} (error: {error}) - failed to get cluster metadata, user ID: {}",
+                identity.user_id
+            )
+        })?;
+    Ok(Json(cluster_metadata))
 }
 
 async fn get_client(
@@ -82,7 +100,7 @@ async fn get_client(
             client_id,
         )
         .await
-        .with_error_context(|error| {
+        .with_error(|error| {
             format!(
                 "{COMPONENT} (error: {error}) - failed to get client, user ID: {}",
                 identity.user_id
@@ -108,7 +126,7 @@ async fn get_clients(
     let clients = system
         .get_clients(&Session::stateless(identity.user_id, identity.ip_address))
         .await
-        .with_error_context(|error| {
+        .with_error(|error| {
             format!(
                 "{COMPONENT} (error: {error}) - failed to get clients, user ID: {}",
                 identity.user_id
@@ -142,7 +160,7 @@ async fn get_snapshot(
     );
     headers.insert(
         header::CONTENT_DISPOSITION,
-        header::HeaderValue::from_str(&format!("attachment; filename=\"{}\"", filename)).unwrap(),
+        header::HeaderValue::from_str(&format!("attachment; filename=\"{filename}\"")).unwrap(),
     );
     Ok((headers, Body::from(zip_data)))
 }

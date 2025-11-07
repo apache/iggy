@@ -1,0 +1,303 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: docker-buildx
+description: Multi-arch Docker build and push
+inputs:
+  task:
+    description: "Task to run (build/publish/docker)"
+    required: false
+    default: "build"
+  component:
+    description: "Component key from .github/config/publish.yml (e.g. rust-server)"
+    required: false
+    default: ""
+  version:
+    description: "Version tag (use 'edge' for master post-merge)"
+    required: false
+    default: "test"
+  context:
+    description: "Build context"
+    required: false
+    default: "."
+  dry_run:
+    description: "Dry run mode"
+    required: false
+    default: "false"
+  libc:
+    description: "Libc to use (glibc/musl)"
+    required: false
+    default: "musl"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Resolve component from publish.yml
+      id: config
+      shell: bash
+      run: |
+        set -euxo pipefail
+
+        comp="${{ inputs.component }}"
+        image=""
+        dockerfile=""
+        cfg_platforms=""
+
+        if [ -n "$comp" ]; then
+          if ! command -v yq >/dev/null 2>&1; then
+            YQ_VERSION="v4.47.1"
+            YQ_CHECKSUM="0fb28c6680193c41b364193d0c0fc4a03177aecde51cfc04d506b1517158c2fb"
+            wget -qO /tmp/yq https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64
+            echo "${YQ_CHECKSUM}  /tmp/yq" | sha256sum -c - || exit 1
+            chmod +x /tmp/yq
+            sudo mv /tmp/yq /usr/local/bin/yq
+          fi
+
+          components_b64="$(yq -o=json -I=0 '.components' .github/config/publish.yml | base64 -w0)"
+
+          JSON_B64="$components_b64" COMP="$comp" node -e '
+            const b64 = process.env.JSON_B64 || "";
+            const comp = process.env.COMP || "";
+            if (!b64) { console.error("Missing publish.yml components"); process.exit(1); }
+            const cfg = JSON.parse(Buffer.from(b64, "base64").toString("utf8"));
+            const e = cfg[comp];
+            if (!e) { console.error(`Component not found in publish.yml: ${comp || "<empty>"}`); process.exit(1); }
+            const out = {
+              image: e.image || "",
+              dockerfile: e.dockerfile || "Dockerfile",
+              platforms: Array.isArray(e.platforms) ? e.platforms.join(",") : (e.platforms || "")
+            };
+            process.stdout.write(JSON.stringify(out));
+          ' > /tmp/_dockercfg.json
+
+          image="$(jq -r .image /tmp/_dockercfg.json)"
+          dockerfile="$(jq -r .dockerfile /tmp/_dockercfg.json)"
+          cfg_platforms="$(jq -r .platforms /tmp/_dockercfg.json)"
+        fi
+
+        should_push="false"
+        if [ "${{ inputs.task }}" = "publish" ] && [ "${{ inputs.dry_run }}" != "true" ]; then
+          should_push="true"
+        fi
+
+        echo "image=$image" >> "$GITHUB_OUTPUT"
+        echo "dockerfile=$dockerfile" >> "$GITHUB_OUTPUT"
+        echo "cfg_platforms=$cfg_platforms" >> "$GITHUB_OUTPUT"
+        echo "should_push=$should_push" >> "$GITHUB_OUTPUT"
+
+        echo "🐳 Config:"
+        echo "  component: ${comp:-<none>}"
+        echo "  image:     ${image:-<unset>}"
+        echo "  dockerfile:${dockerfile:-<unset>}"
+        echo "  push:      ${should_push}"
+        echo "  version:   ${{ inputs.version }}"
+
+        if [ -n "$comp" ] && [ -z "$image" ]; then
+          echo "Component '${comp}' missing image mapping in publish.yml" >&2
+          exit 1
+        fi
+
+    - name: Set up QEMU
+      uses: docker/setup-qemu-action@v3
+      with:
+        platforms: all
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+      with:
+        driver-opts: |
+          network=host
+          image=moby/buildkit:latest
+
+    - name: Login to Docker Hub
+      if: steps.config.outputs.should_push == 'true'
+      uses: docker/login-action@v3
+      with:
+        username: ${{ env.DOCKERHUB_USER }}
+        password: ${{ env.DOCKERHUB_TOKEN }}
+
+    - name: Docker meta
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ steps.config.outputs.image }}
+        tags: |
+          type=raw,value=${{ inputs.version }}
+          type=raw,value=latest,enable=${{ steps.config.outputs.should_push == 'true' && inputs.version != 'test' && inputs.version != 'edge' }}
+          type=sha,enable=${{ inputs.version == 'test' }}
+
+    - name: Determine platforms
+      id: platforms
+      shell: bash
+      run: |
+        p_cfg="${{ steps.config.outputs.cfg_platforms }}"
+        if [ -n "$p_cfg" ]; then
+          platforms="$p_cfg"
+        elif [ "${{ steps.config.outputs.should_push }}" = "true" ]; then
+          platforms="linux/amd64,linux/arm64"
+        else
+          platforms="linux/amd64"
+        fi
+        echo "platforms=$platforms" >> "$GITHUB_OUTPUT"
+        echo "🖥️ Platforms: $platforms"
+
+
+    - name: Compose cache config (no registry on dry-run)
+      id: cachecfg
+      shell: bash
+      run: |
+        set -euo pipefail
+        comp="${{ inputs.component }}"
+        os="${{ runner.os }}"
+        img="${{ steps.config.outputs.image }}"
+        if [ "${{ inputs.dry_run }}" = "true" ]; then
+          # dry-run/forks: avoid Docker Hub completely
+          CACHE_TO=$(
+            printf '%s\n' \
+              "type=gha,scope=buildkit-${comp}-${os},mode=max" \
+              "type=gha,scope=buildkit-${comp},mode=max" \
+              "type=inline"
+          )
+          CACHE_FROM=$(
+            printf '%s\n' \
+              "type=gha,scope=buildkit-${comp}-${os}" \
+              "type=gha,scope=buildkit-${comp}"
+          )
+        else
+          # CI on upstream: use registry + gha + inline
+          CACHE_TO=$(
+            printf '%s\n' \
+              "type=registry,ref=${img}:buildcache,mode=max" \
+              "type=registry,ref=${img}:buildcache-${os},mode=max" \
+              "type=inline" \
+              "type=gha,scope=buildkit-${comp}-${os},mode=max"
+          )
+          CACHE_FROM=$(
+            printf '%s\n' \
+              "type=registry,ref=${img}:buildcache" \
+              "type=registry,ref=${img}:buildcache-${os}" \
+              "type=registry,ref=${img}:latest" \
+              "type=gha,scope=buildkit-${comp}-${os}" \
+              "type=gha,scope=buildkit-${comp}"
+          )
+        fi
+
+        {
+          echo 'CACHE_TO<<EOF'
+          echo "$CACHE_TO"
+          echo 'EOF'
+          echo 'CACHE_FROM<<EOF'
+          echo "$CACHE_FROM"
+          echo 'EOF'
+        } >> "$GITHUB_ENV"
+
+        echo "Computed cache-to:"
+        printf '%s\n' "$CACHE_TO"
+        echo "Computed cache-from:"
+        printf '%s\n' "$CACHE_FROM"
+
+
+    - name: Determine Rust toolchain version (labels)
+      shell: bash
+      run: |
+        if [[ -f rust-toolchain.toml ]]; then
+          ver="$(sed -En 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' rust-toolchain.toml | head -1)"
+          : "${ver:=unknown}"
+          echo "RUST_VERSION=$ver" >> "$GITHUB_ENV"
+          echo "Using toolchain: $ver"
+        else
+          echo "RUST_VERSION=1.89" >> "$GITHUB_ENV"
+          echo "No rust-toolchain.toml found; labeling as 1.89"
+        fi
+
+    - name: Compose build args
+      id: bargs
+      shell: bash
+      run: |
+        set -euo pipefail
+        args="VERSION=${{ inputs.version }}
+        BUILD_DATE=${{ github.event.repository.updated_at }}
+        VCS_REF=${{ github.sha }}
+        RUST_VERSION=${{ env.RUST_VERSION }}
+        LIBC=${{ inputs.libc }}
+        IGGY_CI_BUILD=true"
+        {
+          echo "all<<__EOF__"
+          echo "$args"
+          echo "__EOF__"
+        } >> "$GITHUB_OUTPUT"
+        echo "Build args:"
+        printf '%s\n' "$args"
+
+    - name: Determine build context
+      id: ctx
+      shell: bash
+      run: |
+        # For web-ui, the context should be the web directory
+        if [ "${{ inputs.component }}" = "web-ui" ]; then
+          context="web"
+        else
+          context="${{ inputs.context }}"
+        fi
+        echo "context=$context" >> "$GITHUB_OUTPUT"
+        echo "📁 Build context: $context"
+
+    - name: Build and push
+      id: build
+      uses: docker/build-push-action@v6
+      with:
+        context: ${{ steps.ctx.outputs.context }}
+        file: ${{ steps.config.outputs.dockerfile }}
+        platforms: ${{ steps.platforms.outputs.platforms }}
+        push: ${{ steps.config.outputs.should_push }}
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: ${{ env.CACHE_FROM }}
+        cache-to:   ${{ env.CACHE_TO }}
+        build-args: |
+          ${{ steps.bargs.outputs.all }}
+
+    - name: Export image (if not pushing)
+      if: steps.config.outputs.should_push == 'false' && inputs.task != 'publish'
+      shell: bash
+      run: |
+        echo "Built: ${{ steps.config.outputs.image }}:${{ inputs.version }}"
+        echo "To save: docker save ${{ steps.config.outputs.image }}:${{ inputs.version }} -o image.tar"
+
+    - name: Summary
+      if: always()
+      shell: bash
+      run: |
+        {
+          echo "## 🐳 Docker Build Summary"
+          echo ""
+          echo "| Property | Value |"
+          echo "|----------|-------|"
+          echo "| Image | \`${{ steps.config.outputs.image }}\` |"
+          echo "| Version | \`${{ inputs.version }}\` |"
+          echo "| Dockerfile | \`${{ steps.config.outputs.dockerfile }}\` |"
+          echo "| Platforms | \`${{ steps.platforms.outputs.platforms }}\` |"
+          echo "| Pushed | ${{ steps.config.outputs.should_push }} |"
+          if [ "${{ steps.config.outputs.should_push }}" = "true" ]; then
+            echo "| Digest | \`${{ steps.build.outputs.digest }}\` |"
+            echo ""
+            echo "### Pull"
+            echo '```bash'
+            echo "docker pull ${{ steps.config.outputs.image }}:${{ inputs.version }}"
+            echo '```'
+          fi
+        } >> "$GITHUB_STEP_SUMMARY"

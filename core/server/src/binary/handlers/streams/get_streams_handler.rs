@@ -24,7 +24,7 @@ use crate::binary::sender::SenderKind;
 use crate::streaming::session::Session;
 use crate::streaming::systems::system::SharedSystem;
 use anyhow::Result;
-use error_set::ErrContext;
+use err_trail::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::get_streams::GetStreams;
 use tracing::debug;
@@ -43,7 +43,7 @@ impl ServerCommandHandler for GetStreams {
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
         let system = system.read().await;
-        let streams = system.find_streams(session).with_error_context(|error| {
+        let streams = system.find_streams(session).with_error(|error| {
             format!("{COMPONENT} (error: {error}) - failed to find streams for session: {session}")
         })?;
         let response = mapper::map_streams(&streams);

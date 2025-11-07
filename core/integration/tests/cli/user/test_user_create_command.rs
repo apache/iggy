@@ -347,7 +347,7 @@ Options:
           Available topic permissions: manage_topic / m_top, read_topic / r_top, poll_messages / p_msg,
           send_messages / s_msg.
 {CLAP_INDENT}
-          Permissions format: STREAM_ID[:STREAM_PERMISSIONS][#TOPIC_ID[:TOPIC_PERMISSIONS]]
+          Permissions format: STREAM_ID\[:STREAM_PERMISSIONS\]\[#TOPIC_ID\[:TOPIC_PERMISSIONS\]\]
 {CLAP_INDENT}
           Examples:
            iggy user create guest guest -s 1:manage_topics,read_topics
@@ -381,14 +381,10 @@ Arguments:
   <PASSWORD>  Password
 
 Options:
-  -u, --user-status <USER_STATUS>
-          User status [default: active] [possible values: active, inactive]
-  -g, --global-permissions <GLOBAL_PERMISSIONS>
-          Set global permissions for created user
-  -s, --stream-permissions <STREAM_PERMISSIONS>
-          Set stream permissions for created user
-  -h, --help
-          Print help (see more with '--help')
+  -u, --user-status <USER_STATUS>                User status [default: active] [possible values: active, inactive]
+  -g, --global-permissions <GLOBAL_PERMISSIONS>  Set global permissions for created user
+  -s, --stream-permissions <STREAM_PERMISSIONS>  Set stream permissions for created user
+  -h, --help                                     Print help (see more with '--help')
 "#,
             ),
         ))

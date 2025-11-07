@@ -1,10 +1,7 @@
 <script lang="ts">
-  import type { HTMLInputAttributes } from 'svelte/elements';
   import Input from '$lib/components/Input.svelte';
   import Icon from './Icon.svelte';
   import Button from './Button.svelte';
-
-  
 
   interface Props {
     label: string;
@@ -12,7 +9,7 @@
     name: string;
     errorMessage?: string;
     value: string | number;
-    [key: string]: any
+    [key: string]: any;
   }
 
   let {
@@ -37,11 +34,11 @@
   {...rest}
 >
   {#snippet suffix()}
-    <span >
+    <span>
       <Button
         variant="rounded"
         class="w-[33px] h-[33px] p-0 flex items-center justify-center"
-        on:click={(e) => {
+        onclick={(e) => {
           isVisible = !isVisible;
           e.preventDefault();
           e.stopPropagation();
@@ -49,7 +46,7 @@
       >
         <Icon
           name={isVisible ? 'eye' : 'eyeOff'}
-          class="w-[20px] h-[20px] dark:stroke-white stroke-shadeD200"
+          class="w-[20px] h-[20px] dark:stroke-white stroke-shade-d200"
         />
       </Button>
     </span>

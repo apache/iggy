@@ -17,40 +17,70 @@
 
 package iggcon
 
-import "errors"
-
-type HeaderValue struct {
-	Kind  HeaderKind
-	Value []byte
-}
-
-type HeaderKey struct {
-	Value string
-}
-
-func NewHeaderKey(val string) (HeaderKey, error) {
-	if len(val) == 0 || len(val) > 255 {
-		return HeaderKey{}, errors.New("Value has incorrect size, must be between 1 and 255")
-	}
-	return HeaderKey{Value: val}, nil
-}
-
-type HeaderKind int
-
-const (
-	Raw     HeaderKind = 1
-	String  HeaderKind = 2
-	Bool    HeaderKind = 3
-	Int8    HeaderKind = 4
-	Int16   HeaderKind = 5
-	Int32   HeaderKind = 6
-	Int64   HeaderKind = 7
-	Int128  HeaderKind = 8
-	Uint8   HeaderKind = 9
-	Uint16  HeaderKind = 10
-	Uint32  HeaderKind = 11
-	Uint64  HeaderKind = 12
-	Uint128 HeaderKind = 13
-	Float   HeaderKind = 14
-	Double  HeaderKind = 15
+import (
+	"encoding/binary"
+	"errors"
+	"time"
 )
+
+const MessageHeaderSize = 8 + 16 + 8 + 8 + 8 + 4 + 4
+
+type MessageID [16]byte
+
+type MessageHeader struct {
+	Checksum         uint64    `json:"checksum"`
+	Id               MessageID `json:"id"`
+	Offset           uint64    `json:"offset"`
+	Timestamp        uint64    `json:"timestamp"`
+	OriginTimestamp  uint64    `json:"origin_timestamp"`
+	UserHeaderLength uint32    `json:"user_header_length"`
+	PayloadLength    uint32    `json:"payload_length"`
+}
+
+func NewMessageHeader(id MessageID, payloadLength uint32, userHeaderLength uint32) MessageHeader {
+	return MessageHeader{
+		Id:               id,
+		OriginTimestamp:  uint64(time.Now().UnixMicro()),
+		PayloadLength:    payloadLength,
+		UserHeaderLength: userHeaderLength,
+	}
+}
+
+func MessageHeaderFromBytes(data []byte) (*MessageHeader, error) {
+
+	if len(data) != MessageHeaderSize {
+		return nil, errors.New("data has incorrect size, must be 56")
+	}
+	checksum := binary.LittleEndian.Uint64(data[0:8])
+	id := data[8:24]
+	offset := binary.LittleEndian.Uint64(data[24:32])
+	timestamp := binary.LittleEndian.Uint64(data[32:40])
+	originTimestamp := binary.LittleEndian.Uint64(data[40:48])
+	userHeaderLength := binary.LittleEndian.Uint32(data[48:52])
+	payloadLength := binary.LittleEndian.Uint32(data[52:56])
+
+	return &MessageHeader{
+		Checksum:         checksum,
+		Id:               MessageID(id),
+		Offset:           offset,
+		Timestamp:        timestamp,
+		OriginTimestamp:  originTimestamp,
+		UserHeaderLength: userHeaderLength,
+		PayloadLength:    payloadLength,
+	}, nil
+}
+
+func (mh *MessageHeader) ToBytes() []byte {
+	bytes := make([]byte, 0, MessageHeaderSize)
+
+	bytes = binary.LittleEndian.AppendUint64(bytes, mh.Checksum)
+	idBytes := mh.Id[:]
+	bytes = append(bytes, idBytes...)
+	bytes = binary.LittleEndian.AppendUint64(bytes, mh.Offset)
+	bytes = binary.LittleEndian.AppendUint64(bytes, mh.Timestamp)
+	bytes = binary.LittleEndian.AppendUint64(bytes, mh.OriginTimestamp)
+	bytes = binary.LittleEndian.AppendUint32(bytes, mh.UserHeaderLength)
+	bytes = binary.LittleEndian.AppendUint32(bytes, mh.PayloadLength)
+
+	return bytes
+}

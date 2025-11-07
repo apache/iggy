@@ -23,7 +23,8 @@ use iggy::prelude::{
     DirectConfig, HeaderKey, HeaderValue, IggyClient, IggyDuration, IggyError, IggyMessage,
 };
 use iggy_connector_sdk::{
-    DecodedMessage, Error, ProducedMessages, StreamEncoder, TopicMetadata, transforms::Transform,
+    ConnectorState, DecodedMessage, Error, ProducedMessages, StreamEncoder, TopicMetadata,
+    transforms::Transform,
 };
 use once_cell::sync::Lazy;
 use std::{
@@ -35,7 +36,10 @@ use tracing::{debug, error, info, warn};
 
 use crate::{
     PLUGIN_ID, RuntimeError, SourceApi, SourceConnector, SourceConnectorPlugin,
-    SourceConnectorProducer, SourceConnectorWrapper, configs::SourceConfig, resolve_plugin_path,
+    SourceConnectorProducer, SourceConnectorWrapper,
+    configs::SourceConfig,
+    resolve_plugin_path,
+    state::{FileStateProvider, StateProvider, StateStorage},
     transform,
 };
 
@@ -44,6 +48,7 @@ pub static SOURCE_SENDERS: Lazy<DashMap<u32, Sender<ProducedMessages>>> = Lazy::
 pub async fn init(
     source_configs: HashMap<String, SourceConfig>,
     iggy_client: &IggyClient,
+    state_path: &str,
 ) -> Result<HashMap<String, SourceConnector>, RuntimeError> {
     let mut source_connectors: HashMap<String, SourceConnector> = HashMap::new();
     for (key, config) in source_configs {
@@ -56,31 +61,51 @@ pub async fn init(
         let plugin_id = PLUGIN_ID.load(Ordering::Relaxed);
         let path = resolve_plugin_path(&config.path);
         info!("Initializing source container with name: {name} ({key}), plugin: {path}",);
+        let state_storage = get_state_storage(state_path, &key);
+        let state = match &state_storage {
+            StateStorage::File(file) => file.load().await?,
+        };
         if let Some(container) = source_connectors.get_mut(&path) {
             info!("Source container for plugin: {path} is already loaded.",);
             init_source(
                 &container.container,
                 &config.config.unwrap_or_default(),
                 plugin_id,
+                state,
             );
             container.plugins.push(SourceConnectorPlugin {
                 id: plugin_id,
+                key: key.to_owned(),
+                name: name.to_owned(),
+                path: path.to_owned(),
+                config_format: config.config_format,
                 producer: None,
                 transforms: vec![],
+                state_storage,
             });
         } else {
             let container: Container<SourceApi> =
                 unsafe { Container::load(&path).expect("Failed to load source container") };
             info!("Source container for plugin: {path} loaded successfully.",);
-            init_source(&container, &config.config.unwrap_or_default(), plugin_id);
+            init_source(
+                &container,
+                &config.config.unwrap_or_default(),
+                plugin_id,
+                state,
+            );
             source_connectors.insert(
                 path.to_owned(),
                 SourceConnector {
                     container,
                     plugins: vec![SourceConnectorPlugin {
                         id: plugin_id,
+                        key: key.to_owned(),
+                        name: name.to_owned(),
+                        path: path.to_owned(),
+                        config_format: config.config_format,
                         producer: None,
                         transforms: vec![],
+                        state_storage,
                     }],
                 },
             );
@@ -92,7 +117,8 @@ pub async fn init(
         PLUGIN_ID.fetch_add(1, Ordering::Relaxed);
 
         let transforms = if let Some(transforms_config) = config.transforms {
-            let transforms = transform::load(transforms_config).expect("Failed to load transforms");
+            let transforms =
+                transform::load(&transforms_config).expect("Failed to load transforms");
             let types = transforms
                 .iter()
                 .map(|t| t.r#type().into())
@@ -113,9 +139,9 @@ pub async fn init(
             .find(|p| p.id == plugin_id)
             .expect("Failed to get source plugin");
 
-        for stream in config.streams {
+        for stream in config.streams.iter() {
             let linger_time =
-                IggyDuration::from_str(&stream.linger_time.unwrap_or("5ms".to_owned()))
+                IggyDuration::from_str(stream.linger_time.as_deref().unwrap_or("5ms"))
                     .expect("Invalid send interval");
             let batch_length = stream.batch_length.unwrap_or(1000);
             let producer = iggy_client
@@ -140,9 +166,21 @@ pub async fn init(
     Ok(source_connectors)
 }
 
-fn init_source(container: &Container<SourceApi>, config: &serde_json::Value, id: u32) {
+fn init_source(
+    container: &Container<SourceApi>,
+    config: &serde_json::Value,
+    id: u32,
+    state: Option<ConnectorState>,
+) {
     let config = serde_json::to_string(config).expect("Invalid source config.");
-    (container.open)(id, config.as_ptr(), config.len());
+    let state_ptr = state.as_ref().map_or(std::ptr::null(), |s| s.0.as_ptr());
+    let state_len = state.as_ref().map_or(0, |s| s.0.len());
+    (container.open)(id, config.as_ptr(), config.len(), state_ptr, state_len);
+}
+
+fn get_state_storage(state_path: &str, key: &str) -> StateStorage {
+    let path = format!("{state_path}/source_{key}.state");
+    StateStorage::File(FileStateProvider::new(path))
 }
 
 pub fn handle(sources: Vec<SourceConnectorWrapper>) {
@@ -174,16 +212,16 @@ pub fn handle(sources: Vec<SourceConnectorWrapper>) {
                     topic: producer.topic().to_string(),
                 };
 
-                while let Ok(received_messages) = receiver.recv_async().await {
-                    let count = received_messages.messages.len();
+                while let Ok(produced_messages) = receiver.recv_async().await {
+                    let count = produced_messages.messages.len();
                     info!("Source connector with ID: {plugin_id} received {count} messages",);
-                    let schema = received_messages.schema;
+                    let schema = produced_messages.schema;
                     let mut messages: Vec<DecodedMessage> = Vec::with_capacity(count);
-                    for message in received_messages.messages {
+                    for message in produced_messages.messages {
                         let Ok(payload) = schema.try_into_payload(message.payload) else {
                             error!(
                                 "Failed to decode message payload with schema: {} for source connector with ID: {plugin_id}",
-                                received_messages.schema
+                                produced_messages.schema
                             );
                             continue;
                         };
@@ -232,6 +270,23 @@ pub fn handle(sources: Vec<SourceConnectorWrapper>) {
                         producer.stream(),
                         producer.topic()
                     );
+
+                    let Some(state) = produced_messages.state else {
+                        debug!("No state provided for source connector with ID: {plugin_id}");
+                        continue;
+                    };
+
+                    match &plugin.state_storage {
+                        StateStorage::File(file) => {
+                            if let Err(error) = file.save(state).await {
+                                error!(
+                                    "Failed to save state for source connector with ID: {plugin_id}. {error}"
+                                );
+                                continue;
+                            }
+                            debug!("State saved for source connector with ID: {plugin_id}");
+                        }
+                    }
                 }
             });
         }

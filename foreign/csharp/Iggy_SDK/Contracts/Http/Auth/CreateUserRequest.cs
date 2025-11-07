@@ -15,14 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using Apache.Iggy.Contracts.Auth;
 using Apache.Iggy.Enums;
 
 namespace Apache.Iggy.Contracts.Http.Auth;
 
-public sealed class CreateUserRequest
-{
-    public required string Username { get; init; }
-    public required string Password { get; init; }
-    public required UserStatus Status { get; init; }
-    public Permissions? Permissions { get; init; }
-}
+internal sealed record CreateUserRequest(string Username, string Password, UserStatus Status, Permissions? Permissions);

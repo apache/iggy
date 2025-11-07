@@ -17,11 +17,13 @@
  * under the License.
  */
 
-import { deserializeUUID, toDate } from "../serialize.utils.js";
+import { toDate } from "../serialize.utils.js";
+import { u128LEBufToBigint } from "../number.utils.js";
+
 
 export type IggyMessageHeader = {
   checksum: bigint,
-  id: string | 0 | 0n,
+  id: string | BigInt,
   offset: bigint,
   timestamp: Date,
   originTimestamp: Date,
@@ -48,6 +50,8 @@ export const serializeIggyMessageHeader = (
   return b;
 };
 
+export const deserialiseMessageId = (b: Buffer) => u128LEBufToBigint(b);
+
 export const deserializeIggyMessageHeaders = (b: Buffer) => {
   if(b.length !== IGGY_MESSAGE_HEADER_SIZE)
     throw new Error(
@@ -56,7 +60,7 @@ export const deserializeIggyMessageHeaders = (b: Buffer) => {
     );
   const headers: IggyMessageHeader = {
     checksum: b.readBigUInt64LE(0),
-    id: deserializeUUID(b.subarray(8, 24)),
+    id: deserialiseMessageId(b.subarray(8, 24)),
     offset: b.readBigUInt64LE(24),
     timestamp: toDate(b.readBigUInt64LE(32)),
     originTimestamp: toDate(b.readBigUInt64LE(40)),

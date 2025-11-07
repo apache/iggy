@@ -40,6 +40,7 @@ htmlcov/
 .cache
 nosetests.xml
 coverage.xml
+test-results/
 
 # Translations
 *.mo
@@ -69,3 +70,5 @@ docs/_build/
 
 # Pyenv
 .python-version
+
+Cargo.lock

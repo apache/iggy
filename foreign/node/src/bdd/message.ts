@@ -20,7 +20,7 @@
 
 import assert from 'node:assert/strict';
 import { When, Then } from "@cucumber/cucumber";
-import { ConsumerKind, PollingStrategy, Partitioning } from '../wire/index.js';
+import { Consumer,  PollingStrategy, Partitioning } from '../wire/index.js';
 import { someMessageContent } from '../tcp.sm.utils.js';
 import type { TestWorld } from './world.js';
 
@@ -67,7 +67,7 @@ When(
     const pollReq = {
       streamId,
       topicId,
-      consumer: { kind: ConsumerKind.Single, id: 1 },
+      consumer: Consumer.Single,
       partitionId,
       pollingStrategy: PollingStrategy.Offset(BigInt(offset)),
       count: 100,
@@ -88,8 +88,8 @@ Then(
 
 Then(
   'the messages should have sequential offsets from {int} to {int}',
-  function (this: TestWorld,from: number, to: number) {
-    for(let i = from; i < to; i++) {
+  function (this: TestWorld, from: number, to: number) {
+    for (let i = from; i < to; i++) {
       assert.equal(BigInt(i), this.polledMessages[i].headers.offset)
     }
   }
@@ -100,8 +100,10 @@ Then(
   function (this: TestWorld) {
     this.sendMessages.forEach((msg, i) => {
       assert.deepEqual(msg.payload.toString(), this.polledMessages[i].payload.toString());
+      assert.equal(BigInt(msg.id || 0), this.polledMessages[i].headers.id)
     })
-});
+  }
+);
 
 Then(
   'the last polled message should match the last sent message',
@@ -110,4 +112,5 @@ Then(
     const lastPoll = this.polledMessages[this.polledMessages.length - 1];
     assert.deepEqual(lastSent.payload.toString(), lastPoll.payload.toString());
     assert.deepEqual(lastSent.headers || {}, lastPoll.userHeaders);
-});
+  }
+);

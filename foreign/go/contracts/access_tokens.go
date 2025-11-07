@@ -19,20 +19,20 @@ package iggcon
 
 import "time"
 
-type CreateAccessTokenRequest struct {
+type CreatePersonalAccessTokenRequest struct {
 	Name   string `json:"Name"`
 	Expiry uint32 `json:"Expiry"`
 }
 
-type DeleteAccessTokenRequest struct {
+type DeletePersonalAccessTokenRequest struct {
 	Name string `json:"Name"`
 }
 
-type AccessTokenResponse struct {
+type PersonalAccessTokenInfo struct {
 	Name   string     `json:"Name"`
 	Expiry *time.Time `json:"Expiry"`
 }
 
-type AccessToken struct {
+type RawPersonalAccessToken struct {
 	Token string `json:"token"`
 }

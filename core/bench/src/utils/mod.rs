@@ -22,8 +22,8 @@ use bench_report::{
     transport::BenchmarkTransport,
 };
 use iggy::prelude::*;
-use integration::test_server::Transport;
-use std::{fs, path::Path};
+use integration::test_server::ClientFactory;
+use std::{fs, path::Path, sync::Arc};
 use tracing::{error, info};
 
 use crate::args::{
@@ -61,26 +61,9 @@ pub fn batch_user_size_bytes(polled_messages: &PolledMessages) -> u64 {
         .sum()
 }
 
-pub async fn get_server_stats(
-    transport: &BenchmarkTransport,
-    server_address: &str,
-) -> Result<Stats, IggyError> {
-    let client = IggyClientBuilder::new();
-
-    let client = match transport {
-        BenchmarkTransport::Tcp => client
-            .with_tcp()
-            .with_server_address(server_address.to_string())
-            .build()?,
-        BenchmarkTransport::Http => client
-            .with_http()
-            .with_api_url(format!("http://{server_address}"))
-            .build()?,
-        BenchmarkTransport::Quic => client
-            .with_quic()
-            .with_server_address(server_address.to_string())
-            .build()?,
-    };
+pub async fn get_server_stats(client_factory: &Arc<dyn ClientFactory>) -> Result<Stats, IggyError> {
+    let client = client_factory.create_client().await;
+    let client = IggyClient::create(client, None, None);
 
     client.connect().await?;
     client
@@ -91,26 +74,11 @@ pub async fn get_server_stats(
 }
 
 pub async fn collect_server_logs_and_save_to_file(
-    transport: &BenchmarkTransport,
-    server_address: &str,
+    client_factory: &Arc<dyn ClientFactory>,
     output_dir: &Path,
 ) -> Result<(), IggyError> {
-    let client = IggyClientBuilder::new();
-
-    let client = match transport {
-        BenchmarkTransport::Tcp => client
-            .with_tcp()
-            .with_server_address(server_address.to_string())
-            .build()?,
-        BenchmarkTransport::Http => client
-            .with_http()
-            .with_api_url(format!("http://{server_address}"))
-            .build()?,
-        BenchmarkTransport::Quic => client
-            .with_quic()
-            .with_server_address(server_address.to_string())
-            .build()?,
-    };
+    let client = client_factory.create_client().await;
+    let client = IggyClient::create(client, None, None);
 
     client.connect().await?;
     client
@@ -146,9 +114,9 @@ pub fn params_from_args_and_metrics(
 
     // Ugly conversion but let it stay here to have `bench-report` not depend on `iggy` or `integration`
     let transport = match args.transport() {
-        Transport::Tcp => BenchmarkTransport::Tcp,
-        Transport::Quic => BenchmarkTransport::Quic,
-        Transport::Http => BenchmarkTransport::Http,
+        TransportProtocol::Tcp => BenchmarkTransport::Tcp,
+        TransportProtocol::Quic => BenchmarkTransport::Quic,
+        TransportProtocol::Http => BenchmarkTransport::Http,
     };
     let server_address = args.server_address().to_string();
     let remark = args.remark();
@@ -251,16 +219,16 @@ fn add_basic_arguments(parts: &mut Vec<String>, args: &IggyBenchArgs) {
         parts.push(format!("--messages-per-batch {messages_per_batch}"));
     }
 
-    if let Some(message_batches) = args.message_batches() {
-        if message_batches != DEFAULT_MESSAGE_BATCHES {
-            parts.push(format!("--message-batches {message_batches}"));
-        }
+    if let Some(message_batches) = args.message_batches()
+        && message_batches != DEFAULT_MESSAGE_BATCHES
+    {
+        parts.push(format!("--message-batches {message_batches}"));
     }
 
-    if let Some(total_messages_size) = args.total_data() {
-        if total_messages_size != DEFAULT_TOTAL_MESSAGES_SIZE {
-            parts.push(format!("--total-messages-size {total_messages_size}"));
-        }
+    if let Some(total_messages_size) = args.total_data()
+        && total_messages_size != DEFAULT_TOTAL_MESSAGES_SIZE
+    {
+        parts.push(format!("--total-messages-size {total_messages_size}"));
     }
 
     let message_size = args.message_size();

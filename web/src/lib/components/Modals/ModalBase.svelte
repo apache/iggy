@@ -1,5 +1,4 @@
 <script lang="ts">
-  import type { HTMLAttributes } from 'svelte/elements';
   import { twMerge } from 'tailwind-merge';
   import Icon from '../Icon.svelte';
   import type { TransitionConfig } from 'svelte/transition';
@@ -12,14 +11,10 @@
     title?: string;
     titleSuffix?: import('svelte').Snippet;
     children?: import('svelte').Snippet;
-    [key: string]: any
+    [key: string]: any;
   }
 
-  let {
-    titleSuffix,
-    children,
-    ...rest_1
-  }: Props = $props();
+  let { titleSuffix, children, ...rest_1 }: Props = $props();
 
   function modalTransition(node: Element): TransitionConfig {
     const style = getComputedStyle(node);
@@ -40,8 +35,6 @@
     };
   }
 
-
-
   const { class: className, closeModal, title, ...rest } = rest_1 as Props;
 </script>
 
@@ -49,12 +42,12 @@
   {...rest}
   transition:modalTransition
   class={twMerge(
-    'fixed left-1/2 top-1/2  shadow-lg -translate-x-1/2 -translate-y-1/2 rounded-2xl bg-shadeL100 dark:bg-shadeD700 z-[600]  max-h-[90vh] overflow-auto min-w-[min(90vw,400px)] p-7 pb-5 flex flex-col',
+    'fixed left-1/2 top-1/2  shadow-lg -translate-x-1/2 -translate-y-1/2 rounded-2xl bg-shade-l100 dark:bg-shade-d700 z-600  max-h-[90vh] overflow-auto min-w-[min(90vw,400px)] p-7 pb-5 flex flex-col',
     className
   )}
 >
   <div class="h-[15%]">
-    <Button variant="rounded" on:click={() => closeModal()} class="absolute p-2 top-5 right-5">
+    <Button variant="rounded" onclick={() => closeModal()} class="absolute p-2 top-5 right-5">
       <Icon name="close" strokeWidth={2.3} />
     </Button>
 

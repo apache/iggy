@@ -103,7 +103,7 @@ impl IggyByteSize {
         }
         let seconds = duration.as_secs_f64();
         let normalized_bytes_per_second = Self::from((self.as_bytes_u64() as f64 / seconds) as u64);
-        format!("{}/s", normalized_bytes_per_second)
+        format!("{normalized_bytes_per_second}/s")
     }
 }
 

@@ -236,11 +236,11 @@ impl IggyMessagesBatchSet {
                 continue;
             }
 
-            if let Some(sliced) = container.slice_by_offset(start_offset, remaining_count) {
-                if sliced.count() > 0 {
-                    remaining_count -= sliced.count();
-                    result.add_batch(sliced);
-                }
+            if let Some(sliced) = container.slice_by_offset(start_offset, remaining_count)
+                && sliced.count() > 0
+            {
+                remaining_count -= sliced.count();
+                result.add_batch(sliced);
             }
         }
 
@@ -269,11 +269,11 @@ impl IggyMessagesBatchSet {
                 continue;
             }
 
-            if let Some(sliced) = container.slice_by_timestamp(timestamp, remaining_count) {
-                if sliced.count() > 0 {
-                    remaining_count -= sliced.count();
-                    result.add_batch(sliced);
-                }
+            if let Some(sliced) = container.slice_by_timestamp(timestamp, remaining_count)
+                && sliced.count() > 0
+            {
+                remaining_count -= sliced.count();
+                result.add_batch(sliced);
             }
         }
 
@@ -282,7 +282,7 @@ impl IggyMessagesBatchSet {
 
     /// Get the message at the specified index.
     /// Returns None if the index is out of bounds.
-    pub fn get(&self, index: usize) -> Option<IggyMessageView> {
+    pub fn get(&self, index: usize) -> Option<IggyMessageView<'_>> {
         if index >= self.count as usize {
             return None;
         }
@@ -352,33 +352,5 @@ impl From<Vec<IggyMessagesBatchMut>> for IggyMessagesBatchSet {
 impl From<IggyMessagesBatchMut> for IggyMessagesBatchSet {
     fn from(messages: IggyMessagesBatchMut) -> Self {
         Self::from_vec(vec![messages])
-    }
-}
-
-/// Iterator that consumes an IggyMessagesBatchSet and yields batches
-pub struct IggyMessagesBatchSetIntoIter {
-    batches: Vec<IggyMessagesBatchMut>,
-    position: usize,
-}
-
-impl Iterator for IggyMessagesBatchSetIntoIter {
-    type Item = IggyMessagesBatchMut;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.position < self.batches.len() {
-            let batch = std::mem::replace(
-                &mut self.batches[self.position],
-                IggyMessagesBatchMut::empty(),
-            );
-            self.position += 1;
-            Some(batch)
-        } else {
-            None
-        }
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let remaining = self.batches.len() - self.position;
-        (remaining, Some(remaining))
     }
 }

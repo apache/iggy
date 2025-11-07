@@ -22,7 +22,7 @@ use crate::streaming::session::Session;
 use crate::streaming::systems::COMPONENT;
 use crate::streaming::systems::system::System;
 use crate::streaming::utils::PooledBuffer;
-use error_set::ErrContext;
+use err_trail::ErrContext;
 use iggy_common::{
     BytesSerializable, Confirmation, Consumer, EncryptorKind, IGGY_MESSAGE_HEADER_SIZE, Identifier,
     IggyError, Partitioning, PollingStrategy,
@@ -44,10 +44,10 @@ impl System {
             return Err(IggyError::InvalidMessagesCount);
         }
 
-        let topic = self.find_topic(session, stream_id, topic_id).with_error_context(|error| format!("{COMPONENT} (error: {error}) - topic not found for stream ID: {stream_id}, topic_id: {topic_id}"))?;
+        let topic = self.find_topic(session, stream_id, topic_id).with_error(|error| format!("{COMPONENT} (error: {error}) - topic not found for stream ID: {stream_id}, topic_id: {topic_id}"))?;
         self.permissioner
             .poll_messages(session.get_user_id(), topic.stream_id, topic.topic_id)
-            .with_error_context(|error| format!(
+            .with_error(|error| format!(
                 "{COMPONENT} (error: {error}) - permission denied to poll messages for user {} on stream ID: {}, topic ID: {}",
                 session.get_user_id(),
                 topic.stream_id,
@@ -62,7 +62,7 @@ impl System {
         let Some((polling_consumer, partition_id)) = topic
             .resolve_consumer_with_partition_id(consumer, session.client_id, partition_id, true)
             .await
-            .with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to resolve consumer with partition id, consumer: {consumer}, client ID: {}, partition ID: {:?}", session.client_id, partition_id))? else {
+            .with_error(|error| format!("{COMPONENT} (error: {error}) - failed to resolve consumer with partition id, consumer: {consumer}, client ID: {}, partition ID: {:?}", session.client_id, partition_id))? else {
             return Ok((IggyPollMetadata::new(0, 0), IggyMessagesBatchSet::empty()));
         };
 
@@ -81,7 +81,7 @@ impl System {
             topic
                 .store_consumer_offset_internal(polling_consumer, offset, partition_id)
                 .await
-                .with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to store consumer offset internal, polling consumer: {}, offset: {}, partition ID: {}", polling_consumer, offset, partition_id)) ?;
+                .with_error(|error| format!("{COMPONENT} (error: {error}) - failed to store consumer offset internal, polling consumer: {polling_consumer}, offset: {offset}, partition ID: {partition_id}")) ?;
         }
 
         let batch_set = if let Some(encryptor) = &self.encryptor {
@@ -103,12 +103,12 @@ impl System {
         confirmation: Option<Confirmation>,
     ) -> Result<(), IggyError> {
         self.ensure_authenticated(session)?;
-        let topic = self.find_topic(session, stream_id, topic_id).with_error_context(|error| format!("{COMPONENT} (error: {error}) - topic not found for stream_id: {stream_id}, topic_id: {topic_id}"))?;
+        let topic = self.find_topic(session, stream_id, topic_id).with_error(|error| format!("{COMPONENT} (error: {error}) - topic not found for stream_id: {stream_id}, topic_id: {topic_id}"))?;
         self.permissioner.append_messages(
             session.get_user_id(),
             topic.stream_id,
             topic.topic_id
-        ).with_error_context(|error| format!(
+        ).with_error(|error| format!(
             "{COMPONENT} (error: {error}) - permission denied to append messages for user {} on stream ID: {}, topic ID: {}",
             session.get_user_id(),
             topic.stream_id,
@@ -140,12 +140,12 @@ impl System {
         fsync: bool,
     ) -> Result<(), IggyError> {
         self.ensure_authenticated(session)?;
-        let topic = self.find_topic(session, &stream_id, &topic_id).with_error_context(|error| format!("{COMPONENT} (error: {error}) - topic not found for stream ID: {stream_id}, topic_id: {topic_id}"))?;
+        let topic = self.find_topic(session, &stream_id, &topic_id).with_error(|error| format!("{COMPONENT} (error: {error}) - topic not found for stream ID: {stream_id}, topic_id: {topic_id}"))?;
         self.permissioner.append_messages(
             session.get_user_id(),
             topic.stream_id,
             topic.topic_id
-        ).with_error_context(|error| format!(
+        ).with_error(|error| format!(
             "{COMPONENT} (error: {error}) - permission denied to append messages for user {} on stream ID: {}, topic ID: {}",
             session.get_user_id(),
             topic.stream_id,
@@ -172,13 +172,19 @@ impl System {
                 let payload = encryptor.decrypt(message.payload());
                 match payload {
                     Ok(payload) => {
-                        message.header().write_to_buffer(&mut decrypted_messages);
+                        // Update the header with the decrypted payload length
+                        let mut header = message.header().to_header();
+                        header.payload_length = payload.len() as u32;
+
+                        decrypted_messages.extend_from_slice(&header.to_bytes());
                         decrypted_messages.extend_from_slice(&payload);
                         if let Some(user_headers) = message.user_headers() {
                             decrypted_messages.extend_from_slice(user_headers);
                         }
+                        position += IGGY_MESSAGE_HEADER_SIZE
+                            + payload.len()
+                            + message.header().user_headers_length();
                         indexes.insert(0, position as u32, 0);
-                        position += message.size();
                     }
                     Err(error) => {
                         error!("Cannot decrypt the message. Error: {}", error);
@@ -205,9 +211,8 @@ impl System {
         let mut position = 0;
 
         for message in batch.iter() {
-            let header = message.header();
-            let payload_length = header.payload_length();
-            let user_headers_length = header.user_headers_length();
+            let header = message.header().to_header();
+            let user_headers_length = header.user_headers_length;
             let payload_bytes = message.payload();
             let user_headers_bytes = message.user_headers();
 
@@ -215,13 +220,18 @@ impl System {
 
             match encrypted_payload {
                 Ok(encrypted_payload) => {
-                    encrypted_messages.extend_from_slice(&header.to_bytes());
+                    let mut updated_header = header;
+                    updated_header.payload_length = encrypted_payload.len() as u32;
+
+                    encrypted_messages.extend_from_slice(&updated_header.to_bytes());
                     encrypted_messages.extend_from_slice(&encrypted_payload);
                     if let Some(user_headers_bytes) = user_headers_bytes {
                         encrypted_messages.extend_from_slice(user_headers_bytes);
                     }
+                    position += IGGY_MESSAGE_HEADER_SIZE
+                        + encrypted_payload.len()
+                        + user_headers_length as usize;
                     indexes.insert(0, position as u32, 0);
-                    position += IGGY_MESSAGE_HEADER_SIZE + payload_length + user_headers_length;
                 }
                 Err(error) => {
                     error!("Cannot encrypt the message. Error: {}", error);

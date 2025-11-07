@@ -15,11 +15,11 @@
 # specific language governing permissions and limitations
 # under the License.
 
-version: '3.5'
 services:
-
   iggy-server:
-    build: .
+    build:
+      context: .
+      dockerfile: core/server/Dockerfile
     container_name: iggy-server
     restart: unless-stopped
     networks:

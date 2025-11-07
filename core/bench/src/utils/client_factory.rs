@@ -17,22 +17,35 @@
  */
 
 use crate::args::common::IggyBenchArgs;
+use crate::args::transport::BenchmarkTransportCommand;
+use iggy::prelude::TransportProtocol;
 use integration::http_client::HttpClientFactory;
 use integration::quic_client::QuicClientFactory;
 use integration::tcp_client::TcpClientFactory;
-use integration::test_server::{ClientFactory, Transport};
+use integration::test_server::ClientFactory;
 use std::sync::Arc;
 
 pub fn create_client_factory(args: &IggyBenchArgs) -> Arc<dyn ClientFactory> {
     match &args.transport() {
-        Transport::Http => Arc::new(HttpClientFactory {
+        TransportProtocol::Http => Arc::new(HttpClientFactory {
             server_addr: args.server_address().to_owned(),
         }),
-        Transport::Tcp => Arc::new(TcpClientFactory {
-            server_addr: args.server_address().to_owned(),
-            nodelay: args.nodelay(),
-        }),
-        Transport::Quic => Arc::new(QuicClientFactory {
+        TransportProtocol::Tcp => {
+            let transport_command = args.transport_command();
+            if let BenchmarkTransportCommand::Tcp(tcp_args) = transport_command {
+                Arc::new(TcpClientFactory {
+                    server_addr: args.server_address().to_owned(),
+                    nodelay: args.nodelay(),
+                    tls_enabled: tcp_args.tls,
+                    tls_domain: tcp_args.tls_domain.clone(),
+                    tls_ca_file: tcp_args.tls_ca_file.clone(),
+                    tls_validate_certificate: tcp_args.tls_validate_certificate,
+                })
+            } else {
+                unreachable!("Transport is TCP but transport command is not TcpArgs")
+            }
+        }
+        TransportProtocol::Quic => Arc::new(QuicClientFactory {
             server_addr: args.server_address().to_owned(),
         }),
     }

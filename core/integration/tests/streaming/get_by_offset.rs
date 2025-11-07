@@ -34,11 +34,11 @@ use test_case::test_matrix;
  */
 
 fn msg_size(size: u64) -> IggyByteSize {
-    IggyByteSize::from_str(&format!("{}B", size)).unwrap()
+    IggyByteSize::from_str(&format!("{size}B")).unwrap()
 }
 
 fn segment_size(size: u64) -> IggyByteSize {
-    IggyByteSize::from_str(&format!("{}B", size)).unwrap()
+    IggyByteSize::from_str(&format!("{size}B")).unwrap()
 }
 
 fn msgs_req_to_save(count: u32) -> u32 {
@@ -88,8 +88,7 @@ async fn test_get_messages_by_offset(
     cache_indexes: CacheIndexesConfig,
 ) {
     println!(
-        "Running test with message_size: {}, batches: {:?}, messages_required_to_save: {}, segment_size: {}, cache_indexes: {}",
-        message_size, batch_lengths, messages_required_to_save, segment_size, cache_indexes
+        "Running test with message_size: {message_size}, batches: {batch_lengths:?}, messages_required_to_save: {messages_required_to_save}, segment_size: {segment_size}, cache_indexes: {cache_indexes}"
     );
 
     let setup = TestSetup::init().await;
@@ -139,7 +138,7 @@ async fn test_get_messages_by_offset(
     // Generate all messages as defined in the test matrix
     for i in 1..=total_messages_count {
         let id = i as u128;
-        let beginning_of_payload = format!("message {}", i);
+        let beginning_of_payload = format!("message {i}");
         let mut payload = BytesMut::new();
         payload.extend_from_slice(beginning_of_payload.as_bytes());
         payload.resize(message_size.as_bytes_usize(), 0xD);
@@ -336,10 +335,7 @@ async fn test_get_messages_by_offset(
     }
 
     // Add sequential read test for all batch sizes
-    println!(
-        "Verifying sequential reads, expecting {} messages",
-        total_sent_messages
-    );
+    println!("Verifying sequential reads, expecting {total_sent_messages} messages");
 
     let chunk_size = 500;
     let mut verified_count = 0;
@@ -355,16 +351,13 @@ async fn test_get_messages_by_offset(
         assert_eq!(
             chunk.count(),
             read_size,
-            "Failed to read chunk at offset {} with size {}",
-            chunk_start,
-            read_size
+            "Failed to read chunk at offset {chunk_start} with size {read_size}"
         );
 
         verified_count += chunk.count();
 
         println!(
-            "Read chunk at offset {} with size {}, verified count: {}",
-            chunk_start, read_size, verified_count
+            "Read chunk at offset {chunk_start} with size {read_size}, verified count: {verified_count}"
         );
     }
 

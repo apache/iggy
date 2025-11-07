@@ -17,9 +17,9 @@
  */
 
 use crate::binary::sender::SenderKind;
-use crate::streaming::clients::client_manager::Transport;
 use crate::streaming::systems::system::SharedSystem;
 use crate::tcp::connection_handler::{handle_connection, handle_error};
+use iggy_common::TransportProtocol;
 use std::net::SocketAddr;
 use tokio::net::TcpSocket;
 use tokio::sync::oneshot;
@@ -31,7 +31,7 @@ pub async fn start(address: &str, socket: TcpSocket, system: SharedSystem) -> So
     tokio::spawn(async move {
         let addr = address.parse();
         if addr.is_err() {
-            panic!("Unable to parse address {:?}", address);
+            panic!("Unable to parse address {address:?}");
         }
 
         socket
@@ -45,10 +45,7 @@ pub async fn start(address: &str, socket: TcpSocket, system: SharedSystem) -> So
             .expect("Failed to get local address for TCP listener");
 
         tx.send(local_addr).unwrap_or_else(|_| {
-            panic!(
-                "Failed to send the local address {:?} for TCP listener",
-                local_addr
-            )
+            panic!("Failed to send the local address {local_addr:?} for TCP listener")
         });
 
         loop {
@@ -58,7 +55,7 @@ pub async fn start(address: &str, socket: TcpSocket, system: SharedSystem) -> So
                     let session = system
                         .read()
                         .await
-                        .add_client(&address, Transport::Tcp)
+                        .add_client(&address, TransportProtocol::Tcp)
                         .await;
 
                     let client_id = session.client_id;

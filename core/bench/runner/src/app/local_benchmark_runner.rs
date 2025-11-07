@@ -36,7 +36,7 @@ impl LocalBenchmarkRunner {
     pub fn new(iggy_repository_path: &str) -> Result<Self> {
         let temp_dir = TempDir::new()?;
         let repo = Repository::open(iggy_repository_path)
-            .with_context(|| format!("Failed to open repository at '{}'", iggy_repository_path))?;
+            .with_context(|| format!("Failed to open repository at '{iggy_repository_path}'"))?;
 
         let iggy_repository_path = PathBuf::from(iggy_repository_path).canonicalize()?;
         info!("Opened repository at '{}'", iggy_repository_path.display());
@@ -51,7 +51,7 @@ impl LocalBenchmarkRunner {
         let ref_name = "refs/remotes/origin/master";
         self.repo
             .set_head(ref_name)
-            .with_context(|| format!("Failed to set HEAD to '{}'", ref_name))?;
+            .with_context(|| format!("Failed to set HEAD to '{ref_name}'"))?;
         self.repo
             .checkout_head(Some(CheckoutBuilder::new().force()))
             .with_context(|| "Failed to checkout HEAD".to_string())?;
@@ -139,11 +139,11 @@ impl LocalBenchmarkRunner {
     fn checkout_branch(&self, branch: &Branch) -> Result<()> {
         let branch_name = branch.name()?.context("Branch name is not valid UTF-8")?;
         self.repo
-            .set_head(&format!("refs/heads/{}", branch_name))
-            .with_context(|| format!("Failed to set HEAD to branch '{}'", branch_name))?;
+            .set_head(&format!("refs/heads/{branch_name}"))
+            .with_context(|| format!("Failed to set HEAD to branch '{branch_name}'"))?;
         self.repo
             .checkout_head(Some(CheckoutBuilder::new().force()))
-            .with_context(|| format!("Failed to checkout branch '{}'", branch_name))?;
+            .with_context(|| format!("Failed to checkout branch '{branch_name}'"))?;
 
         info!("Checked out to branch '{}'", branch_name);
 
@@ -154,16 +154,16 @@ impl LocalBenchmarkRunner {
         let obj = self
             .repo
             .revparse_single(commit_ref)
-            .with_context(|| format!("Failed to resolve git ref '{}'", commit_ref))?;
+            .with_context(|| format!("Failed to resolve git ref '{commit_ref}'"))?;
         let commit = obj
             .peel_to_commit()
-            .with_context(|| format!("Failed to peel object to commit for ref '{}'", commit_ref))?;
+            .with_context(|| format!("Failed to peel object to commit for ref '{commit_ref}'"))?;
         self.repo
             .set_head_detached(commit.id())
-            .with_context(|| format!("Failed to set HEAD to commit '{}'", commit_ref))?;
+            .with_context(|| format!("Failed to set HEAD to commit '{commit_ref}'"))?;
         self.repo
             .checkout_head(Some(CheckoutBuilder::new().force()))
-            .with_context(|| format!("Failed to checkout commit '{}'", commit_ref))?;
+            .with_context(|| format!("Failed to checkout commit '{commit_ref}'"))?;
 
         info!("Checked out to commit '{}'", commit_ref);
 
@@ -176,16 +176,16 @@ impl LocalBenchmarkRunner {
                 self.checkout_branch(&branch)?;
             }
             Err(_) => {
-                let remote_branch_ref = format!("refs/remotes/origin/{}", gitref);
+                let remote_branch_ref = format!("refs/remotes/origin/{gitref}");
                 if let Ok(reference) = self.repo.find_reference(&remote_branch_ref) {
                     let commit = reference.peel_to_commit().with_context(|| {
-                        format!("Failed to peel remote branch '{}'", remote_branch_ref)
+                        format!("Failed to peel remote branch '{remote_branch_ref}'")
                     })?;
 
                     let branch = self
                         .repo
                         .branch(gitref, &commit, false)
-                        .with_context(|| format!("Failed to create local branch '{}'", gitref))?;
+                        .with_context(|| format!("Failed to create local branch '{gitref}'"))?;
 
                     self.checkout_branch(&branch)?;
 
@@ -210,12 +210,12 @@ impl LocalBenchmarkRunner {
         let obj = self
             .repo
             .revparse_single(gitref)
-            .with_context(|| format!("Failed to resolve git ref '{}'", gitref))?;
+            .with_context(|| format!("Failed to resolve git ref '{gitref}'"))?;
 
         // Ensure the object is a commit
         let commit = obj
             .peel_to_commit()
-            .with_context(|| format!("Reference '{}' does not point to a commit", gitref))?;
+            .with_context(|| format!("Reference '{gitref}' does not point to a commit"))?;
 
         let oid = commit.id();
 

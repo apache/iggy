@@ -19,10 +19,12 @@
 
 
 import { wrapCommand } from '../command.utils.js';
+import { COMMAND_CODE } from '../command.code.js';
 import { deserializeVoidResponse } from '../../client/client.utils.js';
 import { uint32ToBuf, boolToBuf } from '../number.utils.js';
 import { serializeIdentifier, type Id } from '../identifier.utils.js';
 import { serializePermissions, type UserPermissions } from './permissions.utils.js';
+
 
 export type UpdatePermissions = {
   userId: Id,
@@ -30,9 +32,9 @@ export type UpdatePermissions = {
 };
 
 export const UPDATE_PERMISSIONS = {
-  code: 36,
+  code: COMMAND_CODE.UpdatePermissions,
 
-  serialize: ({ userId, permissions}: UpdatePermissions  ) => {
+  serialize: ({ userId, permissions }: UpdatePermissions) => {
 
     const bPermissions = serializePermissions(permissions);
 
@@ -46,5 +48,6 @@ export const UPDATE_PERMISSIONS = {
 
   deserialize: deserializeVoidResponse
 };
+
 
 export const updatePermissions = wrapCommand<UpdatePermissions, boolean>(UPDATE_PERMISSIONS);

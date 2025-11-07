@@ -15,14 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using Apache.Iggy.Contracts;
+
 namespace Apache.Iggy.Tests.Utils.Stats;
 
 public static class StatsFactory
 {
-
-    public static Contracts.Http.Stats CreateFakeStatsObject()
+    public static StatsResponse CreateFakeStatsObject()
     {
-        return new Contracts.Http.Stats
+        return new StatsResponse
         {
             ProcessId = 123,
             CpuUsage = 12.34f,
@@ -48,6 +49,5 @@ public static class StatsFactory
             ClientsCount = 69,
             IggyServerVersion = "1234"
         };
-
     }
 }

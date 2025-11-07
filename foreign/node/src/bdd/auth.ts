@@ -22,11 +22,14 @@ import assert from 'node:assert/strict';
 import { Client } from '../client/index.js';
 import { Given } from "@cucumber/cucumber";
 import type { TestWorld } from './world.js';
+import { getIggyAddress } from '../tcp.sm.utils.js';
 
 const credentials = { username: 'iggy', password: 'iggy' };
+const [host, port] = getIggyAddress();
+
 const opt = {
   transport: 'TCP' as const,
-  options: { port: 8090, host: '127.0.0.1' },
+  options: { host, port },
   credentials
 };
 
@@ -35,7 +38,7 @@ Given('I have a running Iggy server', function () {
 });
 
 
-Given('I am authenticated as the root user', async function(this: TestWorld) {
+Given('I am authenticated as the root user', async function (this: TestWorld) {
   this.client = new Client(opt);
   assert.deepEqual({ userId: 1 }, await this.client.session.login(credentials));
   assert.equal(true, await this.client.system.ping());

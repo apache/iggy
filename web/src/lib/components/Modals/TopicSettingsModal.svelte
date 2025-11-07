@@ -1,6 +1,6 @@
 <script lang="ts">
-  import type { StreamDetails } from '$lib/domain/StreamDetails';
   import type { CloseModalFn } from '$lib/types/utilTypes';
+  import type { TopicDetails } from '$lib/domain/TopicDetails';
   import { z } from 'zod';
 
   import Button from '../Button.svelte';
@@ -8,18 +8,16 @@
   import Input from '../Input.svelte';
   import ModalBase from './ModalBase.svelte';
   import { setError, superForm, defaults } from 'sveltekit-superforms/client';
-  import { zod } from 'sveltekit-superforms/adapters';
+  import { zod4 } from 'sveltekit-superforms/adapters';
   import { fetchRouteApi } from '$lib/api/fetchRouteApi';
   import { dataHas } from '$lib/utils/dataHas';
-  import { goto, invalidateAll } from '$app/navigation';
+  import { goto } from '$app/navigation';
   import { showToast } from '../AppToasts.svelte';
   import ModalConfirmation from '../ModalConfirmation.svelte';
-  import { typedRoute } from '$lib/types/appRoutes';
   import { browser } from '$app/environment';
-  import type { TopicDetails } from '$lib/domain/TopicDetails';
+  import { customInvalidateAll } from '../PeriodicInvalidator.svelte';
   import { numberSizes } from '$lib/utils/constants/numberSizes';
   import { page } from '$app/state';
-  import { customInvalidateAll } from '../PeriodicInvalidator.svelte';
   import { durationFormatter } from '$lib/utils/formatters/durationFormatter';
 
   interface Props {
@@ -41,22 +39,25 @@
     message_expiry: z.number().min(0).max(numberSizes.max.u32).default(topic.messageExpiry)
   });
 
-  const { form, errors, enhance, constraints, submitting, reset, tainted } = superForm(
-    defaults(zod(schema)),
+  const { form, errors, enhance, constraints, submitting, tainted } = superForm(
+    defaults(zod4(schema)),
     {
       SPA: true,
-      validators: zod(schema),
+      validators: zod4(schema),
       invalidateAll: false,
       taintedMessage: false,
       async onUpdate({ form }) {
         if (!form.valid) return;
+        if (!page.params.streamId) return;
 
         const { data, ok } = await fetchRouteApi({
           method: 'PUT',
           path: `/streams/${+page.params.streamId}/topics/${topic.id}`,
           body: {
             name: form.data.name,
-            message_expiry: form.data.message_expiry
+            message_expiry: form.data.message_expiry,
+            compression_algorithm: topic.compressionAlgorithm,
+            max_topic_size: 0
           }
         });
 
@@ -83,9 +84,9 @@
     confirmationOpen = false;
 
     if (result) {
-      const { data, ok } = await fetchRouteApi({
+      const { ok } = await fetchRouteApi({
         method: 'DELETE',
-        path: `/streams/${+page.params.streamId}/topics/${topic.id}`
+        path: `/streams/${+(page.params.streamId || '')}/topics/${topic.id}`
       });
 
       if (ok) {
@@ -112,16 +113,14 @@
     on:result={onConfirmationResult}
   >
     {#snippet message()}
-
-        Deleting the topic "<span class="font-semibold">{topic.name}</span>" will permenently remove
-        all associated <span class="font-semibold">partitions ({topic.partitionsCount})</span> and
-        <span class="font-semibold">messages ({topic.messagesCount})</span>.
-
-      {/snippet}
+      Deleting the topic "<span class="font-semibold">{topic.name}</span>" will permenently remove
+      all associated <span class="font-semibold">partitions ({topic.partitionsCount})</span> and
+      <span class="font-semibold">messages ({topic.messagesCount})</span>.
+    {/snippet}
   </ModalConfirmation>
 
   <div class="h-[400px] flex flex-col">
-    <form method="POST" class="flex flex-col gap-4 flex-[3] pb-5" use:enhance>
+    <form method="POST" class="flex flex-col gap-4 flex-3 pb-5" use:enhance>
       <Input
         name="name"
         label="Name"
@@ -138,7 +137,7 @@
         errorMessage={$errors.message_expiry?.join(',')}
       />
 
-      <span class="-mt-1 text-xs text-shadeD200 dark:text-shadeL700">
+      <span class="-mt-1 text-xs text-shade-d200 dark:text-shade-l700">
         {#if !$form.message_expiry || $form.message_expiry > numberSizes.max.u32}
           {#if $form.message_expiry === 0}
             never
@@ -149,7 +148,7 @@
       </span>
 
       <div class="flex justify-end gap-3 w-full mt-auto">
-        <Button type="button" variant="text" class="w-2/5" on:click={() => closeModal()}
+        <Button type="button" variant="text" class="w-2/5" onclick={() => closeModal()}
           >Cancel</Button
         >
 
@@ -160,7 +159,7 @@
     </form>
 
     <div class="relative w-full flex-1">
-      <div class="h-[1px] border-b absolute -left-7 -right-7"></div>
+      <div class="h-px border-b absolute -left-7 -right-7"></div>
       <h2 class="text-xl text-color font-semibold mb-7 mt-5">Delete topic</h2>
 
       <form class="w-full">
@@ -170,7 +169,7 @@
           <Button
             variant="containedRed"
             class="max-h-[36px]"
-            on:click={() => (confirmationOpen = true)}
+            onclick={() => (confirmationOpen = true)}
           >
             <Icon name="trash" class="w-[20px] -ml-1" />
             Delete</Button

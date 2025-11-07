@@ -11,7 +11,6 @@
 
   let { currentPage, totalPages, maxVisiblePages = 5 }: Props = $props();
 
-
   const dispatch = createEventDispatcher<{ pageChange: number }>();
 
   function getVisiblePages(currentPage: number, totalPages: number, maxVisiblePages: number) {
@@ -48,23 +47,23 @@
 <div class="flex justify-center items-center space-x-2">
   <Button
     variant="text"
-    on:click={() => emitPageChange(currentPage - 1)}
+    onclick={() => emitPageChange(currentPage - 1)}
     disabled={currentPage === 1}
   >
     <Icon name="arrowLeft" />
   </Button>
 
   {#if visiblePages[0] > 1}
-    <Button variant="text" on:click={() => emitPageChange(1)}>1</Button>
+    <Button variant="text" onclick={() => emitPageChange(1)}>1</Button>
     {#if visiblePages[0] > 2}
       <span class="px-2">...</span>
     {/if}
   {/if}
 
-  {#each visiblePages as page}
+  {#each visiblePages as page (page)}
     <Button
       variant={currentPage === page ? 'contained' : 'text'}
-      on:click={() => emitPageChange(page)}
+      onclick={() => emitPageChange(page)}
     >
       {page}
     </Button>
@@ -74,12 +73,12 @@
     {#if visiblePages[visiblePages.length - 1] < totalPages - 1}
       <span class="px-2">...</span>
     {/if}
-    <Button variant="text" on:click={() => emitPageChange(totalPages)}>{totalPages}</Button>
+    <Button variant="text" onclick={() => emitPageChange(totalPages)}>{totalPages}</Button>
   {/if}
 
   <Button
     variant="text"
-    on:click={() => emitPageChange(currentPage + 1)}
+    onclick={() => emitPageChange(currentPage + 1)}
     disabled={currentPage === totalPages}
   >
     <Icon name="arrowRight" />

@@ -20,6 +20,7 @@
 
 import type { CommandResponse } from '../../client/client.type.js';
 import { wrapCommand } from '../command.utils.js';
+import { COMMAND_CODE } from '../command.code.js';
 import { serializeIdentifier, type Id } from '../identifier.utils.js';
 import { deserializeToStream, type Stream } from './stream.utils.js';
 
@@ -28,15 +29,18 @@ export type GetStream = {
 };
 
 export const GET_STREAM = {
-  code: 200,
+  code: COMMAND_CODE.GetStream,
 
   serialize: ({ streamId }: GetStream) => {
     return serializeIdentifier(streamId);
   },
 
   deserialize: (r: CommandResponse) => {
+    if(r.status === 0 && r.length === 0)
+      return null;
     return deserializeToStream(r.data, 0).data
   }
 }
 
-export const getStream = wrapCommand<GetStream, Stream>(GET_STREAM);
+
+export const getStream = wrapCommand<GetStream, Stream | null>(GET_STREAM);

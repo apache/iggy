@@ -25,7 +25,7 @@ use crate::state::models::CreateStreamWithId;
 use crate::streaming::session::Session;
 use crate::streaming::systems::system::SharedSystem;
 use anyhow::Result;
-use error_set::ErrContext;
+use err_trail::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::create_stream::CreateStream;
 use tracing::{debug, instrument};
@@ -50,10 +50,9 @@ impl ServerCommandHandler for CreateStream {
         let stream = system
                 .create_stream(session, self.stream_id, &self.name)
                 .await
-                .with_error_context(|error| {
+                .with_error(|error| {
                     format!(
-                        "{COMPONENT} (error: {error}) - failed to create stream with id: {:?}, session: {session}",
-                        stream_id
+                        "{COMPONENT} (error: {error}) - failed to create stream with id: {stream_id:?}, session: {session}"
                     )
                 })?;
         let stream_id = stream.stream_id;
@@ -66,10 +65,9 @@ impl ServerCommandHandler for CreateStream {
             stream_id,
             command: self
         }))            .await
-            .with_error_context(|error| {
+            .with_error(|error| {
                 format!(
-                    "{COMPONENT} (error: {error}) - failed to apply create stream for id: {:?}, session: {session}",
-                    stream_id
+                    "{COMPONENT} (error: {error}) - failed to apply create stream for id: {stream_id:?}, session: {session}"
                 )
             })?;
         sender.send_ok_response(&response).await?;

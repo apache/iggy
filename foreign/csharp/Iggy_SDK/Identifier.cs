@@ -23,15 +23,27 @@ namespace Apache.Iggy;
 
 public readonly struct Identifier : IEquatable<Identifier>
 {
-
     public required IdKind Kind { get; init; }
     public required int Length { get; init; }
     public required byte[] Value { get; init; }
 
     public static Identifier Numeric(int value)
     {
-        byte[] bytes = new byte[4];
+        var bytes = new byte[4];
         BinaryPrimitives.WriteInt32LittleEndian(bytes, value);
+
+        return new Identifier
+        {
+            Kind = IdKind.Numeric,
+            Length = 4,
+            Value = bytes
+        };
+    }
+
+    public static Identifier Numeric(uint value)
+    {
+        var bytes = new byte[4];
+        BinaryPrimitives.WriteUInt32LittleEndian(bytes, value);
 
         return new Identifier
         {
@@ -47,6 +59,7 @@ public readonly struct Identifier : IEquatable<Identifier>
         {
             throw new ArgumentException("Value has incorrect size, must be between 1 and 255", nameof(value));
         }
+
         return new Identifier
         {
             Kind = IdKind.String,
@@ -63,6 +76,26 @@ public readonly struct Identifier : IEquatable<Identifier>
             IdKind.String => Encoding.UTF8.GetString(Value),
             _ => throw new ArgumentOutOfRangeException()
         };
+    }
+
+    public uint GetUInt32()
+    {
+        if (Kind != IdKind.Numeric)
+        {
+            throw new InvalidOperationException("Identifier is not numeric");
+        }
+
+        return BinaryPrimitives.ReadUInt32LittleEndian(Value);
+    }
+
+    public string GetString()
+    {
+        if (Kind != IdKind.String)
+        {
+            throw new InvalidOperationException("Identifier is not string");
+        }
+
+        return Encoding.UTF8.GetString(Value);
     }
 
     public bool Equals(Identifier other)

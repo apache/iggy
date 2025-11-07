@@ -15,19 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Apache.Iggy.Contracts.Http;
-using Apache.Iggy.Headers;
+using Apache.Iggy.Kinds;
+using Apache.Iggy.Messages;
 
 namespace Apache.Iggy.IggyClient;
 
 public interface IIggyPublisher
 {
-    Task SendMessagesAsync(MessageSendRequest request, Func<byte[], byte[]>?
-        encryptor = null, CancellationToken token = default);
-    Task SendMessagesAsync<TMessage>(MessageSendRequest<TMessage> request,
-         Func<TMessage, byte[]> serializer,
-        Func<byte[], byte[]>? encryptor = null, Dictionary<HeaderKey, HeaderValue>? headers = null,
+    Task SendMessagesAsync(Identifier streamId, Identifier topicId, Partitioning partitioning, IList<Message> messages,
         CancellationToken token = default);
 
-    Task FlushUnsavedBufferAsync(FlushUnsavedBufferRequest request, CancellationToken token = default);
+    Task FlushUnsavedBufferAsync(Identifier streamId, Identifier topicId, uint partitionId, bool fsync,
+        CancellationToken token = default);
 }

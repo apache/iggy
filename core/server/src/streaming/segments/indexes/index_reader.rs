@@ -19,7 +19,7 @@
 use super::IggyIndexesMut;
 use crate::streaming::utils::PooledBuffer;
 use bytes::BytesMut;
-use error_set::ErrContext;
+use err_trail::ErrContext;
 use iggy_common::{INDEX_SIZE, IggyError, IggyIndex, IggyIndexView};
 use std::{
     fs::File as StdFile,
@@ -49,7 +49,7 @@ impl IndexReader {
             .read(true)
             .open(file_path)
             .await
-            .with_error_context(|error| format!("Failed to open index file: {file_path}. {error}"))
+            .with_error(|error| format!("Failed to open index file: {file_path}. {error}"))
             .map_err(|_| IggyError::CannotReadFile)?;
 
         trace!(
@@ -87,7 +87,7 @@ impl IndexReader {
             }
         };
         let index_count = file_size / INDEX_SIZE as u32;
-        let indexes = IggyIndexesMut::from_bytes(buf, 0);
+        let mut indexes = IggyIndexesMut::from_bytes(buf, 0);
         if indexes.count() != index_count {
             error!(
                 "Loaded {} indexes from disk, expected {}, file {} is probably corrupted!",
@@ -96,7 +96,7 @@ impl IndexReader {
                 self.file_path
             );
         }
-
+        indexes.mark_saved();
         Ok(indexes)
     }
 
@@ -174,15 +174,14 @@ impl IndexReader {
             0
         };
 
+        let indexes = IggyIndexesMut::from_bytes(indexes_bytes, base_position);
+
         trace!(
-            "Loaded {} indexes from disk starting at offset {}, base position: {}",
-            actual_count, relative_start_offset, base_position
+            "Loaded {actual_count} indexes from disk starting at offset {relative_start_offset}, base position: {base_position}, last position: {}",
+            indexes.last_position()
         );
 
-        Ok(Some(IggyIndexesMut::from_bytes(
-            indexes_bytes,
-            base_position,
-        )))
+        Ok(Some(indexes))
     }
 
     /// Loads a specific range of indexes from disk based on timestamp.

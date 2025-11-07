@@ -1,32 +1,32 @@
 {
-    "name": "Iggy C++ Client",
-    "image": "docker.io/iggyrs/iggy-cpp-build:latest",
-    "customizations": {
-        "vscode": {
-            "extensions": [
-                "demiaochen.clang-format-indent-4",
-                "donjayamanne.githistory",
-                "eamodio.gitlens",
-                "formulahendry.code-runner",
-                "foxundermoon.shell-format",
-                "github.copilot",
-                "github.remotehub",
-                "github.vscode-github-actions",
-                "github.vscode-pull-request-github",
-                "ionutvmi.path-autocomplete",
-                "jbenden.c-cpp-flylint",
-                "mads-hartmann.bash-ide-vscode",
-                "matepek.vscode-catch2-test-adapter",
-                "ms-azuretools.vscode-docker",
-                "ms-vscode.cpptools-extension-pack",
-                "rangav.vscode-thunder-client",
-                "stuart.unique-window-colors",
-                "styled-components.vscode-styled-components",
-                "tamasfe.even-better-toml",
-                "vscode-icons-team.vscode-icons",
-                "waderyan.gitblame"
-            ]
-        }
-    },
-    "postCreateCommand": "${containerWorkspaceFolder}/.devcontainer/post-install.sh"
+  "name": "Iggy C++ Client",
+  "image": "docker.io/iggyrs/iggy-cpp-build:latest",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "demiaochen.clang-format-indent-4",
+        "donjayamanne.githistory",
+        "eamodio.gitlens",
+        "formulahendry.code-runner",
+        "foxundermoon.shell-format",
+        "github.copilot",
+        "github.remotehub",
+        "github.vscode-github-actions",
+        "github.vscode-pull-request-github",
+        "ionutvmi.path-autocomplete",
+        "jbenden.c-cpp-flylint",
+        "mads-hartmann.bash-ide-vscode",
+        "matepek.vscode-catch2-test-adapter",
+        "ms-azuretools.vscode-docker",
+        "ms-vscode.cpptools-extension-pack",
+        "rangav.vscode-thunder-client",
+        "stuart.unique-window-colors",
+        "styled-components.vscode-styled-components",
+        "tamasfe.even-better-toml",
+        "vscode-icons-team.vscode-icons",
+        "waderyan.gitblame"
+      ]
+    }
+  },
+  "postCreateCommand": "${containerWorkspaceFolder}/.devcontainer/post-install.sh"
 }

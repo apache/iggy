@@ -312,7 +312,7 @@ Options:
           Available topic permissions: manage_topic / m_top, read_topic / r_top, poll_messages / p_msg,
           send_messages / s_msg.
 {CLAP_INDENT}
-          Permissions format: STREAM_ID[:STREAM_PERMISSIONS][#TOPIC_ID[:TOPIC_PERMISSIONS]]
+          Permissions format: STREAM_ID\[:STREAM_PERMISSIONS\]\[#TOPIC_ID\[:TOPIC_PERMISSIONS\]\]
 {CLAP_INDENT}
           Examples:
            iggy user create guest guest -s 1:manage_topics,read_topics
@@ -335,25 +335,19 @@ pub async fn should_short_help_match() {
 
     iggy_cmd_test
         .execute_test_for_help_command(TestHelpCmd::new(
-            vec!["user", "create", "-h"],
+            vec!["user", "permissions", "-h"],
             format!(
-                r#"Create user with given username and password
+                r#"Set permissions for user with given ID
 
-{USAGE_PREFIX} user create [OPTIONS] <USERNAME> <PASSWORD>
+{USAGE_PREFIX} user permissions [OPTIONS] <USER_ID>
 
 Arguments:
-  <USERNAME>  Username
-  <PASSWORD>  Password
+  <USER_ID>  User ID to update
 
 Options:
-  -u, --user-status <USER_STATUS>
-          User status [default: active] [possible values: active, inactive]
-  -g, --global-permissions <GLOBAL_PERMISSIONS>
-          Set global permissions for created user
-  -s, --stream-permissions <STREAM_PERMISSIONS>
-          Set stream permissions for created user
-  -h, --help
-          Print help (see more with '--help')
+  -g, --global-permissions <GLOBAL_PERMISSIONS>  Set global permissions for created user
+  -s, --stream-permissions <STREAM_PERMISSIONS>  Set stream permissions for created user
+  -h, --help                                     Print help (see more with '--help')
 "#,
             ),
         ))

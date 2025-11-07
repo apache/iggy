@@ -29,6 +29,8 @@ import org.apache.iggy.client.blocking.StreamsClient;
 import org.apache.iggy.client.blocking.SystemClient;
 import org.apache.iggy.client.blocking.TopicsClient;
 import org.apache.iggy.client.blocking.UsersClient;
+import java.time.Duration;
+import java.util.Optional;
 import org.apache.iggy.consumergroup.auto.AutoConsumerGroup;
 
 public class IggyTcpClient implements IggyBaseClient {
@@ -42,8 +44,31 @@ public class IggyTcpClient implements IggyBaseClient {
     private final MessagesTcpClient messagesClient;
     private final SystemTcpClient systemClient;
     private final PersonalAccessTokensTcpClient personalAccessTokensClient;
+    private final String host;
+    private final Integer port;
+    private final Optional<String> username;
+    private final Optional<String> password;
+    private final Optional<Duration> connectionTimeout;
+    private final Optional<Duration> requestTimeout;
+    private final Optional<Integer> connectionPoolSize;
+    private final Optional<RetryPolicy> retryPolicy;
 
     public IggyTcpClient(String host, Integer port) {
+        this(host, port, null, null, null, null, null, null);
+    }
+
+    private IggyTcpClient(String host, Integer port, String username, String password,
+                          Duration connectionTimeout, Duration requestTimeout,
+                          Integer connectionPoolSize, RetryPolicy retryPolicy) {
+        this.host = host;
+        this.port = port;
+        this.username = Optional.ofNullable(username);
+        this.password = Optional.ofNullable(password);
+        this.connectionTimeout = Optional.ofNullable(connectionTimeout);
+        this.requestTimeout = Optional.ofNullable(requestTimeout);
+        this.connectionPoolSize = Optional.ofNullable(connectionPoolSize);
+        this.retryPolicy = Optional.ofNullable(retryPolicy);
+
         InternalTcpClient tcpClient = new InternalTcpClient(host, port);
         tcpClient.connect();
         usersClient = new UsersTcpClient(tcpClient);
@@ -55,6 +80,20 @@ public class IggyTcpClient implements IggyBaseClient {
         messagesClient = new MessagesTcpClient(tcpClient);
         systemClient = new SystemTcpClient(tcpClient);
         personalAccessTokensClient = new PersonalAccessTokensTcpClient(tcpClient);
+
+        // Auto-login if credentials are provided
+        if (this.username.isPresent() && this.password.isPresent()) {
+            usersClient.login(this.username.get(), this.password.get());
+        }
+    }
+
+    /**
+     * Creates a new builder for configuring IggyTcpClient.
+     *
+     * @return a new Builder instance
+     */
+    public static Builder builder() {
+        return new Builder();
     }
 
     @Override
@@ -102,12 +141,4 @@ public class IggyTcpClient implements IggyBaseClient {
         return personalAccessTokensClient;
     }
 
-    /**
-     * Creates a new AutoConsumerGroup builder.
-     *
-     * @return a new AutoConsumerGroup builder
-     */
-    public AutoConsumerGroup.Builder consumerGroup() {
-        return AutoConsumerGroup.builder().client(this);
-    }
 }

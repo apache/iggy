@@ -17,6 +17,7 @@
  */
 
 use crate::archiver::{ArchiverKind, ArchiverKindType};
+use crate::configs::cluster::ClusterConfig;
 use crate::configs::server::{DataMaintenanceConfig, PersonalAccessTokenConfig};
 use crate::configs::system::SystemConfig;
 use crate::map_toggle_str;
@@ -34,7 +35,7 @@ use crate::streaming::users::permissioner::Permissioner;
 use crate::streaming::users::user::User;
 use crate::versioning::SemanticVersion;
 use ahash::AHashMap;
-use error_set::ErrContext;
+use err_trail::ErrContext;
 use iggy_common::locking::IggySharedMut;
 use iggy_common::locking::IggySharedMutFn;
 use iggy_common::{Aes256GcmEncryptor, EncryptorKind, IggyError, UserId};
@@ -57,11 +58,11 @@ impl SharedSystem {
         }
     }
 
-    pub async fn read(&self) -> RwLockReadGuard<System> {
+    pub async fn read(&self) -> RwLockReadGuard<'_, System> {
         self.system.read().await
     }
 
-    pub async fn write(&self) -> RwLockWriteGuard<System> {
+    pub async fn write(&self) -> RwLockWriteGuard<'_, System> {
         self.system.write().await
     }
 }
@@ -82,6 +83,7 @@ pub struct System {
     pub(crate) streams_ids: AHashMap<String, u32>,
     pub(crate) users: AHashMap<UserId, User>,
     pub(crate) config: Arc<SystemConfig>,
+    pub(crate) cluster_config: ClusterConfig,
     pub(crate) client_manager: IggySharedMut<ClientManager>,
     pub(crate) encryptor: Option<Arc<EncryptorKind>>,
     pub(crate) metrics: Metrics,
@@ -93,6 +95,7 @@ pub struct System {
 impl System {
     pub fn new(
         config: Arc<SystemConfig>,
+        cluster_config: ClusterConfig,
         data_maintenance_config: DataMaintenanceConfig,
         pat_config: PersonalAccessTokenConfig,
     ) -> System {
@@ -120,6 +123,7 @@ impl System {
         )));
         Self::create(
             config.clone(),
+            cluster_config,
             SystemStorage::new(config, partition_persister),
             state,
             encryptor,
@@ -137,6 +141,7 @@ impl System {
 
     pub fn create(
         system_config: Arc<SystemConfig>,
+        cluster_config: ClusterConfig,
         storage: SystemStorage,
         state: Arc<StateKind>,
         encryptor: Option<Arc<EncryptorKind>>,
@@ -170,6 +175,7 @@ impl System {
 
         System {
             config: system_config,
+            cluster_config,
             streams: AHashMap::new(),
             streams_ids: AHashMap::new(),
             storage: Arc::new(storage),
@@ -215,28 +221,22 @@ impl System {
             self.config.get_system_path()
         );
 
-        let state_entries = self.state.init().await.with_error_context(|error| {
+        let state_entries = self.state.init().await.with_error(|error| {
             format!("{COMPONENT} (error: {error}) - failed to initialize state entries")
         })?;
-        let system_state = SystemState::init(state_entries)
-            .await
-            .with_error_context(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to initialize system state")
-            })?;
-        let now = Instant::now();
-        self.load_version().await.with_error_context(|error| {
-            format!("{COMPONENT} (error: {error}) - failed to load version")
+        let system_state = SystemState::init(state_entries).await.with_error(|error| {
+            format!("{COMPONENT} (error: {error}) - failed to initialize system state")
         })?;
+        let now = Instant::now();
+        self.load_version()
+            .await
+            .with_error(|error| format!("{COMPONENT} (error: {error}) - failed to load version"))?;
         self.load_users(system_state.users.into_values().collect())
             .await
-            .with_error_context(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to load users")
-            })?;
+            .with_error(|error| format!("{COMPONENT} (error: {error}) - failed to load users"))?;
         self.load_streams(system_state.streams.into_values().collect())
             .await
-            .with_error_context(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to load streams")
-            })?;
+            .with_error(|error| format!("{COMPONENT} (error: {error}) - failed to load streams"))?;
         if let Some(archiver) = self.archiver.as_ref() {
             archiver
                 .init()

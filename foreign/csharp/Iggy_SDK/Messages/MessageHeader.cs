@@ -1,4 +1,4 @@
-﻿// Licensed to the Apache Software Foundation (ASF) under one
+// Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
 // regarding copyright ownership.  The ASF licenses this file
@@ -15,15 +15,21 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using System.Text.Json.Serialization;
+using Apache.Iggy.JsonConverters;
+
 namespace Apache.Iggy.Messages;
 
-public readonly struct MessageHeader
+public class MessageHeader
 {
-    public ulong Checksum { get; init; }
-    public UInt128 Id { get; init; }
-    public ulong Offset { get; init; }
-    public DateTimeOffset Timestamp { get; init; }
-    public ulong OriginTimestamp { get; init; }
-    public int UserHeadersLength { get; init; }
-    public int PayloadLength { get; init; }
+    public ulong Checksum { get; set; }
+    public UInt128 Id { get; set; }
+    public ulong Offset { get; set; }
+
+    [JsonConverter(typeof(DateTimeOffsetConverter))]
+    public DateTimeOffset Timestamp { get; set; }
+
+    public ulong OriginTimestamp { get; set; }
+    public int UserHeadersLength { get; set; }
+    public int PayloadLength { get; set; }
 }

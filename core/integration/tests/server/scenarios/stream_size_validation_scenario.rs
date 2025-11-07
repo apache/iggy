@@ -21,9 +21,6 @@ use bytes::Bytes;
 use iggy::prelude::*;
 use integration::test_server::{ClientFactory, assert_clean_system, login_root};
 use std::str::FromStr;
-use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{EnvFilter, Registry};
 
 const S1_NAME: &str = "test-stream-1";
 const T1_NAME: &str = "test-topic-1";
@@ -35,10 +32,6 @@ const MSGS_COUNT: u64 = 117; // number of messages in a single topic after one p
 const MSGS_SIZE: u64 = MSG_SIZE * MSGS_COUNT; // number of bytes in a single topic after one pass of appending
 
 pub async fn run(client_factory: &dyn ClientFactory) {
-    let _ = Registry::default()
-        .with(tracing_subscriber::fmt::layer())
-        .with(EnvFilter::try_from_default_env().unwrap_or(EnvFilter::new("INFO")))
-        .try_init();
     let client = create_client(client_factory).await;
 
     // 0. Ping server, login as root user and ensure that streams do not exist

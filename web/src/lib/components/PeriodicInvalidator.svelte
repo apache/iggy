@@ -22,7 +22,7 @@
 <script lang="ts">
   import { run } from 'svelte/legacy';
 
-  let timeout: number | undefined = $state();
+  let timeout: ReturnType<typeof setTimeout> | undefined = $state();
 
   run(() => {
     if ($isInvalidating) {
@@ -34,7 +34,7 @@
       }, 320);
     }
   });
-  let invalidateInterval: number | undefined = $state();
+  let invalidateInterval: ReturnType<typeof setInterval> | undefined = $state();
   run(() => {
     if (invalidateInterval) clearInterval(invalidateInterval);
     invalidateInterval = setInterval(() => {
@@ -50,16 +50,17 @@
   });
 </script>
 
-<Button variant="rounded" on:click={customInvalidateAll}>
+<Button variant="rounded" onclick={customInvalidateAll}>
   <div class={twMerge($isInvalidatingClampMin && 'spin')}>
-    <Icon name="refresh" class=" dark:stroke-white" />
+    <Icon name="refresh" class="dark:text-white" />
   </div>
   {#snippet tooltip()}
-    <div >Refresh</div>
+    <div>Refresh</div>
   {/snippet}
 </Button>
 
 <style lang="postcss">
+  @reference "../../styles/app.css";
   .spin {
     animation: spin 0.3s linear infinite;
   }

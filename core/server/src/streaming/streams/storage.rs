@@ -22,11 +22,9 @@ use crate::streaming::streams::COMPONENT;
 use crate::streaming::streams::stream::Stream;
 use crate::streaming::topics::topic::Topic;
 use ahash::AHashSet;
-use error_set::ErrContext;
+use err_trail::ErrContext;
 use futures::future::join_all;
 use iggy_common::IggyError;
-use iggy_common::IggyTimestamp;
-use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
 use tokio::fs;
@@ -36,12 +34,6 @@ use tracing::{error, info, warn};
 
 #[derive(Debug)]
 pub struct FileStreamStorage;
-
-#[derive(Debug, Serialize, Deserialize)]
-struct StreamData {
-    name: String,
-    created_at: IggyTimestamp,
-}
 
 impl StreamStorage for FileStreamStorage {
     async fn load(&self, stream: &mut Stream, mut state: StreamState) -> Result<(), IggyError> {
@@ -134,7 +126,7 @@ impl StreamStorage for FileStreamStorage {
                         stream.storage.clone(),
                     )
                     .await;
-                    topic.persist().await.with_error_context(|error| {
+                    topic.persist().await.with_error(|error| {
                         format!("{COMPONENT} (error: {error}) - failed to persist topic: {topic}")
                     })?;
                     unloaded_topics.push(topic);

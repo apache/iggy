@@ -18,14 +18,17 @@
 package binaryserialization
 
 import (
+	"errors"
 	"testing"
 
-	iggcon "github.com/iggy-rs/iggy-go-client/contracts"
+	ierror "github.com/apache/iggy/foreign/go/errors"
+
+	iggcon "github.com/apache/iggy/foreign/go/contracts"
 )
 
 func TestSerializeIdentifier_StringId(t *testing.T) {
 	// Test case for StringId
-	identifier := iggcon.NewIdentifier("Hello")
+	identifier, _ := iggcon.NewIdentifier("Hello")
 
 	// Serialize the identifier
 	serialized := SerializeIdentifier(identifier)
@@ -45,7 +48,7 @@ func TestSerializeIdentifier_StringId(t *testing.T) {
 
 func TestSerializeIdentifier_NumericId(t *testing.T) {
 	// Test case for NumericId
-	identifier := iggcon.NewIdentifier(123)
+	identifier, _ := iggcon.NewIdentifier(uint32(123))
 
 	// Serialize the identifier
 	serialized := SerializeIdentifier(identifier)
@@ -65,19 +68,10 @@ func TestSerializeIdentifier_NumericId(t *testing.T) {
 
 func TestSerializeIdentifier_EmptyStringId(t *testing.T) {
 	// Test case for an empty StringId
-	identifier := iggcon.NewIdentifier("")
-
-	// Serialize the identifier
-	serialized := SerializeIdentifier(identifier)
-
-	// Expected serialized bytes for an empty StringId
-	expected := []byte{
-		0x02, // Kind (StringId)
-		0x00, // Length (0)
-	}
+	_, err := iggcon.NewIdentifier("")
 
 	// Check if the serialized bytes match the expected bytes
-	if !areBytesEqual(serialized, expected) {
-		t.Errorf("Serialized bytes are incorrect for an empty StringId. \nExpected:\t%v\nGot:\t\t%v", expected, serialized)
+	if !errors.Is(err, ierror.ErrInvalidIdentifier) {
+		t.Errorf("Expected error: %v, got: %v", ierror.ErrInvalidIdentifier, err)
 	}
 }

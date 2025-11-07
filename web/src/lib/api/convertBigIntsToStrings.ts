@@ -23,7 +23,7 @@ export const convertBigIntsToStrings = <T>(data: T): T => {
   }
 
   if (Array.isArray(data)) {
-    return data.map(item => convertBigIntsToStrings(item)) as unknown as T;
+    return data.map((item) => convertBigIntsToStrings(item)) as unknown as T;
   }
 
   if (typeof data === 'object' && data !== null) {

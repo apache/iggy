@@ -111,8 +111,8 @@ impl Identifier {
         self.get_cow_str_value().map(|cow| cow.to_string())
     }
 
-    /// Returns the Cow<str> value of the identifier.
-    pub fn get_cow_str_value(&self) -> Result<Cow<str>, IggyError> {
+    /// Returns the `Cow<str>` value of the identifier.
+    pub fn get_cow_str_value(&self) -> Result<Cow<'_, str>, IggyError> {
         if self.kind != IdKind::String {
             return Err(IggyError::InvalidIdentifier);
         }
@@ -126,7 +126,7 @@ impl Identifier {
     }
 
     // Returns the Cow<str> representation of the identifier.
-    pub fn as_cow_str(&self) -> Cow<str> {
+    pub fn as_cow_str(&self) -> Cow<'_, str> {
         match self.kind {
             IdKind::Numeric => Cow::Owned(self.get_u32_value().unwrap().to_string()),
             IdKind::String => self.get_cow_str_value().unwrap(),

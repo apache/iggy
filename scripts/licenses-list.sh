@@ -78,7 +78,11 @@ cargo license --color never --do-not-bundle --all-features >"$TEMP_FILE"
 # Update mode
 if [ "$MODE" = "update" ]; then
     echo "Updating DEPENDENCIES.md..."
-    cp "$TEMP_FILE" DEPENDENCIES.md
+    {
+        echo "# Dependencies"
+        echo ""
+        cat "$TEMP_FILE"
+    } >DEPENDENCIES.md
     echo "DEPENDENCIES.md has been updated."
     exit 0
 fi
@@ -86,10 +90,19 @@ fi
 # Check mode
 if [ "$MODE" = "check" ]; then
     echo "Checking if DEPENDENCIES.md is up to date..."
-    if ! diff -q "$TEMP_FILE" DEPENDENCIES.md >/dev/null; then
+    # Create expected format for comparison
+    EXPECTED_FILE=$(mktemp)
+    trap 'rm -f "$TEMP_FILE" "$EXPECTED_FILE"' EXIT
+    {
+        echo "# Dependencies"
+        echo ""
+        cat "$TEMP_FILE"
+    } >"$EXPECTED_FILE"
+
+    if ! diff -q "$EXPECTED_FILE" DEPENDENCIES.md >/dev/null; then
         echo "Error: DEPENDENCIES.md is out of date. Please run '$0 --update' to update it."
         echo "Diff:"
-        diff -u DEPENDENCIES.md "$TEMP_FILE"
+        diff -u DEPENDENCIES.md "$EXPECTED_FILE"
         exit 1
     else
         echo "DEPENDENCIES.md is up to date."

@@ -22,7 +22,7 @@ use crate::{
     configs::cache_indexes::CacheIndexesConfig,
     streaming::deduplication::message_deduplicator::MessageDeduplicator,
 };
-use error_set::ErrContext;
+use err_trail::ErrContext;
 use iggy_common::Confirmation;
 use iggy_common::IggyError;
 use std::sync::atomic::Ordering;
@@ -99,7 +99,7 @@ impl Segment {
             .expect("Messages writer not initialized")
             .save_batch_set(batches, confirmation)
             .await
-            .with_error_context(|error| {
+            .with_error(|error| {
                 format!(
                     "Failed to save batch of {batch_count} messages ({batch_size} bytes) to {self}. {error}",
                 )
@@ -113,7 +113,7 @@ impl Segment {
             .expect("Index writer not initialized")
             .save_indexes(unsaved_indexes_slice)
             .await
-            .with_error_context(|error| {
+            .with_error(|error| {
                 format!(
                     "Failed to save index of {} indexes to {self}. {error}",
                     unsaved_indexes_slice.len()
@@ -157,9 +157,7 @@ impl Segment {
             let current_segment_size = self.get_messages_size();
             assert!(
                 current_segment_size >= max_segment_size_from_config,
-                "Current segment size: {} is greater than max segment size: {}",
-                current_segment_size,
-                max_segment_size_from_config
+                "Current segment size: {current_segment_size} is greater than max segment size: {max_segment_size_from_config}"
             );
 
             // Since segment is closing, indexes should be dropped if index cache is disabled

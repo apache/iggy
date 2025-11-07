@@ -17,5 +17,6 @@
  */
 
 pub mod benchmark_producer;
-
+pub mod client;
+pub mod typed_benchmark_producer;
 pub use benchmark_producer::BenchmarkProducer;

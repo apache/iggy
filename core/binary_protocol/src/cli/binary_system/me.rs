@@ -60,7 +60,7 @@ impl CliCommand for GetMeCmd {
             format!("{}", client_info.client_id).as_str(),
         ]);
         if let Some(user_id) = client_info.user_id {
-            table.add_row(vec!["User ID", format!("{}", user_id).as_str()]);
+            table.add_row(vec!["User ID", format!("{user_id}").as_str()]);
         }
         table.add_row(vec!["Address", client_info.address.as_str()]);
         table.add_row(vec!["Transport", client_info.transport.as_str()]);

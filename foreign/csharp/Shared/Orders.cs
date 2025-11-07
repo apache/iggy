@@ -19,15 +19,11 @@ using System.Text;
 using System.Text.Json;
 
 namespace Apache.Iggy.Shared;
+
 public class OrderCreated : ISerializableMessage
 {
     private readonly JsonSerializerOptions _jsonSerializerOptions;
 
-    public OrderCreated()
-    {
-        _jsonSerializerOptions = new JsonSerializerOptions();
-        _jsonSerializerOptions.WriteIndented = true;
-    }
     public required int Id { get; init; }
     public required string CurrencyPair { get; init; }
     public required double Price { get; init; }
@@ -35,9 +31,10 @@ public class OrderCreated : ISerializableMessage
     public required string Side { get; init; }
     public required ulong Timestamp { get; init; }
 
-    private string ToJsonPrint()
+    public OrderCreated()
     {
-        return JsonSerializer.Serialize(this, _jsonSerializerOptions);
+        _jsonSerializerOptions = new JsonSerializerOptions();
+        _jsonSerializerOptions.WriteIndented = true;
     }
 
     public string ToJson()
@@ -54,32 +51,39 @@ public class OrderCreated : ISerializableMessage
         var json = JsonSerializer.Serialize(env, _jsonSerializerOptions);
         return Encoding.UTF8.GetBytes(json);
     }
+
     public Envelope ToEnvelope()
     {
         var envelope = new Envelope();
         var env = envelope.New("order_created", this);
         return env;
+    }
+
+    private string ToJsonPrint()
+    {
+        return JsonSerializer.Serialize(this, _jsonSerializerOptions);
     }
 
     public override string ToString()
     {
         return $"OrderCreated {ToJsonPrint()}";
     }
-
 }
 
 public class OrderConfirmed : ISerializableMessage
 {
     private readonly JsonSerializerOptions _jsonSerializerOptions;
 
+    public required int Id { get; init; }
+    public required double Price { get; init; }
+    public required ulong Timestamp { get; init; }
+
     public OrderConfirmed()
     {
         _jsonSerializerOptions = new JsonSerializerOptions();
         _jsonSerializerOptions.WriteIndented = true;
     }
-    public required int Id { get; init; }
-    public required double Price { get; init; }
-    public required ulong Timestamp { get; init; }
+
     public string ToJson()
     {
         var envelope = new Envelope();
@@ -106,6 +110,7 @@ public class OrderConfirmed : ISerializableMessage
     {
         return JsonSerializer.Serialize(this, _jsonSerializerOptions);
     }
+
     public override string ToString()
     {
         return $"OrderConfirmed {ToJsonPrint()}";
@@ -116,20 +121,23 @@ public class OrderRejected : ISerializableMessage
 {
     private readonly JsonSerializerOptions _jsonSerializerOptions;
 
+    public required int Id { get; init; }
+    public required ulong Timestamp { get; init; }
+    public required string Reason { get; init; }
+
     public OrderRejected()
     {
         _jsonSerializerOptions = new JsonSerializerOptions();
         _jsonSerializerOptions.WriteIndented = true;
     }
-    public required int Id { get; init; }
-    public required ulong Timestamp { get; init; }
-    public required string Reason { get; init; }
+
     public string ToJson()
     {
         var envelope = new Envelope();
         var env = envelope.New("order_rejected", this);
         return JsonSerializer.Serialize(env, _jsonSerializerOptions);
     }
+
     public Envelope ToEnvelope()
     {
         var envelope = new Envelope();

@@ -76,13 +76,13 @@ if(BUILD_TESTS)
   # we are going to use these directly for E2E testing rather than the Docker version
   # to allow for finer-grained control
   execute_process(
-    COMMAND bash -c "curl --silent https://api.github.com/repos/iggy-rs/iggy/releases/latest | jq -r .tag_name"
+    COMMAND bash -c "curl --silent https://api.github.com/repos/apache/iggy/releases/latest | jq -r .tag_name"
     OUTPUT_VARIABLE IGGY_VERSION
     OUTPUT_STRIP_TRAILING_WHITESPACE
   )
   set(ARCH "${CMAKE_HOST_SYSTEM_PROCESSOR}")
   set(IGGY_DOWNLOAD_BASENAME "iggy-Linux-${ARCH}-musl.zip")
-  set(URL "https://github.com/iggy-rs/iggy/releases/download/${IGGY_VERSION}/${IGGY_DOWNLOAD_BASENAME}")
+  set(URL "https://github.com/apache/iggy/releases/download/${IGGY_VERSION}/${IGGY_DOWNLOAD_BASENAME}")
   set(IGGY_DOWNLOAD_FILE "${CMAKE_CURRENT_BINARY_DIR}/${IGGY_DOWNLOAD_BASENAME}")
   message(STATUS "Downloading latest Iggy server MUSL release build from ${URL}")
 

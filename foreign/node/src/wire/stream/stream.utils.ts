@@ -35,6 +35,9 @@ type StreamDeserialized = {
 };
 
 export const deserializeToStream = (r: Buffer, pos = 0): StreamDeserialized => {
+  if (r.length === 0)
+    throw new Error('Steam does not exist');
+
   const id = r.readUInt32LE(pos);
   const createdAt = toDate(r.readBigUint64LE(pos + 4));
   const topicsCount = r.readUInt32LE(pos + 12);

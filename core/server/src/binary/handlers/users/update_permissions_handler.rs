@@ -23,7 +23,7 @@ use crate::state::command::EntryCommand;
 use crate::streaming::session::Session;
 use crate::streaming::systems::system::SharedSystem;
 use anyhow::Result;
-use error_set::ErrContext;
+use err_trail::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::update_permissions::UpdatePermissions;
 use tracing::{debug, instrument};
@@ -47,7 +47,7 @@ impl ServerCommandHandler for UpdatePermissions {
         system
                 .update_permissions(session, &self.user_id, self.permissions.clone())
                 .await
-                .with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to update permissions for user_id: {}, session: {session}",
+                .with_error(|error| format!("{COMPONENT} (error: {error}) - failed to update permissions for user_id: {}, session: {session}",
                     self.user_id
                 ))?;
 

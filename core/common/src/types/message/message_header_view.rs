@@ -40,8 +40,7 @@ impl<'a> IggyMessageHeaderView<'a> {
     pub fn new(data: &'a [u8]) -> Self {
         debug_assert!(
             data.len() >= IGGY_MESSAGE_HEADER_SIZE,
-            "Header view requires at least {} bytes",
-            IGGY_MESSAGE_HEADER_SIZE
+            "Header view requires at least {IGGY_MESSAGE_HEADER_SIZE} bytes"
         );
         Self { data }
     }

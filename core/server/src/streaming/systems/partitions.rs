@@ -19,7 +19,7 @@
 use crate::streaming::session::Session;
 use crate::streaming::systems::COMPONENT;
 use crate::streaming::systems::system::System;
-use error_set::ErrContext;
+use err_trail::ErrContext;
 use iggy_common::Identifier;
 use iggy_common::IggyError;
 
@@ -33,12 +33,12 @@ impl System {
     ) -> Result<(), IggyError> {
         self.ensure_authenticated(session)?;
         {
-            let topic = self.find_topic(session, stream_id, topic_id).with_error_context(|error| format!("{COMPONENT} (error: {error}) - topic not found for stream ID: {stream_id}, topic_id: {topic_id}"))?;
+            let topic = self.find_topic(session, stream_id, topic_id).with_error(|error| format!("{COMPONENT} (error: {error}) - topic not found for stream ID: {stream_id}, topic_id: {topic_id}"))?;
             self.permissioner.create_partitions(
                 session.get_user_id(),
                 topic.stream_id,
                 topic.topic_id,
-            ).with_error_context(|error| format!(
+            ).with_error(|error| format!(
                 "{COMPONENT} (error: {error}) - permission denied to create partitions for user {} on stream ID: {}, topic ID: {}",
                 session.get_user_id(),
                 topic.stream_id,
@@ -49,7 +49,7 @@ impl System {
         let topic = self
             .get_stream_mut(stream_id)?
             .get_topic_mut(topic_id)
-            .with_error_context(|error| {
+            .with_error(|error| {
                 format!(
                     "{COMPONENT} (error: {error}) - failed to get mutable reference to stream with id: {stream_id}"
                 )
@@ -57,7 +57,7 @@ impl System {
         topic
             .add_persisted_partitions(partitions_count)
             .await
-            .with_error_context(|error| {
+            .with_error(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to add persisted partitions, topic: {topic}")
             })?;
         topic.reassign_consumer_groups().await;
@@ -75,12 +75,12 @@ impl System {
     ) -> Result<(), IggyError> {
         self.ensure_authenticated(session)?;
         {
-            let topic = self.find_topic(session, stream_id, topic_id).with_error_context(|error| format!("{COMPONENT} (error: {error}) - topic not found for stream ID: {stream_id}, topic_id: {topic_id}"))?;
+            let topic = self.find_topic(session, stream_id, topic_id).with_error(|error| format!("{COMPONENT} (error: {error}) - topic not found for stream ID: {stream_id}, topic_id: {topic_id}"))?;
             self.permissioner.delete_partitions(
                 session.get_user_id(),
                 topic.stream_id,
                 topic.topic_id,
-            ).with_error_context(|error| format!(
+            ).with_error(|error| format!(
                 "{COMPONENT} (error: {error}) - permission denied to delete partitions for user {} on stream ID: {}, topic ID: {}",
                 session.get_user_id(),
                 topic.stream_id,
@@ -91,7 +91,7 @@ impl System {
         let topic = self
             .get_stream_mut(stream_id)?
             .get_topic_mut(topic_id)
-            .with_error_context(|error| {
+            .with_error(|error| {
                 format!(
                     "{COMPONENT} (error: {error}) - failed to get mutable reference to stream with id: {stream_id}"
                 )
@@ -99,7 +99,7 @@ impl System {
         let partitions = topic
             .delete_persisted_partitions(partitions_count)
             .await
-            .with_error_context(|error| {
+            .with_error(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to delete persisted partitions for topic: {topic}")
             })?;
         topic.reassign_consumer_groups().await;

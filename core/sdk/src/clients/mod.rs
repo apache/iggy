@@ -16,6 +16,7 @@
  * under the License.
  */
 
+mod binary_cluster;
 mod binary_consumer_group;
 mod binary_consumer_offset;
 mod binary_message;

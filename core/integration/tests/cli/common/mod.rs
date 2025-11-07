@@ -24,10 +24,8 @@ use assert_cmd::assert::{Assert, OutputAssertExt};
 use assert_cmd::prelude::CommandCargoExt;
 use async_trait::async_trait;
 use iggy::clients::client::IggyClient;
-use iggy::prelude::TcpClient;
-use iggy::prelude::TcpClientConfig;
 use iggy::prelude::defaults::*;
-use iggy::prelude::{Client, SystemClient, UserClient};
+use iggy::prelude::{Client, ClientWrapper, SystemClient, TcpClient, TcpClientConfig, UserClient};
 use integration::test_server::TestServer;
 use std::fmt::{Display, Formatter, Result};
 use std::io::Write;
@@ -107,7 +105,7 @@ impl IggyCmdTest {
             server_address: server.get_raw_tcp_addr().unwrap(),
             ..TcpClientConfig::default()
         };
-        let client = Box::new(TcpClient::create(Arc::new(tcp_client_config)).unwrap());
+        let client = ClientWrapper::Tcp(TcpClient::create(Arc::new(tcp_client_config)).unwrap());
         let client = IggyClient::create(client, None, None);
 
         Self { server, client }
@@ -149,6 +147,8 @@ impl IggyCmdTest {
         command.envs(command_args.get_env());
         // Set server address for the command - it's randomized for each test
         command.args(test_case.protocol(&self.server));
+        // Set COLUMNS environment variable to 200 to avoid truncation of output
+        command.env("COLUMNS", "200");
 
         // Print used environment variables and command with all arguments.
         // By default, it will not be visible but once test is executed with
@@ -180,8 +180,8 @@ impl IggyCmdTest {
             std::thread::spawn(move || {
                 stdin_input.into_iter().for_each(|line| {
                     stdin
-                        .write_all(format!("{}\n", line).as_bytes())
-                        .unwrap_or_else(|_| panic!("Failed to write to stdin \"{}\"", line,))
+                        .write_all(format!("{line}\n").as_bytes())
+                        .unwrap_or_else(|_| panic!("Failed to write to stdin \"{line}\"",))
                 });
             });
 
@@ -207,6 +207,8 @@ impl IggyCmdTest {
         let command_args = test_case.get_command();
         // Set environment variables for the command
         command.envs(command_args.get_env());
+        // Set COLUMNS environment variable to 200 to avoid truncation of output
+        command.env("COLUMNS", "200");
 
         // Print used environment variables and command with all arguments.
         // By default, it will not be visible but once test is executed with

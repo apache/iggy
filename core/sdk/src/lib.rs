@@ -18,7 +18,7 @@
 
 #[allow(deprecated)]
 pub mod client_provider;
-#[allow(deprecated)]
+pub mod client_wrappers;
 pub mod clients;
 pub mod consumer_ext;
 pub mod http;

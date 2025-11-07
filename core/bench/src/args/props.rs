@@ -17,8 +17,7 @@
  */
 
 use super::{output::BenchmarkOutputCommand, transport::BenchmarkTransportCommand};
-use iggy::prelude::IggyByteSize;
-use integration::test_server::Transport;
+use iggy::prelude::{IggyByteSize, TransportProtocol};
 
 pub trait BenchmarkKindProps {
     fn streams(&self) -> u32;
@@ -38,9 +37,12 @@ pub trait BenchmarkKindProps {
 }
 
 pub trait BenchmarkTransportProps {
-    fn transport(&self) -> &Transport;
+    fn transport(&self) -> &TransportProtocol;
     fn server_address(&self) -> &str;
+    // TODO(hubcio): make benchmark use `client_address` and `validate_certificate`
+    #[allow(dead_code)]
     fn client_address(&self) -> &str;
+    #[allow(dead_code)]
     fn validate_certificate(&self) -> bool;
     fn output_command(&self) -> Option<&BenchmarkOutputCommand>;
     fn nodelay(&self) -> bool;

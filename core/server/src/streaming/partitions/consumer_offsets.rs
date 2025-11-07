@@ -20,7 +20,7 @@ use crate::streaming::partitions::COMPONENT;
 use crate::streaming::partitions::partition::{ConsumerOffset, Partition};
 use crate::streaming::polling_consumer::PollingConsumer;
 use dashmap::DashMap;
-use error_set::ErrContext;
+use err_trail::ErrContext;
 use iggy_common::ConsumerKind;
 use iggy_common::IggyError;
 use tracing::trace;
@@ -43,7 +43,7 @@ impl Partition {
                 }
             }
             PollingConsumer::ConsumerGroup(consumer_group_id, _) => {
-                let consumer_offset = self.consumer_offsets.get(&consumer_group_id);
+                let consumer_offset = self.consumer_group_offsets.get(&consumer_group_id);
                 if let Some(consumer_offset) = consumer_offset {
                     return Ok(Some(consumer_offset.offset));
                 }
@@ -70,12 +70,12 @@ impl Partition {
             PollingConsumer::Consumer(consumer_id, _) => {
                 self.store_offset(ConsumerKind::Consumer, consumer_id, offset)
                     .await
-                    .with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to store consumer offset, consumer ID: {}, offset: {}", consumer_id, offset))?;
+                    .with_error(|error| format!("{COMPONENT} (error: {error}) - failed to store consumer offset, consumer ID: {consumer_id}, offset: {offset}"))?;
             }
             PollingConsumer::ConsumerGroup(consumer_id, _) => {
                 self.store_offset(ConsumerKind::ConsumerGroup, consumer_id, offset)
                     .await
-                    .with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to store consumer group offset, consumer ID: {}, offset: {}", consumer_id, offset))?;
+                    .with_error(|error| format!("{COMPONENT} (error: {error}) - failed to store consumer group offset, consumer ID: {consumer_id}, offset: {offset}"))?;
             }
         };
 
@@ -97,7 +97,7 @@ impl Partition {
                 .partition
                 .save_consumer_offset(offset, &path)
                 .await
-                .with_error_context(|error| {
+                .with_error(|error| {
                     format!(
                         "{COMPONENT} (error: {error}) - failed to save consumer offset, consumer ID: {consumer_id}, offset: {offset}, path: {path}",
                     )
@@ -114,10 +114,9 @@ impl Partition {
             .partition
             .save_consumer_offset(offset, &consumer_offset.path)
             .await
-            .with_error_context(|error| {
+            .with_error(|error| {
                 format!(
-                    "{COMPONENT} (error: {error}) - failed to save new consumer offset, consumer ID: {}, offset: {}",
-                    consumer_id, offset
+                    "{COMPONENT} (error: {error}) - failed to save new consumer offset, consumer ID: {consumer_id}, offset: {offset}"
                 )
             })?;
         consumer_offsets.insert(consumer_id, consumer_offset);
@@ -131,7 +130,7 @@ impl Partition {
         );
         self.load_consumer_offsets_from_storage(ConsumerKind::Consumer)
             .await
-            .with_error_context(|error| {
+            .with_error(|error| {
                 format!(
                     "{COMPONENT} (error: {error}) - failed to load consumer offsets from storage"
                 )
@@ -153,7 +152,7 @@ impl Partition {
             .partition
             .load_consumer_offsets(kind, path)
             .await
-            .with_error_context(|error| {
+            .with_error(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to load consumer offsets, kind: {kind}, path: {path}")
             })?;
         let consumer_offsets = self.get_consumer_offsets(kind);
@@ -198,7 +197,7 @@ impl Partition {
                     .remove(&consumer_id)
                     .ok_or(IggyError::ConsumerOffsetNotFound(consumer_id))?;
                 self.storage.partition.delete_consumer_offset(&offset.path).await
-                    .with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to delete consumer offset, consumer ID: {consumer_id}, partition ID: {partition_id}"))?;
+                    .with_error(|error| format!("{COMPONENT} (error: {error}) - failed to delete consumer offset, consumer ID: {consumer_id}, partition ID: {partition_id}"))?;
             }
             PollingConsumer::ConsumerGroup(consumer_id, _) => {
                 let (_, offset) = self
@@ -206,7 +205,7 @@ impl Partition {
                     .remove(&consumer_id)
                     .ok_or(IggyError::ConsumerOffsetNotFound(consumer_id))?;
                 self.storage.partition.delete_consumer_offset(&offset.path).await
-                    .with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to delete consumer group offset, consumer ID: {consumer_id}, partition ID: {partition_id}"))?;
+                    .with_error(|error| format!("{COMPONENT} (error: {error}) - failed to delete consumer group offset, consumer ID: {consumer_id}, partition ID: {partition_id}"))?;
             }
         };
         trace!("Deleted consumer offset for consumer: {consumer}, partition ID: {partition_id}.");

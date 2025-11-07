@@ -22,7 +22,7 @@ use crate::binary::{handlers::consumer_groups::COMPONENT, sender::SenderKind};
 use crate::streaming::session::Session;
 use crate::streaming::systems::system::SharedSystem;
 use anyhow::Result;
-use error_set::ErrContext;
+use err_trail::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::leave_consumer_group::LeaveConsumerGroup;
 use tracing::{debug, instrument};
@@ -51,7 +51,7 @@ impl ServerCommandHandler for LeaveConsumerGroup {
                 &self.group_id,
             )
             .await
-            .with_error_context(|error| {
+            .with_error(|error| {
                 format!(
                     "{COMPONENT} (error: {error}) - failed to leave consumer group for stream_id: {}, topic_id: {}, group_id: {}, session: {}",
                     self.stream_id, self.topic_id, self.group_id, session

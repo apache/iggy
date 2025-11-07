@@ -12,6 +12,7 @@
     name?: string | undefined;
     bindGroup?: string[] | undefined;
     disabled?: boolean;
+    onclick?: (_event: Event) => void;
   }
 
   let {
@@ -20,7 +21,8 @@
     id = '',
     name = undefined,
     bindGroup = $bindable(undefined),
-    disabled = false
+    disabled = false,
+    onclick
   }: Props = $props();
 
   function onChange(e: Event) {
@@ -47,6 +49,7 @@
     {id}
     {disabled}
     onchange={handlers(onChange, bubble('change'))}
+    {onclick}
     onmousedown={() => (isMouseDown = true)}
     onmouseup={() => (isMouseDown = false)}
     onmouseleave={() => (isMouseDown = false)}
@@ -59,10 +62,10 @@
     tabindex="0"
     aria-checked={checked}
     class={twMerge(
-      'w-[18px] h-[18px] absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 border-neutral-300 border-2 rounded transition-all pointer-events-none',
+      'w-[18px] h-[18px] absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 border-neutral-300 border-2 rounded-sm transition-all pointer-events-none',
       isMouseDown && 'scale-90'
     )}
-></div>
+  ></div>
 
   <svg
     class="w-[18px] h-[18px] pointer-events-none transition-all scale-75 opacity-0 absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2"
@@ -81,12 +84,14 @@
 </div>
 
 <style lang="postcss">
+  @reference "../../styles/app.css";
+
   input[type='checkbox'] {
     @apply cursor-pointer appearance-none m-0 absolute inset-0;
   }
 
   input[type='checkbox'] + div {
-    @apply bg-shadeL100;
+    @apply bg-shade-l100;
   }
 
   input[type='checkbox']:hover:not(:checked):not(:disabled) + div {

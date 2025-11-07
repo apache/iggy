@@ -33,11 +33,13 @@ use iggy_common::delete_consumer_group::DeleteConsumerGroup;
 use iggy_common::delete_consumer_offset::DeleteConsumerOffset;
 use iggy_common::delete_partitions::DeletePartitions;
 use iggy_common::delete_personal_access_token::DeletePersonalAccessToken;
+use iggy_common::delete_segments::DeleteSegments;
 use iggy_common::delete_stream::DeleteStream;
 use iggy_common::delete_topic::DeleteTopic;
 use iggy_common::delete_user::DeleteUser;
 use iggy_common::get_client::GetClient;
 use iggy_common::get_clients::GetClients;
+use iggy_common::get_cluster_metadata::GetClusterMetadata;
 use iggy_common::get_consumer_group::GetConsumerGroup;
 use iggy_common::get_consumer_groups::GetConsumerGroups;
 use iggy_common::get_consumer_offset::GetConsumerOffset;
@@ -75,6 +77,7 @@ define_server_command_enum! {
     GetClient(GetClient), GET_CLIENT_CODE, GET_CLIENT, true;
     GetClients(GetClients), GET_CLIENTS_CODE, GET_CLIENTS, false;
     GetSnapshot(GetSnapshot), GET_SNAPSHOT_FILE_CODE, GET_SNAPSHOT_FILE, false;
+    GetClusterMetadata(GetClusterMetadata), GET_CLUSTER_METADATA_CODE, GET_CLUSTER_METADATA, false;
     PollMessages(PollMessages), POLL_MESSAGES_CODE, POLL_MESSAGES, true;
     FlushUnsavedBuffer(FlushUnsavedBuffer), FLUSH_UNSAVED_BUFFER_CODE, FLUSH_UNSAVED_BUFFER, true;
     GetUser(GetUser), GET_USER_CODE, GET_USER, true;
@@ -108,6 +111,7 @@ define_server_command_enum! {
     PurgeTopic(PurgeTopic), PURGE_TOPIC_CODE, PURGE_TOPIC, true;
     CreatePartitions(CreatePartitions), CREATE_PARTITIONS_CODE, CREATE_PARTITIONS, true;
     DeletePartitions(DeletePartitions), DELETE_PARTITIONS_CODE, DELETE_PARTITIONS, true;
+    DeleteSegments(DeleteSegments), DELETE_SEGMENTS_CODE, DELETE_SEGMENTS, true;
     GetConsumerGroup(GetConsumerGroup), GET_CONSUMER_GROUP_CODE, GET_CONSUMER_GROUP, true;
     GetConsumerGroups(GetConsumerGroups), GET_CONSUMER_GROUPS_CODE, GET_CONSUMER_GROUPS, false;
     CreateConsumerGroup(CreateConsumerGroup), CREATE_CONSUMER_GROUP_CODE, CREATE_CONSUMER_GROUP, true;
@@ -167,6 +171,11 @@ mod tests {
             &ServerCommand::GetStats(GetStats::default()),
             GET_STATS_CODE,
             &GetStats::default(),
+        );
+        assert_serialized_as_bytes_and_deserialized_from_bytes(
+            &ServerCommand::GetClusterMetadata(GetClusterMetadata::default()),
+            GET_CLUSTER_METADATA_CODE,
+            &GetClusterMetadata::default(),
         );
         assert_serialized_as_bytes_and_deserialized_from_bytes(
             &ServerCommand::GetMe(GetMe::default()),
@@ -332,6 +341,11 @@ mod tests {
             &ServerCommand::DeletePartitions(DeletePartitions::default()),
             DELETE_PARTITIONS_CODE,
             &DeletePartitions::default(),
+        );
+        assert_serialized_as_bytes_and_deserialized_from_bytes(
+            &ServerCommand::DeleteSegments(DeleteSegments::default()),
+            DELETE_SEGMENTS_CODE,
+            &DeleteSegments::default(),
         );
         assert_serialized_as_bytes_and_deserialized_from_bytes(
             &ServerCommand::GetConsumerGroup(GetConsumerGroup::default()),

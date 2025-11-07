@@ -17,7 +17,7 @@
  */
 
 use crate::streaming::segments::IggyMessagesBatchSet;
-use error_set::ErrContext;
+use err_trail::ErrContext;
 use flume::{Receiver, unbounded};
 use std::{
     sync::{
@@ -180,10 +180,9 @@ impl PersisterTask {
                             if fsync {
                                 file.sync_all()
                                     .await
-                                    .with_error_context(|error| {
+                                    .with_error(|error| {
                                         format!(
-                                            "Failed to fsync messages file: {}. {error}",
-                                            file_path
+                                            "Failed to fsync messages file: {file_path}. {error}"
                                         )
                                     })
                                     .expect("Failed to fsync messages file");

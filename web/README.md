@@ -1,43 +1,41 @@
-# Apache Iggy (Incubating) Web UI
+# Apache Iggy Web UI
 
-This repository hosts the web user interface for [Iggy](https://github.com/iggy-rs/iggy), a persistent message streaming platform written in Rust. The web UI is built using SvelteKit.
+This project hosts the web user interface for Apache Iggy. The web UI is built using SvelteKit.
 
-![iggy](static/signIn.png)
-![iggy](static/stats.png)
-![iggy](static/permissions.png)
-![iggy](static/streams.png)
-![iggy](static/streamsLight.png)
+![Web](../assets/web_ui.png)
 
 ## Overview
 
 The Iggy Web UI provides a user-friendly panel for managing various aspects of the Iggy platform, including streams, topics, partitions, and more.
+
+The [docker image](https://hub.docker.com/r/apache/iggy-web-ui) is available, and can be fetched via `docker pull apache/iggy-web-ui`.
 
 ### Getting Started
 
 1. **Run Iggy server first**
 
    ```sh
-   docker pull iggyrs/iggy:latest
+   docker pull apache/iggy:latest
    ```
 
    ```sh
-   docker run -p 3000:3000 -p 8090:8090 iggyrs/iggy:latest
+   docker run -p 3000:3000 -p 8090:8090 apache/iggy:latest
    ```
 
-1. **Clone the repository:**
+2. **Clone the repository:**
 
    ```sh
-   git clone https://github.com/iggy-rs/iggy-web-ui.git
+   git clone https://github.com/apache/iggy.git
    ```
 
-1. **Build the project:**
+3. **Build the project:**
 
    ```sh
-   cd iggy-web-ui
+   cd web
    npm install
    ```
 
-1. **Run the project:**
+4. **Run the project:**
 
    ```sh
    npm run dev
@@ -52,7 +50,7 @@ The Iggy Web UI provides a user-friendly panel for managing various aspects of t
    **If Iggy server was run using cargo directly we need to change PUBLIC_IGGY_API_URL env in web ui root folder to:**
 
    ```sh
-   PUBLIC_IGGY_API_URL=http://0.0.0.0:3000
+   PUBLIC_IGGY_API_URL=http://127.0.0.1:3000
    ```
 
    **instead of**
@@ -71,8 +69,8 @@ The Iggy Web UI provides a user-friendly panel for managing various aspects of t
 - [ ] Messages management
 - [ ] General UI improvements
 - [ ] Permission management (in progress)
-- [ ] GitHub actions CI/CD
-- [ ] Publish to Dockerhub as separate Image
+- [x] GitHub actions CI/CD
+- [x] Publish to Dockerhub as separate Image
 
 ## Contributing
 

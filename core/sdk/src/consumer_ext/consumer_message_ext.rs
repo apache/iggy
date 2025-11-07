@@ -25,7 +25,7 @@ use tokio::sync::oneshot;
 use tracing::{error, info, trace};
 
 #[async_trait]
-impl IggyConsumerMessageExt for IggyConsumer {
+impl<'a> IggyConsumerMessageExt<'a> for IggyConsumer {
     /// Consume messages from the stream and process them with the given message consumer.
     ///
     /// # Arguments
@@ -46,8 +46,8 @@ impl IggyConsumerMessageExt for IggyConsumer {
     /// * `IggyError::ClientShutdown`: The client has been shut down.
     ///
     async fn consume_messages<P>(
-        mut self,
-        message_consumer: &'static P,
+        &mut self,
+        message_consumer: &'a P,
         mut shutdown_rx: oneshot::Receiver<()>,
     ) -> Result<(), IggyError>
     where

@@ -21,10 +21,10 @@
 import type { CommandResponse } from '../../client/client.type.js';
 import { deserializeClient, type Client } from './client.utils.js';
 import { wrapCommand } from '../command.utils.js';
+import { COMMAND_CODE } from '../command.code.js';
 
-// GET ME
 export const GET_ME = {
-  code: 20,
+  code: COMMAND_CODE.GetMe,
 
   serialize: () => Buffer.alloc(0),
 

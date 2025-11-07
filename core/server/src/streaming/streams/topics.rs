@@ -19,7 +19,7 @@
 use crate::streaming::streams::COMPONENT;
 use crate::streaming::streams::stream::Stream;
 use crate::streaming::topics::topic::Topic;
-use error_set::ErrContext;
+use err_trail::ErrContext;
 use iggy_common::CompressionAlgorithm;
 use iggy_common::IggyError;
 use iggy_common::IggyExpiry;
@@ -54,7 +54,9 @@ impl Stream {
         }
 
         let mut id;
-        if topic_id.is_none() {
+        if let Some(topic_id) = topic_id {
+            id = topic_id;
+        } else {
             id = self.current_topic_id.fetch_add(1, Ordering::SeqCst);
             loop {
                 if self.topics.contains_key(&id) {
@@ -66,8 +68,6 @@ impl Stream {
                     break;
                 }
             }
-        } else {
-            id = topic_id.unwrap();
         }
 
         if self.topics.contains_key(&id) {
@@ -90,7 +90,7 @@ impl Stream {
             replication_factor,
         )
         .await?;
-        topic.persist().await.with_error_context(|error| {
+        topic.persist().await.with_error(|error| {
             format!("{COMPONENT} (error: {error}) - failed to persist topic: {topic}")
         })?;
         info!("Created topic {}", topic);
@@ -112,34 +112,32 @@ impl Stream {
         let max_topic_size = Topic::get_max_topic_size(max_topic_size, &self.config)?;
         let topic_id;
         {
-            let topic = self.get_topic(id).with_error_context(|error| {
+            let topic = self.get_topic(id).with_error(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to get topic with id: {id}")
             })?;
             topic_id = topic.topic_id;
         }
 
         {
-            if let Some(topic_id_by_name) = self.topics_ids.get(name) {
-                if *topic_id_by_name != topic_id {
-                    return Err(IggyError::TopicNameAlreadyExists(
-                        name.to_owned(),
-                        self.stream_id,
-                    ));
-                }
+            if let Some(topic_id_by_name) = self.topics_ids.get(name)
+                && *topic_id_by_name != topic_id
+            {
+                return Err(IggyError::TopicNameAlreadyExists(
+                    name.to_owned(),
+                    self.stream_id,
+                ));
             }
         }
 
         let old_topic_name = {
-            let topic = self.get_topic(id).with_error_context(|error| {
+            let topic = self.get_topic(id).with_error(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to get topic with id: {id}")
             })?;
             topic.name.clone()
         };
 
         {
-            self.topics_ids.remove(&old_topic_name.clone());
-            self.topics_ids.insert(name.to_owned(), topic_id);
-            let topic = self.get_topic_mut(id).with_error_context(|error| {
+            let topic = self.get_topic_mut(id).with_error(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to get mutable reference to topic with id {id}")
             })?;
 
@@ -155,10 +153,15 @@ impl Stream {
             }
             topic.max_topic_size = max_topic_size;
             topic.replication_factor = replication_factor;
-            topic.persist().await.with_error_context(|error| {
+            topic.persist().await.with_error(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to persist topic: {topic}")
             })?;
             info!("Updated topic: {topic}");
+        }
+
+        {
+            self.topics_ids.remove(&old_topic_name.clone());
+            self.topics_ids.insert(name.to_owned(), topic_id);
         }
 
         Ok(())
@@ -250,7 +253,7 @@ impl Stream {
     }
 
     pub async fn delete_topic(&mut self, id: &Identifier) -> Result<Topic, IggyError> {
-        let topic = self.remove_topic(id).with_error_context(|error| {
+        let topic = self.remove_topic(id).with_error(|error| {
             format!("{COMPONENT} (error: {error}) - failed to remove topic with id: {id}")
         })?;
         let topic_id = topic.topic_id;
@@ -262,7 +265,7 @@ impl Stream {
         topic
             .delete()
             .await
-            .with_error_context(|error| {
+            .with_error(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to delete topic: {topic}")
             })
             .map_err(|_| IggyError::CannotDeleteTopic(topic.topic_id, self.stream_id))?;

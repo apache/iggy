@@ -38,7 +38,7 @@ impl TestStreamCreateCmd {
 
         if let Some(stream_id) = self.stream_id {
             args.push("-s".to_string());
-            args.push(format!("{}", stream_id));
+            args.push(format!("{stream_id}"));
         }
 
         args.push(self.name.clone());
@@ -61,7 +61,7 @@ impl IggyCmdTestCase for TestStreamCreateCmd {
 
     fn verify_command(&self, command_state: Assert) {
         let stream_id = match self.stream_id {
-            Some(stream_id) => format!("ID: {}", stream_id),
+            Some(stream_id) => format!("ID: {stream_id}"),
             None => "ID auto incremented".to_string(),
         };
 

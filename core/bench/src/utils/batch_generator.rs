@@ -113,6 +113,10 @@ impl BenchmarkBatchGenerator {
         &mut self.batch
     }
 
+    pub fn generate_owned_batch(&self) -> BenchmarkMessagesBatch {
+        self.build_single_fixed()
+    }
+
     #[inline]
     fn build_single_fixed(&self) -> BenchmarkMessagesBatch {
         let payload_length = self.message_size.max();

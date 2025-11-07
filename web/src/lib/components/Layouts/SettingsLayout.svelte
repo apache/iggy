@@ -34,7 +34,7 @@
       icon: 'usersGroup',
       name: 'Users',
       href: typedRoute('/dashboard/settings/users')
-    },
+    }
     // {
     //   name: 'Terminal',
     //   icon: 'terminal',
@@ -51,7 +51,7 @@
 </div>
 
 <div class="flex gap-12 border-b px-10">
-  {#each tabs as { icon, name, tab, href }, idx (idx)}
+  {#each tabs as { icon, name, href }, idx (idx)}
     {@const isActive = activeTab === href.split('/').slice(-1)[0]}
     <a
       {href}
@@ -68,9 +68,9 @@
           'absolute left-0 right-0 top-full h-[2px] -translate-y-full rounded-tl-md rounded-tr-md transition-colors duration-200',
           isActive
             ? 'dark:bg-white bg-black'
-            : 'group-hover:bg-shadeL600 dark:group-hover:bg-shadeD300'
+            : 'group-hover:bg-shade-l600 dark:group-hover:bg-shade-d300'
         )}
-></div>
+      ></div>
     </a>
   {/each}
 </div>

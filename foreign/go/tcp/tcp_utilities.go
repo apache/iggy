@@ -18,12 +18,12 @@
 package tcp
 
 import (
-	binaryserialization "github.com/iggy-rs/iggy-go-client/binary_serialization"
-	. "github.com/iggy-rs/iggy-go-client/contracts"
+	binaryserialization "github.com/apache/iggy/foreign/go/binary_serialization"
+	iggcon "github.com/apache/iggy/foreign/go/contracts"
 )
 
-func (tms *IggyTcpClient) GetStats() (*Stats, error) {
-	buffer, err := tms.sendAndFetchResponse([]byte{}, GetStatsCode)
+func (tms *IggyTcpClient) GetStats() (*iggcon.Stats, error) {
+	buffer, err := tms.sendAndFetchResponse([]byte{}, iggcon.GetStatsCode)
 	if err != nil {
 		return nil, err
 	}
@@ -35,6 +35,6 @@ func (tms *IggyTcpClient) GetStats() (*Stats, error) {
 }
 
 func (tms *IggyTcpClient) Ping() error {
-	_, err := tms.sendAndFetchResponse([]byte{}, PingCode)
+	_, err := tms.sendAndFetchResponse([]byte{}, iggcon.PingCode)
 	return err
 }

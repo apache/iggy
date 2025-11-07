@@ -24,6 +24,7 @@ namespace Apache.Iggy.StringHandlers;
 internal ref struct MessageRequestInterpolationHandler
 {
     private DefaultInterpolatedStringHandler _innerHandler;
+
     internal MessageRequestInterpolationHandler(int literalLength, int formattedCount)
     {
         _innerHandler = new DefaultInterpolatedStringHandler(literalLength, formattedCount);
@@ -33,6 +34,7 @@ internal ref struct MessageRequestInterpolationHandler
     {
         _innerHandler.AppendLiteral(message);
     }
+
     internal void AppendFormatted<T>(T t)
     {
         switch (t)

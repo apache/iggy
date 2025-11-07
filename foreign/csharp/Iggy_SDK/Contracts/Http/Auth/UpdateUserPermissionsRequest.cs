@@ -15,13 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using System.Text.Json.Serialization;
+using Apache.Iggy.Contracts.Auth;
 
 namespace Apache.Iggy.Contracts.Http.Auth;
 
-public sealed class UpdateUserPermissionsRequest
-{
-    [JsonIgnore]
-    public required Identifier UserId { get; init; }
-    public Permissions? Permissions { get; init; }
-}
+internal sealed record UpdateUserPermissionsRequest(Permissions? Permissions);

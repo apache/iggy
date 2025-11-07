@@ -22,7 +22,7 @@ use crate::streaming::streams::stream::Stream;
 use crate::streaming::systems::COMPONENT;
 use crate::streaming::systems::system::System;
 use ahash::{AHashMap, AHashSet};
-use error_set::ErrContext;
+use err_trail::ErrContext;
 use futures::future::try_join_all;
 use iggy_common::locking::IggySharedMutFn;
 use iggy_common::{IdKind, Identifier, IggyError};
@@ -174,7 +174,7 @@ impl System {
         self.ensure_authenticated(session)?;
         self.permissioner
             .get_streams(session.get_user_id())
-            .with_error_context(|error| {
+            .with_error(|error| {
                 format!(
                     "{COMPONENT} (error: {error}) - permission denied to get streams for user {}",
                     session.get_user_id(),
@@ -193,7 +193,7 @@ impl System {
         if let Ok(stream) = stream {
             self.permissioner
                 .get_stream(session.get_user_id(), stream.stream_id)
-                .with_error_context(|error| {
+                .with_error(|error| {
                     format!(
                         "{COMPONENT} (error: {error}) - permission denied to get stream for user {}",
                         session.get_user_id(),
@@ -217,7 +217,7 @@ impl System {
 
         self.permissioner
             .get_stream(session.get_user_id(), stream.stream_id)
-            .with_error_context(|error| {
+            .with_error(|error| {
                 format!(
                     "{COMPONENT} (error: {error}) - permission denied to get stream with ID: {identifier} for user with ID: {}",
                     session.get_user_id(),
@@ -307,7 +307,9 @@ impl System {
         }
 
         let mut id;
-        if stream_id.is_none() {
+        if let Some(stream_id) = stream_id {
+            id = stream_id;
+        } else {
             id = CURRENT_STREAM_ID.fetch_add(1, Ordering::SeqCst);
             loop {
                 if self.streams.contains_key(&id) {
@@ -319,8 +321,6 @@ impl System {
                     break;
                 }
             }
-        } else {
-            id = stream_id.unwrap();
         }
 
         if self.streams.contains_key(&id) {
@@ -345,7 +345,7 @@ impl System {
         self.ensure_authenticated(session)?;
         let stream_id;
         {
-            let stream = self.get_stream(id).with_error_context(|error| {
+            let stream = self.get_stream(id).with_error(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to get stream with ID: {id}")
             })?;
             stream_id = stream.stream_id;
@@ -353,7 +353,7 @@ impl System {
 
         self.permissioner
             .update_stream(session.get_user_id(), stream_id)
-            .with_error_context(|error| {
+            .with_error(|error| {
                 format!(
                     "{COMPONENT} (error: {error}) - failed to update stream, user ID: {}, stream ID: {}",
                     session.get_user_id(),
@@ -362,16 +362,16 @@ impl System {
             })?;
 
         {
-            if let Some(stream_id_by_name) = self.streams_ids.get(name) {
-                if *stream_id_by_name != stream_id {
-                    return Err(IggyError::StreamNameAlreadyExists(name.to_owned()));
-                }
+            if let Some(stream_id_by_name) = self.streams_ids.get(name)
+                && *stream_id_by_name != stream_id
+            {
+                return Err(IggyError::StreamNameAlreadyExists(name.to_owned()));
             }
         }
 
         let old_name;
         {
-            let stream = self.get_stream_mut(id).with_error_context(|error| {
+            let stream = self.get_stream_mut(id).with_error(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to get mutable reference to stream with id: {id}")
             })?;
             old_name = stream.name.clone();
@@ -394,13 +394,13 @@ impl System {
         id: &Identifier,
     ) -> Result<u32, IggyError> {
         self.ensure_authenticated(session)?;
-        let stream = self.get_stream(id).with_error_context(|error| {
+        let stream = self.get_stream(id).with_error(|error| {
             format!("{COMPONENT} (error: {error}) - failed to get stream with ID: {id}")
         })?;
         let stream_id = stream.stream_id;
         self.permissioner
             .delete_stream(session.get_user_id(), stream_id)
-            .with_error_context(|error| {
+            .with_error(|error| {
                 format!(
                     "{COMPONENT} (error: {error}) - permission denied to delete stream for user {}, stream ID: {}",
                     session.get_user_id(),
@@ -437,12 +437,12 @@ impl System {
         session: &Session,
         stream_id: &Identifier,
     ) -> Result<(), IggyError> {
-        let stream = self.get_stream(stream_id).with_error_context(|error| {
+        let stream = self.get_stream(stream_id).with_error(|error| {
             format!("{COMPONENT} (error: {error}) - failed to get stream with ID: {stream_id}")
         })?;
         self.permissioner
             .purge_stream(session.get_user_id(), stream.stream_id)
-            .with_error_context(|error| {
+            .with_error(|error| {
                 format!(
                     "{COMPONENT} (error: {error}) - permission denied to purge stream for user {}, stream ID: {}",
                     session.get_user_id(),
@@ -456,6 +456,7 @@ impl System {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::configs::cluster::ClusterConfig;
     use crate::configs::server::{DataMaintenanceConfig, PersonalAccessTokenConfig};
     use crate::configs::system::SystemConfig;
     use crate::state::{MockState, StateKind};
@@ -484,6 +485,7 @@ mod tests {
         let stream_name = "test";
         let mut system = System::create(
             config,
+            ClusterConfig::default(),
             storage,
             Arc::new(StateKind::Mock(MockState::new())),
             None,

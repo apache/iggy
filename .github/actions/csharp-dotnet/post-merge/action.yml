@@ -1,0 +1,110 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: csharp-dotnet-post-merge
+description: .NET post-merge publishing github iggy actions
+
+inputs:
+  version:
+    description: "Version for publishing"
+    required: true
+  dry_run:
+    description: "Dry run mode"
+    required: false
+    default: "false"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: "8.0.x"
+
+    - name: Restore dependencies
+      run: |
+        cd foreign/csharp
+        dotnet restore
+      shell: bash
+
+    - name: Build Release
+      run: |
+        cd foreign/csharp
+
+        # Build in Release mode
+        dotnet build -c Release --no-restore
+
+        # List build output
+        echo "Build output:"
+        find . -name "*.dll" -path "*/bin/Release/*" | head -20 || echo "No DLLs found in Release folders"
+      shell: bash
+
+    - name: Pack NuGet packages
+      run: |
+        cd foreign/csharp
+
+        # Set version if provided
+        if [ -n "${{ inputs.version }}" ]; then
+          dotnet pack ./Iggy_SDK -c Release \
+            -p:PackageVersion=${{ inputs.version }} \
+            -o ./nupkgs \
+            --no-build
+        else
+          echo "❌ Version is required for packing"
+          exit 1
+        fi
+
+        # List packages
+        echo "NuGet packages:"
+        ls -la ./nupkgs/ || echo "No packages found"
+      shell: bash
+
+    - name: Publish to NuGet
+      env:
+        NUGET_API_KEY: ${{ env.NUGET_API_KEY }}
+      run: |
+        cd foreign/csharp
+
+        if [ "${{ inputs.dry_run }}" = "true" ]; then
+          echo "🔍 Dry run - would publish these packages:"
+          ls -la ./nupkgs/*.nupkg
+
+          # Validate packages
+          for package in ./nupkgs/*.nupkg; do
+            echo "Validating: $package"
+            dotnet nuget locals all --clear
+            # Extract package info
+            unzip -l "$package" | head -20
+          done
+        else
+          if [ -z "$NUGET_API_KEY" ]; then
+            echo "❌ NUGET_API_KEY is not set"
+            exit 1
+          fi
+
+          echo "📦 Publishing packages to NuGet..."
+          # Push to NuGet
+          for package in ./nupkgs/*.nupkg; do
+            echo "Publishing: $(basename $package)"
+            dotnet nuget push "$package" \
+              --api-key "$NUGET_API_KEY" \
+              --source https://api.nuget.org/v3/index.json \
+              --skip-duplicate
+          done
+          echo "✅ Publishing completed"
+        fi
+      shell: bash

@@ -81,7 +81,7 @@ impl BenchmarkCache {
             .create(true)
             .open(&gh_workflows_path)
             .await
-            .unwrap_or_else(|_| panic!("Failed to open GH workflows file: {}", gh_workflows_path));
+            .unwrap_or_else(|_| panic!("Failed to open GH workflows file: {gh_workflows_path}"));
 
         Self {
             benchmarks: DashMap::new(),
@@ -101,13 +101,10 @@ impl BenchmarkCache {
     pub async fn insert_gh_workflow(&self, workflow_id: u64) {
         let mut file = self.gh_workflows_file.lock().await;
 
-        if self.gh_workflows.insert(workflow_id) {
-            if let Err(e) = file
-                .write_all(format!("{}\n", workflow_id).as_bytes())
-                .await
-            {
-                error!("Failed to write GH workflow ID to file: {}", e);
-            }
+        if self.gh_workflows.insert(workflow_id)
+            && let Err(e) = file.write_all(format!("{workflow_id}\n").as_bytes()).await
+        {
+            error!("Failed to write GH workflow ID to file: {}", e);
         }
     }
 }

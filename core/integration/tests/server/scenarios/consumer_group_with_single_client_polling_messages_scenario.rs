@@ -130,7 +130,7 @@ async fn execute_using_messages_key_key(client: &IggyClient) {
 }
 
 fn create_message_payload(entity_id: u32) -> String {
-    format!("message-{}", entity_id)
+    format!("message-{entity_id}")
 }
 
 async fn execute_using_none_key(client: &IggyClient) {
@@ -213,5 +213,5 @@ async fn execute_using_none_key(client: &IggyClient) {
 }
 
 fn create_extended_message_payload(partition_id: u32, entity_id: u32) -> String {
-    format!("message-{}-{}", partition_id, entity_id)
+    format!("message-{partition_id}-{entity_id}")
 }

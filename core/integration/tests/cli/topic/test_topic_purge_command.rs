@@ -93,7 +93,7 @@ impl IggyCmdTestCase for TestTopicPurgeCmd {
         assert!(topic.is_ok());
 
         let mut messages = (1..100)
-            .map(|n| format!("message {}", n))
+            .map(|n| format!("message {n}"))
             .filter_map(|s| IggyMessage::from_str(s.as_str()).ok())
             .collect::<Vec<_>>();
 
@@ -138,8 +138,7 @@ impl IggyCmdTestCase for TestTopicPurgeCmd {
         };
 
         let message = format!(
-            "Executing purge topic with ID: {} in stream with ID: {}\nTopic with ID: {} in stream with ID: {} purged\n",
-            topic_id, stream_id, topic_id, stream_id
+            "Executing purge topic with ID: {topic_id} in stream with ID: {stream_id}\nTopic with ID: {topic_id} in stream with ID: {stream_id} purged\n"
         );
 
         command_state.success().stdout(diff(message));

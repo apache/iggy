@@ -17,23 +17,30 @@
 
 package iggcon
 
-type StoreOffsetRequest struct {
+type StoreConsumerOffsetRequest struct {
 	StreamId    Identifier `json:"streamId"`
 	TopicId     Identifier `json:"topicId"`
 	Consumer    Consumer   `json:"consumer"`
-	PartitionId int        `json:"partitionId"`
+	PartitionId *uint32    `json:"partitionId"`
 	Offset      uint64     `json:"offset"`
 }
 
-type GetOffsetRequest struct {
+type GetConsumerOffsetRequest struct {
 	StreamId    Identifier `json:"streamId"`
 	TopicId     Identifier `json:"topicId"`
 	Consumer    Consumer   `json:"consumer"`
-	PartitionId int        `json:"partitionId"`
+	PartitionId *uint32    `json:"partitionId"`
 }
 
-type OffsetResponse struct {
-	PartitionId   int    `json:"partitionId"`
+type ConsumerOffsetInfo struct {
+	PartitionId   uint32 `json:"partitionId"`
 	CurrentOffset uint64 `json:"currentOffset"`
 	StoredOffset  uint64 `json:"storedOffset"`
+}
+
+type DeleteConsumerOffsetRequest struct {
+	Consumer    Consumer
+	StreamId    Identifier
+	TopicId     Identifier
+	PartitionId *uint32
 }

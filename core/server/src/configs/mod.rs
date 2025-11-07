@@ -17,7 +17,7 @@
  */
 
 pub mod cache_indexes;
-pub mod config_provider;
+pub mod cluster;
 pub mod defaults;
 pub mod displays;
 pub mod http;

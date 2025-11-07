@@ -37,7 +37,7 @@ pub struct ArgsOptional {
 
     /// Optional encryption key for the message payload used by the client
     ///
-    /// [default: ]
+    /// (default: none)
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub encryption_key: Option<String>,

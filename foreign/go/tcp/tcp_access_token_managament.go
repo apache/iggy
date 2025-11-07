@@ -18,13 +18,16 @@
 package tcp
 
 import (
-	binaryserialization "github.com/iggy-rs/iggy-go-client/binary_serialization"
-	. "github.com/iggy-rs/iggy-go-client/contracts"
+	binaryserialization "github.com/apache/iggy/foreign/go/binary_serialization"
+	iggcon "github.com/apache/iggy/foreign/go/contracts"
 )
 
-func (tms *IggyTcpClient) CreateAccessToken(request CreateAccessTokenRequest) (*AccessToken, error) {
-	message := binaryserialization.SerializeCreatePersonalAccessToken(request)
-	buffer, err := tms.sendAndFetchResponse(message, CreateAccessTokenCode)
+func (tms *IggyTcpClient) CreatePersonalAccessToken(name string, expiry uint32) (*iggcon.RawPersonalAccessToken, error) {
+	message := binaryserialization.SerializeCreatePersonalAccessToken(iggcon.CreatePersonalAccessTokenRequest{
+		Name:   name,
+		Expiry: expiry,
+	})
+	buffer, err := tms.sendAndFetchResponse(message, iggcon.CreateAccessTokenCode)
 	if err != nil {
 		return nil, err
 	}
@@ -32,14 +35,16 @@ func (tms *IggyTcpClient) CreateAccessToken(request CreateAccessTokenRequest) (*
 	return binaryserialization.DeserializeAccessToken(buffer)
 }
 
-func (tms *IggyTcpClient) DeleteAccessToken(request DeleteAccessTokenRequest) error {
-	message := binaryserialization.SerializeDeletePersonalAccessToken(request)
-	_, err := tms.sendAndFetchResponse(message, DeleteAccessTokenCode)
+func (tms *IggyTcpClient) DeletePersonalAccessToken(name string) error {
+	message := binaryserialization.SerializeDeletePersonalAccessToken(iggcon.DeletePersonalAccessTokenRequest{
+		Name: name,
+	})
+	_, err := tms.sendAndFetchResponse(message, iggcon.DeleteAccessTokenCode)
 	return err
 }
 
-func (tms *IggyTcpClient) GetAccessTokens() ([]AccessTokenResponse, error) {
-	buffer, err := tms.sendAndFetchResponse([]byte{}, GetAccessTokensCode)
+func (tms *IggyTcpClient) GetPersonalAccessTokens() ([]iggcon.PersonalAccessTokenInfo, error) {
+	buffer, err := tms.sendAndFetchResponse([]byte{}, iggcon.GetAccessTokensCode)
 	if err != nil {
 		return nil, err
 	}

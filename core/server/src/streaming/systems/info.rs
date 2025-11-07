@@ -51,8 +51,7 @@ impl System {
         let current_version = SemanticVersion::current()?;
         let mut system_info;
         let load_system_info = self.storage.info.load().await;
-        if load_system_info.is_err() {
-            let error = load_system_info.err().unwrap();
+        if let Err(error) = load_system_info {
             if let IggyError::ResourceNotFound(_) = error {
                 info!("System info not found, creating...");
                 system_info = SystemInfo::default();

@@ -20,6 +20,7 @@
 
 import type { CommandResponse } from '../../client/client.type.js';
 import { wrapCommand } from '../command.utils.js';
+import { COMMAND_CODE } from '../command.code.js';
 import { serializeIdentifier, type Id } from '../identifier.utils.js';
 import { deserializeTopic, type Topic } from './topic.utils.js';
 
@@ -29,7 +30,7 @@ type GetTopic = {
 }
 
 export const GET_TOPIC = {
-  code: 300,
+  code: COMMAND_CODE.GetTopic,
 
   serialize: ({streamId, topicId}: GetTopic) => {
     return Buffer.concat([
@@ -39,8 +40,11 @@ export const GET_TOPIC = {
   },
 
   deserialize: (r: CommandResponse) => {
+    if(r.status === 0 && r.length === 0)
+      return null;
     return deserializeTopic(r.data).data;
   }
 };
 
-export const getTopic = wrapCommand<GetTopic, Topic>(GET_TOPIC);
+
+export const getTopic = wrapCommand<GetTopic, Topic | null>(GET_TOPIC);

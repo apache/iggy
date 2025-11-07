@@ -50,6 +50,9 @@ const statusString = (t: number): string => {
 }
 
 export const deserializeBaseUser = (p: Buffer, pos = 0): BaseUserDeserialized => {
+  if (p.length === 0)
+    throw new Error('User does not exist');
+
   const id = p.readUInt32LE(pos);
   const createdAt = toDate(p.readBigUInt64LE(pos + 4))
   const status = statusString(p.readUInt8(pos + 12));

@@ -17,8 +17,6 @@
  * under the License.
  */
 
-import type { KeysToSnakeCase } from '$lib/utils/utilTypes';
-
 export type GlobalPermissions = {
   manageServers: boolean;
   readServers: boolean;

@@ -19,33 +19,23 @@
 
 
 import type { CommandResponse } from '../../client/client.type.js';
-import type { LoginResponse } from './login.type.js';
+import { serializeLoginWithToken, type LoginResponse } from './login.utils.js';
 import { wrapCommand } from '../command.utils.js';
+import { COMMAND_CODE } from '../command.code.js';
 
 export type LoginWithTokenParam = {
   token: string
 };
 
-
 export const LOGIN_WITH_TOKEN = {
-  code: 44,
+  code: COMMAND_CODE.LoginWithAccessToken,
 
-  serialize: ({token}: LoginWithTokenParam) => {
-    const bToken = Buffer.from(token);
-    if (bToken.length < 1 || bToken.length > 255)
-      throw new Error('Token length should be between 1 and 255 bytes');
-    const b = Buffer.alloc(1);
-    b.writeUInt8(bToken.length);
-    return Buffer.concat([
-      b,
-      bToken
-    ]);
-  },
+  serialize: ({token}: LoginWithTokenParam) => serializeLoginWithToken(token),
 
   deserialize: (r: CommandResponse) => ({
     userId: r.data.readUInt32LE(0)
   })
 };
 
-export const loginWithToken =
-  wrapCommand<LoginWithTokenParam, LoginResponse>(LOGIN_WITH_TOKEN);
+
+export const loginWithToken = wrapCommand<LoginWithTokenParam, LoginResponse>(LOGIN_WITH_TOKEN);

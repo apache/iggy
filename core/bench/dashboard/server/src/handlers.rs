@@ -137,11 +137,11 @@ pub async fn get_benchmark_report_full(
     );
 
     let uuid = Uuid::parse_str(&uuid_str).map_err(|_| {
-        IggyBenchDashboardServerError::NotFound(format!("Invalid UUID format: '{}'", uuid_str))
+        IggyBenchDashboardServerError::NotFound(format!("Invalid UUID format: '{uuid_str}'"))
     })?;
 
     let json_path = data.cache.get_benchmark_json_path(&uuid).ok_or_else(|| {
-        IggyBenchDashboardServerError::NotFound(format!("Benchmark '{}' not found", uuid_str))
+        IggyBenchDashboardServerError::NotFound(format!("Benchmark '{uuid_str}' not found"))
     })?;
 
     let json_content = std::fs::read_to_string(&json_path).map_err(|e| {
@@ -180,8 +180,7 @@ pub async fn get_benchmark_report_light(
                 "{client_addr}: Invalid UUID format in light benchmark request: '{uuid_str}', error: {e}",
             );
             return Err(IggyBenchDashboardServerError::InvalidUuid(format!(
-                "Invalid UUID format: '{}'",
-                uuid_str
+                "Invalid UUID format: '{uuid_str}'"
             )));
         }
     };
@@ -200,8 +199,7 @@ pub async fn get_benchmark_report_light(
                 client_addr, uuid_str
             );
             Err(IggyBenchDashboardServerError::NotFound(format!(
-                "Benchmark '{}' not found",
-                uuid_str
+                "Benchmark '{uuid_str}' not found"
             )))
         }
     }
@@ -225,8 +223,7 @@ pub async fn get_benchmark_trend(
         .get_benchmark_trend_data(&params_identifier, &hardware)
         .ok_or_else(|| {
             IggyBenchDashboardServerError::NotFound(format!(
-                "Trend data not found for hardware '{}' with params identifier '{}'",
-                hardware, params_identifier
+                "Trend data not found for hardware '{hardware}' with params identifier '{params_identifier}'"
             ))
         })?;
 
@@ -272,8 +269,7 @@ pub async fn get_test_artifacts_zip(
                 client_addr, uuid_str
             );
             return Err(IggyBenchDashboardServerError::NotFound(format!(
-                "Benchmark '{}' not found",
-                uuid_str
+                "Benchmark '{uuid_str}' not found"
             )));
         }
     };
@@ -291,8 +287,7 @@ pub async fn get_test_artifacts_zip(
         for entry in WalkDir::new(&artifacts_dir) {
             let entry = entry.map_err(|e| {
                 IggyBenchDashboardServerError::InternalError(format!(
-                    "Error walking directory: {}",
-                    e
+                    "Error walking directory: {e}"
                 ))
             })?;
 
@@ -300,8 +295,7 @@ pub async fn get_test_artifacts_zip(
                 let path = entry.path();
                 let relative_path = path.strip_prefix(&artifacts_dir).map_err(|e| {
                     IggyBenchDashboardServerError::InternalError(format!(
-                        "Error creating relative path: {}",
-                        e
+                        "Error creating relative path: {e}"
                     ))
                 })?;
 
@@ -311,31 +305,23 @@ pub async fn get_test_artifacts_zip(
                 )
                 .map_err(|e| {
                     IggyBenchDashboardServerError::InternalError(format!(
-                        "Error adding file to zip: {}",
-                        e
+                        "Error adding file to zip: {e}"
                     ))
                 })?;
 
                 let mut file = std::fs::File::open(path).map_err(|e| {
-                    IggyBenchDashboardServerError::InternalError(format!(
-                        "Error opening file: {}",
-                        e
-                    ))
+                    IggyBenchDashboardServerError::InternalError(format!("Error opening file: {e}"))
                 })?;
                 std::io::copy(&mut file, &mut zip).map_err(|e| {
                     IggyBenchDashboardServerError::InternalError(format!(
-                        "Error copying file to zip: {}",
-                        e
+                        "Error copying file to zip: {e}"
                     ))
                 })?;
             }
         }
 
         zip.finish().map_err(|e| {
-            IggyBenchDashboardServerError::InternalError(format!(
-                "Error finalizing zip file: {}",
-                e
-            ))
+            IggyBenchDashboardServerError::InternalError(format!("Error finalizing zip file: {e}"))
         })?;
     }
 
@@ -348,7 +334,7 @@ pub async fn get_test_artifacts_zip(
         .content_type("application/zip")
         .append_header((
             "Content-Disposition",
-            format!("attachment; filename=\"test_artifacts_{}.zip\"", uuid_str),
+            format!("attachment; filename=\"test_artifacts_{uuid_str}.zip\""),
         ))
         .body(zip_buffer))
 }

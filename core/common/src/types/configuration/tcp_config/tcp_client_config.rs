@@ -29,9 +29,12 @@ pub struct TcpClientConfig {
     /// Whether to use TLS when connecting to the server.
     pub tls_enabled: bool,
     /// The domain to use for TLS when connecting to the server.
+    /// If empty, automatically extracts the hostname/IP from server_address.
     pub tls_domain: String,
     /// The path to the CA file for TLS.
     pub tls_ca_file: Option<String>,
+    /// Whether to validate the TLS certificate.
+    pub tls_validate_certificate: bool,
     /// Whether to automatically login user after establishing connection.
     pub auto_login: AutoLogin,
     /// Whether to automatically reconnect when disconnected.
@@ -47,8 +50,9 @@ impl Default for TcpClientConfig {
         TcpClientConfig {
             server_address: "127.0.0.1:8090".to_string(),
             tls_enabled: false,
-            tls_domain: "localhost".to_string(),
+            tls_domain: "".to_string(),
             tls_ca_file: None,
+            tls_validate_certificate: true,
             heartbeat_interval: IggyDuration::from_str("5s").unwrap(),
             auto_login: AutoLogin::Disabled,
             reconnection: TcpClientReconnectionConfig::default(),
@@ -65,6 +69,8 @@ impl From<ConnectionString<TcpConnectionStringOptions>> for TcpClientConfig {
             tls_enabled: connection_string.options().tls_enabled(),
             tls_domain: connection_string.options().tls_domain().into(),
             tls_ca_file: connection_string.options().tls_ca_file().to_owned(),
+            // Always validate TLS certificate for connection strings, we don't want to allow self-signed certificates for connection strings
+            tls_validate_certificate: true,
             reconnection: connection_string.options().reconnection().to_owned(),
             heartbeat_interval: connection_string.options().heartbeat_interval(),
             nodelay: connection_string.options().nodelay(),

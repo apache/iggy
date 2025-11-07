@@ -24,12 +24,11 @@ use crate::streaming::topics::consumer_group::ConsumerGroup;
 use crate::streaming::topics::topic::Topic;
 use ahash::AHashSet;
 use anyhow::Context;
-use error_set::ErrContext;
+use err_trail::ErrContext;
 use futures::future::join_all;
 use iggy_common::IggyError;
 use iggy_common::locking::IggySharedMut;
 use iggy_common::locking::IggySharedMutFn;
-use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
 use tokio::fs;
@@ -39,12 +38,6 @@ use tracing::{error, info, warn};
 
 #[derive(Debug)]
 pub struct FileTopicStorage;
-
-#[derive(Debug, Serialize, Deserialize)]
-struct ConsumerGroupData {
-    id: u32,
-    name: String,
-}
 
 impl TopicStorage for FileTopicStorage {
     async fn load(&self, topic: &mut Topic, mut state: TopicState) -> Result<(), IggyError> {
@@ -162,7 +155,7 @@ impl TopicStorage for FileTopicStorage {
                         partition_state.created_at,
                     )
                     .await;
-                    partition.persist().await.with_error_context(|error| {
+                    partition.persist().await.with_error(|error| {
                         format!(
                             "{COMPONENT} (error: {error}) - failed to persist partition: {partition}"
                         )
@@ -256,7 +249,7 @@ impl TopicStorage for FileTopicStorage {
         );
         for (_, partition) in topic.partitions.iter() {
             let mut partition = partition.write().await;
-            partition.persist().await.with_error_context(|error| {
+            partition.persist().await.with_error(|error| {
                 format!(
                     "{COMPONENT} (error: {error}) - failed to persist partition, topic: {topic}"
                 )
