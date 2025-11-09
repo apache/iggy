@@ -23,10 +23,11 @@ namespace Apache.Iggy.Configuration;
 
 public sealed class IggyClientConfigurator
 {
-    public string BaseAddress { get; set; } = "http://127.0.0.1:3000";
-    public Protocol Protocol { get; set; } = Protocol.Http;
+    public required string BaseAddress { get; set; }
+    public required Protocol Protocol { get; set; }
     public int ReceiveBufferSize { get; set; } = 4096;
     public int SendBufferSize { get; set; } = 4096;
     public TlsSettings TlsSettings { get; set; } = new();
+    public ReconnectionSettings ReconnectionSettings { get; set; } = new();
     public ILoggerFactory LoggerFactory { get; set; } = NullLoggerFactory.Instance;
 }

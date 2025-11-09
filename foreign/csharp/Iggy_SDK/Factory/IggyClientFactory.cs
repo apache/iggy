@@ -1,9 +1,19 @@
-// // Licensed to the Apache Software Foundation (ASF) under one
-// // or more contributor license agreements.  See the NOTICE file
-// // distributed with this work for additional information
-// // regarding copyright ownership.  The ASF licenses this file
-// // to you under the Apache License, Version 2.0 (the
-// // "License")
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 using System.ComponentModel;
 using System.Net.Security;
@@ -31,7 +41,10 @@ public static class IggyClientFactory
 
     private static IIggyClient CreateIggyTcpClient(IggyClientConfigurator options)
     {
-        return new TcpMessageStream(CreateTcpStream(options), options.LoggerFactory);
+        var client = new TcpMessageStream(options.LoggerFactory, options);
+        client.Connect();
+        
+        return client;
     }
 
     private static IIggyClient CreateIggyHttpClient(IggyClientConfigurator options)
@@ -46,7 +59,7 @@ public static class IggyClientFactory
         {
             throw new InvalidBaseAdressException();
         }
-
+        
         var socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
         socket.Connect(urlPortSplitter[0], int.Parse(urlPortSplitter[1]));
         socket.SendBufferSize = options.SendBufferSize;
@@ -58,7 +71,7 @@ public static class IggyClientFactory
         };
     }
 
-    private static TcpTlsConnectionStream CreateSslStreamAndAuthenticate(Socket socket, TlsSettings tlsSettings)
+    private static IConnectionStream CreateSslStreamAndAuthenticate(Socket socket, TlsSettings tlsSettings)
     {
         var stream = new NetworkStream(socket);
         var sslStream = new SslStream(stream);
@@ -67,7 +80,7 @@ public static class IggyClientFactory
             sslStream.AuthenticateAsClient(tlsSettings.Hostname);
         }
 
-        return new TcpTlsConnectionStream(sslStream);
+        return new TcpConnectionStream(sslStream);
     }
 
     private static HttpClient CreateHttpClient(IggyClientConfigurator options)

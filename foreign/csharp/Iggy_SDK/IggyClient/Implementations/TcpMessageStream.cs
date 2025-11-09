@@ -17,7 +17,10 @@
 
 using System.Buffers;
 using System.Buffers.Binary;
+using System.Net.Security;
+using System.Net.Sockets;
 using System.Text;
+using Apache.Iggy.Configuration;
 using Apache.Iggy.ConnectionStream;
 using Apache.Iggy.Contracts;
 using Apache.Iggy.Contracts.Auth;
@@ -33,15 +36,18 @@ using Partitioning = Apache.Iggy.Kinds.Partitioning;
 
 namespace Apache.Iggy.IggyClient.Implementations;
 
-public sealed class TcpMessageStream : IIggyClient, IDisposable
+public sealed class TcpMessageStream : IIggyClient
 {
+    private readonly IggyClientConfigurator _configuration;
     private readonly ILogger<TcpMessageStream> _logger;
     private readonly SemaphoreSlim _semaphore;
-    private readonly IConnectionStream _stream;
+    private AuthResponse? _lastAuthResponse;
+    private ConnectionState _state = ConnectionState.Disconnected;
+    private IConnectionStream _stream = null!;
 
-    internal TcpMessageStream(IConnectionStream stream, ILoggerFactory loggerFactory)
+    internal TcpMessageStream(ILoggerFactory loggerFactory, IggyClientConfigurator configuration)
     {
-        _stream = stream;
+        _configuration = configuration;
         _logger = loggerFactory.CreateLogger<TcpMessageStream>();
         _semaphore = new SemaphoreSlim(1, 1);
     }
@@ -442,9 +448,9 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
 
         return BinaryMapper.MapStats(responseBuffer);
     }
-    
+
     /// <summary>
-    /// Get cluster metadata
+    ///     Get cluster metadata
     /// </summary>
     /// <param name="token"></param>
     /// <returns>Cluster information</returns>
@@ -471,6 +477,40 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.PING_CODE);
 
         await SendWithResponseAsync(payload, token);
+    }
+
+    public void Connect()
+    {
+        if (_state is ConnectionState.Connected
+            or ConnectionState.Authenticating
+            or ConnectionState.Authenticated)
+        {
+            return;
+        }
+
+        // ReSharper disable once ConditionIsAlwaysTrueOrFalseAccordingToNullableAPIContract
+        _stream?.Close();
+        _stream?.Dispose();
+
+        _state = ConnectionState.Connecting;
+
+        var urlPortSplitter = _configuration.BaseAddress.Split(":");
+        if (urlPortSplitter.Length > 2)
+        {
+            throw new InvalidBaseAdressException();
+        }
+
+        var socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        socket.SendBufferSize = _configuration.SendBufferSize;
+        socket.ReceiveBufferSize = _configuration.ReceiveBufferSize;
+        socket.Connect(urlPortSplitter[0], int.Parse(urlPortSplitter[1]));
+        _state = ConnectionState.Connected;
+
+        _stream = _configuration.TlsSettings.Enabled switch
+        {
+            true => CreateSslStreamAndAuthenticate(socket, _configuration.TlsSettings),
+            false => new TcpConnectionStream(new NetworkStream(socket))
+        };
     }
 
     public async Task<IReadOnlyList<ClientResponse>> GetClientsAsync(CancellationToken token = default)
@@ -608,7 +648,9 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
 
         var userId = BinaryPrimitives.ReadInt32LittleEndian(responseBuffer.AsSpan()[..responseBuffer.Length]);
 
-        return new AuthResponse(userId, null);
+        var authResponse = new AuthResponse(userId, null);
+        _lastAuthResponse = authResponse;
+        return authResponse;
     }
 
     public async Task LogoutUser(CancellationToken token = default)
@@ -618,6 +660,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.LOGOUT_USER_CODE);
 
         await SendWithResponseAsync(payload, token);
+        _lastAuthResponse = null;
     }
 
     public async Task<IReadOnlyList<PersonalAccessTokenResponse>> GetPersonalAccessTokensAsync(
@@ -679,11 +722,31 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         var userId = BinaryPrimitives.ReadInt32LittleEndian(responseBuffer.AsSpan()[..4]);
 
         //TODO: Figure out how to solve this workaround about default of TokenInfo
-        return new AuthResponse(userId, default);
+        var authResponse = new AuthResponse(userId, default);
+        _lastAuthResponse = authResponse;
+        return authResponse;
+    }
+
+    private static IConnectionStream CreateSslStreamAndAuthenticate(Socket socket, TlsSettings tlsSettings)
+    {
+        var stream = new NetworkStream(socket);
+        var sslStream = new SslStream(stream);
+        if (tlsSettings.Authenticate)
+        {
+            sslStream.AuthenticateAsClient(tlsSettings.Hostname);
+        }
+
+        return new TcpConnectionStream(sslStream);
     }
 
     private async Task<byte[]> SendWithResponseAsync(byte[] payload, CancellationToken token = default)
     {
+        if (_state is ConnectionState.Disconnected or ConnectionState.Connecting)
+        {
+            // todo: change error
+            throw new InvalidOperationException("Connection is not connected");
+        }
+
         try
         {
             await _semaphore.WaitAsync(token);
@@ -751,6 +814,39 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         {
             _semaphore.Release();
         }
+    }
+
+    // private Task ReconnectAsync(CancellationToken token)
+    // {
+    //     try
+    //     {
+    //         _stream.Close();
+    //         _stream.Dispose();
+    //     }
+    //     catch (Exception ex)
+    //     catch (Exception ex)
+    //     {
+    //         _logger.LogDebug(ex, "Error disposing old connection stream");
+    //     }
+    //
+    //     _stream = _connectionFactory();
+    //
+    //     if (_reconnectionSettings.ReauthenticateOnReconnect && _lastAuthResponse != null)
+    //     {
+    //         _logger.LogDebug("Re-authenticating after reconnection");
+    //         // Note: Re-authentication would need to be implemented based on how the client was originally authenticated
+    //         // This is a placeholder for future implementation
+    //     }
+    //
+    //     return Task.CompletedTask;
+    // }
+
+    private static bool IsConnectionException(Exception ex)
+    {
+        return ex is InvalidResponseException or
+            SocketException or
+            IOException or
+            ObjectDisposedException;
     }
 
     private static int CalculatePayloadBufferSize(int messageBufferSize)

@@ -426,6 +426,10 @@ public class HttpMessageStream : IIggyClient
         }
     }
 
+    public void Connect()
+    {
+    }
+
     public async Task<IReadOnlyList<ClientResponse>> GetClientsAsync(CancellationToken token = default)
     {
         var response = await _httpClient.GetAsync("/clients", token);
