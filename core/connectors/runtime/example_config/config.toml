@@ -44,4 +44,4 @@ token = "" # Personal Access Token (PAT) can be used instead of username and pas
 path = "local_state"
 
 [connectors]
-config_dir = ""
+config_dir = "core/connectors/runtime/example_config/connectors"

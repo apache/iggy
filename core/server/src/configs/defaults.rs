@@ -586,3 +586,70 @@ impl Default for NodeConfig {
         }
     }
 }
+
+impl Default for S3ArchiverConfig {
+    fn default() -> S3ArchiverConfig {
+        S3ArchiverConfig {
+            bucket: SERVER_CONFIG
+                .data_maintenance
+                .archiver
+                .s_3
+                .bucket
+                .parse()
+                .unwrap(),
+            region: Some(
+                SERVER_CONFIG
+                    .data_maintenance
+                    .archiver
+                    .s_3
+                    .region
+                    .parse()
+                    .unwrap(),
+            ),
+            key_id: SERVER_CONFIG
+                .data_maintenance
+                .archiver
+                .s_3
+                .key_id
+                .parse()
+                .unwrap(),
+            key_secret: SERVER_CONFIG
+                .data_maintenance
+                .archiver
+                .s_3
+                .key_secret
+                .parse()
+                .unwrap(),
+            endpoint: Some(
+                SERVER_CONFIG
+                    .data_maintenance
+                    .archiver
+                    .s_3
+                    .endpoint
+                    .parse()
+                    .unwrap(),
+            ),
+            tmp_upload_dir: SERVER_CONFIG
+                .data_maintenance
+                .archiver
+                .s_3
+                .tmp_upload_dir
+                .parse()
+                .unwrap(),
+        }
+    }
+}
+
+impl Default for DiskArchiverConfig {
+    fn default() -> DiskArchiverConfig {
+        DiskArchiverConfig {
+            path: SERVER_CONFIG
+                .data_maintenance
+                .archiver
+                .disk
+                .path
+                .parse()
+                .unwrap(),
+        }
+    }
+}

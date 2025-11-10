@@ -1,4 +1,5 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
  * regarding copyright ownership.  The ASF licenses this file
@@ -17,17 +18,19 @@
  */
 
 use crate::api::config::HttpConfig;
+use crate::error::RuntimeError;
 use figment::{
     Metadata, Profile, Provider,
     providers::{Format, Toml},
     value::Dict,
 };
 use iggy::prelude::{DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME};
-use iggy_common::{CustomEnvProvider, FileConfigProvider};
+use iggy_common::{ConfigProvider, CustomEnvProvider, FileConfigProvider};
 use iggy_connector_sdk::{Schema, transforms::TransformType};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, fmt::Formatter};
 use strum::Display;
+use tracing::{debug, info, warn};
 
 #[derive(
     Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize, Display,
@@ -47,11 +50,16 @@ pub enum ConfigFormat {
 
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
 #[serde(default)]
-pub struct ConnectorsConfig {
+pub struct ConnectorsCommonConfig {
+    pub config_dir: String,
+}
+
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ConnectorsRuntimeConfig {
     pub http: HttpConfig,
     pub iggy: IggyConfig,
-    pub sinks: HashMap<String, SinkConfig>,
-    pub sources: HashMap<String, SourceConfig>,
+    pub connectors: ConnectorsCommonConfig,
     pub state: StateConfig,
 }
 
@@ -104,6 +112,25 @@ pub struct SourceConfig {
     pub config: Option<serde_json::Value>,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum ConnectorConfig {
+    Sink(SinkConfig),
+    Source(SourceConfig),
+}
+
+impl Default for ConnectorConfig {
+    fn default() -> Self {
+        Self::Sink(SinkConfig::default())
+    }
+}
+
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ConnectorsConfig {
+    pub configs: HashMap<String, ConnectorConfig>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TransformsConfig {
     #[serde(flatten)]
@@ -126,12 +153,12 @@ impl std::fmt::Display for StateConfig {
     }
 }
 
-impl std::fmt::Display for ConnectorsConfig {
+impl std::fmt::Display for ConnectorsRuntimeConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ http: {}, iggy: {}, sinks: {:?}, sources: {:?}, state: {:} }}",
-            self.http, self.iggy, self.sinks, self.sources, self.state
+            "{{ http: {}, iggy: {}, connectors: {:?}, state: {:} }}",
+            self.http, self.iggy, self.connectors, self.state
         )
     }
 }
@@ -220,6 +247,19 @@ impl std::fmt::Display for SourceConfig {
     }
 }
 
+impl std::fmt::Display for ConnectorConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConnectorConfig::Sink(config) => {
+                write!(f, "sink {config}")
+            }
+            ConnectorConfig::Source(config) => {
+                write!(f, "source {config}",)
+            }
+        }
+    }
+}
+
 impl std::fmt::Display for TransformsConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         let transforms: Vec<String> = self
@@ -250,7 +290,7 @@ impl Default for IggyConfig {
     }
 }
 
-impl ConnectorsConfig {
+impl ConnectorsRuntimeConfig {
     pub fn config_provider(path: String) -> FileConfigProvider<ConnectorsEnvProvider> {
         let default_config = Toml::string(include_str!("../../../connectors/runtime/config.toml"));
         FileConfigProvider::new(
@@ -264,7 +304,7 @@ impl ConnectorsConfig {
 
 #[derive(Debug, Clone)]
 pub struct ConnectorsEnvProvider {
-    provider: CustomEnvProvider<ConnectorsConfig>,
+    provider: CustomEnvProvider<ConnectorsRuntimeConfig>,
 }
 
 impl Default for ConnectorsEnvProvider {
@@ -283,6 +323,117 @@ impl Provider for ConnectorsEnvProvider {
     fn data(&self) -> Result<figment::value::Map<Profile, Dict>, figment::Error> {
         self.provider.deserialize().map_err(|_| {
             figment::Error::from("Cannot deserialize environment variables for connectors config")
+        })
+    }
+}
+
+impl ConnectorsConfig {
+    pub async fn load_configs(
+        configuration: &ConnectorsCommonConfig,
+    ) -> Result<Self, RuntimeError> {
+        if configuration.config_dir.is_empty() {
+            info!("Connectors configuration directory not provided, skipping initialization");
+            return Ok(ConnectorsConfig::default());
+        }
+        if !std::fs::exists(&configuration.config_dir)? {
+            warn!(
+                "Connectors configuration directory does not exist: {}",
+                configuration.config_dir
+            );
+            return Ok(ConnectorsConfig::default());
+        }
+        let mut configs = HashMap::new();
+        info!(
+            "Loading connectors configuration from: {}",
+            configuration.config_dir
+        );
+        let entries = std::fs::read_dir(&configuration.config_dir)?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                debug!("Loading connector configuration from: {:?}", path);
+                let connector_name = path
+                    .file_stem()
+                    .expect("Failed to get connector configuration name")
+                    .to_string_lossy()
+                    .to_string();
+                let connector_config = ConnectorConfig::config_provider(
+                    path.to_str()
+                        .expect("Failed to convert connector configuration path to string")
+                        .to_string(),
+                    &connector_name,
+                )
+                .load_config()
+                .await
+                .expect("Failed to load connector configuration");
+                configs.insert(connector_name, connector_config);
+            }
+        }
+        Ok(Self { configs })
+    }
+
+    pub fn sinks(&self) -> HashMap<String, SinkConfig> {
+        self.configs
+            .iter()
+            .filter_map(|(k, v)| match v {
+                ConnectorConfig::Sink(config) => Some((k.to_owned(), config.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    pub fn sources(&self) -> HashMap<String, SourceConfig> {
+        self.configs
+            .iter()
+            .filter_map(|(k, v)| match v {
+                ConnectorConfig::Source(config) => Some((k.to_owned(), config.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+impl ConnectorConfig {
+    pub fn config_provider(
+        path: String,
+        connector_name: &str,
+    ) -> FileConfigProvider<ConnectorEnvProvider> {
+        FileConfigProvider::new(
+            path,
+            ConnectorEnvProvider::with_connector_name(connector_name),
+            false,
+            None,
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ConnectorEnvProvider {
+    connector_name: String,
+    provider: CustomEnvProvider<ConnectorConfig>,
+}
+
+impl ConnectorEnvProvider {
+    fn with_connector_name(connector_name: &str) -> Self {
+        let prefix = format!("IGGY_CONNECTORS_{}_", connector_name.to_uppercase());
+        Self {
+            connector_name: connector_name.to_owned(),
+            provider: CustomEnvProvider::new(&prefix, &[]),
+        }
+    }
+}
+
+impl Provider for ConnectorEnvProvider {
+    fn metadata(&self) -> Metadata {
+        Metadata::named(format!("iggy-connectors-{}-config", self.connector_name))
+    }
+
+    fn data(&self) -> Result<figment::value::Map<Profile, Dict>, figment::Error> {
+        self.provider.deserialize().map_err(|_| {
+            figment::Error::from(format!(
+                "Cannot deserialize environment variables for connector config {}",
+                self.connector_name
+            ))
         })
     }
 }
