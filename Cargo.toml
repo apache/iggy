@@ -50,7 +50,7 @@ ahash = { version = "0.8.12", features = ["serde"] }
 anyhow = "1.0.100"
 argon2 = "0.5.3"
 async-broadcast = "0.7.2"
-async-channel = "2.3.1"
+async-channel = "2.5.0"
 async-dropper = { version = "0.3.1", features = ["tokio", "simple"] }
 async-trait = "0.1.89"
 async_zip = { version = "0.0.18", features = [
@@ -80,7 +80,7 @@ byte-unit = { version = "5.1.6", default-features = false, features = [
 bytes = "1.10.1"
 charming = "0.6.0"
 chrono = { version = "0.4.42", features = ["serde"] }
-clap = { version = "4.5.50", features = ["derive", "wrap_help"] }
+clap = { version = "4.5.51", features = ["derive", "wrap_help"] }
 colored = "3.0.0"
 comfy-table = "7.2.1"
 compio = { version = "0.16.0", features = [
@@ -90,20 +90,20 @@ compio = { version = "0.16.0", features = [
     "time",
     "rustls",
 ] }
-compio-io = "0.8.1"
+compio-io = "0.8.2"
 compio-net = "0.9.0"
 compio-quic = "0.5.1"
-compio-tls = { version = "0.7.0", features = [
+compio-tls = { version = "0.7.1", features = [
     "rustls",
 ], default-features = false }
-compio-ws = { git = "https://github.com/krishvishal/compio-ws", rev = "86720ac22ecf998438b838d69c64570e54fc5181", features = [
+compio-ws = { git = "https://github.com/krishvishal/compio-ws", rev = "b30c9e4cd2fe607faa81b4c7eff2d14b6140f15d", features = [
     "rustls",
 ] }
-console-subscriber = "0.4.1"
+console-subscriber = "0.5.0"
 crc32fast = "1.5.0"
 crossbeam = "0.8.4"
-cyper = { version = "0.5.0", features = ["rustls"], default-features = false }
-cyper-axum = { version = "0.5.0" }
+cyper = { version = "0.6.2", features = ["rustls"], default-features = false }
+cyper-axum = { version = "0.6.0" }
 dashmap = "6.1.0"
 derive-new = "0.7.0"
 derive_builder = "0.20.2"
@@ -148,7 +148,7 @@ rust-s3 = { version = "0.37.0", default-features = false, features = [
     "tokio-rustls-tls",
     "tags",
 ] }
-rustls = { version = "0.23.34", features = ["ring"] }
+rustls = { version = "0.23.35", features = ["ring"] }
 serde = { version = "1.0.228", features = ["derive", "rc"] }
 serde_json = "1.0.145"
 serde_with = { version = "3.15.1", features = ["base64", "macros"] }
@@ -164,8 +164,8 @@ test-case = "3.3.1"
 thiserror = "2.0.17"
 tokio = { version = "1.48.0", features = ["full"] }
 tokio-rustls = "0.26.4"
-tokio-tungstenite = { version = "0.27", features = ["rustls-tls-webpki-roots"] }
-tokio-util = { version = "0.7.16", features = ["compat"] }
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
+tokio-util = { version = "0.7.17", features = ["compat"] }
 toml = "0.9.8"
 tower-http = { version = "0.6.6", features = [
     "add-extension",
@@ -180,7 +180,7 @@ tracing-subscriber = { version = "0.3.20", default-features = false, features = 
     "ansi",
 ] }
 trait-variant = "0.1.2"
-tungstenite = "0.27.0"
+tungstenite = "0.28.0"
 twox-hash = { version = "2.1.2", features = ["xxhash32"] }
 uuid = { version = "1.18.1", features = [
     "v4",
@@ -189,7 +189,7 @@ uuid = { version = "1.18.1", features = [
     "serde",
     "zerocopy",
 ] }
-webpki-roots = "1.0.3"
+webpki-roots = "1.0.4"
 zip = "6.0.0"
 
 [profile.release]

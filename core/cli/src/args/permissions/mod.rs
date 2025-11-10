@@ -69,16 +69,11 @@ impl From<PermissionsArgs> for Option<Permissions> {
     }
 }
 
-#[derive(Debug, Clone, ValueEnum, PartialEq)]
+#[derive(Debug, Clone, ValueEnum, PartialEq, Default)]
 pub enum UserStatusArg {
+    #[default]
     Active,
     Inactive,
-}
-
-impl Default for UserStatusArg {
-    fn default() -> Self {
-        Self::Active
-    }
 }
 
 impl From<UserStatusArg> for UserStatus {

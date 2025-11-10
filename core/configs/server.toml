@@ -549,9 +549,8 @@ address = "127.0.0.1:8091"
 cpu_allocation = "all"
 
 [websocket]
-
 enabled = true
-address = "0.0.0.0:8092"
+address = "127.0.0.1:8092"
 
 [websocket.tls]
 enabled = false

@@ -29,8 +29,9 @@ use iggy::prelude::{Permissions, UserStatus};
 use predicates::str::diff;
 use serial_test::parallel;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 enum UserStatusTest {
+    #[default]
     Default,
     Active,
     Inactive,
@@ -43,12 +44,6 @@ impl UserStatusTest {
             Self::Active => vec![String::from("--user-status"), String::from("active")],
             Self::Inactive => vec![String::from("--user-status"), String::from("inactive")],
         }
-    }
-}
-
-impl Default for UserStatusTest {
-    fn default() -> Self {
-        Self::Default
     }
 }
 

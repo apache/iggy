@@ -106,7 +106,7 @@ impl BenchmarkInit for HighLevelConsumerClient {
         let client = IggyClient::create(client, None, None);
         login_root(&client).await;
 
-        let stream_id_str = self.config.stream_id.to_string();
+        let stream_id_str = self.config.stream_id.clone();
 
         let mut consumer = if let Some(cg_id) = self.config.consumer_group_id {
             let consumer_group_name = format!("cg_{cg_id}");

@@ -393,15 +393,15 @@ impl IggyBenchArgs {
         ];
 
         if let Some(remark) = &self.remark() {
-            parts.push(remark.to_string());
+            parts.push(remark.clone());
         }
 
         if let Some(gitref) = &self.gitref() {
-            parts.push(gitref.to_string());
+            parts.push(gitref.clone());
         }
 
         if let Some(identifier) = &self.identifier() {
-            parts.push(identifier.to_string());
+            parts.push(identifier.clone());
         }
 
         parts.join("_")

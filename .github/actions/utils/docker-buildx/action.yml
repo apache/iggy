@@ -155,7 +155,6 @@ runs:
         echo "platforms=$platforms" >> "$GITHUB_OUTPUT"
         echo "🖥️ Platforms: $platforms"
 
-
     - name: Compose cache config (no registry on dry-run)
       id: cachecfg
       shell: bash
@@ -210,7 +209,6 @@ runs:
         echo "Computed cache-from:"
         printf '%s\n' "$CACHE_FROM"
 
-
     - name: Determine Rust toolchain version (labels)
       shell: bash
       run: |
@@ -220,8 +218,8 @@ runs:
           echo "RUST_VERSION=$ver" >> "$GITHUB_ENV"
           echo "Using toolchain: $ver"
         else
-          echo "RUST_VERSION=1.89" >> "$GITHUB_ENV"
-          echo "No rust-toolchain.toml found; labeling as 1.89"
+          echo "RUST_VERSION=1.91" >> "$GITHUB_ENV"
+          echo "No rust-toolchain.toml found; labeling as 1.91"
         fi
 
     - name: Compose build args
@@ -267,7 +265,7 @@ runs:
         tags: ${{ steps.meta.outputs.tags }}
         labels: ${{ steps.meta.outputs.labels }}
         cache-from: ${{ env.CACHE_FROM }}
-        cache-to:   ${{ env.CACHE_TO }}
+        cache-to: ${{ env.CACHE_TO }}
         build-args: |
           ${{ steps.bargs.outputs.all }}
 

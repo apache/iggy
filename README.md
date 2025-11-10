@@ -185,6 +185,15 @@ Additionally, you can run the `CLI` which is available in the running container,
 
 Keep in mind that running the container on the OS other than Linux, where the Docker is running in the VM, might result in the performance degradation.
 
+Also, when running the container, **make sure to include the additional capabilities**, as you can find in [docker-compose](https://github.com/apache/iggy/blob/master/docker-compose.yml) file:
+
+```yml
+cap_add:
+  - SYS_NICE
+security_opt:
+  - seccomp:unconfined
+```
+
 ---
 
 ## Configuration

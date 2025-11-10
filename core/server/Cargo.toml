@@ -39,7 +39,7 @@ mimalloc = ["dep:mimalloc"]
 [dependencies]
 ahash = { workspace = true }
 anyhow = { workspace = true }
-arcshift = "0.4.0"
+arcshift = "0.4.2"
 argon2 = { workspace = true }
 async-channel = { workspace = true }
 async_zip = { workspace = true }
@@ -56,14 +56,14 @@ compio-quic = { workspace = true }
 compio-tls = { workspace = true }
 compio-ws = { workspace = true }
 crossbeam = { workspace = true }
-ctrlc = { version = "3.4", features = ["termination"] }
+ctrlc = { version = "3.5", features = ["termination"] }
 cyper = { workspace = true }
 cyper-axum = { workspace = true }
 dashmap = { workspace = true }
 derive_more = { workspace = true }
 dotenvy = { workspace = true }
 enum_dispatch = { workspace = true }
-err_trail = { version = "0.9.0" }
+err_trail = { version = "0.10.2" }
 error_set = { version = "0.9.0" }
 figlet-rs = { workspace = true }
 figment = { workspace = true }
@@ -72,7 +72,7 @@ futures = { workspace = true }
 hash32 = "1.0.0"
 human-repr = { workspace = true }
 iggy_common = { workspace = true }
-jsonwebtoken = "9.3.1"
+jsonwebtoken = { version = "10.2.0", features = ["rust_crypto"] }
 lending-iterator = "0.1.7"
 mimalloc = { workspace = true, optional = true }
 moka = { version = "0.12.11", features = ["future"] }
@@ -107,8 +107,8 @@ rustls-pemfile = "2.2.0"
 send_wrapper = "0.6.0"
 serde = { workspace = true }
 serde_with = { workspace = true }
-slab = "0.4.10"
-socket2 = "0.6.0"
+slab = "0.4.11"
+socket2 = "0.6.1"
 static-toml = "1.3.0"
 strum = { workspace = true }
 sysinfo = { workspace = true }
