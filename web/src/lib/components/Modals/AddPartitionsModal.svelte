@@ -5,10 +5,9 @@
   import ModalBase from './ModalBase.svelte';
   import { numberSizes } from '$lib/utils/constants/numberSizes';
   import { setError, superForm, defaults } from 'sveltekit-superforms/client';
-  import { zod4 } from 'sveltekit-superforms/adapters';
+  import { zod } from 'sveltekit-superforms/adapters';
   import { fetchRouteApi } from '$lib/api/fetchRouteApi';
   import { page } from '$app/state';
-  import { dataHas } from '$lib/utils/dataHas';
   import { showToast } from '../AppToasts.svelte';
   import Button from '../Button.svelte';
   import { customInvalidateAll } from '../PeriodicInvalidator.svelte';
@@ -23,9 +22,9 @@
     partitions_count: z.number().min(1).max(numberSizes.max.u32).default(1)
   });
 
-  const { form, errors, enhance, constraints } = superForm(defaults(zod4(schema)), {
+  const { form, errors, enhance, constraints } = superForm(defaults(zod(schema)), {
     SPA: true,
-    validators: zod4(schema),
+    validators: zod(schema),
     invalidateAll: false,
     taintedMessage: false,
     async onUpdate({ form }) {
@@ -40,10 +39,36 @@
         }
       });
 
-      if (dataHas(data, 'field', 'reason')) {
-        return setError(form, data.field, data.reason);
+      if (!ok) {
+        // Handle API errors
+        if (data?.field && data?.reason) {
+          // Field-specific error - show in form
+          return setError(form, data.field, data.reason);
+        } else if (data?.reason) {
+          // General error with reason - show toast
+          let errorMessage = data.reason;
+          if (data.code && data.id) {
+            errorMessage += `\n${data.code} (${data.id})`;
+          } else if (data.code) {
+            errorMessage += `\n${data.code}`;
+          }
+          showToast({
+            type: 'error',
+            description: errorMessage,
+            duration: 5000
+          });
+        } else {
+          // Fallback error message
+          showToast({
+            type: 'error',
+            description: 'Operation failed',
+            duration: 5000
+          });
+        }
+        return;
       }
 
+      // Success
       if (ok) {
         closeModal(async () => {
           await customInvalidateAll();
@@ -55,6 +80,15 @@
                 : '1 partition has been added.',
             duration: 3500
           });
+        });
+      } else {
+        // Handle API errors that don't have field-specific errors
+        const errorMessage =
+          typeof data === 'string' ? data : data?.message || 'Failed to add partitions';
+        showToast({
+          type: 'error',
+          description: errorMessage,
+          duration: 5000
         });
       }
     }
@@ -69,7 +103,7 @@
       name="partitionsCount"
       bind:value={$form.partitions_count}
       {...$constraints.partitions_count}
-      errorMessage={$errors.partitions_count?.join(',')}
+      errorMessage={$errors.partitions_count?.[0]}
     />
 
     <div class="flex justify-end gap-3 mt-auto">

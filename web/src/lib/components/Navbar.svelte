@@ -59,7 +59,7 @@
       <li>
         <div use:tooltip={{ placement: 'right' }}>
           <a
-            {href}
+            href={resolve(href)}
             data-trigger
             class={twMerge(
               'p-2 block rounded-xl transition-colors  ring-2 ring-transparent',

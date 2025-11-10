@@ -68,7 +68,7 @@
         <span class="text-color font-semibold">{label}</span>
       </span>
     {:else}
-      <a href={path} class="flex ml-1">
+      <a href={resolve(path)} class="flex ml-1">
         <span class={twMerge('font-medium text-gray-600 dark:text-shade-l800')}>{label}</span>
         <span class="font-medium text-shade-l800 w-[10px] flex items-center justify-center ml-1"
           >/</span

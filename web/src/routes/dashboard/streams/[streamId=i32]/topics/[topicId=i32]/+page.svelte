@@ -3,6 +3,7 @@
   import Button from '$lib/components/Button.svelte';
   import Icon from '$lib/components/Icon.svelte';
   import { goto } from '$app/navigation';
+  import { resolve } from '$app/paths';
   import { typedRoute } from '$lib/types/appRoutes';
   import { openModal } from '$lib/components/Modals/AppModals.svelte';
   import SortableList from '$lib/components/SortableList.svelte';
@@ -23,7 +24,7 @@
 </script>
 
 <div class="h-[80px] flex text-xs items-center pl-2 pr-5">
-  <Button variant="rounded" class="mr-5" onclick={() => goto(prevPage)}>
+  <Button variant="rounded" class="mr-5" onclick={() => goto(resolve(prevPage))}>
     <Icon name="arrowLeft" class="h-[40px] w-[30px]" />
   </Button>
 
