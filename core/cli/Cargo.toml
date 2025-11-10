@@ -25,7 +25,7 @@ homepage = "https://iggy.apache.org"
 description = "CLI for Iggy message streaming platform"
 license = "Apache-2.0"
 keywords = ["iggy", "cli", "messaging", "streaming"]
-readme = "../../README.md"
+readme = "README.md"
 
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/{ name }-{ version }/{ name }-{ target }{ archive-suffix }"
