@@ -68,7 +68,7 @@ runs:
       shell: bash
       env:
         NEXUS_USER: ${{ env.NEXUS_USER }}
-        NEXUS_PASSWORD: ${{ env.NEXUS_PASSWORD }}
+        NEXUS_PW: ${{ env.NEXUS_PW }}
       run: |
         if [ "${{ inputs.dry_run }}" = "true" ]; then
           echo "🔍 Dry run - would publish to Maven Nexus:"
@@ -99,8 +99,8 @@ runs:
             echo "  - $(basename $jar)"
           done
         else
-          if [ -z "$NEXUS_USER" ] || [ -z "$NEXUS_PASSWORD" ]; then
-            echo "❌ NEXUS_USER or NEXUS_PASSWORD not set"
+          if [ -z "$NEXUS_USER" ] || [ -z "$NEXUS_PW" ]; then
+            echo "❌ NEXUS_USER or NEXUS_PW not set"
             exit 1
           fi
 
