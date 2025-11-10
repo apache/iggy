@@ -4205,7 +4205,6 @@ dependencies = [
  "chrono",
  "clap",
  "comfy-table",
- "compio-ws",
  "crc32fast",
  "derive_more 2.0.1",
  "fast-async-mutex",
@@ -4221,6 +4220,7 @@ dependencies = [
  "tokio",
  "toml 0.9.8",
  "tracing",
+ "tungstenite",
 ]
 
 [[package]]
