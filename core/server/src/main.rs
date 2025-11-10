@@ -309,6 +309,7 @@ async fn main() -> Result<(), ServerError> {
         let config = config.clone();
         let encryptor = encryptor.clone();
         let metrics = metrics.clone();
+        let current_version = current_version.clone();
         let state_persister = resolve_persister(config.system.state.enforce_fsync);
         let state = FileState::new(
             &config.system.get_state_messages_file_path(),

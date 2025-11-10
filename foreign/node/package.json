@@ -1,7 +1,7 @@
 {
   "name": "apache-iggy",
   "type": "module",
-  "version": "0.5.0",
+  "version": "0.6.0-edge.1",
   "description": "Official Apache Iggy NodeJS SDK",
   "keywords": [
     "iggy",

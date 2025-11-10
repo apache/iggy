@@ -24,7 +24,7 @@ plugins {
 }
 
 group = "org.apache.iggy"
-version = "0.5.0-SNAPSHOT"
+version = "0.6.0-SNAPSHOT"
 
 repositories {
     mavenCentral()
@@ -45,7 +45,7 @@ checkstyle {
 }
 
 val flinkVersion = "2.1.0"
-val iggyVersion = "0.5.0-SNAPSHOT"
+val iggyVersion = "0.6.0-SNAPSHOT"
 
 dependencies {
     // Iggy SDK - use local project when building within Iggy repository
@@ -88,7 +88,7 @@ publishing {
         create<MavenPublication>("maven") {
             groupId = "org.apache.iggy"
             artifactId = "iggy-connector-library"
-            version = "0.5.0-SNAPSHOT"
+            version = "0.6.0-SNAPSHOT"
             from(components["java"])
 
             pom {

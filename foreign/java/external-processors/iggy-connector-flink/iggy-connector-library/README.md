@@ -49,7 +49,7 @@ The `org.apache.iggy.connector.flink.*` packages provide Flink-specific implemen
 
 ```kotlin
 dependencies {
-    implementation("org.apache.iggy:iggy-connector-library:0.5.0-SNAPSHOT")
+    implementation("org.apache.iggy:iggy-connector-library:0.6.0-SNAPSHOT")
     compileOnly("org.apache.flink:flink-streaming-java:1.18.0")
 }
 ```
