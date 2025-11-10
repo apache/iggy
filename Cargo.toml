@@ -80,7 +80,7 @@ byte-unit = { version = "5.1.6", default-features = false, features = [
 bytes = "1.10.1"
 charming = "0.6.0"
 chrono = { version = "0.4.42", features = ["serde"] }
-clap = { version = "4.5.50", features = ["derive", "wrap_help"] }
+clap = { version = "4.5.51", features = ["derive", "wrap_help"] }
 colored = "3.0.0"
 comfy-table = "7.2.1"
 compio = { version = "0.16.0", features = [
@@ -90,10 +90,10 @@ compio = { version = "0.16.0", features = [
     "time",
     "rustls",
 ] }
-compio-io = "0.8.1"
+compio-io = "0.8.2"
 compio-net = "0.9.0"
 compio-quic = "0.5.1"
-compio-tls = { version = "0.7.0", features = [
+compio-tls = { version = "0.7.1", features = [
     "rustls",
 ], default-features = false }
 compio-ws = { git = "https://github.com/krishvishal/compio-ws", rev = "86720ac22ecf998438b838d69c64570e54fc5181", features = [
@@ -132,7 +132,7 @@ mimalloc = "0.1"
 mockall = "0.13.1"
 nonzero_lit = "0.1.2"
 once_cell = "1.21.3"
-passterm = "=2.0.1"
+passterm = "=2.0.5"
 postcard = { version = "1.1.3", features = ["alloc"] }
 predicates = "3.1.3"
 quinn = "0.11.9"
@@ -148,7 +148,7 @@ rust-s3 = { version = "0.37.0", default-features = false, features = [
     "tokio-rustls-tls",
     "tags",
 ] }
-rustls = { version = "0.23.34", features = ["ring"] }
+rustls = { version = "0.23.35", features = ["ring"] }
 serde = { version = "1.0.228", features = ["derive", "rc"] }
 serde_json = "1.0.145"
 serde_with = { version = "3.15.1", features = ["base64", "macros"] }
@@ -165,7 +165,7 @@ thiserror = "2.0.17"
 tokio = { version = "1.48.0", features = ["full"] }
 tokio-rustls = "0.26.4"
 tokio-tungstenite = { version = "0.27", features = ["rustls-tls-webpki-roots"] }
-tokio-util = { version = "0.7.16", features = ["compat"] }
+tokio-util = { version = "0.7.17", features = ["compat"] }
 toml = "0.9.8"
 tower-http = { version = "0.6.6", features = [
     "add-extension",
@@ -189,7 +189,7 @@ uuid = { version = "1.18.1", features = [
     "serde",
     "zerocopy",
 ] }
-webpki-roots = "1.0.3"
+webpki-roots = "1.0.4"
 zip = "6.0.0"
 
 [profile.release]

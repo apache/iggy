@@ -28,12 +28,12 @@ ci-qemu = []
 
 [dependencies]
 ahash = { workspace = true }
-assert_cmd = "2.0.17"
+assert_cmd = "2.1.1"
 async-trait = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
 compio = { workspace = true }
-ctor = "0.6.0"
+ctor = "0.6.1"
 derive_more = { workspace = true }
 env_logger = { workspace = true }
 futures = { workspace = true }
@@ -49,7 +49,7 @@ predicates = { workspace = true }
 rand = { workspace = true }
 rcgen = "0.14.5"
 reqwest = { workspace = true }
-rmcp = { version = "0.8.3", features = [
+rmcp = { version = "0.8.5", features = [
     "client",
     "reqwest",
     "transport-streamable-http-client",
