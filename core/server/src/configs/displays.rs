@@ -1,4 +1,5 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
  * regarding copyright ownership.  The ASF licenses this file
@@ -270,8 +271,8 @@ impl Display for TcpTlsConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ enabled: {}, cert_file: {}, key_file: {} }}",
-            self.enabled, self.cert_file, self.key_file
+            "{{ enabled: {}, self_signed: {}, cert_file: {}, key_file: {} }}",
+            self.enabled, self.self_signed, self.cert_file, self.key_file
         )
     }
 }

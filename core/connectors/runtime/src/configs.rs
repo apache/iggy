@@ -69,6 +69,14 @@ pub struct IggyConfig {
     pub username: String,
     pub password: String,
     pub token: String,
+    pub tls: IggyTlsConfig,
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct IggyTlsConfig {
+    pub enabled: bool,
+    pub ca_file: String,
+    pub domain: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -167,7 +175,7 @@ impl std::fmt::Display for IggyConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ address: {}, username: {}, password: {}, token: {} }}",
+            "{{ address: {}, username: {}, password: {}, token: {}, tls: {} }}",
             self.address,
             self.username,
             if !self.password.is_empty() {
@@ -176,6 +184,17 @@ impl std::fmt::Display for IggyConfig {
                 ""
             },
             if !self.token.is_empty() { "****" } else { "" },
+            self.tls
+        )
+    }
+}
+
+impl std::fmt::Display for IggyTlsConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{{ enabled: {}, ca_file: {:?}, domain: {:?} }}",
+            self.enabled, self.ca_file, self.domain
         )
     }
 }
@@ -286,6 +305,7 @@ impl Default for IggyConfig {
             username: DEFAULT_ROOT_USERNAME.to_owned(),
             password: DEFAULT_ROOT_PASSWORD.to_owned(),
             token: "".to_owned(),
+            tls: IggyTlsConfig::default(),
         }
     }
 }
