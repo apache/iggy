@@ -54,22 +54,12 @@ pub struct ServerConfig {
 #[derive(Debug, Default, Deserialize, Serialize, Clone)]
 pub struct DataMaintenanceConfig {
     pub messages: MessagesMaintenanceConfig,
-    pub state: StateMaintenanceConfig,
 }
 
 #[serde_as]
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct MessagesMaintenanceConfig {
     pub cleaner_enabled: bool,
-    #[serde_as(as = "DisplayFromStr")]
-    pub interval: IggyDuration,
-}
-
-#[serde_as]
-#[derive(Debug, Deserialize, Serialize, Clone)]
-pub struct StateMaintenanceConfig {
-    pub archiver_enabled: bool,
-    pub overwrite: bool,
     #[serde_as(as = "DisplayFromStr")]
     pub interval: IggyDuration,
 }

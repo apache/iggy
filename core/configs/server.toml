@@ -19,17 +19,7 @@
 # Enables or disables the expired message cleaner process.
 cleaner_enabled = false
 
-# Interval for running the message archiver and cleaner.
-interval = "1 m"
-
-[data_maintenance.state]
-# Enables or disables the archiver process for state log.
-archiver_enabled = false
-
-# Sets whether the state archiver should overwrite existing log archive or always create a new one.
-overwrite = true
-
-# Interval for running the state archiver
+# Interval for running the message cleaner.
 interval = "1 m"
 
 # HTTP server configuration

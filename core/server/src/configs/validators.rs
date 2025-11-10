@@ -19,8 +19,7 @@
 extern crate sysinfo;
 
 use super::server::{
-    DataMaintenanceConfig, MessageSaverConfig, MessagesMaintenanceConfig, StateMaintenanceConfig,
-    TelemetryConfig,
+    DataMaintenanceConfig, MessageSaverConfig, MessagesMaintenanceConfig, TelemetryConfig,
 };
 use super::sharding::{CpuAllocation, ShardingConfig};
 use super::system::{CompressionConfig, MemoryPoolConfig, PartitionConfig};
@@ -203,9 +202,6 @@ impl Validatable<ConfigError> for DataMaintenanceConfig {
         self.messages.validate().with_error(|error| {
             format!("{COMPONENT} (error: {error}) - failed to validate messages maintenance config")
         })?;
-        self.state.validate().with_error(|error| {
-            format!("{COMPONENT} (error: {error}) - failed to validate state maintenance config")
-        })?;
         Ok(())
     }
 }
@@ -213,16 +209,6 @@ impl Validatable<ConfigError> for DataMaintenanceConfig {
 impl Validatable<ConfigError> for MessagesMaintenanceConfig {
     fn validate(&self) -> Result<(), ConfigError> {
         if self.cleaner_enabled && self.interval.is_zero() {
-            return Err(ConfigError::InvalidConfiguration);
-        }
-
-        Ok(())
-    }
-}
-
-impl Validatable<ConfigError> for StateMaintenanceConfig {
-    fn validate(&self) -> Result<(), ConfigError> {
-        if self.archiver_enabled && self.interval.is_zero() {
             return Err(ConfigError::InvalidConfiguration);
         }
 

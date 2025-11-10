@@ -18,8 +18,8 @@
 
 use crate::configs::quic::{QuicCertificateConfig, QuicConfig};
 use crate::configs::server::{
-    DataMaintenanceConfig, HeartbeatConfig, MessagesMaintenanceConfig, StateMaintenanceConfig,
-    TelemetryConfig, TelemetryLogsConfig, TelemetryTracesConfig,
+    DataMaintenanceConfig, HeartbeatConfig, MessagesMaintenanceConfig, TelemetryConfig,
+    TelemetryLogsConfig, TelemetryTracesConfig,
 };
 use crate::configs::system::MessageDeduplicationConfig;
 use crate::configs::{
@@ -136,11 +136,7 @@ impl Display for CompressionConfig {
 
 impl Display for DataMaintenanceConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{{ messages: {}, state: {} }}",
-            self.messages, self.state
-        )
+        write!(f, "{{ messages: {} }}", self.messages)
     }
 }
 
@@ -150,16 +146,6 @@ impl Display for MessagesMaintenanceConfig {
             f,
             "{{ cleaner_enabled: {}, interval: {} }}",
             self.cleaner_enabled, self.interval
-        )
-    }
-}
-
-impl Display for StateMaintenanceConfig {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{{ overwrite: {}, interval: {} }}",
-            self.overwrite, self.interval
         )
     }
 }
