@@ -119,7 +119,7 @@ publishing {
 
             credentials {
                 username = System.getenv("NEXUS_USER")
-                password = System.getenv("NEXUS_PASSWORD")
+                password = System.getenv("NEXUS_PW")
             }
         }
     }
