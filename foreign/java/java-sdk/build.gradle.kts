@@ -21,7 +21,6 @@ plugins {
     id("java-library")
     id("maven-publish")
     id("signing")
-    id("org.jreleaser") version ("1.14.0")
     id("checkstyle")
 }
 
@@ -42,7 +41,9 @@ java {
 }
 
 signing {
-    useGpgCmd()
+    val signingKey: String? by project
+    val signingPassword: String? by project
+    useInMemoryPgpKeys(signingKey, signingPassword)
     sign(publishing.publications)
 }
 
@@ -76,10 +77,6 @@ tasks.withType<Test> {
 publishing {
     publications {
         create<MavenPublication>("maven") {
-            groupId = "org.apache.iggy"
-            artifactId = "iggy"
-            version = "0.6.0-SNAPSHOT"
-
             from(components["java"])
 
             pom {

@@ -625,6 +625,8 @@ jobs:
       NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
       NEXUS_USER: ${{ secrets.NEXUS_USER }}
       NEXUS_PW: ${{ secrets.NEXUS_PW }}
+      JAVA_GPG_SIGNING_KEY: ${{ secrets.JAVA_GPG_SIGNING_KEY }}
+      JAVA_GPG_PASSWORD: ${{ secrets.JAVA_GPG_PASSWORD }}
       NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
       DRY_RUN: ${{ inputs.dry_run }}
     outputs:
