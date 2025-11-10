@@ -22,7 +22,7 @@ public sealed class ReconnectionSettings
     /// <summary>
     /// Enable automatic reconnection when connection is lost
     /// </summary>
-    public bool Enabled { get; set; } = true;
+    public bool Enabled { get; set; } = false;
 
     /// <summary>
     /// Maximum number of reconnection attempts (0 = infinite)
@@ -32,7 +32,7 @@ public sealed class ReconnectionSettings
     /// <summary>
     /// Initial delay before first reconnection attempt
     /// </summary>
-    public TimeSpan InitialDelay { get; set; } = TimeSpan.FromMilliseconds(100);
+    public TimeSpan InitialDelay { get; set; } = TimeSpan.FromSeconds(5);
 
     /// <summary>
     /// Maximum delay between reconnection attempts
@@ -53,4 +53,14 @@ public sealed class ReconnectionSettings
     /// Whether to re-authenticate after reconnection (if previously authenticated)
     /// </summary>
     public bool ReauthenticateOnReconnect { get; set; } = true;
+    
+    /// <summary>
+    ///     Specifies the username for auto-login configuration.
+    /// </summary>
+    public string Username { get; set; } = string.Empty;
+
+    /// <summary>
+    ///     Specifies the password for auto-login authentication
+    /// </summary>
+    public string Password { get; set; } = string.Empty;
 }

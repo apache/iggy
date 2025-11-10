@@ -41,46 +41,12 @@ public static class IggyClientFactory
 
     private static IIggyClient CreateIggyTcpClient(IggyClientConfigurator options)
     {
-        var client = new TcpMessageStream(options.LoggerFactory, options);
-        client.Connect();
-        
-        return client;
+        return new TcpMessageStream(options, options.LoggerFactory);
     }
 
     private static IIggyClient CreateIggyHttpClient(IggyClientConfigurator options)
     {
         return new HttpMessageStream(CreateHttpClient(options));
-    }
-
-    private static IConnectionStream CreateTcpStream(IggyClientConfigurator options)
-    {
-        var urlPortSplitter = options.BaseAddress.Split(":");
-        if (urlPortSplitter.Length > 2)
-        {
-            throw new InvalidBaseAdressException();
-        }
-        
-        var socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-        socket.Connect(urlPortSplitter[0], int.Parse(urlPortSplitter[1]));
-        socket.SendBufferSize = options.SendBufferSize;
-        socket.ReceiveBufferSize = options.ReceiveBufferSize;
-        return options.TlsSettings.Enabled switch
-        {
-            true => CreateSslStreamAndAuthenticate(socket, options.TlsSettings),
-            false => new TcpConnectionStream(new NetworkStream(socket))
-        };
-    }
-
-    private static IConnectionStream CreateSslStreamAndAuthenticate(Socket socket, TlsSettings tlsSettings)
-    {
-        var stream = new NetworkStream(socket);
-        var sslStream = new SslStream(stream);
-        if (tlsSettings.Authenticate)
-        {
-            sslStream.AuthenticateAsClient(tlsSettings.Hostname);
-        }
-
-        return new TcpConnectionStream(sslStream);
     }
 
     private static HttpClient CreateHttpClient(IggyClientConfigurator options)

@@ -178,7 +178,7 @@ public class UsersTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task LoginUser_Should_LoginUser_Successfully(Protocol protocol)
     {
-        var client = Fixture.IggyServerFixture.CreateClient(protocol);
+        var client = await Fixture.IggyServerFixture.CreateClient(protocol);
 
         var response = await client.LoginUser(Username.GetWithProtocol(protocol), "user2");
 

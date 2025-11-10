@@ -40,23 +40,27 @@ public sealed class TcpMessageStream : IIggyClient
 {
     private readonly IggyClientConfigurator _configuration;
     private readonly ILogger<TcpMessageStream> _logger;
-    private readonly SemaphoreSlim _semaphore;
-    private AuthResponse? _lastAuthResponse;
+    private readonly SemaphoreSlim _sendingSemaphore;
+    private readonly SemaphoreSlim _connectionSemaphore;
     private ConnectionState _state = ConnectionState.Disconnected;
-    private IConnectionStream _stream = null!;
+    private TcpConnectionStream _stream = null!;
+    private DateTime _lastConnectionTime;
 
-    internal TcpMessageStream(ILoggerFactory loggerFactory, IggyClientConfigurator configuration)
+    internal TcpMessageStream(IggyClientConfigurator configuration, ILoggerFactory loggerFactory)
     {
         _configuration = configuration;
         _logger = loggerFactory.CreateLogger<TcpMessageStream>();
-        _semaphore = new SemaphoreSlim(1, 1);
+        _sendingSemaphore = new SemaphoreSlim(1, 1);
+        _connectionSemaphore = new SemaphoreSlim(1, 1);
+        _lastConnectionTime = DateTime.MinValue;
     }
 
     public void Dispose()
     {
-        _stream.Close();
-        _stream.Dispose();
-        _semaphore.Dispose();
+        _stream?.Close();
+        _stream?.Dispose();
+        _sendingSemaphore.Dispose();
+        _connectionSemaphore.Dispose();
     }
 
     public async Task<StreamResponse?> CreateStreamAsync(string name, CancellationToken token = default)
@@ -479,12 +483,13 @@ public sealed class TcpMessageStream : IIggyClient
         await SendWithResponseAsync(payload, token);
     }
 
-    public void Connect()
+    public async Task ConnectAsync(CancellationToken token = default)
     {
         if (_state is ConnectionState.Connected
             or ConnectionState.Authenticating
             or ConnectionState.Authenticated)
         {
+            _logger.LogWarning("Connection is already connected");
             return;
         }
 
@@ -492,25 +497,72 @@ public sealed class TcpMessageStream : IIggyClient
         _stream?.Close();
         _stream?.Dispose();
 
-        _state = ConnectionState.Connecting;
-
-        var urlPortSplitter = _configuration.BaseAddress.Split(":");
-        if (urlPortSplitter.Length > 2)
+        if (_lastConnectionTime != DateTime.MinValue)
         {
-            throw new InvalidBaseAdressException();
+            await Task.Delay(_configuration.ReconnectionSettings.InitialDelay, token);
         }
+        
+        _state = ConnectionState.Connecting;
+        
+        var retryCount = 0;
+        var delay = _configuration.ReconnectionSettings.InitialDelay;
+        do
+        {   
+            var urlPortSplitter = _configuration.BaseAddress.Split(":");
+            if (urlPortSplitter.Length > 2)
+            {
+                throw new InvalidBaseAdressException();
+            }
 
-        var socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-        socket.SendBufferSize = _configuration.SendBufferSize;
-        socket.ReceiveBufferSize = _configuration.ReceiveBufferSize;
-        socket.Connect(urlPortSplitter[0], int.Parse(urlPortSplitter[1]));
-        _state = ConnectionState.Connected;
+            var socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+            socket.SendBufferSize = _configuration.SendBufferSize;
+            socket.ReceiveBufferSize = _configuration.ReceiveBufferSize;
+            
+            try
+            {
+                await socket.ConnectAsync(urlPortSplitter[0], int.Parse(urlPortSplitter[1]), token);
+            }
+            catch (Exception e)
+            {
+                _logger.LogError(e, "Failed to connect");
 
-        _stream = _configuration.TlsSettings.Enabled switch
-        {
-            true => CreateSslStreamAndAuthenticate(socket, _configuration.TlsSettings),
-            false => new TcpConnectionStream(new NetworkStream(socket))
-        };
+                if (!_configuration.ReconnectionSettings.Enabled ||  
+                    (_configuration.ReconnectionSettings.MaxRetries > 0 && retryCount >= _configuration.ReconnectionSettings.MaxRetries))
+                {
+                    _state = ConnectionState.Disconnected;
+                    throw;
+                }
+
+                retryCount++;
+                if (_configuration.ReconnectionSettings.UseExponentialBackoff)
+                {
+                    delay *= _configuration.ReconnectionSettings.BackoffMultiplier;
+                    
+                    if(delay > _configuration.ReconnectionSettings.MaxDelay)
+                    {
+                        delay = _configuration.ReconnectionSettings.MaxDelay;
+                    }
+                }
+
+                if (_logger.IsEnabled(LogLevel.Information))
+                {
+                    _logger.LogInformation("Retrying connection attempt {RetryCount} with delay {Delay}", retryCount, delay);
+                }
+                await Task.Delay(delay, token);
+
+                continue;
+            }
+            _state = ConnectionState.Connected;
+            _lastConnectionTime = DateTime.UtcNow;
+            
+            _stream = _configuration.TlsSettings.Enabled switch
+            {
+                true => CreateSslStreamAndAuthenticate(socket, _configuration.TlsSettings),
+                false => new TcpConnectionStream(new NetworkStream(socket))
+            };
+
+            break;
+        } while (true);
     }
 
     public async Task<IReadOnlyList<ClientResponse>> GetClientsAsync(CancellationToken token = default)
@@ -635,10 +687,16 @@ public sealed class TcpMessageStream : IIggyClient
 
     public async Task<AuthResponse?> LoginUser(string userName, string password, CancellationToken token = default)
     {
+        if (_state == ConnectionState.Disconnected)
+        {
+            throw new NotConnectedException();
+        }
+        
         var message = TcpContracts.LoginUser(userName, password, "0.5.0", "csharp-sdk");
         var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.LOGIN_USER_CODE);
 
+        _state = ConnectionState.Authenticating;
         var responseBuffer = await SendWithResponseAsync(payload, token);
 
         if (responseBuffer.Length <= 0)
@@ -647,9 +705,8 @@ public sealed class TcpMessageStream : IIggyClient
         }
 
         var userId = BinaryPrimitives.ReadInt32LittleEndian(responseBuffer.AsSpan()[..responseBuffer.Length]);
-
+        _state = ConnectionState.Authenticated;
         var authResponse = new AuthResponse(userId, null);
-        _lastAuthResponse = authResponse;
         return authResponse;
     }
 
@@ -660,7 +717,6 @@ public sealed class TcpMessageStream : IIggyClient
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.LOGOUT_USER_CODE);
 
         await SendWithResponseAsync(payload, token);
-        _lastAuthResponse = null;
     }
 
     public async Task<IReadOnlyList<PersonalAccessTokenResponse>> GetPersonalAccessTokensAsync(
@@ -722,12 +778,10 @@ public sealed class TcpMessageStream : IIggyClient
         var userId = BinaryPrimitives.ReadInt32LittleEndian(responseBuffer.AsSpan()[..4]);
 
         //TODO: Figure out how to solve this workaround about default of TokenInfo
-        var authResponse = new AuthResponse(userId, default);
-        _lastAuthResponse = authResponse;
-        return authResponse;
+        return new AuthResponse(userId, default);
     }
 
-    private static IConnectionStream CreateSslStreamAndAuthenticate(Socket socket, TlsSettings tlsSettings)
+    private static TcpConnectionStream CreateSslStreamAndAuthenticate(Socket socket, TlsSettings tlsSettings)
     {
         var stream = new NetworkStream(socket);
         var sslStream = new SslStream(stream);
@@ -741,16 +795,80 @@ public sealed class TcpMessageStream : IIggyClient
 
     private async Task<byte[]> SendWithResponseAsync(byte[] payload, CancellationToken token = default)
     {
-        if (_state is ConnectionState.Disconnected or ConnectionState.Connecting)
+        try
         {
-            // todo: change error
-            throw new InvalidOperationException("Connection is not connected");
+            return await SendRawAsync(payload, token);
+        }
+        catch (Exception e) when (IsConnectionException(e))
+        {
+            _logger.LogWarning("Connection lost");
+            if (!_configuration.ReconnectionSettings.Enabled)
+            {
+                _logger.LogWarning("Reconnection is disabled");
+                _state = ConnectionState.Disconnected;
+                throw;
+            }
+
+            return await HandleReconnectionAsync(payload, token);
+        }
+    }
+
+    private async Task<byte[]> HandleReconnectionAsync(byte[] payload, CancellationToken token)
+    {
+        var currentTime = DateTime.UtcNow;
+        await _connectionSemaphore.WaitAsync(token);
+            
+        try
+        {
+            if((_state is ConnectionState.Connected or ConnectionState.Authenticated)
+               && _lastConnectionTime > currentTime)
+            {
+                _logger.LogInformation("Connection already established, sending payload");
+                return await SendRawAsync(payload, token);
+            }
+                
+            _state = ConnectionState.Disconnected;
+            _logger.LogInformation("Reconnecting to the server");
+            await ConnectAsync(token);
+                
+            _logger.LogInformation("Reconnected to the server");
+
+            if (_configuration.ReconnectionSettings.ReauthenticateOnReconnect)
+            {
+                _logger.LogInformation("Trying to reauthenticate");
+                var response = await LoginUser(_configuration.ReconnectionSettings.Username,
+                    _configuration.ReconnectionSettings.Password, token);
+                if (response is null)
+                {
+                    _logger.LogError("Failed to reauthenticate");
+                    _stream.Close();
+                    _stream.Dispose();
+                    _state = ConnectionState.Disconnected;
+                    throw new FailedToAuthorizeException("Failed to reauthenticate");
+                }
+
+                _logger.LogInformation("Reauthenticated as {Username}",
+                    _configuration.ReconnectionSettings.Username);
+            }
+        }
+        finally
+        {
+            _connectionSemaphore.Release();
+        }
+
+        return await SendRawAsync(payload, token);
+    }
+
+    private async Task<byte[]> SendRawAsync(byte[] payload, CancellationToken token)
+    {
+        if (_state is ConnectionState.Disconnected or ConnectionState.Connecting) 
+        {
+            throw new NotConnectedException();
         }
 
         try
         {
-            await _semaphore.WaitAsync(token);
-
+            await _sendingSemaphore.WaitAsync(token);
             await _stream.SendAsync(payload, token);
             await _stream.FlushAsync(token);
 
@@ -759,11 +877,14 @@ public sealed class TcpMessageStream : IIggyClient
             var totalRead = 0;
             while (totalRead < BufferSizes.EXPECTED_RESPONSE_SIZE)
             {
-                var readBytes = await _stream.ReadAsync(buffer.AsMemory(totalRead, BufferSizes.EXPECTED_RESPONSE_SIZE - totalRead), token);
+                var readBytes
+                    = await _stream.ReadAsync(buffer.AsMemory(totalRead, BufferSizes.EXPECTED_RESPONSE_SIZE - totalRead),
+                        token);
                 if (readBytes == 0)
                 {
-                    throw new InvalidResponseException("Connection closed while reading response header");
+                    throw new IggyZeroBytesException();
                 }
+
                 totalRead += readBytes;
             }
 
@@ -780,13 +901,16 @@ public sealed class TcpMessageStream : IIggyClient
                 totalRead = 0;
                 while (totalRead < response.Length)
                 {
-                    var readBytes = await _stream.ReadAsync(errorBuffer.AsMemory(totalRead, response.Length - totalRead), token);
+                    var readBytes
+                        = await _stream.ReadAsync(errorBuffer.AsMemory(totalRead, response.Length - totalRead), token);
                     if (readBytes == 0)
                     {
-                        throw new InvalidResponseException($"Connection closed while reading error message. Expected {response.Length} bytes, got {totalRead}");
+                        throw new IggyZeroBytesException();
                     }
+
                     totalRead += readBytes;
                 }
+
                 throw new InvalidResponseException(Encoding.UTF8.GetString(errorBuffer));
             }
 
@@ -795,16 +919,17 @@ public sealed class TcpMessageStream : IIggyClient
                 return [];
             }
 
-            // Read the full payload
             var responseBuffer = new byte[response.Length];
             totalRead = 0;
             while (totalRead < response.Length)
             {
-                var readBytes = await _stream.ReadAsync(responseBuffer.AsMemory(totalRead, response.Length - totalRead), token);
+                var readBytes = await _stream.ReadAsync(responseBuffer.AsMemory(totalRead, response.Length - totalRead),
+                    token);
                 if (readBytes == 0)
                 {
-                    throw new InvalidResponseException($"Connection closed while reading response payload. Expected {response.Length} bytes, got {totalRead}");
+                    throw new IggyZeroBytesException();
                 }
+
                 totalRead += readBytes;
             }
 
@@ -812,38 +937,14 @@ public sealed class TcpMessageStream : IIggyClient
         }
         finally
         {
-            _semaphore.Release();
+            _sendingSemaphore.Release();
         }
     }
 
-    // private Task ReconnectAsync(CancellationToken token)
-    // {
-    //     try
-    //     {
-    //         _stream.Close();
-    //         _stream.Dispose();
-    //     }
-    //     catch (Exception ex)
-    //     catch (Exception ex)
-    //     {
-    //         _logger.LogDebug(ex, "Error disposing old connection stream");
-    //     }
-    //
-    //     _stream = _connectionFactory();
-    //
-    //     if (_reconnectionSettings.ReauthenticateOnReconnect && _lastAuthResponse != null)
-    //     {
-    //         _logger.LogDebug("Re-authenticating after reconnection");
-    //         // Note: Re-authentication would need to be implemented based on how the client was originally authenticated
-    //         // This is a placeholder for future implementation
-    //     }
-    //
-    //     return Task.CompletedTask;
-    // }
-
     private static bool IsConnectionException(Exception ex)
     {
-        return ex is InvalidResponseException or
+        return ex is IggyZeroBytesException or
+            NotConnectedException or
             SocketException or
             IOException or
             ObjectDisposedException;

@@ -1,4 +1,4 @@
-// Licensed to the Apache Software Foundation (ASF) under one
+﻿// Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
 // regarding copyright ownership.  The ASF licenses this file
@@ -15,17 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Apache.Iggy.Contracts;
+namespace Apache.Iggy.Exceptions;
 
-namespace Apache.Iggy.IggyClient;
-
-public interface IIggySystem
+public sealed class NotConnectedException : Exception
 {
-    Task ConnectAsync(CancellationToken token = default);
-    Task<IReadOnlyList<ClientResponse>> GetClientsAsync(CancellationToken token = default);
-    Task<ClientResponse?> GetClientByIdAsync(uint clientId, CancellationToken token = default);
-    Task<ClientResponse?> GetMeAsync(CancellationToken token = default);
-    Task<StatsResponse?> GetStatsAsync(CancellationToken token = default);
-    Task<ClusterMetadata?> GetClusterMetadataAsync(CancellationToken token = default);
-    Task PingAsync(CancellationToken token = default);
+    internal NotConnectedException() : base ("Iggy client is not connected to the server")
+    {
+    }
 }

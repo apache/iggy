@@ -30,7 +30,7 @@ namespace Apache.Iggy.Tests.Integrations.Fixtures;
 
 public class IggyServerFixture : IAsyncInitializer, IAsyncDisposable
 {
-    private readonly IContainer _iggyContainer = new ContainerBuilder().WithImage("apache/iggy:local-apache")
+    private readonly IContainer _iggyContainer = new ContainerBuilder().WithImage("apache/iggy:0.6.0-edge.1")
         .WithPortBinding(3000, true)
         .WithPortBinding(8090, true)
         .WithOutputConsumer(Consume.RedirectStdoutAndStderrToConsole())
@@ -99,50 +99,62 @@ public class IggyServerFixture : IAsyncInitializer, IAsyncDisposable
         return dictionary;
     }
 
-    public async Task<IIggyClient> CreateTcpClient(string userName = "iggy", string password = "iggy")
+    public async Task<IIggyClient> CreateTcpClient(string userName = "iggy", string password = "iggy", bool connect = true)
     {
-        var client = CreateClient(Protocol.Tcp);
+        var client = await CreateClient(Protocol.Tcp, connect: connect);
 
-        await client.LoginUser(userName, password);
+        if (connect)
+        {
+            await client.LoginUser(userName, password);
+        }
 
         return client;
     }
 
     public async Task<IIggyClient> CreateHttpClient(string userName = "iggy", string password = "iggy")
     {
-        var client = CreateClient(Protocol.Http);
+        var client = await CreateClient(Protocol.Http);
 
         await client.LoginUser(userName, password);
 
         return client;
     }
 
-    public IIggyClient CreateClient(Protocol protocol, Protocol? targetContainer = null)
+    public async Task<IIggyClient> CreateClient(Protocol protocol, Protocol? targetContainer = null, bool connect = true)
     {
-        string? address;
+       var address = GetIggyAddress(protocol);
 
+        var client = IggyClientFactory.CreateClient(new IggyClientConfigurator()
+        {
+            BaseAddress = address,
+            Protocol = protocol
+        });
+
+        if (connect)
+        {
+            await client.ConnectAsync();
+        }
+
+        return client;
+    }
+
+    public string GetIggyAddress(Protocol protocol)
+    {
         if (string.IsNullOrEmpty(_iggyServerHost))
         {
             var port = protocol == Protocol.Tcp
                 ? _iggyContainer.GetMappedPublicPort(8090)
                 : _iggyContainer.GetMappedPublicPort(3000);
 
-            address = protocol == Protocol.Tcp
+            return protocol == Protocol.Tcp
                 ? $"127.0.0.1:{port}"
                 : $"http://127.0.0.1:{port}";
         }
-        else
-        {
-            address = protocol == Protocol.Tcp
-                ? $"{_iggyServerHost}:8090"
-                : $"http://{_iggyServerHost}:3000";
-        }
-
-        return IggyClientFactory.CreateClient(new IggyClientConfigurator()
-        {
-            BaseAddress = address,
-            Protocol = protocol
-        });
+        
+        return protocol == Protocol.Tcp
+            ? $"{_iggyServerHost}:8090"
+            : $"http://{_iggyServerHost}:3000";
+        
     }
 
     public static IEnumerable<Func<Protocol>> ProtocolData()

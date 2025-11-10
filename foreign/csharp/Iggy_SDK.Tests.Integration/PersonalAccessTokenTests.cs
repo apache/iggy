@@ -75,7 +75,7 @@ public class PersonalAccessTokenTests
     {
         var response = await Fixture.Clients[protocol].CreatePersonalAccessTokenAsync("test-pat-login", 100_000_000);
 
-        var client = Fixture.IggyServerFixture.CreateClient(protocol);
+        var client = await Fixture.IggyServerFixture.CreateClient(protocol);
 
         var authResponse = await client.LoginWithPersonalAccessToken(response!.Token);
 

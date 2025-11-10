@@ -426,8 +426,9 @@ public class HttpMessageStream : IIggyClient
         }
     }
 
-    public void Connect()
+    public Task ConnectAsync(CancellationToken token = default)
     {
+        return Task.CompletedTask;
     }
 
     public async Task<IReadOnlyList<ClientResponse>> GetClientsAsync(CancellationToken token = default)

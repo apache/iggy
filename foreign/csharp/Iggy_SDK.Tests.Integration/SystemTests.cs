@@ -55,7 +55,7 @@ public class SystemTests
     {
         IReadOnlyList<ClientResponse> clients = await Fixture.Clients[protocol].GetClientsAsync();
 
-        var client = Fixture.IggyServerFixture.CreateClient(Protocol.Tcp, protocol);
+        var client = await Fixture.IggyServerFixture.CreateClient(Protocol.Tcp, protocol);
         await client.LoginUser("iggy", "iggy");
         var clientInfo = await client.GetMeAsync();
         clientInfo.ShouldNotBeNull();
@@ -101,7 +101,7 @@ public class SystemTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task GetClient_WithConsumerGroup_Should_Return_CorrectClient(Protocol protocol)
     {
-        var client = Fixture.IggyServerFixture.CreateClient(Protocol.Tcp, protocol);
+        var client = await Fixture.IggyServerFixture.CreateClient(Protocol.Tcp, protocol);
         await client.LoginUser("iggy", "iggy");
         var stream = await client.CreateStreamAsync(Fixture.StreamId.GetWithProtocol(protocol));
         await client.CreateTopicAsync(Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)), "test_topic", 2);

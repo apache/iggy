@@ -82,6 +82,33 @@ public class IggyConsumerTests
         await Should.NotThrowAsync(() => consumer.InitAsync());
         await consumer.DisposeAsync();
     }
+    
+    [Test]
+    [SkipHttp]
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task InitAsync_NewClient_Should_Initialize_Successfully(Protocol protocol)
+    {
+        var client = protocol == Protocol.Tcp
+            ? await Fixture.CreateTcpClient()
+            : await Fixture.CreateHttpClient();
+        
+        var testStream = await CreateTestStreamWithMessages(client, protocol);
+        
+        var clientAddress = Fixture.GetIggyAddress(protocol);;
+
+        var consumer = IggyConsumerBuilder
+            .Create(Identifier.String(testStream.StreamId),
+                Identifier.String(testStream.TopicId),
+                Consumer.New(2))
+            .WithConnection(protocol, clientAddress, "iggy", "iggy")
+            .WithPollingStrategy(PollingStrategy.Next())
+            .WithBatchSize(10)
+            .WithConsumerGroup("test-group-init")
+            .Build();
+
+        await Should.NotThrowAsync(() => consumer.InitAsync());
+        await consumer.DisposeAsync();
+    }
 
     [Test]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]

@@ -156,7 +156,7 @@ public class ConsumerGroupTests
         var clients = new List<IIggyClient>();
         for (var i = 0; i < 2; i++)
         {
-            var client = Fixture.IggyServerFixture.CreateClient(Protocol.Tcp, protocol);
+            var client = await Fixture.IggyServerFixture.CreateClient(Protocol.Tcp, protocol);
             clients.Add(client);
             await client.LoginUser("iggy", "iggy");
             var me = await client.GetMeAsync();

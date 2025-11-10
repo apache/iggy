@@ -116,12 +116,14 @@ public partial class IggyConsumer : IAsyncDisposable
         {
             return;
         }
-
+        
         if (_config.Consumer.Type == ConsumerType.ConsumerGroup && _config.PartitionId != null)
         {
             _logger.LogWarning("PartitionId is ignored when ConsumerType is ConsumerGroup");
             _config.PartitionId = null;
         }
+        
+        await _client.ConnectAsync(ct);
 
         if (_config.CreateIggyClient)
         {

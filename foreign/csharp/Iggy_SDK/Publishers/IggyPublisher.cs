@@ -163,7 +163,8 @@ public partial class IggyPublisher : IAsyncDisposable
             return;
         }
 
-
+        await _client.ConnectAsync(ct);
+        
         LogInitializingPublisher(_config.StreamId, _config.TopicId);
         if (_config.CreateIggyClient)
         {
