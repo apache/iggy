@@ -20,4 +20,5 @@ namespace Apache.Iggy.IggyClient;
 public interface IIggyClient : IIggyPublisher, IIggyStream, IIggyTopic, IIggyConsumer, IIggyOffset, IIggyConsumerGroup,
     IIggySystem, IIggyPartition, IIggyUsers, IIggyPersonalAccessToken, IDisposable
 {
+    bool IsConnected { get; }
 }

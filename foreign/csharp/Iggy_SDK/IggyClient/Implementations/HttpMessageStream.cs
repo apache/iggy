@@ -56,6 +56,8 @@ public class HttpMessageStream : IIggyClient
         };
     }
 
+    public bool IsConnected => true;
+
     public async Task<StreamResponse?> CreateStreamAsync(string name, CancellationToken token = default)
     {
         var json = JsonSerializer.Serialize(new CreateStreamRequest(name), _jsonSerializerOptions);

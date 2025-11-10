@@ -44,7 +44,7 @@ public sealed class TcpMessageStream : IIggyClient
     private readonly SemaphoreSlim _connectionSemaphore;
     private ConnectionState _state = ConnectionState.Disconnected;
     private TcpConnectionStream _stream = null!;
-    private DateTime _lastConnectionTime;
+    private DateTimeOffset _lastConnectionTime;
 
     internal TcpMessageStream(IggyClientConfigurator configuration, ILoggerFactory loggerFactory)
     {
@@ -52,9 +52,13 @@ public sealed class TcpMessageStream : IIggyClient
         _logger = loggerFactory.CreateLogger<TcpMessageStream>();
         _sendingSemaphore = new SemaphoreSlim(1, 1);
         _connectionSemaphore = new SemaphoreSlim(1, 1);
-        _lastConnectionTime = DateTime.MinValue;
+        _lastConnectionTime = DateTimeOffset.MinValue;
     }
 
+    public bool IsConnected => _state is ConnectionState.Connected 
+        or ConnectionState.Authenticating 
+        or ConnectionState.Authenticated;
+    
     public void Dispose()
     {
         _stream?.Close();
@@ -497,7 +501,7 @@ public sealed class TcpMessageStream : IIggyClient
         _stream?.Close();
         _stream?.Dispose();
 
-        if (_lastConnectionTime != DateTime.MinValue)
+        if (_lastConnectionTime != DateTimeOffset.MinValue)
         {
             await Task.Delay(_configuration.ReconnectionSettings.InitialDelay, token);
         }
@@ -553,7 +557,7 @@ public sealed class TcpMessageStream : IIggyClient
                 continue;
             }
             _state = ConnectionState.Connected;
-            _lastConnectionTime = DateTime.UtcNow;
+            _lastConnectionTime = DateTimeOffset.UtcNow;
             
             _stream = _configuration.TlsSettings.Enabled switch
             {
@@ -815,7 +819,7 @@ public sealed class TcpMessageStream : IIggyClient
 
     private async Task<byte[]> HandleReconnectionAsync(byte[] payload, CancellationToken token)
     {
-        var currentTime = DateTime.UtcNow;
+        var currentTime = DateTimeOffset.UtcNow;
         await _connectionSemaphore.WaitAsync(token);
             
         try

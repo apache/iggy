@@ -154,6 +154,17 @@ internal sealed partial class BackgroundMessageProcessor : IAsyncDisposable
         {
             while (!ct.IsCancellationRequested)
             {
+                if (!_client.IsConnected)
+                {
+                    LogClientIsDisconnected();
+                    if (!await timer.WaitForNextTickAsync(ct))
+                    {
+                        break;
+                    }
+
+                    continue;
+                }
+                
                 while (messageBatch.Count < _config.BackgroundBatchSize &&
                        MessageReader.TryRead(out var message))
                 {
