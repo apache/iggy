@@ -32,7 +32,7 @@ Iggy provides **exceptionally high throughput and performance** while utilizing 
 
 This is **not yet another extension** running on top of existing infrastructure, such as Kafka or SQL database.
 
-Iggy is a persistent message streaming log **built from the ground up** using low-level I/O for speed and efficiency.
+Iggy is a persistent message streaming log **built from the ground up** using low-level I/O with **thread-per-core shared nothing architecture**, `io_uring` and `compio` for maximum speed and efficiency.
 
 The name is an abbreviation for the Italian Greyhound - small yet extremely fast dogs, the best in their class. See the lovely [Fabio & Cookie](https://www.instagram.com/fabio.and.cookie/) ❤️
 
@@ -42,12 +42,13 @@ The name is an abbreviation for the Italian Greyhound - small yet extremely fast
 
 - **Highly performant**, persistent append-only log for message streaming
 - **Very high throughput** for both writes and reads
-- **Low latency and predictable resource usage** thanks to the Rust compiled language (no GC)
+- **Low latency and predictable resource usage** thanks to the Rust compiled language (no GC) and `io_uring`.
 - **User authentication and authorization** with granular permissions and Personal Access Tokens (PAT)
 - Support for multiple streams, topics and partitions
 - Support for **multiple transport protocols** (QUIC, TCP, HTTP)
 - Fully operational RESTful API which can be optionally enabled
 - Available client SDK in multiple languages
+- **Thread per core shared nothing design** together with `io_uring` guarantee the best possible performance on modern `Linux` systems.
 - **Works directly with binary data**, avoiding enforced schema and serialization/deserialization overhead
 - Custom **zero-copy (de)serialization**, which greatly improves the performance and reduces memory usage.
 - Configurable server features (e.g. caching, segment size, data flush interval, transport protocols etc.)
@@ -98,7 +99,6 @@ We do also publish edge/dev/nightly releases (e.g. `0.5.0-edge.1` or `apache/igg
 
 ## Roadmap
 
-- **Shared-nothing** design and **io_uring** support (PoC on experimental branch, WiP on the main branch)
 - **Clustering** & data replication based on **[VSR](http://pmg.csail.mit.edu/papers/vr-revisited.pdf)** (on sandbox project using Raft, will be implemented after shared-nothing design is completed)
 
 ---
@@ -451,9 +451,7 @@ These benchmarks would start the server with the default configuration, create a
 
 For example, to run the benchmark for the already started server, provide the additional argument `--server-address 0.0.0.0:8090`.
 
-Depending on the hardware, transport protocol (`quic`, `tcp` or `http`) and payload size (`messages-per-batch * message-size`) you might expect **over 5000 MB/s (e.g. 5M of 1 KB msg/sec) throughput for writes and reads**.
-
-**Iggy is already capable of processing millions of messages per second at the microseconds range for p99+ latency**, and with the upcoming optimizations related to the io_uring support along with the shared-nothing design, it will only get better.
+ **Iggy is already capable of processing millions of messages per second at the microseconds range for p99+ latency** Depending on the hardware, transport protocol (`quic`, `tcp` or `http`) and payload size (`messages-per-batch * message-size`) you might expect **over 5000 MB/s (e.g. 5M of 1 KB msg/sec) throughput for writes and reads**.
 
 Please refer to the mentioned [benchmarking platform](https://benchmarks.iggy.apache.org) where you can browse the results achieved on the different hardware configurations, using the different Iggy server versions.
 
