@@ -523,6 +523,9 @@ public sealed class TcpMessageStream : IIggyClient
             socket.SendBufferSize = _configuration.SendBufferSize;
             socket.ReceiveBufferSize = _configuration.ReceiveBufferSize;
 
+            socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
+            socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveTime, 5);
+
             try
             {
                 await socket.ConnectAsync(urlPortSplitter[0], int.Parse(urlPortSplitter[1]), token);
