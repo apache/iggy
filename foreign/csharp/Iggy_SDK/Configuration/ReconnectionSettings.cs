@@ -46,7 +46,7 @@ public sealed class ReconnectionSettings
     /// This can help rejoin to e.g., a consumer group.
     /// </remarks>
     public TimeSpan WaitAfterReconnect { get; set; } = TimeSpan.FromSeconds(1);
-    
+
     /// <summary>
     /// Use exponential backoff for reconnection delays
     /// </summary>
@@ -61,7 +61,7 @@ public sealed class ReconnectionSettings
     /// Whether to re-authenticate after reconnection (if previously authenticated)
     /// </summary>
     public bool ReauthenticateOnReconnect { get; set; } = true;
-    
+
     /// <summary>
     ///     Specifies the username for auto-login configuration.
     /// </summary>

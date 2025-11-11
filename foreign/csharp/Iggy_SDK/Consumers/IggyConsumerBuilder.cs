@@ -102,7 +102,7 @@ public class IggyConsumerBuilder
         Config.ReceiveBufferSize = receiveBufferSize;
         Config.SendBufferSize = sendBufferSize;
         Config.ReconnectionSettings = reconnectionSettings;
-        
+
         return this;
     }
 

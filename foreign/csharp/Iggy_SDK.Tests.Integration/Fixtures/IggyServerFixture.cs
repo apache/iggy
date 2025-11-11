@@ -122,7 +122,7 @@ public class IggyServerFixture : IAsyncInitializer, IAsyncDisposable
 
     public async Task<IIggyClient> CreateClient(Protocol protocol, Protocol? targetContainer = null, bool connect = true)
     {
-       var address = GetIggyAddress(protocol);
+        var address = GetIggyAddress(protocol);
 
         var client = IggyClientFactory.CreateClient(new IggyClientConfigurator()
         {
@@ -150,11 +150,11 @@ public class IggyServerFixture : IAsyncInitializer, IAsyncDisposable
                 ? $"127.0.0.1:{port}"
                 : $"http://127.0.0.1:{port}";
         }
-        
+
         return protocol == Protocol.Tcp
             ? $"{_iggyServerHost}:8090"
             : $"http://{_iggyServerHost}:3000";
-        
+
     }
 
     public static IEnumerable<Func<Protocol>> ProtocolData()

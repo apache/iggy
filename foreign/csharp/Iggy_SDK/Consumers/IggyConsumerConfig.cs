@@ -157,5 +157,5 @@ public class IggyConsumerConfig
     /// This property is optional and can be null. If null, reconnection will be disabled.
     /// </summary>
     public ReconnectionSettings? ReconnectionSettings { get; set; }
-    
+
 }

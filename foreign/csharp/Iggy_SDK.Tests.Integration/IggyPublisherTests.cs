@@ -65,13 +65,13 @@ public class IggyPublisherTests
         await Should.NotThrowAsync(() => publisher.InitAsync());
         await publisher.DisposeAsync();
     }
-    
+
     [Test]
     [SkipHttp]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task InitAsync_NewClient_Should_Initialize_Successfully(Protocol protocol)
     {
-        var client = Fixture.GetIggyAddress(protocol);;
+        var client = Fixture.GetIggyAddress(protocol); ;
 
         var stream = Guid.NewGuid().ToString();
         var topic = Guid.NewGuid().ToString();

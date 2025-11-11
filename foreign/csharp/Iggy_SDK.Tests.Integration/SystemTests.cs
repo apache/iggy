@@ -180,7 +180,7 @@ public class SystemTests
     {
         await Should.NotThrowAsync(Fixture.Clients[protocol].PingAsync());
     }
-    
+
     [Test]
     [DependsOn(nameof(Ping_Should_Pong))]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]

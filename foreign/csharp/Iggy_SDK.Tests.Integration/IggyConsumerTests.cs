@@ -82,7 +82,7 @@ public class IggyConsumerTests
         await Should.NotThrowAsync(() => consumer.InitAsync());
         await consumer.DisposeAsync();
     }
-    
+
     [Test]
     [SkipHttp]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
@@ -91,10 +91,10 @@ public class IggyConsumerTests
         var client = protocol == Protocol.Tcp
             ? await Fixture.CreateTcpClient()
             : await Fixture.CreateHttpClient();
-        
+
         var testStream = await CreateTestStreamWithMessages(client, protocol);
-        
-        var clientAddress = Fixture.GetIggyAddress(protocol);;
+
+        var clientAddress = Fixture.GetIggyAddress(protocol); ;
 
         var consumer = IggyConsumerBuilder
             .Create(Identifier.String(testStream.StreamId),

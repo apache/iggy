@@ -902,10 +902,10 @@ internal static class BinaryMapper
         var nameLength = BinaryPrimitives.ReadUInt32LittleEndian(payload[..4]);
         var clusterName = Encoding.UTF8.GetString(payload[4..(4 + (int)nameLength)]);
         var position = 4 + (int)nameLength;
-        
-        var clusterId =  BinaryPrimitives.ReadUInt32LittleEndian(payload[position..(position + 4)]);
+
+        var clusterId = BinaryPrimitives.ReadUInt32LittleEndian(payload[position..(position + 4)]);
         position += 4;
-        
+
         var protocol = (Protocol)payload[position];
         position += 1;
 
@@ -936,16 +936,16 @@ internal static class BinaryMapper
 
         var nameLength = BinaryPrimitives.ReadUInt32LittleEndian(payload[position..(position + 4)]);
         position += 4;
-        
+
         var name = Encoding.UTF8.GetString(payload[position..(position + (int)nameLength)]);
         position += (int)nameLength;
-        
+
         var addressLength = BinaryPrimitives.ReadUInt32LittleEndian(payload[position..(position + 4)]);
         position += 4;
-        
+
         var address = Encoding.UTF8.GetString(payload[position..(position + (int)addressLength)]);
         position += (int)addressLength;
-        
+
         var role = (ClusterNodeRole)payload[position++];
         var status = (ClusterNodeStatus)payload[position];
 

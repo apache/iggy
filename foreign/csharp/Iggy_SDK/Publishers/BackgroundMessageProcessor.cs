@@ -36,7 +36,7 @@ internal sealed partial class BackgroundMessageProcessor : IAsyncDisposable
     private Task? _backgroundTask;
     private bool _canSend = true;
     private bool _disposed;
-    
+
     /// <summary>
     ///     Gets the channel writer for queuing messages to be sent.
     /// </summary>
@@ -77,15 +77,15 @@ internal sealed partial class BackgroundMessageProcessor : IAsyncDisposable
         var messageChannel = Channel.CreateBounded<Message>(options);
         MessageWriter = messageChannel.Writer;
         MessageReader = messageChannel.Reader;
-        
+
         _client.OnConnectionStateChanged += ClientOnOnConnectionStateChanged;
     }
 
     private void ClientOnOnConnectionStateChanged(object? sender, ConnectionStateChangedEventArgs e)
     {
-        if (e.CurrentState is ConnectionState.Disconnected 
-            or ConnectionState.Connecting 
-            or ConnectionState.Connected 
+        if (e.CurrentState is ConnectionState.Disconnected
+            or ConnectionState.Connecting
+            or ConnectionState.Connected
             or ConnectionState.Authenticating)
         {
             _canSend = false;
@@ -109,7 +109,7 @@ internal sealed partial class BackgroundMessageProcessor : IAsyncDisposable
         }
 
         _client.OnConnectionStateChanged -= ClientOnOnConnectionStateChanged;
-        
+
         await _cancellationTokenSource.CancelAsync();
 
         if (_backgroundTask != null)
@@ -185,7 +185,7 @@ internal sealed partial class BackgroundMessageProcessor : IAsyncDisposable
 
                     continue;
                 }
-                
+
                 while (messageBatch.Count < _config.BackgroundBatchSize &&
                        MessageReader.TryRead(out var message))
                 {

@@ -50,6 +50,6 @@ public class ClusterNode
     internal int GetSize()
     {
         // id, name length, name, address length, address, role, status
-        return 4 + 4 + Name.Length + 4 + Address.Length + 1 + 1; 
+        return 4 + 4 + Name.Length + 4 + Address.Length + 1 + 1;
     }
 }

@@ -115,10 +115,14 @@ public partial class IggyConsumer
         Level = LogLevel.Trace,
         Message = "Waiting for {Remaining} milliseconds before polling messages")]
     private partial void LogWaitingBeforePolling(long remaining);
-    
-    [LoggerMessage(LogLevel.Warning, "PartitionId is ignored when ConsumerType is ConsumerGroup")]
+
+    [LoggerMessage(EventId = 301,
+        Level = LogLevel.Warning,
+        Message = "PartitionId is ignored when ConsumerType is ConsumerGroup")]
     partial void LogPartitionIdIsIgnoredWhenConsumerTypeIsConsumerGroup();
 
-    [LoggerMessage(LogLevel.Information, "Rejoining consumer group {ConsumerGroupName} after reconnection")]
+    [LoggerMessage(EventId = 106,
+        Level = LogLevel.Information,
+        Message = "Rejoining consumer group {ConsumerGroupName} after reconnection")]
     partial void LogRejoiningConsumerGroupConsumerGroupNameAfterReconnection(string consumerGroupName);
 }

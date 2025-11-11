@@ -59,7 +59,11 @@ public class HttpMessageStream : IIggyClient
     /// <summary>
     ///     HTTP client does not support connection state changes, so this event is never fired.
     /// </summary>
-    public event EventHandler<ConnectionStateChangedEventArgs>? OnConnectionStateChanged;
+    public event EventHandler<ConnectionStateChangedEventArgs>? OnConnectionStateChanged
+    {
+        add { }
+        remove { }
+    }
 
     public async Task<StreamResponse?> CreateStreamAsync(string name, CancellationToken token = default)
     {
@@ -402,7 +406,7 @@ public class HttpMessageStream : IIggyClient
         await HandleResponseAsync(response);
         return null;
     }
-    
+
     /// <summary>
     /// Get cluster metadata
     /// </summary>

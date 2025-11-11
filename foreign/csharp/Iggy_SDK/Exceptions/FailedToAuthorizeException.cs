@@ -23,7 +23,7 @@ public sealed class FailedToAuthorizeException : Exception
         : base("Failed to authorize the operation. Please check your credentials and permissions.")
     {
     }
-    
+
     public FailedToAuthorizeException(string message) : base(message)
     {
     }

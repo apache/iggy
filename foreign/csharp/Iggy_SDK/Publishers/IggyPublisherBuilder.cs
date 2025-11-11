@@ -121,7 +121,7 @@ public class IggyPublisherBuilder
         Config.ReceiveBufferSize = receiveBufferSize;
         Config.SendBufferSize = sendBufferSize;
         Config.ReconnectionSettings = reconnectionSettings;
-        
+
         return this;
     }
 

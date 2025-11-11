@@ -296,7 +296,7 @@ public partial class IggyConsumer : IAsyncDisposable
                 _logger.LogDebug("Consumer group not joined yet. Skipping polling");
                 return;
             }
-            
+
             if (_config.PollingIntervalMs > 0)
             {
                 await WaitBeforePollingAsync(ct);
@@ -425,11 +425,11 @@ public partial class IggyConsumer : IAsyncDisposable
     {
         LogConnectionStateChanged(e.PreviousState, e.CurrentState);
 
-        if(e.CurrentState == ConnectionState.Disconnected)
+        if (e.CurrentState == ConnectionState.Disconnected)
         {
             _joinedConsumerGroup = false;
         }
-        
+
         if (e.CurrentState == ConnectionState.Authenticated && e.PreviousState != ConnectionState.Authenticated)
         {
             if (e.PreviousState is ConnectionState.Disconnected or ConnectionState.Connecting or ConnectionState.Authenticating)

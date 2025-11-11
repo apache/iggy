@@ -506,13 +506,13 @@ public sealed class TcpMessageStream : IIggyClient
         {
             await Task.Delay(_configuration.ReconnectionSettings.InitialDelay, token);
         }
-        
+
         SetConnectionState(ConnectionState.Connecting);
-        
+
         var retryCount = 0;
         var delay = _configuration.ReconnectionSettings.InitialDelay;
         do
-        {   
+        {
             var urlPortSplitter = _configuration.BaseAddress.Split(":");
             if (urlPortSplitter.Length > 2)
             {
@@ -522,7 +522,7 @@ public sealed class TcpMessageStream : IIggyClient
             var socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
             socket.SendBufferSize = _configuration.SendBufferSize;
             socket.ReceiveBufferSize = _configuration.ReceiveBufferSize;
-            
+
             try
             {
                 await socket.ConnectAsync(urlPortSplitter[0], int.Parse(urlPortSplitter[1]), token);
@@ -531,7 +531,7 @@ public sealed class TcpMessageStream : IIggyClient
             {
                 _logger.LogError(e, "Failed to connect");
 
-                if (!_configuration.ReconnectionSettings.Enabled ||  
+                if (!_configuration.ReconnectionSettings.Enabled ||
                     (_configuration.ReconnectionSettings.MaxRetries > 0 && retryCount >= _configuration.ReconnectionSettings.MaxRetries))
                 {
                     SetConnectionState(ConnectionState.Disconnected);
@@ -542,8 +542,8 @@ public sealed class TcpMessageStream : IIggyClient
                 if (_configuration.ReconnectionSettings.UseExponentialBackoff)
                 {
                     delay *= _configuration.ReconnectionSettings.BackoffMultiplier;
-                    
-                    if(delay > _configuration.ReconnectionSettings.MaxDelay)
+
+                    if (delay > _configuration.ReconnectionSettings.MaxDelay)
                     {
                         delay = _configuration.ReconnectionSettings.MaxDelay;
                     }
@@ -559,7 +559,7 @@ public sealed class TcpMessageStream : IIggyClient
             }
             SetConnectionState(ConnectionState.Connected);
             _lastConnectionTime = DateTimeOffset.UtcNow;
-            
+
             _stream = _configuration.TlsSettings.Enabled switch
             {
                 true => CreateSslStreamAndAuthenticate(socket, _configuration.TlsSettings),
@@ -696,7 +696,7 @@ public sealed class TcpMessageStream : IIggyClient
         {
             throw new NotConnectedException();
         }
-        
+
         var message = TcpContracts.LoginUser(userName, password, "0.5.0", "csharp-sdk");
         var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.LOGIN_USER_CODE);
@@ -822,20 +822,20 @@ public sealed class TcpMessageStream : IIggyClient
     {
         var currentTime = DateTimeOffset.UtcNow;
         await _connectionSemaphore.WaitAsync(token);
-            
+
         try
         {
-            if((_state is ConnectionState.Connected or ConnectionState.Authenticated)
+            if ((_state is ConnectionState.Connected or ConnectionState.Authenticated)
                && _lastConnectionTime > currentTime)
             {
                 _logger.LogInformation("Connection already established, sending payload");
                 return await SendRawAsync(payload, token);
             }
-                
+
             SetConnectionState(ConnectionState.Disconnected);
             _logger.LogInformation("Reconnecting to the server");
             await ConnectAsync(token);
-                
+
             _logger.LogInformation("Reconnected to the server");
 
             if (_configuration.ReconnectionSettings.ReauthenticateOnReconnect)
@@ -857,7 +857,7 @@ public sealed class TcpMessageStream : IIggyClient
             }
 
             await Task.Delay(_configuration.ReconnectionSettings.WaitAfterReconnect, token);
-            
+
             return await SendRawAsync(payload, token);
         }
         finally
@@ -868,7 +868,7 @@ public sealed class TcpMessageStream : IIggyClient
 
     private async Task<byte[]> SendRawAsync(byte[] payload, CancellationToken token)
     {
-        if (_state is ConnectionState.Disconnected or ConnectionState.Connecting) 
+        if (_state is ConnectionState.Disconnected or ConnectionState.Connecting)
         {
             throw new NotConnectedException();
         }
