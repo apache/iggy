@@ -498,10 +498,6 @@ public sealed class TcpMessageStream : IIggyClient
             return;
         }
 
-        // ReSharper disable once ConditionIsAlwaysTrueOrFalseAccordingToNullableAPIContract
-        _stream?.Close();
-        _stream?.Dispose();
-
         if (_lastConnectionTime != DateTimeOffset.MinValue)
         {
             await Task.Delay(_configuration.ReconnectionSettings.InitialDelay, token);
@@ -513,22 +509,37 @@ public sealed class TcpMessageStream : IIggyClient
         var delay = _configuration.ReconnectionSettings.InitialDelay;
         do
         {
+            // ReSharper disable once ConditionIsAlwaysTrueOrFalseAccordingToNullableAPIContract
+            _stream?.Close();
+            _stream?.Dispose();
+
             var urlPortSplitter = _configuration.BaseAddress.Split(":");
             if (urlPortSplitter.Length > 2)
             {
                 throw new InvalidBaseAdressException();
             }
 
-            var socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-            socket.SendBufferSize = _configuration.SendBufferSize;
-            socket.ReceiveBufferSize = _configuration.ReceiveBufferSize;
-
-            socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
-            socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveTime, 5);
-
             try
             {
+                var socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+                socket.SendBufferSize = _configuration.SendBufferSize;
+                socket.ReceiveBufferSize = _configuration.ReceiveBufferSize;
+
                 await socket.ConnectAsync(urlPortSplitter[0], int.Parse(urlPortSplitter[1]), token);
+
+                socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
+                socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveTime, 5);
+
+                SetConnectionState(ConnectionState.Connected);
+                _lastConnectionTime = DateTimeOffset.UtcNow;
+
+                _stream = _configuration.TlsSettings.Enabled switch
+                {
+                    true => CreateSslStreamAndAuthenticate(socket, _configuration.TlsSettings),
+                    false => new TcpConnectionStream(new NetworkStream(socket))
+                };
+
+                break;
             }
             catch (Exception e)
             {
@@ -560,20 +571,7 @@ public sealed class TcpMessageStream : IIggyClient
                 }
 
                 await Task.Delay(delay, token);
-
-                continue;
             }
-
-            SetConnectionState(ConnectionState.Connected);
-            _lastConnectionTime = DateTimeOffset.UtcNow;
-
-            _stream = _configuration.TlsSettings.Enabled switch
-            {
-                true => CreateSslStreamAndAuthenticate(socket, _configuration.TlsSettings),
-                false => new TcpConnectionStream(new NetworkStream(socket))
-            };
-
-            break;
         } while (true);
     }
 
