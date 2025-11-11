@@ -4153,7 +4153,7 @@ dependencies = [
 
 [[package]]
 name = "iggy"
-version = "0.8.0-edge.1"
+version = "0.8.0-edge.2"
 dependencies = [
  "async-broadcast",
  "async-dropper",
@@ -4185,7 +4185,7 @@ dependencies = [
 
 [[package]]
 name = "iggy-bench"
-version = "0.3.0-edge.1"
+version = "0.3.0-edge.2"
 dependencies = [
  "async-trait",
  "bench-report",
@@ -4215,7 +4215,7 @@ dependencies = [
 
 [[package]]
 name = "iggy-bench-dashboard-server"
-version = "0.5.0-edge.1"
+version = "0.5.0-edge.2"
 dependencies = [
  "actix-cors",
  "actix-files",
@@ -4242,7 +4242,7 @@ dependencies = [
 
 [[package]]
 name = "iggy-cli"
-version = "0.10.0-edge.1"
+version = "0.10.0-edge.2"
 dependencies = [
  "ahash 0.8.12",
  "anyhow",
@@ -4262,7 +4262,7 @@ dependencies = [
 
 [[package]]
 name = "iggy-connectors"
-version = "0.2.0-edge.1"
+version = "0.2.0-edge.2"
 dependencies = [
  "axum",
  "axum-server",
@@ -4293,7 +4293,7 @@ dependencies = [
 
 [[package]]
 name = "iggy-mcp"
-version = "0.2.0-edge.1"
+version = "0.2.0-edge.2"
 dependencies = [
  "axum",
  "axum-server",
@@ -4315,7 +4315,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_binary_protocol"
-version = "0.8.0-edge.1"
+version = "0.8.0-edge.2"
 dependencies = [
  "anyhow",
  "async-broadcast",
@@ -4336,7 +4336,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_common"
-version = "0.8.0-edge.1"
+version = "0.8.0-edge.2"
 dependencies = [
  "aes-gcm",
  "ahash 0.8.12",
@@ -7550,7 +7550,7 @@ dependencies = [
 
 [[package]]
 name = "server"
-version = "0.6.0-edge.1"
+version = "0.6.0-edge.2"
 dependencies = [
  "ahash 0.8.12",
  "anyhow",

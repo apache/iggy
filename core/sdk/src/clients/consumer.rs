@@ -502,8 +502,8 @@ impl IggyConsumer {
             warn!("Auto join consumer group is disabled");
             return Ok(());
         }
-        tracing::error!(
-            "creating consumer group for stream_id: {:?}, topic_id: {:?}, consumer: {:?}",
+        tracing::debug!(
+            "Initializing consumer group for stream ID: {}, topic ID: {}, consumer ID: {}",
             self.stream_id,
             self.topic_id,
             self.consumer
