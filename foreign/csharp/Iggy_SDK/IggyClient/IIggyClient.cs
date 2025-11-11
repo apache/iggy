@@ -20,5 +20,10 @@ namespace Apache.Iggy.IggyClient;
 public interface IIggyClient : IIggyPublisher, IIggyStream, IIggyTopic, IIggyConsumer, IIggyOffset, IIggyConsumerGroup,
     IIggySystem, IIggyPartition, IIggyUsers, IIggyPersonalAccessToken, IDisposable
 {
-    bool IsConnected { get; }
+    /// <summary>
+    ///     Fired whenever the client connection state changes.
+    ///     Monitors all state transitions: Disconnected, Connecting, Connected, Authenticating, Authenticated.
+    ///     Includes previous and current state information with timestamps, allowing subscribers to react to all connection state transitions.
+    /// </summary>
+    event EventHandler<ConnectionStateChangedEventArgs>? OnConnectionStateChanged;
 }

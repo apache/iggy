@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using Apache.Iggy.Enums;
 using Microsoft.Extensions.Logging;
 
 namespace Apache.Iggy.Consumers;
@@ -90,6 +91,16 @@ public partial class IggyConsumer
         Message = "Failed to poll messages")]
     private partial void LogFailedToPollMessages(Exception exception);
 
+    [LoggerMessage(EventId = 404,
+        Level = LogLevel.Error,
+        Message = "Failed to rejoin consumer group '{GroupName}' after reconnection")]
+    private partial void LogFailedToRejoinConsumerGroup(Exception exception, string groupName);
+
+    [LoggerMessage(EventId = 105,
+        Level = LogLevel.Information,
+        Message = "Client connection state changed: {PreviousState} -> {CurrentState}")]
+    private partial void LogConnectionStateChanged(ConnectionState previousState, ConnectionState currentState);
+
     [LoggerMessage(EventId = 300,
         Level = LogLevel.Warning,
         Message = "Returned monotonic time went backwards, now < lastPolledAt: ({Now} < {LastPolledAt})")]
@@ -104,4 +115,10 @@ public partial class IggyConsumer
         Level = LogLevel.Trace,
         Message = "Waiting for {Remaining} milliseconds before polling messages")]
     private partial void LogWaitingBeforePolling(long remaining);
+    
+    [LoggerMessage(LogLevel.Warning, "PartitionId is ignored when ConsumerType is ConsumerGroup")]
+    partial void LogPartitionIdIsIgnoredWhenConsumerTypeIsConsumerGroup();
+
+    [LoggerMessage(LogLevel.Information, "Rejoining consumer group {ConsumerGroupName} after reconnection")]
+    partial void LogRejoiningConsumerGroupConsumerGroupNameAfterReconnection(string consumerGroupName);
 }

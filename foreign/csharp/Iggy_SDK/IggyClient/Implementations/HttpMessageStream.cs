@@ -56,7 +56,10 @@ public class HttpMessageStream : IIggyClient
         };
     }
 
-    public bool IsConnected => true;
+    /// <summary>
+    ///     HTTP client does not support connection state changes, so this event is never fired.
+    /// </summary>
+    public event EventHandler<ConnectionStateChangedEventArgs>? OnConnectionStateChanged;
 
     public async Task<StreamResponse?> CreateStreamAsync(string name, CancellationToken token = default)
     {

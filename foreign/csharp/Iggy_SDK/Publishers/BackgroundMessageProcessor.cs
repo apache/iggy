@@ -16,6 +16,7 @@
 // under the License.
 
 using System.Threading.Channels;
+using Apache.Iggy.Enums;
 using Apache.Iggy.IggyClient;
 using Apache.Iggy.Messages;
 using Microsoft.Extensions.Logging;
@@ -32,10 +33,10 @@ internal sealed partial class BackgroundMessageProcessor : IAsyncDisposable
     private readonly IIggyClient _client;
     private readonly IggyPublisherConfig _config;
     private readonly ILogger<BackgroundMessageProcessor> _logger;
-    private readonly Channel<Message> _messageChannel;
     private Task? _backgroundTask;
+    private bool _canSend = true;
     private bool _disposed;
-
+    
     /// <summary>
     ///     Gets the channel writer for queuing messages to be sent.
     /// </summary>
@@ -73,9 +74,27 @@ internal sealed partial class BackgroundMessageProcessor : IAsyncDisposable
             SingleWriter = false
         };
 
-        _messageChannel = Channel.CreateBounded<Message>(options);
-        MessageWriter = _messageChannel.Writer;
-        MessageReader = _messageChannel.Reader;
+        var messageChannel = Channel.CreateBounded<Message>(options);
+        MessageWriter = messageChannel.Writer;
+        MessageReader = messageChannel.Reader;
+        
+        _client.OnConnectionStateChanged += ClientOnOnConnectionStateChanged;
+    }
+
+    private void ClientOnOnConnectionStateChanged(object? sender, ConnectionStateChangedEventArgs e)
+    {
+        if (e.CurrentState is ConnectionState.Disconnected 
+            or ConnectionState.Connecting 
+            or ConnectionState.Connected 
+            or ConnectionState.Authenticating)
+        {
+            _canSend = false;
+        }
+
+        if (e.CurrentState == ConnectionState.Authenticated)
+        {
+            _canSend = true;
+        }
     }
 
     /// <summary>
@@ -89,6 +108,8 @@ internal sealed partial class BackgroundMessageProcessor : IAsyncDisposable
             return;
         }
 
+        _client.OnConnectionStateChanged -= ClientOnOnConnectionStateChanged;
+        
         await _cancellationTokenSource.CancelAsync();
 
         if (_backgroundTask != null)
@@ -154,7 +175,7 @@ internal sealed partial class BackgroundMessageProcessor : IAsyncDisposable
         {
             while (!ct.IsCancellationRequested)
             {
-                if (!_client.IsConnected)
+                if (!_canSend)
                 {
                     LogClientIsDisconnected();
                     if (!await timer.WaitForNextTickAsync(ct))

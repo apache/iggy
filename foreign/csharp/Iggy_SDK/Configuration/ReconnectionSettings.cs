@@ -40,6 +40,14 @@ public sealed class ReconnectionSettings
     public TimeSpan MaxDelay { get; set; } = TimeSpan.FromSeconds(30);
 
     /// <summary>
+    /// Specifies the duration to wait after a successful reconnection before resuming normal operations. Default is 1 second.
+    /// </summary>
+    /// <remarks>
+    /// This can help rejoin to e.g., a consumer group.
+    /// </remarks>
+    public TimeSpan WaitAfterReconnect { get; set; } = TimeSpan.FromSeconds(1);
+    
+    /// <summary>
     /// Use exponential backoff for reconnection delays
     /// </summary>
     public bool UseExponentialBackoff { get; set; } = true;

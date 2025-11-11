@@ -42,6 +42,7 @@ public partial class IggyConsumer : IAsyncDisposable
     private bool _disposed;
     private bool _isInitialized;
     private long _lastPolledAtMs;
+    private bool _joinedConsumerGroup;
 
     /// <summary>
     ///     Initializes a new instance of the <see cref="IggyConsumer" /> class
@@ -66,6 +67,11 @@ public partial class IggyConsumer : IAsyncDisposable
         if (_disposed)
         {
             return;
+        }
+
+        if (_isInitialized)
+        {
+            _client.OnConnectionStateChanged -= OnClientConnectionStateChanged;
         }
 
         if (!string.IsNullOrEmpty(_consumerGroupName) && _isInitialized)
@@ -116,13 +122,13 @@ public partial class IggyConsumer : IAsyncDisposable
         {
             return;
         }
-        
+
         if (_config.Consumer.Type == ConsumerType.ConsumerGroup && _config.PartitionId != null)
         {
-            _logger.LogWarning("PartitionId is ignored when ConsumerType is ConsumerGroup");
+            LogPartitionIdIsIgnoredWhenConsumerTypeIsConsumerGroup();
             _config.PartitionId = null;
         }
-        
+
         await _client.ConnectAsync(ct);
 
         if (_config.CreateIggyClient)
@@ -131,6 +137,9 @@ public partial class IggyConsumer : IAsyncDisposable
         }
 
         await InitializeConsumerGroupAsync(ct);
+
+        // Subscribe to connection state change events to rejoin consumer group when reconnected
+        _client.OnConnectionStateChanged += OnClientConnectionStateChanged;
 
         _isInitialized = true;
     }
@@ -161,8 +170,7 @@ public partial class IggyConsumer : IAsyncDisposable
 
             if (_config.AutoCommitMode == AutoCommitMode.AfterReceive)
             {
-                await _client.StoreOffsetAsync(_config.Consumer, _config.StreamId, _config.TopicId,
-                    message.CurrentOffset, message.PartitionId, ct);
+                await StoreOffsetAsync(message.CurrentOffset, message.PartitionId, ct);
             }
         } while (!ct.IsCancellationRequested);
     }
@@ -193,10 +201,11 @@ public partial class IggyConsumer : IAsyncDisposable
     /// <summary>
     ///     Initializes consumer group if configured, creating and joining as needed
     /// </summary>
-    private async Task InitializeConsumerGroupAsync(CancellationToken ct)
+    private async Task InitializeConsumerGroupAsync(CancellationToken ct = default)
     {
         if (_config.Consumer.Type == ConsumerType.Consumer)
         {
+            _joinedConsumerGroup = true;
             return;
         }
 
@@ -237,6 +246,7 @@ public partial class IggyConsumer : IAsyncDisposable
                 await _client.JoinConsumerGroupAsync(_config.StreamId, _config.TopicId,
                     Identifier.String(_consumerGroupName), ct);
 
+                _joinedConsumerGroup = true;
                 LogConsumerGroupJoined(_consumerGroupName);
             }
         }
@@ -281,6 +291,12 @@ public partial class IggyConsumer : IAsyncDisposable
     {
         try
         {
+            if (!_joinedConsumerGroup)
+            {
+                _logger.LogDebug("Consumer group not joined yet. Skipping polling");
+                return;
+            }
+            
             if (_config.PollingIntervalMs > 0)
             {
                 await WaitBeforePollingAsync(ct);
@@ -398,5 +414,50 @@ public partial class IggyConsumer : IAsyncDisposable
         }
 
         Interlocked.Exchange(ref _lastPolledAtMs, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+    }
+
+    /// <summary>
+    ///     Handles connection state changes from the client.
+    ///     Logs state transitions for diagnostics and debugging.
+    ///     Triggers consumer group rejoin when the client reaches Authenticated state after a reconnection.
+    /// </summary>
+    private void OnClientConnectionStateChanged(object? sender, ConnectionStateChangedEventArgs e)
+    {
+        LogConnectionStateChanged(e.PreviousState, e.CurrentState);
+
+        if(e.CurrentState == ConnectionState.Disconnected)
+        {
+            _joinedConsumerGroup = false;
+        }
+        
+        if (e.CurrentState == ConnectionState.Authenticated && e.PreviousState != ConnectionState.Authenticated)
+        {
+            if (e.PreviousState is ConnectionState.Disconnected or ConnectionState.Connecting or ConnectionState.Authenticating)
+            {
+                _ = Task.Run(RejoinConsumerGroupOnReconnectionAsync);
+            }
+        }
+    }
+
+    /// <summary>
+    ///     Asynchronously rejoins the consumer group after a client reconnection.
+    ///     This restores the consumer group membership that was lost during the connection failure.
+    /// </summary>
+    private async Task RejoinConsumerGroupOnReconnectionAsync()
+    {
+        if (string.IsNullOrEmpty(_consumerGroupName))
+        {
+            return;
+        }
+
+        try
+        {
+            await InitializeConsumerGroupAsync();
+        }
+        catch (Exception ex)
+        {
+            LogFailedToRejoinConsumerGroup(ex, _consumerGroupName);
+            OnPollingError?.Invoke(this, new ConsumerErrorEventArgs(ex, "Failed to rejoin consumer group after reconnection"));
+        }
     }
 }
