@@ -257,9 +257,9 @@ public class IggyPublisherConfig
     public double RetryBackoffMultiplier { get; set; } = 2.0;
 
     /// <summary>
-    /// Gets or sets the reconnection settings to control the behavior of the iggy client
-    /// in case of a disconnect or network failure.
-    /// This property is optional and can be null. If null, reconnection will be disabled.
+    ///     Gets or sets the reconnection settings to control the behavior of the iggy client
+    ///     in case of a disconnect or network failure.
+    ///     This property is optional and can be null. If null, reconnection will be disabled.
     /// </summary>
     public ReconnectionSettings? ReconnectionSettings { get; set; }
 }

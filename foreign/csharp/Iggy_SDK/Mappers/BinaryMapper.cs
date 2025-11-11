@@ -17,7 +17,6 @@
 
 using System.Buffers;
 using System.Buffers.Binary;
-using System.Reflection.PortableExecutable;
 using System.Text;
 using Apache.Iggy.Contracts;
 using Apache.Iggy.Contracts.Auth;
@@ -920,7 +919,7 @@ internal static class BinaryMapper
             position += node.GetSize();
         }
 
-        return new ClusterMetadata()
+        return new ClusterMetadata
         {
             Id = clusterId,
             Name = clusterName,
@@ -949,7 +948,7 @@ internal static class BinaryMapper
         var role = (ClusterNodeRole)payload[position++];
         var status = (ClusterNodeStatus)payload[position];
 
-        return new ClusterNode()
+        return new ClusterNode
         {
             Id = id,
             Name = name,

@@ -17,6 +17,9 @@
 
 namespace Apache.Iggy.Exceptions;
 
+/// <summary>
+/// Represents an exception that is thrown when the client is not connected to the server.
+/// </summary>
 public sealed class NotConnectedException : Exception
 {
     internal NotConnectedException() : base("Iggy client is not connected to the server")

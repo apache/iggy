@@ -17,6 +17,9 @@
 
 namespace Apache.Iggy.Exceptions;
 
+/// <summary>
+/// Represents an exception that is thrown when zero bytes are received from the server.
+/// </summary>
 public sealed class IggyZeroBytesException : Exception
 {
     internal IggyZeroBytesException() : base("Received zero bytes from the server")

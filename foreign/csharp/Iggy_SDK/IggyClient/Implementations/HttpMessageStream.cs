@@ -153,7 +153,7 @@ public class HttpMessageStream : IIggyClient
             MaxTopicSize = maxTopicSize,
             MessageExpiry = messageExpiry,
             PartitionsCount = partitionsCount,
-            ReplicationFactor = replicationFactor,
+            ReplicationFactor = replicationFactor
         }, _jsonSerializerOptions);
         var data = new StringContent(json, Encoding.UTF8, "application/json");
 
@@ -408,7 +408,7 @@ public class HttpMessageStream : IIggyClient
     }
 
     /// <summary>
-    /// Get cluster metadata
+    ///     Get cluster metadata
     /// </summary>
     /// <param name="token"></param>
     /// <returns>Cluster information</returns>

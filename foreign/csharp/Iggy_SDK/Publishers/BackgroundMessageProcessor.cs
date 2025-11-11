@@ -74,27 +74,11 @@ internal sealed partial class BackgroundMessageProcessor : IAsyncDisposable
             SingleWriter = false
         };
 
-        var messageChannel = Channel.CreateBounded<Message>(options);
+        Channel<Message> messageChannel = Channel.CreateBounded<Message>(options);
         MessageWriter = messageChannel.Writer;
         MessageReader = messageChannel.Reader;
 
         _client.OnConnectionStateChanged += ClientOnOnConnectionStateChanged;
-    }
-
-    private void ClientOnOnConnectionStateChanged(object? sender, ConnectionStateChangedEventArgs e)
-    {
-        if (e.CurrentState is ConnectionState.Disconnected
-            or ConnectionState.Connecting
-            or ConnectionState.Connected
-            or ConnectionState.Authenticating)
-        {
-            _canSend = false;
-        }
-
-        if (e.CurrentState == ConnectionState.Authenticated)
-        {
-            _canSend = true;
-        }
     }
 
     /// <summary>
@@ -280,8 +264,7 @@ internal sealed partial class BackgroundMessageProcessor : IAsyncDisposable
                     else
                     {
                         // Ensure we don't exceed TimeSpan.MaxValue
-                        delay = TimeSpan.FromMilliseconds(
-                            Math.Min(nextDelayMs, TimeSpan.MaxValue.TotalMilliseconds));
+                        delay = TimeSpan.FromMilliseconds(Math.Min(nextDelayMs, TimeSpan.MaxValue.TotalMilliseconds));
                     }
                 }
             }
@@ -290,5 +273,21 @@ internal sealed partial class BackgroundMessageProcessor : IAsyncDisposable
         LogFailedToSendBatchAfterRetries(lastException!, messageBatch.Count, _config.MaxRetryAttempts + 1);
         OnMessageBatchFailed?.Invoke(this,
             new MessageBatchFailedEventArgs(lastException!, messageBatch.ToArray(), _config.MaxRetryAttempts));
+    }
+
+    private void ClientOnOnConnectionStateChanged(object? sender, ConnectionStateChangedEventArgs e)
+    {
+        if (e.CurrentState is ConnectionState.Disconnected
+            or ConnectionState.Connecting
+            or ConnectionState.Connected
+            or ConnectionState.Authenticating)
+        {
+            _canSend = false;
+        }
+
+        if (e.CurrentState == ConnectionState.Authenticated)
+        {
+            _canSend = true;
+        }
     }
 }

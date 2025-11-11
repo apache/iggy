@@ -290,7 +290,7 @@ public class IggyPublisherBuilder
                 BaseAddress = Config.Address,
                 ReceiveBufferSize = Config.ReceiveBufferSize,
                 SendBufferSize = Config.SendBufferSize,
-                ReconnectionSettings = Config.ReconnectionSettings ?? new(),
+                ReconnectionSettings = Config.ReconnectionSettings ?? new ReconnectionSettings(),
                 LoggerFactory = Config.LoggerFactory ?? NullLoggerFactory.Instance
             });
         }
@@ -339,8 +339,7 @@ public class IggyPublisherBuilder
         {
             if (IggyClient == null)
             {
-                throw new InvalidOperationException(
-                    "IggyClient must be provided when CreateIggyClient is false.");
+                throw new InvalidOperationException("IggyClient must be provided when CreateIggyClient is false.");
             }
         }
 
@@ -421,8 +420,7 @@ public class IggyPublisherBuilder
 
             if (Config.InitialRetryDelay > Config.MaxRetryDelay)
             {
-                throw new InvalidOperationException(
-                    "InitialRetryDelay must be less than or equal to MaxRetryDelay.");
+                throw new InvalidOperationException("InitialRetryDelay must be less than or equal to MaxRetryDelay.");
             }
         }
     }

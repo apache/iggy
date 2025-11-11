@@ -39,12 +39,12 @@ namespace Apache.Iggy.IggyClient.Implementations;
 public sealed class TcpMessageStream : IIggyClient
 {
     private readonly IggyClientConfigurator _configuration;
+    private readonly SemaphoreSlim _connectionSemaphore;
     private readonly ILogger<TcpMessageStream> _logger;
     private readonly SemaphoreSlim _sendingSemaphore;
-    private readonly SemaphoreSlim _connectionSemaphore;
+    private DateTimeOffset _lastConnectionTime;
     private ConnectionState _state = ConnectionState.Disconnected;
     private TcpConnectionStream _stream = null!;
-    private DateTimeOffset _lastConnectionTime;
 
     internal TcpMessageStream(IggyClientConfigurator configuration, ILoggerFactory loggerFactory)
     {
@@ -532,7 +532,8 @@ public sealed class TcpMessageStream : IIggyClient
                 _logger.LogError(e, "Failed to connect");
 
                 if (!_configuration.ReconnectionSettings.Enabled ||
-                    (_configuration.ReconnectionSettings.MaxRetries > 0 && retryCount >= _configuration.ReconnectionSettings.MaxRetries))
+                    (_configuration.ReconnectionSettings.MaxRetries > 0 &&
+                     retryCount >= _configuration.ReconnectionSettings.MaxRetries))
                 {
                     SetConnectionState(ConnectionState.Disconnected);
                     throw;
@@ -551,12 +552,15 @@ public sealed class TcpMessageStream : IIggyClient
 
                 if (_logger.IsEnabled(LogLevel.Information))
                 {
-                    _logger.LogInformation("Retrying connection attempt {RetryCount} with delay {Delay}", retryCount, delay);
+                    _logger.LogInformation("Retrying connection attempt {RetryCount} with delay {Delay}", retryCount,
+                        delay);
                 }
+
                 await Task.Delay(delay, token);
 
                 continue;
             }
+
             SetConnectionState(ConnectionState.Connected);
             _lastConnectionTime = DateTimeOffset.UtcNow;
 
@@ -825,8 +829,8 @@ public sealed class TcpMessageStream : IIggyClient
 
         try
         {
-            if ((_state is ConnectionState.Connected or ConnectionState.Authenticated)
-               && _lastConnectionTime > currentTime)
+            if (_state is ConnectionState.Connected or ConnectionState.Authenticated
+                && _lastConnectionTime > currentTime)
             {
                 _logger.LogInformation("Connection already established, sending payload");
                 return await SendRawAsync(payload, token);
@@ -885,7 +889,8 @@ public sealed class TcpMessageStream : IIggyClient
             while (totalRead < BufferSizes.EXPECTED_RESPONSE_SIZE)
             {
                 var readBytes
-                    = await _stream.ReadAsync(buffer.AsMemory(totalRead, BufferSizes.EXPECTED_RESPONSE_SIZE - totalRead),
+                    = await _stream.ReadAsync(
+                        buffer.AsMemory(totalRead, BufferSizes.EXPECTED_RESPONSE_SIZE - totalRead),
                         token);
                 if (readBytes == 0)
                 {

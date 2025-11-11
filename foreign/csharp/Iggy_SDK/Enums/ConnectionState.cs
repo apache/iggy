@@ -17,11 +17,34 @@
 
 namespace Apache.Iggy.Enums;
 
+/// <summary>
+///     Represents connection state to iggy server.
+/// </summary>
 public enum ConnectionState
 {
+    /// <summary>
+    ///     Represents a state where the connection to the target server has been lost or terminated.
+    /// </summary>
     Disconnected,
+
+    /// <summary>
+    ///     Indicates a state where the connection to the server is in the process of being established.
+    /// </summary>
     Connecting,
+
+    /// <summary>
+    ///     Represents a state where the connection to the server has been successfully established.
+    /// </summary>
     Connected,
+
+    /// <summary>
+    ///     Represents a state where the client is in the process of authenticating with the server.
+    /// </summary>
     Authenticating,
+
+    /// <summary>
+    ///     Represents a state where the client has successfully authenticated with the target server after establishing a
+    ///     connection.
+    /// </summary>
     Authenticated
 }

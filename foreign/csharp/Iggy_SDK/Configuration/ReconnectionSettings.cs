@@ -20,45 +20,46 @@ namespace Apache.Iggy.Configuration;
 public sealed class ReconnectionSettings
 {
     /// <summary>
-    /// Enable automatic reconnection when connection is lost
+    ///     Enable automatic reconnection when connection is lost
     /// </summary>
     public bool Enabled { get; set; } = false;
 
     /// <summary>
-    /// Maximum number of reconnection attempts (0 = infinite)
+    ///     Maximum number of reconnection attempts (0 = infinite)
     /// </summary>
     public int MaxRetries { get; set; } = 3;
 
     /// <summary>
-    /// Initial delay before first reconnection attempt
+    ///     Initial delay before first reconnection attempt
     /// </summary>
     public TimeSpan InitialDelay { get; set; } = TimeSpan.FromSeconds(5);
 
     /// <summary>
-    /// Maximum delay between reconnection attempts
+    ///     Maximum delay between reconnection attempts
     /// </summary>
     public TimeSpan MaxDelay { get; set; } = TimeSpan.FromSeconds(30);
 
     /// <summary>
-    /// Specifies the duration to wait after a successful reconnection before resuming normal operations. Default is 1 second.
+    ///     Specifies the duration to wait after a successful reconnection before resuming normal operations. Default is 1
+    ///     second.
     /// </summary>
     /// <remarks>
-    /// This can help rejoin to e.g., a consumer group.
+    ///     This can help rejoin to e.g., a consumer group.
     /// </remarks>
     public TimeSpan WaitAfterReconnect { get; set; } = TimeSpan.FromSeconds(1);
 
     /// <summary>
-    /// Use exponential backoff for reconnection delays
+    ///     Use exponential backoff for reconnection delays
     /// </summary>
     public bool UseExponentialBackoff { get; set; } = true;
 
     /// <summary>
-    /// Multiplier for exponential backoff (default: 2.0)
+    ///     Multiplier for exponential backoff (default: 2.0)
     /// </summary>
     public double BackoffMultiplier { get; set; } = 2.0;
 
     /// <summary>
-    /// Whether to re-authenticate after reconnection (if previously authenticated)
+    ///     Whether to re-authenticate after reconnection (if previously authenticated)
     /// </summary>
     public bool ReauthenticateOnReconnect { get; set; } = true;
 

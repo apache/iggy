@@ -16,19 +16,27 @@
 // under the License.
 
 using System.ComponentModel;
-using System.Net.Security;
-using System.Net.Sockets;
 using Apache.Iggy.Configuration;
-using Apache.Iggy.ConnectionStream;
 using Apache.Iggy.Enums;
-using Apache.Iggy.Exceptions;
 using Apache.Iggy.IggyClient;
 using Apache.Iggy.IggyClient.Implementations;
 
 namespace Apache.Iggy.Factory;
 
+/// <summary>
+/// A static factory for creating instances of <see cref="IIggyClient"/>.
+/// </summary>
+/// <remarks>
+/// The factory determines the appropriate implementation of the <see cref="IIggyClient"/> based on the specified protocol in the configurator options.
+/// </remarks>
 public static class IggyClientFactory
 {
+    /// <summary>
+    /// Creates and returns an instance of <see cref="IIggyClient"/> based on the provided configuration options.
+    /// </summary>
+    /// <param name="options">The configuration options for creating the Iggy client, including protocol, base address, and buffer sizes.</param>
+    /// <returns>An instance of <see cref="IIggyClient"/> configured according to the specified options.</returns>
+    /// <exception cref="InvalidEnumArgumentException">Thrown when the specified protocol in <paramref name="options"/> is not supported.</exception>
     public static IIggyClient CreateClient(IggyClientConfigurator options)
     {
         return options.Protocol switch

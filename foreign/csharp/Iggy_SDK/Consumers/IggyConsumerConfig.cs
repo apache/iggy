@@ -152,10 +152,9 @@ public class IggyConsumerConfig
     public ILoggerFactory? LoggerFactory { get; set; }
 
     /// <summary>
-    /// Gets or sets the reconnection settings to control the behavior of the iggy client
-    /// in case of a disconnect or network failure.
-    /// This property is optional and can be null. If null, reconnection will be disabled.
+    ///     Gets or sets the reconnection settings to control the behavior of the iggy client
+    ///     in case of a disconnect or network failure.
+    ///     This property is optional and can be null. If null, reconnection will be disabled.
     /// </summary>
     public ReconnectionSettings? ReconnectionSettings { get; set; }
-
 }

@@ -17,6 +17,9 @@
 
 namespace Apache.Iggy.Exceptions;
 
+/// <summary>
+/// Represents an exception that is thrown when an authorization attempt fails.
+/// </summary>
 public sealed class FailedToAuthorizeException : Exception
 {
     public FailedToAuthorizeException()
