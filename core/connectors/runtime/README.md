@@ -23,6 +23,11 @@ username = "iggy"
 password = "iggy"
 token = "" # Personal Access Token (PAT) can be used instead of username and password
 
+[iggy.tls] # Optional TLS configuration for Iggy TCP connection
+enabled = false
+ca_file = "core/certs/iggy_cert.pem"
+domain = "" # Optional domain for TLS connection
+
 [state]
 path = "local_state"
 

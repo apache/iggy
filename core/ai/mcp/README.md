@@ -18,6 +18,11 @@ password = "iggy"
 # token = "secret" # Personal Access Token (PAT) can be used instead of username and password
 # consumer = "iggy-mcp" # Optional consumer name
 
+[iggy.tls] # Optional TLS configuration for Iggy TCP connection
+enabled = false
+ca_file = "core/certs/iggy_cert.pem"
+domain = "" # Optional domain for TLS connection
+
 [http] # Optional HTTP API configuration
 address = "127.0.0.1:8082"
 path = "/mcp"

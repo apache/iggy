@@ -1,4 +1,5 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
  * regarding copyright ownership.  The ASF licenses this file
@@ -38,6 +39,8 @@ pub enum RuntimeError {
     IggyError(#[from] iggy::prelude::IggyError),
     #[error("Missing Iggy credentials")]
     MissingIggyCredentials,
+    #[error("Missing TLS certificate file")]
+    MissingTlsCertificateFile,
     #[error("JSON error")]
     JsonError(#[from] serde_json::Error),
     #[error("Sink not found with key: {0}")]
