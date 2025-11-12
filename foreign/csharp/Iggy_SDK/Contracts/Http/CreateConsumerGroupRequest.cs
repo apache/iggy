@@ -17,4 +17,4 @@
 
 namespace Apache.Iggy.Contracts.Http;
 
-internal sealed record CreateConsumerGroupRequest(string Name, uint? ConsumerGroupId);
+internal sealed record CreateConsumerGroupRequest(string Name);

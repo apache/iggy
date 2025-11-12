@@ -24,7 +24,7 @@ import type { Handle } from '@sveltejs/kit';
 import { sequence } from '@sveltejs/kit/hooks';
 import { redirect } from '@sveltejs/kit';
 
-console.log(`IggyAPI URL: ${env.PUBLIC_IGGY_API_URL}`);
+console.log(`Iggy API URL: ${env.PUBLIC_IGGY_API_URL}`);
 
 const accessTokenOkRedirects = [
   {

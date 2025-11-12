@@ -71,7 +71,6 @@ impl<B: BinaryClient> ConsumerGroupClient for B {
         stream_id: &Identifier,
         topic_id: &Identifier,
         name: &str,
-        group_id: Option<u32>,
     ) -> Result<ConsumerGroupDetails, IggyError> {
         fail_if_not_authenticated(self).await?;
         let response = self
@@ -79,7 +78,6 @@ impl<B: BinaryClient> ConsumerGroupClient for B {
                 stream_id: stream_id.clone(),
                 topic_id: topic_id.clone(),
                 name: name.to_string(),
-                group_id,
             })
             .await?;
         mapper::map_consumer_group(response)

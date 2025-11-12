@@ -221,9 +221,9 @@ func givenNoStreams(ctx context.Context) error {
 	return err
 }
 
-func whenCreateStream(ctx context.Context, streamID uint32, streamName string) error {
+func whenCreateStream(ctx context.Context, streamName string) error {
 	c := getBasicMessagingCtx(ctx)
-	stream, err := c.client.CreateStream(streamName, &streamID)
+    stream, err := c.client.CreateStream(streamName)
 	if err != nil {
 		return fmt.Errorf("failed to create stream: %w", err)
 	}
@@ -239,16 +239,11 @@ func thenStreamCreatedSuccessfully(ctx context.Context) error {
 	return nil
 }
 
-func thenStreamHasIDAndName(
-	ctx context.Context,
-	expectedID uint32,
-	expectedName string) error {
+func thenStreamHasName(
+    ctx context.Context,
+    expectedName string) error {
 	c := getBasicMessagingCtx(ctx)
-	streamID := *c.lastStreamID
 	streamName := *c.lastStreamName
-	if streamID != expectedID {
-		return fmt.Errorf("expected stream ID %d, got %d", expectedID, streamID)
-	}
 	if streamName != expectedName {
 		return fmt.Errorf("expected stream name %s, got %s", expectedName, streamName)
 	}
@@ -256,23 +251,20 @@ func thenStreamHasIDAndName(
 }
 
 func whenCreateTopic(
-	ctx context.Context,
-	topicID uint32,
-	topicName string,
-	streamID uint32,
-	partitionsCount uint32) error {
+    ctx context.Context,
+    topicName string,
+    streamID uint32,
+    partitionsCount uint32) error {
 	c := getBasicMessagingCtx(ctx)
 	streamIdentifier, _ := iggcon.NewIdentifier(streamID)
-	uint32TopicID := topicID
-	topic, err := c.client.CreateTopic(
+    topic, err := c.client.CreateTopic(
 		streamIdentifier,
 		topicName,
 		partitionsCount,
 		iggcon.CompressionAlgorithmNone,
 		iggcon.IggyExpiryNeverExpire,
-		0,
-		nil,
-		&uint32TopicID,
+        0,
+        nil,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to create topic: %w", err)
@@ -291,16 +283,11 @@ func thenTopicCreatedSuccessfully(ctx context.Context) error {
 	}
 	return nil
 }
-func thenTopicHasIDAndName(
-	ctx context.Context,
-	expectedID uint32,
-	expectedName string) error {
+func thenTopicHasName(
+    ctx context.Context,
+    expectedName string) error {
 	c := getBasicMessagingCtx(ctx)
-	topicID := *c.lastTopicID
 	topicName := *c.lastTopicName
-	if topicID != expectedID {
-		return fmt.Errorf("expected topic ID %d, got %d", expectedID, topicID)
-	}
 	if topicName != expectedName {
 		return fmt.Errorf("expected topic name %s, got %s", expectedName, topicName)
 	}
@@ -328,13 +315,13 @@ func initScenarios(sc *godog.ScenarioContext) {
 	sc.Step(`^the messages should have sequential offsets from (\d+) to (\d+)$`, thenMessagesHaveSequentialOffsets)
 	sc.Step(`each message should have the expected payload content`, thenMessagesHaveExpectedPayload)
 	sc.Step(`the last polled message should match the last sent message`, thenLastPolledMessageMatchesSent)
-	sc.Step(`^the stream should have ID (\d+) and name (.+)$`, thenStreamHasIDAndName)
+    sc.Step(`^the stream should have name "([^"]*)"$`, thenStreamHasName)
 	sc.Step(`the stream should be created successfully`, thenStreamCreatedSuccessfully)
-	sc.Step(`^I create a stream with ID (\d+) and name (.+)$`, whenCreateStream)
+    sc.Step(`^I create a stream with name "([^"]*)"$`, whenCreateStream)
 	sc.Step(`I have no streams in the system`, givenNoStreams)
-	sc.Step(`^I create a topic with ID (\d+) and name (.+) in stream (\d+) with (\d+) partitions$`, whenCreateTopic)
+    sc.Step(`^I create a topic with name "([^"]*)" in stream (\d+) with (\d+) partitions$`, whenCreateTopic)
 	sc.Step(`the topic should be created successfully`, thenTopicCreatedSuccessfully)
-	sc.Step(`^the topic should have ID (\d+) and name (.+)$`, thenTopicHasIDAndName)
+    sc.Step(`^the topic should have name "([^"]*)"$`, thenTopicHasName)
 	sc.Step(`^the topic should have (\d+) partitions$`, thenTopicsHasPartitions)
 }
 

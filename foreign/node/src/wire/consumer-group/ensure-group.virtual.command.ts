@@ -18,7 +18,7 @@
  */
 
 
-import { Id } from '../identifier.utils.js';
+import type { Id } from '../identifier.utils.js';
 import { ClientProvider } from '../../client/index.js';
 import { createGroup } from './create-group.command.js';
 import { getGroup } from './get-group.command.js';
@@ -29,12 +29,11 @@ export const ensureConsumerGroup = (c: ClientProvider) =>
   async function ensureConsumerGroup(
     streamId: Id,
     topicId: Id,
-    groupId: number,
-    groupName = `ensure-cgroup-${streamId}-${topicId}-${groupId}`
+    groupName: string
   ) {
-    const group = await getGroup(c)({ streamId, topicId, groupId });
+    const group = await getGroup(c)({ streamId, topicId, groupId: groupName });
     if (!group)
-      return await createGroup(c)({ streamId, topicId, groupId, name: groupName });
+      return await createGroup(c)({ streamId, topicId, name: groupName });
     return group;
   }
 
@@ -42,11 +41,10 @@ export const ensureConsumerGroupAndJoin = (c: ClientProvider) =>
   async function ensureConsumerGroupAndJoin(
     streamId: Id,
     topicId: Id,
-    groupId: number,
-    groupName = `ensure-cgroup-${streamId}-${topicId}-${groupId}`
+    groupName: string
   ) {
-    const group = await ensureConsumerGroup(c)(streamId, topicId, groupId, groupName);
-    await joinGroup(c)({ streamId, topicId, groupId });
+    const group = await ensureConsumerGroup(c)(streamId, topicId, groupName);
+    await joinGroup(c)({ streamId, topicId, groupId: group.id });
     return group;
   };
 

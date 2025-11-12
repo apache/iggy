@@ -54,7 +54,7 @@ Commands:
 
 Options:
       --transport <TRANSPORT>
-          The transport to use. Valid values are `quic`, `http` and `tcp`
+          The transport to use. Valid values are `quic`, `http`, `tcp` and `ws`
 {CLAP_INDENT}
           [default: tcp]
 
@@ -173,6 +173,21 @@ Options:
 
       --quic-validate-certificate
           Flag to enable certificate validation for QUIC
+
+      --websocket-server-address <WEBSOCKET_SERVER_ADDRESS>
+          The optional server address for the WebSocket transport
+{CLAP_INDENT}
+          [default: 127.0.0.1:8092]
+
+      --websocket-reconnection-max-retries <WEBSOCKET_RECONNECTION_MAX_RETRIES>
+          The optional number of max reconnect retries for the WebSocket transport
+{CLAP_INDENT}
+          [default: 3]
+
+      --websocket-reconnection-interval <WEBSOCKET_RECONNECTION_INTERVAL>
+          The optional reconnect interval for the WebSocket transport
+{CLAP_INDENT}
+          [default: "1s"]
 
   -q, --quiet
           Quiet mode (disabled stdout printing)

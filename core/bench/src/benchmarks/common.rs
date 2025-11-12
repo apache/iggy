@@ -72,8 +72,6 @@ pub async fn init_consumer_groups(
     client_factory: &Arc<dyn ClientFactory>,
     args: &IggyBenchArgs,
 ) -> Result<(), IggyError> {
-    let start_stream_id = args.start_stream_id();
-    let topic_id: u32 = 1;
     let client = client_factory.create_client().await;
     let client = IggyClient::create(client, None, None);
     let cg_count = args.number_of_consumer_groups();
@@ -81,31 +79,19 @@ pub async fn init_consumer_groups(
     login_root(&client).await;
     for i in 1..=cg_count {
         let consumer_group_id = CONSUMER_GROUP_BASE_ID + i;
-        let stream_id = start_stream_id + i;
+        let stream_name = format!("bench-stream-{i}");
+        let stream_id: Identifier = stream_name.as_str().try_into()?;
+        let topic_id: Identifier = "topic-1".try_into()?;
         let consumer_group_name = format!("{CONSUMER_GROUP_NAME_PREFIX}-{consumer_group_id}");
         info!(
-            "Creating test consumer group: name={}, id={}, stream={}, topic={}",
-            consumer_group_name, consumer_group_id, stream_id, topic_id
+            "Creating test consumer group: name={},  stream={}, topic={}",
+            consumer_group_name, stream_name, topic_id
         );
-        match client
-            .create_consumer_group(
-                &stream_id.try_into().unwrap(),
-                &topic_id.try_into().unwrap(),
-                &consumer_group_name,
-                Some(consumer_group_id),
-            )
+        if let Err(err) = client
+            .create_consumer_group(&stream_id, &topic_id, &consumer_group_name)
             .await
         {
-            Err(IggyError::ConsumerGroupIdAlreadyExists(_, _)) => {
-                info!(
-                    "Consumer group with id {} already exists",
-                    consumer_group_id
-                );
-            }
-            Err(err) => {
-                error!("Error when creating consumer group {consumer_group_id}: {err}");
-            }
-            Ok(_) => {}
+            error!("Error when creating consumer group {consumer_group_id}: {err}");
         }
     }
     Ok(())
@@ -117,7 +103,6 @@ pub fn build_producer_futures(
 ) -> Vec<impl Future<Output = Result<BenchmarkIndividualMetrics, IggyError>> + Send + use<>> {
     let streams = args.streams();
     let partitions = args.number_of_partitions();
-    let start_stream_id = args.start_stream_id();
     let producers = args.producers();
     let actors = args.producers() + args.consumers();
     let warmup_time = args.warmup_time();
@@ -141,7 +126,8 @@ pub fn build_producer_futures(
                 BenchmarkFinishCondition::new(args, BenchmarkFinishConditionMode::PerProducer)
             };
 
-            let stream_id = start_stream_id + 1 + (producer_id % streams);
+            let stream_idx = 1 + ((producer_id - 1) % streams);
+            let stream_id = format!("bench-stream-{stream_idx}");
 
             async move {
                 let producer = TypedBenchmarkProducer::new(
@@ -169,7 +155,6 @@ pub fn build_consumer_futures(
     client_factory: &Arc<dyn ClientFactory>,
     args: &IggyBenchArgs,
 ) -> Vec<impl Future<Output = Result<BenchmarkIndividualMetrics, IggyError>> + Send + use<>> {
-    let start_stream_id = args.start_stream_id();
     let cg_count = args.number_of_consumer_groups();
     let consumers = args.consumers();
     let actors = args.producers() + args.consumers();
@@ -204,13 +189,14 @@ pub fn build_consumer_futures(
             } else {
                 BenchmarkFinishCondition::new(args, BenchmarkFinishConditionMode::PerConsumer)
             };
-            let stream_id = if cg_count > 0 {
-                start_stream_id + 1 + (consumer_id % cg_count)
+            let stream_idx = if cg_count > 0 {
+                1 + ((consumer_id - 1) % cg_count)
             } else {
-                start_stream_id + consumer_id
+                consumer_id
             };
+            let stream_id = format!("bench-stream-{stream_idx}");
             let consumer_group_id = if cg_count > 0 {
-                Some(CONSUMER_GROUP_BASE_ID + 1 + (consumer_id % cg_count))
+                Some(CONSUMER_GROUP_BASE_ID + (consumer_id % cg_count))
             } else {
                 None
             };
@@ -249,14 +235,14 @@ pub fn build_producing_consumers_futures(
     let warmup_time = args.warmup_time();
     let messages_per_batch = args.messages_per_batch();
     let message_size = args.message_size();
-    let start_stream_id = args.start_stream_id();
     let polling_kind = PollingKind::Offset;
 
     (1..=producing_consumers)
         .map(|actor_id| {
             let client_factory_clone = client_factory.clone();
             let args_clone = args.clone();
-            let stream_id = start_stream_id + 1 + (actor_id % streams);
+            let stream_idx = 1 + ((actor_id - 1) % streams);
+            let stream_id = format!("bench-stream-{stream_idx}");
 
             let send_finish_condition = BenchmarkFinishCondition::new(
                 &args,
@@ -320,7 +306,6 @@ pub fn build_producing_consumer_groups_futures(
     let warmup_time = args.warmup_time();
     let messages_per_batch = args.messages_per_batch();
     let message_size = args.message_size();
-    let start_stream_id = args.start_stream_id();
     let start_consumer_group_id = CONSUMER_GROUP_BASE_ID;
     let polling_kind = PollingKind::Next;
     let use_high_level_api = args.high_level_api();
@@ -334,7 +319,8 @@ pub fn build_producing_consumer_groups_futures(
         .map(|actor_id| {
             let client_factory_clone = client_factory.clone();
             let args_clone = args.clone();
-            let stream_id = start_stream_id + 1 + (actor_id % cg_count);
+            let stream_idx = 1 + ((actor_id - 1) % cg_count);
+            let stream_id = format!("bench-stream-{stream_idx}");
 
             let should_produce = actor_id <= producers;
             let should_consume = actor_id <= consumers;

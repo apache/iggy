@@ -18,8 +18,8 @@
 
 use crate::binary::sender::SenderKind;
 use crate::define_server_command_enum;
+use crate::shard::IggyShard;
 use crate::streaming::session::Session;
-use crate::streaming::systems::system::SharedSystem;
 use bytes::{BufMut, Bytes, BytesMut};
 use enum_dispatch::enum_dispatch;
 use iggy_common::change_password::ChangePassword;
@@ -67,6 +67,7 @@ use iggy_common::update_stream::UpdateStream;
 use iggy_common::update_topic::UpdateTopic;
 use iggy_common::update_user::UpdateUser;
 use iggy_common::*;
+use std::rc::Rc;
 use strum::EnumString;
 use tracing::error;
 
@@ -132,7 +133,7 @@ pub trait ServerCommandHandler {
         sender: &mut SenderKind,
         length: u32,
         session: &Session,
-        system: &SharedSystem,
+        shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError>;
 }
 

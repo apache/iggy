@@ -24,29 +24,23 @@ pub async fn run(client: &IggyClient) {
     login_root(client).await;
 
     let stream_name = "test-tls-stream";
-    let stream_id = 1;
-    client
-        .create_stream(stream_name, Some(stream_id))
-        .await
-        .unwrap();
+    client.create_stream(stream_name).await.unwrap();
 
     let stream = client
-        .get_stream(&Identifier::numeric(stream_id).unwrap())
+        .get_stream(&Identifier::named(stream_name).unwrap())
         .await
         .unwrap()
         .unwrap();
     assert_eq!(stream.name, stream_name);
 
     let topic_name = "test-tls-topic";
-    let topic_id = 1;
     client
         .create_topic(
-            &Identifier::numeric(stream_id).unwrap(),
+            &Identifier::named(stream_name).unwrap(),
             topic_name,
             1,
             CompressionAlgorithm::default(),
             None,
-            Some(topic_id),
             IggyExpiry::NeverExpire,
             MaxTopicSize::ServerDefault,
         )
@@ -63,9 +57,9 @@ pub async fn run(client: &IggyClient) {
 
     client
         .send_messages(
-            &Identifier::numeric(stream_id).unwrap(),
-            &Identifier::numeric(topic_id).unwrap(),
-            &Partitioning::partition_id(1),
+            &Identifier::named(stream_name).unwrap(),
+            &Identifier::named(topic_name).unwrap(),
+            &Partitioning::partition_id(0),
             &mut messages,
         )
         .await
@@ -73,9 +67,9 @@ pub async fn run(client: &IggyClient) {
 
     let polled_messages = client
         .poll_messages(
-            &Identifier::numeric(stream_id).unwrap(),
-            &Identifier::numeric(topic_id).unwrap(),
-            Some(1),
+            &Identifier::named(stream_name).unwrap(),
+            &Identifier::named(topic_name).unwrap(),
+            Some(0),
             &Consumer::default(),
             &PollingStrategy::offset(0),
             1,
@@ -88,7 +82,7 @@ pub async fn run(client: &IggyClient) {
     assert_eq!(polled_messages.messages[0].payload.as_ref(), b"Hello TLS!");
 
     client
-        .delete_stream(&Identifier::numeric(stream_id).unwrap())
+        .delete_stream(&Identifier::named(stream_name).unwrap())
         .await
         .unwrap();
 

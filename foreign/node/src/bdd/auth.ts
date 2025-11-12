@@ -40,6 +40,6 @@ Given('I have a running Iggy server', function () {
 
 Given('I am authenticated as the root user', async function (this: TestWorld) {
   this.client = new Client(opt);
-  assert.deepEqual({ userId: 1 }, await this.client.session.login(credentials));
+  assert.deepEqual({ userId: 0 }, await this.client.session.login(credentials));
   assert.equal(true, await this.client.system.ping());
 });

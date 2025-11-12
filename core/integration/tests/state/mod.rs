@@ -16,13 +16,15 @@
  * under the License.
  */
 
+use compio::fs::create_dir;
 use iggy::prelude::{Aes256GcmEncryptor, EncryptorKind};
 use server::state::file::FileState;
 use server::streaming::persistence::persister::{FileWithSyncPersister, PersisterKind};
+use server::streaming::utils::file::overwrite;
 use server::versioning::SemanticVersion;
 use std::str::FromStr;
 use std::sync::Arc;
-use tokio::fs::create_dir;
+use std::sync::atomic::{AtomicU32, AtomicU64};
 use uuid::Uuid;
 
 mod file;
@@ -47,19 +49,25 @@ impl StateSetup {
         let directory_path = format!("state_{}", Uuid::now_v7().to_u128_le());
         let messages_file_path = format!("{directory_path}/log");
         create_dir(&directory_path).await.unwrap();
+        overwrite(&messages_file_path).await.unwrap();
 
         let version = SemanticVersion::from_str("1.2.3").unwrap();
         let persister = PersisterKind::FileWithSync(FileWithSyncPersister {});
-        let encryptor = encryption_key.map(|key| {
-            Arc::new(EncryptorKind::Aes256Gcm(
-                Aes256GcmEncryptor::new(key).unwrap(),
-            ))
-        });
+        let encryptor = encryption_key
+            .map(|key| EncryptorKind::Aes256Gcm(Aes256GcmEncryptor::new(key).unwrap()));
+        let state_current_index = Arc::new(AtomicU64::new(0));
+        let state_entries_count = Arc::new(AtomicU64::new(0));
+        let state_current_leader = Arc::new(AtomicU32::new(0));
+        let state_term = Arc::new(AtomicU64::new(0));
         let state = FileState::new(
             &messages_file_path,
             &version,
             Arc::new(persister),
             encryptor,
+            state_current_index,
+            state_entries_count,
+            state_current_leader,
+            state_term,
         );
 
         Self {

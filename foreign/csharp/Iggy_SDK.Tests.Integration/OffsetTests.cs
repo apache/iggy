@@ -17,6 +17,7 @@
 
 using Apache.Iggy.Enums;
 using Apache.Iggy.Kinds;
+using Apache.Iggy.Tests.Integrations.Attributes;
 using Apache.Iggy.Tests.Integrations.Fixtures;
 using Apache.Iggy.Tests.Integrations.Helpers;
 using Shouldly;
@@ -36,7 +37,7 @@ public class OffsetTests
     {
         await Fixture.Clients[protocol]
             .StoreOffsetAsync(Consumer.New(1), Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-                Identifier.String(Fixture.TopicRequest.Name), SetOffset, 1);
+                Identifier.String(Fixture.TopicRequest.Name), SetOffset, 0);
     }
 
     [Test]
@@ -46,11 +47,11 @@ public class OffsetTests
     {
         var offset = await Fixture.Clients[protocol]
             .GetOffsetAsync(Consumer.New(1), Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-                Identifier.String(Fixture.TopicRequest.Name), 1);
+                Identifier.String(Fixture.TopicRequest.Name), 0);
 
         offset.ShouldNotBeNull();
         offset.StoredOffset.ShouldBe(SetOffset);
-        offset.PartitionId.ShouldBe(1);
+        offset.PartitionId.ShouldBe(0);
         offset.CurrentOffset.ShouldBe(3u);
     }
 
@@ -61,11 +62,15 @@ public class OffsetTests
     {
         await Fixture.Clients[protocol]
             .CreateConsumerGroupAsync(Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-                Identifier.String(Fixture.TopicRequest.Name), "test_consumer_group", 1);
+                Identifier.String(Fixture.TopicRequest.Name), "test_consumer_group");
+
+        await Fixture.Clients[Protocol.Tcp].JoinConsumerGroupAsync(
+            Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
+            Identifier.String(Fixture.TopicRequest.Name), Identifier.String("test_consumer_group"));
 
         await Fixture.Clients[protocol]
-            .StoreOffsetAsync(Consumer.Group(1), Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-                Identifier.String(Fixture.TopicRequest.Name), SetOffset, 1);
+            .StoreOffsetAsync(Consumer.Group("test_consumer_group"), Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
+                Identifier.String(Fixture.TopicRequest.Name), SetOffset, 0);
     }
 
     [Test]
@@ -74,12 +79,12 @@ public class OffsetTests
     public async Task GetOffset_ConsumerGroup_Should_GetOffset_Successfully(Protocol protocol)
     {
         var offset = await Fixture.Clients[protocol]
-            .GetOffsetAsync(Consumer.Group(1), Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-                Identifier.String(Fixture.TopicRequest.Name), 1);
+            .GetOffsetAsync(Consumer.Group("test_consumer_group"), Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
+                Identifier.String(Fixture.TopicRequest.Name), 0);
 
         offset.ShouldNotBeNull();
         offset.StoredOffset.ShouldBe(SetOffset);
-        offset.PartitionId.ShouldBe(1);
+        offset.PartitionId.ShouldBe(0);
         offset.CurrentOffset.ShouldBe(3u);
     }
 
@@ -90,11 +95,28 @@ public class OffsetTests
     {
         var offset = await Fixture.Clients[protocol].GetOffsetAsync(Consumer.Group("test_consumer_group"),
             Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)), Identifier.String(Fixture.TopicRequest.Name),
-            1);
+            0);
 
         offset.ShouldNotBeNull();
         offset.StoredOffset.ShouldBe(SetOffset);
-        offset.PartitionId.ShouldBe(1);
+        offset.PartitionId.ShouldBe(0);
         offset.CurrentOffset.ShouldBe(3u);
+    }
+
+    [Test]
+    [SkipHttp]
+    [DependsOn(nameof(GetOffset_ConsumerGroup_ByName_Should_GetOffset_Successfully))]
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task DeleteOffset_ConsumerGroup_Should_DeleteOffset_Successfully(Protocol protocol)
+    {
+        await Fixture.Clients[protocol].DeleteOffsetAsync(Consumer.Group("test_consumer_group"),
+            Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)), Identifier.String(Fixture.TopicRequest.Name),
+            0);
+
+        var offset = await Fixture.Clients[protocol].GetOffsetAsync(Consumer.Group("test_consumer_group"),
+            Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)), Identifier.String(Fixture.TopicRequest.Name),
+            0);
+
+        offset.ShouldBeNull();
     }
 }

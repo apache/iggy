@@ -25,13 +25,12 @@ import { getTestClient } from './test-client.utils.js';
 describe('e2e -> stream', async () => {
 
   const c = getTestClient();
-  
-  const streamId = 164;
+
   const name = 'e2e-tcp-stream';
   const name2 = `${name}-updated`;
 
   it('e2e -> stream::create', async () => {
-    const stream = await c.stream.create({ streamId, name });
+    const stream = await c.stream.create({ name });
     assert.ok(stream);
   });
 
@@ -41,24 +40,24 @@ describe('e2e -> stream', async () => {
   });
 
   it('e2e -> stream::get', async () => {
-    const stream = await c.stream.get({ streamId });
+    const stream = await c.stream.get({ streamId: name });
     assert.ok(stream);
   });
 
   it('e2e -> stream::update', async () => {
     const stream = await c.stream.update({
-      streamId,
+      streamId: name,
       name: name2
     });
     assert.ok(stream);
   });
 
   it('e2e -> stream::purge', async () => {
-    assert.ok(await c.stream.purge({ streamId }));
+    assert.ok(await c.stream.purge({ streamId: name2 }));
   });
 
   it('e2e -> stream::delete', async () => {
-    assert.ok(await c.stream.delete({ streamId }));
+    assert.ok(await c.stream.delete({ streamId: name2 }));
   });
 
   it('e2e -> stream::cleanup', async () => {

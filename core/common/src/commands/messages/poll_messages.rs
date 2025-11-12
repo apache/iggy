@@ -24,7 +24,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
 use std::fmt::Display;
 
-pub const DEFAULT_PARTITION_ID: u32 = 1;
+pub const DEFAULT_PARTITION_ID: u32 = 0;
 pub const DEFAULT_NUMBER_OF_MESSAGES_TO_POLL: u32 = 10;
 
 /// `PollMessages` command is used to poll messages from a topic in a stream.
@@ -76,7 +76,7 @@ impl PollMessages {
         let topic_id_bytes = topic_id.to_bytes();
         let strategy_bytes = strategy.to_bytes();
         let mut bytes = BytesMut::with_capacity(
-            9 + consumer_bytes.len()
+            10 + consumer_bytes.len()
                 + stream_id_bytes.len()
                 + topic_id_bytes.len()
                 + strategy_bytes.len(),
@@ -84,10 +84,13 @@ impl PollMessages {
         bytes.put_slice(&consumer_bytes);
         bytes.put_slice(&stream_id_bytes);
         bytes.put_slice(&topic_id_bytes);
+        // Encode partition_id with a flag byte: 1 = Some, 0 = None
         if let Some(partition_id) = partition_id {
+            bytes.put_u8(1);
             bytes.put_u32_le(partition_id);
         } else {
-            bytes.put_u32_le(0);
+            bytes.put_u8(0);
+            bytes.put_u32_le(0); // Padding to keep structure consistent
         }
         bytes.put_slice(&strategy_bytes);
         bytes.put_u32_le(count);
@@ -149,7 +152,7 @@ impl BytesSerializable for PollMessages {
     }
 
     fn from_bytes(bytes: Bytes) -> Result<Self, IggyError> {
-        if bytes.len() < 29 {
+        if bytes.len() < 30 {
             return Err(IggyError::InvalidCommand);
         }
 
@@ -165,17 +168,20 @@ impl BytesSerializable for PollMessages {
         position += stream_id.get_size_bytes().as_bytes_usize();
         let topic_id = Identifier::from_bytes(bytes.slice(position..))?;
         position += topic_id.get_size_bytes().as_bytes_usize();
-        let partition_id = u32::from_le_bytes(
-            bytes[position..position + 4]
+        // Decode partition_id with flag byte: 1 = Some, 0 = None
+        let has_partition_id = bytes[position];
+        let partition_id_value = u32::from_le_bytes(
+            bytes[position + 1..position + 5]
                 .try_into()
                 .map_err(|_| IggyError::InvalidNumberEncoding)?,
         );
-        let partition_id = match partition_id {
-            0 => None,
-            partition_id => Some(partition_id),
+        let partition_id = if has_partition_id == 1 {
+            Some(partition_id_value)
+        } else {
+            None
         };
-        let polling_kind = PollingKind::from_code(bytes[position + 4])?;
-        position += 5;
+        let polling_kind = PollingKind::from_code(bytes[position + 5])?;
+        position += 6;
         let value = u64::from_le_bytes(
             bytes[position..position + 8]
                 .try_into()
@@ -254,9 +260,16 @@ mod tests {
         position += stream_id.get_size_bytes().as_bytes_usize();
         let topic_id = Identifier::from_bytes(bytes.slice(position..)).unwrap();
         position += topic_id.get_size_bytes().as_bytes_usize();
-        let partition_id = u32::from_le_bytes(bytes[position..position + 4].try_into().unwrap());
-        let polling_kind = PollingKind::from_code(bytes[position + 4]).unwrap();
-        position += 5;
+        let has_partition_id = bytes[position];
+        let partition_id =
+            u32::from_le_bytes(bytes[position + 1..position + 5].try_into().unwrap());
+        let partition_id = if has_partition_id == 1 {
+            Some(partition_id)
+        } else {
+            None
+        };
+        let polling_kind = PollingKind::from_code(bytes[position + 5]).unwrap();
+        position += 6;
         let value = u64::from_le_bytes(bytes[position..position + 8].try_into().unwrap());
         let strategy = PollingStrategy {
             kind: polling_kind,
@@ -270,7 +283,7 @@ mod tests {
         assert_eq!(consumer, command.consumer);
         assert_eq!(stream_id, command.stream_id);
         assert_eq!(topic_id, command.topic_id);
-        assert_eq!(Some(partition_id), command.partition_id);
+        assert_eq!(partition_id, command.partition_id);
         assert_eq!(strategy, command.strategy);
         assert_eq!(count, command.count);
         assert_eq!(auto_commit, command.auto_commit);
@@ -291,7 +304,7 @@ mod tests {
         let topic_id_bytes = topic_id.to_bytes();
         let strategy_bytes = strategy.to_bytes();
         let mut bytes = BytesMut::with_capacity(
-            9 + consumer_bytes.len()
+            10 + consumer_bytes.len()
                 + stream_id_bytes.len()
                 + topic_id_bytes.len()
                 + strategy_bytes.len(),
@@ -299,6 +312,7 @@ mod tests {
         bytes.put_slice(&consumer_bytes);
         bytes.put_slice(&stream_id_bytes);
         bytes.put_slice(&topic_id_bytes);
+        bytes.put_u8(1); // Flag: partition_id is Some
         bytes.put_u32_le(partition_id);
         bytes.put_slice(&strategy_bytes);
         bytes.put_u32_le(count);

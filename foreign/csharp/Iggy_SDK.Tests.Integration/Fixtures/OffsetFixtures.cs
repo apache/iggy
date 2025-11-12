@@ -45,19 +45,15 @@ public class OffsetFixtures : IAsyncInitializer
             await client.Value.CreateTopicAsync(Identifier.String(StreamId.GetWithProtocol(client.Key)),
                 TopicRequest.Name, TopicRequest.PartitionsCount);
 
-            await client.Value.SendMessagesAsync(new MessageSendRequest
+            var messages = new Message[]
             {
-                Partitioning = Partitioning.None(),
-                StreamId = Identifier.String(StreamId.GetWithProtocol(client.Key)),
-                TopicId = Identifier.String(TopicRequest.Name),
-                Messages = new List<Message>
-                {
-                    new(Guid.NewGuid(), "Test message 1"u8.ToArray()),
-                    new(Guid.NewGuid(), "Test message 2"u8.ToArray()),
-                    new(Guid.NewGuid(), "Test message 3"u8.ToArray()),
-                    new(Guid.NewGuid(), "Test message 4"u8.ToArray())
-                }
-            });
+                new(Guid.NewGuid(), "Test message 1"u8.ToArray()),
+                new(Guid.NewGuid(), "Test message 2"u8.ToArray()),
+                new(Guid.NewGuid(), "Test message 3"u8.ToArray()),
+                new(Guid.NewGuid(), "Test message 4"u8.ToArray())
+            };
+            await client.Value.SendMessagesAsync(Identifier.String(StreamId.GetWithProtocol(client.Key)),
+                Identifier.String(TopicRequest.Name), Partitioning.None(), messages);
         }
     }
 }

@@ -16,18 +16,19 @@
  * under the License.
  */
 
+use super::bootstrap_test_environment;
 use crate::streaming::common::test_setup::TestSetup;
 use bytes::BytesMut;
-use iggy::prelude::Confirmation;
 use iggy::prelude::*;
 use server::configs::cache_indexes::CacheIndexesConfig;
 use server::configs::system::{PartitionConfig, SegmentConfig, SystemConfig};
-use server::streaming::partitions::partition::Partition;
+use server::shard::namespace::IggyFullNamespace;
+use server::shard::system::messages::PollingArgs;
+use server::streaming::polling_consumer::PollingConsumer;
 use server::streaming::segments::IggyMessagesBatchMut;
+use server::streaming::traits::MainOps;
 use std::collections::HashMap;
 use std::str::FromStr;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64};
 use std::thread::sleep;
 use test_case::test_matrix;
 
@@ -81,7 +82,7 @@ fn very_large_batches() -> Vec<u32> {
     [msgs_req_to_save(1), msgs_req_to_save(24), msgs_req_to_save(1000), msgs_req_to_save(10000)],
     [segment_size(10), segment_size(200), segment_size(10000000)],
     [index_cache_none(), index_cache_all(), index_cache_open_segment()])]
-#[tokio::test]
+#[compio::test]
 async fn test_get_messages_by_timestamp(
     message_size: IggyByteSize,
     batch_lengths: Vec<u32>,
@@ -93,14 +94,12 @@ async fn test_get_messages_by_timestamp(
         "Running test with message_size: {message_size}, batches: {batch_lengths:?}, messages_required_to_save: {messages_required_to_save}, segment_size: {segment_size}, cache_indexes: {cache_indexes}"
     );
 
+    let shard_id = 0;
     let setup = TestSetup::init().await;
-    let stream_id = 1;
-    let topic_id = 1;
-    let partition_id = 1;
 
     let total_messages_count = batch_lengths.iter().sum();
 
-    let config = Arc::new(SystemConfig {
+    let config = SystemConfig {
         path: setup.config.path.to_string(),
         partition: PartitionConfig {
             messages_required_to_save,
@@ -113,27 +112,24 @@ async fn test_get_messages_by_timestamp(
             ..Default::default()
         },
         ..Default::default()
-    });
+    };
 
-    let mut partition = Partition::create(
-        stream_id,
-        topic_id,
+    // Use the bootstrap method to create streams with proper slab structure
+    let bootstrap_result = bootstrap_test_environment(shard_id as u16, &config)
+        .await
+        .unwrap();
+    let streams = bootstrap_result.streams;
+    let stream_identifier = bootstrap_result.stream_id;
+    let topic_identifier = bootstrap_result.topic_id;
+    let partition_id = bootstrap_result.partition_id;
+    let task_registry = bootstrap_result.task_registry;
+
+    // Create namespace for MainOps calls
+    let namespace = IggyFullNamespace::new(
+        stream_identifier.clone(),
+        topic_identifier.clone(),
         partition_id,
-        true,
-        config.clone(),
-        setup.storage.clone(),
-        IggyExpiry::NeverExpire,
-        Arc::new(AtomicU64::new(0)),
-        Arc::new(AtomicU64::new(0)),
-        Arc::new(AtomicU64::new(0)),
-        Arc::new(AtomicU64::new(0)),
-        Arc::new(AtomicU32::new(0)),
-        IggyTimestamp::now(),
-    )
-    .await;
-
-    setup.create_partitions_directory(stream_id, topic_id).await;
-    partition.persist().await.unwrap();
+    );
 
     let mut all_messages = Vec::with_capacity(total_messages_count as usize);
 
@@ -202,8 +198,8 @@ async fn test_get_messages_by_timestamp(
 
         let batch = IggyMessagesBatchMut::from_messages(messages_slice_to_append, messages_size);
         assert_eq!(batch.count(), batch_len);
-        partition
-            .append_messages(batch, Some(Confirmation::Wait))
+        streams
+            .append_messages(&config, &task_registry, &namespace, batch)
             .await
             .unwrap();
 
@@ -220,9 +216,18 @@ async fn test_get_messages_by_timestamp(
     // Use the exact total messages count from the test matrix
     let total_sent_messages = total_messages_count;
 
+    // Create a single consumer to reuse throughout the test
+    let consumer =
+        PollingConsumer::consumer(&Identifier::numeric(1).unwrap(), partition_id as usize);
+
     // Test 1: All messages from initial timestamp
-    let all_loaded_messages = partition
-        .get_messages_by_timestamp(initial_timestamp, total_sent_messages)
+    let args = PollingArgs::new(
+        PollingStrategy::timestamp(initial_timestamp),
+        total_sent_messages,
+        false,
+    );
+    let (_, all_loaded_messages) = streams
+        .poll_messages(&namespace, consumer, args)
         .await
         .unwrap();
     assert_eq!(
@@ -243,8 +248,13 @@ async fn test_get_messages_by_timestamp(
         let prior_batches_sum: u32 = batch_lengths[..3].iter().sum();
         let remaining_messages = total_sent_messages - prior_batches_sum;
 
-        let middle_messages = partition
-            .get_messages_by_timestamp(middle_timestamp, remaining_messages)
+        let args = PollingArgs::new(
+            PollingStrategy::timestamp(middle_timestamp),
+            remaining_messages,
+            false,
+        );
+        let (_, middle_messages) = streams
+            .poll_messages(&namespace, consumer, args)
             .await
             .unwrap();
 
@@ -258,8 +268,9 @@ async fn test_get_messages_by_timestamp(
     }
 
     // Test 3: No messages after final timestamp
-    let no_messages = partition
-        .get_messages_by_timestamp(final_timestamp, 1)
+    let args = PollingArgs::new(PollingStrategy::timestamp(final_timestamp), 1, false);
+    let (_, no_messages) = streams
+        .poll_messages(&namespace, consumer, args)
         .await
         .unwrap();
     assert_eq!(
@@ -271,8 +282,13 @@ async fn test_get_messages_by_timestamp(
 
     // Test 4: Small subset from initial timestamp
     let subset_size = std::cmp::min(3, total_sent_messages);
-    let subset_messages = partition
-        .get_messages_by_timestamp(initial_timestamp, subset_size)
+    let args = PollingArgs::new(
+        PollingStrategy::timestamp(initial_timestamp),
+        subset_size,
+        false,
+    );
+    let (_, subset_messages) = streams
+        .poll_messages(&namespace, consumer, args)
         .await
         .unwrap();
     assert_eq!(
@@ -289,8 +305,9 @@ async fn test_get_messages_by_timestamp(
         let span_timestamp = IggyTimestamp::from(batch_timestamps[1].as_micros() + 1000);
         let span_size = 8; // Should span across multiple batches
 
-        let spanning_messages = partition
-            .get_messages_by_timestamp(span_timestamp, span_size)
+        let args = PollingArgs::new(PollingStrategy::timestamp(span_timestamp), span_size, false);
+        let (_, spanning_messages) = streams
+            .poll_messages(&namespace, consumer, args)
             .await
             .unwrap();
 

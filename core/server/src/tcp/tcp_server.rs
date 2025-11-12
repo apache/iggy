@@ -16,26 +16,42 @@
  * under the License.
  */
 
-use crate::configs::tcp::TcpConfig;
-use crate::streaming::systems::system::SharedSystem;
-use crate::tcp::{tcp_listener, tcp_socket, tcp_tls_listener};
+use crate::shard::IggyShard;
+use crate::shard::task_registry::ShutdownToken;
+use crate::tcp::{tcp_listener, tcp_tls_listener};
+use iggy_common::IggyError;
 use std::net::SocketAddr;
+use std::rc::Rc;
 use tracing::info;
 
 /// Starts the TCP server.
-/// Returns the address the server is listening on.
-pub async fn start(config: TcpConfig, system: SharedSystem) -> SocketAddr {
-    let server_name = if config.tls.enabled {
+pub async fn spawn_tcp_server(
+    shard: Rc<IggyShard>,
+    shutdown: ShutdownToken,
+) -> Result<(), IggyError> {
+    let server_name = if shard.config.tcp.tls.enabled {
         "Iggy TCP TLS"
     } else {
         "Iggy TCP"
     };
-    info!("Initializing {server_name} server...");
-    let socket = tcp_socket::build(config.ipv6, config.socket);
-    let addr = match config.tls.enabled {
-        true => tcp_tls_listener::start(&config.address, config.tls, socket, system).await,
-        false => tcp_listener::start(&config.address, socket, system).await,
+    let socket_config = &shard.config.tcp.socket;
+    let addr: SocketAddr = shard
+        .config
+        .tcp
+        .address
+        .parse()
+        .expect("Failed to parse TCP address");
+    info!("Initializing {} server...", server_name);
+
+    match shard.config.tcp.tls.enabled {
+        true => {
+            tcp_tls_listener::start(server_name, addr, socket_config, shard.clone(), shutdown)
+                .await?
+        }
+        false => {
+            tcp_listener::start(server_name, addr, socket_config, shard.clone(), shutdown).await?
+        }
     };
-    info!("{server_name} server has started on: {:?}", addr);
-    addr
+
+    Ok(())
 }

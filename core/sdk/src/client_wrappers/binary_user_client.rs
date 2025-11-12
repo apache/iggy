@@ -31,6 +31,7 @@ impl UserClient for ClientWrapper {
             ClientWrapper::Http(client) => client.get_user(user_id).await,
             ClientWrapper::Tcp(client) => client.get_user(user_id).await,
             ClientWrapper::Quic(client) => client.get_user(user_id).await,
+            ClientWrapper::WebSocket(client) => client.get_user(user_id).await,
         }
     }
 
@@ -40,6 +41,7 @@ impl UserClient for ClientWrapper {
             ClientWrapper::Http(client) => client.get_users().await,
             ClientWrapper::Tcp(client) => client.get_users().await,
             ClientWrapper::Quic(client) => client.get_users().await,
+            ClientWrapper::WebSocket(client) => client.get_users().await,
         }
     }
 
@@ -71,6 +73,11 @@ impl UserClient for ClientWrapper {
                     .create_user(username, password, status, permissions)
                     .await
             }
+            ClientWrapper::WebSocket(client) => {
+                client
+                    .create_user(username, password, status, permissions)
+                    .await
+            }
         }
     }
 
@@ -80,6 +87,7 @@ impl UserClient for ClientWrapper {
             ClientWrapper::Tcp(client) => client.delete_user(user_id).await,
             ClientWrapper::Quic(client) => client.delete_user(user_id).await,
             ClientWrapper::Iggy(client) => client.delete_user(user_id).await,
+            ClientWrapper::WebSocket(client) => client.delete_user(user_id).await,
         }
     }
 
@@ -94,6 +102,7 @@ impl UserClient for ClientWrapper {
             ClientWrapper::Tcp(client) => client.update_user(user_id, username, status).await,
             ClientWrapper::Quic(client) => client.update_user(user_id, username, status).await,
             ClientWrapper::Iggy(client) => client.update_user(user_id, username, status).await,
+            ClientWrapper::WebSocket(client) => client.update_user(user_id, username, status).await,
         }
     }
 
@@ -107,6 +116,9 @@ impl UserClient for ClientWrapper {
             ClientWrapper::Http(client) => client.update_permissions(user_id, permissions).await,
             ClientWrapper::Tcp(client) => client.update_permissions(user_id, permissions).await,
             ClientWrapper::Quic(client) => client.update_permissions(user_id, permissions).await,
+            ClientWrapper::WebSocket(client) => {
+                client.update_permissions(user_id, permissions).await
+            }
         }
     }
 
@@ -137,6 +149,11 @@ impl UserClient for ClientWrapper {
                     .change_password(user_id, current_password, new_password)
                     .await
             }
+            ClientWrapper::WebSocket(client) => {
+                client
+                    .change_password(user_id, current_password, new_password)
+                    .await
+            }
         }
     }
 
@@ -146,6 +163,7 @@ impl UserClient for ClientWrapper {
             ClientWrapper::Http(client) => client.login_user(username, password).await,
             ClientWrapper::Tcp(client) => client.login_user(username, password).await,
             ClientWrapper::Quic(client) => client.login_user(username, password).await,
+            ClientWrapper::WebSocket(client) => client.login_user(username, password).await,
         }
     }
 
@@ -155,6 +173,7 @@ impl UserClient for ClientWrapper {
             ClientWrapper::Http(client) => client.logout_user().await,
             ClientWrapper::Tcp(client) => client.logout_user().await,
             ClientWrapper::Quic(client) => client.logout_user().await,
+            ClientWrapper::WebSocket(client) => client.logout_user().await,
         }
     }
 }

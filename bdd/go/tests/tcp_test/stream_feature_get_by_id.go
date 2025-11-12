@@ -55,31 +55,27 @@ var _ = ginkgo.Describe("GET STREAM BY ID:", func() {
 			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 
 			// create two topics
-			t1Id := createRandomUInt32()
 			t1Name := createRandomString(32)
-			t2Id := createRandomUInt32()
 			t2Name := createRandomString(32)
-			_, err := client.CreateTopic(streamIdentifier,
+            t1, err := client.CreateTopic(streamIdentifier,
 				t1Name,
 				2,
 				iggcon.CompressionAlgorithmNone,
 				iggcon.Millisecond,
 				math.MaxUint64,
-				nil,
-				&t1Id)
+                nil)
 			itShouldNotReturnError(err)
-			_, err = client.CreateTopic(
+            t2, err := client.CreateTopic(
 				streamIdentifier,
 				t2Name,
 				2,
 				iggcon.CompressionAlgorithmNone,
 				iggcon.Millisecond,
 				math.MaxUint64,
-				nil,
-				&t2Id)
+                nil)
 			itShouldNotReturnError(err)
-			itShouldSuccessfullyCreateTopic(streamId, t1Id, t1Name, client)
-			itShouldSuccessfullyCreateTopic(streamId, t2Id, t2Name, client)
+			itShouldSuccessfullyCreateTopic(streamId, t1.Id, t1Name, client)
+			itShouldSuccessfullyCreateTopic(streamId, t2.Id, t2Name, client)
 
 			// check stream details
 			stream, err := client.GetStream(streamIdentifier)
@@ -88,8 +84,8 @@ var _ = ginkgo.Describe("GET STREAM BY ID:", func() {
 			ginkgo.It("should have exactly 2 topics", func() {
 				gomega.Expect(len(stream.Topics)).To(gomega.Equal(2))
 			})
-			itShouldContainSpecificTopic(t1Id, t1Name, stream.Topics)
-			itShouldContainSpecificTopic(t2Id, t2Name, stream.Topics)
+			itShouldContainSpecificTopic(t1.Id, t1Name, stream.Topics)
+			itShouldContainSpecificTopic(t2.Id, t2Name, stream.Topics)
 		})
 	})
 

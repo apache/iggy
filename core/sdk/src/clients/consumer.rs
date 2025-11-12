@@ -24,7 +24,7 @@ use futures_util::{FutureExt, StreamExt};
 use iggy_binary_protocol::{
     Client, ConsumerGroupClient, ConsumerOffsetClient, MessageClient, StreamClient, TopicClient,
 };
-use iggy_common::locking::{IggySharedMut, IggySharedMutFn};
+use iggy_common::locking::{IggyRwLock, IggyRwLockFn};
 use iggy_common::{
     Consumer, ConsumerKind, DiagnosticEvent, EncryptorKind, IdKind, Identifier, IggyDuration,
     IggyError, IggyMessage, IggyTimestamp, PolledMessages, PollingKind, PollingStrategy,
@@ -96,7 +96,7 @@ unsafe impl Sync for IggyConsumer {}
 pub struct IggyConsumer {
     initialized: bool,
     can_poll: Arc<AtomicBool>,
-    client: IggySharedMut<ClientWrapper>,
+    client: IggyRwLock<ClientWrapper>,
     consumer_name: String,
     consumer: Arc<Consumer>,
     is_consumer_group: bool,
@@ -132,7 +132,7 @@ pub struct IggyConsumer {
 impl IggyConsumer {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        client: IggySharedMut<ClientWrapper>,
+        client: IggyRwLock<ClientWrapper>,
         consumer_name: String,
         consumer: Consumer,
         stream_id: Identifier,
@@ -408,7 +408,7 @@ impl IggyConsumer {
 
     #[allow(clippy::too_many_arguments)]
     async fn store_consumer_offset(
-        client: &IggySharedMut<ClientWrapper>,
+        client: &IggyRwLock<ClientWrapper>,
         consumer: &Consumer,
         stream_id: &Identifier,
         topic_id: &Identifier,
@@ -502,6 +502,12 @@ impl IggyConsumer {
             warn!("Auto join consumer group is disabled");
             return Ok(());
         }
+        tracing::debug!(
+            "Initializing consumer group for stream ID: {}, topic ID: {}, consumer ID: {}",
+            self.stream_id,
+            self.topic_id,
+            self.consumer
+        );
 
         Self::initialize_consumer_group(
             self.client.clone(),
@@ -778,6 +784,14 @@ impl IggyConsumer {
             return;
         }
 
+        if now < last_sent_at {
+            warn!(
+                "Returned monotonic time went backwards, now < last_sent_at: ({now} < {last_sent_at})"
+            );
+            sleep(Duration::from_micros(interval)).await;
+            return;
+        }
+
         let elapsed = now - last_sent_at;
         if elapsed >= interval {
             trace!("No need to wait before polling messages. {now} - {last_sent_at} = {elapsed}");
@@ -792,7 +806,7 @@ impl IggyConsumer {
     }
 
     async fn initialize_consumer_group(
-        client: IggySharedMut<ClientWrapper>,
+        client: IggyRwLock<ClientWrapper>,
         create_consumer_group_if_not_exists: bool,
         stream_id: Arc<Identifier>,
         topic_id: Arc<Identifier>,
@@ -805,7 +819,7 @@ impl IggyConsumer {
         }
 
         let client = client.read().await;
-        let (name, id) = match consumer.id.kind {
+        let (name, _id) = match consumer.id.kind {
             IdKind::Numeric => (consumer_name.to_owned(), Some(consumer.id.get_u32_value()?)),
             IdKind::String => (consumer.id.get_string_value()?, None),
         };
@@ -821,9 +835,10 @@ impl IggyConsumer {
         {
             if !create_consumer_group_if_not_exists {
                 error!("Consumer group does not exist and auto-creation is disabled.");
+                let topic_identifier = Identifier::from_identifier(&topic_id);
                 return Err(IggyError::ConsumerGroupNameNotFound(
                     name.to_owned(),
-                    topic_id.get_string_value().unwrap_or_default(),
+                    topic_identifier,
                 ));
             }
 
@@ -831,7 +846,7 @@ impl IggyConsumer {
                 "Creating consumer group: {consumer_group_id} for topic: {topic_id}, stream: {stream_id}"
             );
             match client
-                .create_consumer_group(&stream_id, &topic_id, &name, id)
+                .create_consumer_group(&stream_id, &topic_id, &name)
                 .await
             {
                 Ok(_) => {}

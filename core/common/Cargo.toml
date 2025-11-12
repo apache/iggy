@@ -16,7 +16,7 @@
 # under the License.
 [package]
 name = "iggy_common"
-version = "0.7.0"
+version = "0.8.0-edge.2"
 description = "Iggy is the persistent message streaming platform written in Rust, supporting QUIC, TCP and HTTP transport protocols, capable of processing millions of messages per second."
 edition = "2024"
 license = "Apache-2.0"
@@ -47,7 +47,7 @@ derive_more = { workspace = true }
 fast-async-mutex = { version = "0.6.7", optional = true }
 figment = { workspace = true }
 humantime = { workspace = true }
-rcgen = "0.14.4"
+rcgen = "0.14.5"
 rustls = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -57,3 +57,4 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
+tungstenite = { workspace = true }

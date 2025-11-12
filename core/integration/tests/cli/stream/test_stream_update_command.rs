@@ -28,7 +28,7 @@ use serial_test::parallel;
 
 struct TestStreamUpdateCmd {
     stream_id: u32,
-    name: String,
+    stream_name: String,
     new_name: String,
     using_identifier: TestStreamId,
 }
@@ -37,7 +37,7 @@ impl TestStreamUpdateCmd {
     fn new(stream_id: u32, name: String, new_name: String, using_identifier: TestStreamId) -> Self {
         Self {
             stream_id,
-            name,
+            stream_name: name,
             new_name,
             using_identifier,
         }
@@ -45,7 +45,7 @@ impl TestStreamUpdateCmd {
 
     fn to_args(&self) -> Vec<String> {
         match self.using_identifier {
-            TestStreamId::Named => vec![self.name.clone(), self.new_name.clone()],
+            TestStreamId::Named => vec![self.stream_name.clone(), self.new_name.clone()],
             TestStreamId::Numeric => {
                 vec![format!("{}", self.stream_id), self.new_name.clone()]
             }
@@ -56,7 +56,7 @@ impl TestStreamUpdateCmd {
 #[async_trait]
 impl IggyCmdTestCase for TestStreamUpdateCmd {
     async fn prepare_server_state(&mut self, client: &dyn Client) {
-        let stream = client.create_stream(&self.name, Some(self.stream_id)).await;
+        let stream = client.create_stream(&self.stream_name).await;
         assert!(stream.is_ok());
     }
 
@@ -72,7 +72,7 @@ impl IggyCmdTestCase for TestStreamUpdateCmd {
         let message = match self.using_identifier {
             TestStreamId::Named => format!(
                 "Executing update stream with ID: {} and name: {}\nStream with ID: {} updated name: {}\n",
-                self.name, self.new_name, self.name, self.new_name
+                self.stream_name, self.new_name, self.stream_name, self.new_name
             ),
             TestStreamId::Numeric => format!(
                 "Executing update stream with ID: {} and name: {}\nStream with ID: {} updated name: {}\n",
@@ -84,10 +84,17 @@ impl IggyCmdTestCase for TestStreamUpdateCmd {
     }
 
     async fn verify_server_state(&self, client: &dyn Client) {
-        let stream = client.get_stream(&self.stream_id.try_into().unwrap()).await;
+        let stream = client
+            .get_stream(&self.new_name.clone().try_into().unwrap())
+            .await;
         assert!(stream.is_ok());
         let stream = stream.unwrap().expect("Stream not found");
         assert_eq!(stream.name, self.new_name);
+
+        let delete = client
+            .delete_stream(&self.new_name.clone().try_into().unwrap())
+            .await;
+        assert!(delete.is_ok());
     }
 }
 
@@ -99,15 +106,15 @@ pub async fn should_be_successful() {
     iggy_cmd_test.setup().await;
     iggy_cmd_test
         .execute_test(TestStreamUpdateCmd::new(
-            1,
+            0,
             String::from("testing"),
             String::from("development"),
-            TestStreamId::Numeric,
+            TestStreamId::Named,
         ))
         .await;
     iggy_cmd_test
         .execute_test(TestStreamUpdateCmd::new(
-            2,
+            0,
             String::from("production"),
             String::from("prototype"),
             TestStreamId::Named,

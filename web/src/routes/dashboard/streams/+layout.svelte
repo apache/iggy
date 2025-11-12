@@ -7,7 +7,6 @@
   import Button from '$lib/components/Button.svelte';
 
   import { typedRoute } from '$lib/types/appRoutes';
-  import { arrayMax } from '$lib/utils/arrayMax';
   import { onMount } from 'svelte';
   import { resolve } from '$app/paths';
 
@@ -82,14 +81,7 @@
     </ul>
 
     <div class="p-5 pb-7">
-      <Button
-        variant="outlined"
-        class="w-full"
-        onclick={() =>
-          openModal('AddStreamModal', {
-            nextStreamId: arrayMax(data.streams.map((s) => s.id)) + 1
-          })}
-      >
+      <Button variant="outlined" class="w-full" onclick={() => openModal('AddStreamModal')}>
         <Icon name="plus" class="w-[16px] h-[16px]" strokeWidth={2} />
         New stream
       </Button>

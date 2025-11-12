@@ -106,9 +106,7 @@ fn get_command(
     #[warn(clippy::let_and_return)]
     match command {
         Command::Stream(command) => match command {
-            StreamAction::Create(args) => {
-                Box::new(CreateStreamCmd::new(args.stream_id, args.name.clone()))
-            }
+            StreamAction::Create(args) => Box::new(CreateStreamCmd::new(args.name.clone())),
             StreamAction::Delete(args) => Box::new(DeleteStreamCmd::new(args.stream_id.clone())),
             StreamAction::Update(args) => Box::new(UpdateStreamCmd::new(
                 args.stream_id.clone(),
@@ -121,7 +119,6 @@ fn get_command(
         Command::Topic(command) => match command {
             TopicAction::Create(args) => Box::new(CreateTopicCmd::new(
                 args.stream_id.clone(),
-                args.topic_id,
                 args.partitions_count,
                 args.compression_algorithm,
                 args.name.clone(),
@@ -252,7 +249,6 @@ fn get_command(
                 create_args.stream_id.clone(),
                 create_args.topic_id.clone(),
                 create_args.name.clone(),
-                create_args.group_id,
             )),
             ConsumerGroupAction::Delete(delete_args) => Box::new(DeleteConsumerGroupCmd::new(
                 delete_args.stream_id.clone(),

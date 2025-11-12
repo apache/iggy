@@ -84,7 +84,7 @@ public abstract class PersonalAccessTokensBaseTest extends IntegrationTest {
         assertThat(identityInfo).isNotNull();
 
         // when
-        var user = client.users().getUser(1L);
+        var user = client.users().getUser(0L);
 
         // then
         assertThat(user).isPresent();

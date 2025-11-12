@@ -19,6 +19,7 @@
 
 package org.apache.iggy.client.blocking;
 
+import org.apache.iggy.consumergroup.Consumer;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.Partitioning;
 import org.apache.iggy.message.PollingKind;
@@ -28,6 +29,8 @@ import org.junit.jupiter.api.Test;
 import java.math.BigInteger;
 import java.util.List;
 import static java.util.Optional.empty;
+import static org.apache.iggy.TestConstants.STREAM_NAME;
+import static org.apache.iggy.TestConstants.TOPIC_NAME;
 import static org.assertj.core.api.Assertions.assertThat;
 
 public abstract class MessagesClientBaseTest extends IntegrationTest {
@@ -48,9 +51,9 @@ public abstract class MessagesClientBaseTest extends IntegrationTest {
 
         // when
         String text = "message from java sdk";
-        messagesClient.sendMessages(42L, 42L, Partitioning.partitionId(1L), List.of(Message.of(text)));
+        messagesClient.sendMessages(STREAM_NAME, TOPIC_NAME, Partitioning.partitionId(0L), List.of(Message.of(text)));
 
-        var polledMessages = messagesClient.pollMessages(42L, 42L, empty(), 0L,
+        var polledMessages = messagesClient.pollMessages(STREAM_NAME, TOPIC_NAME, empty(), Consumer.of(0L),
                 new PollingStrategy(PollingKind.Last, BigInteger.TEN), 10L, false);
 
         // then
@@ -64,9 +67,9 @@ public abstract class MessagesClientBaseTest extends IntegrationTest {
 
         // when
         String text = "message from java sdk";
-        messagesClient.sendMessages(42L, 42L, Partitioning.balanced(), List.of(Message.of(text)));
+        messagesClient.sendMessages(STREAM_NAME, TOPIC_NAME, Partitioning.balanced(), List.of(Message.of(text)));
 
-        var polledMessages = messagesClient.pollMessages(42L, 42L, empty(), 0L,
+        var polledMessages = messagesClient.pollMessages(STREAM_NAME, TOPIC_NAME, empty(), Consumer.of(0L),
                 new PollingStrategy(PollingKind.Last, BigInteger.TEN), 10L, false);
 
         // then
@@ -80,8 +83,8 @@ public abstract class MessagesClientBaseTest extends IntegrationTest {
 
         // when
         String text = "message from java sdk";
-        messagesClient.sendMessages(42L, 42L, Partitioning.messagesKey("test-key"), List.of(Message.of(text)));
-        var polledMessages = messagesClient.pollMessages(42L, 42L, empty(), 0L,
+        messagesClient.sendMessages(STREAM_NAME, TOPIC_NAME, Partitioning.messagesKey("test-key"), List.of(Message.of(text)));
+        var polledMessages = messagesClient.pollMessages(STREAM_NAME, TOPIC_NAME, empty(), Consumer.of(0L),
                 new PollingStrategy(PollingKind.Last, BigInteger.TEN), 10L, false);
 
         // then

@@ -20,7 +20,7 @@
 import { fail, redirect } from '@sveltejs/kit';
 import type { Actions } from './$types';
 import { message, superValidate } from 'sveltekit-superforms/server';
-import { zod4 } from 'sveltekit-superforms/adapters';
+import { zod } from 'sveltekit-superforms/adapters';
 import { z } from 'zod';
 import { typedRoute } from '$lib/types/appRoutes';
 import { fetchIggyApi } from '$lib/api/fetchApi';
@@ -32,15 +32,17 @@ const schema = z.object({
   password: z.string().min(4)
 });
 
+type FormSchema = z.infer<typeof schema>;
+
 export const load = async () => {
-  const form = await superValidate(zod4(schema));
+  const form = await superValidate(zod(schema));
 
   return { form };
 };
 
 export const actions = {
   default: async ({ request, cookies }) => {
-    const form = await superValidate(request, zod4(schema));
+    const form = await superValidate(request, zod(schema));
 
     if (!form.valid) {
       return fail(400, { form });

@@ -23,8 +23,8 @@ impl Permissioner {
     pub fn poll_messages(
         &self,
         user_id: u32,
-        stream_id: u32,
-        topic_id: u32,
+        stream_id: usize,
+        topic_id: usize,
     ) -> Result<(), IggyError> {
         if self
             .users_that_can_poll_messages_from_all_streams
@@ -83,8 +83,8 @@ impl Permissioner {
     pub fn append_messages(
         &self,
         user_id: u32,
-        stream_id: u32,
-        topic_id: u32,
+        stream_id: usize,
+        topic_id: usize,
     ) -> Result<(), IggyError> {
         if self
             .users_that_can_send_messages_to_all_streams

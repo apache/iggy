@@ -20,7 +20,7 @@ use crate::http::http_transport::HttpTransport;
 use crate::prelude::{Client, HttpClientConfig, IggyDuration, IggyError};
 use async_broadcast::{Receiver, Sender, broadcast};
 use async_trait::async_trait;
-use iggy_common::locking::{IggySharedMut, IggySharedMutFn};
+use iggy_common::locking::{IggyRwLock, IggyRwLockFn};
 use iggy_common::{
     ConnectionString, ConnectionStringUtils, DiagnosticEvent, HttpConnectionStringOptions,
     IdentityInfo, TransportProtocol,
@@ -51,7 +51,7 @@ pub struct HttpClient {
     pub api_url: Url,
     pub(crate) heartbeat_interval: IggyDuration,
     client: ClientWithMiddleware,
-    access_token: IggySharedMut<String>,
+    access_token: IggyRwLock<String>,
     events: (Sender<DiagnosticEvent>, Receiver<DiagnosticEvent>),
 }
 
@@ -280,7 +280,7 @@ impl HttpClient {
             api_url,
             client,
             heartbeat_interval: IggyDuration::from_str("5s").unwrap(),
-            access_token: IggySharedMut::new("".to_string()),
+            access_token: IggyRwLock::new("".to_string()),
             events: broadcast(1000),
         })
     }

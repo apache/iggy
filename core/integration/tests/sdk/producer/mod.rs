@@ -22,9 +22,7 @@ use bytes::Bytes;
 use iggy::clients::client::IggyClient;
 use iggy::prelude::*;
 
-const STREAM_ID: u32 = 1;
-const TOPIC_ID: u32 = 1;
-const PARTITION_ID: u32 = 1;
+const PARTITION_ID: u32 = 0;
 const STREAM_NAME: &str = "test-stream-producer";
 const TOPIC_NAME: &str = "test-topic-producer";
 const PARTITIONS_COUNT: u32 = 3;
@@ -35,20 +33,16 @@ fn create_message_payload(offset: u64) -> Bytes {
 
 async fn init_system(client: &IggyClient) {
     // 1. Create the stream
-    client
-        .create_stream(STREAM_NAME, Some(STREAM_ID))
-        .await
-        .unwrap();
+    client.create_stream(STREAM_NAME).await.unwrap();
 
     // 2. Create the topic
     client
         .create_topic(
-            &Identifier::numeric(STREAM_ID).unwrap(),
+            &Identifier::named(STREAM_NAME).unwrap(),
             TOPIC_NAME,
             PARTITIONS_COUNT,
             CompressionAlgorithm::default(),
             None,
-            Some(TOPIC_ID),
             IggyExpiry::NeverExpire,
             MaxTopicSize::ServerDefault,
         )
@@ -58,7 +52,7 @@ async fn init_system(client: &IggyClient) {
 
 async fn cleanup(system_client: &IggyClient) {
     system_client
-        .delete_stream(&Identifier::numeric(STREAM_ID).unwrap())
+        .delete_stream(&Identifier::named(STREAM_NAME).unwrap())
         .await
         .unwrap();
 }

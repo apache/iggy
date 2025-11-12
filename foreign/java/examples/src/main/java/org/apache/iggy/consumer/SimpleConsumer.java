@@ -80,7 +80,7 @@ public class SimpleConsumer {
         if (stream.isPresent()) {
             return;
         }
-        client.streams().createStream(empty(), STREAM_NAME);
+        client.streams().createStream(STREAM_NAME);
     }
 
     private static void createTopic(IggyBaseClient client) {
@@ -90,7 +90,6 @@ public class SimpleConsumer {
         }
         client.topics()
                 .createTopic(STREAM_ID,
-                        empty(),
                         1L,
                         CompressionAlgorithm.None,
                         BigInteger.ZERO,
@@ -106,7 +105,7 @@ public class SimpleConsumer {
         if (consumerGroup.isPresent()) {
             return;
         }
-        client.consumerGroups().createConsumerGroup(STREAM_ID, TOPIC_ID, empty(), GROUP_NAME);
+        client.consumerGroups().createConsumerGroup(STREAM_ID, TOPIC_ID, GROUP_NAME);
     }
 
 }
