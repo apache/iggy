@@ -559,7 +559,7 @@ public sealed class TcpMessageStream : IIggyClient
                     _logger.LogInformation("Auto login enabled. Trying to login with credentials: {Username}", _configuration.AutoLoginSettings.Username);
                     await LoginUser(_configuration.AutoLoginSettings.Username, _configuration.AutoLoginSettings.Password, token);
 
-                    _currentLeaderNode = await GetCurrentLeaderNodeAsync(token); 
+                    _currentLeaderNode = await GetCurrentLeaderNodeAsync(token);
                     if (_currentLeaderNode == null)
                     {
                         break;
@@ -569,11 +569,11 @@ public sealed class TcpMessageStream : IIggyClient
                     {
                         break;
                     }
-                        
+
                     _logger.LogInformation("Leader address changed. Trying to reconnect to {Address}", _currentLeaderNode.Address);
                     continue;
                 }
-                    
+
                 break;
             }
             catch (Exception e)
@@ -619,7 +619,7 @@ public sealed class TcpMessageStream : IIggyClient
             {
                 return null;
             }
-                            
+
             var leaderNode = clusterMetadata.Nodes.FirstOrDefault(x => x.Role == ClusterNodeRole.Leader);
             if (leaderNode == null)
             {

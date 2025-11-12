@@ -15,17 +15,31 @@
 // // specific language governing permissions and limitations
 // // under the License.
 
-namespace Apache.Iggy.Exceptions;
+namespace Apache.Iggy.Contracts.Http;
 
 /// <summary>
-///     Represents an exception that is thrown when no leader is found in the cluster.
+/// Represents an error response returned by a service or API.
+/// Contains detailed information about the error that occurred.
 /// </summary>
-public class MissingLeaderException : Exception
+public class ErrorResponse
 {
     /// <summary>
-    ///     Represents an exception that is thrown when no leader node is found in the cluster.
+    /// Unique identifier associated with the error response.
     /// </summary>
-    public MissingLeaderException() : base("No leader found in the cluster")
-    {
-    }
+    public int Id { get; set; }
+
+    /// <summary>
+    /// Error code that identifies the specific type of error encountered.
+    /// </summary>
+    public string? Code { get; set; }
+
+    /// <summary>
+    /// Provides a description of the cause of the error or failure.
+    /// </summary>
+    public string? Reason { get; set; }
+
+    /// <summary>
+    /// Specifies the field associated with the error in the response.
+    /// </summary>
+    public string? Field { get; set; }
 }
