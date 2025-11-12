@@ -21,14 +21,14 @@ package org.apache.iggy.connector.flink.sink;
 
 import org.apache.flink.api.connector.sink2.SinkWriter;
 import org.apache.iggy.client.blocking.http.IggyHttpClient;
+import org.apache.iggy.connector.error.ConnectorException;
+import org.apache.iggy.connector.serialization.SerializationSchema;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.MessageHeader;
 import org.apache.iggy.message.MessageId;
 import org.apache.iggy.message.Partitioning;
-import org.apache.iggy.connector.error.ConnectorException;
-import org.apache.iggy.connector.serialization.SerializationSchema;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -38,8 +38,6 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
-import java.util.zip.CRC32;
-import java.util.zip.Checksum;
 
 /**
  * Sink writer implementation for writing records to Iggy.
@@ -73,12 +71,12 @@ public class IggySinkWriter<T> implements SinkWriter<T> {
     /**
      * Creates a new sink writer.
      *
-     * @param httpClient the HTTP Iggy client
-     * @param streamId the stream identifier
-     * @param topicId the topic identifier
-     * @param serializer the serialization schema
-     * @param batchSize maximum number of records to buffer before flushing
-     * @param flushInterval maximum time to wait before flushing
+     * @param httpClient           the HTTP Iggy client
+     * @param streamId             the stream identifier
+     * @param topicId              the topic identifier
+     * @param serializer           the serialization schema
+     * @param batchSize            maximum number of records to buffer before flushing
+     * @param flushInterval        maximum time to wait before flushing
      * @param partitioningStrategy the partitioning strategy
      */
     public IggySinkWriter(
@@ -145,7 +143,7 @@ public class IggySinkWriter<T> implements SinkWriter<T> {
         }
 
         LOGGER.debug("IggySinkWriter.flush() - flushing {} messages to stream={}, topic={}",
-            buffer.size(), streamId, topicId);
+                buffer.size(), streamId, topicId);
 
         try {
             // Serialize all buffered records
@@ -285,12 +283,8 @@ public class IggySinkWriter<T> implements SinkWriter<T> {
      * @return a Message instance
      */
     private Message createMessage(byte[] payload) {
-        Checksum crc32 = new CRC32();
-        crc32.update(payload, 0, payload.length);
-        BigInteger checksum = BigInteger.valueOf(crc32.getValue());
-
         MessageHeader header = new MessageHeader(
-                checksum,
+                BigInteger.ZERO,
                 MessageId.serverGenerated(),
                 BigInteger.ZERO,  // offset
                 BigInteger.ZERO,  // timestamp
