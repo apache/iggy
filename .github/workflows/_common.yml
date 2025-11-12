@@ -78,6 +78,39 @@ jobs:
             revert
             repo
             deps
+          scopes: |
+            bdd
+            bench
+            ci
+            cli
+            connector
+            connectors
+            csharp
+            deps
+            docs
+            example
+            go
+            helm
+            integration
+            io_uring
+            java
+            js
+            mcp
+            proc
+            pr_template
+            python
+            repo
+            rust
+            sdk
+            security
+            server
+            test
+            web
+            consensus
+            cluster
+            metadata
+            message_bus
+            storage
 
   license-headers:
     name: Check license headers
