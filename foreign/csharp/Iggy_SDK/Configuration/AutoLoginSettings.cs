@@ -1,4 +1,4 @@
-// Licensed to the Apache Software Foundation (ASF) under one
+﻿// Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
 // regarding copyright ownership.  The ASF licenses this file
@@ -15,20 +15,22 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Apache.Iggy.Enums;
-using Microsoft.Extensions.Logging;
-using Microsoft.Extensions.Logging.Abstractions;
-
 namespace Apache.Iggy.Configuration;
 
-public sealed class IggyClientConfigurator
+public class AutoLoginSettings
 {
-    public required string BaseAddress { get; set; }
-    public required Protocol Protocol { get; set; }
-    public int ReceiveBufferSize { get; set; } = 4096;
-    public int SendBufferSize { get; set; } = 4096;
-    public TlsSettings TlsSettings { get; set; } = new();
-    public ReconnectionSettings ReconnectionSettings { get; set; } = new();
-    public AutoLoginSettings AutoLoginSettings { get; set; } = new();
-    public ILoggerFactory LoggerFactory { get; set; } = NullLoggerFactory.Instance;
+    /// <summary>
+    ///     Enable automatic login on connection establishment
+    /// </summary>
+    public bool Enabled { get; set; }
+
+    /// <summary>
+    ///     Specifies the username for auto-login configuration.
+    /// </summary>
+    public string Username { get; set; } = string.Empty;
+
+    /// <summary>
+    ///     Specifies the password for auto-login authentication
+    /// </summary>
+    public string Password { get; set; } = string.Empty;
 }

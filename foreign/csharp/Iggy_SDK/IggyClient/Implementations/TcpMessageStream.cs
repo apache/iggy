@@ -45,6 +45,8 @@ public sealed class TcpMessageStream : IIggyClient
     private DateTimeOffset _lastConnectionTime;
     private ConnectionState _state = ConnectionState.Disconnected;
     private TcpConnectionStream _stream = null!;
+    private bool _isConnecting;
+    private ClusterNode? _currentLeaderNode;
 
     internal TcpMessageStream(IggyClientConfigurator configuration, ILoggerFactory loggerFactory)
     {
@@ -504,7 +506,19 @@ public sealed class TcpMessageStream : IIggyClient
         }
 
         SetConnectionState(ConnectionState.Connecting);
+        _isConnecting = true;
+        try
+        {
+            await TryEstablishConnectionAsync(token);
+        }
+        finally
+        {
+            _isConnecting = false;
+        }
+    }
 
+    private async Task TryEstablishConnectionAsync(CancellationToken token)
+    {
         var retryCount = 0;
         var delay = _configuration.ReconnectionSettings.InitialDelay;
         do
@@ -513,7 +527,8 @@ public sealed class TcpMessageStream : IIggyClient
             _stream?.Close();
             _stream?.Dispose();
 
-            var urlPortSplitter = _configuration.BaseAddress.Split(":");
+            var connectionAddress = _currentLeaderNode?.Address ?? _configuration.BaseAddress;
+            var urlPortSplitter = connectionAddress.Split(":");
             if (urlPortSplitter.Length > 2)
             {
                 throw new InvalidBaseAdressException();
@@ -539,6 +554,26 @@ public sealed class TcpMessageStream : IIggyClient
                     false => new TcpConnectionStream(new NetworkStream(socket))
                 };
 
+                if (_configuration.AutoLoginSettings.Enabled)
+                {
+                    _logger.LogInformation("Auto login enabled. Trying to login with credentials: {Username}", _configuration.AutoLoginSettings.Username);
+                    await LoginUser(_configuration.AutoLoginSettings.Username, _configuration.AutoLoginSettings.Password, token);
+
+                    _currentLeaderNode = await GetCurrentLeaderNodeAsync(token); 
+                    if (_currentLeaderNode == null)
+                    {
+                        break;
+                    }
+
+                    if (_currentLeaderNode.Address == _configuration.BaseAddress)
+                    {
+                        break;
+                    }
+                        
+                    _logger.LogInformation("Leader address changed. Trying to reconnect to {Address}", _currentLeaderNode.Address);
+                    continue;
+                }
+                    
                 break;
             }
             catch (Exception e)
@@ -573,6 +608,31 @@ public sealed class TcpMessageStream : IIggyClient
                 await Task.Delay(delay, token);
             }
         } while (true);
+    }
+
+    private async Task<ClusterNode?> GetCurrentLeaderNodeAsync(CancellationToken token)
+    {
+        try
+        {
+            var clusterMetadata = await GetClusterMetadataAsync(token);
+            if (clusterMetadata == null)
+            {
+                return null;
+            }
+                            
+            var leaderNode = clusterMetadata.Nodes.FirstOrDefault(x => x.Role == ClusterNodeRole.Leader);
+            if (leaderNode == null)
+            {
+                throw new MissingLeaderException();
+            }
+
+            return leaderNode;
+        }
+        // todo: change after error refactoring, error code 5 is for feature not supported
+        catch (IggyInvalidStatusCodeException e) when (e.StatusCode == 5)
+        {
+            return null;
+        }
     }
 
     public async Task<IReadOnlyList<ClientResponse>> GetClientsAsync(CancellationToken token = default)
@@ -809,7 +869,7 @@ public sealed class TcpMessageStream : IIggyClient
         {
             return await SendRawAsync(payload, token);
         }
-        catch (Exception e) when (IsConnectionException(e))
+        catch (Exception e) when (IsConnectionException(e) && !_isConnecting)
         {
             _logger.LogWarning("Connection lost");
             if (!_configuration.ReconnectionSettings.Enabled)
@@ -842,24 +902,6 @@ public sealed class TcpMessageStream : IIggyClient
             await ConnectAsync(token);
 
             _logger.LogInformation("Reconnected to the server");
-
-            if (_configuration.ReconnectionSettings.ReauthenticateOnReconnect)
-            {
-                _logger.LogInformation("Trying to reauthenticate");
-                var response = await LoginUser(_configuration.ReconnectionSettings.Username,
-                    _configuration.ReconnectionSettings.Password, token);
-                if (response is null)
-                {
-                    _logger.LogError("Failed to reauthenticate");
-                    _stream.Close();
-                    _stream.Dispose();
-                    SetConnectionState(ConnectionState.Disconnected);
-                    throw new FailedToAuthorizeException("Failed to reauthenticate");
-                }
-
-                _logger.LogInformation("Reauthenticated as {Username}",
-                    _configuration.ReconnectionSettings.Username);
-            }
 
             await Task.Delay(_configuration.ReconnectionSettings.WaitAfterReconnect, token);
 
@@ -907,7 +949,7 @@ public sealed class TcpMessageStream : IIggyClient
             {
                 if (response.Length == 0)
                 {
-                    throw new InvalidResponseException($"Invalid response status code: {response.Status}");
+                    throw new IggyInvalidStatusCodeException(response.Status, $"Invalid response status code: {response.Status}");
                 }
 
                 var errorBuffer = new byte[response.Length];

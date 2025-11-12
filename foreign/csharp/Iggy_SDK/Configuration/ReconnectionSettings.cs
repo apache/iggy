@@ -57,19 +57,4 @@ public sealed class ReconnectionSettings
     ///     Multiplier for exponential backoff (default: 2.0)
     /// </summary>
     public double BackoffMultiplier { get; set; } = 2.0;
-
-    /// <summary>
-    ///     Whether to re-authenticate after reconnection (if previously authenticated)
-    /// </summary>
-    public bool ReauthenticateOnReconnect { get; set; } = true;
-
-    /// <summary>
-    ///     Specifies the username for auto-login configuration.
-    /// </summary>
-    public string Username { get; set; } = string.Empty;
-
-    /// <summary>
-    ///     Specifies the password for auto-login authentication
-    /// </summary>
-    public string Password { get; set; } = string.Empty;
 }

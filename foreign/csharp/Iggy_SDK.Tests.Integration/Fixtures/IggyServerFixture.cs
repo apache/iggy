@@ -21,8 +21,6 @@ using Apache.Iggy.Factory;
 using Apache.Iggy.IggyClient;
 using DotNet.Testcontainers.Builders;
 using DotNet.Testcontainers.Containers;
-using DotNet.Testcontainers.Images;
-using Microsoft.Extensions.Logging.Abstractions;
 using TUnit.Core.Interfaces;
 using TUnit.Core.Logging;
 
@@ -30,7 +28,7 @@ namespace Apache.Iggy.Tests.Integrations.Fixtures;
 
 public class IggyServerFixture : IAsyncInitializer, IAsyncDisposable
 {
-    private readonly IContainer _iggyContainer = new ContainerBuilder().WithImage("apache/iggy:0.6.0-edge.1")
+    private readonly IContainer _iggyContainer = new ContainerBuilder().WithImage("apache/iggy:0.6.0-edge.2")
         .WithPortBinding(3000, true)
         .WithPortBinding(8090, true)
         .WithOutputConsumer(Consume.RedirectStdoutAndStderrToConsole())
@@ -40,14 +38,14 @@ public class IggyServerFixture : IAsyncInitializer, IAsyncDisposable
         .WithEnvironment("IGGY_ROOT_PASSWORD", "iggy")
         .WithEnvironment("IGGY_TCP_ADDRESS", "0.0.0.0:8090")
         .WithEnvironment("IGGY_HTTP_ADDRESS", "0.0.0.0:3000")
-        .WithEnvironment("IGGY_CLUSTER_ENABLED", "true")
-        .WithEnvironment("IGGY_CLUSTER_NODES_0_NAME", "iggy-node-1")
-        .WithEnvironment("IGGY_CLUSTER_NODES_0_ADDRESS", "127.0.0.1:8090")
-        .WithEnvironment("IGGY_CLUSTER_NODES_1_NAME", "iggy-node-2")
-        .WithEnvironment("IGGY_CLUSTER_NODES_1_ADDRESS", "127.0.0.1:8092")
-        .WithEnvironment("IGGY_CLUSTER_ENABLED", "true")
-        .WithEnvironment("IGGY_CLUSTER_ENABLED", "true")
-        .WithEnvironment("IGGY_CLUSTER_ENABLED", "true")
+        //.WithEnvironment("IGGY_CLUSTER_ENABLED", "true")
+        // .WithEnvironment("IGGY_CLUSTER_NODES_0_NAME", "iggy-node-1")
+        // .WithEnvironment("IGGY_CLUSTER_NODES_0_ADDRESS", "127.0.0.1:8090")
+        // .WithEnvironment("IGGY_CLUSTER_NODES_1_NAME", "iggy-node-2")
+        // .WithEnvironment("IGGY_CLUSTER_NODES_1_ADDRESS", "127.0.0.1:8092")
+        // .WithEnvironment("IGGY_CLUSTER_ENABLED", "true")
+        // .WithEnvironment("IGGY_CLUSTER_ENABLED", "true")
+        // .WithEnvironment("IGGY_CLUSTER_ENABLED", "true")
         //.WithEnvironment("IGGY_SYSTEM_LOGGING_LEVEL", "trace")
         //.WithEnvironment("RUST_LOG", "trace")
         .WithPrivileged(true)
@@ -87,7 +85,7 @@ public class IggyServerFixture : IAsyncInitializer, IAsyncDisposable
         }
 
         await CreateTcpClient();
-        //await CreateHttpClient();
+        await CreateHttpClient();
     }
 
     public async Task<Dictionary<Protocol, IIggyClient>> CreateClients()
@@ -127,7 +125,17 @@ public class IggyServerFixture : IAsyncInitializer, IAsyncDisposable
         var client = IggyClientFactory.CreateClient(new IggyClientConfigurator()
         {
             BaseAddress = address,
-            Protocol = protocol
+            Protocol = protocol,
+            ReconnectionSettings = new ReconnectionSettings()
+            {
+                Enabled = true
+            },
+            AutoLoginSettings = new AutoLoginSettings()
+            {
+                Enabled = true,
+                Username = "iggy",
+                Password = "iggy"
+            }
         });
 
         if (connect)
