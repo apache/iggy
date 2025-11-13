@@ -203,11 +203,11 @@ impl FileState {
                 .map_err(|_| IggyError::InvalidNumberEncoding)?;
             total_size += 4;
             let checksum = cursor
-                .read_u32_le()
+                .read_u64_le()
                 .await
                 .with_error(|error| format!("{FILE_STATE_PARSE_ERROR} checksum. {error}"))
                 .map_err(|_| IggyError::InvalidNumberEncoding)?;
-            total_size += 4;
+            total_size += 8;
             let context_length = cursor
                 .read_u32_le()
                 .await

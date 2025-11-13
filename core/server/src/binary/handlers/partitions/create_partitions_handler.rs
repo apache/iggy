@@ -70,7 +70,7 @@ impl ServerCommandHandler for CreatePartitions {
         shard.streams.with_topic_by_id_mut(
             &self.stream_id,
             &self.topic_id,
-            topics::helpers::rebalance_consumer_group(&partition_ids),
+            topics::helpers::rebalance_consumer_groups(&partition_ids),
         );
 
         let stream_id = shard

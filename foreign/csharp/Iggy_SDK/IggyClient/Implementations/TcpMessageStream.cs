@@ -1027,7 +1027,7 @@ public sealed class TcpMessageStream : IIggyClient
     {
         // Original: 14 + 5 + 2 + streamId.Length + 2 + topicId.Length + 2 + consumer.Id.Length
         // Added 1 byte for partition flag
-        return 15 + 5 + 2 + streamId.Length + 2 + topicId.Length + 2 + consumer.Id.Length;
+        return 15 + 5 + 2 + streamId.Length + 2 + topicId.Length + 2 + consumer.ConsumerId.Length;
     }
 
     /// <summary>

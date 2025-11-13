@@ -17,7 +17,7 @@
 
 [package]
 name = "iggy-connectors"
-version = "0.2.0-edge.2"
+version = "0.2.0-edge.3"
 description = "Connectors runtime for Iggy message streaming platform"
 edition = "2024"
 license = "Apache-2.0"

@@ -22,23 +22,24 @@ use crate::Validatable;
 use crate::error::IggyError;
 use bytes::{BufMut, Bytes, BytesMut};
 use clap::ValueEnum;
-use serde::{Deserialize, Serialize};
-use serde_with::{DisplayFromStr, serde_as};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::fmt::Display;
+use std::str::FromStr;
 
 /// `Consumer` represents the type of consumer that is consuming a message.
 /// It can be either a `Consumer` or a `ConsumerGroup`.
 /// It consists of the following fields:
 /// - `kind`: the type of consumer. It can be either `Consumer` or `ConsumerGroup`.
 /// - `id`: the unique identifier of the consumer.
-#[serde_as]
 #[derive(Debug, Serialize, Deserialize, PartialEq, Default, Clone)]
 pub struct Consumer {
     /// The type of consumer. It can be either `Consumer` or `ConsumerGroup`.
     #[serde(skip)]
     pub kind: ConsumerKind,
     /// The unique identifier of the consumer.
-    #[serde_as(as = "DisplayFromStr")]
+    #[serde(rename = "consumer_id")]
+    #[serde(serialize_with = "serialize_identifier")]
+    #[serde(deserialize_with = "deserialize_identifier")]
     #[serde(default = "default_id")]
     pub id: Identifier,
 }
@@ -150,4 +151,78 @@ impl Display for ConsumerKind {
             ConsumerKind::ConsumerGroup => write!(f, "consumer_group"),
         }
     }
+}
+
+fn serialize_identifier<S>(id: &Identifier, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(&id.to_string())
+}
+
+fn deserialize_identifier<'de, D>(deserializer: D) -> Result<Identifier, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct IdentifierVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for IdentifierVisitor {
+        type Value = Identifier;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a string or number representing an identifier")
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Identifier::from_str(value).map_err(serde::de::Error::custom)
+        }
+
+        fn visit_u32<E>(self, value: u32) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Identifier::numeric(value).map_err(serde::de::Error::custom)
+        }
+
+        fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            if value > u32::MAX as u64 {
+                return Err(serde::de::Error::custom(
+                    "numeric identifier must fit in u32",
+                ));
+            }
+            Identifier::numeric(value as u32).map_err(serde::de::Error::custom)
+        }
+
+        fn visit_i32<E>(self, value: i32) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            if value < 0 {
+                return Err(serde::de::Error::custom(
+                    "numeric identifier must be positive",
+                ));
+            }
+            Identifier::numeric(value as u32).map_err(serde::de::Error::custom)
+        }
+
+        fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            if value < 0 || value > u32::MAX as i64 {
+                return Err(serde::de::Error::custom(
+                    "numeric identifier must be a positive u32",
+                ));
+            }
+            Identifier::numeric(value as u32).map_err(serde::de::Error::custom)
+        }
+    }
+
+    deserializer.deserialize_any(IdentifierVisitor)
 }

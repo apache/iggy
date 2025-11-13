@@ -368,8 +368,8 @@ internal static class TcpContracts
         uint count, bool autoCommit, uint? partitionId)
     {
         bytes[0] = GetConsumerTypeByte(consumer.Type);
-        bytes.WriteBytesFromIdentifier(consumer.Id, 1);
-        var position = 1 + consumer.Id.Length + 2;
+        bytes.WriteBytesFromIdentifier(consumer.ConsumerId, 1);
+        var position = 1 + consumer.ConsumerId.Length + 2;
         bytes.WriteBytesFromStreamAndTopicIdentifiers(streamId, topicId, position);
         position += 2 + streamId.Length + 2 + topicId.Length;
 
@@ -738,10 +738,10 @@ internal static class TcpContracts
         uint? partitionId)
     {
         Span<byte> bytes =
-            stackalloc byte[2 + streamId.Length + 2 + topicId.Length + 13 + 1 + 2 + consumer.Id.Length];
+            stackalloc byte[2 + streamId.Length + 2 + topicId.Length + 13 + 1 + 2 + consumer.ConsumerId.Length];
         bytes[0] = GetConsumerTypeByte(consumer.Type);
-        bytes.WriteBytesFromIdentifier(consumer.Id, 1);
-        var position = 1 + consumer.Id.Length + 2;
+        bytes.WriteBytesFromIdentifier(consumer.ConsumerId, 1);
+        var position = 1 + consumer.ConsumerId.Length + 2;
         bytes.WriteBytesFromStreamAndTopicIdentifiers(streamId, topicId, position);
         position += 2 + streamId.Length + 2 + topicId.Length;
 
@@ -764,10 +764,10 @@ internal static class TcpContracts
     internal static byte[] GetOffset(Identifier streamId, Identifier topicId, Consumer consumer, uint? partitionId)
     {
         Span<byte> bytes =
-            stackalloc byte[2 + streamId.Length + 2 + topicId.Length + 5 + 1 + 2 + consumer.Id.Length];
+            stackalloc byte[2 + streamId.Length + 2 + topicId.Length + 5 + 1 + 2 + consumer.ConsumerId.Length];
         bytes[0] = GetConsumerTypeByte(consumer.Type);
-        bytes.WriteBytesFromIdentifier(consumer.Id, 1);
-        var position = 1 + consumer.Id.Length + 2;
+        bytes.WriteBytesFromIdentifier(consumer.ConsumerId, 1);
+        var position = 1 + consumer.ConsumerId.Length + 2;
         bytes.WriteBytesFromStreamAndTopicIdentifiers(streamId, topicId, position);
         position += 2 + streamId.Length + 2 + topicId.Length;
 
@@ -832,10 +832,10 @@ internal static class TcpContracts
     internal static byte[] DeleteOffset(Identifier streamId, Identifier topicId, Consumer consumer, uint? partitionId)
     {
         Span<byte> bytes =
-            stackalloc byte[2 + streamId.Length + 2 + topicId.Length + 5 + 1 + 2 + consumer.Id.Length];
+            stackalloc byte[2 + streamId.Length + 2 + topicId.Length + 5 + 1 + 2 + consumer.ConsumerId.Length];
         bytes[0] = GetConsumerTypeByte(consumer.Type);
-        bytes.WriteBytesFromIdentifier(consumer.Id, 1);
-        var position = 1 + consumer.Id.Length + 2;
+        bytes.WriteBytesFromIdentifier(consumer.ConsumerId, 1);
+        var position = 1 + consumer.ConsumerId.Length + 2;
         bytes.WriteBytesFromStreamAndTopicIdentifiers(streamId, topicId, position);
         position += 2 + streamId.Length + 2 + topicId.Length;
 
