@@ -206,7 +206,7 @@ public partial class IggyConsumer : IAsyncDisposable
     }
 
     /// <summary>
-    ///     
+    ///     Unsubscribe from error events
     /// </summary>
     /// <param name="callback"></param>
     public void UnsubscribeFromErrorEvents(Func<ConsumerErrorEventArgs, Task> callback)

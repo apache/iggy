@@ -45,9 +45,10 @@ var consumer = client.CreateConsumerBuilder(Identifier.String("new-sdk-stream"),
     .WithBatchSize(20)
     .WithAutoCommitMode(AutoCommitMode.AfterReceive)
     .WithLogger(loggerFactory)
-    .SubscribeOnPollingError((s, e) =>
+    .SubscribeOnPollingError(e =>
     {
         logger.LogError("Polling error: {Message}", e.Exception.Message);
+        return Task.CompletedTask;
     })
     .Build();
 
