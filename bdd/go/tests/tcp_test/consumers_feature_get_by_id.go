@@ -50,7 +50,7 @@ var _ = ginkgo.Describe("GET CONSUMER GROUP BY ID:", func() {
 				randomU32Identifier(),
 			)
 
-			itShouldReturnSpecificIggyError(err, ierror.ConsumerGroupIdNotFound)
+			itShouldReturnSpecificError(err, ierror.ErrConsumerGroupIdNotFound)
 		})
 
 		ginkgo.Context("and tries to get consumer from non-existing topic", func() {
@@ -64,7 +64,7 @@ var _ = ginkgo.Describe("GET CONSUMER GROUP BY ID:", func() {
 				randomU32Identifier(),
 			)
 
-			itShouldReturnSpecificIggyError(err, ierror.ConsumerGroupIdNotFound)
+			itShouldReturnSpecificError(err, ierror.ErrConsumerGroupIdNotFound)
 		})
 
 		ginkgo.Context("and tries to get from non-existing consumer", func() {
@@ -80,7 +80,7 @@ var _ = ginkgo.Describe("GET CONSUMER GROUP BY ID:", func() {
 				randomU32Identifier(),
 			)
 
-			itShouldReturnSpecificIggyError(err, ierror.ConsumerGroupIdNotFound)
+			itShouldReturnSpecificError(err, ierror.ErrConsumerGroupIdNotFound)
 		})
 	})
 

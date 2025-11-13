@@ -87,8 +87,8 @@ impl BenchmarkKindProps for BalancedProducerAndConsumerGroupArgs {
     }
 
     fn validate(&self) {
-        let cg_number = self.consumer_groups.get();
-        let streams = self.streams.get();
+        let cg_number = self.number_of_consumer_groups();
+        let streams = self.streams();
         let mut cmd = IggyBenchArgs::command();
 
         if cg_number < streams {
@@ -99,8 +99,8 @@ impl BenchmarkKindProps for BalancedProducerAndConsumerGroupArgs {
             .exit();
         }
 
-        let partitions = self.partitions.get();
-        let consumers = self.consumers.get();
+        let partitions = self.partitions();
+        let consumers = self.consumers();
 
         if partitions < consumers {
             cmd.error(

@@ -33,7 +33,7 @@ export type PollMessages = {
   streamId: Id,
   topicId: Id,
   consumer: Consumer,
-  partitionId: number,
+  partitionId: number | null,
   pollingStrategy: PollingStrategy,
   count: number,
   autocommit: boolean

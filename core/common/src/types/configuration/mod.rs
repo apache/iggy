@@ -20,3 +20,4 @@ pub(crate) mod http_config;
 pub(crate) mod quic_config;
 pub(crate) mod tcp_config;
 pub(crate) mod transport;
+pub(crate) mod websocket_config;

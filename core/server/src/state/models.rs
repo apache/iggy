@@ -18,7 +18,7 @@
 
 use crate::state::COMPONENT;
 use bytes::{BufMut, Bytes, BytesMut};
-use error_set::ErrContext;
+use err_trail::ErrContext;
 use iggy_common::BytesSerializable;
 use iggy_common::Command;
 use iggy_common::IggyError;
@@ -191,7 +191,7 @@ impl BytesSerializable for CreateStreamWithId {
         let stream_id = u32::from_le_bytes(
             bytes[position..4]
                 .try_into()
-                .with_error_context(|error| {
+                .with_error(|error| {
                     format!("{COMPONENT} (error: {error}) - failed to parse stream ID")
                 })
                 .map_err(|_| IggyError::InvalidNumberEncoding)?,
@@ -200,14 +200,14 @@ impl BytesSerializable for CreateStreamWithId {
         let command_length = u32::from_le_bytes(
             bytes[position..position + 4]
                 .try_into()
-                .with_error_context(|error| {
+                .with_error(|error| {
                     format!("{COMPONENT} (error: {error}) - failed to parse stream command length")
                 })
                 .map_err(|_| IggyError::InvalidNumberEncoding)?,
         );
         position += 4;
         let command_bytes = bytes.slice(position..position + command_length as usize);
-        let command = CreateStream::from_bytes(command_bytes).with_error_context(|error| {
+        let command = CreateStream::from_bytes(command_bytes).with_error(|error| {
             format!("{COMPONENT} (error: {error}) - failed to parse stream command")
         })?;
         Ok(Self { stream_id, command })
@@ -232,7 +232,7 @@ impl BytesSerializable for CreateTopicWithId {
         let topic_id = u32::from_le_bytes(
             bytes[position..4]
                 .try_into()
-                .with_error_context(|error| {
+                .with_error(|error| {
                     format!("{COMPONENT} (error: {error}) - failed to parse topic ID")
                 })
                 .map_err(|_| IggyError::InvalidNumberEncoding)?,
@@ -241,14 +241,14 @@ impl BytesSerializable for CreateTopicWithId {
         let command_length = u32::from_le_bytes(
             bytes[position..position + 4]
                 .try_into()
-                .with_error_context(|error| {
+                .with_error(|error| {
                     format!("{COMPONENT} (error: {error}) - failed to parse topic command length")
                 })
                 .map_err(|_| IggyError::InvalidNumberEncoding)?,
         );
         position += 4;
         let command_bytes = bytes.slice(position..position + command_length as usize);
-        let command = CreateTopic::from_bytes(command_bytes).with_error_context(|error| {
+        let command = CreateTopic::from_bytes(command_bytes).with_error(|error| {
             format!("{COMPONENT} (error: {error}) - failed to parse topic command")
         })?;
         Ok(Self { topic_id, command })
@@ -273,7 +273,7 @@ impl BytesSerializable for CreateConsumerGroupWithId {
         let group_id = u32::from_le_bytes(
             bytes[position..4]
                 .try_into()
-                .with_error_context(|error| {
+                .with_error(|error| {
                     format!("{COMPONENT} (error: {error}) - failed to parse consumer group ID")
                 })
                 .map_err(|_| IggyError::InvalidNumberEncoding)?,
@@ -282,17 +282,16 @@ impl BytesSerializable for CreateConsumerGroupWithId {
         let command_length = u32::from_le_bytes(
             bytes[position..position + 4]
                 .try_into()
-                .with_error_context(|error| {
+                .with_error(|error| {
                     format!("{COMPONENT} (error: {error}) - failed to parse consumer group command length")
                 })
                 .map_err(|_| IggyError::InvalidNumberEncoding)?,
         );
         position += 4;
         let command_bytes = bytes.slice(position..position + command_length as usize);
-        let command =
-            CreateConsumerGroup::from_bytes(command_bytes).with_error_context(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to parse consumer group command")
-            })?;
+        let command = CreateConsumerGroup::from_bytes(command_bytes).with_error(|error| {
+            format!("{COMPONENT} (error: {error}) - failed to parse consumer group command")
+        })?;
         Ok(Self { group_id, command })
     }
 }
@@ -315,7 +314,7 @@ impl BytesSerializable for CreateUserWithId {
         let user_id = u32::from_le_bytes(
             bytes[position..4]
                 .try_into()
-                .with_error_context(|error| {
+                .with_error(|error| {
                     format!("{COMPONENT} (error: {error}) - failed to parse user ID")
                 })
                 .map_err(|_| IggyError::InvalidNumberEncoding)?,
@@ -324,14 +323,14 @@ impl BytesSerializable for CreateUserWithId {
         let command_length = u32::from_le_bytes(
             bytes[position..position + 4]
                 .try_into()
-                .with_error_context(|error| {
+                .with_error(|error| {
                     format!("{COMPONENT} (error: {error}) - failed to parse user command length")
                 })
                 .map_err(|_| IggyError::InvalidNumberEncoding)?,
         );
         position += 4;
         let command_bytes = bytes.slice(position..position + command_length as usize);
-        let command = CreateUser::from_bytes(command_bytes).with_error_context(|error| {
+        let command = CreateUser::from_bytes(command_bytes).with_error(|error| {
             format!("{COMPONENT} (error: {error}) - failed to parse user command")
         })?;
         Ok(Self { user_id, command })
@@ -357,7 +356,7 @@ impl BytesSerializable for CreatePersonalAccessTokenWithHash {
         let hash_length = u32::from_le_bytes(
             bytes[position..4]
                 .try_into()
-                .with_error_context(|error| {
+                .with_error(|error| {
                     format!("{COMPONENT} (error: {error}) - failed to parse hash length")
                 })
                 .map_err(|_| IggyError::InvalidNumberEncoding)?,
@@ -371,19 +370,16 @@ impl BytesSerializable for CreatePersonalAccessTokenWithHash {
         let command_length = u32::from_le_bytes(
             bytes[position..position + 4]
                 .try_into()
-                .with_error_context(|error| {
+                .with_error(|error| {
                     format!("{COMPONENT} (error: {error}) - failed to parse personal access token command length")
                 })
                 .map_err(|_| IggyError::InvalidNumberEncoding)?,
         );
         position += 4;
         let command_bytes = bytes.slice(position..position + command_length as usize);
-        let command =
-            CreatePersonalAccessToken::from_bytes(command_bytes).with_error_context(|error| {
-                format!(
-                    "{COMPONENT} (error: {error}) - failed to parse personal access token command"
-                )
-            })?;
+        let command = CreatePersonalAccessToken::from_bytes(command_bytes).with_error(|error| {
+            format!("{COMPONENT} (error: {error}) - failed to parse personal access token command")
+        })?;
         Ok(Self { hash, command })
     }
 }

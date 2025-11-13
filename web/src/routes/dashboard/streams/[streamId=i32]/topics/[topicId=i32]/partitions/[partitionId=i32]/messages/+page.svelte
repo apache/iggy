@@ -3,6 +3,7 @@
   import Button from '$lib/components/Button.svelte';
   import Icon from '$lib/components/Icon.svelte';
   import { goto } from '$app/navigation';
+  import { resolve } from '$app/paths';
   import { openModal } from '$lib/components/Modals/AppModals.svelte';
   import SortableList from '$lib/components/SortableList.svelte';
   import Paginator from '$lib/components/Paginator.svelte';
@@ -14,7 +15,6 @@
       partitionMessages: MessagePartition;
       topic: TopicDetails;
       pagination: {
-        offset: number;
         count: number;
       };
     };
@@ -23,7 +23,9 @@
   let { data }: Props = $props();
   let topic = $derived(data.topic);
   let partitionMessages = $derived(data.partitionMessages);
-  let prevPage = $derived(page.url.pathname.split('/').slice(0, 6).join('/') + '/');
+  let prevPage = $derived(
+    `/dashboard/streams/${page.params.streamId}/topics/${page.params.topicId}/partitions/`
+  );
 
   let direction = $state(page.url.searchParams.get('direction') || 'desc');
   let currentPage = $state(1);
@@ -45,7 +47,7 @@
     const url = new URL(window.location.href);
     url.searchParams.set('offset', offset.toString());
     url.searchParams.set('direction', direction);
-    await goto(url, { keepFocus: true, noScroll: true });
+    await goto(resolve(url.toString()), { keepFocus: true, noScroll: true });
     currentPage = page;
   }
 
@@ -61,7 +63,7 @@
 </script>
 
 <div class="h-[80px] flex text-xs items-center pl-2 pr-5">
-  <Button variant="rounded" class="mr-5" onclick={() => goto(prevPage)}>
+  <Button variant="rounded" class="mr-5" onclick={() => goto(resolve(prevPage))}>
     <Icon name="arrowLeft" class="h-[40px] w-[30px]" />
   </Button>
 
@@ -71,7 +73,11 @@
 
   <div class="flex gap-3 ml-7">
     <div class="chip">
-      <span>Messages: {partitionMessages.messages.length > 0 ? partitionMessages.currentOffset + 1 : 0}</span>
+      <span
+        >Messages: {partitionMessages.messages.length > 0
+          ? partitionMessages.currentOffset + 1
+          : 0}</span
+      >
     </div>
   </div>
 
@@ -116,4 +122,3 @@
 <div class="mt-2 mb-2">
   <Paginator {currentPage} {totalPages} maxVisiblePages={5} on:pageChange={onPageChange} />
 </div>
-

@@ -26,9 +26,8 @@ public interface IIggyTopic
     Task<TopicResponse?> GetTopicByIdAsync(Identifier streamId, Identifier topicId, CancellationToken token = default);
 
     Task<TopicResponse?> CreateTopicAsync(Identifier streamId, string name, uint partitionsCount,
-        CompressionAlgorithm compressionAlgorithm = CompressionAlgorithm.None, uint? topicId = null,
-        byte? replicationFactor = null, ulong messageExpiry = 0, ulong maxTopicSize = 0,
-        CancellationToken token = default);
+        CompressionAlgorithm compressionAlgorithm = CompressionAlgorithm.None, byte? replicationFactor = null,
+        ulong messageExpiry = 0, ulong maxTopicSize = 0, CancellationToken token = default);
 
     Task UpdateTopicAsync(Identifier streamId, Identifier topicId, string name,
         CompressionAlgorithm compressionAlgorithm = CompressionAlgorithm.None, ulong maxTopicSize = 0,

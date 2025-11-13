@@ -20,7 +20,7 @@ use crate::streaming::users::permissioner::Permissioner;
 use iggy_common::IggyError;
 
 impl Permissioner {
-    pub fn get_stream(&self, user_id: u32, stream_id: u32) -> Result<(), IggyError> {
+    pub fn get_stream(&self, user_id: u32, stream_id: usize) -> Result<(), IggyError> {
         if let Some(global_permissions) = self.users_permissions.get(&user_id)
             && (global_permissions.manage_streams || global_permissions.read_streams)
         {
@@ -56,19 +56,19 @@ impl Permissioner {
         Err(IggyError::Unauthorized)
     }
 
-    pub fn update_stream(&self, user_id: u32, stream_id: u32) -> Result<(), IggyError> {
+    pub fn update_stream(&self, user_id: u32, stream_id: usize) -> Result<(), IggyError> {
         self.manage_stream(user_id, stream_id)
     }
 
-    pub fn delete_stream(&self, user_id: u32, stream_id: u32) -> Result<(), IggyError> {
+    pub fn delete_stream(&self, user_id: u32, stream_id: usize) -> Result<(), IggyError> {
         self.manage_stream(user_id, stream_id)
     }
 
-    pub fn purge_stream(&self, user_id: u32, stream_id: u32) -> Result<(), IggyError> {
+    pub fn purge_stream(&self, user_id: u32, stream_id: usize) -> Result<(), IggyError> {
         self.manage_stream(user_id, stream_id)
     }
 
-    fn manage_stream(&self, user_id: u32, stream_id: u32) -> Result<(), IggyError> {
+    fn manage_stream(&self, user_id: u32, stream_id: usize) -> Result<(), IggyError> {
         if let Some(global_permissions) = self.users_permissions.get(&user_id)
             && global_permissions.manage_streams
         {

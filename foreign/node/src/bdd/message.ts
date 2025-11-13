@@ -21,11 +21,13 @@
 import assert from 'node:assert/strict';
 import { When, Then } from "@cucumber/cucumber";
 import { Consumer,  PollingStrategy, Partitioning } from '../wire/index.js';
-import { someMessageContent } from '../tcp.sm.utils.js';
 import type { TestWorld } from './world.js';
 
 const generateTestMessages = (count = 1) => {
-  return [...Array(count)].map((_, i) => ({ id: i + 1, ...someMessageContent() }));
+  return [...Array(count)].map((_, i) => ({
+    id: i + 1,
+    payload: Buffer.from(`Test message ${i}`)
+  }));
 }
 
 When(
@@ -81,7 +83,7 @@ When(
 
 Then(
   'I should receive {int} messages',
-  function (msgCount: number) {
+  function (this: TestWorld, msgCount: number) {
     assert.equal(this.polledMessages.length, msgCount);
   }
 );

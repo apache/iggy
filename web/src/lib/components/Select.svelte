@@ -4,8 +4,7 @@
   const bubble = createBubbler();
   import type { HTMLInputTypeAttribute } from 'svelte/elements';
   import { twMerge } from 'tailwind-merge';
-
-  
+  import { v4 as uuidv4 } from 'uuid';
 
   interface Props {
     errorMessage?: string;
@@ -17,12 +16,12 @@
     value: string | number;
     prefix?: import('svelte').Snippet;
     suffix?: import('svelte').Snippet;
-    [key: string]: any
+    [key: string]: any;
   }
 
   let {
     errorMessage = undefined,
-    id = crypto.randomUUID(),
+    id = uuidv4(),
     label = undefined,
     name,
     options,
@@ -34,7 +33,7 @@
 
   const inputProps = {
     class: twMerge(
-      'w-full px-4 h-full rounded-lg outline-none bg-transparent text-color',
+      'w-full px-4 h-full rounded-lg outline-hidden bg-transparent text-color',
       prefix && 'pl-9',
       suffix && 'pr-12'
     ),
@@ -53,8 +52,8 @@
 
   <div
     class={twMerge(
-      'rounded-md dark:bg-shadeD400  ring-1 ring-gray-300 dark:ring-gray-500 flex items-center h-[40px] text-color relative focus-within:ring-2 focus-within:ring-gray-400 transition group',
-      errorMessage && '!ring-red-600 ring-2 '
+      'rounded-md dark:bg-shade-d400  ring-1 ring-gray-300 dark:ring-gray-500 flex items-center h-[40px] text-color relative focus-within:ring-2 focus-within:ring-gray-400 transition group',
+      errorMessage && 'ring-red-600! ring-2 '
     )}
   >
     {#if prefix}
@@ -64,8 +63,8 @@
     {/if}
 
     <select bind:value oninput={bubble('input')} {...inputProps}>
-      {#each options as option}
-        <option class="dark:bg-shadeD400 dark:text-white bg-white text-black">{option}</option>
+      {#each options as option (option)}
+        <option class="dark:bg-shade-d400 dark:text-white bg-white text-black">{option}</option>
       {/each}
     </select>
 

@@ -30,7 +30,7 @@ var _ = ginkgo.Describe("LOGIN FEATURE:", func() {
 			user, err := client.LoginUser("iggy", "iggy")
 
 			itShouldNotReturnError(err)
-			itShouldReturnUserId(user, 1)
+			itShouldReturnUserId(user, 0)
 		})
 
 		ginkgo.Context("and tries to log with invalid credentials", func() {
@@ -48,7 +48,7 @@ var _ = ginkgo.Describe("LOGIN FEATURE:", func() {
 			user, err := client.LoginUser("iggy", "iggy")
 
 			itShouldNotReturnError(err)
-			itShouldReturnUserId(user, 1)
+			itShouldReturnUserId(user, 0)
 		})
 
 		ginkgo.Context("and tries to log with invalid credentials", func() {

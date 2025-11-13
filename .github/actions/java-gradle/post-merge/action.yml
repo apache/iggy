@@ -68,14 +68,16 @@ runs:
       shell: bash
       env:
         NEXUS_USER: ${{ env.NEXUS_USER }}
-        NEXUS_PASSWORD: ${{ env.NEXUS_PASSWORD }}
+        NEXUS_PW: ${{ env.NEXUS_PW }}
+        ORG_GRADLE_PROJECT_signingKey: ${{ env.JAVA_GPG_SIGNING_KEY }}
+        ORG_GRADLE_PROJECT_signingPassword: ${{ env.JAVA_GPG_PASSWORD }}
       run: |
         if [ "${{ inputs.dry_run }}" = "true" ]; then
           echo "🔍 Dry run - would publish to Maven Nexus:"
           echo ""
 
           # Extract version from build.gradle.kts
-          gradle_version=$(foreign/java/gradlew -p foreign/java properties -q | grep "version:" | cut -d: -f2 | tr -d ' ')
+          gradle_version=$(foreign/java/gradlew -p foreign/java/java-sdk properties -q | grep "version:" | cut -d: -f2 | tr -d ' ')
           echo "Version from gradle: $gradle_version"
           echo "Input version: ${{ inputs.version }}"
 
@@ -99,8 +101,8 @@ runs:
             echo "  - $(basename $jar)"
           done
         else
-          if [ -z "$NEXUS_USER" ] || [ -z "$NEXUS_PASSWORD" ]; then
-            echo "❌ NEXUS_USER or NEXUS_PASSWORD not set"
+          if [ -z "$NEXUS_USER" ] || [ -z "$NEXUS_PW" ]; then
+            echo "❌ NEXUS_USER or NEXUS_PW not set"
             exit 1
           fi
 
@@ -109,7 +111,7 @@ runs:
           echo ""
 
           # Run the publish task
-          foreign/java/dev-support/checks/build.sh build -x test -x checkstyleMain -x checkstyleTest publish
+          foreign/java/dev-support/checks/build.sh build -x test -x checkstyleMain -x checkstyleTest sign publish
           PUBLISH_EXIT_CODE=$?
 
           if [ $PUBLISH_EXIT_CODE -eq 0 ]; then

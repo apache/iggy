@@ -19,6 +19,7 @@ package tcp_test
 
 import (
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
+	ierror "github.com/apache/iggy/foreign/go/errors"
 	"github.com/onsi/ginkgo/v2"
 )
 
@@ -46,14 +47,14 @@ var _ = ginkgo.Describe("UPDATE STREAM:", func() {
 			stream2Identifier, _ := iggcon.NewIdentifier(stream2Id)
 			err := client.UpdateStream(stream2Identifier, stream1Name)
 
-			itShouldReturnSpecificError(err, "stream_name_already_exists")
+			itShouldReturnSpecificError(err, ierror.ErrStreamNameAlreadyExists)
 		})
 
 		ginkgo.Context("and tries to update non-existing stream", func() {
 			client := createAuthorizedConnection()
 			err := client.UpdateStream(randomU32Identifier(), createRandomString(128))
 
-			itShouldReturnSpecificError(err, "stream_id_not_found")
+			itShouldReturnSpecificError(err, ierror.ErrStreamIdNotFound)
 		})
 
 		ginkgo.Context("and tries to update existing stream with a name that's over 255 characters", func() {
@@ -63,7 +64,7 @@ var _ = ginkgo.Describe("UPDATE STREAM:", func() {
 			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 			err := client.UpdateStream(streamIdentifier, createRandomString(256))
 
-			itShouldReturnSpecificError(err, "stream_name_too_long")
+			itShouldReturnSpecificError(err, ierror.ErrInvalidStreamName)
 		})
 	})
 

@@ -25,7 +25,6 @@ use iggy_common::create_stream::CreateStream;
 use iggy_common::create_topic::CreateTopic;
 use iggy_common::create_user::CreateUser;
 use iggy_common::delete_stream::DeleteStream;
-use server::state::State;
 use server::state::command::EntryCommand;
 use server::state::models::{
     CreateConsumerGroupWithId, CreatePersonalAccessTokenWithHash, CreateStreamWithId,
@@ -33,13 +32,13 @@ use server::state::models::{
 };
 use server::state::system::SystemState;
 
-#[tokio::test]
+#[compio::test]
 async fn should_be_initialized_based_on_state_entries() {
     let setup = StateSetup::init().await;
     let state = setup.state();
     state.init().await.unwrap();
 
-    let user_id = 1;
+    let user_id = 0;
     let create_user = CreateUser {
         username: "user".to_string(),
         password: "secret".to_string(),
@@ -55,19 +54,16 @@ async fn should_be_initialized_based_on_state_entries() {
 
     let stream1_id = 1;
     let create_stream1 = CreateStream {
-        stream_id: Some(stream1_id),
         name: "stream1".to_string(),
     };
 
     let create_stream1_clone = CreateStream {
-        stream_id: Some(stream1_id),
         name: "stream1".to_string(),
     };
 
     let topic1_id = 1;
     let create_topic1 = CreateTopic {
         stream_id: stream1_id.try_into().unwrap(),
-        topic_id: Some(topic1_id),
         partitions_count: 1,
         compression_algorithm: Default::default(),
         message_expiry: Default::default(),
@@ -78,7 +74,6 @@ async fn should_be_initialized_based_on_state_entries() {
 
     let create_topic1_clone = CreateTopic {
         stream_id: stream1_id.try_into().unwrap(),
-        topic_id: Some(topic1_id),
         partitions_count: 1,
         compression_algorithm: Default::default(),
         message_expiry: Default::default(),
@@ -89,14 +84,12 @@ async fn should_be_initialized_based_on_state_entries() {
 
     let stream2_id = 2;
     let create_stream2 = CreateStream {
-        stream_id: Some(stream2_id),
         name: "stream2".to_string(),
     };
 
     let topic2_id = 2;
     let create_topic2 = CreateTopic {
         stream_id: stream2_id.try_into().unwrap(),
-        topic_id: Some(topic2_id),
         partitions_count: 1,
         compression_algorithm: Default::default(),
         message_expiry: Default::default(),
@@ -111,7 +104,7 @@ async fn should_be_initialized_based_on_state_entries() {
         partitions_count: 2,
     };
 
-    let delete_stream2 = DeleteStream {
+    let delete_stream = DeleteStream {
         stream_id: stream2_id.try_into().unwrap(),
     };
 
@@ -135,14 +128,12 @@ async fn should_be_initialized_based_on_state_entries() {
     let create_consumer_group = CreateConsumerGroup {
         stream_id: stream1_id.try_into().unwrap(),
         topic_id: topic1_id.try_into().unwrap(),
-        group_id: Some(group_id),
         name: "test".to_string(),
     };
 
     let create_consumer_group_clone = CreateConsumerGroup {
         stream_id: stream1_id.try_into().unwrap(),
         topic_id: topic1_id.try_into().unwrap(),
-        group_id: Some(group_id),
         name: "test".to_string(),
     };
 
@@ -201,7 +192,7 @@ async fn should_be_initialized_based_on_state_entries() {
         .await
         .unwrap();
     state
-        .apply(user_id, &EntryCommand::DeleteStream(delete_stream2))
+        .apply(user_id, &EntryCommand::DeleteStream(delete_stream))
         .await
         .unwrap();
     state
@@ -248,28 +239,19 @@ async fn should_be_initialized_based_on_state_entries() {
     );
 
     assert_eq!(system.streams.len(), 1);
-    let mut stream = system
-        .streams
-        .remove(&create_stream1_clone.stream_id.unwrap())
-        .unwrap();
-    assert_eq!(stream.id, create_stream1_clone.stream_id.unwrap());
+    let mut stream = system.streams.remove(&stream1_id).unwrap();
+    assert_eq!(stream.id, stream1_id);
     assert_eq!(stream.name, create_stream1_clone.name);
     assert_eq!(stream.topics.len(), 1);
 
-    let mut topic = stream
-        .topics
-        .remove(&create_topic1_clone.topic_id.unwrap())
-        .unwrap();
-    assert_eq!(topic.id, create_topic1_clone.topic_id.unwrap());
+    let mut topic = stream.topics.remove(&topic1_id).unwrap();
+    assert_eq!(topic.id, topic1_id);
     assert_eq!(topic.name, create_topic1_clone.name);
     assert_eq!(topic.partitions.len(), 3);
 
     assert_eq!(topic.consumer_groups.len(), 1);
     let consumer_group = topic.consumer_groups.remove(&group_id).unwrap();
 
-    assert_eq!(
-        consumer_group.id,
-        create_consumer_group_clone.group_id.unwrap()
-    );
+    assert_eq!(consumer_group.id, group_id);
     assert_eq!(consumer_group.name, create_consumer_group_clone.name);
 }

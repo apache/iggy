@@ -572,7 +572,7 @@ func DeserializeAccessToken(payload []byte) (*iggcon.RawPersonalAccessToken, err
 
 func DeserializeAccessTokens(payload []byte) ([]iggcon.PersonalAccessTokenInfo, error) {
 	if len(payload) == 0 {
-		return []iggcon.PersonalAccessTokenInfo{}, ierror.CustomError("Empty payload")
+		return []iggcon.PersonalAccessTokenInfo{}, ierror.ErrEmptyMessagePayload
 	}
 
 	var result []iggcon.PersonalAccessTokenInfo

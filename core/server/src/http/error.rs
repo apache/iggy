@@ -96,14 +96,9 @@ impl ErrorResponse {
                 IggyError::InvalidTopicName => Some("name".to_string()),
                 IggyError::TopicNameAlreadyExists(_, _) => Some("name".to_string()),
                 IggyError::InvalidStreamId => Some("stream_id".to_string()),
-                IggyError::StreamIdAlreadyExists(_) => Some("stream_id".to_string()),
                 IggyError::InvalidTopicId => Some("topic_id".to_string()),
-                IggyError::TopicIdAlreadyExists(_, _) => Some("topic_id".to_string()),
                 IggyError::InvalidOffset(_) => Some("offset".to_string()),
                 IggyError::InvalidConsumerGroupId => Some("consumer_group_id".to_string()),
-                IggyError::ConsumerGroupIdAlreadyExists(_, _) => {
-                    Some("consumer_group_id".to_string())
-                }
                 IggyError::ConsumerGroupNameAlreadyExists(_, _) => Some("name".to_string()),
                 IggyError::UserAlreadyExists => Some("username".to_string()),
                 IggyError::PersonalAccessTokenAlreadyExists(_, _) => Some("name".to_string()),

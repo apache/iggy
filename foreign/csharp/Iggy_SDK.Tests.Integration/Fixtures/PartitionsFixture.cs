@@ -40,7 +40,7 @@ public class PartitionsFixture : IAsyncInitializer
         {
             await client.Value.CreateStreamAsync(StreamId.GetWithProtocol(client.Key));
             await client.Value.CreateTopicAsync(Identifier.String(StreamId.GetWithProtocol(client.Key)),
-                TopicRequest.Name, TopicRequest.PartitionsCount, topicId: TopicRequest.TopicId);
+                TopicRequest.Name, TopicRequest.PartitionsCount);
         }
     }
 }

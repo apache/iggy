@@ -17,26 +17,57 @@
  */
 
 use iggy_common::IggyDuration;
-use moka::future::Cache;
+use moka::future::{Cache, CacheBuilder};
 
 #[derive(Debug)]
 pub struct MessageDeduplicator {
+    ttl: Option<IggyDuration>,
+    max_entries: Option<u64>,
     cache: Cache<u128, bool>,
 }
 
-impl MessageDeduplicator {
-    /// Creates a new message deduplicator with the given max entries and time to live for each ID.
-    pub fn new(max_entries: Option<u64>, ttl: Option<IggyDuration>) -> Self {
-        let mut cache = Cache::builder();
-        if let Some(max_entries) = max_entries {
-            cache = cache.max_capacity(max_entries);
-        }
-        if let Some(ttl) = ttl {
-            cache = cache.time_to_live(ttl.get_duration());
-        }
+/// Create deep copy of the `MessageDeduplicator` instance.
+/// Regular `Clone` cheap as it only creates thread-safe reference counted
+/// pointers to the shared internal data structures.
+impl Clone for MessageDeduplicator {
+    fn clone(&self) -> Self {
+        let builder = Cache::builder();
+        let builder = Self::setup_cache_builder(builder, self.max_entries, self.ttl);
+        let cache = builder.build();
 
         Self {
-            cache: cache.build(),
+            ttl: self.ttl,
+            max_entries: self.max_entries,
+            cache,
+        }
+    }
+}
+
+impl MessageDeduplicator {
+    fn setup_cache_builder(
+        mut builder: CacheBuilder<u128, bool, Cache<u128, bool>>,
+        max_entries: Option<u64>,
+        ttl: Option<IggyDuration>,
+    ) -> CacheBuilder<u128, bool, Cache<u128, bool>> {
+        if let Some(max_entries) = max_entries {
+            builder = builder.max_capacity(max_entries);
+        }
+        if let Some(ttl) = ttl {
+            builder = builder.time_to_live(ttl.get_duration());
+        }
+        builder
+    }
+
+    /// Creates a new message deduplicator with the given max entries and time to live for each ID.
+    pub fn new(max_entries: Option<u64>, ttl: Option<IggyDuration>) -> Self {
+        let builder = Cache::builder();
+        let builder = Self::setup_cache_builder(builder, max_entries, ttl);
+        let cache = builder.build();
+
+        Self {
+            ttl,
+            max_entries,
+            cache,
         }
     }
 
@@ -47,7 +78,7 @@ impl MessageDeduplicator {
 
     /// Inserts the given ID.
     pub async fn insert(&self, id: u128) {
-        self.cache.insert(id, true).await;
+        self.cache.insert(id, true).await
     }
 
     /// Tries to insert the given ID, returns false if it already exists.
@@ -64,9 +95,9 @@ impl MessageDeduplicator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::time::sleep;
+    use compio::time::sleep;
 
-    #[tokio::test]
+    #[compio::test]
     async fn message_deduplicator_should_insert_only_unique_identifiers() {
         let max_entries = 1000;
         let ttl = "1s".parse::<IggyDuration>().unwrap();
@@ -79,7 +110,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn message_deduplicator_should_evict_identifiers_after_given_time_to_live() {
         let max_entries = 3;
         let ttl = "100ms".parse::<IggyDuration>().unwrap();

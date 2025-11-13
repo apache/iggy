@@ -20,11 +20,11 @@ use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHa
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
 use crate::binary::sender::SenderKind;
+use crate::shard::IggyShard;
 use crate::streaming::session::Session;
-use crate::streaming::systems::system::SharedSystem;
 use iggy_common::IggyError;
 use iggy_common::get_client::GetClient;
-use iggy_common::locking::IggySharedMutFn;
+use std::rc::Rc;
 use tracing::debug;
 
 impl ServerCommandHandler for GetClient {
@@ -37,12 +37,11 @@ impl ServerCommandHandler for GetClient {
         sender: &mut SenderKind,
         _length: u32,
         session: &Session,
-        system: &SharedSystem,
+        shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
 
-        let system = system.read().await;
-        let Ok(client) = system.get_client(session, self.client_id).await else {
+        let Ok(client) = shard.get_client(session, self.client_id) else {
             sender.send_empty_ok_response().await?;
             return Ok(());
         };
@@ -52,7 +51,6 @@ impl ServerCommandHandler for GetClient {
             return Ok(());
         };
 
-        let client = client.read().await;
         let bytes = mapper::map_client(&client);
 
         sender.send_ok_response(&bytes).await?;

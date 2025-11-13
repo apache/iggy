@@ -113,7 +113,7 @@ export const serializePollMessages = (
   streamId: Id,
   topicId: Id,
   consumer: Consumer,
-  partitionId: number,              // default to 1
+  partitionId: number | null,
   pollingStrategy: PollingStrategy, // default to OffsetPollingStrategy
   count = 10,
   autocommit = false,

@@ -17,8 +17,6 @@
  * under the License.
  */
 
-
-
 export type Stream = {
   id: number;
   name: string;

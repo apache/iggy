@@ -62,7 +62,7 @@ public class SimpleProducer {
         if (stream.isPresent()) {
             return;
         }
-        client.streams().createStream(empty(), STREAM_NAME);
+        client.streams().createStream(STREAM_NAME);
     }
 
     private static void createTopic(IggyTcpClient client) {
@@ -72,7 +72,6 @@ public class SimpleProducer {
         }
         client.topics()
                 .createTopic(STREAM_ID,
-                        empty(),
                         1L,
                         CompressionAlgorithm.None,
                         BigInteger.ZERO,

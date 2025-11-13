@@ -17,4 +17,4 @@
 
 namespace Apache.Iggy.Contracts.Http;
 
-internal sealed record CreateStreamRequest(uint? StreamId, string Name);
+internal sealed record CreateStreamRequest(string Name);

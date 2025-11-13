@@ -16,6 +16,7 @@
  * under the License.
  */
 
+use crate::http::http_server::CompioSocketAddr;
 use crate::http::shared::RequestDetails;
 use crate::streaming::utils::random_id;
 use axum::body::Body;
@@ -25,12 +26,11 @@ use axum::{
     middleware::Next,
     response::Response,
 };
-use std::net::SocketAddr;
-use tokio::time::Instant;
+use std::time::Instant;
 use tracing::{debug, error};
 
 pub async fn request_diagnostics(
-    ConnectInfo(ip_address): ConnectInfo<SocketAddr>,
+    ConnectInfo(ip_address): ConnectInfo<CompioSocketAddr>,
     mut request: Request<Body>,
     next: Next,
 ) -> Result<Response, StatusCode> {
@@ -40,6 +40,7 @@ pub async fn request_diagnostics(
         .path_and_query()
         .map(|p| p.as_str())
         .unwrap_or("/");
+    let ip_address = ip_address.0;
     debug!(
         "Processing a request {} {} with ID: {request_id} from client with IP address: {ip_address}...",
         request.method(),

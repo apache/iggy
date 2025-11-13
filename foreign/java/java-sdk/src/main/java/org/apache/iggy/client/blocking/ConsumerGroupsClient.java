@@ -41,11 +41,11 @@ public interface ConsumerGroupsClient {
 
     List<ConsumerGroup> getConsumerGroups(StreamId streamId, TopicId topicId);
 
-    default ConsumerGroupDetails createConsumerGroup(Long streamId, Long topicId, Optional<Long> groupId, String name) {
-        return createConsumerGroup(StreamId.of(streamId), TopicId.of(topicId), groupId, name);
+    default ConsumerGroupDetails createConsumerGroup(Long streamId, Long topicId, String name) {
+        return createConsumerGroup(StreamId.of(streamId), TopicId.of(topicId), name);
     }
 
-    ConsumerGroupDetails createConsumerGroup(StreamId streamId, TopicId topicId, Optional<Long> groupId, String name);
+    ConsumerGroupDetails createConsumerGroup(StreamId streamId, TopicId topicId, String name);
 
     default void deleteConsumerGroup(Long streamId, Long topicId, Long groupId) {
         deleteConsumerGroup(StreamId.of(streamId), TopicId.of(topicId), ConsumerId.of(groupId));

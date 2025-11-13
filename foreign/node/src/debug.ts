@@ -23,19 +23,17 @@ import { uuidv7, uuidv4 } from 'uuidv7'
 import { groupConsumerStream } from './stream/consumer-stream.js';
 import { PollingStrategy, type PollMessagesResponse } from './wire/index.js';
 
-const streamId = 123;
-const topicId = 345;
-const groupId = 12353;
+const streamName = 'debug-stream';
+const topicName = 'debug-topic';
+const groupName = 'debug-group';
 
 const stream = {
-  streamId,
   name: 'debug-send-message-stream'
 };
 
 const topic = {
-  streamId,
-  topicId,
-  name: 'debug-send-message-topic',
+  streamId: streamName,
+  name: topicName,
   partitionCount: 1,
   compressionAlgorithm: 1
 };
@@ -55,14 +53,14 @@ const opt = {
 const c = new Client(opt);
 
 const cleanup = async () => {
-  assert.ok(await c.stream.delete(stream));
+  assert.ok(await c.stream.delete({ streamId: streamName }));
   assert.ok(await c.session.logout());
   c.destroy();
 }
 
 const msg = {
-  streamId,
-  topicId,
+  streamId: streamName,
+  topicId: topicName,
   messages: [
     { payload: 'yolo msg 2' },
     { id: 0 as const, payload: 'nooooooooo' },
@@ -73,28 +71,28 @@ const msg = {
 };
 
 try {
-  
+
   await c.stream.create(stream);
-  console.log('server stream CREATED::', { streamId });
+  console.log('server stream CREATED::', { streamName });
   await c.topic.create(topic);
-  console.log('server topic CREATED::', { topicId });
-  
+  console.log('server topic CREATED::', { topicName });
+
   // send
   assert.ok(await c.message.send(msg));
   console.log('message SEND::', { msg })
 
   // POLL MESSAGE
   const pollReq = {
-    groupId,
-    streamId,
-    topicId,
+    groupName,
+    streamId: streamName,
+    topicId: topicName,
     pollingStrategy: PollingStrategy.Next,
     count: 5,
     interval: 5000
   };
 
   console.log('poll req', pollReq);
-  
+
   const cs = await groupConsumerStream(opt)(pollReq);
   const dataCb = (d: PollMessagesResponse) => {
     console.log('cli/DATA POLLED:', d);
@@ -122,5 +120,4 @@ try {
 } catch (err) {
   console.log('catch cleanup', err);
   await cleanup();
-
 }

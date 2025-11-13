@@ -1,8 +1,8 @@
 <script lang="ts">
   let className = '';
   export { className as class };
-  const lightLogo = "/iggy-apache-lightbg.svg";
-  const darkLogo = "/iggy-apache-darkbg.svg";
+  const lightLogo = '/iggy-apache-lightbg.svg';
+  const darkLogo = '/iggy-apache-darkbg.svg';
 </script>
 
 <img src={lightLogo} class="{className} block dark:hidden" alt="Apache Iggy" />

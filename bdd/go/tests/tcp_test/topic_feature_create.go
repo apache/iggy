@@ -21,6 +21,7 @@ import (
 	"math"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
+	ierror "github.com/apache/iggy/foreign/go/errors"
 	"github.com/onsi/ginkgo/v2"
 )
 
@@ -30,7 +31,6 @@ var _ = ginkgo.Describe("CREATE TOPIC:", func() {
 		ginkgo.Context("and tries to create topic unique name and id", func() {
 			client := createAuthorizedConnection()
 			streamId, _ := successfullyCreateStream(prefix, client)
-			topicId := uint32(1)
 			replicationFactor := uint8(1)
 			name := createRandomString(32)
 			defer deleteStreamAfterTests(streamId, client)
@@ -42,17 +42,14 @@ var _ = ginkgo.Describe("CREATE TOPIC:", func() {
 				iggcon.CompressionAlgorithmNone,
 				iggcon.Millisecond,
 				math.MaxUint64,
-				&replicationFactor,
-				&topicId)
+				&replicationFactor)
 
 			itShouldNotReturnError(err)
-			itShouldSuccessfullyCreateTopic(streamId, topicId, name, client)
 		})
 
 		ginkgo.Context("and tries to create topic for a non existing stream", func() {
 			client := createAuthorizedConnection()
 			streamId := createRandomUInt32()
-			topicId := uint32(1)
 			replicationFactor := uint8(1)
 			name := createRandomString(32)
 			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
@@ -63,10 +60,9 @@ var _ = ginkgo.Describe("CREATE TOPIC:", func() {
 				iggcon.CompressionAlgorithmNone,
 				iggcon.Millisecond,
 				math.MaxUint64,
-				&replicationFactor,
-				&topicId)
+				&replicationFactor)
 
-			itShouldReturnSpecificError(err, "stream_id_not_found")
+			itShouldReturnSpecificError(err, ierror.ErrStreamIdNotFound)
 		})
 
 		ginkgo.Context("and tries to create topic with duplicate topic name", func() {
@@ -77,7 +73,6 @@ var _ = ginkgo.Describe("CREATE TOPIC:", func() {
 
 			replicationFactor := uint8(1)
 			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
-			topicId := createRandomUInt32()
 			_, err := client.CreateTopic(
 				streamIdentifier,
 				name,
@@ -85,28 +80,8 @@ var _ = ginkgo.Describe("CREATE TOPIC:", func() {
 				iggcon.CompressionAlgorithmNone,
 				iggcon.IggyExpiryServerDefault,
 				math.MaxUint64,
-				&replicationFactor,
-				&topicId)
-			itShouldReturnSpecificError(err, "topic_name_already_exists")
-		})
-
-		ginkgo.Context("and tries to create topic with duplicate topic id", func() {
-			client := createAuthorizedConnection()
-			streamId, _ := successfullyCreateStream(prefix, client)
-			defer deleteStreamAfterTests(streamId, client)
-			topicId, _ := successfullyCreateTopic(streamId, client)
-			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
-			replicationFactor := uint8(1)
-			_, err := client.CreateTopic(
-				streamIdentifier,
-				createRandomString(32),
-				2,
-				iggcon.CompressionAlgorithmNone,
-				iggcon.IggyExpiryServerDefault,
-				math.MaxUint64,
-				&replicationFactor,
-				&topicId)
-			itShouldReturnSpecificError(err, "topic_id_already_exists")
+				&replicationFactor)
+			itShouldReturnSpecificError(err, ierror.ErrTopicNameAlreadyExists)
 		})
 
 		ginkgo.Context("and tries to create topic with name that's over 255 characters", func() {
@@ -116,7 +91,6 @@ var _ = ginkgo.Describe("CREATE TOPIC:", func() {
 
 			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 			replicationFactor := uint8(1)
-			topicId := createRandomUInt32()
 			_, err := client.CreateTopic(
 				streamIdentifier,
 				createRandomString(256),
@@ -124,10 +98,9 @@ var _ = ginkgo.Describe("CREATE TOPIC:", func() {
 				iggcon.CompressionAlgorithmNone,
 				iggcon.IggyExpiryServerDefault,
 				math.MaxUint64,
-				&replicationFactor,
-				&topicId)
+				&replicationFactor)
 
-			itShouldReturnSpecificError(err, "topic_name_too_long")
+			itShouldReturnSpecificError(err, ierror.ErrInvalidTopicName)
 		})
 	})
 
@@ -135,7 +108,6 @@ var _ = ginkgo.Describe("CREATE TOPIC:", func() {
 		ginkgo.Context("and tries to create topic", func() {
 			client := createClient()
 			replicationFactor := uint8(1)
-			topicId := uint32(1)
 			streamIdentifier, _ := iggcon.NewIdentifier[uint32](10)
 			_, err := client.CreateTopic(
 				streamIdentifier,
@@ -144,8 +116,7 @@ var _ = ginkgo.Describe("CREATE TOPIC:", func() {
 				iggcon.CompressionAlgorithmNone,
 				iggcon.IggyExpiryServerDefault,
 				math.MaxUint64,
-				&replicationFactor,
-				&topicId)
+				&replicationFactor)
 
 			itShouldReturnUnauthenticatedError(err)
 		})

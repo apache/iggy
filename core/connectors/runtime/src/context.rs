@@ -1,4 +1,5 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
  * regarding copyright ownership.  The ASF licenses this file
@@ -15,15 +16,16 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-
+use crate::configs::{SinkConfig, SourceConfig};
 use crate::{
     SinkConnectorWrapper, SourceConnectorWrapper,
-    configs::ConnectorsConfig,
+    configs::ConnectorsRuntimeConfig,
     manager::{
         sink::{SinkDetails, SinkInfo, SinkManager},
         source::{SourceDetails, SourceInfo, SourceManager},
     },
 };
+use std::collections::HashMap;
 use tracing::error;
 
 pub struct RuntimeContext {
@@ -33,25 +35,27 @@ pub struct RuntimeContext {
 }
 
 pub fn init(
-    config: &ConnectorsConfig,
+    config: &ConnectorsRuntimeConfig,
+    sinks_config: &HashMap<String, SinkConfig>,
+    sources_config: &HashMap<String, SourceConfig>,
     sink_wrappers: &[SinkConnectorWrapper],
     source_wrappers: &[SourceConnectorWrapper],
 ) -> RuntimeContext {
     RuntimeContext {
-        sinks: SinkManager::new(map_sinks(config, sink_wrappers)),
-        sources: SourceManager::new(map_sources(config, source_wrappers)),
+        sinks: SinkManager::new(map_sinks(sinks_config, sink_wrappers)),
+        sources: SourceManager::new(map_sources(sources_config, source_wrappers)),
         api_key: config.http.api_key.to_owned(),
     }
 }
 
 fn map_sinks(
-    config: &ConnectorsConfig,
+    sinks_config: &HashMap<String, SinkConfig>,
     sink_wrappers: &[SinkConnectorWrapper],
 ) -> Vec<SinkDetails> {
     let mut sinks = vec![];
     for sink_wrapper in sink_wrappers.iter() {
         for sink_plugin in sink_wrapper.plugins.iter() {
-            let Some(sink_config) = config.sinks.get(&sink_plugin.key) else {
+            let Some(sink_config) = sinks_config.get(&sink_plugin.key) else {
                 error!("Missing sink config for: {}", sink_plugin.key);
                 continue;
             };
@@ -76,13 +80,13 @@ fn map_sinks(
 }
 
 fn map_sources(
-    config: &ConnectorsConfig,
+    sources_config: &HashMap<String, SourceConfig>,
     source_wrappers: &[SourceConnectorWrapper],
 ) -> Vec<SourceDetails> {
     let mut sources = vec![];
     for source_wrapper in source_wrappers.iter() {
         for source_plugin in source_wrapper.plugins.iter() {
-            let Some(source_config) = config.sources.get(&source_plugin.key) else {
+            let Some(source_config) = sources_config.get(&source_plugin.key) else {
                 error!("Missing source config for: {}", source_plugin.key);
                 continue;
             };

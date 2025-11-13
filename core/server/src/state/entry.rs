@@ -44,7 +44,7 @@ pub struct StateEntry {
     pub flags: u64,
     pub timestamp: IggyTimestamp,
     pub user_id: u32,
-    pub checksum: u32,
+    pub checksum: u64,
     pub context: Bytes,
     pub command: Bytes,
 }
@@ -59,7 +59,7 @@ impl StateEntry {
         flags: u64,
         timestamp: IggyTimestamp,
         user_id: u32,
-        checksum: u32,
+        checksum: u64,
         context: Bytes,
         command: Bytes,
     ) -> Self {
@@ -92,7 +92,7 @@ impl StateEntry {
         user_id: u32,
         context: &Bytes,
         command: &Bytes,
-    ) -> u32 {
+    ) -> u64 {
         let mut bytes =
             BytesMut::with_capacity(8 + 8 + 4 + 4 + 8 + 8 + 4 + 4 + context.len() + command.len());
         bytes.put_u64_le(index);
@@ -138,7 +138,7 @@ impl BytesSerializable for StateEntry {
         bytes.put_u64_le(self.flags);
         bytes.put_u64_le(self.timestamp.into());
         bytes.put_u32_le(self.user_id);
-        bytes.put_u32_le(self.checksum);
+        bytes.put_u64_le(self.checksum);
         bytes.put_u32_le(self.context.len() as u32);
         bytes.put_slice(&self.context);
         bytes.extend(&self.command);
@@ -156,10 +156,10 @@ impl BytesSerializable for StateEntry {
         let flags = bytes.slice(24..32).get_u64_le();
         let timestamp = IggyTimestamp::from(bytes.slice(32..40).get_u64_le());
         let user_id = bytes.slice(40..44).get_u32_le();
-        let checksum = bytes.slice(44..48).get_u32_le();
-        let context_length = bytes.slice(48..52).get_u32_le() as usize;
-        let context = bytes.slice(52..52 + context_length);
-        let command = bytes.slice(52 + context_length..);
+        let checksum = bytes.slice(44..52).get_u64_le();
+        let context_length = bytes.slice(52..56).get_u32_le() as usize;
+        let context = bytes.slice(56..56 + context_length);
+        let command = bytes.slice(56 + context_length..);
 
         Ok(StateEntry {
             index,

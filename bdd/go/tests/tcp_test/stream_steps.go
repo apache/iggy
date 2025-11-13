@@ -29,14 +29,13 @@ import (
 //operations
 
 func successfullyCreateStream(prefix string, client iggycli.Client) (uint32, string) {
-	streamId := createRandomUInt32()
 	name := createRandomStringWithPrefix(prefix, 128)
 
-	_, err := client.CreateStream(name, &streamId)
+    stream, err := client.CreateStream(name)
 
 	itShouldNotReturnError(err)
-	itShouldSuccessfullyCreateStream(streamId, name, client)
-	return streamId, name
+	itShouldSuccessfullyCreateStream(stream.Id, name, client)
+	return stream.Id, name
 }
 
 //assertions
@@ -110,7 +109,7 @@ func itShouldSuccessfullyDeleteStream(id uint32, client iggycli.Client) {
 	streamIdentifier, _ := iggcon.NewIdentifier(id)
 	stream, err := client.GetStream(streamIdentifier)
 
-	itShouldReturnSpecificIggyError(err, ierror.StreamIdNotFound)
+	itShouldReturnSpecificError(err, ierror.ErrStreamIdNotFound)
 	ginkgo.It("should not return stream", func() {
 		gomega.Expect(stream).To(gomega.BeNil())
 	})

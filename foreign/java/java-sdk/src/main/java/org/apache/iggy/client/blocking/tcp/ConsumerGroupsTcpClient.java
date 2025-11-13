@@ -68,14 +68,13 @@ class ConsumerGroupsTcpClient implements ConsumerGroupsClient {
     }
 
     @Override
-    public ConsumerGroupDetails createConsumerGroup(StreamId streamId, TopicId topicId, Optional<Long> groupId, String name) {
+    public ConsumerGroupDetails createConsumerGroup(StreamId streamId, TopicId topicId, String name) {
         var streamIdBytes = toBytes(streamId);
         var topicIdBytes = toBytes(topicId);
-        var payload = Unpooled.buffer(5 + streamIdBytes.readableBytes() + topicIdBytes.readableBytes() + name.length());
+        var payload = Unpooled.buffer(1 + streamIdBytes.readableBytes() + topicIdBytes.readableBytes() + name.length());
 
         payload.writeBytes(streamIdBytes);
         payload.writeBytes(topicIdBytes);
-        payload.writeIntLE(groupId.orElse(0L).intValue());
         payload.writeBytes(nameToBytes(name));
 
         ByteBuf response = tcpClient.send(CommandCode.ConsumerGroup.CREATE, payload);

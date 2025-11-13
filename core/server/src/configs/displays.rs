@@ -1,4 +1,5 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
  * regarding copyright ownership.  The ASF licenses this file
@@ -18,8 +19,7 @@
 
 use crate::configs::quic::{QuicCertificateConfig, QuicConfig};
 use crate::configs::server::{
-    ArchiverConfig, DataMaintenanceConfig, DiskArchiverConfig, HeartbeatConfig,
-    MessagesMaintenanceConfig, S3ArchiverConfig, StateMaintenanceConfig, TelemetryConfig,
+    DataMaintenanceConfig, HeartbeatConfig, MessagesMaintenanceConfig, TelemetryConfig,
     TelemetryLogsConfig, TelemetryTracesConfig,
 };
 use crate::configs::system::MessageDeduplicationConfig;
@@ -137,48 +137,7 @@ impl Display for CompressionConfig {
 
 impl Display for DataMaintenanceConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{{ archiver: {}, messages: {}, state: {} }}",
-            self.archiver, self.messages, self.state
-        )
-    }
-}
-
-impl Display for ArchiverConfig {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        let disk = self
-            .disk
-            .as_ref()
-            .map_or("none".to_string(), |disk| disk.to_string());
-        let s3 = self
-            .s3
-            .as_ref()
-            .map_or("none".to_string(), |s3| s3.to_string());
-        write!(
-            f,
-            "{{ enabled: {}, kind: {}, disk: {disk}, s3: {s3} }}",
-            self.enabled, self.kind,
-        )
-    }
-}
-
-impl Display for DiskArchiverConfig {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{{ path: {} }}", self.path)
-    }
-}
-
-impl Display for S3ArchiverConfig {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{{ key_id: {}, bucket: {}, endpoint: {}. region: {} }}",
-            self.key_id,
-            self.bucket,
-            self.endpoint.as_deref().unwrap_or_default(),
-            self.region.as_deref().unwrap_or_default()
-        )
+        write!(f, "{{ messages: {} }}", self.messages)
     }
 }
 
@@ -186,18 +145,8 @@ impl Display for MessagesMaintenanceConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ archiver_enabled: {}, cleaner_enabled: {}, interval: {} }}",
-            self.archiver_enabled, self.cleaner_enabled, self.interval
-        )
-    }
-}
-
-impl Display for StateMaintenanceConfig {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{{ archiver_enabled: {}, overwrite: {}, interval: {} }}",
-            self.archiver_enabled, self.overwrite, self.interval
+            "{{ cleaner_enabled: {}, interval: {} }}",
+            self.cleaner_enabled, self.interval
         )
     }
 }
@@ -289,12 +238,8 @@ impl Display for SegmentConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ size_bytes: {}, cache_indexes: {}, message_expiry: {}, archive_expired: {}, server_confirmation: {} }}",
-            self.size,
-            self.cache_indexes,
-            self.message_expiry,
-            self.archive_expired,
-            self.server_confirmation,
+            "{{ size_bytes: {}, cache_indexes: {}, message_expiry: {}, archive_expired: {} }}",
+            self.size, self.cache_indexes, self.message_expiry, self.archive_expired,
         )
     }
 }
@@ -326,8 +271,8 @@ impl Display for TcpTlsConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ enabled: {}, cert_file: {}, key_file: {} }}",
-            self.enabled, self.cert_file, self.key_file
+            "{{ enabled: {}, self_signed: {}, cert_file: {}, key_file: {} }}",
+            self.enabled, self.self_signed, self.cert_file, self.key_file
         )
     }
 }

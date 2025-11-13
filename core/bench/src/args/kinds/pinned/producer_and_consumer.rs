@@ -86,7 +86,7 @@ impl BenchmarkKindProps for PinnedProducerAndConsumerArgs {
     }
 
     fn validate(&self) {
-        let partitions = self.partitions.get();
+        let partitions = self.partitions();
         let mut cmd = IggyBenchArgs::command();
 
         if partitions > 1 {
@@ -98,7 +98,7 @@ impl BenchmarkKindProps for PinnedProducerAndConsumerArgs {
         }
 
         let streams = self.streams();
-        let producers = self.producers.get();
+        let producers = self.producers();
         let mut cmd = IggyBenchArgs::command();
 
         if streams != producers {

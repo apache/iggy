@@ -73,22 +73,18 @@ async fn should_fill_data_with_headers_and_verify_after_restart_using_api(encryp
     login_root(&client).await;
 
     // 3. Create test stream and topic
-    let stream_id = 1001;
-    let topic_id = 1;
+    let stream_name = "test-stream-api";
+    let topic_name = "test-topic-api";
     let partition_count = 1;
 
-    client
-        .create_stream("test-stream-api", Some(stream_id))
-        .await
-        .unwrap();
+    client.create_stream(stream_name).await.unwrap();
     client
         .create_topic(
-            &Identifier::numeric(stream_id).unwrap(),
-            "test-topic-api",
+            &Identifier::named(stream_name).unwrap(),
+            topic_name,
             partition_count,
             CompressionAlgorithm::default(),
             None,
-            Some(topic_id),
             IggyExpiry::NeverExpire,
             MaxTopicSize::ServerDefault,
         )
@@ -132,9 +128,9 @@ async fn should_fill_data_with_headers_and_verify_after_restart_using_api(encryp
 
     client
         .send_messages(
-            &Identifier::numeric(stream_id).unwrap(),
-            &Identifier::numeric(topic_id).unwrap(),
-            &Partitioning::partition_id(1),
+            &Identifier::named(stream_name).unwrap(),
+            &Identifier::named(topic_name).unwrap(),
+            &Partitioning::partition_id(0),
             &mut messages_batch_1,
         )
         .await
@@ -143,9 +139,9 @@ async fn should_fill_data_with_headers_and_verify_after_restart_using_api(encryp
     // 5. Flush and get initial stats
     client
         .flush_unsaved_buffer(
-            &Identifier::numeric(stream_id).unwrap(),
-            &Identifier::numeric(topic_id).unwrap(),
-            1,
+            &Identifier::named(stream_name).unwrap(),
+            &Identifier::named(topic_name).unwrap(),
+            0,
             true, // Force flush
         )
         .await
@@ -162,9 +158,9 @@ async fn should_fill_data_with_headers_and_verify_after_restart_using_api(encryp
     let consumer = Consumer::default();
     let polled = client
         .poll_messages(
-            &Identifier::numeric(stream_id).unwrap(),
-            &Identifier::numeric(topic_id).unwrap(),
-            Some(1),
+            &Identifier::named(stream_name).unwrap(),
+            &Identifier::named(topic_name).unwrap(),
+            Some(0),
             &consumer,
             &PollingStrategy::offset(0),
             messages_per_batch.try_into().unwrap(),
@@ -277,9 +273,9 @@ async fn should_fill_data_with_headers_and_verify_after_restart_using_api(encryp
 
     client
         .send_messages(
-            &Identifier::numeric(stream_id).unwrap(),
-            &Identifier::numeric(topic_id).unwrap(),
-            &Partitioning::partition_id(1), // Use specific partition for testing
+            &Identifier::named(stream_name).unwrap(),
+            &Identifier::named(topic_name).unwrap(),
+            &Partitioning::partition_id(0), // Use specific partition for testing
             &mut messages_batch_2,
         )
         .await
@@ -288,9 +284,9 @@ async fn should_fill_data_with_headers_and_verify_after_restart_using_api(encryp
     // Flush the buffer after sending second batch
     client
         .flush_unsaved_buffer(
-            &Identifier::numeric(stream_id).unwrap(),
-            &Identifier::numeric(topic_id).unwrap(),
-            1,
+            &Identifier::named(stream_name).unwrap(),
+            &Identifier::named(topic_name).unwrap(),
+            0,
             true, // Force flush
         )
         .await
@@ -302,9 +298,9 @@ async fn should_fill_data_with_headers_and_verify_after_restart_using_api(encryp
     // 10. Poll all messages (both batches) and verify
     let polled = client
         .poll_messages(
-            &Identifier::numeric(stream_id).unwrap(),
-            &Identifier::numeric(topic_id).unwrap(),
-            Some(1),
+            &Identifier::named(stream_name).unwrap(),
+            &Identifier::named(topic_name).unwrap(),
+            Some(0),
             &consumer,
             &PollingStrategy::offset(0),
             messages_per_batch as u32 * 2,

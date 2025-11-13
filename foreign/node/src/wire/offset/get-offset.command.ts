@@ -28,21 +28,21 @@ export type GetOffset = {
   streamId: Id,
   topicId: Id,
   consumer: Consumer,
-  partitionId?: number
+  partitionId: number | null
 };
 
 
 export const GET_OFFSET = {
   code: COMMAND_CODE.GetOffset,
 
-  serialize: ({streamId, topicId, consumer, partitionId = 1}: GetOffset) => {
+  serialize: ({ streamId, topicId, consumer, partitionId = 0 }: GetOffset) => {
     return serializeGetOffset(streamId, topicId, consumer, partitionId);
   },
 
   deserialize: (r: CommandResponse) => {
-    if(r.status === 0 && r.length === 0)
+    if (r.status === 0 && r.length === 0)
       return null;
-    
+
     const partitionId = r.data.readUInt32LE(0);
     const currentOffset = r.data.readBigUInt64LE(4);
     const storedOffset = r.data.readBigUInt64LE(12);

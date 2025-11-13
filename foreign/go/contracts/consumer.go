@@ -30,7 +30,7 @@ type Consumer struct {
 }
 
 func DefaultConsumer() Consumer {
-	defaultID, _ := NewIdentifier(uint32(1))
+    defaultID, _ := NewIdentifier(uint32(0))
 	return Consumer{
 		Kind: ConsumerKindSingle,
 		Id:   defaultID,

@@ -64,7 +64,7 @@ impl Default for Identifier {
         Self {
             kind: IdKind::default(),
             length: 4,
-            value: 1u32.to_le_bytes().to_vec(),
+            value: 0u32.to_le_bytes().to_vec(),
         }
     }
 }
@@ -157,9 +157,11 @@ impl Identifier {
 
     /// Creates a new identifier from the given numeric value.
     pub fn numeric(value: u32) -> Result<Self, IggyError> {
+        /*
         if value == 0 {
             return Err(IggyError::InvalidIdentifier);
         }
+        */
 
         Ok(Self {
             kind: IdKind::Numeric,
@@ -363,11 +365,6 @@ mod tests {
     #[test]
     fn identifier_with_a_value_of_greater_than_zero_should_be_valid() {
         assert!(Identifier::numeric(1).is_ok());
-    }
-
-    #[test]
-    fn identifier_with_a_value_of_zero_should_be_invalid() {
-        assert!(Identifier::numeric(0).is_err());
     }
 
     #[test]

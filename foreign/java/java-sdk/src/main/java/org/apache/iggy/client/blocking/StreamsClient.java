@@ -35,7 +35,7 @@ public interface StreamsClient {
 
     List<StreamBase> getStreams();
 
-    StreamDetails createStream(Optional<Long> streamId, String name);
+    StreamDetails createStream(String name);
 
     default void updateStream(Long streamId, String name) {
         updateStream(StreamId.of(streamId), name);

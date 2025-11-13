@@ -28,17 +28,14 @@ pub struct CreateStreamCmd {
 }
 
 impl CreateStreamCmd {
-    pub fn new(stream_id: Option<u32>, name: String) -> Self {
+    pub fn new(name: String) -> Self {
         Self {
-            create_stream: CreateStream { stream_id, name },
+            create_stream: CreateStream { name },
         }
     }
 
     fn get_stream_id_info(&self) -> String {
-        match self.create_stream.stream_id {
-            Some(stream_id) => format!("ID: {stream_id}"),
-            None => "ID auto incremented".to_string(),
-        }
+        "ID auto incremented".to_string()
     }
 }
 
@@ -54,7 +51,7 @@ impl CliCommand for CreateStreamCmd {
 
     async fn execute_cmd(&mut self, client: &dyn Client) -> anyhow::Result<(), anyhow::Error> {
         client
-            .create_stream(&self.create_stream.name, self.create_stream.stream_id)
+            .create_stream(&self.create_stream.name)
             .await
             .with_context(|| {
                 format!(

@@ -17,7 +17,6 @@
  * under the License.
  */
 
-
 export type GlobalPermissions = {
   manageServers: boolean;
   readServers: boolean;

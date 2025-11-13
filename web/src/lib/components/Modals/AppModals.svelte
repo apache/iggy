@@ -27,7 +27,7 @@
     EditUserPermissionsModal,
     InspectMessage,
     StreamSettingsModal,
-    TopicSettingsModal,
+    TopicSettingsModal
   };
 
   type DistributiveOmit<T, K extends string> = T extends T ? Omit<T, K> : never;
@@ -53,7 +53,7 @@
       modal,
       props: {
         closeModal: (cb) => {
-          return new Promise<void>((res, _) => {
+          return new Promise<void>((res) => {
             openedModal.set(undefined);
             setTimeout(async () => {
               if (cb) cb();
@@ -76,23 +76,20 @@
 />
 
 {#if $openedModal}
-  <div 
-    transition:fade={{ duration: 100 }} 
-    class="fixed inset-0 bg-black/40 z-[500]" 
+  <div
+    transition:fade={{ duration: 100 }}
+    class="fixed inset-0 bg-black/40 z-500"
     onclick={() => $openedModal.props.closeModal()}
     onkeydown={(e) => {
-       if (e.key === Keys.ENTER || e.key === Keys.SPACE) {
-         e.preventDefault();
-         $openedModal?.props.closeModal();
-       }
-     }}
-    role="button" 
+      if (e.key === Keys.ENTER || e.key === Keys.SPACE) {
+        e.preventDefault();
+        $openedModal?.props.closeModal();
+      }
+    }}
+    role="button"
     tabindex="0"
     aria-label="Close modal"
   ></div>
   {@const SvelteComponent_1 = noTypeCheck(modals[$openedModal.modal])}
-  <SvelteComponent_1
-    {...$openedModal.props}
-    closeModal={$openedModal.props.closeModal}
-  />
+  <SvelteComponent_1 {...$openedModal.props} closeModal={$openedModal.props.closeModal} />
 {/if}

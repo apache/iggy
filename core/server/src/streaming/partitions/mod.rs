@@ -16,10 +16,11 @@
  * under the License.
  */
 
-pub mod consumer_offsets;
-pub mod messages;
+pub mod consumer_offset;
+pub mod helpers;
+pub mod journal;
+pub mod log;
 pub mod partition;
-pub mod persistence;
 pub mod segments;
 pub mod storage;
 

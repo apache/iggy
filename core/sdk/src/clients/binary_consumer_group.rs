@@ -20,8 +20,9 @@ use crate::prelude::IggyClient;
 use async_dropper::AsyncDrop;
 use async_trait::async_trait;
 use iggy_binary_protocol::{ConsumerGroupClient, UserClient};
-use iggy_common::locking::IggySharedMutFn;
-use iggy_common::{ConsumerGroup, ConsumerGroupDetails, Identifier, IggyError};
+use iggy_common::{
+    ConsumerGroup, ConsumerGroupDetails, Identifier, IggyError, locking::IggyRwLockFn,
+};
 
 #[async_trait]
 impl ConsumerGroupClient for IggyClient {
@@ -55,12 +56,11 @@ impl ConsumerGroupClient for IggyClient {
         stream_id: &Identifier,
         topic_id: &Identifier,
         name: &str,
-        group_id: Option<u32>,
     ) -> Result<ConsumerGroupDetails, IggyError> {
         self.client
             .read()
             .await
-            .create_consumer_group(stream_id, topic_id, name, group_id)
+            .create_consumer_group(stream_id, topic_id, name)
             .await
     }
 

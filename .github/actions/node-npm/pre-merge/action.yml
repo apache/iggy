@@ -84,6 +84,8 @@ runs:
       id: iggy
       if: inputs.task == 'e2e'
       uses: ./.github/actions/utils/server-start
+      env:
+        IGGY_CLUSTER_ENABLED: true
       continue-on-error: true
 
     - name: E2E tests

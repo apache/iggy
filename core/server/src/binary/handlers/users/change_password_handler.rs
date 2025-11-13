@@ -19,14 +19,18 @@
 use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::{handlers::users::COMPONENT, sender::SenderKind};
+
+use crate::shard::IggyShard;
+use crate::shard::transmission::event::ShardEvent;
 use crate::state::command::EntryCommand;
 use crate::streaming::session::Session;
-use crate::streaming::systems::system::SharedSystem;
 use crate::streaming::utils::crypto;
 use anyhow::Result;
-use error_set::ErrContext;
+use err_trail::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::change_password::ChangePassword;
+use std::rc::Rc;
+use tracing::info;
 use tracing::{debug, instrument};
 
 impl ServerCommandHandler for ChangePassword {
@@ -40,29 +44,36 @@ impl ServerCommandHandler for ChangePassword {
         sender: &mut SenderKind,
         _length: u32,
         session: &Session,
-        system: &SharedSystem,
+        shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
 
-        let mut system = system.write().await;
-        system
+        info!("Changing password for user with ID: {}...", self.user_id);
+        shard
                 .change_password(
                     session,
                     &self.user_id,
                     &self.current_password,
                     &self.new_password,
                 )
-                .await
-                .with_error_context(|error| {
+                .with_error(|error| {
                     format!(
                         "{COMPONENT} (error: {error}) - failed to change password for user_id: {}, session: {session}",
                         self.user_id
                     )
                 })?;
 
+        info!("Changed password for user with ID: {}.", self.user_id);
+
+        let event = ShardEvent::ChangedPassword {
+            user_id: self.user_id.clone(),
+            current_password: self.current_password.clone(),
+            new_password: self.new_password.clone(),
+        };
+        shard.broadcast_event_to_all_shards(event).await?;
+
         // For the security of the system, we hash the password before storing it in metadata.
-        let system = system.downgrade();
-        system
+        shard
             .state
             .apply(
                 session.get_user_id(),
@@ -73,7 +84,7 @@ impl ServerCommandHandler for ChangePassword {
                 }),
             )
             .await
-            .with_error_context(|error| {
+            .with_error(|error| {
                 format!(
                     "{COMPONENT} (error: {error}) - failed to apply change password for user_id: {}, session: {session}",
                     self.user_id

@@ -60,7 +60,7 @@ var _ = ginkgo.Describe("DELETE CONSUMER GROUP:", func() {
 				randomU32Identifier(),
 			)
 
-			itShouldReturnSpecificIggyError(err, ierror.ConsumerGroupIdNotFound)
+			itShouldReturnSpecificError(err, ierror.ErrConsumerGroupIdNotFound)
 		})
 
 		ginkgo.Context("and tries to delete consumer non-existing topic", func() {
@@ -75,7 +75,7 @@ var _ = ginkgo.Describe("DELETE CONSUMER GROUP:", func() {
 				randomU32Identifier(),
 			)
 
-			itShouldReturnSpecificError(err, "topic_id_not_found")
+			itShouldReturnSpecificError(err, ierror.ErrTopicIdNotFound)
 		})
 
 		ginkgo.Context("and tries to delete consumer for non-existing topic and stream", func() {
@@ -86,7 +86,7 @@ var _ = ginkgo.Describe("DELETE CONSUMER GROUP:", func() {
 				randomU32Identifier(),
 			)
 
-			itShouldReturnSpecificError(err, "stream_id_not_found")
+			itShouldReturnSpecificError(err, ierror.ErrStreamIdNotFound)
 		})
 	})
 

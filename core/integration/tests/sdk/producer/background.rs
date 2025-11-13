@@ -17,7 +17,7 @@
  */
 
 use crate::sdk::producer::{
-    PARTITION_ID, STREAM_ID, TOPIC_ID, cleanup, create_message_payload, init_system,
+    PARTITION_ID, STREAM_NAME, TOPIC_NAME, cleanup, create_message_payload, init_system,
 };
 use bytes::Bytes;
 use iggy::clients::producer_config::BackpressureMode;
@@ -68,7 +68,7 @@ async fn background_send_receive_ok() {
     }
 
     let producer = client
-        .producer(&STREAM_ID.to_string(), &TOPIC_ID.to_string())
+        .producer(STREAM_NAME, TOPIC_NAME)
         .unwrap()
         .partitioning(Partitioning::partition_id(PARTITION_ID))
         .background(BackgroundConfig::builder().build())
@@ -81,8 +81,8 @@ async fn background_send_receive_ok() {
     let consumer = Consumer::default();
     let polled_messages = client
         .poll_messages(
-            &Identifier::numeric(STREAM_ID).unwrap(),
-            &Identifier::numeric(TOPIC_ID).unwrap(),
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
             Some(PARTITION_ID),
             &consumer,
             &PollingStrategy::offset(0),
@@ -123,7 +123,7 @@ async fn background_buffer_overflow_immediate() {
         .failure_mode(BackpressureMode::FailImmediately)
         .build();
     let producer = client
-        .producer(&STREAM_ID.to_string(), &TOPIC_ID.to_string())
+        .producer(STREAM_NAME, TOPIC_NAME)
         .unwrap()
         .background(cfg)
         .build();
@@ -185,7 +185,7 @@ async fn background_block_with_timeout() {
         )))
         .build();
     let producer = client
-        .producer(&STREAM_ID.to_string(), &TOPIC_ID.to_string())
+        .producer(STREAM_NAME, TOPIC_NAME)
         .unwrap()
         .background(cfg)
         .build();
@@ -238,7 +238,7 @@ async fn background_block_waits_then_succeeds() {
         .build();
 
     let producer = client
-        .producer(&STREAM_ID.to_string(), &TOPIC_ID.to_string())
+        .producer(STREAM_NAME, TOPIC_NAME)
         .unwrap()
         .background(cfg)
         .build();
@@ -290,7 +290,7 @@ async fn background_graceful_shutdown() {
         .linger_time(IggyDuration::from(2_000_000)) // 2s – long enough not to flush automatically
         .build();
     let producer = client
-        .producer(&STREAM_ID.to_string(), &TOPIC_ID.to_string())
+        .producer(STREAM_NAME, TOPIC_NAME)
         .unwrap()
         .background(cfg)
         .build();
@@ -307,8 +307,8 @@ async fn background_graceful_shutdown() {
     let consumer = Consumer::default();
     let polled_messages = client
         .poll_messages(
-            &Identifier::numeric(STREAM_ID).unwrap(),
-            &Identifier::numeric(TOPIC_ID).unwrap(),
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
             Some(PARTITION_ID),
             &consumer,
             &PollingStrategy::offset(0),
@@ -322,8 +322,8 @@ async fn background_graceful_shutdown() {
     producer.shutdown().await;
     let polled_messages = client
         .poll_messages(
-            &Identifier::numeric(STREAM_ID).unwrap(),
-            &Identifier::numeric(TOPIC_ID).unwrap(),
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
             Some(PARTITION_ID),
             &consumer,
             &PollingStrategy::offset(0),
@@ -363,7 +363,7 @@ async fn background_many_parallel_producers() {
         let handle = tokio::spawn(async move {
             let cfg = BackgroundConfig::builder().num_shards(1).build();
             let producer = client_clone
-                .producer(&STREAM_ID.to_string(), &TOPIC_ID.to_string())
+                .producer(STREAM_NAME, TOPIC_NAME)
                 .unwrap()
                 .partitioning(Partitioning::partition_id(PARTITION_ID))
                 .background(cfg)
@@ -391,8 +391,8 @@ async fn background_many_parallel_producers() {
     let consumer = Consumer::default();
     let polled_messages = client
         .poll_messages(
-            &Identifier::numeric(STREAM_ID).unwrap(),
-            &Identifier::numeric(TOPIC_ID).unwrap(),
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
             Some(PARTITION_ID),
             &consumer,
             &PollingStrategy::offset(0),

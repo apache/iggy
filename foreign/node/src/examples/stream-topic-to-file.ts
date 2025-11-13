@@ -27,31 +27,33 @@ import type { PollMessagesResponse } from '../wire/index.js';
 
 export const topicToFile = async (
   filepath: string,
-  streamId: number,
-  topicId: number,
-  partitionId = 1
+  streamName: string,
+  topicName: string,
+  partitionId = 0
 ) => {
   const cli = getClient();
   const fd = await open(filepath, 'w+');
 
-  const t = await cli.topic.get({ streamId, topicId });
+  const t = await cli.topic.get({ streamId: streamName, topicId: topicName });
   console.log('TOPIC/GET', t);
 
-  // reset consumer offset 
+  // reset consumer offset
   try {
     const offset = await cli.offset.get({
-      streamId, topicId, partitionId, consumer: Consumer.Single
+      streamId: streamName, topicId: topicName, partitionId, consumer: Consumer.Single
     });
     if (offset)
-      await cli.offset.delete({ streamId, topicId, partitionId, consumer: Consumer.Single });
+      await cli.offset.delete({
+        streamId: streamName, topicId: topicName, partitionId, consumer: Consumer.Single
+      });
     // eslint-disable-next-line @typescript-eslint/no-unused-vars
   } catch (err) {}
 
   const dStart = Date.now();
   const consumer = singleConsumerStream(cli._config);
   const stream = await consumer({
-    streamId,
-    topicId,
+    streamId: streamName,
+    topicId: topicName,
     partitionId,
     pollingStrategy: PollingStrategy.Next,
     count: 1,
@@ -91,8 +93,8 @@ if (argz.length < 3 || ['-h', '--help', '?'].includes(argz[0])) {
 }
 
 const filepath = resolve(rPath);
-const streamId = parseInt(streamIdStr);
-const topicId = parseInt(topicIdStr);
+const streamId = streamIdStr;
+const topicId = topicIdStr;
 
 console.log('running with params:', { filepath, streamId, topicId });
 

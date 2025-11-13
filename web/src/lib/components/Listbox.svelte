@@ -25,10 +25,12 @@
     errorMessage = undefined
   }: Props<GenericOption> = $props();
 
-  let listbox = $state(createListbox({
-    label: 'Actions',
-    selected: options.find((option) => option.value === selectedValue) ?? options[0]
-  }));
+  let listbox = $state(
+    createListbox({
+      label: 'Actions',
+      selected: options.find((option) => option.value === selectedValue) ?? options[0]
+    })
+  );
 
   $effect(() => {
     const newSelectedOption = options.find((option) => option.value === selectedValue);
@@ -58,9 +60,9 @@
       use:listbox.button
       onselect={onSelect}
       class={twMerge(
-        'rounded-md dark:bg-shadeD400 w-full px-4  ring-1 ring-gray-300 dark:ring-gray-500 flex items-center h-[40px] text-color focus-within:ring-2 focus-within:ring-gray-400 transition group relative',
+        'rounded-md dark:bg-shade-d400 w-full px-4  ring-1 ring-gray-300 dark:ring-gray-500 flex items-center h-[40px] text-color focus-within:ring-2 focus-within:ring-gray-400 transition group relative',
         $listbox.expanded && 'ring-creator-gray4',
-        errorMessage && '!ring-red-600 ring-2'
+        errorMessage && 'ring-red-600! ring-2'
       )}
     >
       <span class="block truncate text-sm">{selectedOptionPrefix} {$listbox.selected.name}</span>
@@ -77,14 +79,14 @@
       <ul
         use:listbox.items
         transition:fade={{ duration: 100 }}
-        class="absolute mt-1 max-h-60 py-1 z-20 w-full border overflow-auto dark:bg-shadeD400 bg-shadeL200 rounded-md text-sm shadow-lg text-color"
+        class="absolute mt-1 max-h-60 py-1 z-20 w-full border overflow-auto dark:bg-shade-d400 bg-shade-l200 rounded-md text-sm shadow-lg text-color"
       >
         {#each options as option, idx (idx)}
           {@const selected = $listbox.selected === option}
           <li
             class={twMerge(
               'relative cursor-default select-none py-2 pr-4 transition-colors p-[10px]  hoverable',
-              selected && 'dark:!bg-shadeD170 !bg-shadeL600'
+              selected && 'dark:!bg-shade-d170 !bg-shade-l600'
             )}
             use:listbox.item={{ value: option }}
           >

@@ -45,6 +45,7 @@ pub use crate::stream_builder::IggyStreamConsumer;
 pub use crate::stream_builder::{IggyProducerConfig, IggyStreamProducer};
 pub use crate::stream_builder::{IggyStream, IggyStreamConfig};
 pub use crate::tcp::tcp_client::TcpClient;
+pub use crate::websocket::websocket_client::WebSocketClient;
 pub use iggy_binary_protocol::{
     Client, ClusterClient, ConsumerGroupClient, ConsumerOffsetClient, MessageClient,
     PartitionClient, PersonalAccessTokenClient, SegmentClient, StreamClient, SystemClient,
@@ -52,7 +53,7 @@ pub use iggy_binary_protocol::{
 };
 pub use iggy_common::{
     Aes256GcmEncryptor, Args, ArgsOptional, AutoLogin, BytesSerializable, CacheMetrics,
-    CacheMetricsKey, ClientError, ClientInfoDetails, CompressionAlgorithm, Confirmation, Consumer,
+    CacheMetricsKey, ClientError, ClientInfoDetails, CompressionAlgorithm, Consumer,
     ConsumerGroupDetails, ConsumerKind, EncryptorKind, FlushUnsavedBuffer, GlobalPermissions,
     HeaderKey, HeaderValue, HttpClientConfig, HttpClientConfigBuilder, IdKind, Identifier,
     IdentityInfo, IggyByteSize, IggyDuration, IggyError, IggyExpiry, IggyIndexView, IggyMessage,
@@ -63,6 +64,7 @@ pub use iggy_common::{
     Sizeable, SnapshotCompression, Stats, Stream, StreamDetails, StreamPermissions,
     SystemSnapshotType, TcpClientConfig, TcpClientConfigBuilder, TcpClientReconnectionConfig,
     Topic, TopicDetails, TopicPermissions, TransportProtocol, UserId, UserStatus, Validatable,
+    WebSocketClientConfig, WebSocketClientConfigBuilder, WebSocketClientReconnectionConfig,
     defaults, locking,
 };
 pub use iggy_common::{

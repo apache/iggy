@@ -35,6 +35,7 @@ import org.apache.iggy.user.StreamPermissions;
 import org.apache.iggy.user.TopicPermissions;
 import java.math.BigInteger;
 import java.util.Map;
+import java.util.Optional;
 
 public final class BytesSerializer {
 
@@ -104,6 +105,18 @@ public final class BytesSerializer {
         var buffer = Unpooled.buffer(9);
         buffer.writeByte(strategy.kind().asCode());
         buffer.writeBytes(toBytesAsU64(strategy.value()));
+        return buffer;
+    }
+
+    static ByteBuf toBytes(Optional<Long> optionalLong) {
+        var buffer = Unpooled.buffer(5);
+        if (optionalLong.isPresent()) {
+            buffer.writeByte(1);
+            buffer.writeIntLE(optionalLong.get().intValue());
+        } else {
+            buffer.writeByte(0);
+            buffer.writeIntLE(0);
+        }
         return buffer;
     }
 

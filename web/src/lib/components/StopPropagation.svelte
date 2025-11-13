@@ -1,13 +1,12 @@
 <script lang="ts">
   import { Keys } from '$lib/utils/constants/keys';
-  
+
   interface Props {
     class?: string | undefined;
     children?: import('svelte').Snippet;
   }
 
   let { class: className = undefined, children }: Props = $props();
-  
 </script>
 
 <div

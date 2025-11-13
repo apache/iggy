@@ -19,34 +19,33 @@ package tcp_test
 
 import (
 	"fmt"
+	"math"
+
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
 	"github.com/apache/iggy/foreign/go/iggycli"
 	"github.com/onsi/ginkgo/v2"
 	"github.com/onsi/gomega"
-	"math"
 )
 
 //operations
 
 func successfullyCreateTopic(streamId uint32, client iggycli.Client) (uint32, string) {
-	topicId := createRandomUInt32()
 	replicationFactor := uint8(1)
 	name := createRandomString(128)
 	streamIdentifier, _ := iggcon.NewIdentifier(streamId)
-	_, err := client.CreateTopic(
+    topic, err := client.CreateTopic(
 		streamIdentifier,
 		name,
 		2,
 		1,
 		0,
 		math.MaxUint64,
-		&replicationFactor,
-		&topicId)
+        &replicationFactor)
 
-	itShouldSuccessfullyCreateTopic(streamId, topicId, name, client)
+    itShouldSuccessfullyCreateTopic(streamId, topic.Id, name, client)
 	itShouldNotReturnError(err)
-	return topicId, name
+    return topic.Id, name
 }
 
 //assertions
@@ -126,7 +125,7 @@ func itShouldSuccessfullyDeleteTopic(streamId uint32, topicId uint32, client igg
 	topicIdentifier, _ := iggcon.NewIdentifier(topicId)
 	topic, err := client.GetTopic(streamIdentifier, topicIdentifier)
 
-	itShouldReturnSpecificIggyError(err, ierror.TopicIdNotFound)
+	itShouldReturnSpecificError(err, ierror.ErrTopicIdNotFound)
 	ginkgo.It("should not return topic", func() {
 		gomega.Expect(topic).To(gomega.BeNil())
 	})

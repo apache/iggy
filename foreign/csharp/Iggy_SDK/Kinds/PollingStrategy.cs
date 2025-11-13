@@ -19,11 +19,30 @@ using Apache.Iggy.Enums;
 
 namespace Apache.Iggy.Kinds;
 
+/// <summary>
+///     Represents a strategy for polling messages from a stream or topic.
+///     Defines the starting point for message consumption.
+/// </summary>
 public readonly struct PollingStrategy
 {
+    /// <summary>
+    ///     Gets the type of message polling strategy to use.
+    /// </summary>
     public required MessagePolling Kind { get; init; }
+
+    /// <summary>
+    ///     Gets the value associated with the polling strategy.
+    ///     For Offset: the message offset to start from.
+    ///     For Timestamp: the Unix timestamp (in microseconds) to start from.
+    ///     For First, Last, and Next: this value is 0.
+    /// </summary>
     public required ulong Value { get; init; }
 
+    /// <summary>
+    ///     Creates a polling strategy that starts from a specific message offset.
+    /// </summary>
+    /// <param name="value">The message offset to start polling from.</param>
+    /// <returns>A <see cref="PollingStrategy" /> configured for offset-based polling.</returns>
     public static PollingStrategy Offset(ulong value)
     {
         return new PollingStrategy
@@ -33,6 +52,11 @@ public readonly struct PollingStrategy
         };
     }
 
+    /// <summary>
+    ///     Creates a polling strategy that starts from a specific timestamp.
+    /// </summary>
+    /// <param name="value">The Unix timestamp (in microseconds) to start polling from.</param>
+    /// <returns>A <see cref="PollingStrategy" /> configured for timestamp-based polling.</returns>
     public static PollingStrategy Timestamp(ulong value)
     {
         return new PollingStrategy
@@ -42,6 +66,10 @@ public readonly struct PollingStrategy
         };
     }
 
+    /// <summary>
+    ///     Creates a polling strategy that starts from the first available message.
+    /// </summary>
+    /// <returns>A <see cref="PollingStrategy" /> configured to poll from the first message.</returns>
     public static PollingStrategy First()
     {
         return new PollingStrategy
@@ -51,6 +79,10 @@ public readonly struct PollingStrategy
         };
     }
 
+    /// <summary>
+    ///     Creates a polling strategy that starts from the last available message.
+    /// </summary>
+    /// <returns>A <see cref="PollingStrategy" /> configured to poll from the last message.</returns>
     public static PollingStrategy Last()
     {
         return new PollingStrategy
@@ -60,6 +92,10 @@ public readonly struct PollingStrategy
         };
     }
 
+    /// <summary>
+    ///     Creates a polling strategy that starts from the next available message after the current consumer offset.
+    /// </summary>
+    /// <returns>A <see cref="PollingStrategy" /> configured to poll from the next message.</returns>
     public static PollingStrategy Next()
     {
         return new PollingStrategy

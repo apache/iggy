@@ -29,8 +29,9 @@ use iggy::prelude::{Permissions, UserStatus};
 use predicates::str::diff;
 use serial_test::parallel;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 enum UserStatusTest {
+    #[default]
     Default,
     Active,
     Inactive,
@@ -43,12 +44,6 @@ impl UserStatusTest {
             Self::Active => vec![String::from("--user-status"), String::from("active")],
             Self::Inactive => vec![String::from("--user-status"), String::from("inactive")],
         }
-    }
-}
-
-impl Default for UserStatusTest {
-    fn default() -> Self {
-        Self::Default
     }
 }
 
@@ -193,7 +188,7 @@ pub async fn should_be_successful() {
                 vec![String::from("3")],
                 Some(Permissions {
                     global: GlobalPermissions::default(),
-                    streams: Some(AHashMap::from([(3u32, StreamPermissions::default())])),
+                    streams: Some(AHashMap::from([(3usize, StreamPermissions::default())])),
                 }),
             ),
         ))
@@ -209,7 +204,7 @@ pub async fn should_be_successful() {
                 Some(Permissions {
                     global: GlobalPermissions::default(),
                     streams: Some(AHashMap::from([(
-                        1u32,
+                        1usize,
                         StreamPermissions {
                             topics: Some(AHashMap::from([(
                                 1,
@@ -249,7 +244,7 @@ pub async fn should_be_successful() {
                         send_messages: false,
                     },
                     streams: Some(AHashMap::from([(
-                        2u32,
+                        2usize,
                         StreamPermissions {
                             topics: Some(AHashMap::from([(
                                 1,
