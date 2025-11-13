@@ -16,6 +16,7 @@
 # under the License.
 
 type = "sink"
+id = "quickwit"
 enabled = true
 version = 0
 name = "Quickwit sink 1"

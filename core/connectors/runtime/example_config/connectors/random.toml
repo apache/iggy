@@ -16,6 +16,7 @@
 # under the License.
 
 type = "source"
+id = "random"
 enabled = true
 version = 0
 name = "Random source"

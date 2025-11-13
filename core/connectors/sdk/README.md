@@ -42,6 +42,7 @@ config_dir = "path/to/connectors"
 
 ```toml
 type = "source"
+id = "protobuf"
 enabled = true
 version = 0
 name = "Protobuf Source"
@@ -64,6 +65,7 @@ use_any_wrapper = true
 
 ```toml
 type = "sink"
+id = "protobuf"
 enabled = true
 version = 0
 name = "Protobuf Sink"

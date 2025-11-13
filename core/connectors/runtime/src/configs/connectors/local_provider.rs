@@ -23,7 +23,9 @@ use async_trait::async_trait;
 use figment::value::Dict;
 use figment::{Metadata, Profile, Provider};
 use iggy_common::{ConfigProvider, CustomEnvProvider, FileConfigProvider};
+use serde::Deserialize;
 use std::collections::HashMap;
+use std::path::Path;
 use tracing::{debug, info, warn};
 
 pub struct LocalConnectorsConfigProvider {
@@ -39,14 +41,48 @@ impl LocalConnectorsConfigProvider {
 
     fn create_file_config_provider(
         path: String,
-        connector_name: &str,
+        base_config: &BaseConnectorConfig,
     ) -> FileConfigProvider<ConnectorEnvProvider> {
         FileConfigProvider::new(
             path,
-            ConnectorEnvProvider::with_connector_name(connector_name),
+            ConnectorEnvProvider::with_connector_base_config(base_config),
             false,
             None,
         )
+    }
+
+    fn read_base_config(path: &Path) -> Result<BaseConnectorConfig, RuntimeError> {
+        let config_data = std::fs::read(path)?;
+        toml::from_slice(&config_data).map_err(|err| {
+            RuntimeError::InvalidConfiguration(format!(
+                "parsing TOML file '{}' raised an error: {}",
+                path.display(),
+                err.message()
+            ))
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum BaseConnectorConfig {
+    Sink { id: String },
+    Source { id: String },
+}
+
+impl BaseConnectorConfig {
+    fn id(&self) -> &str {
+        match self {
+            BaseConnectorConfig::Sink { id } => id,
+            BaseConnectorConfig::Source { id } => id,
+        }
+    }
+
+    fn connector_type(&self) -> &str {
+        match self {
+            BaseConnectorConfig::Sink { .. } => "sink",
+            BaseConnectorConfig::Source { .. } => "source",
+        }
     }
 }
 
@@ -64,31 +100,37 @@ impl ConnectorsConfigProvider for LocalConnectorsConfigProvider {
             );
             return Ok(ConnectorsConfig::default());
         }
-        let mut configs = HashMap::new();
+        let mut sinks = HashMap::new();
+        let mut sources = HashMap::new();
         info!("Loading connectors configuration from: {}", self.config_dir);
         let entries = std::fs::read_dir(&self.config_dir)?;
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_file() {
                 debug!("Loading connector configuration from: {:?}", path);
-                let connector_name = path
-                    .file_stem()
-                    .expect("Failed to get connector configuration name")
-                    .to_string_lossy()
-                    .to_string();
-                let connector_config = Self::create_file_config_provider(
+                let base_config = Self::read_base_config(&path)?;
+                debug!("Loaded base configuration: {:?}", base_config);
+                let connector_config: ConnectorConfig = Self::create_file_config_provider(
                     path.to_str()
                         .expect("Failed to convert connector configuration path to string")
                         .to_string(),
-                    &connector_name,
+                    &base_config,
                 )
                 .load_config()
                 .await
                 .expect("Failed to load connector configuration");
-                configs.insert(connector_name, connector_config);
+
+                match connector_config {
+                    ConnectorConfig::Sink(sink_config) => {
+                        sinks.insert(base_config.id().to_owned(), sink_config);
+                    }
+                    ConnectorConfig::Source(source_config) => {
+                        sources.insert(base_config.id().to_owned(), source_config);
+                    }
+                }
             }
         }
-        Ok(ConnectorsConfig { configs })
+        Ok(ConnectorsConfig { sinks, sources })
     }
 }
 
@@ -99,10 +141,12 @@ pub struct ConnectorEnvProvider {
 }
 
 impl ConnectorEnvProvider {
-    fn with_connector_name(connector_name: &str) -> Self {
-        let prefix = format!("IGGY_CONNECTORS_{}_", connector_name.to_uppercase());
+    fn with_connector_base_config(base_config: &BaseConnectorConfig) -> Self {
+        let connector_type = base_config.connector_type().to_uppercase();
+        let id = base_config.id().to_uppercase();
+        let prefix = format!("IGGY_CONNECTORS_{}_{}_", connector_type, id);
         Self {
-            connector_name: connector_name.to_owned(),
+            connector_name: base_config.id().to_owned(),
             provider: CustomEnvProvider::new(&prefix, &[]),
         }
     }

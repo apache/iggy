@@ -61,6 +61,7 @@ impl Default for ConnectorConfig {
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct SinkConfig {
+    pub id: String,
     pub enabled: bool,
     pub version: u64,
     pub name: String,
@@ -73,6 +74,7 @@ pub struct SinkConfig {
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct SourceConfig {
+    pub id: String,
     pub enabled: bool,
     pub version: u64,
     pub name: String,
@@ -126,7 +128,8 @@ impl From<RuntimeConnectorsConfig> for Box<dyn ConnectorsConfigProvider> {
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ConnectorsConfig {
-    pub configs: HashMap<String, ConnectorConfig>,
+    sinks: HashMap<String, SinkConfig>,
+    sources: HashMap<String, SourceConfig>,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -227,22 +230,10 @@ impl std::fmt::Display for StreamProducerConfig {
 
 impl ConnectorsConfig {
     pub fn sinks(&self) -> HashMap<String, SinkConfig> {
-        self.configs
-            .iter()
-            .filter_map(|(k, v)| match v {
-                ConnectorConfig::Sink(config) => Some((k.to_owned(), config.clone())),
-                _ => None,
-            })
-            .collect()
+        self.sinks.clone()
     }
 
     pub fn sources(&self) -> HashMap<String, SourceConfig> {
-        self.configs
-            .iter()
-            .filter_map(|(k, v)| match v {
-                ConnectorConfig::Source(config) => Some((k.to_owned(), config.clone())),
-                _ => None,
-            })
-            .collect()
+        self.sources.clone()
     }
 }
