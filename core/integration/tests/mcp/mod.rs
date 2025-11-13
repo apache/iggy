@@ -163,7 +163,7 @@ async fn mcp_server_should_return_topic_details() {
         "get_topic",
         Some(json!({"stream_id": STREAM_NAME, "topic_id": TOPIC_NAME})),
         |topic| {
-            assert_eq!(topic.id, 1);
+            assert_eq!(topic.id, 0);
             assert_eq!(topic.name, TOPIC_NAME);
             assert_eq!(topic.messages_count, 1);
         },
@@ -179,7 +179,7 @@ async fn mcp_server_should_create_topic() {
         "create_topic",
         Some(json!({ "stream_id": STREAM_NAME, "name": name, "partitions_count": 1})),
         |topic| {
-            assert_eq!(topic.id, 2);
+            assert_eq!(topic.id, 1);
             assert_eq!(topic.name, name);
             assert_eq!(topic.partitions_count, 1);
             assert_eq!(topic.messages_count, 0);
@@ -244,7 +244,7 @@ async fn mcp_server_should_delete_partitions() {
 async fn mcp_server_should_delete_segments() {
     assert_empty_response(
         "delete_segments",
-        Some(json!({ "stream_id": STREAM_NAME, "topic_id": TOPIC_NAME, "partition_id": 1, "segments_count": 1 })),
+        Some(json!({ "stream_id": STREAM_NAME, "topic_id": TOPIC_NAME, "partition_id": 0, "segments_count": 1 })),
     )
     .await;
 }
@@ -254,7 +254,7 @@ async fn mcp_server_should_delete_segments() {
 async fn mcp_server_should_poll_messages() {
     assert_response::<PolledMessages>(
         "poll_messages",
-        Some(json!({ "stream_id": STREAM_NAME, "topic_id": TOPIC_NAME, "partition_id": 1, "offset": 0 })),
+        Some(json!({ "stream_id": STREAM_NAME, "topic_id": TOPIC_NAME, "partition_id": 0, "offset": 0 })),
         |messages| {
             assert_eq!(messages.messages.len(), 1);
             let message = &messages.messages[0];
@@ -271,7 +271,7 @@ async fn mcp_server_should_poll_messages() {
 async fn mcp_server_should_send_messages() {
     assert_empty_response(
         "send_messages",
-        Some(json!({ "stream_id": STREAM_NAME, "topic_id": TOPIC_NAME, "partition_id": 1, "messages": [
+        Some(json!({ "stream_id": STREAM_NAME, "topic_id": TOPIC_NAME, "partition_id": 0, "messages": [
             {
                 "payload": "test"
             }
@@ -375,11 +375,11 @@ async fn mcp_server_should_delete_consumer_group() {
 async fn mcp_server_should_return_consumer_offset() {
     assert_response::<Option<ConsumerOffsetInfo>>(
         "get_consumer_offset",
-        Some(json!({ "stream_id": STREAM_NAME, "topic_id": TOPIC_NAME, "partition_id": 1 })),
+        Some(json!({ "stream_id": STREAM_NAME, "topic_id": TOPIC_NAME, "partition_id": 0 })),
         |offset| {
             assert!(offset.is_some());
             let offset = offset.unwrap();
-            assert_eq!(offset.partition_id, 1);
+            assert_eq!(offset.partition_id, 0);
             assert_eq!(offset.stored_offset, 0);
             assert_eq!(offset.current_offset, 0);
         },
@@ -392,7 +392,7 @@ async fn mcp_server_should_return_consumer_offset() {
 async fn mcp_server_should_store_consumer_offset() {
     assert_empty_response(
         "store_consumer_offset",
-        Some(json!({ "stream_id": STREAM_NAME, "topic_id": TOPIC_NAME, "partition_id": 1, "offset": 0 })),
+        Some(json!({ "stream_id": STREAM_NAME, "topic_id": TOPIC_NAME, "partition_id": 0, "offset": 0 })),
     )
     .await;
 }
@@ -402,7 +402,7 @@ async fn mcp_server_should_store_consumer_offset() {
 async fn mcp_server_should_delete_consumer_offset() {
     assert_empty_response(
         "delete_consumer_offset",
-        Some(json!({ "stream_id": STREAM_NAME, "topic_id": TOPIC_NAME, "partition_id": 1, "offset": 0 })),
+        Some(json!({ "stream_id": STREAM_NAME, "topic_id": TOPIC_NAME, "partition_id": 0, "offset": 0 })),
     )
     .await;
 }
@@ -602,7 +602,7 @@ async fn seed_data(iggy_server_address: &str) {
         .expect("Failed to initialize Iggy client");
 
     iggy_client
-        .create_stream(STREAM_NAME, None)
+        .create_stream(STREAM_NAME)
         .await
         .expect("Failed to create stream");
 
@@ -612,7 +612,6 @@ async fn seed_data(iggy_server_address: &str) {
             TOPIC_NAME,
             1,
             iggy_common::CompressionAlgorithm::None,
-            None,
             None,
             IggyExpiry::ServerDefault,
             MaxTopicSize::ServerDefault,
@@ -631,7 +630,7 @@ async fn seed_data(iggy_server_address: &str) {
         .send_messages(
             &STREAM_ID,
             &TOPIC_ID,
-            &Partitioning::partition_id(1),
+            &Partitioning::partition_id(0),
             &mut messages,
         )
         .await
@@ -641,12 +640,12 @@ async fn seed_data(iggy_server_address: &str) {
         Consumer::new(Identifier::named(CONSUMER_NAME).expect("Failed to create consumer"));
 
     iggy_client
-        .store_consumer_offset(&consumer, &STREAM_ID, &TOPIC_ID, Some(1), 0)
+        .store_consumer_offset(&consumer, &STREAM_ID, &TOPIC_ID, Some(0), 0)
         .await
         .expect("Failed to store consumer offset");
 
     iggy_client
-        .create_consumer_group(&STREAM_ID, &TOPIC_ID, CONSUMER_GROUP_NAME, None)
+        .create_consumer_group(&STREAM_ID, &TOPIC_ID, CONSUMER_GROUP_NAME)
         .await
         .expect("Failed to create consumer group");
 

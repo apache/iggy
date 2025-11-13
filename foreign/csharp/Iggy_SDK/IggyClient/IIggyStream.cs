@@ -21,7 +21,7 @@ namespace Apache.Iggy.IggyClient;
 
 public interface IIggyStream
 {
-    Task<StreamResponse?> CreateStreamAsync(string name, uint? streamId = null, CancellationToken token = default);
+    Task<StreamResponse?> CreateStreamAsync(string name, CancellationToken token = default);
     Task<StreamResponse?> GetStreamByIdAsync(Identifier streamId, CancellationToken token = default);
     Task UpdateStreamAsync(Identifier streamId, string name, CancellationToken token = default);
     Task<IReadOnlyList<StreamResponse>> GetStreamsAsync(CancellationToken token = default);

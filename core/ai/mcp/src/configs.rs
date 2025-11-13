@@ -1,4 +1,5 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
  * regarding copyright ownership.  The ASF licenses this file
@@ -45,6 +46,14 @@ pub struct IggyConfig {
     pub password: String,
     pub token: String,
     pub consumer: String,
+    pub tls: IggyTlsConfig,
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct IggyTlsConfig {
+    pub enabled: bool,
+    pub ca_file: String,
+    pub domain: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -111,6 +120,7 @@ impl Default for IggyConfig {
             password: DEFAULT_ROOT_PASSWORD.to_owned(),
             token: "".to_owned(),
             consumer: "iggy-mcp".to_owned(),
+            tls: IggyTlsConfig::default(),
         }
     }
 }
@@ -189,7 +199,7 @@ impl std::fmt::Display for IggyConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ address: {}, username: {}, password: {}, token: {}, consumer: {} }}",
+            "{{ address: {}, username: {}, password: {}, token: {}, consumer: {}, tls: {} }}",
             self.address,
             self.username,
             if !self.password.is_empty() {
@@ -198,7 +208,18 @@ impl std::fmt::Display for IggyConfig {
                 ""
             },
             if !self.token.is_empty() { "****" } else { "" },
-            self.consumer
+            self.consumer,
+            self.tls
+        )
+    }
+}
+
+impl std::fmt::Display for IggyTlsConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{{ enabled: {}, ca_file: {:?}, domain: {:?} }}",
+            self.enabled, self.ca_file, self.domain
         )
     }
 }

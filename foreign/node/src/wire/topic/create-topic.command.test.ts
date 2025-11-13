@@ -28,7 +28,6 @@ describe('CreateTopic', () => {
 
     const t1 = {
       streamId: 1,
-      topicId: 2,
       name: 'test-topic',
       partitionCount: 1,
       compressionAlgorithm: 1, // 1 = None, 2 = Gzip
@@ -37,10 +36,10 @@ describe('CreateTopic', () => {
       replicationFactor: 1
     };
 
-    it('serialize 1 numeric id & 1 name into buffer', () => {
+    it('serialize 1 name into buffer', () => {
       assert.deepEqual(
         CREATE_TOPIC.serialize(t1).length,
-        6 + 4 + 4 + 1 + 8 + 8 + 1 + 1 + t1.name.length
+        6  + 4 + 1 + 8 + 8 + 1 + 1 + t1.name.length
       );
     });
 

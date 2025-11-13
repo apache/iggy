@@ -18,13 +18,16 @@
 
 pub mod cache_indexes;
 pub mod cluster;
+pub mod config_provider;
 pub mod defaults;
 pub mod displays;
 pub mod http;
 pub mod quic;
 pub mod server;
+pub mod sharding;
 pub mod system;
 pub mod tcp;
 pub mod validators;
+pub mod websocket;
 
 pub const COMPONENT: &str = "CONFIG";

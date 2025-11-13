@@ -29,7 +29,7 @@ namespace Apache.Iggy.Mappers;
 
 internal static class BinaryMapper
 {
-    private const int PROPERTIES_SIZE = 56;
+    private const int PropertiesSize = 56;
 
     internal static RawPersonalAccessToken MapRawPersonalAccessToken(ReadOnlySpan<byte> payload)
     {
@@ -226,12 +226,12 @@ internal static class BinaryMapper
         var readBytes = 4 + 8 + 1 + 1 + usernameLength;
 
         return (new UserResponse
-            {
-                Id = id,
-                CreatedAt = createdAt,
-                Status = userStatus,
-                Username = username
-            },
+        {
+            Id = id,
+            CreatedAt = createdAt,
+            Status = userStatus,
+            Username = username
+        },
             readBytes);
     }
 
@@ -407,7 +407,7 @@ internal static class BinaryMapper
             }
 
             position += 56 + payloadLength + headersLength;
-            if (position + PROPERTIES_SIZE >= length)
+            if (position + PropertiesSize >= length)
             {
                 break;
             }
@@ -492,7 +492,7 @@ internal static class BinaryMapper
 
             position += 56 + payloadLength + headersLength;
 
-            if (position + PROPERTIES_SIZE >= length)
+            if (position + PropertiesSize >= length)
             {
                 break;
             }
@@ -870,11 +870,11 @@ internal static class BinaryMapper
         }
 
         return (new ConsumerGroupMember
-            {
-                Id = id,
-                PartitionsCount = partitionsCount,
-                Partitions = partitions
-            },
+        {
+            Id = id,
+            PartitionsCount = partitionsCount,
+            Partitions = partitions
+        },
             8 + partitionsCount * 4);
     }
 

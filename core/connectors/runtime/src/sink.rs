@@ -1,4 +1,5 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
  * regarding copyright ownership.  The ASF licenses this file
@@ -16,9 +17,10 @@
  * under the License.
  */
 
+use crate::configs::SinkConfig;
 use crate::{
     PLUGIN_ID, RuntimeError, SinkApi, SinkConnector, SinkConnectorConsumer, SinkConnectorPlugin,
-    SinkConnectorWrapper, configs::SinkConfig, resolve_plugin_path, transform,
+    SinkConnectorWrapper, resolve_plugin_path, transform,
 };
 use dlopen2::wrapper::Container;
 use futures::StreamExt;

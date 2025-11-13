@@ -15,9 +15,5 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-
-#[cfg(not(feature = "tokio-console"))]
 pub mod logger;
-
-#[cfg(feature = "tokio-console")]
-pub mod tokio_console;
+pub mod runtime;

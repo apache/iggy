@@ -57,12 +57,8 @@ impl<'a> IggyMessageViewMut<'a> {
         let checksum_field_size = size_of::<u64>(); // Skip checksum field for checksum calculation
         let size = self.size() - checksum_field_size;
         let data = &self.buffer[checksum_field_size..checksum_field_size + size];
-
-        // TODO(hubcio): checksum field is 64 bits, but actual checksum is 32 bits (crc32fast)
-        // in future, we should change it to some cryptographic safe hash function
         let checksum = calculate_checksum(data);
-
-        self.header_mut().set_checksum(checksum as u64);
+        self.header_mut().set_checksum(checksum);
     }
 }
 

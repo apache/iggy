@@ -43,7 +43,7 @@ class ConsumerOffsetTcpClient implements ConsumerOffsetsClient {
         var payload = toBytes(consumer);
         payload.writeBytes(toBytes(streamId));
         payload.writeBytes(toBytes(topicId));
-        payload.writeIntLE(partitionId.orElse(0L).intValue());
+        payload.writeBytes(toBytes(partitionId));
         payload.writeBytes(toBytesAsU64(offset));
 
         tcpClient.send(CommandCode.ConsumerOffset.STORE, payload);
@@ -54,7 +54,7 @@ class ConsumerOffsetTcpClient implements ConsumerOffsetsClient {
         var payload = toBytes(consumer);
         payload.writeBytes(toBytes(streamId));
         payload.writeBytes(toBytes(topicId));
-        payload.writeIntLE(partitionId.orElse(0L).intValue());
+        payload.writeBytes(toBytes(partitionId));
 
         var response = tcpClient.send(CommandCode.ConsumerOffset.GET, payload);
         if (response.isReadable()) {

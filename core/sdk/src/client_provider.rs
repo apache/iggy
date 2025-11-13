@@ -22,12 +22,15 @@ use crate::clients::client::IggyClient;
 use crate::http::http_client::HttpClient;
 use crate::prelude::{
     ClientError, HttpClientConfig, IggyDuration, QuicClientConfig, QuicClientReconnectionConfig,
-    TcpClientConfig, TcpClientReconnectionConfig,
+    TcpClientConfig, TcpClientReconnectionConfig, WebSocketClient,
 };
 use crate::quic::quic_client::QuicClient;
 use crate::tcp::tcp_client::TcpClient;
 use iggy_binary_protocol::Client;
-use iggy_common::{AutoLogin, Credentials, TransportProtocol};
+use iggy_common::{
+    AutoLogin, Credentials, TransportProtocol, WebSocketClientConfig,
+    WebSocketClientReconnectionConfig, WebSocketConfig,
+};
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -47,6 +50,8 @@ pub struct ClientProviderConfig {
     pub quic: Option<Arc<QuicClientConfig>>,
     /// The optional configuration for the TCP transport.
     pub tcp: Option<Arc<TcpClientConfig>>,
+    /// The optional configuration for the WebSocket transport.
+    pub websocket: Option<Arc<WebSocketClientConfig>>,
 }
 
 impl Default for ClientProviderConfig {
@@ -56,6 +61,7 @@ impl Default for ClientProviderConfig {
             http: Some(Arc::new(HttpClientConfig::default())),
             quic: Some(Arc::new(QuicClientConfig::default())),
             tcp: Some(Arc::new(TcpClientConfig::default())),
+            websocket: Some(Arc::new(WebSocketClientConfig::default())),
         }
     }
 }
@@ -79,6 +85,7 @@ impl ClientProviderConfig {
             http: None,
             quic: None,
             tcp: None,
+            websocket: None,
         };
         match config.transport {
             TransportProtocol::Quic => {
@@ -151,6 +158,36 @@ impl ClientProviderConfig {
                     },
                 }));
             }
+            TransportProtocol::WebSocket => {
+                config.websocket = Some(Arc::new(WebSocketClientConfig {
+                    server_address: args.websocket_server_address,
+                    heartbeat_interval: IggyDuration::from_str(&args.websocket_heartbeat_interval)
+                        .unwrap(),
+                    reconnection: WebSocketClientReconnectionConfig {
+                        enabled: args.websocket_reconnection_enabled,
+                        max_retries: args.websocket_reconnection_max_retries,
+                        interval: IggyDuration::from_str(&args.websocket_reconnection_interval)
+                            .unwrap(),
+                        reestablish_after: IggyDuration::from_str(
+                            &args.websocket_reconnection_reestablish_after,
+                        )
+                        .unwrap(),
+                    },
+                    auto_login: if auto_login {
+                        AutoLogin::Enabled(Credentials::UsernamePassword(
+                            args.username,
+                            args.password,
+                        ))
+                    } else {
+                        AutoLogin::Disabled
+                    },
+                    ws_config: WebSocketConfig::default(),
+                    tls_enabled: args.websocket_tls_enabled,
+                    tls_domain: args.websocket_tls_domain,
+                    tls_ca_file: args.websocket_tls_ca_file,
+                    tls_validate_certificate: args.websocket_tls_validate_certificate,
+                }));
+            }
         }
 
         Ok(config)
@@ -201,6 +238,14 @@ pub async fn get_raw_client(
                 Client::connect(&client).await?
             };
             Ok(ClientWrapper::Tcp(client))
+        }
+        TransportProtocol::WebSocket => {
+            let websocket_config = config.websocket.as_ref().unwrap();
+            let client = WebSocketClient::create(websocket_config.clone())?;
+            if establish_connection {
+                Client::connect(&client).await?
+            };
+            Ok(ClientWrapper::WebSocket(client))
         }
     }
 }

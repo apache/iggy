@@ -17,8 +17,7 @@
  */
 
 use crate::cli::common::{
-    CLAP_INDENT, IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestHelpCmd, TestStreamId,
-    TestTopicId, USAGE_PREFIX,
+    CLAP_INDENT, IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestHelpCmd, USAGE_PREFIX,
 };
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
@@ -30,53 +29,51 @@ use predicates::str::diff;
 use serial_test::parallel;
 
 struct TestPartitionCreateCmd {
-    stream_id: u32,
     stream_name: String,
-    topic_id: u32,
     topic_name: String,
     partitions_count: u32,
     compression_algorithm: CompressionAlgorithm,
     new_partitions: u32,
-    using_stream_id: TestStreamId,
-    using_topic_id: TestTopicId,
+    // These will be populated after creating the resources
+    actual_stream_id: Option<u32>,
+    actual_topic_id: Option<u32>,
 }
 
 impl TestPartitionCreateCmd {
-    #[allow(clippy::too_many_arguments)]
     fn new(
-        stream_id: u32,
         stream_name: String,
-        topic_id: u32,
         topic_name: String,
         partitions_count: u32,
         compression_algorithm: CompressionAlgorithm,
         new_partitions: u32,
-        using_stream_id: TestStreamId,
-        using_topic_id: TestTopicId,
     ) -> Self {
         Self {
-            stream_id,
             stream_name,
-            topic_id,
             topic_name,
             partitions_count,
             compression_algorithm,
             new_partitions,
-            using_stream_id,
-            using_topic_id,
+            actual_stream_id: None,
+            actual_topic_id: None,
         }
     }
 
     fn to_args(&self) -> Vec<String> {
-        let mut command = match self.using_stream_id {
-            TestStreamId::Numeric => vec![format!("{}", self.stream_id)],
-            TestStreamId::Named => vec![self.stream_name.clone()],
-        };
+        let mut command = vec![];
 
-        command.push(match self.using_topic_id {
-            TestTopicId::Numeric => format!("{}", self.topic_id),
-            TestTopicId::Named => self.topic_name.clone(),
-        });
+        // Use actual stream ID if available, otherwise use stream name as fallback
+        if let Some(stream_id) = self.actual_stream_id {
+            command.push(format!("{}", stream_id));
+        } else {
+            command.push(self.stream_name.clone());
+        }
+
+        // Use actual topic ID if available, otherwise use topic name as fallback
+        if let Some(topic_id) = self.actual_topic_id {
+            command.push(format!("{}", topic_id));
+        } else {
+            command.push(self.topic_name.clone());
+        }
 
         command.push(format!("{}", self.new_partitions));
 
@@ -87,24 +84,23 @@ impl TestPartitionCreateCmd {
 #[async_trait]
 impl IggyCmdTestCase for TestPartitionCreateCmd {
     async fn prepare_server_state(&mut self, client: &dyn Client) {
-        let stream = client
-            .create_stream(&self.stream_name, self.stream_id.into())
-            .await;
+        let stream = client.create_stream(&self.stream_name).await;
         assert!(stream.is_ok());
+        self.actual_stream_id = Some(stream.unwrap().id);
 
         let topic = client
             .create_topic(
-                &self.stream_id.try_into().unwrap(),
+                &self.actual_stream_id.unwrap().try_into().unwrap(),
                 &self.topic_name,
                 self.partitions_count,
                 self.compression_algorithm,
                 None,
-                Some(self.topic_id),
                 IggyExpiry::NeverExpire,
                 MaxTopicSize::ServerDefault,
             )
             .await;
         assert!(topic.is_ok());
+        self.actual_topic_id = Some(topic.unwrap().id);
     }
 
     fn get_command(&self) -> IggyCmdCommand {
@@ -116,14 +112,16 @@ impl IggyCmdTestCase for TestPartitionCreateCmd {
     }
 
     fn verify_command(&self, command_state: Assert) {
-        let stream_id = match self.using_stream_id {
-            TestStreamId::Numeric => format!("{}", self.stream_id),
-            TestStreamId::Named => self.stream_name.clone(),
+        let stream_id = if let Some(stream_id) = self.actual_stream_id {
+            format!("{}", stream_id)
+        } else {
+            self.stream_name.clone()
         };
 
-        let topic_id = match self.using_topic_id {
-            TestTopicId::Numeric => format!("{}", self.topic_id),
-            TestTopicId::Named => self.topic_name.clone(),
+        let topic_id = if let Some(topic_id) = self.actual_topic_id {
+            format!("{}", topic_id)
+        } else {
+            self.topic_name.clone()
         };
 
         let mut partitions = String::from("partition");
@@ -142,14 +140,14 @@ impl IggyCmdTestCase for TestPartitionCreateCmd {
     async fn verify_server_state(&self, client: &dyn Client) {
         let topic = client
             .get_topic(
-                &self.stream_id.try_into().unwrap(),
-                &self.topic_id.try_into().unwrap(),
+                &self.actual_stream_id.unwrap().try_into().unwrap(),
+                &self.actual_topic_id.unwrap().try_into().unwrap(),
             )
             .await;
         assert!(topic.is_ok());
         let topic_details = topic.unwrap().expect("Failed to get topic");
         assert_eq!(topic_details.name, self.topic_name);
-        assert_eq!(topic_details.id, self.topic_id);
+        assert_eq!(topic_details.id, self.actual_topic_id.unwrap());
         assert_eq!(
             topic_details.partitions_count,
             self.partitions_count + self.new_partitions
@@ -158,14 +156,14 @@ impl IggyCmdTestCase for TestPartitionCreateCmd {
 
         let topic = client
             .delete_topic(
-                &self.stream_id.try_into().unwrap(),
-                &self.topic_id.try_into().unwrap(),
+                &self.actual_stream_id.unwrap().try_into().unwrap(),
+                &self.actual_topic_id.unwrap().try_into().unwrap(),
             )
             .await;
         assert!(topic.is_ok());
 
         let stream = client
-            .delete_stream(&self.stream_id.try_into().unwrap())
+            .delete_stream(&self.actual_stream_id.unwrap().try_into().unwrap())
             .await;
         assert!(stream.is_ok());
     }
@@ -179,54 +177,38 @@ pub async fn should_be_successful() {
     iggy_cmd_test.setup().await;
     iggy_cmd_test
         .execute_test(TestPartitionCreateCmd::new(
-            1,
             String::from("main"),
-            1,
             String::from("sync"),
             1,
             Default::default(),
             1,
-            TestStreamId::Numeric,
-            TestTopicId::Numeric,
         ))
         .await;
     iggy_cmd_test
         .execute_test(TestPartitionCreateCmd::new(
-            2,
             String::from("stream"),
-            3,
             String::from("topic"),
             3,
             Default::default(),
             2,
-            TestStreamId::Named,
-            TestTopicId::Numeric,
         ))
         .await;
     iggy_cmd_test
         .execute_test(TestPartitionCreateCmd::new(
-            4,
             String::from("development"),
-            1,
             String::from("probe"),
             0,
             Default::default(),
             4,
-            TestStreamId::Numeric,
-            TestTopicId::Named,
         ))
         .await;
     iggy_cmd_test
         .execute_test(TestPartitionCreateCmd::new(
-            2,
             String::from("production"),
-            5,
             String::from("test"),
             4,
             Default::default(),
             1,
-            TestStreamId::Named,
-            TestTopicId::Named,
         ))
         .await;
 }

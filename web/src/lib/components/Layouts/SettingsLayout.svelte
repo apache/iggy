@@ -5,6 +5,7 @@
 
   import { typedRoute } from '$lib/types/appRoutes';
   import { page } from '$app/state';
+  import { resolve } from '$app/paths';
   interface Props {
     actions?: import('svelte').Snippet;
     children?: import('svelte').Snippet;
@@ -34,7 +35,7 @@
       icon: 'usersGroup',
       name: 'Users',
       href: typedRoute('/dashboard/settings/users')
-    },
+    }
     // {
     //   name: 'Terminal',
     //   icon: 'terminal',
@@ -54,7 +55,7 @@
   {#each tabs as { icon, name, href }, idx (idx)}
     {@const isActive = activeTab === href.split('/').slice(-1)[0]}
     <a
-      {href}
+      href={resolve(href)}
       class={twMerge('pb-3 relative group flex items-center  justify-start gap-2 text-color')}
     >
       <Icon name={icon} class="w-[15px] h-[15px]" />
@@ -68,9 +69,9 @@
           'absolute left-0 right-0 top-full h-[2px] -translate-y-full rounded-tl-md rounded-tr-md transition-colors duration-200',
           isActive
             ? 'dark:bg-white bg-black'
-            : 'group-hover:bg-shadeL600 dark:group-hover:bg-shadeD300'
+            : 'group-hover:bg-shade-l600 dark:group-hover:bg-shade-d300'
         )}
-></div>
+      ></div>
     </a>
   {/each}
 </div>

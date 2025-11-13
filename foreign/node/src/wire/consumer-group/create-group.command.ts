@@ -27,22 +27,21 @@ import { deserializeConsumerGroup, type ConsumerGroup } from './group.utils.js';
 export type CreateGroup = {
   streamId: Id,
   topicId: Id,
-  groupId: number,
   name: string,
 };
 
 export const CREATE_GROUP = {
   code: COMMAND_CODE.CreateGroup,
 
-  serialize: ({ streamId, topicId, groupId, name }: CreateGroup) => {
+  serialize: ({ streamId, topicId, name }: CreateGroup) => {
+    // Consumer group ID is now auto-assigned by the server, not sent in the protocol
     const bName = Buffer.from(name);
 
     if (bName.length < 1 || bName.length > 255)
       throw new Error('Consumer group name should be between 1 and 255 bytes');
 
-    const b = Buffer.allocUnsafe(5);
-    b.writeUInt32LE(groupId);
-    b.writeUInt8(bName.length, 4);
+    const b = Buffer.allocUnsafe(1);
+    b.writeUInt8(bName.length, 0);
 
     return Buffer.concat([
       serializeIdentifier(streamId),

@@ -23,7 +23,7 @@ namespace Apache.Iggy.Contracts;
 
 public sealed class MessageResponse<T>
 {
-    public MessageHeader Header { get; set; }
+    public required MessageHeader Header { get; set; }
     public Dictionary<HeaderKey, HeaderValue>? UserHeaders { get; init; }
     public required T Message { get; init; }
 }

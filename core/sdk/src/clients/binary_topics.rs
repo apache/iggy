@@ -19,7 +19,7 @@
 use crate::prelude::IggyClient;
 use async_trait::async_trait;
 use iggy_binary_protocol::TopicClient;
-use iggy_common::locking::IggySharedMutFn;
+use iggy_common::locking::IggyRwLockFn;
 use iggy_common::{
     CompressionAlgorithm, Identifier, IggyError, IggyExpiry, MaxTopicSize, Topic, TopicDetails,
 };
@@ -49,7 +49,6 @@ impl TopicClient for IggyClient {
         partitions_count: u32,
         compression_algorithm: CompressionAlgorithm,
         replication_factor: Option<u8>,
-        topic_id: Option<u32>,
         message_expiry: IggyExpiry,
         max_topic_size: MaxTopicSize,
     ) -> Result<TopicDetails, IggyError> {
@@ -62,7 +61,6 @@ impl TopicClient for IggyClient {
                 partitions_count,
                 compression_algorithm,
                 replication_factor,
-                topic_id,
                 message_expiry,
                 max_topic_size,
             )

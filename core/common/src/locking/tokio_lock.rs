@@ -16,7 +16,7 @@
  * under the License.
  */
 
-use crate::locking::IggySharedMutFn;
+use crate::locking::IggyRwLockFn;
 use std::sync::Arc;
 use tokio::sync::{RwLock as TokioRwLock, RwLockReadGuard, RwLockWriteGuard};
 
@@ -24,10 +24,7 @@ use tokio::sync::{RwLock as TokioRwLock, RwLockReadGuard, RwLockWriteGuard};
 #[derive(Debug)]
 pub struct IggyTokioRwLock<T>(Arc<TokioRwLock<T>>);
 
-impl<T> IggySharedMutFn<T> for IggyTokioRwLock<T>
-where
-    T: Send + Sync,
-{
+impl<T> IggyRwLockFn<T> for IggyTokioRwLock<T> {
     type ReadGuard<'a>
         = RwLockReadGuard<'a, T>
     where

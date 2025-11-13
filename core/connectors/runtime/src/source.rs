@@ -1,4 +1,5 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
  * regarding copyright ownership.  The ASF licenses this file
@@ -34,11 +35,10 @@ use std::{
 };
 use tracing::{debug, error, info, warn};
 
+use crate::configs::SourceConfig;
 use crate::{
     PLUGIN_ID, RuntimeError, SourceApi, SourceConnector, SourceConnectorPlugin,
-    SourceConnectorProducer, SourceConnectorWrapper,
-    configs::SourceConfig,
-    resolve_plugin_path,
+    SourceConnectorProducer, SourceConnectorWrapper, resolve_plugin_path,
     state::{FileStateProvider, StateProvider, StateStorage},
     transform,
 };

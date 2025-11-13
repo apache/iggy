@@ -25,7 +25,7 @@ foreign/node/**/node_modules
 foreign/node/**/dist
 foreign/node/npm-debug.log*
 foreign/node/.npm
-foreign/csharp/**/*.DotSettings.user
+/**/*.DotSettings.user
 *.exe
 *.exe~
 *.dll

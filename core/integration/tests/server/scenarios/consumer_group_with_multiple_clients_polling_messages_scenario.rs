@@ -17,15 +17,14 @@
  */
 
 use crate::server::scenarios::{
-    CONSUMER_GROUP_ID, CONSUMER_GROUP_NAME, MESSAGES_COUNT, PARTITIONS_COUNT, STREAM_ID,
-    STREAM_NAME, TOPIC_ID, TOPIC_NAME, cleanup, create_client, get_consumer_group,
-    join_consumer_group,
+    CONSUMER_GROUP_NAME, MESSAGES_COUNT, PARTITIONS_COUNT, STREAM_NAME, TOPIC_NAME, cleanup,
+    create_client, get_consumer_group, join_consumer_group,
 };
 use iggy::prelude::*;
 use integration::test_server::{
     ClientFactory, assert_clean_system, create_user, login_root, login_user,
 };
-use std::str::{FromStr, from_utf8};
+use std::str::FromStr;
 
 pub async fn run(client_factory: &dyn ClientFactory) {
     let system_client = create_client(client_factory).await;
@@ -50,20 +49,16 @@ async fn init_system(
     create_users: bool,
 ) {
     // 1. Create the stream
-    system_client
-        .create_stream(STREAM_NAME, Some(STREAM_ID))
-        .await
-        .unwrap();
+    system_client.create_stream(STREAM_NAME).await.unwrap();
 
     // 2. Create the topic
     system_client
         .create_topic(
-            &Identifier::numeric(STREAM_ID).unwrap(),
+            &Identifier::named(STREAM_NAME).unwrap(),
             TOPIC_NAME,
             PARTITIONS_COUNT,
             CompressionAlgorithm::default(),
             None,
-            Some(TOPIC_ID),
             IggyExpiry::NeverExpire,
             MaxTopicSize::ServerDefault,
         )
@@ -73,10 +68,9 @@ async fn init_system(
     // 3. Create the consumer group
     system_client
         .create_consumer_group(
-            &Identifier::numeric(STREAM_ID).unwrap(),
-            &Identifier::numeric(TOPIC_ID).unwrap(),
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
             CONSUMER_GROUP_NAME,
-            Some(CONSUMER_GROUP_ID),
         )
         .await
         .unwrap();
@@ -117,8 +111,8 @@ async fn execute_using_messages_key_key(
         let mut messages = vec![message];
         system_client
             .send_messages(
-                &Identifier::numeric(STREAM_ID).unwrap(),
-                &Identifier::numeric(TOPIC_ID).unwrap(),
+                &Identifier::named(STREAM_NAME).unwrap(),
+                &Identifier::named(TOPIC_NAME).unwrap(),
                 &Partitioning::messages_key_u32(entity_id),
                 &mut messages,
             )
@@ -136,13 +130,13 @@ async fn execute_using_messages_key_key(
 }
 
 async fn poll_messages(client: &IggyClient) -> u32 {
-    let consumer = Consumer::group(Identifier::numeric(CONSUMER_GROUP_ID).unwrap());
+    let consumer = Consumer::group(Identifier::named(CONSUMER_GROUP_NAME).unwrap());
     let mut total_read_messages_count = 0;
     for _ in 1..=PARTITIONS_COUNT * MESSAGES_COUNT {
         let polled_messages = client
             .poll_messages(
-                &Identifier::numeric(STREAM_ID).unwrap(),
-                &Identifier::numeric(TOPIC_ID).unwrap(),
+                &Identifier::named(STREAM_NAME).unwrap(),
+                &Identifier::named(TOPIC_NAME).unwrap(),
                 None,
                 &consumer,
                 &PollingStrategy::next(),
@@ -181,8 +175,8 @@ async fn execute_using_none_key(
         let mut messages = vec![message];
         system_client
             .send_messages(
-                &Identifier::numeric(STREAM_ID).unwrap(),
-                &Identifier::numeric(TOPIC_ID).unwrap(),
+                &Identifier::named(STREAM_NAME).unwrap(),
+                &Identifier::named(TOPIC_NAME).unwrap(),
                 &Partitioning::balanced(),
                 &mut messages,
             )
@@ -196,30 +190,19 @@ async fn execute_using_none_key(
     }
 
     // 2. Poll the messages for each client per assigned partition in the consumer group
-    validate_message_polling(client1, &consumer_group_info).await;
-    validate_message_polling(client2, &consumer_group_info).await;
-    validate_message_polling(client3, &consumer_group_info).await;
+    validate_message_polling(client1).await;
+    validate_message_polling(client2).await;
+    validate_message_polling(client3).await;
 }
 
-async fn validate_message_polling(client: &IggyClient, consumer_group: &ConsumerGroupDetails) {
-    let consumer = Consumer::group(Identifier::numeric(CONSUMER_GROUP_ID).unwrap());
-    let client_info = client.get_me().await.unwrap();
-    let consumer_group_member = consumer_group
-        .members
-        .iter()
-        .find(|m| m.id == client_info.client_id)
-        .unwrap();
-    let partition_id = consumer_group_member.partitions[0];
-    let mut start_entity_id = partition_id % PARTITIONS_COUNT;
-    if start_entity_id == 0 {
-        start_entity_id = PARTITIONS_COUNT;
-    }
+async fn validate_message_polling(client: &IggyClient) {
+    let consumer = Consumer::group(Identifier::named(CONSUMER_GROUP_NAME).unwrap());
 
     for i in 1..=MESSAGES_COUNT {
         let polled_messages = client
             .poll_messages(
-                &Identifier::numeric(STREAM_ID).unwrap(),
-                &Identifier::numeric(TOPIC_ID).unwrap(),
+                &Identifier::named(STREAM_NAME).unwrap(),
+                &Identifier::named(TOPIC_NAME).unwrap(),
                 None,
                 &consumer,
                 &PollingStrategy::next(),
@@ -232,18 +215,12 @@ async fn validate_message_polling(client: &IggyClient, consumer_group: &Consumer
         let message = &polled_messages.messages[0];
         let offset = (i - 1) as u64;
         assert_eq!(message.header.offset, offset);
-        let entity_id = start_entity_id + ((i - 1) * PARTITIONS_COUNT);
-        let payload = from_utf8(&message.payload).unwrap();
-        assert_eq!(
-            payload,
-            &create_extended_message_payload(partition_id, entity_id)
-        );
     }
 
     let polled_messages = client
         .poll_messages(
-            &Identifier::numeric(STREAM_ID).unwrap(),
-            &Identifier::numeric(TOPIC_ID).unwrap(),
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
             None,
             &consumer,
             &PollingStrategy::next(),

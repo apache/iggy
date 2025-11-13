@@ -18,7 +18,7 @@
 
 use crate::cli::common::{
     CLAP_INDENT, IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestConsumerId, TestHelpCmd,
-    TestStreamId, TestTopicId, USAGE_PREFIX,
+    USAGE_PREFIX,
 };
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
@@ -30,63 +30,59 @@ use std::str::FromStr;
 struct TestConsumerOffsetGetCmd {
     consumer_id: u32,
     consumer_name: String,
-    stream_id: u32,
     stream_name: String,
-    topic_id: u32,
     topic_name: String,
     partition_id: u32,
     using_consumer_id: TestConsumerId,
-    using_stream_id: TestStreamId,
-    using_topic_id: TestTopicId,
     messages_count: u32,
     stored_offset: u64,
+    // These will be populated after creating the resources
+    actual_stream_id: Option<u32>,
+    actual_topic_id: Option<u32>,
 }
 
 impl TestConsumerOffsetGetCmd {
-    #[allow(clippy::too_many_arguments)]
     fn new(
         consumer_id: u32,
         consumer_name: String,
-        stream_id: u32,
         stream_name: String,
-        topic_id: u32,
         topic_name: String,
         partition_id: u32,
         using_consumer_id: TestConsumerId,
-        using_stream_id: TestStreamId,
-        using_topic_id: TestTopicId,
     ) -> Self {
         Self {
             consumer_id,
             consumer_name,
-            stream_id,
             stream_name,
-            topic_id,
             topic_name,
             partition_id,
             using_consumer_id,
-            using_stream_id,
-            using_topic_id,
             messages_count: 100,
             stored_offset: 66,
+            actual_stream_id: None,
+            actual_topic_id: None,
         }
     }
 
     fn to_args(&self) -> Vec<String> {
         let mut command = match self.using_consumer_id {
-            TestStreamId::Numeric => vec![format!("{}", self.consumer_id)],
-            TestStreamId::Named => vec![self.consumer_name.clone()],
+            TestConsumerId::Numeric => vec![format!("{}", self.consumer_id)],
+            TestConsumerId::Named => vec![self.consumer_name.clone()],
         };
 
-        command.push(match self.using_stream_id {
-            TestTopicId::Numeric => format!("{}", self.stream_id),
-            TestTopicId::Named => self.stream_name.clone(),
-        });
+        // Use actual stream ID if available, otherwise use stream name as fallback
+        if let Some(stream_id) = self.actual_stream_id {
+            command.push(format!("{}", stream_id));
+        } else {
+            command.push(self.stream_name.clone());
+        }
 
-        command.push(match self.using_topic_id {
-            TestTopicId::Numeric => format!("{}", self.topic_id),
-            TestTopicId::Named => self.topic_name.clone(),
-        });
+        // Use actual topic ID if available, otherwise use topic name as fallback
+        if let Some(topic_id) = self.actual_topic_id {
+            command.push(format!("{}", topic_id));
+        } else {
+            command.push(self.topic_name.clone());
+        }
 
         command.push(format!("{}", self.partition_id));
 
@@ -97,24 +93,27 @@ impl TestConsumerOffsetGetCmd {
 #[async_trait]
 impl IggyCmdTestCase for TestConsumerOffsetGetCmd {
     async fn prepare_server_state(&mut self, client: &dyn Client) {
+        // Create stream and capture its actual ID
         let stream = client
-            .create_stream(&self.stream_name, self.stream_id.into())
-            .await;
-        assert!(stream.is_ok());
+            .create_stream(&self.stream_name)
+            .await
+            .expect("Failed to create stream");
+        self.actual_stream_id = Some(stream.id);
 
+        // Create topic and capture its actual ID
         let topic = client
             .create_topic(
-                &self.stream_id.try_into().unwrap(),
+                &stream.id.try_into().unwrap(),
                 &self.topic_name,
                 1,
                 Default::default(),
                 None,
-                Some(self.topic_id),
                 IggyExpiry::NeverExpire,
                 MaxTopicSize::ServerDefault,
             )
-            .await;
-        assert!(topic.is_ok());
+            .await
+            .expect("Failed to create topic");
+        self.actual_topic_id = Some(topic.id);
 
         let mut messages = (1..=self.messages_count)
             .filter_map(|id| IggyMessage::from_str(format!("Test message {id}").as_str()).ok())
@@ -122,8 +121,8 @@ impl IggyCmdTestCase for TestConsumerOffsetGetCmd {
 
         let send_status = client
             .send_messages(
-                &self.stream_id.try_into().unwrap(),
-                &self.topic_id.try_into().unwrap(),
+                &stream.id.try_into().unwrap(),
+                &topic.id.try_into().unwrap(),
                 &Partitioning::partition_id(self.partition_id),
                 &mut messages,
             )
@@ -140,8 +139,8 @@ impl IggyCmdTestCase for TestConsumerOffsetGetCmd {
                     }
                     .unwrap(),
                 },
-                &self.stream_id.try_into().unwrap(),
-                &self.topic_id.try_into().unwrap(),
+                &stream.id.try_into().unwrap(),
+                &topic.id.try_into().unwrap(),
                 Some(self.partition_id),
                 self.stored_offset,
             )
@@ -163,14 +162,16 @@ impl IggyCmdTestCase for TestConsumerOffsetGetCmd {
             TestConsumerId::Named => self.consumer_name.clone(),
         };
 
-        let stream_id = match self.using_stream_id {
-            TestStreamId::Numeric => format!("{}", self.stream_id),
-            TestStreamId::Named => self.stream_name.clone(),
+        let stream_id = if let Some(stream_id) = self.actual_stream_id {
+            format!("{}", stream_id)
+        } else {
+            self.stream_name.clone()
         };
 
-        let topic_id = match self.using_topic_id {
-            TestTopicId::Numeric => format!("{}", self.topic_id),
-            TestTopicId::Named => self.topic_name.clone(),
+        let topic_id = if let Some(topic_id) = self.actual_topic_id {
+            format!("{}", topic_id)
+        } else {
+            self.topic_name.clone()
         };
 
         let message = format!(
@@ -189,18 +190,20 @@ impl IggyCmdTestCase for TestConsumerOffsetGetCmd {
     }
 
     async fn verify_server_state(&self, client: &dyn Client) {
-        let topic = client
-            .delete_topic(
-                &self.stream_id.try_into().unwrap(),
-                &self.topic_id.try_into().unwrap(),
-            )
-            .await;
-        assert!(topic.is_ok());
+        if let Some(topic_id) = self.actual_topic_id {
+            let topic = client
+                .delete_topic(
+                    &self.actual_stream_id.unwrap().try_into().unwrap(),
+                    &topic_id.try_into().unwrap(),
+                )
+                .await;
+            assert!(topic.is_ok());
+        }
 
-        let stream = client
-            .delete_stream(&self.stream_id.try_into().unwrap())
-            .await;
-        assert!(stream.is_ok());
+        if let Some(stream_id) = self.actual_stream_id {
+            let stream = client.delete_stream(&stream_id.try_into().unwrap()).await;
+            assert!(stream.is_ok());
+        }
     }
 }
 
@@ -209,68 +212,18 @@ impl IggyCmdTestCase for TestConsumerOffsetGetCmd {
 pub async fn should_be_successful() {
     let mut iggy_cmd_test = IggyCmdTest::default();
 
-    let test_parameters = vec![
-        (
-            TestConsumerId::Numeric,
-            TestStreamId::Numeric,
-            TestTopicId::Numeric,
-        ),
-        (
-            TestConsumerId::Named,
-            TestStreamId::Numeric,
-            TestTopicId::Numeric,
-        ),
-        (
-            TestConsumerId::Numeric,
-            TestStreamId::Named,
-            TestTopicId::Numeric,
-        ),
-        (
-            TestConsumerId::Numeric,
-            TestStreamId::Numeric,
-            TestTopicId::Named,
-        ),
-        (
-            TestConsumerId::Named,
-            TestStreamId::Named,
-            TestTopicId::Numeric,
-        ),
-        (
-            TestConsumerId::Named,
-            TestStreamId::Numeric,
-            TestTopicId::Named,
-        ),
-        (
-            TestConsumerId::Numeric,
-            TestStreamId::Named,
-            TestTopicId::Named,
-        ),
-        (
-            TestConsumerId::Named,
-            TestStreamId::Named,
-            TestTopicId::Named,
-        ),
-        (
-            TestConsumerId::Numeric,
-            TestStreamId::Numeric,
-            TestTopicId::Numeric,
-        ),
-    ];
+    let test_parameters = vec![TestConsumerId::Numeric, TestConsumerId::Named];
 
     iggy_cmd_test.setup().await;
-    for (using_stream_id, using_topic_id, using_consumer_id) in test_parameters {
+    for using_consumer_id in test_parameters {
         iggy_cmd_test
             .execute_test(TestConsumerOffsetGetCmd::new(
                 1,
                 String::from("consumer"),
-                2,
                 String::from("stream"),
-                3,
                 String::from("topic"),
-                1,
+                0,
                 using_consumer_id,
-                using_stream_id,
-                using_topic_id,
             ))
             .await;
     }

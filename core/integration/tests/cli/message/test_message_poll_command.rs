@@ -17,8 +17,7 @@
  */
 
 use crate::cli::common::{
-    CLAP_INDENT, IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestHelpCmd, TestStreamId,
-    TestTopicId, USAGE_PREFIX,
+    CLAP_INDENT, IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestHelpCmd, USAGE_PREFIX,
 };
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
@@ -30,55 +29,47 @@ use std::collections::HashMap;
 use std::str::FromStr;
 
 struct TestMessagePollCmd {
-    stream_id: u32,
     stream_name: String,
-    topic_id: u32,
     topic_name: String,
     partitions_count: u32,
     messages: Vec<String>,
     partition_id: u32,
     message_count: usize,
     strategy: PollingStrategy,
-    using_stream_id: TestStreamId,
-    using_topic_id: TestTopicId,
     show_headers: bool,
     headers: (HeaderKey, HeaderValue),
+    // These will be populated after creating the resources
+    actual_stream_id: Option<u32>,
+    actual_topic_id: Option<u32>,
 }
 
 impl TestMessagePollCmd {
     #[allow(clippy::too_many_arguments)]
     fn new(
-        stream_id: u32,
         stream_name: String,
-        topic_id: u32,
         topic_name: String,
         partitions_count: u32,
         messages: &[String],
         partition_id: u32,
         message_count: usize,
         strategy: PollingStrategy,
-        using_stream_id: TestStreamId,
-        using_topic_id: TestTopicId,
         show_headers: bool,
         headers: (HeaderKey, HeaderValue),
     ) -> Self {
-        assert!(partition_id <= partitions_count);
-        assert!(partition_id > 0);
+        assert!(partition_id < partitions_count);
         assert!(message_count < messages.len());
         Self {
-            stream_id,
             stream_name,
-            topic_id,
             topic_name,
             partitions_count,
             messages: messages.to_owned(),
             partition_id,
             message_count,
             strategy,
-            using_stream_id,
-            using_topic_id,
             show_headers,
             headers,
+            actual_stream_id: None,
+            actual_topic_id: None,
         }
     }
 
@@ -102,15 +93,19 @@ impl TestMessagePollCmd {
             command.extend(vec!["--show-headers".into()]);
         }
 
-        command.extend(match self.using_stream_id {
-            TestStreamId::Numeric => vec![format!("{}", self.stream_id)],
-            TestStreamId::Named => vec![self.stream_name.clone()],
-        });
+        // Use actual stream ID if available, otherwise use stream name as fallback
+        if let Some(stream_id) = self.actual_stream_id {
+            command.push(format!("{}", stream_id));
+        } else {
+            command.push(self.stream_name.clone());
+        }
 
-        command.push(match self.using_topic_id {
-            TestTopicId::Numeric => format!("{}", self.topic_id),
-            TestTopicId::Named => self.topic_name.clone(),
-        });
+        // Use actual topic ID if available, otherwise use topic name as fallback
+        if let Some(topic_id) = self.actual_topic_id {
+            command.push(format!("{}", topic_id));
+        } else {
+            command.push(self.topic_name.clone());
+        }
 
         command.push(format!("{}", self.partition_id));
 
@@ -121,24 +116,25 @@ impl TestMessagePollCmd {
 #[async_trait]
 impl IggyCmdTestCase for TestMessagePollCmd {
     async fn prepare_server_state(&mut self, client: &dyn Client) {
-        let stream = client
-            .create_stream(&self.stream_name, self.stream_id.into())
-            .await;
+        let stream = client.create_stream(&self.stream_name).await;
         assert!(stream.is_ok());
+        let stream = stream.unwrap();
+        self.actual_stream_id = Some(stream.id);
 
         let topic = client
             .create_topic(
-                &self.stream_id.try_into().unwrap(),
+                &stream.id.try_into().unwrap(),
                 &self.topic_name,
                 self.partitions_count,
                 Default::default(),
                 None,
-                Some(self.topic_id),
                 IggyExpiry::NeverExpire,
                 MaxTopicSize::ServerDefault,
             )
             .await;
         assert!(topic.is_ok());
+        let topic = topic.unwrap();
+        self.actual_topic_id = Some(topic.id);
 
         let mut messages = self
             .messages
@@ -155,8 +151,8 @@ impl IggyCmdTestCase for TestMessagePollCmd {
 
         let send_status = client
             .send_messages(
-                &self.stream_id.try_into().unwrap(),
-                &self.topic_id.try_into().unwrap(),
+                &stream.id.try_into().unwrap(),
+                &topic.id.try_into().unwrap(),
                 &Partitioning::partition_id(self.partition_id),
                 &mut messages,
             )
@@ -173,14 +169,16 @@ impl IggyCmdTestCase for TestMessagePollCmd {
     }
 
     fn verify_command(&self, command_state: Assert) {
-        let stream_id = match self.using_stream_id {
-            TestStreamId::Numeric => format!("{}", self.stream_id),
-            TestStreamId::Named => self.stream_name.clone(),
+        let stream_id = if let Some(stream_id) = self.actual_stream_id {
+            format!("{}", stream_id)
+        } else {
+            self.stream_name.clone()
         };
 
-        let topic_id = match self.using_topic_id {
-            TestTopicId::Numeric => format!("{}", self.topic_id),
-            TestTopicId::Named => self.topic_name.clone(),
+        let topic_id = if let Some(topic_id) = self.actual_topic_id {
+            format!("{}", topic_id)
+        } else {
+            self.topic_name.clone()
         };
 
         let polled_status = match self.message_count {
@@ -235,18 +233,18 @@ impl IggyCmdTestCase for TestMessagePollCmd {
     }
 
     async fn verify_server_state(&self, client: &dyn Client) {
-        let topic = client
-            .delete_topic(
-                &self.stream_id.try_into().unwrap(),
-                &self.topic_id.try_into().unwrap(),
-            )
-            .await;
-        assert!(topic.is_ok());
+        if let (Some(stream_id), Some(topic_id)) = (self.actual_stream_id, self.actual_topic_id) {
+            let topic = client
+                .delete_topic(
+                    &stream_id.try_into().unwrap(),
+                    &topic_id.try_into().unwrap(),
+                )
+                .await;
+            assert!(topic.is_ok());
 
-        let stream = client
-            .delete_stream(&self.stream_id.try_into().unwrap())
-            .await;
-        assert!(stream.is_ok());
+            let stream = client.delete_stream(&stream_id.try_into().unwrap()).await;
+            assert!(stream.is_ok());
+        }
     }
 }
 
@@ -273,74 +271,26 @@ pub async fn should_be_successful() {
         HeaderValue::from_str("value1").unwrap(),
     );
 
-    let test_parameters: Vec<(u32, usize, PollingStrategy, TestStreamId, TestTopicId, bool)> = vec![
-        (
-            1,
-            1,
-            PollingStrategy::offset(0),
-            TestStreamId::Numeric,
-            TestTopicId::Numeric,
-            true,
-        ),
-        (
-            2,
-            5,
-            PollingStrategy::offset(0),
-            TestStreamId::Numeric,
-            TestTopicId::Named,
-            true,
-        ),
-        (
-            3,
-            3,
-            PollingStrategy::offset(3),
-            TestStreamId::Named,
-            TestTopicId::Numeric,
-            true,
-        ),
-        (
-            4,
-            5,
-            PollingStrategy::first(),
-            TestStreamId::Named,
-            TestTopicId::Named,
-            true,
-        ),
-        (
-            1,
-            4,
-            PollingStrategy::last(),
-            TestStreamId::Numeric,
-            TestTopicId::Numeric,
-            true,
-        ),
-        (
-            2,
-            3,
-            PollingStrategy::next(),
-            TestStreamId::Numeric,
-            TestTopicId::Named,
-            false,
-        ),
+    let test_parameters: Vec<(u32, usize, PollingStrategy, bool)> = vec![
+        (0, 1, PollingStrategy::offset(0), true),
+        (1, 5, PollingStrategy::offset(0), true),
+        (2, 3, PollingStrategy::offset(3), true),
+        (3, 5, PollingStrategy::first(), true),
+        (0, 4, PollingStrategy::last(), true),
+        (1, 3, PollingStrategy::next(), false),
     ];
 
     iggy_cmd_test.setup().await;
-    for (partition_id, message_count, strategy, using_stream_id, using_topic_id, show_headers) in
-        test_parameters
-    {
+    for (partition_id, message_count, strategy, show_headers) in test_parameters {
         iggy_cmd_test
             .execute_test(TestMessagePollCmd::new(
-                1,
                 String::from("stream"),
-                2,
                 String::from("topic"),
                 4,
                 &test_messages,
                 partition_id,
                 message_count,
                 strategy,
-                using_stream_id,
-                using_topic_id,
                 show_headers,
                 test_headers.clone(),
             ))
@@ -418,7 +368,7 @@ Options:
 {CLAP_INDENT}
           Consumer ID can be specified as a consumer name or ID
 {CLAP_INDENT}
-          [default: 1]
+          [default: 0]
 
   -s, --show-headers
           Include the message headers in the output
@@ -469,7 +419,7 @@ Options:
   -f, --first                          Polling strategy - start polling from the first message in the partition
   -l, --last                           Polling strategy - start polling from the last message in the partition
   -n, --next                           Polling strategy - start polling from the next message
-  -c, --consumer <CONSUMER>            Regular consumer which will poll messages [default: 1]
+  -c, --consumer <CONSUMER>            Regular consumer which will poll messages [default: 0]
   -s, --show-headers                   Include the message headers in the output
       --output-file <OUTPUT_FILE>      Store polled message into file in binary format
   -h, --help                           Print help (see more with '--help')

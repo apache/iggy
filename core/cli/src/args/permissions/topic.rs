@@ -52,7 +52,7 @@ impl FromStr for TopicPermission {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct TopicPermissionsArg {
-    pub(crate) topic_id: u32,
+    pub(crate) topic_id: usize,
     pub(crate) permissions: TopicPermissions,
 }
 
@@ -63,7 +63,7 @@ impl From<TopicPermissionsArg> for TopicPermissions {
 }
 
 impl TopicPermissionsArg {
-    fn new(topic_id: u32, topic_permissions: Vec<TopicPermission>) -> Self {
+    fn new(topic_id: usize, topic_permissions: Vec<TopicPermission>) -> Self {
         let mut result = Self {
             topic_id,
             permissions: TopicPermissions::default(),

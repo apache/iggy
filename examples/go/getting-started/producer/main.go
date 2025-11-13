@@ -31,10 +31,10 @@ import (
 )
 
 var (
-	StreamId     = uint32(1)
-	TopicId      = uint32(1)
-	PartitionId  = uint32(1)
-	BatchesLimit = uint32(5)
+    StreamId     = uint32(0)
+    TopicId      = uint32(0)
+    PartitionId  = uint32(0)
+    BatchesLimit = uint32(5)
 )
 
 func main() {
@@ -57,21 +57,20 @@ func main() {
 }
 
 func initSystem(client iggycli.Client) {
-	if _, err := client.CreateStream("sample-stream", &StreamId); err != nil {
+    if _, err := client.CreateStream("sample-stream"); err != nil {
 		log.Printf("WARN: Stream already exists or error: %v", err)
 	}
 	log.Println("Stream was created.")
 
 	streamIdentifier, _ := iggcon.NewIdentifier(StreamId)
-	if _, err := client.CreateTopic(
+    if _, err := client.CreateTopic(
 		streamIdentifier,
 		"sample-topic",
 		1,
 		iggcon.CompressionAlgorithmNone,
 		iggcon.IggyExpiryNeverExpire,
 		0,
-		nil,
-		&TopicId); err != nil {
+        nil); err != nil {
 		log.Printf("WARN: Topic already exists and will not be created again or error: %v", err)
 	}
 	log.Println("Topic was created.")

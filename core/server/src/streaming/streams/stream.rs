@@ -1,131 +1,221 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
- */
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-use crate::configs::system::SystemConfig;
-use crate::streaming::storage::SystemStorage;
-use crate::streaming::topics::topic::Topic;
-use ahash::AHashMap;
-use iggy_common::IggyByteSize;
 use iggy_common::IggyTimestamp;
-use std::fmt::Display;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use slab::Slab;
+use std::{
+    cell::{Ref, RefMut},
+    sync::Arc,
+};
 
-#[derive(Debug)]
-pub struct Stream {
-    pub stream_id: u32,
-    pub name: String,
-    pub path: String,
-    pub topics_path: String,
-    pub created_at: IggyTimestamp,
-    pub current_topic_id: AtomicU32,
-    pub size_bytes: Arc<AtomicU64>,
-    pub messages_count: Arc<AtomicU64>,
-    pub segments_count: Arc<AtomicU32>,
-    pub(crate) topics: AHashMap<u32, Topic>,
-    pub(crate) topics_ids: AHashMap<String, u32>,
-    pub(crate) config: Arc<SystemConfig>,
-    pub(crate) storage: Arc<SystemStorage>,
+use crate::{
+    slab::{
+        Keyed,
+        streams::{self, Streams},
+        topics::Topics,
+        traits_ext::{EntityMarker, InsertCell, IntoComponents, IntoComponentsById},
+    },
+    streaming::stats::StreamStats,
+};
+
+#[derive(Debug, Clone)]
+pub struct StreamRoot {
+    id: usize,
+    name: String,
+    created_at: IggyTimestamp,
+    topics: Topics,
 }
 
-impl Stream {
-    pub fn empty(
-        id: u32,
-        name: &str,
-        config: Arc<SystemConfig>,
-        storage: Arc<SystemStorage>,
-    ) -> Self {
-        Stream::create(id, name, config, storage)
+impl Keyed for StreamRoot {
+    type Key = String;
+
+    fn key(&self) -> &Self::Key {
+        &self.name
     }
+}
 
-    pub fn create(
-        id: u32,
-        name: &str,
-        config: Arc<SystemConfig>,
-        storage: Arc<SystemStorage>,
-    ) -> Self {
-        let path = config.get_stream_path(id);
-        let topics_path = config.get_topics_path(id);
-
-        Stream {
-            stream_id: id,
-            name: name.to_string(),
-            path,
-            topics_path,
-            config,
-            current_topic_id: AtomicU32::new(1),
-            size_bytes: Arc::new(AtomicU64::new(0)),
-            messages_count: Arc::new(AtomicU64::new(0)),
-            segments_count: Arc::new(AtomicU32::new(0)),
-            topics: AHashMap::new(),
-            topics_ids: AHashMap::new(),
-            storage,
-            created_at: IggyTimestamp::now(),
+impl StreamRoot {
+    pub fn new(name: String, created_at: IggyTimestamp) -> Self {
+        Self {
+            id: 0,
+            name,
+            created_at,
+            topics: Topics::default(),
         }
     }
 
-    pub fn get_size(&self) -> IggyByteSize {
-        IggyByteSize::from(self.size_bytes.load(Ordering::SeqCst))
+    pub fn update_id(&mut self, id: usize) {
+        self.id = id;
+    }
+
+    pub fn id(&self) -> usize {
+        self.id
+    }
+
+    pub fn name(&self) -> &String {
+        &self.name
+    }
+
+    pub fn set_name(&mut self, name: String) {
+        self.name = name;
+    }
+
+    pub fn topics_count(&self) -> usize {
+        self.topics.len()
+    }
+
+    pub fn remove_topics(&mut self) -> Topics {
+        std::mem::take(&mut self.topics)
+    }
+
+    pub fn topics(&self) -> &Topics {
+        &self.topics
+    }
+
+    pub fn topics_mut(&mut self) -> &mut Topics {
+        &mut self.topics
+    }
+
+    pub fn created_at(&self) -> IggyTimestamp {
+        self.created_at
     }
 }
 
-impl Display for Stream {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "Stream {{ stream ID: {}, name: {}, path: {}, topic_path: {}, created_at: {} }}",
-            self.stream_id, self.name, self.path, self.topics_path, self.created_at,
-        )
+#[derive(Debug, Clone)]
+pub struct Stream {
+    root: StreamRoot,
+    stats: Arc<StreamStats>,
+}
+
+impl IntoComponents for Stream {
+    type Components = (StreamRoot, Arc<StreamStats>);
+
+    fn into_components(self) -> Self::Components {
+        (self.root, self.stats)
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::streaming::{
-        persistence::persister::{FileWithSyncPersister, PersisterKind},
-        utils::MemoryPool,
-    };
+impl EntityMarker for Stream {
+    type Idx = streams::ContainerId;
 
-    #[test]
-    fn should_be_created_given_valid_parameters() {
-        let tempdir = tempfile::TempDir::new().unwrap();
-        let config = Arc::new(SystemConfig {
-            path: tempdir.path().to_str().unwrap().to_string(),
-            ..Default::default()
-        });
-        let storage = Arc::new(SystemStorage::new(
-            config.clone(),
-            Arc::new(PersisterKind::FileWithSync(FileWithSyncPersister {})),
-        ));
-        MemoryPool::init_pool(config.clone());
-        let id = 1;
-        let name = "test";
-        let config = Arc::new(SystemConfig::default());
-        let path = config.get_stream_path(id);
-        let topics_path = config.get_topics_path(id);
-
-        let stream = Stream::create(id, name, config, storage);
-
-        assert_eq!(stream.stream_id, id);
-        assert_eq!(stream.name, name);
-        assert_eq!(stream.path, path);
-        assert_eq!(stream.topics_path, topics_path);
-        assert!(stream.topics.is_empty());
+    fn id(&self) -> Self::Idx {
+        self.root.id
     }
+
+    fn update_id(&mut self, id: Self::Idx) {
+        self.root.id = id;
+    }
+}
+
+impl Stream {
+    pub fn new(name: String, stats: Arc<StreamStats>, created_at: IggyTimestamp) -> Self {
+        let root = StreamRoot::new(name, created_at);
+        Self { root, stats }
+    }
+
+    pub fn new_with_components(root: StreamRoot, stats: Arc<StreamStats>) -> Self {
+        Self { root, stats }
+    }
+
+    pub fn stats(&self) -> &Arc<StreamStats> {
+        &self.stats
+    }
+
+    pub fn root(&self) -> &StreamRoot {
+        &self.root
+    }
+
+    pub fn root_mut(&mut self) -> &mut StreamRoot {
+        &mut self.root
+    }
+}
+
+pub struct StreamRef<'a> {
+    root: Ref<'a, Slab<StreamRoot>>,
+    stats: Ref<'a, Slab<Arc<StreamStats>>>,
+}
+
+impl<'a> StreamRef<'a> {
+    pub fn new(root: Ref<'a, Slab<StreamRoot>>, stats: Ref<'a, Slab<Arc<StreamStats>>>) -> Self {
+        Self { root, stats }
+    }
+}
+
+impl<'a> IntoComponents for StreamRef<'a> {
+    type Components = (Ref<'a, Slab<StreamRoot>>, Ref<'a, Slab<Arc<StreamStats>>>);
+
+    fn into_components(self) -> Self::Components {
+        (self.root, self.stats)
+    }
+}
+
+impl<'a> IntoComponentsById for StreamRef<'a> {
+    type Idx = streams::ContainerId;
+    type Output = (Ref<'a, StreamRoot>, Ref<'a, Arc<StreamStats>>);
+
+    fn into_components_by_id(self, index: Self::Idx) -> Self::Output {
+        let root = Ref::map(self.root, |r| &r[index]);
+        let stats = Ref::map(self.stats, |s| &s[index]);
+        (root, stats)
+    }
+}
+
+pub struct StreamRefMut<'a> {
+    root: RefMut<'a, Slab<StreamRoot>>,
+    stats: RefMut<'a, Slab<Arc<StreamStats>>>,
+}
+
+impl<'a> StreamRefMut<'a> {
+    pub fn new(
+        root: RefMut<'a, Slab<StreamRoot>>,
+        stats: RefMut<'a, Slab<Arc<StreamStats>>>,
+    ) -> Self {
+        Self { root, stats }
+    }
+}
+
+impl<'a> IntoComponents for StreamRefMut<'a> {
+    type Components = (
+        RefMut<'a, Slab<StreamRoot>>,
+        RefMut<'a, Slab<Arc<StreamStats>>>,
+    );
+
+    fn into_components(self) -> Self::Components {
+        (self.root, self.stats)
+    }
+}
+
+impl<'a> IntoComponentsById for StreamRefMut<'a> {
+    type Idx = streams::ContainerId;
+    type Output = (RefMut<'a, StreamRoot>, RefMut<'a, Arc<StreamStats>>);
+
+    fn into_components_by_id(self, index: Self::Idx) -> Self::Output {
+        let root = RefMut::map(self.root, |r| &mut r[index]);
+        let stats = RefMut::map(self.stats, |s| &mut s[index]);
+        (root, stats)
+    }
+}
+
+// TODO: Move this to a dedicated module.
+pub fn create_and_insert_stream_mem(streams: &Streams, name: String) -> Stream {
+    let now = IggyTimestamp::now();
+    let stats = Arc::new(Default::default());
+    let mut stream = Stream::new(name, stats, now);
+    let id = streams.insert(stream.clone());
+    stream.update_id(id);
+    stream
 }

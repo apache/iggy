@@ -19,7 +19,9 @@ package tcp_test
 
 import (
 	"fmt"
+
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
+	ierror "github.com/apache/iggy/foreign/go/errors"
 	"github.com/apache/iggy/foreign/go/iggycli"
 	"github.com/onsi/ginkgo/v2"
 	"github.com/onsi/gomega"
@@ -27,17 +29,15 @@ import (
 
 // operations
 func successfullyCreateConsumer(streamId uint32, topicId uint32, cli iggycli.Client) (uint32, string) {
-	groupId := createRandomUInt32()
 	name := createRandomString(16)
 	streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 	topicIdentifier, _ := iggcon.NewIdentifier(topicId)
-	_, err := cli.CreateConsumerGroup(
+    group, err := cli.CreateConsumerGroup(
 		streamIdentifier,
 		topicIdentifier,
-		name,
-		&groupId)
-
-	itShouldSuccessfullyCreateConsumer(streamId, topicId, groupId, name, cli)
+        name)
+    groupId := group.Id
+    itShouldSuccessfullyCreateConsumer(streamId, topicId, groupId, name, cli)
 	itShouldNotReturnError(err)
 	return groupId, name
 }
@@ -119,7 +119,7 @@ func itShouldSuccessfullyDeletedConsumer(streamId uint32, topicId uint32, groupI
 	topicIdentifier, _ := iggcon.NewIdentifier(topicId)
 	groupIdentifier, _ := iggcon.NewIdentifier(groupId)
 	consumer, err := client.GetConsumerGroup(streamIdentifier, topicIdentifier, groupIdentifier)
-	itShouldReturnSpecificError(err, "consumer_group_not_found")
+	itShouldReturnSpecificError(err, ierror.ErrConsumerGroupIdNotFound)
 	ginkgo.It("should not return consumer", func() {
 		gomega.Expect(consumer).To(gomega.BeNil())
 	})

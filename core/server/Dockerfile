@@ -15,13 +15,14 @@
 # specific language governing permissions and limitations
 # under the License.
 
-ARG RUST_VERSION=1.90
+ARG RUST_VERSION=1.91
 ARG ALPINE_VERSION=3.22
 
 # ── from-source path (unchanged) ──────────────────────────────────────────────
 FROM --platform=$BUILDPLATFORM lukemathwalker/cargo-chef:latest-rust-${RUST_VERSION}-alpine AS chef
 WORKDIR /app
-RUN apk add --no-cache musl-dev pkgconfig openssl-dev openssl-libs-static
+#RUN apk add --no-cache musl-dev pkgconfig openssl-dev openssl-libs-static
+RUN apk add musl-dev
 
 FROM --platform=$BUILDPLATFORM chef AS planner
 COPY . .

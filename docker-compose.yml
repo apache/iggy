@@ -19,15 +19,24 @@ services:
   iggy-server:
     build:
       context: .
-      dockerfile: core/server/Dockerfile
+      dockerfile: Dockerfile
     container_name: iggy-server
     restart: unless-stopped
+    cap_add:
+      - SYS_NICE
+    security_opt:
+      - seccomp:unconfined
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
     networks:
       - iggy
     ports:
       - 3000:3000
       - 8080:8080
       - 8090:8090
+      - 8092:8092
     volumes:
       - iggy-server:/local_data
 

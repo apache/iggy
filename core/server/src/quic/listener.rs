@@ -19,72 +19,123 @@
 use crate::binary::command::{ServerCommand, ServerCommandHandler};
 use crate::binary::sender::SenderKind;
 use crate::server_error::ConnectionError;
+use crate::shard::IggyShard;
+use crate::shard::task_registry::ShutdownToken;
 use crate::streaming::session::Session;
-use crate::streaming::systems::system::SharedSystem;
 use anyhow::anyhow;
+use compio_quic::{Connection, Endpoint, RecvStream, SendStream};
+use futures::FutureExt;
 use iggy_common::IggyError;
 use iggy_common::TransportProtocol;
-use quinn::{Connection, Endpoint, RecvStream, SendStream};
-use tracing::{error, info, trace};
+use std::rc::Rc;
+use tracing::{debug, error, info, trace};
 
-const LISTENERS_COUNT: u32 = 10;
 const INITIAL_BYTES_LENGTH: usize = 4;
 
-pub fn start(endpoint: Endpoint, system: SharedSystem) {
-    for _ in 0..LISTENERS_COUNT {
-        let endpoint = endpoint.clone();
-        let system = system.clone();
-        tokio::spawn(async move {
-            while let Some(incoming_connection) = endpoint.accept().await {
-                info!(
-                    "Incoming connection from client: {}",
-                    incoming_connection.remote_address()
-                );
-                let system = system.clone();
-                let incoming_connection = incoming_connection.accept();
-                if incoming_connection.is_err() {
-                    error!(
-                        "Error when accepting incoming connection: {:?}",
-                        incoming_connection
-                    );
-                    continue;
-                }
-                let incoming_connection = incoming_connection.unwrap();
-                tokio::spawn(async move {
-                    if let Err(error) = handle_connection(incoming_connection, system).await {
-                        error!("Connection has failed: {error}");
-                    }
-                });
+pub async fn start(
+    endpoint: Endpoint,
+    shard: Rc<IggyShard>,
+    shutdown: ShutdownToken,
+) -> Result<(), IggyError> {
+    loop {
+        let accept_future = endpoint.wait_incoming();
+
+        futures::select! {
+            _ = shutdown.wait().fuse() => {
+                debug!( "QUIC listener received shutdown signal, no longer accepting connections");
+                break;
             }
-        });
+            incoming_conn = accept_future.fuse() => {
+                match incoming_conn {
+                    Some(incoming_conn) => {
+                        let remote_addr = incoming_conn.remote_address();
+                        info!("Received incoming QUIC connection from {}", remote_addr);
+
+                        if shard.is_shutting_down() {
+                            info!( "Rejecting new QUIC connection from {} during shutdown", remote_addr);
+                            continue;
+                        }
+
+                        trace!("Incoming connection from client: {}", remote_addr);
+                        let shard_for_conn = shard.clone();
+
+                        shard.task_registry.spawn_connection(async move {
+                            trace!("Accepting connection from {}", remote_addr);
+                            match incoming_conn.await {
+                                Ok(connection) => {
+                                    trace!("Connection established from {}", remote_addr);
+                                    if let Err(error) = handle_connection(connection, shard_for_conn).await {
+                                        error!("QUIC connection from {} has failed: {error}", remote_addr);
+                                    }
+                                }
+                                Err(error) => {
+                                    error!(
+                                        "Error when accepting incoming connection from {}: {:?}",
+                                        remote_addr, error
+                                    );
+                                }
+                            }
+                        });
+                    }
+                    None => {
+                        info!("QUIC endpoint closed for shard {}", shard.id);
+                        break;
+                    }
+                }
+            }
+        }
     }
+    Ok(())
 }
 
 async fn handle_connection(
-    incoming_connection: quinn::Connecting,
-    system: SharedSystem,
+    connection: Connection,
+    shard: Rc<IggyShard>,
 ) -> Result<(), ConnectionError> {
-    let connection = incoming_connection.await?;
     let address = connection.remote_address();
     info!("Client has connected: {address}");
-    let session = system
-        .read()
-        .await
-        .add_client(&address, TransportProtocol::Quic)
-        .await;
+    let session = Rc::new(shard.add_client(&address, TransportProtocol::Quic));
 
     let client_id = session.client_id;
-    while let Some(stream) = accept_stream(&connection, &system, client_id).await? {
-        let system = system.clone();
-        let session = session.clone();
+    debug!(
+        "Added {} client with session: {} for IP address: {}",
+        TransportProtocol::Quic,
+        session,
+        address
+    );
 
-        let handle_stream_task = async move {
-            if let Err(err) = handle_stream(stream, system, session).await {
-                error!("Error when handling QUIC stream: {:?}", err)
+    let conn_stop_receiver = shard.task_registry.add_connection(client_id);
+
+    loop {
+        let shard = shard.clone();
+        futures::select! {
+            // Check for shutdown signal
+            _ = conn_stop_receiver.recv().fuse() => {
+                info!("QUIC connection {} shutting down gracefully", client_id);
+                break;
             }
-        };
-        let _handle = tokio::spawn(handle_stream_task);
+            // Accept new connection
+            stream_result = accept_stream(&connection, shard.clone(), client_id).fuse() => {
+                match stream_result? {
+                    Some(stream) => {
+                        let shard_clone = shard.clone();
+                        let session_rc = session.clone();
+
+                        shard.task_registry.spawn_connection(async move {
+                            if let Err(err) = handle_stream(stream, shard_clone, &session_rc).await {
+                                error!("Error when handling QUIC stream: {:?}", err)
+                            }
+                        });
+                    }
+                    None => break, // Connection closed
+                }
+            }
+        }
     }
+
+    shard.delete_client(client_id);
+    shard.task_registry.remove_connection(&client_id);
+    info!("QUIC connection {} closed", client_id);
     Ok(())
 }
 
@@ -92,18 +143,16 @@ type BiStream = (SendStream, RecvStream);
 
 async fn accept_stream(
     connection: &Connection,
-    system: &SharedSystem,
-    client_id: u32,
+    _shard: Rc<IggyShard>,
+    _client_id: u32,
 ) -> Result<Option<BiStream>, ConnectionError> {
     match connection.accept_bi().await {
-        Err(quinn::ConnectionError::ApplicationClosed { .. }) => {
+        Err(compio_quic::ConnectionError::ApplicationClosed { .. }) => {
             info!("Connection closed");
-            system.read().await.delete_client(client_id).await;
             Ok(None)
         }
         Err(error) => {
-            error!("Error when handling QUIC stream: {:?}", error);
-            system.read().await.delete_client(client_id).await;
+            error!("Error when accepting QUIC connection: {:?}", error);
             Err(error.into())
         }
         Ok(stream) => Ok(Some(stream)),
@@ -112,16 +161,16 @@ async fn accept_stream(
 
 async fn handle_stream(
     stream: BiStream,
-    system: SharedSystem,
-    session: impl AsRef<Session> + std::fmt::Debug,
+    shard: Rc<IggyShard>,
+    session: &Session,
 ) -> anyhow::Result<()> {
     let (send_stream, mut recv_stream) = stream;
 
     let mut length_buffer = [0u8; INITIAL_BYTES_LENGTH];
     let mut code_buffer = [0u8; INITIAL_BYTES_LENGTH];
 
-    recv_stream.read_exact(&mut length_buffer).await?;
-    recv_stream.read_exact(&mut code_buffer).await?;
+    recv_stream.read_exact(&mut length_buffer[..]).await?;
+    recv_stream.read_exact(&mut code_buffer[..]).await?;
 
     let length = u32::from_le_bytes(length_buffer);
     let code = u32::from_le_bytes(code_buffer);
@@ -138,17 +187,9 @@ async fn handle_stream(
         }
     };
 
-    // if let Err(e) = command.validate() {
-    //     sender.send_error_response(e.clone()).await?;
-    //     return Err(anyhow!("Command validation failed: {e}"));
-    // }
-
     trace!("Received a QUIC command: {command}, payload size: {length}");
 
-    match command
-        .handle(&mut sender, length, session.as_ref(), &system)
-        .await
-    {
+    match command.handle(&mut sender, length, session, &shard).await {
         Ok(_) => {
             trace!(
                 "Command was handled successfully, session: {:?}. QUIC response was sent.",

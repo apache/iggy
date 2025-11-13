@@ -226,7 +226,7 @@ internal static class MessageFactory
     {
         return new MessageFetchRequest
         {
-            Count = Random.Shared.Next(1, 10),
+            Count = (uint)Random.Shared.Next(1, 10),
             AutoCommit = true,
             Consumer = Consumer.New(1),
             PartitionId = (uint)Random.Shared.Next(1, 10),
@@ -241,7 +241,7 @@ internal static class MessageFactory
     {
         return new MessageFetchRequest
         {
-            Count = count,
+            Count = (uint)count,
             AutoCommit = true,
             Consumer = Consumer.New(consumerId),
             PartitionId = partitionId,
@@ -256,7 +256,7 @@ internal static class MessageFactory
     {
         return new MessageFetchRequest
         {
-            Count = count,
+            Count = (uint)count,
             AutoCommit = true,
             Consumer = Consumer.Group(consumerGroupId),
             PartitionId = partitionId,

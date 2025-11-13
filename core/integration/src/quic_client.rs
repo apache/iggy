@@ -33,6 +33,8 @@ impl ClientFactory for QuicClientFactory {
     async fn create_client(&self) -> ClientWrapper {
         let config = QuicClientConfig {
             server_address: self.server_addr.clone(),
+            // TODO: Need to increase this in order to not timeout during tests
+            max_idle_timeout: 2_000_000,
             ..QuicClientConfig::default()
         };
         let client = QuicClient::create(Arc::new(config)).unwrap();

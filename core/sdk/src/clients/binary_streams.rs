@@ -19,7 +19,7 @@
 use crate::prelude::IggyClient;
 use async_trait::async_trait;
 use iggy_binary_protocol::StreamClient;
-use iggy_common::locking::IggySharedMutFn;
+use iggy_common::locking::IggyRwLockFn;
 use iggy_common::{Identifier, IggyError, Stream, StreamDetails};
 
 #[async_trait]
@@ -32,16 +32,8 @@ impl StreamClient for IggyClient {
         self.client.read().await.get_streams().await
     }
 
-    async fn create_stream(
-        &self,
-        name: &str,
-        stream_id: Option<u32>,
-    ) -> Result<StreamDetails, IggyError> {
-        self.client
-            .read()
-            .await
-            .create_stream(name, stream_id)
-            .await
+    async fn create_stream(&self, name: &str) -> Result<StreamDetails, IggyError> {
+        self.client.read().await.create_stream(name).await
     }
 
     async fn update_stream(&self, stream_id: &Identifier, name: &str) -> Result<(), IggyError> {

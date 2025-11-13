@@ -51,6 +51,11 @@ impl ConsumerGroupClient for ClientWrapper {
                     .get_consumer_group(stream_id, topic_id, group_id)
                     .await
             }
+            ClientWrapper::WebSocket(client) => {
+                client
+                    .get_consumer_group(stream_id, topic_id, group_id)
+                    .await
+            }
         }
     }
 
@@ -64,6 +69,9 @@ impl ConsumerGroupClient for ClientWrapper {
             ClientWrapper::Http(client) => client.get_consumer_groups(stream_id, topic_id).await,
             ClientWrapper::Tcp(client) => client.get_consumer_groups(stream_id, topic_id).await,
             ClientWrapper::Quic(client) => client.get_consumer_groups(stream_id, topic_id).await,
+            ClientWrapper::WebSocket(client) => {
+                client.get_consumer_groups(stream_id, topic_id).await
+            }
         }
     }
 
@@ -72,27 +80,31 @@ impl ConsumerGroupClient for ClientWrapper {
         stream_id: &Identifier,
         topic_id: &Identifier,
         name: &str,
-        group_id: Option<u32>,
     ) -> Result<ConsumerGroupDetails, IggyError> {
         match self {
             ClientWrapper::Iggy(client) => {
                 client
-                    .create_consumer_group(stream_id, topic_id, name, group_id)
+                    .create_consumer_group(stream_id, topic_id, name)
                     .await
             }
             ClientWrapper::Http(client) => {
                 client
-                    .create_consumer_group(stream_id, topic_id, name, group_id)
+                    .create_consumer_group(stream_id, topic_id, name)
                     .await
             }
             ClientWrapper::Tcp(client) => {
                 client
-                    .create_consumer_group(stream_id, topic_id, name, group_id)
+                    .create_consumer_group(stream_id, topic_id, name)
                     .await
             }
             ClientWrapper::Quic(client) => {
                 client
-                    .create_consumer_group(stream_id, topic_id, name, group_id)
+                    .create_consumer_group(stream_id, topic_id, name)
+                    .await
+            }
+            ClientWrapper::WebSocket(client) => {
+                client
+                    .create_consumer_group(stream_id, topic_id, name)
                     .await
             }
         }
@@ -121,6 +133,11 @@ impl ConsumerGroupClient for ClientWrapper {
                     .await
             }
             ClientWrapper::Quic(client) => {
+                client
+                    .delete_consumer_group(stream_id, topic_id, group_id)
+                    .await
+            }
+            ClientWrapper::WebSocket(client) => {
                 client
                     .delete_consumer_group(stream_id, topic_id, group_id)
                     .await
@@ -155,6 +172,11 @@ impl ConsumerGroupClient for ClientWrapper {
                     .join_consumer_group(stream_id, topic_id, group_id)
                     .await
             }
+            ClientWrapper::WebSocket(client) => {
+                client
+                    .join_consumer_group(stream_id, topic_id, group_id)
+                    .await
+            }
         }
     }
 
@@ -185,6 +207,11 @@ impl ConsumerGroupClient for ClientWrapper {
                     .leave_consumer_group(stream_id, topic_id, group_id)
                     .await
             }
+            ClientWrapper::WebSocket(client) => {
+                client
+                    .leave_consumer_group(stream_id, topic_id, group_id)
+                    .await
+            }
         }
     }
 }
@@ -203,6 +230,9 @@ impl AsyncDrop for ClientWrapper {
                 let _ = client.logout_user().await;
             }
             ClientWrapper::Quic(client) => {
+                let _ = client.logout_user().await;
+            }
+            ClientWrapper::WebSocket(client) => {
                 let _ = client.logout_user().await;
             }
         }

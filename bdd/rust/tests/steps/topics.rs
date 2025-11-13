@@ -20,12 +20,9 @@ use crate::common::global_context::GlobalContext;
 use cucumber::{then, when};
 use iggy::prelude::{CompressionAlgorithm, Identifier, IggyExpiry, MaxTopicSize, TopicClient};
 
-#[when(
-    regex = r"^I create a topic with ID (\d+) and name (.+) in stream (\d+) with (\d+) partitions$"
-)]
+#[when(regex = r"^I create a topic with name (.+) in stream (\d+) with (\d+) partitions$")]
 pub async fn when_create_topic(
     world: &mut GlobalContext,
-    topic_id: u32,
     topic_name: String,
     stream_id: u32,
     partitions_count: u32,
@@ -38,7 +35,6 @@ pub async fn when_create_topic(
             partitions_count,
             CompressionAlgorithm::default(),
             None,
-            Some(topic_id),
             IggyExpiry::NeverExpire,
             MaxTopicSize::ServerDefault,
         )
@@ -58,15 +54,9 @@ pub async fn then_topic_created_successfully(world: &mut GlobalContext) {
     );
 }
 
-#[then(regex = r"^the topic should have ID (\d+) and name (.+)$")]
-pub async fn then_topic_has_id_and_name(
-    world: &mut GlobalContext,
-    expected_id: u32,
-    expected_name: String,
-) {
-    let topic_id = world.last_topic_id.expect("Topic should exist");
+#[then(regex = r"^the topic should have name (.+)$")]
+pub async fn then_topic_has_name(world: &mut GlobalContext, expected_name: String) {
     let topic_name = world.last_topic_name.as_ref().expect("Topic should exist");
-    assert_eq!(topic_id, expected_id, "Topic should have expected ID");
     assert_eq!(
         topic_name, &expected_name,
         "Topic should have expected name"

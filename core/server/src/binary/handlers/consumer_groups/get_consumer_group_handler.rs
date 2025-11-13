@@ -20,11 +20,13 @@ use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHa
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
 use crate::binary::sender::SenderKind;
+use crate::shard::IggyShard;
 use crate::streaming::session::Session;
-use crate::streaming::systems::system::SharedSystem;
+use crate::streaming::{streams, topics};
 use anyhow::Result;
 use iggy_common::IggyError;
 use iggy_common::get_consumer_group::GetConsumerGroup;
+use std::rc::Rc;
 use tracing::debug;
 
 impl ServerCommandHandler for GetConsumerGroup {
@@ -37,24 +39,41 @@ impl ServerCommandHandler for GetConsumerGroup {
         sender: &mut SenderKind,
         _length: u32,
         session: &Session,
-        system: &SharedSystem,
+        shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
-
-        let system = system.read().await;
-        let Ok(consumer_group) =
-            system.get_consumer_group(session, &self.stream_id, &self.topic_id, &self.group_id)
-        else {
+        shard.ensure_authenticated(session)?;
+        let exists = shard
+            .ensure_consumer_group_exists(&self.stream_id, &self.topic_id, &self.group_id)
+            .is_ok();
+        if !exists {
             sender.send_empty_ok_response().await?;
             return Ok(());
-        };
-        let Some(consumer_group) = consumer_group else {
+        }
+        let numeric_topic_id = shard.streams.with_topic_by_id(
+            &self.stream_id,
+            &self.topic_id,
+            topics::helpers::get_topic_id(),
+        );
+        let numeric_stream_id = shard
+            .streams
+            .with_stream_by_id(&self.stream_id, streams::helpers::get_stream_id());
+        let has_permission = shard
+            .permissioner
+            .borrow()
+            .get_consumer_group(session.get_user_id(), numeric_stream_id, numeric_topic_id)
+            .is_ok();
+        if !has_permission {
             sender.send_empty_ok_response().await?;
             return Ok(());
-        };
+        }
 
-        let consumer_group = consumer_group.read().await;
-        let consumer_group = mapper::map_consumer_group(&consumer_group).await;
+        let consumer_group = shard.streams.with_consumer_group_by_id(
+            &self.stream_id,
+            &self.topic_id,
+            &self.group_id,
+            |(root, members)| mapper::map_consumer_group(root, members),
+        );
         sender.send_ok_response(&consumer_group).await?;
         Ok(())
     }

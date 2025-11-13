@@ -245,11 +245,9 @@ class IggyClient:
 
         Returns Ok(()) on successful connection or a PyRuntimeError on failure.
         """
-    def create_stream(
-        self, name: builtins.str, stream_id: typing.Optional[builtins.int] = None
-    ) -> collections.abc.Awaitable[None]:
+    def create_stream(self, name: builtins.str) -> collections.abc.Awaitable[None]:
         r"""
-        Creates a new stream with the provided ID and name.
+        Creates a new stream with the provided name.
 
         Returns Ok(()) on successful stream creation or a PyRuntimeError on failure.
         """
@@ -267,7 +265,6 @@ class IggyClient:
         name: builtins.str,
         partitions_count: builtins.int,
         compression_algorithm: typing.Optional[builtins.str] = None,
-        topic_id: typing.Optional[builtins.int] = None,
         replication_factor: typing.Optional[builtins.int] = None,
     ) -> collections.abc.Awaitable[None]:
         r"""

@@ -18,6 +18,7 @@
 using Apache.Iggy.Contracts.Auth;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
+using Apache.Iggy.Tests.Integrations.Attributes;
 using Apache.Iggy.Tests.Integrations.Fixtures;
 using Shouldly;
 
@@ -79,7 +80,7 @@ public class PersonalAccessTokenTests
         var authResponse = await client.LoginWithPersonalAccessToken(response!.Token);
 
         authResponse.ShouldNotBeNull();
-        authResponse.UserId.ShouldBeGreaterThan(1);
+        authResponse.UserId.ShouldBeGreaterThan(0);
     }
 
     [Test]

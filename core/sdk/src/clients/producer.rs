@@ -24,7 +24,7 @@ use crate::clients::producer_dispatcher::ProducerDispatcher;
 use bytes::Bytes;
 use futures_util::StreamExt;
 use iggy_binary_protocol::{Client, MessageClient, StreamClient, TopicClient};
-use iggy_common::locking::{IggySharedMut, IggySharedMutFn};
+use iggy_common::locking::{IggyRwLock, IggyRwLockFn};
 use iggy_common::{
     CompressionAlgorithm, DiagnosticEvent, EncryptorKind, IdKind, Identifier, IggyDuration,
     IggyError, IggyExpiry, IggyMessage, IggyTimestamp, MaxTopicSize, Partitioner, Partitioning,
@@ -53,7 +53,7 @@ pub trait ProducerCoreBackend: Send + Sync + 'static {
 pub struct ProducerCore {
     initialized: AtomicBool,
     can_send: Arc<AtomicBool>,
-    client: Arc<IggySharedMut<ClientWrapper>>,
+    client: Arc<IggyRwLock<ClientWrapper>>,
     stream_id: Arc<Identifier>,
     stream_name: String,
     topic_id: Arc<Identifier>,
@@ -92,7 +92,7 @@ impl ProducerCore {
                 return Err(IggyError::StreamNameNotFound(self.stream_name.clone()));
             }
 
-            let (name, id) = match stream_id.kind {
+            let (name, _id) = match stream_id.kind {
                 IdKind::Numeric => (
                     self.stream_name.to_owned(),
                     Some(self.stream_id.get_u32_value()?),
@@ -100,7 +100,7 @@ impl ProducerCore {
                 IdKind::String => (self.stream_id.get_string_value()?, None),
             };
             info!("Creating stream: {name}");
-            client.create_stream(&name, id).await?;
+            client.create_stream(&name).await?;
         }
 
         if client.get_topic(&stream_id, &topic_id).await?.is_none() {
@@ -112,7 +112,7 @@ impl ProducerCore {
                 ));
             }
 
-            let (name, id) = match self.topic_id.kind {
+            let (name, _id) = match self.topic_id.kind {
                 IdKind::Numeric => (
                     self.topic_name.to_owned(),
                     Some(self.topic_id.get_u32_value()?),
@@ -127,7 +127,6 @@ impl ProducerCore {
                     self.topic_partitions_count,
                     CompressionAlgorithm::None,
                     self.topic_replication_factor,
-                    id,
                     self.topic_message_expiry,
                     self.topic_max_size,
                 )
@@ -432,7 +431,7 @@ pub struct IggyProducer {
 impl IggyProducer {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        client: IggySharedMut<ClientWrapper>,
+        client: IggyRwLock<ClientWrapper>,
         stream: Identifier,
         stream_name: String,
         topic: Identifier,

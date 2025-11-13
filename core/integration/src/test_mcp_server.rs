@@ -24,17 +24,18 @@ use rmcp::{
     service::RunningService,
     transport::StreamableHttpClientTransport,
 };
-use std::fs::OpenOptions;
-use std::io::Write;
+use std::fs::{self, File};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
+use std::thread::panicking;
 use std::time::Duration;
 use std::{collections::HashMap, net::TcpListener};
 use tokio::time::sleep;
 
 pub const CONSUMER_NAME: &str = "mcp";
 const MCP_PATH: &str = "/mcp";
+const TEST_VERBOSITY_ENV_VAR: &str = "IGGY_TEST_VERBOSE";
 
 pub type McpClient = RunningService<RoleClient, InitializeRequestParam>;
 
@@ -101,7 +102,23 @@ impl TestMcpServer {
             Command::cargo_bin("iggy-mcp").unwrap()
         };
         command.envs(self.envs.clone());
-        let child = command.spawn().expect("Failed to start MCP server process");
+
+        // By default, MCP server logs are redirected to files,
+        // and dumped to stderr when test fails. With IGGY_TEST_VERBOSE=1
+        // logs are dumped to stdout during test execution.
+        if std::env::var(TEST_VERBOSITY_ENV_VAR).is_ok()
+            || self.envs.contains_key(TEST_VERBOSITY_ENV_VAR)
+        {
+            command.stdout(Stdio::inherit());
+            command.stderr(Stdio::inherit());
+        } else {
+            command.stdout(self.get_stdout_file());
+            self.stdout_file_path = Some(fs::canonicalize(self.get_stdout_file_path()).unwrap());
+            command.stderr(self.get_stderr_file());
+            self.stderr_file_path = Some(fs::canonicalize(self.get_stderr_file_path()).unwrap());
+        }
+
+        let child = command.spawn().unwrap();
         self.child_handle = Some(child);
     }
 
@@ -118,29 +135,7 @@ impl TestMcpServer {
             #[cfg(not(unix))]
             child_handle.kill().unwrap();
 
-            if let Ok(output) = child_handle.wait_with_output() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                if let Some(stderr_file_path) = &self.stderr_file_path {
-                    OpenOptions::new()
-                        .append(true)
-                        .create(true)
-                        .open(stderr_file_path)
-                        .unwrap()
-                        .write_all(stderr.as_bytes())
-                        .unwrap();
-                }
-
-                if let Some(stdout_file_path) = &self.stdout_file_path {
-                    OpenOptions::new()
-                        .append(true)
-                        .create(true)
-                        .open(stdout_file_path)
-                        .unwrap()
-                        .write_all(stdout.as_bytes())
-                        .unwrap();
-                }
-            }
+            let _ = child_handle.wait();
         }
     }
 
@@ -224,10 +219,55 @@ impl TestMcpServer {
 
         panic!("Failed to find a free port after {max_retries} retries");
     }
+
+    fn get_stdout_file_path(&self) -> String {
+        format!("/tmp/iggy-mcp-{}.stdout", self.server_address.port())
+    }
+
+    fn get_stderr_file_path(&self) -> String {
+        format!("/tmp/iggy-mcp-{}.stderr", self.server_address.port())
+    }
+
+    fn get_stdout_file(&self) -> Stdio {
+        Stdio::from(File::create(self.get_stdout_file_path()).unwrap())
+    }
+
+    fn get_stderr_file(&self) -> Stdio {
+        Stdio::from(File::create(self.get_stderr_file_path()).unwrap())
+    }
+
+    fn read_file_to_string(path: &str) -> String {
+        fs::read_to_string(path).unwrap_or_else(|_| format!("Failed to read file: {}", path))
+    }
 }
 
 impl Drop for TestMcpServer {
     fn drop(&mut self) {
         self.stop();
+
+        if panicking() {
+            if let Some(stdout_file_path) = &self.stdout_file_path {
+                eprintln!(
+                    "Iggy MCP server stdout:\n{}",
+                    Self::read_file_to_string(stdout_file_path.to_str().unwrap())
+                );
+            }
+
+            if let Some(stderr_file_path) = &self.stderr_file_path {
+                eprintln!(
+                    "Iggy MCP server stderr:\n{}",
+                    Self::read_file_to_string(stderr_file_path.to_str().unwrap())
+                );
+            }
+        }
+
+        // Clean up log files
+        if let Some(stdout_file_path) = &self.stdout_file_path {
+            fs::remove_file(stdout_file_path).unwrap();
+        }
+
+        if let Some(stderr_file_path) = &self.stderr_file_path {
+            fs::remove_file(stderr_file_path).unwrap();
+        }
     }
 }

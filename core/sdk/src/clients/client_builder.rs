@@ -21,10 +21,11 @@ use crate::clients::client::IggyClient;
 use crate::http::http_client::HttpClient;
 use crate::prelude::{
     AutoLogin, EncryptorKind, HttpClientConfigBuilder, IggyDuration, IggyError, Partitioner,
-    QuicClientConfigBuilder, TcpClientConfigBuilder,
+    QuicClientConfigBuilder, TcpClientConfigBuilder, WebSocketClientConfigBuilder,
 };
 use crate::quic::quic_client::QuicClient;
 use crate::tcp::tcp_client::TcpClient;
+use crate::websocket::websocket_client::WebSocketClient;
 use iggy_common::{ConnectionStringUtils, TransportProtocol};
 use std::sync::Arc;
 use tracing::error;
@@ -63,6 +64,11 @@ impl IggyClientBuilder {
                 builder.client = Some(ClientWrapper::Http(HttpClient::from_connection_string(
                     connection_string,
                 )?));
+            }
+            TransportProtocol::WebSocket => {
+                builder.client = Some(ClientWrapper::WebSocket(
+                    WebSocketClient::from_connection_string(connection_string)?,
+                ));
             }
         }
 
@@ -113,6 +119,16 @@ impl IggyClientBuilder {
     pub fn with_http(self) -> HttpClientBuilder {
         HttpClientBuilder {
             config: HttpClientConfigBuilder::default(),
+            parent_builder: self,
+        }
+    }
+
+    /// This method provides fluent API for the WebSocket client configuration.
+    /// It returns the `WebSocketClientBuilder` instance, which allows to configure the WebSocket client with custom settings or using defaults.
+    /// This should be called after the non-protocol specific methods, such as `with_partitioner`, `with_encryptor` or `with_message_handler`.
+    pub fn with_websocket(self) -> WebSocketClientBuilder {
+        WebSocketClientBuilder {
+            config: WebSocketClientConfigBuilder::default(),
             parent_builder: self,
         }
     }
@@ -286,6 +302,61 @@ impl HttpClientBuilder {
         let client = self
             .parent_builder
             .with_client(ClientWrapper::Http(client))
+            .build()?;
+        Ok(client)
+    }
+}
+
+pub struct WebSocketClientBuilder {
+    config: WebSocketClientConfigBuilder,
+    parent_builder: IggyClientBuilder,
+}
+
+impl WebSocketClientBuilder {
+    /// Sets the server address for the WebSocket client.
+    pub fn with_server_address(mut self, server_address: String) -> Self {
+        self.config = self.config.with_server_address(server_address);
+        self
+    }
+
+    /// Sets the auto sign in during connection.
+    pub fn with_auto_sign_in(mut self, auto_sign_in: AutoLogin) -> Self {
+        self.config = self.config.with_auto_sign_in(auto_sign_in);
+        self
+    }
+
+    /// Sets whether to use TLS when connecting to the server.
+    pub fn with_tls_enabled(mut self, tls_enabled: bool) -> Self {
+        self.config = self.config.with_tls_enabled(tls_enabled);
+        self
+    }
+
+    /// Sets the domain to use for TLS when connecting to the server.
+    pub fn with_tls_domain(mut self, tls_domain: String) -> Self {
+        self.config = self.config.with_tls_domain(tls_domain);
+        self
+    }
+
+    /// Sets the path to the CA file for TLS.
+    pub fn with_tls_ca_file(mut self, tls_ca_file: String) -> Self {
+        self.config = self.config.with_tls_ca_file(tls_ca_file);
+        self
+    }
+
+    /// Sets whether to validate the TLS certificate.
+    pub fn with_tls_validate_certificate(mut self, tls_validate_certificate: bool) -> Self {
+        self.config = self
+            .config
+            .with_tls_validate_certificate(tls_validate_certificate);
+        self
+    }
+
+    /// Builds the parent `IggyClient` with WebSocket configuration.
+    pub fn build(self) -> Result<IggyClient, IggyError> {
+        let client = WebSocketClient::create(Arc::new(self.config.build()?))?;
+        let client = self
+            .parent_builder
+            .with_client(ClientWrapper::WebSocket(client))
             .build()?;
         Ok(client)
     }

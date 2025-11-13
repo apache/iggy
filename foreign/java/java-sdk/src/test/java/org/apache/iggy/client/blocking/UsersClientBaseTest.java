@@ -49,7 +49,7 @@ public abstract class UsersClientBaseTest extends IntegrationTest {
 
         // then
         assertThat(identityInfo).isNotNull();
-        assertThat(identityInfo.userId()).isEqualTo(1L);
+        assertThat(identityInfo.userId()).isEqualTo(0L);
     }
 
     @Test
@@ -58,7 +58,7 @@ public abstract class UsersClientBaseTest extends IntegrationTest {
         login();
 
         // when
-        var user = usersClient.getUser(1L);
+        var user = usersClient.getUser(0L);
 
         // then
         assertThat(user).isPresent();

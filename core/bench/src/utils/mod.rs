@@ -117,6 +117,7 @@ pub fn params_from_args_and_metrics(
         TransportProtocol::Tcp => BenchmarkTransport::Tcp,
         TransportProtocol::Quic => BenchmarkTransport::Quic,
         TransportProtocol::Http => BenchmarkTransport::Http,
+        TransportProtocol::WebSocket => BenchmarkTransport::WebSocket,
     };
     let server_address = args.server_address().to_string();
     let remark = args.remark();

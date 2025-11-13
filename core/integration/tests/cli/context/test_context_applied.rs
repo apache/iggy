@@ -16,8 +16,8 @@
  * under the License.
  */
 
-use std::collections::HashMap;
-
+use super::common::TestIggyContext;
+use crate::cli::common::{IggyCmdCommand, IggyCmdTest, IggyCmdTestCase};
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
 use iggy::prelude::ArgsOptional;
@@ -26,10 +26,7 @@ use iggy_binary_protocol::cli::binary_context::common::ContextConfig;
 use integration::test_server::TestServer;
 use predicates::str::{contains, starts_with};
 use serial_test::parallel;
-
-use crate::cli::common::{IggyCmdCommand, IggyCmdTest, IggyCmdTestCase};
-
-use super::common::TestIggyContext;
+use std::collections::HashMap;
 
 struct TestContextApplied {
     set_transport_context: Option<String>,

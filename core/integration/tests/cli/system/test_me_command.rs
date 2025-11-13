@@ -44,6 +44,7 @@ impl TransportProtocolExt for TransportProtocol {
         match self {
             TransportProtocol::Tcp => vec!["--transport", "tcp"],
             TransportProtocol::Quic => vec!["--transport", "quic"],
+            TransportProtocol::WebSocket => vec!["--transport", "websocket"],
             // Note: HTTP is not supported for the 'me' command
             TransportProtocol::Http => {
                 panic!("HTTP transport is not supported for the 'me' command")
@@ -116,6 +117,10 @@ impl IggyCmdTestCase for TestMeCmd {
             TransportProtocol::Quic => vec![
                 "--quic-server-address".into(),
                 server.get_quic_udp_addr().unwrap(),
+            ],
+            TransportProtocol::WebSocket => vec![
+                "--websocket-server-address".into(),
+                server.get_websocket_addr().unwrap(),
             ],
             TransportProtocol::Http => {
                 panic!("HTTP transport is not supported for the 'me' command")

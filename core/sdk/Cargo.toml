@@ -17,7 +17,7 @@
 
 [package]
 name = "iggy"
-version = "0.7.0"
+version = "0.8.0-edge.3"
 description = "Iggy is the persistent message streaming platform written in Rust, supporting QUIC, TCP and HTTP transport protocols, capable of processing millions of messages per second."
 edition = "2024"
 license = "Apache-2.0"
@@ -57,8 +57,10 @@ rustls = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true }
 tokio-rustls = { workspace = true }
+tokio-tungstenite = { workspace = true }
 tracing = { workspace = true }
 trait-variant = { workspace = true }
+tungstenite = { workspace = true }
 webpki-roots = { workspace = true }
 
 [dev-dependencies]

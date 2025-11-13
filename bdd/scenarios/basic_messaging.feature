@@ -26,19 +26,19 @@ Feature: Basic Messaging Operations
 
   Scenario: Create stream and send messages
     Given I have no streams in the system
-    When I create a stream with ID 1 and name "test-stream"
+    When I create a stream with name "test-stream"
     Then the stream should be created successfully
-    And the stream should have ID 1 and name "test-stream"
+    And the stream should have name "test-stream"
 
-    When I create a topic with ID 1 and name "test-topic" in stream 1 with 3 partitions
+    When I create a topic with name "test-topic" in stream 0 with 3 partitions
     Then the topic should be created successfully
-    And the topic should have ID 1 and name "test-topic" 
+    And the topic should have name "test-topic"
     And the topic should have 3 partitions
 
-    When I send 10 messages to stream 1, topic 1, partition 1
+    When I send 10 messages to stream 0, topic 0, partition 0
     Then all messages should be sent successfully
 
-    When I poll messages from stream 1, topic 1, partition 1 starting from offset 0
+    When I poll messages from stream 0, topic 0, partition 0 starting from offset 0
     Then I should receive 10 messages
     And the messages should have sequential offsets from 0 to 9
     And each message should have the expected payload content

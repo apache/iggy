@@ -26,19 +26,13 @@ import { getTopic } from './get-topic.command.js';
 export const ensureTopic = (c: ClientProvider) =>
   async function ensureTopic(
     streamId: Id,
-    topicId: number,
-    topicName = `ensure-topic-${streamId}-${topicId}`,
+    topicName: string,
     partitionCount = 1,
     compressionAlgorithm = 1
   ) {
-    const topic = await getTopic(c)({ streamId, topicId });
+    const topic = await getTopic(c)({ streamId, topicId: topicName });
     return topic === null ?
       createTopic(c)({
-        streamId,
-        topicId,
-        name: topicName,
-        partitionCount,
-        compressionAlgorithm
-      }) :
-      true;
+        streamId, name: topicName, partitionCount, compressionAlgorithm
+      }) : topic;
   };

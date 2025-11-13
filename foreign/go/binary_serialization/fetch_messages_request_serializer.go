@@ -24,9 +24,11 @@ import (
 )
 
 const (
-	partitionStrategySize = 5
-	offsetSize            = 12
-	commitFlagSize        = 1
+    partitionPresenceSize = 1
+    partitionFieldSize    = 4
+    partitionStrategySize = partitionPresenceSize + partitionFieldSize + 1
+    offsetSize            = 12
+    commitFlagSize        = 1
 )
 
 type TcpFetchMessagesRequest struct {
@@ -40,23 +42,29 @@ type TcpFetchMessagesRequest struct {
 }
 
 func (request *TcpFetchMessagesRequest) Serialize() []byte {
-	if request.PartitionId == nil {
-		request.PartitionId = new(uint32)
-	}
-	streamTopicIdLength := 2 + request.StreamId.Length + 2 + request.TopicId.Length
-	messageSize := 2 + request.Consumer.Id.Length + streamTopicIdLength + partitionStrategySize + offsetSize + commitFlagSize + 1
+	consumerIdBytes := SerializeIdentifier(request.Consumer.Id)
+	streamIdBytes := SerializeIdentifier(request.StreamId)
+	topicIdBytes := SerializeIdentifier(request.TopicId)
+	messageSize := 1 + len(consumerIdBytes) + len(streamIdBytes) + len(topicIdBytes) + partitionStrategySize + offsetSize + commitFlagSize
 	bytes := make([]byte, messageSize)
 
 	bytes[0] = byte(request.Consumer.Kind)
-	copy(bytes[1:3+request.Consumer.Id.Length], SerializeIdentifier(request.Consumer.Id))
+	position := 1
+	copy(bytes[position:position+len(consumerIdBytes)], consumerIdBytes)
+	position += len(consumerIdBytes)
 
-	position := 3 + request.Consumer.Id.Length
-
-	copy(bytes[position:position+streamTopicIdLength], SerializeIdentifiers(request.StreamId, request.TopicId))
-
-	position += streamTopicIdLength
-	binary.LittleEndian.PutUint32(bytes[position:position+4], *request.PartitionId)
-	bytes[position+4] = byte(request.Strategy.Kind)
+    copy(bytes[position:position+len(streamIdBytes)], streamIdBytes)
+	position += len(streamIdBytes)
+    copy(bytes[position:position+len(topicIdBytes)], topicIdBytes)
+	position += len(topicIdBytes)
+    if request.PartitionId != nil {
+        bytes[position] = 1
+        binary.LittleEndian.PutUint32(bytes[position+1:position+1+4], *request.PartitionId)
+    } else {
+        bytes[position] = 0
+        binary.LittleEndian.PutUint32(bytes[position+1:position+1+4], 0)
+    }
+    bytes[position+1+4] = byte(request.Strategy.Kind)
 
 	position += partitionStrategySize
 	binary.LittleEndian.PutUint64(bytes[position:position+8], request.Strategy.Value)

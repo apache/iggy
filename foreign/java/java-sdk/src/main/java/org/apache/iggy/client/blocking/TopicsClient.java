@@ -43,7 +43,6 @@ public interface TopicsClient {
     List<Topic> getTopics(StreamId streamId);
 
     default TopicDetails createTopic(Long streamId,
-                                     Optional<Long> topicId,
                                      Long partitionsCount,
                                      CompressionAlgorithm compressionAlgorithm,
                                      BigInteger messageExpiry,
@@ -51,7 +50,6 @@ public interface TopicsClient {
                                      Optional<Short> replicationFactor,
                                      String name) {
         return createTopic(StreamId.of(streamId),
-                topicId,
                 partitionsCount,
                 compressionAlgorithm,
                 messageExpiry,
@@ -61,7 +59,6 @@ public interface TopicsClient {
     }
 
     TopicDetails createTopic(StreamId streamId,
-                             Optional<Long> topicId,
                              Long partitionsCount,
                              CompressionAlgorithm compressionAlgorithm,
                              BigInteger messageExpiry,

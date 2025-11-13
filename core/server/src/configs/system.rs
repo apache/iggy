@@ -16,15 +16,23 @@
  * under the License.
  */
 
+use crate::slab::partitions;
+use crate::slab::streams;
+use crate::slab::topics;
+
 use super::cache_indexes::CacheIndexesConfig;
-use iggy_common::Confirmation;
+use super::sharding::ShardingConfig;
 use iggy_common::IggyByteSize;
+use iggy_common::IggyError;
 use iggy_common::IggyExpiry;
 use iggy_common::MaxTopicSize;
 use iggy_common::{CompressionAlgorithm, IggyDuration};
 use serde::{Deserialize, Serialize};
 use serde_with::DisplayFromStr;
 use serde_with::serde_as;
+
+pub const INDEX_EXTENSION: &str = "index";
+pub const LOG_EXTENSION: &str = "log";
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct SystemConfig {
@@ -42,6 +50,7 @@ pub struct SystemConfig {
     pub message_deduplication: MessageDeduplicationConfig,
     pub recovery: RecoveryConfig,
     pub memory_pool: MemoryPoolConfig,
+    pub sharding: ShardingConfig,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -141,8 +150,6 @@ pub struct SegmentConfig {
     #[serde_as(as = "DisplayFromStr")]
     pub message_expiry: IggyExpiry,
     pub archive_expired: bool,
-    #[serde_as(as = "DisplayFromStr")]
-    pub server_confirmation: Confirmation,
 }
 
 #[serde_as]
@@ -194,19 +201,19 @@ impl SystemConfig {
         format!("{}/{}", self.get_system_path(), self.stream.path)
     }
 
-    pub fn get_stream_path(&self, stream_id: u32) -> String {
+    pub fn get_stream_path(&self, stream_id: usize) -> String {
         format!("{}/{}", self.get_streams_path(), stream_id)
     }
 
-    pub fn get_topics_path(&self, stream_id: u32) -> String {
+    pub fn get_topics_path(&self, stream_id: usize) -> String {
         format!("{}/{}", self.get_stream_path(stream_id), self.topic.path)
     }
 
-    pub fn get_topic_path(&self, stream_id: u32, topic_id: u32) -> String {
+    pub fn get_topic_path(&self, stream_id: usize, topic_id: usize) -> String {
         format!("{}/{}", self.get_topics_path(stream_id), topic_id)
     }
 
-    pub fn get_partitions_path(&self, stream_id: u32, topic_id: u32) -> String {
+    pub fn get_partitions_path(&self, stream_id: usize, topic_id: usize) -> String {
         format!(
             "{}/{}",
             self.get_topic_path(stream_id, topic_id),
@@ -214,7 +221,12 @@ impl SystemConfig {
         )
     }
 
-    pub fn get_partition_path(&self, stream_id: u32, topic_id: u32, partition_id: u32) -> String {
+    pub fn get_partition_path(
+        &self,
+        stream_id: streams::ContainerId,
+        topic_id: topics::ContainerId,
+        partition_id: partitions::ContainerId,
+    ) -> String {
         format!(
             "{}/{}",
             self.get_partitions_path(stream_id, topic_id),
@@ -222,7 +234,12 @@ impl SystemConfig {
         )
     }
 
-    pub fn get_offsets_path(&self, stream_id: u32, topic_id: u32, partition_id: u32) -> String {
+    pub fn get_offsets_path(
+        &self,
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
+    ) -> String {
         format!(
             "{}/offsets",
             self.get_partition_path(stream_id, topic_id, partition_id)
@@ -231,9 +248,9 @@ impl SystemConfig {
 
     pub fn get_consumer_offsets_path(
         &self,
-        stream_id: u32,
-        topic_id: u32,
-        partition_id: u32,
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
     ) -> String {
         format!(
             "{}/consumers",
@@ -243,9 +260,9 @@ impl SystemConfig {
 
     pub fn get_consumer_group_offsets_path(
         &self,
-        stream_id: u32,
-        topic_id: u32,
-        partition_id: u32,
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
     ) -> String {
         format!(
             "{}/groups",
@@ -255,9 +272,9 @@ impl SystemConfig {
 
     pub fn get_segment_path(
         &self,
-        stream_id: u32,
-        topic_id: u32,
-        partition_id: u32,
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
         start_offset: u64,
     ) -> String {
         format!(
@@ -265,5 +282,53 @@ impl SystemConfig {
             self.get_partition_path(stream_id, topic_id, partition_id),
             start_offset
         )
+    }
+
+    pub fn get_messages_file_path(
+        &self,
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
+        start_offset: u64,
+    ) -> String {
+        let path = self.get_segment_path(stream_id, topic_id, partition_id, start_offset);
+        format!("{path}.{LOG_EXTENSION}")
+    }
+
+    pub fn get_index_path(
+        &self,
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
+        start_offset: u64,
+    ) -> String {
+        let path = self.get_segment_path(stream_id, topic_id, partition_id, start_offset);
+        format!("{path}.{INDEX_EXTENSION}")
+    }
+
+    pub fn resolve_max_topic_size(
+        &self,
+        max_topic_size: MaxTopicSize,
+    ) -> Result<MaxTopicSize, IggyError> {
+        match max_topic_size {
+            MaxTopicSize::ServerDefault => Ok(self.topic.max_size),
+            _ => {
+                if max_topic_size.as_bytes_u64() < self.segment.size.as_bytes_u64() {
+                    Err(IggyError::InvalidTopicSize(
+                        max_topic_size,
+                        self.segment.size,
+                    ))
+                } else {
+                    Ok(max_topic_size)
+                }
+            }
+        }
+    }
+
+    pub fn resolve_message_expiry(&self, message_expiry: IggyExpiry) -> IggyExpiry {
+        match message_expiry {
+            IggyExpiry::ServerDefault => self.segment.message_expiry,
+            _ => message_expiry,
+        }
     }
 }

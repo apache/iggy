@@ -1,32 +1,37 @@
 /* Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
- */
+* or more contributor license agreements.  See the NOTICE file
+* distributed with this work for additional information
+* regarding copyright ownership.  The ASF licenses         let consumer = PollingConsumer::consumer(&Identifier::numeric(2).unwrap(), partition_id as usize);
+       let args = PollingArgs::new(PollingStrategy::offset(middle_offset + 1), remaining_messages, false);
+       let (_, middle_messages) = streams
+           .poll_messages(&namespace, consumer, args)s file
+* to you under the Apache License, Version 2.0 (the
+* "License"); you may not use this file except in compliance
+* with the License.  You may obtain a copy of the License at
+*
+*   http://www.apache.org/licenses/LICENSE-2.0
+*
+* Unless required by applicable law or agreed to in writing,
+* software distributed under the License is distributed on an
+* "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+* KIND, either express or implied.  See the License for the
+* specific language governing permissions and limitations
+* under the License.
+*/
 
+use super::bootstrap_test_environment;
 use crate::streaming::common::test_setup::TestSetup;
 use bytes::BytesMut;
 use iggy::prelude::*;
 use server::configs::cache_indexes::CacheIndexesConfig;
 use server::configs::system::{PartitionConfig, SegmentConfig, SystemConfig};
-use server::streaming::partitions::partition::Partition;
+use server::shard::namespace::IggyFullNamespace;
+use server::shard::system::messages::PollingArgs;
+use server::streaming::polling_consumer::PollingConsumer;
 use server::streaming::segments::IggyMessagesBatchMut;
+use server::streaming::traits::MainOps;
 use std::collections::HashMap;
 use std::str::FromStr;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64};
 use test_case::test_matrix;
 
 /*
@@ -79,7 +84,7 @@ fn very_large_batches() -> Vec<u32> {
     [msgs_req_to_save(1), msgs_req_to_save(24), msgs_req_to_save(1000), msgs_req_to_save(10000)],
     [segment_size(10), segment_size(200), segment_size(10000000)],
     [index_cache_none(), index_cache_all(), index_cache_open_segment()])]
-#[tokio::test]
+#[compio::test]
 async fn test_get_messages_by_offset(
     message_size: IggyByteSize,
     batch_lengths: Vec<u32>,
@@ -91,14 +96,12 @@ async fn test_get_messages_by_offset(
         "Running test with message_size: {message_size}, batches: {batch_lengths:?}, messages_required_to_save: {messages_required_to_save}, segment_size: {segment_size}, cache_indexes: {cache_indexes}"
     );
 
+    let shard_id = 0;
     let setup = TestSetup::init().await;
-    let stream_id = 1;
-    let topic_id = 1;
-    let partition_id = 1;
 
     let total_messages_count = batch_lengths.iter().sum();
 
-    let config = Arc::new(SystemConfig {
+    let config = SystemConfig {
         path: setup.config.path.to_string(),
         partition: PartitionConfig {
             messages_required_to_save,
@@ -111,27 +114,24 @@ async fn test_get_messages_by_offset(
             ..Default::default()
         },
         ..Default::default()
-    });
+    };
 
-    let mut partition = Partition::create(
-        stream_id,
-        topic_id,
+    // Use the bootstrap method to create streams with proper slab structure
+    let bootstrap_result = bootstrap_test_environment(shard_id as u16, &config)
+        .await
+        .unwrap();
+    let streams = bootstrap_result.streams;
+    let stream_identifier = bootstrap_result.stream_id;
+    let topic_identifier = bootstrap_result.topic_id;
+    let partition_id = bootstrap_result.partition_id;
+    let task_registry = bootstrap_result.task_registry;
+
+    // Create namespace for MainOps calls
+    let namespace = IggyFullNamespace::new(
+        stream_identifier.clone(),
+        topic_identifier.clone(),
         partition_id,
-        true,
-        config.clone(),
-        setup.storage.clone(),
-        IggyExpiry::NeverExpire,
-        Arc::new(AtomicU64::new(0)),
-        Arc::new(AtomicU64::new(0)),
-        Arc::new(AtomicU64::new(0)),
-        Arc::new(AtomicU64::new(0)),
-        Arc::new(AtomicU32::new(0)),
-        IggyTimestamp::now(),
-    )
-    .await;
-
-    setup.create_partitions_directory(stream_id, topic_id).await;
-    partition.persist().await.unwrap();
+    );
 
     let mut all_messages = Vec::with_capacity(total_messages_count as usize);
 
@@ -195,18 +195,33 @@ async fn test_get_messages_by_offset(
 
         let batch = IggyMessagesBatchMut::from_messages(messages_slice_to_append, messages_size);
         assert_eq!(batch.count(), batch_len);
-        partition.append_messages(batch, None).await.unwrap();
+        streams
+            .append_messages(&config, &task_registry, &namespace, batch)
+            .await
+            .unwrap();
 
-        batch_offsets.push(partition.current_offset);
+        // Get current offset after appending
+        let current_offset = streams.with_partition_by_id(
+            &stream_identifier,
+            &topic_identifier,
+            partition_id,
+            |(_, _, _, offset, ..)| offset.load(std::sync::atomic::Ordering::Relaxed),
+        );
+        batch_offsets.push(current_offset);
         current_pos += batch_len as usize;
     }
 
     // Use the exact total messages count from the test matrix
     let total_sent_messages = total_messages_count;
 
+    // Create a single consumer to reuse throughout the test
+    let consumer =
+        PollingConsumer::consumer(&Identifier::numeric(1).unwrap(), partition_id as usize);
+
     // Test 1: All messages from start
-    let all_loaded_messages = partition
-        .get_messages_by_offset(0, total_sent_messages)
+    let args = PollingArgs::new(PollingStrategy::offset(0), total_sent_messages, false);
+    let (_, all_loaded_messages) = streams
+        .poll_messages(&namespace, consumer, args)
         .await
         .unwrap();
     assert_eq!(
@@ -223,8 +238,13 @@ async fn test_get_messages_by_offset(
         let prior_batches_sum: u32 = batch_lengths[..3].iter().sum();
         let remaining_messages = total_sent_messages - prior_batches_sum;
 
-        let middle_messages = partition
-            .get_messages_by_offset(middle_offset + 1, remaining_messages)
+        let args = PollingArgs::new(
+            PollingStrategy::offset(middle_offset + 1),
+            remaining_messages,
+            false,
+        );
+        let (_, middle_messages) = streams
+            .poll_messages(&namespace, consumer, args)
             .await
             .unwrap();
 
@@ -240,8 +260,9 @@ async fn test_get_messages_by_offset(
     // Test 3: No messages beyond final offset
     if !batch_offsets.is_empty() {
         let final_offset = *batch_offsets.last().unwrap();
-        let no_messages = partition
-            .get_messages_by_offset(final_offset + 1, 1)
+        let args = PollingArgs::new(PollingStrategy::offset(final_offset + 1), 1, false);
+        let (_, no_messages) = streams
+            .poll_messages(&namespace, consumer, args)
             .await
             .unwrap();
         assert_eq!(
@@ -254,8 +275,9 @@ async fn test_get_messages_by_offset(
 
     // Test 4: Small subset from start
     let subset_size = std::cmp::min(3, total_sent_messages);
-    let subset_messages = partition
-        .get_messages_by_offset(0, subset_size)
+    let args = PollingArgs::new(PollingStrategy::offset(0), subset_size, false);
+    let (_, subset_messages) = streams
+        .poll_messages(&namespace, consumer, args)
         .await
         .unwrap();
     assert_eq!(
@@ -270,8 +292,9 @@ async fn test_get_messages_by_offset(
     if batch_offsets.len() >= 4 {
         let span_offset = batch_offsets[1] + 1; // Start from middle of 2nd batch
         let span_size = 8; // Should span across 2nd, 3rd, and into 4th batch
-        let batches = partition
-            .get_messages_by_offset(span_offset, span_size)
+        let args = PollingArgs::new(PollingStrategy::offset(span_offset), span_size, false);
+        let (_, batches) = streams
+            .poll_messages(&namespace, consumer, args)
             .await
             .unwrap();
         assert_eq!(
@@ -343,8 +366,13 @@ async fn test_get_messages_by_offset(
     for chunk_start in (0..total_sent_messages).step_by(chunk_size as usize) {
         let read_size = std::cmp::min(chunk_size, total_sent_messages - chunk_start);
 
-        let chunk = partition
-            .get_messages_by_offset(chunk_start as u64, read_size)
+        let args = PollingArgs::new(
+            PollingStrategy::offset(chunk_start as u64),
+            read_size,
+            false,
+        );
+        let (_, chunk) = streams
+            .poll_messages(&namespace, consumer, args)
             .await
             .unwrap();
 

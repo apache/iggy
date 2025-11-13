@@ -28,7 +28,7 @@ use serial_test::parallel;
 
 struct TestStreamDeleteCmd {
     stream_id: u32,
-    name: String,
+    stream_name: String,
     using_identifier: TestStreamId,
 }
 
@@ -36,14 +36,14 @@ impl TestStreamDeleteCmd {
     fn new(stream_id: u32, name: String, using_identifier: TestStreamId) -> Self {
         Self {
             stream_id,
-            name,
+            stream_name: name,
             using_identifier,
         }
     }
 
     fn to_arg(&self) -> String {
         match self.using_identifier {
-            TestStreamId::Named => self.name.clone(),
+            TestStreamId::Named => self.stream_name.clone(),
             TestStreamId::Numeric => format!("{}", self.stream_id),
         }
     }
@@ -52,7 +52,7 @@ impl TestStreamDeleteCmd {
 #[async_trait]
 impl IggyCmdTestCase for TestStreamDeleteCmd {
     async fn prepare_server_state(&mut self, client: &dyn Client) {
-        let stream = client.create_stream(&self.name, Some(self.stream_id)).await;
+        let stream = client.create_stream(&self.stream_name).await;
         assert!(stream.is_ok());
     }
 
@@ -68,7 +68,7 @@ impl IggyCmdTestCase for TestStreamDeleteCmd {
         let message = match self.using_identifier {
             TestStreamId::Named => format!(
                 "Executing delete stream with ID: {}\nStream with ID: {} deleted\n",
-                self.name, self.name
+                self.stream_name, self.stream_name
             ),
             TestStreamId::Numeric => format!(
                 "Executing delete stream with ID: {}\nStream with ID: {} deleted\n",
@@ -95,14 +95,14 @@ pub async fn should_be_successful() {
     iggy_cmd_test.setup().await;
     iggy_cmd_test
         .execute_test(TestStreamDeleteCmd::new(
-            1,
+            0,
             String::from("testing"),
-            TestStreamId::Numeric,
+            TestStreamId::Named,
         ))
         .await;
     iggy_cmd_test
         .execute_test(TestStreamDeleteCmd::new(
-            2,
+            0,
             String::from("production"),
             TestStreamId::Named,
         ))

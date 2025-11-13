@@ -16,15 +16,21 @@
  * under the License.
  */
 
+use compio::fs::{File, OpenOptions, remove_file};
 use std::path::Path;
-use tokio::fs::{File, OpenOptions, remove_file};
 
 pub async fn open(path: &str) -> Result<File, std::io::Error> {
     OpenOptions::new().read(true).open(path).await
 }
 
-pub async fn append(path: &str) -> Result<File, std::io::Error> {
-    OpenOptions::new().read(true).append(true).open(path).await
+pub async fn append(path: &str) -> Result<(File, u64), std::io::Error> {
+    let file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(path)
+        .await?;
+    let position = file.metadata().await?.len();
+    Ok((file, position))
 }
 
 pub async fn overwrite(path: &str) -> Result<File, std::io::Error> {
@@ -35,14 +41,15 @@ pub async fn overwrite(path: &str) -> Result<File, std::io::Error> {
         .open(path)
         .await
 }
+
 pub async fn remove(path: &str) -> Result<(), std::io::Error> {
     remove_file(path).await
 }
 
 pub async fn rename(old_path: &str, new_path: &str) -> Result<(), std::io::Error> {
-    tokio::fs::rename(Path::new(old_path), Path::new(new_path)).await
+    compio::fs::rename(Path::new(old_path), Path::new(new_path)).await
 }
 
 pub async fn exists(path: &str) -> Result<bool, std::io::Error> {
-    tokio::fs::try_exists(path).await
+    std::fs::exists(path)
 }

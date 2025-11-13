@@ -67,7 +67,7 @@ impl IggyCmdTestCase for TestClientGetCmd {
                 "Client ID             | {}",
                 self.get_client_id()
             )))
-            .stdout(contains("User ID               | 1"));
+            .stdout(contains("User ID               | 0"));
     }
 
     async fn verify_server_state(&self, _client: &dyn Client) {}

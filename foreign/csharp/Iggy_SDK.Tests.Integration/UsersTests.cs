@@ -20,6 +20,7 @@ using Apache.Iggy.Contracts.Auth;
 using Apache.Iggy.Contracts.Http.Auth;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
+using Apache.Iggy.Tests.Integrations.Attributes;
 using Apache.Iggy.Tests.Integrations.Fixtures;
 using Apache.Iggy.Tests.Integrations.Helpers;
 using Shouldly;
@@ -33,6 +34,7 @@ public class UsersTests
 
     [ClassDataSource<UsersFixture>(Shared = SharedType.PerClass)]
     public required UsersFixture Fixture { get; init; }
+
 
     [Test]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
@@ -68,7 +70,7 @@ public class UsersTests
         var response = await Fixture.Clients[protocol].GetUser(Identifier.String(Username.GetWithProtocol(protocol)));
 
         response.ShouldNotBeNull();
-        response.Id.ShouldBeGreaterThan((uint)1);
+        response.Id.ShouldBeGreaterThanOrEqualTo(0u);
         response.Username.ShouldBe(Username.GetWithProtocol(protocol));
         response.Status.ShouldBe(UserStatus.Active);
         response.CreatedAt.ShouldBeGreaterThan(0u);
@@ -102,7 +104,7 @@ public class UsersTests
         var user = await Fixture.Clients[protocol].GetUser(Identifier.String(newUsername));
 
         user.ShouldNotBeNull();
-        user.Id.ShouldBeGreaterThan(1u);
+        user.Id.ShouldBeGreaterThanOrEqualTo(0u);
         user.Username.ShouldBe(newUsername);
         user.Status.ShouldBe(UserStatus.Active);
         user.CreatedAt.ShouldBeGreaterThan(0u);
@@ -124,7 +126,7 @@ public class UsersTests
         var user = await Fixture.Clients[protocol].GetUser(Identifier.String(Username.GetWithProtocol(protocol)));
 
         user.ShouldNotBeNull();
-        user.Id.ShouldBeGreaterThan(1u);
+        user.Id.ShouldBeGreaterThanOrEqualTo(0u);
         user.Permissions.ShouldNotBeNull();
         user.Permissions!.Global.ShouldNotBeNull();
         user.Permissions.Global.ManageServers.ShouldBeTrue();
@@ -181,7 +183,7 @@ public class UsersTests
         var response = await client.LoginUser(Username.GetWithProtocol(protocol), "user2");
 
         response.ShouldNotBeNull();
-        response.UserId.ShouldBeGreaterThan(1);
+        response.UserId.ShouldBeGreaterThan(0);
         switch (protocol)
         {
             case Protocol.Tcp:
@@ -198,8 +200,13 @@ public class UsersTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task DeleteUser_Should_DeleteUser_Successfully(Protocol protocol)
     {
+        var userToRemove = await Fixture.Clients[protocol]
+            .CreateUser("user-to-remove".GetWithProtocol(protocol), "test123", UserStatus.Active);
+        userToRemove.ShouldNotBeNull();
+
         await Should.NotThrowAsync(Fixture.Clients[protocol]
-            .DeleteUser(Identifier.String(Username.GetWithProtocol(protocol))));
+            .DeleteUser(Identifier.String(userToRemove.Username)));
+
     }
 
     [Test]

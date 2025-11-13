@@ -72,7 +72,7 @@ export type SingleConsumerStreamRequest = ConsumerStreamRequest & {
   partitionId: number,
 };
 
-export type GroupConsumerStreamRequest = ConsumerStreamRequest & { groupId: number };
+export type GroupConsumerStreamRequest = ConsumerStreamRequest & { groupName: string };
 
 export const singleConsumerStream = (config: ClientConfig) => async (
   {
@@ -97,7 +97,7 @@ export const singleConsumerStream = (config: ClientConfig) => async (
     count,
     autocommit
   };
-  
+
   const ps = Readable.from(
     genEagerUntilPoll(c, poll, interval, endOnLastOffset),
     { objectMode: true }
@@ -108,7 +108,7 @@ export const singleConsumerStream = (config: ClientConfig) => async (
 
 export const groupConsumerStream = (config: ClientConfig) =>
   async function groupConsumerStream({
-    groupId,
+    groupName,
     streamId,
     topicId,
     pollingStrategy,
@@ -118,13 +118,13 @@ export const groupConsumerStream = (config: ClientConfig) =>
     endOnLastOffset = false
   }: GroupConsumerStreamRequest): Promise<Readable> {
     const s = await getClient(config);
-    await s.group.ensureAndJoin(streamId, topicId, groupId);
-    
+    await s.group.ensureAndJoin(streamId, topicId, groupName);
+
     const poll = {
       streamId,
       topicId,
-      consumer: Consumer.Group(groupId),
-      partitionId: 0,
+      consumer: Consumer.Group(groupName),
+      partitionId: null,
       pollingStrategy,
       count,
       autocommit

@@ -42,11 +42,10 @@ class StreamsTcpClient implements StreamsClient {
     }
 
     @Override
-    public StreamDetails createStream(Optional<Long> streamId, String name) {
-        var payloadSize = 4 + 1 + name.length();
+    public StreamDetails createStream(String name) {
+        var payloadSize = 1 + name.length();
         var payload = Unpooled.buffer(payloadSize);
 
-        payload.writeIntLE(streamId.orElse(0L).intValue());
         payload.writeBytes(nameToBytes(name));
         var response = tcpClient.send(CommandCode.Stream.CREATE, payload);
         return readStreamDetails(response);

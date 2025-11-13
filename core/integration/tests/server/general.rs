@@ -24,7 +24,7 @@ use serial_test::parallel;
 use test_case::test_matrix;
 
 #[test_matrix(
-    [TransportProtocol::Tcp, TransportProtocol::Quic, TransportProtocol::Http],
+    [quic(), tcp(), http(), websocket()],
     [
         system_scenario(),
         user_scenario(),
@@ -38,4 +38,20 @@ use test_case::test_matrix;
 #[parallel]
 async fn matrix(transport: TransportProtocol, scenario: ScenarioFn) {
     run_scenario(transport, scenario).await;
+}
+
+fn quic() -> TransportProtocol {
+    TransportProtocol::Quic
+}
+
+fn tcp() -> TransportProtocol {
+    TransportProtocol::Tcp
+}
+
+fn http() -> TransportProtocol {
+    TransportProtocol::Http
+}
+
+fn websocket() -> TransportProtocol {
+    TransportProtocol::WebSocket
 }

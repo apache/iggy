@@ -44,7 +44,7 @@ var _ = ginkgo.Describe("GET TOPIC BY ID:", func() {
 
 			_, err := client.GetTopic(randomU32Identifier(), randomU32Identifier())
 
-			itShouldReturnSpecificIggyError(err, ierror.TopicIdNotFound)
+			itShouldReturnSpecificError(err, ierror.ErrTopicIdNotFound)
 		})
 
 		ginkgo.Context("and tries to get non-existing topic", func() {
@@ -55,7 +55,7 @@ var _ = ginkgo.Describe("GET TOPIC BY ID:", func() {
 
 			_, err := client.GetTopic(streamIdentifier, randomU32Identifier())
 
-			itShouldReturnSpecificIggyError(err, ierror.TopicIdNotFound)
+			itShouldReturnSpecificError(err, ierror.ErrTopicIdNotFound)
 		})
 	})
 

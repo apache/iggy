@@ -89,7 +89,7 @@ impl ConnectorsRuntime {
 
         let client = self.create_client().await;
         client
-            .create_stream(&iggy_setup.stream, None)
+            .create_stream(&iggy_setup.stream)
             .await
             .expect("Failed to create stream");
         let stream_id = iggy_setup
@@ -102,7 +102,6 @@ impl ConnectorsRuntime {
                 &iggy_setup.topic,
                 1,
                 CompressionAlgorithm::None,
-                None,
                 None,
                 IggyExpiry::ServerDefault,
                 MaxTopicSize::ServerDefault,
