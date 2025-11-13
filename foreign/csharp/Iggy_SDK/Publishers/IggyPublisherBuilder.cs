@@ -33,8 +33,8 @@ namespace Apache.Iggy.Publishers;
 /// </summary>
 public class IggyPublisherBuilder
 {
-    protected EventHandler<PublisherErrorEventArgs>? OnBackgroundError;
-    protected EventHandler<MessageBatchFailedEventArgs>? OnMessageBatchFailed;
+    internal Func<PublisherErrorEventArgs, Task>? OnBackgroundError { get; set; }
+    internal Func<MessageBatchFailedEventArgs, Task>? OnMessageBatchFailed { get; set; }
 
     /// <summary>
     ///     Gets or sets the publisher configuration.
@@ -197,7 +197,7 @@ public class IggyPublisherBuilder
     /// </summary>
     /// <param name="handler">The event handler to invoke when background errors occur.</param>
     /// <returns>The builder instance for method chaining.</returns>
-    public IggyPublisherBuilder SubscribeOnBackgroundError(EventHandler<PublisherErrorEventArgs> handler)
+    public IggyPublisherBuilder SubscribeOnBackgroundError(Func<PublisherErrorEventArgs, Task> handler)
     {
         OnBackgroundError = handler;
         return this;
@@ -209,11 +209,13 @@ public class IggyPublisherBuilder
     /// </summary>
     /// <param name="handler">The event handler to invoke when message batches fail to send.</param>
     /// <returns>The builder instance for method chaining.</returns>
-    public IggyPublisherBuilder SubscribeOnMessageBatchFailed(EventHandler<MessageBatchFailedEventArgs> handler)
+    public IggyPublisherBuilder SubscribeOnMessageBatchFailed(Func<MessageBatchFailedEventArgs, Task> handler)
     {
         OnMessageBatchFailed = handler;
         return this;
     }
+
+
 
     /// <summary>
     ///     Configures retry behavior for failed message sends.
@@ -301,12 +303,12 @@ public class IggyPublisherBuilder
 
         if (OnBackgroundError != null)
         {
-            publisher.OnBackgroundError += OnBackgroundError;
+            publisher.SubscribeOnBackgroundError(OnBackgroundError);
         }
 
         if (OnMessageBatchFailed != null)
         {
-            publisher.OnMessageBatchFailed += OnMessageBatchFailed;
+            publisher.SubscribeOnMessageBatchFailed(OnMessageBatchFailed);
         }
 
         return publisher;

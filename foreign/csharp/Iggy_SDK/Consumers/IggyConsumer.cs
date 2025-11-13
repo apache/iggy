@@ -23,6 +23,7 @@ using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
 using Apache.Iggy.IggyClient;
 using Apache.Iggy.Kinds;
+using Apache.Iggy.Utils;
 using Microsoft.Extensions.Logging;
 
 namespace Apache.Iggy.Consumers;
@@ -43,20 +44,22 @@ public partial class IggyConsumer : IAsyncDisposable
     private bool _isInitialized;
     private long _lastPolledAtMs;
     private bool _joinedConsumerGroup;
+    private readonly EventAggregator<ConsumerErrorEventArgs> _consumerErrorEvents;
 
     /// <summary>
     ///     Initializes a new instance of the <see cref="IggyConsumer" /> class
     /// </summary>
     /// <param name="client">The Iggy client for server communication</param>
     /// <param name="config">Consumer configuration settings</param>
-    /// <param name="logger">Logger instance for diagnostic output</param>
-    public IggyConsumer(IIggyClient client, IggyConsumerConfig config, ILogger<IggyConsumer> logger)
+    /// <param name="loggerFactory">Logger for creating loggers</param>
+    public IggyConsumer(IIggyClient client, IggyConsumerConfig config, ILoggerFactory loggerFactory)
     {
         _client = client;
         _config = config;
-        _logger = logger;
+        _logger = loggerFactory.CreateLogger<IggyConsumer>();
 
         _channel = Channel.CreateUnbounded<ReceivedMessage>();
+        _consumerErrorEvents = new EventAggregator<ConsumerErrorEventArgs>(loggerFactory);
     }
 
     /// <summary>
@@ -71,7 +74,7 @@ public partial class IggyConsumer : IAsyncDisposable
 
         if (_isInitialized)
         {
-            _client.OnConnectionStateChanged -= OnClientConnectionStateChanged;
+            _client.UnsubscribeConnectionEvents(OnClientConnectionStateChanged);
         }
 
         if (!string.IsNullOrEmpty(_consumerGroupName) && _isInitialized)
@@ -102,13 +105,9 @@ public partial class IggyConsumer : IAsyncDisposable
             }
         }
 
+        _consumerErrorEvents.Clear();
         _disposed = true;
     }
-
-    /// <summary>
-    ///     Fired when an error occurs during message polling
-    /// </summary>
-    public event EventHandler<ConsumerErrorEventArgs>? OnPollingError;
 
     /// <summary>
     ///     Initializes the consumer by logging in (if needed) and setting up consumer groups
@@ -138,8 +137,7 @@ public partial class IggyConsumer : IAsyncDisposable
 
         await InitializeConsumerGroupAsync(ct);
 
-        // Subscribe to connection state change events to rejoin consumer group when reconnected
-        _client.OnConnectionStateChanged += OnClientConnectionStateChanged;
+        _client.SubscribeConnectionEvents(OnClientConnectionStateChanged);
 
         _isInitialized = true;
     }
@@ -196,6 +194,24 @@ public partial class IggyConsumer : IAsyncDisposable
     public async Task DeleteOffsetAsync(uint partitionId, CancellationToken ct = default)
     {
         await _client.DeleteOffsetAsync(_config.Consumer, _config.StreamId, _config.TopicId, partitionId, ct);
+    }
+
+    /// <summary>
+    ///     Event raised when an error occurs during polling.
+    /// </summary>
+    /// <param name="callback">Callback method</param>
+    public void SubscribeToErrorEvents(Func<ConsumerErrorEventArgs, Task> callback)
+    {
+        _consumerErrorEvents.Subscribe(callback);
+    }
+
+    /// <summary>
+    ///     
+    /// </summary>
+    /// <param name="callback"></param>
+    public void UnsubscribeFromErrorEvents(Func<ConsumerErrorEventArgs, Task> callback)
+    {
+        _consumerErrorEvents.Unsubscribe(callback);
     }
 
     /// <summary>
@@ -291,6 +307,7 @@ public partial class IggyConsumer : IAsyncDisposable
     {
         try
         {
+            var cg = await _client.GetConsumerGroupByIdAsync(Identifier.String($"stream_0"), Identifier.String($"topic_0"), Identifier.String("cg-1"));
             if (!_joinedConsumerGroup)
             {
                 _logger.LogDebug("Consumer group not joined yet. Skipping polling");
@@ -370,7 +387,7 @@ public partial class IggyConsumer : IAsyncDisposable
         catch (Exception ex)
         {
             LogFailedToPollMessages(ex);
-            OnPollingError?.Invoke(this, new ConsumerErrorEventArgs(ex, "Failed to poll messages"));
+            _consumerErrorEvents.Publish(new ConsumerErrorEventArgs(ex, "Failed to poll messages"));
         }
     }
 
@@ -418,10 +435,9 @@ public partial class IggyConsumer : IAsyncDisposable
 
     /// <summary>
     ///     Handles connection state changes from the client.
-    ///     Logs state transitions for diagnostics and debugging.
-    ///     Triggers consumer group rejoin when the client reaches Authenticated state after a reconnection.
     /// </summary>
-    private void OnClientConnectionStateChanged(object? sender, ConnectionStateChangedEventArgs e)
+    /// <param name="e">Event object</param>
+    private async Task OnClientConnectionStateChanged(ConnectionStateChangedEventArgs e)
     {
         LogConnectionStateChanged(e.PreviousState, e.CurrentState);
 
@@ -434,7 +450,7 @@ public partial class IggyConsumer : IAsyncDisposable
         {
             if (e.PreviousState is ConnectionState.Disconnected or ConnectionState.Connecting or ConnectionState.Authenticating)
             {
-                _ = Task.Run(RejoinConsumerGroupOnReconnectionAsync);
+                await RejoinConsumerGroupOnReconnectionAsync();
             }
         }
     }
@@ -457,7 +473,7 @@ public partial class IggyConsumer : IAsyncDisposable
         catch (Exception ex)
         {
             LogFailedToRejoinConsumerGroup(ex, _consumerGroupName);
-            OnPollingError?.Invoke(this, new ConsumerErrorEventArgs(ex, "Failed to rejoin consumer group after reconnection"));
+            _consumerErrorEvents.Publish(new ConsumerErrorEventArgs(ex, "Failed to rejoin consumer group after reconnection"));
         }
     }
 }

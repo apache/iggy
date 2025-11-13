@@ -707,6 +707,16 @@ public class HttpMessageStream : IIggyClient
     {
     }
 
+    public void SubscribeConnectionEvents(Func<ConnectionStateChangedEventArgs, Task> callback)
+    {
+
+    }
+
+    public void UnsubscribeConnectionEvents(Func<ConnectionStateChangedEventArgs, Task> callback)
+    {
+
+    }
+
     private static async Task HandleResponseAsync(HttpResponseMessage response, bool shouldThrowOnGetNotFound = false)
     {
         if ((int)response.StatusCode > 300

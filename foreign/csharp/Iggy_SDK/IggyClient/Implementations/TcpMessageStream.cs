@@ -47,6 +47,7 @@ public sealed class TcpMessageStream : IIggyClient
     private TcpConnectionStream _stream = null!;
     private bool _isConnecting;
     private ClusterNode? _currentLeaderNode;
+    private readonly EventAggregator<ConnectionStateChangedEventArgs> _connectionEvents;
 
     internal TcpMessageStream(IggyClientConfigurator configuration, ILoggerFactory loggerFactory)
     {
@@ -55,12 +56,13 @@ public sealed class TcpMessageStream : IIggyClient
         _sendingSemaphore = new SemaphoreSlim(1, 1);
         _connectionSemaphore = new SemaphoreSlim(1, 1);
         _lastConnectionTime = DateTimeOffset.MinValue;
+        _connectionEvents = new EventAggregator<ConnectionStateChangedEventArgs>(loggerFactory);
     }
 
     /// <summary>
     ///     Fired whenever the connection state changes.
     /// </summary>
-    public event EventHandler<ConnectionStateChangedEventArgs>? OnConnectionStateChanged;
+    //public event EventHandler<ConnectionStateChangedEventArgs>? OnConnectionStateChanged;
 
     public void Dispose()
     {
@@ -68,6 +70,17 @@ public sealed class TcpMessageStream : IIggyClient
         _stream?.Dispose();
         _sendingSemaphore.Dispose();
         _connectionSemaphore.Dispose();
+        _connectionEvents.Clear();
+    }
+
+    public void SubscribeConnectionEvents(Func<ConnectionStateChangedEventArgs, Task> callback)
+    {
+        _connectionEvents.Subscribe(callback);
+    }
+
+    public void UnsubscribeConnectionEvents(Func<ConnectionStateChangedEventArgs, Task> callback)
+    {
+        _connectionEvents.Unsubscribe(callback);
     }
 
     public async Task<StreamResponse?> CreateStreamAsync(string name, CancellationToken token = default)
@@ -505,7 +518,7 @@ public sealed class TcpMessageStream : IIggyClient
             await Task.Delay(_configuration.ReconnectionSettings.InitialDelay, token);
         }
 
-        SetConnectionState(ConnectionState.Connecting);
+        SetConnectionStateAsync(ConnectionState.Connecting);
         _isConnecting = true;
         try
         {
@@ -545,7 +558,7 @@ public sealed class TcpMessageStream : IIggyClient
                 socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
                 socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveTime, 5);
 
-                SetConnectionState(ConnectionState.Connected);
+                SetConnectionStateAsync(ConnectionState.Connected);
                 _lastConnectionTime = DateTimeOffset.UtcNow;
 
                 _stream = _configuration.TlsSettings.Enabled switch
@@ -584,7 +597,7 @@ public sealed class TcpMessageStream : IIggyClient
                     (_configuration.ReconnectionSettings.MaxRetries > 0 &&
                      retryCount >= _configuration.ReconnectionSettings.MaxRetries))
                 {
-                    SetConnectionState(ConnectionState.Disconnected);
+                    SetConnectionStateAsync(ConnectionState.Disconnected);
                     throw;
                 }
 
@@ -766,7 +779,7 @@ public sealed class TcpMessageStream : IIggyClient
         var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.LOGIN_USER_CODE);
 
-        SetConnectionState(ConnectionState.Authenticating);
+        SetConnectionStateAsync(ConnectionState.Authenticating);
         var responseBuffer = await SendWithResponseAsync(payload, token);
 
         if (responseBuffer.Length <= 0)
@@ -775,7 +788,7 @@ public sealed class TcpMessageStream : IIggyClient
         }
 
         var userId = BinaryPrimitives.ReadInt32LittleEndian(responseBuffer.AsSpan()[..responseBuffer.Length]);
-        SetConnectionState(ConnectionState.Authenticated);
+        SetConnectionStateAsync(ConnectionState.Authenticated);
         var authResponse = new AuthResponse(userId, null);
         return authResponse;
     }
@@ -875,7 +888,7 @@ public sealed class TcpMessageStream : IIggyClient
             if (!_configuration.ReconnectionSettings.Enabled)
             {
                 _logger.LogWarning("Reconnection is disabled");
-                SetConnectionState(ConnectionState.Disconnected);
+                SetConnectionStateAsync(ConnectionState.Disconnected);
                 throw;
             }
 
@@ -897,7 +910,7 @@ public sealed class TcpMessageStream : IIggyClient
                 return await SendRawAsync(payload, token);
             }
 
-            SetConnectionState(ConnectionState.Disconnected);
+            SetConnectionStateAsync(ConnectionState.Disconnected);
             _logger.LogInformation("Reconnecting to the server");
             await ConnectAsync(token);
 
@@ -1021,7 +1034,7 @@ public sealed class TcpMessageStream : IIggyClient
     ///     Sets the connection state and fires the OnConnectionStateChanged event.
     /// </summary>
     /// <param name="newState">The new connection state</param>
-    private void SetConnectionState(ConnectionState newState)
+    private void SetConnectionStateAsync(ConnectionState newState)
     {
         if (_state == newState)
         {
@@ -1032,6 +1045,6 @@ public sealed class TcpMessageStream : IIggyClient
         _state = newState;
 
         _logger.LogInformation("Connection state changed: {PreviousState} -> {CurrentState}", previousState, newState);
-        OnConnectionStateChanged?.Invoke(this, new ConnectionStateChangedEventArgs(previousState, newState));
+        _connectionEvents.Publish(new ConnectionStateChangedEventArgs(previousState, newState));
     }
 }

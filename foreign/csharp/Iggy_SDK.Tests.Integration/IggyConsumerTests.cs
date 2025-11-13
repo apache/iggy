@@ -695,10 +695,11 @@ public class IggyConsumerTests
             .WithBatchSize(10)
             .WithPartitionId(999)
             .WithAutoCommitMode(AutoCommitMode.Disabled)
-            .SubscribeOnPollingError((sender, args) =>
+            .SubscribeOnPollingError(error =>
             {
                 errorFired = true;
-                capturedError = args.Exception;
+                capturedError = error.Exception;
+                return Task.CompletedTask;
             })
             .Build();
 
