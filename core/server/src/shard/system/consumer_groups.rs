@@ -267,12 +267,18 @@ impl IggyShard {
         group_id: &Identifier,
         client_id: u32,
     ) -> Result<(), IggyError> {
-        self.streams.with_consumer_group_by_id_mut(
+        let Some(_) = self.streams.with_consumer_group_by_id_mut(
             stream_id,
             topic_id,
             group_id,
             topics::helpers::leave_consumer_group(client_id),
-        );
+        ) else {
+            return Err(IggyError::ConsumerGroupMemberNotFound(
+                client_id,
+                group_id.clone(),
+                topic_id.clone(),
+            ));
+        };
 
         // Update ClientManager state
         let stream_id_value = self

@@ -172,11 +172,13 @@ pub fn join_consumer_group(client_id: u32) -> impl FnOnce(ComponentsById<Consume
     }
 }
 
-pub fn leave_consumer_group(client_id: u32) -> impl FnOnce(ComponentsById<ConsumerGroupRefMut>) {
+pub fn leave_consumer_group(
+    client_id: u32,
+) -> impl FnOnce(ComponentsById<ConsumerGroupRefMut>) -> Option<usize> {
     move |(root, members)| {
         let partitions = root.partitions();
         let id = root.id();
-        delete_member(id, client_id, members, partitions);
+        delete_member(id, client_id, members, partitions)
     }
 }
 
@@ -266,13 +268,12 @@ fn delete_member(
     client_id: u32,
     members: &mut ConsumerGroupMembers,
     partitions: &[usize],
-) {
+) -> Option<usize> {
     let member_id = members
         .inner()
         .shared_get()
         .iter()
-        .find_map(|(_, member)| (member.client_id == client_id).then_some(member.id))
-        .expect("delete_member: find member in consumer group slab");
+        .find_map(|(_, member)| (member.client_id == client_id).then_some(member.id))?;
     members.inner_mut().rcu(|members| {
         let mut members = mimic_members(members);
         members.remove(member_id);
@@ -283,6 +284,7 @@ fn delete_member(
         assign_partitions_to_members(id, &mut members, partitions);
         members
     });
+    Some(member_id)
 }
 
 fn assign_partitions_to_members(id: usize, members: &mut Slab<Member>, partitions: &[usize]) {
