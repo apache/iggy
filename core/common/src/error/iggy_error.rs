@@ -64,7 +64,7 @@ pub enum IggyError {
     #[error("State file corrupted")]
     StateFileCorrupted = 15,
     #[error("Invalid state entry checksum: {0}, expected: {1}, for index: {2}")]
-    InvalidStateEntryChecksum(u32, u32, u64) = 16,
+    InvalidStateEntryChecksum(u64, u64, u64) = 16,
     #[error("Cannot open database, Path: {0}")]
     CannotOpenDatabase(String) = 19,
     #[error("Resource with key: {0} was not found.")]

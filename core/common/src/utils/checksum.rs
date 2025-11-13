@@ -16,6 +16,8 @@
  * under the License.
  */
 
-pub fn calculate_checksum(data: &[u8]) -> u32 {
-    crc32fast::hash(data)
+use twox_hash::XxHash3_64;
+
+pub fn calculate_checksum(data: &[u8]) -> u64 {
+    XxHash3_64::oneshot(data)
 }

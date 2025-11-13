@@ -268,7 +268,7 @@ public class HttpMessageStream : IIggyClient
         PollingStrategy pollingStrategy, uint count, bool autoCommit, CancellationToken token = default)
     {
         var partitionIdParam = partitionId.HasValue ? $"&partition_id={partitionId.Value}" : string.Empty;
-        var url = CreateUrl($"/streams/{streamId}/topics/{topicId}/messages?consumer_id={consumer.Id}" +
+        var url = CreateUrl($"/streams/{streamId}/topics/{topicId}/messages?consumer_id={consumer.ConsumerId}" +
                             $"{partitionIdParam}&kind={pollingStrategy.Kind}&value={pollingStrategy.Value}&count={count}&auto_commit={autoCommit}");
 
         var response = await _httpClient.GetAsync(url, token);
@@ -304,7 +304,7 @@ public class HttpMessageStream : IIggyClient
     {
         var partitionIdParam = partitionId.HasValue ? $"&partition_id={partitionId.Value}" : string.Empty;
         var response = await _httpClient.GetAsync($"/streams/{streamId}/topics/{topicId}/" +
-                                                  $"consumer-offsets?consumer_id={consumer.Id}{partitionIdParam}",
+                                                  $"consumer-offsets?consumer_id={consumer.ConsumerId}{partitionIdParam}",
             token);
         if (response.IsSuccessStatusCode)
         {

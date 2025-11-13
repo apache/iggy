@@ -304,7 +304,7 @@ public class IggyConsumerBuilder
 
         if (Config.Consumer.Type == ConsumerType.ConsumerGroup)
         {
-            if (Config.Consumer.Id.Kind == IdKind.Numeric &&
+            if (Config.Consumer.ConsumerId.Kind == IdKind.Numeric &&
                 Config.CreateConsumerGroupIfNotExists &&
                 string.IsNullOrWhiteSpace(Config.ConsumerGroupName))
             {

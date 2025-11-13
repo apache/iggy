@@ -280,6 +280,13 @@ impl IggyShard {
             ));
         };
 
+        self.streams.with_consumer_group_by_id_mut(
+            stream_id,
+            topic_id,
+            group_id,
+            topics::helpers::rebalance_consumer_group(),
+        );
+
         // Update ClientManager state
         let stream_id_value = self
             .streams

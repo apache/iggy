@@ -77,7 +77,7 @@ pub async fn run(client_factory: &dyn ClientFactory) {
     .await;
     send_message_and_check_result(
         &client,
-        MessageToSend::OfSizeWithHeaders(100_000, 10_000_001),
+        MessageToSend::OfSizeWithHeaders(100_000, 64_000_001),
         Err(IggyError::TooBigMessagePayload),
     )
     .await;

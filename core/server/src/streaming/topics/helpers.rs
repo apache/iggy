@@ -182,7 +182,19 @@ pub fn leave_consumer_group(
     }
 }
 
-pub fn rebalance_consumer_group(
+pub fn rebalance_consumer_group() -> impl FnOnce(ComponentsById<ConsumerGroupRefMut>) {
+    move |(root, members)| {
+        let partitions = root.partitions();
+        let id = root.id();
+        members.inner_mut().rcu(|existing_members| {
+            let mut new_members = mimic_members(existing_members);
+            assign_partitions_to_members(id, &mut new_members, partitions);
+            new_members
+        });
+    }
+}
+
+pub fn rebalance_consumer_groups(
     partition_ids: &[usize],
 ) -> impl FnOnce(ComponentsById<TopicRefMut>) {
     move |(mut root, ..)| {
@@ -269,14 +281,22 @@ fn delete_member(
     members: &mut ConsumerGroupMembers,
     partitions: &[usize],
 ) -> Option<usize> {
-    let member_id = members
+    let member_ids: Vec<usize> = members
         .inner()
         .shared_get()
         .iter()
-        .find_map(|(_, member)| (member.client_id == client_id).then_some(member.id))?;
+        .filter_map(|(_, member)| (member.client_id == client_id).then_some(member.id))
+        .collect();
+
+    if member_ids.is_empty() {
+        return None;
+    }
+
     members.inner_mut().rcu(|members| {
         let mut members = mimic_members(members);
-        members.remove(member_id);
+        for member_id in &member_ids {
+            members.remove(*member_id);
+        }
         members.compact(|entry, _, idx| {
             entry.id = idx;
             true
@@ -284,7 +304,8 @@ fn delete_member(
         assign_partitions_to_members(id, &mut members, partitions);
         members
     });
-    Some(member_id)
+
+    Some(member_ids[0])
 }
 
 fn assign_partitions_to_members(id: usize, members: &mut Slab<Member>, partitions: &[usize]) {

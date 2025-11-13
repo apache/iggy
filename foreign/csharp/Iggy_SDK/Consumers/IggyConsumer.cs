@@ -198,8 +198,8 @@ public partial class IggyConsumer : IAsyncDisposable
             return;
         }
 
-        _consumerGroupName = _config.Consumer.Id.Kind == IdKind.String
-            ? _config.Consumer.Id.GetString()
+        _consumerGroupName = _config.Consumer.ConsumerId.Kind == IdKind.String
+            ? _config.Consumer.ConsumerId.GetString()
             : _config.ConsumerGroupName;
 
         if (string.IsNullOrEmpty(_consumerGroupName))

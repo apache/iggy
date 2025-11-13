@@ -16,8 +16,8 @@
 # under the License.
 
 @url = http://localhost:3000
-@stream_id = 1
-@topic_id = 1
+@stream_id = 0
+@topic_id = 0
 @partition_id = 0
 @consumer_group_id = 1
 @consumer_id = 1
@@ -344,7 +344,6 @@ Authorization: Bearer {{access_token}}
 Content-Type: application/json
 
 {
-  "consumer_group_id": {{consumer_group_id}},
   "name": "consumer_group_1"
 }
 

@@ -137,7 +137,7 @@ runs:
         images: ${{ steps.config.outputs.image }}
         tags: |
           type=raw,value=${{ inputs.version }}
-          type=raw,value=latest,enable=${{ steps.config.outputs.should_push == 'true' && inputs.version != 'test' && inputs.version != 'edge' }}
+          type=raw,value=latest,enable=${{ steps.config.outputs.should_push == 'true' && inputs.version != 'test' && !contains(inputs.version, 'edge') && !contains(inputs.version, 'rc') && !contains(inputs.version, 'alpha') && !contains(inputs.version, 'beta') }}
           type=sha,enable=${{ inputs.version == 'test' }}
 
     - name: Determine platforms
