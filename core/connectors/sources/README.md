@@ -27,11 +27,12 @@ Each source connector is configured in its own separate configuration file withi
 ```rust
 pub struct SourceConfig {
     pub enabled: bool,
+    pub version: u64,
     pub name: String,
     pub path: String,
     pub transforms: Option<TransformsConfig>,
     pub streams: Vec<StreamProducerConfig>,
-    pub config_format: ConfigFormat,
+    pub config_format: Option<ConfigFormat>,
     pub config: Option<serde_json::Value>,
 }
 ```
@@ -40,6 +41,7 @@ pub struct SourceConfig {
 
 ```toml
 [connectors]
+config_type = "local"
 config_dir = "path/to/connectors"
 ```
 
@@ -51,6 +53,7 @@ type = "source"
 
 # Required configuration for a source connector
 enabled = true # Toggle source on/off
+version = 0
 name = "Random source" # Name of the source
 path = "libiggy_connector_random_source" # Path to the source connector
 config_format = "toml"

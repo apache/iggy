@@ -17,8 +17,9 @@
  * under the License.
  */
 
-use crate::configs::ConnectorsConfig;
-use configs::{ConfigFormat, ConnectorsRuntimeConfig};
+use crate::configs::connectors::ConnectorsConfigProvider;
+use configs::connectors::ConfigFormat;
+use configs::runtime::ConnectorsRuntimeConfig;
 use dlopen2::wrapper::{Container, WrapperApi};
 use dotenvy::dotenv;
 use error::RuntimeError;
@@ -125,7 +126,10 @@ async fn main() -> Result<(), RuntimeError> {
 
     let iggy_clients = stream::init(config.iggy.clone()).await?;
 
-    let connectors_config = ConnectorsConfig::load_configs(&config.connectors).await?;
+    let connectors_config_provider: Box<dyn ConnectorsConfigProvider> =
+        config.connectors.clone().into();
+
+    let connectors_config = connectors_config_provider.load_configs().await?;
     let sources_config = connectors_config.sources();
     let sources = source::init(
         sources_config.clone(),

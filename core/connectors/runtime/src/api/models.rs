@@ -1,4 +1,5 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
  * regarding copyright ownership.  The ASF licenses this file
@@ -16,10 +17,8 @@
  * under the License.
  */
 
-use crate::{
-    configs::{ConfigFormat, StreamConsumerConfig, StreamProducerConfig},
-    manager::{sink::SinkInfo, source::SourceInfo},
-};
+use crate::configs::connectors::{ConfigFormat, StreamConsumerConfig, StreamProducerConfig};
+use crate::manager::{sink::SinkInfo, source::SourceInfo};
 use iggy_connector_sdk::transforms::TransformType;
 use serde::{Deserialize, Serialize};
 

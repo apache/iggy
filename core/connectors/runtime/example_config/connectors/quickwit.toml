@@ -17,6 +17,7 @@
 
 type = "sink"
 enabled = true
+version = 0
 name = "Quickwit sink 1"
 path = "target/release/libiggy_connector_quickwit_sink"
 config_format = "yaml"

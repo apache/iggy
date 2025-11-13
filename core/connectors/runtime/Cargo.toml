@@ -29,6 +29,7 @@ repository = "https://github.com/apache/iggy"
 readme = "README.md"
 
 [dependencies]
+async-trait = { workspace = true }
 axum = { workspace = true }
 axum-server = { workspace = true }
 dashmap = { workspace = true }

@@ -32,11 +32,12 @@ Each sink connector is configured in its own separate configuration file within 
 ```rust
 pub struct SinkConfig {
     pub enabled: bool,
+    pub version: u64,
     pub name: String,
     pub path: String,
     pub transforms: Option<TransformsConfig>,
     pub streams: Vec<StreamConsumerConfig>,
-    pub config_format: ConfigFormat,
+    pub config_format: Option<ConfigFormat>,
     pub config: Option<serde_json::Value>,
 }
 ```
@@ -45,6 +46,7 @@ pub struct SinkConfig {
 
 ```toml
 [connectors]
+config_type = "local"
 config_dir = "path/to/connectors"
 ```
 
@@ -56,6 +58,7 @@ type = "sink"
 
 # Required configuration for a sink connector
 enabled = true
+version = 0
 name = "Stdout sink"
 path = "target/release/libiggy_connector_stdout_sink"
 config_format = "toml"

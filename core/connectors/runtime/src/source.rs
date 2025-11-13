@@ -35,7 +35,7 @@ use std::{
 };
 use tracing::{debug, error, info, warn};
 
-use crate::configs::SourceConfig;
+use crate::configs::connectors::SourceConfig;
 use crate::{
     PLUGIN_ID, RuntimeError, SourceApi, SourceConnector, SourceConnectorPlugin,
     SourceConnectorProducer, SourceConnectorWrapper, resolve_plugin_path,
@@ -60,7 +60,10 @@ pub async fn init(
 
         let plugin_id = PLUGIN_ID.load(Ordering::Relaxed);
         let path = resolve_plugin_path(&config.path);
-        info!("Initializing source container with name: {name} ({key}), plugin: {path}",);
+        info!(
+            "Initializing source container with name: {name} ({key}), config version: {}, plugin: {path}",
+            &config.version
+        );
         let state_storage = get_state_storage(state_path, &key);
         let state = match &state_storage {
             StateStorage::File(file) => file.load().await?,
