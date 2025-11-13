@@ -24,7 +24,7 @@ use iggy_common::defaults::*;
 use iggy_common::{Permissions, UserId};
 use std::sync::Arc;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct User {
     pub id: UserId,
     pub status: UserStatus,
@@ -38,7 +38,7 @@ pub struct User {
 impl Default for User {
     fn default() -> Self {
         Self {
-            id: 1,
+            id: 0,
             status: UserStatus::Active,
             username: "user".to_string(),
             password: "secret".to_string(),

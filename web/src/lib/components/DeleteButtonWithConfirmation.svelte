@@ -9,7 +9,7 @@
   let wrapperRef: HTMLDivElement | null = $state<HTMLDivElement | null>(null);
 
   let counter = $state(7);
-  let interval: number | undefined = undefined;
+  let interval: ReturnType<typeof setInterval> | undefined = undefined;
 
   function startCountingDown() {
     if (interval) return;

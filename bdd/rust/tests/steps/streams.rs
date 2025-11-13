@@ -33,11 +33,11 @@ pub async fn given_no_streams(world: &mut GlobalContext) {
     );
 }
 
-#[when(regex = r"^I create a stream with ID (\d+) and name (.+)$")]
-pub async fn when_create_stream(world: &mut GlobalContext, stream_id: u32, stream_name: String) {
+#[when(regex = r"^I create a stream with name (.+)$")]
+pub async fn when_create_stream(world: &mut GlobalContext, stream_name: String) {
     let client = world.client.as_ref().expect("Client should be available");
     let stream = client
-        .create_stream(&stream_name, Some(stream_id))
+        .create_stream(&stream_name)
         .await
         .expect("Should be able to create stream");
 
@@ -53,18 +53,12 @@ pub async fn then_stream_created_successfully(world: &mut GlobalContext) {
     );
 }
 
-#[then(regex = r"^the stream should have ID (\d+) and name (.+)$")]
-pub async fn then_stream_has_id_and_name(
-    world: &mut GlobalContext,
-    expected_id: u32,
-    expected_name: String,
-) {
-    let stream_id = world.last_stream_id.expect("Stream should exist");
+#[then(regex = r"^the stream should have name (.+)$")]
+pub async fn then_stream_has_name(world: &mut GlobalContext, expected_name: String) {
     let stream_name = world
         .last_stream_name
         .as_ref()
         .expect("Stream should exist");
-    assert_eq!(stream_id, expected_id, "Stream should have expected ID");
     assert_eq!(
         stream_name, &expected_name,
         "Stream should have expected name"

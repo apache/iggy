@@ -29,6 +29,7 @@ impl StreamClient for ClientWrapper {
             ClientWrapper::Http(client) => client.get_stream(stream_id).await,
             ClientWrapper::Tcp(client) => client.get_stream(stream_id).await,
             ClientWrapper::Quic(client) => client.get_stream(stream_id).await,
+            ClientWrapper::WebSocket(client) => client.get_stream(stream_id).await,
         }
     }
 
@@ -38,19 +39,17 @@ impl StreamClient for ClientWrapper {
             ClientWrapper::Http(client) => client.get_streams().await,
             ClientWrapper::Tcp(client) => client.get_streams().await,
             ClientWrapper::Quic(client) => client.get_streams().await,
+            ClientWrapper::WebSocket(client) => client.get_streams().await,
         }
     }
 
-    async fn create_stream(
-        &self,
-        name: &str,
-        stream_id: Option<u32>,
-    ) -> Result<StreamDetails, IggyError> {
+    async fn create_stream(&self, name: &str) -> Result<StreamDetails, IggyError> {
         match self {
-            ClientWrapper::Iggy(client) => client.create_stream(name, stream_id).await,
-            ClientWrapper::Http(client) => client.create_stream(name, stream_id).await,
-            ClientWrapper::Tcp(client) => client.create_stream(name, stream_id).await,
-            ClientWrapper::Quic(client) => client.create_stream(name, stream_id).await,
+            ClientWrapper::Iggy(client) => client.create_stream(name).await,
+            ClientWrapper::Http(client) => client.create_stream(name).await,
+            ClientWrapper::Tcp(client) => client.create_stream(name).await,
+            ClientWrapper::Quic(client) => client.create_stream(name).await,
+            ClientWrapper::WebSocket(client) => client.create_stream(name).await,
         }
     }
 
@@ -60,6 +59,7 @@ impl StreamClient for ClientWrapper {
             ClientWrapper::Http(client) => client.update_stream(stream_id, name).await,
             ClientWrapper::Tcp(client) => client.update_stream(stream_id, name).await,
             ClientWrapper::Quic(client) => client.update_stream(stream_id, name).await,
+            ClientWrapper::WebSocket(client) => client.update_stream(stream_id, name).await,
         }
     }
 
@@ -69,6 +69,7 @@ impl StreamClient for ClientWrapper {
             ClientWrapper::Http(client) => client.delete_stream(stream_id).await,
             ClientWrapper::Tcp(client) => client.delete_stream(stream_id).await,
             ClientWrapper::Quic(client) => client.delete_stream(stream_id).await,
+            ClientWrapper::WebSocket(client) => client.delete_stream(stream_id).await,
         }
     }
 
@@ -78,6 +79,7 @@ impl StreamClient for ClientWrapper {
             ClientWrapper::Http(client) => client.purge_stream(stream_id).await,
             ClientWrapper::Tcp(client) => client.purge_stream(stream_id).await,
             ClientWrapper::Quic(client) => client.purge_stream(stream_id).await,
+            ClientWrapper::WebSocket(client) => client.purge_stream(stream_id).await,
         }
     }
 }

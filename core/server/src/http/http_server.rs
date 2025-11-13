@@ -18,33 +18,77 @@
 
 use crate::configs::http::{HttpConfig, HttpCorsConfig};
 use crate::http::diagnostics::request_diagnostics;
-use crate::http::jwt::cleaner::start_expired_tokens_cleaner;
+use crate::http::http_shard_wrapper::HttpSafeShard;
 use crate::http::jwt::jwt_manager::JwtManager;
 use crate::http::jwt::middleware::jwt_auth;
 use crate::http::metrics::metrics;
 use crate::http::shared::AppState;
 use crate::http::*;
-use crate::streaming::systems::system::SharedSystem;
+use crate::shard::IggyShard;
+use crate::shard::task_registry::ShutdownToken;
+use crate::shard::tasks::periodic::spawn_jwt_token_cleaner;
+use crate::shard::transmission::event::ShardEvent;
+use crate::streaming::persistence::persister::PersisterKind;
 use axum::extract::DefaultBodyLimit;
+use axum::extract::connect_info::Connected;
 use axum::http::Method;
 use axum::{Router, middleware};
 use axum_server::tls_rustls::RustlsConfig;
+use compio_net::TcpListener;
+use iggy_common::IggyError;
+use iggy_common::TransportProtocol;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::Arc;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::{error, info};
 
+#[derive(Debug, Clone, Copy)]
+pub struct CompioSocketAddr(pub SocketAddr);
+
+impl From<SocketAddr> for CompioSocketAddr {
+    fn from(addr: SocketAddr) -> Self {
+        CompioSocketAddr(addr)
+    }
+}
+
+impl From<CompioSocketAddr> for SocketAddr {
+    fn from(addr: CompioSocketAddr) -> Self {
+        addr.0
+    }
+}
+
+impl<'a> Connected<cyper_axum::IncomingStream<'a, TcpListener>> for CompioSocketAddr {
+    fn connect_info(target: cyper_axum::IncomingStream<'a, TcpListener>) -> Self {
+        let addr = *target.remote_addr();
+        CompioSocketAddr(addr)
+    }
+}
+
 /// Starts the HTTP API server.
 /// Returns the address the server is listening on.
-pub async fn start(config: HttpConfig, system: SharedSystem) -> SocketAddr {
+pub async fn start_http_server(
+    config: HttpConfig,
+    persister: Arc<PersisterKind>,
+    shard: Rc<IggyShard>,
+    shutdown: ShutdownToken,
+) -> Result<(), IggyError> {
+    if shard.id != 0 {
+        info!(
+            "HTTP server disabled for shard {} (only runs on shard 0)",
+            shard.id
+        );
+        panic!("HTTP server only runs on shard 0");
+    }
+
     let api_name = if config.tls.enabled {
         "HTTP API (TLS)"
     } else {
         "HTTP API"
     };
 
-    let app_state = build_app_state(&config, system).await;
+    let app_state = build_app_state(&config, persister, shard.clone()).await;
     let mut app = Router::new()
         .merge(system::router(app_state.clone(), &config.metrics))
         .merge(personal_access_tokens::router(app_state.clone()))
@@ -68,29 +112,43 @@ pub async fn start(config: HttpConfig, system: SharedSystem) -> SocketAddr {
         app = app.layer(middleware::from_fn_with_state(app_state.clone(), metrics));
     }
 
-    start_expired_tokens_cleaner(app_state.clone());
+    spawn_jwt_token_cleaner(shard.clone(), app_state.clone());
+
     app = app.layer(middleware::from_fn(request_diagnostics));
 
     if !config.tls.enabled {
-        let listener = tokio::net::TcpListener::bind(config.address.clone())
+        let listener = TcpListener::bind(config.address.clone())
             .await
             .unwrap_or_else(|_| panic!("Failed to bind to HTTP address {}", config.address));
         let address = listener
             .local_addr()
             .expect("Failed to get local address for HTTP server");
         info!("Started {api_name} on: {address}");
-        tokio::task::spawn(async move {
-            if let Err(error) = axum::serve(
-                listener,
-                app.into_make_service_with_connect_info::<SocketAddr>(),
-            )
-            .await
-            {
-                error!("Failed to start {api_name} server, error {}", error);
-            }
-        });
 
-        address
+        // Notify shard about the bound address
+        let event = ShardEvent::AddressBound {
+            protocol: TransportProtocol::Http,
+            address,
+        };
+        shard.handle_event(event).await.ok();
+
+        let service = app.into_make_service_with_connect_info::<CompioSocketAddr>();
+
+        let shutdown_token = shutdown.clone();
+        let result = cyper_axum::serve(listener, service)
+            .with_graceful_shutdown(async move { shutdown_token.wait().await })
+            .await;
+
+        match result {
+            Ok(()) => {
+                info!("{api_name} shut down gracefully");
+                Ok(())
+            }
+            Err(error) => {
+                error!("{api_name} server error: {}", error);
+                Err(IggyError::CannotBindToSocket(format!("HTTP: {}", error)))
+            }
+        }
     } else {
         let tls_config = RustlsConfig::from_pem_file(
             PathBuf::from(config.tls.cert_file),
@@ -100,32 +158,62 @@ pub async fn start(config: HttpConfig, system: SharedSystem) -> SocketAddr {
         .unwrap();
 
         let listener = std::net::TcpListener::bind(config.address).unwrap();
+        listener
+            .set_nonblocking(true)
+            .expect("Failed to set TLS listener to non-blocking");
         let address = listener
             .local_addr()
             .expect("Failed to get local address for HTTPS / TLS server");
 
         info!("Started {api_name} on: {address}");
 
-        tokio::task::spawn(async move {
-            if let Err(error) = axum_server::from_tcp_rustls(listener, tls_config)
-                .serve(app.into_make_service_with_connect_info::<SocketAddr>())
-                .await
-            {
-                error!("Failed to start {api_name} server, error: {}", error);
-            }
-        });
+        // Notify shard about the bound address
+        use crate::shard::transmission::event::ShardEvent;
+        use iggy_common::TransportProtocol;
+        let event = ShardEvent::AddressBound {
+            protocol: TransportProtocol::Http,
+            address,
+        };
+        shard.handle_event(event).await.ok();
 
-        address
+        let service = app.into_make_service_with_connect_info::<SocketAddr>();
+        let handle = axum_server::Handle::new();
+        let shutdown_handle = handle.clone();
+        let api_name_for_task = api_name;
+        shard
+            .task_registry
+            .oneshot("http_shutdown_listener")
+            .critical(false)
+            .run(move |shutdown: ShutdownToken| async move {
+                shutdown.wait().await;
+                info!("Initiating graceful shutdown for {api_name_for_task}");
+                shutdown_handle.graceful_shutdown(None);
+                Ok(())
+            })
+            .spawn();
+
+        let server = axum_server::from_tcp_rustls(listener, tls_config).handle(handle);
+        match server.serve(service).await {
+            Ok(()) => {
+                info!("{api_name} shut down gracefully");
+                Ok(())
+            }
+            Err(error) => {
+                error!("Failed to start {api_name} server, error: {}", error);
+                Err(IggyError::CannotBindToSocket(format!("HTTPS: {}", error)))
+            }
+        }
     }
 }
 
-async fn build_app_state(config: &HttpConfig, system: SharedSystem) -> Arc<AppState> {
+async fn build_app_state(
+    config: &HttpConfig,
+    persister: Arc<PersisterKind>,
+    shard: Rc<IggyShard>,
+) -> Arc<AppState> {
     let tokens_path;
-    let persister;
     {
-        let system = system.read().await;
-        tokens_path = system.config.get_state_tokens_path();
-        persister = system.storage.persister.clone();
+        tokens_path = shard.config.system.get_state_tokens_path();
     }
 
     let jwt_manager = JwtManager::from_config(persister, &tokens_path, &config.jwt);
@@ -140,7 +228,7 @@ async fn build_app_state(config: &HttpConfig, system: SharedSystem) -> Arc<AppSt
 
     Arc::new(AppState {
         jwt_manager,
-        system,
+        shard: HttpSafeShard::new(shard),
     })
 }
 

@@ -18,7 +18,7 @@
 [package]
 name = "iggy-bench-dashboard-server"
 license = "Apache-2.0"
-version = "0.4.0"
+version = "0.5.0-edge.3"
 edition = "2024"
 
 [dependencies]
@@ -30,9 +30,9 @@ bench-report = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
 clap = { workspace = true }
 dashmap = { workspace = true }
-file-operation = "0.8.4"
+file-operation = "0.8.6"
 notify = "8.2.0"
-octocrab = "0.45.0"
+octocrab = "0.47.1"
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 tempfile = { workspace = true }

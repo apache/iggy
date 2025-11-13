@@ -21,36 +21,41 @@ use rand::Rng;
 use std::collections::HashMap;
 use std::str::FromStr;
 
-const PROD_STREAM_ID: u32 = 1;
-const TEST_STREAM_ID: u32 = 2;
-const DEV_STREAM_ID: u32 = 3;
+const PROD_STREAM_NAME: &str = "prod";
+const TEST_STREAM_NAME: &str = "test";
+const DEV_STREAM_NAME: &str = "dev";
 
 pub async fn seed(client: &IggyClient) -> Result<(), IggyError> {
-    create_streams(client).await?;
-    create_topics(client).await?;
-    send_messages(client).await?;
+    let streams = create_streams(client).await?;
+    create_topics(client, &streams).await?;
+    send_messages(client, &streams).await?;
     Ok(())
 }
 
-async fn create_streams(client: &IggyClient) -> Result<(), IggyError> {
-    client.create_stream("prod", Some(PROD_STREAM_ID)).await?;
-    client.create_stream("test", Some(TEST_STREAM_ID)).await?;
-    client.create_stream("dev", Some(DEV_STREAM_ID)).await?;
-    Ok(())
+async fn create_streams(client: &IggyClient) -> Result<Vec<(String, u32)>, IggyError> {
+    let mut streams = Vec::new();
+
+    let prod_stream = client.create_stream(PROD_STREAM_NAME).await?;
+    streams.push((PROD_STREAM_NAME.to_string(), prod_stream.id));
+
+    let test_stream = client.create_stream(TEST_STREAM_NAME).await?;
+    streams.push((TEST_STREAM_NAME.to_string(), test_stream.id));
+
+    let dev_stream = client.create_stream(DEV_STREAM_NAME).await?;
+    streams.push((DEV_STREAM_NAME.to_string(), dev_stream.id));
+
+    Ok(streams)
 }
 
-async fn create_topics(client: &IggyClient) -> Result<(), IggyError> {
-    let streams = [PROD_STREAM_ID, TEST_STREAM_ID, DEV_STREAM_ID];
-    for stream_id in streams {
-        let stream_id = stream_id.try_into()?;
+async fn create_topics(client: &IggyClient, streams: &[(String, u32)]) -> Result<(), IggyError> {
+    for (stream_name, _stream_id) in streams {
         client
             .create_topic(
-                &stream_id,
+                &Identifier::named(stream_name).unwrap(),
                 "orders",
                 1,
                 Default::default(),
                 None,
-                None,
                 IggyExpiry::NeverExpire,
                 MaxTopicSize::ServerDefault,
             )
@@ -58,12 +63,11 @@ async fn create_topics(client: &IggyClient) -> Result<(), IggyError> {
 
         client
             .create_topic(
-                &stream_id,
+                &Identifier::named(stream_name).unwrap(),
                 "users",
                 2,
                 Default::default(),
                 None,
-                None,
                 IggyExpiry::NeverExpire,
                 MaxTopicSize::ServerDefault,
             )
@@ -71,12 +75,11 @@ async fn create_topics(client: &IggyClient) -> Result<(), IggyError> {
 
         client
             .create_topic(
-                &stream_id,
+                &Identifier::named(stream_name).unwrap(),
                 "notifications",
                 3,
                 Default::default(),
                 None,
-                None,
                 IggyExpiry::NeverExpire,
                 MaxTopicSize::ServerDefault,
             )
@@ -84,12 +87,11 @@ async fn create_topics(client: &IggyClient) -> Result<(), IggyError> {
 
         client
             .create_topic(
-                &stream_id,
+                &Identifier::named(stream_name).unwrap(),
                 "payments",
                 2,
                 Default::default(),
                 None,
-                None,
                 IggyExpiry::NeverExpire,
                 MaxTopicSize::ServerDefault,
             )
@@ -97,11 +99,10 @@ async fn create_topics(client: &IggyClient) -> Result<(), IggyError> {
 
         client
             .create_topic(
-                &stream_id,
+                &Identifier::named(stream_name).unwrap(),
                 "deliveries",
                 1,
                 Default::default(),
-                None,
                 None,
                 IggyExpiry::NeverExpire,
                 MaxTopicSize::ServerDefault,
@@ -111,9 +112,8 @@ async fn create_topics(client: &IggyClient) -> Result<(), IggyError> {
     Ok(())
 }
 
-async fn send_messages(client: &IggyClient) -> Result<(), IggyError> {
+async fn send_messages(client: &IggyClient, streams: &[(String, u32)]) -> Result<(), IggyError> {
     let mut rng = rand::rng();
-    let streams = [PROD_STREAM_ID, TEST_STREAM_ID, DEV_STREAM_ID];
     let partitioning = Partitioning::balanced();
 
     let message_batches_range = 100..=1000;
@@ -122,18 +122,19 @@ async fn send_messages(client: &IggyClient) -> Result<(), IggyError> {
     let mut total_messages_sent = 0;
     let mut total_batches_sent = 0;
 
-    for (stream_idx, stream_id) in streams.iter().enumerate() {
-        let stream_id_identifier = (*stream_id).try_into()?;
+    for (stream_idx, (stream_name, stream_id)) in streams.iter().enumerate() {
+        let stream_id_identifier = Identifier::named(stream_name).unwrap();
         let topics = client.get_topics(&stream_id_identifier).await?;
         tracing::info!(
-            "Processing stream {} ({}/{})",
+            "Processing stream {} ({}) ({}/{})",
+            stream_name,
             stream_id,
             stream_idx + 1,
             streams.len()
         );
 
         for (topic_idx, topic) in topics.iter().enumerate() {
-            let topic_id = topic.id.try_into()?;
+            let topic_id_identifier = Identifier::named(&topic.name).unwrap();
 
             let message_batches = rng.random_range(message_batches_range.clone());
             tracing::info!(
@@ -183,7 +184,7 @@ async fn send_messages(client: &IggyClient) -> Result<(), IggyError> {
                 client
                     .send_messages(
                         &stream_id_identifier,
-                        &topic_id,
+                        &topic_id_identifier,
                         &partitioning,
                         &mut messages,
                     )

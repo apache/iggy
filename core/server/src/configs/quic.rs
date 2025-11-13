@@ -37,6 +37,15 @@ pub struct QuicConfig {
     #[serde_as(as = "DisplayFromStr")]
     pub max_idle_timeout: IggyDuration,
     pub certificate: QuicCertificateConfig,
+    pub socket: QuicSocketConfig,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct QuicSocketConfig {
+    pub override_defaults: bool,
+    pub recv_buffer_size: IggyByteSize,
+    pub send_buffer_size: IggyByteSize,
+    pub keepalive: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]

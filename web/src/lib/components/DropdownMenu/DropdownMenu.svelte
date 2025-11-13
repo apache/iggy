@@ -2,7 +2,6 @@
   import { tooltip } from '$lib/actions/tooltip';
   import type { Placement } from '@floating-ui/dom';
 
-
   interface Props {
     class?: string;
     placement: Placement;
@@ -10,12 +9,7 @@
     children?: import('svelte').Snippet<[any]>;
   }
 
-  let {
-    class: className = '',
-    placement,
-    trigger,
-    children
-  }: Props = $props();
+  let { class: className = '', placement, trigger, children }: Props = $props();
 
   let tooltipRef = $state<HTMLDivElement | null>(null);
 
@@ -27,7 +21,7 @@
 
   <div class="tooltip" bind:this={tooltipRef}>
     <div class="z-50">
-      {@render children?.({ close: closeTooltip, })}
+      {@render children?.({ close: closeTooltip })}
     </div>
   </div>
 </div>
@@ -42,7 +36,7 @@
           }
         }}
         class={twMerge(
-          ' grid grid-cols-[20px,1fr] gap-x-1 rounded-md items-center w-full px-2 py-2 text-sm text-color cursor-default',
+          ' grid grid-cols-[20px_1fr] gap-x-1 rounded-md items-center w-full px-2 py-2 text-sm text-color cursor-default',
           action && 'hoverable cursor-pointer'
         )}
       >

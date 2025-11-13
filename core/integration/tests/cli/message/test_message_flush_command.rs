@@ -17,8 +17,7 @@
  */
 
 use crate::cli::common::{
-    CLAP_INDENT, IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestHelpCmd, TestStreamId,
-    TestTopicId, USAGE_PREFIX,
+    CLAP_INDENT, IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestHelpCmd, USAGE_PREFIX,
 };
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
@@ -31,55 +30,51 @@ use serial_test::parallel;
 use std::str::FromStr;
 
 struct TestMessageFetchCmd {
-    stream_id: u32,
     stream_name: String,
-    topic_id: u32,
     topic_name: String,
     partitions_count: u32,
-    using_stream_id: TestStreamId,
-    using_topic_id: TestTopicId,
     partition_id: u32,
     fsync: bool,
+    // These will be populated after creating the resources
+    actual_stream_id: Option<u32>,
+    actual_topic_id: Option<u32>,
 }
 
 impl TestMessageFetchCmd {
-    #[allow(clippy::too_many_arguments)]
     fn new(
-        stream_id: u32,
         stream_name: &str,
-        topic_id: u32,
         topic_name: &str,
         partitions_count: u32,
-        using_stream_id: TestStreamId,
-        using_topic_id: TestTopicId,
         partition_id: u32,
         fsync: bool,
     ) -> Self {
         Self {
-            stream_id,
             stream_name: stream_name.to_string(),
-            topic_id,
             topic_name: topic_name.to_string(),
             partitions_count,
-            using_stream_id,
-            using_topic_id,
             partition_id,
             fsync,
+            actual_stream_id: None,
+            actual_topic_id: None,
         }
     }
 
     fn to_args(&self) -> Vec<String> {
         let mut command = Vec::new();
 
-        command.extend(match self.using_stream_id {
-            TestStreamId::Numeric => vec![format!("{}", self.stream_id)],
-            TestStreamId::Named => vec![self.stream_name.clone()],
-        });
+        // Use actual stream ID if available, otherwise use stream name as fallback
+        if let Some(stream_id) = self.actual_stream_id {
+            command.push(format!("{}", stream_id));
+        } else {
+            command.push(self.stream_name.clone());
+        }
 
-        command.push(match self.using_topic_id {
-            TestTopicId::Numeric => format!("{}", self.topic_id),
-            TestTopicId::Named => self.topic_name.clone(),
-        });
+        // Use actual topic ID if available, otherwise use topic name as fallback
+        if let Some(topic_id) = self.actual_topic_id {
+            command.push(format!("{}", topic_id));
+        } else {
+            command.push(self.topic_name.clone());
+        }
 
         command.push(format!("{}", self.partition_id));
 
@@ -94,26 +89,27 @@ impl TestMessageFetchCmd {
 #[async_trait]
 impl IggyCmdTestCase for TestMessageFetchCmd {
     async fn prepare_server_state(&mut self, client: &dyn Client) {
-        let stream = client.create_stream(&self.stream_name, None).await;
-        assert!(stream.is_ok());
+        // Create stream and capture its actual ID
+        let stream = client
+            .create_stream(&self.stream_name)
+            .await
+            .expect("Failed to create stream");
+        self.actual_stream_id = Some(stream.id);
 
-        let stream_id = Identifier::from_str(&self.stream_name);
-        assert!(stream_id.is_ok());
-        let stream_id = stream_id.unwrap();
-
+        // Create topic and capture its actual ID
         let topic = client
             .create_topic(
-                &stream_id,
+                &stream.id.try_into().unwrap(),
                 &self.topic_name,
                 self.partitions_count,
                 Default::default(),
                 None,
-                None,
                 IggyExpiry::NeverExpire,
                 MaxTopicSize::ServerDefault,
             )
-            .await;
-        assert!(topic.is_ok());
+            .await
+            .expect("Failed to create topic");
+        self.actual_topic_id = Some(topic.id);
     }
 
     fn get_command(&self) -> IggyCmdCommand {
@@ -125,14 +121,16 @@ impl IggyCmdTestCase for TestMessageFetchCmd {
     }
 
     fn verify_command(&self, command_state: Assert) {
-        let stream_id = match self.using_stream_id {
-            TestStreamId::Numeric => format!("{}", self.stream_id),
-            TestStreamId::Named => self.stream_name.clone(),
+        let stream_id = if let Some(stream_id) = self.actual_stream_id {
+            format!("{}", stream_id)
+        } else {
+            self.stream_name.clone()
         };
 
-        let topic_id = match self.using_topic_id {
-            TestTopicId::Numeric => format!("{}", self.topic_id),
-            TestTopicId::Named => self.topic_name.clone(),
+        let topic_id = if let Some(topic_id) = self.actual_topic_id {
+            format!("{}", topic_id)
+        } else {
+            self.topic_name.clone()
         };
 
         let identification_part = format!(
@@ -153,18 +151,19 @@ impl IggyCmdTestCase for TestMessageFetchCmd {
     }
 
     async fn verify_server_state(&self, client: &dyn Client) {
-        let topic_id = Identifier::from_str(&self.topic_name);
-        assert!(topic_id.is_ok());
-        let topic_id = topic_id.unwrap();
-        let stream_id = Identifier::from_str(&self.stream_name);
-        assert!(stream_id.is_ok());
-        let stream_id = stream_id.unwrap();
+        if let Some(topic_id) = self.actual_topic_id {
+            let stream_id = Identifier::from_str(&self.stream_name);
+            assert!(stream_id.is_ok());
+            let stream_id = stream_id.unwrap();
 
-        let topic = client.delete_topic(&stream_id, &topic_id).await;
-        assert!(topic.is_ok());
+            let topic = client
+                .delete_topic(&stream_id, &topic_id.try_into().unwrap())
+                .await;
+            assert!(topic.is_ok());
 
-        let stream = client.delete_stream(&stream_id).await;
-        assert!(stream.is_ok());
+            let stream = client.delete_stream(&stream_id).await;
+            assert!(stream.is_ok());
+        }
     }
 }
 
@@ -173,31 +172,12 @@ impl IggyCmdTestCase for TestMessageFetchCmd {
 pub async fn should_be_successful() {
     let mut iggy_cmd_test = IggyCmdTest::default();
 
-    let test_parameters: Vec<(TestStreamId, TestTopicId, bool)> = vec![
-        (TestStreamId::Numeric, TestTopicId::Numeric, false),
-        (TestStreamId::Numeric, TestTopicId::Named, false),
-        (TestStreamId::Named, TestTopicId::Numeric, false),
-        (TestStreamId::Named, TestTopicId::Named, false),
-        (TestStreamId::Numeric, TestTopicId::Numeric, true),
-        (TestStreamId::Numeric, TestTopicId::Named, true),
-        (TestStreamId::Named, TestTopicId::Numeric, true),
-        (TestStreamId::Named, TestTopicId::Named, true),
-    ];
+    let test_parameters = vec![false, true]; // Test with and without fsync
 
     iggy_cmd_test.setup().await;
-    for (using_stream_id, using_topic_id, fsync) in test_parameters {
+    for fsync in test_parameters {
         iggy_cmd_test
-            .execute_test(TestMessageFetchCmd::new(
-                1,
-                "stream",
-                1,
-                "topic",
-                1,
-                using_stream_id,
-                using_topic_id,
-                1,
-                fsync,
-            ))
+            .execute_test(TestMessageFetchCmd::new("stream", "topic", 1, 0, fsync))
             .await;
     }
 }

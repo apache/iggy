@@ -38,7 +38,6 @@ type ConsumerGroupMember struct {
 type CreateConsumerGroupRequest struct {
 	StreamId        Identifier `json:"streamId"`
 	TopicId         Identifier `json:"topicId"`
-	ConsumerGroupId *uint32    `json:"consumerGroupId"`
 	Name            string     `json:"name"`
 }
 

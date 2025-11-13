@@ -32,6 +32,8 @@ const schema = z.object({
   password: z.string().min(4)
 });
 
+type FormSchema = z.infer<typeof schema>;
+
 export const load = async () => {
   const form = await superValidate(zod(schema));
 
@@ -58,9 +60,7 @@ export const actions = {
       return message(form, 'Username or password is not valid', { status: 403 });
     }
 
-    const {
-      access_token
-    } = (await getJson(result)) as any;
+    const { access_token } = (await getJson(result)) as any;
 
     cookies.set(tokens.accessToken, access_token.token, {
       path: '/',

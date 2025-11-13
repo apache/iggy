@@ -168,50 +168,47 @@ export class IggyConnection extends EventEmitter {
       this.waitingResponseEnd
     );
 
-    if (this.waitingResponseEnd) {
+    // Append new data to any buffered data
+    if (this.waitingResponseEnd && this.readBuffers.length > 0) {
       data = Buffer.concat([this.readBuffers, data]);
     }
 
-    if (data.length < 8) {
-      this.socket.unshift(data);
-      return;
+    // Keep processing while we have enough data
+    let offset = 0;
+
+    while (offset < data.length) {
+      const remaining = data.length - offset;
+
+      // Need at least 8 bytes for the header (4 bytes status + 4 bytes length)
+      if (remaining < 8) {
+        // Buffer the incomplete header and wait for more data
+        this.waitingResponseEnd = true;
+        this.readBuffers = data.subarray(offset);
+        return;
+      }
+
+      // Read the header
+      const responseSize = data.readUInt32LE(offset + 4);
+      const totalSize = 8 + responseSize;
+
+      // Check if we have the complete response (header + payload)
+      if (remaining < totalSize) {
+        // Buffer the incomplete response and wait for more data
+        this.waitingResponseEnd = true;
+        this.readBuffers = data.subarray(offset);
+        return;
+      }
+
+      // We have a complete response, extract it and emit
+      const response = data.subarray(offset, offset + totalSize);
+      this.emit('response', response);
+
+      // Move to the next response
+      offset += totalSize;
     }
 
-    /**
-     * data[0:4] hold response status code
-     * const status = data.readUInt32LE(0);
-     * data[4:8] hold response length
-     */
-    const responseSize = data.readUInt32LE(4);
-
-    /** response is just head, no payload */
-    if (responseSize === 0 && data.length === 8) {
-      this.emit('response', data);
-      return;
-    }
-
-    const payloadLength = data.length - 8;
-
-    /** payload is complete */
-    if (payloadLength === responseSize) {
-      this.emit('response', data);
-      this._endResponseWait();
-      return;
-    }
-
-    /** payload is incomplete, buffering until next data event */
-    if (payloadLength < responseSize) {
-      this.waitingResponseEnd = true;
-      this.readBuffers = data;
-      return;
-    }
-
-    /** payload is bigger than expected, cut response and unshift extra data  */
-    if (payloadLength > responseSize) {
-      this.emit('response', data.subarray(0, 8 + responseSize));
-      this._endResponseWait();
-      this.socket.unshift(data.subarray(8 + responseSize));
-    }
+    // All data processed, reset buffers
+    this._endResponseWait();
   }
 
   writeCommand(command: number, payload: Buffer): boolean {

@@ -17,32 +17,19 @@
 
 package binaryserialization
 
-import (
-	"encoding/binary"
-)
-
 type TcpCreateStreamRequest struct {
 	Name     string
-	StreamId *uint32
 }
 
 const (
-	streamIDOffset   = 0
-	nameLengthOffset = 4
-	payloadOffset    = 5
+    nameLengthOffset = 0
+    payloadOffset    = 1
 )
 
 func (request *TcpCreateStreamRequest) Serialize() []byte {
-	if request.StreamId == nil {
-		request.StreamId = new(uint32)
-	}
-
-	nameLength := len(request.Name)
-	serialized := make([]byte, payloadOffset+nameLength)
-
-	binary.LittleEndian.PutUint32(serialized[streamIDOffset:], *request.StreamId)
-	serialized[nameLengthOffset] = byte(nameLength)
-	copy(serialized[payloadOffset:], []byte(request.Name))
-
-	return serialized
+    nameLength := len(request.Name)
+    serialized := make([]byte, payloadOffset+nameLength)
+    serialized[nameLengthOffset] = byte(nameLength)
+    copy(serialized[payloadOffset:], []byte(request.Name))
+    return serialized
 }

@@ -69,6 +69,11 @@ components:
       - "rust-binary-protocol"
       - "rust-server"
       - "rust-tools"
+      - "rust-cli"
+      - "rust-bench"
+      - "rust-connectors"
+      - "rust-mcp"
+      - "rust-integration"
       - "ci-infrastructure"  # CI changes trigger full regression
     paths:
       - "Dockerfile*"

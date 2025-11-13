@@ -25,11 +25,11 @@ using Apache.Iggy.JsonConverters;
 namespace Apache.Iggy.Messages;
 
 [JsonConverter(typeof(MessageConverter))]
-public readonly struct Message
+public class Message
 {
     public required MessageHeader Header { get; init; }
-    public required byte[] Payload { get; init; }
-    public Dictionary<HeaderKey, HeaderValue>? UserHeaders { get; init; }
+    public required byte[] Payload { get; set; }
+    public Dictionary<HeaderKey, HeaderValue>? UserHeaders { get; set; }
 
     public Message()
     {

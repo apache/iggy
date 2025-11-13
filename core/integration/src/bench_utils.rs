@@ -37,6 +37,7 @@ pub fn run_bench_and_wait_for_finish(
     bench: &str,
     amount_of_data_to_process: IggyByteSize,
 ) {
+    #[allow(deprecated)]
     let mut command = Command::cargo_bin("iggy-bench").unwrap();
 
     let mut stderr_file_path = None;

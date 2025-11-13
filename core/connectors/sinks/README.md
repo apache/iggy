@@ -27,7 +27,7 @@ pub trait Sink: Send + Sync {
 
 ## Configuration
 
-Sink is configured in the default `config` file used by runtime. Each sink configuration, is part of the map of `<String, SinkConfig>`, which can be represented using toml, json, or yaml.
+Each sink connector is configured in its own separate configuration file within the connectors directory specified in the main runtime config.
 
 ```rust
 pub struct SinkConfig {
@@ -41,18 +41,27 @@ pub struct SinkConfig {
 }
 ```
 
-Below is the example configuration for a sink connector, using `stdout` as it's unique identifier:
+**Main runtime config (config.toml):**
 
 ```toml
+[connectors]
+config_dir = "path/to/connectors"
+```
+
+**Sink connector config (connectors/stdout.toml):**
+
+```toml
+# Type of connector (sink or source)
+type = "sink"
+
 # Required configuration for a sink connector
-[sinks.stdout]
 enabled = true
 name = "Stdout sink"
 path = "target/release/libiggy_connector_stdout_sink"
 config_format = "toml"
 
 # Collection of the streams from which messages are consumed
-[[sinks.stdout.streams]]
+[[streams]]
 stream = "example_stream"
 topics = ["example_topic"]
 schema = "json"
@@ -61,15 +70,15 @@ poll_interval = "5ms"
 consumer_group = "stdout_sink_connector"
 
 # Custom configuration for the sink connector, deserialized to type T from `config` field
-[sinks.stdout.config]
+[config]
 print_payload = true
 
 # Optional data transformation(s) to be applied after consuming messages from the stream
-[sinks.stdout.transforms.add_fields]
+[transforms.add_fields]
 enabled = true
 
 # Collection of the fields transforms to be applied after consuming messages from the stream
-[[sinks.stdout.transforms.add_fields.fields]]
+[[transforms.add_fields.fields]]
 key = "message"
 value.static = "hello"
 ```
@@ -207,7 +216,7 @@ While the schema of messages (that will be consumed from the Iggy stream), canno
 
 Keep in mind, that it might be sometimes difficult/impossible e.g. to transform one format to another e.g. JSON to SBE or so, and in such a case, the consumed messages will be ignored.
 
-Eventually, compile the source code and update the runtime configuration file using the example config above (`config.toml` file by default, unless you prefer `yaml` or `json` format instead - just make sure that `path` points to the existing plugin).
+Eventually, compile the source code and create a separate connector configuration file in the connectors directory (as specified in the main runtime `config.toml`).  Make sure that `path` points to the existing plugin.
 
 And that's all, enjoy using the sink connector!
 

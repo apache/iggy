@@ -35,7 +35,7 @@ pub struct Permissions {
     pub global: GlobalPermissions,
 
     /// Stream permissions are applied to a specific stream.
-    pub streams: Option<AHashMap<u32, StreamPermissions>>,
+    pub streams: Option<AHashMap<usize, StreamPermissions>>,
 }
 
 /// `GlobalPermissions` are applied to all streams without a need to specify them one by one in the `streams` field.
@@ -142,7 +142,7 @@ pub struct StreamPermissions {
     pub send_messages: bool,
 
     /// The `topics` field allows to define the granular permissions for each topic of a stream.
-    pub topics: Option<AHashMap<u32, TopicPermissions>>,
+    pub topics: Option<AHashMap<usize, TopicPermissions>>,
 }
 
 /// `TopicPermissions` are applied to a specific topic of a stream. This is the lowest level of permissions.
@@ -237,7 +237,7 @@ impl BytesSerializable for Permissions {
             let streams_count = streams.len();
             let mut current_stream = 1;
             for (stream_id, stream) in streams {
-                bytes.put_u32_le(*stream_id);
+                bytes.put_u32_le(*stream_id as u32);
                 bytes.put_u8(if stream.manage_stream { 1 } else { 0 });
                 bytes.put_u8(if stream.read_stream { 1 } else { 0 });
                 bytes.put_u8(if stream.manage_topics { 1 } else { 0 });
@@ -249,7 +249,7 @@ impl BytesSerializable for Permissions {
                     let topics_count = topics.len();
                     let mut current_topic = 1;
                     for (topic_id, topic) in topics {
-                        bytes.put_u32_le(*topic_id);
+                        bytes.put_u32_le(*topic_id as u32);
                         bytes.put_u8(if topic.manage_topic { 1 } else { 0 });
                         bytes.put_u8(if topic.read_topic { 1 } else { 0 });
                         bytes.put_u8(if topic.poll_messages { 1 } else { 0 });
@@ -296,7 +296,7 @@ impl BytesSerializable for Permissions {
         if bytes.get_u8() == 1 {
             let mut streams_map = AHashMap::new();
             loop {
-                let stream_id = bytes.get_u32_le();
+                let stream_id = bytes.get_u32_le() as usize;
                 let manage_stream = bytes.get_u8() == 1;
                 let read_stream = bytes.get_u8() == 1;
                 let manage_topics = bytes.get_u8() == 1;
@@ -307,7 +307,7 @@ impl BytesSerializable for Permissions {
                 if bytes.get_u8() == 1 {
                     let mut topics_map = AHashMap::new();
                     loop {
-                        let topic_id = bytes.get_u32_le();
+                        let topic_id = bytes.get_u32_le() as usize;
                         let manage_topic = bytes.get_u8() == 1;
                         let read_topic = bytes.get_u8() == 1;
                         let poll_messages = bytes.get_u8() == 1;

@@ -46,7 +46,7 @@ impl TypedBenchmarkProducer {
         client_factory: Arc<dyn ClientFactory>,
         benchmark_kind: BenchmarkKind,
         producer_id: u32,
-        stream_id: u32,
+        stream_id: String,
         partitions: u32,
         messages_per_batch: BenchmarkNumericParameter,
         message_size: BenchmarkNumericParameter,

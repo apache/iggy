@@ -22,7 +22,7 @@ pub trait Source: Send + Sync {
 
 ## Configuration
 
-Source is configured in the default `config` file used by runtime. Each source configuration, is part of the map of `<String, SourceConfig>`, which can be represented using toml, json, or yaml.
+Each source connector is configured in its own separate configuration file within the connectors directory specified in the main runtime config.
 
 ```rust
 pub struct SourceConfig {
@@ -36,18 +36,27 @@ pub struct SourceConfig {
 }
 ```
 
-Below is the example configuration for a source connector, using `random` as it's unique identifier:
+**Main runtime config (config.toml):**
 
 ```toml
+[connectors]
+config_dir = "path/to/connectors"
+```
+
+**Source connector config (connectors/random.toml):**
+
+```toml
+# Type of connector (sink or source)
+type = "source"
+
 # Required configuration for a source connector
-[sources.random]
 enabled = true # Toggle source on/off
 name = "Random source" # Name of the source
 path = "libiggy_connector_random_source" # Path to the source connector
 config_format = "toml"
 
 # Collection of the streams to which the produced messages are sent
-[[sources.random.streams]]
+[[streams]]
 stream = "example_stream"
 topic = "example_topic"
 schema = "json"
@@ -55,15 +64,15 @@ batch_length = 100
 linger_time = "5ms"
 
 # Custom configuration for the source connector, deserialized to type T from `config` field
-[sources.random.config]
+[config]
 messages_count = 10
 
 # Optional data transformation(s) to be applied before sending messages to the stream
-[sources.random.transforms.add_fields]
+[transforms.add_fields]
 enabled = true
 
 # Collection of the fields transforms to be applied before sending messages to the stream
-[[sources.random.transforms.add_fields.fields]]
+[[transforms.add_fields.fields]]
 key = "message"
 value.static = "hello"
 ```
@@ -224,7 +233,7 @@ It's also important to note, that the supported format(s) might vary depending o
 
 While the final schema of messages (that will be appended to the Iggy stream), can be controlled with the built-in configuration (the particular `StreamEncoder` will be used), keep in mind, that it might be sometimes difficult/impossible e.g. to transform one format to another e.g. JSON to SBE or so, and in such a case, the produced messages will be ignored.
 
-Eventually, compile the source code and update the runtime configuration file using the example config above (`config.toml` file by default, unless you prefer `yaml` or `json` format instead - just make sure that `path` points to the existing plugin).
+Eventually, compile the source code and create a separate connector configuration file in the connectors directory (as specified in the main runtime `config.toml`). Make sure that `path` points to the existing plugin.
 
 And before starting the runtime, do not forget to create the specified stream and topic e.g. via Iggy CLI.
 

@@ -19,11 +19,11 @@ The [docker image](https://hub.docker.com/r/apache/iggy-connect) is available, a
 
 ## Quick Start
 
-1. Build the project in release mode (or debug, and update the connectors paths in the config accordingly), and make sure that the plugins specified in `core/connectors/example_config.toml` under `path` are available. You can use either of `toml`, `json` or `yaml` formats for the configuration file.
+1. Build the project in release mode (or debug, and update the connectors paths in the config accordingly), and make sure that the plugins specified in `core/connectors/runtime/example_config/connectors/` directory under `path` are available. The configuration must be provided in `toml` format.
 
 2. Run `docker compose up -d` from `/examples/rust/src/sink-data-producer` which will start the Quickwit server to be used by an example sink connector. At this point, you can access the Quickwit UI at [http://localhost:7280](http://localhost:7280) - check this dashboard again later on, after the `events` index will be created.
 
-3. Set environment variable `IGGY_CONNECTORS_CONFIG_PATH=core/connectors/runtime/example_config.toml` (adjust the path as needed) pointing to the runtime configuration file.
+3. Set environment variable `IGGY_CONNECTORS_CONFIG_PATH=core/connectors/runtime/example_config/config.toml` (adjust the path as needed) pointing to the runtime configuration file.
 
 4. Start the Iggy server and invoke the following commands via Iggy CLI to create the example streams and topics used by the sample connectors.
 

@@ -201,7 +201,7 @@ async fn create_user(
             .expect("Topic does not exist");
 
         topic_permissions.insert(
-            topic.id,
+            topic.id as usize,
             TopicPermissions {
                 read_topic: true,
                 poll_messages: true,
@@ -212,7 +212,7 @@ async fn create_user(
 
     let mut streams_permissions = AHashMap::new();
     streams_permissions.insert(
-        stream.id,
+        stream.id as usize,
         StreamPermissions {
             read_stream: true,
             topics: Some(topic_permissions),

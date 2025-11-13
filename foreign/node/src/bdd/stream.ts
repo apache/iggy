@@ -27,9 +27,9 @@ Given('I have no streams in the system', async function (this: TestWorld) {
 });
 
 When(
-  'I create a stream with ID {int} and name {string}',
-  async function (this: TestWorld, streamId: number, name: string) {
-    this.stream = await this.client.stream.create({ streamId, name })
+  'I create a stream with name {string}',
+  async function (this: TestWorld, name: string) {
+    this.stream = await this.client.stream.create({ name })
     return this.stream;
   }
 );
@@ -39,9 +39,8 @@ Then('the stream should be created successfully', function () {
 });
 
 Then(
-  'the stream should have ID {int} and name {string}',
-  async function (this: TestWorld, streamId: number, name: string) {
-    assert.equal(this.stream.id, streamId);
+  'the stream should have name {string}',
+  async function (this: TestWorld, name: string) {
     assert.equal(this.stream.name, name);
   }
 );

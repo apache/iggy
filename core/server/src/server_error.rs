@@ -16,26 +16,26 @@
  * under the License.
  */
 
+use compio_quic::{ConnectionError as QuicConnectionError, ReadError, WriteError};
 use error_set::error_set;
-use quinn::{ConnectionError as QuicConnectionError, ReadToEndError, WriteError};
 use std::array::TryFromSliceError;
-use tokio::io;
+use std::io;
 
 error_set!(
-    ServerError = ConfigError || ArchiverError || ConnectionError || LogError || CompatError || QuicError;
+    ServerError := ConfigError || ArchiverError || ConnectionError || LogError || CompatError || QuicError
 
-    IoError = {
+    IoError := {
         #[display("IO error")]
         IoError(io::Error),
 
         #[display("Write error")]
         WriteError(WriteError),
 
-        #[display("Read to end error")]
-        ReadToEndError(ReadToEndError)
-    };
+        #[display("Read error")]
+        ReadToEndError(ReadError)
+    }
 
-    ConfigError = {
+    ConfigError := {
         #[display("Invalid configuration provider: {}", provider_type)]
         InvalidConfigurationProvider { provider_type: String },
 
@@ -47,9 +47,9 @@ error_set!(
 
         #[display("Cache config validation failure")]
         CacheConfigValidationFailure,
-    };
+    }
 
-    ArchiverError = {
+    ArchiverError := {
         #[display("File to archive not found: {}", file_path)]
         FileToArchiveNotFound { file_path: String },
 
@@ -59,16 +59,19 @@ error_set!(
         #[display("Invalid S3 credentials")]
         InvalidS3Credentials,
 
+        #[display("HTTP request error: {0}")]
+        CyperError(cyper::Error),
+
         #[display("Cannot archive file: {}", file_path)]
         CannotArchiveFile { file_path: String },
-    } || IoError;
+    } || IoError
 
-    ConnectionError = {
+    ConnectionError := {
         #[display("Connection error")]
         QuicConnectionError(QuicConnectionError),
-    } || IoError || CommonError;
+    } || IoError || CommonError
 
-    LogError = {
+    LogError := {
         #[display("Logging filter reload failure")]
         FilterReloadFailure,
 
@@ -77,22 +80,22 @@ error_set!(
 
         #[display("Logging file reload failure")]
         FileReloadFailure,
-    };
+    }
 
-    CompatError = {
+    CompatError := {
         #[display("Index migration error")]
         IndexMigrationError,
-    } || IoError || CommonError;
+    } || IoError || CommonError
 
-    CommonError = {
+    CommonError := {
         #[display("Try from slice error")]
         TryFromSliceError(TryFromSliceError),
 
         #[display("SDK error")]
         SdkError(iggy_common::IggyError),
-    };
+    }
 
-    QuicError = {
+    QuicError := {
         #[display("Cert load error")]
         CertLoadError,
         #[display("Cert generation error")]
@@ -101,5 +104,5 @@ error_set!(
         ConfigCreationError,
         #[display("Transport config error")]
         TransportConfigError,
-    };
+    }
 );

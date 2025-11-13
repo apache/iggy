@@ -1,0 +1,273 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+services:
+  # Iggy Message Broker
+  iggy:
+    image: apache/iggy:edge
+    container_name: iggy-server
+    ports:
+      - "8080:8080"  # QUIC transport
+      - "8090:8090"  # TCP transport
+      - "3000:3000"  # HTTP API / Web UI
+    environment:
+      - IGGY_TCP_ADDRESS=0.0.0.0:8090
+      - IGGY_HTTP_ADDRESS=0.0.0.0:3000
+      - IGGY_QUIC_ADDRESS=0.0.0.0:8080
+      - IGGY_SYSTEM_LOGGING_LEVEL=info
+      - IGGY_ROOT_USERNAME=iggy
+      - IGGY_ROOT_PASSWORD=iggy
+    volumes:
+      - iggy-data:/local_data
+    networks:
+      - flink-iggy-network
+
+  # Flink JobManager
+  jobmanager:
+    image: flink:2.1.0-scala_2.12-java21
+    container_name: flink-jobmanager
+    ports:
+      - "8081:8081"  # Web UI
+      - "6123:6123"  # RPC
+    user: root  # Start as root to fix permissions
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        # Create checkpoint/savepoint directories with correct permissions
+        mkdir -p /tmp/flink-checkpoints /tmp/flink-savepoints
+        chown -R flink:flink /tmp/flink-checkpoints /tmp/flink-savepoints
+        chmod -R 755 /tmp/flink-checkpoints /tmp/flink-savepoints
+        # Switch to flink user and run jobmanager
+        exec gosu flink /docker-entrypoint.sh jobmanager
+    environment:
+      - IGGY_SERVER=iggy:8090
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: jobmanager
+        jobmanager.memory.process.size: 1600m
+        state.backend.type: hashmap
+        state.checkpoints.dir: file:///tmp/flink-checkpoints
+        state.savepoints.dir: file:///tmp/flink-savepoints
+        execution.checkpointing.interval: 60000
+        execution.checkpointing.mode: EXACTLY_ONCE
+        execution.checkpointing.externalized-checkpoint-retention: RETAIN_ON_CANCELLATION
+        parallelism.default: 2
+        taskmanager.numberOfTaskSlots: 4
+    volumes:
+      - flink-checkpoints:/tmp/flink-checkpoints
+      - flink-savepoints:/tmp/flink-savepoints
+      # Mount your fat JARs here
+      - ./iggy-flink-examples/build/libs:/opt/flink/usrlib
+      # OR if you need shared connector libraries:
+      # - ./lib/iggy-connector.jar:/opt/flink/lib/iggy-connector.jar
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - flink-iggy-network
+    depends_on:
+      - iggy
+
+  # Flink TaskManager
+  taskmanager:
+    image: flink:2.1.0-scala_2.12-java21
+    container_name: flink-taskmanager
+    user: root  # Start as root to fix permissions
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        # Create checkpoint/savepoint directories with correct permissions
+        mkdir -p /tmp/flink-checkpoints /tmp/flink-savepoints
+        chown -R flink:flink /tmp/flink-checkpoints /tmp/flink-savepoints
+        chmod -R 755 /tmp/flink-checkpoints /tmp/flink-savepoints
+        # Switch to flink user and run taskmanager
+        exec gosu flink /docker-entrypoint.sh taskmanager
+    environment:
+      - IGGY_SERVER=iggy:8090
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: jobmanager
+        taskmanager.memory.process.size: 1728m
+        taskmanager.numberOfTaskSlots: 4
+    volumes:
+      - flink-checkpoints:/tmp/flink-checkpoints
+      - flink-savepoints:/tmp/flink-savepoints
+      # Same library mounts as jobmanager if needed
+      # - ./lib/iggy-connector.jar:/opt/flink/lib/iggy-connector.jar
+    networks:
+      - flink-iggy-network
+    depends_on:
+      - jobmanager
+
+  # Iggy Setup - Creates streams and topics
+  iggy-setup:
+    image: alpine:latest
+    container_name: iggy-setup
+    depends_on:
+      - iggy
+    networks:
+      - flink-iggy-network
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        # Install dependencies
+        echo "Installing dependencies..."
+        apk add --no-cache curl jq
+
+        echo "Waiting for Iggy to be ready..."
+        # Wait with health check instead of blind sleep
+        MAX_RETRIES=30
+        RETRY=0
+        while [ $$RETRY -lt $$MAX_RETRIES ]; do
+          if curl -f -s http://iggy:3000/stats > /dev/null 2>&1; then
+            echo "Iggy is ready!"
+            break
+          fi
+          RETRY=$$((RETRY + 1))
+          echo "Waiting for Iggy... ($$RETRY/$$MAX_RETRIES)"
+          sleep 2
+        done
+
+        if [ $$RETRY -eq $$MAX_RETRIES ]; then
+          echo "Iggy failed to start within timeout"
+          exit 1
+        fi
+
+        echo "Authenticating with Iggy..."
+        RESPONSE=$$(curl -s -X POST http://iggy:3000/users/login \
+          -H "Content-Type: application/json" \
+          -d '{"username":"iggy","password":"iggy"}')
+
+        TOKEN=$$(echo "$$RESPONSE" | jq -r '.access_token.token')
+
+        if [ -z "$$TOKEN" ] || [ "$$TOKEN" = "null" ]; then
+          echo "Failed to authenticate"
+          echo "Response was: $$RESPONSE"
+          exit 1
+        fi
+
+        echo "Authentication successful!"
+        echo "Creating streams and topics for examples..."
+
+        # StreamTransformJob streams
+        echo "Creating 'sensors' stream..."
+        curl -s -X POST http://iggy:3000/streams \
+          -H "Content-Type: application/json" \
+          -H "Authorization: Bearer $$TOKEN" \
+          -d '{"name": "sensors"}' || true
+
+        echo "Creating 'readings' topic in 'sensors' stream..."
+        curl -s -X POST http://iggy:3000/streams/sensors/topics \
+          -H "Content-Type: application/json" \
+          -H "Authorization: Bearer $$TOKEN" \
+          -d '{"name": "readings", "partitions_count": 4, "compression_algorithm": "none", "message_expiry": 0, "max_topic_size": 10737418240}' || true
+
+        echo "Creating 'alerts' stream..."
+        curl -s -X POST http://iggy:3000/streams \
+          -H "Content-Type: application/json" \
+          -H "Authorization: Bearer $$TOKEN" \
+          -d '{"name": "alerts"}' || true
+
+        echo "Creating 'critical' topic in 'alerts' stream..."
+        curl -s -X POST http://iggy:3000/streams/alerts/topics \
+          -H "Content-Type: application/json" \
+          -H "Authorization: Bearer $$TOKEN" \
+          -d '{"name": "critical", "partitions_count": 4, "compression_algorithm": "none", "message_expiry": 0, "max_topic_size": 10737418240}' || true
+
+        # WordCountJob streams
+        echo "Creating 'text-input' stream..."
+        curl -s -X POST http://iggy:3000/streams \
+          -H "Content-Type: application/json" \
+          -H "Authorization: Bearer $$TOKEN" \
+          -d '{"name": "text-input"}' || true
+
+        echo "Creating 'lines' topic in 'text-input' stream..."
+        curl -s -X POST http://iggy:3000/streams/text-input/topics \
+          -H "Content-Type: application/json" \
+          -H "Authorization: Bearer $$TOKEN" \
+          -d '{"name": "lines", "partitions_count": 2, "compression_algorithm": "none", "message_expiry": 0, "max_topic_size": 10737418240}' || true
+
+        echo "Creating 'word-counts' stream..."
+        curl -s -X POST http://iggy:3000/streams \
+          -H "Content-Type: application/json" \
+          -H "Authorization: Bearer $$TOKEN" \
+          -d '{"name": "word-counts"}' || true
+
+        echo "Creating 'results' topic in 'word-counts' stream..."
+        curl -s -X POST http://iggy:3000/streams/word-counts/topics \
+          -H "Content-Type: application/json" \
+          -H "Authorization: Bearer $$TOKEN" \
+          -d '{"name": "results", "partitions_count": 2, "compression_algorithm": "none", "message_expiry": 0, "max_topic_size": 10737418240}' || true
+
+        echo "Creating consumer group 'flink-word-counter' for text-input/lines..."
+        curl -s -X POST http://iggy:3000/streams/text-input/topics/lines/consumer-groups \
+          -H "Content-Type: application/json" \
+          -H "Authorization: Bearer $$TOKEN" \
+          -d '{"name": "flink-word-counter"}' || true
+
+        # MultiStreamJoinJob streams
+        echo "Creating 'user-activities' stream..."
+        curl -s -X POST http://iggy:3000/streams \
+          -H "Content-Type: application/json" \
+          -H "Authorization: Bearer $$TOKEN" \
+          -d '{"name": "user-activities"}' || true
+
+        echo "Creating 'events' topic in 'user-activities' stream..."
+        curl -s -X POST http://iggy:3000/streams/user-activities/topics \
+          -H "Content-Type: application/json" \
+          -H "Authorization: Bearer $$TOKEN" \
+          -d '{"name": "events", "partitions_count": 4, "compression_algorithm": "none", "message_expiry": 0, "max_topic_size": 10737418240}' || true
+
+        echo "Creating 'user-profiles' stream..."
+        curl -s -X POST http://iggy:3000/streams \
+          -H "Content-Type: application/json" \
+          -H "Authorization: Bearer $$TOKEN" \
+          -d '{"name": "user-profiles"}' || true
+
+        echo "Creating 'updates' topic in 'user-profiles' stream..."
+        curl -s -X POST http://iggy:3000/streams/user-profiles/topics \
+          -H "Content-Type: application/json" \
+          -H "Authorization: Bearer $$TOKEN" \
+          -d '{"name": "updates", "partitions_count": 2, "compression_algorithm": "none", "message_expiry": 0, "max_topic_size": 10737418240}' || true
+
+        echo "Creating 'enriched-activities' stream..."
+        curl -s -X POST http://iggy:3000/streams \
+          -H "Content-Type: application/json" \
+          -H "Authorization: Bearer $$TOKEN" \
+          -d '{"name": "enriched-activities"}' || true
+
+        echo "Creating 'results' topic in 'enriched-activities' stream..."
+        curl -s -X POST http://iggy:3000/streams/enriched-activities/topics \
+          -H "Content-Type: application/json" \
+          -H "Authorization: Bearer $$TOKEN" \
+          -d '{"name": "results", "partitions_count": 4, "compression_algorithm": "none", "message_expiry": 0, "max_topic_size": 10737418240}' || true
+
+        echo "Stream and topic creation completed!"
+
+networks:
+  flink-iggy-network:
+    driver: bridge
+
+volumes:
+  flink-checkpoints:
+  flink-savepoints:
+  iggy-data:

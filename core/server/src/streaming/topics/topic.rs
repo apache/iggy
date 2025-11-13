@@ -1,348 +1,371 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
- */
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-use crate::configs::system::SystemConfig;
-use crate::streaming::partitions::partition::Partition;
-use crate::streaming::polling_consumer::PollingConsumer;
-use crate::streaming::storage::SystemStorage;
-use crate::streaming::topics::consumer_group::ConsumerGroup;
-use ahash::AHashMap;
-use core::fmt;
-use iggy_common::locking::IggySharedMut;
-use iggy_common::{
-    CompressionAlgorithm, Consumer, ConsumerKind, IggyByteSize, IggyError, IggyExpiry,
-    IggyTimestamp, MaxTopicSize, Sizeable,
-};
-
+use crate::slab::streams::Streams;
+use crate::slab::topics;
+use crate::slab::traits_ext::{EntityMarker, InsertCell, IntoComponents, IntoComponentsById};
+use crate::slab::{Keyed, consumer_groups::ConsumerGroups, partitions::Partitions};
+use crate::streaming::stats::{StreamStats, TopicStats};
+use iggy_common::{CompressionAlgorithm, Identifier, IggyExpiry, IggyTimestamp, MaxTopicSize};
+use slab::Slab;
+use std::cell::{Ref, RefMut};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use tokio::sync::RwLock;
-use tracing::info;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-const ALMOST_FULL_THRESHOLD: f64 = 0.9;
+#[derive(Debug, Clone)]
+pub struct TopicAuxilary {
+    current_partition_id: Arc<AtomicUsize>,
+}
 
-#[derive(Debug)]
+impl TopicAuxilary {
+    pub fn get_next_partition_id(&self, upperbound: usize) -> usize {
+        let mut partition_id = self.current_partition_id.fetch_add(1, Ordering::AcqRel);
+        if partition_id >= upperbound {
+            partition_id = 0;
+            self.current_partition_id
+                .swap(partition_id + 1, Ordering::Release);
+        }
+        tracing::trace!("Next partition ID: {}", partition_id);
+        partition_id
+    }
+}
+
+#[derive(Default, Debug, Clone)]
+pub struct TopicRoot {
+    id: usize,
+    // TODO: This property should be removed, we won't use it in our clustering impl.
+    replication_factor: u8,
+    name: String,
+    created_at: IggyTimestamp,
+    message_expiry: IggyExpiry,
+    compression_algorithm: CompressionAlgorithm,
+    max_topic_size: MaxTopicSize,
+
+    partitions: Partitions,
+    consumer_groups: ConsumerGroups,
+}
+
+impl Keyed for TopicRoot {
+    type Key = String;
+
+    fn key(&self) -> &Self::Key {
+        &self.name
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct Topic {
-    pub stream_id: u32,
-    pub topic_id: u32,
-    pub name: String,
-    pub path: String,
-    pub partitions_path: String,
-    pub(crate) size_bytes: Arc<AtomicU64>,
-    pub(crate) size_of_parent_stream: Arc<AtomicU64>,
-    pub(crate) messages_count_of_parent_stream: Arc<AtomicU64>,
-    pub(crate) messages_count: Arc<AtomicU64>,
-    pub(crate) segments_count_of_parent_stream: Arc<AtomicU32>,
-    pub(crate) config: Arc<SystemConfig>,
-    pub(crate) partitions: AHashMap<u32, IggySharedMut<Partition>>,
-    pub(crate) storage: Arc<SystemStorage>,
-    pub(crate) consumer_groups: AHashMap<u32, RwLock<ConsumerGroup>>,
-    pub(crate) consumer_groups_ids: AHashMap<String, u32>,
-    pub(crate) current_consumer_group_id: AtomicU32,
-    pub(crate) current_partition_id: AtomicU32,
-    pub message_expiry: IggyExpiry,
-    pub compression_algorithm: CompressionAlgorithm,
-    pub max_topic_size: MaxTopicSize,
-    pub replication_factor: u8,
-    pub created_at: IggyTimestamp,
+    root: TopicRoot,
+    auxilary: TopicAuxilary,
+    stats: Arc<TopicStats>,
 }
 
 impl Topic {
-    #[allow(clippy::too_many_arguments)]
-    pub async fn empty(
-        stream_id: u32,
-        topic_id: u32,
-        name: &str,
-        size_of_parent_stream: Arc<AtomicU64>,
-        messages_count_of_parent_stream: Arc<AtomicU64>,
-        segments_count_of_parent_stream: Arc<AtomicU32>,
-        config: Arc<SystemConfig>,
-        storage: Arc<SystemStorage>,
-    ) -> Topic {
-        Topic::create(
-            stream_id,
-            topic_id,
-            name,
-            0,
-            config,
-            storage,
-            size_of_parent_stream,
-            messages_count_of_parent_stream,
-            segments_count_of_parent_stream,
-            IggyExpiry::NeverExpire,
-            Default::default(),
-            MaxTopicSize::ServerDefault,
-            1,
-        )
-        .await
-        .unwrap()
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub async fn create(
-        stream_id: u32,
-        topic_id: u32,
-        name: &str,
-        partitions_count: u32,
-        config: Arc<SystemConfig>,
-        storage: Arc<SystemStorage>,
-        size_of_parent_stream: Arc<AtomicU64>,
-        messages_count_of_parent_stream: Arc<AtomicU64>,
-        segments_count_of_parent_stream: Arc<AtomicU32>,
-        message_expiry: IggyExpiry,
-        compression_algorithm: CompressionAlgorithm,
-        max_topic_size: MaxTopicSize,
+    pub fn new(
+        name: String,
+        stats: Arc<TopicStats>,
+        created_at: IggyTimestamp,
         replication_factor: u8,
-    ) -> Result<Topic, IggyError> {
-        let path = config.get_topic_path(stream_id, topic_id);
-        let partitions_path = config.get_partitions_path(stream_id, topic_id);
-        let mut topic = Topic {
-            stream_id,
-            topic_id,
-            name: name.to_string(),
-            partitions: AHashMap::new(),
-            path,
-            partitions_path,
-            storage,
-            size_bytes: Arc::new(AtomicU64::new(0)),
-            size_of_parent_stream,
-            messages_count_of_parent_stream,
-            messages_count: Arc::new(AtomicU64::new(0)),
-            segments_count_of_parent_stream,
-            consumer_groups: AHashMap::new(),
-            consumer_groups_ids: AHashMap::new(),
-            current_consumer_group_id: AtomicU32::new(1),
-            current_partition_id: AtomicU32::new(1),
-            message_expiry: Topic::get_message_expiry(message_expiry, &config),
-            max_topic_size: Topic::get_max_topic_size(max_topic_size, &config)?,
-            compression_algorithm,
-            replication_factor,
-            config,
-            created_at: IggyTimestamp::now(),
-        };
-
-        info!(
-            "Received message expiry: {}, set expiry: {}",
-            message_expiry, topic.message_expiry
-        );
-
-        topic.add_partitions(partitions_count).await?;
-        Ok(topic)
-    }
-
-    pub fn is_full(&self) -> bool {
-        match self.max_topic_size {
-            MaxTopicSize::Unlimited => false,
-            MaxTopicSize::ServerDefault => false,
-            MaxTopicSize::Custom(size) => {
-                self.size_bytes.load(Ordering::SeqCst) >= size.as_bytes_u64()
-            }
-        }
-    }
-
-    pub fn is_almost_full(&self) -> bool {
-        match self.max_topic_size {
-            MaxTopicSize::Unlimited => false,
-            MaxTopicSize::ServerDefault => false,
-            MaxTopicSize::Custom(size) => {
-                self.size_bytes.load(Ordering::SeqCst)
-                    >= (size.as_bytes_u64() as f64 * ALMOST_FULL_THRESHOLD) as u64
-            }
-        }
-    }
-
-    pub fn is_unlimited(&self) -> bool {
-        matches!(self.max_topic_size, MaxTopicSize::Unlimited)
-    }
-
-    pub fn get_partitions(&self) -> Vec<IggySharedMut<Partition>> {
-        self.partitions.values().cloned().collect()
-    }
-
-    pub fn get_partition(&self, partition_id: u32) -> Result<IggySharedMut<Partition>, IggyError> {
-        match self.partitions.get(&partition_id) {
-            Some(partition_arc) => Ok(partition_arc.clone()),
-            None => Err(IggyError::PartitionNotFound(
-                partition_id,
-                self.topic_id,
-                self.stream_id,
-            )),
-        }
-    }
-
-    pub async fn resolve_consumer_with_partition_id(
-        &self,
-        consumer: &Consumer,
-        client_id: u32,
-        partition_id: Option<u32>,
-        calculate_partition_id: bool,
-    ) -> Result<Option<(PollingConsumer, u32)>, IggyError> {
-        match consumer.kind {
-            ConsumerKind::Consumer => {
-                let partition_id = partition_id.unwrap_or(1);
-                Ok(Some((
-                    PollingConsumer::consumer(&consumer.id, partition_id),
-                    partition_id,
-                )))
-            }
-            ConsumerKind::ConsumerGroup => {
-                let consumer_group = self.get_consumer_group(&consumer.id)?.read().await;
-                if let Some(partition_id) = partition_id {
-                    return Ok(Some((
-                        PollingConsumer::consumer_group(consumer_group.group_id, client_id),
-                        partition_id,
-                    )));
-                }
-
-                let partition_id = if calculate_partition_id {
-                    consumer_group.calculate_partition_id(client_id).await?
-                } else {
-                    consumer_group.get_current_partition_id(client_id).await?
-                };
-                let Some(partition_id) = partition_id else {
-                    return Ok(None);
-                };
-
-                Ok(Some((
-                    PollingConsumer::consumer_group(consumer_group.group_id, client_id),
-                    partition_id,
-                )))
-            }
-        }
-    }
-
-    pub fn get_max_topic_size(
+        message_expiry: IggyExpiry,
+        compression: CompressionAlgorithm,
         max_topic_size: MaxTopicSize,
-        config: &SystemConfig,
-    ) -> Result<MaxTopicSize, IggyError> {
-        match max_topic_size {
-            MaxTopicSize::ServerDefault => Ok(config.topic.max_size),
-            _ => {
-                if max_topic_size.as_bytes_u64() < config.segment.size.as_bytes_u64() {
-                    Err(IggyError::InvalidTopicSize(
-                        max_topic_size,
-                        config.segment.size,
-                    ))
-                } else {
-                    Ok(max_topic_size)
-                }
-            }
-        }
-    }
-
-    pub fn get_message_expiry(message_expiry: IggyExpiry, config: &SystemConfig) -> IggyExpiry {
-        match message_expiry {
-            IggyExpiry::ServerDefault => config.segment.message_expiry,
-            _ => message_expiry,
-        }
-    }
-}
-
-impl Sizeable for Topic {
-    fn get_size_bytes(&self) -> IggyByteSize {
-        IggyByteSize::from(self.size_bytes.load(Ordering::SeqCst))
-    }
-}
-
-impl fmt::Display for Topic {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "Topic {{ id: {}, stream ID: {}, name: {}, path: {}, partitions: {}, message_expiry: {}, max_topic_size: {}, replication_factor: {} }}",
-            self.topic_id,
-            self.stream_id,
-            self.name,
-            self.path,
-            self.partitions.len(),
-            self.message_expiry,
-            self.max_topic_size,
-            self.replication_factor,
-        )
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::streaming::{
-        persistence::persister::{FileWithSyncPersister, PersisterKind},
-        utils::MemoryPool,
-    };
-    use iggy_common::locking::IggySharedMutFn;
-    use std::str::FromStr;
-
-    #[tokio::test]
-    async fn should_be_created_given_valid_parameters() {
-        let tempdir = tempfile::TempDir::new().unwrap();
-        let config = Arc::new(SystemConfig {
-            path: tempdir.path().to_str().unwrap().to_string(),
-            ..Default::default()
-        });
-        let storage = Arc::new(SystemStorage::new(
-            config.clone(),
-            Arc::new(PersisterKind::FileWithSync(FileWithSyncPersister {})),
-        ));
-        MemoryPool::init_pool(config.clone());
-
-        let stream_id = 1;
-        let topic_id = 2;
-        let name = "test";
-        let partitions_count = 3;
-        let message_expiry = IggyExpiry::NeverExpire;
-        let compression_algorithm = CompressionAlgorithm::None;
-        let max_topic_size = MaxTopicSize::Custom(IggyByteSize::from_str("2 GiB").unwrap());
-        let replication_factor = 1;
-        let path = config.get_topic_path(stream_id, topic_id);
-        let size_of_parent_stream = Arc::new(AtomicU64::new(0));
-        let messages_count_of_parent_stream = Arc::new(AtomicU64::new(0));
-        let segments_count_of_parent_stream = Arc::new(AtomicU32::new(0));
-
-        let topic = Topic::create(
-            stream_id,
-            topic_id,
+    ) -> Self {
+        let root = TopicRoot::new(
             name,
-            partitions_count,
-            config,
-            storage,
-            messages_count_of_parent_stream,
-            size_of_parent_stream,
-            segments_count_of_parent_stream,
-            message_expiry,
-            compression_algorithm,
-            max_topic_size,
+            created_at,
             replication_factor,
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(topic.stream_id, stream_id);
-        assert_eq!(topic.topic_id, topic_id);
-        assert_eq!(topic.path, path);
-        assert_eq!(topic.name, name);
-        assert_eq!(topic.partitions.len(), partitions_count as usize);
-        assert_eq!(topic.message_expiry, message_expiry);
-
-        for (id, partition) in topic.partitions {
-            let partition = partition.read().await;
-            assert_eq!(partition.stream_id, stream_id);
-            assert_eq!(partition.topic_id, topic.topic_id);
-            assert_eq!(partition.partition_id, id);
-            assert_eq!(partition.segments.len(), 1);
+            message_expiry,
+            compression,
+            max_topic_size,
+        );
+        let auxilary = TopicAuxilary {
+            current_partition_id: Arc::new(AtomicUsize::new(0)),
+        };
+        Self {
+            root,
+            auxilary,
+            stats,
         }
     }
+    pub fn new_with_components(
+        root: TopicRoot,
+        auxilary: TopicAuxilary,
+        stats: Arc<TopicStats>,
+    ) -> Self {
+        Self {
+            root,
+            auxilary,
+            stats,
+        }
+    }
+
+    pub fn root(&self) -> &TopicRoot {
+        &self.root
+    }
+
+    pub fn root_mut(&mut self) -> &mut TopicRoot {
+        &mut self.root
+    }
+
+    pub fn stats(&self) -> &TopicStats {
+        &self.stats
+    }
+}
+
+impl IntoComponents for Topic {
+    type Components = (TopicRoot, TopicAuxilary, Arc<TopicStats>);
+
+    fn into_components(self) -> Self::Components {
+        (self.root, self.auxilary, self.stats)
+    }
+}
+
+impl EntityMarker for Topic {
+    type Idx = topics::ContainerId;
+    fn id(&self) -> Self::Idx {
+        self.root.id
+    }
+
+    fn update_id(&mut self, id: Self::Idx) {
+        self.root.id = id;
+    }
+}
+
+// TODO: Create a macro to impl those TopicRef/TopicRefMut structs and it's traits.
+pub struct TopicRef<'a> {
+    root: Ref<'a, Slab<TopicRoot>>,
+    auxilary: Ref<'a, Slab<TopicAuxilary>>,
+    stats: Ref<'a, Slab<Arc<TopicStats>>>,
+}
+
+impl<'a> TopicRef<'a> {
+    pub fn new(
+        root: Ref<'a, Slab<TopicRoot>>,
+        auxilary: Ref<'a, Slab<TopicAuxilary>>,
+        stats: Ref<'a, Slab<Arc<TopicStats>>>,
+    ) -> Self {
+        Self {
+            root,
+            auxilary,
+            stats,
+        }
+    }
+}
+
+impl<'a> IntoComponents for TopicRef<'a> {
+    type Components = (
+        Ref<'a, Slab<TopicRoot>>,
+        Ref<'a, Slab<TopicAuxilary>>,
+        Ref<'a, Slab<Arc<TopicStats>>>,
+    );
+
+    fn into_components(self) -> Self::Components {
+        (self.root, self.auxilary, self.stats)
+    }
+}
+
+impl<'a> IntoComponentsById for TopicRef<'a> {
+    type Idx = topics::ContainerId;
+    type Output = (
+        Ref<'a, TopicRoot>,
+        Ref<'a, TopicAuxilary>,
+        Ref<'a, Arc<TopicStats>>,
+    );
+
+    fn into_components_by_id(self, index: Self::Idx) -> Self::Output {
+        let root = Ref::map(self.root, |r| &r[index]);
+        let auxilary = Ref::map(self.auxilary, |a| &a[index]);
+        let stats = Ref::map(self.stats, |s| &s[index]);
+        (root, auxilary, stats)
+    }
+}
+
+pub struct TopicRefMut<'a> {
+    root: RefMut<'a, Slab<TopicRoot>>,
+    auxilary: RefMut<'a, Slab<TopicAuxilary>>,
+    stats: RefMut<'a, Slab<Arc<TopicStats>>>,
+}
+
+impl<'a> TopicRefMut<'a> {
+    pub fn new(
+        root: RefMut<'a, Slab<TopicRoot>>,
+        auxilary: RefMut<'a, Slab<TopicAuxilary>>,
+        stats: RefMut<'a, Slab<Arc<TopicStats>>>,
+    ) -> Self {
+        Self {
+            root,
+            auxilary,
+            stats,
+        }
+    }
+}
+
+impl<'a> IntoComponents for TopicRefMut<'a> {
+    type Components = (
+        RefMut<'a, Slab<TopicRoot>>,
+        RefMut<'a, Slab<TopicAuxilary>>,
+        RefMut<'a, Slab<Arc<TopicStats>>>,
+    );
+
+    fn into_components(self) -> Self::Components {
+        (self.root, self.auxilary, self.stats)
+    }
+}
+
+impl<'a> IntoComponentsById for TopicRefMut<'a> {
+    type Idx = topics::ContainerId;
+    type Output = (
+        RefMut<'a, TopicRoot>,
+        RefMut<'a, TopicAuxilary>,
+        RefMut<'a, Arc<TopicStats>>,
+    );
+
+    fn into_components_by_id(self, index: Self::Idx) -> Self::Output {
+        let root = RefMut::map(self.root, |r| &mut r[index]);
+        let auxilary = RefMut::map(self.auxilary, |a| &mut a[index]);
+        let stats = RefMut::map(self.stats, |s| &mut s[index]);
+        (root, auxilary, stats)
+    }
+}
+
+impl TopicRoot {
+    pub fn new(
+        name: String,
+        created_at: IggyTimestamp,
+        replication_factor: u8,
+        message_expiry: IggyExpiry,
+        compression: CompressionAlgorithm,
+        max_topic_size: MaxTopicSize,
+    ) -> Self {
+        Self {
+            id: 0,
+            name,
+            created_at,
+            replication_factor,
+            message_expiry,
+            compression_algorithm: compression,
+            max_topic_size,
+            partitions: Partitions::default(),
+            consumer_groups: ConsumerGroups::default(),
+        }
+    }
+
+    pub fn invoke<T>(&self, f: impl FnOnce(&Self) -> T) -> T {
+        f(self)
+    }
+
+    pub fn invoke_mut<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
+        f(self)
+    }
+
+    pub fn update_id(&mut self, id: usize) {
+        self.id = id;
+    }
+
+    pub fn id(&self) -> topics::ContainerId {
+        self.id
+    }
+
+    pub fn message_expiry(&self) -> IggyExpiry {
+        self.message_expiry
+    }
+
+    pub fn max_topic_size(&self) -> MaxTopicSize {
+        self.max_topic_size
+    }
+
+    pub fn name(&self) -> &String {
+        &self.name
+    }
+
+    pub fn set_name(&mut self, name: String) {
+        self.name = name;
+    }
+
+    pub fn set_compression(&mut self, compression: CompressionAlgorithm) {
+        self.compression_algorithm = compression;
+    }
+
+    pub fn set_message_expiry(&mut self, message_expiry: IggyExpiry) {
+        self.message_expiry = message_expiry;
+    }
+
+    pub fn set_max_topic_size(&mut self, max_topic_size: MaxTopicSize) {
+        self.max_topic_size = max_topic_size;
+    }
+
+    pub fn set_replication_factor(&mut self, replication_factor: u8) {
+        self.replication_factor = replication_factor;
+    }
+
+    pub fn partitions(&self) -> &Partitions {
+        &self.partitions
+    }
+
+    pub fn partitions_mut(&mut self) -> &mut Partitions {
+        &mut self.partitions
+    }
+
+    pub fn consumer_groups(&self) -> &ConsumerGroups {
+        &self.consumer_groups
+    }
+
+    pub fn consumer_groups_mut(&mut self) -> &mut ConsumerGroups {
+        &mut self.consumer_groups
+    }
+
+    pub fn created_at(&self) -> IggyTimestamp {
+        self.created_at
+    }
+
+    pub fn compression_algorithm(&self) -> CompressionAlgorithm {
+        self.compression_algorithm
+    }
+
+    pub fn replication_factor(&self) -> u8 {
+        self.replication_factor
+    }
+}
+
+// TODO: Move to separate module.
+#[allow(clippy::too_many_arguments)]
+pub fn create_and_insert_topics_mem(
+    streams: &Streams,
+    stream_id: &Identifier,
+    name: String,
+    replication_factor: u8,
+    message_expiry: IggyExpiry,
+    compression: CompressionAlgorithm,
+    max_topic_size: MaxTopicSize,
+    parent_stats: Arc<StreamStats>,
+) -> Topic {
+    let stats = Arc::new(TopicStats::new(parent_stats));
+    let now = IggyTimestamp::now();
+    let mut topic = Topic::new(
+        name,
+        stats,
+        now,
+        replication_factor,
+        message_expiry,
+        compression,
+        max_topic_size,
+    );
+
+    let id = streams.with_topics(stream_id, |topics| topics.insert(topic.clone()));
+    topic.update_id(id);
+    topic
 }

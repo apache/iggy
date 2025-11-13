@@ -79,10 +79,10 @@ impl IggyService {
     #[tool(description = "Create stream")]
     pub async fn create_stream(
         &self,
-        Parameters(CreateStream { name, stream_id }): Parameters<CreateStream>,
+        Parameters(CreateStream { name }): Parameters<CreateStream>,
     ) -> Result<CallToolResult, ErrorData> {
         self.permissions.ensure_create()?;
-        request(self.client.create_stream(&name, stream_id).await)
+        request(self.client.create_stream(&name).await)
     }
 
     #[tool(description = "Update stream")]
@@ -146,7 +146,6 @@ impl IggyService {
             partitions_count,
             compression_algorithm,
             replication_factor,
-            topic_id,
             message_expiry,
             max_size,
         }): Parameters<CreateTopic>,
@@ -167,7 +166,6 @@ impl IggyService {
                     partitions_count,
                     compression_algorithm,
                     replication_factor,
-                    topic_id,
                     message_expiry,
                     max_size,
                 )
@@ -501,13 +499,12 @@ impl IggyService {
             stream_id,
             topic_id,
             name,
-            group_id,
         }): Parameters<CreateConsumerGroup>,
     ) -> Result<CallToolResult, ErrorData> {
         self.permissions.ensure_create()?;
         request(
             self.client
-                .create_consumer_group(&id(&stream_id)?, &id(&topic_id)?, &name, group_id)
+                .create_consumer_group(&id(&stream_id)?, &id(&topic_id)?, &name)
                 .await,
         )
     }

@@ -51,9 +51,8 @@ class ConsumerGroupsHttpClient implements ConsumerGroupsClient {
     }
 
     @Override
-    public ConsumerGroupDetails createConsumerGroup(StreamId streamId, TopicId topicId, Optional<Long> groupId, String name) {
-        var request = httpClient.preparePostRequest(path(streamId, topicId),
-                new CreateConsumerGroup(groupId, name));
+    public ConsumerGroupDetails createConsumerGroup(StreamId streamId, TopicId topicId, String name) {
+        var request = httpClient.preparePostRequest(path(streamId, topicId), new CreateConsumerGroup(name));
         return httpClient.execute(request, new TypeReference<>() {
         });
     }
@@ -78,7 +77,7 @@ class ConsumerGroupsHttpClient implements ConsumerGroupsClient {
         return "/streams/" + streamId + "/topics/" + topicId + "/consumer-groups";
     }
 
-    private record CreateConsumerGroup(Optional<Long> groupId, String name) {
+    private record CreateConsumerGroup(String name) {
     }
 
 }

@@ -25,9 +25,9 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Registry};
 
-const STREAM_ID: u32 = 1;
-const TOPIC_ID: u32 = 1;
-const PARTITION_ID: u32 = 1;
+const STREAM_NAME: &str = "sample-stream";
+const TOPIC_NAME: &str = "sample-topic";
+const PARTITION_ID: u32 = 0;
 const BATCHES_LIMIT: u32 = 5;
 
 #[tokio::main]
@@ -50,41 +50,71 @@ async fn main() -> Result<(), Box<dyn Error>> {
     client
         .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
         .await?;
-    init_system(&client).await;
-    produce_messages(&client).await
+    let (stream_id, topic_id) = init_system(&client).await;
+    produce_messages(&client, stream_id, topic_id).await
 }
 
-async fn init_system(client: &IggyClient) {
-    match client.create_stream("sample-stream", Some(STREAM_ID)).await {
-        Ok(_) => info!("Stream was created."),
-        Err(_) => warn!("Stream already exists and will not be created again."),
-    }
+async fn init_system(client: &IggyClient) -> (u32, u32) {
+    let stream = match client.create_stream(STREAM_NAME).await {
+        Ok(stream) => {
+            info!("Stream was created.");
+            stream
+        }
+        Err(_) => {
+            warn!("Stream already exists and will not be created again.");
+            client
+                .get_stream(&Identifier::named(STREAM_NAME).unwrap())
+                .await
+                .unwrap()
+                .expect("Failed to get stream")
+        }
+    };
 
-    match client
+    let topic = match client
         .create_topic(
-            &STREAM_ID.try_into().unwrap(),
-            "sample-topic",
+            &Identifier::named(STREAM_NAME).unwrap(),
+            TOPIC_NAME,
             1,
             CompressionAlgorithm::default(),
             None,
-            Some(TOPIC_ID),
             IggyExpiry::NeverExpire,
             MaxTopicSize::ServerDefault,
         )
         .await
     {
-        Ok(_) => info!("Topic was created."),
-        Err(_) => warn!("Topic already exists and will not be created again."),
-    }
+        Ok(topic) => {
+            info!("Topic was created.");
+            topic
+        }
+        Err(_) => {
+            warn!("Topic already exists and will not be created again.");
+            client
+                .get_topic(
+                    &Identifier::named(STREAM_NAME).unwrap(),
+                    &Identifier::named(TOPIC_NAME).unwrap(),
+                )
+                .await
+                .unwrap()
+                .expect("Failed to get topic")
+        }
+    };
+
+    (stream.id, topic.id)
 }
 
-async fn produce_messages(client: &dyn Client) -> Result<(), Box<dyn Error>> {
+async fn produce_messages(
+    client: &dyn Client,
+    stream_id: u32,
+    topic_id: u32,
+) -> Result<(), Box<dyn Error>> {
     let duration = IggyDuration::from_str("500ms")?;
     let mut interval = tokio::time::interval(duration.get_duration());
     info!(
-        "Messages will be sent to stream: {}, topic: {}, partition: {} with interval {}.",
-        STREAM_ID,
-        TOPIC_ID,
+        "Messages will be sent to stream: {} ({}), topic: {} ({}), partition: {} with interval {}.",
+        STREAM_NAME,
+        stream_id,
+        TOPIC_NAME,
+        topic_id,
         PARTITION_ID,
         duration.as_human_time_string()
     );
@@ -109,8 +139,8 @@ async fn produce_messages(client: &dyn Client) -> Result<(), Box<dyn Error>> {
         }
         client
             .send_messages(
-                &STREAM_ID.try_into().unwrap(),
-                &TOPIC_ID.try_into().unwrap(),
+                &Identifier::named(STREAM_NAME).unwrap(),
+                &Identifier::named(TOPIC_NAME).unwrap(),
                 &partitioning,
                 &mut messages,
             )

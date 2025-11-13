@@ -16,14 +16,14 @@
  * under the License.
  */
 
-use crate::locking::IggySharedMutFn;
+use crate::locking::IggyRwLockFn;
 use fast_async_mutex::rwlock::{RwLock as FastAsyncRwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::sync::Arc;
 
 #[derive(Debug)]
 pub struct IggyFastAsyncRwLock<T>(Arc<FastAsyncRwLock<T>>);
 
-impl<T> IggySharedMutFn<T> for IggyFastAsyncRwLock<T>
+impl<T> IggyRwLockFn<T> for IggyFastAsyncRwLock<T>
 where
     T: Send + Sync,
 {

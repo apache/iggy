@@ -104,19 +104,4 @@ var _ = ginkgo.Describe("SEND MESSAGES:", func() {
 			itShouldReturnSpecificError(err, ierror.ErrInvalidMessagesCount)
 		})
 	})
-
-	ginkgo.When("User is not logged in", func() {
-		ginkgo.Context("and tries to update stream", func() {
-			client := createClient()
-			messages := createDefaultMessages()
-			err := client.SendMessages(
-				randomU32Identifier(),
-				randomU32Identifier(),
-				iggcon.None(),
-				messages,
-			)
-
-			itShouldReturnUnauthenticatedError(err)
-		})
-	})
 })

@@ -29,10 +29,10 @@ import (
 )
 
 var (
-	StreamID     = uint32(1)
-	TopicID      = uint32(1)
-	PartitionID  = uint32(1)
-	BatchesLimit = uint32(5)
+    StreamID     = uint32(0)
+    TopicID      = uint32(0)
+    PartitionID  = uint32(0)
+    BatchesLimit = uint32(5)
 )
 
 func main() {

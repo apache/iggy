@@ -49,7 +49,7 @@ impl From<PermissionsArgs> for Option<Permissions> {
             .stream
             .into_iter()
             .map(|s| (s.stream_id, s.into()))
-            .collect::<AHashMap<u32, StreamPermissions>>();
+            .collect::<AHashMap<usize, StreamPermissions>>();
 
         match (value.global, stream_permissions.is_empty()) {
             (Some(global), true) => Some(Permissions {
@@ -69,16 +69,11 @@ impl From<PermissionsArgs> for Option<Permissions> {
     }
 }
 
-#[derive(Debug, Clone, ValueEnum, PartialEq)]
+#[derive(Debug, Clone, ValueEnum, PartialEq, Default)]
 pub enum UserStatusArg {
+    #[default]
     Active,
     Inactive,
-}
-
-impl Default for UserStatusArg {
-    fn default() -> Self {
-        Self::Active
-    }
 }
 
 impl From<UserStatusArg> for UserStatus {

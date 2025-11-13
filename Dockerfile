@@ -15,7 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-ARG RUST_VERSION=1.90
+ARG RUST_VERSION=1.91
 ARG ALPINE_VERSION=3.22
 
 FROM rust:${RUST_VERSION}.0-alpine${ALPINE_VERSION} AS builder
@@ -37,5 +37,6 @@ COPY --from=builder /build/target/release/iggy-server .
 ENV IGGY_HTTP_ADDRESS=0.0.0.0:3000
 ENV IGGY_QUIC_ADDRESS=0.0.0.0:8080
 ENV IGGY_TCP_ADDRESS=0.0.0.0:8090
+ENV IGGY_WEBSOCKET_ADDRESS=0.0.0.0:8092
 
 CMD ["/iggy-server"]

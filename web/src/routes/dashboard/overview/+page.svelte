@@ -5,7 +5,9 @@
 
   let { data }: Props = $props();
 
-  let statsValues = $derived(Object.values(data.stats).map((val) => val as { name: string; value: string }));
+  let statsValues = $derived(
+    Object.values(data.stats).map((val) => val as { name: string; value: string })
+  );
 </script>
 
 <div class="h-full overflow-auto p-10">

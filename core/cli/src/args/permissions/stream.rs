@@ -58,7 +58,7 @@ impl FromStr for StreamPermission {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct StreamPermissionsArg {
-    pub(crate) stream_id: u32,
+    pub(crate) stream_id: usize,
     pub(crate) permissions: StreamPermissions,
 }
 
@@ -70,7 +70,7 @@ impl From<StreamPermissionsArg> for StreamPermissions {
 
 impl StreamPermissionsArg {
     pub(super) fn new(
-        stream_id: u32,
+        stream_id: usize,
         stream_permissions: Vec<StreamPermission>,
         topic_permissions: Vec<TopicPermissionsArg>,
     ) -> Self {

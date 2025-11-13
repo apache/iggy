@@ -57,22 +57,22 @@ func (request *TcpSendMessagesRequest) Serialize(compression iggcon.IggyMessageC
 		}
 	}
 
-	streamIdFieldSize := 2 + request.StreamId.Length
-	topicIdFieldSize := 2 + request.TopicId.Length
-	partitioningFieldSize := 2 + request.Partitioning.Length
+	streamIdBytes := SerializeIdentifier(request.StreamId)
+	topicIdBytes := SerializeIdentifier(request.TopicId)
+	partitioningBytes := SerializePartitioning(request.Partitioning)
 	metadataLenFieldSize := 4 // uint32
 	messageCount := len(request.Messages)
 	messagesCountFieldSize := 4 // uint32
-	metadataLen := streamIdFieldSize +
-		topicIdFieldSize +
-		partitioningFieldSize +
+	metadataLen := len(streamIdBytes) +
+		len(topicIdBytes) +
+		len(partitioningBytes) +
 		messagesCountFieldSize
 	indexesSize := messageCount * indexSize
 	messageBytesCount := calculateMessageBytesCount(request.Messages)
 	totalSize := metadataLenFieldSize +
-		streamIdFieldSize +
-		topicIdFieldSize +
-		partitioningFieldSize +
+		len(streamIdBytes) +
+		len(topicIdBytes) +
+		len(partitioningBytes) +
 		messagesCountFieldSize +
 		indexesSize +
 		messageBytesCount
@@ -85,15 +85,14 @@ func (request *TcpSendMessagesRequest) Serialize(compression iggcon.IggyMessageC
 	binary.LittleEndian.PutUint32(bytes[:4], uint32(metadataLen))
 	position = 4
 	//ids
-	copy(bytes[position:position+streamIdFieldSize], SerializeIdentifier(request.StreamId))
-	copy(bytes[position+streamIdFieldSize:position+streamIdFieldSize+topicIdFieldSize], SerializeIdentifier(request.TopicId))
-	position += streamIdFieldSize + topicIdFieldSize
+	copy(bytes[position:position+len(streamIdBytes)], streamIdBytes)
+	position += len(streamIdBytes)
+	copy(bytes[position:position+len(topicIdBytes)], topicIdBytes)
+	position += len(topicIdBytes)
 
 	//partitioning
-	bytes[position] = byte(request.Partitioning.Kind)
-	bytes[position+1] = byte(request.Partitioning.Length)
-	copy(bytes[position+2:position+partitioningFieldSize], []byte(request.Partitioning.Value))
-	position += partitioningFieldSize
+	copy(bytes[position:position+len(partitioningBytes)], partitioningBytes)
+	position += len(partitioningBytes)
 	binary.LittleEndian.PutUint32(bytes[position:position+4], uint32(messageCount))
 	position += 4
 

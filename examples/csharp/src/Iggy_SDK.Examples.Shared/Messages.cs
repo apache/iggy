@@ -22,9 +22,12 @@ namespace Iggy_SDK.Examples.Shared;
 
 public class Envelope
 {
-    public const string OrderCreatedType = "order_created";
-    public const string OrderConfirmedType = "order_confirmed";
-    public const string OrderRejectedType = "order_rejected";
+    public const string ORDER_CREATED_TYPE = "order_created";
+    public const string ORDER_CONFIRMED_TYPE = "order_confirmed";
+    public const string ORDER_REJECTED_TYPE = "order_rejected";
+
+    public string MessageType { get; }
+    public string Payload { get; }
 
     public Envelope(string messageType, ISerializableMessage payload)
     {
@@ -38,9 +41,6 @@ public class Envelope
         MessageType = messageType;
         Payload = payload;
     }
-
-    public string MessageType { get; }
-    public string Payload { get; }
 
     public string ToJson()
     {
@@ -63,7 +63,7 @@ public record OrderCreated(
     string Side,
     DateTimeOffset Timestamp) : ISerializableMessage
 {
-    public string MessageType => Envelope.OrderCreatedType;
+    public string MessageType => Envelope.ORDER_CREATED_TYPE;
 
     public string ToJson()
     {
@@ -76,13 +76,9 @@ public record OrderCreated(
     }
 }
 
-public record OrderConfirmed(
-    ulong OrderId,
-    double Price,
-    DateTimeOffset Timestamp
-) : ISerializableMessage
+public record OrderConfirmed(ulong OrderId, double Price, DateTimeOffset Timestamp) : ISerializableMessage
 {
-    public string MessageType => Envelope.OrderConfirmedType;
+    public string MessageType => Envelope.ORDER_CONFIRMED_TYPE;
 
     public string ToJson()
     {
@@ -95,13 +91,9 @@ public record OrderConfirmed(
     }
 }
 
-public record OrderRejected(
-    ulong OrderId,
-    DateTimeOffset Timestamp,
-    string Reason
-) : ISerializableMessage
+public record OrderRejected(ulong OrderId, DateTimeOffset Timestamp, string Reason) : ISerializableMessage
 {
-    public string MessageType => Envelope.OrderRejectedType;
+    public string MessageType => Envelope.ORDER_REJECTED_TYPE;
 
     public string ToJson()
     {

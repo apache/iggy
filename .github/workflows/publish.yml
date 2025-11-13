@@ -58,7 +58,7 @@ env:
   IGGY_CI_BUILD: true
 
 permissions:
-  contents: write  # For tag creation
+  contents: write # For tag creation
   packages: write
   id-token: write
 
@@ -605,7 +605,8 @@ jobs:
 
   publish:
     name: ${{ matrix.name }}
-    needs: [validate, plan, check-tags, build-python-wheels, publish-rust-crates]
+    needs:
+      [validate, plan, check-tags, build-python-wheels, publish-rust-crates]
     if: |
       always() &&
       needs.validate.outputs.has_targets == 'true' &&
@@ -623,7 +624,9 @@ jobs:
       PYPI_API_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
       NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
       NEXUS_USER: ${{ secrets.NEXUS_USER }}
-      NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+      NEXUS_PW: ${{ secrets.NEXUS_PW }}
+      JAVA_GPG_SIGNING_KEY: ${{ secrets.JAVA_GPG_SIGNING_KEY }}
+      JAVA_GPG_PASSWORD: ${{ secrets.JAVA_GPG_PASSWORD }}
       NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
       DRY_RUN: ${{ inputs.dry_run }}
     outputs:
@@ -764,7 +767,15 @@ jobs:
 
   create-tags:
     name: Create Git tags
-    needs: [validate, plan, check-tags, build-python-wheels, publish-rust-crates, publish]
+    needs:
+      [
+        validate,
+        plan,
+        check-tags,
+        build-python-wheels,
+        publish-rust-crates,
+        publish,
+      ]
     if: |
       always() &&
       needs.validate.outputs.has_targets == 'true' &&
@@ -855,7 +866,16 @@ jobs:
 
   summary:
     name: Publish Summary
-    needs: [validate, plan, check-tags, build-python-wheels, publish-rust-crates, publish, create-tags]
+    needs:
+      [
+        validate,
+        plan,
+        check-tags,
+        build-python-wheels,
+        publish-rust-crates,
+        publish,
+        create-tags,
+      ]
     if: always() && needs.validate.outputs.has_targets == 'true'
     runs-on: ubuntu-latest
     steps:
@@ -1029,7 +1049,16 @@ jobs:
 
   notify-failure:
     name: Notify on failure
-    needs: [validate, plan, build-python-wheels, publish-rust-crates, publish, create-tags, summary]
+    needs:
+      [
+        validate,
+        plan,
+        build-python-wheels,
+        publish-rust-crates,
+        publish,
+        create-tags,
+        summary,
+      ]
     if: failure() && inputs.dry_run == false
     runs-on: ubuntu-latest
     steps:

@@ -24,9 +24,9 @@ import { getTestClient } from './test-client.utils.js';
 
 describe('e2e -> system', async () => {
 
-  
+
   const c = getTestClient();
-  
+
   it('e2e -> system::ping', async () => {
     assert.ok(await c.system.ping());
   });
@@ -34,7 +34,7 @@ describe('e2e -> system', async () => {
   it('e2e -> system::login', async () => {
     assert.deepEqual(
       await c.session.login({ username: 'iggy', password: 'iggy' }),
-      { userId: 1 }
+      { userId: 0 }
     )
   });
 

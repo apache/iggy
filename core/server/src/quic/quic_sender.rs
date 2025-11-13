@@ -17,11 +17,14 @@
  */
 
 use crate::quic::COMPONENT;
+use crate::streaming::utils::PooledBuffer;
 use crate::{binary::sender::Sender, server_error::ServerError};
-use error_set::ErrContext;
+use compio::BufResult;
+use compio::buf::IoBufMut;
+use compio::io::AsyncReadExt;
+use compio_quic::{RecvStream, SendStream};
+use err_trail::ErrContext;
 use iggy_common::IggyError;
-use quinn::{RecvStream, SendStream};
-use std::io::IoSlice;
 use tracing::{debug, error};
 
 const STATUS_OK: &[u8] = &[0; 4];
@@ -33,15 +36,17 @@ pub struct QuicSender {
 }
 
 impl Sender for QuicSender {
-    async fn read(&mut self, buffer: &mut [u8]) -> Result<usize, IggyError> {
-        // Not-so-nice code because quinn recv stream has different API for read_exact
-        let read_bytes = buffer.len();
-        self.recv.read_exact(buffer).await.map_err(|error| {
-            error!("Failed to read from the stream: {:?}", error);
-            IggyError::QuicError
-        })?;
-
-        Ok(read_bytes)
+    /// Reads data from the QUIC stream directly into the buffer.
+    async fn read<B: IoBufMut>(&mut self, buffer: B) -> (Result<(), IggyError>, B) {
+        let BufResult(result, buffer) =
+            <RecvStream as AsyncReadExt>::read_exact(&mut self.recv, buffer).await;
+        match (result, buffer) {
+            (Ok(_), buffer) => (Ok(()), buffer),
+            (Err(error), buffer) => {
+                error!("Failed to read from the stream: {:?}", error);
+                (Err(IggyError::QuicError), buffer)
+            }
+        }
     }
 
     async fn send_empty_ok_response(&mut self) -> Result<(), IggyError> {
@@ -64,7 +69,7 @@ impl Sender for QuicSender {
     async fn send_ok_response_vectored(
         &mut self,
         length: &[u8],
-        slices: Vec<IoSlice<'_>>,
+        slices: Vec<PooledBuffer>,
     ) -> Result<(), IggyError> {
         debug!("Sending vectored response with status: {:?}...", STATUS_OK);
 
@@ -72,7 +77,7 @@ impl Sender for QuicSender {
         self.send
             .write_all(&headers)
             .await
-            .with_error_context(|error| {
+            .with_error(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to write headers to stream")
             })
             .map_err(|_| IggyError::QuicError)?;
@@ -85,7 +90,7 @@ impl Sender for QuicSender {
                 self.send
                     .write_all(slice_data)
                     .await
-                    .with_error_context(|error| {
+                    .with_error(|error| {
                         format!("{COMPONENT} (error: {error}) - failed to write slice to stream")
                     })
                     .map_err(|_| IggyError::QuicError)?;
@@ -101,7 +106,7 @@ impl Sender for QuicSender {
 
         self.send
             .finish()
-            .with_error_context(|error| {
+            .with_error(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to finish send stream")
             })
             .map_err(|_| IggyError::QuicError)?;
@@ -122,13 +127,13 @@ impl QuicSender {
         self.send
             .write_all(&[status, &length, payload].as_slice().concat())
             .await
-            .with_error_context(|error| {
+            .with_error(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to write buffer to the stream")
             })
             .map_err(|_| IggyError::QuicError)?;
         self.send
             .finish()
-            .with_error_context(|error| {
+            .with_error(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to finish send stream")
             })
             .map_err(|_| IggyError::QuicError)?;

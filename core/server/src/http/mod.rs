@@ -16,18 +16,20 @@
  * under the License.
  */
 
-pub mod consumer_groups;
-pub mod consumer_offsets;
 pub mod diagnostics;
 pub mod error;
 pub mod http_server;
+mod http_shard_wrapper;
 pub mod jwt;
 mod mapper;
-pub mod messages;
 pub mod metrics;
+pub mod shared;
+
+pub mod consumer_groups;
+pub mod consumer_offsets;
+pub mod messages;
 pub mod partitions;
 pub mod personal_access_tokens;
-mod shared;
 pub mod streams;
 pub mod system;
 pub mod topics;

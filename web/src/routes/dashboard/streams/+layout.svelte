@@ -7,8 +7,8 @@
   import Button from '$lib/components/Button.svelte';
 
   import { typedRoute } from '$lib/types/appRoutes';
-  import { arrayMax } from '$lib/utils/arrayMax';
   import { onMount } from 'svelte';
+  import { resolve } from '$app/paths';
 
   interface Props {
     data: any;
@@ -23,20 +23,19 @@
 
   onMount(() => {
     if (data.streams.length > 0 && page.url.pathname === typedRoute('/dashboard/streams')) {
-      goto(typedRoute(`/dashboard/streams/${data.streams[0].id}`));
+      goto(resolve(typedRoute(`/dashboard/streams/${data.streams[0].id}`)));
     }
   });
-
 </script>
 
 <div class="flex h-full flex-row">
-  <div class="w-[290px] border-r h-full bg-shadeL200 dark:bg-shadeD900 flex flex-col">
+  <div class="w-[290px] border-r h-full bg-shade-l200 dark:bg-shade-d900 flex flex-col">
     <div class="p-7 pl-9 py-5 border-b flex gap-2 relative">
       <Icon name="search" class="absolute text-gray-400 left-3 top-1/2 -translate-y-1/2 w-[20px]" />
       <input
         bind:value={searchQuery}
         placeholder="Search streams..."
-        class="outline-none text-sm bg-transparent w-full ml-2 dark:text-white"
+        class="outline-hidden text-sm bg-transparent w-full ml-2 dark:text-white"
       />
     </div>
 
@@ -51,16 +50,16 @@
         {@const isActive = page.params.streamId === id.toString()}
         <li class="last:mb-6">
           <a
-            href={typedRoute(`/dashboard/streams/${id}`)}
+            href={resolve(typedRoute(`/dashboard/streams/${id}`))}
             class={twMerge(
-              'flex w-full flex-col border-b gap-1 px-5 py-2 transition-colors  outline-none dark:text-white hoverable',
-              isActive && 'bg-shadeL300 dark:bg-shadeD300'
+              'flex w-full flex-col border-b gap-1 px-5 py-2 transition-colors  outline-hidden dark:text-white hoverable',
+              isActive && 'bg-shade-l300 dark:bg-shade-d300'
             )}
           >
             <span
               class={twMerge(
                 'font-semibold text-base truncate',
-                isActive ? 'text-black dark:text-white' : 'text-shadeL1000  dark:text-shadeD100 '
+                isActive ? 'text-black dark:text-white' : 'text-shade-l1000  dark:text-shade-d100 '
               )}>{name}</span
             >
             <div class="grid grid-cols-2 w-full">
@@ -82,14 +81,7 @@
     </ul>
 
     <div class="p-5 pb-7">
-      <Button
-        variant="outlined"
-        class="w-full"
-        onclick={() =>
-          openModal('AddStreamModal', {
-            nextStreamId: arrayMax(data.streams.map((s) => s.id)) + 1
-          })}
-      >
+      <Button variant="outlined" class="w-full" onclick={() => openModal('AddStreamModal')}>
         <Icon name="plus" class="w-[16px] h-[16px]" strokeWidth={2} />
         New stream
       </Button>

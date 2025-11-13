@@ -28,33 +28,26 @@ import { getTestClient } from './test-client.utils.js';
 describe('e2e -> message', async () => {
 
   const c = getTestClient();
-  
-  const streamId = 934;
-  const topicId = 832;
-  const partitionId = 1;
 
-  const stream = {
-    streamId,
-    name: 'e2e-send-message-stream'
-  };
+  const streamName = 'e2e-stream-934';
+  const topicName = 'e2e-topic-832';
+  const partitionId = 0;
 
+  await c.stream.create({ name: streamName });
   const topic = {
-    streamId,
-    topicId,
-    name: 'e2e-send-message-topic',
+    streamId: streamName,
+    name: topicName,
     partitionCount: 1,
     compressionAlgorithm: 1
   };
+  await c.topic.create(topic);
 
   const msg = {
-    streamId,
-    topicId,
+    streamId: streamName,
+    topicId: topicName,
     messages: generateMessages(6),
     partition: Partitioning.PartitionId(partitionId)
   };
-
-  await c.stream.create(stream);
-  await c.topic.create(topic);
 
   it('e2e -> message::send', async () => {
     assert.ok(await c.message.send(msg));
@@ -62,8 +55,8 @@ describe('e2e -> message', async () => {
 
   it('e2e -> message::poll/last', async () => {
     const pollReq = {
-      streamId,
-      topicId,
+      streamId: streamName,
+      topicId: topicName,
       consumer: Consumer.Single,
       partitionId,
       pollingStrategy: PollingStrategy.Last,
@@ -77,8 +70,8 @@ describe('e2e -> message', async () => {
 
   it('e2e -> message::poll/first', async () => {
     const pollReq = {
-      streamId,
-      topicId,
+      streamId: streamName,
+      topicId: topicName,
       consumer: Consumer.Single,
       partitionId,
       pollingStrategy: PollingStrategy.First,
@@ -92,8 +85,8 @@ describe('e2e -> message', async () => {
 
   it('e2e -> message::poll/next', async () => {
     const pollReq = {
-      streamId,
-      topicId,
+      streamId: streamName,
+      topicId: topicName,
       consumer: Consumer.Single,
       partitionId,
       pollingStrategy: PollingStrategy.Next,
@@ -107,8 +100,8 @@ describe('e2e -> message', async () => {
 
   it('e2e -> message::poll/next+commit', async () => {
     const pollReq = {
-      streamId,
-      topicId,
+      streamId: streamName,
+      topicId: topicName,
       consumer: Consumer.Single,
       partitionId,
       pollingStrategy: PollingStrategy.Next,
@@ -124,12 +117,60 @@ describe('e2e -> message', async () => {
     assert.equal(r2.messages.length, 0)
   });
 
+  it('e2e -> message::getOffset', async () => {
+    const offset = await c.offset.get({
+      streamId: streamName,
+      topicId: topicName,
+      consumer: Consumer.Single,
+      partitionId
+    });
+    assert.deepEqual(offset, { partitionId: 0, currentOffset: 5n, storedOffset: 5n });
+  });
+
+  it('e2e -> message::deleteOffset', async () => {
+    const r = await c.offset.delete({
+      streamId: streamName,
+      topicId: topicName,
+      consumer: Consumer.Single,
+      partitionId
+    });
+    assert.ok(r);
+
+    const offset = await c.offset.get({
+      streamId: streamName,
+      topicId: topicName,
+      consumer: Consumer.Single,
+      partitionId
+    });
+    assert.equal(offset, null);
+  });
+
+  it('e2e -> message::storeOffset', async () => {
+    const r = await c.offset.store({
+      streamId: streamName,
+      topicId: topicName,
+      consumer: Consumer.Single,
+      partitionId,
+      offset: 2n
+    });
+    assert.ok(r);
+
+    const offset = await c.offset.get({
+      streamId: streamName,
+      topicId: topicName,
+      consumer: Consumer.Single,
+      partitionId
+    });
+    assert.deepEqual(offset, { partitionId: 0, currentOffset: 5n, storedOffset: 2n });
+  });
+
   it('e2e -> message::cleanup', async () => {
-    assert.ok(await c.stream.delete(stream));
+    assert.ok(await c.stream.delete({ streamId: streamName }));
     assert.ok(await c.session.logout());
   });
 
   after(() => {
     c.destroy();
   });
+
 });

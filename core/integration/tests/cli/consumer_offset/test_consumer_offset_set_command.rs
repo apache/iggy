@@ -97,10 +97,10 @@ impl TestConsumerOffsetSetCmd {
 #[async_trait]
 impl IggyCmdTestCase for TestConsumerOffsetSetCmd {
     async fn prepare_server_state(&mut self, client: &dyn Client) {
-        let stream = client
-            .create_stream(&self.stream_name, Some(self.stream_id))
-            .await;
+        let stream = client.create_stream(&self.stream_name).await;
         assert!(stream.is_ok());
+        let stream_details = stream.unwrap();
+        self.stream_id = stream_details.id;
 
         let topic = client
             .create_topic(
@@ -109,12 +109,13 @@ impl IggyCmdTestCase for TestConsumerOffsetSetCmd {
                 1,
                 Default::default(),
                 None,
-                Some(self.topic_id),
                 IggyExpiry::NeverExpire,
                 MaxTopicSize::ServerDefault,
             )
             .await;
         assert!(topic.is_ok());
+        let topic_details = topic.unwrap();
+        self.topic_id = topic_details.id;
 
         let mut messages = (1..=self.stored_offset + 1)
             .filter_map(|id| IggyMessage::from_str(format!("Test message {id}").as_str()).ok())
@@ -274,7 +275,7 @@ pub async fn should_be_successful() {
                 String::from("stream"),
                 3,
                 String::from("topic"),
-                1,
+                0,
                 using_consumer_id,
                 using_stream_id,
                 using_topic_id,

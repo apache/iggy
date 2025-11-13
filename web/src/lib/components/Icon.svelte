@@ -68,7 +68,6 @@
   }
 
   let { strokeWidth = 1.7, name, class: className = '' }: Props = $props();
-  
 </script>
 
 <svg
@@ -78,5 +77,6 @@
   stroke-linecap="round"
   stroke-linejoin="round"
 >
+  <!-- eslint-disable-next-line svelte/no-at-html-tags -->
   {@html icons[name]}
 </svg>

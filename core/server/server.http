@@ -16,9 +16,9 @@
 # under the License.
 
 @url = http://localhost:3000
-@stream_id = 1
-@topic_id = 1
-@partition_id = 1
+@stream_id = 0
+@topic_id = 0
+@partition_id = 0
 @consumer_group_id = 1
 @consumer_id = 1
 @client_id = 1
@@ -208,7 +208,6 @@ Authorization: Bearer {{access_token}}
 Content-Type: application/json
 
 {
-  "stream_id": {{stream_id}},
   "name": "stream1"
 }
 
@@ -243,10 +242,9 @@ Authorization: Bearer {{access_token}}
 Content-Type: application/json
 
 {
-  "topic_id": {{topic_id}},
   "name": "topic1",
+  "partitions_count": 1,
   "compression_algorithm": "none",
-  "partitions_count": 3,
   "max_topic_size": 0,
   "message_expiry": 0
 }
@@ -346,7 +344,6 @@ Authorization: Bearer {{access_token}}
 Content-Type: application/json
 
 {
-  "consumer_group_id": {{consumer_group_id}},
   "name": "consumer_group_1"
 }
 

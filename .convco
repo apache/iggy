@@ -1,1 +1,0 @@
-scopeRegex: "(ci|sdk|server|connectors|cli|bench|misc|mcp|docs|io_uring|test|repo|deps|deps-dev|web|security)(,(ci|sdk|server|connectors|cli|bench|misc|mcp|docs|io_uring|test|repo|deps|deps-dev|web|security))*"

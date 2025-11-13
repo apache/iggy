@@ -29,17 +29,15 @@ import (
 
 // operations
 func successfullyCreateConsumer(streamId uint32, topicId uint32, cli iggycli.Client) (uint32, string) {
-	groupId := createRandomUInt32()
 	name := createRandomString(16)
 	streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 	topicIdentifier, _ := iggcon.NewIdentifier(topicId)
-	_, err := cli.CreateConsumerGroup(
+    group, err := cli.CreateConsumerGroup(
 		streamIdentifier,
 		topicIdentifier,
-		name,
-		&groupId)
-
-	itShouldSuccessfullyCreateConsumer(streamId, topicId, groupId, name, cli)
+        name)
+    groupId := group.Id
+    itShouldSuccessfullyCreateConsumer(streamId, topicId, groupId, name, cli)
 	itShouldNotReturnError(err)
 	return groupId, name
 }

@@ -23,7 +23,7 @@ from loguru import logger
 
 STREAM_NAME = "sample-stream"
 TOPIC_NAME = "sample-topic"
-PARTITION_ID = 1
+PARTITION_ID = 0
 
 
 async def main():

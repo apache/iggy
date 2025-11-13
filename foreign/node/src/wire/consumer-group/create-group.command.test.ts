@@ -29,19 +29,18 @@ describe('CreateGroup', () => {
     const s1 = {
       streamId: 5,
       topicId: 2,
-      groupId: 1,
       name: 'test-group'
     };
-    
+
     it('serialize group id & name into buffer', () => {
       assert.deepEqual(
         CREATE_GROUP.serialize(s1).length,
-        6 + 6 + 5 + s1.name.length
+        6 + 6 + 1 + s1.name.length
       );
     });
 
     it('throw on name < 1', () => {
-      const s2 = {...s1, name: ''}; 
+      const s2 = {...s1, name: ''};
       assert.throws(
         () => CREATE_GROUP.serialize(s2)
       );

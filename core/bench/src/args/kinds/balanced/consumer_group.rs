@@ -74,8 +74,8 @@ impl BenchmarkKindProps for BalancedConsumerGroupArgs {
     }
 
     fn validate(&self) {
-        let cg_number = self.consumer_groups.get();
-        let streams = self.streams.get();
+        let cg_number = self.number_of_consumer_groups();
+        let streams = self.streams();
         let mut cmd = IggyBenchArgs::command();
 
         if cg_number < streams {

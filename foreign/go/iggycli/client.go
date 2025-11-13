@@ -30,9 +30,9 @@ type Client interface {
 	// Authentication is required, and the permission to read the streams.
 	GetStreams() ([]iggcon.Stream, error)
 
-	// CreateStream create a new stream.
-	// Authentication is required, and the permission to manage the streams.
-	CreateStream(name string, streamId *uint32) (*iggcon.StreamDetails, error)
+    // CreateStream create a new stream.
+    // Authentication is required, and the permission to manage the streams.
+    CreateStream(name string) (*iggcon.StreamDetails, error)
 
 	// UpdateStream update a stream by unique ID or name.
 	// Authentication is required, and the permission to manage the streams.
@@ -52,16 +52,15 @@ type Client interface {
 
 	// CreateTopic create a new topic.
 	// Authentication is required, and the permission to manage the topics.
-	CreateTopic(
-		streamId iggcon.Identifier,
-		name string,
-		partitionsCount uint32,
-		compressionAlgorithm iggcon.CompressionAlgorithm,
-		messageExpiry iggcon.Duration,
-		maxTopicSize uint64,
-		replicationFactor *uint8,
-		topicId *uint32,
-	) (*iggcon.TopicDetails, error)
+    CreateTopic(
+        streamId iggcon.Identifier,
+        name string,
+        partitionsCount uint32,
+        compressionAlgorithm iggcon.CompressionAlgorithm,
+        messageExpiry iggcon.Duration,
+        maxTopicSize uint64,
+        replicationFactor *uint8,
+    ) (*iggcon.TopicDetails, error)
 
 	// UpdateTopic update a topic by unique ID or name.
 	// Authentication is required, and the permission to manage the topics.
@@ -142,12 +141,11 @@ type Client interface {
 
 	// CreateConsumerGroup create a new consumer group for the given stream and topic by unique IDs or names.
 	// Authentication is required, and the permission to manage the streams or topics.
-	CreateConsumerGroup(
-		streamId iggcon.Identifier,
-		topicId iggcon.Identifier,
-		name string,
-		groupId *uint32,
-	) (*iggcon.ConsumerGroupDetails, error)
+    CreateConsumerGroup(
+        streamId iggcon.Identifier,
+        topicId iggcon.Identifier,
+        name string,
+    ) (*iggcon.ConsumerGroupDetails, error)
 
 	// DeleteConsumerGroup delete a consumer group by unique ID or name for the given stream and topic by unique IDs or names.
 	// Authentication is required, and the permission to manage the streams or topics.

@@ -22,13 +22,13 @@ namespace Apache.Iggy.Kinds;
 public readonly struct Consumer
 {
     public required ConsumerType Type { get; init; }
-    public required Identifier Id { get; init; }
+    public required Identifier ConsumerId { get; init; }
 
     public static Consumer New(int id)
     {
         return new Consumer
         {
-            Id = Identifier.Numeric(id),
+            ConsumerId = Identifier.Numeric(id),
             Type = ConsumerType.Consumer
         };
     }
@@ -37,7 +37,7 @@ public readonly struct Consumer
     {
         return new Consumer
         {
-            Id = Identifier.String(id),
+            ConsumerId = Identifier.String(id),
             Type = ConsumerType.Consumer
         };
     }
@@ -46,7 +46,7 @@ public readonly struct Consumer
     {
         return new Consumer
         {
-            Id = Identifier.Numeric(id),
+            ConsumerId = Identifier.Numeric(id),
             Type = ConsumerType.ConsumerGroup
         };
     }
@@ -55,7 +55,7 @@ public readonly struct Consumer
     {
         return new Consumer
         {
-            Id = Identifier.String(id),
+            ConsumerId = Identifier.String(id),
             Type = ConsumerType.ConsumerGroup
         };
     }

@@ -75,7 +75,6 @@ impl ConsumerGroupClient for HttpClient {
         stream_id: &Identifier,
         topic_id: &Identifier,
         name: &str,
-        group_id: Option<u32>,
     ) -> Result<ConsumerGroupDetails, IggyError> {
         let response = self
             .post(
@@ -84,7 +83,6 @@ impl ConsumerGroupClient for HttpClient {
                     stream_id: stream_id.clone(),
                     topic_id: topic_id.clone(),
                     name: name.to_string(),
-                    group_id,
                 },
             )
             .await?;

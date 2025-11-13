@@ -49,10 +49,6 @@ func NewIdentifier[T uint32 | string](value T) (Identifier, error) {
 
 // newNumericIdentifier creates a new identifier from the given numeric value.
 func newNumericIdentifier(value uint32) (Identifier, error) {
-	if value == 0 {
-		return Identifier{}, ierror.ErrInvalidIdentifier
-	}
-
 	val := make([]byte, 4)
 	binary.LittleEndian.PutUint32(val, value)
 	return Identifier{
