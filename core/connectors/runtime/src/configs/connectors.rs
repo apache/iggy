@@ -117,13 +117,13 @@ pub trait ConnectorsConfigProvider: Send + Sync {
     async fn get_sink_config(
         &self,
         key: &str,
-        version: u64,
+        version: Option<u64>,
     ) -> Result<Option<SinkConfig>, RuntimeError>;
     async fn get_source_configs(&self, key: &str) -> Result<Vec<SourceConfig>, RuntimeError>;
     async fn get_source_config(
         &self,
         key: &str,
-        version: u64,
+        version: Option<u64>,
     ) -> Result<Option<SourceConfig>, RuntimeError>;
 }
 

@@ -163,7 +163,7 @@ async fn get_source_config(
 
     let config = context
         .config_provider
-        .get_source_config(&key, version)
+        .get_source_config(&key, Some(version))
         .await?;
 
     match config {

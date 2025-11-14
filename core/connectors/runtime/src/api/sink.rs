@@ -157,7 +157,7 @@ async fn get_sink_config(
 
     let config = context
         .config_provider
-        .get_sink_config(&key, version)
+        .get_sink_config(&key, Some(version))
         .await?;
 
     match config {

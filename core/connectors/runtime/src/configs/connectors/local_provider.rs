@@ -83,6 +83,14 @@ impl LocalConnectorsConfigProvider {
         }
         Ok(true)
     }
+
+    fn get_paths_with_key_prefix(&self, prefix: &str) -> Vec<String> {
+        self.file_mapping
+            .iter()
+            .filter(|entry| entry.key().starts_with(prefix))
+            .map(|entry| entry.value().clone())
+            .collect::<Vec<_>>()
+    }
 }
 
 #[derive(Display, Debug)]
@@ -238,12 +246,7 @@ impl ConnectorsConfigProvider for LocalConnectorsConfigProvider {
         let file_id = ConnectorConfigFileId::from_sink_key(key);
         let file_mapping_key_prefix = file_id.to_file_mapping_key_prefix();
 
-        let paths = self
-            .file_mapping
-            .iter()
-            .filter(|item| item.key().starts_with(&file_mapping_key_prefix))
-            .map(|item| item.value().clone())
-            .collect::<Vec<_>>();
+        let paths = self.get_paths_with_key_prefix(&file_mapping_key_prefix);
 
         let mut configs = Vec::new();
         for path in paths {
@@ -265,35 +268,44 @@ impl ConnectorsConfigProvider for LocalConnectorsConfigProvider {
     async fn get_sink_config(
         &self,
         key: &str,
-        version: u64,
+        version: Option<u64>,
     ) -> Result<Option<SinkConfig>, RuntimeError> {
         if !self.config_dir_exists()? {
             return Ok(None);
         }
 
-        let file_id = ConnectorConfigFileId::from_sink_key_and_version(key, version);
-        if let Some(path) = self.file_mapping.get(&file_id.to_file_mapping_key()) {
-            let path = path.value().clone();
-            let base_config = BaseConnectorConfig::Sink {
-                key: key.to_owned(),
-            };
-            let connector_config: ConnectorConfig =
-                Self::create_file_config_provider(path, &base_config)
-                    .load_config()
-                    .await
-                    .expect("Failed to load sink configuration");
-            if let ConnectorConfig::Sink(sink_config) = connector_config {
-                Ok(Some(sink_config))
+        if let Some(version) = version {
+            let file_id = ConnectorConfigFileId::from_sink_key_and_version(key, version);
+            if let Some(path) = self.file_mapping.get(&file_id.to_file_mapping_key()) {
+                let path = path.value().clone();
+                let base_config = BaseConnectorConfig::Sink {
+                    key: key.to_owned(),
+                };
+                let connector_config: ConnectorConfig =
+                    Self::create_file_config_provider(path, &base_config)
+                        .load_config()
+                        .await
+                        .expect("Failed to load sink configuration");
+                if let ConnectorConfig::Sink(sink_config) = connector_config {
+                    Ok(Some(sink_config))
+                } else {
+                    Err(RuntimeError::InvalidConfiguration(
+                        "Configuration is not a sink configuration".to_owned(),
+                    ))
+                }
             } else {
-                Err(RuntimeError::InvalidConfiguration(
-                    "Configuration is not a sink configuration".to_owned(),
-                ))
+                debug!("No file mapping found for connector config: {:?}", file_id);
+                Ok(None)
             }
         } else {
-            debug!("No file mapping found for connector config: {:?}", file_id);
-            Ok(None)
+            Ok(self
+                .get_sink_configs(key)
+                .await?
+                .into_iter()
+                .max_by_key(|config| config.version))
         }
     }
+
     async fn get_source_configs(&self, key: &str) -> Result<Vec<SourceConfig>, RuntimeError> {
         if !self.config_dir_exists()? {
             return Ok(Vec::new());
@@ -302,12 +314,7 @@ impl ConnectorsConfigProvider for LocalConnectorsConfigProvider {
         let file_id = ConnectorConfigFileId::from_source_key(key);
         let file_mapping_key_prefix = file_id.to_file_mapping_key_prefix();
 
-        let paths = self
-            .file_mapping
-            .iter()
-            .filter(|item| item.key().starts_with(&file_mapping_key_prefix))
-            .map(|item| item.value().clone())
-            .collect::<Vec<_>>();
+        let paths = self.get_paths_with_key_prefix(&file_mapping_key_prefix);
 
         let mut configs = Vec::new();
         for path in paths {
@@ -329,34 +336,42 @@ impl ConnectorsConfigProvider for LocalConnectorsConfigProvider {
     async fn get_source_config(
         &self,
         key: &str,
-        version: u64,
+        version: Option<u64>,
     ) -> Result<Option<SourceConfig>, RuntimeError> {
         if !self.config_dir_exists()? {
             return Ok(None);
         }
 
-        let file_id = ConnectorConfigFileId::from_source_key_and_version(key, version);
+        if let Some(version) = version {
+            let file_id = ConnectorConfigFileId::from_source_key_and_version(key, version);
 
-        if let Some(path) = self.file_mapping.get(&file_id.to_file_mapping_key()) {
-            let path = path.value().clone();
-            let base_config = BaseConnectorConfig::Sink {
-                key: key.to_owned(),
-            };
-            let connector_config: ConnectorConfig =
-                Self::create_file_config_provider(path, &base_config)
-                    .load_config()
-                    .await
-                    .expect("Failed to load sink configuration");
-            if let ConnectorConfig::Source(sink_config) = connector_config {
-                Ok(Some(sink_config))
+            if let Some(path) = self.file_mapping.get(&file_id.to_file_mapping_key()) {
+                let path = path.value().clone();
+                let base_config = BaseConnectorConfig::Sink {
+                    key: key.to_owned(),
+                };
+                let connector_config: ConnectorConfig =
+                    Self::create_file_config_provider(path, &base_config)
+                        .load_config()
+                        .await
+                        .expect("Failed to load sink configuration");
+                if let ConnectorConfig::Source(sink_config) = connector_config {
+                    Ok(Some(sink_config))
+                } else {
+                    Err(RuntimeError::InvalidConfiguration(
+                        "Configuration is not a source configuration".to_owned(),
+                    ))
+                }
             } else {
-                Err(RuntimeError::InvalidConfiguration(
-                    "Configuration is not a source configuration".to_owned(),
-                ))
+                debug!("No file mapping found for connector config: {:?}", file_id);
+                Ok(None)
             }
         } else {
-            debug!("No file mapping found for connector config: {:?}", file_id);
-            Ok(None)
+            Ok(self
+                .get_source_configs(key)
+                .await?
+                .into_iter()
+                .max_by_key(|config| config.version))
         }
     }
 }
