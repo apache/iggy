@@ -39,15 +39,15 @@ pub fn router(state: Arc<RuntimeContext>) -> Router {
     Router::new()
         .route("/sources", get(get_sources))
         .route("/sources/{key}", get(get_source))
-        .route(
-            "/sources/{key}/plugin_config",
-            get(get_source_plugin_config),
-        )
         .route("/sources/{key}/transforms", get(get_source_transforms))
         .route("/sources/{key}/configs", get(get_source_configs))
         .route("/sources/{key}/configs/{version}", get(get_source_config))
         .route(
-            "/sources/{key}/active_config",
+            "/sources/{key}/configs/plugin",
+            get(get_source_plugin_config),
+        )
+        .route(
+            "/sources/{key}/configs/active",
             get(get_source_active_config),
         )
         .with_state(state)

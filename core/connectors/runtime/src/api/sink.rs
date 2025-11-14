@@ -39,11 +39,11 @@ pub fn router(state: Arc<RuntimeContext>) -> Router {
     Router::new()
         .route("/sinks", get(get_sinks))
         .route("/sinks/{key}", get(get_sink))
-        .route("/sinks/{key}/plugin_config", get(get_sink_plugin_config))
         .route("/sinks/{key}/transforms", get(get_sink_transforms))
         .route("/sinks/{key}/configs", get(get_sink_configs))
         .route("/sinks/{key}/configs/{version}", get(get_sink_config))
-        .route("/sinks/{key}/active_config", get(get_sink_active_config))
+        .route("/sinks/{key}/configs/plugin", get(get_sink_plugin_config))
+        .route("/sinks/{key}/configs/active", get(get_sink_active_config))
         .with_state(state)
 }
 
