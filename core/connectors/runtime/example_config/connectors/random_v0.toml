@@ -16,12 +16,12 @@
 # under the License.
 
 type = "source"
-id = "random"
+key = "random"
 enabled = true
 version = 0
 name = "Random source"
 path = "target/release/libiggy_connector_random_source"
-config_format = "json"
+plugin_config_format = "json"
 
 [[streams]]
 stream = "example_stream"
@@ -30,7 +30,7 @@ schema = "json"
 batch_length = 1000
 linger_time = "5ms"
 
-[config]
+[plugin_config]
 interval = "100ms"
 max_count = 1000
 messages_range = [10, 50]

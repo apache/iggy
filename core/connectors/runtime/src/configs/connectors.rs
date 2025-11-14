@@ -61,28 +61,28 @@ impl Default for ConnectorConfig {
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct SinkConfig {
-    pub id: String,
+    pub key: String,
     pub enabled: bool,
     pub version: u64,
     pub name: String,
     pub path: String,
     pub transforms: Option<TransformsConfig>,
     pub streams: Vec<StreamConsumerConfig>,
-    pub config_format: Option<ConfigFormat>,
-    pub config: Option<serde_json::Value>,
+    pub plugin_config_format: Option<ConfigFormat>,
+    pub plugin_config: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct SourceConfig {
-    pub id: String,
+    pub key: String,
     pub enabled: bool,
     pub version: u64,
     pub name: String,
     pub path: String,
     pub transforms: Option<TransformsConfig>,
     pub streams: Vec<StreamProducerConfig>,
-    pub config_format: Option<ConfigFormat>,
-    pub config: Option<serde_json::Value>,
+    pub plugin_config_format: Option<ConfigFormat>,
+    pub plugin_config: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -111,8 +111,20 @@ pub struct StreamProducerConfig {
 }
 
 #[async_trait]
-pub trait ConnectorsConfigProvider {
-    async fn load_configs(&self) -> Result<ConnectorsConfig, RuntimeError>;
+pub trait ConnectorsConfigProvider: Send + Sync {
+    async fn get_all_configs(&self) -> Result<ConnectorsConfig, RuntimeError>;
+    async fn get_sink_configs(&self, key: &str) -> Result<Vec<SinkConfig>, RuntimeError>;
+    async fn get_sink_config(
+        &self,
+        key: &str,
+        version: u64,
+    ) -> Result<Option<SinkConfig>, RuntimeError>;
+    async fn get_source_configs(&self, key: &str) -> Result<Vec<SourceConfig>, RuntimeError>;
+    async fn get_source_config(
+        &self,
+        key: &str,
+        version: u64,
+    ) -> Result<Option<SourceConfig>, RuntimeError>;
 }
 
 impl From<RuntimeConnectorsConfig> for Box<dyn ConnectorsConfigProvider> {
@@ -128,8 +140,8 @@ impl From<RuntimeConnectorsConfig> for Box<dyn ConnectorsConfigProvider> {
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ConnectorsConfig {
-    sinks: HashMap<String, SinkConfig>,
-    sources: HashMap<String, SourceConfig>,
+    sinks: HashMap<String, Vec<SinkConfig>>,
+    sources: HashMap<String, Vec<SourceConfig>>,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -154,7 +166,7 @@ impl std::fmt::Display for SinkConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ enabled: {}, name: {}, path: {}, transforms: {:?}, streams: [{}], config_format: {:?} }}",
+            "{{ enabled: {}, name: {}, path: {}, transforms: {:?}, streams: [{}], plugin_config_format: {:?} }}",
             self.enabled,
             self.name,
             self.path,
@@ -164,7 +176,7 @@ impl std::fmt::Display for SinkConfig {
                 .map(|s| s.to_string())
                 .collect::<Vec<String>>()
                 .join(", "),
-            self.config_format,
+            self.plugin_config_format,
         )
     }
 }
@@ -173,7 +185,7 @@ impl std::fmt::Display for SourceConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ enabled: {}, name: {}, path: {}, transforms: {:?}, streams: [{}], config_format: {:?} }}",
+            "{{ enabled: {}, name: {}, path: {}, transforms: {:?}, streams: [{}], plugin_config_format: {:?} }}",
             self.enabled,
             self.name,
             self.path,
@@ -183,7 +195,7 @@ impl std::fmt::Display for SourceConfig {
                 .map(|s| s.to_string())
                 .collect::<Vec<String>>()
                 .join(", "),
-            self.config_format,
+            self.plugin_config_format,
         )
     }
 }
@@ -229,11 +241,35 @@ impl std::fmt::Display for StreamProducerConfig {
 }
 
 impl ConnectorsConfig {
-    pub fn sinks(&self) -> HashMap<String, SinkConfig> {
-        self.sinks.clone()
+    pub fn sinks_latest(&self) -> HashMap<String, SinkConfig> {
+        self.sinks
+            .iter()
+            .filter(|(_, v)| !v.is_empty())
+            .map(|(k, v)| {
+                (
+                    k.clone(),
+                    v.iter()
+                        .max_by_key(|config| config.version)
+                        .expect("at least one sink config must be present")
+                        .clone(),
+                )
+            })
+            .collect()
     }
 
-    pub fn sources(&self) -> HashMap<String, SourceConfig> {
-        self.sources.clone()
+    pub fn sources_latest(&self) -> HashMap<String, SourceConfig> {
+        self.sources
+            .iter()
+            .filter(|(_, v)| !v.is_empty())
+            .map(|(k, v)| {
+                (
+                    k.clone(),
+                    v.iter()
+                        .max_by_key(|config| config.version)
+                        .expect("at least one source config must be present")
+                        .clone(),
+                )
+            })
+            .collect()
     }
 }

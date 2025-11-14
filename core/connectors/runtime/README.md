@@ -71,9 +71,19 @@ Currently, it does expose the following endpoints:
 - `GET /health`: health status of the runtime.
 - `GET /sinks`: list of sinks.
 - `GET /sinks/{key}`: sink details.
-- `GET /sinks/{key}/config`: sink config, including the optional `format` query parameter to specify the config format.
+- `GET /sinks/{key}/configs`: list of configuration versions for the sink.
+- `POST /sinks/{key}/configs`: add a new configuration version for the sink.
+- `GET /sinks/{key}/configs/{version}`: configuration details for a specific version.
+- `GET /sinks/{key}/active_config`: active configuration details.
+- `PUT /sinks/{key}/active_config`: activate a specific configuration version for the sink.
+- `GET /sinks/{key}/plugin_config`: sink plugin config, including the optional `format` query parameter to specify the config format.
 - `GET /sinks/{key}/transforms`: sink transforms to be applied to the fields.
 - `GET /sources`: list of sources.
 - `GET /sources/{key}`: source details.
-- `GET /sources/{key}/config`: source config, including the optional `format` query parameter to specify the config format.
+- `GET /sources/{key}/configs`: list of configuration versions for the source.
+- `POST /sources/{key}/configs`: add a new configuration version for the source.
+- `GET /sources/{key}/configs/{version}`: configuration details for a specific version.
+- `GET /sources/{key}/active_config`: active configuration details.
+- `PUT /sources/{key}/active_config`: activate a specific configuration version for the source.
+- `GET /sources/{key}/plugin_config`: source plugin config, including the optional `format` query parameter to specify the config format.
 - `GET /sources/{key}/transforms`: source transforms to be applied to the fields.

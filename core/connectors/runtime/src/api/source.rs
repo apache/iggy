@@ -22,6 +22,7 @@ use super::{
     error::ApiError,
     models::{SourceDetailsResponse, SourceInfoResponse, TransformResponse},
 };
+use crate::api::models::SourceConfigResponse;
 use crate::configs::connectors::ConfigFormat;
 use crate::{context::RuntimeContext, error::RuntimeError};
 use axum::{
@@ -38,8 +39,17 @@ pub fn router(state: Arc<RuntimeContext>) -> Router {
     Router::new()
         .route("/sources", get(get_sources))
         .route("/sources/{key}", get(get_source))
-        .route("/sources/{key}/config", get(get_source_config))
+        .route(
+            "/sources/{key}/plugin_config",
+            get(get_source_plugin_config),
+        )
         .route("/sources/{key}/transforms", get(get_source_transforms))
+        .route("/sources/{key}/configs", get(get_source_configs))
+        .route("/sources/{key}/configs/{version}", get(get_source_config))
+        .route(
+            "/sources/{key}/active_config",
+            get(get_source_active_config),
+        )
         .with_state(state)
 }
 
@@ -66,11 +76,11 @@ async fn get_source(
     let source = source.lock().await;
     Ok(Json(SourceDetailsResponse {
         info: source.info.clone().into(),
-        streams: source.streams.to_vec(),
+        streams: source.config.streams.to_vec(),
     }))
 }
 
-async fn get_source_config(
+async fn get_source_plugin_config(
     State(context): State<Arc<RuntimeContext>>,
     Path(key): Path<String>,
     Query(query): Query<GetSourceConfig>,
@@ -79,13 +89,13 @@ async fn get_source_config(
         return Err(ApiError::Error(RuntimeError::SourceNotFound(key)));
     };
     let source = source.lock().await;
-    let Some(config) = source.config.as_ref() else {
+    let Some(config) = source.config.plugin_config.as_ref() else {
         return Ok(StatusCode::NOT_FOUND.into_response());
     };
 
     let format = query
         .format
-        .unwrap_or(source.info.config_format.unwrap_or_default());
+        .unwrap_or(source.info.plugin_config_format.unwrap_or_default());
     let (content_type, config) = map_connector_config(config, format)?;
     let mut headers = HeaderMap::new();
     headers.insert(header::CONTENT_TYPE, content_type);
@@ -105,7 +115,7 @@ async fn get_source_transforms(
         return Err(ApiError::Error(RuntimeError::SourceNotFound(key)));
     };
     let source = source.lock().await;
-    let Some(transforms) = source.transforms.as_ref() else {
+    let Some(transforms) = source.config.transforms.as_ref() else {
         return Ok(Json(vec![]));
     };
 
@@ -119,4 +129,68 @@ async fn get_source_transforms(
             })
             .collect(),
     ))
+}
+
+async fn get_source_configs(
+    State(context): State<Arc<RuntimeContext>>,
+    Path((key,)): Path<(String,)>,
+) -> Result<Json<Vec<SourceConfigResponse>>, ApiError> {
+    let active_config = context
+        .sources
+        .get_config(&key)
+        .await
+        .ok_or(ApiError::Error(RuntimeError::SourceNotFound(key.clone())))?;
+    let configs = context.config_provider.get_source_configs(&key).await?;
+    let configs = configs
+        .into_iter()
+        .map(|config| {
+            let active = config.version == active_config.version;
+            SourceConfigResponse { config, active }
+        })
+        .collect();
+    Ok(Json(configs))
+}
+
+async fn get_source_config(
+    State(context): State<Arc<RuntimeContext>>,
+    Path((key, version)): Path<(String, u64)>,
+) -> Result<Json<SourceConfigResponse>, ApiError> {
+    let active_config = context
+        .sources
+        .get_config(&key)
+        .await
+        .ok_or(ApiError::Error(RuntimeError::SourceNotFound(key.clone())))?;
+
+    let config = context
+        .config_provider
+        .get_source_config(&key, version)
+        .await?;
+
+    match config {
+        Some(source_config) => {
+            let active = source_config.version == active_config.version;
+            Ok(Json(SourceConfigResponse {
+                config: source_config,
+                active,
+            }))
+        }
+        None => Err(ApiError::Error(RuntimeError::SourceConfigNotFound(
+            key, version,
+        ))),
+    }
+}
+
+async fn get_source_active_config(
+    State(context): State<Arc<RuntimeContext>>,
+    Path((key,)): Path<(String,)>,
+) -> Result<Json<SourceConfigResponse>, ApiError> {
+    let config = context
+        .sources
+        .get_config(&key)
+        .await
+        .ok_or(ApiError::Error(RuntimeError::SourceNotFound(key)))?;
+    Ok(Json(SourceConfigResponse {
+        config,
+        active: true,
+    }))
 }

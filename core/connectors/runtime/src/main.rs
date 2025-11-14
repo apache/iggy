@@ -129,8 +129,8 @@ async fn main() -> Result<(), RuntimeError> {
     let connectors_config_provider: Box<dyn ConnectorsConfigProvider> =
         config.connectors.clone().into();
 
-    let connectors_config = connectors_config_provider.load_configs().await?;
-    let sources_config = connectors_config.sources();
+    let connectors_config = connectors_config_provider.get_all_configs().await?;
+    let sources_config = connectors_config.sources_latest();
     let sources = source::init(
         sources_config.clone(),
         &iggy_clients.producer,
@@ -138,7 +138,7 @@ async fn main() -> Result<(), RuntimeError> {
     )
     .await?;
 
-    let sinks_config = connectors_config.sinks();
+    let sinks_config = connectors_config.sinks_latest();
     let sinks = sink::init(sinks_config.clone(), &iggy_clients.consumer).await?;
 
     let mut sink_wrappers = vec![];
@@ -181,6 +181,7 @@ async fn main() -> Result<(), RuntimeError> {
         &sources_config,
         &sink_wrappers,
         &source_wrappers,
+        connectors_config_provider,
     );
     let context = Arc::new(context);
     api::init(&config.http, context).await;
