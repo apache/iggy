@@ -23,7 +23,7 @@ use super::{
     models::{SourceDetailsResponse, SourceInfoResponse, TransformResponse},
 };
 use crate::api::models::SourceConfigResponse;
-use crate::configs::connectors::ConfigFormat;
+use crate::configs::connectors::{ConfigFormat, CreateSourceConfigCommand};
 use crate::{context::RuntimeContext, error::RuntimeError};
 use axum::{
     Json, Router,
@@ -40,7 +40,10 @@ pub fn router(state: Arc<RuntimeContext>) -> Router {
         .route("/sources", get(get_sources))
         .route("/sources/{key}", get(get_source))
         .route("/sources/{key}/transforms", get(get_source_transforms))
-        .route("/sources/{key}/configs", get(get_source_configs))
+        .route(
+            "/sources/{key}/configs",
+            get(get_source_configs).post(create_source_config),
+        )
         .route("/sources/{key}/configs/{version}", get(get_source_config))
         .route(
             "/sources/{key}/configs/plugin",
@@ -149,6 +152,22 @@ async fn get_source_configs(
         })
         .collect();
     Ok(Json(configs))
+}
+
+async fn create_source_config(
+    State(context): State<Arc<RuntimeContext>>,
+    Path((key,)): Path<(String,)>,
+    Json(config): Json<CreateSourceConfigCommand>,
+) -> Result<Json<SourceConfigResponse>, ApiError> {
+    let created_config = context
+        .config_provider
+        .create_source_config(&key, config.clone())
+        .await?;
+
+    Ok(Json(SourceConfigResponse {
+        config: created_config,
+        active: false,
+    }))
 }
 
 async fn get_source_config(

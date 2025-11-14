@@ -23,7 +23,7 @@ use super::{
     models::{SinkDetailsResponse, SinkInfoResponse, TransformResponse},
 };
 use crate::api::models::SinkConfigResponse;
-use crate::configs::connectors::ConfigFormat;
+use crate::configs::connectors::{ConfigFormat, CreateSinkConfigCommand};
 use crate::{context::RuntimeContext, error::RuntimeError};
 use axum::{
     Json, Router,
@@ -40,7 +40,10 @@ pub fn router(state: Arc<RuntimeContext>) -> Router {
         .route("/sinks", get(get_sinks))
         .route("/sinks/{key}", get(get_sink))
         .route("/sinks/{key}/transforms", get(get_sink_transforms))
-        .route("/sinks/{key}/configs", get(get_sink_configs))
+        .route(
+            "/sinks/{key}/configs",
+            get(get_sink_configs).post(create_sink_config),
+        )
         .route("/sinks/{key}/configs/{version}", get(get_sink_config))
         .route("/sinks/{key}/configs/plugin", get(get_sink_plugin_config))
         .route("/sinks/{key}/configs/active", get(get_sink_active_config))
@@ -143,6 +146,22 @@ async fn get_sink_configs(
         })
         .collect();
     Ok(Json(configs))
+}
+
+async fn create_sink_config(
+    State(context): State<Arc<RuntimeContext>>,
+    Path((key,)): Path<(String,)>,
+    Json(config): Json<CreateSinkConfigCommand>,
+) -> Result<Json<SinkConfigResponse>, ApiError> {
+    let created_config = context
+        .config_provider
+        .create_sink_config(&key, config.clone())
+        .await?;
+
+    Ok(Json(SinkConfigResponse {
+        config: created_config,
+        active: false,
+    }))
 }
 
 async fn get_sink_config(

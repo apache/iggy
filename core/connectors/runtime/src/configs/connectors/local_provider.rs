@@ -19,7 +19,8 @@
 
 use crate::configs::connectors::local_provider::ConnectorType::{Sink, Source};
 use crate::configs::connectors::{
-    ConnectorConfig, ConnectorsConfig, ConnectorsConfigProvider, SinkConfig, SourceConfig,
+    ConnectorConfig, ConnectorsConfig, ConnectorsConfigProvider, CreateSinkConfigCommand,
+    CreateSourceConfigCommand, SinkConfig, SourceConfig,
 };
 use crate::error::RuntimeError;
 use async_trait::async_trait;
@@ -190,6 +191,84 @@ impl BaseConnectorConfig {
 
 #[async_trait]
 impl ConnectorsConfigProvider for LocalConnectorsConfigProvider {
+    async fn create_sink_config(
+        &self,
+        key: &str,
+        cmd: CreateSinkConfigCommand,
+    ) -> Result<SinkConfig, RuntimeError> {
+        if self.config_dir.is_empty() {
+            return Err(RuntimeError::InvalidConfiguration(
+                "Connectors configuration directory not provided".to_string(),
+            ));
+        }
+        std::fs::create_dir_all(&self.config_dir)?;
+
+        let next_version = self
+            .get_sink_config(key, None)
+            .await?
+            .map(|config| config.version + 1)
+            .unwrap_or(0);
+
+        let config = cmd.to_sink_config(key, next_version);
+
+        let connector_config = ConnectorConfig::Sink(config.clone());
+        let file_id: ConnectorConfigFileId = connector_config.clone().into();
+        if self
+            .file_mapping
+            .get(&file_id.to_file_mapping_key())
+            .is_some()
+        {
+            return Err(RuntimeError::InvalidConfiguration(
+                "Sink configuration with this version already exists".to_string(),
+            ));
+        }
+        let path = format!("{}/{}.toml", self.config_dir, file_id.to_file_mapping_key());
+        std::fs::write(&path, toml::to_string(&connector_config).unwrap())?;
+        self.file_mapping
+            .insert(file_id.to_file_mapping_key(), path);
+
+        Ok(config)
+    }
+
+    async fn create_source_config(
+        &self,
+        key: &str,
+        cmd: CreateSourceConfigCommand,
+    ) -> Result<SourceConfig, RuntimeError> {
+        if self.config_dir.is_empty() {
+            return Err(RuntimeError::InvalidConfiguration(
+                "Connectors configuration directory not provided".to_string(),
+            ));
+        }
+        std::fs::create_dir_all(&self.config_dir)?;
+
+        let next_version = self
+            .get_source_config(key, None)
+            .await?
+            .map(|config| config.version + 1)
+            .unwrap_or(0);
+
+        let config = cmd.to_source_config(key, next_version);
+
+        let connector_config = ConnectorConfig::Source(config.clone());
+        let file_id: ConnectorConfigFileId = connector_config.clone().into();
+        if self
+            .file_mapping
+            .get(&file_id.to_file_mapping_key())
+            .is_some()
+        {
+            return Err(RuntimeError::InvalidConfiguration(
+                "Source configuration with this version already exists".to_string(),
+            ));
+        }
+        let path = format!("{}/{}.toml", self.config_dir, file_id.to_file_mapping_key());
+        std::fs::write(&path, toml::to_string(&connector_config).unwrap())?;
+        self.file_mapping
+            .insert(file_id.to_file_mapping_key(), path);
+
+        Ok(config)
+    }
+
     async fn get_all_configs(&self) -> Result<ConnectorsConfig, RuntimeError> {
         if !self.config_dir_exists()? {
             return Ok(ConnectorsConfig::default());

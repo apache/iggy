@@ -60,6 +60,33 @@ impl Default for ConnectorConfig {
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct CreateSinkConfigCommand {
+    pub enabled: bool,
+    pub name: String,
+    pub path: String,
+    pub transforms: Option<TransformsConfig>,
+    pub streams: Vec<StreamConsumerConfig>,
+    pub plugin_config_format: Option<ConfigFormat>,
+    pub plugin_config: Option<serde_json::Value>,
+}
+
+impl CreateSinkConfigCommand {
+    fn to_sink_config(&self, key: &str, version: u64) -> SinkConfig {
+        SinkConfig {
+            key: key.to_owned(),
+            enabled: self.enabled,
+            version,
+            name: self.name.clone(),
+            path: self.path.clone(),
+            transforms: self.transforms.clone(),
+            streams: self.streams.clone(),
+            plugin_config_format: self.plugin_config_format,
+            plugin_config: self.plugin_config.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct SinkConfig {
     pub key: String,
     pub enabled: bool,
@@ -70,6 +97,33 @@ pub struct SinkConfig {
     pub streams: Vec<StreamConsumerConfig>,
     pub plugin_config_format: Option<ConfigFormat>,
     pub plugin_config: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct CreateSourceConfigCommand {
+    pub enabled: bool,
+    pub name: String,
+    pub path: String,
+    pub transforms: Option<TransformsConfig>,
+    pub streams: Vec<StreamProducerConfig>,
+    pub plugin_config_format: Option<ConfigFormat>,
+    pub plugin_config: Option<serde_json::Value>,
+}
+
+impl CreateSourceConfigCommand {
+    fn to_source_config(&self, key: &str, version: u64) -> SourceConfig {
+        SourceConfig {
+            key: key.to_owned(),
+            enabled: self.enabled,
+            version,
+            name: self.name.clone(),
+            path: self.path.clone(),
+            transforms: self.transforms.clone(),
+            streams: self.streams.clone(),
+            plugin_config_format: self.plugin_config_format,
+            plugin_config: self.plugin_config.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -112,6 +166,16 @@ pub struct StreamProducerConfig {
 
 #[async_trait]
 pub trait ConnectorsConfigProvider: Send + Sync {
+    async fn create_sink_config(
+        &self,
+        key: &str,
+        config: CreateSinkConfigCommand,
+    ) -> Result<SinkConfig, RuntimeError>;
+    async fn create_source_config(
+        &self,
+        key: &str,
+        config: CreateSourceConfigCommand,
+    ) -> Result<SourceConfig, RuntimeError>;
     async fn get_all_configs(&self) -> Result<ConnectorsConfig, RuntimeError>;
     async fn get_sink_configs(&self, key: &str) -> Result<Vec<SinkConfig>, RuntimeError>;
     async fn get_sink_config(
