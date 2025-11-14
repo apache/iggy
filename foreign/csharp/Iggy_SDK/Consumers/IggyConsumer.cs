@@ -37,14 +37,16 @@ public partial class IggyConsumer : IAsyncDisposable
     private readonly Channel<ReceivedMessage> _channel;
     private readonly IIggyClient _client;
     private readonly IggyConsumerConfig _config;
+    private readonly SemaphoreSlim _connectionStateSemaphore = new(1, 1);
+    private readonly EventAggregator<ConsumerErrorEventArgs> _consumerErrorEvents;
     private readonly ConcurrentDictionary<int, ulong> _lastPolledOffset = new();
     private readonly ILogger<IggyConsumer> _logger;
+    private readonly SemaphoreSlim _pollingSemaphore = new(1, 1);
     private string? _consumerGroupName;
-    private bool _disposed;
-    private bool _isInitialized;
+    private int _disposeState;
+    private volatile bool _isInitialized;
+    private volatile bool _joinedConsumerGroup;
     private long _lastPolledAtMs;
-    private bool _joinedConsumerGroup;
-    private readonly EventAggregator<ConsumerErrorEventArgs> _consumerErrorEvents;
 
     /// <summary>
     ///     Initializes a new instance of the <see cref="IggyConsumer" /> class
@@ -67,7 +69,7 @@ public partial class IggyConsumer : IAsyncDisposable
     /// </summary>
     public async ValueTask DisposeAsync()
     {
-        if (_disposed)
+        if (Interlocked.Exchange(ref _disposeState, 1) == 1)
         {
             return;
         }
@@ -106,7 +108,9 @@ public partial class IggyConsumer : IAsyncDisposable
         }
 
         _consumerErrorEvents.Clear();
-        _disposed = true;
+        _pollingSemaphore.Dispose();
+        _connectionStateSemaphore.Dispose();
+
     }
 
     /// <summary>
@@ -122,24 +126,37 @@ public partial class IggyConsumer : IAsyncDisposable
             return;
         }
 
-        if (_config.Consumer.Type == ConsumerType.ConsumerGroup && _config.PartitionId != null)
+        await _connectionStateSemaphore.WaitAsync(ct);
+        try
         {
-            LogPartitionIdIsIgnoredWhenConsumerTypeIsConsumerGroup();
-            _config.PartitionId = null;
+            if (_isInitialized)
+            {
+                return;
+            }
+
+            if (_config.Consumer.Type == ConsumerType.ConsumerGroup && _config.PartitionId != null)
+            {
+                LogPartitionIdIsIgnoredWhenConsumerTypeIsConsumerGroup();
+                _config.PartitionId = null;
+            }
+
+            await _client.ConnectAsync(ct);
+
+            if (_config.CreateIggyClient)
+            {
+                await _client.LoginUser(_config.Login, _config.Password, ct);
+            }
+
+            await InitializeConsumerGroupAsync(ct);
+
+            _client.SubscribeConnectionEvents(OnClientConnectionStateChanged);
+
+            _isInitialized = true;
         }
-
-        await _client.ConnectAsync(ct);
-
-        if (_config.CreateIggyClient)
+        finally
         {
-            await _client.LoginUser(_config.Login, _config.Password, ct);
+            _connectionStateSemaphore.Release();
         }
-
-        await InitializeConsumerGroupAsync(ct);
-
-        _client.SubscribeConnectionEvents(OnClientConnectionStateChanged);
-
-        _isInitialized = true;
     }
 
     /// <summary>
@@ -219,6 +236,11 @@ public partial class IggyConsumer : IAsyncDisposable
     /// </summary>
     private async Task InitializeConsumerGroupAsync(CancellationToken ct = default)
     {
+        if (_joinedConsumerGroup)
+        {
+            return;
+        }
+
         if (_config.Consumer.Type == ConsumerType.Consumer)
         {
             _joinedConsumerGroup = true;
@@ -302,18 +324,20 @@ public partial class IggyConsumer : IAsyncDisposable
     /// <summary>
     ///     Polls messages from the server and writes them to the internal channel.
     ///     Handles decryption, offset tracking, and auto-commit logic.
+    ///     Uses semaphore to ensure single concurrent polling operation.
     /// </summary>
     private async Task PollMessagesAsync(CancellationToken ct)
     {
+        if (!_joinedConsumerGroup)
+        {
+            LogConsumerGroupNotJoinedYetSkippingPolling();
+            return;
+        }
+
+        await _pollingSemaphore.WaitAsync(ct);
+
         try
         {
-            var cg = await _client.GetConsumerGroupByIdAsync(Identifier.String($"stream_0"), Identifier.String($"topic_0"), Identifier.String("cg-1"));
-            if (!_joinedConsumerGroup)
-            {
-                _logger.LogDebug("Consumer group not joined yet. Skipping polling");
-                return;
-            }
-
             if (_config.PollingIntervalMs > 0)
             {
                 await WaitBeforePollingAsync(ct);
@@ -323,16 +347,28 @@ public partial class IggyConsumer : IAsyncDisposable
                 _config.PartitionId, _config.Consumer, _config.PollingStrategy, _config.BatchSize,
                 _config.AutoCommit, ct);
 
-            if (_lastPolledOffset.TryGetValue(messages.PartitionId, out var value))
+            var receiveMessages = messages.Messages.Count > 0;
+
+            if (_lastPolledOffset.TryGetValue(messages.PartitionId, out var lastPolledPartitionOffset))
             {
-                messages.Messages = messages.Messages.Where(x => x.Header.Offset > value).ToList();
+                messages.Messages = messages.Messages.Where(x => x.Header.Offset > lastPolledPartitionOffset).ToList();
             }
 
-            if (!messages.Messages.Any())
+            if (messages.Messages.Count == 0
+                && receiveMessages
+                && _config.AutoCommitMode != AutoCommitMode.Disabled)
+            {
+                _logger.LogDebug("No new messages found, committing offset {Offset} for partition {PartitionId}",
+                    lastPolledPartitionOffset, messages.PartitionId);
+                await StoreOffsetAsync(lastPolledPartitionOffset, (uint)messages.PartitionId, ct);
+            }
+
+            if (messages.Messages.Count == 0)
             {
                 return;
             }
 
+            var currentOffset = 0ul;
             foreach (var message in messages.Messages)
             {
                 var processedMessage = message;
@@ -369,25 +405,25 @@ public partial class IggyConsumer : IAsyncDisposable
                 };
 
                 await _channel.Writer.WriteAsync(receivedMessage, ct);
-
-                _lastPolledOffset[messages.PartitionId] = message.Header.Offset;
+                currentOffset = receivedMessage.CurrentOffset;
             }
 
-            if (_config.AutoCommitMode == AutoCommitMode.AfterPoll)
-            {
-                await _client.StoreOffsetAsync(_config.Consumer, _config.StreamId, _config.TopicId,
-                    _lastPolledOffset[messages.PartitionId], (uint)messages.PartitionId, ct);
-            }
+            _lastPolledOffset.AddOrUpdate(messages.PartitionId, currentOffset,
+                (_, _) => currentOffset);
 
             if (_config.PollingStrategy.Kind == MessagePolling.Offset)
             {
-                _config.PollingStrategy = PollingStrategy.Offset(_lastPolledOffset[messages.PartitionId] + 1);
+                _config.PollingStrategy = PollingStrategy.Offset(currentOffset + 1);
             }
         }
         catch (Exception ex)
         {
             LogFailedToPollMessages(ex);
             _consumerErrorEvents.Publish(new ConsumerErrorEventArgs(ex, "Failed to poll messages"));
+        }
+        finally
+        {
+            _pollingSemaphore.Release();
         }
     }
 
@@ -441,17 +477,26 @@ public partial class IggyConsumer : IAsyncDisposable
     {
         LogConnectionStateChanged(e.PreviousState, e.CurrentState);
 
-        if (e.CurrentState == ConnectionState.Disconnected)
+        await _connectionStateSemaphore.WaitAsync();
+        try
         {
-            _joinedConsumerGroup = false;
-        }
-
-        if (e.CurrentState == ConnectionState.Authenticated && e.PreviousState != ConnectionState.Authenticated)
-        {
-            if (e.PreviousState is ConnectionState.Disconnected or ConnectionState.Connecting or ConnectionState.Authenticating)
+            if (e.CurrentState == ConnectionState.Disconnected)
             {
-                await RejoinConsumerGroupOnReconnectionAsync();
+                _joinedConsumerGroup = false;
             }
+
+            if (e.CurrentState != ConnectionState.Authenticated
+                || e.PreviousState == ConnectionState.Authenticated
+                || _joinedConsumerGroup)
+            {
+                return;
+            }
+
+            await RejoinConsumerGroupOnReconnectionAsync();
+        }
+        finally
+        {
+            _connectionStateSemaphore.Release();
         }
     }
 
@@ -463,6 +508,7 @@ public partial class IggyConsumer : IAsyncDisposable
     {
         if (string.IsNullOrEmpty(_consumerGroupName))
         {
+            LogConsumerGroupNameIsEmptySkippingRejoiningConsumerGroup();
             return;
         }
 
@@ -473,7 +519,8 @@ public partial class IggyConsumer : IAsyncDisposable
         catch (Exception ex)
         {
             LogFailedToRejoinConsumerGroup(ex, _consumerGroupName);
-            _consumerErrorEvents.Publish(new ConsumerErrorEventArgs(ex, "Failed to rejoin consumer group after reconnection"));
+            _consumerErrorEvents.Publish(new ConsumerErrorEventArgs(ex,
+                "Failed to rejoin consumer group after reconnection"));
         }
     }
 }

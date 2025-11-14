@@ -22,7 +22,6 @@ namespace Apache.Iggy.Consumers;
 
 public partial class IggyConsumer
 {
-    // Information logs
     [LoggerMessage(EventId = 100,
         Level = LogLevel.Information,
         Message = "Creating consumer group '{GroupName}' for stream {StreamId}, topic {TopicId}")]
@@ -60,7 +59,6 @@ public partial class IggyConsumer
         Message = "Failed to logout user or dispose client")]
     private partial void LogFailedToLogoutOrDispose(Exception exception);
 
-    // Error logs
     [LoggerMessage(EventId = 400,
         Level = LogLevel.Error,
         Message = "Failed to initialize consumer group '{GroupName}'")]
@@ -80,6 +78,16 @@ public partial class IggyConsumer
         Level = LogLevel.Debug,
         Message = "Message polling stopped")]
     private partial void LogMessagePollingStopped();
+
+    [LoggerMessage(EventId = 3,
+        Level = LogLevel.Debug,
+        Message = "Consumer group not joined yet. Skipping polling")]
+    partial void LogConsumerGroupNotJoinedYetSkippingPolling();
+
+    [LoggerMessage(EventId = 4,
+        Level = LogLevel.Debug,
+        Message = "Consumer group name is empty. Skipping rejoining consumer group")]
+    partial void LogConsumerGroupNameIsEmptySkippingRejoiningConsumerGroup();
 
     [LoggerMessage(EventId = 402,
         Level = LogLevel.Error,

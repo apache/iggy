@@ -564,7 +564,7 @@ public sealed class TcpMessageStream : IIggyClient
                 _stream = _configuration.TlsSettings.Enabled switch
                 {
                     true => CreateSslStreamAndAuthenticate(socket, _configuration.TlsSettings),
-                    false => new TcpConnectionStream(new NetworkStream(socket))
+                    false => new TcpConnectionStream(new NetworkStream(socket, true))
                 };
 
                 if (_configuration.AutoLoginSettings.Enabled)
@@ -866,7 +866,7 @@ public sealed class TcpMessageStream : IIggyClient
 
     private static TcpConnectionStream CreateSslStreamAndAuthenticate(Socket socket, TlsSettings tlsSettings)
     {
-        var stream = new NetworkStream(socket);
+        var stream = new NetworkStream(socket, true);
         var sslStream = new SslStream(stream);
         if (tlsSettings.Authenticate)
         {

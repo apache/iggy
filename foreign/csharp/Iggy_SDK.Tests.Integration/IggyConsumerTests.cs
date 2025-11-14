@@ -487,7 +487,7 @@ public class IggyConsumerTests
             .WithPollingStrategy(PollingStrategy.First())
             .WithBatchSize(5)
             .WithPartitionId(1)
-            .WithAutoCommitMode(AutoCommitMode.AfterPoll)
+            .WithAutoCommitMode(AutoCommitMode.Auto)
             .Build();
 
         await consumer.InitAsync();
