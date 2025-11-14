@@ -60,29 +60,83 @@ impl Default for ConnectorConfig {
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct CreateSinkConfigCommand {
+    pub enabled: bool,
+    pub name: String,
+    pub path: String,
+    pub transforms: Option<TransformsConfig>,
+    pub streams: Vec<StreamConsumerConfig>,
+    pub plugin_config_format: Option<ConfigFormat>,
+    pub plugin_config: Option<serde_json::Value>,
+}
+
+impl CreateSinkConfigCommand {
+    fn to_sink_config(&self, key: &str, version: u64) -> SinkConfig {
+        SinkConfig {
+            key: key.to_owned(),
+            enabled: self.enabled,
+            version,
+            name: self.name.clone(),
+            path: self.path.clone(),
+            transforms: self.transforms.clone(),
+            streams: self.streams.clone(),
+            plugin_config_format: self.plugin_config_format,
+            plugin_config: self.plugin_config.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct SinkConfig {
-    pub id: String,
+    pub key: String,
     pub enabled: bool,
     pub version: u64,
     pub name: String,
     pub path: String,
     pub transforms: Option<TransformsConfig>,
     pub streams: Vec<StreamConsumerConfig>,
-    pub config_format: Option<ConfigFormat>,
-    pub config: Option<serde_json::Value>,
+    pub plugin_config_format: Option<ConfigFormat>,
+    pub plugin_config: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct CreateSourceConfigCommand {
+    pub enabled: bool,
+    pub name: String,
+    pub path: String,
+    pub transforms: Option<TransformsConfig>,
+    pub streams: Vec<StreamProducerConfig>,
+    pub plugin_config_format: Option<ConfigFormat>,
+    pub plugin_config: Option<serde_json::Value>,
+}
+
+impl CreateSourceConfigCommand {
+    fn to_source_config(&self, key: &str, version: u64) -> SourceConfig {
+        SourceConfig {
+            key: key.to_owned(),
+            enabled: self.enabled,
+            version,
+            name: self.name.clone(),
+            path: self.path.clone(),
+            transforms: self.transforms.clone(),
+            streams: self.streams.clone(),
+            plugin_config_format: self.plugin_config_format,
+            plugin_config: self.plugin_config.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct SourceConfig {
-    pub id: String,
+    pub key: String,
     pub enabled: bool,
     pub version: u64,
     pub name: String,
     pub path: String,
     pub transforms: Option<TransformsConfig>,
     pub streams: Vec<StreamProducerConfig>,
-    pub config_format: Option<ConfigFormat>,
-    pub config: Option<serde_json::Value>,
+    pub plugin_config_format: Option<ConfigFormat>,
+    pub plugin_config: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -110,9 +164,46 @@ pub struct StreamProducerConfig {
     pub linger_time: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConnectorConfigVersionInfo {
+    pub version: u64,
+    pub is_active: bool,
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct ConnectorConfigVersions {
+    pub sinks: HashMap<String, Vec<ConnectorConfigVersionInfo>>,
+    pub sources: HashMap<String, Vec<ConnectorConfigVersionInfo>>,
+}
+
 #[async_trait]
-pub trait ConnectorsConfigProvider {
-    async fn load_configs(&self) -> Result<ConnectorsConfig, RuntimeError>;
+pub trait ConnectorsConfigProvider: Send + Sync {
+    async fn create_sink_config(
+        &self,
+        key: &str,
+        config: CreateSinkConfigCommand,
+    ) -> Result<SinkConfig, RuntimeError>;
+    async fn create_source_config(
+        &self,
+        key: &str,
+        config: CreateSourceConfigCommand,
+    ) -> Result<SourceConfig, RuntimeError>;
+    async fn get_all_active_configs(&self) -> Result<ConnectorsConfig, RuntimeError>;
+    async fn set_active_sink_version(&self, key: &str, version: u64) -> Result<(), RuntimeError>;
+    async fn set_active_source_version(&self, key: &str, version: u64) -> Result<(), RuntimeError>;
+    async fn get_sink_configs(&self, key: &str) -> Result<Vec<SinkConfig>, RuntimeError>;
+    async fn get_sink_config(
+        &self,
+        key: &str,
+        version: Option<u64>,
+    ) -> Result<Option<SinkConfig>, RuntimeError>;
+    async fn get_source_configs(&self, key: &str) -> Result<Vec<SourceConfig>, RuntimeError>;
+    async fn get_source_config(
+        &self,
+        key: &str,
+        version: Option<u64>,
+    ) -> Result<Option<SourceConfig>, RuntimeError>;
+    async fn get_config_versions(&self) -> Result<ConnectorConfigVersions, RuntimeError>;
 }
 
 impl From<RuntimeConnectorsConfig> for Box<dyn ConnectorsConfigProvider> {
@@ -154,7 +245,7 @@ impl std::fmt::Display for SinkConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ enabled: {}, name: {}, path: {}, transforms: {:?}, streams: [{}], config_format: {:?} }}",
+            "{{ enabled: {}, name: {}, path: {}, transforms: {:?}, streams: [{}], plugin_config_format: {:?} }}",
             self.enabled,
             self.name,
             self.path,
@@ -164,7 +255,7 @@ impl std::fmt::Display for SinkConfig {
                 .map(|s| s.to_string())
                 .collect::<Vec<String>>()
                 .join(", "),
-            self.config_format,
+            self.plugin_config_format,
         )
     }
 }
@@ -173,7 +264,7 @@ impl std::fmt::Display for SourceConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ enabled: {}, name: {}, path: {}, transforms: {:?}, streams: [{}], config_format: {:?} }}",
+            "{{ enabled: {}, name: {}, path: {}, transforms: {:?}, streams: [{}], plugin_config_format: {:?} }}",
             self.enabled,
             self.name,
             self.path,
@@ -183,7 +274,7 @@ impl std::fmt::Display for SourceConfig {
                 .map(|s| s.to_string())
                 .collect::<Vec<String>>()
                 .join(", "),
-            self.config_format,
+            self.plugin_config_format,
         )
     }
 }
@@ -229,11 +320,15 @@ impl std::fmt::Display for StreamProducerConfig {
 }
 
 impl ConnectorsConfig {
-    pub fn sinks(&self) -> HashMap<String, SinkConfig> {
-        self.sinks.clone()
+    pub fn new(sinks: HashMap<String, SinkConfig>, sources: HashMap<String, SourceConfig>) -> Self {
+        Self { sinks, sources }
     }
 
-    pub fn sources(&self) -> HashMap<String, SourceConfig> {
-        self.sources.clone()
+    pub fn sinks(&self) -> &HashMap<String, SinkConfig> {
+        &self.sinks
+    }
+
+    pub fn sources(&self) -> &HashMap<String, SourceConfig> {
+        &self.sources
     }
 }

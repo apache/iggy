@@ -58,30 +58,30 @@ pub struct HttpTlsConfig {
 }
 
 pub fn map_connector_config(
-    config: &serde_json::Value,
+    plugin_config: &serde_json::Value,
     format: ConfigFormat,
 ) -> Result<(HeaderValue, String), RuntimeError> {
     match format {
-        ConfigFormat::Json => Ok((JSON_HEADER, config.to_string())),
+        ConfigFormat::Json => Ok((JSON_HEADER, plugin_config.to_string())),
         ConfigFormat::Yaml => {
-            let config = serde_yaml_ng::to_value(config).map_err(|error| {
+            let plugin_config = serde_yaml_ng::to_value(plugin_config).map_err(|error| {
                 error!("Failed to convert configuration to YAML. {error}");
                 RuntimeError::CannotConvertConfiguration
             })?;
-            let config = serde_yaml_ng::to_string(&config).map_err(|error| {
+            let plugin_config = serde_yaml_ng::to_string(&plugin_config).map_err(|error| {
                 error!("Failed to serialize YAML configuration. {error}");
                 RuntimeError::CannotConvertConfiguration
             })?;
-            Ok((YAML_HEADER, config))
+            Ok((YAML_HEADER, plugin_config))
         }
         ConfigFormat::Toml => {
-            let config = toml::to_string(config).map_err(|error| {
+            let plugin_config = toml::to_string(plugin_config).map_err(|error| {
                 error!("Failed to convert configuration to TOML. {error}");
                 RuntimeError::CannotConvertConfiguration
             })?;
-            Ok((TOML_HEADER, config))
+            Ok((TOML_HEADER, plugin_config))
         }
-        ConfigFormat::Text => Ok((TEXT_HEADER, config.to_string())),
+        ConfigFormat::Text => Ok((TEXT_HEADER, plugin_config.to_string())),
     }
 }
 

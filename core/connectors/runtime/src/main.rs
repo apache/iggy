@@ -129,7 +129,7 @@ async fn main() -> Result<(), RuntimeError> {
     let connectors_config_provider: Box<dyn ConnectorsConfigProvider> =
         config.connectors.clone().into();
 
-    let connectors_config = connectors_config_provider.load_configs().await?;
+    let connectors_config = connectors_config_provider.get_all_active_configs().await?;
     let sources_config = connectors_config.sources();
     let sources = source::init(
         sources_config.clone(),
@@ -177,10 +177,11 @@ async fn main() -> Result<(), RuntimeError> {
 
     let context = context::init(
         &config,
-        &sinks_config,
-        &sources_config,
+        sinks_config,
+        sources_config,
         &sink_wrappers,
         &source_wrappers,
+        connectors_config_provider,
     );
     let context = Arc::new(context);
     api::init(&config.http, context).await;
