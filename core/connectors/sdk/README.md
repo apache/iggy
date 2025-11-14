@@ -34,6 +34,7 @@ username = "iggy"
 password = "iggy"
 
 [connectors]
+config_type = "local"
 config_dir = "path/to/connectors"
 ```
 
@@ -41,7 +42,9 @@ config_dir = "path/to/connectors"
 
 ```toml
 type = "source"
+id = "protobuf"
 enabled = true
+version = 0
 name = "Protobuf Source"
 path = "target/release/libiggy_connector_protobuf_source"
 
@@ -62,7 +65,9 @@ use_any_wrapper = true
 
 ```toml
 type = "sink"
+id = "protobuf"
 enabled = true
+version = 0
 name = "Protobuf Sink"
 path = "target/release/libiggy_connector_protobuf_sink"
 

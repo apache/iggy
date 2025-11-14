@@ -17,7 +17,7 @@
  * under the License.
  */
 
-use crate::configs::SinkConfig;
+use crate::configs::connectors::SinkConfig;
 use crate::{
     PLUGIN_ID, RuntimeError, SinkApi, SinkConnector, SinkConnectorConsumer, SinkConnectorPlugin,
     SinkConnectorWrapper, resolve_plugin_path, transform,
@@ -54,7 +54,10 @@ pub async fn init(
 
         let plugin_id = PLUGIN_ID.load(Ordering::Relaxed);
         let path = resolve_plugin_path(&config.path);
-        info!("Initializing sink container with name: {name} ({key}), plugin: {path}",);
+        info!(
+            "Initializing sink container with name: {name} ({key}), config version: {}, plugin: {path}",
+            &config.version
+        );
         if let Some(container) = sink_connectors.get_mut(&path) {
             info!("Sink container for plugin: {path} is already loaded.",);
             init_sink(

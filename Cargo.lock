@@ -4264,6 +4264,7 @@ dependencies = [
 name = "iggy-connectors"
 version = "0.2.0-edge.3"
 dependencies = [
+ "async-trait",
  "axum",
  "axum-server",
  "dashmap",
