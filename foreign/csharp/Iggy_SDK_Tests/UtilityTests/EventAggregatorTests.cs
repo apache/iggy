@@ -120,6 +120,9 @@ public class EventAggregatorTests
             executedEventValue = e;
             return Task.CompletedTask;
         });
+        
+        Assert.False(executed);
+        Assert.Equal(string.Empty, executedEventValue);
     }
 
     [Fact]
