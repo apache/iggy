@@ -4153,7 +4153,7 @@ dependencies = [
 
 [[package]]
 name = "iggy"
-version = "0.8.0-edge.4"
+version = "0.8.0-edge.5"
 dependencies = [
  "async-broadcast",
  "async-dropper",
@@ -4316,7 +4316,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_binary_protocol"
-version = "0.8.0-edge.4"
+version = "0.8.0-edge.5"
 dependencies = [
  "anyhow",
  "async-broadcast",
@@ -4337,7 +4337,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_common"
-version = "0.8.0-edge.4"
+version = "0.8.0-edge.5"
 dependencies = [
  "aes-gcm",
  "ahash 0.8.12",

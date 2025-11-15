@@ -200,6 +200,20 @@ impl IggyShard {
         partition_ids: &[usize],
     ) -> Result<(), IggyError> {
         for &partition_id in partition_ids {
+            // Skip if offset does not exist.
+            let has_offset = self
+                .streams
+                .with_partition_by_id(
+                    stream_id,
+                    topic_id,
+                    partition_id,
+                    partitions::helpers::get_consumer_group_offset(cg_id),
+                )
+                .is_some();
+            if !has_offset {
+                continue;
+            }
+
             let path = self.streams
                 .with_partition_by_id(stream_id, topic_id, partition_id, partitions::helpers::delete_consumer_group_offset(cg_id))
                 .with_error(|error| {
