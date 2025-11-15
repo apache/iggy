@@ -41,6 +41,7 @@ def parse_args() -> argparse.Namespace:
             "Connection string for Iggy client, e.g. 'iggy+tcp://iggy:iggy@127.0.0.1:8090'"
         ),
         default="iggy+tcp://iggy:iggy@127.0.0.1:8090",
+        nargs="?",
         type=str,
     )
     return parser.parse_args()

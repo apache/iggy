@@ -112,6 +112,10 @@ jobs:
           # Run the examples script which will use the prebuilt server binary
           ./scripts/run-csharp-examples-from-readme.sh
 
+      - name: Run Python examples
+        if: inputs.component == 'examples-suite' && inputs.task == 'examples-python'
+        uses: ./.github/actions/python-maturin/test-examples
+
       - name: Upload reports
         if: always()
         uses: actions/upload-artifact@v4
