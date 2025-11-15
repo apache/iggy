@@ -47,24 +47,36 @@
   "author": "github.com/T1B0",
   "license": "Apache-2.0",
   "dependencies": {
-    "debug": "4.3.7",
+    "debug": "4.4.3",
     "generic-pool": "3.9.0",
     "uuidv7": "1.0.2"
   },
   "devDependencies": {
-    "@commitlint/cli": "19.6.1",
-    "@commitlint/config-conventional": "19.6.0",
-    "@cucumber/cucumber": "11.3.0",
+    "@commitlint/cli": "20.1.0",
+    "@commitlint/config-conventional": "20.0.0",
+    "@cucumber/cucumber": "12.2.0",
     "@semantic-release/changelog": "6.0.3",
-    "@semantic-release/exec": "6.0.3",
+    "@semantic-release/exec": "7.1.0",
     "@semantic-release/git": "10.0.1",
-    "@semantic-release/release-notes-generator": "14.0.1",
-    "@swc-node/register": "1.10.9",
+    "@semantic-release/release-notes-generator": "14.1.0",
+    "@swc-node/register": "1.11.1",
     "@types/debug": "4.1.12",
-    "@types/node": "22.9.3",
+    "@types/node": "24.10.1",
     "husky": "9.1.7",
-    "semantic-release": "24.2.0",
-    "typescript": "5.7.2",
-    "typescript-eslint": "8.16.0"
+    "semantic-release": "^24.2.9",
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.46.4"
+  },
+  "optionalDependencies": {
+    "@swc/core-darwin-arm64": "^1.15.2",
+    "@swc/core-darwin-x64": "^1.15.2",
+    "@swc/core-linux-arm-gnueabihf": "^1.15.2",
+    "@swc/core-linux-arm64-gnu": "^1.15.2",
+    "@swc/core-linux-arm64-musl": "^1.15.2",
+    "@swc/core-linux-x64-gnu": "^1.15.2",
+    "@swc/core-linux-x64-musl": "^1.15.2",
+    "@swc/core-win32-arm64-msvc": "^1.15.2",
+    "@swc/core-win32-ia32-msvc": "^1.15.2",
+    "@swc/core-win32-x64-msvc": "^1.15.2"
   }
 }

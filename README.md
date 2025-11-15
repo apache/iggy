@@ -93,7 +93,7 @@ This is the high-level architecture of the Iggy message streaming server, where 
 
 The official releases follow the regular semver (`0.5.0`) or have `latest` tag applied (`apache/iggy:latest`).
 
-We do also publish edge/dev/nightly releases (e.g. `0.5.0-edge.1` or `apache/iggy:edge`), for both, SDKs and the Docker images, which are typically compatible with the latest changes, but are not guaranteed to be stable, and as the name states, are not recommended for production use.
+We do also publish edge/dev/nightly releases (e.g. `0.6.0-edge.1` or `apache/iggy:edge`), for both, SDKs and the Docker images, which are typically compatible with the latest changes, but are not guaranteed to be stable, and as the name states, are not recommended for production use.
 
 ---
 
@@ -192,6 +192,10 @@ cap_add:
   - SYS_NICE
 security_opt:
   - seccomp:unconfined
+ulimits:
+  memlock:
+    soft: -1
+    hard: -1
 ```
 
 ---

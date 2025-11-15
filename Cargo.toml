@@ -61,8 +61,8 @@ async_zip = { version = "0.0.18", features = [
     "deflate",
     "zstd",
 ] }
-axum = { version = "0.8.6", features = ["macros"] }
-axum-server = { version = "0.7.2", features = ["tls-rustls"] }
+axum = { version = "0.8.7", features = ["macros"] }
+axum-server = { version = "0.7.3", features = ["tls-rustls"] }
 base64 = "0.22.1"
 bench-dashboard-frontend = { path = "core/bench/dashboard/frontend" }
 bench-dashboard-server = { path = "core/bench/dashboard/server" }
@@ -77,7 +77,7 @@ byte-unit = { version = "5.1.6", default-features = false, features = [
     "byte",
     "std",
 ] }
-bytes = "1.10.1"
+bytes = "1.11.0"
 charming = "0.6.0"
 chrono = { version = "0.4.42", features = ["serde"] }
 clap = { version = "4.5.51", features = ["derive", "wrap_help"] }
@@ -90,7 +90,7 @@ compio = { version = "0.16.0", features = [
     "time",
     "rustls",
 ] }
-compio-io = "0.8.2"
+compio-io = "0.8.3"
 compio-net = "0.9.0"
 compio-quic = "0.5.1"
 compio-tls = { version = "0.7.1", features = [
@@ -150,7 +150,7 @@ rust-s3 = { version = "0.37.0", default-features = false, features = [
 rustls = { version = "0.23.35", features = ["ring"] }
 serde = { version = "1.0.228", features = ["derive", "rc"] }
 serde_json = "1.0.145"
-serde_with = { version = "3.15.1", features = ["base64", "macros"] }
+serde_with = { version = "3.16.0", features = ["base64", "macros"] }
 serde_yaml_ng = "0.10.0"
 serial_test = "3.2.0"
 server = { path = "core/server" }
