@@ -42,7 +42,7 @@ config_dir = "path/to/connectors"
 
 ```toml
 type = "source"
-id = "protobuf"
+key = "protobuf"
 enabled = true
 version = 0
 name = "Protobuf Source"
@@ -55,7 +55,7 @@ schema = "proto"
 batch_size = 1000
 send_interval = "5ms"
 
-[config]
+[plugin_config]
 schema_path = "schemas/message.proto"
 message_type = "com.example.Message"
 use_any_wrapper = true
@@ -65,7 +65,7 @@ use_any_wrapper = true
 
 ```toml
 type = "sink"
-id = "protobuf"
+key = "protobuf"
 enabled = true
 version = 0
 name = "Protobuf Sink"

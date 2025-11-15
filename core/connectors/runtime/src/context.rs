@@ -16,7 +16,7 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-use crate::configs::connectors::{SinkConfig, SourceConfig};
+use crate::configs::connectors::{ConnectorsConfigProvider, SinkConfig, SourceConfig};
 use crate::configs::runtime::ConnectorsRuntimeConfig;
 use crate::{
     SinkConnectorWrapper, SourceConnectorWrapper,
@@ -26,12 +26,14 @@ use crate::{
     },
 };
 use std::collections::HashMap;
+use std::sync::Arc;
 use tracing::error;
 
 pub struct RuntimeContext {
     pub sinks: SinkManager,
     pub sources: SourceManager,
     pub api_key: String,
+    pub config_provider: Arc<dyn ConnectorsConfigProvider>,
 }
 
 pub fn init(
@@ -40,11 +42,13 @@ pub fn init(
     sources_config: &HashMap<String, SourceConfig>,
     sink_wrappers: &[SinkConnectorWrapper],
     source_wrappers: &[SourceConnectorWrapper],
+    config_provider: Box<dyn ConnectorsConfigProvider>,
 ) -> RuntimeContext {
     RuntimeContext {
         sinks: SinkManager::new(map_sinks(sinks_config, sink_wrappers)),
         sources: SourceManager::new(map_sources(sources_config, source_wrappers)),
         api_key: config.http.api_key.to_owned(),
+        config_provider: Arc::from(config_provider),
     }
 }
 
@@ -68,11 +72,9 @@ fn map_sinks(
                     path: sink_plugin.path.to_owned(),
                     enabled: sink_config.enabled,
                     running: sink_config.enabled,
-                    config_format: sink_plugin.config_format,
+                    plugin_config_format: sink_plugin.config_format,
                 },
-                config: sink_config.config.clone(),
-                transforms: sink_config.transforms.clone(),
-                streams: sink_config.streams.clone(),
+                config: sink_config.clone(),
             });
         }
     }
@@ -99,11 +101,9 @@ fn map_sources(
                     path: source_plugin.path.to_owned(),
                     enabled: source_config.enabled,
                     running: source_config.enabled,
-                    config_format: source_plugin.config_format,
+                    plugin_config_format: source_plugin.config_format,
                 },
-                config: source_config.config.clone(),
-                transforms: source_config.transforms.clone(),
-                streams: source_config.streams.clone(),
+                config: source_config.clone(),
             });
         }
     }
