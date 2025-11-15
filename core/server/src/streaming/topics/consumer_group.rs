@@ -196,6 +196,10 @@ impl ConsumerGroup {
         Self { root, members }
     }
 
+    pub fn partitions(&self) -> &Vec<partitions::ContainerId> {
+        &self.root.partitions
+    }
+
     pub fn members(&self) -> &ConsumerGroupMembers {
         &self.members
     }

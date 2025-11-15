@@ -24,6 +24,7 @@ use crate::shard::IggyShard;
 use crate::shard::transmission::event::ShardEvent;
 use crate::slab::traits_ext::EntityMarker;
 use crate::state::command::EntryCommand;
+use crate::streaming::polling_consumer::ConsumerGroupId;
 use crate::streaming::session::Session;
 use anyhow::Result;
 use err_trail::ErrContext;
@@ -53,6 +54,7 @@ impl ServerCommandHandler for DeleteConsumerGroup {
             )
         })?;
         let cg_id = cg.id();
+        let partition_ids = cg.partitions();
 
         // Remove all consumer group members from ClientManager using helper functions to resolve identifiers
         let stream_id_usize = shard.streams.with_stream_by_id(
@@ -81,6 +83,22 @@ impl ServerCommandHandler for DeleteConsumerGroup {
                 );
             }
         }
+
+        let cg_id_spez = ConsumerGroupId(cg_id);
+        // Delete all consumer group offsets for this group using the specialized method
+        shard.delete_consumer_group_offsets(
+            cg_id_spez,
+            &self.stream_id,
+            &self.topic_id,
+            partition_ids,
+        ).await.with_error(|error| {
+            format!(
+                "{COMPONENT} (error: {error}) - failed to delete consumer group offsets for group ID: {} in stream: {}, topic: {}",
+                cg_id_spez,
+                self.stream_id,
+                self.topic_id
+            )
+        })?;
 
         let event = ShardEvent::DeletedConsumerGroup {
             id: cg_id,

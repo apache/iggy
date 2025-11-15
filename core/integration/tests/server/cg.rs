@@ -17,7 +17,7 @@
 
 use crate::server::{
     ScenarioFn, auto_commit_reconnection_scenario, join_scenario, multiple_clients_scenario,
-    run_scenario, single_client_scenario,
+    offset_cleanup_scenario, run_scenario, single_client_scenario,
 };
 use iggy_common::TransportProtocol;
 use serial_test::parallel;
@@ -32,6 +32,7 @@ use test_case::test_matrix;
         single_client_scenario(),
         multiple_clients_scenario(),
         auto_commit_reconnection_scenario(),
+        offset_cleanup_scenario(),
     ]
 )]
 #[tokio::test]

@@ -20,6 +20,7 @@ pub mod bench_scenario;
 pub mod concurrent_scenario;
 pub mod consumer_group_auto_commit_reconnection_scenario;
 pub mod consumer_group_join_scenario;
+pub mod consumer_group_offset_cleanup_scenario;
 pub mod consumer_group_with_multiple_clients_polling_messages_scenario;
 pub mod consumer_group_with_single_client_polling_messages_scenario;
 pub mod create_message_payload;

@@ -32,6 +32,7 @@ use integration::{
 };
 use scenarios::{
     bench_scenario, consumer_group_auto_commit_reconnection_scenario, consumer_group_join_scenario,
+    consumer_group_offset_cleanup_scenario,
     consumer_group_with_multiple_clients_polling_messages_scenario,
     consumer_group_with_single_client_polling_messages_scenario, create_message_payload,
     message_headers_scenario, stream_size_validation_scenario, system_scenario, user_scenario,
@@ -79,6 +80,10 @@ fn auto_commit_reconnection_scenario() -> ScenarioFn {
             factory,
         ))
     }
+}
+
+fn offset_cleanup_scenario() -> ScenarioFn {
+    |factory| Box::pin(consumer_group_offset_cleanup_scenario::run(factory))
 }
 
 fn bench_scenario() -> ScenarioFn {
