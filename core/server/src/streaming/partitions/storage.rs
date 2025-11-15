@@ -17,8 +17,10 @@
 
 use super::COMPONENT;
 use crate::{
-    configs::system::SystemConfig, io::fs_utils::remove_dir_all,
+    configs::system::SystemConfig,
+    io::fs_utils::remove_dir_all,
     streaming::partitions::consumer_offset::ConsumerOffset,
+    streaming::polling_consumer::{ConsumerGroupId, MemberId},
 };
 use compio::{
     fs::{self, OpenOptions, create_dir_all},
@@ -159,10 +161,7 @@ pub async fn persist_offset(path: &str, offset: u64) -> Result<(), IggyError> {
     Ok(())
 }
 
-pub fn load_consumer_offsets(
-    path: &str,
-    kind: ConsumerKind,
-) -> Result<Vec<ConsumerOffset>, IggyError> {
+pub fn load_consumer_offsets(path: &str) -> Result<Vec<ConsumerOffset>, IggyError> {
     trace!("Loading consumer offsets from path: {path}...");
     let dir_entries = std::fs::read_dir(path);
     if dir_entries.is_err() {
@@ -183,11 +182,9 @@ pub fn load_consumer_offsets(
         }
 
         let name = dir_entry.file_name().into_string().unwrap();
-        let consumer_id = name.parse::<u32>();
-        if consumer_id.is_err() {
-            error!("Invalid consumer ID file with name: '{}'.", name);
-            continue;
-        }
+        let consumer_id = name.parse::<u32>().unwrap_or_else(|_| {
+            panic!("Invalid consumer ID file with name: '{}'.", name);
+        });
 
         let path = dir_entry.path();
         let path = path.to_str();
@@ -197,7 +194,6 @@ pub fn load_consumer_offsets(
         }
 
         let path = path.unwrap().to_string();
-        let consumer_id = consumer_id.unwrap();
         let file = std::fs::File::open(&path)
             .with_error(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to open offset file, path: {path}")
@@ -214,7 +210,7 @@ pub fn load_consumer_offsets(
         let offset = AtomicU64::new(u64::from_le_bytes(offset));
 
         consumer_offsets.push(ConsumerOffset {
-            kind,
+            kind: ConsumerKind::Consumer,
             consumer_id,
             offset,
             path,
@@ -223,4 +219,94 @@ pub fn load_consumer_offsets(
 
     consumer_offsets.sort_by(|a, b| a.consumer_id.cmp(&b.consumer_id));
     Ok(consumer_offsets)
+}
+
+pub fn load_consumer_group_offsets(
+    path: &str,
+) -> Result<Vec<(ConsumerGroupId, MemberId, ConsumerOffset)>, IggyError> {
+    trace!("Loading consumer group offsets from path: {path}...");
+    let dir_entries = std::fs::read_dir(path);
+    if dir_entries.is_err() {
+        return Err(IggyError::CannotReadConsumerOffsets(path.to_owned()));
+    }
+
+    let mut consumer_group_offsets = Vec::new();
+    let dir_entries = dir_entries.unwrap();
+    for dir_entry in dir_entries {
+        let dir_entry = dir_entry.unwrap();
+        let metadata = dir_entry.metadata();
+        if metadata.is_err() {
+            break;
+        }
+
+        if metadata.unwrap().is_dir() {
+            continue;
+        }
+
+        let name = dir_entry.file_name().into_string().unwrap();
+
+        // For consumer groups, filename format is: {consumer_group_id}_{member_id}
+        let (consumer_group_id, member_id) = if let Some(underscore_pos) = name.find('_') {
+            let consumer_group_id_str = &name[..underscore_pos];
+            let member_id_str = &name[underscore_pos + 1..];
+            let consumer_group_id = consumer_group_id_str.parse::<u32>().unwrap_or_else(|_| {
+                panic!(
+                    "Invalid consumer group ID in consumer group file with name: '{}'.",
+                    name
+                );
+            });
+            let member_id = member_id_str.parse::<u32>().unwrap_or_else(|_| {
+                panic!(
+                    "Invalid member ID in consumer group file with name: '{}'.",
+                    name
+                );
+            });
+            (
+                ConsumerGroupId(consumer_group_id as usize),
+                MemberId(member_id as usize),
+            )
+        } else {
+            panic!(
+                "Invalid consumer group file format with name: '{}'. Expected format: 'group_id_member_id'.",
+                name
+            );
+        };
+
+        let path = dir_entry.path();
+        let path = path.to_str();
+        if path.is_none() {
+            error!(
+                "Invalid consumer group offset path for file with name: '{}'.",
+                name
+            );
+            continue;
+        }
+
+        let path = path.unwrap().to_string();
+        let file = std::fs::File::open(&path)
+            .with_error(|error| {
+                format!("{COMPONENT} (error: {error}) - failed to open offset file, path: {path}")
+            })
+            .map_err(|_| IggyError::CannotReadFile)?;
+        let mut cursor = std::io::Cursor::new(file);
+        let mut offset = [0; 8];
+        cursor
+            .get_mut().read_exact(&mut offset)
+            .with_error(|error| {
+                format!("{COMPONENT} (error: {error}) - failed to read consumer group offset from file, path: {path}")
+            })
+            .map_err(|_| IggyError::CannotReadFile)?;
+        let offset = AtomicU64::new(u64::from_le_bytes(offset));
+
+        let consumer_offset = ConsumerOffset {
+            kind: ConsumerKind::ConsumerGroup,
+            consumer_id: member_id.0 as u32,
+            offset,
+            path,
+        };
+
+        consumer_group_offsets.push((consumer_group_id, member_id, consumer_offset));
+    }
+
+    Ok(consumer_group_offsets)
 }

@@ -128,12 +128,17 @@ impl IggyShard {
                 partition_id,
                 partitions::helpers::get_consumer_offset(id),
             ),
-            PollingConsumer::ConsumerGroup(_, id) => self.streams.with_partition_by_id(
-                stream_id,
-                topic_id,
-                partition_id,
-                partitions::helpers::get_consumer_group_member_offset(id),
-            ),
+            PollingConsumer::ConsumerGroup(consumer_group_id, member_id) => {
+                self.streams.with_partition_by_id(
+                    stream_id,
+                    topic_id,
+                    partition_id,
+                    partitions::helpers::get_consumer_group_member_offset(
+                        consumer_group_id,
+                        member_id,
+                    ),
+                )
+            }
         };
         Ok(offset)
     }
@@ -216,13 +221,14 @@ impl IggyShard {
                     ),
                 );
             }
-            PollingConsumer::ConsumerGroup(_, id) => {
+            PollingConsumer::ConsumerGroup(consumer_group_id, member_id) => {
                 self.streams.with_partition_by_id(
                     stream_id,
                     topic_id,
                     partition_id,
                     partitions::helpers::store_consumer_group_member_offset(
-                        *id,
+                        *consumer_group_id,
+                        *member_id,
                         stream_id_num,
                         topic_id_num,
                         partition_id,
@@ -250,11 +256,11 @@ impl IggyShard {
                         )
                     })
             }
-            PollingConsumer::ConsumerGroup(_, id) => {
+            PollingConsumer::ConsumerGroup(consumer_group_id, member_id) => {
                 self.streams
-                    .with_partition_by_id(stream_id, topic_id, partition_id, partitions::helpers::delete_consumer_group_member_offset(*id)).with_error(|error| {
+                    .with_partition_by_id(stream_id, topic_id, partition_id, partitions::helpers::delete_consumer_group_member_offset(*consumer_group_id, *member_id)).with_error(|error| {
                         format!(
-                            "{COMPONENT} (error: {error}) - failed to delete consumer group member offset for member with ID: {id} in topic with ID: {topic_id} and stream with ID: {stream_id}",
+                            "{COMPONENT} (error: {error}) - failed to delete consumer group member offset for member with ID: {member_id:?} in topic with ID: {topic_id} and stream with ID: {stream_id}",
                         )
                     })
             }
@@ -286,19 +292,21 @@ impl IggyShard {
                 );
                 partitions::storage::persist_offset(&path, offset_value).await
             }
-            PollingConsumer::ConsumerGroup(_, id) => {
+            PollingConsumer::ConsumerGroup(consumer_group_id, member_id) => {
                 let (offset_value, path) = self.streams.with_partition_by_id(
                     stream_id,
                     topic_id,
                     partition_id,
-                    |(.., offsets, _)| {
+                    move |(.., offsets, _)| {
                         let hdl = offsets.pin();
-                        let item = hdl.get(id).expect(
-                            "persist_consumer_group_member_offset_to_disk: offset not found",
-                        );
-                        let offset = item.offset.load(std::sync::atomic::Ordering::Relaxed);
-                        let path = item.path.clone();
-                        (offset, path)
+                        let key = (*consumer_group_id, *member_id);
+                        let item = hdl
+                            .get(&key)
+                            .expect("persist_consumer_offset_to_disk: offset not found");
+                        (
+                            item.offset.load(std::sync::atomic::Ordering::Relaxed),
+                            item.path.clone(),
+                        )
                     },
                 );
                 partitions::storage::persist_offset(&path, offset_value).await

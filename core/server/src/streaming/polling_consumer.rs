@@ -20,10 +20,28 @@ use crate::streaming::utils::hash;
 use iggy_common::{IdKind, Identifier};
 use std::fmt::{Display, Formatter};
 
+#[derive(Debug, PartialEq, Eq, Hash, Copy, Clone)]
+pub struct ConsumerGroupId(pub usize);
+
+impl Display for ConsumerGroupId {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Hash, Copy, Clone)]
+pub struct MemberId(pub usize);
+
+impl Display for MemberId {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 #[derive(Debug, PartialEq, Copy, Clone)]
 pub enum PollingConsumer {
-    Consumer(usize, usize),      // Consumer ID + Partition ID
-    ConsumerGroup(usize, usize), // Consumer Group ID + Member ID
+    Consumer(usize, usize),                   // Consumer ID + Partition ID
+    ConsumerGroup(ConsumerGroupId, MemberId), // Consumer Group ID + Member ID
 }
 
 impl PollingConsumer {
@@ -32,7 +50,7 @@ impl PollingConsumer {
     }
 
     pub fn consumer_group(consumer_group_id: usize, member_id: usize) -> Self {
-        PollingConsumer::ConsumerGroup(consumer_group_id, member_id)
+        PollingConsumer::ConsumerGroup(ConsumerGroupId(consumer_group_id), MemberId(member_id))
     }
 
     pub fn resolve_consumer_id(identifier: &Identifier) -> usize {
@@ -103,8 +121,8 @@ mod tests {
 
         match polling_consumer {
             PollingConsumer::ConsumerGroup(consumer_group_id, member_id) => {
-                assert_eq!(consumer_group_id, group_id);
-                assert_eq!(member_id, client_id);
+                assert_eq!(consumer_group_id, ConsumerGroupId(group_id));
+                assert_eq!(member_id, MemberId(client_id));
             }
             _ => panic!("Expected ConsumerGroup"),
         }

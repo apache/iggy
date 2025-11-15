@@ -29,6 +29,7 @@ use crate::{
             consumer_offset, helpers::create_message_deduplicator, journal::MemoryMessageJournal,
             log::SegmentedLog,
         },
+        polling_consumer::{ConsumerGroupId, MemberId},
         stats::{PartitionStats, TopicStats},
     },
 };
@@ -69,7 +70,9 @@ impl std::ops::DerefMut for ConsumerOffsets {
 }
 
 #[derive(Debug, Clone)]
-pub struct ConsumerGroupOffsets(papaya::HashMap<usize, consumer_offset::ConsumerOffset>);
+pub struct ConsumerGroupOffsets(
+    papaya::HashMap<(ConsumerGroupId, MemberId), consumer_offset::ConsumerOffset>,
+);
 
 impl ConsumerGroupOffsets {
     pub fn with_capacity(capacity: usize) -> Self {
@@ -79,7 +82,7 @@ impl ConsumerGroupOffsets {
 
 impl<I> From<I> for ConsumerGroupOffsets
 where
-    I: IntoIterator<Item = (usize, consumer_offset::ConsumerOffset)>,
+    I: IntoIterator<Item = ((ConsumerGroupId, MemberId), consumer_offset::ConsumerOffset)>,
 {
     fn from(iter: I) -> Self {
         Self(papaya::HashMap::from_iter(iter))
@@ -87,7 +90,7 @@ where
 }
 
 impl std::ops::Deref for ConsumerGroupOffsets {
-    type Target = papaya::HashMap<usize, consumer_offset::ConsumerOffset>;
+    type Target = papaya::HashMap<(ConsumerGroupId, MemberId), consumer_offset::ConsumerOffset>;
 
     fn deref(&self) -> &Self::Target {
         &self.0
