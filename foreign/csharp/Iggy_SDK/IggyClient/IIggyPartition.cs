@@ -17,11 +17,31 @@
 
 namespace Apache.Iggy.IggyClient;
 
+/// <summary>
+///     Defines methods for managing partitions within topics in an Iggy client.
+///     Partitions distribute messages across multiple storage units for scalability and parallel processing.
+/// </summary>
 public interface IIggyPartition
 {
+    /// <summary>
+    ///     Deletes a specified number of partitions from a topic.
+    /// </summary>
+    /// <param name="streamId">The identifier of the stream containing the topic (numeric ID or name).</param>
+    /// <param name="topicId">The identifier of the topic (numeric ID or name).</param>
+    /// <param name="partitionsCount">The number of partitions to delete.</param>
+    /// <param name="token">The cancellation token to cancel the operation.</param>
+    /// <returns>A task representing the asynchronous operation.</returns>
     Task DeletePartitionsAsync(Identifier streamId, Identifier topicId, uint partitionsCount,
         CancellationToken token = default);
 
+    /// <summary>
+    ///     Creates and adds new partitions to a topic.
+    /// </summary>
+    /// <param name="streamId">The identifier of the stream containing the topic (numeric ID or name).</param>
+    /// <param name="topicId">The identifier of the topic (numeric ID or name).</param>
+    /// <param name="partitionsCount">The number of new partitions to create.</param>
+    /// <param name="token">The cancellation token to cancel the operation.</param>
+    /// <returns>A task representing the asynchronous operation.</returns>
     Task CreatePartitionsAsync(Identifier streamId, Identifier topicId, uint partitionsCount,
         CancellationToken token = default);
 }

@@ -42,13 +42,11 @@ public partial class IggyConsumer
         Message = "Successfully joined consumer group '{GroupName}'")]
     private partial void LogConsumerGroupJoined(string groupName);
 
-    // Trace logs
     [LoggerMessage(EventId = 200,
         Level = LogLevel.Trace,
         Message = "Left consumer group '{GroupName}'")]
     private partial void LogLeftConsumerGroup(string groupName);
 
-    // Warning logs
     [LoggerMessage(EventId = 302,
         Level = LogLevel.Warning,
         Message = "Failed to leave consumer group '{GroupName}'")]

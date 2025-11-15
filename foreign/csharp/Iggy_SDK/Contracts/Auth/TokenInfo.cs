@@ -20,10 +20,19 @@ using Apache.Iggy.JsonConverters;
 
 namespace Apache.Iggy.Contracts.Auth;
 
+/// <summary>
+///     Details about an access token.
+/// </summary>
 public class TokenInfo
 {
+    /// <summary>
+    ///     Access token.
+    /// </summary>
     public required string Token { get; init; }
 
+    /// <summary>
+    ///     Expiry date of the token.
+    /// </summary>
     [JsonConverter(typeof(ExpiryConverter))]
     public required DateTimeOffset? Expiry { get; init; }
 }

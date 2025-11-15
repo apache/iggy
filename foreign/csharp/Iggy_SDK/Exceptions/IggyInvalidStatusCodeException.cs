@@ -17,8 +17,14 @@
 
 namespace Apache.Iggy.Exceptions;
 
+/// <summary>
+///     Exception thrown when the status code returned by the server is not valid.
+/// </summary>
 public sealed class IggyInvalidStatusCodeException : Exception
 {
+    /// <summary>
+    ///     Status code returned by the server.
+    /// </summary>
     public int StatusCode { get; init; }
 
     internal IggyInvalidStatusCodeException(int statusCode, string message) : base(message)

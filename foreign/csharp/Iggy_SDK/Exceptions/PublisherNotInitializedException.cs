@@ -17,19 +17,16 @@
 
 namespace Apache.Iggy.Exceptions;
 
+/// <summary>
+///     Exception thrown when trying to send a message before the publisher is initialized.
+/// </summary>
 public sealed class PublisherNotInitializedException : InvalidOperationException
 {
+    /// <summary>
+    ///     Initializes a new instance of the <see cref="PublisherNotInitializedException" /> class.
+    /// </summary>
     public PublisherNotInitializedException()
         : base("Publisher must be initialized before sending messages. Call InitAsync() first.")
-    {
-    }
-
-    public PublisherNotInitializedException(string message) : base(message)
-    {
-    }
-
-    public PublisherNotInitializedException(string message, Exception innerException)
-        : base(message, innerException)
     {
     }
 }

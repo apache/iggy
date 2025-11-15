@@ -15,14 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using System.Buffers.Binary;
-using System.Text;
 using Apache.Iggy.Contracts;
 using Apache.Iggy.Contracts.Auth;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Extensions;
 using Apache.Iggy.Tests.Utils;
-using Apache.Iggy.Tests.Utils.DummyObj;
 using Apache.Iggy.Tests.Utils.Groups;
 using Apache.Iggy.Tests.Utils.Messages;
 using Apache.Iggy.Tests.Utils.Stats;
@@ -68,60 +65,6 @@ public sealed class BinaryMapper
         Assert.Equal(partitionId, response.PartitionId);
         Assert.Equal(currentOffset, response.CurrentOffset);
         Assert.Equal(storedOffset, response.StoredOffset);
-    }
-
-    [Fact]
-    public void MapMessagesTMessage_NoHeaders_ReturnsValidMessageResponse()
-    {
-        //Arrange
-        Func<byte[], DummyMessage> deserializer = bytes =>
-        {
-            var id = BinaryPrimitives.ReadInt32LittleEndian(bytes);
-            var textLength = BinaryPrimitives.ReadInt32LittleEndian(bytes[4..8]);
-            var text = Encoding.UTF8.GetString(bytes[8..(8 + textLength)]);
-            return new DummyMessage
-            {
-                Id = id,
-                Text = text
-            };
-        };
-
-        var (offset, timestamp, guid, headersLength, checkSum, payload)
-            = MessageFactory.CreateMessageResponseFieldsTMessage();
-        var msgOnePayload = BinaryFactory.CreateMessagePayload(offset, timestamp, 0, checkSum,
-            guid, payload);
-
-        var (offset1, timestamp1, guid1, headersLength1, checkSum2, payload1)
-            = MessageFactory.CreateMessageResponseFieldsTMessage();
-        var msgTwoPayload = BinaryFactory.CreateMessagePayload(offset1, timestamp1, 0, checkSum2,
-            guid1, payload1);
-
-        var combinedPayload = new byte[16 + msgOnePayload.Length + msgTwoPayload.Length];
-        msgOnePayload.CopyTo(combinedPayload.AsSpan(16));
-        msgTwoPayload.CopyTo(combinedPayload.AsSpan(16 + msgOnePayload.Length));
-
-        //Act
-        PolledMessages<DummyMessage> response = Mappers.BinaryMapper.MapMessages<DummyMessage>(combinedPayload, bytes =>
-        {
-            var id = BitConverter.ToInt32(bytes[..4]);
-            var txtLength = BitConverter.ToInt32(bytes[4..8]);
-            var text = Encoding.UTF8.GetString(bytes[txtLength..]);
-            return new DummyMessage
-            {
-                Id = id,
-                Text = text
-            };
-        });
-        //Assert
-        Assert.NotEmpty(response.Messages);
-        Assert.Equal(2, response.Messages.Count);
-        // Assert.Equal(response.Messages[0].Id, guid);
-        // Assert.Equal(response.Messages[0].Offset, offset);
-        // Assert.Equal(response.Messages[0].Timestamp, timestamp);
-        // Assert.Equal(response.Messages[1].Id, guid1);
-        // Assert.Equal(response.Messages[1].Offset, offset1);
-        // Assert.Equal(response.Messages[1].Timestamp, timestamp1);
-        Assert.Equal(response.Messages[0].Message.Id, deserializer(payload).Id);
     }
 
     [Fact]

@@ -20,10 +20,10 @@ using Apache.Iggy.JsonConverters;
 using Apache.Iggy.Kinds;
 using Apache.Iggy.Messages;
 
-namespace Apache.Iggy.Contracts;
+namespace Apache.Iggy.Contracts.Http;
 
 [JsonConverter(typeof(MessagesConverter))]
-public sealed class MessageSendRequest
+internal sealed class MessageSendRequest
 {
     public required Identifier StreamId { get; init; }
     public required Identifier TopicId { get; init; }

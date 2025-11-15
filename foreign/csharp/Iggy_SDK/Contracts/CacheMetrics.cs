@@ -17,9 +17,23 @@
 
 namespace Apache.Iggy.Contracts;
 
+/// <summary>
+///     Cache metrics for a specific partition
+/// </summary>
 public class CacheMetrics
 {
+    /// <summary>
+    ///     Number of cache hits.
+    /// </summary>
     public ulong Hits { get; set; }
+
+    /// <summary>
+    ///     Number of cache misses.
+    /// </summary>
     public ulong Misses { get; set; }
+
+    /// <summary>
+    ///     Cache hit ratio.
+    /// </summary>
     public float HitRatio { get; set; }
 }

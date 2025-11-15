@@ -17,8 +17,14 @@
 
 namespace Apache.Iggy.Exceptions;
 
+/// <summary>
+///     Exception thrown when the response from the server is invalid.
+/// </summary>
 public sealed class InvalidResponseException : Exception
 {
+    /// <summary>
+    ///     Initializes a new instance of the <see cref="InvalidResponseException" /> class.
+    /// </summary>
     internal InvalidResponseException(string message) : base(message)
     {
     }

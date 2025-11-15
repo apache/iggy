@@ -28,7 +28,7 @@ namespace Apache.Iggy.Tests.Integrations.Fixtures;
 
 public class IggyServerFixture : IAsyncInitializer, IAsyncDisposable
 {
-    private readonly IContainer _iggyContainer = new ContainerBuilder().WithImage("apache/iggy:0.6.0-edge.2")
+    private readonly IContainer _iggyContainer = new ContainerBuilder().WithImage("apache/iggy:edge")
         .WithPortBinding(3000, true)
         .WithPortBinding(8090, true)
         .WithOutputConsumer(Consume.RedirectStdoutAndStderrToConsole())
@@ -53,20 +53,6 @@ public class IggyServerFixture : IAsyncInitializer, IAsyncDisposable
         .Build();
 
     private string? _iggyServerHost;
-
-    private Action<MessageBatchingSettings> BatchingSettings { get; } = options =>
-    {
-        options.Enabled = false;
-        options.Interval = TimeSpan.FromMilliseconds(100);
-        options.MaxMessagesPerBatch = 1000;
-        options.MaxRequests = 4096;
-    };
-
-    private Action<MessagePollingSettings> PollingSettings { get; } = options =>
-    {
-        options.Interval = TimeSpan.FromMilliseconds(100);
-        options.StoreOffsetStrategy = StoreOffset.WhenMessagesAreReceived;
-    };
 
     public async ValueTask DisposeAsync()
     {
@@ -97,7 +83,8 @@ public class IggyServerFixture : IAsyncInitializer, IAsyncDisposable
         return dictionary;
     }
 
-    public async Task<IIggyClient> CreateTcpClient(string userName = "iggy", string password = "iggy", bool connect = true)
+    public async Task<IIggyClient> CreateTcpClient(string userName = "iggy", string password = "iggy",
+        bool connect = true)
     {
         var client = await CreateClient(Protocol.Tcp, connect: connect);
 
@@ -118,19 +105,17 @@ public class IggyServerFixture : IAsyncInitializer, IAsyncDisposable
         return client;
     }
 
-    public async Task<IIggyClient> CreateClient(Protocol protocol, Protocol? targetContainer = null, bool connect = true)
+    public async Task<IIggyClient> CreateClient(Protocol protocol, Protocol? targetContainer = null,
+        bool connect = true)
     {
         var address = GetIggyAddress(protocol);
 
-        var client = IggyClientFactory.CreateClient(new IggyClientConfigurator()
+        var client = IggyClientFactory.CreateClient(new IggyClientConfigurator
         {
             BaseAddress = address,
             Protocol = protocol,
-            ReconnectionSettings = new ReconnectionSettings()
-            {
-                Enabled = true
-            },
-            AutoLoginSettings = new AutoLoginSettings()
+            ReconnectionSettings = new ReconnectionSettings { Enabled = true },
+            AutoLoginSettings = new AutoLoginSettings
             {
                 Enabled = true,
                 Username = "iggy",
@@ -162,7 +147,6 @@ public class IggyServerFixture : IAsyncInitializer, IAsyncDisposable
         return protocol == Protocol.Tcp
             ? $"{_iggyServerHost}:8090"
             : $"http://{_iggyServerHost}:3000";
-
     }
 
     public static IEnumerable<Func<Protocol>> ProtocolData()

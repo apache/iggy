@@ -19,12 +19,38 @@ using Apache.Iggy.Enums;
 
 namespace Apache.Iggy.Contracts;
 
+/// <summary>
+///     Details about a client.
+/// </summary>
 public sealed class ClientResponse
 {
+    /// <summary>
+    ///     Client identifier.
+    /// </summary>
     public required uint ClientId { get; init; }
+
+    /// <summary>
+    ///     Remote address of the client.
+    /// </summary>
     public required string Address { get; init; }
+
+    /// <summary>
+    ///     Identifier of the user. This field is optional, as the client might be connected but not authenticated yet.
+    /// </summary>
     public required uint? UserId { get; init; }
+
+    /// <summary>
+    ///     Transport protocol used by the client.
+    /// </summary>
     public required Protocol Transport { get; init; }
+
+    /// <summary>
+    ///     Number of consumer groups the client is part of.
+    /// </summary>
     public required int ConsumerGroupsCount { get; init; }
+
+    /// <summary>
+    ///     List of consumer groups the client is part of.
+    /// </summary>
     public IEnumerable<ConsumerGroupInfo> ConsumerGroups { get; init; } = [];
 }

@@ -17,6 +17,9 @@
 
 namespace Apache.Iggy.Configuration;
 
+/// <summary>
+///     Settings for automatic reconnection
+/// </summary>
 public sealed class ReconnectionSettings
 {
     /// <summary>

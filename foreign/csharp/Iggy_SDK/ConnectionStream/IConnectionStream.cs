@@ -17,7 +17,7 @@
 
 namespace Apache.Iggy.ConnectionStream;
 
-public interface IConnectionStream : IDisposable
+internal interface IConnectionStream : IDisposable
 {
     ValueTask SendAsync(ReadOnlyMemory<byte> payload, CancellationToken cancellationToken = default);
     ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default);

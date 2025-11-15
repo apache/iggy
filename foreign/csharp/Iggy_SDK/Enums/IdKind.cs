@@ -20,9 +20,19 @@ using System.Runtime.CompilerServices;
 
 namespace Apache.Iggy.Enums;
 
+/// <summary>
+///     The kind of identifier.
+/// </summary>
 public enum IdKind
 {
+    /// <summary>
+    ///     Numeric identifier.
+    /// </summary>
     Numeric,
+
+    /// <summary>
+    ///     String identifier.
+    /// </summary>
     String
 }
 
