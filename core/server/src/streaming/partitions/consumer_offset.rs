@@ -17,7 +17,7 @@
 
 use std::sync::atomic::AtomicU64;
 
-use crate::streaming::polling_consumer::{ConsumerGroupId, MemberId};
+use crate::streaming::polling_consumer::ConsumerGroupId;
 use iggy_common::ConsumerKind;
 
 #[derive(Debug)]
@@ -49,16 +49,12 @@ impl ConsumerOffset {
         }
     }
 
-    pub fn default_for_consumer_group(
-        consumer_group_id: ConsumerGroupId,
-        member_id: MemberId,
-        path: &str,
-    ) -> Self {
+    pub fn default_for_consumer_group(consumer_group_id: ConsumerGroupId, path: &str) -> Self {
         Self {
             kind: ConsumerKind::ConsumerGroup,
-            consumer_id: member_id.0 as u32,
+            consumer_id: consumer_group_id.0 as u32,
             offset: AtomicU64::new(0),
-            path: format!("{path}/{}_{}", consumer_group_id.0, member_id.0),
+            path: format!("{path}/{}", consumer_group_id.0),
         }
     }
 

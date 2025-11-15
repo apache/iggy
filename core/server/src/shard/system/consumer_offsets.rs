@@ -128,15 +128,12 @@ impl IggyShard {
                 partition_id,
                 partitions::helpers::get_consumer_offset(id),
             ),
-            PollingConsumer::ConsumerGroup(consumer_group_id, member_id) => {
+            PollingConsumer::ConsumerGroup(consumer_group_id, _) => {
                 self.streams.with_partition_by_id(
                     stream_id,
                     topic_id,
                     partition_id,
-                    partitions::helpers::get_consumer_group_member_offset(
-                        consumer_group_id,
-                        member_id,
-                    ),
+                    partitions::helpers::get_consumer_group_offset(consumer_group_id),
                 )
             }
         };
@@ -221,14 +218,13 @@ impl IggyShard {
                     ),
                 );
             }
-            PollingConsumer::ConsumerGroup(consumer_group_id, member_id) => {
+            PollingConsumer::ConsumerGroup(consumer_group_id, _) => {
                 self.streams.with_partition_by_id(
                     stream_id,
                     topic_id,
                     partition_id,
-                    partitions::helpers::store_consumer_group_member_offset(
+                    partitions::helpers::store_consumer_group_offset(
                         *consumer_group_id,
-                        *member_id,
                         stream_id_num,
                         topic_id_num,
                         partition_id,
@@ -256,11 +252,11 @@ impl IggyShard {
                         )
                     })
             }
-            PollingConsumer::ConsumerGroup(consumer_group_id, member_id) => {
+            PollingConsumer::ConsumerGroup(consumer_group_id, _) => {
                 self.streams
-                    .with_partition_by_id(stream_id, topic_id, partition_id, partitions::helpers::delete_consumer_group_member_offset(*consumer_group_id, *member_id)).with_error(|error| {
+                    .with_partition_by_id(stream_id, topic_id, partition_id, partitions::helpers::delete_consumer_group_offset(*consumer_group_id)).with_error(|error| {
                         format!(
-                            "{COMPONENT} (error: {error}) - failed to delete consumer group member offset for member with ID: {member_id:?} in topic with ID: {topic_id} and stream with ID: {stream_id}",
+                            "{COMPONENT} (error: {error}) - failed to delete consumer group offset for group with ID: {consumer_group_id:?} in topic with ID: {topic_id} and stream with ID: {stream_id}",
                         )
                     })
             }
@@ -292,16 +288,15 @@ impl IggyShard {
                 );
                 partitions::storage::persist_offset(&path, offset_value).await
             }
-            PollingConsumer::ConsumerGroup(consumer_group_id, member_id) => {
+            PollingConsumer::ConsumerGroup(consumer_group_id, _) => {
                 let (offset_value, path) = self.streams.with_partition_by_id(
                     stream_id,
                     topic_id,
                     partition_id,
                     move |(.., offsets, _)| {
                         let hdl = offsets.pin();
-                        let key = (*consumer_group_id, *member_id);
                         let item = hdl
-                            .get(&key)
+                            .get(consumer_group_id)
                             .expect("persist_consumer_offset_to_disk: offset not found");
                         (
                             item.offset.load(std::sync::atomic::Ordering::Relaxed),

@@ -52,7 +52,7 @@ use crate::{
         },
         persistence::persister::{FilePersister, FileWithSyncPersister, PersisterKind},
         personal_access_tokens::personal_access_token::PersonalAccessToken,
-        polling_consumer::{ConsumerGroupId, MemberId},
+        polling_consumer::ConsumerGroupId,
         segments::{Segment, storage::Storage},
         stats::{PartitionStats, StreamStats, TopicStats},
         storage::SystemStorage,
@@ -704,8 +704,7 @@ async fn load_partition(
     let consumer_group_offset = Arc::new(
         load_consumer_group_offsets(&consumer_group_offsets_path)?
             .into_iter()
-            .map(|(consumer_group_id, member_id, offset)| ((consumer_group_id, member_id), offset))
-            .collect::<HashMap<(ConsumerGroupId, MemberId), ConsumerOffset>>()
+            .collect::<HashMap<ConsumerGroupId, ConsumerOffset>>()
             .into(),
     );
 

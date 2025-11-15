@@ -376,14 +376,13 @@ impl MainOps for Streams {
                             streaming_partitions::helpers::get_consumer_offset(consumer_id),
                         )
                         .map(|c_offset| c_offset.stored_offset),
-                    PollingConsumer::ConsumerGroup(consumer_group_id, member_id) => self
+                    PollingConsumer::ConsumerGroup(consumer_group_id, _) => self
                         .with_partition_by_id(
                             stream_id,
                             topic_id,
                             partition_id,
-                            streaming_partitions::helpers::get_consumer_group_member_offset(
+                            streaming_partitions::helpers::get_consumer_group_offset(
                                 consumer_group_id,
-                                member_id,
                             ),
                         )
                         .map(|cg_offset| cg_offset.stored_offset),
@@ -1448,12 +1447,11 @@ impl Streams {
                 );
                 crate::streaming::partitions::storage::persist_offset(&path, offset_value).await?;
             }
-            PollingConsumer::ConsumerGroup(consumer_group_id, member_id) => {
+            PollingConsumer::ConsumerGroup(consumer_group_id, _) => {
                 tracing::trace!(
-                    "Auto-committing offset {} for consumer group {} member {} on stream {}, topic {}, partition {}",
+                    "Auto-committing offset {} for consumer group {} on stream {}, topic {}, partition {}",
                     offset,
                     consumer_group_id.0,
-                    member_id.0,
                     numeric_stream_id,
                     numeric_topic_id,
                     partition_id
@@ -1464,12 +1462,10 @@ impl Streams {
                     partition_id,
                     |(.., offsets, _)| {
                         let hdl = offsets.pin();
-                        let key = (consumer_group_id, member_id);
                         let item = hdl.get_or_insert(
-                            key,
+                            consumer_group_id,
                             ConsumerOffset::default_for_consumer_group(
                                 consumer_group_id,
-                                member_id,
                                 &config.get_consumer_group_offsets_path(
                                     numeric_stream_id,
                                     numeric_topic_id,

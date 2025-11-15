@@ -16,7 +16,7 @@
 // under the License.
 
 use crate::server::{
-    ScenarioFn, auto_commit_reconnection_scenario, join_scenario, multiple_clients_scenario, 
+    ScenarioFn, auto_commit_reconnection_scenario, join_scenario, multiple_clients_scenario,
     run_scenario, single_client_scenario,
 };
 use iggy_common::TransportProtocol;

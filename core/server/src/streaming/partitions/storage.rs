@@ -17,10 +17,9 @@
 
 use super::COMPONENT;
 use crate::{
-    configs::system::SystemConfig,
-    io::fs_utils::remove_dir_all,
+    configs::system::SystemConfig, io::fs_utils::remove_dir_all,
     streaming::partitions::consumer_offset::ConsumerOffset,
-    streaming::polling_consumer::{ConsumerGroupId, MemberId},
+    streaming::polling_consumer::ConsumerGroupId,
 };
 use compio::{
     fs::{self, OpenOptions, create_dir_all},
@@ -223,7 +222,7 @@ pub fn load_consumer_offsets(path: &str) -> Result<Vec<ConsumerOffset>, IggyErro
 
 pub fn load_consumer_group_offsets(
     path: &str,
-) -> Result<Vec<(ConsumerGroupId, MemberId, ConsumerOffset)>, IggyError> {
+) -> Result<Vec<(ConsumerGroupId, ConsumerOffset)>, IggyError> {
     trace!("Loading consumer group offsets from path: {path}...");
     let dir_entries = std::fs::read_dir(path);
     if dir_entries.is_err() {
@@ -245,32 +244,13 @@ pub fn load_consumer_group_offsets(
 
         let name = dir_entry.file_name().into_string().unwrap();
 
-        // For consumer groups, filename format is: {consumer_group_id}_{member_id}
-        let (consumer_group_id, member_id) = if let Some(underscore_pos) = name.find('_') {
-            let consumer_group_id_str = &name[..underscore_pos];
-            let member_id_str = &name[underscore_pos + 1..];
-            let consumer_group_id = consumer_group_id_str.parse::<u32>().unwrap_or_else(|_| {
-                panic!(
-                    "Invalid consumer group ID in consumer group file with name: '{}'.",
-                    name
-                );
-            });
-            let member_id = member_id_str.parse::<u32>().unwrap_or_else(|_| {
-                panic!(
-                    "Invalid member ID in consumer group file with name: '{}'.",
-                    name
-                );
-            });
-            (
-                ConsumerGroupId(consumer_group_id as usize),
-                MemberId(member_id as usize),
-            )
-        } else {
+        let consumer_group_id = name.parse::<u32>().unwrap_or_else(|_| {
             panic!(
-                "Invalid consumer group file format with name: '{}'. Expected format: 'group_id_member_id'.",
+                "Invalid consumer group ID in consumer group file with name: '{}'.",
                 name
             );
-        };
+        });
+        let consumer_group_id = ConsumerGroupId(consumer_group_id as usize);
 
         let path = dir_entry.path();
         let path = path.to_str();
@@ -300,12 +280,12 @@ pub fn load_consumer_group_offsets(
 
         let consumer_offset = ConsumerOffset {
             kind: ConsumerKind::ConsumerGroup,
-            consumer_id: member_id.0 as u32,
+            consumer_id: consumer_group_id.0 as u32,
             offset,
             path,
         };
 
-        consumer_group_offsets.push((consumer_group_id, member_id, consumer_offset));
+        consumer_group_offsets.push((consumer_group_id, consumer_offset));
     }
 
     Ok(consumer_group_offsets)

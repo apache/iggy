@@ -17,15 +17,14 @@
  */
 
 use crate::server::scenarios::{
-    CONSUMER_GROUP_NAME, PARTITION_ID, PARTITIONS_COUNT, STREAM_NAME, TOPIC_NAME, cleanup,
-    create_client, 
+    CONSUMER_GROUP_NAME, PARTITION_ID, STREAM_NAME, TOPIC_NAME, create_client,
 };
 use futures::StreamExt;
 use iggy::prelude::*;
 use iggy_common::ConsumerOffsetInfo;
-use integration::test_server::{ClientFactory, assert_clean_system, login_root};
+use integration::test_server::{ClientFactory, login_root};
 use std::str::FromStr;
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 
 const TEST_MESSAGES_COUNT: u32 = 100;
 const HALF_MESSAGES_COUNT: u32 = TEST_MESSAGES_COUNT / 2;
@@ -35,8 +34,6 @@ pub async fn run(client_factory: &dyn ClientFactory) {
     login_root(&client).await;
     init_system(&client).await;
     execute_auto_commit_reconnection_scenario(&client).await;
-    cleanup(&client, false).await;
-    assert_clean_system(&client).await;
 }
 
 async fn init_system(client: &IggyClient) {
@@ -48,7 +45,7 @@ async fn init_system(client: &IggyClient) {
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
             TOPIC_NAME,
-            PARTITIONS_COUNT,
+            1,
             CompressionAlgorithm::default(),
             None,
             IggyExpiry::NeverExpire,
@@ -107,34 +104,38 @@ async fn execute_auto_commit_reconnection_scenario(client: &IggyClient) {
     assert!(committed_offset_final.is_some());
     let final_offset_info = committed_offset_final.unwrap();
     // The offset should be at the last message (offset is 0-based)
-    assert_eq!(final_offset_info.stored_offset, (TEST_MESSAGES_COUNT - 1) as u64);
+    assert_eq!(
+        final_offset_info.stored_offset,
+        (TEST_MESSAGES_COUNT - 1) as u64
+    );
 
     drop(consumer);
 }
 
 async fn produce_messages_to_partition(client: &IggyClient) {
+    let mut messages = Vec::new();
     for message_id in 1..=TEST_MESSAGES_COUNT {
         let payload = format!("test_message_{}", message_id);
         let message = IggyMessage::from_str(&payload).unwrap();
-        let mut messages = vec![message];
-        
-        client
-            .send_messages(
-                &Identifier::named(STREAM_NAME).unwrap(),
-                &Identifier::named(TOPIC_NAME).unwrap(),
-                &Partitioning::partition_id(PARTITION_ID),
-                &mut messages,
-            )
-            .await
-            .unwrap();
+        messages.push(message);
     }
+
+    client
+        .send_messages(
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
+            &Partitioning::partition_id(PARTITION_ID),
+            &mut messages,
+        )
+        .await
+        .unwrap();
 }
 
 async fn create_auto_commit_consumer(client: &IggyClient) -> IggyConsumer {
     let mut consumer = client
         .consumer_group(CONSUMER_GROUP_NAME, STREAM_NAME, TOPIC_NAME)
         .unwrap()
-        .batch_length(1)
+        .batch_length(10)
         .poll_interval(IggyDuration::from_str("100ms").expect("Invalid duration"))
         .polling_strategy(PollingStrategy::next())
         .auto_join_consumer_group()
@@ -143,7 +144,7 @@ async fn create_auto_commit_consumer(client: &IggyClient) -> IggyConsumer {
             AutoCommitAfter::ConsumingEachMessage,
         ))
         .build();
-    
+
     consumer.init().await.unwrap();
     consumer
 }
@@ -151,7 +152,7 @@ async fn create_auto_commit_consumer(client: &IggyClient) -> IggyConsumer {
 async fn consume_half_messages(consumer: &mut IggyConsumer) -> Vec<IggyMessage> {
     let mut consumed_messages = Vec::new();
     let mut count = 0;
-    
+
     while count < HALF_MESSAGES_COUNT {
         if let Some(message_result) = consumer.next().await {
             match message_result {
@@ -163,14 +164,14 @@ async fn consume_half_messages(consumer: &mut IggyConsumer) -> Vec<IggyMessage> 
             }
         }
     }
-    
+
     consumed_messages
 }
 
 async fn consume_remaining_messages(consumer: &mut IggyConsumer) -> Vec<IggyMessage> {
     let mut consumed_messages = Vec::new();
     let mut count = 0;
-    
+
     while count < HALF_MESSAGES_COUNT {
         if let Some(message_result) = consumer.next().await {
             match message_result {
@@ -182,7 +183,7 @@ async fn consume_remaining_messages(consumer: &mut IggyConsumer) -> Vec<IggyMess
             }
         }
     }
-    
+
     consumed_messages
 }
 

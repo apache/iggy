@@ -74,7 +74,11 @@ fn multiple_clients_scenario() -> ScenarioFn {
 }
 
 fn auto_commit_reconnection_scenario() -> ScenarioFn {
-    |factory| Box::pin(consumer_group_auto_commit_reconnection_scenario::run(factory))
+    |factory| {
+        Box::pin(consumer_group_auto_commit_reconnection_scenario::run(
+            factory,
+        ))
+    }
 }
 
 fn bench_scenario() -> ScenarioFn {

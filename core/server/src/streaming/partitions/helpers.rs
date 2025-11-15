@@ -38,7 +38,7 @@ use crate::{
             partition::{self, PartitionRef, PartitionRefMut},
             storage,
         },
-        polling_consumer::{ConsumerGroupId, MemberId},
+        polling_consumer::ConsumerGroupId,
         segments::{IggyIndexesMut, IggyMessagesBatchMut, IggyMessagesBatchSet, storage::Storage},
     },
 };
@@ -137,17 +137,18 @@ pub fn get_consumer_offset(
     }
 }
 
-pub fn get_consumer_group_member_offset(
+pub fn get_consumer_group_offset(
     consumer_group_id: ConsumerGroupId,
-    member_id: MemberId,
 ) -> impl FnOnce(ComponentsById<PartitionRef>) -> Option<ConsumerOffsetInfo> {
     move |(root, _, _, current_offset, _, offsets, _)| {
-        let key = (consumer_group_id, member_id);
-        offsets.pin().get(&key).map(|item| ConsumerOffsetInfo {
-            partition_id: root.id() as u32,
-            current_offset: current_offset.load(Ordering::Relaxed),
-            stored_offset: item.offset.load(Ordering::Relaxed),
-        })
+        offsets
+            .pin()
+            .get(&consumer_group_id)
+            .map(|item| ConsumerOffsetInfo {
+                partition_id: root.id() as u32,
+                current_offset: current_offset.load(Ordering::Relaxed),
+                stored_offset: item.offset.load(Ordering::Relaxed),
+            })
     }
 }
 
@@ -210,9 +211,8 @@ pub fn delete_consumer_offset_from_disk(
     }
 }
 
-pub fn store_consumer_group_member_offset(
+pub fn store_consumer_group_offset(
     consumer_group_id: ConsumerGroupId,
-    member_id: MemberId,
     stream_id: usize,
     topic_id: usize,
     partition_id: usize,
@@ -221,12 +221,10 @@ pub fn store_consumer_group_member_offset(
 ) -> impl FnOnce(ComponentsById<PartitionRef>) {
     move |(.., offsets, _)| {
         let hdl = offsets.pin();
-        let key = (consumer_group_id, member_id);
         let item = hdl.get_or_insert(
-            key,
+            consumer_group_id,
             ConsumerOffset::default_for_consumer_group(
                 consumer_group_id,
-                member_id,
                 &config.get_consumer_group_offsets_path(stream_id, topic_id, partition_id),
             ),
         );
@@ -234,45 +232,39 @@ pub fn store_consumer_group_member_offset(
     }
 }
 
-pub fn delete_consumer_group_member_offset(
+pub fn delete_consumer_group_offset(
     consumer_group_id: ConsumerGroupId,
-    member_id: MemberId,
 ) -> impl FnOnce(ComponentsById<PartitionRef>) -> Result<String, IggyError> {
     move |(.., offsets, _)| {
         let hdl = offsets.pin();
-        let key = (consumer_group_id, member_id);
         let offset = hdl
-            .remove(&key)
-            .ok_or_else(|| IggyError::ConsumerOffsetNotFound(member_id.0))?;
+            .remove(&consumer_group_id)
+            .ok_or_else(|| IggyError::ConsumerOffsetNotFound(consumer_group_id.0))?;
         Ok(offset.path.clone())
     }
 }
 
-pub fn persist_consumer_group_member_offset_to_disk(
+pub fn persist_consumer_group_offset_to_disk(
     consumer_group_id: ConsumerGroupId,
-    member_id: MemberId,
 ) -> impl AsyncFnOnce(ComponentsById<PartitionRef>) -> Result<(), IggyError> {
     async move |(.., offsets, _)| {
         let hdl = offsets.pin();
-        let key = (consumer_group_id, member_id);
         let item = hdl
-            .get(&key)
-            .expect("persist_consumer_group_member_offset_to_disk: offset not found");
+            .get(&consumer_group_id)
+            .expect("persist_consumer_group_offset_to_disk: offset not found");
         let offset = item.offset.load(Ordering::Relaxed);
         storage::persist_offset(&item.path, offset).await
     }
 }
 
-pub fn delete_consumer_group_member_offset_from_disk(
+pub fn delete_consumer_group_offset_from_disk(
     consumer_group_id: ConsumerGroupId,
-    member_id: MemberId,
 ) -> impl AsyncFnOnce(ComponentsById<PartitionRef>) -> Result<(), IggyError> {
     async move |(.., offsets, _)| {
         let hdl = offsets.pin();
-        let key = (consumer_group_id, member_id);
         let item = hdl
-            .get(&key)
-            .expect("delete_consumer_group_member_offset_from_disk: offset not found");
+            .get(&consumer_group_id)
+            .expect("delete_consumer_group_offset_from_disk: offset not found");
         let path = &item.path;
         storage::delete_persisted_offset(path).await
     }
