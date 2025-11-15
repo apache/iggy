@@ -66,6 +66,7 @@ dependencies {
     testImplementation(platform("org.junit:junit-bom:5.11.3"))
     testImplementation("org.junit.jupiter:junit-jupiter")
     testImplementation("org.assertj:assertj-core:3.26.3")
+    testImplementation("org.awaitility:awaitility:4.2.0")
     testRuntimeOnly("ch.qos.logback:logback-classic:1.5.11")
     testRuntimeOnly("io.netty:netty-resolver-dns-native-macos:4.2.1.Final:osx-aarch_64")
 }
