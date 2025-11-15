@@ -19,16 +19,110 @@
 
 package org.apache.iggy.client.blocking;
 
+/**
+ * Main entry point for synchronous Iggy client operations.
+ * This class provides access to the synchronous client functionality.
+ */
 public class IggyClient {
 
     private final IggyBaseClient baseClient;
 
+    /**
+     * Creates a new IggyClient with the specified base client.
+     *
+     * @param baseClient the base client
+     */
     public IggyClient(IggyBaseClient baseClient) {
         this.baseClient = baseClient;
     }
 
+    /**
+     * Gets the base client.
+     *
+     * @return the base client
+     */
     public IggyBaseClient getBaseClient() {
         return baseClient;
     }
 
+    /**
+     * Gets the system client.
+     *
+     * @return the system client
+     */
+    public SystemClient system() {
+        return baseClient.system();
+    }
+
+    /**
+     * Gets the streams client.
+     *
+     * @return the streams client
+     */
+    public StreamsClient streams() {
+        return baseClient.streams();
+    }
+
+    /**
+     * Gets the users client.
+     *
+     * @return the users client
+     */
+    public UsersClient users() {
+        return baseClient.users();
+    }
+
+    /**
+     * Gets the topics client.
+     *
+     * @return the topics client
+     */
+    public TopicsClient topics() {
+        return baseClient.topics();
+    }
+
+    /**
+     * Gets the partitions client.
+     *
+     * @return the partitions client
+     */
+    public PartitionsClient partitions() {
+        return baseClient.partitions();
+    }
+
+    /**
+     * Gets the consumer groups client.
+     *
+     * @return the consumer groups client
+     */
+    public ConsumerGroupsClient consumerGroups() {
+        return baseClient.consumerGroups();
+    }
+
+    /**
+     * Gets the consumer offsets client.
+     *
+     * @return the consumer offsets client
+     */
+    public ConsumerOffsetsClient consumerOffsets() {
+        return baseClient.consumerOffsets();
+    }
+
+    /**
+     * Gets the messages client.
+     *
+     * @return the messages client
+     */
+    public MessagesClient messages() {
+        return baseClient.messages();
+    }
+
+    /**
+     * Gets the personal access tokens client.
+     *
+     * @return the personal access tokens client
+     */
+    public PersonalAccessTokensClient personalAccessTokens() {
+        return baseClient.personalAccessTokens();
+    }
 }
