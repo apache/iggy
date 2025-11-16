@@ -31,6 +31,7 @@ var client = IggyClientFactory.CreateClient(new IggyClientConfigurator()
     LoggerFactory = loggerFactory
 });
 
+await client.ConnectAsync();
 await client.LoginUser("iggy", "iggy");
 
 await Utils.InitSystem(client, logger);

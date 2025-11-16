@@ -17,8 +17,18 @@
 
 namespace Apache.Iggy.Enums;
 
+/// <summary>
+///     Type of consumer
+/// </summary>
 public enum ConsumerType
 {
+    /// <summary>
+    ///     Regular consumer.
+    /// </summary>
     Consumer,
+
+    /// <summary>
+    ///     Consumer group.
+    /// </summary>
     ConsumerGroup
 }

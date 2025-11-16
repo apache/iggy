@@ -55,7 +55,7 @@ public class SystemTests
     {
         IReadOnlyList<ClientResponse> clients = await Fixture.Clients[protocol].GetClientsAsync();
 
-        var client = Fixture.IggyServerFixture.CreateClient(Protocol.Tcp, protocol);
+        var client = await Fixture.IggyServerFixture.CreateClient(Protocol.Tcp, protocol);
         await client.LoginUser("iggy", "iggy");
         var clientInfo = await client.GetMeAsync();
         clientInfo.ShouldNotBeNull();
@@ -101,7 +101,7 @@ public class SystemTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task GetClient_WithConsumerGroup_Should_Return_CorrectClient(Protocol protocol)
     {
-        var client = Fixture.IggyServerFixture.CreateClient(Protocol.Tcp, protocol);
+        var client = await Fixture.IggyServerFixture.CreateClient(Protocol.Tcp, protocol);
         await client.LoginUser("iggy", "iggy");
         var stream = await client.CreateStreamAsync(Fixture.StreamId.GetWithProtocol(protocol));
         await client.CreateTopicAsync(Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)), "test_topic", 2);
@@ -180,4 +180,29 @@ public class SystemTests
     {
         await Should.NotThrowAsync(Fixture.Clients[protocol].PingAsync());
     }
+
+    // [Test]
+    // [DependsOn(nameof(Ping_Should_Pong))]
+    // [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    // public async Task GetClusterMetadata_Should_Return_ClusterMetadata(Protocol protocol)
+    // {
+    //     var clusterMetadata = await Fixture.Clients[protocol].GetClusterMetadataAsync();
+    //
+    //     clusterMetadata.ShouldNotBeNull();
+    //     clusterMetadata.Id.ShouldBe(1u);
+    //     clusterMetadata.Name.ShouldBe("iggy-cluster");
+    //     clusterMetadata.Transport.ShouldBe(Protocol.Tcp);
+    //     clusterMetadata.Nodes.ShouldNotBeEmpty();
+    //     clusterMetadata.Nodes.Length.ShouldBe(2);
+    //     clusterMetadata.Nodes[0].Id.ShouldBe(1u);
+    //     clusterMetadata.Nodes[0].Name.ShouldBe("iggy-node-1");
+    //     clusterMetadata.Nodes[0].Address.ShouldBe("127.0.0.1:8090");
+    //     clusterMetadata.Nodes[0].Role.ShouldBe(ClusterNodeRole.Leader);
+    //     clusterMetadata.Nodes[0].Status.ShouldBe(ClusterNodeStatus.Healthy);
+    //     clusterMetadata.Nodes[1].Id.ShouldBe(2u);
+    //     clusterMetadata.Nodes[1].Name.ShouldBe("iggy-node-2");
+    //     clusterMetadata.Nodes[1].Address.ShouldBe("127.0.0.1:8092");
+    //     clusterMetadata.Nodes[1].Role.ShouldBe(ClusterNodeRole.Follower);
+    //     clusterMetadata.Nodes[1].Status.ShouldBe(ClusterNodeStatus.Healthy);
+    // }
 }

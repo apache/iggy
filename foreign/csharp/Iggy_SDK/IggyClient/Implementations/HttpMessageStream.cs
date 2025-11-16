@@ -34,6 +34,9 @@ using Partitioning = Apache.Iggy.Kinds.Partitioning;
 
 namespace Apache.Iggy.IggyClient.Implementations;
 
+/// <summary>
+///     Implementation of <see cref="IIggyClient" /> that uses <see cref="HttpClient" /> to communicate with the server.
+/// </summary>
 public class HttpMessageStream : IIggyClient
 {
     private const string Context = "csharp-sdk";
@@ -56,6 +59,7 @@ public class HttpMessageStream : IIggyClient
         };
     }
 
+    /// <inheritdoc />
     public async Task<StreamResponse?> CreateStreamAsync(string name, CancellationToken token = default)
     {
         var json = JsonSerializer.Serialize(new CreateStreamRequest(name), _jsonSerializerOptions);
@@ -74,6 +78,7 @@ public class HttpMessageStream : IIggyClient
         return null;
     }
 
+    /// <inheritdoc />
     public async Task PurgeStreamAsync(Identifier streamId, CancellationToken token = default)
     {
         var response = await _httpClient.DeleteAsync($"/streams/{streamId}/purge", token);
@@ -83,6 +88,7 @@ public class HttpMessageStream : IIggyClient
         }
     }
 
+    /// <inheritdoc />
     public async Task DeleteStreamAsync(Identifier streamId, CancellationToken token = default)
     {
         var response = await _httpClient.DeleteAsync($"/streams/{streamId}", token);
@@ -92,6 +98,7 @@ public class HttpMessageStream : IIggyClient
         }
     }
 
+    /// <inheritdoc />
     public async Task<StreamResponse?> GetStreamByIdAsync(Identifier streamId, CancellationToken token = default)
     {
         var response = await _httpClient.GetAsync($"/streams/{streamId}", token);
@@ -106,6 +113,7 @@ public class HttpMessageStream : IIggyClient
         return null;
     }
 
+    /// <inheritdoc />
     public async Task UpdateStreamAsync(Identifier streamId, string name, CancellationToken token = default)
     {
         var json = JsonSerializer.Serialize(new UpdateStreamRequest(name), _jsonSerializerOptions);
@@ -118,6 +126,7 @@ public class HttpMessageStream : IIggyClient
         }
     }
 
+    /// <inheritdoc />
     public async Task<IReadOnlyList<StreamResponse>> GetStreamsAsync(CancellationToken token = default)
     {
         var response = await _httpClient.GetAsync("/streams", token);
@@ -132,6 +141,7 @@ public class HttpMessageStream : IIggyClient
         return Array.Empty<StreamResponse>();
     }
 
+    /// <inheritdoc />
     public async Task<TopicResponse?> CreateTopicAsync(Identifier streamId, string name, uint partitionsCount,
         CompressionAlgorithm compressionAlgorithm = CompressionAlgorithm.None, byte? replicationFactor = null,
         ulong messageExpiry = 0, ulong maxTopicSize = 0,
@@ -144,7 +154,7 @@ public class HttpMessageStream : IIggyClient
             MaxTopicSize = maxTopicSize,
             MessageExpiry = messageExpiry,
             PartitionsCount = partitionsCount,
-            ReplicationFactor = replicationFactor,
+            ReplicationFactor = replicationFactor
         }, _jsonSerializerOptions);
         var data = new StringContent(json, Encoding.UTF8, "application/json");
 
@@ -160,6 +170,7 @@ public class HttpMessageStream : IIggyClient
         return null;
     }
 
+    /// <inheritdoc />
     public async Task UpdateTopicAsync(Identifier streamId, Identifier topicId, string name,
         CompressionAlgorithm compressionAlgorithm = CompressionAlgorithm.None,
         ulong maxTopicSize = 0, ulong messageExpiry = 0, byte? replicationFactor = null,
@@ -176,6 +187,7 @@ public class HttpMessageStream : IIggyClient
         }
     }
 
+    /// <inheritdoc />
     public async Task DeleteTopicAsync(Identifier streamId, Identifier topicId, CancellationToken token = default)
     {
         var response = await _httpClient.DeleteAsync($"/streams/{streamId}/topics/{topicId}", token);
@@ -185,6 +197,7 @@ public class HttpMessageStream : IIggyClient
         }
     }
 
+    /// <inheritdoc />
     public Task PurgeTopicAsync(Identifier streamId, Identifier topicId, CancellationToken token = default)
     {
         return _httpClient.DeleteAsync($"/streams/{streamId}/topics/{topicId}/purge", token)
@@ -197,6 +210,7 @@ public class HttpMessageStream : IIggyClient
             }, token);
     }
 
+    /// <inheritdoc />
     public async Task<IReadOnlyList<TopicResponse>> GetTopicsAsync(Identifier streamId,
         CancellationToken token = default)
     {
@@ -211,6 +225,7 @@ public class HttpMessageStream : IIggyClient
         return Array.Empty<TopicResponse>();
     }
 
+    /// <inheritdoc />
     public async Task<TopicResponse?> GetTopicByIdAsync(Identifier streamId, Identifier topicId,
         CancellationToken token = default)
     {
@@ -226,6 +241,7 @@ public class HttpMessageStream : IIggyClient
         return null;
     }
 
+    /// <inheritdoc />
     public async Task SendMessagesAsync(Identifier streamId, Identifier topicId, Partitioning partitioning,
         IList<Message> messages,
         CancellationToken token = default)
@@ -250,6 +266,7 @@ public class HttpMessageStream : IIggyClient
         }
     }
 
+    /// <inheritdoc />
     public async Task FlushUnsavedBufferAsync(Identifier streamId, Identifier topicId, uint partitionId, bool fsync,
         CancellationToken token = default)
     {
@@ -263,6 +280,7 @@ public class HttpMessageStream : IIggyClient
         }
     }
 
+    /// <inheritdoc />
     public async Task<PolledMessages> PollMessagesAsync(Identifier streamId, Identifier topicId, uint? partitionId,
         Consumer consumer,
         PollingStrategy pollingStrategy, uint count, bool autoCommit, CancellationToken token = default)
@@ -284,6 +302,7 @@ public class HttpMessageStream : IIggyClient
         return PolledMessages.Empty;
     }
 
+    /// <inheritdoc />
     public async Task StoreOffsetAsync(Consumer consumer, Identifier streamId, Identifier topicId, ulong offset,
         uint? partitionId, CancellationToken token = default)
     {
@@ -299,6 +318,7 @@ public class HttpMessageStream : IIggyClient
         }
     }
 
+    /// <inheritdoc />
     public async Task<OffsetResponse?> GetOffsetAsync(Consumer consumer, Identifier streamId, Identifier topicId,
         uint? partitionId, CancellationToken token = default)
     {
@@ -315,6 +335,7 @@ public class HttpMessageStream : IIggyClient
         return null;
     }
 
+    /// <inheritdoc />
     public async Task DeleteOffsetAsync(Consumer consumer, Identifier streamId, Identifier topicId, uint? partitionId,
         CancellationToken token = default)
     {
@@ -324,6 +345,7 @@ public class HttpMessageStream : IIggyClient
         await HandleResponseAsync(response);
     }
 
+    /// <inheritdoc />
     public async Task<IReadOnlyList<ConsumerGroupResponse>> GetConsumerGroupsAsync(Identifier streamId,
         Identifier topicId, CancellationToken token = default)
     {
@@ -340,6 +362,7 @@ public class HttpMessageStream : IIggyClient
         return Array.Empty<ConsumerGroupResponse>();
     }
 
+    /// <inheritdoc />
     public async Task<ConsumerGroupResponse?> GetConsumerGroupByIdAsync(Identifier streamId, Identifier topicId,
         Identifier groupId, CancellationToken token = default)
     {
@@ -355,6 +378,7 @@ public class HttpMessageStream : IIggyClient
         return null;
     }
 
+    /// <inheritdoc />
     public async Task<ConsumerGroupResponse?> CreateConsumerGroupAsync(Identifier streamId, Identifier topicId,
         string name, CancellationToken token = default)
     {
@@ -373,6 +397,7 @@ public class HttpMessageStream : IIggyClient
         return null;
     }
 
+    /// <inheritdoc />
     public async Task DeleteConsumerGroupAsync(Identifier streamId, Identifier topicId, Identifier groupId,
         CancellationToken token = default)
     {
@@ -381,11 +406,18 @@ public class HttpMessageStream : IIggyClient
         await HandleResponseAsync(response);
     }
 
+    /// <summary>
+    ///     This method is only supported in TCP protocol
+    /// </summary>
+    /// <param name="token"></param>
+    /// <returns></returns>
+    /// <exception cref="FeatureUnavailableException"></exception>
     public Task<ClientResponse?> GetMeAsync(CancellationToken token = default)
     {
         throw new FeatureUnavailableException();
     }
 
+    /// <inheritdoc />
     public async Task<StatsResponse?> GetStatsAsync(CancellationToken token = default)
     {
         var response = await _httpClient.GetAsync("/stats", token);
@@ -398,6 +430,21 @@ public class HttpMessageStream : IIggyClient
         return null;
     }
 
+    /// <inheritdoc />
+    public async Task<ClusterMetadata?> GetClusterMetadataAsync(CancellationToken token = default)
+    {
+        var response = await _httpClient.GetAsync("/cluster/metadata", token);
+        if (response.IsSuccessStatusCode)
+        {
+            return await response.Content.ReadFromJsonAsync<ClusterMetadata>(_jsonSerializerOptions, token);
+        }
+
+        await HandleResponseAsync(response);
+
+        return null;
+    }
+
+    /// <inheritdoc />
     public async Task PingAsync(CancellationToken token = default)
     {
         var response = await _httpClient.GetAsync("/ping", token);
@@ -408,6 +455,13 @@ public class HttpMessageStream : IIggyClient
         }
     }
 
+    /// <inheritdoc />
+    public Task ConnectAsync(CancellationToken token = default)
+    {
+        return Task.CompletedTask;
+    }
+
+    /// <inheritdoc />
     public async Task<IReadOnlyList<ClientResponse>> GetClientsAsync(CancellationToken token = default)
     {
         var response = await _httpClient.GetAsync("/clients", token);
@@ -422,6 +476,7 @@ public class HttpMessageStream : IIggyClient
         return Array.Empty<ClientResponse>();
     }
 
+    /// <inheritdoc />
     public async Task<ClientResponse?> GetClientByIdAsync(uint clientId, CancellationToken token = default)
     {
         var response = await _httpClient.GetAsync($"/clients/{clientId}", token);
@@ -434,6 +489,15 @@ public class HttpMessageStream : IIggyClient
         return null;
     }
 
+    /// <summary>
+    ///     This method is only supported in TCP protocol
+    /// </summary>
+    /// <param name="streamId">The identifier of the stream containing the topic (numeric ID or name).</param>
+    /// <param name="topicId">The identifier of the topic (numeric ID or name).</param>
+    /// <param name="groupId">The identifier of the consumer group to join (numeric ID or name).</param>
+    /// <param name="token">The cancellation token to cancel the operation.</param>
+    /// <returns>A task representing the asynchronous operation.</returns>
+    /// <exception cref="FeatureUnavailableException"></exception>
     [Obsolete("This method is only supported in TCP protocol", true)]
     public Task JoinConsumerGroupAsync(Identifier streamId, Identifier topicId, Identifier groupId,
         CancellationToken token = default)
@@ -441,6 +505,15 @@ public class HttpMessageStream : IIggyClient
         throw new FeatureUnavailableException();
     }
 
+    /// <summary>
+    ///     This method is only supported in TCP protocol
+    /// </summary>
+    /// <param name="streamId">The identifier of the stream containing the topic (numeric ID or name).</param>
+    /// <param name="topicId">The identifier of the topic (numeric ID or name).</param>
+    /// <param name="groupId">The identifier of the consumer group to leave (numeric ID or name).</param>
+    /// <param name="token">The cancellation token to cancel the operation.</param>
+    /// <returns>A task representing the asynchronous operation.</returns>
+    /// <exception cref="FeatureUnavailableException"></exception>
     [Obsolete("This method is only supported in TCP protocol", true)]
     public Task LeaveConsumerGroupAsync(Identifier streamId, Identifier topicId, Identifier groupId,
         CancellationToken token = default)
@@ -448,6 +521,7 @@ public class HttpMessageStream : IIggyClient
         throw new FeatureUnavailableException();
     }
 
+    /// <inheritdoc />
     public async Task DeletePartitionsAsync(Identifier streamId, Identifier topicId, uint partitionsCount,
         CancellationToken token = default)
     {
@@ -460,6 +534,7 @@ public class HttpMessageStream : IIggyClient
         }
     }
 
+    /// <inheritdoc />
     public async Task CreatePartitionsAsync(Identifier streamId, Identifier topicId, uint partitionsCount,
         CancellationToken token = default)
     {
@@ -474,6 +549,7 @@ public class HttpMessageStream : IIggyClient
         }
     }
 
+    /// <inheritdoc />
     public async Task<UserResponse?> GetUser(Identifier userId, CancellationToken token = default)
     {
         //TODO - this doesn't work prob needs a custom json serializer
@@ -487,6 +563,7 @@ public class HttpMessageStream : IIggyClient
         return null;
     }
 
+    /// <inheritdoc />
     public async Task<IReadOnlyList<UserResponse>> GetUsers(CancellationToken token = default)
     {
         var response = await _httpClient.GetAsync("/users", token);
@@ -500,6 +577,7 @@ public class HttpMessageStream : IIggyClient
         return Array.Empty<UserResponse>();
     }
 
+    /// <inheritdoc />
     public async Task<UserResponse?> CreateUser(string userName, string password, UserStatus status,
         Permissions? permissions = null, CancellationToken token = default)
     {
@@ -517,6 +595,7 @@ public class HttpMessageStream : IIggyClient
         return null;
     }
 
+    /// <inheritdoc />
     public async Task DeleteUser(Identifier userId, CancellationToken token = default)
     {
         var response = await _httpClient.DeleteAsync($"/users/{userId}", token);
@@ -526,6 +605,7 @@ public class HttpMessageStream : IIggyClient
         }
     }
 
+    /// <inheritdoc />
     public async Task UpdateUser(Identifier userId, string? userName = null, UserStatus? status = null,
         CancellationToken token = default)
     {
@@ -538,6 +618,7 @@ public class HttpMessageStream : IIggyClient
         }
     }
 
+    /// <inheritdoc />
     public async Task UpdatePermissions(Identifier userId, Permissions? permissions = null,
         CancellationToken token = default)
     {
@@ -550,6 +631,7 @@ public class HttpMessageStream : IIggyClient
         }
     }
 
+    /// <inheritdoc />
     public async Task ChangePassword(Identifier userId, string currentPassword, string newPassword,
         CancellationToken token = default)
     {
@@ -563,6 +645,7 @@ public class HttpMessageStream : IIggyClient
         }
     }
 
+    /// <inheritdoc />
     public async Task<AuthResponse?> LoginUser(string userName, string password, CancellationToken token = default)
     {
         // TODO: get version
@@ -593,6 +676,7 @@ public class HttpMessageStream : IIggyClient
         return null;
     }
 
+    /// <inheritdoc />
     public async Task LogoutUser(CancellationToken token = default)
     {
         var response = await _httpClient.DeleteAsync("users/logout", token);
@@ -604,6 +688,7 @@ public class HttpMessageStream : IIggyClient
         _httpClient.DefaultRequestHeaders.Authorization = null;
     }
 
+    /// <inheritdoc />
     public async Task<IReadOnlyList<PersonalAccessTokenResponse>> GetPersonalAccessTokensAsync(
         CancellationToken token = default)
     {
@@ -619,6 +704,7 @@ public class HttpMessageStream : IIggyClient
         return Array.Empty<PersonalAccessTokenResponse>();
     }
 
+    /// <inheritdoc />
     public async Task<RawPersonalAccessToken?> CreatePersonalAccessTokenAsync(string name, ulong? expiry = null,
         CancellationToken token = default)
     {
@@ -634,6 +720,7 @@ public class HttpMessageStream : IIggyClient
         return await response.Content.ReadFromJsonAsync<RawPersonalAccessToken>(_jsonSerializerOptions, token);
     }
 
+    /// <inheritdoc />
     public async Task DeletePersonalAccessTokenAsync(string name, CancellationToken token = default)
     {
         var response = await _httpClient.DeleteAsync($"/personal-access-tokens/{name}", token);
@@ -643,6 +730,7 @@ public class HttpMessageStream : IIggyClient
         }
     }
 
+    /// <inheritdoc />
     public async Task<AuthResponse?> LoginWithPersonalAccessToken(string token, CancellationToken ct = default)
     {
         var json = JsonSerializer.Serialize(new LoginWithPersonalAccessTokenRequest(token), _jsonSerializerOptions);
@@ -671,7 +759,20 @@ public class HttpMessageStream : IIggyClient
         return null;
     }
 
+    /// <summary>
+    ///     Dispose the client.
+    /// </summary>
     public void Dispose()
+    {
+    }
+
+    /// <inheritdoc />
+    public void SubscribeConnectionEvents(Func<ConnectionStateChangedEventArgs, Task> callback)
+    {
+    }
+
+    /// <inheritdoc />
+    public void UnsubscribeConnectionEvents(Func<ConnectionStateChangedEventArgs, Task> callback)
     {
     }
 
@@ -683,7 +784,8 @@ public class HttpMessageStream : IIggyClient
                  !shouldThrowOnGetNotFound))
         {
             var err = await response.Content.ReadAsStringAsync();
-            throw new InvalidResponseException(err);
+            var errorModel = JsonSerializer.Deserialize<ErrorResponse>(err);
+            throw new IggyInvalidStatusCodeException(errorModel?.Id ?? -1, err);
         }
 
         if (response.StatusCode == HttpStatusCode.InternalServerError)

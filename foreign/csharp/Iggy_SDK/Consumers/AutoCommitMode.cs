@@ -28,11 +28,6 @@ public enum AutoCommitMode
     Auto,
 
     /// <summary>
-    ///     Set offset after polling messages
-    /// </summary>
-    AfterPoll,
-
-    /// <summary>
     ///     Set offset after receive message
     /// </summary>
     AfterReceive,

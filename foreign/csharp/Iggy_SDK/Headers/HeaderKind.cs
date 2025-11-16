@@ -17,17 +17,63 @@
 
 namespace Apache.Iggy.Headers;
 
+/// <summary>
+///     The kind of header.
+/// </summary>
 public enum HeaderKind
 {
+    /// <summary>
+    ///     Raw header as bytes.
+    /// </summary>
     Raw,
+
+    /// <summary>
+    ///     String header.
+    /// </summary>
     String,
+
+    /// <summary>
+    ///     Boolean header.
+    /// </summary>
     Bool,
+
+    /// <summary>
+    ///     Integer header.
+    /// </summary>
     Int32,
+
+    /// <summary>
+    ///     Long header.
+    /// </summary>
     Int64,
+
+    /// <summary>
+    ///     128-bit integer header.
+    /// </summary>
     Int128,
+
+    /// <summary>
+    ///     Unsigned integer header.
+    /// </summary>
     Uint32,
+
+    /// <summary>
+    ///     Unsigned long header.
+    /// </summary>
     Uint64,
+
+    /// <summary>
+    ///     Unsigned 128-bit integer header.
+    /// </summary>
     Uint128,
+
+    /// <summary>
+    ///     Floating point header.
+    /// </summary>
     Float,
+
+    /// <summary>
+    ///     Double precision floating point header.
+    /// </summary>
     Double
 }

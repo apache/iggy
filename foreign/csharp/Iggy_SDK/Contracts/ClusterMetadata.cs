@@ -15,19 +15,32 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using Apache.Iggy.Enums;
+
 namespace Apache.Iggy.Contracts;
 
-public sealed class PolledMessages<T>
+/// <summary>
+///     Represents metadata of all nodes in the cluster
+/// </summary>
+public class ClusterMetadata
 {
-    public required int PartitionId { get; init; }
-    public required ulong CurrentOffset { get; init; }
-    public required IReadOnlyList<MessageResponse<T>> Messages { get; init; }
+    /// <summary>
+    ///     Name of the cluster
+    /// </summary>
+    public required string Name { get; set; }
 
-    public static PolledMessages<T> Empty =>
-        new()
-        {
-            Messages = Array.Empty<MessageResponse<T>>().AsReadOnly(),
-            CurrentOffset = 0,
-            PartitionId = 0
-        };
+    /// <summary>
+    ///     Unique identifier of the cluster
+    /// </summary>
+    public required uint Id { get; set; }
+
+    /// <summary>
+    ///     Transport used for cluster communication
+    /// </summary>
+    public required Protocol Transport { get; set; }
+
+    /// <summary>
+    ///     List of all nodes in the cluster
+    /// </summary>
+    public required ClusterNode[] Nodes { get; set; } = [];
 }

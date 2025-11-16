@@ -49,7 +49,7 @@ public class PersonalAccessTokenTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task CreatePersonalAccessToken_Duplicate_Should_Throw_InvalidResponse(Protocol protocol)
     {
-        await Should.ThrowAsync<InvalidResponseException>(() =>
+        await Should.ThrowAsync<IggyInvalidStatusCodeException>(() =>
             Fixture.Clients[protocol].CreatePersonalAccessTokenAsync(Name, Expiry));
     }
 
@@ -75,7 +75,7 @@ public class PersonalAccessTokenTests
     {
         var response = await Fixture.Clients[protocol].CreatePersonalAccessTokenAsync("test-pat-login", 100_000_000);
 
-        var client = Fixture.IggyServerFixture.CreateClient(protocol);
+        var client = await Fixture.IggyServerFixture.CreateClient(protocol);
 
         var authResponse = await client.LoginWithPersonalAccessToken(response!.Token);
 

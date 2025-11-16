@@ -31,12 +31,14 @@ Each sink connector is configured in its own separate configuration file within 
 
 ```rust
 pub struct SinkConfig {
+    pub id: String,
     pub enabled: bool,
+    pub version: u64,
     pub name: String,
     pub path: String,
     pub transforms: Option<TransformsConfig>,
     pub streams: Vec<StreamConsumerConfig>,
-    pub config_format: ConfigFormat,
+    pub config_format: Option<ConfigFormat>,
     pub config: Option<serde_json::Value>,
 }
 ```
@@ -45,6 +47,7 @@ pub struct SinkConfig {
 
 ```toml
 [connectors]
+config_type = "local"
 config_dir = "path/to/connectors"
 ```
 
@@ -53,9 +56,11 @@ config_dir = "path/to/connectors"
 ```toml
 # Type of connector (sink or source)
 type = "sink"
+id = "stdout" # Unique sink ID
 
 # Required configuration for a sink connector
 enabled = true
+version = 0
 name = "Stdout sink"
 path = "target/release/libiggy_connector_stdout_sink"
 config_format = "toml"
@@ -81,6 +86,16 @@ enabled = true
 [[transforms.add_fields.fields]]
 key = "message"
 value.static = "hello"
+```
+
+### Environment Variable Overrides
+
+Configuration properties can be overridden using environment variables. The pattern follows: `IGGY_CONNECTORS_SINK_[ID]_[PROPERTY]`
+
+For example, to override the `enabled` property for a sink with ID `stdout`:
+
+```bash
+IGGY_CONNECTORS_SINK_STDOUT_ENABLED=false
 ```
 
 ## Sample implementation

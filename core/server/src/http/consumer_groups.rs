@@ -24,6 +24,7 @@ use crate::http::shared::AppState;
 use crate::slab::traits_ext::{EntityComponentSystem, EntityMarker, IntoComponents};
 use crate::state::command::EntryCommand;
 use crate::state::models::CreateConsumerGroupWithId;
+use crate::streaming::polling_consumer::ConsumerGroupId;
 use crate::streaming::session::Session;
 use axum::debug_handler;
 use axum::extract::{Path, State};
@@ -277,6 +278,23 @@ async fn delete_consumer_group(
                 );
             }
         }
+
+        let cg_id_spez = ConsumerGroupId(cg_id);
+        // Clean up consumer group offsets from all partitions using the specialized method
+        let partition_ids = consumer_group.partitions();
+        state.shard.shard().delete_consumer_group_offsets(
+            cg_id_spez,
+            &identifier_stream_id,
+            &identifier_topic_id,
+            partition_ids,
+        ).await.with_error(|error| {
+            format!(
+                "{COMPONENT} (error: {error}) - failed to delete consumer group offsets for group ID: {} in stream: {}, topic: {}",
+                cg_id_spez,
+                identifier_stream_id,
+                identifier_topic_id
+            )
+        })?;
 
         // Send event for consumer group deletion
         {

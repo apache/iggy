@@ -37,11 +37,11 @@ public class IggyConsumer<T> : IggyConsumer
     /// <param name="client">The Iggy client for server communication</param>
     /// <param name="config">Typed consumer configuration including deserializer</param>
     /// <param name="logger">Logger instance for diagnostic output</param>
-    public IggyConsumer(IIggyClient client, IggyConsumerConfig<T> config, ILogger<IggyConsumer<T>> logger) : base(
+    public IggyConsumer(IIggyClient client, IggyConsumerConfig<T> config, ILoggerFactory logger) : base(
         client, config, logger)
     {
         _typedConfig = config;
-        _typedLogger = logger;
+        _typedLogger = logger.CreateLogger<IggyConsumer<T>>();
     }
 
     /// <summary>

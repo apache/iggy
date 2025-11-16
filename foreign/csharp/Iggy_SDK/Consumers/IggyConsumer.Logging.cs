@@ -15,13 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using Apache.Iggy.Enums;
 using Microsoft.Extensions.Logging;
 
 namespace Apache.Iggy.Consumers;
 
 public partial class IggyConsumer
 {
-    // Information logs
     [LoggerMessage(EventId = 100,
         Level = LogLevel.Information,
         Message = "Creating consumer group '{GroupName}' for stream {StreamId}, topic {TopicId}")]
@@ -42,13 +42,11 @@ public partial class IggyConsumer
         Message = "Successfully joined consumer group '{GroupName}'")]
     private partial void LogConsumerGroupJoined(string groupName);
 
-    // Trace logs
     [LoggerMessage(EventId = 200,
         Level = LogLevel.Trace,
         Message = "Left consumer group '{GroupName}'")]
     private partial void LogLeftConsumerGroup(string groupName);
 
-    // Warning logs
     [LoggerMessage(EventId = 302,
         Level = LogLevel.Warning,
         Message = "Failed to leave consumer group '{GroupName}'")]
@@ -59,7 +57,6 @@ public partial class IggyConsumer
         Message = "Failed to logout user or dispose client")]
     private partial void LogFailedToLogoutOrDispose(Exception exception);
 
-    // Error logs
     [LoggerMessage(EventId = 400,
         Level = LogLevel.Error,
         Message = "Failed to initialize consumer group '{GroupName}'")]
@@ -80,6 +77,16 @@ public partial class IggyConsumer
         Message = "Message polling stopped")]
     private partial void LogMessagePollingStopped();
 
+    [LoggerMessage(EventId = 3,
+        Level = LogLevel.Debug,
+        Message = "Consumer group not joined yet. Skipping polling")]
+    partial void LogConsumerGroupNotJoinedYetSkippingPolling();
+
+    [LoggerMessage(EventId = 4,
+        Level = LogLevel.Debug,
+        Message = "Consumer group name is empty. Skipping rejoining consumer group")]
+    partial void LogConsumerGroupNameIsEmptySkippingRejoiningConsumerGroup();
+
     [LoggerMessage(EventId = 402,
         Level = LogLevel.Error,
         Message = "Failed to decrypt message with offset {Offset}")]
@@ -89,6 +96,16 @@ public partial class IggyConsumer
         Level = LogLevel.Error,
         Message = "Failed to poll messages")]
     private partial void LogFailedToPollMessages(Exception exception);
+
+    [LoggerMessage(EventId = 404,
+        Level = LogLevel.Error,
+        Message = "Failed to rejoin consumer group '{GroupName}' after reconnection")]
+    private partial void LogFailedToRejoinConsumerGroup(Exception exception, string groupName);
+
+    [LoggerMessage(EventId = 105,
+        Level = LogLevel.Information,
+        Message = "Client connection state changed: {PreviousState} -> {CurrentState}")]
+    private partial void LogConnectionStateChanged(ConnectionState previousState, ConnectionState currentState);
 
     [LoggerMessage(EventId = 300,
         Level = LogLevel.Warning,
@@ -104,4 +121,14 @@ public partial class IggyConsumer
         Level = LogLevel.Trace,
         Message = "Waiting for {Remaining} milliseconds before polling messages")]
     private partial void LogWaitingBeforePolling(long remaining);
+
+    [LoggerMessage(EventId = 301,
+        Level = LogLevel.Warning,
+        Message = "PartitionId is ignored when ConsumerType is ConsumerGroup")]
+    partial void LogPartitionIdIsIgnoredWhenConsumerTypeIsConsumerGroup();
+
+    [LoggerMessage(EventId = 106,
+        Level = LogLevel.Information,
+        Message = "Rejoining consumer group {ConsumerGroupName} after reconnection")]
+    partial void LogRejoiningConsumerGroupConsumerGroupNameAfterReconnection(string consumerGroupName);
 }

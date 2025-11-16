@@ -12,6 +12,7 @@ local_state*
 /rust-clippy-results.sarif
 /performance_results*
 .env
+.envrc
 /iggy_release
 /iggy_release_tmp
 /**/obj

@@ -22,23 +22,65 @@ using Apache.Iggy.JsonConverters;
 
 namespace Apache.Iggy.Contracts;
 
+/// <summary>
+///     Information about a topic.
+/// </summary>
 public sealed class TopicResponse
 {
+    /// <summary>
+    ///     Topic identifier.
+    /// </summary>
     public required uint Id { get; init; }
 
+    /// <summary>
+    ///     Topic creation date.
+    /// </summary>
     [JsonConverter(typeof(DateTimeOffsetConverter))]
     public required DateTimeOffset CreatedAt { get; init; }
 
+    /// <summary>
+    ///     Unique topic name.
+    /// </summary>
     public required string Name { get; init; }
+
+    /// <summary>
+    ///     Compression algorithm used for the topic.
+    /// </summary>
     public CompressionAlgorithm CompressionAlgorithm { get; set; }
 
+    /// <summary>
+    ///     Topic size in bytes.
+    /// </summary>
     [JsonConverter(typeof(SizeConverter))]
     public required ulong Size { get; init; }
 
+    /// <summary>
+    ///     Message expiry in milliseconds.
+    /// </summary>
     public ulong MessageExpiry { get; init; }
+
+    /// <summary>
+    ///     Maximum topic size in bytes.
+    /// </summary>
     public required ulong MaxTopicSize { get; init; }
+
+    /// <summary>
+    ///     Number of messages in the topic.
+    /// </summary>
     public required ulong MessagesCount { get; init; }
+
+    /// <summary>
+    ///     Number of partitions in the topic.
+    /// </summary>
     public required uint PartitionsCount { get; init; }
+
+    /// <summary>
+    ///     Replication factor of the topic.
+    /// </summary>
     public required byte? ReplicationFactor { get; init; }
+
+    /// <summary>
+    ///     List of partitions in the topic.
+    /// </summary>
     public IEnumerable<PartitionResponse>? Partitions { get; init; }
 }

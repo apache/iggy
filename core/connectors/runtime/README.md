@@ -32,6 +32,7 @@ domain = "" # Optional domain for TLS connection
 path = "local_state"
 
 [connectors]
+config_type = "local"
 config_dir = "path/to/connectors"
 ```
 

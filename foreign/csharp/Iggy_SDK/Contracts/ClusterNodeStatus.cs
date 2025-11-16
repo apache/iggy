@@ -15,11 +15,35 @@
 // specific language governing permissions and limitations
 // under the License.
 
-namespace Apache.Iggy.Enums;
+namespace Apache.Iggy.Contracts;
 
-public enum StoreOffset
+/// <summary>
+///     Current status of a node
+/// </summary>
+public enum ClusterNodeStatus : byte
 {
-    Never,
-    WhenMessagesAreReceived,
-    AfterProcessingEachMessage
+    /// <summary>
+    ///     Node is healthy and responsive
+    /// </summary>
+    Healthy = 0,
+
+    /// <summary>
+    ///     Node is starting up
+    /// </summary>
+    Starting = 1,
+
+    /// <summary>
+    ///     Node is shutting down
+    /// </summary>
+    Stopping = 2,
+
+    /// <summary>
+    ///     Node is unreachable
+    /// </summary>
+    Unreachable = 3,
+
+    /// <summary>
+    ///     Node is in maintenance mode
+    /// </summary>
+    Maintenance = 4
 }

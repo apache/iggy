@@ -58,7 +58,7 @@ public class UsersTests
     {
         var request = new CreateUserRequest(Username.GetWithProtocol(protocol), "test1", UserStatus.Active, null);
 
-        await Should.ThrowAsync<InvalidResponseException>(Fixture.Clients[protocol]
+        await Should.ThrowAsync<IggyInvalidStatusCodeException>(Fixture.Clients[protocol]
             .CreateUser(request.Username, request.Password, request.Status));
     }
 
@@ -169,7 +169,7 @@ public class UsersTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task ChangePassword_WrongCurrentPassword_Should_Throw_InvalidResponse(Protocol protocol)
     {
-        await Should.ThrowAsync<InvalidResponseException>(Fixture.Clients[protocol]
+        await Should.ThrowAsync<IggyInvalidStatusCodeException>(Fixture.Clients[protocol]
             .ChangePassword(Identifier.String(Username.GetWithProtocol(protocol)), "test_password_1", "user2"));
     }
 
@@ -178,7 +178,7 @@ public class UsersTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task LoginUser_Should_LoginUser_Successfully(Protocol protocol)
     {
-        var client = Fixture.IggyServerFixture.CreateClient(protocol);
+        var client = await Fixture.IggyServerFixture.CreateClient(protocol);
 
         var response = await client.LoginUser(Username.GetWithProtocol(protocol), "user2");
 

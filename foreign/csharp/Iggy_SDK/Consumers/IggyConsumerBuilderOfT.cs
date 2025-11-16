@@ -104,13 +104,12 @@ public class IggyConsumerBuilder<T> : IggyConsumerBuilder
             throw new InvalidOperationException("Invalid consumer config");
         }
 
-        var consumer = new IggyConsumer<T>(IggyClient!, config,
-            Config.LoggerFactory?.CreateLogger<IggyConsumer<T>>() ??
-            NullLoggerFactory.Instance.CreateLogger<IggyConsumer<T>>());
+        var loggerFactory = Config.LoggerFactory ?? NullLoggerFactory.Instance;
+        var consumer = new IggyConsumer<T>(IggyClient!, config, loggerFactory);
 
         if (OnPollingError != null)
         {
-            consumer.OnPollingError += OnPollingError;
+            consumer.SubscribeToErrorEvents(OnPollingError);
         }
 
         return consumer;

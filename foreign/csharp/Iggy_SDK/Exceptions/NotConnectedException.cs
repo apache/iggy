@@ -17,9 +17,12 @@
 
 namespace Apache.Iggy.Exceptions;
 
-public sealed class TcpInvalidResponseException : Exception
+/// <summary>
+/// Represents an exception that is thrown when the client is not connected to the server.
+/// </summary>
+public sealed class NotConnectedException : Exception
 {
-    public TcpInvalidResponseException() : base("Received an Invalid Response")
+    internal NotConnectedException() : base("Iggy client is not connected to the server")
     {
     }
 }

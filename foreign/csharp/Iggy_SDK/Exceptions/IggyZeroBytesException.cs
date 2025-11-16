@@ -15,16 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Apache.Iggy.Kinds;
+namespace Apache.Iggy.Exceptions;
 
-namespace Apache.Iggy.Contracts;
-
-public sealed class PollMessagesRequest
+/// <summary>
+/// Represents an exception that is thrown when zero bytes are received from the server.
+/// </summary>
+public sealed class IggyZeroBytesException : Exception
 {
-    public required Consumer Consumer { get; init; }
-    public required Identifier StreamId { get; init; }
-    public required Identifier TopicId { get; init; }
-    public required uint PartitionId { get; init; }
-    public required PollingStrategy PollingStrategy { get; set; }
-    public required int Count { get; init; }
+    internal IggyZeroBytesException() : base("Received zero bytes from the server")
+    {
+    }
 }

@@ -16,7 +16,9 @@
 # under the License.
 
 type = "sink"
+id = "stdout"
 enabled = true
+version = 0
 name = "Stdout sink"
 path = "target/release/libiggy_connector_stdout_sink"
 

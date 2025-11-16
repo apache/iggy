@@ -1,4 +1,5 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
  * regarding copyright ownership.  The ASF licenses this file
@@ -16,10 +17,8 @@
  * under the License.
  */
 
-use crate::{
-    RuntimeError,
-    configs::{SharedTransformConfig, TransformsConfig},
-};
+use crate::RuntimeError;
+use crate::configs::connectors::{SharedTransformConfig, TransformsConfig};
 use iggy_connector_sdk::transforms::Transform;
 use serde::Deserialize;
 use std::sync::Arc;

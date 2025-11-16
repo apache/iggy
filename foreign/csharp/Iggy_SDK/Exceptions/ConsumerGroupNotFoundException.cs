@@ -7,11 +7,21 @@
 
 namespace Apache.Iggy.Exceptions;
 
+/// <summary>
+///     Exception thrown when a consumer group is not found
+/// </summary>
 public class ConsumerGroupNotFoundException : Exception
 {
+    /// <summary>
+    ///     Name of the consumer group that was not found
+    /// </summary>
     public string ConsumerGroupName { get; }
 
-    public ConsumerGroupNotFoundException(string consumerGroupName) : base($"Consumer Group {consumerGroupName} not found")
+    /// <summary>
+    ///     Initializes a new instance of the <see cref="ConsumerGroupNotFoundException" /> class.
+    /// </summary>
+    public ConsumerGroupNotFoundException(string consumerGroupName) : base(
+        $"Consumer Group {consumerGroupName} not found")
     {
         ConsumerGroupName = consumerGroupName;
     }

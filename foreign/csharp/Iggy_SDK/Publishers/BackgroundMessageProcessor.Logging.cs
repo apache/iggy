@@ -54,6 +54,11 @@ internal sealed partial class BackgroundMessageProcessor : IAsyncDisposable
         Message = "Background task completed")]
     private partial void LogBackgroundTaskCompleted();
 
+    [LoggerMessage(EventId = 16,
+        Level = LogLevel.Debug,
+        Message = "Iggy client is disconnected. Skipping batch send")]
+    private partial void LogClientIsDisconnected();
+
     [LoggerMessage(EventId = 300,
         Level = LogLevel.Warning,
         Message = "Failed to send batch of {Count} messages (attempt {Attempt}/{MaxAttempts}). Retrying in {Delay}ms")]

@@ -80,8 +80,8 @@ pub fn store_consumer_offset(
     }
 }
 
-pub fn store_consumer_group_member_offset(
-    member_id: usize,
+pub fn store_consumer_group_offset(
+    consumer_group_id: crate::streaming::polling_consumer::ConsumerGroupId,
     topic_id: &Identifier,
     partition_id: usize,
     offset: u64,
@@ -93,8 +93,8 @@ pub fn store_consumer_group_member_offset(
             let topic_id = root.id();
             root.partitions().with_components_by_id(
                 partition_id,
-                partitions::helpers::store_consumer_group_member_offset(
-                    member_id,
+                partitions::helpers::store_consumer_group_offset(
+                    consumer_group_id,
                     stream_id,
                     topic_id,
                     partition_id,

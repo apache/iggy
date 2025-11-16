@@ -17,6 +17,7 @@
 
 use crate::shard::task_registry::TaskRegistry;
 use crate::streaming::partitions as streaming_partitions;
+use crate::streaming::partitions::consumer_offset::ConsumerOffset;
 use crate::streaming::stats::StreamStats;
 use crate::{
     binary::handlers::messages::poll_messages_handler::IggyPollMetadata,
@@ -366,27 +367,25 @@ impl MainOps for Streams {
                 Ok(batches)
             }
             PollingKind::Next => {
-                let (consumer_offset, consumer_id) = match consumer {
-                    PollingConsumer::Consumer(consumer_id, _) => (
-                        self.with_partition_by_id(
+                let consumer_offset = match consumer {
+                    PollingConsumer::Consumer(consumer_id, _) => self
+                        .with_partition_by_id(
                             stream_id,
                             topic_id,
                             partition_id,
                             streaming_partitions::helpers::get_consumer_offset(consumer_id),
                         )
                         .map(|c_offset| c_offset.stored_offset),
-                        consumer_id,
-                    ),
-                    PollingConsumer::ConsumerGroup(cg_id, _) => (
-                        self.with_partition_by_id(
+                    PollingConsumer::ConsumerGroup(consumer_group_id, _) => self
+                        .with_partition_by_id(
                             stream_id,
                             topic_id,
                             partition_id,
-                            streaming_partitions::helpers::get_consumer_group_member_offset(cg_id),
+                            streaming_partitions::helpers::get_consumer_group_offset(
+                                consumer_group_id,
+                            ),
                         )
                         .map(|cg_offset| cg_offset.stored_offset),
-                        cg_id,
-                    ),
                 };
 
                 if consumer_offset.is_none() {
@@ -397,12 +396,25 @@ impl MainOps for Streams {
                 } else {
                     let consumer_offset = consumer_offset.unwrap();
                     let offset = consumer_offset + 1;
-                    tracing::trace!(
-                        "Getting next messages for consumer id: {} for partition: {} from offset: {}...",
-                        consumer_id,
-                        partition_id,
-                        offset
-                    );
+                    match consumer {
+                        PollingConsumer::Consumer(consumer_id, _) => {
+                            tracing::trace!(
+                                "Getting next messages for consumer id: {} for partition: {} from offset: {}...",
+                                consumer_id,
+                                partition_id,
+                                offset
+                            );
+                        }
+                        PollingConsumer::ConsumerGroup(consumer_group_id, member_id) => {
+                            tracing::trace!(
+                                "Getting next messages for consumer group: {} member: {} for partition: {} from offset: {}...",
+                                consumer_group_id.0,
+                                member_id.0,
+                                partition_id,
+                                offset
+                            );
+                        }
+                    }
                     let batches = self
                         .get_messages_by_offset(stream_id, topic_id, partition_id, offset, count)
                         .await?;
@@ -1406,6 +1418,14 @@ impl Streams {
 
         match consumer {
             PollingConsumer::Consumer(consumer_id, _) => {
+                tracing::trace!(
+                    "Auto-committing offset {} for consumer {} on stream {}, topic {}, partition {}",
+                    offset,
+                    consumer_id,
+                    numeric_stream_id,
+                    numeric_topic_id,
+                    partition_id
+                );
                 let (offset_value, path) = self.with_partition_by_id(
                     stream_id,
                     topic_id,
@@ -1427,7 +1447,15 @@ impl Streams {
                 );
                 crate::streaming::partitions::storage::persist_offset(&path, offset_value).await?;
             }
-            PollingConsumer::ConsumerGroup(cg_id, _) => {
+            PollingConsumer::ConsumerGroup(consumer_group_id, _) => {
+                tracing::trace!(
+                    "Auto-committing offset {} for consumer group {} on stream {}, topic {}, partition {}",
+                    offset,
+                    consumer_group_id.0,
+                    numeric_stream_id,
+                    numeric_topic_id,
+                    partition_id
+                );
                 let (offset_value, path) = self.with_partition_by_id(
                     stream_id,
                     topic_id,
@@ -1435,10 +1463,14 @@ impl Streams {
                     |(.., offsets, _)| {
                         let hdl = offsets.pin();
                         let item = hdl.get_or_insert(
-                            cg_id,
-                            crate::streaming::partitions::consumer_offset::ConsumerOffset::default_for_consumer_group(
-                                cg_id as u32,
-                                &config.get_consumer_group_offsets_path(numeric_stream_id, numeric_topic_id, partition_id),
+                            consumer_group_id,
+                            ConsumerOffset::default_for_consumer_group(
+                                consumer_group_id,
+                                &config.get_consumer_group_offsets_path(
+                                    numeric_stream_id,
+                                    numeric_topic_id,
+                                    partition_id,
+                                ),
                             ),
                         );
                         item.offset.store(offset, Ordering::Relaxed);

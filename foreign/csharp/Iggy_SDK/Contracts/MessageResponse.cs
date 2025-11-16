@@ -20,9 +20,23 @@ using Apache.Iggy.Messages;
 
 namespace Apache.Iggy.Contracts;
 
+/// <summary>
+///     Response from the server containing a message payload.
+/// </summary>
 public sealed class MessageResponse
 {
+    /// <summary>
+    ///     Message header.
+    /// </summary>
     public required MessageHeader Header { get; set; }
+
+    /// <summary>
+    ///     Message payload.
+    /// </summary>
     public required byte[] Payload { get; set; } = [];
+
+    /// <summary>
+    ///     Headers defined by the user.
+    /// </summary>
     public Dictionary<HeaderKey, HeaderValue>? UserHeaders { get; init; }
 }

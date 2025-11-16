@@ -15,30 +15,28 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Apache.Iggy.Enums;
-
 namespace Apache.Iggy.Exceptions;
 
+/// <summary>
+///     Thrown when a topic is not found in a stream.
+/// </summary>
 public sealed class TopicNotFoundException : Exception
 {
+    /// <summary>
+    ///     Topic identifier that was not found.
+    /// </summary>
     public Identifier TopicId { get; }
+
+    /// <summary>
+    ///     Stream identifier where the topic was not found.
+    /// </summary>
     public Identifier StreamId { get; }
 
+    /// <summary>
+    ///     Initializes a new instance of the <see cref="TopicNotFoundException" /> class.
+    /// </summary>
     public TopicNotFoundException(Identifier topicId, Identifier streamId)
         : base($"Topic {topicId} does not exist in stream {streamId} and auto-creation is disabled")
-    {
-        TopicId = topicId;
-        StreamId = streamId;
-    }
-
-    public TopicNotFoundException(Identifier topicId, Identifier streamId, string message) : base(message)
-    {
-        TopicId = topicId;
-        StreamId = streamId;
-    }
-
-    public TopicNotFoundException(Identifier topicId, Identifier streamId, string message, Exception innerException)
-        : base(message, innerException)
     {
         TopicId = topicId;
         StreamId = streamId;

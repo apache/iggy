@@ -45,6 +45,7 @@ var client = IggyClientFactory.CreateClient(new IggyClientConfigurator()
     LoggerFactory = loggerFactory
 });
 
+await client.ConnectAsync();
 await client.LoginUser(settings.Username, settings.Password);
 
 logger.LogInformation("Basic producer has logged on successfully");

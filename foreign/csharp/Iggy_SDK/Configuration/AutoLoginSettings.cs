@@ -15,11 +15,25 @@
 // specific language governing permissions and limitations
 // under the License.
 
-namespace Apache.Iggy.Exceptions;
+namespace Apache.Iggy.Configuration;
 
-internal sealed class TcpInvalidStatus : Exception
+/// <summary>
+///     Represents the settings required for automatic login functionality in the Iggy client.
+/// </summary>
+public class AutoLoginSettings
 {
-    internal TcpInvalidStatus() : base("Received an Invalid Response Status")
-    {
-    }
+    /// <summary>
+    ///     Enable automatic login on connection establishment
+    /// </summary>
+    public bool Enabled { get; set; }
+
+    /// <summary>
+    ///     Specifies the username for auto-login configuration.
+    /// </summary>
+    public string Username { get; set; } = string.Empty;
+
+    /// <summary>
+    ///     Specifies the password for auto-login authentication
+    /// </summary>
+    public string Password { get; set; } = string.Empty;
 }

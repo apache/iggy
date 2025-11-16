@@ -16,10 +16,10 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-use crate::configs::{SinkConfig, SourceConfig};
+use crate::configs::connectors::{SinkConfig, SourceConfig};
+use crate::configs::runtime::ConnectorsRuntimeConfig;
 use crate::{
     SinkConnectorWrapper, SourceConnectorWrapper,
-    configs::ConnectorsRuntimeConfig,
     manager::{
         sink::{SinkDetails, SinkInfo, SinkManager},
         source::{SourceDetails, SourceInfo, SourceManager},

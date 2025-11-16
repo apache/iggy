@@ -17,7 +17,13 @@
 
 namespace Apache.Iggy.Contracts.Auth;
 
+/// <summary>
+///     Personal access token.
+/// </summary>
 public sealed class RawPersonalAccessToken
 {
+    /// <summary>
+    ///     Personal access token.
+    /// </summary>
     public required string Token { get; init; }
 }

@@ -15,17 +15,41 @@
 // specific language governing permissions and limitations
 // under the License.
 
-namespace Apache.Iggy.Configuration;
+namespace Apache.Iggy.Contracts;
 
-public sealed class MessageBatchingSettings
+/// <summary>
+///     Cluster node metadata
+/// </summary>
+public class ClusterNode
 {
-    public bool Enabled { get; set; } = true;
-    public TimeSpan Interval { get; set; } = TimeSpan.FromMilliseconds(150);
-    public int MaxMessagesPerBatch { get; set; } = 1000;
+    /// <summary>
+    ///     Node identifier
+    /// </summary>
+    public required uint Id { get; set; }
 
     /// <summary>
-    ///     Defines maximum number of requests in interval
-    ///     Used mainly to avoid flooding the channel (default value 2056).
+    ///     Node name
     /// </summary>
-    public int MaxRequests { get; set; } = 2056;
+    public required string Name { get; set; }
+
+    /// <summary>
+    ///     Node address
+    /// </summary>
+    public required string Address { get; set; }
+
+    /// <summary>
+    ///     Node role within the cluster
+    /// </summary>
+    public required ClusterNodeRole Role { get; set; }
+
+    /// <summary>
+    ///     Node status
+    /// </summary>
+    public required ClusterNodeStatus Status { get; set; }
+
+    internal int GetSize()
+    {
+        // id, name length, name, address length, address, role, status
+        return 4 + 4 + Name.Length + 4 + Address.Length + 1 + 1;
+    }
 }
