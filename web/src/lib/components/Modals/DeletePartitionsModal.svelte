@@ -5,7 +5,7 @@
   import { z } from 'zod';
   import ModalBase from './ModalBase.svelte';
   import { setError, superForm, defaults } from 'sveltekit-superforms/client';
-  import { zod } from 'sveltekit-superforms/adapters';
+  import { zod4 } from 'sveltekit-superforms/adapters';
   import Button from '../Button.svelte';
 
   import ModalConfirmation from '../ModalConfirmation.svelte';
@@ -39,9 +39,9 @@
     partitions_count: z.coerce.number().min(1).max(topic.partitionsCount).default(1)
   });
 
-  const { form, errors, enhance, constraints, validateForm } = superForm(defaults(zod(schema)), {
+  const { form, errors, enhance, constraints, validateForm } = superForm(defaults(zod4(schema)), {
     SPA: true,
-    validators: zod(schema),
+    validators: zod4(schema),
 
     async onUpdate({ form }) {
       if (!form.valid) return;

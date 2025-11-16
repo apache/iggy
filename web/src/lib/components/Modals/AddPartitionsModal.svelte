@@ -5,7 +5,7 @@
   import ModalBase from './ModalBase.svelte';
   import { numberSizes } from '$lib/utils/constants/numberSizes';
   import { setError, superForm, defaults } from 'sveltekit-superforms/client';
-  import { zod } from 'sveltekit-superforms/adapters';
+  import { zod4 } from 'sveltekit-superforms/adapters';
   import { fetchRouteApi } from '$lib/api/fetchRouteApi';
   import { page } from '$app/state';
   import { showToast } from '../AppToasts.svelte';
@@ -22,9 +22,9 @@
     partitions_count: z.number().min(1).max(numberSizes.max.u32).default(1)
   });
 
-  const { form, errors, enhance, constraints } = superForm(defaults(zod(schema)), {
+  const { form, errors, enhance, constraints } = superForm(defaults(zod4(schema)), {
     SPA: true,
-    validators: zod(schema),
+    validators: zod4(schema),
     invalidateAll: false,
     taintedMessage: false,
     async onUpdate({ form }) {
