@@ -584,19 +584,18 @@ Additionally, builder-based APIs are available:
 
 Examples are located in `examples/csharp/` in root iggy directory.
 
-1. Start the Iggy server:
-
+- Start the Iggy server:
 ```bash
 cargo run --bin iggy-server
 ```
 
-2. Run the producer example:
+- Run the producer example:
 
 ```bash
 dotnet run -c Release --project Iggy_SDK.Examples.GettingStarted.Producer
 ```
 
-3. Run the consumer example:
+- Run the consumer example:
 
 ```bash
 dotnet run -c Release --project Iggy_SDK.Examples.GettingStarted.Consumer
