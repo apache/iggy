@@ -585,6 +585,7 @@ Additionally, builder-based APIs are available:
 Examples are located in `examples/csharp/` in root iggy directory.
 
 - Start the Iggy server:
+
 ```bash
 cargo run --bin iggy-server
 ```
