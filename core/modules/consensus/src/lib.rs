@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub trait consensus {
+pub trait Consensus {
     type RequestMessage;
     type ReplicateMessage;
     type AckMessage;

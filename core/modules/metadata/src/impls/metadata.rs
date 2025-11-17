@@ -14,13 +14,13 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use consensus::consensus;
+use consensus::Consensus;
 
 // TODO: Define a trait (probably in some external crate)
 #[expect(unused)]
 trait Metadata<C>
 where
-    C: consensus,
+    C: Consensus,
 {
     fn on_request(&self, message: C::RequestMessage);
     fn on_replicate(&self, message: C::ReplicateMessage);
@@ -37,7 +37,7 @@ struct IggyMetadata<C, M, J, S> {
 
 impl<C, M, J, S> Metadata<C> for IggyMetadata<C, M, J, S>
 where
-    C: consensus,
+    C: Consensus,
 {
     fn on_request(&self, _message: C::RequestMessage) {
         todo!()
