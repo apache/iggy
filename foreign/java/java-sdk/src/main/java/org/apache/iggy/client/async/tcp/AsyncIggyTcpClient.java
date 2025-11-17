@@ -81,6 +81,12 @@ public class AsyncIggyTcpClient {
      */
     public CompletableFuture<Void> connect() {
         connection = new AsyncTcpConnection(host, port);
+        
+        // Set request timeout if configured
+        if (requestTimeout.isPresent()) {
+            connection.setRequestTimeout(requestTimeout.get());
+        }
+        
         return connection.connect()
             .thenRun(() -> {
                 messagesClient = new MessagesTcpClient(connection);

@@ -63,8 +63,19 @@ class AsyncTcpProtocolErrorTest extends AsyncTcpTestBase {
 
     @AfterEach
     void cleanupProtocolErrorTest() throws Exception {
-        if (mockServer != null) {
-            mockServer.stop();
+        try {
+            if (mockServer != null) {
+                mockServer.stop();
+            }
+        } catch (Exception ignored) {
+            // Server may already be stopped
+        }
+        if (client != null) {
+            try {
+                client.close().get(1, TimeUnit.SECONDS);
+            } catch (Exception ignored) {
+                // Client may already be closed
+            }
         }
     }
 
