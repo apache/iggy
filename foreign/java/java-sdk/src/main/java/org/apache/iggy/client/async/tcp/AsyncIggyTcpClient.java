@@ -81,6 +81,12 @@ public class AsyncIggyTcpClient {
      */
     public CompletableFuture<Void> connect() {
         connection = new AsyncTcpConnection(host, port);
+        
+        // Set request timeout if configured
+        if (requestTimeout.isPresent()) {
+            connection.setRequestTimeout(requestTimeout.get());
+        }
+        
         return connection.connect()
             .thenRun(() -> {
                 messagesClient = new MessagesTcpClient(connection);
@@ -264,8 +270,8 @@ public class AsyncIggyTcpClient {
             if (host == null || host.isEmpty()) {
                 throw new IllegalArgumentException("Host cannot be null or empty");
             }
-            if (port == null || port <= 0) {
-                throw new IllegalArgumentException("Port must be a positive integer");
+            if (port == null || port <= 0 || port > 65535) {
+                throw new IllegalArgumentException("Port must be between 1 and 65535");
             }
             return new AsyncIggyTcpClient(host, port, username, password,
                     connectionTimeout, requestTimeout, connectionPoolSize, retryPolicy);

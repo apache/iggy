@@ -28,8 +28,11 @@ import io.netty.channel.socket.nio.NioSocketChannel;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.time.Duration;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -43,14 +46,21 @@ public class AsyncTcpConnection {
     private final int port;
     private final EventLoopGroup eventLoopGroup;
     private final Bootstrap bootstrap;
+    private final ScheduledExecutorService scheduler;
     private Channel channel;
     private final AtomicLong requestIdGenerator = new AtomicLong(0);
     private final ConcurrentHashMap<Long, CompletableFuture<ByteBuf>> pendingRequests = new ConcurrentHashMap<>();
+    private Duration requestTimeout = Duration.ofSeconds(30); // default timeout
 
     public AsyncTcpConnection(String host, int port) {
         this.host = host;
         this.port = port;
         this.eventLoopGroup = new NioEventLoopGroup();
+        this.scheduler = java.util.concurrent.Executors.newScheduledThreadPool(1, r -> {
+            Thread t = new Thread(r, "AsyncTcpConnection-Timeout-" + hashCode());
+            t.setDaemon(true);
+            return t;
+        });
         this.bootstrap = new Bootstrap();
         configureBootstrap();
     }
@@ -98,6 +108,13 @@ public class AsyncTcpConnection {
     }
 
     /**
+     * Sets the request timeout duration.
+     */
+    public void setRequestTimeout(Duration timeout) {
+        this.requestTimeout = timeout;
+    }
+
+    /**
      * Sends a command asynchronously and returns the response.
      */
     public CompletableFuture<ByteBuf> sendAsync(int commandCode, ByteBuf payload) {
@@ -106,24 +123,18 @@ public class AsyncTcpConnection {
                 new IllegalStateException("Connection not established or closed"));
         }
 
-        // Since Iggy doesn't use request IDs, we'll just use a simple queue
-        // Each request will get the next response in order
         CompletableFuture<ByteBuf> responseFuture = new CompletableFuture<>();
         long requestId = requestIdGenerator.incrementAndGet();
         pendingRequests.put(requestId, responseFuture);
 
-        // Build the request frame exactly like the blocking client
-        // Frame format: [payload_size:4][command:4][payload:N]
-        // where payload_size = 4 (command size) + N (payload size)
         int payloadSize = payload.readableBytes();
-        int framePayloadSize = 4 + payloadSize; // command (4 bytes) + payload
+        int framePayloadSize = 4 + payloadSize;
 
         ByteBuf frame = channel.alloc().buffer(4 + framePayloadSize);
-        frame.writeIntLE(framePayloadSize);  // Length field (includes command)
-        frame.writeIntLE(commandCode);        // Command
-        frame.writeBytes(payload, payload.readerIndex(), payloadSize); // Payload
+        frame.writeIntLE(framePayloadSize);
+        frame.writeIntLE(commandCode);
+        frame.writeBytes(payload, payload.readerIndex(), payloadSize);
 
-        // Debug: print frame bytes
         byte[] frameBytes = new byte[Math.min(frame.readableBytes(), 30)];
         if (logger.isTraceEnabled()) {
             frame.getBytes(0, frameBytes);
@@ -138,7 +149,18 @@ public class AsyncTcpConnection {
 
         payload.release();
 
-        // Send the frame
+        // Schedule timeout to fail the request if no response is received
+        scheduler.schedule(() -> {
+            if (!responseFuture.isDone()) {
+                CompletableFuture<ByteBuf> removed = pendingRequests.remove(requestId);
+                if (removed != null) {
+                    removed.completeExceptionally(
+                        new java.util.concurrent.TimeoutException(
+                            "Request timeout after " + requestTimeout.toMillis() + "ms"));
+                }
+            }
+        }, requestTimeout.toMillis(), TimeUnit.MILLISECONDS);
+
         channel.writeAndFlush(frame).addListener((ChannelFutureListener) future -> {
             if (!future.isSuccess()) {
                 logger.error("Failed to send frame: {}", future.cause().getMessage());
@@ -154,9 +176,13 @@ public class AsyncTcpConnection {
 
     /**
      * Closes the connection and releases resources.
+     * This method is idempotent - multiple calls are safe.
      */
     public CompletableFuture<Void> close() {
         CompletableFuture<Void> future = new CompletableFuture<>();
+
+        // Shutdown scheduler
+        scheduler.shutdown();
 
         if (channel != null && channel.isActive()) {
             channel.close().addListener((ChannelFutureListener) channelFuture -> {
@@ -168,7 +194,9 @@ public class AsyncTcpConnection {
                 }
             });
         } else {
-            eventLoopGroup.shutdownGracefully();
+            if (!eventLoopGroup.isShuttingDown() && !eventLoopGroup.isShutdown()) {
+                eventLoopGroup.shutdownGracefully();
+            }
             future.complete(null);
         }
 
