@@ -21,7 +21,11 @@ package org.apache.iggy.connector.flink.source;
 
 import org.apache.flink.core.io.SimpleVersionedSerializer;
 
-import java.io.*;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 
 /**
@@ -39,7 +43,7 @@ public class IggySourceSplitSerializer implements SimpleVersionedSerializer<Iggy
     @Override
     public byte[] serialize(IggySourceSplit split) throws IOException {
         try (ByteArrayOutputStream baos = new ByteArrayOutputStream();
-             DataOutputStream out = new DataOutputStream(baos)) {
+                DataOutputStream out = new DataOutputStream(baos)) {
 
             // Write streamId
             byte[] streamIdBytes = split.getStreamId().getBytes(StandardCharsets.UTF_8);
@@ -72,7 +76,7 @@ public class IggySourceSplitSerializer implements SimpleVersionedSerializer<Iggy
         }
 
         try (ByteArrayInputStream bais = new ByteArrayInputStream(serialized);
-             DataInputStream in = new DataInputStream(bais)) {
+                DataInputStream in = new DataInputStream(bais)) {
 
             // Read streamId
             int streamIdLength = in.readInt();

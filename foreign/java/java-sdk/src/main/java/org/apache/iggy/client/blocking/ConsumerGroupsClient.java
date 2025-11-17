@@ -24,6 +24,7 @@ import org.apache.iggy.consumergroup.ConsumerGroupDetails;
 import org.apache.iggy.identifier.ConsumerId;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
+
 import java.util.List;
 import java.util.Optional;
 
@@ -64,5 +65,4 @@ public interface ConsumerGroupsClient {
     }
 
     void leaveConsumerGroup(StreamId streamId, TopicId topicId, ConsumerId groupId);
-
 }

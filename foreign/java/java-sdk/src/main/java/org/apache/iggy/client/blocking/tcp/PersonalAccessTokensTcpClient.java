@@ -24,10 +24,12 @@ import org.apache.iggy.client.blocking.PersonalAccessTokensClient;
 import org.apache.iggy.personalaccesstoken.PersonalAccessTokenInfo;
 import org.apache.iggy.personalaccesstoken.RawPersonalAccessToken;
 import org.apache.iggy.user.IdentityInfo;
+
 import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+
 import static org.apache.iggy.client.blocking.tcp.BytesDeserializer.readPersonalAccessTokenInfo;
 import static org.apache.iggy.client.blocking.tcp.BytesDeserializer.readRawPersonalAccessToken;
 import static org.apache.iggy.client.blocking.tcp.BytesSerializer.nameToBytes;

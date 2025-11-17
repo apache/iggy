@@ -19,12 +19,14 @@
 
 package org.apache.iggy.client.blocking.tcp;
 
-import org.junit.jupiter.api.Test;
 import org.apache.iggy.client.blocking.IggyBaseClient;
 import org.apache.iggy.client.blocking.SystemClientBaseTest;
 import org.apache.iggy.system.ClientInfo;
 import org.apache.iggy.system.ClientInfoDetails;
+import org.junit.jupiter.api.Test;
+
 import java.util.List;
+
 import static org.assertj.core.api.Assertions.assertThat;
 
 class SystemTcpClientTest extends SystemClientBaseTest {

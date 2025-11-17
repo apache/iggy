@@ -19,13 +19,17 @@
 
 package org.apache.iggy.client.async.tcp;
 
-import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Test;
+
 import java.time.Duration;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 
-import static org.junit.jupiter.api.Assertions.*;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * Integration tests for AsyncIggyTcpClient builder pattern.
@@ -48,10 +52,7 @@ class AsyncIggyTcpClientBuilderTest {
     @Test
     void shouldCreateClientWithBuilder() throws Exception {
         // Given: Builder with basic configuration
-        client = AsyncIggyTcpClient.builder()
-                .host(HOST)
-                .port(PORT)
-                .build();
+        client = AsyncIggyTcpClient.builder().host(HOST).port(PORT).build();
 
         // When: Connect to server
         client.connect().get(5, TimeUnit.SECONDS);
@@ -205,9 +206,8 @@ class AsyncIggyTcpClientBuilderTest {
     @Test
     void shouldThrowExceptionForEmptyHost() {
         // Given: Builder with empty host
-        AsyncIggyTcpClient.Builder builder = AsyncIggyTcpClient.builder()
-                .host("")
-                .port(PORT);
+        AsyncIggyTcpClient.Builder builder =
+                AsyncIggyTcpClient.builder().host("").port(PORT);
 
         // When/Then: Building should throw IllegalArgumentException
         assertThrows(IllegalArgumentException.class, builder::build);
@@ -216,9 +216,8 @@ class AsyncIggyTcpClientBuilderTest {
     @Test
     void shouldThrowExceptionForNullHost() {
         // Given: Builder with null host
-        AsyncIggyTcpClient.Builder builder = AsyncIggyTcpClient.builder()
-                .host(null)
-                .port(PORT);
+        AsyncIggyTcpClient.Builder builder =
+                AsyncIggyTcpClient.builder().host(null).port(PORT);
 
         // When/Then: Building should throw IllegalArgumentException
         assertThrows(IllegalArgumentException.class, builder::build);
@@ -227,9 +226,8 @@ class AsyncIggyTcpClientBuilderTest {
     @Test
     void shouldThrowExceptionForInvalidPort() {
         // Given: Builder with invalid port
-        AsyncIggyTcpClient.Builder builder = AsyncIggyTcpClient.builder()
-                .host(HOST)
-                .port(-1);
+        AsyncIggyTcpClient.Builder builder =
+                AsyncIggyTcpClient.builder().host(HOST).port(-1);
 
         // When/Then: Building should throw IllegalArgumentException
         assertThrows(IllegalArgumentException.class, builder::build);
@@ -238,9 +236,8 @@ class AsyncIggyTcpClientBuilderTest {
     @Test
     void shouldThrowExceptionForZeroPort() {
         // Given: Builder with zero port
-        AsyncIggyTcpClient.Builder builder = AsyncIggyTcpClient.builder()
-                .host(HOST)
-                .port(0);
+        AsyncIggyTcpClient.Builder builder =
+                AsyncIggyTcpClient.builder().host(HOST).port(0);
 
         // When/Then: Building should throw IllegalArgumentException
         assertThrows(IllegalArgumentException.class, builder::build);

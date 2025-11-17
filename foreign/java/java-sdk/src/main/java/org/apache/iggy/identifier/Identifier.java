@@ -20,6 +20,7 @@
 package org.apache.iggy.identifier;
 
 import org.apache.commons.lang3.StringUtils;
+
 import javax.annotation.Nullable;
 
 public abstract class Identifier {
@@ -75,6 +76,4 @@ public abstract class Identifier {
             return 2 + name.length();
         }
     }
-
 }
-

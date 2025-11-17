@@ -45,12 +45,7 @@ public class IggyCommittable implements Serializable {
      * @param lastWrittenOffset the last offset written to this partition
      * @param messageCount the number of messages in this commit
      */
-    public IggyCommittable(
-            String streamId,
-            String topicId,
-            int partitionId,
-            long lastWrittenOffset,
-            int messageCount) {
+    public IggyCommittable(String streamId, String topicId, int partitionId, long lastWrittenOffset, int messageCount) {
 
         if (streamId == null || streamId.isEmpty()) {
             throw new IllegalArgumentException("streamId cannot be null or empty");

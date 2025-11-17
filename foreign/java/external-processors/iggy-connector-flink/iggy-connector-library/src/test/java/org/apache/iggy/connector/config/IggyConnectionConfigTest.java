@@ -19,11 +19,12 @@
 
 package org.apache.iggy.connector.config;
 
-import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
-import org.junit.jupiter.api.Test;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class IggyConnectionConfigTest {
 
@@ -68,9 +69,9 @@ class IggyConnectionConfigTest {
     @Test
     void shouldThrowExceptionWhenServerAddressIsNull() {
         assertThatThrownBy(() -> IggyConnectionConfig.builder()
-                .username("iggy")
-                .password("iggy")
-                .build())
+                        .username("iggy")
+                        .password("iggy")
+                        .build())
                 .isInstanceOf(NullPointerException.class)
                 .hasMessageContaining("serverAddress must not be null");
     }
@@ -78,9 +79,9 @@ class IggyConnectionConfigTest {
     @Test
     void shouldThrowExceptionWhenUsernameIsNull() {
         assertThatThrownBy(() -> IggyConnectionConfig.builder()
-                .serverAddress("localhost:8080")
-                .password("iggy")
-                .build())
+                        .serverAddress("localhost:8080")
+                        .password("iggy")
+                        .build())
                 .isInstanceOf(NullPointerException.class)
                 .hasMessageContaining("username must not be null");
     }
@@ -88,9 +89,9 @@ class IggyConnectionConfigTest {
     @Test
     void shouldThrowExceptionWhenPasswordIsNull() {
         assertThatThrownBy(() -> IggyConnectionConfig.builder()
-                .serverAddress("localhost:8080")
-                .username("iggy")
-                .build())
+                        .serverAddress("localhost:8080")
+                        .username("iggy")
+                        .build())
                 .isInstanceOf(NullPointerException.class)
                 .hasMessageContaining("password must not be null");
     }
@@ -98,11 +99,11 @@ class IggyConnectionConfigTest {
     @Test
     void shouldThrowExceptionWhenConnectionTimeoutIsNull() {
         assertThatThrownBy(() -> IggyConnectionConfig.builder()
-                .serverAddress("localhost:8080")
-                .username("iggy")
-                .password("iggy")
-                .connectionTimeout(null)
-                .build())
+                        .serverAddress("localhost:8080")
+                        .username("iggy")
+                        .password("iggy")
+                        .connectionTimeout(null)
+                        .build())
                 .isInstanceOf(NullPointerException.class)
                 .hasMessageContaining("connectionTimeout must not be null");
     }
@@ -110,11 +111,11 @@ class IggyConnectionConfigTest {
     @Test
     void shouldThrowExceptionWhenRequestTimeoutIsNull() {
         assertThatThrownBy(() -> IggyConnectionConfig.builder()
-                .serverAddress("localhost:8080")
-                .username("iggy")
-                .password("iggy")
-                .requestTimeout(null)
-                .build())
+                        .serverAddress("localhost:8080")
+                        .username("iggy")
+                        .password("iggy")
+                        .requestTimeout(null)
+                        .build())
                 .isInstanceOf(NullPointerException.class)
                 .hasMessageContaining("requestTimeout must not be null");
     }
@@ -122,11 +123,11 @@ class IggyConnectionConfigTest {
     @Test
     void shouldThrowExceptionWhenRetryBackoffIsNull() {
         assertThatThrownBy(() -> IggyConnectionConfig.builder()
-                .serverAddress("localhost:8080")
-                .username("iggy")
-                .password("iggy")
-                .retryBackoff(null)
-                .build())
+                        .serverAddress("localhost:8080")
+                        .username("iggy")
+                        .password("iggy")
+                        .retryBackoff(null)
+                        .build())
                 .isInstanceOf(NullPointerException.class)
                 .hasMessageContaining("retryBackoff must not be null");
     }
@@ -134,11 +135,11 @@ class IggyConnectionConfigTest {
     @Test
     void shouldThrowExceptionWhenMaxRetriesIsNegative() {
         assertThatThrownBy(() -> IggyConnectionConfig.builder()
-                .serverAddress("localhost:8080")
-                .username("iggy")
-                .password("iggy")
-                .maxRetries(-1)
-                .build())
+                        .serverAddress("localhost:8080")
+                        .username("iggy")
+                        .password("iggy")
+                        .maxRetries(-1)
+                        .build())
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("maxRetries must be non-negative");
     }

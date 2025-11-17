@@ -44,8 +44,7 @@ import java.util.Optional;
  */
 public final class AsyncBytesDeserializer {
 
-    private AsyncBytesDeserializer() {
-    }
+    private AsyncBytesDeserializer() {}
 
     /**
      * Reads PolledMessages from the response buffer.
@@ -74,8 +73,8 @@ public final class AsyncBytesDeserializer {
         var originTimestamp = readU64AsBigInteger(response);
         var userHeadersLength = response.readUnsignedIntLE();
         var payloadLength = response.readUnsignedIntLE();
-        var header = new MessageHeader(checksum, id, offset, timestamp, originTimestamp,
-            userHeadersLength, payloadLength);
+        var header =
+                new MessageHeader(checksum, id, offset, timestamp, originTimestamp, userHeadersLength, payloadLength);
         var payload = new byte[toInt(payloadLength)];
         response.readBytes(payload);
         // TODO: Add support for user headers.
@@ -166,7 +165,8 @@ public final class AsyncBytesDeserializer {
         var nameLength = response.readByte();
         var name = response.readCharSequence(nameLength, StandardCharsets.UTF_8).toString();
 
-        return new Topic(topicId,
+        return new Topic(
+                topicId,
                 createdAt,
                 name,
                 size.toString(),
@@ -205,7 +205,6 @@ public final class AsyncBytesDeserializer {
         var size = readU64AsBigInteger(response);
         var messagesCount = readU64AsBigInteger(response);
 
-        return new Partition(partitionId, createdAt, segmentsCount,
-                currentOffset, size.toString(), messagesCount);
+        return new Partition(partitionId, createdAt, segmentsCount, currentOffset, size.toString(), messagesCount);
     }
 }

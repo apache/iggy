@@ -39,8 +39,7 @@ import java.util.Optional;
  */
 public final class AsyncBytesSerializer {
 
-    private AsyncBytesSerializer() {
-    }
+    private AsyncBytesSerializer() {}
 
     /**
      * Serializes a Consumer to bytes.

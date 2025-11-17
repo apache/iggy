@@ -21,7 +21,7 @@ package org.apache.iggy.identifier;
 
 import javax.annotation.Nullable;
 
-public class StreamId extends Identifier {
+public final class StreamId extends Identifier {
 
     private StreamId(@Nullable String name, @Nullable Long id) {
         super(name, id);
@@ -34,5 +34,4 @@ public class StreamId extends Identifier {
     public static StreamId of(Long id) {
         return new StreamId(null, id);
     }
-
 }

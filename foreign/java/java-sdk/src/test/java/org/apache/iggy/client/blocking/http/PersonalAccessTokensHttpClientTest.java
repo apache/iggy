@@ -28,5 +28,4 @@ class PersonalAccessTokensHttpClientTest extends PersonalAccessTokensBaseTest {
     protected IggyBaseClient getClient() {
         return HttpClientFactory.create(iggyServer);
     }
-
 }

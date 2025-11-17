@@ -21,6 +21,7 @@ package org.apache.iggy.message;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
+
 import java.math.BigInteger;
 import java.util.Arrays;
 
@@ -49,5 +50,4 @@ public class BytesMessageId implements MessageId {
     public String toString() {
         return Arrays.toString(value);
     }
-
 }

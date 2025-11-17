@@ -22,6 +22,7 @@ package org.apache.iggy.client.blocking;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.stream.StreamBase;
 import org.apache.iggy.stream.StreamDetails;
+
 import java.util.List;
 import java.util.Optional;
 
@@ -48,5 +49,4 @@ public interface StreamsClient {
     }
 
     void deleteStream(StreamId streamId);
-
 }

@@ -47,12 +47,7 @@ public class IggySourceSplit implements SourceSplit, Serializable {
      * @param startOffset the initial offset to start reading from
      * @param currentOffset the current offset (for checkpointing)
      */
-    public IggySourceSplit(
-            String streamId,
-            String topicId,
-            int partitionId,
-            long startOffset,
-            long currentOffset) {
+    public IggySourceSplit(String streamId, String topicId, int partitionId, long startOffset, long currentOffset) {
 
         if (streamId == null || streamId.isEmpty()) {
             throw new IllegalArgumentException("streamId cannot be null or empty");
@@ -86,11 +81,7 @@ public class IggySourceSplit implements SourceSplit, Serializable {
      * @param startOffset the offset to start reading from
      * @return a new source split
      */
-    public static IggySourceSplit create(
-            String streamId,
-            String topicId,
-            int partitionId,
-            long startOffset) {
+    public static IggySourceSplit create(String streamId, String topicId, int partitionId, long startOffset) {
         return new IggySourceSplit(streamId, topicId, partitionId, startOffset, startOffset);
     }
 

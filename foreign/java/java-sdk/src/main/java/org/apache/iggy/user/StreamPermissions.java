@@ -21,6 +21,7 @@ package org.apache.iggy.user;
 
 import com.fasterxml.jackson.annotation.JsonSetter;
 import com.fasterxml.jackson.annotation.Nulls;
+
 import java.util.Map;
 
 public record StreamPermissions(
@@ -30,7 +31,4 @@ public record StreamPermissions(
         boolean readTopics,
         boolean pollMessages,
         boolean sendMessages,
-        @JsonSetter(nulls = Nulls.AS_EMPTY)
-        Map<Long, TopicPermissions> topics
-) {
-}
+        @JsonSetter(nulls = Nulls.AS_EMPTY) Map<Long, TopicPermissions> topics) {}

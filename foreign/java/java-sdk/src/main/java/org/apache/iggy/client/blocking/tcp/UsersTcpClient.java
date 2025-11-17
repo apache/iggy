@@ -27,9 +27,11 @@ import org.apache.iggy.user.Permissions;
 import org.apache.iggy.user.UserInfo;
 import org.apache.iggy.user.UserInfoDetails;
 import org.apache.iggy.user.UserStatus;
+
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+
 import static org.apache.iggy.client.blocking.tcp.BytesDeserializer.readUserInfoDetails;
 import static org.apache.iggy.client.blocking.tcp.BytesSerializer.nameToBytes;
 import static org.apache.iggy.client.blocking.tcp.BytesSerializer.toBytes;
@@ -63,17 +65,20 @@ class UsersTcpClient implements UsersClient {
     }
 
     @Override
-    public UserInfoDetails createUser(String username, String password, UserStatus status, Optional<Permissions> permissions) {
+    public UserInfoDetails createUser(
+            String username, String password, UserStatus status, Optional<Permissions> permissions) {
         var payload = Unpooled.buffer();
         payload.writeBytes(nameToBytes(username));
         payload.writeBytes(nameToBytes(password));
         payload.writeByte(status.asCode());
-        permissions.ifPresentOrElse(perms -> {
-            payload.writeByte(1);
-            var permissionBytes = toBytes(perms);
-            payload.writeIntLE(permissionBytes.readableBytes());
-            payload.writeBytes(permissionBytes);
-        }, () -> payload.writeByte(0));
+        permissions.ifPresentOrElse(
+                perms -> {
+                    payload.writeByte(1);
+                    var permissionBytes = toBytes(perms);
+                    payload.writeIntLE(permissionBytes.readableBytes());
+                    payload.writeBytes(permissionBytes);
+                },
+                () -> payload.writeByte(0));
 
         var response = tcpClient.send(CommandCode.User.CREATE, payload);
         return readUserInfoDetails(response);
@@ -88,14 +93,18 @@ class UsersTcpClient implements UsersClient {
     @Override
     public void updateUser(UserId userId, Optional<String> usernameOptional, Optional<UserStatus> statusOptional) {
         var payload = toBytes(userId);
-        usernameOptional.ifPresentOrElse((username) -> {
-            payload.writeByte(1);
-            payload.writeBytes(nameToBytes(username));
-        }, () -> payload.writeByte(0));
-        statusOptional.ifPresentOrElse((status) -> {
-            payload.writeByte(1);
-            payload.writeByte(status.asCode());
-        }, () -> payload.writeByte(0));
+        usernameOptional.ifPresentOrElse(
+                (username) -> {
+                    payload.writeByte(1);
+                    payload.writeBytes(nameToBytes(username));
+                },
+                () -> payload.writeByte(0));
+        statusOptional.ifPresentOrElse(
+                (status) -> {
+                    payload.writeByte(1);
+                    payload.writeByte(status.asCode());
+                },
+                () -> payload.writeByte(0));
 
         tcpClient.send(CommandCode.User.UPDATE, payload);
     }
@@ -104,12 +113,14 @@ class UsersTcpClient implements UsersClient {
     public void updatePermissions(UserId userId, Optional<Permissions> permissionsOptional) {
         var payload = toBytes(userId);
 
-        permissionsOptional.ifPresentOrElse(permissions -> {
-            payload.writeByte(1);
-            var permissionBytes = toBytes(permissions);
-            payload.writeIntLE(permissionBytes.readableBytes());
-            payload.writeBytes(permissionBytes);
-        }, () -> payload.writeByte(0));
+        permissionsOptional.ifPresentOrElse(
+                permissions -> {
+                    payload.writeByte(1);
+                    var permissionBytes = toBytes(permissions);
+                    payload.writeIntLE(permissionBytes.readableBytes());
+                    payload.writeBytes(permissionBytes);
+                },
+                () -> payload.writeByte(0));
 
         tcpClient.send(CommandCode.User.UPDATE_PERMISSIONS, payload);
     }

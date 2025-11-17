@@ -20,7 +20,6 @@
 plugins {
     id("java-library")
     id("maven-publish")
-    id("checkstyle")
 }
 
 group = "org.apache.iggy"
@@ -37,11 +36,6 @@ java {
 
     withJavadocJar()
     withSourcesJar()
-}
-
-checkstyle {
-    toolVersion = "10.23.1"
-    configFile = file("../../../dev-support/checkstyle/checkstyle.xml")
 }
 
 val flinkVersion = "2.1.0"

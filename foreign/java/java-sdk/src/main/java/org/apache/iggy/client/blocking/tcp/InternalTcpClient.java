@@ -139,7 +139,5 @@ final class InternalTcpClient {
         }
     }
 
-    record IggyResponse(long status, int length, ByteBuf payload) {
-    }
-
+    record IggyResponse(long status, int length, ByteBuf payload) {}
 }

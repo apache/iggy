@@ -25,6 +25,7 @@ import org.apache.iggy.personalaccesstoken.PersonalAccessTokenInfo;
 import org.apache.iggy.personalaccesstoken.RawPersonalAccessToken;
 import org.apache.iggy.user.IdentityInfo;
 import org.apache.iggy.user.TokenInfo;
+
 import java.math.BigInteger;
 import java.util.List;
 
@@ -39,17 +40,15 @@ class PersonalAccessTokensHttpClient implements PersonalAccessTokensClient {
 
     @Override
     public RawPersonalAccessToken createPersonalAccessToken(String name, BigInteger expiry) {
-        var request = httpClient.preparePostRequest(PERSONAL_ACCESS_TOKENS,
-                new CreatePersonalAccessToken(name, expiry));
-        return httpClient.execute(request, new TypeReference<>() {
-        });
+        var request =
+                httpClient.preparePostRequest(PERSONAL_ACCESS_TOKENS, new CreatePersonalAccessToken(name, expiry));
+        return httpClient.execute(request, new TypeReference<>() {});
     }
 
     @Override
     public List<PersonalAccessTokenInfo> getPersonalAccessTokens() {
         var request = httpClient.prepareGetRequest(PERSONAL_ACCESS_TOKENS);
-        return httpClient.execute(request, new TypeReference<>() {
-        });
+        return httpClient.execute(request, new TypeReference<>() {});
     }
 
     @Override
@@ -60,17 +59,14 @@ class PersonalAccessTokensHttpClient implements PersonalAccessTokensClient {
 
     @Override
     public IdentityInfo loginWithPersonalAccessToken(String token) {
-        var request = httpClient.preparePostRequest(PERSONAL_ACCESS_TOKENS + "/login",
-                new LoginWithPersonalAccessToken(token));
+        var request = httpClient.preparePostRequest(
+                PERSONAL_ACCESS_TOKENS + "/login", new LoginWithPersonalAccessToken(token));
         var response = httpClient.execute(request, IdentityInfo.class);
         httpClient.setToken(response.accessToken().map(TokenInfo::token));
         return response;
     }
 
-    record CreatePersonalAccessToken(String name, BigInteger expiry) {
-    }
+    record CreatePersonalAccessToken(String name, BigInteger expiry) {}
 
-    record LoginWithPersonalAccessToken(String token) {
-    }
-
+    record LoginWithPersonalAccessToken(String token) {}
 }

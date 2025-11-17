@@ -30,5 +30,4 @@ public class IggyClient {
     public IggyBaseClient getBaseClient() {
         return baseClient;
     }
-
 }

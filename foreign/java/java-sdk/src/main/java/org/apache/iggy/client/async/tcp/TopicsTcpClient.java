@@ -34,7 +34,9 @@ import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 
-import static org.apache.iggy.client.async.tcp.AsyncBytesSerializer.*;
+import static org.apache.iggy.client.async.tcp.AsyncBytesSerializer.nameToBytes;
+import static org.apache.iggy.client.async.tcp.AsyncBytesSerializer.toBytes;
+import static org.apache.iggy.client.async.tcp.AsyncBytesSerializer.toBytesAsU64;
 
 /**
  * Async TCP implementation of TopicsClient using Netty for non-blocking I/O.
@@ -53,35 +55,35 @@ public class TopicsTcpClient implements TopicsClient {
         payload.writeBytes(toBytes(streamId));
         payload.writeBytes(toBytes(topicId));
 
-        return connection.sendAsync(CommandCode.Topic.GET.getValue(), payload)
-            .thenApply(response -> {
-                try {
-                    if (response.isReadable()) {
-                        return Optional.of(AsyncBytesDeserializer.readTopicDetails(response));
-                    }
-                    return Optional.<TopicDetails>empty();
-                } finally {
-                    response.release();
+        return connection.sendAsync(CommandCode.Topic.GET.getValue(), payload).thenApply(response -> {
+            try {
+                if (response.isReadable()) {
+                    return Optional.of(AsyncBytesDeserializer.readTopicDetails(response));
                 }
-            });
+                return Optional.<TopicDetails>empty();
+            } finally {
+                response.release();
+            }
+        });
     }
 
     @Override
     public CompletableFuture<List<Topic>> getTopicsAsync(StreamId streamId) {
         var payload = toBytes(streamId);
 
-        return connection.sendAsync(CommandCode.Topic.GET_ALL.getValue(), payload)
-            .thenApply(response -> {
-                try {
-                    List<Topic> topics = new ArrayList<>();
-                    while (response.isReadable()) {
-                        topics.add(AsyncBytesDeserializer.readTopic(response));
+        return connection
+                .sendAsync(CommandCode.Topic.GET_ALL.getValue(), payload)
+                .thenApply(response -> {
+                    try {
+                        List<Topic> topics = new ArrayList<>();
+                        while (response.isReadable()) {
+                            topics.add(AsyncBytesDeserializer.readTopic(response));
+                        }
+                        return topics;
+                    } finally {
+                        response.release();
                     }
-                    return topics;
-                } finally {
-                    response.release();
-                }
-            });
+                });
     }
 
     @Override
@@ -105,14 +107,15 @@ public class TopicsTcpClient implements TopicsClient {
         payload.writeByte(replicationFactor.orElse((short) 0));
         payload.writeBytes(nameToBytes(name));
 
-        return connection.sendAsync(CommandCode.Topic.CREATE.getValue(), payload)
-            .thenApply(response -> {
-                try {
-                    return AsyncBytesDeserializer.readTopicDetails(response);
-                } finally {
-                    response.release();
-                }
-            });
+        return connection
+                .sendAsync(CommandCode.Topic.CREATE.getValue(), payload)
+                .thenApply(response -> {
+                    try {
+                        return AsyncBytesDeserializer.readTopicDetails(response);
+                    } finally {
+                        response.release();
+                    }
+                });
     }
 
     @Override
@@ -134,8 +137,9 @@ public class TopicsTcpClient implements TopicsClient {
         payload.writeByte(replicationFactor.orElse((short) 0));
         payload.writeBytes(nameToBytes(name));
 
-        return connection.sendAsync(CommandCode.Topic.UPDATE.getValue(), payload)
-            .thenAccept(response -> response.release());
+        return connection
+                .sendAsync(CommandCode.Topic.UPDATE.getValue(), payload)
+                .thenAccept(response -> response.release());
     }
 
     @Override
@@ -144,7 +148,8 @@ public class TopicsTcpClient implements TopicsClient {
         payload.writeBytes(toBytes(streamId));
         payload.writeBytes(toBytes(topicId));
 
-        return connection.sendAsync(CommandCode.Topic.DELETE.getValue(), payload)
-            .thenAccept(response -> response.release());
+        return connection
+                .sendAsync(CommandCode.Topic.DELETE.getValue(), payload)
+                .thenAccept(response -> response.release());
     }
 }

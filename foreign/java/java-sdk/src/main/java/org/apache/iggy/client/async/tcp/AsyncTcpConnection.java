@@ -49,7 +49,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * Manages the connection lifecycle and request/response correlation.
  */
 public class AsyncTcpConnection {
-    private static final Logger logger = LoggerFactory.getLogger(AsyncTcpConnection.class);
+    private static final Logger log = LoggerFactory.getLogger(AsyncTcpConnection.class);
 
     private final String host;
     private final int port;
@@ -88,7 +88,8 @@ public class AsyncTcpConnection {
     }
 
     private void configureBootstrap() {
-        bootstrap.group(eventLoopGroup)
+        bootstrap
+                .group(eventLoopGroup)
                 .channel(NioSocketChannel.class)
                 .option(ChannelOption.TCP_NODELAY, true)
                 .option(ChannelOption.SO_KEEPALIVE, true)
@@ -109,8 +110,7 @@ public class AsyncTcpConnection {
                         // would duplicate it. This matches the blocking client implementation.
 
                         // Response handler
-                        pipeline.addLast("responseHandler",
-                                new IggyResponseHandler(pendingRequests));
+                        pipeline.addLast("responseHandler", new IggyResponseHandler(pendingRequests));
                     }
                 });
     }
@@ -138,8 +138,7 @@ public class AsyncTcpConnection {
      */
     public CompletableFuture<ByteBuf> sendAsync(int commandCode, ByteBuf payload) {
         if (channel == null || !channel.isActive()) {
-            return CompletableFuture.failedFuture(
-                    new IllegalStateException("Connection not established or closed"));
+            return CompletableFuture.failedFuture(new IllegalStateException("Connection not established or closed"));
         }
 
         // Since Iggy doesn't use request IDs, we'll just use a simple queue
@@ -155,21 +154,25 @@ public class AsyncTcpConnection {
         int framePayloadSize = 4 + payloadSize; // command (4 bytes) + payload
 
         ByteBuf frame = channel.alloc().buffer(4 + framePayloadSize);
-        frame.writeIntLE(framePayloadSize);  // Length field (includes command)
-        frame.writeIntLE(commandCode);        // Command
+        frame.writeIntLE(framePayloadSize); // Length field (includes command)
+        frame.writeIntLE(commandCode); // Command
         frame.writeBytes(payload, payload.readerIndex(), payloadSize); // Payload
 
         // Debug: print frame bytes
         byte[] frameBytes = new byte[Math.min(frame.readableBytes(), 30)];
-        if (logger.isTraceEnabled()) {
+        if (log.isTraceEnabled()) {
             frame.getBytes(0, frameBytes);
             StringBuilder hex = new StringBuilder();
             for (byte b : frameBytes) {
                 hex.append(String.format("%02x ", b));
             }
-            logger.trace("Sending frame with command: {}, payload size: {}, frame payload size (with command): {}, total frame size: {}",
-                    commandCode, payloadSize, framePayloadSize, frame.readableBytes());
-            logger.trace("Frame bytes (hex): {}", hex.toString());
+            log.trace(
+                    "Sending frame with command: {}, payload size: {}, frame payload size (with command): {}, total frame size: {}",
+                    commandCode,
+                    payloadSize,
+                    framePayloadSize,
+                    frame.readableBytes());
+            log.trace("Frame bytes (hex): {}", hex.toString());
         }
 
         payload.release();
@@ -177,11 +180,11 @@ public class AsyncTcpConnection {
         // Send the frame
         channel.writeAndFlush(frame).addListener((ChannelFutureListener) future -> {
             if (!future.isSuccess()) {
-                logger.error("Failed to send frame: {}", future.cause().getMessage());
+                log.error("Failed to send frame: {}", future.cause().getMessage());
                 pendingRequests.remove(requestId);
                 responseFuture.completeExceptionally(future.cause());
             } else {
-                logger.trace("Frame sent successfully to {}", channel.remoteAddress());
+                log.trace("Frame sent successfully to {}", channel.remoteAddress());
             }
         });
 
@@ -230,9 +233,8 @@ public class AsyncTcpConnection {
             // Since Iggy doesn't use request IDs, we process responses in order
             // Get the oldest pending request
             if (!pendingRequests.isEmpty()) {
-                Long oldestRequestId = pendingRequests.keySet().stream()
-                        .min(Long::compare)
-                        .orElse(null);
+                Long oldestRequestId =
+                        pendingRequests.keySet().stream().min(Long::compare).orElse(null);
 
                 if (oldestRequestId != null) {
                     CompletableFuture<ByteBuf> future = pendingRequests.remove(oldestRequestId);
@@ -248,8 +250,7 @@ public class AsyncTcpConnection {
                             future.completeExceptionally(
                                     new RuntimeException("Server error: " + new String(errorBytes)));
                         } else {
-                            future.completeExceptionally(
-                                    new RuntimeException("Server error with status: " + status));
+                            future.completeExceptionally(new RuntimeException("Server error with status: " + status));
                         }
                     }
                 }
@@ -259,8 +260,7 @@ public class AsyncTcpConnection {
         @Override
         public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
             // Fail all pending requests
-            pendingRequests.values().forEach(future ->
-                    future.completeExceptionally(cause));
+            pendingRequests.values().forEach(future -> future.completeExceptionally(cause));
             pendingRequests.clear();
             ctx.close();
         }

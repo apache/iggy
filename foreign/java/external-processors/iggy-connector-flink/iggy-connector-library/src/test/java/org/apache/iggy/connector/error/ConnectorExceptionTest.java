@@ -19,9 +19,9 @@
 
 package org.apache.iggy.connector.error;
 
-import static org.assertj.core.api.Assertions.assertThat;
-
 import org.junit.jupiter.api.Test;
+
+import static org.assertj.core.api.Assertions.assertThat;
 
 class ConnectorExceptionTest {
 
@@ -48,11 +48,8 @@ class ConnectorExceptionTest {
 
     @Test
     void shouldCreateExceptionWithMessageErrorCodeAndRetryable() {
-        ConnectorException exception = new ConnectorException(
-                "Connection failed",
-                ConnectorException.ErrorCode.CONNECTION_FAILED,
-                true
-        );
+        ConnectorException exception =
+                new ConnectorException("Connection failed", ConnectorException.ErrorCode.CONNECTION_FAILED, true);
 
         assertThat(exception.getMessage()).isEqualTo("Connection failed");
         assertThat(exception.getErrorCode()).isEqualTo(ConnectorException.ErrorCode.CONNECTION_FAILED);
@@ -64,11 +61,7 @@ class ConnectorExceptionTest {
     void shouldCreateExceptionWithAllParameters() {
         Throwable cause = new RuntimeException("Root cause");
         ConnectorException exception = new ConnectorException(
-                "Connection failed",
-                cause,
-                ConnectorException.ErrorCode.CONNECTION_FAILED,
-                true
-        );
+                "Connection failed", cause, ConnectorException.ErrorCode.CONNECTION_FAILED, true);
 
         assertThat(exception.getMessage()).isEqualTo("Connection failed");
         assertThat(exception.getCause()).isEqualTo(cause);
@@ -92,11 +85,8 @@ class ConnectorExceptionTest {
 
     @Test
     void shouldMarkConnectionErrorsAsRetryable() {
-        ConnectorException exception = new ConnectorException(
-                "Connection failed",
-                ConnectorException.ErrorCode.CONNECTION_FAILED,
-                true
-        );
+        ConnectorException exception =
+                new ConnectorException("Connection failed", ConnectorException.ErrorCode.CONNECTION_FAILED, true);
 
         assertThat(exception.isRetryable()).isTrue();
     }
@@ -104,43 +94,31 @@ class ConnectorExceptionTest {
     @Test
     void shouldMarkAuthenticationErrorsAsNonRetryable() {
         ConnectorException exception = new ConnectorException(
-                "Authentication failed",
-                ConnectorException.ErrorCode.AUTHENTICATION_FAILED,
-                false
-        );
+                "Authentication failed", ConnectorException.ErrorCode.AUTHENTICATION_FAILED, false);
 
         assertThat(exception.isRetryable()).isFalse();
     }
 
     @Test
     void shouldMarkSerializationErrorsAsNonRetryable() {
-        ConnectorException exception = new ConnectorException(
-                "Serialization failed",
-                ConnectorException.ErrorCode.SERIALIZATION_ERROR,
-                false
-        );
+        ConnectorException exception =
+                new ConnectorException("Serialization failed", ConnectorException.ErrorCode.SERIALIZATION_ERROR, false);
 
         assertThat(exception.isRetryable()).isFalse();
     }
 
     @Test
     void shouldMarkTimeoutErrorsAsRetryable() {
-        ConnectorException exception = new ConnectorException(
-                "Operation timed out",
-                ConnectorException.ErrorCode.TIMEOUT,
-                true
-        );
+        ConnectorException exception =
+                new ConnectorException("Operation timed out", ConnectorException.ErrorCode.TIMEOUT, true);
 
         assertThat(exception.isRetryable()).isTrue();
     }
 
     @Test
     void shouldMarkConfigurationErrorsAsNonRetryable() {
-        ConnectorException exception = new ConnectorException(
-                "Configuration error",
-                ConnectorException.ErrorCode.CONFIGURATION_ERROR,
-                false
-        );
+        ConnectorException exception =
+                new ConnectorException("Configuration error", ConnectorException.ErrorCode.CONFIGURATION_ERROR, false);
 
         assertThat(exception.isRetryable()).isFalse();
     }

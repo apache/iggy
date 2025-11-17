@@ -21,11 +21,11 @@ package org.apache.iggy.async;
 
 import org.apache.iggy.client.async.tcp.AsyncIggyTcpClient;
 import org.apache.iggy.client.blocking.tcp.IggyTcpClient;
-import org.apache.iggy.identifier.StreamId;
-import org.apache.iggy.identifier.TopicId;
-import org.apache.iggy.identifier.ConsumerId;
 import org.apache.iggy.consumergroup.Consumer;
 import org.apache.iggy.consumergroup.ConsumerGroupDetails;
+import org.apache.iggy.identifier.ConsumerId;
+import org.apache.iggy.identifier.StreamId;
+import org.apache.iggy.identifier.TopicId;
 import org.apache.iggy.message.PollingStrategy;
 import org.apache.iggy.stream.StreamDetails;
 import org.apache.iggy.topic.CompressionAlgorithm;
@@ -35,14 +35,16 @@ import org.slf4j.LoggerFactory;
 
 import java.math.BigInteger;
 import java.util.Optional;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 import static java.util.Optional.empty;
 
 /**
  * Example demonstrating the true async Netty-based client.
  */
-public class AsyncConsumerExample {
+public final class AsyncConsumerExample {
 
     private static final String STREAM_NAME = "async-test";
     private static final StreamId STREAM_ID = StreamId.of(STREAM_NAME);
@@ -52,7 +54,9 @@ public class AsyncConsumerExample {
     private static final ConsumerId GROUP_ID = ConsumerId.of(GROUP_NAME);
     private static final Logger log = LoggerFactory.getLogger(AsyncConsumerExample.class);
 
-    public static void main(String[] args) throws Exception {
+    private AsyncConsumerExample() {}
+
+    public static void main(String[] args) throws ExecutionException, InterruptedException, TimeoutException {
         // First, setup the stream/topic/group using blocking client
         setupWithBlockingClient();
 
@@ -60,7 +64,7 @@ public class AsyncConsumerExample {
         testAsyncClient();
     }
 
-    private static void setupWithBlockingClient() throws Exception {
+    private static void setupWithBlockingClient() {
         log.info("Setting up stream, topic, and consumer group...");
 
         var blockingClient = new IggyTcpClient("localhost", 8090);
@@ -76,21 +80,22 @@ public class AsyncConsumerExample {
         // Create topic if needed
         Optional<TopicDetails> topic = blockingClient.topics().getTopic(STREAM_ID, TOPIC_ID);
         if (!topic.isPresent()) {
-            blockingClient.topics().createTopic(
-                STREAM_ID,
-                    1L,
-                CompressionAlgorithm.None,
-                BigInteger.ZERO,
-                BigInteger.ZERO,
-                empty(),
-                TOPIC_NAME
-            );
+            blockingClient
+                    .topics()
+                    .createTopic(
+                            STREAM_ID,
+                            1L,
+                            CompressionAlgorithm.None,
+                            BigInteger.ZERO,
+                            BigInteger.ZERO,
+                            empty(),
+                            TOPIC_NAME);
             log.info("Created topic: {}", TOPIC_NAME);
         }
 
         // Create consumer group if needed
-        Optional<ConsumerGroupDetails> group = blockingClient.consumerGroups()
-            .getConsumerGroup(STREAM_ID, TOPIC_ID, GROUP_ID);
+        Optional<ConsumerGroupDetails> group =
+                blockingClient.consumerGroups().getConsumerGroup(STREAM_ID, TOPIC_ID, GROUP_ID);
         if (!group.isPresent()) {
             blockingClient.consumerGroups().createConsumerGroup(STREAM_ID, TOPIC_ID, GROUP_NAME);
             log.info("Created consumer group: {}", GROUP_NAME);
@@ -101,7 +106,7 @@ public class AsyncConsumerExample {
         log.info("Joined consumer group");
     }
 
-    private static void testAsyncClient() throws Exception {
+    private static void testAsyncClient() throws ExecutionException, InterruptedException, TimeoutException {
         log.info("Testing async client with Netty...");
 
         // Create async client
@@ -109,47 +114,43 @@ public class AsyncConsumerExample {
 
         // Connect asynchronously
         log.info("Connecting to server...");
-        asyncClient.connect()
-            .thenCompose(v -> {
-                log.info("Connected! Logging in...");
-                return asyncClient.users().loginAsync("iggy", "iggy");
-            })
-            .thenCompose(v -> {
-                log.info("Logged in! Joining consumer group...");
-                // Join the consumer group first
-                return asyncClient.consumerGroups().joinConsumerGroup(
-                    STREAM_ID,
-                    TOPIC_ID,
-                    GROUP_ID
-                );
-            })
-            .thenCompose(v -> {
-                log.info("Joined consumer group! Now polling messages...");
-                return asyncClient.messages().pollMessagesAsync(
-                    STREAM_ID,
-                    TOPIC_ID,
-                    Optional.empty(),
-                    Consumer.group(GROUP_ID),
-                    PollingStrategy.next(),
-                    10L,
-                    true
-                );
-            })
-            .thenAccept(messages -> {
-                log.info("Received {} messages", messages.messages().size());
-                messages.messages().forEach(msg ->
-                    log.info("Message: {}", new String(msg.payload()))
-                );
-            })
-            .exceptionally(error -> {
-                log.error("Error in async operation", error);
-                return null;
-            })
-            .thenCompose(v -> {
-                log.info("Closing connection...");
-                return asyncClient.close();
-            })
-            .get(10, TimeUnit.SECONDS);
+        asyncClient
+                .connect()
+                .thenCompose(v -> {
+                    log.info("Connected! Logging in...");
+                    return asyncClient.users().loginAsync("iggy", "iggy");
+                })
+                .thenCompose(v -> {
+                    log.info("Logged in! Joining consumer group...");
+                    // Join the consumer group first
+                    return asyncClient.consumerGroups().joinConsumerGroup(STREAM_ID, TOPIC_ID, GROUP_ID);
+                })
+                .thenCompose(v -> {
+                    log.info("Joined consumer group! Now polling messages...");
+                    return asyncClient
+                            .messages()
+                            .pollMessagesAsync(
+                                    STREAM_ID,
+                                    TOPIC_ID,
+                                    Optional.empty(),
+                                    Consumer.group(GROUP_ID),
+                                    PollingStrategy.next(),
+                                    10L,
+                                    true);
+                })
+                .thenAccept(messages -> {
+                    log.info("Received {} messages", messages.messages().size());
+                    messages.messages().forEach(msg -> log.info("Message: {}", new String(msg.payload())));
+                })
+                .exceptionally(error -> {
+                    log.error("Error in async operation", error);
+                    return null;
+                })
+                .thenCompose(v -> {
+                    log.info("Closing connection...");
+                    return asyncClient.close();
+                })
+                .get(10, TimeUnit.SECONDS);
 
         log.info("Async test completed!");
     }

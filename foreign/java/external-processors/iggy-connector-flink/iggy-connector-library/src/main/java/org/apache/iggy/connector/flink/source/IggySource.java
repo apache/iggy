@@ -19,12 +19,17 @@
 
 package org.apache.iggy.connector.flink.source;
 
-import org.apache.flink.api.connector.source.*;
+import org.apache.flink.api.connector.source.Boundedness;
+import org.apache.flink.api.connector.source.Source;
+import org.apache.flink.api.connector.source.SourceReader;
+import org.apache.flink.api.connector.source.SourceReaderContext;
+import org.apache.flink.api.connector.source.SplitEnumerator;
+import org.apache.flink.api.connector.source.SplitEnumeratorContext;
 import org.apache.flink.core.io.SimpleVersionedSerializer;
 import org.apache.iggy.client.async.tcp.AsyncIggyTcpClient;
-import org.apache.iggy.consumergroup.Consumer;
 import org.apache.iggy.connector.config.IggyConnectionConfig;
 import org.apache.iggy.connector.config.OffsetConfig;
+import org.apache.iggy.consumergroup.Consumer;
 
 import java.io.Serializable;
 
@@ -56,7 +61,7 @@ public class IggySource<T> implements Source<T, IggySourceSplit, IggySourceEnume
     private final IggyConnectionConfig connectionConfig;
     private final String streamId;
     private final String topicId;
-    private final String consumerGroupName;  // Serializable representation
+    private final String consumerGroupName; // Serializable representation
     private final org.apache.iggy.connector.serialization.DeserializationSchema<T> deserializer;
     private final OffsetConfig offsetConfig;
     private final long pollBatchSize;
@@ -110,12 +115,7 @@ public class IggySource<T> implements Source<T, IggySourceSplit, IggySourceEnume
     public SourceReader<T, IggySourceSplit> createReader(SourceReaderContext readerContext) throws Exception {
         AsyncIggyTcpClient asyncClient = createAsyncIggyClient();
         Consumer consumer = createConsumer();
-        return new IggySourceReader<>(
-                readerContext,
-                asyncClient,
-                deserializer,
-                consumer,
-                pollBatchSize);
+        return new IggySourceReader<>(readerContext, asyncClient, deserializer, consumer, pollBatchSize);
     }
 
     @Override
@@ -124,29 +124,17 @@ public class IggySource<T> implements Source<T, IggySourceSplit, IggySourceEnume
 
         AsyncIggyTcpClient asyncClient = createAsyncIggyClient();
         return new IggySourceSplitEnumerator(
-                enumContext,
-                asyncClient,
-                streamId,
-                topicId,
-                consumerGroupName,
-                offsetConfig,
-                null);
+                enumContext, asyncClient, streamId, topicId, consumerGroupName, offsetConfig, null);
     }
 
     @Override
     public SplitEnumerator<IggySourceSplit, IggySourceEnumeratorState> restoreEnumerator(
-            SplitEnumeratorContext<IggySourceSplit> enumContext,
-            IggySourceEnumeratorState checkpoint) throws Exception {
+            SplitEnumeratorContext<IggySourceSplit> enumContext, IggySourceEnumeratorState checkpoint)
+            throws Exception {
 
         AsyncIggyTcpClient asyncClient = createAsyncIggyClient();
         return new IggySourceSplitEnumerator(
-                enumContext,
-                asyncClient,
-                streamId,
-                topicId,
-                consumerGroupName,
-                offsetConfig,
-                checkpoint);
+                enumContext, asyncClient, streamId, topicId, consumerGroupName, offsetConfig, checkpoint);
     }
 
     @Override
@@ -192,7 +180,7 @@ public class IggySource<T> implements Source<T, IggySourceSplit, IggySourceEnume
 
             return asyncClient;
 
-        } catch (Exception e) {
+        } catch (RuntimeException e) {
             throw new RuntimeException("Failed to create async Iggy client", e);
         }
     }

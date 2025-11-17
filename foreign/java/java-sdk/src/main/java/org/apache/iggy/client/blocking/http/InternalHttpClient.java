@@ -29,10 +29,11 @@ import org.apache.hc.core5.http.ClassicHttpResponse;
 import org.apache.hc.core5.http.NameValuePair;
 import org.apache.hc.core5.http.io.HttpClientResponseHandler;
 import org.apache.hc.core5.http.io.support.ClassicRequestBuilder;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 import org.apache.iggy.client.blocking.http.error.IggyHttpError;
 import org.apache.iggy.client.blocking.http.error.IggyHttpException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.io.IOException;
 import java.util.Optional;
 
@@ -65,6 +66,13 @@ final class InternalHttpClient {
         return executeRequest(request, response -> handleTypedResponse(response, type));
     }
 
+    void execute(ClassicHttpRequest request) {
+        executeRequest(request, response -> {
+            handleErrorResponse(response);
+            return "";
+        });
+    }
+
     public <T> Optional<T> executeWithOptionalResponse(ClassicHttpRequest request, Class<T> clazz) {
         return executeWithOptionalResponse(request, objectMapper.constructType(clazz));
     }
@@ -85,13 +93,6 @@ final class InternalHttpClient {
         });
     }
 
-    void execute(ClassicHttpRequest request) {
-        executeRequest(request, response -> {
-            handleErrorResponse(response);
-            return "";
-        });
-    }
-
     private <T> T executeRequest(ClassicHttpRequest request, HttpClientResponseHandler<T> responseHandler) {
         try (var client = HttpClients.createDefault()) {
             return client.execute(request, responseHandler);
@@ -108,14 +109,12 @@ final class InternalHttpClient {
     }
 
     ClassicHttpRequest preparePostRequest(String path, Object body) {
-        var builder = ClassicRequestBuilder.post(url + path)
-                .setHeader(AUTHORIZATION, getBearerToken());
+        var builder = ClassicRequestBuilder.post(url + path).setHeader(AUTHORIZATION, getBearerToken());
         return addRequestBody(builder, body);
     }
 
     ClassicHttpRequest preparePutRequest(String path, Object body) {
-        var builder = ClassicRequestBuilder.put(url + path)
-                .setHeader(AUTHORIZATION, getBearerToken());
+        var builder = ClassicRequestBuilder.put(url + path).setHeader(AUTHORIZATION, getBearerToken());
         return addRequestBody(builder, body);
     }
 
@@ -137,7 +136,6 @@ final class InternalHttpClient {
         } catch (JsonProcessingException e) {
             throw new RuntimeException(e);
         }
-
     }
 
     private <T> T handleTypedResponse(ClassicHttpResponse response, JavaType type) throws IOException {

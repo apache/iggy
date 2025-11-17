@@ -34,7 +34,9 @@ import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
@@ -42,7 +44,7 @@ import java.util.concurrent.atomic.AtomicInteger;
  * This producer sends messages asynchronously and handles responses using CompletableFuture.
  */
 public class AsyncProducer {
-    private static final Logger logger = LoggerFactory.getLogger(AsyncProducer.class);
+    private static final Logger log = LoggerFactory.getLogger(AsyncProducer.class);
 
     private static final String HOST = "127.0.0.1";
     private static final int PORT = 8090;
@@ -65,92 +67,89 @@ public class AsyncProducer {
     }
 
     public CompletableFuture<Void> start() {
-        logger.info("Starting AsyncProducer...");
+        log.info("Starting AsyncProducer...");
 
         return client.connect()
-            .thenCompose(v -> {
-                logger.info("Connected to Iggy server at {}:{}", HOST, PORT);
-                return client.users().loginAsync(USERNAME, PASSWORD);
-            })
-            .thenCompose(v -> {
-                logger.info("Logged in successfully as user: {}", USERNAME);
-                return setupStreamAndTopic();
-            })
-            .thenCompose(v -> {
-                logger.info("Stream and topic setup complete");
-                return sendMessages();
-            })
-            .thenRun(() -> {
-                logger.info("All messages sent. Success: {}, Errors: {}",
-                    successCount.get(), errorCount.get());
-            })
-            .exceptionally(ex -> {
-                logger.error("Error in producer flow", ex);
-                return null;
-            });
+                .thenCompose(v -> {
+                    log.info("Connected to Iggy server at {}:{}", HOST, PORT);
+                    return client.users().loginAsync(USERNAME, PASSWORD);
+                })
+                .thenCompose(v -> {
+                    log.info("Logged in successfully as user: {}", USERNAME);
+                    return setupStreamAndTopic();
+                })
+                .thenCompose(v -> {
+                    log.info("Stream and topic setup complete");
+                    return sendMessages();
+                })
+                .thenRun(() -> {
+                    log.info("All messages sent. Success: {}, Errors: {}", successCount.get(), errorCount.get());
+                })
+                .exceptionally(ex -> {
+                    log.error("Error in producer flow", ex);
+                    return null;
+                });
     }
 
     private CompletableFuture<Void> setupStreamAndTopic() {
-        logger.info("Checking stream: {}", STREAM_NAME);
+        log.info("Checking stream: {}", STREAM_NAME);
 
-        return client.streams().getStreamAsync(StreamId.of(STREAM_NAME))
-            .thenCompose(stream -> {
-                if (stream.isEmpty()) {
-                    logger.info("Creating stream: {}", STREAM_NAME);
-                    return client.streams().createStreamAsync(STREAM_NAME)
-                        .thenAccept(created -> logger.info("Stream created: {}", created.name()));
-                } else {
-                    logger.info("Stream exists: {}", STREAM_NAME);
-                    return CompletableFuture.completedFuture(null);
-                }
-            })
-            .thenCompose(v -> {
-                logger.info("Checking topic: {}", TOPIC_NAME);
-                return client.topics().getTopicAsync(
-                    StreamId.of(STREAM_NAME),
-                    TopicId.of(TOPIC_NAME)
-                );
-            })
-            .thenCompose(topic -> {
-                if (topic.isEmpty()) {
-                    logger.info("Creating topic: {}", TOPIC_NAME);
-                    return client.topics().createTopicAsync(
-                        StreamId.of(STREAM_NAME),
-                            1L,  // 1 partition
-                        CompressionAlgorithm.None,
-                        BigInteger.ZERO,
-                        BigInteger.ZERO,
-                        Optional.empty(),
-                        TOPIC_NAME
-                    ).thenAccept(created -> logger.info("Topic created: {}", created.name()));
-                } else {
-                    logger.info("Topic exists: {}", TOPIC_NAME);
-                    return CompletableFuture.completedFuture(null);
-                }
-            });
+        return client.streams()
+                .getStreamAsync(StreamId.of(STREAM_NAME))
+                .thenCompose(stream -> {
+                    if (stream.isEmpty()) {
+                        log.info("Creating stream: {}", STREAM_NAME);
+                        return client.streams()
+                                .createStreamAsync(STREAM_NAME)
+                                .thenAccept(created -> log.info("Stream created: {}", created.name()));
+                    } else {
+                        log.info("Stream exists: {}", STREAM_NAME);
+                        return CompletableFuture.completedFuture(null);
+                    }
+                })
+                .thenCompose(v -> {
+                    log.info("Checking topic: {}", TOPIC_NAME);
+                    return client.topics().getTopicAsync(StreamId.of(STREAM_NAME), TopicId.of(TOPIC_NAME));
+                })
+                .thenCompose(topic -> {
+                    if (topic.isEmpty()) {
+                        log.info("Creating topic: {}", TOPIC_NAME);
+                        return client.topics()
+                                .createTopicAsync(
+                                        StreamId.of(STREAM_NAME),
+                                        1L, // 1 partition
+                                        CompressionAlgorithm.None,
+                                        BigInteger.ZERO,
+                                        BigInteger.ZERO,
+                                        Optional.empty(),
+                                        TOPIC_NAME)
+                                .thenAccept(created -> log.info("Topic created: {}", created.name()));
+                    } else {
+                        log.info("Topic exists: {}", TOPIC_NAME);
+                        return CompletableFuture.completedFuture(null);
+                    }
+                });
     }
 
     private CompletableFuture<Void> sendMessages() {
-        logger.info("Sending {} messages...", MESSAGE_COUNT);
+        log.info("Sending {} messages...", MESSAGE_COUNT);
 
         CompletableFuture<?>[] futures = new CompletableFuture[MESSAGE_COUNT];
 
         for (int i = 0; i < MESSAGE_COUNT; i++) {
             final int messageIndex = i;
-            futures[i] = sendMessage(messageIndex)
-                .handle((result, ex) -> {
-                    if (ex != null) {
-                        logger.error("Failed to send message {}: {}",
-                            messageIndex, ex.getMessage());
-                        errorCount.incrementAndGet();
-                    } else {
-                        if (messageIndex % 10 == 0) {
-                            logger.debug("Sent message {}", messageIndex);
-                        }
-                        successCount.incrementAndGet();
+            futures[i] = sendMessage(messageIndex).handle((result, ex) -> {
+                if (ex != null) {
+                    log.error("Failed to send message {}: {}", messageIndex, ex.getMessage());
+                    errorCount.incrementAndGet();
+                } else {
+                    if (messageIndex % 10 == 0) {
+                        log.debug("Sent message {}", messageIndex);
                     }
-                    return null;
-                });
+                    successCount.incrementAndGet();
+                }
+                return null;
+            });
 
             // Add a small delay between messages to avoid overwhelming the server
             try {
@@ -166,12 +165,8 @@ public class AsyncProducer {
 
     private CompletableFuture<Void> sendMessage(int index) {
         // Create message payload
-        String messageContent = String.format(
-            "Async message %d - %s - %s",
-            index,
-            UUID.randomUUID(),
-            System.currentTimeMillis()
-        );
+        String messageContent =
+                String.format("Async message %d - %s - %s", index, UUID.randomUUID(), System.currentTimeMillis());
 
         // Pad message to desired size
         while (messageContent.length() < MESSAGE_SIZE) {
@@ -187,38 +182,32 @@ public class AsyncProducer {
         Partitioning partitioning = Partitioning.partitionId(PARTITION_ID);
 
         // Send message using async client
-        return client.messages().sendMessagesAsync(
-            StreamId.of(STREAM_NAME),
-            TopicId.of(TOPIC_NAME),
-            partitioning,
-            List.of(message)
-        );
+        return client.messages()
+                .sendMessagesAsync(StreamId.of(STREAM_NAME), TopicId.of(TOPIC_NAME), partitioning, List.of(message));
     }
 
     public CompletableFuture<Void> stop() {
-        logger.info("Stopping AsyncProducer...");
-        return client.close()
-            .thenRun(() -> logger.info("AsyncProducer stopped"));
+        log.info("Stopping AsyncProducer...");
+        return client.close().thenRun(() -> log.info("AsyncProducer stopped"));
     }
 
     public static void main(String[] args) {
         AsyncProducer producer = new AsyncProducer();
 
         CompletableFuture<Void> producerFuture = producer.start()
-            .thenCompose(v -> {
-                // Keep producer running for a while
-                CompletableFuture<Void> delay = new CompletableFuture<>();
-                CompletableFuture.delayedExecutor(2, TimeUnit.SECONDS)
-                    .execute(() -> delay.complete(null));
-                return delay;
-            })
-            .thenCompose(v -> producer.stop());
+                .thenCompose(v -> {
+                    // Keep producer running for a while
+                    CompletableFuture<Void> delay = new CompletableFuture<>();
+                    CompletableFuture.delayedExecutor(2, TimeUnit.SECONDS).execute(() -> delay.complete(null));
+                    return delay;
+                })
+                .thenCompose(v -> producer.stop());
 
         try {
             producerFuture.get(30, TimeUnit.SECONDS);
-            logger.info("AsyncProducer completed successfully");
-        } catch (Exception e) {
-            logger.error("AsyncProducer failed", e);
+            log.info("AsyncProducer completed successfully");
+        } catch (InterruptedException | ExecutionException | TimeoutException e) {
+            log.error("AsyncProducer failed", e);
             System.exit(1);
         }
     }

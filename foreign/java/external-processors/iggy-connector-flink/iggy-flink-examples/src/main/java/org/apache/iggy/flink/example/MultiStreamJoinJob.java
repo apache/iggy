@@ -36,7 +36,9 @@ import org.apache.iggy.flink.example.model.EnrichedActivity;
 import org.apache.iggy.flink.example.model.UserActivity;
 import org.apache.iggy.flink.example.model.UserProfile;
 
+import java.io.Serializable;
 import java.time.Duration;
+import java.util.function.Function;
 
 /**
  * Example demonstrating multi-stream join using Iggy connector.
@@ -71,24 +73,26 @@ import java.time.Duration;
  *   | iggy stream send user-activities events
  * </pre>
  */
-public class MultiStreamJoinJob {
+public final class MultiStreamJoinJob {
 
     private static final String IGGY_SERVER = getEnv("IGGY_SERVER", "localhost:8090");
     private static final String IGGY_USERNAME = getEnv("IGGY_USERNAME", "iggy");
     private static final String IGGY_PASSWORD = getEnv("IGGY_PASSWORD", "iggy");
 
     // Use numeric IDs to match docker-compose.yml setup
-    private static final String ACTIVITY_STREAM = "5";  // user-activities
-    private static final String ACTIVITY_TOPIC = "1";   // events
-    private static final String PROFILE_STREAM = "6";   // user-profiles
-    private static final String PROFILE_TOPIC = "1";    // updates
-    private static final String OUTPUT_STREAM = "7";    // enriched-activities
-    private static final String OUTPUT_TOPIC = "1";     // results
+    private static final String ACTIVITY_STREAM = "5"; // user-activities
+    private static final String ACTIVITY_TOPIC = "1"; // events
+    private static final String PROFILE_STREAM = "6"; // user-profiles
+    private static final String PROFILE_TOPIC = "1"; // updates
+    private static final String OUTPUT_STREAM = "7"; // enriched-activities
+    private static final String OUTPUT_TOPIC = "1"; // results
 
+    private MultiStreamJoinJob() {}
+
+    @SuppressWarnings("checkstyle:IllegalThrows")
     public static void main(String[] args) throws Exception {
         // Set up Flink execution environment
-        final StreamExecutionEnvironment env =
-                StreamExecutionEnvironment.getExecutionEnvironment();
+        final StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
 
         // Enable checkpointing for fault tolerance
         env.enableCheckpointing(60000); // Checkpoint every 60 seconds
@@ -103,33 +107,32 @@ public class MultiStreamJoinJob {
 
         // Read user activities from Iggy
         DataStream<UserActivity> activities = env.fromSource(
-                IggySource.<UserActivity>builder()
-                        .setConnectionConfig(connectionConfig)
-                        .setStreamId(ACTIVITY_STREAM)
-                        .setTopicId(ACTIVITY_TOPIC)
-                        .setConsumerGroup("flink-activity-enricher")
-                        .setDeserializer(new JsonDeserializationSchema<>(UserActivity.class))
-                        .setPollBatchSize(100)
-                        .build(),
-                WatermarkStrategy
-                        .<UserActivity>forBoundedOutOfOrderness(Duration.ofSeconds(10))
-                        .withTimestampAssigner((activity, timestamp) ->
-                                activity.getTimestamp().toEpochMilli()),
-                "Iggy Activity Source")
+                        IggySource.<UserActivity>builder()
+                                .setConnectionConfig(connectionConfig)
+                                .setStreamId(ACTIVITY_STREAM)
+                                .setTopicId(ACTIVITY_TOPIC)
+                                .setConsumerGroup("flink-activity-enricher")
+                                .setDeserializer(new JsonDeserializationSchema<>(UserActivity.class))
+                                .setPollBatchSize(100)
+                                .build(),
+                        WatermarkStrategy.<UserActivity>forBoundedOutOfOrderness(Duration.ofSeconds(10))
+                                .withTimestampAssigner((activity, timestamp) ->
+                                        activity.getTimestamp().toEpochMilli()),
+                        "Iggy Activity Source")
                 .returns(UserActivity.class);
 
         // Read user profiles from Iggy
         DataStream<UserProfile> profiles = env.fromSource(
-                IggySource.<UserProfile>builder()
-                        .setConnectionConfig(connectionConfig)
-                        .setStreamId(PROFILE_STREAM)
-                        .setTopicId(PROFILE_TOPIC)
-                        .setConsumerGroup("flink-profile-reader")
-                        .setDeserializer(new JsonDeserializationSchema<>(UserProfile.class))
-                        .setPollBatchSize(50)
-                        .build(),
-                WatermarkStrategy.noWatermarks(),
-                "Iggy Profile Source")
+                        IggySource.<UserProfile>builder()
+                                .setConnectionConfig(connectionConfig)
+                                .setStreamId(PROFILE_STREAM)
+                                .setTopicId(PROFILE_TOPIC)
+                                .setConsumerGroup("flink-profile-reader")
+                                .setDeserializer(new JsonDeserializationSchema<>(UserProfile.class))
+                                .setPollBatchSize(50)
+                                .build(),
+                        WatermarkStrategy.noWatermarks(),
+                        "Iggy Profile Source")
                 .returns(UserProfile.class);
 
         // Enrich activities with profile information using stateful join
@@ -140,20 +143,25 @@ public class MultiStreamJoinJob {
                 .name("Enrich Activities");
 
         // Write enriched activities back to Iggy
-        enrichedActivities.sinkTo(
-                IggySink.<EnrichedActivity>builder()
+        enrichedActivities
+                .sinkTo(IggySink.<EnrichedActivity>builder()
                         .setConnectionConfig(connectionConfig)
                         .setStreamId(OUTPUT_STREAM)
                         .setTopicId(OUTPUT_TOPIC)
                         .setSerializer(new JsonSerializationSchema<>())
                         .setBatchSize(50)
                         .setFlushInterval(Duration.ofSeconds(5))
-                        .withBalancedPartitioning()  // Use balanced partitioning instead
+                        .withBalancedPartitioning() // Use balanced partitioning instead
                         .build())
                 .name("Iggy Enriched Activity Sink");
 
         // Execute the job
         env.execute("Multi-Stream Join with Iggy");
+    }
+
+    private static String getEnv(String key, String defaultValue) {
+        String value = System.getenv(key);
+        return value != null ? value : defaultValue;
     }
 
     /**
@@ -182,17 +190,17 @@ public class MultiStreamJoinJob {
         }
 
         @Override
-        public void processElement1(
-                UserActivity activity,
-                Context context,
-                Collector<EnrichedActivity> out) throws Exception {
+        public void processElement1(UserActivity activity, Context context, Collector<EnrichedActivity> out)
+                throws Exception {
             // Process activity event
-            System.out.println(">>> processElement1 - Activity: userId=" + activity.getUserId() + ", type=" + activity.getActivityType());
+            System.out.println(">>> processElement1 - Activity: userId=" + activity.getUserId() + ", type="
+                    + activity.getActivityType());
             UserProfile profile = profileState.value();
 
             if (profile != null) {
                 // Profile is available, enrich and emit
-                System.out.println(">>> MATCH! Profile found for userId=" + activity.getUserId() + ", emitting enriched activity");
+                System.out.println(
+                        ">>> MATCH! Profile found for userId=" + activity.getUserId() + ", emitting enriched activity");
                 out.collect(EnrichedActivity.from(activity, profile));
             } else {
                 // Profile not yet available, buffer the activity
@@ -202,12 +210,11 @@ public class MultiStreamJoinJob {
         }
 
         @Override
-        public void processElement2(
-                UserProfile profile,
-                Context context,
-                Collector<EnrichedActivity> out) throws Exception {
+        public void processElement2(UserProfile profile, Context context, Collector<EnrichedActivity> out)
+                throws Exception {
             // Process profile update
-            System.out.println(">>> processElement2 - Profile: userId=" + profile.getUserId() + ", name=" + profile.getUserName());
+            System.out.println(
+                    ">>> processElement2 - Profile: userId=" + profile.getUserId() + ", name=" + profile.getUserName());
             profileState.update(profile);
 
             // Check if there's a pending activity for this user
@@ -224,16 +231,11 @@ public class MultiStreamJoinJob {
         }
     }
 
-    private static String getEnv(String key, String defaultValue) {
-        String value = System.getenv(key);
-        return value != null ? value : defaultValue;
-    }
-
     /**
      * Serializable partition key extractor for enriched activities.
      */
-    private static class EnrichedActivityPartitionKeyExtractor
-            implements java.util.function.Function<EnrichedActivity, Integer>, java.io.Serializable {
+    private static final class EnrichedActivityPartitionKeyExtractor
+            implements Function<EnrichedActivity, Integer>, Serializable {
         @Override
         public Integer apply(EnrichedActivity enriched) {
             return enriched.getUserId().hashCode();

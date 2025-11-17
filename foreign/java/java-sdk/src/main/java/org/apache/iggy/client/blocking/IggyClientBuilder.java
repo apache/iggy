@@ -34,5 +34,4 @@ public class IggyClientBuilder {
         }
         return new IggyClient(client);
     }
-
 }

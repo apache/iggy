@@ -28,6 +28,7 @@ import org.apache.iggy.connector.serialization.SerializationSchema;
 
 import java.io.IOException;
 import java.io.Serializable;
+import java.net.URISyntaxException;
 import java.time.Duration;
 
 /**
@@ -107,13 +108,7 @@ public class IggySink<T> implements Sink<T>, Serializable {
     public SinkWriter<T> createWriter(WriterInitContext context) throws IOException {
         IggyHttpClient httpClient = createHttpClient();
         return new IggySinkWriter<>(
-                httpClient,
-                streamId,
-                topicId,
-                serializer,
-                batchSize,
-                flushInterval,
-                partitioningStrategy);
+                httpClient, streamId, topicId, serializer, batchSize, flushInterval, partitioningStrategy);
     }
 
     /**
@@ -128,8 +123,8 @@ public class IggySink<T> implements Sink<T>, Serializable {
 
             // Parse server address to extract host
             java.net.URI uri = serverAddress.contains("://")
-                ? new java.net.URI(serverAddress)
-                : new java.net.URI("tcp://" + serverAddress);
+                    ? new java.net.URI(serverAddress)
+                    : new java.net.URI("tcp://" + serverAddress);
 
             String host = uri.getHost();
             if (host == null) {
@@ -143,16 +138,12 @@ public class IggySink<T> implements Sink<T>, Serializable {
             IggyHttpClient httpClient = new IggyHttpClient(httpUrl);
 
             // Login
-            httpClient.users().login(
-                connectionConfig.getUsername(),
-                connectionConfig.getPassword()
-            );
+            httpClient.users().login(connectionConfig.getUsername(), connectionConfig.getPassword());
 
             return httpClient;
 
-        } catch (java.net.URISyntaxException e) {
-            throw new RuntimeException("Invalid server address format: "
-                + connectionConfig.getServerAddress(), e);
+        } catch (URISyntaxException e) {
+            throw new RuntimeException("Invalid server address format: " + connectionConfig.getServerAddress(), e);
         } catch (RuntimeException e) {
             throw new RuntimeException("Failed to create HTTP Iggy client", e);
         }

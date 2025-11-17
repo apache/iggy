@@ -17,40 +17,34 @@
  * under the License.
  */
 
-package org.apache.iggy.consumergroup;
+import com.diffplug.gradle.spotless.SpotlessExtension
 
-import org.apache.iggy.identifier.ConsumerId;
+plugins {
+    id("com.diffplug.spotless") version "8.0.0" apply false
+}
 
-public record Consumer(Kind kind, ConsumerId id) {
+subprojects {
+    apply(plugin = "com.diffplug.spotless")
 
-    public static Consumer of(Long id) {
-        return new Consumer(Kind.Consumer, ConsumerId.of(id));
-    }
-
-    public static Consumer of(ConsumerId id) {
-        return new Consumer(Kind.Consumer, id);
-    }
-
-    public static Consumer group(Long id) {
-        return new Consumer(Kind.ConsumerGroup, ConsumerId.of(id));
-    }
-
-    public static Consumer group(ConsumerId id) {
-        return new Consumer(Kind.ConsumerGroup, id);
-    }
-
-    public enum Kind {
-        Consumer(1),
-        ConsumerGroup(2);
-
-        private final int code;
-
-        Kind(int code) {
-            this.code = code;
+    configure<SpotlessExtension> {
+        java {
+            palantirJavaFormat()
+            endWithNewline()
+            trimTrailingWhitespace()
+            importOrder("", "\n", "javax|java", "\n", "\\#")
+            removeUnusedImports()
+            forbidWildcardImports()
+            formatAnnotations()
         }
+    }
 
-        public int asCode() {
-            return code;
+    plugins.withType<JavaPlugin> {
+        apply(plugin = "checkstyle")
+
+        configure<CheckstyleExtension> {
+            toolVersion = "10.23.1"
+            configFile = file("${project.rootDir}/dev-support/checkstyle/checkstyle.xml")
+            configDirectory = file("${project.rootDir}/dev-support/checkstyle")
         }
     }
 }

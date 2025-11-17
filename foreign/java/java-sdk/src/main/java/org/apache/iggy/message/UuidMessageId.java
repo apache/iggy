@@ -21,6 +21,7 @@ package org.apache.iggy.message;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
+
 import java.math.BigInteger;
 import java.nio.ByteBuffer;
 import java.util.UUID;
@@ -52,5 +53,4 @@ public class UuidMessageId implements MessageId {
     public String toString() {
         return value.toString();
     }
-
 }

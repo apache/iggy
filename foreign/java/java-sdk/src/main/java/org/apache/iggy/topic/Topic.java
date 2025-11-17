@@ -31,6 +31,4 @@ public record Topic(
         BigInteger maxTopicSize,
         Short replicationFactor,
         BigInteger messagesCount,
-        Long partitionsCount
-) {
-}
+        Long partitionsCount) {}
