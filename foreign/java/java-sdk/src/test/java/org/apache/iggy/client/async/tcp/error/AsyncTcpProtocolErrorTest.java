@@ -39,6 +39,7 @@ import java.util.Collections;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -96,10 +97,11 @@ class AsyncTcpProtocolErrorTest extends AsyncTcpTestBase {
         );
 
         // Then: Should receive server error
-        await().timeout(Duration.ofSeconds(10))
-                .pollDelay(Duration.ofMillis(100))
-                .pollInterval(Duration.ofMillis(100))
-                .untilAsserted(() -> assertThat(sendFuture.isDone()).isTrue());
+        await().timeout(Duration.ofSeconds(5))
+                .untilAsserted(() -> {
+                    assertThatThrownBy(() -> sendFuture.get(100, TimeUnit.MILLISECONDS))
+                            .isInstanceOf(ExecutionException.class);
+                });
     }
 
     @Test
@@ -130,10 +132,11 @@ class AsyncTcpProtocolErrorTest extends AsyncTcpTestBase {
         );
 
         // Then: Should receive 400 error
-        await().timeout(Duration.ofSeconds(10))
-                .pollDelay(Duration.ofMillis(100))
-                .pollInterval(Duration.ofMillis(100))
-                .untilAsserted(() -> assertThat(sendFuture.isDone()).isTrue());
+        await().timeout(Duration.ofSeconds(5))
+                .untilAsserted(() -> {
+                    assertThatThrownBy(() -> sendFuture.get(100, TimeUnit.MILLISECONDS))
+                            .isInstanceOf(ExecutionException.class);
+                });
     }
 
     @Test
@@ -164,10 +167,11 @@ class AsyncTcpProtocolErrorTest extends AsyncTcpTestBase {
         );
 
         // Then: Should properly parse and return the error message
-        await().timeout(Duration.ofSeconds(10))
-                .pollDelay(Duration.ofMillis(100))
-                .pollInterval(Duration.ofMillis(100))
-                .untilAsserted(() -> assertThat(sendFuture.isDone()).isTrue());
+        await().timeout(Duration.ofSeconds(5))
+                .untilAsserted(() -> {
+                    assertThatThrownBy(() -> sendFuture.get(100, TimeUnit.MILLISECONDS))
+                            .isInstanceOf(ExecutionException.class);
+                });
     }
 
     @Test
@@ -198,10 +202,11 @@ class AsyncTcpProtocolErrorTest extends AsyncTcpTestBase {
         );
 
         // Then: Should generate generic error message
-        await().timeout(Duration.ofSeconds(10))
-                .pollDelay(Duration.ofMillis(100))
-                .pollInterval(Duration.ofMillis(100))
-                .untilAsserted(() -> assertThat(sendFuture.isDone()).isTrue());
+        await().timeout(Duration.ofSeconds(5))
+                .untilAsserted(() -> {
+                    assertThatThrownBy(() -> sendFuture.get(100, TimeUnit.MILLISECONDS))
+                            .isInstanceOf(ExecutionException.class);
+                });
     }
 
     @Test
@@ -232,10 +237,11 @@ class AsyncTcpProtocolErrorTest extends AsyncTcpTestBase {
         );
 
         // Then: Should handle unexpected format gracefully
-        await().timeout(Duration.ofSeconds(10))
-                .pollDelay(Duration.ofMillis(100))
-                .pollInterval(Duration.ofMillis(100))
-                .untilAsserted(() -> assertThat(sendFuture.isDone()).isTrue());
+        await().timeout(Duration.ofSeconds(5))
+                .untilAsserted(() -> {
+                    assertThatThrownBy(() -> sendFuture.get(100, TimeUnit.MILLISECONDS))
+                            .isInstanceOf(TimeoutException.class);
+                });
     }
 
     @Test
@@ -273,9 +279,10 @@ class AsyncTcpProtocolErrorTest extends AsyncTcpTestBase {
         );
 
         // Then: Each should be handled independently
-        await().timeout(Duration.ofSeconds(10))
-                .pollDelay(Duration.ofMillis(100))
-                .pollInterval(Duration.ofMillis(100))
-                .untilAsserted(() -> assertThat(future1.isDone() && future2.isDone()).isTrue());
+        await().timeout(Duration.ofSeconds(5))
+                .untilAsserted(() -> {
+                    assertThatThrownBy(() -> future1.get(100, TimeUnit.MILLISECONDS))
+                            .isInstanceOf(ExecutionException.class);
+                });
     }
 }

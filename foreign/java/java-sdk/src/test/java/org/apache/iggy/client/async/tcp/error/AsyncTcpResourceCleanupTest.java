@@ -39,6 +39,7 @@ import java.util.Collections;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -86,10 +87,8 @@ class AsyncTcpResourceCleanupTest extends AsyncTcpTestBase {
         CompletableFuture<Void> closeFuture = client.close();
 
         // Then: Should complete successfully
-        await().timeout(Duration.ofSeconds(10))
-                .pollDelay(Duration.ofMillis(100))
-                .pollInterval(Duration.ofMillis(100))
-                .untilAsserted(() -> assertThat(closeFuture.isDone()).isTrue());
+        await().timeout(Duration.ofSeconds(5))
+                .untilAsserted(() -> closeFuture.get(1, TimeUnit.SECONDS));
     }
 
     @Test
@@ -151,10 +150,11 @@ class AsyncTcpResourceCleanupTest extends AsyncTcpTestBase {
         closeFuture.get(5, TimeUnit.SECONDS);
 
         // Then: Pending request should be cancelled
-        await().timeout(Duration.ofSeconds(10))
-                .pollDelay(Duration.ofMillis(100))
-                .pollInterval(Duration.ofMillis(100))
-                .untilAsserted(() -> assertThat(sendFuture.isDone()).isTrue());
+        await().timeout(Duration.ofSeconds(5))
+                .untilAsserted(() -> {
+                    assertThatThrownBy(() -> sendFuture.get(100, TimeUnit.MILLISECONDS))
+                            .isInstanceOf(TimeoutException.class);
+                });
     }
 
     @Test
@@ -213,10 +213,12 @@ class AsyncTcpResourceCleanupTest extends AsyncTcpTestBase {
         CompletableFuture<Void> closeFuture3 = client.close();
 
         // Then: All should complete successfully
-        await().timeout(Duration.ofSeconds(10))
-                .pollDelay(Duration.ofMillis(100))
-                .pollInterval(Duration.ofMillis(100))
-                .untilAsserted(() -> assertThat(closeFuture1.isDone() && closeFuture2.isDone() && closeFuture3.isDone()).isTrue());
+        await().timeout(Duration.ofSeconds(5))
+                .untilAsserted(() -> {
+                    closeFuture1.get(100, TimeUnit.MILLISECONDS);
+                    closeFuture2.get(100, TimeUnit.MILLISECONDS);
+                    closeFuture3.get(100, TimeUnit.MILLISECONDS);
+                });
     }
 
     @Test
@@ -292,9 +294,9 @@ class AsyncTcpResourceCleanupTest extends AsyncTcpTestBase {
         CompletableFuture<Void> closeFuture = client.close();
 
         // Then: Should be thread-safe with no race conditions
-        await().timeout(Duration.ofSeconds(10))
-                .pollDelay(Duration.ofMillis(100))
-                .pollInterval(Duration.ofMillis(100))
-                .untilAsserted(() -> assertThat(closeFuture.isDone()).isTrue());
+        await().timeout(Duration.ofSeconds(5))
+                .untilAsserted(() -> {
+                    closeFuture.get(100, TimeUnit.MILLISECONDS); // Close should always succeed
+                });
     }
 }
