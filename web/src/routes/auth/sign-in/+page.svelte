@@ -40,6 +40,7 @@
   <Input
     label="Username"
     name="username"
+    autocomplete="username"
     errorMessage={Array.isArray($errors?.username)
       ? $errors.username.join(',')
       : String($errors?.username || '')}
@@ -50,6 +51,7 @@
   <PasswordInput
     label="Password"
     name="password"
+    autocomplete="current-password"
     errorMessage={Array.isArray($errors?.password)
       ? $errors.password.join(',')
       : String($errors?.password || '')}
