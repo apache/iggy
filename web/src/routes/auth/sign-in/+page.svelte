@@ -15,12 +15,11 @@
   let { data }: Props = $props();
   const { form, constraints, errors, message } = superForm(data.form, {});
 
-  const remember = persistedStore('rememberMe', { rememberMe: true, username: '', password: '' });
+  const remember = persistedStore('rememberMe', { rememberMe: true, username: '' });
 
   onMount(() => {
     if ($remember.rememberMe) {
       $form.username = $remember.username;
-      $form.password = $remember.password;
     }
   });
 </script>
@@ -30,10 +29,8 @@
   onsubmit={() => {
     if ($remember.rememberMe) {
       $remember.username = $form.username;
-      $remember.password = $form.password;
     } else {
       $remember.username = '';
-      $remember.password = '';
     }
   }}
   class="min-w-[350px] max-w-[400px] bg-white dark:bg-shade-d700 border text-color p-5 rounded-2xl card-shadow dark:shadow-lg flex flex-col gap-5"

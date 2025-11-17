@@ -8,7 +8,7 @@
   import Input from '../Input.svelte';
   import ModalBase from './ModalBase.svelte';
   import { setError, superForm, defaults } from 'sveltekit-superforms/client';
-  import { zod } from 'sveltekit-superforms/adapters';
+  import { zod4 } from 'sveltekit-superforms/adapters';
   import { fetchRouteApi } from '$lib/api/fetchRouteApi';
   import { goto } from '$app/navigation';
   import { resolve } from '$app/paths';
@@ -40,10 +40,10 @@
   });
 
   const { form, errors, enhance, constraints, submitting, tainted } = superForm(
-    defaults(zod(schema)),
+    defaults(zod4(schema)),
     {
       SPA: true,
-      validators: zod(schema),
+      validators: zod4(schema),
       invalidateAll: false,
       taintedMessage: false,
       async onUpdate({ form }) {
