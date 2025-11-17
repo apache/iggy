@@ -244,8 +244,8 @@ public class IggyTcpClient implements IggyBaseClient {
             if (host == null || host.isEmpty()) {
                 throw new IllegalArgumentException("Host cannot be null or empty");
             }
-            if (port == null || port <= 0) {
-                throw new IllegalArgumentException("Port must be a positive integer");
+            if (port == null || port <= 0 || port > 65535) {
+                throw new IllegalArgumentException("Port must be between 1 and 65535");
             }
             return new IggyTcpClient(host, port, username, password,
                     connectionTimeout, requestTimeout, connectionPoolSize, retryPolicy);

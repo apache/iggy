@@ -154,6 +154,7 @@ public class AsyncTcpConnection {
 
     /**
      * Closes the connection and releases resources.
+     * This method is idempotent - multiple calls are safe.
      */
     public CompletableFuture<Void> close() {
         CompletableFuture<Void> future = new CompletableFuture<>();
@@ -168,7 +169,11 @@ public class AsyncTcpConnection {
                 }
             });
         } else {
-            eventLoopGroup.shutdownGracefully();
+            // Already closed or not connected - return completed future
+            // This ensures idempotent behavior for multiple close() calls
+            if (!eventLoopGroup.isShuttingDown() && !eventLoopGroup.isShutdown()) {
+                eventLoopGroup.shutdownGracefully();
+            }
             future.complete(null);
         }
 

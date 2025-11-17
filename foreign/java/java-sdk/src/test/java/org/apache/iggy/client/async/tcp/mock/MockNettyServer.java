@@ -215,6 +215,17 @@ public class MockNettyServer {
     }
 
     /**
+     * Creates an error response frame with status code and error message.
+     *
+     * @param statusCode the error status code
+     * @param payload the error message payload
+     * @return a ByteBuf containing the error response frame
+     */
+    private ByteBuf createErrorResponse(int statusCode, byte[] payload) {
+        return createResponse(statusCode, payload);
+    }
+
+    /**
      * Netty handler for processing incoming connections and requests.
      */
     private class MockServerHandler extends SimpleChannelInboundHandler<ByteBuf> {
@@ -227,7 +238,7 @@ public class MockNettyServer {
             }
 
             if (sendMalformedResponse) {
-                // Send a malformed response
+                // Send a malformed response (incomplete frame)
                 ByteBuf malformed = ctx.alloc().buffer(4);
                 malformed.writeIntLE(0); // Only status, no length
                 ctx.writeAndFlush(malformed);
@@ -243,6 +254,28 @@ public class MockNettyServer {
             int frameLength = msg.readIntLE();
             int command = msg.readIntLE();
             ByteBuf payload = msg.readSlice(frameLength - 4); // Remaining bytes after command
+
+            // If statusCode is not 0, send error response directly
+            if (statusCode != 0) {
+                ByteBuf errorResponse = createErrorResponse(statusCode, responsePayload);
+                
+                if (dropConnectionAfterBytes) {
+                    // Send partial response and then drop connection
+                    if (errorResponse.readableBytes() > bytesToSendBeforeDrop) {
+                        ByteBuf partial = errorResponse.readSlice(bytesToSendBeforeDrop);
+                        ctx.writeAndFlush(partial).addListener(ChannelFutureListener.CLOSE);
+                        return;
+                    }
+                }
+
+                if (!responseDelay.isZero()) {
+                    // Add delay before responding
+                    Thread.sleep(responseDelay.toMillis());
+                }
+
+                ctx.writeAndFlush(errorResponse);
+                return;
+            }
 
             // Process the request using the configured handler
             ByteBuf response = requestHandler.apply(command, payload);
