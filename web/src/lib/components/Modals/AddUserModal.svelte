@@ -114,6 +114,7 @@
       <PasswordInput
         label="Password"
         name="password"
+        autocomplete="new-password"
         errorMessage={$errors.password?.[0]}
         bind:value={$form.password}
         {...$constraints.password}
