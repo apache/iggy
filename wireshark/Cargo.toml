@@ -1,0 +1,18 @@
+[package]
+name = "wireshark"
+version = "0.0.1"
+edition = "2024"
+
+[features]
+protocol-tests = []
+
+[[test]]
+name = "protocol_tests"
+path = "tests/protocol_tests.rs"
+required-features = ["protocol-tests"]
+
+[dependencies]
+iggy = { workspace = true }
+iggy_common = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
