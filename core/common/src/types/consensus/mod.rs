@@ -156,6 +156,7 @@ pub enum Operation {
 
 // Which will have an method that returns discriminator between Metadata and Partition requests
 
+#[expect(unused)]
 pub struct Message<H> {
     _phantom_header: PhantomData<H>,
 }
