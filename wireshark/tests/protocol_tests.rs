@@ -1,5 +1,5 @@
 use iggy::prelude::*;
-use iggy_common::{IggyError, PING_CODE, LOGIN_USER_CODE, CREATE_TOPIC_CODE};
+use iggy_common::{CREATE_TOPIC_CODE, IggyError, LOGIN_USER_CODE, PING_CODE};
 use serde_json::Value;
 use std::fmt::Display;
 use std::fs;
@@ -54,7 +54,10 @@ fn status_code_to_name(status_code: u32) -> &'static str {
 }
 
 fn check_tshark_available() -> bool {
-    ProcessCommand::new("tshark").arg("--version").output().is_ok()
+    ProcessCommand::new("tshark")
+        .arg("--version")
+        .output()
+        .is_ok()
 }
 
 struct TsharkCapture {
@@ -156,10 +159,10 @@ impl TsharkCapture {
             .output()?;
 
         if !output.status.success() {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("tshark failed: {}", String::from_utf8_lossy(&output.stderr)),
-            ));
+            return Err(io::Error::other(format!(
+                "tshark failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )));
         }
 
         let json_str = String::from_utf8_lossy(&output.stdout);
@@ -168,8 +171,8 @@ impl TsharkCapture {
             return Ok(Vec::new());
         }
 
-        let packets: Vec<Value> = serde_json::from_str(&json_str)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let packets: Vec<Value> =
+            serde_json::from_str(&json_str).map_err(io::Error::other)?;
 
         Ok(packets)
     }
@@ -178,7 +181,11 @@ impl TsharkCapture {
 impl Drop for TsharkCapture {
     fn drop(&mut self) {
         if let Err(e) = fs::remove_file(&self.pcap_file) {
-            eprintln!("Warning: Failed to remove pcap file {}: {}", self.pcap_file.display(), e);
+            eprintln!(
+                "Warning: Failed to remove pcap file {}: {}",
+                self.pcap_file.display(),
+                e
+            );
         }
     }
 }
@@ -201,8 +208,8 @@ impl TestFixture {
             ..Default::default()
         };
 
-        let tcp_client = TcpClient::create(Arc::new(tcp_config))
-            .expect("Failed to create TCP client");
+        let tcp_client =
+            TcpClient::create(Arc::new(tcp_config)).expect("Failed to create TCP client");
         let client = IggyClient::new(ClientWrapper::Tcp(tcp_client));
 
         Self { capture, client }
@@ -214,8 +221,9 @@ impl TestFixture {
 
         tokio::time::timeout(
             Duration::from_millis(SERVER_CONNECT_TIMEOUT_MS),
-            self.client.connect()
-        ).await??;
+            self.client.connect(),
+        )
+        .await??;
 
         if login {
             self.client
@@ -283,15 +291,17 @@ fn find_request_response<'a>(
                 && iggy.get("iggy.response.status").is_some()
         })
         .copied()
-        .ok_or_else(|| format!("Response for command {} ({}) not found in capture", command_id, command_name))?;
+        .ok_or_else(|| {
+            format!(
+                "Response for command {} ({}) not found in capture",
+                command_id, command_name
+            )
+        })?;
 
     Ok((req, resp))
 }
 
-fn verify_request_packet(
-    iggy: &Value,
-    expected_length: u32,
-) {
+fn verify_request_packet(iggy: &Value, expected_length: u32) {
     let command: u32 = expect_field(iggy, "iggy.request.command");
 
     let expected_cmd_name = iggy_common::get_name_from_code(command)
@@ -304,11 +314,7 @@ fn verify_request_packet(
     assert_eq!(length, expected_length);
 }
 
-fn verify_response_packet(
-    iggy: &Value,
-    expected_status_code: u32,
-    expected_length: u32,
-) {
+fn verify_response_packet(iggy: &Value, expected_status_code: u32, expected_length: u32) {
     let _cmd_name: String = expect_field(iggy, "iggy.request.command_name");
 
     let status: u32 = expect_field(iggy, "iggy.response.status");
@@ -342,8 +348,7 @@ fn print_packet_json(packets: &[Value], show_all: bool) {
             println!("{}", json);
         } else if let Some(iggy) = packet["_source"]["layers"].get("iggy") {
             println!("\nIggy Protocol:");
-            let json =
-                serde_json::to_string_pretty(iggy).unwrap_or_else(|_| "Error".to_string());
+            let json = serde_json::to_string_pretty(iggy).unwrap_or_else(|_| "Error".to_string());
             println!("{}", json);
         }
     }
@@ -363,10 +368,16 @@ async fn test_ping_dissection() -> Result<(), Box<dyn std::error::Error>> {
     let (req, resp) = find_request_response(&iggy_layers, PING_CODE)?;
 
     verify_request_packet(req, 4);
-    assert!(get_request_payload(req).is_none(), "Ping request should not have payload");
+    assert!(
+        get_request_payload(req).is_none(),
+        "Ping request should not have payload"
+    );
 
     verify_response_packet(resp, 0, 0);
-    assert!(get_response_payload(resp).is_none(), "Ping response should not have payload");
+    assert!(
+        get_response_payload(resp).is_none(),
+        "Ping response should not have payload"
+    );
 
     Ok(())
 }
@@ -401,8 +412,7 @@ async fn test_login_user_dissection() -> Result<(), Box<dyn std::error::Error>> 
 
     verify_response_packet(resp, 0, 4);
 
-    let resp_payload = get_response_payload(resp)
-        .expect("LoginUser response should have payload");
+    let resp_payload = get_response_payload(resp).expect("LoginUser response should have payload");
 
     let user_id: u32 = expect_field(resp_payload, "iggy.login_user.resp.user_id");
     assert!(user_id > 0, "User ID should be greater than 0");
@@ -418,12 +428,12 @@ async fn test_create_topic_dissection() -> Result<(), Box<dyn std::error::Error>
     let stream_name = "test_create_topic_stream";
     let topic_name = "test_create_topic";
 
-    let _ = fixture.client.delete_stream(&Identifier::named(stream_name)?).await;
-
-    fixture
+    let _ = fixture
         .client
-        .create_stream(stream_name, None)
-        .await?;
+        .delete_stream(&Identifier::named(stream_name)?)
+        .await;
+
+    fixture.client.create_stream(stream_name, None).await?;
 
     let partitions_count = 3u32;
 
@@ -441,7 +451,10 @@ async fn test_create_topic_dissection() -> Result<(), Box<dyn std::error::Error>
         )
         .await?;
 
-    fixture.client.delete_stream(&Identifier::named(stream_name)?).await?;
+    fixture
+        .client
+        .delete_stream(&Identifier::named(stream_name)?)
+        .await?;
 
     let packets = fixture.stop_and_analyze().await?;
     let iggy_layers = extract_iggy_layers(&packets);
@@ -455,10 +468,12 @@ async fn test_create_topic_dissection() -> Result<(), Box<dyn std::error::Error>
     let req_stream_id_kind: u32 = expect_field(req_payload, "iggy.create_topic.req.stream_id_kind");
     assert_eq!(req_stream_id_kind, IdKind::String.as_code() as u32);
 
-    let req_stream_id_length: u32 = expect_field(req_payload, "iggy.create_topic.req.stream_id_length");
+    let req_stream_id_length: u32 =
+        expect_field(req_payload, "iggy.create_topic.req.stream_id_length");
     assert_eq!(req_stream_id_length, stream_name.len() as u32);
 
-    let req_stream_id_value: String = expect_field(req_payload, "iggy.create_topic.req.stream_id_value_string");
+    let req_stream_id_value: String =
+        expect_field(req_payload, "iggy.create_topic.req.stream_id_value_string");
     assert_eq!(req_stream_id_value, stream_name);
 
     let name: String = expect_field(req_payload, "iggy.create_topic.req.name");
@@ -472,8 +487,8 @@ async fn test_create_topic_dissection() -> Result<(), Box<dyn std::error::Error>
 
     verify_response_packet(resp, 0, 188);
 
-    let resp_payload = get_response_payload(resp)
-        .expect("CreateTopic response should have payload");
+    let resp_payload =
+        get_response_payload(resp).expect("CreateTopic response should have payload");
 
     let resp_topic_id: u32 = expect_field(resp_payload, "iggy.create_topic.resp.topic_id");
     assert!(resp_topic_id > 0, "Topic ID should be greater than 0");
@@ -484,10 +499,12 @@ async fn test_create_topic_dissection() -> Result<(), Box<dyn std::error::Error>
     let resp_name_len: u32 = expect_field(resp_payload, "iggy.create_topic.resp.name_len");
     assert_eq!(resp_name_len, topic_name.len() as u32);
 
-    let resp_partitions: u32 = expect_field(resp_payload, "iggy.create_topic.resp.partitions_count");
+    let resp_partitions: u32 =
+        expect_field(resp_payload, "iggy.create_topic.resp.partitions_count");
     assert_eq!(resp_partitions, partitions_count);
 
-    let resp_messages_count: u32 = expect_field(resp_payload, "iggy.create_topic.resp.messages_count");
+    let resp_messages_count: u32 =
+        expect_field(resp_payload, "iggy.create_topic.resp.messages_count");
     assert_eq!(resp_messages_count, 0);
 
     let resp_size: u32 = expect_field(resp_payload, "iggy.create_topic.resp.size");
