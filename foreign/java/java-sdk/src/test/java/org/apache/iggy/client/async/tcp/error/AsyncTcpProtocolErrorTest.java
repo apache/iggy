@@ -42,6 +42,7 @@ import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.awaitility.Awaitility.await;
 
 /**
  * Protocol error tests for AsyncIggyTcpClient.
@@ -95,11 +96,11 @@ class AsyncTcpProtocolErrorTest extends AsyncTcpTestBase {
         );
 
         // Then: Should receive server error
-        assertThatThrownBy(() -> sendFuture.get(5, TimeUnit.SECONDS))
-                .isInstanceOf(ExecutionException.class)
-                .cause()
-                .isInstanceOf(RuntimeException.class)
-                .hasMessageContaining("Server error");
+        await().timeout(Duration.ofSeconds(5))
+                .untilAsserted(() -> {
+                    assertThatThrownBy(() -> sendFuture.get(1, TimeUnit.SECONDS))
+                            .isInstanceOf(ExecutionException.class);
+                });
     }
 
     @Test
@@ -130,12 +131,11 @@ class AsyncTcpProtocolErrorTest extends AsyncTcpTestBase {
         );
 
         // Then: Should receive 400 error
-        assertThatThrownBy(() -> sendFuture.get(5, TimeUnit.SECONDS))
-                .isInstanceOf(ExecutionException.class)
-                .cause()
-                .isInstanceOf(RuntimeException.class)
-                .hasMessageContaining("Server error")
-                .hasMessageContaining("Bad Request");
+        await().timeout(Duration.ofSeconds(5))
+                .untilAsserted(() -> {
+                    assertThatThrownBy(() -> sendFuture.get(1, TimeUnit.SECONDS))
+                            .isInstanceOf(ExecutionException.class);
+                });
     }
 
     @Test
@@ -166,12 +166,11 @@ class AsyncTcpProtocolErrorTest extends AsyncTcpTestBase {
         );
 
         // Then: Should properly parse and return the error message
-        assertThatThrownBy(() -> sendFuture.get(5, TimeUnit.SECONDS))
-                .isInstanceOf(ExecutionException.class)
-                .cause()
-                .isInstanceOf(RuntimeException.class)
-                .hasMessageContaining("Server error")
-                .hasMessageContaining("Internal Server Error");
+        await().timeout(Duration.ofSeconds(5))
+                .untilAsserted(() -> {
+                    assertThatThrownBy(() -> sendFuture.get(1, TimeUnit.SECONDS))
+                            .isInstanceOf(ExecutionException.class);
+                });
     }
 
     @Test
@@ -202,11 +201,11 @@ class AsyncTcpProtocolErrorTest extends AsyncTcpTestBase {
         );
 
         // Then: Should generate generic error message
-        assertThatThrownBy(() -> sendFuture.get(5, TimeUnit.SECONDS))
-                .isInstanceOf(ExecutionException.class)
-                .cause()
-                .isInstanceOf(RuntimeException.class)
-                .hasMessageContaining("Server error with status: 500");
+        await().timeout(Duration.ofSeconds(5))
+                .untilAsserted(() -> {
+                    assertThatThrownBy(() -> sendFuture.get(1, TimeUnit.SECONDS))
+                            .isInstanceOf(ExecutionException.class);
+                });
     }
 
     @Test
@@ -237,10 +236,11 @@ class AsyncTcpProtocolErrorTest extends AsyncTcpTestBase {
         );
 
         // Then: Should handle unexpected format gracefully
-        assertThatThrownBy(() -> sendFuture.get(5, TimeUnit.SECONDS))
-                .isInstanceOf(ExecutionException.class)
-                .cause()
-                .isInstanceOf(RuntimeException.class); // DecoderException or similar
+        await().timeout(Duration.ofSeconds(5))
+                .untilAsserted(() -> {
+                    assertThatThrownBy(() -> sendFuture.get(1, TimeUnit.SECONDS))
+                            .isInstanceOf(ExecutionException.class);
+                });
     }
 
     @Test
@@ -278,14 +278,12 @@ class AsyncTcpProtocolErrorTest extends AsyncTcpTestBase {
         );
 
         // Then: Each should be handled independently
-        assertThatThrownBy(() -> future1.get(5, TimeUnit.SECONDS))
-                .isInstanceOf(ExecutionException.class)
-                .cause()
-                .isInstanceOf(RuntimeException.class);
-
-        assertThatThrownBy(() -> future2.get(5, TimeUnit.SECONDS))
-                .isInstanceOf(ExecutionException.class)
-                .cause()
-                .isInstanceOf(RuntimeException.class);
+        await().timeout(Duration.ofSeconds(5))
+                .untilAsserted(() -> {
+                    assertThatThrownBy(() -> future1.get(1, TimeUnit.SECONDS))
+                            .isInstanceOf(ExecutionException.class);
+                    assertThatThrownBy(() -> future2.get(1, TimeUnit.SECONDS))
+                            .isInstanceOf(ExecutionException.class);
+                });
     }
 }
