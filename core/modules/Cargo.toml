@@ -16,9 +16,5 @@
 # under the License.
 
 [workspace]
-members = [
-    "consensus",
-    "messages",
-    "metadata",
-]
+members = ["consensus", "messages", "metadata"]
 resolver = "2"
