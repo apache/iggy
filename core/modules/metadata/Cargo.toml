@@ -30,3 +30,5 @@ readme = "../../../README.md"
 
 [dependencies]
 messages = { path = "../messages" }
+consensus = { path = "../consensus" }
+

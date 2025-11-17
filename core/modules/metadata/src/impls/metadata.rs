@@ -14,16 +14,17 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-
-use messages::consensus::Message;
+use consensus::Consesus;
 
 // TODO: Define a trait (probably in some external crate)
 #[expect(unused)]
-trait Metadata {
-    // TODO: I was thinking about having the `RequestHeader` be generic over type of request
-    // but I think having the `Operation` enum return an discriminant, and handle it outside of `Metadata` is good enough.
-    type Header;
-    fn handle(&self, message: Message<Self::Header>);
+trait Metadata<C>
+where
+    C: Consesus,
+{
+    fn on_request(&self, message: C::RequestMessage);
+    fn on_replicate(&self, message: C::ReplicateMessage);
+    fn on_ack(&self, message: C::AckMessage);
 }
 
 #[expect(unused)]
@@ -34,9 +35,19 @@ struct IggyMetadata<C, M, J, S> {
     snapshot: S,
 }
 
-impl<C, M, J, S> Metadata for IggyMetadata<C, M, J, S> {
-    type Header = (); // RequestMetadataHeader;
+impl<C, M, J, S> Metadata<C> for IggyMetadata<C, M, J, S>
+where
+    C: Consesus,
+{
+    fn on_request(&self, _message: C::RequestMessage) {
+        todo!()
+    }
 
-    #[expect(unused)]
-    fn handle(&self, message: Message<Self::Header>) {}
+    fn on_replicate(&self, _message: C::ReplicateMessage) {
+        todo!()
+    }
+
+    fn on_ack(&self, _message: C::AckMessage) {
+        todo!()
+    }
 }
