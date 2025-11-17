@@ -19,6 +19,6 @@
 
 pub mod consensus;
 
-// TODO: I think this module should be part of consesus module
-// There is potential for cyclic reference, as consesus requires messages, but messages require
-// command type from consesus layer.
+// TODO: I think this module should be part of consensus module
+// There is potential for cyclic reference, as consensus requires messages, but messages require
+// command type from consensus layer.
