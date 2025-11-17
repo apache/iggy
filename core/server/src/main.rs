@@ -82,6 +82,7 @@ async fn main() -> Result<(), ServerError> {
         );
     }
     let args = Args::parse();
+    let is_follower = args.follower;
 
     // FIRST DISCRETE LOADING STEP.
     // Load config and create directories.
@@ -114,6 +115,10 @@ async fn main() -> Result<(), ServerError> {
 
     // From this point on, we can use tracing macros to log messages.
     logging.late_init(config.system.get_system_path(), &config.system.logging)?;
+
+    if is_follower {
+        info!("Server is running in FOLLOWER mode for testing leader redirection");
+    }
 
     if args.with_default_root_credentials {
         let username_set = std::env::var("IGGY_ROOT_USERNAME").is_ok();
@@ -357,6 +362,7 @@ async fn main() -> Result<(), ServerError> {
                         .encryptor(encryptor)
                         .version(current_version)
                         .metrics(metrics)
+                        .is_follower(is_follower)
                         .build();
                     let shard = Rc::new(shard);
 

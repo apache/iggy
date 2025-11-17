@@ -18,10 +18,7 @@
 
 use crate::shard::IggyShard;
 use crate::streaming::session::Session;
-use iggy_common::{
-    ClusterMetadata, ClusterNode, ClusterNodeRole, ClusterNodeStatus, IggyError, TransportProtocol,
-};
-use std::str::FromStr;
+use iggy_common::{ClusterMetadata, ClusterNode, ClusterNodeRole, ClusterNodeStatus, IggyError};
 use tracing::trace;
 
 impl IggyShard {
@@ -35,12 +32,13 @@ impl IggyShard {
         // TODO(hubcio): Clustering is not yet implemented
         // The leader/follower as well as node status are currently placeholder implementations.
 
-        let name = self.config.cluster.name.clone();
-        let id = self.config.cluster.id;
+        let cluster_name = self.config.cluster.name.clone();
+        let cluster_id = self.config.cluster.id;
 
-        // Parse transport string to TransportProtocol enum
-        let transport = TransportProtocol::from_str(&self.config.cluster.transport)
-            .map_err(|_| IggyError::InvalidConfiguration)?;
+        // Cannot fail because we validated it in config
+        let transport = self.config.cluster.transport;
+
+        let own_node_id = self.config.cluster.node.id;
 
         let nodes: Vec<ClusterNode> = self
             .config
@@ -48,13 +46,25 @@ impl IggyShard {
             .nodes
             .iter()
             .map(|node_config| {
-                let role = if node_config.id == 1 {
-                    ClusterNodeRole::Leader
+                let (role, status) = if node_config.id == own_node_id {
+                    (
+                        if self.is_follower {
+                            ClusterNodeRole::Follower
+                        } else {
+                            ClusterNodeRole::Leader
+                        },
+                        ClusterNodeStatus::Healthy,
+                    )
                 } else {
-                    ClusterNodeRole::Follower
+                    (
+                        if self.is_follower {
+                            ClusterNodeRole::Leader
+                        } else {
+                            ClusterNodeRole::Follower
+                        },
+                        ClusterNodeStatus::Healthy,
+                    )
                 };
-
-                let status = ClusterNodeStatus::Healthy;
 
                 ClusterNode {
                     id: node_config.id,
@@ -67,8 +77,8 @@ impl IggyShard {
             .collect();
 
         Ok(ClusterMetadata {
-            name,
-            id,
+            name: cluster_name,
+            id: cluster_id,
             transport,
             nodes,
         })
