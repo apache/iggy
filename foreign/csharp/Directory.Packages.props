@@ -13,10 +13,10 @@
         <PackageVersion Include="Microsoft.Testing.Extensions.CodeCoverage" Version="18.0.4" />
         <PackageVersion Include="Microsoft.Testing.Extensions.TrxReport" Version="1.9.0" />
         <PackageVersion Include="Moq" Version="4.20.72" />
-        <PackageVersion Include="Reqnroll.xUnit" Version="3.1.2" />
+        <PackageVersion Include="Reqnroll.xUnit" Version="3.2.1" />
         <PackageVersion Include="Shouldly" Version="4.3.0" />
         <PackageVersion Include="System.IO.Hashing" Version="8.0.0" />
-        <PackageVersion Include="Testcontainers" Version="4.7.0" />
+        <PackageVersion Include="Testcontainers" Version="4.8.1" />
         <PackageVersion Include="TUnit" Version="0.70.0" />
         <PackageVersion Include="xunit" Version="2.9.3" />
         <PackageVersion Include="xunit.runner.visualstudio" Version="3.1.5">

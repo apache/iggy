@@ -1,7 +1,7 @@
 <script lang="ts">
   import type { CloseModalFn } from '$lib/types/utilTypes';
   import { setError, superForm, defaults } from 'sveltekit-superforms/client';
-  import { zod } from 'sveltekit-superforms/adapters';
+  import { zod4 } from 'sveltekit-superforms/adapters';
   import { z } from 'zod';
   import Button from '../Button.svelte';
   import Input from '../Input.svelte';
@@ -23,9 +23,9 @@
       .max(255, 'Name must not exceed 255 characters')
   });
 
-  const { form, errors, enhance, submitting } = superForm(defaults(zod(schema)), {
+  const { form, errors, enhance, submitting } = superForm(defaults(zod4(schema)), {
     SPA: true,
-    validators: zod(schema),
+    validators: zod4(schema),
     invalidateAll: false,
     taintedMessage: false,
     async onUpdate({ form }) {

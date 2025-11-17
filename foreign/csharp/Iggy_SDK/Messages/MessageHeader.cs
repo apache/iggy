@@ -20,16 +20,44 @@ using Apache.Iggy.JsonConverters;
 
 namespace Apache.Iggy.Messages;
 
+/// <summary>
+///     Header information for a message.
+/// </summary>
 public class MessageHeader
 {
+    /// <summary>
+    ///     Message checksum.
+    /// </summary>
     public ulong Checksum { get; set; }
+
+    /// <summary>
+    ///     Message identifier.
+    /// </summary>
     public UInt128 Id { get; set; }
+
+    /// <summary>
+    ///     Message offset.
+    /// </summary>
     public ulong Offset { get; set; }
 
+    /// <summary>
+    ///     Message timestamp.
+    /// </summary>
     [JsonConverter(typeof(DateTimeOffsetConverter))]
     public DateTimeOffset Timestamp { get; set; }
 
+    /// <summary>
+    ///     Message origin timestamp.
+    /// </summary>
     public ulong OriginTimestamp { get; set; }
+
+    /// <summary>
+    ///     Length of the user headers.
+    /// </summary>
     public int UserHeadersLength { get; set; }
+
+    /// <summary>
+    ///     Length of the payload.
+    /// </summary>
     public int PayloadLength { get; set; }
 }

@@ -15,18 +15,20 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using System.Text.Json.Serialization;
-using Apache.Iggy.JsonConverters;
-using Apache.Iggy.Kinds;
-using Apache.Iggy.Messages;
-
 namespace Apache.Iggy.Contracts;
 
-[JsonConverter(typeof(MessagesConverter))]
-public sealed class MessageSendRequest
+/// <summary>
+///     Node role within the cluster
+/// </summary>
+public enum ClusterNodeRole : byte
 {
-    public required Identifier StreamId { get; init; }
-    public required Identifier TopicId { get; init; }
-    public required Partitioning Partitioning { get; init; }
-    public required IList<Message> Messages { get; init; }
+    /// <summary>
+    ///     Primary/Leader node - handles all writes
+    /// </summary>
+    Leader = 0,
+
+    /// <summary>
+    ///     Follower/Secondary node - read replica
+    /// </summary>
+    Follower = 1
 }

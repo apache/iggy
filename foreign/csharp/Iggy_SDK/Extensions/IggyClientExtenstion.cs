@@ -22,20 +22,50 @@ using Apache.Iggy.Publishers;
 
 namespace Apache.Iggy.Extensions;
 
+/// <summary>
+///     Extension methods for <see cref="IIggyClient" />
+/// </summary>
 public static class IggyClientExtenstion
 {
+    /// <summary>
+    ///     Creates a new <see cref="IggyConsumerBuilder" /> from <see cref="IIggyClient" /> for the specified stream and
+    ///     topic.
+    /// </summary>
+    /// <param name="client">Existing iggy client</param>
+    /// <param name="streamId">Stream identifier from which to consume</param>
+    /// <param name="topicId">Topic identifier from which to consume</param>
+    /// <param name="consumer">Consumer</param>
+    /// <returns>Iggy consumer builder</returns>
     public static IggyConsumerBuilder CreateConsumerBuilder(this IIggyClient client, Identifier streamId,
         Identifier topicId, Consumer consumer)
     {
         return IggyConsumerBuilder.Create(client, streamId, topicId, consumer);
     }
 
+    /// <summary>
+    ///     Creates a new <see cref="IggyConsumerBuilder{T}" /> from <see cref="IIggyClient" /> for the specified stream and
+    ///     topic.
+    /// </summary>
+    /// <param name="client">Existing iggy client</param>
+    /// <param name="streamId">Stream identifier from which to consume</param>
+    /// <param name="topicId">Topic identifier from which to consume</param>
+    /// <param name="consumer">Consumer</param>
+    /// <param name="deserializer">Optional deserializer</param>
+    /// <returns>Iggy consumer builder</returns>
     public static IggyConsumerBuilder CreateConsumerBuilder<T>(this IIggyClient client, Identifier streamId,
         Identifier topicId, Consumer consumer, IDeserializer<T> deserializer) where T : IDeserializer<T>
     {
         return IggyConsumerBuilder.Create(client, streamId, topicId, consumer);
     }
 
+    /// <summary>
+    ///     Creates a new <see cref="IggyPublisherBuilder" /> from <see cref="IIggyClient" /> for the specified stream and
+    ///     topic.
+    /// </summary>
+    /// <param name="client">Existing iggy client</param>
+    /// <param name="streamId">Stream identifier to publish to</param>
+    /// <param name="topicId">>Topic identifier to publish to</param>
+    /// <returns>Iggy publisher builder</returns>
     public static IggyPublisherBuilder CreatePublisherBuilder(this IIggyClient client, Identifier streamId,
         Identifier topicId)
     {

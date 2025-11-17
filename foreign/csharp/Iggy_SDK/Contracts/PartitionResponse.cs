@@ -20,17 +20,40 @@ using Apache.Iggy.JsonConverters;
 
 namespace Apache.Iggy.Contracts;
 
+/// <summary>
+///     Information about a partition.
+/// </summary>
 public sealed class PartitionResponse
 {
+    /// <summary>
+    ///     Partition identifier.
+    /// </summary>
     public required int Id { get; init; }
+
+    /// <summary>
+    ///     Number of messages in the partition.
+    /// </summary>
     public required ulong MessagesCount { get; init; }
 
+    /// <summary>
+    ///     Creation date of the partition.
+    /// </summary>
     [JsonConverter(typeof(DateTimeOffsetConverter))]
     public required DateTimeOffset CreatedAt { get; init; }
 
+    /// <summary>
+    ///     Number of segments in the partition.
+    /// </summary>
     public required int SegmentsCount { get; init; }
+
+    /// <summary>
+    ///     Current offset of the partition.
+    /// </summary>
     public required ulong CurrentOffset { get; init; }
 
+    /// <summary>
+    ///     Size of the partition.
+    /// </summary>
     [JsonConverter(typeof(SizeConverter))]
     public required ulong Size { get; init; }
 }

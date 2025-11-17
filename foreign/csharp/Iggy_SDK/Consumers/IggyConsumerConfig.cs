@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using Apache.Iggy.Configuration;
 using Apache.Iggy.Encryption;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Kinds;
@@ -149,4 +150,11 @@ public class IggyConsumerConfig
     ///     Optional logger factory for creating loggers
     /// </summary>
     public ILoggerFactory? LoggerFactory { get; set; }
+
+    /// <summary>
+    ///     Gets or sets the reconnection settings to control the behavior of the iggy client
+    ///     in case of a disconnect or network failure.
+    ///     This property is optional and can be null. If null, reconnection will be disabled.
+    /// </summary>
+    public ReconnectionSettings? ReconnectionSettings { get; set; }
 }

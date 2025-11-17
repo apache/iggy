@@ -15,27 +15,23 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Apache.Iggy.Enums;
-
 namespace Apache.Iggy.Exceptions;
 
+/// <summary>
+///     Exception thrown when a stream is not found and auto-creation is disabled
+/// </summary>
 public sealed class StreamNotFoundException : Exception
 {
+    /// <summary>
+    ///     Stream identifier that was not found.
+    /// </summary>
     public Identifier StreamId { get; }
 
+    /// <summary>
+    ///     Initializes a new instance of the <see cref="StreamNotFoundException" /> class.
+    /// </summary>
     public StreamNotFoundException(Identifier streamId)
         : base($"Stream {streamId} does not exist and auto-creation is disabled")
-    {
-        StreamId = streamId;
-    }
-
-    public StreamNotFoundException(Identifier streamId, string message) : base(message)
-    {
-        StreamId = streamId;
-    }
-
-    public StreamNotFoundException(Identifier streamId, string message, Exception innerException)
-        : base(message, innerException)
     {
         StreamId = streamId;
     }

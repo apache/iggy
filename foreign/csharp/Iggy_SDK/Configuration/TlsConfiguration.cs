@@ -17,9 +17,23 @@
 
 namespace Apache.Iggy.Configuration;
 
+/// <summary>
+///     TLS configuration
+/// </summary>
 public class TlsSettings
 {
+    /// <summary>
+    ///     Whether TLS is enabled.
+    /// </summary>
     public bool Enabled { get; set; }
+
+    /// <summary>
+    ///     The name of the server that shares ssl stream.
+    /// </summary>
     public string Hostname { get; set; } = string.Empty;
+
+    /// <summary>
+    ///     Whether to authenticate the client.
+    /// </summary>
     public bool Authenticate { get; set; }
 }

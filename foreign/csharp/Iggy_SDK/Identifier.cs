@@ -21,12 +21,31 @@ using Apache.Iggy.Enums;
 
 namespace Apache.Iggy;
 
+/// <summary>
+///     A unique identifier for a resource.
+/// </summary>
 public readonly struct Identifier : IEquatable<Identifier>
 {
+    /// <summary>
+    ///     Identifier kind.
+    /// </summary>
     public required IdKind Kind { get; init; }
+
+    /// <summary>
+    ///     Identifier length in bytes.
+    /// </summary>
     public required int Length { get; init; }
+
+    /// <summary>
+    ///     Identifier value as bytes.
+    /// </summary>
     public required byte[] Value { get; init; }
 
+    /// <summary>
+    ///     Creates a numeric identifier from a value.
+    /// </summary>
+    /// <param name="value">Identifier value</param>
+    /// <returns></returns>
     public static Identifier Numeric(int value)
     {
         var bytes = new byte[4];
@@ -40,6 +59,11 @@ public readonly struct Identifier : IEquatable<Identifier>
         };
     }
 
+    /// <summary>
+    ///     Creates a numeric identifier from a value.
+    /// </summary>
+    /// <param name="value">Identifier value</param>
+    /// <returns></returns>
     public static Identifier Numeric(uint value)
     {
         var bytes = new byte[4];
@@ -53,6 +77,12 @@ public readonly struct Identifier : IEquatable<Identifier>
         };
     }
 
+    /// <summary>
+    ///     Creates a string identifier from a value.
+    /// </summary>
+    /// <param name="value">Identifier value</param>
+    /// <returns></returns>
+    /// <exception cref="ArgumentException">Thrown when the value is too long or too short.</exception>
     public static Identifier String(string value)
     {
         if (value.Length is 0 or > 255)
@@ -68,6 +98,7 @@ public readonly struct Identifier : IEquatable<Identifier>
         };
     }
 
+    /// <inheritdoc />
     public override string ToString()
     {
         return Kind switch
@@ -78,6 +109,11 @@ public readonly struct Identifier : IEquatable<Identifier>
         };
     }
 
+    /// <summary>
+    ///     Gets the numeric value of the identifier.
+    /// </summary>
+    /// <returns>Unsigned integer identifier value.</returns>
+    /// <exception cref="InvalidOperationException">Thrown when the identifier is not numeric.</exception>
     public uint GetUInt32()
     {
         if (Kind != IdKind.Numeric)
@@ -88,6 +124,11 @@ public readonly struct Identifier : IEquatable<Identifier>
         return BinaryPrimitives.ReadUInt32LittleEndian(Value);
     }
 
+    /// <summary>
+    ///     Gets the string value of the identifier.
+    /// </summary>
+    /// <returns>String identifier value.</returns>
+    /// <exception cref="InvalidOperationException">Thrown when the identifier is not string.</exception>
     public string GetString()
     {
         if (Kind != IdKind.String)
@@ -98,16 +139,23 @@ public readonly struct Identifier : IEquatable<Identifier>
         return Encoding.UTF8.GetString(Value);
     }
 
+    /// <summary>
+    ///     Determines whether the current identifier is equal to another identifier.
+    /// </summary>
+    /// <param name="other">The identifier to compare with the current identifier.</param>
+    /// <returns>True if the current identifier is equal to the other identifier; otherwise, false.</returns>
     public bool Equals(Identifier other)
     {
         return Kind == other.Kind && Value.Equals(other.Value);
     }
 
+    /// <inheritdoc />
     public override bool Equals(object? obj)
     {
         return obj is Identifier other && Equals(other);
     }
 
+    /// <inheritdoc />
     public override int GetHashCode()
     {
         return HashCode.Combine((int)Kind, Value);

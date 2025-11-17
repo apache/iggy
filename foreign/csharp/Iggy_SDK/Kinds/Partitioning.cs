@@ -20,12 +20,30 @@ using System.Text;
 
 namespace Apache.Iggy.Kinds;
 
+/// <summary>
+///     Used to specify to which partition the messages should be sent.
+/// </summary>
 public readonly struct Partitioning
 {
+    /// <summary>
+    ///     Partitioning strategy.
+    /// </summary>
     public required Enums.Partitioning Kind { get; init; }
+
+    /// <summary>
+    ///     Length of the partitioning value.
+    /// </summary>
     public required int Length { get; init; }
+
+    /// <summary>
+    ///     Partitioning value as bytes.
+    /// </summary>
     public required byte[] Value { get; init; }
 
+    /// <summary>
+    ///     Creates a partitioning strategy that use default partitioning (balanced).
+    /// </summary>
+    /// <returns>Partitioning instance</returns>
     public static Partitioning None()
     {
         return new Partitioning
@@ -36,6 +54,11 @@ public readonly struct Partitioning
         };
     }
 
+    /// <summary>
+    ///     Creates a partitioning strategy that use a specific partition id.
+    /// </summary>
+    /// <param name="value">Partition id</param>
+    /// <returns>Partitioning instance</returns>
     public static Partitioning PartitionId(int value)
     {
         var bytes = new byte[4];
@@ -49,6 +72,12 @@ public readonly struct Partitioning
         };
     }
 
+    /// <summary>
+    ///     Creates a partitioning strategy that use message key as partitioning value.
+    /// </summary>
+    /// <param name="value">>Message key as string</param>
+    /// <returns>Partitioning instance</returns>
+    /// <exception cref="ArgumentException">Thrown when the value size is incorrect</exception>
     public static Partitioning EntityIdString(string value)
     {
         if (value.Length is 0 or > 255)
@@ -64,6 +93,12 @@ public readonly struct Partitioning
         };
     }
 
+    /// <summary>
+    ///     Creates a partitioning strategy that use message key as partitioning value.
+    /// </summary>
+    /// <param name="value">>Message key as byte array</param>
+    /// <returns>Partitioning instance</returns>
+    /// <exception cref="ArgumentException">Thrown when the value size is incorrect</exception>
     public static Partitioning EntityIdBytes(byte[] value)
     {
         if (value.Length is 0 or > 255)
@@ -79,6 +114,11 @@ public readonly struct Partitioning
         };
     }
 
+    /// <summary>
+    ///     Creates a partitioning strategy that use message key as partitioning value.
+    /// </summary>
+    /// <param name="value">>Message key as int</param>
+    /// <returns>>Partitioning instance</returns>
     public static Partitioning EntityIdInt(int value)
     {
         Span<byte> bytes = stackalloc byte[4];
@@ -91,6 +131,11 @@ public readonly struct Partitioning
         };
     }
 
+    /// <summary>
+    ///     Creates a partitioning strategy that use message key as partitioning value.
+    /// </summary>
+    /// <param name="value">>>Message key as ulong</param>
+    /// <returns>>Partitioning instance</returns>
     public static Partitioning EntityIdUlong(ulong value)
     {
         Span<byte> bytes = stackalloc byte[8];
@@ -103,6 +148,11 @@ public readonly struct Partitioning
         };
     }
 
+    /// <summary>
+    ///     Creates a partitioning strategy that use message key as partitioning value.
+    /// </summary>
+    /// <param name="value">>Message key as Guid</param>
+    /// <returns>>Partitioning instance</returns>
     public static Partitioning EntityIdGuid(Guid value)
     {
         var bytes = value.ToByteArray();

@@ -17,8 +17,18 @@
 
 namespace Apache.Iggy.Enums;
 
+/// <summary>
+///     User status
+/// </summary>
 public enum UserStatus
 {
+    /// <summary>
+    ///     User is active.
+    /// </summary>
     Active = 1,
+
+    /// <summary>
+    ///     User is inactive.
+    /// </summary>
     Inactive = 2
 }

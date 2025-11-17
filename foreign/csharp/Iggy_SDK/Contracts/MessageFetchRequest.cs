@@ -19,13 +19,43 @@ using Apache.Iggy.Kinds;
 
 namespace Apache.Iggy.Contracts;
 
+/// <summary>
+///     Request for fetching messages from a topic.
+/// </summary>
 public sealed class MessageFetchRequest
 {
+    /// <summary>
+    ///     Consumer requesting the messages.
+    /// </summary>
     public required Consumer Consumer { get; init; }
+
+    /// <summary>
+    ///     Stream identifier.
+    /// </summary>
     public required Identifier StreamId { get; init; }
+
+    /// <summary>
+    ///     Topic identifier.
+    /// </summary>
     public required Identifier TopicId { get; init; }
+
+    /// <summary>
+    ///     Partition identifier.
+    /// </summary>
     public uint? PartitionId { get; init; }
+
+    /// <summary>
+    ///     Polling strategy.
+    /// </summary>
     public required PollingStrategy PollingStrategy { get; init; }
+
+    /// <summary>
+    ///     Maximum number of messages to fetch.
+    /// </summary>
     public required uint Count { get; init; }
+
+    /// <summary>
+    ///     Whether to commit the offset automatically.
+    /// </summary>
     public required bool AutoCommit { get; init; }
 }

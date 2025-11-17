@@ -16,8 +16,10 @@
 // under the License.
 
 using System.Threading.Channels;
+using Apache.Iggy.Enums;
 using Apache.Iggy.IggyClient;
 using Apache.Iggy.Messages;
+using Apache.Iggy.Utils;
 using Microsoft.Extensions.Logging;
 
 namespace Apache.Iggy.Publishers;
@@ -28,12 +30,14 @@ namespace Apache.Iggy.Publishers;
 /// </summary>
 internal sealed partial class BackgroundMessageProcessor : IAsyncDisposable
 {
+    private readonly EventAggregator<PublisherErrorEventArgs> _backgroundErrorAggregator;
     private readonly CancellationTokenSource _cancellationTokenSource;
     private readonly IIggyClient _client;
     private readonly IggyPublisherConfig _config;
     private readonly ILogger<BackgroundMessageProcessor> _logger;
-    private readonly Channel<Message> _messageChannel;
+    private readonly EventAggregator<MessageBatchFailedEventArgs> _messageBatchErrorAggregator;
     private Task? _backgroundTask;
+    private bool _canSend = true;
     private bool _disposed;
 
     /// <summary>
@@ -56,14 +60,14 @@ internal sealed partial class BackgroundMessageProcessor : IAsyncDisposable
     /// </summary>
     /// <param name="client">The Iggy client used to send messages.</param>
     /// <param name="config">Configuration settings for the publisher.</param>
-    /// <param name="logger">Logger instance for diagnostic output.</param>
+    /// <param name="loggerFactory">Logger instance for diagnostic output.</param>
     public BackgroundMessageProcessor(IIggyClient client,
         IggyPublisherConfig config,
-        ILogger<BackgroundMessageProcessor> logger)
+        ILoggerFactory loggerFactory)
     {
         _client = client;
         _config = config;
-        _logger = logger;
+        _logger = loggerFactory.CreateLogger<BackgroundMessageProcessor>();
         _cancellationTokenSource = new CancellationTokenSource();
 
         var options = new BoundedChannelOptions(_config.BackgroundQueueCapacity)
@@ -73,9 +77,13 @@ internal sealed partial class BackgroundMessageProcessor : IAsyncDisposable
             SingleWriter = false
         };
 
-        _messageChannel = Channel.CreateBounded<Message>(options);
-        MessageWriter = _messageChannel.Writer;
-        MessageReader = _messageChannel.Reader;
+        Channel<Message> messageChannel = Channel.CreateBounded<Message>(options);
+        MessageWriter = messageChannel.Writer;
+        MessageReader = messageChannel.Reader;
+
+        _backgroundErrorAggregator = new EventAggregator<PublisherErrorEventArgs>(loggerFactory);
+        _messageBatchErrorAggregator = new EventAggregator<MessageBatchFailedEventArgs>(loggerFactory);
+        _client.SubscribeConnectionEvents(ClientOnOnConnectionStateChanged);
     }
 
     /// <summary>
@@ -88,6 +96,8 @@ internal sealed partial class BackgroundMessageProcessor : IAsyncDisposable
         {
             return;
         }
+
+        _client.UnsubscribeConnectionEvents(ClientOnOnConnectionStateChanged);
 
         await _cancellationTokenSource.CancelAsync();
 
@@ -112,18 +122,10 @@ internal sealed partial class BackgroundMessageProcessor : IAsyncDisposable
         MessageWriter.Complete();
         _cancellationTokenSource.Dispose();
 
+        _backgroundErrorAggregator.Clear();
+        _messageBatchErrorAggregator.Clear();
         _disposed = true;
     }
-
-    /// <summary>
-    ///     Event raised when an unexpected error occurs in the background processor.
-    /// </summary>
-    public event EventHandler<PublisherErrorEventArgs>? OnBackgroundError;
-
-    /// <summary>
-    ///     Event raised when a message batch fails to send after all retry attempts.
-    /// </summary>
-    public event EventHandler<MessageBatchFailedEventArgs>? OnMessageBatchFailed;
 
     /// <summary>
     ///     Starts the background message processing task.
@@ -141,6 +143,42 @@ internal sealed partial class BackgroundMessageProcessor : IAsyncDisposable
     }
 
     /// <summary>
+    ///     Subscribe to background error events
+    /// </summary>
+    /// <param name="handler">Callback to handle the error event</param>
+    public void SubscribeOnBackgroundError(Func<PublisherErrorEventArgs, Task> handler)
+    {
+        _backgroundErrorAggregator.Subscribe(handler);
+    }
+
+    /// <summary>
+    ///     Unsubscribe from background error events
+    /// </summary>
+    /// <param name="handler">Callback to handle the error event</param>
+    public void UnsubscribeOnBackgroundError(Func<PublisherErrorEventArgs, Task> handler)
+    {
+        _backgroundErrorAggregator.Unsubscribe(handler);
+    }
+
+    /// <summary>
+    ///     Subscribe to message batch failed events
+    /// </summary>
+    /// <param name="handler">Callback to handle the message batch failed event</param>
+    public void SubscribeOnMessageBatchFailed(Func<MessageBatchFailedEventArgs, Task> handler)
+    {
+        _messageBatchErrorAggregator.Subscribe(handler);
+    }
+
+    /// <summary>
+    ///     Unsubscribe from message batch failed events
+    /// </summary>
+    /// <param name="handler">Callback to handle the message batch failed event</param>
+    public void UnsubscribeOnMessageBatchFailed(Func<MessageBatchFailedEventArgs, Task> handler)
+    {
+        _messageBatchErrorAggregator.Unsubscribe(handler);
+    }
+
+    /// <summary>
     ///     Main background processing loop that reads messages from the channel,
     ///     batches them, and sends them periodically or when the batch size is reached.
     /// </summary>
@@ -154,6 +192,17 @@ internal sealed partial class BackgroundMessageProcessor : IAsyncDisposable
         {
             while (!ct.IsCancellationRequested)
             {
+                if (!_canSend)
+                {
+                    LogClientIsDisconnected();
+                    if (!await timer.WaitForNextTickAsync(ct))
+                    {
+                        break;
+                    }
+
+                    continue;
+                }
+
                 while (messageBatch.Count < _config.BackgroundBatchSize &&
                        MessageReader.TryRead(out var message))
                 {
@@ -183,8 +232,8 @@ internal sealed partial class BackgroundMessageProcessor : IAsyncDisposable
         catch (Exception ex)
         {
             LogBackgroundProcessorError(ex);
-            OnBackgroundError?.Invoke(this,
-                new PublisherErrorEventArgs(ex, "Unexpected error in background message processor"));
+            _backgroundErrorAggregator.Publish(new PublisherErrorEventArgs(ex,
+                "Unexpected error in background message processor"));
         }
         finally
         {
@@ -210,7 +259,7 @@ internal sealed partial class BackgroundMessageProcessor : IAsyncDisposable
             catch (Exception ex)
             {
                 LogFailedToSendBatch(ex, messageBatch.Count);
-                OnMessageBatchFailed?.Invoke(this, new MessageBatchFailedEventArgs(ex, messageBatch.ToArray()));
+                _messageBatchErrorAggregator.Publish(new MessageBatchFailedEventArgs(ex, messageBatch.ToArray()));
             }
 
             return;
@@ -248,15 +297,48 @@ internal sealed partial class BackgroundMessageProcessor : IAsyncDisposable
                     else
                     {
                         // Ensure we don't exceed TimeSpan.MaxValue
-                        delay = TimeSpan.FromMilliseconds(
-                            Math.Min(nextDelayMs, TimeSpan.MaxValue.TotalMilliseconds));
+                        delay = TimeSpan.FromMilliseconds(Math.Min(nextDelayMs, TimeSpan.MaxValue.TotalMilliseconds));
                     }
                 }
             }
         }
 
         LogFailedToSendBatchAfterRetries(lastException!, messageBatch.Count, _config.MaxRetryAttempts + 1);
-        OnMessageBatchFailed?.Invoke(this,
-            new MessageBatchFailedEventArgs(lastException!, messageBatch.ToArray(), _config.MaxRetryAttempts));
+        _messageBatchErrorAggregator.Publish(new MessageBatchFailedEventArgs(lastException!,
+            messageBatch.ToArray(), _config.MaxRetryAttempts));
+    }
+
+    private Task ClientOnOnConnectionStateChanged(ConnectionStateChangedEventArgs e)
+    {
+        if (e.CurrentState is ConnectionState.Disconnected
+            or ConnectionState.Connecting
+            or ConnectionState.Connected
+            or ConnectionState.Authenticating)
+        {
+            _canSend = false;
+        }
+
+        if (e.CurrentState == ConnectionState.Authenticated)
+        {
+            _canSend = true;
+        }
+
+        return Task.CompletedTask;
+    }
+
+    private void ClientOnOnConnectionStateChanged(object? sender, ConnectionStateChangedEventArgs e)
+    {
+        if (e.CurrentState is ConnectionState.Disconnected
+            or ConnectionState.Connecting
+            or ConnectionState.Connected
+            or ConnectionState.Authenticating)
+        {
+            _canSend = false;
+        }
+
+        if (e.CurrentState == ConnectionState.Authenticated)
+        {
+            _canSend = true;
+        }
     }
 }

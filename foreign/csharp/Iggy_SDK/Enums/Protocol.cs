@@ -17,9 +17,18 @@
 
 namespace Apache.Iggy.Enums;
 
+/// <summary>
+///     The protocol used to connect to the server.
+/// </summary>
 public enum Protocol
 {
+    /// <summary>
+    ///     HTTP protocol.
+    /// </summary>
     Http,
-    Tcp,
-    Quic
+
+    /// <summary>
+    ///     TCP protocol.
+    /// </summary>
+    Tcp
 }

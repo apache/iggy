@@ -17,8 +17,18 @@
 
 namespace Apache.Iggy.Contracts.Auth;
 
+/// <summary>
+///     Permissions for a user.
+/// </summary>
 public sealed class Permissions
 {
+    /// <summary>
+    ///     Global permissions applied to all streams.
+    /// </summary>
     public required GlobalPermissions Global { get; init; }
+
+    /// <summary>
+    ///     Permissions applied to specific streams.
+    /// </summary>
     public Dictionary<int, StreamPermissions>? Streams { get; init; }
 }

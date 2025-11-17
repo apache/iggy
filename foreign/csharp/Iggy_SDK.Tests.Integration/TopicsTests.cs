@@ -71,7 +71,7 @@ public class TopicsTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task Create_DuplicateTopic_Should_Throw_InvalidResponse(Protocol protocol)
     {
-        await Should.ThrowAsync<InvalidResponseException>(Fixture.Clients[protocol].CreateTopicAsync(
+        await Should.ThrowAsync<IggyInvalidStatusCodeException>(Fixture.Clients[protocol].CreateTopicAsync(
             Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)), TopicRequest.Name,
             TopicRequest.PartitionsCount, TopicRequest.CompressionAlgorithm, TopicRequest.ReplicationFactor,
             TopicRequest.MessageExpiry, TopicRequest.MaxTopicSize));
@@ -277,7 +277,7 @@ public class TopicsTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task Delete_NonExistingTopic_Should_Throw_InvalidResponse(Protocol protocol)
     {
-        await Should.ThrowAsync<InvalidResponseException>(Fixture.Clients[protocol].DeleteTopicAsync(
+        await Should.ThrowAsync<IggyInvalidStatusCodeException>(Fixture.Clients[protocol].DeleteTopicAsync(
             Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
             Identifier.String("topic-to-delete")));
     }

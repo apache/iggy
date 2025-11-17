@@ -15,12 +15,18 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Apache.Iggy.Enums;
+using System.Text.Json.Serialization;
+using Apache.Iggy.JsonConverters;
+using Apache.Iggy.Kinds;
+using Apache.Iggy.Messages;
 
-namespace Apache.Iggy.Configuration;
+namespace Apache.Iggy.Contracts.Http;
 
-public sealed class MessagePollingSettings
+[JsonConverter(typeof(MessagesConverter))]
+internal sealed class MessageSendRequest
 {
-    public TimeSpan Interval { get; set; }
-    public StoreOffset StoreOffsetStrategy { get; set; }
+    public required Identifier StreamId { get; init; }
+    public required Identifier TopicId { get; init; }
+    public required Partitioning Partitioning { get; init; }
+    public required IList<Message> Messages { get; init; }
 }
