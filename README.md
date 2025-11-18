@@ -26,7 +26,7 @@
 
 ---
 
-**Iggy** is a persistent message streaming platform written in Rust, supporting QUIC, TCP (custom binary specification) and HTTP (regular REST API) transport protocols, **capable of processing millions of messages per second at ultra-low latency**.
+**Iggy** is a persistent message streaming platform written in Rust, supporting QUIC, WebSocket, TCP (custom binary specification) and HTTP (regular REST API) transport protocols, **capable of processing millions of messages per second at ultra-low latency**.
 
 Iggy provides **exceptionally high throughput and performance** while utilizing minimal computing resources.
 
@@ -45,7 +45,7 @@ The name is an abbreviation for the Italian Greyhound - small yet extremely fast
 - **Low latency and predictable resource usage** thanks to the Rust compiled language (no GC) and `io_uring`.
 - **User authentication and authorization** with granular permissions and Personal Access Tokens (PAT)
 - Support for multiple streams, topics and partitions
-- Support for **multiple transport protocols** (QUIC, TCP, HTTP)
+- Support for **multiple transport protocols** (QUIC, WebSocket, TCP, HTTP)
 - Fully operational RESTful API which can be optionally enabled
 - Available client SDK in multiple languages
 - **Thread per core shared nothing design** together with `io_uring` guarantee the best possible performance on modern `Linux` systems.
@@ -63,7 +63,7 @@ The name is an abbreviation for the Italian Greyhound - small yet extremely fast
 - **Message expiry** with auto deletion based on the configurable **retention policy**
 - Additional features such as **server side message deduplication**
 - **Multi-tenant** support via abstraction of **streams** which group **topics**
-- **TLS** support for all transport protocols (TCP, QUIC, HTTPS)
+- **TLS** support for all transport protocols (TCP, WebSocket, QUIC, HTTPS)
 - **[Connectors](https://github.com/apache/iggy/tree/master/core/connectors)** - sinks, sources and data transformations based on the **custom Rust plugins**
 - **[Model Context Protocol](https://github.com/apache/iggy/tree/master/core/ai/mcp)** - provide context to LLM with **MCP server**
 - Optional server-side as well as client-side **data encryption** using AES-256-GCM
@@ -282,7 +282,7 @@ To quickly generate the sample data:
 
 *Please note that all commands below are using `iggy` binary, which is part of release (`cli` sub-crate).*
 
-Create a stream with name `dev` (numerical ID will be assigned by server automatically) using default credentials and `tcp` transport (available transports: `quic`, `tcp`, `http`, default `tcp`):
+Create a stream with name `dev` (numerical ID will be assigned by server automatically) using default credentials and `tcp` transport (available transports: `quic`, `websocket`, `tcp`, `http`, default `tcp`):
 
 `cargo run --bin iggy -- --transport tcp --username <iggy_username> --password <iggy_password> stream create dev`
 
@@ -455,7 +455,7 @@ These benchmarks would start the server with the default configuration, create a
 
 For example, to run the benchmark for the already started server, provide the additional argument `--server-address 0.0.0.0:8090`.
 
- **Iggy is already capable of processing millions of messages per second at the microseconds range for p99+ latency** Depending on the hardware, transport protocol (`quic`, `tcp` or `http`) and payload size (`messages-per-batch * message-size`) you might expect **over 5000 MB/s (e.g. 5M of 1 KB msg/sec) throughput for writes and reads**.
+ **Iggy is already capable of processing millions of messages per second at the microseconds range for p99+ latency** Depending on the hardware, transport protocol (`quic`, `websocket`, `tcp` or `http`) and payload size (`messages-per-batch * message-size`) you might expect **over 5000 MB/s (e.g. 5M of 1 KB msg/sec) throughput for writes and reads**.
 
 Please refer to the mentioned [benchmarking platform](https://benchmarks.iggy.apache.org) where you can browse the results achieved on the different hardware configurations, using the different Iggy server versions.
 
