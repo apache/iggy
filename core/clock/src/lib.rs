@@ -14,25 +14,11 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use clock::Clock;
 
-pub trait Project<U, T, C>
-where
-    C: Consensus<T>,
-    T: Clock,
-{
-    fn project(self, consensus: &C) -> U;
-}
-
-pub trait Consensus<C>
-where
-    Self: Sized,
-    C: Clock,
-{
-    type RequestMessage: Project<Self::ReplicateMessage, C, Self>;
-    type ReplicateMessage: Project<Self::AckMessage, C, Self>;
-    type AckMessage;
+pub trait Clock {
+    type Realtime;
+    fn realtime(&self) -> Self::Realtime;
 }
 
 mod impls;
-pub use impls::*;
+pub use impls::IggySystemClock;

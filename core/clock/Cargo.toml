@@ -1,0 +1,7 @@
+[package]
+name = "clock"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+iggy_common = { workspace = true }

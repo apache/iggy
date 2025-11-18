@@ -29,5 +29,7 @@ repository = "https://github.com/apache/iggy"
 readme = "../../../README.md"
 
 [dependencies]
+clock = { path = "../clock" }
 consensus = { path = "../consensus" }
+tracing = { workspace = true }
 
