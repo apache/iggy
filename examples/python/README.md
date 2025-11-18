@@ -30,7 +30,7 @@ IGGY_HTTP_ENABLED=true IGGY_TCP_ADDRESS=0.0.0.0:8090 cargo run --bin iggy-server
 and then install Python dependencies:
 
 ```bash
-pip -r requirements.txt
+pip install -r requirements.txt
 ```
 
 ## Basic Examples
@@ -49,8 +49,8 @@ python getting-started/consumer.py
 Core functionality with detailed configuration options:
 
 ```bash
-python basic/producer.py <connection_string>
-python basic/consumer.py <connection_string>
+python basic/producer.py
+python basic/consumer.py
 ```
 
 Demonstrates fundamental client connection, authentication, batch message sending, and polling with support for TCP/QUIC/HTTP protocols.
