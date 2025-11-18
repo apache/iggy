@@ -95,9 +95,12 @@ runs:
         # Build all targets first
         cargo build --locked --all-targets
 
-        # Run tests with nextest for better parallelization and output
-        # nextest automatically uses all available cores and provides better test output
-        cargo nextest run --locked --no-fail-fast
+        # Use nextest if available, otherwise use cargo test
+        if command -v cargo-nextest &> /dev/null; then
+          cargo nextest run --locked --no-fail-fast
+        else
+          cargo test --locked --no-fail-fast
+        fi
       shell: bash
 
     - name: Backwards compatibility check
