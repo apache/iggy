@@ -33,7 +33,7 @@ import java.util.concurrent.CompletableFuture;
  * Async TCP implementation of users client.
  */
 public class UsersTcpClient implements UsersClient {
-    private static final Logger logger = LoggerFactory.getLogger(UsersTcpClient.class);
+    private static final Logger log = LoggerFactory.getLogger(UsersTcpClient.class);
 
     private final AsyncTcpConnection connection;
 
@@ -57,30 +57,28 @@ public class UsersTcpClient implements UsersClient {
         payload.writeIntLE(context.length());
         payload.writeBytes(context.getBytes());
 
-        logger.debug("Logging in user: {}", username);
+        log.debug("Logging in user: {}", username);
 
-        return connection.sendAsync(CommandCode.User.LOGIN.getValue(), payload)
-            .thenApply(response -> {
-                try {
-                    // Read the user ID from response (4-byte unsigned int LE)
-                    var userId = response.readUnsignedIntLE();
-                    return new IdentityInfo(userId, Optional.empty());
-                } finally {
-                    response.release();
-                }
-            });
+        return connection.sendAsync(CommandCode.User.LOGIN.getValue(), payload).thenApply(response -> {
+            try {
+                // Read the user ID from response (4-byte unsigned int LE)
+                var userId = response.readUnsignedIntLE();
+                return new IdentityInfo(userId, Optional.empty());
+            } finally {
+                response.release();
+            }
+        });
     }
 
     @Override
     public CompletableFuture<Void> logoutAsync() {
         var payload = Unpooled.buffer(0); // Empty payload for logout
 
-        logger.debug("Logging out");
+        log.debug("Logging out");
 
-        return connection.sendAsync(CommandCode.User.LOGOUT.getValue(), payload)
-            .thenAccept(response -> {
-                response.release();
-                logger.debug("Logged out successfully");
-            });
+        return connection.sendAsync(CommandCode.User.LOGOUT.getValue(), payload).thenAccept(response -> {
+            response.release();
+            log.debug("Logged out successfully");
+        });
     }
 }

@@ -21,18 +21,45 @@ using Apache.Iggy.JsonConverters;
 
 namespace Apache.Iggy.Contracts;
 
+/// <summary>
+///     Information about a stream.
+/// </summary>
 public sealed class StreamResponse
 {
+    /// <summary>
+    ///     Stream identifier.
+    /// </summary>
     public required uint Id { get; init; }
+
+    /// <summary>
+    ///     Unique stream name.
+    /// </summary>
     public required string Name { get; init; }
 
+    /// <summary>
+    ///     Stream size in bytes.
+    /// </summary>
     [JsonConverter(typeof(SizeConverter))]
     public required ulong Size { get; init; }
 
+    /// <summary>
+    ///     Stream creation date.
+    /// </summary>
     [JsonConverter(typeof(DateTimeOffsetConverter))]
     public required DateTimeOffset CreatedAt { get; init; }
 
+    /// <summary>
+    ///     Number of messages in the stream.
+    /// </summary>
     public required ulong MessagesCount { get; init; }
+
+    /// <summary>
+    ///     Number of topics in the stream.
+    /// </summary>
     public required int TopicsCount { get; init; }
+
+    /// <summary>
+    ///     List of topics in the stream.
+    /// </summary>
     public IEnumerable<TopicResponse> Topics { get; init; } = [];
 }

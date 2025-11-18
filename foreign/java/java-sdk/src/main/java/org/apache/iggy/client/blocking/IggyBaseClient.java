@@ -38,5 +38,4 @@ public interface IggyBaseClient {
     MessagesClient messages();
 
     PersonalAccessTokensClient personalAccessTokens();
-
 }

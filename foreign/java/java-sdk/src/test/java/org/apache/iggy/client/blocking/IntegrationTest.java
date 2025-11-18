@@ -20,19 +20,21 @@
 package org.apache.iggy.client.blocking;
 
 import org.apache.iggy.stream.StreamDetails;
-import org.junit.jupiter.api.BeforeEach;
-import org.junit.jupiter.api.BeforeAll;
-import org.junit.jupiter.api.AfterEach;
+import org.apache.iggy.topic.CompressionAlgorithm;
 import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.BeforeEach;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.testcontainers.containers.GenericContainer;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.utility.DockerImageName;
-import org.apache.iggy.topic.CompressionAlgorithm;
+
 import java.math.BigInteger;
-import java.util.List;
 import java.util.ArrayList;
+import java.util.List;
+
 import static java.util.Optional.empty;
 import static org.apache.iggy.TestConstants.STREAM_NAME;
 import static org.apache.iggy.TestConstants.TOPIC_NAME;
@@ -40,18 +42,16 @@ import static org.apache.iggy.TestConstants.TOPIC_NAME;
 @Testcontainers
 public abstract class IntegrationTest {
 
-    private static final Logger log = LoggerFactory.getLogger(IntegrationTest.class);
-
     public static final int HTTP_PORT = 3000;
     public static final int TCP_PORT = 8090;
-
-    private static final boolean USE_EXTERNAL_SERVER = System.getenv("USE_EXTERNAL_SERVER") != null;
-
     protected static GenericContainer<?> iggyServer;
+    private static final Logger log = LoggerFactory.getLogger(IntegrationTest.class);
+    private static final boolean USE_EXTERNAL_SERVER = System.getenv("USE_EXTERNAL_SERVER") != null;
 
     // Track created resources for cleanup
     protected List<Long> createdStreamIds = new ArrayList<>();
     protected List<Long> createdUserIds = new ArrayList<>();
+    protected IggyBaseClient client;
 
     @BeforeAll
     static void setupContainer() {
@@ -81,8 +81,6 @@ public abstract class IntegrationTest {
         }
     }
 
-    protected IggyBaseClient client;
-
     @BeforeEach
     void beforeEachIntegrationTest() {
         client = getClient();
@@ -100,7 +98,7 @@ public abstract class IntegrationTest {
         // Login as root to ensure we have permissions for cleanup
         try {
             login();
-        } catch (Exception e) {
+        } catch (RuntimeException e) {
             // Already logged in or login failed - continue with cleanup anyway
         }
 
@@ -108,7 +106,7 @@ public abstract class IntegrationTest {
         for (Long streamId : createdStreamIds) {
             try {
                 client.streams().deleteStream(streamId);
-            } catch (Exception e) {
+            } catch (RuntimeException e) {
                 // Stream might already be deleted or doesn't exist - ignore
             }
         }
@@ -119,13 +117,13 @@ public abstract class IntegrationTest {
                 if (userId != 0) { // Don't try to delete root user
                     client.users().deleteUser(userId);
                 }
-            } catch (Exception e) {
+            } catch (RuntimeException e) {
                 // User might already be deleted or doesn't exist - ignore
             }
         }
     }
 
-    abstract protected IggyBaseClient getClient();
+    protected abstract IggyBaseClient getClient();
 
     protected void setUpStream() {
         StreamDetails stream = client.streams().createStream(STREAM_NAME.getName());
@@ -135,7 +133,8 @@ public abstract class IntegrationTest {
     protected void setUpStreamAndTopic() {
         setUpStream();
         client.topics()
-                .createTopic(STREAM_NAME,
+                .createTopic(
+                        STREAM_NAME,
                         1L,
                         CompressionAlgorithm.None,
                         BigInteger.ZERO,
@@ -161,5 +160,4 @@ public abstract class IntegrationTest {
             createdUserIds.add(userId);
         }
     }
-
 }

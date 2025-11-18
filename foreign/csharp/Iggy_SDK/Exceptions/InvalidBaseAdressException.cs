@@ -17,9 +17,12 @@
 
 namespace Apache.Iggy.Exceptions;
 
-internal sealed class InvalidBaseAdressException : Exception
+/// <summary>
+///     Invalid Base Address Exception
+/// </summary>
+public sealed class InvalidBaseAddressException : Exception
 {
-    internal InvalidBaseAdressException() : base("Invalid Base Address, use ':' only to describe the port")
+    internal InvalidBaseAddressException() : base("Invalid Base Address, use ':' only to describe the port")
     {
     }
 }

@@ -21,7 +21,7 @@ package org.apache.iggy.identifier;
 
 import javax.annotation.Nullable;
 
-public class UserId extends Identifier {
+public final class UserId extends Identifier {
 
     private UserId(@Nullable String name, @Nullable Long id) {
         super(name, id);
@@ -34,5 +34,4 @@ public class UserId extends Identifier {
     public static UserId of(Long id) {
         return new UserId(null, id);
     }
-
 }

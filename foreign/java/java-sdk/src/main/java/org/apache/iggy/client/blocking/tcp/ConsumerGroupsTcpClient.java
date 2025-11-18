@@ -27,9 +27,11 @@ import org.apache.iggy.consumergroup.ConsumerGroupDetails;
 import org.apache.iggy.identifier.ConsumerId;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
+
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+
 import static org.apache.iggy.client.blocking.tcp.BytesDeserializer.readConsumerGroup;
 import static org.apache.iggy.client.blocking.tcp.BytesDeserializer.readConsumerGroupDetails;
 import static org.apache.iggy.client.blocking.tcp.BytesSerializer.nameToBytes;
@@ -106,5 +108,4 @@ class ConsumerGroupsTcpClient implements ConsumerGroupsClient {
 
         tcpClient.send(CommandCode.ConsumerGroup.LEAVE, payload);
     }
-
 }

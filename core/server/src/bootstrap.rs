@@ -43,12 +43,16 @@ use crate::{
     state::system::{StreamState, TopicState, UserState},
     streaming::{
         partitions::{
-            consumer_offset::ConsumerOffset, helpers::create_message_deduplicator,
-            journal::MemoryMessageJournal, log::SegmentedLog, partition,
-            storage::load_consumer_offsets,
+            consumer_offset::ConsumerOffset,
+            helpers::create_message_deduplicator,
+            journal::MemoryMessageJournal,
+            log::SegmentedLog,
+            partition,
+            storage::{load_consumer_group_offsets, load_consumer_offsets},
         },
         persistence::persister::{FilePersister, FileWithSyncPersister, PersisterKind},
         personal_access_tokens::personal_access_token::PersonalAccessToken,
+        polling_consumer::ConsumerGroupId,
         segments::{Segment, storage::Storage},
         stats::{PartitionStats, StreamStats, TopicStats},
         storage::SystemStorage,
@@ -63,7 +67,7 @@ use ahash::HashMap;
 use compio::{fs::create_dir_all, runtime::Runtime};
 use err_trail::ErrContext;
 use iggy_common::{
-    ConsumerKind, IggyByteSize, IggyError,
+    IggyByteSize, IggyError,
     defaults::{
         DEFAULT_ROOT_USERNAME, MAX_PASSWORD_LENGTH, MAX_USERNAME_LENGTH, MIN_PASSWORD_LENGTH,
         MIN_USERNAME_LENGTH,
@@ -690,7 +694,7 @@ async fn load_partition(
         config.get_consumer_group_offsets_path(stream_id, topic_id, partition_id as usize);
 
     let consumer_offset = Arc::new(
-        load_consumer_offsets(&consumer_offset_path, ConsumerKind::Consumer)?
+        load_consumer_offsets(&consumer_offset_path)?
             .into_iter()
             .map(|offset| (offset.consumer_id as usize, offset))
             .collect::<HashMap<usize, ConsumerOffset>>()
@@ -698,10 +702,9 @@ async fn load_partition(
     );
 
     let consumer_group_offset = Arc::new(
-        load_consumer_offsets(&consumer_group_offsets_path, ConsumerKind::ConsumerGroup)?
+        load_consumer_group_offsets(&consumer_group_offsets_path)?
             .into_iter()
-            .map(|offset| (offset.consumer_id as usize, offset))
-            .collect::<HashMap<usize, ConsumerOffset>>()
+            .collect::<HashMap<ConsumerGroupId, ConsumerOffset>>()
             .into(),
     );
 

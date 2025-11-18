@@ -19,11 +19,13 @@
 
 package org.apache.iggy.client.blocking;
 
-import org.junit.jupiter.api.BeforeEach;
-import org.junit.jupiter.api.Test;
 import org.apache.iggy.identifier.TopicId;
 import org.apache.iggy.topic.CompressionAlgorithm;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+
 import java.math.BigInteger;
+
 import static java.util.Optional.empty;
 import static org.apache.iggy.TestConstants.STREAM_NAME;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -43,13 +45,8 @@ public abstract class TopicsClientBaseTest extends IntegrationTest {
     @Test
     void shouldCreateAndDeleteTopic() {
         // when
-        var topicDetails = topicsClient.createTopic(STREAM_NAME,
-                1L,
-                CompressionAlgorithm.None,
-                BigInteger.ZERO,
-                BigInteger.ZERO,
-                empty(),
-                "test-topic");
+        var topicDetails = topicsClient.createTopic(
+                STREAM_NAME, 1L, CompressionAlgorithm.None, BigInteger.ZERO, BigInteger.ZERO, empty(), "test-topic");
         var topicId = TopicId.of("test-topic");
         var topicOptional = topicsClient.getTopic(STREAM_NAME, topicId);
 
@@ -68,16 +65,12 @@ public abstract class TopicsClientBaseTest extends IntegrationTest {
     @Test
     void shouldUpdateTopic() {
         // given
-        var topic = topicsClient.createTopic(STREAM_NAME,
-                1L,
-                CompressionAlgorithm.None,
-                BigInteger.ZERO,
-                BigInteger.ZERO,
-                empty(),
-                "test-topic");
+        var topic = topicsClient.createTopic(
+                STREAM_NAME, 1L, CompressionAlgorithm.None, BigInteger.ZERO, BigInteger.ZERO, empty(), "test-topic");
 
         // when
-        topicsClient.updateTopic(STREAM_NAME,
+        topicsClient.updateTopic(
+                STREAM_NAME,
                 TopicId.of(topic.id()),
                 CompressionAlgorithm.None,
                 BigInteger.valueOf(5000),
@@ -86,7 +79,8 @@ public abstract class TopicsClientBaseTest extends IntegrationTest {
                 "new-name");
 
         // then
-        var updatedTopic = topicsClient.getTopic(STREAM_NAME, TopicId.of(topic.id())).get();
+        var updatedTopic =
+                topicsClient.getTopic(STREAM_NAME, TopicId.of(topic.id())).get();
         assertThat(updatedTopic.name()).isEqualTo("new-name");
         assertThat(updatedTopic.messageExpiry()).isEqualTo(BigInteger.valueOf(5000));
     }
@@ -99,5 +93,4 @@ public abstract class TopicsClientBaseTest extends IntegrationTest {
         // then
         assertThat(topic).isEmpty();
     }
-
 }

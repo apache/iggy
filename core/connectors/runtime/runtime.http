@@ -1,0 +1,173 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+@url = http://localhost:8081
+@sink_key = stdout
+@sink_version = 0
+@source_key = random
+@source_version = 0
+
+###
+GET {{url}}
+
+###
+GET {{url}}/health
+
+###
+GET {{url}}/sinks
+
+###
+GET {{url}}/sinks/{{sink_key}}
+
+###
+GET {{url}}/sinks/{{sink_key}}/configs
+
+###
+POST {{url}}/sinks/{{sink_key}}/configs
+Content-Type: application/json
+
+{
+    "enabled": true,
+    "name": "Stdout sink",
+    "path": "target/release/libiggy_connector_stdout_sink",
+    "transforms": {
+      "add_fields": {
+        "enabled": true,
+        "fields": [
+          {
+            "key": "message",
+            "value": {
+              "static": "hello"
+            }
+          }
+        ]
+      }
+    },
+    "streams": [
+      {
+        "stream": "example_stream",
+        "topics": [
+          "example_topic"
+        ],
+        "schema": "json",
+        "batch_length": 100,
+        "poll_interval": "5ms",
+        "consumer_group": "stdout_sink_connector"
+      }
+    ],
+    "plugin_config_format": null,
+    "plugin_config": {
+      "print_payload": false
+    }
+  }
+
+###
+GET {{url}}/sinks/{{sink_key}}/configs/{{sink_version}}
+
+###
+DELETE {{url}}/sinks/{{sink_key}}/configs?version={{sink_version}}
+
+###
+GET {{url}}/sinks/{{sink_key}}/configs/active
+
+###
+PUT {{url}}/sinks/{{sink_key}}/configs/active
+Content-Type: application/json
+
+{
+  "version": {{sink_version}}
+}
+
+###
+GET {{url}}/sinks/{{sink_key}}/configs/plugin
+
+###
+GET {{url}}/sinks/{{sink_key}}/transforms
+
+###
+GET {{url}}/sources
+
+###
+GET {{url}}/sources/{{source_key}}
+
+###
+GET {{url}}/sources/{{source_key}}/configs
+
+###
+POST {{url}}/sources/{{source_key}}/configs
+Content-Type: application/json
+
+{
+  "enabled": true,
+  "name": "Random source",
+  "path": "target/release/libiggy_connector_random_source",
+  "transforms": {
+    "add_fields": {
+      "enabled": true,
+      "fields": [
+        {
+          "key": "test_field",
+          "value": {
+            "static": "hello!"
+          }
+        }
+      ]
+    }
+  },
+  "streams": [
+    {
+      "stream": "example_stream",
+      "topic": "example_topic",
+      "schema": "json",
+      "batch_length": 1000,
+      "linger_time": "5ms"
+    }
+  ],
+  "plugin_config_format": "json",
+  "plugin_config": {
+    "interval": "1000ms",
+    "max_count": 1000000,
+    "messages_range": [
+      1,
+      5
+    ],
+    "payload_size": 200
+  }
+}
+
+###
+GET {{url}}/sources/{{source_key}}/configs/{{source_version}}
+
+###
+DELETE {{url}}/sources/{{source_key}}/configs?version={{source_version}}
+
+###
+GET {{url}}/sources/{{source_key}}/configs/active
+
+###
+PUT {{url}}/sources/{{source_key}}/configs/active
+Content-Type: application/json
+
+{
+  "version": {{source_version}}
+}
+
+###
+GET {{url}}/sources/{{source_key}}/configs/plugin
+
+###
+GET {{url}}/sources/{{source_key}}/transforms

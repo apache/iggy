@@ -31,7 +31,7 @@ namespace Apache.Iggy.Consumers;
 /// </summary>
 public class IggyConsumerBuilder
 {
-    protected EventHandler<ConsumerErrorEventArgs>? OnPollingError;
+    internal Func<ConsumerErrorEventArgs, Task>? OnPollingError { get; set; }
     internal IggyConsumerConfig Config { get; set; } = new();
     internal IIggyClient? IggyClient { get; set; }
 
@@ -90,9 +90,10 @@ public class IggyConsumerBuilder
     /// <param name="password">The password for authentication.</param>
     /// <param name="receiveBufferSize">The size of the receive buffer.</param>
     /// <param name="sendBufferSize">The size of the send buffer.</param>
+    /// <param name="reconnectionSettings">Reconnection settings for the client.</param>
     /// <returns>The current instance of <see cref="IggyConsumerBuilder" /> to allow method chaining.</returns>
     public IggyConsumerBuilder WithConnection(Protocol protocol, string address, string login, string password,
-        int receiveBufferSize = 4096, int sendBufferSize = 4096)
+        int receiveBufferSize = 4096, int sendBufferSize = 4096, ReconnectionSettings? reconnectionSettings = null)
     {
         Config.Protocol = protocol;
         Config.Address = address;
@@ -100,6 +101,7 @@ public class IggyConsumerBuilder
         Config.Password = password;
         Config.ReceiveBufferSize = receiveBufferSize;
         Config.SendBufferSize = sendBufferSize;
+        Config.ReconnectionSettings = reconnectionSettings;
 
         return this;
     }
@@ -211,7 +213,7 @@ public class IggyConsumerBuilder
     /// </summary>
     /// <param name="handler">The event handler to handle polling errors.</param>
     /// <returns>The current instance of <see cref="IggyConsumerBuilder" /> to allow method chaining.</returns>
-    public IggyConsumerBuilder SubscribeOnPollingError(EventHandler<ConsumerErrorEventArgs> handler)
+    public IggyConsumerBuilder SubscribeOnPollingError(Func<ConsumerErrorEventArgs, Task> handler)
     {
         OnPollingError = handler;
         return this;
@@ -234,17 +236,18 @@ public class IggyConsumerBuilder
                 Protocol = Config.Protocol,
                 BaseAddress = Config.Address,
                 ReceiveBufferSize = Config.ReceiveBufferSize,
-                SendBufferSize = Config.SendBufferSize
+                SendBufferSize = Config.SendBufferSize,
+                ReconnectionSettings = Config.ReconnectionSettings ?? new(),
+                LoggerFactory = Config.LoggerFactory ?? NullLoggerFactory.Instance
             });
         }
 
-        var consumer = new IggyConsumer(IggyClient!, Config,
-            Config.LoggerFactory?.CreateLogger<IggyConsumer>() ??
-            NullLoggerFactory.Instance.CreateLogger<IggyConsumer>());
+        var loggerFactory = Config.LoggerFactory ?? NullLoggerFactory.Instance;
+        var consumer = new IggyConsumer(IggyClient!, Config, loggerFactory);
 
         if (OnPollingError != null)
         {
-            consumer.OnPollingError += OnPollingError;
+            consumer.SubscribeToErrorEvents(OnPollingError);
         }
 
         return consumer;

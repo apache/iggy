@@ -49,6 +49,7 @@ public class BasicMessagingOperationsSteps
             Protocol = Protocol.Tcp
         });
 
+        await _context.IggyClient.ConnectAsync();
         await _context.IggyClient.PingAsync();
     }
 

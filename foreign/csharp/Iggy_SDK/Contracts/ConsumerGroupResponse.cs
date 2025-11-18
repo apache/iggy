@@ -17,11 +17,33 @@
 
 namespace Apache.Iggy.Contracts;
 
+/// <summary>
+///     Consumer group details.
+/// </summary>
 public sealed class ConsumerGroupResponse
 {
+    /// <summary>
+    ///     Consumer group identifier.
+    /// </summary>
     public required uint Id { get; init; }
+
+    /// <summary>
+    ///     Consumer group name.
+    /// </summary>
     public required string Name { get; init; }
+
+    /// <summary>
+    ///     Number of members in the consumer group.
+    /// </summary>
     public required uint MembersCount { get; init; }
+
+    /// <summary>
+    ///     Number of partitions in the consumer group.
+    /// </summary>
     public required uint PartitionsCount { get; init; }
+
+    /// <summary>
+    ///     List of members in the consumer group.
+    /// </summary>
     public List<ConsumerGroupMember>? Members { get; init; }
 }

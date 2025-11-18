@@ -40,8 +40,7 @@ public class IggySinkBuilder<T> implements Serializable {
     private SerializationSchema<T> serializer;
     private int batchSize = 100;
     private Duration flushInterval = Duration.ofSeconds(5);
-    private IggySinkWriter.PartitioningStrategy partitioningStrategy =
-            IggySinkWriter.PartitioningStrategy.BALANCED;
+    private IggySinkWriter.PartitioningStrategy partitioningStrategy = IggySinkWriter.PartitioningStrategy.BALANCED;
 
     /**
      * Sets the connection configuration.
@@ -143,8 +142,7 @@ public class IggySinkBuilder<T> implements Serializable {
      * @param partitioningStrategy the partitioning strategy
      * @return this builder
      */
-    public IggySinkBuilder<T> setPartitioningStrategy(
-            IggySinkWriter.PartitioningStrategy partitioningStrategy) {
+    public IggySinkBuilder<T> setPartitioningStrategy(IggySinkWriter.PartitioningStrategy partitioningStrategy) {
         this.partitioningStrategy = partitioningStrategy;
         return this;
     }
@@ -189,13 +187,7 @@ public class IggySinkBuilder<T> implements Serializable {
         validate();
 
         return new IggySink<>(
-                connectionConfig,
-                streamId,
-                topicId,
-                serializer,
-                batchSize,
-                flushInterval,
-                partitioningStrategy);
+                connectionConfig, streamId, topicId, serializer, batchSize, flushInterval, partitioningStrategy);
     }
 
     /**

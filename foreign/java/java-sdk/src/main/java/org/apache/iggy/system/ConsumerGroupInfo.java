@@ -19,9 +19,4 @@
 
 package org.apache.iggy.system;
 
-public record ConsumerGroupInfo(
-        Long streamId,
-        Long topicId,
-        Long consumerGroupId
-) {
-}
+public record ConsumerGroupInfo(Long streamId, Long topicId, Long consumerGroupId) {}

@@ -58,7 +58,7 @@ public class StreamsTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task CreateStream_Duplicate_Should_Throw_InvalidResponse(Protocol protocol)
     {
-        await Should.ThrowAsync<InvalidResponseException>(Fixture.Clients[protocol]
+        await Should.ThrowAsync<IggyInvalidStatusCodeException>(Fixture.Clients[protocol]
             .CreateStreamAsync(Name.GetWithProtocol(protocol)));
     }
 
@@ -229,7 +229,7 @@ public class StreamsTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task DeleteStream_NotExists_Should_Throw_InvalidResponse(Protocol protocol)
     {
-        await Should.ThrowAsync<InvalidResponseException>(() =>
+        await Should.ThrowAsync<IggyInvalidStatusCodeException>(() =>
             Fixture.Clients[protocol].DeleteStreamAsync(Identifier.String("stream-to-delete".GetWithProtocol(protocol))));
     }
 

@@ -29,9 +29,14 @@ public record ClientInfoDetails(
         String address,
         String transport,
         Long consumerGroupsCount,
-        List<ConsumerGroupInfo> consumerGroups
-) {
+        List<ConsumerGroupInfo> consumerGroups) {
     public ClientInfoDetails(ClientInfo clientInfo, ArrayList<ConsumerGroupInfo> consumerGroups) {
-        this(clientInfo.clientId(), clientInfo.userId(), clientInfo.address(), clientInfo.transport(), clientInfo.consumerGroupsCount(), consumerGroups);
+        this(
+                clientInfo.clientId(),
+                clientInfo.userId(),
+                clientInfo.address(),
+                clientInfo.transport(),
+                clientInfo.consumerGroupsCount(),
+                consumerGroups);
     }
 }

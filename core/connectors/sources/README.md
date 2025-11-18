@@ -26,13 +26,15 @@ Each source connector is configured in its own separate configuration file withi
 
 ```rust
 pub struct SourceConfig {
+    pub key: String,
     pub enabled: bool,
+    pub version: u64,
     pub name: String,
     pub path: String,
     pub transforms: Option<TransformsConfig>,
     pub streams: Vec<StreamProducerConfig>,
-    pub config_format: ConfigFormat,
-    pub config: Option<serde_json::Value>,
+    pub plugin_config_format: Option<ConfigFormat>,
+    pub plugin_config: Option<serde_json::Value>,
 }
 ```
 
@@ -40,6 +42,7 @@ pub struct SourceConfig {
 
 ```toml
 [connectors]
+config_type = "local"
 config_dir = "path/to/connectors"
 ```
 
@@ -48,9 +51,11 @@ config_dir = "path/to/connectors"
 ```toml
 # Type of connector (sink or source)
 type = "source"
+key = "random" # Unique source ID
 
 # Required configuration for a source connector
 enabled = true # Toggle source on/off
+version = 0
 name = "Random source" # Name of the source
 path = "libiggy_connector_random_source" # Path to the source connector
 config_format = "toml"
@@ -63,8 +68,8 @@ schema = "json"
 batch_length = 100
 linger_time = "5ms"
 
-# Custom configuration for the source connector, deserialized to type T from `config` field
-[config]
+# Custom configuration for the source connector, deserialized to type T from `plugin_config` field
+[plugin_config]
 messages_count = 10
 
 # Optional data transformation(s) to be applied before sending messages to the stream
@@ -75,6 +80,16 @@ enabled = true
 [[transforms.add_fields.fields]]
 key = "message"
 value.static = "hello"
+```
+
+### Environment Variable Overrides
+
+Configuration properties can be overridden using environment variables. The pattern follows: `IGGY_CONNECTORS_SOURCE_[KEY]_[PROPERTY]`
+
+For example, to override the `enabled` property for a source with ID `random`:
+
+```bash
+IGGY_CONNECTORS_SOURCE_RANDOM_ENABLED=false
 ```
 
 ## Sample implementation

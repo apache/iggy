@@ -67,6 +67,28 @@ public class IggyPublisherTests
     }
 
     [Test]
+    [SkipHttp]
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task InitAsync_NewClient_Should_Initialize_Successfully(Protocol protocol)
+    {
+        var client = Fixture.GetIggyAddress(protocol); ;
+
+        var stream = Guid.NewGuid().ToString();
+        var topic = Guid.NewGuid().ToString();
+
+        var publisher = IggyPublisherBuilder
+            .Create(Identifier.String(stream), Identifier.String(topic))
+            .CreateStreamIfNotExists(stream)
+            .CreateTopicIfNotExists(topic)
+            .WithConnection(protocol, client, "iggy", "iggy")
+            .WithPartitioning(Partitioning.PartitionId(1))
+            .Build();
+
+        await Should.NotThrowAsync(() => publisher.InitAsync());
+        await publisher.DisposeAsync();
+    }
+
+    [Test]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task InitAsync_CalledTwice_Should_NotThrow(Protocol protocol)
     {

@@ -5,7 +5,7 @@
   import { z } from 'zod';
   import ModalBase from './ModalBase.svelte';
   import { setError, superForm, defaults } from 'sveltekit-superforms/client';
-  import { zod } from 'sveltekit-superforms/adapters';
+  import { zod4 } from 'sveltekit-superforms/adapters';
   import PasswordInput from '../PasswordInput.svelte';
   import Button from '../Button.svelte';
   import PermissionsManager from '../PermissionsManager.svelte';
@@ -28,9 +28,9 @@
     permissions: z.any().nullable().default(null)
   });
 
-  const { form, errors, enhance, constraints } = superForm(defaults(zod(schema)), {
+  const { form, errors, enhance, constraints } = superForm(defaults(zod4(schema)), {
     SPA: true,
-    validators: zod(schema),
+    validators: zod4(schema),
     taintedMessage: false,
 
     async onUpdate({ form }) {
@@ -114,6 +114,7 @@
       <PasswordInput
         label="Password"
         name="password"
+        autocomplete="new-password"
         errorMessage={$errors.password?.[0]}
         bind:value={$form.password}
         {...$constraints.password}

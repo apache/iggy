@@ -69,7 +69,7 @@ public class PartitionsTests
     {
         await Fixture.Clients[protocol].DeleteTopicAsync(Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
             Identifier.String(Fixture.TopicRequest.Name));
-        await Should.ThrowAsync<InvalidResponseException>(() =>
+        await Should.ThrowAsync<IggyInvalidStatusCodeException>(() =>
             Fixture.Clients[protocol].DeletePartitionsAsync(
                 Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
                 Identifier.String(Fixture.TopicRequest.Name), 1));
@@ -82,7 +82,7 @@ public class PartitionsTests
     {
         await Fixture.Clients[protocol]
             .DeleteStreamAsync(Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)));
-        await Should.ThrowAsync<InvalidResponseException>(() =>
+        await Should.ThrowAsync<IggyInvalidStatusCodeException>(() =>
             Fixture.Clients[protocol].DeletePartitionsAsync(
                 Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
                 Identifier.String(Fixture.TopicRequest.Name), 1));

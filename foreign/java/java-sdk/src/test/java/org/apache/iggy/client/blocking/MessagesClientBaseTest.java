@@ -26,8 +26,10 @@ import org.apache.iggy.message.PollingKind;
 import org.apache.iggy.message.PollingStrategy;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+
 import java.math.BigInteger;
 import java.util.List;
+
 import static java.util.Optional.empty;
 import static org.apache.iggy.TestConstants.STREAM_NAME;
 import static org.apache.iggy.TestConstants.TOPIC_NAME;
@@ -53,8 +55,14 @@ public abstract class MessagesClientBaseTest extends IntegrationTest {
         String text = "message from java sdk";
         messagesClient.sendMessages(STREAM_NAME, TOPIC_NAME, Partitioning.partitionId(0L), List.of(Message.of(text)));
 
-        var polledMessages = messagesClient.pollMessages(STREAM_NAME, TOPIC_NAME, empty(), Consumer.of(0L),
-                new PollingStrategy(PollingKind.Last, BigInteger.TEN), 10L, false);
+        var polledMessages = messagesClient.pollMessages(
+                STREAM_NAME,
+                TOPIC_NAME,
+                empty(),
+                Consumer.of(0L),
+                new PollingStrategy(PollingKind.Last, BigInteger.TEN),
+                10L,
+                false);
 
         // then
         assertThat(polledMessages.messages()).hasSize(1);
@@ -69,8 +77,14 @@ public abstract class MessagesClientBaseTest extends IntegrationTest {
         String text = "message from java sdk";
         messagesClient.sendMessages(STREAM_NAME, TOPIC_NAME, Partitioning.balanced(), List.of(Message.of(text)));
 
-        var polledMessages = messagesClient.pollMessages(STREAM_NAME, TOPIC_NAME, empty(), Consumer.of(0L),
-                new PollingStrategy(PollingKind.Last, BigInteger.TEN), 10L, false);
+        var polledMessages = messagesClient.pollMessages(
+                STREAM_NAME,
+                TOPIC_NAME,
+                empty(),
+                Consumer.of(0L),
+                new PollingStrategy(PollingKind.Last, BigInteger.TEN),
+                10L,
+                false);
 
         // then
         assertThat(polledMessages.messages()).hasSize(1);
@@ -83,12 +97,18 @@ public abstract class MessagesClientBaseTest extends IntegrationTest {
 
         // when
         String text = "message from java sdk";
-        messagesClient.sendMessages(STREAM_NAME, TOPIC_NAME, Partitioning.messagesKey("test-key"), List.of(Message.of(text)));
-        var polledMessages = messagesClient.pollMessages(STREAM_NAME, TOPIC_NAME, empty(), Consumer.of(0L),
-                new PollingStrategy(PollingKind.Last, BigInteger.TEN), 10L, false);
+        messagesClient.sendMessages(
+                STREAM_NAME, TOPIC_NAME, Partitioning.messagesKey("test-key"), List.of(Message.of(text)));
+        var polledMessages = messagesClient.pollMessages(
+                STREAM_NAME,
+                TOPIC_NAME,
+                empty(),
+                Consumer.of(0L),
+                new PollingStrategy(PollingKind.Last, BigInteger.TEN),
+                10L,
+                false);
 
         // then
         assertThat(polledMessages.messages()).hasSize(1);
     }
-
 }

@@ -30,8 +30,11 @@ import java.util.List;
 /**
  * Simple utility to send test messages to Iggy for WordCountJob testing.
  */
-public class SendTestMessages {
-    public static void main(String[] args) throws Exception {
+public final class SendTestMessages {
+
+    private SendTestMessages() {}
+
+    public static void main(String[] args) {
         String serverAddress = System.getenv().getOrDefault("IGGY_SERVER", "localhost:3000");
         String username = System.getenv().getOrDefault("IGGY_USERNAME", "iggy");
         String password = System.getenv().getOrDefault("IGGY_PASSWORD", "iggy");
@@ -58,12 +61,12 @@ public class SendTestMessages {
         // Send messages using stream/topic names
         System.out.println("\nSending messages to text-input/lines...");
         for (String text : messages) {
-            client.messages().sendMessages(
-                StreamId.of("text-input"),
-                TopicId.of("lines"),
-                Partitioning.balanced(),
-                List.of(Message.of(text))
-            );
+            client.messages()
+                    .sendMessages(
+                            StreamId.of("text-input"),
+                            TopicId.of("lines"),
+                            Partitioning.balanced(),
+                            List.of(Message.of(text)));
             System.out.println("✓ Sent: " + text);
         }
 

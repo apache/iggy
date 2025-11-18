@@ -24,7 +24,14 @@ import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.Partitioning;
-import org.junit.jupiter.api.*;
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.MethodOrderer;
+import org.junit.jupiter.api.Order;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.TestInstance;
+import org.junit.jupiter.api.TestMethodOrder;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -52,7 +59,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
 class AsyncTcpMessageSendTest {
 
-    private static final Logger LOG = LoggerFactory.getLogger(AsyncTcpMessageSendTest.class);
+    private static final Logger log = LoggerFactory.getLogger(AsyncTcpMessageSendTest.class);
 
     private static final String IGGY_SERVER_HOST = "localhost";
     private static final int IGGY_SERVER_TCP_PORT = 8090;
@@ -62,8 +69,8 @@ class AsyncTcpMessageSendTest {
     private AsyncIggyTcpClient client;
 
     @BeforeAll
-    void setUp() throws Exception {
-        LOG.info("Setting up Async TCP Client...");
+    void setUp() {
+        log.info("Setting up Async TCP Client...");
 
         // Create client with credentials for auto-login
         client = AsyncIggyTcpClient.builder()
@@ -74,7 +81,7 @@ class AsyncTcpMessageSendTest {
 
         // Connect - this will also auto-login with the provided credentials
         client.connect().join();
-        LOG.info("Connected to Iggy server at {}:{}", IGGY_SERVER_HOST, IGGY_SERVER_TCP_PORT);
+        log.info("Connected to Iggy server at {}:{}", IGGY_SERVER_HOST, IGGY_SERVER_TCP_PORT);
     }
 
     @AfterAll
@@ -82,16 +89,16 @@ class AsyncTcpMessageSendTest {
         if (client != null) {
             try {
                 client.users().logoutAsync().join();
-                LOG.info("Logged out successfully");
-            } catch (Exception e) {
-                LOG.warn("Error during logout: {}", e.getMessage());
+                log.info("Logged out successfully");
+            } catch (RuntimeException e) {
+                log.warn("Error during logout: {}", e.getMessage());
             }
 
             try {
                 client.close().join();
-                LOG.info("Disconnected from Iggy server");
-            } catch (Exception e) {
-                LOG.warn("Error during disconnect: {}", e.getMessage());
+                log.info("Disconnected from Iggy server");
+            } catch (RuntimeException e) {
+                log.warn("Error during disconnect: {}", e.getMessage());
             }
         }
     }
@@ -100,7 +107,7 @@ class AsyncTcpMessageSendTest {
     @Order(1)
     @DisplayName("Send single text message")
     void testSendSingleMessage() throws ExecutionException, InterruptedException {
-        LOG.info("Test: Send single text message");
+        log.info("Test: Send single text message");
 
         StreamId streamId = StreamId.of("text-input");
         TopicId topicId = TopicId.of("lines");
@@ -111,16 +118,12 @@ class AsyncTcpMessageSendTest {
         List<Message> messages = new ArrayList<>();
         messages.add(message);
 
-        CompletableFuture<Void> sendFuture = client.messages().sendMessagesAsync(
-                streamId,
-                topicId,
-                Partitioning.balanced(),
-                messages
-        );
+        CompletableFuture<Void> sendFuture =
+                client.messages().sendMessagesAsync(streamId, topicId, Partitioning.balanced(), messages);
 
         sendFuture.get();
 
-        LOG.info("Successfully sent message: {}", messageContent);
+        log.info("Successfully sent message: {}", messageContent);
         assertThat(sendFuture).isCompleted();
     }
 
@@ -128,7 +131,7 @@ class AsyncTcpMessageSendTest {
     @Order(2)
     @DisplayName("Send batch of messages")
     void testSendBatchMessages() throws ExecutionException, InterruptedException {
-        LOG.info("Test: Send batch of messages");
+        log.info("Test: Send batch of messages");
 
         StreamId streamId = StreamId.of("text-input");
         TopicId topicId = TopicId.of("lines");
@@ -141,15 +144,11 @@ class AsyncTcpMessageSendTest {
             messages.add(Message.of(content));
         }
 
-        CompletableFuture<Void> sendFuture = client.messages().sendMessagesAsync(
-                streamId,
-                topicId,
-                Partitioning.balanced(),
-                messages
-        );
+        CompletableFuture<Void> sendFuture =
+                client.messages().sendMessagesAsync(streamId, topicId, Partitioning.balanced(), messages);
         sendFuture.get();
 
-        LOG.info("Successfully sent batch of {} messages", batchSize);
+        log.info("Successfully sent batch of {} messages", batchSize);
         assertThat(sendFuture).isCompleted();
     }
 
@@ -157,7 +156,7 @@ class AsyncTcpMessageSendTest {
     @Order(3)
     @DisplayName("Send message to specific partition")
     void testSendToSpecificPartition() throws ExecutionException, InterruptedException {
-        LOG.info("Test: Send message to specific partition");
+        log.info("Test: Send message to specific partition");
 
         StreamId streamId = StreamId.of("text-input");
         TopicId topicId = TopicId.of("lines");
@@ -169,15 +168,11 @@ class AsyncTcpMessageSendTest {
         List<Message> messages = new ArrayList<>();
         messages.add(message);
 
-        CompletableFuture<Void> sendFuture = client.messages().sendMessagesAsync(
-                streamId,
-                topicId,
-                Partitioning.partitionId(targetPartition),
-                messages
-        );
+        CompletableFuture<Void> sendFuture = client.messages()
+                .sendMessagesAsync(streamId, topicId, Partitioning.partitionId(targetPartition), messages);
         sendFuture.get();
 
-        LOG.info("Successfully sent message to partition {}", targetPartition);
+        log.info("Successfully sent message to partition {}", targetPartition);
         assertThat(sendFuture).isCompleted();
     }
 
@@ -185,7 +180,7 @@ class AsyncTcpMessageSendTest {
     @Order(4)
     @DisplayName("Send messages using message key partitioning")
     void testSendWithMessageKey() throws ExecutionException, InterruptedException {
-        LOG.info("Test: Send messages using message key partitioning");
+        log.info("Test: Send messages using message key partitioning");
 
         StreamId streamId = StreamId.of("text-input");
         TopicId topicId = TopicId.of("lines");
@@ -197,15 +192,11 @@ class AsyncTcpMessageSendTest {
         messages.add(message);
 
         String messageKey = "test-key-123";
-        CompletableFuture<Void> sendFuture = client.messages().sendMessagesAsync(
-                streamId,
-                topicId,
-                Partitioning.messagesKey(messageKey),
-                messages
-        );
+        CompletableFuture<Void> sendFuture =
+                client.messages().sendMessagesAsync(streamId, topicId, Partitioning.messagesKey(messageKey), messages);
         sendFuture.get();
 
-        LOG.info("Successfully sent message with key: {}", messageKey);
+        log.info("Successfully sent message with key: {}", messageKey);
         assertThat(sendFuture).isCompleted();
     }
 
@@ -213,30 +204,23 @@ class AsyncTcpMessageSendTest {
     @Order(5)
     @DisplayName("Send JSON-like messages")
     void testSendJsonMessages() throws ExecutionException, InterruptedException {
-        LOG.info("Test: Send JSON messages");
+        log.info("Test: Send JSON messages");
 
         StreamId streamId = StreamId.of("text-input");
         TopicId topicId = TopicId.of("lines");
 
         String jsonPayload = String.format(
-                "{\"sensor_id\":\"sensor-001\",\"temperature\":%.2f,\"timestamp\":\"%s\"}",
-                23.5,
-                Instant.now()
-        );
+                "{\"sensor_id\":\"sensor-001\",\"temperature\":%.2f,\"timestamp\":\"%s\"}", 23.5, Instant.now());
 
         Message message = Message.of(jsonPayload);
         List<Message> messages = new ArrayList<>();
         messages.add(message);
 
-        CompletableFuture<Void> sendFuture = client.messages().sendMessagesAsync(
-                streamId,
-                topicId,
-                Partitioning.balanced(),
-                messages
-        );
+        CompletableFuture<Void> sendFuture =
+                client.messages().sendMessagesAsync(streamId, topicId, Partitioning.balanced(), messages);
         sendFuture.get();
 
-        LOG.info("Successfully sent JSON message: {}", jsonPayload);
+        log.info("Successfully sent JSON message: {}", jsonPayload);
         assertThat(sendFuture).isCompleted();
     }
 
@@ -244,7 +228,7 @@ class AsyncTcpMessageSendTest {
     @Order(6)
     @DisplayName("Send multiple messages in parallel")
     void testSendMultipleMessagesInParallel() throws ExecutionException, InterruptedException {
-        LOG.info("Test: Send multiple messages in parallel");
+        log.info("Test: Send multiple messages in parallel");
 
         StreamId streamId = StreamId.of("text-input");
         TopicId topicId = TopicId.of("lines");
@@ -258,21 +242,15 @@ class AsyncTcpMessageSendTest {
             List<Message> messages = new ArrayList<>();
             messages.add(message);
 
-            CompletableFuture<Void> future = client.messages().sendMessagesAsync(
-                    streamId,
-                    topicId,
-                    Partitioning.balanced(),
-                    messages
-            );
+            CompletableFuture<Void> future =
+                    client.messages().sendMessagesAsync(streamId, topicId, Partitioning.balanced(), messages);
             futures.add(future);
         }
 
-        CompletableFuture<Void> allFutures = CompletableFuture.allOf(
-                futures.toArray(new CompletableFuture[0])
-        );
+        CompletableFuture<Void> allFutures = CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]));
         allFutures.get();
 
-        LOG.info("Successfully sent {} messages in parallel", parallelRequests);
+        log.info("Successfully sent {} messages in parallel", parallelRequests);
         assertThat(allFutures).isCompleted();
     }
 
@@ -280,7 +258,7 @@ class AsyncTcpMessageSendTest {
     @Order(7)
     @DisplayName("Send large batch of messages")
     void testSendLargeBatch() throws ExecutionException, InterruptedException {
-        LOG.info("Test: Send large batch of messages");
+        log.info("Test: Send large batch of messages");
 
         StreamId streamId = StreamId.of("text-input");
         TopicId topicId = TopicId.of("lines");
@@ -293,16 +271,12 @@ class AsyncTcpMessageSendTest {
         }
 
         long startTime = System.currentTimeMillis();
-        CompletableFuture<Void> sendFuture = client.messages().sendMessagesAsync(
-                streamId,
-                topicId,
-                Partitioning.balanced(),
-                messages
-        );
+        CompletableFuture<Void> sendFuture =
+                client.messages().sendMessagesAsync(streamId, topicId, Partitioning.balanced(), messages);
         sendFuture.get();
         long duration = System.currentTimeMillis() - startTime;
 
-        LOG.info("Successfully sent {} messages in {}ms", batchSize, duration);
+        log.info("Successfully sent {} messages in {}ms", batchSize, duration);
         assertThat(sendFuture).isCompleted();
     }
 }

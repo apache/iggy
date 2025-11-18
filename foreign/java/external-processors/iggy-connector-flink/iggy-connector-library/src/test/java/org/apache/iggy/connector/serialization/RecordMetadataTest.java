@@ -19,9 +19,9 @@
 
 package org.apache.iggy.connector.serialization;
 
-import static org.assertj.core.api.Assertions.assertThat;
-
 import org.junit.jupiter.api.Test;
+
+import static org.assertj.core.api.Assertions.assertThat;
 
 class RecordMetadataTest {
 

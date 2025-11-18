@@ -21,7 +21,6 @@ plugins {
     id("java-library")
     id("maven-publish")
     id("signing")
-    id("checkstyle")
 }
 
 group = "org.apache.iggy"
@@ -45,11 +44,6 @@ signing {
     val signingPassword: String? by project
     useInMemoryPgpKeys(signingKey, signingPassword)
     sign(publishing.publications)
-}
-
-checkstyle {
-    toolVersion = "10.23.1"
-    configFile = file("../dev-support/checkstyle/checkstyle.xml")
 }
 
 dependencies {

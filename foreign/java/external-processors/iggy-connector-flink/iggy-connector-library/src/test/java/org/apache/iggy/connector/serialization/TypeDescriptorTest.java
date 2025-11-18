@@ -19,13 +19,14 @@
 
 package org.apache.iggy.connector.serialization;
 
-import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import org.junit.jupiter.api.Test;
 
 import java.lang.reflect.ParameterizedType;
 import java.lang.reflect.Type;
 import java.util.List;
-import org.junit.jupiter.api.Test;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class TypeDescriptorTest {
 
@@ -42,7 +43,7 @@ class TypeDescriptorTest {
         Type genericType = new ParameterizedType() {
             @Override
             public Type[] getActualTypeArguments() {
-                return new Type[]{String.class};
+                return new Type[] {String.class};
             }
 
             @Override
@@ -117,7 +118,7 @@ class TypeDescriptorTest {
         Type genericType1 = new ParameterizedType() {
             @Override
             public Type[] getActualTypeArguments() {
-                return new Type[]{String.class};
+                return new Type[] {String.class};
             }
 
             @Override
@@ -134,7 +135,7 @@ class TypeDescriptorTest {
         Type genericType2 = new ParameterizedType() {
             @Override
             public Type[] getActualTypeArguments() {
-                return new Type[]{Integer.class};
+                return new Type[] {Integer.class};
             }
 
             @Override

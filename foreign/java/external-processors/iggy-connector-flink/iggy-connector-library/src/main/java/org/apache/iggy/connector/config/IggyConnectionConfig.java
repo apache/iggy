@@ -19,6 +19,9 @@
 
 package org.apache.iggy.connector.config;
 
+import org.apache.commons.lang3.builder.EqualsBuilder;
+import org.apache.commons.lang3.builder.HashCodeBuilder;
+
 import java.io.Serializable;
 import java.time.Duration;
 import java.util.Objects;
@@ -116,31 +119,37 @@ public final class IggyConnectionConfig implements Serializable {
         if (this == o) {
             return true;
         }
+
         if (o == null || getClass() != o.getClass()) {
             return false;
         }
+
         IggyConnectionConfig that = (IggyConnectionConfig) o;
-        return maxRetries == that.maxRetries
-                && enableTls == that.enableTls
-                && Objects.equals(serverAddress, that.serverAddress)
-                && Objects.equals(username, that.username)
-                && Objects.equals(password, that.password)
-                && Objects.equals(connectionTimeout, that.connectionTimeout)
-                && Objects.equals(requestTimeout, that.requestTimeout)
-                && Objects.equals(retryBackoff, that.retryBackoff);
+
+        return new EqualsBuilder()
+                .append(maxRetries, that.maxRetries)
+                .append(enableTls, that.enableTls)
+                .append(serverAddress, that.serverAddress)
+                .append(username, that.username)
+                .append(password, that.password)
+                .append(connectionTimeout, that.connectionTimeout)
+                .append(requestTimeout, that.requestTimeout)
+                .append(retryBackoff, that.retryBackoff)
+                .isEquals();
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(
-                serverAddress,
-                username,
-                password,
-                connectionTimeout,
-                requestTimeout,
-                maxRetries,
-                retryBackoff,
-                enableTls);
+        return new HashCodeBuilder(17, 37)
+                .append(serverAddress)
+                .append(username)
+                .append(password)
+                .append(connectionTimeout)
+                .append(requestTimeout)
+                .append(maxRetries)
+                .append(retryBackoff)
+                .append(enableTls)
+                .toHashCode();
     }
 
     @Override
@@ -159,7 +168,6 @@ public final class IggyConnectionConfig implements Serializable {
     /**
      * Builder for {@link IggyConnectionConfig}.
      */
-    @SuppressWarnings("checkstyle:HiddenField")
     public static final class Builder {
         private String serverAddress;
         private String username;
@@ -170,8 +178,7 @@ public final class IggyConnectionConfig implements Serializable {
         private Duration retryBackoff = Duration.ofMillis(100);
         private boolean enableTls = false;
 
-        private Builder() {
-        }
+        private Builder() {}
 
         public Builder serverAddress(String serverAddress) {
             this.serverAddress = serverAddress;

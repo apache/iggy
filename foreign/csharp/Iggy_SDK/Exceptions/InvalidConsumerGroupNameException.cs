@@ -17,8 +17,14 @@
 
 namespace Apache.Iggy.Exceptions;
 
+/// <summary>
+///     Exception thrown when a consumer group name is invalid
+/// </summary>
 public class InvalidConsumerGroupNameException : Exception
 {
+    /// <summary>
+    ///     Initializes a new instance of the <see cref="InvalidConsumerGroupNameException" /> class.
+    /// </summary>
     public InvalidConsumerGroupNameException(string message) : base(message)
     {
     }

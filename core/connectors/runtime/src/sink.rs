@@ -17,7 +17,7 @@
  * under the License.
  */
 
-use crate::configs::SinkConfig;
+use crate::configs::connectors::SinkConfig;
 use crate::{
     PLUGIN_ID, RuntimeError, SinkApi, SinkConnector, SinkConnectorConsumer, SinkConnectorPlugin,
     SinkConnectorWrapper, resolve_plugin_path, transform,
@@ -54,12 +54,15 @@ pub async fn init(
 
         let plugin_id = PLUGIN_ID.load(Ordering::Relaxed);
         let path = resolve_plugin_path(&config.path);
-        info!("Initializing sink container with name: {name} ({key}), plugin: {path}",);
+        info!(
+            "Initializing sink container with name: {name} ({key}), config version: {}, plugin: {path}",
+            &config.version
+        );
         if let Some(container) = sink_connectors.get_mut(&path) {
             info!("Sink container for plugin: {path} is already loaded.",);
             init_sink(
                 &container.container,
-                &config.config.unwrap_or_default(),
+                &config.plugin_config.unwrap_or_default(),
                 plugin_id,
             );
             container.plugins.push(SinkConnectorPlugin {
@@ -67,14 +70,18 @@ pub async fn init(
                 key: key.to_owned(),
                 name: name.to_owned(),
                 path: path.to_owned(),
-                config_format: config.config_format,
+                config_format: config.plugin_config_format,
                 consumers: vec![],
             });
         } else {
             let container: Container<SinkApi> =
                 unsafe { Container::load(&path).expect("Failed to load sink container") };
             info!("Sink container for plugin: {path} loaded successfully.",);
-            init_sink(&container, &config.config.unwrap_or_default(), plugin_id);
+            init_sink(
+                &container,
+                &config.plugin_config.unwrap_or_default(),
+                plugin_id,
+            );
             sink_connectors.insert(
                 path.to_owned(),
                 SinkConnector {
@@ -84,7 +91,7 @@ pub async fn init(
                         key: key.to_owned(),
                         name: name.to_owned(),
                         path: path.to_owned(),
-                        config_format: config.config_format,
+                        config_format: config.plugin_config_format,
                         consumers: vec![],
                     }],
                 },
@@ -255,9 +262,9 @@ async fn consume_messages(
     Ok(())
 }
 
-fn init_sink(container: &Container<SinkApi>, config: &serde_json::Value, id: u32) {
-    let config = serde_json::to_string(config).expect("Invalid sink config.");
-    (container.open)(id, config.as_ptr(), config.len());
+fn init_sink(container: &Container<SinkApi>, plugin_config: &serde_json::Value, id: u32) {
+    let plugin_config = serde_json::to_string(plugin_config).expect("Invalid sink plugin config.");
+    (container.open)(id, plugin_config.as_ptr(), plugin_config.len());
 }
 
 async fn process_messages(

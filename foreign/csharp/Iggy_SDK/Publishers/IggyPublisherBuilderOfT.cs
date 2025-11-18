@@ -105,12 +105,12 @@ public class IggyPublisherBuilder<T> : IggyPublisherBuilder
 
         if (OnBackgroundError != null)
         {
-            publisher.OnBackgroundError += OnBackgroundError;
+            publisher.SubscribeOnBackgroundError(OnBackgroundError);
         }
 
         if (OnMessageBatchFailed != null)
         {
-            publisher.OnMessageBatchFailed += OnMessageBatchFailed;
+            publisher.SubscribeOnMessageBatchFailed(OnMessageBatchFailed);
         }
 
         return publisher;

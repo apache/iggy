@@ -17,9 +17,23 @@
 
 namespace Apache.Iggy.Contracts;
 
+/// <summary>
+///     Information about consumer offset.
+/// </summary>
 public sealed class OffsetResponse
 {
+    /// <summary>
+    ///     Partition identifier.
+    /// </summary>
     public required int PartitionId { get; init; }
+
+    /// <summary>
+    ///     Current offset.
+    /// </summary>
     public required ulong CurrentOffset { get; init; }
+
+    /// <summary>
+    ///     Stored offset by the consumer in the partition.
+    /// </summary>
     public required ulong StoredOffset { get; init; }
 }

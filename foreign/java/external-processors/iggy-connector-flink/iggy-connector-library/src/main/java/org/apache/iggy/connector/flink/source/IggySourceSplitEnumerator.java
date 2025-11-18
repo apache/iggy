@@ -31,14 +31,19 @@ import org.apache.iggy.topic.TopicDetails;
 
 import javax.annotation.Nullable;
 import java.io.IOException;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
 
 /**
  * Split enumerator for Iggy source.
  * Discovers partitions and assigns them to source readers.
  */
-public class IggySourceSplitEnumerator implements
-        SplitEnumerator<IggySourceSplit, IggySourceEnumeratorState> {
+public class IggySourceSplitEnumerator implements SplitEnumerator<IggySourceSplit, IggySourceEnumeratorState> {
 
     private final SplitEnumeratorContext<IggySourceSplit> context;
     private final AsyncIggyTcpClient asyncClient;
@@ -49,18 +54,18 @@ public class IggySourceSplitEnumerator implements
 
     private final Set<IggySourceSplit> assignedSplits;
     private final Set<Integer> discoveredPartitions;
-    private final Set<String> sentToReaders;  // Track splits already sent to readers
+    private final Set<String> sentToReaders; // Track splits already sent to readers
 
     /**
      * Creates a new split enumerator.
      *
-     * @param context the split enumerator context
-     * @param asyncClient the async Iggy client
-     * @param streamId the stream ID
-     * @param topicId the topic ID
+     * @param context           the split enumerator context
+     * @param asyncClient       the async Iggy client
+     * @param streamId          the stream ID
+     * @param topicId           the topic ID
      * @param consumerGroupName the consumer group name
-     * @param offsetConfig the offset configuration
-     * @param initialState the initial state (for recovery)
+     * @param offsetConfig      the offset configuration
+     * @param initialState      the initial state (for recovery)
      */
     public IggySourceSplitEnumerator(
             SplitEnumeratorContext<IggySourceSplit> context,
@@ -99,7 +104,7 @@ public class IggySourceSplitEnumerator implements
 
     /**
      * Ensures the consumer group exists, creating it if necessary.
-     *
+     * <p>
      * Note: In Iggy SDK async API, consumer group creation is not available.
      * Consumer groups must be created beforehand using the blocking HTTP client
      * or through the setup scripts. The async API only supports joining/leaving
@@ -151,9 +156,8 @@ public class IggySourceSplitEnumerator implements
             TopicId topic = parseTopicId(topicId);
 
             // Get topic details including partitions
-            Optional<TopicDetails> topicDetailsOpt = asyncClient.topics()
-                    .getTopicAsync(stream, topic)
-                    .join();
+            Optional<TopicDetails> topicDetailsOpt =
+                    asyncClient.topics().getTopicAsync(stream, topic).join();
 
             if (topicDetailsOpt.isPresent()) {
                 TopicDetails topicDetails = topicDetailsOpt.get();
@@ -161,26 +165,22 @@ public class IggySourceSplitEnumerator implements
                     for (Partition partition : topicDetails.partitions()) {
                         int partitionId = partition.id().intValue();
 
-                    // Skip if already discovered
-                    if (discoveredPartitions.contains(partitionId)) {
-                        continue;
-                    }
+                        // Skip if already discovered
+                        if (discoveredPartitions.contains(partitionId)) {
+                            continue;
+                        }
 
-                    // Determine starting offset
-                    long startOffset = determineStartOffset(partition);
+                        // Determine starting offset
+                        long startOffset = determineStartOffset(partition);
 
-                    // Create split
-                    IggySourceSplit split = IggySourceSplit.create(
-                            streamId,
-                            topicId,
-                            partitionId,
-                            startOffset);
+                        // Create split
+                        IggySourceSplit split = IggySourceSplit.create(streamId, topicId, partitionId, startOffset);
 
-                    discoveredPartitions.add(partitionId);
+                        discoveredPartitions.add(partitionId);
 
-                    // Check if this split is already assigned
-                    boolean alreadyAssigned = assignedSplits.stream()
-                            .anyMatch(s -> s.getPartitionId() == partitionId);
+                        // Check if this split is already assigned
+                        boolean alreadyAssigned =
+                                assignedSplits.stream().anyMatch(s -> s.getPartitionId() == partitionId);
 
                         if (!alreadyAssigned) {
                             assignedSplits.add(split);
@@ -192,7 +192,7 @@ public class IggySourceSplitEnumerator implements
             // Assign discovered splits to readers
             assignSplits();
 
-        } catch (Exception e) {
+        } catch (RuntimeException e) {
             throw new RuntimeException("Failed to discover partitions", e);
         }
     }
@@ -222,14 +222,12 @@ public class IggySourceSplitEnumerator implements
             int readerIndex = i % readers.size();
             int readerId = readers.get(readerIndex);
 
-            assignments.computeIfAbsent(readerId, k -> new ArrayList<>())
-                    .add(unassignedSplits.get(i));
+            assignments.computeIfAbsent(readerId, k -> new ArrayList<>()).add(unassignedSplits.get(i));
         }
 
         // Assign splits to readers and mark them as sent
         for (Map.Entry<Integer, List<IggySourceSplit>> entry : assignments.entrySet()) {
-            context.assignSplits(new SplitsAssignment<>(
-                    Map.of(entry.getKey(), entry.getValue())));
+            context.assignSplits(new SplitsAssignment<>(Map.of(entry.getKey(), entry.getValue())));
 
             // Mark these splits as sent
             for (IggySourceSplit split : entry.getValue()) {

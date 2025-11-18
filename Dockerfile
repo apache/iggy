@@ -16,12 +16,16 @@
 # under the License.
 
 ARG RUST_VERSION=1.91
-ARG ALPINE_VERSION=3.22
 
-FROM rust:${RUST_VERSION}.0-alpine${ALPINE_VERSION} AS builder
-RUN apk add musl-dev
+FROM rust:${RUST_VERSION}-slim-bookworm AS builder
+
 WORKDIR /build
-COPY . /build
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    pkg-config \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+COPY . .
 RUN cargo build --bin iggy --release
 RUN cargo build --bin iggy-server --release
 

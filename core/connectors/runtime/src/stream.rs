@@ -20,7 +20,8 @@
 use iggy::prelude::{Client, IggyClient, IggyClientBuilder};
 use tracing::{error, info};
 
-use crate::{configs::IggyConfig, error::RuntimeError};
+use crate::configs::runtime::IggyConfig;
+use crate::error::RuntimeError;
 
 pub struct IggyClients {
     pub producer: IggyClient,

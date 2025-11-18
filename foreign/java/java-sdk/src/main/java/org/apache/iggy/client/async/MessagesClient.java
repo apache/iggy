@@ -26,6 +26,7 @@ import org.apache.iggy.message.Message;
 import org.apache.iggy.message.Partitioning;
 import org.apache.iggy.message.PolledMessages;
 import org.apache.iggy.message.PollingStrategy;
+
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
@@ -78,14 +79,13 @@ public interface MessagesClient {
             Long count,
             boolean autoCommit) {
         return pollMessagesAsync(
-            StreamId.of(streamId),
-            TopicId.of(topicId),
-            partitionId,
-            Consumer.of(consumerId),
-            strategy,
-            count,
-            autoCommit
-        );
+                StreamId.of(streamId),
+                TopicId.of(topicId),
+                partitionId,
+                Consumer.of(consumerId),
+                strategy,
+                count,
+                autoCommit);
     }
 
     /**
@@ -98,10 +98,7 @@ public interface MessagesClient {
      * @return CompletableFuture that will complete when messages are sent
      */
     CompletableFuture<Void> sendMessagesAsync(
-            StreamId streamId,
-            TopicId topicId,
-            Partitioning partitioning,
-            List<Message> messages);
+            StreamId streamId, TopicId topicId, Partitioning partitioning, List<Message> messages);
 
     /**
      * Asynchronously sends messages to a topic (convenience method).
@@ -113,15 +110,7 @@ public interface MessagesClient {
      * @return CompletableFuture that will complete when messages are sent
      */
     default CompletableFuture<Void> sendMessagesAsync(
-            Long streamId,
-            Long topicId,
-            Partitioning partitioning,
-            List<Message> messages) {
-        return sendMessagesAsync(
-            StreamId.of(streamId),
-            TopicId.of(topicId),
-            partitioning,
-            messages
-        );
+            Long streamId, Long topicId, Partitioning partitioning, List<Message> messages) {
+        return sendMessagesAsync(StreamId.of(streamId), TopicId.of(topicId), partitioning, messages);
     }
 }

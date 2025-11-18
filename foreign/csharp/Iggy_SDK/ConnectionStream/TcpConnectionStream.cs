@@ -17,7 +17,7 @@
 
 namespace Apache.Iggy.ConnectionStream;
 
-public sealed class TcpConnectionStream : IConnectionStream
+internal sealed class TcpConnectionStream : IConnectionStream
 {
     private readonly Stream _stream;
 

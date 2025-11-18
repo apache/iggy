@@ -17,19 +17,16 @@
 
 namespace Apache.Iggy.Exceptions;
 
+/// <summary>
+///     Exception thrown when a consumer is not initialized.
+/// </summary>
 public sealed class ConsumerNotInitializedException : InvalidOperationException
 {
+    /// <summary>
+    ///     Initializes a new instance of the <see cref="ConsumerNotInitializedException" /> class.
+    /// </summary>
     public ConsumerNotInitializedException()
         : base("Consumer must be initialized before receiving messages. Call InitAsync() first.")
-    {
-    }
-
-    public ConsumerNotInitializedException(string message) : base(message)
-    {
-    }
-
-    public ConsumerNotInitializedException(string message, Exception innerException)
-        : base(message, innerException)
     {
     }
 }

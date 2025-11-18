@@ -34,6 +34,7 @@ username = "iggy"
 password = "iggy"
 
 [connectors]
+config_type = "local"
 config_dir = "path/to/connectors"
 ```
 
@@ -41,7 +42,9 @@ config_dir = "path/to/connectors"
 
 ```toml
 type = "source"
+key = "protobuf"
 enabled = true
+version = 0
 name = "Protobuf Source"
 path = "target/release/libiggy_connector_protobuf_source"
 
@@ -52,7 +55,7 @@ schema = "proto"
 batch_size = 1000
 send_interval = "5ms"
 
-[config]
+[plugin_config]
 schema_path = "schemas/message.proto"
 message_type = "com.example.Message"
 use_any_wrapper = true
@@ -62,7 +65,9 @@ use_any_wrapper = true
 
 ```toml
 type = "sink"
+key = "protobuf"
 enabled = true
+version = 0
 name = "Protobuf Sink"
 path = "target/release/libiggy_connector_protobuf_sink"
 

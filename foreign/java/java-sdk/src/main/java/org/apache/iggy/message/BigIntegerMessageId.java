@@ -21,6 +21,7 @@ package org.apache.iggy.message;
 
 import io.netty.buffer.ByteBuf;
 import org.apache.iggy.client.blocking.tcp.BytesSerializer;
+
 import java.math.BigInteger;
 
 public class BigIntegerMessageId implements MessageId {
@@ -49,5 +50,4 @@ public class BigIntegerMessageId implements MessageId {
     public String toString() {
         return value.toString();
     }
-
 }

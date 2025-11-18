@@ -27,16 +27,21 @@ members = [
     "core/bench/runner",
     "core/binary_protocol",
     "core/cli",
+    "core/clock",
     "core/common",
     "core/connectors/runtime",
     "core/connectors/sdk",
     "core/connectors/sinks/iceberg_sink",
+    "core/connectors/sinks/elasticsearch_sink",
     "core/connectors/sinks/postgres_sink",
     "core/connectors/sinks/quickwit_sink",
     "core/connectors/sinks/stdout_sink",
+    "core/connectors/sources/elasticsearch_source",
     "core/connectors/sources/postgres_source",
     "core/connectors/sources/random_source",
+    "core/consensus",
     "core/integration",
+    "core/metadata",
     "core/sdk",
     "core/server",
     "core/tools",
@@ -65,8 +70,8 @@ async_zip = { version = "0.0.18", features = [
     "deflate",
     "zstd",
 ] }
-axum = { version = "0.8.6", features = ["macros"] }
-axum-server = { version = "0.7.2", features = ["tls-rustls"] }
+axum = { version = "0.8.7", features = ["macros"] }
+axum-server = { version = "0.7.3", features = ["tls-rustls"] }
 base64 = "0.22.1"
 bench-dashboard-frontend = { path = "core/bench/dashboard/frontend" }
 bench-dashboard-server = { path = "core/bench/dashboard/server" }
@@ -81,7 +86,7 @@ byte-unit = { version = "5.1.6", default-features = false, features = [
     "byte",
     "std",
 ] }
-bytes = "1.10.1"
+bytes = "1.11.0"
 charming = "0.6.0"
 chrono = { version = "0.4.42", features = ["serde"] }
 clap = { version = "4.5.51", features = ["derive", "wrap_help"] }
@@ -94,15 +99,13 @@ compio = { version = "0.16.0", features = [
     "time",
     "rustls",
 ] }
-compio-io = "0.8.2"
+compio-io = "0.8.3"
 compio-net = "0.9.0"
 compio-quic = "0.5.1"
 compio-tls = { version = "0.7.1", features = [
     "rustls",
 ], default-features = false }
-compio-ws = { git = "https://github.com/krishvishal/compio-ws", rev = "b30c9e4cd2fe607faa81b4c7eff2d14b6140f15d", features = [
-    "rustls",
-] }
+compio-ws = "0.1.1"
 console-subscriber = "0.5.0"
 crossbeam = "0.8.4"
 cyper = { version = "0.6.2", features = ["rustls"], default-features = false }
@@ -126,9 +129,9 @@ humantime = "2.3.0"
 iceberg = "0.6.0"
 iceberg-catalog-glue = "0.6.0"
 iceberg-catalog-rest = "0.6.0"
-iggy = { path = "core/sdk", version = "0.8.0-edge.3" }
-iggy_binary_protocol = { path = "core/binary_protocol", version = "0.8.0-edge.3" }
-iggy_common = { path = "core/common", version = "0.8.0-edge.3" }
+iggy = { path = "core/sdk", version = "0.8.0-edge.5" }
+iggy_binary_protocol = { path = "core/binary_protocol", version = "0.8.0-edge.5" }
+iggy_common = { path = "core/common", version = "0.8.0-edge.5" }
 iggy_connector_sdk = { path = "core/connectors/sdk", version = "0.1.0" }
 integration = { path = "core/integration" }
 keyring = { version = "3.6.3", features = ["sync-secret-service", "vendored"] }
@@ -158,7 +161,7 @@ rust-s3 = { version = "0.37.0", default-features = false, features = [
 rustls = { version = "0.23.35", features = ["ring"] }
 serde = { version = "1.0.228", features = ["derive", "rc"] }
 serde_json = "1.0.145"
-serde_with = { version = "3.15.1", features = ["base64", "macros"] }
+serde_with = { version = "3.16.0", features = ["base64", "macros"] }
 serde_yaml_ng = "0.10.0"
 serial_test = "3.2.0"
 server = { path = "core/server" }

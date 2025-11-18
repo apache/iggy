@@ -19,13 +19,12 @@
 
 package org.apache.iggy.connector.serialization;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
-import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.DeserializationFeature;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.util.Optional;
@@ -39,7 +38,7 @@ import java.util.function.Function;
  */
 public class JsonSerializationSchema<T> implements SerializationSchema<T> {
 
-	private static final Logger LOG = LoggerFactory.getLogger(JsonSerializationSchema.class);
+    private static final Logger log = LoggerFactory.getLogger(JsonSerializationSchema.class);
 
     private static final long serialVersionUID = 1L;
 
@@ -63,19 +62,6 @@ public class JsonSerializationSchema<T> implements SerializationSchema<T> {
     }
 
     /**
-     * Creates a new JSON serializer with partition key extractor.
-     * Static factory method to avoid constructor ambiguity.
-     *
-     * @param partitionKeyExtractor function to extract partition key from elements
-     * @param <T> the type to serialize
-     * @return new JsonSerializationSchema instance
-     */
-    public static <T> JsonSerializationSchema<T> withPartitionKeyExtractor(
-            Function<T, Integer> partitionKeyExtractor) {
-        return new JsonSerializationSchema<>(partitionKeyExtractor);
-    }
-
-    /**
      * Creates a new JSON serializer with a custom ObjectMapper.
      *
      * @param objectMapper the Jackson ObjectMapper to use
@@ -90,14 +76,24 @@ public class JsonSerializationSchema<T> implements SerializationSchema<T> {
      * @param objectMapper the Jackson ObjectMapper to use
      * @param partitionKeyExtractor function to extract partition key from elements
      */
-    public JsonSerializationSchema(
-            ObjectMapper objectMapper,
-            Function<T, Integer> partitionKeyExtractor) {
+    public JsonSerializationSchema(ObjectMapper objectMapper, Function<T, Integer> partitionKeyExtractor) {
         if (objectMapper == null) {
             throw new IllegalArgumentException("objectMapper cannot be null");
         }
         this.objectMapper = objectMapper;
         this.partitionKeyExtractor = partitionKeyExtractor;
+    }
+
+    /**
+     * Creates a new JSON serializer with partition key extractor.
+     * Static factory method to avoid constructor ambiguity.
+     *
+     * @param partitionKeyExtractor function to extract partition key from elements
+     * @param <T> the type to serialize
+     * @return new JsonSerializationSchema instance
+     */
+    public static <T> JsonSerializationSchema<T> withPartitionKeyExtractor(Function<T, Integer> partitionKeyExtractor) {
+        return new JsonSerializationSchema<>(partitionKeyExtractor);
     }
 
     @Override
@@ -122,7 +118,7 @@ public class JsonSerializationSchema<T> implements SerializationSchema<T> {
                 return Optional.ofNullable(key);
             } catch (RuntimeException e) {
                 // Log and return empty if extraction fails
-				LOG.warn("Failed to extract partitionKey: {}", e.getMessage());
+                log.warn("Failed to extract partitionKey: {}", e.getMessage());
                 return Optional.empty();
             }
         }

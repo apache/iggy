@@ -25,9 +25,11 @@ import org.apache.iggy.client.blocking.StreamsClient;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.stream.StreamBase;
 import org.apache.iggy.stream.StreamDetails;
+
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+
 import static org.apache.iggy.client.blocking.tcp.BytesDeserializer.readStreamBase;
 import static org.apache.iggy.client.blocking.tcp.BytesDeserializer.readStreamDetails;
 import static org.apache.iggy.client.blocking.tcp.BytesSerializer.nameToBytes;
@@ -87,5 +89,4 @@ class StreamsTcpClient implements StreamsClient {
         var payload = toBytes(streamId);
         tcpClient.send(CommandCode.Stream.DELETE, payload);
     }
-
 }

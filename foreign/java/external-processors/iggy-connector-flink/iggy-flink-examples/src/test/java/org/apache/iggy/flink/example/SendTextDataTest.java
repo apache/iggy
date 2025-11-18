@@ -24,11 +24,14 @@ import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.Partitioning;
-import org.junit.jupiter.api.*;
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.TestInstance;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -38,7 +41,7 @@ import java.util.List;
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
 class SendTextDataTest {
 
-    private static final Logger LOG = LoggerFactory.getLogger(SendTextDataTest.class);
+    private static final Logger log = LoggerFactory.getLogger(SendTextDataTest.class);
 
     private static final String IGGY_SERVER_HOST = "localhost";
     private static final int IGGY_SERVER_TCP_PORT = 8090;
@@ -48,8 +51,8 @@ class SendTextDataTest {
     private AsyncIggyTcpClient client;
 
     @BeforeAll
-    void setUp() throws Exception {
-        LOG.info("Setting up Async TCP Client...");
+    void setUp() {
+        log.info("Setting up Async TCP Client...");
 
         client = AsyncIggyTcpClient.builder()
                 .host(IGGY_SERVER_HOST)
@@ -58,7 +61,7 @@ class SendTextDataTest {
                 .build();
 
         client.connect().join();
-        LOG.info("Connected to Iggy server at {}:{}", IGGY_SERVER_HOST, IGGY_SERVER_TCP_PORT);
+        log.info("Connected to Iggy server at {}:{}", IGGY_SERVER_HOST, IGGY_SERVER_TCP_PORT);
     }
 
     @AfterAll
@@ -66,16 +69,16 @@ class SendTextDataTest {
         if (client != null) {
             try {
                 client.users().logoutAsync().join();
-                LOG.info("Logged out successfully");
-            } catch (Exception e) {
-                LOG.warn("Error during logout: {}", e.getMessage());
+                log.info("Logged out successfully");
+            } catch (RuntimeException e) {
+                log.warn("Error during logout: {}", e.getMessage());
             }
 
             try {
                 client.close().join();
-                LOG.info("Disconnected from Iggy server");
-            } catch (Exception e) {
-                LOG.warn("Error during disconnect: {}", e.getMessage());
+                log.info("Disconnected from Iggy server");
+            } catch (RuntimeException e) {
+                log.warn("Error during disconnect: {}", e.getMessage());
             }
         }
     }
@@ -83,37 +86,33 @@ class SendTextDataTest {
     @Test
     @DisplayName("Send sample text lines for word count")
     void testSendSampleTextLines() throws Exception {
-        LOG.info("Sending sample text lines for WordCountJob testing...");
+        log.info("Sending sample text lines for WordCountJob testing...");
 
         StreamId streamId = StreamId.of("text-input");
         TopicId topicId = TopicId.of("lines");
 
         List<String> sampleTexts = List.of(
-            "hello world hello flink",
-            "apache flink connector for iggy",
-            "flink streaming with iggy broker",
-            "hello flink hello world",
-            "real time stream processing",
-            "apache flink word count example",
-            "iggy message broker stream",
-            "flink apache iggy connector test",
-            "hello world stream processing",
-            "apache iggy flink integration"
-        );
+                "hello world hello flink",
+                "apache flink connector for iggy",
+                "flink streaming with iggy broker",
+                "hello flink hello world",
+                "real time stream processing",
+                "apache flink word count example",
+                "iggy message broker stream",
+                "flink apache iggy connector test",
+                "hello world stream processing",
+                "apache iggy flink integration");
 
         List<Message> messages = new ArrayList<>();
         for (String text : sampleTexts) {
             messages.add(Message.of(text));
         }
 
-        client.messages().sendMessagesAsync(
-            streamId,
-            topicId,
-            Partitioning.balanced(),
-            messages
-        ).get();
+        client.messages()
+                .sendMessagesAsync(streamId, topicId, Partitioning.balanced(), messages)
+                .get();
 
-        LOG.info("Successfully sent {} text lines to stream 'text-input', topic 'lines'", messages.size());
+        log.info("Successfully sent {} text lines to stream 'text-input', topic 'lines'", messages.size());
 
         // Send a few more batches to have continuous data
         for (int batch = 1; batch <= 3; batch++) {
@@ -124,16 +123,13 @@ class SendTextDataTest {
                 batchMessages.add(Message.of(text + " batch" + batch));
             }
 
-            client.messages().sendMessagesAsync(
-                streamId,
-                topicId,
-                Partitioning.balanced(),
-                batchMessages
-            ).get();
+            client.messages()
+                    .sendMessagesAsync(streamId, topicId, Partitioning.balanced(), batchMessages)
+                    .get();
 
-            LOG.info("Sent batch {} with {} messages", batch, batchMessages.size());
+            log.info("Sent batch {} with {} messages", batch, batchMessages.size());
         }
 
-        LOG.info("Total messages sent: {}", sampleTexts.size() * 4);
+        log.info("Total messages sent: {}", sampleTexts.size() * 4);
     }
 }

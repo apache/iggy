@@ -17,8 +17,9 @@
  * under the License.
  */
 
-use crate::configs::ConnectorsConfig;
-use configs::{ConfigFormat, ConnectorsRuntimeConfig};
+use crate::configs::connectors::{ConnectorsConfigProvider, create_connectors_config_provider};
+use configs::connectors::ConfigFormat;
+use configs::runtime::ConnectorsRuntimeConfig;
 use dlopen2::wrapper::{Container, WrapperApi};
 use dotenvy::dotenv;
 use error::RuntimeError;
@@ -125,7 +126,10 @@ async fn main() -> Result<(), RuntimeError> {
 
     let iggy_clients = stream::init(config.iggy.clone()).await?;
 
-    let connectors_config = ConnectorsConfig::load_configs(&config.connectors).await?;
+    let connectors_config_provider: Box<dyn ConnectorsConfigProvider> =
+        create_connectors_config_provider(&config.connectors).await?;
+
+    let connectors_config = connectors_config_provider.get_active_configs().await?;
     let sources_config = connectors_config.sources();
     let sources = source::init(
         sources_config.clone(),
@@ -173,10 +177,11 @@ async fn main() -> Result<(), RuntimeError> {
 
     let context = context::init(
         &config,
-        &sinks_config,
-        &sources_config,
+        sinks_config,
+        sources_config,
         &sink_wrappers,
         &source_wrappers,
+        connectors_config_provider,
     );
     let context = Arc::new(context);
     api::init(&config.http, context).await;

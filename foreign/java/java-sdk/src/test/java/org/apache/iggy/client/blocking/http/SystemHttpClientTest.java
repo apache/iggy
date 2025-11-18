@@ -28,5 +28,4 @@ class SystemHttpClientTest extends SystemClientBaseTest {
     protected IggyBaseClient getClient() {
         return HttpClientFactory.create(iggyServer);
     }
-
 }

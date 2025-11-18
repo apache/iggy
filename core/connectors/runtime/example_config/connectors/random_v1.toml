@@ -1,0 +1,44 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+type = "source"
+key = "random"
+enabled = true
+version = 1
+name = "Random source"
+path = "target/release/libiggy_connector_random_source"
+plugin_config_format = "json"
+
+[[streams]]
+stream = "example_stream"
+topic = "example_topic"
+schema = "json"
+batch_length = 1000
+linger_time = "5ms"
+
+[plugin_config]
+interval = "1000ms"
+max_count = 1_000_000
+messages_range = [1, 5]
+payload_size = 200
+
+[transforms.add_fields]
+enabled = true
+
+[[transforms.add_fields.fields]]
+key = "test_field"
+value.static = "hello!"

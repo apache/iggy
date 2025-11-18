@@ -21,7 +21,7 @@ use std::{collections::HashMap, str::FromStr, time::Duration};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use iggy_connector_sdk::{
-    ConnectorState, Error, ProducedMessage, ProducedMessages, Schema, Source, source_connector,
+    Error, ProducedMessage, ProducedMessages, Schema, Source, source_connector,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::{Column, Pool, Postgres, Row, TypeInfo, postgres::PgPoolOptions};
@@ -76,7 +76,7 @@ pub struct DatabaseRecord {
 }
 
 impl PostgresSource {
-    pub fn new(id: u32, config: PostgresSourceConfig, _state: Option<ConnectorState>) -> Self {
+    pub fn new(id: u32, config: PostgresSourceConfig, _state: Option<serde_json::Value>) -> Self {
         PostgresSource {
             id,
             pool: None,

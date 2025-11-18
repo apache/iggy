@@ -63,11 +63,8 @@ public partial class IggyPublisher : IAsyncDisposable
         {
             LogInitializingBackgroundSending(_config.BackgroundQueueCapacity, _config.BackgroundBatchSize);
 
-            ILogger<BackgroundMessageProcessor> processorLogger
-                = _config.LoggerFactory?.CreateLogger<BackgroundMessageProcessor>()
-                  ?? NullLogger<BackgroundMessageProcessor>.Instance;
-
-            _backgroundProcessor = new BackgroundMessageProcessor(_client, _config, processorLogger);
+            var loggerFactory = config.LoggerFactory ?? NullLoggerFactory.Instance;
+            _backgroundProcessor = new BackgroundMessageProcessor(_client, _config, loggerFactory);
         }
     }
 
@@ -86,6 +83,7 @@ public partial class IggyPublisher : IAsyncDisposable
 
         if (_backgroundProcessor != null)
         {
+
             await _backgroundProcessor.DisposeAsync();
         }
 
@@ -107,45 +105,39 @@ public partial class IggyPublisher : IAsyncDisposable
     }
 
     /// <summary>
-    ///     Fired when any error occurs in the background task
+    ///     Subscribe to background error events
     /// </summary>
-    public event EventHandler<PublisherErrorEventArgs>? OnBackgroundError
+    /// <param name="handler">The handler to invoke on background errors</param>
+    public void SubscribeOnBackgroundError(Func<PublisherErrorEventArgs, Task> handler)
     {
-        add
-        {
-            if (_backgroundProcessor != null)
-            {
-                _backgroundProcessor.OnBackgroundError += value;
-            }
-        }
-        remove
-        {
-            if (_backgroundProcessor != null)
-            {
-                _backgroundProcessor.OnBackgroundError -= value;
-            }
-        }
+        _backgroundProcessor?.SubscribeOnBackgroundError(handler);
     }
 
     /// <summary>
-    ///     Fired when a batch of messages fails to send
+    /// Unsubscribe from background error events
     /// </summary>
-    public event EventHandler<MessageBatchFailedEventArgs>? OnMessageBatchFailed
+    /// <param name="handler">The handler to invoke on background errors</param>
+    public void UnsubscribeOnBackgroundError(Func<PublisherErrorEventArgs, Task> handler)
     {
-        add
-        {
-            if (_backgroundProcessor != null)
-            {
-                _backgroundProcessor.OnMessageBatchFailed += value;
-            }
-        }
-        remove
-        {
-            if (_backgroundProcessor != null)
-            {
-                _backgroundProcessor.OnMessageBatchFailed -= value;
-            }
-        }
+        _backgroundProcessor?.UnsubscribeOnBackgroundError(handler);
+    }
+
+    /// <summary>
+    ///     Subscribe to message batch failed events
+    /// </summary>
+    /// <param name="handler">The handler to invoke on message batch failures</param>
+    public void SubscribeOnMessageBatchFailed(Func<MessageBatchFailedEventArgs, Task> handler)
+    {
+        _backgroundProcessor?.SubscribeOnMessageBatchFailed(handler);
+    }
+
+    /// <summary>
+    /// Unsubscribe from message batch failed events
+    /// </summary>
+    /// <param name="handler">The handler to invoke on message batch failures</param>
+    public void UnsubscribeOnMessageBatchFailed(Func<MessageBatchFailedEventArgs, Task> handler)
+    {
+        _backgroundProcessor?.UnsubscribeOnMessageBatchFailed(handler);
     }
 
     /// <summary>
@@ -163,6 +155,7 @@ public partial class IggyPublisher : IAsyncDisposable
             return;
         }
 
+        await _client.ConnectAsync(ct);
 
         LogInitializingPublisher(_config.StreamId, _config.TopicId);
         if (_config.CreateIggyClient)

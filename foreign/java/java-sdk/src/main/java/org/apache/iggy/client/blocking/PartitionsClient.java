@@ -35,5 +35,4 @@ public interface PartitionsClient {
     }
 
     void deletePartitions(StreamId streamId, TopicId topicId, Long partitionsCount);
-
 }

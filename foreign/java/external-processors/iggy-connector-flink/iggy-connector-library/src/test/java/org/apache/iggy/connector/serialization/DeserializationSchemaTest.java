@@ -19,12 +19,13 @@
 
 package org.apache.iggy.connector.serialization;
 
-import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
-import org.junit.jupiter.api.Test;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class DeserializationSchemaTest {
 
@@ -136,7 +137,8 @@ class DeserializationSchemaTest {
             @Override
             public String deserialize(byte[] data, RecordMetadata metadata) {
                 String content = new String(data, StandardCharsets.UTF_8);
-                return String.format("%s:%s:%d:%d:%s",
+                return String.format(
+                        "%s:%s:%d:%d:%s",
                         metadata.getStreamId(),
                         metadata.getTopicId(),
                         metadata.getPartitionId(),

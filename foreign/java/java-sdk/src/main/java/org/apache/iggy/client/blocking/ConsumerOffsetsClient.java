@@ -23,21 +23,25 @@ import org.apache.iggy.consumergroup.Consumer;
 import org.apache.iggy.consumeroffset.ConsumerOffsetInfo;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
+
 import java.math.BigInteger;
 import java.util.Optional;
 
 public interface ConsumerOffsetsClient {
 
-    default void storeConsumerOffset(Long streamId, Long topicId, Optional<Long> partitionId, Long consumerId, BigInteger offset) {
+    default void storeConsumerOffset(
+            Long streamId, Long topicId, Optional<Long> partitionId, Long consumerId, BigInteger offset) {
         storeConsumerOffset(StreamId.of(streamId), TopicId.of(topicId), partitionId, Consumer.of(consumerId), offset);
     }
 
-    void storeConsumerOffset(StreamId streamId, TopicId topicId, Optional<Long> partitionId, Consumer consumer, BigInteger offset);
+    void storeConsumerOffset(
+            StreamId streamId, TopicId topicId, Optional<Long> partitionId, Consumer consumer, BigInteger offset);
 
-    default Optional<ConsumerOffsetInfo> getConsumerOffset(Long streamId, Long topicId, Optional<Long> partitionId, Long consumerId) {
+    default Optional<ConsumerOffsetInfo> getConsumerOffset(
+            Long streamId, Long topicId, Optional<Long> partitionId, Long consumerId) {
         return getConsumerOffset(StreamId.of(streamId), TopicId.of(topicId), partitionId, Consumer.of(consumerId));
     }
 
-    Optional<ConsumerOffsetInfo> getConsumerOffset(StreamId streamId, TopicId topicId, Optional<Long> partitionId, Consumer consumer);
-
+    Optional<ConsumerOffsetInfo> getConsumerOffset(
+            StreamId streamId, TopicId topicId, Optional<Long> partitionId, Consumer consumer);
 }

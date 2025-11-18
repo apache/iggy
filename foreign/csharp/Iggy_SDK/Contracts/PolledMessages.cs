@@ -17,12 +17,29 @@
 
 namespace Apache.Iggy.Contracts;
 
+/// <summary>
+///     Response from the server containing a list of messages and the current offset.
+/// </summary>
 public sealed class PolledMessages
 {
+    /// <summary>
+    ///     Partition identifier for the messages.
+    /// </summary>
     public required int PartitionId { get; init; }
+
+    /// <summary>
+    ///     Current offset for the partition.
+    /// </summary>
     public required ulong CurrentOffset { get; init; }
+
+    /// <summary>
+    ///     List of messages.
+    /// </summary>
     public required IReadOnlyList<MessageResponse> Messages { get; set; }
 
+    /// <summary>
+    ///     Empty polled messages.
+    /// </summary>
     public static PolledMessages Empty =>
         new()
         {

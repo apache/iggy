@@ -1,4 +1,5 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
  * regarding copyright ownership.  The ASF licenses this file
@@ -15,37 +16,46 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-
-use crate::configs::{ConfigFormat, StreamConsumerConfig, TransformsConfig};
-use std::{collections::HashMap, sync::Arc};
+use crate::configs::connectors::{ConfigFormat, SinkConfig};
+use dashmap::DashMap;
+use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::sync::Mutex;
 
 #[derive(Debug)]
 pub struct SinkManager {
-    sinks: Mutex<HashMap<String, Arc<Mutex<SinkDetails>>>>,
+    sinks: DashMap<String, Arc<Mutex<SinkDetails>>>,
 }
 
 impl SinkManager {
     pub fn new(sinks: Vec<SinkDetails>) -> Self {
         Self {
-            sinks: Mutex::new(
+            sinks: DashMap::from_iter(
                 sinks
                     .into_iter()
                     .map(|sink| (sink.info.key.to_owned(), Arc::new(Mutex::new(sink))))
-                    .collect(),
+                    .collect::<HashMap<_, _>>(),
             ),
         }
     }
 
     pub async fn get(&self, key: &str) -> Option<Arc<Mutex<SinkDetails>>> {
-        let sinks = self.sinks.lock().await;
-        sinks.get(key).cloned()
+        self.sinks.get(key).map(|entry| entry.value().clone())
+    }
+
+    pub async fn get_config(&self, key: &str) -> Option<SinkConfig> {
+        if let Some(sink) = self.sinks.get(key).map(|entry| entry.value().clone()) {
+            let sink = sink.lock().await;
+            Some(sink.config.clone())
+        } else {
+            None
+        }
     }
 
     pub async fn get_all(&self) -> Vec<SinkInfo> {
-        let sinks = self.sinks.lock().await;
+        let sinks = &self.sinks;
         let mut results = Vec::with_capacity(sinks.len());
-        for sink in sinks.values() {
+        for sink in sinks.iter().map(|entry| entry.value().clone()) {
             let sink = sink.lock().await;
             results.push(sink.info.clone());
         }
@@ -61,13 +71,11 @@ pub struct SinkInfo {
     pub path: String,
     pub enabled: bool,
     pub running: bool,
-    pub config_format: Option<ConfigFormat>,
+    pub plugin_config_format: Option<ConfigFormat>,
 }
 
 #[derive(Debug)]
 pub struct SinkDetails {
     pub info: SinkInfo,
-    pub transforms: Option<TransformsConfig>,
-    pub streams: Vec<StreamConsumerConfig>,
-    pub config: Option<serde_json::Value>,
+    pub config: SinkConfig,
 }

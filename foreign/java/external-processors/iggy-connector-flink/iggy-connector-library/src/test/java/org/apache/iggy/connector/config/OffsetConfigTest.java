@@ -19,11 +19,12 @@
 
 package org.apache.iggy.connector.config;
 
-import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
-import org.junit.jupiter.api.Test;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class OffsetConfigTest {
 
@@ -72,45 +73,35 @@ class OffsetConfigTest {
 
     @Test
     void shouldThrowExceptionWhenResetStrategyIsNull() {
-        assertThatThrownBy(() -> OffsetConfig.builder()
-                .resetStrategy(null)
-                .build())
+        assertThatThrownBy(() -> OffsetConfig.builder().resetStrategy(null).build())
                 .isInstanceOf(NullPointerException.class)
                 .hasMessageContaining("resetStrategy must not be null");
     }
 
     @Test
     void shouldThrowExceptionWhenCommitIntervalIsNull() {
-        assertThatThrownBy(() -> OffsetConfig.builder()
-                .commitInterval(null)
-                .build())
+        assertThatThrownBy(() -> OffsetConfig.builder().commitInterval(null).build())
                 .isInstanceOf(NullPointerException.class)
                 .hasMessageContaining("commitInterval must not be null");
     }
 
     @Test
     void shouldThrowExceptionWhenCommitBatchSizeIsZero() {
-        assertThatThrownBy(() -> OffsetConfig.builder()
-                .commitBatchSize(0)
-                .build())
+        assertThatThrownBy(() -> OffsetConfig.builder().commitBatchSize(0).build())
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("commitBatchSize must be positive");
     }
 
     @Test
     void shouldThrowExceptionWhenCommitBatchSizeIsNegative() {
-        assertThatThrownBy(() -> OffsetConfig.builder()
-                .commitBatchSize(-1)
-                .build())
+        assertThatThrownBy(() -> OffsetConfig.builder().commitBatchSize(-1).build())
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("commitBatchSize must be positive");
     }
 
     @Test
     void shouldAcceptMinimalCommitBatchSize() {
-        OffsetConfig config = OffsetConfig.builder()
-                .commitBatchSize(1)
-                .build();
+        OffsetConfig config = OffsetConfig.builder().commitBatchSize(1).build();
 
         assertThat(config.getCommitBatchSize()).isEqualTo(1);
     }

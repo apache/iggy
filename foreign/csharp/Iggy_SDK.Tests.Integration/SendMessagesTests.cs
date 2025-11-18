@@ -87,7 +87,7 @@ public class SendMessagesTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task SendMessages_NoHeaders_Should_Throw_InvalidResponse(Protocol protocol)
     {
-        await Should.ThrowAsync<InvalidResponseException>(() =>
+        await Should.ThrowAsync<IggyInvalidStatusCodeException>(() =>
             Fixture.Clients[protocol].SendMessagesAsync(Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
                 Identifier.Numeric(69), Partitioning.None(), _messagesWithoutHeaders));
     }
@@ -107,7 +107,7 @@ public class SendMessagesTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task SendMessages_WithHeaders_Should_Throw_InvalidResponse(Protocol protocol)
     {
-        await Should.ThrowAsync<InvalidResponseException>(() =>
+        await Should.ThrowAsync<IggyInvalidStatusCodeException>(() =>
             Fixture.Clients[protocol].SendMessagesAsync(Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
                 Identifier.Numeric(69), Partitioning.None(), _messagesWithHeaders));
     }

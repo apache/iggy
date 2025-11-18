@@ -52,6 +52,5 @@ public record Consumer(Kind kind, ConsumerId id) {
         public int asCode() {
             return code;
         }
-
     }
 }

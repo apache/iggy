@@ -55,7 +55,7 @@ public class FlushMessagesTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task FlushUnsavedBuffer_Should_Throw_WhenStream_DoesNotExist(Protocol protocol)
     {
-        await Should.ThrowAsync<InvalidResponseException>(() =>
+        await Should.ThrowAsync<IggyInvalidStatusCodeException>(() =>
             Fixture.Clients[protocol].FlushUnsavedBufferAsync(
                 Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
                 Identifier.String(Fixture.TopicRequest.Name), 55, false));

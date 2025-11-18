@@ -33,8 +33,8 @@ namespace Apache.Iggy.Publishers;
 /// </summary>
 public class IggyPublisherBuilder
 {
-    protected EventHandler<PublisherErrorEventArgs>? OnBackgroundError;
-    protected EventHandler<MessageBatchFailedEventArgs>? OnMessageBatchFailed;
+    internal Func<PublisherErrorEventArgs, Task>? OnBackgroundError { get; set; }
+    internal Func<MessageBatchFailedEventArgs, Task>? OnMessageBatchFailed { get; set; }
 
     /// <summary>
     ///     Gets or sets the publisher configuration.
@@ -109,9 +109,10 @@ public class IggyPublisherBuilder
     /// <param name="password">The password for authentication.</param>
     /// <param name="receiveBufferSize">The size of the receive buffer in bytes. Default is 4096.</param>
     /// <param name="sendBufferSize">The size of the send buffer in bytes. Default is 4096.</param>
+    /// <param name="reconnectionSettings">Reconnection settings for the client.</param>
     /// <returns>The builder instance for method chaining.</returns>
     public IggyPublisherBuilder WithConnection(Protocol protocol, string address, string login, string password,
-        int receiveBufferSize = 4096, int sendBufferSize = 4096)
+        int receiveBufferSize = 4096, int sendBufferSize = 4096, ReconnectionSettings? reconnectionSettings = null)
     {
         Config.Protocol = protocol;
         Config.Address = address;
@@ -119,6 +120,7 @@ public class IggyPublisherBuilder
         Config.Password = password;
         Config.ReceiveBufferSize = receiveBufferSize;
         Config.SendBufferSize = sendBufferSize;
+        Config.ReconnectionSettings = reconnectionSettings;
 
         return this;
     }
@@ -195,7 +197,7 @@ public class IggyPublisherBuilder
     /// </summary>
     /// <param name="handler">The event handler to invoke when background errors occur.</param>
     /// <returns>The builder instance for method chaining.</returns>
-    public IggyPublisherBuilder SubscribeOnBackgroundError(EventHandler<PublisherErrorEventArgs> handler)
+    public IggyPublisherBuilder SubscribeOnBackgroundError(Func<PublisherErrorEventArgs, Task> handler)
     {
         OnBackgroundError = handler;
         return this;
@@ -207,11 +209,13 @@ public class IggyPublisherBuilder
     /// </summary>
     /// <param name="handler">The event handler to invoke when message batches fail to send.</param>
     /// <returns>The builder instance for method chaining.</returns>
-    public IggyPublisherBuilder SubscribeOnMessageBatchFailed(EventHandler<MessageBatchFailedEventArgs> handler)
+    public IggyPublisherBuilder SubscribeOnMessageBatchFailed(Func<MessageBatchFailedEventArgs, Task> handler)
     {
         OnMessageBatchFailed = handler;
         return this;
     }
+
+
 
     /// <summary>
     ///     Configures retry behavior for failed message sends.
@@ -287,7 +291,9 @@ public class IggyPublisherBuilder
                 Protocol = Config.Protocol,
                 BaseAddress = Config.Address,
                 ReceiveBufferSize = Config.ReceiveBufferSize,
-                SendBufferSize = Config.SendBufferSize
+                SendBufferSize = Config.SendBufferSize,
+                ReconnectionSettings = Config.ReconnectionSettings ?? new ReconnectionSettings(),
+                LoggerFactory = Config.LoggerFactory ?? NullLoggerFactory.Instance
             });
         }
 
@@ -297,12 +303,12 @@ public class IggyPublisherBuilder
 
         if (OnBackgroundError != null)
         {
-            publisher.OnBackgroundError += OnBackgroundError;
+            publisher.SubscribeOnBackgroundError(OnBackgroundError);
         }
 
         if (OnMessageBatchFailed != null)
         {
-            publisher.OnMessageBatchFailed += OnMessageBatchFailed;
+            publisher.SubscribeOnMessageBatchFailed(OnMessageBatchFailed);
         }
 
         return publisher;
@@ -335,8 +341,7 @@ public class IggyPublisherBuilder
         {
             if (IggyClient == null)
             {
-                throw new InvalidOperationException(
-                    "IggyClient must be provided when CreateIggyClient is false.");
+                throw new InvalidOperationException("IggyClient must be provided when CreateIggyClient is false.");
             }
         }
 
@@ -417,8 +422,7 @@ public class IggyPublisherBuilder
 
             if (Config.InitialRetryDelay > Config.MaxRetryDelay)
             {
-                throw new InvalidOperationException(
-                    "InitialRetryDelay must be less than or equal to MaxRetryDelay.");
+                throw new InvalidOperationException("InitialRetryDelay must be less than or equal to MaxRetryDelay.");
             }
         }
     }

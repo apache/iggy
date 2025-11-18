@@ -37,8 +37,7 @@ public final class PartitionInfo implements Serializable {
     private final long currentOffset;
     private final long endOffset;
 
-    private PartitionInfo(
-            String streamId, String topicId, int partitionId, long currentOffset, long endOffset) {
+    private PartitionInfo(String streamId, String topicId, int partitionId, long currentOffset, long endOffset) {
         this.streamId = Objects.requireNonNull(streamId, "streamId must not be null");
         this.topicId = Objects.requireNonNull(topicId, "topicId must not be null");
         this.partitionId = partitionId;

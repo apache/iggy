@@ -19,12 +19,14 @@
 
 package org.apache.iggy.client.async.tcp;
 
+import org.apache.commons.lang3.StringUtils;
 import org.apache.iggy.client.async.ConsumerGroupsClient;
 import org.apache.iggy.client.async.MessagesClient;
 import org.apache.iggy.client.async.StreamsClient;
 import org.apache.iggy.client.async.TopicsClient;
 import org.apache.iggy.client.async.UsersClient;
 
+import java.io.File;
 import java.time.Duration;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
@@ -43,6 +45,8 @@ public class AsyncIggyTcpClient {
     private final Optional<Duration> requestTimeout;
     private final Optional<Integer> connectionPoolSize;
     private final Optional<RetryPolicy> retryPolicy;
+    private final boolean enableTls;
+    private final Optional<File> tlsCertificate;
     private AsyncTcpConnection connection;
     private MessagesClient messagesClient;
     private ConsumerGroupsClient consumerGroupsClient;
@@ -51,12 +55,21 @@ public class AsyncIggyTcpClient {
     private UsersClient usersClient;
 
     public AsyncIggyTcpClient(String host, int port) {
-        this(host, port, null, null, null, null, null, null);
+        this(host, port, null, null, null, null, null, null, false, Optional.empty());
     }
 
-    private AsyncIggyTcpClient(String host, int port, String username, String password,
-                               Duration connectionTimeout, Duration requestTimeout,
-                               Integer connectionPoolSize, RetryPolicy retryPolicy) {
+    @SuppressWarnings("checkstyle:ParameterNumber")
+    private AsyncIggyTcpClient(
+            String host,
+            int port,
+            String username,
+            String password,
+            Duration connectionTimeout,
+            Duration requestTimeout,
+            Integer connectionPoolSize,
+            RetryPolicy retryPolicy,
+            boolean enableTls,
+            Optional<File> tlsCertificate) {
         this.host = host;
         this.port = port;
         this.username = Optional.ofNullable(username);
@@ -65,6 +78,8 @@ public class AsyncIggyTcpClient {
         this.requestTimeout = Optional.ofNullable(requestTimeout);
         this.connectionPoolSize = Optional.ofNullable(connectionPoolSize);
         this.retryPolicy = Optional.ofNullable(retryPolicy);
+        this.enableTls = enableTls;
+        this.tlsCertificate = tlsCertificate;
     }
 
     /**
@@ -80,23 +95,25 @@ public class AsyncIggyTcpClient {
      * Connects to the Iggy server asynchronously.
      */
     public CompletableFuture<Void> connect() {
-        connection = new AsyncTcpConnection(host, port);
-        return connection.connect()
-            .thenRun(() -> {
-                messagesClient = new MessagesTcpClient(connection);
-                consumerGroupsClient = new ConsumerGroupsTcpClient(connection);
-                streamsClient = new StreamsTcpClient(connection);
-                topicsClient = new TopicsTcpClient(connection);
-                usersClient = new UsersTcpClient(connection);
-            })
-            .thenCompose(v -> {
-                // Auto-login if credentials are provided
-                if (username.isPresent() && password.isPresent()) {
-                    return usersClient.loginAsync(username.get(), password.get())
-                            .thenApply(identity -> null);
-                }
-                return CompletableFuture.completedFuture(null);
-            });
+        connection = new AsyncTcpConnection(host, port, enableTls, tlsCertificate);
+        return connection
+                .connect()
+                .thenRun(() -> {
+                    messagesClient = new MessagesTcpClient(connection);
+                    consumerGroupsClient = new ConsumerGroupsTcpClient(connection);
+                    streamsClient = new StreamsTcpClient(connection);
+                    topicsClient = new TopicsTcpClient(connection);
+                    usersClient = new UsersTcpClient(connection);
+                })
+                .thenCompose(v -> {
+                    // Auto-login if credentials are provided
+                    if (username.isPresent() && password.isPresent()) {
+                        return usersClient
+                                .loginAsync(username.get(), password.get())
+                                .thenApply(identity -> null);
+                    }
+                    return CompletableFuture.completedFuture(null);
+                });
     }
 
     /**
@@ -162,7 +179,7 @@ public class AsyncIggyTcpClient {
     /**
      * Builder for creating configured AsyncIggyTcpClient instances.
      */
-    public static class Builder {
+    public static final class Builder {
         private String host = "localhost";
         private Integer port = 8090;
         private String username;
@@ -171,9 +188,10 @@ public class AsyncIggyTcpClient {
         private Duration requestTimeout;
         private Integer connectionPoolSize;
         private RetryPolicy retryPolicy;
+        private boolean enableTls = false;
+        private File tlsTrustedCertificatePem;
 
-        private Builder() {
-        }
+        private Builder() {}
 
         /**
          * Sets the host address for the Iggy server.
@@ -255,6 +273,49 @@ public class AsyncIggyTcpClient {
         }
 
         /**
+         * Enables or disables TLS for the TCP connection.
+         *
+         * @param enableTls whether to enable TLS
+         * @return this builder
+         */
+        public Builder tls(boolean enableTls) {
+            this.enableTls = enableTls;
+            return this;
+        }
+
+        /**
+         * Enables TLS for the TCP connection.
+         *
+         * @return this builder
+         */
+        public Builder enableTls() {
+            this.enableTls = true;
+            return this;
+        }
+
+        /**
+         * Sets a custom trusted certificate (PEM file) to validate the server certificate.
+         *
+         * @param certificate the PEM file containing the certificate or CA chain
+         * @return this builder
+         */
+        public Builder tlsTrustedCertificate(File certificate) {
+            this.tlsTrustedCertificatePem = certificate;
+            return this;
+        }
+
+        /**
+         * Sets a custom trusted certificate (PEM file path) to validate the server certificate.
+         *
+         * @param certificatePath the PEM file path containing the certificate or CA chain
+         * @return this builder
+         */
+        public Builder tlsTrustedCertificate(String certificatePath) {
+            this.tlsTrustedCertificatePem = StringUtils.isBlank(certificatePath) ? null : new File(certificatePath);
+            return this;
+        }
+
+        /**
          * Builds and returns a configured AsyncIggyTcpClient instance.
          * Note: You still need to call connect() on the returned client.
          *
@@ -267,15 +328,24 @@ public class AsyncIggyTcpClient {
             if (port == null || port <= 0) {
                 throw new IllegalArgumentException("Port must be a positive integer");
             }
-            return new AsyncIggyTcpClient(host, port, username, password,
-                    connectionTimeout, requestTimeout, connectionPoolSize, retryPolicy);
+            return new AsyncIggyTcpClient(
+                    host,
+                    port,
+                    username,
+                    password,
+                    connectionTimeout,
+                    requestTimeout,
+                    connectionPoolSize,
+                    retryPolicy,
+                    enableTls,
+                    Optional.ofNullable(tlsTrustedCertificatePem));
         }
     }
 
     /**
      * Retry policy for client operations.
      */
-    public static class RetryPolicy {
+    public static final class RetryPolicy {
         private final int maxRetries;
         private final Duration initialDelay;
         private final Duration maxDelay;
@@ -300,13 +370,14 @@ public class AsyncIggyTcpClient {
         /**
          * Creates a retry policy with exponential backoff and custom parameters.
          *
-         * @param maxRetries the maximum number of retries
+         * @param maxRetries   the maximum number of retries
          * @param initialDelay the initial delay before the first retry
-         * @param maxDelay the maximum delay between retries
-         * @param multiplier the multiplier for exponential backoff
+         * @param maxDelay     the maximum delay between retries
+         * @param multiplier   the multiplier for exponential backoff
          * @return a RetryPolicy with custom exponential backoff configuration
          */
-        public static RetryPolicy exponentialBackoff(int maxRetries, Duration initialDelay, Duration maxDelay, double multiplier) {
+        public static RetryPolicy exponentialBackoff(
+                int maxRetries, Duration initialDelay, Duration maxDelay, double multiplier) {
             return new RetryPolicy(maxRetries, initialDelay, maxDelay, multiplier);
         }
 
@@ -314,7 +385,7 @@ public class AsyncIggyTcpClient {
          * Creates a retry policy with fixed delay.
          *
          * @param maxRetries the maximum number of retries
-         * @param delay the fixed delay between retries
+         * @param delay      the fixed delay between retries
          * @return a RetryPolicy with fixed delay configuration
          */
         public static RetryPolicy fixedDelay(int maxRetries, Duration delay) {

@@ -19,19 +19,23 @@
 
 package org.apache.iggy.connector.flink.source;
 
-import org.apache.flink.api.connector.source.SourceReader;
-import org.apache.flink.api.connector.source.SourceReaderContext;
 import org.apache.flink.api.connector.source.ReaderOutput;
 import org.apache.flink.api.connector.source.SourceEvent;
+import org.apache.flink.api.connector.source.SourceReader;
+import org.apache.flink.api.connector.source.SourceReaderContext;
 import org.apache.flink.core.io.InputStatus;
 import org.apache.iggy.client.async.tcp.AsyncIggyTcpClient;
-import org.apache.iggy.consumergroup.Consumer;
 import org.apache.iggy.connector.serialization.DeserializationSchema;
-
+import org.apache.iggy.consumergroup.Consumer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.util.*;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Queue;
 import java.util.concurrent.CompletableFuture;
 
 /**
@@ -40,7 +44,7 @@ import java.util.concurrent.CompletableFuture;
  */
 public class IggySourceReader<T> implements SourceReader<T, IggySourceSplit> {
 
-	private static final Logger LOGGER = LoggerFactory.getLogger(IggySourceReader.class);
+    private static final Logger log = LoggerFactory.getLogger(IggySourceReader.class);
 
     private final SourceReaderContext context;
     private final AsyncIggyTcpClient asyncClient;
@@ -152,12 +156,8 @@ public class IggySourceReader<T> implements SourceReader<T, IggySourceSplit> {
         for (IggySourceSplit split : splits) {
             String splitId = split.splitId();
             if (!splitReaders.containsKey(splitId)) {
-                IggyPartitionSplitReader<T> splitReader = new IggyPartitionSplitReader<>(
-                        asyncClient,
-                        split,
-                        deserializer,
-                        consumer,
-                        pollBatchSize);
+                IggyPartitionSplitReader<T> splitReader =
+                        new IggyPartitionSplitReader<>(asyncClient, split, deserializer, consumer, pollBatchSize);
                 splitReaders.put(splitId, splitReader);
             }
         }
@@ -185,7 +185,7 @@ public class IggySourceReader<T> implements SourceReader<T, IggySourceSplit> {
                 asyncClient.close().join();
             } catch (RuntimeException e) {
                 // Log but don't throw - we're in cleanup phase
-                LOGGER.error("Error closing async Iggy client: " + e.getMessage());
+                log.error("Error closing async Iggy client: " + e.getMessage());
             }
         }
     }

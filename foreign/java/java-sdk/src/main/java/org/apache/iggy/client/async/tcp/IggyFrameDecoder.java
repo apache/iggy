@@ -32,7 +32,7 @@ import java.util.List;
  * Response format: [4-byte status LE] [4-byte length LE] [payload]
  */
 public class IggyFrameDecoder extends ByteToMessageDecoder {
-    private static final Logger logger = LoggerFactory.getLogger(IggyFrameDecoder.class);
+    private static final Logger log = LoggerFactory.getLogger(IggyFrameDecoder.class);
     private static final int HEADER_SIZE = 8; // status (4) + length (4)
 
     @Override
@@ -49,7 +49,7 @@ public class IggyFrameDecoder extends ByteToMessageDecoder {
         int status = in.readIntLE();
         int length = in.readIntLE();
 
-        logger.trace("Received response with status={}, length={}", status, length);
+        log.trace("Received response with status={}, length={}", status, length);
 
         // Check if we have the complete payload
         if (in.readableBytes() < length) {
@@ -67,7 +67,7 @@ public class IggyFrameDecoder extends ByteToMessageDecoder {
             response.writeBytes(in, length);
         }
 
-        logger.trace("Decoded complete response, forwarding to handler");
+        log.trace("Decoded complete response, forwarding to handler");
         out.add(response);
     }
 }

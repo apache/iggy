@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using System.Runtime.InteropServices;
 using System.Text;
 using Apache.Iggy;
 using Apache.Iggy.Configuration;
@@ -43,6 +44,7 @@ var client = IggyClientFactory.CreateClient(new IggyClientConfigurator()
     LoggerFactory = loggerFactory
 });
 
+await client.ConnectAsync();
 await client.LoginUser(settings.Username, settings.Password);
 
 logger.LogInformation("Basic consumer has logged on successfully");

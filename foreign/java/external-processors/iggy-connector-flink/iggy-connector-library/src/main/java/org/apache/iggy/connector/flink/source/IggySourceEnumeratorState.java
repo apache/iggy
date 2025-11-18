@@ -20,7 +20,10 @@
 package org.apache.iggy.connector.flink.source;
 
 import java.io.Serializable;
-import java.util.*;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.Objects;
+import java.util.Set;
 
 /**
  * State for the Iggy source split enumerator.
@@ -39,9 +42,7 @@ public class IggySourceEnumeratorState implements Serializable {
      * @param assignedSplits the splits that have been assigned to readers
      * @param discoveredPartitions the partition IDs that have been discovered
      */
-    public IggySourceEnumeratorState(
-            Set<IggySourceSplit> assignedSplits,
-            Set<Integer> discoveredPartitions) {
+    public IggySourceEnumeratorState(Set<IggySourceSplit> assignedSplits, Set<Integer> discoveredPartitions) {
         this.assignedSplits = new HashSet<>(assignedSplits);
         this.discoveredPartitions = new HashSet<>(discoveredPartitions);
     }

@@ -16,7 +16,9 @@
 # under the License.
 
 type = "sink"
+key = "stdout"
 enabled = true
+version = 0
 name = "Stdout sink"
 path = "target/release/libiggy_connector_stdout_sink"
 
@@ -28,7 +30,7 @@ batch_length = 100
 poll_interval = "5ms"
 consumer_group = "stdout_sink_connector"
 
-[config]
+[plugin_config]
 print_payload = false
 
 [transforms.add_fields]

@@ -1,4 +1,5 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
  * regarding copyright ownership.  The ASF licenses this file
@@ -16,10 +17,10 @@
  * under the License.
  */
 
-use crate::{
-    configs::{ConfigFormat, StreamConsumerConfig, StreamProducerConfig},
-    manager::{sink::SinkInfo, source::SourceInfo},
+use crate::configs::connectors::{
+    ConfigFormat, SinkConfig, SourceConfig, StreamConsumerConfig, StreamProducerConfig,
 };
+use crate::manager::{sink::SinkInfo, source::SourceInfo};
 use iggy_connector_sdk::transforms::TransformType;
 use serde::{Deserialize, Serialize};
 
@@ -31,7 +32,7 @@ pub struct SinkInfoResponse {
     pub path: String,
     pub enabled: bool,
     pub running: bool,
-    pub config_format: Option<ConfigFormat>,
+    pub plugin_config_format: Option<ConfigFormat>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -42,6 +43,13 @@ pub struct SinkDetailsResponse {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct SinkConfigResponse {
+    #[serde(flatten)]
+    pub config: SinkConfig,
+    pub active: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct SourceInfoResponse {
     pub id: u32,
     pub key: String,
@@ -49,7 +57,7 @@ pub struct SourceInfoResponse {
     pub path: String,
     pub enabled: bool,
     pub running: bool,
-    pub config_format: Option<ConfigFormat>,
+    pub plugin_config_format: Option<ConfigFormat>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -57,6 +65,13 @@ pub struct SourceDetailsResponse {
     #[serde(flatten)]
     pub info: SourceInfoResponse,
     pub streams: Vec<StreamProducerConfig>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SourceConfigResponse {
+    #[serde(flatten)]
+    pub config: SourceConfig,
+    pub active: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -74,7 +89,7 @@ impl From<SinkInfo> for SinkInfoResponse {
             path: sink.path,
             enabled: sink.enabled,
             running: sink.running,
-            config_format: sink.config_format,
+            plugin_config_format: sink.plugin_config_format,
         }
     }
 }
@@ -88,7 +103,7 @@ impl From<SourceInfo> for SourceInfoResponse {
             path: source.path,
             enabled: source.enabled,
             running: source.running,
-            config_format: source.config_format,
+            plugin_config_format: source.plugin_config_format,
         }
     }
 }

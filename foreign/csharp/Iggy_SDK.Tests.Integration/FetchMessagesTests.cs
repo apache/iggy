@@ -76,7 +76,7 @@ public class FetchMessagesTests
             TopicId = Identifier.Numeric(2137)
         };
 
-        await Should.ThrowAsync<InvalidResponseException>(() =>
+        await Should.ThrowAsync<IggyInvalidStatusCodeException>(() =>
             Fixture.Clients[protocol].PollMessagesAsync(invalidFetchRequest));
     }
 

@@ -22,11 +22,33 @@ namespace Apache.Iggy.Enums;
 //First/Last N messages
 //Next N messages for the specific consumer
 
+/// <summary>
+///     Polling strategy for fetching messages from a topic.
+/// </summary>
 public enum MessagePolling
 {
+    /// <summary>
+    ///     By offset (using the indexes).
+    /// </summary>
     Offset,
+
+    /// <summary>
+    ///     By timestamp (using the time indexes).
+    /// </summary>
     Timestamp,
+
+    /// <summary>
+    ///     Get first N messages.
+    /// </summary>
     First,
+
+    /// <summary>
+    ///     Get last N messages.
+    /// </summary>
     Last,
+
+    /// <summary>
+    ///     Get next N messages for the specific consumer.
+    /// </summary>
     Next
 }

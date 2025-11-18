@@ -21,5 +21,4 @@ package org.apache.iggy.user;
 
 import java.util.Optional;
 
-public record IdentityInfo(Long userId, Optional<TokenInfo> accessToken) {
-}
+public record IdentityInfo(Long userId, Optional<TokenInfo> accessToken) {}

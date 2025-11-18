@@ -23,16 +23,17 @@ import java.math.BigInteger;
 import java.util.Map;
 import java.util.Optional;
 
-public record Message(
-        MessageHeader header,
-        byte[] payload,
-        Optional<Map<String, HeaderValue>> userHeaders
-) {
+public record Message(MessageHeader header, byte[] payload, Optional<Map<String, HeaderValue>> userHeaders) {
 
     public static Message of(String payload) {
         final byte[] payloadBytes = payload.getBytes();
-        final MessageHeader msgHeader = new MessageHeader(BigInteger.ZERO, MessageId.serverGenerated(),
-                BigInteger.ZERO, BigInteger.ZERO, BigInteger.ZERO, 0L,
+        final MessageHeader msgHeader = new MessageHeader(
+                BigInteger.ZERO,
+                MessageId.serverGenerated(),
+                BigInteger.ZERO,
+                BigInteger.ZERO,
+                BigInteger.ZERO,
+                0L,
                 (long) payloadBytes.length);
         return new Message(msgHeader, payloadBytes, Optional.empty());
     }
