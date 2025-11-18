@@ -23,7 +23,7 @@ use super::{
     models::{SinkDetailsResponse, SinkInfoResponse, TransformResponse},
 };
 use crate::api::models::SinkConfigResponse;
-use crate::configs::connectors::{ConfigFormat, CreateSinkConfigCommand};
+use crate::configs::connectors::{ConfigFormat, CreateSinkConfig};
 use crate::{context::RuntimeContext, error::RuntimeError};
 use axum::{
     Json, Router,
@@ -154,7 +154,7 @@ async fn get_sink_configs(
 async fn create_sink_config(
     State(context): State<Arc<RuntimeContext>>,
     Path((key,)): Path<(String,)>,
-    Json(config): Json<CreateSinkConfigCommand>,
+    Json(config): Json<CreateSinkConfig>,
 ) -> Result<Json<SinkConfigResponse>, ApiError> {
     let created_config = context
         .config_provider
@@ -220,10 +220,10 @@ async fn update_sink_active_config(
     State(context): State<Arc<RuntimeContext>>,
     Path((key,)): Path<(String,)>,
     Json(update): Json<UpdateSinkActiveConfig>,
-) -> Result<Json<()>, ApiError> {
+) -> Result<StatusCode, ApiError> {
     context
         .config_provider
         .set_active_sink_version(&key, update.version)
         .await?;
-    Ok(Json(()))
+    Ok(StatusCode::NO_CONTENT)
 }

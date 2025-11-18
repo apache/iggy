@@ -23,7 +23,7 @@ use super::{
     models::{SourceDetailsResponse, SourceInfoResponse, TransformResponse},
 };
 use crate::api::models::SourceConfigResponse;
-use crate::configs::connectors::{ConfigFormat, CreateSourceConfigCommand};
+use crate::configs::connectors::{ConfigFormat, CreateSourceConfig};
 use crate::{context::RuntimeContext, error::RuntimeError};
 use axum::{
     Json, Router,
@@ -157,7 +157,7 @@ async fn get_source_configs(
 async fn create_source_config(
     State(context): State<Arc<RuntimeContext>>,
     Path((key,)): Path<(String,)>,
-    Json(config): Json<CreateSourceConfigCommand>,
+    Json(config): Json<CreateSourceConfig>,
 ) -> Result<Json<SourceConfigResponse>, ApiError> {
     let created_config = context
         .config_provider
@@ -223,10 +223,10 @@ async fn update_source_active_config(
     State(context): State<Arc<RuntimeContext>>,
     Path((key,)): Path<(String,)>,
     Json(update): Json<UpdateSourceActiveConfig>,
-) -> Result<Json<()>, ApiError> {
+) -> Result<StatusCode, ApiError> {
     context
         .config_provider
         .set_active_source_version(&key, update.version)
         .await?;
-    Ok(Json(()))
+    Ok(StatusCode::NO_CONTENT)
 }

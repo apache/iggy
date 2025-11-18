@@ -23,6 +23,7 @@ use crate::configs::connectors::local_provider::LocalConnectorsConfigProvider;
 use crate::configs::runtime::ConnectorsConfig as RuntimeConnectorsConfig;
 use crate::error::RuntimeError;
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use iggy_connector_sdk::Schema;
 use iggy_connector_sdk::transforms::TransformType;
 use serde::{Deserialize, Serialize};
@@ -59,8 +60,17 @@ impl Default for ConnectorConfig {
     }
 }
 
+impl ConnectorConfig {
+    fn version(&self) -> u64 {
+        match self {
+            ConnectorConfig::Sink(config) => config.version,
+            ConnectorConfig::Source(config) => config.version,
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
-pub struct CreateSinkConfigCommand {
+pub struct CreateSinkConfig {
     pub enabled: bool,
     pub name: String,
     pub path: String,
@@ -70,7 +80,7 @@ pub struct CreateSinkConfigCommand {
     pub plugin_config: Option<serde_json::Value>,
 }
 
-impl CreateSinkConfigCommand {
+impl CreateSinkConfig {
     fn to_sink_config(&self, key: &str, version: u64) -> SinkConfig {
         SinkConfig {
             key: key.to_owned(),
@@ -100,7 +110,7 @@ pub struct SinkConfig {
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
-pub struct CreateSourceConfigCommand {
+pub struct CreateSourceConfig {
     pub enabled: bool,
     pub name: String,
     pub path: String,
@@ -110,7 +120,7 @@ pub struct CreateSourceConfigCommand {
     pub plugin_config: Option<serde_json::Value>,
 }
 
-impl CreateSourceConfigCommand {
+impl CreateSourceConfig {
     fn to_source_config(&self, key: &str, version: u64) -> SourceConfig {
         SourceConfig {
             key: key.to_owned(),
@@ -167,13 +177,13 @@ pub struct StreamProducerConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectorConfigVersionInfo {
     pub version: u64,
-    pub is_active: bool,
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct ConnectorConfigVersions {
-    pub sinks: HashMap<String, Vec<ConnectorConfigVersionInfo>>,
-    pub sources: HashMap<String, Vec<ConnectorConfigVersionInfo>>,
+    pub sinks: HashMap<String, ConnectorConfigVersionInfo>,
+    pub sources: HashMap<String, ConnectorConfigVersionInfo>,
 }
 
 #[async_trait]
@@ -181,14 +191,16 @@ pub trait ConnectorsConfigProvider: Send + Sync {
     async fn create_sink_config(
         &self,
         key: &str,
-        config: CreateSinkConfigCommand,
+        config: CreateSinkConfig,
     ) -> Result<SinkConfig, RuntimeError>;
     async fn create_source_config(
         &self,
         key: &str,
-        config: CreateSourceConfigCommand,
+        config: CreateSourceConfig,
     ) -> Result<SourceConfig, RuntimeError>;
-    async fn get_all_active_configs(&self) -> Result<ConnectorsConfig, RuntimeError>;
+    async fn get_active_configs(&self) -> Result<ConnectorsConfig, RuntimeError>;
+    #[allow(dead_code)]
+    async fn get_active_configs_versions(&self) -> Result<ConnectorConfigVersions, RuntimeError>;
     async fn set_active_sink_version(&self, key: &str, version: u64) -> Result<(), RuntimeError>;
     async fn set_active_source_version(&self, key: &str, version: u64) -> Result<(), RuntimeError>;
     async fn get_sink_configs(&self, key: &str) -> Result<Vec<SinkConfig>, RuntimeError>;
@@ -203,15 +215,16 @@ pub trait ConnectorsConfigProvider: Send + Sync {
         key: &str,
         version: Option<u64>,
     ) -> Result<Option<SourceConfig>, RuntimeError>;
-    async fn get_config_versions(&self) -> Result<ConnectorConfigVersions, RuntimeError>;
 }
 
-impl From<RuntimeConnectorsConfig> for Box<dyn ConnectorsConfigProvider> {
-    fn from(value: RuntimeConnectorsConfig) -> Self {
-        match value {
-            RuntimeConnectorsConfig::Local(config) => {
-                Box::new(LocalConnectorsConfigProvider::new(&config.config_dir))
-            }
+pub async fn create_connectors_config_provider(
+    config: &RuntimeConnectorsConfig,
+) -> Result<Box<dyn ConnectorsConfigProvider>, RuntimeError> {
+    match config {
+        RuntimeConnectorsConfig::Local(config) => {
+            let provider = LocalConnectorsConfigProvider::new(&config.config_dir);
+            let provider = provider.init().await?;
+            Ok(Box::new(provider))
         }
     }
 }

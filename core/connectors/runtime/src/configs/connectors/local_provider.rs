@@ -17,14 +17,13 @@
  * under the License.
  */
 
-use crate::configs::connectors::local_provider::ConnectorType::{Sink, Source};
 use crate::configs::connectors::{
     ConnectorConfig, ConnectorConfigVersionInfo, ConnectorConfigVersions, ConnectorsConfig,
-    ConnectorsConfigProvider, CreateSinkConfigCommand, CreateSourceConfigCommand, SinkConfig,
-    SourceConfig,
+    ConnectorsConfigProvider, CreateSinkConfig, CreateSourceConfig, SinkConfig, SourceConfig,
 };
 use crate::error::RuntimeError;
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use figment::value::Dict;
 use figment::{Metadata, Profile, Provider};
@@ -32,23 +31,80 @@ use iggy_common::{ConfigProvider, CustomEnvProvider, FileConfigProvider};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
-use strum::Display;
 use tracing::{debug, info, warn};
 
-#[derive(Debug, Default, Clone, Deserialize, Serialize)]
-#[serde(default)]
-struct AllConnectorsConfig {
-    sinks: HashMap<String, Vec<SinkConfig>>,
-    sources: HashMap<String, Vec<SourceConfig>>,
+#[derive(Eq, PartialEq, Hash, Clone, Debug)]
+struct ConnectorId {
+    key: String,
+    version: u64,
 }
 
-impl AllConnectorsConfig {
-    pub fn sinks(&self) -> &HashMap<String, Vec<SinkConfig>> {
+impl ConnectorId {
+    fn to_filename_key(&self) -> String {
+        format!("{}_{}", self.key, self.version)
+    }
+}
+
+impl From<&ConnectorConfig> for ConnectorId {
+    fn from(value: &ConnectorConfig) -> Self {
+        match value {
+            ConnectorConfig::Sink(config) => ConnectorId {
+                key: config.key.clone(),
+                version: config.version,
+            },
+            ConnectorConfig::Source(config) => ConnectorId {
+                key: config.key.clone(),
+                version: config.version,
+            },
+        }
+    }
+}
+
+#[derive(Clone)]
+struct SinkConfigFile {
+    config: SinkConfig,
+    #[allow(dead_code)]
+    created_at: DateTime<Utc>,
+}
+
+#[derive(Clone)]
+struct SourceConfigFile {
+    config: SourceConfig,
+    #[allow(dead_code)]
+    created_at: DateTime<Utc>,
+}
+
+#[derive(Default)]
+struct ImportedConfigurations {
+    sinks: DashMap<ConnectorId, SinkConfigFile>,
+    sources: DashMap<ConnectorId, SourceConfigFile>,
+}
+
+impl ImportedConfigurations {
+    fn sinks(&self) -> &DashMap<ConnectorId, SinkConfigFile> {
         &self.sinks
     }
 
-    pub fn sources(&self) -> &HashMap<String, Vec<SourceConfig>> {
+    fn sinks_grouped_by_key(&self) -> HashMap<String, Vec<SinkConfigFile>> {
+        let mut grouped: HashMap<String, Vec<SinkConfigFile>> = HashMap::new();
+        for entry in self.sinks.iter() {
+            let key = entry.key().key.clone();
+            grouped.entry(key).or_default().push(entry.value().clone());
+        }
+        grouped
+    }
+
+    fn sources(&self) -> &DashMap<ConnectorId, SourceConfigFile> {
         &self.sources
+    }
+
+    fn sources_grouped_by_key(&self) -> HashMap<String, Vec<SourceConfigFile>> {
+        let mut grouped: HashMap<String, Vec<SourceConfigFile>> = HashMap::new();
+        for entry in self.sources.iter() {
+            let key = entry.key().key.clone();
+            grouped.entry(key).or_default().push(entry.value().clone());
+        }
+        grouped
     }
 }
 
@@ -60,65 +116,118 @@ struct ActiveConfigVersions {
     sources: HashMap<String, u64>,
 }
 
-pub struct LocalConnectorsConfigProvider {
-    config_dir: String,
-    file_mapping: DashMap<String, String>,
+pub trait ProviderState {}
+
+pub struct Created {}
+
+impl ProviderState for Created {}
+
+#[derive(Default)]
+pub struct Initialized {
+    connectors_config: ImportedConfigurations,
 }
 
-impl LocalConnectorsConfigProvider {
+impl ProviderState for Initialized {}
+
+pub struct LocalConnectorsConfigProvider<S: ProviderState> {
+    config_dir: String,
+    state: S,
+}
+
+impl LocalConnectorsConfigProvider<Created> {
     pub fn new(config_dir: &str) -> Self {
         Self {
             config_dir: config_dir.to_owned(),
-            file_mapping: DashMap::new(),
+            state: Created {},
         }
     }
 
-    fn create_file_config_provider(
-        path: String,
-        base_config: &BaseConnectorConfig,
-    ) -> FileConfigProvider<ConnectorEnvProvider> {
-        FileConfigProvider::new(
-            path,
-            ConnectorEnvProvider::with_connector_base_config(base_config),
-            false,
-            None,
-        )
-    }
-
-    fn read_base_config(path: &Path) -> Result<BaseConnectorConfig, RuntimeError> {
-        let config_data = std::fs::read(path)?;
-        toml::from_slice(&config_data).map_err(|err| {
-            RuntimeError::InvalidConfiguration(format!(
-                "parsing TOML file '{}' raised an error: {}",
-                path.display(),
-                err.message()
-            ))
-        })
-    }
-
-    fn config_dir_exists(&self) -> Result<bool, RuntimeError> {
+    pub async fn init(&self) -> Result<LocalConnectorsConfigProvider<Initialized>, RuntimeError> {
         if self.config_dir.is_empty() {
-            warn!("Connectors configuration directory not provided");
-            return Ok(false);
+            return Err(RuntimeError::InvalidConfiguration(
+                "Connectors configuration directory not provided".to_string(),
+            ));
         }
         if !std::fs::exists(&self.config_dir)? {
             warn!(
                 "Connectors configuration directory does not exist: {}",
                 self.config_dir
             );
-            return Ok(false);
+            std::fs::create_dir_all(&self.config_dir)?;
+            return Ok(LocalConnectorsConfigProvider {
+                config_dir: self.config_dir.clone(),
+                state: Initialized::default(),
+            });
         }
-        Ok(true)
-    }
 
-    fn get_paths_with_key_prefix(&self, prefix: &str) -> Vec<String> {
-        self.file_mapping
-            .iter()
-            .filter(|entry| entry.key().starts_with(prefix))
-            .map(|entry| entry.value().clone())
-            .collect::<Vec<_>>()
-    }
+        let sinks: DashMap<ConnectorId, SinkConfigFile> = DashMap::new();
+        let sources: DashMap<ConnectorId, SourceConfigFile> = DashMap::new();
+        info!("Loading connectors configuration from: {}", self.config_dir);
+        let entries = std::fs::read_dir(&self.config_dir)?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                if let Some(file_name) = path.file_name().and_then(|n| n.to_str())
+                    && file_name.starts_with('.')
+                {
+                    debug!("Skipping hidden file: {:?}", path);
+                    continue;
+                }
 
+                debug!("Loading connector configuration from: {:?}", path);
+                let base_config = Self::read_base_config(&path)?;
+                debug!("Loaded base configuration: {:?}", base_config);
+                let path = path
+                    .to_str()
+                    .expect("Failed to convert connector configuration path to string")
+                    .to_string();
+                let connector_config: ConnectorConfig =
+                    Self::create_file_config_provider(path.clone(), &base_config)
+                        .load_config()
+                        .await
+                        .expect("Failed to load connector configuration");
+
+                let created_at: DateTime<Utc> = entry.metadata()?.created()?.into();
+                let connector_id: ConnectorId = (&connector_config).into();
+                match connector_config.clone() {
+                    ConnectorConfig::Sink(sink_config) => {
+                        sinks.insert(
+                            connector_id,
+                            SinkConfigFile {
+                                config: sink_config,
+                                created_at,
+                            },
+                        );
+                    }
+                    ConnectorConfig::Source(source_config) => {
+                        sources.insert(
+                            connector_id,
+                            SourceConfigFile {
+                                config: source_config,
+                                created_at,
+                            },
+                        );
+                    }
+                }
+
+                debug!(
+                    "Loaded connector configuration with key {}, version {}, created at {}",
+                    base_config.key(),
+                    connector_config.version(),
+                    created_at.to_rfc3339()
+                );
+            }
+        }
+        Ok(LocalConnectorsConfigProvider {
+            config_dir: self.config_dir.clone(),
+            state: Initialized {
+                connectors_config: ImportedConfigurations { sinks, sources },
+            },
+        })
+    }
+}
+
+impl LocalConnectorsConfigProvider<Initialized> {
     fn active_versions_file_path(&self) -> String {
         format!("{}/.active_versions.toml", self.config_dir)
     }
@@ -156,132 +265,30 @@ impl LocalConnectorsConfigProvider {
         std::fs::write(&path, content)?;
         Ok(())
     }
-
-    async fn get_all_configs(&self) -> Result<AllConnectorsConfig, RuntimeError> {
-        if !self.config_dir_exists()? {
-            return Ok(AllConnectorsConfig::default());
-        }
-
-        let mut sinks: HashMap<String, Vec<SinkConfig>> = HashMap::new();
-        let mut sources: HashMap<String, Vec<SourceConfig>> = HashMap::new();
-        info!("Loading connectors configuration from: {}", self.config_dir);
-        let entries = std::fs::read_dir(&self.config_dir)?;
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_file() {
-                if let Some(file_name) = path.file_name().and_then(|n| n.to_str())
-                    && file_name.starts_with('.')
-                {
-                    debug!("Skipping hidden file: {:?}", path);
-                    continue;
-                }
-
-                debug!("Loading connector configuration from: {:?}", path);
-                let base_config = Self::read_base_config(&path)?;
-                debug!("Loaded base configuration: {:?}", base_config);
-                let path = path
-                    .to_str()
-                    .expect("Failed to convert connector configuration path to string")
-                    .to_string();
-                let connector_config: ConnectorConfig =
-                    Self::create_file_config_provider(path.clone(), &base_config)
-                        .load_config()
-                        .await
-                        .expect("Failed to load connector configuration");
-
-                match connector_config.clone() {
-                    ConnectorConfig::Sink(sink_config) => {
-                        sinks
-                            .entry(base_config.key().to_owned())
-                            .or_default()
-                            .push(sink_config);
-                    }
-                    ConnectorConfig::Source(source_config) => {
-                        sources
-                            .entry(base_config.key().to_owned())
-                            .or_default()
-                            .push(source_config);
-                    }
-                }
-
-                let file_id: ConnectorConfigFileId = connector_config.into();
-                self.file_mapping
-                    .insert(file_id.to_file_mapping_key(), path);
-            }
-        }
-        Ok(AllConnectorsConfig { sinks, sources })
-    }
 }
 
-#[derive(Display, Debug)]
-enum ConnectorType {
-    Sink,
-    Source,
-}
-
-#[derive(Debug)]
-struct ConnectorConfigFileId {
-    connector_type: ConnectorType,
-    key: String,
-    version: u64,
-}
-
-impl ConnectorConfigFileId {
-    fn from_sink_key_and_version(key: &str, version: u64) -> Self {
-        Self {
-            connector_type: Sink,
-            key: key.to_owned(),
-            version,
-        }
+impl<S: ProviderState> LocalConnectorsConfigProvider<S> {
+    fn create_file_config_provider(
+        path: String,
+        base_config: &BaseConnectorConfig,
+    ) -> FileConfigProvider<ConnectorEnvProvider> {
+        FileConfigProvider::new(
+            path,
+            ConnectorEnvProvider::with_connector_base_config(base_config),
+            false,
+            None,
+        )
     }
 
-    fn from_sink_key(key: &str) -> Self {
-        Self {
-            connector_type: Sink,
-            key: key.to_owned(),
-            version: 0,
-        }
-    }
-
-    fn from_source_key_and_version(key: &str, version: u64) -> Self {
-        Self {
-            connector_type: Source,
-            key: key.to_owned(),
-            version,
-        }
-    }
-
-    fn from_source_key(key: &str) -> Self {
-        Self {
-            connector_type: Source,
-            key: key.to_owned(),
-            version: 0,
-        }
-    }
-
-    fn to_file_mapping_key(&self) -> String {
-        format!("{}_{}_{}", self.connector_type, self.key, self.version)
-    }
-
-    fn to_file_mapping_key_prefix(&self) -> String {
-        format!("{}_{}_", self.connector_type, self.key)
-    }
-}
-
-impl From<ConnectorConfig> for ConnectorConfigFileId {
-    fn from(value: ConnectorConfig) -> Self {
-        match value {
-            ConnectorConfig::Sink(config) => Self {
-                connector_type: Sink,
-                key: config.key,
-                version: config.version,
-            },
-            ConnectorConfig::Source(config) => Self {
-                connector_type: Source,
-                key: config.key,
-                version: config.version,
-            },
-        }
+    fn read_base_config(path: &Path) -> Result<BaseConnectorConfig, RuntimeError> {
+        let config_data = std::fs::read(path)?;
+        toml::from_slice(&config_data).map_err(|err| {
+            RuntimeError::InvalidConfiguration(format!(
+                "parsing TOML file '{}' raised an error: {}",
+                path.display(),
+                err.message()
+            ))
+        })
     }
 }
 
@@ -309,42 +316,37 @@ impl BaseConnectorConfig {
 }
 
 #[async_trait]
-impl ConnectorsConfigProvider for LocalConnectorsConfigProvider {
+impl ConnectorsConfigProvider for LocalConnectorsConfigProvider<Initialized> {
     async fn create_sink_config(
         &self,
         key: &str,
-        cmd: CreateSinkConfigCommand,
+        cmd: CreateSinkConfig,
     ) -> Result<SinkConfig, RuntimeError> {
-        if self.config_dir.is_empty() {
-            return Err(RuntimeError::InvalidConfiguration(
-                "Connectors configuration directory not provided".to_string(),
-            ));
-        }
-        std::fs::create_dir_all(&self.config_dir)?;
-
-        let next_version = self
-            .get_sink_config(key, None)
-            .await?
-            .map(|config| config.version + 1)
+        let sinks = self.state.connectors_config.sinks();
+        let next_version = sinks
+            .iter()
+            .filter(|entry| entry.key().key == key)
+            .max_by_key(|entry| entry.config.version)
+            .map(|entry| entry.config.version + 1)
             .unwrap_or(0);
 
         let config = cmd.to_sink_config(key, next_version);
-
         let connector_config = ConnectorConfig::Sink(config.clone());
-        let file_id: ConnectorConfigFileId = connector_config.clone().into();
-        if self
-            .file_mapping
-            .get(&file_id.to_file_mapping_key())
-            .is_some()
-        {
-            return Err(RuntimeError::InvalidConfiguration(
-                "Sink configuration with this version already exists".to_string(),
-            ));
-        }
-        let path = format!("{}/{}.toml", self.config_dir, file_id.to_file_mapping_key());
+        let connector_id: ConnectorId = (&connector_config).into();
+
+        let path = format!(
+            "{}/sink_{}.toml",
+            self.config_dir,
+            connector_id.to_filename_key()
+        );
         std::fs::write(&path, toml::to_string(&connector_config).unwrap())?;
-        self.file_mapping
-            .insert(file_id.to_file_mapping_key(), path);
+        sinks.insert(
+            connector_id,
+            SinkConfigFile {
+                config: config.clone(),
+                created_at: Utc::now(),
+            },
+        );
 
         Ok(config)
     }
@@ -352,134 +354,204 @@ impl ConnectorsConfigProvider for LocalConnectorsConfigProvider {
     async fn create_source_config(
         &self,
         key: &str,
-        cmd: CreateSourceConfigCommand,
+        cmd: CreateSourceConfig,
     ) -> Result<SourceConfig, RuntimeError> {
-        if self.config_dir.is_empty() {
-            return Err(RuntimeError::InvalidConfiguration(
-                "Connectors configuration directory not provided".to_string(),
-            ));
-        }
-        std::fs::create_dir_all(&self.config_dir)?;
-
-        let next_version = self
-            .get_source_config(key, None)
-            .await?
-            .map(|config| config.version + 1)
+        let sources = &self.state.connectors_config.sources;
+        let next_version = sources
+            .iter()
+            .filter(|entry| entry.key().key == key)
+            .max_by_key(|entry| entry.config.version)
+            .map(|entry| entry.config.version + 1)
             .unwrap_or(0);
 
         let config = cmd.to_source_config(key, next_version);
-
         let connector_config = ConnectorConfig::Source(config.clone());
-        let file_id: ConnectorConfigFileId = connector_config.clone().into();
-        if self
-            .file_mapping
-            .get(&file_id.to_file_mapping_key())
-            .is_some()
-        {
-            return Err(RuntimeError::InvalidConfiguration(
-                "Source configuration with this version already exists".to_string(),
-            ));
-        }
-        let path = format!("{}/{}.toml", self.config_dir, file_id.to_file_mapping_key());
+        let connector_id: ConnectorId = (&connector_config).into();
+
+        let path = format!(
+            "{}/source_{}.toml",
+            self.config_dir,
+            connector_id.to_filename_key()
+        );
         std::fs::write(&path, toml::to_string(&connector_config).unwrap())?;
-        self.file_mapping
-            .insert(file_id.to_file_mapping_key(), path);
+        sources.insert(
+            connector_id,
+            SourceConfigFile {
+                config: config.clone(),
+                created_at: Utc::now(),
+            },
+        );
 
         Ok(config)
     }
 
-    async fn get_all_active_configs(&self) -> Result<ConnectorsConfig, RuntimeError> {
-        let all_configs = self.get_all_configs().await?;
+    async fn get_active_configs(&self) -> Result<ConnectorsConfig, RuntimeError> {
+        let all_configs = &self.state.connectors_config;
         let active_versions = self.load_active_versions();
 
         let sinks = all_configs
-            .sinks()
+            .sinks_grouped_by_key()
             .iter()
-            .filter_map(|(key, configs)| {
-                if configs.is_empty() {
+            .filter_map(|(key, config_files)| {
+                if config_files.is_empty() {
                     return None;
                 }
                 let active_config = if let Some(&version) = active_versions.sinks.get(key) {
-                    configs.iter().find(|c| c.version == version).cloned()
+                    config_files
+                        .iter()
+                        .find(|c| c.config.version == version)
+                        .cloned()
                 } else {
-                    configs.iter().max_by_key(|c| c.version).cloned()
+                    config_files
+                        .iter()
+                        .max_by_key(|c| c.config.version)
+                        .cloned()
                 };
-                active_config.map(|config| (key.clone(), config))
+                active_config.map(|config_file| (key.clone(), config_file.config.clone()))
             })
             .collect();
 
         let sources = all_configs
-            .sources()
+            .sources_grouped_by_key()
             .iter()
-            .filter_map(|(key, configs)| {
-                if configs.is_empty() {
+            .filter_map(|(key, config_files)| {
+                if config_files.is_empty() {
                     return None;
                 }
                 let active_config = if let Some(&version) = active_versions.sources.get(key) {
-                    configs.iter().find(|c| c.version == version).cloned()
+                    config_files
+                        .iter()
+                        .find(|c| c.config.version == version)
+                        .cloned()
                 } else {
-                    configs.iter().max_by_key(|c| c.version).cloned()
+                    config_files
+                        .iter()
+                        .max_by_key(|c| c.config.version)
+                        .cloned()
                 };
-                active_config.map(|config| (key.clone(), config))
+                active_config.map(|config_file| (key.clone(), config_file.config.clone()))
             })
             .collect();
 
         Ok(ConnectorsConfig::new(sinks, sources))
     }
 
+    async fn get_active_configs_versions(&self) -> Result<ConnectorConfigVersions, RuntimeError> {
+        let all_configs = &self.state.connectors_config;
+        let active_versions = self.load_active_versions();
+
+        let sinks = all_configs
+            .sinks_grouped_by_key()
+            .iter()
+            .filter_map(|(key, config_files)| {
+                if config_files.is_empty() {
+                    return None;
+                }
+                let latest_version = config_files
+                    .iter()
+                    .map(|c| c.config.version)
+                    .max()
+                    .expect("At least one config version must exist");
+                let active_version = active_versions
+                    .sinks
+                    .get(key)
+                    .copied()
+                    .unwrap_or(latest_version);
+
+                config_files
+                    .iter()
+                    .find(|config_file| config_file.config.version == active_version)
+                    .map(|config_file| ConnectorConfigVersionInfo {
+                        version: config_file.config.version,
+                        created_at: config_file.created_at,
+                    })
+                    .map(|config| (key.clone(), config))
+            })
+            .collect();
+
+        let sources = all_configs
+            .sources_grouped_by_key()
+            .iter()
+            .filter_map(|(key, config_files)| {
+                if config_files.is_empty() {
+                    return None;
+                }
+                let latest_version = config_files
+                    .iter()
+                    .map(|c| c.config.version)
+                    .max()
+                    .expect("At least one config version must exist");
+                let active_version = active_versions
+                    .sources
+                    .get(key)
+                    .copied()
+                    .unwrap_or(latest_version);
+
+                config_files
+                    .iter()
+                    .find(|config_file| config_file.config.version == active_version)
+                    .map(|config_file| ConnectorConfigVersionInfo {
+                        version: config_file.config.version,
+                        created_at: config_file.created_at,
+                    })
+                    .map(|config| (key.clone(), config))
+            })
+            .collect();
+
+        Ok(ConnectorConfigVersions { sinks, sources })
+    }
+
     async fn set_active_sink_version(&self, key: &str, version: u64) -> Result<(), RuntimeError> {
-        let file_id = ConnectorConfigFileId::from_sink_key_and_version(key, version);
+        let connector_id = ConnectorId {
+            key: key.to_owned(),
+            version,
+        };
         if self
-            .file_mapping
-            .get(&file_id.to_file_mapping_key())
+            .state
+            .connectors_config
+            .sinks()
+            .get(&connector_id)
             .is_none()
         {
             return Err(RuntimeError::SinkConfigNotFound(key.to_owned(), version));
         }
+
         let mut active_versions = self.load_active_versions();
         active_versions.sinks.insert(key.to_owned(), version);
         self.save_active_versions(&active_versions)
     }
 
     async fn set_active_source_version(&self, key: &str, version: u64) -> Result<(), RuntimeError> {
-        let file_id = ConnectorConfigFileId::from_source_key_and_version(key, version);
+        let connector_id = ConnectorId {
+            key: key.to_owned(),
+            version,
+        };
         if self
-            .file_mapping
-            .get(&file_id.to_file_mapping_key())
+            .state
+            .connectors_config
+            .sources()
+            .get(&connector_id)
             .is_none()
         {
             return Err(RuntimeError::SourceConfigNotFound(key.to_owned(), version));
         }
+
         let mut active_versions = self.load_active_versions();
         active_versions.sources.insert(key.to_owned(), version);
         self.save_active_versions(&active_versions)
     }
 
     async fn get_sink_configs(&self, key: &str) -> Result<Vec<SinkConfig>, RuntimeError> {
-        if !self.config_dir_exists()? {
-            return Ok(Vec::new());
-        }
-
-        let file_id = ConnectorConfigFileId::from_sink_key(key);
-        let file_mapping_key_prefix = file_id.to_file_mapping_key_prefix();
-
-        let paths = self.get_paths_with_key_prefix(&file_mapping_key_prefix);
-
-        let mut configs = Vec::new();
-        for path in paths {
-            let base_config = BaseConnectorConfig::Sink {
-                key: key.to_owned(),
-            };
-            let connector_config: ConnectorConfig =
-                Self::create_file_config_provider(path, &base_config)
-                    .load_config()
-                    .await
-                    .expect("Failed to load sink configuration");
-            if let ConnectorConfig::Sink(sink_config) = connector_config {
-                configs.push(sink_config);
-            }
-        }
-        Ok(configs)
+        Ok(self
+            .state
+            .connectors_config
+            .sinks_grouped_by_key()
+            .get(key)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|config_file| config_file.config)
+            .collect())
     }
 
     async fn get_sink_config(
@@ -487,33 +559,17 @@ impl ConnectorsConfigProvider for LocalConnectorsConfigProvider {
         key: &str,
         version: Option<u64>,
     ) -> Result<Option<SinkConfig>, RuntimeError> {
-        if !self.config_dir_exists()? {
-            return Ok(None);
-        }
-
         if let Some(version) = version {
-            let file_id = ConnectorConfigFileId::from_sink_key_and_version(key, version);
-            if let Some(path) = self.file_mapping.get(&file_id.to_file_mapping_key()) {
-                let path = path.value().clone();
-                let base_config = BaseConnectorConfig::Sink {
-                    key: key.to_owned(),
-                };
-                let connector_config: ConnectorConfig =
-                    Self::create_file_config_provider(path, &base_config)
-                        .load_config()
-                        .await
-                        .expect("Failed to load sink configuration");
-                if let ConnectorConfig::Sink(sink_config) = connector_config {
-                    Ok(Some(sink_config))
-                } else {
-                    Err(RuntimeError::InvalidConfiguration(
-                        "Configuration is not a sink configuration".to_owned(),
-                    ))
-                }
-            } else {
-                debug!("No file mapping found for connector config: {:?}", file_id);
-                Ok(None)
-            }
+            let connector_id = ConnectorId {
+                key: key.to_owned(),
+                version,
+            };
+            Ok(self
+                .state
+                .connectors_config
+                .sinks()
+                .get(&connector_id)
+                .map(|entry| entry.config.clone()))
         } else {
             Ok(self
                 .get_sink_configs(key)
@@ -524,30 +580,16 @@ impl ConnectorsConfigProvider for LocalConnectorsConfigProvider {
     }
 
     async fn get_source_configs(&self, key: &str) -> Result<Vec<SourceConfig>, RuntimeError> {
-        if !self.config_dir_exists()? {
-            return Ok(Vec::new());
-        }
-
-        let file_id = ConnectorConfigFileId::from_source_key(key);
-        let file_mapping_key_prefix = file_id.to_file_mapping_key_prefix();
-
-        let paths = self.get_paths_with_key_prefix(&file_mapping_key_prefix);
-
-        let mut configs = Vec::new();
-        for path in paths {
-            let base_config = BaseConnectorConfig::Sink {
-                key: key.to_owned(),
-            };
-            let connector_config: ConnectorConfig =
-                Self::create_file_config_provider(path, &base_config)
-                    .load_config()
-                    .await
-                    .expect("Failed to load sink configuration");
-            if let ConnectorConfig::Source(sink_config) = connector_config {
-                configs.push(sink_config);
-            }
-        }
-        Ok(configs)
+        Ok(self
+            .state
+            .connectors_config
+            .sources_grouped_by_key()
+            .get(key)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|config_file| config_file.config)
+            .collect())
     }
 
     async fn get_source_config(
@@ -555,34 +597,17 @@ impl ConnectorsConfigProvider for LocalConnectorsConfigProvider {
         key: &str,
         version: Option<u64>,
     ) -> Result<Option<SourceConfig>, RuntimeError> {
-        if !self.config_dir_exists()? {
-            return Ok(None);
-        }
-
         if let Some(version) = version {
-            let file_id = ConnectorConfigFileId::from_source_key_and_version(key, version);
-
-            if let Some(path) = self.file_mapping.get(&file_id.to_file_mapping_key()) {
-                let path = path.value().clone();
-                let base_config = BaseConnectorConfig::Sink {
-                    key: key.to_owned(),
-                };
-                let connector_config: ConnectorConfig =
-                    Self::create_file_config_provider(path, &base_config)
-                        .load_config()
-                        .await
-                        .expect("Failed to load sink configuration");
-                if let ConnectorConfig::Source(sink_config) = connector_config {
-                    Ok(Some(sink_config))
-                } else {
-                    Err(RuntimeError::InvalidConfiguration(
-                        "Configuration is not a source configuration".to_owned(),
-                    ))
-                }
-            } else {
-                debug!("No file mapping found for connector config: {:?}", file_id);
-                Ok(None)
-            }
+            let connector_id = ConnectorId {
+                key: key.to_owned(),
+                version,
+            };
+            Ok(self
+                .state
+                .connectors_config
+                .sources()
+                .get(&connector_id)
+                .map(|entry| entry.config.clone()))
         } else {
             Ok(self
                 .get_source_configs(key)
@@ -590,49 +615,6 @@ impl ConnectorsConfigProvider for LocalConnectorsConfigProvider {
                 .into_iter()
                 .max_by_key(|config| config.version))
         }
-    }
-
-    async fn get_config_versions(&self) -> Result<ConnectorConfigVersions, RuntimeError> {
-        let all_configs = self.get_all_configs().await?;
-        let active_versions = self.load_active_versions();
-
-        let sinks = all_configs
-            .sinks()
-            .iter()
-            .map(|(key, configs)| {
-                let latest_version = configs.iter().map(|c| c.version).max();
-                let active_version = active_versions.sinks.get(key).copied().or(latest_version);
-
-                let versions = configs
-                    .iter()
-                    .map(|config| ConnectorConfigVersionInfo {
-                        version: config.version,
-                        is_active: active_version == Some(config.version),
-                    })
-                    .collect();
-                (key.clone(), versions)
-            })
-            .collect();
-
-        let sources = all_configs
-            .sources()
-            .iter()
-            .map(|(key, configs)| {
-                let latest_version = configs.iter().map(|c| c.version).max();
-                let active_version = active_versions.sources.get(key).copied().or(latest_version);
-
-                let versions = configs
-                    .iter()
-                    .map(|config| ConnectorConfigVersionInfo {
-                        version: config.version,
-                        is_active: active_version == Some(config.version),
-                    })
-                    .collect();
-                (key.clone(), versions)
-            })
-            .collect();
-
-        Ok(ConnectorConfigVersions { sinks, sources })
     }
 }
 
