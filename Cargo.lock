@@ -1656,17 +1656,13 @@ dependencies = [
 
 [[package]]
 name = "compio-ws"
-version = "0.1.0"
-source = "git+https://github.com/krishvishal/compio-ws?rev=b30c9e4cd2fe607faa81b4c7eff2d14b6140f15d#b30c9e4cd2fe607faa81b4c7eff2d14b6140f15d"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c472e61baedabde6491c787e04123a778199229e9c957b58cd10ff409e802acc"
 dependencies = [
- "compio",
  "compio-buf",
  "compio-io",
- "compio-net",
- "compio-runtime",
- "compio-tls",
  "log",
- "rustls",
  "rustls-pemfile",
  "tungstenite",
 ]
