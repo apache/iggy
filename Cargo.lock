@@ -4219,7 +4219,7 @@ dependencies = [
 
 [[package]]
 name = "iggy-bench-dashboard-server"
-version = "0.5.0-edge.3"
+version = "0.5.0-edge.4"
 dependencies = [
  "actix-cors",
  "actix-files",
