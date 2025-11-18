@@ -15,12 +15,14 @@
 # specific language governing permissions and limitations
 # under the License.
 
-[sinks.postgres]
+type = "sink"
+key = "postgres"
 enabled = true
+version = 0
 name = "Postgres sink"
 path = "../../target/debug/libiggy_connector_postgres_sink"
 
-[[sinks.postgres.streams]]
+[[streams]]
 stream = ""
 topics = [""]
 schema = "json"
@@ -28,7 +30,7 @@ batch_length = 100
 poll_interval = "5ms"
 consumer_group = "test"
 
-[sinks.postgres.config]
+[plugin_config]
 connection_string = ""
 target_table = "iggy_messages"
 batch_size = 100

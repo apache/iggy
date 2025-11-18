@@ -16,12 +16,12 @@
 # under the License.
 
 type = "sink"
-id = "quickwit"
+key = "quickwit"
 enabled = true
 version = 0
 name = "Quickwit sink 1"
 path = "target/release/libiggy_connector_quickwit_sink"
-config_format = "yaml"
+plugin_config_format = "yaml"
 
 [[streams]]
 stream = "qw"
@@ -50,7 +50,7 @@ value.computed = "uuid_v7"
 enabled = true
 fields = ["email", "created_at"]
 
-[config]
+[plugin_config]
 url = "http://localhost:7280"
 index = """
 version: 0.9

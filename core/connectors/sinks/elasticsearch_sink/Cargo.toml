@@ -16,12 +16,12 @@
 # under the License.
 
 [package]
-name = "iggy_connector_random_source"
+name = "iggy_connector_elasticsearch_sink"
 version = "0.1.0"
-description = "Iggy is the persistent message streaming platform written in Rust, supporting QUIC, TCP and HTTP transport protocols, capable of processing millions of messages per second."
+description = "Iggy Elasticsearch sink connector"
 edition = "2024"
 license = "Apache-2.0"
-keywords = ["iggy", "messaging", "streaming"]
+keywords = ["iggy", "messaging", "streaming", "elastic", "elasticsearch"]
 categories = ["command-line-utilities", "database", "network-programming"]
 homepage = "https://iggy.apache.org"
 documentation = "https://iggy.apache.org/docs"
@@ -29,21 +29,21 @@ repository = "https://github.com/apache/iggy"
 readme = "../../README.md"
 
 [package.metadata.cargo-machete]
-ignored = ["dashmap", "once_cell"]
+ignored = ["dashmap", "once_cell", "futures", "simd-json"]
 
 [lib]
 crate-type = ["cdylib", "lib"]
 
 [dependencies]
 async-trait = { workspace = true }
+base64 = { workspace = true }
+chrono = { workspace = true }
 dashmap = { workspace = true }
-humantime = { workspace = true }
-iggy_connector_sdk = { workspace = true }
+elasticsearch = "9.1.0-alpha.1"
+iggy_connector_sdk = { path = "../../sdk" }
 once_cell = { workspace = true }
-rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 simd-json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
-uuid = { workspace = true }

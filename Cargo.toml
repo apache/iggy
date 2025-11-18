@@ -31,9 +31,11 @@ members = [
     "core/common",
     "core/connectors/runtime",
     "core/connectors/sdk",
+    "core/connectors/sinks/elasticsearch_sink",
     "core/connectors/sinks/postgres_sink",
     "core/connectors/sinks/quickwit_sink",
     "core/connectors/sinks/stdout_sink",
+    "core/connectors/sources/elasticsearch_source",
     "core/connectors/sources/postgres_source",
     "core/connectors/sources/random_source",
     "core/consensus",
@@ -99,9 +101,7 @@ compio-quic = "0.5.1"
 compio-tls = { version = "0.7.1", features = [
     "rustls",
 ], default-features = false }
-compio-ws = { git = "https://github.com/krishvishal/compio-ws", rev = "b30c9e4cd2fe607faa81b4c7eff2d14b6140f15d", features = [
-    "rustls",
-] }
+compio-ws = "0.1.1"
 console-subscriber = "0.5.0"
 crossbeam = "0.8.4"
 cyper = { version = "0.6.2", features = ["rustls"], default-features = false }

@@ -15,27 +15,6 @@
 # specific language governing permissions and limitations
 # under the License.
 
-type = "sink"
-key = "stdout"
-enabled = true
-version = 0
-name = "Stdout sink"
-path = "target/release/libiggy_connector_stdout_sink"
-
-[[streams]]
-stream = "example_stream"
-topics = ["example_topic"]
-schema = "json"
-batch_length = 100
-poll_interval = "5ms"
-consumer_group = "stdout_sink_connector"
-
-[plugin_config]
-print_payload = false
-
-[transforms.add_fields]
-enabled = true
-
-[[transforms.add_fields.fields]]
-key = "message"
-value.static = "hello"
+[connectors]
+config_type = "local"
+config_dir = "postgres/connectors_config"

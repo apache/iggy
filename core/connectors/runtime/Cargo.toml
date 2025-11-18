@@ -32,6 +32,7 @@ readme = "README.md"
 async-trait = { workspace = true }
 axum = { workspace = true }
 axum-server = { workspace = true }
+chrono = { workspace = true }
 dashmap = { workspace = true }
 dlopen2 = { workspace = true }
 dotenvy = { workspace = true }
