@@ -76,8 +76,7 @@ impl StateProvider for FileStateProvider {
             Ok(None)
         } else {
             info!("Loaded state file: {}", self.path);
-            let state = serde_json::from_slice(&buffer)
-                .map_err(|_| Error::CannotReadStateFile)?;
+            let state = serde_json::from_slice(&buffer).map_err(|_| Error::CannotReadStateFile)?;
             Ok(Some(state))
         }
     }
@@ -98,8 +97,7 @@ impl StateProvider for FileStateProvider {
             Error::CannotWriteStateFile
         })?;
 
-        let state_bytes = serde_json::to_vec(&state)
-            .map_err(|_| Error::CannotWriteStateFile)?;
+        let state_bytes = serde_json::to_vec(&state).map_err(|_| Error::CannotWriteStateFile)?;
 
         file.write_all(&state_bytes).await.map_err(|error| {
             error!("Cannot write state file: {}. {error}.", self.path);

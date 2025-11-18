@@ -24,8 +24,7 @@ use iggy::prelude::{
     DirectConfig, HeaderKey, HeaderValue, IggyClient, IggyDuration, IggyError, IggyMessage,
 };
 use iggy_connector_sdk::{
-    DecodedMessage, Error, ProducedMessages, StreamEncoder, TopicMetadata,
-    transforms::Transform,
+    DecodedMessage, Error, ProducedMessages, StreamEncoder, TopicMetadata, transforms::Transform,
 };
 use once_cell::sync::Lazy;
 use std::{
