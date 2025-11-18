@@ -37,10 +37,7 @@ public final class OffsetConfig implements Serializable {
     private final int commitBatchSize;
 
     private OffsetConfig(
-            OffsetResetStrategy resetStrategy,
-            Duration commitInterval,
-            boolean autoCommit,
-            int commitBatchSize) {
+            OffsetResetStrategy resetStrategy, Duration commitInterval, boolean autoCommit, int commitBatchSize) {
         this.resetStrategy = Objects.requireNonNull(resetStrategy, "resetStrategy must not be null");
         this.commitInterval = Objects.requireNonNull(commitInterval, "commitInterval must not be null");
         this.autoCommit = autoCommit;
@@ -116,15 +113,13 @@ public final class OffsetConfig implements Serializable {
     /**
      * Builder for {@link OffsetConfig}.
      */
-    @SuppressWarnings("checkstyle:HiddenField")
     public static final class Builder {
         private OffsetResetStrategy resetStrategy = OffsetResetStrategy.LATEST;
         private Duration commitInterval = Duration.ofSeconds(5);
         private boolean autoCommit = true;
         private int commitBatchSize = 100;
 
-        private Builder() {
-        }
+        private Builder() {}
 
         public Builder resetStrategy(OffsetResetStrategy resetStrategy) {
             this.resetStrategy = resetStrategy;

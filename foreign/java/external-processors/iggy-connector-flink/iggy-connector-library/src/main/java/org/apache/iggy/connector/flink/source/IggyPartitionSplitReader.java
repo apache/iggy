@@ -20,29 +20,29 @@
 package org.apache.iggy.connector.flink.source;
 
 import org.apache.iggy.client.async.tcp.AsyncIggyTcpClient;
+import org.apache.iggy.connector.error.ConnectorException;
+import org.apache.iggy.connector.serialization.DeserializationSchema;
+import org.apache.iggy.connector.serialization.RecordMetadata;
 import org.apache.iggy.consumergroup.Consumer;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.PolledMessages;
 import org.apache.iggy.message.PollingStrategy;
-import org.apache.iggy.connector.error.ConnectorException;
-import org.apache.iggy.connector.serialization.DeserializationSchema;
-import org.apache.iggy.connector.serialization.RecordMetadata;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 /**
  * Reads messages from a single Iggy partition.
  * Manages offset tracking and message deserialization.
  */
 public class IggyPartitionSplitReader<T> {
-    private static final Logger LOGGER = LoggerFactory.getLogger(IggyPartitionSplitReader.class);
+    private static final Logger log = LoggerFactory.getLogger(IggyPartitionSplitReader.class);
 
     private final AsyncIggyTcpClient asyncClient;
     private final IggySourceSplit split;
@@ -57,10 +57,10 @@ public class IggyPartitionSplitReader<T> {
     /**
      * Creates a new partition split reader.
      *
-     * @param asyncClient the async Iggy client
-     * @param split the source split to read from
-     * @param deserializer the deserialization schema
-     * @param consumer the consumer identifier
+     * @param asyncClient   the async Iggy client
+     * @param split         the source split to read from
+     * @param deserializer  the deserialization schema
+     * @param consumer      the consumer identifier
      * @param pollBatchSize number of messages to fetch per poll
      */
     public IggyPartitionSplitReader(
@@ -111,15 +111,19 @@ public class IggyPartitionSplitReader<T> {
 
             // Join consumer group on first poll (idempotent operation in Iggy)
             if (!consumerGroupJoined) {
-                LOGGER.info("IggyPartitionSplitReader: Joining consumer group for stream={}, "
+                log.info(
+                        "IggyPartitionSplitReader: Joining consumer group for stream={}, "
                                 + "topic={}, consumer={}, partition={}",
-                        split.getStreamId(), split.getTopicId(), consumer.id(),
+                        split.getStreamId(),
+                        split.getTopicId(),
+                        consumer.id(),
                         split.getPartitionId());
-                asyncClient.consumerGroups()
+                asyncClient
+                        .consumerGroups()
                         .joinConsumerGroup(streamId, topicId, consumer.id())
                         .join();
                 consumerGroupJoined = true;
-                LOGGER.info("IggyPartitionSplitReader: Successfully joined consumer group");
+                log.info("IggyPartitionSplitReader: Successfully joined consumer group");
             }
             Optional<Long> partitionId = Optional.of((long) split.getPartitionId());
 
@@ -128,23 +132,27 @@ public class IggyPartitionSplitReader<T> {
             // Using PollingStrategy.offset() conflicts with consumer group offset management.
             PollingStrategy strategy = PollingStrategy.next();
 
-            LOGGER.info("IggyPartitionSplitReader: Polling partition={}, "
+            log.info(
+                    "IggyPartitionSplitReader: Polling partition={}, "
                             + "strategy=NEXT (consumer-group-managed), batchSize={}",
-                    split.getPartitionId(), pollBatchSize);
+                    split.getPartitionId(),
+                    pollBatchSize);
 
             // CRITICAL FIX: Enable autoCommit to advance consumer group offset after each poll
             // Without this, offset never advances and we read the same messages repeatedly
             // Poll messages from Iggy (async with blocking)
-            PolledMessages polledMessages = asyncClient.messages()
-                    .pollMessagesAsync(streamId, topicId, partitionId, consumer, strategy,
-                            pollBatchSize, true)
+            PolledMessages polledMessages = asyncClient
+                    .messages()
+                    .pollMessagesAsync(streamId, topicId, partitionId, consumer, strategy, pollBatchSize, true)
                     .join();
 
-            LOGGER.info("IggyPartitionSplitReader: Polled partition={}, messagesCount={}, "
-                            + "currentOffset={}",
-                    split.getPartitionId(), polledMessages.messages().size(),
+            log.info(
+                    "IggyPartitionSplitReader: Polled partition={}, messagesCount={}, " + "currentOffset={}",
+                    split.getPartitionId(),
+                    polledMessages.messages().size(),
                     polledMessages.currentOffset() != null
-                            ? polledMessages.currentOffset().longValue() : "null");
+                            ? polledMessages.currentOffset().longValue()
+                            : "null");
 
             if (polledMessages.messages().isEmpty()) {
                 // For unbounded streams, keep polling even if no messages available
@@ -157,9 +165,10 @@ public class IggyPartitionSplitReader<T> {
             for (Message message : polledMessages.messages()) {
                 T record = deserializeMessage(message);
                 if (record != null) {
-                    LOGGER.info("IggyPartitionSplitReader: Deserialized message at "
-                                    + "offset={}, record={}",
-                            message.header().offset(), record);
+                    log.info(
+                            "IggyPartitionSplitReader: Deserialized message at " + "offset={}, record={}",
+                            message.header().offset(),
+                            record);
                     records.add(record);
                 }
             }
@@ -167,13 +176,12 @@ public class IggyPartitionSplitReader<T> {
             // Update current offset
             if (polledMessages.currentOffset() != null) {
                 currentOffset = polledMessages.currentOffset().longValue() + 1;
-                LOGGER.info("IggyPartitionSplitReader: Updated currentOffset to {}",
-                        currentOffset);
+                log.info("IggyPartitionSplitReader: Updated currentOffset to {}", currentOffset);
             }
 
             return records;
 
-        } catch (Exception e) {
+        } catch (RuntimeException e) {
             throw new ConnectorException(
                     "Failed to poll messages from partition " + split.getPartitionId(),
                     e,
@@ -200,8 +208,11 @@ public class IggyPartitionSplitReader<T> {
 
         } catch (IOException e) {
             // Log warning and skip this message (can be made configurable)
-            LOGGER.warn("Failed to deserialize message at offset {}: {}",
-                    message.header().offset(), e.getMessage(), e);
+            log.warn(
+                    "Failed to deserialize message at offset {}: {}",
+                    message.header().offset(),
+                    e.getMessage(),
+                    e);
             return null;
         }
     }

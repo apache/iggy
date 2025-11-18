@@ -29,6 +29,4 @@ public record GlobalPermissions(
         boolean manageTopics,
         boolean readTopics,
         boolean pollMessages,
-        boolean sendMessages
-) {
-}
+        boolean sendMessages) {}

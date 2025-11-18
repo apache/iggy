@@ -19,8 +19,8 @@
 
 package org.apache.iggy.connector.serialization;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.DeserializationFeature;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 
@@ -74,8 +74,7 @@ public class JsonDeserializationSchema<T> implements DeserializationSchema<T> {
         try {
             return getObjectMapper().readValue(data, typeClass);
         } catch (IOException e) {
-            throw new IOException(
-                    "Failed to deserialize JSON for type " + typeClass.getName(), e);
+            throw new IOException("Failed to deserialize JSON for type " + typeClass.getName(), e);
         }
     }
 

@@ -19,10 +19,4 @@
 
 package org.apache.iggy.client.blocking.http.error;
 
-public record IggyHttpError(
-        String id,
-        String code,
-        String reason,
-        String field
-) {
-}
+public record IggyHttpError(String id, String code, String reason, String field) {}

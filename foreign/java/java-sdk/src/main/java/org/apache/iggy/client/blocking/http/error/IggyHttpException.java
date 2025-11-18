@@ -30,5 +30,4 @@ public class IggyHttpException extends RuntimeException {
     public IggyHttpError getError() {
         return error;
     }
-
 }

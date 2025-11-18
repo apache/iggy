@@ -54,42 +54,43 @@ public class StreamsTcpClient implements StreamsClient {
 
         payload.writeBytes(nameToBytes(name));
 
-        return connection.sendAsync(CommandCode.Stream.CREATE.getValue(), payload)
-            .thenApply(response -> {
-                StreamDetails details = readStreamDetails(response);
-                response.release();
-                return details;
-            });
+        return connection
+                .sendAsync(CommandCode.Stream.CREATE.getValue(), payload)
+                .thenApply(response -> {
+                    StreamDetails details = readStreamDetails(response);
+                    response.release();
+                    return details;
+                });
     }
 
     @Override
     public CompletableFuture<Optional<StreamDetails>> getStreamAsync(StreamId streamId) {
         var payload = toBytes(streamId);
 
-        return connection.sendAsync(CommandCode.Stream.GET.getValue(), payload)
-            .thenApply(response -> {
-                Optional<StreamDetails> result;
-                if (response.isReadable()) {
-                    result = Optional.of(readStreamDetails(response));
-                } else {
-                    result = Optional.empty();
-                }
-                response.release();
-                return result;
-            });
+        return connection.sendAsync(CommandCode.Stream.GET.getValue(), payload).thenApply(response -> {
+            Optional<StreamDetails> result;
+            if (response.isReadable()) {
+                result = Optional.of(readStreamDetails(response));
+            } else {
+                result = Optional.empty();
+            }
+            response.release();
+            return result;
+        });
     }
 
     @Override
     public CompletableFuture<List<StreamBase>> getStreamsAsync() {
-        return connection.sendAsync(CommandCode.Stream.GET_ALL.getValue(), Unpooled.EMPTY_BUFFER)
-            .thenApply(response -> {
-                List<StreamBase> streams = new ArrayList<>();
-                while (response.isReadable()) {
-                    streams.add(readStreamBase(response));
-                }
-                response.release();
-                return streams;
-            });
+        return connection
+                .sendAsync(CommandCode.Stream.GET_ALL.getValue(), Unpooled.EMPTY_BUFFER)
+                .thenApply(response -> {
+                    List<StreamBase> streams = new ArrayList<>();
+                    while (response.isReadable()) {
+                        streams.add(readStreamBase(response));
+                    }
+                    response.release();
+                    return streams;
+                });
     }
 
     @Override
@@ -101,15 +102,17 @@ public class StreamsTcpClient implements StreamsClient {
         payload.writeBytes(idBytes);
         payload.writeBytes(nameToBytes(name));
 
-        return connection.sendAsync(CommandCode.Stream.UPDATE.getValue(), payload)
-            .thenAccept(response -> response.release());
+        return connection
+                .sendAsync(CommandCode.Stream.UPDATE.getValue(), payload)
+                .thenAccept(response -> response.release());
     }
 
     @Override
     public CompletableFuture<Void> deleteStreamAsync(StreamId streamId) {
         var payload = toBytes(streamId);
 
-        return connection.sendAsync(CommandCode.Stream.DELETE.getValue(), payload)
-            .thenAccept(response -> response.release());
+        return connection
+                .sendAsync(CommandCode.Stream.DELETE.getValue(), payload)
+                .thenAccept(response -> response.release());
     }
 }

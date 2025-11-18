@@ -28,5 +28,4 @@ class MessagesHttpClientTest extends MessagesClientBaseTest {
     protected IggyBaseClient getClient() {
         return HttpClientFactory.create(iggyServer);
     }
-
 }

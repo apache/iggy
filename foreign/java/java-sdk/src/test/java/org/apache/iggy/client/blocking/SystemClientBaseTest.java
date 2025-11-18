@@ -21,6 +21,7 @@ package org.apache.iggy.client.blocking;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+
 import static org.assertj.core.api.Assertions.assertThat;
 
 public abstract class SystemClientBaseTest extends IntegrationTest {
@@ -42,5 +43,4 @@ public abstract class SystemClientBaseTest extends IntegrationTest {
         // then
         assertThat(stats).isNotNull();
     }
-
 }

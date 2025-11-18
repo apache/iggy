@@ -19,14 +19,16 @@
 
 package org.apache.iggy.client.blocking.tcp;
 
-import org.apache.iggy.client.blocking.IntegrationTest;
 import org.apache.iggy.client.blocking.IggyBaseClient;
+import org.apache.iggy.client.blocking.IntegrationTest;
 import org.apache.iggy.system.ClientInfo;
 import org.junit.jupiter.api.Test;
+
 import java.time.Duration;
 import java.util.List;
 
-import static org.junit.jupiter.api.Assertions.*;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 /**
  * Integration tests for IggyTcpClient builder pattern.
@@ -42,10 +44,8 @@ class IggyTcpClientBuilderTest extends IntegrationTest {
     @Test
     void shouldCreateClientWithBuilder() {
         // Given: Builder with basic configuration
-        IggyTcpClient client = IggyTcpClient.builder()
-                .host("127.0.0.1")
-                .port(TCP_PORT)
-                .build();
+        IggyTcpClient client =
+                IggyTcpClient.builder().host("127.0.0.1").port(TCP_PORT).build();
 
         // When: Login to verify connection
         client.users().login("iggy", "iggy");
@@ -174,9 +174,8 @@ class IggyTcpClientBuilderTest extends IntegrationTest {
     @Test
     void shouldUseDefaultValues() {
         // Given: Builder with only required fields (should use defaults)
-        IggyTcpClient client = IggyTcpClient.builder()
-                .credentials("iggy", "iggy")
-                .build(); // Uses default host=localhost, port=8090
+        IggyTcpClient client =
+                IggyTcpClient.builder().credentials("iggy", "iggy").build(); // Uses default host=localhost, port=8090
 
         // When: Perform an operation
         // Then: Should succeed
@@ -187,9 +186,7 @@ class IggyTcpClientBuilderTest extends IntegrationTest {
     @Test
     void shouldThrowExceptionForEmptyHost() {
         // Given: Builder with empty host
-        IggyTcpClient.Builder builder = IggyTcpClient.builder()
-                .host("")
-                .port(TCP_PORT);
+        IggyTcpClient.Builder builder = IggyTcpClient.builder().host("").port(TCP_PORT);
 
         // When/Then: Building should throw IllegalArgumentException
         assertThrows(IllegalArgumentException.class, builder::build);
@@ -198,9 +195,7 @@ class IggyTcpClientBuilderTest extends IntegrationTest {
     @Test
     void shouldThrowExceptionForNullHost() {
         // Given: Builder with null host
-        IggyTcpClient.Builder builder = IggyTcpClient.builder()
-                .host(null)
-                .port(TCP_PORT);
+        IggyTcpClient.Builder builder = IggyTcpClient.builder().host(null).port(TCP_PORT);
 
         // When/Then: Building should throw IllegalArgumentException
         assertThrows(IllegalArgumentException.class, builder::build);
@@ -209,9 +204,8 @@ class IggyTcpClientBuilderTest extends IntegrationTest {
     @Test
     void shouldThrowExceptionForInvalidPort() {
         // Given: Builder with invalid port
-        IggyTcpClient.Builder builder = IggyTcpClient.builder()
-                .host("127.0.0.1")
-                .port(-1);
+        IggyTcpClient.Builder builder =
+                IggyTcpClient.builder().host("127.0.0.1").port(-1);
 
         // When/Then: Building should throw IllegalArgumentException
         assertThrows(IllegalArgumentException.class, builder::build);
@@ -220,9 +214,8 @@ class IggyTcpClientBuilderTest extends IntegrationTest {
     @Test
     void shouldThrowExceptionForZeroPort() {
         // Given: Builder with zero port
-        IggyTcpClient.Builder builder = IggyTcpClient.builder()
-                .host("127.0.0.1")
-                .port(0);
+        IggyTcpClient.Builder builder =
+                IggyTcpClient.builder().host("127.0.0.1").port(0);
 
         // When/Then: Building should throw IllegalArgumentException
         assertThrows(IllegalArgumentException.class, builder::build);

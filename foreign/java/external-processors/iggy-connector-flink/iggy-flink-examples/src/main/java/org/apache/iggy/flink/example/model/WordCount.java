@@ -36,9 +36,7 @@ public class WordCount implements Serializable {
     private final long count;
 
     @JsonCreator
-    public WordCount(
-            @JsonProperty("word") String word,
-            @JsonProperty("count") long count) {
+    public WordCount(@JsonProperty("word") String word, @JsonProperty("count") long count) {
         this.word = word;
         this.count = count;
     }

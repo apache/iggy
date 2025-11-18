@@ -19,10 +19,10 @@
 
 package org.apache.iggy.client.blocking.tcp;
 
-import org.junit.jupiter.api.BeforeEach;
 import org.apache.iggy.client.blocking.IggyBaseClient;
 import org.apache.iggy.client.blocking.UsersClient;
 import org.apache.iggy.client.blocking.UsersClientBaseTest;
+import org.junit.jupiter.api.BeforeEach;
 
 class UsersTcpClientTest extends UsersClientBaseTest {
 
@@ -37,5 +37,4 @@ class UsersTcpClientTest extends UsersClientBaseTest {
     void beforeEach() {
         usersClient = client.users();
     }
-
 }

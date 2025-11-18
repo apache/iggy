@@ -28,5 +28,4 @@ class PartitionsTcpClientTest extends PartitionsClientBaseTest {
     protected IggyBaseClient getClient() {
         return TcpClientFactory.create(iggyServer);
     }
-
 }

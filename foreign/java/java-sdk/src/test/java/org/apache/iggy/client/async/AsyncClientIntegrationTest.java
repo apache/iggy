@@ -27,7 +27,13 @@ import org.apache.iggy.message.Message;
 import org.apache.iggy.message.Partitioning;
 import org.apache.iggy.message.PollingStrategy;
 import org.apache.iggy.topic.CompressionAlgorithm;
-import org.junit.jupiter.api.*;
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Disabled;
+import org.junit.jupiter.api.MethodOrderer;
+import org.junit.jupiter.api.Order;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.TestMethodOrder;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -40,7 +46,6 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * Integration test for the complete async client flow.
@@ -48,7 +53,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  */
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
 class AsyncClientIntegrationTest {
-    private static final Logger logger = LoggerFactory.getLogger(AsyncClientIntegrationTest.class);
+    private static final Logger log = LoggerFactory.getLogger(AsyncClientIntegrationTest.class);
 
     private static final String HOST = "127.0.0.1";
     private static final int PORT = 8090;
@@ -63,73 +68,69 @@ class AsyncClientIntegrationTest {
 
     @BeforeAll
     public static void setup() throws Exception {
-        logger.info("Setting up async client for integration tests");
+        log.info("Setting up async client for integration tests");
         client = new AsyncIggyTcpClient(HOST, PORT);
 
         // Connect and login
         client.connect()
                 .thenCompose(v -> {
-                    logger.info("Connected to Iggy server");
+                    log.info("Connected to Iggy server");
                     return client.users().loginAsync(USERNAME, PASSWORD);
                 })
                 .get(5, TimeUnit.SECONDS);
 
-        logger.info("Successfully logged in as: {}", USERNAME);
+        log.info("Successfully logged in as: {}", USERNAME);
     }
 
     @AfterAll
     public static void tearDown() throws Exception {
-        logger.info("Cleaning up test resources");
+        log.info("Cleaning up test resources");
 
         try {
             // Clean up test stream if it exists
-            client.streams().deleteStreamAsync(StreamId.of(TEST_STREAM))
-                    .get(5, TimeUnit.SECONDS);
-            logger.info("Deleted test stream: {}", TEST_STREAM);
-        } catch (Exception e) {
+            client.streams().deleteStreamAsync(StreamId.of(TEST_STREAM)).get(5, TimeUnit.SECONDS);
+            log.info("Deleted test stream: {}", TEST_STREAM);
+        } catch (RuntimeException e) {
             // Stream may not exist, which is fine
-            logger.debug("Stream cleanup failed (may not exist): {}", e.getMessage());
+            log.debug("Stream cleanup failed (may not exist): {}", e.getMessage());
         }
 
         // Close the client
         if (client != null) {
             client.close().get(5, TimeUnit.SECONDS);
-            logger.info("Closed async client");
+            log.info("Closed async client");
         }
     }
 
     @Test
     @Order(1)
     public void testCreateStream() throws Exception {
-        logger.info("Testing stream creation");
+        log.info("Testing stream creation");
 
-        var streamDetails = client.streams()
-                .createStreamAsync(TEST_STREAM)
-                .get(5, TimeUnit.SECONDS);
+        var streamDetails = client.streams().createStreamAsync(TEST_STREAM).get(5, TimeUnit.SECONDS);
 
         assertThat(streamDetails).isNotNull();
         assertThat(streamDetails.name()).isEqualTo(TEST_STREAM);
-        logger.info("Successfully created stream: {}", streamDetails.name());
+        log.info("Successfully created stream: {}", streamDetails.name());
     }
 
     @Test
     @Order(2)
     public void testGetStream() throws Exception {
-        logger.info("Testing stream retrieval");
+        log.info("Testing stream retrieval");
 
-        var streamOpt = client.streams()
-                .getStreamAsync(StreamId.of(TEST_STREAM))
-                .get(5, TimeUnit.SECONDS);
+        var streamOpt =
+                client.streams().getStreamAsync(StreamId.of(TEST_STREAM)).get(5, TimeUnit.SECONDS);
 
         assertThat(streamOpt).isPresent();
         assertThat(streamOpt.get().name()).isEqualTo(TEST_STREAM);
-        logger.info("Successfully retrieved stream: {}", streamOpt.get().name());
+        log.info("Successfully retrieved stream: {}", streamOpt.get().name());
     }
 
     @Test
     @Order(3)
     public void testCreateTopic() throws Exception {
-        logger.info("Testing topic creation");
+        log.info("Testing topic creation");
 
         var topicDetails = client.topics()
                 .createTopicAsync(
@@ -139,38 +140,36 @@ class AsyncClientIntegrationTest {
                         BigInteger.ZERO,
                         BigInteger.ZERO,
                         Optional.empty(),
-                        TEST_TOPIC
-                )
+                        TEST_TOPIC)
                 .get(5, TimeUnit.SECONDS);
 
         assertThat(topicDetails).isNotNull();
         assertThat(topicDetails.name()).isEqualTo(TEST_TOPIC);
         assertThat(topicDetails.partitionsCount()).isEqualTo(2);
-        logger.info("Successfully created topic: {} with {} partitions",
-                topicDetails.name(), topicDetails.partitionsCount());
+        log.info(
+                "Successfully created topic: {} with {} partitions",
+                topicDetails.name(),
+                topicDetails.partitionsCount());
     }
 
     @Test
     @Order(4)
     public void testGetTopic() throws Exception {
-        logger.info("Testing topic retrieval");
+        log.info("Testing topic retrieval");
 
         var topicOpt = client.topics()
-                .getTopicAsync(
-                        StreamId.of(TEST_STREAM),
-                        TopicId.of(TEST_TOPIC)
-                )
+                .getTopicAsync(StreamId.of(TEST_STREAM), TopicId.of(TEST_TOPIC))
                 .get(5, TimeUnit.SECONDS);
 
         assertThat(topicOpt).isPresent();
         assertThat(topicOpt.get().name()).isEqualTo(TEST_TOPIC);
-        logger.info("Successfully retrieved topic: {}", topicOpt.get().name());
+        log.info("Successfully retrieved topic: {}", topicOpt.get().name());
     }
 
     @Test
     @Order(5)
     public void testSendMessages() throws Exception {
-        logger.info("Testing message sending");
+        log.info("Testing message sending");
 
         List<Message> messages = new ArrayList<>();
         for (int i = 0; i < 10; i++) {
@@ -184,17 +183,16 @@ class AsyncClientIntegrationTest {
                         StreamId.of(TEST_STREAM),
                         TopicId.of(TEST_TOPIC),
                         Partitioning.partitionId(PARTITION_ID),
-                        messages
-                )
+                        messages)
                 .get(5, TimeUnit.SECONDS);
 
-        logger.info("Successfully sent {} messages", messages.size());
+        log.info("Successfully sent {} messages", messages.size());
     }
 
     @Test
     @Order(6)
     public void testPollMessages() throws Exception {
-        logger.info("Testing message polling");
+        log.info("Testing message polling");
 
         // Poll messages from partition 1 - Use valid consumer instead of null
         var consumer = Consumer.of(12345L); // Create consumer with ID
@@ -206,30 +204,32 @@ class AsyncClientIntegrationTest {
                         consumer, // Use valid consumer instead of null
                         PollingStrategy.offset(BigInteger.ZERO),
                         10L,
-                        false
-                )
+                        false)
                 .get(5, TimeUnit.SECONDS);
 
         assertThat(polledMessages).isNotNull();
         assertThat(polledMessages.partitionId()).isEqualTo(PARTITION_ID);
         assertThat(polledMessages.messages()).isNotEmpty();
-        logger.info("Successfully polled {} messages from partition {}",
-                polledMessages.messages().size(), polledMessages.partitionId());
+        log.info(
+                "Successfully polled {} messages from partition {}",
+                polledMessages.messages().size(),
+                polledMessages.partitionId());
 
         // Verify message content
         for (var message : polledMessages.messages()) {
             String content = new String(message.payload());
             assertThat(content).startsWith("Test message");
-            logger.debug("Polled message: {}", content);
+            log.debug("Polled message: {}", content);
         }
     }
 
     // TODO: Re-enable when server supports null consumer polling
     // This test fails because it uses null consumer which causes server timeout
-    // @Test
+    @Test
+    @Disabled
     @Order(7)
-    public void testSendAndPollLargeVolume_DISABLED() throws Exception {
-        logger.info("Testing high-volume message operations");
+    public void testSendAndPollLargeVolume() throws Exception {
+        log.info("Testing high-volume message operations");
 
         int messageCount = 100;
         List<CompletableFuture<Void>> sendFutures = new ArrayList<>();
@@ -248,16 +248,14 @@ class AsyncClientIntegrationTest {
                             StreamId.of(TEST_STREAM),
                             TopicId.of(TEST_TOPIC),
                             Partitioning.partitionId(PARTITION_ID),
-                            batchMessages
-                    );
+                            batchMessages);
             sendFutures.add(future);
         }
 
         // Wait for all sends to complete
-        CompletableFuture.allOf(sendFutures.toArray(new CompletableFuture[0]))
-                .get(10, TimeUnit.SECONDS);
+        CompletableFuture.allOf(sendFutures.toArray(new CompletableFuture[0])).get(10, TimeUnit.SECONDS);
 
-        logger.info("Successfully sent {} messages in batches", messageCount);
+        log.info("Successfully sent {} messages in batches", messageCount);
 
         // Poll all messages
         var polledMessages = client.messages()
@@ -268,21 +266,21 @@ class AsyncClientIntegrationTest {
                         null,
                         PollingStrategy.offset(BigInteger.ZERO),
                         (long) messageCount + 10, // Poll all messages sent
-                        false
-                )
+                        false)
                 .get(5, TimeUnit.SECONDS);
 
         assertThat(polledMessages).isNotNull();
         assertThat(polledMessages.messages().size()).isGreaterThanOrEqualTo(messageCount);
-        logger.info("Successfully polled {} messages", polledMessages.messages().size());
+        log.info("Successfully polled {} messages", polledMessages.messages().size());
     }
 
     // TODO: This test fails with connection issues after null consumer timeout
     // The connection gets closed after the previous test's null consumer timeout
-    // @Test
+    @Test
+    @Disabled
     @Order(8)
-    public void testUpdateTopic_DISABLED() throws Exception {
-        logger.info("Testing topic update");
+    public void testUpdateTopic() throws Exception {
+        log.info("Testing topic update");
 
         // Update topic with new compression algorithm
         client.topics()
@@ -293,30 +291,28 @@ class AsyncClientIntegrationTest {
                         BigInteger.valueOf(3600000000L), // 1 hour message expiry
                         BigInteger.valueOf(1073741824L), // 1GB max size
                         Optional.empty(),
-                        TEST_TOPIC
-                )
+                        TEST_TOPIC)
                 .get(5, TimeUnit.SECONDS);
 
         // Verify the update
         var updatedTopic = client.topics()
-                .getTopicAsync(
-                        StreamId.of(TEST_STREAM),
-                        TopicId.of(TEST_TOPIC)
-                )
+                .getTopicAsync(StreamId.of(TEST_STREAM), TopicId.of(TEST_TOPIC))
                 .get(5, TimeUnit.SECONDS);
 
         assertThat(updatedTopic).isPresent();
         assertThat(updatedTopic.get().compressionAlgorithm()).isEqualTo(CompressionAlgorithm.Gzip);
-        logger.info("Successfully updated topic with compression: {}",
+        log.info(
+                "Successfully updated topic with compression: {}",
                 updatedTopic.get().compressionAlgorithm());
     }
 
     // TODO: This test fails with connection issues after null consumer timeout
     // The connection gets closed after previous tests' null consumer timeout
-    // @Test
+    @Test
+    @Disabled
     @Order(9)
-    public void testDeleteTopic_DISABLED() throws Exception {
-        logger.info("Testing topic deletion");
+    public void testDeleteTopic() throws Exception {
+        log.info("Testing topic deletion");
 
         // Create a temporary topic to delete
         String tempTopic = "temp-topic-" + UUID.randomUUID();
@@ -328,37 +324,30 @@ class AsyncClientIntegrationTest {
                         BigInteger.ZERO,
                         BigInteger.ZERO,
                         Optional.empty(),
-                        tempTopic
-                )
+                        tempTopic)
                 .get(5, TimeUnit.SECONDS);
 
         // Delete the topic
         client.topics()
-                .deleteTopicAsync(
-                        StreamId.of(TEST_STREAM),
-                        TopicId.of(tempTopic)
-                )
+                .deleteTopicAsync(StreamId.of(TEST_STREAM), TopicId.of(tempTopic))
                 .get(5, TimeUnit.SECONDS);
 
         // Verify deletion
         var deletedTopic = client.topics()
-                .getTopicAsync(
-                        StreamId.of(TEST_STREAM),
-                        TopicId.of(tempTopic)
-                )
+                .getTopicAsync(StreamId.of(TEST_STREAM), TopicId.of(tempTopic))
                 .get(5, TimeUnit.SECONDS);
 
         assertThat(deletedTopic).isNotPresent();
-        logger.info("Successfully deleted topic: {}", tempTopic);
+        log.info("Successfully deleted topic: {}", tempTopic);
     }
 
     // TODO: Re-enable when server supports null consumer polling
     // This test uses null consumer in concurrent poll operations which causes timeout
-    // @Test
-    // @Test
+    @Test
+    @Disabled
     @Order(10)
-    void testConcurrentOperations_DISABLED() throws Exception {
-        logger.info("Testing concurrent async operations");
+    void testConcurrentOperations() throws Exception {
+        log.info("Testing concurrent async operations");
 
         // Create multiple concurrent operations
         List<CompletableFuture<?>> operations = new ArrayList<>();
@@ -367,20 +356,19 @@ class AsyncClientIntegrationTest {
         for (int i = 0; i < 5; i++) {
             final int threadNum = i;
             var future = CompletableFuture.supplyAsync(() -> {
-                List<Message> messages = new ArrayList<>();
-                for (int j = 0; j < 20; j++) {
-                    String content = String.format("Thread %d - Message %d", threadNum, j);
-                    messages.add(Message.of(content));
-                }
-                return messages;
-            }).thenCompose(messages ->
-                    client.messages().sendMessagesAsync(
-                            StreamId.of(TEST_STREAM),
-                            TopicId.of(TEST_TOPIC),
-                            Partitioning.partitionId(PARTITION_ID),
-                            messages
-                    )
-            );
+                        List<Message> messages = new ArrayList<>();
+                        for (int j = 0; j < 20; j++) {
+                            String content = String.format("Thread %d - Message %d", threadNum, j);
+                            messages.add(Message.of(content));
+                        }
+                        return messages;
+                    })
+                    .thenCompose(messages -> client.messages()
+                            .sendMessagesAsync(
+                                    StreamId.of(TEST_STREAM),
+                                    TopicId.of(TEST_TOPIC),
+                                    Partitioning.partitionId(PARTITION_ID),
+                                    messages));
             operations.add(future);
         }
 
@@ -394,15 +382,13 @@ class AsyncClientIntegrationTest {
                             null,
                             PollingStrategy.last(),
                             10L,
-                            false
-                    );
+                            false);
             operations.add(future);
         }
 
         // Wait for all operations to complete
-        CompletableFuture.allOf(operations.toArray(new CompletableFuture[0]))
-                .get(15, TimeUnit.SECONDS);
+        CompletableFuture.allOf(operations.toArray(new CompletableFuture[0])).get(15, TimeUnit.SECONDS);
 
-        logger.info("Successfully completed {} concurrent operations", operations.size());
+        log.info("Successfully completed {} concurrent operations", operations.size());
     }
 }

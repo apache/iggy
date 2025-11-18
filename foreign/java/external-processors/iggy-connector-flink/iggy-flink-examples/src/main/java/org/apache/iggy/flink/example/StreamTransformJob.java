@@ -38,7 +38,9 @@ import org.apache.iggy.flink.example.model.SensorReading;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.Serializable;
 import java.time.Duration;
+import java.util.function.Function;
 
 /**
  * Example Flink job demonstrating stream-to-stream transformation using Iggy connector.
@@ -60,25 +62,27 @@ import java.time.Duration;
  * flink run build/libs/flink-iggy-examples.jar
  * </pre>
  */
-public class StreamTransformJob {
+public final class StreamTransformJob {
 
     private static final String IGGY_SERVER = getEnv("IGGY_SERVER", "localhost:8090");
     private static final String IGGY_USERNAME = getEnv("IGGY_USERNAME", "iggy");
     private static final String IGGY_PASSWORD = getEnv("IGGY_PASSWORD", "iggy");
 
     // Stream and topic IDs (numeric)
-    private static final String INPUT_STREAM = "1";  // sensors
-    private static final String INPUT_TOPIC = "1";   // readings
+    private static final String INPUT_STREAM = "1"; // sensors
+    private static final String INPUT_TOPIC = "1"; // readings
     private static final String OUTPUT_STREAM = "2"; // alerts
-    private static final String OUTPUT_TOPIC = "1";  // critical
+    private static final String OUTPUT_TOPIC = "1"; // critical
 
     private static final double TEMP_THRESHOLD = 30.0;
     private static final double HUMIDITY_THRESHOLD = 80.0;
 
+    private StreamTransformJob() {}
+
+    @SuppressWarnings("checkstyle:IllegalThrows")
     public static void main(String[] args) throws Exception {
         // Set up Flink execution environment
-        final StreamExecutionEnvironment env =
-                StreamExecutionEnvironment.getExecutionEnvironment();
+        final StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
 
         // Enable checkpointing for fault tolerance
         env.enableCheckpointing(60000); // Checkpoint every 60 seconds
@@ -101,8 +105,7 @@ public class StreamTransformJob {
                         .setDeserializer(new JsonDeserializationSchema<>(SensorReading.class))
                         .setPollBatchSize(100)
                         .build(),
-                WatermarkStrategy
-                        .<SensorReading>forBoundedOutOfOrderness(Duration.ofSeconds(10))
+                WatermarkStrategy.<SensorReading>forBoundedOutOfOrderness(Duration.ofSeconds(10))
                         .withTimestampAssigner(new TimestampExtractor()),
                 "Iggy Sensor Source",
                 TypeInformation.of(SensorReading.class));
@@ -114,22 +117,21 @@ public class StreamTransformJob {
                 .name("Generate Alerts");
 
         // Optional: Add windowed aggregation to count alerts per sensor
-        DataStream<Alert> windowedAlerts = alerts
-                .keyBy(Alert::getSensorId)
+        DataStream<Alert> windowedAlerts = alerts.keyBy(Alert::getSensorId)
                 .window(TumblingEventTimeWindows.of(Duration.ofMinutes(5)))
                 .reduce(new AlertReducer())
                 .name("Window Alerts");
 
         // Write alerts back to Iggy
-        windowedAlerts.sinkTo(
-                IggySink.<Alert>builder()
+        windowedAlerts
+                .sinkTo(IggySink.<Alert>builder()
                         .setConnectionConfig(connectionConfig)
                         .setStreamId(OUTPUT_STREAM)
                         .setTopicId(OUTPUT_TOPIC)
                         .setSerializer(new JsonSerializationSchema<>())
                         .setBatchSize(50)
                         .setFlushInterval(Duration.ofSeconds(5))
-                        .withBalancedPartitioning()  // Use balanced partitioning instead
+                        .withBalancedPartitioning() // Use balanced partitioning instead
                         .build())
                 .name("Iggy Alert Sink");
 
@@ -143,21 +145,24 @@ public class StreamTransformJob {
     }
 
     // Static serializable function classes
-    private static class AnomalyFilter implements FilterFunction<SensorReading> {
-        private static final Logger logger = LoggerFactory.getLogger(AnomalyFilter.class);
+    private static final class AnomalyFilter implements FilterFunction<SensorReading> {
+        private static final Logger log = LoggerFactory.getLogger(AnomalyFilter.class);
 
         @Override
         public boolean filter(SensorReading reading) {
-            boolean isAnomaly = reading.getTemperature() > TEMP_THRESHOLD
-                    || reading.getHumidity() > HUMIDITY_THRESHOLD;
-            logger.info("AnomalyFilter: reading={}, temp={}, humidity={}, isAnomaly={}",
-                reading.getSensorId(), reading.getTemperature(), reading.getHumidity(), isAnomaly);
+            boolean isAnomaly = reading.getTemperature() > TEMP_THRESHOLD || reading.getHumidity() > HUMIDITY_THRESHOLD;
+            log.info(
+                    "AnomalyFilter: reading={}, temp={}, humidity={}, isAnomaly={}",
+                    reading.getSensorId(),
+                    reading.getTemperature(),
+                    reading.getHumidity(),
+                    isAnomaly);
             return isAnomaly;
         }
     }
 
-    private static class AlertMapper implements MapFunction<SensorReading, Alert> {
-        private static final Logger logger = LoggerFactory.getLogger(AlertMapper.class);
+    private static final class AlertMapper implements MapFunction<SensorReading, Alert> {
+        private static final Logger log = LoggerFactory.getLogger(AlertMapper.class);
 
         @Override
         public Alert map(SensorReading reading) {
@@ -169,51 +174,44 @@ public class StreamTransformJob {
                 alertType = "HIGH_TEMPERATURE";
                 value = reading.getTemperature();
                 message = String.format(
-                        "Temperature %.1f°C exceeds threshold %.1f°C",
-                        reading.getTemperature(), TEMP_THRESHOLD);
+                        "Temperature %.1f°C exceeds threshold %.1f°C", reading.getTemperature(), TEMP_THRESHOLD);
             } else {
                 alertType = "HIGH_HUMIDITY";
                 value = reading.getHumidity();
                 message = String.format(
-                        "Humidity %.1f%% exceeds threshold %.1f%%",
-                        reading.getHumidity(), HUMIDITY_THRESHOLD);
+                        "Humidity %.1f%% exceeds threshold %.1f%%", reading.getHumidity(), HUMIDITY_THRESHOLD);
             }
 
-            Alert alert = new Alert(
-                    reading.getSensorId(),
-                    alertType,
-                    value,
-                    message,
-                    reading.getTimestamp());
-            logger.info("AlertMapper: created alert={}, type={}, sensor={}",
-                alert, alertType, reading.getSensorId());
+            Alert alert = new Alert(reading.getSensorId(), alertType, value, message, reading.getTimestamp());
+            log.info("AlertMapper: created alert={}, type={}, sensor={}", alert, alertType, reading.getSensorId());
             return alert;
         }
     }
 
-    private static class AlertReducer implements ReduceFunction<Alert> {
-        private static final Logger logger = LoggerFactory.getLogger(AlertReducer.class);
+    private static final class AlertReducer implements ReduceFunction<Alert> {
+        private static final Logger log = LoggerFactory.getLogger(AlertReducer.class);
 
         @Override
         public Alert reduce(Alert alert1, Alert alert2) {
             // Keep the latest alert in the window
-            Alert result = alert1.getTimestamp().isAfter(alert2.getTimestamp())
-                    ? alert1
-                    : alert2;
-            logger.info("AlertReducer: reducing alert1={} and alert2={}, result={}",
-                alert1.getSensorId(), alert2.getSensorId(), result.getSensorId());
+            Alert result = alert1.getTimestamp().isAfter(alert2.getTimestamp()) ? alert1 : alert2;
+            log.info(
+                    "AlertReducer: reducing alert1={} and alert2={}, result={}",
+                    alert1.getSensorId(),
+                    alert2.getSensorId(),
+                    result.getSensorId());
             return result;
         }
     }
 
-    private static class TimestampExtractor implements SerializableTimestampAssigner<SensorReading> {
+    private static final class TimestampExtractor implements SerializableTimestampAssigner<SensorReading> {
         @Override
         public long extractTimestamp(SensorReading reading, long recordTimestamp) {
             return reading.getTimestamp().toEpochMilli();
         }
     }
 
-    private static class PartitionKeyExtractor implements java.util.function.Function<Alert, Integer>, java.io.Serializable {
+    private static final class PartitionKeyExtractor implements Function<Alert, Integer>, Serializable {
         @Override
         public Integer apply(Alert alert) {
             return alert.getSensorId().hashCode();

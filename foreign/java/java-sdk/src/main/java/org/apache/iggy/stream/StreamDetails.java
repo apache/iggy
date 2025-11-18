@@ -20,6 +20,7 @@
 package org.apache.iggy.stream;
 
 import org.apache.iggy.topic.Topic;
+
 import java.math.BigInteger;
 import java.util.List;
 
@@ -30,8 +31,7 @@ public record StreamDetails(
         String size,
         BigInteger messagesCount,
         Long topicsCount,
-        List<Topic> topics
-) {
+        List<Topic> topics) {
     public StreamDetails(StreamBase base, List<Topic> topics) {
         this(base.id(), base.createdAt(), base.name(), base.size(), base.messagesCount(), base.topicsCount(), topics);
     }

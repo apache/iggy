@@ -24,10 +24,8 @@ import org.apache.iggy.identifier.TopicId;
 
 public final class TestConstants {
 
-    private TestConstants() {
-    }
-
     public static final StreamId STREAM_NAME = StreamId.of("test-stream");
     public static final TopicId TOPIC_NAME = TopicId.of("test-topic");
 
+    private TestConstants() {}
 }

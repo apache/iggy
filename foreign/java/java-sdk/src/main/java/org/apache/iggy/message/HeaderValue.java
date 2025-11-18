@@ -19,5 +19,4 @@
 
 package org.apache.iggy.message;
 
-public record HeaderValue(HeaderKind kind, String value) {
-}
+public record HeaderValue(HeaderKind kind, String value) {}

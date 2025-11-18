@@ -19,9 +19,10 @@
 
 package org.apache.iggy.client.blocking;
 
+import org.apache.iggy.topic.TopicDetails;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
-import org.apache.iggy.topic.TopicDetails;
+
 import static org.apache.iggy.TestConstants.STREAM_NAME;
 import static org.apache.iggy.TestConstants.TOPIC_NAME;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -39,7 +40,6 @@ public abstract class PartitionsClientBaseTest extends IntegrationTest {
         login();
         setUpStreamAndTopic();
     }
-
 
     @Test
     void shouldCreateAndDeletePartitions() {
@@ -60,5 +60,4 @@ public abstract class PartitionsClientBaseTest extends IntegrationTest {
         topic = topicsClient.getTopic(STREAM_NAME, TOPIC_NAME).get();
         assertThat(topic.partitionsCount()).isEqualTo(1L);
     }
-
 }

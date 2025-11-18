@@ -19,10 +19,8 @@
 
 package org.apache.iggy.client.async.tcp;
 
-import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import org.apache.iggy.client.async.MessagesClient;
-import org.apache.iggy.client.blocking.tcp.BytesSerializer;
 import org.apache.iggy.client.blocking.tcp.CommandCode;
 import org.apache.iggy.consumergroup.Consumer;
 import org.apache.iggy.identifier.StreamId;
@@ -81,7 +79,8 @@ public class MessagesTcpClient implements MessagesClient {
         payload.writeByte(autoCommit ? 1 : 0);
 
         // Send async request and transform response
-        return connection.sendAsync(CommandCode.Messages.POLL.getValue(), payload)
+        return connection
+                .sendAsync(CommandCode.Messages.POLL.getValue(), payload)
                 .thenApply(response -> {
                     try {
                         return AsyncBytesDeserializer.readPolledMessages(response);
@@ -93,10 +92,7 @@ public class MessagesTcpClient implements MessagesClient {
 
     @Override
     public CompletableFuture<Void> sendMessagesAsync(
-            StreamId streamId,
-            TopicId topicId,
-            Partitioning partitioning,
-            List<Message> messages) {
+            StreamId streamId, TopicId topicId, Partitioning partitioning, List<Message> messages) {
 
         // Build metadata section following the blocking client pattern
         var metadataLength = streamId.getSize() + topicId.getSize() + partitioning.getSize() + 4;
@@ -129,7 +125,8 @@ public class MessagesTcpClient implements MessagesClient {
         }
 
         // Send async request (no response data expected for send)
-        return connection.sendAsync(CommandCode.Messages.SEND.getValue(), payload)
+        return connection
+                .sendAsync(CommandCode.Messages.SEND.getValue(), payload)
                 .thenAccept(response -> {
                     // Response received, messages sent successfully
                     response.release(); // Release the buffer

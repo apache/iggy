@@ -19,10 +19,4 @@
 
 package org.apache.iggy.user;
 
-public record TopicPermissions(
-        boolean manageTopic,
-        boolean readTopic,
-        boolean pollMessages,
-        boolean sendMessages
-) {
-}
+public record TopicPermissions(boolean manageTopic, boolean readTopic, boolean pollMessages, boolean sendMessages) {}

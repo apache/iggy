@@ -19,6 +19,7 @@
 
 package org.apache.iggy.connector.flink.source;
 
+import org.apache.commons.lang3.StringUtils;
 import org.apache.iggy.connector.config.IggyConnectionConfig;
 import org.apache.iggy.connector.config.OffsetConfig;
 import org.apache.iggy.connector.serialization.DeserializationSchema;
@@ -37,7 +38,7 @@ public class IggySourceBuilder<T> implements Serializable {
     private IggyConnectionConfig connectionConfig;
     private String streamId;
     private String topicId;
-    private String consumerGroupName;  // Store as String for serialization
+    private String consumerGroupName; // Store as String for serialization
     private DeserializationSchema<T> deserializer;
     private OffsetConfig offsetConfig = OffsetConfig.builder().build();
     private long pollBatchSize = 100L;
@@ -154,13 +155,7 @@ public class IggySourceBuilder<T> implements Serializable {
         validate();
 
         return new IggySource<>(
-                connectionConfig,
-                streamId,
-                topicId,
-                consumerGroupName,
-                deserializer,
-                offsetConfig,
-                pollBatchSize);
+                connectionConfig, streamId, topicId, consumerGroupName, deserializer, offsetConfig, pollBatchSize);
     }
 
     /**
@@ -172,13 +167,13 @@ public class IggySourceBuilder<T> implements Serializable {
         if (connectionConfig == null) {
             throw new IllegalStateException("connectionConfig is required");
         }
-        if (streamId == null || streamId.isEmpty()) {
+        if (StringUtils.isBlank(streamId)) {
             throw new IllegalStateException("streamId is required");
         }
-        if (topicId == null || topicId.isEmpty()) {
+        if (StringUtils.isBlank(topicId)) {
             throw new IllegalStateException("topicId is required");
         }
-        if (consumerGroupName == null || consumerGroupName.isEmpty()) {
+        if (StringUtils.isBlank(consumerGroupName)) {
             throw new IllegalStateException("consumerGroup is required (use setConsumerGroup)");
         }
         if (deserializer == null) {

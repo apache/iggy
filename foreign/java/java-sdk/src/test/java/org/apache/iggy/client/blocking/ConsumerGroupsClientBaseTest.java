@@ -19,11 +19,12 @@
 
 package org.apache.iggy.client.blocking;
 
+import org.apache.iggy.consumergroup.ConsumerGroup;
 import org.apache.iggy.consumergroup.ConsumerGroupDetails;
+import org.apache.iggy.identifier.ConsumerId;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
-import org.apache.iggy.consumergroup.ConsumerGroup;
-import org.apache.iggy.identifier.ConsumerId;
+
 import static org.apache.iggy.TestConstants.STREAM_NAME;
 import static org.apache.iggy.TestConstants.TOPIC_NAME;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -48,12 +49,10 @@ public abstract class ConsumerGroupsClientBaseTest extends IntegrationTest {
         String consumerGroupName = "consumer-group-42";
         ConsumerGroupDetails consumerGroup = createConsumerGroup(consumerGroupName);
 
-        var consumerGroupById = consumerGroupsClient.getConsumerGroup(STREAM_NAME,
-                TOPIC_NAME,
-                ConsumerId.of(consumerGroup.id()));
-        var consumerGroupByName = consumerGroupsClient.getConsumerGroup(STREAM_NAME,
-                TOPIC_NAME,
-                ConsumerId.of(consumerGroupName));
+        var consumerGroupById =
+                consumerGroupsClient.getConsumerGroup(STREAM_NAME, TOPIC_NAME, ConsumerId.of(consumerGroup.id()));
+        var consumerGroupByName =
+                consumerGroupsClient.getConsumerGroup(STREAM_NAME, TOPIC_NAME, ConsumerId.of(consumerGroupName));
 
         // then
         assertThat(consumerGroupById).isPresent();
@@ -65,10 +64,11 @@ public abstract class ConsumerGroupsClientBaseTest extends IntegrationTest {
         consumerGroupsClient.deleteConsumerGroup(STREAM_NAME, TOPIC_NAME, ConsumerId.of(consumerGroup.id()));
 
         // then
-        assertThat(consumerGroupsClient.getConsumerGroups(STREAM_NAME, TOPIC_NAME)).isEmpty();
-        assertThat(consumerGroupsClient.getConsumerGroup(STREAM_NAME, TOPIC_NAME, ConsumerId.of(consumerGroup.id()))).isEmpty();
+        assertThat(consumerGroupsClient.getConsumerGroups(STREAM_NAME, TOPIC_NAME))
+                .isEmpty();
+        assertThat(consumerGroupsClient.getConsumerGroup(STREAM_NAME, TOPIC_NAME, ConsumerId.of(consumerGroup.id())))
+                .isEmpty();
     }
-
 
     @Test
     void shouldDeleteConsumerGroupByName() {
@@ -83,7 +83,8 @@ public abstract class ConsumerGroupsClientBaseTest extends IntegrationTest {
         consumerGroupsClient.deleteConsumerGroup(STREAM_NAME, TOPIC_NAME, ConsumerId.of(groupName));
 
         // then
-        assertThat(consumerGroupsClient.getConsumerGroups(STREAM_NAME, TOPIC_NAME)).isEmpty();
+        assertThat(consumerGroupsClient.getConsumerGroups(STREAM_NAME, TOPIC_NAME))
+                .isEmpty();
     }
 
     @Test
@@ -108,5 +109,4 @@ public abstract class ConsumerGroupsClientBaseTest extends IntegrationTest {
     private ConsumerGroupDetails createConsumerGroup(String groupName) {
         return consumerGroupsClient.createConsumerGroup(STREAM_NAME, TOPIC_NAME, groupName);
     }
-
 }

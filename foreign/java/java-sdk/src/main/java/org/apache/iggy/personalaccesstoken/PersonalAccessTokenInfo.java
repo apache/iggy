@@ -22,5 +22,4 @@ package org.apache.iggy.personalaccesstoken;
 import java.math.BigInteger;
 import java.util.Optional;
 
-public record PersonalAccessTokenInfo(String name, Optional<BigInteger> expiryAt) {
-}
+public record PersonalAccessTokenInfo(String name, Optional<BigInteger> expiryAt) {}

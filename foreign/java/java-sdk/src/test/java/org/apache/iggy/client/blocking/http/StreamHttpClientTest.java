@@ -28,5 +28,4 @@ class StreamHttpClientTest extends StreamClientBaseTest {
     protected IggyBaseClient getClient() {
         return HttpClientFactory.create(iggyServer);
     }
-
 }

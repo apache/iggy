@@ -19,9 +19,9 @@
 
 package org.apache.iggy.client.blocking;
 
-import org.apache.iggy.stream.StreamDetails;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+
 import static org.assertj.core.api.Assertions.assertThat;
 
 public abstract class StreamClientBaseTest extends IntegrationTest {

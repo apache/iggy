@@ -24,9 +24,13 @@ import org.apache.iggy.client.blocking.SystemClient;
 import org.apache.iggy.system.ClientInfo;
 import org.apache.iggy.system.ClientInfoDetails;
 import org.apache.iggy.system.Stats;
+
 import java.util.ArrayList;
 import java.util.List;
-import static org.apache.iggy.client.blocking.tcp.BytesDeserializer.*;
+
+import static org.apache.iggy.client.blocking.tcp.BytesDeserializer.readClientInfo;
+import static org.apache.iggy.client.blocking.tcp.BytesDeserializer.readClientInfoDetails;
+import static org.apache.iggy.client.blocking.tcp.BytesDeserializer.readStats;
 
 class SystemTcpClient implements SystemClient {
 

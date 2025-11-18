@@ -21,6 +21,7 @@ package org.apache.iggy.flink.example;
 
 import org.apache.flink.api.common.eventtime.WatermarkStrategy;
 import org.apache.flink.api.common.functions.FlatMapFunction;
+import org.apache.flink.api.java.tuple.Tuple2;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.streaming.api.windowing.assigners.TumblingProcessingTimeWindows;
@@ -58,7 +59,7 @@ import java.time.Duration;
  * echo "apache flink connector for iggy" | iggy stream send text-input lines
  * </pre>
  */
-public class WordCountJob {
+public final class WordCountJob {
 
     private static final String IGGY_SERVER = getEnv("IGGY_SERVER", "localhost:8090");
     private static final String IGGY_USERNAME = getEnv("IGGY_USERNAME", "iggy");
@@ -70,10 +71,12 @@ public class WordCountJob {
     private static final String OUTPUT_STREAM = "word-counts";
     private static final String OUTPUT_TOPIC = "results";
 
+    private WordCountJob() {}
+
+    @SuppressWarnings("checkstyle:IllegalThrows")
     public static void main(String[] args) throws Exception {
         // Set up Flink execution environment
-        final StreamExecutionEnvironment env =
-                StreamExecutionEnvironment.getExecutionEnvironment();
+        final StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
 
         // Enable checkpointing for fault tolerance
         env.enableCheckpointing(30000); // Checkpoint every 30 seconds
@@ -88,16 +91,16 @@ public class WordCountJob {
 
         // Read text lines from Iggy
         DataStream<String> textLines = env.fromSource(
-                IggySource.<String>builder()
-                        .setConnectionConfig(connectionConfig)
-                        .setStreamId(INPUT_STREAM)
-                        .setTopicId(INPUT_TOPIC)
-                        .setConsumerGroup("flink-word-counter")
-                        .setDeserializer(new StringDeserializationSchema())
-                        .setPollBatchSize(100)
-                        .build(),
-                WatermarkStrategy.noWatermarks(),
-                "Iggy Text Source")
+                        IggySource.<String>builder()
+                                .setConnectionConfig(connectionConfig)
+                                .setStreamId(INPUT_STREAM)
+                                .setTopicId(INPUT_TOPIC)
+                                .setConsumerGroup("flink-word-counter")
+                                .setDeserializer(new StringDeserializationSchema())
+                                .setPollBatchSize(100)
+                                .build(),
+                        WatermarkStrategy.noWatermarks(),
+                        "Iggy Text Source")
                 .returns(String.class);
 
         // Tokenize, count, and aggregate words
@@ -115,15 +118,15 @@ public class WordCountJob {
                 .name("Create WordCount");
 
         // Write word counts back to Iggy
-        wordCounts.sinkTo(
-                IggySink.<WordCount>builder()
+        wordCounts
+                .sinkTo(IggySink.<WordCount>builder()
                         .setConnectionConfig(connectionConfig)
                         .setStreamId(OUTPUT_STREAM)
                         .setTopicId(OUTPUT_TOPIC)
                         .setSerializer(new JsonSerializationSchema<>())
                         .setBatchSize(50)
                         .setFlushInterval(Duration.ofSeconds(5))
-                        .withBalancedPartitioning()  // Use balanced partitioning instead
+                        .withBalancedPartitioning() // Use balanced partitioning instead
                         .build())
                 .name("Iggy WordCount Sink");
 
@@ -131,16 +134,18 @@ public class WordCountJob {
         env.execute("Word Count with Iggy");
     }
 
+    private static String getEnv(String key, String defaultValue) {
+        String value = System.getenv(key);
+        return value != null ? value : defaultValue;
+    }
+
     /**
      * Tokenizer that splits lines into words.
      */
-    public static final class Tokenizer
-            implements FlatMapFunction<String, org.apache.flink.api.java.tuple.Tuple2<String, Long>> {
+    public static final class Tokenizer implements FlatMapFunction<String, Tuple2<String, Long>> {
 
         @Override
-        public void flatMap(
-                String line,
-                Collector<org.apache.flink.api.java.tuple.Tuple2<String, Long>> out) {
+        public void flatMap(String line, Collector<Tuple2<String, Long>> out) {
             if (line == null || line.trim().isEmpty()) {
                 return;
             }
@@ -153,14 +158,9 @@ public class WordCountJob {
 
             for (String word : words) {
                 if (!word.isEmpty()) {
-                    out.collect(new org.apache.flink.api.java.tuple.Tuple2<>(word, 1L));
+                    out.collect(new Tuple2<>(word, 1L));
                 }
             }
         }
-    }
-
-    private static String getEnv(String key, String defaultValue) {
-        String value = System.getenv(key);
-        return value != null ? value : defaultValue;
     }
 }

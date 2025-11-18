@@ -21,15 +21,18 @@ package org.apache.iggy.connector.flink.source;
 
 import org.apache.flink.core.io.SimpleVersionedSerializer;
 
-import java.io.*;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
+import java.io.IOException;
 import java.util.HashSet;
 import java.util.Set;
 
 /**
  * Serializer for IggySourceEnumeratorState for checkpointing.
  */
-public class IggySourceEnumeratorStateSerializer
-        implements SimpleVersionedSerializer<IggySourceEnumeratorState> {
+public class IggySourceEnumeratorStateSerializer implements SimpleVersionedSerializer<IggySourceEnumeratorState> {
 
     private static final int VERSION = 1;
 
@@ -43,7 +46,7 @@ public class IggySourceEnumeratorStateSerializer
     @Override
     public byte[] serialize(IggySourceEnumeratorState state) throws IOException {
         try (ByteArrayOutputStream baos = new ByteArrayOutputStream();
-             DataOutputStream out = new DataOutputStream(baos)) {
+                DataOutputStream out = new DataOutputStream(baos)) {
 
             // Write assigned splits
             Set<IggySourceSplit> assignedSplits = state.getAssignedSplits();
@@ -73,7 +76,7 @@ public class IggySourceEnumeratorStateSerializer
         }
 
         try (ByteArrayInputStream bais = new ByteArrayInputStream(serialized);
-             DataInputStream in = new DataInputStream(bais)) {
+                DataInputStream in = new DataInputStream(bais)) {
 
             // Read assigned splits
             int splitsCount = in.readInt();
@@ -82,8 +85,7 @@ public class IggySourceEnumeratorStateSerializer
                 int splitBytesLength = in.readInt();
                 byte[] splitBytes = new byte[splitBytesLength];
                 in.readFully(splitBytes);
-                IggySourceSplit split = splitSerializer.deserialize(
-                        splitSerializer.getVersion(), splitBytes);
+                IggySourceSplit split = splitSerializer.deserialize(splitSerializer.getVersion(), splitBytes);
                 assignedSplits.add(split);
             }
 

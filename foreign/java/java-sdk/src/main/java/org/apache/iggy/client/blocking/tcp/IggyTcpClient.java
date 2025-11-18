@@ -61,10 +61,18 @@ public class IggyTcpClient implements IggyBaseClient {
         this(host, port, null, null, null, null, null, null, false, Optional.empty());
     }
 
-    private IggyTcpClient(String host, Integer port, String username, String password,
-                          Duration connectionTimeout, Duration requestTimeout,
-                          Integer connectionPoolSize, RetryPolicy retryPolicy,
-                          boolean enableTls, Optional<File> tlsCertificate) {
+    @SuppressWarnings("checkstyle:ParameterNumber")
+    private IggyTcpClient(
+            String host,
+            Integer port,
+            String username,
+            String password,
+            Duration connectionTimeout,
+            Duration requestTimeout,
+            Integer connectionPoolSize,
+            RetryPolicy retryPolicy,
+            boolean enableTls,
+            Optional<File> tlsCertificate) {
         this.host = host;
         this.port = port;
         this.username = Optional.ofNullable(username);
@@ -151,7 +159,7 @@ public class IggyTcpClient implements IggyBaseClient {
     /**
      * Builder for creating configured IggyTcpClient instances.
      */
-    public static class Builder {
+    public static final class Builder {
         private String host = "localhost";
         private Integer port = 8090;
         private String username;
@@ -163,8 +171,7 @@ public class IggyTcpClient implements IggyBaseClient {
         private boolean enableTls = false;
         private File tlsCertificate;
 
-        private Builder() {
-        }
+        private Builder() {}
 
         /**
          * Sets the host address for the Iggy server.
@@ -300,17 +307,24 @@ public class IggyTcpClient implements IggyBaseClient {
             if (port == null || port <= 0) {
                 throw new IllegalArgumentException("Port must be a positive integer");
             }
-            boolean enableTls = this.enableTls;
-            return new IggyTcpClient(host, port, username, password,
-                    connectionTimeout, requestTimeout, connectionPoolSize, retryPolicy,
-                    enableTls, Optional.ofNullable(tlsCertificate));
+            return new IggyTcpClient(
+                    host,
+                    port,
+                    username,
+                    password,
+                    connectionTimeout,
+                    requestTimeout,
+                    connectionPoolSize,
+                    retryPolicy,
+                    this.enableTls,
+                    Optional.ofNullable(tlsCertificate));
         }
     }
 
     /**
      * Retry policy for client operations.
      */
-    public static class RetryPolicy {
+    public static final class RetryPolicy {
         private final int maxRetries;
         private final Duration initialDelay;
         private final Duration maxDelay;
@@ -341,7 +355,8 @@ public class IggyTcpClient implements IggyBaseClient {
          * @param multiplier   the multiplier for exponential backoff
          * @return a RetryPolicy with custom exponential backoff configuration
          */
-        public static RetryPolicy exponentialBackoff(int maxRetries, Duration initialDelay, Duration maxDelay, double multiplier) {
+        public static RetryPolicy exponentialBackoff(
+                int maxRetries, Duration initialDelay, Duration maxDelay, double multiplier) {
             return new RetryPolicy(maxRetries, initialDelay, maxDelay, multiplier);
         }
 
@@ -381,5 +396,4 @@ public class IggyTcpClient implements IggyBaseClient {
             return multiplier;
         }
     }
-
 }

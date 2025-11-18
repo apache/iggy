@@ -21,5 +21,4 @@ package org.apache.iggy.user;
 
 import java.math.BigInteger;
 
-public record TokenInfo(String token, BigInteger expiry) {
-}
+public record TokenInfo(String token, BigInteger expiry) {}

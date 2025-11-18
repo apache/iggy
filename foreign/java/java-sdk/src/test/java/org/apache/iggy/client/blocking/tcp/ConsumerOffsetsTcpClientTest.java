@@ -28,5 +28,4 @@ class ConsumerOffsetsTcpClientTest extends ConsumerOffsetsClientBaseTest {
     protected IggyBaseClient getClient() {
         return TcpClientFactory.create(iggyServer);
     }
-
 }

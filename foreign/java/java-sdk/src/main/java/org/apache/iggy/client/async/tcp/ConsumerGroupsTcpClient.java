@@ -34,7 +34,7 @@ import java.util.concurrent.CompletableFuture;
  * Async TCP implementation of consumer groups client.
  */
 public class ConsumerGroupsTcpClient implements ConsumerGroupsClient {
-    private static final Logger logger = LoggerFactory.getLogger(ConsumerGroupsTcpClient.class);
+    private static final Logger log = LoggerFactory.getLogger(ConsumerGroupsTcpClient.class);
 
     private final AsyncTcpConnection connection;
 
@@ -55,13 +55,14 @@ public class ConsumerGroupsTcpClient implements ConsumerGroupsClient {
         // Serialize consumer group ID
         payload.writeBytes(AsyncBytesSerializer.toBytes(groupId));
 
-        logger.debug("Joining consumer group - Stream: {}, Topic: {}, Group: {}", streamId, topicId, groupId);
+        log.debug("Joining consumer group - Stream: {}, Topic: {}, Group: {}", streamId, topicId, groupId);
 
-        return connection.sendAsync(CommandCode.ConsumerGroup.JOIN.getValue(), payload)
-            .thenAccept(response -> {
-                logger.debug("Successfully joined consumer group");
-                response.release();
-            });
+        return connection
+                .sendAsync(CommandCode.ConsumerGroup.JOIN.getValue(), payload)
+                .thenAccept(response -> {
+                    log.debug("Successfully joined consumer group");
+                    response.release();
+                });
     }
 
     @Override
@@ -77,12 +78,13 @@ public class ConsumerGroupsTcpClient implements ConsumerGroupsClient {
         // Serialize consumer group ID
         payload.writeBytes(AsyncBytesSerializer.toBytes(groupId));
 
-        logger.debug("Leaving consumer group - Stream: {}, Topic: {}, Group: {}", streamId, topicId, groupId);
+        log.debug("Leaving consumer group - Stream: {}, Topic: {}, Group: {}", streamId, topicId, groupId);
 
-        return connection.sendAsync(CommandCode.ConsumerGroup.LEAVE.getValue(), payload)
-            .thenAccept(response -> {
-                logger.debug("Successfully left consumer group");
-                response.release();
-            });
+        return connection
+                .sendAsync(CommandCode.ConsumerGroup.LEAVE.getValue(), payload)
+                .thenAccept(response -> {
+                    log.debug("Successfully left consumer group");
+                    response.release();
+                });
     }
 }
