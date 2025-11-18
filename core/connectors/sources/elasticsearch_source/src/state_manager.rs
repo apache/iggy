@@ -18,12 +18,12 @@
  */
 
 use crate::{ElasticsearchSource, StateConfig};
-use iggy_connector_sdk::{Error, SourceState, StateStorage, FileStateStorage, Source};
+use iggy_connector_sdk::{Error, FileStateStorage, Source, SourceState, StateStorage};
 use serde_json::Value;
+use std::str::FromStr;
 use std::sync::Arc;
 use tokio::time::{Duration, interval};
-use tracing::{info, warn, error};
-use std::str::FromStr;
+use tracing::{error, info, warn};
 
 /// State manager for Elasticsearch source connector
 pub struct StateManager {
@@ -65,11 +65,16 @@ impl StateManager {
             }
             Some("elasticsearch") => {
                 // TODO: Implement Elasticsearch-based state storage
-                warn!("Elasticsearch state storage not yet implemented, falling back to file storage");
+                warn!(
+                    "Elasticsearch state storage not yet implemented, falling back to file storage"
+                );
                 Ok(Arc::new(FileStateStorage::new("./connector_states")))
             }
             Some(storage_type) => {
-                warn!("Unknown state storage type: {}, falling back to file storage", storage_type);
+                warn!(
+                    "Unknown state storage type: {}, falling back to file storage",
+                    storage_type
+                );
                 Ok(Arc::new(FileStateStorage::new("./connector_states")))
             }
         }
@@ -77,7 +82,9 @@ impl StateManager {
 
     /// Start auto-save background task
     pub async fn start_auto_save(&self, connector: std::sync::Arc<ElasticsearchSource>) {
-        let interval_duration = self.auto_save_interval.unwrap_or_else(|| Duration::from_secs(60));
+        let interval_duration = self
+            .auto_save_interval
+            .unwrap_or_else(|| Duration::from_secs(60));
         let storage = self.storage.clone();
         let state_id = self.config.state_id.clone();
         tokio::spawn(async move {
@@ -86,9 +93,16 @@ impl StateManager {
                 interval.tick().await;
                 if let Ok(Some(state)) = Source::get_state(&*connector).await {
                     if let Err(e) = storage.save_source_state(&state).await {
-                        error!("Failed to auto-save state for {}: {}", state_id.as_deref().unwrap_or("unknown"), e);
+                        error!(
+                            "Failed to auto-save state for {}: {}",
+                            state_id.as_deref().unwrap_or("unknown"),
+                            e
+                        );
                     } else {
-                        info!("Auto-saved state for {}", state_id.as_deref().unwrap_or("unknown"));
+                        info!(
+                            "Auto-saved state for {}",
+                            state_id.as_deref().unwrap_or("unknown")
+                        );
                     }
                 }
             }
@@ -130,14 +144,14 @@ impl StateManager {
         let mut deleted_count = 0;
 
         for state_id in state_ids {
-            if let Some(state) = self.storage.load_source_state(&state_id).await? {
-                if state.last_updated < cutoff_time {
-                    if let Err(e) = self.storage.delete_state(&state_id).await {
-                        warn!("Failed to delete old state {}: {}", state_id, e);
-                    } else {
-                        deleted_count += 1;
-                        info!("Deleted old state: {}", state_id);
-                    }
+            if let Some(state) = self.storage.load_source_state(&state_id).await?
+                && state.last_updated < cutoff_time
+            {
+                if let Err(e) = self.storage.delete_state(&state_id).await {
+                    warn!("Failed to delete old state {}: {}", state_id, e);
+                } else {
+                    deleted_count += 1;
+                    info!("Deleted old state: {}", state_id);
                 }
             }
         }
@@ -197,7 +211,8 @@ impl StateManagerExt for ElasticsearchSource {
     }
 
     async fn import_state(&mut self, state_json: Value) -> Result<(), Error> {
-        let source_state: SourceState = serde_json::from_value(state_json).map_err(|e| Error::Storage(e.to_string()))?;
+        let source_state: SourceState =
+            serde_json::from_value(state_json).map_err(|e| Error::Storage(e.to_string()))?;
         Source::set_state(self, source_state).await
     }
 

@@ -18,17 +18,20 @@
  */
 
 use async_trait::async_trait;
-use elasticsearch::{Elasticsearch, http::transport::Transport, BulkParts, IndexParts};
+use base64::{Engine as _, engine::general_purpose};
+use elasticsearch::{
+    BulkParts, Elasticsearch,
+    auth::Credentials,
+    http::{Url, request::JsonBody, transport::TransportBuilder},
+};
 use iggy_connector_sdk::{
     ConsumedMessage, Error, MessagesMetadata, Payload, Sink, TopicMetadata, sink_connector,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::json;
+use simd_json::{OwnedValue, prelude::*};
 use tokio::sync::Mutex;
-use tracing::{error, info, warn};
-
-use chrono::Utc;
-use base64;
+use tracing::{info, warn};
 
 sink_connector!(ElasticsearchSink);
 
@@ -48,7 +51,7 @@ pub struct ElasticsearchSinkConfig {
     pub batch_size: Option<usize>,
     pub timeout_seconds: Option<u64>,
     pub create_index_if_not_exists: Option<bool>,
-    pub index_mapping: Option<Value>,
+    pub index_mapping: Option<serde_json::Value>,
 }
 
 #[derive(Debug)]
@@ -74,17 +77,15 @@ impl ElasticsearchSink {
     }
 
     async fn create_client(&self) -> Result<Elasticsearch, Error> {
-        let url = elasticsearch::http::Url::parse(&self.config.url)
-            .map_err(|e| Error::Connection(format!("Invalid Elasticsearch URL: {}", e)))?;
+        let url = Url::parse(&self.config.url)
+            .map_err(|error| Error::Connection(format!("Invalid Elasticsearch URL: {error}")))?;
 
-        let mut transport_builder = Transport::single_node(&self.config.url)
-            .map_err(|e| Error::Connection(format!("Failed to create transport: {}", e)))?;
+        let conn_pool = elasticsearch::http::transport::SingleNodeConnectionPool::new(url);
+        let mut transport_builder = TransportBuilder::new(conn_pool);
 
         if let (Some(username), Some(password)) = (&self.config.username, &self.config.password) {
-            transport_builder = transport_builder.auth(elasticsearch::auth::Credentials::Basic(
-                username.clone(),
-                password.clone(),
-            ));
+            let credentials = Credentials::Basic(username.clone(), password.clone());
+            transport_builder = transport_builder.auth(credentials);
         }
 
         let transport = transport_builder
@@ -101,7 +102,9 @@ impl ElasticsearchSink {
 
         let response = client
             .indices()
-            .exists(elasticsearch::indices::IndicesExistsParts::Index(&[&self.config.index]))
+            .exists(elasticsearch::indices::IndicesExistsParts::Index(&[&self
+                .config
+                .index]))
             .send()
             .await
             .map_err(|e| Error::Connection(format!("Failed to check index existence: {}", e)))?;
@@ -111,18 +114,26 @@ impl ElasticsearchSink {
             return Ok(());
         }
 
-        let mut create_request = client
-            .indices()
-            .create(elasticsearch::indices::IndicesCreateParts::Index(&self.config.index));
-
-        if let Some(mapping) = &self.config.index_mapping {
-            create_request = create_request.body(mapping.clone());
-        }
-
-        let response = create_request
-            .send()
-            .await
-            .map_err(|e| Error::Connection(format!("Failed to create index: {}", e)))?;
+        let response = if let Some(mapping) = &self.config.index_mapping {
+            client
+                .indices()
+                .create(elasticsearch::indices::IndicesCreateParts::Index(
+                    &self.config.index,
+                ))
+                .body(mapping.clone())
+                .send()
+                .await
+                .map_err(|e| Error::Connection(format!("Failed to create index: {}", e)))?
+        } else {
+            client
+                .indices()
+                .create(elasticsearch::indices::IndicesCreateParts::Index(
+                    &self.config.index,
+                ))
+                .send()
+                .await
+                .map_err(|e| Error::Connection(format!("Failed to create index: {}", e)))?
+        };
 
         if response.status_code().is_success() {
             info!("Successfully created index '{}'", self.config.index);
@@ -140,21 +151,30 @@ impl ElasticsearchSink {
         Ok(())
     }
 
-    async fn bulk_index_documents(&self, client: &Elasticsearch, documents: Vec<Value>) -> Result<(), Error> {
+    async fn bulk_index_documents(
+        &self,
+        client: &Elasticsearch,
+        documents: Vec<OwnedValue>,
+    ) -> Result<(), Error> {
         if documents.is_empty() {
             return Ok(());
         }
 
-        let mut body = Vec::new();
+        let mut body: Vec<JsonBody<_>> = Vec::with_capacity(documents.len() * 2);
         for doc in documents {
             // Add index action
-            body.push(json!({
-                "index": {
-                    "_index": self.config.index
-                }
-            }));
-            // Add document
-            body.push(doc);
+            body.push(
+                json!({
+                    "index": {
+                        "_index": self.config.index
+                    }
+                })
+                .into(),
+            );
+            // Convert OwnedValue to serde_json::Value for Elasticsearch
+            let doc_json: serde_json::Value =
+                serde_json::from_str(&doc.to_string()).unwrap_or_else(|_| serde_json::json!({}));
+            body.push(doc_json.into());
         }
 
         let response = client
@@ -175,7 +195,7 @@ impl ElasticsearchSink {
             )));
         }
 
-        let response_body: Value = response
+        let response_body: serde_json::Value = response
             .json()
             .await
             .map_err(|e| Error::Connection(format!("Failed to parse bulk response: {}", e)))?;
@@ -184,11 +204,11 @@ impl ElasticsearchSink {
         if let Some(items) = response_body.get("items").and_then(|v| v.as_array()) {
             let mut errors = 0;
             for item in items {
-                if let Some(index_result) = item.get("index") {
-                    if let Some(error) = index_result.get("error") {
-                        warn!("Document indexing error: {}", error);
-                        errors += 1;
-                    }
+                if let Some(index_result) = item.get("index")
+                    && let Some(error) = index_result.get("error")
+                {
+                    warn!("Document indexing error: {}", error);
+                    errors += 1;
                 }
             }
 
@@ -243,27 +263,33 @@ impl Sink for ElasticsearchSink {
             invocation
         );
 
-        let client = self.client.as_ref().ok_or_else(|| {
-            Error::Connection("Elasticsearch client not initialized".to_string())
-        })?;
+        let client = self
+            .client
+            .as_ref()
+            .ok_or_else(|| Error::Connection("Elasticsearch client not initialized".to_string()))?;
 
-        let mut documents = Vec::with_capacity(messages.len());
+        let messages_count = messages.len();
+        let mut documents = Vec::with_capacity(messages_count);
         for message in messages {
             let mut doc = match message.payload {
                 Payload::Json(value) => value,
-                Payload::Binary(bytes) => {
-                    // Try to parse binary as JSON
-                    match serde_json::from_slice::<Value>(&bytes) {
+                Payload::Raw(bytes) => {
+                    // Try to parse raw bytes as JSON
+                    match simd_json::from_slice::<OwnedValue>(&mut bytes.clone()) {
                         Ok(value) => value,
                         Err(_) => {
                             // If not JSON, create a document with the binary data as base64
-                            json!({
-                                "data": base64::encode(&bytes),
-                                "data_type": "binary"
+                            simd_json::json!({
+                                "data": general_purpose::STANDARD.encode(&bytes),
+                                "data_type": "raw"
                             })
                         }
                     }
                 }
+                Payload::Text(text) => simd_json::json!({
+                    "text": text,
+                    "data_type": "text"
+                }),
                 _ => {
                     warn!("Unsupported payload format: {}", messages_metadata.schema);
                     continue;
@@ -272,14 +298,33 @@ impl Sink for ElasticsearchSink {
 
             // Add metadata fields
             if let Some(obj) = doc.as_object_mut() {
-                obj.insert("_iggy_offset".to_string(), json!(message.offset));
-                obj.insert("_iggy_stream".to_string(), json!(topic_metadata.stream));
-                obj.insert("_iggy_topic".to_string(), json!(topic_metadata.topic));
-                obj.insert("_iggy_partition".to_string(), json!(messages_metadata.partition_id));
-                obj.insert("_iggy_timestamp".to_string(), json!(chrono::Utc::now().timestamp_millis()));
+                obj.insert("_iggy_offset".to_string(), OwnedValue::from(message.offset));
+                obj.insert(
+                    "_iggy_stream".to_string(),
+                    OwnedValue::from(topic_metadata.stream.as_str()),
+                );
+                obj.insert(
+                    "_iggy_topic".to_string(),
+                    OwnedValue::from(topic_metadata.topic.as_str()),
+                );
+                obj.insert(
+                    "_iggy_partition".to_string(),
+                    OwnedValue::from(messages_metadata.partition_id),
+                );
+                obj.insert(
+                    "_iggy_timestamp".to_string(),
+                    OwnedValue::from(chrono::Utc::now().timestamp_millis()),
+                );
 
                 if let Some(headers) = &message.headers {
-                    obj.insert("_iggy_headers".to_string(), json!(headers));
+                    // Convert headers to simd_json value
+                    let headers_json = serde_json::to_string(headers).unwrap_or_default();
+                    let mut headers_bytes = headers_json.into_bytes();
+                    if let Ok(headers_value) =
+                        simd_json::from_slice::<OwnedValue>(&mut headers_bytes)
+                    {
+                        obj.insert("_iggy_headers".to_string(), headers_value);
+                    }
                 }
             }
 
@@ -290,8 +335,7 @@ impl Sink for ElasticsearchSink {
             self.bulk_index_documents(client, documents).await?;
             info!(
                 "Successfully indexed {} documents to Elasticsearch index '{}'",
-                messages.len(),
-                self.config.index
+                messages_count, self.config.index
             );
         }
 
@@ -307,7 +351,10 @@ impl Sink for ElasticsearchSink {
         drop(state);
 
         self.client = None;
-        info!("Elasticsearch sink connector with ID: {} is closed.", self.id);
+        info!(
+            "Elasticsearch sink connector with ID: {} is closed.",
+            self.id
+        );
         Ok(())
     }
 }

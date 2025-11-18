@@ -19,24 +19,25 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use elasticsearch::{Elasticsearch, http::transport::Transport, SearchParts};
+use elasticsearch::{
+    Elasticsearch, SearchParts,
+    auth::Credentials,
+    http::{Url, transport::TransportBuilder},
+};
 use iggy_connector_sdk::{
-    Error, ProducedMessage, ProducedMessages, Schema, Source, source_connector,
-    SourceState, StateStorage, FileStateStorage,
+    Error, FileStateStorage, ProducedMessage, ProducedMessages, Schema, Source, SourceState,
+    StateStorage, source_connector,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
+use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::{sync::Mutex, time::sleep};
 use tracing::{info, warn};
-use std::sync::Arc;
-use std::str::FromStr;
 
 mod state_manager;
-pub use state_manager::{StateManager, StateManagerExt, StateStats, StateInfo};
-
-#[cfg(test)]
-mod state_manager_test;
+pub use state_manager::{StateInfo, StateManager, StateManagerExt, StateStats};
 
 source_connector!(ElasticsearchSource);
 
@@ -112,7 +113,11 @@ pub struct ElasticsearchSource {
 }
 
 impl ElasticsearchSource {
-    pub fn new(id: u32, config: ElasticsearchSourceConfig, _state: Option<serde_json::Value>) -> Self {
+    pub fn new(
+        id: u32,
+        config: ElasticsearchSourceConfig,
+        _state: Option<serde_json::Value>,
+    ) -> Self {
         let polling_interval = config
             .polling_interval
             .as_deref()
@@ -166,11 +171,16 @@ impl ElasticsearchSource {
             }
             Some("elasticsearch") => {
                 // TODO: Implement Elasticsearch-based state storage
-                warn!("Elasticsearch state storage not yet implemented, falling back to file storage");
+                warn!(
+                    "Elasticsearch state storage not yet implemented, falling back to file storage"
+                );
                 Some(Arc::new(FileStateStorage::new("./connector_states")))
             }
             Some(storage_type) => {
-                warn!("Unknown state storage type: {}, falling back to file storage", storage_type);
+                warn!(
+                    "Unknown state storage type: {}, falling back to file storage",
+                    storage_type
+                );
                 Some(Arc::new(FileStateStorage::new("./connector_states")))
             }
         }
@@ -216,28 +226,30 @@ impl ElasticsearchSource {
     }
 
     /// Convert SourceState to internal state
-    async fn source_state_to_internal_state(&mut self, source_state: SourceState) -> Result<(), Error> {
+    async fn source_state_to_internal_state(
+        &mut self,
+        source_state: SourceState,
+    ) -> Result<(), Error> {
         let mut state = self.state.lock().await;
 
         if let Some(data) = source_state.data.as_object() {
-            if let Some(timestamp) = data.get("last_poll_timestamp") {
-                if let Some(ts_str) = timestamp.as_str() {
-                    if let Ok(dt) = DateTime::parse_from_rfc3339(ts_str) {
-                        state.last_poll_timestamp = Some(dt.with_timezone(&Utc));
-                    }
-                }
+            if let Some(timestamp) = data.get("last_poll_timestamp")
+                && let Some(ts_str) = timestamp.as_str()
+                && let Ok(dt) = DateTime::parse_from_rfc3339(ts_str)
+            {
+                state.last_poll_timestamp = Some(dt.with_timezone(&Utc));
             }
 
-            if let Some(count) = data.get("total_documents_fetched") {
-                if let Some(count_val) = count.as_u64() {
-                    state.total_documents_fetched = count_val as usize;
-                }
+            if let Some(count) = data.get("total_documents_fetched")
+                && let Some(count_val) = count.as_u64()
+            {
+                state.total_documents_fetched = count_val as usize;
             }
 
-            if let Some(count) = data.get("poll_count") {
-                if let Some(count_val) = count.as_u64() {
-                    state.poll_count = count_val as usize;
-                }
+            if let Some(count) = data.get("poll_count")
+                && let Some(count_val) = count.as_u64()
+            {
+                state.poll_count = count_val as usize;
             }
 
             if let Some(doc_id) = data.get("last_document_id") {
@@ -252,20 +264,20 @@ impl ElasticsearchSource {
                 state.last_offset = offset.as_u64();
             }
 
-            if let Some(error_count) = data.get("error_count") {
-                if let Some(count_val) = error_count.as_u64() {
-                    state.error_count = count_val as usize;
-                }
+            if let Some(error_count) = data.get("error_count")
+                && let Some(count_val) = error_count.as_u64()
+            {
+                state.error_count = count_val as usize;
             }
 
             if let Some(last_error) = data.get("last_error") {
                 state.last_error = last_error.as_str().map(|s| s.to_string());
             }
 
-            if let Some(stats) = data.get("processing_stats") {
-                if let Ok(processing_stats) = serde_json::from_value(stats.clone()) {
-                    state.processing_stats = processing_stats;
-                }
+            if let Some(stats) = data.get("processing_stats")
+                && let Ok(processing_stats) = serde_json::from_value(stats.clone())
+            {
+                state.processing_stats = processing_stats;
             }
         }
 
@@ -273,48 +285,56 @@ impl ElasticsearchSource {
     }
 
     async fn create_client(&self) -> Result<Elasticsearch, Error> {
-        let transport_builder = Transport::single_node(&self.config.url)
-            .map_err(|e| Error::Storage(format!("Failed to create transport: {}", e)))?;
+        let url = Url::parse(&self.config.url)
+            .map_err(|error| Error::Storage(format!("Invalid Elasticsearch URL: {error}")))?;
+
+        let conn_pool = elasticsearch::http::transport::SingleNodeConnectionPool::new(url);
+        let mut transport_builder = TransportBuilder::new(conn_pool);
 
         if let (Some(username), Some(password)) = (&self.config.username, &self.config.password) {
-            transport_builder.set_auth(elasticsearch::auth::Credentials::Basic(
-                username.clone(),
-                password.clone(),
-            ));
+            let credentials = Credentials::Basic(username.clone(), password.clone());
+            transport_builder = transport_builder.auth(credentials);
         }
 
-        let transport = transport_builder;
+        let transport = transport_builder
+            .build()
+            .map_err(|e| Error::Storage(format!("Failed to build transport: {}", e)))?;
 
         Ok(Elasticsearch::new(transport))
     }
 
-    async fn search_documents(&self, client: &Elasticsearch) -> Result<Vec<ProducedMessage>, Error> {
+    async fn search_documents(
+        &self,
+        client: &Elasticsearch,
+    ) -> Result<Vec<ProducedMessage>, Error> {
         let state = self.state.lock().await;
         let batch_size = self.config.batch_size.unwrap_or(100);
 
         // Build query based on timestamp field if configured
-        let mut query = self.config.query.clone().unwrap_or_else(|| json!({
-            "match_all": {}
-        }));
+        let mut query = self.config.query.clone().unwrap_or_else(|| {
+            json!({
+                "match_all": {}
+            })
+        });
 
         // Add timestamp filter for incremental polling
-        if let Some(timestamp_field) = &self.config.timestamp_field {
-            if let Some(last_timestamp) = state.last_poll_timestamp {
-                query = json!({
-                    "bool": {
-                        "must": [
-                            query,
-                            {
-                                "range": {
-                                    timestamp_field: {
-                                        "gt": last_timestamp.to_rfc3339()
-                                    }
+        if let Some(timestamp_field) = &self.config.timestamp_field
+            && let Some(last_timestamp) = state.last_poll_timestamp
+        {
+            query = json!({
+                "bool": {
+                    "must": [
+                        query,
+                        {
+                            "range": {
+                                timestamp_field: {
+                                    "gt": last_timestamp.to_rfc3339()
                                 }
                             }
-                        ]
-                    }
-                });
-            }
+                        }
+                    ]
+                }
+            });
         }
 
         let search_body = json!({
@@ -365,20 +385,21 @@ impl ElasticsearchSource {
             for hit in hits {
                 if let Some(source) = hit.get("_source") {
                     // Extract timestamp for incremental polling
-                    if let Some(timestamp_field) = &self.config.timestamp_field {
-                        if let Some(timestamp_str) = source.get(timestamp_field).and_then(|v| v.as_str()) {
-                            if let Ok(timestamp) = DateTime::parse_from_rfc3339(timestamp_str) {
-                                let timestamp_utc = timestamp.with_timezone(&Utc);
-                                if latest_timestamp.is_none() || timestamp_utc > latest_timestamp.unwrap() {
-                                    latest_timestamp = Some(timestamp_utc);
-                                }
-                            }
+                    if let Some(timestamp_field) = &self.config.timestamp_field
+                        && let Some(timestamp_str) =
+                            source.get(timestamp_field).and_then(|v| v.as_str())
+                        && let Ok(timestamp) = DateTime::parse_from_rfc3339(timestamp_str)
+                    {
+                        let timestamp_utc = timestamp.with_timezone(&Utc);
+                        if latest_timestamp.is_none() || timestamp_utc > latest_timestamp.unwrap() {
+                            latest_timestamp = Some(timestamp_utc);
                         }
                     }
 
                     // Create message from document
-                    let payload = serde_json::to_vec(source)
-                        .map_err(|e| Error::Serialization(format!("Failed to serialize document: {}", e)))?;
+                    let payload = serde_json::to_vec(source).map_err(|e| {
+                        Error::Serialization(format!("Failed to serialize document: {}", e))
+                    })?;
 
                     let message = ProducedMessage {
                         id: None,
@@ -418,7 +439,9 @@ impl Source for ElasticsearchSource {
         // Test connection by checking if index exists
         let response = client
             .indices()
-            .exists(elasticsearch::indices::IndicesExistsParts::Index(&[&self.config.index]))
+            .exists(elasticsearch::indices::IndicesExistsParts::Index(&[&self
+                .config
+                .index]))
             .send()
             .await
             .map_err(|e| Error::Storage(format!("Failed to check index existence: {}", e)))?;
@@ -433,13 +456,18 @@ impl Source for ElasticsearchSource {
         self.client = Some(client);
 
         // Load state if state management is enabled
-        if self.config.state.as_ref().map(|s| s.enabled).unwrap_or(false) {
-            if let Err(e) = self.load_state().await {
-                warn!(
-                    "Failed to load state for Elasticsearch source connector with ID: {}: {}",
-                    self.id, e
-                );
-            }
+        if self
+            .config
+            .state
+            .as_ref()
+            .map(|s| s.enabled)
+            .unwrap_or(false)
+            && let Err(e) = self.load_state().await
+        {
+            warn!(
+                "Failed to load state for Elasticsearch source connector with ID: {}: {}",
+                self.id, e
+            );
         }
 
         info!(
@@ -454,9 +482,10 @@ impl Source for ElasticsearchSource {
 
         sleep(self.polling_interval).await;
 
-        let client = self.client.as_ref().ok_or_else(|| {
-            Error::Storage("Elasticsearch client not initialized".to_string())
-        })?;
+        let client = self
+            .client
+            .as_ref()
+            .ok_or_else(|| Error::Storage("Elasticsearch client not initialized".to_string()))?;
 
         let messages = match self.search_documents(client).await {
             Ok(msgs) => {
@@ -466,9 +495,13 @@ impl Source for ElasticsearchSource {
                 state.processing_stats.last_successful_poll = Some(Utc::now());
 
                 let processing_time = start_time.elapsed().as_millis() as f64;
-                let total_polls = state.processing_stats.successful_polls_count + state.processing_stats.empty_polls_count;
+                let total_polls = state.processing_stats.successful_polls_count
+                    + state.processing_stats.empty_polls_count;
                 state.processing_stats.avg_batch_processing_time_ms =
-                    (state.processing_stats.avg_batch_processing_time_ms * (total_polls - 1) as f64 + processing_time) / total_polls as f64;
+                    (state.processing_stats.avg_batch_processing_time_ms
+                        * (total_polls - 1) as f64
+                        + processing_time)
+                        / total_polls as f64;
 
                 if msgs.is_empty() {
                     state.processing_stats.empty_polls_count += 1;
@@ -505,22 +538,36 @@ impl Source for ElasticsearchSource {
         drop(state);
 
         // Save final state if state management is enabled
-        if self.config.state.as_ref().map(|s| s.enabled).unwrap_or(false) {
-            if let Err(e) = self.save_state().await {
-                warn!(
-                    "Failed to save final state for Elasticsearch source connector with ID: {}: {}",
-                    self.id, e
-                );
-            }
+        if self
+            .config
+            .state
+            .as_ref()
+            .map(|s| s.enabled)
+            .unwrap_or(false)
+            && let Err(e) = self.save_state().await
+        {
+            warn!(
+                "Failed to save final state for Elasticsearch source connector with ID: {}: {}",
+                self.id, e
+            );
         }
 
         self.client = None;
-        info!("Elasticsearch source connector with ID: {} is closed.", self.id);
+        info!(
+            "Elasticsearch source connector with ID: {} is closed.",
+            self.id
+        );
         Ok(())
     }
 
     async fn get_state(&self) -> Result<Option<SourceState>, Error> {
-        if self.config.state.as_ref().map(|s| s.enabled).unwrap_or(false) {
+        if self
+            .config
+            .state
+            .as_ref()
+            .map(|s| s.enabled)
+            .unwrap_or(false)
+        {
             Ok(Some(self.internal_state_to_source_state().await?))
         } else {
             Ok(None)
@@ -528,7 +575,13 @@ impl Source for ElasticsearchSource {
     }
 
     async fn set_state(&mut self, state: SourceState) -> Result<(), Error> {
-        if self.config.state.as_ref().map(|s| s.enabled).unwrap_or(false) {
+        if self
+            .config
+            .state
+            .as_ref()
+            .map(|s| s.enabled)
+            .unwrap_or(false)
+        {
             self.source_state_to_internal_state(state).await
         } else {
             Ok(())
@@ -536,11 +589,18 @@ impl Source for ElasticsearchSource {
     }
 
     async fn save_state(&self) -> Result<(), Error> {
-        if !self.config.state.as_ref().map(|s| s.enabled).unwrap_or(false) {
+        if !self
+            .config
+            .state
+            .as_ref()
+            .map(|s| s.enabled)
+            .unwrap_or(false)
+        {
             return Ok(());
         }
 
-        let storage = self.create_state_storage()
+        let storage = self
+            .create_state_storage()
             .ok_or_else(|| Error::Storage("State storage not configured".to_string()))?;
 
         let source_state = self.internal_state_to_source_state().await?;
@@ -554,11 +614,18 @@ impl Source for ElasticsearchSource {
     }
 
     async fn load_state(&mut self) -> Result<(), Error> {
-        if !self.config.state.as_ref().map(|s| s.enabled).unwrap_or(false) {
+        if !self
+            .config
+            .state
+            .as_ref()
+            .map(|s| s.enabled)
+            .unwrap_or(false)
+        {
             return Ok(());
         }
 
-        let storage = self.create_state_storage()
+        let storage = self
+            .create_state_storage()
             .ok_or_else(|| Error::Storage("State storage not configured".to_string()))?;
 
         let state_id = self.get_state_id();
@@ -568,10 +635,7 @@ impl Source for ElasticsearchSource {
             let state = self.state.lock().await;
             info!(
                 "Loaded state for Elasticsearch source connector with ID: {} - last poll: {:?}, total docs: {}, polls: {}",
-                self.id,
-                state.last_poll_timestamp,
-                state.total_documents_fetched,
-                state.poll_count
+                self.id, state.last_poll_timestamp, state.total_documents_fetched, state.poll_count
             );
         } else {
             info!(

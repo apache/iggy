@@ -556,4 +556,6 @@ pub enum Error {
     CannotWriteStateFile,
     #[error("Invalid state")]
     InvalidState,
+    #[error("Connection error: {0}")]
+    Connection(String),
 }
