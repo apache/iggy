@@ -18,19 +18,21 @@ This Elasticsearch source connector provides comprehensive state management capa
 ### Basic Configuration
 
 ```toml
-[sources.elasticsearch]
+type = "source"
+key = "elasticsearch"
 enabled = true
+version = 0
 name = "Elasticsearch source"
 path = "target/release/libiggy_connector_elasticsearch_source"
 
-[[sources.elasticsearch.streams]]
+[[streams]]
 stream = "elasticsearch_stream"
 topic = "documents"
 schema = "json"
 batch_length = 100
 linger_time = "5ms"
 
-[sources.elasticsearch.config]
+[plugin_config]
 url = "http://localhost:9200"
 index = "logs-*"
 polling_interval = "30s"
@@ -44,7 +46,7 @@ query = {
 ### State Management Configuration
 
 ```toml
-[sources.elasticsearch.config]
+[plugin_config]
 # ... basic config ...
 state = {
   enabled = true
