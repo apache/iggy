@@ -1694,6 +1694,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "consensus"
+version = "0.1.0"
+
+[[package]]
 name = "console"
 version = "0.15.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5212,6 +5216,13 @@ name = "memchr"
 version = "2.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f52b00d39961fc5b2736ea853c9cc86238e165017a493d1d5c8eac6bdc4cc273"
+
+[[package]]
+name = "metadata"
+version = "0.1.0"
+dependencies = [
+ "consensus",
+]
 
 [[package]]
 name = "miette"

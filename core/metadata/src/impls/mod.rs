@@ -14,23 +14,4 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-
-pub(crate) mod args;
-pub(crate) mod client;
-pub(crate) mod client_state;
-pub(crate) mod cluster;
-pub(crate) mod command;
-pub(crate) mod compression;
-pub(crate) mod configuration;
-pub(crate) mod consensus;
-pub(crate) mod consumer;
-pub(crate) mod diagnostic;
-pub(crate) mod identifier;
-pub(crate) mod message;
-pub(crate) mod partition;
-pub(crate) mod permissions;
-pub(crate) mod snapshot;
-pub(crate) mod stats;
-pub(crate) mod stream;
-pub(crate) mod topic;
-pub(crate) mod user;
+pub mod metadata;

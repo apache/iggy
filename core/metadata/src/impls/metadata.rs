@@ -14,23 +14,40 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+use consensus::Consensus;
 
-pub(crate) mod args;
-pub(crate) mod client;
-pub(crate) mod client_state;
-pub(crate) mod cluster;
-pub(crate) mod command;
-pub(crate) mod compression;
-pub(crate) mod configuration;
-pub(crate) mod consensus;
-pub(crate) mod consumer;
-pub(crate) mod diagnostic;
-pub(crate) mod identifier;
-pub(crate) mod message;
-pub(crate) mod partition;
-pub(crate) mod permissions;
-pub(crate) mod snapshot;
-pub(crate) mod stats;
-pub(crate) mod stream;
-pub(crate) mod topic;
-pub(crate) mod user;
+// TODO: Define a trait (probably in some external crate)
+#[expect(unused)]
+trait Metadata<C>
+where
+    C: Consensus,
+{
+    fn on_request(&self, message: C::RequestMessage);
+    fn on_replicate(&self, message: C::ReplicateMessage);
+    fn on_ack(&self, message: C::AckMessage);
+}
+
+#[expect(unused)]
+struct IggyMetadata<C, M, J, S> {
+    consensus: C,
+    mux_stm: M,
+    journal: J,
+    snapshot: S,
+}
+
+impl<C, M, J, S> Metadata<C> for IggyMetadata<C, M, J, S>
+where
+    C: Consensus,
+{
+    fn on_request(&self, _message: C::RequestMessage) {
+        todo!()
+    }
+
+    fn on_replicate(&self, _message: C::ReplicateMessage) {
+        todo!()
+    }
+
+    fn on_ack(&self, _message: C::AckMessage) {
+        todo!()
+    }
+}
