@@ -17,9 +17,9 @@
  */
 
 use crate::{
-    IcebergSink,
     catalog::init_catalog,
     router::{dynamic_router::DynamicRouter, static_router::StaticRouter},
+    IcebergSink,
 };
 use async_trait::async_trait;
 use iceberg::Catalog;
@@ -29,9 +29,21 @@ use tracing::{debug, error, info};
 #[async_trait]
 impl Sink for IcebergSink {
     async fn open(&mut self) -> Result<(), Error> {
+        let redacted_store_key = self
+            .config
+            .store_access_key_id
+            .chars()
+            .take(3)
+            .collect::<String>();
+        let redacted_store_secret = self
+            .config
+            .store_secret_access_key
+            .chars()
+            .take(3)
+            .collect::<String>();
         info!(
-            "Opened Iceberg sink connector with ID: {} for URL: {}",
-            self.id, self.config.uri
+            "Opened Iceberg sink connector with ID: {} for URL: {}, store access key ID: {}  store secret: {}",
+            self.id, self.config.uri, redacted_store_key, redacted_store_secret
         );
 
         info!(

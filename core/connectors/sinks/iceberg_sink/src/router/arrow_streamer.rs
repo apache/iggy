@@ -34,15 +34,15 @@ impl<'a> JsonArrowReader<'a> {
     }
 
     fn load_next(&mut self) -> io::Result<bool> {
-        if let Some(val) = self.values.next() {
-            let mut buf = Vec::new();
-            simd_json::to_writer(&mut buf, val).map_err(io::Error::other)?;
-            buf.push(b'\n');
-            self.cursor = Cursor::new(buf);
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+        let Some(val) = self.values.next() else {
+            return Ok(false);
+        };
+
+        let mut buf = Vec::new();
+        simd_json::to_writer(&mut buf, val).map_err(io::Error::other)?;
+        buf.push(b'\n');
+        self.cursor = Cursor::new(buf);
+        Ok(true)
     }
 }
 

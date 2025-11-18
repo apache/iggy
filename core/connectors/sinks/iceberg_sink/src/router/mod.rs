@@ -85,12 +85,12 @@ fn get_partition_type_value(default_partition_type: &StructType) -> Result<Optio
     };
 
     for field in default_partition_type.fields() {
-        let t = field.field_type.as_primitive_type().ok_or_else(|| {
+        let field_type = field.field_type.as_primitive_type().ok_or_else(|| {
             error!("The partition type of the configured iceberg table is not a primitive type");
             Error::InvalidConfig
         })?;
 
-        let value = Some(Literal::Primitive(primitive_type_to_literal(t)?));
+        let value = Some(Literal::Primitive(primitive_type_to_literal(field_type)?));
 
         fields.push(value);
     }
