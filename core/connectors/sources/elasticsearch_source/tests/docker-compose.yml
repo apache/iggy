@@ -58,4 +58,4 @@ volumes:
 
 networks:
   es_test_network:
-    driver: bridge 
+    driver: bridge

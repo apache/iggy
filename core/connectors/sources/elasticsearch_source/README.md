@@ -60,7 +60,7 @@ state = {
   auto_save_interval = "5m"
   tracked_fields = [
     "last_poll_timestamp",
-    "last_document_id", 
+    "last_document_id",
     "total_documents_fetched"
   ]
 }
@@ -189,7 +189,7 @@ if let Some(state_manager) = connector.get_state_manager() {
     // Get state statistics
     let stats = state_manager.get_state_stats().await?;
     println!("Total states: {}", stats.total_states);
-    
+
     // Clean up old states (older than 30 days)
     let deleted_count = state_manager.cleanup_old_states(30).await?;
     println!("Deleted {} old states", deleted_count);

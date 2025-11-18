@@ -73,10 +73,10 @@ mod tests {
         // Given a valid state configuration
         let temp_dir = tempfile::tempdir().unwrap();
         let config = given_test_state_config(&temp_dir);
-        
+
         // When creating a state manager
         let _state_manager = StateManager::new(config.clone()).unwrap();
-        
+
         // Then it should be created successfully with auto-save interval
         assert!(config.auto_save_interval.is_some());
     }
@@ -87,10 +87,10 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let mut config = given_test_state_config(&temp_dir);
         config.storage_type = Some("invalid_storage".to_string());
-        
+
         // When creating a state manager
         let _state_manager = StateManager::new(config.clone()).unwrap();
-        
+
         // Then it should fall back to file storage
         assert!(config.auto_save_interval.is_some());
     }
@@ -102,14 +102,14 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let storage = FileStateStorage::new(temp_dir.path());
         let state = given_test_source_state();
-        
+
         // When saving the state
         storage.save_source_state(&state).await.unwrap();
-        
+
         // Then it should be loadable
         let loaded_state = storage.load_source_state(&state.id).await.unwrap();
         assert!(loaded_state.is_some());
-        
+
         let loaded = loaded_state.unwrap();
         assert_eq!(loaded.id, state.id);
         assert_eq!(loaded.version, state.version);
@@ -122,10 +122,10 @@ mod tests {
         let storage = FileStateStorage::new(temp_dir.path());
         let state = given_test_source_state();
         storage.save_source_state(&state).await.unwrap();
-        
+
         // When listing states
         let states = storage.list_states().await.unwrap();
-        
+
         // Then it should contain the saved state
         assert_eq!(states.len(), 1);
         assert_eq!(states[0], state.id);
@@ -138,10 +138,10 @@ mod tests {
         let storage = FileStateStorage::new(temp_dir.path());
         let state = given_test_source_state();
         storage.save_source_state(&state).await.unwrap();
-        
+
         // When deleting the state
         storage.delete_state(&state.id).await.unwrap();
-        
+
         // Then it should no longer exist
         let deleted_state = storage.load_source_state(&state.id).await.unwrap();
         assert!(deleted_state.is_none());
@@ -154,10 +154,10 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let config = given_test_state_config(&temp_dir);
         let _state_manager = StateManager::new(config).unwrap();
-        
+
         // When getting state statistics
         let stats = _state_manager.get_state_stats().await.unwrap();
-        
+
         // Then it should report empty stats
         assert_eq!(stats.total_states, 0);
         assert!(stats.states.is_empty());
@@ -169,14 +169,14 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let config = given_test_state_config(&temp_dir);
         let _state_manager = StateManager::new(config).unwrap();
-        
+
         let storage = FileStateStorage::new(temp_dir.path());
         let state = given_test_source_state();
         storage.save_source_state(&state).await.unwrap();
-        
+
         // When getting state statistics
         let stats = _state_manager.get_state_stats().await.unwrap();
-        
+
         // Then it should report correct stats
         assert_eq!(stats.total_states, 1);
         assert_eq!(stats.states.len(), 1);
@@ -192,17 +192,17 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let config = given_test_state_config(&temp_dir);
         let _state_manager = StateManager::new(config).unwrap();
-        
+
         let storage = FileStateStorage::new(temp_dir.path());
         let state = given_test_source_state();
         storage.save_source_state(&state).await.unwrap();
-        
+
         // When cleaning up old states
         let deleted_count = _state_manager.cleanup_old_states(1).await.unwrap();
-        
+
         // Then no states should be deleted
         assert_eq!(deleted_count, 0);
-        
+
         // And the state should still exist
         let stats = _state_manager.get_state_stats().await.unwrap();
         assert_eq!(stats.total_states, 1);
@@ -222,11 +222,11 @@ mod tests {
             auto_save_interval: Some("5m".to_string()),
             tracked_fields: Some(vec!["field1".to_string(), "field2".to_string()]),
         };
-        
+
         // When serializing and deserializing
         let json = serde_json::to_string(&config).unwrap();
         let deserialized: StateConfig = serde_json::from_str(&json).unwrap();
-        
+
         // Then all fields should match
         assert_eq!(config.enabled, deserialized.enabled);
         assert_eq!(config.storage_type, deserialized.storage_type);
@@ -239,11 +239,11 @@ mod tests {
     async fn source_state_should_serialize_and_deserialize_correctly() {
         // Given a source state
         let state = given_test_source_state();
-        
+
         // When serializing and deserializing
         let json = serde_json::to_string(&state).unwrap();
         let deserialized: SourceState = serde_json::from_str(&json).unwrap();
-        
+
         // Then all fields should match
         assert_eq!(state.id, deserialized.id);
         assert_eq!(state.version, deserialized.version);
@@ -258,14 +258,14 @@ mod tests {
         let config = given_test_state_config(&temp_dir);
         let _state_manager = StateManager::new(config).unwrap();
         let storage = FileStateStorage::new(temp_dir.path());
-        
+
         // When performing a complete workflow: save -> load -> update -> save
         let mut state = given_test_source_state();
         storage.save_source_state(&state).await.unwrap();
-        
+
         let loaded_state = storage.load_source_state(&state.id).await.unwrap().unwrap();
         assert_eq!(loaded_state.id, state.id);
-        
+
         // Update state
         state.version = 2;
         state.data = json!({
@@ -273,10 +273,10 @@ mod tests {
             "total_documents_fetched": 200,
         });
         storage.save_source_state(&state).await.unwrap();
-        
+
         // Then the updated state should be persisted
         let updated_state = storage.load_source_state(&state.id).await.unwrap().unwrap();
         assert_eq!(updated_state.version, 2);
         assert_eq!(updated_state.data["total_documents_fetched"], 200);
     }
-} 
+}

@@ -161,7 +161,7 @@ impl ElasticsearchSource {
                     .and_then(|c| c.get("base_path"))
                     .and_then(|p| p.as_str())
                     .unwrap_or("./connector_states");
-                
+
                 Some(Arc::new(FileStateStorage::new(base_path)))
             }
             Some("elasticsearch") => {
@@ -188,7 +188,7 @@ impl ElasticsearchSource {
     /// Convert internal state to SourceState
     async fn internal_state_to_source_state(&self) -> Result<SourceState, Error> {
         let state = self.state.lock().await;
-        
+
         let data = json!({
             "last_poll_timestamp": state.last_poll_timestamp,
             "total_documents_fetched": state.total_documents_fetched,
@@ -218,7 +218,7 @@ impl ElasticsearchSource {
     /// Convert SourceState to internal state
     async fn source_state_to_internal_state(&mut self, source_state: SourceState) -> Result<(), Error> {
         let mut state = self.state.lock().await;
-        
+
         if let Some(data) = source_state.data.as_object() {
             if let Some(timestamp) = data.get("last_poll_timestamp") {
                 if let Some(ts_str) = timestamp.as_str() {
@@ -227,48 +227,48 @@ impl ElasticsearchSource {
                     }
                 }
             }
-            
+
             if let Some(count) = data.get("total_documents_fetched") {
                 if let Some(count_val) = count.as_u64() {
                     state.total_documents_fetched = count_val as usize;
                 }
             }
-            
+
             if let Some(count) = data.get("poll_count") {
                 if let Some(count_val) = count.as_u64() {
                     state.poll_count = count_val as usize;
                 }
             }
-            
+
             if let Some(doc_id) = data.get("last_document_id") {
                 state.last_document_id = doc_id.as_str().map(|s| s.to_string());
             }
-            
+
             if let Some(scroll_id) = data.get("last_scroll_id") {
                 state.last_scroll_id = scroll_id.as_str().map(|s| s.to_string());
             }
-            
+
             if let Some(offset) = data.get("last_offset") {
                 state.last_offset = offset.as_u64();
             }
-            
+
             if let Some(error_count) = data.get("error_count") {
                 if let Some(count_val) = error_count.as_u64() {
                     state.error_count = count_val as usize;
                 }
             }
-            
+
             if let Some(last_error) = data.get("last_error") {
                 state.last_error = last_error.as_str().map(|s| s.to_string());
             }
-            
+
             if let Some(stats) = data.get("processing_stats") {
                 if let Ok(processing_stats) = serde_json::from_value(stats.clone()) {
                     state.processing_stats = processing_stats;
                 }
             }
         }
-        
+
         Ok(())
     }
 
@@ -451,7 +451,7 @@ impl Source for ElasticsearchSource {
 
     async fn poll(&self) -> Result<ProducedMessages, Error> {
         let start_time = std::time::Instant::now();
-        
+
         sleep(self.polling_interval).await;
 
         let client = self.client.as_ref().ok_or_else(|| {
@@ -464,16 +464,16 @@ impl Source for ElasticsearchSource {
                 let mut state = self.state.lock().await;
                 state.processing_stats.successful_polls_count += 1;
                 state.processing_stats.last_successful_poll = Some(Utc::now());
-                
+
                 let processing_time = start_time.elapsed().as_millis() as f64;
                 let total_polls = state.processing_stats.successful_polls_count + state.processing_stats.empty_polls_count;
-                state.processing_stats.avg_batch_processing_time_ms = 
+                state.processing_stats.avg_batch_processing_time_ms =
                     (state.processing_stats.avg_batch_processing_time_ms * (total_polls - 1) as f64 + processing_time) / total_polls as f64;
-                
+
                 if msgs.is_empty() {
                     state.processing_stats.empty_polls_count += 1;
                 }
-                
+
                 drop(state);
                 msgs
             }
@@ -526,7 +526,7 @@ impl Source for ElasticsearchSource {
             Ok(None)
         }
     }
-    
+
     async fn set_state(&mut self, state: SourceState) -> Result<(), Error> {
         if self.config.state.as_ref().map(|s| s.enabled).unwrap_or(false) {
             self.source_state_to_internal_state(state).await
@@ -534,7 +534,7 @@ impl Source for ElasticsearchSource {
             Ok(())
         }
     }
-    
+
     async fn save_state(&self) -> Result<(), Error> {
         if !self.config.state.as_ref().map(|s| s.enabled).unwrap_or(false) {
             return Ok(());
@@ -542,17 +542,17 @@ impl Source for ElasticsearchSource {
 
         let storage = self.create_state_storage()
             .ok_or_else(|| Error::Storage("State storage not configured".to_string()))?;
-        
+
         let source_state = self.internal_state_to_source_state().await?;
         storage.save_source_state(&source_state).await?;
-        
+
         info!(
             "Saved state for Elasticsearch source connector with ID: {}",
             self.id
         );
         Ok(())
     }
-    
+
     async fn load_state(&mut self) -> Result<(), Error> {
         if !self.config.state.as_ref().map(|s| s.enabled).unwrap_or(false) {
             return Ok(());
@@ -560,11 +560,11 @@ impl Source for ElasticsearchSource {
 
         let storage = self.create_state_storage()
             .ok_or_else(|| Error::Storage("State storage not configured".to_string()))?;
-        
+
         let state_id = self.get_state_id();
         if let Some(source_state) = storage.load_source_state(&state_id).await? {
             self.source_state_to_internal_state(source_state).await?;
-            
+
             let state = self.state.lock().await;
             info!(
                 "Loaded state for Elasticsearch source connector with ID: {} - last poll: {:?}, total docs: {}, polls: {}",
@@ -579,7 +579,7 @@ impl Source for ElasticsearchSource {
                 self.id
             );
         }
-        
+
         Ok(())
     }
 }

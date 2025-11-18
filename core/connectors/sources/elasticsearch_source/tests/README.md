@@ -163,7 +163,7 @@ Tests create and use the following indices:
    ```bash
    # Check Docker logs
    docker-compose logs elasticsearch
-   
+
    # Check available memory
    docker system df
    ```
@@ -173,7 +173,7 @@ Tests create and use the following indices:
    ```bash
    # Check if port 9200 is in use
    lsof -i :9200
-   
+
    # Modify docker-compose.yml to use different ports
    ```
 

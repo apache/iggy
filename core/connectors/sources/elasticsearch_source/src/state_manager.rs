@@ -60,7 +60,7 @@ impl StateManager {
                     .and_then(|c| c.get("base_path"))
                     .and_then(|p| p.as_str())
                     .unwrap_or("./connector_states");
-                
+
                 Ok(Arc::new(FileStateStorage::new(base_path)))
             }
             Some("elasticsearch") => {
@@ -169,13 +169,13 @@ pub struct StateInfo {
 pub trait StateManagerExt {
     /// Get state manager for this connector
     fn get_state_manager(&self) -> Option<StateManager>;
-    
+
     /// Export current state to JSON
     async fn export_state(&self) -> Result<Value, Error>;
-    
+
     /// Import state from JSON
     async fn import_state(&mut self, state_json: Value) -> Result<(), Error>;
-    
+
     /// Reset state (clear all state data)
     async fn reset_state(&mut self) -> Result<(), Error>;
 }
@@ -225,4 +225,4 @@ impl StateManagerExt for ElasticsearchSource {
         // Save the reset state
         Source::save_state(self).await
     }
-} 
+}

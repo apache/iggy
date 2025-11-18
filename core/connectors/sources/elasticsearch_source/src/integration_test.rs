@@ -56,7 +56,7 @@ async fn elasticsearch_source_should_connect_to_elasticsearch() {
 
     // Then it should open successfully (even if ES is not available, it should handle the error gracefully)
     let result = source.open().await;
-    
+
     // The test should not panic, even if Elasticsearch is not available
     // This tests the error handling of the connector
     match result {
@@ -106,7 +106,7 @@ async fn elasticsearch_source_should_handle_poll_without_elasticsearch() {
 
     // Then it should handle poll gracefully even without Elasticsearch
     let result = source.poll().await;
-    
+
     match result {
         Ok(ProducedMessages { messages, schema, state }) => {
             println!("Poll successful: {} messages, schema: {:?}", messages.len(), schema);
@@ -197,14 +197,14 @@ async fn elasticsearch_source_should_close_gracefully() {
 
     // When creating and closing the Elasticsearch source
     let mut source = ElasticsearchSource::new(3, config, None);
-    
+
     // Open (may fail if ES is not available, but that's OK)
     let _ = source.open().await;
-    
+
     // Close should always succeed
     let close_result = source.close().await;
     assert!(close_result.is_ok());
-    
+
     println!("Elasticsearch source closed gracefully");
 }
 
@@ -240,15 +240,15 @@ async fn elasticsearch_source_should_handle_state_persistence() {
 
     // When creating the source and performing operations
     let source = ElasticsearchSource::new(4, config, None);
-    
+
     // Poll should return state even if no data is available
     let poll_result = source.poll().await;
-    
+
     match poll_result {
         Ok(ProducedMessages { messages, schema, state }) => {
             println!("Poll returned: {} messages, schema: {:?}", messages.len(), schema);
             assert_eq!(schema, Schema::Json);
-            
+
             // State should be present even if no messages
             if let Some(state_value) = state {
                 println!("State returned: {:?}", state_value);
@@ -261,6 +261,6 @@ async fn elasticsearch_source_should_handle_state_persistence() {
             // Don't fail the test for connection issues
         }
     }
-    
+
     println!("State persistence test completed");
-} 
+}
