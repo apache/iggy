@@ -79,6 +79,9 @@ Content-Type: application/json
 GET {{url}}/sinks/{{sink_key}}/configs/{{sink_version}}
 
 ###
+DELETE {{url}}/sinks/{{sink_key}}/configs?version={{sink_version}}
+
+###
 GET {{url}}/sinks/{{sink_key}}/configs/active
 
 ###
@@ -148,6 +151,9 @@ Content-Type: application/json
 
 ###
 GET {{url}}/sources/{{source_key}}/configs/{{source_version}}
+
+###
+DELETE {{url}}/sources/{{source_key}}/configs?version={{source_version}}
 
 ###
 GET {{url}}/sources/{{source_key}}/configs/active

@@ -215,6 +215,13 @@ pub trait ConnectorsConfigProvider: Send + Sync {
         key: &str,
         version: Option<u64>,
     ) -> Result<Option<SourceConfig>, RuntimeError>;
+    async fn delete_sink_config(&self, key: &str, version: Option<u64>)
+    -> Result<(), RuntimeError>;
+    async fn delete_source_config(
+        &self,
+        key: &str,
+        version: Option<u64>,
+    ) -> Result<(), RuntimeError>;
 }
 
 pub async fn create_connectors_config_provider(

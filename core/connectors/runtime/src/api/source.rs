@@ -42,7 +42,9 @@ pub fn router(state: Arc<RuntimeContext>) -> Router {
         .route("/sources/{key}/transforms", get(get_source_transforms))
         .route(
             "/sources/{key}/configs",
-            get(get_source_configs).post(create_source_config),
+            get(get_source_configs)
+                .post(create_source_config)
+                .delete(delete_source_config),
         )
         .route("/sources/{key}/configs/{version}", get(get_source_config))
         .route(
@@ -227,6 +229,23 @@ async fn update_source_active_config(
     context
         .config_provider
         .set_active_source_version(&key, update.version)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Deserialize)]
+struct DeleteSourceConfig {
+    version: Option<u64>,
+}
+
+async fn delete_source_config(
+    State(context): State<Arc<RuntimeContext>>,
+    Path((key,)): Path<(String,)>,
+    Query(query): Query<DeleteSourceConfig>,
+) -> Result<StatusCode, ApiError> {
+    context
+        .config_provider
+        .delete_source_config(&key, query.version)
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }

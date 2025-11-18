@@ -65,6 +65,7 @@ struct SinkConfigFile {
     config: SinkConfig,
     #[allow(dead_code)]
     created_at: DateTime<Utc>,
+    path: String,
 }
 
 #[derive(Clone)]
@@ -72,6 +73,7 @@ struct SourceConfigFile {
     config: SourceConfig,
     #[allow(dead_code)]
     created_at: DateTime<Utc>,
+    path: String,
 }
 
 #[derive(Default)]
@@ -196,6 +198,7 @@ impl LocalConnectorsConfigProvider<Created> {
                             SinkConfigFile {
                                 config: sink_config,
                                 created_at,
+                                path,
                             },
                         );
                     }
@@ -205,6 +208,7 @@ impl LocalConnectorsConfigProvider<Created> {
                             SourceConfigFile {
                                 config: source_config,
                                 created_at,
+                                path,
                             },
                         );
                     }
@@ -345,6 +349,7 @@ impl ConnectorsConfigProvider for LocalConnectorsConfigProvider<Initialized> {
             SinkConfigFile {
                 config: config.clone(),
                 created_at: Utc::now(),
+                path: path.clone(),
             },
         );
 
@@ -379,6 +384,7 @@ impl ConnectorsConfigProvider for LocalConnectorsConfigProvider<Initialized> {
             SourceConfigFile {
                 config: config.clone(),
                 created_at: Utc::now(),
+                path: path.clone(),
             },
         );
 
@@ -615,6 +621,112 @@ impl ConnectorsConfigProvider for LocalConnectorsConfigProvider<Initialized> {
                 .into_iter()
                 .max_by_key(|config| config.version))
         }
+    }
+
+    async fn delete_sink_config(
+        &self,
+        key: &str,
+        version: Option<u64>,
+    ) -> Result<(), RuntimeError> {
+        debug!("Deleting sink config: {}@{:?}", &key, &version);
+        let sinks = self.state.connectors_config.sinks();
+        let active_versions = self.load_active_versions();
+
+        let version_to_delete = version
+            .or(active_versions.sinks.get(key).copied())
+            .ok_or_else(|| RuntimeError::SinkConfigNotFound(key.to_owned(), 0))?;
+
+        let connector_id = ConnectorId {
+            key: key.to_owned(),
+            version: version_to_delete,
+        };
+
+        let config_file = {
+            sinks
+                .get(&connector_id)
+                .ok_or_else(|| RuntimeError::SinkConfigNotFound(key.to_owned(), version_to_delete))?
+                .value()
+                .clone()
+        };
+
+        std::fs::remove_file(&config_file.path)?;
+        sinks.remove(&connector_id);
+
+        let mut active_versions = self.load_active_versions();
+        let remaining_versions: Vec<u64> = sinks
+            .iter()
+            .filter(|entry| entry.key().key == key)
+            .map(|entry| entry.key().version)
+            .collect();
+
+        if remaining_versions.is_empty() {
+            active_versions.sinks.remove(key);
+        } else if Some(version_to_delete) == active_versions.sinks.get(key).copied() {
+            let latest_version = remaining_versions
+                .into_iter()
+                .max()
+                .expect("At least one version must exist");
+            active_versions.sinks.insert(key.to_owned(), latest_version);
+        }
+
+        self.save_active_versions(&active_versions)?;
+        debug!("Deleted sink configuration: {}@{:?}", &key, &version);
+        Ok(())
+    }
+
+    async fn delete_source_config(
+        &self,
+        key: &str,
+        version: Option<u64>,
+    ) -> Result<(), RuntimeError> {
+        debug!("Deleting source config: {}@{:?}", &key, &version);
+        let sources = self.state.connectors_config.sources();
+        let active_versions = self.load_active_versions();
+
+        let version_to_delete = version
+            .or(active_versions.sources.get(key).copied())
+            .ok_or_else(|| RuntimeError::SourceConfigNotFound(key.to_owned(), 0))?;
+
+        let connector_id = ConnectorId {
+            key: key.to_owned(),
+            version: version_to_delete,
+        };
+
+        let config_file = {
+            sources
+                .get(&connector_id)
+                .ok_or_else(|| {
+                    RuntimeError::SourceConfigNotFound(key.to_owned(), version_to_delete)
+                })?
+                .value()
+                .clone()
+        };
+
+        std::fs::remove_file(&config_file.path)?;
+        sources.remove(&connector_id);
+
+        let mut active_versions = self.load_active_versions();
+        let remaining_versions: Vec<u64> = sources
+            .iter()
+            .filter(|entry| entry.key().key == key)
+            .map(|entry| entry.key().version)
+            .collect();
+
+        if remaining_versions.is_empty() {
+            active_versions.sources.remove(key);
+        } else if Some(version_to_delete) == active_versions.sources.get(key).copied() {
+            let latest_version = remaining_versions
+                .into_iter()
+                .max()
+                .expect("At least one version must exist");
+            active_versions
+                .sources
+                .insert(key.to_owned(), latest_version);
+        }
+
+        self.save_active_versions(&active_versions)?;
+        debug!("Deleted source configuration: {}@{:?}", &key, &version);
+        Ok(())
     }
 }
 

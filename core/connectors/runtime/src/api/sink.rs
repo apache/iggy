@@ -42,7 +42,9 @@ pub fn router(state: Arc<RuntimeContext>) -> Router {
         .route("/sinks/{key}/transforms", get(get_sink_transforms))
         .route(
             "/sinks/{key}/configs",
-            get(get_sink_configs).post(create_sink_config),
+            get(get_sink_configs)
+                .post(create_sink_config)
+                .delete(delete_sink_config),
         )
         .route("/sinks/{key}/configs/{version}", get(get_sink_config))
         .route("/sinks/{key}/configs/plugin", get(get_sink_plugin_config))
@@ -224,6 +226,23 @@ async fn update_sink_active_config(
     context
         .config_provider
         .set_active_sink_version(&key, update.version)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Deserialize)]
+struct DeleteSinkConfig {
+    version: Option<u64>,
+}
+
+async fn delete_sink_config(
+    State(context): State<Arc<RuntimeContext>>,
+    Path((key,)): Path<(String,)>,
+    Query(query): Query<DeleteSinkConfig>,
+) -> Result<StatusCode, ApiError> {
+    context
+        .config_provider
+        .delete_sink_config(&key, query.version)
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }
