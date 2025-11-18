@@ -17,21 +17,47 @@
 
 using System.Diagnostics.CodeAnalysis;
 using System.IO.Hashing;
+using System.Text.Json.Serialization;
 using Apache.Iggy.Extensions;
 using Apache.Iggy.Headers;
+using Apache.Iggy.JsonConverters;
 
 namespace Apache.Iggy.Messages;
 
-public readonly struct Message
+/// <summary>
+///     A message which can be sent to the server.
+/// </summary>
+[JsonConverter(typeof(MessageConverter))]
+public class Message
 {
+    /// <summary>
+    ///     Message header.
+    /// </summary>
     public required MessageHeader Header { get; init; }
-    public required byte[] Payload { get; init; }
-    public Dictionary<HeaderKey, HeaderValue>? UserHeaders { get; init; }
 
+    /// <summary>
+    ///     Message payload.
+    /// </summary>
+    public required byte[] Payload { get; set; }
+
+    /// <summary>
+    ///     User defined headers.
+    /// </summary>
+    public Dictionary<HeaderKey, HeaderValue>? UserHeaders { get; set; }
+
+    /// <summary>
+    ///     Default constructor.
+    /// </summary>
     public Message()
     {
     }
 
+    /// <summary>
+    ///     Initializes a new instance of the <see cref="Message" /> class.
+    /// </summary>
+    /// <param name="id">Message ID.</param>
+    /// <param name="payload">Message payload.</param>
+    /// <param name="userHeaders">User defined headers.</param>
     [SetsRequiredMembers]
     public Message(Guid id, byte[] payload, Dictionary<HeaderKey, HeaderValue>? userHeaders = null)
     {
@@ -45,6 +71,12 @@ public readonly struct Message
         UserHeaders = userHeaders;
     }
 
+    /// <summary>
+    ///     Initializes a new instance of the <see cref="Message" /> class.
+    /// </summary>
+    /// <param name="id">Message ID.</param>
+    /// <param name="payload">Message payload.</param>
+    /// <param name="userHeaders">User defined headers.</param>
     [SetsRequiredMembers]
     public Message(UInt128 id, byte[] payload, Dictionary<HeaderKey, HeaderValue>? userHeaders = null)
     {
@@ -58,6 +90,10 @@ public readonly struct Message
         UserHeaders = userHeaders;
     }
 
+    /// <summary>
+    ///     Returns the size of the message in bytes.
+    /// </summary>
+    /// <returns></returns>
     public int GetSize()
     {
         //return 56 + Payload.Length + (UserHeaders?.Count ?? 0);

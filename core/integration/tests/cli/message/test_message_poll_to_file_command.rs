@@ -36,6 +36,9 @@ pub(super) struct TestMessagePollToFileCmd<'a> {
     headers: HashMap<HeaderKey, HeaderValue>,
     output_file: String,
     cleanup: bool,
+    // These will be populated after creating the resources
+    actual_stream_id: Option<u32>,
+    actual_topic_id: Option<u32>,
 }
 
 impl<'a> TestMessagePollToFileCmd<'a> {
@@ -60,6 +63,8 @@ impl<'a> TestMessagePollToFileCmd<'a> {
             headers,
             output_file: output_file.into(),
             cleanup,
+            actual_stream_id: None,
+            actual_topic_id: None,
         }
     }
 
@@ -81,11 +86,21 @@ impl<'a> TestMessagePollToFileCmd<'a> {
 
         command.extend(vec!["--output-file".into(), self.output_file.clone()]);
 
-        command.extend(vec![
-            self.stream_name.clone(),
-            self.topic_name.clone(),
-            "1".into(),
-        ]);
+        // Use actual stream ID if available, otherwise use stream name as fallback
+        if let Some(stream_id) = self.actual_stream_id {
+            command.push(format!("{}", stream_id));
+        } else {
+            command.push(self.stream_name.clone());
+        }
+
+        // Use actual topic ID if available, otherwise use topic name as fallback
+        if let Some(topic_id) = self.actual_topic_id {
+            command.push(format!("{}", topic_id));
+        } else {
+            command.push(self.topic_name.clone());
+        }
+
+        command.push("0".into());
 
         command
     }
@@ -94,30 +109,25 @@ impl<'a> TestMessagePollToFileCmd<'a> {
 #[async_trait]
 impl IggyCmdTestCase for TestMessagePollToFileCmd<'_> {
     async fn prepare_server_state(&mut self, client: &dyn Client) {
-        let stream = client.create_stream(&self.stream_name, None).await;
+        let stream = client.create_stream(&self.stream_name).await;
         assert!(stream.is_ok());
-
-        let stream_id = Identifier::from_str(self.stream_name.as_str());
-        assert!(stream_id.is_ok());
-        let stream_id = stream_id.unwrap();
+        let stream = stream.unwrap();
+        self.actual_stream_id = Some(stream.id);
 
         let topic = client
             .create_topic(
-                &stream_id,
+                &stream.id.try_into().unwrap(),
                 &self.topic_name,
                 1,
                 Default::default(),
-                None,
                 None,
                 IggyExpiry::NeverExpire,
                 MaxTopicSize::ServerDefault,
             )
             .await;
         assert!(topic.is_ok());
-
-        let topic_id = Identifier::from_str(self.topic_name.as_str());
-        assert!(topic_id.is_ok());
-        let topic_id = topic_id.unwrap();
+        let topic = topic.unwrap();
+        self.actual_topic_id = Some(topic.id);
 
         let mut messages = self
             .messages
@@ -134,9 +144,9 @@ impl IggyCmdTestCase for TestMessagePollToFileCmd<'_> {
 
         let send_status = client
             .send_messages(
-                &stream_id,
-                &topic_id,
-                &Partitioning::partition_id(1),
+                &stream.id.try_into().unwrap(),
+                &topic.id.try_into().unwrap(),
+                &Partitioning::partition_id(0),
                 &mut messages,
             )
             .await;
@@ -157,9 +167,21 @@ impl IggyCmdTestCase for TestMessagePollToFileCmd<'_> {
             _ => format!("Polled {} messages", self.message_count),
         };
 
+        let stream_id = if let Some(stream_id) = self.actual_stream_id {
+            format!("{}", stream_id)
+        } else {
+            self.stream_name.clone()
+        };
+
+        let topic_id = if let Some(topic_id) = self.actual_topic_id {
+            format!("{}", topic_id)
+        } else {
+            self.topic_name.clone()
+        };
+
         let message_prefix = format!(
-            "Executing poll messages from topic ID: {} and stream with ID: {}\nPolled messages from topic with ID: {} and stream with ID: {} (from partition with ID: 1)\n{polled_status}",
-            self.topic_name, self.stream_name, self.topic_name, self.stream_name
+            "Executing poll messages from topic ID: {} and stream with ID: {}\nPolled messages from topic with ID: {} and stream with ID: {} (from partition with ID: 0)\n{polled_status}",
+            topic_id, stream_id, topic_id, stream_id
         );
         let message_file = format!("Storing messages to {} binary file", self.output_file);
         let message_count = format!(
@@ -179,19 +201,18 @@ impl IggyCmdTestCase for TestMessagePollToFileCmd<'_> {
     }
 
     async fn verify_server_state(&self, client: &dyn Client) {
-        let stream_id = Identifier::from_str(self.stream_name.as_str());
-        assert!(stream_id.is_ok());
-        let stream_id = stream_id.unwrap();
+        if let (Some(stream_id), Some(topic_id)) = (self.actual_stream_id, self.actual_topic_id) {
+            let topic = client
+                .delete_topic(
+                    &stream_id.try_into().unwrap(),
+                    &topic_id.try_into().unwrap(),
+                )
+                .await;
+            assert!(topic.is_ok());
 
-        let topic_id = Identifier::from_str(self.topic_name.as_str());
-        assert!(topic_id.is_ok());
-        let topic_id = topic_id.unwrap();
-
-        let topic = client.delete_topic(&stream_id, &topic_id).await;
-        assert!(topic.is_ok());
-
-        let stream = client.delete_stream(&stream_id).await;
-        assert!(stream.is_ok());
+            let stream = client.delete_stream(&stream_id.try_into().unwrap()).await;
+            assert!(stream.is_ok());
+        }
 
         assert!(Path::new(&self.output_file).is_file());
         if self.cleanup {

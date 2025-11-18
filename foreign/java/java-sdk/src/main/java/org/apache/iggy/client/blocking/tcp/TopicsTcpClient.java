@@ -26,13 +26,17 @@ import org.apache.iggy.identifier.TopicId;
 import org.apache.iggy.topic.CompressionAlgorithm;
 import org.apache.iggy.topic.Topic;
 import org.apache.iggy.topic.TopicDetails;
+
 import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+
 import static org.apache.iggy.client.blocking.tcp.BytesDeserializer.readTopic;
 import static org.apache.iggy.client.blocking.tcp.BytesDeserializer.readTopicDetails;
-import static org.apache.iggy.client.blocking.tcp.BytesSerializer.*;
+import static org.apache.iggy.client.blocking.tcp.BytesSerializer.nameToBytes;
+import static org.apache.iggy.client.blocking.tcp.BytesSerializer.toBytes;
+import static org.apache.iggy.client.blocking.tcp.BytesSerializer.toBytesAsU64;
 
 class TopicsTcpClient implements TopicsClient {
 
@@ -65,12 +69,18 @@ class TopicsTcpClient implements TopicsClient {
     }
 
     @Override
-    public TopicDetails createTopic(StreamId streamId, Optional<Long> topicId, Long partitionsCount, CompressionAlgorithm compressionAlgorithm, BigInteger messageExpiry, BigInteger maxTopicSize, Optional<Short> replicationFactor, String name) {
+    public TopicDetails createTopic(
+            StreamId streamId,
+            Long partitionsCount,
+            CompressionAlgorithm compressionAlgorithm,
+            BigInteger messageExpiry,
+            BigInteger maxTopicSize,
+            Optional<Short> replicationFactor,
+            String name) {
         var streamIdBytes = toBytes(streamId);
-        var payload = Unpooled.buffer(27 + streamIdBytes.readableBytes() + name.length());
+        var payload = Unpooled.buffer(23 + streamIdBytes.readableBytes() + name.length());
 
         payload.writeBytes(streamIdBytes);
-        payload.writeIntLE(topicId.orElse(0L).intValue());
         payload.writeIntLE(partitionsCount.intValue());
         payload.writeByte(compressionAlgorithm.asCode());
         payload.writeBytes(toBytesAsU64(messageExpiry));
@@ -83,13 +93,14 @@ class TopicsTcpClient implements TopicsClient {
     }
 
     @Override
-    public void updateTopic(StreamId streamId,
-                            TopicId topicId,
-                            CompressionAlgorithm compressionAlgorithm,
-                            BigInteger messageExpiry,
-                            BigInteger maxTopicSize,
-                            Optional<Short> replicationFactor,
-                            String name) {
+    public void updateTopic(
+            StreamId streamId,
+            TopicId topicId,
+            CompressionAlgorithm compressionAlgorithm,
+            BigInteger messageExpiry,
+            BigInteger maxTopicSize,
+            Optional<Short> replicationFactor,
+            String name) {
         var payload = Unpooled.buffer();
         payload.writeBytes(toBytes(streamId));
         payload.writeBytes(toBytes(topicId));

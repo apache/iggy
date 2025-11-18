@@ -21,12 +21,11 @@ use bytes::Bytes;
 use iggy::prelude::BytesSerializable;
 use iggy_common::create_stream::CreateStream;
 use iggy_common::create_user::CreateUser;
-use server::state::State;
 use server::state::command::EntryCommand;
 use server::state::entry::StateEntry;
 use server::state::models::{CreateStreamWithId, CreateUserWithId};
 
-#[tokio::test]
+#[compio::test]
 async fn should_be_empty_given_initialized_state() {
     let setup = StateSetup::init().await;
     let state = setup.state();
@@ -35,15 +34,15 @@ async fn should_be_empty_given_initialized_state() {
     assert!(entries.is_empty());
 }
 
-#[tokio::test]
+#[compio::test]
 async fn should_apply_single_entry() {
     let setup = StateSetup::init().await;
     let state = setup.state();
     state.init().await.unwrap();
 
-    let user_id = 1;
+    let user_id = 0;
     let command = EntryCommand::CreateUser(CreateUserWithId {
-        user_id,
+        user_id: 1,
         command: CreateUser {
             username: "test".to_string(),
             password: "secret".to_string(),
@@ -61,15 +60,15 @@ async fn should_apply_single_entry() {
     assert_entry(entry, 0, setup.version(), user_id, command_bytes);
 }
 
-#[tokio::test]
+#[compio::test]
 async fn should_apply_encrypted_entry() {
     let setup = StateSetup::init_with_encryptor().await;
     let state = setup.state();
     state.init().await.unwrap();
 
-    let user_id = 1;
+    let user_id = 0;
     let command = EntryCommand::CreateUser(CreateUserWithId {
-        user_id,
+        user_id: 1,
         command: CreateUser {
             username: "test".to_string(),
             password: "secret".to_string(),
@@ -87,7 +86,7 @@ async fn should_apply_encrypted_entry() {
     assert_entry(entry, 0, setup.version(), user_id, command_bytes);
 }
 
-#[tokio::test]
+#[compio::test]
 async fn should_apply_multiple_entries() {
     let setup = StateSetup::init().await;
     let state = setup.state();
@@ -98,9 +97,10 @@ async fn should_apply_multiple_entries() {
     assert_eq!(state.entries_count(), 0);
     assert_eq!(state.term(), 0);
 
-    let first_user_id = 1;
+    let first_user_id = 0; // Root user
+    let created_user_id = 1; // First created user
     let create_user = EntryCommand::CreateUser(CreateUserWithId {
-        user_id: first_user_id,
+        user_id: created_user_id,
         command: CreateUser {
             username: "test".to_string(),
             password: "secret".to_string(),
@@ -115,12 +115,11 @@ async fn should_apply_multiple_entries() {
     assert_eq!(state.current_index(), 0);
     assert_eq!(state.entries_count(), 1);
 
-    let second_user_id = 2;
+    let second_user_id = 1;
     let stream_id = 1;
     let create_stream = EntryCommand::CreateStream(CreateStreamWithId {
         stream_id,
         command: CreateStream {
-            stream_id: Some(stream_id),
             name: "test".to_string(),
         },
     });

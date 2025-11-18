@@ -327,11 +327,11 @@ async fn create_stream_and_user(
     username: &str,
     client: &IggyClient,
 ) -> Result<(), IggyError> {
-    let stream = client.create_stream(stream_name, None).await?;
+    let stream = client.create_stream(stream_name).await?;
     info!("Created stream: {stream_name} with ID: {}", stream.id);
     let mut streams_permissions = AHashMap::new();
     streams_permissions.insert(
-        stream.id,
+        stream.id as usize,
         StreamPermissions {
             read_stream: true,
             manage_topics: true,

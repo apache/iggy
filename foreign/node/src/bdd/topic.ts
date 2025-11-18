@@ -24,16 +24,15 @@ import type { TestWorld } from './world.js';
 
 
 When(
-  'I create a topic with ID {int} and name {string} in stream {int} with {int} partitions',
+  'I create a topic with name {string} in stream {int} with {int} partitions',
   async function (
     this: TestWorld,
-    topicId: number,
     name: string,
     streamId: number,
     partitionCount: number
   ) {
     this.topic = await this.client.topic.create({
-      topicId, name, streamId, partitionCount, compressionAlgorithm: 1
+      name, streamId, partitionCount, compressionAlgorithm: 1
     });
 
   }
@@ -44,9 +43,8 @@ Then('the topic should be created successfully', function (this: TestWorld) {
 });
 
 Then(
-  'the topic should have ID {int} and name {string}',
-  function (this: TestWorld, topicId: number, name: string) {
-    assert.equal(this.topic.id, topicId);
+  'the topic should have name {string}',
+  function (this: TestWorld, name: string) {
     assert.equal(this.topic.name, name);
   }
 );

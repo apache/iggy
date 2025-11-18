@@ -22,10 +22,4 @@ package org.apache.iggy.message;
 import java.math.BigInteger;
 import java.util.List;
 
-public record PolledMessages(
-        Long partitionId,
-        BigInteger currentOffset,
-        Long count,
-        List<Message> messages
-) {
-}
+public record PolledMessages(Long partitionId, BigInteger currentOffset, Long count, List<Message> messages) {}

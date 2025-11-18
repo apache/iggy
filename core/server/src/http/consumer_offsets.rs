@@ -21,11 +21,12 @@ use crate::http::error::CustomError;
 use crate::http::jwt::json_web_token::Identity;
 use crate::http::shared::AppState;
 use crate::streaming::session::Session;
+use axum::debug_handler;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{delete, get};
 use axum::{Extension, Json, Router};
-use error_set::ErrContext;
+use err_trail::ErrContext;
 use iggy_common::Consumer;
 use iggy_common::ConsumerOffsetInfo;
 use iggy_common::Identifier;
@@ -33,6 +34,7 @@ use iggy_common::Validatable;
 use iggy_common::delete_consumer_offset::DeleteConsumerOffset;
 use iggy_common::get_consumer_offset::GetConsumerOffset;
 use iggy_common::store_consumer_offset::StoreConsumerOffset;
+use send_wrapper::SendWrapper;
 use std::sync::Arc;
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -48,21 +50,24 @@ pub fn router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
+#[debug_handler]
 async fn get_consumer_offset(
     State(state): State<Arc<AppState>>,
     Extension(identity): Extension<Identity>,
     Path((stream_id, topic_id)): Path<(String, String)>,
-    mut query: Query<GetConsumerOffset>,
+    query: Query<GetConsumerOffset>,
 ) -> Result<Json<ConsumerOffsetInfo>, CustomError> {
+    let mut query = query;
     query.stream_id = Identifier::from_str_value(&stream_id)?;
     query.topic_id = Identifier::from_str_value(&topic_id)?;
     query.validate()?;
     let consumer = Consumer::new(query.0.consumer.id);
-    let system = state.system.read().await;
-    let Ok(offset) = system
+    let session = SendWrapper::new(Session::stateless(identity.user_id, identity.ip_address));
+    let Ok(offset) = state
+        .shard
         .get_consumer_offset(
-            &Session::stateless(identity.user_id, identity.ip_address),
-            &consumer,
+            &session,
+            consumer,
             &query.0.stream_id,
             &query.0.topic_id,
             query.0.partition_id,
@@ -79,6 +84,7 @@ async fn get_consumer_offset(
     Ok(Json(offset))
 }
 
+#[debug_handler]
 async fn store_consumer_offset(
     State(state): State<Arc<AppState>>,
     Extension(identity): Extension<Identity>,
@@ -88,11 +94,11 @@ async fn store_consumer_offset(
     command.stream_id = Identifier::from_str_value(&stream_id)?;
     command.topic_id = Identifier::from_str_value(&topic_id)?;
     command.validate()?;
+    let session = SendWrapper::new(Session::stateless(identity.user_id, identity.ip_address));
     let consumer = Consumer::new(command.0.consumer.id);
-    let system = state.system.read().await;
-    system
+    state.shard
         .store_consumer_offset(
-            &Session::stateless(identity.user_id, identity.ip_address),
+            &session,
             consumer,
             &command.0.stream_id,
             &command.0.topic_id,
@@ -100,10 +106,11 @@ async fn store_consumer_offset(
             command.0.offset,
         )
         .await
-        .with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to store consumer offset, stream ID: {}, topic ID: {}, partition ID: {:?}", stream_id, topic_id, command.0.partition_id))?;
+        .with_error(|error| format!("{COMPONENT} (error: {error}) - failed to store consumer offset, stream ID: {}, topic ID: {}, partition ID: {:?}", stream_id, topic_id, command.0.partition_id))?;
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[debug_handler]
 async fn delete_consumer_offset(
     State(state): State<Arc<AppState>>,
     Extension(identity): Extension<Identity>,
@@ -111,16 +118,17 @@ async fn delete_consumer_offset(
     query: Query<DeleteConsumerOffset>,
 ) -> Result<StatusCode, CustomError> {
     let consumer = Consumer::new(consumer_id.try_into()?);
-    let system = state.system.read().await;
-    system
+    let session = SendWrapper::new(Session::stateless(identity.user_id, identity.ip_address));
+    state
+        .shard
         .delete_consumer_offset(
-            &Session::stateless(identity.user_id, identity.ip_address),
+            &session,
             consumer,
             &query.stream_id,
             &query.topic_id,
             query.partition_id,
         )
         .await
-        .with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to delete consumer offset, stream ID: {}, topic ID: {}, partition ID: {:?}", stream_id, topic_id, query.partition_id))?;
+        .with_error(|error| format!("{COMPONENT} (error: {error}) - failed to delete consumer offset, stream ID: {}, topic ID: {}, partition ID: {:?}", stream_id, topic_id, query.partition_id))?;
     Ok(StatusCode::NO_CONTENT)
 }

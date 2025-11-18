@@ -16,9 +16,8 @@
  * under the License.
  */
 
-use crate::{AutoLogin, ConnectionStringOptions, Credentials, IggyError};
+use crate::{AutoLogin, ConnectionStringOptions, Credentials, IggyError, TransportProtocol};
 use std::str::FromStr;
-use strum::{Display, EnumString, IntoStaticStr};
 
 const DEFAULT_CONNECTION_STRING_PREFIX: &str = "iggy://";
 const CONNECTION_STRING_PREFIX: &str = "iggy+";
@@ -44,7 +43,11 @@ impl<T: ConnectionStringOptions + Default> ConnectionString<T> {
     }
 
     pub fn new(connection_string: &str) -> Result<Self, IggyError> {
-        let connection_string = connection_string.split("://").collect::<Vec<&str>>()[1];
+        let protocol_parts = connection_string.split("://").collect::<Vec<&str>>();
+        if protocol_parts.len() != 2 {
+            return Err(IggyError::InvalidConnectionString);
+        }
+        let connection_string = protocol_parts[1];
         let parts = connection_string.split('@').collect::<Vec<&str>>();
         let mut username = "";
         let mut password = "";
@@ -128,24 +131,6 @@ impl<T: ConnectionStringOptions + Default> FromStr for ConnectionString<T> {
 
 /// ConnectionStringUtils is a utility struct for connection strings.
 pub struct ConnectionStringUtils;
-
-#[derive(Clone, Copy, Debug, Default, Display, PartialEq, EnumString, IntoStaticStr)]
-#[strum(serialize_all = "snake_case")]
-pub enum TransportProtocol {
-    #[default]
-    #[strum(to_string = "tcp")]
-    Tcp,
-    #[strum(to_string = "quic")]
-    Quic,
-    #[strum(to_string = "http")]
-    Http,
-}
-
-impl TransportProtocol {
-    pub fn as_str(&self) -> &'static str {
-        self.into()
-    }
-}
 
 impl ConnectionStringUtils {
     pub fn parse_protocol(connection_string: &str) -> Result<TransportProtocol, IggyError> {

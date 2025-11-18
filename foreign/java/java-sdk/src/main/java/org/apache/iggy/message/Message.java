@@ -22,31 +22,24 @@ package org.apache.iggy.message;
 import java.math.BigInteger;
 import java.util.Map;
 import java.util.Optional;
-import java.util.zip.CRC32;
-import java.util.zip.Checksum;
 
-public record Message(
-        MessageHeader header,
-        byte[] payload,
-        Optional<Map<String, HeaderValue>> userHeaders
-) {
+public record Message(MessageHeader header, byte[] payload, Optional<Map<String, HeaderValue>> userHeaders) {
 
-  public static Message of(String payload) {
-    final byte[] payloadBytes = payload.getBytes();
-    final MessageHeader msgHeader = new MessageHeader(getChecksum(payloadBytes), MessageId.serverGenerated(),
-        BigInteger.ZERO, BigInteger.ZERO, BigInteger.ZERO, 0L,
-        (long)payloadBytes.length);
-    return new Message(msgHeader, payloadBytes, Optional.empty());
-  }
+    public static Message of(String payload) {
+        final byte[] payloadBytes = payload.getBytes();
+        final MessageHeader msgHeader = new MessageHeader(
+                BigInteger.ZERO,
+                MessageId.serverGenerated(),
+                BigInteger.ZERO,
+                BigInteger.ZERO,
+                BigInteger.ZERO,
+                0L,
+                (long) payloadBytes.length);
+        return new Message(msgHeader, payloadBytes, Optional.empty());
+    }
 
-  private static BigInteger getChecksum(byte[] payload) {
-    final Checksum crc32 = new CRC32();
-    crc32.update(payload, 0, payload.length);
-    return BigInteger.valueOf(crc32.getValue());
-  }
-
-  public int getSize() {
-    // userHeaders is empty for now.
-    return MessageHeader.SIZE + payload.length;
-  }
+    public int getSize() {
+        // userHeaders is empty for now.
+        return MessageHeader.SIZE + payload.length;
+    }
 }

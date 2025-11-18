@@ -25,6 +25,7 @@ import org.apache.iggy.user.Permissions;
 import org.apache.iggy.user.UserInfo;
 import org.apache.iggy.user.UserInfoDetails;
 import org.apache.iggy.user.UserStatus;
+
 import java.util.List;
 import java.util.Optional;
 
@@ -67,5 +68,4 @@ public interface UsersClient {
     IdentityInfo login(String username, String password);
 
     void logout();
-
 }

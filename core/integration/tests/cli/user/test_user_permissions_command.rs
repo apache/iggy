@@ -159,7 +159,7 @@ pub async fn should_be_successful() {
                 vec![String::from("3")],
                 Some(Permissions {
                     global: GlobalPermissions::default(),
-                    streams: Some(AHashMap::from([(3u32, StreamPermissions::default())])),
+                    streams: Some(AHashMap::from([(3usize, StreamPermissions::default())])),
                 }),
             ),
             TestUserId::Numeric,
@@ -174,7 +174,7 @@ pub async fn should_be_successful() {
                 Some(Permissions {
                     global: GlobalPermissions::default(),
                     streams: Some(AHashMap::from([(
-                        1u32,
+                        1usize,
                         StreamPermissions {
                             topics: Some(AHashMap::from([(
                                 2,
@@ -213,10 +213,10 @@ pub async fn should_be_successful() {
                         send_messages: false,
                     },
                     streams: Some(AHashMap::from([(
-                        2u32,
+                        2usize,
                         StreamPermissions {
                             topics: Some(AHashMap::from([(
-                                2u32,
+                                2usize,
                                 TopicPermissions {
                                     manage_topic: false,
                                     read_topic: false,
@@ -335,25 +335,19 @@ pub async fn should_short_help_match() {
 
     iggy_cmd_test
         .execute_test_for_help_command(TestHelpCmd::new(
-            vec!["user", "create", "-h"],
+            vec!["user", "permissions", "-h"],
             format!(
-                r#"Create user with given username and password
+                r#"Set permissions for user with given ID
 
-{USAGE_PREFIX} user create [OPTIONS] <USERNAME> <PASSWORD>
+{USAGE_PREFIX} user permissions [OPTIONS] <USER_ID>
 
 Arguments:
-  <USERNAME>  Username
-  <PASSWORD>  Password
+  <USER_ID>  User ID to update
 
 Options:
-  -u, --user-status <USER_STATUS>
-          User status [default: active] [possible values: active, inactive]
-  -g, --global-permissions <GLOBAL_PERMISSIONS>
-          Set global permissions for created user
-  -s, --stream-permissions <STREAM_PERMISSIONS>
-          Set stream permissions for created user
-  -h, --help
-          Print help (see more with '--help')
+  -g, --global-permissions <GLOBAL_PERMISSIONS>  Set global permissions for created user
+  -s, --stream-permissions <STREAM_PERMISSIONS>  Set stream permissions for created user
+  -h, --help                                     Print help (see more with '--help')
 "#,
             ),
         ))

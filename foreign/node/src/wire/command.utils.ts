@@ -28,13 +28,6 @@ export type Command<I, O> = {
   deserialize: (r: CommandResponse) => O
 }
 
-// export function wrapCommand<I, O>(cmd: Command<I, O>) {
-//   return (client: RawClient) =>
-//     async (arg: I) => cmd.deserialize(
-//       await client.sendCommand(cmd.code, cmd.serialize(arg))
-//     );
-// };
-
 
 export function wrapCommand<I, O>(cmd: Command<I, O>) {
   return (getClient: ClientProvider) =>

@@ -27,9 +27,11 @@ import org.apache.iggy.consumergroup.ConsumerGroupDetails;
 import org.apache.iggy.identifier.ConsumerId;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
+
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+
 import static org.apache.iggy.client.blocking.tcp.BytesDeserializer.readConsumerGroup;
 import static org.apache.iggy.client.blocking.tcp.BytesDeserializer.readConsumerGroupDetails;
 import static org.apache.iggy.client.blocking.tcp.BytesSerializer.nameToBytes;
@@ -68,14 +70,13 @@ class ConsumerGroupsTcpClient implements ConsumerGroupsClient {
     }
 
     @Override
-    public ConsumerGroupDetails createConsumerGroup(StreamId streamId, TopicId topicId, Optional<Long> groupId, String name) {
+    public ConsumerGroupDetails createConsumerGroup(StreamId streamId, TopicId topicId, String name) {
         var streamIdBytes = toBytes(streamId);
         var topicIdBytes = toBytes(topicId);
-        var payload = Unpooled.buffer(5 + streamIdBytes.readableBytes() + topicIdBytes.readableBytes() + name.length());
+        var payload = Unpooled.buffer(1 + streamIdBytes.readableBytes() + topicIdBytes.readableBytes() + name.length());
 
         payload.writeBytes(streamIdBytes);
         payload.writeBytes(topicIdBytes);
-        payload.writeIntLE(groupId.orElse(0L).intValue());
         payload.writeBytes(nameToBytes(name));
 
         ByteBuf response = tcpClient.send(CommandCode.ConsumerGroup.CREATE, payload);
@@ -107,5 +108,4 @@ class ConsumerGroupsTcpClient implements ConsumerGroupsClient {
 
         tcpClient.send(CommandCode.ConsumerGroup.LEAVE, payload);
     }
-
 }

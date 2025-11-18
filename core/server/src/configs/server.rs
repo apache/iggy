@@ -16,16 +16,17 @@
  * under the License.
  */
 
-use crate::archiver::ArchiverKindType;
 use crate::configs::COMPONENT;
+use crate::configs::cluster::ClusterConfig;
 use crate::configs::config_provider::ConfigProviderKind;
 use crate::configs::http::HttpConfig;
 use crate::configs::quic::QuicConfig;
 use crate::configs::system::SystemConfig;
 use crate::configs::tcp::TcpConfig;
+use crate::configs::websocket::WebSocketConfig;
 use crate::server_error::ConfigError;
 use derive_more::Display;
-use error_set::ErrContext;
+use err_trail::ErrContext;
 use iggy_common::IggyDuration;
 use iggy_common::Validatable;
 use serde::{Deserialize, Serialize};
@@ -44,56 +45,23 @@ pub struct ServerConfig {
     pub quic: QuicConfig,
     pub tcp: TcpConfig,
     pub http: HttpConfig,
+    pub websocket: WebSocketConfig,
     pub telemetry: TelemetryConfig,
+    pub cluster: ClusterConfig,
 }
 
 #[serde_as]
 #[derive(Debug, Default, Deserialize, Serialize, Clone)]
 pub struct DataMaintenanceConfig {
-    pub archiver: ArchiverConfig,
     pub messages: MessagesMaintenanceConfig,
-    pub state: StateMaintenanceConfig,
-}
-
-#[derive(Debug, Deserialize, Serialize, Clone)]
-pub struct ArchiverConfig {
-    pub enabled: bool,
-    pub kind: ArchiverKindType,
-    pub disk: Option<DiskArchiverConfig>,
-    pub s3: Option<S3ArchiverConfig>,
 }
 
 #[serde_as]
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct MessagesMaintenanceConfig {
-    pub archiver_enabled: bool,
     pub cleaner_enabled: bool,
     #[serde_as(as = "DisplayFromStr")]
     pub interval: IggyDuration,
-}
-
-#[serde_as]
-#[derive(Debug, Deserialize, Serialize, Clone)]
-pub struct StateMaintenanceConfig {
-    pub archiver_enabled: bool,
-    pub overwrite: bool,
-    #[serde_as(as = "DisplayFromStr")]
-    pub interval: IggyDuration,
-}
-
-#[derive(Debug, Deserialize, Serialize, Clone)]
-pub struct DiskArchiverConfig {
-    pub path: String,
-}
-
-#[derive(Debug, Deserialize, Serialize, Clone)]
-pub struct S3ArchiverConfig {
-    pub key_id: String,
-    pub key_secret: String,
-    pub bucket: String,
-    pub endpoint: Option<String>,
-    pub region: Option<String>,
-    pub tmp_upload_dir: String,
 }
 
 #[serde_as]
@@ -169,13 +137,10 @@ impl FromStr for TelemetryTransport {
 
 impl ServerConfig {
     pub async fn load(config_provider: &ConfigProviderKind) -> Result<ServerConfig, ConfigError> {
-        let server_config = config_provider
-            .load_config()
-            .await
-            .with_error_context(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to load config provider config")
-            })?;
-        server_config.validate().with_error_context(|error| {
+        let server_config = config_provider.load_config().await.with_error(|error| {
+            format!("{COMPONENT} (error: {error}) - failed to load config provider config")
+        })?;
+        server_config.validate().with_error(|error| {
             format!("{COMPONENT} (error: {error}) - failed to validate server config")
         })?;
         Ok(server_config)

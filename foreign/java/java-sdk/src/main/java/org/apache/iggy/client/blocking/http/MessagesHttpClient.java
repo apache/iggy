@@ -28,6 +28,7 @@ import org.apache.iggy.message.Message;
 import org.apache.iggy.message.Partitioning;
 import org.apache.iggy.message.PolledMessages;
 import org.apache.iggy.message.PollingStrategy;
+
 import java.util.List;
 import java.util.Optional;
 
@@ -40,10 +41,20 @@ class MessagesHttpClient implements MessagesClient {
     }
 
     @Override
-    public PolledMessages pollMessages(StreamId streamId, TopicId topicId, Optional<Long> partitionId, Consumer consumer, PollingStrategy strategy, Long count, boolean autoCommit) {
-        var request = httpClient.prepareGetRequest(path(streamId, topicId),
+    public PolledMessages pollMessages(
+            StreamId streamId,
+            TopicId topicId,
+            Optional<Long> partitionId,
+            Consumer consumer,
+            PollingStrategy strategy,
+            Long count,
+            boolean autoCommit) {
+        var request = httpClient.prepareGetRequest(
+                path(streamId, topicId),
                 new BasicNameValuePair("consumer_id", consumer.id().toString()),
-                partitionId.map(id -> new BasicNameValuePair("partition_id", id.toString())).orElse(null),
+                partitionId
+                        .map(id -> new BasicNameValuePair("partition_id", id.toString()))
+                        .orElse(null),
                 new BasicNameValuePair("strategy_kind", strategy.kind().name()),
                 new BasicNameValuePair("strategy_value", strategy.value().toString()),
                 new BasicNameValuePair("count", count.toString()),
@@ -61,6 +72,5 @@ class MessagesHttpClient implements MessagesClient {
         return "/streams/" + streamId + "/topics/" + topicId + "/messages";
     }
 
-    private record SendMessages(Partitioning partitioning, List<Message> messages) {
-    }
+    private record SendMessages(Partitioning partitioning, List<Message> messages) {}
 }

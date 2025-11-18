@@ -19,12 +19,12 @@ use crate::server::{
     ScenarioFn, bench_scenario, create_message_payload_scenario, message_headers_scenario,
     run_scenario, stream_size_validation_scenario, system_scenario, user_scenario,
 };
-use integration::test_server::Transport;
+use iggy_common::TransportProtocol;
 use serial_test::parallel;
 use test_case::test_matrix;
 
 #[test_matrix(
-    [Transport::Tcp, Transport::Quic, Transport::Http],
+    [quic(), tcp(), http(), websocket()],
     [
         system_scenario(),
         user_scenario(),
@@ -36,6 +36,22 @@ use test_case::test_matrix;
 )]
 #[tokio::test]
 #[parallel]
-async fn matrix(transport: Transport, scenario: ScenarioFn) {
+async fn matrix(transport: TransportProtocol, scenario: ScenarioFn) {
     run_scenario(transport, scenario).await;
+}
+
+fn quic() -> TransportProtocol {
+    TransportProtocol::Quic
+}
+
+fn tcp() -> TransportProtocol {
+    TransportProtocol::Tcp
+}
+
+fn http() -> TransportProtocol {
+    TransportProtocol::Http
+}
+
+fn websocket() -> TransportProtocol {
+    TransportProtocol::WebSocket
 }

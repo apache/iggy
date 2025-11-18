@@ -24,22 +24,22 @@ export const Keys = {
   TAB: 'Tab',
   BACKSPACE: 'Backspace',
   DELETE: 'Delete',
-  
+
   ARROW_UP: 'ArrowUp',
   ARROW_DOWN: 'ArrowDown',
   ARROW_LEFT: 'ArrowLeft',
   ARROW_RIGHT: 'ArrowRight',
-  
+
   PAGE_UP: 'PageUp',
   PAGE_DOWN: 'PageDown',
   HOME: 'Home',
   END: 'End',
-  
+
   SHIFT: 'Shift',
   CONTROL: 'Control',
   ALT: 'Alt',
   META: 'Meta',
-  
+
   F1: 'F1',
   F2: 'F2',
   F3: 'F3',
@@ -51,5 +51,5 @@ export const Keys = {
   F9: 'F9',
   F10: 'F10',
   F11: 'F11',
-  F12: 'F12',
+  F12: 'F12'
 } as const;

@@ -542,7 +542,10 @@ fn configure(config: &QuicClientConfig) -> Result<ClientConfig, IggyError> {
         );
     }
     let mut client_config = match config.validate_certificate {
-        true => ClientConfig::with_platform_verifier(),
+        true => ClientConfig::try_with_platform_verifier().map_err(|error| {
+            error!("Failed to create QUIC client configuration: {error}");
+            IggyError::InvalidConfiguration
+        })?,
         false => {
             match QuinnQuicClientConfig::try_from(
                 rustls::ClientConfig::builder()

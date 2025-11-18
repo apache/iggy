@@ -17,55 +17,74 @@
 
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
+using Apache.Iggy.Tests.Integrations.Attributes;
 using Apache.Iggy.Tests.Integrations.Fixtures;
+using Apache.Iggy.Tests.Integrations.Helpers;
 using Shouldly;
 
 namespace Apache.Iggy.Tests.Integrations;
 
-[MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
-public class PartitionsTests(Protocol protocol)
+public class PartitionsTests
 {
     [ClassDataSource<PartitionsFixture>(Shared = SharedType.PerClass)]
     public required PartitionsFixture Fixture { get; init; }
 
     [Test]
-    public async Task CreatePartition_HappyPath_Should_CreatePartition_Successfully()
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task CreatePartition_HappyPath_Should_CreatePartition_Successfully(Protocol protocol)
     {
-        await Should.NotThrowAsync(() => Fixture.Clients[protocol].CreatePartitionsAsync(Identifier.Numeric(Fixture.StreamId),
-            Identifier.Numeric(Fixture.TopicRequest.TopicId!.Value), 3));
+        await Should.NotThrowAsync(() =>
+            Fixture.Clients[protocol]
+                .CreatePartitionsAsync(Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
+                    Identifier.String(Fixture.TopicRequest.Name), 3));
 
-        var response = await Fixture.Clients[protocol].GetTopicByIdAsync(Identifier.Numeric(1), Identifier.Numeric(1));
+        var response = await Fixture.Clients[protocol].GetTopicByIdAsync(
+            Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
+            Identifier.String(Fixture.TopicRequest.Name));
         response.ShouldNotBeNull();
         response.PartitionsCount.ShouldBe(4u);
     }
 
     [Test]
     [DependsOn(nameof(CreatePartition_HappyPath_Should_CreatePartition_Successfully))]
-    public async Task DeletePartition_Should_DeletePartition_Successfully()
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task DeletePartition_Should_DeletePartition_Successfully(Protocol protocol)
     {
-        await Should.NotThrowAsync(() => Fixture.Clients[protocol].DeletePartitionsAsync(Identifier.Numeric(Fixture.StreamId),
-            Identifier.Numeric(Fixture.TopicRequest.TopicId!.Value), 1));
+        await Should.NotThrowAsync(() =>
+            Fixture.Clients[protocol].DeletePartitionsAsync(
+                Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
+                Identifier.String(Fixture.TopicRequest.Name), 1));
 
-        var response = await Fixture.Clients[protocol].GetTopicByIdAsync(Identifier.Numeric(1), Identifier.Numeric(1));
+        var response = await Fixture.Clients[protocol].GetTopicByIdAsync(
+            Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
+            Identifier.String(Fixture.TopicRequest.Name));
         response.ShouldNotBeNull();
         response.PartitionsCount.ShouldBe(3u);
     }
 
     [Test]
     [DependsOn(nameof(DeletePartition_Should_DeletePartition_Successfully))]
-    public async Task DeletePartition_Should_Throw_WhenTopic_DoesNotExist()
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task DeletePartition_Should_Throw_WhenTopic_DoesNotExist(Protocol protocol)
     {
-        await Fixture.Clients[protocol].DeleteTopicAsync(Identifier.Numeric(1), Identifier.Numeric(1));
-        await Should.ThrowAsync<InvalidResponseException>(() => Fixture.Clients[protocol].DeletePartitionsAsync(Identifier.Numeric(Fixture.StreamId),
-            Identifier.Numeric(Fixture.TopicRequest.TopicId!.Value), 1));
+        await Fixture.Clients[protocol].DeleteTopicAsync(Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
+            Identifier.String(Fixture.TopicRequest.Name));
+        await Should.ThrowAsync<IggyInvalidStatusCodeException>(() =>
+            Fixture.Clients[protocol].DeletePartitionsAsync(
+                Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
+                Identifier.String(Fixture.TopicRequest.Name), 1));
     }
 
     [Test]
     [DependsOn(nameof(DeletePartition_Should_Throw_WhenTopic_DoesNotExist))]
-    public async Task DeletePartition_Should_Throw_WhenStream_DoesNotExist()
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task DeletePartition_Should_Throw_WhenStream_DoesNotExist(Protocol protocol)
     {
-        await Fixture.Clients[protocol].DeleteStreamAsync(Identifier.Numeric(1));
-        await Should.ThrowAsync<InvalidResponseException>(() => Fixture.Clients[protocol].DeletePartitionsAsync(Identifier.Numeric(Fixture.StreamId),
-            Identifier.Numeric(Fixture.TopicRequest.TopicId!.Value), 1));
+        await Fixture.Clients[protocol]
+            .DeleteStreamAsync(Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)));
+        await Should.ThrowAsync<IggyInvalidStatusCodeException>(() =>
+            Fixture.Clients[protocol].DeletePartitionsAsync(
+                Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
+                Identifier.String(Fixture.TopicRequest.Name), 1));
     }
 }

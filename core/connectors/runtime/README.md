@@ -10,34 +10,47 @@ Internally, [dlopen2](https://github.com/OpenByteDev/dlopen2) provides a safe an
 
 By default, runtime will look for the configuration file, to decide which connectors to load and how to configure them.
 
-The minimal viable configuration requires at least the Iggy credentials, to create 2 separate instances of producer & consumer connections and the state directory path where source connectors can store their optional state.
+To start the connector runtime, simply run `cargo run --bin iggy-connectors`.
+
+The [docker image](https://hub.docker.com/r/apache/iggy-connect) is available, and can be fetched via `docker pull apache/iggy-connect`.
+
+The minimal viable configuration requires at least the Iggy credentials to create 2 separate instances of producer & consumer connections, the state directory path where source connectors can store their optional state, and the `connectors.config_dir` setting that specifies the directory containing individual connector configuration files.
 
 ```toml
 [iggy]
 address = "localhost:8090"
 username = "iggy"
 password = "iggy"
-# token = "secret" # Personal Access Token (PAT) can be used instead of username and password
+token = "" # Personal Access Token (PAT) can be used instead of username and password
+
+[iggy.tls] # Optional TLS configuration for Iggy TCP connection
+enabled = false
+ca_file = "core/certs/iggy_ca_cert.pem"
+domain = "" # Optional domain for TLS connection
 
 [state]
 path = "local_state"
+
+[connectors]
+config_type = "local"
+config_dir = "path/to/connectors"
 ```
 
-All the other config sections start either with `sources` or `sinks` depending on the connector type.
+Each connector (source or sink) is configured in its own separate file within the directory specified by `connectors.config_dir`. If `config_dir` is empty or the directory doesn't exist, no connectors will be loaded.
 
-Keep in mind that either of `toml`, `yaml`, or `json` formats are supported for the configuration file. The path to the configuration can be overriden by `IGGY_CONNECTORS_CONFIG_PATH` environment variable. Each configuration section can be also additionally updated by using the following convention `IGGY_CONNECTORS_SECTION_NAME.KEY_NAME` e.g. `IGGY_CONNECTORS_IGGY_USERNAME` and so on.
+The path to the configuration can be overridden by `IGGY_CONNECTORS_CONFIG_PATH` environment variable. Each configuration section can be also additionally updated by using the following convention `IGGY_CONNECTORS_SECTION_NAME.KEY_NAME` e.g. `IGGY_CONNECTORS_IGGY_USERNAME` and so on.
 
 ## HTTP API
 
-Connector runtime has an optional HTTP API that can be enabled by setting the `enabled` flag to `true` in the `[http_api]` section.
+Connector runtime has an optional HTTP API that can be enabled by setting the `enabled` flag to `true` in the `[http]` section.
 
 ```toml
-[http_api] # Optional HTTP API configuration
+[http] # Optional HTTP API configuration
 enabled = true
 address = "127.0.0.1:8081"
-# api_key = "secret" # Optional API key for authentication to be passed as `api-key` header
+api_key = "" # Optional API key for authentication to be passed as `api-key` header
 
-[http_api.cors] # Optional CORS configuration for HTTP API
+[http.cors] # Optional CORS configuration for HTTP API
 enabled = false
 allowed_methods = ["GET", "POST", "PUT", "DELETE"]
 allowed_origins = ["*"]
@@ -46,7 +59,7 @@ exposed_headers = [""]
 allow_credentials = false
 allow_private_network = false
 
-[http_api.tls] # Optional TLS configuration for HTTP API
+[http.tls] # Optional TLS configuration for HTTP API
 enabled = false
 cert_file = "core/certs/iggy_cert.pem"
 key_file = "core/certs/iggy_key.pem"

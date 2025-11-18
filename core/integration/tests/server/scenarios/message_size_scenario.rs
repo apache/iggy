@@ -22,8 +22,6 @@ use integration::test_server::{ClientFactory, assert_clean_system, login_root};
 use std::collections::HashMap;
 use std::str::FromStr;
 
-const STREAM_ID: u32 = 1;
-const TOPIC_ID: u32 = 1;
 const STREAM_NAME: &str = "test-stream";
 const TOPIC_NAME: &str = "test-topic";
 const PARTITIONS_COUNT: u32 = 3;
@@ -79,7 +77,7 @@ pub async fn run(client_factory: &dyn ClientFactory) {
     .await;
     send_message_and_check_result(
         &client,
-        MessageToSend::OfSizeWithHeaders(100_000, 10_000_001),
+        MessageToSend::OfSizeWithHeaders(100_000, 64_000_001),
         Err(IggyError::TooBigMessagePayload),
     )
     .await;
@@ -93,8 +91,8 @@ async fn assert_message_count(client: &IggyClient, expected_count: u32) {
     // 4. Poll messages and validate the count
     let polled_messages = client
         .poll_messages(
-            &STREAM_ID.try_into().unwrap(),
-            &TOPIC_ID.try_into().unwrap(),
+            &STREAM_NAME.try_into().unwrap(),
+            &TOPIC_NAME.try_into().unwrap(),
             Some(PARTITION_ID),
             &Consumer::default(),
             &PollingStrategy::offset(0),
@@ -109,19 +107,15 @@ async fn assert_message_count(client: &IggyClient, expected_count: u32) {
 
 async fn init_system(client: &IggyClient) {
     // 1. Create the stream
-    client
-        .create_stream(STREAM_NAME, Some(STREAM_ID))
-        .await
-        .unwrap();
+    client.create_stream(STREAM_NAME).await.unwrap();
 
     // 2. Create the topic
     client
         .create_topic(
-            &STREAM_ID.try_into().unwrap(),
+            &STREAM_NAME.try_into().unwrap(),
             TOPIC_NAME,
             PARTITIONS_COUNT,
             Default::default(),
-            None,
             None,
             IggyExpiry::NeverExpire,
             MaxTopicSize::ServerDefault,
@@ -132,7 +126,7 @@ async fn init_system(client: &IggyClient) {
 
 async fn cleanup_system(client: &IggyClient) {
     client
-        .delete_stream(&STREAM_ID.try_into().unwrap())
+        .delete_stream(&STREAM_NAME.try_into().unwrap())
         .await
         .unwrap();
 }
@@ -183,8 +177,8 @@ async fn send_message_and_check_result(
 
     let send_result = client
         .send_messages(
-            &STREAM_ID.try_into().unwrap(),
-            &TOPIC_ID.try_into().unwrap(),
+            &STREAM_NAME.try_into().unwrap(),
+            &TOPIC_NAME.try_into().unwrap(),
             &Partitioning::partition_id(PARTITION_ID),
             &mut messages,
         )

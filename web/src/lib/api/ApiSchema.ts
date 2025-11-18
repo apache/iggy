@@ -88,7 +88,6 @@ type Streams =
       method: 'POST';
       path: '/streams';
       body: {
-        stream_id: number;
         name: string;
       };
     }
@@ -121,13 +120,12 @@ type Topics =
       method: 'POST';
       path: `/streams/${number}/topics`;
       body: {
-        compression_algorithm: "none" | "gzip";
+        compression_algorithm: 'none' | 'gzip';
         max_topic_size: number;
         message_expiry: number;
         name: string;
         partitions_count: number;
         stream_id: number;
-        topic_id: number;
       };
     }
   | {

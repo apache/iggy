@@ -1,289 +1,243 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
- */
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-use ahash::AHashMap;
-use iggy_common::IggyError;
-use tokio::sync::RwLock;
-use tracing::trace;
+use crate::slab::{
+    Keyed, consumer_groups, partitions,
+    traits_ext::{EntityMarker, IntoComponents, IntoComponentsById},
+};
+use arcshift::ArcShift;
+use slab::Slab;
+use std::sync::atomic::AtomicUsize;
 
-#[derive(Debug)]
-pub struct ConsumerGroup {
-    pub topic_id: u32,
-    pub group_id: u32,
-    pub name: String,
-    pub partitions_count: u32,
-    members: AHashMap<u32, RwLock<ConsumerGroupMember>>,
+pub const MEMBERS_CAPACITY: usize = 128;
+
+#[derive(Debug, Clone)]
+pub struct ConsumerGroupMembers {
+    inner: ArcShift<Slab<Member>>,
 }
 
-#[derive(Debug)]
-pub struct ConsumerGroupMember {
-    pub id: u32,
-    partitions: AHashMap<u32, u32>,
-    current_partition_index: Option<u32>,
-    current_partition_id: Option<u32>,
+impl ConsumerGroupMembers {
+    pub fn new(inner: ArcShift<Slab<Member>>) -> Self {
+        Self { inner }
+    }
+
+    pub fn into_inner(self) -> ArcShift<Slab<Member>> {
+        self.inner
+    }
+
+    pub fn inner(&self) -> &ArcShift<Slab<Member>> {
+        &self.inner
+    }
+
+    pub fn inner_mut(&mut self) -> &mut ArcShift<Slab<Member>> {
+        &mut self.inner
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ConsumerGroup {
+    root: ConsumerGroupRoot,
+    members: ConsumerGroupMembers,
+}
+
+#[derive(Default, Debug, Clone)]
+pub struct ConsumerGroupRoot {
+    id: usize,
+    name: String,
+    partitions: Vec<partitions::ContainerId>,
+}
+
+impl ConsumerGroupRoot {
+    pub fn disarray(self) -> (String, Vec<usize>) {
+        (self.name, self.partitions)
+    }
+
+    pub fn partitions(&self) -> &Vec<partitions::ContainerId> {
+        &self.partitions
+    }
+
+    pub fn update_id(&mut self, id: usize) {
+        self.id = id;
+    }
+
+    pub fn assign_partitions(&mut self, partitions: Vec<usize>) {
+        self.partitions = partitions;
+    }
+
+    pub fn id(&self) -> consumer_groups::ContainerId {
+        self.id
+    }
+}
+
+impl Keyed for ConsumerGroupRoot {
+    type Key = String;
+
+    fn key(&self) -> &Self::Key {
+        &self.name
+    }
+}
+
+impl EntityMarker for ConsumerGroup {
+    type Idx = consumer_groups::ContainerId;
+
+    fn id(&self) -> Self::Idx {
+        self.root.id
+    }
+
+    fn update_id(&mut self, id: Self::Idx) {
+        self.root.id = id;
+    }
+}
+
+impl IntoComponents for ConsumerGroup {
+    type Components = (ConsumerGroupRoot, ConsumerGroupMembers);
+
+    fn into_components(self) -> Self::Components {
+        (self.root, self.members)
+    }
+}
+
+pub struct ConsumerGroupRef<'a> {
+    root: &'a Slab<ConsumerGroupRoot>,
+    members: &'a Slab<ConsumerGroupMembers>,
+}
+
+impl<'a> ConsumerGroupRef<'a> {
+    pub fn new(root: &'a Slab<ConsumerGroupRoot>, members: &'a Slab<ConsumerGroupMembers>) -> Self {
+        Self { root, members }
+    }
+}
+
+impl<'a> IntoComponents for ConsumerGroupRef<'a> {
+    type Components = (&'a Slab<ConsumerGroupRoot>, &'a Slab<ConsumerGroupMembers>);
+
+    fn into_components(self) -> Self::Components {
+        (self.root, self.members)
+    }
+}
+
+impl<'a> IntoComponentsById for ConsumerGroupRef<'a> {
+    type Idx = consumer_groups::ContainerId;
+    type Output = (&'a ConsumerGroupRoot, &'a ConsumerGroupMembers);
+
+    fn into_components_by_id(self, index: Self::Idx) -> Self::Output {
+        let root = &self.root[index];
+        let members = &self.members[index];
+        (root, members)
+    }
+}
+
+pub struct ConsumerGroupRefMut<'a> {
+    root: &'a mut Slab<ConsumerGroupRoot>,
+    members: &'a mut Slab<ConsumerGroupMembers>,
+}
+
+impl<'a> ConsumerGroupRefMut<'a> {
+    pub fn new(
+        root: &'a mut Slab<ConsumerGroupRoot>,
+        members: &'a mut Slab<ConsumerGroupMembers>,
+    ) -> Self {
+        Self { root, members }
+    }
+}
+
+impl<'a> IntoComponents for ConsumerGroupRefMut<'a> {
+    type Components = (
+        &'a mut Slab<ConsumerGroupRoot>,
+        &'a mut Slab<ConsumerGroupMembers>,
+    );
+
+    fn into_components(self) -> Self::Components {
+        (self.root, self.members)
+    }
+}
+
+impl<'a> IntoComponentsById for ConsumerGroupRefMut<'a> {
+    type Idx = consumer_groups::ContainerId;
+    type Output = (&'a mut ConsumerGroupRoot, &'a mut ConsumerGroupMembers);
+
+    fn into_components_by_id(self, index: Self::Idx) -> Self::Output {
+        let root = &mut self.root[index];
+        let members = &mut self.members[index];
+        (root, members)
+    }
 }
 
 impl ConsumerGroup {
-    pub fn new(topic_id: u32, group_id: u32, name: &str, partitions_count: u32) -> ConsumerGroup {
-        ConsumerGroup {
-            topic_id,
-            group_id,
-            name: name.to_string(),
-            partitions_count,
-            members: AHashMap::new(),
-        }
+    pub fn new(
+        name: String,
+        members: ArcShift<Slab<Member>>,
+        partitions: Vec<partitions::ContainerId>,
+    ) -> Self {
+        let root = ConsumerGroupRoot {
+            id: 0,
+            name,
+            partitions,
+        };
+        let members = ConsumerGroupMembers { inner: members };
+        Self { root, members }
     }
 
-    pub fn get_members(&self) -> Vec<&RwLock<ConsumerGroupMember>> {
-        self.members.values().collect()
+    pub fn new_with_components(root: ConsumerGroupRoot, members: ConsumerGroupMembers) -> Self {
+        Self { root, members }
     }
 
-    pub async fn reassign_partitions(&mut self, partitions_count: u32) {
-        self.partitions_count = partitions_count;
-        self.assign_partitions().await;
+    pub fn partitions(&self) -> &Vec<partitions::ContainerId> {
+        &self.root.partitions
     }
 
-    pub async fn calculate_partition_id(&self, member_id: u32) -> Result<Option<u32>, IggyError> {
-        let member = self.members.get(&member_id);
-        if let Some(member) = member {
-            return Ok(member.write().await.calculate_partition_id());
-        }
-        Err(IggyError::ConsumerGroupMemberNotFound(
-            member_id,
-            self.group_id,
-            self.topic_id,
-        ))
+    pub fn members(&self) -> &ConsumerGroupMembers {
+        &self.members
     }
+}
 
-    pub async fn get_current_partition_id(&self, member_id: u32) -> Result<Option<u32>, IggyError> {
-        let member = self.members.get(&member_id);
-        if let Some(member) = member {
-            return Ok(member.read().await.current_partition_id);
-        }
-        Err(IggyError::ConsumerGroupMemberNotFound(
-            member_id,
-            self.group_id,
-            self.topic_id,
-        ))
-    }
+#[derive(Debug)]
+pub struct Member {
+    pub id: usize,
+    pub client_id: u32,
+    pub partitions: Vec<partitions::ContainerId>,
+    pub current_partition_idx: AtomicUsize,
+}
 
-    pub async fn add_member(&mut self, member_id: u32) {
-        self.members.insert(
-            member_id,
-            RwLock::new(ConsumerGroupMember {
-                id: member_id,
-                partitions: AHashMap::new(),
-                current_partition_index: None,
-                current_partition_id: None,
-            }),
-        );
-        trace!(
-            "Added member with ID: {} to consumer group: {} for topic with ID: {}",
-            member_id, self.group_id, self.topic_id
-        );
-        self.assign_partitions().await;
-    }
-
-    pub async fn delete_member(&mut self, member_id: u32) {
-        if self.members.remove(&member_id).is_some() {
-            trace!(
-                "Deleted member with ID: {} in consumer group: {} for topic with ID: {}",
-                member_id, self.group_id, self.topic_id
-            );
-            self.assign_partitions().await;
-        }
-    }
-
-    async fn assign_partitions(&mut self) {
-        let mut members = self.members.values_mut().collect::<Vec<_>>();
-        if members.is_empty() {
-            return;
-        }
-
-        let members_count = members.len() as u32;
-        for member in members.iter_mut() {
-            let mut member = member.write().await;
-            member.current_partition_index = None;
-            member.current_partition_id = None;
-            member.partitions.clear();
-        }
-
-        for partition_index in 0..self.partitions_count {
-            let partition_id = partition_index + 1;
-            let member_index = partition_index % members_count;
-            let member = members.get(member_index as usize).unwrap();
-            let mut member = member.write().await;
-            let member_partition_index = member.partitions.len() as u32;
-            member
-                .partitions
-                .insert(member_partition_index, partition_id);
-            if member.current_partition_id.is_none() {
-                member.current_partition_id = Some(partition_id);
-                member.current_partition_index = Some(member_partition_index);
-            }
-            trace!(
-                "Assigned partition ID: {} to member with ID: {} for topic with ID: {} in consumer group: {}",
-                partition_id, member.id, self.topic_id, self.group_id
-            )
+impl Clone for Member {
+    fn clone(&self) -> Self {
+        Self {
+            id: self.id,
+            client_id: self.client_id,
+            partitions: self.partitions.clone(),
+            current_partition_idx: AtomicUsize::new(0),
         }
     }
 }
 
-impl ConsumerGroupMember {
-    pub fn get_partitions(&self) -> Vec<u32> {
-        self.partitions.values().copied().collect()
-    }
-
-    pub fn calculate_partition_id(&mut self) -> Option<u32> {
-        let partition_index = self.current_partition_index?;
-        let Some(partition_id) = self.partitions.get(&partition_index) else {
-            trace!(
-                "No partition ID found for index: {} for member with ID: {}.",
-                partition_index, self.id
-            );
-            return None;
-        };
-
-        let partition_id = *partition_id;
-        self.current_partition_id = Some(partition_id);
-        if self.partitions.len() <= (partition_index + 1) as usize {
-            self.current_partition_index = Some(0);
-        } else {
-            self.current_partition_index = Some(partition_index + 1);
-        }
-        trace!(
-            "Calculated partition ID: {} for member with ID: {}",
-            partition_id, self.id
-        );
-        Some(partition_id)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn should_calculate_partition_id_using_round_robin() {
-        let member_id = 123;
-        let mut consumer_group = ConsumerGroup {
-            topic_id: 1,
-            group_id: 1,
-            name: "test".to_string(),
-            partitions_count: 3,
-            members: AHashMap::new(),
-        };
-
-        consumer_group.add_member(member_id).await;
-        for i in 0..1000 {
-            let partition_id = consumer_group
-                .calculate_partition_id(member_id)
-                .await
-                .unwrap()
-                .expect("Partition ID not found");
-            assert_eq!(partition_id, (i % consumer_group.partitions_count) + 1);
+impl Member {
+    pub fn new(client_id: u32) -> Self {
+        Member {
+            id: 0,
+            client_id,
+            partitions: Vec::new(),
+            current_partition_idx: AtomicUsize::new(0),
         }
     }
 
-    #[tokio::test]
-    async fn should_assign_all_partitions_to_the_only_single_member() {
-        let member_id = 123;
-        let mut consumer_group = ConsumerGroup {
-            topic_id: 1,
-            group_id: 1,
-            name: "test".to_string(),
-            partitions_count: 3,
-            members: AHashMap::new(),
-        };
-
-        consumer_group.add_member(member_id).await;
-        let member = consumer_group.members.get(&member_id).unwrap();
-        let member = member.read().await;
-        assert_eq!(
-            member.partitions.len() as u32,
-            consumer_group.partitions_count
-        );
-        let member_partitions = member.partitions.values().collect::<Vec<_>>();
-        for partition_id in 1..=consumer_group.partitions_count {
-            assert!(member_partitions.contains(&&partition_id));
-        }
-    }
-
-    #[tokio::test]
-    async fn should_assign_partitions_to_the_multiple_members() {
-        let member1_id = 123;
-        let member2_id = 456;
-        let mut consumer_group = ConsumerGroup {
-            topic_id: 1,
-            group_id: 1,
-            name: "test".to_string(),
-            partitions_count: 3,
-            members: AHashMap::new(),
-        };
-
-        consumer_group.add_member(member1_id).await;
-        consumer_group.add_member(member2_id).await;
-        let member1 = consumer_group.members.get(&member1_id).unwrap();
-        let member2 = consumer_group.members.get(&member2_id).unwrap();
-        let member1 = member1.read().await;
-        let member2 = member2.read().await;
-        assert_eq!(
-            member1.partitions.len() + member2.partitions.len(),
-            consumer_group.partitions_count as usize
-        );
-        let member1_partitions = member1.partitions.values().collect::<Vec<_>>();
-        let member2_partitions = member2.partitions.values().collect::<Vec<_>>();
-        let members_partitions = member1_partitions
-            .into_iter()
-            .chain(member2_partitions.into_iter())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            members_partitions.len(),
-            consumer_group.partitions_count as usize
-        );
-        for partition_id in 1..=consumer_group.partitions_count {
-            assert!(members_partitions.contains(&&partition_id));
-        }
-    }
-
-    #[tokio::test]
-    async fn should_assign_only_single_partition_to_the_only_single_member() {
-        let member1_id = 123;
-        let member2_id = 456;
-        let mut consumer_group = ConsumerGroup {
-            topic_id: 1,
-            group_id: 1,
-            name: "test".to_string(),
-            partitions_count: 1,
-            members: AHashMap::new(),
-        };
-
-        consumer_group.add_member(member1_id).await;
-        consumer_group.add_member(member2_id).await;
-        let member1 = consumer_group.members.get(&member1_id).unwrap();
-        let member2 = consumer_group.members.get(&member2_id).unwrap();
-        let member1 = member1.read().await;
-        let member2 = member2.read().await;
-        if member1.partitions.len() == 1 {
-            assert_eq!(member2.partitions.len(), 0);
-        } else {
-            assert_eq!(member1.partitions.len(), 0);
-            assert_eq!(member2.partitions.len(), 1);
-        }
+    pub fn insert_into(self, container: &mut Slab<Self>) -> usize {
+        let idx = container.insert(self);
+        let member = &mut container[idx];
+        member.id = idx;
+        idx
     }
 }

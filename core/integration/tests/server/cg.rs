@@ -16,23 +16,27 @@
 // under the License.
 
 use crate::server::{
-    ScenarioFn, join_scenario, multiple_clients_scenario, run_scenario, single_client_scenario,
+    ScenarioFn, auto_commit_reconnection_scenario, join_scenario, multiple_clients_scenario,
+    offset_cleanup_scenario, run_scenario, single_client_scenario,
 };
-use integration::test_server::Transport;
+use iggy_common::TransportProtocol;
 use serial_test::parallel;
 use test_case::test_matrix;
 
+// TODO: Add `QUIC`.
 // Consumer group scenarios do not support HTTP
 #[test_matrix(
-    [Transport::Tcp, Transport::Quic],
+    [TransportProtocol::Tcp, TransportProtocol::WebSocket],
     [
         join_scenario(),
         single_client_scenario(),
         multiple_clients_scenario(),
+        auto_commit_reconnection_scenario(),
+        offset_cleanup_scenario(),
     ]
 )]
 #[tokio::test]
 #[parallel]
-async fn matrix(transport: Transport, scenario: ScenarioFn) {
+async fn matrix(transport: TransportProtocol, scenario: ScenarioFn) {
     run_scenario(transport, scenario).await;
 }

@@ -22,11 +22,26 @@ using Apache.Iggy.Extensions;
 
 namespace Apache.Iggy.Headers;
 
+/// <summary>
+///     A header value.
+/// </summary>
 public readonly struct HeaderValue
 {
+    /// <summary>
+    ///     Header kind.
+    /// </summary>
     public required HeaderKind Kind { get; init; }
+
+    /// <summary>
+    ///     Header value.
+    /// </summary>
     public required byte[] Value { get; init; }
 
+    /// <summary>
+    ///     Creates a header value from raw bytes.
+    /// </summary>
+    /// <param name="value">Raw bytes</param>
+    /// <returns></returns>
     public static HeaderValue FromBytes(byte[] value)
     {
         return new HeaderValue
@@ -36,6 +51,12 @@ public readonly struct HeaderValue
         };
     }
 
+    /// <summary>
+    ///     Creates a header value from a string.
+    /// </summary>
+    /// <param name="value">Header value</param>
+    /// <returns></returns>
+    /// <exception cref="ArgumentException"></exception>
     public static HeaderValue FromString(string value)
     {
         if (value.Length is 0 or > 255)
@@ -50,6 +71,11 @@ public readonly struct HeaderValue
         };
     }
 
+    /// <summary>
+    ///     Creates a header value from a boolean.
+    /// </summary>
+    /// <param name="value">Header value</param>
+    /// <returns></returns>
     public static HeaderValue FromBool(bool value)
     {
         return new HeaderValue
@@ -59,6 +85,11 @@ public readonly struct HeaderValue
         };
     }
 
+    /// <summary>
+    ///     Creates a header value from an integer.
+    /// </summary>
+    /// <param name="value">Header value</param>
+    /// <returns></returns>
     public static HeaderValue FromInt32(int value)
     {
         var bytes = new byte[4];
@@ -70,6 +101,11 @@ public readonly struct HeaderValue
         };
     }
 
+    /// <summary>
+    ///     Creates a header value from a long.
+    /// </summary>
+    /// <param name="value">Header value</param>
+    /// <returns></returns>
     public static HeaderValue FromInt64(long value)
     {
         var bytes = new byte[8];
@@ -81,6 +117,11 @@ public readonly struct HeaderValue
         };
     }
 
+    /// <summary>
+    ///     Creates a header value from an Int128.
+    /// </summary>
+    /// <param name="value">Header value</param>
+    /// <returns></returns>
     public static HeaderValue FromInt128(Int128 value)
     {
         return new HeaderValue
@@ -90,6 +131,11 @@ public readonly struct HeaderValue
         };
     }
 
+    /// <summary>
+    ///     Creates a header value from a Guid.
+    /// </summary>
+    /// <param name="value">Header value</param>
+    /// <returns></returns>
     public static HeaderValue FromGuid(Guid value)
     {
         return new HeaderValue
@@ -99,6 +145,11 @@ public readonly struct HeaderValue
         };
     }
 
+    /// <summary>
+    ///     Creates a header value from a uint.
+    /// </summary>
+    /// <param name="value">Header value</param>
+    /// <returns></returns>
     public static HeaderValue FromUInt32(uint value)
     {
         var bytes = new byte[4];
@@ -110,6 +161,11 @@ public readonly struct HeaderValue
         };
     }
 
+    /// <summary>
+    ///     Creates a header value from a ulong.
+    /// </summary>
+    /// <param name="value">Header value</param>
+    /// <returns></returns>
     public static HeaderValue FromUInt64(ulong value)
     {
         var bytes = new byte[8];
@@ -121,6 +177,11 @@ public readonly struct HeaderValue
         };
     }
 
+    /// <summary>
+    ///     Creates a header value from a UInt128.
+    /// </summary>
+    /// <param name="value">Header value</param>
+    /// <returns></returns>
     public static HeaderValue FromUInt128(UInt128 value)
     {
         return new HeaderValue
@@ -130,6 +191,11 @@ public readonly struct HeaderValue
         };
     }
 
+    /// <summary>
+    ///     Creates a header value from a float.
+    /// </summary>
+    /// <param name="value">Header value</param>
+    /// <returns></returns>
     public static HeaderValue FromFloat(float value)
     {
         var bytes = new byte[4];
@@ -141,6 +207,11 @@ public readonly struct HeaderValue
         };
     }
 
+    /// <summary>
+    ///     Creates a header value from a double.
+    /// </summary>
+    /// <param name="value">Header value</param>
+    /// <returns></returns>
     public static HeaderValue FromDouble(double value)
     {
         var bytes = new byte[8];
@@ -152,6 +223,11 @@ public readonly struct HeaderValue
         };
     }
 
+    /// <summary>
+    ///     Converts the header value to raw bytes.
+    /// </summary>
+    /// <returns>Header values as bytes</returns>
+    /// <exception cref="InvalidOperationException"></exception>
     public byte[] ToBytes()
     {
         if (Kind is not HeaderKind.Raw)
@@ -162,6 +238,11 @@ public readonly struct HeaderValue
         return Value;
     }
 
+    /// <summary>
+    ///     Converts the header value to a string.
+    /// </summary>
+    /// <returns>String representation of header value</returns>
+    /// <exception cref="InvalidOperationException"></exception>
     public new string ToString()
     {
         return Kind switch
@@ -181,6 +262,11 @@ public readonly struct HeaderValue
         } ?? throw new InvalidOperationException();
     }
 
+    /// <summary>
+    ///     Converts the header value to a boolean.
+    /// </summary>
+    /// <returns>Boolean representation of the header value.</returns>
+    /// <exception cref="InvalidOperationException">Thrown when the header kind is not Bool.</exception>
     public bool ToBool()
     {
         if (Kind is not HeaderKind.Bool)
@@ -191,6 +277,11 @@ public readonly struct HeaderValue
         return BitConverter.ToBoolean(Value, 0);
     }
 
+    /// <summary>
+    ///     Converts the header value to a 32-bit integer.
+    /// </summary>
+    /// <returns>The 32-bit integer representation of the header value.</returns>
+    /// <exception cref="InvalidOperationException">Thrown when the header kind is not <see cref="HeaderKind.Int32" />.</exception>
     public int ToInt32()
     {
         if (Kind is not HeaderKind.Int32)
@@ -201,6 +292,11 @@ public readonly struct HeaderValue
         return BitConverter.ToInt32(Value, 0);
     }
 
+    /// <summary>
+    ///     Converts the header value to a 64-bit signed integer.
+    /// </summary>
+    /// <returns>A 64-bit signed integer representation of the header value.</returns>
+    /// <exception cref="InvalidOperationException">Thrown when the header kind is not <see cref="HeaderKind.Int64" />.</exception>
     public long ToInt64()
     {
         if (Kind is not HeaderKind.Int64)
@@ -211,6 +307,11 @@ public readonly struct HeaderValue
         return BitConverter.ToInt64(Value, 0);
     }
 
+    /// <summary>
+    ///     Converts the header value to a 128-bit integer.
+    /// </summary>
+    /// <returns>The 128-bit integer representation of the header value.</returns>
+    /// <exception cref="InvalidOperationException">Thrown if the header kind is not Int128.</exception>
     public Int128 ToInt128()
     {
         if (Kind is not HeaderKind.Int128)
@@ -221,6 +322,13 @@ public readonly struct HeaderValue
         return Value.ToInt128();
     }
 
+    /// <summary>
+    ///     Converts the header value to a GUID.
+    /// </summary>
+    /// <returns>A <see cref="Guid" /> representation of the header value.</returns>
+    /// <exception cref="InvalidOperationException">
+    ///     Thrown when the header value's kind is not <see cref="HeaderKind.Uint128" />.
+    /// </exception>
     public Guid ToGuid()
     {
         if (Kind is not HeaderKind.Uint128)
@@ -231,6 +339,11 @@ public readonly struct HeaderValue
         return new Guid(Value);
     }
 
+    /// <summary>
+    ///     Converts the current header value to an unsigned 32-bit integer.
+    /// </summary>
+    /// <returns>An unsigned 32-bit integer representation of the header value.</returns>
+    /// <exception cref="InvalidOperationException">Thrown when the header kind is not <c>HeaderKind.Uint32</c>.</exception>
     public uint ToUInt32()
     {
         if (Kind is not HeaderKind.Uint32)
@@ -241,6 +354,11 @@ public readonly struct HeaderValue
         return BitConverter.ToUInt32(Value);
     }
 
+    /// <summary>
+    ///     Converts the header value to a 64-bit unsigned integer.
+    /// </summary>
+    /// <returns>A 64-bit unsigned integer representation of the header value.</returns>
+    /// <exception cref="InvalidOperationException">Thrown when the header kind is not Uint64.</exception>
     public ulong ToUInt64()
     {
         if (Kind is not HeaderKind.Uint64)
@@ -251,6 +369,11 @@ public readonly struct HeaderValue
         return BitConverter.ToUInt64(Value);
     }
 
+    /// <summary>
+    ///     Converts the header value to a UInt128 type.
+    /// </summary>
+    /// <returns>The UInt128 representation of the header value.</returns>
+    /// <exception cref="InvalidOperationException">Thrown when the header kind is not Uint128.</exception>
     public UInt128 ToUInt128()
     {
         if (Kind is not HeaderKind.Uint128)
@@ -261,6 +384,11 @@ public readonly struct HeaderValue
         return Value.ToUInt128();
     }
 
+    /// <summary>
+    ///     Converts the header value to a float.
+    /// </summary>
+    /// <returns>A float representation of the header value.</returns>
+    /// <exception cref="InvalidOperationException">Thrown when the header kind is not <c>HeaderKind.Float</c>.</exception>
     public float ToFloat()
     {
         if (Kind is not HeaderKind.Float)
@@ -271,6 +399,11 @@ public readonly struct HeaderValue
         return BitConverter.ToSingle(Value);
     }
 
+    /// <summary>
+    ///     Converts the header value to a double-precision floating-point number.
+    /// </summary>
+    /// <returns>The double-precision floating-point number represented by the header value.</returns>
+    /// <exception cref="InvalidOperationException">Thrown when the header kind is not compatible with a double conversion.</exception>
     public double ToDouble()
     {
         if (Kind is not HeaderKind.Double)

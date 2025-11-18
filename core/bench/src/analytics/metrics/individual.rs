@@ -231,7 +231,7 @@ fn calculate_latency_metrics(
 
     let avg = latencies_ms.iter().sum::<f64>() / latencies_ms.len() as f64;
     let len = latencies_ms.len() / 2;
-    let median = if latencies_ms.len() % 2 == 0 {
+    let median = if latencies_ms.len().is_multiple_of(2) {
         f64::midpoint(latencies_ms[len - 1], latencies_ms[len])
     } else {
         latencies_ms[len]

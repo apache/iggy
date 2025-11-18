@@ -36,7 +36,6 @@ impl CreateTopicCmd {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         stream_id: Identifier,
-        topic_id: Option<u32>,
         partitions_count: u32,
         compression_algorithm: CompressionAlgorithm,
         name: String,
@@ -47,7 +46,6 @@ impl CreateTopicCmd {
         Self {
             create_topic: CreateTopic {
                 stream_id,
-                topic_id,
                 partitions_count,
                 compression_algorithm,
                 name,
@@ -60,13 +58,6 @@ impl CreateTopicCmd {
             replication_factor,
         }
     }
-
-    fn get_topic_id_info(&self) -> String {
-        match self.create_topic.topic_id {
-            Some(topic_id) => format!("ID: {topic_id}"),
-            None => "ID auto incremented".to_string(),
-        }
-    }
 }
 
 #[async_trait]
@@ -77,19 +68,28 @@ impl CliCommand for CreateTopicCmd {
 
     async fn execute_cmd(&mut self, client: &dyn Client) -> anyhow::Result<(), anyhow::Error> {
         client
-            .create_topic(&self.create_topic.stream_id, &self.create_topic.name, self.create_topic.partitions_count, self.create_topic.compression_algorithm, self.create_topic.replication_factor, self.create_topic.topic_id, self.create_topic.message_expiry, self.create_topic.max_topic_size)
+            .create_topic(
+                &self.create_topic.stream_id,
+                &self.create_topic.name,
+                self.create_topic.partitions_count,
+                self.create_topic.compression_algorithm,
+                self.create_topic.replication_factor,
+                self.create_topic.message_expiry,
+                self.create_topic.max_topic_size,
+            )
             .await
             .with_context(|| {
                 format!(
-                    "Problem creating topic (ID: {}, name: {}, partitions count: {}) in stream with ID: {}",
-                    self.create_topic.topic_id.unwrap_or(0), self.create_topic.name, self.create_topic.partitions_count, self.create_topic.stream_id
+                    "Problem creating topic (name: {}, partitions count: {}) in stream with ID: {}",
+                    self.create_topic.name,
+                    self.create_topic.partitions_count,
+                    self.create_topic.stream_id
                 )
             })?;
 
         event!(target: PRINT_TARGET, Level::INFO,
-            "Topic with name: {}, {}, partitions count: {}, compression algorithm: {}, message expiry: {}, max topic size: {}, replication factor: {} created in stream with ID: {}",
+            "Topic with name: {}, partitions count: {}, compression algorithm: {}, message expiry: {}, max topic size: {}, replication factor: {} created in stream with ID: {}",
             self.create_topic.name,
-            self.get_topic_id_info(),
             self.create_topic.partitions_count,
             self.create_topic.compression_algorithm,
             self.message_expiry,
@@ -104,7 +104,6 @@ impl CliCommand for CreateTopicCmd {
 
 impl fmt::Display for CreateTopicCmd {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let topic_id = self.get_topic_id_info();
         let topic_name = &self.create_topic.name;
         let compression_algorithm = &self.create_topic.compression_algorithm;
         let message_expiry = &self.message_expiry;
@@ -114,7 +113,7 @@ impl fmt::Display for CreateTopicCmd {
 
         write!(
             f,
-            "create topic with name: {topic_name}, {topic_id}, message expiry: {message_expiry}, compression algorithm: {compression_algorithm}, \
+            "create topic with name: {topic_name}, message expiry: {message_expiry}, compression algorithm: {compression_algorithm}, \
             max topic size: {max_topic_size}, replication factor: {replication_factor} in stream with ID: {stream_id}",
         )
     }

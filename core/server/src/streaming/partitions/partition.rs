@@ -1,295 +1,454 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
- */
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-use crate::configs::system::SystemConfig;
-use crate::streaming::deduplication::message_deduplicator::MessageDeduplicator;
-use crate::streaming::segments::*;
-use crate::streaming::storage::SystemStorage;
-use dashmap::DashMap;
-use iggy_common::ConsumerKind;
-use iggy_common::IggyByteSize;
-use iggy_common::IggyDuration;
-use iggy_common::IggyExpiry;
-use iggy_common::IggyTimestamp;
-use iggy_common::Sizeable;
-use std::fmt;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use crate::{
+    configs::system::SystemConfig,
+    slab::{
+        partitions,
+        streams::Streams,
+        traits_ext::{EntityMarker, IntoComponents, IntoComponentsById},
+    },
+    streaming::{
+        self,
+        deduplication::message_deduplicator::MessageDeduplicator,
+        partitions::{
+            consumer_offset, helpers::create_message_deduplicator, journal::MemoryMessageJournal,
+            log::SegmentedLog,
+        },
+        polling_consumer::ConsumerGroupId,
+        stats::{PartitionStats, TopicStats},
+    },
+};
+use iggy_common::{Identifier, IggyTimestamp};
+use slab::Slab;
+use std::sync::{Arc, atomic::AtomicU64};
+
+#[derive(Debug, Clone)]
+pub struct ConsumerOffsets(papaya::HashMap<usize, consumer_offset::ConsumerOffset>);
+
+impl ConsumerOffsets {
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self(papaya::HashMap::with_capacity(capacity))
+    }
+}
+
+impl<I> From<I> for ConsumerOffsets
+where
+    I: IntoIterator<Item = (usize, consumer_offset::ConsumerOffset)>,
+{
+    fn from(iter: I) -> Self {
+        Self(papaya::HashMap::from_iter(iter))
+    }
+}
+
+impl std::ops::Deref for ConsumerOffsets {
+    type Target = papaya::HashMap<usize, consumer_offset::ConsumerOffset>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for ConsumerOffsets {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ConsumerGroupOffsets(papaya::HashMap<ConsumerGroupId, consumer_offset::ConsumerOffset>);
+
+impl ConsumerGroupOffsets {
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self(papaya::HashMap::with_capacity(capacity))
+    }
+}
+
+impl<I> From<I> for ConsumerGroupOffsets
+where
+    I: IntoIterator<Item = (ConsumerGroupId, consumer_offset::ConsumerOffset)>,
+{
+    fn from(iter: I) -> Self {
+        Self(papaya::HashMap::from_iter(iter))
+    }
+}
+
+impl std::ops::Deref for ConsumerGroupOffsets {
+    type Target = papaya::HashMap<ConsumerGroupId, consumer_offset::ConsumerOffset>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for ConsumerGroupOffsets {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
 
 #[derive(Debug)]
 pub struct Partition {
-    pub stream_id: u32,
-    pub topic_id: u32,
-    pub partition_id: u32,
-    pub partition_path: String,
-    pub offsets_path: String,
-    pub consumer_offsets_path: String,
-    pub consumer_group_offsets_path: String,
-    pub current_offset: u64,
-    pub message_deduplicator: Option<MessageDeduplicator>,
-    pub unsaved_messages_count: u32,
-    pub unsaved_messages_size: IggyByteSize,
-    pub should_increment_offset: bool,
-    pub created_at: IggyTimestamp,
-    pub avg_timestamp_delta: IggyDuration,
-    pub messages_count_of_parent_stream: Arc<AtomicU64>,
-    pub messages_count_of_parent_topic: Arc<AtomicU64>,
-    pub messages_count: Arc<AtomicU64>,
-    pub size_of_parent_stream: Arc<AtomicU64>,
-    pub size_of_parent_topic: Arc<AtomicU64>,
-    pub size_bytes: Arc<AtomicU64>,
-    pub segments_count_of_parent_stream: Arc<AtomicU32>,
-    pub(crate) message_expiry: IggyExpiry,
-    pub(crate) consumer_offsets: DashMap<u32, ConsumerOffset>,
-    pub(crate) consumer_group_offsets: DashMap<u32, ConsumerOffset>,
-    pub(crate) segments: Vec<Segment>,
-    pub(crate) config: Arc<SystemConfig>,
-    pub(crate) storage: Arc<SystemStorage>,
-}
-
-#[derive(Debug, PartialEq, Clone)]
-pub struct ConsumerOffset {
-    pub kind: ConsumerKind,
-    pub consumer_id: u32,
-    pub offset: u64,
-    pub path: Arc<String>,
-}
-
-impl ConsumerOffset {
-    pub fn new(kind: ConsumerKind, consumer_id: u32, offset: u64, path: &str) -> ConsumerOffset {
-        ConsumerOffset {
-            kind,
-            consumer_id,
-            offset,
-            path: Arc::new(format!("{path}/{consumer_id}")),
-        }
-    }
+    root: PartitionRoot,
+    stats: Arc<PartitionStats>,
+    message_deduplicator: Option<Arc<MessageDeduplicator>>,
+    offset: Arc<AtomicU64>,
+    consumer_offset: Arc<ConsumerOffsets>,
+    consumer_group_offset: Arc<ConsumerGroupOffsets>,
+    log: SegmentedLog<MemoryMessageJournal>,
 }
 
 impl Partition {
     #[allow(clippy::too_many_arguments)]
-    pub async fn create(
-        stream_id: u32,
-        topic_id: u32,
-        partition_id: u32,
-        with_segment: bool,
-        config: Arc<SystemConfig>,
-        storage: Arc<SystemStorage>,
-        message_expiry: IggyExpiry,
-        messages_count_of_parent_stream: Arc<AtomicU64>,
-        messages_count_of_parent_topic: Arc<AtomicU64>,
-        size_of_parent_stream: Arc<AtomicU64>,
-        size_of_parent_topic: Arc<AtomicU64>,
-        segments_count_of_parent_stream: Arc<AtomicU32>,
+    pub fn new(
         created_at: IggyTimestamp,
-    ) -> Partition {
-        let partition_path = config.get_partition_path(stream_id, topic_id, partition_id);
-        let offsets_path = config.get_offsets_path(stream_id, topic_id, partition_id);
-        let consumer_offsets_path =
-            config.get_consumer_offsets_path(stream_id, topic_id, partition_id);
-        let consumer_group_offsets_path =
-            config.get_consumer_group_offsets_path(stream_id, topic_id, partition_id);
-
-        let message_deduplicator = match config.message_deduplication.enabled {
-            true => Some(MessageDeduplicator::new(
-                if config.message_deduplication.max_entries > 0 {
-                    Some(config.message_deduplication.max_entries)
-                } else {
-                    None
-                },
-                {
-                    if config.message_deduplication.expiry.is_zero() {
-                        None
-                    } else {
-                        Some(config.message_deduplication.expiry)
-                    }
-                },
-            )),
-            false => None,
-        };
-
-        let mut partition = Partition {
-            stream_id,
-            topic_id,
-            partition_id,
-            partition_path,
-            offsets_path,
-            consumer_offsets_path,
-            consumer_group_offsets_path,
-            message_expiry,
+        should_increment_offset: bool,
+        stats: Arc<PartitionStats>,
+        message_deduplicator: Option<MessageDeduplicator>,
+        offset: Arc<AtomicU64>,
+        consumer_offset: Arc<ConsumerOffsets>,
+        consumer_group_offset: Arc<ConsumerGroupOffsets>,
+        log: SegmentedLog<MemoryMessageJournal>,
+    ) -> Self {
+        let root = PartitionRoot::new(created_at, should_increment_offset);
+        let message_deduplicator = message_deduplicator.map(Arc::new);
+        Self {
+            root,
+            stats,
             message_deduplicator,
-            segments: vec![],
-            current_offset: 0,
-            unsaved_messages_count: 0,
-            unsaved_messages_size: IggyByteSize::from(0),
-            should_increment_offset: false,
-            consumer_offsets: DashMap::new(),
-            consumer_group_offsets: DashMap::new(),
-            config,
-            storage,
-            created_at,
-            avg_timestamp_delta: IggyDuration::default(),
-            size_of_parent_stream,
-            size_of_parent_topic,
-            size_bytes: Arc::new(AtomicU64::new(0)),
-            messages_count_of_parent_stream,
-            messages_count_of_parent_topic,
-            messages_count: Arc::new(AtomicU64::new(0)),
-            segments_count_of_parent_stream,
-        };
+            offset,
+            consumer_offset,
+            consumer_group_offset,
+            log,
+        }
+    }
 
-        if with_segment {
-            let segment = Segment::create(
+    pub fn new_with_components(
+        root: PartitionRoot,
+        stats: Arc<PartitionStats>,
+        message_deduplicator: Option<Arc<MessageDeduplicator>>,
+        offset: Arc<AtomicU64>,
+        consumer_offset: Arc<ConsumerOffsets>,
+        consumer_group_offset: Arc<ConsumerGroupOffsets>,
+        log: SegmentedLog<MemoryMessageJournal>,
+    ) -> Self {
+        Self {
+            root,
+            stats,
+            message_deduplicator,
+            offset,
+            consumer_offset,
+            consumer_group_offset,
+            log,
+        }
+    }
+
+    pub fn stats(&self) -> &PartitionStats {
+        &self.stats
+    }
+}
+
+impl Clone for Partition {
+    fn clone(&self) -> Self {
+        Self {
+            root: self.root.clone(),
+            stats: Arc::clone(&self.stats),
+            message_deduplicator: self.message_deduplicator.clone(),
+            offset: Arc::clone(&self.offset),
+            consumer_offset: Arc::clone(&self.consumer_offset),
+            consumer_group_offset: Arc::clone(&self.consumer_group_offset),
+            log: Default::default(),
+        }
+    }
+}
+
+impl EntityMarker for Partition {
+    type Idx = partitions::ContainerId;
+
+    fn id(&self) -> Self::Idx {
+        self.root.id
+    }
+
+    fn update_id(&mut self, id: Self::Idx) {
+        self.root.id = id;
+    }
+}
+
+impl IntoComponents for Partition {
+    type Components = (
+        PartitionRoot,
+        Arc<PartitionStats>,
+        Option<Arc<MessageDeduplicator>>,
+        Arc<AtomicU64>,
+        Arc<ConsumerOffsets>,
+        Arc<ConsumerGroupOffsets>,
+        SegmentedLog<MemoryMessageJournal>,
+    );
+
+    fn into_components(self) -> Self::Components {
+        (
+            self.root,
+            self.stats,
+            self.message_deduplicator,
+            self.offset,
+            self.consumer_offset,
+            self.consumer_group_offset,
+            self.log,
+        )
+    }
+}
+
+#[derive(Default, Debug, Clone)]
+pub struct PartitionRoot {
+    id: usize,
+    created_at: IggyTimestamp,
+    should_increment_offset: bool,
+}
+
+impl PartitionRoot {
+    pub fn new(created_at: IggyTimestamp, should_increment_offset: bool) -> Self {
+        Self {
+            id: 0,
+            created_at,
+            should_increment_offset,
+        }
+    }
+
+    pub fn id(&self) -> usize {
+        self.id
+    }
+
+    pub fn update_id(&mut self, id: usize) {
+        self.id = id;
+    }
+
+    pub fn created_at(&self) -> IggyTimestamp {
+        self.created_at
+    }
+
+    pub fn should_increment_offset(&self) -> bool {
+        self.should_increment_offset
+    }
+
+    pub fn set_should_increment_offset(&mut self, value: bool) {
+        self.should_increment_offset = value;
+    }
+}
+
+pub struct PartitionRef<'a> {
+    root: &'a Slab<PartitionRoot>,
+    stats: &'a Slab<Arc<PartitionStats>>,
+    message_deduplicator: &'a Slab<Option<Arc<MessageDeduplicator>>>,
+    offset: &'a Slab<Arc<AtomicU64>>,
+    consumer_offset: &'a Slab<Arc<ConsumerOffsets>>,
+    consumer_group_offset: &'a Slab<Arc<ConsumerGroupOffsets>>,
+    log: &'a Slab<SegmentedLog<MemoryMessageJournal>>,
+}
+
+impl<'a> PartitionRef<'a> {
+    pub fn new(
+        root: &'a Slab<PartitionRoot>,
+        stats: &'a Slab<Arc<PartitionStats>>,
+        message_deduplicator: &'a Slab<Option<Arc<MessageDeduplicator>>>,
+        offset: &'a Slab<Arc<AtomicU64>>,
+        consumer_offset: &'a Slab<Arc<ConsumerOffsets>>,
+        consumer_group_offset: &'a Slab<Arc<ConsumerGroupOffsets>>,
+        log: &'a Slab<SegmentedLog<MemoryMessageJournal>>,
+    ) -> Self {
+        Self {
+            root,
+            stats,
+            message_deduplicator,
+            offset,
+            consumer_offset,
+            consumer_group_offset,
+            log,
+        }
+    }
+}
+
+impl<'a> IntoComponents for PartitionRef<'a> {
+    type Components = (
+        &'a Slab<PartitionRoot>,
+        &'a Slab<Arc<PartitionStats>>,
+        &'a Slab<Option<Arc<MessageDeduplicator>>>,
+        &'a Slab<Arc<AtomicU64>>,
+        &'a Slab<Arc<ConsumerOffsets>>,
+        &'a Slab<Arc<ConsumerGroupOffsets>>,
+        &'a Slab<SegmentedLog<MemoryMessageJournal>>,
+    );
+
+    fn into_components(self) -> Self::Components {
+        (
+            self.root,
+            self.stats,
+            self.message_deduplicator,
+            self.offset,
+            self.consumer_offset,
+            self.consumer_group_offset,
+            self.log,
+        )
+    }
+}
+
+impl<'a> IntoComponentsById for PartitionRef<'a> {
+    type Idx = partitions::ContainerId;
+    type Output = (
+        &'a PartitionRoot,
+        &'a Arc<PartitionStats>,
+        &'a Option<Arc<MessageDeduplicator>>,
+        &'a Arc<AtomicU64>,
+        &'a Arc<ConsumerOffsets>,
+        &'a Arc<ConsumerGroupOffsets>,
+        &'a SegmentedLog<MemoryMessageJournal>,
+    );
+
+    fn into_components_by_id(self, index: Self::Idx) -> Self::Output {
+        (
+            &self.root[index],
+            &self.stats[index],
+            &self.message_deduplicator[index],
+            &self.offset[index],
+            &self.consumer_offset[index],
+            &self.consumer_group_offset[index],
+            &self.log[index],
+        )
+    }
+}
+
+pub struct PartitionRefMut<'a> {
+    root: &'a mut Slab<PartitionRoot>,
+    stats: &'a mut Slab<Arc<PartitionStats>>,
+    message_deduplicator: &'a mut Slab<Option<Arc<MessageDeduplicator>>>,
+    offset: &'a mut Slab<Arc<AtomicU64>>,
+    consumer_offset: &'a mut Slab<Arc<ConsumerOffsets>>,
+    consumer_group_offset: &'a mut Slab<Arc<ConsumerGroupOffsets>>,
+    log: &'a mut Slab<SegmentedLog<MemoryMessageJournal>>,
+}
+
+impl<'a> PartitionRefMut<'a> {
+    pub fn new(
+        root: &'a mut Slab<PartitionRoot>,
+        stats: &'a mut Slab<Arc<PartitionStats>>,
+        message_deduplicator: &'a mut Slab<Option<Arc<MessageDeduplicator>>>,
+        offset: &'a mut Slab<Arc<AtomicU64>>,
+        consumer_offset: &'a mut Slab<Arc<ConsumerOffsets>>,
+        consumer_group_offset: &'a mut Slab<Arc<ConsumerGroupOffsets>>,
+        log: &'a mut Slab<SegmentedLog<MemoryMessageJournal>>,
+    ) -> Self {
+        Self {
+            root,
+            stats,
+            message_deduplicator,
+            offset,
+            consumer_offset,
+            consumer_group_offset,
+            log,
+        }
+    }
+}
+
+impl<'a> IntoComponents for PartitionRefMut<'a> {
+    type Components = (
+        &'a mut Slab<PartitionRoot>,
+        &'a mut Slab<Arc<PartitionStats>>,
+        &'a mut Slab<Option<Arc<MessageDeduplicator>>>,
+        &'a mut Slab<Arc<AtomicU64>>,
+        &'a mut Slab<Arc<ConsumerOffsets>>,
+        &'a mut Slab<Arc<ConsumerGroupOffsets>>,
+        &'a mut Slab<SegmentedLog<MemoryMessageJournal>>,
+    );
+
+    fn into_components(self) -> Self::Components {
+        (
+            self.root,
+            self.stats,
+            self.message_deduplicator,
+            self.offset,
+            self.consumer_offset,
+            self.consumer_group_offset,
+            self.log,
+        )
+    }
+}
+
+impl<'a> IntoComponentsById for PartitionRefMut<'a> {
+    type Idx = partitions::ContainerId;
+    type Output = (
+        &'a mut PartitionRoot,
+        &'a mut Arc<PartitionStats>,
+        &'a mut Option<Arc<MessageDeduplicator>>,
+        &'a mut Arc<AtomicU64>,
+        &'a mut Arc<ConsumerOffsets>,
+        &'a mut Arc<ConsumerGroupOffsets>,
+        &'a mut SegmentedLog<MemoryMessageJournal>,
+    );
+
+    fn into_components_by_id(self, index: Self::Idx) -> Self::Output {
+        (
+            &mut self.root[index],
+            &mut self.stats[index],
+            &mut self.message_deduplicator[index],
+            &mut self.offset[index],
+            &mut self.consumer_offset[index],
+            &mut self.consumer_group_offset[index],
+            &mut self.log[index],
+        )
+    }
+}
+
+pub fn create_and_insert_partitions_mem(
+    streams: &Streams,
+    stream_id: &Identifier,
+    topic_id: &Identifier,
+    parent_stats: Arc<TopicStats>,
+    partitions_count: u32,
+    config: &SystemConfig,
+) -> Vec<Partition> {
+    let range = 0..partitions_count as usize;
+    let created_at = IggyTimestamp::now();
+    range
+        .map(|_| {
+            // Areczkuuuu.
+            let stats = Arc::new(PartitionStats::new(parent_stats.clone()));
+            let should_increment_offset = false;
+            let deduplicator = create_message_deduplicator(config);
+            let offset = Arc::new(AtomicU64::new(0));
+            let consumer_offset = Arc::new(ConsumerOffsets::with_capacity(2137));
+            let consumer_group_offset = Arc::new(ConsumerGroupOffsets::with_capacity(2137));
+            let log = Default::default();
+
+            let mut partition = Partition::new(
+                created_at,
+                should_increment_offset,
+                stats,
+                deduplicator,
+                offset,
+                consumer_offset,
+                consumer_group_offset,
+                log,
+            );
+            let id = streams.with_partitions_mut(
                 stream_id,
                 topic_id,
-                partition_id,
-                0,
-                partition.config.clone(),
-                partition.message_expiry,
-                partition.size_of_parent_stream.clone(),
-                partition.size_of_parent_topic.clone(),
-                partition.size_bytes.clone(),
-                partition.messages_count_of_parent_stream.clone(),
-                partition.messages_count_of_parent_topic.clone(),
-                partition.messages_count.clone(),
-                true,
+                streaming::partitions::helpers::insert_partition(partition.clone()),
             );
-            partition.segments.push(segment);
+            partition.update_id(id);
             partition
-                .segments_count_of_parent_stream
-                .fetch_add(1, Ordering::SeqCst);
-        }
-
-        partition
-    }
-}
-
-impl Sizeable for Partition {
-    fn get_size_bytes(&self) -> IggyByteSize {
-        IggyByteSize::from(self.size_bytes.load(Ordering::SeqCst))
-    }
-}
-
-impl fmt::Display for Partition {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "Partition {{ stream ID: {}, topic ID: {}, partition_id: {}, path: {}, current_offset: {} }}",
-            self.stream_id,
-            self.topic_id,
-            self.partition_id,
-            self.partition_path,
-            self.current_offset,
-        )
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::configs::system::SystemConfig;
-    use crate::streaming::partitions::partition::Partition;
-    use crate::streaming::persistence::persister::{FileWithSyncPersister, PersisterKind};
-    use crate::streaming::storage::SystemStorage;
-    use crate::streaming::utils::MemoryPool;
-    use iggy_common::IggyDuration;
-    use iggy_common::IggyExpiry;
-    use iggy_common::IggyTimestamp;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicU32, AtomicU64};
-
-    #[tokio::test]
-    async fn should_be_created_with_a_single_segment_given_valid_parameters() {
-        let tempdir = tempfile::TempDir::new().unwrap();
-        let config = Arc::new(SystemConfig {
-            path: tempdir.path().to_str().unwrap().to_string(),
-            ..Default::default()
-        });
-        let storage = Arc::new(SystemStorage::new(
-            config.clone(),
-            Arc::new(PersisterKind::FileWithSync(FileWithSyncPersister {})),
-        ));
-        MemoryPool::init_pool(config.clone());
-
-        let stream_id = 1;
-        let topic_id = 2;
-        let partition_id = 3;
-        let with_segment = true;
-        let path = config.get_partition_path(stream_id, topic_id, partition_id);
-        let message_expiry = IggyExpiry::ExpireDuration(IggyDuration::from(10));
-        let partition = Partition::create(
-            stream_id,
-            topic_id,
-            partition_id,
-            with_segment,
-            config,
-            storage,
-            message_expiry,
-            Arc::new(AtomicU64::new(0)),
-            Arc::new(AtomicU64::new(0)),
-            Arc::new(AtomicU64::new(0)),
-            Arc::new(AtomicU64::new(0)),
-            Arc::new(AtomicU32::new(0)),
-            IggyTimestamp::now(),
-        )
-        .await;
-
-        assert_eq!(partition.stream_id, stream_id);
-        assert_eq!(partition.topic_id, topic_id);
-        assert_eq!(partition.partition_id, partition_id);
-        assert_eq!(partition.partition_path, path);
-        assert_eq!(partition.current_offset, 0);
-        assert_eq!(partition.unsaved_messages_count, 0);
-        assert_eq!(partition.segments.len(), 1);
-        assert!(!partition.should_increment_offset);
-        let consumer_offsets = partition.consumer_offsets;
-        assert_eq!(partition.message_expiry, message_expiry);
-        assert!(consumer_offsets.is_empty());
-    }
-
-    #[tokio::test]
-    async fn should_not_initialize_segments_given_false_with_segment_parameter() {
-        let tempdir = tempfile::TempDir::new().unwrap();
-        let config = Arc::new(SystemConfig {
-            path: tempdir.path().to_str().unwrap().to_string(),
-            ..Default::default()
-        });
-        let storage = Arc::new(SystemStorage::new(
-            config.clone(),
-            Arc::new(PersisterKind::FileWithSync(FileWithSyncPersister {})),
-        ));
-
-        let topic_id = 1;
-        let partition = Partition::create(
-            1,
-            topic_id,
-            1,
-            false,
-            Arc::new(SystemConfig::default()),
-            storage,
-            IggyExpiry::NeverExpire,
-            Arc::new(AtomicU64::new(0)),
-            Arc::new(AtomicU64::new(0)),
-            Arc::new(AtomicU64::new(0)),
-            Arc::new(AtomicU64::new(0)),
-            Arc::new(AtomicU32::new(0)),
-            IggyTimestamp::now(),
-        )
-        .await;
-        assert!(partition.segments.is_empty());
-    }
+        })
+        .collect()
 }

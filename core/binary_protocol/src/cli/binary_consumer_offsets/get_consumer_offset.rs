@@ -35,11 +35,12 @@ impl GetConsumerOffsetCmd {
         stream_id: Identifier,
         topic_id: Identifier,
         partition_id: u32,
+        kind: ConsumerKind,
     ) -> Self {
         Self {
             get_consumer_offset: GetConsumerOffset {
                 consumer: Consumer {
-                    kind: ConsumerKind::Consumer,
+                    kind,
                     id: consumer_id,
                 },
                 stream_id,

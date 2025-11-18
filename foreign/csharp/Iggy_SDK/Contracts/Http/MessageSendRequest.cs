@@ -15,12 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using System.Text.Json.Serialization;
+using Apache.Iggy.JsonConverters;
 using Apache.Iggy.Kinds;
 using Apache.Iggy.Messages;
 
 namespace Apache.Iggy.Contracts.Http;
 
-public sealed class MessageSendRequest
+[JsonConverter(typeof(MessagesConverter))]
+internal sealed class MessageSendRequest
 {
     public required Identifier StreamId { get; init; }
     public required Identifier TopicId { get; init; }

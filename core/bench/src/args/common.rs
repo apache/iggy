@@ -23,8 +23,7 @@ use super::{
     defaults::{
         DEFAULT_MESSAGE_BATCHES, DEFAULT_MESSAGE_SIZE, DEFAULT_MESSAGES_PER_BATCH,
         DEFAULT_MOVING_AVERAGE_WINDOW, DEFAULT_PERFORM_CLEANUP, DEFAULT_SAMPLING_TIME,
-        DEFAULT_SERVER_STDOUT_VISIBILITY, DEFAULT_SKIP_SERVER_START, DEFAULT_START_STREAM_ID,
-        DEFAULT_WARMUP_TIME,
+        DEFAULT_SERVER_STDOUT_VISIBILITY, DEFAULT_SKIP_SERVER_START, DEFAULT_WARMUP_TIME,
     },
     transport::BenchmarkTransportCommand,
 };
@@ -32,8 +31,7 @@ use bench_report::benchmark_kind::BenchmarkKind;
 use bench_report::numeric_parameter::BenchmarkNumericParameter;
 use clap::error::ErrorKind;
 use clap::{CommandFactory, Parser};
-use iggy::prelude::{IggyByteSize, IggyDuration};
-use integration::test_server::Transport;
+use iggy::prelude::{IggyByteSize, IggyDuration, TransportProtocol};
 use std::net::SocketAddr;
 use std::num::NonZeroU32;
 use std::path::Path;
@@ -64,10 +62,6 @@ pub struct IggyBenchArgs {
     /// This argument is mutually exclusive with `message_batches`.
     #[arg(long, short = 'T', group = "data_to_process")]
     pub total_data: Option<IggyByteSize>,
-
-    /// Start stream id
-    #[arg(long, short = 'S', default_value_t = DEFAULT_START_STREAM_ID)]
-    pub start_stream_id: NonZeroU32,
 
     /// Optional total rate limit (aggregate, for all actors)
     /// Accepts human-readable formats like "50KB", "10MB", or "1GB"
@@ -123,7 +117,7 @@ impl IggyBenchArgs {
         self.benchmark_kind.transport_command()
     }
 
-    pub fn transport(&self) -> &Transport {
+    pub fn transport(&self) -> &TransportProtocol {
         self.benchmark_kind.transport_command().transport()
     }
 
@@ -136,10 +130,6 @@ impl IggyBenchArgs {
             .inner()
             .transport_command()
             .server_address()
-    }
-
-    pub const fn start_stream_id(&self) -> u32 {
-        self.start_stream_id.get()
     }
 
     pub fn validate(&mut self) {
@@ -370,6 +360,7 @@ impl IggyBenchArgs {
             BenchmarkTransportCommand::Tcp(_) => "tcp",
             BenchmarkTransportCommand::Quic(_) => "quic",
             BenchmarkTransportCommand::Http(_) => "http",
+            BenchmarkTransportCommand::WebSocket(_) => "ws",
         };
 
         let actors = match &self.benchmark_kind {
@@ -402,15 +393,15 @@ impl IggyBenchArgs {
         ];
 
         if let Some(remark) = &self.remark() {
-            parts.push(remark.to_string());
+            parts.push(remark.clone());
         }
 
         if let Some(gitref) = &self.gitref() {
-            parts.push(gitref.to_string());
+            parts.push(gitref.clone());
         }
 
         if let Some(identifier) = &self.identifier() {
-            parts.push(identifier.to_string());
+            parts.push(identifier.clone());
         }
 
         parts.join("_")

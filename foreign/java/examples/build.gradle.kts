@@ -19,13 +19,18 @@
 
 plugins {
     id("java")
+    id("application")
 }
 
 group = "org.apache.iggy"
-version = "0.5.0-SNAPSHOT"
+version = "0.6.0-SNAPSHOT"
 
 repositories {
     mavenCentral()
+}
+
+application {
+    mainClass.set("org.apache.iggy.consumer.SimpleConsumer")
 }
 
 dependencies {
@@ -33,4 +38,44 @@ dependencies {
     implementation("org.slf4j:slf4j-api:2.0.9")
     runtimeOnly("ch.qos.logback:logback-classic:1.4.12")
     runtimeOnly("io.netty:netty-resolver-dns-native-macos:4.2.1.Final:osx-aarch_64")
+}
+
+// Task for running async consumer example
+tasks.register<JavaExec>("runAsyncConsumer") {
+    group = "application"
+    description = "Run the Async Consumer example with Netty"
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("org.apache.iggy.async.AsyncConsumerExample")
+}
+
+// Task for running simple consumer
+tasks.register<JavaExec>("runSimpleConsumer") {
+    group = "application"
+    description = "Run the Simple Consumer example"
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("org.apache.iggy.consumer.SimpleConsumer")
+}
+
+// Task for running simple producer
+tasks.register<JavaExec>("runSimpleProducer") {
+    group = "application"
+    description = "Run the Simple Producer example"
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("org.apache.iggy.producer.SimpleProducer")
+}
+
+// Task for running simple async test
+tasks.register<JavaExec>("runSimpleAsyncTest") {
+    group = "application"
+    description = "Run the Simple Async Test for debugging"
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("org.apache.iggy.async.SimpleAsyncTest")
+}
+
+// Task for running async producer
+tasks.register<JavaExec>("runAsyncProducer") {
+    group = "application"
+    description = "Run the Async Producer example"
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("org.apache.iggy.async.AsyncProducer")
 }

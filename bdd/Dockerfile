@@ -15,7 +15,8 @@
 # specific language governing permissions and limitations
 # under the License.
 
-FROM rust:1.89 AS builder
+FROM rust:1.89.0-alpine3.22 AS builder
+RUN apk add musl-dev
 
 WORKDIR /app
 COPY . .
@@ -40,6 +41,13 @@ COPY core/configs ./configs
 RUN mkdir -p /app/local_data
 
 WORKDIR /app
+
+ENV IGGY_HTTP_ADDRESS=0.0.0.0:3000
+ENV IGGY_QUIC_ADDRESS=0.0.0.0:8080
+ENV IGGY_TCP_ADDRESS=0.0.0.0:8090
+ENV IGGY_WEBSOCKET_ADDRESS=0.0.0.0:8092
+ENV IGGY_ROOT_USERNAME=iggy
+ENV IGGY_ROOT_PASSWORD=iggy
 
 # Expose ports
 EXPOSE 8090 3000 8080

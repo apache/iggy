@@ -17,7 +17,4 @@
 
 namespace Apache.Iggy.Contracts.Http;
 
-public sealed class CreatePartitionsRequest
-{
-    public required uint PartitionsCount { get; init; }
-}
+internal sealed record CreatePartitionsRequest(uint PartitionsCount);

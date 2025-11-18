@@ -17,13 +17,14 @@
 
 using Apache.Iggy.Enums;
 using Apache.Iggy.Kinds;
+using Apache.Iggy.Tests.Integrations.Attributes;
 using Apache.Iggy.Tests.Integrations.Fixtures;
+using Apache.Iggy.Tests.Integrations.Helpers;
 using Shouldly;
 
 namespace Apache.Iggy.Tests.Integrations;
 
-[MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
-public class OffsetTests(Protocol protocol)
+public class OffsetTests
 {
     private const ulong SetOffset = 2;
 
@@ -31,41 +32,91 @@ public class OffsetTests(Protocol protocol)
     public required OffsetFixtures Fixture { get; init; }
 
     [Test]
-    public async Task StoreOffset_IndividualConsumer_Should_StoreOffset_Successfully()
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task StoreOffset_IndividualConsumer_Should_StoreOffset_Successfully(Protocol protocol)
     {
-        await Fixture.Clients[protocol].StoreOffsetAsync(Consumer.New(1), Identifier.Numeric(1), Identifier.Numeric(1), SetOffset, 1);
+        await Fixture.Clients[protocol]
+            .StoreOffsetAsync(Consumer.New("test-consumer"), Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
+                Identifier.String(Fixture.TopicRequest.Name), SetOffset, 0);
     }
 
     [Test]
     [DependsOn(nameof(StoreOffset_IndividualConsumer_Should_StoreOffset_Successfully))]
-    public async Task GetOffset_IndividualConsumer_Should_GetOffset_Successfully()
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task GetOffset_IndividualConsumer_Should_GetOffset_Successfully(Protocol protocol)
     {
-        var offset = await Fixture.Clients[protocol].GetOffsetAsync(Consumer.New(1), Identifier.Numeric(1), Identifier.Numeric(1), 1);
+        var offset = await Fixture.Clients[protocol]
+            .GetOffsetAsync(Consumer.New("test-consumer"), Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
+                Identifier.String(Fixture.TopicRequest.Name), 0);
 
         offset.ShouldNotBeNull();
         offset.StoredOffset.ShouldBe(SetOffset);
-        offset.PartitionId.ShouldBe(1);
+        offset.PartitionId.ShouldBe(0);
         offset.CurrentOffset.ShouldBe(3u);
     }
 
     [Test]
     [DependsOn(nameof(GetOffset_IndividualConsumer_Should_GetOffset_Successfully))]
-    public async Task StoreOffset_ConsumerGroup_Should_StoreOffset_Successfully()
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task StoreOffset_ConsumerGroup_Should_StoreOffset_Successfully(Protocol protocol)
     {
-        await Fixture.Clients[protocol].CreateConsumerGroupAsync(Identifier.Numeric(1), Identifier.Numeric(1), "test_consumer_group", 1);
+        await Fixture.Clients[protocol]
+            .CreateConsumerGroupAsync(Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
+                Identifier.String(Fixture.TopicRequest.Name), "test_consumer_group");
 
-        await Fixture.Clients[protocol].StoreOffsetAsync(Consumer.Group(1), Identifier.Numeric(1), Identifier.Numeric(1), SetOffset, 1);
+        await Fixture.Clients[Protocol.Tcp].JoinConsumerGroupAsync(
+            Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
+            Identifier.String(Fixture.TopicRequest.Name), Identifier.String("test_consumer_group"));
+
+        await Fixture.Clients[protocol]
+            .StoreOffsetAsync(Consumer.Group("test_consumer_group"), Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
+                Identifier.String(Fixture.TopicRequest.Name), SetOffset, 0);
     }
 
     [Test]
     [DependsOn(nameof(StoreOffset_ConsumerGroup_Should_StoreOffset_Successfully))]
-    public async Task GetOffset_ConsumerGroup_Should_GetOffset_Successfully()
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task GetOffset_ConsumerGroup_Should_GetOffset_Successfully(Protocol protocol)
     {
-        var offset = await Fixture.Clients[protocol].GetOffsetAsync(Consumer.Group(1), Identifier.Numeric(1), Identifier.Numeric(1), 1);
+        var offset = await Fixture.Clients[protocol]
+            .GetOffsetAsync(Consumer.Group("test_consumer_group"), Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
+                Identifier.String(Fixture.TopicRequest.Name), 0);
 
         offset.ShouldNotBeNull();
         offset.StoredOffset.ShouldBe(SetOffset);
-        offset.PartitionId.ShouldBe(1);
+        offset.PartitionId.ShouldBe(0);
         offset.CurrentOffset.ShouldBe(3u);
+    }
+
+    [Test]
+    [DependsOn(nameof(StoreOffset_ConsumerGroup_Should_StoreOffset_Successfully))]
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task GetOffset_ConsumerGroup_ByName_Should_GetOffset_Successfully(Protocol protocol)
+    {
+        var offset = await Fixture.Clients[protocol].GetOffsetAsync(Consumer.Group("test_consumer_group"),
+            Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)), Identifier.String(Fixture.TopicRequest.Name),
+            0);
+
+        offset.ShouldNotBeNull();
+        offset.StoredOffset.ShouldBe(SetOffset);
+        offset.PartitionId.ShouldBe(0);
+        offset.CurrentOffset.ShouldBe(3u);
+    }
+
+    [Test]
+    [SkipHttp]
+    [DependsOn(nameof(GetOffset_ConsumerGroup_ByName_Should_GetOffset_Successfully))]
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task DeleteOffset_ConsumerGroup_Should_DeleteOffset_Successfully(Protocol protocol)
+    {
+        await Fixture.Clients[protocol].DeleteOffsetAsync(Consumer.Group("test_consumer_group"),
+            Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)), Identifier.String(Fixture.TopicRequest.Name),
+            0);
+
+        var offset = await Fixture.Clients[protocol].GetOffsetAsync(Consumer.Group("test_consumer_group"),
+            Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)), Identifier.String(Fixture.TopicRequest.Name),
+            0);
+
+        offset.ShouldBeNull();
     }
 }

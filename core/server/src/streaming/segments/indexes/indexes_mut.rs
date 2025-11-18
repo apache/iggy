@@ -221,9 +221,12 @@ impl IggyIndexesMut {
     }
 
     /// Gets the unsaved part of the index buffer
-    pub fn unsaved_slice(&self) -> &[u8] {
+    pub fn unsaved_slice(&self) -> PooledBuffer {
         let start_pos = self.saved_count as usize * INDEX_SIZE;
-        &self.buffer[start_pos..]
+        // TODO: Dunno how to handle this better, maybe we should have a `split` method,
+        // That splits the underlying Indexes buffer into two parts
+        // saved on disk and not saved yet.
+        PooledBuffer::from(&self.buffer[start_pos..])
     }
 
     /// Mark all indexes as saved to disk
@@ -253,7 +256,7 @@ impl IggyIndexesMut {
         if relative_start_offset == 0 {
             Some(IggyIndexesMut::from_bytes(slice, self.base_position))
         } else {
-            let position_offset = self.get(relative_start_offset - 1).unwrap().position();
+            let position_offset: u32 = self.get(relative_start_offset - 1).unwrap().position();
             Some(IggyIndexesMut::from_bytes(slice, position_offset))
         }
     }

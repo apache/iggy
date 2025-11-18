@@ -19,8 +19,6 @@
 
 package org.apache.iggy.producer;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 import org.apache.iggy.client.blocking.tcp.IggyTcpClient;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
@@ -29,17 +27,23 @@ import org.apache.iggy.message.Partitioning;
 import org.apache.iggy.stream.StreamDetails;
 import org.apache.iggy.topic.CompressionAlgorithm;
 import org.apache.iggy.topic.TopicDetails;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.math.BigInteger;
 import java.util.Optional;
+
 import static java.util.Collections.singletonList;
 import static java.util.Optional.empty;
 
-public class SimpleProducer {
+public final class SimpleProducer {
     private static final String STREAM_NAME = "dev01";
     private static final StreamId STREAM_ID = StreamId.of(STREAM_NAME);
     private static final String TOPIC_NAME = "events";
     private static final TopicId TOPIC_ID = TopicId.of(TOPIC_NAME);
     private static final Logger log = LoggerFactory.getLogger(SimpleProducer.class);
+
+    private SimpleProducer() {}
 
     public static void main(String[] args) {
         var client = new IggyTcpClient("localhost", 8090);
@@ -54,7 +58,6 @@ public class SimpleProducer {
             client.messages().sendMessages(STREAM_ID, TOPIC_ID, Partitioning.balanced(), singletonList(message));
             log.debug("Message {} sent", counter);
         }
-
     }
 
     private static void createStream(IggyTcpClient client) {
@@ -62,7 +65,7 @@ public class SimpleProducer {
         if (stream.isPresent()) {
             return;
         }
-        client.streams().createStream(empty(), STREAM_NAME);
+        client.streams().createStream(STREAM_NAME);
     }
 
     private static void createTopic(IggyTcpClient client) {
@@ -71,8 +74,8 @@ public class SimpleProducer {
             return;
         }
         client.topics()
-                .createTopic(STREAM_ID,
-                        empty(),
+                .createTopic(
+                        STREAM_ID,
                         1L,
                         CompressionAlgorithm.None,
                         BigInteger.ZERO,
@@ -80,5 +83,4 @@ public class SimpleProducer {
                         empty(),
                         TOPIC_NAME);
     }
-
 }

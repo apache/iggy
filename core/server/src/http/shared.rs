@@ -16,14 +16,14 @@
  * under the License.
  */
 
+use super::http_shard_wrapper::HttpSafeShard;
 use crate::http::jwt::jwt_manager::JwtManager;
-use crate::streaming::systems::system::SharedSystem;
 use std::net::SocketAddr;
 use ulid::Ulid;
 
 pub struct AppState {
     pub jwt_manager: JwtManager,
-    pub system: SharedSystem,
+    pub shard: HttpSafeShard,
 }
 
 #[derive(Debug, Copy, Clone)]

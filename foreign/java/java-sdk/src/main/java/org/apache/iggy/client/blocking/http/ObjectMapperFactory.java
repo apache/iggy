@@ -37,11 +37,9 @@ final class ObjectMapperFactory {
             .registerModule(new Jdk8Module())
             .setPropertyNamingStrategy(PropertyNamingStrategies.SNAKE_CASE);
 
-    private ObjectMapperFactory() {
-    }
+    private ObjectMapperFactory() {}
 
     static ObjectMapper getInstance() {
         return INSTANCE;
     }
-
 }

@@ -19,57 +19,79 @@
 use crate::binary::command::ServerCommandHandler;
 use crate::binary::{command, sender::SenderKind};
 use crate::server_error::ConnectionError;
+use crate::shard::IggyShard;
 use crate::streaming::session::Session;
-use crate::streaming::systems::system::SharedSystem;
 use crate::tcp::connection_handler::command::ServerCommand;
+use async_channel::Receiver;
+use bytes::BytesMut;
+use futures::FutureExt;
 use iggy_common::IggyError;
 use std::io::ErrorKind;
-use std::sync::Arc;
+use std::rc::Rc;
 use tracing::{debug, error, info};
 
 const INITIAL_BYTES_LENGTH: usize = 4;
 
 pub(crate) async fn handle_connection(
-    session: Arc<Session>,
+    session: &Session,
     sender: &mut SenderKind,
-    system: SharedSystem,
+    shard: &Rc<IggyShard>,
+    stop_receiver: Receiver<()>,
 ) -> Result<(), ConnectionError> {
-    let mut length_buffer = [0u8; INITIAL_BYTES_LENGTH];
-    let mut code_buffer = [0u8; INITIAL_BYTES_LENGTH];
+    let mut length_buffer = BytesMut::with_capacity(INITIAL_BYTES_LENGTH);
+    let mut code_buffer = BytesMut::with_capacity(INITIAL_BYTES_LENGTH);
     loop {
-        let read_length = match sender.read(&mut length_buffer).await {
-            Ok(read_length) => read_length,
-            Err(error) => {
-                if error.as_code() == IggyError::ConnectionClosed.as_code() {
-                    return Err(ConnectionError::from(error));
-                } else {
-                    sender.send_error_response(error).await?;
-                    continue;
+        let read_future = sender.read(length_buffer);
+        // TODO(hubcio): this futures::select! call is translated to epoll_wait syscall for every
+        // message, which adds around 100 us median latency. We could instead just call sender.shutdown()
+        // if some atomic bool is set, since this is all happenng within single thread.
+        let (_, mut initial_buffer) = futures::select! {
+            _ = stop_receiver.recv().fuse() => {
+                info!("Connection stop signal received for session: {}", session);
+                let _ = sender.send_error_response(IggyError::Disconnected).await;
+                return Ok(());
+            }
+            result = read_future.fuse() => {
+                match result {
+                    (Ok(read_length), initial_buffer) => (read_length, initial_buffer),
+                    (Err(error), initial_buffer) => {
+                        length_buffer = initial_buffer;
+                        if error.as_code() == IggyError::ConnectionClosed.as_code() {
+                            return Err(ConnectionError::from(error));
+                        } else {
+                            error!("got error: {:?}", error);
+                            sender.send_error_response(error).await?;
+                            continue;
+                        }
+                    }
                 }
             }
         };
 
-        if read_length != INITIAL_BYTES_LENGTH {
-            sender.send_error_response(IggyError::CommandLengthError(format!(
-                "Unable to read the TCP request length, expected: {INITIAL_BYTES_LENGTH} bytes, received: {read_length} bytes."
-            ))).await?;
-            continue;
-        }
-
-        let length = u32::from_le_bytes(length_buffer);
-        sender.read(&mut code_buffer).await?;
-        let code = u32::from_le_bytes(code_buffer);
+        let length =
+            u32::from_le_bytes(initial_buffer[0..INITIAL_BYTES_LENGTH].try_into().unwrap());
+        let (res, mut code_buffer_out) = sender.read(code_buffer).await;
+        res?;
+        let code: u32 =
+            u32::from_le_bytes(code_buffer_out[0..INITIAL_BYTES_LENGTH].try_into().unwrap());
+        initial_buffer.clear();
+        code_buffer_out.clear();
+        length_buffer = initial_buffer;
+        code_buffer = code_buffer_out;
         debug!("Received a TCP request, length: {length}, code: {code}");
         let command = ServerCommand::from_code_and_reader(code, sender, length - 4).await?;
         debug!("Received a TCP command: {command}, payload size: {length}");
-        match command.handle(sender, length, &session, &system).await {
+        let cmd_code = command.code();
+        match command.handle(sender, length, session, shard).await {
             Ok(_) => {
                 debug!(
-                    "Command was handled successfully, session: {session}. TCP response was sent."
+                    "Command {cmd_code} was handled successfully, session: {session}. TCP response was sent."
                 );
             }
             Err(error) => {
-                error!("Command was not handled successfully, session: {session}, error: {error}.");
+                error!(
+                    "Command with code {cmd_code} was not handled successfully, session: {session}, error: {error}."
+                );
                 if let IggyError::ClientNotFound(_) = error {
                     sender.send_error_response(error).await?;
                     debug!("TCP error response was sent to: {session}.");

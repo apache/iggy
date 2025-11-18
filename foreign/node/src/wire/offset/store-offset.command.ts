@@ -28,7 +28,7 @@ export type StoreOffset = {
   streamId: Id,
   topicId: Id,
   consumer: Consumer,
-  partitionId: number,
+  partitionId: number | null,
   offset: bigint
 };
 

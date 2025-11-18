@@ -15,12 +15,11 @@
   let { data }: Props = $props();
   const { form, constraints, errors, message } = superForm(data.form, {});
 
-  const remember = persistedStore('rememberMe', { rememberMe: true, username: '', password: '' });
+  const remember = persistedStore('rememberMe', { rememberMe: true, username: '' });
 
   onMount(() => {
     if ($remember.rememberMe) {
       $form.username = $remember.username;
-      $form.password = $remember.password;
     }
   });
 </script>
@@ -30,20 +29,21 @@
   onsubmit={() => {
     if ($remember.rememberMe) {
       $remember.username = $form.username;
-      $remember.password = $form.password;
     } else {
       $remember.username = '';
-      $remember.password = '';
     }
   }}
-  class="min-w-[350px] max-w-[400px] bg-white dark:bg-shadeD700 border text-color p-5 rounded-2xl card-shadow dark:shadow-lg flex flex-col gap-5"
+  class="min-w-[350px] max-w-[400px] bg-white dark:bg-shade-d700 border text-color p-5 rounded-2xl card-shadow dark:shadow-lg flex flex-col gap-5"
 >
   <span class="mx-auto font-semibold">Admin sign in</span>
 
   <Input
     label="Username"
     name="username"
-    errorMessage={Array.isArray($errors?.username) ? $errors.username.join(',') : String($errors?.username || '')}
+    autocomplete="username"
+    errorMessage={Array.isArray($errors?.username)
+      ? $errors.username.join(',')
+      : String($errors?.username || '')}
     bind:value={$form.username}
     {...$constraints.username}
   />
@@ -51,7 +51,10 @@
   <PasswordInput
     label="Password"
     name="password"
-    errorMessage={Array.isArray($errors?.password) ? $errors.password.join(',') : String($errors?.password || '')}
+    autocomplete="current-password"
+    errorMessage={Array.isArray($errors?.password)
+      ? $errors.password.join(',')
+      : String($errors?.password || '')}
     bind:value={$form.password}
     {...$constraints.password}
   />

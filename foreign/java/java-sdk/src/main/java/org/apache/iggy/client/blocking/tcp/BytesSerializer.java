@@ -33,13 +33,14 @@ import org.apache.iggy.user.GlobalPermissions;
 import org.apache.iggy.user.Permissions;
 import org.apache.iggy.user.StreamPermissions;
 import org.apache.iggy.user.TopicPermissions;
+
 import java.math.BigInteger;
 import java.util.Map;
+import java.util.Optional;
 
 public final class BytesSerializer {
 
-    private BytesSerializer() {
-    }
+    private BytesSerializer() {}
 
     static ByteBuf toBytes(Consumer consumer) {
         ByteBuf buffer = Unpooled.buffer();
@@ -64,13 +65,6 @@ public final class BytesSerializer {
         } else {
             throw new IllegalArgumentException("Unknown identifier kind: " + identifier.getKind());
         }
-    }
-
-    static ByteBuf nameToBytes(String name) {
-        ByteBuf buffer = Unpooled.buffer(1 + name.length());
-        buffer.writeByte(name.length());
-        buffer.writeBytes(name.getBytes());
-        return buffer;
     }
 
     static ByteBuf toBytes(Partitioning partitioning) {
@@ -107,6 +101,18 @@ public final class BytesSerializer {
         return buffer;
     }
 
+    static ByteBuf toBytes(Optional<Long> optionalLong) {
+        var buffer = Unpooled.buffer(5);
+        if (optionalLong.isPresent()) {
+            buffer.writeByte(1);
+            buffer.writeIntLE(optionalLong.get().intValue());
+        } else {
+            buffer.writeByte(0);
+            buffer.writeIntLE(0);
+        }
+        return buffer;
+    }
+
     static ByteBuf toBytes(Map<String, HeaderValue> headers) {
         if (headers.isEmpty()) {
             return Unpooled.EMPTY_BUFFER;
@@ -131,7 +137,8 @@ public final class BytesSerializer {
         if (permissions.streams().isEmpty()) {
             buffer.writeByte(0);
         } else {
-            for (Map.Entry<Long, StreamPermissions> entry : permissions.streams().entrySet()) {
+            for (Map.Entry<Long, StreamPermissions> entry :
+                    permissions.streams().entrySet()) {
                 buffer.writeByte(1);
                 buffer.writeIntLE(entry.getKey().intValue());
                 buffer.writeBytes(toBytes(entry.getValue()));
@@ -189,6 +196,13 @@ public final class BytesSerializer {
         return buffer;
     }
 
+    static ByteBuf nameToBytes(String name) {
+        ByteBuf buffer = Unpooled.buffer(1 + name.length());
+        buffer.writeByte(name.length());
+        buffer.writeBytes(name.getBytes());
+        return buffer;
+    }
+
     static ByteBuf toBytesAsU64(BigInteger value) {
         if (value.signum() == -1) {
             throw new IllegalArgumentException("Negative value cannot be serialized to unsigned 64: " + value);
@@ -222,5 +236,4 @@ public final class BytesSerializer {
         }
         return buffer;
     }
-
 }

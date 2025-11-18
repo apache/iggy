@@ -19,43 +19,73 @@ using Apache.Iggy.Enums;
 
 namespace Apache.Iggy.Kinds;
 
+/// <summary>
+///     Consumer identifier
+/// </summary>
 public readonly struct Consumer
 {
+    /// <summary>
+    ///     Consumer type.
+    /// </summary>
     public required ConsumerType Type { get; init; }
-    public required Identifier Id { get; init; }
 
+    /// <summary>
+    ///     Consumer identifier.
+    /// </summary>
+    public required Identifier ConsumerId { get; init; }
+
+    /// <summary>
+    ///     Creates a new regular consumer identifier.
+    /// </summary>
+    /// <param name="id">Identifier value</param>
+    /// <returns>Consumer instance</returns>
     public static Consumer New(int id)
     {
         return new Consumer
         {
-            Id = Identifier.Numeric(id),
+            ConsumerId = Identifier.Numeric(id),
             Type = ConsumerType.Consumer
         };
     }
 
+    /// <summary>
+    ///     Creates a new regular consumer identifier.
+    /// </summary>
+    /// <param name="id">Identifier value</param>
+    /// <returns>Consumer instance</returns>
     public static Consumer New(string id)
     {
         return new Consumer
         {
-            Id = Identifier.String(id),
+            ConsumerId = Identifier.String(id),
             Type = ConsumerType.Consumer
         };
     }
 
+    /// <summary>
+    ///     Creates a new consumer group identifier.
+    /// </summary>
+    /// <param name="id">Identifier value</param>
+    /// <returns>Consumer instance</returns>
     public static Consumer Group(int id)
     {
         return new Consumer
         {
-            Id = Identifier.Numeric(id),
+            ConsumerId = Identifier.Numeric(id),
             Type = ConsumerType.ConsumerGroup
         };
     }
 
+    /// <summary>
+    ///     Creates a new consumer group identifier.
+    /// </summary>
+    /// <param name="id">Identifier value</param>
+    /// <returns>>Consumer instance</returns>
     public static Consumer Group(string id)
     {
         return new Consumer
         {
-            Id = Identifier.String(id),
+            ConsumerId = Identifier.String(id),
             Type = ConsumerType.ConsumerGroup
         };
     }

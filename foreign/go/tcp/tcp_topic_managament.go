@@ -40,7 +40,7 @@ func (tms *IggyTcpClient) GetTopic(streamId iggcon.Identifier, topicId iggcon.Id
 		return nil, err
 	}
 	if len(buffer) == 0 {
-		return nil, ierror.TopicIdNotFound
+		return nil, ierror.ErrTopicIdNotFound
 	}
 
 	topic, err := binaryserialization.DeserializeTopic(buffer)
@@ -58,12 +58,18 @@ func (tms *IggyTcpClient) CreateTopic(
 	compressionAlgorithm iggcon.CompressionAlgorithm,
 	messageExpiry iggcon.Duration,
 	maxTopicSize uint64,
-	replicationFactor *uint8,
-	topicId *uint32,
+    replicationFactor *uint8,
 ) (*iggcon.TopicDetails, error) {
-	if MaxStringLength < len(name) {
-		return nil, ierror.TextTooLong("topic_name")
+	if len(name) == 0 || len(name) > MaxStringLength {
+		return nil, ierror.ErrInvalidTopicName
 	}
+	if partitionsCount > MaxPartitionCount {
+		return nil, ierror.ErrTooManyPartitions
+	}
+	if replicationFactor != nil && *replicationFactor == 0 {
+		return nil, ierror.ErrInvalidReplicationFactor
+	}
+
 	serializedRequest := binaryserialization.TcpCreateTopicRequest{
 		StreamId:             streamId,
 		Name:                 name,
@@ -72,7 +78,6 @@ func (tms *IggyTcpClient) CreateTopic(
 		MessageExpiry:        messageExpiry,
 		MaxTopicSize:         maxTopicSize,
 		ReplicationFactor:    replicationFactor,
-		TopicId:              topicId,
 	}
 	buffer, err := tms.sendAndFetchResponse(serializedRequest.Serialize(), iggcon.CreateTopicCode)
 	if err != nil {
@@ -91,8 +96,11 @@ func (tms *IggyTcpClient) UpdateTopic(
 	maxTopicSize uint64,
 	replicationFactor *uint8,
 ) error {
-	if MaxStringLength < len(name) {
-		return ierror.TextTooLong("topic_name")
+	if len(name) == 0 || len(name) > MaxStringLength {
+		return ierror.ErrInvalidTopicName
+	}
+	if replicationFactor != nil && *replicationFactor == 0 {
+		return ierror.ErrInvalidReplicationFactor
 	}
 	serializedRequest := binaryserialization.TcpUpdateTopicRequest{
 		StreamId:             streamId,

@@ -86,11 +86,11 @@ type IggyMessageOpt func(message *IggyMessage)
 // NewIggyMessage Creates a new message with customizable parameters.
 func NewIggyMessage(payload []byte, opts ...IggyMessageOpt) (IggyMessage, error) {
 	if len(payload) == 0 {
-		return IggyMessage{}, ierror.InvalidMessagePayloadLength
+		return IggyMessage{}, ierror.ErrInvalidMessagePayloadLength
 	}
 
 	if len(payload) > MaxPayloadSize {
-		return IggyMessage{}, ierror.TooBigUserMessagePayload
+		return IggyMessage{}, ierror.ErrTooBigMessagePayload
 	}
 
 	header := NewMessageHeader(MessageID{}, uint32(len(payload)), 0)
@@ -106,7 +106,7 @@ func NewIggyMessage(payload []byte, opts ...IggyMessageOpt) (IggyMessage, error)
 	}
 	userHeaderLength := len(message.UserHeaders)
 	if userHeaderLength > MaxUserHeadersSize {
-		return IggyMessage{}, ierror.TooBigUserHeaders
+		return IggyMessage{}, ierror.ErrTooBigUserHeaders
 	}
 	message.Header.UserHeaderLength = uint32(userHeaderLength)
 	return message, nil

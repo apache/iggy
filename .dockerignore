@@ -13,5 +13,10 @@
 /local_data
 /performance_results
 /scripts
+**/target
 /target
+!/target/debug/iggy
+!/target/debug/iggy-server
+!/target/debug/iggy-mcp
+!/target/debug/iggy-connectors
 /web

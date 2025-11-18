@@ -33,11 +33,7 @@ pub trait StreamClient {
     /// Create a new stream.
     ///
     /// Authentication is required, and the permission to manage the streams.
-    async fn create_stream(
-        &self,
-        name: &str,
-        stream_id: Option<u32>,
-    ) -> Result<StreamDetails, IggyError>;
+    async fn create_stream(&self, name: &str) -> Result<StreamDetails, IggyError>;
     /// Update a stream by unique ID or name.
     ///
     /// Authentication is required, and the permission to manage the streams.

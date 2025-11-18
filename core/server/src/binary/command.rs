@@ -18,8 +18,8 @@
 
 use crate::binary::sender::SenderKind;
 use crate::define_server_command_enum;
+use crate::shard::IggyShard;
 use crate::streaming::session::Session;
-use crate::streaming::systems::system::SharedSystem;
 use bytes::{BufMut, Bytes, BytesMut};
 use enum_dispatch::enum_dispatch;
 use iggy_common::change_password::ChangePassword;
@@ -39,6 +39,7 @@ use iggy_common::delete_topic::DeleteTopic;
 use iggy_common::delete_user::DeleteUser;
 use iggy_common::get_client::GetClient;
 use iggy_common::get_clients::GetClients;
+use iggy_common::get_cluster_metadata::GetClusterMetadata;
 use iggy_common::get_consumer_group::GetConsumerGroup;
 use iggy_common::get_consumer_groups::GetConsumerGroups;
 use iggy_common::get_consumer_offset::GetConsumerOffset;
@@ -66,6 +67,7 @@ use iggy_common::update_stream::UpdateStream;
 use iggy_common::update_topic::UpdateTopic;
 use iggy_common::update_user::UpdateUser;
 use iggy_common::*;
+use std::rc::Rc;
 use strum::EnumString;
 use tracing::error;
 
@@ -76,6 +78,7 @@ define_server_command_enum! {
     GetClient(GetClient), GET_CLIENT_CODE, GET_CLIENT, true;
     GetClients(GetClients), GET_CLIENTS_CODE, GET_CLIENTS, false;
     GetSnapshot(GetSnapshot), GET_SNAPSHOT_FILE_CODE, GET_SNAPSHOT_FILE, false;
+    GetClusterMetadata(GetClusterMetadata), GET_CLUSTER_METADATA_CODE, GET_CLUSTER_METADATA, false;
     PollMessages(PollMessages), POLL_MESSAGES_CODE, POLL_MESSAGES, true;
     FlushUnsavedBuffer(FlushUnsavedBuffer), FLUSH_UNSAVED_BUFFER_CODE, FLUSH_UNSAVED_BUFFER, true;
     GetUser(GetUser), GET_USER_CODE, GET_USER, true;
@@ -130,7 +133,7 @@ pub trait ServerCommandHandler {
         sender: &mut SenderKind,
         length: u32,
         session: &Session,
-        system: &SharedSystem,
+        shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError>;
 }
 
@@ -169,6 +172,11 @@ mod tests {
             &ServerCommand::GetStats(GetStats::default()),
             GET_STATS_CODE,
             &GetStats::default(),
+        );
+        assert_serialized_as_bytes_and_deserialized_from_bytes(
+            &ServerCommand::GetClusterMetadata(GetClusterMetadata::default()),
+            GET_CLUSTER_METADATA_CODE,
+            &GetClusterMetadata::default(),
         );
         assert_serialized_as_bytes_and_deserialized_from_bytes(
             &ServerCommand::GetMe(GetMe::default()),

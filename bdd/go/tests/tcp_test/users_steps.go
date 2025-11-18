@@ -19,6 +19,7 @@ package tcp_test
 
 import (
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
+	ierror "github.com/apache/iggy/foreign/go/errors"
 	"github.com/apache/iggy/foreign/go/iggycli"
 	"github.com/onsi/ginkgo/v2"
 	"github.com/onsi/gomega"
@@ -116,7 +117,7 @@ func itShouldSuccessfullyDeleteUser(userId uint32, client iggycli.Client) {
 	identifier, _ := iggcon.NewIdentifier(userId)
 	user, err := client.GetUser(identifier)
 
-	itShouldReturnSpecificError(err, "resource_not_found")
+	itShouldReturnSpecificError(err, ierror.ErrResourceNotFound)
 	ginkgo.It("should not return user", func() {
 		gomega.Expect(user).To(gomega.BeNil())
 	})

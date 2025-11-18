@@ -20,6 +20,7 @@ use crate::clients::client::IggyClient;
 use crate::http::http_client::HttpClient;
 use crate::quic::quic_client::QuicClient;
 use crate::tcp::tcp_client::TcpClient;
+use crate::websocket::websocket_client::WebSocketClient;
 
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
@@ -28,4 +29,5 @@ pub enum ClientWrapper {
     Http(HttpClient),
     Tcp(TcpClient),
     Quic(QuicClient),
+    WebSocket(WebSocketClient),
 }

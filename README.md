@@ -32,7 +32,7 @@ Iggy provides **exceptionally high throughput and performance** while utilizing 
 
 This is **not yet another extension** running on top of existing infrastructure, such as Kafka or SQL database.
 
-Iggy is a persistent message streaming log **built from the ground up** using low-level I/O for speed and efficiency.
+Iggy is a persistent message streaming log **built from the ground up** using low-level I/O with **thread-per-core shared nothing architecture**, `io_uring` and `compio` for maximum speed and efficiency.
 
 The name is an abbreviation for the Italian Greyhound - small yet extremely fast dogs, the best in their class. See the lovely [Fabio & Cookie](https://www.instagram.com/fabio.and.cookie/) ❤️
 
@@ -42,12 +42,13 @@ The name is an abbreviation for the Italian Greyhound - small yet extremely fast
 
 - **Highly performant**, persistent append-only log for message streaming
 - **Very high throughput** for both writes and reads
-- **Low latency and predictable resource usage** thanks to the Rust compiled language (no GC)
+- **Low latency and predictable resource usage** thanks to the Rust compiled language (no GC) and `io_uring`.
 - **User authentication and authorization** with granular permissions and Personal Access Tokens (PAT)
 - Support for multiple streams, topics and partitions
 - Support for **multiple transport protocols** (QUIC, TCP, HTTP)
 - Fully operational RESTful API which can be optionally enabled
 - Available client SDK in multiple languages
+- **Thread per core shared nothing design** together with `io_uring` guarantee the best possible performance on modern `Linux` systems.
 - **Works directly with binary data**, avoiding enforced schema and serialization/deserialization overhead
 - Custom **zero-copy (de)serialization**, which greatly improves the performance and reduces memory usage.
 - Configurable server features (e.g. caching, segment size, data flush interval, transport protocols etc.)
@@ -92,14 +93,13 @@ This is the high-level architecture of the Iggy message streaming server, where 
 
 The official releases follow the regular semver (`0.5.0`) or have `latest` tag applied (`apache/iggy:latest`).
 
-We do also publish edge/dev/nightly releases (e.g. `0.5.0-edge.1` or `apache/iggy:edge`), for both, SDKs and the Docker images, which are typically compatible with the latest changes, but are not guaranteed to be stable, and as the name states, are not recommended for production use.
+We do also publish edge/dev/nightly releases (e.g. `0.6.0-edge.1` or `apache/iggy:edge`), for both, SDKs and the Docker images, which are typically compatible with the latest changes, but are not guaranteed to be stable, and as the name states, are not recommended for production use.
 
 ---
 
 ## Roadmap
 
-- **Shared-nothing** design and **io_uring** support (PoC on experimental branch, WiP on the main branch)
-- **Clustering** & data replication based on **[VSR](https://pmg.csail.mit.edu/papers/vr-revisited.pdf)** (on sandbox project using Raft, will be implemented after shared-nothing design is completed)
+- **Clustering** & data replication based on **[VSR](http://pmg.csail.mit.edu/papers/vr-revisited.pdf)** (on sandbox project using Raft, will be implemented after shared-nothing design is completed)
 
 ---
 
@@ -126,7 +126,7 @@ Iggy CLI can be installed with `cargo install iggy-cli` and then simply accessed
 
 ## Web UI
 
-There's a dedicated Web UI for the server, which allows managing the streams, topics, partitions, browsing the messages and so on. This is an ongoing effort to build a comprehensive dashboard for administrative purposes of the Iggy server. Check the Web UI in the `/web` directory. The [docker image for Web UI](https://hub.docker.com/r/iggyrs/iggy-web-ui) is available, and can be fetched via `docker pull iggyrs/iggy-web-ui`.
+There's a dedicated Web UI for the server, which allows managing the streams, topics, partitions, browsing the messages and so on. This is an ongoing effort to build a comprehensive dashboard for administrative purposes of the Iggy server. Check the Web UI in the `/web` directory. The [docker image for Web UI](https://hub.docker.com/r/apache/iggy-web-ui) is available, and can be fetched via `docker pull apache/iggy-web-ui`.
 
 ![Web UI](assets/web_ui.png)
 
@@ -175,7 +175,7 @@ The [Model Context Protocol](https://modelcontextprotocol.io) (MCP) is an open p
 
 The official Apache Iggy images can be found in [Docker Hub](https://hub.docker.com/r/apache/iggy), simply type `docker pull apache/iggy` to pull the image.
 
-You can also find the images for all the different tooling such as Connectors, MCP Server etc. [here](https://hub.docker.com/u/apache?page=1&search=iggy).
+You can also find the images for all the different tooling such as Connectors, MCP Server etc. at [Docker Hub](https://hub.docker.com/u/apache?page=1&search=iggy).
 
 Please note that the images tagged as `latest` are based on the official, stable releases, while the `edge` ones are updated directly from latest version of the `master` branch.
 
@@ -184,6 +184,19 @@ You can find the `Dockerfile` and `docker-compose` in the root of the repository
 Additionally, you can run the `CLI` which is available in the running container, by executing: `docker exec -it iggy-server /iggy`.
 
 Keep in mind that running the container on the OS other than Linux, where the Docker is running in the VM, might result in the performance degradation.
+
+Also, when running the container, **make sure to include the additional capabilities**, as you can find in [docker-compose](https://github.com/apache/iggy/blob/master/docker-compose.yml) file:
+
+```yml
+cap_add:
+  - SYS_NICE
+security_opt:
+  - seccomp:unconfined
+ulimits:
+  memlock:
+    soft: -1
+    hard: -1
+```
 
 ---
 
@@ -209,9 +222,41 @@ Run the tests:
 
 `cargo test`
 
+Set root user credentials (OPTIONAL):
+
+Iggy requires credentials to authenticate request to the server.
+You can set the root user **before** starting the server.
+
+(macOS/Linux)
+
+```bash
+export IGGY_ROOT_USERNAME=iggy
+export IGGY_ROOT_PASSWORD=iggy
+```
+
+(Windows(Powershell))
+
+```bash
+$env:IGGY_ROOT_USERNAME = "iggy"
+$env:IGGY_ROOT_PASSWORD = "iggy"
+```
+
+By default, `iggy-server` will generate a randomized root user password and print it to `stdout`, when there's
+NO users created.
+
 Start the server:
 
 `cargo run --bin iggy-server`
+
+All the data used by the server will be persisted under the `local_data` directory by default, unless specified differently in the configuration (see `system.path` in `server.toml`).
+
+One can use default root credentials with optional `--with-default-root-credentials`.
+This flag is equivalent to setting `IGGY_ROOT_USERNAME=iggy` and `IGGY_ROOT_PASSWORD=iggy`, plus
+it should only be used for development and testing.
+
+`cargo run --bin iggy-server -- --with-default-root-credentials`
+
+Root credentials are only set on the first server startup when the data directory doesn't exist yet. Once the server has been started and persisted data exists, the existing root credentials will be reused, and the `--with-default-root-credentials` flag or environment variables will have no effect. To reset credentials, delete the data directory.
 
 For configuration options and detailed help:
 
@@ -228,6 +273,9 @@ You can also use environment variables to override any configuration setting:
 - Enable HTTP transport
    `IGGY_HTTP_ENABLED=true cargo run --bin iggy-server`
 
+- Set custom root user credentials
+   `IGGY_ROOT_USERNAME=iggy IGGY_ROOT_PASSWORD=iggy cargo run --bin iggy-server`
+
 To quickly generate the sample data:
 
 `cargo run --bin data-seeder-tool`
@@ -236,39 +284,39 @@ To quickly generate the sample data:
 
 Create a stream with name `dev` (numerical ID will be assigned by server automatically) using default credentials and `tcp` transport (available transports: `quic`, `tcp`, `http`, default `tcp`):
 
-`cargo run --bin iggy -- --transport tcp --username iggy --password iggy stream create dev`
+`cargo run --bin iggy -- --transport tcp --username <iggy_username> --password <iggy_password> stream create dev`
 
 List available streams:
 
-`cargo run --bin iggy -- --username iggy --password iggy stream list`
+`cargo run --bin iggy -- --username <iggy_username> --password <iggy_password> stream list`
 
 Get `dev` stream details:
 
-`cargo run --bin iggy -- -u iggy -p iggy stream get dev`
+`cargo run --bin iggy -- -u <iggy_username> -p <iggy_password> stream get dev`
 
 Create a topic named `sample` (numerical ID will be assigned by server automatically) for stream `dev`, with 2 partitions (IDs 1 and 2), disabled compression (`none`) and disabled message expiry (skipped optional parameter):
 
-`cargo run --bin iggy -- -u iggy -p iggy topic create dev sample 2 none`
+`cargo run --bin iggy -- -u <iggy_username> -p <iggy_password> topic create dev sample 2 none`
 
 List available topics for stream `dev`:
 
-`cargo run --bin iggy -- -u iggy -p iggy topic list dev`
+`cargo run --bin iggy -- -u <iggy_username> -p <iggy_password> topic list dev`
 
 Get topic details for topic `sample` in stream `dev`:
 
-`cargo run --bin iggy -- -u iggy -p iggy topic get dev sample`
+`cargo run --bin iggy -- -u <iggy_username> -p <iggy_password> topic get dev sample`
 
 Send a message 'hello world' (message ID 1) to the stream `dev` to topic `sample` and partition 1:
 
-`cargo run --bin iggy -- -u iggy -p iggy message send --partition-id 1 dev sample "hello world"`
+`cargo run --bin iggy -- -u <iggy_username> -p <iggy_password> message send --partition-id 1 dev sample "hello world"`
 
 Send another message 'lorem ipsum' (message ID 2) to the same stream, topic and partition:
 
-`cargo run --bin iggy -- -u iggy -p iggy message send --partition-id 1 dev sample "lorem ipsum"`
+`cargo run --bin iggy -- -u <iggy_username> -p <iggy_password> message send --partition-id 1 dev sample "lorem ipsum"`
 
 Poll messages by a regular consumer with ID 1 from the stream `dev` for topic `sample` and partition with ID 1, starting with offset 0, messages count 2, without auto commit (storing consumer offset on server):
 
-`cargo run --bin iggy -- -u iggy -p iggy message poll --consumer 1 --offset 0 --message-count 2 --auto-commit dev sample 1`
+`cargo run --bin iggy -- -u <iggy_username> -p <iggy_password> message poll --consumer 1 --offset 0 --message-count 2 --auto-commit dev sample 1`
 
 Finally, restart the server to see it is able to load the persisted data.
 
@@ -407,9 +455,7 @@ These benchmarks would start the server with the default configuration, create a
 
 For example, to run the benchmark for the already started server, provide the additional argument `--server-address 0.0.0.0:8090`.
 
-Depending on the hardware, transport protocol (`quic`, `tcp` or `http`) and payload size (`messages-per-batch * message-size`) you might expect **over 5000 MB/s (e.g. 5M of 1 KB msg/sec) throughput for writes and reads**.
-
-**Iggy is already capable of processing millions of messages per second at the microseconds range for p99+ latency**, and with the upcoming optimizations related to the io_uring support along with the shared-nothing design, it will only get better.
+ **Iggy is already capable of processing millions of messages per second at the microseconds range for p99+ latency** Depending on the hardware, transport protocol (`quic`, `tcp` or `http`) and payload size (`messages-per-batch * message-size`) you might expect **over 5000 MB/s (e.g. 5M of 1 KB msg/sec) throughput for writes and reads**.
 
 Please refer to the mentioned [benchmarking platform](https://benchmarks.iggy.apache.org) where you can browse the results achieved on the different hardware configurations, using the different Iggy server versions.
 

@@ -25,7 +25,7 @@ use crate::actors::{ApiLabel, BatchMetrics, BenchmarkInit};
 pub struct BenchmarkConsumerConfig {
     pub consumer_id: u32,
     pub consumer_group_id: Option<u32>,
-    pub stream_id: u32,
+    pub stream_id: String,
     pub messages_per_batch: BenchmarkNumericParameter,
     pub warmup_time: IggyDuration,
     pub polling_kind: PollingKind,

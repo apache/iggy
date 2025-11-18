@@ -16,10 +16,11 @@
  * under the License.
  */
 
-use crate::test_server::{ClientFactory, Transport};
+use crate::test_server::ClientFactory;
 use async_trait::async_trait;
 use iggy::prelude::{Client, ClientWrapper, QuicClientConfig};
 use iggy::quic::quic_client::QuicClient;
+use iggy_common::TransportProtocol;
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
@@ -32,6 +33,8 @@ impl ClientFactory for QuicClientFactory {
     async fn create_client(&self) -> ClientWrapper {
         let config = QuicClientConfig {
             server_address: self.server_addr.clone(),
+            // TODO: Need to increase this in order to not timeout during tests
+            max_idle_timeout: 2_000_000,
             ..QuicClientConfig::default()
         };
         let client = QuicClient::create(Arc::new(config)).unwrap();
@@ -39,8 +42,8 @@ impl ClientFactory for QuicClientFactory {
         ClientWrapper::Quic(client)
     }
 
-    fn transport(&self) -> Transport {
-        Transport::Quic
+    fn transport(&self) -> TransportProtocol {
+        TransportProtocol::Quic
     }
 
     fn server_addr(&self) -> String {

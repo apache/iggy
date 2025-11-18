@@ -16,9 +16,13 @@
  * under the License.
  */
 
+use bytes::Bytes;
 use iggy::prelude::{IggyMessage as RustIggyMessage, IggyMessageHeader};
-use pyo3::prelude::*;
-use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
+use pyo3::{prelude::*, types::PyBytes};
+use pyo3_stub_gen::{
+    derive::{gen_stub_pyclass, gen_stub_pymethods},
+    impl_stub_type,
+};
 use std::str::FromStr;
 
 /// A Python class representing a message to be sent.
@@ -54,14 +58,29 @@ impl Clone for SendMessage {
 #[gen_stub_pymethods]
 #[pymethods]
 impl SendMessage {
-    /// Constructs a new `SendMessage` instance from a string.
+    /// Constructs a new `SendMessage` instance from a string or bytes.
     ///
     /// This method allows for the creation of a `SendMessage` instance
-    /// directly from Python using the provided string data.
+    /// directly from Python using the provided string or bytes data.
     #[new]
-    pub fn new(data: String) -> Self {
+    pub fn new(py: Python, data: PyMessagePayload) -> Self {
         // TODO: handle errors
-        let inner = RustIggyMessage::from_str(&data).unwrap();
+        let inner = match data {
+            PyMessagePayload::String(data) => RustIggyMessage::from_str(&data).unwrap(),
+            PyMessagePayload::Bytes(data) => {
+                let bytes = Bytes::from(data.extract::<Vec<u8>>(py).unwrap());
+                RustIggyMessage::builder().payload(bytes).build().unwrap()
+            }
+        };
         Self { inner }
     }
 }
+
+#[derive(FromPyObject, IntoPyObject)]
+pub enum PyMessagePayload {
+    #[pyo3(transparent, annotation = "str")]
+    String(String),
+    #[pyo3(transparent, annotation = "bytes")]
+    Bytes(Py<PyBytes>),
+}
+impl_stub_type!(PyMessagePayload = String | PyBytes);

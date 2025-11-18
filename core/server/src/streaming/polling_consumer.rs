@@ -20,25 +20,43 @@ use crate::streaming::utils::hash;
 use iggy_common::{IdKind, Identifier};
 use std::fmt::{Display, Formatter};
 
+#[derive(Debug, PartialEq, Eq, Hash, Copy, Clone)]
+pub struct ConsumerGroupId(pub usize);
+
+impl Display for ConsumerGroupId {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Hash, Copy, Clone)]
+pub struct MemberId(pub usize);
+
+impl Display for MemberId {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 #[derive(Debug, PartialEq, Copy, Clone)]
 pub enum PollingConsumer {
-    Consumer(u32, u32),      // Consumer ID + Partition ID
-    ConsumerGroup(u32, u32), // Consumer Group ID + Member ID
+    Consumer(usize, usize),                   // Consumer ID + Partition ID
+    ConsumerGroup(ConsumerGroupId, MemberId), // Consumer Group ID + Member ID
 }
 
 impl PollingConsumer {
-    pub fn consumer(consumer_id: &Identifier, partition_id: u32) -> Self {
+    pub fn consumer(consumer_id: &Identifier, partition_id: usize) -> Self {
         PollingConsumer::Consumer(Self::resolve_consumer_id(consumer_id), partition_id)
     }
 
-    pub fn consumer_group(consumer_group_id: u32, member_id: u32) -> Self {
-        PollingConsumer::ConsumerGroup(consumer_group_id, member_id)
+    pub fn consumer_group(consumer_group_id: usize, member_id: usize) -> Self {
+        PollingConsumer::ConsumerGroup(ConsumerGroupId(consumer_group_id), MemberId(member_id))
     }
 
-    pub fn resolve_consumer_id(identifier: &Identifier) -> u32 {
+    pub fn resolve_consumer_id(identifier: &Identifier) -> usize {
         match identifier.kind {
-            IdKind::Numeric => identifier.get_u32_value().unwrap(),
-            IdKind::String => hash::calculate_32(&identifier.value),
+            IdKind::Numeric => identifier.get_u32_value().unwrap() as usize,
+            IdKind::String => hash::calculate_32(&identifier.value) as usize,
         }
     }
 }
@@ -75,7 +93,7 @@ mod tests {
 
         assert_eq!(
             polling_consumer,
-            PollingConsumer::Consumer(consumer_id_value, partition_id)
+            PollingConsumer::Consumer(consumer_id_value as usize, partition_id)
         );
     }
 
@@ -103,8 +121,8 @@ mod tests {
 
         match polling_consumer {
             PollingConsumer::ConsumerGroup(consumer_group_id, member_id) => {
-                assert_eq!(consumer_group_id, group_id);
-                assert_eq!(member_id, client_id);
+                assert_eq!(consumer_group_id, ConsumerGroupId(group_id));
+                assert_eq!(member_id, MemberId(client_id));
             }
             _ => panic!("Expected ConsumerGroup"),
         }

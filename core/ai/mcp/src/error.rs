@@ -1,4 +1,5 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
  * regarding copyright ownership.  The ASF licenses this file
@@ -22,8 +23,6 @@ use thiserror::Error;
 pub enum McpRuntimeError {
     #[error("Failed to create service")]
     FailedToCreateService,
-    #[error("Missing configuration")]
-    MissingConfig,
     #[error("Failed to start HTTP server")]
     FailedToStartHttpServer,
     #[error("Iggy client error")]
@@ -32,6 +31,8 @@ pub enum McpRuntimeError {
     IggyError(#[from] iggy::prelude::IggyError),
     #[error("Missing Iggy credentials")]
     MissingIggyCredentials,
+    #[error("Missing TLS certificate file")]
+    MissingTlsCertificateFile,
     #[error("Failed to create Iggy consumer ID")]
     FailedToCreateConsumerId,
     #[error("Invalid API path")]

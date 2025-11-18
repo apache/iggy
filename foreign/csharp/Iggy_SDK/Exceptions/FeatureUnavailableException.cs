@@ -17,8 +17,14 @@
 
 namespace Apache.Iggy.Exceptions;
 
+/// <summary>
+///     Exception thrown when a feature is not available.
+/// </summary>
 public sealed class FeatureUnavailableException : Exception
 {
+    /// <summary>
+    ///     Initializes a new instance of the <see cref="FeatureUnavailableException" /> class.
+    /// </summary>
     public FeatureUnavailableException() : base("This feature is not available.")
     {
     }

@@ -28,9 +28,11 @@ import org.apache.iggy.user.UserStatus;
 import org.jetbrains.annotations.NotNull;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+
 import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
+
 import static org.assertj.core.api.Assertions.assertThat;
 
 public abstract class UsersClientBaseTest extends IntegrationTest {
@@ -49,7 +51,7 @@ public abstract class UsersClientBaseTest extends IntegrationTest {
 
         // then
         assertThat(identityInfo).isNotNull();
-        assertThat(identityInfo.userId()).isEqualTo(1L);
+        assertThat(identityInfo.userId()).isEqualTo(0L);
     }
 
     @Test
@@ -58,7 +60,7 @@ public abstract class UsersClientBaseTest extends IntegrationTest {
         login();
 
         // when
-        var user = usersClient.getUser(1L);
+        var user = usersClient.getUser(0L);
 
         // then
         assertThat(user).isPresent();
@@ -70,15 +72,21 @@ public abstract class UsersClientBaseTest extends IntegrationTest {
         login();
 
         // when
-        var createdUser = usersClient.createUser("test",
+        var createdUser = usersClient.createUser(
+                "test",
                 "test",
                 UserStatus.Active,
                 Optional.of(new Permissions(createGlobalPermissions(true), Collections.emptyMap())));
+        trackUser(createdUser.id());
 
         // then
         assertThat(createdUser).isNotNull();
-        assertThat(createdUser.permissions().map(Permissions::global).map(
-            GlobalPermissions::manageServers).orElse(false)).isTrue();
+        assertThat(createdUser
+                        .permissions()
+                        .map(Permissions::global)
+                        .map(GlobalPermissions::manageServers)
+                        .orElse(false))
+                .isTrue();
 
         // when
         List<UserInfo> users = usersClient.getUsers();
@@ -100,6 +108,7 @@ public abstract class UsersClientBaseTest extends IntegrationTest {
         // given
         login();
         UserInfoDetails user = usersClient.createUser("test", "test", UserStatus.Active, Optional.empty());
+        trackUser(user.id());
 
         // when
         usersClient.updateUser(user.id(), Optional.empty(), Optional.of(UserStatus.Inactive));
@@ -115,18 +124,22 @@ public abstract class UsersClientBaseTest extends IntegrationTest {
         var permissions = new Permissions(createGlobalPermissions(true), Collections.emptyMap());
         login();
         UserInfoDetails user = usersClient.createUser("test", "test", UserStatus.Active, Optional.of(permissions));
+        trackUser(user.id());
 
         // when
-        usersClient.updatePermissions(user.id(), Optional.of(new Permissions(createGlobalPermissions(false), Collections.emptyMap())));
+        usersClient.updatePermissions(
+                user.id(), Optional.of(new Permissions(createGlobalPermissions(false), Collections.emptyMap())));
 
         // then
         var updatedUser = usersClient.getUser(user.id());
         assertThat(updatedUser).isPresent();
-        assertThat(updatedUser.get()
-                .permissions()
-                .map(Permissions::global)
-                .map(GlobalPermissions::manageServers)
-                .orElse(true)).isFalse();
+        assertThat(updatedUser
+                        .get()
+                        .permissions()
+                        .map(Permissions::global)
+                        .map(GlobalPermissions::manageServers)
+                        .orElse(true))
+                .isFalse();
     }
 
     @Test
@@ -141,6 +154,9 @@ public abstract class UsersClientBaseTest extends IntegrationTest {
 
         // then
         assertThat(newLogin).isNotNull();
+
+        // restore original password for other tests
+        usersClient.changePassword(identity.userId(), "new-pass", "iggy");
     }
 
     @Test
@@ -158,5 +174,4 @@ public abstract class UsersClientBaseTest extends IntegrationTest {
     private static @NotNull GlobalPermissions createGlobalPermissions(boolean manageServers) {
         return new GlobalPermissions(manageServers, false, false, false, false, false, false, false, false, false);
     }
-
 }

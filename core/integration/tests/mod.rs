@@ -25,9 +25,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Once};
 use std::{panic, thread};
 
-mod archiver;
 mod cli;
 mod config_provider;
+mod connectors;
 mod data_integrity;
 mod mcp;
 mod sdk;

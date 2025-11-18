@@ -23,11 +23,9 @@ import org.apache.iggy.client.blocking.IggyClientBuilder;
 
 public final class Iggy {
 
-    private Iggy() {
-    }
+    private Iggy() {}
 
     public static IggyClientBuilder clientBuilder() {
         return new IggyClientBuilder();
     }
-
 }

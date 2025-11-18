@@ -23,8 +23,10 @@ import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
+
 import java.math.BigInteger;
 import java.util.Arrays;
+
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
@@ -67,10 +69,8 @@ class BytesSerializerTest {
             var value = BigInteger.valueOf(-1);
 
             // when & then
-            assertThatThrownBy(() -> BytesSerializer.toBytesAsU64(value))
-                    .isInstanceOf(IllegalArgumentException.class);
+            assertThatThrownBy(() -> BytesSerializer.toBytesAsU64(value)).isInstanceOf(IllegalArgumentException.class);
         }
-
     }
 
     @Nested
@@ -90,7 +90,6 @@ class BytesSerializerTest {
             // then
             assertThat(bytesAsU128).isEqualByComparingTo(Unpooled.wrappedBuffer(maxU128, 1, 16));
         }
-
 
         @Test
         void shouldSerializeZero() {
@@ -112,9 +111,7 @@ class BytesSerializerTest {
             var value = BigInteger.valueOf(-1);
 
             // when & then
-            assertThatThrownBy(() -> BytesSerializer.toBytesAsU128(value))
-                    .isInstanceOf(IllegalArgumentException.class);
+            assertThatThrownBy(() -> BytesSerializer.toBytesAsU128(value)).isInstanceOf(IllegalArgumentException.class);
         }
     }
-
 }

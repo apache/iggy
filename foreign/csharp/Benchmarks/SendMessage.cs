@@ -17,7 +17,7 @@
 
 using System.Diagnostics;
 using System.Text;
-using Apache.Iggy.Contracts.Http;
+using Apache.Iggy.Contracts;
 using Apache.Iggy.IggyClient;
 using Apache.Iggy.Kinds;
 using Apache.Iggy.Messages;
@@ -39,13 +39,7 @@ public static class SendMessage
         for (var i = 0; i < messagesBatch; i++)
         {
             var startTime = Stopwatch.GetTimestamp();
-            await bus.SendMessagesAsync(new MessageSendRequest
-            {
-                StreamId = streamId,
-                TopicId = topicId,
-                Partitioning = Partitioning.PartitionId(1),
-                Messages = messages
-            });
+            await bus.SendMessagesAsync(streamId, topicId, Partitioning.PartitionId(1), messages);
             var diff = Stopwatch.GetElapsedTime(startTime);
             latencies.Add(diff);
         }

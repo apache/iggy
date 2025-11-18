@@ -1,4 +1,5 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
  * regarding copyright ownership.  The ASF licenses this file
@@ -16,7 +17,7 @@
  * under the License.
  */
 
-use crate::configs::{ConfigFormat, StreamConsumerConfig, TransformsConfig};
+use crate::configs::connectors::{ConfigFormat, StreamConsumerConfig, TransformsConfig};
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::Mutex;
 

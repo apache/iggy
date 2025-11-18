@@ -17,6 +17,7 @@
  */
 
 mod binary_client;
+mod binary_cluster_client;
 mod binary_consumer_group_client;
 mod binary_consumer_offset_client;
 mod binary_message_client;

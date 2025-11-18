@@ -28,7 +28,7 @@ pub struct Identity {
     pub ip_address: SocketAddr,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct JwtClaims {
     pub jti: String,
     pub iss: String,

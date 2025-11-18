@@ -19,7 +19,7 @@
 use bytes::Bytes;
 use iggy_common::{
     BytesSerializable, CacheMetrics, CacheMetricsKey, ClientInfo, ClientInfoDetails,
-    CompressionAlgorithm, ConsumerGroup, ConsumerGroupDetails, ConsumerGroupInfo,
+    ClusterMetadata, CompressionAlgorithm, ConsumerGroup, ConsumerGroupDetails, ConsumerGroupInfo,
     ConsumerGroupMember, ConsumerOffsetInfo, IdentityInfo, IggyByteSize, IggyError, IggyExpiry,
     MaxTopicSize, Partition, Permissions, PersonalAccessTokenInfo, RawPersonalAccessToken, Stats,
     Stream, StreamDetails, Topic, TopicDetails, UserInfo, UserInfoDetails, UserStatus,
@@ -898,7 +898,7 @@ fn map_to_client_info(
             .map_err(|_| IggyError::InvalidNumberEncoding)?,
     );
     let user_id = match user_id {
-        0 => None,
+        u32::MAX => None,
         _ => Some(user_id),
     };
 
@@ -989,4 +989,8 @@ fn map_to_pat_info(
     };
     let read_bytes = 1 + name_length as usize + 8;
     Ok((PersonalAccessTokenInfo { name, expiry_at }, read_bytes))
+}
+
+pub fn map_cluster_metadata(payload: Bytes) -> Result<ClusterMetadata, IggyError> {
+    ClusterMetadata::from_bytes(payload)
 }

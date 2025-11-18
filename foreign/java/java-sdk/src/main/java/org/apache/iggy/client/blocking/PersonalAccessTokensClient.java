@@ -22,6 +22,7 @@ package org.apache.iggy.client.blocking;
 import org.apache.iggy.personalaccesstoken.PersonalAccessTokenInfo;
 import org.apache.iggy.personalaccesstoken.RawPersonalAccessToken;
 import org.apache.iggy.user.IdentityInfo;
+
 import java.math.BigInteger;
 import java.util.List;
 
@@ -34,5 +35,4 @@ public interface PersonalAccessTokensClient {
     void deletePersonalAccessToken(String name);
 
     IdentityInfo loginWithPersonalAccessToken(String token);
-
 }

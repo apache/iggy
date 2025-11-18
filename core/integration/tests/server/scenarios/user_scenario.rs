@@ -37,7 +37,7 @@ pub async fn run(client_factory: &dyn ClientFactory) {
     // 3. Login as root user
     let identity_info = login_root(&client).await;
 
-    assert_eq!(identity_info.user_id, 1);
+    assert_eq!(identity_info.user_id, 0);
 
     // 4. List all users
     let users = client.get_users().await.unwrap();
@@ -45,7 +45,7 @@ pub async fn run(client_factory: &dyn ClientFactory) {
 
     // 5. Get user details
     let user = users.first().unwrap();
-    assert_eq!(user.id, 1);
+    assert_eq!(user.id, 0);
     assert!(user.created_at.as_micros() > 0);
     assert_eq!(user.username, DEFAULT_ROOT_USERNAME);
     assert_eq!(user.status, UserStatus::Active);
@@ -56,7 +56,7 @@ pub async fn run(client_factory: &dyn ClientFactory) {
         .unwrap()
         .expect("Failed to get user");
 
-    assert_eq!(user.id, 1);
+    assert_eq!(user.id, 0);
     assert!(user.created_at.as_micros() > 0);
     assert_eq!(user.username, DEFAULT_ROOT_USERNAME);
     assert_eq!(user.status, UserStatus::Active);
@@ -102,7 +102,7 @@ pub async fn run(client_factory: &dyn ClientFactory) {
     // 9. Login as the new user
     let identity_info = client.login_user(test_user, test_password).await.unwrap();
 
-    assert_eq!(identity_info.user_id, 2);
+    assert_eq!(identity_info.user_id, 1);
 
     // 10. Trying to create a new user (or any other resource) without the appropriate permissions should fail
     let create_user_result = client
@@ -168,14 +168,14 @@ pub async fn run(client_factory: &dyn ClientFactory) {
         .await
         .unwrap();
 
-    assert_eq!(identity_info.user_id, 2);
+    assert_eq!(identity_info.user_id, 1);
 
     let identity_info = client
         .login_with_personal_access_token(&raw_pat2.token)
         .await
         .unwrap();
 
-    assert_eq!(identity_info.user_id, 2);
+    assert_eq!(identity_info.user_id, 1);
 
     // 17. Delete the personal access tokens
     client

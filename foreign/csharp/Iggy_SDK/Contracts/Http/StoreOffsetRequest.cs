@@ -15,13 +15,23 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using System.Text.Json.Serialization;
+using Apache.Iggy.JsonConverters;
 using Apache.Iggy.Kinds;
 
 namespace Apache.Iggy.Contracts.Http;
 
-public sealed class StoreOffsetRequest
+internal sealed class StoreOffsetRequest
 {
-    public required Consumer Consumer { get; init; }
-    public required uint? PartitionId { get; init; }
-    public required ulong Offset { get; init; }
+    [JsonConverter(typeof(ConsumerConverter))]
+    public Consumer ConsumerId { get; init; }
+    public uint? PartitionId { get; init; }
+    public ulong Offset { get; init; }
+
+    public StoreOffsetRequest(Consumer consumer, uint? partitionId, ulong offset)
+    {
+        ConsumerId = consumer;
+        PartitionId = partitionId;
+        Offset = offset;
+    }
 }

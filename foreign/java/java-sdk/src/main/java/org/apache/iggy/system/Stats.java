@@ -43,6 +43,4 @@ public record Stats(
         String hostname,
         String osName,
         String osVersion,
-        String kernelVersion
-) {
-}
+        String kernelVersion) {}

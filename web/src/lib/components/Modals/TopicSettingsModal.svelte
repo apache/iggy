@@ -8,10 +8,10 @@
   import Input from '../Input.svelte';
   import ModalBase from './ModalBase.svelte';
   import { setError, superForm, defaults } from 'sveltekit-superforms/client';
-  import { zod } from 'sveltekit-superforms/adapters';
+  import { zod4 } from 'sveltekit-superforms/adapters';
   import { fetchRouteApi } from '$lib/api/fetchRouteApi';
-  import { dataHas } from '$lib/utils/dataHas';
   import { goto } from '$app/navigation';
+  import { resolve } from '$app/paths';
   import { showToast } from '../AppToasts.svelte';
   import ModalConfirmation from '../ModalConfirmation.svelte';
   import { browser } from '$app/environment';
@@ -40,10 +40,10 @@
   });
 
   const { form, errors, enhance, constraints, submitting, tainted } = superForm(
-    defaults(zod(schema)),
+    defaults(zod4(schema)),
     {
       SPA: true,
-      validators: zod(schema),
+      validators: zod4(schema),
       invalidateAll: false,
       taintedMessage: false,
       async onUpdate({ form }) {
@@ -61,10 +61,36 @@
           }
         });
 
-        if (dataHas(data, 'field', 'reason')) {
-          return setError(form, data.field, data.reason);
+        if (!ok) {
+          // Handle API errors
+          if (data?.field && data?.reason) {
+            // Field-specific error - show in form
+            return setError(form, data.field, data.reason);
+          } else if (data?.reason) {
+            // General error with reason - show toast
+            let errorMessage = data.reason;
+            if (data.code && data.id) {
+              errorMessage += `\n${data.code} (${data.id})`;
+            } else if (data.code) {
+              errorMessage += `\n${data.code}`;
+            }
+            showToast({
+              type: 'error',
+              description: errorMessage,
+              duration: 5000
+            });
+          } else {
+            // Fallback error message
+            showToast({
+              type: 'error',
+              description: 'Operation failed',
+              duration: 5000
+            });
+          }
+          return;
         }
 
+        // Success
         if (ok) {
           closeModal(async () => {
             await customInvalidateAll();
@@ -92,7 +118,7 @@
       if (ok) {
         closeModal(async () => {
           if (!browser) return;
-          await goto(onDeleteRedirectPath);
+          await goto(resolve(onDeleteRedirectPath));
           await customInvalidateAll();
           showToast({
             type: 'success',
@@ -113,22 +139,15 @@
     on:result={onConfirmationResult}
   >
     {#snippet message()}
-
-        Deleting the topic "<span class="font-semibold">{topic.name}</span>" will permenently remove
-        all associated <span class="font-semibold">partitions ({topic.partitionsCount})</span> and
-        <span class="font-semibold">messages ({topic.messagesCount})</span>.
-
-      {/snippet}
+      Deleting the topic "<span class="font-semibold">{topic.name}</span>" will permenently remove
+      all associated <span class="font-semibold">partitions ({topic.partitionsCount})</span> and
+      <span class="font-semibold">messages ({topic.messagesCount})</span>.
+    {/snippet}
   </ModalConfirmation>
 
   <div class="h-[400px] flex flex-col">
-    <form method="POST" class="flex flex-col gap-4 flex-[3] pb-5" use:enhance>
-      <Input
-        name="name"
-        label="Name"
-        bind:value={$form.name}
-        errorMessage={$errors.name?.join(',')}
-      />
+    <form method="POST" class="flex flex-col gap-4 flex-3 pb-5" use:enhance>
+      <Input name="name" label="Name" bind:value={$form.name} errorMessage={$errors.name?.[0]} />
 
       <Input
         label="Message expiry"
@@ -136,10 +155,10 @@
         name="messageExpiry"
         bind:value={$form.message_expiry}
         {...$constraints.message_expiry}
-        errorMessage={$errors.message_expiry?.join(',')}
+        errorMessage={$errors.message_expiry?.[0]}
       />
 
-      <span class="-mt-1 text-xs text-shadeD200 dark:text-shadeL700">
+      <span class="-mt-1 text-xs text-shade-d200 dark:text-shade-l700">
         {#if !$form.message_expiry || $form.message_expiry > numberSizes.max.u32}
           {#if $form.message_expiry === 0}
             never
@@ -161,7 +180,7 @@
     </form>
 
     <div class="relative w-full flex-1">
-      <div class="h-[1px] border-b absolute -left-7 -right-7"></div>
+      <div class="h-px border-b absolute -left-7 -right-7"></div>
       <h2 class="text-xl text-color font-semibold mb-7 mt-5">Delete topic</h2>
 
       <form class="w-full">

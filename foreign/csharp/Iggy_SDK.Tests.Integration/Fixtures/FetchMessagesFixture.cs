@@ -17,79 +17,50 @@
 
 using System.Text;
 using Apache.Iggy.Contracts.Http;
+using Apache.Iggy.Enums;
 using Apache.Iggy.Headers;
-using Apache.Iggy.Kinds;
+using Apache.Iggy.IggyClient;
 using Apache.Iggy.Messages;
 using Apache.Iggy.Tests.Integrations.Helpers;
-using Apache.Iggy.Tests.Integrations.Models;
+using TUnit.Core.Interfaces;
+using Partitioning = Apache.Iggy.Kinds.Partitioning;
 
 namespace Apache.Iggy.Tests.Integrations.Fixtures;
 
-public class FetchMessagesFixture : IggyServerFixture
+public class FetchMessagesFixture : IAsyncInitializer
 {
-    public readonly CreateTopicRequest HeadersTopicRequest = TopicFactory.CreateTopic(2);
-    public readonly int MessageCount = 20;
-    public readonly uint StreamId = 1;
-    public readonly CreateTopicRequest TopicDummyHeaderRequest = TopicFactory.CreateTopic(4);
-    public readonly CreateTopicRequest TopicDummyRequest = TopicFactory.CreateTopic(3);
-    public readonly CreateTopicRequest TopicRequest = TopicFactory.CreateTopic();
+    internal readonly int MessageCount = 20;
+    internal readonly string StreamId = "FetchMessagesStream";
+    internal readonly CreateTopicRequest TopicHeadersRequest = TopicFactory.CreateTopic("HeadersTopic");
+    internal readonly CreateTopicRequest TopicRequest = TopicFactory.CreateTopic("Topic");
 
-    public override async Task InitializeAsync()
+    [ClassDataSource<IggyServerFixture>(Shared = SharedType.PerAssembly)]
+    public required IggyServerFixture IggyServerFixture { get; init; }
+
+    public Dictionary<Protocol, IIggyClient> Clients { get; set; } = new();
+
+    public async Task InitializeAsync()
     {
-        await base.InitializeAsync();
-
-        var request = new MessageSendRequest
+        Clients = await IggyServerFixture.CreateClients();
+        foreach (KeyValuePair<Protocol, IIggyClient> client in Clients)
         {
-            StreamId = Identifier.Numeric(StreamId),
-            TopicId = Identifier.Numeric(TopicRequest.TopicId!.Value),
-            Partitioning = Partitioning.None(),
-            Messages = CreateMessagesWithoutHeader(MessageCount)
-        };
+            var streamId = Identifier.String(StreamId.GetWithProtocol(client.Key));
 
-        var requestWithHeaders = new MessageSendRequest
-        {
-            StreamId = Identifier.Numeric(StreamId),
-            TopicId = Identifier.Numeric(HeadersTopicRequest.TopicId!.Value),
-            Partitioning = Partitioning.None(),
-            Messages = CreateMessagesWithHeader(MessageCount)
-        };
+            await client.Value.CreateStreamAsync(streamId.GetString());
+            await client.Value.CreateTopicAsync(streamId, TopicRequest.Name,
+                TopicRequest.PartitionsCount);
+            await client.Value.CreateTopicAsync(streamId, TopicHeadersRequest.Name,
+                TopicHeadersRequest.PartitionsCount);
 
-        var requestDummyMessage = new MessageSendRequest<DummyMessage>
-        {
-            StreamId = Identifier.Numeric(StreamId),
-            TopicId = Identifier.Numeric(TopicDummyRequest.TopicId!.Value),
-            Partitioning = Partitioning.None(),
-            Messages = CreateDummyMessagesWithoutHeader(MessageCount)
-        };
+            await client.Value.SendMessagesAsync(streamId, Identifier.String(TopicRequest.Name), Partitioning.None(),
+                CreateMessagesWithoutHeader(MessageCount));
 
-        var requestDummyMessageWithHeaders = new MessageSendRequest<DummyMessage>
-        {
-            StreamId = Identifier.Numeric(StreamId),
-            TopicId = Identifier.Numeric(TopicDummyHeaderRequest.TopicId!.Value),
-            Partitioning = Partitioning.None(),
-            Messages = CreateDummyMessagesWithoutHeader(MessageCount)
-        };
-
-        foreach (var client in Clients.Values)
-        {
-            await client.CreateStreamAsync("Test Stream", StreamId);
-            await client.CreateTopicAsync(Identifier.Numeric(StreamId), TopicRequest.Name, TopicRequest.PartitionsCount, topicId: TopicRequest.TopicId);
-            await client.CreateTopicAsync(Identifier.Numeric(StreamId), TopicDummyRequest.Name, TopicDummyRequest.PartitionsCount, topicId: TopicDummyRequest.TopicId);
-            await client.CreateTopicAsync(Identifier.Numeric(StreamId), HeadersTopicRequest.Name, HeadersTopicRequest.PartitionsCount, topicId: HeadersTopicRequest.TopicId);
-            await client.CreateTopicAsync(Identifier.Numeric(StreamId), TopicDummyHeaderRequest.Name, TopicDummyHeaderRequest.PartitionsCount, topicId: TopicDummyHeaderRequest.TopicId);
-
-            await client.SendMessagesAsync(request);
-            await client.SendMessagesAsync(requestDummyMessage, message => message.SerializeDummyMessage());
-            await client.SendMessagesAsync(requestWithHeaders);
-            await client.SendMessagesAsync(requestDummyMessageWithHeaders, message => message.SerializeDummyMessage(), headers: new Dictionary<HeaderKey, HeaderValue>
-            {
-                { HeaderKey.New("header1"), HeaderValue.FromString("value1") },
-                { HeaderKey.New("header2"), HeaderValue.FromInt32(14) }
-            });
+            await client.Value.SendMessagesAsync(streamId, Identifier.String(TopicHeadersRequest.Name),
+                Partitioning.None(), CreateMessagesWithHeader(MessageCount));
         }
     }
 
-    private static List<Message> CreateMessagesWithoutHeader(int count)
+    private static Message[] CreateMessagesWithoutHeader(int count)
     {
         var messages = new List<Message>();
         for (var i = 0; i < count; i++)
@@ -105,25 +76,10 @@ public class FetchMessagesFixture : IggyServerFixture
             messages.Add(new Message(Guid.NewGuid(), Encoding.UTF8.GetBytes(dummyJson)));
         }
 
-        return messages;
+        return messages.ToArray();
     }
 
-    private static List<DummyMessage> CreateDummyMessagesWithoutHeader(int count)
-    {
-        var messages = new List<DummyMessage>();
-        for (var i = 0; i < count; i++)
-        {
-            messages.Add(new DummyMessage
-            {
-                Text = $"Dummy message {i}",
-                Id = i
-            });
-        }
-
-        return messages;
-    }
-
-    private static List<Message> CreateMessagesWithHeader(int count)
+    private static Message[] CreateMessagesWithHeader(int count)
     {
         var messages = new List<Message>();
         for (var i = 0; i < count; i++)
@@ -136,13 +92,14 @@ public class FetchMessagesFixture : IggyServerFixture
                                 "completed": false
                               }
                               """;
-            messages.Add(new Message(Guid.NewGuid(), Encoding.UTF8.GetBytes(dummyJson), new Dictionary<HeaderKey, HeaderValue>
-            {
-                { HeaderKey.New("header1"), HeaderValue.FromString("value1") },
-                { HeaderKey.New("header2"), HeaderValue.FromInt32(14 + i) }
-            }));
+            messages.Add(new Message(Guid.NewGuid(), Encoding.UTF8.GetBytes(dummyJson),
+                new Dictionary<HeaderKey, HeaderValue>
+                {
+                    { HeaderKey.New("header1"), HeaderValue.FromString("value1") },
+                    { HeaderKey.New("header2"), HeaderValue.FromInt32(14 + i) }
+                }));
         }
 
-        return messages;
+        return messages.ToArray();
     }
 }

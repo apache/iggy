@@ -19,9 +19,10 @@
 
 package org.apache.iggy.client.blocking.http;
 
-import org.junit.jupiter.api.Test;
 import org.apache.iggy.client.blocking.IggyBaseClient;
 import org.apache.iggy.client.blocking.UsersClientBaseTest;
+import org.junit.jupiter.api.Test;
+
 import static org.assertj.core.api.Assertions.assertThat;
 
 class UsersHttpClientTest extends UsersClientBaseTest {
@@ -30,7 +31,6 @@ class UsersHttpClientTest extends UsersClientBaseTest {
     protected IggyBaseClient getClient() {
         return HttpClientFactory.create(iggyServer);
     }
-
 
     @Test
     void shouldGetTokens() {
@@ -42,5 +42,4 @@ class UsersHttpClientTest extends UsersClientBaseTest {
         assertThat(identityInfo.accessToken()).isPresent();
         assertThat(identityInfo.accessToken().get().token()).isNotBlank();
     }
-
 }

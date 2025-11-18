@@ -15,37 +15,39 @@
 // // specific language governing permissions and limitations
 // // under the License.
 
-using Apache.Iggy.Contracts.Http;
+using Apache.Iggy.Contracts;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
 using Apache.Iggy.Messages;
+using Apache.Iggy.Tests.Integrations.Attributes;
 using Apache.Iggy.Tests.Integrations.Fixtures;
 using Apache.Iggy.Tests.Integrations.Helpers;
 using Shouldly;
+using TUnit.Core.Logging;
 using Partitioning = Apache.Iggy.Kinds.Partitioning;
 
 namespace Apache.Iggy.Tests.Integrations;
 
-[MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
-public class StreamsTests(Protocol protocol)
+public class StreamsTests
 {
-    private const string Name = "test-stream";
-    private const uint StreamId = 1;
+    private const string Name = "StreamTests";
 
+    [ClassDataSource<StreamsFixture>(Shared = SharedType.PerClass)]
+    public required StreamsFixture Fixture { get; init; }
 
-    [ClassDataSource<IggyServerFixture>(Shared = SharedType.PerClass)]
-    public required IggyServerFixture Fixture { get; init; }
 
     [Test]
-    public async Task CreateStream_HappyPath_Should_CreateStream_Successfully()
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task CreateStream_HappyPath_Should_CreateStream_Successfully(Protocol protocol)
     {
-        var response = await Fixture.Clients[protocol].CreateStreamAsync(Name, StreamId);
+        var response = await Fixture.Clients[protocol]
+            .CreateStreamAsync(Name.GetWithProtocol(protocol));
 
         response.ShouldNotBeNull();
-        response.Id.ShouldBe(StreamId);
-        response.Name.ShouldBe(Name);
+        response.Id.ShouldBeGreaterThanOrEqualTo(0u);
+        response.Name.ShouldBe(Name.GetWithProtocol(protocol));
         response.Size.ShouldBe(0u);
-        response.CreatedAt.UtcDateTime.ShouldBe(DateTimeOffset.UtcNow.UtcDateTime, TimeSpan.FromSeconds(20));
+        response.CreatedAt.UtcDateTime.ShouldBe(DateTimeOffset.UtcNow.UtcDateTime, TimeSpan.FromMinutes(1));
         response.MessagesCount.ShouldBe(0u);
         response.TopicsCount.ShouldBe(0);
         response.Topics.ShouldBeEmpty();
@@ -53,93 +55,110 @@ public class StreamsTests(Protocol protocol)
 
     [Test]
     [DependsOn(nameof(CreateStream_HappyPath_Should_CreateStream_Successfully))]
-    public async Task CreateStream_Duplicate_Should_Throw_InvalidResponse()
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task CreateStream_Duplicate_Should_Throw_InvalidResponse(Protocol protocol)
     {
-        await Should.ThrowAsync<InvalidResponseException>(Fixture.Clients[protocol].CreateStreamAsync(Name, StreamId));
+        await Should.ThrowAsync<IggyInvalidStatusCodeException>(Fixture.Clients[protocol]
+            .CreateStreamAsync(Name.GetWithProtocol(protocol)));
     }
 
     [Test]
     [DependsOn(nameof(CreateStream_Duplicate_Should_Throw_InvalidResponse))]
-    public async Task GetStreams_Should_ReturnValidResponse()
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task GetStreams_Should_ReturnValidResponse(Protocol protocol)
     {
-        await Fixture.Clients[protocol].CreateStreamAsync("Test Stream 2", 2);
+        await Fixture.Clients[protocol].CreateStreamAsync("test-stream-2".GetWithProtocol(protocol));
 
         IReadOnlyList<StreamResponse> response = await Fixture.Clients[protocol].GetStreamsAsync();
 
         response.ShouldNotBeNull();
-        response.Count.ShouldBe(2);
-        response.ShouldContain(x => x.Id == 1);
-        response.ShouldContain(x => x.Id == 2);
+        response.Count.ShouldBeGreaterThanOrEqualTo(2);
+        response.ShouldContain(x => x.Name == Name.GetWithProtocol(protocol));
+        response.ShouldContain(x => x.Name == "test-stream-2".GetWithProtocol(protocol));
     }
 
     [Test]
     [DependsOn(nameof(GetStreams_Should_ReturnValidResponse))]
-    public async Task GetStreamById_Should_ReturnValidResponse()
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task GetStreamById_Should_ReturnValidResponse(Protocol protocol)
     {
-        var response = await Fixture.Clients[protocol].GetStreamByIdAsync(Identifier.Numeric(StreamId));
+        var newStream = await Fixture.Clients[protocol].CreateStreamAsync("test-stream-3".GetWithProtocol(protocol));
+        newStream.ShouldNotBeNull();
+
+        var response = await Fixture.Clients[protocol]
+            .GetStreamByIdAsync(Identifier.Numeric(newStream.Id));
         response.ShouldNotBeNull();
-        response.Id.ShouldBe(StreamId);
-        response.Name.ShouldBe(Name);
+        response.Id.ShouldBe(newStream.Id);
+        response.Name.ShouldBe(newStream.Name);
         response.Size.ShouldBe(0u);
-        response.CreatedAt.UtcDateTime.ShouldBe(DateTimeOffset.UtcNow.UtcDateTime, TimeSpan.FromSeconds(20));
+        response.CreatedAt.UtcDateTime.ShouldBe(DateTimeOffset.UtcNow.UtcDateTime, TimeSpan.FromMinutes(1));
+        response.MessagesCount.ShouldBe(0u);
+        response.TopicsCount.ShouldBe(0);
+        response.Topics.ShouldBeEmpty();
+    }
+
+
+    [Test]
+    [DependsOn(nameof(GetStreamById_Should_ReturnValidResponse))]
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task GetStreams_ByStreamName_Should_ReturnValidResponse(Protocol protocol)
+    {
+        var name = "test-stream-3".GetWithProtocol(protocol);
+        var response = await Fixture.Clients[protocol].GetStreamByIdAsync(Identifier.String(name));
+
+        response.ShouldNotBeNull();
+        response.Id.ShouldNotBe(0u);
+        response.Name.ShouldBe(name);
+        response.Size.ShouldBe(0u);
+        response.CreatedAt.UtcDateTime.ShouldBe(DateTimeOffset.UtcNow.UtcDateTime, TimeSpan.FromMinutes(1));
         response.MessagesCount.ShouldBe(0u);
         response.TopicsCount.ShouldBe(0);
         response.Topics.ShouldBeEmpty();
     }
 
     [Test]
-    [DependsOn(nameof(GetStreamById_Should_ReturnValidResponse))]
-    public async Task GetStreamById_WithTopics_Should_ReturnValidResponse()
+    [DependsOn(nameof(GetStreams_ByStreamName_Should_ReturnValidResponse))]
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task GetStreamById_WithTopics_Should_ReturnValidResponse(Protocol protocol)
     {
-        var topicRequest1 = TopicFactory.CreateTopic(messageExpiry: 100_000);
-        var topicRequest2 = TopicFactory.CreateTopic(2, messageExpiry: 100_000);
+        var topicRequest1 = TopicFactory.CreateTopic("Topic1", messageExpiry: 100_000);
+        var topicRequest2 = TopicFactory.CreateTopic("Topic2", messageExpiry: 100_000);
 
-        await Fixture.Clients[protocol].CreateTopicAsync(Identifier.Numeric(StreamId), topicRequest1.Name,
-            topicRequest1.PartitionsCount, messageExpiry: topicRequest1.MessageExpiry, topicId: topicRequest1.TopicId);
-        await Fixture.Clients[protocol].CreateTopicAsync(Identifier.Numeric(StreamId), topicRequest2.Name,
-            topicRequest2.PartitionsCount, messageExpiry: topicRequest2.MessageExpiry, topicId: topicRequest2.TopicId);
+        await Fixture.Clients[protocol].CreateTopicAsync(Identifier.String(Name.GetWithProtocol(protocol)),
+            topicRequest1.Name, topicRequest1.PartitionsCount, messageExpiry: topicRequest1.MessageExpiry);
+        await Fixture.Clients[protocol].CreateTopicAsync(Identifier.String(Name.GetWithProtocol(protocol)),
+            topicRequest2.Name, topicRequest2.PartitionsCount, messageExpiry: topicRequest2.MessageExpiry);
+
+        await Fixture.Clients[protocol].SendMessagesAsync(Identifier.String(Name.GetWithProtocol(protocol)),
+            Identifier.String(topicRequest1.Name), Partitioning.None(),
+            [
+                new Message(Guid.NewGuid(), "Test message 1"u8.ToArray()),
+                new Message(Guid.NewGuid(), "Test message 2"u8.ToArray()),
+                new Message(Guid.NewGuid(), "Test message 3"u8.ToArray())
+            ]);
 
 
-        await Fixture.Clients[protocol].SendMessagesAsync(new MessageSendRequest
-        {
-            Partitioning = Partitioning.None(),
-            StreamId = Identifier.Numeric(1),
-            TopicId = Identifier.Numeric(topicRequest1.TopicId!.Value),
-            Messages = new List<Message>
-            {
-                new(Guid.NewGuid(), "Test message 1"u8.ToArray()),
-                new(Guid.NewGuid(), "Test message 2"u8.ToArray()),
-                new(Guid.NewGuid(), "Test message 3"u8.ToArray())
-            }
-        });
+        await Fixture.Clients[protocol].SendMessagesAsync(Identifier.String(Name.GetWithProtocol(protocol)),
+            Identifier.String(topicRequest2.Name), Partitioning.None(), [
+                new Message(Guid.NewGuid(), "Test message 4"u8.ToArray()),
+                new Message(Guid.NewGuid(), "Test message 5"u8.ToArray()),
+                new Message(Guid.NewGuid(), "Test message 6"u8.ToArray()),
+                new Message(Guid.NewGuid(), "Test message 7"u8.ToArray())
+            ]);
 
-        await Fixture.Clients[protocol].SendMessagesAsync(new MessageSendRequest
-        {
-            Partitioning = Partitioning.None(),
-            StreamId = Identifier.Numeric(1),
-            TopicId = Identifier.Numeric(2),
-            Messages = new List<Message>
-            {
-                new(Guid.NewGuid(), "Test message 4"u8.ToArray()),
-                new(Guid.NewGuid(), "Test message 5"u8.ToArray()),
-                new(Guid.NewGuid(), "Test message 6"u8.ToArray()),
-                new(Guid.NewGuid(), "Test message 7"u8.ToArray())
-            }
-        });
-
-        var response = await Fixture.Clients[protocol].GetStreamByIdAsync(Identifier.Numeric(StreamId));
+        var response = await Fixture.Clients[protocol]
+            .GetStreamByIdAsync(Identifier.String(Name.GetWithProtocol(protocol)));
         response.ShouldNotBeNull();
-        response.Id.ShouldBe(StreamId);
-        response.Name.ShouldBe(Name);
+        response.Id.ShouldBeGreaterThanOrEqualTo(0u);
+        response.Name.ShouldBe(Name.GetWithProtocol(protocol));
         response.Size.ShouldBe(490u);
-        response.CreatedAt.UtcDateTime.ShouldBe(DateTimeOffset.UtcNow.UtcDateTime, TimeSpan.FromSeconds(20));
+        response.CreatedAt.UtcDateTime.ShouldBe(DateTimeOffset.UtcNow.UtcDateTime, TimeSpan.FromMinutes(1));
         response.MessagesCount.ShouldBe(7u);
         response.TopicsCount.ShouldBe(2);
         response.Topics.Count().ShouldBe(2);
 
-        var topic = response.Topics.First(x => x.Id == topicRequest1.TopicId!.Value);
-        topic.Id.ShouldBe(topicRequest1.TopicId!.Value);
-        topic.CreatedAt.UtcDateTime.ShouldBe(DateTimeOffset.UtcNow.UtcDateTime, TimeSpan.FromSeconds(10));
+        var topic = response.Topics.First(x => x.Name == topicRequest1.Name);
+        topic.CreatedAt.UtcDateTime.ShouldBe(DateTimeOffset.UtcNow.UtcDateTime, TimeSpan.FromMinutes(1));
         topic.Name.ShouldBe(topicRequest1.Name);
         topic.CompressionAlgorithm.ShouldBe(topicRequest1.CompressionAlgorithm);
         topic.Partitions.ShouldBeNull();
@@ -153,28 +172,40 @@ public class StreamsTests(Protocol protocol)
 
     [Test]
     [DependsOn(nameof(GetStreamById_WithTopics_Should_ReturnValidResponse))]
-    public async Task UpdateStream_Should_UpdateStream_Successfully()
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task UpdateStream_Should_UpdateStream_Successfully(Protocol protocol)
     {
-        await Fixture.Clients[protocol].UpdateStreamAsync(Identifier.Numeric(StreamId), "updated-test-stream");
+        var streamToUpdate = await Fixture.Clients[protocol]
+            .CreateStreamAsync("stream-to-update".GetWithProtocol(protocol));
+        streamToUpdate.ShouldNotBeNull();
 
-        var result = await Fixture.Clients[protocol].GetStreamByIdAsync(Identifier.Numeric(StreamId!));
+        await Fixture.Clients[protocol].UpdateStreamAsync(Identifier.String(streamToUpdate.Name),
+            "updated-test-stream".GetWithProtocol(protocol));
+
+        var result = await Fixture.Clients[protocol]
+            .GetStreamByIdAsync(Identifier.Numeric(streamToUpdate.Id));
         result.ShouldNotBeNull();
-        result.Name.ShouldBe("updated-test-stream");
+        result.Name.ShouldBe("updated-test-stream".GetWithProtocol(protocol));
     }
 
     [Test]
     [DependsOn(nameof(UpdateStream_Should_UpdateStream_Successfully))]
-    public async Task PurgeStream_Should_PurgeStream_Successfully()
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task PurgeStream_Should_PurgeStream_Successfully(Protocol protocol)
     {
         // Ensure the stream has messages (created in previous steps) before purging
-        var stream = await Fixture.Clients[protocol].GetStreamByIdAsync(Identifier.Numeric(StreamId!));
+        var stream = await Fixture.Clients[protocol]
+            .GetStreamByIdAsync(Identifier.String(Name.GetWithProtocol(protocol)));
+
         stream.ShouldNotBeNull();
         stream.MessagesCount.ShouldBe(7u);
         stream.TopicsCount.ShouldBe(2);
 
-        await Should.NotThrowAsync(() => Fixture.Clients[protocol].PurgeStreamAsync(Identifier.Numeric(StreamId)));
+        await Should.NotThrowAsync(() =>
+            Fixture.Clients[protocol].PurgeStreamAsync(Identifier.String(Name.GetWithProtocol(protocol))));
 
-        stream = await Fixture.Clients[protocol].GetStreamByIdAsync(Identifier.Numeric(StreamId));
+        stream = await Fixture.Clients[protocol]
+            .GetStreamByIdAsync(Identifier.String(Name.GetWithProtocol(protocol)));
         stream.ShouldNotBeNull();
         stream.MessagesCount.ShouldBe(0u);
         stream.TopicsCount.ShouldBe(2);
@@ -182,22 +213,34 @@ public class StreamsTests(Protocol protocol)
 
     [Test]
     [DependsOn(nameof(PurgeStream_Should_PurgeStream_Successfully))]
-    public async Task DeleteStream_Should_DeleteStream_Successfully()
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task DeleteStream_Should_DeleteStream_Successfully(Protocol protocol)
     {
-        await Should.NotThrowAsync(() => Fixture.Clients[protocol].DeleteStreamAsync(Identifier.Numeric(StreamId)));
+        var streamToDelete = await Fixture.Clients[protocol]
+            .CreateStreamAsync("stream-to-delete".GetWithProtocol(protocol));
+        streamToDelete.ShouldNotBeNull();
+
+        await Should.NotThrowAsync(() =>
+            Fixture.Clients[protocol].DeleteStreamAsync(Identifier.Numeric(streamToDelete.Id)));
     }
 
     [Test]
     [DependsOn(nameof(DeleteStream_Should_DeleteStream_Successfully))]
-    public async Task DeleteStream_NotExists_Should_Throw_InvalidResponse()
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task DeleteStream_NotExists_Should_Throw_InvalidResponse(Protocol protocol)
     {
-        await Should.ThrowAsync<InvalidResponseException>(() => Fixture.Clients[protocol].DeleteStreamAsync(Identifier.Numeric(StreamId)));
+        await Should.ThrowAsync<IggyInvalidStatusCodeException>(() =>
+            Fixture.Clients[protocol].DeleteStreamAsync(Identifier.String("stream-to-delete".GetWithProtocol(protocol))));
     }
 
     [Test]
     [DependsOn(nameof(DeleteStream_NotExists_Should_Throw_InvalidResponse))]
-    public async Task GetStreamById_AfterDelete_Should_Throw_InvalidResponse()
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task GetStreamById_AfterDelete_Should_Throw_InvalidResponse(Protocol protocol)
     {
-        await Should.ThrowAsync<InvalidResponseException>(() => Fixture.Clients[protocol].GetStreamByIdAsync(Identifier.Numeric(StreamId)));
+        var stream = await Fixture.Clients[protocol]
+            .GetStreamByIdAsync(Identifier.String("stream-to-delete".GetWithProtocol(protocol)));
+
+        stream.ShouldBeNull();
     }
 }

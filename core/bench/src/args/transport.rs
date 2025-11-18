@@ -19,10 +19,11 @@
 use super::defaults::{
     DEFAULT_HTTP_SERVER_ADDRESS, DEFAULT_QUIC_CLIENT_ADDRESS, DEFAULT_QUIC_SERVER_ADDRESS,
     DEFAULT_QUIC_SERVER_NAME, DEFAULT_QUIC_VALIDATE_CERTIFICATE, DEFAULT_TCP_SERVER_ADDRESS,
+    DEFAULT_WEBSOCKET_SERVER_ADDRESS,
 };
 use super::{output::BenchmarkOutputCommand, props::BenchmarkTransportProps};
 use clap::{Parser, Subcommand};
-use integration::test_server::Transport;
+use iggy::prelude::TransportProtocol;
 use serde::{Serialize, Serializer};
 
 #[derive(Subcommand, Debug, Clone)]
@@ -30,6 +31,8 @@ pub enum BenchmarkTransportCommand {
     Http(HttpArgs),
     Tcp(TcpArgs),
     Quic(QuicArgs),
+    #[command(alias = "ws")]
+    WebSocket(WebSocketArgs),
 }
 
 impl Serialize for BenchmarkTransportCommand {
@@ -41,13 +44,14 @@ impl Serialize for BenchmarkTransportCommand {
             Self::Http(_) => "http",
             Self::Tcp(_) => "tcp",
             Self::Quic(_) => "quic",
+            Self::WebSocket(_) => "websocket",
         };
         serializer.serialize_str(variant_str)
     }
 }
 
 impl BenchmarkTransportProps for BenchmarkTransportCommand {
-    fn transport(&self) -> &Transport {
+    fn transport(&self) -> &TransportProtocol {
         self.inner().transport()
     }
 
@@ -72,6 +76,7 @@ impl BenchmarkTransportProps for BenchmarkTransportCommand {
             Self::Http(args) => args,
             Self::Tcp(args) => args,
             Self::Quic(args) => args,
+            Self::WebSocket(args) => args,
         }
     }
 
@@ -92,8 +97,8 @@ pub struct HttpArgs {
 }
 
 impl BenchmarkTransportProps for HttpArgs {
-    fn transport(&self) -> &Transport {
-        &Transport::Http
+    fn transport(&self) -> &TransportProtocol {
+        &TransportProtocol::Http
     }
 
     fn server_address(&self) -> &str {
@@ -149,8 +154,8 @@ pub struct TcpArgs {
 }
 
 impl BenchmarkTransportProps for TcpArgs {
-    fn transport(&self) -> &Transport {
-        &Transport::Tcp
+    fn transport(&self) -> &TransportProtocol {
+        &TransportProtocol::Tcp
     }
 
     fn server_address(&self) -> &str {
@@ -198,8 +203,8 @@ pub struct QuicArgs {
 }
 
 impl BenchmarkTransportProps for QuicArgs {
-    fn transport(&self) -> &Transport {
-        &Transport::Quic
+    fn transport(&self) -> &TransportProtocol {
+        &TransportProtocol::Quic
     }
 
     fn server_address(&self) -> &str {
@@ -216,6 +221,43 @@ impl BenchmarkTransportProps for QuicArgs {
 
     fn nodelay(&self) -> bool {
         panic!("Setting nodelay for QUIC transport is not supported!")
+    }
+
+    fn output_command(&self) -> Option<&BenchmarkOutputCommand> {
+        self.output.as_ref()
+    }
+}
+
+#[derive(Parser, Debug, Clone)]
+pub struct WebSocketArgs {
+    /// Address of the WebSocket iggy-server
+    #[arg(long, default_value_t = DEFAULT_WEBSOCKET_SERVER_ADDRESS.to_owned())]
+    pub server_address: String,
+
+    /// Optional output command, used to output results (charts, raw json data) to a directory
+    #[command(subcommand)]
+    pub output: Option<BenchmarkOutputCommand>,
+}
+
+impl BenchmarkTransportProps for WebSocketArgs {
+    fn transport(&self) -> &TransportProtocol {
+        &TransportProtocol::WebSocket
+    }
+
+    fn server_address(&self) -> &str {
+        &self.server_address
+    }
+
+    fn validate_certificate(&self) -> bool {
+        panic!("Cannot validate certificate for WebSocket transport!")
+    }
+
+    fn client_address(&self) -> &str {
+        panic!("Setting client address for WebSocket transport is not supported!")
+    }
+
+    fn nodelay(&self) -> bool {
+        panic!("Setting nodelay for WebSocket transport is not supported!")
     }
 
     fn output_command(&self) -> Option<&BenchmarkOutputCommand> {

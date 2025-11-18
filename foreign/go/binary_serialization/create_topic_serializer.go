@@ -30,13 +30,9 @@ type TcpCreateTopicRequest struct {
 	MaxTopicSize         uint64                      `json:"maxTopicSize"`
 	Name                 string                      `json:"name"`
 	ReplicationFactor    *uint8                      `json:"replicationFactor"`
-	TopicId              *uint32                     `json:"topicId"`
 }
 
 func (request *TcpCreateTopicRequest) Serialize() []byte {
-	if request.TopicId == nil {
-		request.TopicId = new(uint32)
-	}
 	if request.ReplicationFactor == nil {
 		request.ReplicationFactor = new(uint8)
 	}
@@ -44,8 +40,7 @@ func (request *TcpCreateTopicRequest) Serialize() []byte {
 	streamIdBytes := SerializeIdentifier(request.StreamId)
 	nameBytes := []byte(request.Name)
 
-	totalLength := len(streamIdBytes) + // StreamId
-		4 + // TopicId
+    totalLength := len(streamIdBytes) + // StreamId
 		4 + // PartitionsCount
 		1 + // CompressionAlgorithm
 		8 + // MessageExpiry
@@ -60,10 +55,6 @@ func (request *TcpCreateTopicRequest) Serialize() []byte {
 	// StreamId
 	copy(bytes[position:], streamIdBytes)
 	position += len(streamIdBytes)
-
-	// TopicId
-	binary.LittleEndian.PutUint32(bytes[position:], *request.TopicId)
-	position += 4
 
 	// PartitionsCount
 	binary.LittleEndian.PutUint32(bytes[position:], request.PartitionsCount)

@@ -99,5 +99,4 @@ public class IggyHttpClient implements IggyBaseClient {
     public PersonalAccessTokensClient personalAccessTokens() {
         return personalAccessTokensHttpClient;
     }
-
 }

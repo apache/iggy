@@ -5,12 +5,11 @@
   import { openModal } from '$lib/components/Modals/AppModals.svelte';
   import SortableList from '$lib/components/SortableList.svelte';
   import { typedRoute } from '$lib/types/appRoutes';
-  import { arrayMax } from '$lib/utils/arrayMax';
   import type { StreamDetails } from '$lib/domain/StreamDetails';
 
   interface Props {
     data: {
-      streamDetails: StreamDetails
+      streamDetails: StreamDetails;
     };
   }
 
@@ -28,9 +27,7 @@
     class="ml-3"
     onclick={() => openModal('StreamSettingsModal', { stream })}
   >
-    {#snippet children()}
-      <Icon name="settings" class="dark:text-white" />
-    {/snippet}
+    <Icon name="settings" class="dark:text-white" />
     {#snippet tooltip()}
       <div>Settings</div>
     {/snippet}
@@ -56,8 +53,7 @@
     class="ml-auto"
     onclick={() =>
       openModal('AddTopicModal', {
-        streamDetails: stream,
-        nextTopicId: arrayMax(data.streamDetails.topics.map((t) => t.id)) + 1
+        streamDetails: stream
       })}
   >
     <Icon name="plus" class="w-[16px] h-[16px]" strokeWidth={2} />
@@ -82,4 +78,3 @@
     sizeBytes: undefined
   }}
 />
-

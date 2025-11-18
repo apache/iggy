@@ -18,9 +18,23 @@
 
 namespace Apache.Iggy.Enums;
 
+/// <summary>
+///     Specifies the partitioning strategy selection.
+/// </summary>
 public enum Partitioning
 {
+    /// <summary>
+    ///     Partition ID is calculated by the server using the round-robin algorithm.
+    /// </summary>
     Balanced = 1,
+
+    /// <summary>
+    ///     Partition ID is specified by the user.
+    /// </summary>
     PartitionId = 2,
+
+    /// <summary>
+    ///     Partition ID is calculated by hashing the message key.
+    /// </summary>
     MessageKey = 3
 }

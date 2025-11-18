@@ -47,6 +47,7 @@ impl FromStr for MeasurementType {
 }
 
 #[derive(Properties, PartialEq)]
+#[allow(dead_code)]
 pub struct MeasurementTypeSelectorProps {
     pub selected_measurement: MeasurementType,
     pub on_measurement_select: Callback<MeasurementType>,

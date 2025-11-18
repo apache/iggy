@@ -20,6 +20,7 @@
 package org.apache.iggy.topic;
 
 import org.apache.iggy.partition.Partition;
+
 import java.math.BigInteger;
 import java.util.List;
 
@@ -34,10 +35,10 @@ public record TopicDetails(
         Short replicationFactor,
         BigInteger messagesCount,
         Long partitionsCount,
-        List<Partition> partitions
-) {
+        List<Partition> partitions) {
     public TopicDetails(Topic topic, List<Partition> partitions) {
-        this(topic.id(),
+        this(
+                topic.id(),
                 topic.createdAt(),
                 topic.name(),
                 topic.size(),
