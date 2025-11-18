@@ -1,4 +1,5 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
  * regarding copyright ownership.  The ASF licenses this file
@@ -306,14 +307,12 @@ impl StateStorage for FileStateStorage {
             .await
             .map_err(|e| Error::Storage(format!("Failed to read directory entry: {e}")))?
         {
-            if let Some(extension) = entry.path().extension() {
-                if extension == "json" {
-                    if let Some(stem) = entry.path().file_stem() {
-                        if let Some(id) = stem.to_str() {
-                            states.push(id.to_string());
-                        }
-                    }
-                }
+            if let Some(extension) = entry.path().extension()
+                && extension == "json"
+                && let Some(stem) = entry.path().file_stem()
+                && let Some(id) = stem.to_str()
+            {
+                states.push(id.to_string());
             }
         }
 
