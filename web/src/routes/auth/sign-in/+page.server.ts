@@ -32,6 +32,8 @@ const schema = z.object({
   password: z.string().min(4)
 });
 
+type FormSchema = z.infer<typeof schema>;
+
 export const load = async () => {
   const form = await superValidate(zod4(schema));
 
@@ -53,6 +55,8 @@ export const actions = {
       path: '/users/login',
       body: { username, password }
     });
+
+    console.log(result);
 
     if (!(result instanceof Response) || !result.ok) {
       return message(form, 'Username or password is not valid', { status: 403 });

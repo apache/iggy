@@ -77,7 +77,7 @@ pub(crate) struct ConsumerOffsetGetArgs {
     #[arg(value_parser = clap::value_parser!(Identifier))]
     pub(crate) topic_id: Identifier,
     /// Partitions ID for which consumer offset is retrieved
-    #[arg(value_parser = clap::value_parser!(u32).range(1..))]
+    #[arg(value_parser = clap::value_parser!(u32).range(0..))]
     pub(crate) partition_id: u32,
     /// Consumer kind: "consumer" for regular consumer, "consumer_group" for consumer group
     #[arg(short = 'k', long = "kind", default_value = "consumer", value_enum)]
@@ -103,7 +103,7 @@ pub(crate) struct ConsumerOffsetSetArgs {
     #[arg(value_parser = clap::value_parser!(Identifier))]
     pub(crate) topic_id: Identifier,
     /// Partitions ID for which consumer offset is set
-    #[arg(value_parser = clap::value_parser!(u32).range(1..))]
+    #[arg(value_parser = clap::value_parser!(u32).range(0..))]
     pub(crate) partition_id: u32,
     /// Offset to set
     pub(crate) offset: u64,

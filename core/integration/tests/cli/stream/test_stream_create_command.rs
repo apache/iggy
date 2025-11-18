@@ -25,12 +25,15 @@ use serial_test::parallel;
 
 struct TestStreamCreateCmd {
     stream_id: Option<u32>,
-    name: String,
+    stream_name: String,
 }
 
 impl TestStreamCreateCmd {
     fn new(stream_id: Option<u32>, name: String) -> Self {
-        Self { stream_id, name }
+        Self {
+            stream_id,
+            stream_name: name,
+        }
     }
 
     fn to_args(&self) -> Vec<String> {
@@ -41,7 +44,7 @@ impl TestStreamCreateCmd {
             args.push(format!("{stream_id}"));
         }
 
-        args.push(self.name.clone());
+        args.push(self.stream_name.clone());
 
         args
     }
@@ -60,14 +63,11 @@ impl IggyCmdTestCase for TestStreamCreateCmd {
     }
 
     fn verify_command(&self, command_state: Assert) {
-        let stream_id = match self.stream_id {
-            Some(stream_id) => format!("ID: {stream_id}"),
-            None => "ID auto incremented".to_string(),
-        };
+        let stream_id = "ID auto incremented";
 
         let message = format!(
             "Executing create stream with name: {} and {}\nStream with name: {} and {} created\n",
-            self.name, stream_id, self.name, stream_id
+            self.stream_name, stream_id, self.stream_name, stream_id
         );
 
         command_state.success().stdout(diff(message));
@@ -75,17 +75,14 @@ impl IggyCmdTestCase for TestStreamCreateCmd {
 
     async fn verify_server_state(&self, client: &dyn Client) {
         let stream = client
-            .get_stream(&self.name.clone().try_into().unwrap())
+            .get_stream(&self.stream_name.clone().try_into().unwrap())
             .await;
         assert!(stream.is_ok());
         let stream = stream.unwrap().expect("Stream not found");
-        assert_eq!(stream.name, self.name);
-        if let Some(stream_id) = self.stream_id {
-            assert_eq!(stream.id, stream_id);
-        }
+        assert_eq!(stream.name, self.stream_name);
 
         let delete = client
-            .delete_stream(&self.name.clone().try_into().unwrap())
+            .delete_stream(&self.stream_name.clone().try_into().unwrap())
             .await;
         assert!(delete.is_ok());
     }
@@ -98,7 +95,7 @@ pub async fn should_be_successful() {
 
     iggy_cmd_test.setup().await;
     iggy_cmd_test
-        .execute_test(TestStreamCreateCmd::new(Some(123), String::from("main")))
+        .execute_test(TestStreamCreateCmd::new(None, String::from("main")))
         .await;
 
     iggy_cmd_test.setup().await;

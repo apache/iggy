@@ -8,26 +8,22 @@
   import ModalBase from './ModalBase.svelte';
   import { showToast } from '../AppToasts.svelte';
   import { fetchRouteApi } from '$lib/api/fetchRouteApi';
-  import { dataHas } from '$lib/utils/dataHas';
-  import { numberSizes } from '$lib/utils/constants/numberSizes';
   import { customInvalidateAll } from '../PeriodicInvalidator.svelte';
 
   interface Props {
     closeModal: CloseModalFn;
-    nextStreamId: number;
   }
 
-  let { closeModal, nextStreamId }: Props = $props();
+  let { closeModal }: Props = $props();
 
   const schema = z.object({
-    stream_id: z.number().min(0).max(numberSizes.max.u32).default(nextStreamId),
     name: z
       .string()
       .min(1, 'Name must contain at least 1 character')
       .max(255, 'Name must not exceed 255 characters')
   });
 
-  const { form, errors, enhance, constraints, submitting } = superForm(defaults(zod4(schema)), {
+  const { form, errors, enhance, submitting } = superForm(defaults(zod4(schema)), {
     SPA: true,
     validators: zod4(schema),
     invalidateAll: false,
@@ -39,45 +35,55 @@
         method: 'POST',
         path: '/streams',
         body: {
-          stream_id: form.data.stream_id,
           name: form.data.name
         }
       });
 
-      if (dataHas(data, 'field', 'reason')) {
-        return setError(form, data.field, data.reason);
+      if (!ok) {
+        // Handle API errors
+        if (data?.field && data?.reason) {
+          // Field-specific error - show in form
+          return setError(form, data.field, data.reason);
+        } else if (data?.reason) {
+          // General error with reason - show toast
+          let errorMessage = data.reason;
+          if (data.code && data.id) {
+            errorMessage += `\n${data.code} (${data.id})`;
+          } else if (data.code) {
+            errorMessage += `\n${data.code}`;
+          }
+          showToast({
+            type: 'error',
+            description: errorMessage,
+            duration: 5000
+          });
+        } else {
+          // Fallback error message
+          showToast({
+            type: 'error',
+            description: 'Failed to create stream',
+            duration: 5000
+          });
+        }
+        return;
       }
 
-      if (ok) {
-        closeModal(async () => {
-          await customInvalidateAll();
-          showToast({
-            type: 'success',
-            description: `Stream ${form.data.name} has been added.`,
-            duration: 3500
-          });
+      // Success
+      closeModal(async () => {
+        await customInvalidateAll();
+        showToast({
+          type: 'success',
+          description: `Stream ${form.data.name} has been added.`,
+          duration: 3500
         });
-      }
+      });
     }
   });
 </script>
 
 <ModalBase {closeModal} title="Add new stream">
   <form method="POST" class="flex flex-col h-[300px] gap-4" use:enhance>
-    <Input
-      label="Id"
-      name="stream_id"
-      type="number"
-      bind:value={$form.stream_id}
-      {...$constraints.stream_id}
-      errorMessage={$errors.stream_id?.join(',')}
-    />
-    <Input
-      name="name"
-      label="Name"
-      bind:value={$form.name}
-      errorMessage={$errors.name?.join(',')}
-    />
+    <Input name="name" label="Name" bind:value={$form.name} errorMessage={$errors.name?.[0]} />
 
     <div class="flex justify-end gap-3 mt-auto w-full">
       <Button type="button" variant="text" class="w-2/5" onclick={() => closeModal()}>Cancel</Button

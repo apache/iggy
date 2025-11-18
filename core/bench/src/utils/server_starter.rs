@@ -30,6 +30,7 @@ struct ServerConfig {
     http: ConfigAddress,
     tcp: ConfigAddress,
     quic: ConfigAddress,
+    websocket: ConfigAddress,
 }
 
 #[derive(Debug, Deserialize)]
@@ -147,6 +148,23 @@ async fn evaluate_server_start_condition(args: &IggyBenchArgs) -> (bool, HashMap
             (
                 addresses_are_equivalent(&args_quic_address, &config_quic_address)
                     && !is_udp_addr_in_use(&args_quic_address).await,
+                envs,
+            )
+        }
+        TransportProtocol::WebSocket => {
+            let args_websocket_address = args.server_address().parse::<SocketAddr>().unwrap();
+            let config_websocket_address = default_config
+                .websocket
+                .address
+                .parse::<SocketAddr>()
+                .unwrap();
+            let envs = HashMap::from([(
+                "IGGY_WEBSOCKET_ADDRESS".to_owned(),
+                default_config.websocket.address.clone(),
+            )]);
+            (
+                addresses_are_equivalent(&args_websocket_address, &config_websocket_address)
+                    && !is_tcp_addr_in_use(&args_websocket_address).await,
                 envs,
             )
         }

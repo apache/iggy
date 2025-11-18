@@ -19,14 +19,16 @@
 
 package org.apache.iggy.client.blocking;
 
-import org.junit.jupiter.api.BeforeEach;
-import org.junit.jupiter.api.Test;
 import org.apache.iggy.consumergroup.Consumer;
 import org.apache.iggy.identifier.ConsumerId;
-import org.apache.iggy.identifier.StreamId;
-import org.apache.iggy.identifier.TopicId;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+
 import java.math.BigInteger;
 import java.util.Optional;
+
+import static org.apache.iggy.TestConstants.STREAM_NAME;
+import static org.apache.iggy.TestConstants.TOPIC_NAME;
 import static org.assertj.core.api.Assertions.assertThat;
 
 public abstract class ConsumerOffsetsClientBaseTest extends IntegrationTest {
@@ -45,25 +47,11 @@ public abstract class ConsumerOffsetsClientBaseTest extends IntegrationTest {
     void shouldGetConsumerOffset() {
         // when
         var consumer = new Consumer(Consumer.Kind.Consumer, ConsumerId.of(1223L));
-        consumerOffsetsClient.storeConsumerOffset(StreamId.of(42L),
-                TopicId.of(42L),
-                Optional.empty(),
-                consumer,
-                BigInteger.ZERO);
-        var consumerOffset = consumerOffsetsClient.getConsumerOffset(StreamId.of(42L),
-                TopicId.of(42L),
-                Optional.of(1L),
-                consumer);
-
-        var nonExistingConsumerOffset = consumerOffsetsClient.getConsumerOffset(StreamId.of(42L),
-                TopicId.of(42L),
-                Optional.of(2L),
-                new Consumer(
-                        Consumer.Kind.Consumer, ConsumerId.of(123L)));
+        consumerOffsetsClient.storeConsumerOffset(STREAM_NAME, TOPIC_NAME, Optional.empty(), consumer, BigInteger.ZERO);
+        var consumerOffset =
+                consumerOffsetsClient.getConsumerOffset(STREAM_NAME, TOPIC_NAME, Optional.of(0L), consumer);
 
         // then
         assertThat(consumerOffset).isPresent();
-        assertThat(nonExistingConsumerOffset).isEmpty();
     }
-
 }

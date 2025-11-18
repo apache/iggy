@@ -16,19 +16,23 @@
 // under the License.
 
 use crate::server::{
-    ScenarioFn, join_scenario, multiple_clients_scenario, run_scenario, single_client_scenario,
+    ScenarioFn, auto_commit_reconnection_scenario, join_scenario, multiple_clients_scenario,
+    offset_cleanup_scenario, run_scenario, single_client_scenario,
 };
 use iggy_common::TransportProtocol;
 use serial_test::parallel;
 use test_case::test_matrix;
 
+// TODO: Add `QUIC`.
 // Consumer group scenarios do not support HTTP
 #[test_matrix(
-    [TransportProtocol::Tcp, TransportProtocol::Quic],
+    [TransportProtocol::Tcp, TransportProtocol::WebSocket],
     [
         join_scenario(),
         single_client_scenario(),
         multiple_clients_scenario(),
+        auto_commit_reconnection_scenario(),
+        offset_cleanup_scenario(),
     ]
 )]
 #[tokio::test]

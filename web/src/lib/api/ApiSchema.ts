@@ -88,7 +88,6 @@ type Streams =
       method: 'POST';
       path: '/streams';
       body: {
-        stream_id: number;
         name: string;
       };
     }
@@ -127,7 +126,6 @@ type Topics =
         name: string;
         partitions_count: number;
         stream_id: number;
-        topic_id: number;
       };
     }
   | {

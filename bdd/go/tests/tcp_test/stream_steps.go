@@ -19,7 +19,6 @@ package tcp_test
 
 import (
 	"fmt"
-
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
 	"github.com/apache/iggy/foreign/go/iggycli"
@@ -30,14 +29,13 @@ import (
 //operations
 
 func successfullyCreateStream(prefix string, client iggycli.Client) (uint32, string) {
-	streamId := createRandomUInt32()
 	name := createRandomStringWithPrefix(prefix, 128)
 
-	_, err := client.CreateStream(name, &streamId)
+    stream, err := client.CreateStream(name)
 
 	itShouldNotReturnError(err)
-	itShouldSuccessfullyCreateStream(streamId, name, client)
-	return streamId, name
+	itShouldSuccessfullyCreateStream(stream.Id, name, client)
+	return stream.Id, name
 }
 
 //assertions

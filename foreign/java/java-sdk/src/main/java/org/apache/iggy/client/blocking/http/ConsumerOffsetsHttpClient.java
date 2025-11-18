@@ -25,6 +25,7 @@ import org.apache.iggy.consumergroup.Consumer;
 import org.apache.iggy.consumeroffset.ConsumerOffsetInfo;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
+
 import java.math.BigInteger;
 import java.util.Optional;
 
@@ -38,17 +39,21 @@ class ConsumerOffsetsHttpClient implements ConsumerOffsetsClient {
     }
 
     @Override
-    public void storeConsumerOffset(StreamId streamId, TopicId topicId, Optional<Long> partitionId, Consumer consumer, BigInteger offset) {
-        var request = httpClient.preparePutRequest(path(streamId, topicId),
-                new StoreConsumerOffset(consumer.id().toString(), partitionId, offset));
+    public void storeConsumerOffset(
+            StreamId streamId, TopicId topicId, Optional<Long> partitionId, Consumer consumer, BigInteger offset) {
+        var request = httpClient.preparePutRequest(
+                path(streamId, topicId), new StoreConsumerOffset(consumer.id().toString(), partitionId, offset));
         httpClient.execute(request);
     }
 
     @Override
-    public Optional<ConsumerOffsetInfo> getConsumerOffset(StreamId streamId, TopicId topicId, Optional<Long> partitionId, Consumer consumer) {
-        var request = httpClient.prepareGetRequest(path(streamId, topicId),
+    public Optional<ConsumerOffsetInfo> getConsumerOffset(
+            StreamId streamId, TopicId topicId, Optional<Long> partitionId, Consumer consumer) {
+        var request = httpClient.prepareGetRequest(
+                path(streamId, topicId),
                 new BasicNameValuePair("consumer_id", consumer.id().toString()),
-                new BasicNameValuePair("partition_id", partitionId.map(Object::toString).orElse(DEFAULT_PARTITION_ID)));
+                new BasicNameValuePair(
+                        "partition_id", partitionId.map(Object::toString).orElse(DEFAULT_PARTITION_ID)));
         return httpClient.executeWithOptionalResponse(request, ConsumerOffsetInfo.class);
     }
 
@@ -56,6 +61,5 @@ class ConsumerOffsetsHttpClient implements ConsumerOffsetsClient {
         return "/streams/" + streamId + "/topics/" + topicId + "/consumer-offsets";
     }
 
-    private record StoreConsumerOffset(String consumerId, Optional<Long> partitionId, BigInteger offset) {
-    }
+    private record StoreConsumerOffset(String consumerId, Optional<Long> partitionId, BigInteger offset) {}
 }

@@ -47,14 +47,13 @@ runs:
       if: inputs.task == 'lint'
       shell: bash
       run: |
-        # TODO(hubcio): make this blocking when Java lints are fixed
-        foreign/java/dev-support/checks/build.sh check -x test || true
+        foreign/java/dev-support/checks/build.sh check -x test
 
     - name: Build
       shell: bash
       if: inputs.task == 'build'
       run: |
-        foreign/java/dev-support/checks/build.sh build -x test -x checkstyleMain -x checkstyleTest
+        foreign/java/dev-support/checks/build.sh build -x test -x checkstyleMain -x checkstyleTest -x spotlessCheck
         BUILD_EXIT_CODE=$?
 
         # List artifacts only if build succeeded
@@ -87,16 +86,19 @@ runs:
       run: |
         foreign/java/dev-support/checks/build.sh test
 
-        # Copy test reports
-        if [ -d "foreign/java/build/test-results" ]; then
-          mkdir -p reports
-          cp -r foreign/java/build/test-results reports/java-tests
+    - name: Copy test reports
+      if: ${{ !cancelled() && inputs.task == 'test' }}
+      shell: bash
+      run: |
+        if [ -d "foreign/java/java-sdk/build/test-results" ]; then
+          echo "Found test reports in java-sdk"
+          mkdir -p reports/java-tests
+          cp -r foreign/java/java-sdk/build/test-results reports/java-tests/sdk
         fi
-
-        # Generate test report if jacoco is configured
-        if grep -q "jacoco" foreign/java/build.gradle 2>/dev/null; then
-          cd foreign/java
-          ./gradlew jacocoTestReport --no-daemon
+        if [ -d "foreign/java/external-processors/iggy-connector-flink/iggy-connector-library/build/test-results" ]; then
+          echo "Found test reports in flink"
+          mkdir -p reports/java-tests
+          cp -r foreign/java/external-processors/iggy-connector-flink/iggy-connector-library/build/test-results reports/java-tests/flink
         fi
 
     - name: Stop Iggy server
@@ -105,3 +107,11 @@ runs:
       with:
         pid-file: ${{ steps.iggy.outputs.pid_file }}
         log-file: ${{ steps.iggy.outputs.log_file }}
+
+    - name: Test Summary
+      uses: test-summary/action@v2
+      with:
+        paths: |
+          foreign/java/java-sdk/build/test-results/**/TEST-*.xml
+          foreign/java/external-processors/iggy-connector-flink/iggy-connector-library/build/test-results/**/TEST-*.xml
+      if: ${{ !cancelled() && inputs.task == 'test' }}

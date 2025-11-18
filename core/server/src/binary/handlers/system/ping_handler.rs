@@ -18,13 +18,13 @@
 
 use crate::binary::command::{BinaryServerCommand, ServerCommandHandler};
 use crate::binary::sender::SenderKind;
+use crate::shard::IggyShard;
 use crate::streaming::session::Session;
-use crate::streaming::systems::system::SharedSystem;
 use anyhow::Result;
 use iggy_common::IggyError;
 use iggy_common::IggyTimestamp;
-use iggy_common::locking::IggySharedMutFn;
 use iggy_common::ping::Ping;
+use std::rc::Rc;
 use tracing::debug;
 
 impl ServerCommandHandler for Ping {
@@ -37,13 +37,10 @@ impl ServerCommandHandler for Ping {
         sender: &mut SenderKind,
         _length: u32,
         session: &Session,
-        system: &SharedSystem,
+        shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
-        let system = system.read().await;
-        let client_manager = system.client_manager.read().await;
-        if let Some(client) = client_manager.try_get_client(session.client_id) {
-            let mut client = client.write().await;
+        if let Some(mut client) = shard.client_manager.try_get_client_mut(session.client_id) {
             let now = IggyTimestamp::now();
             client.last_heartbeat = now;
             debug!("Updated last heartbeat to: {now} for session: {session}");

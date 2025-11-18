@@ -23,10 +23,16 @@ import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.handler.codec.ByteToMessageDecoder;
+import io.netty.handler.ssl.SslContext;
+import io.netty.handler.ssl.SslContextBuilder;
 import reactor.core.publisher.Mono;
 import reactor.netty.Connection;
 import reactor.netty.tcp.TcpClient;
+
+import javax.net.ssl.SSLException;
+import java.io.File;
 import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
 
@@ -41,10 +47,27 @@ final class InternalTcpClient {
     private Connection connection;
 
     InternalTcpClient(String host, Integer port) {
-        client = TcpClient.create()
+        this(host, port, false, Optional.empty());
+    }
+
+    InternalTcpClient(String host, Integer port, boolean enableTls, Optional<File> tlsCertificate) {
+        TcpClient tcpClient = TcpClient.create()
                 .host(host)
                 .port(port)
                 .doOnConnected(conn -> conn.addHandlerLast(new IggyResponseDecoder()));
+
+        if (enableTls) {
+            try {
+                SslContextBuilder builder = SslContextBuilder.forClient();
+                tlsCertificate.ifPresent(builder::trustManager);
+                SslContext sslContext = builder.build();
+                tcpClient = tcpClient.secure(sslSpec -> sslSpec.sslContext(sslContext));
+            } catch (SSLException e) {
+                throw new RuntimeException("Failed to configure TLS for TcpClient", e);
+            }
+        }
+
+        client = tcpClient;
     }
 
     void connect() {
@@ -56,7 +79,9 @@ final class InternalTcpClient {
         return send(code.getValue());
     }
 
-    /** Use {@link #send(CommandCode)} instead. */
+    /**
+     * Use {@link #send(CommandCode)} instead.
+     */
     @Deprecated
     ByteBuf send(int command) {
         return send(command, Unpooled.EMPTY_BUFFER);
@@ -66,7 +91,9 @@ final class InternalTcpClient {
         return send(code.getValue(), payload);
     }
 
-    /** Use {@link #send(CommandCode, ByteBuf)} instead. */
+    /**
+     * Use {@link #send(CommandCode, ByteBuf)} instead.
+     */
     @Deprecated
     ByteBuf send(int command, ByteBuf payload) {
         var payloadSize = payload.readableBytes() + COMMAND_LENGTH;
@@ -112,7 +139,5 @@ final class InternalTcpClient {
         }
     }
 
-    record IggyResponse(long status, int length, ByteBuf payload) {
-    }
-
+    record IggyResponse(long status, int length, ByteBuf payload) {}
 }

@@ -28,6 +28,7 @@ import org.apache.iggy.user.TokenInfo;
 import org.apache.iggy.user.UserInfo;
 import org.apache.iggy.user.UserInfoDetails;
 import org.apache.iggy.user.UserStatus;
+
 import java.util.List;
 import java.util.Optional;
 
@@ -49,15 +50,14 @@ class UsersHttpClient implements UsersClient {
     @Override
     public List<UserInfo> getUsers() {
         var request = httpClient.prepareGetRequest(USERS);
-        return httpClient.execute(request, new TypeReference<>() {
-        });
+        return httpClient.execute(request, new TypeReference<>() {});
     }
 
     @Override
-    public UserInfoDetails createUser(String username, String password, UserStatus status, Optional<Permissions> permissions) {
+    public UserInfoDetails createUser(
+            String username, String password, UserStatus status, Optional<Permissions> permissions) {
         var request = httpClient.preparePostRequest(USERS, new CreateUser(username, password, status, permissions));
-        return httpClient.execute(request, new TypeReference<>() {
-        });
+        return httpClient.execute(request, new TypeReference<>() {});
     }
 
     @Override
@@ -74,15 +74,15 @@ class UsersHttpClient implements UsersClient {
 
     @Override
     public void updatePermissions(UserId userId, Optional<Permissions> permissions) {
-        var request = httpClient.preparePutRequest(USERS + "/" + userId + "/permissions",
-                new UpdatePermissions(permissions));
+        var request =
+                httpClient.preparePutRequest(USERS + "/" + userId + "/permissions", new UpdatePermissions(permissions));
         httpClient.execute(request);
     }
 
     @Override
     public void changePassword(UserId userId, String currentPassword, String newPassword) {
-        var request = httpClient.preparePutRequest(USERS + "/" + userId + "/password",
-                new ChangePassword(currentPassword, newPassword));
+        var request = httpClient.preparePutRequest(
+                USERS + "/" + userId + "/password", new ChangePassword(currentPassword, newPassword));
         httpClient.execute(request);
     }
 
@@ -103,18 +103,13 @@ class UsersHttpClient implements UsersClient {
         httpClient.setToken(Optional.empty());
     }
 
-    record Login(String username, String password, String version, String context) {
-    }
+    record Login(String username, String password, String version, String context) {}
 
-    private record CreateUser(String username, String password, UserStatus status, Optional<Permissions> permissions) {
-    }
+    private record CreateUser(String username, String password, UserStatus status, Optional<Permissions> permissions) {}
 
-    private record UpdateUser(Optional<String> username, Optional<UserStatus> status) {
-    }
+    private record UpdateUser(Optional<String> username, Optional<UserStatus> status) {}
 
-    private record UpdatePermissions(Optional<Permissions> permissions) {
-    }
+    private record UpdatePermissions(Optional<Permissions> permissions) {}
 
-    private record ChangePassword(String currentPassword, String newPassword) {
-    }
+    private record ChangePassword(String currentPassword, String newPassword) {}
 }

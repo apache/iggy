@@ -29,13 +29,6 @@ import org.apache.iggy.message.BytesMessageId;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.MessageHeader;
 import org.apache.iggy.message.PolledMessages;
-import org.apache.iggy.user.GlobalPermissions;
-import org.apache.iggy.user.Permissions;
-import org.apache.iggy.user.StreamPermissions;
-import org.apache.iggy.user.TopicPermissions;
-import org.apache.iggy.user.UserInfo;
-import org.apache.iggy.user.UserInfoDetails;
-import org.apache.iggy.user.UserStatus;
 import org.apache.iggy.partition.Partition;
 import org.apache.iggy.personalaccesstoken.PersonalAccessTokenInfo;
 import org.apache.iggy.personalaccesstoken.RawPersonalAccessToken;
@@ -48,14 +41,25 @@ import org.apache.iggy.system.Stats;
 import org.apache.iggy.topic.CompressionAlgorithm;
 import org.apache.iggy.topic.Topic;
 import org.apache.iggy.topic.TopicDetails;
+import org.apache.iggy.user.GlobalPermissions;
+import org.apache.iggy.user.Permissions;
+import org.apache.iggy.user.StreamPermissions;
+import org.apache.iggy.user.TopicPermissions;
+import org.apache.iggy.user.UserInfo;
+import org.apache.iggy.user.UserInfoDetails;
+import org.apache.iggy.user.UserStatus;
+
 import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
 
 final class BytesDeserializer {
 
-    private BytesDeserializer() {
-    }
+    private BytesDeserializer() {}
 
     static StreamBase readStreamBase(ByteBuf response) {
         var streamId = response.readUnsignedIntLE();
@@ -113,7 +117,8 @@ final class BytesDeserializer {
         var messagesCount = readU64AsBigInteger(response);
         var nameLength = response.readByte();
         var name = response.readCharSequence(nameLength, StandardCharsets.UTF_8).toString();
-        return new Topic(topicId,
+        return new Topic(
+                topicId,
                 createdAt,
                 name,
                 size.toString(),
@@ -181,8 +186,8 @@ final class BytesDeserializer {
         var originTimestamp = readU64AsBigInteger(response);
         var userHeadersLength = response.readUnsignedIntLE();
         var payloadLength = response.readUnsignedIntLE();
-        var header = new MessageHeader(checksum, id, offset, timestamp, originTimestamp,
-            userHeadersLength, payloadLength);
+        var header =
+                new MessageHeader(checksum, id, offset, timestamp, originTimestamp, userHeadersLength, payloadLength);
         var payload = newByteArray(payloadLength);
         response.readBytes(payload);
         // TODO: Add support for user headers.
@@ -209,15 +214,20 @@ final class BytesDeserializer {
         var clientsCount = response.readUnsignedIntLE();
         var consumerGroupsCount = response.readUnsignedIntLE();
         var hostnameLength = response.readUnsignedIntLE();
-        var hostname = response.readCharSequence(toInt(hostnameLength), StandardCharsets.UTF_8).toString();
+        var hostname = response.readCharSequence(toInt(hostnameLength), StandardCharsets.UTF_8)
+                .toString();
         var osNameLength = response.readUnsignedIntLE();
-        var osName = response.readCharSequence(toInt(osNameLength), StandardCharsets.UTF_8).toString();
+        var osName = response.readCharSequence(toInt(osNameLength), StandardCharsets.UTF_8)
+                .toString();
         var osVersionLength = response.readUnsignedIntLE();
-        var osVersion = response.readCharSequence(toInt(osVersionLength), StandardCharsets.UTF_8).toString();
+        var osVersion = response.readCharSequence(toInt(osVersionLength), StandardCharsets.UTF_8)
+                .toString();
         var kernelVersionLength = response.readUnsignedIntLE();
-        var kernelVersion = response.readCharSequence(toInt(kernelVersionLength), StandardCharsets.UTF_8).toString();
+        var kernelVersion = response.readCharSequence(toInt(kernelVersionLength), StandardCharsets.UTF_8)
+                .toString();
 
-        return new Stats(processId,
+        return new Stats(
+                processId,
                 cpuUsage,
                 totalCpuUsage,
                 memoryUsage.toString(),
@@ -264,7 +274,8 @@ final class BytesDeserializer {
             transportString = "Quic";
         }
         var addressLength = response.readUnsignedIntLE();
-        var address = response.readCharSequence(toInt(addressLength), StandardCharsets.UTF_8).toString();
+        var address = response.readCharSequence(toInt(addressLength), StandardCharsets.UTF_8)
+                .toString();
         var consumerGroupsCount = response.readUnsignedIntLE();
         return new ClientInfo(clientId, userIdOptional, address, transportString, consumerGroupsCount);
     }
@@ -314,13 +325,8 @@ final class BytesDeserializer {
             var topicPermissions = readTopicPermissions(response);
             topicPermissionsMap.put(topicId, topicPermissions);
         }
-        return new StreamPermissions(manageStream,
-                readStream,
-                manageTopics,
-                readTopics,
-                pollMessages,
-                sendMessages,
-                topicPermissionsMap);
+        return new StreamPermissions(
+                manageStream, readStream, manageTopics, readTopics, pollMessages, sendMessages, topicPermissionsMap);
     }
 
     static TopicPermissions readTopicPermissions(ByteBuf response) {
@@ -342,7 +348,8 @@ final class BytesDeserializer {
         var readTopics = response.readBoolean();
         var pollMessages = response.readBoolean();
         var sendMessages = response.readBoolean();
-        return new GlobalPermissions(manageServers,
+        return new GlobalPermissions(
+                manageServers,
                 readServers,
                 manageUsers,
                 readUsers,
@@ -360,13 +367,15 @@ final class BytesDeserializer {
         var statusCode = response.readByte();
         var status = UserStatus.fromCode(statusCode);
         var usernameLength = response.readByte();
-        var username = response.readCharSequence(usernameLength, StandardCharsets.UTF_8).toString();
+        var username = response.readCharSequence(usernameLength, StandardCharsets.UTF_8)
+                .toString();
         return new UserInfo(userId, createdAt, status, username);
     }
 
     static RawPersonalAccessToken readRawPersonalAccessToken(ByteBuf response) {
         var tokenLength = response.readByte();
-        var token = response.readCharSequence(tokenLength, StandardCharsets.UTF_8).toString();
+        var token =
+                response.readCharSequence(tokenLength, StandardCharsets.UTF_8).toString();
         return new RawPersonalAccessToken(token);
     }
 
@@ -399,5 +408,4 @@ final class BytesDeserializer {
     private static byte[] newByteArray(Long size) {
         return new byte[size.intValue()];
     }
-
 }

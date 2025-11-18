@@ -58,12 +58,8 @@ func (tms *IggyTcpClient) CreateTopic(
 	compressionAlgorithm iggcon.CompressionAlgorithm,
 	messageExpiry iggcon.Duration,
 	maxTopicSize uint64,
-	replicationFactor *uint8,
-	topicId *uint32,
+    replicationFactor *uint8,
 ) (*iggcon.TopicDetails, error) {
-	if topicId != nil && *topicId == 0 {
-		return nil, ierror.ErrInvalidTopicId
-	}
 	if len(name) == 0 || len(name) > MaxStringLength {
 		return nil, ierror.ErrInvalidTopicName
 	}
@@ -82,7 +78,6 @@ func (tms *IggyTcpClient) CreateTopic(
 		MessageExpiry:        messageExpiry,
 		MaxTopicSize:         maxTopicSize,
 		ReplicationFactor:    replicationFactor,
-		TopicId:              topicId,
 	}
 	buffer, err := tms.sendAndFetchResponse(serializedRequest.Serialize(), iggcon.CreateTopicCode)
 	if err != nil {

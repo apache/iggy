@@ -24,6 +24,7 @@ import org.apache.iggy.client.blocking.StreamsClient;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.stream.StreamBase;
 import org.apache.iggy.stream.StreamDetails;
+
 import java.util.List;
 import java.util.Optional;
 
@@ -45,15 +46,13 @@ class StreamsHttpClient implements StreamsClient {
     @Override
     public List<StreamBase> getStreams() {
         var request = httpClient.prepareGetRequest(STREAMS);
-        return httpClient.execute(request, new TypeReference<>() {
-        });
+        return httpClient.execute(request, new TypeReference<>() {});
     }
 
     @Override
-    public StreamDetails createStream(Optional<Long> streamId, String name) {
-        var request = httpClient.preparePostRequest(STREAMS, new CreateStream(streamId, name));
-        return httpClient.execute(request, new TypeReference<>() {
-        });
+    public StreamDetails createStream(String name) {
+        var request = httpClient.preparePostRequest(STREAMS, new CreateStream(name));
+        return httpClient.execute(request, new TypeReference<>() {});
     }
 
     @Override
@@ -68,9 +67,7 @@ class StreamsHttpClient implements StreamsClient {
         httpClient.execute(request);
     }
 
-    record CreateStream(Optional<Long> streamId, String name) {
-    }
+    record CreateStream(String name) {}
 
-    record UpdateStream(String name) {
-    }
+    record UpdateStream(String name) {}
 }

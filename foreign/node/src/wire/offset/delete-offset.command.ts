@@ -31,7 +31,7 @@ export type DeleteOffset = GetOffset;
 export const DELETE_OFFSET = {
   code: COMMAND_CODE.DeleteConsumerOffset,
 
-  serialize: ({streamId, topicId, consumer, partitionId = 1}: DeleteOffset) => {
+  serialize: ({ streamId, topicId, consumer, partitionId = 0 }: DeleteOffset) => {
     return serializeGetOffset(streamId, topicId, consumer, partitionId);
   },
 

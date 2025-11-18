@@ -22,6 +22,7 @@ package org.apache.iggy.message;
 import com.fasterxml.jackson.annotation.JsonCreator;
 import com.fasterxml.jackson.annotation.JsonValue;
 import io.netty.buffer.ByteBuf;
+
 import java.math.BigInteger;
 
 public interface MessageId {
@@ -39,5 +40,4 @@ public interface MessageId {
     BigInteger toBigInteger();
 
     ByteBuf toBytes();
-
 }

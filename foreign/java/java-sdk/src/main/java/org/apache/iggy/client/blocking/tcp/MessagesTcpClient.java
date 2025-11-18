@@ -28,8 +28,10 @@ import org.apache.iggy.message.Message;
 import org.apache.iggy.message.Partitioning;
 import org.apache.iggy.message.PolledMessages;
 import org.apache.iggy.message.PollingStrategy;
+
 import java.util.List;
 import java.util.Optional;
+
 import static org.apache.iggy.client.blocking.tcp.BytesSerializer.toBytes;
 
 class MessagesTcpClient implements MessagesClient {
@@ -41,11 +43,18 @@ class MessagesTcpClient implements MessagesClient {
     }
 
     @Override
-    public PolledMessages pollMessages(StreamId streamId, TopicId topicId, Optional<Long> partitionId, Consumer consumer, PollingStrategy strategy, Long count, boolean autoCommit) {
+    public PolledMessages pollMessages(
+            StreamId streamId,
+            TopicId topicId,
+            Optional<Long> partitionId,
+            Consumer consumer,
+            PollingStrategy strategy,
+            Long count,
+            boolean autoCommit) {
         var payload = toBytes(consumer);
         payload.writeBytes(toBytes(streamId));
         payload.writeBytes(toBytes(topicId));
-        payload.writeIntLE(partitionId.orElse(0L).intValue());
+        payload.writeBytes(toBytes(partitionId));
         payload.writeBytes(toBytes(strategy));
         payload.writeIntLE(count.intValue());
         payload.writeByte(autoCommit ? 1 : 0);

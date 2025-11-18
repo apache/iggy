@@ -1,4 +1,5 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
  * regarding copyright ownership.  The ASF licenses this file
@@ -16,7 +17,9 @@
  * under the License.
  */
 
-use configs::{ConfigFormat, ConnectorsConfig};
+use crate::configs::connectors::ConnectorsConfigProvider;
+use configs::connectors::ConfigFormat;
+use configs::runtime::ConnectorsRuntimeConfig;
 use dlopen2::wrapper::{Container, WrapperApi};
 use dotenvy::dotenv;
 use error::RuntimeError;
@@ -112,7 +115,7 @@ async fn main() -> Result<(), RuntimeError> {
         env::var("IGGY_CONNECTORS_CONFIG_PATH").unwrap_or_else(|_| DEFAULT_CONFIG_PATH.to_string());
     info!("Starting Iggy Connectors Runtime, loading configuration from: {config_path}...");
 
-    let config: ConnectorsConfig = ConnectorsConfig::config_provider(config_path)
+    let config: ConnectorsRuntimeConfig = ConnectorsRuntimeConfig::config_provider(config_path)
         .load_config()
         .await
         .expect("Failed to load configuration");
@@ -122,13 +125,21 @@ async fn main() -> Result<(), RuntimeError> {
     info!("State will be stored in: {}", config.state.path);
 
     let iggy_clients = stream::init(config.iggy.clone()).await?;
+
+    let connectors_config_provider: Box<dyn ConnectorsConfigProvider> =
+        config.connectors.clone().into();
+
+    let connectors_config = connectors_config_provider.load_configs().await?;
+    let sources_config = connectors_config.sources();
     let sources = source::init(
-        config.sources.clone(),
+        sources_config.clone(),
         &iggy_clients.producer,
         &config.state.path,
     )
     .await?;
-    let sinks = sink::init(config.sinks.clone(), &iggy_clients.consumer).await?;
+
+    let sinks_config = connectors_config.sinks();
+    let sinks = sink::init(sinks_config.clone(), &iggy_clients.consumer).await?;
 
     let mut sink_wrappers = vec![];
     let mut sink_with_plugins = HashMap::new();
@@ -164,7 +175,13 @@ async fn main() -> Result<(), RuntimeError> {
         );
     }
 
-    let context = context::init(&config, &sink_wrappers, &source_wrappers);
+    let context = context::init(
+        &config,
+        &sinks_config,
+        &sources_config,
+        &sink_wrappers,
+        &source_wrappers,
+    );
     let context = Arc::new(context);
     api::init(&config.http, context).await;
 

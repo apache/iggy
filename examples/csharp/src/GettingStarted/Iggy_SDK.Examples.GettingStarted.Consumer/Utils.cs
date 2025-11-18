@@ -27,29 +27,29 @@ namespace Iggy_SDK.Examples.GettingStarted.Consumer;
 
 public static class Utils
 {
-    private const uint STREAM_ID = 1;
-    private const uint TOPIC_ID = 2;
-    private const uint PARTITION_ID = 1;
-    private const uint BATCHES_LIMIT = 5;
+    private const string StreamName = "getting-started-example-stream";
+    private const string TopicName = "getting-started-example-topic";
+    private const uint PartitionId = 0;
+    private const uint BatchesLimit = 5;
 
     public static async Task ConsumeMessages(IIggyClient client, ILogger logger)
     {
         var interval = TimeSpan.FromMilliseconds(500);
         logger.LogInformation(
             "Messages will be consumed from stream: {StreamId}, topic: {TopicId}, partition: {PartitionId} with interval {Interval}.",
-            STREAM_ID,
-            TOPIC_ID,
-            PARTITION_ID,
+            StreamName,
+            TopicName,
+            PartitionId,
             interval
         );
 
         var offset = 0ul;
-        var messagesPerBatch = 10;
+        uint messagesPerBatch = 10;
         var consumedBatches = 0;
         var consumer = Apache.Iggy.Kinds.Consumer.New(1);
         while (true)
         {
-            if (consumedBatches == BATCHES_LIMIT)
+            if (consumedBatches == BatchesLimit)
             {
                 logger.LogInformation(
                     "Consumed {ConsumedBatches} batches of messages, exiting.",
@@ -58,12 +58,12 @@ public static class Utils
                 return;
             }
 
-            var streamIdentifier = Identifier.Numeric(STREAM_ID);
-            var topicIdentifier = Identifier.Numeric(TOPIC_ID);
+            var streamIdentifier = Identifier.String(StreamName);
+            var topicIdentifier = Identifier.String(TopicName);
             var polledMessages = await client.PollMessagesAsync(
                 streamIdentifier,
                 topicIdentifier,
-                PARTITION_ID,
+                PartitionId,
                 consumer,
                 PollingStrategy.Offset(offset),
                 messagesPerBatch,
@@ -104,14 +104,20 @@ public static class Utils
 
         argumentName = argumentName ?? throw new ArgumentNullException(argumentName);
         if (argumentName != "--tcp-server-address")
+        {
             throw new FormatException(
                 $"Invalid argument {argumentName}! Usage: --tcp-server-address <server-address>"
             );
+        }
+
         tcpServerAddr = tcpServerAddr ?? throw new ArgumentNullException(tcpServerAddr);
         if (!IPEndPoint.TryParse(tcpServerAddr, out _))
+        {
             throw new FormatException(
                 $"Invalid server address {tcpServerAddr}! Usage: --tcp-server-address <server-address>"
             );
+        }
+
         logger.LogInformation("Using server address: {TcpServerAddr}", tcpServerAddr);
         return tcpServerAddr;
     }

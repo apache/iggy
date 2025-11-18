@@ -1,4 +1,4 @@
-﻿// Licensed to the Apache Software Foundation (ASF) under one
+// Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
 // regarding copyright ownership.  The ASF licenses this file
@@ -17,6 +17,7 @@
 
 using System.Text;
 using Apache.Iggy;
+using Apache.Iggy.Configuration;
 using Apache.Iggy.Contracts;
 using Apache.Iggy.Factory;
 using Apache.Iggy.Kinds;
@@ -37,15 +38,14 @@ logger.LogInformation(
     settings.Protocol
 );
 
-var client = MessageStreamFactory.CreateMessageStream(
-    opt =>
-    {
-        opt.BaseAdress = settings.BaseAddress;
-        opt.Protocol = settings.Protocol;
-    },
-    loggerFactory
-);
+var client = IggyClientFactory.CreateClient(new IggyClientConfigurator()
+{
+    BaseAddress = settings.BaseAddress,
+    Protocol = settings.Protocol,
+    LoggerFactory = loggerFactory
+});
 
+await client.ConnectAsync();
 await client.LoginUser(settings.Username, settings.Password);
 
 logger.LogInformation("Basic producer has logged on successfully");
@@ -82,15 +82,7 @@ while (true)
 
     var messages = payloads.Select(payload => new Message(Guid.NewGuid(), Encoding.UTF8.GetBytes(payload))).ToList();
 
-    await client.SendMessagesAsync(
-        new MessageSendRequest
-        {
-            StreamId = streamId,
-            TopicId = topicId,
-            Messages = messages,
-            Partitioning = Partitioning.None()
-        }
-    );
+    await client.SendMessagesAsync(streamId, topicId, Partitioning.None(), messages);
 
     currentId += settings.MessagesPerBatch;
     sentBatches++;

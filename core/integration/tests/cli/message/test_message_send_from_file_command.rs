@@ -35,6 +35,9 @@ pub(super) struct TestMessageSendFromFileCmd<'a> {
     messages: Vec<&'a str>,
     message_count: usize,
     headers: HashMap<HeaderKey, HeaderValue>,
+    // These will be populated after creating the resources
+    actual_stream_id: Option<u32>,
+    actual_topic_id: Option<u32>,
 }
 
 impl<'a> TestMessageSendFromFileCmd<'a> {
@@ -57,18 +60,32 @@ impl<'a> TestMessageSendFromFileCmd<'a> {
             messages: messages.to_owned(),
             message_count,
             headers,
+            actual_stream_id: None,
+            actual_topic_id: None,
         }
     }
 
     fn to_args(&self) -> Vec<String> {
-        let command = vec![
+        let mut command = vec![
             "--input-file".into(),
             self.input_file.clone(),
             "--partition-id".into(),
-            "1".into(),
-            self.stream_name.clone(),
-            self.topic_name.clone(),
+            "0".into(),
         ];
+
+        // Use actual stream ID if available, otherwise use stream name as fallback
+        if let Some(stream_id) = self.actual_stream_id {
+            command.push(format!("{}", stream_id));
+        } else {
+            command.push(self.stream_name.clone());
+        }
+
+        // Use actual topic ID if available, otherwise use topic name as fallback
+        if let Some(topic_id) = self.actual_topic_id {
+            command.push(format!("{}", topic_id));
+        } else {
+            command.push(self.topic_name.clone());
+        }
 
         command
     }
@@ -77,29 +94,27 @@ impl<'a> TestMessageSendFromFileCmd<'a> {
 #[async_trait]
 impl IggyCmdTestCase for TestMessageSendFromFileCmd<'_> {
     async fn prepare_server_state(&mut self, client: &dyn Client) {
-        let stream = client.create_stream(&self.stream_name, None).await;
-        assert!(stream.is_ok());
+        // Create stream and capture its actual ID
+        let stream = client
+            .create_stream(&self.stream_name)
+            .await
+            .expect("Failed to create stream");
+        self.actual_stream_id = Some(stream.id);
 
-        let stream_id = Identifier::from_str(self.stream_name.as_str());
-        assert!(stream_id.is_ok());
-        let stream_id = stream_id.unwrap();
-
+        // Create topic and capture its actual ID
         let topic = client
             .create_topic(
-                &stream_id,
+                &stream.id.try_into().unwrap(),
                 &self.topic_name,
                 1,
                 Default::default(),
                 None,
-                None,
                 IggyExpiry::NeverExpire,
                 MaxTopicSize::ServerDefault,
             )
-            .await;
-        assert!(topic.is_ok());
-
-        let topic_id = Identifier::from_str(self.topic_name.as_str());
-        assert!(topic_id.is_ok());
+            .await
+            .expect("Failed to create topic");
+        self.actual_topic_id = Some(topic.id);
 
         if self.initialize {
             let file = tokio::fs::OpenOptions::new()
@@ -154,9 +169,21 @@ impl IggyCmdTestCase for TestMessageSendFromFileCmd<'_> {
     }
 
     fn verify_command(&self, command_state: Assert) {
+        let stream_id = if let Some(stream_id) = self.actual_stream_id {
+            format!("{}", stream_id)
+        } else {
+            self.stream_name.clone()
+        };
+
+        let topic_id = if let Some(topic_id) = self.actual_topic_id {
+            format!("{}", topic_id)
+        } else {
+            self.topic_name.clone()
+        };
+
         let message_prefix = format!(
             "Executing send messages to topic with ID: {} and stream with ID: {}\n",
-            self.topic_name, self.stream_name
+            topic_id, stream_id
         );
         let message_read = format!("Read [0-9]+ bytes from {} file", self.input_file);
         let message_created = format!(
@@ -168,7 +195,7 @@ impl IggyCmdTestCase for TestMessageSendFromFileCmd<'_> {
         );
         let message_sent = format!(
             "Sent messages to topic with ID: {} and stream with ID: {}\n",
-            self.topic_name, self.stream_name
+            topic_id, stream_id
         );
 
         command_state
@@ -180,49 +207,48 @@ impl IggyCmdTestCase for TestMessageSendFromFileCmd<'_> {
     }
 
     async fn verify_server_state(&self, client: &dyn Client) {
-        let stream_id = Identifier::from_str(self.stream_name.as_str());
-        assert!(stream_id.is_ok());
-        let stream_id = stream_id.unwrap();
+        if let (Some(stream_id), Some(topic_id)) = (self.actual_stream_id, self.actual_topic_id) {
+            let messages = client
+                .poll_messages(
+                    &stream_id.try_into().unwrap(),
+                    &topic_id.try_into().unwrap(),
+                    Some(0),
+                    &Consumer::new(Identifier::default()),
+                    &PollingStrategy::offset(0),
+                    self.message_count as u32 * 2,
+                    true,
+                )
+                .await;
+            assert!(messages.is_ok());
+            let messages = messages.unwrap();
 
-        let topic_id = Identifier::from_str(self.topic_name.as_str());
-        assert!(topic_id.is_ok());
-        let topic_id = topic_id.unwrap();
+            // Check if there are only the expected number of messages
+            assert_eq!(messages.messages.len(), self.message_count);
 
-        let messages = client
-            .poll_messages(
-                &stream_id,
-                &topic_id,
-                Some(1),
-                &Consumer::new(Identifier::default()),
-                &PollingStrategy::offset(0),
-                self.message_count as u32 * 2,
-                true,
-            )
-            .await;
-        assert!(messages.is_ok());
-        let messages = messages.unwrap();
+            // Check message order and content (payload and headers)
+            for (i, message) in messages.messages.iter().enumerate() {
+                assert_eq!(
+                    message.payload,
+                    Bytes::from(self.messages[i].as_bytes().to_vec())
+                );
+                assert_eq!(
+                    message.user_headers_map().unwrap().is_some(),
+                    !self.headers.is_empty()
+                );
+                assert_eq!(&message.user_headers_map().unwrap().unwrap(), &self.headers);
+            }
 
-        // Check if there are only the expected number of messages
-        assert_eq!(messages.messages.len(), self.message_count);
+            let topic_delete = client
+                .delete_topic(
+                    &stream_id.try_into().unwrap(),
+                    &topic_id.try_into().unwrap(),
+                )
+                .await;
+            assert!(topic_delete.is_ok());
 
-        // Check message order and content (payload and headers)
-        for (i, message) in messages.messages.iter().enumerate() {
-            assert_eq!(
-                message.payload,
-                Bytes::from(self.messages[i].as_bytes().to_vec())
-            );
-            assert_eq!(
-                message.user_headers_map().unwrap().is_some(),
-                !self.headers.is_empty()
-            );
-            assert_eq!(&message.user_headers_map().unwrap().unwrap(), &self.headers);
+            let stream_delete = client.delete_stream(&stream_id.try_into().unwrap()).await;
+            assert!(stream_delete.is_ok());
         }
-
-        let topic_delete = client.delete_topic(&stream_id, &topic_id).await;
-        assert!(topic_delete.is_ok());
-
-        let stream_delete = client.delete_stream(&stream_id).await;
-        assert!(stream_delete.is_ok());
 
         let file_removal = std::fs::remove_file(&self.input_file);
         assert!(file_removal.is_ok());

@@ -20,10 +20,20 @@ using Apache.Iggy.JsonConverters;
 
 namespace Apache.Iggy.Contracts.Auth;
 
+/// <summary>
+///     Information about a personal access token
+/// </summary>
 public sealed class PersonalAccessTokenResponse
 {
+    /// <summary>
+    ///     Personal access token identifier.
+    /// </summary>
     public required string Name { get; init; }
 
+
+    /// <summary>
+    ///     The expiry date of the token.
+    /// </summary>
     [JsonConverter(typeof(ExpiryConverter))]
     public DateTimeOffset? ExpiryAt { get; init; }
 }

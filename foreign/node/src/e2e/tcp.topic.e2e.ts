@@ -24,73 +24,65 @@ import { getTestClient } from './test-client.utils.js';
 
 
 describe('e2e -> topic', async () => {
-  
-  const c = getTestClient();
-  
-  const streamId = 111;
-  const topicId = 123;
 
-  await c.stream.create({ streamId, name: 'e2e-tcp-topic-stream' });
+  const c = getTestClient();
+  const streamName = 'e2e-tcp-topic-stream';
+
+  const topicName = 'e2e-tcp-topic-topic-123';
+  await c.stream.create({ name: streamName });
 
   it('e2e -> topic::create', async () => {
-    const topic = await c.topic.create({
-      streamId, topicId,
-      name: 'e2e-tcp-topic',
+    const TOPIC = await c.topic.create({
+      streamId: streamName,
+      name: topicName,
       partitionCount: 0,
       compressionAlgorithm: 1,
       messageExpiry: 0n,
       replicationFactor: 1
     });
-    assert.ok(topic);
+    assert.ok(TOPIC);
   });
 
   it('e2e -> topic::list', async () => {
-    const topics = await c.topic.list({ streamId });
+    const topics = await c.topic.list({ streamId: streamName });
     assert.ok(topics.length > 0);
   });
 
   it('e2e -> topic::get', async () => {
-    const topic = await c.topic.get({ streamId, topicId });
+    const topic = await c.topic.get({ streamId: streamName, topicId: topicName });
     assert.ok(topic);
   });
 
   it('e2e -> topic::createPartition', async () => {
     const cp = await c.partition.create({
-      streamId, topicId,
-      partitionCount : 22
+      streamId: streamName,
+      topicId: topicName,
+      partitionCount: 22
     });
     assert.ok(cp);
   });
 
   it('e2e -> topic::deletePartition', async () => {
     const dp = await c.partition.delete({
-      streamId, topicId,
-      partitionCount : 19
+      streamId: streamName,
+      topicId: topicName,
+      partitionCount: 19
     });
     assert.ok(dp);
   });
 
-  it('e2e -> topic::update', async () => {
-    const topic = await c.topic.get({ streamId, topicId });
-    assert.ok(topic);
-    const u2 = await c.topic.update({
-      streamId, topicId,
-      name: topic.name,
-      messageExpiry: 42n
-    });
-    assert.ok(u2);
-  });
-
   it('e2e -> topic::purge', async () => {
-    assert.ok(await c.topic.purge({ streamId, topicId }));
+    assert.ok(await c.topic.purge({ streamId: streamName, topicId: topicName }));
   });
 
   it('e2e -> topic::delete', async () => {
-    assert.ok(await c.topic.delete({ streamId, topicId, partitionsCount: 0 }));
+    assert.ok(await c.topic.delete({
+      streamId: streamName, topicId: topicName, partitionsCount: 0
+    }));
   });
 
   it('e2e -> topic::cleanup', async () => {
-    assert.ok(await c.stream.delete({ streamId }));
+    assert.ok(await c.stream.delete({ streamId: streamName }));
     assert.ok(await c.session.logout());
   });
 

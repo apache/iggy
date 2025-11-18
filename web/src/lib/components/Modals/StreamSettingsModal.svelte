@@ -9,7 +9,6 @@
   import { setError, superForm, defaults } from 'sveltekit-superforms/client';
   import { zod4 } from 'sveltekit-superforms/adapters';
   import { fetchRouteApi } from '$lib/api/fetchRouteApi';
-  import { dataHas } from '$lib/utils/dataHas';
   import { goto } from '$app/navigation';
   import { showToast } from '../AppToasts.svelte';
   import ModalConfirmation from '../ModalConfirmation.svelte';
@@ -52,10 +51,36 @@
         }
       });
 
-      if (dataHas(data, 'field', 'reason')) {
-        return setError(form, data.field, data.reason);
+      if (!ok) {
+        // Handle API errors
+        if (data?.field && data?.reason) {
+          // Field-specific error - show in form
+          return setError(form, data.field, data.reason);
+        } else if (data?.reason) {
+          // General error with reason - show toast
+          let errorMessage = data.reason;
+          if (data.code && data.id) {
+            errorMessage += `\n${data.code} (${data.id})`;
+          } else if (data.code) {
+            errorMessage += `\n${data.code}`;
+          }
+          showToast({
+            type: 'error',
+            description: errorMessage,
+            duration: 5000
+          });
+        } else {
+          // Fallback error message
+          showToast({
+            type: 'error',
+            description: 'Operation failed',
+            duration: 5000
+          });
+        }
+        return;
       }
 
+      // Success
       if (ok) {
         closeModal(async () => {
           await customInvalidateAll();
@@ -64,6 +89,15 @@
             description: `Stream ${form.data.name} has been updated.`,
             duration: 3500
           });
+        });
+      } else {
+        // Handle API errors that don't have field-specific errors
+        const errorMessage =
+          typeof data === 'string' ? data : data?.message || 'Failed to update stream';
+        showToast({
+          type: 'error',
+          description: errorMessage,
+          duration: 5000
         });
       }
     }
@@ -89,6 +123,15 @@
             description: `Stream ${stream.name} has been deleted.`,
             duration: 3500
           });
+        });
+      } else {
+        // Handle API errors for stream deletion
+        const errorMessage =
+          typeof data === 'string' ? data : data?.message || 'Failed to delete stream';
+        showToast({
+          type: 'error',
+          description: errorMessage,
+          duration: 5000
         });
       }
     }
@@ -116,12 +159,7 @@
 
   <div class="h-[350px] flex flex-col">
     <form method="POST" class="flex flex-col h-[300px] gap-4 flex-3 pb-5" use:enhance>
-      <Input
-        name="name"
-        label="Name"
-        bind:value={$form.name}
-        errorMessage={$errors.name?.join(',')}
-      />
+      <Input name="name" label="Name" bind:value={$form.name} errorMessage={$errors.name?.[0]} />
 
       <div class="flex justify-end gap-3 w-full mt-auto">
         <Button type="button" variant="text" class="w-2/5" onclick={() => closeModal()}

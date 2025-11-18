@@ -1,4 +1,5 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
  * regarding copyright ownership.  The ASF licenses this file
@@ -21,7 +22,8 @@ use super::{
     error::ApiError,
     models::{SinkDetailsResponse, SinkInfoResponse, TransformResponse},
 };
-use crate::{configs::ConfigFormat, context::RuntimeContext, error::RuntimeError};
+use crate::configs::connectors::ConfigFormat;
+use crate::{context::RuntimeContext, error::RuntimeError};
 use axum::{
     Json, Router,
     extract::{Path, Query, State},

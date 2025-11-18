@@ -1,4 +1,5 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
  * regarding copyright ownership.  The ASF licenses this file
@@ -34,11 +35,10 @@ use std::{
 };
 use tracing::{debug, error, info, warn};
 
+use crate::configs::connectors::SourceConfig;
 use crate::{
     PLUGIN_ID, RuntimeError, SourceApi, SourceConnector, SourceConnectorPlugin,
-    SourceConnectorProducer, SourceConnectorWrapper,
-    configs::SourceConfig,
-    resolve_plugin_path,
+    SourceConnectorProducer, SourceConnectorWrapper, resolve_plugin_path,
     state::{FileStateProvider, StateProvider, StateStorage},
     transform,
 };
@@ -60,7 +60,10 @@ pub async fn init(
 
         let plugin_id = PLUGIN_ID.load(Ordering::Relaxed);
         let path = resolve_plugin_path(&config.path);
-        info!("Initializing source container with name: {name} ({key}), plugin: {path}",);
+        info!(
+            "Initializing source container with name: {name} ({key}), config version: {}, plugin: {path}",
+            &config.version
+        );
         let state_storage = get_state_storage(state_path, &key);
         let state = match &state_storage {
             StateStorage::File(file) => file.load().await?,

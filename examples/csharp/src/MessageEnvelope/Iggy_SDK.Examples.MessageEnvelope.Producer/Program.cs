@@ -1,4 +1,4 @@
-﻿// Licensed to the Apache Software Foundation (ASF) under one
+// Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
 // regarding copyright ownership.  The ASF licenses this file
@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using Apache.Iggy.Configuration;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Factory;
 using Iggy_SDK.Examples.MessageEnvelope.Producer;
@@ -23,15 +24,14 @@ using Microsoft.Extensions.Logging;
 var loggerFactory = LoggerFactory.Create(b => { b.AddConsole(); });
 var logger = loggerFactory.CreateLogger<Program>();
 
-var client = MessageStreamFactory.CreateMessageStream(
-    opt =>
-    {
-        opt.BaseAdress = Utils.GetTcpServerAddr(args, logger);
-        opt.Protocol = Protocol.Tcp;
-    },
-    loggerFactory
-);
+var client = IggyClientFactory.CreateClient(new IggyClientConfigurator()
+{
+    BaseAddress = Utils.GetTcpServerAddr(args, logger),
+    Protocol = Protocol.Tcp,
+    LoggerFactory = loggerFactory
+});
 
+await client.ConnectAsync();
 await client.LoginUser("iggy", "iggy");
 
 await Utils.InitSystem(client, logger);

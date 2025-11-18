@@ -23,19 +23,17 @@ import { ClientConfig, SingleClient } from './client/index.js';
 import { groupConsumerStream } from './stream/consumer-stream.js';
 import { PollingStrategy, type PollMessagesResponse } from './wire/index.js';
 
-const streamId = 321;
-const topicId = 543;
-const groupId = 531231;
+const streamName = 'debug-snd-stream';
+const topicName = 'debug-snd-topic';
+const groupName = 'debug-snd-group';
 
 const stream = {
-  streamId,
-  name: 'debug2-send-message-stream'
+  name: streamName
 };
 
 const topic = {
-  streamId,
-  topicId,
-  name: 'debug2-send-message-topic',
+  streamId: streamName,
+  name: topicName,
   partitionCount: 1,
   compressionAlgorithm: 1
 };
@@ -59,14 +57,14 @@ const opt: ClientConfig = {
 const c = new SingleClient(opt);
 
 const cleanup = async () => {
-  assert.ok(await c.stream.delete(stream));
+  assert.ok(await c.stream.delete({ streamId: streamName }));
   assert.ok(await c.session.logout());
   c.destroy();
 }
 
 const msg = {
-  streamId,
-  topicId,
+  streamId: streamName,
+  topicId: topicName,
   messages: [
     { payload: 'yolo msg 2' },
     { payload: 'yolo msg v4' },
@@ -77,9 +75,9 @@ const msg = {
 try {
 
   await c.stream.create(stream);
-  console.log('server stream CREATED::', { streamId });
+  console.log('server stream CREATED::', { streamName });
   await c.topic.create(topic);
-  console.log('server topic CREATED::', { topicId });
+  console.log('server topic CREATED::', { topicName });
 
   // send
   setInterval(async () => {
@@ -90,9 +88,9 @@ try {
 
   // POLL MESSAGE
   const pollReq = {
-    groupId,
-    streamId,
-    topicId,
+    groupName,
+    streamId: streamName,
+    topicId: topicName,
     pollingStrategy: PollingStrategy.Next,
     count: 1,
     interval: 5000

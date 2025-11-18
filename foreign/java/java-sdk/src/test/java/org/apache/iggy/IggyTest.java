@@ -19,8 +19,9 @@
 
 package org.apache.iggy;
 
-import org.junit.jupiter.api.Test;
 import org.apache.iggy.client.blocking.http.IggyHttpClient;
+import org.junit.jupiter.api.Test;
+
 import static org.assertj.core.api.Assertions.assertThat;
 
 class IggyTest {
@@ -29,11 +30,8 @@ class IggyTest {
     void test() {
         var baseClient = new IggyHttpClient("http://localhost:8080");
 
-        var client = Iggy.clientBuilder()
-                .withBaseClient(baseClient)
-                .build();
+        var client = Iggy.clientBuilder().withBaseClient(baseClient).build();
 
         assertThat(client).isNotNull();
     }
-
 }

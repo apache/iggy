@@ -38,15 +38,4 @@ internal static class TopicFactory
         return (topicId, partitionsCount, topicName, messageExpiry, sizeBytes, messagesCount, createdAt,
             replicationFactor, maxTopicSize);
     }
-
-    internal static CreateTopicRequest CreateTopicRequest()
-    {
-        return new CreateTopicRequest((uint)Random.Shared.Next(1, 9999),
-            "test_topic" + Random.Shared.Next(1, 69) + Utility.RandomString(12).ToLower(),
-            CompressionAlgorithm.Gzip,
-            (ulong)Random.Shared.Next(1, 69),
-            maxTopicSize: (ulong)Random.Shared.NextInt64(2_000_000_000, 10_000_000_000),
-            replicationFactor: (byte)Random.Shared.Next(1, 8),
-            partitionsCount: (uint)Random.Shared.Next(5, 25));
-    }
 }

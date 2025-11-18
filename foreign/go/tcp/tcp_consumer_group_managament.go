@@ -47,17 +47,13 @@ func (tms *IggyTcpClient) GetConsumerGroup(streamId, topicId, groupId iggcon.Ide
 	return consumerGroupDetails, err
 }
 
-func (tms *IggyTcpClient) CreateConsumerGroup(streamId iggcon.Identifier, topicId iggcon.Identifier, name string, groupId *uint32) (*iggcon.ConsumerGroupDetails, error) {
-	if groupId != nil && *groupId == 0 {
-		return nil, ierror.ErrInvalidConsumerGroupId
-	}
+func (tms *IggyTcpClient) CreateConsumerGroup(streamId iggcon.Identifier, topicId iggcon.Identifier, name string) (*iggcon.ConsumerGroupDetails, error) {
 	if MaxStringLength < len(name) || len(name) == 0 {
 		return nil, ierror.ErrInvalidConsumerGroupName
 	}
 	message := binaryserialization.CreateGroup(iggcon.CreateConsumerGroupRequest{
 		StreamId:        streamId,
 		TopicId:         topicId,
-		ConsumerGroupId: groupId,
 		Name:            name,
 	})
 	buffer, err := tms.sendAndFetchResponse(message, iggcon.CreateGroupCode)

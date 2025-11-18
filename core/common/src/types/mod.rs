@@ -22,7 +22,7 @@ pub(crate) mod cluster;
 pub(crate) mod command;
 pub(crate) mod compression;
 pub(crate) mod configuration;
-pub(crate) mod confirmation;
+pub(crate) mod consensus;
 pub(crate) mod consumer;
 pub(crate) mod diagnostic;
 pub(crate) mod identifier;

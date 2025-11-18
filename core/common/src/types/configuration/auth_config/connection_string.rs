@@ -43,7 +43,11 @@ impl<T: ConnectionStringOptions + Default> ConnectionString<T> {
     }
 
     pub fn new(connection_string: &str) -> Result<Self, IggyError> {
-        let connection_string = connection_string.split("://").collect::<Vec<&str>>()[1];
+        let protocol_parts = connection_string.split("://").collect::<Vec<&str>>();
+        if protocol_parts.len() != 2 {
+            return Err(IggyError::InvalidConnectionString);
+        }
+        let connection_string = protocol_parts[1];
         let parts = connection_string.split('@').collect::<Vec<&str>>();
         let mut username = "";
         let mut password = "";

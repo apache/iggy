@@ -19,10 +19,12 @@
 
 package org.apache.iggy.client.blocking;
 
+import org.apache.iggy.user.IdentityInfo;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
-import org.apache.iggy.user.IdentityInfo;
+
 import java.math.BigInteger;
+
 import static org.assertj.core.api.Assertions.assertThat;
 
 public abstract class PersonalAccessTokensBaseTest extends IntegrationTest {
@@ -40,7 +42,7 @@ public abstract class PersonalAccessTokensBaseTest extends IntegrationTest {
         for (var token : existingTokens) {
             try {
                 personalAccessTokensClient.deletePersonalAccessToken(token.name());
-            } catch (Exception e) {
+            } catch (RuntimeException e) {
                 // Ignore if already deleted
             }
         }
@@ -49,8 +51,8 @@ public abstract class PersonalAccessTokensBaseTest extends IntegrationTest {
     @Test
     void shouldManagePersonalAccessTokens() {
         // when
-        var createdToken = personalAccessTokensClient.createPersonalAccessToken("new-token",
-                BigInteger.valueOf(50_000));
+        var createdToken =
+                personalAccessTokensClient.createPersonalAccessToken("new-token", BigInteger.valueOf(50_000));
 
         // then
         assertThat(createdToken).isNotNull();
@@ -73,8 +75,8 @@ public abstract class PersonalAccessTokensBaseTest extends IntegrationTest {
     @Test
     void shouldCreateAndLogInWithPersonalAccessToken() {
         // given
-        var createdToken = personalAccessTokensClient.createPersonalAccessToken("new-token",
-                BigInteger.valueOf(50_000));
+        var createdToken =
+                personalAccessTokensClient.createPersonalAccessToken("new-token", BigInteger.valueOf(50_000));
         client.users().logout();
 
         // when
@@ -84,7 +86,7 @@ public abstract class PersonalAccessTokensBaseTest extends IntegrationTest {
         assertThat(identityInfo).isNotNull();
 
         // when
-        var user = client.users().getUser(1L);
+        var user = client.users().getUser(0L);
 
         // then
         assertThat(user).isPresent();
@@ -92,5 +94,4 @@ public abstract class PersonalAccessTokensBaseTest extends IntegrationTest {
         // cleanup
         personalAccessTokensClient.deletePersonalAccessToken("new-token");
     }
-
 }

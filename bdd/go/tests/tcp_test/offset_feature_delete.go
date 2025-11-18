@@ -37,7 +37,7 @@ var _ = ginkgo.Describe("DELETE CONSUMER OFFSET:", func() {
 			topicIdentifier, _ := iggcon.NewIdentifier(topicId)
 			groupIdentifier, _ := iggcon.NewIdentifier(groupId)
 
-			partitionId := uint32(1)
+			partitionId := uint32(0)
 			testOffset := uint64(1)
 			consumer := iggcon.NewSingleConsumer(groupIdentifier)
 

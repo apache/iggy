@@ -21,13 +21,32 @@ services:
     environment:
       IGGY_ROOT_USERNAME: admin
       IGGY_ROOT_PASSWORD: admin
+      IGGY_HTTP_ADDRESS: 0.0.0.0:3000
+      IGGY_QUIC_ADDRESS: 0.0.0.0:8080
+      IGGY_TCP_ADDRESS: 0.0.0.0:8090
+      IGGY_WEBSOCKET_ADDRESS: 0.0.0.0:8092
+    cap_add:
+      - SYS_NICE
+    security_opt:
+      - seccomp:unconfined
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    networks:
+      - iggy
     ports:
       - 3000:3000
       - 8080:8080
       - 8090:8090
+      - 8092:8092
     volumes:
       - iggy-server:/local_data
 
 volumes:
   iggy-server:
     driver: local
+
+networks:
+  iggy:
+    name: iggy-network

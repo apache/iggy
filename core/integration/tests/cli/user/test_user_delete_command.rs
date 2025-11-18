@@ -111,7 +111,7 @@ pub async fn should_be_successful() {
             String::from("username"),
             String::from("password"),
             UserStatus::Active,
-            2,
+            1,
             TestUserId::Numeric,
         ))
         .await;
@@ -120,7 +120,7 @@ pub async fn should_be_successful() {
             String::from("testuser"),
             String::from("testpass"),
             UserStatus::Inactive,
-            2,
+            1,
             TestUserId::Named,
         ))
         .await;

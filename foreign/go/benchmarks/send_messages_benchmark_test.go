@@ -105,24 +105,23 @@ func BenchmarkSendMessage(b *testing.B) {
 
 func ensureInfrastructureIsInitialized(cli iggycli.Client, streamId uint32) error {
 	streamIdentifier, _ := iggcon.NewIdentifier(streamId)
-	if _, streamErr := cli.GetStream(streamIdentifier); streamErr != nil {
-		_, streamErr = cli.CreateStream("benchmark"+fmt.Sprint(streamId), &streamId)
+    if _, streamErr := cli.GetStream(streamIdentifier); streamErr != nil {
+        _, streamErr = cli.CreateStream("benchmark"+fmt.Sprint(streamId))
 		if streamErr != nil {
 			panic(streamErr)
 		}
 	}
 
-	topicIdentifier, _ := iggcon.NewIdentifier(uint32(1))
-	if _, topicErr := cli.GetTopic(streamIdentifier, topicIdentifier); topicErr != nil {
-		_, topicErr = cli.CreateTopic(
+    topicIdentifier, _ := iggcon.NewIdentifier(uint32(0))
+    if _, topicErr := cli.GetTopic(streamIdentifier, topicIdentifier); topicErr != nil {
+        _, topicErr = cli.CreateTopic(
 			streamIdentifier,
 			"benchmark",
 			1,
 			iggcon.CompressionAlgorithmNone,
 			iggcon.IggyExpiryServerDefault,
 			1,
-			nil,
-			nil,
+            nil,
 		)
 
 		if topicErr != nil {

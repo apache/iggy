@@ -65,12 +65,17 @@ def no_streams_in_system(context):
     pass
 
 
-@when(parsers.parse('I create a stream with ID {stream_id:d} and name {stream_name}'))
-def create_stream(context, stream_id, stream_name):
-    """Create a stream with specified ID and name"""
+@when(parsers.parse('I create a stream with name {stream_name}'))
+def create_stream(context, stream_name):
+    """Create a stream with specified name"""    
     async def _create():
-        await context.client.create_stream(name=stream_name, stream_id=stream_id)
-        context.last_stream_id = stream_id
+        await context.client.create_stream(name=stream_name)
+        
+        stream = await context.client.get_stream(stream_name)
+        if stream is None:
+            raise RuntimeError(f"Stream {stream_name} was not found after creation")
+        
+        context.last_stream_id = stream.id
         context.last_stream_name = stream_name
 
     asyncio.run(_create())
@@ -86,29 +91,32 @@ def stream_created_successfully(context):
     asyncio.run(_verify())
 
 
-@then(parsers.parse('the stream should have ID {stream_id:d} and name {stream_name}'))
-def verify_stream_properties(context, stream_id, stream_name):
-    """Verify stream has correct ID and name"""
+@then(parsers.parse('the stream should have name {stream_name}'))
+def verify_stream_properties(context, stream_name):
+    """Verify stream has correct name"""
     async def _verify():
         stream = await context.client.get_stream(stream_name)
         assert stream is not None
-        assert stream.id == stream_id
         assert stream.name == stream_name
 
     asyncio.run(_verify())
 
 
-@when(parsers.parse('I create a topic with ID {topic_id:d} and name {topic_name} in stream {stream_id:d} with {partitions:d} partitions'))
-def create_topic(context, topic_id, topic_name, stream_id, partitions):
+@when(parsers.parse('I create a topic with name {topic_name} in stream {stream_id:d} with {partitions:d} partitions'))
+def create_topic(context, topic_name, stream_id, partitions):
     """Create a topic with specified parameters"""
     async def _create():
         await context.client.create_topic(
             stream=stream_id,
             name=topic_name,
-            partitions_count=partitions,
-            topic_id=topic_id
+            partitions_count=partitions
         )
-        context.last_topic_id = topic_id
+        
+        topic = await context.client.get_topic(stream_id, topic_name)
+        if topic is None:
+            raise RuntimeError(f"Topic {topic_name} was not found after creation")
+        
+        context.last_topic_id = topic.id
         context.last_topic_name = topic_name
         context.last_topic_partitions = partitions
 
@@ -125,13 +133,12 @@ def topic_created_successfully(context):
     asyncio.run(_verify())
 
 
-@then(parsers.parse('the topic should have ID {topic_id:d} and name {topic_name}'))
-def verify_topic_properties(context, topic_id, topic_name):
-    """Verify topic has correct ID and name"""
+@then(parsers.parse('the topic should have name {topic_name}'))
+def verify_topic_properties(context, topic_name):
+    """Verify topic has correct name"""
     async def _verify():
         topic = await context.client.get_topic(context.last_stream_id, topic_name)
         assert topic is not None
-        assert topic.id == topic_id
         assert topic.name == topic_name
 
     asyncio.run(_verify())

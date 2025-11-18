@@ -21,7 +21,7 @@ package org.apache.iggy.client.blocking;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
-import java.util.Optional;
+
 import static org.assertj.core.api.Assertions.assertThat;
 
 public abstract class StreamClientBaseTest extends IntegrationTest {
@@ -38,14 +38,13 @@ public abstract class StreamClientBaseTest extends IntegrationTest {
     @Test
     void shouldCreateAndDeleteStream() {
         // when
-        streamsClient.createStream(Optional.of(42L), "test-stream");
-        trackStream(42L);
-        var streamOptional = streamsClient.getStream(42L);
+        var streamDetails = streamsClient.createStream("test-stream");
+        trackStream(streamDetails.id());
+        var streamOptional = streamsClient.getStream(streamDetails.id());
 
         // then
         assertThat(streamOptional).isPresent();
         var stream = streamOptional.get();
-        assertThat(stream.id()).isEqualTo(42L);
         assertThat(stream.name()).isEqualTo("test-stream");
 
         // when
@@ -55,8 +54,8 @@ public abstract class StreamClientBaseTest extends IntegrationTest {
         assertThat(streams).hasSize(1);
 
         // when
-        streamsClient.deleteStream(42L);
-        createdStreamIds.remove(42L); // Remove from tracking since we deleted it
+        streamsClient.deleteStream(streamDetails.id());
+        createdStreamIds.remove(streamDetails.id()); // Remove from tracking since we deleted it
         streams = streamsClient.getStreams();
 
         // then
@@ -66,18 +65,17 @@ public abstract class StreamClientBaseTest extends IntegrationTest {
     @Test
     void shouldUpdateStream() {
         // given
-        streamsClient.createStream(Optional.of(42L), "test-stream");
-        trackStream(42L);
+        var streamDetails = streamsClient.createStream("test-stream");
+        trackStream(streamDetails.id());
 
         // when
-        streamsClient.updateStream(42L, "test-stream-new");
+        streamsClient.updateStream(streamDetails.id(), "test-stream-new");
 
         // then
-        var streamOptional = streamsClient.getStream(42L);
+        var streamOptional = streamsClient.getStream(streamDetails.id());
 
         assertThat(streamOptional).isPresent();
         var stream = streamOptional.get();
-        assertThat(stream.id()).isEqualTo(42L);
         assertThat(stream.name()).isEqualTo("test-stream-new");
     }
 

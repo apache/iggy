@@ -24,9 +24,13 @@ namespace Apache.Iggy.Enums;
 /// </summary>
 public enum CompressionAlgorithm
 {
-    // No compression
+    /// <summary>
+    ///     No compression.
+    /// </summary>
     None = 1,
 
-    // Gzip compression algorithm
+    /// <summary>
+    ///     Gzip compression algorithm.
+    /// </summary>
     Gzip = 2
 }

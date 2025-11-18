@@ -22,14 +22,13 @@ package org.apache.iggy.message;
 import java.math.BigInteger;
 
 public record MessageHeader(
-    BigInteger checksum,
-    MessageId id,
-    BigInteger offset,
-    BigInteger timestamp,
-    BigInteger originTimestamp,
-    Long userHeadersLength,
-    Long payloadLength
-) {
+        BigInteger checksum,
+        MessageId id,
+        BigInteger offset,
+        BigInteger timestamp,
+        BigInteger originTimestamp,
+        Long userHeadersLength,
+        Long payloadLength) {
 
-  public static final int SIZE = 8 + 16 + 8 + 8 + 8 + 4 + 4;
+    public static final int SIZE = 8 + 16 + 8 + 8 + 8 + 4 + 4;
 }

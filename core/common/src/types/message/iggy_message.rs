@@ -41,9 +41,9 @@ use tracing::warn;
 /// # Constraints
 ///
 /// * Minimum payload size: 1 byte (empty payloads are not allowed)
-/// * Maximum payload size: 10 MB
+/// * Maximum payload size: 64 MB
 ///
-pub const MAX_PAYLOAD_SIZE: u32 = 10 * 1000 * 1000;
+pub const MAX_PAYLOAD_SIZE: u32 = 64 * 1000 * 1000;
 
 /// Maximum allowed size in bytes for user-defined headers.
 ///

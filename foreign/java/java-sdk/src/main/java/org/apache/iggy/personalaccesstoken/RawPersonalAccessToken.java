@@ -19,5 +19,4 @@
 
 package org.apache.iggy.personalaccesstoken;
 
-public record RawPersonalAccessToken(String token) {
-}
+public record RawPersonalAccessToken(String token) {}

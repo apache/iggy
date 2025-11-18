@@ -1,4 +1,4 @@
-﻿// Licensed to the Apache Software Foundation (ASF) under one
+// Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
 // regarding copyright ownership.  The ASF licenses this file
@@ -15,8 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using System.Runtime.InteropServices;
 using System.Text;
 using Apache.Iggy;
+using Apache.Iggy.Configuration;
 using Apache.Iggy.Factory;
 using Apache.Iggy.Kinds;
 using Iggy_SDK.Examples.Basic.Consumer;
@@ -35,22 +37,21 @@ logger.LogInformation(
     settings.Protocol
 );
 
-var client = MessageStreamFactory.CreateMessageStream(
-    opt =>
-    {
-        opt.BaseAdress = settings.BaseAddress;
-        opt.Protocol = settings.Protocol;
-    },
-    loggerFactory
-);
+var client = IggyClientFactory.CreateClient(new IggyClientConfigurator()
+{
+    BaseAddress = settings.BaseAddress,
+    Protocol = settings.Protocol,
+    LoggerFactory = loggerFactory
+});
 
+await client.ConnectAsync();
 await client.LoginUser(settings.Username, settings.Password);
 
 logger.LogInformation("Basic consumer has logged on successfully");
 
 var streamId = Identifier.String(settings.StreamName);
 var topicId = Identifier.String(settings.TopicName);
-var partitionId = 1u;
+var partitionId = 0u;
 var consumerId = 1;
 
 await ExampleHelpers.EnsureStreamExists(client, streamId, settings.StreamName);

@@ -19,11 +19,33 @@ using Apache.Iggy.Enums;
 
 namespace Apache.Iggy.Contracts.Auth;
 
+/// <summary>
+///     Information about a user.
+/// </summary>
 public sealed class UserResponse
 {
+    /// <summary>
+    ///     User identifier.
+    /// </summary>
     public required uint Id { get; init; }
+
+    /// <summary>
+    ///     User creation date.
+    /// </summary>
     public required ulong CreatedAt { get; init; }
+
+    /// <summary>
+    ///     User status.
+    /// </summary>
     public required UserStatus Status { get; init; }
+
+    /// <summary>
+    ///     User name.
+    /// </summary>
     public required string Username { get; init; }
+
+    /// <summary>
+    ///     Optional user permissions.
+    /// </summary>
     public Permissions? Permissions { get; init; }
 }

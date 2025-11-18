@@ -21,7 +21,7 @@ package org.apache.iggy.identifier;
 
 import javax.annotation.Nullable;
 
-public class TopicId extends Identifier {
+public final class TopicId extends Identifier {
 
     private TopicId(@Nullable String name, @Nullable Long id) {
         super(name, id);
@@ -34,5 +34,4 @@ public class TopicId extends Identifier {
     public static TopicId of(Long id) {
         return new TopicId(null, id);
     }
-
 }

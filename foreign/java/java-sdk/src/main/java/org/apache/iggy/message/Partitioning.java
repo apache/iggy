@@ -20,15 +20,13 @@
 package org.apache.iggy.message;
 
 import org.apache.commons.lang3.ArrayUtils;
+
 import java.nio.ByteBuffer;
 
-public record Partitioning(
-        PartitioningKind kind,
-        byte[] value
-) {
+public record Partitioning(PartitioningKind kind, byte[] value) {
 
     public static Partitioning balanced() {
-        return new Partitioning(PartitioningKind.Balanced, new byte[]{});
+        return new Partitioning(PartitioningKind.Balanced, new byte[] {});
     }
 
     public static Partitioning partitionId(Long id) {

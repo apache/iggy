@@ -26,6 +26,7 @@ import org.apache.iggy.identifier.TopicId;
 import org.apache.iggy.topic.CompressionAlgorithm;
 import org.apache.iggy.topic.Topic;
 import org.apache.iggy.topic.TopicDetails;
+
 import java.math.BigInteger;
 import java.util.List;
 import java.util.Optional;
@@ -49,40 +50,36 @@ class TopicsHttpClient implements TopicsClient {
     @Override
     public List<Topic> getTopics(StreamId streamId) {
         var request = httpClient.prepareGetRequest(STREAMS + "/" + streamId + TOPICS);
-        return httpClient.execute(request, new TypeReference<>() {
-        });
+        return httpClient.execute(request, new TypeReference<>() {});
     }
 
     @Override
-    public TopicDetails createTopic(StreamId streamId,
-                                    Optional<Long> topicId,
-                                    Long partitionsCount,
-                                    CompressionAlgorithm compressionAlgorithm,
-                                    BigInteger messageExpiry,
-                                    BigInteger maxTopicSize,
-                                    Optional<Short> replicationFactor,
-                                    String name) {
-        var request = httpClient.preparePostRequest(STREAMS + "/" + streamId + TOPICS,
-                new CreateTopic(topicId,
-                        partitionsCount,
-                        compressionAlgorithm,
-                        messageExpiry,
-                        maxTopicSize,
-                        replicationFactor,
-                        name));
-        return httpClient.execute(request, new TypeReference<>() {
-        });
+    public TopicDetails createTopic(
+            StreamId streamId,
+            Long partitionsCount,
+            CompressionAlgorithm compressionAlgorithm,
+            BigInteger messageExpiry,
+            BigInteger maxTopicSize,
+            Optional<Short> replicationFactor,
+            String name) {
+        var request = httpClient.preparePostRequest(
+                STREAMS + "/" + streamId + TOPICS,
+                new CreateTopic(
+                        partitionsCount, compressionAlgorithm, messageExpiry, maxTopicSize, replicationFactor, name));
+        return httpClient.execute(request, new TypeReference<>() {});
     }
 
     @Override
-    public void updateTopic(StreamId streamId,
-                            TopicId topicId,
-                            CompressionAlgorithm compressionAlgorithm,
-                            BigInteger messageExpiry,
-                            BigInteger maxTopicSize,
-                            Optional<Short> replicationFactor,
-                            String name) {
-        var request = httpClient.preparePutRequest(STREAMS + "/" + streamId + TOPICS + "/" + topicId,
+    public void updateTopic(
+            StreamId streamId,
+            TopicId topicId,
+            CompressionAlgorithm compressionAlgorithm,
+            BigInteger messageExpiry,
+            BigInteger maxTopicSize,
+            Optional<Short> replicationFactor,
+            String name) {
+        var request = httpClient.preparePutRequest(
+                STREAMS + "/" + streamId + TOPICS + "/" + topicId,
                 new UpdateTopic(compressionAlgorithm, messageExpiry, maxTopicSize, replicationFactor, name));
         httpClient.execute(request);
     }
@@ -94,22 +91,17 @@ class TopicsHttpClient implements TopicsClient {
     }
 
     record CreateTopic(
-            Optional<Long> topicId,
             Long partitionsCount,
             CompressionAlgorithm compressionAlgorithm,
             BigInteger messageExpiry,
             BigInteger maxTopicSize,
             Optional<Short> replicationFactor,
-            String name
-    ) {
-    }
+            String name) {}
 
     record UpdateTopic(
             CompressionAlgorithm compressionAlgorithm,
             BigInteger messageExpiry,
             BigInteger maxTopicSize,
             Optional<Short> replicationFactor,
-            String name
-    ) {
-    }
+            String name) {}
 }

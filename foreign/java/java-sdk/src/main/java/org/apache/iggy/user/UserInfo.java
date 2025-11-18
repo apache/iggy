@@ -21,10 +21,4 @@ package org.apache.iggy.user;
 
 import java.math.BigInteger;
 
-public record UserInfo(
-        Long id,
-        BigInteger createdAt,
-        UserStatus status,
-        String username
-) {
-}
+public record UserInfo(Long id, BigInteger createdAt, UserStatus status, String username) {}

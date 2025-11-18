@@ -17,9 +17,8 @@
  */
 
 use crate::server::scenarios::{
-    CONSUMER_GROUP_ID, CONSUMER_GROUP_NAME, CONSUMER_ID, CONSUMER_KIND, MESSAGES_COUNT,
-    PARTITION_ID, PARTITIONS_COUNT, STREAM_ID, STREAM_NAME, TOPIC_ID, TOPIC_NAME,
-    get_consumer_group, leave_consumer_group,
+    CONSUMER_GROUP_NAME, CONSUMER_KIND, MESSAGES_COUNT, PARTITION_ID, PARTITIONS_COUNT,
+    STREAM_NAME, TOPIC_NAME, get_consumer_group, leave_consumer_group,
 };
 use bytes::Bytes;
 use iggy::prelude::*;
@@ -32,7 +31,7 @@ pub async fn run(client_factory: &dyn ClientFactory) {
 
     let consumer = Consumer {
         kind: CONSUMER_KIND,
-        id: Identifier::numeric(CONSUMER_ID).unwrap(),
+        id: Identifier::named("test-consumer").unwrap(),
     };
 
     // 0. Ping server
@@ -49,19 +48,16 @@ pub async fn run(client_factory: &dyn ClientFactory) {
     assert!(streams.is_empty());
 
     // 3. Create the stream
-    let stream = client
-        .create_stream(STREAM_NAME, Some(STREAM_ID))
-        .await
-        .unwrap();
+    let stream = client.create_stream(STREAM_NAME).await.unwrap();
 
-    assert_eq!(stream.id, STREAM_ID);
+    let stream_id = stream.id;
     assert_eq!(stream.name, STREAM_NAME);
 
     // 4. Get streams and validate that created stream exists
     let streams = client.get_streams().await.unwrap();
     assert_eq!(streams.len(), 1);
     let stream = streams.first().unwrap();
-    assert_eq!(stream.id, STREAM_ID);
+    assert_eq!(stream.id, stream_id);
     assert_eq!(stream.name, STREAM_NAME);
     assert_eq!(stream.topics_count, 0);
     assert_eq!(stream.size, 0);
@@ -69,12 +65,12 @@ pub async fn run(client_factory: &dyn ClientFactory) {
 
     // 5. Get stream details by ID
     let stream = client
-        .get_stream(&Identifier::numeric(STREAM_ID).unwrap())
+        .get_stream(&Identifier::named(STREAM_NAME).unwrap())
         .await
         .unwrap()
         .expect("Failed to get stream");
 
-    assert_eq!(stream.id, STREAM_ID);
+    assert_eq!(stream.id, stream_id);
     assert_eq!(stream.name, STREAM_NAME);
     assert_eq!(stream.topics_count, 0);
     assert!(stream.topics.is_empty());
@@ -88,45 +84,38 @@ pub async fn run(client_factory: &dyn ClientFactory) {
         .unwrap()
         .expect("Failed to get stream");
 
-    assert_eq!(stream.id, STREAM_ID);
+    assert_eq!(stream.id, stream_id);
     assert_eq!(stream.name, STREAM_NAME);
 
-    // 7. Try to create the stream with the same ID but the different name and validate that it fails
-    let create_stream_result = client
-        .create_stream(&format!("{STREAM_NAME}-2"), Some(STREAM_ID))
-        .await;
-    assert!(create_stream_result.is_err());
-
-    // 8. Try to create the stream with the same name but the different ID and validate that it fails
-    let create_stream_result = client.create_stream(STREAM_NAME, Some(STREAM_ID + 1)).await;
+    // 7. Try to create the stream with the same name and validate that it fails
+    let create_stream_result = client.create_stream(STREAM_NAME).await;
     assert!(create_stream_result.is_err());
 
     // 9. Create the topic
     let topic = client
         .create_topic(
-            &Identifier::numeric(STREAM_ID).unwrap(),
+            &Identifier::named(STREAM_NAME).unwrap(),
             TOPIC_NAME,
             PARTITIONS_COUNT,
             Default::default(),
             None,
-            Some(TOPIC_ID),
             IggyExpiry::NeverExpire,
             MaxTopicSize::ServerDefault,
         )
         .await
         .unwrap();
 
-    assert_eq!(topic.id, TOPIC_ID);
+    let topic_id = topic.id;
     assert_eq!(topic.name, TOPIC_NAME);
 
     // 10. Get topics and validate that created topic exists
     let topics = client
-        .get_topics(&Identifier::numeric(STREAM_ID).unwrap())
+        .get_topics(&Identifier::named(STREAM_NAME).unwrap())
         .await
         .unwrap();
     assert_eq!(topics.len(), 1);
     let topic = topics.first().unwrap();
-    assert_eq!(topic.id, TOPIC_ID);
+    assert_eq!(topic.id, topic_id);
     assert_eq!(topic.name, TOPIC_NAME);
     assert_eq!(topic.partitions_count, PARTITIONS_COUNT);
     assert_eq!(topic.compression_algorithm, CompressionAlgorithm::default());
@@ -139,47 +128,45 @@ pub async fn run(client_factory: &dyn ClientFactory) {
     // 11. Get topic details by ID
     let topic = client
         .get_topic(
-            &Identifier::numeric(STREAM_ID).unwrap(),
-            &Identifier::numeric(TOPIC_ID).unwrap(),
-        )
-        .await
-        .unwrap()
-        .expect("Failed to get topic");
-    assert_eq!(topic.id, TOPIC_ID);
-    assert_eq!(topic.name, TOPIC_NAME);
-    assert_eq!(topic.partitions_count, PARTITIONS_COUNT);
-    assert_eq!(topic.partitions.len(), PARTITIONS_COUNT as usize);
-    assert_eq!(topic.size, 0);
-    assert_eq!(topic.messages_count, 0);
-    let mut id = 1;
-    for topic_partition in topic.partitions {
-        assert_eq!(topic_partition.id, id);
-        assert_eq!(topic_partition.segments_count, 1);
-        assert_eq!(topic_partition.size, 0);
-        assert_eq!(topic_partition.current_offset, 0);
-        assert_eq!(topic_partition.messages_count, 0);
-        id += 1;
-    }
-
-    // 12. Get topic details by name
-    let topic = client
-        .get_topic(
-            &Identifier::numeric(STREAM_ID).unwrap(),
+            &Identifier::named(STREAM_NAME).unwrap(),
             &Identifier::named(TOPIC_NAME).unwrap(),
         )
         .await
         .unwrap()
         .expect("Failed to get topic");
-    assert_eq!(topic.id, TOPIC_ID);
+    assert_eq!(topic.id, topic_id);
+    assert_eq!(topic.name, TOPIC_NAME);
+    assert_eq!(topic.partitions_count, PARTITIONS_COUNT);
+    assert_eq!(topic.partitions.len(), PARTITIONS_COUNT as usize);
+    assert_eq!(topic.size, 0);
+    assert_eq!(topic.messages_count, 0);
+    for (id, topic_partition) in topic.partitions.iter().enumerate() {
+        assert_eq!(topic_partition.id, id as u32);
+        assert_eq!(topic_partition.segments_count, 1);
+        assert_eq!(topic_partition.size, 0);
+        assert_eq!(topic_partition.current_offset, 0);
+        assert_eq!(topic_partition.messages_count, 0);
+    }
+
+    // 12. Get topic details by name
+    let topic = client
+        .get_topic(
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
+        )
+        .await
+        .unwrap()
+        .expect("Failed to get topic");
+    assert_eq!(topic.id, topic_id);
     assert_eq!(topic.name, TOPIC_NAME);
 
     // 13. Get stream details and validate that created topic exists
     let stream = client
-        .get_stream(&Identifier::numeric(STREAM_ID).unwrap())
+        .get_stream(&Identifier::named(STREAM_NAME).unwrap())
         .await
         .unwrap()
         .expect("Failed to get stream");
-    assert_eq!(stream.id, STREAM_ID);
+    assert_eq!(stream.id, stream_id);
     assert_eq!(stream.name, STREAM_NAME);
     assert_eq!(stream.topics_count, 1);
     assert_eq!(stream.topics.len(), 1);
@@ -191,30 +178,14 @@ pub async fn run(client_factory: &dyn ClientFactory) {
     assert_eq!(stream_topic.size, 0);
     assert_eq!(stream_topic.messages_count, 0);
 
-    // 15. Try to create the topic with the same ID but the different name and validate that it fails
+    // 15. Try to create the topic with the same name and validate that it fails
     let create_topic_result = client
         .create_topic(
-            &Identifier::numeric(STREAM_ID).unwrap(),
-            &format!("{TOPIC_NAME}-2"),
-            PARTITIONS_COUNT,
-            Default::default(),
-            None,
-            Some(TOPIC_ID),
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
-        )
-        .await;
-    assert!(create_topic_result.is_err());
-
-    // 16. Try to create the topic with the different ID but the same name and validate that it fails
-    let create_topic_result = client
-        .create_topic(
-            &Identifier::numeric(STREAM_ID).unwrap(),
+            &Identifier::named(STREAM_NAME).unwrap(),
             TOPIC_NAME,
             PARTITIONS_COUNT,
             Default::default(),
             None,
-            Some(TOPIC_ID + 1),
             IggyExpiry::NeverExpire,
             MaxTopicSize::ServerDefault,
         )
@@ -225,8 +196,8 @@ pub async fn run(client_factory: &dyn ClientFactory) {
     let mut messages = create_messages();
     client
         .send_messages(
-            &Identifier::numeric(STREAM_ID).unwrap(),
-            &Identifier::numeric(TOPIC_ID).unwrap(),
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
             &Partitioning::partition_id(PARTITION_ID),
             &mut messages,
         )
@@ -236,8 +207,8 @@ pub async fn run(client_factory: &dyn ClientFactory) {
     // 18. Poll messages from the specific partition in topic
     let polled_messages = client
         .poll_messages(
-            &Identifier::numeric(STREAM_ID).unwrap(),
-            &Identifier::numeric(TOPIC_ID).unwrap(),
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
             Some(PARTITION_ID),
             &consumer,
             &PollingStrategy::offset(0),
@@ -260,8 +231,8 @@ pub async fn run(client_factory: &dyn ClientFactory) {
         let start_offset = (i * batch_length) as u64;
         let polled_messages = client
             .poll_messages(
-                &Identifier::numeric(STREAM_ID).unwrap(),
-                &Identifier::numeric(TOPIC_ID).unwrap(),
+                &Identifier::named(STREAM_NAME).unwrap(),
+                &Identifier::named(TOPIC_NAME).unwrap(),
                 Some(PARTITION_ID),
                 &consumer,
                 &PollingStrategy::offset(start_offset),
@@ -281,19 +252,19 @@ pub async fn run(client_factory: &dyn ClientFactory) {
     // 20. Get topic details and validate the partition details
     let topic = client
         .get_topic(
-            &Identifier::numeric(STREAM_ID).unwrap(),
+            &Identifier::named(STREAM_NAME).unwrap(),
             &Identifier::named(TOPIC_NAME).unwrap(),
         )
         .await
         .unwrap()
         .expect("Failed to get topic");
-    assert_eq!(topic.id, TOPIC_ID);
+    assert_eq!(topic.id, topic_id);
     assert_eq!(topic.name, TOPIC_NAME);
     assert_eq!(topic.partitions_count, PARTITIONS_COUNT);
     assert_eq!(topic.partitions.len(), PARTITIONS_COUNT as usize);
     assert_eq!(topic.size, 89806);
     assert_eq!(topic.messages_count, MESSAGES_COUNT as u64);
-    let topic_partition = topic.partitions.get((PARTITION_ID - 1) as usize).unwrap();
+    let topic_partition = topic.partitions.get((PARTITION_ID) as usize).unwrap();
     assert_eq!(topic_partition.id, PARTITION_ID);
     assert_eq!(topic_partition.segments_count, 1);
     assert!(topic_partition.size > 0);
@@ -303,8 +274,8 @@ pub async fn run(client_factory: &dyn ClientFactory) {
     // 21. Ensure that messages do not exist in the second partition in the same topic
     let polled_messages = client
         .poll_messages(
-            &Identifier::numeric(STREAM_ID).unwrap(),
-            &Identifier::numeric(TOPIC_ID).unwrap(),
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
             Some(PARTITION_ID + 1),
             &consumer,
             &PollingStrategy::offset(0),
@@ -319,8 +290,8 @@ pub async fn run(client_factory: &dyn ClientFactory) {
     let offset = client
         .get_consumer_offset(
             &consumer,
-            &Identifier::numeric(STREAM_ID).unwrap(),
-            &Identifier::numeric(TOPIC_ID).unwrap(),
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
             Some(PARTITION_ID),
         )
         .await
@@ -332,8 +303,8 @@ pub async fn run(client_factory: &dyn ClientFactory) {
     client
         .store_consumer_offset(
             &consumer,
-            &Identifier::numeric(STREAM_ID).unwrap(),
-            &Identifier::numeric(TOPIC_ID).unwrap(),
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
             Some(PARTITION_ID),
             stored_offset,
         )
@@ -344,8 +315,8 @@ pub async fn run(client_factory: &dyn ClientFactory) {
     let offset = client
         .get_consumer_offset(
             &consumer,
-            &Identifier::numeric(STREAM_ID).unwrap(),
-            &Identifier::numeric(TOPIC_ID).unwrap(),
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
             Some(PARTITION_ID),
         )
         .await
@@ -359,8 +330,8 @@ pub async fn run(client_factory: &dyn ClientFactory) {
     client
         .delete_consumer_offset(
             &consumer,
-            &Identifier::numeric(STREAM_ID).unwrap(),
-            &Identifier::numeric(TOPIC_ID).unwrap(),
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
             Some(PARTITION_ID),
         )
         .await
@@ -370,8 +341,8 @@ pub async fn run(client_factory: &dyn ClientFactory) {
     let offset = client
         .get_consumer_offset(
             &consumer,
-            &Identifier::numeric(STREAM_ID).unwrap(),
-            &Identifier::numeric(TOPIC_ID).unwrap(),
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
             Some(PARTITION_ID),
         )
         .await
@@ -382,8 +353,8 @@ pub async fn run(client_factory: &dyn ClientFactory) {
     client
         .store_consumer_offset(
             &consumer,
-            &Identifier::numeric(STREAM_ID).unwrap(),
-            &Identifier::numeric(TOPIC_ID).unwrap(),
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
             Some(PARTITION_ID),
             stored_offset,
         )
@@ -394,8 +365,8 @@ pub async fn run(client_factory: &dyn ClientFactory) {
     let messages_count = 10;
     let polled_messages = client
         .poll_messages(
-            &Identifier::numeric(STREAM_ID).unwrap(),
-            &Identifier::numeric(TOPIC_ID).unwrap(),
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
             Some(PARTITION_ID),
             &consumer,
             &PollingStrategy::next(),
@@ -415,8 +386,8 @@ pub async fn run(client_factory: &dyn ClientFactory) {
     let offset = client
         .get_consumer_offset(
             &consumer,
-            &Identifier::numeric(STREAM_ID).unwrap(),
-            &Identifier::numeric(TOPIC_ID).unwrap(),
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
             Some(PARTITION_ID),
         )
         .await
@@ -429,8 +400,8 @@ pub async fn run(client_factory: &dyn ClientFactory) {
     // 29. Get the consumer groups and validate that there are no groups
     let consumer_groups = client
         .get_consumer_groups(
-            &Identifier::numeric(STREAM_ID).unwrap(),
-            &Identifier::numeric(TOPIC_ID).unwrap(),
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
         )
         .await
         .unwrap();
@@ -440,44 +411,43 @@ pub async fn run(client_factory: &dyn ClientFactory) {
     // 30. Create the consumer group
     let consumer_group = client
         .create_consumer_group(
-            &Identifier::numeric(STREAM_ID).unwrap(),
-            &Identifier::numeric(TOPIC_ID).unwrap(),
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
             CONSUMER_GROUP_NAME,
-            Some(CONSUMER_GROUP_ID),
         )
         .await
         .unwrap();
 
-    assert_eq!(consumer_group.id, CONSUMER_GROUP_ID);
+    let consumer_group_id = consumer_group.id;
     assert_eq!(consumer_group.name, CONSUMER_GROUP_NAME);
 
     // 31. Get the consumer groups and validate that there is one group
     let consumer_groups = client
         .get_consumer_groups(
-            &Identifier::numeric(STREAM_ID).unwrap(),
-            &Identifier::numeric(TOPIC_ID).unwrap(),
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
         )
         .await
         .unwrap();
 
     assert_eq!(consumer_groups.len(), 1);
     let consumer_group = consumer_groups.first().unwrap();
-    assert_eq!(consumer_group.id, CONSUMER_GROUP_ID);
+    assert_eq!(consumer_group.id, consumer_group_id);
     assert_eq!(consumer_group.partitions_count, PARTITIONS_COUNT);
     assert_eq!(consumer_group.members_count, 0);
 
     // 32. Get the consumer group details
     let consumer_group = client
         .get_consumer_group(
-            &Identifier::numeric(STREAM_ID).unwrap(),
-            &Identifier::numeric(TOPIC_ID).unwrap(),
-            &Identifier::numeric(CONSUMER_GROUP_ID).unwrap(),
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
+            &Identifier::named(CONSUMER_GROUP_NAME).unwrap(),
         )
         .await
         .unwrap()
         .expect("Failed to get consumer group");
 
-    assert_eq!(consumer_group.id, CONSUMER_GROUP_ID);
+    assert_eq!(consumer_group.id, consumer_group_id);
     assert_eq!(consumer_group.partitions_count, PARTITIONS_COUNT);
     assert_eq!(consumer_group.members_count, 0);
     assert!(consumer_group.members.is_empty());
@@ -485,16 +455,16 @@ pub async fn run(client_factory: &dyn ClientFactory) {
     // 33. Join the consumer group and then leave it if the feature is available
     let result = client
         .join_consumer_group(
-            &Identifier::numeric(STREAM_ID).unwrap(),
-            &Identifier::numeric(TOPIC_ID).unwrap(),
-            &Identifier::numeric(CONSUMER_GROUP_ID).unwrap(),
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
+            &Identifier::named(CONSUMER_GROUP_NAME).unwrap(),
         )
         .await;
 
     match result {
         Ok(_) => {
             let consumer_group = get_consumer_group(&client).await;
-            assert_eq!(consumer_group.id, CONSUMER_GROUP_ID);
+            assert_eq!(consumer_group.id, consumer_group_id);
             assert_eq!(consumer_group.partitions_count, PARTITIONS_COUNT);
             assert_eq!(consumer_group.name, CONSUMER_GROUP_NAME);
             assert_eq!(consumer_group.members_count, 1);
@@ -507,9 +477,9 @@ pub async fn run(client_factory: &dyn ClientFactory) {
             assert_eq!(me.consumer_groups_count, 1);
             assert_eq!(me.consumer_groups.len(), 1);
             let consumer_group = &me.consumer_groups[0];
-            assert_eq!(consumer_group.stream_id, STREAM_ID);
-            assert_eq!(consumer_group.topic_id, TOPIC_ID);
-            assert_eq!(consumer_group.group_id, CONSUMER_GROUP_ID);
+            assert_eq!(consumer_group.stream_id, stream_id);
+            assert_eq!(consumer_group.topic_id, topic_id);
+            assert_eq!(consumer_group.group_id, consumer_group_id);
 
             leave_consumer_group(&client).await;
 
@@ -543,9 +513,9 @@ pub async fn run(client_factory: &dyn ClientFactory) {
     // 35. Delete the consumer group
     client
         .delete_consumer_group(
-            &Identifier::numeric(STREAM_ID).unwrap(),
-            &Identifier::numeric(TOPIC_ID).unwrap(),
-            &Identifier::numeric(CONSUMER_GROUP_ID).unwrap(),
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
+            &Identifier::named(CONSUMER_GROUP_NAME).unwrap(),
         )
         .await
         .unwrap();
@@ -553,8 +523,8 @@ pub async fn run(client_factory: &dyn ClientFactory) {
     // 36. Create new partitions and validate that the number of partitions is increased
     client
         .create_partitions(
-            &Identifier::numeric(STREAM_ID).unwrap(),
-            &Identifier::numeric(TOPIC_ID).unwrap(),
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
             PARTITIONS_COUNT,
         )
         .await
@@ -562,8 +532,8 @@ pub async fn run(client_factory: &dyn ClientFactory) {
 
     let topic = client
         .get_topic(
-            &Identifier::numeric(STREAM_ID).unwrap(),
-            &Identifier::numeric(TOPIC_ID).unwrap(),
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
         )
         .await
         .unwrap()
@@ -574,8 +544,8 @@ pub async fn run(client_factory: &dyn ClientFactory) {
     // 37. Delete the partitions and validate that the number of partitions is decreased
     client
         .delete_partitions(
-            &Identifier::numeric(STREAM_ID).unwrap(),
-            &Identifier::numeric(TOPIC_ID).unwrap(),
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
             PARTITIONS_COUNT,
         )
         .await
@@ -583,8 +553,8 @@ pub async fn run(client_factory: &dyn ClientFactory) {
 
     let topic = client
         .get_topic(
-            &Identifier::numeric(STREAM_ID).unwrap(),
-            &Identifier::numeric(TOPIC_ID).unwrap(),
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
         )
         .await
         .unwrap()
@@ -601,8 +571,8 @@ pub async fn run(client_factory: &dyn ClientFactory) {
 
     client
         .update_topic(
-            &Identifier::numeric(STREAM_ID).unwrap(),
-            &Identifier::numeric(TOPIC_ID).unwrap(),
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
             &updated_topic_name,
             CompressionAlgorithm::Gzip,
             Some(updated_replication_factor),
@@ -614,8 +584,8 @@ pub async fn run(client_factory: &dyn ClientFactory) {
 
     let updated_topic = client
         .get_topic(
-            &Identifier::numeric(STREAM_ID).unwrap(),
-            &Identifier::numeric(TOPIC_ID).unwrap(),
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(&updated_topic_name).unwrap(),
         )
         .await
         .unwrap()
@@ -636,16 +606,16 @@ pub async fn run(client_factory: &dyn ClientFactory) {
     // 39. Purge the existing topic and ensure it has no messages
     client
         .purge_topic(
-            &Identifier::numeric(STREAM_ID).unwrap(),
-            &Identifier::numeric(TOPIC_ID).unwrap(),
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(&updated_topic_name).unwrap(),
         )
         .await
         .unwrap();
 
     let polled_messages = client
         .poll_messages(
-            &Identifier::numeric(STREAM_ID).unwrap(),
-            &Identifier::numeric(TOPIC_ID).unwrap(),
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(&updated_topic_name).unwrap(),
             Some(PARTITION_ID),
             &consumer,
             &PollingStrategy::offset(0),
@@ -662,14 +632,14 @@ pub async fn run(client_factory: &dyn ClientFactory) {
 
     client
         .update_stream(
-            &Identifier::numeric(STREAM_ID).unwrap(),
+            &Identifier::named(STREAM_NAME).unwrap(),
             &updated_stream_name,
         )
         .await
         .unwrap();
 
     let updated_stream = client
-        .get_stream(&Identifier::numeric(STREAM_ID).unwrap())
+        .get_stream(&Identifier::named(&updated_stream_name).unwrap())
         .await
         .unwrap()
         .expect("Failed to get stream");
@@ -680,8 +650,8 @@ pub async fn run(client_factory: &dyn ClientFactory) {
     let mut messages = create_messages();
     client
         .send_messages(
-            &Identifier::numeric(STREAM_ID).unwrap(),
-            &Identifier::numeric(TOPIC_ID).unwrap(),
+            &Identifier::named(&updated_stream_name).unwrap(),
+            &Identifier::named(&updated_topic_name).unwrap(),
             &Partitioning::partition_id(PARTITION_ID),
             &mut messages,
         )
@@ -689,14 +659,14 @@ pub async fn run(client_factory: &dyn ClientFactory) {
         .unwrap();
 
     client
-        .purge_stream(&Identifier::numeric(STREAM_ID).unwrap())
+        .purge_stream(&Identifier::named(&updated_stream_name).unwrap())
         .await
         .unwrap();
 
     let polled_messages = client
         .poll_messages(
-            &Identifier::numeric(STREAM_ID).unwrap(),
-            &Identifier::numeric(TOPIC_ID).unwrap(),
+            &Identifier::named(&updated_stream_name).unwrap(),
+            &Identifier::named(&updated_topic_name).unwrap(),
             Some(PARTITION_ID),
             &consumer,
             &PollingStrategy::offset(0),
@@ -711,41 +681,37 @@ pub async fn run(client_factory: &dyn ClientFactory) {
     // 42. Delete the existing topic and ensure it doesn't exist anymore
     client
         .delete_topic(
-            &Identifier::numeric(STREAM_ID).unwrap(),
-            &Identifier::numeric(TOPIC_ID).unwrap(),
+            &Identifier::named(&updated_stream_name).unwrap(),
+            &Identifier::named(&updated_topic_name).unwrap(),
         )
         .await
         .unwrap();
     let topics = client
-        .get_topics(&Identifier::numeric(STREAM_ID).unwrap())
+        .get_topics(&Identifier::named(&updated_stream_name).unwrap())
         .await
         .unwrap();
     assert!(topics.is_empty());
 
-    // 43. Create the stream with automatically generated ID on the server
+    // 43. Create the stream
     let stream_name = format!("{STREAM_NAME}-auto");
-    let stream_id = STREAM_ID + 1;
-    client.create_stream(&stream_name, None).await.unwrap();
+    let _ = client.create_stream(&stream_name).await.unwrap();
 
     let stream = client
-        .get_stream(&Identifier::numeric(stream_id).unwrap())
+        .get_stream(&Identifier::named(&stream_name).unwrap())
         .await
         .unwrap()
         .expect("Failed to get stream");
 
-    assert_eq!(stream.id, stream_id);
     assert_eq!(stream.name, stream_name);
 
-    // 44. Create the topic with automatically generated ID on the server
+    // 44. Create the topic
     let topic_name = format!("{TOPIC_NAME}-auto");
-    let topic_id = 1;
-    client
+    let _ = client
         .create_topic(
-            &Identifier::numeric(stream_id).unwrap(),
+            &Identifier::named(&stream_name).unwrap(),
             &topic_name,
             PARTITIONS_COUNT,
             CompressionAlgorithm::default(),
-            None,
             None,
             IggyExpiry::NeverExpire,
             MaxTopicSize::ServerDefault,
@@ -755,14 +721,13 @@ pub async fn run(client_factory: &dyn ClientFactory) {
 
     let topic = client
         .get_topic(
-            &Identifier::numeric(stream_id).unwrap(),
-            &Identifier::numeric(topic_id).unwrap(),
+            &Identifier::named(&stream_name).unwrap(),
+            &Identifier::named(&topic_name).unwrap(),
         )
         .await
         .unwrap()
         .expect("Failed to get topic");
 
-    assert_eq!(topic.id, topic_id);
     assert_eq!(topic.name, topic_name);
 
     // 45. Delete the existing streams and ensure there's no streams left
@@ -771,7 +736,7 @@ pub async fn run(client_factory: &dyn ClientFactory) {
 
     for stream in streams {
         client
-            .delete_stream(&Identifier::numeric(stream.id).unwrap())
+            .delete_stream(&Identifier::named(&stream.name).unwrap())
             .await
             .unwrap();
     }

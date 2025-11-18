@@ -21,7 +21,6 @@ using Apache.Iggy.Factory;
 using Apache.Iggy.IggyClient;
 using DotNet.Testcontainers.Builders;
 using DotNet.Testcontainers.Containers;
-using Microsoft.Extensions.Logging.Abstractions;
 using TUnit.Core.Interfaces;
 using TUnit.Core.Logging;
 
@@ -35,26 +34,25 @@ public class IggyServerFixture : IAsyncInitializer, IAsyncDisposable
         .WithOutputConsumer(Consume.RedirectStdoutAndStderrToConsole())
         .WithWaitStrategy(Wait.ForUnixContainer().UntilInternalTcpPortIsAvailable(8090))
         .WithName($"{Guid.NewGuid()}")
+        .WithEnvironment("IGGY_ROOT_USERNAME", "iggy")
+        .WithEnvironment("IGGY_ROOT_PASSWORD", "iggy")
+        .WithEnvironment("IGGY_TCP_ADDRESS", "0.0.0.0:8090")
+        .WithEnvironment("IGGY_HTTP_ADDRESS", "0.0.0.0:3000")
+        //.WithEnvironment("IGGY_CLUSTER_ENABLED", "true")
+        // .WithEnvironment("IGGY_CLUSTER_NODES_0_NAME", "iggy-node-1")
+        // .WithEnvironment("IGGY_CLUSTER_NODES_0_ADDRESS", "127.0.0.1:8090")
+        // .WithEnvironment("IGGY_CLUSTER_NODES_1_NAME", "iggy-node-2")
+        // .WithEnvironment("IGGY_CLUSTER_NODES_1_ADDRESS", "127.0.0.1:8092")
+        // .WithEnvironment("IGGY_CLUSTER_ENABLED", "true")
+        // .WithEnvironment("IGGY_CLUSTER_ENABLED", "true")
+        // .WithEnvironment("IGGY_CLUSTER_ENABLED", "true")
         //.WithEnvironment("IGGY_SYSTEM_LOGGING_LEVEL", "trace")
         //.WithEnvironment("RUST_LOG", "trace")
+        .WithPrivileged(true)
         .WithCleanUp(true)
         .Build();
 
     private string? _iggyServerHost;
-
-    private Action<MessageBatchingSettings> BatchingSettings { get; } = options =>
-    {
-        options.Enabled = false;
-        options.Interval = TimeSpan.FromMilliseconds(100);
-        options.MaxMessagesPerBatch = 1000;
-        options.MaxRequests = 4096;
-    };
-
-    private Action<MessagePollingSettings> PollingSettings { get; } = options =>
-    {
-        options.Interval = TimeSpan.FromMilliseconds(100);
-        options.StoreOffsetStrategy = StoreOffset.WhenMessagesAreReceived;
-    };
 
     public async ValueTask DisposeAsync()
     {
@@ -85,53 +83,70 @@ public class IggyServerFixture : IAsyncInitializer, IAsyncDisposable
         return dictionary;
     }
 
-    public async Task<IIggyClient> CreateTcpClient(string userName = "iggy", string password = "iggy")
+    public async Task<IIggyClient> CreateTcpClient(string userName = "iggy", string password = "iggy",
+        bool connect = true)
     {
-        var client = CreateClient(Protocol.Tcp);
+        var client = await CreateClient(Protocol.Tcp, connect: connect);
 
-        await client.LoginUser(userName, password);
-        ;
+        if (connect)
+        {
+            await client.LoginUser(userName, password);
+        }
 
         return client;
     }
 
     public async Task<IIggyClient> CreateHttpClient(string userName = "iggy", string password = "iggy")
     {
-        var client = CreateClient(Protocol.Http);
+        var client = await CreateClient(Protocol.Http);
 
         await client.LoginUser(userName, password);
 
         return client;
     }
 
-    public IIggyClient CreateClient(Protocol protocol, Protocol? targetContainer = null)
+    public async Task<IIggyClient> CreateClient(Protocol protocol, Protocol? targetContainer = null,
+        bool connect = true)
     {
-        string? address;
+        var address = GetIggyAddress(protocol);
 
+        var client = IggyClientFactory.CreateClient(new IggyClientConfigurator
+        {
+            BaseAddress = address,
+            Protocol = protocol,
+            ReconnectionSettings = new ReconnectionSettings { Enabled = true },
+            AutoLoginSettings = new AutoLoginSettings
+            {
+                Enabled = true,
+                Username = "iggy",
+                Password = "iggy"
+            }
+        });
+
+        if (connect)
+        {
+            await client.ConnectAsync();
+        }
+
+        return client;
+    }
+
+    public string GetIggyAddress(Protocol protocol)
+    {
         if (string.IsNullOrEmpty(_iggyServerHost))
         {
             var port = protocol == Protocol.Tcp
                 ? _iggyContainer.GetMappedPublicPort(8090)
                 : _iggyContainer.GetMappedPublicPort(3000);
 
-            address = protocol == Protocol.Tcp
+            return protocol == Protocol.Tcp
                 ? $"127.0.0.1:{port}"
                 : $"http://127.0.0.1:{port}";
         }
-        else
-        {
-            address = protocol == Protocol.Tcp
-                ? $"{_iggyServerHost}:8090"
-                : $"http://{_iggyServerHost}:3000";
-        }
 
-        return MessageStreamFactory.CreateMessageStream(options =>
-        {
-            options.BaseAdress = address;
-            options.Protocol = protocol;
-            options.MessageBatchingSettings = BatchingSettings;
-            options.MessagePollingSettings = PollingSettings;
-        }, NullLoggerFactory.Instance);
+        return protocol == Protocol.Tcp
+            ? $"{_iggyServerHost}:8090"
+            : $"http://{_iggyServerHost}:3000";
     }
 
     public static IEnumerable<Func<Protocol>> ProtocolData()

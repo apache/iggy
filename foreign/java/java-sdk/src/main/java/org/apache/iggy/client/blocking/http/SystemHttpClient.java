@@ -24,6 +24,7 @@ import org.apache.iggy.client.blocking.SystemClient;
 import org.apache.iggy.system.ClientInfo;
 import org.apache.iggy.system.ClientInfoDetails;
 import org.apache.iggy.system.Stats;
+
 import java.util.List;
 
 class SystemHttpClient implements SystemClient {
@@ -57,8 +58,7 @@ class SystemHttpClient implements SystemClient {
     @Override
     public List<ClientInfo> getClients() {
         var request = httpClient.prepareGetRequest(CLIENTS);
-        return httpClient.execute(request, new TypeReference<>() {
-        });
+        return httpClient.execute(request, new TypeReference<>() {});
     }
 
     @Override

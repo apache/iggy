@@ -42,5 +42,4 @@ public record PollingStrategy(PollingKind kind, BigInteger value) {
     public static PollingStrategy next() {
         return new PollingStrategy(PollingKind.Next, BigInteger.ZERO);
     }
-
 }

@@ -13,7 +13,6 @@
   import { fetchRouteApi } from '$lib/api/fetchRouteApi';
   import { showToast } from '../AppToasts.svelte';
   import { customInvalidateAll } from '../PeriodicInvalidator.svelte';
-  import { dataHas } from '$lib/utils/dataHas';
 
   interface Props {
     closeModal: CloseModalFn;
@@ -48,10 +47,36 @@
         }
       });
 
-      if (dataHas(data, 'field', 'reason')) {
-        return setError(form, data.field, data.reason);
+      if (!ok) {
+        // Handle API errors
+        if (data?.field && data?.reason) {
+          // Field-specific error - show in form
+          return setError(form, data.field, data.reason);
+        } else if (data?.reason) {
+          // General error with reason - show toast
+          let errorMessage = data.reason;
+          if (data.code && data.id) {
+            errorMessage += `\n${data.code} (${data.id})`;
+          } else if (data.code) {
+            errorMessage += `\n${data.code}`;
+          }
+          showToast({
+            type: 'error',
+            description: errorMessage,
+            duration: 5000
+          });
+        } else {
+          // Fallback error message
+          showToast({
+            type: 'error',
+            description: 'Operation failed',
+            duration: 5000
+          });
+        }
+        return;
       }
 
+      // Success
       if (ok) {
         closeModal(async () => {
           await customInvalidateAll();
@@ -60,6 +85,15 @@
             description: `User ${form.data.username} has been created.`,
             duration: 3500
           });
+        });
+      } else {
+        // Handle API errors that don't have field-specific errors
+        const errorMessage =
+          typeof data === 'string' ? data : data?.message || 'Failed to create user';
+        showToast({
+          type: 'error',
+          description: errorMessage,
+          duration: 5000
         });
       }
     }
@@ -74,13 +108,14 @@
         name="username"
         bind:value={$form.username}
         {...$constraints.username}
-        errorMessage={$errors.username?.join(',')}
+        errorMessage={$errors.username?.[0]}
       />
 
       <PasswordInput
         label="Password"
         name="password"
-        errorMessage={$errors.password?.join(',')}
+        autocomplete="new-password"
+        errorMessage={$errors.password?.[0]}
         bind:value={$form.password}
         {...$constraints.password}
       />

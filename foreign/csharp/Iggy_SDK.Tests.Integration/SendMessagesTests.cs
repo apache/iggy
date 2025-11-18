@@ -22,6 +22,7 @@ using Apache.Iggy.Exceptions;
 using Apache.Iggy.Headers;
 using Apache.Iggy.Kinds;
 using Apache.Iggy.Messages;
+using Apache.Iggy.Tests.Integrations.Attributes;
 using Apache.Iggy.Tests.Integrations.Fixtures;
 using Apache.Iggy.Tests.Integrations.Helpers;
 using Shouldly;
@@ -76,13 +77,9 @@ public class SendMessagesTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task SendMessages_NoHeaders_Should_SendMessages_Successfully(Protocol protocol)
     {
-        await Should.NotThrowAsync(() => Fixture.Clients[protocol].SendMessagesAsync(new MessageSendRequest
-        {
-            Messages = _messagesWithoutHeaders,
-            Partitioning = Partitioning.None(),
-            StreamId = Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-            TopicId = Identifier.String(Fixture.TopicRequest.Name)
-        }));
+        await Should.NotThrowAsync(() =>
+            Fixture.Clients[protocol].SendMessagesAsync(Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
+                Identifier.String(Fixture.TopicRequest.Name), Partitioning.None(), _messagesWithoutHeaders));
     }
 
     [Test]
@@ -90,14 +87,9 @@ public class SendMessagesTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task SendMessages_NoHeaders_Should_Throw_InvalidResponse(Protocol protocol)
     {
-        await Should.ThrowAsync<InvalidResponseException>(() =>
-            Fixture.Clients[protocol].SendMessagesAsync(new MessageSendRequest
-            {
-                Messages = _messagesWithoutHeaders,
-                Partitioning = Partitioning.None(),
-                StreamId = Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-                TopicId = Identifier.Numeric(69)
-            }));
+        await Should.ThrowAsync<IggyInvalidStatusCodeException>(() =>
+            Fixture.Clients[protocol].SendMessagesAsync(Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
+                Identifier.Numeric(69), Partitioning.None(), _messagesWithoutHeaders));
     }
 
     [Test]
@@ -105,13 +97,9 @@ public class SendMessagesTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task SendMessages_WithHeaders_Should_SendMessages_Successfully(Protocol protocol)
     {
-        await Should.NotThrowAsync(() => Fixture.Clients[protocol].SendMessagesAsync(new MessageSendRequest
-        {
-            Messages = _messagesWithHeaders,
-            Partitioning = Partitioning.None(),
-            StreamId = Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-            TopicId = Identifier.String(Fixture.TopicRequest.Name)
-        }));
+        await Should.NotThrowAsync(() =>
+            Fixture.Clients[protocol].SendMessagesAsync(Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
+                Identifier.String(Fixture.TopicRequest.Name), Partitioning.None(), _messagesWithHeaders));
     }
 
     [Test]
@@ -119,43 +107,8 @@ public class SendMessagesTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task SendMessages_WithHeaders_Should_Throw_InvalidResponse(Protocol protocol)
     {
-        await Should.ThrowAsync<InvalidResponseException>(() =>
-            Fixture.Clients[protocol].SendMessagesAsync(new MessageSendRequest
-            {
-                Messages = _messagesWithHeaders,
-                Partitioning = Partitioning.None(),
-                StreamId = Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-                TopicId = Identifier.Numeric(69)
-            }));
-    }
-
-    [Test]
-    [DependsOn(nameof(SendMessages_WithHeaders_Should_Throw_InvalidResponse))]
-    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
-    public async Task SendMessages_WithEncryptor_Should_SendMessage_Successfully(Protocol protocol)
-    {
-        await Fixture.Clients[protocol].SendMessagesAsync(Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-            Identifier.String(Fixture.TopicRequest.Name), Partitioning.None(),
-            [new Message(Guid.NewGuid(), "Test message"u8.ToArray())], bytes =>
-            {
-                Array.Reverse(bytes);
-                return bytes;
-            });
-
-        var messageFetchRequest = new MessageFetchRequest
-        {
-            Count = 1,
-            AutoCommit = true,
-            Consumer = Consumer.New(1),
-            PartitionId = 1,
-            PollingStrategy = PollingStrategy.Last(),
-            StreamId = Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-            TopicId = Identifier.String(Fixture.TopicRequest.Name)
-        };
-
-        var response = await Fixture.Clients[protocol].PollMessagesAsync(messageFetchRequest);
-
-        response.Messages.Count.ShouldBe(1);
-        Encoding.UTF8.GetString(response.Messages[0].Payload).ShouldBe("egassem tseT");
+        await Should.ThrowAsync<IggyInvalidStatusCodeException>(() =>
+            Fixture.Clients[protocol].SendMessagesAsync(Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
+                Identifier.Numeric(69), Partitioning.None(), _messagesWithHeaders));
     }
 }

@@ -55,11 +55,15 @@ public class SystemTests
     {
         IReadOnlyList<ClientResponse> clients = await Fixture.Clients[protocol].GetClientsAsync();
 
+        var client = await Fixture.IggyServerFixture.CreateClient(Protocol.Tcp, protocol);
+        await client.LoginUser("iggy", "iggy");
+        var clientInfo = await client.GetMeAsync();
+        clientInfo.ShouldNotBeNull();
+
         clients.Count.ShouldBeGreaterThanOrEqualTo(Fixture.TotalClientsCount);
-        var id = clients.First(x => x.UserId != null).ClientId;
-        var response = await Fixture.Clients[protocol].GetClientByIdAsync(id);
+        var response = await Fixture.Clients[protocol].GetClientByIdAsync(clientInfo.ClientId);
         response.ShouldNotBeNull();
-        response.ClientId.ShouldBe(id);
+        response.ClientId.ShouldBe(clientInfo.ClientId);
         response.UserId.ShouldNotBeNull();
         response.UserId.Value.ShouldBeGreaterThanOrEqualTo(0u);
         response.Address.ShouldNotBeNullOrEmpty();
@@ -77,7 +81,7 @@ public class SystemTests
         var me = await Fixture.Clients[protocol].GetMeAsync();
         me.ShouldNotBeNull();
         me.ClientId.ShouldNotBe(0u);
-        me.UserId.ShouldBe(1u);
+        me.UserId.ShouldBe(0u);
         me.Address.ShouldNotBeNullOrEmpty();
         me.Transport.ShouldBe(Protocol.Tcp);
     }
@@ -97,27 +101,27 @@ public class SystemTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task GetClient_WithConsumerGroup_Should_Return_CorrectClient(Protocol protocol)
     {
-        var client = Fixture.IggyServerFixture.CreateClient(Protocol.Tcp, protocol);
+        var client = await Fixture.IggyServerFixture.CreateClient(Protocol.Tcp, protocol);
         await client.LoginUser("iggy", "iggy");
         var stream = await client.CreateStreamAsync(Fixture.StreamId.GetWithProtocol(protocol));
         await client.CreateTopicAsync(Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)), "test_topic", 2);
 
         var consumerGroup
             = await client.CreateConsumerGroupAsync(Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-                Identifier.Numeric(1), "test_consumer_group", 1);
+                Identifier.String("test_topic"), "test_consumer_group");
         await client.JoinConsumerGroupAsync(Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-            Identifier.Numeric(1), Identifier.Numeric(1));
+            Identifier.String("test_topic"), Identifier.String("test_consumer_group"));
         var me = await client.GetMeAsync();
 
         var response = await Fixture.Clients[protocol].GetClientByIdAsync(me!.ClientId);
         response.ShouldNotBeNull();
-        response.UserId.ShouldBe(1u);
+        response.UserId.ShouldBe(0u);
         response.Address.ShouldNotBeNullOrEmpty();
         response.Transport.ShouldBe(Protocol.Tcp);
         response.ConsumerGroupsCount.ShouldBe(1);
         response.ConsumerGroups.ShouldNotBeEmpty();
         response.ConsumerGroups.ShouldContain(x => x.GroupId == consumerGroup!.Id);
-        response.ConsumerGroups.ShouldContain(x => x.TopicId == 1);
+        response.ConsumerGroups.ShouldContain(x => x.TopicId == 0);
         response.ConsumerGroups.ShouldContain(x => x.StreamId == stream!.Id);
     }
 
@@ -127,18 +131,13 @@ public class SystemTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task GetStats_Should_ReturnValidResponse(Protocol protocol)
     {
-        await Fixture.Clients[protocol].SendMessagesAsync(new MessageSendRequest
-        {
-            StreamId = Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-            TopicId = Identifier.Numeric(1),
-            Partitioning = Partitioning.None(),
-            Messages = [new Message(Guid.NewGuid(), "Test message"u8.ToArray())]
-        });
+        await Fixture.Clients[protocol].SendMessagesAsync(Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
+            Identifier.Numeric(0), Partitioning.None(), [new Message(Guid.NewGuid(), "Test message"u8.ToArray())]);
 
         await Fixture.Clients[protocol].PollMessagesAsync(new MessageFetchRequest
         {
             StreamId = Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-            TopicId = Identifier.Numeric(1),
+            TopicId = Identifier.Numeric(0),
             AutoCommit = true,
             Consumer = Consumer.New(1),
             Count = 1,
@@ -181,4 +180,29 @@ public class SystemTests
     {
         await Should.NotThrowAsync(Fixture.Clients[protocol].PingAsync());
     }
+
+    // [Test]
+    // [DependsOn(nameof(Ping_Should_Pong))]
+    // [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    // public async Task GetClusterMetadata_Should_Return_ClusterMetadata(Protocol protocol)
+    // {
+    //     var clusterMetadata = await Fixture.Clients[protocol].GetClusterMetadataAsync();
+    //
+    //     clusterMetadata.ShouldNotBeNull();
+    //     clusterMetadata.Id.ShouldBe(1u);
+    //     clusterMetadata.Name.ShouldBe("iggy-cluster");
+    //     clusterMetadata.Transport.ShouldBe(Protocol.Tcp);
+    //     clusterMetadata.Nodes.ShouldNotBeEmpty();
+    //     clusterMetadata.Nodes.Length.ShouldBe(2);
+    //     clusterMetadata.Nodes[0].Id.ShouldBe(1u);
+    //     clusterMetadata.Nodes[0].Name.ShouldBe("iggy-node-1");
+    //     clusterMetadata.Nodes[0].Address.ShouldBe("127.0.0.1:8090");
+    //     clusterMetadata.Nodes[0].Role.ShouldBe(ClusterNodeRole.Leader);
+    //     clusterMetadata.Nodes[0].Status.ShouldBe(ClusterNodeStatus.Healthy);
+    //     clusterMetadata.Nodes[1].Id.ShouldBe(2u);
+    //     clusterMetadata.Nodes[1].Name.ShouldBe("iggy-node-2");
+    //     clusterMetadata.Nodes[1].Address.ShouldBe("127.0.0.1:8092");
+    //     clusterMetadata.Nodes[1].Role.ShouldBe(ClusterNodeRole.Follower);
+    //     clusterMetadata.Nodes[1].Status.ShouldBe(ClusterNodeStatus.Healthy);
+    // }
 }

@@ -17,6 +17,7 @@
 
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
+using Apache.Iggy.Tests.Integrations.Attributes;
 using Apache.Iggy.Tests.Integrations.Fixtures;
 using Apache.Iggy.Tests.Integrations.Helpers;
 using Shouldly;
@@ -35,7 +36,7 @@ public class FlushMessagesTests
         await Should.NotThrowAsync(() =>
             Fixture.Clients[protocol].FlushUnsavedBufferAsync(
                 Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-                Identifier.String(Fixture.TopicRequest.Name), 1, true));
+                Identifier.String(Fixture.TopicRequest.Name), 0, true));
     }
 
     [Test]
@@ -46,7 +47,7 @@ public class FlushMessagesTests
         await Should.NotThrowAsync(() =>
             Fixture.Clients[protocol].FlushUnsavedBufferAsync(
                 Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-                Identifier.String(Fixture.TopicRequest.Name), 1, false));
+                Identifier.String(Fixture.TopicRequest.Name), 0, false));
     }
 
     [Test]
@@ -54,7 +55,7 @@ public class FlushMessagesTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task FlushUnsavedBuffer_Should_Throw_WhenStream_DoesNotExist(Protocol protocol)
     {
-        await Should.ThrowAsync<InvalidResponseException>(() =>
+        await Should.ThrowAsync<IggyInvalidStatusCodeException>(() =>
             Fixture.Clients[protocol].FlushUnsavedBufferAsync(
                 Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
                 Identifier.String(Fixture.TopicRequest.Name), 55, false));

@@ -6,407 +6,615 @@
 
 </div>
 
+## Overview
+
+The Apache Iggy C# SDK provides a comprehensive client library for interacting with Iggy message streaming servers. It
+offers a modern, async-first API with support for multiple transport protocols and comprehensive message streaming
+capabilities.
+
 ## Getting Started
 
-Currently supported transfer protocols
+### Installation
 
-- TCP
-- HTTP
+Install the NuGet package:
 
-The whole SDK revolves around `IIggyClient` interface to create an instance of it, use following code
+```bash
+dotnet add package Apache.Iggy
+```
+
+### Supported Protocols
+
+The SDK supports two transport protocols:
+
+- **TCP** - Binary protocol for optimal performance and lower latency (recommended)
+- **HTTP** - RESTful JSON API for stateless operations
+
+### Creating a Client
+
+The SDK is built around the `IIggyClient` interface. To create a client instance:
 
 ```c#
 var loggerFactory = LoggerFactory.Create(builder =>
 {
     builder
-        .AddFilter("Iggy_SDK.MessageStream.Implementations;", LogLevel.Trace)
+        .AddFilter("Apache.Iggy", LogLevel.Information)
         .AddConsole();
 });
-var bus = MessageStreamFactory.CreateMessageStream(options =>
+
+var client = IggyClientFactory.CreateClient(new IggyClientConfigurator
 {
-    options.BaseAdress = "127.0.0.1:8090";
-    options.Protocol = Protocol.Tcp;
-    options.TlsSettings = x =>
-    {
-        x.Enabled = false;
-        x.Hostname = "iggy";
-        x.Authenticate = false;
-    };
+    BaseAddress = "127.0.0.1:8090",
+    Protocol = Protocol.Tcp
 }, loggerFactory);
+
+await client.ConnectAsync();
 ```
 
-Iggy necessitates the use of `ILoggerFactory` to generate logs from locations that are inaccessible to the user.
+The `ILoggerFactory` is required and used throughout the SDK for diagnostics and debugging.
 
-In addition to the basic configuration settings, Iggy provides support for batching send/poll messages at intervals,
-which effectively decreases the frequency of network calls, this option is enabled by default.
+### Configuration
 
-```c#
-//---Snip---
-var bus = MessageStreamFactory.CreateMessageStream(options =>
-{
-    options.BaseAdress = "127.0.0.1:8090";
-    options.Protocol = protocol;
-    options.TlsSettings = x =>
-    {
-        x.Enabled = false;
-        x.Hostname = "iggy";
-        x.Authenticate = false;
-    };
-
-    options.IntervalBatchingConfig = x =>
-    {
-        x.Enabled = true;
-        x.Interval = TimeSpan.FromMilliseconds(100);
-        x.MaxMessagesPerBatch = 1000;
-        x.MaxRequests = 4096;
-    };
-    options.MessagePollingSettings = x =>
-    {
-        x.Interval = TimeSpan.FromMilliseconds(100);
-        x.StoreOffsetStrategy = StoreOffset.AfterProcessingEachMessage;
-    };
-}, loggerFactory);
-```
-
-### Creating and logging in a user
-
-To begin, utilize the root account (note that the root account cannot be removed or updated).
+The `IggyClientConfigurator` provides comprehensive configuration options:
 
 ```c#
-var response = await bus.LoginUser(new LoginUserRequest
+var client = IggyClientFactory.CreateClient(new IggyClientConfigurator
 {
-    Username = "iggy",
-    Password = "iggy",
-});
-```
+    BaseAddress = "127.0.0.1:8090",
+    Protocol = Protocol.Tcp,
 
-Furthermore, after logging in, you have the option to create an account with customizable `Permissions`.
+    // Buffer sizes (optional, default: 4096)
+    ReceiveBufferSize = 4096,
+    SendBufferSize = 4096,
 
-```c#
-//---Snip---
-await bus.CreateUser(new CreateUserRequest
-{
-    Username = "test_user",
-    Password = "pa55w0rD!@",
-    Status = UserStatus.Active,
-    Permissions = new Permissions
+    // TLS/SSL configuration
+    TlsSettings = new TlsConfiguration
     {
-        Global = new GlobalPermissions
-        {
-            ManageServers = true,
-            ManageUsers = true,
-            ManageStreams = true,
-            ManageTopics = true,
-            PollMessages = true,
-            ReadServers = true,
-            ReadStreams = true,
-            ReadTopics = true,
-            ReadUsers = true,
-            SendMessages = true
-        },
-        Streams = new Dictionary<int, StreamPermissions>
-        {
-            {
-                streamId, new StreamPermissions
-                {
-                    ManageStream = true,
-                    ReadStream = true,
-                    SendMessages = true,
-                    PollMessages = true,
-                    ManageTopics = true,
-                    ReadTopics = true,
-                    Topics = new Dictionary<int, TopicPermissions>
-                    {
-                        {
-                            topicId, new TopicPermissions
-                            {
-                                ManageTopic = true,
-                                ReadTopic = true,
-                                PollMessages = true,
-                                SendMessages = true
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        Enabled = true,
+        Hostname = "iggy",
+        Authenticate = true
+    },
+
+    // Automatic reconnection with exponential backoff
+    ReconnectionSettings = new ReconnectionSettings
+    {
+        Enabled = true,
+        MaxRetries = 3,              // 0 = infinite retries
+        InitialDelay = TimeSpan.FromSeconds(5),
+        MaxDelay = TimeSpan.FromSeconds(30),
+        WaitAfterReconnect = TimeSpan.FromSeconds(1),
+        UseExponentialBackoff = true,
+        BackoffMultiplier = 2.0
+    },
+
+    // Auto-login after connection
+    AutoLoginSettings = new AutoLoginSettings
+    {
+        Enabled = true,
+        Username = "your_username",
+        Password = "your_password"
     }
-});
+}, loggerFactory);
 
-var response = await bus.LoginUser(new LoginUserRequest
-{
-    Username = "test_user",
-    Password = "pa55w0rD!@",
-});
+await client.ConnectAsync();
 ```
 
-Alternatively, once you've logged in, you can create a `Personal Access Token` that can be reused for further logins.
+## Authentication
+
+### User Login
+
+Begin by using the root account (note: the root account cannot be removed or updated):
 
 ```c#
-var response = await bus.LoginUser(new LoginUserRequest
-{
-    Username = "your_username",
-    Password = "your_password",
-});
-
-var patResponse = await bus.CreatePersonalAccessTokenAsync(new CreatePersonalAccessTokenRequest
-{
-    Name = "first-pat",
-    Expiry = 60, // seconds from creation time
-});
-await bus.LoginWithPersonalAccessToken(new LoginWithPersonalAccessToken
-{
-    Token = patResponse.Token
-});
+var response = await client.LoginUser("iggy", "iggy");
 ```
 
-### Creating first stream and topic
+### Creating Users
 
-In order to create stream use `CreateStreamAsync` method.
-
-```c#
-await bus.CreateStreamAsync(new StreamRequest
-{
-    StreamId = 1,
-    Name = "first-stream",
-});
-```
-
-Every stream has a topic to which you can broadcast messages, for the purpose of create one
-use `CreateTopicAsync` method.
+Create new users with customizable permissions:
 
 ```c#
-var streamId = Identifier.Numeric(1);
-await bus.CreateTopicAsync(streamId, new TopicRequest
+var permissions = new Permissions
 {
-    Name = "first-topic",
-    PartitionsCount = 3,
-    TopicId = 1
-});
-```
-
-Notice that both Stream aswell as Topic use `-` instead of space in its name, Iggy will replace any spaces in
-name with `-` instead, so keep that in mind.
-
-### Sending messages
-
-To send messages you can use `SendMessagesAsync` method.
-
-```c#
-Func<byte[], byte[]> encryptor = static payload =>
-{
-    string aes_key = "AXe8YwuIn1zxt3FPWTZFlAa14EHdPAdN9FaZ9RQWihc=";
-    string aes_iv = "bsxnWolsAyO7kCfWuyrnqg==";
-
-    var key = Convert.FromBase64String(aes_key);
-    var iv = Convert.FromBase64String(aes_iv);
-
-    using Aes aes = Aes.Create();
-    ICryptoTransform encryptor = aes.CreateEncryptor(key, iv);
-
-    using MemoryStream memoryStream = new MemoryStream();
-    using CryptoStream cryptoStream = new CryptoStream(memoryStream, encryptor, CryptoStreamMode.Write);
-    using BinaryWriter streamWriter = new BinaryWriter(cryptoStream);
-    streamWriter.Write(payload);
-
-    return memoryStream.ToArray();
+    Global = new GlobalPermissions
+    {
+        ManageServers = true,
+        ManageUsers = true,
+        ManageStreams = true,
+        ManageTopics = true,
+        PollMessages = true,
+        ReadServers = true,
+        ReadStreams = true,
+        ReadTopics = true,
+        ReadUsers = true,
+        SendMessages = true
+    }
 };
 
-var messages = new List<Message>(); // your messages
-var streamId = Identifier.Numeric(1);
-var topicId = Identifier.Numeric(1);
-await bus.SendMessagesAsync(new MessageSendRequest
-{
-    Messages = new List<Message>(),
-    Partitioning = Partitioning.PartitionId(1),
-    StreamId = streamId,
-    TopicId = topicId,
-}, encryptor); //encryptor is optional
+await client.CreateUser("test_user", "secure_password", UserStatus.Active, permissions);
+
+// Login with the new user
+var loginResponse = await client.LoginUser("test_user", "secure_password");
 ```
 
-The `Message` struct has two fields `Id` and `Payload`.
+### Personal Access Tokens
+
+Create and use Personal Access Tokens (PAT) for programmatic access:
 
 ```c#
-struct Message
-{
-    public required MessageHeader Header { get; init; }
-    public required byte[] Payload { get; init; }
-    public Dictionary<HeaderKey, HeaderValue>? UserHeaders { get; init; }
-}
+// Create a PAT
+var patResponse = await client.CreatePersonalAccessTokenAsync("api-token", 3600);
 
-public readonly struct MessageHeader
-{
-    public ulong Checksum { get; init; }
-    public UInt128 Id { get; init; }
-    public ulong Offset { get; init; }
-    public DateTimeOffset Timestamp { get; init; }
-    public ulong OriginTimestamp { get; init; }
-    public int UserHeadersLength { get; init; }
-    public int PayloadLength { get; init; }
-}
+// Login with PAT
+await client.LoginWithPersonalAccessToken(patResponse.Token);
 ```
 
-Furthermore, there's a generic overload for this method that takes binary serializer as argument.
+## Streams and Topics
+
+### Creating Streams
 
 ```c#
-//---Snip---
-Func<Envelope, byte[]> serializer = static envelope =>
+await client.CreateStreamAsync("my-stream");
+```
+
+You can reference streams by either numeric ID or name:
+
+```c#
+var streamById = Identifier.Numeric(0);
+var streamByName = Identifier.String("my-stream");
+```
+
+### Creating Topics
+
+Every stream contains topics for organizing messages:
+
+```c#
+var streamId = Identifier.String("my-stream");
+
+await client.CreateTopicAsync(
+    streamId,
+    name: "my-topic",
+    partitionsCount: 3,
+    compressionAlgorithm: CompressionAlgorithm.None,
+    replicationFactor: 1,
+    messageExpiry: 0,  // 0 = never expire
+    maxTopicSize: 0    // 0 = unlimited
+);
+```
+
+Note: Stream and topic names use hyphens instead of spaces. Iggy automatically replaces spaces with hyphens.
+
+## Publishing Messages
+
+### Sending Messages
+
+Send messages using the publisher interface:
+
+```c#
+var streamId = Identifier.String("my-stream");
+var topicId = Identifier.String("my-topic");
+
+var messages = new List<Message>
 {
-    Span<byte> buffer = stackalloc byte[envelope.MessageType.Length + 4 + envelope.Payload.Length];
-
-    BinaryPrimitives.WriteInt32LittleEndian(buffer[..4], envelope.MessageType.Length);
-    Encoding.UTF8.GetBytes(envelope.MessageType).CopyTo(buffer[4..(envelope.MessageType.Length + 4)]);
-    Encoding.UTF8.GetBytes(envelope.Payload).CopyTo(buffer[(envelope.MessageType.Length + 4)..]);
-
-    return buffer.ToArray();
+    new(Guid.NewGuid(), "Hello, Iggy!"u8.ToArray()),
+    new(1, "Another message"u8.ToArray())
 };
 
-var messages = new List<Envelope>(); // your messages
-await bus.SendMessagesAsync(new MessageSendRequest<Envelope>
-{
-    StreamId = streamId,
-    TopicId = topicId,
-    Partitioning = Partitioning.PartitionId(1),
-    Messages = messages
-},
-serializer,
-encryptor);
+await client.SendMessagesAsync(
+    streamId,
+    topicId,
+    Partitioning.None(),  // balanced partitioning
+    messages
+);
 ```
 
-Both generic and non generic method accept optional `Headers` dictionary.
+### Partitioning Strategies
+
+Control which partition receives each message:
 
 ```c#
-//---Snip---
+// Balanced partitioning (default)
+Partitioning.None()
+
+// Send to specific partition
+Partitioning.PartitionId(1)
+
+// Key-based partitioning (string)
+Partitioning.EntityIdString("user-123")
+
+// Key-based partitioning (integer)
+Partitioning.EntityIdInt(12345)
+
+// Key-based partitioning (GUID)
+Partitioning.EntityIdGuid(Guid.NewGuid())
+```
+
+### User-Defined Headers
+
+Add custom headers to messages with typed values:
+
+```c#
 var headers = new Dictionary<HeaderKey, HeaderValue>
 {
-    { new HeaderKey { Value = "key_1".ToLower() }, HeaderValue.FromString("test-value-1") },
-    { new HeaderKey { Value = "key_2".ToLower() }, HeaderValue.FromInt32(69) },
-    { new HeaderKey { Value = "key_3".ToLower() }, HeaderValue.FromFloat(420.69f) },
-    { new HeaderKey { Value = "key_4".ToLower() }, HeaderValue.FromBool(true) },
-    { new HeaderKey { Value = "key_5".ToLower() }, HeaderValue.FromBytes(byteArray) },
-    { new HeaderKey { Value = "key_6".ToLower() }, HeaderValue.FromInt128(new Int128(6969696969, 420420420)) },
-    { new HeaderKey { Value = "key7".ToLower() }, HeaderValue.FromGuid(Guid.NewGuid()) }
+    { new HeaderKey { Value = "correlation_id" }, HeaderValue.FromString("req-123") },
+    { new HeaderKey { Value = "priority" }, HeaderValue.FromInt32(1) },
+    { new HeaderKey { Value = "timeout" }, HeaderValue.FromInt64(5000) },
+    { new HeaderKey { Value = "confidence" }, HeaderValue.FromFloat(0.95f) },
+    { new HeaderKey { Value = "is_urgent" }, HeaderValue.FromBool(true) },
+    { new HeaderKey { Value = "request_id" }, HeaderValue.FromGuid(Guid.NewGuid()) }
 };
 
-await bus.SendMessagesAsync<Envelope>(new MessageSendRequest<Envelope>
+var messages = new List<Message>
 {
-    StreamId = streamId,
-    TopicId = topicId,
-    Partitioning = Partitioning.PartitionId(1),
-    Messages = messages
-},
-serializer,
-encryptor,
-headers);
+    new(Guid.NewGuid(), "Message with headers"u8.ToArray(), headers)
+};
+
+await client.SendMessagesAsync(
+    streamId,
+    topicId,
+    Partitioning.PartitionId(1),
+    messages
+);
 ```
+
+## Consumer Groups
+
+### Creating Consumer Groups
+
+Coordinate message consumption across multiple consumers:
+
+```c#
+var groupResponse = await client.CreateConsumerGroupAsync(
+    Identifier.String("my-stream"),
+    Identifier.String("my-topic"),
+    "my-consumer-group"
+);
+```
+
+### Joining and Leaving Groups
+
+**Note:** Join/Leave operations are only supported on TCP protocol and will throw `FeatureUnavailableException` on HTTP.
+
+```c#
+// Join a consumer group
+await client.JoinConsumerGroupAsync(
+    Identifier.String("my-stream"),
+    Identifier.String("my-topic"),
+    Identifier.Numeric(1)  // consumer ID
+);
+
+// Leave a consumer group
+await client.LeaveConsumerGroupAsync(
+    Identifier.String("my-stream"),
+    Identifier.String("my-topic"),
+    Identifier.Numeric(1)  // consumer ID
+);
+```
+
+## Consuming Messages
 
 ### Fetching Messages
 
-Fetching messages is done with `FetchMessagesAsync`.
+Fetch a batch of messages:
 
 ```c#
-Func<byte[], byte[]> decryptor = static payload =>
-{
-    string aes_key = "AXe8YwuIn1zxt3FPWTZFlAa14EHdPAdN9FaZ9RQWihc=";
-    string aes_iv = "bsxnWolsAyO7kCfWuyrnqg==";
-
-    var key = Convert.FromBase64String(aes_key);
-    var iv = Convert.FromBase64String(aes_iv);
-
-    using Aes aes = Aes.Create();
-    ICryptoTransform decryptor = aes.CreateDecryptor(key, iv);
-
-    using MemoryStream memoryStream = new MemoryStream(payload);
-    using CryptoStream cryptoStream = new CryptoStream(memoryStream, decryptor, CryptoStreamMode.Read);
-    using BinaryReader binaryReader = new BinaryReader(cryptoStream);
-
-    return binaryReader.ReadBytes(payload.Length);
-};
-
-var messages = await bus.FetchMessagesAsync(new MessageFetchRequest
+var polledMessages = await client.PollMessagesAsync(new MessageFetchRequest
 {
     StreamId = streamId,
     TopicId = topicId,
-    Consumer = Consumer.New(1),
-    Count = 1,
-    PartitionId = 1,
+    Consumer = Consumer.New(1), // or Consumer.Group("my-consumer-group") for consumer group
+    Count = 10,
+    PartitionId = 0, // optional, null for consumer group
     PollingStrategy = PollingStrategy.Next(),
     AutoCommit = true
-},
-decryptor);
+});
+
+foreach (var message in polledMessages.Messages)
+{
+    Console.WriteLine($"Message: {Encoding.UTF8.GetString(message.Payload)}");
+}
 ```
 
-Similarly, as with `SendMessagesAsync`, there's a generic overload that accepts a binary deserializer.
+### Polling Strategies
+
+Control where message consumption starts:
 
 ```c#
-//---Snip---
-Func<byte[], Envelope> deserializer = serializedData =>
+// Start from a specific offset
+PollingStrategy.Offset(1000)
+
+// Start from a specific timestamp (microseconds since epoch)
+PollingStrategy.Timestamp(1699564800000000)
+
+// Start from the first message
+PollingStrategy.First()
+
+// Start from the last message
+PollingStrategy.Last()
+
+// Start from the next unread message
+PollingStrategy.Next()
+```
+
+## Offset Management
+
+### Storing Offsets
+
+Store the current consumer position:
+
+```c#
+await client.StoreOffsetAsync(
+    Identifier.String("my-stream"),
+    Identifier.String("my-topic"),
+    Identifier.Numeric(1),  // consumer ID
+    0,                      // partition ID
+    42                      // offset value
+);
+```
+
+### Retrieving Offsets
+
+Get the current stored offset:
+
+```c#
+var offsetInfo = await client.GetOffsetAsync(
+    Identifier.String("my-stream"),
+    Identifier.String("my-topic"),
+    Identifier.Numeric(1),  // consumer ID
+    0                       // partition ID
+);
+
+Console.WriteLine($"Current offset: {offsetInfo.Offset}");
+```
+
+### Deleting Offsets
+
+Clear stored offsets:
+
+```c#
+await client.DeleteOffsetAsync(
+    Identifier.String("my-stream"),
+    Identifier.String("my-topic"),
+    Identifier.Numeric(1),  // consumer ID
+    0                       // partition ID
+);
+```
+
+## System Operations
+
+### Cluster Information
+
+Get cluster metadata and node information:
+
+```c#
+var metadata = await client.GetClusterMetadataAsync();
+```
+
+### Server Statistics
+
+Retrieve server performance metrics:
+
+```c#
+var stats = await client.GetStatsAsync();
+```
+
+### Health Checks
+
+Verify server connectivity:
+
+```c#
+await client.PingAsync();
+```
+
+### Client Information
+
+Get information about connected clients:
+
+```c#
+var clients = await client.GetClientsAsync();
+var currentClient = await client.GetMeAsync();
+```
+
+## Event Subscription
+
+Subscribe to connection events:
+
+```c#
+// Subscribe to connection events
+client.SubscribeConnectionEvents(async connectionState =>
 {
-    Envelope envelope = new Envelope();
-    int messageTypeLength = BitConverter.ToInt32(serializedData, 0);
-    envelope.MessageType = Encoding.UTF8.GetString(serializedData, 4, messageTypeLength);
-    envelope.Payload = Encoding.UTF8.GetString(serializedData, 4 + messageTypeLength, serializedData.Length - (4 + messageTypeLength));
-    return envelope;
+    Console.WriteLine($"Current connection state: {connectionState.CurrentState}");
+
+    await SaveConnectionStateLog(connectionState.CurrentState);
+});
+
+// Unsubscribe
+client.UnsubscribeConnectionEvents(handler);
+```
+
+## Advanced: IggyPublisher
+
+High-level publisher with background sending, retries, and encryption:
+
+```c#
+var publisher = IggyPublisherBuilder.Create(
+    client,
+    Identifier.String("my-stream"),
+    Identifier.String("my-topic")
+)
+.WithBackgroundSending(enabled: true, batchSize: 100)
+.WithRetry(maxAttempts: 3)
+.Build();
+
+await publisher.InitAsync();
+
+var messages = new List<Message>
+{
+    new(Guid.NewGuid(), "Message 1"u8.ToArray()),
+    new(0, "Message 2"u8.ToArray())
 };
 
-var messages = await bus.FetchMessagesAsync<Envelope>(new MessageFetchRequest
-{
-    StreamId = streamId,
-    TopicId = topicId,
-    Consumer = Consumer.New(1),
-    Count = 1,
-    PartitionId = 1,
-    PollingStrategy = PollingStrategy.Next(),
-    AutoCommit = true
-}, deserializer, decryptor);
+await publisher.SendMessages(messages);
+
+// Wait for all messages to be sent
+await publisher.WaitUntilAllSends();
+await publisher.DisposeAsync();
 ```
 
-Beyond the `FetchMessagesAsync` functionality, there's also a `PollMessagesAsync` method that spawns new thread which
-polls messages in background.
+For automatic object serialization, use the typed variant:
 
 ```c#
-//---Snip---
-await foreach (var messageResponse in bus.PollMessagesAsync<Envelope>(new PollMessagesRequest
+class OrderSerializer : ISerializer<Order>
 {
-    Consumer = Consumer.New(consumerId),
-    Count = 1,
-    TopicId = topicId,
-    StreamId = streamId,
-    PartitionId = 1,
-    PollingStrategy = PollingStrategy.Next(),
-}, deserializer, decryptor))
-{
-    //handle the message response
+    public byte[] Serialize(Order data) =>
+        Encoding.UTF8.GetBytes(JsonSerializer.Serialize(data));
 }
 
+var publisher = IggyPublisherBuilder<Order>.Create(
+    client,
+    Identifier.String("orders-stream"),
+    Identifier.String("orders-topic"),
+    new OrderSerializer()
+).Build();
+
+await publisher.InitAsync();
+await publisher.SendAsync(new List<Order> { /* ... */ });
 ```
 
-It is worth noting that every method (except `PollMessagesAsync`) will throw an `InvalidResponseException` when
-encountering an error.
+## Advanced: IggyConsumer
 
-If you register `IIggyClient` in a dependency injection container, you will have access to interfaces
-that encapsulate smaller parts of the system `IIggyStream` `IIggyTopic` `IIggyPublisher` `IIggyConsumer`
-`IIggyConsumerGroup` `IIggyOffset`
-`IIggyPartition` `IIggyUsers` `IIggyUtils`
+High-level consumer with automatic offset management and consumer groups:
 
-For more information about how Iggy works check its [documentation](https://iggy.apache.org/docs/)
+```c#
+var consumer = IggyConsumerBuilder.Create(
+    client,
+    Identifier.String("my-stream"),
+    Identifier.String("my-topic"),
+    Consumer.New(1)
+)
+.WithPollingStrategy(PollingStrategy.Next())
+.WithBatchSize(10)
+.WithAutoCommitMode(AutoCommitMode.Auto)
+.Build();
 
-## Producer / Consumer Sample
+await consumer.InitAsync();
 
-To run the samples, first get [Iggy](https://github.com/apache/iggy), Run the server with `cargo run --bin iggy-server`,
-then get the SDK, cd into `Iggy_SDK`
-and run following commands: `dotnet run -c Release --project Iggy_Sample_Producer` for producer,
-`dotnet run -c Release --project Iggy_Sample_Consumer`
-for consumer.
+await foreach (var message in consumer.ReceiveAsync())
+{
+    var payload = Encoding.UTF8.GetString(message.Message.Payload);
+    Console.WriteLine($"Offset {message.CurrentOffset}: {payload}");
+}
+```
+
+For consumer groups (load-balanced across multiple consumers):
+
+```c#
+var consumer = IggyConsumerBuilder.Create(
+    client,
+    Identifier.String("my-stream"),
+    Identifier.String("my-topic"),
+    Consumer.Group("my-group")
+)
+.WithConsumerGroup("my-group", createIfNotExists: true)
+.WithPollingStrategy(PollingStrategy.Next())
+.WithAutoCommitMode(AutoCommitMode.AfterReceive)
+.Build();
+
+await consumer.InitAsync();
+
+await foreach (var message in consumer.ReceiveAsync())
+{
+    Console.WriteLine($"Partition {message.PartitionId}: {message.Message.Payload}");
+}
+
+await consumer.DisposeAsync();
+```
+
+For automatic deserialization:
+
+```c#
+class OrderDeserializer : IDeserializer<OrderEvent>
+{
+    public OrderEvent Deserialize(byte[] data) =>
+        JsonSerializer.Deserialize<OrderEvent>(Encoding.UTF8.GetString(data))!;
+}
+
+var consumer = IggyConsumerBuilder<OrderEvent>.Create(
+    client,
+    Identifier.String("orders-stream"),
+    Identifier.String("orders-topic"),
+    Consumer.Group("order-processors"),
+    new OrderDeserializer()
+)
+.WithAutoCommitMode(AutoCommitMode.Auto)
+.Build();
+
+await consumer.InitAsync();
+
+await foreach (var message in consumer.ReceiveDeserializedAsync())
+{
+    if (message.Status == MessageStatus.Success)
+    {
+        Console.WriteLine($"Order: {message.Data?.OrderId}");
+    }
+}
+```
+
+## API Reference
+
+The SDK provides the following main interfaces:
+
+- **IIggyClient** - Main client interface (aggregates all features)
+- **IIggyPublisher** - High-level message publishing interface
+- **IIggyConsumer** - High-level message consumption interface
+- **IIggyStream** - Stream management
+- **IIggyTopic** - Topic management
+- **IIggyOffset** - Offset management
+- **IIggyConsumerGroup** - Consumer group operations
+- **IIggyPartition** - Partition operations
+- **IIggyUsers** - User and authentication management
+- **IIggySystem** - System and cluster operations
+- **IIggyPersonalAccessToken** - Personal access token management
+
+Additionally, builder-based APIs are available:
+
+- **IggyPublisherBuilder** / **IggyPublisherBuilder<T>** - Fluent publisher configuration
+- **IggyConsumerBuilder** / **IggyConsumerBuilder<T>** - Fluent consumer configuration
+
+## Running Examples
+
+Examples are located in `examples/csharp/` in root iggy directory.
+
+- Start the Iggy server:
+
+```bash
+cargo run --bin iggy-server
+```
+
+- Run the producer example:
+
+```bash
+dotnet run -c Release --project Iggy_SDK.Examples.GettingStarted.Producer
+```
+
+- Run the consumer example:
+
+```bash
+dotnet run -c Release --project Iggy_SDK.Examples.GettingStarted.Consumer
+```
 
 ## Integration Tests
 
-Integration tests are located in `Iggy_SDK/Iggy_Sample_Producer/IntegrationTests` folder.
-Tests can be run against a dockerized Iggy server with TestContainers or local Iggy server.
-To run with a local Iggy server, the environment variable `IGGY_SERVER_HOST` needs to be set.
+Integration tests are located in `Iggy_SDK.Tests.Integration/`. Tests can run against:
+
+- A dockerized Iggy server with TestContainers
+- A local Iggy server (set `IGGY_SERVER_HOST` environment variable)
+
+## Useful Resources
+
+- [Iggy Documentation](https://iggy.apache.org/docs/)
+- [NuGet Package](https://www.nuget.org/packages/Apache.Iggy)
 
 ## ROADMAP - TODO
 
-- [ ] Consumer/Publisher client - WIP
 - [ ] Error handling with status codes and descriptions
 - [ ] Add support for `ASP.NET Core` Dependency Injection

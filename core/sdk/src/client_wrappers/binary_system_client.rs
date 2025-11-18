@@ -32,6 +32,7 @@ impl SystemClient for ClientWrapper {
             ClientWrapper::Http(client) => client.get_stats().await,
             ClientWrapper::Tcp(client) => client.get_stats().await,
             ClientWrapper::Quic(client) => client.get_stats().await,
+            ClientWrapper::WebSocket(client) => client.get_stats().await,
         }
     }
 
@@ -41,6 +42,7 @@ impl SystemClient for ClientWrapper {
             ClientWrapper::Http(client) => client.get_me().await,
             ClientWrapper::Tcp(client) => client.get_me().await,
             ClientWrapper::Quic(client) => client.get_me().await,
+            ClientWrapper::WebSocket(client) => client.get_me().await,
         }
     }
 
@@ -50,6 +52,7 @@ impl SystemClient for ClientWrapper {
             ClientWrapper::Http(client) => client.get_client(client_id).await,
             ClientWrapper::Tcp(client) => client.get_client(client_id).await,
             ClientWrapper::Quic(client) => client.get_client(client_id).await,
+            ClientWrapper::WebSocket(client) => client.get_client(client_id).await,
         }
     }
 
@@ -59,6 +62,7 @@ impl SystemClient for ClientWrapper {
             ClientWrapper::Http(client) => client.get_clients().await,
             ClientWrapper::Tcp(client) => client.get_clients().await,
             ClientWrapper::Quic(client) => client.get_clients().await,
+            ClientWrapper::WebSocket(client) => client.get_clients().await,
         }
     }
 
@@ -68,6 +72,7 @@ impl SystemClient for ClientWrapper {
             ClientWrapper::Http(client) => client.ping().await,
             ClientWrapper::Tcp(client) => client.ping().await,
             ClientWrapper::Quic(client) => client.ping().await,
+            ClientWrapper::WebSocket(client) => client.ping().await,
         }
     }
 
@@ -77,6 +82,7 @@ impl SystemClient for ClientWrapper {
             ClientWrapper::Http(client) => client.heartbeat_interval().await,
             ClientWrapper::Tcp(client) => client.heartbeat_interval().await,
             ClientWrapper::Quic(client) => client.heartbeat_interval().await,
+            ClientWrapper::WebSocket(client) => client.heartbeat_interval().await,
         }
     }
 
@@ -90,6 +96,7 @@ impl SystemClient for ClientWrapper {
             ClientWrapper::Http(client) => client.snapshot(compression, snapshot_types).await,
             ClientWrapper::Tcp(client) => client.snapshot(compression, snapshot_types).await,
             ClientWrapper::Quic(client) => client.snapshot(compression, snapshot_types).await,
+            ClientWrapper::WebSocket(client) => client.snapshot(compression, snapshot_types).await,
         }
     }
 }

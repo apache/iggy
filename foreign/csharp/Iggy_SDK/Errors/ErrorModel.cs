@@ -17,10 +17,24 @@
 
 namespace Apache.Iggy.Errors;
 
+/// <summary>
+///     Error model
+/// </summary>
 public sealed class ErrorModel
 {
+    /// <summary>
+    ///     Error identifier.
+    /// </summary>
     public int Id { get; init; }
+
+    /// <summary>
+    ///     Error code.
+    /// </summary>
     public string Code { get; init; }
+
+    /// <summary>
+    ///     Error reason.
+    /// </summary>
     public string Reason { get; init; }
 
     internal ErrorModel(int id, string code, string reason)

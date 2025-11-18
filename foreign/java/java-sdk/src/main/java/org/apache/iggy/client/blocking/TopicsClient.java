@@ -24,6 +24,7 @@ import org.apache.iggy.identifier.TopicId;
 import org.apache.iggy.topic.CompressionAlgorithm;
 import org.apache.iggy.topic.Topic;
 import org.apache.iggy.topic.TopicDetails;
+
 import java.math.BigInteger;
 import java.util.List;
 import java.util.Optional;
@@ -42,16 +43,16 @@ public interface TopicsClient {
 
     List<Topic> getTopics(StreamId streamId);
 
-    default TopicDetails createTopic(Long streamId,
-                                     Optional<Long> topicId,
-                                     Long partitionsCount,
-                                     CompressionAlgorithm compressionAlgorithm,
-                                     BigInteger messageExpiry,
-                                     BigInteger maxTopicSize,
-                                     Optional<Short> replicationFactor,
-                                     String name) {
-        return createTopic(StreamId.of(streamId),
-                topicId,
+    default TopicDetails createTopic(
+            Long streamId,
+            Long partitionsCount,
+            CompressionAlgorithm compressionAlgorithm,
+            BigInteger messageExpiry,
+            BigInteger maxTopicSize,
+            Optional<Short> replicationFactor,
+            String name) {
+        return createTopic(
+                StreamId.of(streamId),
                 partitionsCount,
                 compressionAlgorithm,
                 messageExpiry,
@@ -60,23 +61,25 @@ public interface TopicsClient {
                 name);
     }
 
-    TopicDetails createTopic(StreamId streamId,
-                             Optional<Long> topicId,
-                             Long partitionsCount,
-                             CompressionAlgorithm compressionAlgorithm,
-                             BigInteger messageExpiry,
-                             BigInteger maxTopicSize,
-                             Optional<Short> replicationFactor,
-                             String name);
+    TopicDetails createTopic(
+            StreamId streamId,
+            Long partitionsCount,
+            CompressionAlgorithm compressionAlgorithm,
+            BigInteger messageExpiry,
+            BigInteger maxTopicSize,
+            Optional<Short> replicationFactor,
+            String name);
 
-    default void updateTopic(Long streamId,
-                             Long topicId,
-                             CompressionAlgorithm compressionAlgorithm,
-                             BigInteger messageExpiry,
-                             BigInteger maxTopicSize,
-                             Optional<Short> replicationFactor,
-                             String name) {
-        updateTopic(StreamId.of(streamId),
+    default void updateTopic(
+            Long streamId,
+            Long topicId,
+            CompressionAlgorithm compressionAlgorithm,
+            BigInteger messageExpiry,
+            BigInteger maxTopicSize,
+            Optional<Short> replicationFactor,
+            String name) {
+        updateTopic(
+                StreamId.of(streamId),
                 TopicId.of(topicId),
                 compressionAlgorithm,
                 messageExpiry,
@@ -85,18 +88,18 @@ public interface TopicsClient {
                 name);
     }
 
-    void updateTopic(StreamId streamId,
-                     TopicId topicId,
-                     CompressionAlgorithm compressionAlgorithm,
-                     BigInteger messageExpiry,
-                     BigInteger maxTopicSize,
-                     Optional<Short> replicationFactor,
-                     String name);
+    void updateTopic(
+            StreamId streamId,
+            TopicId topicId,
+            CompressionAlgorithm compressionAlgorithm,
+            BigInteger messageExpiry,
+            BigInteger maxTopicSize,
+            Optional<Short> replicationFactor,
+            String name);
 
     default void deleteTopic(Long streamId, Long topicId) {
         deleteTopic(StreamId.of(streamId), TopicId.of(topicId));
     }
 
     void deleteTopic(StreamId streamId, TopicId topicId);
-
 }

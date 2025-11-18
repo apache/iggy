@@ -57,7 +57,7 @@ impl Default for StoreConsumerOffset {
             consumer: Consumer::default(),
             stream_id: Identifier::default(),
             topic_id: Identifier::default(),
-            partition_id: Some(1),
+            partition_id: Some(0),
             offset: 0,
         }
     }
@@ -81,22 +81,25 @@ impl BytesSerializable for StoreConsumerOffset {
         let stream_id_bytes = self.stream_id.to_bytes();
         let topic_id_bytes = self.topic_id.to_bytes();
         let mut bytes = BytesMut::with_capacity(
-            12 + consumer_bytes.len() + stream_id_bytes.len() + topic_id_bytes.len(),
+            13 + consumer_bytes.len() + stream_id_bytes.len() + topic_id_bytes.len(),
         );
         bytes.put_slice(&consumer_bytes);
         bytes.put_slice(&stream_id_bytes);
         bytes.put_slice(&topic_id_bytes);
+        // Encode partition_id with a flag byte: 1 = Some, 0 = None
         if let Some(partition_id) = self.partition_id {
+            bytes.put_u8(1);
             bytes.put_u32_le(partition_id);
         } else {
-            bytes.put_u32_le(0);
+            bytes.put_u8(0);
+            bytes.put_u32_le(0); // Padding to keep structure consistent
         }
         bytes.put_u64_le(self.offset);
         bytes.freeze()
     }
 
     fn from_bytes(bytes: Bytes) -> Result<StoreConsumerOffset, IggyError> {
-        if bytes.len() < 23 {
+        if bytes.len() < 24 {
             return Err(IggyError::InvalidCommand);
         }
 
@@ -112,18 +115,20 @@ impl BytesSerializable for StoreConsumerOffset {
         position += stream_id.get_size_bytes().as_bytes_usize();
         let topic_id = Identifier::from_bytes(bytes.slice(position..))?;
         position += topic_id.get_size_bytes().as_bytes_usize();
-        let partition_id = u32::from_le_bytes(
-            bytes[position..position + 4]
+        // Decode partition_id with flag byte: 1 = Some, 0 = None
+        let has_partition_id = bytes[position];
+        let partition_id_value = u32::from_le_bytes(
+            bytes[position + 1..position + 5]
                 .try_into()
                 .map_err(|_| IggyError::InvalidNumberEncoding)?,
         );
-        let partition_id = if partition_id == 0 {
-            None
+        let partition_id = if has_partition_id == 1 {
+            Some(partition_id_value)
         } else {
-            Some(partition_id)
+            None
         };
         let offset = u64::from_le_bytes(
-            bytes[position + 4..position + 12]
+            bytes[position + 5..position + 13]
                 .try_into()
                 .map_err(|_| IggyError::InvalidNumberEncoding)?,
         );
@@ -179,14 +184,21 @@ mod tests {
         position += stream_id.get_size_bytes().as_bytes_usize();
         let topic_id = Identifier::from_bytes(bytes.slice(position..)).unwrap();
         position += topic_id.get_size_bytes().as_bytes_usize();
-        let partition_id = u32::from_le_bytes(bytes[position..position + 4].try_into().unwrap());
-        let offset = u64::from_le_bytes(bytes[position + 4..position + 12].try_into().unwrap());
+        let has_partition_id = bytes[position];
+        let partition_id =
+            u32::from_le_bytes(bytes[position + 1..position + 5].try_into().unwrap());
+        let partition_id = if has_partition_id == 1 {
+            Some(partition_id)
+        } else {
+            None
+        };
+        let offset = u64::from_le_bytes(bytes[position + 5..position + 13].try_into().unwrap());
 
         assert!(!bytes.is_empty());
         assert_eq!(consumer, command.consumer);
         assert_eq!(stream_id, command.stream_id);
         assert_eq!(topic_id, command.topic_id);
-        assert_eq!(Some(partition_id), command.partition_id);
+        assert_eq!(partition_id, command.partition_id);
         assert_eq!(offset, command.offset);
     }
 
@@ -202,11 +214,12 @@ mod tests {
         let stream_id_bytes = stream_id.to_bytes();
         let topic_id_bytes = topic_id.to_bytes();
         let mut bytes = BytesMut::with_capacity(
-            12 + consumer_bytes.len() + stream_id_bytes.len() + topic_id_bytes.len(),
+            13 + consumer_bytes.len() + stream_id_bytes.len() + topic_id_bytes.len(),
         );
         bytes.put_slice(&consumer_bytes);
         bytes.put_slice(&stream_id_bytes);
         bytes.put_slice(&topic_id_bytes);
+        bytes.put_u8(1); // Flag: partition_id is Some
         bytes.put_u32_le(partition_id);
         bytes.put_u64_le(offset);
 

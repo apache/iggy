@@ -31,8 +31,8 @@ enum TestUser<'a> {
     Existing(&'a str),
     New(&'a str),
     NewWithGlobalPerms(&'a str),
-    NewWithStreamPerms(&'a str, u32),
-    NewWithStreamAndTopicPerms(&'a str, u32, u32),
+    NewWithStreamPerms(&'a str, usize),
+    NewWithStreamAndTopicPerms(&'a str, usize, usize),
 }
 
 struct TestUserGetCmd {
@@ -42,8 +42,8 @@ struct TestUserGetCmd {
     using_user_id: TestUserId,
     create_user: bool,
     check_global_perms: bool,
-    check_stream_perms: Option<u32>,
-    check_topic_perms: Option<u32>,
+    check_stream_perms: Option<usize>,
+    check_topic_perms: Option<usize>,
 }
 
 impl TestUserGetCmd {

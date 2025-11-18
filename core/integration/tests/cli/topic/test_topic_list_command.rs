@@ -31,7 +31,6 @@ use serial_test::parallel;
 struct TestTopicListCmd {
     stream_id: u32,
     stream_name: String,
-    topic_id: u32,
     topic_name: String,
     using_stream_id: TestStreamId,
     output: OutputFormat,
@@ -41,7 +40,6 @@ impl TestTopicListCmd {
     fn new(
         stream_id: u32,
         stream_name: String,
-        topic_id: u32,
         topic_name: String,
         using_stream_id: TestStreamId,
         output: OutputFormat,
@@ -49,7 +47,6 @@ impl TestTopicListCmd {
         Self {
             stream_id,
             stream_name,
-            topic_id,
             topic_name,
             using_stream_id,
             output,
@@ -71,19 +68,16 @@ impl TestTopicListCmd {
 #[async_trait]
 impl IggyCmdTestCase for TestTopicListCmd {
     async fn prepare_server_state(&mut self, client: &dyn Client) {
-        let stream = client
-            .create_stream(&self.stream_name, Some(self.stream_id))
-            .await;
+        let stream = client.create_stream(&self.stream_name).await;
         assert!(stream.is_ok());
 
         let topic = client
             .create_topic(
-                &self.stream_id.try_into().unwrap(),
+                &self.stream_name.clone().try_into().unwrap(),
                 &self.topic_name,
                 1,
                 Default::default(),
                 None,
-                Some(self.topic_id),
                 IggyExpiry::NeverExpire,
                 MaxTopicSize::ServerDefault,
             )
@@ -117,14 +111,14 @@ impl IggyCmdTestCase for TestTopicListCmd {
     async fn verify_server_state(&self, client: &dyn Client) {
         let topic = client
             .delete_topic(
-                &self.stream_id.try_into().unwrap(),
-                &self.topic_id.try_into().unwrap(),
+                &self.stream_name.clone().try_into().unwrap(),
+                &self.topic_name.clone().try_into().unwrap(),
             )
             .await;
         assert!(topic.is_ok());
 
         let stream = client
-            .delete_stream(&self.stream_id.try_into().unwrap())
+            .delete_stream(&self.stream_name.clone().try_into().unwrap())
             .await;
         assert!(stream.is_ok());
     }
@@ -138,19 +132,17 @@ pub async fn should_be_successful() {
     iggy_cmd_test.setup().await;
     iggy_cmd_test
         .execute_test(TestTopicListCmd::new(
-            1,
+            0,
             String::from("main"),
-            1,
             String::from("sync"),
-            TestStreamId::Numeric,
+            TestStreamId::Named,
             OutputFormat::Default,
         ))
         .await;
     iggy_cmd_test
         .execute_test(TestTopicListCmd::new(
-            2,
+            1,
             String::from("customer"),
-            3,
             String::from("topic"),
             TestStreamId::Named,
             OutputFormat::List,
@@ -158,11 +150,10 @@ pub async fn should_be_successful() {
         .await;
     iggy_cmd_test
         .execute_test(TestTopicListCmd::new(
-            3,
+            2,
             String::from("production"),
-            1,
             String::from("data"),
-            TestStreamId::Numeric,
+            TestStreamId::Named,
             OutputFormat::Table,
         ))
         .await;

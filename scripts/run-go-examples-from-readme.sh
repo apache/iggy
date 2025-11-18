@@ -114,7 +114,7 @@ echo $! >${PID_FILE}
 
 # Wait until "Iggy server has started" string is present inside iggy-server.log
 SERVER_START_TIME=0
-while ! grep -q "Iggy server has started" ${LOG_FILE}; do
+while ! grep -q "has started" ${LOG_FILE}; do
     if [ ${SERVER_START_TIME} -gt ${TIMEOUT} ]; then
         echo "Server did not start within ${TIMEOUT} seconds."
         ps fx

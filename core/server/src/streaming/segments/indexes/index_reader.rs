@@ -19,37 +19,39 @@
 use super::IggyIndexesMut;
 use crate::streaming::utils::PooledBuffer;
 use bytes::BytesMut;
-use error_set::ErrContext;
+use compio::{
+    buf::{IntoInner, IoBuf},
+    fs::{File, OpenOptions},
+    io::AsyncReadAtExt,
+};
+use err_trail::ErrContext;
 use iggy_common::{INDEX_SIZE, IggyError, IggyIndex, IggyIndexView};
 use std::{
-    fs::File as StdFile,
     io::ErrorKind,
-    os::unix::fs::FileExt,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    rc::Rc,
+    sync::atomic::{AtomicU64, Ordering},
 };
-use tokio::fs::OpenOptions;
-use tokio::task::spawn_blocking;
 use tracing::{error, trace};
 
 /// A dedicated struct for reading from the index file.
 #[derive(Debug)]
 pub struct IndexReader {
     file_path: String,
-    file: Arc<StdFile>,
-    index_size_bytes: Arc<AtomicU64>,
+    file: File,
+    index_size_bytes: Rc<AtomicU64>,
 }
+
+// Safety: We are guaranteeing that IndexWriter will never be used from multiple threads
+unsafe impl Send for IndexReader {}
 
 impl IndexReader {
     /// Opens the index file in read-only mode.
-    pub async fn new(file_path: &str, index_size_bytes: Arc<AtomicU64>) -> Result<Self, IggyError> {
+    pub async fn new(file_path: &str, index_size_bytes: Rc<AtomicU64>) -> Result<Self, IggyError> {
         let file = OpenOptions::new()
             .read(true)
             .open(file_path)
             .await
-            .with_error_context(|error| format!("Failed to open index file: {file_path}. {error}"))
+            .with_error(|error| format!("Failed to open index file: {file_path}. {error}"))
             .map_err(|_| IggyError::CannotReadFile)?;
 
         trace!(
@@ -58,9 +60,13 @@ impl IndexReader {
         );
         Ok(Self {
             file_path: file_path.to_string(),
-            file: Arc::new(file.into_std().await),
+            file,
             index_size_bytes,
         })
+    }
+
+    pub fn path(&self) -> String {
+        self.file_path.clone()
     }
 
     /// Loads all indexes from the index file into the optimized binary format.
@@ -148,6 +154,7 @@ impl IndexReader {
         {
             Ok(buf) => buf,
             Err(error) if error.kind() == ErrorKind::UnexpectedEof => {
+                error!("Unexpected EOF while reading indexes");
                 return Ok(None);
             }
             Err(error) => {
@@ -334,21 +341,24 @@ impl IndexReader {
         len: u32,
         use_pool: bool,
     ) -> Result<PooledBuffer, std::io::Error> {
-        let file = self.file.clone();
-        spawn_blocking(move || {
-            if use_pool {
-                let mut buf = PooledBuffer::with_capacity(len as usize);
-                unsafe { buf.set_len(len as usize) };
-                file.read_exact_at(&mut buf, offset as u64)?;
-                Ok(buf)
-            } else {
-                let mut buf = BytesMut::with_capacity(len as usize);
-                unsafe { buf.set_len(len as usize) };
-                file.read_exact_at(&mut buf, offset as u64)?;
-                Ok(PooledBuffer::from_existing(buf))
-            }
-        })
-        .await?
+        if use_pool {
+            let len = len as usize;
+            let buf = PooledBuffer::with_capacity(len);
+            let (result, buf) = self
+                .file
+                .read_exact_at(buf.slice(..len), offset as u64)
+                .await
+                .into();
+            let buf = buf.into_inner();
+            result?;
+            Ok(buf)
+        } else {
+            let mut buf = BytesMut::with_capacity(len as usize);
+            unsafe { buf.set_len(len as usize) };
+            let (result, buf) = self.file.read_exact_at(buf, offset as u64).await.into();
+            result?;
+            Ok(PooledBuffer::from_existing(buf))
+        }
     }
 
     /// Gets the nth index from the index file.

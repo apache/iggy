@@ -26,6 +26,7 @@ import org.apache.iggy.consumergroup.ConsumerGroupDetails;
 import org.apache.iggy.identifier.ConsumerId;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
+
 import java.util.List;
 import java.util.Optional;
 
@@ -46,16 +47,13 @@ class ConsumerGroupsHttpClient implements ConsumerGroupsClient {
     @Override
     public List<ConsumerGroup> getConsumerGroups(StreamId streamId, TopicId topicId) {
         var request = httpClient.prepareGetRequest(path(streamId, topicId));
-        return httpClient.execute(request, new TypeReference<>() {
-        });
+        return httpClient.execute(request, new TypeReference<>() {});
     }
 
     @Override
-    public ConsumerGroupDetails createConsumerGroup(StreamId streamId, TopicId topicId, Optional<Long> groupId, String name) {
-        var request = httpClient.preparePostRequest(path(streamId, topicId),
-                new CreateConsumerGroup(groupId, name));
-        return httpClient.execute(request, new TypeReference<>() {
-        });
+    public ConsumerGroupDetails createConsumerGroup(StreamId streamId, TopicId topicId, String name) {
+        var request = httpClient.preparePostRequest(path(streamId, topicId), new CreateConsumerGroup(name));
+        return httpClient.execute(request, new TypeReference<>() {});
     }
 
     @Override
@@ -78,7 +76,5 @@ class ConsumerGroupsHttpClient implements ConsumerGroupsClient {
         return "/streams/" + streamId + "/topics/" + topicId + "/consumer-groups";
     }
 
-    private record CreateConsumerGroup(Optional<Long> groupId, String name) {
-    }
-
+    private record CreateConsumerGroup(String name) {}
 }

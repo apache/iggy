@@ -19,9 +19,12 @@
 
 package org.apache.iggy.client.blocking;
 
+import org.apache.iggy.topic.TopicDetails;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
-import org.apache.iggy.topic.TopicDetails;
+
+import static org.apache.iggy.TestConstants.STREAM_NAME;
+import static org.apache.iggy.TestConstants.TOPIC_NAME;
 import static org.assertj.core.api.Assertions.assertThat;
 
 public abstract class PartitionsClientBaseTest extends IntegrationTest {
@@ -38,25 +41,23 @@ public abstract class PartitionsClientBaseTest extends IntegrationTest {
         setUpStreamAndTopic();
     }
 
-
     @Test
     void shouldCreateAndDeletePartitions() {
         // given
-        assert topicsClient.getTopic(42L, 42L).get().partitionsCount() == 1L;
+        assert topicsClient.getTopic(STREAM_NAME, TOPIC_NAME).get().partitionsCount() == 1L;
 
         // when
-        partitionsClient.createPartitions(42L, 42L, 10L);
+        partitionsClient.createPartitions(STREAM_NAME, TOPIC_NAME, 10L);
 
         // then
-        TopicDetails topic = topicsClient.getTopic(42L, 42L).get();
+        TopicDetails topic = topicsClient.getTopic(STREAM_NAME, TOPIC_NAME).get();
         assertThat(topic.partitionsCount()).isEqualTo(11L);
 
         // when
-        partitionsClient.deletePartitions(42L, 42L, 10L);
+        partitionsClient.deletePartitions(STREAM_NAME, TOPIC_NAME, 10L);
 
         // then
-        topic = topicsClient.getTopic(42L, 42L).get();
+        topic = topicsClient.getTopic(STREAM_NAME, TOPIC_NAME).get();
         assertThat(topic.partitionsCount()).isEqualTo(1L);
     }
-
 }

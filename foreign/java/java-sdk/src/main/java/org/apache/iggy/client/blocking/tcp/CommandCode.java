@@ -21,172 +21,172 @@ package org.apache.iggy.client.blocking.tcp;
 
 public interface CommandCode {
 
-  int getValue();
+    int getValue();
 
-  enum System implements CommandCode {
-    PING(1),
-    GET_STATS(10),
-    GET_ME(20),
-    GET_CLIENT(21),
-    GET_ALL_CLIENTS(22);
+    enum System implements CommandCode {
+        PING(1),
+        GET_STATS(10),
+        GET_ME(20),
+        GET_CLIENT(21),
+        GET_ALL_CLIENTS(22);
 
-    private final int value;
+        private final int value;
 
-    System(int value) {
-      this.value = value;
+        System(int value) {
+            this.value = value;
+        }
+
+        @Override
+        public int getValue() {
+            return value;
+        }
     }
 
-    @Override
-    public int getValue() {
-      return value;
-    }
-  }
+    enum User implements CommandCode {
+        GET(31),
+        GET_ALL(32),
+        CREATE(33),
+        DELETE(34),
+        UPDATE(35),
+        UPDATE_PERMISSIONS(36),
+        CHANGE_PASSWORD(37),
+        LOGIN(38),
+        LOGOUT(39);
 
-  enum User implements CommandCode {
-    GET(31),
-    GET_ALL(32),
-    CREATE(33),
-    DELETE(34),
-    UPDATE(35),
-    UPDATE_PERMISSIONS(36),
-    CHANGE_PASSWORD(37),
-    LOGIN(38),
-    LOGOUT(39);
+        private final int value;
 
-    private final int value;
+        User(int value) {
+            this.value = value;
+        }
 
-    User(int value) {
-      this.value = value;
-    }
-
-    @Override
-    public int getValue() {
-      return value;
-    }
-  }
-
-  enum PersonalAccessToken implements CommandCode {
-    GET_ALL(41),
-    CREATE(42),
-    DELETE(43),
-    LOGIN(44);
-
-    private final int value;
-
-    PersonalAccessToken(int value) {
-      this.value = value;
+        @Override
+        public int getValue() {
+            return value;
+        }
     }
 
-    @Override
-    public int getValue() {
-      return value;
-    }
-  }
+    enum PersonalAccessToken implements CommandCode {
+        GET_ALL(41),
+        CREATE(42),
+        DELETE(43),
+        LOGIN(44);
 
-  enum Messages implements CommandCode {
-    POLL(100),
-    SEND(101);
+        private final int value;
 
-    private final int value;
+        PersonalAccessToken(int value) {
+            this.value = value;
+        }
 
-    Messages(int value) {
-      this.value = value;
-    }
-
-    @Override
-    public int getValue() {
-      return value;
-    }
-  }
-
-  enum ConsumerOffset implements CommandCode {
-    GET(120),
-    STORE(121);
-
-    private final int value;
-
-    ConsumerOffset(int value) {
-      this.value = value;
+        @Override
+        public int getValue() {
+            return value;
+        }
     }
 
-    @Override
-    public int getValue() {
-      return value;
-    }
-  }
+    enum Messages implements CommandCode {
+        POLL(100),
+        SEND(101);
 
-  enum Stream implements CommandCode {
-    GET(200),
-    GET_ALL(201),
-    CREATE(202),
-    DELETE(203),
-    UPDATE(204);
+        private final int value;
 
-    private final int value;
+        Messages(int value) {
+            this.value = value;
+        }
 
-    Stream(int value) {
-      this.value = value;
+        @Override
+        public int getValue() {
+            return value;
+        }
     }
 
-    @Override
-    public int getValue() {
-      return value;
-    }
-  }
+    enum ConsumerOffset implements CommandCode {
+        GET(120),
+        STORE(121);
 
-  enum Topic implements CommandCode {
-    GET(300),
-    GET_ALL(301),
-    CREATE(302),
-    DELETE(303),
-    UPDATE(304),
-    PURGE(305);
+        private final int value;
 
-    private final int value;
+        ConsumerOffset(int value) {
+            this.value = value;
+        }
 
-    Topic(int value) {
-      this.value = value;
+        @Override
+        public int getValue() {
+            return value;
+        }
     }
 
-    @Override
-    public int getValue() {
-      return value;
-    }
-  }
+    enum Stream implements CommandCode {
+        GET(200),
+        GET_ALL(201),
+        CREATE(202),
+        DELETE(203),
+        UPDATE(204);
 
-  enum Partition implements CommandCode {
-    CREATE(402),
-    DELETE(403);
+        private final int value;
 
-    private final int value;
+        Stream(int value) {
+            this.value = value;
+        }
 
-    Partition(int value) {
-      this.value = value;
-    }
-
-    @Override
-    public int getValue() {
-      return value;
-    }
-  }
-
-  enum ConsumerGroup implements CommandCode {
-    GET(600),
-    GET_ALL(601),
-    CREATE(602),
-    DELETE(603),
-    JOIN(604),
-    LEAVE(605);
-
-    private final int value;
-
-    ConsumerGroup(int value) {
-      this.value = value;
+        @Override
+        public int getValue() {
+            return value;
+        }
     }
 
-    @Override
-    public int getValue() {
-      return value;
+    enum Topic implements CommandCode {
+        GET(300),
+        GET_ALL(301),
+        CREATE(302),
+        DELETE(303),
+        UPDATE(304),
+        PURGE(305);
+
+        private final int value;
+
+        Topic(int value) {
+            this.value = value;
+        }
+
+        @Override
+        public int getValue() {
+            return value;
+        }
     }
-  }
+
+    enum Partition implements CommandCode {
+        CREATE(402),
+        DELETE(403);
+
+        private final int value;
+
+        Partition(int value) {
+            this.value = value;
+        }
+
+        @Override
+        public int getValue() {
+            return value;
+        }
+    }
+
+    enum ConsumerGroup implements CommandCode {
+        GET(600),
+        GET_ALL(601),
+        CREATE(602),
+        DELETE(603),
+        JOIN(604),
+        LEAVE(605);
+
+        private final int value;
+
+        ConsumerGroup(int value) {
+            this.value = value;
+        }
+
+        @Override
+        public int getValue() {
+            return value;
+        }
+    }
 }

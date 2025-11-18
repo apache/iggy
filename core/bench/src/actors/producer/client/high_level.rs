@@ -77,7 +77,7 @@ impl BenchmarkInit for HighLevelProducerClient {
         let client = IggyClient::create(client, None, None);
         login_root(&client).await;
 
-        let stream_id_str = self.config.stream_id.to_string();
+        let stream_id_str = self.config.stream_id.clone();
         let topic_id_str = topic_id.to_string();
 
         self.producer = Some(

@@ -45,14 +45,22 @@ internal static class TcpMessageStreamHelpers
 
     internal static int CalculateMessageBytesCount(IList<Message> messages)
     {
-        return messages switch
+        var bytesCount = 0;
+        foreach (var message in messages)
         {
-            Message[] messagesArray => CalculateMessageBytesCountArray(messagesArray),
-            List<Message> messagesList => CalculateMessageBytesCountList(messagesList),
-            _ => messages.Sum(msg => 16 + 56 + msg.Payload.Length + 4 +
-                                     (msg.UserHeaders?.Sum(header =>
-                                         4 + header.Key.Value.Length + 1 + 4 + header.Value.Value.Length) ?? 0))
-        };
+            bytesCount += 16 + 56 + message.Payload.Length;
+            if (message.UserHeaders is null)
+            {
+                continue;
+            }
+
+            foreach (var header in message.UserHeaders)
+            {
+                bytesCount += 4 + header.Key.Value.Length + 1 + 4 + header.Value.Value.Length;
+            }
+        }
+
+        return bytesCount;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -72,58 +80,5 @@ internal static class TcpMessageStreamHelpers
         }
 
         return bytes.ToArray();
-    }
-
-    private static int CalculateMessageBytesCountArray(Message[] messages)
-    {
-        ref var start = ref MemoryMarshal.GetArrayDataReference(messages);
-        ref var end = ref Unsafe.Add(ref start, messages.Length);
-        var msgBytesSum = 0;
-        while (Unsafe.IsAddressLessThan(ref start, ref end))
-        {
-            if (start.UserHeaders is not null)
-            {
-                msgBytesSum += start.Payload.Length + 16 + 56;
-                foreach (var (headerKey, headerValue) in start.UserHeaders)
-                {
-                    msgBytesSum += 4 + headerKey.Value.Length + 1 + 4 + headerValue.Value.Length;
-                }
-            }
-            else
-            {
-                msgBytesSum += start.Payload.Length + 16 + 56;
-            }
-
-            start = ref Unsafe.Add(ref start, 1);
-        }
-
-        return msgBytesSum;
-    }
-
-    private static int CalculateMessageBytesCountList(List<Message> messages)
-    {
-        Span<Message> messagesSpan = CollectionsMarshal.AsSpan(messages);
-        ref var start = ref MemoryMarshal.GetReference(messagesSpan);
-        ref var end = ref Unsafe.Add(ref start, messagesSpan.Length);
-        var msgBytesSum = 0;
-        while (Unsafe.IsAddressLessThan(ref start, ref end))
-        {
-            if (start.UserHeaders is not null)
-            {
-                msgBytesSum += start.Payload.Length + 16 + 56;
-                foreach (var (headerKey, headerValue) in start.UserHeaders)
-                {
-                    msgBytesSum += 4 + headerKey.Value.Length + 1 + 4 + headerValue.Value.Length;
-                }
-            }
-            else
-            {
-                msgBytesSum += start.Payload.Length + 16 + 56;
-            }
-
-            start = ref Unsafe.Add(ref start, 1);
-        }
-
-        return msgBytesSum;
     }
 }

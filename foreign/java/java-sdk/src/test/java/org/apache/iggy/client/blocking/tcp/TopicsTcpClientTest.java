@@ -28,5 +28,4 @@ class TopicsTcpClientTest extends TopicsClientBaseTest {
     protected IggyBaseClient getClient() {
         return TcpClientFactory.create(iggyServer);
     }
-
 }

@@ -19,10 +19,13 @@
 
 package org.apache.iggy.client.blocking.tcp;
 
-import org.junit.jupiter.api.Test;
 import org.apache.iggy.client.blocking.ConsumerGroupsClientBaseTest;
 import org.apache.iggy.client.blocking.IggyBaseClient;
-import java.util.Optional;
+import org.apache.iggy.identifier.ConsumerId;
+import org.junit.jupiter.api.Test;
+
+import static org.apache.iggy.TestConstants.STREAM_NAME;
+import static org.apache.iggy.TestConstants.TOPIC_NAME;
 import static org.assertj.core.api.Assertions.assertThat;
 
 class ConsumerGroupsTcpClientTest extends ConsumerGroupsClientBaseTest {
@@ -36,24 +39,25 @@ class ConsumerGroupsTcpClientTest extends ConsumerGroupsClientBaseTest {
     void shouldJoinAndLeaveConsumerGroup() {
         // given
         setUpStreamAndTopic();
-        var group = consumerGroupsClient.createConsumerGroup(42L,
-                42L,
-                Optional.of(42L),
-                "consumer-group-42");
+        var group = consumerGroupsClient.createConsumerGroup(STREAM_NAME, TOPIC_NAME, "consumer-group-42");
+        ConsumerId groupId = ConsumerId.of(group.id());
 
         // when
-        consumerGroupsClient.joinConsumerGroup(42L, 42L, group.id());
+        consumerGroupsClient.joinConsumerGroup(STREAM_NAME, TOPIC_NAME, groupId);
 
         // then
-        group = consumerGroupsClient.getConsumerGroup(42L, 42L, group.id()).get();
+        group = consumerGroupsClient
+                .getConsumerGroup(STREAM_NAME, TOPIC_NAME, groupId)
+                .get();
         assertThat(group.membersCount()).isEqualTo(1);
 
         // when
-        consumerGroupsClient.leaveConsumerGroup(42L, 42L, group.id());
+        consumerGroupsClient.leaveConsumerGroup(STREAM_NAME, TOPIC_NAME, groupId);
 
         // then
-        group = consumerGroupsClient.getConsumerGroup(42L, 42L, group.id()).get();
+        group = consumerGroupsClient
+                .getConsumerGroup(STREAM_NAME, TOPIC_NAME, groupId)
+                .get();
         assertThat(group.membersCount()).isEqualTo(0);
     }
-
 }

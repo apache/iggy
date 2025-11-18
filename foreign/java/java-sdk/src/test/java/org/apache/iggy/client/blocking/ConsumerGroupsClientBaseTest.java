@@ -19,13 +19,14 @@
 
 package org.apache.iggy.client.blocking;
 
+import org.apache.iggy.consumergroup.ConsumerGroup;
+import org.apache.iggy.consumergroup.ConsumerGroupDetails;
+import org.apache.iggy.identifier.ConsumerId;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
-import org.apache.iggy.consumergroup.ConsumerGroup;
-import org.apache.iggy.identifier.ConsumerId;
-import org.apache.iggy.identifier.StreamId;
-import org.apache.iggy.identifier.TopicId;
-import java.util.Optional;
+
+import static org.apache.iggy.TestConstants.STREAM_NAME;
+import static org.apache.iggy.TestConstants.TOPIC_NAME;
 import static org.assertj.core.api.Assertions.assertThat;
 
 public abstract class ConsumerGroupsClientBaseTest extends IntegrationTest {
@@ -45,46 +46,45 @@ public abstract class ConsumerGroupsClientBaseTest extends IntegrationTest {
         setUpStreamAndTopic();
 
         // when
-        consumerGroupsClient.createConsumerGroup(42L,
-                42L,
-                Optional.of(42L),
-                "consumer-group-42");
+        String consumerGroupName = "consumer-group-42";
+        ConsumerGroupDetails consumerGroup = createConsumerGroup(consumerGroupName);
 
-        var consumerGroupById = consumerGroupsClient.getConsumerGroup(StreamId.of(42L),
-                TopicId.of(42L),
-                ConsumerId.of(42L));
-        var consumerGroupByName = consumerGroupsClient.getConsumerGroup(StreamId.of(42L),
-                TopicId.of(42L),
-                ConsumerId.of("consumer-group-42"));
+        var consumerGroupById =
+                consumerGroupsClient.getConsumerGroup(STREAM_NAME, TOPIC_NAME, ConsumerId.of(consumerGroup.id()));
+        var consumerGroupByName =
+                consumerGroupsClient.getConsumerGroup(STREAM_NAME, TOPIC_NAME, ConsumerId.of(consumerGroupName));
 
         // then
         assertThat(consumerGroupById).isPresent();
-        assertThat(consumerGroupById.get().id()).isEqualTo(42L);
-        assertThat(consumerGroupById.get().name()).isEqualTo("consumer-group-42");
+        assertThat(consumerGroupById.get().id()).isEqualTo(consumerGroup.id());
+        assertThat(consumerGroupById.get().name()).isEqualTo(consumerGroupName);
         assertThat(consumerGroupById).isEqualTo(consumerGroupByName);
 
         // when
-        consumerGroupsClient.deleteConsumerGroup(42L, 42L, 42L);
+        consumerGroupsClient.deleteConsumerGroup(STREAM_NAME, TOPIC_NAME, ConsumerId.of(consumerGroup.id()));
 
         // then
-        assertThat(consumerGroupsClient.getConsumerGroups(42L, 42L)).isEmpty();
-        assertThat(consumerGroupsClient.getConsumerGroup(42L, 42L, 42L)).isEmpty();
+        assertThat(consumerGroupsClient.getConsumerGroups(STREAM_NAME, TOPIC_NAME))
+                .isEmpty();
+        assertThat(consumerGroupsClient.getConsumerGroup(STREAM_NAME, TOPIC_NAME, ConsumerId.of(consumerGroup.id())))
+                .isEmpty();
     }
 
     @Test
     void shouldDeleteConsumerGroupByName() {
         // given
         setUpStreamAndTopic();
-        consumerGroupsClient.createConsumerGroup(42L, 42L, Optional.of(42L), "consumer-group-42");
-        var consumerGroup = consumerGroupsClient.getConsumerGroup(42L, 42L, 42L);
+        String groupName = "consumes-group-42";
+        createConsumerGroup(groupName);
+        var consumerGroup = consumerGroupsClient.getConsumerGroup(STREAM_NAME, TOPIC_NAME, ConsumerId.of(groupName));
         assert consumerGroup.isPresent();
 
         // when
-        consumerGroupsClient.deleteConsumerGroup(StreamId.of(42L), TopicId.of(42L),
-                ConsumerId.of("consumer-group-42"));
+        consumerGroupsClient.deleteConsumerGroup(STREAM_NAME, TOPIC_NAME, ConsumerId.of(groupName));
 
         // then
-        assertThat(consumerGroupsClient.getConsumerGroups(42L, 42L)).isEmpty();
+        assertThat(consumerGroupsClient.getConsumerGroups(STREAM_NAME, TOPIC_NAME))
+                .isEmpty();
     }
 
     @Test
@@ -92,12 +92,12 @@ public abstract class ConsumerGroupsClientBaseTest extends IntegrationTest {
         // given
         setUpStreamAndTopic();
 
-        consumerGroupsClient.createConsumerGroup(42L, 42L, Optional.of(42L), "consumer-group-42");
-        consumerGroupsClient.createConsumerGroup(42L, 42L, Optional.of(43L), "consumer-group-43");
-        consumerGroupsClient.createConsumerGroup(42L, 42L, Optional.of(44L), "consumer-group-44");
+        createConsumerGroup("consumer-group-42");
+        createConsumerGroup("consumer-group-43");
+        createConsumerGroup("consumer-group-44");
 
         // when
-        var consumerGroups = consumerGroupsClient.getConsumerGroups(42L, 42L);
+        var consumerGroups = consumerGroupsClient.getConsumerGroups(STREAM_NAME, TOPIC_NAME);
 
         // then
         assertThat(consumerGroups).hasSize(3);
@@ -106,4 +106,7 @@ public abstract class ConsumerGroupsClientBaseTest extends IntegrationTest {
                 .containsExactlyInAnyOrder("consumer-group-42", "consumer-group-43", "consumer-group-44");
     }
 
+    private ConsumerGroupDetails createConsumerGroup(String groupName) {
+        return consumerGroupsClient.createConsumerGroup(STREAM_NAME, TOPIC_NAME, groupName);
+    }
 }

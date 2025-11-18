@@ -15,11 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using System.Buffers;
 using System.Buffers.Binary;
-using System.IO.Hashing;
-using System.Runtime.CompilerServices;
+using System.Net.Security;
+using System.Net.Sockets;
 using System.Text;
-using System.Threading.Channels;
 using Apache.Iggy.Configuration;
 using Apache.Iggy.ConnectionStream;
 using Apache.Iggy.Contracts;
@@ -27,47 +27,70 @@ using Apache.Iggy.Contracts.Auth;
 using Apache.Iggy.Contracts.Tcp;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
-using Apache.Iggy.Headers;
 using Apache.Iggy.Kinds;
 using Apache.Iggy.Mappers;
 using Apache.Iggy.Messages;
-using Apache.Iggy.MessagesDispatcher;
 using Apache.Iggy.Utils;
 using Microsoft.Extensions.Logging;
+using Partitioning = Apache.Iggy.Kinds.Partitioning;
 
 namespace Apache.Iggy.IggyClient.Implementations;
 
-public sealed class TcpMessageStream : IIggyClient, IDisposable
+/// <summary>
+///     A TCP client for interacting with the Iggy server.
+/// </summary>
+public sealed class TcpMessageStream : IIggyClient
 {
-    private readonly Channel<MessageSendRequest>? _channel;
+    private readonly IggyClientConfigurator _configuration;
+    private readonly EventAggregator<ConnectionStateChangedEventArgs> _connectionEvents;
+    private readonly SemaphoreSlim _connectionSemaphore;
     private readonly ILogger<TcpMessageStream> _logger;
-    private readonly IMessageInvoker? _messageInvoker;
-    private readonly MessagePollingSettings _messagePollingSettings;
-    private readonly SemaphoreSlim _semaphore;
-    private readonly IConnectionStream _stream;
+    private readonly SemaphoreSlim _sendingSemaphore;
+    private ClusterNode? _currentLeaderNode;
+    private bool _isConnecting;
+    private DateTimeOffset _lastConnectionTime;
+    private ConnectionState _state = ConnectionState.Disconnected;
+    private TcpConnectionStream _stream = null!;
 
-    internal TcpMessageStream(IConnectionStream stream, Channel<MessageSendRequest>? channel,
-        MessagePollingSettings messagePollingSettings, ILoggerFactory loggerFactory,
-        IMessageInvoker? messageInvoker = null)
+    internal TcpMessageStream(IggyClientConfigurator configuration, ILoggerFactory loggerFactory)
     {
-        _stream = stream;
-        _channel = channel;
-        _messagePollingSettings = messagePollingSettings;
-        _messageInvoker = messageInvoker;
+        _configuration = configuration;
         _logger = loggerFactory.CreateLogger<TcpMessageStream>();
-        _semaphore = new SemaphoreSlim(1, 1);
+        _sendingSemaphore = new SemaphoreSlim(1, 1);
+        _connectionSemaphore = new SemaphoreSlim(1, 1);
+        _lastConnectionTime = DateTimeOffset.MinValue;
+        _connectionEvents = new EventAggregator<ConnectionStateChangedEventArgs>(loggerFactory);
     }
 
+    /// <summary>
+    ///     Fired whenever the connection state changes.
+    /// </summary>
+    //public event EventHandler<ConnectionStateChangedEventArgs>? OnConnectionStateChanged;
     public void Dispose()
     {
-        _stream.Close();
-        _stream.Dispose();
-        _semaphore.Dispose();
+        _stream?.Close();
+        _stream?.Dispose();
+        _sendingSemaphore.Dispose();
+        _connectionSemaphore.Dispose();
+        _connectionEvents.Clear();
     }
 
-    public async Task<StreamResponse?> CreateStreamAsync(string name, uint? streamId, CancellationToken token = default)
+    /// <inheritdoc />
+    public void SubscribeConnectionEvents(Func<ConnectionStateChangedEventArgs, Task> callback)
     {
-        var message = TcpContracts.CreateStream(name, streamId);
+        _connectionEvents.Subscribe(callback);
+    }
+
+    /// <inheritdoc />
+    public void UnsubscribeConnectionEvents(Func<ConnectionStateChangedEventArgs, Task> callback)
+    {
+        _connectionEvents.Unsubscribe(callback);
+    }
+
+    /// <inheritdoc />
+    public async Task<StreamResponse?> CreateStreamAsync(string name, CancellationToken token = default)
+    {
+        var message = TcpContracts.CreateStream(name);
         var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.CREATE_STREAM_CODE);
 
@@ -81,6 +104,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         return BinaryMapper.MapStream(responseBuffer);
     }
 
+    /// <inheritdoc />
     public async Task<StreamResponse?> GetStreamByIdAsync(Identifier streamId, CancellationToken token = default)
     {
         var message = TcpMessageStreamHelpers.GetBytesFromIdentifier(streamId);
@@ -91,12 +115,13 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
 
         if (responseBuffer.Length == 0)
         {
-            throw new InvalidResponseException("Received empty response while trying to get stream by ID.");
+            return null;
         }
 
         return BinaryMapper.MapStream(responseBuffer);
     }
 
+    /// <inheritdoc />
     public async Task<IReadOnlyList<StreamResponse>> GetStreamsAsync(CancellationToken token = default)
     {
         var message = Array.Empty<byte>();
@@ -113,6 +138,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         return BinaryMapper.MapStreams(responseBuffer);
     }
 
+    /// <inheritdoc />
     public async Task UpdateStreamAsync(Identifier streamId, string name, CancellationToken token = default)
     {
         var message = TcpContracts.UpdateStream(streamId, name);
@@ -122,6 +148,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         await SendWithResponseAsync(payload, token);
     }
 
+    /// <inheritdoc />
     public async Task PurgeStreamAsync(Identifier streamId, CancellationToken token = default)
     {
         var message = TcpMessageStreamHelpers.GetBytesFromIdentifier(streamId);
@@ -131,6 +158,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         await SendWithResponseAsync(payload, token);
     }
 
+    /// <inheritdoc />
     public async Task DeleteStreamAsync(Identifier streamId, CancellationToken token = default)
     {
         var message = TcpMessageStreamHelpers.GetBytesFromIdentifier(streamId);
@@ -140,6 +168,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         await SendWithResponseAsync(payload, token);
     }
 
+    /// <inheritdoc />
     public async Task<IReadOnlyList<TopicResponse>> GetTopicsAsync(Identifier streamId,
         CancellationToken token = default)
     {
@@ -157,6 +186,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         return BinaryMapper.MapTopics(responseBuffer);
     }
 
+    /// <inheritdoc />
     public async Task<TopicResponse?> GetTopicByIdAsync(Identifier streamId, Identifier topicId,
         CancellationToken token = default)
     {
@@ -168,19 +198,18 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
 
         if (responseBuffer.Length == 0)
         {
-            throw new InvalidResponseException("Received empty response while trying to get topic by ID.");
+            return null;
         }
 
         return BinaryMapper.MapTopic(responseBuffer);
     }
 
-
+    /// <inheritdoc />
     public async Task<TopicResponse?> CreateTopicAsync(Identifier streamId, string name, uint partitionsCount,
-        CompressionAlgorithm compressionAlgorithm = CompressionAlgorithm.None,
-        uint? topicId = null, byte? replicationFactor = null, ulong messageExpiry = 0, ulong maxTopicSize = 0,
-        CancellationToken token = default)
+        CompressionAlgorithm compressionAlgorithm = CompressionAlgorithm.None, byte? replicationFactor = null,
+        ulong messageExpiry = 0, ulong maxTopicSize = 0, CancellationToken token = default)
     {
-        var message = TcpContracts.CreateTopic(streamId, name, partitionsCount, compressionAlgorithm, topicId,
+        var message = TcpContracts.CreateTopic(streamId, name, partitionsCount, compressionAlgorithm,
             replicationFactor, messageExpiry, maxTopicSize);
         var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.CREATE_TOPIC_CODE);
@@ -195,6 +224,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         return BinaryMapper.MapTopic(responseBuffer);
     }
 
+    /// <inheritdoc />
     public async Task UpdateTopicAsync(Identifier streamId, Identifier topicId, string name,
         CompressionAlgorithm compressionAlgorithm = CompressionAlgorithm.None,
         ulong maxTopicSize = 0, ulong messageExpiry = 0, byte? replicationFactor = null,
@@ -208,6 +238,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         await SendWithResponseAsync(payload, token);
     }
 
+    /// <inheritdoc />
     public async Task DeleteTopicAsync(Identifier streamId, Identifier topicId, CancellationToken token = default)
     {
         var message = TcpContracts.DeleteTopic(streamId, topicId);
@@ -217,6 +248,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         await SendWithResponseAsync(payload, token);
     }
 
+    /// <inheritdoc />
     public async Task PurgeTopicAsync(Identifier streamId, Identifier topicId, CancellationToken token = default)
     {
         var message = TcpContracts.PurgeTopic(streamId, topicId);
@@ -226,87 +258,37 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         await SendWithResponseAsync(payload, token);
     }
 
-    public async Task SendMessagesAsync(MessageSendRequest request,
-        Func<byte[], byte[]>? encryptor = null,
-        CancellationToken token = default)
+
+    /// <inheritdoc />
+    public async Task SendMessagesAsync(Identifier streamId, Identifier topicId, Partitioning partitioning,
+        IList<Message> messages, CancellationToken token = default)
     {
-        if (request.Messages.Count == 0)
-        {
-            return;
-        }
+        var metadataLength = 2 + streamId.Length + 2 + topicId.Length
+                             + 2 + partitioning.Length + 4 + 4;
+        var messageBufferSize = TcpMessageStreamHelpers.CalculateMessageBytesCount(messages)
+                                + metadataLength;
+        var payloadBufferSize = messageBufferSize + 4 + BufferSizes.INITIAL_BYTES_LENGTH;
 
-        //TODO - explore making fields of Message class mutable, so there is no need to create em from scratch
-        if (encryptor is not null)
+        IMemoryOwner<byte> messageBuffer = MemoryPool<byte>.Shared.Rent(messageBufferSize);
+        IMemoryOwner<byte> payloadBuffer = MemoryPool<byte>.Shared.Rent(payloadBufferSize);
+        try
         {
-            for (var i = 0; i < request.Messages.Count; i++)
-            {
-                request.Messages[i] = request.Messages[i] with { Payload = encryptor(request.Messages[i].Payload) };
-            }
-        }
+            TcpContracts.CreateMessage(messageBuffer.Memory.Span[..messageBufferSize], streamId,
+                topicId, partitioning, messages);
 
-        if (_messageInvoker is not null)
+            TcpMessageStreamHelpers.CreatePayload(payloadBuffer.Memory.Span[..payloadBufferSize],
+                messageBuffer.Memory.Span[..messageBufferSize], CommandCodes.SEND_MESSAGES_CODE);
+
+            await SendWithResponseAsync(payloadBuffer.Memory[..payloadBufferSize].ToArray(), token);
+        }
+        finally
         {
-            await _messageInvoker.SendMessagesAsync(request, token);
-            return;
+            messageBuffer.Dispose();
+            payloadBuffer.Dispose();
         }
-
-        await _channel!.Writer.WriteAsync(request, token);
     }
 
-    // TODO: Change TMessage implementation
-    public async Task SendMessagesAsync<TMessage>(MessageSendRequest<TMessage> request,
-        Func<TMessage, byte[]> serializer,
-        Func<byte[], byte[]>? encryptor = null,
-        Dictionary<HeaderKey, HeaderValue>? headers = null,
-        CancellationToken token = default)
-    {
-        IList<TMessage> messages = request.Messages;
-        if (messages.Count == 0)
-        {
-            return;
-        }
-
-        //TODO - explore making fields of Message class mutable, so there is no need to create em from scratch
-        var messagesBuffer = new Message[messages.Count];
-        for (var i = 0; i < messages.Count || token.IsCancellationRequested; i++)
-        {
-            var payload = encryptor is not null ? encryptor(serializer(messages[i])) : serializer(messages[i]);
-            var checksum = BitConverter.ToUInt64(Crc64.Hash(payload));
-
-            messagesBuffer[i] = new Message
-            {
-                Payload = payload,
-                Header = new MessageHeader
-                {
-                    Id = 0,
-                    Checksum = checksum,
-                    Offset = 0,
-                    OriginTimestamp = 0,
-                    Timestamp = DateTimeOffset.UtcNow,
-                    PayloadLength = payload.Length,
-                    UserHeadersLength = 0
-                },
-                UserHeaders = headers
-            };
-        }
-
-        var sendRequest = new MessageSendRequest
-        {
-            StreamId = request.StreamId,
-            TopicId = request.TopicId,
-            Partitioning = request.Partitioning,
-            Messages = messagesBuffer
-        };
-
-        if (_messageInvoker is not null)
-        {
-            await _messageInvoker.SendMessagesAsync(sendRequest, token);
-            return;
-        }
-
-        await _channel!.Writer.WriteAsync(sendRequest, token);
-    }
-
+    /// <inheritdoc />
     public async Task FlushUnsavedBufferAsync(Identifier streamId, Identifier topicId, uint partitionId, bool fsync,
         CancellationToken token = default)
     {
@@ -318,98 +300,27 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         await SendWithResponseAsync(payload, token);
     }
 
-    public async Task<PolledMessages<TMessage>> PollMessagesAsync<TMessage>(MessageFetchRequest request,
-        Func<byte[], TMessage> serializer, Func<byte[], byte[]>? decryptor = null, CancellationToken token = default)
+    /// <inheritdoc />
+    public async Task<PolledMessages> PollMessagesAsync(Identifier streamId, Identifier topicId, uint? partitionId,
+        Consumer consumer,
+        PollingStrategy pollingStrategy, uint count, bool autoCommit, CancellationToken token = default)
     {
-        var messageBufferSize = CalculateMessageBufferSize(request.StreamId, request.TopicId, request.Consumer);
+        var messageBufferSize = CalculateMessageBufferSize(streamId, topicId, consumer);
         var payloadBufferSize = CalculatePayloadBufferSize(messageBufferSize);
         var message = new byte[messageBufferSize];
         var payload = new byte[payloadBufferSize];
 
-        TcpContracts.GetMessages(message.AsSpan()[..messageBufferSize], request.Consumer, request.StreamId,
-            request.TopicId,
-            request.PollingStrategy, request.Count, request.AutoCommit, request.PartitionId);
+        TcpContracts.GetMessages(message.AsSpan()[..messageBufferSize], consumer, streamId,
+            topicId, pollingStrategy, count, autoCommit, partitionId);
         TcpMessageStreamHelpers.CreatePayload(payload, message.AsSpan()[..messageBufferSize],
             CommandCodes.POLL_MESSAGES_CODE);
 
         var responseBuffer = await SendWithResponseAsync(payload, token);
 
-        return BinaryMapper.MapMessages(responseBuffer, serializer, decryptor);
+        return BinaryMapper.MapMessages(responseBuffer);
     }
 
-    public async IAsyncEnumerable<MessageResponse<TMessage>> PollMessagesAsync<TMessage>(PollMessagesRequest request,
-        Func<byte[], TMessage> deserializer, Func<byte[], byte[]>? decryptor = null,
-        [EnumeratorCancellation] CancellationToken token = default)
-    {
-        var channel = Channel.CreateUnbounded<MessageResponse<TMessage>>();
-        var autoCommit = _messagePollingSettings.StoreOffsetStrategy switch
-        {
-            StoreOffset.Never => false,
-            StoreOffset.WhenMessagesAreReceived => true,
-            StoreOffset.AfterProcessingEachMessage => false,
-            _ => throw new ArgumentOutOfRangeException()
-        };
-        var fetchRequest = new MessageFetchRequest
-        {
-            Consumer = request.Consumer,
-            StreamId = request.StreamId,
-            TopicId = request.TopicId,
-            AutoCommit = autoCommit,
-            Count = request.Count,
-            PartitionId = request.PartitionId,
-            PollingStrategy = request.PollingStrategy
-        };
-
-
-        _ = StartPollingMessagesAsync(fetchRequest, deserializer, _messagePollingSettings.Interval, channel.Writer,
-            decryptor, token);
-        await foreach (MessageResponse<TMessage> messageResponse in channel.Reader.ReadAllAsync(token))
-        {
-            yield return messageResponse;
-
-            var currentOffset = messageResponse.Header.Offset;
-            if (_messagePollingSettings.StoreOffsetStrategy is StoreOffset.AfterProcessingEachMessage)
-            {
-                try
-                {
-                    await StoreOffsetAsync(request.Consumer, request.StreamId, request.TopicId, currentOffset,
-                        request.PartitionId, token);
-                }
-                catch
-                {
-                    _logger.LogError(
-                        "Error encountered while saving offset information - Offset: {offset}, Stream ID: {streamId}, Topic ID: {topicId}, Partition ID: {partitionId}",
-                        currentOffset, request.StreamId, request.TopicId, request.PartitionId);
-                }
-            }
-
-            if (request.PollingStrategy.Kind is MessagePolling.Offset)
-            {
-                //TODO - check with profiler whether this doesn't cause a lot of allocations
-                request.PollingStrategy = PollingStrategy.Offset(currentOffset + 1);
-            }
-        }
-    }
-
-    public async Task<PolledMessages> PollMessagesAsync(MessageFetchRequest request,
-        Func<byte[], byte[]>? decryptor = null,
-        CancellationToken token = default)
-    {
-        var messageBufferSize = CalculateMessageBufferSize(request.StreamId, request.TopicId, request.Consumer);
-        var payloadBufferSize = CalculatePayloadBufferSize(messageBufferSize);
-        var message = new byte[messageBufferSize];
-        var payload = new byte[payloadBufferSize];
-
-        TcpContracts.GetMessages(message.AsSpan()[..messageBufferSize], request.Consumer, request.StreamId,
-            request.TopicId, request.PollingStrategy, request.Count, request.AutoCommit, request.PartitionId);
-        TcpMessageStreamHelpers.CreatePayload(payload, message.AsSpan()[..messageBufferSize],
-            CommandCodes.POLL_MESSAGES_CODE);
-
-        var responseBuffer = await SendWithResponseAsync(payload, token);
-
-        return BinaryMapper.MapMessages(responseBuffer, decryptor);
-    }
-
+    /// <inheritdoc />
     public async Task StoreOffsetAsync(Consumer consumer, Identifier streamId, Identifier topicId, ulong offset,
         uint? partitionId, CancellationToken token = default)
     {
@@ -420,6 +331,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         await SendWithResponseAsync(payload, token);
     }
 
+    /// <inheritdoc />
     public async Task<OffsetResponse?> GetOffsetAsync(Consumer consumer, Identifier streamId, Identifier topicId,
         uint? partitionId, CancellationToken token = default)
     {
@@ -437,6 +349,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         return BinaryMapper.MapOffsets(responseBuffer);
     }
 
+    /// <inheritdoc />
     public async Task DeleteOffsetAsync(Consumer consumer, Identifier streamId, Identifier topicId, uint? partitionId,
         CancellationToken token = default)
     {
@@ -447,6 +360,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         await SendWithResponseAsync(payload, token);
     }
 
+    /// <inheritdoc />
     public async Task<IReadOnlyList<ConsumerGroupResponse>> GetConsumerGroupsAsync(Identifier streamId,
         Identifier topicId,
         CancellationToken token = default)
@@ -465,6 +379,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         return BinaryMapper.MapConsumerGroups(responseBuffer);
     }
 
+    /// <inheritdoc />
     public async Task<ConsumerGroupResponse?> GetConsumerGroupByIdAsync(Identifier streamId, Identifier topicId,
         Identifier groupId, CancellationToken token = default)
     {
@@ -482,10 +397,11 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         return BinaryMapper.MapConsumerGroup(responseBuffer);
     }
 
+    /// <inheritdoc />
     public async Task<ConsumerGroupResponse?> CreateConsumerGroupAsync(Identifier streamId, Identifier topicId,
-        string name, uint? groupId, CancellationToken token = default)
+        string name, CancellationToken token = default)
     {
-        var message = TcpContracts.CreateGroup(streamId, topicId, name, groupId);
+        var message = TcpContracts.CreateGroup(streamId, topicId, name);
         var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.CREATE_CONSUMER_GROUP_CODE);
 
@@ -499,6 +415,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         return BinaryMapper.MapConsumerGroup(responseBuffer);
     }
 
+    /// <inheritdoc />
     public async Task DeleteConsumerGroupAsync(Identifier streamId, Identifier topicId, Identifier groupId,
         CancellationToken token = default)
     {
@@ -509,6 +426,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         await SendWithResponseAsync(payload, token);
     }
 
+    /// <inheritdoc />
     public async Task JoinConsumerGroupAsync(Identifier streamId, Identifier topicId, Identifier groupId,
         CancellationToken token = default)
     {
@@ -519,6 +437,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         await SendWithResponseAsync(payload, token);
     }
 
+    /// <inheritdoc />
     public async Task LeaveConsumerGroupAsync(Identifier streamId, Identifier topicId, Identifier groupId,
         CancellationToken token = default)
     {
@@ -529,6 +448,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         await SendWithResponseAsync(payload, token);
     }
 
+    /// <inheritdoc />
     public async Task DeletePartitionsAsync(Identifier streamId, Identifier topicId, uint partitionsCount,
         CancellationToken token = default)
     {
@@ -539,6 +459,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         await SendWithResponseAsync(payload, token);
     }
 
+    /// <inheritdoc />
     public async Task CreatePartitionsAsync(Identifier streamId, Identifier topicId, uint partitionsCount,
         CancellationToken token = default)
     {
@@ -549,6 +470,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         await SendWithResponseAsync(payload, token);
     }
 
+    /// <inheritdoc />
     public async Task<ClientResponse?> GetMeAsync(CancellationToken token = default)
     {
         var message = Array.Empty<byte>();
@@ -565,6 +487,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         return BinaryMapper.MapClient(responseBuffer);
     }
 
+    /// <inheritdoc />
     public async Task<StatsResponse?> GetStatsAsync(CancellationToken token = default)
     {
         var message = Array.Empty<byte>();
@@ -581,6 +504,24 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         return BinaryMapper.MapStats(responseBuffer);
     }
 
+    /// <inheritdoc />
+    public async Task<ClusterMetadata?> GetClusterMetadataAsync(CancellationToken token = default)
+    {
+        var message = Array.Empty<byte>();
+        var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
+        TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.GET_CLUSTER_METADATA_CODE);
+
+        var responseBuffer = await SendWithResponseAsync(payload, token);
+
+        if (responseBuffer.Length == 0)
+        {
+            return null;
+        }
+
+        return BinaryMapper.MapClusterMetadata(responseBuffer);
+    }
+
+    /// <inheritdoc />
     public async Task PingAsync(CancellationToken token = default)
     {
         var message = Array.Empty<byte>();
@@ -590,6 +531,35 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         await SendWithResponseAsync(payload, token);
     }
 
+    /// <inheritdoc />
+    public async Task ConnectAsync(CancellationToken token = default)
+    {
+        if (_state is ConnectionState.Connected
+            or ConnectionState.Authenticating
+            or ConnectionState.Authenticated)
+        {
+            _logger.LogWarning("Connection is already connected");
+            return;
+        }
+
+        if (_lastConnectionTime != DateTimeOffset.MinValue)
+        {
+            await Task.Delay(_configuration.ReconnectionSettings.InitialDelay, token);
+        }
+
+        SetConnectionStateAsync(ConnectionState.Connecting);
+        _isConnecting = true;
+        try
+        {
+            await TryEstablishConnectionAsync(token);
+        }
+        finally
+        {
+            _isConnecting = false;
+        }
+    }
+
+    /// <inheritdoc />
     public async Task<IReadOnlyList<ClientResponse>> GetClientsAsync(CancellationToken token = default)
     {
         var message = Array.Empty<byte>();
@@ -606,6 +576,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         return BinaryMapper.MapClients(responseBuffer);
     }
 
+    /// <inheritdoc />
     public async Task<ClientResponse?> GetClientByIdAsync(uint clientId, CancellationToken token = default)
     {
         var message = TcpContracts.GetClient(clientId);
@@ -622,6 +593,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         return BinaryMapper.MapClient(responseBuffer);
     }
 
+    /// <inheritdoc />
     public async Task<UserResponse?> GetUser(Identifier userId, CancellationToken token = default)
     {
         var message = TcpContracts.GetUser(userId);
@@ -638,6 +610,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         return BinaryMapper.MapUser(responseBuffer);
     }
 
+    /// <inheritdoc />
     public async Task<IReadOnlyList<UserResponse>> GetUsers(CancellationToken token = default)
     {
         var message = Array.Empty<byte>();
@@ -654,6 +627,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         return BinaryMapper.MapUsers(responseBuffer);
     }
 
+    /// <inheritdoc />
     public async Task<UserResponse?> CreateUser(string userName, string password, UserStatus status,
         Permissions? permissions = null, CancellationToken token = default)
     {
@@ -671,6 +645,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         return BinaryMapper.MapUser(responseBuffer);
     }
 
+    /// <inheritdoc />
     public async Task DeleteUser(Identifier userId, CancellationToken token = default)
     {
         var message = TcpContracts.DeleteUser(userId);
@@ -680,6 +655,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         await SendWithResponseAsync(payload, token);
     }
 
+    /// <inheritdoc />
     public async Task UpdateUser(Identifier userId, string? userName = null, UserStatus? status = null,
         CancellationToken token = default)
     {
@@ -690,6 +666,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         await SendWithResponseAsync(payload, token);
     }
 
+    /// <inheritdoc />
     public async Task UpdatePermissions(Identifier userId, Permissions? permissions = null,
         CancellationToken token = default)
     {
@@ -700,6 +677,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         await SendWithResponseAsync(payload, token);
     }
 
+    /// <inheritdoc />
     public async Task ChangePassword(Identifier userId, string currentPassword, string newPassword,
         CancellationToken token = default)
     {
@@ -710,12 +688,19 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         await SendWithResponseAsync(payload, token);
     }
 
+    /// <inheritdoc />
     public async Task<AuthResponse?> LoginUser(string userName, string password, CancellationToken token = default)
     {
+        if (_state == ConnectionState.Disconnected)
+        {
+            throw new NotConnectedException();
+        }
+
         var message = TcpContracts.LoginUser(userName, password, "0.5.0", "csharp-sdk");
         var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.LOGIN_USER_CODE);
 
+        SetConnectionStateAsync(ConnectionState.Authenticating);
         var responseBuffer = await SendWithResponseAsync(payload, token);
 
         if (responseBuffer.Length <= 0)
@@ -724,10 +709,12 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         }
 
         var userId = BinaryPrimitives.ReadInt32LittleEndian(responseBuffer.AsSpan()[..responseBuffer.Length]);
-
-        return new AuthResponse(userId, null);
+        SetConnectionStateAsync(ConnectionState.Authenticated);
+        var authResponse = new AuthResponse(userId, null);
+        return authResponse;
     }
 
+    /// <inheritdoc />
     public async Task LogoutUser(CancellationToken token = default)
     {
         var message = Array.Empty<byte>();
@@ -737,6 +724,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         await SendWithResponseAsync(payload, token);
     }
 
+    /// <inheritdoc />
     public async Task<IReadOnlyList<PersonalAccessTokenResponse>> GetPersonalAccessTokensAsync(
         CancellationToken token = default)
     {
@@ -754,6 +742,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         return BinaryMapper.MapPersonalAccessTokens(responseBuffer);
     }
 
+    /// <inheritdoc />
     public async Task<RawPersonalAccessToken?> CreatePersonalAccessTokenAsync(string name, ulong? expiry = 0,
         CancellationToken token = default)
     {
@@ -771,6 +760,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         return BinaryMapper.MapRawPersonalAccessToken(responseBuffer);
     }
 
+    /// <inheritdoc />
     public async Task DeletePersonalAccessTokenAsync(string name, CancellationToken token = default)
     {
         var message = TcpContracts.DeletePersonalRequestToken(name);
@@ -780,6 +770,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         await SendWithResponseAsync(payload, token);
     }
 
+    /// <inheritdoc />
     public async Task<AuthResponse?> LoginWithPersonalAccessToken(string token, CancellationToken ct = default)
     {
         var message = TcpContracts.LoginWithPersonalAccessToken(token);
@@ -799,56 +790,217 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         return new AuthResponse(userId, default);
     }
 
-    //TODO - look into calling the non generic FetchMessagesAsync method in order
-    //to make this method re-usable for non generic PollMessages method.
-    private async Task StartPollingMessagesAsync<TMessage>(MessageFetchRequest request,
-        Func<byte[], TMessage> deserializer, TimeSpan interval, ChannelWriter<MessageResponse<TMessage>> writer,
-        Func<byte[], byte[]>? decryptor = null,
-        CancellationToken token = default)
+    private async Task TryEstablishConnectionAsync(CancellationToken token)
     {
-        var timer = new PeriodicTimer(interval);
-        while (await timer.WaitForNextTickAsync(token) || token.IsCancellationRequested)
+        var retryCount = 0;
+        var delay = _configuration.ReconnectionSettings.InitialDelay;
+        do
         {
+            // ReSharper disable once ConditionIsAlwaysTrueOrFalseAccordingToNullableAPIContract
+            _stream?.Close();
+            _stream?.Dispose();
+
+            var connectionAddress = _currentLeaderNode?.Address ?? _configuration.BaseAddress;
+            var urlPortSplitter = connectionAddress.Split(":");
+            if (urlPortSplitter.Length > 2)
+            {
+                throw new InvalidBaseAddressException();
+            }
+
             try
             {
-                PolledMessages<TMessage> fetchResponse
-                    = await PollMessagesAsync(request, deserializer, decryptor, token);
-                if (fetchResponse.Messages.Count == 0)
+                var socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+                socket.SendBufferSize = _configuration.SendBufferSize;
+                socket.ReceiveBufferSize = _configuration.ReceiveBufferSize;
+
+                await socket.ConnectAsync(urlPortSplitter[0], int.Parse(urlPortSplitter[1]), token);
+
+                socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
+                socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveTime, 5);
+
+                SetConnectionStateAsync(ConnectionState.Connected);
+                _lastConnectionTime = DateTimeOffset.UtcNow;
+
+                _stream = _configuration.TlsSettings.Enabled switch
                 {
+                    true => CreateSslStreamAndAuthenticate(socket, _configuration.TlsSettings),
+                    false => new TcpConnectionStream(new NetworkStream(socket, true))
+                };
+
+                if (_configuration.AutoLoginSettings.Enabled)
+                {
+                    _logger.LogInformation("Auto login enabled. Trying to login with credentials: {Username}",
+                        _configuration.AutoLoginSettings.Username);
+                    await LoginUser(_configuration.AutoLoginSettings.Username,
+                        _configuration.AutoLoginSettings.Password, token);
+
+                    _currentLeaderNode = await GetCurrentLeaderNodeAsync(token);
+                    if (_currentLeaderNode == null)
+                    {
+                        break;
+                    }
+
+                    if (_currentLeaderNode.Address == _configuration.BaseAddress)
+                    {
+                        break;
+                    }
+
+                    _logger.LogInformation("Leader address changed. Trying to reconnect to {Address}",
+                        _currentLeaderNode.Address);
                     continue;
                 }
 
-                foreach (MessageResponse<TMessage> messageResponse in fetchResponse.Messages)
-                {
-                    await writer.WriteAsync(messageResponse, token);
-                }
+                break;
             }
-            catch (InvalidResponseException e)
+            catch (Exception e)
             {
-                _logger.LogError(
-                    "Error encountered while polling messages - Stream ID: {streamId}, Topic ID: {topicId}, Partition ID: {partitionId}, error message {message}",
-                    request.StreamId, request.TopicId, request.PartitionId, e.Message);
+                _logger.LogError(e, "Failed to connect");
+
+                if (!_configuration.ReconnectionSettings.Enabled ||
+                    (_configuration.ReconnectionSettings.MaxRetries > 0 &&
+                     retryCount >= _configuration.ReconnectionSettings.MaxRetries))
+                {
+                    SetConnectionStateAsync(ConnectionState.Disconnected);
+                    throw;
+                }
+
+                retryCount++;
+                if (_configuration.ReconnectionSettings.UseExponentialBackoff)
+                {
+                    delay *= _configuration.ReconnectionSettings.BackoffMultiplier;
+
+                    if (delay > _configuration.ReconnectionSettings.MaxDelay)
+                    {
+                        delay = _configuration.ReconnectionSettings.MaxDelay;
+                    }
+                }
+
+                if (_logger.IsEnabled(LogLevel.Information))
+                {
+                    _logger.LogInformation("Retrying connection attempt {RetryCount} with delay {Delay}", retryCount,
+                        delay);
+                }
+
+                await Task.Delay(delay, token);
             }
+        } while (true);
+    }
+
+    private async Task<ClusterNode?> GetCurrentLeaderNodeAsync(CancellationToken token)
+    {
+        try
+        {
+            var clusterMetadata = await GetClusterMetadataAsync(token);
+            if (clusterMetadata == null)
+            {
+                return null;
+            }
+
+            var leaderNode = clusterMetadata.Nodes.FirstOrDefault(x => x.Role == ClusterNodeRole.Leader);
+            if (leaderNode == null)
+            {
+                throw new MissingLeaderException();
+            }
+
+            return leaderNode;
+        }
+        // todo: change after error refactoring, error code 5 is for feature not supported
+        catch (IggyInvalidStatusCodeException e) when (e.StatusCode == 5)
+        {
+            return null;
+        }
+    }
+
+    private static TcpConnectionStream CreateSslStreamAndAuthenticate(Socket socket, TlsSettings tlsSettings)
+    {
+        var stream = new NetworkStream(socket, true);
+        var sslStream = new SslStream(stream);
+        if (tlsSettings.Authenticate)
+        {
+            sslStream.AuthenticateAsClient(tlsSettings.Hostname);
         }
 
-        writer.Complete();
+        return new TcpConnectionStream(sslStream);
     }
 
     private async Task<byte[]> SendWithResponseAsync(byte[] payload, CancellationToken token = default)
     {
         try
         {
-            await _semaphore.WaitAsync(token);
+            return await SendRawAsync(payload, token);
+        }
+        catch (Exception e) when (IsConnectionException(e) && !_isConnecting)
+        {
+            _logger.LogWarning("Connection lost");
+            if (!_configuration.ReconnectionSettings.Enabled)
+            {
+                _logger.LogWarning("Reconnection is disabled");
+                SetConnectionStateAsync(ConnectionState.Disconnected);
+                throw;
+            }
 
+            return await HandleReconnectionAsync(payload, token);
+        }
+    }
+
+    private async Task<byte[]> HandleReconnectionAsync(byte[] payload, CancellationToken token)
+    {
+        var currentTime = DateTimeOffset.UtcNow;
+        await _connectionSemaphore.WaitAsync(token);
+
+        try
+        {
+            if (_state is ConnectionState.Connected or ConnectionState.Authenticated
+                && _lastConnectionTime > currentTime)
+            {
+                _logger.LogInformation("Connection already established, sending payload");
+                return await SendRawAsync(payload, token);
+            }
+
+            SetConnectionStateAsync(ConnectionState.Disconnected);
+            _logger.LogInformation("Reconnecting to the server");
+            await ConnectAsync(token);
+
+            _logger.LogInformation("Reconnected to the server");
+
+            await Task.Delay(_configuration.ReconnectionSettings.WaitAfterReconnect, token);
+
+            return await SendRawAsync(payload, token);
+        }
+        finally
+        {
+            _connectionSemaphore.Release();
+        }
+    }
+
+    private async Task<byte[]> SendRawAsync(byte[] payload, CancellationToken token)
+    {
+        if (_state is ConnectionState.Disconnected or ConnectionState.Connecting)
+        {
+            throw new NotConnectedException();
+        }
+
+        try
+        {
+            await _sendingSemaphore.WaitAsync(token);
             await _stream.SendAsync(payload, token);
             await _stream.FlushAsync(token);
 
+            // Read the 8-byte header (4 bytes status + 4 bytes length)
             var buffer = new byte[BufferSizes.EXPECTED_RESPONSE_SIZE];
-            var readBytes = await _stream.ReadAsync(buffer, token);
-
-            if (readBytes == 0)
+            var totalRead = 0;
+            while (totalRead < BufferSizes.EXPECTED_RESPONSE_SIZE)
             {
-                throw new InvalidResponseException("Received empty response from server or connection was closed");
+                var readBytes
+                    = await _stream.ReadAsync(
+                        buffer.AsMemory(totalRead, BufferSizes.EXPECTED_RESPONSE_SIZE - totalRead),
+                        token);
+                if (readBytes == 0)
+                {
+                    throw new IggyZeroBytesException();
+                }
+
+                totalRead += readBytes;
             }
 
             var response = TcpMessageStreamHelpers.GetResponseLengthAndStatus(buffer);
@@ -857,11 +1009,24 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
             {
                 if (response.Length == 0)
                 {
-                    throw new InvalidResponseException($"Invalid response status code: {response.Status}");
+                    throw new IggyInvalidStatusCodeException(response.Status,
+                        $"Invalid response status code: {response.Status}");
                 }
 
                 var errorBuffer = new byte[response.Length];
-                await _stream.ReadAsync(errorBuffer, token);
+                totalRead = 0;
+                while (totalRead < response.Length)
+                {
+                    var readBytes
+                        = await _stream.ReadAsync(errorBuffer.AsMemory(totalRead, response.Length - totalRead), token);
+                    if (readBytes == 0)
+                    {
+                        throw new IggyZeroBytesException();
+                    }
+
+                    totalRead += readBytes;
+                }
+
                 throw new InvalidResponseException(Encoding.UTF8.GetString(errorBuffer));
             }
 
@@ -871,13 +1036,34 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
             }
 
             var responseBuffer = new byte[response.Length];
-            await _stream.ReadAsync(responseBuffer, token);
+            totalRead = 0;
+            while (totalRead < response.Length)
+            {
+                var readBytes = await _stream.ReadAsync(responseBuffer.AsMemory(totalRead, response.Length - totalRead),
+                    token);
+                if (readBytes == 0)
+                {
+                    throw new IggyZeroBytesException();
+                }
+
+                totalRead += readBytes;
+            }
+
             return responseBuffer;
         }
         finally
         {
-            _semaphore.Release();
+            _sendingSemaphore.Release();
         }
+    }
+
+    private static bool IsConnectionException(Exception ex)
+    {
+        return ex is IggyZeroBytesException or
+            NotConnectedException or
+            SocketException or
+            IOException or
+            ObjectDisposedException;
     }
 
     private static int CalculatePayloadBufferSize(int messageBufferSize)
@@ -887,6 +1073,26 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
 
     private static int CalculateMessageBufferSize(Identifier streamId, Identifier topicId, Consumer consumer)
     {
-        return 14 + 5 + 2 + streamId.Length + 2 + topicId.Length + 2 + consumer.Id.Length;
+        // Original: 14 + 5 + 2 + streamId.Length + 2 + topicId.Length + 2 + consumer.Id.Length
+        // Added 1 byte for partition flag
+        return 15 + 5 + 2 + streamId.Length + 2 + topicId.Length + 2 + consumer.ConsumerId.Length;
+    }
+
+    /// <summary>
+    ///     Sets the connection state and fires the OnConnectionStateChanged event.
+    /// </summary>
+    /// <param name="newState">The new connection state</param>
+    private void SetConnectionStateAsync(ConnectionState newState)
+    {
+        if (_state == newState)
+        {
+            return;
+        }
+
+        var previousState = _state;
+        _state = newState;
+
+        _logger.LogInformation("Connection state changed: {PreviousState} -> {CurrentState}", previousState, newState);
+        _connectionEvents.Publish(new ConnectionStateChangedEventArgs(previousState, newState));
     }
 }

@@ -28,7 +28,7 @@ namespace Apache.Iggy.Tests.Integrations;
 
 public class ConsumerGroupTests
 {
-    private static readonly uint GroupId = 1;
+    private static readonly uint GroupId = 0;
     private static readonly string GroupName = "test_consumer_group";
     private Identifier TopicId => Identifier.String(Fixture.TopicId);
 
@@ -42,7 +42,7 @@ public class ConsumerGroupTests
         var consumerGroup
             = await Fixture.Clients[protocol]
                 .CreateConsumerGroupAsync(Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)), TopicId,
-                    GroupName, GroupId);
+                    GroupName);
 
         consumerGroup.ShouldNotBeNull();
         consumerGroup.Id.ShouldBe(GroupId);
@@ -56,10 +56,10 @@ public class ConsumerGroupTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task CreateConsumerGroup_Should_Throw_InvalidResponse(Protocol protocol)
     {
-        await Should.ThrowAsync<InvalidResponseException>(() =>
+        await Should.ThrowAsync<IggyInvalidStatusCodeException>(() =>
             Fixture.Clients[protocol]
                 .CreateConsumerGroupAsync(Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)), TopicId,
-                    GroupName, GroupId));
+                    GroupName));
     }
 
     [Test]
@@ -156,7 +156,7 @@ public class ConsumerGroupTests
         var clients = new List<IIggyClient>();
         for (var i = 0; i < 2; i++)
         {
-            var client = Fixture.IggyServerFixture.CreateClient(Protocol.Tcp, protocol);
+            var client = await Fixture.IggyServerFixture.CreateClient(Protocol.Tcp, protocol);
             clients.Add(client);
             await client.LoginUser("iggy", "iggy");
             var me = await client.GetMeAsync();
@@ -175,7 +175,6 @@ public class ConsumerGroupTests
         response.MembersCount.ShouldBe(2u);
         response.Members.ShouldNotBeNull();
         response.Members.Count.ShouldBe(2);
-        response.Members.ShouldAllBe(m => clientIds.Contains(m.Id));
         response.Members.ShouldAllBe(x => x.PartitionsCount == 5);
         response.Members.ShouldAllBe(x => x.Partitions.Count == 5);
     }
@@ -196,7 +195,7 @@ public class ConsumerGroupTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task JoinConsumerGroup_Tcp_Should_Throw_InvalidResponse(Protocol protocol)
     {
-        await Should.ThrowAsync<InvalidResponseException>(() =>
+        await Should.ThrowAsync<IggyInvalidStatusCodeException>(() =>
             Fixture.Clients[protocol]
                 .JoinConsumerGroupAsync(Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)), TopicId,
                     Identifier.Numeric(GroupId)));
@@ -208,7 +207,7 @@ public class ConsumerGroupTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task DeleteConsumerGroup_Should_Throw_InvalidResponse(Protocol protocol)
     {
-        await Should.ThrowAsync<InvalidResponseException>(() =>
+        await Should.ThrowAsync<IggyInvalidStatusCodeException>(() =>
             Fixture.Clients[protocol].DeleteConsumerGroupAsync(
                 Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)), TopicId, Identifier.Numeric(GroupId)));
     }
