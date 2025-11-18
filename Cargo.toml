@@ -27,6 +27,7 @@ members = [
     "core/bench/runner",
     "core/binary_protocol",
     "core/cli",
+    "core/clock",
     "core/common",
     "core/connectors/runtime",
     "core/connectors/sdk",
