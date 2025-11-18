@@ -40,8 +40,11 @@ jobs:
           ref: ${{ github.event.pull_request.head.ref }}
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Setup Rust
-        uses: dtolnay/rust-action@stable
+      - name: Setup Rust with cache
+        uses: ./.github/actions/utils/setup-rust-with-cache
+        with:
+          cache-targets: false # Only cache registry and git deps, not target dir (sccache handles that)
+          show-stats: true
 
       - name: Install cargo-license
         run: cargo install cargo-license

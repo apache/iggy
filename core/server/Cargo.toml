@@ -19,13 +19,13 @@
 name = "server"
 version = "0.6.0-edge.3"
 edition = "2024"
-build = "src/build.rs"
 license = "Apache-2.0"
 
 [package.metadata.cargo-udeps.ignore]
 normal = ["tracing-appender"]
 
 [package.metadata.cargo-machete]
+ignored = ["vergen-git2"]
 
 [[bin]]
 name = "iggy-server"
