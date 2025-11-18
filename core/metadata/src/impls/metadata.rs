@@ -14,13 +14,17 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use consensus::Consensus;
+use clock::Clock;
+use consensus::{Consensus, Project};
+use std::marker::PhantomData;
+use tracing::debug;
 
 // TODO: Define a trait (probably in some external crate)
 #[expect(unused)]
-trait Metadata<C>
+trait Metadata<C, T>
 where
-    C: Consensus,
+    C: Consensus<T>,
+    T: Clock,
 {
     fn on_request(&self, message: C::RequestMessage);
     fn on_replicate(&self, message: C::ReplicateMessage);
@@ -28,19 +32,27 @@ where
 }
 
 #[expect(unused)]
-struct IggyMetadata<C, M, J, S> {
+struct IggyMetadata<C, M, J, S, T>
+where
+    C: Consensus<T>,
+    T: Clock,
+{
     consensus: C,
     mux_stm: M,
     journal: J,
     snapshot: S,
+
+    _t: PhantomData<T>,
 }
 
-impl<C, M, J, S> Metadata<C> for IggyMetadata<C, M, J, S>
+impl<C, M, J, S, T> Metadata<C, T> for IggyMetadata<C, M, J, S, T>
 where
-    C: Consensus,
+    C: Consensus<T>,
+    T: Clock,
 {
-    fn on_request(&self, _message: C::RequestMessage) {
-        todo!()
+    fn on_request(&self, message: C::RequestMessage) {
+        debug!("handling metadata request");
+        let _message = message.project(&self.consensus);
     }
 
     fn on_replicate(&self, _message: C::ReplicateMessage) {
@@ -51,3 +63,7 @@ where
         todo!()
     }
 }
+
+// TODO: Hide with associated types all of those generics, so they are not leaking to the upper layer
+#[expect(unused)]
+pub trait MetadataHandle {}

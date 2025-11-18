@@ -63,7 +63,7 @@
     "@types/debug": "4.1.12",
     "@types/node": "24.10.1",
     "husky": "9.1.7",
-    "semantic-release": "^24.2.9",
+    "semantic-release": "^25.0.2",
     "typescript": "5.9.3",
     "typescript-eslint": "8.46.4"
   },

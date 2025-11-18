@@ -16,19 +16,9 @@
 # under the License.
 
 [package]
-name = "consensus"
+name = "clock"
 version = "0.1.0"
-description = "Iggy consensus module"
 edition = "2024"
-license = "Apache-2.0"
-keywords = ["iggy", "messaging", "streaming"]
-categories = ["command-line-utilities", "database", "network-programming"]
-homepage = "https://iggy.apache.org"
-documentation = "https://iggy.apache.org/docs"
-repository = "https://github.com/apache/iggy"
-readme = "../../../README.md"
 
 [dependencies]
-clock = { path = "../clock" }
-
-
+iggy_common = { workspace = true }
