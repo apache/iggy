@@ -1,24 +1,25 @@
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
-//
-//   http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
 
 use std::io::SeekFrom;
 
-use iggy_connector_sdk::Error;
-use serde_json::Value;
+use iggy_connector_sdk::{ConnectorState, Error};
 use strum::Display;
 use tokio::{
     fs::{File, OpenOptions},
@@ -28,8 +29,8 @@ use tokio::{
 use tracing::{debug, error, info};
 
 pub trait StateProvider {
-    async fn load(&self) -> Result<Option<Value>, Error>;
-    async fn save(&self, state: Value) -> Result<(), Error>;
+    async fn load(&self) -> Result<Option<ConnectorState>, Error>;
+    async fn save(&self, state: ConnectorState) -> Result<(), Error>;
 }
 
 #[non_exhaustive]
@@ -55,7 +56,7 @@ impl FileStateProvider {
 }
 
 impl StateProvider for FileStateProvider {
-    async fn load(&self) -> Result<Option<Value>, Error> {
+    async fn load(&self) -> Result<Option<ConnectorState>, Error> {
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -76,12 +77,11 @@ impl StateProvider for FileStateProvider {
             Ok(None)
         } else {
             info!("Loaded state file: {}", self.path);
-            let state = serde_json::from_slice(&buffer).map_err(|_| Error::CannotReadStateFile)?;
-            Ok(Some(state))
+            Ok(Some(ConnectorState(buffer)))
         }
     }
 
-    async fn save(&self, state: Value) -> Result<(), Error> {
+    async fn save(&self, state: ConnectorState) -> Result<(), Error> {
         let mut file = self.file.lock().await;
         let Some(file) = file.as_mut() else {
             return Err(Error::CannotReadStateFile);
@@ -97,9 +97,7 @@ impl StateProvider for FileStateProvider {
             Error::CannotWriteStateFile
         })?;
 
-        let state_bytes = serde_json::to_vec(&state).map_err(|_| Error::CannotWriteStateFile)?;
-
-        file.write_all(&state_bytes).await.map_err(|error| {
+        file.write_all(&state.0).await.map_err(|error| {
             error!("Cannot write state file: {}. {error}.", self.path);
             Error::CannotWriteStateFile
         })?;

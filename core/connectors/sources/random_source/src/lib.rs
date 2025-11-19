@@ -1,4 +1,5 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
  * regarding copyright ownership.  The ASF licenses this file
@@ -16,17 +17,16 @@
  * under the License.
  */
 
-use std::{str::FromStr, time::Duration};
-
 use async_trait::async_trait;
 use iggy_connector_sdk::{
-    Error, ProducedMessage, ProducedMessages, Schema, Source, source_connector,
+    ConnectorState, Error, ProducedMessage, ProducedMessages, Schema, Source, source_connector,
 };
 use rand::{
     Rng,
     distr::{Alphanumeric, Uniform},
 };
 use serde::{Deserialize, Serialize};
+use std::{str::FromStr, time::Duration};
 use tokio::{sync::Mutex, time::sleep};
 use tracing::{error, info};
 use uuid::Uuid;
@@ -57,20 +57,23 @@ struct State {
 }
 
 impl RandomSource {
-    pub fn new(id: u32, config: RandomSourceConfig, state: Option<serde_json::Value>) -> Self {
+    pub fn new(id: u32, config: RandomSourceConfig, state: Option<ConnectorState>) -> Self {
         let interval = config.interval.unwrap_or("1s".to_string());
         let interval = humantime::Duration::from_str(&interval)
             .unwrap_or(humantime::Duration::from_str("1s").expect("Failed to parse interval"));
 
         let current_number = if let Some(state) = state {
-            serde_json::from_value::<usize>(state)
-                .inspect_err(|error| {
-                    error!("Failed to convert state to current number. {error}");
-                })
-                .unwrap_or_default()
+            u64::from_le_bytes(
+                state.0[0..8]
+                    .try_into()
+                    .inspect_err(|error| {
+                        error!("Failed to convert state to current number. {error}");
+                    })
+                    .unwrap_or_default(),
+            )
         } else {
             0
-        };
+        } as usize;
 
         RandomSource {
             id,
@@ -152,7 +155,7 @@ impl Source for RandomSource {
             return Ok(ProducedMessages {
                 schema: Schema::Json,
                 messages: vec![],
-                state: Some(serde_json::to_value(state.current_number).unwrap()),
+                state: Some(ConnectorState(state.current_number.to_le_bytes().to_vec())),
             });
         }
 
@@ -166,7 +169,7 @@ impl Source for RandomSource {
         Ok(ProducedMessages {
             schema: Schema::Json,
             messages,
-            state: Some(serde_json::to_value(state.current_number).unwrap()),
+            state: Some(ConnectorState(state.current_number.to_le_bytes().to_vec())),
         })
     }
 

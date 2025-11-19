@@ -1,4 +1,5 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
  * regarding copyright ownership.  The ASF licenses this file
@@ -21,7 +22,7 @@ use std::{collections::HashMap, str::FromStr, time::Duration};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use iggy_connector_sdk::{
-    Error, ProducedMessage, ProducedMessages, Schema, Source, source_connector,
+    ConnectorState, Error, ProducedMessage, ProducedMessages, Schema, Source, source_connector,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::{Column, Pool, Postgres, Row, TypeInfo, postgres::PgPoolOptions};
@@ -76,7 +77,7 @@ pub struct DatabaseRecord {
 }
 
 impl PostgresSource {
-    pub fn new(id: u32, config: PostgresSourceConfig, _state: Option<serde_json::Value>) -> Self {
+    pub fn new(id: u32, config: PostgresSourceConfig, _state: Option<ConnectorState>) -> Self {
         PostgresSource {
             id,
             pool: None,

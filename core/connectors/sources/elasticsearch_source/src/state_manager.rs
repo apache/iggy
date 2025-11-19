@@ -18,12 +18,88 @@
  */
 
 use crate::{ElasticsearchSource, StateConfig};
-use iggy_connector_sdk::{Error, FileStateStorage, Source, SourceState, StateStorage};
-use serde_json::Value;
+use async_trait::async_trait;
+use iggy_connector_sdk::Error;
+use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::time::{Duration, interval};
 use tracing::{error, info, warn};
+
+impl ElasticsearchSource {
+    async fn get_state(&self) -> Result<Option<SourceState>, Error> {
+        if self
+            .config
+            .state
+            .as_ref()
+            .map(|s| s.enabled)
+            .unwrap_or(false)
+        {
+            Ok(Some(self.internal_state_to_source_state().await?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub(super) async fn save_state(&self) -> Result<(), Error> {
+        if !self
+            .config
+            .state
+            .as_ref()
+            .map(|s| s.enabled)
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+
+        let storage = self
+            .create_state_storage()
+            .ok_or_else(|| Error::Storage("State storage not configured".to_string()))?;
+
+        let source_state = self.internal_state_to_source_state().await?;
+        storage.save_source_state(&source_state).await?;
+
+        info!(
+            "Saved state for Elasticsearch source connector with ID: {}",
+            self.id
+        );
+        Ok(())
+    }
+
+    pub(super) async fn load_state(&mut self) -> Result<(), Error> {
+        if !self
+            .config
+            .state
+            .as_ref()
+            .map(|s| s.enabled)
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+
+        let storage = self
+            .create_state_storage()
+            .ok_or_else(|| Error::Storage("State storage not configured".to_string()))?;
+
+        let state_id = self.get_state_id();
+        if let Some(source_state) = storage.load_source_state(&state_id).await? {
+            self.source_state_to_internal_state(source_state).await?;
+
+            let state = self.state.lock().await;
+            info!(
+                "Loaded state for Elasticsearch source connector with ID: {} - last poll: {:?}, total docs: {}, polls: {}",
+                self.id, state.last_poll_timestamp, state.total_documents_fetched, state.poll_count
+            );
+        } else {
+            info!(
+                "No existing state found for Elasticsearch source connector with ID: {}, starting fresh",
+                self.id
+            );
+        }
+
+        Ok(())
+    }
+}
 
 /// State manager for Elasticsearch source connector
 pub struct StateManager {
@@ -81,7 +157,7 @@ impl StateManager {
     }
 
     /// Start auto-save background task
-    pub async fn start_auto_save(&self, connector: std::sync::Arc<ElasticsearchSource>) {
+    pub async fn start_auto_save(&self, connector: Arc<ElasticsearchSource>) {
         let interval_duration = self
             .auto_save_interval
             .unwrap_or_else(|| Duration::from_secs(60));
@@ -91,7 +167,7 @@ impl StateManager {
             let mut interval = interval(interval_duration);
             loop {
                 interval.tick().await;
-                if let Ok(Some(state)) = Source::get_state(&*connector).await {
+                if let Ok(Some(state)) = connector.get_state().await {
                     if let Err(e) = storage.save_source_state(&state).await {
                         error!(
                             "Failed to auto-save state for {}: {}",
@@ -178,66 +254,136 @@ pub struct StateInfo {
     pub connector_type: String,
 }
 
-/// Extension trait for ElasticsearchSource to add state management utilities
-#[allow(async_fn_in_trait)]
-pub trait StateManagerExt {
-    /// Get state manager for this connector
-    fn get_state_manager(&self) -> Option<StateManager>;
-
-    /// Export current state to JSON
-    async fn export_state(&self) -> Result<Value, Error>;
-
-    /// Import state from JSON
-    async fn import_state(&mut self, state_json: Value) -> Result<(), Error>;
-
-    /// Reset state (clear all state data)
-    async fn reset_state(&mut self) -> Result<(), Error>;
+/// State management for source connectors
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SourceState {
+    /// Unique identifier for this state
+    pub id: String,
+    /// Timestamp when this state was last updated
+    pub last_updated: chrono::DateTime<chrono::Utc>,
+    /// Version of the state format
+    pub version: u32,
+    /// Generic state data as JSON
+    pub data: serde_json::Value,
+    /// Optional metadata
+    pub metadata: Option<serde_json::Value>,
 }
 
-impl StateManagerExt for ElasticsearchSource {
-    fn get_state_manager(&self) -> Option<StateManager> {
-        self.config.state.as_ref().and_then(|config| {
-            if config.enabled {
-                StateManager::new(config.clone()).ok()
-            } else {
-                None
+/// State storage backend trait
+#[async_trait]
+pub trait StateStorage: Send + Sync {
+    /// Save source state to storage
+    async fn save_source_state(&self, state: &SourceState) -> Result<(), Error>;
+
+    /// Load source state from storage
+    async fn load_source_state(&self, id: &str) -> Result<Option<SourceState>, Error>;
+
+    /// Delete state from storage
+    async fn delete_state(&self, id: &str) -> Result<(), Error>;
+
+    /// List all state IDs
+    async fn list_states(&self) -> Result<Vec<String>, Error>;
+}
+
+/// File-based state storage implementation
+pub struct FileStateStorage {
+    base_path: std::path::PathBuf,
+}
+
+impl FileStateStorage {
+    pub fn new<P: AsRef<std::path::Path>>(base_path: P) -> Self {
+        Self {
+            base_path: base_path.as_ref().to_path_buf(),
+        }
+    }
+
+    fn get_state_path(&self, id: &str) -> std::path::PathBuf {
+        self.base_path.join(format!("{id}.json"))
+    }
+}
+
+#[async_trait]
+impl StateStorage for FileStateStorage {
+    async fn save_source_state(&self, state: &SourceState) -> Result<(), Error> {
+        use tokio::fs;
+
+        // Ensure directory exists
+        if let Some(parent) = self.base_path.parent() {
+            fs::create_dir_all(parent)
+                .await
+                .map_err(|e| Error::Storage(format!("Failed to create state directory: {e}")))?;
+        }
+
+        let path = self.get_state_path(&state.id);
+        let json = serde_json::to_string_pretty(state)
+            .map_err(|e| Error::Serialization(format!("Failed to serialize source state: {e}")))?;
+
+        fs::write(path, json)
+            .await
+            .map_err(|e| Error::Storage(format!("Failed to write state file: {e}")))?;
+
+        Ok(())
+    }
+
+    async fn load_source_state(&self, id: &str) -> Result<Option<SourceState>, Error> {
+        use tokio::fs;
+
+        let path = self.get_state_path(id);
+        if !path.exists() {
+            return Ok(None);
+        }
+
+        let content = fs::read_to_string(path)
+            .await
+            .map_err(|e| Error::Storage(format!("Failed to read state file: {e}")))?;
+
+        let state: SourceState = serde_json::from_str(&content).map_err(|e| {
+            Error::Serialization(format!("Failed to deserialize source state: {e}"))
+        })?;
+
+        Ok(Some(state))
+    }
+
+    async fn delete_state(&self, id: &str) -> Result<(), Error> {
+        use tokio::fs;
+
+        let path = self.get_state_path(id);
+        if path.exists() {
+            fs::remove_file(path)
+                .await
+                .map_err(|e| Error::Storage(format!("Failed to delete state file: {e}")))?;
+        }
+
+        Ok(())
+    }
+
+    async fn list_states(&self) -> Result<Vec<String>, Error> {
+        use tokio::fs;
+
+        let mut states = Vec::new();
+
+        if !self.base_path.exists() {
+            return Ok(states);
+        }
+
+        let mut entries = fs::read_dir(&self.base_path)
+            .await
+            .map_err(|e| Error::Storage(format!("Failed to read state directory: {e}")))?;
+
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|e| Error::Storage(format!("Failed to read directory entry: {e}")))?
+        {
+            if let Some(extension) = entry.path().extension()
+                && extension == "json"
+                && let Some(stem) = entry.path().file_stem()
+                && let Some(id) = stem.to_str()
+            {
+                states.push(id.to_string());
             }
-        })
-    }
+        }
 
-    async fn export_state(&self) -> Result<Value, Error> {
-        let state = Source::get_state(self).await?;
-        serde_json::to_value(state).map_err(|e| Error::Storage(e.to_string()))
-    }
-
-    async fn import_state(&mut self, state_json: Value) -> Result<(), Error> {
-        let source_state: SourceState =
-            serde_json::from_value(state_json).map_err(|e| Error::Storage(e.to_string()))?;
-        Source::set_state(self, source_state).await
-    }
-
-    async fn reset_state(&mut self) -> Result<(), Error> {
-        let mut state = self.state.lock().await;
-        *state = crate::State {
-            last_poll_timestamp: None,
-            total_documents_fetched: 0,
-            poll_count: 0,
-            last_document_id: None,
-            last_scroll_id: None,
-            last_offset: None,
-            error_count: 0,
-            last_error: None,
-            processing_stats: crate::ProcessingStats {
-                total_bytes_processed: 0,
-                avg_batch_processing_time_ms: 0.0,
-                last_successful_poll: None,
-                empty_polls_count: 0,
-                successful_polls_count: 0,
-            },
-        };
-        drop(state);
-
-        // Save the reset state
-        Source::save_state(self).await
+        Ok(states)
     }
 }
