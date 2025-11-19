@@ -30,7 +30,6 @@ mod sink;
 #[serde(rename_all = "lowercase")]
 pub enum IcebergSinkTypes {
     REST,
-    GLUE,
 }
 
 #[derive(Debug, Serialize, Deserialize, StrumDisplay)]

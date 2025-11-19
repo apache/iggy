@@ -19,16 +19,13 @@
 use super::{Error, IcebergSinkConfig, IcebergSinkTypes};
 use crate::props::init_props;
 use iceberg::Catalog;
-use iceberg_catalog_glue::{GlueCatalog, GlueCatalogConfig};
 use iceberg_catalog_rest::{RestCatalog, RestCatalogConfig};
 use std::collections::HashMap;
-use tracing::error;
 
 pub async fn init_catalog(config: &IcebergSinkConfig) -> Result<Box<dyn Catalog>, Error> {
     let props = init_props(config)?;
     match config.catalog_type {
         IcebergSinkTypes::REST => Ok(Box::new(get_rest_catalog(config, props))),
-        IcebergSinkTypes::GLUE => Ok(Box::new(get_glue_catalog(config, props).await?)),
     }
 }
 
@@ -41,20 +38,4 @@ fn get_rest_catalog(config: &IcebergSinkConfig, props: HashMap<String, String>) 
         .build();
 
     RestCatalog::new(catalog_config)
-}
-
-#[inline(always)]
-async fn get_glue_catalog(
-    config: &IcebergSinkConfig,
-    props: HashMap<String, String>,
-) -> Result<GlueCatalog, Error> {
-    let config = GlueCatalogConfig::builder()
-        .props(props.clone())
-        .warehouse(config.warehouse.clone())
-        .build();
-
-    GlueCatalog::new(config).await.map_err(|err| {
-            error!("Failed to get glue catalog with error: {}. Make sure the catalog is correctly declared on the config file", err);
-            Error::InitError(err.to_string())
-        })
 }
