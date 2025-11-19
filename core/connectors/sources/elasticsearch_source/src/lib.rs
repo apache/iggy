@@ -16,7 +16,6 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use elasticsearch::{
@@ -25,8 +24,7 @@ use elasticsearch::{
     http::{Url, transport::TransportBuilder},
 };
 use iggy_connector_sdk::{
-    Error, FileStateStorage, ProducedMessage, ProducedMessages, Schema, Source, SourceState,
-    StateStorage, source_connector,
+    ConnectorState, Error, ProducedMessage, ProducedMessages, Schema, Source, source_connector,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -37,7 +35,8 @@ use tokio::{sync::Mutex, time::sleep};
 use tracing::{info, warn};
 
 mod state_manager;
-pub use state_manager::{StateInfo, StateManager, StateManagerExt, StateStats};
+use crate::state_manager::{FileStateStorage, SourceState, StateStorage};
+pub use state_manager::{StateInfo, StateManager, StateStats};
 
 source_connector!(ElasticsearchSource);
 
@@ -80,7 +79,7 @@ pub struct StateConfig {
     /// State storage type: "file", "elasticsearch", "redis", etc.
     pub storage_type: Option<String>,
     /// State storage configuration (depends on storage_type)
-    pub storage_config: Option<serde_json::Value>,
+    pub storage_config: Option<Value>,
     /// State ID for this connector instance
     pub state_id: Option<String>,
     /// Auto-save state interval (e.g., "30s", "5m")
@@ -95,7 +94,7 @@ pub struct ElasticsearchSourceConfig {
     pub index: String,
     pub username: Option<String>,
     pub password: Option<String>,
-    pub query: Option<serde_json::Value>,
+    pub query: Option<Value>,
     pub polling_interval: Option<String>,
     pub batch_size: Option<usize>,
     pub timestamp_field: Option<String>,
@@ -113,11 +112,7 @@ pub struct ElasticsearchSource {
 }
 
 impl ElasticsearchSource {
-    pub fn new(
-        id: u32,
-        config: ElasticsearchSourceConfig,
-        _state: Option<serde_json::Value>,
-    ) -> Self {
+    pub fn new(id: u32, config: ElasticsearchSourceConfig, _state: Option<ConnectorState>) -> Self {
         let polling_interval = config
             .polling_interval
             .as_deref()
@@ -519,13 +514,16 @@ impl Source for ElasticsearchSource {
                 return Err(e);
             }
         };
-
-        let state_guard = self.state.lock().await;
-        let state_value = serde_json::to_value(&*state_guard).ok();
+        let state_value = {
+            let state = self.state.lock().await;
+            serde_json::to_vec(&*state).map_err(|err| {
+                Error::Serialization(format!("Failed to serialize state: {}", err))
+            })?
+        };
         Ok(ProducedMessages {
             schema: Schema::Json,
             messages,
-            state: state_value,
+            state: Some(ConnectorState(state_value)),
         })
     }
 
@@ -557,93 +555,6 @@ impl Source for ElasticsearchSource {
             "Elasticsearch source connector with ID: {} is closed.",
             self.id
         );
-        Ok(())
-    }
-
-    async fn get_state(&self) -> Result<Option<SourceState>, Error> {
-        if self
-            .config
-            .state
-            .as_ref()
-            .map(|s| s.enabled)
-            .unwrap_or(false)
-        {
-            Ok(Some(self.internal_state_to_source_state().await?))
-        } else {
-            Ok(None)
-        }
-    }
-
-    async fn set_state(&mut self, state: SourceState) -> Result<(), Error> {
-        if self
-            .config
-            .state
-            .as_ref()
-            .map(|s| s.enabled)
-            .unwrap_or(false)
-        {
-            self.source_state_to_internal_state(state).await
-        } else {
-            Ok(())
-        }
-    }
-
-    async fn save_state(&self) -> Result<(), Error> {
-        if !self
-            .config
-            .state
-            .as_ref()
-            .map(|s| s.enabled)
-            .unwrap_or(false)
-        {
-            return Ok(());
-        }
-
-        let storage = self
-            .create_state_storage()
-            .ok_or_else(|| Error::Storage("State storage not configured".to_string()))?;
-
-        let source_state = self.internal_state_to_source_state().await?;
-        storage.save_source_state(&source_state).await?;
-
-        info!(
-            "Saved state for Elasticsearch source connector with ID: {}",
-            self.id
-        );
-        Ok(())
-    }
-
-    async fn load_state(&mut self) -> Result<(), Error> {
-        if !self
-            .config
-            .state
-            .as_ref()
-            .map(|s| s.enabled)
-            .unwrap_or(false)
-        {
-            return Ok(());
-        }
-
-        let storage = self
-            .create_state_storage()
-            .ok_or_else(|| Error::Storage("State storage not configured".to_string()))?;
-
-        let state_id = self.get_state_id();
-        if let Some(source_state) = storage.load_source_state(&state_id).await? {
-            self.source_state_to_internal_state(source_state).await?;
-
-            let state = self.state.lock().await;
-            info!(
-                "Loaded state for Elasticsearch source connector with ID: {} - last poll: {:?}, total docs: {}, polls: {}",
-                self.id, state.last_poll_timestamp, state.total_documents_fetched, state.poll_count
-            );
-        } else {
-            info!(
-                "No existing state found for Elasticsearch source connector with ID: {}, starting fresh",
-                self.id
-            );
-        }
-
         Ok(())
     }
 }
