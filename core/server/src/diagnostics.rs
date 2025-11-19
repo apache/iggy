@@ -18,6 +18,7 @@
 
 /// Prints information about locked memory limits when runtime creation fails.
 /// This is typically needed when io_uring cannot allocate memory due to RLIMIT_MEMLOCK.
+#[cfg(target_os = "linux")]
 pub fn print_locked_memory_limit_info() {
     use nix::sys::resource::{Resource, getrlimit};
 
@@ -71,6 +72,7 @@ pub fn print_locked_memory_limit_info() {
 
 /// Prints information about io_uring permission issues in containerized environments.
 /// This occurs when seccomp blocks io_uring syscalls.
+#[cfg(target_os = "linux")]
 pub fn print_io_uring_permission_info() {
     eprintln!();
     eprintln!("=== io_uring Permission Denied ===");
@@ -97,3 +99,9 @@ pub fn print_io_uring_permission_info() {
     eprintln!("         type: Unconfined");
     eprintln!();
 }
+
+#[cfg(not(target_os = "linux"))]
+pub fn print_locked_memory_limit_info() {}
+
+#[cfg(not(target_os = "linux"))]
+pub fn print_io_uring_permission_info() {}
