@@ -39,7 +39,7 @@ async-trait = { workspace = true }
 base64 = { workspace = true }
 chrono = { workspace = true }
 dashmap = { workspace = true }
-elasticsearch = "9.1.0-alpha.1"
+elasticsearch = { version = "9.1.0-alpha.1", features = ["rustls-tls"], default-features = false }
 iggy_connector_sdk = { path = "../../sdk" }
 once_cell = { workspace = true }
 serde = { workspace = true }
