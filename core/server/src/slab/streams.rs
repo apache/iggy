@@ -200,7 +200,7 @@ impl MainOps for Streams {
 
         let current_position =
             self.with_partition_by_id(stream_id, topic_id, partition_id, |(.., log)| {
-                log.active_segment().current_position as u32
+                log.active_segment().current_position
             });
         let (segment_start_offset, message_deduplicator) = self.with_partition_by_id(
             stream_id,

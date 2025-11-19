@@ -24,7 +24,7 @@ pub struct Segment {
     pub message_expiry: IggyExpiry,
     pub start_timestamp: u64,
     pub end_timestamp: u64,
-    pub current_position: u64,
+    pub current_position: u32,
     pub start_offset: u64,
     pub end_offset: u64,
     pub size: IggyByteSize,     // u64
