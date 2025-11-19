@@ -24,7 +24,8 @@ use iggy::prelude::{
     DirectConfig, HeaderKey, HeaderValue, IggyClient, IggyDuration, IggyError, IggyMessage,
 };
 use iggy_connector_sdk::{
-    DecodedMessage, Error, ProducedMessages, StreamEncoder, TopicMetadata, transforms::Transform,
+    ConnectorState, DecodedMessage, Error, ProducedMessages, StreamEncoder, TopicMetadata,
+    transforms::Transform,
 };
 use once_cell::sync::Lazy;
 use std::{
@@ -32,7 +33,7 @@ use std::{
     str::FromStr,
     sync::{Arc, atomic::Ordering},
 };
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::configs::connectors::SourceConfig;
 use crate::{
@@ -172,15 +173,13 @@ fn init_source(
     container: &Container<SourceApi>,
     plugin_config: &serde_json::Value,
     id: u32,
-    state: Option<serde_json::Value>,
+    state: Option<ConnectorState>,
 ) {
+    trace!("Initializing source plugin with config: {plugin_config:?} (ID: {id})");
     let plugin_config =
         serde_json::to_string(plugin_config).expect("Invalid source plugin config.");
-    let state_bytes = state.as_ref().map_or(Vec::new(), |s| {
-        serde_json::to_vec(s).expect("Failed to serialize state")
-    });
-    let state_ptr = state_bytes.as_ptr();
-    let state_len = state_bytes.len();
+    let state_ptr = state.as_ref().map_or(std::ptr::null(), |s| s.0.as_ptr());
+    let state_len = state.as_ref().map_or(0, |s| s.0.len());
     (container.open)(
         id,
         plugin_config.as_ptr(),
@@ -357,13 +356,16 @@ extern "C" fn handle_produced_messages(
     unsafe {
         if let Some(sender) = SOURCE_SENDERS.get(&plugin_id) {
             let messages = std::slice::from_raw_parts(messages_ptr, messages_len);
-            let Ok(messages) = postcard::from_bytes::<ProducedMessages>(messages) else {
-                error!(
-                    "Failed to deserialize produced messages for source connector with ID: {plugin_id}"
-                );
-                return;
-            };
-            let _ = sender.send(messages);
+            match postcard::from_bytes::<ProducedMessages>(messages) {
+                Ok(messages) => {
+                    let _ = sender.send(messages);
+                }
+                Err(err) => {
+                    error!(
+                        "Failed to deserialize produced messages for source connector with ID: {plugin_id}. {err}"
+                    );
+                }
+            }
         }
     }
 }

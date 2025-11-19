@@ -1,4 +1,5 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
  * regarding copyright ownership.  The ASF licenses this file
@@ -16,7 +17,7 @@
  * under the License.
  */
 
-use crate::{Error, Source, get_runtime};
+use crate::{ConnectorState, Error, Source, get_runtime};
 use serde::de::DeserializeOwned;
 use std::sync::Arc;
 use tokio::{sync::watch, task::JoinHandle};
@@ -66,7 +67,7 @@ impl<T: Source + std::fmt::Debug + 'static> SourceContainer<T> {
         factory: F,
     ) -> i32
     where
-        F: FnOnce(u32, C, Option<serde_json::Value>) -> T,
+        F: FnOnce(u32, C, Option<ConnectorState>) -> T,
         C: DeserializeOwned,
     {
         unsafe {
@@ -89,10 +90,7 @@ impl<T: Source + std::fmt::Debug + 'static> SourceContainer<T> {
                 None
             } else {
                 let state = std::slice::from_raw_parts(state_ptr, state_len);
-                let Ok(state) = serde_json::from_slice(state) else {
-                    error!("Failed to parse state for source connector with ID: {id}",);
-                    return -1;
-                };
+                let state = ConnectorState(state.to_vec());
                 Some(state)
             };
 

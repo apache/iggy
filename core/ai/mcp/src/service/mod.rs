@@ -17,8 +17,8 @@
  */
 
 use iggy::prelude::{
-    Consumer, ConsumerGroupClient, ConsumerOffsetClient, Identifier, IggyClient, IggyError,
-    IggyMessage, IggyTimestamp, MessageClient, PartitionClient, Partitioning,
+    ClusterClient, Consumer, ConsumerGroupClient, ConsumerOffsetClient, Identifier, IggyClient,
+    IggyError, IggyMessage, IggyTimestamp, MessageClient, PartitionClient, Partitioning,
     PersonalAccessTokenClient, PollingKind, PollingStrategy, SegmentClient, StreamClient,
     SystemClient, SystemSnapshotType, TopicClient, UserClient, UserStatus,
 };
@@ -59,6 +59,12 @@ impl IggyService {
     pub async fn ping(&self) -> Result<CallToolResult, ErrorData> {
         self.permissions.ensure_read()?;
         request(self.client.ping().await)
+    }
+
+    #[tool(description = "Get cluster metadata")]
+    pub async fn get_cluster_metadata(&self) -> Result<CallToolResult, ErrorData> {
+        self.permissions.ensure_read()?;
+        request(self.client.get_cluster_metadata().await)
     }
 
     #[tool(description = "Get stream")]
