@@ -16,17 +16,16 @@
  * under the License.
  */
 
-pub mod binary_cluster;
-pub mod binary_consumer_groups;
-pub mod binary_consumer_offsets;
-pub mod binary_messages;
-pub mod binary_partitions;
-pub mod binary_personal_access_tokens;
-pub mod binary_segments;
-pub mod binary_streams;
-pub mod binary_system;
-pub mod binary_topics;
-pub mod binary_users;
-#[allow(deprecated)]
+pub mod cluster;
+pub mod consumer_groups;
+pub mod consumer_offsets;
 pub mod http_client;
 mod http_transport;
+pub mod messages;
+pub mod partitions;
+pub mod personal_access_tokens;
+pub mod segments;
+pub mod streams;
+pub mod system;
+pub mod topics;
+pub mod users;

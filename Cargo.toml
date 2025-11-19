@@ -89,10 +89,10 @@ byte-unit = { version = "5.1.6", default-features = false, features = [
 bytes = "1.11.0"
 charming = "0.6.0"
 chrono = { version = "0.4.42", features = ["serde"] }
-clap = { version = "4.5.51", features = ["derive", "wrap_help"] }
+clap = { version = "4.5.52", features = ["derive", "wrap_help"] }
 colored = "3.0.0"
 comfy-table = "7.2.1"
-compio = { version = "0.16.0", features = [
+compio = { version = "0.16.1", features = [
     "runtime",
     "macros",
     "io-uring",
@@ -128,9 +128,9 @@ human-repr = "1.1.0"
 humantime = "2.3.0"
 iceberg = "=0.6.0"
 iceberg-catalog-rest = "=0.6.0"
-iggy = { path = "core/sdk", version = "0.8.0-edge.5" }
-iggy_binary_protocol = { path = "core/binary_protocol", version = "0.8.0-edge.5" }
-iggy_common = { path = "core/common", version = "0.8.0-edge.5" }
+iggy = { path = "core/sdk", version = "0.8.0" }
+iggy_binary_protocol = { path = "core/binary_protocol", version = "0.8.0" }
+iggy_common = { path = "core/common", version = "0.8.0" }
 iggy_connector_sdk = { path = "core/connectors/sdk", version = "0.1.0" }
 integration = { path = "core/integration" }
 keyring = { version = "3.6.3", features = ["sync-secret-service", "vendored"] }

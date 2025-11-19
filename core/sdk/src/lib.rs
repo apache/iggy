@@ -16,7 +16,6 @@
  * under the License.
  */
 
-#[allow(deprecated)]
 pub mod client_provider;
 pub mod client_wrappers;
 pub mod clients;
