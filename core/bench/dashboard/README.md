@@ -242,11 +242,11 @@ Using a named volume:
 
 #### Environment Variables
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| HOST | 0.0.0.0 | Server host address |
-| PORT | 8061 | Server port |
-| RESULTS_DIR | /data/performance_results | Directory for performance results |
+| Variable     | Default                   | Description                       |
+| ------------ | ------------------------- | --------------------------------- |
+| HOST         | 0.0.0.0                   | Server host address               |
+| PORT         | 8061                      | Server port                       |
+| RESULTS_DIR  | /data/performance_results | Directory for performance results |
 
 #### Volume Permissions
 
