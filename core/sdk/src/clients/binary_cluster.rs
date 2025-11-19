@@ -19,14 +19,11 @@
 use crate::prelude::IggyClient;
 use async_trait::async_trait;
 use iggy_binary_protocol::ClusterClient;
-use iggy_common::{ClusterMetadata, IggyError};
+use iggy_common::{ClusterMetadata, IggyError, locking::IggyRwLockFn};
 
 #[async_trait]
 impl ClusterClient for IggyClient {
     async fn get_cluster_metadata(&self) -> Result<ClusterMetadata, IggyError> {
-        todo!();
-        /*
         self.client.read().await.get_cluster_metadata().await
-        */
     }
 }

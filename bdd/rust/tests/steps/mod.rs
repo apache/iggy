@@ -17,6 +17,7 @@
  */
 
 pub mod auth;
+pub mod leader_redirection;
 pub mod messages;
 pub mod server;
 pub mod streams;

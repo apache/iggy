@@ -30,6 +30,7 @@
 pub use crate::client_provider;
 pub use crate::client_provider::ClientProviderConfig;
 pub use crate::client_wrappers::client_wrapper::ClientWrapper;
+pub use crate::client_wrappers::connection_info::ConnectionInfo;
 pub use crate::clients::client::IggyClient;
 pub use crate::clients::client_builder::IggyClientBuilder;
 pub use crate::clients::consumer::{
@@ -53,19 +54,19 @@ pub use iggy_binary_protocol::{
 };
 pub use iggy_common::{
     Aes256GcmEncryptor, Args, ArgsOptional, AutoLogin, BytesSerializable, CacheMetrics,
-    CacheMetricsKey, ClientError, ClientInfoDetails, CompressionAlgorithm, Consumer,
-    ConsumerGroupDetails, ConsumerKind, EncryptorKind, FlushUnsavedBuffer, GlobalPermissions,
-    HeaderKey, HeaderValue, HttpClientConfig, HttpClientConfigBuilder, IdKind, Identifier,
-    IdentityInfo, IggyByteSize, IggyDuration, IggyError, IggyExpiry, IggyIndexView, IggyMessage,
-    IggyMessageHeader, IggyMessageHeaderView, IggyMessageView, IggyMessageViewIterator,
-    IggyTimestamp, MaxTopicSize, Partition, Partitioner, Partitioning, Permissions,
-    PersonalAccessTokenExpiry, PollMessages, PolledMessages, PollingKind, PollingStrategy,
-    QuicClientConfig, QuicClientConfigBuilder, QuicClientReconnectionConfig, SendMessages,
-    Sizeable, SnapshotCompression, Stats, Stream, StreamDetails, StreamPermissions,
-    SystemSnapshotType, TcpClientConfig, TcpClientConfigBuilder, TcpClientReconnectionConfig,
-    Topic, TopicDetails, TopicPermissions, TransportProtocol, UserId, UserStatus, Validatable,
-    WebSocketClientConfig, WebSocketClientConfigBuilder, WebSocketClientReconnectionConfig,
-    defaults, locking,
+    CacheMetricsKey, ClientError, ClientInfoDetails, ClusterMetadata, ClusterNode, ClusterNodeRole,
+    ClusterNodeStatus, CompressionAlgorithm, Consumer, ConsumerGroupDetails, ConsumerKind,
+    EncryptorKind, FlushUnsavedBuffer, GlobalPermissions, HeaderKey, HeaderValue, HttpClientConfig,
+    HttpClientConfigBuilder, IdKind, Identifier, IdentityInfo, IggyByteSize, IggyDuration,
+    IggyError, IggyExpiry, IggyIndexView, IggyMessage, IggyMessageHeader, IggyMessageHeaderView,
+    IggyMessageView, IggyMessageViewIterator, IggyTimestamp, MaxTopicSize, Partition, Partitioner,
+    Partitioning, Permissions, PersonalAccessTokenExpiry, PollMessages, PolledMessages,
+    PollingKind, PollingStrategy, QuicClientConfig, QuicClientConfigBuilder,
+    QuicClientReconnectionConfig, SendMessages, Sizeable, SnapshotCompression, Stats, Stream,
+    StreamDetails, StreamPermissions, SystemSnapshotType, TcpClientConfig, TcpClientConfigBuilder,
+    TcpClientReconnectionConfig, Topic, TopicDetails, TopicPermissions, TransportProtocol, UserId,
+    UserStatus, Validatable, WebSocketClientConfig, WebSocketClientConfigBuilder,
+    WebSocketClientReconnectionConfig, defaults, locking,
 };
 pub use iggy_common::{
     IGGY_MESSAGE_CHECKSUM_OFFSET_RANGE, IGGY_MESSAGE_HEADER_SIZE,

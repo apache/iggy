@@ -86,6 +86,7 @@ pub struct IggyShard {
     pub(crate) permissioner: RefCell<Permissioner>,
     pub(crate) users: Users,
     pub(crate) metrics: Metrics,
+    pub(crate) is_follower: bool,
     pub messages_receiver: Cell<Option<Receiver<ShardFrame>>>,
     pub(crate) stop_receiver: StopReceiver,
     pub(crate) is_shutting_down: AtomicBool,

@@ -27,7 +27,7 @@ COPY . .
 RUN mkdir -p /app/features
 
 # Build tests
-RUN cargo test --no-run -p bdd --features "iggy-server-in-docker bdd"
+RUN cargo test --no-run -p bdd
 
 # Default command will be overridden by docker-compose
-CMD ["cargo", "test", "-p", "bdd", "--features", "iggy-server-in-docker", "--features", "bdd"]
+CMD ["cargo", "test", "-p", "bdd", "--features", "bdd"]

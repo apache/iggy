@@ -16,5 +16,14 @@
  * under the License.
  */
 
-pub mod global_context;
-pub mod leader_context;
+pub(crate) mod common;
+pub(crate) mod helpers;
+pub(crate) mod steps;
+
+use crate::common::leader_context::LeaderContext;
+use cucumber::World;
+
+#[tokio::main]
+async fn main() {
+    LeaderContext::run("../../bdd/scenarios/leader_redirection.feature").await;
+}

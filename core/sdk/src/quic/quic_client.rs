@@ -16,6 +16,7 @@
  * under the License.
  */
 
+use crate::leader_aware::{LeaderRedirectionState, check_and_redirect_to_leader};
 use crate::prelude::AutoLogin;
 use iggy_binary_protocol::{
     BinaryClient, BinaryTransport, Client, PersonalAccessTokenClient, UserClient,
@@ -28,7 +29,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use iggy_common::{
     ClientState, Command, ConnectionString, ConnectionStringUtils, Credentials, DiagnosticEvent,
-    QuicConnectionStringOptions, TransportProtocol,
+    IggyErrorDiscriminants, QuicConnectionStringOptions, TransportProtocol,
 };
 use quinn::crypto::rustls::QuicClientConfig as QuinnQuicClientConfig;
 use quinn::{ClientConfig, Connection, Endpoint, IdleTimeout, RecvStream, VarInt};
@@ -51,10 +52,11 @@ pub struct QuicClient {
     pub(crate) endpoint: Endpoint,
     pub(crate) connection: Arc<Mutex<Option<Connection>>>,
     pub(crate) config: Arc<QuicClientConfig>,
-    pub(crate) server_address: SocketAddr,
     pub(crate) state: Mutex<ClientState>,
     events: (Sender<DiagnosticEvent>, Receiver<DiagnosticEvent>),
-    connected_at: Mutex<Option<IggyTimestamp>>,
+    pub(crate) connected_at: Mutex<Option<IggyTimestamp>>,
+    leader_redirection_state: Mutex<LeaderRedirectionState>,
+    pub(crate) current_server_address: Mutex<String>,
 }
 
 unsafe impl Send for QuicClient {}
@@ -126,9 +128,10 @@ impl BinaryTransport for QuicClient {
         }
 
         self.disconnect().await?;
+        let server_address = self.current_server_address.lock().await.to_string();
         info!(
             "Reconnecting to the server: {}, by client: {}",
-            self.config.server_address, self.config.client_address
+            server_address, self.config.client_address
         );
         self.connect().await?;
         self.send_raw(code, payload).await
@@ -195,11 +198,12 @@ impl QuicClient {
         Ok(Self {
             config,
             endpoint,
-            server_address,
             connection: Arc::new(Mutex::new(None)),
             state: Mutex::new(ClientState::Disconnected),
             events: broadcast(1000),
             connected_at: Mutex::new(None),
+            leader_redirection_state: Mutex::new(LeaderRedirectionState::new()),
+            current_server_address: Mutex::new(server_address.to_string()),
         })
     }
 
@@ -235,11 +239,20 @@ impl QuicClient {
                 .map_err(|_| IggyError::InvalidNumberEncoding)?,
         );
         if status != 0 {
-            error!(
-                "Received an invalid response with status: {} ({}).",
-                status,
-                IggyError::from_code_as_string(status)
-            );
+            // Log FeatureUnavailable as debug instead of error (e.g., when clustering is disabled)
+            if status == IggyErrorDiscriminants::FeatureUnavailable as u32 {
+                tracing::debug!(
+                    "Feature unavailable on server: {} ({})",
+                    status,
+                    IggyError::from_code_as_string(status)
+                );
+            } else {
+                error!(
+                    "Received an invalid response with status: {} ({}).",
+                    status,
+                    IggyError::from_code_as_string(status)
+                );
+            }
 
             return Err(IggyError::from_code(status));
         }
@@ -260,134 +273,182 @@ impl QuicClient {
     }
 
     async fn connect(&self) -> Result<(), IggyError> {
-        match self.get_state().await {
-            ClientState::Shutdown => {
-                trace!("Cannot connect. Client is shutdown.");
-                return Err(IggyError::ClientShutdown);
-            }
-            ClientState::Connected | ClientState::Authenticating | ClientState::Authenticated => {
-                trace!("Client is already connected.");
-                return Ok(());
-            }
-            ClientState::Connecting => {
-                trace!("Client is already connecting.");
-                return Ok(());
-            }
-            _ => {}
-        }
-
-        self.set_state(ClientState::Connecting).await;
-        if let Some(connected_at) = self.connected_at.lock().await.as_ref() {
-            let now = IggyTimestamp::now();
-            let elapsed = now.as_micros() - connected_at.as_micros();
-            let interval = self.config.reconnection.reestablish_after.as_micros();
-            trace!(
-                "Elapsed time since last connection: {}",
-                IggyDuration::from(elapsed)
-            );
-            if elapsed < interval {
-                let remaining = IggyDuration::from(interval - elapsed);
-                info!("Trying to connect to the server in: {remaining}",);
-                sleep(remaining.get_duration()).await;
-            }
-        }
-
-        let mut retry_count = 0;
-        let connection;
-        let remote_address;
         loop {
-            info!(
-                "{NAME} client is connecting to server: {}...",
-                self.config.server_address
-            );
-            let connection_result = self
-                .endpoint
-                .connect(self.server_address, &self.config.server_name)
-                .unwrap()
-                .await;
+            match self.get_state().await {
+                ClientState::Shutdown => {
+                    trace!("Cannot connect. Client is shutdown.");
+                    return Err(IggyError::ClientShutdown);
+                }
+                ClientState::Connected
+                | ClientState::Authenticating
+                | ClientState::Authenticated => {
+                    trace!("Client is already connected.");
+                    return Ok(());
+                }
+                ClientState::Connecting => {
+                    trace!("Client is already connecting.");
+                    return Ok(());
+                }
+                _ => {}
+            }
 
-            if connection_result.is_err() {
-                error!(
-                    "Failed to connect to server: {}",
-                    self.config.server_address
+            self.set_state(ClientState::Connecting).await;
+            if let Some(connected_at) = self.connected_at.lock().await.as_ref() {
+                let now = IggyTimestamp::now();
+                let elapsed = now.as_micros() - connected_at.as_micros();
+                let interval = self.config.reconnection.reestablish_after.as_micros();
+                trace!(
+                    "Elapsed time since last connection: {}",
+                    IggyDuration::from(elapsed)
                 );
-                if !self.config.reconnection.enabled {
-                    warn!("Automatic reconnection is disabled.");
+                if elapsed < interval {
+                    let remaining = IggyDuration::from(interval - elapsed);
+                    info!("Trying to connect to the server in: {remaining}",);
+                    sleep(remaining.get_duration()).await;
+                }
+            }
+
+            let mut retry_count = 0;
+            let connection;
+            let remote_address;
+            loop {
+                let server_address_str = self.current_server_address.lock().await.clone();
+                let server_address: SocketAddr = server_address_str.parse().map_err(|e| {
+                    error!(
+                        "Failed to parse server address '{}': {}",
+                        server_address_str, e
+                    );
+                    IggyError::InvalidServerAddress
+                })?;
+                info!(
+                    "{NAME} client is connecting to server: {}...",
+                    server_address
+                );
+                let connection_result = self
+                    .endpoint
+                    .connect(server_address, &self.config.server_name)
+                    .unwrap()
+                    .await;
+
+                if connection_result.is_err() {
+                    error!("Failed to connect to server: {}", server_address);
+                    if !self.config.reconnection.enabled {
+                        warn!("Automatic reconnection is disabled.");
+                        return Err(IggyError::CannotEstablishConnection);
+                    }
+
+                    let unlimited_retries = self.config.reconnection.max_retries.is_none();
+                    let max_retries = self.config.reconnection.max_retries.unwrap_or_default();
+                    let max_retries_str =
+                        if let Some(max_retries) = self.config.reconnection.max_retries {
+                            max_retries.to_string()
+                        } else {
+                            "unlimited".to_string()
+                        };
+
+                    let interval_str = self.config.reconnection.interval.as_human_time_string();
+                    if unlimited_retries || retry_count < max_retries {
+                        retry_count += 1;
+                        info!(
+                            "Retrying to connect to server ({retry_count}/{max_retries_str}): {} in: {interval_str}",
+                            server_address,
+                        );
+                        sleep(self.config.reconnection.interval.get_duration()).await;
+                        continue;
+                    }
+
+                    self.set_state(ClientState::Disconnected).await;
+                    self.publish_event(DiagnosticEvent::Disconnected).await;
                     return Err(IggyError::CannotEstablishConnection);
                 }
 
-                let unlimited_retries = self.config.reconnection.max_retries.is_none();
-                let max_retries = self.config.reconnection.max_retries.unwrap_or_default();
-                let max_retries_str =
-                    if let Some(max_retries) = self.config.reconnection.max_retries {
-                        max_retries.to_string()
-                    } else {
-                        "unlimited".to_string()
-                    };
+                connection = connection_result.map_err(|error| {
+                    error!("Failed to establish QUIC connection: {error}");
+                    IggyError::CannotEstablishConnection
+                })?;
+                remote_address = connection.remote_address();
+                break;
+            }
 
-                let interval_str = self.config.reconnection.interval.as_human_time_string();
-                if unlimited_retries || retry_count < max_retries {
-                    retry_count += 1;
+            let now = IggyTimestamp::now();
+            info!("{NAME} client has connected to server: {remote_address} at {now}",);
+            self.set_state(ClientState::Connected).await;
+            self.connection.lock().await.replace(connection);
+            self.connected_at.lock().await.replace(now);
+            self.publish_event(DiagnosticEvent::Connected).await;
+
+            // Handle auto-login
+            let should_redirect = match &self.config.auto_login {
+                AutoLogin::Disabled => {
+                    info!("Automatic sign-in is disabled.");
+                    false
+                }
+                AutoLogin::Enabled(credentials) => {
                     info!(
-                        "Retrying to connect to server ({retry_count}/{max_retries_str}): {} in: {interval_str}",
-                        self.config.server_address,
+                        "{NAME} client: {} is signing in...",
+                        self.config.client_address
                     );
-                    sleep(self.config.reconnection.interval.get_duration()).await;
-                    continue;
-                }
+                    self.set_state(ClientState::Authenticating).await;
+                    match credentials {
+                        Credentials::UsernamePassword(username, password) => {
+                            self.login_user(username, password).await?;
+                            self.publish_event(DiagnosticEvent::SignedIn).await;
+                            info!(
+                                "{NAME} client: {} has signed in with the user credentials, username: {username}",
+                                self.config.client_address
+                            );
+                        }
+                        Credentials::PersonalAccessToken(token) => {
+                            self.login_with_personal_access_token(token).await?;
+                            self.publish_event(DiagnosticEvent::SignedIn).await;
+                            info!(
+                                "{NAME} client: {} has signed in with a personal access token.",
+                                self.config.client_address
+                            );
+                        }
+                    }
 
-                self.set_state(ClientState::Disconnected).await;
-                self.publish_event(DiagnosticEvent::Disconnected).await;
-                return Err(IggyError::CannotEstablishConnection);
+                    self.handle_leader_redirection().await?
+                }
+            };
+
+            if should_redirect {
+                continue;
             }
 
-            connection = connection_result.map_err(|error| {
-                error!("Failed to establish QUIC connection: {error}");
-                IggyError::CannotEstablishConnection
-            })?;
-            remote_address = connection.remote_address();
-            break;
+            return Ok(());
         }
+    }
 
-        let now = IggyTimestamp::now();
-        info!("{NAME} client has connected to server: {remote_address} at {now}",);
-        self.set_state(ClientState::Connected).await;
-        self.connection.lock().await.replace(connection);
-        self.connected_at.lock().await.replace(now);
-        self.publish_event(DiagnosticEvent::Connected).await;
+    /// Checks cluster metadata and handles leader redirection if needed.
+    /// Returns true if redirection occurred and reconnection is needed.
+    pub(crate) async fn handle_leader_redirection(&self) -> Result<bool, IggyError> {
+        let current_address = self.current_server_address.lock().await.clone();
+        let leader_address = check_and_redirect_to_leader(self, &current_address).await?;
 
-        match &self.config.auto_login {
-            AutoLogin::Disabled => {
-                info!("Automatic sign-in is disabled.");
-                Ok(())
+        if let Some(new_leader_address) = leader_address {
+            let mut redirection_state = self.leader_redirection_state.lock().await;
+            if !redirection_state.can_redirect() {
+                warn!("Maximum leader redirections reached, continuing with current connection");
+                return Ok(false);
             }
-            AutoLogin::Enabled(credentials) => {
-                info!(
-                    "{NAME} client: {} is signing in...",
-                    self.config.client_address
-                );
-                self.set_state(ClientState::Authenticating).await;
-                match credentials {
-                    Credentials::UsernamePassword(username, password) => {
-                        self.login_user(username, password).await?;
-                        self.publish_event(DiagnosticEvent::SignedIn).await;
-                        info!(
-                            "{NAME} client: {} has signed in with the user credentials, username: {username}",
-                            self.config.client_address
-                        );
-                        Ok(())
-                    }
-                    Credentials::PersonalAccessToken(token) => {
-                        self.login_with_personal_access_token(token).await?;
-                        self.publish_event(DiagnosticEvent::SignedIn).await;
-                        info!(
-                            "{NAME} client: {} has signed in with a personal access token.",
-                            self.config.client_address
-                        );
-                        Ok(())
-                    }
-                }
-            }
+
+            info!(
+                "Current node is not leader, redirecting to leader at: {}",
+                new_leader_address
+            );
+            redirection_state.increment_redirect(new_leader_address.clone());
+            drop(redirection_state);
+
+            // Clear connected_at to avoid reestablish_after delay during redirection
+            self.connected_at.lock().await.take();
+            self.disconnect().await?;
+            *self.current_server_address.lock().await = new_leader_address;
+
+            Ok(true)
+        } else {
+            self.leader_redirection_state.lock().await.reset();
+            Ok(false)
         }
     }
 

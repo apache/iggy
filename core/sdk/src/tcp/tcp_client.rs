@@ -16,6 +16,7 @@
  * under the License.
  */
 
+use crate::leader_aware::{LeaderRedirectionState, check_and_redirect_to_leader};
 use crate::prelude::Client;
 use crate::prelude::TcpClientConfig;
 use crate::tcp::tcp_connection_stream::TcpConnectionStream;
@@ -53,7 +54,9 @@ pub struct TcpClient {
     pub(crate) state: Mutex<ClientState>,
     client_address: Mutex<Option<SocketAddr>>,
     events: (Sender<DiagnosticEvent>, Receiver<DiagnosticEvent>),
-    connected_at: Mutex<Option<IggyTimestamp>>,
+    pub(crate) connected_at: Mutex<Option<IggyTimestamp>>,
+    leader_redirection_state: Mutex<LeaderRedirectionState>,
+    pub(crate) current_server_address: Mutex<String>,
 }
 
 impl Default for TcpClient {
@@ -129,9 +132,10 @@ impl BinaryTransport for TcpClient {
 
         {
             let client_address = self.get_client_address_value().await;
+            let server_address = self.current_server_address.lock().await.clone();
             info!(
                 "Reconnecting to the server: {} by client: {client_address}...",
-                self.config.server_address
+                server_address
             );
         }
 
@@ -191,6 +195,7 @@ impl TcpClient {
 
     /// Create a new TCP client based on the provided configuration.
     pub fn create(config: Arc<TcpClientConfig>) -> Result<Self, IggyError> {
+        let server_address = config.server_address.clone();
         Ok(Self {
             config,
             client_address: Mutex::new(None),
@@ -198,6 +203,8 @@ impl TcpClient {
             state: Mutex::new(ClientState::Disconnected),
             events: broadcast(1000),
             connected_at: Mutex::new(None),
+            leader_redirection_state: Mutex::new(LeaderRedirectionState::new()),
+            current_server_address: Mutex::new(server_address),
         })
     }
 
@@ -216,6 +223,13 @@ impl TcpClient {
             {
                 tracing::debug!(
                     "Received a server resource already exists response: {} ({})",
+                    status,
+                    IggyError::from_code_as_string(status)
+                )
+            } else if status == IggyErrorDiscriminants::FeatureUnavailable as u32 {
+                // Feature unavailable - likely clustering is disabled on server
+                tracing::debug!(
+                    "Feature unavailable on server: {} ({})",
                     status,
                     IggyError::from_code_as_string(status)
                 )
@@ -242,208 +256,251 @@ impl TcpClient {
     }
 
     async fn connect(&self) -> Result<(), IggyError> {
-        match self.get_state().await {
-            ClientState::Shutdown => {
-                trace!("Cannot connect. Client is shutdown.");
-                return Err(IggyError::ClientShutdown);
-            }
-            ClientState::Connected | ClientState::Authenticating | ClientState::Authenticated => {
-                let client_address = self.get_client_address_value().await;
-                trace!("Client: {client_address} is already connected.");
-                return Ok(());
-            }
-            ClientState::Connecting => {
-                trace!("Client is already connecting.");
-                return Ok(());
-            }
-            _ => {}
-        }
-
-        self.set_state(ClientState::Connecting).await;
-        if let Some(connected_at) = self.connected_at.lock().await.as_ref() {
-            let now = IggyTimestamp::now();
-            let elapsed = now.as_micros() - connected_at.as_micros();
-            let interval = self.config.reconnection.reestablish_after.as_micros();
-            trace!(
-                "Elapsed time since last connection: {}",
-                IggyDuration::from(elapsed)
-            );
-            if elapsed < interval {
-                let remaining = IggyDuration::from(interval - elapsed);
-                info!("Trying to connect to the server in: {remaining}",);
-                sleep(remaining.get_duration()).await;
-            }
-        }
-
-        let tls_enabled = self.config.tls_enabled;
-        let mut retry_count = 0;
-        let connection_stream: ConnectionStreamKind;
-        let remote_address;
-        let client_address;
         loop {
-            info!(
-                "{NAME} client is connecting to server: {}...",
-                self.config.server_address
-            );
+            match self.get_state().await {
+                ClientState::Shutdown => {
+                    trace!("Cannot connect. Client is shutdown.");
+                    return Err(IggyError::ClientShutdown);
+                }
+                ClientState::Connected
+                | ClientState::Authenticating
+                | ClientState::Authenticated => {
+                    let client_address = self.get_client_address_value().await;
+                    trace!("Client: {client_address} is already connected.");
+                    return Ok(());
+                }
+                ClientState::Connecting => {
+                    trace!("Client is already connecting.");
+                    return Ok(());
+                }
+                _ => {}
+            }
 
-            let connection = TcpStream::connect(&self.config.server_address).await;
-            if let Err(err) = &connection {
-                error!(
-                    "Failed to connect to server: {}. Error: {}",
-                    self.config.server_address, err
+            self.set_state(ClientState::Connecting).await;
+            if let Some(connected_at) = self.connected_at.lock().await.as_ref() {
+                let now = IggyTimestamp::now();
+                let elapsed = now.as_micros() - connected_at.as_micros();
+                let interval = self.config.reconnection.reestablish_after.as_micros();
+                trace!(
+                    "Elapsed time since last connection: {}",
+                    IggyDuration::from(elapsed)
                 );
-                if !self.config.reconnection.enabled {
-                    warn!("Automatic reconnection is disabled.");
+                if elapsed < interval {
+                    let remaining = IggyDuration::from(interval - elapsed);
+                    info!("Trying to connect to the server in: {remaining}",);
+                    sleep(remaining.get_duration()).await;
+                }
+            }
+
+            let tls_enabled = self.config.tls_enabled;
+            let mut retry_count = 0;
+            let connection_stream: ConnectionStreamKind;
+            let remote_address;
+            let client_address;
+            loop {
+                let server_address = self.current_server_address.lock().await.clone();
+                info!(
+                    "{NAME} client is connecting to server: {}...",
+                    server_address
+                );
+
+                let connection = TcpStream::connect(&server_address).await;
+                if let Err(err) = &connection {
+                    error!(
+                        "Failed to connect to server: {}. Error: {}",
+                        server_address, err
+                    );
+                    if !self.config.reconnection.enabled {
+                        warn!("Automatic reconnection is disabled.");
+                        return Err(IggyError::CannotEstablishConnection);
+                    }
+
+                    let unlimited_retries = self.config.reconnection.max_retries.is_none();
+                    let max_retries = self.config.reconnection.max_retries.unwrap_or_default();
+                    let max_retries_str =
+                        if let Some(max_retries) = self.config.reconnection.max_retries {
+                            max_retries.to_string()
+                        } else {
+                            "unlimited".to_string()
+                        };
+
+                    let interval_str = self.config.reconnection.interval.as_human_time_string();
+                    if unlimited_retries || retry_count < max_retries {
+                        retry_count += 1;
+                        info!(
+                            "Retrying to connect to server ({retry_count}/{max_retries_str}): {} in: {interval_str}",
+                            server_address,
+                        );
+                        sleep(self.config.reconnection.interval.get_duration()).await;
+                        continue;
+                    }
+
+                    self.set_state(ClientState::Disconnected).await;
+                    self.publish_event(DiagnosticEvent::Disconnected).await;
                     return Err(IggyError::CannotEstablishConnection);
                 }
 
-                let unlimited_retries = self.config.reconnection.max_retries.is_none();
-                let max_retries = self.config.reconnection.max_retries.unwrap_or_default();
-                let max_retries_str =
-                    if let Some(max_retries) = self.config.reconnection.max_retries {
-                        max_retries.to_string()
-                    } else {
-                        "unlimited".to_string()
-                    };
+                let stream = connection.map_err(|error| {
+                    error!("Failed to establish TCP connection to the server: {error}",);
+                    IggyError::CannotEstablishConnection
+                })?;
+                client_address = stream.local_addr().map_err(|error| {
+                    error!("Failed to get the local address of the client: {error}",);
+                    IggyError::CannotEstablishConnection
+                })?;
+                remote_address = stream.peer_addr().map_err(|error| {
+                    error!("Failed to get the remote address of the server: {error}",);
+                    IggyError::CannotEstablishConnection
+                })?;
+                self.client_address.lock().await.replace(client_address);
 
-                let interval_str = self.config.reconnection.interval.as_human_time_string();
-                if unlimited_retries || retry_count < max_retries {
-                    retry_count += 1;
-                    info!(
-                        "Retrying to connect to server ({retry_count}/{max_retries_str}): {} in: {interval_str}",
-                        self.config.server_address,
-                    );
-                    sleep(self.config.reconnection.interval.get_duration()).await;
-                    continue;
+                if let Err(e) = stream.set_nodelay(self.config.nodelay) {
+                    error!("Failed to set the nodelay option on the client: {e}, continuing...",);
                 }
 
-                self.set_state(ClientState::Disconnected).await;
-                self.publish_event(DiagnosticEvent::Disconnected).await;
-                return Err(IggyError::CannotEstablishConnection);
-            }
+                if !tls_enabled {
+                    connection_stream =
+                        ConnectionStreamKind::Tcp(TcpConnectionStream::new(client_address, stream));
+                    break;
+                }
 
-            let stream = connection.map_err(|error| {
-                error!("Failed to establish TCP connection to the server: {error}",);
-                IggyError::CannotEstablishConnection
-            })?;
-            client_address = stream.local_addr().map_err(|error| {
-                error!("Failed to get the local address of the client: {error}",);
-                IggyError::CannotEstablishConnection
-            })?;
-            remote_address = stream.peer_addr().map_err(|error| {
-                error!("Failed to get the remote address of the server: {error}",);
-                IggyError::CannotEstablishConnection
-            })?;
-            self.client_address.lock().await.replace(client_address);
+                let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
-            if let Err(e) = stream.set_nodelay(self.config.nodelay) {
-                error!("Failed to set the nodelay option on the client: {e}, continuing...",);
-            }
-
-            if !tls_enabled {
-                connection_stream =
-                    ConnectionStreamKind::Tcp(TcpConnectionStream::new(client_address, stream));
-                break;
-            }
-
-            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-
-            let config = if self.config.tls_validate_certificate {
-                let mut root_cert_store = rustls::RootCertStore::empty();
-                if let Some(certificate_path) = &self.config.tls_ca_file {
-                    for cert in
-                        CertificateDer::pem_file_iter(certificate_path).map_err(|error| {
-                            error!("Failed to read the CA file: {certificate_path}. {error}",);
-                            IggyError::InvalidTlsCertificatePath
-                        })?
-                    {
-                        let certificate = cert.map_err(|error| {
+                let config = if self.config.tls_validate_certificate {
+                    let mut root_cert_store = rustls::RootCertStore::empty();
+                    if let Some(certificate_path) = &self.config.tls_ca_file {
+                        for cert in
+                            CertificateDer::pem_file_iter(certificate_path).map_err(|error| {
+                                error!("Failed to read the CA file: {certificate_path}. {error}",);
+                                IggyError::InvalidTlsCertificatePath
+                            })?
+                        {
+                            let certificate = cert.map_err(|error| {
                             error!(
                                 "Failed to read a certificate from the CA file: {certificate_path}. {error}",
                             );
                             IggyError::InvalidTlsCertificate
                         })?;
-                        root_cert_store.add(certificate).map_err(|error| {
+                            root_cert_store.add(certificate).map_err(|error| {
                             error!(
                                 "Failed to add a certificate to the root certificate store. {error}",
                             );
                             IggyError::InvalidTlsCertificate
                         })?;
+                        }
+                    } else {
+                        root_cert_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
                     }
+
+                    rustls::ClientConfig::builder()
+                        .with_root_certificates(root_cert_store)
+                        .with_no_client_auth()
                 } else {
-                    root_cert_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-                }
+                    use crate::tcp::tcp_tls_verifier::NoServerVerification;
+                    rustls::ClientConfig::builder()
+                        .dangerous()
+                        .with_custom_certificate_verifier(Arc::new(NoServerVerification))
+                        .with_no_client_auth()
+                };
+                let connector = TlsConnector::from(Arc::new(config));
+                let tls_domain = if self.config.tls_domain.is_empty() {
+                    // Extract hostname/IP from server_address when tls_domain is not specified
+                    server_address
+                        .split(':')
+                        .next()
+                        .unwrap_or(&server_address)
+                        .to_string()
+                } else {
+                    self.config.tls_domain.to_owned()
+                };
+                let domain = ServerName::try_from(tls_domain).map_err(|error| {
+                    error!("Failed to create a server name from the domain. {error}",);
+                    IggyError::InvalidTlsDomain
+                })?;
+                let stream = connector.connect(domain, stream).await.map_err(|error| {
+                    error!("Failed to establish a TLS connection to the server: {error}",);
+                    IggyError::CannotEstablishConnection
+                })?;
+                connection_stream = ConnectionStreamKind::TcpTls(TcpTlsConnectionStream::new(
+                    client_address,
+                    TlsStream::Client(stream),
+                ));
+                break;
+            }
 
-                rustls::ClientConfig::builder()
-                    .with_root_certificates(root_cert_store)
-                    .with_no_client_auth()
-            } else {
-                use crate::tcp::tcp_tls_verifier::NoServerVerification;
-                rustls::ClientConfig::builder()
-                    .dangerous()
-                    .with_custom_certificate_verifier(Arc::new(NoServerVerification))
-                    .with_no_client_auth()
+            let now = IggyTimestamp::now();
+            info!(
+                "{NAME} client: {client_address} has connected to server: {remote_address} at: {now}",
+            );
+            self.stream.lock().await.replace(connection_stream);
+            self.set_state(ClientState::Connected).await;
+            self.connected_at.lock().await.replace(now);
+            self.publish_event(DiagnosticEvent::Connected).await;
+            // Handle auto-login
+            let should_redirect = match &self.config.auto_login {
+                AutoLogin::Disabled => {
+                    info!("Automatic sign-in is disabled.");
+                    false
+                }
+                AutoLogin::Enabled(credentials) => {
+                    info!("{NAME} client: {client_address} is signing in...");
+                    self.set_state(ClientState::Authenticating).await;
+                    match credentials {
+                        Credentials::UsernamePassword(username, password) => {
+                            self.login_user(username, password).await?;
+                            info!(
+                                "{NAME} client: {client_address} has signed in with the user credentials, username: {username}",
+                            );
+                        }
+                        Credentials::PersonalAccessToken(token) => {
+                            self.login_with_personal_access_token(token).await?;
+                            info!(
+                                "{NAME} client: {client_address} has signed in with a personal access token.",
+                            );
+                        }
+                    }
+
+                    self.handle_leader_redirection().await?
+                }
             };
-            let connector = TlsConnector::from(Arc::new(config));
-            let tls_domain = if self.config.tls_domain.is_empty() {
-                // Extract hostname/IP from server_address when tls_domain is not specified
-                self.config
-                    .server_address
-                    .split(':')
-                    .next()
-                    .unwrap_or(&self.config.server_address)
-                    .to_string()
-            } else {
-                self.config.tls_domain.to_owned()
-            };
-            let domain = ServerName::try_from(tls_domain).map_err(|error| {
-                error!("Failed to create a server name from the domain. {error}",);
-                IggyError::InvalidTlsDomain
-            })?;
-            let stream = connector.connect(domain, stream).await.map_err(|error| {
-                error!("Failed to establish a TLS connection to the server: {error}",);
-                IggyError::CannotEstablishConnection
-            })?;
-            connection_stream = ConnectionStreamKind::TcpTls(TcpTlsConnectionStream::new(
-                client_address,
-                TlsStream::Client(stream),
-            ));
-            break;
+
+            if should_redirect {
+                continue;
+            }
+
+            return Ok(());
         }
+    }
 
-        let now = IggyTimestamp::now();
-        info!(
-            "{NAME} client: {client_address} has connected to server: {remote_address} at: {now}",
-        );
-        self.stream.lock().await.replace(connection_stream);
-        self.set_state(ClientState::Connected).await;
-        self.connected_at.lock().await.replace(now);
-        self.publish_event(DiagnosticEvent::Connected).await;
-        match &self.config.auto_login {
-            AutoLogin::Disabled => {
-                info!("Automatic sign-in is disabled.");
-                Ok(())
+    /// Checks cluster metadata and handles leader redirection if needed.
+    /// Returns true if redirection occurred and reconnection is needed.
+    pub(crate) async fn handle_leader_redirection(&self) -> Result<bool, IggyError> {
+        let current_address = self.current_server_address.lock().await.clone();
+        let leader_address = check_and_redirect_to_leader(self, &current_address).await?;
+
+        if let Some(new_leader_address) = leader_address {
+            let mut redirection_state = self.leader_redirection_state.lock().await;
+            if !redirection_state.can_redirect() {
+                warn!("Maximum leader redirections reached, continuing with current connection");
+                return Ok(false);
             }
-            AutoLogin::Enabled(credentials) => {
-                info!("{NAME} client: {client_address} is signing in...");
-                self.set_state(ClientState::Authenticating).await;
-                match credentials {
-                    Credentials::UsernamePassword(username, password) => {
-                        self.login_user(username, password).await?;
-                        info!(
-                            "{NAME} client: {client_address} has signed in with the user credentials, username: {username}",
-                        );
-                        Ok(())
-                    }
-                    Credentials::PersonalAccessToken(token) => {
-                        self.login_with_personal_access_token(token).await?;
-                        info!(
-                            "{NAME} client: {client_address} has signed in with a personal access token.",
-                        );
-                        Ok(())
-                    }
-                }
-            }
+
+            info!(
+                "Current node is not leader, redirecting to leader at: {}",
+                new_leader_address
+            );
+            redirection_state.increment_redirect(new_leader_address.clone());
+            drop(redirection_state);
+
+            // Clear connected_at to avoid reestablish_after delay during redirection
+            self.connected_at.lock().await.take();
+            self.disconnect().await?;
+
+            *self.current_server_address.lock().await = new_leader_address;
+            Ok(true)
+        } else {
+            self.leader_redirection_state.lock().await.reset();
+            Ok(false)
         }
     }
 

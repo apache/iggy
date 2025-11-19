@@ -16,8 +16,7 @@
  * under the License.
  */
 
-extern crate sysinfo;
-
+use super::cluster::ClusterConfig;
 use super::server::{
     DataMaintenanceConfig, MessageSaverConfig, MessagesMaintenanceConfig, TelemetryConfig,
 };
@@ -60,6 +59,9 @@ impl Validatable<ConfigError> for ServerConfig {
         })?;
         self.system.sharding.validate().with_error(|error| {
             format!("{COMPONENT} (error: {error}) - failed to validate sharding config")
+        })?;
+        self.cluster.validate().with_error(|error| {
+            format!("{COMPONENT} (error: {error}) - failed to validate cluster config")
         })?;
 
         let topic_size = match self.system.topic.max_size {
@@ -320,5 +322,95 @@ impl Validatable<ConfigError> for ShardingConfig {
                 Ok(())
             }
         }
+    }
+}
+
+impl Validatable<ConfigError> for ClusterConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if !self.enabled {
+            return Ok(());
+        }
+
+        // Validate cluster name is not empty
+        if self.name.trim().is_empty() {
+            eprintln!("Invalid cluster configuration: cluster name cannot be empty");
+            return Err(ConfigError::InvalidConfiguration);
+        }
+
+        // Validate nodes list is not empty
+        if self.nodes.is_empty() {
+            eprintln!("Invalid cluster configuration: nodes list cannot be empty");
+            return Err(ConfigError::InvalidConfiguration);
+        }
+
+        // Check if nodes start from ID 0
+        let has_node_zero = self.nodes.iter().any(|node| node.id == 0);
+        if !has_node_zero {
+            eprintln!("Invalid cluster configuration: nodes must start from ID 0");
+            return Err(ConfigError::InvalidConfiguration);
+        }
+
+        // Check if current node ID exists in nodes vector
+        let current_node_exists = self.nodes.iter().any(|node| node.id == self.node.id);
+        if !current_node_exists {
+            eprintln!(
+                "Invalid cluster configuration: current node ID {} not found in nodes list",
+                self.node.id
+            );
+            return Err(ConfigError::InvalidConfiguration);
+        }
+
+        // Check for duplicate node IDs
+        let mut node_ids = std::collections::HashSet::new();
+        for node in &self.nodes {
+            if !node_ids.insert(node.id) {
+                eprintln!(
+                    "Invalid cluster configuration: duplicate node ID {} found",
+                    node.id
+                );
+                return Err(ConfigError::InvalidConfiguration);
+            }
+        }
+
+        // Validate unique addresses (IP:port combinations)
+        let mut addresses = std::collections::HashSet::new();
+        for node in &self.nodes {
+            // Validate address format (should contain IP:port or [IPv6]:port)
+            let is_valid_address = if node.address.starts_with('[') {
+                // IPv6 address format: [::1]:8090
+                node.address.contains("]:") && node.address.matches(':').count() >= 2
+            } else {
+                // IPv4 address format: 127.0.0.1:8090
+                node.address.matches(':').count() == 1
+            };
+
+            if !is_valid_address {
+                eprintln!(
+                    "Invalid cluster configuration: malformed address '{}' for node ID {}",
+                    node.address, node.id
+                );
+                return Err(ConfigError::InvalidConfiguration);
+            }
+
+            // Check for duplicate full addresses
+            if !addresses.insert(node.address.clone()) {
+                eprintln!(
+                    "Invalid cluster configuration: duplicate address {} found (node ID: {})",
+                    node.address, node.id
+                );
+                return Err(ConfigError::InvalidConfiguration);
+            }
+
+            // Validate node name is not empty
+            if node.name.trim().is_empty() {
+                eprintln!(
+                    "Invalid cluster configuration: node name cannot be empty for node ID {}",
+                    node.id
+                );
+                return Err(ConfigError::InvalidConfiguration);
+            }
+        }
+
+        Ok(())
     }
 }

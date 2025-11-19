@@ -167,13 +167,16 @@ impl BytesSerializable for ClusterMetadata {
 
 impl Display for ClusterMetadata {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let nodes = self
+            .nodes
+            .iter()
+            .map(|node| node.to_string())
+            .collect::<Vec<_>>();
+
         write!(
             f,
-            "ClusterMetadata {{ name: {}, id: {}, transport: {}, nodes: {} }}",
-            self.name,
-            self.id,
-            self.transport,
-            self.nodes.len()
+            "ClusterMetadata {{ name: {}, id: {}, transport: {}, nodes: {:?} }}",
+            self.name, self.id, self.transport, nodes
         )
     }
 }

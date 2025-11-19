@@ -16,6 +16,7 @@
  * under the License.
  */
 
+use crate::leader_aware::{LeaderRedirectionState, check_and_redirect_to_leader};
 use crate::websocket::websocket_connection_stream::WebSocketConnectionStream;
 use crate::websocket::websocket_stream_kind::WebSocketStreamKind;
 use crate::websocket::websocket_tls_connection_stream::WebSocketTlsConnectionStream;
@@ -53,7 +54,9 @@ pub struct WebSocketClient {
     pub(crate) state: Mutex<ClientState>,
     client_address: Mutex<Option<SocketAddr>>,
     events: (Sender<DiagnosticEvent>, Receiver<DiagnosticEvent>),
-    connected_at: Mutex<Option<IggyTimestamp>>,
+    pub(crate) connected_at: Mutex<Option<IggyTimestamp>>,
+    leader_redirection_state: Mutex<LeaderRedirectionState>,
+    pub(crate) current_server_address: Mutex<String>,
 }
 
 impl Default for WebSocketClient {
@@ -149,6 +152,7 @@ impl WebSocketClient {
     /// Create a new WebSocket client with the provided configuration.
     pub fn create(config: Arc<WebSocketClientConfig>) -> Result<Self, IggyError> {
         let (sender, receiver) = broadcast(1000);
+        let server_address = config.server_address.clone();
         Ok(WebSocketClient {
             stream: Arc::new(Mutex::new(None)),
             config,
@@ -156,6 +160,8 @@ impl WebSocketClient {
             client_address: Mutex::new(None),
             events: (sender, receiver),
             connected_at: Mutex::new(None),
+            leader_redirection_state: Mutex::new(LeaderRedirectionState::new()),
+            current_server_address: Mutex::new(server_address),
         })
     }
 
@@ -176,80 +182,82 @@ impl WebSocketClient {
     }
 
     async fn connect(&self) -> Result<(), IggyError> {
-        if self.get_state().await == ClientState::Connected {
-            return Ok(());
-        }
-
-        let mut retry_count = 0;
-
         loop {
-            let protocol = if self.config.tls_enabled { "wss" } else { "ws" };
-            info!(
-                "{NAME} client is connecting to server: {}://{}...",
-                protocol, self.config.server_address
-            );
-            self.set_state(ClientState::Connecting).await;
-
-            if retry_count > 0 {
-                let elapsed = self
-                    .connected_at
-                    .lock()
-                    .await
-                    .map(|ts| IggyTimestamp::now().as_micros() - ts.as_micros())
-                    .unwrap_or(0);
-
-                let interval = self.config.reconnection.reestablish_after.as_micros();
-                debug!("Elapsed time since last connection: {}μs", elapsed);
-
-                if elapsed < interval {
-                    let remaining =
-                        IggyDuration::new(std::time::Duration::from_micros(interval - elapsed));
-                    info!("Trying to connect to the server in: {remaining}");
-                    sleep(remaining.get_duration()).await;
-                }
+            if self.get_state().await == ClientState::Connected {
+                return Ok(());
             }
 
-            let server_addr = self
-                .config
-                .server_address
-                .parse::<SocketAddr>()
-                .map_err(|_| {
-                    error!("Invalid server address: {}", self.config.server_address);
+            let mut retry_count = 0;
+
+            loop {
+                let current_address = self.current_server_address.lock().await.clone();
+                let protocol = if self.config.tls_enabled { "wss" } else { "ws" };
+                info!(
+                    "{NAME} client is connecting to server: {}://{}...",
+                    protocol, current_address
+                );
+                self.set_state(ClientState::Connecting).await;
+
+                if retry_count > 0 {
+                    let elapsed = self
+                        .connected_at
+                        .lock()
+                        .await
+                        .map(|ts| IggyTimestamp::now().as_micros() - ts.as_micros())
+                        .unwrap_or(0);
+
+                    let interval = self.config.reconnection.reestablish_after.as_micros();
+                    debug!("Elapsed time since last connection: {}μs", elapsed);
+
+                    if elapsed < interval {
+                        let remaining =
+                            IggyDuration::new(std::time::Duration::from_micros(interval - elapsed));
+                        info!("Trying to connect to the server in: {remaining}");
+                        sleep(remaining.get_duration()).await;
+                    }
+                }
+
+                let server_addr = current_address.parse::<SocketAddr>().map_err(|_| {
+                    error!("Invalid server address: {}", current_address);
                     IggyError::InvalidConfiguration
                 })?;
 
-            let connection_stream = if self.config.tls_enabled {
-                match self.connect_tls(server_addr, &mut retry_count).await {
-                    Ok(stream) => stream,
-                    Err(IggyError::CannotEstablishConnection) => {
-                        return Err(IggyError::CannotEstablishConnection);
+                let connection_stream = if self.config.tls_enabled {
+                    match self.connect_tls(server_addr, &mut retry_count).await {
+                        Ok(stream) => stream,
+                        Err(IggyError::CannotEstablishConnection) => {
+                            return Err(IggyError::CannotEstablishConnection);
+                        }
+                        Err(_) => continue, // retry
                     }
-                    Err(_) => continue, // retry
-                }
-            } else {
-                match self.connect_plain(server_addr, &mut retry_count).await {
-                    Ok(stream) => stream,
-                    Err(IggyError::CannotEstablishConnection) => {
-                        return Err(IggyError::CannotEstablishConnection);
+                } else {
+                    match self.connect_plain(server_addr, &mut retry_count).await {
+                        Ok(stream) => stream,
+                        Err(IggyError::CannotEstablishConnection) => {
+                            return Err(IggyError::CannotEstablishConnection);
+                        }
+                        Err(_) => continue, // retry
                     }
-                    Err(_) => continue, // retry
-                }
-            };
+                };
 
-            *self.stream.lock().await = Some(connection_stream);
-            *self.client_address.lock().await = Some(server_addr);
-            self.set_state(ClientState::Connected).await;
-            *self.connected_at.lock().await = Some(IggyTimestamp::now());
-            self.publish_event(DiagnosticEvent::Connected).await;
+                *self.stream.lock().await = Some(connection_stream);
+                *self.client_address.lock().await = Some(server_addr);
+                self.set_state(ClientState::Connected).await;
+                *self.connected_at.lock().await = Some(IggyTimestamp::now());
+                self.publish_event(DiagnosticEvent::Connected).await;
 
-            let now = IggyTimestamp::now();
-            info!(
-                "{NAME} client has connected to server: {} at: {now}",
-                server_addr
-            );
+                let now = IggyTimestamp::now();
+                info!(
+                    "{NAME} client has connected to server: {} at: {now}",
+                    server_addr
+                );
 
-            self.auto_login().await?;
-            return Ok(());
+                break;
+            }
+
+            if !self.check_and_maybe_redirect().await? {
+                return Ok(());
+            }
         }
     }
 
@@ -413,6 +421,46 @@ impl WebSocketClient {
         self.set_state(ClientState::Disconnected).await;
         self.publish_event(DiagnosticEvent::Disconnected).await;
         Err(IggyError::CannotEstablishConnection)
+    }
+
+    async fn check_and_maybe_redirect(&self) -> Result<bool, IggyError> {
+        match &self.config.auto_login {
+            AutoLogin::Disabled => Ok(false),
+            AutoLogin::Enabled(_) => {
+                self.auto_login().await?;
+                self.handle_leader_redirection().await
+            }
+        }
+    }
+
+    /// Checks cluster metadata and handles leader redirection if needed.
+    /// Returns true if redirection occurred and reconnection is needed.
+    pub(crate) async fn handle_leader_redirection(&self) -> Result<bool, IggyError> {
+        let current_address = self.current_server_address.lock().await.clone();
+        let leader_address = check_and_redirect_to_leader(self, &current_address).await?;
+
+        if let Some(new_leader_address) = leader_address {
+            let mut redirection_state = self.leader_redirection_state.lock().await;
+            if !redirection_state.can_redirect() {
+                warn!("Maximum leader redirections reached for WebSocket client");
+                return Ok(false);
+            }
+
+            redirection_state.increment_redirect(new_leader_address.clone());
+            drop(redirection_state);
+
+            info!(
+                "WebSocket client redirecting to leader at: {}",
+                new_leader_address
+            );
+            self.connected_at.lock().await.take();
+            self.disconnect().await?;
+            *self.current_server_address.lock().await = new_leader_address;
+            Ok(true)
+        } else {
+            self.leader_redirection_state.lock().await.reset();
+            Ok(false)
+        }
     }
 
     async fn auto_login(&self) -> Result<(), IggyError> {

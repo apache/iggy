@@ -23,7 +23,6 @@ edition = "2024"
 license = "Apache-2.0"
 
 [features]
-iggy-server-in-docker = []
 bdd = []
 
 [dev-dependencies]
@@ -41,11 +40,7 @@ name = "basic_messaging"
 harness = false
 required-features = ["bdd"]
 
-# Future test scenarios can be added here:
-# [[test]]
-# name = "user_management"
-# harness = false
-#
-# [[test]]
-# name = "consumer_groups"
-# harness = false
+[[test]]
+name = "leader_redirection"
+harness = false
+required-features = ["bdd"]
