@@ -1,4 +1,5 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
  * regarding copyright ownership.  The ASF licenses this file
@@ -17,9 +18,9 @@
  */
 
 use crate::{
+    IcebergSink,
     catalog::init_catalog,
     router::{dynamic_router::DynamicRouter, static_router::StaticRouter},
-    IcebergSink,
 };
 use async_trait::async_trait;
 use iceberg::Catalog;
@@ -42,8 +43,8 @@ impl Sink for IcebergSink {
             .take(3)
             .collect::<String>();
         info!(
-            "Opened Iceberg sink connector with ID: {} for URL: {}, store access key ID: {}  store secret: {}",
-            self.id, self.config.uri, redacted_store_key, redacted_store_secret
+            "Opened Iceberg sink connector with ID: {} for URL: {}, store access key ID: {redacted_store_key}***  store secret: {redacted_store_secret}***",
+            self.id, self.config.uri
         );
 
         info!(

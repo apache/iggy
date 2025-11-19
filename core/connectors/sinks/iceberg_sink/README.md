@@ -13,7 +13,7 @@ The Iceberg Sink Connector allows you to consume messages from Iggy topics and s
 ## Configuration example
 
 ```toml
-[sinks.iceberg.config]
+[plugin_config]
 tables = ["nyc.users"]
 catalog_type = "rest"
 warehouse = "warehouse"
@@ -54,7 +54,7 @@ The Iggy Iceberg Connector will skip messages in the following cases:
 ### Dynamic routing configuration example
 
 ```toml
-[sinks.iceberg.config]
+[plugin_config]
 tables = [""]
 catalog_type = "rest"
 warehouse = "warehouse"

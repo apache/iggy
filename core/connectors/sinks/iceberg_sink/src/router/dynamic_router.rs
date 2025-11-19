@@ -1,4 +1,5 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
  * regarding copyright ownership.  The ASF licenses this file
@@ -118,8 +119,7 @@ impl Router for DynamicRouter {
 
             if !is_valid_namespaced_table(&route_field_val) {
                 warn!(
-                    "Found invalid route field name on message: {}. Route fields should have at least 1 namespace separated by '.' character before the table",
-                    route_field_val
+                    "Found invalid route field name on message: {route_field_val}. Route fields should have at least 1 namespace separated by '.' character before the table"
                 );
                 continue;
             }
