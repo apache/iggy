@@ -137,14 +137,16 @@ There's a dedicated Web UI for the server, which allows managing the streams, to
 The highly performant and modular **[runtime](https://github.com/apache/iggy/tree/master/core/connectors)** for statically typed, yet dynamically loaded connectors. Ingest the data from the external sources and push it further to the Iggy streams, or fetch the data from the Iggy streams and push it further to the external sources. **Create your own Rust plugins** by simply implementing either the `Source` or `Sink` trait and **build custom pipelines for the data processing**.
 
 ```toml
-## Configure a sink or source connector, depending on your needs
-[sinks.quickwit]
+## Configure a sink or source connector, depending on your needs in its own config file.
+type = "sink"
+key = "quickwit"
 enabled = true
+version = 0
 name = "Quickwit sink"
 path = "target/release/libiggy_connector_quickwit_sink"
-config_format = "yaml"
+plugin_config_format = "yaml"
 
-[[sinks.quickwit.streams]]
+[[streams]]
 stream = "qw"
 topics = ["records"]
 schema = "json"
@@ -152,11 +154,18 @@ batch_length = 1000
 poll_interval = "5ms"
 consumer_group = "qw_sink_connector"
 
-[[sinks.quickwit.transforms.add_fields.fields]]
-key = "random_id"
-value.computed = "uuid_v7"
+[transforms.add_fields]
+enabled = true
 
-[sinks.quickwit.transforms.delete_fields]
+[[transforms.add_fields.fields]]
+key = "service_name"
+value.static = "qw_connector"
+
+[[transforms.add_fields.fields]]
+key = "timestamp"
+value.computed = "timestamp_millis"
+
+[transforms.delete_fields]
 enabled = true
 fields = ["email", "created_at"]
 ```

@@ -23,8 +23,8 @@ name = "Postgres sink"
 path = "../../target/debug/libiggy_connector_postgres_sink"
 
 [[streams]]
-stream = ""
-topics = [""]
+stream = "test_stream"
+topics = ["test_topic"]
 schema = "json"
 batch_length = 100
 poll_interval = "5ms"

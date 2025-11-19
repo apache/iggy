@@ -15,6 +15,30 @@
 # specific language governing permissions and limitations
 # under the License.
 
-[connectors]
-config_type = "local"
-config_dir = "tests/connectors/postgres/connectors_config"
+type = "source"
+key = "random"
+enabled = true
+version = 0
+name = "Random source"
+path = "../../target/debug/libiggy_connector_random_source"
+plugin_config_format = "json"
+
+[[streams]]
+stream = "test_stream"
+topic = "test_topic"
+schema = "json"
+batch_length = 1000
+linger_time = "5ms"
+
+[plugin_config]
+interval = "100ms"
+max_count = 1_000_000
+messages_range = [1, 5]
+payload_size = 200
+
+[transforms.add_fields]
+enabled = true
+
+[[transforms.add_fields.fields]]
+key = "test_field"
+value.static = "hello!"

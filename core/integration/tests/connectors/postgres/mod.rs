@@ -17,14 +17,13 @@
  * under the License.
  */
 
-use crate::connectors::{IggySetup, setup_runtime};
-use iggy::prelude::IggyClient;
+use crate::connectors::{ConnectorsRuntime, IggySetup, setup_runtime};
 use std::collections::HashMap;
 use testcontainers_modules::{postgres, testcontainers::runners::AsyncRunner};
 
 mod postgres_sink;
 
-async fn setup() -> IggyClient {
+async fn setup() -> ConnectorsRuntime {
     let container = postgres::Postgres::default()
         .start()
         .await
@@ -57,5 +56,5 @@ async fn setup() -> IggyClient {
     runtime
         .init("postgres/config.toml", Some(envs), iggy_setup)
         .await;
-    runtime.create_client().await
+    runtime
 }

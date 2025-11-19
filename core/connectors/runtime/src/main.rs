@@ -130,6 +130,11 @@ async fn main() -> Result<(), RuntimeError> {
         create_connectors_config_provider(&config.connectors).await?;
 
     let connectors_config = connectors_config_provider.get_active_configs().await?;
+    info!(
+        "Found {} source and {} sink configurations.",
+        connectors_config.sources().len(),
+        connectors_config.sinks().len()
+    );
     let sources_config = connectors_config.sources();
     let sources = source::init(
         sources_config.clone(),

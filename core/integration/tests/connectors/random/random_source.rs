@@ -1,4 +1,5 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
  * regarding copyright ownership.  The ASF licenses this file
@@ -16,9 +17,23 @@
  * under the License.
  */
 
-use crate::connectors::postgres::setup;
+use crate::connectors::random::setup;
+use std::time::Duration;
+use tokio::time::sleep;
 
 #[tokio::test]
-async fn given_valid_configuration_postgres_sink_connector_should_start() {
-    let _runtime = setup().await;
+async fn given_valid_configuration_random_source_connector_should_produce_messages() {
+    let runtime = setup().await;
+    let client = runtime.create_client().await;
+    // Wait for some messages to be produced
+    sleep(Duration::from_secs(1)).await;
+    let messages = client.get_messages().await.expect("Failed to get messages");
+    assert!(
+        !messages.messages.is_empty(),
+        "No messages received from random source"
+    );
+    assert!(
+        messages.current_offset > 0,
+        "Current offset should be greater than 0"
+    );
 }

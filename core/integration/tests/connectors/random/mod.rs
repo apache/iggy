@@ -1,4 +1,5 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
  * regarding copyright ownership.  The ASF licenses this file
@@ -16,9 +17,13 @@
  * under the License.
  */
 
-use crate::connectors::postgres::setup;
+use crate::connectors::{ConnectorsRuntime, IggySetup, setup_runtime};
 
-#[tokio::test]
-async fn given_valid_configuration_postgres_sink_connector_should_start() {
-    let _runtime = setup().await;
+mod random_source;
+
+async fn setup() -> ConnectorsRuntime {
+    let iggy_setup = IggySetup::default();
+    let mut runtime = setup_runtime();
+    runtime.init("random/config.toml", None, iggy_setup).await;
+    runtime
 }
