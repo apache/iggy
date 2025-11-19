@@ -76,7 +76,7 @@ jsonwebtoken = { version = "10.2.0", features = ["rust_crypto"] }
 lending-iterator = "0.1.7"
 mimalloc = { workspace = true, optional = true }
 moka = { version = "0.12.11", features = ["future"] }
-nix = { version = "0.30", features = ["fs"] }
+nix = { version = "0.30", features = ["fs", "resource"] }
 once_cell = "1.21.3"
 opentelemetry = { version = "0.31.0", features = ["trace", "logs"] }
 opentelemetry-appender-tracing = { version = "0.31.1", features = ["log"] }

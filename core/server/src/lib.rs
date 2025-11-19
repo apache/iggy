@@ -31,6 +31,7 @@ pub mod binary;
 pub mod bootstrap;
 pub(crate) mod compat;
 pub mod configs;
+pub mod diagnostics;
 pub mod http;
 pub mod io;
 pub mod log;
