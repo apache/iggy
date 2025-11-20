@@ -29,6 +29,7 @@ use tracing::trace;
 /// A dedicated struct for writing to the messages file.
 #[derive(Debug)]
 pub struct MessagesWriter {
+    flock: Rc<tokio::sync::RwLock<()>>,
     file_path: String,
     file: File,
     messages_size_bytes: Rc<AtomicU64>,
@@ -49,6 +50,7 @@ impl MessagesWriter {
         messages_size_bytes: Rc<AtomicU64>,
         fsync: bool,
         file_exists: bool,
+        flock: Rc<tokio::sync::RwLock<()>>,
     ) -> Result<Self, IggyError> {
         let file = OpenOptions::new()
             .create(true)
@@ -86,6 +88,7 @@ impl MessagesWriter {
             file,
             messages_size_bytes,
             fsync,
+            flock,
         })
     }
 
@@ -94,6 +97,7 @@ impl MessagesWriter {
         &self,
         batch_set: IggyMessagesBatchSet,
     ) -> Result<IggyByteSize, IggyError> {
+        let _flock = self.flock.write().await;
         let messages_size = batch_set.size();
         let messages_count = batch_set.count();
         let containers_count = batch_set.containers_count();

@@ -34,6 +34,7 @@ use tracing::{error, trace};
 /// A dedicated struct for reading from the messages file.
 #[derive(Debug)]
 pub struct MessagesReader {
+    flock: Rc<tokio::sync::RwLock<()>>,
     file_path: String,
     file: File,
     messages_size_bytes: Rc<AtomicU64>,
@@ -47,6 +48,7 @@ impl MessagesReader {
     pub async fn new(
         file_path: &str,
         messages_size_bytes: Rc<AtomicU64>,
+        flock: Rc<tokio::sync::RwLock<()>>,
     ) -> Result<Self, IggyError> {
         let file = OpenOptions::new()
             .read(true)
@@ -81,6 +83,7 @@ impl MessagesReader {
             file_path: file_path.to_string(),
             file,
             messages_size_bytes,
+            flock,
         })
     }
 
@@ -135,6 +138,7 @@ impl MessagesReader {
         &self,
         indexes: IggyIndexesMut,
     ) -> Result<IggyMessagesBatchMut, IggyError> {
+        let _flock = self.flock.read().await;
         let file_size = self.file_size();
         if file_size == 0 {
             return Ok(IggyMessagesBatchMut::empty());

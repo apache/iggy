@@ -47,8 +47,16 @@ impl Storage {
     ) -> Result<Self, IggyError> {
         let size = Rc::new(AtomicU64::new(messages_size));
         let indexes_size = Rc::new(AtomicU64::new(indexes_size));
+        let flock = Rc::new(tokio::sync::RwLock::new(()));
         let messages_writer = Rc::new(
-            MessagesWriter::new(messages_path, size.clone(), log_fsync, file_exists).await?,
+            MessagesWriter::new(
+                messages_path,
+                size.clone(),
+                log_fsync,
+                file_exists,
+                flock.clone(),
+            )
+            .await?,
         );
 
         let index_writer = Rc::new(
@@ -60,7 +68,7 @@ impl Storage {
             index_writer.fsync().await?;
         }
 
-        let messages_reader = Rc::new(MessagesReader::new(messages_path, size).await?);
+        let messages_reader = Rc::new(MessagesReader::new(messages_path, size, flock).await?);
         let index_reader = Rc::new(IndexReader::new(index_path, indexes_size).await?);
         Ok(Self {
             messages_writer: Some(messages_writer),
