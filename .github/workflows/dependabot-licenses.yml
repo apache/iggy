@@ -50,7 +50,7 @@ jobs:
         run: cargo install cargo-license
 
       - name: Update DEPENDENCIES.md
-        run: ./scripts/licenses-list.sh --update
+        run: ./scripts/ci/licenses-list.sh --update
 
       - name: Commit changes
         run: |
