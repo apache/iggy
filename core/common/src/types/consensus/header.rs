@@ -48,32 +48,22 @@ pub enum Command {
     Commit = 9,
 
     StartViewChange = 10,
-    DoViewChange = 11,
-    StartView = 24,
 
-    RequestStartView = 12,
-    RequstHeads = 13,
-    RequestPrepare = 14,
-    RequestReply = 15,
+    RequstHeads = 11,
+    RequestPrepare = 12,
+    RequestReply = 13,
 
-    Headers = 16,
+    Headers = 14,
 
-    Eviction = 17,
+    Eviction = 15,
 
-    RequestBlocks = 18,
-    Block = 19,
+    RequestBlocks = 16,
+    Block = 17,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Operation {
-    Reserved = 0,
-    Root = 1,
-    Register = 2,
-    Reconfigure = 3,
-    Pulse = 4,
-    Upgrade = 5,
-
     CreateStream = 128,
     UpdateStream = 129,
     DeleteStream = 130,
@@ -100,10 +90,7 @@ pub enum Operation {
 #[derive(Debug, Clone, Copy)]
 pub struct GenericHeader {
     pub checksum: u128,
-    pub checksum_padding: u128,
     pub checksum_body: u128,
-    pub checksum_body_padding: u128,
-    pub nonce_reserved: u128,
     pub cluster: u128,
     pub size: u32,
     pub epoch: u32,
@@ -145,10 +132,7 @@ impl ConsensusHeader for GenericHeader {
 #[derive(Debug, Clone, Copy)]
 pub struct PrepareHeader {
     pub checksum: u128,
-    pub checksum_padding: u128,
     pub checksum_body: u128,
-    pub checksum_body_padding: u128,
-    pub nonce_reserved: u128,
     pub cluster: u128,
     pub size: u32,
     pub epoch: u32,
@@ -164,11 +148,10 @@ pub struct PrepareHeader {
     pub request_checksum: u128,
     pub request_checksum_padding: u128,
     pub checkpoint_id: u128,
-    pub client: u128,
     pub op: u64,
     pub commit: u64,
     pub timestamp: u64,
-    pub request: u32,
+    pub request: u64,
     pub operation: Operation,
     pub reserved: [u8; 3],
 }
@@ -202,9 +185,6 @@ impl ConsensusHeader for PrepareHeader {
         if self.request_checksum_padding != 0 {
             return Err("request_checksum_padding must be 0");
         }
-        if self.operation == Operation::Reserved {
-            return Err("operation must be Reserved");
-        }
         Ok(())
     }
 }
@@ -213,10 +193,7 @@ impl ConsensusHeader for PrepareHeader {
 #[derive(Debug, Clone, Copy)]
 pub struct CommitHeader {
     pub checksum: u128,
-    pub checksum_padding: u128,
     pub checksum_body: u128,
-    pub checksum_body_padding: u128,
-    pub nonce_reserved: u128,
     pub cluster: u128,
     pub size: u32,
     pub epoch: u32,
@@ -269,10 +246,7 @@ impl ConsensusHeader for CommitHeader {
 #[derive(Debug, Clone, Copy)]
 pub struct ReplyHeader {
     pub checksum: u128,
-    pub checksum_padding: u128,
     pub checksum_body: u128,
-    pub checksum_body_padding: u128,
-    pub nonce_reserved: u128,
     pub cluster: u128,
     pub size: u32,
     pub epoch: u32,
@@ -287,11 +261,10 @@ pub struct ReplyHeader {
     pub request_checksum_padding: u128,
     pub context: u128,
     pub context_padding: u128,
-    pub client: u128,
     pub op: u64,
     pub commit: u64,
     pub timestamp: u64,
-    pub request: u32,
+    pub request: u64,
     pub operation: Operation,
     pub reserved: [u8; 19],
 }
