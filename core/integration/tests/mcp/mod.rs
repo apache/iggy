@@ -67,9 +67,8 @@ async fn mcp_server_should_list_tools() {
     let tools = client.list_tools().await.expect("Failed to list tools");
 
     assert!(!tools.tools.is_empty());
-    // TODO(hubcio): fix this once GetClusterMetadata is enabled for MCP tests
-    let tools_count = tools.tools.len() - 1;
-    assert_eq!(tools_count, 40);
+    let tools_count = tools.tools.len();
+    assert_eq!(tools_count, 41);
 }
 
 #[tokio::test]
@@ -78,17 +77,12 @@ async fn mcp_server_should_handle_ping() {
     assert_empty_response("ping", None).await;
 }
 
-// TODO(hubcio): not sure how to fix the cluster ports in CI
-#[ignore]
 #[tokio::test]
 #[parallel]
 async fn mcp_server_should_return_cluster_metadata() {
     assert_response::<ClusterMetadata>("get_cluster_metadata", None, |cluster| {
-        assert_eq!(cluster.id, 0);
         assert!(!cluster.name.is_empty());
-        assert_eq!(cluster.nodes.len(), 1);
-        let node = &cluster.nodes[0];
-        assert_eq!(node.id, 0);
+        assert_eq!(cluster.nodes.len(), 2);
     })
     .await;
 }
@@ -579,8 +573,7 @@ async fn invoke_request<T: DeserializeOwned>(
 
 async fn setup() -> McpInfra {
     let mut iggy_envs = HashMap::new();
-    // TODO(hubcio): not sure how to fix the cluster ports in CI
-    // iggy_envs.insert("IGGY_CLUSTER_ENABLED".to_owned(), "true".to_owned());
+    iggy_envs.insert("IGGY_CLUSTER_ENABLED".to_owned(), "true".to_owned());
     iggy_envs.insert("IGGY_QUIC_ENABLED".to_owned(), "false".to_owned());
     iggy_envs.insert("IGGY_WEBSOCKET_ENABLED".to_owned(), "false".to_owned());
     let mut test_server = TestServer::new(Some(iggy_envs), true, None, IpAddrKind::V4);

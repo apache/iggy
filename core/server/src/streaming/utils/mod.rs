@@ -16,6 +16,7 @@
  * under the License.
  */
 
+pub mod address;
 pub mod crypto;
 pub mod file;
 pub mod hash;

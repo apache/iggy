@@ -25,20 +25,28 @@ import { getTestClient } from "./test-client.utils.js";
 // response is mocked from /core/configs/server.toml
 const expectedMeta = {
   name: "iggy-cluster",
-  id: 0,
-  transport: "TCP",
   nodes: [
     {
-      id: 0,
       name: "iggy-node-1",
-      address: "127.0.0.1:8090",
+      ip: "127.0.0.1",
+      endpoints: {
+        tcp: 8090,
+        quic: 8080,
+        http: 3000,
+        websocket: 8092,
+      },
       role: "Leader",
       status: "Healthy",
     },
     {
-      id: 1,
       name: "iggy-node-2",
-      address: "127.0.0.1:8091",
+      ip: "127.0.0.1",
+      endpoints: {
+        tcp: 8091,
+        quic: 8081,
+        http: 3001,
+        websocket: 8093,
+      },
       role: "Follower",
       status: "Healthy",
     },

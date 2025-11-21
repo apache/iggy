@@ -168,12 +168,29 @@ impl CustomEnvProvider {
             if remaining_path.is_empty() {
                 arr[array_index] = value;
             } else if let FigmentValue::Dict(_, elem_dict) = &mut arr[array_index] {
-                Self::insert_overridden_values_from_env(
-                    &Dict::new(),
-                    elem_dict,
-                    remaining_path.to_vec(),
-                    value,
-                );
+                // TODO(hubcio): this is workaround done by Claude because this code is overly
+                // complicated and I don't want to spend time on it.
+                // For nested structures in arrays, check if we need to create intermediate dicts
+                // Handle the "ports" case where it should be a nested structure
+                if remaining_path.len() >= 2 && remaining_path[0] == "ports" {
+                    // Create the ports dict if it doesn't exist
+                    elem_dict
+                        .entry("ports".to_string())
+                        .or_insert_with(|| FigmentValue::Dict(Tag::Default, Dict::new()));
+
+                    if let Some(FigmentValue::Dict(_, ports_dict)) = elem_dict.get_mut("ports") {
+                        // Insert the specific port value (tcp, quic, http, websocket)
+                        ports_dict.insert(remaining_path[1].clone(), value);
+                    }
+                } else {
+                    // Default behavior for other fields
+                    Self::insert_overridden_values_from_env(
+                        &Dict::new(),
+                        elem_dict,
+                        remaining_path.to_vec(),
+                        value,
+                    );
+                }
             }
         }
     }

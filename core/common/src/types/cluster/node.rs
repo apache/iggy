@@ -18,7 +18,9 @@
 
 use crate::{
     BytesSerializable, IggyError,
-    types::cluster::{role::ClusterNodeRole, status::ClusterNodeStatus},
+    types::cluster::{
+        role::ClusterNodeRole, status::ClusterNodeStatus, transport_endpoints::TransportEndpoints,
+    },
 };
 use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
@@ -26,9 +28,9 @@ use std::fmt::Display;
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ClusterNode {
-    pub id: u32,
     pub name: String,
-    pub address: String,
+    pub ip: String,
+    pub endpoints: TransportEndpoints,
     pub role: ClusterNodeRole,
     pub status: ClusterNodeStatus,
 }
@@ -43,19 +45,11 @@ impl BytesSerializable for ClusterNode {
 
     fn from_bytes(bytes: Bytes) -> Result<Self, IggyError> {
         if bytes.len() < 10 {
-            // Minimum: 4 (id) + 4 (name_len) + 4 (address_len) + 1 (role) + 1 (status)
+            // Minimum: 4 (name_len) + 4 (ip_len) + 1 (role) + 1 (status)
             return Err(IggyError::InvalidCommand);
         }
 
         let mut position = 0;
-
-        // Read id
-        let id = u32::from_le_bytes(
-            bytes[position..position + 4]
-                .try_into()
-                .map_err(|_| IggyError::InvalidNumberEncoding)?,
-        );
-        position += 4;
 
         // Read name length
         let name_len = u32::from_le_bytes(
@@ -73,24 +67,26 @@ impl BytesSerializable for ClusterNode {
             .map_err(|_| IggyError::InvalidCommand)?;
         position += name_len;
 
-        // Read address length
-        if bytes.len() < position + 4 {
-            return Err(IggyError::InvalidCommand);
-        }
-        let address_len = u32::from_le_bytes(
+        // Read IP length
+        let ip_len = u32::from_le_bytes(
             bytes[position..position + 4]
                 .try_into()
                 .map_err(|_| IggyError::InvalidNumberEncoding)?,
         ) as usize;
         position += 4;
 
-        // Read address
-        if bytes.len() < position + address_len {
+        // Read IP
+        if bytes.len() < position + ip_len {
             return Err(IggyError::InvalidCommand);
         }
-        let address = String::from_utf8(bytes[position..position + address_len].to_vec())
+        let ip = String::from_utf8(bytes[position..position + ip_len].to_vec())
             .map_err(|_| IggyError::InvalidCommand)?;
-        position += address_len;
+        position += ip_len;
+
+        // Read transport endpoints
+        let endpoints_bytes = bytes.slice(position..);
+        let endpoints = TransportEndpoints::from_bytes(endpoints_bytes)?;
+        position += endpoints.get_buffer_size();
 
         // Read role
         if bytes.len() < position + 1 {
@@ -106,26 +102,26 @@ impl BytesSerializable for ClusterNode {
         let status = ClusterNodeStatus::try_from(bytes[position])?;
 
         Ok(ClusterNode {
-            id,
             name,
-            address,
+            ip,
+            endpoints,
             role,
             status,
         })
     }
 
     fn write_to_buffer(&self, buf: &mut BytesMut) {
-        buf.put_u32_le(self.id);
         buf.put_u32_le(self.name.len() as u32);
         buf.put_slice(self.name.as_bytes());
-        buf.put_u32_le(self.address.len() as u32);
-        buf.put_slice(self.address.as_bytes());
+        buf.put_u32_le(self.ip.len() as u32);
+        buf.put_slice(self.ip.as_bytes());
+        self.endpoints.write_to_buffer(buf);
         self.role.write_to_buffer(buf);
         self.status.write_to_buffer(buf);
     }
 
     fn get_buffer_size(&self) -> usize {
-        4 + 4 + self.name.len() + 4 + self.address.len() + 1 + 1 // id + name_len + name + address_len + address + role + status
+        4 + self.name.len() + 4 + self.ip.len() + self.endpoints.get_buffer_size() + 1 + 1 // name_len + name + ip_len + ip + endpoints + role + status
     }
 }
 
@@ -133,8 +129,8 @@ impl Display for ClusterNode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "ClusterNode {{ id: {}, name: {}, address: {}, role: {}, status: {} }}",
-            self.id, self.name, self.address, self.role, self.status
+            "ClusterNode {{ name: {}, ip: {}, endpoints: {}, role: {}, status: {} }}",
+            self.name, self.ip, self.endpoints, self.role, self.status
         )
     }
 }

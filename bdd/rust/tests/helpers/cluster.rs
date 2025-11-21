@@ -112,7 +112,7 @@ pub fn update_node_role(
 ) -> bool {
     if let Some(node) = nodes
         .iter_mut()
-        .find(|n| n.id == node_id && n.address.ends_with(&format!(":{}", port)))
+        .find(|n| n.name == format!("node-{}", node_id) && n.endpoints.tcp == port)
     {
         node.role = role;
         node.status = ClusterNodeStatus::Healthy;
@@ -120,14 +120,6 @@ pub fn update_node_role(
     } else {
         false
     }
-}
-
-/// Extracts port number from an address string
-pub fn extract_port_from_address(address: &str) -> Option<u16> {
-    address
-        .rsplit(':')
-        .next()
-        .and_then(|port_str| port_str.parse().ok())
 }
 
 /// Determines server type from port number

@@ -18,38 +18,27 @@
 namespace Apache.Iggy.Contracts;
 
 /// <summary>
-///     Cluster node metadata
+///     Represents transport endpoints (ports) for different protocols
 /// </summary>
-public class ClusterNode
+public class TransportEndpoints
 {
     /// <summary>
-    ///     Node name
+    ///     TCP port
     /// </summary>
-    public required string Name { get; set; }
+    public required ushort Tcp { get; set; }
 
     /// <summary>
-    ///     Node IP address
+    ///     QUIC port
     /// </summary>
-    public required string Ip { get; set; }
+    public required ushort Quic { get; set; }
 
     /// <summary>
-    ///     Transport endpoints (ports) for different protocols
+    ///     HTTP port
     /// </summary>
-    public required TransportEndpoints Endpoints { get; set; }
+    public required ushort Http { get; set; }
 
     /// <summary>
-    ///     Node role within the cluster
+    ///     WebSocket port
     /// </summary>
-    public required ClusterNodeRole Role { get; set; }
-
-    /// <summary>
-    ///     Node status
-    /// </summary>
-    public required ClusterNodeStatus Status { get; set; }
-
-    internal int GetSize()
-    {
-        // name length, name, ip length, ip, endpoints (4 * 2 bytes), role, status
-        return 4 + Name.Length + 4 + Ip.Length + 8 + 1 + 1;
-    }
+    public required ushort WebSocket { get; set; }
 }

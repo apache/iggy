@@ -337,77 +337,72 @@ impl Validatable<ConfigError> for ClusterConfig {
             return Err(ConfigError::InvalidConfiguration);
         }
 
-        // Validate nodes list is not empty
-        if self.nodes.is_empty() {
-            eprintln!("Invalid cluster configuration: nodes list cannot be empty");
+        // Validate current node name is not empty
+        if self.node.current.name.trim().is_empty() {
+            eprintln!("Invalid cluster configuration: current node name cannot be empty");
             return Err(ConfigError::InvalidConfiguration);
         }
 
-        // Check if nodes start from ID 0
-        let has_node_zero = self.nodes.iter().any(|node| node.id == 0);
-        if !has_node_zero {
-            eprintln!("Invalid cluster configuration: nodes must start from ID 0");
-            return Err(ConfigError::InvalidConfiguration);
-        }
+        // Check for duplicate node names among other nodes
+        let mut node_names = std::collections::HashSet::new();
+        node_names.insert(self.node.current.name.clone());
 
-        // Check if current node ID exists in nodes vector
-        let current_node_exists = self.nodes.iter().any(|node| node.id == self.node.id);
-        if !current_node_exists {
-            eprintln!(
-                "Invalid cluster configuration: current node ID {} not found in nodes list",
-                self.node.id
-            );
-            return Err(ConfigError::InvalidConfiguration);
-        }
-
-        // Check for duplicate node IDs
-        let mut node_ids = std::collections::HashSet::new();
-        for node in &self.nodes {
-            if !node_ids.insert(node.id) {
+        for node in &self.node.others {
+            if !node_names.insert(node.name.clone()) {
                 eprintln!(
-                    "Invalid cluster configuration: duplicate node ID {} found",
-                    node.id
+                    "Invalid cluster configuration: duplicate node name '{}' found",
+                    node.name
                 );
                 return Err(ConfigError::InvalidConfiguration);
             }
         }
 
-        // Validate unique addresses (IP:port combinations)
-        let mut addresses = std::collections::HashSet::new();
-        for node in &self.nodes {
-            // Validate address format (should contain IP:port or [IPv6]:port)
-            let is_valid_address = if node.address.starts_with('[') {
-                // IPv6 address format: [::1]:8090
-                node.address.contains("]:") && node.address.matches(':').count() >= 2
-            } else {
-                // IPv4 address format: 127.0.0.1:8090
-                node.address.matches(':').count() == 1
-            };
-
-            if !is_valid_address {
-                eprintln!(
-                    "Invalid cluster configuration: malformed address '{}' for node ID {}",
-                    node.address, node.id
-                );
-                return Err(ConfigError::InvalidConfiguration);
-            }
-
-            // Check for duplicate full addresses
-            if !addresses.insert(node.address.clone()) {
-                eprintln!(
-                    "Invalid cluster configuration: duplicate address {} found (node ID: {})",
-                    node.address, node.id
-                );
-                return Err(ConfigError::InvalidConfiguration);
-            }
-
+        // Validate each other node configuration
+        let mut used_endpoints = std::collections::HashSet::new();
+        for node in &self.node.others {
             // Validate node name is not empty
             if node.name.trim().is_empty() {
+                eprintln!("Invalid cluster configuration: node name cannot be empty");
+                return Err(ConfigError::InvalidConfiguration);
+            }
+
+            // Validate IP is not empty
+            if node.ip.trim().is_empty() {
                 eprintln!(
-                    "Invalid cluster configuration: node name cannot be empty for node ID {}",
-                    node.id
+                    "Invalid cluster configuration: IP cannot be empty for node '{}'",
+                    node.name
                 );
                 return Err(ConfigError::InvalidConfiguration);
+            }
+
+            // Validate transport ports if provided
+            let port_list = [
+                ("TCP", node.ports.tcp),
+                ("QUIC", node.ports.quic),
+                ("HTTP", node.ports.http),
+                ("WebSocket", node.ports.websocket),
+            ];
+
+            for (name, port_opt) in &port_list {
+                if let Some(port) = port_opt {
+                    if *port == 0 {
+                        eprintln!(
+                            "Invalid cluster configuration: {} port cannot be 0 for node '{}'",
+                            name, node.name
+                        );
+                        return Err(ConfigError::InvalidConfiguration);
+                    }
+
+                    // Check for port conflicts across nodes on the same IP
+                    let endpoint = format!("{}:{}:{}", node.ip, name, port);
+                    if !used_endpoints.insert(endpoint.clone()) {
+                        eprintln!(
+                            "Invalid cluster configuration: port conflict - {}:{} is already used",
+                            node.ip, port
+                        );
+                        return Err(ConfigError::InvalidConfiguration);
+                    }
+                }
             }
         }
 

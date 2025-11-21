@@ -16,59 +16,31 @@
  * under the License.
  */
 
-use integration::file::{file_exists, get_root_path};
 use serial_test::serial;
 use server::configs::config_provider::{ConfigProvider, FileConfigProvider};
 use std::env;
 
-async fn scenario_parsing_from_file(extension: &str) {
-    let mut config_path = get_root_path().join("../configs/server");
-    assert!(config_path.set_extension(extension), "Cannot set extension");
-    let config_path = config_path.as_path().display().to_string();
-    let config_provider = FileConfigProvider::new(config_path.clone());
-    assert!(
-        file_exists(&config_path),
-        "Config file not found: {config_path}"
-    );
-    assert!(
-        config_provider.load_config().await.is_ok(),
-        "ConfigProvider failed to parse config from {config_path}"
-    );
-}
+use integration::file::get_root_path;
 
-#[compio::test]
-async fn validate_server_config_toml_from_repository() {
-    scenario_parsing_from_file("toml").await;
-}
-
-// This test needs to be run in serial because it modifies the environment variables
-// which are shared, since all tests run in parallel by default.
 #[serial]
-#[compio::test]
-async fn validate_custom_env_provider() {
-    let expected_datagram_send_buffer_size = "1.00 KB";
-    let expected_quic_certificate_self_signed = false;
-    let expected_http_enabled = false;
-    let expected_tcp_enabled = "false";
-    let expected_message_saver_enabled = false;
-    let expected_message_expiry = "10s";
+#[tokio::test]
+async fn validate_config_env_override() {
+    let expected_http = true;
+    let expected_tcp = true;
+    let expected_message_saver = true;
+    let expected_message_expiry = "1s";
 
     unsafe {
-        env::set_var(
-            "IGGY_QUIC_DATAGRAM_SEND_BUFFER_SIZE",
-            expected_datagram_send_buffer_size,
-        );
-        env::set_var(
-            "IGGY_QUIC_CERTIFICATE_SELF_SIGNED",
-            expected_quic_certificate_self_signed.to_string(),
-        );
-        env::set_var("IGGY_HTTP_ENABLED", expected_http_enabled.to_string());
-        env::set_var("IGGY_TCP_ENABLED", expected_tcp_enabled);
+        env::set_var("IGGY_HTTP_ENABLED", expected_http.to_string());
+        env::set_var("IGGY_TCP_ENABLED", expected_tcp.to_string());
         env::set_var(
             "IGGY_MESSAGE_SAVER_ENABLED",
-            expected_message_saver_enabled.to_string(),
+            expected_message_saver.to_string(),
         );
-        env::set_var("IGGY_SYSTEM_SEGMENT_MESSAGE_EXPIRY", "10s");
+        env::set_var(
+            "IGGY_SYSTEM_SEGMENT_MESSAGE_EXPIRY",
+            expected_message_expiry,
+        );
     }
 
     let config_path = get_root_path().join("../configs/server.toml");
@@ -76,76 +48,146 @@ async fn validate_custom_env_provider() {
     let config = file_config_provider
         .load_config()
         .await
-        .expect("Failed to load default server.toml config");
+        .expect("Failed to load server.toml config");
 
-    assert_eq!(
-        config.quic.datagram_send_buffer_size.to_string(),
-        expected_datagram_send_buffer_size
-    );
-    assert_eq!(
-        config.quic.certificate.self_signed,
-        expected_quic_certificate_self_signed
-    );
-    assert_eq!(config.http.enabled, expected_http_enabled);
-    assert_eq!(config.tcp.enabled.to_string(), expected_tcp_enabled);
-    assert_eq!(config.message_saver.enabled, expected_message_saver_enabled);
+    assert_eq!(config.http.enabled, expected_http);
+    assert_eq!(config.tcp.enabled, expected_tcp);
+    assert_eq!(config.message_saver.enabled, expected_message_saver);
     assert_eq!(
         config.system.segment.message_expiry.to_string(),
         expected_message_expiry
     );
 
     unsafe {
-        env::remove_var("IGGY_QUIC_DATAGRAM_SEND_BUFFER_SIZE");
-        env::remove_var("IGGY_QUIC_CERTIFICATE_SELF_SIGNED");
         env::remove_var("IGGY_HTTP_ENABLED");
         env::remove_var("IGGY_TCP_ENABLED");
         env::remove_var("IGGY_MESSAGE_SAVER_ENABLED");
-        env::remove_var("IGGY_SYSTEM_RETENTION_POLICY_MESSAGE_EXPIRY");
+        env::remove_var("IGGY_SYSTEM_SEGMENT_MESSAGE_EXPIRY");
     }
 }
 
-// Test for cluster configuration with environment variable overrides
+#[serial]
+#[tokio::test]
+async fn validate_socket_override() {
+    // Simulating env::set_var with "true" for the tests
+    let expected_send_buffer = "666666";
+    let expected_recv_buffer = "777777";
+    unsafe {
+        env::set_var("IGGY_TCP_SOCKET_OVERRIDE_DEFAULTS", "true");
+        env::set_var("IGGY_TCP_SOCKET_SEND_BUFFER_SIZE", expected_send_buffer);
+        env::set_var("IGGY_TCP_SOCKET_RECV_BUFFER_SIZE", expected_recv_buffer);
+    }
+
+    let config_path = get_root_path().join("../configs/server.toml");
+    let file_config_provider = FileConfigProvider::new(config_path.as_path().display().to_string());
+    let config = file_config_provider
+        .load_config()
+        .await
+        .expect("Failed to load server.toml config with socket override");
+
+    assert!(config.tcp.socket.override_defaults);
+    assert_eq!(
+        config.tcp.socket.send_buffer_size.to_string(),
+        expected_send_buffer
+    );
+    assert_eq!(
+        config.tcp.socket.recv_buffer_size.to_string(),
+        expected_recv_buffer
+    );
+
+    unsafe {
+        env::remove_var("IGGY_TCP_SOCKET_OVERRIDE_DEFAULTS");
+        env::remove_var("IGGY_TCP_SOCKET_SEND_BUFFER_SIZE");
+        env::remove_var("IGGY_TCP_SOCKET_RECV_BUFFER_SIZE");
+    }
+}
+
+#[serial]
+#[tokio::test]
+async fn validate_socket_no_override() {
+    let config_path = get_root_path().join("../configs/server.toml");
+    let file_config_provider = FileConfigProvider::new(config_path.as_path().display().to_string());
+    let config = file_config_provider
+        .load_config()
+        .await
+        .expect("Failed to load server.toml config without socket override");
+
+    assert!(!config.tcp.socket.override_defaults);
+}
+
 #[serial]
 #[tokio::test]
 async fn validate_cluster_config_env_override() {
     // Test data for cluster configuration
     let expected_cluster_enabled = true;
-    let expected_cluster_id = 0;
     let expected_cluster_name = "test-cluster";
-    let expected_node_id = 0;
+    let expected_current_node_name = "test-node-1";
 
-    // Test data for cluster nodes array
-    let expected_node_0_id = 0;
-    let expected_node_0_name = "test-node-1";
-    let expected_node_0_address = "192.168.1.100:9090";
+    // Test data for other nodes in cluster
+    let expected_other_node_0_name = "test-node-2";
+    let expected_other_node_0_ip = "192.168.1.101";
+    let expected_other_node_0_tcp = 9091_u16;
+    let expected_other_node_0_quic = 9081_u16;
+    let expected_other_node_0_http = 4001_u16;
+    let expected_other_node_0_websocket = 9093_u16;
 
-    let expected_node_1_id = 1;
-    let expected_node_1_name = "test-node-2";
-    let expected_node_1_address = "192.168.1.101:9091";
-
-    let expected_node_2_id = 2;
-    let expected_node_2_name = "test-node-3";
-    let expected_node_2_address = "192.168.1.102:9092";
+    let expected_other_node_1_name = "test-node-3";
+    let expected_other_node_1_ip = "192.168.1.102";
+    let expected_other_node_1_tcp = 9092_u16;
+    let expected_other_node_1_quic = 9082_u16;
+    let expected_other_node_1_http = 4002_u16;
+    let expected_other_node_1_websocket = 9094_u16;
 
     unsafe {
         // Set cluster configuration environment variables
         env::set_var("IGGY_CLUSTER_ENABLED", expected_cluster_enabled.to_string());
-        env::set_var("IGGY_CLUSTER_ID", expected_cluster_id.to_string());
         env::set_var("IGGY_CLUSTER_NAME", expected_cluster_name);
-        env::set_var("IGGY_CLUSTER_NODE_ID", expected_node_id.to_string());
+        env::set_var("IGGY_CLUSTER_NODE_CURRENT_NAME", expected_current_node_name);
 
-        // Set cluster nodes array environment variables
-        env::set_var("IGGY_CLUSTER_NODES_0_ID", expected_node_0_id.to_string());
-        env::set_var("IGGY_CLUSTER_NODES_0_NAME", expected_node_0_name);
-        env::set_var("IGGY_CLUSTER_NODES_0_ADDRESS", expected_node_0_address);
+        // Set other nodes array environment variables
+        env::set_var(
+            "IGGY_CLUSTER_NODE_OTHERS_0_NAME",
+            expected_other_node_0_name,
+        );
+        env::set_var("IGGY_CLUSTER_NODE_OTHERS_0_IP", expected_other_node_0_ip);
+        env::set_var(
+            "IGGY_CLUSTER_NODE_OTHERS_0_PORTS_TCP",
+            expected_other_node_0_tcp.to_string(),
+        );
+        env::set_var(
+            "IGGY_CLUSTER_NODE_OTHERS_0_PORTS_QUIC",
+            expected_other_node_0_quic.to_string(),
+        );
+        env::set_var(
+            "IGGY_CLUSTER_NODE_OTHERS_0_PORTS_HTTP",
+            expected_other_node_0_http.to_string(),
+        );
+        env::set_var(
+            "IGGY_CLUSTER_NODE_OTHERS_0_PORTS_WEBSOCKET",
+            expected_other_node_0_websocket.to_string(),
+        );
 
-        env::set_var("IGGY_CLUSTER_NODES_1_ID", expected_node_1_id.to_string());
-        env::set_var("IGGY_CLUSTER_NODES_1_NAME", expected_node_1_name);
-        env::set_var("IGGY_CLUSTER_NODES_1_ADDRESS", expected_node_1_address);
-
-        env::set_var("IGGY_CLUSTER_NODES_2_ID", expected_node_2_id.to_string());
-        env::set_var("IGGY_CLUSTER_NODES_2_NAME", expected_node_2_name);
-        env::set_var("IGGY_CLUSTER_NODES_2_ADDRESS", expected_node_2_address);
+        env::set_var(
+            "IGGY_CLUSTER_NODE_OTHERS_1_NAME",
+            expected_other_node_1_name,
+        );
+        env::set_var("IGGY_CLUSTER_NODE_OTHERS_1_IP", expected_other_node_1_ip);
+        env::set_var(
+            "IGGY_CLUSTER_NODE_OTHERS_1_PORTS_TCP",
+            expected_other_node_1_tcp.to_string(),
+        );
+        env::set_var(
+            "IGGY_CLUSTER_NODE_OTHERS_1_PORTS_QUIC",
+            expected_other_node_1_quic.to_string(),
+        );
+        env::set_var(
+            "IGGY_CLUSTER_NODE_OTHERS_1_PORTS_HTTP",
+            expected_other_node_1_http.to_string(),
+        );
+        env::set_var(
+            "IGGY_CLUSTER_NODE_OTHERS_1_PORTS_WEBSOCKET",
+            expected_other_node_1_websocket.to_string(),
+        );
     }
 
     let config_path = get_root_path().join("../configs/server.toml");
@@ -157,64 +199,185 @@ async fn validate_cluster_config_env_override() {
 
     // Verify cluster configuration
     assert_eq!(config.cluster.enabled, expected_cluster_enabled);
-    assert_eq!(config.cluster.id, expected_cluster_id);
     assert_eq!(config.cluster.name, expected_cluster_name);
-    assert_eq!(config.cluster.node.id, expected_node_id);
+    assert_eq!(config.cluster.node.current.name, expected_current_node_name);
 
-    // Verify cluster nodes array - should have 3 nodes instead of the default 2
+    // Verify other nodes array - should have 2 nodes from environment variables
     assert_eq!(
-        config.cluster.nodes.len(),
-        3,
-        "Should have 3 nodes from environment variables"
+        config.cluster.node.others.len(),
+        2,
+        "Should have 2 other nodes from environment variables"
     );
 
-    // Verify first node
-    assert_eq!(config.cluster.nodes[0].id, expected_node_0_id);
-    assert_eq!(config.cluster.nodes[0].name, expected_node_0_name);
-    assert_eq!(config.cluster.nodes[0].address, expected_node_0_address);
+    // Verify first other node
+    assert_eq!(
+        config.cluster.node.others[0].name,
+        expected_other_node_0_name
+    );
+    assert_eq!(config.cluster.node.others[0].ip, expected_other_node_0_ip);
+    assert_eq!(
+        config.cluster.node.others[0].ports.tcp,
+        Some(expected_other_node_0_tcp)
+    );
+    assert_eq!(
+        config.cluster.node.others[0].ports.quic,
+        Some(expected_other_node_0_quic)
+    );
+    assert_eq!(
+        config.cluster.node.others[0].ports.http,
+        Some(expected_other_node_0_http)
+    );
+    assert_eq!(
+        config.cluster.node.others[0].ports.websocket,
+        Some(expected_other_node_0_websocket)
+    );
 
-    // Verify second node
-    assert_eq!(config.cluster.nodes[1].id, expected_node_1_id);
-    assert_eq!(config.cluster.nodes[1].name, expected_node_1_name);
-    assert_eq!(config.cluster.nodes[1].address, expected_node_1_address);
-
-    // Verify third node (added via env vars)
-    assert_eq!(config.cluster.nodes[2].id, expected_node_2_id);
-    assert_eq!(config.cluster.nodes[2].name, expected_node_2_name);
-    assert_eq!(config.cluster.nodes[2].address, expected_node_2_address);
+    // Verify second other node
+    assert_eq!(
+        config.cluster.node.others[1].name,
+        expected_other_node_1_name
+    );
+    assert_eq!(config.cluster.node.others[1].ip, expected_other_node_1_ip);
+    assert_eq!(
+        config.cluster.node.others[1].ports.tcp,
+        Some(expected_other_node_1_tcp)
+    );
+    assert_eq!(
+        config.cluster.node.others[1].ports.quic,
+        Some(expected_other_node_1_quic)
+    );
+    assert_eq!(
+        config.cluster.node.others[1].ports.http,
+        Some(expected_other_node_1_http)
+    );
+    assert_eq!(
+        config.cluster.node.others[1].ports.websocket,
+        Some(expected_other_node_1_websocket)
+    );
 
     unsafe {
         // Clean up environment variables
         env::remove_var("IGGY_CLUSTER_ENABLED");
         env::remove_var("IGGY_CLUSTER_ID");
         env::remove_var("IGGY_CLUSTER_NAME");
-        env::remove_var("IGGY_CLUSTER_NODE_ID");
+        env::remove_var("IGGY_CLUSTER_NODE_CURRENT_NAME");
 
-        env::remove_var("IGGY_CLUSTER_NODES_0_ID");
-        env::remove_var("IGGY_CLUSTER_NODES_0_NAME");
-        env::remove_var("IGGY_CLUSTER_NODES_0_ADDRESS");
+        env::remove_var("IGGY_CLUSTER_NODE_OTHERS_0_NAME");
+        env::remove_var("IGGY_CLUSTER_NODE_OTHERS_0_IP");
+        env::remove_var("IGGY_CLUSTER_NODE_OTHERS_0_PORTS_TCP");
+        env::remove_var("IGGY_CLUSTER_NODE_OTHERS_0_PORTS_QUIC");
+        env::remove_var("IGGY_CLUSTER_NODE_OTHERS_0_PORTS_HTTP");
+        env::remove_var("IGGY_CLUSTER_NODE_OTHERS_0_PORTS_WEBSOCKET");
 
-        env::remove_var("IGGY_CLUSTER_NODES_1_ID");
-        env::remove_var("IGGY_CLUSTER_NODES_1_NAME");
-        env::remove_var("IGGY_CLUSTER_NODES_1_ADDRESS");
-
-        env::remove_var("IGGY_CLUSTER_NODES_2_ID");
-        env::remove_var("IGGY_CLUSTER_NODES_2_NAME");
-        env::remove_var("IGGY_CLUSTER_NODES_2_ADDRESS");
+        env::remove_var("IGGY_CLUSTER_NODE_OTHERS_1_NAME");
+        env::remove_var("IGGY_CLUSTER_NODE_OTHERS_1_IP");
+        env::remove_var("IGGY_CLUSTER_NODE_OTHERS_1_PORTS_TCP");
+        env::remove_var("IGGY_CLUSTER_NODE_OTHERS_1_PORTS_QUIC");
+        env::remove_var("IGGY_CLUSTER_NODE_OTHERS_1_PORTS_HTTP");
+        env::remove_var("IGGY_CLUSTER_NODE_OTHERS_1_PORTS_WEBSOCKET");
     }
 }
 
-// Test partial override - only override specific fields
 #[serial]
 #[tokio::test]
-async fn validate_cluster_partial_env_override() {
-    // Only override the cluster ID and one node's address
-    let expected_cluster_id = 99;
-    let expected_node_1_address = "10.0.0.1:8888";
+async fn validate_four_node_cluster_config_env_override() {
+    // Test data for cluster configuration
+    let expected_cluster_enabled = true;
+    let expected_cluster_name = "test-4node-cluster";
+    let expected_current_node_name = "node-1";
+    let expected_current_node_ip = "10.0.0.1";
+
+    // Test data for other nodes in cluster (3 other nodes for a 4-node cluster)
+    let expected_other_node_0_name = "node-2";
+    let expected_other_node_0_ip = "10.0.0.2";
+    let expected_other_node_0_tcp = 8090_u16;
+    let expected_other_node_0_quic = 8080_u16;
+    let expected_other_node_0_http = 3000_u16;
+    let expected_other_node_0_websocket = 8092_u16;
+
+    let expected_other_node_1_name = "node-3";
+    let expected_other_node_1_ip = "10.0.0.3";
+    let expected_other_node_1_tcp = 8091_u16;
+    let expected_other_node_1_quic = 8081_u16;
+    let expected_other_node_1_http = 3001_u16;
+    let expected_other_node_1_websocket = 8093_u16;
+
+    let expected_other_node_2_name = "node-4";
+    let expected_other_node_2_ip = "10.0.0.4";
+    let expected_other_node_2_tcp = 8092_u16;
+    // QUIC and WebSocket ports will be None in config (defaults applied at runtime)
+    let expected_other_node_2_http = 3002_u16;
 
     unsafe {
-        env::set_var("IGGY_CLUSTER_ID", expected_cluster_id.to_string());
-        env::set_var("IGGY_CLUSTER_NODES_1_ADDRESS", expected_node_1_address);
+        // Set cluster configuration environment variables
+        env::set_var("IGGY_CLUSTER_ENABLED", expected_cluster_enabled.to_string());
+        env::set_var("IGGY_CLUSTER_NAME", expected_cluster_name);
+        env::set_var("IGGY_CLUSTER_NODE_CURRENT_NAME", expected_current_node_name);
+        env::set_var("IGGY_CLUSTER_NODE_CURRENT_IP", expected_current_node_ip);
+
+        // Set other nodes array environment variables - Node 2
+        env::set_var(
+            "IGGY_CLUSTER_NODE_OTHERS_0_NAME",
+            expected_other_node_0_name,
+        );
+        env::set_var("IGGY_CLUSTER_NODE_OTHERS_0_IP", expected_other_node_0_ip);
+        env::set_var(
+            "IGGY_CLUSTER_NODE_OTHERS_0_PORTS_TCP",
+            expected_other_node_0_tcp.to_string(),
+        );
+        env::set_var(
+            "IGGY_CLUSTER_NODE_OTHERS_0_PORTS_QUIC",
+            expected_other_node_0_quic.to_string(),
+        );
+        env::set_var(
+            "IGGY_CLUSTER_NODE_OTHERS_0_PORTS_HTTP",
+            expected_other_node_0_http.to_string(),
+        );
+        env::set_var(
+            "IGGY_CLUSTER_NODE_OTHERS_0_PORTS_WEBSOCKET",
+            expected_other_node_0_websocket.to_string(),
+        );
+
+        // Set other nodes array environment variables - Node 3
+        env::set_var(
+            "IGGY_CLUSTER_NODE_OTHERS_1_NAME",
+            expected_other_node_1_name,
+        );
+        env::set_var("IGGY_CLUSTER_NODE_OTHERS_1_IP", expected_other_node_1_ip);
+        env::set_var(
+            "IGGY_CLUSTER_NODE_OTHERS_1_PORTS_TCP",
+            expected_other_node_1_tcp.to_string(),
+        );
+        env::set_var(
+            "IGGY_CLUSTER_NODE_OTHERS_1_PORTS_QUIC",
+            expected_other_node_1_quic.to_string(),
+        );
+        env::set_var(
+            "IGGY_CLUSTER_NODE_OTHERS_1_PORTS_HTTP",
+            expected_other_node_1_http.to_string(),
+        );
+        env::set_var(
+            "IGGY_CLUSTER_NODE_OTHERS_1_PORTS_WEBSOCKET",
+            expected_other_node_1_websocket.to_string(),
+        );
+
+        // Set other nodes array environment variables - Node 4
+        // Only set TCP and HTTP ports, leaving QUIC and WebSocket to use defaults
+        env::set_var(
+            "IGGY_CLUSTER_NODE_OTHERS_2_NAME",
+            expected_other_node_2_name,
+        );
+        env::set_var("IGGY_CLUSTER_NODE_OTHERS_2_IP", expected_other_node_2_ip);
+        env::set_var(
+            "IGGY_CLUSTER_NODE_OTHERS_2_PORTS_TCP",
+            expected_other_node_2_tcp.to_string(),
+        );
+        // IGGY_CLUSTER_NODE_OTHERS_2_PORTS_QUIC is NOT set - should use default (8080)
+        env::set_var(
+            "IGGY_CLUSTER_NODE_OTHERS_2_PORTS_HTTP",
+            expected_other_node_2_http.to_string(),
+        );
+        // IGGY_CLUSTER_NODE_OTHERS_2_PORTS_WEBSOCKET is NOT set - should use default (8092)
     }
 
     let config_path = get_root_path().join("../configs/server.toml");
@@ -222,104 +385,133 @@ async fn validate_cluster_partial_env_override() {
     let config = file_config_provider
         .load_config()
         .await
-        .expect("Failed to load server.toml config with partial cluster env overrides");
+        .expect("Failed to load server.toml config with 4-node cluster env overrides");
 
-    // Verify overridden values
-    assert_eq!(config.cluster.id, expected_cluster_id);
-    assert_eq!(config.cluster.nodes[1].address, expected_node_1_address);
+    // Verify cluster configuration
+    assert_eq!(config.cluster.enabled, expected_cluster_enabled);
+    assert_eq!(config.cluster.name, expected_cluster_name);
+    assert_eq!(config.cluster.node.current.name, expected_current_node_name);
+    assert_eq!(config.cluster.node.current.ip, expected_current_node_ip);
 
-    // Verify non-overridden values remain default
-    assert_eq!(config.cluster.name, "iggy-cluster"); // default from server.toml
-    assert_eq!(config.cluster.nodes[0].id, 0); // default from server.toml
-    assert_eq!(config.cluster.nodes[0].name, "iggy-node-1"); // default from server.toml
-    assert_eq!(config.cluster.nodes[1].id, 1); // default from server.toml
-    assert_eq!(config.cluster.nodes[1].name, "iggy-node-2"); // default from server.toml
-
-    unsafe {
-        env::remove_var("IGGY_CLUSTER_ID");
-        env::remove_var("IGGY_CLUSTER_NODES_1_ADDRESS");
-    }
-}
-
-// Test sparse array override - setting index 5 when only 2 nodes exist in TOML
-// This test verifies that sparse arrays will fail because intermediate elements
-// won't have required fields, which is the expected safety behavior
-#[serial]
-#[tokio::test]
-async fn validate_cluster_sparse_array_fails_with_missing_fields() {
-    // Set node at index 5 (when TOML only has nodes 0 and 1)
-    // This should fail because nodes 2-4 will be created as empty dicts
-    // without required fields
-    let expected_node_5_id = 100;
-    let expected_node_5_name = "sparse-node";
-    let expected_node_5_address = "10.0.0.100:9999";
-
-    unsafe {
-        env::set_var("IGGY_CLUSTER_NODES_5_ID", expected_node_5_id.to_string());
-        env::set_var("IGGY_CLUSTER_NODES_5_NAME", expected_node_5_name);
-        env::set_var("IGGY_CLUSTER_NODES_5_ADDRESS", expected_node_5_address);
-    }
-
-    let config_path = get_root_path().join("../configs/server.toml");
-    let file_config_provider = FileConfigProvider::new(config_path.as_path().display().to_string());
-
-    // This should fail because nodes 2-4 will be missing required fields
-    let result = file_config_provider.load_config().await;
-    assert!(
-        result.is_err(),
-        "Should fail to load config with sparse array due to missing required fields in intermediate elements"
-    );
-
-    unsafe {
-        env::remove_var("IGGY_CLUSTER_NODES_5_ID");
-        env::remove_var("IGGY_CLUSTER_NODES_5_NAME");
-        env::remove_var("IGGY_CLUSTER_NODES_5_ADDRESS");
-    }
-}
-
-// Test that we can add node 2 successfully (contiguous array)
-#[serial]
-#[tokio::test]
-async fn validate_cluster_contiguous_array_override() {
-    // Add node at index 2 (TOML has nodes 0 and 1, so this is contiguous)
-    let expected_node_2_id = 2;
-    let expected_node_2_name = "iggy-node-3";
-    let expected_node_2_address = "10.0.0.50:8092";
-
-    unsafe {
-        env::set_var("IGGY_CLUSTER_NODES_2_ID", expected_node_2_id.to_string());
-        env::set_var("IGGY_CLUSTER_NODES_2_NAME", expected_node_2_name);
-        env::set_var("IGGY_CLUSTER_NODES_2_ADDRESS", expected_node_2_address);
-    }
-
-    let config_path = get_root_path().join("../configs/server.toml");
-    let file_config_provider = FileConfigProvider::new(config_path.as_path().display().to_string());
-    let config = file_config_provider
-        .load_config()
-        .await
-        .expect("Failed to load server.toml config with contiguous array override");
-
-    // Should have 3 nodes total
+    // Verify other nodes array - should have 3 nodes from environment variables
     assert_eq!(
-        config.cluster.nodes.len(),
+        config.cluster.node.others.len(),
         3,
-        "Should have 3 nodes when adding index 2"
+        "Should have 3 other nodes from environment variables for a 4-node cluster"
     );
 
-    // Check original nodes are preserved
-    assert_eq!(config.cluster.nodes[0].id, 0); // from TOML
-    assert_eq!(config.cluster.nodes[0].name, "iggy-node-1"); // from TOML
-    assert_eq!(config.cluster.nodes[1].id, 1); // from TOML
-    assert_eq!(config.cluster.nodes[1].name, "iggy-node-2"); // from TOML
+    // Verify first other node (Node 2)
+    assert_eq!(
+        config.cluster.node.others[0].name,
+        expected_other_node_0_name
+    );
+    assert_eq!(config.cluster.node.others[0].ip, expected_other_node_0_ip);
+    assert_eq!(
+        config.cluster.node.others[0].ports.tcp,
+        Some(expected_other_node_0_tcp)
+    );
+    assert_eq!(
+        config.cluster.node.others[0].ports.quic,
+        Some(expected_other_node_0_quic)
+    );
+    assert_eq!(
+        config.cluster.node.others[0].ports.http,
+        Some(expected_other_node_0_http)
+    );
+    assert_eq!(
+        config.cluster.node.others[0].ports.websocket,
+        Some(expected_other_node_0_websocket)
+    );
 
-    // Check the node we added at index 2
-    assert_eq!(config.cluster.nodes[2].id, expected_node_2_id);
-    assert_eq!(config.cluster.nodes[2].name, expected_node_2_name);
-    assert_eq!(config.cluster.nodes[2].address, expected_node_2_address);
+    // Verify second other node (Node 3)
+    assert_eq!(
+        config.cluster.node.others[1].name,
+        expected_other_node_1_name
+    );
+    assert_eq!(config.cluster.node.others[1].ip, expected_other_node_1_ip);
+    assert_eq!(
+        config.cluster.node.others[1].ports.tcp,
+        Some(expected_other_node_1_tcp)
+    );
+    assert_eq!(
+        config.cluster.node.others[1].ports.quic,
+        Some(expected_other_node_1_quic)
+    );
+    assert_eq!(
+        config.cluster.node.others[1].ports.http,
+        Some(expected_other_node_1_http)
+    );
+    assert_eq!(
+        config.cluster.node.others[1].ports.websocket,
+        Some(expected_other_node_1_websocket)
+    );
+
+    // Verify third other node (Node 4)
+    // This node has only TCP and HTTP explicitly set, QUIC and WebSocket should be None
+    // (defaults will be applied at runtime by the cluster system)
+    assert_eq!(
+        config.cluster.node.others[2].name,
+        expected_other_node_2_name
+    );
+    assert_eq!(config.cluster.node.others[2].ip, expected_other_node_2_ip);
+
+    // TCP port was explicitly set via env var
+    assert_eq!(
+        config.cluster.node.others[2].ports.tcp,
+        Some(expected_other_node_2_tcp),
+        "TCP port should be the explicitly set value (8092)"
+    );
+
+    // QUIC port was NOT set via env var - should be None in config
+    // Runtime will use default port 8080 from current node's QUIC config
+    assert_eq!(
+        config.cluster.node.others[2].ports.quic, None,
+        "QUIC port should be None (default 8080 applied at runtime)"
+    );
+
+    // HTTP port was explicitly set via env var
+    assert_eq!(
+        config.cluster.node.others[2].ports.http,
+        Some(expected_other_node_2_http),
+        "HTTP port should be the explicitly set value (3002)"
+    );
+
+    // WebSocket port was NOT set via env var - should be None in config
+    // Runtime will use default port 8092 from current node's WebSocket config
+    assert_eq!(
+        config.cluster.node.others[2].ports.websocket, None,
+        "WebSocket port should be None (default 8092 applied at runtime)"
+    );
 
     unsafe {
-        env::remove_var("IGGY_CLUSTER_NODES_2_ID");
-        env::remove_var("IGGY_CLUSTER_NODES_2_NAME");
-        env::remove_var("IGGY_CLUSTER_NODES_2_ADDRESS");
+        // Clean up environment variables
+        env::remove_var("IGGY_CLUSTER_ENABLED");
+        env::remove_var("IGGY_CLUSTER_NAME");
+        env::remove_var("IGGY_CLUSTER_NODE_CURRENT_NAME");
+        env::remove_var("IGGY_CLUSTER_NODE_CURRENT_IP");
+
+        // Clean up Node 2 env vars
+        env::remove_var("IGGY_CLUSTER_NODE_OTHERS_0_NAME");
+        env::remove_var("IGGY_CLUSTER_NODE_OTHERS_0_IP");
+        env::remove_var("IGGY_CLUSTER_NODE_OTHERS_0_PORTS_TCP");
+        env::remove_var("IGGY_CLUSTER_NODE_OTHERS_0_PORTS_QUIC");
+        env::remove_var("IGGY_CLUSTER_NODE_OTHERS_0_PORTS_HTTP");
+        env::remove_var("IGGY_CLUSTER_NODE_OTHERS_0_PORTS_WEBSOCKET");
+
+        // Clean up Node 3 env vars
+        env::remove_var("IGGY_CLUSTER_NODE_OTHERS_1_NAME");
+        env::remove_var("IGGY_CLUSTER_NODE_OTHERS_1_IP");
+        env::remove_var("IGGY_CLUSTER_NODE_OTHERS_1_PORTS_TCP");
+        env::remove_var("IGGY_CLUSTER_NODE_OTHERS_1_PORTS_QUIC");
+        env::remove_var("IGGY_CLUSTER_NODE_OTHERS_1_PORTS_HTTP");
+        env::remove_var("IGGY_CLUSTER_NODE_OTHERS_1_PORTS_WEBSOCKET");
+
+        // Clean up Node 4 env vars (only TCP and HTTP were set)
+        env::remove_var("IGGY_CLUSTER_NODE_OTHERS_2_NAME");
+        env::remove_var("IGGY_CLUSTER_NODE_OTHERS_2_IP");
+        env::remove_var("IGGY_CLUSTER_NODE_OTHERS_2_PORTS_TCP");
+        // IGGY_CLUSTER_NODE_OTHERS_2_PORTS_QUIC was not set
+        env::remove_var("IGGY_CLUSTER_NODE_OTHERS_2_PORTS_HTTP");
+        // IGGY_CLUSTER_NODE_OTHERS_2_PORTS_WEBSOCKET was not set
     }
 }

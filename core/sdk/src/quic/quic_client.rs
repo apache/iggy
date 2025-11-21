@@ -29,7 +29,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use iggy_common::{
     ClientState, Command, ConnectionString, ConnectionStringUtils, Credentials, DiagnosticEvent,
-    IggyErrorDiscriminants, QuicConnectionStringOptions, TransportProtocol,
+    QuicConnectionStringOptions, TransportProtocol,
 };
 use quinn::crypto::rustls::QuicClientConfig as QuinnQuicClientConfig;
 use quinn::{ClientConfig, Connection, Endpoint, IdleTimeout, RecvStream, VarInt};
@@ -239,20 +239,11 @@ impl QuicClient {
                 .map_err(|_| IggyError::InvalidNumberEncoding)?,
         );
         if status != 0 {
-            // Log FeatureUnavailable as debug instead of error (e.g., when clustering is disabled)
-            if status == IggyErrorDiscriminants::FeatureUnavailable as u32 {
-                tracing::debug!(
-                    "Feature unavailable on server: {} ({})",
-                    status,
-                    IggyError::from_code_as_string(status)
-                );
-            } else {
-                error!(
-                    "Received an invalid response with status: {} ({}).",
-                    status,
-                    IggyError::from_code_as_string(status)
-                );
-            }
+            error!(
+                "Received an invalid response with status: {} ({}).",
+                status,
+                IggyError::from_code_as_string(status)
+            );
 
             return Err(IggyError::from_code(status));
         }
@@ -424,7 +415,12 @@ impl QuicClient {
     /// Returns true if redirection occurred and reconnection is needed.
     pub(crate) async fn handle_leader_redirection(&self) -> Result<bool, IggyError> {
         let current_address = self.current_server_address.lock().await.clone();
-        let leader_address = check_and_redirect_to_leader(self, &current_address).await?;
+        let leader_address = check_and_redirect_to_leader(
+            self,
+            &current_address,
+            iggy_common::TransportProtocol::Quic,
+        )
+        .await?;
 
         if let Some(new_leader_address) = leader_address {
             let mut redirection_state = self.leader_redirection_state.lock().await;

@@ -816,12 +816,6 @@ internal static class BinaryMapper
         var clusterName = Encoding.UTF8.GetString(payload[4..(4 + (int)nameLength)]);
         var position = 4 + (int)nameLength;
 
-        var clusterId = BinaryPrimitives.ReadUInt32LittleEndian(payload[position..(position + 4)]);
-        position += 4;
-
-        var protocol = (Protocol)payload[position];
-        position += 1;
-
         var nodesCount = BinaryPrimitives.ReadUInt32LittleEndian(payload[position..(position + 4)]);
         position += 4;
 
@@ -835,38 +829,54 @@ internal static class BinaryMapper
 
         return new ClusterMetadata
         {
-            Id = clusterId,
             Name = clusterName,
-            Transport = protocol,
             Nodes = nodes
         };
     }
 
     private static ClusterNode MapClusterNode(ReadOnlySpan<byte> payload)
     {
-        var id = BinaryPrimitives.ReadUInt32LittleEndian(payload[..4]);
-        var position = 4;
+        var position = 0;
 
+        // Read name
         var nameLength = BinaryPrimitives.ReadUInt32LittleEndian(payload[position..(position + 4)]);
         position += 4;
 
         var name = Encoding.UTF8.GetString(payload[position..(position + (int)nameLength)]);
         position += (int)nameLength;
 
-        var addressLength = BinaryPrimitives.ReadUInt32LittleEndian(payload[position..(position + 4)]);
+        // Read IP
+        var ipLength = BinaryPrimitives.ReadUInt32LittleEndian(payload[position..(position + 4)]);
         position += 4;
 
-        var address = Encoding.UTF8.GetString(payload[position..(position + (int)addressLength)]);
-        position += (int)addressLength;
+        var ip = Encoding.UTF8.GetString(payload[position..(position + (int)ipLength)]);
+        position += (int)ipLength;
 
+        // Read transport endpoints (4 ports, each 2 bytes)
+        var tcp = BinaryPrimitives.ReadUInt16LittleEndian(payload[position..(position + 2)]);
+        position += 2;
+        var quic = BinaryPrimitives.ReadUInt16LittleEndian(payload[position..(position + 2)]);
+        position += 2;
+        var http = BinaryPrimitives.ReadUInt16LittleEndian(payload[position..(position + 2)]);
+        position += 2;
+        var webSocket = BinaryPrimitives.ReadUInt16LittleEndian(payload[position..(position + 2)]);
+        position += 2;
+
+        // Read role and status
         var role = (ClusterNodeRole)payload[position++];
         var status = (ClusterNodeStatus)payload[position];
 
         return new ClusterNode
         {
-            Id = id,
             Name = name,
-            Address = address,
+            Ip = ip,
+            Endpoints = new TransportEndpoints
+            {
+                Tcp = tcp,
+                Quic = quic,
+                Http = http,
+                WebSocket = webSocket
+            },
             Role = role,
             Status = status
         };

@@ -36,10 +36,21 @@ async fn given_cluster_config(world: &mut LeaderContext, node_count: usize) {
 
 #[given(regex = r"^node (\d+) is configured on port (\d+)$")]
 async fn given_node_configured(world: &mut LeaderContext, node_id: u32, port: u16) {
+    let (quic_port, http_port, ws_port) = match port {
+        8091 => (8081, 3001, 8071),               // Leader ports
+        8092 => (8082, 3002, 8072),               // Follower ports
+        _ => (port - 10, port - 5090, port - 20), // Default mapping
+    };
+
     let node = ClusterNode {
-        id: node_id,
         name: format!("node-{}", node_id),
-        address: format!("iggy-server:{}", port),
+        ip: "iggy-server".to_string(),
+        endpoints: TransportEndpoints::new(
+            port,      // TCP port
+            quic_port, // QUIC port
+            http_port, // HTTP port
+            ws_port,   // WebSocket port
+        ),
         role: ClusterNodeRole::Follower,
         status: ClusterNodeStatus::Healthy,
     };
@@ -196,7 +207,7 @@ async fn then_verify_client_port(world: &mut LeaderContext, expected_port: u16) 
     // Check cluster metadata if available
     if let Ok(Some(leader)) = cluster::verify_leader_in_metadata(client).await {
         // If we found a leader and we're connected to the leader port, mark redirection
-        if cluster::extract_port_from_address(&leader.address) == Some(expected_port) {
+        if leader.endpoints.tcp == expected_port {
             world.test_state.redirection_occurred = true;
         }
     }
@@ -223,8 +234,8 @@ async fn then_verify_named_client_port(
 
     if let Ok(Some(leader)) = cluster::verify_leader_in_metadata(client).await {
         assert!(
-            cluster::extract_port_from_address(&leader.address).is_some(),
-            "Client {} should find valid leader in cluster metadata",
+            leader.endpoints.tcp > 0,
+            "Client {} should find valid leader TCP port in cluster metadata",
             client_name
         );
     }
@@ -298,7 +309,8 @@ async fn then_both_use_same_server(world: &mut LeaderContext) {
         cluster::verify_leader_in_metadata(client_b).await,
     ) {
         assert_eq!(
-            leader_a.address, leader_b.address,
+            format!("{}:{}", leader_a.ip, leader_a.endpoints.tcp),
+            format!("{}:{}", leader_b.ip, leader_b.endpoints.tcp),
             "Both clients should see the same leader"
         );
     }
