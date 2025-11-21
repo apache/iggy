@@ -17,15 +17,10 @@
  * under the License.
  */
 
-import org.gradle.external.javadoc.StandardJavadocDocletOptions
-
 plugins {
     application
     id("com.github.johnrengelman.shadow") version "8.1.1"
 }
-
-group = "org.apache.iggy"
-version = "0.6.0-SNAPSHOT"
 
 repositories {
     mavenCentral()
@@ -50,16 +45,17 @@ dependencies {
     runtimeOnly("org.apache.flink:flink-clients:${flinkVersion}")
 
     // Jackson for JSON serialization in model classes
-    implementation("com.fasterxml.jackson.core:jackson-databind:2.18.0")
-    implementation("com.fasterxml.jackson.datatype:jackson-datatype-jsr310:2.18.0")
+    implementation("com.fasterxml.jackson.core:jackson-databind:2.20.1")
+    implementation("com.fasterxml.jackson.datatype:jackson-datatype-jsr310:2.20.1")
 
     // Include in fat jar for standalone execution
     implementation("org.slf4j:slf4j-simple:2.0.16")
     implementation("com.typesafe:config:1.4.3")
 
     // Testing
-    testImplementation("org.junit.jupiter:junit-jupiter:5.11.3")
-    testImplementation("org.assertj:assertj-core:3.26.3")
+    testImplementation("org.junit.jupiter:junit-jupiter:5.14.1")
+    testImplementation("org.assertj:assertj-core:3.27.6")
+    testRuntimeOnly("org.junit.platform:junit-platform-launcher")
     testRuntimeOnly("org.slf4j:slf4j-simple:2.0.16")
 }
 
