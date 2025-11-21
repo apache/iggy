@@ -44,9 +44,7 @@ pub struct PrepareOk;
 
 impl Consensus for VsrConsensus {
     type RequestMessage = Request;
-
     type ReplicateMessage = Prepare;
-
     type AckMessage = PrepareOk;
 
     fn pipeline_message(&self, _message: Self::ReplicateMessage) {

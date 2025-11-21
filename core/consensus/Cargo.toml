@@ -29,6 +29,5 @@ repository = "https://github.com/apache/iggy"
 readme = "../../../README.md"
 
 [dependencies]
-clock = { path = "../clock" }
 
 

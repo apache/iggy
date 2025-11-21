@@ -1960,9 +1960,6 @@ dependencies = [
 [[package]]
 name = "consensus"
 version = "0.1.0"
-dependencies = [
- "clock",
-]
 
 [[package]]
 name = "console"
@@ -5811,7 +5808,6 @@ checksum = "f52b00d39961fc5b2736ea853c9cc86238e165017a493d1d5c8eac6bdc4cc273"
 name = "metadata"
 version = "0.1.0"
 dependencies = [
- "clock",
  "consensus",
  "tracing",
 ]
