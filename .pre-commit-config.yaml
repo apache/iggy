@@ -1,0 +1,120 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+default_stages: [pre-commit]
+default_install_hook_types: [pre-commit, pre-push]
+
+repos:
+  # Standard pre-commit hooks
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-yaml
+      - id: mixed-line-ending
+
+  # CI scripts
+  - repo: local
+    hooks:
+      - id: markdownlint
+        name: markdownlint
+        entry: ./scripts/ci/markdownlint.sh
+        args: ["--fix", "--staged"]
+        language: system
+        types: [markdown]
+        pass_filenames: false
+
+      - id: shellcheck
+        name: shellcheck
+        entry: ./scripts/ci/shellcheck.sh
+        args: ["--fix", "--staged"]
+        language: system
+        types: [shell]
+        pass_filenames: false
+
+      - id: license-headers
+        name: license headers
+        entry: ./scripts/ci/license-headers.sh
+        args: ["--fix"]
+        language: system
+        pass_filenames: false
+
+      - id: licenses-list
+        name: licenses list
+        entry: ./scripts/ci/licenses-list.sh
+        args: ["--fix"]
+        language: system
+        files: ^Cargo\.lock$
+        pass_filenames: false
+
+      - id: rust-version-sync
+        name: rust version sync
+        entry: ./scripts/ci/sync-rust-version.sh
+        args: ["--fix"]
+        language: system
+        files: ^rust-toolchain\.toml$
+        pass_filenames: false
+
+      - id: trailing-whitespace
+        name: trailing whitespace
+        entry: ./scripts/ci/trailing-whitespace.sh
+        args: ["--fix", "--staged"]
+        language: system
+        types: [text]
+        pass_filenames: false
+
+      - id: trailing-newline
+        name: trailing newline
+        entry: ./scripts/ci/trailing-newline.sh
+        args: ["--fix", "--staged"]
+        language: system
+        types: [text]
+        pass_filenames: false
+
+  # Rust
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: cargo fmt --all
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      - id: cargo-clippy
+        name: cargo clippy
+        entry: cargo clippy
+        args:
+          [
+            "--all-features",
+            "--all-targets",
+            "--manifest-path",
+            "Cargo.toml",
+            "--",
+            "-D",
+            "warnings",
+          ]
+        language: system
+        types: [rust]
+        pass_filenames: false
+        stages: [pre-push]
+
+        # TODO(hubcio): add fast checks, linters, formatters for other languages
+        # - python (maturin, pytest, ruff, black)
+        # - java
+        # - go
+        # - csharp
+        # - js

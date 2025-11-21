@@ -107,7 +107,7 @@ case "$COMMAND" in
         # Iterate through all saved files
         find "$TMP_SAVED" -type f | while read -r saved_file; do
             # Get relative path by removing the tmp prefix
-            rel_path="${saved_file#$TMP_SAVED/}"
+            rel_path="${saved_file#"$TMP_SAVED"/}"
             dest_dir=$(dirname "$rel_path")
 
             # Create destination directory if it doesn't exist

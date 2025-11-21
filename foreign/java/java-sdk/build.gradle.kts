@@ -20,11 +20,7 @@
 plugins {
     id("java-library")
     id("maven-publish")
-    id("signing")
 }
-
-group = "org.apache.iggy"
-version = "0.6.0-SNAPSHOT"
 
 repositories {
     mavenCentral()
@@ -39,29 +35,23 @@ java {
     withSourcesJar()
 }
 
-signing {
-    val signingKey: String? by project
-    val signingPassword: String? by project
-    useInMemoryPgpKeys(signingKey, signingPassword)
-    sign(publishing.publications)
-}
-
 dependencies {
-    implementation("org.apache.httpcomponents.client5:httpclient5:5.4.3")
-    implementation("com.fasterxml.jackson.core:jackson-databind:2.18.0")
-    implementation("com.fasterxml.jackson.datatype:jackson-datatype-jdk8:2.18.0")
-    implementation("org.apache.commons:commons-lang3:3.18.0")
-    implementation("org.slf4j:slf4j-api:2.0.16")
-    implementation("com.google.code.findbugs:jsr305:3.0.2")
-    implementation("io.projectreactor:reactor-core:3.6.11")
-    implementation("io.projectreactor.netty:reactor-netty-core:1.1.23")
-    testImplementation("org.testcontainers:testcontainers:1.20.3")
-    testImplementation("org.testcontainers:junit-jupiter:1.20.3")
-    testImplementation(platform("org.junit:junit-bom:5.11.3"))
+    implementation("org.apache.httpcomponents.client5:httpclient5:5.5.1")
+    implementation("com.fasterxml.jackson.core:jackson-databind:2.20.1")
+    implementation("com.fasterxml.jackson.datatype:jackson-datatype-jdk8:2.20.1")
+    implementation("org.apache.commons:commons-lang3:3.20.0")
+    implementation("org.slf4j:slf4j-api:2.0.17")
+    implementation("com.github.spotbugs:spotbugs-annotations:4.9.8")
+    implementation("io.projectreactor:reactor-core:3.8.0")
+    implementation("io.projectreactor.netty:reactor-netty-core:1.3.0")
+    testImplementation("org.testcontainers:testcontainers:1.21.3")
+    testImplementation("org.testcontainers:junit-jupiter:1.21.3")
+    testImplementation(platform("org.junit:junit-bom:5.14.1"))
     testImplementation("org.junit.jupiter:junit-jupiter")
-    testImplementation("org.assertj:assertj-core:3.26.3")
-    testRuntimeOnly("ch.qos.logback:logback-classic:1.5.11")
-    testRuntimeOnly("io.netty:netty-resolver-dns-native-macos:4.2.1.Final:osx-aarch_64")
+    testImplementation("org.assertj:assertj-core:3.27.6")
+    testRuntimeOnly("org.junit.platform:junit-platform-launcher")
+    testRuntimeOnly("ch.qos.logback:logback-classic:1.5.21")
+    testRuntimeOnly("io.netty:netty-resolver-dns-native-macos:4.2.7.Final:osx-aarch_64")
 }
 
 tasks.withType<Test> {
@@ -70,47 +60,13 @@ tasks.withType<Test> {
 
 publishing {
     publications {
-        create<MavenPublication>("maven") {
-            from(components["java"])
-
+        named<MavenPublication>("maven") {
             pom {
                 name = "Apache Iggy Java Client SDK"
                 description = "Official Java client SDK for Apache Iggy.\n" +
                         "Apache Iggy (Incubating) is an effort undergoing incubation at the Apache Software Foundation (ASF), " +
                         "sponsored by the Apache Incubator PMC."
-                url = "https://github.com/apache/iggy"
                 packaging = "jar"
-                licenses {
-                    license {
-                        name = "Apache License, Version 2.0"
-                        url = "https://www.apache.org/licenses/LICENSE-2.0.txt"
-                    }
-                }
-                developers {
-                    developer {
-                        name = "Apache Iggy"
-                        email = "dev@iggy.apache.org"
-                    }
-                    scm {
-                        url = "https://github.com/apache/iggy"
-                        connection = "scm:git:git://github.com/apache/iggy.git"
-                        developerConnection = "scm:git:git://github.com/apache/iggy.git"
-                    }
-                }
-            }
-        }
-    }
-
-    repositories {
-        maven {
-            val releasesRepoUrl = "https://repository.apache.org/service/local/staging/deploy/maven2"
-            val snapshotsRepoUrl = "https://repository.apache.org/content/repositories/snapshots/"
-
-            url = uri(if ((version as String).endsWith("SNAPSHOT")) snapshotsRepoUrl else releasesRepoUrl)
-
-            credentials {
-                username = System.getenv("NEXUS_USER")
-                password = System.getenv("NEXUS_PW")
             }
         }
     }
