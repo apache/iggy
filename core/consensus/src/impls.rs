@@ -15,4 +15,49 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::{Consensus, Project};
+
 pub struct VsrConsensus;
+
+#[derive(Clone)]
+pub struct Request;
+
+impl Project<Prepare> for Request {
+    type Consensus = VsrConsensus;
+    fn project(self, _consensus: &Self::Consensus) -> Prepare {
+        Prepare
+    }
+}
+
+#[derive(Clone)]
+pub struct Prepare;
+
+impl Project<PrepareOk> for Prepare {
+    type Consensus = VsrConsensus;
+    fn project(self, _consensus: &Self::Consensus) -> PrepareOk {
+        PrepareOk
+    }
+}
+
+#[derive(Clone)]
+pub struct PrepareOk;
+
+impl Consensus for VsrConsensus {
+    type RequestMessage = Request;
+
+    type ReplicateMessage = Prepare;
+
+    type AckMessage = PrepareOk;
+
+    fn pipeline_message(&self, _message: Self::ReplicateMessage) {
+        todo!()
+    }
+
+    fn verify_pipeline(&self) {
+        todo!()
+    }
+
+    fn post_replicate_verify(&self, _message: &Self::ReplicateMessage) {
+        todo!()
+    }
+}
