@@ -58,40 +58,35 @@ async function consumeMessages(client: Client): Promise<void> {
   let consumedBatches = 0;
 
   while (consumedBatches < BATCHES_LIMIT) {
-    try {
-      log('Polling for messages...');
-      const polledMessages = await client.message.poll({
-        streamId: STREAM_ID,
-        topicId: TOPIC_ID,
-        consumer: Consumer.Single,
-        partitionId: PARTITION_ID,
-        pollingStrategy: PollingStrategy.Offset(BigInt(offset)),
-        count: MESSAGES_PER_BATCH,
-        autocommit: false
-      });
+    log('Polling for messages...');
+    const polledMessages = await client.message.poll({
+      streamId: STREAM_ID,
+      topicId: TOPIC_ID,
+      consumer: Consumer.Single,
+      partitionId: PARTITION_ID,
+      pollingStrategy: PollingStrategy.Offset(BigInt(offset)),
+      count: MESSAGES_PER_BATCH,
+      autocommit: false
+    });
 
-      if (!polledMessages || polledMessages.messages.length === 0) {
-        log('No messages found in current poll - this is expected if the producer had issues sending messages');
-        consumedBatches++; // Increment even when no messages found
-        log('Completed poll attempt %d (no messages).', consumedBatches);
-        await new Promise(resolve => setTimeout(resolve, interval));
-        continue;
-      }
-
-      offset += polledMessages.messages.length;
-      
-      for (const message of polledMessages.messages) {
-        handleMessage(message);
-      }
-      
+    if (!polledMessages || polledMessages.messages.length === 0) {
+      log('No messages found in current poll');
       consumedBatches++;
-      log('Consumed %d message(s) in batch %d.', polledMessages.messages.length, consumedBatches);
-      
+      log('Completed poll attempt %d (no messages).', consumedBatches);
       await new Promise(resolve => setTimeout(resolve, interval));
-    } catch (error) {
-      log('Error consuming messages: %o', error);
-      throw error;
+      continue;
     }
+
+    offset += polledMessages.messages.length;
+    
+    for (const message of polledMessages.messages) {
+      handleMessage(message);
+    }
+    
+    consumedBatches++;
+    log('Consumed %d message(s) in batch %d.', polledMessages.messages.length, consumedBatches);
+    
+    await new Promise(resolve => setTimeout(resolve, interval));
   }
 
   log('Consumed %d batches of messages, exiting.', consumedBatches);
@@ -121,23 +116,18 @@ async function main(): Promise<void> {
     credentials: { username: 'iggy', password: 'iggy' }
   });
 
-  try {
-    log('Connecting to Iggy server...');
-    // Client connects automatically when first command is called
-    log('Connected successfully.');
+  log('Connecting to Iggy server...');
+  // Client connects automatically when first command is called
+  log('Connected successfully.');
 
-    log('Logging in user...');
-    await client.session.login({ username: 'iggy', password: 'iggy' });
-    log('Logged in successfully.');
+  log('Logging in user...');
+  await client.session.login({ username: 'iggy', password: 'iggy' });
+  log('Logged in successfully.');
 
-    await consumeMessages(client);
-  } catch (error) {
-    log('Error in main: %o', error);
-    process.exitCode = 1;
-  } finally {
-    await client.destroy();
-    log('Disconnected from server.');
-  }
+  await consumeMessages(client);
+  
+  await client.destroy();
+  log('Disconnected from server.');
 }
 
 
@@ -147,12 +137,8 @@ process.on('unhandledRejection', (reason, promise) => {
 });
 
 if (import.meta.url === `file://${process.argv[1]}`) {
-  void (async () => {
-    try {
-      await main();
-    } catch (error) {
-      log('Main function error: %o', error);
-      process.exit(1);
-    }
-  })();
+  main().catch((error) => {
+    log('Error: %o', error);
+    process.exit(1);
+  });
 }

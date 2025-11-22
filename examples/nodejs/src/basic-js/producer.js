@@ -41,16 +41,21 @@ function parseArgs() {
 }
 
 async function initSystem(client) {
+  log('Creating stream with ID %d...', STREAM_ID);
   try {
-    log('Creating stream with ID %d...', STREAM_ID);
     await client.stream.create({ streamId: STREAM_ID, name: 'sample-stream' });
     log('Stream was created successfully.');
   } catch (error) {
-    log('Stream already exists or error creating stream: %o', error);
+    // Error code 1012 means stream already exists - this is expected when rerunning examples
+    if (error?.error?.code === 1012 || error?.message?.includes('already exists')) {
+      log('Stream already exists, continuing...');
+    } else {
+      throw error;
+    }
   }
 
+  log('Creating topic with ID %d in stream %d...', TOPIC_ID, STREAM_ID);
   try {
-    log('Creating topic with ID %d in stream %d...', TOPIC_ID, STREAM_ID);
     await client.topic.create({
       streamId: STREAM_ID,
       topicId: TOPIC_ID,
@@ -61,10 +66,13 @@ async function initSystem(client) {
     });
     log('Topic was created successfully.');
   } catch (error) {
-    log('Topic already exists or error creating topic: %o', error);
+    // Error code 1013 means topic already exists - this is expected when rerunning examples
+    if (error?.error?.code === 1013 || error?.message?.includes('already exists')) {
+      log('Topic already exists, continuing...');
+    } else {
+      throw error;
+    }
   }
-
-  // Server ACK confirms creation; no extra wait needed
 }
 
 async function produceMessages(client) {
@@ -102,15 +110,20 @@ async function produceMessages(client) {
       });
       log('Sent messages: %o', sentMessages);
     } catch (error) {
-      log('Error sending messages: %o', error);
-      log('This might be due to server version compatibility. The stream and topic creation worked successfully.');
-      log('Please check the Iggy server version and ensure it supports the SendMessages command.');
-      // Don't throw error, just log and continue to show that other parts work
-      log('Simulated sending messages: %o', sentMessages);
-    } finally {
-      sentBatches++;
-      await new Promise(resolve => setTimeout(resolve, interval));
+      // Error code 3 means invalid command - this is a known server compatibility issue
+      if (error?.error?.code === 3 || error?.message?.includes('Invalid command')) {
+        log('Error sending messages: %o', error);
+        log('This might be due to server version compatibility. The stream and topic creation worked successfully.');
+        log('Please check the Iggy server version and ensure it supports the SendMessages command.');
+        // Don't throw error, just log and continue to show that other parts work
+        log('Simulated sending messages: %o', sentMessages);
+      } else {
+        throw error;
+      }
     }
+    
+    sentBatches++;
+    await new Promise(resolve => setTimeout(resolve, interval));
   }
 
   log('Sent %d batches of messages, exiting.', sentBatches);
@@ -134,22 +147,17 @@ async function main() {
     credentials: { username, password }
   });
 
-  try {
-    log('Basic producer has started, selected transport: TCP');
-    log('Connecting to Iggy server...');
-    // Client connects automatically when first command is called
-    log('Connected successfully.');
-    // Login will be handled automatically by the client on first command
+  log('Basic producer has started, selected transport: TCP');
+  log('Connecting to Iggy server...');
+  // Client connects automatically when first command is called
+  log('Connected successfully.');
+  // Login will be handled automatically by the client on first command
 
-    await initSystem(client);
-    await produceMessages(client);
-  } catch (error) {
-    log('Error in main: %o', error);
-    process.exitCode = 1;
-  } finally {
-    await client.destroy();
-    log('Disconnected from server.');
-  }
+  await initSystem(client);
+  await produceMessages(client);
+  
+  await client.destroy();
+  log('Disconnected from server.');
 }
 
 
@@ -158,11 +166,7 @@ process.on('unhandledRejection', (reason, promise) => {
   process.exitCode = 1;
 });
 
-void (async () => {
-  try {
-    await main();
-  } catch (error) {
-    log('Main function error: %o', error);
-    process.exit(1);
-  }
-})();
+main().catch((error) => {
+  log('Error: %o', error);
+  process.exit(1);
+});
