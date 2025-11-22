@@ -30,4 +30,4 @@ readme = "../../../README.md"
 
 [dependencies]
 consensus = { path = "../consensus" }
-
+tracing = { workspace = true }

@@ -17,8 +17,8 @@
  */
 
 use iggy::prelude::{Client, DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME, IggyClient};
-use iggy_binary_protocol::{StreamClient, TopicClient, UserClient};
-use iggy_common::{CompressionAlgorithm, IggyExpiry, MaxTopicSize};
+use iggy_binary_protocol::{MessageClient, StreamClient, TopicClient, UserClient};
+use iggy_common::{CompressionAlgorithm, IggyExpiry, MaxTopicSize, PolledMessages};
 use integration::{
     tcp_client::TcpClientFactory,
     test_connectors_runtime::TestConnectorsRuntime,
@@ -27,6 +27,7 @@ use integration::{
 use std::collections::HashMap;
 
 mod postgres;
+mod random;
 
 const DEFAULT_TEST_STREAM: &str = "test_stream";
 const DEFAULT_TEST_TOPIC: &str = "test_topic";
@@ -34,18 +35,46 @@ const DEFAULT_TEST_TOPIC: &str = "test_topic";
 fn setup_runtime() -> ConnectorsRuntime {
     let mut iggy_envs = HashMap::new();
     iggy_envs.insert("IGGY_QUIC_ENABLED".to_owned(), "false".to_owned());
+    iggy_envs.insert("IGGY_WEBSOCKET_ENABLED".to_owned(), "false".to_owned());
     let mut test_server = TestServer::new(Some(iggy_envs), true, None, IpAddrKind::V4);
     test_server.start();
     ConnectorsRuntime {
         iggy_server: test_server,
         connectors_runtime: None,
+        stream: "".to_owned(),
+        topic: "".to_owned(),
     }
 }
 
 #[derive(Debug)]
 struct ConnectorsRuntime {
+    stream: String,
+    topic: String,
     iggy_server: TestServer,
     connectors_runtime: Option<TestConnectorsRuntime>,
+}
+
+#[derive(Debug)]
+struct ConnectorsIggyClient {
+    stream: String,
+    topic: String,
+    client: IggyClient,
+}
+
+impl ConnectorsIggyClient {
+    async fn get_messages(&self) -> Result<PolledMessages, iggy_common::IggyError> {
+        self.client
+            .poll_messages(
+                &self.stream.clone().try_into().unwrap(),
+                &self.topic.clone().try_into().unwrap(),
+                None,
+                &iggy_common::Consumer::new("test_consumer".try_into().unwrap()),
+                &iggy_common::PollingStrategy::next(),
+                10,
+                true,
+            )
+            .await
+    }
 }
 
 #[derive(Debug)]
@@ -87,7 +116,7 @@ impl ConnectorsRuntime {
             }
         }
 
-        let client = self.create_client().await;
+        let client = self.create_iggy_client().await;
         client
             .create_stream(&iggy_setup.stream)
             .await
@@ -118,10 +147,20 @@ impl ConnectorsRuntime {
             TestConnectorsRuntime::with_iggy_address(&iggy_server_address, Some(all_envs));
         connectors_runtime.start();
         connectors_runtime.ensure_started().await;
+        self.stream = self.stream.clone();
+        self.topic = self.topic.clone();
         self.connectors_runtime = Some(connectors_runtime);
     }
 
-    async fn create_client(&self) -> IggyClient {
+    pub async fn create_client(&self) -> ConnectorsIggyClient {
+        ConnectorsIggyClient {
+            stream: DEFAULT_TEST_STREAM.to_owned(),
+            topic: DEFAULT_TEST_TOPIC.to_owned(),
+            client: self.create_iggy_client().await,
+        }
+    }
+
+    async fn create_iggy_client(&self) -> IggyClient {
         let server_addr = self
             .iggy_server
             .get_raw_tcp_addr()

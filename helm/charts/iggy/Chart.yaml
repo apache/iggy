@@ -20,8 +20,8 @@ apiVersion: v2
 name: iggy
 description: A Helm chart for Apache Iggy server and web-ui
 type: application
-version: 0.2.0
-appVersion: "0.5.0"
+version: 0.3.0
+appVersion: "0.6.0"
 sources:
   - https://github.com/apache/iggy
 keywords:

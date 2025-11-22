@@ -60,6 +60,14 @@ components:
     paths:
       - "core/server/**"
 
+  rust-cluster:
+    depends_on:
+      - "rust-workspace"  # Cluster is affected by workspace changes
+      - "ci-infrastructure"  # CI changes trigger full regression
+    paths:
+      - "core/consensus/"
+      - "core/metadata/"
+
   # Main Rust workspace testing
   rust:
     depends_on:
@@ -68,6 +76,7 @@ components:
       - "rust-common"
       - "rust-binary-protocol"
       - "rust-server"
+      - "rust-cluster"
       - "rust-tools"
       - "rust-cli"
       - "rust-bench"
@@ -237,13 +246,15 @@ components:
       - "rust-server"
       - "sdk-go"
       - "sdk-csharp"
+      - "sdk-python"
       - "ci-infrastructure"  # CI changes trigger full regression
     paths:
       - "examples/**"
       - "scripts/run-rust-examples-from-readme.sh"
       - "scripts/run-go-examples-from-readme.sh"
       - "scripts/run-csharp-examples-from-readme.sh"
-    tasks: ["examples-rust", "examples-go", "examples-csharp"]
+      - "scripts/run-python-examples-from-readme.sh"
+    tasks: ["examples-rust", "examples-go", "examples-csharp", "examples-python"]
 
   web-ui:
     paths:

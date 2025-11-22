@@ -1,4 +1,5 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
  * regarding copyright ownership.  The ASF licenses this file
@@ -307,6 +308,10 @@ pub enum Error {
     InvalidTextPayload,
     #[error("Cannot decode schema {0}")]
     CannotDecode(Schema),
+    #[error("Storage error: {0}")]
+    Storage(String),
+    #[error("Serialization error: {0}")]
+    Serialization(String),
     #[error("Invalid protobuf payload.")]
     InvalidProtobufPayload,
     #[error("Cannot open state file")]
@@ -317,4 +322,6 @@ pub enum Error {
     CannotWriteStateFile,
     #[error("Invalid state")]
     InvalidState,
+    #[error("Connection error: {0}")]
+    Connection(String),
 }

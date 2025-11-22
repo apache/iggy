@@ -1,4 +1,5 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
  * regarding copyright ownership.  The ASF licenses this file
@@ -16,8 +17,6 @@
  * under the License.
  */
 
-use std::{str::FromStr, time::Duration};
-
 use async_trait::async_trait;
 use iggy_connector_sdk::{
     ConnectorState, Error, ProducedMessage, ProducedMessages, Schema, Source, source_connector,
@@ -27,6 +26,7 @@ use rand::{
     distr::{Alphanumeric, Uniform},
 };
 use serde::{Deserialize, Serialize};
+use std::{str::FromStr, time::Duration};
 use tokio::{sync::Mutex, time::sleep};
 use tracing::{error, info};
 use uuid::Uuid;

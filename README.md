@@ -26,7 +26,7 @@
 
 ---
 
-**Iggy** is a persistent message streaming platform written in Rust, supporting QUIC, TCP (custom binary specification) and HTTP (regular REST API) transport protocols, **capable of processing millions of messages per second at ultra-low latency**.
+**Iggy** is a persistent message streaming platform written in Rust, supporting QUIC, WebSocket, TCP (custom binary specification) and HTTP (regular REST API) transport protocols, **capable of processing millions of messages per second at ultra-low latency**.
 
 Iggy provides **exceptionally high throughput and performance** while utilizing minimal computing resources.
 
@@ -45,7 +45,7 @@ The name is an abbreviation for the Italian Greyhound - small yet extremely fast
 - **Low latency and predictable resource usage** thanks to the Rust compiled language (no GC) and `io_uring`.
 - **User authentication and authorization** with granular permissions and Personal Access Tokens (PAT)
 - Support for multiple streams, topics and partitions
-- Support for **multiple transport protocols** (QUIC, TCP, HTTP)
+- Support for **multiple transport protocols** (QUIC, WebSocket, TCP, HTTP)
 - Fully operational RESTful API which can be optionally enabled
 - Available client SDK in multiple languages
 - **Thread per core shared nothing design** together with `io_uring` guarantee the best possible performance on modern `Linux` systems.
@@ -63,7 +63,7 @@ The name is an abbreviation for the Italian Greyhound - small yet extremely fast
 - **Message expiry** with auto deletion based on the configurable **retention policy**
 - Additional features such as **server side message deduplication**
 - **Multi-tenant** support via abstraction of **streams** which group **topics**
-- **TLS** support for all transport protocols (TCP, QUIC, HTTPS)
+- **TLS** support for all transport protocols (TCP, WebSocket, QUIC, HTTPS)
 - **[Connectors](https://github.com/apache/iggy/tree/master/core/connectors)** - sinks, sources and data transformations based on the **custom Rust plugins**
 - **[Model Context Protocol](https://github.com/apache/iggy/tree/master/core/ai/mcp)** - provide context to LLM with **MCP server**
 - Optional server-side as well as client-side **data encryption** using AES-256-GCM
@@ -137,14 +137,16 @@ There's a dedicated Web UI for the server, which allows managing the streams, to
 The highly performant and modular **[runtime](https://github.com/apache/iggy/tree/master/core/connectors)** for statically typed, yet dynamically loaded connectors. Ingest the data from the external sources and push it further to the Iggy streams, or fetch the data from the Iggy streams and push it further to the external sources. **Create your own Rust plugins** by simply implementing either the `Source` or `Sink` trait and **build custom pipelines for the data processing**.
 
 ```toml
-## Configure a sink or source connector, depending on your needs
-[sinks.quickwit]
+## Configure a sink or source connector, depending on your needs in its own config file.
+type = "sink"
+key = "quickwit"
 enabled = true
+version = 0
 name = "Quickwit sink"
 path = "target/release/libiggy_connector_quickwit_sink"
-config_format = "yaml"
+plugin_config_format = "yaml"
 
-[[sinks.quickwit.streams]]
+[[streams]]
 stream = "qw"
 topics = ["records"]
 schema = "json"
@@ -152,11 +154,18 @@ batch_length = 1000
 poll_interval = "5ms"
 consumer_group = "qw_sink_connector"
 
-[[sinks.quickwit.transforms.add_fields.fields]]
-key = "random_id"
-value.computed = "uuid_v7"
+[transforms.add_fields]
+enabled = true
 
-[sinks.quickwit.transforms.delete_fields]
+[[transforms.add_fields.fields]]
+key = "service_name"
+value.static = "qw_connector"
+
+[[transforms.add_fields.fields]]
+key = "timestamp"
+value.computed = "timestamp_millis"
+
+[transforms.delete_fields]
 enabled = true
 fields = ["email", "created_at"]
 ```
@@ -282,7 +291,7 @@ To quickly generate the sample data:
 
 *Please note that all commands below are using `iggy` binary, which is part of release (`cli` sub-crate).*
 
-Create a stream with name `dev` (numerical ID will be assigned by server automatically) using default credentials and `tcp` transport (available transports: `quic`, `tcp`, `http`, default `tcp`):
+Create a stream with name `dev` (numerical ID will be assigned by server automatically) using default credentials and `tcp` transport (available transports: `quic`, `websocket`, `tcp`, `http`, default `tcp`):
 
 `cargo run --bin iggy -- --transport tcp --username <iggy_username> --password <iggy_password> stream create dev`
 
@@ -455,7 +464,7 @@ These benchmarks would start the server with the default configuration, create a
 
 For example, to run the benchmark for the already started server, provide the additional argument `--server-address 0.0.0.0:8090`.
 
- **Iggy is already capable of processing millions of messages per second at the microseconds range for p99+ latency** Depending on the hardware, transport protocol (`quic`, `tcp` or `http`) and payload size (`messages-per-batch * message-size`) you might expect **over 5000 MB/s (e.g. 5M of 1 KB msg/sec) throughput for writes and reads**.
+ **Iggy is already capable of processing millions of messages per second at the microseconds range for p99+ latency** Depending on the hardware, transport protocol (`quic`, `websocket`, `tcp` or `http`) and payload size (`messages-per-batch * message-size`) you might expect **over 5000 MB/s (e.g. 5M of 1 KB msg/sec) throughput for writes and reads**.
 
 Please refer to the mentioned [benchmarking platform](https://benchmarks.iggy.apache.org) where you can browse the results achieved on the different hardware configurations, using the different Iggy server versions.
 

@@ -511,7 +511,7 @@ enabled = false
 
 # Unique cluster identifier (u32).
 # All nodes in the same cluster must share the same cluster id.
-id = 1
+id = 0
 
 # Unique cluster name (string).
 # All nodes in the same cluster must share the same name.
@@ -519,23 +519,23 @@ id = 1
 name = "iggy-cluster"
 
 # Transport protocol used for communication between nodes in the cluster (string).
-# Supported values: "tcp", "quic", "http"
+# Supported values: "tcp", "quic", "ws"
 transport = "tcp"
 
 # Current node configuration
 [cluster.node]
 # This node unique identifier within the cluster (u32).
 # Must be unique across all nodes and match one of the ids in the nodes list.
-id = 1
+id = 0
 
 # All nodes in the cluster.
 [[cluster.nodes]]
-id = 1
+id = 0
 name = "iggy-node-1"
 address = "127.0.0.1:8090"
 
 [[cluster.nodes]]
-id = 2
+id = 1
 name = "iggy-node-2"
 address = "127.0.0.1:8091"
 

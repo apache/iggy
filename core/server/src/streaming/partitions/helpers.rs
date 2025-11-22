@@ -425,6 +425,7 @@ pub fn append_to_journal(
             root.set_should_increment_offset(true);
             offset.store(last_offset, Ordering::Relaxed);
         }
+        log.active_segment_mut().current_position += batch_messages_size;
 
         Ok((journal_messages_count, journal_size))
     }

@@ -29,3 +29,4 @@ mod binary_system_client;
 mod binary_topic_client;
 mod binary_user_client;
 pub mod client_wrapper;
+pub mod connection_info;

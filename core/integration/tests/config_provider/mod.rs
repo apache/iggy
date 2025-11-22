@@ -110,20 +110,20 @@ async fn validate_custom_env_provider() {
 async fn validate_cluster_config_env_override() {
     // Test data for cluster configuration
     let expected_cluster_enabled = true;
-    let expected_cluster_id = 42;
+    let expected_cluster_id = 0;
     let expected_cluster_name = "test-cluster";
-    let expected_node_id = 5;
+    let expected_node_id = 0;
 
     // Test data for cluster nodes array
-    let expected_node_0_id = 10;
+    let expected_node_0_id = 0;
     let expected_node_0_name = "test-node-1";
     let expected_node_0_address = "192.168.1.100:9090";
 
-    let expected_node_1_id = 20;
+    let expected_node_1_id = 1;
     let expected_node_1_name = "test-node-2";
     let expected_node_1_address = "192.168.1.101:9091";
 
-    let expected_node_2_id = 30;
+    let expected_node_2_id = 2;
     let expected_node_2_name = "test-node-3";
     let expected_node_2_address = "192.168.1.102:9092";
 
@@ -230,9 +230,9 @@ async fn validate_cluster_partial_env_override() {
 
     // Verify non-overridden values remain default
     assert_eq!(config.cluster.name, "iggy-cluster"); // default from server.toml
-    assert_eq!(config.cluster.nodes[0].id, 1); // default from server.toml
+    assert_eq!(config.cluster.nodes[0].id, 0); // default from server.toml
     assert_eq!(config.cluster.nodes[0].name, "iggy-node-1"); // default from server.toml
-    assert_eq!(config.cluster.nodes[1].id, 2); // default from server.toml
+    assert_eq!(config.cluster.nodes[1].id, 1); // default from server.toml
     assert_eq!(config.cluster.nodes[1].name, "iggy-node-2"); // default from server.toml
 
     unsafe {
@@ -282,7 +282,7 @@ async fn validate_cluster_sparse_array_fails_with_missing_fields() {
 #[tokio::test]
 async fn validate_cluster_contiguous_array_override() {
     // Add node at index 2 (TOML has nodes 0 and 1, so this is contiguous)
-    let expected_node_2_id = 50;
+    let expected_node_2_id = 2;
     let expected_node_2_name = "iggy-node-3";
     let expected_node_2_address = "10.0.0.50:8092";
 
@@ -307,9 +307,9 @@ async fn validate_cluster_contiguous_array_override() {
     );
 
     // Check original nodes are preserved
-    assert_eq!(config.cluster.nodes[0].id, 1); // from TOML
+    assert_eq!(config.cluster.nodes[0].id, 0); // from TOML
     assert_eq!(config.cluster.nodes[0].name, "iggy-node-1"); // from TOML
-    assert_eq!(config.cluster.nodes[1].id, 2); // from TOML
+    assert_eq!(config.cluster.nodes[1].id, 1); // from TOML
     assert_eq!(config.cluster.nodes[1].name, "iggy-node-2"); // from TOML
 
     // Check the node we added at index 2

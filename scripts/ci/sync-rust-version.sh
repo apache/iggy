@@ -64,8 +64,8 @@ if [ -z "$MODE" ]; then
     exit 1
 fi
 
-# Get the repository root (parent of scripts directory)
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Get the repository root (two levels up from scripts/ci/)
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
 
 # Extract Rust version from rust-toolchain.toml

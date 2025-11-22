@@ -17,6 +17,10 @@
 
 use std::marker::PhantomData;
 
+use bytes::Bytes;
+
+use crate::types::consensus::header::ConsensusHeader;
+
 // TODO: Header generic
 // TODO: We will have to impl something like this (NOT ONE TO ONE JUST A SKETCH) as we will use `bytemuck`:
 /*
@@ -40,14 +44,20 @@ pub trait Header: Sized {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Command {
-    Reserved = 0,
-    Ping = 1,
-    Pong = 2,
-    Request = 3,
-    Prepare = 4,
-    PrepareOk = 5,
-    Reply = 6,
-    Commit = 7,
+    reserved = 0,
+
+    ping = 1,
+    pong = 2,
+
+    request = 5,
+    prepare = 6,
+    prepare_ok = 7,
+    reply = 8,
+    commit = 9,
+
+    start_view_change = 10,
+    do_view_change = 11,
+    start_view = 24,
     // ... etc
 }
 
@@ -59,6 +69,9 @@ pub struct GenericHeader {
     size: u32,
     // ... other fields
 }
+
+// first 128 bytes GenericHeader (checksum, command, size, etc....)
+// second 128 bytes specific header (PrepareHeader, CommitHeader, etc....)
 
 impl Header for GenericHeader {
     const COMMAND: Command = Command::Reserved;
@@ -86,6 +99,7 @@ impl Header for PrepareHeader {
     fn size(&self) -> u32 { self.size }
     fn command(&self) -> Command { self.command }
     fn checksum(&self) -> u128 { self.checksum }
+}
 */
 
 // And then for Message impl
@@ -152,11 +166,47 @@ pub enum Operation {
     Consume = 101,
     Fetch = 102,
 }
+
+// Specific header types
+#[repr(C)]
+pub struct PrepareHeader {
+    checksum: u128,
+    command: Command,
+    size: u32,
+    // ... prepare-specific fields
+    view: u32,
+    op: u64,
+    commit: u64,
+
+    // second 128 bytes
+    operation: Operation,
+}
 */
 
 // Which will have an method that returns discriminator between Metadata and Partition requests
 
+// TODO: Fill this enum
 #[expect(unused)]
-pub struct Message<H> {
-    _phantom_header: PhantomData<H>,
+pub enum MessageBag {
+    Void,
 }
+
+#[expect(unused)]
+pub struct Message<H>
+where
+    H: ConsensusHeader,
+{
+    buffer: Bytes,
+    _h: PhantomData<H>,
+}
+
+impl<H> From<Message<H>> for MessageBag
+where
+    H: ConsensusHeader,
+{
+    fn from(_value: Message<H>) -> Self {
+        MessageBag::Void
+    }
+}
+
+pub(crate) mod header;

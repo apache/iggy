@@ -39,18 +39,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Check Rust versions are synchronized
-        run: |
-          # Use the sync-rust-version.sh script in check mode
-          if ! bash scripts/sync-rust-version.sh --check; then
-            echo ""
-            echo "❌ Rust versions are not synchronized!"
-            echo ""
-            echo "To fix this issue, run:"
-            echo "  ./scripts/sync-rust-version.sh --fix"
-            echo ""
-            echo "This script will automatically update all Dockerfiles to match rust-toolchain.toml"
-            exit 1
-          fi
+        run: ./scripts/ci/sync-rust-version.sh --check
 
   pr-title:
     name: Check PR Title
@@ -121,36 +110,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Check Apache license headers
-        run: |
-          echo "🔍 Checking license headers..."
-
-          # Pull the addlicense image
-          docker pull ghcr.io/google/addlicense:latest
-
-          # Run the check
-          if docker run --rm -v ${{ github.workspace }}:/src -w /src \
-            ghcr.io/google/addlicense:latest \
-            -check -f ASF_LICENSE.txt . > missing_files.txt 2>&1; then
-            echo "✅ All files have proper license headers"
-          else
-            file_count=$(wc -l < missing_files.txt)
-            echo "❌ Found $file_count files missing license headers:"
-            echo ""
-            cat missing_files.txt | sed 's/^/  • /'
-            echo ""
-            echo "💡 Run 'addlicense -f ASF_LICENSE.txt .' to fix automatically"
-
-            # Add to summary
-            echo "## ❌ License Headers Missing" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "The following files are missing Apache license headers:" >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
-            cat missing_files.txt >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
-            echo 'Please call `just licenses-fix` to fix automatically.' >> $GITHUB_STEP_SUMMARY
-
-            exit 1
-          fi
+        run: ./scripts/ci/license-headers.sh --check
 
   license-list:
     name: Check licenses list
@@ -163,9 +123,12 @@ jobs:
       - name: Setup Rust toolchain
         uses: ./.github/actions/utils/setup-rust-with-cache
         with:
-          enabled: "false"  # Don't need cache for just checking licenses
+          enabled: "false" # Don't need cache for just checking licenses
 
-      - run: scripts/licenses-list.sh --check
+      - name: Install cargo-license
+        run: cargo install cargo-license
+
+      - run: ./scripts/ci/licenses-list.sh --check
 
   markdown:
     name: Markdown lint
@@ -178,37 +141,13 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '23'
+          node-version: "23"
 
       - name: Install markdownlint-cli
         run: npm install -g markdownlint-cli
 
       - name: Run markdownlint
-        run: |
-          echo "🔍 Checking markdown files..."
-
-          # Create config if it doesn't exist
-          if [ ! -f ".markdownlint.yml" ]; then
-            cat > .markdownlint.yml << 'EOF'
-          # Markdown lint configuration
-          default: true
-          MD013:
-            line_length: 120
-            tables: false
-          MD033:
-            allowed_elements: [details, summary, img]
-          MD041: false  # First line in file should be a top level heading
-          EOF
-          fi
-
-          # Run the linter
-          if markdownlint '**/*.md' --ignore-path .gitignore; then
-            echo "✅ All markdown files are properly formatted"
-          else
-            echo "❌ Markdown linting failed"
-            echo "💡 Run 'markdownlint **/*.md --fix' to auto-fix issues"
-            exit 1
-          fi
+        run: ./scripts/ci/markdownlint.sh --check
 
   shellcheck:
     name: Shell scripts lint
@@ -221,26 +160,12 @@ jobs:
 
       - name: Install shellcheck
         run: |
-          sudo apt-get update --yes && sudo apt-get install --yes shellcheck
+          SHELLCHECK_VERSION="0.11.0"
+          wget -qO- "https://github.com/koalaman/shellcheck/releases/download/v${SHELLCHECK_VERSION}/shellcheck-v${SHELLCHECK_VERSION}.linux.x86_64.tar.xz" | tar -xJv
+          sudo cp "shellcheck-v${SHELLCHECK_VERSION}/shellcheck" /usr/local/bin/
 
       - name: Check shell scripts
-        run: |
-          echo "🔍 Checking shell scripts..."
-
-          # Find all shell scripts excluding certain directories
-          if find . -type f -name "*.sh" \
-            -not -path "./target/*" \
-            -not -path "./node_modules/*" \
-            -not -path "./.git/*" \
-            -not -path "./foreign/node/node_modules/*" \
-            -not -path "./foreign/python/.venv/*" \
-            -exec shellcheck -S warning {} +; then
-            echo "✅ All shell scripts passed shellcheck"
-          else
-            echo "❌ Shellcheck found issues in shell scripts"
-            echo "💡 Fix the issues reported above"
-            exit 1
-          fi
+        run: ./scripts/ci/shellcheck.sh --check
 
   trailing-whitespace:
     name: Check trailing whitespace
@@ -251,76 +176,10 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # Need full history to get diff
+          fetch-depth: 0 # Need full history to get diff
 
       - name: Check for trailing whitespace in changed files
-        run: |
-          echo "🔍 Checking for trailing whitespace in changed files..."
-
-          # Get list of changed files in PR
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            git fetch --no-tags --depth=1 origin ${{ github.event.pull_request.base.ref }}:${{ github.event.pull_request.base.ref }} || true
-            BASE_SHA="${{ github.event.pull_request.base.sha }}"
-            CHANGED_FILES=$(git diff --name-only --diff-filter=ACM "$BASE_SHA"...HEAD || true)
-          else
-            CHANGED_FILES=$(git diff --name-only --diff-filter=ACM HEAD~1)
-          fi
-
-          if [ -z "$CHANGED_FILES" ]; then
-            echo "No files changed to check"
-            exit 0
-          fi
-
-          echo "Files to check:"
-          echo "$CHANGED_FILES" | sed 's/^/  • /'
-          echo ""
-
-          # Check each changed file for trailing whitespace
-          FILES_WITH_TRAILING=""
-          for file in $CHANGED_FILES; do
-            # Skip if file doesn't exist (might be deleted)
-            if [ ! -f "$file" ]; then
-              continue
-            fi
-
-            # Skip binary files
-            if file "$file" | grep -qE "binary|data|executable|compressed"; then
-              continue
-            fi
-
-            # Check for trailing whitespace
-            if grep -q '[[:space:]]$' "$file" 2>/dev/null; then
-              FILES_WITH_TRAILING="$FILES_WITH_TRAILING $file"
-            fi
-          done
-
-          if [ -z "$FILES_WITH_TRAILING" ]; then
-            echo "✅ No trailing whitespace found in changed files"
-          else
-            echo "❌ Found trailing whitespace in the following changed files:"
-            echo ""
-            for file in $FILES_WITH_TRAILING; do
-              echo "  • $file"
-              # Show lines with trailing whitespace (limit to first 5 occurrences per file)
-              grep -n '[[:space:]]$' "$file" | head -5 | while IFS=: read -r line_num content; do
-                # Show the line with visible whitespace markers
-                visible_content=$(echo "$content" | sed 's/ /·/g; s/\t/→/g')
-                echo "    Line $line_num: '${visible_content}'"
-              done
-              TOTAL_LINES=$(grep -c '[[:space:]]$' "$file")
-              if [ "$TOTAL_LINES" -gt 5 ]; then
-                echo "    ... and $((TOTAL_LINES - 5)) more lines"
-              fi
-              echo ""
-            done
-
-            echo "💡 To fix trailing whitespace in these files:"
-            echo "   • VSCode: Enable 'files.trimTrailingWhitespace' setting"
-            echo "   • Fix specific file: sed -i 's/[[:space:]]*$//' <filename>"
-            echo "   • Fix all changed files:"
-            echo "     for f in$FILES_WITH_TRAILING; do sed -i 's/[[:space:]]*$//' \$f; done"
-            exit 1
-          fi
+        run: ./scripts/ci/trailing-whitespace.sh --check --ci
 
   trailing-newline:
     name: Check trailing newline
@@ -331,80 +190,24 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # Need full history to get diff
+          fetch-depth: 0 # Need full history to get diff
 
       - name: Check for trailing newline in changed text files
-        run: |
-          echo "🔍 Checking for trailing newline in changed text files..."
-
-          # Get list of changed files in PR
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            git fetch --no-tags --depth=1 origin ${{ github.event.pull_request.base.ref }}:${{ github.event.pull_request.base.ref }} || true
-            BASE_SHA="${{ github.event.pull_request.base.sha }}"
-            CHANGED_FILES=$(git diff --name-only --diff-filter=ACM "$BASE_SHA"...HEAD || true)
-          else
-            CHANGED_FILES=$(git diff --name-only --diff-filter=ACM HEAD~1)
-          fi
-
-          if [ -z "$CHANGED_FILES" ]; then
-            echo "No files changed to check"
-            exit 0
-          fi
-
-          echo "Files to check:"
-          echo "$CHANGED_FILES" | sed 's/^/  • /'
-          echo ""
-
-          # Check each changed file for missing trailing newline
-          FILES_WITHOUT_NEWLINE=""
-          for file in $CHANGED_FILES; do
-            # Skip if file doesn't exist (might be deleted)
-            if [ ! -f "$file" ]; then
-              continue
-            fi
-
-            # Skip binary files
-            if file "$file" | grep -qE "binary|data|executable|compressed"; then
-              continue
-            fi
-
-            # Skip empty files
-            if [ ! -s "$file" ]; then
-              continue
-            fi
-
-            # Check if file ends with a newline
-            # Use tail to get last byte and od to check if it's a newline (0x0a)
-            if [ -n "$(tail -c 1 "$file" | od -An -tx1 | grep -v '0a')" ]; then
-              FILES_WITHOUT_NEWLINE="$FILES_WITHOUT_NEWLINE $file"
-            fi
-          done
-
-          if [ -z "$FILES_WITHOUT_NEWLINE" ]; then
-            echo "✅ All changed text files have trailing newlines"
-          else
-            echo "❌ Found text files without trailing newline:"
-            echo ""
-            for file in $FILES_WITHOUT_NEWLINE; do
-              echo "  • $file"
-              # Show last few characters of the file for context
-              echo -n "    Last characters: '"
-              tail -c 20 "$file" | tr '\n' '↵' | sed 's/\t/→/g'
-              echo "'"
-              echo ""
-            done
-
-            echo "💡 To add trailing newlines to these files:"
-            echo "   • VSCode: Enable 'files.insertFinalNewline' setting"
-            echo "   • Fix specific file: echo >> <filename>"
-            echo "   • Fix all files:"
-            echo "     for f in$FILES_WITHOUT_NEWLINE; do [ -n \"\$(tail -c 1 \"\$f\")\" ] && echo >> \"\$f\"; done"
-            exit 1
-          fi
+        run: ./scripts/ci/trailing-newline.sh --check --ci
 
   summary:
     name: Common checks summary
-    needs: [rust-versions, pr-title, license-headers, license-list, markdown, shellcheck, trailing-whitespace, trailing-newline]
+    needs:
+      [
+        rust-versions,
+        pr-title,
+        license-headers,
+        license-list,
+        markdown,
+        shellcheck,
+        trailing-whitespace,
+        trailing-newline,
+      ]
     if: always()
     runs-on: ubuntu-latest
     env:

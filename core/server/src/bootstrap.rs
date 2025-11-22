@@ -539,6 +539,8 @@ pub async fn load_segments(
         segment.end_timestamp = end_timestamp;
         segment.end_offset = end_offset;
         segment.size = IggyByteSize::from(messages_size as u64);
+        // At segment load, set the current position to the size of the segment (No data is buffered yet).
+        segment.current_position = segment.size.as_bytes_u32();
         segment.sealed = true; // Persisted segments are assumed to be sealed
 
         if config.partition.validate_checksum {

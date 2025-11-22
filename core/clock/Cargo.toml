@@ -15,28 +15,10 @@
 # specific language governing permissions and limitations
 # under the License.
 
-name: CI
+[package]
+name = "clock"
+version = "0.1.0"
+edition = "2024"
 
-on:
-  push:
-    branches: [ "master" ]
-  pull_request:
-    branches: [ "master" ]
-
-jobs:
-  # Run sanity checks first
-  sanity:
-    uses: ./.github/workflows/sanity.yml
-
-  # Run build and test after sanity checks
-  build-and-test:
-    needs: sanity
-    uses: ./.github/workflows/build-and-test.yml
-
-  # Trigger Docker workflow if needed
-  trigger-docker:
-    needs: [sanity, build-and-test]
-    uses: ./.github/workflows/docker.yml
-    secrets:
-      DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
-      DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+[dependencies]
+iggy_common = { workspace = true }

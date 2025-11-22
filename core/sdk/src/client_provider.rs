@@ -17,7 +17,6 @@
  */
 
 use crate::client_wrappers::client_wrapper::ClientWrapper;
-#[allow(deprecated)]
 use crate::clients::client::IggyClient;
 use crate::http::http_client::HttpClient;
 use crate::prelude::{
