@@ -18,9 +18,8 @@
  */
 
 import { Client, PollingStrategy, Consumer } from 'apache-iggy';
-import debug from 'debug';
+import { log } from '../utils';
 
-const log = debug('iggy:getting-started:consumer');
 
 const STREAM_ID = 1;
 const TOPIC_ID = 1;

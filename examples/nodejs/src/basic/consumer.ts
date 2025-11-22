@@ -27,11 +27,7 @@ const PARTITION_ID = 1;
 const BATCHES_LIMIT = 5;
 const MESSAGES_PER_BATCH = 10;
 
-interface Args {
-  connectionString: string;
-}
-
-function parseArgs(): Args {
+function parseArgs() {
   const args = process.argv.slice(2);
   const connectionString = args[0] || 'iggy+tcp://iggy:iggy@127.0.0.1:8090';
   
@@ -44,7 +40,8 @@ function parseArgs(): Args {
   return { connectionString };
 }
 
-async function consumeMessages(client: Client): Promise<void> {
+
+async function consumeMessages(client: Client) {
   const interval = 500; // 500 milliseconds
   log(
     'Messages will be consumed from stream: %d, topic: %d, partition: %d with interval %d ms.',
@@ -78,7 +75,10 @@ async function consumeMessages(client: Client): Promise<void> {
       offset += polledMessages.messages.length;
       
       for (const message of polledMessages.messages) {
-        handleMessage(message);
+        const payload = message.payload.toString();
+        const { offset, timestamp } = message.headers;
+
+        log('Received message: %s (offset: %d, timestamp: %d)', payload, offset, timestamp);
       }
       log('Consumed %d message(s).', polledMessages.messages.length);
     } catch (error) {
@@ -93,17 +93,7 @@ async function consumeMessages(client: Client): Promise<void> {
   log('Consumed %d batches of messages, exiting.', consumedBatches);
 }
 
-function handleMessage(message: any): void {
-  // The payload can be of any type as it is a raw byte array. In this case it's a simple string.
-  const payload = message.payload.toString('utf8');
-  log(
-    'Handling message at offset: %d, payload: %s...',
-    message.offset,
-    payload
-  );
-}
-
-async function main(): Promise<void> {
+async function main() {
   const args = parseArgs();
   
   log('Using connection string: %s', args.connectionString);
@@ -123,7 +113,6 @@ async function main(): Promise<void> {
 
   try {
     log('Basic consumer has started, selected transport: TCP');
-    log('Connecting to Iggy server...');
     // Client connects automatically when first command is called
     log('Connected successfully.');
 
@@ -145,13 +134,5 @@ process.on('unhandledRejection', (reason, promise) => {
   process.exitCode = 1;
 });
 
-if (import.meta.url === `file://${process.argv[1]}`) {
-  void (async () => {
-    try {
-      await main();
-    } catch (error) {
-      log('Main function error: %o', error);
-      process.exit(1);
-    }
-  })();
-}
+// Prefer async/await style over Promise chaining for consistency
+main()

@@ -18,156 +18,180 @@
  */
 
 import { Client, Partitioning } from 'apache-iggy';
-
+import crypto from 'crypto';
 const log = console.log;
 
-const STREAM_ID = 1;
-const TOPIC_ID = 1;
-const PARTITION_ID = 1;
+const PARTITION_COUNT = 5;
 const BATCHES_LIMIT = 5;
 const MESSAGES_PER_BATCH = 10;
 
-interface Args {
-  connectionString: string;
-}
-
-function parseArgs(): Args {
+function parseArgs() {
+  console.log = (...args) => process.stdout.write(args.join(' ') + '\n');
   const args = process.argv.slice(2);
-  const connectionString = args[0] || 'iggy+tcp://iggy:iggy@127.0.0.1:8090';
-  
-  if (args.length > 0 && (args[0] === '-h' || args[0] === '--help')) {
+  const connectionString = args[ 0 ] || 'iggy+tcp://iggy:iggy@127.0.0.1:8090';
+
+  if (args.length > 0 && (args[ 0 ] === '-h' || args[ 0 ] === '--help')) {
     log('Usage: node producer.js [connection_string]');
     log('Example: node producer.js iggy+tcp://iggy:iggy@127.0.0.1:8090');
     process.exit(0);
   }
-  
+
   return { connectionString };
 }
+async function initSystem(client: Client) {
+  log('Creating stream with random name...');
+  console.table(await client.stream.list());
+  const stream = await client.stream.create({
+    name: `sample-stream-${crypto.randomBytes(8).toString('hex')}`,
+  });
 
-async function initSystem(client: Client): Promise<void> {
-  try {
-    log('Creating stream with ID %d...', STREAM_ID);
-    await client.stream.create({ streamId: STREAM_ID, name: 'sample-stream' });
-    log('Stream was created successfully.');
-  } catch (error) {
-    log('Stream already exists or error creating stream: %o', error);
-  }
+  log('Stream was created successfully. Stream ID: %s', stream?.id);
 
-  try {
-    log('Creating topic with ID %d in stream %d...', TOPIC_ID, STREAM_ID);
-    await client.topic.create({
-      streamId: STREAM_ID,
-      topicId: TOPIC_ID,
-      name: 'sample-topic',
-      partitionCount: 1,
-      compressionAlgorithm: 1, // None
-      replicationFactor: 1
+  log('Creating topic in stream ID %s...', stream.id);
+
+  const topic = await client.topic.create({
+    streamId: stream.id,
+    name: `sample-topic-${crypto.randomBytes(4).toString('hex')}`,
+    partitionCount: PARTITION_COUNT,
+    compressionAlgorithm: 1, // None
+    replicationFactor: 1
     });
-    log('Topic was created successfully.');
-  } catch (error) {
-    log('Topic already exists or error creating topic: %o', error);
+
+  log('Topic was created successfully.', 'Topic ID: %s', topic?.id);
+  return {
+    stream,
+    topic
   }
 }
-
-async function produceMessages(client: Client): Promise<void> {
+async function produceMessages(client: Client, stream: Awaited<ReturnType<typeof initSystem>>[ 'stream' ], topic: Awaited<ReturnType<typeof initSystem>>[ 'topic' ]) {
   const interval = 500; // 500 milliseconds
   log(
     'Messages will be sent to stream: %d, topic: %d, partition: %d with interval %d ms.',
-    STREAM_ID,
-    TOPIC_ID,
-    PARTITION_ID,
     interval
   );
 
   let currentId = 0;
   let sentBatches = 0;
 
-  while (sentBatches < BATCHES_LIMIT) {
-    const messages: { payload: Buffer }[] = [];
-    const sentMessages: string[] = [];
-    
-    for (let i = 0; i < MESSAGES_PER_BATCH; i++) {
+  for (; sentBatches < BATCHES_LIMIT;) {
+    const messages = Array.from({ length: MESSAGES_PER_BATCH }).map(() => {
       currentId++;
-      const payload = `message-${currentId}`;
-      messages.push({
-        payload: Buffer.from(payload, 'utf8')
-      });
-      sentMessages.push(payload);
-    }
+      return {
+        //optional message id can be used for deduplication
+        id: currentId,
+        //optional headers can be used to store metadata
+        headers: {},
+        payload: `message-${currentId}`
+      };
+    });
 
     try {
       await client.message.send({
-        streamId: STREAM_ID,
-        topicId: TOPIC_ID,
+        streamId: stream.id,
+        topicId: topic.id,
         messages,
-        partition: Partitioning.PartitionId(PARTITION_ID)
+        partition: Partitioning.PartitionId(topic.partitions[
+          Math.floor(Math.random() * topic.partitions.length)
+        ].id),
       });
-      log('Sent messages: %o', sentMessages);
     } catch (error) {
       log('Error sending messages: %o', error);
       log('This might be due to server version compatibility. The stream and topic creation worked successfully.');
       log('Please check the Iggy server version and ensure it supports the SendMessages command.');
-      // Don't throw error, just log and continue to show that other parts work
-      log('Simulated sending messages: %o', sentMessages);
     } finally {
       sentBatches++;
+      log('Sent messages: %o', messages);
       await new Promise(resolve => setTimeout(resolve, interval));
     }
   }
 
   log('Sent %d batches of messages, exiting.', sentBatches);
 }
+async function cleanup(client: Client, streamId: number | string, topicId: number | string) {
+  log('Cleaning up: deleting topic ID %d and stream ID %d...', topicId, streamId);
+  try {
+    await client.topic.delete({
+      streamId: streamId,
+      topicId: topicId,
+      partitionsCount: PARTITION_COUNT
+    });
+    log('Topic deleted successfully.');
+  } catch (error) {
+    log('Error deleting topic: %o', error);
+  }
 
-async function main(): Promise<void> {
+  try {
+    await client.stream.delete({ streamId });
+    log('Stream deleted successfully.');
+  } catch (error) {
+    log('Error deleting stream: %o', error);
+  }
+}
+
+async function main() {
   const args = parseArgs();
-  
+
   log('Using connection string: %s', args.connectionString);
-  
+
   // Parse connection string (simplified parsing for this example)
   const url = new URL(args.connectionString.replace('iggy+tcp://', 'http://'));
   const host = url.hostname;
   const port = parseInt(url.port) || 8090;
   const username = url.username || 'iggy';
   const password = url.password || 'iggy';
-  
   const client = new Client({
     transport: 'TCP',
-    options: { port, host },
+    options: {
+      port,
+      host,
+      keepAlive: true,
+    },
+    reconnect: {
+      enabled: true,
+      interval: 5000,
+      maxRetries: 5
+    },
+    heartbeatInterval: 5000,
     credentials: { username, password }
   });
-
+  let streamId = null;
+  // iggy will create topic with id 0 by default
+  let topicId = 0;
   try {
     log('Basic producer has started, selected transport: TCP');
     log('Connecting to Iggy server...');
     // Client connects automatically when first command is called
     log('Connected successfully.');
-
     // Login will be handled automatically by the client on first command
 
-    await initSystem(client);
-    await produceMessages(client);
+    let { stream, topic } = await initSystem(client);
+    streamId = stream.id;
+    topicId = topic.id;
+
+    //ping before producing messages
+    const pong = await client.system.ping();
+    log('Ping successful.', pong);
+
+    const stats = await client.system.getStats();
+    log('System stats: %o', stats);
+
+
+    log('Stream ID: %s, Topic ID: %s', streamId, topicId);
+    await produceMessages(client, stream, topic);
   } catch (error) {
     log('Error in main: %o', error);
+    await client.destroy();
+    log('Disconnected from server.');
     process.exitCode = 1;
   } finally {
+    if (streamId) {
+      await cleanup(client, streamId, topicId);
+    }
     await client.destroy();
     log('Disconnected from server.');
   }
 }
 
 
-process.on('unhandledRejection', (reason, promise) => {
-  log('Unhandled Rejection at: %o, reason: %o', promise, reason);
-  process.exitCode = 1;
-});
 
-if (import.meta.url === `file://${process.argv[1]}`) {
-  void (async () => {
-    try {
-      await main();
-    } catch (error) {
-      log('Main function error: %o', error);
-      process.exit(1);
-    }
-  })();
-}
+main();

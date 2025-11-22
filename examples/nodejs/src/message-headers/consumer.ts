@@ -17,44 +17,93 @@
  * under the License.
  */
 
-import { Client, PollingStrategy, Consumer } from 'apache-iggy';
+import { Client, Consumer, PollingStrategy } from 'apache-iggy';
+import { log, initSystem, cleanup } from '../utils';
 
-const log = console.log;
-
-const STREAM_ID = 1;
-const TOPIC_ID = 1;
-const PARTITION_ID = 1;
 const BATCHES_LIMIT = 5;
 const MESSAGES_PER_BATCH = 10;
 
+interface OrderCreated {
+  orderId: string;
+  customerId: string;
+  amount: number;
+}
+
+interface OrderConfirmed {
+  orderId: string;
+  timestamp: number;
+}
+
+interface OrderRejected {
+  orderId: string;
+  reason: string;
+}
+
+const ORDER_CREATED_TYPE = 'OrderCreated';
+const ORDER_CONFIRMED_TYPE = 'OrderConfirmed';
+const ORDER_REJECTED_TYPE = 'OrderRejected';
+
 function parseArgs() {
+  console.log = (...args) => process.stdout.write(args.join(' ') + '\n');
   const args = process.argv.slice(2);
   const connectionString = args[0] || 'iggy+tcp://iggy:iggy@127.0.0.1:8090';
-  
+
   if (args.length > 0 && (args[0] === '-h' || args[0] === '--help')) {
-    log('Usage: node consumer.js [connection_string]');
-    log('Example: node consumer.js iggy+tcp://iggy:iggy@127.0.0.1:8090');
+    log('Usage: node consumer.ts [connection_string]');
+    log('Example: node consumer.ts iggy+tcp://iggy:iggy@127.0.0.1:8090');
     process.exit(0);
   }
-  
+
   return { connectionString };
 }
 
-function handleMessage(message) {
-  const payload = message.payload.toString();
-  const offset = message.headers.offset;
-  const timestamp = message.headers.timestamp;
+function handleMessage(message: any): void {
+  // The payload can be of any type as it is a raw byte array. In this case it's a JSON string.
+  const payload = new TextDecoder().decode(new Uint8Array(Object.values(message.payload)));
   
-  log('Received message: %s (offset: %d, timestamp: %d)', payload, offset, timestamp);
+  try {
+    const envelope = JSON.parse(payload);
+    const messageType = envelope.messageType;
+    const data = envelope.data;
+    
+    log('Handling message type: %s...', messageType);
+
+    switch (messageType) {
+      case ORDER_CREATED_TYPE: {
+        const orderCreated: OrderCreated = JSON.parse(data);
+        log('Order Created: %o', orderCreated);
+        break;
+      }
+      case ORDER_CONFIRMED_TYPE: {
+        const orderConfirmed: OrderConfirmed = JSON.parse(data);
+        log('Order Confirmed: %o', orderConfirmed);
+        break;
+      }
+      case ORDER_REJECTED_TYPE: {
+        const orderRejected: OrderRejected = JSON.parse(data);
+        log('Order Rejected: %o', orderRejected);
+        break;
+      }
+      default: {
+        log('Received unknown message type: %s', messageType);
+      }
+    }
+  } catch (error) {
+    log('Error handling message: %o', error);
+  }
 }
 
-async function consumeMessages(client) {
+async function consumeMessages(
+  client: Client,
+  stream: Awaited<ReturnType<typeof initSystem>>['stream'],
+  topic: Awaited<ReturnType<typeof initSystem>>['topic']
+) {
   const interval = 500; // 500 milliseconds
   log(
     'Messages will be consumed from stream: %d, topic: %d, partition: %d with interval %d ms.',
-    STREAM_ID,
-    TOPIC_ID,
-    PARTITION_ID,
+    stream.id,
+    topic.id,
+    topic.partitions[0].id,
     interval
   );
 
@@ -65,22 +114,24 @@ async function consumeMessages(client) {
     try {
       log('Polling for messages...');
       const polledMessages = await client.message.poll({
-        streamId: STREAM_ID,
-        topicId: TOPIC_ID,
+        streamId: stream.id,
+        topicId: topic.id,
         consumer: Consumer.Single,
-        partitionId: PARTITION_ID,
+        partitionId: topic.partitions[0].id,
         pollingStrategy: PollingStrategy.Offset(BigInt(offset)),
         count: MESSAGES_PER_BATCH,
-        autocommit: false
+        autocommit: false,
       });
 
       if (!polledMessages || polledMessages.messages.length === 0) {
-        log('No messages found in current poll - this is expected if the producer had issues sending messages');
+        log('No messages available.');
+        consumedBatches++;
+        await new Promise(resolve => setTimeout(resolve, interval));
         continue;
       }
 
       offset += polledMessages.messages.length;
-      
+
       for (const message of polledMessages.messages) {
         handleMessage(message);
       }
@@ -99,47 +150,63 @@ async function consumeMessages(client) {
 
 async function main() {
   const args = parseArgs();
-  
+
   log('Using connection string: %s', args.connectionString);
-  
+
   // Parse connection string (simplified parsing for this example)
   const url = new URL(args.connectionString.replace('iggy+tcp://', 'http://'));
   const host = url.hostname;
   const port = parseInt(url.port) || 8090;
   const username = url.username || 'iggy';
   const password = url.password || 'iggy';
-  
+
   const client = new Client({
     transport: 'TCP',
-    options: { port, host },
-    credentials: { username, password }
+    options: {
+      port,
+      host,
+      keepAlive: true,
+    },
+    reconnect: {
+      enabled: true,
+      interval: 5000,
+      maxRetries: 5,
+    },
+    heartbeatInterval: 5000,
+    credentials: { username, password },
   });
 
+  let streamId = null;
+  let topicId = 0;
+
   try {
-    log('Basic consumer has started, selected transport: TCP');
+    log('Message headers consumer has started, selected transport: TCP');
     log('Connecting to Iggy server...');
     // Client connects automatically when first command is called
     log('Connected successfully.');
-
     // Login will be handled automatically by the client on first command
 
-    await consumeMessages(client);
+    const { stream, topic } = await initSystem(client);
+    streamId = stream.id;
+    topicId = topic.id;
+    await consumeMessages(client, stream, topic);
   } catch (error) {
     log('Error in main: %o', error);
     process.exitCode = 1;
   } finally {
+    if (streamId !== null && topicId !== null) {
+      await cleanup(client, streamId, topicId);
+    }
     await client.destroy();
     log('Disconnected from server.');
   }
 }
-
 
 process.on('unhandledRejection', (reason, promise) => {
   log('Unhandled Rejection at: %o, reason: %o', promise, reason);
   process.exitCode = 1;
 });
 
-// Prefer async/await style over Promise chaining for consistency
 void (async () => {
   try {
     await main();
