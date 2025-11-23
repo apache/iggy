@@ -159,10 +159,22 @@ public class AsyncIggyTcpClient {
      * Closes the connection and releases resources.
      */
     public CompletableFuture<Void> close() {
+        CompletableFuture<Void> closeFuture;
         if (connection != null) {
-            return connection.close();
+            closeFuture = connection.close();
+        } else {
+            closeFuture = CompletableFuture.completedFuture(null);
         }
-        return CompletableFuture.completedFuture(null);
+        
+        // Clear all client references after closing
+        return closeFuture.thenRun(() -> {
+            messagesClient = null;
+            consumerGroupsClient = null;
+            streamsClient = null;
+            topicsClient = null;
+            usersClient = null;
+            connection = null;
+        });
     }
 
     /**

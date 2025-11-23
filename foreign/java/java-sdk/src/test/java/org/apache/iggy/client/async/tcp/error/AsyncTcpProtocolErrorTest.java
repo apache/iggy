@@ -38,6 +38,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
@@ -232,10 +233,14 @@ class AsyncTcpProtocolErrorTest extends AsyncTcpTestBase {
         // Then: Each should fail independently with the same error
         assertThatThrownBy(() -> future1.get(5, TimeUnit.SECONDS))
                 .isInstanceOf(ExecutionException.class)
-                .hasCauseInstanceOf(RuntimeException.class);
+                .satisfies(ex -> {
+                    assertThat(ex.getCause()).isInstanceOf(RuntimeException.class);
+                });
 
         assertThatThrownBy(() -> future2.get(5, TimeUnit.SECONDS))
                 .isInstanceOf(ExecutionException.class)
-                .hasCauseInstanceOf(RuntimeException.class);
+                .satisfies(ex -> {
+                    assertThat(ex.getCause()).isInstanceOf(RuntimeException.class);
+                });
     }
 }

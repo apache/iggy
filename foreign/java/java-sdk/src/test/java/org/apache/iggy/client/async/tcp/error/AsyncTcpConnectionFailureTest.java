@@ -29,12 +29,9 @@ import org.slf4j.LoggerFactory;
 import java.net.ConnectException;
 import java.net.UnknownHostException;
 import java.time.Duration;
-import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
 
-import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
@@ -94,21 +91,22 @@ class AsyncTcpConnectionFailureTest extends AsyncTcpTestBase {
                 .port(-1)
                 .build())
                 .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("Port must be a positive integer");
+                .hasMessageContaining("Port must be between 1 and 65535");
 
         assertThatThrownBy(() -> AsyncIggyTcpClient.builder()
                 .host(HOST)
                 .port(0)
                 .build())
                 .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("Port must be a positive integer");
+                .hasMessageContaining("Port must be between 1 and 65535");
 
         // Port 65536 is out of valid range (max is 65535)
         assertThatThrownBy(() -> AsyncIggyTcpClient.builder()
                 .host(HOST)
                 .port(65536)
                 .build())
-                .isInstanceOf(IllegalArgumentException.class);
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Port must be between 1 and 65535");
     }
 
     @Test
