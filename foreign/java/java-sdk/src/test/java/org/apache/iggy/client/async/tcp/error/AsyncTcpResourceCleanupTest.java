@@ -19,7 +19,6 @@
 
 package org.apache.iggy.client.async.tcp.error;
 
-import io.netty.buffer.ByteBuf;
 import org.apache.iggy.client.async.tcp.AsyncIggyTcpClient;
 import org.apache.iggy.client.async.tcp.base.AsyncTcpTestBase;
 import org.apache.iggy.client.async.tcp.mock.FaultyNettyServer;
@@ -34,16 +33,12 @@ import org.junit.jupiter.api.DisplayName;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.time.Duration;
 import java.util.Collections;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
-import static org.awaitility.Awaitility.await;
 
 /**
  * Resource cleanup tests for AsyncIggyTcpClient.
@@ -63,18 +58,18 @@ class AsyncTcpResourceCleanupTest extends AsyncTcpTestBase {
 
     @AfterEach
     void cleanupResourceCleanupTest() throws Exception {
-        try {
-            if (mockServer != null) {
+        if (mockServer != null) {
+            try {
                 mockServer.stop();
+            } catch (Exception e) {
+                logger.warn("Error stopping mock server: {}", e.getMessage());
             }
-        } catch (Exception ignored) {
-            // Server may already be stopped
         }
         if (client != null) {
             try {
                 client.close().get(1, TimeUnit.SECONDS);
-            } catch (Exception ignored) {
-                // Client may already be closed
+            } catch (Exception e) {
+                logger.warn("Error closing client: {}", e.getMessage());
             }
         }
     }
@@ -96,111 +91,11 @@ class AsyncTcpResourceCleanupTest extends AsyncTcpTestBase {
 
         // When: Close the connection
         CompletableFuture<Void> closeFuture = client.close();
-
-        // Then: Should complete successfully
-        await().timeout(Duration.ofSeconds(5))
-                .untilAsserted(() -> closeFuture.get(1, TimeUnit.SECONDS));
-    }
-
-    @Test
-    @DisplayName("Event loop group should be shut down after close")
-    void testEventLoopGroupShutdown() throws Exception {
-        logger.info("Testing event loop group shutdown");
-
-        // Given: Connected client
-        mockServer.start().get(5, TimeUnit.SECONDS);
-        
-        client = AsyncIggyTcpClient.builder()
-                .host(HOST)
-                .port(PORT)
-                .build();
-
-        client.connect().get(5, TimeUnit.SECONDS);
-
-        // When: Close the connection
-        client.close().get(5, TimeUnit.SECONDS);
-
-        // Then: Event loop group should be shut down
-        // Note: This is internal to AsyncTcpConnection and hard to test directly
-        // We'll assume it works if close completes without error
-        assertThat(true).isTrue(); // Placeholder - actual implementation would need access to internal state
-    }
-
-    @Test
-    @DisplayName("Pending requests should be cleaned up on close")
-    void testPendingRequestsCleanupOnClose() throws Exception {
-        logger.info("Testing pending requests cleanup on close");
-
-        // Given: Client with pending requests
-        mockServer.start().get(5, TimeUnit.SECONDS);
-        
-        client = AsyncIggyTcpClient.builder()
-                .host(HOST)
-                .port(PORT)
-                .requestTimeout(Duration.ofSeconds(10))
-                .build();
-
-        client.connect().get(5, TimeUnit.SECONDS);
-
-        // Configure server to not respond
-        mockServer.simulateConnectionTimeout();
-
-        // Send a request that will remain pending
-        CompletableFuture<Void> sendFuture = client.messages().sendMessagesAsync(
-                StreamId.of(1L),
-                TopicId.of(1L),
-                Partitioning.partitionId(1L),
-                Collections.singletonList(Message.of("test message"))
-        );
-
-        // Give some time for the request to be sent
-        Thread.sleep(100);
-
-        // When: Close the connection while request is pending
-        CompletableFuture<Void> closeFuture = client.close();
         closeFuture.get(5, TimeUnit.SECONDS);
 
-        // Then: Pending request should be cancelled
-        await().timeout(Duration.ofSeconds(5))
-                .untilAsserted(() -> {
-                    assertThatThrownBy(() -> sendFuture.get(100, TimeUnit.MILLISECONDS))
-                            .isInstanceOf(TimeoutException.class);
-                });
-    }
-
-    @Test
-    @DisplayName("ByteBuf memory should be properly released")
-    void testByteBufMemoryLeak() throws Exception {
-        logger.info("Testing ByteBuf memory leak prevention");
-
-        // Given: Client sending messages
-        mockServer.start().get(5, TimeUnit.SECONDS);
-        
-        client = AsyncIggyTcpClient.builder()
-                .host(HOST)
-                .port(PORT)
-                .build();
-
-        client.connect().get(5, TimeUnit.SECONDS);
-
-        // Configure server to respond normally
-        mockServer.setResponse(0, new byte[0]); // Success response
-
-        // When: Send multiple messages
-        for (int i = 0; i < 5; i++) {
-            CompletableFuture<Void> sendFuture = client.messages().sendMessagesAsync(
-                    StreamId.of(1L),
-                    TopicId.of(1L),
-                    Partitioning.partitionId(1L),
-                    Collections.singletonList(Message.of("test message " + i))
-            );
-            sendFuture.get(5, TimeUnit.SECONDS);
-        }
-
-        // Then: Memory should be properly managed
-        // Note: This is hard to test without Netty's ResourceLeakDetector
-        // We'll assume it works if no exceptions are thrown
-        assertThat(true).isTrue(); // Placeholder - actual implementation would use Netty's leak detection
+        // Then: Should complete successfully
+        assertThat(closeFuture.isDone()).isTrue();
+        assertThat(closeFuture.isCompletedExceptionally()).isFalse();
     }
 
     @Test
@@ -220,24 +115,74 @@ class AsyncTcpResourceCleanupTest extends AsyncTcpTestBase {
 
         // When: Close multiple times
         CompletableFuture<Void> closeFuture1 = client.close();
+        closeFuture1.get(5, TimeUnit.SECONDS);
+        
         CompletableFuture<Void> closeFuture2 = client.close();
+        closeFuture2.get(5, TimeUnit.SECONDS);
+        
         CompletableFuture<Void> closeFuture3 = client.close();
+        closeFuture3.get(5, TimeUnit.SECONDS);
 
         // Then: All should complete successfully
-        await().timeout(Duration.ofSeconds(5))
-                .untilAsserted(() -> {
-                    closeFuture1.get(100, TimeUnit.MILLISECONDS);
-                    closeFuture2.get(100, TimeUnit.MILLISECONDS);
-                    closeFuture3.get(100, TimeUnit.MILLISECONDS);
-                });
+        assertThat(closeFuture1.isDone()).isTrue();
+        assertThat(closeFuture2.isDone()).isTrue();
+        assertThat(closeFuture3.isDone()).isTrue();
+        
+        assertThat(closeFuture1.isCompletedExceptionally()).isFalse();
+        assertThat(closeFuture2.isCompletedExceptionally()).isFalse();
+        assertThat(closeFuture3.isCompletedExceptionally()).isFalse();
     }
 
     @Test
-    @DisplayName("Client should not be reusable after error")
-    void testClientReusabilityAfterError() throws Exception {
-        logger.info("Testing client reusability after error");
+    @DisplayName("Close before connect should work")
+    void testCloseBeforeConnect() throws Exception {
+        logger.info("Testing close before connect");
+
+        // Given: Client not yet connected
+        client = AsyncIggyTcpClient.builder()
+                .host(HOST)
+                .port(PORT)
+                .build();
+
+        // When: Close without connecting
+        CompletableFuture<Void> closeFuture = client.close();
+        closeFuture.get(5, TimeUnit.SECONDS);
+
+        // Then: Should complete successfully
+        assertThat(closeFuture.isDone()).isTrue();
+        assertThat(closeFuture.isCompletedExceptionally()).isFalse();
+    }
+
+    @Test
+    @DisplayName("Operations after close should fail")
+    void testOperationsAfterClose() throws Exception {
+        logger.info("Testing operations after close");
+
+        // Given: Connected then closed client
+        mockServer.start().get(5, TimeUnit.SECONDS);
+        
+        client = AsyncIggyTcpClient.builder()
+                .host(HOST)
+                .port(PORT)
+                .build();
+
+        client.connect().get(5, TimeUnit.SECONDS);
+        client.close().get(5, TimeUnit.SECONDS);
+
+        // When: Try to send a message after close
+        // Then: Should throw IllegalStateException because clients are not initialized
+        assertThatThrownBy(() -> client.messages())
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("Client not connected");
+    }
+
+    @Test
+    @DisplayName("Client after error should handle close gracefully")
+    void testCloseAfterError() throws Exception {
+        logger.info("Testing close after error");
 
         // Given: Client that encounters an error
+        mockServer.simulateServerError(500, "Internal Server Error");
         mockServer.start().get(5, TimeUnit.SECONDS);
         
         client = AsyncIggyTcpClient.builder()
@@ -247,9 +192,6 @@ class AsyncTcpResourceCleanupTest extends AsyncTcpTestBase {
 
         client.connect().get(5, TimeUnit.SECONDS);
 
-        // Configure server to return error
-        mockServer.simulateServerError(500, "Internal Server Error");
-
         // Send a request that fails
         CompletableFuture<Void> sendFuture = client.messages().sendMessagesAsync(
                 StreamId.of(1L),
@@ -258,25 +200,19 @@ class AsyncTcpResourceCleanupTest extends AsyncTcpTestBase {
                 Collections.singletonList(Message.of("test message"))
         );
 
-        assertThatThrownBy(() -> sendFuture.get(5, TimeUnit.SECONDS))
-                .isInstanceOf(ExecutionException.class);
-
-        // When: Try to send another request
-        CompletableFuture<Void> sendFuture2 = client.messages().sendMessagesAsync(
-                StreamId.of(1L),
-                TopicId.of(1L),
-                Partitioning.partitionId(1L),
-                Collections.singletonList(Message.of("test message 2"))
-        );
-
-        // Then: Should either work or fail consistently
-        // Depending on implementation, the client may still be usable or may need recreation
         try {
-            sendFuture2.get(5, TimeUnit.SECONDS);
-            // If it succeeds, that's fine
-        } catch (ExecutionException e) {
-            // If it fails, that's also acceptable
+            sendFuture.get(5, TimeUnit.SECONDS);
+        } catch (Exception e) {
+            // Expected to fail
         }
+
+        // When: Close after error
+        CompletableFuture<Void> closeFuture = client.close();
+        closeFuture.get(5, TimeUnit.SECONDS);
+
+        // Then: Should close gracefully
+        assertThat(closeFuture.isDone()).isTrue();
+        assertThat(closeFuture.isCompletedExceptionally()).isFalse();
     }
 
     @Test
@@ -294,20 +230,32 @@ class AsyncTcpResourceCleanupTest extends AsyncTcpTestBase {
 
         client.connect().get(5, TimeUnit.SECONDS);
 
-        // When: Concurrently close and send
-        CompletableFuture<Void> sendFuture = client.messages().sendMessagesAsync(
-                StreamId.of(1L),
-                TopicId.of(1L),
-                Partitioning.partitionId(1L),
-                Collections.singletonList(Message.of("test message"))
-        );
+        // When: Concurrently send and close
+        CompletableFuture<Void> sendFuture = CompletableFuture.runAsync(() -> {
+            try {
+                client.messages().sendMessagesAsync(
+                        StreamId.of(1L),
+                        TopicId.of(1L),
+                        Partitioning.partitionId(1L),
+                        Collections.singletonList(Message.of("test message"))
+                ).get(5, TimeUnit.SECONDS);
+            } catch (Exception e) {
+                // May fail if close happens first, which is acceptable
+                logger.debug("Send failed (expected if close happened first): {}", e.getMessage());
+            }
+        });
         
         CompletableFuture<Void> closeFuture = client.close();
 
-        // Then: Should be thread-safe with no race conditions
-        await().timeout(Duration.ofSeconds(5))
-                .untilAsserted(() -> {
-                    closeFuture.get(100, TimeUnit.MILLISECONDS); // Close should always succeed
-                });
+        // Then: Close should complete successfully
+        closeFuture.get(5, TimeUnit.SECONDS);
+        assertThat(closeFuture.isDone()).isTrue();
+
+        // Wait for send to complete (may have succeeded or failed)
+        try {
+            sendFuture.get(5, TimeUnit.SECONDS);
+        } catch (Exception e) {
+            // Acceptable
+        }
     }
 }

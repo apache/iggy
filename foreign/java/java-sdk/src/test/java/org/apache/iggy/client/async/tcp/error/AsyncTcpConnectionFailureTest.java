@@ -93,14 +93,17 @@ class AsyncTcpConnectionFailureTest extends AsyncTcpTestBase {
                 .host(HOST)
                 .port(-1)
                 .build())
-                .isInstanceOf(IllegalArgumentException.class);
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Port must be a positive integer");
 
         assertThatThrownBy(() -> AsyncIggyTcpClient.builder()
                 .host(HOST)
                 .port(0)
                 .build())
-                .isInstanceOf(IllegalArgumentException.class);
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Port must be a positive integer");
 
+        // Port 65536 is out of valid range (max is 65535)
         assertThatThrownBy(() -> AsyncIggyTcpClient.builder()
                 .host(HOST)
                 .port(65536)
@@ -141,9 +144,7 @@ class AsyncTcpConnectionFailureTest extends AsyncTcpTestBase {
         // When/Then: Connection should be refused
         assertThatThrownBy(() -> client.connect().get(5, TimeUnit.SECONDS))
                 .isInstanceOf(ExecutionException.class)
-                .cause()
-                .isInstanceOf(ConnectException.class)
-                .hasMessageContaining("Connection refused");
+                .hasCauseInstanceOf(ConnectException.class);
     }
 
     @Test

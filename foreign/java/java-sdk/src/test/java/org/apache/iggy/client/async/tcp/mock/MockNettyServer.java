@@ -25,14 +25,11 @@ import io.netty.channel.*;
 import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.SocketChannel;
 import io.netty.channel.socket.nio.NioServerSocketChannel;
-import io.netty.handler.codec.LengthFieldBasedFrameDecoder;
-import io.netty.handler.codec.LengthFieldPrepender;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.time.Duration;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.TimeUnit;
 import java.util.function.BiFunction;
 import java.util.function.Consumer;
 
@@ -53,19 +50,19 @@ public class MockNettyServer {
     private Consumer<ChannelHandlerContext> connectionHandler;
     
     // Fault injection
-    private boolean dropConnectionAfterBytes = false;
-    private int bytesToSendBeforeDrop = 0;
-    private Duration responseDelay = Duration.ZERO;
-    private boolean sendMalformedResponse = false;
-    private boolean acceptButNotRespond = false;
-    private int statusCode = 0;
-    private byte[] responsePayload = new byte[0];
+    private volatile boolean dropConnectionAfterBytes = false;
+    private volatile int bytesToSendBeforeDrop = 0;
+    private volatile Duration responseDelay = Duration.ZERO;
+    private volatile boolean sendMalformedResponse = false;
+    private volatile boolean acceptButNotRespond = false;
+    private volatile int statusCode = 0;
+    private volatile byte[] responsePayload = new byte[0];
 
     public MockNettyServer(int port) {
         this.port = port;
         this.requestHandler = (command, payload) -> {
-            // Default handler - echo back the command
-            return createResponse(0, new byte[0]);
+            // Default handler - return success response
+            return createResponse(statusCode, responsePayload);
         };
     }
 
@@ -88,12 +85,7 @@ public class MockNettyServer {
                     @Override
                     protected void initChannel(SocketChannel ch) {
                         ChannelPipeline pipeline = ch.pipeline();
-                        
-                        // Add frame decoder and encoder for proper message framing
-                        pipeline.addLast(new LengthFieldBasedFrameDecoder(Integer.MAX_VALUE, 0, 4, 0, 4));
-                        pipeline.addLast(new LengthFieldPrepender(4));
-                        
-                        // Add our mock handler
+                        // Add our mock handler - no frame decoder, we handle raw bytes
                         pipeline.addLast(new MockServerHandler());
                     }
                 })
@@ -195,7 +187,7 @@ public class MockNettyServer {
     }
 
     /**
-     * Creates a response frame.
+     * Creates a response frame in Iggy protocol format: [status:4][length:4][payload:N]
      *
      * @param status the status code
      * @param payload the response payload
@@ -203,8 +195,6 @@ public class MockNettyServer {
      */
     private ByteBuf createResponse(int status, byte[] payload) {
         int length = payload != null ? payload.length : 0;
-        // Note: This method should only be called from within a handler context
-        // For now, we'll create an unpooled buffer
         ByteBuf response = io.netty.buffer.Unpooled.buffer(8 + length);
         response.writeIntLE(status);
         response.writeIntLE(length);
@@ -228,42 +218,65 @@ public class MockNettyServer {
     /**
      * Netty handler for processing incoming connections and requests.
      */
-    private class MockServerHandler extends SimpleChannelInboundHandler<ByteBuf> {
+    private class MockServerHandler extends ChannelInboundHandlerAdapter {
+        private static final int HEADER_SIZE = 8; // length(4) + command(4)
+        
         @Override
-        protected void channelRead0(ChannelHandlerContext ctx, ByteBuf msg) throws Exception {
-            if (acceptButNotRespond) {
-                // Just consume the message and don't respond
-                logger.debug("Accepting message but not responding (simulating timeout)");
+        public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
+            if (!(msg instanceof ByteBuf)) {
                 return;
             }
+            
+            ByteBuf buf = (ByteBuf) msg;
+            
+            try {
+                if (acceptButNotRespond) {
+                    // Just consume the message and don't respond
+                    logger.debug("Accepting message but not responding (simulating timeout)");
+                    return;
+                }
 
-            if (sendMalformedResponse) {
-                // Send a malformed response (incomplete frame)
-                ByteBuf malformed = ctx.alloc().buffer(4);
-                malformed.writeIntLE(0); // Only status, no length
-                ctx.writeAndFlush(malformed);
-                return;
-            }
+                if (sendMalformedResponse) {
+                    // Send a malformed response (incomplete header)
+                    ByteBuf malformed = ctx.alloc().buffer(4);
+                    malformed.writeIntLE(0); // Only status, no length
+                    ctx.writeAndFlush(malformed);
+                    return;
+                }
 
-            // Parse the request: [length:4][command:4][payload:N]
-            if (msg.readableBytes() < 8) {
-                logger.warn("Received incomplete request frame");
-                return;
-            }
+                // Parse Iggy request frame: [payload_size:4][command:4][payload:N]
+                if (buf.readableBytes() < HEADER_SIZE) {
+                    logger.warn("Received incomplete request frame, only {} bytes", buf.readableBytes());
+                    return;
+                }
 
-            int frameLength = msg.readIntLE();
-            int command = msg.readIntLE();
-            ByteBuf payload = msg.readSlice(frameLength - 4); // Remaining bytes after command
-
-            // If statusCode is not 0, send error response directly
-            if (statusCode != 0) {
-                ByteBuf errorResponse = createErrorResponse(statusCode, responsePayload);
+                int frameLength = buf.readIntLE();
+                int command = buf.readIntLE();
+                int payloadSize = frameLength - 4; // command is 4 bytes
                 
+                ByteBuf payload = null;
+                if (payloadSize > 0 && buf.readableBytes() >= payloadSize) {
+                    payload = buf.readSlice(payloadSize);
+                }
+
+                logger.debug("Received request: command={}, frameLength={}, payloadSize={}", 
+                    command, frameLength, payloadSize);
+
+                // If statusCode is not 0, send error response directly
+                ByteBuf response;
+                if (statusCode != 0) {
+                    response = createErrorResponse(statusCode, responsePayload);
+                } else {
+                    // Process the request using the configured handler
+                    response = requestHandler.apply(command, payload);
+                }
+
                 if (dropConnectionAfterBytes) {
                     // Send partial response and then drop connection
-                    if (errorResponse.readableBytes() > bytesToSendBeforeDrop) {
-                        ByteBuf partial = errorResponse.readSlice(bytesToSendBeforeDrop);
+                    if (response.readableBytes() > bytesToSendBeforeDrop) {
+                        ByteBuf partial = response.readSlice(bytesToSendBeforeDrop).retain();
                         ctx.writeAndFlush(partial).addListener(ChannelFutureListener.CLOSE);
+                        response.release();
                         return;
                     }
                 }
@@ -273,29 +286,12 @@ public class MockNettyServer {
                     Thread.sleep(responseDelay.toMillis());
                 }
 
-                ctx.writeAndFlush(errorResponse);
-                return;
+                // Send the response
+                ctx.writeAndFlush(response);
+                
+            } finally {
+                buf.release();
             }
-
-            // Process the request using the configured handler
-            ByteBuf response = requestHandler.apply(command, payload);
-
-            if (dropConnectionAfterBytes) {
-                // Send partial response and then drop connection
-                if (response.readableBytes() > bytesToSendBeforeDrop) {
-                    ByteBuf partial = response.readSlice(bytesToSendBeforeDrop);
-                    ctx.writeAndFlush(partial).addListener(ChannelFutureListener.CLOSE);
-                    return;
-                }
-            }
-
-            if (!responseDelay.isZero()) {
-                // Add delay before responding
-                Thread.sleep(responseDelay.toMillis());
-            }
-
-            // Send the response
-            ctx.writeAndFlush(response);
         }
 
         @Override

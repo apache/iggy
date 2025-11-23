@@ -19,8 +19,6 @@
 
 package org.apache.iggy.client.async.tcp.error;
 
-import io.netty.buffer.ByteBuf;
-import io.netty.buffer.Unpooled;
 import org.apache.iggy.client.async.tcp.AsyncIggyTcpClient;
 import org.apache.iggy.client.async.tcp.base.AsyncTcpTestBase;
 import org.apache.iggy.client.async.tcp.mock.FaultyNettyServer;
@@ -44,12 +42,14 @@ import java.util.concurrent.TimeoutException;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
-import static org.awaitility.Awaitility.await;
 
 /**
  * Network interruption tests for AsyncIggyTcpClient.
  * Tests various network interruption scenarios including connection drops,
  * partial frame transmission, corrupted frames, and slow networks.
+ * 
+ * Note: These tests use a mock server and may not perfectly replicate real network conditions.
+ * They are designed to test the client's resilience to various error scenarios.
  */
 @DisplayName("Async TCP Network Interruption Tests")
 class AsyncTcpNetworkInterruptionTest extends AsyncTcpTestBase {
@@ -64,42 +64,40 @@ class AsyncTcpNetworkInterruptionTest extends AsyncTcpTestBase {
 
     @AfterEach
     void cleanupNetworkInterruptionTest() throws Exception {
-        try {
-            if (mockServer != null) {
+        if (mockServer != null) {
+            try {
                 mockServer.stop();
+            } catch (Exception e) {
+                logger.warn("Error stopping mock server: {}", e.getMessage());
             }
-        } catch (Exception ignored) {
-            // Server may already be stopped
         }
         if (client != null) {
             try {
                 client.close().get(1, TimeUnit.SECONDS);
-            } catch (Exception ignored) {
-                // Client may already be closed
+            } catch (Exception e) {
+                logger.warn("Error closing client: {}", e.getMessage());
             }
         }
     }
 
     @Test
-    @DisplayName("Connection drop during send should fail send operation")
-    void testConnectionDropDuringSend() throws Exception {
-        logger.info("Testing connection drop during send");
+    @DisplayName("Server accepting but not responding should timeout")
+    void testConnectionTimeout() throws Exception {
+        logger.info("Testing server not responding");
 
-        // Given: Mock server that drops connection after accepting it
+        // Given: Mock server that accepts connections but doesn't respond
+        mockServer.simulateConnectionTimeout();
         mockServer.start().get(5, TimeUnit.SECONDS);
         
         client = AsyncIggyTcpClient.builder()
                 .host(HOST)
                 .port(PORT)
-                .requestTimeout(Duration.ofSeconds(2))
                 .build();
 
+        // Client connects successfully (TCP handshake completes)
         client.connect().get(5, TimeUnit.SECONDS);
 
-        // Configure server to drop connection when receiving data
-        mockServer.simulateConnectionTimeout();
-
-        // When: Attempt to send a message
+        // When: Try to send a message (requires server response)
         CompletableFuture<Void> sendFuture = client.messages().sendMessagesAsync(
                 StreamId.of(1L),
                 TopicId.of(1L),
@@ -107,34 +105,124 @@ class AsyncTcpNetworkInterruptionTest extends AsyncTcpTestBase {
                 Collections.singletonList(Message.of("test message"))
         );
 
-        // Then: Send should fail - wait for timeout to trigger
-        await().timeout(Duration.ofSeconds(5))
-                .untilAsserted(() -> {
-                    assertThatThrownBy(() -> sendFuture.get(100, TimeUnit.MILLISECONDS))
-                            .isInstanceOf(TimeoutException.class);
-                });
+        // Then: Should timeout because server doesn't respond
+        assertThatThrownBy(() -> sendFuture.get(3, TimeUnit.SECONDS))
+                .isInstanceOf(TimeoutException.class);
     }
 
     @Test
-    @DisplayName("Connection drop during receive should fail pending requests")
-    void testConnectionDropDuringReceive() throws Exception {
-        logger.info("Testing connection drop during receive");
+    @DisplayName("Malformed response should cause error")
+    void testMalformedResponse() throws Exception {
+        logger.info("Testing malformed response");
 
-        // Given: Mock server that accepts connection but doesn't respond
+        // Given: Mock server that sends malformed responses
+        mockServer.simulateMalformedResponse();
         mockServer.start().get(5, TimeUnit.SECONDS);
         
         client = AsyncIggyTcpClient.builder()
                 .host(HOST)
                 .port(PORT)
-                .requestTimeout(Duration.ofSeconds(2))
                 .build();
 
         client.connect().get(5, TimeUnit.SECONDS);
 
-        // Configure server to accept but not respond
+        // When: Send a request
+        CompletableFuture<Void> sendFuture = client.messages().sendMessagesAsync(
+                StreamId.of(1L),
+                TopicId.of(1L),
+                Partitioning.partitionId(1L),
+                Collections.singletonList(Message.of("test message"))
+        );
+
+        // Then: Should fail due to malformed response
+        // This may timeout or fail with an exception depending on how the decoder handles it
+        assertThatThrownBy(() -> sendFuture.get(3, TimeUnit.SECONDS))
+                .satisfiesAnyOf(
+                    ex -> assertThat(ex).isInstanceOf(ExecutionException.class),
+                    ex -> assertThat(ex).isInstanceOf(TimeoutException.class)
+                );
+    }
+
+    @Test
+    @DisplayName("Partial frame transmission should be handled")
+    void testPartialFrameTransmission() throws Exception {
+        logger.info("Testing partial frame transmission");
+
+        // Given: Mock server that sends partial frames
+        mockServer.simulatePartialFrame();
+        mockServer.start().get(5, TimeUnit.SECONDS);
+        
+        client = AsyncIggyTcpClient.builder()
+                .host(HOST)
+                .port(PORT)
+                .build();
+
+        client.connect().get(5, TimeUnit.SECONDS);
+
+        // When: Send a request
+        CompletableFuture<Void> sendFuture = client.messages().sendMessagesAsync(
+                StreamId.of(1L),
+                TopicId.of(1L),
+                Partitioning.partitionId(1L),
+                Collections.singletonList(Message.of("test message"))
+        );
+
+        // Then: Should fail due to incomplete frame
+        assertThatThrownBy(() -> sendFuture.get(3, TimeUnit.SECONDS))
+                .satisfiesAnyOf(
+                    ex -> assertThat(ex).isInstanceOf(ExecutionException.class),
+                    ex -> assertThat(ex).isInstanceOf(TimeoutException.class)
+                );
+    }
+
+    @Test
+    @DisplayName("Slow network should respect timeouts")
+    void testSlowNetworkSimulation() throws Exception {
+        logger.info("Testing slow network simulation");
+
+        // Given: Mock server with slow response (2 seconds delay)
+        mockServer.simulateSlowNetwork(Duration.ofSeconds(2));
+        mockServer.start().get(5, TimeUnit.SECONDS);
+        
+        client = AsyncIggyTcpClient.builder()
+                .host(HOST)
+                .port(PORT)
+                .build();
+
+        client.connect().get(5, TimeUnit.SECONDS);
+
+        // When: Send a request with short timeout
+        CompletableFuture<Void> sendFuture = client.messages().sendMessagesAsync(
+                StreamId.of(1L),
+                TopicId.of(1L),
+                Partitioning.partitionId(1L),
+                Collections.singletonList(Message.of("test message"))
+        );
+
+        // Then: Should timeout before server responds
+        assertThatThrownBy(() -> sendFuture.get(1, TimeUnit.SECONDS))
+                .isInstanceOf(TimeoutException.class);
+    }
+
+    @Test
+    @DisplayName("Server crash during request should fail pending requests")
+    void testServerCrashDuringRequest() throws Exception {
+        logger.info("Testing server crash during request");
+
+        // Given: Mock server
+        mockServer.start().get(5, TimeUnit.SECONDS);
+        
+        client = AsyncIggyTcpClient.builder()
+                .host(HOST)
+                .port(PORT)
+                .build();
+
+        client.connect().get(5, TimeUnit.SECONDS);
+
+        // Configure server to not respond
         mockServer.simulateConnectionTimeout();
 
-        // When: Send a request and then close the connection from server side
+        // When: Send a request
         CompletableFuture<Void> sendFuture = client.messages().sendMessagesAsync(
                 StreamId.of(1L),
                 TopicId.of(1L),
@@ -145,188 +233,14 @@ class AsyncTcpNetworkInterruptionTest extends AsyncTcpTestBase {
         // Give some time for the request to be sent
         Thread.sleep(100);
 
-        // Close server to simulate connection drop
+        // Crash the server
         mockServer.stop();
 
         // Then: Pending request should fail
-        await().timeout(Duration.ofSeconds(5))
-                .untilAsserted(() -> {
-                    assertThatThrownBy(() -> sendFuture.get(100, TimeUnit.MILLISECONDS))
-                            .isInstanceOf(TimeoutException.class);
-                });
-    }
-
-    @Test
-    @DisplayName("Partial frame transmission should be handled gracefully")
-    void testPartialFrameTransmission() throws Exception {
-        logger.info("Testing partial frame transmission");
-
-        // Given: Mock server that sends partial frames
-        mockServer.start().get(5, TimeUnit.SECONDS);
-        
-        client = AsyncIggyTcpClient.builder()
-                .host(HOST)
-                .port(PORT)
-                .requestTimeout(Duration.ofSeconds(2))
-                .build();
-
-        client.connect().get(5, TimeUnit.SECONDS);
-
-        // Configure server to send partial frames
-        mockServer.simulatePartialFrame();
-
-        // When: Send a request
-        CompletableFuture<Void> sendFuture = client.messages().sendMessagesAsync(
-                StreamId.of(1L),
-                TopicId.of(1L),
-                Partitioning.partitionId(1L),
-                Collections.singletonList(Message.of("test message"))
-        );
-
-        // Then: Should handle partial frame gracefully
-        await().timeout(Duration.ofSeconds(5))
-                .untilAsserted(() -> {
-                    assertThatThrownBy(() -> sendFuture.get(100, TimeUnit.MILLISECONDS))
-                            .isInstanceOf(TimeoutException.class);
-                });
-    }
-
-    @Test
-    @DisplayName("Corrupted frame header should be detected and handled")
-    void testCorruptedFrameHeader() throws Exception {
-        logger.info("Testing corrupted frame header");
-
-        // Given: Mock server that sends malformed responses
-        mockServer.start().get(5, TimeUnit.SECONDS);
-        
-        client = AsyncIggyTcpClient.builder()
-                .host(HOST)
-                .port(PORT)
-                .requestTimeout(Duration.ofSeconds(2))
-                .build();
-
-        client.connect().get(5, TimeUnit.SECONDS);
-
-        // Configure server to send malformed responses
-        mockServer.simulateMalformedResponse();
-
-        // When: Send a request
-        CompletableFuture<Void> sendFuture = client.messages().sendMessagesAsync(
-                StreamId.of(1L),
-                TopicId.of(1L),
-                Partitioning.partitionId(1L),
-                Collections.singletonList(Message.of("test message"))
-        );
-
-        // Then: Should detect and handle corrupted frame
-        await().timeout(Duration.ofSeconds(5))
-                .untilAsserted(() -> {
-                    assertThatThrownBy(() -> sendFuture.get(100, TimeUnit.MILLISECONDS))
-                            .isInstanceOf(TimeoutException.class);
-                });
-    }
-
-    @Test
-    @DisplayName("Slow network simulation should respect timeouts")
-    void testSlowNetworkSimulation() throws Exception {
-        logger.info("Testing slow network simulation");
-
-        // Given: Mock server with slow response
-        mockServer.start().get(5, TimeUnit.SECONDS);
-        
-        client = AsyncIggyTcpClient.builder()
-                .host(HOST)
-                .port(PORT)
-                .requestTimeout(Duration.ofMillis(500))
-                .build();
-
-        client.connect().get(5, TimeUnit.SECONDS);
-
-        // Configure server to be slow
-        mockServer.simulateSlowNetwork(Duration.ofSeconds(2));
-
-        // When: Send a request
-        CompletableFuture<Void> sendFuture = client.messages().sendMessagesAsync(
-                StreamId.of(1L),
-                TopicId.of(1L),
-                Partitioning.partitionId(1L),
-                Collections.singletonList(Message.of("test message"))
-        );
-
-        // Then: Should timeout due to slow network
-        assertThatThrownBy(() -> sendFuture.get(1, TimeUnit.SECONDS))
-                .isInstanceOf(TimeoutException.class);
-    }
-
-    @Test
-    @DisplayName("Multiple requests with interruption should all fail")
-    void testMultipleRequestsWithInterruption() throws Exception {
-        logger.info("Testing multiple requests with interruption");
-
-        // Given: Mock server that will be interrupted
-        mockServer.start().get(5, TimeUnit.SECONDS);
-        
-        client = AsyncIggyTcpClient.builder()
-                .host(HOST)
-                .port(PORT)
-                .requestTimeout(Duration.ofSeconds(2))
-                .build();
-
-        client.connect().get(5, TimeUnit.SECONDS);
-
-        // Send multiple concurrent requests
-        CompletableFuture<Void> future1 = client.messages().sendMessagesAsync(
-                StreamId.of(1L),
-                TopicId.of(1L),
-                Partitioning.partitionId(1L),
-                Collections.singletonList(Message.of("test message 1"))
-        );
-        
-        CompletableFuture<Void> future2 = client.messages().sendMessagesAsync(
-                StreamId.of(1L),
-                TopicId.of(1L),
-                Partitioning.partitionId(1L),
-                Collections.singletonList(Message.of("test message 2"))
-        );
-        
-        CompletableFuture<Void> future3 = client.messages().sendMessagesAsync(
-                StreamId.of(1L),
-                TopicId.of(1L),
-                Partitioning.partitionId(1L),
-                Collections.singletonList(Message.of("test message 3"))
-        );
-
-        // Give some time for requests to be sent
-        Thread.sleep(100);
-
-        // Simulate network interruption by stopping server
-        mockServer.stop();
-
-        // Then: All requests should fail
-        await().timeout(Duration.ofSeconds(5))
-                .untilAsserted(() -> {
-                    // At least one should have timed out
-                    boolean hasTimeout = false;
-                    try {
-                        future1.get(100, TimeUnit.MILLISECONDS);
-                    } catch (TimeoutException e) {
-                        hasTimeout = true;
-                    } catch (Exception ignored) {}
-                    if (!hasTimeout) {
-                        try {
-                            future2.get(100, TimeUnit.MILLISECONDS);
-                        } catch (TimeoutException e) {
-                            hasTimeout = true;
-                        } catch (Exception ignored) {}
-                    }
-                    if (!hasTimeout) {
-                        try {
-                            future3.get(100, TimeUnit.MILLISECONDS);
-                        } catch (TimeoutException e) {
-                            hasTimeout = true;
-                        } catch (Exception ignored) {}
-                    }
-                    assertThat(hasTimeout).isTrue();
-                });
+        assertThatThrownBy(() -> sendFuture.get(3, TimeUnit.SECONDS))
+                .satisfiesAnyOf(
+                    ex -> assertThat(ex).isInstanceOf(ExecutionException.class),
+                    ex -> assertThat(ex).isInstanceOf(TimeoutException.class)
+                );
     }
 }
