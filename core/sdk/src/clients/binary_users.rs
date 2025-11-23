@@ -16,13 +16,15 @@
  * under the License.
  */
 
+use crate::client_wrappers::client_wrapper::ClientWrapper;
 use crate::prelude::IggyClient;
 use async_trait::async_trait;
-use iggy_binary_protocol::UserClient;
+use iggy_binary_protocol::{Client, UserClient};
 use iggy_common::locking::IggyRwLockFn;
 use iggy_common::{
     Identifier, IdentityInfo, IggyError, Permissions, UserInfo, UserInfoDetails, UserStatus,
 };
+use tracing::info;
 
 #[async_trait]
 impl UserClient for IggyClient {
@@ -91,11 +93,32 @@ impl UserClient for IggyClient {
     }
 
     async fn login_user(&self, username: &str, password: &str) -> Result<IdentityInfo, IggyError> {
-        self.client
+        let identity = self
+            .client
             .read()
             .await
             .login_user(username, password)
-            .await
+            .await?;
+
+        let should_redirect = {
+            let client = self.client.read().await;
+            match &*client {
+                ClientWrapper::Tcp(tcp_client) => tcp_client.handle_leader_redirection().await?,
+                ClientWrapper::Quic(quic_client) => quic_client.handle_leader_redirection().await?,
+                ClientWrapper::WebSocket(ws_client) => {
+                    ws_client.handle_leader_redirection().await?
+                }
+                _ => false,
+            }
+        };
+
+        if should_redirect {
+            info!("Redirected to leader, reconnecting and re-authenticating");
+            self.connect().await?;
+            self.login_user(username, password).await
+        } else {
+            Ok(identity)
+        }
     }
 
     async fn logout_user(&self) -> Result<(), IggyError> {

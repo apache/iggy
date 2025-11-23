@@ -105,4 +105,19 @@ pub struct Args {
     ///   iggy-server --with-default-root-credentials     # Use 'iggy/iggy' as root credentials
     #[arg(long, default_value_t = false, verbatim_doc_comment)]
     pub with_default_root_credentials: bool,
+
+    /// Run server as a follower node (FOR TESTING LEADER REDIRECTION)
+    ///
+    /// When this flag is set, the server will report itself as a follower node
+    /// in cluster metadata responses. This is useful for testing leader-aware
+    /// client connections and redirection logic.
+    ///
+    /// The server will return cluster metadata showing this server as a follower node.
+    ///
+    /// Examples:
+    ///   iggy-server                                      # Run as leader (default)
+    ///   iggy-server --follower                           # Run as follower
+    ///   IGGY_TCP_ADDRESS=127.0.0.1:8091 iggy-server --follower  # Follower on port 8091
+    #[arg(long, default_value_t = false, verbatim_doc_comment)]
+    pub follower: bool,
 }

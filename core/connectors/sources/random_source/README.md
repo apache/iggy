@@ -10,7 +10,7 @@ The Random Source connector generates random data and sends it to the specified 
 - `payload_size`: An integer representing the size in bytes of the `text` field payload to generate. Defaults to `100`.
 
 ```toml
-[sources.random.config]
+[plugin_config]
 interval = "100ms"
 max_count = 1000
 messages_range = [10, 50]

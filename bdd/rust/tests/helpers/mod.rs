@@ -16,4 +16,5 @@
  * under the License.
  */
 
+pub mod cluster;
 pub mod test_data;

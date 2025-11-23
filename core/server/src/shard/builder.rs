@@ -48,6 +48,7 @@ pub struct IggyShardBuilder {
     encryptor: Option<EncryptorKind>,
     version: Option<SemanticVersion>,
     metrics: Option<Metrics>,
+    is_follower: bool,
 }
 
 impl IggyShardBuilder {
@@ -109,6 +110,11 @@ impl IggyShardBuilder {
         self
     }
 
+    pub fn is_follower(mut self, is_follower: bool) -> Self {
+        self.is_follower = is_follower;
+        self
+    }
+
     // TODO: Too much happens in there, some of those bootstrapping logic should be moved outside.
     pub fn build(self) -> IggyShard {
         let id = self.id.unwrap();
@@ -161,6 +167,7 @@ impl IggyShardBuilder {
             stop_receiver,
             messages_receiver: Cell::new(Some(frame_receiver)),
             metrics,
+            is_follower: self.is_follower,
             is_shutting_down: AtomicBool::new(false),
             tcp_bound_address: Cell::new(None),
             quic_bound_address: Cell::new(None),

@@ -204,8 +204,10 @@ impl IggyShard {
                 "create_partitions_bypass_auth: partition mismatch ID, wrong creation order ?!"
             );
             let ns = IggyNamespace::new(numeric_stream_id, numeric_topic_id, id);
-            let shard_id = ShardId::new(calculate_shard_assignment(&ns, shards_count));
-            self.insert_shard_table_record(ns, shard_id);
+            let shard_id = self.find_shard_table_record(&ns).unwrap_or_else(|| {
+                tracing::warn!("WARNING: missing shard table record for namespace: {:?}, in the event handler for `CreatedPartitions` event.", ns);
+                ShardId::new(calculate_shard_assignment(&ns, shards_count))
+            });
             if self.id == *shard_id {
                 self.init_log(stream_id, topic_id, id).await?;
             }

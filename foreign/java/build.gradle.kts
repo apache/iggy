@@ -47,4 +47,59 @@ subprojects {
             configDirectory = file("${project.rootDir}/dev-support/checkstyle")
         }
     }
+
+    // Configure publishing for modules that publish to Maven
+    plugins.withId("maven-publish") {
+        apply(plugin = "signing")
+
+        configure<PublishingExtension> {
+            publications {
+                create<MavenPublication>("maven") {
+                    from(components["java"])
+
+                    pom {
+                        url = "https://github.com/apache/iggy"
+                        licenses {
+                            license {
+                                name = "Apache License, Version 2.0"
+                                url = "https://www.apache.org/licenses/LICENSE-2.0.txt"
+                            }
+                        }
+                        developers {
+                            developer {
+                                name = "Apache Iggy"
+                                email = "dev@iggy.apache.org"
+                            }
+                        }
+                        scm {
+                            url = "https://github.com/apache/iggy"
+                            connection = "scm:git:git://github.com/apache/iggy.git"
+                            developerConnection = "scm:git:git://github.com/apache/iggy.git"
+                        }
+                    }
+                }
+            }
+
+            repositories {
+                maven {
+                    val releasesRepoUrl = "https://repository.apache.org/service/local/staging/deploy/maven2"
+                    val snapshotsRepoUrl = "https://repository.apache.org/content/repositories/snapshots/"
+
+                    url = uri(if ((version as String).endsWith("SNAPSHOT")) snapshotsRepoUrl else releasesRepoUrl)
+
+                    credentials {
+                        username = System.getenv("NEXUS_USER")
+                        password = System.getenv("NEXUS_PW")
+                    }
+                }
+            }
+        }
+
+        configure<SigningExtension> {
+            val signingKey: String? by project
+            val signingPassword: String? by project
+            useInMemoryPgpKeys(signingKey, signingPassword)
+            sign(the<PublishingExtension>().publications)
+        }
+    }
 }

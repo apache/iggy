@@ -72,6 +72,40 @@ $ cargo version
 cargo 1.86.0 (adf9b6ad1 2025-02-28)
 ```
 
+### Pre-commit Hooks (Recommended)
+
+Iggy uses [prek](https://github.com/9999years/prek) for pre-commit hooks to ensure code quality before commits. Setting up hooks is optional but strongly recommended to catch issues early.
+
+#### Setup
+
+```shell
+cargo install prek
+prek install
+```
+
+This will install git hooks that automatically run on `pre-commit` and `pre-push` events.
+
+#### Manual hook execution
+
+You can manually run specific hooks:
+
+```shell
+# Run all pre-commit hooks
+prek run
+
+# Run specific hook
+prek run cargo-fmt
+prek run cargo-clippy
+```
+
+#### Skip hooks (when necessary)
+
+If you need to skip hooks for a specific commit:
+
+```shell
+git commit --no-verify -m "your message"
+```
+
 ## How to build
 
 See [Quick Start](https://github.com/apache/iggy?tab=readme-ov-file#quick-start)

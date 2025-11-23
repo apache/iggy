@@ -17,7 +17,7 @@
 
 [package]
 name = "iggy-mcp"
-version = "0.2.0-edge.3"
+version = "0.2.0"
 description = "MCP Server for Iggy message streaming platform"
 edition = "2024"
 license = "Apache-2.0"
@@ -34,7 +34,7 @@ figlet-rs = { workspace = true }
 figment = { workspace = true }
 iggy = { workspace = true }
 iggy_common = { workspace = true }
-rmcp = { version = "0.8.5", features = [
+rmcp = { version = "0.9.0", features = [
     "server",
     "transport-io",
     "transport-sse-server",

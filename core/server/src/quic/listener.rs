@@ -25,8 +25,7 @@ use crate::streaming::session::Session;
 use anyhow::anyhow;
 use compio_quic::{Connection, Endpoint, RecvStream, SendStream};
 use futures::FutureExt;
-use iggy_common::IggyError;
-use iggy_common::TransportProtocol;
+use iggy_common::{GET_CLUSTER_METADATA_CODE, IggyError, TransportProtocol};
 use std::rc::Rc;
 use tracing::{debug, error, info, trace};
 
@@ -198,21 +197,32 @@ async fn handle_stream(
             Ok(())
         }
         Err(e) => {
-            error!(
-                "Command was not handled successfully, session: {:?}, error: {e}.",
-                session
-            );
-            // Only return a connection-terminating error for client not found
-            if let IggyError::ClientNotFound(_) = e {
-                sender.send_error_response(e.clone()).await?;
-                trace!("QUIC error response was sent.");
-                error!("Session will be deleted.");
-                Err(anyhow!("Client not found: {e}"))
-            } else {
-                // For all other errors, send response and continue the connection
+            // Special handling for GetClusterMetadata when clustering is disabled
+            if code == GET_CLUSTER_METADATA_CODE && matches!(e, IggyError::FeatureUnavailable) {
+                debug!(
+                    "GetClusterMetadata command not available (clustering disabled), session: {:?}.",
+                    session
+                );
                 sender.send_error_response(e).await?;
                 trace!("QUIC error response was sent.");
                 Ok(())
+            } else {
+                error!(
+                    "Command was not handled successfully, session: {:?}, error: {e}.",
+                    session
+                );
+                // Only return a connection-terminating error for client not found
+                if let IggyError::ClientNotFound(_) = e {
+                    sender.send_error_response(e.clone()).await?;
+                    trace!("QUIC error response was sent.");
+                    error!("Session will be deleted.");
+                    Err(anyhow!("Client not found: {e}"))
+                } else {
+                    // For all other errors, send response and continue the connection
+                    sender.send_error_response(e).await?;
+                    trace!("QUIC error response was sent.");
+                    Ok(())
+                }
             }
         }
     }

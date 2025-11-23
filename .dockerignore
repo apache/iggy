@@ -1,6 +1,5 @@
 .config
 .dockerignore
-.git
 .github
 .gitignore
 .idea

@@ -22,9 +22,6 @@ plugins {
     id("maven-publish")
 }
 
-group = "org.apache.iggy"
-version = "0.6.0-SNAPSHOT"
-
 repositories {
     mavenCentral()
 }
@@ -39,7 +36,6 @@ java {
 }
 
 val flinkVersion = "2.1.0"
-val iggyVersion = "0.6.0-SNAPSHOT"
 
 dependencies {
     // Iggy SDK - use local project when building within Iggy repository
@@ -59,8 +55,9 @@ dependencies {
     // Testing
     testImplementation("org.apache.flink:flink-test-utils:${flinkVersion}")
     testImplementation("org.apache.flink:flink-runtime:${flinkVersion}:tests")
-    testImplementation("org.junit.jupiter:junit-jupiter:5.11.3")
-    testImplementation("org.assertj:assertj-core:3.26.3")
+    testImplementation("org.junit.jupiter:junit-jupiter:5.14.1")
+    testImplementation("org.assertj:assertj-core:3.27.6")
+    testRuntimeOnly("org.junit.platform:junit-platform-launcher")
     testRuntimeOnly("org.slf4j:slf4j-simple:2.0.16")
 }
 
@@ -79,33 +76,12 @@ tasks.withType<Javadoc> {
 
 publishing {
     publications {
-        create<MavenPublication>("maven") {
-            groupId = "org.apache.iggy"
-            artifactId = "iggy-connector-library"
-            version = "0.6.0-SNAPSHOT"
-            from(components["java"])
+        named<MavenPublication>("maven") {
+            artifactId = "flink-connector"
 
             pom {
-                name = "Apache Iggy Connector Library"
-                description = "Core connector library for Apache Iggy stream processors (Flink, Spark, etc.)"
-                url = "https://github.com/apache/iggy"
-                licenses {
-                    license {
-                        name = "Apache License, Version 2.0"
-                        url = "https://www.apache.org/licenses/LICENSE-2.0.txt"
-                    }
-                }
-                developers {
-                    developer {
-                        name = "Apache Iggy"
-                        email = "dev@iggy.apache.org"
-                    }
-                }
-                scm {
-                    url = "https://github.com/apache/iggy"
-                    connection = "scm:git:git://github.com/apache/iggy.git"
-                    developerConnection = "scm:git:git://github.com/apache/iggy.git"
-                }
+                name = "Apache Iggy - Flink Connector"
+                description = "Apache Iggy connector library supporting Apache Flink"
             }
         }
     }

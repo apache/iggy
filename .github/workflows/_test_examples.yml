@@ -52,6 +52,19 @@ jobs:
         with:
           cache-targets: false # Only cache registry and git deps, not target dir (sccache handles that)
 
+      - name: Setup Python
+        if: inputs.component == 'examples-suite'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip
+        if: inputs.component == 'examples-suite'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ hashFiles('foreign/python/pyproject.toml') }}
+
       - name: Build common binaries for all examples
         if: inputs.component == 'examples-suite'
         run: |
@@ -95,22 +108,25 @@ jobs:
         if: inputs.component == 'examples-suite' && inputs.task == 'examples-rust'
         run: |
           echo "Running Rust examples tests..."
-          # Run the examples script which will use the prebuilt binaries
           ./scripts/run-rust-examples-from-readme.sh
 
       - name: Run Go examples
         if: inputs.component == 'examples-suite' && inputs.task == 'examples-go'
         run: |
           echo "Running Go examples tests..."
-          # Run the examples script which will use the prebuilt server binary
           ./scripts/run-go-examples-from-readme.sh
 
       - name: Run Csharp examples
         if: inputs.component == 'examples-suite' && inputs.task == 'examples-csharp'
         run: |
           echo "Running Csharp examples tests..."
-          # Run the examples script which will use the prebuilt server binary
           ./scripts/run-csharp-examples-from-readme.sh
+
+      - name: Run Python examples
+        if: inputs.component == 'examples-suite' && inputs.task == 'examples-python'
+        run: |
+          echo "Running Python examples tests..."
+          ./scripts/run-python-examples-from-readme.sh
 
       - name: Upload reports
         if: always()

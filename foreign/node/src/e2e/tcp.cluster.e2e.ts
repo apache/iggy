@@ -17,45 +17,40 @@
  * under the License.
  */
 
-
-import { after, describe, it } from 'node:test';
-import assert from 'node:assert/strict';
-import { getTestClient } from './test-client.utils.js';
+import { after, describe, it } from "node:test";
+import assert from "node:assert/strict";
+import { getTestClient } from "./test-client.utils.js";
 
 // cluster mode still in dev atm
 // response is mocked from /core/configs/server.toml
 const expectedMeta = {
-  "name": "iggy-cluster",
-  "id": 1,
-  "transport": "TCP",
-  "nodes": [
+  name: "iggy-cluster",
+  id: 0,
+  transport: "TCP",
+  nodes: [
     {
-      "id": 1,
-      "name": "iggy-node-1",
-      "address": "127.0.0.1:8090",
-      "role": "Leader",
-      "status": "Healthy"
+      id: 0,
+      name: "iggy-node-1",
+      address: "127.0.0.1:8090",
+      role: "Leader",
+      status: "Healthy",
     },
     {
-      "id": 2,
-      "name": "iggy-node-2",
-      "address": "127.0.0.1:8091",
-      "role": "Follower",
-      "status": "Healthy"
-    }
-  ]
+      id: 1,
+      name: "iggy-node-2",
+      address: "127.0.0.1:8091",
+      role: "Follower",
+      status: "Healthy",
+    },
+  ],
 };
 
-describe('e2e -> system', async () => {
-
+describe("e2e -> system", async () => {
   const c = getTestClient();
 
-  it('e2e -> cluster::getClusterMetadata', async () => {
+  it("e2e -> cluster::getClusterMetadata", async () => {
     const meta = await c.cluster.getClusterMetadata();
-    assert.deepEqual(
-      meta,
-      expectedMeta
-    );
+    assert.deepEqual(meta, expectedMeta);
   });
 
   after(() => {

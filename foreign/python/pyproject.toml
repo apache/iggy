@@ -22,7 +22,7 @@ build-backend = "maturin"
 [project]
 name = "apache-iggy"
 requires-python = ">=3.7"
-version = "0.6.0.dev1"
+version = "0.6.0"
 description = "Apache Iggy is the persistent message streaming platform written in Rust, supporting QUIC, TCP and HTTP transport protocols, capable of processing millions of messages per second."
 readme = "README.md"
 license = { file = "LICENSE" }

@@ -81,7 +81,9 @@ impl<'de> Deserialize<'de> for TransportProtocol {
             type Value = TransportProtocol;
 
             fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-                formatter.write_str("a string (\"tcp\", \"quic\", \"http\") or a number (1, 2, 3)")
+                formatter.write_str(
+                    "a string (\"tcp\", \"quic\", \"http\", \"ws\") or a number (1, 2, 3, 4)",
+                )
             }
 
             fn visit_str<E>(self, value: &str) -> Result<TransportProtocol, E>

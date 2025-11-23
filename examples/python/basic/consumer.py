@@ -24,9 +24,9 @@ from loguru import logger
 
 STREAM_NAME = "sample-stream"
 TOPIC_NAME = "sample-topic"
-STREAM_ID = 1
-TOPIC_ID = 1
-PARTITION_ID = 1
+STREAM_ID = 0
+TOPIC_ID = 0
+PARTITION_ID = 0
 BATCHES_LIMIT = 5
 
 ArgNamespace = namedtuple("ArgNamespace", ["connection_string"])
@@ -40,6 +40,7 @@ def parse_args() -> argparse.Namespace:
             "Connection string for Iggy client, e.g. 'iggy+tcp://iggy:iggy@127.0.0.1:8090'"
         ),
         default="iggy+tcp://iggy:iggy@127.0.0.1:8090",
+        nargs="?",
         type=str,
     )
     return parser.parse_args()

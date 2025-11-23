@@ -33,7 +33,7 @@ use std::{
     str::FromStr,
     sync::{Arc, atomic::Ordering},
 };
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::configs::connectors::SourceConfig;
 use crate::{
@@ -72,7 +72,7 @@ pub async fn init(
             info!("Source container for plugin: {path} is already loaded.",);
             init_source(
                 &container.container,
-                &config.config.unwrap_or_default(),
+                &config.plugin_config.unwrap_or_default(),
                 plugin_id,
                 state,
             );
@@ -81,7 +81,7 @@ pub async fn init(
                 key: key.to_owned(),
                 name: name.to_owned(),
                 path: path.to_owned(),
-                config_format: config.config_format,
+                config_format: config.plugin_config_format,
                 producer: None,
                 transforms: vec![],
                 state_storage,
@@ -92,7 +92,7 @@ pub async fn init(
             info!("Source container for plugin: {path} loaded successfully.",);
             init_source(
                 &container,
-                &config.config.unwrap_or_default(),
+                &config.plugin_config.unwrap_or_default(),
                 plugin_id,
                 state,
             );
@@ -105,7 +105,7 @@ pub async fn init(
                         key: key.to_owned(),
                         name: name.to_owned(),
                         path: path.to_owned(),
-                        config_format: config.config_format,
+                        config_format: config.plugin_config_format,
                         producer: None,
                         transforms: vec![],
                         state_storage,
@@ -171,14 +171,22 @@ pub async fn init(
 
 fn init_source(
     container: &Container<SourceApi>,
-    config: &serde_json::Value,
+    plugin_config: &serde_json::Value,
     id: u32,
     state: Option<ConnectorState>,
 ) {
-    let config = serde_json::to_string(config).expect("Invalid source config.");
+    trace!("Initializing source plugin with config: {plugin_config:?} (ID: {id})");
+    let plugin_config =
+        serde_json::to_string(plugin_config).expect("Invalid source plugin config.");
     let state_ptr = state.as_ref().map_or(std::ptr::null(), |s| s.0.as_ptr());
     let state_len = state.as_ref().map_or(0, |s| s.0.len());
-    (container.open)(id, config.as_ptr(), config.len(), state_ptr, state_len);
+    (container.open)(
+        id,
+        plugin_config.as_ptr(),
+        plugin_config.len(),
+        state_ptr,
+        state_len,
+    );
 }
 
 fn get_state_storage(state_path: &str, key: &str) -> StateStorage {
@@ -348,13 +356,16 @@ extern "C" fn handle_produced_messages(
     unsafe {
         if let Some(sender) = SOURCE_SENDERS.get(&plugin_id) {
             let messages = std::slice::from_raw_parts(messages_ptr, messages_len);
-            let Ok(messages) = postcard::from_bytes::<ProducedMessages>(messages) else {
-                error!(
-                    "Failed to deserialize produced messages for source connector with ID: {plugin_id}"
-                );
-                return;
-            };
-            let _ = sender.send(messages);
+            match postcard::from_bytes::<ProducedMessages>(messages) {
+                Ok(messages) => {
+                    let _ = sender.send(messages);
+                }
+                Err(err) => {
+                    error!(
+                        "Failed to deserialize produced messages for source connector with ID: {plugin_id}. {err}"
+                    );
+                }
+            }
         }
     }
 }

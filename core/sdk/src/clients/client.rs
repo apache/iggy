@@ -16,11 +16,9 @@
  * under the License.
  */
 
-use crate::clients::client_builder::IggyClientBuilder;
-use iggy_common::Consumer;
-use iggy_common::locking::{IggyRwLock, IggyRwLockFn};
-
 use crate::client_wrappers::client_wrapper::ClientWrapper;
+use crate::client_wrappers::connection_info::ConnectionInfo;
+use crate::clients::client_builder::IggyClientBuilder;
 use crate::http::http_client::HttpClient;
 use crate::prelude::EncryptorKind;
 use crate::prelude::IggyConsumerBuilder;
@@ -32,6 +30,8 @@ use crate::websocket::websocket_client::WebSocketClient;
 use async_broadcast::Receiver;
 use async_trait::async_trait;
 use iggy_binary_protocol::{Client, SystemClient};
+use iggy_common::Consumer;
+use iggy_common::locking::{IggyRwLock, IggyRwLockFn};
 use iggy_common::{ConnectionStringUtils, DiagnosticEvent, Partitioner, TransportProtocol};
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -64,7 +64,6 @@ impl IggyClient {
     }
 
     /// Creates a new `IggyClientBuilder` from the provided connection string.
-    /// Creates a new `IggyClientBuilder` from the provided connection string.
     pub fn builder_from_connection_string(
         connection_string: &str,
     ) -> Result<IggyClientBuilder, IggyError> {
@@ -81,7 +80,6 @@ impl IggyClient {
         }
     }
 
-    /// Creates a new `IggyClient` from the provided connection string.
     /// Creates a new `IggyClient` from the provided connection string.
     pub fn from_connection_string(connection_string: &str) -> Result<Self, IggyError> {
         match ConnectionStringUtils::parse_protocol(connection_string)? {
@@ -176,6 +174,13 @@ impl IggyClient {
             self.encryptor.clone(),
             None,
         ))
+    }
+
+    /// Returns the current connection information including the transport protocol and server address.
+    /// This is useful for verifying which server the client is connected to, especially after
+    /// leader redirection in a clustered environment.
+    pub async fn get_connection_info(&self) -> ConnectionInfo {
+        self.client.read().await.get_connection_info().await
     }
 }
 

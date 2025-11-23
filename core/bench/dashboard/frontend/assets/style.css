@@ -351,7 +351,7 @@ body.dark select option {
     gap: var(--spacing-sm);
     padding: var(--spacing-sm);
     background-color: var(--color-background);
-    z-index: 10;
+    z-index: 20;
 }
 
 .icon-button,

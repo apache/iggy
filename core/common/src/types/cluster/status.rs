@@ -38,6 +38,8 @@ pub enum ClusterNodeStatus {
     Unreachable,
     /// Node is in maintenance mode
     Maintenance,
+    /// Node is unknown
+    Unknown,
 }
 
 impl TryFrom<u8> for ClusterNodeStatus {

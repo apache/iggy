@@ -187,20 +187,13 @@ impl IggyShard {
             })
             .collect()
     }
-
-    pub fn insert_shard_table_records(
-        &self,
-        records: impl IntoIterator<Item = (IggyNamespace, ShardId)>,
-    ) {
-        for (ns, shard_id) in records {
-            self.shards_table.insert(ns, shard_id);
-        }
-    }
 }
 
 // Utility function for shard assignment calculation
 pub fn calculate_shard_assignment(ns: &IggyNamespace, upperbound: u32) -> u16 {
     let mut hasher = Murmur3Hasher::default();
     hasher.write_u64(ns.inner());
-    (hasher.finish32() % upperbound) as u16
+    let hash = hasher.finish32();
+    // Murmur3 has problems with weak lower bits for small integer inputs, so we use bits from the middle.
+    ((hash >> 16) % upperbound) as u16
 }

@@ -15,8 +15,23 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub trait Consensus {
-    type RequestMessage;
-    type ReplicateMessage;
-    type AckMessage;
+pub trait Project<U> {
+    type Consensus: Consensus;
+    fn project(self, consensus: &Self::Consensus) -> U;
 }
+
+pub trait Consensus {
+    // I am wondering, whether we should create a dedicated trait for cloning, so it's explicit that we do ref counting.
+    type RequestMessage: Project<Self::ReplicateMessage, Consensus = Self> + Clone;
+    type ReplicateMessage: Project<Self::AckMessage, Consensus = Self> + Clone;
+    type AckMessage;
+
+    fn pipeline_message(&self, message: Self::ReplicateMessage);
+    fn verify_pipeline(&self);
+
+    // TODO: Figure out how we can achieve that without exposing such methods in the Consensus trait.
+    fn post_replicate_verify(&self, message: &Self::ReplicateMessage);
+}
+
+mod impls;
+pub use impls::*;

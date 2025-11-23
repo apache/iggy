@@ -25,7 +25,7 @@ use crate::tcp::connection_handler::command::ServerCommand;
 use async_channel::Receiver;
 use bytes::BytesMut;
 use futures::FutureExt;
-use iggy_common::IggyError;
+use iggy_common::{GET_CLUSTER_METADATA_CODE, IggyError};
 use std::io::ErrorKind;
 use std::rc::Rc;
 use tracing::{debug, error, info};
@@ -89,19 +89,30 @@ pub(crate) async fn handle_connection(
                 );
             }
             Err(error) => {
-                error!(
-                    "Command with code {cmd_code} was not handled successfully, session: {session}, error: {error}."
-                );
-                if let IggyError::ClientNotFound(_) = error {
+                // Special handling for GetClusterMetadata when clustering is disabled
+                if cmd_code == GET_CLUSTER_METADATA_CODE
+                    && matches!(error, IggyError::FeatureUnavailable)
+                {
+                    debug!(
+                        "GetClusterMetadata command not available (clustering disabled), session: {session}."
+                    );
                     sender.send_error_response(error).await?;
                     debug!("TCP error response was sent to: {session}.");
-                    error!("Session: {session} will be deleted.");
-                    return Err(ConnectionError::from(IggyError::ClientNotFound(
-                        session.client_id,
-                    )));
                 } else {
-                    sender.send_error_response(error).await?;
-                    debug!("TCP error response was sent to: {session}.");
+                    error!(
+                        "Command with code {cmd_code} was not handled successfully, session: {session}, error: {error}."
+                    );
+                    if let IggyError::ClientNotFound(_) = error {
+                        sender.send_error_response(error).await?;
+                        debug!("TCP error response was sent to: {session}.");
+                        error!("Session: {session} will be deleted.");
+                        return Err(ConnectionError::from(IggyError::ClientNotFound(
+                            session.client_id,
+                        )));
+                    } else {
+                        sender.send_error_response(error).await?;
+                        debug!("TCP error response was sent to: {session}.");
+                    }
                 }
             }
         }

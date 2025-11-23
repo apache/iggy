@@ -19,6 +19,6 @@
 use crate::connectors::postgres::setup;
 
 #[tokio::test]
-async fn given_valid_configuration_postgres_sink_should_start() {
-    let _client = setup().await;
+async fn given_valid_configuration_postgres_sink_connector_should_start() {
+    let _runtime = setup().await;
 }

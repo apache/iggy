@@ -16,7 +16,6 @@
  * under the License.
  */
 
-#[allow(deprecated)]
 use crate::BinaryClient;
 use crate::SegmentClient;
 use crate::utils::auth::fail_if_not_authenticated;
