@@ -86,8 +86,8 @@ byte-unit = { version = "5.2.0", default-features = false, features = [
     "byte",
     "std",
 ] }
-bytes = "1.11.0"
 bytemuck = { version = "1.14" }
+bytes = "1.11.0"
 charming = "0.6.0"
 chrono = { version = "0.4.42", features = ["serde"] }
 clap = { version = "4.5.53", features = ["derive", "wrap_help"] }
