@@ -81,7 +81,7 @@ bench-runner = { path = "core/bench/runner" }
 bincode = { version = "2.0.1", features = ["serde"] }
 blake3 = "1.8.2"
 bon = "3.8.1"
-byte-unit = { version = "5.1.6", default-features = false, features = [
+byte-unit = { version = "5.2.0", default-features = false, features = [
     "serde",
     "byte",
     "std",
@@ -89,7 +89,7 @@ byte-unit = { version = "5.1.6", default-features = false, features = [
 bytes = "1.11.0"
 charming = "0.6.0"
 chrono = { version = "0.4.42", features = ["serde"] }
-clap = { version = "4.5.52", features = ["derive", "wrap_help"] }
+clap = { version = "4.5.53", features = ["derive", "wrap_help"] }
 colored = "3.0.0"
 comfy-table = "7.2.1"
 compio = { version = "0.16.1", features = [
@@ -128,16 +128,16 @@ human-repr = "1.1.0"
 humantime = "2.3.0"
 iceberg = "=0.6.0"
 iceberg-catalog-rest = "=0.6.0"
-iggy = { path = "core/sdk", version = "0.8.0-edge.6" }
-iggy_binary_protocol = { path = "core/binary_protocol", version = "0.8.0-edge.6" }
-iggy_common = { path = "core/common", version = "0.8.0-edge.6" }
-iggy_connector_sdk = { path = "core/connectors/sdk", version = "0.1.0-edge.4" }
+iggy = { path = "core/sdk", version = "0.8.0" }
+iggy_binary_protocol = { path = "core/binary_protocol", version = "0.8.0" }
+iggy_common = { path = "core/common", version = "0.8.0" }
+iggy_connector_sdk = { path = "core/connectors/sdk", version = "0.1.0" }
 integration = { path = "core/integration" }
 keyring = { version = "3.6.3", features = ["sync-secret-service", "vendored"] }
 lazy_static = "1.5.0"
 log = "0.4.28"
 mimalloc = "0.1"
-mockall = "0.13.1"
+mockall = "0.14.0"
 nonzero_lit = "0.1.2"
 once_cell = "1.21.3"
 parquet = "=55.2.0"

@@ -66,6 +66,7 @@ RELEASE_DIRS=(
   "core"
   "examples"
   "foreign"
+  "helm"
   "licenses"
   "scripts"
   "web"
@@ -77,6 +78,7 @@ IGNORED_FILES=(
 )
 
 IGNORED_DIRS=(
+  "assets"
   "target"
   "node_modules"
   "pkg"
@@ -91,6 +93,11 @@ IGNORED_DIRS=(
   ".eggs"
   ".venv"
   ".svelte-kit"
+  ".config"
+  ".github"
+  ".idea"
+  ".vscode"
+  ".zed"
 )
 
 for file in "${RELEASE_FILES[@]}"; do

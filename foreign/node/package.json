@@ -1,7 +1,7 @@
 {
   "name": "apache-iggy",
   "type": "module",
-  "version": "0.6.0-edge.3",
+  "version": "0.6.0",
   "description": "Official Apache Iggy NodeJS SDK",
   "keywords": [
     "iggy",
@@ -63,15 +63,15 @@
     "typescript-eslint": "^8.47.0"
   },
   "optionalDependencies": {
-    "@swc/core-darwin-arm64": "^1.15.2",
-    "@swc/core-darwin-x64": "^1.15.2",
-    "@swc/core-linux-arm-gnueabihf": "^1.15.2",
-    "@swc/core-linux-arm64-gnu": "^1.15.2",
-    "@swc/core-linux-arm64-musl": "^1.15.2",
-    "@swc/core-linux-x64-gnu": "^1.15.2",
-    "@swc/core-linux-x64-musl": "^1.15.2",
-    "@swc/core-win32-arm64-msvc": "^1.15.2",
-    "@swc/core-win32-ia32-msvc": "^1.15.2",
-    "@swc/core-win32-x64-msvc": "^1.15.2"
+    "@swc/core-darwin-arm64": "^1.15.3",
+    "@swc/core-darwin-x64": "^1.15.3",
+    "@swc/core-linux-arm-gnueabihf": "^1.15.3",
+    "@swc/core-linux-arm64-gnu": "^1.15.3",
+    "@swc/core-linux-arm64-musl": "^1.15.3",
+    "@swc/core-linux-x64-gnu": "^1.15.3",
+    "@swc/core-linux-x64-musl": "^1.15.3",
+    "@swc/core-win32-arm64-msvc": "^1.15.3",
+    "@swc/core-win32-ia32-msvc": "^1.15.3",
+    "@swc/core-win32-x64-msvc": "^1.15.3"
   }
 }
