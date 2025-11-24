@@ -19,6 +19,7 @@
 
 package org.apache.iggy.client.async;
 
+import org.apache.iggy.IntegrationTest;
 import org.apache.iggy.client.async.tcp.AsyncIggyTcpClient;
 import org.apache.iggy.consumergroup.Consumer;
 import org.apache.iggy.identifier.StreamId;
@@ -46,6 +47,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  * Integration test for the complete async client flow.
  * Tests connection, authentication, stream/topic management, and message operations.
  */
+@IntegrationTest
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
 class AsyncClientIntegrationTest {
     private static final Logger logger = LoggerFactory.getLogger(AsyncClientIntegrationTest.class);

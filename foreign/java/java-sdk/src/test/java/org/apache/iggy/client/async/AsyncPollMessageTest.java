@@ -19,6 +19,7 @@
 
 package org.apache.iggy.client.async;
 
+import org.apache.iggy.IntegrationTest;
 import org.apache.iggy.client.async.tcp.AsyncIggyTcpClient;
 import org.apache.iggy.consumergroup.Consumer;
 import org.apache.iggy.identifier.StreamId;
@@ -50,6 +51,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  * 2. Polling with invalid consumer ID returns error 1010
  * 3. Polling with valid consumer group member works correctly
  */
+@IntegrationTest
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
 public class AsyncPollMessageTest {
 

@@ -19,6 +19,7 @@
 
 package org.apache.iggy.client.async.tcp;
 
+import org.apache.iggy.IntegrationTest;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.AfterEach;
 import java.time.Duration;
@@ -31,6 +32,7 @@ import static org.junit.jupiter.api.Assertions.*;
  * Integration tests for AsyncIggyTcpClient builder pattern.
  * Tests the builder functionality against a running Iggy server.
  */
+@IntegrationTest
 class AsyncIggyTcpClientBuilderTest {
 
     private static final String HOST = "127.0.0.1";

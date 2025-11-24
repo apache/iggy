@@ -72,7 +72,15 @@ dependencies {
 }
 
 tasks.withType<Test> {
+    useJUnitPlatform {
+        excludeTags("integration")
+    }
+}
+
+// Task to run all tests including integration tests
+tasks.register<Test>("integrationTest") {
     useJUnitPlatform()
+    shouldRunAfter(tasks.test)
 }
 
 publishing {
