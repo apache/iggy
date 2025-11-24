@@ -4,6 +4,7 @@
   import { type Message, type HeaderField } from '$lib/domain/Message';
   import MessageDecoder from '$lib/components/MessageDecoder/MessageDecoder.svelte';
   import { decodeBase64 } from '$lib/utils/base64Utils';
+  import { formatMessageId } from '$lib/utils/formatters/uuidFormatter';
 
   interface Props {
     closeModal: CloseModalFn;
@@ -11,6 +12,8 @@
   }
 
   let { closeModal, message }: Props = $props();
+
+  const formattedId = $derived(message?.id ? formatMessageId(message.id) : 'N/A');
 
   const formatHeaders = (headers: Record<string, HeaderField> | null | undefined) => {
     if (!headers || Object.keys(headers).length === 0) {
@@ -36,7 +39,14 @@
     <div class="flex flex-col gap-4">
       <div class="bg-shade-l200 dark:bg-shade-d400 p-3 lg:p-4 rounded-md">
         <span class="text-xs text-shade-l900 dark:text-shade-l700 block mb-1">ID</span>
-        <div class="text-sm text-color font-medium">{message?.id ?? 'N/A'}</div>
+        <div class="text-sm text-color font-medium font-mono break-all">
+          {formattedId}
+          {#if formattedId !== message?.id && message?.id}
+            <span class="text-xs text-shade-l900 dark:text-shade-l700 block mt-1">
+              Raw: {message.id}
+            </span>
+          {/if}
+        </div>
       </div>
 
       <div class="bg-shade-l200 dark:bg-shade-d400 p-3 lg:p-4 rounded-md">
