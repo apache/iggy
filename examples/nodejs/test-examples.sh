@@ -50,7 +50,7 @@ test_example() {
     
     # Wait for the specified timeout
     local count=0
-    while [ $count -lt $timeout ]; do
+    while [ $count -lt "$timeout" ]; do
         if ! kill -0 $pid 2>/dev/null; then
             # Process finished
             output=$(cat /tmp/test_output_$$)
@@ -60,7 +60,6 @@ test_example() {
                 echo -e "${GREEN}✅ $name passed${NC}"
                 return 0
             else
-                local exit_code=$?
                 # Check if the output contains our expected error message
                 if echo "$output" | grep -q "This might be due to server version compatibility"; then
                     echo -e "${YELLOW}⚠️  $name completed with known server compatibility issue${NC}"

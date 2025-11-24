@@ -210,11 +210,4 @@ process.on('unhandledRejection', (reason, promise) => {
   process.exitCode = 1;
 });
 
-void (async () => {
-  try {
-    await main();
-  } catch (error) {
-    log('Main function error: %o', error);
-    process.exit(1);
-  }
-})();
+await main();

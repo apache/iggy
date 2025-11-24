@@ -19,6 +19,7 @@
 
 import { Client, Partitioning } from 'apache-iggy';
 import { log, sleep } from '../utils';
+import crypto from 'crypto';
 
 const SOURCES = ['browser', 'mobile', 'desktop', 'email', 'network', 'other'];
 const STATES = ['active', 'inactive', 'blocked', 'deleted', 'unknown'];
@@ -32,17 +33,10 @@ interface Record {
   state: string;
 }
 
-function randomString(length: number): string {
-  const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
-  let result = '';
-  for (let i = 0; i < length; i++) {
-    result += chars.charAt(Math.floor(Math.random() * chars.length));
-  }
-  return result;
-}
+
 
 function randomRecord(): Record {
-  const userId = `user-${randomString(8)}`;
+  const userId = `user-${crypto.randomBytes(8).toString('hex')}`;
   const now = new Date();
   const daysAgo = Math.floor(Math.random() * 30);
   const createdAt = new Date(now.getTime() - daysAgo * 24 * 60 * 60 * 1000);
@@ -207,4 +201,4 @@ async function main() {
   }
 }
 
-main();
+await main();
