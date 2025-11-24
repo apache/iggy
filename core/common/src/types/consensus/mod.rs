@@ -48,6 +48,7 @@ where
     /// - buffer is too small for the header
     /// - buffer is too small for the size specified in the header
     /// - header validation fails
+    #[allow(unused)]
     pub fn from_bytes(buffer: Bytes) -> Result<Self, header::ConsensusError> {
         // verify minimum size
         if buffer.len() < size_of::<H>() {
@@ -80,6 +81,7 @@ where
     /// Create a new message with a specific size, initializing the buffer with zeros.
     ///
     /// The header will be zeroed and must be initialized by the caller.
+    #[allow(unused)]
     pub fn new(size: usize) -> Self {
         assert!(size >= size_of::<H>(), "Size must be at least header size");
         let buffer = Bytes::from(vec![0u8; size]);
@@ -94,6 +96,7 @@ where
     /// This uses `bytemuck::from_bytes` to cast the buffer to the header type
     /// without any copying or allocation.
     #[inline]
+    #[allow(unused)]
     pub fn header(&self) -> &H {
         let header_bytes = &self.buffer[..size_of::<H>()];
         bytemuck::from_bytes(header_bytes)
@@ -103,6 +106,7 @@ where
     ///
     /// Returns an empty slice if there is no body.
     #[inline]
+    #[allow(unused)]
     pub fn body(&self) -> &[u8] {
         let header_size = size_of::<H>();
         let total_size = self.header().size() as usize;
@@ -116,6 +120,7 @@ where
 
     /// Get the complete message as bytes (header + body).
     #[inline]
+    #[allow(unused)]
     pub fn as_bytes(&self) -> &[u8] {
         let total_size = self.header().size() as usize;
         &self.buffer[..total_size]
@@ -123,12 +128,14 @@ where
 
     /// Get the underlying buffer.
     #[inline]
+    #[allow(unused)]
     pub fn buffer(&self) -> &Bytes {
         &self.buffer
     }
 
     /// Convert into the underlying buffer.
     #[inline]
+    #[allow(unused)]
     pub fn into_buffer(self) -> Bytes {
         self.buffer
     }
@@ -141,6 +148,7 @@ where
     /// - The buffer is already validated
     /// - If doing a zero-cost type conversion (like to GenericHeader)
     #[inline]
+    #[allow(unused)]
     fn from_buffer_unchecked(buffer: Bytes) -> Self {
         Self {
             buffer,
@@ -151,11 +159,13 @@ where
     /// Convert to a generic message (erasing the specific header type).
     ///
     /// This allows treating any message as a generic message for common operations.
+    #[allow(unused)]
     pub fn into_generic(self) -> Message<header::GenericHeader> {
         Message::from_buffer_unchecked(self.buffer)
     }
 
     /// Get a reference to this message as a generic message.
+    #[allow(unused)]
     pub fn as_generic(&self) -> &Message<header::GenericHeader> {
         // SAFETY: Message<H> and Message<GenericHeader> have the same memory layout
         // because they only differ in the PhantomData type parameter
@@ -172,6 +182,7 @@ where
     /// Returns an error if:
     /// - The command doesn't match the target type
     /// - The target header validation fails
+    #[allow(unused)]
     pub fn try_into_typed<T>(self) -> Result<Message<T>, header::ConsensusError>
     where
         T: ConsensusHeader,
@@ -201,6 +212,7 @@ where
     /// Try to get a reference to this message as a different header type.
     ///
     /// This is similar to `try_into_typed` but borrows instead of consuming.
+    #[allow(unused)]
     pub fn try_as_typed<T>(&self) -> Result<&Message<T>, header::ConsensusError>
     where
         T: ConsensusHeader,
@@ -240,6 +252,7 @@ pub enum MessageBag {
 }
 
 impl MessageBag {
+    #[allow(unused)]
     pub fn command(&self) -> header::Command {
         match self {
             MessageBag::Generic(message) => message.header().command,
@@ -249,6 +262,7 @@ impl MessageBag {
         }
     }
 
+    #[allow(unused)]
     pub fn size(&self) -> u32 {
         match self {
             MessageBag::Generic(message) => message.header().size(),
@@ -258,6 +272,7 @@ impl MessageBag {
         }
     }
 
+    #[allow(unused)]
     pub fn as_prepare(&self) -> Option<&Message<header::PrepareHeader>> {
         match self {
             MessageBag::Prepare(m) => Some(m),
@@ -265,6 +280,7 @@ impl MessageBag {
         }
     }
 
+    #[allow(unused)]
     pub fn as_commit(&self) -> Option<&Message<header::CommitHeader>> {
         match self {
             MessageBag::Commit(m) => Some(m),
@@ -272,6 +288,7 @@ impl MessageBag {
         }
     }
 
+    #[allow(unused)]
     pub fn as_reply(&self) -> Option<&Message<header::ReplyHeader>> {
         match self {
             MessageBag::Reply(m) => Some(m),
@@ -279,6 +296,7 @@ impl MessageBag {
         }
     }
 
+    #[allow(unused)]
     pub fn into_prepare(self) -> Result<Message<header::PrepareHeader>, Self> {
         match self {
             MessageBag::Prepare(m) => Ok(m),
@@ -286,6 +304,7 @@ impl MessageBag {
         }
     }
 
+    #[allow(unused)]
     pub fn into_commit(self) -> Result<Message<header::CommitHeader>, Self> {
         match self {
             MessageBag::Commit(m) => Ok(m),
@@ -293,6 +312,7 @@ impl MessageBag {
         }
     }
 
+    #[allow(unused)]
     pub fn into_reply(self) -> Result<Message<header::ReplyHeader>, Self> {
         match self {
             MessageBag::Reply(m) => Ok(m),
@@ -300,6 +320,7 @@ impl MessageBag {
         }
     }
 
+    #[allow(unused)]
     pub fn into_generic(self) -> Message<header::GenericHeader> {
         match self {
             MessageBag::Generic(m) => m,
@@ -309,6 +330,7 @@ impl MessageBag {
         }
     }
 
+    #[allow(unused)]
     pub fn as_generic(&self) -> &Message<header::GenericHeader> {
         match self {
             MessageBag::Generic(m) => m,
@@ -407,8 +429,13 @@ mod tests {
         header.size = 256;
         header.command = header::Command::Reserved;
 
-        for i in size_of::<header::GenericHeader>()..256 {
-            buffer[i] = (i % 256) as u8;
+        for (i, item) in buffer
+            .iter_mut()
+            .enumerate()
+            .take(256)
+            .skip(size_of::<header::GenericHeader>())
+        {
+            *item = (i % 256) as u8;
         }
 
         let message = Message::<header::GenericHeader>::from_bytes(Bytes::from(buffer)).unwrap();

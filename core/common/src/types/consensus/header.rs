@@ -30,6 +30,7 @@ pub trait ConsensusHeader: Sized + Pod + Zeroable {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+#[expect(unused)]
 pub enum Command {
     Reserved = 0,
 
@@ -59,6 +60,7 @@ pub enum Command {
 }
 
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
+#[expect(unused)]
 pub enum ConsensusError {
     #[error("invalid command: expected {expected:?}, found {found:?}")]
     InvalidCommand { expected: Command, found: Command },
@@ -94,6 +96,7 @@ pub enum ConsensusError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+#[expect(unused)]
 pub enum Operation {
     CreateStream = 128,
     UpdateStream = 129,
