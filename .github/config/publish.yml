@@ -108,8 +108,8 @@ components:
   sdk-java:
     tag_pattern: "^java-sdk-([0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?)$"
     registry: maven
-    version_file: "foreign/java/java-sdk/build.gradle.kts"
-    version_regex: '(?m)^\s*version\s*=\s*"([^"]+)"'
+    version_file: "foreign/java/gradle.properties"
+    version_regex: '(?m)^\s*version\s*=\s*([^\s]+)'
 
   sdk-csharp:
     tag_pattern: "^csharp-sdk-([0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?)$"
