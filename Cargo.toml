@@ -127,7 +127,7 @@ futures-util = "0.3.31"
 human-repr = "1.1.0"
 humantime = "2.3.0"
 iceberg = "=0.6.0"
-iceberg-catalog-rest = "=0.6.0"
+iceberg-catalog-rest = "=0.7.0"
 iggy = { path = "core/sdk", version = "0.8.0" }
 iggy_binary_protocol = { path = "core/binary_protocol", version = "0.8.0" }
 iggy_common = { path = "core/common", version = "0.8.0" }
