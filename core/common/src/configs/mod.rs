@@ -1,4 +1,5 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
  * regarding copyright ownership.  The ASF licenses this file
@@ -51,6 +52,7 @@ pub enum ConfigurationError {
     DefaultSerializationFailed,
     DefaultParsingFailed,
     EnvironmentVariableParsingFailed,
+    InvalidConfigurationValue,
 }
 
 impl Display for ConfigurationError {
@@ -64,6 +66,9 @@ impl Display for ConfigurationError {
             Self::EnvironmentVariableParsingFailed => {
                 write!(f, "Failed to parse environment variables")
             }
+            Self::InvalidConfigurationValue => {
+                write!(f, "Provided configuration value is invalid")
+            }
         }
     }
 }
@@ -71,7 +76,7 @@ impl Display for ConfigurationError {
 impl std::error::Error for ConfigurationError {}
 
 pub trait ConfigProvider<T: ConfigurationType> {
-    fn load_config(self) -> impl Future<Output = Result<T, ConfigurationError>>;
+    fn load_config(&self) -> impl Future<Output = Result<T, ConfigurationError>>;
 }
 
 /// File-based configuration provider that combines file, default, and environment configurations
@@ -263,12 +268,29 @@ impl<T: ConfigurationType> CustomEnvProvider<T> {
             if remaining_path.is_empty() {
                 arr[array_index] = value;
             } else if let FigmentValue::Dict(_, elem_dict) = &mut arr[array_index] {
-                Self::insert_environment_override(
-                    &Dict::new(),
-                    elem_dict,
-                    remaining_path.to_vec(),
-                    value,
-                );
+                // TODO(hubcio): this is workaround done by Claude because this code is overly
+                // complicated and I don't want to spend time on it.
+                // For nested structures in arrays, check if we need to create intermediate dicts
+                // Handle the "ports" case where it should be a nested structure
+                if remaining_path.len() >= 2 && remaining_path[0] == "ports" {
+                    // Create the ports dict if it doesn't exist
+                    elem_dict
+                        .entry("ports".to_string())
+                        .or_insert_with(|| FigmentValue::Dict(Tag::Default, Dict::new()));
+
+                    if let Some(FigmentValue::Dict(_, ports_dict)) = elem_dict.get_mut("ports") {
+                        // Insert the specific port value (tcp, quic, http, websocket)
+                        ports_dict.insert(remaining_path[1].clone(), value);
+                    }
+                } else {
+                    // Default behavior for other fields
+                    Self::insert_environment_override(
+                        &Dict::new(),
+                        elem_dict,
+                        remaining_path.to_vec(),
+                        value,
+                    );
+                }
             }
         }
     }
@@ -682,7 +704,11 @@ impl<T: ConfigurationType> CustomEnvProvider<T> {
             _ => {}
         }
 
-        // Try parsing as integer
+        // Try u64 first for most numeric values (ports, byte sizes, etc.)
+        if let Ok(uint_val) = value.parse::<u64>() {
+            return FigmentValue::from(uint_val);
+        }
+        // Fall back to i64 for signed integers
         if let Ok(int_val) = value.parse::<i64>() {
             return FigmentValue::from(int_val);
         }
@@ -725,13 +751,13 @@ fn file_exists<P: AsRef<Path>>(path: P) -> bool {
 }
 
 impl<T: ConfigurationType, P: Provider + Clone> ConfigProvider<T> for FileConfigProvider<P> {
-    async fn load_config(self) -> Result<T, ConfigurationError> {
+    async fn load_config(&self) -> Result<T, ConfigurationError> {
         println!("Loading config from path: '{}'...", self.file_path);
 
         // Start with the default configuration if provided
         let mut config_builder = Figment::new();
         let has_default = self.default_config.is_some();
-        if let Some(default) = self.default_config {
+        if let Some(default) = &self.default_config {
             config_builder = config_builder.merge(default);
         } else {
             println!("No default configuration provided.");
@@ -752,7 +778,7 @@ impl<T: ConfigurationType, P: Provider + Clone> ConfigProvider<T> for FileConfig
         }
 
         // Merge environment variables into the configuration
-        config_builder = config_builder.merge(self.env_provider);
+        config_builder = config_builder.merge(self.env_provider.clone());
 
         // Finally, attempt to extract the final configuration
         let config_result: Result<T, figment::Error> = config_builder.extract();

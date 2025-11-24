@@ -1,4 +1,5 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
  * regarding copyright ownership.  The ASF licenses this file
@@ -22,7 +23,7 @@ use std::array::TryFromSliceError;
 use std::io;
 
 error_set!(
-    ServerError := ConfigError || ArchiverError || ConnectionError || LogError || CompatError || QuicError
+    ServerError := ConfigurationError || ArchiverError || ConnectionError || LogError || CompatError || QuicError
 
     IoError := {
         #[display("IO error")]
@@ -35,18 +36,8 @@ error_set!(
         ReadToEndError(ReadError)
     }
 
-    ConfigError := {
-        #[display("Invalid configuration provider: {}", provider_type)]
-        InvalidConfigurationProvider { provider_type: String },
-
-        #[display("Cannot load configuration")]
-        CannotLoadConfiguration,
-
-        #[display("Invalid configuration")]
-        InvalidConfiguration,
-
-        #[display("Cache config validation failure")]
-        CacheConfigValidationFailure,
+    ConfigurationError := {
+        ConfigurationError(iggy_common::ConfigurationError),
     }
 
     ArchiverError := {

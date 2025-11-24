@@ -1,4 +1,5 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
  * regarding copyright ownership.  The ASF licenses this file
@@ -15,25 +16,38 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-
+use crate::IGGY_ROOT_PASSWORD_ENV;
 use crate::configs::COMPONENT;
 use crate::configs::cluster::ClusterConfig;
-use crate::configs::config_provider::ConfigProviderKind;
 use crate::configs::http::HttpConfig;
 use crate::configs::quic::QuicConfig;
 use crate::configs::system::SystemConfig;
 use crate::configs::tcp::TcpConfig;
 use crate::configs::websocket::WebSocketConfig;
-use crate::server_error::ConfigError;
+use crate::server_error::ConfigurationError;
 use derive_more::Display;
 use err_trail::ErrContext;
-use iggy_common::IggyDuration;
-use iggy_common::Validatable;
+use figment::providers::{Format, Toml};
+use figment::value::Dict;
+use figment::{Metadata, Profile, Provider};
+use iggy_common::{ConfigProvider, Validatable};
+use iggy_common::{CustomEnvProvider, FileConfigProvider, IggyDuration};
 use serde::{Deserialize, Serialize};
 use serde_with::DisplayFromStr;
 use serde_with::serde_as;
+use std::env;
 use std::str::FromStr;
 use std::sync::Arc;
+
+const DEFAULT_CONFIG_PATH: &str = "configs/server.toml";
+const SECRET_KEYS: [&str; 6] = [
+    IGGY_ROOT_PASSWORD_ENV,
+    "IGGY_DATA_MAINTENANCE_ARCHIVER_S3_KEY_SECRET",
+    "IGGY_HTTP_JWT_ENCODING_SECRET",
+    "IGGY_HTTP_JWT_DECODING_SECRET",
+    "IGGY_TCP_TLS_PASSWORD",
+    "IGGY_SYSTEM_ENCRYPTION_KEY",
+];
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ServerConfig {
@@ -136,13 +150,52 @@ impl FromStr for TelemetryTransport {
 }
 
 impl ServerConfig {
-    pub async fn load(config_provider: &ConfigProviderKind) -> Result<ServerConfig, ConfigError> {
-        let server_config = config_provider.load_config().await.with_error(|error| {
-            format!("{COMPONENT} (error: {error}) - failed to load config provider config")
-        })?;
+    pub async fn load() -> Result<ServerConfig, ConfigurationError> {
+        let config_path =
+            env::var("IGGY_CONFIG_PATH").unwrap_or_else(|_| DEFAULT_CONFIG_PATH.to_string());
+        let config_provider = ServerConfig::config_provider(&config_path);
+        let server_config: ServerConfig =
+            config_provider.load_config().await.with_error(|error| {
+                format!("{COMPONENT} (error: {error}) - failed to load config provider config")
+            })?;
         server_config.validate().with_error(|error| {
             format!("{COMPONENT} (error: {error}) - failed to validate server config")
         })?;
         Ok(server_config)
+    }
+
+    pub fn config_provider(config_path: &str) -> FileConfigProvider<ServerConfigEnvProvider> {
+        let default_config = Toml::string(include_str!("../../../configs/server.toml"));
+        FileConfigProvider::new(
+            config_path.to_string(),
+            ServerConfigEnvProvider::default(),
+            true,
+            Some(default_config),
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ServerConfigEnvProvider {
+    provider: CustomEnvProvider<ServerConfig>,
+}
+
+impl Default for ServerConfigEnvProvider {
+    fn default() -> Self {
+        Self {
+            provider: CustomEnvProvider::new("IGGY_", &SECRET_KEYS),
+        }
+    }
+}
+
+impl Provider for ServerConfigEnvProvider {
+    fn metadata(&self) -> Metadata {
+        Metadata::named("iggy-server config")
+    }
+
+    fn data(&self) -> Result<figment::value::Map<Profile, Dict>, figment::Error> {
+        self.provider.deserialize().map_err(|_| {
+            figment::Error::from("Cannot deserialize environment variables for server config")
+        })
     }
 }

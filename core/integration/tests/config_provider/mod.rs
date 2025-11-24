@@ -1,4 +1,5 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
  * regarding copyright ownership.  The ASF licenses this file
@@ -16,11 +17,11 @@
  * under the License.
  */
 
-use serial_test::serial;
-use server::configs::config_provider::{ConfigProvider, FileConfigProvider};
-use std::env;
-
+use iggy_common::ConfigProvider;
 use integration::file::get_root_path;
+use serial_test::serial;
+use server::configs::server::ServerConfig;
+use std::env;
 
 #[serial]
 #[tokio::test]
@@ -44,8 +45,9 @@ async fn validate_config_env_override() {
     }
 
     let config_path = get_root_path().join("../configs/server.toml");
-    let file_config_provider = FileConfigProvider::new(config_path.as_path().display().to_string());
-    let config = file_config_provider
+    let file_config_provider =
+        ServerConfig::config_provider(&config_path.as_path().display().to_string());
+    let config: ServerConfig = file_config_provider
         .load_config()
         .await
         .expect("Failed to load server.toml config");
@@ -85,8 +87,9 @@ async fn validate_socket_override() {
     }
 
     let config_path = get_root_path().join("../configs/server.toml");
-    let file_config_provider = FileConfigProvider::new(config_path.as_path().display().to_string());
-    let config = file_config_provider
+    let file_config_provider =
+        ServerConfig::config_provider(&config_path.as_path().display().to_string());
+    let config: ServerConfig = file_config_provider
         .load_config()
         .await
         .expect("Failed to load server.toml config with socket override");
@@ -113,8 +116,9 @@ async fn validate_socket_override() {
 #[tokio::test]
 async fn validate_socket_no_override() {
     let config_path = get_root_path().join("../configs/server.toml");
-    let file_config_provider = FileConfigProvider::new(config_path.as_path().display().to_string());
-    let config = file_config_provider
+    let file_config_provider =
+        ServerConfig::config_provider(&config_path.as_path().display().to_string());
+    let config: ServerConfig = file_config_provider
         .load_config()
         .await
         .expect("Failed to load server.toml config without socket override");
@@ -198,8 +202,9 @@ async fn validate_cluster_config_env_override() {
     }
 
     let config_path = get_root_path().join("../configs/server.toml");
-    let file_config_provider = FileConfigProvider::new(config_path.as_path().display().to_string());
-    let config = file_config_provider
+    let file_config_provider =
+        ServerConfig::config_provider(&config_path.as_path().display().to_string());
+    let config: ServerConfig = file_config_provider
         .load_config()
         .await
         .expect("Failed to load server.toml config with cluster env overrides");
@@ -388,8 +393,9 @@ async fn validate_four_node_cluster_config_env_override() {
     }
 
     let config_path = get_root_path().join("../configs/server.toml");
-    let file_config_provider = FileConfigProvider::new(config_path.as_path().display().to_string());
-    let config = file_config_provider
+    let file_config_provider =
+        ServerConfig::config_provider(&config_path.as_path().display().to_string());
+    let config: ServerConfig = file_config_provider
         .load_config()
         .await
         .expect("Failed to load server.toml config with 4-node cluster env overrides");
