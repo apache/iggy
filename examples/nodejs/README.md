@@ -30,7 +30,7 @@ IGGY_HTTP_ENABLED=true IGGY_TCP_ADDRESS=0.0.0.0:8090 cargo run --bin iggy-server
 and then install Node.js dependencies:
 
 ```bash
-npm install
+npm ci
 ```
 
 ## Basic Examples
@@ -44,13 +44,6 @@ npm run test:getting-started:producer
 npm run test:getting-started:consumer
 ```
 
-JavaScript versions:
-
-```bash
-npm run test:js:getting-started:producer
-npm run test:js:getting-started:consumer
-```
-
 ### Basic Usage
 
 Core functionality with detailed configuration options:
@@ -58,13 +51,6 @@ Core functionality with detailed configuration options:
 ```bash
 npm run test:basic:producer
 npm run test:basic:consumer
-```
-
-JavaScript versions:
-
-```bash
-npm run test:js:basic:producer
-npm run test:js:basic:consumer
 ```
 
 Demonstrates fundamental client connection, authentication, batch message sending, and polling with support for TCP transport.

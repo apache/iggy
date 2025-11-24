@@ -60,12 +60,12 @@ function parseArgs() {
 function handleMessage(message: any): void {
   // The payload can be of any type as it is a raw byte array. In this case it's a JSON string.
   const payload = new TextDecoder().decode(new Uint8Array(Object.values(message.payload)));
-  
+
   try {
     const envelope = JSON.parse(payload);
     const messageType = envelope.messageType;
     const data = envelope.data;
-    
+
     log('Handling message type: %s...', messageType);
 
     switch (messageType) {

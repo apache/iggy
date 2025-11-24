@@ -44,7 +44,7 @@ interface OrderRejected {
   reason: string;
 }
 
-type MessageTypes = OrderCreated | OrderConfirmed | OrderRejected;
+export type MessageTypes = OrderCreated | OrderConfirmed | OrderRejected;
 
 const ORDER_CREATED_TYPE = 'OrderCreated';
 const ORDER_CONFIRMED_TYPE = 'OrderConfirmed';
@@ -109,7 +109,7 @@ async function produceMessages(
     interval
   );
 
-  let messageGenerator = new MessagesGenerator();
+  const messageGenerator = new MessagesGenerator();
   let sentBatches = 0;
 
   while (sentBatches < BATCHES_LIMIT) {

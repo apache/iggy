@@ -36,18 +36,18 @@ test_example() {
     local name="$1"
     local command="$2"
     local timeout="${3:-10}"
-    
+
     echo -e "\n${YELLOW}Testing $name...${NC}"
     echo "Command: $command"
-    
+
     # Run the command with timeout using background process
     local output
     local pid
-    
+
     # Start the command in background
     $command > /tmp/test_output_$$ 2>&1 &
     pid=$!
-    
+
     # Wait for the specified timeout
     local count=0
     while [ $count -lt "$timeout" ]; do
@@ -55,7 +55,7 @@ test_example() {
             # Process finished
             output=$(cat /tmp/test_output_$$)
             rm -f /tmp/test_output_$$
-            
+
             if wait $pid; then
                 echo -e "${GREEN}✅ $name passed${NC}"
                 return 0
@@ -74,12 +74,12 @@ test_example() {
         sleep 1
         count=$((count + 1))
     done
-    
+
     # Timeout reached, kill the process
     kill $pid 2>/dev/null
     wait $pid 2>/dev/null
     rm -f /tmp/test_output_$$
-    
+
     echo -e "${YELLOW}⏰ $name timed out after ${timeout}s (this is expected for long-running examples)${NC}"
     return 0
 }
@@ -103,14 +103,33 @@ echo -e "${GREEN}✅ Iggy server is running${NC}"
 echo -e "\n${YELLOW}Testing Getting Started Examples${NC}"
 test_example "Getting Started Producer (TS)" "npm run test:getting-started:producer" 10
 test_example "Getting Started Consumer (TS)" "npm run test:getting-started:consumer" 8
-test_example "Getting Started Producer (JS)" "npm run test:js:getting-started:producer" 10
-test_example "Getting Started Consumer (JS)" "npm run test:js:getting-started:consumer" 8
 
 # Test basic examples
 echo -e "\n${YELLOW}Testing Basic Examples${NC}"
 test_example "Basic Producer" "npm run test:basic:producer" 10
 test_example "Basic Consumer" "npm run test:basic:consumer" 8
-test_example "Basic Producer (JS)" "npm run test:js:basic:producer" 10
-test_example "Basic Consumer (JS)" "npm run test:js:basic:consumer" 8
+
+# Message envelope examples
+echo -e "\n${YELLOW}Testing Message Envelope Examples${NC}"
+test_example "Message Envelope Producer" "npm run test:message-envelope:producer" 10
+test_example "Message Envelope Consumer" "npm run test:message-envelope:consumer" 8
+
+# Message headers examples
+echo -e "\n${YELLOW}Testing Message Headers Examples${NC}"
+test_example "Message Headers Producer" "npm run test:message-headers:producer" 10
+test_example "Message Headers Consumer" "npm run test:message-headers:consumer" 8
+
+# Multi-tenant examples
+echo -e "\n${YELLOW}Testing Multi-Tenant Examples${NC}"
+test_example "Multi-Tenant Producer" "npm run test:multi-tenant:producer" 10
+test_example "Multi-Tenant Consumer" "npm run test:multi-tenant:consumer" 8
+
+# Stream builder example
+echo -e "\n${YELLOW}Testing Stream Builder Example${NC}"
+test_example "Stream Builder" "npm run test:stream-builder" 8
+
+# Sink data producer
+echo -e "\n${YELLOW}Testing Sink Data Producer${NC}"
+test_example "Sink Data Producer" "npm run test:sink-data-producer" 8
 
 echo -e "\n${GREEN}🎉 All tests completed!${NC}"

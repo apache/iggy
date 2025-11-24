@@ -164,7 +164,7 @@ async function main() {
     log('Connected successfully.');
     // Login will be handled automatically by the client on first command
 
-    let { stream, topic } = await initSystem(client);
+    const { stream, topic } = await initSystem(client);
     streamId = stream.id;
     topicId = topic.id;
 

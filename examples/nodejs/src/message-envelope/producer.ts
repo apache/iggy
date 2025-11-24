@@ -21,7 +21,6 @@ import { Client, Partitioning } from 'apache-iggy';
 import { cleanup, initSystem, log, parseArgs, sleep } from '../utils';
 
 
-const PARTITION_COUNT = 5;
 const BATCHES_LIMIT = 5;
 const MESSAGES_PER_BATCH = 10;
 
@@ -45,9 +44,9 @@ interface OrderRejected {
   reason: string;
 }
 
-type MessageTypes = OrderCreated | OrderConfirmed | OrderRejected;
+export type MessageTypes = OrderCreated | OrderConfirmed | OrderRejected;
 
-interface MessageEnvelope {
+export interface MessageEnvelope {
   message_type: string;
   payload: string;
 }
@@ -120,7 +119,7 @@ async function produceMessages(
     interval
   );
 
-  let messageGenerator = new MessagesGenerator();
+  const messageGenerator = new MessagesGenerator();
   let sentBatches = 0;
 
   while (sentBatches < BATCHES_LIMIT) {

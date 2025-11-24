@@ -30,13 +30,13 @@ const MESSAGES_PER_BATCH = 10;
 function parseArgs() {
   const args = process.argv.slice(2);
   const connectionString = args[0] || 'iggy+tcp://iggy:iggy@127.0.0.1:8090';
-  
+
   if (args.length > 0 && (args[0] === '-h' || args[0] === '--help')) {
     log('Usage: node consumer.js [connection_string]');
     log('Example: node consumer.js iggy+tcp://iggy:iggy@127.0.0.1:8090');
     process.exit(0);
   }
-  
+
   return { connectionString };
 }
 
@@ -73,7 +73,7 @@ async function consumeMessages(client: Client) {
       }
 
       offset += polledMessages.messages.length;
-      
+
       for (const message of polledMessages.messages) {
         const payload = message.payload.toString();
         const { offset, timestamp } = message.headers;
@@ -95,16 +95,16 @@ async function consumeMessages(client: Client) {
 
 async function main() {
   const args = parseArgs();
-  
+
   log('Using connection string: %s', args.connectionString);
-  
+
   // Parse connection string (simplified parsing for this example)
   const url = new URL(args.connectionString.replace('iggy+tcp://', 'http://'));
   const host = url.hostname;
   const port = parseInt(url.port) || 8090;
   const username = url.username || 'iggy';
   const password = url.password || 'iggy';
-  
+
   const client = new Client({
     transport: 'TCP',
     options: { port, host },

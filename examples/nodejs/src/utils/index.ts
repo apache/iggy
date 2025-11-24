@@ -18,7 +18,7 @@
  */
 
 import crypto from 'crypto';
-import { Client, Consumer, PollingStrategy } from 'apache-iggy';
+import { Client } from 'apache-iggy';
 import debug from 'debug';
 
 export const log = debug('iggy:getting-started:consumer');

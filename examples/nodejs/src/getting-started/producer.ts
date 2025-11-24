@@ -18,11 +18,9 @@
  */
 
 import { Client, Partitioning } from 'apache-iggy';
-import crypto from 'crypto';
 import { cleanup, initSystem, parseArgs, sleep } from '../utils';
 const log = console.log;
 
-const PARTITION_COUNT = 5;
 const BATCHES_LIMIT = 5;
 const MESSAGES_PER_BATCH = 10;
 
@@ -109,7 +107,7 @@ async function main() {
     log('Connected successfully.');
     // Login will be handled automatically by the client on first command
 
-    let { stream, topic } = await initSystem(client);
+    const { stream, topic } = await initSystem(client);
     streamId = stream.id;
     topicId = topic.id;
 

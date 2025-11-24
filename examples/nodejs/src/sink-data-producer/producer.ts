@@ -23,7 +23,7 @@ import crypto from 'crypto';
 
 const SOURCES = ['browser', 'mobile', 'desktop', 'email', 'network', 'other'];
 const STATES = ['active', 'inactive', 'blocked', 'deleted', 'unknown'];
-const DOMAINS = ['gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com', 'aol.com'];
+// const DOMAINS = ['gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com', 'aol.com'];
 
 interface Record {
   user_id: string;
@@ -43,7 +43,7 @@ function randomRecord(): Record {
 
   const source = SOURCES[Math.floor(Math.random() * SOURCES.length)];
   const state = STATES[Math.floor(Math.random() * STATES.length)];
-  const domain = DOMAINS[Math.floor(Math.random() * DOMAINS.length)];
+  // const domain = DOMAINS[Math.floor(Math.random() * DOMAINS.length)];
 
   return {
     user_id: userId,
@@ -102,6 +102,7 @@ async function produceData(client: Client, streamName: string, topicName: string
       stream = await client.stream.create({ name: streamName });
     }
   } catch (error) {
+    log(`Error getting or creating stream: ${error}`);
     stream = await client.stream.create({ name: streamName });
   }
 
@@ -122,6 +123,7 @@ async function produceData(client: Client, streamName: string, topicName: string
       });
     }
   } catch (error) {
+    log(`Error getting or creating topic: ${error}`);
     topic = await client.topic.create({
       streamId: stream.id,
       name: topicName,

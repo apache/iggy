@@ -34,12 +34,12 @@ interface Args {
 function parseArgs(): Args {
   const args = process.argv.slice(2);
   const tcpServerAddress = args[0] || '127.0.0.1:8090';
-  
+
   if (args.length > 0 && args[0] !== '--tcp-server-address') {
     console.error('Invalid argument! Usage: node consumer.js [--tcp-server-address <server-address>]');
     process.exit(1);
   }
-  
+
   return { tcpServerAddress };
 }
 
@@ -78,14 +78,14 @@ async function consumeMessages(client: Client): Promise<void> {
       }
 
       offset += polledMessages.messages.length;
-      
+
       for (const message of polledMessages.messages) {
         handleMessage(message);
       }
-      
+
       consumedBatches++;
       log('Consumed %d message(s) in batch %d.', polledMessages.messages.length, consumedBatches);
-      
+
       await new Promise(resolve => setTimeout(resolve, interval));
     } catch (error) {
       log('Error consuming messages: %o', error);
@@ -108,12 +108,12 @@ function handleMessage(message: any): void {
 
 async function main(): Promise<void> {
   const args = parseArgs();
-  
+
   log('Using server address: %s', args.tcpServerAddress);
-  
+
   const client = new Client({
     transport: 'TCP',
-    options: { 
+    options: {
       port: parseInt(args.tcpServerAddress.split(':')[1]) || 8090,
       host: args.tcpServerAddress.split(':')[0] || '127.0.0.1'
     },
