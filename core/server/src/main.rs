@@ -1,4 +1,5 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
  * regarding copyright ownership.  The ASF licenses this file
@@ -28,7 +29,6 @@ use server::bootstrap::{
     create_directories, create_shard_connections, create_shard_executor, load_config, load_streams,
     load_users, resolve_persister, update_system_info,
 };
-use server::configs::config_provider::{self};
 use server::configs::sharding::CpuAllocation;
 use server::diagnostics::{print_io_uring_permission_info, print_locked_memory_limit_info};
 use server::io::fs_utils;
@@ -99,8 +99,7 @@ fn main() -> Result<(), ServerError> {
         // FIRST DISCRETE LOADING STEP.
         // Load config and create directories.
         // Remove `local_data` directory if run with `--fresh` flag.
-        let config_provider = config_provider::resolve(&args.config_provider)?;
-        let config = load_config(&config_provider).await.with_error(|error| {
+        let config = load_config().await.with_error(|error| {
             format!("{COMPONENT} (error: {error}) - failed to load config during bootstrap")
         })?;
         if args.fresh {

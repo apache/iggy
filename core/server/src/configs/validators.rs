@@ -1,4 +1,5 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
  * regarding copyright ownership.  The ASF licenses this file
@@ -25,18 +26,17 @@ use super::system::{CompressionConfig, MemoryPoolConfig, PartitionConfig};
 use crate::configs::COMPONENT;
 use crate::configs::server::{PersonalAccessTokenConfig, ServerConfig};
 use crate::configs::system::SegmentConfig;
-use crate::server_error::ConfigError;
 use crate::streaming::segments::*;
 use err_trail::ErrContext;
-use iggy_common::CompressionAlgorithm;
 use iggy_common::IggyExpiry;
 use iggy_common::MaxTopicSize;
 use iggy_common::Validatable;
+use iggy_common::{CompressionAlgorithm, ConfigurationError};
 use std::thread::available_parallelism;
 use tracing::error;
 
-impl Validatable<ConfigError> for ServerConfig {
-    fn validate(&self) -> Result<(), ConfigError> {
+impl Validatable<ConfigurationError> for ServerConfig {
+    fn validate(&self) -> Result<(), ConfigurationError> {
         self.system.memory_pool.validate().with_error(|error| {
             format!("{COMPONENT} (error: {error}) - failed to validate memory pool config")
         })?;
@@ -67,29 +67,29 @@ impl Validatable<ConfigError> for ServerConfig {
         let topic_size = match self.system.topic.max_size {
             MaxTopicSize::Custom(size) => Ok(size.as_bytes_u64()),
             MaxTopicSize::Unlimited => Ok(u64::MAX),
-            MaxTopicSize::ServerDefault => Err(ConfigError::InvalidConfiguration),
+            MaxTopicSize::ServerDefault => Err(ConfigurationError::InvalidConfigurationValue),
         }?;
 
         if let IggyExpiry::ServerDefault = self.system.segment.message_expiry {
-            return Err(ConfigError::InvalidConfiguration);
+            return Err(ConfigurationError::InvalidConfigurationValue);
         }
 
         if self.http.enabled
             && let IggyExpiry::ServerDefault = self.http.jwt.access_token_expiry
         {
-            return Err(ConfigError::InvalidConfiguration);
+            return Err(ConfigurationError::InvalidConfigurationValue);
         }
 
         if topic_size < self.system.segment.size.as_bytes_u64() {
-            return Err(ConfigError::InvalidConfiguration);
+            return Err(ConfigurationError::InvalidConfigurationValue);
         }
 
         Ok(())
     }
 }
 
-impl Validatable<ConfigError> for CompressionConfig {
-    fn validate(&self) -> Result<(), ConfigError> {
+impl Validatable<ConfigurationError> for CompressionConfig {
+    fn validate(&self) -> Result<(), ConfigurationError> {
         let compression_alg = &self.default_algorithm;
         if *compression_alg != CompressionAlgorithm::None {
             // TODO(numinex): Change this message once server side compression is fully developed.
@@ -102,36 +102,36 @@ impl Validatable<ConfigError> for CompressionConfig {
     }
 }
 
-impl Validatable<ConfigError> for TelemetryConfig {
-    fn validate(&self) -> Result<(), ConfigError> {
+impl Validatable<ConfigurationError> for TelemetryConfig {
+    fn validate(&self) -> Result<(), ConfigurationError> {
         if !self.enabled {
             return Ok(());
         }
 
         if self.service_name.trim().is_empty() {
-            return Err(ConfigError::InvalidConfiguration);
+            return Err(ConfigurationError::InvalidConfigurationValue);
         }
 
         if self.logs.endpoint.is_empty() {
-            return Err(ConfigError::InvalidConfiguration);
+            return Err(ConfigurationError::InvalidConfigurationValue);
         }
 
         if self.traces.endpoint.is_empty() {
-            return Err(ConfigError::InvalidConfiguration);
+            return Err(ConfigurationError::InvalidConfigurationValue);
         }
 
         Ok(())
     }
 }
 
-impl Validatable<ConfigError> for PartitionConfig {
-    fn validate(&self) -> Result<(), ConfigError> {
+impl Validatable<ConfigurationError> for PartitionConfig {
+    fn validate(&self) -> Result<(), ConfigurationError> {
         if self.messages_required_to_save < 32 {
             eprintln!(
                 "Configured system.partition.messages_required_to_save {} is less than minimum {}",
                 self.messages_required_to_save, 32
             );
-            return Err(ConfigError::InvalidConfiguration);
+            return Err(ConfigurationError::InvalidConfigurationValue);
         }
 
         if !self.messages_required_to_save.is_multiple_of(32) {
@@ -139,7 +139,7 @@ impl Validatable<ConfigError> for PartitionConfig {
                 "Configured system.partition.messages_required_to_save {} is not a multiple of 32",
                 self.messages_required_to_save
             );
-            return Err(ConfigError::InvalidConfiguration);
+            return Err(ConfigurationError::InvalidConfigurationValue);
         }
 
         if self.size_of_messages_required_to_save < 512 {
@@ -147,7 +147,7 @@ impl Validatable<ConfigError> for PartitionConfig {
                 "Configured system.partition.size_of_messages_required_to_save {} is less than minimum {}",
                 self.size_of_messages_required_to_save, 512
             );
-            return Err(ConfigError::InvalidConfiguration);
+            return Err(ConfigurationError::InvalidConfigurationValue);
         }
 
         if !self
@@ -159,22 +159,22 @@ impl Validatable<ConfigError> for PartitionConfig {
                 "Configured system.partition.size_of_messages_required_to_save {} is not a multiple of 512 B",
                 self.size_of_messages_required_to_save
             );
-            return Err(ConfigError::InvalidConfiguration);
+            return Err(ConfigurationError::InvalidConfigurationValue);
         }
 
         Ok(())
     }
 }
 
-impl Validatable<ConfigError> for SegmentConfig {
-    fn validate(&self) -> Result<(), ConfigError> {
+impl Validatable<ConfigurationError> for SegmentConfig {
+    fn validate(&self) -> Result<(), ConfigurationError> {
         if self.size > SEGMENT_MAX_SIZE_BYTES {
             eprintln!(
                 "Configured system.segment.size {} B is greater than maximum {} B",
                 self.size.as_bytes_u64(),
                 SEGMENT_MAX_SIZE_BYTES
             );
-            return Err(ConfigError::InvalidConfiguration);
+            return Err(ConfigurationError::InvalidConfigurationValue);
         }
 
         if !self.size.as_bytes_u64().is_multiple_of(512) {
@@ -182,25 +182,25 @@ impl Validatable<ConfigError> for SegmentConfig {
                 "Configured system.segment.size {} B is not a multiple of 512 B",
                 self.size.as_bytes_u64()
             );
-            return Err(ConfigError::InvalidConfiguration);
+            return Err(ConfigurationError::InvalidConfigurationValue);
         }
 
         Ok(())
     }
 }
 
-impl Validatable<ConfigError> for MessageSaverConfig {
-    fn validate(&self) -> Result<(), ConfigError> {
+impl Validatable<ConfigurationError> for MessageSaverConfig {
+    fn validate(&self) -> Result<(), ConfigurationError> {
         if self.enabled && self.interval.is_zero() {
-            return Err(ConfigError::InvalidConfiguration);
+            return Err(ConfigurationError::InvalidConfigurationValue);
         }
 
         Ok(())
     }
 }
 
-impl Validatable<ConfigError> for DataMaintenanceConfig {
-    fn validate(&self) -> Result<(), ConfigError> {
+impl Validatable<ConfigurationError> for DataMaintenanceConfig {
+    fn validate(&self) -> Result<(), ConfigurationError> {
         self.messages.validate().with_error(|error| {
             format!("{COMPONENT} (error: {error}) - failed to validate messages maintenance config")
         })?;
@@ -208,37 +208,37 @@ impl Validatable<ConfigError> for DataMaintenanceConfig {
     }
 }
 
-impl Validatable<ConfigError> for MessagesMaintenanceConfig {
-    fn validate(&self) -> Result<(), ConfigError> {
+impl Validatable<ConfigurationError> for MessagesMaintenanceConfig {
+    fn validate(&self) -> Result<(), ConfigurationError> {
         if self.cleaner_enabled && self.interval.is_zero() {
-            return Err(ConfigError::InvalidConfiguration);
+            return Err(ConfigurationError::InvalidConfigurationValue);
         }
 
         Ok(())
     }
 }
 
-impl Validatable<ConfigError> for PersonalAccessTokenConfig {
-    fn validate(&self) -> Result<(), ConfigError> {
+impl Validatable<ConfigurationError> for PersonalAccessTokenConfig {
+    fn validate(&self) -> Result<(), ConfigurationError> {
         if self.max_tokens_per_user == 0 {
-            return Err(ConfigError::InvalidConfiguration);
+            return Err(ConfigurationError::InvalidConfigurationValue);
         }
 
         if self.cleaner.enabled && self.cleaner.interval.is_zero() {
-            return Err(ConfigError::InvalidConfiguration);
+            return Err(ConfigurationError::InvalidConfigurationValue);
         }
 
         Ok(())
     }
 }
 
-impl Validatable<ConfigError> for MemoryPoolConfig {
-    fn validate(&self) -> Result<(), ConfigError> {
+impl Validatable<ConfigurationError> for MemoryPoolConfig {
+    fn validate(&self) -> Result<(), ConfigurationError> {
         if self.enabled && self.size == 0 {
             error!(
                 "Configured system.memory_pool.enabled is true and system.memory_pool.size is 0"
             );
-            return Err(ConfigError::InvalidConfiguration);
+            return Err(ConfigurationError::InvalidConfigurationValue);
         }
 
         const MIN_POOL_SIZE: u64 = 512 * 1024 * 1024; // 512 MiB
@@ -253,7 +253,7 @@ impl Validatable<ConfigError> for MemoryPoolConfig {
                 MIN_POOL_SIZE,
                 MIN_POOL_SIZE / (1024 * 1024),
             );
-            return Err(ConfigError::InvalidConfiguration);
+            return Err(ConfigurationError::InvalidConfigurationValue);
         }
 
         if self.enabled && !self.size.as_bytes_u64().is_multiple_of(DEFAULT_PAGE_SIZE) {
@@ -262,7 +262,7 @@ impl Validatable<ConfigError> for MemoryPoolConfig {
                 self.size.as_bytes_u64(),
                 DEFAULT_PAGE_SIZE
             );
-            return Err(ConfigError::InvalidConfiguration);
+            return Err(ConfigurationError::InvalidConfigurationValue);
         }
 
         if self.enabled && self.bucket_capacity < MIN_BUCKET_CAPACITY {
@@ -270,7 +270,7 @@ impl Validatable<ConfigError> for MemoryPoolConfig {
                 "Configured system.memory_pool.buffers {} is less than minimum {}",
                 self.bucket_capacity, MIN_BUCKET_CAPACITY
             );
-            return Err(ConfigError::InvalidConfiguration);
+            return Err(ConfigurationError::InvalidConfigurationValue);
         }
 
         if self.enabled && !self.bucket_capacity.is_power_of_two() {
@@ -278,15 +278,15 @@ impl Validatable<ConfigError> for MemoryPoolConfig {
                 "Configured system.memory_pool.buffers {} is not a power of 2",
                 self.bucket_capacity
             );
-            return Err(ConfigError::InvalidConfiguration);
+            return Err(ConfigurationError::InvalidConfigurationValue);
         }
 
         Ok(())
     }
 }
 
-impl Validatable<ConfigError> for ShardingConfig {
-    fn validate(&self) -> Result<(), ConfigError> {
+impl Validatable<ConfigurationError> for ShardingConfig {
+    fn validate(&self) -> Result<(), ConfigurationError> {
         let available_cpus = available_parallelism()
             .expect("Failed to get number of CPU cores")
             .get();
@@ -296,13 +296,13 @@ impl Validatable<ConfigError> for ShardingConfig {
             CpuAllocation::Count(count) => {
                 if *count == 0 {
                     eprintln!("Invalid sharding configuration: cpu_allocation count cannot be 0");
-                    return Err(ConfigError::InvalidConfiguration);
+                    return Err(ConfigurationError::InvalidConfigurationValue);
                 }
                 if *count > available_cpus {
                     eprintln!(
                         "Invalid sharding configuration: cpu_allocation count {count} exceeds available CPU cores {available_cpus}"
                     );
-                    return Err(ConfigError::InvalidConfiguration);
+                    return Err(ConfigurationError::InvalidConfigurationValue);
                 }
                 Ok(())
             }
@@ -311,13 +311,13 @@ impl Validatable<ConfigError> for ShardingConfig {
                     eprintln!(
                         "Invalid sharding configuration: cpu_allocation range {start}..{end} is invalid (start must be less than end)"
                     );
-                    return Err(ConfigError::InvalidConfiguration);
+                    return Err(ConfigurationError::InvalidConfigurationValue);
                 }
                 if *end > available_cpus {
                     eprintln!(
                         "Invalid sharding configuration: cpu_allocation range {start}..{end} exceeds available CPU cores (max: {available_cpus})"
                     );
-                    return Err(ConfigError::InvalidConfiguration);
+                    return Err(ConfigurationError::InvalidConfigurationValue);
                 }
                 Ok(())
             }
@@ -325,8 +325,8 @@ impl Validatable<ConfigError> for ShardingConfig {
     }
 }
 
-impl Validatable<ConfigError> for ClusterConfig {
-    fn validate(&self) -> Result<(), ConfigError> {
+impl Validatable<ConfigurationError> for ClusterConfig {
+    fn validate(&self) -> Result<(), ConfigurationError> {
         if !self.enabled {
             return Ok(());
         }
@@ -334,13 +334,13 @@ impl Validatable<ConfigError> for ClusterConfig {
         // Validate cluster name is not empty
         if self.name.trim().is_empty() {
             eprintln!("Invalid cluster configuration: cluster name cannot be empty");
-            return Err(ConfigError::InvalidConfiguration);
+            return Err(ConfigurationError::InvalidConfigurationValue);
         }
 
         // Validate current node name is not empty
         if self.node.current.name.trim().is_empty() {
             eprintln!("Invalid cluster configuration: current node name cannot be empty");
-            return Err(ConfigError::InvalidConfiguration);
+            return Err(ConfigurationError::InvalidConfigurationValue);
         }
 
         // Check for duplicate node names among other nodes
@@ -353,7 +353,7 @@ impl Validatable<ConfigError> for ClusterConfig {
                     "Invalid cluster configuration: duplicate node name '{}' found",
                     node.name
                 );
-                return Err(ConfigError::InvalidConfiguration);
+                return Err(ConfigurationError::InvalidConfigurationValue);
             }
         }
 
@@ -363,7 +363,7 @@ impl Validatable<ConfigError> for ClusterConfig {
             // Validate node name is not empty
             if node.name.trim().is_empty() {
                 eprintln!("Invalid cluster configuration: node name cannot be empty");
-                return Err(ConfigError::InvalidConfiguration);
+                return Err(ConfigurationError::InvalidConfigurationValue);
             }
 
             // Validate IP is not empty
@@ -372,7 +372,7 @@ impl Validatable<ConfigError> for ClusterConfig {
                     "Invalid cluster configuration: IP cannot be empty for node '{}'",
                     node.name
                 );
-                return Err(ConfigError::InvalidConfiguration);
+                return Err(ConfigurationError::InvalidConfigurationValue);
             }
 
             // Validate transport ports if provided
@@ -390,7 +390,7 @@ impl Validatable<ConfigError> for ClusterConfig {
                             "Invalid cluster configuration: {} port cannot be 0 for node '{}'",
                             name, node.name
                         );
-                        return Err(ConfigError::InvalidConfiguration);
+                        return Err(ConfigurationError::InvalidConfigurationValue);
                     }
 
                     // Check for port conflicts across nodes on the same IP
@@ -400,7 +400,7 @@ impl Validatable<ConfigError> for ClusterConfig {
                             "Invalid cluster configuration: port conflict - {}:{} is already used",
                             node.ip, port
                         );
-                        return Err(ConfigError::InvalidConfiguration);
+                        return Err(ConfigurationError::InvalidConfigurationValue);
                     }
                 }
             }
