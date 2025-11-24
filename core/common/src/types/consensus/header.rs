@@ -25,6 +25,7 @@ pub trait ConsensusHeader: Sized + Pod + Zeroable {
     const COMMAND: Command;
 
     fn validate(&self) -> Result<(), ConsensusError>;
+    fn size(&self) -> u32;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,6 +144,10 @@ impl ConsensusHeader for GenericHeader {
     fn validate(&self) -> Result<(), ConsensusError> {
         Ok(())
     }
+
+    fn size(&self) -> u32 {
+        self.size
+    }
 }
 
 #[repr(C)]
@@ -194,6 +199,10 @@ impl ConsensusHeader for PrepareHeader {
         }
         Ok(())
     }
+
+    fn size(&self) -> u32 {
+        self.size
+    }
 }
 
 #[repr(C)]
@@ -233,6 +242,10 @@ impl ConsensusHeader for CommitHeader {
             return Err(ConsensusError::CommitInvalidSize(self.size));
         }
         Ok(())
+    }
+
+    fn size(&self) -> u32 {
+        self.size
     }
 }
 
@@ -280,5 +293,9 @@ impl ConsensusHeader for ReplyHeader {
             return Err(ConsensusError::ReplyContextPaddingNonZero);
         }
         Ok(())
+    }
+
+    fn size(&self) -> u32 {
+        self.size
     }
 }
