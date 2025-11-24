@@ -140,12 +140,12 @@ mod tests {
 
     #[test]
     fn should_parse_basic_semantic_version() {
-        let version = "1.2.3".parse::<SemanticVersion>().unwrap();
+        let version = "1.2.4".parse::<SemanticVersion>().unwrap();
         assert_eq!(version.major, 1);
         assert_eq!(version.minor, 2);
-        assert_eq!(version.patch, 3);
+        assert_eq!(version.patch, 4);
         assert_eq!(version.prerelease, None);
-        assert_eq!(version.to_string(), "1.2.3");
+        assert_eq!(version.to_string(), "1.2.4");
     }
 
     #[test]
