@@ -16,6 +16,7 @@
 // under the License.
 
 use bytemuck::{Pod, Zeroable};
+use thiserror::Error;
 
 #[expect(unused)]
 pub struct Header {}
@@ -23,12 +24,7 @@ pub struct Header {}
 pub trait ConsensusHeader: Sized + Pod + Zeroable {
     const COMMAND: Command;
 
-    fn size(&self) -> u32;
-    fn command(&self) -> Command;
-    fn checksum(&self) -> u128;
-    fn cluster(&self) -> u128;
-
-    fn validate(&self) -> Result<(), &'static str>;
+    fn validate(&self) -> Result<(), ConsensusError>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,6 +55,40 @@ pub enum Command {
 
     RequestBlocks = 16,
     Block = 17,
+}
+
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
+pub enum ConsensusError {
+    #[error("invalid command: expected {expected:?}, found {found:?}")]
+    InvalidCommand { expected: Command, found: Command },
+
+    #[error("invalid checksum")]
+    InvalidChecksum,
+
+    #[error("invalid cluster ID")]
+    InvalidCluster,
+
+    #[error("parent_padding must be 0")]
+    PrepareParentPaddingNonZero,
+
+    #[error("request_checksum_padding must be 0")]
+    PrepareRequestChecksumPaddingNonZero,
+
+    #[error("command must be Commit")]
+    CommitInvalidCommand,
+
+    #[error("size must be 256, found {0}")]
+    CommitInvalidSize(u32),
+
+    // ReplyHeader specific
+    #[error("command must be Reply")]
+    ReplyInvalidCommand,
+
+    #[error("request_checksum_padding must be 0")]
+    ReplyRequestChecksumPaddingNonZero,
+
+    #[error("context_padding must be 0")]
+    ReplyContextPaddingNonZero,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,20 +140,7 @@ unsafe impl Zeroable for GenericHeader {}
 impl ConsensusHeader for GenericHeader {
     const COMMAND: Command = Command::Reserved;
 
-    fn size(&self) -> u32 {
-        self.size
-    }
-    fn command(&self) -> Command {
-        self.command
-    }
-    fn checksum(&self) -> u128 {
-        self.checksum
-    }
-    fn cluster(&self) -> u128 {
-        self.cluster
-    }
-
-    fn validate(&self) -> Result<(), &'static str> {
+    fn validate(&self) -> Result<(), ConsensusError> {
         Ok(())
     }
 }
@@ -162,28 +179,18 @@ unsafe impl Zeroable for PrepareHeader {}
 impl ConsensusHeader for PrepareHeader {
     const COMMAND: Command = Command::Prepare;
 
-    fn size(&self) -> u32 {
-        self.size
-    }
-    fn command(&self) -> Command {
-        self.command
-    }
-    fn checksum(&self) -> u128 {
-        self.checksum
-    }
-    fn cluster(&self) -> u128 {
-        self.cluster
-    }
-
-    fn validate(&self) -> Result<(), &'static str> {
+    fn validate(&self) -> Result<(), ConsensusError> {
         if self.command != Command::Prepare {
-            return Err("command must be Prepare");
+            return Err(ConsensusError::InvalidCommand {
+                expected: Command::Prepare,
+                found: self.command,
+            });
         }
         if self.parent_padding != 0 {
-            return Err("parent_padding must be 0");
+            return Err(ConsensusError::PrepareParentPaddingNonZero);
         }
         if self.request_checksum_padding != 0 {
-            return Err("request_checksum_padding must be 0");
+            return Err(ConsensusError::PrepareRequestChecksumPaddingNonZero);
         }
         Ok(())
     }
@@ -218,25 +225,12 @@ unsafe impl Zeroable for CommitHeader {}
 impl ConsensusHeader for CommitHeader {
     const COMMAND: Command = Command::Commit;
 
-    fn size(&self) -> u32 {
-        self.size
-    }
-    fn command(&self) -> Command {
-        self.command
-    }
-    fn checksum(&self) -> u128 {
-        self.checksum
-    }
-    fn cluster(&self) -> u128 {
-        self.cluster
-    }
-
-    fn validate(&self) -> Result<(), &'static str> {
+    fn validate(&self) -> Result<(), ConsensusError> {
         if self.command != Command::Commit {
-            return Err("command != Commit");
+            return Err(ConsensusError::CommitInvalidCommand);
         }
         if self.size != 256 {
-            return Err("size != 256");
+            return Err(ConsensusError::CommitInvalidSize(self.size));
         }
         Ok(())
     }
@@ -275,22 +269,15 @@ unsafe impl Zeroable for ReplyHeader {}
 impl ConsensusHeader for ReplyHeader {
     const COMMAND: Command = Command::Reply;
 
-    fn size(&self) -> u32 {
-        self.size
-    }
-    fn command(&self) -> Command {
-        self.command
-    }
-    fn checksum(&self) -> u128 {
-        self.checksum
-    }
-    fn cluster(&self) -> u128 {
-        self.cluster
-    }
-
-    fn validate(&self) -> Result<(), &'static str> {
+    fn validate(&self) -> Result<(), ConsensusError> {
         if self.command != Command::Reply {
-            return Err("command != Reply");
+            return Err(ConsensusError::ReplyInvalidCommand);
+        }
+        if self.request_checksum_padding != 0 {
+            return Err(ConsensusError::ReplyRequestChecksumPaddingNonZero);
+        }
+        if self.context_padding != 0 {
+            return Err(ConsensusError::ReplyContextPaddingNonZero);
         }
         Ok(())
     }
