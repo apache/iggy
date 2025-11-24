@@ -23,8 +23,12 @@ import debug from 'debug';
 
 export const log = debug('iggy:getting-started:consumer');
 
-const PARTITION_COUNT = 5;
-
+export const PARTITION_COUNT = 5;
+export const STREAM_ID = 0;
+export const TOPIC_ID = 0;
+export const PARTITION_ID = 0;
+export const BATCHES_LIMIT = 5;
+export const MESSAGES_PER_BATCH = 10;
 
 export async function initSystem(client: Client) {
   log('Creating stream with random name...');

@@ -18,14 +18,10 @@
  */
 
 import { Client, PollingStrategy, Consumer } from 'apache-iggy';
-import { log } from '../utils';
+import { BATCHES_LIMIT, log, MESSAGES_PER_BATCH, PARTITION_ID, STREAM_ID, TOPIC_ID } from '../utils';
 
 
-const STREAM_ID = 1;
-const TOPIC_ID = 1;
-const PARTITION_ID = 1;
-const BATCHES_LIMIT = 5;
-const MESSAGES_PER_BATCH = 10;
+
 
 interface Args {
   tcpServerAddress: string;

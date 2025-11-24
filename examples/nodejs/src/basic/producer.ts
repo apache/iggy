@@ -19,11 +19,10 @@
 
 import { Client, Partitioning } from 'apache-iggy';
 import crypto from 'crypto';
-const log = console.log;
+import debug from 'debug';
+import { PARTITION_COUNT, BATCHES_LIMIT, MESSAGES_PER_BATCH } from '../utils';
 
-const PARTITION_COUNT = 5;
-const BATCHES_LIMIT = 5;
-const MESSAGES_PER_BATCH = 10;
+const log = debug('iggy:examples:basic-producer');
 
 function parseArgs() {
   console.log = (...args) => process.stdout.write(args.join(' ') + '\n');

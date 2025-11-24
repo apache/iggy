@@ -18,12 +18,11 @@
  */
 
 import { Client, Partitioning } from 'apache-iggy';
-import { log } from '../utils';
+import { BATCHES_LIMIT, log, MESSAGES_PER_BATCH } from '../utils';
 import crypto from 'crypto';
 
 const TOPICS = ['events', 'logs', 'notifications'];
-const BATCHES_LIMIT = 3;
-const MESSAGES_PER_BATCH = 5;
+
 
 interface TenantProducer {
   tenantId: number;

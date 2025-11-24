@@ -18,12 +18,12 @@
  */
 
 import { Client, PollingStrategy, Consumer } from 'apache-iggy';
+import debug from 'debug';
+import { STREAM_ID, TOPIC_ID, PARTITION_ID } from '../utils';
 
-const log = console.log;
+const log = debug('iggy:examples:basic-consumer');
 
-const STREAM_ID = 1;
-const TOPIC_ID = 1;
-const PARTITION_ID = 1;
+
 const BATCHES_LIMIT = 5;
 const MESSAGES_PER_BATCH = 10;
 

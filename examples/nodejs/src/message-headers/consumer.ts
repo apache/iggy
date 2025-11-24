@@ -18,10 +18,8 @@
  */
 
 import { Client, Consumer, PollingStrategy } from 'apache-iggy';
-import { log, initSystem, cleanup } from '../utils';
+import { log, initSystem, cleanup, BATCHES_LIMIT, MESSAGES_PER_BATCH } from '../utils';
 
-const BATCHES_LIMIT = 5;
-const MESSAGES_PER_BATCH = 10;
 
 interface OrderCreated {
   orderId: string;

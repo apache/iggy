@@ -18,11 +18,8 @@
  */
 
 import { Client, Partitioning } from 'apache-iggy';
-import { cleanup, initSystem, log, parseArgs, sleep } from '../utils';
+import { BATCHES_LIMIT, cleanup, initSystem, log, MESSAGES_PER_BATCH, parseArgs, sleep } from '../utils';
 
-
-const BATCHES_LIMIT = 5;
-const MESSAGES_PER_BATCH = 10;
 
 interface SerializedMessage {
   to_json_envelope(): string;

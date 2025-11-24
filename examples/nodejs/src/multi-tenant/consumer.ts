@@ -18,9 +18,8 @@
  */
 
 import { Client, Consumer, PollingStrategy } from 'apache-iggy';
-import { log, parseArgs } from '../utils';
+import { BATCHES_LIMIT, log, parseArgs } from '../utils';
 
-const BATCHES_LIMIT = 3;
 
 interface TenantConsumer {
   tenantId: number;
