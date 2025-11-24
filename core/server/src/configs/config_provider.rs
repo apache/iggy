@@ -323,6 +323,11 @@ impl CustomEnvProvider {
         if value == "false" {
             return FigmentValue::from(false);
         }
+        // Try u64 first for most numeric values (ports, byte sizes, etc.)
+        if let Ok(uint_val) = value.parse::<u64>() {
+            return FigmentValue::from(uint_val);
+        }
+        // Fall back to i64 for signed integers
         if let Ok(int_val) = value.parse::<i64>() {
             return FigmentValue::from(int_val);
         }

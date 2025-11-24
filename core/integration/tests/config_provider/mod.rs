@@ -69,13 +69,19 @@ async fn validate_config_env_override() {
 #[serial]
 #[tokio::test]
 async fn validate_socket_override() {
-    // Simulating env::set_var with "true" for the tests
-    let expected_send_buffer = "666666";
-    let expected_recv_buffer = "777777";
+    // Environment variables are set as raw byte counts
+    let send_buffer_bytes = 666666_u64;
+    let recv_buffer_bytes = 777777_u64;
     unsafe {
         env::set_var("IGGY_TCP_SOCKET_OVERRIDE_DEFAULTS", "true");
-        env::set_var("IGGY_TCP_SOCKET_SEND_BUFFER_SIZE", expected_send_buffer);
-        env::set_var("IGGY_TCP_SOCKET_RECV_BUFFER_SIZE", expected_recv_buffer);
+        env::set_var(
+            "IGGY_TCP_SOCKET_SEND_BUFFER_SIZE",
+            send_buffer_bytes.to_string(),
+        );
+        env::set_var(
+            "IGGY_TCP_SOCKET_RECV_BUFFER_SIZE",
+            recv_buffer_bytes.to_string(),
+        );
     }
 
     let config_path = get_root_path().join("../configs/server.toml");
@@ -86,13 +92,14 @@ async fn validate_socket_override() {
         .expect("Failed to load server.toml config with socket override");
 
     assert!(config.tcp.socket.override_defaults);
+    // Verify the buffer sizes match the expected byte counts
     assert_eq!(
-        config.tcp.socket.send_buffer_size.to_string(),
-        expected_send_buffer
+        config.tcp.socket.send_buffer_size.as_bytes_u64(),
+        send_buffer_bytes
     );
     assert_eq!(
-        config.tcp.socket.recv_buffer_size.to_string(),
-        expected_recv_buffer
+        config.tcp.socket.recv_buffer_size.as_bytes_u64(),
+        recv_buffer_bytes
     );
 
     unsafe {

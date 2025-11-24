@@ -1,6 +1,6 @@
 {
   "name": "iggy-web-ui",
-  "version": "0.1.0",
+  "version": "0.1.0-edge.2",
   "private": true,
   "scripts": {
     "dev": "vite dev --port 3050",

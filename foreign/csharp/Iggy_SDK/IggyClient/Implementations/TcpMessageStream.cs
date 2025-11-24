@@ -901,6 +901,12 @@ public sealed class TcpMessageStream : IIggyClient
                 return null;
             }
 
+            // Single-node cluster (clustering disabled) - no redirection needed
+            if (clusterMetadata.Nodes.Count() == 1)
+            {
+                return null;
+            }
+
             var leaderNode = clusterMetadata.Nodes.FirstOrDefault(x => x.Role == ClusterNodeRole.Leader);
             if (leaderNode == null)
             {

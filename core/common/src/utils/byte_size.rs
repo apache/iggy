@@ -20,7 +20,7 @@ use super::duration::IggyDuration;
 use crate::IggyError;
 use byte_unit::{Byte, UnitType};
 use core::fmt;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::{
     iter::Sum,
     ops::{Add, AddAssign, Sub, SubAssign},
@@ -53,8 +53,49 @@ use std::{
 /// assert_eq!("1.00 GB", size.as_human_string());
 /// assert_eq!("1.00 GB", format!("{}", size));
 /// ```
-#[derive(Debug, Copy, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Copy, Clone, PartialEq, Serialize)]
 pub struct IggyByteSize(Byte);
+
+impl<'de> Deserialize<'de> for IggyByteSize {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        use serde::de::{self, Visitor};
+
+        struct IggyByteSizeVisitor;
+
+        impl<'de> Visitor<'de> for IggyByteSizeVisitor {
+            type Value = IggyByteSize;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter
+                    .write_str("a string like \"123KB\" or an unsigned integer representing bytes")
+            }
+
+            fn visit_u64<E>(self, value: u64) -> Result<IggyByteSize, E>
+            where
+                E: de::Error,
+            {
+                Ok(IggyByteSize::from(value))
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<IggyByteSize, E>
+            where
+                E: de::Error,
+            {
+                if let Ok(bytes) = value.parse::<u64>() {
+                    return Ok(IggyByteSize::from(bytes));
+                }
+                Byte::from_str(value)
+                    .map(IggyByteSize)
+                    .map_err(|e| E::custom(format!("Failed to parse byte size: {}", e)))
+            }
+        }
+
+        deserializer.deserialize_any(IggyByteSizeVisitor)
+    }
+}
 
 impl Default for IggyByteSize {
     fn default() -> Self {
