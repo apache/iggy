@@ -22,9 +22,11 @@ use figment::providers::{Format, Toml};
 use figment::value::Dict;
 use figment::{Metadata, Profile, Provider};
 use iggy_common::defaults::{DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME};
-use iggy_common::{CustomEnvProvider, FileConfigProvider};
+use iggy_common::{CustomEnvProvider, FileConfigProvider, IggyDuration};
 use serde::{Deserialize, Serialize};
-use std::fmt::Formatter;
+use serde_with::{DisplayFromStr, serde_as};
+use std::collections::HashMap;
+use std::fmt::{Display, Formatter};
 
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
 #[serde(default)]
@@ -57,10 +59,51 @@ pub struct LocalConnectorsConfig {
     pub config_dir: String,
 }
 
+#[serde_as]
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+pub struct HttpConnectorsConfig {
+    pub base_url: String,
+    #[serde_as(as = "DisplayFromStr")]
+    #[serde(default = "default_from_secs")]
+    pub timeout: IggyDuration,
+    #[serde(default)]
+    pub request_headers: HashMap<String, String>,
+    #[serde(default)]
+    pub url_templates: HashMap<String, String>,
+    #[serde(default)]
+    pub response: ResponseConfig,
+}
+
+impl Display for HttpConnectorsConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{{ type: \"http\", base_url: {:?}, request_headers: {:?}, timeout: {}, url_templates: {:?}, response: {:?} }}",
+            self.base_url,
+            self.request_headers.keys(),
+            self.timeout,
+            self.url_templates,
+            self.response
+        )
+    }
+}
+
+fn default_from_secs() -> IggyDuration {
+    IggyDuration::new_from_secs(10)
+}
+
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ResponseConfig {
+    pub data_path: Option<String>,
+    pub error_path: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "config_type", rename_all = "lowercase")]
 pub enum ConnectorsConfig {
     Local(LocalConnectorsConfig),
+    Http(HttpConnectorsConfig),
 }
 
 impl Default for ConnectorsConfig {
@@ -74,13 +117,13 @@ pub struct StateConfig {
     pub path: String,
 }
 
-impl std::fmt::Display for StateConfig {
+impl Display for StateConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "{{ path: {} }}", self.path)
     }
 }
 
-impl std::fmt::Display for ConnectorsRuntimeConfig {
+impl Display for ConnectorsRuntimeConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
@@ -90,7 +133,7 @@ impl std::fmt::Display for ConnectorsRuntimeConfig {
     }
 }
 
-impl std::fmt::Display for IggyConfig {
+impl Display for IggyConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
@@ -108,7 +151,7 @@ impl std::fmt::Display for IggyConfig {
     }
 }
 
-impl std::fmt::Display for IggyTlsConfig {
+impl Display for IggyTlsConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
@@ -118,7 +161,7 @@ impl std::fmt::Display for IggyTlsConfig {
     }
 }
 
-impl std::fmt::Display for ConnectorsConfig {
+impl Display for ConnectorsConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             ConnectorsConfig::Local(config) => write!(
@@ -126,6 +169,7 @@ impl std::fmt::Display for ConnectorsConfig {
                 "{{ type: \"file\", config_dir: {:?} }}",
                 config.config_dir
             ),
+            ConnectorsConfig::Http(config) => write!(f, "{config}",),
         }
     }
 }

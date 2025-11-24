@@ -17,8 +17,10 @@
  * under the License.
  */
 
+pub mod http_provider;
 mod local_provider;
 
+use crate::configs::connectors::http_provider::HttpConnectorsConfigProvider;
 use crate::configs::connectors::local_provider::LocalConnectorsConfigProvider;
 use crate::configs::runtime::ConnectorsConfig as RuntimeConnectorsConfig;
 use crate::error::RuntimeError;
@@ -231,6 +233,16 @@ pub async fn create_connectors_config_provider(
         RuntimeConnectorsConfig::Local(config) => {
             let provider = LocalConnectorsConfigProvider::new(&config.config_dir);
             let provider = provider.init().await?;
+            Ok(Box::new(provider))
+        }
+        RuntimeConnectorsConfig::Http(config) => {
+            let provider = HttpConnectorsConfigProvider::new(
+                &config.base_url,
+                config.timeout.get_duration(),
+                &config.request_headers,
+                &config.url_templates,
+                &config.response,
+            )?;
             Ok(Box::new(provider))
         }
     }
