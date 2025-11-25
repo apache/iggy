@@ -18,60 +18,29 @@
  */
 
 plugins {
-    id("java-library")
-    id("maven-publish")
+    id("iggy.java-library-conventions")
 }
-
-repositories {
-    mavenCentral()
-}
-
-java {
-    // Target Java 17 for CI compatibility (Java 21 Flink Docker can run Java 17 bytecode)
-    sourceCompatibility = JavaVersion.VERSION_17
-    targetCompatibility = JavaVersion.VERSION_17
-
-    withJavadocJar()
-    withSourcesJar()
-}
-
-val flinkVersion = "2.1.0"
 
 dependencies {
     // Iggy SDK - use local project when building within Iggy repository
     api(project(":iggy"))
 
     // Flink dependencies (provided - not bundled with connector)
-    compileOnly("org.apache.flink:flink-connector-base:${flinkVersion}")
-    compileOnly("org.apache.flink:flink-streaming-java:${flinkVersion}")
+    compileOnly(libs.flink.connector.base)
+    compileOnly(libs.flink.streaming.java)
 
     // Serialization support
-    implementation("com.fasterxml.jackson.core:jackson-databind:2.18.0")
-    implementation("com.fasterxml.jackson.datatype:jackson-datatype-jsr310:2.18.0")
+    implementation(libs.jackson.databind)
 
     // Logging
-    compileOnly("org.slf4j:slf4j-api:2.0.16")
+    compileOnly(libs.slf4j.api)
 
     // Testing
-    testImplementation("org.apache.flink:flink-test-utils:${flinkVersion}")
-    testImplementation("org.apache.flink:flink-runtime:${flinkVersion}:tests")
-    testImplementation("org.junit.jupiter:junit-jupiter:5.14.1")
-    testImplementation("org.assertj:assertj-core:3.27.6")
-    testRuntimeOnly("org.junit.platform:junit-platform-launcher")
-    testRuntimeOnly("org.slf4j:slf4j-simple:2.0.16")
-}
-
-tasks.withType<Test> {
-    useJUnitPlatform()
-}
-
-tasks.withType<JavaCompile> {
-    options.encoding = "UTF-8"
-    options.compilerArgs.add("-parameters")
-}
-
-tasks.withType<Javadoc> {
-    options.encoding = "UTF-8"
+    testImplementation(libs.flink.test.utils)
+    testImplementation(libs.flink.runtime.tests) { artifact { classifier = "tests" } }
+    testImplementation(platform(libs.junit.bom))
+    testImplementation(libs.bundles.testing)
+    testRuntimeOnly(libs.slf4j.simple)
 }
 
 publishing {
