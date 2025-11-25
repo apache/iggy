@@ -257,9 +257,9 @@ pub fn create_shard_connections(
     let connectors: Vec<ShardConnector<ShardFrame>> = shard_assignment
         .iter()
         .enumerate()
-        .map(|(idx, assignment)| {
-            let cpu_id = assignment.cpu_set.iter().next().unwrap_or(&idx);
-            ShardConnector::new(*cpu_id as u16)
+        .map(|(idx, _assignment)| {
+            // let cpu_id = assignment.cpu_set.iter().next().unwrap_or(&idx);
+            ShardConnector::new(idx as u16)
         })
         .collect();
 

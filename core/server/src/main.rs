@@ -241,34 +241,32 @@ fn main() -> Result<(), ServerError> {
         let shard_assignment = shard_allocator.to_shard_assignments().unwrap();
 
         info!("Shard Assignment: {:?}", shard_assignment);
-
-
-        let shards_set = config.system.sharding.cpu_allocation.to_shard_set();
-        info!("Shards_set: {:?}", shards_set);
-        match &config.system.sharding.cpu_allocation {
-            CpuAllocation::All => {
-                info!(
-                    "Using all available CPU cores ({} shards with affinity)",
-                    shards_set.len()
-                );
-            }
-            CpuAllocation::Count(count) => {
-                info!("Using {count} shards with affinity to cores 0..{count}");
-            }
-            CpuAllocation::Range(start, end) => {
-                info!(
-                    "Using {} shards with affinity to cores {start}..{end}",
-                    end - start
-                );
-            }
-            CpuAllocation::NumaAware(numa) => {
-                info!(
-                    "Using {} shards with {} NUMA node, {} Core per node, and avoid hyperthread {}",
-                    (numa.nodes.len() * numa.cores_per_node), numa.nodes.len(), numa.cores_per_node, numa.avoid_hyperthread
-                );
-
-            }
-        }
+        // let shards_set = config.system.sharding.cpu_allocation.to_shard_set();
+        // info!("Shards_set: {:?}", shards_set);
+        // match &config.system.sharding.cpu_allocation {
+        //     CpuAllocation::All => {
+        //         info!(
+        //             "Using all available CPU cores ({} shards with affinity)",
+        //             shards_set.len()
+        //         );
+        //     }
+        //     CpuAllocation::Count(count) => {
+        //         info!("Using {count} shards with affinity to cores 0..{count}");
+        //     }
+        //     CpuAllocation::Range(start, end) => {
+        //         info!(
+        //             "Using {} shards with affinity to cores {start}..{end}",
+        //             end - start
+        //         );
+        //     }
+        //     CpuAllocation::NumaAware(numa) => {
+        //         info!(
+        //             "Using {} shards with {} NUMA node, {} Core per node, and avoid hyperthread {}",
+        //             (numa.nodes.len() * numa.cores_per_node), numa.nodes.len(), numa.cores_per_node, numa.avoid_hyperthread
+        //         );
+        //
+        //     }
+        // }
 
         #[cfg(feature = "disable-mimalloc")]
         warn!("Using default system allocator because code was build with `disable-mimalloc` feature");
@@ -324,7 +322,7 @@ fn main() -> Result<(), ServerError> {
         for (id, assignment) in shard_assignment
             .into_iter()
             .enumerate()
-            .map(|(idx, cpu)| (idx as u16, cpu))
+            .map(|(idx, assignment)| (idx as u16, assignment))
         {
             let streams = streams.clone();
             let shards_table = shards_table.clone();
@@ -402,8 +400,6 @@ fn main() -> Result<(), ServerError> {
                 .unwrap_or_else(|e| panic!("Failed to spawn thread for shard-{id}: {e}"));
             handles.push(handle);
         }
-
-        todo!();
 
         let shutdown_handles_for_signal = shutdown_handles.clone();
         ctrlc::set_handler(move || {
