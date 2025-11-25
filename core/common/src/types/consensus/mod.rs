@@ -237,6 +237,7 @@ where
 }
 
 #[derive(Debug)]
+#[allow(unused)]
 pub enum MessageBag {
     Generic(Message<GenericHeader>),
     Prepare(Message<PrepareHeader>),
@@ -266,27 +267,35 @@ impl MessageBag {
     }
 }
 
-impl From<Message<header::PrepareHeader>> for MessageBag {
-    fn from(value: Message<header::PrepareHeader>) -> Self {
-        MessageBag::Prepare(value)
-    }
-}
+impl<T> From<Message<T>> for MessageBag
+where
+    T: ConsensusHeader,
+{
+    fn from(value: Message<T>) -> Self {
+        let command = value.as_generic().header().command;
 
-impl From<Message<header::CommitHeader>> for MessageBag {
-    fn from(value: Message<header::CommitHeader>) -> Self {
-        MessageBag::Commit(value)
-    }
-}
+        let buffer = value.into_inner();
 
-impl From<Message<header::ReplyHeader>> for MessageBag {
-    fn from(value: Message<header::ReplyHeader>) -> Self {
-        MessageBag::Reply(value)
-    }
-}
-
-impl From<Message<header::GenericHeader>> for MessageBag {
-    fn from(value: Message<header::GenericHeader>) -> Self {
-        MessageBag::Generic(value)
+        // SAFETY: All Message<H> types have identical memory layout (only PhantomData differs).
+        // We've validated the command when the original message was created.
+        match command {
+            header::Command::Prepare => {
+                let msg =
+                    unsafe { Message::<header::PrepareHeader>::from_buffer_unchecked(buffer) };
+                MessageBag::Prepare(msg)
+            }
+            header::Command::Commit => {
+                let msg = unsafe { Message::<header::CommitHeader>::from_buffer_unchecked(buffer) };
+                MessageBag::Commit(msg)
+            }
+            header::Command::Reply => {
+                let msg = unsafe { Message::<header::ReplyHeader>::from_buffer_unchecked(buffer) };
+                MessageBag::Reply(msg)
+            }
+            _ => unreachable!(
+                "For now we only support Prepare, Commit, and Reply. In the future we will support more commands. Command: {command:?}"
+            ),
+        }
     }
 }
 
