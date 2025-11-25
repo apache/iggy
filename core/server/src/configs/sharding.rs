@@ -16,9 +16,15 @@
  * under the License.
  */
 
+use hwlocality::Topology;
+use hwlocality::bitmap::SpecializedBitmapRef;
+use hwlocality::cpu::cpuset::CpuSet;
+use hwlocality::memory::binding::{MemoryBindingFlags, MemoryBindingPolicy};
+use hwlocality::object::types::ObjectType::{self, NUMANode};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashSet;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::thread::available_parallelism;
 
 #[derive(Debug, Deserialize, Serialize, Default)]
@@ -33,6 +39,78 @@ pub enum CpuAllocation {
     All,
     Count(usize),
     Range(usize, usize),
+    NumaAware(NumaConfig),
+}
+
+/// NUMA specific configuration
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct NumaConfig {
+    /// Which NUMA nodes to use (empty = auto-detect all)
+    pub nodes: Vec<usize>,
+    /// Cores per node to use (0 = use all available)
+    pub cores_per_node: usize,
+    /// skip hyperthread sibling
+    pub avoid_hyperthread: bool,
+}
+
+impl NumaConfig {
+    pub fn validate(&self, topology: &NumaTopology) -> Result<(), AllocationError> {
+        let available_nodes = topology.node_count;
+
+        if available_nodes == 0 {
+            return Err(AllocationError::NoNumaNodes);
+        }
+
+        for &node in &self.nodes {
+            if node >= available_nodes {
+                return Err(AllocationError::InvalidNode {
+                    requested: node,
+                    available: available_nodes,
+                });
+            }
+        }
+
+        // Validate core per node
+        if self.cores_per_node > 0 {
+            for &node in &self.nodes {
+                let available_cores = if self.avoid_hyperthread {
+                    topology.physical_cores_for_node(node)
+                } else {
+                    topology.logical_cores_for_node(node)
+                };
+
+                tracing::info!(
+                    "core_per_node: {}, available_cores: {}",
+                    self.cores_per_node,
+                    available_cores
+                );
+
+                if self.cores_per_node > available_cores {
+                    return Err(AllocationError::InsufficientCores {
+                        requested: self.cores_per_node,
+                        available: available_cores,
+                        node,
+                    });
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    // pub fn or_fallback(&self, topology: &NumaTopology) -> CpuAllocation {
+    //     if topology.node_count < 2 {
+    //         tracing::warn!(
+    //             "NUMA requested but only {} node detected, falling back to count",
+    //             topology.node_count
+    //         );
+    //     }
+    //
+    //     // let total_shards = if self.nodes.is_empty() {
+    //     // }
+    //
+    //     todo!()
+    // }
 }
 
 impl CpuAllocation {
@@ -46,7 +124,445 @@ impl CpuAllocation {
             }
             CpuAllocation::Count(count) => (0..*count).collect(),
             CpuAllocation::Range(start, end) => (*start..*end).collect(),
+            CpuAllocation::NumaAware(numa) => (0..numa.cores_per_node).collect(),
         }
+    }
+
+    fn parse_numa(s: &str) -> Result<CpuAllocation, String> {
+        let params = s
+            .strip_prefix("numa:")
+            .ok_or_else(|| "Numa config must start with 'numa:'".to_string())?;
+
+        if params == "auto" {
+            return Ok(CpuAllocation::NumaAware(NumaConfig {
+                nodes: vec![],
+                cores_per_node: 0,
+                avoid_hyperthread: true,
+            }));
+        }
+
+        let mut nodes = Vec::new();
+        let mut cores_per_node = 0;
+        let mut avoid_hyperthread = true;
+
+        for param in params.split(';') {
+            let kv: Vec<&str> = param.split('=').collect();
+            if kv.len() != 2 {
+                return Err(format!(
+                    "Invalid NUMA parameter: '{param}', only available: 'auto'"
+                ));
+            }
+
+            match kv[0] {
+                "nodes" => {
+                    nodes = kv[1]
+                        .split(',')
+                        .map(|n| {
+                            n.parse::<usize>()
+                                .map_err(|_| format!("Invalid node number: {n}"))
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                }
+                "cores" => {
+                    cores_per_node = kv[1]
+                        .parse::<usize>()
+                        .map_err(|_| format!("Invalid cores value: {}", kv[1]))?;
+                }
+                "no_ht" => {
+                    avoid_hyperthread = kv[1]
+                        .parse::<bool>()
+                        .map_err(|_| format!("Invalid no ht value: {}", kv[1]))?;
+                }
+                _ => {
+                    return Err(format!("Unknown NUMA parameter: {}", kv[0]));
+                }
+            }
+        }
+
+        Ok(CpuAllocation::NumaAware(NumaConfig {
+            nodes,
+            cores_per_node,
+            avoid_hyperthread,
+        }))
+    }
+}
+
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum AllocationError {
+    #[error("Failed to detect topology: {0}")]
+    TopologyDetection(String),
+
+    #[error("There is no NUMA node on this server")]
+    NoNumaNodes,
+
+    #[error("No Topology")]
+    NoTopology,
+
+    #[error("Binding Failed")]
+    BindingFailed,
+
+    #[error("Insufficient cores on node {node}: requested {requested}, only {available} available")]
+    InsufficientCores {
+        requested: usize,
+        available: usize,
+        node: usize,
+    },
+
+    #[error("Invalid NUMA node: requested {requested}, only available {available} node")]
+    InvalidNode { requested: usize, available: usize },
+
+    #[error("Other: {0}")]
+    Other(String),
+}
+
+#[derive(Debug)]
+pub struct NumaTopology {
+    topology: Topology,
+    node_count: usize,
+    physical_cores_per_node: Vec<usize>,
+    logical_cores_per_node: Vec<usize>,
+}
+
+impl NumaTopology {
+    pub fn detect() -> Result<NumaTopology, AllocationError> {
+        let topology =
+            Topology::new().map_err(|e| AllocationError::TopologyDetection(e.to_string()))?;
+
+        let numa_nodes: Vec<_> = topology.objects_with_type(NUMANode).collect();
+
+        let node_count = numa_nodes.len();
+
+        if node_count == 0 {
+            return Err(AllocationError::NoNumaNodes);
+        }
+
+        let mut physical_cores_per_node = Vec::new();
+        let mut logical_cores_per_node = Vec::new();
+
+        for node in numa_nodes {
+            let cpuset = node.cpuset().ok_or(AllocationError::TopologyDetection(
+                "NUMA node has no CPU set".to_string(),
+            ))?;
+
+            let logical_cores = cpuset.weight().unwrap_or(0);
+
+            let physical_cores = topology
+                .objects_with_type(ObjectType::Core)
+                .filter(|core| {
+                    if let Some(core_cpuset) = core.cpuset() {
+                        !(cpuset & core_cpuset).is_empty()
+                    } else {
+                        false
+                    }
+                })
+                .count();
+
+            physical_cores_per_node.push(physical_cores);
+            logical_cores_per_node.push(logical_cores);
+        }
+
+        Ok(Self {
+            topology,
+            node_count,
+            physical_cores_per_node,
+            logical_cores_per_node,
+        })
+    }
+
+    pub fn node_count(&self) -> usize {
+        self.node_count
+    }
+
+    pub fn physical_cores_for_node(&self, node: usize) -> usize {
+        self.physical_cores_per_node.get(node).copied().unwrap_or(0)
+    }
+
+    pub fn logical_cores_for_node(&self, node: usize) -> usize {
+        self.logical_cores_per_node.get(node).copied().unwrap_or(0)
+    }
+
+    fn filter_physical_cores(&self, node_cpuset: CpuSet) -> CpuSet {
+        let mut physical_cpuset = CpuSet::new();
+
+        for core in self.topology.objects_with_type(ObjectType::Core) {
+            if let Some(core_cpuset) = core.cpuset() {
+                let intersection = node_cpuset.clone() & core_cpuset;
+                if !intersection.is_empty()
+                    && let Some(first_cpu) = intersection.iter_set().next()
+                {
+                    physical_cpuset.set(first_cpu)
+                }
+            }
+        }
+
+        physical_cpuset
+    }
+
+    /// Get CPU set for a NUMA node
+    fn get_cpuset_for_node(
+        &self,
+        node_id: usize,
+        avoid_hyperthread: bool,
+    ) -> Result<CpuSet, AllocationError> {
+        let node = self
+            .topology
+            .objects_with_type(ObjectType::NUMANode)
+            .nth(node_id)
+            .ok_or(AllocationError::InvalidNode {
+                requested: node_id,
+                available: self.node_count,
+            })?;
+
+        let cpuset_ref = node
+            .cpuset()
+            .ok_or(AllocationError::TopologyDetection(format!(
+                "Node {} has no CPU set",
+                node_id
+            )))?;
+
+        let cpuset = SpecializedBitmapRef::to_owned(&cpuset_ref);
+
+        if avoid_hyperthread {
+            Ok(self.filter_physical_cores(cpuset))
+        } else {
+            Ok(cpuset)
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ShardInfo {
+    /// CPUs this shard should use
+    pub cpu_set: HashSet<usize>,
+    /// NUMA node
+    pub numa_node: Option<usize>,
+}
+
+impl ShardInfo {
+    pub fn bind_memory(&self) -> Result<(), AllocationError> {
+        if let Some(node_id) = self.numa_node {
+            let topology = Topology::new()
+                .map_err(|err| AllocationError::TopologyDetection(err.to_string()))?;
+
+            let node = topology
+                .objects_with_type(ObjectType::NUMANode)
+                .nth(node_id)
+                .ok_or(AllocationError::InvalidNode {
+                    requested: node_id,
+                    available: topology.objects_with_type(ObjectType::NUMANode).count(),
+                })?;
+
+            if let Some(nodeset) = node.nodeset() {
+                topology
+                    .bind_memory(
+                        nodeset,
+                        MemoryBindingPolicy::Bind,
+                        MemoryBindingFlags::THREAD | MemoryBindingFlags::STRICT,
+                    )
+                    .map_err(|_| AllocationError::BindingFailed)?;
+
+                tracing::info!("Memory bound to NUMA node {node_id}");
+            }
+        }
+
+        Ok(())
+    }
+}
+
+pub struct ShardAllocator {
+    allocation: CpuAllocation,
+    topology: Option<Arc<NumaTopology>>,
+}
+
+impl ShardAllocator {
+    pub fn new(allocation: &CpuAllocation) -> Result<ShardAllocator, AllocationError> {
+        let topology = if matches!(allocation, CpuAllocation::NumaAware(_)) {
+            let numa_topology = NumaTopology::detect()?;
+
+            println!("CPU Allocation: {:?}", allocation);
+            println!("Numa Topology: {:?}", numa_topology);
+
+            Some(Arc::new(numa_topology))
+        } else {
+            None
+        };
+
+        Ok(Self {
+            allocation: allocation.clone(),
+            topology,
+        })
+    }
+
+    pub fn validate(&self) -> Result<(), AllocationError> {
+        match &self.allocation {
+            CpuAllocation::NumaAware(numa) => {
+                let topology = self.topology.as_ref().ok_or(AllocationError::NoTopology)?;
+
+                numa.validate(topology)?;
+            }
+            _ => {
+                // Other allocations are always valid for now
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn to_shard_assignments(&self) -> Result<Vec<ShardInfo>, AllocationError> {
+        match &self.allocation {
+            CpuAllocation::All => {
+                let available_cpus = std::thread::available_parallelism()
+                    .map_err(|err| AllocationError::TopologyDetection(err.to_string()))?
+                    .get();
+
+                let rs = (0..available_cpus)
+                    .map(|cpu_id| ShardInfo {
+                        cpu_set: HashSet::from([cpu_id]),
+                        numa_node: None,
+                    })
+                    .collect();
+
+                Ok(rs)
+            }
+            CpuAllocation::Count(count) => {
+                let rs = (0..*count)
+                    .map(|cpu_id| ShardInfo {
+                        cpu_set: HashSet::from([cpu_id]),
+                        numa_node: None,
+                    })
+                    .collect();
+
+                Ok(rs)
+            }
+            CpuAllocation::Range(start, end) => {
+                let rs = (*start..*end)
+                    .map(|cpu_id| ShardInfo {
+                        cpu_set: HashSet::from([cpu_id]),
+                        numa_node: None,
+                    })
+                    .collect();
+
+                Ok(rs)
+            }
+            CpuAllocation::NumaAware(numa_config) => {
+                let topology = self.topology.as_ref().ok_or(AllocationError::NoTopology)?;
+                tracing::info!("Inside Numa Aware 0");
+
+                self.compute_numa_assignments(topology, numa_config)
+            }
+        }
+    }
+
+    fn compute_numa_assignments(
+        &self,
+        topology: &NumaTopology,
+        numa: &NumaConfig,
+    ) -> Result<Vec<ShardInfo>, AllocationError> {
+        // Determine  which noes to use
+        let nodes = if numa.nodes.is_empty() {
+            // Auto: use all nodes
+            (0..topology.node_count).collect()
+        } else {
+            numa.nodes.clone()
+        };
+
+        tracing::info!("Nodes: {nodes:?}");
+
+        // Determine cores per node
+        let cores_per_node = if numa.cores_per_node == 0 {
+            // Auto: use all available
+            if numa.avoid_hyperthread {
+                topology.physical_cores_for_node(nodes[0])
+            } else {
+                topology.logical_cores_for_node(nodes[0])
+            }
+        } else {
+            numa.cores_per_node
+        };
+
+        tracing::info!("Core per node: {cores_per_node:?}");
+
+        let mut shard_infos = Vec::new();
+
+        let node_cpus: Vec<Vec<usize>> = nodes
+            .iter()
+            .map(|&node_id| {
+                let cpuset = topology.get_cpuset_for_node(node_id, numa.avoid_hyperthread)?;
+                Ok(cpuset.iter_set().map(usize::from).collect())
+            })
+            .collect::<Result<_, AllocationError>>()?;
+
+        tracing::info!("node_cpus: {node_cpus:?}");
+
+        // For each node, create one shard per core (thread-per-core)
+        for (idx, &node_id) in nodes.iter().enumerate() {
+            let available_cpus = &node_cpus[idx];
+
+            // Take first core_per_node CPUs from this node
+            let cores_to_use: Vec<usize> = available_cpus
+                .iter()
+                .take(cores_per_node)
+                .copied()
+                .collect();
+
+            if cores_to_use.len() < cores_per_node {
+                return Err(AllocationError::InsufficientCores {
+                    requested: cores_per_node,
+                    available: available_cpus.len(),
+                    node: node_id,
+                });
+            }
+
+            // Create one shard per core
+            for cpu_id in cores_to_use {
+                shard_infos.push(ShardInfo {
+                    cpu_set: HashSet::from([cpu_id]),
+                    numa_node: Some(node_id),
+                });
+            }
+        }
+
+        // let mut node_idx = 0;
+        // let mut core_offset = vec![0; nodes.len()];
+        //
+        // loop {
+        //     let node_id = nodes[node_idx];
+        //     let available_cpus = &node_cpus[node_idx];
+        //     let offset = core_offset[node_idx];
+        //
+        //     // Take net batch of cores from this node
+        //     let shard_cpus: HashSet<usize> = available_cpus
+        //         .iter()
+        //         .skip(offset)
+        //         .take(cores_per_node)
+        //         .copied()
+        //         .collect();
+        //
+        //     if shard_cpus.is_empty() {
+        //         // No more cores on this node, try next node
+        //         node_idx = (node_idx + 1) % nodes.len();
+        //
+        //         // If we are cycled back to node 0 and it also empty, we are done
+        //         if node_idx == 0 && core_offset[0] > 0 {
+        //             break;
+        //         }
+        //
+        //         continue;
+        //     }
+        //
+        //     shard_infos.push(ShardInfo {
+        //         cpu_set: shard_cpus,
+        //         numa_node: Some(node_id),
+        //     });
+        //
+        //     // Move to next node
+        //     core_offset[node_idx] += cores_per_node;
+        //     node_idx = (node_idx + 1) % nodes.len();
+        // }
+
+        Ok(shard_infos)
     }
 }
 
@@ -56,6 +572,7 @@ impl FromStr for CpuAllocation {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "all" => Ok(CpuAllocation::All),
+            s if s.starts_with("numa:") => Self::parse_numa(s),
             s if s.contains("..") => {
                 let parts: Vec<&str> = s.split("..").collect();
                 if parts.len() != 2 {
@@ -89,6 +606,25 @@ impl Serialize for CpuAllocation {
             CpuAllocation::Count(n) => serializer.serialize_u64(*n as u64),
             CpuAllocation::Range(start, end) => {
                 serializer.serialize_str(&format!("{start}..{end}"))
+            }
+            CpuAllocation::NumaAware(numa) => {
+                if numa.nodes.is_empty() && numa.cores_per_node == 0 {
+                    serializer.serialize_str("numa:auto")
+                } else {
+                    let nodes_str = numa
+                        .nodes
+                        .iter()
+                        .map(|n| n.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",");
+
+                    let full_str = format!(
+                        "numa:nodes={};cores:{};no_ht={}",
+                        nodes_str, numa.cores_per_node, numa.avoid_hyperthread
+                    );
+
+                    serializer.serialize_str(&full_str)
+                }
             }
         }
     }

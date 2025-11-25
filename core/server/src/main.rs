@@ -29,7 +29,8 @@ use server::bootstrap::{
     create_directories, create_shard_connections, create_shard_executor, load_config, load_streams,
     load_users, resolve_persister, update_system_info,
 };
-use server::configs::sharding::CpuAllocation;
+use server::configs::config_provider::{self};
+use server::configs::sharding::{CpuAllocation, ShardAllocator};
 use server::diagnostics::{print_io_uring_permission_info, print_locked_memory_limit_info};
 use server::io::fs_utils;
 use server::log::logger::Logging;
@@ -235,7 +236,15 @@ fn main() -> Result<(), ServerError> {
         let users = load_users(users_state.into_values());
 
         // ELEVENTH DISCRETE LOADING STEP.
+        let shard_allocator = ShardAllocator::new(&config.system.sharding.cpu_allocation).unwrap();
+        shard_allocator.validate().unwrap();
+        let shard_assignment = shard_allocator.to_shard_assignments().unwrap();
+
+        info!("Shard Assignment: {:?}", shard_assignment);
+
+
         let shards_set = config.system.sharding.cpu_allocation.to_shard_set();
+        info!("Shards_set: {:?}", shards_set);
         match &config.system.sharding.cpu_allocation {
             CpuAllocation::All => {
                 info!(
@@ -252,6 +261,13 @@ fn main() -> Result<(), ServerError> {
                     end - start
                 );
             }
+            CpuAllocation::NumaAware(numa) => {
+                info!(
+                    "Using {} shards with {} NUMA node, {} Core per node, and avoid hyperthread {}",
+                    (numa.nodes.len() * numa.cores_per_node), numa.nodes.len(), numa.cores_per_node, numa.avoid_hyperthread
+                );
+
+            }
         }
 
         #[cfg(feature = "disable-mimalloc")]
@@ -264,9 +280,9 @@ fn main() -> Result<(), ServerError> {
         let metrics = Metrics::init();
 
         // TWELFTH DISCRETE LOADING STEP.
-        info!("Starting {} shard(s)", shards_set.len());
-        let (connections, shutdown_handles) = create_shard_connections(&shards_set);
-        let mut handles = Vec::with_capacity(shards_set.len());
+        info!("Starting {} shard(s)", shard_assignment.len());
+        let (connections, shutdown_handles) = create_shard_connections(&shard_assignment);
+        let mut handles = Vec::with_capacity(shard_assignment.len());
 
         // TODO: Persist the shards table and load it from the disk, so it does not have to be
         // THIRTEENTH DISCRETE LOADING STEP.
@@ -295,7 +311,7 @@ fn main() -> Result<(), ServerError> {
                                 let ns = IggyNamespace::new(stream_id, topic_id, partition_id);
                                 let shard_id = ShardId::new(calculate_shard_assignment(
                                     &ns,
-                                    shards_set.len() as u32,
+                                    shard_assignment.len() as u32,
                                 ));
                                 shards_table.insert(ns, shard_id);
                             }
@@ -305,7 +321,7 @@ fn main() -> Result<(), ServerError> {
             }
         });
 
-        for (id, cpu_id) in shards_set
+        for (id, assignment) in shard_assignment
             .into_iter()
             .enumerate()
             .map(|(idx, cpu)| (idx as u16, cpu))
@@ -357,8 +373,8 @@ fn main() -> Result<(), ServerError> {
             let handle = std::thread::Builder::new()
                 .name(format!("shard-{id}"))
                 .spawn(move || {
-                    let affinity_set = HashSet::from([cpu_id]);
-                    let rt = create_shard_executor(affinity_set);
+                    assignment.bind_memory().unwrap();
+                    let rt = create_shard_executor(assignment.cpu_set);
                     rt.block_on(async move {
                         let builder = IggyShard::builder();
                         let shard = builder
@@ -386,6 +402,8 @@ fn main() -> Result<(), ServerError> {
                 .unwrap_or_else(|e| panic!("Failed to spawn thread for shard-{id}: {e}"));
             handles.push(handle);
         }
+
+        todo!();
 
         let shutdown_handles_for_signal = shutdown_handles.clone();
         ctrlc::set_handler(move || {
