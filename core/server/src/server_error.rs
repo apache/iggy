@@ -23,7 +23,11 @@ use std::array::TryFromSliceError;
 use std::io;
 
 error_set!(
+<<<<<<< HEAD
     ServerError := ConfigurationError || ArchiverError || ConnectionError || LogError || CompatError || QuicError
+=======
+    ServerError := NumaError|| ConfigError || ArchiverError || ConnectionError || LogError || CompatError || QuicError
+>>>>>>> 9bb5e535 (remove unwrap)
 
     IoError := {
         #[display("IO error")]
@@ -36,8 +40,54 @@ error_set!(
         ReadToEndError(ReadError)
     }
 
+<<<<<<< HEAD
     ConfigurationError := {
         ConfigurationError(iggy_common::ConfigurationError),
+=======
+    NumaError := {
+        #[display("Failed to detect topology: {}", msg)]
+        TopologyDetection {
+            msg: String
+        },
+
+        #[display("There is no NUMA node on this server")]
+        NoNumaNodes,
+
+        #[display("No Topology")]
+        NoTopology,
+
+        #[display("Binding Failed")]
+        BindingFailed,
+
+        #[display("Insufficient cores on node {}: requested {}, only {} available", node, requested, available)]
+        InsufficientCores {
+            requested: usize,
+            available: usize,
+            node: usize,
+        },
+
+        #[display("Invalid NUMA node: requested {}, only available {} node", requested, available)]
+        InvalidNode { requested: usize, available: usize },
+
+        #[display("Other error: {}", msg)]
+        Other {
+            msg: String
+        },
+    }
+
+    ConfigError := {
+        #[display("Invalid configuration provider: {}", provider_type)]
+        InvalidConfigurationProvider { provider_type: String },
+
+        #[display("Cannot load configuration")]
+        CannotLoadConfiguration,
+
+        #[display("Invalid configuration")]
+        InvalidConfiguration,
+
+        #[display("Cache config validation failure")]
+        CacheConfigValidationFailure,
+>>>>>>> 9bb5e535 (remove unwrap)
     }
 
     ArchiverError := {

@@ -235,37 +235,11 @@ fn main() -> Result<(), ServerError> {
         let users = load_users(users_state.into_values());
 
         // ELEVENTH DISCRETE LOADING STEP.
-        let shard_allocator = ShardAllocator::new(&config.system.sharding.cpu_allocation).unwrap();
-        shard_allocator.validate().unwrap();
-        let shard_assignment = shard_allocator.to_shard_assignments().unwrap();
+        let shard_allocator = ShardAllocator::new(&config.system.sharding.cpu_allocation)?;
+        shard_allocator.validate()?;
+        let shard_assignment = shard_allocator.to_shard_assignments()?;
 
         info!("Shard Assignment: {:?}", shard_assignment);
-        // let shards_set = config.system.sharding.cpu_allocation.to_shard_set();
-        // info!("Shards_set: {:?}", shards_set);
-        // match &config.system.sharding.cpu_allocation {
-        //     CpuAllocation::All => {
-        //         info!(
-        //             "Using all available CPU cores ({} shards with affinity)",
-        //             shards_set.len()
-        //         );
-        //     }
-        //     CpuAllocation::Count(count) => {
-        //         info!("Using {count} shards with affinity to cores 0..{count}");
-        //     }
-        //     CpuAllocation::Range(start, end) => {
-        //         info!(
-        //             "Using {} shards with affinity to cores {start}..{end}",
-        //             end - start
-        //         );
-        //     }
-        //     CpuAllocation::NumaAware(numa) => {
-        //         info!(
-        //             "Using {} shards with {} NUMA node, {} Core per node, and avoid hyperthread {}",
-        //             (numa.nodes.len() * numa.cores_per_node), numa.nodes.len(), numa.cores_per_node, numa.avoid_hyperthread
-        //         );
-        //
-        //     }
-        // }
 
         #[cfg(feature = "disable-mimalloc")]
         warn!("Using default system allocator because code was build with `disable-mimalloc` feature");
@@ -370,7 +344,10 @@ fn main() -> Result<(), ServerError> {
             let handle = std::thread::Builder::new()
                 .name(format!("shard-{id}"))
                 .spawn(move || {
-                    assignment.bind_memory().unwrap();
+                    if let Err(e) = assignment.bind_memory() {
+                        error!("Failed to bind memory: {e:?}");
+                    }
+
                     let rt = create_shard_executor(assignment.cpu_set);
                     rt.block_on(async move {
                         let builder = IggyShard::builder();
