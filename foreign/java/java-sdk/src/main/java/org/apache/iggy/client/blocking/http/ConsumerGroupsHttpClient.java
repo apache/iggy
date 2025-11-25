@@ -19,13 +19,13 @@
 
 package org.apache.iggy.client.blocking.http;
 
-import com.fasterxml.jackson.core.type.TypeReference;
 import org.apache.iggy.client.blocking.ConsumerGroupsClient;
 import org.apache.iggy.consumergroup.ConsumerGroup;
 import org.apache.iggy.consumergroup.ConsumerGroupDetails;
 import org.apache.iggy.identifier.ConsumerId;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
+import tools.jackson.core.type.TypeReference;
 
 import java.util.List;
 import java.util.Optional;

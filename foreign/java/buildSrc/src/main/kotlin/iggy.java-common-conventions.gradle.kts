@@ -17,25 +17,28 @@
  * under the License.
  */
 
-package org.apache.iggy.client.blocking.http;
+plugins {
+    java
+}
 
-import tools.jackson.databind.DeserializationFeature;
-import tools.jackson.databind.MapperFeature;
-import tools.jackson.databind.ObjectMapper;
-import tools.jackson.databind.PropertyNamingStrategies;
-import tools.jackson.databind.json.JsonMapper;
+repositories {
+    mavenCentral()
+}
 
-final class ObjectMapperFactory {
+java {
+    sourceCompatibility = JavaVersion.VERSION_17
+    targetCompatibility = JavaVersion.VERSION_17
+}
 
-    private static final ObjectMapper INSTANCE = JsonMapper.builder()
-            .enable(MapperFeature.ACCEPT_CASE_INSENSITIVE_ENUMS)
-            .enable(DeserializationFeature.FAIL_ON_NULL_CREATOR_PROPERTIES)
-            .propertyNamingStrategy(PropertyNamingStrategies.SNAKE_CASE)
-            .build();
+tasks.withType<JavaCompile> {
+    options.encoding = "UTF-8"
+    options.compilerArgs.add("-parameters")
+}
 
-    private ObjectMapperFactory() {}
+tasks.withType<Javadoc> {
+    options.encoding = "UTF-8"
+}
 
-    static ObjectMapper getInstance() {
-        return INSTANCE;
-    }
+tasks.withType<Test> {
+    useJUnitPlatform()
 }

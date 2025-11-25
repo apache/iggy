@@ -19,11 +19,11 @@
 
 package org.apache.iggy.client.blocking.http;
 
-import com.fasterxml.jackson.core.type.TypeReference;
 import org.apache.iggy.client.blocking.StreamsClient;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.stream.StreamBase;
 import org.apache.iggy.stream.StreamDetails;
+import tools.jackson.core.type.TypeReference;
 
 import java.util.List;
 import java.util.Optional;

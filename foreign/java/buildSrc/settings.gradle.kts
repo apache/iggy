@@ -17,25 +17,4 @@
  * under the License.
  */
 
-package org.apache.iggy.client.blocking.http;
-
-import tools.jackson.databind.DeserializationFeature;
-import tools.jackson.databind.MapperFeature;
-import tools.jackson.databind.ObjectMapper;
-import tools.jackson.databind.PropertyNamingStrategies;
-import tools.jackson.databind.json.JsonMapper;
-
-final class ObjectMapperFactory {
-
-    private static final ObjectMapper INSTANCE = JsonMapper.builder()
-            .enable(MapperFeature.ACCEPT_CASE_INSENSITIVE_ENUMS)
-            .enable(DeserializationFeature.FAIL_ON_NULL_CREATOR_PROPERTIES)
-            .propertyNamingStrategy(PropertyNamingStrategies.SNAKE_CASE)
-            .build();
-
-    private ObjectMapperFactory() {}
-
-    static ObjectMapper getInstance() {
-        return INSTANCE;
-    }
-}
+rootProject.name = "buildSrc"

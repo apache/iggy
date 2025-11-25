@@ -18,12 +18,7 @@
  */
 
 plugins {
-    id("java")
-    id("application")
-}
-
-repositories {
-    mavenCentral()
+    id("iggy.java-application-conventions")
 }
 
 application {
@@ -32,9 +27,9 @@ application {
 
 dependencies {
     implementation(project(":iggy"))
-    implementation("org.slf4j:slf4j-api:2.0.17")
-    runtimeOnly("ch.qos.logback:logback-classic:1.5.21")
-    runtimeOnly("io.netty:netty-resolver-dns-native-macos:4.2.7.Final:osx-aarch_64")
+    implementation(libs.slf4j.api)
+    runtimeOnly(libs.logback.classic)
+    runtimeOnly(libs.netty.dns.macos) { artifact { classifier = "osx-aarch_64" } }
 }
 
 // Task for running async consumer example

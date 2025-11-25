@@ -19,10 +19,6 @@
 
 package org.apache.iggy.client.blocking.http;
 
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.core.type.TypeReference;
-import com.fasterxml.jackson.databind.JavaType;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.hc.client5.http.impl.classic.HttpClients;
 import org.apache.hc.core5.http.ClassicHttpRequest;
 import org.apache.hc.core5.http.ClassicHttpResponse;
@@ -33,6 +29,9 @@ import org.apache.iggy.client.blocking.http.error.IggyHttpError;
 import org.apache.iggy.client.blocking.http.error.IggyHttpException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import tools.jackson.core.type.TypeReference;
+import tools.jackson.databind.JavaType;
+import tools.jackson.databind.ObjectMapper;
 
 import java.io.IOException;
 import java.util.Optional;
@@ -126,16 +125,12 @@ final class InternalHttpClient {
     }
 
     private ClassicHttpRequest addRequestBody(ClassicRequestBuilder requestBuilder, Object body) {
-        try {
-            var encodedBody = objectMapper.writeValueAsString(body);
-            log.debug("Request body: {}", encodedBody);
-            return requestBuilder
-                    .setHeader("Content-Type", "application/json")
-                    .setEntity(encodedBody)
-                    .build();
-        } catch (JsonProcessingException e) {
-            throw new RuntimeException(e);
-        }
+        var encodedBody = objectMapper.writeValueAsString(body);
+        log.debug("Request body: {}", encodedBody);
+        return requestBuilder
+                .setHeader("Content-Type", "application/json")
+                .setEntity(encodedBody)
+                .build();
     }
 
     private <T> T handleTypedResponse(ClassicHttpResponse response, JavaType type) throws IOException {
