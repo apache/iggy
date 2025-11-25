@@ -30,7 +30,7 @@ use server::bootstrap::{
     load_users, resolve_persister, update_system_info,
 };
 use server::configs::config_provider::{self};
-use server::configs::sharding::{CpuAllocation, ShardAllocator};
+use server::configs::sharding::ShardAllocator;
 use server::diagnostics::{print_io_uring_permission_info, print_locked_memory_limit_info};
 use server::io::fs_utils;
 use server::log::logger::Logging;
@@ -50,7 +50,6 @@ use server::streaming::storage::SystemStorage;
 use server::streaming::utils::MemoryPool;
 use server::streaming::utils::ptr::EternalPtr;
 use server::versioning::SemanticVersion;
-use std::collections::HashSet;
 use std::rc::Rc;
 use std::str::FromStr;
 use std::sync::Arc;

@@ -551,7 +551,7 @@ ports = { tcp = 8091, quic = 8081, http = 3001, websocket = 8093 }
 # - range (e.g. "5..8"): Use 3 shards with affinity to cores 5, 6, 7
 # cpu_allocation = "numa:auto"
 # cpu_allocation = "all"
-cpu_allocation = "numa:nodes=0;cores=4;no_ht=true"
+cpu_allocation = "numa:auto"
 
 [websocket]
 enabled = true
