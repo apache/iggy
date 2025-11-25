@@ -67,6 +67,7 @@ components:
     paths:
       - "core/consensus/"
       - "core/metadata/"
+      - "core/message_bus/"
 
   # Main Rust workspace testing
   rust:

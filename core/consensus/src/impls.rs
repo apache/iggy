@@ -16,8 +16,24 @@
 // under the License.
 
 use crate::{Consensus, Project};
+use message_bus::IggyMessageBus;
+use std::cell::Cell;
 
-pub struct VsrConsensus;
+pub struct VsrConsensus {
+    op: Cell<u64>,
+}
+
+impl VsrConsensus {
+    pub fn advance_commit_number(&self) {}
+
+    pub fn update_op(&self, op: u64) {
+        self.op.set(op);
+    }
+
+    pub fn op(&self) -> u64 {
+        self.op.get()
+    }
+}
 
 #[derive(Clone)]
 pub struct Request;
@@ -43,6 +59,8 @@ impl Project<PrepareOk> for Prepare {
 pub struct PrepareOk;
 
 impl Consensus for VsrConsensus {
+    type MessageBus = IggyMessageBus;
+
     type RequestMessage = Request;
     type ReplicateMessage = Prepare;
     type AckMessage = PrepareOk;
@@ -56,6 +74,10 @@ impl Consensus for VsrConsensus {
     }
 
     fn post_replicate_verify(&self, _message: &Self::ReplicateMessage) {
+        todo!()
+    }
+
+    fn is_follower(&self) -> bool {
         todo!()
     }
 }

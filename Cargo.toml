@@ -41,6 +41,8 @@ members = [
     "core/connectors/sources/random_source",
     "core/consensus",
     "core/integration",
+    "core/journal",
+    "core/message_bus",
     "core/metadata",
     "core/sdk",
     "core/server",

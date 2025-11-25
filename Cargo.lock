@@ -1920,6 +1920,9 @@ dependencies = [
 [[package]]
 name = "consensus"
 version = "0.1.0"
+dependencies = [
+ "message_bus",
+]
 
 [[package]]
 name = "console"
@@ -5259,6 +5262,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "journal"
+version = "0.1.0"
+
+[[package]]
 name = "js-sys"
 version = "0.3.82"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5752,10 +5759,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f52b00d39961fc5b2736ea853c9cc86238e165017a493d1d5c8eac6bdc4cc273"
 
 [[package]]
+name = "message_bus"
+version = "0.1.0"
+
+[[package]]
 name = "metadata"
 version = "0.1.0"
 dependencies = [
  "consensus",
+ "journal",
  "tracing",
 ]
 

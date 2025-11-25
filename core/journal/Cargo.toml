@@ -16,9 +16,9 @@
 # under the License.
 
 [package]
-name = "consensus"
+name = "journal"
 version = "0.1.0"
-description = "Iggy consensus module"
+description = "Iggy journal module"
 edition = "2024"
 license = "Apache-2.0"
 keywords = ["iggy", "messaging", "streaming"]
@@ -28,6 +28,4 @@ repository = "https://github.com/apache/iggy"
 readme = "../../../README.md"
 
 [dependencies]
-message_bus = { path = "../message_bus" }
-
 
