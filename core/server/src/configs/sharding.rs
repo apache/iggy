@@ -335,9 +335,6 @@ impl ShardAllocator {
         let topology = if matches!(allocation, CpuAllocation::NumaAware(_)) {
             let numa_topology = NumaTopology::detect()?;
 
-            println!("CPU Allocation: {:?}", allocation);
-            println!("Numa Topology: {:?}", numa_topology);
-
             Some(Arc::new(numa_topology))
         } else {
             None
@@ -542,6 +539,58 @@ impl<'de> Deserialize<'de> for CpuAllocation {
                 CpuAllocation::from_str(&s).map_err(serde::de::Error::custom)
             }
             CpuAllocationHelper::Number(n) => Ok(CpuAllocation::Count(n)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_all() {
+        assert_eq!(CpuAllocation::from_str("all").unwrap(), CpuAllocation::All);
+    }
+
+    #[test]
+    fn test_parse_count() {
+        assert_eq!(
+            CpuAllocation::from_str("4").unwrap(),
+            CpuAllocation::Count(4)
+        );
+    }
+
+    #[test]
+    fn test_parse_range() {
+        assert_eq!(
+            CpuAllocation::from_str("2..8").unwrap(),
+            CpuAllocation::Range(2, 8)
+        );
+    }
+
+    #[test]
+    fn test_parse_numa_auto() {
+        let result = CpuAllocation::from_str("numa:auto").unwrap();
+        match result {
+            CpuAllocation::NumaAware(numa) => {
+                assert!(numa.nodes.is_empty());
+                assert_eq!(numa.cores_per_node, 0);
+                assert!(numa.avoid_hyperthread);
+            }
+            _ => panic!("Expected NumaAware"),
+        }
+    }
+
+    #[test]
+    fn test_parse_numa_explicit() {
+        let result = CpuAllocation::from_str("numa:nodes=0,1;cores=4;no_ht=true").unwrap();
+        match result {
+            CpuAllocation::NumaAware(numa) => {
+                assert_eq!(numa.nodes, vec![0, 1]);
+                assert_eq!(numa.cores_per_node, 4);
+                assert!(numa.avoid_hyperthread);
+            }
+            _ => panic!("Expected NumaAware"),
         }
     }
 }
