@@ -108,28 +108,11 @@ impl NumaConfig {
     //         );
     //     }
     //
-    //     // let total_shards = if self.nodes.is_empty() {
-    //     // }
-    //
     //     todo!()
     // }
 }
 
 impl CpuAllocation {
-    pub fn to_shard_set(&self) -> HashSet<usize> {
-        match self {
-            CpuAllocation::All => {
-                let available_cpus = available_parallelism()
-                    .expect("Failed to get num of cores")
-                    .get();
-                (0..available_cpus).collect()
-            }
-            CpuAllocation::Count(count) => (0..*count).collect(),
-            CpuAllocation::Range(start, end) => (*start..*end).collect(),
-            CpuAllocation::NumaAware(numa) => (0..numa.cores_per_node).collect(),
-        }
-    }
-
     fn parse_numa(s: &str) -> Result<CpuAllocation, String> {
         let params = s
             .strip_prefix("numa:")
@@ -192,36 +175,6 @@ impl CpuAllocation {
     }
 }
 
-// use thiserror::Error;
-//
-// #[derive(Debug, Error)]
-// pub enum ServerError {
-//     #[error("Failed to detect topology: {0}")]
-//     TopologyDetection(String),
-//
-//     #[error("There is no NUMA node on this server")]
-//     NoNumaNodes,
-//
-//     #[error("No Topology")]
-//     NoTopology,
-//
-//     #[error("Binding Failed")]
-//     BindingFailed,
-//
-//     #[error("Insufficient cores on node {node}: requested {requested}, only {available} available")]
-//     InsufficientCores {
-//         requested: usize,
-//         available: usize,
-//         node: usize,
-//     },
-//
-//     #[error("Invalid NUMA node: requested {requested}, only available {available} node")]
-//     InvalidNode { requested: usize, available: usize },
-//
-//     #[error("Other: {0}")]
-//     Other(String),
-// }
-
 #[derive(Debug)]
 pub struct NumaTopology {
     topology: Topology,
@@ -276,10 +229,6 @@ impl NumaTopology {
         })
     }
 
-    pub fn node_count(&self) -> usize {
-        self.node_count
-    }
-
     pub fn physical_cores_for_node(&self, node: usize) -> usize {
         self.physical_cores_per_node.get(node).copied().unwrap_or(0)
     }
@@ -290,18 +239,17 @@ impl NumaTopology {
 
     fn filter_physical_cores(&self, node_cpuset: CpuSet) -> CpuSet {
         let mut physical_cpuset = CpuSet::new();
-
         for core in self.topology.objects_with_type(ObjectType::Core) {
             if let Some(core_cpuset) = core.cpuset() {
                 let intersection = node_cpuset.clone() & core_cpuset;
-                if !intersection.is_empty()
-                    && let Some(first_cpu) = intersection.iter_set().next()
-                {
-                    physical_cpuset.set(first_cpu)
+                if !intersection.is_empty() {
+                    // Take the minimum (first) CPU ID for consistency
+                    if let Some(first_cpu) = intersection.iter_set().min() {
+                        physical_cpuset.set(first_cpu)
+                    }
                 }
             }
         }
-
         physical_cpuset
     }
 
@@ -401,58 +349,43 @@ impl ShardAllocator {
         })
     }
 
-    pub fn validate(&self) -> Result<(), ServerError> {
-        match &self.allocation {
-            CpuAllocation::NumaAware(numa) => {
-                let topology = self.topology.as_ref().ok_or(ServerError::NoTopology)?;
-
-                numa.validate(topology)?;
-            }
-            _ => {
-                // Other allocations are always valid for now
-            }
-        }
-
-        Ok(())
-    }
-
     pub fn to_shard_assignments(&self) -> Result<Vec<ShardInfo>, ServerError> {
         match &self.allocation {
             CpuAllocation::All => {
-                let available_cpus = std::thread::available_parallelism()
+                let available_cpus = available_parallelism()
                     .map_err(|err| ServerError::Other {
                         msg: format!("Failed to get available_parallelism: {:?}", err),
                     })?
                     .get();
 
-                let rs = (0..available_cpus)
+                let shard_assignments = (0..available_cpus)
                     .map(|cpu_id| ShardInfo {
                         cpu_set: HashSet::from([cpu_id]),
                         numa_node: None,
                     })
                     .collect();
 
-                Ok(rs)
+                Ok(shard_assignments)
             }
             CpuAllocation::Count(count) => {
-                let rs = (0..*count)
+                let shard_assignments = (0..*count)
                     .map(|cpu_id| ShardInfo {
                         cpu_set: HashSet::from([cpu_id]),
                         numa_node: None,
                     })
                     .collect();
 
-                Ok(rs)
+                Ok(shard_assignments)
             }
             CpuAllocation::Range(start, end) => {
-                let rs = (*start..*end)
+                let shard_assignments = (*start..*end)
                     .map(|cpu_id| ShardInfo {
                         cpu_set: HashSet::from([cpu_id]),
                         numa_node: None,
                     })
                     .collect();
 
-                Ok(rs)
+                Ok(shard_assignments)
             }
             CpuAllocation::NumaAware(numa_config) => {
                 let topology = self.topology.as_ref().ok_or(ServerError::NoTopology)?;
@@ -474,8 +407,6 @@ impl ShardAllocator {
             numa.nodes.clone()
         };
 
-        tracing::info!("Nodes: {nodes:?}");
-
         // Determine cores per node
         let cores_per_node = if numa.cores_per_node == 0 {
             // Auto: use all available
@@ -488,8 +419,6 @@ impl ShardAllocator {
             numa.cores_per_node
         };
 
-        tracing::info!("Core per node: {cores_per_node:?}");
-
         let mut shard_infos = Vec::new();
 
         let node_cpus: Vec<Vec<usize>> = nodes
@@ -499,8 +428,6 @@ impl ShardAllocator {
                 Ok(cpuset.iter_set().map(usize::from).collect())
             })
             .collect::<Result<_, ServerError>>()?;
-
-        tracing::info!("node_cpus: {node_cpus:?}");
 
         // For each node, create one shard per core (thread-per-core)
         for (idx, &node_id) in nodes.iter().enumerate() {

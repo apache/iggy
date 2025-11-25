@@ -236,9 +236,7 @@ fn main() -> Result<(), ServerError> {
 
         // ELEVENTH DISCRETE LOADING STEP.
         let shard_allocator = ShardAllocator::new(&config.system.sharding.cpu_allocation)?;
-        shard_allocator.validate()?;
         let shard_assignment = shard_allocator.to_shard_assignments()?;
-
         info!("Shard Assignment: {:?}", shard_assignment);
 
         #[cfg(feature = "disable-mimalloc")]
