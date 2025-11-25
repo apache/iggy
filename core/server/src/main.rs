@@ -30,7 +30,7 @@ use server::bootstrap::{
     load_users, resolve_persister, update_system_info,
 };
 use server::configs::config_provider::{self};
-use server::configs::sharding::ShardAllocator;
+use server::configs::sharding::{CpuAllocation, ShardAllocator};
 use server::diagnostics::{print_io_uring_permission_info, print_locked_memory_limit_info};
 use server::io::fs_utils;
 use server::log::logger::Logging;
@@ -237,7 +237,31 @@ fn main() -> Result<(), ServerError> {
         // ELEVENTH DISCRETE LOADING STEP.
         let shard_allocator = ShardAllocator::new(&config.system.sharding.cpu_allocation)?;
         let shard_assignment = shard_allocator.to_shard_assignments()?;
-        info!("Shard Assignment: {:?}", shard_assignment);
+
+        match &config.system.sharding.cpu_allocation {
+            CpuAllocation::All => {
+                info!(
+                    "Using all available CPU cores ({} shards with affinity)",
+                    shard_assignment.len()
+                );
+            }
+            CpuAllocation::Count(count) => {
+                info!("Using {count} shards with affinity to cores 0..{count}");
+            }
+            CpuAllocation::Range(start, end) => {
+                info!(
+                    "Using {} shards with affinity to cores {start}..{end}",
+                    end - start
+                );
+            }
+            CpuAllocation::NumaAware(numa) => {
+                info!(
+                    "Using {} shards with {} NUMA node, {} Core per node, and avoid hyperthread {}",
+                    (numa.nodes.len() * numa.cores_per_node), numa.nodes.len(), numa.cores_per_node, numa.avoid_hyperthread
+                );
+            }
+        }
+
 
         #[cfg(feature = "disable-mimalloc")]
         warn!("Using default system allocator because code was build with `disable-mimalloc` feature");
