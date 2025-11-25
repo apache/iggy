@@ -1,4 +1,5 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
  * regarding copyright ownership.  The ASF licenses this file
@@ -26,6 +27,7 @@ use integration::{
 };
 use std::collections::HashMap;
 
+mod http_config_provider;
 mod postgres;
 mod random;
 
@@ -176,5 +178,11 @@ impl ConnectorsRuntime {
             .await
             .expect("Failed to login as root user");
         IggyClient::create(client, None, None)
+    }
+
+    pub fn connectors_api_address(&self) -> Option<String> {
+        self.connectors_runtime
+            .as_ref()
+            .map(|connectors_runtime| connectors_runtime.get_http_api_address())
     }
 }
