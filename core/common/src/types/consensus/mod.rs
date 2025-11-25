@@ -126,17 +126,10 @@ where
         &self.buffer[..total_size]
     }
 
-    /// Get the underlying buffer.
-    #[inline]
-    #[allow(unused)]
-    pub fn buffer(&self) -> &Bytes {
-        &self.buffer
-    }
-
     /// Convert into the underlying buffer.
     #[inline]
     #[allow(unused)]
-    pub fn into_buffer(self) -> Bytes {
+    pub fn into_inner(self) -> Bytes {
         self.buffer
     }
 
@@ -149,7 +142,7 @@ where
     /// - If doing a zero-cost type conversion (like to GenericHeader)
     #[inline]
     #[allow(unused)]
-    fn from_buffer_unchecked(buffer: Bytes) -> Self {
+    unsafe fn from_buffer_unchecked(buffer: Bytes) -> Self {
         Self {
             buffer,
             _marker: PhantomData,
@@ -161,7 +154,7 @@ where
     /// This allows treating any message as a generic message for common operations.
     #[allow(unused)]
     pub fn into_generic(self) -> Message<header::GenericHeader> {
-        Message::from_buffer_unchecked(self.buffer)
+        unsafe { Message::from_buffer_unchecked(self.buffer) }
     }
 
     /// Get a reference to this message as a generic message.
@@ -202,7 +195,7 @@ where
             });
         }
 
-        let new_message = Message::<T>::from_buffer_unchecked(self.buffer);
+        let new_message = unsafe { Message::<T>::from_buffer_unchecked(self.buffer) };
 
         new_message.header().validate()?;
 
@@ -271,74 +264,6 @@ impl MessageBag {
             MessageBag::Reply(message) => message.header().size(),
         }
     }
-
-    #[allow(unused)]
-    pub fn as_prepare(&self) -> Option<&Message<header::PrepareHeader>> {
-        match self {
-            MessageBag::Prepare(m) => Some(m),
-            _ => None,
-        }
-    }
-
-    #[allow(unused)]
-    pub fn as_commit(&self) -> Option<&Message<header::CommitHeader>> {
-        match self {
-            MessageBag::Commit(m) => Some(m),
-            _ => None,
-        }
-    }
-
-    #[allow(unused)]
-    pub fn as_reply(&self) -> Option<&Message<header::ReplyHeader>> {
-        match self {
-            MessageBag::Reply(m) => Some(m),
-            _ => None,
-        }
-    }
-
-    #[allow(unused)]
-    pub fn into_prepare(self) -> Result<Message<header::PrepareHeader>, Self> {
-        match self {
-            MessageBag::Prepare(m) => Ok(m),
-            other => Err(other),
-        }
-    }
-
-    #[allow(unused)]
-    pub fn into_commit(self) -> Result<Message<header::CommitHeader>, Self> {
-        match self {
-            MessageBag::Commit(m) => Ok(m),
-            other => Err(other),
-        }
-    }
-
-    #[allow(unused)]
-    pub fn into_reply(self) -> Result<Message<header::ReplyHeader>, Self> {
-        match self {
-            MessageBag::Reply(m) => Ok(m),
-            other => Err(other),
-        }
-    }
-
-    #[allow(unused)]
-    pub fn into_generic(self) -> Message<header::GenericHeader> {
-        match self {
-            MessageBag::Generic(m) => m,
-            MessageBag::Prepare(m) => m.into_generic(),
-            MessageBag::Commit(m) => m.into_generic(),
-            MessageBag::Reply(m) => m.into_generic(),
-        }
-    }
-
-    #[allow(unused)]
-    pub fn as_generic(&self) -> &Message<header::GenericHeader> {
-        match self {
-            MessageBag::Generic(m) => m,
-            MessageBag::Prepare(m) => m.as_generic(),
-            MessageBag::Commit(m) => m.as_generic(),
-            MessageBag::Reply(m) => m.as_generic(),
-        }
-    }
 }
 
 impl From<Message<header::PrepareHeader>> for MessageBag {
@@ -371,156 +296,155 @@ mod tests {
 
     use super::*;
 
+    trait MessageFactory: ConsensusHeader + Sized {
+        fn create_test() -> Message<Self>;
+    }
+
+    impl MessageFactory for header::GenericHeader {
+        fn create_test() -> Message<Self> {
+            let header_size = size_of::<Self>();
+            let body_size = 128;
+            let total_size = header_size + body_size;
+
+            let mut buffer = BytesMut::zeroed(total_size);
+
+            let header = bytemuck::from_bytes_mut::<Self>(&mut buffer[..header_size]);
+
+            header.checksum = 123456;
+            header.cluster = 12345;
+            header.size = total_size as u32;
+            header.command = header::Command::Reserved;
+
+            for (i, item) in buffer
+                .iter_mut()
+                .enumerate()
+                .take(total_size)
+                .skip(header_size)
+            {
+                *item = (i % 256) as u8;
+            }
+
+            Message::<Self>::from_bytes(buffer.freeze()).unwrap()
+        }
+    }
+
+    impl MessageFactory for header::PrepareHeader {
+        fn create_test() -> Message<Self> {
+            let header_size = size_of::<Self>();
+            let body_size = 64;
+            let total_size = header_size + body_size;
+
+            let mut buffer = BytesMut::zeroed(total_size);
+
+            let header = bytemuck::from_bytes_mut::<Self>(&mut buffer[..header_size]);
+
+            header.checksum = 123456;
+            header.checksum_body = 789012;
+            header.cluster = 12345;
+            header.size = total_size as u32;
+            header.view = 1;
+            header.command = header::Command::Prepare;
+            header.replica = 1;
+            header.op = 100;
+            header.commit = 99;
+            header.timestamp = 1234567890;
+            header.operation = header::Operation::CreateStream;
+
+            Message::<Self>::from_bytes(buffer.freeze()).unwrap()
+        }
+    }
+
+    impl MessageFactory for header::CommitHeader {
+        fn create_test() -> Message<Self> {
+            let header_size = size_of::<Self>();
+            let total_size = 256;
+
+            let mut buffer = BytesMut::zeroed(total_size);
+
+            let header = bytemuck::from_bytes_mut::<Self>(&mut buffer[..header_size]);
+
+            header.checksum = 123456;
+            header.cluster = 12345;
+            header.size = 256;
+            header.view = 1;
+            header.command = header::Command::Commit;
+            header.replica = 2;
+            header.commit = 50;
+
+            Message::<Self>::from_bytes(buffer.freeze()).unwrap()
+        }
+    }
+
+    impl MessageFactory for header::ReplyHeader {
+        fn create_test() -> Message<Self> {
+            let header_size = size_of::<Self>();
+            let body_size = 32;
+            let total_size = header_size + body_size;
+
+            let mut buffer = BytesMut::zeroed(total_size);
+
+            let header = bytemuck::from_bytes_mut::<Self>(&mut buffer[..header_size]);
+
+            header.checksum = 123456;
+            header.cluster = 12345;
+            header.size = total_size as u32;
+            header.view = 1;
+            header.command = header::Command::Reply;
+            header.replica = 3;
+            header.op = 100;
+            header.commit = 99;
+            header.operation = header::Operation::CreateStream;
+
+            Message::<Self>::from_bytes(buffer.freeze()).unwrap()
+        }
+    }
+
     #[test]
     fn test_message_creation_and_access() {
-        let mut buffer = vec![0u8; 256];
+        let message = header::GenericHeader::create_test();
 
-        let header = bytemuck::from_bytes_mut::<header::GenericHeader>(
-            &mut buffer[..size_of::<header::GenericHeader>()],
-        );
-        header.size = 256;
-        header.command = header::Command::Reserved;
-        header.cluster = 123;
-
-        let message = Message::<header::GenericHeader>::from_bytes(Bytes::from(buffer)).unwrap();
-
-        assert_eq!(message.header().size, 256);
-        assert_eq!(message.header().cluster, 123);
+        assert_eq!(message.header().cluster, 12345);
         assert_eq!(message.header().command, header::Command::Reserved);
         assert_eq!(
             message.body().len(),
-            256 - size_of::<header::GenericHeader>()
+            message.header().size() as usize - size_of::<header::GenericHeader>()
         );
+
+        let body = message.body();
+        let header_size = size_of::<header::GenericHeader>();
+        for (i, &byte) in body.iter().enumerate() {
+            let expected = ((i + header_size) % 256) as u8;
+            assert_eq!(byte, expected);
+        }
     }
 
     #[test]
     fn test_message_conversion() {
-        let mut buffer = vec![0u8; 256];
+        let prepare_message = header::PrepareHeader::create_test();
 
-        let header = bytemuck::from_bytes_mut::<header::PrepareHeader>(
-            &mut buffer[..size_of::<header::PrepareHeader>()],
-        );
-        header.size = 256;
-        header.command = header::Command::Prepare;
-        header.cluster = 456;
-        header.op = 100;
-        header.view = 1;
-        header.operation = header::Operation::CreateStream;
-
-        let prepare_message =
-            Message::<header::PrepareHeader>::from_bytes(Bytes::from(buffer)).unwrap();
+        let original_bytes = prepare_message.as_bytes().to_vec();
 
         let generic_message = prepare_message.into_generic();
         assert_eq!(generic_message.header().command, header::Command::Prepare);
 
         let prepare_again: Message<header::PrepareHeader> =
             generic_message.try_into_typed().unwrap();
+
         assert_eq!(prepare_again.header().op, 100);
         assert_eq!(prepare_again.header().view, 1);
-    }
+        assert_eq!(prepare_again.header().cluster, 12345);
 
-    #[test]
-    fn test_message_body() {
-        let mut buffer = vec![0u8; 256];
+        let roundtrip_bytes = prepare_again.as_bytes().to_vec();
 
-        let header = bytemuck::from_bytes_mut::<header::GenericHeader>(
-            &mut buffer[..size_of::<header::GenericHeader>()],
+        assert_eq!(
+            original_bytes, roundtrip_bytes,
+            "Bytes should be identical after round-trip conversion"
         );
-        header.size = 256;
-        header.command = header::Command::Reserved;
-
-        for (i, item) in buffer
-            .iter_mut()
-            .enumerate()
-            .take(256)
-            .skip(size_of::<header::GenericHeader>())
-        {
-            *item = (i % 256) as u8;
-        }
-
-        let message = Message::<header::GenericHeader>::from_bytes(Bytes::from(buffer)).unwrap();
-
-        let body = message.body();
-        assert_eq!(body.len(), 256 - size_of::<header::GenericHeader>());
-
-        for (i, &byte) in body.iter().enumerate() {
-            let expected = ((i + size_of::<header::GenericHeader>()) % 256) as u8;
-            assert_eq!(byte, expected);
-        }
-    }
-
-    fn create_test_prepare(op: u64, cluster: u128, view: u32) -> Message<header::PrepareHeader> {
-        let header_size = size_of::<header::PrepareHeader>();
-        let body_size = 64;
-        let total_size = header_size + body_size;
-
-        let mut buffer = BytesMut::zeroed(total_size);
-
-        let header = bytemuck::from_bytes_mut::<header::PrepareHeader>(&mut buffer[..header_size]);
-
-        header.checksum = 123456;
-        header.checksum_body = 789012;
-        header.cluster = cluster;
-        header.size = total_size as u32;
-        header.view = view;
-        header.command = header::Command::Prepare;
-        header.replica = 1;
-        header.op = op;
-        header.commit = op.saturating_sub(1);
-        header.timestamp = 1234567890;
-        header.operation = header::Operation::CreateStream;
-
-        Message::<header::PrepareHeader>::from_bytes(buffer.freeze()).unwrap()
-    }
-
-    fn create_test_commit(
-        commit_num: u64,
-        cluster: u128,
-        view: u32,
-    ) -> Message<header::CommitHeader> {
-        let header_size = size_of::<header::CommitHeader>();
-        let total_size = 256; // CommitHeader must be exactly 256 bytes
-
-        let mut buffer = BytesMut::zeroed(total_size);
-
-        let header = bytemuck::from_bytes_mut::<header::CommitHeader>(&mut buffer[..header_size]);
-
-        header.checksum = 123456;
-        header.cluster = cluster;
-        header.size = 256;
-        header.view = view;
-        header.command = header::Command::Commit;
-        header.replica = 2;
-        header.commit = commit_num;
-
-        Message::<header::CommitHeader>::from_bytes(buffer.freeze()).unwrap()
-    }
-
-    fn create_test_reply(op: u64, cluster: u128, view: u32) -> Message<header::ReplyHeader> {
-        let header_size = size_of::<header::ReplyHeader>();
-        let body_size = 32;
-        let total_size = header_size + body_size;
-
-        let mut buffer = BytesMut::zeroed(total_size);
-
-        let header = bytemuck::from_bytes_mut::<header::ReplyHeader>(&mut buffer[..header_size]);
-
-        header.checksum = 123456;
-        header.cluster = cluster;
-        header.size = total_size as u32;
-        header.view = view;
-        header.command = header::Command::Reply;
-        header.replica = 3;
-        header.op = op;
-        header.commit = op.saturating_sub(1);
-        header.operation = header::Operation::CreateStream;
-
-        Message::<header::ReplyHeader>::from_bytes(buffer.freeze()).unwrap()
     }
 
     #[test]
     fn test_message_bag_from_prepare() {
-        let prepare = create_test_prepare(100, 12345, 1);
+        let prepare = header::PrepareHeader::create_test();
         let bag = MessageBag::from(prepare);
 
         assert_eq!(bag.command(), header::Command::Prepare);
@@ -532,7 +456,7 @@ mod tests {
 
     #[test]
     fn test_message_bag_from_commit() {
-        let commit = create_test_commit(50, 12345, 1);
+        let commit = header::CommitHeader::create_test();
         let bag = MessageBag::from(commit);
 
         assert_eq!(bag.command(), header::Command::Commit);
@@ -544,7 +468,7 @@ mod tests {
 
     #[test]
     fn test_message_bag_from_reply() {
-        let reply = create_test_reply(100, 12345, 1);
+        let reply = header::ReplyHeader::create_test();
         let bag = MessageBag::from(reply);
 
         assert_eq!(bag.command(), header::Command::Reply);
@@ -552,37 +476,6 @@ mod tests {
         assert!(!matches!(bag, MessageBag::Commit(_)));
         assert!(matches!(bag, MessageBag::Reply(_)));
         assert!(!matches!(bag, MessageBag::Generic(_)));
-    }
-
-    #[test]
-    fn test_message_bag_as_generic() {
-        let prepare = create_test_prepare(100, 12345, 1);
-        let bag = MessageBag::from(prepare);
-
-        let generic = bag.as_generic();
-        assert_eq!(generic.header().command, header::Command::Prepare);
-        assert_eq!(generic.header().cluster, 12345);
-    }
-
-    #[test]
-    fn test_message_bag_into_prepare() {
-        let prepare = create_test_prepare(100, 12345, 1);
-        let bag = MessageBag::from(prepare);
-
-        let prepare_back = bag.into_prepare().unwrap();
-        assert_eq!(prepare_back.header().op, 100);
-    }
-
-    #[test]
-    fn test_message_bag_into_wrong_type() {
-        let prepare = create_test_prepare(100, 12345, 1);
-        let bag = MessageBag::from(prepare);
-
-        let result = bag.into_commit();
-        assert!(result.is_err(), "Should fail to unwrap as Commit");
-
-        let bag_again = result.unwrap_err();
-        assert!(matches!(bag_again, MessageBag::Prepare(_)));
     }
 }
 

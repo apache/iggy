@@ -46,17 +46,6 @@ pub enum Command {
     Commit = 9,
 
     StartViewChange = 10,
-
-    RequstHeads = 11,
-    RequestPrepare = 12,
-    RequestReply = 13,
-
-    Headers = 14,
-
-    Eviction = 15,
-
-    RequestBlocks = 16,
-    Block = 17,
 }
 
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
