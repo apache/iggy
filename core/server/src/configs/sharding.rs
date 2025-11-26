@@ -26,6 +26,7 @@ use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::thread::available_parallelism;
+use tracing::info;
 
 use crate::server_error::ServerError;
 
@@ -81,10 +82,9 @@ impl NumaConfig {
                     topology.logical_cores_for_node(node)
                 };
 
-                tracing::info!(
+                info!(
                     "core_per_node: {}, available_cores: {}",
-                    self.cores_per_node,
-                    available_cores
+                    self.cores_per_node, available_cores
                 );
 
                 if self.cores_per_node > available_cores {
@@ -317,7 +317,7 @@ impl ShardInfo {
                         ServerError::BindingFailed
                     })?;
 
-                tracing::info!("Memory bound to NUMA node {node_id}");
+                info!("Memory bound to NUMA node {node_id}");
             }
         }
 
@@ -355,12 +355,17 @@ impl ShardAllocator {
                     })?
                     .get();
 
-                let shard_assignments = (0..available_cpus)
+                let shard_assignments: Vec<_> = (0..available_cpus)
                     .map(|cpu_id| ShardInfo {
                         cpu_set: HashSet::from([cpu_id]),
                         numa_node: None,
                     })
                     .collect();
+
+                info!(
+                    "Using all available CPU cores ({} shards with affinity)",
+                    shard_assignments.len()
+                );
 
                 Ok(shard_assignments)
             }
@@ -372,6 +377,8 @@ impl ShardAllocator {
                     })
                     .collect();
 
+                info!("Using {count} shards with affinity to cores 0..{count}");
+
                 Ok(shard_assignments)
             }
             CpuAllocation::Range(start, end) => {
@@ -381,6 +388,11 @@ impl ShardAllocator {
                         numa_node: None,
                     })
                     .collect();
+
+                info!(
+                    "Using {} shards with affinity to cores {start}..{end}",
+                    end - start
+                );
 
                 Ok(shard_assignments)
             }
@@ -453,6 +465,14 @@ impl ShardAllocator {
                 });
             }
         }
+
+        info!(
+            "Using {} shards with {} NUMA node, {} cores per node, and avoid hyperthread {}",
+            shard_infos.len(),
+            nodes.len(),
+            cores_per_node,
+            numa.avoid_hyperthread
+        );
 
         Ok(shard_infos)
     }
