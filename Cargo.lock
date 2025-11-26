@@ -1921,6 +1921,7 @@ dependencies = [
 name = "consensus"
 version = "0.1.0"
 dependencies = [
+ "iggy_common",
  "message_bus",
 ]
 
@@ -5767,6 +5768,7 @@ name = "metadata"
 version = "0.1.0"
 dependencies = [
  "consensus",
+ "iggy_common",
  "journal",
  "tracing",
 ]
