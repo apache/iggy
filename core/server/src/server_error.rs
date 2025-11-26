@@ -23,11 +23,7 @@ use std::array::TryFromSliceError;
 use std::io;
 
 error_set!(
-<<<<<<< HEAD
-    ServerError := ConfigurationError || ArchiverError || ConnectionError || LogError || CompatError || QuicError
-=======
-    ServerError := NumaError|| ConfigError || ArchiverError || ConnectionError || LogError || CompatError || QuicError
->>>>>>> 9bb5e535 (remove unwrap)
+    ServerError := NumaError || ConfigurationError || ArchiverError || ConnectionError || LogError || CompatError || QuicError
 
     IoError := {
         #[display("IO error")]
@@ -40,10 +36,6 @@ error_set!(
         ReadToEndError(ReadError)
     }
 
-<<<<<<< HEAD
-    ConfigurationError := {
-        ConfigurationError(iggy_common::ConfigurationError),
-=======
     NumaError := {
         #[display("Failed to detect topology: {}", msg)]
         TopologyDetection {
@@ -75,19 +67,8 @@ error_set!(
         },
     }
 
-    ConfigError := {
-        #[display("Invalid configuration provider: {}", provider_type)]
-        InvalidConfigurationProvider { provider_type: String },
-
-        #[display("Cannot load configuration")]
-        CannotLoadConfiguration,
-
-        #[display("Invalid configuration")]
-        InvalidConfiguration,
-
-        #[display("Cache config validation failure")]
-        CacheConfigValidationFailure,
->>>>>>> 9bb5e535 (remove unwrap)
+    ConfigurationError := {
+        ConfigurationError(iggy_common::ConfigurationError),
     }
 
     ArchiverError := {

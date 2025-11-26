@@ -29,7 +29,6 @@ use server::bootstrap::{
     create_directories, create_shard_connections, create_shard_executor, load_config, load_streams,
     load_users, resolve_persister, update_system_info,
 };
-use server::configs::config_provider::{self};
 use server::configs::sharding::{CpuAllocation, ShardAllocator};
 use server::diagnostics::{print_io_uring_permission_info, print_locked_memory_limit_info};
 use server::io::fs_utils;
