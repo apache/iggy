@@ -24,6 +24,8 @@ RUN apt-get update && apt-get install -y \
     build-essential \
     pkg-config \
     libssl-dev \
+    libhwloc-dev \
+    libudev-dev
     && rm -rf /var/lib/apt/lists/*
 COPY . .
 RUN cargo build --bin iggy --release
