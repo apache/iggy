@@ -251,7 +251,7 @@ pub fn load_users(state: impl IntoIterator<Item = UserState>) -> Users {
 }
 
 pub fn create_shard_connections(
-    shard_assignment: &Vec<ShardInfo>,
+    shard_assignment: &[ShardInfo],
 ) -> (Vec<ShardConnector<ShardFrame>>, Vec<(u16, StopSender)>) {
     // Create connectors with sequential IDs (0, 1, 2, ...) regardless of CPU core numbers
     let connectors: Vec<ShardConnector<ShardFrame>> = shard_assignment
