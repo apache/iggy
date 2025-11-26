@@ -37,6 +37,12 @@ inputs:
 runs:
   using: "composite"
   steps:
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libhwloc-dev pkg-config
+      shell: bash
+
     - name: Setup Rust toolchain
       run: |
         echo "Using Rust toolchain from rust-toolchain.toml: $(rustup show)"
