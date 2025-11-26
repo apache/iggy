@@ -40,7 +40,7 @@ runs:
     - name: Install system dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y libhwloc-dev pkg-config
+        sudo apt-get install -y libhwloc-dev pkg-config libudev-dev
       shell: bash
 
     - name: Setup Rust toolchain
