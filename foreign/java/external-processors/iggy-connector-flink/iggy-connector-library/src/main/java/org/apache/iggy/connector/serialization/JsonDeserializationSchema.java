@@ -19,12 +19,9 @@
 
 package org.apache.iggy.connector.serialization;
 
-import com.fasterxml.jackson.databind.DeserializationFeature;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.SerializationFeature;
-import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
-
-import java.io.IOException;
+import tools.jackson.core.JacksonException;
+import tools.jackson.databind.ObjectMapper;
+import tools.jackson.databind.json.JsonMapper;
 
 /**
  * Deserialization schema for JSON using Jackson.
@@ -45,13 +42,13 @@ public class JsonDeserializationSchema<T> implements DeserializationSchema<T> {
      * @param typeClass the class to deserialize to
      */
     public JsonDeserializationSchema(Class<T> typeClass) {
-        this(typeClass, createDefaultObjectMapper());
+        this(typeClass, new JsonMapper());
     }
 
     /**
      * Creates a new JSON deserializer with a custom ObjectMapper.
      *
-     * @param typeClass the class to deserialize to
+     * @param typeClass    the class to deserialize to
      * @param objectMapper the Jackson ObjectMapper to use
      */
     public JsonDeserializationSchema(Class<T> typeClass, ObjectMapper objectMapper) {
@@ -66,15 +63,15 @@ public class JsonDeserializationSchema<T> implements DeserializationSchema<T> {
     }
 
     @Override
-    public T deserialize(byte[] data, RecordMetadata metadata) throws IOException {
+    public T deserialize(byte[] data, RecordMetadata metadata) {
         if (data == null || data.length == 0) {
             return null;
         }
 
         try {
             return getObjectMapper().readValue(data, typeClass);
-        } catch (IOException e) {
-            throw new IOException("Failed to deserialize JSON for type " + typeClass.getName(), e);
+        } catch (JacksonException e) {
+            throw new RuntimeException("Failed to deserialize JSON for type " + typeClass.getName(), e);
         }
     }
 
@@ -98,27 +95,7 @@ public class JsonDeserializationSchema<T> implements DeserializationSchema<T> {
             return objectMapper;
         }
         // Fallback for deserialized instances
-        return createDefaultObjectMapper();
-    }
-
-    /**
-     * Creates a default ObjectMapper configured for common use cases.
-     *
-     * @return configured ObjectMapper
-     */
-    private static ObjectMapper createDefaultObjectMapper() {
-        ObjectMapper mapper = new ObjectMapper();
-
-        // Register Java 8 time module for LocalDateTime, Instant, etc.
-        mapper.registerModule(new JavaTimeModule());
-
-        // Don't fail on unknown properties
-        mapper.configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
-
-        // Write dates as ISO-8601 strings, not timestamps
-        mapper.configure(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS, false);
-
-        return mapper;
+        return new JsonMapper();
     }
 
     /**

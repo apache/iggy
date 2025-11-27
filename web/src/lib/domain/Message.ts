@@ -26,11 +26,11 @@ export type MessagePartition = {
 };
 
 export type Message = {
-  checksum: number;
-  id: number;
-  offset: number;
-  timestamp: number;
-  origin_timestamp: number;
+  checksum: string;
+  id: string;
+  offset: string;
+  timestamp: string;
+  origin_timestamp: string;
   user_headers_length: number;
   payload_length: number;
   formattedTimestamp: string;
@@ -47,14 +47,28 @@ export type HeaderField = {
 export function messageMapper(item: any): Message {
   const payload = item.payload;
   const truncatedPayload = payload.length > 30 ? `${payload.slice(0, 30)} [...]` : payload;
-  const formattedTimestamp = formatDateWithMicroseconds(item.header.timestamp);
+
+  // Convert all header numbers to strings to preserve precision
+  // getJson() returns numbers for values <= MAX_SAFE_INTEGER, strings for larger values
+  const checksum = String(item.header.checksum);
+  const id = String(item.header.id);
+  const offset = String(item.header.offset);
+  const timestamp = String(item.header.timestamp);
+  const origin_timestamp = String(item.header.origin_timestamp);
+
+  // Use numeric value for date formatting (getJson already converted to number if safe)
+  const timestampNum =
+    typeof item.header.timestamp === 'number'
+      ? item.header.timestamp
+      : Number(item.header.timestamp);
+  const formattedTimestamp = formatDateWithMicroseconds(timestampNum);
 
   return {
-    checksum: item.header.checksum,
-    id: item.header.id,
-    offset: item.header.offset,
-    timestamp: item.header.timestamp,
-    origin_timestamp: item.header.origin_timestamp,
+    checksum,
+    id,
+    offset,
+    timestamp,
+    origin_timestamp,
     user_headers_length: item.header.user_headers_length,
     payload_length: item.header.payload_length,
     formattedTimestamp: formattedTimestamp,

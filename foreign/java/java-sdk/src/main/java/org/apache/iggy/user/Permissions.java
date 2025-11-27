@@ -25,4 +25,5 @@ import com.fasterxml.jackson.annotation.Nulls;
 import java.util.Map;
 
 public record Permissions(
-        GlobalPermissions global, @JsonSetter(nulls = Nulls.AS_EMPTY) Map<Long, StreamPermissions> streams) {}
+        GlobalPermissions global,
+        @JsonSetter(nulls = Nulls.AS_EMPTY) Map<Long, StreamPermissions> streams) {}

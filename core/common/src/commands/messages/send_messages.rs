@@ -293,8 +293,9 @@ impl<'de> Deserialize<'de> for SendMessages {
                             let mut iggy_messages = Vec::new();
 
                             for msg in message_data {
-                                let id =
-                                    msg.get("id").and_then(|v| v.as_u64()).unwrap_or(0) as u128;
+                                let id = parse_message_id(msg.get("id")).map_err(|errror| {
+                                    de::Error::custom(format!("Invalid message ID: {errror}"))
+                                })?;
 
                                 let payload = msg
                                     .get("payload")
@@ -371,6 +372,36 @@ impl<'de> Deserialize<'de> for SendMessages {
     }
 }
 
+fn parse_message_id(value: Option<&serde_json::Value>) -> Result<u128, String> {
+    let value = match value {
+        Some(v) => v,
+        None => return Ok(0),
+    };
+
+    match value {
+        serde_json::Value::Number(id) => id
+            .as_u64()
+            .map(|v| v as u128)
+            .ok_or_else(|| "ID must be a positive integer".to_string()),
+        serde_json::Value::String(id) => {
+            if let Ok(id) = id.parse::<u128>() {
+                return Ok(id);
+            }
+
+            let hex_str = id.replace('-', "");
+            if hex_str.len() == 32 && hex_str.chars().all(|c| c.is_ascii_hexdigit()) {
+                u128::from_str_radix(&hex_str, 16)
+                    .map_err(|error| format!("Invalid UUID format: {error}"))
+            } else {
+                Err(format!(
+                    "Invalid ID string: '{id}' - must be a decimal number or UUID hex format",
+                ))
+            }
+        }
+        _ => Err("ID must be a number or string".to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -425,5 +456,46 @@ mod tests {
         let messages_key = "a".repeat(256);
         let key = Partitioning::messages_key_str(&messages_key);
         assert!(key.is_err());
+    }
+
+    #[test]
+    fn parse_message_id_from_number() {
+        let value = serde_json::json!(12345);
+        let id = parse_message_id(Some(&value)).unwrap();
+        assert_eq!(id, 12345u128);
+    }
+
+    #[test]
+    fn parse_message_id_from_large_number_string() {
+        let value = serde_json::json!("340282366920938463463374607431768211455");
+        let id = parse_message_id(Some(&value)).unwrap();
+        assert_eq!(id, 340282366920938463463374607431768211455u128);
+    }
+
+    #[test]
+    fn parse_message_id_from_uuid_with_dashes() {
+        let value = serde_json::json!("af362865-042c-4000-0000-000000000000");
+        let id = parse_message_id(Some(&value)).unwrap();
+        assert_eq!(id, 0xaf362865042c40000000000000000000u128);
+    }
+
+    #[test]
+    fn parse_message_id_from_uuid_without_dashes() {
+        let value = serde_json::json!("af362865042c40000000000000000000");
+        let id = parse_message_id(Some(&value)).unwrap();
+        assert_eq!(id, 0xaf362865042c40000000000000000000u128);
+    }
+
+    #[test]
+    fn parse_message_id_defaults_to_zero_when_missing() {
+        let id = parse_message_id(None).unwrap();
+        assert_eq!(id, 0u128);
+    }
+
+    #[test]
+    fn parse_message_id_rejects_invalid_string() {
+        let value = serde_json::json!("not-a-valid-id");
+        let result = parse_message_id(Some(&value));
+        assert!(result.is_err());
     }
 }

@@ -23,19 +23,19 @@ namespace Apache.Iggy.Contracts;
 public class ClusterNode
 {
     /// <summary>
-    ///     Node identifier
-    /// </summary>
-    public required uint Id { get; set; }
-
-    /// <summary>
     ///     Node name
     /// </summary>
     public required string Name { get; set; }
 
     /// <summary>
-    ///     Node address
+    ///     Node IP address
     /// </summary>
-    public required string Address { get; set; }
+    public required string Ip { get; set; }
+
+    /// <summary>
+    ///     Transport endpoints (ports) for different protocols
+    /// </summary>
+    public required TransportEndpoints Endpoints { get; set; }
 
     /// <summary>
     ///     Node role within the cluster
@@ -49,7 +49,7 @@ public class ClusterNode
 
     internal int GetSize()
     {
-        // id, name length, name, address length, address, role, status
-        return 4 + 4 + Name.Length + 4 + Address.Length + 1 + 1;
+        // name length, name, ip length, ip, endpoints (4 * 2 bytes), role, status
+        return 4 + Name.Length + 4 + Ip.Length + 8 + 1 + 1;
     }
 }

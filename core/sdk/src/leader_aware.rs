@@ -18,7 +18,7 @@
 
 use iggy_binary_protocol::ClusterClient;
 use iggy_common::{
-    ClusterMetadata, ClusterNodeRole, ClusterNodeStatus, IggyError, IggyErrorDiscriminants,
+    ClusterMetadata, ClusterNodeRole, ClusterNodeStatus, IggyError, TransportProtocol,
 };
 use std::net::SocketAddr;
 use std::str::FromStr;
@@ -31,6 +31,7 @@ const MAX_LEADER_REDIRECTS: u8 = 3;
 pub async fn check_and_redirect_to_leader<C: ClusterClient>(
     client: &C,
     current_address: &str,
+    transport: TransportProtocol,
 ) -> Result<Option<String>, IggyError> {
     debug!("Checking cluster metadata for leader detection");
 
@@ -41,11 +42,7 @@ pub async fn check_and_redirect_to_leader<C: ClusterClient>(
                 metadata.nodes.len(),
                 metadata.name
             );
-            process_cluster_metadata(&metadata, current_address)
-        }
-        Err(e) if is_feature_unavailable_error(&e) => {
-            debug!("Cluster metadata feature unavailable - server doesn't support clustering");
-            Ok(None)
+            process_cluster_metadata(&metadata, current_address, transport)
         }
         Err(e) => {
             warn!(
@@ -61,7 +58,17 @@ pub async fn check_and_redirect_to_leader<C: ClusterClient>(
 fn process_cluster_metadata(
     metadata: &ClusterMetadata,
     current_address: &str,
+    transport: TransportProtocol,
 ) -> Result<Option<String>, IggyError> {
+    // If there's only one node in the cluster, no redirection is needed
+    if metadata.nodes.len() == 1 {
+        debug!(
+            "Single-node cluster detected ({}), no leader redirection needed",
+            metadata.nodes[0].name
+        );
+        return Ok(None);
+    }
+
     let leader = metadata
         .nodes
         .iter()
@@ -69,17 +76,25 @@ fn process_cluster_metadata(
 
     match leader {
         Some(leader_node) => {
+            let leader_port = match transport {
+                TransportProtocol::Tcp => leader_node.endpoints.tcp,
+                TransportProtocol::Quic => leader_node.endpoints.quic,
+                TransportProtocol::Http => leader_node.endpoints.http,
+                TransportProtocol::WebSocket => leader_node.endpoints.websocket,
+            };
+            let leader_address = format!("{}:{}", leader_node.ip, leader_port);
+
             info!(
-                "Found leader node: {} at {}",
-                leader_node.name, leader_node.address
+                "Found leader node: {} at {} (using {} transport)",
+                leader_node.name, leader_address, transport
             );
 
-            if !is_same_address(current_address, &leader_node.address) {
+            if !is_same_address(current_address, &leader_address) {
                 info!(
                     "Current connection to {} is not the leader, will redirect to {}",
-                    current_address, leader_node.address
+                    current_address, leader_address
                 );
-                Ok(Some(leader_node.address.clone()))
+                Ok(Some(leader_address))
             } else {
                 debug!("Already connected to leader at {}", current_address);
                 Ok(None)
@@ -122,14 +137,6 @@ fn normalize_address(addr: &str) -> String {
     addr.to_lowercase()
         .replace("localhost", "127.0.0.1")
         .replace("[::]", "[::1]")
-}
-
-/// Check if the error indicates that the feature is unavailable
-fn is_feature_unavailable_error(error: &IggyError) -> bool {
-    matches!(
-        error,
-        IggyError::FeatureUnavailable | IggyError::InvalidCommand
-    ) || error.as_code() == IggyErrorDiscriminants::FeatureUnavailable as u32
 }
 
 /// Struct to track leader redirection state

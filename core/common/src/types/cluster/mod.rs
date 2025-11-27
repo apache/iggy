@@ -20,8 +20,10 @@ mod metadata;
 mod node;
 mod role;
 mod status;
+mod transport_endpoints;
 
 pub use metadata::ClusterMetadata;
 pub use node::ClusterNode;
 pub use role::ClusterNodeRole;
 pub use status::ClusterNodeStatus;
+pub use transport_endpoints::TransportEndpoints;

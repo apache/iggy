@@ -509,35 +509,38 @@ bucket_capacity = 8192
 # When enabled, this node will participate in the cluster and coordinate with other nodes.
 enabled = false
 
-# Unique cluster identifier (u32).
-# All nodes in the same cluster must share the same cluster id.
-id = 0
-
 # Unique cluster name (string).
 # All nodes in the same cluster must share the same name.
 # This prevents accidental cross-cluster communication.
 name = "iggy-cluster"
 
-# Transport protocol used for communication between nodes in the cluster (string).
-# Supported values: "tcp", "quic", "ws"
-transport = "tcp"
-
 # Current node configuration
-[cluster.node]
-# This node unique identifier within the cluster (u32).
-# Must be unique across all nodes and match one of the ids in the nodes list.
-id = 0
-
-# All nodes in the cluster.
-[[cluster.nodes]]
-id = 0
+[cluster.node.current]
+# Name of this node - must be unique across all nodes in the cluster
+# The node will use its configured transport addresses (tcp.address, quic.address, etc.)
 name = "iggy-node-1"
-address = "127.0.0.1:8090"
+# IP address that other nodes should use to connect to this node
+ip = "127.0.0.1"
 
-[[cluster.nodes]]
-id = 1
+# Other nodes in the cluster
+# Each field in 'ports' is optional. If omitted, the current node's configured port will be used.
+# This is useful when all nodes use the same ports but different IPs, or when only some ports differ.
+[[cluster.node.others]]
 name = "iggy-node-2"
-address = "127.0.0.1:8091"
+ip = "127.0.0.1"
+ports = { tcp = 8091, quic = 8081, http = 3001, websocket = 8093 }
+
+# [[cluster.node.others]]
+# name = "iggy-node-3"
+# ip = "192.168.1.100"
+# # Only some ports specified, others will use defaults from current node
+# ports = { tcp = 8092, http = 3002 }
+
+# Example with all default ports (uses current node's configured ports):
+# [[cluster.node.others]]
+# name = "iggy-node-4"
+# ip = "192.168.1.101"
+# ports = {}  # Empty ports - all will use current node's defaults
 
 # Sharding configuration
 [system.sharding]

@@ -19,14 +19,12 @@
 
 package org.apache.iggy.connector.serialization;
 
-import com.fasterxml.jackson.databind.DeserializationFeature;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.SerializationFeature;
-import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import tools.jackson.core.JacksonException;
+import tools.jackson.databind.ObjectMapper;
+import tools.jackson.databind.json.JsonMapper;
 
-import java.io.IOException;
 import java.util.Optional;
 import java.util.function.Function;
 
@@ -49,7 +47,7 @@ public class JsonSerializationSchema<T> implements SerializationSchema<T> {
      * Creates a new JSON serializer.
      */
     public JsonSerializationSchema() {
-        this(createDefaultObjectMapper(), null);
+        this(new JsonMapper(), null);
     }
 
     /**
@@ -58,7 +56,7 @@ public class JsonSerializationSchema<T> implements SerializationSchema<T> {
      * @param partitionKeyExtractor function to extract partition key from elements
      */
     public JsonSerializationSchema(Function<T, Integer> partitionKeyExtractor) {
-        this(createDefaultObjectMapper(), partitionKeyExtractor);
+        this((ObjectMapper) new JsonMapper(), partitionKeyExtractor);
     }
 
     /**
@@ -73,7 +71,7 @@ public class JsonSerializationSchema<T> implements SerializationSchema<T> {
     /**
      * Creates a new JSON serializer with custom ObjectMapper and partition key extractor.
      *
-     * @param objectMapper the Jackson ObjectMapper to use
+     * @param objectMapper          the Jackson ObjectMapper to use
      * @param partitionKeyExtractor function to extract partition key from elements
      */
     public JsonSerializationSchema(ObjectMapper objectMapper, Function<T, Integer> partitionKeyExtractor) {
@@ -89,7 +87,7 @@ public class JsonSerializationSchema<T> implements SerializationSchema<T> {
      * Static factory method to avoid constructor ambiguity.
      *
      * @param partitionKeyExtractor function to extract partition key from elements
-     * @param <T> the type to serialize
+     * @param <T>                   the type to serialize
      * @return new JsonSerializationSchema instance
      */
     public static <T> JsonSerializationSchema<T> withPartitionKeyExtractor(Function<T, Integer> partitionKeyExtractor) {
@@ -97,15 +95,15 @@ public class JsonSerializationSchema<T> implements SerializationSchema<T> {
     }
 
     @Override
-    public byte[] serialize(T element) throws IOException {
+    public byte[] serialize(T element) {
         if (element == null) {
             return null;
         }
 
         try {
             return getObjectMapper().writeValueAsBytes(element);
-        } catch (IOException e) {
-            throw new IOException(
+        } catch (JacksonException e) {
+            throw new RuntimeException(
                     "Failed to serialize object of type " + element.getClass().getName(), e);
         }
     }
@@ -140,26 +138,6 @@ public class JsonSerializationSchema<T> implements SerializationSchema<T> {
             return objectMapper;
         }
         // Fallback for deserialized instances
-        return createDefaultObjectMapper();
-    }
-
-    /**
-     * Creates a default ObjectMapper configured for common use cases.
-     *
-     * @return configured ObjectMapper
-     */
-    private static ObjectMapper createDefaultObjectMapper() {
-        ObjectMapper mapper = new ObjectMapper();
-
-        // Register Java 8 time module for LocalDateTime, Instant, etc.
-        mapper.registerModule(new JavaTimeModule());
-
-        // Don't fail on unknown properties
-        mapper.configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
-
-        // Write dates as ISO-8601 strings, not timestamps
-        mapper.configure(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS, false);
-
-        return mapper;
+        return new JsonMapper();
     }
 }

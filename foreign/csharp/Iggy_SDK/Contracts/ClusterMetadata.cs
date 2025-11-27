@@ -15,8 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Apache.Iggy.Enums;
-
 namespace Apache.Iggy.Contracts;
 
 /// <summary>
@@ -28,16 +26,6 @@ public class ClusterMetadata
     ///     Name of the cluster
     /// </summary>
     public required string Name { get; set; }
-
-    /// <summary>
-    ///     Unique identifier of the cluster
-    /// </summary>
-    public required uint Id { get; set; }
-
-    /// <summary>
-    ///     Transport used for cluster communication
-    /// </summary>
-    public required Protocol Transport { get; set; }
 
     /// <summary>
     ///     List of all nodes in the cluster

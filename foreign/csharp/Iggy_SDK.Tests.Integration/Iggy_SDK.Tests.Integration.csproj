@@ -26,4 +26,23 @@
         <ProjectReference Include="..\Iggy_SDK\Iggy_SDK.csproj" />
     </ItemGroup>
 
+    <ItemGroup>
+        <Content Include="..\..\..\core\certs\iggy.pfx">
+            <Link>Certs\iggy.pfx</Link>
+            <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+        </Content>
+        <Content Include="..\..\..\core\certs\iggy_ca_cert.pem">
+            <Link>Certs\iggy_ca_cert.pem</Link>
+            <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+        </Content>
+        <Content Include="..\..\..\core\certs\iggy_cert.pem">
+            <Link>Certs\iggy_cert.pem</Link>
+            <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+        </Content>
+        <Content Include="..\..\..\core\certs\iggy_key.pem">
+            <Link>Certs\iggy_key.pem</Link>
+            <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+        </Content>
+    </ItemGroup>
+
 </Project>

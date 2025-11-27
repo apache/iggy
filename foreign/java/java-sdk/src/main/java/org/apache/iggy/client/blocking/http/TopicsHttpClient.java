@@ -19,13 +19,13 @@
 
 package org.apache.iggy.client.blocking.http;
 
-import com.fasterxml.jackson.core.type.TypeReference;
 import org.apache.iggy.client.blocking.TopicsClient;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
 import org.apache.iggy.topic.CompressionAlgorithm;
 import org.apache.iggy.topic.Topic;
 import org.apache.iggy.topic.TopicDetails;
+import tools.jackson.core.type.TypeReference;
 
 import java.math.BigInteger;
 import java.util.List;

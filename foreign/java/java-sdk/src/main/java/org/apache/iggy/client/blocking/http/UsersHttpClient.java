@@ -19,7 +19,6 @@
 
 package org.apache.iggy.client.blocking.http;
 
-import com.fasterxml.jackson.core.type.TypeReference;
 import org.apache.iggy.client.blocking.UsersClient;
 import org.apache.iggy.identifier.UserId;
 import org.apache.iggy.user.IdentityInfo;
@@ -28,6 +27,7 @@ import org.apache.iggy.user.TokenInfo;
 import org.apache.iggy.user.UserInfo;
 import org.apache.iggy.user.UserInfoDetails;
 import org.apache.iggy.user.UserStatus;
+import tools.jackson.core.type.TypeReference;
 
 import java.util.List;
 import java.util.Optional;

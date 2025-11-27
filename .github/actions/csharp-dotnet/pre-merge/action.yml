@@ -15,8 +15,6 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# TODO(hubcio): Currently, C# tests don't need server. They use testcontainers with 'edge' image.
-#               We should change this to use server-start/stop action, so that code from PR is tested.
 
 name: csharp-dotnet-pre-merge
 description: .NET pre-merge testing github iggy actions
@@ -39,11 +37,6 @@ runs:
       uses: ./.github/actions/utils/setup-rust-with-cache
       with:
         cache-targets: false # Only cache registry and git deps, not target dir (sccache handles that)
-
-    - name: Install netcat
-      if: inputs.task == 'e2e'
-      run: sudo apt-get update && sudo apt-get install -y netcat-openbsd
-      shell: bash
 
     - name: Restore dependencies
       run: |
@@ -77,26 +70,22 @@ runs:
 
       shell: bash
 
-    - name: Start Iggy server
-      id: iggy
+    - name: Build Iggy server Docker image
+      id: docker_build
       if: inputs.task == 'e2e'
-      uses: ./.github/actions/utils/server-start
-      continue-on-error: true
+      uses: ./.github/actions/utils/docker-build-test-server
+      with:
+        image-tag: "iggy-server:test"
+        libc: "glibc"
+        profile: "debug"
 
     - name: Run integration tests
       if: inputs.task == 'e2e'
       env:
-        IGGY_SERVER_HOST: 127.0.0.1
+        IGGY_SERVER_DOCKER_IMAGE: ${{ steps.docker_build.outputs.docker_image }}
       run: |
         dotnet test foreign/csharp/Iggy_SDK.Tests.Integration --no-build --verbosity normal
       shell: bash
-
-    - name: Stop Iggy server
-      if: inputs.task == 'e2e'
-      uses: ./.github/actions/utils/server-stop
-      with:
-        pid-file: ${{ steps.iggy.outputs.pid_file }}
-        log-file: ${{ steps.iggy.outputs.log_file }}
 
     - name: Build Release
       if: inputs.task == 'build'

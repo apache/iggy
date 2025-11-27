@@ -28,12 +28,12 @@ public class TlsSettings
     public bool Enabled { get; set; }
 
     /// <summary>
-    ///     The name of the server that shares ssl stream.
+    ///     The name of the server for TLS handshake.
     /// </summary>
     public string Hostname { get; set; } = string.Empty;
 
     /// <summary>
-    ///     Whether to authenticate the client.
+    ///     Path to the certificate (ca/self-signed) file.
     /// </summary>
-    public bool Authenticate { get; set; }
+    public string CertificatePath { get; set; } = string.Empty;
 }

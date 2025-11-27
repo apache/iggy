@@ -60,6 +60,15 @@ components:
     paths:
       - "core/server/**"
 
+  rust-cluster:
+    depends_on:
+      - "rust-workspace"  # Cluster is affected by workspace changes
+      - "ci-infrastructure"  # CI changes trigger full regression
+    paths:
+      - "core/consensus/"
+      - "core/metadata/"
+      - "core/message_bus/"
+
   # Main Rust workspace testing
   rust:
     depends_on:
@@ -68,6 +77,7 @@ components:
       - "rust-common"
       - "rust-binary-protocol"
       - "rust-server"
+      - "rust-cluster"
       - "rust-tools"
       - "rust-cli"
       - "rust-bench"

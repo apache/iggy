@@ -64,9 +64,9 @@ pub use iggy_common::{
     PollingKind, PollingStrategy, QuicClientConfig, QuicClientConfigBuilder,
     QuicClientReconnectionConfig, SendMessages, Sizeable, SnapshotCompression, Stats, Stream,
     StreamDetails, StreamPermissions, SystemSnapshotType, TcpClientConfig, TcpClientConfigBuilder,
-    TcpClientReconnectionConfig, Topic, TopicDetails, TopicPermissions, TransportProtocol, UserId,
-    UserStatus, Validatable, WebSocketClientConfig, WebSocketClientConfigBuilder,
-    WebSocketClientReconnectionConfig, defaults, locking,
+    TcpClientReconnectionConfig, Topic, TopicDetails, TopicPermissions, TransportEndpoints,
+    TransportProtocol, UserId, UserStatus, Validatable, WebSocketClientConfig,
+    WebSocketClientConfigBuilder, WebSocketClientReconnectionConfig, defaults, locking,
 };
 pub use iggy_common::{
     IGGY_MESSAGE_CHECKSUM_OFFSET_RANGE, IGGY_MESSAGE_HEADER_SIZE,

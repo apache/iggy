@@ -71,7 +71,7 @@ var client = IggyClientFactory.CreateClient(new IggyClientConfigurator
     {
         Enabled = true,
         Hostname = "iggy",
-        Authenticate = true
+        CertificatePath = "/path/to/cert"
     },
 
     // Automatic reconnection with exponential backoff

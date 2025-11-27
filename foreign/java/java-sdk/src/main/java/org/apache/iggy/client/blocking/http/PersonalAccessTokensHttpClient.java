@@ -19,12 +19,12 @@
 
 package org.apache.iggy.client.blocking.http;
 
-import com.fasterxml.jackson.core.type.TypeReference;
 import org.apache.iggy.client.blocking.PersonalAccessTokensClient;
 import org.apache.iggy.personalaccesstoken.PersonalAccessTokenInfo;
 import org.apache.iggy.personalaccesstoken.RawPersonalAccessToken;
 import org.apache.iggy.user.IdentityInfo;
 import org.apache.iggy.user.TokenInfo;
+import tools.jackson.core.type.TypeReference;
 
 import java.math.BigInteger;
 import java.util.List;

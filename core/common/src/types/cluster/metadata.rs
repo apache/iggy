@@ -16,7 +16,7 @@
  * under the License.
  */
 
-use crate::{BytesSerializable, IggyError, TransportProtocol, types::cluster::node::ClusterNode};
+use crate::{BytesSerializable, IggyError, types::cluster::node::ClusterNode};
 use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
 use std::fmt::Display;
@@ -26,35 +26,23 @@ use std::fmt::Display;
 pub struct ClusterMetadata {
     /// Name of the cluster.
     pub name: String,
-    /// Unique identifier of the cluster.
-    pub id: u32,
-    /// Transport used for cluster communication (for binary protocol it's u8, 1=TCP, 2=QUIC, 3=HTTP).
-    /// For HTTP it's a string "tcp", "quic", "http".
-    pub transport: TransportProtocol,
-    /// List of all nodes in the cluster.
+    /// List of all nodes in the cluster with their transport endpoints.
     pub nodes: Vec<ClusterNode>,
 }
 
 impl BytesSerializable for ClusterMetadata {
     fn to_bytes(&self) -> Bytes {
         let name_bytes = self.name.as_bytes();
-        let transport = self.transport as u8;
 
         // Calculate size for each node
         let nodes_size: usize = self.nodes.iter().map(|node| node.get_buffer_size()).sum();
-        let size = 4 + name_bytes.len() + 4 + 1 + 4 + nodes_size; // name_len + name + id + transport + nodes_len + nodes
+        let size = 4 + name_bytes.len() + 4 + nodes_size; // name_len + name + nodes_len + nodes
 
         let mut bytes = BytesMut::with_capacity(size);
 
         // Write name length and name
         bytes.put_u32_le(name_bytes.len() as u32);
         bytes.put_slice(name_bytes);
-
-        // Write cluster id
-        bytes.put_u32_le(self.id);
-
-        // Write transport
-        bytes.put_u8(transport);
 
         // Write nodes count
         bytes.put_u32_le(self.nodes.len() as u32);
@@ -68,7 +56,7 @@ impl BytesSerializable for ClusterMetadata {
     }
 
     fn from_bytes(bytes: Bytes) -> Result<ClusterMetadata, IggyError> {
-        if bytes.len() < 12 {
+        if bytes.len() < 8 {
             return Err(IggyError::InvalidCommand);
         }
 
@@ -90,25 +78,6 @@ impl BytesSerializable for ClusterMetadata {
             .map_err(|_| IggyError::InvalidCommand)?;
         position += name_len;
 
-        // Read cluster id
-        if bytes.len() < position + 4 {
-            return Err(IggyError::InvalidCommand);
-        }
-        let id = u32::from_le_bytes(
-            bytes[position..position + 4]
-                .try_into()
-                .map_err(|_| IggyError::InvalidNumberEncoding)?,
-        );
-        position += 4;
-
-        // Read transport
-        if bytes.len() < position + 1 {
-            return Err(IggyError::InvalidCommand);
-        }
-        let transport_byte = bytes[position];
-        let transport = TransportProtocol::try_from(transport_byte)?;
-        position += 1;
-
         // Read nodes count
         if bytes.len() < position + 4 {
             return Err(IggyError::InvalidCommand);
@@ -128,27 +97,15 @@ impl BytesSerializable for ClusterMetadata {
             nodes.push(node);
         }
 
-        Ok(ClusterMetadata {
-            name,
-            id,
-            transport,
-            nodes,
-        })
+        Ok(ClusterMetadata { name, nodes })
     }
 
     fn write_to_buffer(&self, buf: &mut BytesMut) {
         let name_bytes = self.name.as_bytes();
-        let transport = self.transport as u8;
 
         // Write name length and name
         buf.put_u32_le(name_bytes.len() as u32);
         buf.put_slice(name_bytes);
-
-        // Write cluster id
-        buf.put_u32_le(self.id);
-
-        // Write transport as u8
-        buf.put_u8(transport);
 
         // Write nodes count
         buf.put_u32_le(self.nodes.len() as u32);
@@ -161,7 +118,7 @@ impl BytesSerializable for ClusterMetadata {
 
     fn get_buffer_size(&self) -> usize {
         let nodes_size: usize = self.nodes.iter().map(|node| node.get_buffer_size()).sum();
-        4 + self.name.len() + 4 + 1 + 4 + nodes_size // name_len + name + id + transport + nodes_len + nodes
+        4 + self.name.len() + 4 + nodes_size // name_len + name + nodes_len + nodes
     }
 }
 
@@ -175,8 +132,8 @@ impl Display for ClusterMetadata {
 
         write!(
             f,
-            "ClusterMetadata {{ name: {}, id: {}, transport: {}, nodes: {:?} }}",
-            self.name, self.id, self.transport, nodes
+            "ClusterMetadata {{ name: {}, nodes: {:?} }}",
+            self.name, nodes
         )
     }
 }

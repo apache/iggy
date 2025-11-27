@@ -15,7 +15,8 @@ The [docker image](https://hub.docker.com/r/apache/iggy-connect) is available, a
 - **Statically Typed**: Ensures type safety and compile-time checks, reducing runtime errors.
 - **Easy Customization**: Provides a simple interface for implementing custom connectors, making it easy to create new plugins.
 - **Data transformation**: Supports data transformation with the help of existing functions.
-- **Powerful configuration**: Define your sinks, sources, and transformations in the configuration file.
+- **Powerful configuration**: Define your sinks, sources, and transformations in the configuration file or fetch them from a remote HTTP API.
+- **Flexible configuration providers**: Support for local file-based and HTTP-based configuration providers for centralized configuration management.
 
 ## Quick Start
 

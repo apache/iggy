@@ -22,24 +22,29 @@ import { deserializeError } from '../error.utils.js';
 import {
   type ClusterNodeRoleKey,
   type ClusterNodeStatusKey,
-  type TransportProtocolKey,
   mapClusterNodeRole,
   mapClusterNodeStatus,
-  mapTransportProtocol,
 } from './cluster.type.js';
 
 
+export type TransportEndpoints = {
+  tcp: number
+  quic: number
+  http: number
+  websocket: number
+}
+
 export type ClusterNode = {
-  id: number
   name: string
-  address: string
+  ip: string
+  endpoints: TransportEndpoints
   role: ClusterNodeRoleKey
   status: ClusterNodeStatusKey
 }
 
 type DeserializedClusterNode = { length: number, data: ClusterNode }
 
-const CLUSTER_NODE_MIN_BUFFER_SIZE = 16; // 4 + 1 + 4 + 1 + 4 + 1 + 1;
+const CLUSTER_NODE_MIN_BUFFER_SIZE = 18; // 4 + 1 + 4 + 1 + 8 (endpoints) + 1 + 1;
 
 export const deserializeNode = (b: Buffer, pos = 0): DeserializedClusterNode => {
   if (b.length - pos < CLUSTER_NODE_MIN_BUFFER_SIZE)
@@ -47,30 +52,46 @@ export const deserializeNode = (b: Buffer, pos = 0): DeserializedClusterNode => 
       'cluster node', pos, b.length, CLUSTER_NODE_MIN_BUFFER_SIZE
     );
 
-  const id = b.readUInt32LE(pos);
-  pos += 4;
+  const startPos = pos;
 
+  // Read name
   const nameLen = b.readUInt32LE(pos);
   if (b.length - pos < 4 + nameLen)
     deserializeError(
-      'cluster node', pos, b.length, 4 + nameLen, { id, nameLen }
+      'cluster node', pos, b.length, 4 + nameLen, { nameLen }
     );
 
   const name = b.subarray(pos + 4, pos + 4 + nameLen).toString();
   pos += nameLen + 4;
 
-  const addrLen = b.readUInt32LE(pos);
-  if (b.length - pos < 4 + addrLen)
+  // Read IP
+  const ipLen = b.readUInt32LE(pos);
+  if (b.length - pos < 4 + ipLen)
     deserializeError(
-      'cluster node', pos, b.length, 4 + addrLen, { id, nameLen, name, addrLen }
+      'cluster node', pos, b.length, 4 + ipLen, { nameLen, name, ipLen }
     );
 
-  const address = b.subarray(pos + 4, pos + 4 + addrLen).toString();
-  pos += addrLen + 4;
+  const ip = b.subarray(pos + 4, pos + 4 + ipLen).toString();
+  pos += ipLen + 4;
 
+  // Read transport endpoints (4 ports, each u16)
+  if (b.length - pos < 8)
+    deserializeError(
+      'cluster node endpoints', pos, b.length, 8, { nameLen, name, ipLen, ip }
+    );
+
+  const endpoints: TransportEndpoints = {
+    tcp: b.readUInt16LE(pos),
+    quic: b.readUInt16LE(pos + 2),
+    http: b.readUInt16LE(pos + 4),
+    websocket: b.readUInt16LE(pos + 6)
+  };
+  pos += 8;
+
+  // Read role and status
   if (b.length - pos < 2)
     deserializeError(
-      'cluster node', pos, b.length, 2, { id, nameLen, name, addrLen, address }
+      'cluster node', pos, b.length, 2, { nameLen, name, ipLen, ip }
     );
 
   const role = mapClusterNodeRole(b.readUInt8(pos));
@@ -80,11 +101,11 @@ export const deserializeNode = (b: Buffer, pos = 0): DeserializedClusterNode => 
   pos += 1;
 
   return {
-    length: 4 + nameLen + 4 + addrLen + 4 + 1 + 1,
+    length: pos - startPos,
     data: {
-      id,
       name,
-      address,
+      ip,
+      endpoints,
       role,
       status
     }
@@ -94,17 +115,12 @@ export const deserializeNode = (b: Buffer, pos = 0): DeserializedClusterNode => 
 export type ClusterMetadata = {
   // Name of the cluster.
   name: string,
-  // Unique identifier of the cluster.
-  id: number,
-  // Transport used for cluster communication
-  // (for binary protocol it's u8, 1=TCP, 2=QUIC, 3=HTTP).
-  transport: TransportProtocolKey,
   // List of all nodes in the cluster.
   nodes: ClusterNode[],
 };
 
-// min = 4 + 1 + 4 + 1 + 1 + 4 + CLUSTER_NODE_MIN_BUFFER_SIZE;
-const CLUSTER_METADATA_MIN_SIZE = 15 + CLUSTER_NODE_MIN_BUFFER_SIZE;
+// min = 4 + 1 + 4 + CLUSTER_NODE_MIN_BUFFER_SIZE;
+const CLUSTER_METADATA_MIN_SIZE = 8 + CLUSTER_NODE_MIN_BUFFER_SIZE;
 
 export const deserializeMetadata = (b: Buffer, pos = 0): ClusterMetadata => {
   if (b.length - pos < CLUSTER_METADATA_MIN_SIZE)
@@ -112,6 +128,7 @@ export const deserializeMetadata = (b: Buffer, pos = 0): ClusterMetadata => {
       'cluster metadata', pos, b.length, CLUSTER_METADATA_MIN_SIZE
     );
 
+  // Read cluster name
   const nameLen = b.readUInt32LE(pos);
   if (b.length - pos < 4 + nameLen)
     deserializeError(
@@ -121,20 +138,16 @@ export const deserializeMetadata = (b: Buffer, pos = 0): ClusterMetadata => {
   const name = b.subarray(pos + 4, pos + 4 + nameLen).toString();
   pos += nameLen + 4;
 
-  if (b.length - pos < 4 + 1 + 4)
+  // Read nodes count
+  if (b.length - pos < 4)
     deserializeError(
-      'cluster metadata', pos, b.length, 4 + 1 + 4, { nameLen, name }
+      'cluster metadata', pos, b.length, 4, { nameLen, name }
     );
-
-  const id = b.readUInt32LE(pos);
-  pos += 4;
-
-  const transport = mapTransportProtocol(b.readUInt8(pos));
-  pos += 1;
 
   const nodeCount = b.readUInt32LE(pos);
   pos += 4;
 
+  // Read nodes array
   const nodes: ClusterNode[] = [];
   for (let i = 0; i < nodeCount; i++) {
     const { length, data } = deserializeNode(b, pos);
@@ -144,8 +157,6 @@ export const deserializeMetadata = (b: Buffer, pos = 0): ClusterMetadata => {
 
   return {
     name,
-    id,
-    transport,
     nodes
   }
 };

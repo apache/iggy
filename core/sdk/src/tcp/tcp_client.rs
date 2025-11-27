@@ -226,13 +226,6 @@ impl TcpClient {
                     status,
                     IggyError::from_code_as_string(status)
                 )
-            } else if status == IggyErrorDiscriminants::FeatureUnavailable as u32 {
-                // Feature unavailable - likely clustering is disabled on server
-                tracing::debug!(
-                    "Feature unavailable on server: {} ({})",
-                    status,
-                    IggyError::from_code_as_string(status)
-                )
             } else {
                 error!(
                     "Received an invalid response with status: {} ({}).",
@@ -476,7 +469,12 @@ impl TcpClient {
     /// Returns true if redirection occurred and reconnection is needed.
     pub(crate) async fn handle_leader_redirection(&self) -> Result<bool, IggyError> {
         let current_address = self.current_server_address.lock().await.clone();
-        let leader_address = check_and_redirect_to_leader(self, &current_address).await?;
+        let leader_address = check_and_redirect_to_leader(
+            self,
+            &current_address,
+            iggy_common::TransportProtocol::Tcp,
+        )
+        .await?;
 
         if let Some(new_leader_address) = leader_address {
             let mut redirection_state = self.leader_redirection_state.lock().await;

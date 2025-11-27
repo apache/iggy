@@ -17,17 +17,60 @@
  * under the License.
  */
 
+import JSONBigInt from 'json-bigint';
+
+// Configure json-bigint to parse as strings to avoid BigInt issues with math operations
+const JSONbig = JSONBigInt({
+  useNativeBigInt: true,
+  alwaysParseAsBig: false,
+  strict: false,
+  // Custom reviver to convert BigInt to string to avoid math operation issues
+  protoAction: 'ignore',
+  constructorAction: 'ignore'
+});
+
 export const getJson = async (res: Response): Promise<unknown | null> => {
   const text = await res.text();
   try {
-    const json = JSON.parse(text, (_key, value) => {
-      if (typeof value === 'number' && value > Number.MAX_SAFE_INTEGER) {
-        return BigInt(value);
-      }
-      return value;
-    });
+    // Parse with json-bigint which handles large numbers correctly
+    const parsed = JSONbig.parse(text);
+
+    // Convert any BigInt values to strings or numbers depending on size
+    const json = convertBigInts(parsed);
     return json as unknown;
   } catch (err) {
     return null;
   }
 };
+
+// Recursively convert BigInt values to appropriate types
+function convertBigInts(obj: any): any {
+  if (obj === null || obj === undefined) {
+    return obj;
+  }
+
+  if (typeof obj === 'bigint') {
+    // If it fits in a safe number, convert to number for math operations
+    // Otherwise keep as string for display
+    if (obj <= Number.MAX_SAFE_INTEGER && obj >= Number.MIN_SAFE_INTEGER) {
+      return Number(obj);
+    }
+    return obj.toString();
+  }
+
+  if (Array.isArray(obj)) {
+    return obj.map(convertBigInts);
+  }
+
+  if (typeof obj === 'object') {
+    const result: any = {};
+    for (const key in obj) {
+      if (Object.prototype.hasOwnProperty.call(obj, key)) {
+        result[key] = convertBigInts(obj[key]);
+      }
+    }
+    return result;
+  }
+
+  return obj;
+}
