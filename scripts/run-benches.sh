@@ -54,7 +54,7 @@ echo
 
 # Start tcp poll bench
 echo "Running iggy-bench pinned-consumer tcp..."
-poll_results=$(target/release/iggy-bench pinned-consumer tcp | grep -e "Results: total throughput")
+poll_results=$(target/release/iggy-bench pinned-consumer tcp | grep -e "Consumers Results: Total throughput")
 
 echo "Poll results:"
 echo "${poll_results}"

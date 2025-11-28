@@ -71,6 +71,7 @@ flume = { workspace = true }
 futures = { workspace = true }
 hash32 = "1.0.0"
 human-repr = { workspace = true }
+hwlocality = { workspace = true }
 iggy_common = { workspace = true }
 jsonwebtoken = { version = "10.2.0", features = ["rust_crypto"] }
 lending-iterator = "0.1.7"
