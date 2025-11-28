@@ -1,0 +1,36 @@
+{
+  "name": "iggy-nodejs-examples",
+  "version": "1.0.0",
+  "description": "Node.js examples for Apache Iggy",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "test": "./test-examples.sh",
+    "test:getting-started:producer": "tsx src/getting-started/producer.ts",
+    "test:getting-started:consumer": "tsx src/getting-started/consumer.ts",
+    "test:basic:producer": "tsx src/basic/producer.ts",
+    "test:basic:consumer": "tsx src/basic/consumer.ts",
+    "test:js:getting-started:producer": "node src/getting-started-js/producer.js",
+    "test:js:getting-started:consumer": "node src/getting-started-js/consumer.js",
+    "test:js:basic:producer": "node src/basic-js/producer.js",
+    "test:js:basic:consumer": "node src/basic-js/consumer.js"
+  },
+  "keywords": [
+    "iggy",
+    "apache",
+    "messaging",
+    "streaming",
+    "examples"
+  ],
+  "author": "Apache Iggy",
+  "license": "Apache-2.0",
+  "dependencies": {
+    "apache-iggy": "^0.5.0",
+    "debug": "^4.3.7"
+  },
+  "devDependencies": {
+    "@types/debug": "^4.1.12",
+    "@types/node": "^22.9.3",
+    "tsx": "^4.7.0"
+  }
+}
