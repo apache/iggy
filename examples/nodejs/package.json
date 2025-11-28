@@ -1,0 +1,56 @@
+{
+  "name": "iggy-nodejs-examples",
+  "version": "1.0.0",
+  "description": "Node.js examples for Apache Iggy",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "test": "./test-examples.sh",
+    "lint": "eslint src/**/*.ts",
+    "lint:fix": "eslint src/**/*.ts --fix",
+    "test:getting-started:producer": "tsx src/getting-started/producer.ts",
+    "test:getting-started:consumer": "tsx src/getting-started/consumer.ts",
+    "test:basic:producer": "tsx src/basic/producer.ts",
+    "test:basic:consumer": "tsx src/basic/consumer.ts",
+    "test:message-envelope:producer": "tsx src/message-envelope/producer.ts",
+    "test:message-envelope:consumer": "tsx src/message-envelope/consumer.ts",
+    "test:message-headers:producer": "tsx src/message-headers/producer.ts",
+    "test:message-headers:consumer": "tsx src/message-headers/consumer.ts",
+    "test:multi-tenant:producer": "tsx src/multi-tenant/producer.ts",
+    "test:multi-tenant:consumer": "tsx src/multi-tenant/consumer.ts",
+    "test:stream-builder": "tsx src/stream-builder/example.ts",
+    "test:sink-data-producer": "tsx src/sink-data-producer/producer.ts"
+  },
+  "keywords": [
+    "iggy",
+    "apache",
+    "messaging",
+    "streaming",
+    "examples"
+  ],
+  "author": "Apache Iggy",
+  "license": "Apache-2.0",
+  "dependencies": {
+    "apache-iggy": "0.6.0-edge.2",
+    "debug": "^4.3.7"
+  },
+  "devDependencies": {
+    "@types/debug": "^4.1.12",
+    "@types/node": "^22.9.3",
+    "eslint": "^9.39.1",
+    "jiti": "^2.6.1",
+    "tsx": "^4.7.0",
+    "typescript-eslint": "^8.47.0"
+  },
+  "eslintConfig": {
+    "root": true,
+    "env": {
+      "node": true,
+      "es2021": true
+    },
+    "extends": [],
+    "rules": {
+      "no-trailing-spaces": "error"
+    }
+  }
+}
