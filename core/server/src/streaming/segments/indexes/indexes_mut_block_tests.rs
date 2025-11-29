@@ -19,7 +19,7 @@
 #[cfg(test)]
 mod tests {
     use crate::streaming::segments::indexes::indexes_mut::IggyIndexesMut;
-    use crate::streaming::utils::{memory_pool, MemoryPool, MEMORY_POOL};
+    use crate::streaming::utils::{MemoryPool, MEMORY_POOL};
     use crate::configs::system::SystemConfig;
     use iggy_common::ENTRIES_PER_CACHE_LINE;
     use std::sync::{Arc, Once};
