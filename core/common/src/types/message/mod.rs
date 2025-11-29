@@ -18,6 +18,7 @@
 
 mod iggy_message;
 mod index;
+mod index_cache_line_block;
 mod index_view;
 mod indexes;
 mod message_header;
@@ -38,6 +39,9 @@ pub use crate::commands::messages::poll_messages::PollMessages;
 pub use crate::commands::messages::send_messages::SendMessages;
 pub use iggy_message::{IggyMessage, MAX_PAYLOAD_SIZE, MAX_USER_HEADERS_SIZE};
 pub use index::IggyIndex;
+pub use index_cache_line_block::{
+    IndexCacheLineBlock, CACHE_LINE_SIZE, ENTRIES_PER_CACHE_LINE,
+};
 pub use index_view::IggyIndexView;
 pub use indexes::IggyIndexes;
 pub use message_header::{
