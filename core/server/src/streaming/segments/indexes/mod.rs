@@ -23,6 +23,9 @@ mod indexes_mut;
 #[cfg(test)]
 mod indexes_mut_block_tests;
 
+#[cfg(test)]
+mod indexes_mut_bench;
+
 pub use index_reader::IndexReader;
 pub use index_writer::IndexWriter;
 pub use indexes_mut::IggyIndexesMut;
