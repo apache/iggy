@@ -16,9 +16,5 @@
  * under the License.
  */
 
-pub mod address;
-pub mod crypto;
-pub mod file;
-pub mod hash;
-pub mod ptr;
-pub mod random_id;
+pub(crate) mod buffer;
+pub(crate) mod memory_pool;

@@ -17,7 +17,6 @@
  */
 
 use super::sharding::ShardingConfig;
-use super::system::MemoryPoolConfig;
 use super::tcp::TcpSocketConfig;
 use crate::configs::cluster::CurrentNodeConfig;
 use crate::configs::cluster::{ClusterConfig, NodeConfig, OtherNodeConfig, TransportPorts};
@@ -26,9 +25,9 @@ use crate::configs::http::{
 };
 use crate::configs::quic::{QuicCertificateConfig, QuicConfig, QuicSocketConfig};
 use crate::configs::server::{
-    DataMaintenanceConfig, HeartbeatConfig, MessageSaverConfig, MessagesMaintenanceConfig,
-    PersonalAccessTokenCleanerConfig, PersonalAccessTokenConfig, ServerConfig, TelemetryConfig,
-    TelemetryLogsConfig, TelemetryTracesConfig,
+    DataMaintenanceConfig, HeartbeatConfig, MemoryPoolConfig, MessageSaverConfig,
+    MessagesMaintenanceConfig, PersonalAccessTokenCleanerConfig, PersonalAccessTokenConfig,
+    ServerConfig, TelemetryConfig, TelemetryLogsConfig, TelemetryTracesConfig,
 };
 use crate::configs::system::{
     BackupConfig, CompatibilityConfig, CompressionConfig, EncryptionConfig, LoggingConfig,
@@ -504,7 +503,7 @@ impl Default for RecoveryConfig {
 
 impl Default for MemoryPoolConfig {
     fn default() -> MemoryPoolConfig {
-        MemoryPoolConfig {
+        Self {
             enabled: SERVER_CONFIG.system.memory_pool.enabled,
             size: SERVER_CONFIG.system.memory_pool.size.parse().unwrap(),
             bucket_capacity: SERVER_CONFIG.system.memory_pool.bucket_capacity as u32,

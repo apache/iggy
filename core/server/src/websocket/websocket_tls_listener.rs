@@ -16,7 +16,6 @@
  * under the License.
  */
 
-use crate::binary::sender::SenderKind;
 use crate::configs::websocket::WebSocketConfig;
 use crate::shard::IggyShard;
 use crate::shard::task_registry::ShutdownToken;
@@ -28,7 +27,7 @@ use compio_tls::TlsAcceptor;
 use compio_ws::accept_async_with_config;
 use err_trail::ErrContext;
 use futures::FutureExt;
-use iggy_common::{IggyError, TransportProtocol};
+use iggy_common::{IggyError, SenderKind, TransportProtocol, WebSocketTlsSender};
 use rustls::ServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls_pemfile::{certs, private_key};
@@ -201,7 +200,7 @@ async fn accept_loop(
                                             let session = shard_clone.add_client(&remote_addr, TransportProtocol::WebSocket);
                                             let client_id = session.client_id;
 
-                                            let sender = crate::websocket::websocket_tls_sender::WebSocketTlsSender::new(websocket);
+                                            let sender = WebSocketTlsSender::new(websocket);
                                             let mut sender_kind = SenderKind::WebSocketTls(sender);
                                             let client_stop_receiver = registry_clone.add_connection(client_id);
 

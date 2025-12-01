@@ -19,7 +19,7 @@
 use super::COMPONENT;
 use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
 use crate::binary::handlers::utils::receive_and_validate;
-use crate::binary::sender::SenderKind;
+use iggy_common::SenderKind;
 
 use crate::shard::IggyShard;
 use crate::streaming::session::Session;

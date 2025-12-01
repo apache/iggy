@@ -1837,9 +1837,9 @@ dependencies = [
 
 [[package]]
 name = "compio-runtime"
-version = "0.10.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7c0b2855c4a94362f73d0c7ab9abd04ed23aaffddfbdbf5ef63fe51fce7d6bcd"
+checksum = "83fd890a129a8086af857bbe18401689c130aa6ccfc7f3c029a7800f7256af3e"
 dependencies = [
  "async-task",
  "cfg-if",
@@ -4771,15 +4771,24 @@ dependencies = [
  "chrono",
  "clap",
  "comfy-table",
+ "compio",
+ "compio-quic",
+ "compio-tls",
+ "compio-ws",
+ "crossbeam",
  "derive_more 2.0.1",
+ "err_trail",
  "fast-async-mutex",
  "figment",
+ "human-repr",
  "humantime",
+ "once_cell",
  "rcgen",
  "rustls",
  "serde",
  "serde_json",
  "serde_with",
+ "serial_test",
  "strum 0.27.2",
  "thiserror 2.0.17",
  "tokio",
@@ -8292,7 +8301,6 @@ dependencies = [
  "compio-quic",
  "compio-tls",
  "compio-ws",
- "crossbeam",
  "ctrlc",
  "cyper",
  "cyper-axum",
@@ -8314,7 +8322,6 @@ dependencies = [
  "mimalloc",
  "moka",
  "nix",
- "once_cell",
  "opentelemetry",
  "opentelemetry-appender-tracing",
  "opentelemetry-otlp",
@@ -8331,7 +8338,6 @@ dependencies = [
  "send_wrapper",
  "serde",
  "serde_with",
- "serial_test",
  "slab",
  "socket2 0.6.1",
  "static-toml",

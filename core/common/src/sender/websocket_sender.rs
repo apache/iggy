@@ -16,31 +16,29 @@
  * under the License.
  */
 
-use crate::binary::sender::Sender;
-use crate::server_error::ServerError;
-use crate::streaming::utils::PooledBuffer;
+use super::Sender;
+use crate::IggyError;
+use crate::alloc::buffer::PooledBuffer;
 use bytes::{BufMut, BytesMut};
 use compio::buf::IoBufMut;
 use compio::net::TcpStream;
-use compio_tls::TlsStream;
 use compio_ws::WebSocketStream;
 use compio_ws::tungstenite::{Error as TungsteniteError, Message};
-use iggy_common::IggyError;
 use std::ptr;
-use tracing::debug;
+use tracing::{debug, warn};
 
 const READ_BUFFER_CAPACITY: usize = 8192;
 const WRITE_BUFFER_CAPACITY: usize = 8192;
 const STATUS_OK: &[u8] = &[0; 4];
 
-pub struct WebSocketTlsSender {
-    pub(crate) stream: WebSocketStream<TlsStream<TcpStream>>,
+pub struct WebSocketSender {
+    pub(crate) stream: WebSocketStream<TcpStream>,
     pub(crate) read_buffer: BytesMut,
     pub(crate) write_buffer: BytesMut,
 }
 
-impl WebSocketTlsSender {
-    pub fn new(stream: WebSocketStream<TlsStream<TcpStream>>) -> Self {
+impl WebSocketSender {
+    pub fn new(stream: WebSocketStream<TcpStream>) -> Self {
         Self {
             stream,
             read_buffer: BytesMut::with_capacity(READ_BUFFER_CAPACITY),
@@ -53,20 +51,33 @@ impl WebSocketTlsSender {
             return Ok(());
         }
         let data = self.write_buffer.split().freeze();
-        self.stream
-            .send(Message::Binary(data))
-            .await
-            .map_err(|_| IggyError::TcpError)
+        debug!("WebSocket sending data: {:?}", data.to_vec());
+
+        self.stream.send(Message::Binary(data)).await.map_err(|e| {
+            debug!("WebSocket send error: {:?}", e);
+            match e {
+                TungsteniteError::ConnectionClosed | TungsteniteError::AlreadyClosed => {
+                    IggyError::ConnectionClosed
+                }
+                TungsteniteError::Io(ref io_err)
+                    if io_err.kind() == std::io::ErrorKind::BrokenPipe =>
+                {
+                    warn!("Broken pipe detected (client closed connection)");
+                    IggyError::ConnectionClosed
+                }
+                _ => IggyError::TcpError,
+            }
+        })
     }
 }
 
-impl std::fmt::Debug for WebSocketTlsSender {
+impl std::fmt::Debug for WebSocketSender {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("WebSocketTlsSender").finish()
+        f.debug_struct("WebSocketSender").finish()
     }
 }
 
-impl Sender for WebSocketTlsSender {
+impl Sender for WebSocketSender {
     async fn read<B: IoBufMut>(&mut self, mut buffer: B) -> (Result<(), IggyError>, B) {
         let required_len = buffer.buf_capacity();
         if required_len == 0 {
@@ -109,7 +120,7 @@ impl Sender for WebSocketTlsSender {
 
     async fn send_ok_response(&mut self, payload: &[u8]) -> Result<(), IggyError> {
         debug!(
-            "Sending WebSocket TLS response with status: OK, payload length: {}",
+            "Sending WebSocket response with status: OK, payload length: {}",
             payload.len()
         );
 
@@ -129,10 +140,7 @@ impl Sender for WebSocketTlsSender {
 
     async fn send_error_response(&mut self, error: IggyError) -> Result<(), IggyError> {
         let status = &error.as_code().to_le_bytes();
-        debug!(
-            "Sending WebSocket TLS error response with status: {:?}",
-            status
-        );
+        debug!("Sending WebSocket error response with status: {:?}", status);
         let length = 0u32.to_le_bytes();
         let total_size = status.len() + length.len();
 
@@ -144,19 +152,17 @@ impl Sender for WebSocketTlsSender {
         self.flush_write_buffer().await
     }
 
-    async fn shutdown(&mut self) -> Result<(), ServerError> {
-        self.flush_write_buffer().await.map_err(ServerError::from)?;
+    async fn shutdown(&mut self) -> Result<(), IggyError> {
+        self.flush_write_buffer().await?;
 
         match self.stream.close(None).await {
             Ok(_) => Ok(()),
             Err(e) => match e {
                 TungsteniteError::ConnectionClosed | TungsteniteError::AlreadyClosed => {
-                    debug!("WebSocket TLS connection already closed: {}", e);
+                    debug!("WebSocket connection already closed: {}", e);
                     Ok(())
                 }
-                _ => Err(ServerError::from(
-                    IggyError::CannotCloseWebSocketConnection(format!("{}", e)),
-                )),
+                _ => Err(IggyError::CannotCloseWebSocketConnection(format!("{}", e))),
             },
         }
     }
@@ -181,6 +187,17 @@ impl Sender for WebSocketTlsSender {
         self.stream
             .send(Message::Binary(response_bytes.freeze()))
             .await
-            .map_err(|_| IggyError::TcpError)
+            .map_err(|e| match e {
+                TungsteniteError::ConnectionClosed | TungsteniteError::AlreadyClosed => {
+                    IggyError::ConnectionClosed
+                }
+                TungsteniteError::Io(ref io_err)
+                    if io_err.kind() == std::io::ErrorKind::BrokenPipe =>
+                {
+                    warn!("Broken pipe in vectored send - client closed connection");
+                    IggyError::ConnectionClosed
+                }
+                _ => IggyError::TcpError,
+            })
     }
 }
