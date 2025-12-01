@@ -98,10 +98,9 @@ const fn const_parse_u32(s: &str) -> u32 {
 impl SemanticVersion {
     pub const fn current() -> Self {
         const PRERELEASE_STR: &str = env!("VERSION_PRERELEASE");
-        const PRERELEASE: Option<&'static str> = if PRERELEASE_STR.is_empty() {
-            None
-        } else {
-            Some(PRERELEASE_STR)
+        const PRERELEASE: Option<&'static str> = match PRERELEASE_STR.len() {
+            0 => None,
+            _ => Some(PRERELEASE_STR),
         };
 
         SemanticVersion {
