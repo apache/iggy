@@ -22,10 +22,10 @@ local_state*
 foreign/cpp/build
 foreign/java/**/build
 foreign/java/**/out
-foreign/node/**/node_modules
 foreign/node/**/dist
 foreign/node/npm-debug.log*
 foreign/node/.npm
+**/node_modules
 /**/*.DotSettings.user
 *.exe
 *.exe~

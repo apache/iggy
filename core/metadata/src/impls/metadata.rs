@@ -14,7 +14,8 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use consensus::{Consensus, Prepare, Project, VsrConsensus};
+use consensus::{Consensus, Project, VsrConsensus};
+use iggy_common::{header::PrepareHeader, message::Message};
 use journal::Journal;
 use tracing::{debug, warn};
 
@@ -42,7 +43,7 @@ struct IggyMetadata<M, J, S> {
 
 impl<M, J, S> Metadata for IggyMetadata<M, J, S>
 where
-    J: Journal<Entry = Prepare>,
+    J: Journal<Entry = <VsrConsensus as Consensus>::ReplicateMessage>,
 {
     type Consensus = VsrConsensus;
     type Journal = J;
@@ -74,10 +75,10 @@ where
 
 impl<M, J, S> IggyMetadata<M, J, S>
 where
-    J: Journal<Entry = Prepare>,
+    J: Journal<Entry = <VsrConsensus as Consensus>::ReplicateMessage>,
 {
     #[expect(unused)]
-    fn pipeline_prepare(&self, prepare: Prepare) {
+    fn pipeline_prepare(&self, prepare: Message<PrepareHeader>) {
         debug!("inserting prepare into metadata pipeline");
         self.consensus.verify_pipeline();
         self.consensus.pipeline_message(prepare.clone());
@@ -86,12 +87,12 @@ where
         self.consensus.post_replicate_verify(&prepare);
     }
 
-    fn fence_old_prepare(&self, _prepare: &Prepare) -> bool {
+    fn fence_old_prepare(&self, _prepare: &Message<PrepareHeader>) -> bool {
         // TODO
         false
     }
 
-    fn replicate(&self, _prepare: Prepare) {
+    fn replicate(&self, _prepare: Message<PrepareHeader>) {
         todo!()
     }
 }

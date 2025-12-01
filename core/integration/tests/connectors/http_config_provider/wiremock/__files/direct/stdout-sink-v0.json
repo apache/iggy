@@ -1,0 +1,34 @@
+{
+  "key": "stdout",
+  "enabled": true,
+  "version": 0,
+  "name": "Stdout sink",
+  "path": "../../target/debug/libiggy_connector_stdout_sink",
+  "transforms": {
+    "add_fields": {
+      "enabled": true,
+      "fields": [
+        {
+          "key": "message",
+          "value": {
+            "static": "hello"
+          }
+        }
+      ]
+    }
+  },
+  "streams": [
+    {
+      "stream": "test_stream",
+      "topics": ["test_topic"],
+      "schema": "json",
+      "batch_length": 100,
+      "poll_interval": "5ms",
+      "consumer_group": "stdout_sink_connector"
+    }
+  ],
+  "plugin_config_format": null,
+  "plugin_config": {
+    "print_payload": false
+  }
+}

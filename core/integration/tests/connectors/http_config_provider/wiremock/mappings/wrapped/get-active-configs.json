@@ -1,0 +1,13 @@
+{
+  "request": {
+    "method": "GET",
+    "url": "/configs/active"
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "application/json"
+    },
+    "bodyFileName": "wrapped/connectors-config.json"
+  }
+}

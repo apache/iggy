@@ -35,13 +35,8 @@ runs:
 
     - name: Setup Gradle
       uses: gradle/actions/setup-gradle@af1da67850ed9a4cedd57bfd976089dd991e2582 # v4.0.0
-
-    - name: Grant execute permission for gradlew
-      shell: bash
-      run: |
-        if [ -f "foreign/java/gradlew" ]; then
-          chmod +x foreign/java/gradlew
-        fi
+      with:
+        gradle-version: '9.2.1'
 
     - name: Lint
       if: inputs.task == 'lint'
