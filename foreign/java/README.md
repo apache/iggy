@@ -24,7 +24,7 @@ implementation 'org.apache.iggy:iggy:0.6.0'
 </dependency>
 ```
 
-Find the latest version on [Maven Central](https://central.sonatype.com/artifact/org.apache.iggy/iggy).
+Find the latest version on [Maven Repository](https://mvnrepository.com/artifact/org.apache.iggy/iggy-java-sdk).
 
 ## Examples
 
