@@ -59,4 +59,3 @@ toml = { workspace = true }
 tracing = { workspace = true }
 tungstenite = { workspace = true }
 twox-hash = { workspace = true }
-bit-set = { workspace = true }

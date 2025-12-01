@@ -4773,7 +4773,6 @@ dependencies = [
  "aes-gcm",
  "ahash 0.8.12",
  "base64 0.22.1",
- "bit-set",
  "bon",
  "byte-unit",
  "bytemuck",
