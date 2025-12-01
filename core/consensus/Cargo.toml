@@ -30,5 +30,4 @@ readme = "../../../README.md"
 [dependencies]
 iggy_common = { path = "../common" }
 message_bus = { path = "../message_bus" }
-
-
+bit-set = { workspace = true }
