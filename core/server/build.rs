@@ -21,21 +21,8 @@ use std::{env, error};
 use vergen_git2::{BuildBuilder, CargoBuilder, Emitter, Git2Builder, RustcBuilder, SysinfoBuilder};
 
 fn main() -> Result<(), Box<dyn error::Error>> {
-    let version = env::var("CARGO_PKG_VERSION").unwrap();
-
-    // Split on '+' to remove build metadata (we ignore it)
-    let version_core = version.split('+').next().expect("Should have version core");
-
-    // Split on '-' to separate prerelease
-    let mut parts = version_core.split('-');
-    let version_numbers = parts.next().expect("Should have version number");
-    let prerelease = parts.next();
-
-    // Parse major.minor.patch
-    let mut nums = version_numbers.split('.');
-    let major = nums.next().expect("Should have major version");
-    let minor = nums.next().expect("Should have minor version");
-    let patch = nums.next().expect("Should have patch version");
+    let version = env::var("CARGO_PKG_VERSION").expect("Should have version on CARGO_PKG");
+    let (major, minor, patch, prerelease) = parse_semver(&version);
 
     println!("cargo:rustc-env=VERSION_MAJOR={}", major);
     println!("cargo:rustc-env=VERSION_MINOR={}", minor);
@@ -73,4 +60,23 @@ fn main() -> Result<(), Box<dyn error::Error>> {
     }
 
     Ok(())
+}
+
+/// Parses semantic version string into (major, minor, patch, prerelease)
+///
+/// Note: Duplicated in versioning.rs because build scripts run at compile time
+/// and cannot share code with the runtime library
+fn parse_semver(version: &str) -> (&str, &str, &str, Option<&str>) {
+    let version_core = version.split('+').next().expect("Should have version core");
+
+    let mut parts = version_core.split('-');
+    let version_numbers = parts.next().expect("Should have version number");
+    let prerelease = parts.next();
+
+    let mut nums = version_numbers.split('.');
+    let major = nums.next().expect("Should have major version");
+    let minor = nums.next().expect("Should have minor version");
+    let patch = nums.next().expect("Should have patch version");
+
+    (major, minor, patch, prerelease)
 }
