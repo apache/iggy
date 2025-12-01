@@ -39,13 +39,8 @@ runs:
 
     - name: Setup Gradle
       uses: gradle/actions/setup-gradle@af1da67850ed9a4cedd57bfd976089dd991e2582 # v4.0.0
-
-    - name: Grant execute permission for gradlew
-      shell: bash
-      run: |
-        if [ -f "foreign/java/gradlew" ]; then
-          chmod +x foreign/java/gradlew
-        fi
+      with:
+        gradle-version: '9.2.1'
 
     - name: Build for publishing
       shell: bash
@@ -77,7 +72,7 @@ runs:
           echo ""
 
           # Extract version from build.gradle.kts
-          gradle_version=$(foreign/java/gradlew -p foreign/java/java-sdk properties -q | grep "version:" | cut -d: -f2 | tr -d ' ')
+          gradle_version=$(gradle -p foreign/java/java-sdk properties -q | grep "version:" | cut -d: -f2 | tr -d ' ')
           echo "Version from gradle: $gradle_version"
           echo "Input version: ${{ inputs.version }}"
 
