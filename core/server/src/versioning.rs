@@ -16,7 +16,6 @@
  * under the License.
  */
 
-use crate::VERSION;
 use iggy_common::IggyError;
 use std::fmt::Display;
 use std::str::FromStr;
@@ -26,7 +25,7 @@ pub struct SemanticVersion {
     pub major: u32,
     pub minor: u32,
     pub patch: u32,
-    pub prerelease: Option<String>,
+    pub prerelease: Option<&'static str>,
 }
 
 impl FromStr for SemanticVersion {
@@ -38,7 +37,9 @@ impl FromStr for SemanticVersion {
         // Split on '-' to separate prerelease identifier
         let mut parts = version_core.split('-');
         let version_numbers = parts.next().unwrap();
-        let prerelease = parts.next().map(String::from);
+        let prerelease = parts
+            .next()
+            .map(|s| Box::leak(s.to_string().into_boxed_str()) as &'static str);
 
         // Parse major.minor.patch
         let mut version = version_numbers.split('.');
@@ -67,13 +68,48 @@ impl FromStr for SemanticVersion {
     }
 }
 
-impl SemanticVersion {
-    pub fn current() -> Result<Self, IggyError> {
-        if let Ok(version) = VERSION.parse::<SemanticVersion>() {
-            return Ok(version);
+const fn const_parse_u32(s: &str) -> u32 {
+    let bytes = s.as_bytes();
+
+    if bytes.is_empty() {
+        panic!("Can not parse empty string as u32");
+    }
+
+    let mut result = 0u32;
+    let mut i = 0;
+
+    while i < bytes.len() {
+        let byte = bytes[i];
+
+        // Validate if the byte is digit
+        if byte < b'0' || byte > b'9' {
+            panic!("Invalid digit in version number");
         }
 
-        Err(IggyError::InvalidVersion(VERSION.into()))
+        // ASCII '0' - '9' to 0-9
+        let digit = bytes[i] - b'0';
+        result = result * 10 + digit as u32;
+        i += 1;
+    }
+
+    result
+}
+
+impl SemanticVersion {
+    pub const fn current() -> Self {
+        const PRERELEASE_STR: &str = env!("VERSION_PRERELEASE");
+        const PRERELEASE: Option<&'static str> = if PRERELEASE_STR.is_empty() {
+            None
+        } else {
+            Some(PRERELEASE_STR)
+        };
+
+        SemanticVersion {
+            major: const_parse_u32(env!("VERSION_MAJOR")),
+            minor: const_parse_u32(env!("VERSION_MINOR")),
+            patch: const_parse_u32(env!("VERSION_PATCH")),
+            prerelease: PRERELEASE,
+        }
     }
 
     #[must_use]
@@ -133,6 +169,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_const_parse_u32_valid() {
+        assert_eq!(const_parse_u32("0"), 0);
+        assert_eq!(const_parse_u32("1"), 1);
+        assert_eq!(const_parse_u32("42"), 42);
+        assert_eq!(const_parse_u32("123"), 123);
+        assert_eq!(const_parse_u32("999"), 999);
+        assert_eq!(const_parse_u32("2024"), 2024);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_const_parse_u32_invalid_char() {
+        const_parse_u32("12a");
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_const_parse_u32_empty() {
+        const_parse_u32("");
+    }
+
+    #[test]
+    fn test_semantic_version_current() {
+        let version = SemanticVersion::current();
+
+        assert!(version.major < 1000);
+        assert!(version.minor < 1000);
+        assert!(version.patch < 1000);
+    }
+
+    #[test]
     fn should_load_the_expected_version_from_package_definition() {
         const CARGO_TOML_VERSION: &str = env!("CARGO_PKG_VERSION");
         assert_eq!(crate::VERSION, CARGO_TOML_VERSION);
@@ -154,7 +221,7 @@ mod tests {
         assert_eq!(version.major, 0);
         assert_eq!(version.minor, 6);
         assert_eq!(version.patch, 0);
-        assert_eq!(version.prerelease, Some("rc1".to_string()));
+        assert_eq!(version.prerelease, Some("rc1"));
         assert_eq!(version.to_string(), "0.6.0-rc1");
     }
 
@@ -164,7 +231,7 @@ mod tests {
         assert_eq!(version.major, 2);
         assert_eq!(version.minor, 0);
         assert_eq!(version.patch, 0);
-        assert_eq!(version.prerelease, Some("alpha.1".to_string()));
+        assert_eq!(version.prerelease, Some("alpha.1"));
         assert_eq!(version.to_string(), "2.0.0-alpha.1");
     }
 
@@ -187,7 +254,7 @@ mod tests {
         assert_eq!(version.major, 1);
         assert_eq!(version.minor, 0);
         assert_eq!(version.patch, 0);
-        assert_eq!(version.prerelease, Some("beta".to_string()));
+        assert_eq!(version.prerelease, Some("beta"));
         assert_eq!(version.to_string(), "1.0.0-beta");
     }
 

@@ -16,11 +16,37 @@
  * under the License.
  */
 
-use std::error;
 use std::path::PathBuf;
+use std::{env, error};
 use vergen_git2::{BuildBuilder, CargoBuilder, Emitter, Git2Builder, RustcBuilder, SysinfoBuilder};
 
 fn main() -> Result<(), Box<dyn error::Error>> {
+    let version = env::var("CARGO_PKG_VERSION").unwrap();
+
+    // Split on '+' to remove build metadata (we ignore it)
+    let version_core = version.split('+').next().expect("Should have version core");
+
+    // Split on '-' to separate prerelease
+    let mut parts = version_core.split('-');
+    let version_numbers = parts.next().expect("Should have version number");
+    let prerelease = parts.next();
+
+    // Parse major.minor.patch
+    let mut nums = version_numbers.split('.');
+    let major = nums.next().expect("Should have major version");
+    let minor = nums.next().expect("Should have minor version");
+    let patch = nums.next().expect("Should have patch version");
+
+    println!("cargo:rustc-env=VERSION_MAJOR={}", major);
+    println!("cargo:rustc-env=VERSION_MINOR={}", minor);
+    println!("cargo:rustc-env=VERSION_PATCH={}", patch);
+
+    if let Some(pre) = prerelease {
+        println!("cargo:rustc-env=VERSION_PRERELEASE={}", pre);
+    } else {
+        println!("cargo:rustc-env=VERSION_PRERELEASE=");
+    }
+
     if option_env!("IGGY_CI_BUILD") == Some("true") {
         Emitter::default()
             .add_instructions(&BuildBuilder::all_build()?)?
