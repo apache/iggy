@@ -16,16 +16,15 @@
  * under the License.
  */
 
-use crate::binary::sender::Sender;
-use crate::server_error::ServerError;
-use crate::streaming::utils::PooledBuffer;
+use super::Sender;
+use crate::IggyError;
+use crate::alloc::buffer::PooledBuffer;
 use bytes::{BufMut, BytesMut};
 use compio::buf::IoBufMut;
 use compio::net::TcpStream;
 use compio_tls::TlsStream;
 use compio_ws::TungsteniteError;
 use compio_ws::{WebSocketMessage as Message, WebSocketStream};
-use iggy_common::IggyError;
 use std::ptr;
 use tracing::debug;
 
@@ -144,8 +143,8 @@ impl Sender for WebSocketTlsSender {
         self.flush_write_buffer().await
     }
 
-    async fn shutdown(&mut self) -> Result<(), ServerError> {
-        self.flush_write_buffer().await.map_err(ServerError::from)?;
+    async fn shutdown(&mut self) -> Result<(), IggyError> {
+        self.flush_write_buffer().await?;
 
         match self.stream.close(None).await {
             Ok(_) => Ok(()),
@@ -154,9 +153,7 @@ impl Sender for WebSocketTlsSender {
                     debug!("WebSocket TLS connection already closed: {}", e);
                     Ok(())
                 }
-                _ => Err(ServerError::from(
-                    IggyError::CannotCloseWebSocketConnection(format!("{}", e)),
-                )),
+                _ => Err(IggyError::CannotCloseWebSocketConnection(format!("{}", e))),
             },
         }
     }

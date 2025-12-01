@@ -18,9 +18,9 @@
 
 use super::{PooledBuffer, Sender};
 use crate::IggyError;
+use compio::BufResult;
 use compio::buf::IoBufMut;
 use compio::io::AsyncReadExt;
-use compio::BufResult;
 use compio_quic::{RecvStream, SendStream};
 use err_trail::ErrContext;
 use tracing::{debug, error};
@@ -61,7 +61,7 @@ impl Sender for QuicSender {
             .await
     }
 
-    async fn shutdown(&mut self) -> Result<(), std::io::Error> {
+    async fn shutdown(&mut self) -> Result<(), IggyError> {
         Ok(())
     }
 

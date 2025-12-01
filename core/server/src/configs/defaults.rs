@@ -25,9 +25,9 @@ use crate::configs::http::{
 };
 use crate::configs::quic::{QuicCertificateConfig, QuicConfig, QuicSocketConfig};
 use crate::configs::server::{
-    DataMaintenanceConfig, HeartbeatConfig, MessageSaverConfig, MessagesMaintenanceConfig,
-    PersonalAccessTokenCleanerConfig, PersonalAccessTokenConfig, ServerConfig, TelemetryConfig,
-    TelemetryLogsConfig, TelemetryTracesConfig,
+    DataMaintenanceConfig, HeartbeatConfig, MemoryPoolConfig, MessageSaverConfig,
+    MessagesMaintenanceConfig, PersonalAccessTokenCleanerConfig, PersonalAccessTokenConfig,
+    ServerConfig, TelemetryConfig, TelemetryLogsConfig, TelemetryTracesConfig,
 };
 use crate::configs::system::{
     BackupConfig, CompatibilityConfig, CompressionConfig, EncryptionConfig, LoggingConfig,
@@ -36,7 +36,7 @@ use crate::configs::system::{
 };
 use crate::configs::tcp::{TcpConfig, TcpTlsConfig};
 use crate::configs::websocket::{WebSocketConfig, WebSocketTlsConfig};
-use iggy_common::{IggyByteSize, MemoryPoolConfig};
+use iggy_common::IggyByteSize;
 use iggy_common::IggyDuration;
 use std::sync::Arc;
 use std::time::Duration;
@@ -503,7 +503,7 @@ impl Default for RecoveryConfig {
 
 impl Default for MemoryPoolConfig {
     fn default() -> MemoryPoolConfig {
-        MemoryPoolConfig {
+        Self {
             enabled: SERVER_CONFIG.system.memory_pool.enabled,
             size: SERVER_CONFIG.system.memory_pool.size.parse().unwrap(),
             bucket_capacity: SERVER_CONFIG.system.memory_pool.bucket_capacity as u32,

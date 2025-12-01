@@ -22,9 +22,9 @@ use super::server::{
     DataMaintenanceConfig, MessageSaverConfig, MessagesMaintenanceConfig, TelemetryConfig,
 };
 use super::sharding::{CpuAllocation, ShardingConfig};
-use super::system::{CompressionConfig, MemoryPoolConfig, PartitionConfig};
+use super::system::{CompressionConfig, PartitionConfig};
 use crate::configs::COMPONENT;
-use crate::configs::server::{PersonalAccessTokenConfig, ServerConfig};
+use crate::configs::server::{MemoryPoolConfig, PersonalAccessTokenConfig, ServerConfig};
 use crate::configs::system::SegmentConfig;
 use crate::streaming::segments::*;
 use err_trail::ErrContext;

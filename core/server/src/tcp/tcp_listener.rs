@@ -16,7 +16,6 @@
  * under the License.
  */
 
-use crate::binary::sender::SenderKind;
 use crate::configs::tcp::TcpSocketConfig;
 
 use crate::shard::IggyShard;
@@ -26,7 +25,7 @@ use crate::tcp::connection_handler::{handle_connection, handle_error};
 use compio::net::{TcpListener, TcpOpts};
 use err_trail::ErrContext;
 use futures::FutureExt;
-use iggy_common::{IggyError, TransportProtocol};
+use iggy_common::{IggyError, SenderKind, TransportProtocol};
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::time::Duration;

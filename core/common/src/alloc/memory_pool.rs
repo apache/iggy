@@ -20,7 +20,6 @@ use bytes::BytesMut;
 use crossbeam::queue::ArrayQueue;
 use human_repr::HumanCount;
 use once_cell::sync::OnceCell;
-use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tracing::{info, trace, warn};
@@ -75,8 +74,8 @@ pub fn memory_pool() -> &'static MemoryPool {
 }
 
 /// Configuration for the memory pool.
-#[derive(Deserialize, Serialize, Debug)]
-pub struct MemoryPoolConfig {
+#[derive(Debug)]
+pub struct MemoryPoolConfigOther {
     /// Whether the pool is enabled.
     pub enabled: bool,
     /// Maximum size of the pool.
@@ -164,7 +163,7 @@ impl MemoryPool {
     }
 
     /// Initialize the global pool from the given config.
-    pub fn init_pool(config: &MemoryPoolConfig) {
+    pub fn init_pool(config: &MemoryPoolConfigOther) {
         let is_enabled = config.enabled;
         let memory_limit = config.size.as_bytes_usize();
         let bucket_capacity = config.bucket_capacity as usize;
@@ -472,23 +471,24 @@ mod tests {
     use crate::{IggyByteSize, alloc::buffer::PooledBuffer};
 
     use super::*;
+    use serial_test::serial;
     use std::{str::FromStr, sync::Once};
 
     static TEST_INIT: Once = Once::new();
 
     fn initialize_pool_for_tests() {
         TEST_INIT.call_once(|| {
-            let config = 
-                MemoryPoolConfig {
-                    enabled: true,
-                    size: IggyByteSize::from_str("4GiB").unwrap(),
-                    bucket_capacity: 8192,
-                };
+            let config = MemoryPoolConfigOther {
+                enabled: true,
+                size: IggyByteSize::from_str("4GiB").unwrap(),
+                bucket_capacity: 8192,
+            };
             MemoryPool::init_pool(&config);
         });
     }
 
     #[test]
+    #[serial(memory_pool)]
     fn test_pooled_buffer_resize_tracking() {
         initialize_pool_for_tests();
 
@@ -559,6 +559,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(memory_pool)]
     fn test_multiple_resize_operations() {
         initialize_pool_for_tests();
 
@@ -643,6 +644,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(memory_pool)]
     fn test_different_resize_methods() {
         initialize_pool_for_tests();
 

@@ -34,4 +34,3 @@ pub(crate) mod stats;
 pub(crate) mod stream;
 pub(crate) mod topic;
 pub(crate) mod user;
-pub(crate) mod sender;

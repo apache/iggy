@@ -16,6 +16,7 @@
  * under the License.
  */
 
+use crate::configs::server::MemoryPoolConfig;
 use crate::slab::partitions;
 use crate::slab::streams;
 use crate::slab::topics;
