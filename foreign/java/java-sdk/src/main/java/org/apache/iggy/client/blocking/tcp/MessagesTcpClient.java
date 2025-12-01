@@ -59,9 +59,7 @@ class MessagesTcpClient implements MessagesClient {
         payload.writeIntLE(count.intValue());
         payload.writeByte(autoCommit ? 1 : 0);
 
-        var response = tcpClient.send(CommandCode.Messages.POLL, payload);
-
-        return BytesDeserializer.readPolledMessages(response);
+        return tcpClient.exchangeForEntity(CommandCode.Messages.POLL, payload, BytesDeserializer::readPolledMessages);
     }
 
     @Override

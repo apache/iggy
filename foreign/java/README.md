@@ -36,7 +36,7 @@ For Apache Flink integration, see the [Flink Connector Library](external-process
 
 Before opening a pull request:
 
-1. **Format code:** `./gradlew spotlessApply`
-2. **Validate build:** `./gradlew check`
+1. **Format code:** `gradle spotlessApply`
+2. **Validate build:** `gradle check`
 
 This ensures code style compliance and that all tests and checkstyle validations pass.
