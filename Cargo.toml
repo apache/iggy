@@ -59,7 +59,7 @@ anyhow = "1.0.100"
 argon2 = "0.5.3"
 arrow = "=55.2.0"
 arrow-array = "=55.2.0"
-arrow-json = "=55.2.0"
+arrow-json = "=57.1.0"
 async-broadcast = "0.7.2"
 async-channel = "2.5.0"
 async-dropper = { version = "0.3.1", features = ["tokio", "simple"] }
