@@ -17,6 +17,9 @@
 
 pub trait MessageBus {}
 
-pub struct IggyMessageBus;
+pub struct IggyMessageBus {
+    client_connections: HashMap<u128, ClientConnection>
+
+}
 
 impl MessageBus for IggyMessageBus {}

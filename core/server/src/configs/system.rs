@@ -135,13 +135,6 @@ pub struct RecoveryConfig {
     pub recreate_missing_state: bool,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-pub struct MemoryPoolConfig {
-    pub enabled: bool,
-    pub size: IggyByteSize,
-    pub bucket_capacity: u32,
-}
-
 #[serde_as]
 #[derive(Debug, Deserialize, Serialize)]
 pub struct SegmentConfig {

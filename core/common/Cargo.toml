@@ -43,8 +43,11 @@ bytes = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
 comfy-table = { workspace = true }
+crossbeam = { workspace = true }
 derive_more = { workspace = true }
 fast-async-mutex = { version = "0.6.7", optional = true }
+human-repr = { workspace = true }
+once_cell = { workspace = true }
 figment = { workspace = true }
 humantime = { workspace = true }
 rcgen = "0.14.5"
@@ -59,3 +62,9 @@ toml = { workspace = true }
 tracing = { workspace = true }
 tungstenite = { workspace = true }
 twox-hash = { workspace = true }
+compio = { workspace = true }
+compio-quic = { workspace = true }
+compio-tls = { workspace = true }
+compio-ws = { workspace = true }
+err_trail = { workspace = true }
+error_set = { workspace = true }

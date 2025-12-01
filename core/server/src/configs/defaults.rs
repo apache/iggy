@@ -17,7 +17,6 @@
  */
 
 use super::sharding::ShardingConfig;
-use super::system::MemoryPoolConfig;
 use super::tcp::TcpSocketConfig;
 use crate::configs::cluster::CurrentNodeConfig;
 use crate::configs::cluster::{ClusterConfig, NodeConfig, OtherNodeConfig, TransportPorts};
@@ -37,7 +36,7 @@ use crate::configs::system::{
 };
 use crate::configs::tcp::{TcpConfig, TcpTlsConfig};
 use crate::configs::websocket::{WebSocketConfig, WebSocketTlsConfig};
-use iggy_common::IggyByteSize;
+use iggy_common::{IggyByteSize, MemoryPoolConfig};
 use iggy_common::IggyDuration;
 use std::sync::Arc;
 use std::time::Duration;

@@ -63,8 +63,8 @@ dashmap = { workspace = true }
 derive_more = { workspace = true }
 dotenvy = { workspace = true }
 enum_dispatch = { workspace = true }
-err_trail = { version = "0.10.2" }
-error_set = { version = "0.9.0" }
+err_trail = { workspace = true }
+error_set = { workspace = true }
 figlet-rs = { workspace = true }
 figment = { workspace = true }
 flume = { workspace = true }
