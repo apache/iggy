@@ -68,6 +68,11 @@ impl FromStr for SemanticVersion {
     }
 }
 
+/// Parses a string slice to u32 at compile time.
+///
+/// # Panics
+/// - If the string is empty
+/// - If the string contains non-digit characters
 const fn const_parse_u32(s: &str) -> u32 {
     let bytes = s.as_bytes();
 
