@@ -34,7 +34,7 @@ public class BlockingTcpPollBenchmark extends BasePollBenchmark {
 
     @Override
     protected void setupClient() {
-        client = new IggyTcpClient("localhost", getTcpPort());
+        client = new IggyTcpClient("localhost", iggyContainer.getTcpPort());
         client.users().login("iggy", "iggy");
     }
 

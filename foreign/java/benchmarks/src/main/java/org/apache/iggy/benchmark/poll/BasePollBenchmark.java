@@ -92,14 +92,6 @@ public abstract class BasePollBenchmark {
         }
     }
 
-    protected int getHttpPort() {
-        return iggyContainer.getHttpPort();
-    }
-
-    protected int getTcpPort() {
-        return iggyContainer.getTcpPort();
-    }
-
     @Setup(Level.Iteration)
     public void resetOffset() {
         currentOffset = BigInteger.ZERO;

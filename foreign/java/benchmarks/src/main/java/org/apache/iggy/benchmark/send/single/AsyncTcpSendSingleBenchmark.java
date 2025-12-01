@@ -33,7 +33,7 @@ public class AsyncTcpSendSingleBenchmark extends BaseSingleMessageSendBenchmark 
 
     @Override
     protected void setupClient() throws Exception {
-        asyncClient = new AsyncIggyTcpClient("localhost", getTcpPort());
+        asyncClient = new AsyncIggyTcpClient("localhost", iggyContainer.getTcpPort());
         asyncClient
                 .connect()
                 .thenCompose(v -> asyncClient.users().loginAsync("iggy", "iggy"))

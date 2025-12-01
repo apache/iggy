@@ -30,7 +30,7 @@ public class BlockingTcpSendBatchBenchmark extends BaseBatchMessageSendBenchmark
 
     @Override
     protected void setupClient() {
-        client = new IggyTcpClient("localhost", getTcpPort());
+        client = new IggyTcpClient("localhost", iggyContainer.getTcpPort());
         client.users().login("iggy", "iggy");
     }
 

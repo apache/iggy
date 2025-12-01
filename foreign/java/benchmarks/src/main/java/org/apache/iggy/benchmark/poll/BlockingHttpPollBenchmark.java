@@ -34,7 +34,7 @@ public class BlockingHttpPollBenchmark extends BasePollBenchmark {
 
     @Override
     protected void setupClient() {
-        client = new IggyHttpClient("http://localhost:" + getHttpPort());
+        client = new IggyHttpClient("http://localhost:" + iggyContainer.getHttpPort());
         client.users().login("iggy", "iggy");
     }
 

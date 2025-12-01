@@ -87,14 +87,6 @@ public abstract class BaseSendBenchmark {
         }
     }
 
-    protected int getHttpPort() {
-        return iggyContainer.getHttpPort();
-    }
-
-    protected int getTcpPort() {
-        return iggyContainer.getTcpPort();
-    }
-
     protected void initializeInfrastructure() {
         IggyBaseClient mgmtClient = getManagementClient();
         assert mgmtClient != null;

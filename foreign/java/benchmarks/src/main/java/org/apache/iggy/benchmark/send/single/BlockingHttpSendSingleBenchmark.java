@@ -32,7 +32,7 @@ public class BlockingHttpSendSingleBenchmark extends BaseSingleMessageSendBenchm
 
     @Override
     protected void setupClient() {
-        client = new IggyHttpClient("http://localhost:" + getHttpPort());
+        client = new IggyHttpClient("http://localhost:" + iggyContainer.getHttpPort());
         client.users().login("iggy", "iggy");
     }
 
