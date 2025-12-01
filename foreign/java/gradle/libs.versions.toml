@@ -50,6 +50,9 @@ spotbugs = "4.9.8"
 # Config
 typesafe-config = "1.4.5"
 
+# JMH
+jmh = "1.37"
+
 # Build plugins
 spotless = "8.1.0"
 shadow = "9.2.2"
@@ -97,6 +100,10 @@ spotbugs-annotations = { module = "com.github.spotbugs:spotbugs-annotations", ve
 
 # Config
 typesafe-config = { module = "com.typesafe:config", version.ref = "typesafe-config" }
+
+# JMH
+jmh-core = { module = "org.openjdk.jmh:jmh-core", version.ref = "jmh" }
+jmh-generator = { module = "org.openjdk.jmh:jmh-generator-annprocess", version.ref = "jmh" }
 
 [bundles]
 testing = ["junit-jupiter", "junit-platform-launcher", "assertj-core"]
