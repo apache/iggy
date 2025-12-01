@@ -1,0 +1,12 @@
+{
+  "request": {
+    "method": "DELETE",
+    "urlPattern": "/sinks/([^/]+)/configs.*"
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "application/json"
+    }
+  }
+}

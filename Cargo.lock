@@ -4581,7 +4581,7 @@ dependencies = [
 
 [[package]]
 name = "iggy"
-version = "0.8.1-edge.1"
+version = "0.8.0"
 dependencies = [
  "async-broadcast",
  "async-dropper",
@@ -4613,7 +4613,7 @@ dependencies = [
 
 [[package]]
 name = "iggy-bench"
-version = "0.3.1-edge.1"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "bench-report",
@@ -4643,7 +4643,7 @@ dependencies = [
 
 [[package]]
 name = "iggy-bench-dashboard-server"
-version = "0.5.1-edge.1"
+version = "0.5.0"
 dependencies = [
  "actix-cors",
  "actix-files",
@@ -4670,7 +4670,7 @@ dependencies = [
 
 [[package]]
 name = "iggy-cli"
-version = "0.10.1-edge.1"
+version = "0.10.0"
 dependencies = [
  "ahash 0.8.12",
  "anyhow",
@@ -4690,7 +4690,7 @@ dependencies = [
 
 [[package]]
 name = "iggy-connectors"
-version = "0.2.1-edge.1"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -4725,7 +4725,7 @@ dependencies = [
 
 [[package]]
 name = "iggy-mcp"
-version = "0.2.1-edge.1"
+version = "0.2.0"
 dependencies = [
  "axum",
  "axum-server",
@@ -4747,7 +4747,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_binary_protocol"
-version = "0.8.1-edge.1"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "async-broadcast",
@@ -4768,7 +4768,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_common"
-version = "0.8.1-edge.1"
+version = "0.8.0"
 dependencies = [
  "aes-gcm",
  "ahash 0.8.12",
@@ -4780,15 +4780,24 @@ dependencies = [
  "chrono",
  "clap",
  "comfy-table",
+ "compio",
+ "compio-quic",
+ "compio-tls",
+ "compio-ws",
+ "crossbeam",
  "derive_more 2.0.1",
+ "err_trail",
  "fast-async-mutex",
  "figment",
+ "human-repr",
  "humantime",
+ "once_cell",
  "rcgen",
  "rustls",
  "serde",
  "serde_json",
  "serde_with",
+ "serial_test",
  "strum 0.27.2",
  "thiserror 2.0.17",
  "tokio",
@@ -4924,7 +4933,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_sdk"
-version = "0.1.1-edge.1"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -5134,8 +5143,10 @@ dependencies = [
  "rcgen",
  "reqwest",
  "rmcp",
+ "serde_json",
  "serial_test",
  "server",
+ "strum_macros 0.27.2",
  "tempfile",
  "test-case",
  "testcontainers-modules",
@@ -8326,7 +8337,7 @@ dependencies = [
 
 [[package]]
 name = "server"
-version = "0.6.1-edge.1"
+version = "0.6.0"
 dependencies = [
  "ahash 0.8.12",
  "anyhow",
@@ -8346,7 +8357,6 @@ dependencies = [
  "compio-quic",
  "compio-tls",
  "compio-ws",
- "crossbeam",
  "ctrlc",
  "cyper",
  "cyper-axum",
@@ -8368,7 +8378,6 @@ dependencies = [
  "mimalloc",
  "moka",
  "nix",
- "once_cell",
  "opentelemetry",
  "opentelemetry-appender-tracing",
  "opentelemetry-otlp",
@@ -8385,7 +8394,6 @@ dependencies = [
  "send_wrapper",
  "serde",
  "serde_with",
- "serial_test",
  "slab",
  "socket2 0.6.1",
  "static-toml",

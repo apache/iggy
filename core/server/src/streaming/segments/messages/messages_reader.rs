@@ -17,13 +17,13 @@
  */
 
 use crate::streaming::segments::{IggyIndexesMut, IggyMessagesBatchMut};
-use crate::streaming::utils::PooledBuffer;
 use bytes::BytesMut;
 use compio::buf::{IntoInner, IoBuf};
 use compio::fs::{File, OpenOptions};
 use compio::io::AsyncReadAtExt;
 use err_trail::ErrContext;
 use iggy_common::IggyError;
+use iggy_common::PooledBuffer;
 use std::rc::Rc;
 use std::{
     io::ErrorKind,

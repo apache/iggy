@@ -1,0 +1,76 @@
+{
+  "sinks": {
+    "stdout": {
+      "key": "stdout",
+      "enabled": true,
+      "version": 0,
+      "name": "Stdout sink",
+      "path": "../../target/debug/libiggy_connector_stdout_sink",
+      "transforms": {
+        "add_fields": {
+          "enabled": true,
+          "fields": [
+            {
+              "key": "message",
+              "value": {
+                "static": "hello"
+              }
+            }
+          ]
+        }
+      },
+      "streams": [
+        {
+          "stream": "test_stream",
+          "topics": ["test_topic"],
+          "schema": "json",
+          "batch_length": 100,
+          "poll_interval": "5ms",
+          "consumer_group": "stdout_sink_connector"
+        }
+      ],
+      "plugin_config_format": null,
+      "plugin_config": {
+        "print_payload": false
+      }
+    }
+  },
+  "sources": {
+    "random": {
+      "key": "random",
+      "enabled": true,
+      "version": 1,
+      "name": "Random source",
+      "path": "../../target/debug/libiggy_connector_random_source",
+      "transforms": {
+        "add_fields": {
+          "enabled": true,
+          "fields": [
+            {
+              "key": "test_field",
+              "value": {
+                "static": "hello!"
+              }
+            }
+          ]
+        }
+      },
+      "streams": [
+        {
+          "stream": "test_stream",
+          "topic": "test_topic",
+          "schema": "json",
+          "batch_length": 1000,
+          "linger_time": "5ms"
+        }
+      ],
+      "plugin_config_format": "json",
+      "plugin_config": {
+        "interval": "1000ms",
+        "max_count": 1000000,
+        "messages_range": [1, 5],
+        "payload_size": 200
+      }
+    }
+  }
+}

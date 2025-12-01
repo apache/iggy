@@ -16,20 +16,18 @@
  * under the License.
  */
 
-use crate::binary::sender::SenderKind;
 use crate::configs::websocket::WebSocketConfig;
 use crate::shard::IggyShard;
 use crate::shard::task_registry::ShutdownToken;
 use crate::shard::transmission::event::ShardEvent;
 use crate::websocket::connection_handler::{handle_connection, handle_error};
-use crate::websocket::websocket_sender::WebSocketSender;
 use compio::net::TcpListener;
 use compio_net::TcpOpts;
 use compio_ws::accept_async_with_config;
 use err_trail::ErrContext;
 use futures::FutureExt;
-use iggy_common::IggyError;
 use iggy_common::TransportProtocol;
+use iggy_common::{IggyError, SenderKind, WebSocketSender};
 use std::net::SocketAddr;
 use std::rc::Rc;
 use tracing::{debug, error, info};

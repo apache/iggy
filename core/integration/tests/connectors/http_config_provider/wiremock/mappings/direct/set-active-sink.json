@@ -1,0 +1,22 @@
+{
+  "request": {
+    "method": "PUT",
+    "urlPattern": "/sinks/([^/]+)/configs/active",
+    "headers": {
+      "Content-Type": {
+        "contains": "application/json"
+      }
+    },
+    "bodyPatterns": [
+      {
+        "matchesJsonPath": "$.version"
+      }
+    ]
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "application/json"
+    }
+  }
+}

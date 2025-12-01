@@ -55,8 +55,10 @@ rmcp = { version = "0.9.0", features = [
     "transport-streamable-http-client",
     "transport-streamable-http-client-reqwest",
 ] }
+serde_json = { workspace = true }
 serial_test = { workspace = true }
 server = { workspace = true }
+strum_macros = { workspace = true }
 tempfile = { workspace = true }
 test-case = { workspace = true }
 testcontainers-modules = { version = "0.13.0", features = ["postgres"] }

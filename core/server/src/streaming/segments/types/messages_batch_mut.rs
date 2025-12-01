@@ -19,9 +19,9 @@
 use super::message_view_mut::IggyMessageViewMutIterator;
 use crate::streaming::deduplication::message_deduplicator::MessageDeduplicator;
 use crate::streaming::segments::indexes::IggyIndexesMut;
-use crate::streaming::utils::PooledBuffer;
 use crate::streaming::utils::random_id;
 use bytes::{BufMut, BytesMut};
+use iggy_common::PooledBuffer;
 use iggy_common::{
     BytesSerializable, IGGY_MESSAGE_HEADER_SIZE, INDEX_SIZE, IggyByteSize, IggyError,
     IggyIndexView, IggyMessage, IggyMessageView, IggyMessageViewIterator, IggyTimestamp,

@@ -15,10 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod alloc;
 mod certificates;
 mod commands;
 mod configs;
 mod error;
+mod sender;
 mod traits;
 mod types;
 mod utils;
@@ -27,6 +29,8 @@ pub use error::client_error::ClientError;
 pub use error::iggy_error::{IggyError, IggyErrorDiscriminants};
 // Locking is feature gated, thus only mod level re-export.
 pub mod locking;
+pub use alloc::buffer::PooledBuffer;
+pub use alloc::memory_pool::{MEMORY_POOL, MemoryPool, MemoryPoolConfigOther, memory_pool};
 pub use certificates::generate_self_signed_certificate;
 pub use commands::consumer_groups::*;
 pub use commands::consumer_offsets::*;
@@ -40,6 +44,9 @@ pub use commands::system::*;
 pub use commands::topics::*;
 pub use commands::users::*;
 pub use configs::*;
+pub use sender::{
+    QuicSender, Sender, SenderKind, TcpSender, TcpTlsSender, WebSocketSender, WebSocketTlsSender,
+};
 pub use traits::bytes_serializable::BytesSerializable;
 pub use traits::partitioner::Partitioner;
 pub use traits::sizeable::Sizeable;
