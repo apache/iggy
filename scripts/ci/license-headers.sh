@@ -37,13 +37,6 @@ if [ $# -gt 0 ]; then
   esac
 fi
 
-# Check if docker is available
-if ! command -v docker &> /dev/null; then
-  echo "❌ docker command not found"
-  echo "💡 Install Docker to run license header checks"
-  exit 1
-fi
-
 # Get the repository root
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
@@ -53,10 +46,6 @@ if [ ! -f "ASF_LICENSE.txt" ]; then
   echo "❌ ASF_LICENSE.txt not found in repository root"
   exit 1
 fi
-
-# Pull the addlicense image
-echo "Pulling addlicense Docker image..."
-docker pull ghcr.io/google/addlicense:latest >/dev/null 2>&1
 
 # Common patterns to ignore (build artifacts, dependencies, IDE files)
 IGNORE_PATTERNS=(
@@ -78,11 +67,32 @@ IGNORE_PATTERNS=(
   ".vscode/**"
   "**/.gradle/**"
   ".gradle/**"
+  "**/.svelte-kit/**"
+  ".svelte-kit/**"
   "**/bin/**"
   "**/obj/**"
   "**/local_data*/**"
   "**/performance_results*/**"
 )
+
+# Determine how to run addlicense: prefer local binary, fall back to Docker
+USE_DOCKER=false
+ADDLICENSE_CMD=""
+
+if command -v addlicense &> /dev/null; then
+  ADDLICENSE_CMD="addlicense"
+  echo "Using local addlicense binary"
+elif command -v docker &> /dev/null; then
+  USE_DOCKER=true
+  echo "Local addlicense not found, using Docker fallback"
+  echo "Pulling addlicense Docker image..."
+  docker pull ghcr.io/google/addlicense:latest >/dev/null 2>&1
+else
+  echo "❌ Neither addlicense nor docker command found"
+  echo "💡 Install addlicense: go install github.com/google/addlicense@latest"
+  echo "   Or install Docker to use the containerized version"
+  exit 1
+fi
 
 # Build ignore flags for addlicense
 IGNORE_FLAGS=()
@@ -90,25 +100,29 @@ for pattern in "${IGNORE_PATTERNS[@]}"; do
   IGNORE_FLAGS+=("-ignore" "$pattern")
 done
 
+run_addlicense() {
+  local extra_args=("$@")
+
+  if [ "$USE_DOCKER" = true ]; then
+    docker run --rm -v "$REPO_ROOT:/src" -w /src \
+      ghcr.io/google/addlicense:latest \
+      -f ASF_LICENSE.txt "${IGNORE_FLAGS[@]}" "${extra_args[@]}"
+  else
+    "$ADDLICENSE_CMD" -f ASF_LICENSE.txt "${IGNORE_FLAGS[@]}" "${extra_args[@]}"
+  fi
+}
+
 if [ "$MODE" = "fix" ]; then
   echo "🔧 Adding license headers to files..."
-
-  # Run addlicense without -check to fix files
-  docker run --rm -v "$REPO_ROOT:/src" -w /src \
-    ghcr.io/google/addlicense:latest \
-    -f ASF_LICENSE.txt "${IGNORE_FLAGS[@]}" .
-
+  run_addlicense .
   echo "✅ License headers have been added to files"
 else
   echo "🔍 Checking license headers..."
 
-  # Run the check and capture output
   TEMP_FILE=$(mktemp)
   trap 'rm -f "$TEMP_FILE"' EXIT
 
-  if docker run --rm -v "$REPO_ROOT:/src" -w /src \
-    ghcr.io/google/addlicense:latest \
-    -check -f ASF_LICENSE.txt "${IGNORE_FLAGS[@]}" . > "$TEMP_FILE" 2>&1; then
+  if run_addlicense -check . > "$TEMP_FILE" 2>&1; then
     echo "✅ All files have proper license headers"
   else
     file_count=$(wc -l < "$TEMP_FILE")
@@ -118,7 +132,6 @@ else
     echo ""
     echo "💡 Run '$0 --fix' to add license headers automatically"
 
-    # Add to GitHub Actions summary if running in CI
     if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
       {
         echo "## ❌ License Headers Missing"

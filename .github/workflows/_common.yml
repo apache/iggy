@@ -109,6 +109,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+          cache: false
+
+      - name: Install addlicense
+        run: go install github.com/google/addlicense@4529cd558fa0bf07ab0f2650e36d089fb1c07c89
+
       - name: Check Apache license headers
         run: ./scripts/ci/license-headers.sh --check
 
