@@ -27,4 +27,9 @@
 
     <!-- Allow non-private fields in test code (e.g., @Inject, test base classes) -->
     <suppress checks="VisibilityModifier" files=".*[\\/]src[\\/]test[\\/].*"/>
+
+    <!-- Benchmark-specific suppressions -->
+    <suppress checks="VisibilityModifier" files=".*[\\/]benchmarks[\\/].*"/>
+    <suppress checks="IllegalThrows" files=".*[\\/]benchmarks[\\/].*"/>
+    <suppress checks="IllegalCatch" files=".*[\\/]benchmarks[\\/].*"/>
 </suppressions>
