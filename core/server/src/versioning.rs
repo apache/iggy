@@ -18,6 +18,7 @@
 
 use crate::VERSION;
 use iggy_common::IggyError;
+use std::borrow::Cow;
 use std::fmt::Display;
 use std::str::FromStr;
 
@@ -26,7 +27,7 @@ pub struct SemanticVersion {
     pub major: u32,
     pub minor: u32,
     pub patch: u32,
-    pub prerelease: Option<&'static str>,
+    pub prerelease: Option<Cow<'static, str>>,
 }
 
 /// Parses a string slice to u32 at compile time.
@@ -49,8 +50,7 @@ const fn const_parse_u32_range(bytes: &[u8], start: usize, end: usize) -> u32 {
     while i < end {
         let byte = bytes[i];
 
-        // Validate if the byte is digit
-        if byte < b'0' || byte > b'9' {
+        if !byte.is_ascii_digit() {
             panic!("Invalid digit in version number");
         }
 
@@ -95,8 +95,14 @@ const fn find_byte_pos_or_len(bytes: &[u8], target: u8) -> usize {
 const fn const_str_slice(s: &str, start: usize, end: usize) -> &str {
     let bytes = s.as_bytes();
 
+    if start > end {
+        panic!("start index must be less than or equal to end index");
+    }
+    if end > bytes.len() {
+        panic!("end index out of bounds");
+    }
+
     // SAFETY: Creating a slice within the bound of original byte slice.
-    // The caller should ensure that: start <= end <= bytes.len()
     let slice = unsafe { core::slice::from_raw_parts(bytes.as_ptr().add(start), end - start) };
 
     match core::str::from_utf8(slice) {
@@ -114,9 +120,7 @@ impl FromStr for SemanticVersion {
         // Split on '-' to separate prerelease identifier
         let mut parts = version_core.split('-');
         let version_numbers = parts.next().unwrap();
-        let prerelease = parts
-            .next()
-            .map(|s| Box::leak(s.to_string().into_boxed_str()) as &'static str);
+        let prerelease = parts.next().map(|s| Cow::Owned(s.to_string()));
 
         // Parse major.minor.patch
         let mut version = version_numbers.split('.');
@@ -175,7 +179,7 @@ impl SemanticVersion {
 
         // Extract prerelease if it present
         let prerelease = if dash_pos < core_end {
-            Some(const_str_slice(s, dash_pos + 1, core_end))
+            Some(Cow::Borrowed(const_str_slice(s, dash_pos + 1, core_end)))
         } else {
             None
         };
@@ -302,13 +306,13 @@ mod tests {
         assert_eq!(SEMVER.major, 1);
         assert_eq!(SEMVER.minor, 0);
         assert_eq!(SEMVER.patch, 0);
-        assert_eq!(SEMVER.prerelease, Some("beta"));
+        assert_eq!(SEMVER.prerelease, Some(Cow::Borrowed("beta")));
 
         const SEMVER_1: SemanticVersion = SemanticVersion::parse_const("2.1.5-rc.1");
         assert_eq!(SEMVER_1.major, 2);
         assert_eq!(SEMVER_1.minor, 1);
         assert_eq!(SEMVER_1.patch, 5);
-        assert_eq!(SEMVER_1.prerelease, Some("rc.1"));
+        assert_eq!(SEMVER_1.prerelease, Some(Cow::Borrowed("rc.1")));
 
         const SEMVER_2: SemanticVersion = SemanticVersion::parse_const("1.2.3+build.123");
         assert_eq!(SEMVER_2.major, 1);
@@ -320,7 +324,7 @@ mod tests {
         assert_eq!(SEMVER_3.major, 3);
         assert_eq!(SEMVER_3.minor, 2);
         assert_eq!(SEMVER_3.patch, 1);
-        assert_eq!(SEMVER_3.prerelease, Some("alpha.2"));
+        assert_eq!(SEMVER_3.prerelease, Some(Cow::Borrowed("alpha.2")));
     }
 
     #[test]
@@ -354,7 +358,7 @@ mod tests {
         assert_eq!(version.major, 0);
         assert_eq!(version.minor, 6);
         assert_eq!(version.patch, 0);
-        assert_eq!(version.prerelease, Some("rc1"));
+        assert_eq!(version.prerelease, Some(Cow::Borrowed("rc1")));
         assert_eq!(version.to_string(), "0.6.0-rc1");
     }
 
@@ -364,7 +368,7 @@ mod tests {
         assert_eq!(version.major, 2);
         assert_eq!(version.minor, 0);
         assert_eq!(version.patch, 0);
-        assert_eq!(version.prerelease, Some("alpha.1"));
+        assert_eq!(version.prerelease, Some(Cow::Borrowed("alpha.1")));
         assert_eq!(version.to_string(), "2.0.0-alpha.1");
     }
 
@@ -387,7 +391,7 @@ mod tests {
         assert_eq!(version.major, 1);
         assert_eq!(version.minor, 0);
         assert_eq!(version.patch, 0);
-        assert_eq!(version.prerelease, Some("beta"));
+        assert_eq!(version.prerelease, Some(Cow::Borrowed("beta")));
         assert_eq!(version.to_string(), "1.0.0-beta");
     }
 
