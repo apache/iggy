@@ -16,6 +16,7 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+use super::status::{ConnectorError, ConnectorStatus};
 use crate::configs::connectors::{ConfigFormat, SinkConfig};
 use dashmap::DashMap;
 use std::collections::HashMap;
@@ -61,6 +62,24 @@ impl SinkManager {
         }
         results
     }
+
+    pub async fn update_status(&self, key: &str, status: ConnectorStatus) {
+        if let Some(sink) = self.sinks.get(key) {
+            let mut sink = sink.lock().await;
+            sink.info.status = status;
+            if matches!(status, ConnectorStatus::Running | ConnectorStatus::Stopped) {
+                sink.info.last_error = None;
+            }
+        }
+    }
+
+    pub async fn set_error(&self, key: &str, error_message: &str) {
+        if let Some(sink) = self.sinks.get(key) {
+            let mut sink = sink.lock().await;
+            sink.info.status = ConnectorStatus::Error;
+            sink.info.last_error = Some(ConnectorError::new(error_message));
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -70,7 +89,8 @@ pub struct SinkInfo {
     pub name: String,
     pub path: String,
     pub enabled: bool,
-    pub running: bool,
+    pub status: ConnectorStatus,
+    pub last_error: Option<ConnectorError>,
     pub plugin_config_format: Option<ConfigFormat>,
 }
 
