@@ -24,7 +24,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 
 pub trait Sequencer {
-    type Sequence: Copy + Default + PartialOrd + std::ops::Add<Output = Self::Sequence>;
+    type Sequence;
     /// Get the current sequence number
     fn current_sequence(&self) -> Self::Sequence;
 
@@ -37,13 +37,13 @@ pub trait Sequencer {
 }
 
 pub struct LocalSequencer {
-    sequence: Cell<u64>,
+    op: Cell<u64>,
 }
 
 impl LocalSequencer {
-    pub fn new(initial_sequence: u64) -> Self {
+    pub fn new(initial_op: u64) -> Self {
         Self {
-            sequence: Cell::new(initial_sequence),
+            op: Cell::new(initial_op),
         }
     }
 }
@@ -52,18 +52,18 @@ impl Sequencer for LocalSequencer {
     type Sequence = u64;
 
     fn current_sequence(&self) -> Self::Sequence {
-        self.sequence.get()
+        self.op.get()
     }
 
     fn next_sequence(&self) -> Self::Sequence {
         let current = self.current_sequence();
         let next = current.checked_add(1).expect("sequence number overflow");
-        self.sequence.set(next);
+        self.set_sequence(next);
         next
     }
 
     fn set_sequence(&self, sequence: Self::Sequence) {
-        self.sequence.set(sequence);
+        self.op.set(sequence);
     }
 }
 
@@ -175,11 +175,11 @@ impl Pipeline {
         if let Some(tail) = self.prepare_queue.back() {
             let tail_header = tail.message.header();
             assert_eq!(
-                header.sequence,
-                tail_header.sequence + 1,
+                header.op,
+                tail_header.op + 1,
                 "sequence must be sequential: expected {}, got {}",
-                tail_header.sequence + 1,
-                header.sequence
+                tail_header.op + 1,
+                header.op
             );
             assert_eq!(
                 header.parent, tail_header.checksum,
@@ -217,8 +217,8 @@ impl Pipeline {
         sequence: u64,
         checksum: u128,
     ) -> Option<&mut PipelineEntry> {
-        let head_sequence = self.prepare_queue.front()?.message.header().sequence;
-        let tail_sequence = self.prepare_queue.back()?.message.header().sequence;
+        let head_sequence = self.prepare_queue.front()?.message.header().op;
+        let tail_sequence = self.prepare_queue.back()?.message.header().op;
 
         // Verify consecutive sequences invariant
         debug_assert_eq!(
@@ -234,7 +234,7 @@ impl Pipeline {
         let index = (sequence - head_sequence) as usize;
         let entry = self.prepare_queue.get_mut(index)?;
 
-        debug_assert_eq!(entry.message.header().sequence, sequence);
+        debug_assert_eq!(entry.message.header().op, sequence);
 
         if entry.message.header().checksum == checksum {
             Some(entry)
@@ -245,7 +245,7 @@ impl Pipeline {
 
     /// Find a prepare by sequence number only.
     pub fn prepare_by_sequence(&self, sequence: u64) -> Option<&PipelineEntry> {
-        let head_sequence = self.prepare_queue.front()?.message.header().sequence;
+        let head_sequence = self.prepare_queue.front()?.message.header().op;
 
         if sequence < head_sequence {
             return None;
@@ -275,16 +275,13 @@ impl Pipeline {
 
         // Verify prepare queue hash chain
         if let Some(head) = self.prepare_queue.front() {
-            let mut expected_sequence = head.message.header().sequence;
+            let mut expected_sequence = head.message.header().op;
             let mut expected_parent = head.message.header().parent;
 
             for entry in &self.prepare_queue {
                 let header = entry.message.header();
 
-                assert_eq!(
-                    header.sequence, expected_sequence,
-                    "sequences must be sequential"
-                );
+                assert_eq!(header.op, expected_sequence, "sequences must be sequential");
                 assert_eq!(header.parent, expected_parent, "must be hash-chained");
 
                 expected_parent = header.checksum;
@@ -386,7 +383,7 @@ impl Project<Message<PrepareHeader>> for Message<RequestHeader> {
                 request_checksum: prev.request_checksum,
                 request: prev.request,
                 commit: consensus.commit.get(),
-                sequence,
+                op: sequence,
                 timestamp: 0, // 0 for now. Implement correct way to get timestamp later
                 operation: prev.operation,
                 ..Default::default()
@@ -409,7 +406,7 @@ impl Project<Message<PrepareOkHeader>> for Message<PrepareHeader> {
                 epoch: 0, // TODO: consensus.epoch
                 // It's important to use the view of the replica, not the received prepare!
                 view: consensus.view.get(),
-                sequence: prev.sequence,
+                op: prev.op,
                 commit: consensus.commit.get(),
                 timestamp: prev.timestamp,
                 operation: prev.operation,
@@ -456,11 +453,11 @@ impl Consensus for VsrConsensus {
 
         // verify op is sequential
         assert_eq!(
-            header.sequence,
+            header.op,
             self.sequencer.current_sequence() + 1,
             "op must be sequential: expected {}, got {}",
             self.sequencer.current_sequence() + 1,
-            header.sequence
+            header.op
         );
 
         // verify hash chain
