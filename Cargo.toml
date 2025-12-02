@@ -196,7 +196,7 @@ tracing-subscriber = { version = "0.3.22", default-features = false, features = 
 trait-variant = "0.1.2"
 tungstenite = "0.28.0"
 twox-hash = { version = "2.1.2", features = ["xxhash32"] }
-uuid = { version = "1.18.1", features = [
+uuid = { version = "1.19.0", features = [
     "v4",
     "v7",
     "fast-rng",
