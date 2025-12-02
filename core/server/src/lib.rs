@@ -19,6 +19,8 @@
 #[cfg(not(feature = "disable-mimalloc"))]
 use mimalloc::MiMalloc;
 
+use crate::versioning::SemanticVersion;
+
 #[cfg(not(feature = "disable-mimalloc"))]
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
@@ -46,5 +48,6 @@ pub mod versioning;
 pub mod websocket;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const SEMANTIC_VERSION: SemanticVersion = SemanticVersion::current();
 pub const IGGY_ROOT_USERNAME_ENV: &str = "IGGY_ROOT_USERNAME";
 pub const IGGY_ROOT_PASSWORD_ENV: &str = "IGGY_ROOT_PASSWORD";
