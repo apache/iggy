@@ -211,30 +211,30 @@ impl Pipeline {
         self.prepare_queue.back()
     }
 
-    /// Find a prepare by sequence number and checksum.
-    pub fn prepare_by_sequence_and_checksum(
+    /// Find a prepare by op number and checksum.
+    pub fn prepare_by_op_and_checksum(
         &mut self,
-        sequence: u64,
+        op: u64,
         checksum: u128,
     ) -> Option<&mut PipelineEntry> {
-        let head_sequence = self.prepare_queue.front()?.message.header().op;
-        let tail_sequence = self.prepare_queue.back()?.message.header().op;
+        let head_op = self.prepare_queue.front()?.message.header().op;
+        let tail_op = self.prepare_queue.back()?.message.header().op;
 
-        // Verify consecutive sequences invariant
+        // Verify consecutive ops invariant
         debug_assert_eq!(
-            tail_sequence,
-            head_sequence + self.prepare_queue.len() as u64 - 1,
-            "prepare queue sequences not consecutive"
+            tail_op,
+            head_op + self.prepare_queue.len() as u64 - 1,
+            "prepare queue ops not consecutive"
         );
 
-        if sequence < head_sequence || sequence > tail_sequence {
+        if op < head_op || op > tail_op {
             return None;
         }
 
-        let index = (sequence - head_sequence) as usize;
+        let index = (op - head_op) as usize;
         let entry = self.prepare_queue.get_mut(index)?;
 
-        debug_assert_eq!(entry.message.header().op, sequence);
+        debug_assert_eq!(entry.message.header().op, op);
 
         if entry.message.header().checksum == checksum {
             Some(entry)
@@ -243,15 +243,15 @@ impl Pipeline {
         }
     }
 
-    /// Find a prepare by sequence number only.
-    pub fn prepare_by_sequence(&self, sequence: u64) -> Option<&PipelineEntry> {
-        let head_sequence = self.prepare_queue.front()?.message.header().op;
+    /// Find a prepare by op number only.
+    pub fn prepare_by_op(&self, op: u64) -> Option<&PipelineEntry> {
+        let head_op = self.prepare_queue.front()?.message.header().op;
 
-        if sequence < head_sequence {
+        if op < head_op {
             return None;
         }
 
-        let index = (sequence - head_sequence) as usize;
+        let index = (op - head_op) as usize;
         self.prepare_queue.get(index)
     }
 
@@ -275,22 +275,22 @@ impl Pipeline {
 
         // Verify prepare queue hash chain
         if let Some(head) = self.prepare_queue.front() {
-            let mut expected_sequence = head.message.header().op;
+            let mut expected_op = head.message.header().op;
             let mut expected_parent = head.message.header().parent;
 
             for entry in &self.prepare_queue {
                 let header = entry.message.header();
 
-                assert_eq!(header.op, expected_sequence, "sequences must be sequential");
+                assert_eq!(header.op, expected_op, "ops must be sequential");
                 assert_eq!(header.parent, expected_parent, "must be hash-chained");
 
                 expected_parent = header.checksum;
-                expected_sequence += 1;
+                expected_op += 1;
             }
         }
     }
 
-    /// Clear both queues.
+    /// Clear prepare queue.
     pub fn clear(&mut self) {
         self.prepare_queue.clear();
     }
@@ -368,7 +368,7 @@ impl Project<Message<PrepareHeader>> for Message<RequestHeader> {
     type Consensus = VsrConsensus;
 
     fn project(self, consensus: &Self::Consensus) -> Message<PrepareHeader> {
-        let sequence = consensus.sequencer.current_sequence() + 1;
+        let op = consensus.sequencer.current_sequence() + 1;
 
         self.replace_header(|prev| {
             PrepareHeader {
@@ -383,7 +383,7 @@ impl Project<Message<PrepareHeader>> for Message<RequestHeader> {
                 request_checksum: prev.request_checksum,
                 request: prev.request,
                 commit: consensus.commit.get(),
-                op: sequence,
+                op,
                 timestamp: 0, // 0 for now. Implement correct way to get timestamp later
                 operation: prev.operation,
                 ..Default::default()
