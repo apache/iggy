@@ -51,6 +51,13 @@ jobs:
         with:
           cache-targets: false # Only cache registry and git deps, not target dir (sccache handles that)
 
+      - name: Setup Node with cache for examples
+        if: inputs.component == 'examples-suite'
+        uses: ./.github/actions/utils/setup-node-with-cache
+        with:
+          node-version: "23"
+          cache-dependency-path: examples/node/package-lock.json
+
       - name: Setup Python
         if: inputs.component == 'examples-suite'
         uses: actions/setup-python@v5
