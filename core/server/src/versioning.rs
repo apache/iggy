@@ -99,8 +99,10 @@ const fn const_str_slice(s: &str, start: usize, end: usize) -> &str {
     // The caller should ensure that: start <= end <= bytes.len()
     let slice = unsafe { core::slice::from_raw_parts(bytes.as_ptr().add(start), end - start) };
 
-    // SAFETY: the original string is a valid UTF-8 (&str)
-    unsafe { core::str::from_utf8_unchecked(slice) }
+    match core::str::from_utf8(slice) {
+        Ok(substr) => substr,
+        Err(_) => panic!("Invalid UTF-8 in version string"),
+    }
 }
 
 impl FromStr for SemanticVersion {
