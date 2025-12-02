@@ -107,4 +107,3 @@ npm run test:sink-data-producer
 ```
 
 Demonstrates how to produce data that can be consumed by external sinks for integration with other systems.
-

@@ -40,7 +40,7 @@ set -euo pipefail
 readonly LOG_FILE="iggy-server.log"
 readonly PID_FILE="iggy-server.pid"
 readonly TIMEOUT=300
-readonly ROOT_WORKDIR="$(pwd)"
+ROOT_WORKDIR="$(pwd)"
 #set debug env
 export DEBUG=iggy:examples
 # Get target architecture from argument or use default
