@@ -45,7 +45,8 @@ test_example() {
     local pid
 
     # Start the command in background
-    $command > /tmp/test_output_$$ 2>&1 &
+    # $command > /tmp/test_output_$$ 2>&1 &
+    $command > example_output.log 2>&1 &
     pid=$!
 
     # Wait for the specified timeout
@@ -53,8 +54,8 @@ test_example() {
     while [ $count -lt "$timeout" ]; do
         if ! kill -0 $pid 2>/dev/null; then
             # Process finished
-            output=$(cat /tmp/test_output_$$)
-            rm -f /tmp/test_output_$$
+            output=$(cat example_output.log)
+            rm -f example_output.log
 
             if wait $pid; then
                 echo -e "${GREEN}✅ $name passed${NC}"
@@ -78,7 +79,7 @@ test_example() {
     # Timeout reached, kill the process
     kill $pid 2>/dev/null
     wait $pid 2>/dev/null
-    rm -f /tmp/test_output_$$
+    rm -f example_output.log
 
     echo -e "${YELLOW}⏰ $name timed out after ${timeout}s (this is expected for long-running examples)${NC}"
     return 0

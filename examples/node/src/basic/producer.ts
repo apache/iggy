@@ -20,7 +20,7 @@
 import { Client, Partitioning } from 'apache-iggy';
 import crypto from 'crypto';
 import debug from 'debug';
-import { PARTITION_COUNT, BATCHES_LIMIT, MESSAGES_PER_BATCH } from '../utils';
+import { PARTITION_COUNT, BATCHES_LIMIT, MESSAGES_PER_BATCH, initSystem } from '../utils';
 
 const log = debug('iggy:examples:basic-producer');
 
@@ -37,31 +37,7 @@ function parseArgs() {
 
   return { connectionString };
 }
-async function initSystem(client: Client) {
-  log('Creating stream with random name...');
-  console.table(await client.stream.list());
-  const stream = await client.stream.create({
-    name: `sample-stream-${crypto.randomBytes(8).toString('hex')}`,
-  });
 
-  log('Stream was created successfully. Stream ID: %s', stream?.id);
-
-  log('Creating topic in stream ID %s...', stream.id);
-
-  const topic = await client.topic.create({
-    streamId: stream.id,
-    name: `sample-topic-${crypto.randomBytes(4).toString('hex')}`,
-    partitionCount: PARTITION_COUNT,
-    compressionAlgorithm: 1, // None
-    replicationFactor: 1
-    });
-
-  log('Topic was created successfully.', 'Topic ID: %s', topic?.id);
-  return {
-    stream,
-    topic
-  }
-}
 async function produceMessages(client: Client, stream: Awaited<ReturnType<typeof initSystem>>[ 'stream' ], topic: Awaited<ReturnType<typeof initSystem>>[ 'topic' ]) {
   const interval = 500; // 500 milliseconds
   log(

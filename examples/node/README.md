@@ -54,3 +54,57 @@ npm run test:basic:consumer
 ```
 
 Demonstrates fundamental client connection, authentication, batch message sending, and polling with support for TCP transport.
+
+### Message Envelope
+
+Working with message envelopes:
+
+```bash
+npm run test:message-envelope:producer
+npm run test:message-envelope:consumer
+```
+
+Demonstrates how to create and handle message envelopes with custom metadata and headers.
+
+### Message Headers
+
+Using message headers:
+
+```bash
+npm run test:message-headers:producer
+npm run test:message-headers:consumer
+```
+
+Shows how to attach and retrieve custom headers with messages for additional context and metadata.
+
+### Multi-Tenant
+
+Multi-tenant application patterns:
+
+```bash
+npm run test:multi-tenant:producer
+npm run test:multi-tenant:consumer
+```
+
+Demonstrates how to implement multi-tenant patterns using separate streams and consumer groups.
+
+### Stream Builder
+
+Building streams with advanced configuration:
+
+```bash
+npm run test:stream-builder
+```
+
+Shows how to use the stream builder API to create and configure streams with custom settings.
+
+### Sink Data Producer
+
+Sending data to external sinks:
+
+```bash
+npm run test:sink-data-producer
+```
+
+Demonstrates how to produce data that can be consumed by external sinks for integration with other systems.
+

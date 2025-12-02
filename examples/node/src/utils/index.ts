@@ -21,7 +21,7 @@ import crypto from 'crypto';
 import { Client } from 'apache-iggy';
 import debug from 'debug';
 
-export const log = debug('iggy:getting-started:consumer');
+export const log = debug('iggy:examples');
 
 export const PARTITION_COUNT = 5;
 export const STREAM_ID = 0;

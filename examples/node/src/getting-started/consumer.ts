@@ -96,8 +96,7 @@ function handleMessage(message: any): void {
   // The payload can be of any type as it is a raw byte array. In this case it's a simple string.
   const payload = message.payload.toString('utf8');
   log(
-    'Handling message at offset: %d, payload: %s...',
-    message.offset,
+    `Handling message at offset: ${message.headers.offset}, payload: %s...`,
     payload
   );
 }

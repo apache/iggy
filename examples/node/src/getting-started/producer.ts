@@ -19,8 +19,7 @@
 
 import { Client, Partitioning } from 'apache-iggy';
 import debug from 'debug';
-import { BATCHES_LIMIT, cleanup, initSystem, MESSAGES_PER_BATCH, parseArgs, sleep } from '../utils';
-const log = debug('iggy:examples:getting-started:producer');
+import { BATCHES_LIMIT, cleanup, initSystem, log, MESSAGES_PER_BATCH, parseArgs, sleep } from '../utils';
 
 async function produceMessages(client: Client, stream: Awaited<ReturnType<typeof initSystem>>[ 'stream' ], topic: Awaited<ReturnType<typeof initSystem>>[ 'topic' ]) {
   const interval = 500; // 500 milliseconds

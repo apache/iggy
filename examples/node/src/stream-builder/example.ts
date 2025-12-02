@@ -21,10 +21,9 @@ import { Client, Partitioning } from 'apache-iggy';
 import { log, sleep } from '../utils';
 import crypto from 'crypto';
 
-const log_info = (message: string) => log(message);
 
 async function buildClientAndStream(connectionString: string) {
-  log_info('Building Iggy client and connecting...');
+  log('Building Iggy client and connecting...');
 
   // Parse connection string
   const url = new URL(connectionString.replace('iggy+tcp://', 'http://'));
@@ -49,7 +48,7 @@ async function buildClientAndStream(connectionString: string) {
     credentials: { username, password },
   });
 
-  log_info('Creating stream and topic...');
+  log('Creating stream and topic...');
   const streamName = `stream-${crypto.randomBytes(4).toString('hex')}`;
   const topicName = `topic-${crypto.randomBytes(4).toString('hex')}`;
 
@@ -65,16 +64,16 @@ async function buildClientAndStream(connectionString: string) {
     replicationFactor: 1,
   });
 
-  log_info(`Stream created: ${stream.id}`);
-  log_info(`Topic created: ${topic.id}`);
+  log(`Stream created: ${stream.id}`);
+  log(`Topic created: ${topic.id}`);
 
   return { client, stream, topic };
 }
 
 async function produceAndConsume(client: Client, stream: any, topic: any) {
-  log_info('Starting producer and consumer...');
+  log('Starting producer and consumer...');
 
-  log_info('Sending 3 test messages...');
+  log('Sending 3 test messages...');
   const messages = [
     { payload: 'Hello World' },
     { payload: 'Hola Iggy' },
@@ -88,10 +87,10 @@ async function produceAndConsume(client: Client, stream: any, topic: any) {
     partition: Partitioning.PartitionId(topic.partitions[0].id),
   });
 
-  log_info('Messages sent, waiting for consumption...');
+  log('Messages sent, waiting for consumption...');
   await sleep(500);
 
-  log_info('Polling messages...');
+  log('Polling messages...');
   const polledMessages = await client.message.poll({
     streamId: stream.id,
     topicId: topic.id,
@@ -103,32 +102,32 @@ async function produceAndConsume(client: Client, stream: any, topic: any) {
   });
 
   if (polledMessages && polledMessages.messages.length > 0) {
-    log_info(`Consumed ${polledMessages.messages.length} messages:`);
+    log(`Consumed ${polledMessages.messages.length} messages:`);
     for (const message of polledMessages.messages) {
       const payload = new TextDecoder().decode(new Uint8Array(Object.values(message.payload)));
-      log_info(`  - ${payload}`);
+      log(`  - ${payload}`);
     }
   }
 }
 
 async function cleanup(client: Client, stream: any, topic: any) {
-  log_info('Cleaning up...');
+  log('Cleaning up...');
   try {
     await client.topic.delete({
       streamId: stream.id,
       topicId: topic.id,
       partitionsCount: 1,
     });
-    log_info('Topic deleted');
+    log('Topic deleted');
   } catch (error) {
-    log_info(`Error deleting topic: ${error}`);
+    log(`Error deleting topic: ${error}`);
   }
 
   try {
     await client.stream.delete({ streamId: stream.id });
-    log_info('Stream deleted');
+    log('Stream deleted');
   } catch (error) {
-    log_info(`Error deleting stream: ${error}`);
+    log(`Error deleting stream: ${error}`);
   }
 }
 
@@ -136,7 +135,7 @@ async function main() {
   const connectionString = process.argv[2] || 'iggy+tcp://iggy:iggy@127.0.0.1:8090';
 
   try {
-    log_info('Stream Builder Example');
+    log('Stream Builder Example');
     const { client, stream, topic } = await buildClientAndStream(connectionString);
 
     await produceAndConsume(client, stream, topic);
@@ -144,9 +143,9 @@ async function main() {
     await cleanup(client, stream, topic);
 
     await client.destroy();
-    log_info('Disconnected from server');
+    log('Disconnected from server');
   } catch (error) {
-    log_info(`Error: ${error}`);
+    log(`Error: ${error}`);
     process.exitCode = 1;
   }
 }

@@ -47,7 +47,6 @@ const ORDER_CONFIRMED_TYPE = 'OrderConfirmed';
 const ORDER_REJECTED_TYPE = 'OrderRejected';
 
 function parseArgs() {
-  console.log = (...args) => process.stdout.write(args.join(' ') + '\n');
   const args = process.argv.slice(2);
   const connectionString = args[0] || 'iggy+tcp://iggy:iggy@127.0.0.1:8090';
 
