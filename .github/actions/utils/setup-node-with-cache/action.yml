@@ -33,7 +33,10 @@ inputs:
     description: "Path to lock file for npm caching"
     required: false
     default: "package-lock.json"
-
+  workspace:
+    description: "Workspace directory"
+    required: false
+    default: "."
 runs:
   using: "composite"
   steps:
@@ -52,6 +55,12 @@ runs:
         key: npm-${{ runner.os }}-${{ hashFiles(inputs.cache-dependency-path) }}
         restore-keys: |
           npm-${{ runner.os }}-
+
+    - name: Change to workspace directory
+      if: inputs.workspace != '.'
+      run: |
+        cd ${{ inputs.workspace }}
+      shell: bash
 
     - name: Install dependencies
       if: inputs.enabled == 'true'

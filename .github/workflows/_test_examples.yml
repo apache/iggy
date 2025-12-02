@@ -57,6 +57,7 @@ jobs:
         with:
           node-version: "23"
           cache-dependency-path: examples/node/package-lock.json
+          workspace: examples/node
 
       - name: Setup Python
         if: inputs.component == 'examples-suite'
