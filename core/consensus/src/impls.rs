@@ -24,41 +24,46 @@ use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 
 pub trait Sequencer {
-    /// Get the current op number
-    fn current_op(&self) -> u64;
+    type Sequence: Copy + Default + PartialOrd + std::ops::Add<Output = Self::Sequence>;
+    /// Get the current sequence number
+    fn current_sequence(&self) -> Self::Sequence;
 
-    /// Allocate the next op number.
+    /// Allocate the next sequence number.
     /// TODO Should this return a Future<Output = u64>? for async case?
-    fn next_op(&self) -> u64;
+    fn next_sequence(&self) -> Self::Sequence;
 
-    /// Update the current op number.
-    fn set_op(&self, op: u64);
+    /// Update the current sequence number.
+    fn set_sequence(&self, sequence: Self::Sequence);
 }
 
 pub struct LocalSequencer {
-    op: Cell<u64>,
+    sequence: Cell<u64>,
 }
 
 impl LocalSequencer {
-    pub fn new(initial_op: u64) -> Self {
+    pub fn new(initial_sequence: u64) -> Self {
         Self {
-            op: Cell::new(initial_op),
+            sequence: Cell::new(initial_sequence),
         }
     }
 }
 
 impl Sequencer for LocalSequencer {
-    fn current_op(&self) -> u64 {
-        self.op.get()
+    type Sequence = u64;
+
+    fn current_sequence(&self) -> Self::Sequence {
+        self.sequence.get()
     }
 
-    fn next_op(&self) -> u64 {
-        self.op.set(self.op.get() + 1);
-        self.op.get()
+    fn next_sequence(&self) -> Self::Sequence {
+        let current = self.current_sequence();
+        let next = current.checked_add(1).expect("sequence number overflow");
+        self.sequence.set(next);
+        next
     }
 
-    fn set_op(&self, op: u64) {
-        self.op.set(op);
+    fn set_sequence(&self, sequence: Self::Sequence) {
+        self.sequence.set(sequence);
     }
 }
 
@@ -66,8 +71,6 @@ impl Sequencer for LocalSequencer {
 /// TODO understand how to configure these numbers.
 /// Maximum number of prepares that can be in-flight in the pipeline.
 pub const PIPELINE_PREPARE_QUEUE_MAX: usize = 8;
-/// Maximum number of requests waiting to be prepared.
-pub const PIPELINE_REQUEST_QUEUE_MAX: usize = 8;
 
 /// Maximum number of replicas in a cluster.
 pub const REPLICAS_MAX: usize = 32;
@@ -126,8 +129,6 @@ impl RequestEntry {
 pub struct Pipeline {
     /// Messages being prepared (uncommitted and being replicated).
     prepare_queue: VecDeque<PipelineEntry>,
-    /// Messages accepted from clients but not yet preparing.
-    request_queue: VecDeque<RequestEntry>,
 }
 
 impl Default for Pipeline {
@@ -140,7 +141,6 @@ impl Pipeline {
     pub fn new() -> Self {
         Self {
             prepare_queue: VecDeque::with_capacity(PIPELINE_PREPARE_QUEUE_MAX),
-            request_queue: VecDeque::with_capacity(PIPELINE_REQUEST_QUEUE_MAX),
         }
     }
 
@@ -148,25 +148,17 @@ impl Pipeline {
         self.prepare_queue.len()
     }
 
-    pub fn request_count(&self) -> usize {
-        self.request_queue.len()
-    }
-
     pub fn prepare_queue_full(&self) -> bool {
         self.prepare_queue.len() >= PIPELINE_PREPARE_QUEUE_MAX
     }
 
-    pub fn request_queue_full(&self) -> bool {
-        self.request_queue.len() >= PIPELINE_REQUEST_QUEUE_MAX
-    }
-
-    /// Returns true if both queues are full.
+    /// Returns true if prepare queue is full.
     pub fn is_full(&self) -> bool {
-        self.prepare_queue_full() && self.request_queue_full()
+        self.prepare_queue_full()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.prepare_queue.is_empty() && self.request_queue.is_empty()
+        self.prepare_queue.is_empty()
     }
 
     /// Push a new prepare to the pipeline.
@@ -183,11 +175,11 @@ impl Pipeline {
         if let Some(tail) = self.prepare_queue.back() {
             let tail_header = tail.message.header();
             assert_eq!(
-                header.op,
-                tail_header.op + 1,
-                "op must be sequential: expected {}, got {}",
-                tail_header.op + 1,
-                header.op
+                header.sequence,
+                tail_header.sequence + 1,
+                "sequence must be sequential: expected {}, got {}",
+                tail_header.sequence + 1,
+                header.sequence
             );
             assert_eq!(
                 header.parent, tail_header.checksum,
@@ -201,8 +193,6 @@ impl Pipeline {
 
     /// Pop the oldest prepare (after it's been committed).
     ///
-    /// Note: After popping, if request_queue is not empty, the caller should
-    /// call `pop_request` and prepare it to maintain invariants.
     pub fn pop_prepare(&mut self) -> Option<PipelineEntry> {
         self.prepare_queue.pop_front()
     }
@@ -221,30 +211,30 @@ impl Pipeline {
         self.prepare_queue.back()
     }
 
-    /// Find a prepare by op number and checksum.
-    pub fn prepare_by_op_and_checksum(
+    /// Find a prepare by sequence number and checksum.
+    pub fn prepare_by_sequence_and_checksum(
         &mut self,
-        op: u64,
+        sequence: u64,
         checksum: u128,
     ) -> Option<&mut PipelineEntry> {
-        let head_op = self.prepare_queue.front()?.message.header().op;
-        let tail_op = self.prepare_queue.back()?.message.header().op;
+        let head_sequence = self.prepare_queue.front()?.message.header().sequence;
+        let tail_sequence = self.prepare_queue.back()?.message.header().sequence;
 
-        // Verify consecutive ops invariant
+        // Verify consecutive sequences invariant
         debug_assert_eq!(
-            tail_op,
-            head_op + self.prepare_queue.len() as u64 - 1,
-            "prepare queue ops not consecutive"
+            tail_sequence,
+            head_sequence + self.prepare_queue.len() as u64 - 1,
+            "prepare queue sequences not consecutive"
         );
 
-        if op < head_op || op > tail_op {
+        if sequence < head_sequence || sequence > tail_sequence {
             return None;
         }
 
-        let index = (op - head_op) as usize;
+        let index = (sequence - head_sequence) as usize;
         let entry = self.prepare_queue.get_mut(index)?;
 
-        debug_assert_eq!(entry.message.header().op, op);
+        debug_assert_eq!(entry.message.header().sequence, sequence);
 
         if entry.message.header().checksum == checksum {
             Some(entry)
@@ -253,57 +243,19 @@ impl Pipeline {
         }
     }
 
-    /// Find a prepare by op number only.
-    pub fn prepare_by_op(&self, op: u64) -> Option<&PipelineEntry> {
-        let head_op = self.prepare_queue.front()?.message.header().op;
+    /// Find a prepare by sequence number only.
+    pub fn prepare_by_sequence(&self, sequence: u64) -> Option<&PipelineEntry> {
+        let head_sequence = self.prepare_queue.front()?.message.header().sequence;
 
-        if op < head_op {
+        if sequence < head_sequence {
             return None;
         }
 
-        let index = (op - head_op) as usize;
+        let index = (sequence - head_sequence) as usize;
         self.prepare_queue.get(index)
     }
 
-    /// Push a new request to the pipeline.
-    ///
-    /// # Panics
-    /// - If request queue is full.
-    /// - If there's already a request from this client in the request queue.
-    pub fn push_request(&mut self, message: Message<RequestHeader>) {
-        assert!(!self.request_queue_full(), "request queue is full");
-
-        let client = message.header().client;
-
-        // A client may have at most one request in the request queue
-        debug_assert!(
-            !self
-                .request_queue
-                .iter()
-                .any(|r| r.message.header().client == client),
-            "client {} already has a request in the queue",
-            client
-        );
-
-        self.request_queue.push_back(RequestEntry::new(message));
-    }
-
-    /// Pop the oldest request
-    pub fn pop_request(&mut self) -> Option<RequestEntry> {
-        self.request_queue.pop_front()
-    }
-
-    /// Peek at the oldest request.
-    pub fn request_head(&self) -> Option<&RequestEntry> {
-        self.request_queue.front()
-    }
-
-    /// Iterate over all requests.
-    pub fn requests(&self) -> impl Iterator<Item = &RequestEntry> {
-        self.request_queue.iter()
-    }
-
-    /// Search both queues for a message from the given client.
+    /// Search prepare queue for a message from the given client.
     ///
     /// If there are multiple messages (possible in prepare_queue after view change),
     /// returns the latest one.
@@ -311,17 +263,6 @@ impl Pipeline {
         self.prepare_queue
             .iter()
             .any(|p| p.message.header().client == client)
-            || self
-                .request_queue
-                .iter()
-                .any(|r| r.message.header().client == client)
-    }
-
-    /// Check if there's a request from the given client in the request queue.
-    pub fn has_request_from_client(&self, client: u128) -> bool {
-        self.request_queue
-            .iter()
-            .any(|r| r.message.header().client == client)
     }
 
     /// Verify pipeline invariants.
@@ -331,29 +272,23 @@ impl Pipeline {
     pub fn verify(&self) {
         // Check capacity limits
         assert!(self.prepare_queue.len() <= PIPELINE_PREPARE_QUEUE_MAX);
-        assert!(self.request_queue.len() <= PIPELINE_REQUEST_QUEUE_MAX);
-
-        // If request_queue is not empty, prepare_queue should be full or almost full
-        if !self.request_queue.is_empty() {
-            assert!(
-                self.prepare_queue.len() >= PIPELINE_PREPARE_QUEUE_MAX - 1,
-                "request_queue not empty but prepare_queue not nearly full"
-            );
-        }
 
         // Verify prepare queue hash chain
         if let Some(head) = self.prepare_queue.front() {
-            let mut expected_op = head.message.header().op;
+            let mut expected_sequence = head.message.header().sequence;
             let mut expected_parent = head.message.header().parent;
 
             for entry in &self.prepare_queue {
                 let header = entry.message.header();
 
-                assert_eq!(header.op, expected_op, "ops must be sequential");
+                assert_eq!(
+                    header.sequence, expected_sequence,
+                    "sequences must be sequential"
+                );
                 assert_eq!(header.parent, expected_parent, "must be hash-chained");
 
                 expected_parent = header.checksum;
-                expected_op += 1;
+                expected_sequence += 1;
             }
         }
     }
@@ -361,7 +296,6 @@ impl Pipeline {
     /// Clear both queues.
     pub fn clear(&mut self) {
         self.prepare_queue.clear();
-        self.request_queue.clear();
     }
 }
 
@@ -437,7 +371,7 @@ impl Project<Message<PrepareHeader>> for Message<RequestHeader> {
     type Consensus = VsrConsensus;
 
     fn project(self, consensus: &Self::Consensus) -> Message<PrepareHeader> {
-        let op = consensus.sequencer.current_op() + 1;
+        let sequence = consensus.sequencer.current_sequence() + 1;
 
         self.replace_header(|prev| {
             PrepareHeader {
@@ -452,7 +386,7 @@ impl Project<Message<PrepareHeader>> for Message<RequestHeader> {
                 request_checksum: prev.request_checksum,
                 request: prev.request,
                 commit: consensus.commit.get(),
-                op,
+                sequence,
                 timestamp: 0, // 0 for now. Implement correct way to get timestamp later
                 operation: prev.operation,
                 ..Default::default()
@@ -475,7 +409,7 @@ impl Project<Message<PrepareOkHeader>> for Message<PrepareHeader> {
                 epoch: 0, // TODO: consensus.epoch
                 // It's important to use the view of the replica, not the received prepare!
                 view: consensus.view.get(),
-                op: prev.op,
+                sequence: prev.sequence,
                 commit: consensus.commit.get(),
                 timestamp: prev.timestamp,
                 operation: prev.operation,
@@ -522,11 +456,11 @@ impl Consensus for VsrConsensus {
 
         // verify op is sequential
         assert_eq!(
-            header.op,
-            self.sequencer.current_op() + 1,
+            header.sequence,
+            self.sequencer.current_sequence() + 1,
             "op must be sequential: expected {}, got {}",
-            self.sequencer.current_op() + 1,
-            header.op
+            self.sequencer.current_sequence() + 1,
+            header.sequence
         );
 
         // verify hash chain

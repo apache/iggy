@@ -376,7 +376,7 @@ mod tests {
             header.view = 1;
             header.command = header::Command2::Prepare;
             header.replica = 1;
-            header.op = 100;
+            header.sequence = 100;
             header.commit = 99;
             header.timestamp = 1234567890;
             header.operation = header::Operation::CreateStream;
@@ -422,7 +422,7 @@ mod tests {
             header.view = 1;
             header.command = header::Command2::Reply;
             header.replica = 3;
-            header.op = 100;
+            header.sequence = 100;
             header.commit = 99;
             header.operation = header::Operation::CreateStream;
 
@@ -461,7 +461,7 @@ mod tests {
         let prepare_again: Message<header::PrepareHeader> =
             generic_message.try_into_typed().unwrap();
 
-        assert_eq!(prepare_again.header().op, 100);
+        assert_eq!(prepare_again.header().sequence, 100);
         assert_eq!(prepare_again.header().view, 1);
         assert_eq!(prepare_again.header().cluster, 12345);
 
