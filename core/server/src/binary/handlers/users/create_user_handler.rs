@@ -17,9 +17,9 @@
  */
 
 use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
+use crate::binary::handlers::users::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
-use crate::binary::{handlers::users::COMPONENT, sender::SenderKind};
 use crate::shard::IggyShard;
 use crate::shard::transmission::event::ShardEvent;
 use crate::shard::transmission::frame::ShardResponse;
@@ -33,7 +33,7 @@ use crate::streaming::utils::crypto;
 use anyhow::Result;
 use err_trail::ErrContext;
 use iggy_common::create_user::CreateUser;
-use iggy_common::{Identifier, IggyError};
+use iggy_common::{Identifier, IggyError, SenderKind};
 use std::rc::Rc;
 use tracing::debug;
 use tracing::instrument;

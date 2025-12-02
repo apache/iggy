@@ -55,6 +55,8 @@ pub enum RuntimeError {
     CannotConvertConfiguration,
     #[error("IO operation failed with error: {0:?}")]
     IoError(#[from] std::io::Error),
+    #[error("HTTP request failed: {0}")]
+    HttpRequestFailed(String),
 }
 
 impl RuntimeError {
@@ -66,6 +68,7 @@ impl RuntimeError {
             RuntimeError::SourceConfigNotFound(_, _) => "source_config_not_found",
             RuntimeError::MissingIggyCredentials => "invalid_configuration",
             RuntimeError::InvalidConfiguration(_) => "invalid_configuration",
+            RuntimeError::HttpRequestFailed(_) => "http_request_failed",
             _ => "error",
         }
     }

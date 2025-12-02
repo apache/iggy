@@ -16,8 +16,8 @@
  * under the License.
  */
 
+use crate::binary::command;
 use crate::binary::command::ServerCommandHandler;
-use crate::binary::{command, sender::SenderKind};
 use crate::server_error::ConnectionError;
 use crate::shard::IggyShard;
 use crate::streaming::session::Session;
@@ -25,7 +25,7 @@ use crate::websocket::connection_handler::command::ServerCommand;
 use async_channel::Receiver;
 use bytes::BytesMut;
 use futures::FutureExt;
-use iggy_common::IggyError;
+use iggy_common::{IggyError, SenderKind};
 use std::io::ErrorKind;
 use std::rc::Rc;
 use tracing::{debug, error, info, warn};

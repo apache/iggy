@@ -1,4 +1,5 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
  * regarding copyright ownership.  The ASF licenses this file
@@ -22,9 +23,9 @@ use derive_more::Display;
 use futures::executor::block_on;
 use iggy::prelude::UserStatus::Active;
 use iggy::prelude::*;
-use iggy_common::TransportProtocol;
+use iggy_common::{ConfigProvider, TransportProtocol};
 use rand::Rng;
-use server::configs::config_provider::{ConfigProvider, FileConfigProvider};
+use server::configs::server::ServerConfig;
 use std::collections::HashMap;
 use std::fs;
 use std::fs::{File, OpenOptions};
@@ -338,7 +339,7 @@ impl TestServer {
 
     fn wait_until_server_has_bound(&mut self) {
         let config_path = format!("{}/runtime/current_config.toml", self.local_data_path);
-        let file_config_provider = FileConfigProvider::new(config_path.clone());
+        let file_config_provider = ServerConfig::config_provider(&config_path);
 
         let max_attempts = (MAX_PORT_WAIT_DURATION_S * 1000) / SLEEP_INTERVAL_MS;
         self.server_addrs.clear();
@@ -356,7 +357,8 @@ impl TestServer {
                     sleep(Duration::from_millis(SLEEP_INTERVAL_MS));
                     continue;
                 }
-                match file_config_provider.load_config().await {
+                let config: Result<ServerConfig, _> = file_config_provider.load_config().await;
+                match config {
                     Ok(config) => {
                         // Verify config contains fresh addresses, not stale defaults
                         // Default ports: TCP=8090, HTTP=3000, QUIC=8080, WebSocket=8092

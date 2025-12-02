@@ -17,17 +17,17 @@
  */
 
 use super::sharding::ShardingConfig;
-use super::system::MemoryPoolConfig;
 use super::tcp::TcpSocketConfig;
-use crate::configs::cluster::{ClusterConfig, ClusterNodeConfig, NodeConfig};
+use crate::configs::cluster::CurrentNodeConfig;
+use crate::configs::cluster::{ClusterConfig, NodeConfig, OtherNodeConfig, TransportPorts};
 use crate::configs::http::{
     HttpConfig, HttpCorsConfig, HttpJwtConfig, HttpMetricsConfig, HttpTlsConfig,
 };
 use crate::configs::quic::{QuicCertificateConfig, QuicConfig, QuicSocketConfig};
 use crate::configs::server::{
-    DataMaintenanceConfig, HeartbeatConfig, MessageSaverConfig, MessagesMaintenanceConfig,
-    PersonalAccessTokenCleanerConfig, PersonalAccessTokenConfig, ServerConfig, TelemetryConfig,
-    TelemetryLogsConfig, TelemetryTracesConfig,
+    DataMaintenanceConfig, HeartbeatConfig, MemoryPoolConfig, MessageSaverConfig,
+    MessagesMaintenanceConfig, PersonalAccessTokenCleanerConfig, PersonalAccessTokenConfig,
+    ServerConfig, TelemetryConfig, TelemetryLogsConfig, TelemetryTracesConfig,
 };
 use crate::configs::system::{
     BackupConfig, CompatibilityConfig, CompressionConfig, EncryptionConfig, LoggingConfig,
@@ -503,7 +503,7 @@ impl Default for RecoveryConfig {
 
 impl Default for MemoryPoolConfig {
     fn default() -> MemoryPoolConfig {
-        MemoryPoolConfig {
+        Self {
             enabled: SERVER_CONFIG.system.memory_pool.enabled,
             size: SERVER_CONFIG.system.memory_pool.size.parse().unwrap(),
             bucket_capacity: SERVER_CONFIG.system.memory_pool.bucket_capacity as u32,
@@ -544,22 +544,8 @@ impl Default for ClusterConfig {
     fn default() -> ClusterConfig {
         ClusterConfig {
             enabled: SERVER_CONFIG.cluster.enabled,
-            id: SERVER_CONFIG.cluster.id as u32,
             name: SERVER_CONFIG.cluster.name.parse().unwrap(),
-            transport: SERVER_CONFIG.cluster.transport.parse().unwrap(),
             node: NodeConfig::default(),
-            nodes: vec![
-                ClusterNodeConfig {
-                    id: SERVER_CONFIG.cluster.nodes[0].id as u32,
-                    name: SERVER_CONFIG.cluster.nodes[0].name.parse().unwrap(),
-                    address: SERVER_CONFIG.cluster.nodes[0].address.parse().unwrap(),
-                },
-                ClusterNodeConfig {
-                    id: SERVER_CONFIG.cluster.nodes[1].id as u32,
-                    name: SERVER_CONFIG.cluster.nodes[1].name.parse().unwrap(),
-                    address: SERVER_CONFIG.cluster.nodes[1].address.parse().unwrap(),
-                },
-            ],
         }
     }
 }
@@ -567,7 +553,26 @@ impl Default for ClusterConfig {
 impl Default for NodeConfig {
     fn default() -> NodeConfig {
         NodeConfig {
-            id: SERVER_CONFIG.cluster.node.id as u32,
+            current: CurrentNodeConfig {
+                name: SERVER_CONFIG.cluster.node.current.name.parse().unwrap(),
+                ip: SERVER_CONFIG.cluster.node.current.ip.parse().unwrap(),
+            },
+            others: SERVER_CONFIG
+                .cluster
+                .node
+                .others
+                .iter()
+                .map(|other| OtherNodeConfig {
+                    name: other.name.parse().unwrap(),
+                    ip: other.ip.parse().unwrap(),
+                    ports: TransportPorts {
+                        tcp: Some(other.ports.tcp as u16),
+                        quic: Some(other.ports.quic as u16),
+                        http: Some(other.ports.http as u16),
+                        websocket: Some(other.ports.websocket as u16),
+                    },
+                })
+                .collect(),
         }
     }
 }

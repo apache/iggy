@@ -22,7 +22,7 @@
 @consumer_group_id = 1
 @consumer_id = 1
 @client_id = 1
-@partition_id_payload_base64 = AQAAAA==
+@partition_id_payload_base64 = AAAAAA==
 @message_1_payload_base64 = aGVsbG8=
 @message_2_payload_base64 = d29ybGQ=
 @header_1_payload_base_64 = dmFsdWUgMQ==

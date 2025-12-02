@@ -18,13 +18,12 @@
 
 use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
 use crate::binary::handlers::utils::receive_and_validate;
-use crate::binary::sender::SenderKind;
 use crate::shard::IggyShard;
 use crate::shard::system::messages::PollingArgs;
 use crate::streaming::session::Session;
-use crate::streaming::utils::PooledBuffer;
 use anyhow::Result;
-use iggy_common::{IggyError, PollMessages};
+use iggy_common::SenderKind;
+use iggy_common::{IggyError, PollMessages, PooledBuffer};
 use std::rc::Rc;
 use tracing::{debug, trace};
 

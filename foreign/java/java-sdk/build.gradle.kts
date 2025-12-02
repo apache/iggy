@@ -18,44 +18,23 @@
  */
 
 plugins {
-    id("java-library")
-    id("maven-publish")
-}
-
-repositories {
-    mavenCentral()
-}
-
-java {
-    // Keep Java 17 for SDK compatibility with broader ecosystem
-    sourceCompatibility = JavaVersion.VERSION_17
-    targetCompatibility = JavaVersion.VERSION_17
-
-    withJavadocJar()
-    withSourcesJar()
+    id("iggy.java-library-conventions")
 }
 
 dependencies {
-    implementation("org.apache.httpcomponents.client5:httpclient5:5.5.1")
-    implementation("com.fasterxml.jackson.core:jackson-databind:2.20.1")
-    implementation("com.fasterxml.jackson.datatype:jackson-datatype-jdk8:2.20.1")
-    implementation("org.apache.commons:commons-lang3:3.20.0")
-    implementation("org.slf4j:slf4j-api:2.0.17")
-    implementation("com.github.spotbugs:spotbugs-annotations:4.9.8")
-    implementation("io.projectreactor:reactor-core:3.8.0")
-    implementation("io.projectreactor.netty:reactor-netty-core:1.3.0")
-    testImplementation("org.testcontainers:testcontainers:1.21.3")
-    testImplementation("org.testcontainers:junit-jupiter:1.21.3")
-    testImplementation(platform("org.junit:junit-bom:5.14.1"))
-    testImplementation("org.junit.jupiter:junit-jupiter")
-    testImplementation("org.assertj:assertj-core:3.27.6")
-    testRuntimeOnly("org.junit.platform:junit-platform-launcher")
-    testRuntimeOnly("ch.qos.logback:logback-classic:1.5.21")
-    testRuntimeOnly("io.netty:netty-resolver-dns-native-macos:4.2.7.Final:osx-aarch_64")
-}
-
-tasks.withType<Test> {
-    useJUnitPlatform()
+    implementation(libs.httpclient5)
+    implementation(libs.jackson.databind)
+    implementation(libs.commons.lang3)
+    implementation(libs.slf4j.api)
+    implementation(libs.spotbugs.annotations)
+    implementation(libs.reactor.core)
+    implementation(libs.reactor.netty.core)
+    testImplementation(libs.testcontainers)
+    testImplementation(libs.testcontainers.junit)
+    testImplementation(platform(libs.junit.bom))
+    testImplementation(libs.bundles.testing)
+    testRuntimeOnly(libs.logback.classic)
+    testRuntimeOnly(libs.netty.dns.macos) { artifact { classifier = "osx-aarch_64" } }
 }
 
 publishing {

@@ -51,7 +51,8 @@ export const ReverseClusterNodeStatus = reverseRecord(ClusterNodeStatus);
 export const TransportProtocol = {
   TCP: 1,
   QUIC: 2,
-  HTTP: 3
+  HTTP: 3,
+  WebSocket: 4
 } as const;
 
 export type TransportProtocol = typeof TransportProtocol;

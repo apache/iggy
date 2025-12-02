@@ -16,7 +16,6 @@
  * under the License.
  */
 
-use crate::binary::sender::SenderKind;
 use crate::configs::tcp::TcpSocketConfig;
 use crate::shard::IggyShard;
 use crate::shard::task_registry::ShutdownToken;
@@ -26,7 +25,7 @@ use compio::net::{TcpListener, TcpOpts};
 use compio_tls::TlsAcceptor;
 use err_trail::ErrContext;
 use futures::FutureExt;
-use iggy_common::{IggyError, TransportProtocol};
+use iggy_common::{IggyError, SenderKind, TransportProtocol};
 use rustls::ServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls_pemfile::{certs, private_key};

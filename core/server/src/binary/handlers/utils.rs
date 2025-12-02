@@ -16,9 +16,9 @@
  * under the License.
  */
 
-use crate::binary::{command::ServerCommand, sender::SenderKind};
+use crate::binary::command::ServerCommand;
 use bytes::BytesMut;
-use iggy_common::IggyError;
+use iggy_common::{IggyError, SenderKind};
 
 pub async fn receive_and_validate(
     sender: &mut SenderKind,

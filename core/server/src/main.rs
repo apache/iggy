@@ -1,4 +1,5 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
  * regarding copyright ownership.  The ASF licenses this file
@@ -22,13 +23,12 @@ use dashmap::DashMap;
 use dotenvy::dotenv;
 use err_trail::ErrContext;
 use figlet_rs::FIGfont;
-use iggy_common::{Aes256GcmEncryptor, EncryptorKind, IggyError};
+use iggy_common::{Aes256GcmEncryptor, EncryptorKind, IggyError, MemoryPool};
 use server::args::Args;
 use server::bootstrap::{
     create_directories, create_shard_connections, create_shard_executor, load_config, load_streams,
     load_users, resolve_persister, update_system_info,
 };
-use server::configs::config_provider::{self};
 use server::configs::sharding::CpuAllocation;
 use server::diagnostics::{print_io_uring_permission_info, print_locked_memory_limit_info};
 use server::io::fs_utils;
@@ -46,7 +46,6 @@ use server::state::system::SystemState;
 use server::streaming::clients::client_manager::{Client, ClientManager};
 use server::streaming::diagnostics::metrics::Metrics;
 use server::streaming::storage::SystemStorage;
-use server::streaming::utils::MemoryPool;
 use server::streaming::utils::ptr::EternalPtr;
 use server::versioning::SemanticVersion;
 use std::collections::HashSet;
@@ -99,8 +98,7 @@ fn main() -> Result<(), ServerError> {
         // FIRST DISCRETE LOADING STEP.
         // Load config and create directories.
         // Remove `local_data` directory if run with `--fresh` flag.
-        let config_provider = config_provider::resolve(&args.config_provider)?;
-        let config = load_config(&config_provider).await.with_error(|error| {
+        let config = load_config().await.with_error(|error| {
             format!("{COMPONENT} (error: {error}) - failed to load config during bootstrap")
         })?;
         if args.fresh {
@@ -159,7 +157,7 @@ fn main() -> Result<(), ServerError> {
         }
 
         // FOURTH DISCRETE LOADING STEP.
-        MemoryPool::init_pool(config.system.clone());
+        MemoryPool::init_pool(&config.system.memory_pool.into_other());
 
         // SIXTH DISCRETE LOADING STEP.
         let partition_persister = resolve_persister(config.system.partition.enforce_fsync);

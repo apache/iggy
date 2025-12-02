@@ -17,8 +17,8 @@
  */
 
 use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
+use crate::binary::handlers::streams::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
-use crate::binary::{handlers::streams::COMPONENT, sender::SenderKind};
 use crate::shard::IggyShard;
 use crate::shard::transmission::event::ShardEvent;
 use crate::shard::transmission::frame::ShardResponse;
@@ -31,7 +31,7 @@ use crate::streaming::session::Session;
 use anyhow::Result;
 use err_trail::ErrContext;
 use iggy_common::delete_stream::DeleteStream;
-use iggy_common::{Identifier, IggyError};
+use iggy_common::{Identifier, IggyError, SenderKind};
 use std::rc::Rc;
 use tracing::info;
 use tracing::{debug, instrument};

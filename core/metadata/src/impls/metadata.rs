@@ -14,15 +14,22 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use consensus::{Consensus, Prepare, Project, VsrConsensus};
+use consensus::{Consensus, Project, VsrConsensus};
+use iggy_common::{header::PrepareHeader, message::Message};
+use journal::Journal;
 use tracing::{debug, warn};
 
 // TODO: Define a trait (probably in some external crate)
 #[expect(unused)]
 trait Metadata {
     type Consensus: Consensus;
+    type Journal: Journal<Entry = <Self::Consensus as Consensus>::ReplicateMessage>;
+
     fn on_request(&self, message: <Self::Consensus as Consensus>::RequestMessage);
-    fn on_replicate(&self, message: <Self::Consensus as Consensus>::ReplicateMessage);
+    fn on_replicate(
+        &self,
+        message: <Self::Consensus as Consensus>::ReplicateMessage,
+    ) -> impl Future<Output = ()>;
     fn on_ack(&self, message: <Self::Consensus as Consensus>::AckMessage);
 }
 
@@ -34,8 +41,12 @@ struct IggyMetadata<M, J, S> {
     snapshot: S,
 }
 
-impl<M, J, S> Metadata for IggyMetadata<M, J, S> {
+impl<M, J, S> Metadata for IggyMetadata<M, J, S>
+where
+    J: Journal<Entry = <VsrConsensus as Consensus>::ReplicateMessage>,
+{
     type Consensus = VsrConsensus;
+    type Journal = J;
     fn on_request(&self, message: <Self::Consensus as Consensus>::RequestMessage) {
         // TODO: Bunch of asserts.
         debug!("handling metadata request");
@@ -43,12 +54,18 @@ impl<M, J, S> Metadata for IggyMetadata<M, J, S> {
         self.pipeline_prepare(prepare);
     }
 
-    fn on_replicate(&self, message: <Self::Consensus as Consensus>::ReplicateMessage) {
+    async fn on_replicate(&self, message: <Self::Consensus as Consensus>::ReplicateMessage) {
         if !self.fence_old_prepare(&message) {
             self.replicate(message.clone());
         } else {
             warn!("received old prepare, not replicating");
         }
+
+        if self.consensus.is_follower() {
+            self.consensus.advance_commit_number();
+        }
+        //self.consensus.update_op(header.op());
+        self.journal.append(message).await;
     }
 
     fn on_ack(&self, _message: <Self::Consensus as Consensus>::AckMessage) {
@@ -56,9 +73,12 @@ impl<M, J, S> Metadata for IggyMetadata<M, J, S> {
     }
 }
 
-impl<M, J, S> IggyMetadata<M, J, S> {
+impl<M, J, S> IggyMetadata<M, J, S>
+where
+    J: Journal<Entry = <VsrConsensus as Consensus>::ReplicateMessage>,
+{
     #[expect(unused)]
-    fn pipeline_prepare(&self, prepare: Prepare) {
+    fn pipeline_prepare(&self, prepare: Message<PrepareHeader>) {
         debug!("inserting prepare into metadata pipeline");
         self.consensus.verify_pipeline();
         self.consensus.pipeline_message(prepare.clone());
@@ -67,12 +87,12 @@ impl<M, J, S> IggyMetadata<M, J, S> {
         self.consensus.post_replicate_verify(&prepare);
     }
 
-    fn fence_old_prepare(&self, _prepare: &Prepare) -> bool {
+    fn fence_old_prepare(&self, _prepare: &Message<PrepareHeader>) -> bool {
         // TODO
         false
     }
 
-    fn replicate(&self, _prepare: Prepare) {
+    fn replicate(&self, _prepare: Message<PrepareHeader>) {
         todo!()
     }
 }

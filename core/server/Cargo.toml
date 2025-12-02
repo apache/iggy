@@ -55,7 +55,6 @@ compio-net = { workspace = true }
 compio-quic = { workspace = true }
 compio-tls = { workspace = true }
 compio-ws = { workspace = true }
-crossbeam = { workspace = true }
 ctrlc = { version = "3.5", features = ["termination"] }
 cyper = { workspace = true }
 cyper-axum = { workspace = true }
@@ -63,8 +62,8 @@ dashmap = { workspace = true }
 derive_more = { workspace = true }
 dotenvy = { workspace = true }
 enum_dispatch = { workspace = true }
-err_trail = { version = "0.10.2" }
-error_set = { version = "0.9.0" }
+err_trail = { workspace = true }
+error_set = { workspace = true }
 figlet-rs = { workspace = true }
 figment = { workspace = true }
 flume = { workspace = true }
@@ -77,7 +76,6 @@ lending-iterator = "0.1.7"
 mimalloc = { workspace = true, optional = true }
 moka = { version = "0.12.11", features = ["future"] }
 nix = { version = "0.30", features = ["fs", "resource"] }
-once_cell = "1.21.3"
 opentelemetry = { version = "0.31.0", features = ["trace", "logs"] }
 opentelemetry-appender-tracing = { version = "0.31.1", features = ["log"] }
 opentelemetry-otlp = { version = "0.31.0", features = [
@@ -134,6 +132,3 @@ vergen-git2 = { version = "1.0.7", features = [
     "rustc",
     "si",
 ] }
-
-[dev-dependencies]
-serial_test = { workspace = true }

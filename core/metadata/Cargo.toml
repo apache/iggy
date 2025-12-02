@@ -22,14 +22,13 @@ description = "Iggy metadata module"
 edition = "2024"
 license = "Apache-2.0"
 keywords = ["iggy", "messaging", "streaming"]
-categories = ["database", "network-programming"]
 homepage = "https://iggy.apache.org"
 documentation = "https://iggy.apache.org/docs"
 repository = "https://github.com/apache/iggy"
 readme = "../../../README.md"
 
 [dependencies]
-clock = { path = "../clock" }
 consensus = { path = "../consensus" }
+iggy_common = { path = "../common" }
+journal = { path = "../journal" }
 tracing = { workspace = true }
-

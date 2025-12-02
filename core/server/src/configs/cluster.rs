@@ -16,27 +16,38 @@
  * under the License.
  */
 
-use iggy_common::TransportProtocol;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ClusterConfig {
     pub enabled: bool,
     pub name: String,
-    pub id: u32,
-    pub transport: TransportProtocol,
     pub node: NodeConfig,
-    pub nodes: Vec<ClusterNodeConfig>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct NodeConfig {
-    pub id: u32,
+    pub current: CurrentNodeConfig,
+    pub others: Vec<OtherNodeConfig>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
-pub struct ClusterNodeConfig {
-    pub id: u32,
+pub struct CurrentNodeConfig {
     pub name: String,
-    pub address: String,
+    pub ip: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct OtherNodeConfig {
+    pub name: String,
+    pub ip: String,
+    pub ports: TransportPorts,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct TransportPorts {
+    pub tcp: Option<u16>,
+    pub quic: Option<u16>,
+    pub http: Option<u16>,
+    pub websocket: Option<u16>,
 }

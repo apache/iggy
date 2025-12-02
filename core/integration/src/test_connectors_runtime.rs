@@ -1,4 +1,5 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
  * regarding copyright ownership.  The ASF licenses this file
@@ -18,17 +19,18 @@
 
 use assert_cmd::prelude::CommandCargoExt;
 use rand::Rng;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 use std::{collections::HashMap, net::TcpListener};
 use tokio::time::sleep;
 use uuid::Uuid;
 
 pub const STATE_PATH_ENV_VAR: &str = "IGGY_CONNECTORS_STATE_PATH";
+pub const TEST_VERBOSITY_ENV_VAR: &str = "IGGY_TEST_VERBOSE";
 pub const CONSUMER_NAME: &str = "connectors";
 const LOCAL_STATE_PREFIX: &str = "local_state_";
 
@@ -116,6 +118,19 @@ impl TestConnectorsRuntime {
             Command::cargo_bin("iggy-connectors").unwrap()
         };
         command.envs(self.envs.clone());
+
+        if std::env::var(TEST_VERBOSITY_ENV_VAR).is_ok()
+            || self.envs.contains_key(TEST_VERBOSITY_ENV_VAR)
+        {
+            command.stdout(Stdio::inherit());
+            command.stderr(Stdio::inherit());
+        } else {
+            command.stdout(self.get_stdout_file());
+            self.stdout_file_path = Some(fs::canonicalize(self.get_stdout_file_path()).unwrap());
+            command.stderr(self.get_stderr_file());
+            self.stderr_file_path = Some(fs::canonicalize(self.get_stderr_file_path()).unwrap());
+        }
+
         let child = command
             .spawn()
             .expect("Failed to start Connectors Runtime process");
@@ -174,7 +189,23 @@ impl TestConnectorsRuntime {
         format!("{}{}", LOCAL_STATE_PREFIX, Uuid::now_v7().to_u128_le())
     }
 
-    fn get_http_api_address(&self) -> String {
+    fn get_stdout_file_path(&self) -> PathBuf {
+        format!("{}_stdout.txt", self.local_state_path).into()
+    }
+
+    fn get_stderr_file_path(&self) -> PathBuf {
+        format!("{}_stderr.txt", self.local_state_path).into()
+    }
+
+    fn get_stdout_file(&self) -> File {
+        File::create(self.get_stdout_file_path()).unwrap()
+    }
+
+    fn get_stderr_file(&self) -> File {
+        File::create(self.get_stderr_file_path()).unwrap()
+    }
+
+    pub fn get_http_api_address(&self) -> String {
         format!(
             "http://{}:{}",
             self.server_address.ip(),

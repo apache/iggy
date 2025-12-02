@@ -20,7 +20,7 @@
 import com.diffplug.gradle.spotless.SpotlessExtension
 
 plugins {
-    id("com.diffplug.spotless") version "8.0.0" apply false
+    alias(libs.plugins.spotless) apply false
 }
 
 subprojects {
@@ -42,7 +42,7 @@ subprojects {
         apply(plugin = "checkstyle")
 
         configure<CheckstyleExtension> {
-            toolVersion = "10.23.1"
+            toolVersion = libs.versions.checkstyle.get()
             configFile = file("${project.rootDir}/dev-support/checkstyle/checkstyle.xml")
             configDirectory = file("${project.rootDir}/dev-support/checkstyle")
         }

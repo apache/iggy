@@ -42,8 +42,7 @@ internal sealed class MessageConverter : JsonConverter<Message>
 
     private static void WriteMessageId(Utf8JsonWriter writer, UInt128 id)
     {
-        writer.WritePropertyName("id");
-        writer.WriteRawValue(id.ToString());
+        writer.WriteString("id", id.ToString());
     }
 
     private static void WritePayload(Utf8JsonWriter writer, byte[] payload)
