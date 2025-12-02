@@ -24,7 +24,7 @@ implementation 'org.apache.iggy:iggy:0.6.0'
 </dependency>
 ```
 
-Find the latest version on [Maven Central](https://central.sonatype.com/artifact/org.apache.iggy/iggy).
+Find the latest version on [Maven Repository](https://mvnrepository.com/artifact/org.apache.iggy/iggy-java-sdk).
 
 ## Examples
 
@@ -36,7 +36,7 @@ For Apache Flink integration, see the [Flink Connector Library](external-process
 
 Before opening a pull request:
 
-1. **Format code:** `./gradlew spotlessApply`
-2. **Validate build:** `./gradlew check`
+1. **Format code:** `gradle spotlessApply`
+2. **Validate build:** `gradle check`
 
 This ensures code style compliance and that all tests and checkstyle validations pass.

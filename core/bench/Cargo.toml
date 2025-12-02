@@ -42,7 +42,7 @@ clap = { workspace = true }
 figlet-rs = { workspace = true }
 futures-util = { workspace = true }
 governor = "0.10.2"
-hostname = "0.4.1"
+hostname = "0.4.2"
 human-repr = { workspace = true }
 iggy = { workspace = true }
 integration = { workspace = true }

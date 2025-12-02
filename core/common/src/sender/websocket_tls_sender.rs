@@ -23,8 +23,8 @@ use bytes::{BufMut, BytesMut};
 use compio::buf::IoBufMut;
 use compio::net::TcpStream;
 use compio_tls::TlsStream;
-use compio_ws::TungsteniteError;
-use compio_ws::{WebSocketMessage as Message, WebSocketStream};
+use compio_ws::WebSocketStream;
+use compio_ws::tungstenite::{Error as TungsteniteError, Message};
 use std::ptr;
 use tracing::debug;
 
