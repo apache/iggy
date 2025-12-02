@@ -60,6 +60,8 @@ runs:
       if: inputs.workspace != '.'
       run: |
         cd ${{ inputs.workspace }}
+        pwd # Print working directory to verify
+        find . -maxdepth 1 -type f -name "package*.json" -exec echo "Found package.json in workspace: {}" \;
       shell: bash
 
     - name: Install dependencies
