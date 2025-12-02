@@ -61,7 +61,6 @@ runs:
       if: inputs.enabled == 'true'
       run: |
         echo "📦 Installing Node.js dependencies..."
-        
         if [ "${{ inputs.workspace }}" != "." ]; then
           echo "Changing to workspace directory: ${{ inputs.workspace }}"
           cd ${{ inputs.workspace }}
@@ -69,7 +68,6 @@ runs:
         fi
 
         find . -maxdepth 1 -type f -name "package*.json" -exec echo "Found package.json in workspace: {}" \;
-        
         npm ci --ignore-scripts
       shell: bash
       continue-on-error: true
