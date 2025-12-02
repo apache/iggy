@@ -18,11 +18,13 @@
  */
 use crate::configs::connectors::{ConnectorsConfigProvider, SinkConfig, SourceConfig};
 use crate::configs::runtime::ConnectorsRuntimeConfig;
+use crate::manager::status::ConnectorError;
 use crate::{
     SinkConnectorWrapper, SourceConnectorWrapper,
     manager::{
         sink::{SinkDetails, SinkInfo, SinkManager},
         source::{SourceDetails, SourceInfo, SourceManager},
+        status::ConnectorStatus,
     },
 };
 use std::collections::HashMap;
@@ -64,6 +66,14 @@ fn map_sinks(
                 continue;
             };
 
+            let status = if sink_plugin.error.is_some() {
+                ConnectorStatus::Error
+            } else if sink_config.enabled {
+                ConnectorStatus::Starting
+            } else {
+                ConnectorStatus::Stopped
+            };
+
             sinks.push(SinkDetails {
                 info: SinkInfo {
                     id: sink_plugin.id,
@@ -71,7 +81,11 @@ fn map_sinks(
                     name: sink_plugin.name.to_owned(),
                     path: sink_plugin.path.to_owned(),
                     enabled: sink_config.enabled,
-                    running: sink_config.enabled,
+                    status,
+                    last_error: sink_plugin
+                        .error
+                        .as_ref()
+                        .map(|err| ConnectorError::new(&err.to_string())),
                     plugin_config_format: sink_plugin.config_format,
                 },
                 config: sink_config.clone(),
@@ -93,6 +107,14 @@ fn map_sources(
                 continue;
             };
 
+            let status = if source_plugin.error.is_some() {
+                ConnectorStatus::Error
+            } else if source_config.enabled {
+                ConnectorStatus::Starting
+            } else {
+                ConnectorStatus::Stopped
+            };
+
             sources.push(SourceDetails {
                 info: SourceInfo {
                     id: source_plugin.id,
@@ -100,7 +122,11 @@ fn map_sources(
                     name: source_plugin.name.to_owned(),
                     path: source_plugin.path.to_owned(),
                     enabled: source_config.enabled,
-                    running: source_config.enabled,
+                    status,
+                    last_error: source_plugin
+                        .error
+                        .as_ref()
+                        .map(|err| ConnectorError::new(&err.to_string())),
                     plugin_config_format: source_plugin.config_format,
                 },
                 config: source_config.clone(),
