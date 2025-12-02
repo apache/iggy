@@ -77,6 +77,7 @@ const fn find_byte_in_range(bytes: &[u8], target: u8, start: usize, end: usize) 
     end
 }
 
+/// Find pos of a byte in a slice, return bytes.len() if not found any
 const fn find_byte_pos_or_len(bytes: &[u8], target: u8) -> usize {
     let mut i = 0;
 
