@@ -96,10 +96,10 @@ const fn const_str_slice(s: &str, start: usize, end: usize) -> &str {
     let bytes = s.as_bytes();
 
     if start > end {
-        panic!("start index must be less than or equal to end index");
+        panic!("Start index must be less than or equal to end index");
     }
     if end > bytes.len() {
-        panic!("end index out of bounds");
+        panic!("End index out of bounds");
     }
 
     // SAFETY: Creating a slice within the bound of original byte slice.
