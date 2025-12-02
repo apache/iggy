@@ -56,18 +56,20 @@ runs:
         restore-keys: |
           npm-${{ runner.os }}-
 
-    - name: Change to workspace directory
-      if: inputs.workspace != '.'
-      run: |
-        cd ${{ inputs.workspace }}
-        pwd # Print working directory to verify
-        find . -maxdepth 1 -type f -name "package*.json" -exec echo "Found package.json in workspace: {}" \;
-      shell: bash
 
     - name: Install dependencies
       if: inputs.enabled == 'true'
       run: |
         echo "📦 Installing Node.js dependencies..."
+        
+        if [ "${{ inputs.workspace }}" != "." ]; then
+          echo "Changing to workspace directory: ${{ inputs.workspace }}"
+          cd ${{ inputs.workspace }}
+          pwd # Print working directory to verify
+        fi
+
+        find . -maxdepth 1 -type f -name "package*.json" -exec echo "Found package.json in workspace: {}" \;
+        
         npm ci --ignore-scripts
       shell: bash
       continue-on-error: true
