@@ -62,9 +62,6 @@ public abstract class BasePollBenchmark {
     private static final String TOPIC_NAME = "topic-1";
     private static final long PARTITION_COUNT = 1;
 
-    @Param({"20000000"}) // 20MB
-    public long totalDataSizeBytes;
-
     @Param({"1", "10", "100", "1000"})
     public long messagesPerPoll;
 
@@ -128,19 +125,11 @@ public abstract class BasePollBenchmark {
     }
 
     protected void populateTestData() {
-        int messagesPerBatch = 1000;
         IggyBaseClient mgmtClient = getManagementClient();
         assert mgmtClient != null;
 
-        int countToPopulate = (int) (totalDataSizeBytes / MESSAGE_PAYLOAD_BYTES);
-        assert countToPopulate % messagesPerBatch == 0;
-
-        int batches = countToPopulate / messagesPerBatch;
-
-        for (int i = 0; i < batches; i++) {
-            List<Message> messages = MessageFixtures.generateMessages(messagesPerBatch, MESSAGE_PAYLOAD_BYTES);
-            mgmtClient.messages().sendMessages(streamId, topicId, Partitioning.partitionId(0L), messages);
-        }
+        List<Message> messages = MessageFixtures.generateMessages((int) messagesPerPoll, MESSAGE_PAYLOAD_BYTES);
+        mgmtClient.messages().sendMessages(streamId, topicId, Partitioning.partitionId(0L), messages);
     }
 
     protected void cleanupInfrastructure() {

@@ -55,16 +55,14 @@ public class BlockingHttpPollBenchmark extends BasePollBenchmark {
 
     @Benchmark
     public PolledMessages pollOffset() {
-        PolledMessages result = client.messages()
+        return client.messages()
                 .pollMessages(
                         streamId,
                         topicId,
                         Optional.of(0L),
                         consumer,
-                        PollingStrategy.offset(currentOffset),
+                        PollingStrategy.offset(BigInteger.ZERO),
                         messagesPerPoll,
                         false);
-        currentOffset = currentOffset.add(BigInteger.valueOf(result.messages().size()));
-        return result;
     }
 }

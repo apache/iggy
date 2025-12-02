@@ -63,18 +63,16 @@ public class AsyncTcpPollBenchmark extends BasePollBenchmark {
 
     @Benchmark
     public PolledMessages pollOffset() throws Exception {
-        PolledMessages result = asyncClient
+        return asyncClient
                 .messages()
                 .pollMessagesAsync(
                         streamId,
                         topicId,
                         Optional.of(0L),
                         consumer,
-                        PollingStrategy.offset(currentOffset),
+                        PollingStrategy.offset(BigInteger.ZERO),
                         messagesPerPoll,
                         false)
                 .get();
-        currentOffset = currentOffset.add(BigInteger.valueOf(result.messages().size()));
-        return result;
     }
 }
