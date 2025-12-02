@@ -28,6 +28,7 @@ pub trait Consensus {
     type RequestMessage: Project<Self::ReplicateMessage, Consensus = Self> + Clone;
     type ReplicateMessage: Project<Self::AckMessage, Consensus = Self> + Clone;
     type AckMessage;
+    type Sequencer: Sequencer;
 
     fn pipeline_message(&self, message: Self::ReplicateMessage);
     fn verify_pipeline(&self);
