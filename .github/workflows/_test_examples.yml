@@ -26,8 +26,7 @@ on:
       task:
         type: string
         required: true
-        description: "Task to run (e.g., 'examples-rust', 'examples-go')"
-
+        description: "Task to run (e.g., 'examples-rust', 'examples-go', 'examples-node')"
 permissions:
   contents: read
   security-events: write
@@ -127,6 +126,12 @@ jobs:
         run: |
           echo "Running Python examples tests..."
           ./scripts/run-python-examples-from-readme.sh
+
+      - name: Run Node.js examples
+        if: inputs.component == 'examples-suite' && inputs.task == 'examples-node'
+        run: |
+          echo "Running Node.js examples tests..."
+          ./scripts/run-node-examples-from-readme.sh
 
       - name: Upload reports
         if: always()
