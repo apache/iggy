@@ -25,12 +25,7 @@ import org.apache.iggy.system.ClientInfo;
 import org.apache.iggy.system.ClientInfoDetails;
 import org.apache.iggy.system.Stats;
 
-import java.util.ArrayList;
 import java.util.List;
-
-import static org.apache.iggy.client.blocking.tcp.BytesDeserializer.readClientInfo;
-import static org.apache.iggy.client.blocking.tcp.BytesDeserializer.readClientInfoDetails;
-import static org.apache.iggy.client.blocking.tcp.BytesDeserializer.readStats;
 
 class SystemTcpClient implements SystemClient {
 
@@ -42,32 +37,27 @@ class SystemTcpClient implements SystemClient {
 
     @Override
     public Stats getStats() {
-        var response = tcpClient.send(CommandCode.System.GET_STATS);
-        return readStats(response);
+        return tcpClient.exchangeForEntity(
+                CommandCode.System.GET_STATS, Unpooled.EMPTY_BUFFER, BytesDeserializer::readStats);
     }
 
     @Override
     public ClientInfoDetails getMe() {
-        var response = tcpClient.send(CommandCode.System.GET_ME);
-        return readClientInfoDetails(response);
+        return tcpClient.exchangeForEntity(
+                CommandCode.System.GET_ME, Unpooled.EMPTY_BUFFER, BytesDeserializer::readClientInfoDetails);
     }
 
     @Override
     public ClientInfoDetails getClient(Long clientId) {
         var payload = Unpooled.buffer(4);
         payload.writeIntLE(clientId.intValue());
-        var response = tcpClient.send(CommandCode.System.GET_CLIENT, payload);
-        return readClientInfoDetails(response);
+        return tcpClient.exchangeForEntity(
+                CommandCode.System.GET_CLIENT, payload, BytesDeserializer::readClientInfoDetails);
     }
 
     @Override
     public List<ClientInfo> getClients() {
-        var response = tcpClient.send(CommandCode.System.GET_ALL_CLIENTS);
-        List<ClientInfo> clients = new ArrayList<>();
-        while (response.isReadable()) {
-            clients.add(readClientInfo(response));
-        }
-        return clients;
+        return tcpClient.exchangeForList(CommandCode.System.GET_ALL_CLIENTS, BytesDeserializer::readClientInfo);
     }
 
     @Override

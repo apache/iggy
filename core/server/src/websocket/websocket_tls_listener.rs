@@ -158,7 +158,7 @@ pub async fn start(
 async fn accept_loop(
     listener: TcpListener,
     acceptor: TlsAcceptor,
-    ws_config: compio_ws::WebSocketConfig,
+    ws_config: tungstenite::protocol::WebSocketConfig,
     shard: Rc<IggyShard>,
     shutdown: ShutdownToken,
 ) -> Result<(), IggyError> {

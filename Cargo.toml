@@ -88,37 +88,37 @@ byte-unit = { version = "5.2.0", default-features = false, features = [
     "byte",
     "std",
 ] }
-bytemuck = { version = "1.14" }
+bytemuck = { version = "1.24" }
 bytes = "1.11.0"
 charming = "0.6.0"
 chrono = { version = "0.4.42", features = ["serde"] }
 clap = { version = "4.5.53", features = ["derive", "wrap_help"] }
 colored = "3.0.0"
 comfy-table = "7.2.1"
-compio = { version = "0.16.1", features = [
+compio = { version = "0.17.0", features = [
     "runtime",
     "macros",
     "io-uring",
     "time",
     "rustls",
 ] }
-compio-io = "0.8.3"
-compio-net = "0.9.0"
-compio-quic = "0.5.1"
-compio-tls = { version = "0.7.1", features = [
+compio-io = "0.8.4"
+compio-net = "0.10.0"
+compio-quic = "0.6.0"
+compio-tls = { version = "0.8.0", features = [
     "rustls",
 ], default-features = false }
-compio-ws = "0.1.1"
+compio-ws = "0.2.0"
 console-subscriber = "0.5.0"
 crossbeam = "0.8.4"
-cyper = { version = "0.6.2", features = ["rustls"], default-features = false }
-cyper-axum = { version = "0.6.0" }
+cyper = { version = "0.7.0", features = ["rustls"], default-features = false }
+cyper-axum = { version = "0.7.0" }
 dashmap = "6.1.0"
 derive-new = "0.7.0"
 derive_builder = "0.20.2"
 derive_more = { version = "2.0.1", features = ["full"] }
 dirs = "6.0.0"
-dlopen2 = "0.8.0"
+dlopen2 = "0.8.1"
 dotenvy = "0.15.7"
 enum_dispatch = "0.3.13"
 env_logger = "0.11.8"
@@ -157,7 +157,7 @@ reqwest = { version = "0.12.24", default-features = false, features = [
     "rustls-tls",
 ] }
 reqwest-middleware = { version = "0.4.2", features = ["json"] }
-reqwest-retry = "0.7.0"
+reqwest-retry = "0.8.0"
 rust-s3 = { version = "0.37.0", default-features = false, features = [
     "tokio-rustls-tls",
     "tags",
@@ -165,7 +165,7 @@ rust-s3 = { version = "0.37.0", default-features = false, features = [
 rustls = { version = "0.23.35", features = ["ring"] }
 serde = { version = "1.0.228", features = ["derive", "rc"] }
 serde_json = "1.0.145"
-serde_with = { version = "3.16.0", features = ["base64", "macros"] }
+serde_with = { version = "3.16.1", features = ["base64", "macros"] }
 serde_yaml_ng = "0.10.0"
 serial_test = "3.2.0"
 server = { path = "core/server" }
@@ -181,14 +181,14 @@ tokio-rustls = "0.26.4"
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 tokio-util = { version = "0.7.17", features = ["compat"] }
 toml = "0.9.8"
-tower-http = { version = "0.6.6", features = [
+tower-http = { version = "0.6.7", features = [
     "add-extension",
     "cors",
     "trace",
 ] }
-tracing = "0.1.41"
-tracing-appender = "0.2.3"
-tracing-subscriber = { version = "0.3.20", default-features = false, features = [
+tracing = "0.1.43"
+tracing-appender = "0.2.4"
+tracing-subscriber = { version = "0.3.22", default-features = false, features = [
     "fmt",
     "env-filter",
     "ansi",

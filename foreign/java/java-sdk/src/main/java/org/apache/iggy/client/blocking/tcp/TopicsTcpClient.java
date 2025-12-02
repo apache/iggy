@@ -28,12 +28,9 @@ import org.apache.iggy.topic.Topic;
 import org.apache.iggy.topic.TopicDetails;
 
 import java.math.BigInteger;
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 
-import static org.apache.iggy.client.blocking.tcp.BytesDeserializer.readTopic;
-import static org.apache.iggy.client.blocking.tcp.BytesDeserializer.readTopicDetails;
 import static org.apache.iggy.client.blocking.tcp.BytesSerializer.nameToBytes;
 import static org.apache.iggy.client.blocking.tcp.BytesSerializer.toBytes;
 import static org.apache.iggy.client.blocking.tcp.BytesSerializer.toBytesAsU64;
@@ -50,22 +47,13 @@ class TopicsTcpClient implements TopicsClient {
     public Optional<TopicDetails> getTopic(StreamId streamId, TopicId topicId) {
         var payload = toBytes(streamId);
         payload.writeBytes(toBytes(topicId));
-        var response = tcpClient.send(CommandCode.Topic.GET, payload);
-        if (response.isReadable()) {
-            return Optional.of(readTopicDetails(response));
-        }
-        return Optional.empty();
+        return tcpClient.exchangeForOptional(CommandCode.Topic.GET, payload, BytesDeserializer::readTopicDetails);
     }
 
     @Override
     public List<Topic> getTopics(StreamId streamId) {
         var payload = toBytes(streamId);
-        var response = tcpClient.send(CommandCode.Topic.GET_ALL, payload);
-        List<Topic> topics = new ArrayList<>();
-        while (response.isReadable()) {
-            topics.add(readTopic(response));
-        }
-        return topics;
+        return tcpClient.exchangeForList(CommandCode.Topic.GET_ALL, payload, BytesDeserializer::readTopic);
     }
 
     @Override
@@ -88,8 +76,7 @@ class TopicsTcpClient implements TopicsClient {
         payload.writeByte(replicationFactor.orElse((short) 0));
         payload.writeBytes(nameToBytes(name));
 
-        var response = tcpClient.send(CommandCode.Topic.CREATE, payload);
-        return readTopicDetails(response);
+        return tcpClient.exchangeForEntity(CommandCode.Topic.CREATE, payload, BytesDeserializer::readTopicDetails);
     }
 
     @Override
