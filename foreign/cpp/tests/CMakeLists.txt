@@ -57,19 +57,21 @@ if(BUILD_TESTS)
 
 
   if(ENABLE_CODE_COVERAGE)
-    include(../cmake/modules/CodeCoverage.cmake)
+    message(FATAL_ERROR "Not implemented")
 
-    setup_target_for_coverage_gcovr_coveralls(
-      NAME coveralls
-      EXECUTABLE iggy_cpp_test
-      EXCLUDE "build/vcpkg_installed/*" "tests/*"
-      DEPENDENCIES iggy)
+    # include(../cmake/modules/CodeCoverage.cmake)
 
-    setup_target_for_coverage_gcovr_html(
-      NAME coverage
-      EXECUTABLE iggy_cpp_test
-      EXCLUDE "build/vcpkg_installed/*" "tests/*"
-      DEPENDENCIES iggy)
+    # setup_target_for_coverage_gcovr_coveralls(
+    #   NAME coveralls
+    #   EXECUTABLE iggy_cpp_test
+    #   EXCLUDE "build/vcpkg_installed/*" "tests/*"
+    #   DEPENDENCIES iggy)
+
+    # setup_target_for_coverage_gcovr_html(
+    #   NAME coverage
+    #   EXECUTABLE iggy_cpp_test
+    #   EXCLUDE "build/vcpkg_installed/*" "tests/*"
+    #   DEPENDENCIES iggy)
   endif()
 
   # download correct version of Iggy, flatten out the binaries and make them executable;

@@ -17,7 +17,6 @@
  */
 
 use crate::binary::command::{ServerCommand, ServerCommandHandler};
-use crate::binary::sender::SenderKind;
 use crate::server_error::ConnectionError;
 use crate::shard::IggyShard;
 use crate::shard::task_registry::ShutdownToken;
@@ -25,7 +24,7 @@ use crate::streaming::session::Session;
 use anyhow::anyhow;
 use compio_quic::{Connection, Endpoint, RecvStream, SendStream};
 use futures::FutureExt;
-use iggy_common::{GET_CLUSTER_METADATA_CODE, IggyError, TransportProtocol};
+use iggy_common::{GET_CLUSTER_METADATA_CODE, IggyError, SenderKind, TransportProtocol};
 use std::rc::Rc;
 use tracing::{debug, error, info, trace};
 

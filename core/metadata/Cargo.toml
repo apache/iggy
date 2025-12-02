@@ -29,5 +29,6 @@ readme = "../../../README.md"
 
 [dependencies]
 consensus = { path = "../consensus" }
+iggy_common = { path = "../common" }
 journal = { path = "../journal" }
 tracing = { workspace = true }

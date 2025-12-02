@@ -17,6 +17,6 @@
 
 pub trait MessageBus {}
 
-pub struct IggyMessageBus;
+pub struct IggyMessageBus {}
 
 impl MessageBus for IggyMessageBus {}

@@ -17,7 +17,6 @@
  */
 
 use super::IggyIndexesMut;
-use crate::streaming::utils::PooledBuffer;
 use bytes::BytesMut;
 use compio::{
     buf::{IntoInner, IoBuf},
@@ -25,6 +24,7 @@ use compio::{
     io::AsyncReadAtExt,
 };
 use err_trail::ErrContext;
+use iggy_common::PooledBuffer;
 use iggy_common::{INDEX_SIZE, IggyError, IggyIndex, IggyIndexView};
 use std::{
     io::ErrorKind,

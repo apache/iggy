@@ -16,6 +16,8 @@
 // under the License.
 
 use crate::{Consensus, Project};
+use iggy_common::header::{Command2, PrepareHeader, PrepareOkHeader, RequestHeader};
+use iggy_common::message::Message;
 use message_bus::IggyMessageBus;
 use std::cell::Cell;
 
@@ -35,35 +37,61 @@ impl VsrConsensus {
     }
 }
 
-#[derive(Clone)]
-pub struct Request;
-
-impl Project<Prepare> for Request {
+impl Project<Message<PrepareHeader>> for Message<RequestHeader> {
     type Consensus = VsrConsensus;
-    fn project(self, _consensus: &Self::Consensus) -> Prepare {
-        Prepare
+    fn project(self, _consensus: &Self::Consensus) -> Message<PrepareHeader> {
+        self.replace_header(|prev| {
+            PrepareHeader {
+                cluster: 0, // TODO: consesus.cluster
+                size: prev.size,
+                view: 0, // TODO: consesus view
+                release: prev.release,
+                command: Command2::Prepare,
+                replica: 0, // TODO: consesus replica
+                parent: 0, // TODO: Get this from the previous entry in the journal (figure out how to pass that ctx here)
+                request_checksum: prev.request_checksum,
+                request: prev.request,
+                commit: 0,    // TODO: consensus.commit
+                op: 0,        // TODO: consensus.op
+                timestamp: 0, // TODO: consensus timestamp
+                operation: prev.operation,
+                ..Default::default()
+            }
+        })
     }
 }
 
-#[derive(Clone)]
-pub struct Prepare;
-
-impl Project<PrepareOk> for Prepare {
+impl Project<Message<PrepareOkHeader>> for Message<PrepareHeader> {
     type Consensus = VsrConsensus;
-    fn project(self, _consensus: &Self::Consensus) -> PrepareOk {
-        PrepareOk
+    fn project(self, _consensus: &Self::Consensus) -> Message<PrepareOkHeader> {
+        self.replace_header(|prev| {
+            PrepareOkHeader {
+                command: Command2::PrepareOk,
+                parent: prev.parent,
+                prepare_checksum: prev.checksum,
+                request: prev.request,
+                cluster: 0, // TODO: consensus.cluster
+                replica: 0, // TODO: consensus replica
+                epoch: 0,   // TODO: consensus.epoch
+                // It's important to use the view of the replica, not the received prepare!
+                view: 0, // TODO: consensus.view
+                op: prev.op,
+                commit: 0, // TODO: consensus.commit
+                timestamp: prev.timestamp,
+                operation: prev.operation,
+                // PrepareOks are only header no body
+                ..Default::default()
+            }
+        })
     }
 }
-
-#[derive(Clone)]
-pub struct PrepareOk;
 
 impl Consensus for VsrConsensus {
     type MessageBus = IggyMessageBus;
 
-    type RequestMessage = Request;
-    type ReplicateMessage = Prepare;
-    type AckMessage = PrepareOk;
+    type RequestMessage = Message<RequestHeader>;
+    type ReplicateMessage = Message<PrepareHeader>;
+    type AckMessage = Message<PrepareOkHeader>;
 
     fn pipeline_message(&self, _message: Self::ReplicateMessage) {
         todo!()

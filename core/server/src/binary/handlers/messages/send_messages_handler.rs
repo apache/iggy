@@ -17,15 +17,15 @@
  */
 
 use crate::binary::command::{BinaryServerCommand, ServerCommandHandler};
-use crate::binary::sender::SenderKind;
 use crate::shard::IggyShard;
 use crate::streaming::segments::{IggyIndexesMut, IggyMessagesBatchMut};
 use crate::streaming::session::Session;
-use crate::streaming::utils::PooledBuffer;
 use anyhow::Result;
 use compio::buf::{IntoInner as _, IoBuf};
 use iggy_common::INDEX_SIZE;
 use iggy_common::Identifier;
+use iggy_common::PooledBuffer;
+use iggy_common::SenderKind;
 use iggy_common::Sizeable;
 use iggy_common::{IggyError, Partitioning, SendMessages, Validatable};
 use std::rc::Rc;

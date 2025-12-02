@@ -1,0 +1,13 @@
+{
+  "request": {
+    "method": "GET",
+    "url": "/configs/active/versions"
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "application/json"
+    },
+    "bodyFileName": "direct/config-versions.json"
+  }
+}

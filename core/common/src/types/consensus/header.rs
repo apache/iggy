@@ -18,20 +18,19 @@
 use bytemuck::{Pod, Zeroable};
 use thiserror::Error;
 
-#[expect(unused)]
 pub struct Header {}
 
 pub trait ConsensusHeader: Sized + Pod + Zeroable {
-    const COMMAND: Command;
+    const COMMAND: Command2;
 
     fn validate(&self) -> Result<(), ConsensusError>;
     fn size(&self) -> u32;
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
-#[expect(unused)]
-pub enum Command {
+pub enum Command2 {
+    #[default]
     Reserved = 0,
 
     Ping = 1,
@@ -49,10 +48,9 @@ pub enum Command {
 }
 
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
-#[expect(unused)]
 pub enum ConsensusError {
     #[error("invalid command: expected {expected:?}, found {found:?}")]
-    InvalidCommand { expected: Command, found: Command },
+    InvalidCommand { expected: Command2, found: Command2 },
 
     #[error("invalid checksum")]
     InvalidChecksum,
@@ -67,14 +65,14 @@ pub enum ConsensusError {
     PrepareRequestChecksumPaddingNonZero,
 
     #[error("command must be Commit")]
-    CommitInvalidCommand,
+    CommitInvalidCommand2,
 
     #[error("size must be 256, found {0}")]
     CommitInvalidSize(u32),
 
     // ReplyHeader specific
     #[error("command must be Reply")]
-    ReplyInvalidCommand,
+    ReplyInvalidCommand2,
 
     #[error("request_checksum_padding must be 0")]
     ReplyRequestChecksumPaddingNonZero,
@@ -83,10 +81,11 @@ pub enum ConsensusError {
     ReplyContextPaddingNonZero,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
-#[expect(unused)]
 pub enum Operation {
+    #[default]
+    Default = 0,
     CreateStream = 128,
     UpdateStream = 129,
     DeleteStream = 130,
@@ -120,7 +119,7 @@ pub struct GenericHeader {
     pub view: u32,
     pub release: u32,
     pub protocol: u16,
-    pub command: Command,
+    pub command: Command2,
     pub replica: u8,
     pub reserved_frame: [u8; 12],
 
@@ -131,7 +130,7 @@ unsafe impl Pod for GenericHeader {}
 unsafe impl Zeroable for GenericHeader {}
 
 impl ConsensusHeader for GenericHeader {
-    const COMMAND: Command = Command::Reserved;
+    const COMMAND: Command2 = Command2::Reserved;
 
     fn validate(&self) -> Result<(), ConsensusError> {
         Ok(())
@@ -144,6 +143,50 @@ impl ConsensusHeader for GenericHeader {
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
+pub struct RequestHeader {
+    pub checksum: u128,
+    pub checksum_body: u128,
+    pub cluster: u128,
+    pub size: u32,
+    pub epoch: u32,
+    pub view: u32,
+    pub release: u32,
+    pub protocol: u16,
+    pub command: Command2,
+    pub replica: u8,
+    pub reserved_frame: [u8; 12],
+
+    pub request_checksum: u128,
+    pub timestamp: u64,
+    pub request: u64,
+    pub operation: Operation,
+    pub reserved: [u8; 95],
+}
+
+unsafe impl Pod for RequestHeader {}
+unsafe impl Zeroable for RequestHeader {}
+
+impl ConsensusHeader for RequestHeader {
+    const COMMAND: Command2 = Command2::Request;
+
+    fn validate(&self) -> Result<(), ConsensusError> {
+        if self.command != Command2::Request {
+            return Err(ConsensusError::InvalidCommand {
+                expected: Command2::Request,
+                found: self.command,
+            });
+        }
+        Ok(())
+    }
+
+    fn size(&self) -> u32 {
+        self.size
+    }
+}
+
+// TODO: Manually impl default (and use a const for the `release`)
+#[repr(C)]
+#[derive(Default, Debug, Clone, Copy)]
 pub struct PrepareHeader {
     pub checksum: u128,
     pub checksum_body: u128,
@@ -153,7 +196,7 @@ pub struct PrepareHeader {
     pub view: u32,
     pub release: u32,
     pub protocol: u16,
-    pub command: Command,
+    pub command: Command2,
     pub replica: u8,
     pub reserved_frame: [u8; 12],
 
@@ -161,25 +204,24 @@ pub struct PrepareHeader {
     pub parent_padding: u128,
     pub request_checksum: u128,
     pub request_checksum_padding: u128,
-    pub checkpoint_id: u128,
     pub op: u64,
     pub commit: u64,
     pub timestamp: u64,
     pub request: u64,
     pub operation: Operation,
-    pub reserved: [u8; 3],
+    pub reserved: [u8; 19],
 }
 
 unsafe impl Pod for PrepareHeader {}
 unsafe impl Zeroable for PrepareHeader {}
 
 impl ConsensusHeader for PrepareHeader {
-    const COMMAND: Command = Command::Prepare;
+    const COMMAND: Command2 = Command2::Prepare;
 
     fn validate(&self) -> Result<(), ConsensusError> {
-        if self.command != Command::Prepare {
+        if self.command != Command2::Prepare {
             return Err(ConsensusError::InvalidCommand {
-                expected: Command::Prepare,
+                expected: Command2::Prepare,
                 found: self.command,
             });
         }
@@ -187,6 +229,61 @@ impl ConsensusHeader for PrepareHeader {
             return Err(ConsensusError::PrepareParentPaddingNonZero);
         }
         if self.request_checksum_padding != 0 {
+            return Err(ConsensusError::PrepareRequestChecksumPaddingNonZero);
+        }
+        Ok(())
+    }
+
+    fn size(&self) -> u32 {
+        self.size
+    }
+}
+
+// TODO: Manually impl default (and use a const for the `release`)
+#[repr(C)]
+#[derive(Default, Debug, Clone, Copy)]
+pub struct PrepareOkHeader {
+    pub checksum: u128,
+    pub checksum_body: u128,
+    pub cluster: u128,
+    pub size: u32,
+    pub epoch: u32,
+    pub view: u32,
+    pub release: u32,
+    pub protocol: u16,
+    pub command: Command2,
+    pub replica: u8,
+    pub reserved_frame: [u8; 12],
+
+    pub parent: u128,
+    pub parent_padding: u128,
+    pub prepare_checksum: u128,
+    pub prepare_checksum_padding: u128,
+    pub op: u64,
+    pub commit: u64,
+    pub timestamp: u64,
+    pub request: u64,
+    pub operation: Operation,
+    pub reserved: [u8; 19],
+}
+
+unsafe impl Pod for PrepareOkHeader {}
+unsafe impl Zeroable for PrepareOkHeader {}
+
+impl ConsensusHeader for PrepareOkHeader {
+    const COMMAND: Command2 = Command2::PrepareOk;
+
+    fn validate(&self) -> Result<(), ConsensusError> {
+        if self.command != Command2::PrepareOk {
+            return Err(ConsensusError::InvalidCommand {
+                expected: Command2::PrepareOk,
+                found: self.command,
+            });
+        }
+        if self.parent_padding != 0 {
+            return Err(ConsensusError::PrepareParentPaddingNonZero);
+        }
+        if self.prepare_checksum_padding != 0 {
             return Err(ConsensusError::PrepareRequestChecksumPaddingNonZero);
         }
         Ok(())
@@ -208,27 +305,26 @@ pub struct CommitHeader {
     pub view: u32,
     pub release: u32,
     pub protocol: u16,
-    pub command: Command,
+    pub command: Command2,
     pub replica: u8,
     pub reserved_frame: [u8; 12],
 
     pub commit_checksum: u128,
     pub timestamp_monotonic: u64,
-    pub checkpoint_id: u128,
     pub commit: u64,
     pub checkpoint_op: u64,
-    pub reserved: [u8; 80],
+    pub reserved: [u8; 96],
 }
 
 unsafe impl Pod for CommitHeader {}
 unsafe impl Zeroable for CommitHeader {}
 
 impl ConsensusHeader for CommitHeader {
-    const COMMAND: Command = Command::Commit;
+    const COMMAND: Command2 = Command2::Commit;
 
     fn validate(&self) -> Result<(), ConsensusError> {
-        if self.command != Command::Commit {
-            return Err(ConsensusError::CommitInvalidCommand);
+        if self.command != Command2::Commit {
+            return Err(ConsensusError::CommitInvalidCommand2);
         }
         if self.size != 256 {
             return Err(ConsensusError::CommitInvalidSize(self.size));
@@ -252,7 +348,7 @@ pub struct ReplyHeader {
     pub view: u32,
     pub release: u32,
     pub protocol: u16,
-    pub command: Command,
+    pub command: Command2,
     pub replica: u8,
     pub reserved_frame: [u8; 12],
 
@@ -272,11 +368,11 @@ unsafe impl Pod for ReplyHeader {}
 unsafe impl Zeroable for ReplyHeader {}
 
 impl ConsensusHeader for ReplyHeader {
-    const COMMAND: Command = Command::Reply;
+    const COMMAND: Command2 = Command2::Reply;
 
     fn validate(&self) -> Result<(), ConsensusError> {
-        if self.command != Command::Reply {
-            return Err(ConsensusError::ReplyInvalidCommand);
+        if self.command != Command2::Reply {
+            return Err(ConsensusError::ReplyInvalidCommand2);
         }
         if self.request_checksum_padding != 0 {
             return Err(ConsensusError::ReplyRequestChecksumPaddingNonZero);
