@@ -24,6 +24,7 @@ use dotenvy::dotenv;
 use err_trail::ErrContext;
 use figlet_rs::FIGfont;
 use iggy_common::{Aes256GcmEncryptor, EncryptorKind, IggyError, MemoryPool};
+use server::SEMANTIC_VERSION;
 use server::args::Args;
 use server::bootstrap::{
     create_directories, create_shard_connections, create_shard_executor, load_config, load_streams,
@@ -164,7 +165,9 @@ fn main() -> Result<(), ServerError> {
         let storage = SystemStorage::new(config.system.clone(), partition_persister);
 
         // SEVENTH DISCRETE LOADING STEP.
-        let current_version = SemanticVersion::current().expect("Invalid version");
+        let current_version = SEMANTIC_VERSION;
+        info!("Current semantic version: {:?}", current_version);
+
         let mut system_info;
         let load_system_info = storage.info.load().await;
         match load_system_info {
