@@ -21,6 +21,11 @@ use bytes::{Buf, BufMut, BytesMut};
 use compio::buf::{IoBuf, IoBufMut, SetBufInit};
 use std::ops::{Deref, DerefMut};
 
+/// A buffer wrapper that participates in memory pooling.
+///
+/// This buffer automatically acquires memory from the global memory pool
+/// and returns it when dropped. It also tracks resize events to keep
+/// pool accounting accurate.
 #[derive(Debug)]
 pub struct PooledBuffer {
     from_pool: bool,
@@ -170,6 +175,28 @@ impl PooledBuffer {
             self.check_for_resize();
         }
     }
+
+    /// Returns the capacity of the inner buffer
+    pub fn capacity(&self) -> usize {
+        self.inner.capacity()
+    }
+
+    /// Returns the length of the inner buffer
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    /// Returns true if the buffer is empty
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    /// Consumes the PooledBuffer and returns the inner BytesMut.
+    /// Note: This bypasses pool return logic, use with caution.
+    pub fn into_inner(self) -> BytesMut {
+        let mut this = std::mem::ManuallyDrop::new(self);
+        std::mem::take(&mut this.inner)
+    }
 }
 
 impl Deref for PooledBuffer {
@@ -200,6 +227,12 @@ impl From<&[u8]> for PooledBuffer {
         let mut buf = PooledBuffer::with_capacity(slice.len());
         buf.inner.extend_from_slice(slice);
         buf
+    }
+}
+
+impl From<BytesMut> for PooledBuffer {
+    fn from(bytes: BytesMut) -> Self {
+        Self::from_existing(bytes)
     }
 }
 

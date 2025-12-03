@@ -16,8 +16,8 @@
  * under the License.
  */
 
-use std::error;
 use std::path::PathBuf;
+use std::{env, error};
 use vergen_git2::{BuildBuilder, CargoBuilder, Emitter, Git2Builder, RustcBuilder, SysinfoBuilder};
 
 fn main() -> Result<(), Box<dyn error::Error>> {

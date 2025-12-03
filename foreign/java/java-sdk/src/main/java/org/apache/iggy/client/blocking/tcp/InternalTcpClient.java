@@ -31,10 +31,12 @@ import reactor.netty.tcp.TcpClient;
 
 import javax.net.ssl.SSLException;
 import java.io.File;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.function.Function;
 
 final class InternalTcpClient {
 
@@ -75,50 +77,69 @@ final class InternalTcpClient {
         this.connection.inbound().receiveObject().ofType(IggyResponse.class).subscribe(responses::add);
     }
 
-    ByteBuf send(CommandCode code) {
-        return send(code.getValue());
+    <T> List<T> exchangeForList(CommandCode command, Function<ByteBuf, T> responseMapper) {
+        return exchangeForList(command, Unpooled.EMPTY_BUFFER, responseMapper);
     }
 
-    /**
-     * Use {@link #send(CommandCode)} instead.
-     */
-    @Deprecated
-    ByteBuf send(int command) {
-        return send(command, Unpooled.EMPTY_BUFFER);
+    <T> List<T> exchangeForList(CommandCode command, ByteBuf payload, Function<ByteBuf, T> responseMapper) {
+        return exchange(command, payload, response -> {
+            List<T> list = new ArrayList<>();
+            var buf = response.payload();
+            while (buf.isReadable()) {
+                list.add(responseMapper.apply(buf));
+            }
+            return list;
+        });
     }
 
-    ByteBuf send(CommandCode code, ByteBuf payload) {
-        return send(code.getValue(), payload);
+    <T> Optional<T> exchangeForOptional(CommandCode command, ByteBuf payload, Function<ByteBuf, T> responseMapper) {
+        return exchange(command, payload, response -> {
+            ByteBuf buf = response.payload();
+            if (!buf.isReadable()) {
+                return Optional.empty();
+            }
+            return Optional.ofNullable(responseMapper.apply(buf));
+        });
     }
 
-    /**
-     * Use {@link #send(CommandCode, ByteBuf)} instead.
-     */
-    @Deprecated
-    ByteBuf send(int command, ByteBuf payload) {
+    <T> T exchangeForEntity(CommandCode command, ByteBuf payload, Function<ByteBuf, T> responseMapper) {
+        return exchange(command, payload, response -> {
+            if (!response.payload().isReadable()) {
+                throw new RuntimeException("Received an empty response for command " + command);
+            }
+            return responseMapper.apply(response.payload());
+        });
+    }
+
+    void send(CommandCode command) {
+        send(command, Unpooled.EMPTY_BUFFER);
+    }
+
+    void send(CommandCode command, ByteBuf payload) {
+        exchange(command, payload, response -> null);
+    }
+
+    private <T> T exchange(CommandCode command, ByteBuf payload, Function<IggyResponse, T> responseMapper) {
         var payloadSize = payload.readableBytes() + COMMAND_LENGTH;
         var buffer = Unpooled.buffer(REQUEST_INITIAL_BYTES_LENGTH + payloadSize);
         buffer.writeIntLE(payloadSize);
-        buffer.writeIntLE(command);
+        buffer.writeIntLE(command.getValue());
         buffer.writeBytes(payload);
 
         connection.outbound().send(Mono.just(buffer)).then().block();
         try {
             IggyResponse response = responses.take();
-            return handleResponse(response);
+            if (response.status() != 0) {
+                throw new RuntimeException("Received an invalid response with status " + response.status());
+            }
+            try {
+                return responseMapper.apply(response);
+            } finally {
+                response.payload().release();
+            }
         } catch (InterruptedException e) {
             throw new RuntimeException(e);
         }
-    }
-
-    private ByteBuf handleResponse(IggyResponse response) {
-        if (response.status() != 0) {
-            throw new RuntimeException("Received an invalid response with status " + response.status());
-        }
-        if (response.length() == 0) {
-            return Unpooled.EMPTY_BUFFER;
-        }
-        return response.payload();
     }
 
     static class IggyResponseDecoder extends ByteToMessageDecoder {

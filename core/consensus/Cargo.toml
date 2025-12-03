@@ -28,7 +28,6 @@ repository = "https://github.com/apache/iggy"
 readme = "../../../README.md"
 
 [dependencies]
+bit-set = { workspace = true }
 iggy_common = { path = "../common" }
 message_bus = { path = "../message_bus" }
-
-

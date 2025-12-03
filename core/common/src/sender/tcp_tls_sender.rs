@@ -16,16 +16,15 @@
  * under the License.
  */
 
-use crate::binary::sender::Sender;
-use crate::streaming::utils::PooledBuffer;
-use crate::tcp::COMPONENT;
-use crate::{server_error::ServerError, tcp::sender};
+use super::{PooledBuffer, Sender};
+use crate::IggyError;
 use compio::buf::IoBufMut;
 use compio::io::AsyncWrite;
 use compio::net::TcpStream;
 use compio_tls::TlsStream;
 use err_trail::ErrContext;
-use iggy_common::IggyError;
+
+const COMPONENT: &str = "TCP";
 
 #[derive(Debug)]
 pub struct TcpTlsSender {
@@ -34,11 +33,11 @@ pub struct TcpTlsSender {
 
 impl Sender for TcpTlsSender {
     async fn read<B: IoBufMut>(&mut self, buffer: B) -> (Result<(), IggyError>, B) {
-        sender::read(&mut self.stream, buffer).await
+        super::read(&mut self.stream, buffer).await
     }
 
     async fn send_empty_ok_response(&mut self) -> Result<(), IggyError> {
-        sender::send_empty_ok_response(&mut self.stream).await?;
+        super::send_empty_ok_response(&mut self.stream).await?;
         self.stream
             .flush()
             .await
@@ -47,7 +46,7 @@ impl Sender for TcpTlsSender {
     }
 
     async fn send_ok_response(&mut self, payload: &[u8]) -> Result<(), IggyError> {
-        sender::send_ok_response(&mut self.stream, payload).await?;
+        super::send_ok_response(&mut self.stream, payload).await?;
         self.stream
             .flush()
             .await
@@ -56,7 +55,7 @@ impl Sender for TcpTlsSender {
     }
 
     async fn send_error_response(&mut self, error: IggyError) -> Result<(), IggyError> {
-        sender::send_error_response(&mut self.stream, error).await?;
+        super::send_error_response(&mut self.stream, error).await?;
         self.stream
             .flush()
             .await
@@ -64,14 +63,14 @@ impl Sender for TcpTlsSender {
             .map_err(|_| IggyError::TcpError)
     }
 
-    async fn shutdown(&mut self) -> Result<(), ServerError> {
+    async fn shutdown(&mut self) -> Result<(), IggyError> {
         self.stream
             .shutdown()
             .await
             .with_error(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to shutdown TCP TLS stream")
             })
-            .map_err(ServerError::IoError)
+            .map_err(|e| IggyError::IoError(e.to_string()))
     }
 
     async fn send_ok_response_vectored(
@@ -79,7 +78,7 @@ impl Sender for TcpTlsSender {
         length: &[u8],
         slices: Vec<PooledBuffer>,
     ) -> Result<(), IggyError> {
-        sender::send_ok_response_vectored(&mut self.stream, length, slices).await?;
+        super::send_ok_response_vectored(&mut self.stream, length, slices).await?;
         self.stream
             .flush()
             .await

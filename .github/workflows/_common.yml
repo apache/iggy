@@ -74,6 +74,7 @@ jobs:
             cli
             connector
             connectors
+            cpp
             csharp
             deps
             docs

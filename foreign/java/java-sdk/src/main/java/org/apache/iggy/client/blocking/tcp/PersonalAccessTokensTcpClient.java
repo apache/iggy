@@ -26,12 +26,9 @@ import org.apache.iggy.personalaccesstoken.RawPersonalAccessToken;
 import org.apache.iggy.user.IdentityInfo;
 
 import java.math.BigInteger;
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 
-import static org.apache.iggy.client.blocking.tcp.BytesDeserializer.readPersonalAccessTokenInfo;
-import static org.apache.iggy.client.blocking.tcp.BytesDeserializer.readRawPersonalAccessToken;
 import static org.apache.iggy.client.blocking.tcp.BytesSerializer.nameToBytes;
 import static org.apache.iggy.client.blocking.tcp.BytesSerializer.toBytesAsU64;
 
@@ -48,18 +45,14 @@ class PersonalAccessTokensTcpClient implements PersonalAccessTokensClient {
         var payload = Unpooled.buffer();
         payload.writeBytes(nameToBytes(name));
         payload.writeBytes(toBytesAsU64(expiry));
-        var response = tcpClient.send(CommandCode.PersonalAccessToken.CREATE, payload);
-        return readRawPersonalAccessToken(response);
+        return tcpClient.exchangeForEntity(
+                CommandCode.PersonalAccessToken.CREATE, payload, BytesDeserializer::readRawPersonalAccessToken);
     }
 
     @Override
     public List<PersonalAccessTokenInfo> getPersonalAccessTokens() {
-        var response = tcpClient.send(CommandCode.PersonalAccessToken.GET_ALL);
-        var tokens = new ArrayList<PersonalAccessTokenInfo>();
-        while (response.isReadable()) {
-            tokens.add(readPersonalAccessTokenInfo(response));
-        }
-        return tokens;
+        return tcpClient.exchangeForList(
+                CommandCode.PersonalAccessToken.GET_ALL, BytesDeserializer::readPersonalAccessTokenInfo);
     }
 
     @Override
@@ -71,8 +64,9 @@ class PersonalAccessTokensTcpClient implements PersonalAccessTokensClient {
     @Override
     public IdentityInfo loginWithPersonalAccessToken(String token) {
         var payload = nameToBytes(token);
-        var response = tcpClient.send(CommandCode.PersonalAccessToken.LOGIN, payload);
-        var userId = response.readUnsignedIntLE();
-        return new IdentityInfo(userId, Optional.empty());
+        return tcpClient.exchangeForEntity(CommandCode.PersonalAccessToken.LOGIN, payload, buf -> {
+            var userId = buf.readUnsignedIntLE();
+            return new IdentityInfo(userId, Optional.empty());
+        });
     }
 }

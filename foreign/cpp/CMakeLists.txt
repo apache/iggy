@@ -110,8 +110,9 @@ target_link_libraries(
 # even though this is related to unit tests, to get a full report we need to ensure that
 # all library files are compiled with --coverage so gcno is generated properly
 if(ENABLE_CODE_COVERAGE)
-  include(cmake/modules/CodeCoverage.cmake)
-  append_coverage_compiler_flags()
+  message(FATAL_ERROR "Not implemented")
+  # include(cmake/modules/CodeCoverage.cmake)
+  # append_coverage_compiler_flags()
 endif()
 
 if(BUILD_TESTS)

@@ -28,7 +28,6 @@ import org.apache.iggy.identifier.TopicId;
 import java.math.BigInteger;
 import java.util.Optional;
 
-import static org.apache.iggy.client.blocking.tcp.BytesDeserializer.readConsumerOffsetInfo;
 import static org.apache.iggy.client.blocking.tcp.BytesSerializer.toBytes;
 import static org.apache.iggy.client.blocking.tcp.BytesSerializer.toBytesAsU64;
 
@@ -60,10 +59,7 @@ class ConsumerOffsetTcpClient implements ConsumerOffsetsClient {
         payload.writeBytes(toBytes(topicId));
         payload.writeBytes(toBytes(partitionId));
 
-        var response = tcpClient.send(CommandCode.ConsumerOffset.GET, payload);
-        if (response.isReadable()) {
-            return Optional.of(readConsumerOffsetInfo(response));
-        }
-        return Optional.empty();
+        return tcpClient.exchangeForOptional(
+                CommandCode.ConsumerOffset.GET, payload, BytesDeserializer::readConsumerOffsetInfo);
     }
 }

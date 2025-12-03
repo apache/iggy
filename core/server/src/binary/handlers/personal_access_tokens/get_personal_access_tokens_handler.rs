@@ -20,11 +20,11 @@ use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHa
 use crate::binary::handlers::personal_access_tokens::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
-use crate::binary::sender::SenderKind;
 use crate::shard::IggyShard;
 use crate::streaming::session::Session;
 use err_trail::ErrContext;
 use iggy_common::IggyError;
+use iggy_common::SenderKind;
 use iggy_common::get_personal_access_tokens::GetPersonalAccessTokens;
 use std::rc::Rc;
 use tracing::debug;

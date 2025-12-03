@@ -1,0 +1,81 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# NOTE: this action sets up the Node.js toolchain + npm cache for dependencies,
+#       it is a convenience wrapper, so that we can use it in all workflows.
+
+name: setup-node-with-cache
+description: Setup Node.js toolchain and comprehensive caching (npm cache for dependencies)
+inputs:
+  node-version:
+    description: "Node.js version to use"
+    required: false
+    default: "23"
+  enabled:
+    description: "Whether to enable caching"
+    required: false
+    default: "true"
+  cache-dependency-path:
+    description: "Path to lock file for npm caching"
+    required: false
+    default: "package-lock.json"
+  workspace:
+    description: "Workspace directory"
+    required: false
+    default: "."
+runs:
+  using: "composite"
+  steps:
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ inputs.node-version }}
+        cache: "npm"
+        cache-dependency-path: ${{ inputs.cache-dependency-path }}
+
+    - name: Setup npm cache
+      if: inputs.enabled == 'true'
+      uses: actions/cache@v4
+      with:
+        path: ~/.npm
+        key: npm-${{ runner.os }}-${{ hashFiles(inputs.cache-dependency-path) }}
+        restore-keys: |
+          npm-${{ runner.os }}-
+
+
+    - name: Install dependencies
+      if: inputs.enabled == 'true'
+      run: |
+        echo "📦 Installing Node.js dependencies..."
+        if [ "${{ inputs.workspace }}" != "." ]; then
+          echo "Changing to workspace directory: ${{ inputs.workspace }}"
+          cd ${{ inputs.workspace }}
+          pwd # Print working directory to verify
+        fi
+
+        find . -maxdepth 1 -type f -name "package*.json" -exec echo "Found package.json in workspace: {}" \;
+        npm ci --ignore-scripts
+      shell: bash
+      continue-on-error: true
+
+    - name: Verify npm installation
+      run: |
+        echo "✅ Node.js setup complete"
+        node --version
+        npm --version
+      shell: bash
+

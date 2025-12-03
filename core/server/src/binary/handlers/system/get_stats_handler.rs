@@ -20,7 +20,6 @@ use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHa
 use crate::binary::handlers::system::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
-use crate::binary::sender::SenderKind;
 use crate::shard::IggyShard;
 use crate::shard::transmission::frame::ShardResponse;
 use crate::shard::transmission::message::{
@@ -28,6 +27,7 @@ use crate::shard::transmission::message::{
 };
 use crate::streaming::session::Session;
 use err_trail::ErrContext;
+use iggy_common::SenderKind;
 use iggy_common::get_stats::GetStats;
 use iggy_common::{Identifier, IggyError};
 use std::rc::Rc;
