@@ -231,6 +231,7 @@ pub async fn create_connectors_config_provider(
 ) -> Result<Box<dyn ConnectorsConfigProvider>, RuntimeError> {
     match config {
         RuntimeConnectorsConfig::Local(config) => {
+            tracing::info!("Connector Config: {:?}", config);
             let provider = LocalConnectorsConfigProvider::new(&config.config_dir);
             let provider = provider.init().await?;
             Ok(Box::new(provider))
@@ -242,6 +243,7 @@ pub async fn create_connectors_config_provider(
                 &config.request_headers,
                 &config.url_templates,
                 &config.response,
+                &config.retry,
             )?;
             Ok(Box::new(provider))
         }
