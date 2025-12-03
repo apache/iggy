@@ -26,7 +26,7 @@ dependencies {
     implementation(project(":iggy"))
     implementation(libs.jmh.core)
     implementation(libs.slf4j.api)
-    implementation(libs.testcontainers)
+    implementation(libs.reactor.netty.core)  // For ByteBuf access
     annotationProcessor(libs.jmh.generator)
     runtimeOnly(libs.logback.classic)
     runtimeOnly(libs.netty.dns.macos) { artifact { classifier = "osx-aarch_64" } }
@@ -51,6 +51,11 @@ tasks.register<JavaExec>("jmh") {
 
     val jmhArgs = project.findProperty("jmhArgs")?.toString() ?: ""
     val jarFile = tasks.shadowJar.get().archiveFile.get().asFile
+
+    // Ensure build/reports/jmh directory exists
+    doFirst {
+        file("build/reports/jmh").mkdirs()
+    }
 
     classpath = files(jarFile)
     mainClass.set("org.openjdk.jmh.Main")
