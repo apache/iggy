@@ -26,14 +26,12 @@ dependencies {
     implementation(project(":iggy"))
     implementation(libs.jmh.core)
     implementation(libs.slf4j.api)
-    implementation(libs.reactor.netty.core)  // For ByteBuf access
     annotationProcessor(libs.jmh.generator)
     runtimeOnly(libs.logback.classic)
-    runtimeOnly(libs.netty.dns.macos) { artifact { classifier = "osx-aarch_64" } }
 }
 
 tasks.shadowJar {
-    archiveBaseName.set("iggy-jmh-benchmarks")
+    archiveBaseName.set("iggy-jmh-microbenchmarks")
     archiveClassifier.set("")
 
     manifest {
@@ -45,7 +43,7 @@ tasks.shadowJar {
 
 tasks.register<JavaExec>("jmh") {
     group = "benchmark"
-    description = "Run JMH benchmarks. Use -PjmhArgs to pass JMH arguments."
+    description = "Run JMH microbenchmarks. Use -PjmhArgs to pass JMH arguments."
 
     dependsOn(tasks.shadowJar)
 

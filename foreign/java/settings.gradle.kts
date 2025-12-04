@@ -32,6 +32,6 @@ project(":iggy-connector-library").projectDir = file("external-processors/iggy-c
 include("iggy-flink-examples")
 project(":iggy-flink-examples").projectDir = file("external-processors/iggy-connector-flink/iggy-flink-examples")
 
-// Benchmarks
-include("iggy-benchmarks")
-project(":iggy-benchmarks").projectDir = file("benchmarks")
+// Microbenchmarks
+include("iggy-microbenchmarks")
+project(":iggy-microbenchmarks").projectDir = file("microbenchmarks")
