@@ -368,10 +368,10 @@ impl IggyIndexesMut {
         let mut entries = [iggy_common::IggyIndex::default(); ENTRIES_PER_CACHE_LINE];
 
         // Decode each entry from the buffer using IggyIndexView
-        for i in 0..ENTRIES_PER_CACHE_LINE {
+        for (i, entry) in entries.iter_mut().enumerate() {
             let entry_index = base_entry_index + i as u32;
             if let Some(view) = self.get(entry_index) {
-                entries[i] = view.to_index();
+                *entry = view.to_index();
             } else {
                 return None;
             }

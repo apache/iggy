@@ -54,13 +54,6 @@ impl IndexCacheLineBlock {
         Self { entries }
     }
 
-    /// Creates a new cache-line block with default (zero) entries.
-    pub fn default() -> Self {
-        Self {
-            entries: [IggyIndex::default(); ENTRIES_PER_CACHE_LINE],
-        }
-    }
-
     /// Gets a reference to a specific entry in the block.
     ///
     /// # Arguments
@@ -105,12 +98,9 @@ impl IndexCacheLineBlock {
     /// The first entry with timestamp >= target_timestamp, or None if not found
     pub fn find_by_timestamp(&self, target_timestamp: u64) -> Option<&IggyIndex> {
         // Linear search through 4 entries (very fast with prefetching)
-        for entry in &self.entries {
-            if entry.timestamp >= target_timestamp {
-                return Some(entry);
-            }
-        }
-        None
+        self.entries
+            .iter()
+            .find(|entry| entry.timestamp >= target_timestamp)
     }
 
     /// Finds the index position within the block for a given timestamp.
@@ -154,7 +144,9 @@ impl IndexCacheLineBlock {
 
 impl Default for IndexCacheLineBlock {
     fn default() -> Self {
-        Self::default()
+        Self {
+            entries: [IggyIndex::default(); ENTRIES_PER_CACHE_LINE],
+        }
     }
 }
 
