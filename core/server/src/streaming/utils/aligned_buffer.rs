@@ -20,7 +20,7 @@ use iggy_common::CACHE_LINE_SIZE;
 
 /// Checks if a buffer pointer is cache-line aligned.
 pub fn is_cache_line_aligned(ptr: *const u8) -> bool {
-    (ptr as usize) % CACHE_LINE_SIZE == 0
+    (ptr as usize).is_multiple_of(CACHE_LINE_SIZE)
 }
 
 /// Rounds up a size to the next multiple of cache line size.
