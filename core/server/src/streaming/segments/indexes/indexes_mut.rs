@@ -18,7 +18,7 @@
 
 use crate::streaming::utils::aligned_buffer;
 use iggy_common::PooledBuffer;
-use iggy_common::{INDEX_SIZE, IggyIndexView, IndexCacheLineBlock, ENTRIES_PER_CACHE_LINE};
+use iggy_common::{ENTRIES_PER_CACHE_LINE, INDEX_SIZE, IggyIndexView, IndexCacheLineBlock};
 use std::fmt;
 use std::ops::{Deref, Index as StdIndex};
 
@@ -411,7 +411,8 @@ impl IggyIndexesMut {
             let remaining_entries = self.count() % ENTRIES_PER_CACHE_LINE as u32;
             if remaining_entries > 0 {
                 // Fall back to entry-level search for incomplete block
-                return self.binary_search_position_for_timestamp_sync(target_timestamp)
+                return self
+                    .binary_search_position_for_timestamp_sync(target_timestamp)
                     .map(|pos| {
                         let block_idx = pos / ENTRIES_PER_CACHE_LINE as u32;
                         let entry_idx = (pos % ENTRIES_PER_CACHE_LINE as u32) as usize;
@@ -466,8 +467,13 @@ impl IggyIndexesMut {
     ///
     /// # Returns
     /// The first index with timestamp >= target_timestamp, or None if not found
-    pub fn find_by_timestamp_block_aware(&self, target_timestamp: u64) -> Option<IggyIndexView<'_>> {
-        if let Some((block_idx, entry_idx)) = self.binary_search_blocks_by_timestamp(target_timestamp) {
+    pub fn find_by_timestamp_block_aware(
+        &self,
+        target_timestamp: u64,
+    ) -> Option<IggyIndexView<'_>> {
+        if let Some((block_idx, entry_idx)) =
+            self.binary_search_blocks_by_timestamp(target_timestamp)
+        {
             let global_index = block_idx * ENTRIES_PER_CACHE_LINE as u32 + entry_idx as u32;
             self.get(global_index)
         } else {

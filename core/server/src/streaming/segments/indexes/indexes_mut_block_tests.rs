@@ -18,10 +18,10 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::streaming::segments::indexes::indexes_mut::IggyIndexesMut;
-    use iggy_common::{MemoryPool, MEMORY_POOL};
     use crate::configs::system::SystemConfig;
+    use crate::streaming::segments::indexes::indexes_mut::IggyIndexesMut;
     use iggy_common::ENTRIES_PER_CACHE_LINE;
+    use iggy_common::{MEMORY_POOL, MemoryPool};
     use std::sync::{Arc, Once};
 
     static INIT: Once = Once::new();
@@ -45,8 +45,8 @@ mod tests {
 
         for i in 0..count {
             indexes.insert(
-                i,                          // offset
-                i * 1000,                   // position
+                i,                           // offset
+                i * 1000,                    // position
                 1000000 + (i as u64 * 1000), // timestamp
             );
         }
@@ -86,7 +86,7 @@ mod tests {
 
         // Get middle block
         let block2 = indexes.get_block(2).expect("Block 2 should exist");
-        assert_eq!(block2.get(0).unwrap().offset, 8);  // 2 * 4 = 8
+        assert_eq!(block2.get(0).unwrap().offset, 8); // 2 * 4 = 8
         assert_eq!(block2.get(1).unwrap().offset, 9);
         assert_eq!(block2.get(2).unwrap().offset, 10);
         assert_eq!(block2.get(3).unwrap().offset, 11);
@@ -167,16 +167,22 @@ mod tests {
         let indexes = create_test_indexes(20);
 
         // Exact match
-        let idx = indexes.find_by_timestamp_block_aware(1005000).expect("Should find");
+        let idx = indexes
+            .find_by_timestamp_block_aware(1005000)
+            .expect("Should find");
         assert_eq!(idx.offset(), 5);
         assert_eq!(idx.timestamp(), 1005000);
 
         // Between timestamps
-        let idx = indexes.find_by_timestamp_block_aware(1005500).expect("Should find");
+        let idx = indexes
+            .find_by_timestamp_block_aware(1005500)
+            .expect("Should find");
         assert_eq!(idx.offset(), 6); // Next higher
 
         // Before first
-        let idx = indexes.find_by_timestamp_block_aware(999000).expect("Should find");
+        let idx = indexes
+            .find_by_timestamp_block_aware(999000)
+            .expect("Should find");
         assert_eq!(idx.offset(), 0);
 
         // After last
@@ -189,12 +195,12 @@ mod tests {
         let indexes = create_test_indexes(100);
 
         let test_timestamps = vec![
-            1000000,  // First
-            1050000,  // Middle
-            1099000,  // Last
-            999000,   // Before first
-            1025500,  // Between entries
-            2000000,  // After last
+            1000000, // First
+            1050000, // Middle
+            1099000, // Last
+            999000,  // Before first
+            1025500, // Between entries
+            2000000, // After last
         ];
 
         for timestamp in test_timestamps {
@@ -206,12 +212,14 @@ mod tests {
                     assert_eq!(
                         block_idx.offset(),
                         regular_idx.offset(),
-                        "Mismatch for timestamp {}", timestamp
+                        "Mismatch for timestamp {}",
+                        timestamp
                     );
                     assert_eq!(
                         block_idx.timestamp(),
                         regular_idx.timestamp(),
-                        "Mismatch for timestamp {}", timestamp
+                        "Mismatch for timestamp {}",
+                        timestamp
                     );
                 }
                 (None, None) => {
@@ -257,15 +265,21 @@ mod tests {
         assert_eq!(indexes.block_count(), 250);
 
         // Search near beginning
-        let idx = indexes.find_by_timestamp_block_aware(1001000).expect("Should find");
+        let idx = indexes
+            .find_by_timestamp_block_aware(1001000)
+            .expect("Should find");
         assert_eq!(idx.offset(), 1);
 
         // Search in middle
-        let idx = indexes.find_by_timestamp_block_aware(1500000).expect("Should find");
+        let idx = indexes
+            .find_by_timestamp_block_aware(1500000)
+            .expect("Should find");
         assert_eq!(idx.offset(), 500);
 
         // Search near end
-        let idx = indexes.find_by_timestamp_block_aware(1999000).expect("Should find");
+        let idx = indexes
+            .find_by_timestamp_block_aware(1999000)
+            .expect("Should find");
         assert_eq!(idx.offset(), 999);
     }
 }
