@@ -33,7 +33,7 @@ use iggy_common::MaxTopicSize;
 use iggy_common::Validatable;
 use iggy_common::{CompressionAlgorithm, ConfigurationError};
 use std::thread::available_parallelism;
-use tracing::error;
+use tracing::{error, warn};
 
 impl Validatable<ConfigurationError> for ServerConfig {
     fn validate(&self) -> Result<(), ConfigurationError> {
@@ -93,7 +93,7 @@ impl Validatable<ConfigurationError> for CompressionConfig {
         let compression_alg = &self.default_algorithm;
         if *compression_alg != CompressionAlgorithm::None {
             // TODO(numinex): Change this message once server side compression is fully developed.
-            println!(
+            warn!(
                 "Server started with server-side compression enabled, using algorithm: {compression_alg}, this feature is not implemented yet!"
             );
         }
@@ -127,7 +127,7 @@ impl Validatable<ConfigurationError> for TelemetryConfig {
 impl Validatable<ConfigurationError> for PartitionConfig {
     fn validate(&self) -> Result<(), ConfigurationError> {
         if self.messages_required_to_save < 32 {
-            eprintln!(
+            error!(
                 "Configured system.partition.messages_required_to_save {} is less than minimum {}",
                 self.messages_required_to_save, 32
             );
@@ -135,7 +135,7 @@ impl Validatable<ConfigurationError> for PartitionConfig {
         }
 
         if !self.messages_required_to_save.is_multiple_of(32) {
-            eprintln!(
+            error!(
                 "Configured system.partition.messages_required_to_save {} is not a multiple of 32",
                 self.messages_required_to_save
             );
@@ -143,7 +143,7 @@ impl Validatable<ConfigurationError> for PartitionConfig {
         }
 
         if self.size_of_messages_required_to_save < 512 {
-            eprintln!(
+            error!(
                 "Configured system.partition.size_of_messages_required_to_save {} is less than minimum {}",
                 self.size_of_messages_required_to_save, 512
             );
@@ -155,7 +155,7 @@ impl Validatable<ConfigurationError> for PartitionConfig {
             .as_bytes_u64()
             .is_multiple_of(512)
         {
-            eprintln!(
+            error!(
                 "Configured system.partition.size_of_messages_required_to_save {} is not a multiple of 512 B",
                 self.size_of_messages_required_to_save
             );
@@ -169,7 +169,7 @@ impl Validatable<ConfigurationError> for PartitionConfig {
 impl Validatable<ConfigurationError> for SegmentConfig {
     fn validate(&self) -> Result<(), ConfigurationError> {
         if self.size > SEGMENT_MAX_SIZE_BYTES {
-            eprintln!(
+            error!(
                 "Configured system.segment.size {} B is greater than maximum {} B",
                 self.size.as_bytes_u64(),
                 SEGMENT_MAX_SIZE_BYTES
@@ -178,7 +178,7 @@ impl Validatable<ConfigurationError> for SegmentConfig {
         }
 
         if !self.size.as_bytes_u64().is_multiple_of(512) {
-            eprintln!(
+            error!(
                 "Configured system.segment.size {} B is not a multiple of 512 B",
                 self.size.as_bytes_u64()
             );
@@ -295,11 +295,11 @@ impl Validatable<ConfigurationError> for ShardingConfig {
             CpuAllocation::All => Ok(()),
             CpuAllocation::Count(count) => {
                 if *count == 0 {
-                    eprintln!("Invalid sharding configuration: cpu_allocation count cannot be 0");
+                    error!("Invalid sharding configuration: cpu_allocation count cannot be 0");
                     return Err(ConfigurationError::InvalidConfigurationValue);
                 }
                 if *count > available_cpus {
-                    eprintln!(
+                    error!(
                         "Invalid sharding configuration: cpu_allocation count {count} exceeds available CPU cores {available_cpus}"
                     );
                     return Err(ConfigurationError::InvalidConfigurationValue);
@@ -308,13 +308,13 @@ impl Validatable<ConfigurationError> for ShardingConfig {
             }
             CpuAllocation::Range(start, end) => {
                 if start >= end {
-                    eprintln!(
+                    error!(
                         "Invalid sharding configuration: cpu_allocation range {start}..{end} is invalid (start must be less than end)"
                     );
                     return Err(ConfigurationError::InvalidConfigurationValue);
                 }
                 if *end > available_cpus {
-                    eprintln!(
+                    error!(
                         "Invalid sharding configuration: cpu_allocation range {start}..{end} exceeds available CPU cores (max: {available_cpus})"
                     );
                     return Err(ConfigurationError::InvalidConfigurationValue);
@@ -333,13 +333,13 @@ impl Validatable<ConfigurationError> for ClusterConfig {
 
         // Validate cluster name is not empty
         if self.name.trim().is_empty() {
-            eprintln!("Invalid cluster configuration: cluster name cannot be empty");
+            error!("Invalid cluster configuration: cluster name cannot be empty");
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
 
         // Validate current node name is not empty
         if self.node.current.name.trim().is_empty() {
-            eprintln!("Invalid cluster configuration: current node name cannot be empty");
+            error!("Invalid cluster configuration: current node name cannot be empty");
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
 
@@ -349,7 +349,7 @@ impl Validatable<ConfigurationError> for ClusterConfig {
 
         for node in &self.node.others {
             if !node_names.insert(node.name.clone()) {
-                eprintln!(
+                error!(
                     "Invalid cluster configuration: duplicate node name '{}' found",
                     node.name
                 );
@@ -362,13 +362,13 @@ impl Validatable<ConfigurationError> for ClusterConfig {
         for node in &self.node.others {
             // Validate node name is not empty
             if node.name.trim().is_empty() {
-                eprintln!("Invalid cluster configuration: node name cannot be empty");
+                error!("Invalid cluster configuration: node name cannot be empty");
                 return Err(ConfigurationError::InvalidConfigurationValue);
             }
 
             // Validate IP is not empty
             if node.ip.trim().is_empty() {
-                eprintln!(
+                error!(
                     "Invalid cluster configuration: IP cannot be empty for node '{}'",
                     node.name
                 );
@@ -386,7 +386,7 @@ impl Validatable<ConfigurationError> for ClusterConfig {
             for (name, port_opt) in &port_list {
                 if let Some(port) = port_opt {
                     if *port == 0 {
-                        eprintln!(
+                        error!(
                             "Invalid cluster configuration: {} port cannot be 0 for node '{}'",
                             name, node.name
                         );
@@ -396,7 +396,7 @@ impl Validatable<ConfigurationError> for ClusterConfig {
                     // Check for port conflicts across nodes on the same IP
                     let endpoint = format!("{}:{}:{}", node.ip, name, port);
                     if !used_endpoints.insert(endpoint.clone()) {
-                        eprintln!(
+                        error!(
                             "Invalid cluster configuration: port conflict - {}:{} is already used",
                             node.ip, port
                         );

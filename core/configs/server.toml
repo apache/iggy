@@ -340,7 +340,10 @@ path = "runtime"
 # Path for storing log files.
 path = "logs"
 
-# Level of logging detail. Options: "debug", "info", "warn", "error".
+# Log filtering directive using the same syntax as the RUST_LOG environment variable.
+# Supports simple levels ("trace", "debug", "info", "warn", "error", "off" or "none")
+# as well as complex directives like "warn,server=debug,iggy=trace".
+# Note: RUST_LOG environment variable always takes precedence over this setting.
 level = "info"
 
 # Maximum size of the log files before rotation.

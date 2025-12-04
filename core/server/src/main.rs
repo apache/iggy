@@ -138,6 +138,11 @@ fn main() -> Result<(), ServerError> {
         let is_follower = args.follower;
 
         // FIRST DISCRETE LOADING STEP.
+        // Initialize early logging before config parsing so we can log during bootstrap.
+        let mut logging = Logging::new();
+        logging.early_init();
+
+        // SECOND DISCRETE LOADING STEP.
         // Load config and create directories.
         // Remove `local_data` directory if run with `--fresh` flag.
         let config = load_config().await.with_error(|error| {
@@ -146,27 +151,28 @@ fn main() -> Result<(), ServerError> {
         if args.fresh {
             let system_path = config.system.get_system_path();
             if compio::fs::metadata(&system_path).await.is_ok() {
-                println!(
+                warn!(
                     "Removing system path at: {} because `--fresh` flag was set",
                     system_path
                 );
                 if let Err(e) = fs_utils::remove_dir_all(&system_path).await {
-                    eprintln!("Failed to remove system path at {}: {}", system_path, e);
+                    warn!("Failed to remove system path at {system_path}: {e}");
                 }
             }
         }
 
-        // SECOND DISCRETE LOADING STEP.
+        // THIRD DISCRETE LOADING STEP.
         // Create directories.
         create_directories(&config.system).await?;
 
-        // Initialize logging
-        // THIRD DISCRETE LOADING STEP.
-        let mut logging = Logging::new(config.telemetry.clone());
-        logging.early_init();
-
-        // From this point on, we can use tracing macros to log messages.
-        logging.late_init(config.system.get_system_path(), &config.system.logging)?;
+        // FOURTH DISCRETE LOADING STEP.
+        // Complete logging setup with config (file output, telemetry).
+        // From this point on, logs are persisted to file and telemetry is active.
+        logging.late_init(
+            config.system.get_system_path(),
+            &config.system.logging,
+            &config.telemetry,
+        )?;
 
         if is_follower {
             info!("Server is running in FOLLOWER mode for testing leader redirection");
@@ -198,7 +204,7 @@ fn main() -> Result<(), ServerError> {
             }
         }
 
-        // FOURTH DISCRETE LOADING STEP.
+        // FIFTH DISCRETE LOADING STEP.
         MemoryPool::init_pool(&config.system.memory_pool.into_other());
 
         // SIXTH DISCRETE LOADING STEP.
