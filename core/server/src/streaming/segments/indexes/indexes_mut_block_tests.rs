@@ -19,7 +19,7 @@
 #[cfg(test)]
 mod tests {
     use crate::streaming::segments::indexes::indexes_mut::IggyIndexesMut;
-    use crate::streaming::utils::{MemoryPool, MEMORY_POOL};
+    use iggy_common::{MemoryPool, MEMORY_POOL};
     use crate::configs::system::SystemConfig;
     use iggy_common::ENTRIES_PER_CACHE_LINE;
     use std::sync::{Arc, Once};
@@ -33,7 +33,7 @@ mod tests {
             // Only initialize if not already initialized
             if MEMORY_POOL.get().is_none() {
                 let config = Arc::new(SystemConfig::default());
-                MemoryPool::init_pool(config);
+                MemoryPool::init_pool(&config.memory_pool.into_other());
             }
         });
     }
