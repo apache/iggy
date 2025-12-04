@@ -49,6 +49,7 @@ java -jar microbenchmarks/build/libs/iggy-jmh-microbenchmarks-*-SNAPSHOT.jar -h
 ## Troubleshooting
 
 **Verbose logging:** Edit `src/main/resources/logback.xml`:
+
 ```xml
 <logger name="org.apache.iggy.benchmark" level="DEBUG"/>
 ```
