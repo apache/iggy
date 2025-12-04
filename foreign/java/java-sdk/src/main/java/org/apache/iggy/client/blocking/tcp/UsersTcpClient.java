@@ -19,6 +19,7 @@
 
 package org.apache.iggy.client.blocking.tcp;
 
+import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import org.apache.iggy.client.blocking.UsersClient;
 import org.apache.iggy.identifier.UserId;
@@ -28,11 +29,9 @@ import org.apache.iggy.user.UserInfo;
 import org.apache.iggy.user.UserInfoDetails;
 import org.apache.iggy.user.UserStatus;
 
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 
-import static org.apache.iggy.client.blocking.tcp.BytesDeserializer.readUserInfoDetails;
 import static org.apache.iggy.client.blocking.tcp.BytesSerializer.nameToBytes;
 import static org.apache.iggy.client.blocking.tcp.BytesSerializer.toBytes;
 
@@ -47,21 +46,12 @@ class UsersTcpClient implements UsersClient {
     @Override
     public Optional<UserInfoDetails> getUser(UserId userId) {
         var payload = toBytes(userId);
-        var response = tcpClient.send(CommandCode.User.GET, payload);
-        if (response.isReadable()) {
-            return Optional.of(readUserInfoDetails(response));
-        }
-        return Optional.empty();
+        return tcpClient.exchangeForOptional(CommandCode.User.GET, payload, BytesDeserializer::readUserInfoDetails);
     }
 
     @Override
     public List<UserInfo> getUsers() {
-        var response = tcpClient.send(CommandCode.User.GET_ALL);
-        List<UserInfo> users = new ArrayList<>();
-        while (response.isReadable()) {
-            users.add(BytesDeserializer.readUserInfo(response));
-        }
-        return users;
+        return tcpClient.exchangeForList(CommandCode.User.GET_ALL, BytesDeserializer::readUserInfo);
     }
 
     @Override
@@ -80,8 +70,7 @@ class UsersTcpClient implements UsersClient {
                 },
                 () -> payload.writeByte(0));
 
-        var response = tcpClient.send(CommandCode.User.CREATE, payload);
-        return readUserInfoDetails(response);
+        return tcpClient.exchangeForEntity(CommandCode.User.CREATE, payload, BytesDeserializer::readUserInfoDetails);
     }
 
     @Override
@@ -148,9 +137,7 @@ class UsersTcpClient implements UsersClient {
         payload.writeIntLE(context.length());
         payload.writeBytes(context.getBytes());
 
-        var response = tcpClient.send(CommandCode.User.LOGIN, payload);
-
-        var userId = response.readUnsignedIntLE();
+        var userId = tcpClient.exchangeForEntity(CommandCode.User.LOGIN, payload, ByteBuf::readUnsignedIntLE);
         return new IdentityInfo(userId, Optional.empty());
     }
 

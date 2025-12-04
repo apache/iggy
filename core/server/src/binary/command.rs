@@ -16,12 +16,12 @@
  * under the License.
  */
 
-use crate::binary::sender::SenderKind;
 use crate::define_server_command_enum;
 use crate::shard::IggyShard;
 use crate::streaming::session::Session;
 use bytes::{BufMut, Bytes, BytesMut};
 use enum_dispatch::enum_dispatch;
+use iggy_common::SenderKind;
 use iggy_common::change_password::ChangePassword;
 use iggy_common::create_consumer_group::CreateConsumerGroup;
 use iggy_common::create_partitions::CreatePartitions;

@@ -16,6 +16,7 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+use super::status::{ConnectorError, ConnectorStatus};
 use crate::configs::connectors::{ConfigFormat, SourceConfig};
 use dashmap::DashMap;
 use std::collections::HashMap;
@@ -61,6 +62,24 @@ impl SourceManager {
         }
         results
     }
+
+    pub async fn update_status(&self, key: &str, status: ConnectorStatus) {
+        if let Some(source) = self.sources.get(key) {
+            let mut source = source.lock().await;
+            source.info.status = status;
+            if matches!(status, ConnectorStatus::Running | ConnectorStatus::Stopped) {
+                source.info.last_error = None;
+            }
+        }
+    }
+
+    pub async fn set_error(&self, key: &str, error_message: &str) {
+        if let Some(source) = self.sources.get(key) {
+            let mut source = source.lock().await;
+            source.info.status = ConnectorStatus::Error;
+            source.info.last_error = Some(ConnectorError::new(error_message));
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -70,7 +89,8 @@ pub struct SourceInfo {
     pub name: String,
     pub path: String,
     pub enabled: bool,
-    pub running: bool,
+    pub status: ConnectorStatus,
+    pub last_error: Option<ConnectorError>,
     pub plugin_config_format: Option<ConfigFormat>,
 }
 

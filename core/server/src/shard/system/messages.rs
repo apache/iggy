@@ -26,9 +26,9 @@ use crate::shard::transmission::message::{
 };
 use crate::streaming::segments::{IggyIndexesMut, IggyMessagesBatchMut, IggyMessagesBatchSet};
 use crate::streaming::traits::MainOps;
-use crate::streaming::utils::PooledBuffer;
 use crate::streaming::{partitions, streams, topics};
 use err_trail::ErrContext;
+use iggy_common::PooledBuffer;
 use iggy_common::{
     BytesSerializable, Consumer, EncryptorKind, IGGY_MESSAGE_HEADER_SIZE, Identifier, IggyError,
     Partitioning, PartitioningKind, PollingKind, PollingStrategy,

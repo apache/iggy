@@ -16,15 +16,14 @@
  * under the License.
  */
 
-use crate::binary::sender::Sender;
-use crate::server_error::ServerError;
-use crate::streaming::utils::PooledBuffer;
+use super::Sender;
+use crate::IggyError;
+use crate::alloc::buffer::PooledBuffer;
 use bytes::{BufMut, BytesMut};
 use compio::buf::IoBufMut;
 use compio::net::TcpStream;
-use compio_ws::TungsteniteError;
-use compio_ws::{WebSocketMessage as Message, WebSocketStream};
-use iggy_common::IggyError;
+use compio_ws::WebSocketStream;
+use compio_ws::tungstenite::{Error as TungsteniteError, Message};
 use std::ptr;
 use tracing::{debug, warn};
 
@@ -69,6 +68,12 @@ impl WebSocketSender {
                 _ => IggyError::TcpError,
             }
         })
+    }
+}
+
+impl std::fmt::Debug for WebSocketSender {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WebSocketSender").finish()
     }
 }
 
@@ -147,8 +152,8 @@ impl Sender for WebSocketSender {
         self.flush_write_buffer().await
     }
 
-    async fn shutdown(&mut self) -> Result<(), ServerError> {
-        self.flush_write_buffer().await.map_err(ServerError::from)?;
+    async fn shutdown(&mut self) -> Result<(), IggyError> {
+        self.flush_write_buffer().await?;
 
         match self.stream.close(None).await {
             Ok(_) => Ok(()),
@@ -157,9 +162,7 @@ impl Sender for WebSocketSender {
                     debug!("WebSocket connection already closed: {}", e);
                     Ok(())
                 }
-                _ => Err(ServerError::from(
-                    IggyError::CannotCloseWebSocketConnection(format!("{}", e)),
-                )),
+                _ => Err(IggyError::CannotCloseWebSocketConnection(format!("{}", e))),
             },
         }
     }

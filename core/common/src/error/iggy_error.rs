@@ -489,6 +489,9 @@ pub enum IggyError {
     CannotBindToSocket(String) = 12000,
     #[error("Task execution timeout")]
     TaskTimeout = 12001,
+
+    #[error("IO error: {0}")]
+    IoError(String) = 13000,
 }
 
 impl IggyError {

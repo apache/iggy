@@ -107,7 +107,7 @@ We do also publish edge/dev/nightly releases (e.g. `0.6.0-edge.1` or `apache/igg
 
 - [Rust](https://crates.io/crates/iggy)
 - [C#](https://www.nuget.org/packages/Apache.Iggy/)
-- [Java](https://repository.apache.org/#nexus-search;quick~iggy)
+- [Java](https://mvnrepository.com/artifact/org.apache.iggy/iggy-java-sdk)
 - [Python](https://pypi.org/project/apache-iggy/)
 - [Node.js (TypeScript)](https://www.npmjs.com/package/apache-iggy)
 - [Go](https://pkg.go.dev/github.com/apache/iggy/foreign/go)

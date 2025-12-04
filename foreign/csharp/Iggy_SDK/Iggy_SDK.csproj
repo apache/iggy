@@ -7,7 +7,7 @@
         <TargetFramework>net8.0</TargetFramework>
         <AssemblyName>Apache.Iggy</AssemblyName>
         <RootNamespace>Apache.Iggy</RootNamespace>
-        <PackageVersion>0.6.1-edge.1</PackageVersion>
+        <PackageVersion>0.6.0</PackageVersion>
         <GenerateDocumentationFile>true</GenerateDocumentationFile>
     </PropertyGroup>
 

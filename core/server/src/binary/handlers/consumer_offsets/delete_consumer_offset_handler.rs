@@ -19,13 +19,12 @@
 use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
 use crate::binary::handlers::consumer_offsets::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
-use crate::binary::sender::SenderKind;
 use crate::shard::IggyShard;
 use crate::streaming::session::Session;
 use anyhow::Result;
 use err_trail::ErrContext;
-use iggy_common::IggyError;
 use iggy_common::delete_consumer_offset::DeleteConsumerOffset;
+use iggy_common::{IggyError, SenderKind};
 use std::rc::Rc;
 use tracing::debug;
 

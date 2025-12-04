@@ -23,7 +23,8 @@ use dashmap::DashMap;
 use dotenvy::dotenv;
 use err_trail::ErrContext;
 use figlet_rs::FIGfont;
-use iggy_common::{Aes256GcmEncryptor, EncryptorKind, IggyError};
+use iggy_common::{Aes256GcmEncryptor, EncryptorKind, IggyError, MemoryPool};
+use server::SEMANTIC_VERSION;
 use server::args::Args;
 use server::bootstrap::{
     create_directories, create_shard_connections, create_shard_executor, load_config, load_streams,
@@ -46,7 +47,6 @@ use server::state::system::SystemState;
 use server::streaming::clients::client_manager::{Client, ClientManager};
 use server::streaming::diagnostics::metrics::Metrics;
 use server::streaming::storage::SystemStorage;
-use server::streaming::utils::MemoryPool;
 use server::streaming::utils::ptr::EternalPtr;
 use server::versioning::SemanticVersion;
 use std::collections::HashSet;
@@ -158,14 +158,16 @@ fn main() -> Result<(), ServerError> {
         }
 
         // FOURTH DISCRETE LOADING STEP.
-        MemoryPool::init_pool(config.system.clone());
+        MemoryPool::init_pool(&config.system.memory_pool.into_other());
 
         // SIXTH DISCRETE LOADING STEP.
         let partition_persister = resolve_persister(config.system.partition.enforce_fsync);
         let storage = SystemStorage::new(config.system.clone(), partition_persister);
 
         // SEVENTH DISCRETE LOADING STEP.
-        let current_version = SemanticVersion::current().expect("Invalid version");
+        let current_version = SEMANTIC_VERSION;
+        info!("Current semantic version: {:?}", current_version);
+
         let mut system_info;
         let load_system_info = storage.info.load().await;
         match load_system_info {

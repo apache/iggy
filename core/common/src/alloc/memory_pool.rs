@@ -16,7 +16,6 @@
  * under the License.
  */
 
-use crate::configs::system::SystemConfig;
 use bytes::BytesMut;
 use crossbeam::queue::ArrayQueue;
 use human_repr::HumanCount;
@@ -72,6 +71,17 @@ pub fn memory_pool() -> &'static MemoryPool {
     MEMORY_POOL
         .get()
         .expect("Memory pool not initialized - MemoryPool::init_pool should be called first")
+}
+
+/// Configuration for the memory pool.
+#[derive(Debug)]
+pub struct MemoryPoolConfigOther {
+    /// Whether the pool is enabled.
+    pub enabled: bool,
+    /// Maximum size of the pool.
+    pub size: crate::IggyByteSize,
+    /// Maximum number of buffers per bucket.
+    pub bucket_capacity: u32,
 }
 
 /// A memory pool that maintains fixed-size buckets for reusing `BytesMut` buffers.
@@ -153,10 +163,10 @@ impl MemoryPool {
     }
 
     /// Initialize the global pool from the given config.
-    pub fn init_pool(config: Arc<SystemConfig>) {
-        let is_enabled = config.memory_pool.enabled;
-        let memory_limit = config.memory_pool.size.as_bytes_usize();
-        let bucket_capacity = config.memory_pool.bucket_capacity as usize;
+    pub fn init_pool(config: &MemoryPoolConfigOther) {
+        let is_enabled = config.enabled;
+        let memory_limit = config.size.as_bytes_usize();
+        let bucket_capacity = config.bucket_capacity as usize;
 
         let _ =
             MEMORY_POOL.get_or_init(|| MemoryPool::new(is_enabled, memory_limit, bucket_capacity));
@@ -445,7 +455,7 @@ impl BytesMutExt for BytesMut {
     }
 }
 
-/// Convert a size in bytes to a string like “8KiB” or “2MiB”.
+/// Convert a size in bytes to a string like "8KiB" or "2MiB".
 fn size_str(size: usize) -> String {
     if size >= 1024 * 1024 {
         format!("{}MiB", size / (1024 * 1024))
@@ -458,9 +468,9 @@ fn size_str(size: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use crate::{IggyByteSize, alloc::buffer::PooledBuffer};
+
     use super::*;
-    use crate::{configs::system::MemoryPoolConfig, streaming::utils::PooledBuffer};
-    use iggy_common::IggyByteSize;
     use serial_test::serial;
     use std::{str::FromStr, sync::Once};
 
@@ -468,15 +478,12 @@ mod tests {
 
     fn initialize_pool_for_tests() {
         TEST_INIT.call_once(|| {
-            let config = Arc::new(SystemConfig {
-                memory_pool: MemoryPoolConfig {
-                    enabled: true,
-                    size: IggyByteSize::from_str("4GiB").unwrap(),
-                    bucket_capacity: 8192,
-                },
-                ..SystemConfig::default()
-            });
-            MemoryPool::init_pool(config);
+            let config = MemoryPoolConfigOther {
+                enabled: true,
+                size: IggyByteSize::from_str("4GiB").unwrap(),
+                bucket_capacity: 8192,
+            };
+            MemoryPool::init_pool(&config);
         });
     }
 

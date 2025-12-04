@@ -156,6 +156,7 @@ pub struct RequestHeader {
     pub replica: u8,
     pub reserved_frame: [u8; 12],
 
+    pub client: u128,
     pub request_checksum: u128,
     pub timestamp: u64,
     pub request: u64,
@@ -200,6 +201,7 @@ pub struct PrepareHeader {
     pub replica: u8,
     pub reserved_frame: [u8; 12],
 
+    pub client: u128,
     pub parent: u128,
     pub parent_padding: u128,
     pub request_checksum: u128,

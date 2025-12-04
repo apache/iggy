@@ -20,7 +20,11 @@
 use crate::configs::connectors::{
     ConfigFormat, SinkConfig, SourceConfig, StreamConsumerConfig, StreamProducerConfig,
 };
-use crate::manager::{sink::SinkInfo, source::SourceInfo};
+use crate::manager::{
+    sink::SinkInfo,
+    source::SourceInfo,
+    status::{ConnectorError, ConnectorStatus},
+};
 use iggy_connector_sdk::transforms::TransformType;
 use serde::{Deserialize, Serialize};
 
@@ -31,7 +35,9 @@ pub struct SinkInfoResponse {
     pub name: String,
     pub path: String,
     pub enabled: bool,
-    pub running: bool,
+    pub status: ConnectorStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<ConnectorError>,
     pub plugin_config_format: Option<ConfigFormat>,
 }
 
@@ -56,7 +62,9 @@ pub struct SourceInfoResponse {
     pub name: String,
     pub path: String,
     pub enabled: bool,
-    pub running: bool,
+    pub status: ConnectorStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<ConnectorError>,
     pub plugin_config_format: Option<ConfigFormat>,
 }
 
@@ -88,7 +96,8 @@ impl From<SinkInfo> for SinkInfoResponse {
             name: sink.name,
             path: sink.path,
             enabled: sink.enabled,
-            running: sink.running,
+            status: sink.status,
+            last_error: sink.last_error,
             plugin_config_format: sink.plugin_config_format,
         }
     }
@@ -102,7 +111,8 @@ impl From<SourceInfo> for SourceInfoResponse {
             name: source.name,
             path: source.path,
             enabled: source.enabled,
-            running: source.running,
+            status: source.status,
+            last_error: source.last_error,
             plugin_config_format: source.plugin_config_format,
         }
     }

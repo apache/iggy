@@ -62,7 +62,8 @@ where
         }
 
         if self.consensus.is_follower() {
-            self.consensus.advance_commit_number();
+            self.consensus
+                .advance_commit_number(message.header().commit);
         }
         //self.consensus.update_op(header.op());
         self.journal.append(message).await;

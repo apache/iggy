@@ -17,13 +17,13 @@
  */
 
 use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
+use crate::binary::handlers::messages::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
-use crate::binary::{handlers::messages::COMPONENT, sender::SenderKind};
 use crate::shard::IggyShard;
 use crate::streaming::session::Session;
 use anyhow::Result;
 use err_trail::ErrContext;
-use iggy_common::{FlushUnsavedBuffer, IggyError};
+use iggy_common::{FlushUnsavedBuffer, IggyError, SenderKind};
 use std::rc::Rc;
 use tracing::{debug, instrument};
 
