@@ -4745,6 +4745,8 @@ dependencies = [
  "once_cell",
  "postcard",
  "reqwest",
+ "reqwest-middleware",
+ "reqwest-retry",
  "serde",
  "serde_json",
  "serde_with",

@@ -86,6 +86,7 @@ pub struct CompressionConfig {
 pub struct LoggingConfig {
     pub path: String,
     pub level: String,
+    pub file_enabled: bool,
     pub max_size: IggyByteSize,
     #[serde_as(as = "DisplayFromStr")]
     pub retention: IggyDuration,

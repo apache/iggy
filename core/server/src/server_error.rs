@@ -23,7 +23,7 @@ use std::array::TryFromSliceError;
 use std::io;
 
 error_set!(
-    ServerError := NumaError || ConfigurationError || ArchiverError || ConnectionError || LogError || CompatError || QuicError
+    ServerError := NumaError || ConfigurationError || ArchiverError || ConnectionError || LogError || CompatError || QuicError || ShardError
 
     IoError := {
         #[display("IO error")]
@@ -126,5 +126,10 @@ error_set!(
         ConfigCreationError,
         #[display("Transport config error")]
         TransportConfigError,
+    }
+
+    ShardError := {
+        #[display("Shard failed: {}", message)]
+        ShardFailure { message: String },
     }
 );

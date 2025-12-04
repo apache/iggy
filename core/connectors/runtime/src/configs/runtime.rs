@@ -53,6 +53,44 @@ pub struct IggyTlsConfig {
     pub domain: Option<String>,
 }
 
+#[serde_as]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetryConfig {
+    pub enabled: bool,
+    pub max_attempts: u32,
+    #[serde_as(as = "DisplayFromStr")]
+    pub initial_backoff: IggyDuration,
+    #[serde_as(as = "DisplayFromStr")]
+    pub max_backoff: IggyDuration,
+    pub backoff_multiplier: u32,
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_attempts: 3,
+            initial_backoff: IggyDuration::new_from_secs(1),
+            max_backoff: IggyDuration::new_from_secs(30),
+            backoff_multiplier: 2,
+        }
+    }
+}
+
+impl Display for RetryConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{{ enabled: {}, max_attempts: {}, initial_backoff: {}, max_backoff: {}, backoff_multiplier: {} }}",
+            self.enabled,
+            self.max_attempts,
+            self.initial_backoff,
+            self.max_backoff,
+            self.backoff_multiplier
+        )
+    }
+}
+
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct LocalConnectorsConfig {
@@ -72,18 +110,21 @@ pub struct HttpConnectorsConfig {
     pub url_templates: HashMap<String, String>,
     #[serde(default)]
     pub response: ResponseConfig,
+    #[serde(default)]
+    pub retry: RetryConfig,
 }
 
 impl Display for HttpConnectorsConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ type: \"http\", base_url: {:?}, request_headers: {:?}, timeout: {}, url_templates: {:?}, response: {:?} }}",
+            "{{ type: \"http\", base_url: {:?}, request_headers: {:?}, timeout: {}, url_templates: {:?}, response: {:?}, retry: {} }}",
             self.base_url,
             self.request_headers.keys(),
             self.timeout,
             self.url_templates,
-            self.response
+            self.response,
+            self.retry
         )
     }
 }
@@ -99,6 +140,7 @@ pub struct ResponseConfig {
     pub error_path: Option<String>,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "config_type", rename_all = "lowercase")]
 pub enum ConnectorsConfig {
