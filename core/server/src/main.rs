@@ -424,6 +424,7 @@ fn main() -> Result<(), ServerError> {
                                 return Err(e.to_string());
                             }
                             info!("Shard {id} run completed");
+
                             Ok(())
                         })
                     }));
