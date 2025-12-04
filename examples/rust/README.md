@@ -49,12 +49,6 @@ You can reset the credentials in one of two ways:
 
    This will ignore any existing data directory and re-initialize it with the default credentials.
 
-After starting the server, run any example with:
-
-```bash
-cargo run --example EXAMPLE_NAME
-```
-
 For server configuration options and help:
 
 ```bash
