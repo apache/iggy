@@ -49,7 +49,6 @@ use server::streaming::diagnostics::metrics::Metrics;
 use server::streaming::storage::SystemStorage;
 use server::streaming::utils::ptr::EternalPtr;
 use server::versioning::SemanticVersion;
-use std::collections::HashSet;
 use std::panic::AssertUnwindSafe;
 use std::rc::Rc;
 use std::str::FromStr;
@@ -299,7 +298,7 @@ fn main() -> Result<(), ServerError> {
         // TWELFTH DISCRETE LOADING STEP.
         info!("Starting {} shard(s)", shard_assignment.len());
         let (connections, shutdown_handles) = create_shard_connections(&shard_assignment);
-        let shards_count = shards_set.len();
+        let shards_count = shard_assignment.len();
         let mut handles: Vec<JoinHandle<()>> = Vec::with_capacity(shards_count);
 
         // Channel for shard completion notifications
