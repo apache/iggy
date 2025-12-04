@@ -30,7 +30,7 @@ use err_trail::ErrContext;
 use figment::providers::{Format, Toml};
 use figment::value::Dict;
 use figment::{Metadata, Profile, Provider};
-use iggy_common::{ConfigProvider, Validatable};
+use iggy_common::{ConfigProvider, IggyByteSize, MemoryPoolConfigOther, Validatable};
 use iggy_common::{CustomEnvProvider, FileConfigProvider, IggyDuration};
 use serde::{Deserialize, Serialize};
 use serde_with::DisplayFromStr;
@@ -62,6 +62,28 @@ pub struct ServerConfig {
     pub websocket: WebSocketConfig,
     pub telemetry: TelemetryConfig,
     pub cluster: ClusterConfig,
+}
+
+/// Configuration for the memory pool.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct MemoryPoolConfig {
+    /// Whether the pool is enabled.
+    pub enabled: bool,
+    /// Maximum size of the pool.
+    pub size: IggyByteSize,
+    /// Maximum number of buffers per bucket.
+    pub bucket_capacity: u32,
+}
+
+// Hack around the fact that we define our config inside of the `server`  crate, but `memory_pool` is in `common`.
+impl MemoryPoolConfig {
+    pub fn into_other(&self) -> MemoryPoolConfigOther {
+        MemoryPoolConfigOther {
+            enabled: self.enabled,
+            size: self.size,
+            bucket_capacity: self.bucket_capacity,
+        }
+    }
 }
 
 #[serde_as]

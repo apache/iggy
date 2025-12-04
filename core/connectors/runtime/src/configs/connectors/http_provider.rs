@@ -26,10 +26,12 @@ use crate::configs::connectors::{
     ConnectorConfigVersions, ConnectorsConfig, ConnectorsConfigProvider, CreateSinkConfig,
     CreateSourceConfig, SinkConfig, SourceConfig,
 };
-use crate::configs::runtime::ResponseConfig;
+use crate::configs::runtime::{ResponseConfig, RetryConfig};
 use crate::error::RuntimeError;
 use async_trait::async_trait;
 use reqwest;
+use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
+use reqwest_retry::{Jitter, RetryTransientMiddleware, policies::ExponentialBackoff};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -43,7 +45,7 @@ struct SetActiveVersionRequest {
 pub struct HttpConnectorsConfigProvider {
     url_builder: UrlBuilder,
     response_extractor: ResponseExtractor,
-    client: reqwest::Client,
+    client: ClientWithMiddleware,
 }
 
 impl HttpConnectorsConfigProvider {
@@ -53,6 +55,7 @@ impl HttpConnectorsConfigProvider {
         request_headers: &HashMap<String, String>,
         url_templates: &HashMap<String, String>,
         response_config: &ResponseConfig,
+        retry_config: &RetryConfig,
     ) -> Result<Self, RuntimeError> {
         let mut headers = reqwest::header::HeaderMap::new();
         for (key, value) in request_headers {
@@ -75,13 +78,35 @@ impl HttpConnectorsConfigProvider {
                 RuntimeError::InvalidConfiguration(format!("Failed to build HTTP client: {err}"))
             })?;
 
+        let mut client_with_middleware = ClientBuilder::new(client);
+
+        if retry_config.enabled {
+            tracing::trace!("Apply retry config: {:?}", retry_config);
+
+            let retry_policy = ExponentialBackoff::builder()
+                .retry_bounds(
+                    retry_config.initial_backoff.get_duration(),
+                    retry_config.max_backoff.get_duration(),
+                )
+                .base(retry_config.backoff_multiplier)
+                .jitter(Jitter::Bounded)
+                .build_with_max_retries(retry_config.max_attempts);
+
+            let retry_transient_middleware =
+                RetryTransientMiddleware::new_with_policy(retry_policy);
+
+            client_with_middleware = client_with_middleware.with(retry_transient_middleware);
+        }
+
+        let final_client = client_with_middleware.build();
+
         let url_builder = UrlBuilder::new(base_url, url_templates);
         let response_extractor = ResponseExtractor::new(response_config);
 
         Ok(Self {
             url_builder,
             response_extractor,
-            client,
+            client: final_client,
         })
     }
 

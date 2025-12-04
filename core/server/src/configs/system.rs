@@ -16,6 +16,7 @@
  * under the License.
  */
 
+use crate::configs::server::MemoryPoolConfig;
 use crate::slab::partitions;
 use crate::slab::streams;
 use crate::slab::topics;
@@ -85,6 +86,7 @@ pub struct CompressionConfig {
 pub struct LoggingConfig {
     pub path: String,
     pub level: String,
+    pub file_enabled: bool,
     pub max_size: IggyByteSize,
     #[serde_as(as = "DisplayFromStr")]
     pub retention: IggyDuration,
@@ -133,13 +135,6 @@ pub struct MessageDeduplicationConfig {
 #[derive(Debug, Deserialize, Serialize)]
 pub struct RecoveryConfig {
     pub recreate_missing_state: bool,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-pub struct MemoryPoolConfig {
-    pub enabled: bool,
-    pub size: IggyByteSize,
-    pub bucket_capacity: u32,
 }
 
 #[serde_as]

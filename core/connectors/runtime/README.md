@@ -65,6 +65,13 @@ timeout = "10s"
 [connectors.request_headers]
 api-key = "your-api-key"
 
+[connectors.retry]
+enabled = true
+max_attempts = 3
+initial_backoff = "1 s"
+max_backoff = "30 s"
+backoff_multiplier = 2
+
 [connectors.url_templates]
 # Optional: Customize URL templates for specific operations
 # If not specified, default RESTful URL patterns are used

@@ -255,7 +255,8 @@ components:
       - "scripts/run-go-examples-from-readme.sh"
       - "scripts/run-csharp-examples-from-readme.sh"
       - "scripts/run-python-examples-from-readme.sh"
-    tasks: ["examples-rust", "examples-go", "examples-csharp", "examples-python"]
+      - "scripts/run-node-examples-from-readme.sh"
+    tasks: ["examples-rust", "examples-go", "examples-csharp", "examples-python", "examples-node"]
 
   web-ui:
     paths:

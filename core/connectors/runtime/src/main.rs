@@ -189,10 +189,10 @@ async fn main() -> Result<(), RuntimeError> {
         connectors_config_provider,
     );
     let context = Arc::new(context);
-    api::init(&config.http, context).await;
+    api::init(&config.http, context.clone()).await;
 
-    source::handle(source_wrappers);
-    sink::consume(sink_wrappers);
+    source::handle(source_wrappers, context.clone());
+    sink::consume(sink_wrappers, context.clone());
     info!("All sources and sinks spawned.");
 
     #[cfg(unix)]
@@ -265,6 +265,7 @@ struct SinkConnectorPlugin {
     path: String,
     config_format: Option<ConfigFormat>,
     consumers: Vec<SinkConnectorConsumer>,
+    error: Option<String>,
 }
 
 struct SinkConnectorConsumer {
@@ -298,6 +299,7 @@ struct SourceConnectorPlugin {
     transforms: Vec<Arc<dyn Transform>>,
     producer: Option<SourceConnectorProducer>,
     state_storage: StateStorage,
+    error: Option<String>,
 }
 
 struct SourceConnectorProducer {

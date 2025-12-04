@@ -16,10 +16,9 @@
  * under the License.
  */
 
-use crate::VERSION;
 use crate::shard::IggyShard;
 use crate::slab::traits_ext::{EntityComponentSystem, IntoComponents};
-use crate::versioning::SemanticVersion;
+use crate::{SEMANTIC_VERSION, VERSION};
 use iggy_common::{IggyDuration, IggyError, Stats};
 use std::cell::RefCell;
 use sysinfo::{Pid, ProcessesToUpdate, System as SysinfoSystem};
@@ -69,9 +68,7 @@ impl IggyShard {
                 os_version,
                 kernel_version,
                 iggy_server_version: VERSION.to_owned(),
-                iggy_server_semver: SemanticVersion::current()
-                    .ok()
-                    .and_then(|v| v.get_numeric_version().ok()),
+                iggy_server_semver: SEMANTIC_VERSION.get_numeric_version().ok(),
                 ..Default::default()
             };
 

@@ -26,7 +26,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::trace;
 
-use crate::streaming::utils::PooledBuffer;
+use iggy_common::PooledBuffer;
 
 /// A dedicated struct for writing to the index file.
 #[derive(Debug)]

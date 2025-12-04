@@ -19,19 +19,15 @@
 
 package org.apache.iggy.client.blocking.tcp;
 
-import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import org.apache.iggy.client.blocking.StreamsClient;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.stream.StreamBase;
 import org.apache.iggy.stream.StreamDetails;
 
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 
-import static org.apache.iggy.client.blocking.tcp.BytesDeserializer.readStreamBase;
-import static org.apache.iggy.client.blocking.tcp.BytesDeserializer.readStreamDetails;
 import static org.apache.iggy.client.blocking.tcp.BytesSerializer.nameToBytes;
 import static org.apache.iggy.client.blocking.tcp.BytesSerializer.toBytes;
 
@@ -49,28 +45,18 @@ class StreamsTcpClient implements StreamsClient {
         var payload = Unpooled.buffer(payloadSize);
 
         payload.writeBytes(nameToBytes(name));
-        var response = tcpClient.send(CommandCode.Stream.CREATE, payload);
-        return readStreamDetails(response);
+        return tcpClient.exchangeForEntity(CommandCode.Stream.CREATE, payload, BytesDeserializer::readStreamDetails);
     }
 
     @Override
     public Optional<StreamDetails> getStream(StreamId streamId) {
         var payload = toBytes(streamId);
-        var response = tcpClient.send(CommandCode.Stream.GET, payload);
-        if (response.isReadable()) {
-            return Optional.of(readStreamDetails(response));
-        }
-        return Optional.empty();
+        return tcpClient.exchangeForOptional(CommandCode.Stream.GET, payload, BytesDeserializer::readStreamDetails);
     }
 
     @Override
     public List<StreamBase> getStreams() {
-        ByteBuf response = tcpClient.send(CommandCode.Stream.GET_ALL);
-        List<StreamBase> streams = new ArrayList<>();
-        while (response.isReadable()) {
-            streams.add(readStreamBase(response));
-        }
-        return streams;
+        return tcpClient.exchangeForList(CommandCode.Stream.GET_ALL, BytesDeserializer::readStreamBase);
     }
 
     @Override

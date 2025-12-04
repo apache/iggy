@@ -19,7 +19,6 @@
 
 package org.apache.iggy.client.blocking.tcp;
 
-import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import org.apache.iggy.client.blocking.ConsumerGroupsClient;
 import org.apache.iggy.consumergroup.ConsumerGroup;
@@ -28,12 +27,9 @@ import org.apache.iggy.identifier.ConsumerId;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
 
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 
-import static org.apache.iggy.client.blocking.tcp.BytesDeserializer.readConsumerGroup;
-import static org.apache.iggy.client.blocking.tcp.BytesDeserializer.readConsumerGroupDetails;
 import static org.apache.iggy.client.blocking.tcp.BytesSerializer.nameToBytes;
 import static org.apache.iggy.client.blocking.tcp.BytesSerializer.toBytes;
 
@@ -50,23 +46,16 @@ class ConsumerGroupsTcpClient implements ConsumerGroupsClient {
         var payload = toBytes(streamId);
         payload.writeBytes(toBytes(topicId));
         payload.writeBytes(toBytes(groupId));
-        var response = tcpClient.send(CommandCode.ConsumerGroup.GET, payload);
-        if (response.isReadable()) {
-            return Optional.of(readConsumerGroupDetails(response));
-        }
-        return Optional.empty();
+        return tcpClient.exchangeForOptional(
+                CommandCode.ConsumerGroup.GET, payload, BytesDeserializer::readConsumerGroupDetails);
     }
 
     @Override
     public List<ConsumerGroup> getConsumerGroups(StreamId streamId, TopicId topicId) {
         var payload = toBytes(streamId);
         payload.writeBytes(toBytes(topicId));
-        var response = tcpClient.send(CommandCode.ConsumerGroup.GET_ALL, payload);
-        List<ConsumerGroup> groups = new ArrayList<>();
-        while (response.isReadable()) {
-            groups.add(readConsumerGroup(response));
-        }
-        return groups;
+        return tcpClient.exchangeForList(
+                CommandCode.ConsumerGroup.GET_ALL, payload, BytesDeserializer::readConsumerGroup);
     }
 
     @Override
@@ -79,8 +68,8 @@ class ConsumerGroupsTcpClient implements ConsumerGroupsClient {
         payload.writeBytes(topicIdBytes);
         payload.writeBytes(nameToBytes(name));
 
-        ByteBuf response = tcpClient.send(CommandCode.ConsumerGroup.CREATE, payload);
-        return readConsumerGroupDetails(response);
+        return tcpClient.exchangeForEntity(
+                CommandCode.ConsumerGroup.CREATE, payload, BytesDeserializer::readConsumerGroupDetails);
     }
 
     @Override

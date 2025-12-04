@@ -55,18 +55,21 @@ pub fn print_locked_memory_limit_info() {
     eprintln!("  1. Temporarily (current session only):");
     eprintln!("     ulimit -l unlimited");
     eprintln!();
-    eprintln!("  2. Persistently (add to /etc/security/limits.conf):");
-    eprintln!("     * soft memlock unlimited");
-    eprintln!("     * hard memlock unlimited");
+    eprintln!("  2. Docker run:");
+    eprintln!("     docker run --ulimit memlock=-1:-1 ...");
     eprintln!();
-    eprintln!("  3. For systemd services (add to service file):");
-    eprintln!("     LimitMEMLOCK=infinity");
-    eprintln!();
-    eprintln!("  4. Docker Compose (add to service):");
+    eprintln!("  3. Docker Compose (add to service):");
     eprintln!("     ulimits:");
     eprintln!("       memlock:");
     eprintln!("         soft: -1");
     eprintln!("         hard: -1");
+    eprintln!();
+    eprintln!("  4. Persistently (add to /etc/security/limits.conf):");
+    eprintln!("     * soft memlock unlimited");
+    eprintln!("     * hard memlock unlimited");
+    eprintln!();
+    eprintln!("  5. For systemd services (add to service file):");
+    eprintln!("     LimitMEMLOCK=infinity");
     eprintln!();
 }
 

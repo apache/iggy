@@ -16,17 +16,16 @@
  * under the License.
  */
 
-use crate::quic::COMPONENT;
-use crate::streaming::utils::PooledBuffer;
-use crate::{binary::sender::Sender, server_error::ServerError};
+use super::{PooledBuffer, Sender};
+use crate::IggyError;
 use compio::BufResult;
 use compio::buf::IoBufMut;
 use compio::io::AsyncReadExt;
 use compio_quic::{RecvStream, SendStream};
 use err_trail::ErrContext;
-use iggy_common::IggyError;
 use tracing::{debug, error};
 
+const COMPONENT: &str = "QUIC";
 const STATUS_OK: &[u8] = &[0; 4];
 
 #[derive(Debug)]
@@ -62,7 +61,7 @@ impl Sender for QuicSender {
             .await
     }
 
-    async fn shutdown(&mut self) -> Result<(), ServerError> {
+    async fn shutdown(&mut self) -> Result<(), IggyError> {
         Ok(())
     }
 

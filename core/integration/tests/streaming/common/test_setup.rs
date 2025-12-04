@@ -17,9 +17,9 @@
  */
 
 use compio::fs;
+use iggy_common::MemoryPool;
 use server::bootstrap::create_directories;
 use server::configs::system::SystemConfig;
-use server::streaming::utils::MemoryPool;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -40,7 +40,7 @@ impl TestSetup {
         let config = Arc::new(config);
         fs::create_dir(config.get_system_path()).await.unwrap();
         create_directories(&config).await.unwrap();
-        MemoryPool::init_pool(config.clone());
+        MemoryPool::init_pool(&config.memory_pool.into_other());
         TestSetup { config }
     }
 }

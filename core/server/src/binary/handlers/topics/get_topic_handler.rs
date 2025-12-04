@@ -19,12 +19,12 @@
 use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
-use crate::binary::sender::SenderKind;
 use crate::shard::IggyShard;
 use crate::streaming::session::Session;
 use crate::streaming::streams;
 use anyhow::Result;
 use iggy_common::IggyError;
+use iggy_common::SenderKind;
 use iggy_common::get_topic::GetTopic;
 use std::rc::Rc;
 use tracing::debug;

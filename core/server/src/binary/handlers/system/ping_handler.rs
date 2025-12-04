@@ -17,12 +17,12 @@
  */
 
 use crate::binary::command::{BinaryServerCommand, ServerCommandHandler};
-use crate::binary::sender::SenderKind;
 use crate::shard::IggyShard;
 use crate::streaming::session::Session;
 use anyhow::Result;
 use iggy_common::IggyError;
 use iggy_common::IggyTimestamp;
+use iggy_common::SenderKind;
 use iggy_common::ping::Ping;
 use std::rc::Rc;
 use tracing::debug;
