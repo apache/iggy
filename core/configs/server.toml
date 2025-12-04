@@ -346,6 +346,10 @@ path = "logs"
 # Note: RUST_LOG environment variable always takes precedence over this setting.
 level = "info"
 
+# Whether to write logs to file. When false, logs are only written to stdout.
+# When enabled, logs are stored in {system.path}/{system.logging.path} (default: local_data/logs).
+file_enabled = true
+
 # Maximum size of the log files before rotation.
 max_size = "512 MB"
 

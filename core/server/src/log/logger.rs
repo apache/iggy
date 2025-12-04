@@ -248,39 +248,49 @@ impl Logging {
 
         self.dump_to_stdout();
 
-        // Initialize directory and file for logs
-        let base_directory = PathBuf::from(base_directory);
-        let logs_subdirectory = PathBuf::from(config.path.clone());
-        let logs_path = base_directory.join(logs_subdirectory.clone());
-        let file_appender =
-            tracing_appender::rolling::hourly(logs_path.clone(), IGGY_LOG_FILE_PREFIX);
-        let (mut non_blocking_file, file_guard) = tracing_appender::non_blocking(file_appender);
+        // Initialize file logging if enabled
+        let logs_path = if config.file_enabled {
+            let base_directory = PathBuf::from(base_directory);
+            let logs_subdirectory = PathBuf::from(config.path.clone());
+            let logs_path = base_directory.join(logs_subdirectory.clone());
+            let file_appender =
+                tracing_appender::rolling::hourly(logs_path.clone(), IGGY_LOG_FILE_PREFIX);
+            let (mut non_blocking_file, file_guard) = tracing_appender::non_blocking(file_appender);
 
-        self.dump_to_file(&mut non_blocking_file);
+            self.dump_to_file(&mut non_blocking_file);
 
-        let file_layer = fmt::layer()
-            .event_format(Self::get_log_format())
-            .with_target(true)
-            .with_writer(non_blocking_file)
-            .with_ansi(false)
-            .fmt_fields(NoAnsiFields {})
-            .boxed();
+            let file_layer = fmt::layer()
+                .event_format(Self::get_log_format())
+                .with_target(true)
+                .with_writer(non_blocking_file)
+                .with_ansi(false)
+                .fmt_fields(NoAnsiFields {})
+                .boxed();
 
-        self.file_guard = Some(file_guard);
-        self.file_reload_handle
-            .as_ref()
-            .ok_or(LogError::FileReloadFailure)?
-            .modify(|layer| *layer = file_layer)
-            .expect("Failed to modify file layer");
+            self.file_guard = Some(file_guard);
+            self.file_reload_handle
+                .as_ref()
+                .ok_or(LogError::FileReloadFailure)?
+                .modify(|layer| *layer = file_layer)
+                .expect("Failed to modify file layer");
+
+            Some(logs_path)
+        } else {
+            None
+        };
 
         // Initialize telemetry if enabled
         if telemetry_config.enabled {
             self.init_telemetry(telemetry_config)?;
         }
 
-        info!(
-            "Logging initialized, logs will be stored at: {logs_path:?}. Logs will be rotated hourly. Log filter: {log_filter}."
-        );
+        if let Some(logs_path) = logs_path {
+            info!(
+                "Logging initialized, logs will be stored at: {logs_path:?}. Logs will be rotated hourly. Log filter: {log_filter}."
+            );
+        } else {
+            info!("Logging initialized (file output disabled). Log filter: {log_filter}.");
+        }
 
         Ok(())
     }
