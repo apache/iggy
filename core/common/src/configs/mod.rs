@@ -34,6 +34,7 @@ use figment::{
 use serde::{Serialize, de::DeserializeOwned};
 use std::{env, fmt::Display, future::Future, marker::PhantomData, path::Path};
 use toml::{Value as TomlValue, map::Map as TomlMap};
+use tracing::{error, info, warn};
 
 const SECRET_MASK: &str = "******";
 const ARRAY_SEPARATOR: char = '_';
@@ -162,7 +163,7 @@ impl<T: ConfigurationType> CustomEnvProvider<T> {
                 value = SECRET_MASK.to_string();
             }
 
-            println!("{env_key} value changed to: {value} from environment variable");
+            info!("{env_key} value changed to: {value} from environment variable");
             Self::insert_environment_override(&source_dict, &mut target_dict, keys, env_var_value);
         }
 
@@ -752,7 +753,7 @@ fn file_exists<P: AsRef<Path>>(path: P) -> bool {
 
 impl<T: ConfigurationType, P: Provider + Clone> ConfigProvider<T> for FileConfigProvider<P> {
     async fn load_config(&self) -> Result<T, ConfigurationError> {
-        println!("Loading config from path: '{}'...", self.file_path);
+        info!("Loading config from path: '{}'...", self.file_path);
 
         // Start with the default configuration if provided
         let mut config_builder = Figment::new();
@@ -760,20 +761,22 @@ impl<T: ConfigurationType, P: Provider + Clone> ConfigProvider<T> for FileConfig
         if let Some(default) = &self.default_config {
             config_builder = config_builder.merge(default);
         } else {
-            println!("No default configuration provided.");
+            warn!("No default configuration provided.");
         }
 
         // If the config file exists, merge it into the configuration
         if file_exists(&self.file_path) {
-            println!("Found configuration file at path: '{}'.", self.file_path);
+            info!("Found configuration file at path: '{}'.", self.file_path);
             config_builder = config_builder.merge(Toml::file(&self.file_path));
         } else {
-            println!(
+            warn!(
                 "Configuration file not found at path: '{}'.",
                 self.file_path
             );
             if has_default {
-                println!("Using default configuration as no config file was found.");
+                info!(
+                    "Using default configuration embedded into server, as no config file was found."
+                );
             }
         }
 
@@ -785,17 +788,17 @@ impl<T: ConfigurationType, P: Provider + Clone> ConfigProvider<T> for FileConfig
 
         match config_result {
             Ok(config) => {
-                println!("Config loaded successfully.");
+                info!("Config loaded successfully.");
                 let display_config = env::var(DISPLAY_CONFIG_ENV)
                     .map(|val| val == "1" || val.to_lowercase() == "true")
                     .unwrap_or(self.display_config);
                 if display_config {
-                    println!("Using Config: {config}");
+                    info!("Using Config: {config}");
                 }
                 Ok(config)
             }
             Err(e) => {
-                println!("Failed to load config: {e}");
+                error!("Failed to load config: {e}");
                 Err(ConfigurationError::CannotLoadConfiguration)
             }
         }

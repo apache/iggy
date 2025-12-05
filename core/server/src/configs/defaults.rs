@@ -399,6 +399,7 @@ impl Default for LoggingConfig {
         LoggingConfig {
             path: SERVER_CONFIG.system.logging.path.parse().unwrap(),
             level: SERVER_CONFIG.system.logging.level.parse().unwrap(),
+            file_enabled: SERVER_CONFIG.system.logging.file_enabled,
             max_size: SERVER_CONFIG.system.logging.max_size.parse().unwrap(),
             retention: SERVER_CONFIG.system.logging.retention.parse().unwrap(),
             sysinfo_print_interval: SERVER_CONFIG

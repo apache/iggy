@@ -242,6 +242,7 @@ pub async fn create_connectors_config_provider(
                 &config.request_headers,
                 &config.url_templates,
                 &config.response,
+                &config.retry,
             )?;
             Ok(Box::new(provider))
         }
