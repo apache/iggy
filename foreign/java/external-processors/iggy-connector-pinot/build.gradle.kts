@@ -40,6 +40,7 @@ dependencies {
     // Testing
     testImplementation(platform(libs.junit.bom))
     testImplementation(libs.bundles.testing)
+    testImplementation("org.apache.pinot:pinot-spi:1.2.0") // Need Pinot SPI for tests
     testRuntimeOnly(libs.slf4j.simple)
 }
 
