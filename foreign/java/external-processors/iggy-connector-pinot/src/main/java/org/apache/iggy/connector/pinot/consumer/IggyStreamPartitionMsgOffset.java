@@ -38,15 +38,6 @@ public class IggyStreamPartitionMsgOffset implements StreamPartitionMsgOffset {
         this.offset = offset;
     }
 
-    /**
-     * Creates an offset from a string representation.
-     *
-     * @param offsetStr string representation of offset
-     * @return parsed offset
-     */
-    public static IggyStreamPartitionMsgOffset fromString(String offsetStr) {
-        return new IggyStreamPartitionMsgOffset(Long.parseLong(offsetStr));
-    }
 
     public long getOffset() {
         return offset;

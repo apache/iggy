@@ -21,8 +21,8 @@ package org.apache.iggy.connector.pinot.config;
 
 import java.util.Map;
 
+import org.apache.pinot.spi.stream.OffsetCriteria;
 import org.apache.pinot.spi.stream.StreamConfig;
-import org.apache.pinot.spi.stream.StreamConfigProperties;
 
 /**
  * Configuration class for Iggy stream ingestion in Pinot.
@@ -149,9 +149,9 @@ public class IggyStreamConfig {
     /**
      * Gets the offset specification from Pinot's consumer config.
      *
-     * @return offset spec (e.g., "smallest", "largest")
+     * @return offset criteria
      */
-    public String getOffsetSpec() {
+    public OffsetCriteria getOffsetCriteria() {
         return streamConfig.getOffsetCriteria();
     }
 

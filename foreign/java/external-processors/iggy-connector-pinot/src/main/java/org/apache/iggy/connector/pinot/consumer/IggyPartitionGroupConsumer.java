@@ -94,7 +94,6 @@ public class IggyPartitionGroupConsumer implements PartitionGroupConsumer {
      * @param timeoutMillis timeout for the fetch operation
      * @return batch of messages, or empty batch if no messages available
      */
-    @Override
     public MessageBatch fetchMessages(StreamPartitionMsgOffset startOffset, long timeoutMillis) {
         try {
             ensureConnected();
@@ -201,11 +200,17 @@ public class IggyPartitionGroupConsumer implements PartitionGroupConsumer {
                     partitionId,
                     config.getPollBatchSize());
 
-            // Poll with auto-commit enabled
+            // Poll with auto-commit enabled (convert int to Long)
             PolledMessages polledMessages = asyncClient
                     .messages()
                     .pollMessagesAsync(
-                            streamId, topicId, partition, consumer, strategy, config.getPollBatchSize(), true)
+                            streamId,
+                            topicId,
+                            partition,
+                            consumer,
+                            strategy,
+                            Long.valueOf(config.getPollBatchSize()),
+                            true)
                     .join();
 
             log.debug(

@@ -20,8 +20,6 @@
 package org.apache.iggy.connector.pinot.metadata;
 
 import java.io.IOException;
-import java.util.ArrayList;
-import java.util.List;
 import java.util.Optional;
 
 import org.apache.iggy.client.async.tcp.AsyncIggyTcpClient;
@@ -29,10 +27,9 @@ import org.apache.iggy.connector.pinot.config.IggyStreamConfig;
 import org.apache.iggy.connector.pinot.consumer.IggyStreamPartitionMsgOffset;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
-import org.apache.iggy.message.MessageState;
-import org.apache.iggy.stats.TopicStats;
-import org.apache.iggy.topic.Topic;
-import org.apache.pinot.spi.stream.PartitionGroupMetadata;
+import org.apache.iggy.partition.Partition;
+import org.apache.iggy.topic.TopicDetails;
+import org.apache.pinot.spi.stream.OffsetCriteria;
 import org.apache.pinot.spi.stream.StreamMetadataProvider;
 import org.apache.pinot.spi.stream.StreamPartitionMsgOffset;
 import org.slf4j.Logger;
@@ -61,9 +58,9 @@ public class IggyStreamMetadataProvider implements StreamMetadataProvider {
     private AsyncIggyTcpClient asyncClient;
     private StreamId streamId;
     private TopicId topicId;
-    private TopicStats cachedTopicStats;
-    private long lastStatsRefresh;
-    private static final long STATS_CACHE_MS = 5000; // 5 seconds cache
+    private TopicDetails cachedTopicDetails;
+    private long lastDetailsRefresh;
+    private static final long DETAILS_CACHE_MS = 5000; // 5 seconds cache
 
     /**
      * Creates a stream-level metadata provider (all partitions).
@@ -100,30 +97,19 @@ public class IggyStreamMetadataProvider implements StreamMetadataProvider {
      *
      * @param timeoutMillis timeout for the operation
      * @return list of partition metadata
-     * @throws IOException if metadata retrieval fails
+     * @throws Exception if metadata retrieval fails
      */
     @Override
-    public List<PartitionGroupMetadata> computePartitionGroupMetadata(
-            String clientId, StreamConfig streamConfig, List<PartitionGroupConsumptionStatus> partitionGroupConsumptionStatusList, long timeoutMillis)
-            throws IOException {
+    public int fetchPartitionCount(long timeoutMillis) {
         try {
             ensureConnected();
-
-            Topic topic = fetchTopicInfo();
-            int partitionCount = topic.partitionsCount();
-
+            TopicDetails topicDetails = fetchTopicDetails();
+            int partitionCount = topicDetails.partitionsCount().intValue();
             log.info("Found {} partitions for topic {}", partitionCount, config.getTopicId());
-
-            List<PartitionGroupMetadata> metadataList = new ArrayList<>();
-            for (int i = 0; i < partitionCount; i++) {
-                metadataList.add(new PartitionGroupMetadata(i, new IggyStreamPartitionMsgOffset(0)));
-            }
-
-            return metadataList;
-
+            return partitionCount;
         } catch (Exception e) {
-            log.error("Error computing partition metadata: {}", e.getMessage(), e);
-            throw new IOException("Failed to compute partition metadata", e);
+            log.error("Error fetching partition count: {}", e.getMessage(), e);
+            throw new RuntimeException("Failed to fetch partition count", e);
         }
     }
 
@@ -131,24 +117,37 @@ public class IggyStreamMetadataProvider implements StreamMetadataProvider {
      * Fetches the current offset for consumption.
      * For Iggy, we rely on consumer group state, so this returns the earliest offset.
      *
-     * @param partition partition identifier
+     * @param offsetCriteria offset criteria (earliest, latest, etc.)
      * @param timeoutMillis timeout for the operation
      * @return current offset for the partition
-     * @throws IOException if fetch fails
      */
     @Override
-    public StreamPartitionMsgOffset fetchStreamPartitionOffset(
-            PartitionGroupMetadata partition, long timeoutMillis) throws IOException {
+    public StreamPartitionMsgOffset fetchStreamPartitionOffset(OffsetCriteria offsetCriteria, long timeoutMillis) {
         try {
             ensureConnected();
 
-            // For consumer group based consumption, return earliest offset
-            // The consumer group will manage the actual offset
-            return new IggyStreamPartitionMsgOffset(0);
+            if (partitionId == null) {
+                throw new IllegalStateException("Partition ID must be set for offset queries");
+            }
+
+            Partition partition = getPartitionInfo(partitionId);
+
+            // Handle offset criteria
+            if (offsetCriteria != null && offsetCriteria.isSmallest()) {
+                // Return earliest available offset (0 for Iggy)
+                return new IggyStreamPartitionMsgOffset(0);
+            } else if (offsetCriteria != null && offsetCriteria.isLargest()) {
+                // Return latest offset based on messages count
+                long latestOffset = partition.messagesCount().longValue();
+                return new IggyStreamPartitionMsgOffset(latestOffset);
+            } else {
+                // Default to consumer group managed offset (start from 0)
+                return new IggyStreamPartitionMsgOffset(0);
+            }
 
         } catch (Exception e) {
             log.error("Error fetching partition offset: {}", e.getMessage(), e);
-            throw new IOException("Failed to fetch partition offset", e);
+            throw new RuntimeException("Failed to fetch partition offset", e);
         }
     }
 
@@ -178,55 +177,33 @@ public class IggyStreamMetadataProvider implements StreamMetadataProvider {
     }
 
     /**
-     * Fetches topic information from Iggy.
+     * Fetches topic details with caching.
      */
-    private Topic fetchTopicInfo() {
-        try {
-            return asyncClient.topics().getTopic(streamId, topicId).join();
-        } catch (Exception e) {
-            log.error("Error fetching topic info: {}", e.getMessage(), e);
-            throw new RuntimeException("Failed to fetch topic info", e);
-        }
-    }
-
-    /**
-     * Fetches topic statistics with caching.
-     */
-    private TopicStats fetchTopicStats() {
+    private TopicDetails fetchTopicDetails() {
         long now = System.currentTimeMillis();
-        if (cachedTopicStats == null || (now - lastStatsRefresh) > STATS_CACHE_MS) {
+        if (cachedTopicDetails == null || (now - lastDetailsRefresh) > DETAILS_CACHE_MS) {
             try {
-                cachedTopicStats = asyncClient.topics().getTopicStats(streamId, topicId).join();
-                lastStatsRefresh = now;
+                Optional<TopicDetails> details = asyncClient.topics().getTopicAsync(streamId, topicId).join();
+                cachedTopicDetails = details.orElseThrow(
+                        () -> new RuntimeException("Topic not found: " + config.getTopicId()));
+                lastDetailsRefresh = now;
             } catch (Exception e) {
-                log.error("Error fetching topic stats: {}", e.getMessage(), e);
-                throw new RuntimeException("Failed to fetch topic stats", e);
+                log.error("Error fetching topic details: {}", e.getMessage(), e);
+                throw new RuntimeException("Failed to fetch topic details", e);
             }
         }
-        return cachedTopicStats;
+        return cachedTopicDetails;
     }
 
     /**
-     * Gets the number of partitions in the topic.
+     * Gets information for a specific partition.
      */
-    public int getPartitionCount() {
-        ensureConnected();
-        Topic topic = fetchTopicInfo();
-        return topic.partitionsCount();
-    }
-
-    /**
-     * Gets statistics for a specific partition.
-     */
-    public MessageState getPartitionStats(int partitionId) {
-        ensureConnected();
-        TopicStats stats = fetchTopicStats();
-
-        Optional<MessageState> partitionStats =
-                stats.partitions().stream().filter(p -> p.id() == partitionId).findFirst();
-
-        return partitionStats.orElseThrow(
-                () -> new IllegalArgumentException("Partition " + partitionId + " not found"));
+    private Partition getPartitionInfo(int partitionId) {
+        TopicDetails details = fetchTopicDetails();
+        return details.partitions().stream()
+                .filter(p -> p.id().intValue() == partitionId)
+                .findFirst()
+                .orElseThrow(() -> new IllegalArgumentException("Partition " + partitionId + " not found"));
     }
 
     /**

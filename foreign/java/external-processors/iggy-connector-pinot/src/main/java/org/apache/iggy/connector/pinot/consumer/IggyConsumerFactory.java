@@ -49,6 +49,13 @@ import org.apache.pinot.spi.stream.StreamMetadataProvider;
  */
 public class IggyConsumerFactory extends StreamConsumerFactory {
 
+    private StreamConfig streamConfig;
+
+    @Override
+    public void init(StreamConfig streamConfig) {
+        this.streamConfig = streamConfig;
+    }
+
     /**
      * Creates a partition-level consumer for reading from a specific Iggy partition.
      * Pinot calls this method for each partition that needs to be consumed.
@@ -57,9 +64,8 @@ public class IggyConsumerFactory extends StreamConsumerFactory {
      * @param groupId partition group identifier (partition ID in Iggy)
      * @return a new partition consumer instance
      */
-    @Override
     public PartitionGroupConsumer createPartitionGroupConsumer(String clientId, int groupId) {
-        IggyStreamConfig iggyConfig = new IggyStreamConfig(streamConfig);
+        IggyStreamConfig iggyConfig = new IggyStreamConfig(this.streamConfig);
         return new IggyPartitionGroupConsumer(clientId, iggyConfig, groupId);
     }
 
@@ -71,9 +77,8 @@ public class IggyConsumerFactory extends StreamConsumerFactory {
      * @param groupId partition group identifier
      * @return a new metadata provider instance
      */
-    @Override
     public StreamMetadataProvider createPartitionMetadataProvider(String clientId, int groupId) {
-        IggyStreamConfig iggyConfig = new IggyStreamConfig(streamConfig);
+        IggyStreamConfig iggyConfig = new IggyStreamConfig(this.streamConfig);
         return new IggyStreamMetadataProvider(clientId, iggyConfig, groupId);
     }
 
@@ -83,103 +88,9 @@ public class IggyConsumerFactory extends StreamConsumerFactory {
      * @param clientId unique identifier for this metadata provider instance
      * @return a new metadata provider instance
      */
-    @Override
     public StreamMetadataProvider createStreamMetadataProvider(String clientId) {
-        IggyStreamConfig iggyConfig = new IggyStreamConfig(streamConfig);
+        IggyStreamConfig iggyConfig = new IggyStreamConfig(this.streamConfig);
         return new IggyStreamMetadataProvider(clientId, iggyConfig);
     }
 
-    /**
-     * Gets the consumption status for a partition group.
-     * This is used by Pinot to track whether a partition has reached the end.
-     *
-     * @param consumer the partition consumer
-     * @param startTime consumption start time
-     * @param endTime consumption end time
-     * @param endOffset target end offset
-     * @return consumption status indicating progress
-     */
-    @Override
-    public PartitionGroupConsumptionStatus createPartitionGroupConsumptionStatus(
-            PartitionGroupConsumer consumer, long startTime, long endTime, long endOffset) {
-        // For unbounded streams, return a status indicating more data is available
-        return new IggyPartitionGroupConsumptionStatus(startTime, endTime, endOffset);
-    }
-
-    /**
-     * Implementation of PartitionGroupConsumptionStatus for Iggy streams.
-     * Since Iggy is an unbounded stream, we always indicate that catchup is not complete.
-     */
-    private static class IggyPartitionGroupConsumptionStatus implements PartitionGroupConsumptionStatus {
-        private final long startTime;
-        private final long endTime;
-        private final long endOffset;
-
-        public IggyPartitionGroupConsumptionStatus(long startTime, long endTime, long endOffset) {
-            this.startTime = startTime;
-            this.endTime = endTime;
-            this.endOffset = endOffset;
-        }
-
-        @Override
-        public long getStartOffset() {
-            return 0;
-        }
-
-        @Override
-        public long getEndOffset() {
-            return endOffset;
-        }
-
-        @Override
-        public long getCurrentOffset() {
-            return 0;
-        }
-
-        @Override
-        public long getStartTime() {
-            return startTime;
-        }
-
-        @Override
-        public long getEndTime() {
-            return endTime;
-        }
-
-        @Override
-        public long getTotalStreamMessageCount() {
-            return 0;
-        }
-
-        @Override
-        public long getTotalPartitionGroupMessageCount() {
-            return 0;
-        }
-
-        /**
-         * For unbounded streams, catchup is never complete.
-         * This ensures Pinot continues to poll for new messages.
-         */
-        @Override
-        public boolean isCatchupComplete() {
-            return false;
-        }
-
-        @Override
-        public long getCatchupTimeMillis() {
-            return 0;
-        }
-
-        @Override
-        public String toString() {
-            return "IggyPartitionGroupConsumptionStatus{"
-                    + "startTime="
-                    + startTime
-                    + ", endTime="
-                    + endTime
-                    + ", endOffset="
-                    + endOffset
-                    + ", isCatchupComplete=false}";
-        }
-    }
 }
