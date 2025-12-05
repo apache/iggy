@@ -1,0 +1,100 @@
+version: '3.8'
+
+services:
+  # Apache Iggy Server (from official Apache repo)
+  iggy:
+    image: apache/iggy:latest
+    container_name: iggy-server
+    ports:
+      - "8090:8090"  # TCP
+      - "3000:3000"  # HTTP
+      - "8080:8080"  # HTTP API
+    environment:
+      - IGGY_LOG_LEVEL=info
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - iggy-pinot-network
+
+  # Zookeeper (required by Pinot)
+  zookeeper:
+    image: zookeeper:3.9
+    container_name: pinot-zookeeper
+    ports:
+      - "2181:2181"
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    networks:
+      - iggy-pinot-network
+
+  # Apache Pinot Controller
+  pinot-controller:
+    image: apachepinot/pinot:latest
+    container_name: pinot-controller
+    command: "StartController -zkAddress zookeeper:2181"
+    ports:
+      - "9000:9000"
+    environment:
+      JAVA_OPTS: "-Xms1G -Xmx2G -XX:+UseG1GC"
+    depends_on:
+      - zookeeper
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - iggy-pinot-network
+
+  # Apache Pinot Broker
+  pinot-broker:
+    image: apachepinot/pinot:latest
+    container_name: pinot-broker
+    command: "StartBroker -zkAddress zookeeper:2181"
+    ports:
+      - "8099:8099"
+    environment:
+      JAVA_OPTS: "-Xms512M -Xmx1G -XX:+UseG1GC"
+    depends_on:
+      - pinot-controller
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8099/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - iggy-pinot-network
+
+  # Apache Pinot Server
+  pinot-server:
+    image: apachepinot/pinot:latest
+    container_name: pinot-server
+    command: "StartServer -zkAddress zookeeper:2181"
+    ports:
+      - "8098:8098"
+    environment:
+      JAVA_OPTS: "-Xms1G -Xmx2G -XX:+UseG1GC"
+    depends_on:
+      - pinot-broker
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8098/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    volumes:
+      - ./build/libs:/opt/pinot/plugins/iggy-connector
+      - ./deployment:/opt/pinot/deployment
+    networks:
+      - iggy-pinot-network
+
+networks:
+  iggy-pinot-network:
+    driver: bridge
