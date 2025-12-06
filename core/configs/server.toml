@@ -556,7 +556,10 @@ ports = { tcp = 8091, quic = 8081, http = 3001, websocket = 8093 }
 # - "all": Use all available CPU cores (default)
 # - numeric value (e.g. 4): Use 4 shards (4 threads pinned to cores 0, 1, 2, 3)
 # - range (e.g. "5..8"): Use 3 shards with affinity to cores 5, 6, 7
-cpu_allocation = "all"
+# - numa settings:
+#     + "numa:auto": Use all available numa node, cores
+#     + "numa:nodes=0,1;cores=4;no_ht=true": Use NUMA node 0 and 1, each nodes use 4 cores, and no hyperthreads
+cpu_allocation = "numa:auto"
 
 [websocket]
 enabled = true

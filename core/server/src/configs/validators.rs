@@ -25,6 +25,7 @@ use super::sharding::{CpuAllocation, ShardingConfig};
 use super::system::{CompressionConfig, PartitionConfig};
 use crate::configs::COMPONENT;
 use crate::configs::server::{MemoryPoolConfig, PersonalAccessTokenConfig, ServerConfig};
+use crate::configs::sharding::NumaTopology;
 use crate::configs::system::SegmentConfig;
 use crate::streaming::segments::*;
 use err_trail::ErrContext;
@@ -321,6 +322,18 @@ impl Validatable<ConfigurationError> for ShardingConfig {
                 }
                 Ok(())
             }
+            CpuAllocation::NumaAware(numa_config) => match NumaTopology::detect() {
+                // TODO: dry the validation, already validate it from the shard allocation
+                Ok(topology) => numa_config.validate(&topology).map_err(|e| {
+                    eprintln!("Invalid NUMA configuration: {}", e);
+                    ConfigurationError::InvalidConfigurationValue
+                }),
+                Err(e) => {
+                    eprintln!("Failed to detect NUMA topology: {}", e);
+                    eprintln!("NUMA allocation requested but system doesn't support it");
+                    Err(ConfigurationError::InvalidConfigurationValue)
+                }
+            },
         }
     }
 }
