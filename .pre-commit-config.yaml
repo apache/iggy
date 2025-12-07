@@ -89,7 +89,7 @@ repos:
     hooks:
       - id: cargo-fmt
         name: cargo fmt
-        entry: cargo fmt --all
+        entry: cargo +nightly fmt --all
         language: system
         types: [rust]
         pass_filenames: false

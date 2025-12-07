@@ -47,6 +47,11 @@ runs:
         cache-targets: false # Only cache registry and git deps, not target dir (sccache handles that)
         show-stats: true
 
+    - name: Install nightly toolchain for rustfmt
+      if: inputs.task == 'fmt'
+      run: rustup toolchain install nightly --component rustfmt
+      shell: bash
+
     - name: Install tools for specific tasks
       run: |
         case "${{ inputs.task }}" in
@@ -67,7 +72,7 @@ runs:
 
     - name: Cargo fmt
       if: inputs.task == 'fmt'
-      run: cargo fmt --all -- --check
+      run: cargo +nightly fmt --all -- --check
       shell: bash
 
     - name: Cargo clippy
