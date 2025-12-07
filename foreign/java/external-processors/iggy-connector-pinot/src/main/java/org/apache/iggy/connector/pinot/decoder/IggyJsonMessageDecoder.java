@@ -19,14 +19,12 @@
 
 package org.apache.iggy.connector.pinot.decoder;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.apache.pinot.spi.data.readers.GenericRow;
+import org.apache.pinot.spi.stream.StreamMessageDecoder;
+
 import java.util.Map;
 import java.util.Set;
-
-import com.fasterxml.jackson.databind.ObjectMapper;
-
-import org.apache.pinot.spi.data.readers.GenericRow;
-import org.apache.pinot.spi.plugin.PluginManager;
-import org.apache.pinot.spi.stream.StreamMessageDecoder;
 
 /**
  * JSON message decoder for Iggy streams.
@@ -54,8 +52,7 @@ public class IggyJsonMessageDecoder implements StreamMessageDecoder<byte[]> {
      * @throws Exception if initialization fails
      */
     @Override
-    public void init(Map<String, String> props, Set<String> fieldsToRead, String topicName)
-            throws Exception {
+    public void init(Map<String, String> props, Set<String> fieldsToRead, String topicName) throws Exception {
         // No special initialization needed for basic JSON decoding
     }
 
@@ -77,7 +74,7 @@ public class IggyJsonMessageDecoder implements StreamMessageDecoder<byte[]> {
 
             return destination;
 
-        } catch (Exception e) {
+        } catch (java.io.IOException e) {
             throw new RuntimeException("Failed to decode JSON message", e);
         }
     }

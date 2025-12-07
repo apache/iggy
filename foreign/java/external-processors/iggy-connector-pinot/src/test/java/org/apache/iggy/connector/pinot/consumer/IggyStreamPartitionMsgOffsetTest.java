@@ -19,9 +19,11 @@
 
 package org.apache.iggy.connector.pinot.consumer;
 
-import static org.junit.jupiter.api.Assertions.*;
-
 import org.junit.jupiter.api.Test;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class IggyStreamPartitionMsgOffsetTest {
 

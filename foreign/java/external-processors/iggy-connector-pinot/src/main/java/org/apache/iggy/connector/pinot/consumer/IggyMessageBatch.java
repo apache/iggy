@@ -19,10 +19,10 @@
 
 package org.apache.iggy.connector.pinot.consumer;
 
-import java.util.List;
-
 import org.apache.pinot.spi.stream.MessageBatch;
 import org.apache.pinot.spi.stream.StreamPartitionMsgOffset;
+
+import java.util.List;
 
 /**
  * Implementation of Pinot's MessageBatch for Iggy messages.

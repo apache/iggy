@@ -38,7 +38,6 @@ public class IggyStreamPartitionMsgOffset implements StreamPartitionMsgOffset {
         this.offset = offset;
     }
 
-
     public long getOffset() {
         return offset;
     }

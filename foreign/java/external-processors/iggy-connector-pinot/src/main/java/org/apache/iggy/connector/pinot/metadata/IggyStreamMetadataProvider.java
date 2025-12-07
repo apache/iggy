@@ -19,9 +19,6 @@
 
 package org.apache.iggy.connector.pinot.metadata;
 
-import java.io.IOException;
-import java.util.Optional;
-
 import org.apache.iggy.client.async.tcp.AsyncIggyTcpClient;
 import org.apache.iggy.connector.pinot.config.IggyStreamConfig;
 import org.apache.iggy.connector.pinot.consumer.IggyStreamPartitionMsgOffset;
@@ -34,6 +31,9 @@ import org.apache.pinot.spi.stream.StreamMetadataProvider;
 import org.apache.pinot.spi.stream.StreamPartitionMsgOffset;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import java.io.IOException;
+import java.util.Optional;
 
 /**
  * Metadata provider for Iggy streams.
@@ -51,6 +51,8 @@ public class IggyStreamMetadataProvider implements StreamMetadataProvider {
 
     private static final Logger log = LoggerFactory.getLogger(IggyStreamMetadataProvider.class);
 
+    private static final long DETAILS_CACHE_MS = 5000; // 5 seconds cache
+
     private final String clientId;
     private final IggyStreamConfig config;
     private final Integer partitionId; // null for stream-level, non-null for partition-level
@@ -60,7 +62,6 @@ public class IggyStreamMetadataProvider implements StreamMetadataProvider {
     private TopicId topicId;
     private TopicDetails cachedTopicDetails;
     private long lastDetailsRefresh;
-    private static final long DETAILS_CACHE_MS = 5000; // 5 seconds cache
 
     /**
      * Creates a stream-level metadata provider (all partitions).
@@ -107,7 +108,7 @@ public class IggyStreamMetadataProvider implements StreamMetadataProvider {
             int partitionCount = topicDetails.partitionsCount().intValue();
             log.info("Found {} partitions for topic {}", partitionCount, config.getTopicId());
             return partitionCount;
-        } catch (Exception e) {
+        } catch (RuntimeException e) {
             log.error("Error fetching partition count: {}", e.getMessage(), e);
             throw new RuntimeException("Failed to fetch partition count", e);
         }
@@ -145,7 +146,7 @@ public class IggyStreamMetadataProvider implements StreamMetadataProvider {
                 return new IggyStreamPartitionMsgOffset(0);
             }
 
-        } catch (Exception e) {
+        } catch (RuntimeException e) {
             log.error("Error fetching partition offset: {}", e.getMessage(), e);
             throw new RuntimeException("Failed to fetch partition offset", e);
         }
@@ -183,11 +184,12 @@ public class IggyStreamMetadataProvider implements StreamMetadataProvider {
         long now = System.currentTimeMillis();
         if (cachedTopicDetails == null || (now - lastDetailsRefresh) > DETAILS_CACHE_MS) {
             try {
-                Optional<TopicDetails> details = asyncClient.topics().getTopicAsync(streamId, topicId).join();
-                cachedTopicDetails = details.orElseThrow(
-                        () -> new RuntimeException("Topic not found: " + config.getTopicId()));
+                Optional<TopicDetails> details =
+                        asyncClient.topics().getTopicAsync(streamId, topicId).join();
+                cachedTopicDetails =
+                        details.orElseThrow(() -> new RuntimeException("Topic not found: " + config.getTopicId()));
                 lastDetailsRefresh = now;
-            } catch (Exception e) {
+            } catch (RuntimeException e) {
                 log.error("Error fetching topic details: {}", e.getMessage(), e);
                 throw new RuntimeException("Failed to fetch topic details", e);
             }
@@ -235,7 +237,7 @@ public class IggyStreamMetadataProvider implements StreamMetadataProvider {
                 log.info("Closing Iggy metadata provider");
                 asyncClient.close().join();
                 log.info("Iggy metadata provider closed successfully");
-            } catch (Exception e) {
+            } catch (RuntimeException e) {
                 log.error("Error closing Iggy client: {}", e.getMessage(), e);
             } finally {
                 asyncClient = null;

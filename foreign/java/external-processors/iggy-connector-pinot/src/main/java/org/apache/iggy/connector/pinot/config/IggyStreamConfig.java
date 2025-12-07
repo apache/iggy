@@ -19,10 +19,10 @@
 
 package org.apache.iggy.connector.pinot.config;
 
-import java.util.Map;
-
 import org.apache.pinot.spi.stream.OffsetCriteria;
 import org.apache.pinot.spi.stream.StreamConfig;
+
+import java.util.Map;
 
 /**
  * Configuration class for Iggy stream ingestion in Pinot.
@@ -97,7 +97,9 @@ public class IggyStreamConfig {
     }
 
     private void requireProperty(String key, String errorMessage) {
-        if (!props.containsKey(key) || props.get(key) == null || props.get(key).trim().isEmpty()) {
+        if (!props.containsKey(key)
+                || props.get(key) == null
+                || props.get(key).trim().isEmpty()) {
             throw new IllegalArgumentException(errorMessage + " (property: " + key + ")");
         }
     }

@@ -22,7 +22,6 @@ package org.apache.iggy.connector.pinot.consumer;
 import org.apache.iggy.connector.pinot.config.IggyStreamConfig;
 import org.apache.iggy.connector.pinot.metadata.IggyStreamMetadataProvider;
 import org.apache.pinot.spi.stream.PartitionGroupConsumer;
-import org.apache.pinot.spi.stream.PartitionGroupConsumptionStatus;
 import org.apache.pinot.spi.stream.StreamConfig;
 import org.apache.pinot.spi.stream.StreamConsumerFactory;
 import org.apache.pinot.spi.stream.StreamMetadataProvider;
@@ -92,5 +91,4 @@ public class IggyConsumerFactory extends StreamConsumerFactory {
         IggyStreamConfig iggyConfig = new IggyStreamConfig(this.streamConfig);
         return new IggyStreamMetadataProvider(clientId, iggyConfig);
     }
-
 }

@@ -19,10 +19,6 @@
 
 package org.apache.iggy.connector.pinot.consumer;
 
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Optional;
-
 import org.apache.iggy.client.async.tcp.AsyncIggyTcpClient;
 import org.apache.iggy.connector.pinot.config.IggyStreamConfig;
 import org.apache.iggy.consumergroup.Consumer;
@@ -37,6 +33,10 @@ import org.apache.pinot.spi.stream.PartitionGroupConsumer;
 import org.apache.pinot.spi.stream.StreamPartitionMsgOffset;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Optional;
 
 /**
  * Partition-level consumer implementation for Iggy streams.
@@ -112,7 +112,7 @@ public class IggyPartitionGroupConsumer implements PartitionGroupConsumer {
             // Convert to Pinot MessageBatch
             return convertToMessageBatch(polledMessages);
 
-        } catch (Exception e) {
+        } catch (RuntimeException e) {
             log.error("Error fetching messages from partition {}: {}", partitionId, e.getMessage(), e);
             return new IggyMessageBatch(new ArrayList<>());
         }
@@ -157,12 +157,15 @@ public class IggyPartitionGroupConsumer implements PartitionGroupConsumer {
                     config.getConsumerGroup(),
                     partitionId);
 
-            asyncClient.consumerGroups().joinConsumerGroup(streamId, topicId, consumer.id()).join();
+            asyncClient
+                    .consumerGroups()
+                    .joinConsumerGroup(streamId, topicId, consumer.id())
+                    .join();
 
             consumerGroupJoined = true;
             log.info("Successfully joined consumer group");
 
-        } catch (Exception e) {
+        } catch (RuntimeException e) {
             log.error("Failed to join consumer group: {}", e.getMessage(), e);
             throw new RuntimeException("Failed to join consumer group", e);
         }
@@ -226,7 +229,7 @@ public class IggyPartitionGroupConsumer implements PartitionGroupConsumer {
 
             return polledMessages;
 
-        } catch (Exception e) {
+        } catch (RuntimeException e) {
             log.error("Error polling messages: {}", e.getMessage(), e);
             throw new RuntimeException("Failed to poll messages", e);
         }
@@ -278,7 +281,7 @@ public class IggyPartitionGroupConsumer implements PartitionGroupConsumer {
                 log.info("Closing Iggy consumer for partition {}", partitionId);
                 asyncClient.close().join();
                 log.info("Iggy consumer closed successfully");
-            } catch (Exception e) {
+            } catch (RuntimeException e) {
                 log.error("Error closing Iggy client: {}", e.getMessage(), e);
             } finally {
                 asyncClient = null;

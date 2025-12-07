@@ -19,13 +19,16 @@
 
 package org.apache.iggy.connector.pinot.config;
 
-import static org.junit.jupiter.api.Assertions.*;
+import org.apache.pinot.spi.stream.StreamConfig;
+import org.junit.jupiter.api.Test;
 
 import java.util.HashMap;
 import java.util.Map;
 
-import org.apache.pinot.spi.stream.StreamConfig;
-import org.junit.jupiter.api.Test;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class IggyStreamConfigTest {
 
@@ -170,10 +173,10 @@ class IggyStreamConfigTest {
         props.put("streamType", "iggy"); // Required by Pinot StreamConfig
         props.put("stream.iggy.topic.name", "events"); // Required by Pinot StreamConfig
         props.put("stream.iggy.consumer.type", "lowlevel"); // Required by Pinot
-        props.put("stream.iggy.consumer.factory.class.name",
+        props.put(
+                "stream.iggy.consumer.factory.class.name",
                 "org.apache.iggy.connector.pinot.consumer.IggyConsumerFactory");
-        props.put("stream.iggy.decoder.class.name",
-                "org.apache.iggy.connector.pinot.decoder.IggyJsonMessageDecoder");
+        props.put("stream.iggy.decoder.class.name", "org.apache.iggy.connector.pinot.decoder.IggyJsonMessageDecoder");
 
         props.put("stream.iggy.host", "localhost");
         props.put("stream.iggy.port", "8090");
