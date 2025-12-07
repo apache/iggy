@@ -16,9 +16,8 @@
 * under the License.
 */
 
-use std::str::FromStr;
-
 use crate::{ConnectionStringOptions, IggyDuration, IggyError, QuicClientReconnectionConfig};
+use std::str::FromStr;
 
 #[derive(Debug)]
 pub struct QuicConnectionStringOptions {

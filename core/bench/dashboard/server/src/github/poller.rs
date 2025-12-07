@@ -15,16 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::{path::PathBuf, sync::Arc, time::Duration};
-
-use file_operation::async_copy_dir_files;
-use tokio::{fs, sync::watch, task::JoinHandle, time::sleep};
-use tracing::{info, trace};
-
 use crate::{
     cache::BenchmarkCache, error::IggyBenchDashboardServerError,
     github::client::IggyBenchDashboardGithubClient,
 };
+use file_operation::async_copy_dir_files;
+use std::{path::PathBuf, sync::Arc, time::Duration};
+use tokio::{fs, sync::watch, task::JoinHandle, time::sleep};
+use tracing::{info, trace};
 
 /// A long-running background task that polls GitHub for workflow runs.
 pub struct IggyBenchDashboardGithubPoller {

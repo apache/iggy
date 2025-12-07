@@ -16,11 +16,6 @@
  * under the License.
  */
 
-use std::{fmt::Display, str::from_utf8};
-
-use bytes::{BufMut, Bytes, BytesMut};
-use serde::{Deserialize, Serialize};
-
 use super::{MAX_NAME_LENGTH, MAX_PARTITIONS_COUNT};
 use crate::{
     BytesSerializable, CREATE_TOPIC_CODE, Command, CompressionAlgorithm, Identifier, Sizeable,
@@ -28,6 +23,9 @@ use crate::{
     error::IggyError,
     utils::{expiry::IggyExpiry, topic_size::MaxTopicSize},
 };
+use bytes::{BufMut, Bytes, BytesMut};
+use serde::{Deserialize, Serialize};
+use std::{fmt::Display, str::from_utf8};
 
 /// `CreateTopic` command is used to create a new topic in a stream.
 /// It has additional payload:
@@ -183,9 +181,8 @@ impl Display for CreateTopic {
 
 #[cfg(test)]
 mod tests {
-    use bytes::BufMut;
-
     use super::*;
+    use bytes::BufMut;
 
     #[test]
     fn should_be_serialized_as_bytes() {

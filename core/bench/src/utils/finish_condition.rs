@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::args::{common::IggyBenchArgs, kind::BenchmarkKindCommand};
+use human_repr::HumanCount;
 use std::{
     fmt::Display,
     sync::{
@@ -22,10 +24,6 @@ use std::{
         atomic::{AtomicI64, Ordering},
     },
 };
-
-use human_repr::HumanCount;
-
-use crate::args::{common::IggyBenchArgs, kind::BenchmarkKindCommand};
 
 const MINIMUM_MSG_PAYLOAD_SIZE: usize = 20;
 

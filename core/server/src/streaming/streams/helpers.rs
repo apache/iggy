@@ -15,8 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use iggy_common::Identifier;
-
 use crate::{
     configs::system::SystemConfig,
     slab::{
@@ -28,6 +26,7 @@ use crate::{
         streams::stream::{StreamRef, StreamRefMut},
     },
 };
+use iggy_common::Identifier;
 
 pub fn get_stream_id() -> impl FnOnce(ComponentsById<StreamRef>) -> streams::ContainerId {
     |(root, _)| root.id()

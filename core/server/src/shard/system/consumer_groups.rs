@@ -16,11 +16,6 @@
  * under the License.
  */
 
-use arcshift::ArcShift;
-use err_trail::ErrContext;
-use iggy_common::{Identifier, IggyError};
-use slab::Slab;
-
 use super::COMPONENT;
 use crate::{
     shard::IggyShard,
@@ -35,6 +30,10 @@ use crate::{
         topics::{consumer_group, consumer_group::MEMBERS_CAPACITY},
     },
 };
+use arcshift::ArcShift;
+use err_trail::ErrContext;
+use iggy_common::{Identifier, IggyError};
+use slab::Slab;
 
 impl IggyShard {
     pub fn create_consumer_group(

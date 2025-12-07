@@ -16,16 +16,15 @@
  * under the License.
  */
 
+use crate::cli::common::{
+    CLAP_INDENT, IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestHelpCmd, TestStreamId,
+    USAGE_PREFIX,
+};
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
 use iggy::prelude::Client;
 use predicates::str::diff;
 use serial_test::parallel;
-
-use crate::cli::common::{
-    CLAP_INDENT, IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestHelpCmd, TestStreamId,
-    USAGE_PREFIX,
-};
 
 struct TestStreamDeleteCmd {
     stream_id: u32,

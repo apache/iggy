@@ -16,10 +16,9 @@
  * under the License.
  */
 
+use super::IggyMessageHeaderViewMut;
 use iggy_common::{IGGY_MESSAGE_HEADER_SIZE, IggyMessageHeaderView, calculate_checksum};
 use lending_iterator::prelude::*;
-
-use super::IggyMessageHeaderViewMut;
 
 /// A mutable view of a message for in-place modifications
 #[derive(Debug)]

@@ -16,14 +16,13 @@
  * under the License.
  */
 
-use colored::{Color, ColoredString, Colorize};
-use human_repr::HumanCount;
-use tracing::info;
-
 use crate::{
     actor_kind::ActorKind, benchmark_kind::BenchmarkKind, group_metrics::BenchmarkGroupMetrics,
     group_metrics_kind::GroupMetricsKind, report::BenchmarkReport,
 };
+use colored::{Color, ColoredString, Colorize};
+use human_repr::HumanCount;
+use tracing::info;
 
 impl BenchmarkReport {
     pub fn print_summary(&self) {

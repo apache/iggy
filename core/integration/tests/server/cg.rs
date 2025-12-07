@@ -15,14 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use iggy_common::TransportProtocol;
-use serial_test::parallel;
-use test_case::test_matrix;
-
 use crate::server::{
     ScenarioFn, auto_commit_reconnection_scenario, join_scenario, multiple_clients_scenario,
     offset_cleanup_scenario, run_scenario, single_client_scenario,
 };
+use iggy_common::TransportProtocol;
+use serial_test::parallel;
+use test_case::test_matrix;
 
 // TODO: Add `QUIC`.
 // Consumer group scenarios do not support HTTP

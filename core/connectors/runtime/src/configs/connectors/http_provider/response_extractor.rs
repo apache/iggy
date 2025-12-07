@@ -17,10 +17,9 @@
  * under the License.
  */
 
+use crate::{configs::runtime::ResponseConfig, error::RuntimeError};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-
-use crate::{configs::runtime::ResponseConfig, error::RuntimeError};
 
 /// Extracts data from JSON responses using configured paths
 pub struct ResponseExtractor {
@@ -137,9 +136,8 @@ impl ResponseExtractor {
 
 #[cfg(test)]
 mod tests {
-    use serde::{Deserialize, Serialize};
-
     use super::*;
+    use serde::{Deserialize, Serialize};
 
     #[derive(Debug, Serialize, Deserialize, PartialEq)]
     struct TestData {

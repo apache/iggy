@@ -17,13 +17,11 @@
  * under the License.
  */
 
-use std::{
-    collections::HashMap,
-    str::FromStr,
-    sync::{Arc, atomic::Ordering},
-    time::Instant,
+use crate::{
+    PLUGIN_ID, RuntimeError, SinkApi, SinkConnector, SinkConnectorConsumer, SinkConnectorPlugin,
+    SinkConnectorWrapper, configs::connectors::SinkConfig, context::RuntimeContext,
+    manager::status::ConnectorStatus, resolve_plugin_path, transform,
 };
-
 use dlopen2::wrapper::Container;
 use futures::StreamExt;
 use iggy::prelude::{
@@ -34,13 +32,13 @@ use iggy_connector_sdk::{
     DecodedMessage, MessagesMetadata, RawMessage, RawMessages, ReceivedMessage, StreamDecoder,
     TopicMetadata, sink::ConsumeCallback, transforms::Transform,
 };
-use tracing::{error, info, warn};
-
-use crate::{
-    PLUGIN_ID, RuntimeError, SinkApi, SinkConnector, SinkConnectorConsumer, SinkConnectorPlugin,
-    SinkConnectorWrapper, configs::connectors::SinkConfig, context::RuntimeContext,
-    manager::status::ConnectorStatus, resolve_plugin_path, transform,
+use std::{
+    collections::HashMap,
+    str::FromStr,
+    sync::{Arc, atomic::Ordering},
+    time::Instant,
 };
+use tracing::{error, info, warn};
 
 pub async fn init(
     sink_configs: HashMap<String, SinkConfig>,

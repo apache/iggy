@@ -15,12 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::HashSet;
-
-use bench_report::benchmark_kind::BenchmarkKind;
-use yew::prelude::*;
-
 use crate::state::benchmark::use_benchmark;
+use bench_report::benchmark_kind::BenchmarkKind;
+use std::collections::HashSet;
+use yew::prelude::*;
 
 #[derive(Properties, PartialEq)]
 pub struct BenchmarkKindSelectorProps {

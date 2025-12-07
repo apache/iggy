@@ -20,14 +20,6 @@
 mod response_extractor;
 mod url_builder;
 
-use std::{collections::HashMap, str::FromStr, time::Duration};
-
-use async_trait::async_trait;
-use reqwest;
-use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
-use reqwest_retry::{Jitter, RetryTransientMiddleware, policies::ExponentialBackoff};
-use serde::{Deserialize, Serialize};
-
 use crate::{
     configs::{
         connectors::{
@@ -42,6 +34,12 @@ use crate::{
     },
     error::RuntimeError,
 };
+use async_trait::async_trait;
+use reqwest;
+use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
+use reqwest_retry::{Jitter, RetryTransientMiddleware, policies::ExponentialBackoff};
+use serde::{Deserialize, Serialize};
+use std::{collections::HashMap, str::FromStr, time::Duration};
 
 #[derive(Debug, Serialize, Deserialize)]
 struct SetActiveVersionRequest {

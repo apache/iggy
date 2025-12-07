@@ -16,11 +16,9 @@
  * under the License.
  */
 
-use std::num::TryFromIntError;
-
-use socket2::{Domain, Protocol, Socket, Type};
-
 use crate::configs::tcp::TcpSocketConfig;
+use socket2::{Domain, Protocol, Socket, Type};
+use std::num::TryFromIntError;
 
 pub fn build(ipv6: bool, config: &TcpSocketConfig) -> Socket {
     let socket = if ipv6 {
@@ -71,11 +69,9 @@ pub fn build(ipv6: bool, config: &TcpSocketConfig) -> Socket {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
-    use iggy_common::{IggyByteSize, IggyDuration};
-
     use super::*;
+    use iggy_common::{IggyByteSize, IggyDuration};
+    use std::time::Duration;
 
     #[test]
     fn given_override_defaults_socket_should_be_configured() {

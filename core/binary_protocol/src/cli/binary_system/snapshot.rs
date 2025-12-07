@@ -16,19 +16,17 @@
  * under the License.
  */
 
-use std::path::Path;
-
-use anyhow::Context;
-use async_trait::async_trait;
-use comfy_table::Table;
-use iggy_common::{SnapshotCompression, SystemSnapshotType, get_snapshot::GetSnapshot};
-use tokio::io::AsyncWriteExt;
-use tracing::{Level, event};
-
 use crate::{
     Client,
     cli::cli_command::{CliCommand, PRINT_TARGET},
 };
+use anyhow::Context;
+use async_trait::async_trait;
+use comfy_table::Table;
+use iggy_common::{SnapshotCompression, SystemSnapshotType, get_snapshot::GetSnapshot};
+use std::path::Path;
+use tokio::io::AsyncWriteExt;
+use tracing::{Level, event};
 
 pub struct GetSnapshotCmd {
     _get_snapshot: GetSnapshot,

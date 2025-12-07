@@ -15,15 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::sync::Arc;
-
-use async_trait::async_trait;
-use bench_report::{benchmark_kind::BenchmarkKind, individual_metrics::BenchmarkIndividualMetrics};
-use iggy::prelude::*;
-use integration::test_server::ClientFactory;
-use tokio::task::JoinSet;
-use tracing::info;
-
 use crate::{
     args::common::IggyBenchArgs,
     benchmarks::{
@@ -31,6 +22,13 @@ use crate::{
         common::{build_consumer_futures, build_producer_futures},
     },
 };
+use async_trait::async_trait;
+use bench_report::{benchmark_kind::BenchmarkKind, individual_metrics::BenchmarkIndividualMetrics};
+use iggy::prelude::*;
+use integration::test_server::ClientFactory;
+use std::sync::Arc;
+use tokio::task::JoinSet;
+use tracing::info;
 
 pub struct PinnedProducerAndConsumerBenchmark {
     args: Arc<IggyBenchArgs>,

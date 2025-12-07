@@ -16,18 +16,16 @@
  * under the License.
  */
 
-use std::sync::Arc;
-
-use ahash::AHashMap;
-use anyhow::Context;
-use err_trail::ErrContext;
-use iggy_common::IggyError;
-use tracing::{error, info};
-
 use crate::{
     http::jwt::{COMPONENT, json_web_token::RevokedAccessToken},
     streaming::persistence::persister::PersisterKind,
 };
+use ahash::AHashMap;
+use anyhow::Context;
+use err_trail::ErrContext;
+use iggy_common::IggyError;
+use std::sync::Arc;
+use tracing::{error, info};
 
 #[derive(Debug)]
 pub struct TokenStorage {

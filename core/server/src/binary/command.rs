@@ -16,8 +16,7 @@
  * under the License.
  */
 
-use std::rc::Rc;
-
+use crate::{define_server_command_enum, shard::IggyShard, streaming::session::Session};
 use bytes::{BufMut, Bytes, BytesMut};
 use enum_dispatch::enum_dispatch;
 use iggy_common::{
@@ -39,10 +38,9 @@ use iggy_common::{
     store_consumer_offset::StoreConsumerOffset, update_permissions::UpdatePermissions,
     update_stream::UpdateStream, update_topic::UpdateTopic, update_user::UpdateUser, *,
 };
+use std::rc::Rc;
 use strum::EnumString;
 use tracing::error;
-
-use crate::{define_server_command_enum, shard::IggyShard, streaming::session::Session};
 
 define_server_command_enum! {
     Ping(Ping), PING_CODE, PING, false;

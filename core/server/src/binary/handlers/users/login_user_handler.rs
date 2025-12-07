@@ -16,13 +16,6 @@
  * under the License.
  */
 
-use std::rc::Rc;
-
-use anyhow::Result;
-use err_trail::ErrContext;
-use iggy_common::{IggyError, SenderKind, login_user::LoginUser};
-use tracing::{debug, info, instrument, warn};
-
 use crate::{
     binary::{
         command::{BinaryServerCommand, ServerCommand, ServerCommandHandler},
@@ -32,6 +25,11 @@ use crate::{
     shard::IggyShard,
     streaming::session::Session,
 };
+use anyhow::Result;
+use err_trail::ErrContext;
+use iggy_common::{IggyError, SenderKind, login_user::LoginUser};
+use std::rc::Rc;
+use tracing::{debug, info, instrument, warn};
 
 impl ServerCommandHandler for LoginUser {
     fn code(&self) -> u32 {

@@ -16,10 +16,9 @@
  * under the License.
  */
 
-use std::env;
-
 use iggy::{clients::client::IggyClient, prelude::*};
 use integration::{tcp_client::TcpClientFactory, test_server::ClientFactory};
+use std::env;
 
 /// Resolves server address based on role and port, checking environment variables first
 pub fn resolve_server_address(role: &str, port: u16) -> String {

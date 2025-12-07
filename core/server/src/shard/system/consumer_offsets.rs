@@ -17,9 +17,6 @@
 * under the License.
 */
 
-use err_trail::ErrContext;
-use iggy_common::{Consumer, ConsumerOffsetInfo, Identifier, IggyError};
-
 use super::COMPONENT;
 use crate::{
     shard::IggyShard,
@@ -30,6 +27,8 @@ use crate::{
         streams, topics,
     },
 };
+use err_trail::ErrContext;
+use iggy_common::{Consumer, ConsumerOffsetInfo, Identifier, IggyError};
 
 impl IggyShard {
     pub async fn store_consumer_offset(

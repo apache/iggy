@@ -16,6 +16,14 @@
  * under the License.
  */
 
+use assert_cmd::prelude::CommandCargoExt;
+use rand::Rng;
+use rmcp::{
+    RoleClient, ServiceExt,
+    model::{ClientCapabilities, ClientInfo, Implementation, InitializeRequestParam},
+    service::RunningService,
+    transport::StreamableHttpClientTransport,
+};
 use std::{
     collections::HashMap,
     fs::{self, File},
@@ -24,15 +32,6 @@ use std::{
     process::{Child, Command, Stdio},
     thread::panicking,
     time::Duration,
-};
-
-use assert_cmd::prelude::CommandCargoExt;
-use rand::Rng;
-use rmcp::{
-    RoleClient, ServiceExt,
-    model::{ClientCapabilities, ClientInfo, Implementation, InitializeRequestParam},
-    service::RunningService,
-    transport::StreamableHttpClientTransport,
 };
 use tokio::time::sleep;
 

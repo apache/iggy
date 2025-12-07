@@ -16,12 +16,7 @@
  * under the License.
  */
 
-use std::{
-    fmt,
-    fmt::{Display, Formatter},
-    str::from_utf8,
-};
-
+use crate::state::COMPONENT;
 use bytes::{BufMut, Bytes, BytesMut};
 use err_trail::ErrContext;
 use iggy_common::{
@@ -30,8 +25,11 @@ use iggy_common::{
     create_topic::CreateTopic, create_user::CreateUser,
 };
 use serde::{Deserialize, Serialize};
-
-use crate::state::COMPONENT;
+use std::{
+    fmt,
+    fmt::{Display, Formatter},
+    str::from_utf8,
+};
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub struct CreateStreamWithId {

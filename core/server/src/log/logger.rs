@@ -16,18 +16,26 @@
  * under the License.
  */
 
-use std::{
-    io::{self, Write},
-    path::PathBuf,
-    sync::{Arc, Mutex},
+use crate::{
+    VERSION,
+    configs::{
+        server::{TelemetryConfig, TelemetryTransport},
+        system::LoggingConfig,
+    },
+    log::runtime::CompioRuntime,
+    server_error::LogError,
 };
-
 use opentelemetry::{KeyValue, global, trace::TracerProvider};
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
 use opentelemetry_otlp::{WithExportConfig, WithHttpConfig};
 use opentelemetry_sdk::{
     Resource, logs::log_processor_with_async_runtime, propagation::TraceContextPropagator,
     trace::span_processor_with_async_runtime,
+};
+use std::{
+    io::{self, Write},
+    path::PathBuf,
+    sync::{Arc, Mutex},
 };
 use tracing::{info, trace};
 use tracing_appender::non_blocking::WorkerGuard;
@@ -45,16 +53,6 @@ use tracing_subscriber::{
     reload,
     reload::Handle,
     util::SubscriberInitExt,
-};
-
-use crate::{
-    VERSION,
-    configs::{
-        server::{TelemetryConfig, TelemetryTransport},
-        system::LoggingConfig,
-    },
-    log::runtime::CompioRuntime,
-    server_error::LogError,
 };
 
 const IGGY_LOG_FILE_PREFIX: &str = "iggy-server.log";

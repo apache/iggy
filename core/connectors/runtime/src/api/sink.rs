@@ -17,17 +17,6 @@
  * under the License.
  */
 
-use std::sync::Arc;
-
-use axum::{
-    Json, Router,
-    extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode, header},
-    response::IntoResponse,
-    routing::get,
-};
-use serde::Deserialize;
-
 use super::{
     config::map_connector_config,
     error::ApiError,
@@ -39,6 +28,15 @@ use crate::{
     context::RuntimeContext,
     error::RuntimeError,
 };
+use axum::{
+    Json, Router,
+    extract::{Path, Query, State},
+    http::{HeaderMap, StatusCode, header},
+    response::IntoResponse,
+    routing::get,
+};
+use serde::Deserialize;
+use std::sync::Arc;
 
 pub fn router(state: Arc<RuntimeContext>) -> Router {
     Router::new()

@@ -16,13 +16,6 @@
  * under the License.
  */
 
-use std::rc::Rc;
-
-use anyhow::Result;
-use err_trail::ErrContext;
-use iggy_common::{Identifier, IggyError, SenderKind, create_consumer_group::CreateConsumerGroup};
-use tracing::{debug, instrument};
-
 use crate::{
     binary::{
         command::{BinaryServerCommand, ServerCommand, ServerCommandHandler},
@@ -34,6 +27,11 @@ use crate::{
     state::{command::EntryCommand, models::CreateConsumerGroupWithId},
     streaming::session::Session,
 };
+use anyhow::Result;
+use err_trail::ErrContext;
+use iggy_common::{Identifier, IggyError, SenderKind, create_consumer_group::CreateConsumerGroup};
+use std::rc::Rc;
+use tracing::{debug, instrument};
 
 impl ServerCommandHandler for CreateConsumerGroup {
     fn code(&self) -> u32 {

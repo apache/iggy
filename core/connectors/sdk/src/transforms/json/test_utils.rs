@@ -16,13 +16,12 @@
  * under the License.
  */
 
+use crate::{DecodedMessage, Payload, TopicMetadata};
 use simd_json::{
     OwnedValue,
     prelude::{TypedScalarValue, ValueAsScalar},
 };
 use uuid;
-
-use crate::{DecodedMessage, Payload, TopicMetadata};
 
 /// Helper function to create a test message with the given JSON payload
 pub fn create_test_message(json: &str) -> DecodedMessage {

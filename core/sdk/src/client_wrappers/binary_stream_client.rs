@@ -16,11 +16,10 @@
  * under the License.
  */
 
+use crate::client_wrappers::client_wrapper::ClientWrapper;
 use async_trait::async_trait;
 use iggy_binary_protocol::StreamClient;
 use iggy_common::{Identifier, IggyError, Stream, StreamDetails};
-
-use crate::client_wrappers::client_wrapper::ClientWrapper;
 
 #[async_trait]
 impl StreamClient for ClientWrapper {

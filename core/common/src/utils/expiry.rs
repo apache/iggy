@@ -16,12 +16,10 @@
  * under the License.
  */
 
-use std::{fmt, fmt::Display, iter::Sum, ops::Add, str::FromStr, time::Duration};
-
+use crate::utils::duration::IggyDuration;
 use humantime::{Duration as HumanDuration, format_duration};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de, de::Visitor};
-
-use crate::utils::duration::IggyDuration;
+use std::{fmt, fmt::Display, iter::Sum, ops::Add, str::FromStr, time::Duration};
 
 /// Helper enum for various time-based expiry related functionalities
 #[derive(Debug, Copy, Default, Clone, Eq, PartialEq)]

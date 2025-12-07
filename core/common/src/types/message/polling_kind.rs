@@ -16,11 +16,9 @@
  * under the License.
  */
 
-use std::{fmt::Display, str::FromStr};
-
-use serde::{Deserialize, Serialize};
-
 use crate::error::IggyError;
+use serde::{Deserialize, Serialize};
+use std::{fmt::Display, str::FromStr};
 
 /// `PollingKind` is an enum which specifies from where to start polling messages and is used by `PollingStrategy`.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Default, Copy, Clone)]

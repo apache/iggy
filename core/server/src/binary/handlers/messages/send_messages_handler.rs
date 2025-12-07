@@ -16,16 +16,6 @@
  * under the License.
  */
 
-use std::rc::Rc;
-
-use anyhow::Result;
-use compio::buf::{IntoInner as _, IoBuf};
-use iggy_common::{
-    INDEX_SIZE, Identifier, IggyError, Partitioning, PooledBuffer, SendMessages, SenderKind,
-    Sizeable, Validatable,
-};
-use tracing::instrument;
-
 use crate::{
     binary::command::{BinaryServerCommand, ServerCommandHandler},
     shard::IggyShard,
@@ -34,6 +24,14 @@ use crate::{
         session::Session,
     },
 };
+use anyhow::Result;
+use compio::buf::{IntoInner as _, IoBuf};
+use iggy_common::{
+    INDEX_SIZE, Identifier, IggyError, Partitioning, PooledBuffer, SendMessages, SenderKind,
+    Sizeable, Validatable,
+};
+use std::rc::Rc;
+use tracing::instrument;
 
 impl ServerCommandHandler for SendMessages {
     fn code(&self) -> u32 {

@@ -16,19 +16,17 @@
  * under the License.
  */
 
-use std::sync::Arc;
-
-use anyhow::Context;
-use compio::{buf::IoBuf, io::AsyncReadAtExt};
-use err_trail::ErrContext;
-use iggy_common::{IggyError, PooledBuffer};
-use tracing::info;
-
 use super::COMPONENT;
 use crate::{
     shard::system::info::SystemInfo,
     streaming::{persistence::persister::PersisterKind, utils::file},
 };
+use anyhow::Context;
+use compio::{buf::IoBuf, io::AsyncReadAtExt};
+use err_trail::ErrContext;
+use iggy_common::{IggyError, PooledBuffer};
+use std::sync::Arc;
+use tracing::info;
 
 #[derive(Debug)]
 pub struct FileSystemInfoStorage {

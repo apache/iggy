@@ -16,13 +16,11 @@
  * under the License.
  */
 
-use std::{fmt::Display, str::FromStr};
-
+use crate::{BytesSerializable, Identifier, Validatable, error::IggyError};
 use bytes::{BufMut, Bytes, BytesMut};
 use clap::ValueEnum;
 use serde::{Deserialize, Deserializer, Serialize};
-
-use crate::{BytesSerializable, Identifier, Validatable, error::IggyError};
+use std::{fmt::Display, str::FromStr};
 
 /// `Consumer` represents the type of consumer that is consuming a message.
 /// It can be either a `Consumer` or a `ConsumerGroup`.

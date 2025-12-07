@@ -16,8 +16,16 @@
  * under the License.
  */
 
-use std::sync::Arc;
-
+use crate::{
+    http::{
+        COMPONENT, error::CustomError, jwt::json_web_token::Identity, mapper,
+        mapper::map_generated_access_token_to_identity_info, shared::AppState,
+    },
+    state::{command::EntryCommand, models::CreatePersonalAccessTokenWithHash},
+    streaming::{
+        personal_access_tokens::personal_access_token::PersonalAccessToken, session::Session,
+    },
+};
 use axum::{
     Extension, Json, Router, debug_handler,
     extract::{Path, State},
@@ -32,18 +40,8 @@ use iggy_common::{
     login_with_personal_access_token::LoginWithPersonalAccessToken,
 };
 use send_wrapper::SendWrapper;
+use std::sync::Arc;
 use tracing::instrument;
-
-use crate::{
-    http::{
-        COMPONENT, error::CustomError, jwt::json_web_token::Identity, mapper,
-        mapper::map_generated_access_token_to_identity_info, shared::AppState,
-    },
-    state::{command::EntryCommand, models::CreatePersonalAccessTokenWithHash},
-    streaming::{
-        personal_access_tokens::personal_access_token::PersonalAccessToken, session::Session,
-    },
-};
 
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()

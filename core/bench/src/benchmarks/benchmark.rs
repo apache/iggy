@@ -16,15 +16,6 @@
  * under the License.
  */
 
-use std::sync::Arc;
-
-use async_trait::async_trait;
-use bench_report::{benchmark_kind::BenchmarkKind, individual_metrics::BenchmarkIndividualMetrics};
-use iggy::{clients::client::IggyClient, prelude::*};
-use integration::test_server::{ClientFactory, login_root};
-use tokio::task::JoinSet;
-use tracing::info;
-
 use super::{
     balanced_consumer_group::BalancedConsumerGroupBenchmark,
     balanced_producer::BalancedProducerBenchmark,
@@ -38,6 +29,13 @@ use crate::{
     args::{common::IggyBenchArgs, kind::BenchmarkKindCommand},
     utils::client_factory::create_client_factory,
 };
+use async_trait::async_trait;
+use bench_report::{benchmark_kind::BenchmarkKind, individual_metrics::BenchmarkIndividualMetrics};
+use iggy::{clients::client::IggyClient, prelude::*};
+use integration::test_server::{ClientFactory, login_root};
+use std::sync::Arc;
+use tokio::task::JoinSet;
+use tracing::info;
 
 impl From<IggyBenchArgs> for Box<dyn Benchmarkable> {
     fn from(args: IggyBenchArgs) -> Self {

@@ -21,8 +21,7 @@ mod error;
 mod github;
 mod handlers;
 
-use std::sync::Arc;
-
+use crate::cache::CacheWatcher;
 use actix_cors::Cors;
 use actix_files::{self as fs, NamedFile};
 use actix_web::{
@@ -35,6 +34,7 @@ use args::{IggyBenchDashboardServerArgs, PollGithub};
 use cache::BenchmarkCache;
 use github::IggyBenchDashboardGithubPoller;
 use handlers::AppState;
+use std::sync::Arc;
 use tracing::{error, info};
 use tracing_subscriber::{
     EnvFilter,
@@ -42,8 +42,6 @@ use tracing_subscriber::{
     layer::SubscriberExt,
     util::SubscriberInitExt,
 };
-
-use crate::cache::CacheWatcher;
 
 #[derive(Clone)]
 struct ServerState {

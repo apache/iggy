@@ -15,11 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::fs::{DirEntry, read_dir};
-
 use bytes::Bytes;
 use iggy::prelude::*;
 use integration::test_server::{ClientFactory, TestServer};
+use std::fs::{DirEntry, read_dir};
 
 const STREAM_NAME: &str = "test_stream";
 const TOPIC_NAME: &str = "test_topic";

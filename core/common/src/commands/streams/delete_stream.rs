@@ -16,14 +16,12 @@
  * under the License.
  */
 
-use std::fmt::Display;
-
-use bytes::Bytes;
-use serde::{Deserialize, Serialize};
-
 use crate::{
     BytesSerializable, Command, DELETE_STREAM_CODE, Identifier, Validatable, error::IggyError,
 };
+use bytes::Bytes;
+use serde::{Deserialize, Serialize};
+use std::fmt::Display;
 
 /// `DeleteStream` command is used to delete an existing stream.
 /// It has additional payload:

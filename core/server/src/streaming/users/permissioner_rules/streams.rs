@@ -16,9 +16,8 @@
  * under the License.
  */
 
-use iggy_common::IggyError;
-
 use crate::streaming::users::permissioner::Permissioner;
+use iggy_common::IggyError;
 
 impl Permissioner {
     pub fn get_stream(&self, user_id: u32, stream_id: usize) -> Result<(), IggyError> {

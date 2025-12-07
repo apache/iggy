@@ -16,10 +16,9 @@
  * under the License.
  */
 
-use std::{error::Error, str::FromStr, sync::Arc};
-
 use iggy::prelude::*;
 use iggy_examples::shared::{args::Args, system};
+use std::{error::Error, str::FromStr, sync::Arc};
 use tracing::info;
 use tracing_subscriber::{EnvFilter, Registry, layer::SubscriberExt, util::SubscriberInitExt};
 

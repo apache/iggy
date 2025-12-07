@@ -16,13 +16,6 @@
  * under the License.
  */
 
-use std::rc::Rc;
-
-use anyhow::Result;
-use err_trail::ErrContext;
-use iggy_common::{IggyError, SenderKind, create_personal_access_token::CreatePersonalAccessToken};
-use tracing::{debug, instrument};
-
 use crate::{
     binary::{
         command::{BinaryServerCommand, ServerCommand, ServerCommandHandler},
@@ -33,6 +26,11 @@ use crate::{
     state::{command::EntryCommand, models::CreatePersonalAccessTokenWithHash},
     streaming::session::Session,
 };
+use anyhow::Result;
+use err_trail::ErrContext;
+use iggy_common::{IggyError, SenderKind, create_personal_access_token::CreatePersonalAccessToken};
+use std::rc::Rc;
+use tracing::{debug, instrument};
 
 impl ServerCommandHandler for CreatePersonalAccessToken {
     fn code(&self) -> u32 {

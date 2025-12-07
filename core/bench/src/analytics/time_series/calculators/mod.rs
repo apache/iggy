@@ -19,14 +19,13 @@
 mod latency;
 mod throughput;
 
+use crate::analytics::record::BenchmarkRecord;
 use bench_report::time_series::TimeSeries;
 use iggy::prelude::IggyDuration;
 pub use latency::LatencyTimeSeriesCalculator;
 pub use throughput::{
     MBThroughputCalculator, MessageThroughputCalculator, ThroughputTimeSeriesCalculator,
 };
-
-use crate::analytics::record::BenchmarkRecord;
 
 /// Common functionality for time series calculations
 pub trait TimeSeriesCalculation {

@@ -16,9 +16,6 @@
  * under the License.
  */
 
-use err_trail::ErrContext;
-use iggy_common::{Identifier, IggyError};
-
 use super::COMPONENT;
 use crate::{
     shard::IggyShard,
@@ -32,6 +29,8 @@ use crate::{
         },
     },
 };
+use err_trail::ErrContext;
+use iggy_common::{Identifier, IggyError};
 
 impl IggyShard {
     pub async fn create_stream(

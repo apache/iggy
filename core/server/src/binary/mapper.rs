@@ -16,13 +16,6 @@
  * under the License.
  */
 
-use std::sync::{Arc, atomic::AtomicU64};
-
-use arcshift::SharedGetGuard;
-use bytes::{BufMut, Bytes, BytesMut};
-use iggy_common::{BytesSerializable, ConsumerOffsetInfo, Stats, TransportProtocol, UserId};
-use slab::Slab;
-
 use crate::{
     slab::{
         Keyed,
@@ -41,6 +34,11 @@ use crate::{
         users::user::User,
     },
 };
+use arcshift::SharedGetGuard;
+use bytes::{BufMut, Bytes, BytesMut};
+use iggy_common::{BytesSerializable, ConsumerOffsetInfo, Stats, TransportProtocol, UserId};
+use slab::Slab;
+use std::sync::{Arc, atomic::AtomicU64};
 
 pub fn map_stats(stats: &Stats) -> Bytes {
     let mut bytes = BytesMut::with_capacity(104);

@@ -16,15 +16,14 @@
  * under the License.
  */
 
-use anyhow::Context;
-use async_trait::async_trait;
-use iggy_common::{Consumer, ConsumerKind, Identifier, store_consumer_offset::StoreConsumerOffset};
-use tracing::{Level, event};
-
 use crate::{
     Client,
     cli::cli_command::{CliCommand, PRINT_TARGET},
 };
+use anyhow::Context;
+use async_trait::async_trait;
+use iggy_common::{Consumer, ConsumerKind, Identifier, store_consumer_offset::StoreConsumerOffset};
+use tracing::{Level, event};
 
 pub struct SetConsumerOffsetCmd {
     set_consumer_offset: StoreConsumerOffset,

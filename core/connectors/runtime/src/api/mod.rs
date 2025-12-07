@@ -16,16 +16,14 @@
  * under the License.
  */
 
-use std::{net::SocketAddr, path::PathBuf, sync::Arc};
-
+use crate::context::RuntimeContext;
 use auth::resolve_api_key;
 use axum::{Json, Router, middleware, routing::get};
 use axum_server::tls_rustls::RustlsConfig;
 use config::{HttpConfig, configure_cors};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 use tokio::spawn;
 use tracing::{error, info};
-
-use crate::context::RuntimeContext;
 
 mod auth;
 pub mod config;

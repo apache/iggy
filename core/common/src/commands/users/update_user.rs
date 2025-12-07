@@ -16,16 +16,14 @@
  * under the License.
  */
 
-use std::{fmt::Display, str::from_utf8};
-
-use bytes::{BufMut, Bytes, BytesMut};
-use serde::{Deserialize, Serialize};
-
 use super::defaults::*;
 use crate::{
     BytesSerializable, Command, Identifier, Sizeable, UPDATE_USER_CODE, UserStatus, Validatable,
     error::IggyError,
 };
+use bytes::{BufMut, Bytes, BytesMut};
+use serde::{Deserialize, Serialize};
+use std::{fmt::Display, str::from_utf8};
 
 /// `UpdateUser` command is used to update a user's username and status.
 /// It has additional payload:

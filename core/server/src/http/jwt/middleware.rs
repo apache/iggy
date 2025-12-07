@@ -16,8 +16,10 @@
  * under the License.
  */
 
-use std::sync::Arc;
-
+use crate::http::{
+    jwt::json_web_token::Identity,
+    shared::{AppState, RequestDetails},
+};
 use axum::{
     body::Body,
     extract::State,
@@ -26,11 +28,7 @@ use axum::{
     response::Response,
 };
 use err_trail::ErrContext;
-
-use crate::http::{
-    jwt::json_web_token::Identity,
-    shared::{AppState, RequestDetails},
-};
+use std::sync::Arc;
 
 const COMPONENT: &str = "JWT_MIDDLEWARE";
 const AUTHORIZATION: &str = "authorization";

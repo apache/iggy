@@ -16,12 +16,10 @@
  * under the License.
  */
 
-use std::rc::Rc;
-
-use futures::FutureExt;
-use tracing::{debug, info};
-
 use crate::shard::{IggyShard, task_registry::ShutdownToken, transmission::frame::ShardFrame};
+use futures::FutureExt;
+use std::rc::Rc;
+use tracing::{debug, info};
 
 pub fn spawn_message_pump(shard: Rc<IggyShard>) {
     let shard_clone = shard.clone();

@@ -16,12 +16,10 @@
  * under the License.
  */
 
-use std::fmt::Display;
-
+use crate::{BytesSerializable, Command, GET_CLIENT_CODE, Validatable, error::IggyError};
 use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
-
-use crate::{BytesSerializable, Command, GET_CLIENT_CODE, Validatable, error::IggyError};
+use std::fmt::Display;
 
 /// `GetClient` command is used to get the information about a specific client by unique ID.
 /// It has additional payload:

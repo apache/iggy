@@ -26,14 +26,13 @@
 //! - JSON value field handling
 //! - Automatic type conversion and validation
 
-use std::{env, fmt::Display, future::Future, marker::PhantomData, path::Path};
-
 use figment::{
     Figment, Profile, Provider,
     providers::{Data, Format, Toml},
     value::{Dict, Map as FigmentMap, Tag, Value as FigmentValue},
 };
 use serde::{Serialize, de::DeserializeOwned};
+use std::{env, fmt::Display, future::Future, marker::PhantomData, path::Path};
 use toml::{Value as TomlValue, map::Map as TomlMap};
 use tracing::{error, info, warn};
 

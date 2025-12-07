@@ -16,17 +16,6 @@
  * under the License.
  */
 
-use std::{sync::Arc, time::Duration};
-
-use bench_report::{
-    actor_kind::ActorKind, benchmark_kind::BenchmarkKind,
-    individual_metrics::BenchmarkIndividualMetrics, numeric_parameter::BenchmarkNumericParameter,
-};
-use human_repr::HumanCount;
-use iggy::prelude::*;
-use tokio::time::Instant;
-use tracing::info;
-
 use crate::{
     actors::producer::client::{BenchmarkProducerClient, interface::BenchmarkProducerConfig},
     analytics::{metrics::individual::from_records, record::BenchmarkRecord},
@@ -35,6 +24,15 @@ use crate::{
         rate_limiter::BenchmarkRateLimiter,
     },
 };
+use bench_report::{
+    actor_kind::ActorKind, benchmark_kind::BenchmarkKind,
+    individual_metrics::BenchmarkIndividualMetrics, numeric_parameter::BenchmarkNumericParameter,
+};
+use human_repr::HumanCount;
+use iggy::prelude::*;
+use std::{sync::Arc, time::Duration};
+use tokio::time::Instant;
+use tracing::info;
 
 pub struct BenchmarkProducer<P: BenchmarkProducerClient> {
     pub client: P,

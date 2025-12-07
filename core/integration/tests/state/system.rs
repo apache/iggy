@@ -16,6 +16,7 @@
  * under the License.
  */
 
+use crate::state::StateSetup;
 use iggy::prelude::IggyExpiry;
 use iggy_common::{
     create_consumer_group::CreateConsumerGroup, create_partitions::CreatePartitions,
@@ -30,8 +31,6 @@ use server::state::{
     },
     system::SystemState,
 };
-
-use crate::state::StateSetup;
 
 #[compio::test]
 async fn should_be_initialized_based_on_state_entries() {

@@ -17,10 +17,9 @@
  * under the License.
  */
 
+use crate::{configs::runtime::IggyConfig, error::RuntimeError};
 use iggy::prelude::{Client, IggyClient, IggyClientBuilder};
 use tracing::{error, info};
-
-use crate::{configs::runtime::IggyConfig, error::RuntimeError};
 
 pub struct IggyClients {
     pub producer: IggyClient,

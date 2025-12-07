@@ -16,10 +16,6 @@
  * under the License.
  */
 
-use anyhow::Context;
-use async_trait::async_trait;
-use tracing::{Level, event};
-
 use crate::{
     Client,
     cli::{
@@ -27,6 +23,9 @@ use crate::{
         cli_command::{CliCommand, PRINT_TARGET},
     },
 };
+use anyhow::Context;
+use async_trait::async_trait;
+use tracing::{Level, event};
 
 pub struct LogoutCmd {
     server_session: ServerSession,

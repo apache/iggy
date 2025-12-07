@@ -16,11 +16,10 @@
  * under the License.
  */
 
+use crate::client_wrappers::client_wrapper::ClientWrapper;
 use async_trait::async_trait;
 use iggy_binary_protocol::ConsumerOffsetClient;
 use iggy_common::{Consumer, ConsumerOffsetInfo, Identifier, IggyError};
-
-use crate::client_wrappers::client_wrapper::ClientWrapper;
 
 #[async_trait]
 impl ConsumerOffsetClient for ClientWrapper {

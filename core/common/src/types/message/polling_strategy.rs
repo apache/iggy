@@ -16,16 +16,14 @@
  * under the License.
  */
 
-use std::fmt::Display;
-
-use bytes::{BufMut, Bytes, BytesMut};
-use serde::{Deserialize, Serialize};
-use serde_with::{DisplayFromStr, serde_as};
-
 use crate::{
     BytesSerializable, error::IggyError, types::message::polling_kind::PollingKind,
     utils::timestamp::IggyTimestamp,
 };
+use bytes::{BufMut, Bytes, BytesMut};
+use serde::{Deserialize, Serialize};
+use serde_with::{DisplayFromStr, serde_as};
+use std::fmt::Display;
 
 /// Default value for the polling strategy.
 const DEFAULT_POLLING_STRATEGY_VALUE: u64 = 0;

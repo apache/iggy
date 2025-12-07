@@ -16,6 +16,7 @@
  * under the License.
  */
 
+use crate::cli::common::{IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestHelpCmd, USAGE_PREFIX};
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
 use iggy::prelude::Client;
@@ -23,8 +24,6 @@ use iggy_common::TransportProtocol;
 use integration::test_server::TestServer;
 use predicates::str::{contains, diff, starts_with};
 use serial_test::parallel;
-
-use crate::cli::common::{IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestHelpCmd, USAGE_PREFIX};
 
 #[derive(Debug, Default)]
 pub(super) enum Scenario {

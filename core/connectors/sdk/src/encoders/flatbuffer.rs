@@ -16,13 +16,11 @@
  * under the License.
  */
 
-use std::{collections::HashMap, path::PathBuf};
-
+use crate::{Error, Payload, Schema, StreamEncoder};
 use base64::Engine;
 use flatbuffers::FlatBufferBuilder;
 use serde::{Deserialize, Serialize};
-
-use crate::{Error, Payload, Schema, StreamEncoder};
+use std::{collections::HashMap, path::PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FlatBufferEncoderConfig {

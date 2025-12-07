@@ -15,9 +15,8 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-use std::{fmt::Debug, pin::Pin, sync::Arc};
-
 use iggy_common::{Identifier, IggyError, IggyMessage, Partitioning};
+use std::{fmt::Debug, pin::Pin, sync::Arc};
 use tracing::error;
 
 #[derive(Debug)]

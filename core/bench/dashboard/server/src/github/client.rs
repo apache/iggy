@@ -15,8 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::io::Cursor;
-
+use crate::error::IggyBenchDashboardServerError;
 use octocrab::{
     Octocrab,
     models::{
@@ -26,12 +25,11 @@ use octocrab::{
     },
     params::actions::ArchiveFormat,
 };
+use std::io::Cursor;
 use tempfile::TempDir;
 use tokio::fs::read_dir;
 use tracing::{info, trace};
 use zip::ZipArchive;
-
-use crate::error::IggyBenchDashboardServerError;
 
 const OWNER: &str = "apache";
 const REPO: &str = "iggy";

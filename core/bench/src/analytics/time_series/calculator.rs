@@ -18,16 +18,15 @@
 
 #![allow(clippy::cast_precision_loss)]
 
-use bench_report::time_series::{TimePoint, TimeSeries, TimeSeriesKind};
-use iggy::prelude::IggyDuration;
-use rayon::prelude::*;
-use tracing::warn;
-
 use super::calculators::{
     LatencyTimeSeriesCalculator, MBThroughputCalculator, MessageThroughputCalculator,
     ThroughputTimeSeriesCalculator, TimeSeriesCalculation,
 };
 use crate::analytics::record::BenchmarkRecord;
+use bench_report::time_series::{TimePoint, TimeSeries, TimeSeriesKind};
+use iggy::prelude::IggyDuration;
+use rayon::prelude::*;
+use tracing::warn;
 
 /// Calculate time series data from benchmark records
 pub struct TimeSeriesCalculator;

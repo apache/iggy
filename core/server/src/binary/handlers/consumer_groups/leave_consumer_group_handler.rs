@@ -16,13 +16,6 @@
  * under the License.
  */
 
-use std::rc::Rc;
-
-use anyhow::Result;
-use err_trail::ErrContext;
-use iggy_common::{IggyError, SenderKind, leave_consumer_group::LeaveConsumerGroup};
-use tracing::{debug, instrument};
-
 use super::COMPONENT;
 use crate::{
     binary::{
@@ -32,6 +25,11 @@ use crate::{
     shard::IggyShard,
     streaming::session::Session,
 };
+use anyhow::Result;
+use err_trail::ErrContext;
+use iggy_common::{IggyError, SenderKind, leave_consumer_group::LeaveConsumerGroup};
+use std::rc::Rc;
+use tracing::{debug, instrument};
 
 impl ServerCommandHandler for LeaveConsumerGroup {
     fn code(&self) -> u32 {

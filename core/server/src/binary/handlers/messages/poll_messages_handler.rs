@@ -16,12 +16,6 @@
  * under the License.
  */
 
-use std::rc::Rc;
-
-use anyhow::Result;
-use iggy_common::{IggyError, PollMessages, PooledBuffer, SenderKind};
-use tracing::{debug, trace};
-
 use crate::{
     binary::{
         command::{BinaryServerCommand, ServerCommand, ServerCommandHandler},
@@ -30,6 +24,10 @@ use crate::{
     shard::{IggyShard, system::messages::PollingArgs},
     streaming::session::Session,
 };
+use anyhow::Result;
+use iggy_common::{IggyError, PollMessages, PooledBuffer, SenderKind};
+use std::rc::Rc;
+use tracing::{debug, trace};
 
 #[derive(Debug)]
 pub struct IggyPollMetadata {

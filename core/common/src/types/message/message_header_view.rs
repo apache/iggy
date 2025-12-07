@@ -16,8 +16,6 @@
  * under the License.
  */
 
-use bytes::{Bytes, BytesMut};
-
 use crate::{
     BytesSerializable, IGGY_MESSAGE_CHECKSUM_OFFSET_RANGE, IGGY_MESSAGE_HEADER_SIZE,
     IGGY_MESSAGE_HEADERS_LENGTH_OFFSET_RANGE, IGGY_MESSAGE_ID_OFFSET_RANGE,
@@ -25,6 +23,7 @@ use crate::{
     IGGY_MESSAGE_PAYLOAD_LENGTH_OFFSET_RANGE, IGGY_MESSAGE_TIMESTAMP_OFFSET_RANGE,
     IggyMessageHeader, error::IggyError,
 };
+use bytes::{Bytes, BytesMut};
 
 /// A read-only, typed view into a message header in a raw buffer.
 ///

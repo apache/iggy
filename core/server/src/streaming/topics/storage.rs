@@ -15,17 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::path::Path;
-
-use compio::fs::create_dir_all;
-use iggy_common::IggyError;
-
 use crate::{
     configs::system::SystemConfig,
     io::fs_utils::remove_dir_all,
     slab::traits_ext::{Delete, EntityComponentSystem, EntityMarker, IntoComponents},
     streaming::{partitions::storage::delete_partitions_from_disk, topics::topic},
 };
+use compio::fs::create_dir_all;
+use iggy_common::IggyError;
+use std::path::Path;
 
 pub async fn create_topic_file_hierarchy(
     stream_id: usize,

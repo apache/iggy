@@ -16,11 +16,10 @@
  * under the License.
  */
 
+use crate::args::common::ListModeExt;
 use clap::Args;
 use iggy::prelude::{SnapshotCompression, SystemSnapshotType};
 use iggy_binary_protocol::cli::utils::login_session_expiry::LoginSessionExpiry;
-
-use crate::args::common::ListModeExt;
 
 #[derive(Debug, Clone, Args)]
 pub(crate) struct PingArgs {

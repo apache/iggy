@@ -16,12 +16,10 @@
  * under the License.
  */
 
-use std::{rc::Rc, sync::Arc};
-
-use iggy_common::{IggyError, IggyTimestamp};
-use tracing::{info, trace};
-
 use crate::shard::IggyShard;
+use iggy_common::{IggyError, IggyTimestamp};
+use std::{rc::Rc, sync::Arc};
+use tracing::{info, trace};
 
 pub fn spawn_personal_access_token_cleaner(shard: Rc<IggyShard>) {
     let period = shard

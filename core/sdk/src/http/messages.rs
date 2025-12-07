@@ -16,10 +16,6 @@
  * under the License.
  */
 
-use async_trait::async_trait;
-use iggy_binary_protocol::MessageClient;
-use iggy_common::IggyMessagesBatch;
-
 use crate::{
     http::{http_client::HttpClient, http_transport::HttpTransport},
     prelude::{
@@ -27,6 +23,9 @@ use crate::{
         PollMessages, PolledMessages, PollingStrategy, SendMessages,
     },
 };
+use async_trait::async_trait;
+use iggy_binary_protocol::MessageClient;
+use iggy_common::IggyMessagesBatch;
 
 #[async_trait]
 impl MessageClient for HttpClient {

@@ -16,9 +16,8 @@
  * under the License.
  */
 
-use std::path::Path;
-
 use compio::fs::{File, OpenOptions, remove_file};
+use std::path::Path;
 
 pub async fn open(path: &str) -> Result<File, std::io::Error> {
     OpenOptions::new().read(true).open(path).await

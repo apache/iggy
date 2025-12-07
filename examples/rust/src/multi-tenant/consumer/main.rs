@@ -16,12 +16,11 @@
  * under the License.
  */
 
-use std::{collections::HashMap, env, error::Error, str::FromStr};
-
 use ahash::AHashMap;
 use futures_util::{StreamExt, future::join_all};
 use iggy::prelude::*;
 use iggy_examples::shared::args::Args;
+use std::{collections::HashMap, env, error::Error, str::FromStr};
 use tokio::task::JoinHandle;
 use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, Registry, layer::SubscriberExt, util::SubscriberInitExt};

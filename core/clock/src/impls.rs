@@ -15,9 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use iggy_common::IggyTimestamp;
-
 use crate::Clock;
+use iggy_common::IggyTimestamp;
 
 pub struct IggySystemClock;
 

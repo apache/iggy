@@ -16,12 +16,6 @@
  * under the License.
  */
 
-use std::{net::SocketAddr, num::NonZeroU32, path::Path, str::FromStr};
-
-use bench_report::{benchmark_kind::BenchmarkKind, numeric_parameter::BenchmarkNumericParameter};
-use clap::{CommandFactory, Parser, error::ErrorKind};
-use iggy::prelude::{IggyByteSize, IggyDuration, TransportProtocol};
-
 use super::{
     defaults::{
         DEFAULT_MESSAGE_BATCHES, DEFAULT_MESSAGE_SIZE, DEFAULT_MESSAGES_PER_BATCH,
@@ -33,6 +27,10 @@ use super::{
     props::{BenchmarkKindProps, BenchmarkTransportProps},
     transport::BenchmarkTransportCommand,
 };
+use bench_report::{benchmark_kind::BenchmarkKind, numeric_parameter::BenchmarkNumericParameter};
+use clap::{CommandFactory, Parser, error::ErrorKind};
+use iggy::prelude::{IggyByteSize, IggyDuration, TransportProtocol};
+use std::{net::SocketAddr, num::NonZeroU32, path::Path, str::FromStr};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]

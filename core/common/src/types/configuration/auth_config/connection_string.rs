@@ -16,9 +16,8 @@
  * under the License.
  */
 
-use std::str::FromStr;
-
 use crate::{AutoLogin, ConnectionStringOptions, Credentials, IggyError, TransportProtocol};
+use std::str::FromStr;
 
 const DEFAULT_CONNECTION_STRING_PREFIX: &str = "iggy://";
 const CONNECTION_STRING_PREFIX: &str = "iggy+";

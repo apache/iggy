@@ -16,13 +16,6 @@
  * under the License.
  */
 
-use std::rc::Rc;
-
-use anyhow::Result;
-use err_trail::ErrContext;
-use iggy_common::{Identifier, IggyError, SenderKind, create_user::CreateUser};
-use tracing::{debug, instrument};
-
 use crate::{
     binary::{
         command::{BinaryServerCommand, ServerCommand, ServerCommandHandler},
@@ -40,6 +33,11 @@ use crate::{
     state::{command::EntryCommand, models::CreateUserWithId},
     streaming::{session::Session, utils::crypto},
 };
+use anyhow::Result;
+use err_trail::ErrContext;
+use iggy_common::{Identifier, IggyError, SenderKind, create_user::CreateUser};
+use std::rc::Rc;
+use tracing::{debug, instrument};
 
 impl ServerCommandHandler for CreateUser {
     fn code(&self) -> u32 {

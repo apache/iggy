@@ -16,11 +16,10 @@
  * under the License.
  */
 
-use simd_json::OwnedValue;
-
 use crate::{
     DecodedMessage, Error, Payload, TopicMetadata, transforms::delete_fields::DeleteFields,
 };
+use simd_json::OwnedValue;
 
 impl DeleteFields {
     pub(crate) fn transform_json(

@@ -16,9 +16,8 @@
 * under the License.
 */
 
-use std::str::FromStr;
-
 use crate::{ConnectionStringOptions, IggyDuration, IggyError, TcpClientReconnectionConfig};
+use std::str::FromStr;
 
 #[derive(Debug)]
 pub struct TcpConnectionStringOptions {

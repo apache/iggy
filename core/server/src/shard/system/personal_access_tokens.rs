@@ -16,10 +16,6 @@
  * under the License.
  */
 
-use err_trail::ErrContext;
-use iggy_common::{IggyError, IggyExpiry, IggyTimestamp};
-use tracing::{error, info};
-
 use super::COMPONENT;
 use crate::{
     shard::IggyShard,
@@ -28,6 +24,9 @@ use crate::{
         users::user::User,
     },
 };
+use err_trail::ErrContext;
+use iggy_common::{IggyError, IggyExpiry, IggyTimestamp};
+use tracing::{error, info};
 
 impl IggyShard {
     pub fn get_personal_access_tokens(

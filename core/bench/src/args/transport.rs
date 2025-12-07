@@ -16,10 +16,6 @@
  * under the License.
  */
 
-use clap::{Parser, Subcommand};
-use iggy::prelude::TransportProtocol;
-use serde::{Serialize, Serializer};
-
 use super::{
     defaults::{
         DEFAULT_HTTP_SERVER_ADDRESS, DEFAULT_QUIC_CLIENT_ADDRESS, DEFAULT_QUIC_SERVER_ADDRESS,
@@ -29,6 +25,9 @@ use super::{
     output::BenchmarkOutputCommand,
     props::BenchmarkTransportProps,
 };
+use clap::{Parser, Subcommand};
+use iggy::prelude::TransportProtocol;
+use serde::{Serialize, Serializer};
 
 #[derive(Subcommand, Debug, Clone)]
 pub enum BenchmarkTransportCommand {

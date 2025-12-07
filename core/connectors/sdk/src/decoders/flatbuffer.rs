@@ -16,13 +16,11 @@
  * under the License.
  */
 
-use std::{collections::HashMap, path::PathBuf};
-
+use crate::{Error, Payload, Schema, StreamDecoder};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
+use std::{collections::HashMap, path::PathBuf};
 use tracing::error;
-
-use crate::{Error, Payload, Schema, StreamDecoder};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FlatBufferConfig {
@@ -178,9 +176,8 @@ impl Default for FlatBufferStreamDecoder {
 
 #[cfg(test)]
 mod tests {
-    use flatbuffers::FlatBufferBuilder;
-
     use super::*;
+    use flatbuffers::FlatBufferBuilder;
 
     #[test]
     fn decode_should_fail_given_empty_payload() {

@@ -16,14 +16,6 @@
  * under the License.
  */
 
-use std::{path::Path, time::Duration};
-
-use bench_report::hardware::BenchmarkHardware;
-use iggy::prelude::IggyError;
-use integration::test_server::TestServer;
-use tokio::time::sleep;
-use tracing::{error, info};
-
 use crate::{
     analytics::report_builder::BenchmarkReportBuilder,
     args::common::IggyBenchArgs,
@@ -34,6 +26,12 @@ use crate::{
         params_from_args_and_metrics, server_starter::start_server_if_needed,
     },
 };
+use bench_report::hardware::BenchmarkHardware;
+use iggy::prelude::IggyError;
+use integration::test_server::TestServer;
+use std::{path::Path, time::Duration};
+use tokio::time::sleep;
+use tracing::{error, info};
 
 pub struct BenchmarkRunner {
     pub args: Option<IggyBenchArgs>,

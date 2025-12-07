@@ -16,11 +16,10 @@
  * under the License.
  */
 
-use std::{error::Error, sync::Arc};
-
 use anyhow::Result;
 use iggy::prelude::*;
 use iggy_examples::shared::{args::Args, messages::*, system};
+use std::{error::Error, sync::Arc};
 use tracing::{info, warn};
 use tracing_subscriber::{EnvFilter, Registry, layer::SubscriberExt, util::SubscriberInitExt};
 

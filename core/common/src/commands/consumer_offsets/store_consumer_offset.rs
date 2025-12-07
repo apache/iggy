@@ -16,15 +16,13 @@
  * under the License.
  */
 
-use std::fmt::Display;
-
-use bytes::{BufMut, Bytes, BytesMut};
-use serde::{Deserialize, Serialize};
-
 use crate::{
     BytesSerializable, Command, Consumer, ConsumerKind, Identifier, STORE_CONSUMER_OFFSET_CODE,
     Sizeable, Validatable, error::IggyError,
 };
+use bytes::{BufMut, Bytes, BytesMut};
+use serde::{Deserialize, Serialize};
+use std::fmt::Display;
 
 /// `StoreConsumerOffset` command stores the offset of a consumer for a given partition on the server.
 /// It has additional payload:

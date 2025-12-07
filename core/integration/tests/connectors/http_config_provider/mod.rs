@@ -20,16 +20,14 @@
 mod direct_responses;
 mod wrapped_responses;
 
+use crate::connectors::{ConnectorsRuntime, IggySetup, setup_runtime};
 use std::collections::HashMap;
-
 use strum_macros::Display;
 use testcontainers_modules::testcontainers::{
     ContainerAsync, GenericImage, ImageExt,
     core::{IntoContainerPort, Mount, WaitFor::Healthcheck, wait::HealthWaitStrategy},
     runners::AsyncRunner,
 };
-
-use crate::connectors::{ConnectorsRuntime, IggySetup, setup_runtime};
 
 async fn setup(mode: WireMockMode) -> WiremockConnectorsRuntime {
     let iggy_setup = IggySetup::default();

@@ -16,15 +16,14 @@
  * under the License.
  */
 
-use async_trait::async_trait;
-use comfy_table::Table;
-use tracing::{Level, event};
-
 use super::common::ContextManager;
 use crate::{
     Client,
     cli::cli_command::{CliCommand, PRINT_TARGET},
 };
+use async_trait::async_trait;
+use comfy_table::Table;
+use tracing::{Level, event};
 
 pub enum GetContextsOutput {
     Table,

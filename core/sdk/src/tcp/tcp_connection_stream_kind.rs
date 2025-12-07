@@ -15,12 +15,11 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-use iggy_common::IggyError;
-
 use crate::tcp::{
     tcp_connection_stream::TcpConnectionStream, tcp_stream::ConnectionStream,
     tcp_tls_connection_stream::TcpTlsConnectionStream,
 };
+use iggy_common::IggyError;
 
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)] // TODO(hubcio): consider `Box`ing

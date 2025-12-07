@@ -16,11 +16,6 @@
  * under the License.
  */
 
-use anyhow::Context;
-use async_trait::async_trait;
-use iggy_common::SEC_IN_MICRO;
-use tracing::{Level, event};
-
 use crate::{
     Client,
     cli::{
@@ -29,6 +24,10 @@ use crate::{
         utils::login_session_expiry::LoginSessionExpiry,
     },
 };
+use anyhow::Context;
+use async_trait::async_trait;
+use iggy_common::SEC_IN_MICRO;
+use tracing::{Level, event};
 
 const DEFAULT_LOGIN_SESSION_TIMEOUT: u64 = SEC_IN_MICRO * 15 * 60;
 

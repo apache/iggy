@@ -16,8 +16,10 @@
  * under the License.
  */
 
-use std::fmt::{Display, Formatter};
-
+use crate::state::models::{
+    CreateConsumerGroupWithId, CreatePersonalAccessTokenWithHash, CreateStreamWithId,
+    CreateTopicWithId, CreateUserWithId,
+};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use iggy_common::{
     BytesSerializable, CHANGE_PASSWORD_CODE, CREATE_CONSUMER_GROUP_CODE, CREATE_PARTITIONS_CODE,
@@ -32,11 +34,7 @@ use iggy_common::{
     purge_stream::PurgeStream, purge_topic::PurgeTopic, update_permissions::UpdatePermissions,
     update_stream::UpdateStream, update_topic::UpdateTopic, update_user::UpdateUser,
 };
-
-use crate::state::models::{
-    CreateConsumerGroupWithId, CreatePersonalAccessTokenWithHash, CreateStreamWithId,
-    CreateTopicWithId, CreateUserWithId,
-};
+use std::fmt::{Display, Formatter};
 
 #[derive(Debug, PartialEq)]
 pub enum EntryCommand {

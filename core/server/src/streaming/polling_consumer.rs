@@ -16,11 +16,9 @@
  * under the License.
  */
 
-use std::fmt::{Display, Formatter};
-
-use iggy_common::{IdKind, Identifier};
-
 use crate::streaming::utils::hash;
+use iggy_common::{IdKind, Identifier};
+use std::fmt::{Display, Formatter};
 
 #[derive(Debug, PartialEq, Eq, Hash, Copy, Clone)]
 pub struct ConsumerGroupId(pub usize);
@@ -82,9 +80,8 @@ impl Display for PollingConsumer {
 
 #[cfg(test)]
 mod tests {
-    use iggy_common::Consumer;
-
     use super::*;
+    use iggy_common::Consumer;
 
     #[test]
     fn given_consumer_with_numeric_id_polling_consumer_should_be_created() {

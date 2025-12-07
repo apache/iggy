@@ -16,6 +16,7 @@
  * under the License.
  */
 
+use crate::state::StateSetup;
 use bytes::Bytes;
 use iggy::prelude::BytesSerializable;
 use iggy_common::{create_stream::CreateStream, create_user::CreateUser};
@@ -24,8 +25,6 @@ use server::state::{
     entry::StateEntry,
     models::{CreateStreamWithId, CreateUserWithId},
 };
-
-use crate::state::StateSetup;
 
 #[compio::test]
 async fn should_be_empty_given_initialized_state() {

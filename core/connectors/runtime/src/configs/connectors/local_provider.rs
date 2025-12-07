@@ -17,16 +17,6 @@
  * under the License.
  */
 
-use std::{collections::HashMap, path::Path};
-
-use async_trait::async_trait;
-use chrono::{DateTime, Utc};
-use dashmap::DashMap;
-use figment::{Metadata, Profile, Provider, value::Dict};
-use iggy_common::{ConfigProvider, CustomEnvProvider, FileConfigProvider};
-use serde::{Deserialize, Serialize};
-use tracing::{debug, info, warn};
-
 use crate::{
     configs::connectors::{
         ConnectorConfig, ConnectorConfigVersionInfo, ConnectorConfigVersions, ConnectorsConfig,
@@ -34,6 +24,14 @@ use crate::{
     },
     error::RuntimeError,
 };
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use dashmap::DashMap;
+use figment::{Metadata, Profile, Provider, value::Dict};
+use iggy_common::{ConfigProvider, CustomEnvProvider, FileConfigProvider};
+use serde::{Deserialize, Serialize};
+use std::{collections::HashMap, path::Path};
+use tracing::{debug, info, warn};
 
 #[derive(Eq, PartialEq, Hash, Clone, Debug)]
 struct ConnectorId {

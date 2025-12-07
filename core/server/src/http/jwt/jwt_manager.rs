@@ -16,17 +16,6 @@
  * under the License.
  */
 
-use std::sync::Arc;
-
-use ahash::AHashMap;
-use err_trail::ErrContext;
-use iggy_common::{
-    IggyDuration, IggyError, IggyExpiry, IggyTimestamp, UserId,
-    locking::{IggyRwLock, IggyRwLockFn},
-};
-use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, TokenData, Validation, encode};
-use tracing::{debug, error, info};
-
 use crate::{
     configs::http::HttpJwtConfig,
     http::jwt::{
@@ -36,6 +25,15 @@ use crate::{
     },
     streaming::persistence::persister::PersisterKind,
 };
+use ahash::AHashMap;
+use err_trail::ErrContext;
+use iggy_common::{
+    IggyDuration, IggyError, IggyExpiry, IggyTimestamp, UserId,
+    locking::{IggyRwLock, IggyRwLockFn},
+};
+use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, TokenData, Validation, encode};
+use std::sync::Arc;
+use tracing::{debug, error, info};
 
 pub struct IssuerOptions {
     pub issuer: String,

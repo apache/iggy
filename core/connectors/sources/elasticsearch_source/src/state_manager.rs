@@ -17,15 +17,13 @@
  * under the License.
  */
 
-use std::{str::FromStr, sync::Arc};
-
+use crate::{ElasticsearchSource, StateConfig};
 use async_trait::async_trait;
 use iggy_connector_sdk::Error;
 use serde::{Deserialize, Serialize};
+use std::{str::FromStr, sync::Arc};
 use tokio::time::{Duration, interval};
 use tracing::{error, info, warn};
-
-use crate::{ElasticsearchSource, StateConfig};
 
 impl ElasticsearchSource {
     async fn get_state(&self) -> Result<Option<SourceState>, Error> {

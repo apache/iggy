@@ -16,13 +16,12 @@
  * under the License.
  */
 
-use iggy_common::IggyError;
-use tracing::error;
-
 use super::{
     frame::{ShardFrame, ShardResponse},
     message::ShardMessage,
 };
+use iggy_common::IggyError;
+use tracing::error;
 
 pub type StopSender = async_channel::Sender<()>;
 pub type StopReceiver = async_channel::Receiver<()>;

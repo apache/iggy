@@ -16,16 +16,15 @@
  * under the License.
  */
 
+use crate::{
+    Client,
+    cli::cli_command::{CliCommand, PRINT_TARGET},
+};
 use anyhow::Context;
 use async_trait::async_trait;
 use comfy_table::Table;
 use iggy_common::get_clients::GetClients;
 use tracing::{Level, event};
-
-use crate::{
-    Client,
-    cli::cli_command::{CliCommand, PRINT_TARGET},
-};
 
 pub enum GetClientsOutput {
     Table,

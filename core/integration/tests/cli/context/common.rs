@@ -16,9 +16,8 @@
  * under the License.
  */
 
-use std::path::PathBuf;
-
 use iggy_binary_protocol::cli::binary_context::common::{ContextReaderWriter, ContextsConfigMap};
+use std::path::PathBuf;
 use tempfile::{TempDir, tempdir};
 
 pub struct TestIggyContext {

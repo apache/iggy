@@ -16,10 +16,6 @@
  * under the License.
  */
 
-use err_trail::ErrContext;
-use iggy_common::{Identifier, IggyError};
-use tracing::info;
-
 use super::COMPONENT;
 use crate::{
     shard::{
@@ -37,6 +33,9 @@ use crate::{
         streams, topics,
     },
 };
+use err_trail::ErrContext;
+use iggy_common::{Identifier, IggyError};
+use tracing::info;
 
 impl IggyShard {
     fn validate_partition_permissions(

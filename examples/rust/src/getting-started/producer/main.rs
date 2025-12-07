@@ -16,9 +16,8 @@
  * under the License.
  */
 
-use std::{env, error::Error, str::FromStr};
-
 use iggy::prelude::*;
+use std::{env, error::Error, str::FromStr};
 use tracing::{info, warn};
 use tracing_subscriber::{EnvFilter, Registry, layer::SubscriberExt, util::SubscriberInitExt};
 

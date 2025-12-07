@@ -15,23 +15,21 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
-
-use futures::FutureExt;
-use iggy_common::{Identifier, IggyError, IggyMessage, Partitioning, Sizeable};
-use tokio::{
-    sync::{Semaphore, broadcast},
-    task::JoinHandle,
-};
-
 use crate::clients::{
     producer::ProducerCoreBackend,
     producer_config::{BackgroundConfig, BackpressureMode},
     producer_error_callback::ErrorCtx,
     producer_sharding::{Shard, ShardMessage, ShardMessageWithPermits},
+};
+use futures::FutureExt;
+use iggy_common::{Identifier, IggyError, IggyMessage, Partitioning, Sizeable};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use tokio::{
+    sync::{Semaphore, broadcast},
+    task::JoinHandle,
 };
 
 pub struct ProducerDispatcher {
@@ -240,16 +238,14 @@ impl ProducerDispatcher {
 
 #[cfg(test)]
 mod tests {
-    use std::{pin::Pin, sync::atomic::AtomicUsize, time::Duration};
-
-    use bytes::Bytes;
-    use tokio::time::sleep;
-
     use super::*;
     use crate::clients::{
         producer::MockProducerCoreBackend, producer_error_callback::ErrorCallback,
         producer_sharding::Sharding,
     };
+    use bytes::Bytes;
+    use std::{pin::Pin, sync::atomic::AtomicUsize, time::Duration};
+    use tokio::time::sleep;
 
     fn dummy_identifier() -> Arc<Identifier> {
         Arc::new(Identifier::numeric(1).unwrap())

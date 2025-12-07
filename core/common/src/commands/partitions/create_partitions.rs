@@ -16,16 +16,14 @@
  * under the License.
  */
 
-use std::fmt::Display;
-
-use bytes::{BufMut, Bytes, BytesMut};
-use serde::{Deserialize, Serialize};
-
 use super::MAX_PARTITIONS_COUNT;
 use crate::{
     BytesSerializable, CREATE_PARTITIONS_CODE, Command, Identifier, Sizeable, Validatable,
     error::IggyError,
 };
+use bytes::{BufMut, Bytes, BytesMut};
+use serde::{Deserialize, Serialize};
+use std::fmt::Display;
 
 /// `CreatePartitions` command is used to create new partitions for a topic.
 /// It has additional payload:
@@ -117,9 +115,8 @@ impl Display for CreatePartitions {
 
 #[cfg(test)]
 mod tests {
-    use bytes::BufMut;
-
     use super::*;
+    use bytes::BufMut;
 
     #[test]
     fn should_be_serialized_as_bytes() {

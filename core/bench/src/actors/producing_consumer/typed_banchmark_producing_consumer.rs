@@ -16,15 +16,6 @@
  * under the License.
  */
 
-use std::sync::Arc;
-
-use bench_report::{
-    benchmark_kind::BenchmarkKind, individual_metrics::BenchmarkIndividualMetrics,
-    numeric_parameter::BenchmarkNumericParameter,
-};
-use iggy::prelude::*;
-use integration::test_server::ClientFactory;
-
 use crate::{
     actors::{
         consumer::client::{
@@ -39,6 +30,13 @@ use crate::{
     },
     utils::finish_condition::BenchmarkFinishCondition,
 };
+use bench_report::{
+    benchmark_kind::BenchmarkKind, individual_metrics::BenchmarkIndividualMetrics,
+    numeric_parameter::BenchmarkNumericParameter,
+};
+use iggy::prelude::*;
+use integration::test_server::ClientFactory;
+use std::sync::Arc;
 
 pub enum TypedBenchmarkProducingConsumer {
     High(BenchmarkProducingConsumer<HighLevelProducerClient, HighLevelConsumerClient>),

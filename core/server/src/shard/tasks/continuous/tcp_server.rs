@@ -16,14 +16,12 @@
  * under the License.
  */
 
-use std::rc::Rc;
-
-use iggy_common::IggyError;
-
 use crate::{
     shard::{IggyShard, task_registry::ShutdownToken},
     tcp::tcp_server,
 };
+use iggy_common::IggyError;
+use std::rc::Rc;
 
 pub fn spawn_tcp_server(shard: Rc<IggyShard>) {
     let shard_clone = shard.clone();

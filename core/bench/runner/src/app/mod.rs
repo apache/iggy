@@ -17,12 +17,11 @@
 
 mod local_benchmark_runner;
 mod utils;
+use crate::args::IggyBenchRunnerArgs;
 use anyhow::{Context, Result};
 use dircpy::copy_dir;
 use local_benchmark_runner::LocalBenchmarkRunner;
 use tracing::info;
-
-use crate::args::IggyBenchRunnerArgs;
 
 pub struct IggyBenchRunnerApp {
     args: IggyBenchRunnerArgs,

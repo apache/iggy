@@ -16,16 +16,14 @@
  * under the License.
  */
 
-use std::fmt::Display;
-
-use bytes::{BufMut, Bytes, BytesMut};
-use serde::{Deserialize, Serialize};
-use tracing::error;
-
 use crate::{
     BytesSerializable, Command, GET_SNAPSHOT_FILE_CODE, SnapshotCompression, SystemSnapshotType,
     Validatable, error::IggyError,
 };
+use bytes::{BufMut, Bytes, BytesMut};
+use serde::{Deserialize, Serialize};
+use std::fmt::Display;
+use tracing::error;
 
 /// `GetSnapshot` command is used to get snapshot information.
 #[derive(Debug, Serialize, Deserialize, PartialEq)]

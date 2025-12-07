@@ -15,19 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::{
-    cell::{Cell, RefCell},
-    collections::VecDeque,
-};
-
+use crate::{Consensus, Project};
 use bit_set::BitSet;
 use iggy_common::{
     header::{Command2, PrepareHeader, PrepareOkHeader, RequestHeader},
     message::Message,
 };
 use message_bus::IggyMessageBus;
-
-use crate::{Consensus, Project};
+use std::{
+    cell::{Cell, RefCell},
+    collections::VecDeque,
+};
 
 pub trait Sequencer {
     type Sequence;

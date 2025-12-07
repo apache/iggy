@@ -16,12 +16,6 @@
  * under the License.
  */
 
-use std::rc::Rc;
-
-use anyhow::Result;
-use iggy_common::{IggyError, SenderKind, get_topics::GetTopics};
-use tracing::debug;
-
 use crate::{
     binary::{
         command::{BinaryServerCommand, ServerCommand, ServerCommandHandler},
@@ -32,6 +26,10 @@ use crate::{
     slab::traits_ext::{EntityComponentSystem, IntoComponents},
     streaming::{session::Session, streams},
 };
+use anyhow::Result;
+use iggy_common::{IggyError, SenderKind, get_topics::GetTopics};
+use std::rc::Rc;
+use tracing::debug;
 
 impl ServerCommandHandler for GetTopics {
     fn code(&self) -> u32 {

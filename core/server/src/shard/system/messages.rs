@@ -16,15 +16,6 @@
  * under the License.
  */
 
-use std::sync::atomic::Ordering;
-
-use err_trail::ErrContext;
-use iggy_common::{
-    BytesSerializable, Consumer, EncryptorKind, IGGY_MESSAGE_HEADER_SIZE, Identifier, IggyError,
-    Partitioning, PartitioningKind, PollingKind, PollingStrategy, PooledBuffer,
-};
-use tracing::error;
-
 use super::COMPONENT;
 use crate::{
     binary::handlers::messages::poll_messages_handler::IggyPollMetadata,
@@ -43,6 +34,13 @@ use crate::{
         traits::MainOps,
     },
 };
+use err_trail::ErrContext;
+use iggy_common::{
+    BytesSerializable, Consumer, EncryptorKind, IGGY_MESSAGE_HEADER_SIZE, Identifier, IggyError,
+    Partitioning, PartitioningKind, PollingKind, PollingStrategy, PooledBuffer,
+};
+use std::sync::atomic::Ordering;
+use tracing::error;
 
 impl IggyShard {
     pub async fn append_messages(

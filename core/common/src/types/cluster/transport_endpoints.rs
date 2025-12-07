@@ -16,12 +16,10 @@
  * under the License.
  */
 
-use std::fmt::Display;
-
+use crate::{BytesSerializable, IggyError};
 use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
-
-use crate::{BytesSerializable, IggyError};
+use std::fmt::Display;
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct TransportEndpoints {

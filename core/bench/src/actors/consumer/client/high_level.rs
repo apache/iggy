@@ -16,14 +16,6 @@
  * under the License.
  */
 
-use std::{sync::Arc, time::Duration};
-
-use futures_util::StreamExt;
-use iggy::prelude::*;
-use integration::test_server::{ClientFactory, login_root};
-use tokio::time::{Instant, timeout};
-use tracing::{error, warn};
-
 use crate::actors::{
     ApiLabel, BatchMetrics, BenchmarkInit,
     consumer::client::{
@@ -31,6 +23,12 @@ use crate::actors::{
         interface::{BenchmarkConsumerConfig, ConsumerClient},
     },
 };
+use futures_util::StreamExt;
+use iggy::prelude::*;
+use integration::test_server::{ClientFactory, login_root};
+use std::{sync::Arc, time::Duration};
+use tokio::time::{Instant, timeout};
+use tracing::{error, warn};
 
 pub struct HighLevelConsumerClient {
     client_factory: Arc<dyn ClientFactory>,

@@ -16,8 +16,6 @@
  * under the License.
  */
 
-use std::{error::Error, str::FromStr, sync::Arc};
-
 use futures_util::StreamExt;
 use iggy::prelude::*;
 use iggy_examples::shared::{
@@ -27,6 +25,7 @@ use iggy_examples::shared::{
         OrderCreated, OrderRejected,
     },
 };
+use std::{error::Error, str::FromStr, sync::Arc};
 use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, Registry, layer::SubscriberExt, util::SubscriberInitExt};
 

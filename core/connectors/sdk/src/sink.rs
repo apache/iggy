@@ -16,12 +16,11 @@
  * under the License.
  */
 
+use crate::{ConsumedMessage, MessagesMetadata, RawMessages, Sink, TopicMetadata, get_runtime};
 use serde::de::DeserializeOwned;
 use tokio::sync::watch;
 use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, Registry, layer::SubscriberExt, util::SubscriberInitExt};
-
-use crate::{ConsumedMessage, MessagesMetadata, RawMessages, Sink, TopicMetadata, get_runtime};
 
 pub type ConsumeCallback = extern "C" fn(
     plugin_id: u32,

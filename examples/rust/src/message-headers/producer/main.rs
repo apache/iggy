@@ -16,12 +16,11 @@
  * under the License.
  */
 
-use std::{collections::HashMap, error::Error, str::FromStr, sync::Arc};
-
 use anyhow::Result;
 use bytes::Bytes;
 use iggy::prelude::*;
 use iggy_examples::shared::{args::Args, messages_generator::MessagesGenerator, system};
+use std::{collections::HashMap, error::Error, str::FromStr, sync::Arc};
 use tracing::info;
 use tracing_subscriber::{EnvFilter, Registry, layer::SubscriberExt, util::SubscriberInitExt};
 

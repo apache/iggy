@@ -16,17 +16,16 @@
  * under the License.
  */
 
+use crate::cli::common::{
+    CLAP_INDENT, IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestHelpCmd, TestUserId,
+    USAGE_PREFIX,
+};
 use ahash::AHashMap;
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
 use iggy::prelude::{Client, Permissions, StreamPermissions, TopicPermissions, UserId, UserStatus};
 use predicates::str::{is_match, starts_with};
 use serial_test::parallel;
-
-use crate::cli::common::{
-    CLAP_INDENT, IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestHelpCmd, TestUserId,
-    USAGE_PREFIX,
-};
 
 enum TestUser<'a> {
     Existing(&'a str),

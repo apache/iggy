@@ -16,17 +16,16 @@
  * under the License.
  */
 
-use std::{
-    rc::Rc,
-    sync::atomic::{AtomicU64, Ordering},
-};
-
 use compio::{
     fs::{File, OpenOptions},
     io::AsyncWriteAtExt,
 };
 use err_trail::ErrContext;
 use iggy_common::{INDEX_SIZE, IggyError, PooledBuffer};
+use std::{
+    rc::Rc,
+    sync::atomic::{AtomicU64, Ordering},
+};
 use tracing::trace;
 
 /// A dedicated struct for writing to the index file.

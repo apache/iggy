@@ -17,7 +17,6 @@
  */
 
 use std::{env, error, path::PathBuf};
-
 use vergen_git2::{BuildBuilder, CargoBuilder, Emitter, Git2Builder, RustcBuilder, SysinfoBuilder};
 
 fn main() -> Result<(), Box<dyn error::Error>> {

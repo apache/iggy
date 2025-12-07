@@ -16,17 +16,15 @@
  * under the License.
  */
 
-use std::{
-    fmt::{Display, Formatter},
-    str::from_utf8,
-};
-
-use bytes::{BufMut, Bytes, BytesMut};
-use serde::{Deserialize, Serialize};
-
 use crate::{
     BytesSerializable, Command, LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE, Validatable, defaults::*,
     error::IggyError,
+};
+use bytes::{BufMut, Bytes, BytesMut};
+use serde::{Deserialize, Serialize};
+use std::{
+    fmt::{Display, Formatter},
+    str::from_utf8,
 };
 
 /// `LoginWithPersonalAccessToken` command is used to login the user with a personal access token, instead of the username and password.

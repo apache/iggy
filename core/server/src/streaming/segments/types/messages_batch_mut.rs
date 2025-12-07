@@ -16,11 +16,11 @@
  * under the License.
  */
 
-use std::{
-    ops::{Deref, Index},
-    sync::Arc,
+use super::message_view_mut::IggyMessageViewMutIterator;
+use crate::streaming::{
+    deduplication::message_deduplicator::MessageDeduplicator, segments::indexes::IggyIndexesMut,
+    utils::random_id,
 };
-
 use bytes::{BufMut, BytesMut};
 use iggy_common::{
     BytesSerializable, IGGY_MESSAGE_HEADER_SIZE, INDEX_SIZE, IggyByteSize, IggyError,
@@ -28,13 +28,11 @@ use iggy_common::{
     MAX_PAYLOAD_SIZE, MAX_USER_HEADERS_SIZE, PooledBuffer, Sizeable, Validatable,
 };
 use lending_iterator::prelude::*;
-use tracing::{error, warn};
-
-use super::message_view_mut::IggyMessageViewMutIterator;
-use crate::streaming::{
-    deduplication::message_deduplicator::MessageDeduplicator, segments::indexes::IggyIndexesMut,
-    utils::random_id,
+use std::{
+    ops::{Deref, Index},
+    sync::Arc,
 };
+use tracing::{error, warn};
 
 /// A container for mutable messages that are being prepared for persistence.
 ///

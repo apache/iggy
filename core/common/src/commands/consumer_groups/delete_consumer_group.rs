@@ -16,15 +16,13 @@
  * under the License.
  */
 
-use std::fmt::Display;
-
-use bytes::{BufMut, Bytes, BytesMut};
-use serde::{Deserialize, Serialize};
-
 use crate::{
     BytesSerializable, Command, DELETE_CONSUMER_GROUP_CODE, Identifier, Sizeable, Validatable,
     error::IggyError,
 };
+use bytes::{BufMut, Bytes, BytesMut};
+use serde::{Deserialize, Serialize};
+use std::fmt::Display;
 
 /// `DeleteConsumerGroup` command deletes an existing consumer group from the topic.
 /// It has additional payload:

@@ -16,11 +16,6 @@
  * under the License.
  */
 
-use std::{collections::HashMap, str::FromStr};
-
-use iggy::prelude::*;
-use serial_test::parallel;
-
 use crate::cli::{
     common::IggyCmdTest,
     message::{
@@ -28,6 +23,9 @@ use crate::cli::{
         test_message_send_from_file_command::TestMessageSendFromFileCmd,
     },
 };
+use iggy::prelude::*;
+use serial_test::parallel;
+use std::{collections::HashMap, str::FromStr};
 
 #[tokio::test]
 #[parallel]

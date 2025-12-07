@@ -20,6 +20,13 @@
 #![allow(clippy::cast_possible_truncation)]
 #![allow(clippy::cast_sign_loss)]
 
+use crate::analytics::{
+    record::BenchmarkRecord,
+    time_series::{
+        calculator::TimeSeriesCalculator,
+        processors::{TimeSeriesProcessor, moving_average::MovingAverageProcessor},
+    },
+};
 use bench_report::{
     actor_kind::ActorKind,
     benchmark_kind::BenchmarkKind,
@@ -29,14 +36,6 @@ use bench_report::{
     utils::{max, min, std_dev},
 };
 use iggy::prelude::IggyDuration;
-
-use crate::analytics::{
-    record::BenchmarkRecord,
-    time_series::{
-        calculator::TimeSeriesCalculator,
-        processors::{TimeSeriesProcessor, moving_average::MovingAverageProcessor},
-    },
-};
 
 pub fn from_records(
     records: &[BenchmarkRecord],

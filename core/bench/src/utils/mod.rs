@@ -16,17 +16,6 @@
  * under the License.
  */
 
-use std::{fs, path::Path, sync::Arc};
-
-use bench_report::{
-    benchmark_kind::BenchmarkKind, individual_metrics::BenchmarkIndividualMetrics,
-    numeric_parameter::BenchmarkNumericParameter, params::BenchmarkParams,
-    transport::BenchmarkTransport,
-};
-use iggy::prelude::*;
-use integration::test_server::ClientFactory;
-use tracing::{error, info};
-
 use crate::args::{
     common::IggyBenchArgs,
     defaults::{
@@ -38,6 +27,15 @@ use crate::args::{
         DEFAULT_TOTAL_MESSAGES_SIZE, DEFAULT_WARMUP_TIME,
     },
 };
+use bench_report::{
+    benchmark_kind::BenchmarkKind, individual_metrics::BenchmarkIndividualMetrics,
+    numeric_parameter::BenchmarkNumericParameter, params::BenchmarkParams,
+    transport::BenchmarkTransport,
+};
+use iggy::prelude::*;
+use integration::test_server::ClientFactory;
+use std::{fs, path::Path, sync::Arc};
+use tracing::{error, info};
 
 pub mod batch_generator;
 pub mod client_factory;

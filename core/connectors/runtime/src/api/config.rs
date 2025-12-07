@@ -17,14 +17,12 @@
  * under the License.
  */
 
-use std::fmt::Formatter;
-
+use crate::{configs::connectors::ConfigFormat, error::RuntimeError};
 use axum::http::{HeaderValue, Method};
 use serde::{Deserialize, Serialize};
+use std::fmt::Formatter;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::error;
-
-use crate::{configs::connectors::ConfigFormat, error::RuntimeError};
 
 pub const JSON_HEADER: HeaderValue = HeaderValue::from_static("application/json");
 pub const YAML_HEADER: HeaderValue = HeaderValue::from_static("application/yaml");

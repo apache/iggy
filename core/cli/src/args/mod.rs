@@ -16,16 +16,6 @@
  * under the License.
  */
 
-use std::path::PathBuf;
-
-use clap::{Args, Command as ClapCommand, Parser, Subcommand};
-use clap_complete::{Generator, Shell, generate};
-use figlet_rs::FIGfont;
-use iggy::prelude::{Args as IggyArgs, ArgsOptional as IggyArgsOptional};
-use iggy_binary_protocol::cli::binary_context::common::ContextConfig;
-use segment::SegmentAction;
-use system::SnapshotArgs;
-
 use self::user::UserAction;
 #[cfg(feature = "login-session")]
 use crate::args::system::LoginArgs;
@@ -41,6 +31,14 @@ use crate::args::{
     system::{PingArgs, StatsArgs},
     topic::TopicAction,
 };
+use clap::{Args, Command as ClapCommand, Parser, Subcommand};
+use clap_complete::{Generator, Shell, generate};
+use figlet_rs::FIGfont;
+use iggy::prelude::{Args as IggyArgs, ArgsOptional as IggyArgsOptional};
+use iggy_binary_protocol::cli::binary_context::common::ContextConfig;
+use segment::SegmentAction;
+use std::path::PathBuf;
+use system::SnapshotArgs;
 
 pub(crate) mod client;
 pub(crate) mod common;

@@ -15,9 +15,6 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-use async_channel::Sender;
-use iggy_common::{IggyError, Stats};
-
 use crate::{
     binary::handlers::messages::poll_messages_handler::IggyPollMetadata,
     shard::transmission::message::ShardMessage,
@@ -25,6 +22,8 @@ use crate::{
         segments::IggyMessagesBatchSet, streams::stream, topics::topic, users::user::User,
     },
 };
+use async_channel::Sender;
+use iggy_common::{IggyError, Stats};
 
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]

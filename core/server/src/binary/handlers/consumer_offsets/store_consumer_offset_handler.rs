@@ -16,13 +16,6 @@
  * under the License.
  */
 
-use std::rc::Rc;
-
-use anyhow::Result;
-use err_trail::ErrContext;
-use iggy_common::{IggyError, SenderKind, store_consumer_offset::StoreConsumerOffset};
-use tracing::debug;
-
 use crate::{
     binary::{
         command::{BinaryServerCommand, ServerCommand, ServerCommandHandler},
@@ -31,6 +24,11 @@ use crate::{
     shard::IggyShard,
     streaming::session::Session,
 };
+use anyhow::Result;
+use err_trail::ErrContext;
+use iggy_common::{IggyError, SenderKind, store_consumer_offset::StoreConsumerOffset};
+use std::rc::Rc;
+use tracing::debug;
 
 impl ServerCommandHandler for StoreConsumerOffset {
     fn code(&self) -> u32 {

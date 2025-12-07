@@ -16,10 +16,6 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-use std::{collections::HashMap, sync::Arc};
-
-use tracing::error;
-
 use crate::{
     SinkConnectorWrapper, SourceConnectorWrapper,
     configs::{
@@ -32,6 +28,8 @@ use crate::{
         status::{ConnectorError, ConnectorStatus},
     },
 };
+use std::{collections::HashMap, sync::Arc};
+use tracing::error;
 
 pub struct RuntimeContext {
     pub sinks: SinkManager,

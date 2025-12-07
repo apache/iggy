@@ -35,7 +35,6 @@ pub use alloc::{
     buffer::PooledBuffer,
     memory_pool::{MEMORY_POOL, MemoryPool, MemoryPoolConfigOther, memory_pool},
 };
-
 pub use certificates::generate_self_signed_certificate;
 pub use commands::{
     consumer_groups::*,

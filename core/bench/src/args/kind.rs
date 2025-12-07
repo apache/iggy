@@ -16,10 +16,6 @@
  * under the License.
  */
 
-use bench_report::benchmark_kind::BenchmarkKind;
-use clap::Subcommand;
-use iggy::prelude::IggyByteSize;
-
 use super::{
     examples::print_examples,
     kinds::{
@@ -42,6 +38,9 @@ use crate::args::kinds::{
         producer_and_consumer::PinnedProducerAndConsumerArgs,
     },
 };
+use bench_report::benchmark_kind::BenchmarkKind;
+use clap::Subcommand;
+use iggy::prelude::IggyByteSize;
 
 #[derive(Subcommand, Debug)]
 pub enum BenchmarkKindCommand {

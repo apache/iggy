@@ -21,8 +21,16 @@ mod credentials;
 mod error;
 mod logging;
 
-use std::sync::Arc;
-
+use crate::{
+    args::{
+        Command, IggyConsoleArgs, client::ClientAction, consumer_group::ConsumerGroupAction,
+        consumer_offset::ConsumerOffsetAction, permissions::PermissionsArgs,
+        personal_access_token::PersonalAccessTokenAction, stream::StreamAction, topic::TopicAction,
+    },
+    credentials::IggyCredentials,
+    error::{CmdToolError, IggyCmdError},
+    logging::Logging,
+};
 use args::{
     CliOptions, IggyMergedConsoleArgs, context::ContextAction, message::MessageAction,
     partition::PartitionAction, segment::SegmentAction, user::UserAction,
@@ -79,18 +87,8 @@ use iggy_binary_protocol::cli::{
     },
     cli_command::{CliCommand, PRINT_TARGET},
 };
+use std::sync::Arc;
 use tracing::{Level, event};
-
-use crate::{
-    args::{
-        Command, IggyConsoleArgs, client::ClientAction, consumer_group::ConsumerGroupAction,
-        consumer_offset::ConsumerOffsetAction, permissions::PermissionsArgs,
-        personal_access_token::PersonalAccessTokenAction, stream::StreamAction, topic::TopicAction,
-    },
-    credentials::IggyCredentials,
-    error::{CmdToolError, IggyCmdError},
-    logging::Logging,
-};
 
 #[cfg(feature = "login-session")]
 mod main_login_session {

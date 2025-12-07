@@ -16,13 +16,6 @@
  * under the License.
  */
 
-use std::rc::Rc;
-
-use anyhow::Result;
-use err_trail::ErrContext;
-use iggy_common::{IggyError, SenderKind, delete_segments::DeleteSegments};
-use tracing::{debug, instrument};
-
 use crate::{
     binary::{
         command::{BinaryServerCommand, ServerCommand, ServerCommandHandler},
@@ -40,6 +33,11 @@ use crate::{
     streaming,
     streaming::session::Session,
 };
+use anyhow::Result;
+use err_trail::ErrContext;
+use iggy_common::{IggyError, SenderKind, delete_segments::DeleteSegments};
+use std::rc::Rc;
+use tracing::{debug, instrument};
 
 impl ServerCommandHandler for DeleteSegments {
     fn code(&self) -> u32 {

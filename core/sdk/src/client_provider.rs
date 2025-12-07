@@ -16,14 +16,6 @@
  * under the License.
  */
 
-use std::{str::FromStr, sync::Arc};
-
-use iggy_binary_protocol::Client;
-use iggy_common::{
-    AutoLogin, Credentials, TransportProtocol, WebSocketClientConfig,
-    WebSocketClientReconnectionConfig, WebSocketConfig,
-};
-
 use crate::{
     client_wrappers::client_wrapper::ClientWrapper,
     clients::client::IggyClient,
@@ -36,6 +28,12 @@ use crate::{
     quic::quic_client::QuicClient,
     tcp::tcp_client::TcpClient,
 };
+use iggy_binary_protocol::Client;
+use iggy_common::{
+    AutoLogin, Credentials, TransportProtocol, WebSocketClientConfig,
+    WebSocketClientReconnectionConfig, WebSocketConfig,
+};
+use std::{str::FromStr, sync::Arc};
 
 /// Configuration for the `ClientProvider`.
 /// It consists of the following fields:

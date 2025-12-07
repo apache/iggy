@@ -16,8 +16,6 @@
  * under the License.
  */
 
-use serde::{Deserialize, Serialize};
-
 use crate::{
     CompressionAlgorithm, Partition,
     utils::{
@@ -25,6 +23,7 @@ use crate::{
         topic_size::MaxTopicSize,
     },
 };
+use serde::{Deserialize, Serialize};
 
 /// `Topic` represents the medium level of logical separation of data as it's a part of the stream.
 /// It consists of the following fields:

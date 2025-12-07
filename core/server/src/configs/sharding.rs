@@ -16,9 +16,8 @@
  * under the License.
  */
 
-use std::{collections::HashSet, str::FromStr, thread::available_parallelism};
-
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::{collections::HashSet, str::FromStr, thread::available_parallelism};
 
 #[derive(Debug, Deserialize, Serialize, Default)]
 pub struct ShardingConfig {

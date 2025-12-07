@@ -16,14 +16,12 @@
  * under the License.
  */
 
-use std::str::FromStr;
-
-use iggy::prelude::TopicPermissions;
-
 use super::constants::{
     MANAGE_TOPIC_LONG, MANAGE_TOPIC_SHORT, POLL_MESSAGES_LONG, POLL_MESSAGES_SHORT,
     READ_TOPIC_LONG, READ_TOPIC_SHORT, SEND_MESSAGES_LONG, SEND_MESSAGES_SHORT,
 };
+use iggy::prelude::TopicPermissions;
+use std::str::FromStr;
 
 #[derive(Clone, Debug, PartialEq)]
 enum TopicPermission {

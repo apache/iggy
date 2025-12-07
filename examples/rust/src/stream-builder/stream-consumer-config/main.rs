@@ -16,10 +16,9 @@
  * under the License.
  */
 
-use std::str::FromStr;
-
 use iggy::prelude::*;
 use iggy_examples::shared::stream::PrintEventConsumer;
+use std::str::FromStr;
 use tokio::sync::oneshot;
 
 const IGGY_URL: &str = "iggy://iggy:iggy@localhost:8090";

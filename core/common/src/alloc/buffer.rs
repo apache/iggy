@@ -16,12 +16,10 @@
  * under the License.
  */
 
-use std::ops::{Deref, DerefMut};
-
+use super::memory_pool::{BytesMutExt, memory_pool};
 use bytes::{Buf, BufMut, BytesMut};
 use compio::buf::{IoBuf, IoBufMut, SetBufInit};
-
-use super::memory_pool::{BytesMutExt, memory_pool};
+use std::ops::{Deref, DerefMut};
 
 /// A buffer wrapper that participates in memory pooling.
 ///

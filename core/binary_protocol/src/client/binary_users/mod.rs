@@ -16,16 +16,15 @@
  * under the License.
  */
 
+use crate::{
+    BinaryClient, UserClient,
+    utils::{auth::fail_if_not_authenticated, mapper},
+};
 use iggy_common::{
     ClientState, DiagnosticEvent, Identifier, IdentityInfo, IggyError, Permissions, UserInfo,
     UserInfoDetails, UserStatus, change_password::ChangePassword, create_user::CreateUser,
     delete_user::DeleteUser, get_user::GetUser, get_users::GetUsers, login_user::LoginUser,
     logout_user::LogoutUser, update_permissions::UpdatePermissions, update_user::UpdateUser,
-};
-
-use crate::{
-    BinaryClient, UserClient,
-    utils::{auth::fail_if_not_authenticated, mapper},
 };
 
 #[async_trait::async_trait]

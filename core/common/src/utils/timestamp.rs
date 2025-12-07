@@ -16,19 +16,17 @@
  * under the License.
  */
 
-use core::fmt;
-use std::{
-    ops::{Add, Sub},
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
-
+use crate::IggyDuration;
 use chrono::{DateTime, Local, Utc};
+use core::fmt;
 use serde::{
     Deserialize, Deserializer, Serialize, Serializer,
     de::{self, Visitor},
 };
-
-use crate::IggyDuration;
+use std::{
+    ops::{Add, Sub},
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 /// A struct that represents a timestamp.
 ///

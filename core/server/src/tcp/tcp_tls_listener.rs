@@ -16,8 +16,11 @@
  * under the License.
  */
 
-use std::{io::BufReader, net::SocketAddr, rc::Rc, sync::Arc, time::Duration};
-
+use crate::{
+    configs::tcp::TcpSocketConfig,
+    shard::{IggyShard, task_registry::ShutdownToken, transmission::event::ShardEvent},
+    tcp::connection_handler::{handle_connection, handle_error},
+};
 use compio::net::{TcpListener, TcpOpts};
 use compio_tls::TlsAcceptor;
 use err_trail::ErrContext;
@@ -28,13 +31,8 @@ use rustls::{
     pki_types::{CertificateDer, PrivateKeyDer},
 };
 use rustls_pemfile::{certs, private_key};
+use std::{io::BufReader, net::SocketAddr, rc::Rc, sync::Arc, time::Duration};
 use tracing::{error, info, trace, warn};
-
-use crate::{
-    configs::tcp::TcpSocketConfig,
-    shard::{IggyShard, task_registry::ShutdownToken, transmission::event::ShardEvent},
-    tcp::connection_handler::{handle_connection, handle_error},
-};
 
 pub(crate) async fn start(
     server_name: &'static str,

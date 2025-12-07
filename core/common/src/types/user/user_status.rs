@@ -16,11 +16,9 @@
  * under the License.
  */
 
-use std::{fmt::Display, str::FromStr};
-
-use serde::{Deserialize, Serialize};
-
 use crate::error::IggyError;
+use serde::{Deserialize, Serialize};
+use std::{fmt::Display, str::FromStr};
 
 /// `UserStatus` represents the status of the user.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Default, Clone, Copy)]

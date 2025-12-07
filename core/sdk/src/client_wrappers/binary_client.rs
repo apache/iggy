@@ -16,12 +16,11 @@
  * under the License.
  */
 
+use crate::client_wrappers::client_wrapper::ClientWrapper;
 use async_broadcast::Receiver;
 use async_trait::async_trait;
 use iggy_binary_protocol::Client;
 use iggy_common::{DiagnosticEvent, IggyError};
-
-use crate::client_wrappers::client_wrapper::ClientWrapper;
 
 #[async_trait]
 impl Client for ClientWrapper {

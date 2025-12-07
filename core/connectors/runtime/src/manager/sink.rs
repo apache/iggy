@@ -16,13 +16,11 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-use std::{collections::HashMap, sync::Arc};
-
-use dashmap::DashMap;
-use tokio::sync::Mutex;
-
 use super::status::{ConnectorError, ConnectorStatus};
 use crate::configs::connectors::{ConfigFormat, SinkConfig};
+use dashmap::DashMap;
+use std::{collections::HashMap, sync::Arc};
+use tokio::sync::Mutex;
 
 #[derive(Debug)]
 pub struct SinkManager {

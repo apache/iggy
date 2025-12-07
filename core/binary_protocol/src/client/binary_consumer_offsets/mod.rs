@@ -15,16 +15,15 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-use iggy_common::{
-    Consumer, ConsumerOffsetInfo, Identifier, IggyError,
-    delete_consumer_offset::DeleteConsumerOffset, get_consumer_offset::GetConsumerOffset,
-    store_consumer_offset::StoreConsumerOffset,
-};
-
 use crate::{
     ConsumerOffsetClient,
     client::binary_clients::BinaryClient,
     utils::{auth::fail_if_not_authenticated, mapper},
+};
+use iggy_common::{
+    Consumer, ConsumerOffsetInfo, Identifier, IggyError,
+    delete_consumer_offset::DeleteConsumerOffset, get_consumer_offset::GetConsumerOffset,
+    store_consumer_offset::StoreConsumerOffset,
 };
 
 #[async_trait::async_trait]

@@ -15,11 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::{pin::Pin, time::Duration};
-
 use futures::{Stream, StreamExt, channel::mpsc};
 use opentelemetry_sdk::runtime::{Runtime, RuntimeChannel, TrySend};
 use send_wrapper::SendWrapper;
+use std::{pin::Pin, time::Duration};
 
 #[derive(Clone)]
 pub struct CompioRuntime;

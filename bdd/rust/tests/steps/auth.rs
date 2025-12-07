@@ -16,14 +16,13 @@
  * under the License.
  */
 
+use crate::common::global_context::GlobalContext;
 use cucumber::given;
 use iggy::{clients::client::IggyClient, prelude::SystemClient};
 use integration::{
     tcp_client::TcpClientFactory,
     test_server::{ClientFactory, login_root},
 };
-
-use crate::common::global_context::GlobalContext;
 
 #[given("I am authenticated as the root user")]
 pub async fn given_authenticated_as_root(world: &mut GlobalContext) {

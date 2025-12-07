@@ -94,9 +94,8 @@ impl MessageDeduplicator {
 
 #[cfg(test)]
 mod tests {
-    use compio::time::sleep;
-
     use super::*;
+    use compio::time::sleep;
 
     #[compio::test]
     async fn message_deduplicator_should_insert_only_unique_identifiers() {

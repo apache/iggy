@@ -18,8 +18,6 @@
 
 mod seeder;
 
-use std::{error::Error, sync::Arc};
-
 use anyhow::Result;
 use clap::Parser;
 use iggy::{
@@ -28,6 +26,7 @@ use iggy::{
     clients::client::IggyClient,
     prelude::{Aes256GcmEncryptor, Args, ArgsOptional, Client, EncryptorKind, UserClient},
 };
+use std::{error::Error, sync::Arc};
 use tracing::info;
 use tracing_subscriber::{EnvFilter, Registry, layer::SubscriberExt, util::SubscriberInitExt};
 

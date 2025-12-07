@@ -15,12 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::future::Future;
-
 use compio::{
     buf::{IoBuf, IoBufMut},
     io::{AsyncReadAtExt, AsyncWriteAtExt},
 };
+use std::future::Future;
 
 pub trait Storage {
     fn read_exact_at<B: IoBufMut>(

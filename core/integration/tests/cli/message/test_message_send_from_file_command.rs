@@ -16,17 +16,15 @@
  * under the License.
  */
 
-use std::{collections::HashMap, str::FromStr};
-
+use crate::cli::common::{IggyCmdCommand, IggyCmdTest, IggyCmdTestCase};
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
 use bytes::Bytes;
 use iggy::prelude::*;
 use predicates::str::{ends_with, is_match, starts_with};
 use serial_test::parallel;
+use std::{collections::HashMap, str::FromStr};
 use tokio::io::AsyncWriteExt;
-
-use crate::cli::common::{IggyCmdCommand, IggyCmdTest, IggyCmdTestCase};
 
 pub(super) struct TestMessageSendFromFileCmd<'a> {
     initialize: bool,

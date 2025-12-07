@@ -16,10 +16,9 @@
  * under the License.
  */
 
+use crate::common::global_context::GlobalContext;
 use cucumber::{given, then, when};
 use iggy::prelude::StreamClient;
-
-use crate::common::global_context::GlobalContext;
 
 #[given("I have no streams in the system")]
 pub async fn given_no_streams(world: &mut GlobalContext) {

@@ -16,8 +16,7 @@
  * under the License.
  */
 
-use std::sync::Arc;
-
+use crate::{router::arrow_streamer::JsonArrowReader, slice_user_table};
 use arrow_json::ReaderBuilder;
 use async_trait::async_trait;
 use iceberg::{
@@ -37,10 +36,9 @@ use iceberg::{
 };
 use iggy_connector_sdk::{ConsumedMessage, Error, MessagesMetadata, Payload, Schema};
 use parquet::file::properties::WriterProperties;
+use std::sync::Arc;
 use tracing::{error, warn};
 use uuid::Uuid;
-
-use crate::{router::arrow_streamer::JsonArrowReader, slice_user_table};
 
 mod arrow_streamer;
 pub mod dynamic_router;

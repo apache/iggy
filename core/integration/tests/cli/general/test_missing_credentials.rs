@@ -16,13 +16,12 @@
  * under the License.
  */
 
+use crate::cli::common::{IggyCmdCommand, IggyCmdTest, IggyCmdTestCase};
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
 use iggy::prelude::Client;
 use predicates::str::starts_with;
 use serial_test::parallel;
-
-use crate::cli::common::{IggyCmdCommand, IggyCmdTest, IggyCmdTestCase};
 
 struct TestNoCredentialsCmd {}
 

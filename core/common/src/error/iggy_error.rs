@@ -16,15 +16,13 @@
  * under the License.
  */
 
-use std::sync::Arc;
-
-use strum::{EnumDiscriminants, FromRepr, IntoStaticStr};
-use thiserror::Error;
-
 use crate::{
     Identifier, IggyMessage,
     utils::{byte_size::IggyByteSize, topic_size::MaxTopicSize},
 };
+use std::sync::Arc;
+use strum::{EnumDiscriminants, FromRepr, IntoStaticStr};
+use thiserror::Error;
 
 #[derive(Clone, Debug, Error, EnumDiscriminants, IntoStaticStr, FromRepr, Default)]
 #[repr(u32)]

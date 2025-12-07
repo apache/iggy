@@ -15,9 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use bench_report::benchmark_kind::BenchmarkKind;
-use yew::prelude::*;
-
 use super::logo::Logo;
 use crate::{
     components::selectors::{
@@ -31,6 +28,8 @@ use crate::{
         ui::{ViewMode, use_ui},
     },
 };
+use bench_report::benchmark_kind::BenchmarkKind;
+use yew::prelude::*;
 
 #[derive(Clone, PartialEq)]
 pub enum BenchmarkTab {

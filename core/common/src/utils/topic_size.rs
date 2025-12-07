@@ -16,15 +16,13 @@
  * under the License.
  */
 
+use super::byte_size::IggyByteSize;
 use core::fmt;
-use std::str::FromStr;
-
 use serde::{
     Deserialize, Deserializer, Serialize, Serializer,
     de::{self, Visitor},
 };
-
-use super::byte_size::IggyByteSize;
+use std::str::FromStr;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
 pub enum MaxTopicSize {

@@ -16,10 +16,9 @@
  * under the License.
  */
 
-use std::num::NonZeroU32;
-
 use iggy::prelude::IggyByteSize;
 use nonzero_lit::u32;
+use std::num::NonZeroU32;
 
 pub const DEFAULT_HTTP_SERVER_ADDRESS: &str = "127.0.0.1:3000";
 

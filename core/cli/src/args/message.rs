@@ -16,10 +16,9 @@
  * under the License.
  */
 
-use std::str::FromStr;
-
 use clap::{ArgGroup, Args, Subcommand, builder::NonEmptyStringValueParser};
 use iggy::prelude::*;
+use std::str::FromStr;
 
 #[derive(Debug, Clone, Subcommand)]
 pub(crate) enum MessageAction {
@@ -232,9 +231,8 @@ pub(crate) struct FlushMessagesArgs {
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
-
     use super::*;
+    use std::str::FromStr;
 
     #[test]
     fn parse_key_val_should_parse_string() {

@@ -16,10 +16,9 @@
  * under the License.
  */
 
+use crate::{consumer_ext::MessageConsumer, prelude::IggyError};
 use async_trait::async_trait;
 use tokio::sync::oneshot;
-
-use crate::{consumer_ext::MessageConsumer, prelude::IggyError};
 
 #[async_trait]
 pub trait IggyConsumerMessageExt<'a> {

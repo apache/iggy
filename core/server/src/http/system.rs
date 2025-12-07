@@ -16,8 +16,13 @@
  * under the License.
  */
 
-use std::sync::Arc;
-
+use crate::{
+    configs::http::HttpMetricsConfig,
+    http::{
+        COMPONENT, error::CustomError, jwt::json_web_token::Identity, mapper, shared::AppState,
+    },
+    streaming::session::Session,
+};
 use axum::{
     Extension, Json, Router,
     body::Body,
@@ -34,14 +39,7 @@ use iggy_common::{
     ClientInfo, ClientInfoDetails, ClusterMetadata, Stats, Validatable, get_snapshot::GetSnapshot,
 };
 use send_wrapper::SendWrapper;
-
-use crate::{
-    configs::http::HttpMetricsConfig,
-    http::{
-        COMPONENT, error::CustomError, jwt::json_web_token::Identity, mapper, shared::AppState,
-    },
-    streaming::session::Session,
-};
+use std::sync::Arc;
 
 const NAME: &str = "Iggy API";
 const PONG: &str = "pong";

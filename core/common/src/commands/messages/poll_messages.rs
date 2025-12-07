@@ -16,15 +16,13 @@
  * under the License.
  */
 
-use std::fmt::Display;
-
-use bytes::{BufMut, Bytes, BytesMut};
-use serde::{Deserialize, Serialize};
-
 use crate::{
     BytesSerializable, Command, Consumer, ConsumerKind, Identifier, POLL_MESSAGES_CODE,
     PollingKind, PollingStrategy, Sizeable, Validatable, error::IggyError,
 };
+use bytes::{BufMut, Bytes, BytesMut};
+use serde::{Deserialize, Serialize};
+use std::fmt::Display;
 
 pub const DEFAULT_PARTITION_ID: u32 = 0;
 pub const DEFAULT_NUMBER_OF_MESSAGES_TO_POLL: u32 = 10;

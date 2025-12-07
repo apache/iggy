@@ -16,14 +16,12 @@
  * under the License.
  */
 
-use std::fmt::Display;
-
-use bytes::Bytes;
-use serde::{Deserialize, Serialize};
-
 use crate::{
     BytesSerializable, Command, GET_TOPICS_CODE, Identifier, Validatable, error::IggyError,
 };
+use bytes::Bytes;
+use serde::{Deserialize, Serialize};
+use std::fmt::Display;
 
 /// `GetTopics` command is used to retrieve the collection of topics from a stream.
 /// It has additional payload:

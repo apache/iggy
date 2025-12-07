@@ -16,15 +16,13 @@
  * under the License.
  */
 
-use std::net::SocketAddr;
-
-use dashmap::DashMap;
-use iggy_common::{IggyError, IggyTimestamp, TransportProtocol, UserId};
-
 use crate::streaming::{
     session::Session,
     utils::{hash, ptr::EternalPtr},
 };
+use dashmap::DashMap;
+use iggy_common::{IggyError, IggyTimestamp, TransportProtocol, UserId};
+use std::net::SocketAddr;
 
 pub struct ClientManager {
     clients: EternalPtr<DashMap<u32, Client>>,

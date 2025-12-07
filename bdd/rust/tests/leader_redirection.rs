@@ -20,9 +20,8 @@ pub(crate) mod common;
 pub(crate) mod helpers;
 pub(crate) mod steps;
 
-use cucumber::World;
-
 use crate::common::leader_context::LeaderContext;
+use cucumber::World;
 
 #[tokio::main]
 async fn main() {

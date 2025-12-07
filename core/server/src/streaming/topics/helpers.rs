@@ -15,11 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::sync::{Arc, atomic::Ordering};
-
-use iggy_common::{CompressionAlgorithm, Identifier, IggyExpiry, MaxTopicSize};
-use slab::Slab;
-
 use crate::{
     slab::{
         Keyed,
@@ -41,6 +36,9 @@ use crate::{
         utils::hash,
     },
 };
+use iggy_common::{CompressionAlgorithm, Identifier, IggyExpiry, MaxTopicSize};
+use slab::Slab;
+use std::sync::{Arc, atomic::Ordering};
 
 pub fn rename_index(
     old_name: &<TopicRoot as Keyed>::Key,

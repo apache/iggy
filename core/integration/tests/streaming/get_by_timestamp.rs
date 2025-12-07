@@ -16,8 +16,8 @@
  * under the License.
  */
 
-use std::{collections::HashMap, str::FromStr, thread::sleep};
-
+use super::bootstrap_test_environment;
+use crate::streaming::common::test_setup::TestSetup;
 use bytes::BytesMut;
 use iggy::prelude::*;
 use server::{
@@ -30,10 +30,8 @@ use server::{
         polling_consumer::PollingConsumer, segments::IggyMessagesBatchMut, traits::MainOps,
     },
 };
+use std::{collections::HashMap, str::FromStr, thread::sleep};
 use test_case::test_matrix;
-
-use super::bootstrap_test_environment;
-use crate::streaming::common::test_setup::TestSetup;
 
 /*
  * Below helper functions are here only to make test function name more readable.

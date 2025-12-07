@@ -17,9 +17,6 @@
  * under the License.
  */
 
-use iggy_connector_sdk::transforms::TransformType;
-use serde::{Deserialize, Serialize};
-
 use crate::{
     configs::connectors::{
         ConfigFormat, SinkConfig, SourceConfig, StreamConsumerConfig, StreamProducerConfig,
@@ -30,6 +27,8 @@ use crate::{
         status::{ConnectorError, ConnectorStatus},
     },
 };
+use iggy_connector_sdk::transforms::TransformType;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SinkInfoResponse {

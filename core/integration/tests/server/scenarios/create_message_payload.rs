@@ -16,11 +16,10 @@
  * under the License.
  */
 
-use std::{collections::HashMap, str::FromStr};
-
 use bytes::Bytes;
 use iggy::prelude::*;
 use integration::test_server::{ClientFactory, assert_clean_system, login_root};
+use std::{collections::HashMap, str::FromStr};
 
 const STREAM_NAME: &str = "test-stream";
 const TOPIC_NAME: &str = "test-topic";

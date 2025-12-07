@@ -24,16 +24,14 @@ mod plot;
 mod runner;
 mod utils;
 
-use std::{fs, path::Path};
-
+use crate::{args::common::IggyBenchArgs, runner::BenchmarkRunner};
 use clap::Parser;
 use figlet_rs::FIGfont;
 use iggy::prelude::IggyError;
+use std::{fs, path::Path};
 use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 use utils::cpu_name::append_cpu_name_lowercase;
-
-use crate::{args::common::IggyBenchArgs, runner::BenchmarkRunner};
 
 #[tokio::main]
 async fn main() -> Result<(), IggyError> {

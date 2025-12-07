@@ -18,12 +18,10 @@
 
 #![allow(clippy::cast_precision_loss)]
 
-use std::collections::VecDeque;
-
-use bench_report::time_series::{TimePoint, TimeSeries};
-use tracing::warn;
-
 use super::TimeSeriesProcessor;
+use bench_report::time_series::{TimePoint, TimeSeries};
+use std::collections::VecDeque;
+use tracing::warn;
 
 /// Moving average processor
 pub struct MovingAverageProcessor {

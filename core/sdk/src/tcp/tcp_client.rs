@@ -16,8 +16,15 @@
  * under the License.
  */
 
-use std::{net::SocketAddr, str::FromStr, sync::Arc};
-
+use crate::{
+    leader_aware::{LeaderRedirectionState, check_and_redirect_to_leader},
+    prelude::{Client, TcpClientConfig},
+    tcp::{
+        tcp_connection_stream::TcpConnectionStream,
+        tcp_connection_stream_kind::ConnectionStreamKind,
+        tcp_tls_connection_stream::TcpTlsConnectionStream,
+    },
+};
 use async_broadcast::{Receiver, Sender, broadcast};
 use async_trait::async_trait;
 use bytes::{BufMut, Bytes, BytesMut};
@@ -28,19 +35,10 @@ use iggy_common::{
     TcpConnectionStringOptions, TransportProtocol,
 };
 use rustls::pki_types::{CertificateDer, ServerName, pem::PemObject};
+use std::{net::SocketAddr, str::FromStr, sync::Arc};
 use tokio::{net::TcpStream, sync::Mutex, time::sleep};
 use tokio_rustls::{TlsConnector, TlsStream};
 use tracing::{error, info, trace, warn};
-
-use crate::{
-    leader_aware::{LeaderRedirectionState, check_and_redirect_to_leader},
-    prelude::{Client, TcpClientConfig},
-    tcp::{
-        tcp_connection_stream::TcpConnectionStream,
-        tcp_connection_stream_kind::ConnectionStreamKind,
-        tcp_tls_connection_stream::TcpTlsConnectionStream,
-    },
-};
 
 const REQUEST_INITIAL_BYTES_LENGTH: usize = 4;
 const RESPONSE_INITIAL_BYTES_LENGTH: usize = 8;

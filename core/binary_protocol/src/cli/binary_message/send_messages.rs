@@ -16,24 +16,22 @@
  * under the License.
  */
 
-use std::{
-    collections::HashMap,
-    io::{self, Read},
+use crate::{
+    Client,
+    cli::cli_command::{CliCommand, PRINT_TARGET},
 };
-
 use anyhow::Context;
 use async_trait::async_trait;
 use bytes::Bytes;
 use iggy_common::{
     BytesSerializable, HeaderKey, HeaderValue, Identifier, IggyMessage, Partitioning, Sizeable,
 };
+use std::{
+    collections::HashMap,
+    io::{self, Read},
+};
 use tokio::io::AsyncReadExt;
 use tracing::{Level, event};
-
-use crate::{
-    Client,
-    cli::cli_command::{CliCommand, PRINT_TARGET},
-};
 
 pub struct SendMessagesCmd {
     stream_id: Identifier,

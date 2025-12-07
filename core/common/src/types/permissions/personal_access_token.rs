@@ -16,9 +16,8 @@
  * under the License.
  */
 
-use serde::{Deserialize, Serialize};
-
 use crate::utils::timestamp::IggyTimestamp;
+use serde::{Deserialize, Serialize};
 
 /// `RawPersonalAccessToken` represents the raw personal access token - the secured token which is returned only once during the creation.
 /// It consists of the following fields:

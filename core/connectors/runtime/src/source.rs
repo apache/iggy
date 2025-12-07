@@ -17,12 +17,16 @@
  * under the License.
  */
 
-use std::{
-    collections::HashMap,
-    str::FromStr,
-    sync::{Arc, atomic::Ordering},
+use crate::{
+    PLUGIN_ID, RuntimeError, SourceApi, SourceConnector, SourceConnectorPlugin,
+    SourceConnectorProducer, SourceConnectorWrapper,
+    configs::connectors::SourceConfig,
+    context::RuntimeContext,
+    manager::status::ConnectorStatus,
+    resolve_plugin_path,
+    state::{FileStateProvider, StateProvider, StateStorage},
+    transform,
 };
-
 use dashmap::DashMap;
 use dlopen2::wrapper::Container;
 use flume::{Receiver, Sender};
@@ -34,18 +38,12 @@ use iggy_connector_sdk::{
     transforms::Transform,
 };
 use once_cell::sync::Lazy;
-use tracing::{debug, error, info, trace, warn};
-
-use crate::{
-    PLUGIN_ID, RuntimeError, SourceApi, SourceConnector, SourceConnectorPlugin,
-    SourceConnectorProducer, SourceConnectorWrapper,
-    configs::connectors::SourceConfig,
-    context::RuntimeContext,
-    manager::status::ConnectorStatus,
-    resolve_plugin_path,
-    state::{FileStateProvider, StateProvider, StateStorage},
-    transform,
+use std::{
+    collections::HashMap,
+    str::FromStr,
+    sync::{Arc, atomic::Ordering},
 };
+use tracing::{debug, error, info, trace, warn};
 
 pub static SOURCE_SENDERS: Lazy<DashMap<u32, Sender<ProducedMessages>>> = Lazy::new(DashMap::new);
 

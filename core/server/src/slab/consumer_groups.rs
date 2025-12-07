@@ -15,10 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use ahash::AHashMap;
-use iggy_common::Identifier;
-use slab::Slab;
-
 use crate::{
     slab::{
         Keyed, consumer_groups,
@@ -29,6 +25,9 @@ use crate::{
     },
     streaming::topics::consumer_group::{self, ConsumerGroupRef, ConsumerGroupRefMut},
 };
+use ahash::AHashMap;
+use iggy_common::Identifier;
+use slab::Slab;
 
 const CAPACITY: usize = 1024;
 pub type ContainerId = usize;

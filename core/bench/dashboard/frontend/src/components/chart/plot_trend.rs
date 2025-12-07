@@ -19,6 +19,7 @@
 // but they are kept for future use.
 #![allow(dead_code)]
 
+use super::{PlotConfig, PlotType};
 use bench_dashboard_shared::BenchmarkReportLight;
 use bench_report::{
     group_metrics_kind::GroupMetricsKind,
@@ -31,8 +32,6 @@ use charming::{
     element::{Symbol, Tooltip, Trigger},
     theme::Theme,
 };
-
-use super::{PlotConfig, PlotType};
 
 fn trend_chart_title(params: &BenchmarkParams, kind: ChartKind) -> String {
     if let Some(remark) = &params.remark {

@@ -15,15 +15,14 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-use anyhow::Context;
-use async_trait::async_trait;
-use iggy_common::{Identifier, delete_segments::DeleteSegments};
-use tracing::{Level, event};
-
 use crate::{
     Client,
     cli::cli_command::{CliCommand, PRINT_TARGET},
 };
+use anyhow::Context;
+use async_trait::async_trait;
+use iggy_common::{Identifier, delete_segments::DeleteSegments};
+use tracing::{Level, event};
 
 pub struct DeleteSegmentsCmd {
     delete_segments: DeleteSegments,

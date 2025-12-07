@@ -16,11 +16,6 @@
  * under the License.
  */
 
-use std::rc::Rc;
-
-use err_trail::ErrContext;
-use iggy_common::{IggyError, SenderKind, get_me::GetMe};
-
 use crate::{
     binary::{
         command::{BinaryServerCommand, ServerCommand, ServerCommandHandler},
@@ -30,6 +25,9 @@ use crate::{
     shard::IggyShard,
     streaming::session::Session,
 };
+use err_trail::ErrContext;
+use iggy_common::{IggyError, SenderKind, get_me::GetMe};
+use std::rc::Rc;
 
 impl ServerCommandHandler for GetMe {
     fn code(&self) -> u32 {

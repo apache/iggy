@@ -16,13 +16,11 @@
  * under the License.
  */
 
-use std::{fmt::Display, str::from_utf8};
-
-use bytes::{BufMut, Bytes, BytesMut};
-use serde::{Deserialize, Serialize};
-
 use super::defaults::*;
 use crate::{BytesSerializable, Command, LOGIN_USER_CODE, Validatable, error::IggyError};
+use bytes::{BufMut, Bytes, BytesMut};
+use serde::{Deserialize, Serialize};
+use std::{fmt::Display, str::from_utf8};
 
 /// `LoginUser` command is used to login a user by username and password.
 /// It has additional payload:

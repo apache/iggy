@@ -15,12 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::{ops::AsyncFnOnce, time::Duration};
-
-use iggy_common::IggyError;
-
 use super::NoShutdown;
 use crate::shard::task_registry::{ShutdownToken, registry::TaskRegistry};
+use iggy_common::IggyError;
+use std::{ops::AsyncFnOnce, time::Duration};
 
 pub struct OneShotBuilder<'a, Task, OnShutdown = NoShutdown> {
     reg: &'a TaskRegistry,

@@ -16,6 +16,8 @@
  * under the License.
  */
 
+use async_channel::{Receiver, Sender, bounded};
+use futures::FutureExt;
 use std::{
     sync::{
         Arc,
@@ -23,9 +25,6 @@ use std::{
     },
     time::Duration,
 };
-
-use async_channel::{Receiver, Sender, bounded};
-use futures::FutureExt;
 use tracing::trace;
 
 /// Coordinates graceful shutdown across multiple tasks

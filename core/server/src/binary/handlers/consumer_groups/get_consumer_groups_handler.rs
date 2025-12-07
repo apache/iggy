@@ -16,12 +16,6 @@
  * under the License.
  */
 
-use std::rc::Rc;
-
-use anyhow::Result;
-use iggy_common::{IggyError, SenderKind, get_consumer_groups::GetConsumerGroups};
-use tracing::debug;
-
 use crate::{
     binary::{
         command::{BinaryServerCommand, ServerCommand, ServerCommandHandler},
@@ -32,6 +26,10 @@ use crate::{
     slab::traits_ext::{EntityComponentSystem, IntoComponents},
     streaming::{session::Session, streams, topics},
 };
+use anyhow::Result;
+use iggy_common::{IggyError, SenderKind, get_consumer_groups::GetConsumerGroups};
+use std::rc::Rc;
+use tracing::debug;
 
 impl ServerCommandHandler for GetConsumerGroups {
     fn code(&self) -> u32 {

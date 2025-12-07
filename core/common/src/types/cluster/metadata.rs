@@ -16,12 +16,10 @@
  * under the License.
  */
 
-use std::fmt::Display;
-
+use crate::{BytesSerializable, IggyError, types::cluster::node::ClusterNode};
 use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
-
-use crate::{BytesSerializable, IggyError, types::cluster::node::ClusterNode};
+use std::fmt::Display;
 
 /// Represents metadata of all nodes in the cluster.
 #[derive(Debug, Deserialize, Serialize, Clone)]

@@ -17,11 +17,7 @@
  * under the License.
  */
 
-use std::{
-    collections::HashMap,
-    fmt::{Display, Formatter},
-};
-
+use crate::api::config::HttpConfig;
 use figment::{
     Metadata, Profile, Provider,
     providers::{Format, Toml},
@@ -33,8 +29,10 @@ use iggy_common::{
 };
 use serde::{Deserialize, Serialize};
 use serde_with::{DisplayFromStr, serde_as};
-
-use crate::api::config::HttpConfig;
+use std::{
+    collections::HashMap,
+    fmt::{Display, Formatter},
+};
 
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
 #[serde(default)]

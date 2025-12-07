@@ -15,13 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::cell::RefCell;
-
+use crate::streaming::users::user::User;
 use ahash::AHashMap;
 use iggy_common::{Identifier, IggyError};
 use slab::Slab;
-
-use crate::streaming::users::user::User;
+use std::cell::RefCell;
 
 const CAPACITY: usize = 1024;
 

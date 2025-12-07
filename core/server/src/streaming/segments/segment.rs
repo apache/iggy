@@ -15,9 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::fmt::Display;
-
 use iggy_common::{IggyByteSize, IggyExpiry, IggyTimestamp};
+use std::fmt::Display;
 
 #[derive(Default, Debug, Clone)]
 pub struct Segment {

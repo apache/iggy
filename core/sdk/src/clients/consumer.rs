@@ -16,18 +16,7 @@
  * under the License.
  */
 
-use std::{
-    collections::VecDeque,
-    future::Future,
-    pin::Pin,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU32, AtomicU64},
-    },
-    task::{Context, Poll},
-    time::Duration,
-};
-
+use crate::client_wrappers::client_wrapper::ClientWrapper;
 use bytes::Bytes;
 use dashmap::DashMap;
 use futures::Stream;
@@ -40,10 +29,19 @@ use iggy_common::{
     IggyError, IggyMessage, IggyTimestamp, PolledMessages, PollingKind, PollingStrategy,
     locking::{IggyRwLock, IggyRwLockFn},
 };
+use std::{
+    collections::VecDeque,
+    future::Future,
+    pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU32, AtomicU64},
+    },
+    task::{Context, Poll},
+    time::Duration,
+};
 use tokio::{time, time::sleep};
 use tracing::{error, info, trace, warn};
-
-use crate::client_wrappers::client_wrapper::ClientWrapper;
 
 const ORDERING: std::sync::atomic::Ordering = std::sync::atomic::Ordering::SeqCst;
 type PollMessagesFuture = Pin<Box<dyn Future<Output = Result<PolledMessages, IggyError>>>>;

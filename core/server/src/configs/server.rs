@@ -16,8 +16,14 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-use std::{env, str::FromStr, sync::Arc};
-
+use crate::{
+    IGGY_ROOT_PASSWORD_ENV,
+    configs::{
+        COMPONENT, cluster::ClusterConfig, http::HttpConfig, quic::QuicConfig,
+        system::SystemConfig, tcp::TcpConfig, websocket::WebSocketConfig,
+    },
+    server_error::ConfigurationError,
+};
 use derive_more::Display;
 use err_trail::ErrContext;
 use figment::{
@@ -31,15 +37,7 @@ use iggy_common::{
 };
 use serde::{Deserialize, Serialize};
 use serde_with::{DisplayFromStr, serde_as};
-
-use crate::{
-    IGGY_ROOT_PASSWORD_ENV,
-    configs::{
-        COMPONENT, cluster::ClusterConfig, http::HttpConfig, quic::QuicConfig,
-        system::SystemConfig, tcp::TcpConfig, websocket::WebSocketConfig,
-    },
-    server_error::ConfigurationError,
-};
+use std::{env, str::FromStr, sync::Arc};
 
 const DEFAULT_CONFIG_PATH: &str = "configs/server.toml";
 const SECRET_KEYS: [&str; 6] = [

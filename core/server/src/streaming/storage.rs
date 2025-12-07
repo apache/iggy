@@ -16,10 +16,9 @@
  * under the License.
  */
 
-use std::sync::Arc;
-
 use super::persistence::persister::PersisterKind;
 use crate::{configs::system::SystemConfig, shard::system::storage::FileSystemInfoStorage};
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub struct SystemStorage {

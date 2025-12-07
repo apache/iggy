@@ -16,17 +16,15 @@
  * under the License.
  */
 
-use std::sync::Arc;
-
+use super::benchmark::Benchmarkable;
+use crate::{args::common::IggyBenchArgs, benchmarks::common::build_producer_futures};
 use async_trait::async_trait;
 use bench_report::{benchmark_kind::BenchmarkKind, individual_metrics::BenchmarkIndividualMetrics};
 use iggy::prelude::*;
 use integration::test_server::ClientFactory;
+use std::sync::Arc;
 use tokio::task::JoinSet;
 use tracing::info;
-
-use super::benchmark::Benchmarkable;
-use crate::{args::common::IggyBenchArgs, benchmarks::common::build_producer_futures};
 
 pub struct BalancedProducerBenchmark {
     args: Arc<IggyBenchArgs>,

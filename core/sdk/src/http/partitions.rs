@@ -16,14 +16,13 @@
  * under the License.
  */
 
-use async_trait::async_trait;
-use iggy_binary_protocol::PartitionClient;
-use iggy_common::{create_partitions::CreatePartitions, delete_partitions::DeletePartitions};
-
 use crate::{
     http::{http_client::HttpClient, http_transport::HttpTransport},
     prelude::{Identifier, IggyError},
 };
+use async_trait::async_trait;
+use iggy_binary_protocol::PartitionClient;
+use iggy_common::{create_partitions::CreatePartitions, delete_partitions::DeletePartitions};
 
 #[async_trait]
 impl PartitionClient for HttpClient {

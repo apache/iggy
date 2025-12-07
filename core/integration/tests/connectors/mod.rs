@@ -17,8 +17,6 @@
  * under the License.
  */
 
-use std::collections::HashMap;
-
 use iggy::prelude::{Client, DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME, IggyClient};
 use iggy_binary_protocol::{MessageClient, StreamClient, TopicClient, UserClient};
 use iggy_common::{CompressionAlgorithm, IggyExpiry, MaxTopicSize, PolledMessages};
@@ -27,6 +25,7 @@ use integration::{
     test_connectors_runtime::TestConnectorsRuntime,
     test_server::{ClientFactory, IpAddrKind, TestServer},
 };
+use std::collections::HashMap;
 
 mod http_config_provider;
 mod postgres;

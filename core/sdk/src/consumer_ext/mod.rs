@@ -19,9 +19,8 @@
 mod consumer_message_ext;
 mod consumer_message_trait;
 
-pub use consumer_message_trait::IggyConsumerMessageExt;
-
 use crate::{clients::consumer::ReceivedMessage, prelude::IggyError};
+pub use consumer_message_trait::IggyConsumerMessageExt;
 
 /// Trait for message consumer
 #[allow(dead_code)] // Clippy can't see that the trait is used

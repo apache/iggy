@@ -16,11 +16,9 @@
  * under the License.
  */
 
-use std::sync::Arc;
-
-use tokio::sync::{RwLock as TokioRwLock, RwLockReadGuard, RwLockWriteGuard};
-
 use crate::locking::IggyRwLockFn;
+use std::sync::Arc;
+use tokio::sync::{RwLock as TokioRwLock, RwLockReadGuard, RwLockWriteGuard};
 
 #[cfg(feature = "tokio_lock")]
 #[derive(Debug)]

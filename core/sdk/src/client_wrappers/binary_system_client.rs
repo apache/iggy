@@ -16,14 +16,13 @@
  * under the License.
  */
 
+use crate::client_wrappers::client_wrapper::ClientWrapper;
 use async_trait::async_trait;
 use iggy_binary_protocol::SystemClient;
 use iggy_common::{
     ClientInfo, ClientInfoDetails, IggyDuration, IggyError, Snapshot, SnapshotCompression, Stats,
     SystemSnapshotType,
 };
-
-use crate::client_wrappers::client_wrapper::ClientWrapper;
 
 #[async_trait]
 impl SystemClient for ClientWrapper {

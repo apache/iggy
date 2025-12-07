@@ -16,12 +16,10 @@
  * under the License.
  */
 
-use std::net::SocketAddr;
-
-use ulid::Ulid;
-
 use super::http_shard_wrapper::HttpSafeShard;
 use crate::http::jwt::jwt_manager::JwtManager;
+use std::net::SocketAddr;
+use ulid::Ulid;
 
 pub struct AppState {
     pub jwt_manager: JwtManager,

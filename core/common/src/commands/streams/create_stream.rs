@@ -16,13 +16,11 @@
  * under the License.
  */
 
-use std::{fmt::Display, str::from_utf8};
-
-use bytes::{BufMut, Bytes, BytesMut};
-use serde::{Deserialize, Serialize};
-
 use super::MAX_NAME_LENGTH;
 use crate::{BytesSerializable, CREATE_STREAM_CODE, Command, Validatable, error::IggyError};
+use bytes::{BufMut, Bytes, BytesMut};
+use serde::{Deserialize, Serialize};
+use std::{fmt::Display, str::from_utf8};
 
 /// `CreateStream` command is used to create a new stream.
 /// It has additional payload:

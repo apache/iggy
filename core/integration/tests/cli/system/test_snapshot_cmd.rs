@@ -16,22 +16,20 @@
  * under the License.
  */
 
-use std::{
-    fs::{self, File},
-    io::Read,
+use crate::cli::common::{
+    CLAP_INDENT, IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestHelpCmd, USAGE_PREFIX,
 };
-
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
 use iggy::prelude::Client;
 use predicates::str::starts_with;
 use serial_test::parallel;
+use std::{
+    fs::{self, File},
+    io::Read,
+};
 use tempfile::tempdir;
 use zip::ZipArchive;
-
-use crate::cli::common::{
-    CLAP_INDENT, IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestHelpCmd, USAGE_PREFIX,
-};
 
 struct TestSnapshotCmd {
     temp_out_dir: String,

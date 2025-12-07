@@ -15,8 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use yew::prelude::*;
-
 use crate::{
     components::{chart::single_chart::SingleChart, layout::topbar::TopBar},
     state::{
@@ -24,6 +22,7 @@ use crate::{
         ui::{ViewMode, use_ui},
     },
 };
+use yew::prelude::*;
 
 #[derive(Properties, PartialEq)]
 pub struct MainContentProps {

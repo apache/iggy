@@ -16,16 +16,14 @@
  * under the License.
  */
 
-use std::{fmt::Display, str::from_utf8};
-
-use bytes::{BufMut, Bytes, BytesMut};
-use serde::{Deserialize, Serialize};
-
 use super::defaults::*;
 use crate::{
     BytesSerializable, CREATE_USER_CODE, Command, Permissions, UserStatus, Validatable,
     error::IggyError,
 };
+use bytes::{BufMut, Bytes, BytesMut};
+use serde::{Deserialize, Serialize};
+use std::{fmt::Display, str::from_utf8};
 
 /// `CreateUser` command is used to create a new user.
 /// It has additional payload:

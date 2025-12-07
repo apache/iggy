@@ -16,20 +16,6 @@
  * under the License.
  */
 
-use std::{net::SocketAddr, path::PathBuf, rc::Rc, sync::Arc};
-
-use axum::{
-    Router,
-    extract::{DefaultBodyLimit, connect_info::Connected},
-    http::Method,
-    middleware,
-};
-use axum_server::tls_rustls::RustlsConfig;
-use compio_net::TcpListener;
-use iggy_common::{IggyError, TransportProtocol};
-use tower_http::cors::{AllowOrigin, CorsLayer};
-use tracing::{error, info};
-
 use crate::{
     configs::http::{HttpConfig, HttpCorsConfig},
     http::{
@@ -46,6 +32,18 @@ use crate::{
     },
     streaming::persistence::persister::PersisterKind,
 };
+use axum::{
+    Router,
+    extract::{DefaultBodyLimit, connect_info::Connected},
+    http::Method,
+    middleware,
+};
+use axum_server::tls_rustls::RustlsConfig;
+use compio_net::TcpListener;
+use iggy_common::{IggyError, TransportProtocol};
+use std::{net::SocketAddr, path::PathBuf, rc::Rc, sync::Arc};
+use tower_http::cors::{AllowOrigin, CorsLayer};
+use tracing::{error, info};
 
 #[derive(Debug, Clone, Copy)]
 pub struct CompioSocketAddr(pub SocketAddr);
@@ -171,9 +169,8 @@ pub async fn start_http_server(
         info!("Started {api_name} on: {address}");
 
         // Notify shard about the bound address
-        use iggy_common::TransportProtocol;
-
         use crate::shard::transmission::event::ShardEvent;
+        use iggy_common::TransportProtocol;
         let event = ShardEvent::AddressBound {
             protocol: TransportProtocol::Http,
             address,

@@ -16,13 +16,12 @@
  * under the License.
  */
 
-use tracing::{error, trace};
-
 use crate::{
     clients::{client::IggyClient, consumer::IggyConsumer},
     prelude::{ConsumerKind, IggyError},
     stream_builder::IggyConsumerConfig,
 };
+use tracing::{error, trace};
 
 /// Builds an `IggyConsumer` from the given `IggyClient` and `IggyConsumerConfig`.
 ///

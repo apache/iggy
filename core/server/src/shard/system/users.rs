@@ -16,15 +16,14 @@
  * under the License.
  */
 
-use err_trail::ErrContext;
-use iggy_common::{Identifier, IggyError, Permissions, UserStatus};
-use tracing::{error, warn};
-
 use super::COMPONENT;
 use crate::{
     shard::IggyShard,
     streaming::{session::Session, users::user::User, utils::crypto},
 };
+use err_trail::ErrContext;
+use iggy_common::{Identifier, IggyError, Permissions, UserStatus};
+use tracing::{error, warn};
 
 const MAX_USERS: usize = u32::MAX as usize;
 

@@ -16,12 +16,6 @@
  * under the License.
  */
 
-use std::rc::Rc;
-
-use anyhow::Result;
-use iggy_common::{IggyError, SenderKind, get_topic::GetTopic};
-use tracing::debug;
-
 use crate::{
     binary::{
         command::{BinaryServerCommand, ServerCommand, ServerCommandHandler},
@@ -31,6 +25,10 @@ use crate::{
     shard::IggyShard,
     streaming::{session::Session, streams},
 };
+use anyhow::Result;
+use iggy_common::{IggyError, SenderKind, get_topic::GetTopic};
+use std::rc::Rc;
+use tracing::debug;
 
 impl ServerCommandHandler for GetTopic {
     fn code(&self) -> u32 {

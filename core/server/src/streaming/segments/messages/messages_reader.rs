@@ -16,12 +16,7 @@
  * under the License.
  */
 
-use std::{
-    io::ErrorKind,
-    rc::Rc,
-    sync::atomic::{AtomicU64, Ordering},
-};
-
+use crate::streaming::segments::{IggyIndexesMut, IggyMessagesBatchMut};
 use bytes::BytesMut;
 use compio::{
     buf::{IntoInner, IoBuf},
@@ -30,9 +25,12 @@ use compio::{
 };
 use err_trail::ErrContext;
 use iggy_common::{IggyError, PooledBuffer};
+use std::{
+    io::ErrorKind,
+    rc::Rc,
+    sync::atomic::{AtomicU64, Ordering},
+};
 use tracing::{error, trace};
-
-use crate::streaming::segments::{IggyIndexesMut, IggyMessagesBatchMut};
 
 /// A dedicated struct for reading from the messages file.
 #[derive(Debug)]

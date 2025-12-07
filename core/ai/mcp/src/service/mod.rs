@@ -16,8 +16,7 @@
  * under the License.
  */
 
-use std::sync::Arc;
-
+use crate::Permissions;
 use iggy::prelude::{
     ClusterClient, Consumer, ConsumerGroupClient, ConsumerOffsetClient, Identifier, IggyClient,
     IggyError, IggyMessage, IggyTimestamp, MessageClient, PartitionClient, Partitioning,
@@ -32,9 +31,8 @@ use rmcp::{
     tool, tool_handler, tool_router,
 };
 use serde::Serialize;
+use std::sync::Arc;
 use tracing::error;
-
-use crate::Permissions;
 mod requests;
 
 #[derive(Debug, Clone)]

@@ -15,14 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::{
-    cell::{Ref, RefMut},
-    sync::Arc,
-};
-
-use iggy_common::IggyTimestamp;
-use slab::Slab;
-
 use crate::{
     slab::{
         Keyed,
@@ -31,6 +23,12 @@ use crate::{
         traits_ext::{EntityMarker, InsertCell, IntoComponents, IntoComponentsById},
     },
     streaming::stats::StreamStats,
+};
+use iggy_common::IggyTimestamp;
+use slab::Slab;
+use std::{
+    cell::{Ref, RefMut},
+    sync::Arc,
 };
 
 #[derive(Debug, Clone)]

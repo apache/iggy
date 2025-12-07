@@ -15,14 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::rc::Rc;
-
-use iggy_common::{
-    Consumer, ConsumerOffsetInfo, Identifier, IggyError, IggyExpiry, Partitioning, Permissions,
-    Stats, UserId, UserStatus,
-};
-use send_wrapper::SendWrapper;
-
 use crate::{
     binary::handlers::messages::poll_messages_handler::IggyPollMetadata,
     shard::{IggyShard, system::messages::PollingArgs},
@@ -34,6 +26,12 @@ use crate::{
         users::user::User,
     },
 };
+use iggy_common::{
+    Consumer, ConsumerOffsetInfo, Identifier, IggyError, IggyExpiry, Partitioning, Permissions,
+    Stats, UserId, UserStatus,
+};
+use send_wrapper::SendWrapper;
+use std::rc::Rc;
 
 /// A wrapper around IggyShard that is safe to use in HTTP handlers.
 ///

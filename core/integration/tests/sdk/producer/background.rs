@@ -16,8 +16,9 @@
  * under the License.
  */
 
-use std::{sync::Arc, time::Duration};
-
+use crate::sdk::producer::{
+    PARTITION_ID, STREAM_NAME, TOPIC_NAME, cleanup, create_message_payload, init_system,
+};
 use bytes::Bytes;
 use iggy::{
     clients::{client::IggyClient, producer_config::BackpressureMode},
@@ -26,11 +27,8 @@ use iggy::{
 use iggy_common::TcpClientConfig;
 use integration::test_server::{TestServer, login_root};
 use serial_test::parallel;
+use std::{sync::Arc, time::Duration};
 use tokio::time::{Instant, sleep};
-
-use crate::sdk::producer::{
-    PARTITION_ID, STREAM_NAME, TOPIC_NAME, cleanup, create_message_payload, init_system,
-};
 
 #[tokio::test]
 #[parallel]

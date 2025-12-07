@@ -16,17 +16,16 @@
  * under the License.
  */
 
+use crate::{
+    BinaryClient, PersonalAccessTokenClient,
+    utils::{auth::fail_if_not_authenticated, mapper},
+};
 use iggy_common::{
     ClientState, IdentityInfo, IggyError, PersonalAccessTokenExpiry, PersonalAccessTokenInfo,
     RawPersonalAccessToken, create_personal_access_token::CreatePersonalAccessToken,
     delete_personal_access_token::DeletePersonalAccessToken,
     get_personal_access_tokens::GetPersonalAccessTokens,
     login_with_personal_access_token::LoginWithPersonalAccessToken,
-};
-
-use crate::{
-    BinaryClient, PersonalAccessTokenClient,
-    utils::{auth::fail_if_not_authenticated, mapper},
 };
 
 #[async_trait::async_trait]

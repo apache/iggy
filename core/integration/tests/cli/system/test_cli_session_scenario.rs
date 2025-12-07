@@ -16,9 +16,6 @@
  * under the License.
  */
 
-use iggy_common::TransportProtocol;
-use serial_test::serial;
-
 use crate::cli::{
     common::IggyCmdTest,
     system::{
@@ -27,6 +24,8 @@ use crate::cli::{
         test_me_command::{Scenario, TestMeCmd},
     },
 };
+use iggy_common::TransportProtocol;
+use serial_test::serial;
 
 #[tokio::test]
 #[serial]

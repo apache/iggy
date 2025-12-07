@@ -16,11 +16,9 @@
  * under the License.
  */
 
-use std::sync::atomic::AtomicU32;
-
-use serde::{Deserialize, Serialize};
-
 use crate::{Permissions, types::user::user_status::UserStatus, utils::timestamp::IggyTimestamp};
+use serde::{Deserialize, Serialize};
+use std::sync::atomic::AtomicU32;
 
 /// `UserId` represents the unique identifier (numeric) of the user.
 pub type UserId = u32;

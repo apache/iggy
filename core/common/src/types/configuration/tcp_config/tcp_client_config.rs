@@ -15,8 +15,6 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-use std::str::FromStr;
-
 use crate::{
     AutoLogin, IggyDuration, TcpClientReconnectionConfig,
     types::configuration::{
@@ -26,6 +24,7 @@ use crate::{
         tcp_config::tcp_connection_string_options::TcpConnectionStringOptions,
     },
 };
+use std::str::FromStr;
 
 /// Configuration for the TCP client.
 #[derive(Debug, Clone)]

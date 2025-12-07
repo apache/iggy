@@ -16,12 +16,6 @@
  * under the License.
  */
 
-use std::rc::Rc;
-
-use bytes::Bytes;
-use iggy_common::{IggyError, SenderKind, get_snapshot::GetSnapshot};
-use tracing::debug;
-
 use crate::{
     binary::{
         command::{BinaryServerCommand, ServerCommand, ServerCommandHandler},
@@ -30,6 +24,10 @@ use crate::{
     shard::IggyShard,
     streaming::session::Session,
 };
+use bytes::Bytes;
+use iggy_common::{IggyError, SenderKind, get_snapshot::GetSnapshot};
+use std::rc::Rc;
+use tracing::debug;
 
 impl ServerCommandHandler for GetSnapshot {
     fn code(&self) -> u32 {

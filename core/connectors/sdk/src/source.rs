@@ -17,14 +17,12 @@
  * under the License.
  */
 
-use std::sync::Arc;
-
+use crate::{ConnectorState, Error, Source, get_runtime};
 use serde::de::DeserializeOwned;
+use std::sync::Arc;
 use tokio::{sync::watch, task::JoinHandle};
 use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, Registry, layer::SubscriberExt, util::SubscriberInitExt};
-
-use crate::{ConnectorState, Error, Source, get_runtime};
 
 #[repr(C)]
 pub struct RawMessage {

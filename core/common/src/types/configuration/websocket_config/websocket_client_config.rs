@@ -16,13 +16,6 @@
  * under the License.
  */
 
-use std::{
-    fmt::{Display, Formatter},
-    str::FromStr,
-};
-
-use tungstenite::protocol::WebSocketConfig as TungsteniteConfig;
-
 use crate::{
     AutoLogin, IggyDuration, WebSocketClientReconnectionConfig,
     types::configuration::{
@@ -30,6 +23,11 @@ use crate::{
         websocket_config::websocket_connection_string_options::WebSocketConnectionStringOptions,
     },
 };
+use std::{
+    fmt::{Display, Formatter},
+    str::FromStr,
+};
+use tungstenite::protocol::WebSocketConfig as TungsteniteConfig;
 
 /// Configuration for the WebSocket client.
 #[derive(Debug, Clone)]

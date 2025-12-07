@@ -16,9 +16,8 @@
  * under the License.
  */
 
-use async_trait::async_trait;
-
 use crate::{BinaryTransport, client::binary_clients::client::Client};
+use async_trait::async_trait;
 
 /// A client that can send and receive binary messages.
 #[async_trait]

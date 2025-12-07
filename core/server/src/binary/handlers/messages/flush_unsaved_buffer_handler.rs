@@ -16,13 +16,6 @@
  * under the License.
  */
 
-use std::rc::Rc;
-
-use anyhow::Result;
-use err_trail::ErrContext;
-use iggy_common::{FlushUnsavedBuffer, IggyError, SenderKind};
-use tracing::{debug, instrument};
-
 use crate::{
     binary::{
         command::{BinaryServerCommand, ServerCommand, ServerCommandHandler},
@@ -31,6 +24,11 @@ use crate::{
     shard::IggyShard,
     streaming::session::Session,
 };
+use anyhow::Result;
+use err_trail::ErrContext;
+use iggy_common::{FlushUnsavedBuffer, IggyError, SenderKind};
+use std::rc::Rc;
+use tracing::{debug, instrument};
 
 impl ServerCommandHandler for FlushUnsavedBuffer {
     fn code(&self) -> u32 {

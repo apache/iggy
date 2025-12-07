@@ -23,8 +23,7 @@ pub mod flatbuffer_convert;
 pub mod json;
 pub mod proto_convert;
 mod update_fields;
-use std::sync::Arc;
-
+use crate::{DecodedMessage, Error, TopicMetadata};
 pub use add_fields::{AddFields, AddFieldsConfig, Field as AddField};
 pub use delete_fields::{DeleteFields, DeleteFieldsConfig};
 pub use filter_fields::{
@@ -35,10 +34,9 @@ pub use flatbuffer_convert::{FlatBufferConvert, FlatBufferConvertConfig};
 pub use proto_convert::{ProtoConvert, ProtoConvertConfig};
 use serde::{Deserialize, Serialize};
 use simd_json::OwnedValue;
+use std::sync::Arc;
 use strum_macros::{Display, IntoStaticStr};
 pub use update_fields::{Field as UpdateField, UpdateCondition, UpdateFields, UpdateFieldsConfig};
-
-use crate::{DecodedMessage, Error, TopicMetadata};
 
 /// The value of a field, either static or computed at runtime
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

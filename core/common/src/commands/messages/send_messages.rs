@@ -16,11 +16,11 @@
  * under the License.
  */
 
-use std::{
-    collections::HashMap,
-    fmt::{Display, Formatter},
+use crate::{
+    BytesSerializable, Command, INDEX_SIZE, Identifier, IggyMessage, IggyMessageView,
+    IggyMessagesBatch, PartitioningKind, SEND_MESSAGES_CODE, Sizeable, Validatable,
+    error::IggyError, types::message::partitioning::Partitioning,
 };
-
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use bytes::{BufMut, Bytes, BytesMut};
 use serde::{
@@ -28,11 +28,9 @@ use serde::{
     de::{self, MapAccess, Visitor},
     ser::SerializeStruct,
 };
-
-use crate::{
-    BytesSerializable, Command, INDEX_SIZE, Identifier, IggyMessage, IggyMessageView,
-    IggyMessagesBatch, PartitioningKind, SEND_MESSAGES_CODE, Sizeable, Validatable,
-    error::IggyError, types::message::partitioning::Partitioning,
+use std::{
+    collections::HashMap,
+    fmt::{Display, Formatter},
 };
 
 /// `SendMessages` command is used to send messages to a topic in a stream.

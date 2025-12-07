@@ -16,13 +16,11 @@
  * under the License.
  */
 
-use std::collections::HashSet;
-
-use serde::{Deserialize, Serialize};
-use simd_json::OwnedValue;
-
 use super::{Transform, TransformType};
 use crate::{DecodedMessage, Error, Payload, TopicMetadata};
+use serde::{Deserialize, Serialize};
+use simd_json::OwnedValue;
+use std::collections::HashSet;
 
 /// Configuration for the DeleteFields transform
 #[derive(Debug, Serialize, Deserialize)]

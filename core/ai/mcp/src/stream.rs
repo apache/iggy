@@ -17,10 +17,9 @@
  * under the License.
  */
 
+use crate::{configs::IggyConfig, error::McpRuntimeError};
 use iggy::prelude::{Client, IggyClient, IggyClientBuilder};
 use tracing::{error, info};
-
-use crate::{configs::IggyConfig, error::McpRuntimeError};
 
 pub async fn init(config: IggyConfig) -> Result<IggyClient, McpRuntimeError> {
     let address = config.address;

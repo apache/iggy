@@ -15,10 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::sync::{Arc, atomic::AtomicU64};
-
-use slab::Slab;
-
 use crate::{
     slab::traits_ext::{
         Borrow, ComponentsById, Delete, EntityComponentSystem, EntityComponentSystemMut, Insert,
@@ -37,6 +33,8 @@ use crate::{
         stats::PartitionStats,
     },
 };
+use slab::Slab;
+use std::sync::{Arc, atomic::AtomicU64};
 
 // TODO: This could be upper limit of partitions per topic, use that value to validate instead of whathever this thing is in `common` crate.
 pub const PARTITIONS_CAPACITY: usize = 16384;

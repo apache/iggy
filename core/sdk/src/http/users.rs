@@ -16,17 +16,16 @@
  * under the License.
  */
 
+use crate::{
+    http::{http_client::HttpClient, http_transport::HttpTransport},
+    prelude::{Identifier, IggyError},
+};
 use async_trait::async_trait;
 use iggy_binary_protocol::UserClient;
 use iggy_common::{
     IdentityInfo, Permissions, UserInfo, UserInfoDetails, UserStatus,
     change_password::ChangePassword, create_user::CreateUser, login_user::LoginUser,
     update_permissions::UpdatePermissions, update_user::UpdateUser,
-};
-
-use crate::{
-    http::{http_client::HttpClient, http_transport::HttpTransport},
-    prelude::{Identifier, IggyError},
 };
 
 const PATH: &str = "/users";

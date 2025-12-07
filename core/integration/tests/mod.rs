@@ -16,6 +16,8 @@
  * under the License.
  */
 
+use ctor::{ctor, dtor};
+use lazy_static::lazy_static;
 use std::{
     collections::{HashMap, HashSet},
     io::Write,
@@ -26,9 +28,6 @@ use std::{
     },
     thread,
 };
-
-use ctor::{ctor, dtor};
-use lazy_static::lazy_static;
 
 mod cli;
 mod config_provider;

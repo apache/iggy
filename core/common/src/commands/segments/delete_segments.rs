@@ -15,15 +15,13 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-use std::fmt::Display;
-
-use bytes::{BufMut, Bytes, BytesMut};
-use serde::{Deserialize, Serialize};
-
 use crate::{
     BytesSerializable, Command, DELETE_SEGMENTS_CODE, Identifier, Sizeable, Validatable,
     error::IggyError,
 };
+use bytes::{BufMut, Bytes, BytesMut};
+use serde::{Deserialize, Serialize};
+use std::fmt::Display;
 
 /// `DeleteSegments` command is used to delete segments from a partition.
 /// It has additional payload:
@@ -129,9 +127,8 @@ impl Display for DeleteSegments {
 
 #[cfg(test)]
 mod tests {
-    use bytes::BufMut;
-
     use super::*;
+    use bytes::BufMut;
 
     #[test]
     fn should_be_serialized_as_bytes() {

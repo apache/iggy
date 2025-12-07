@@ -16,18 +16,16 @@
  * under the License.
  */
 
-use std::{fmt::Display, time::SystemTime};
-
-use anyhow::Context;
-use async_trait::async_trait;
-use comfy_table::Table;
-use iggy_common::get_stats::GetStats;
-use tracing::{Level, event};
-
 use crate::{
     Client,
     cli::cli_command::{CliCommand, PRINT_TARGET},
 };
+use anyhow::Context;
+use async_trait::async_trait;
+use comfy_table::Table;
+use iggy_common::get_stats::GetStats;
+use std::{fmt::Display, time::SystemTime};
+use tracing::{Level, event};
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum GetStatsOutput {

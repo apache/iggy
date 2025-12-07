@@ -17,15 +17,13 @@
  * under the License.
  */
 
-use std::collections::HashMap;
-
+use crate::router::{Router, is_valid_namespaced_table, table_exists, write_data};
 use async_trait::async_trait;
 use iceberg::{Catalog, table::Table};
 use iggy_connector_sdk::{ConsumedMessage, Error, MessagesMetadata, Payload};
 use simd_json::base::ValueAsObject;
+use std::collections::HashMap;
 use tracing::{info, warn};
-
-use crate::router::{Router, is_valid_namespaced_table, table_exists, write_data};
 
 #[derive(Debug)]
 pub struct DynamicRouter {

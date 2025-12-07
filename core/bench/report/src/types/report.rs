@@ -16,17 +16,15 @@
  * under the License.
  */
 
-use std::path::Path;
-
-use serde::{Deserialize, Serialize};
-use uuid::Uuid;
-
 use super::server_stats::BenchmarkServerStats;
 use crate::{
     group_metrics::BenchmarkGroupMetrics,
     individual_metrics::BenchmarkIndividualMetrics,
     types::{hardware::BenchmarkHardware, params::BenchmarkParams},
 };
+use serde::{Deserialize, Serialize};
+use std::path::Path;
+use uuid::Uuid;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct BenchmarkReport {

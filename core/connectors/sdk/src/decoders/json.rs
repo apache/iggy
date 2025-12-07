@@ -16,9 +16,8 @@
  * under the License.
  */
 
-use tracing::error;
-
 use crate::{Error, Payload, Schema, StreamDecoder};
+use tracing::error;
 
 pub struct JsonStreamDecoder;
 

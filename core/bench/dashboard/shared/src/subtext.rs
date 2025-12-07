@@ -15,12 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::{BenchmarkGroupMetricsLight, BenchmarkReportLight};
 use bench_report::{
     actor_kind::ActorKind, benchmark_kind::BenchmarkKind, group_metrics_kind::GroupMetricsKind,
 };
 use human_repr::HumanCount;
-
-use crate::{BenchmarkGroupMetricsLight, BenchmarkReportLight};
 
 impl BenchmarkReportLight {
     pub fn subtext(&self) -> String {

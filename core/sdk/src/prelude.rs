@@ -27,6 +27,27 @@
 //! use iggy::prelude::*;
 //! ```
 
+pub use crate::{
+    client_provider,
+    client_provider::ClientProviderConfig,
+    client_wrappers::{client_wrapper::ClientWrapper, connection_info::ConnectionInfo},
+    clients::{
+        client::IggyClient,
+        client_builder::IggyClientBuilder,
+        consumer::{AutoCommit, AutoCommitAfter, AutoCommitWhen, IggyConsumer, ReceivedMessage},
+        consumer_builder::IggyConsumerBuilder,
+        producer::IggyProducer,
+        producer_builder::IggyProducerBuilder,
+        producer_config::{BackgroundConfig, DirectConfig},
+    },
+    consumer_ext::IggyConsumerMessageExt,
+    stream_builder::{
+        IggyConsumerConfig, IggyProducerConfig, IggyStream, IggyStreamConfig, IggyStreamConsumer,
+        IggyStreamProducer,
+    },
+    tcp::tcp_client::TcpClient,
+    websocket::websocket_client::WebSocketClient,
+};
 pub use iggy_binary_protocol::{
     Client, ClusterClient, ConsumerGroupClient, ConsumerOffsetClient, MessageClient,
     PartitionClient, PersonalAccessTokenClient, SegmentClient, StreamClient, SystemClient,
@@ -53,26 +74,4 @@ pub use iggy_common::{
     WebSocketClientConfigBuilder, WebSocketClientReconnectionConfig, defaults,
     defaults::{DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USER_ID, DEFAULT_ROOT_USERNAME},
     locking,
-};
-
-pub use crate::{
-    client_provider,
-    client_provider::ClientProviderConfig,
-    client_wrappers::{client_wrapper::ClientWrapper, connection_info::ConnectionInfo},
-    clients::{
-        client::IggyClient,
-        client_builder::IggyClientBuilder,
-        consumer::{AutoCommit, AutoCommitAfter, AutoCommitWhen, IggyConsumer, ReceivedMessage},
-        consumer_builder::IggyConsumerBuilder,
-        producer::IggyProducer,
-        producer_builder::IggyProducerBuilder,
-        producer_config::{BackgroundConfig, DirectConfig},
-    },
-    consumer_ext::IggyConsumerMessageExt,
-    stream_builder::{
-        IggyConsumerConfig, IggyProducerConfig, IggyStream, IggyStreamConfig, IggyStreamConsumer,
-        IggyStreamProducer,
-    },
-    tcp::tcp_client::TcpClient,
-    websocket::websocket_client::WebSocketClient,
 };

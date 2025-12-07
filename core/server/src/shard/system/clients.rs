@@ -16,17 +16,15 @@
  * under the License.
  */
 
-use std::net::SocketAddr;
-
-use err_trail::ErrContext;
-use iggy_common::{Identifier, IggyError, TransportProtocol};
-use tracing::{error, info};
-
 use super::COMPONENT;
 use crate::{
     shard::IggyShard,
     streaming::{clients::client_manager::Client, session::Session},
 };
+use err_trail::ErrContext;
+use iggy_common::{Identifier, IggyError, TransportProtocol};
+use std::net::SocketAddr;
+use tracing::{error, info};
 
 impl IggyShard {
     pub fn add_client(&self, address: &SocketAddr, transport: TransportProtocol) -> Session {

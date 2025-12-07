@@ -18,13 +18,10 @@
 
 pub(crate) mod command;
 pub(crate) mod help;
-use std::{
-    fmt::{Display, Formatter, Result},
-    io::Write,
-    process::{Command, Stdio},
-    sync::Arc,
+pub(crate) use crate::cli::common::{
+    command::IggyCmdCommand,
+    help::{CLAP_INDENT, TestHelpCmd, USAGE_PREFIX},
 };
-
 use assert_cmd::{
     assert::{Assert, OutputAssertExt},
     prelude::CommandCargoExt,
@@ -37,10 +34,11 @@ use iggy::{
     },
 };
 use integration::test_server::TestServer;
-
-pub(crate) use crate::cli::common::{
-    command::IggyCmdCommand,
-    help::{CLAP_INDENT, TestHelpCmd, USAGE_PREFIX},
+use std::{
+    fmt::{Display, Formatter, Result},
+    io::Write,
+    process::{Command, Stdio},
+    sync::Arc,
 };
 
 pub(crate) enum TestIdentifier {

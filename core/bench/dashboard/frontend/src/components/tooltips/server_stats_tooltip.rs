@@ -15,10 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::state::ui::ViewMode;
 use bench_dashboard_shared::BenchmarkReportLight;
 use yew::prelude::*;
-
-use crate::state::ui::ViewMode;
 
 #[derive(Properties, PartialEq)]
 pub struct ServerStatsTooltipProps {

@@ -16,12 +16,10 @@
  * under the License.
  */
 
-use std::fmt::Display;
-
+use crate::{BytesSerializable, Command, GET_CLIENTS_CODE, Validatable, error::IggyError};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-
-use crate::{BytesSerializable, Command, GET_CLIENTS_CODE, Validatable, error::IggyError};
+use std::fmt::Display;
 
 /// `GetClients` command is used to get the information about all connected clients.
 /// It has no additional payload.

@@ -16,17 +16,15 @@
  * under the License.
  */
 
+use super::PartitioningKind;
+use crate::{BytesSerializable, IggyByteSize, Sizeable, error::IggyError};
+use bytes::{BufMut, Bytes, BytesMut};
+use serde::{Deserialize, Serialize};
+use serde_with::{base64::Base64, serde_as};
 use std::{
     fmt::Display,
     hash::{Hash, Hasher},
 };
-
-use bytes::{BufMut, Bytes, BytesMut};
-use serde::{Deserialize, Serialize};
-use serde_with::{base64::Base64, serde_as};
-
-use super::PartitioningKind;
-use crate::{BytesSerializable, IggyByteSize, Sizeable, error::IggyError};
 
 /// `Partitioning` is used to specify to which partition the messages should be sent.
 /// It has the following kinds:

@@ -16,10 +16,9 @@
  * under the License.
  */
 
+use crate::IggyError;
 use thiserror::Error;
 use tokio::io;
-
-use crate::IggyError;
 
 /// The error type for the client.
 #[derive(Debug, Error)]

@@ -15,18 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::{
-    cell::RefCell,
-    rc::Rc,
-    sync::{Arc, atomic::Ordering},
-};
-
-use ahash::AHashMap;
-use err_trail::ErrContext;
-use iggy_common::{Identifier, IggyError, IggyTimestamp, PollingKind};
-use slab::Slab;
-use tracing::error;
-
 use crate::{
     binary::handlers::messages::poll_messages_handler::IggyPollMetadata,
     configs::{cache_indexes::CacheIndexesConfig, system::SystemConfig},
@@ -68,6 +56,16 @@ use crate::{
         traits::MainOps,
     },
 };
+use ahash::AHashMap;
+use err_trail::ErrContext;
+use iggy_common::{Identifier, IggyError, IggyTimestamp, PollingKind};
+use slab::Slab;
+use std::{
+    cell::RefCell,
+    rc::Rc,
+    sync::{Arc, atomic::Ordering},
+};
+use tracing::error;
 
 const CAPACITY: usize = 1024;
 pub type ContainerId = usize;

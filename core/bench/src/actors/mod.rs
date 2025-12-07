@@ -16,9 +16,8 @@
  * under the License.
  */
 
-use std::time::Duration;
-
 use iggy::prelude::IggyError;
+use std::time::Duration;
 
 pub mod consumer;
 pub mod producer;

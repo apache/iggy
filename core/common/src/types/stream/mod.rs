@@ -16,9 +16,8 @@
  * under the License.
  */
 
-use serde::{Deserialize, Serialize};
-
 use crate::{IggyByteSize, IggyTimestamp, Topic};
+use serde::{Deserialize, Serialize};
 
 /// `Stream` represents the highest level of logical separation of data.
 /// It consists of the following fields:

@@ -15,10 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::path::Path;
-
 use anyhow::Result;
 use clap::Parser;
+use std::path::Path;
 
 #[derive(Debug, Parser)]
 #[command(version, about, long_about = None, verbatim_doc_comment)]

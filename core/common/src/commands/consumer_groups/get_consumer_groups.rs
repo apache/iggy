@@ -16,15 +16,13 @@
  * under the License.
  */
 
-use std::fmt::Display;
-
-use bytes::{BufMut, Bytes, BytesMut};
-use serde::{Deserialize, Serialize};
-
 use crate::{
     BytesSerializable, Command, GET_CONSUMER_GROUPS_CODE, Identifier, Sizeable, Validatable,
     error::IggyError,
 };
+use bytes::{BufMut, Bytes, BytesMut};
+use serde::{Deserialize, Serialize};
+use std::fmt::Display;
 
 /// `GetConsumerGroups` command retrieves the consumer groups from the topic.
 /// It has additional payload:
@@ -87,9 +85,8 @@ impl Display for GetConsumerGroups {
 
 #[cfg(test)]
 mod tests {
-    use bytes::BufMut;
-
     use super::*;
+    use bytes::BufMut;
 
     #[test]
     fn should_be_serialized_as_bytes() {

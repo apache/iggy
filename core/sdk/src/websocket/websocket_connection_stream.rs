@@ -16,17 +16,15 @@
  * under the License.
  */
 
-use std::{io::ErrorKind, net::SocketAddr};
-
+use crate::websocket::websocket_stream::ConnectionStream;
 use async_trait::async_trait;
 use bytes::BytesMut;
 use futures_util::{SinkExt, StreamExt};
 use iggy_common::IggyError;
+use std::{io::ErrorKind, net::SocketAddr};
 use tokio::net::TcpStream;
 use tokio_tungstenite::{WebSocketStream, tungstenite::Message};
 use tracing::{debug, error, trace};
-
-use crate::websocket::websocket_stream::ConnectionStream;
 
 #[derive(Debug)]
 pub struct WebSocketConnectionStream {

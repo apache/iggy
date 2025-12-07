@@ -22,16 +22,15 @@ mod error;
 mod router;
 mod state;
 
+use crate::{
+    components::{app_content::AppContent, footer::Footer},
+    state::hardware::HardwareProvider,
+};
 use components::theme::theme_provider::ThemeProvider;
 use router::AppRoute;
 use state::{benchmark::BenchmarkProvider, gitref::GitrefProvider, ui::UiProvider};
 use yew::prelude::*;
 use yew_router::{BrowserRouter, Switch};
-
-use crate::{
-    components::{app_content::AppContent, footer::Footer},
-    state::hardware::HardwareProvider,
-};
 
 #[function_component(App)]
 pub fn app() -> Html {

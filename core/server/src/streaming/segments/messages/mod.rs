@@ -19,12 +19,11 @@
 mod messages_reader;
 mod messages_writer;
 
+use super::IggyMessagesBatchSet;
 use compio::{fs::File, io::AsyncWriteAtExt};
 use iggy_common::IggyError;
 pub use messages_reader::MessagesReader;
 pub use messages_writer::MessagesWriter;
-
-use super::IggyMessagesBatchSet;
 
 /// Vectored write a batches of messages to file
 async fn write_batch(

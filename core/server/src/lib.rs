@@ -16,10 +16,9 @@
  * under the License.
  */
 
+use crate::versioning::SemanticVersion;
 #[cfg(not(feature = "disable-mimalloc"))]
 use mimalloc::MiMalloc;
-
-use crate::versioning::SemanticVersion;
 
 #[cfg(not(feature = "disable-mimalloc"))]
 #[global_allocator]

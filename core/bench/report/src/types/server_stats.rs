@@ -16,9 +16,8 @@
  * under the License.
  */
 
-use std::collections::HashMap;
-
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// This file is a big workaround - struct `Stats` exists in `iggy` crate and this crate needs it.
 /// However, this crate is being compiled to wasm and `iggy` can't be compiled for this target.
@@ -110,11 +109,9 @@ pub struct BenchmarkCacheMetrics {
 }
 
 mod cache_metrics_serializer {
-    use std::collections::HashMap;
-
-    use serde::{Deserialize, Deserializer, Serializer};
-
     use super::*;
+    use serde::{Deserialize, Deserializer, Serializer};
+    use std::collections::HashMap;
 
     pub fn serialize<S>(
         metrics: &HashMap<BenchmarkCacheMetricsKey, BenchmarkCacheMetrics>,

@@ -15,13 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::hash::Hasher as _;
-
-use futures::future::join_all;
-use hash32::{Hasher, Murmur3Hasher};
-use iggy_common::IggyError;
-use tracing::{error, info, warn};
-
 use crate::shard::{
     BROADCAST_TIMEOUT, COMPONENT, IggyShard,
     namespace::IggyNamespace,
@@ -33,6 +26,11 @@ use crate::shard::{
         message::{ShardMessage, ShardSendRequestResult},
     },
 };
+use futures::future::join_all;
+use hash32::{Hasher, Murmur3Hasher};
+use iggy_common::IggyError;
+use std::hash::Hasher as _;
+use tracing::{error, info, warn};
 
 impl IggyShard {
     pub async fn send_request_to_shard_or_recoil(

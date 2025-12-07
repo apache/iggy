@@ -16,13 +16,12 @@
  * under the License.
  */
 
-use tracing::trace;
-
 use crate::{
     clients::{client::IggyClient, consumer::IggyConsumer},
     prelude::{IggyError, SystemClient},
     stream_builder::{IggyConsumerConfig, build},
 };
+use tracing::trace;
 
 #[derive(Debug, Default, Clone, Eq, PartialEq)]
 pub struct IggyStreamConsumer;

@@ -15,8 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use yew::prelude::*;
-
 use crate::{
     api,
     components::{
@@ -33,6 +31,7 @@ use crate::{
         ui::{UiAction, use_ui},
     },
 };
+use yew::prelude::*;
 
 #[derive(Properties, PartialEq)]
 pub struct TopBarProps {

@@ -16,17 +16,15 @@
  * under the License.
  */
 
-use std::num::NonZeroU32;
-
-use clap::{CommandFactory, Parser, error::ErrorKind};
-use iggy::prelude::IggyByteSize;
-
 use crate::args::{
     common::IggyBenchArgs,
     defaults::{DEFAULT_NUMBER_OF_PRODUCERS, DEFAULT_PINNED_NUMBER_OF_STREAMS},
     props::BenchmarkKindProps,
     transport::BenchmarkTransportCommand,
 };
+use clap::{CommandFactory, Parser, error::ErrorKind};
+use iggy::prelude::IggyByteSize;
+use std::num::NonZeroU32;
 
 #[derive(Parser, Debug, Clone)]
 pub struct EndToEndProducingConsumerArgs {

@@ -16,17 +16,15 @@
  * under the License.
  */
 
-use std::str::FromStr;
-
-use iggy::prelude::*;
-use integration::test_server::{
-    ClientFactory, assert_clean_system, create_user, login_root, login_user,
-};
-
 use crate::server::scenarios::{
     CONSUMER_GROUP_NAME, MESSAGES_COUNT, PARTITIONS_COUNT, STREAM_NAME, TOPIC_NAME, cleanup,
     create_client, get_consumer_group, join_consumer_group,
 };
+use iggy::prelude::*;
+use integration::test_server::{
+    ClientFactory, assert_clean_system, create_user, login_root, login_user,
+};
+use std::str::FromStr;
 
 pub async fn run(client_factory: &dyn ClientFactory) {
     let system_client = create_client(client_factory).await;

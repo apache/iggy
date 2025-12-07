@@ -16,14 +16,13 @@
  * under the License.
  */
 
-use async_trait::async_trait;
-use tracing::{Level, event};
-
 use super::common::{ContextManager, DEFAULT_CONTEXT_NAME};
 use crate::{
     Client,
     cli::cli_command::{CliCommand, PRINT_TARGET},
 };
+use async_trait::async_trait;
+use tracing::{Level, event};
 
 pub struct UseContextCmd {
     context_name: String,

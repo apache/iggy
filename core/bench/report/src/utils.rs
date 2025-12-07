@@ -16,9 +16,8 @@
  * under the License.
  */
 
-use serde::Serializer;
-
 use crate::time_series::TimeSeries;
+use serde::Serializer;
 
 pub(crate) fn round_float<S>(value: &f64, serializer: S) -> Result<S::Ok, S::Error>
 where

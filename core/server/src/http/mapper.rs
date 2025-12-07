@@ -16,14 +16,6 @@
  * under the License.
  */
 
-use std::sync::Arc;
-
-use iggy_common::{
-    ConsumerGroupDetails, ConsumerGroupInfo, ConsumerGroupMember, IdentityInfo, IggyByteSize,
-    PersonalAccessTokenInfo, TokenInfo, TopicDetails, UserInfo, UserInfoDetails,
-};
-use slab::Slab;
-
 use crate::{
     http::jwt::json_web_token::GeneratedToken,
     slab::{
@@ -41,6 +33,12 @@ use crate::{
         users::user::User,
     },
 };
+use iggy_common::{
+    ConsumerGroupDetails, ConsumerGroupInfo, ConsumerGroupMember, IdentityInfo, IggyByteSize,
+    PersonalAccessTokenInfo, TokenInfo, TopicDetails, UserInfo, UserInfoDetails,
+};
+use slab::Slab;
+use std::sync::Arc;
 
 /// Map TopicRoot with partitions to TopicDetails for HTTP responses
 pub fn map_topic_details(root: &TopicRoot, stats: &TopicStats) -> TopicDetails {

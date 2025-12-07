@@ -16,10 +16,10 @@
  * under the License.
  */
 
-use std::net::SocketAddr;
-
+use crate::tcp::tcp_stream::ConnectionStream;
 use async_trait::async_trait;
 use iggy_common::IggyError;
+use std::net::SocketAddr;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter},
     net::{
@@ -28,8 +28,6 @@ use tokio::{
     },
 };
 use tracing::error;
-
-use crate::tcp::tcp_stream::ConnectionStream;
 
 #[derive(Debug)]
 pub struct TcpConnectionStream {

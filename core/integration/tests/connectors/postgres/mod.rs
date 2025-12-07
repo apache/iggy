@@ -17,11 +17,9 @@
  * under the License.
  */
 
-use std::collections::HashMap;
-
-use testcontainers_modules::{postgres, testcontainers::runners::AsyncRunner};
-
 use crate::connectors::{ConnectorsRuntime, IggySetup, setup_runtime};
+use std::collections::HashMap;
+use testcontainers_modules::{postgres, testcontainers::runners::AsyncRunner};
 
 mod postgres_sink;
 

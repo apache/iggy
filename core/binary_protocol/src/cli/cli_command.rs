@@ -16,10 +16,9 @@
  * under the License.
  */
 
+use crate::Client;
 use anyhow::{Error, Result};
 use async_trait::async_trait;
-
-use crate::Client;
 
 pub static PRINT_TARGET: &str = "iggy::cli::output";
 

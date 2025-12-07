@@ -16,15 +16,13 @@
  * under the License.
  */
 
-use std::{collections::HashMap, path::PathBuf};
-
+use crate::{Error, Payload, Schema, StreamEncoder};
 use base64::{Engine as Base64Engine, engine::general_purpose};
 use prost::Message;
 use prost_types::Any;
 use serde::{Deserialize, Serialize};
+use std::{collections::HashMap, path::PathBuf};
 use tracing::{error, info};
-
-use crate::{Error, Payload, Schema, StreamEncoder};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProtoEncoderConfig {
@@ -129,10 +127,9 @@ impl ProtoStreamEncoder {
     }
 
     fn compile_schema_internal(&mut self, schema_path: &PathBuf) -> Result<(), Error> {
-        use std::fs;
-
         use protox::file::GoogleFileResolver;
         use protox_parse::parse;
+        use std::fs;
 
         info!(
             "Compiling protobuf schema for encoding from: {:?}",
@@ -716,9 +713,8 @@ impl Default for ProtoStreamEncoder {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, path::PathBuf};
-
     use super::*;
+    use std::{collections::HashMap, path::PathBuf};
 
     #[test]
     fn encode_should_succeed_given_json_payload_with_any_wrapper() {

@@ -16,9 +16,8 @@
  * under the License.
  */
 
-use base64::{Engine, engine::general_purpose};
-
 use crate::IggyError;
+use base64::{Engine, engine::general_purpose};
 
 pub fn from_base64_as_bytes(value: &str) -> Result<Vec<u8>, IggyError> {
     let result = general_purpose::STANDARD.decode(value);

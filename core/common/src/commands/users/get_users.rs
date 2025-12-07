@@ -16,12 +16,10 @@
  * under the License.
  */
 
-use std::fmt::Display;
-
+use crate::{BytesSerializable, Command, GET_USERS_CODE, Validatable, error::IggyError};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-
-use crate::{BytesSerializable, Command, GET_USERS_CODE, Validatable, error::IggyError};
+use std::fmt::Display;
 
 /// `GetUsers` command is used to retrieve the information about all users.
 /// It has no additional payload.
@@ -62,9 +60,8 @@ impl Display for GetUsers {
 
 #[cfg(test)]
 mod tests {
-    use bytes::Bytes;
-
     use super::*;
+    use bytes::Bytes;
 
     #[test]
     fn should_be_serialized_as_empty_bytes() {

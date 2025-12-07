@@ -20,14 +20,6 @@
 pub mod http_provider;
 mod local_provider;
 
-use std::{collections::HashMap, fmt::Formatter};
-
-use async_trait::async_trait;
-use chrono::{DateTime, Utc};
-use iggy_connector_sdk::{Schema, transforms::TransformType};
-use serde::{Deserialize, Serialize};
-use strum::Display;
-
 use crate::{
     configs::{
         connectors::{
@@ -38,6 +30,12 @@ use crate::{
     },
     error::RuntimeError,
 };
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use iggy_connector_sdk::{Schema, transforms::TransformType};
+use serde::{Deserialize, Serialize};
+use std::{collections::HashMap, fmt::Formatter};
+use strum::Display;
 
 #[derive(
     Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize, Display,

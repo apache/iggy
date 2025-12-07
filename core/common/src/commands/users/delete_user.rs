@@ -16,14 +16,12 @@
  * under the License.
  */
 
-use std::fmt::Display;
-
-use bytes::Bytes;
-use serde::{Deserialize, Serialize};
-
 use crate::{
     BytesSerializable, Command, DELETE_USER_CODE, Identifier, Validatable, error::IggyError,
 };
+use bytes::Bytes;
+use serde::{Deserialize, Serialize};
+use std::fmt::Display;
 
 /// `DeleteUser` command is used to delete a user by unique ID.
 /// It has additional payload:

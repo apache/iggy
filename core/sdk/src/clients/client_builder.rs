@@ -16,11 +16,6 @@
  * under the License.
  */
 
-use std::sync::Arc;
-
-use iggy_common::{ConnectionStringUtils, TransportProtocol};
-use tracing::error;
-
 use crate::{
     client_wrappers::client_wrapper::ClientWrapper,
     clients::client::IggyClient,
@@ -33,6 +28,9 @@ use crate::{
     tcp::tcp_client::TcpClient,
     websocket::websocket_client::WebSocketClient,
 };
+use iggy_common::{ConnectionStringUtils, TransportProtocol};
+use std::sync::Arc;
+use tracing::error;
 
 /// The builder for the `IggyClient` instance, which allows to configure and provide custom implementations for the partitioner, encryptor or message handler.
 #[derive(Debug, Default)]

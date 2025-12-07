@@ -16,13 +16,12 @@
  * under the License.
  */
 
-use simd_json::OwnedValue;
-
 use super::compute_value;
 use crate::{
     DecodedMessage, Error, Payload, TopicMetadata,
     transforms::{AddFields, FieldValue},
 };
+use simd_json::OwnedValue;
 
 impl AddFields {
     pub(crate) fn transform_json(
@@ -48,8 +47,6 @@ impl AddFields {
 
 #[cfg(test)]
 mod tests {
-    use simd_json::OwnedValue;
-
     use super::*;
     use crate::transforms::{
         ComputedValue, FieldValue, Transform,
@@ -59,6 +56,7 @@ mod tests {
             create_test_topic_metadata, extract_json_object,
         },
     };
+    use simd_json::OwnedValue;
 
     #[test]
     fn should_return_message_unchanged_when_no_fields() {

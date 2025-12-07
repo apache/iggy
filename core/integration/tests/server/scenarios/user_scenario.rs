@@ -16,14 +16,13 @@
  * under the License.
  */
 
+use crate::server::scenarios::create_client;
 use iggy::prelude::{
     GlobalPermissions, Identifier, Permissions, PersonalAccessTokenClient,
     PersonalAccessTokenExpiry, SEC_IN_MICRO, SystemClient, UserClient, UserStatus,
     defaults::DEFAULT_ROOT_USERNAME,
 };
 use integration::test_server::{ClientFactory, assert_clean_system, login_root};
-
-use crate::server::scenarios::create_client;
 
 pub async fn run(client_factory: &dyn ClientFactory) {
     let client = create_client(client_factory).await;

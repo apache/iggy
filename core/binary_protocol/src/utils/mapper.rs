@@ -16,8 +16,6 @@
  * under the License.
  */
 
-use std::{collections::HashMap, str::from_utf8};
-
 use bytes::Bytes;
 use iggy_common::{
     BytesSerializable, CacheMetrics, CacheMetricsKey, ClientInfo, ClientInfoDetails,
@@ -26,6 +24,7 @@ use iggy_common::{
     MaxTopicSize, Partition, Permissions, PersonalAccessTokenInfo, RawPersonalAccessToken, Stats,
     Stream, StreamDetails, Topic, TopicDetails, UserInfo, UserInfoDetails, UserStatus,
 };
+use std::{collections::HashMap, str::from_utf8};
 
 const EMPTY_TOPICS: Vec<Topic> = vec![];
 const EMPTY_STREAMS: Vec<Stream> = vec![];

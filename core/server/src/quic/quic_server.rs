@@ -16,8 +16,12 @@
  * under the License.
  */
 
-use std::{fs::File, io::BufReader, net::SocketAddr, rc::Rc, sync::Arc};
-
+use crate::{
+    configs::quic::QuicConfig,
+    quic::{COMPONENT, listener, quic_socket},
+    server_error::QuicError,
+    shard::{IggyShard, task_registry::ShutdownToken, transmission::event::ShardEvent},
+};
 use anyhow::Result;
 use compio_quic::{
     Endpoint, EndpointConfig, IdleTimeout, ServerBuilder, ServerConfig, TransportConfig, VarInt,
@@ -27,14 +31,8 @@ use rustls::{
     crypto::ring::default_provider,
     pki_types::{CertificateDer, PrivateKeyDer},
 };
+use std::{fs::File, io::BufReader, net::SocketAddr, rc::Rc, sync::Arc};
 use tracing::{error, info, trace, warn};
-
-use crate::{
-    configs::quic::QuicConfig,
-    quic::{COMPONENT, listener, quic_socket},
-    server_error::QuicError,
-    shard::{IggyShard, task_registry::ShutdownToken, transmission::event::ShardEvent},
-};
 
 /// Starts the QUIC server.
 /// Returns the address the server is listening on.

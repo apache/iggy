@@ -16,9 +16,8 @@
  * under the License.
  */
 
-use std::path::PathBuf;
-
 use iggy_binary_protocol::cli::cli_command::PRINT_TARGET;
+use std::path::PathBuf;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{
     filter::{self, LevelFilter},

@@ -16,14 +16,6 @@
  * under the License.
  */
 
-use std::{
-    str::FromStr,
-    sync::{
-        Arc,
-        atomic::{AtomicU32, AtomicU64},
-    },
-};
-
 use compio::fs::create_dir;
 use iggy::prelude::{Aes256GcmEncryptor, EncryptorKind};
 use server::{
@@ -33,6 +25,13 @@ use server::{
         utils::file::overwrite,
     },
     versioning::SemanticVersion,
+};
+use std::{
+    str::FromStr,
+    sync::{
+        Arc,
+        atomic::{AtomicU32, AtomicU64},
+    },
 };
 use uuid::Uuid;
 

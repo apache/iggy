@@ -17,8 +17,6 @@
  * under the License.
  */
 
-use std::{collections::HashMap, sync::Arc};
-
 use async_trait::async_trait;
 use base64::{self, Engine};
 use decoders::{
@@ -33,6 +31,7 @@ use iggy::prelude::{HeaderKey, HeaderValue};
 use once_cell::sync::OnceCell;
 use prost::Message;
 use serde::{Deserialize, Serialize};
+use std::{collections::HashMap, sync::Arc};
 use strum_macros::{Display, IntoStaticStr};
 use thiserror::Error;
 use tokio::runtime::Runtime;

@@ -16,8 +16,11 @@
  * under the License.
  */
 
-use std::{net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
-
+use crate::{
+    leader_aware::{LeaderRedirectionState, check_and_redirect_to_leader},
+    prelude::{AutoLogin, IggyDuration, IggyError, IggyTimestamp, QuicClientConfig},
+    quic::skip_server_verification::SkipServerVerification,
+};
 use async_broadcast::{Receiver, Sender, broadcast};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -33,14 +36,9 @@ use quinn::{
     crypto::rustls::QuicClientConfig as QuinnQuicClientConfig,
 };
 use rustls::crypto::CryptoProvider;
+use std::{net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
 use tokio::{sync::Mutex, time::sleep};
 use tracing::{error, info, trace, warn};
-
-use crate::{
-    leader_aware::{LeaderRedirectionState, check_and_redirect_to_leader},
-    prelude::{AutoLogin, IggyDuration, IggyError, IggyTimestamp, QuicClientConfig},
-    quic::skip_server_verification::SkipServerVerification,
-};
 
 const REQUEST_INITIAL_BYTES_LENGTH: usize = 4;
 const RESPONSE_INITIAL_BYTES_LENGTH: usize = 8;

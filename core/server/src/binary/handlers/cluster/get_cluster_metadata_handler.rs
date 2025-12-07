@@ -16,15 +16,6 @@
  * under the License.
  */
 
-use std::rc::Rc;
-
-//use crate::streaming::systems::system::SharedSystem;
-use anyhow::Result;
-use iggy_common::{
-    BytesSerializable, IggyError, SenderKind, get_cluster_metadata::GetClusterMetadata,
-};
-use tracing::{debug, instrument};
-
 use crate::{
     binary::{
         command::{BinaryServerCommand, ServerCommand, ServerCommandHandler},
@@ -33,6 +24,13 @@ use crate::{
     shard::IggyShard,
     streaming::session::Session,
 };
+//use crate::streaming::systems::system::SharedSystem;
+use anyhow::Result;
+use iggy_common::{
+    BytesSerializable, IggyError, SenderKind, get_cluster_metadata::GetClusterMetadata,
+};
+use std::rc::Rc;
+use tracing::{debug, instrument};
 
 impl ServerCommandHandler for GetClusterMetadata {
     fn code(&self) -> u32 {

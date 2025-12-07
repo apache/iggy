@@ -15,9 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use iggy_common::{Identifier, IggyError, TransportProtocol};
-use tracing::info;
-
 use super::*;
 use crate::{
     shard::{
@@ -31,6 +28,8 @@ use crate::{
     },
     streaming::{session::Session, traits::MainOps},
 };
+use iggy_common::{Identifier, IggyError, TransportProtocol};
+use tracing::info;
 
 pub(super) async fn handle_shard_message(
     shard: &IggyShard,

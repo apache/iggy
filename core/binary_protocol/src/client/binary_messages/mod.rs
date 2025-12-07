@@ -15,13 +15,12 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+use crate::{BinaryClient, MessageClient, utils::auth::fail_if_not_authenticated};
 use iggy_common::{
     BytesSerializable, Consumer, FlushUnsavedBuffer, Identifier, IggyError, IggyMessage,
     POLL_MESSAGES_CODE, Partitioning, PollMessages, PolledMessages, PollingStrategy,
     SEND_MESSAGES_CODE, SendMessages,
 };
-
-use crate::{BinaryClient, MessageClient, utils::auth::fail_if_not_authenticated};
 
 #[async_trait::async_trait]
 impl<B: BinaryClient> MessageClient for B {

@@ -16,21 +16,19 @@
  * under the License.
  */
 
-use std::{
-    fmt::{Display, Formatter, Result},
-    time::Duration,
-};
-
-use anyhow::Context;
-use async_trait::async_trait;
-use iggy_common::ping::Ping;
-use tokio::time::{Instant, sleep};
-use tracing::{Level, event};
-
 use crate::{
     Client,
     cli::cli_command::{CliCommand, PRINT_TARGET},
 };
+use anyhow::Context;
+use async_trait::async_trait;
+use iggy_common::ping::Ping;
+use std::{
+    fmt::{Display, Formatter, Result},
+    time::Duration,
+};
+use tokio::time::{Instant, sleep};
+use tracing::{Level, event};
 
 pub struct PingCmd {
     _ping: Ping,

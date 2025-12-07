@@ -16,16 +16,15 @@
  * under the License.
  */
 
+use crate::cli::common::{
+    CLAP_INDENT, IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, OutputFormat, TestHelpCmd,
+    USAGE_PREFIX,
+};
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
 use iggy::prelude::{Client, PersonalAccessTokenExpiry};
 use predicates::str::{contains, starts_with};
 use serial_test::parallel;
-
-use crate::cli::common::{
-    CLAP_INDENT, IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, OutputFormat, TestHelpCmd,
-    USAGE_PREFIX,
-};
 
 struct TestPatListCmd {
     name: String,

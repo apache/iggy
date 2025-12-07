@@ -16,10 +16,9 @@
  * under the License.
  */
 
+use crate::shared::messages::{OrderConfirmed, OrderCreated, OrderRejected, SerializableMessage};
 use iggy::prelude::IggyTimestamp;
 use rand::{Rng, rngs::ThreadRng};
-
-use crate::shared::messages::{OrderConfirmed, OrderCreated, OrderRejected, SerializableMessage};
 
 const CURRENCY_PAIRS: &[&str] = &["EUR/USD", "EUR/GBP", "USD/GBP", "EUR/PLN", "USD/PLN"];
 

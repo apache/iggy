@@ -16,8 +16,7 @@
  * under the License.
  */
 
-use std::sync::Arc;
-
+use crate::http::shared::AppState;
 use axum::{
     body::Body,
     extract::State,
@@ -25,8 +24,7 @@ use axum::{
     middleware::Next,
     response::Response,
 };
-
-use crate::http::shared::AppState;
+use std::sync::Arc;
 
 pub async fn metrics(
     State(state): State<Arc<AppState>>,

@@ -16,10 +16,9 @@
  * under the License.
  */
 
+use crate::streaming::users::user::User;
 use ahash::{AHashMap, AHashSet};
 use iggy_common::{GlobalPermissions, Permissions, StreamPermissions, UserId};
-
-use crate::streaming::users::user::User;
 
 #[derive(Debug, Default)]
 pub struct Permissioner {

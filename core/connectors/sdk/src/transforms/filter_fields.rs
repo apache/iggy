@@ -16,17 +16,15 @@
  * under the License.
  */
 
-use std::collections::HashSet;
-
+use super::{Transform, TransformType};
+use crate::{DecodedMessage, Error, Payload, TopicMetadata};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use simd_json::{
     OwnedValue,
     prelude::{TypedArrayValue, TypedObjectValue, TypedScalarValue, ValueAsScalar},
 };
-
-use super::{Transform, TransformType};
-use crate::{DecodedMessage, Error, Payload, TopicMetadata};
+use std::collections::HashSet;
 
 /// Pattern matching for field keys with various string matching strategies
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

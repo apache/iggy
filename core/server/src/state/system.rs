@@ -16,21 +16,19 @@
  * under the License.
  */
 
-use std::{collections::BTreeMap, fmt::Display};
-
+use crate::{
+    bootstrap::create_root_user,
+    state::{COMPONENT, EntryCommand, StateEntry, file::FileState, models::CreateUserWithId},
+    streaming::personal_access_tokens::personal_access_token::PersonalAccessToken,
+};
 use ahash::AHashMap;
 use err_trail::ErrContext;
 use iggy_common::{
     CompressionAlgorithm, IdKind, Identifier, IggyError, IggyExpiry, IggyTimestamp, MaxTopicSize,
     Permissions, UserStatus, create_user::CreateUser, defaults::DEFAULT_ROOT_USER_ID,
 };
+use std::{collections::BTreeMap, fmt::Display};
 use tracing::{debug, error, info};
-
-use crate::{
-    bootstrap::create_root_user,
-    state::{COMPONENT, EntryCommand, StateEntry, file::FileState, models::CreateUserWithId},
-    streaming::personal_access_tokens::personal_access_token::PersonalAccessToken,
-};
 
 #[derive(Debug, Clone)]
 pub struct SystemState {

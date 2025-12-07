@@ -16,8 +16,10 @@
  * under the License.
  */
 
-use std::{ops::Deref, str::FromStr, sync::Arc};
-
+use crate::{
+    http::http_transport::HttpTransport,
+    prelude::{Client, HttpClientConfig, IggyDuration, IggyError},
+};
 use async_broadcast::{Receiver, Sender, broadcast};
 use async_trait::async_trait;
 use iggy_common::{
@@ -29,11 +31,7 @@ use reqwest::{Response, StatusCode, Url};
 use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
 use reqwest_retry::{RetryTransientMiddleware, policies::ExponentialBackoff};
 use serde::Serialize;
-
-use crate::{
-    http::http_transport::HttpTransport,
-    prelude::{Client, HttpClientConfig, IggyDuration, IggyError},
-};
+use std::{ops::Deref, str::FromStr, sync::Arc};
 
 const PUBLIC_PATHS: &[&str] = &[
     "/",

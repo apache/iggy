@@ -16,13 +16,11 @@
  * under the License.
  */
 
-use std::ops::{Deref, Index as StdIndex};
-
+use crate::{INDEX_SIZE, IggyIndexView};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use serde_with::{base64::Base64, serde_as};
-
-use crate::{INDEX_SIZE, IggyIndexView};
+use std::ops::{Deref, Index as StdIndex};
 
 /// A container for binary-encoded index data.
 /// Optimized for efficient storage and I/O operations.

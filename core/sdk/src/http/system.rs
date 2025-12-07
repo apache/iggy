@@ -16,16 +16,15 @@
  * under the License.
  */
 
+use crate::{
+    http::{http_client::HttpClient, http_transport::HttpTransport},
+    prelude::{IggyDuration, IggyError},
+};
 use async_trait::async_trait;
 use iggy_binary_protocol::SystemClient;
 use iggy_common::{
     ClientInfo, ClientInfoDetails, Snapshot, SnapshotCompression, Stats, SystemSnapshotType,
     get_snapshot::GetSnapshot,
-};
-
-use crate::{
-    http::{http_client::HttpClient, http_transport::HttpTransport},
-    prelude::{IggyDuration, IggyError},
 };
 
 const PING: &str = "/ping";

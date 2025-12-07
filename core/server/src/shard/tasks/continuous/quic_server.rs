@@ -16,14 +16,12 @@
  * under the License.
  */
 
-use std::rc::Rc;
-
-use iggy_common::IggyError;
-
 use crate::{
     quic::quic_server,
     shard::{IggyShard, task_registry::ShutdownToken},
 };
+use iggy_common::IggyError;
+use std::rc::Rc;
 
 pub fn spawn_quic_server(shard: Rc<IggyShard>) {
     let shard_clone = shard.clone();

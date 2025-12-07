@@ -15,18 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::sync::Arc;
-
-use iggy_common::{
-    EncryptorKind, Identifier, IggyDuration, IggyExpiry, MaxTopicSize, Partitioner, Partitioning,
-    locking::IggyRwLock,
-};
-
 use crate::{
     client_wrappers::client_wrapper::ClientWrapper,
     clients::producer_config::{BackgroundConfig, DirectConfig},
     prelude::IggyProducer,
 };
+use iggy_common::{
+    EncryptorKind, Identifier, IggyDuration, IggyExpiry, MaxTopicSize, Partitioner, Partitioning,
+    locking::IggyRwLock,
+};
+use std::sync::Arc;
 
 pub enum SendMode {
     Direct(DirectConfig),

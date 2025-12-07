@@ -17,9 +17,8 @@
  * under the License.
  */
 
-use std::io::SeekFrom;
-
 use iggy_connector_sdk::{ConnectorState, Error};
+use std::io::SeekFrom;
 use strum::Display;
 use tokio::{
     fs::{File, OpenOptions},

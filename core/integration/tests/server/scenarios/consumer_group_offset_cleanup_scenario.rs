@@ -16,15 +16,13 @@
  * under the License.
  */
 
-use std::str::FromStr;
-
+use crate::server::scenarios::{PARTITION_ID, STREAM_NAME, TOPIC_NAME, cleanup, create_client};
 use futures::StreamExt;
 use iggy::prelude::*;
 use iggy_common::ConsumerOffsetInfo;
 use integration::test_server::{ClientFactory, assert_clean_system, login_root};
+use std::str::FromStr;
 use tokio::time::{Duration, sleep};
-
-use crate::server::scenarios::{PARTITION_ID, STREAM_NAME, TOPIC_NAME, cleanup, create_client};
 
 const TEST_MESSAGES_COUNT: u32 = 100;
 const MESSAGES_TO_CONSUME: u32 = 50;

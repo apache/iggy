@@ -16,12 +16,10 @@
  * under the License.
  */
 
-use std::fmt::Display;
-
+use crate::{BytesSerializable, Command, GET_USER_CODE, Identifier, Validatable, error::IggyError};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-
-use crate::{BytesSerializable, Command, GET_USER_CODE, Identifier, Validatable, error::IggyError};
+use std::fmt::Display;
 
 /// `GetUser` command is used to retrieve the information about a user by unique ID.
 /// It has additional payload:

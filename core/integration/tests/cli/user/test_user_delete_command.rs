@@ -16,16 +16,15 @@
  * under the License.
  */
 
+use crate::cli::common::{
+    CLAP_INDENT, IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestHelpCmd, TestUserId,
+    USAGE_PREFIX,
+};
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
 use iggy::prelude::{Client, UserStatus};
 use predicates::str::diff;
 use serial_test::parallel;
-
-use crate::cli::common::{
-    CLAP_INDENT, IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestHelpCmd, TestUserId,
-    USAGE_PREFIX,
-};
 
 struct TestUserDeleteCmd {
     username: String,

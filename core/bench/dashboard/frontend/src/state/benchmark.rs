@@ -15,14 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::{collections::BTreeMap, rc::Rc};
-
 use bench_dashboard_shared::BenchmarkReportLight;
 use bench_report::{
     benchmark_kind::BenchmarkKind, numeric_parameter::BenchmarkNumericParameter,
     transport::BenchmarkTransport,
 };
 use gloo::console::log;
+use std::{collections::BTreeMap, rc::Rc};
 use yew::prelude::*;
 
 /// Represents the state of benchmarks in the application

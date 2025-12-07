@@ -16,11 +16,9 @@
  * under the License.
  */
 
-use std::{fmt, str::FromStr};
-
-use serde::{Deserialize, Serialize};
-
 use crate::error::IggyError;
+use serde::{Deserialize, Serialize};
+use std::{fmt, str::FromStr};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Snapshot(pub Vec<u8>);

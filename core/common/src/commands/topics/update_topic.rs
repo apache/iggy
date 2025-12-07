@@ -16,11 +16,6 @@
  * under the License.
  */
 
-use std::{fmt::Display, str::from_utf8};
-
-use bytes::{BufMut, Bytes, BytesMut};
-use serde::{Deserialize, Serialize};
-
 use super::MAX_NAME_LENGTH;
 use crate::{
     BytesSerializable, Command, CompressionAlgorithm, Identifier, Sizeable, UPDATE_TOPIC_CODE,
@@ -28,6 +23,9 @@ use crate::{
     error::IggyError,
     utils::{expiry::IggyExpiry, topic_size::MaxTopicSize},
 };
+use bytes::{BufMut, Bytes, BytesMut};
+use serde::{Deserialize, Serialize};
+use std::{fmt::Display, str::from_utf8};
 
 /// `UpdateTopic` command is used to update a topic in a stream.
 /// It has additional payload:
@@ -181,10 +179,9 @@ impl Display for UpdateTopic {
 
 #[cfg(test)]
 mod tests {
-    use bytes::BufMut;
-
     use super::*;
     use crate::utils::byte_size::IggyByteSize;
+    use bytes::BufMut;
 
     #[test]
     fn should_be_serialized_as_bytes() {

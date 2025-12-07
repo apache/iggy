@@ -16,12 +16,11 @@
  * under the License.
  */
 
-use std::{collections::HashMap, env::var, path, path::PathBuf};
-
 use anyhow::{Context, Result, bail};
 use dirs::home_dir;
 use iggy_common::ArgsOptional;
 use serde::{Deserialize, Serialize};
+use std::{collections::HashMap, env::var, path, path::PathBuf};
 use tokio::join;
 
 static ENV_IGGY_HOME: &str = "IGGY_HOME";

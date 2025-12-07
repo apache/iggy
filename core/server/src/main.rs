@@ -17,19 +17,6 @@
  * under the License.
  */
 
-use std::{
-    collections::HashSet,
-    panic::AssertUnwindSafe,
-    rc::Rc,
-    str::FromStr,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
-        mpsc,
-    },
-    thread::JoinHandle,
-};
-
 use anyhow::Result;
 use clap::Parser;
 use dashmap::DashMap;
@@ -62,6 +49,18 @@ use server::{
         utils::ptr::EternalPtr,
     },
     versioning::SemanticVersion,
+};
+use std::{
+    collections::HashSet,
+    panic::AssertUnwindSafe,
+    rc::Rc,
+    str::FromStr,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+        mpsc,
+    },
+    thread::JoinHandle,
 };
 use tracing::{error, info, instrument, warn};
 

@@ -25,16 +25,13 @@ mod procdump;
 // 2. Use std::process::Command with compio::runtime::spawn_blocking (requires thread pool)
 // 3. Find alternative approach that doesn't rely on thread pool
 // See: https://compio.rs/docs/compio/process and bootstrap::create_shard_executor
-use std::process::Command;
-use std::{path::PathBuf, time::Instant};
-
+use crate::{configs::system::SystemConfig, shard::IggyShard, streaming::session::Session};
 use async_zip::{Compression, ZipEntryBuilder, base::write::ZipFileWriter};
 use compio::{fs::OpenOptions, io::AsyncWriteAtExt};
 use iggy_common::{IggyDuration, IggyError, Snapshot, SnapshotCompression, SystemSnapshotType};
+use std::{path::PathBuf, process::Command, time::Instant};
 use tempfile::NamedTempFile;
 use tracing::{error, info};
-
-use crate::{configs::system::SystemConfig, shard::IggyShard, streaming::session::Session};
 
 impl IggyShard {
     pub async fn get_snapshot(

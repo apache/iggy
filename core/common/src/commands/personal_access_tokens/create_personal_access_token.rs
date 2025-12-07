@@ -16,17 +16,15 @@
  * under the License.
  */
 
-use std::{
-    fmt::{Display, Formatter},
-    str::from_utf8,
-};
-
-use bytes::{BufMut, Bytes, BytesMut};
-use serde::{Deserialize, Serialize};
-
 use crate::{
     BytesSerializable, CREATE_PERSONAL_ACCESS_TOKEN_CODE, Command, Validatable, defaults::*,
     error::IggyError, utils::expiry::IggyExpiry,
+};
+use bytes::{BufMut, Bytes, BytesMut};
+use serde::{Deserialize, Serialize};
+use std::{
+    fmt::{Display, Formatter},
+    str::from_utf8,
 };
 
 /// `CreatePersonalAccessToken` command is used to create a new personal access token for the authenticated user.

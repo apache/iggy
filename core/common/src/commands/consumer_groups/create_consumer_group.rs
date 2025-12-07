@@ -16,16 +16,14 @@
  * under the License.
  */
 
-use std::{fmt::Display, str::from_utf8};
-
-use bytes::{BufMut, Bytes, BytesMut};
-use serde::{Deserialize, Serialize};
-
 use super::MAX_NAME_LENGTH;
 use crate::{
     BytesSerializable, CREATE_CONSUMER_GROUP_CODE, Command, Identifier, Sizeable, Validatable,
     error::IggyError,
 };
+use bytes::{BufMut, Bytes, BytesMut};
+use serde::{Deserialize, Serialize};
+use std::{fmt::Display, str::from_utf8};
 
 /// `CreateConsumerGroup` command creates a new consumer group for the topic.
 /// It has additional payload:

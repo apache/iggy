@@ -16,14 +16,12 @@
  * under the License.
  */
 
-use std::fmt::Display;
-
-use bytes::Bytes;
-use serde::{Deserialize, Serialize};
-
 use crate::{
     BytesSerializable, Command, GET_PERSONAL_ACCESS_TOKENS_CODE, Validatable, error::IggyError,
 };
+use bytes::Bytes;
+use serde::{Deserialize, Serialize};
+use std::fmt::Display;
 
 /// `GetPersonalAccessTokens` command is used to get all personal access tokens for the authenticated user.
 /// It has no additional payload.

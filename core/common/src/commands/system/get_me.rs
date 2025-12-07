@@ -16,12 +16,10 @@
  * under the License.
  */
 
-use std::fmt::Display;
-
+use crate::{BytesSerializable, Command, GET_ME_CODE, Validatable, error::IggyError};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-
-use crate::{BytesSerializable, Command, GET_ME_CODE, Validatable, error::IggyError};
+use std::fmt::Display;
 
 /// `GetMe` command is used to get the information connected client.
 /// It has no additional payload.

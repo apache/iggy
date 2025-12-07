@@ -16,12 +16,6 @@
  * under the License.
  */
 
-use std::rc::Rc;
-
-use err_trail::ErrContext;
-use iggy_common::{IggyError, SenderKind, get_clients::GetClients};
-use tracing::debug;
-
 use crate::{
     binary::{
         command::{BinaryServerCommand, ServerCommand, ServerCommandHandler},
@@ -31,6 +25,10 @@ use crate::{
     shard::IggyShard,
     streaming::session::Session,
 };
+use err_trail::ErrContext;
+use iggy_common::{IggyError, SenderKind, get_clients::GetClients};
+use std::rc::Rc;
+use tracing::debug;
 
 impl ServerCommandHandler for GetClients {
     fn code(&self) -> u32 {

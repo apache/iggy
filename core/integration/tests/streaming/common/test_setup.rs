@@ -16,11 +16,10 @@
  * under the License.
  */
 
-use std::sync::Arc;
-
 use compio::fs;
 use iggy_common::MemoryPool;
 use server::{bootstrap::create_directories, configs::system::SystemConfig};
+use std::sync::Arc;
 use uuid::Uuid;
 
 pub struct TestSetup {

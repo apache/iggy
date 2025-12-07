@@ -17,11 +17,9 @@
  * under the License.
  */
 
-use std::time::Duration;
-
-use tokio::time::sleep;
-
 use crate::connectors::random::setup;
+use std::time::Duration;
+use tokio::time::sleep;
 
 #[tokio::test]
 async fn given_valid_configuration_random_source_connector_should_produce_messages() {

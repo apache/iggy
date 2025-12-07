@@ -27,24 +27,6 @@ mod communication;
 mod handlers;
 
 // Re-export for backwards compatibility
-use std::{
-    cell::{Cell, RefCell},
-    net::SocketAddr,
-    rc::Rc,
-    sync::atomic::{AtomicBool, Ordering},
-    time::{Duration, Instant},
-};
-
-use builder::IggyShardBuilder;
-pub use communication::calculate_shard_assignment;
-use dashmap::DashMap;
-use iggy_common::{EncryptorKind, Identifier, IggyError};
-use tracing::{debug, error, info, instrument};
-use transmission::{
-    connector::{Receiver, ShardConnector, StopReceiver},
-    id::ShardId,
-};
-
 use self::tasks::{continuous, periodic};
 use crate::{
     configs::server::ServerConfig,
@@ -65,6 +47,22 @@ use crate::{
         users::permissioner::Permissioner, utils::ptr::EternalPtr,
     },
     versioning::SemanticVersion,
+};
+use builder::IggyShardBuilder;
+pub use communication::calculate_shard_assignment;
+use dashmap::DashMap;
+use iggy_common::{EncryptorKind, Identifier, IggyError};
+use std::{
+    cell::{Cell, RefCell},
+    net::SocketAddr,
+    rc::Rc,
+    sync::atomic::{AtomicBool, Ordering},
+    time::{Duration, Instant},
+};
+use tracing::{debug, error, info, instrument};
+use transmission::{
+    connector::{Receiver, ShardConnector, StopReceiver},
+    id::ShardId,
 };
 
 pub const COMPONENT: &str = "SHARD";

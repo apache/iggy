@@ -16,15 +16,14 @@
  * under the License.
  */
 
-use anyhow::Context;
-use async_trait::async_trait;
-use iggy_common::{Identifier, Permissions, update_permissions::UpdatePermissions};
-use tracing::{Level, event};
-
 use crate::{
     Client,
     cli::cli_command::{CliCommand, PRINT_TARGET},
 };
+use anyhow::Context;
+use async_trait::async_trait;
+use iggy_common::{Identifier, Permissions, update_permissions::UpdatePermissions};
+use tracing::{Level, event};
 
 pub struct UpdatePermissionsCmd {
     update_permissions: UpdatePermissions,

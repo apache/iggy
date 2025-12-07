@@ -16,16 +16,15 @@
  * under the License.
  */
 
+use crate::{
+    BinaryClient, ConsumerGroupClient,
+    utils::{auth::fail_if_not_authenticated, mapper},
+};
 use iggy_common::{
     ConsumerGroup, ConsumerGroupDetails, Identifier, IggyError,
     create_consumer_group::CreateConsumerGroup, delete_consumer_group::DeleteConsumerGroup,
     get_consumer_group::GetConsumerGroup, get_consumer_groups::GetConsumerGroups,
     join_consumer_group::JoinConsumerGroup, leave_consumer_group::LeaveConsumerGroup,
-};
-
-use crate::{
-    BinaryClient, ConsumerGroupClient,
-    utils::{auth::fail_if_not_authenticated, mapper},
 };
 
 #[async_trait::async_trait]

@@ -16,6 +16,10 @@
  * under the License.
  */
 
+use crate::server::scenarios::{
+    CONSUMER_GROUP_NAME, PARTITIONS_COUNT, STREAM_NAME, TOPIC_NAME, USERNAME_1, USERNAME_2,
+    USERNAME_3, cleanup, create_client, join_consumer_group,
+};
 use iggy::{
     clients::client::IggyClient,
     prelude::{
@@ -25,11 +29,6 @@ use iggy::{
 };
 use integration::test_server::{
     ClientFactory, assert_clean_system, create_user, login_root, login_user,
-};
-
-use crate::server::scenarios::{
-    CONSUMER_GROUP_NAME, PARTITIONS_COUNT, STREAM_NAME, TOPIC_NAME, USERNAME_1, USERNAME_2,
-    USERNAME_3, cleanup, create_client, join_consumer_group,
 };
 
 pub async fn run(client_factory: &dyn ClientFactory) {

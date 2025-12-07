@@ -16,15 +16,13 @@
  * under the License.
  */
 
-use std::fmt::Display;
-
-use bytes::{BufMut, Bytes, BytesMut};
-use serde::{Deserialize, Serialize};
-
 use crate::{
     BytesSerializable, Command, Consumer, ConsumerKind, DELETE_CONSUMER_OFFSET_CODE, Identifier,
     Sizeable, Validatable, error::IggyError,
 };
+use bytes::{BufMut, Bytes, BytesMut};
+use serde::{Deserialize, Serialize};
+use std::fmt::Display;
 
 /// `DeleteConsumerOffset` command deletes the offset of a consumer from a given partition on the server.
 /// It has additional payload:

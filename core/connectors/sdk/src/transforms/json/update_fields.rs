@@ -16,13 +16,12 @@
  * under the License.
  */
 
-use simd_json::OwnedValue;
-
 use super::compute_value;
 use crate::{
     DecodedMessage, Error, Payload, TopicMetadata,
     transforms::{FieldValue, UpdateFields, update_fields::UpdateCondition},
 };
+use simd_json::OwnedValue;
 
 impl UpdateFields {
     pub(crate) fn transform_json(
@@ -56,8 +55,6 @@ impl UpdateFields {
 
 #[cfg(test)]
 mod tests {
-    use simd_json::{OwnedValue, prelude::TypedScalarValue};
-
     use super::*;
     use crate::transforms::{
         ComputedValue, FieldValue, Transform,
@@ -67,6 +64,7 @@ mod tests {
         },
         update_fields::{Field, UpdateCondition, UpdateFields, UpdateFieldsConfig},
     };
+    use simd_json::{OwnedValue, prelude::TypedScalarValue};
 
     #[test]
     fn should_always_update_field_when_no_condition() {

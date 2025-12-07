@@ -16,12 +16,10 @@
  * under the License.
  */
 
-use std::fmt::{Display, Formatter};
-
+use crate::state::command::EntryCommand;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use iggy_common::{BytesSerializable, IggyError, IggyTimestamp, calculate_checksum};
-
-use crate::state::command::EntryCommand;
+use std::fmt::{Display, Formatter};
 
 /// State entry in the log
 /// - `index` - Index (operation number) of the entry in the log

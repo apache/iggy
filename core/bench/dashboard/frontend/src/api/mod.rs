@@ -15,18 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-
-use bench_dashboard_shared::BenchmarkReportLight;
-use bench_report::{hardware::BenchmarkHardware, report::BenchmarkReport};
-use gloo::{console::log, net::http::Request};
-use uuid::Uuid;
-use web_sys::window;
-
 use crate::{
     config::get_api_base_url,
     error::{IggyBenchDashboardError, Result},
 };
+use bench_dashboard_shared::BenchmarkReportLight;
+use bench_report::{hardware::BenchmarkHardware, report::BenchmarkReport};
+use gloo::{console::log, net::http::Request};
+use std::sync::atomic::{AtomicBool, Ordering};
+use uuid::Uuid;
+use web_sys::window;
 
 static HEALTH_CHECK_DONE: AtomicBool = AtomicBool::new(false);
 

@@ -15,11 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use bench_report::hardware::BenchmarkHardware;
-use gloo::console::log;
-use yew::prelude::*;
-use yew_router::{hooks::use_route, prelude::use_navigator};
-
 use crate::{
     api,
     components::layout::{main_content::MainContent, sidebar::Sidebar},
@@ -31,6 +26,10 @@ use crate::{
         ui::use_ui,
     },
 };
+use bench_report::hardware::BenchmarkHardware;
+use gloo::console::log;
+use yew::prelude::*;
+use yew_router::{hooks::use_route, prelude::use_navigator};
 
 // Props definitions
 #[derive(Properties, PartialEq)]

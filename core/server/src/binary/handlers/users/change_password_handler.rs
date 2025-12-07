@@ -16,13 +16,6 @@
  * under the License.
  */
 
-use std::rc::Rc;
-
-use anyhow::Result;
-use err_trail::ErrContext;
-use iggy_common::{IggyError, SenderKind, change_password::ChangePassword};
-use tracing::{debug, info, instrument};
-
 use crate::{
     binary::{
         command::{BinaryServerCommand, ServerCommand, ServerCommandHandler},
@@ -32,6 +25,11 @@ use crate::{
     state::command::EntryCommand,
     streaming::{session::Session, utils::crypto},
 };
+use anyhow::Result;
+use err_trail::ErrContext;
+use iggy_common::{IggyError, SenderKind, change_password::ChangePassword};
+use std::rc::Rc;
+use tracing::{debug, info, instrument};
 
 impl ServerCommandHandler for ChangePassword {
     fn code(&self) -> u32 {

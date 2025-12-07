@@ -16,8 +16,7 @@
  * under the License.
  */
 
-use std::sync::Arc;
-
+use crate::context::RuntimeContext;
 use axum::{
     body::Body,
     extract::State,
@@ -25,8 +24,7 @@ use axum::{
     middleware::Next,
     response::Response,
 };
-
-use crate::context::RuntimeContext;
+use std::sync::Arc;
 
 const API_KEY_HEADER: &str = "api-key";
 const PUBLIC_PATHS: &[&str] = &["/", "/health"];

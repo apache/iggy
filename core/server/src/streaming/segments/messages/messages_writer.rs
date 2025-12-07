@@ -16,17 +16,15 @@
  * under the License.
  */
 
+use crate::streaming::segments::{IggyMessagesBatchSet, messages::write_batch};
+use compio::fs::{File, OpenOptions};
+use err_trail::ErrContext;
+use iggy_common::{IggyByteSize, IggyError};
 use std::{
     rc::Rc,
     sync::atomic::{AtomicU64, Ordering},
 };
-
-use compio::fs::{File, OpenOptions};
-use err_trail::ErrContext;
-use iggy_common::{IggyByteSize, IggyError};
 use tracing::trace;
-
-use crate::streaming::segments::{IggyMessagesBatchSet, messages::write_batch};
 
 /// A dedicated struct for writing to the messages file.
 #[derive(Debug)]

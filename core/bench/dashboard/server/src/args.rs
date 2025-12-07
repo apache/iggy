@@ -15,10 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::path::PathBuf;
-
 use clap::{CommandFactory, Parser, Subcommand, error::ErrorKind};
 use serde::Deserialize;
+use std::path::PathBuf;
 
 #[derive(Debug, Subcommand, Deserialize)]
 pub enum PollGithub {

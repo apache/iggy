@@ -16,14 +16,12 @@
  * under the License.
  */
 
+use crate::error::IggyError;
+use serde::{Deserialize, Serialize};
 use std::{
     fmt::Display,
     hash::{Hash, Hasher},
 };
-
-use serde::{Deserialize, Serialize};
-
-use crate::error::IggyError;
 
 /// `PartitioningKind` is an enum which specifies the kind of partitioning and is used by `Partitioning`.
 #[derive(Debug, Serialize, Deserialize, Eq, PartialEq, Default, Copy, Clone)]

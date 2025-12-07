@@ -16,10 +16,6 @@
  * under the License.
  */
 
-use std::{sync::Arc, time::Duration};
-
-use iggy_common::{IggyByteSize, IggyDuration};
-
 use super::{sharding::ShardingConfig, tcp::TcpSocketConfig};
 use crate::configs::{
     cluster::{ClusterConfig, CurrentNodeConfig, NodeConfig, OtherNodeConfig, TransportPorts},
@@ -38,6 +34,8 @@ use crate::configs::{
     tcp::{TcpConfig, TcpTlsConfig},
     websocket::{WebSocketConfig, WebSocketTlsConfig},
 };
+use iggy_common::{IggyByteSize, IggyDuration};
+use std::{sync::Arc, time::Duration};
 
 static_toml::static_toml! {
     // static_toml crate always starts from CARGO_MANIFEST_DIR (in this case iggy-server root directory)

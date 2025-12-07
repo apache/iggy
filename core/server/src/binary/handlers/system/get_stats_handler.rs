@@ -16,12 +16,6 @@
  * under the License.
  */
 
-use std::rc::Rc;
-
-use err_trail::ErrContext;
-use iggy_common::{Identifier, IggyError, SenderKind, get_stats::GetStats};
-use tracing::debug;
-
 use crate::{
     binary::{
         command::{BinaryServerCommand, ServerCommand, ServerCommandHandler},
@@ -37,6 +31,10 @@ use crate::{
     },
     streaming::session::Session,
 };
+use err_trail::ErrContext;
+use iggy_common::{Identifier, IggyError, SenderKind, get_stats::GetStats};
+use std::rc::Rc;
+use tracing::debug;
 
 impl ServerCommandHandler for GetStats {
     fn code(&self) -> u32 {

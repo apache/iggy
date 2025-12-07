@@ -16,8 +16,11 @@
  * under the License.
  */
 
-use std::{io::BufReader, net::SocketAddr, rc::Rc, sync::Arc};
-
+use crate::{
+    configs::websocket::WebSocketConfig,
+    shard::{IggyShard, task_registry::ShutdownToken, transmission::event::ShardEvent},
+    websocket::connection_handler::{handle_connection, handle_error},
+};
 use compio::net::TcpListener;
 use compio_net::TcpOpts;
 use compio_tls::TlsAcceptor;
@@ -30,13 +33,8 @@ use rustls::{
     pki_types::{CertificateDer, PrivateKeyDer},
 };
 use rustls_pemfile::{certs, private_key};
+use std::{io::BufReader, net::SocketAddr, rc::Rc, sync::Arc};
 use tracing::{debug, error, info, trace, warn};
-
-use crate::{
-    configs::websocket::WebSocketConfig,
-    shard::{IggyShard, task_registry::ShutdownToken, transmission::event::ShardEvent},
-    websocket::connection_handler::{handle_connection, handle_error},
-};
 
 async fn create_listener(addr: SocketAddr) -> Result<TcpListener, std::io::Error> {
     // Required by the thread-per-core model...

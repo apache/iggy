@@ -16,8 +16,10 @@
  * under the License.
  */
 
-use std::sync::Arc;
-
+use crate::{
+    http::{COMPONENT, error::CustomError, jwt::json_web_token::Identity, shared::AppState},
+    streaming::session::Session,
+};
 use axum::{
     Extension, Json, Router, debug_handler,
     extract::{Path, Query, State},
@@ -31,11 +33,7 @@ use iggy_common::{
     store_consumer_offset::StoreConsumerOffset,
 };
 use send_wrapper::SendWrapper;
-
-use crate::{
-    http::{COMPONENT, error::CustomError, jwt::json_web_token::Identity, shared::AppState},
-    streaming::session::Session,
-};
+use std::sync::Arc;
 
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()

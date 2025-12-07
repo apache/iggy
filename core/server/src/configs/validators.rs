@@ -17,14 +17,6 @@
  * under the License.
  */
 
-use std::thread::available_parallelism;
-
-use err_trail::ErrContext;
-use iggy_common::{
-    CompressionAlgorithm, ConfigurationError, IggyExpiry, MaxTopicSize, Validatable,
-};
-use tracing::{error, warn};
-
 use super::{
     cluster::ClusterConfig,
     server::{
@@ -41,6 +33,12 @@ use crate::{
     },
     streaming::segments::*,
 };
+use err_trail::ErrContext;
+use iggy_common::{
+    CompressionAlgorithm, ConfigurationError, IggyExpiry, MaxTopicSize, Validatable,
+};
+use std::thread::available_parallelism;
+use tracing::{error, warn};
 
 impl Validatable<ConfigurationError> for ServerConfig {
     fn validate(&self) -> Result<(), ConfigurationError> {

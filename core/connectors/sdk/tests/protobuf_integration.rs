@@ -15,8 +15,6 @@
  * under the License.
  */
 
-use std::{collections::HashMap, path::PathBuf};
-
 use iggy_connector_sdk::{
     Payload, Schema, StreamDecoder, StreamEncoder,
     decoders::proto::{ProtoConfig, ProtoStreamDecoder},
@@ -25,6 +23,7 @@ use iggy_connector_sdk::{
 };
 use prost::Message;
 use prost_types::Any;
+use std::{collections::HashMap, path::PathBuf};
 
 #[tokio::test]
 async fn should_transform_with_real_schema_and_field_mapping() {

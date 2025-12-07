@@ -16,11 +16,6 @@
  * under the License.
  */
 
-use std::{cell::Cell, rc::Rc, sync::atomic::AtomicBool};
-
-use dashmap::DashMap;
-use iggy_common::EncryptorKind;
-
 use super::{
     IggyShard, TaskRegistry,
     transmission::{connector::ShardConnector, frame::ShardFrame, id::ShardId},
@@ -36,6 +31,9 @@ use crate::{
     },
     versioning::SemanticVersion,
 };
+use dashmap::DashMap;
+use iggy_common::EncryptorKind;
+use std::{cell::Cell, rc::Rc, sync::atomic::AtomicBool};
 
 #[derive(Default)]
 pub struct IggyShardBuilder {

@@ -16,10 +16,9 @@
  * under the License.
  */
 
+use crate::actors::{ApiLabel, BatchMetrics, BenchmarkInit};
 use bench_report::numeric_parameter::BenchmarkNumericParameter;
 use iggy::prelude::*;
-
-use crate::actors::{ApiLabel, BatchMetrics, BenchmarkInit};
 
 #[derive(Debug, Clone)]
 pub struct BenchmarkConsumerConfig {

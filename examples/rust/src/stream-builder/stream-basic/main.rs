@@ -16,13 +16,11 @@
  * under the License.
  */
 
-use std::str::FromStr;
-
+use crate::shared::stream::PrintEventConsumer;
 use iggy::{consumer_ext::IggyConsumerMessageExt, prelude::*};
 use iggy_examples::shared;
+use std::str::FromStr;
 use tokio::sync::oneshot;
-
-use crate::shared::stream::PrintEventConsumer;
 
 #[tokio::main]
 async fn main() -> Result<(), IggyError> {

@@ -16,11 +16,10 @@
  * under the License.
  */
 
+use crate::prelude::IggyClient;
 use async_trait::async_trait;
 use iggy_binary_protocol::SegmentClient;
 use iggy_common::{Identifier, IggyError, locking::IggyRwLockFn};
-
-use crate::prelude::IggyClient;
 
 #[async_trait]
 impl SegmentClient for IggyClient {

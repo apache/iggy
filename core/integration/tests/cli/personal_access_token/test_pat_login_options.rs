@@ -16,16 +16,14 @@
  * under the License.
  */
 
-use std::fmt::{Display, Formatter, Result};
-
+use crate::cli::common::{IggyCmdCommand, IggyCmdTest, IggyCmdTestCase};
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
 use iggy::prelude::{Client, PersonalAccessTokenExpiry};
 use keyring::Entry;
 use predicates::str::{contains, starts_with};
 use serial_test::parallel;
-
-use crate::cli::common::{IggyCmdCommand, IggyCmdTest, IggyCmdTestCase};
+use std::fmt::{Display, Formatter, Result};
 
 const IGGY_SERVICE: &str = "iggy";
 

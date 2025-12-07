@@ -16,9 +16,8 @@
  * under the License.
  */
 
-use std::fmt::Display;
-
 use crate::{BytesSerializable, Validatable, error::IggyError};
+use std::fmt::Display;
 
 pub trait Command: BytesSerializable + Validatable<IggyError> + Send + Sync + Display {
     fn code(&self) -> u32;

@@ -17,8 +17,6 @@
  * under the License.
  */
 
-use std::{collections::HashMap, str::FromStr, time::Duration};
-
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use iggy_connector_sdk::{
@@ -26,6 +24,7 @@ use iggy_connector_sdk::{
 };
 use serde::{Deserialize, Serialize};
 use sqlx::{Column, Pool, Postgres, Row, TypeInfo, postgres::PgPoolOptions};
+use std::{collections::HashMap, str::FromStr, time::Duration};
 use tokio::sync::Mutex;
 use tracing::{error, info};
 use uuid::Uuid;

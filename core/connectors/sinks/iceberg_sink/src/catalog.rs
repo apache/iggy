@@ -16,13 +16,11 @@
  * under the License.
  */
 
-use std::collections::HashMap;
-
-use iceberg::Catalog;
-use iceberg_catalog_rest::{RestCatalog, RestCatalogConfig};
-
 use super::{Error, IcebergSinkConfig, IcebergSinkTypes};
 use crate::props::init_props;
+use iceberg::Catalog;
+use iceberg_catalog_rest::{RestCatalog, RestCatalogConfig};
+use std::collections::HashMap;
 
 pub async fn init_catalog(config: &IcebergSinkConfig) -> Result<Box<dyn Catalog>, Error> {
     let props = init_props(config)?;

@@ -16,15 +16,14 @@
  * under the License.
  */
 
-use anyhow::Context;
-use async_trait::async_trait;
-use iggy_common::{Identifier, UserStatus, update_user::UpdateUser};
-use tracing::{Level, event};
-
 use crate::{
     Client,
     cli::cli_command::{CliCommand, PRINT_TARGET},
 };
+use anyhow::Context;
+use async_trait::async_trait;
+use iggy_common::{Identifier, UserStatus, update_user::UpdateUser};
+use tracing::{Level, event};
 
 #[derive(Debug, Clone)]
 pub enum UpdateUserType {

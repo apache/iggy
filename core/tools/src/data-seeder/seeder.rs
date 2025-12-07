@@ -16,10 +16,9 @@
  * under the License.
  */
 
-use std::{collections::HashMap, str::FromStr};
-
 use iggy::prelude::*;
 use rand::Rng;
+use std::{collections::HashMap, str::FromStr};
 
 const PROD_STREAM_NAME: &str = "prod";
 const TEST_STREAM_NAME: &str = "test";

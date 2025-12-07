@@ -16,8 +16,10 @@
  * under the License.
  */
 
-use std::time::Instant;
-
+use crate::{
+    http::{http_server::CompioSocketAddr, shared::RequestDetails},
+    streaming::utils::random_id,
+};
 use axum::{
     body::Body,
     extract::ConnectInfo,
@@ -25,12 +27,8 @@ use axum::{
     middleware::Next,
     response::Response,
 };
+use std::time::Instant;
 use tracing::{debug, error};
-
-use crate::{
-    http::{http_server::CompioSocketAddr, shared::RequestDetails},
-    streaming::utils::random_id,
-};
 
 pub async fn request_diagnostics(
     ConnectInfo(ip_address): ConnectInfo<CompioSocketAddr>,

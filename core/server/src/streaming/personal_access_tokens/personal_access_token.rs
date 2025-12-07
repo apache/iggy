@@ -15,12 +15,10 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-use std::sync::Arc;
-
+use crate::streaming::utils::hash;
 use iggy_common::{IggyExpiry, IggyTimestamp, UserId, text::as_base64};
 use ring::rand::SecureRandom;
-
-use crate::streaming::utils::hash;
+use std::sync::Arc;
 
 const SIZE: usize = 50;
 
@@ -94,9 +92,8 @@ impl PersonalAccessToken {
 
 #[cfg(test)]
 mod tests {
-    use iggy_common::{IggyDuration, IggyTimestamp};
-
     use super::*;
+    use iggy_common::{IggyDuration, IggyTimestamp};
 
     #[test]
     fn personal_access_token_should_be_created_with_random_secure_value_and_hashed_successfully() {

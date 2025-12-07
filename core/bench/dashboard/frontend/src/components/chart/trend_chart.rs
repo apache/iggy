@@ -15,11 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use charming::Echarts;
-use gloo::console::log;
-use yew::{platform::spawn_local, prelude::*};
-use yew_hooks::use_size;
-
 use crate::{
     api::fetch_benchmark_trend,
     components::{
@@ -28,6 +23,10 @@ use crate::{
     },
     state::hardware::use_hardware,
 };
+use charming::Echarts;
+use gloo::console::log;
+use yew::{platform::spawn_local, prelude::*};
+use yew_hooks::use_size;
 
 #[derive(Properties, PartialEq)]
 #[allow(dead_code)]

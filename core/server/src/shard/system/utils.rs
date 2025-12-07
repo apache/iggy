@@ -15,8 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use iggy_common::{Consumer, ConsumerKind, Identifier, IggyError};
-
 use crate::{
     shard::IggyShard,
     streaming::{
@@ -24,6 +22,7 @@ use crate::{
         topics::{self},
     },
 };
+use iggy_common::{Consumer, ConsumerKind, Identifier, IggyError};
 
 impl IggyShard {
     pub fn ensure_stream_exists(&self, stream_id: &Identifier) -> Result<(), IggyError> {

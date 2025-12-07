@@ -16,12 +16,11 @@
  * under the License.
  */
 
-use iggy_common::{ClusterMetadata, GetClusterMetadata, IggyError};
-
 use crate::{
     BinaryClient, ClusterClient,
     utils::{auth::fail_if_not_authenticated, mapper},
 };
+use iggy_common::{ClusterMetadata, GetClusterMetadata, IggyError};
 
 #[async_trait::async_trait]
 impl<B: BinaryClient> ClusterClient for B {

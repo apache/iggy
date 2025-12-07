@@ -16,19 +16,17 @@
  * under the License.
  */
 
-use std::{net::SocketAddr, rc::Rc, time::Duration};
-
-use compio::net::{TcpListener, TcpOpts};
-use err_trail::ErrContext;
-use futures::FutureExt;
-use iggy_common::{IggyError, SenderKind, TransportProtocol};
-use tracing::{debug, error, info};
-
 use crate::{
     configs::tcp::TcpSocketConfig,
     shard::{IggyShard, task_registry::ShutdownToken, transmission::event::ShardEvent},
     tcp::connection_handler::{handle_connection, handle_error},
 };
+use compio::net::{TcpListener, TcpOpts};
+use err_trail::ErrContext;
+use futures::FutureExt;
+use iggy_common::{IggyError, SenderKind, TransportProtocol};
+use std::{net::SocketAddr, rc::Rc, time::Duration};
+use tracing::{debug, error, info};
 
 async fn create_listener(
     addr: SocketAddr,

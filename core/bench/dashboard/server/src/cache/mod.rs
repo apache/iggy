@@ -15,10 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::{path::PathBuf, sync::Arc, time::Instant};
-
+use crate::error::IggyBenchDashboardServerError;
 use bench_dashboard_shared::BenchmarkReportLight;
 use dashmap::{DashMap, DashSet};
+use std::{path::PathBuf, sync::Arc, time::Instant};
 use tokio::{
     fs::{File, OpenOptions},
     io::AsyncWriteExt,
@@ -26,8 +26,6 @@ use tokio::{
 };
 use tracing::{error, info};
 use uuid::Uuid;
-
-use crate::error::IggyBenchDashboardServerError;
 
 mod loader;
 mod query;

@@ -15,14 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::num::NonZeroU32;
-
 use governor::{
     Quota, RateLimiter as GovernorRateLimiter,
     clock::DefaultClock,
     state::{InMemoryState, NotKeyed},
 };
 use iggy::prelude::IggyByteSize;
+use std::num::NonZeroU32;
 
 pub struct BenchmarkRateLimiter {
     rate_limiter: GovernorRateLimiter<NotKeyed, InMemoryState, DefaultClock>,

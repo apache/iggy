@@ -16,12 +16,10 @@
  * under the License.
  */
 
-use std::rc::Rc;
-
-use iggy_common::{Identifier, IggyError, IggyTimestamp};
-use tracing::{debug, error, info, trace, warn};
-
 use crate::{shard::IggyShard, streaming::topics::helpers as topics_helpers};
+use iggy_common::{Identifier, IggyError, IggyTimestamp};
+use std::rc::Rc;
+use tracing::{debug, error, info, trace, warn};
 
 pub fn spawn_message_cleaner(shard: Rc<IggyShard>) {
     if !shard.config.data_maintenance.messages.cleaner_enabled {

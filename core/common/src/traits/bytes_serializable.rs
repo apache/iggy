@@ -16,9 +16,8 @@
  * under the License.
  */
 
-use bytes::{Bytes, BytesMut};
-
 use crate::IggyError;
+use bytes::{Bytes, BytesMut};
 
 /// The trait represents the logic responsible for serializing and deserializing the struct to and from bytes.
 pub trait BytesSerializable {

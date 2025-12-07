@@ -16,9 +16,8 @@
  * under the License.
  */
 
-use std::collections::HashMap;
-
 use super::{Error, IcebergSinkConfig, IcebergSinkStoreClass};
+use std::collections::HashMap;
 
 pub fn init_props(config: &IcebergSinkConfig) -> Result<HashMap<String, String>, Error> {
     match config.store_class {

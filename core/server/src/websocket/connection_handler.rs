@@ -16,14 +16,6 @@
  * under the License.
  */
 
-use std::{io::ErrorKind, rc::Rc};
-
-use async_channel::Receiver;
-use bytes::BytesMut;
-use futures::FutureExt;
-use iggy_common::{IggyError, SenderKind};
-use tracing::{debug, error, info, warn};
-
 use crate::{
     binary::{command, command::ServerCommandHandler},
     server_error::ConnectionError,
@@ -31,6 +23,12 @@ use crate::{
     streaming::session::Session,
     websocket::connection_handler::command::ServerCommand,
 };
+use async_channel::Receiver;
+use bytes::BytesMut;
+use futures::FutureExt;
+use iggy_common::{IggyError, SenderKind};
+use std::{io::ErrorKind, rc::Rc};
+use tracing::{debug, error, info, warn};
 
 const INITIAL_BYTES_LENGTH: usize = 4;
 

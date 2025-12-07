@@ -16,15 +16,14 @@
  * under the License.
  */
 
+use crate::cli::common::{
+    CLAP_INDENT, IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestHelpCmd, USAGE_PREFIX,
+};
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
 use iggy::prelude::{Client, CompressionAlgorithm, IggyExpiry, MaxTopicSize};
 use predicates::str::diff;
 use serial_test::parallel;
-
-use crate::cli::common::{
-    CLAP_INDENT, IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestHelpCmd, USAGE_PREFIX,
-};
 
 struct TestPartitionCreateCmd {
     stream_name: String,

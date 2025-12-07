@@ -15,17 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::{
-    cell::{Ref, RefMut},
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
-};
-
-use iggy_common::{CompressionAlgorithm, Identifier, IggyExpiry, IggyTimestamp, MaxTopicSize};
-use slab::Slab;
-
 use crate::{
     slab::{
         Keyed,
@@ -36,6 +25,15 @@ use crate::{
         traits_ext::{EntityMarker, InsertCell, IntoComponents, IntoComponentsById},
     },
     streaming::stats::{StreamStats, TopicStats},
+};
+use iggy_common::{CompressionAlgorithm, Identifier, IggyExpiry, IggyTimestamp, MaxTopicSize};
+use slab::Slab;
+use std::{
+    cell::{Ref, RefMut},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 #[derive(Debug, Clone)]

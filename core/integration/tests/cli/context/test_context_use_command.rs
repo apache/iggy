@@ -16,19 +16,17 @@
  * under the License.
  */
 
-use std::collections::HashMap;
-
+use super::common::TestIggyContext;
+use crate::cli::common::{
+    CLAP_INDENT, IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestHelpCmd, USAGE_PREFIX,
+};
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
 use iggy::prelude::Client;
 use iggy_binary_protocol::cli::binary_context::common::ContextConfig;
 use predicates::str::contains;
 use serial_test::parallel;
-
-use super::common::TestIggyContext;
-use crate::cli::common::{
-    CLAP_INDENT, IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestHelpCmd, USAGE_PREFIX,
-};
+use std::collections::HashMap;
 struct TestContextUseCmd {
     test_iggy_context: TestIggyContext,
     new_context_key: String,

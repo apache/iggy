@@ -16,12 +16,11 @@
  * under the License.
  */
 
-use std::{net::SocketAddr, str::FromStr};
-
 use iggy_binary_protocol::ClusterClient;
 use iggy_common::{
     ClusterMetadata, ClusterNodeRole, ClusterNodeStatus, IggyError, TransportProtocol,
 };
+use std::{net::SocketAddr, str::FromStr};
 use tracing::{debug, info, warn};
 
 /// Maximum number of leader redirections to prevent infinite loops

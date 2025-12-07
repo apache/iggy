@@ -16,8 +16,12 @@
  * under the License.
  */
 
-use std::sync::Arc;
-
+use crate::{
+    http::{COMPONENT, error::CustomError, jwt::json_web_token::Identity, shared::AppState},
+    slab::traits_ext::{EntityComponentSystem, IntoComponents},
+    state::{command::EntryCommand, models::CreateStreamWithId},
+    streaming::session::Session,
+};
 use axum::{
     Extension, Json, Router, debug_handler,
     extract::{Path, State},
@@ -30,14 +34,8 @@ use iggy_common::{
     delete_stream::DeleteStream, purge_stream::PurgeStream, update_stream::UpdateStream,
 };
 use send_wrapper::SendWrapper;
+use std::sync::Arc;
 use tracing::instrument;
-
-use crate::{
-    http::{COMPONENT, error::CustomError, jwt::json_web_token::Identity, shared::AppState},
-    slab::traits_ext::{EntityComponentSystem, IntoComponents},
-    state::{command::EntryCommand, models::CreateStreamWithId},
-    streaming::session::Session,
-};
 
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()

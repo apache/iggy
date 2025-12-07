@@ -15,13 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::HashMap;
-
+use super::BenchmarkCache;
 use bench_dashboard_shared::BenchmarkReportLight;
 use bench_report::hardware::BenchmarkHardware;
 use chrono::{self, DateTime, FixedOffset};
-
-use super::BenchmarkCache;
+use std::collections::HashMap;
 
 impl BenchmarkCache {
     pub fn get_hardware_configurations(&self) -> Vec<BenchmarkHardware> {

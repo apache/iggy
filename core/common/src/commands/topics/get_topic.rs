@@ -16,14 +16,12 @@
  * under the License.
  */
 
-use std::fmt::Display;
-
-use bytes::{BufMut, Bytes, BytesMut};
-use serde::{Deserialize, Serialize};
-
 use crate::{
     BytesSerializable, Command, GET_TOPIC_CODE, Identifier, Sizeable, Validatable, error::IggyError,
 };
+use bytes::{BufMut, Bytes, BytesMut};
+use serde::{Deserialize, Serialize};
+use std::fmt::Display;
 
 /// `GetTopic` command is used to retrieve a topic from a stream.
 /// It has additional payload:
@@ -86,9 +84,8 @@ impl Display for GetTopic {
 
 #[cfg(test)]
 mod tests {
-    use bytes::BufMut;
-
     use super::*;
+    use bytes::BufMut;
 
     #[test]
     fn should_be_serialized_as_bytes() {

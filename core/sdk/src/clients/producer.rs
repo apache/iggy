@@ -15,14 +15,14 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+use super::ORDERING;
+use crate::{
+    client_wrappers::client_wrapper::ClientWrapper,
+    clients::{
+        MAX_BATCH_LENGTH, producer_builder::SendMode, producer_config::DirectConfig,
+        producer_dispatcher::ProducerDispatcher,
     },
-    time::Duration,
 };
-
 use bytes::Bytes;
 use futures_util::StreamExt;
 use iggy_binary_protocol::{Client, MessageClient, StreamClient, TopicClient};
@@ -33,17 +33,15 @@ use iggy_common::{
 };
 #[cfg(test)]
 use mockall::automock;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 use tokio::time::{Interval, sleep};
 use tracing::{error, info, trace, warn};
-
-use super::ORDERING;
-use crate::{
-    client_wrappers::client_wrapper::ClientWrapper,
-    clients::{
-        MAX_BATCH_LENGTH, producer_builder::SendMode, producer_config::DirectConfig,
-        producer_dispatcher::ProducerDispatcher,
-    },
-};
 
 #[cfg_attr(test, automock)]
 pub trait ProducerCoreBackend: Send + Sync + 'static {

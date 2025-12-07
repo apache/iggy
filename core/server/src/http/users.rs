@@ -16,8 +16,14 @@
  * under the License.
  */
 
-use std::sync::Arc;
-
+use crate::{
+    http::{
+        COMPONENT, error::CustomError, jwt::json_web_token::Identity, mapper,
+        mapper::map_generated_access_token_to_identity_info, shared::AppState,
+    },
+    state::{command::EntryCommand, models::CreateUserWithId},
+    streaming::{session::Session, users::user::User, utils::crypto},
+};
 use ::iggy_common::{
     change_password::ChangePassword, create_user::CreateUser, delete_user::DeleteUser,
     login_user::LoginUser, update_permissions::UpdatePermissions, update_user::UpdateUser,
@@ -32,16 +38,8 @@ use err_trail::ErrContext;
 use iggy_common::{Identifier, IdentityInfo, UserInfo, UserInfoDetails, Validatable};
 use send_wrapper::SendWrapper;
 use serde::Deserialize;
+use std::sync::Arc;
 use tracing::instrument;
-
-use crate::{
-    http::{
-        COMPONENT, error::CustomError, jwt::json_web_token::Identity, mapper,
-        mapper::map_generated_access_token_to_identity_info, shared::AppState,
-    },
-    state::{command::EntryCommand, models::CreateUserWithId},
-    streaming::{session::Session, users::user::User, utils::crypto},
-};
 
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()

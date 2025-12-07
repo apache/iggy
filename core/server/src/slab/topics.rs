@@ -15,12 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::{cell::RefCell, sync::Arc};
-
-use ahash::AHashMap;
-use iggy_common::Identifier;
-use slab::Slab;
-
 use crate::{
     slab::{
         Keyed,
@@ -40,6 +34,10 @@ use crate::{
         },
     },
 };
+use ahash::AHashMap;
+use iggy_common::Identifier;
+use slab::Slab;
+use std::{cell::RefCell, sync::Arc};
 
 const CAPACITY: usize = 1024;
 pub type ContainerId = usize;

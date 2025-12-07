@@ -16,15 +16,14 @@
  * under the License.
  */
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, AtomicUsize, Ordering},
-};
-
 use bytes::BytesMut;
 use crossbeam::queue::ArrayQueue;
 use human_repr::HumanCount;
 use once_cell::sync::OnceCell;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+};
 use tracing::{info, trace, warn};
 
 /// Global memory pool instance. Use `memory_pool()` to access it.
@@ -471,12 +470,10 @@ fn size_str(size: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{str::FromStr, sync::Once};
-
-    use serial_test::serial;
-
     use super::*;
     use crate::{IggyByteSize, alloc::buffer::PooledBuffer};
+    use serial_test::serial;
+    use std::{str::FromStr, sync::Once};
 
     static TEST_INIT: Once = Once::new();
 

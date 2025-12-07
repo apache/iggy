@@ -16,11 +16,10 @@
  * under the License.
  */
 
-use std::collections::HashMap;
-
 use iggy::prelude;
 use rmcp::schemars::{self, JsonSchema};
 use serde::Deserialize;
+use std::collections::HashMap;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct GetStream {

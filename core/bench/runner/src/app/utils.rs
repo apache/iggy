@@ -15,9 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::path::PathBuf;
-
 use anyhow::{Context, Result};
+use std::path::PathBuf;
 use tempfile::TempDir;
 use tokio::fs;
 

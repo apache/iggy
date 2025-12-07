@@ -17,6 +17,8 @@
  * under the License.
  */
 
+use assert_cmd::prelude::CommandCargoExt;
+use rand::Rng;
 use std::{
     collections::HashMap,
     fs::{self, File, OpenOptions},
@@ -26,9 +28,6 @@ use std::{
     process::{Child, Command, Stdio},
     time::Duration,
 };
-
-use assert_cmd::prelude::CommandCargoExt;
-use rand::Rng;
 use tokio::time::sleep;
 use uuid::Uuid;
 

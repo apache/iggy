@@ -16,12 +16,6 @@
  * under the License.
  */
 
-use std::str::FromStr;
-
-use err_trail::ErrContext;
-use iggy_common::{CompressionAlgorithm, Identifier, IggyError, IggyExpiry, MaxTopicSize};
-use tracing::info;
-
 use super::COMPONENT;
 use crate::{
     shard::IggyShard,
@@ -36,6 +30,10 @@ use crate::{
         },
     },
 };
+use err_trail::ErrContext;
+use iggy_common::{CompressionAlgorithm, Identifier, IggyError, IggyExpiry, MaxTopicSize};
+use std::str::FromStr;
+use tracing::info;
 
 impl IggyShard {
     #[allow(clippy::too_many_arguments)]

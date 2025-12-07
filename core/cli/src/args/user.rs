@@ -16,14 +16,13 @@
  * under the License.
  */
 
-use clap::{Args, Subcommand};
-use iggy::prelude::Identifier;
-
 use super::permissions::global::GlobalPermissionsArg;
 use crate::args::{
     common::ListMode,
     permissions::{UserStatusArg, stream::StreamPermissionsArg},
 };
+use clap::{Args, Subcommand};
+use iggy::prelude::Identifier;
 
 #[derive(Debug, Clone, Subcommand)]
 pub(crate) enum UserAction {

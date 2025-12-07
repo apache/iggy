@@ -16,15 +16,13 @@
  * under the License.
  */
 
-use std::{collections::HashMap, net::SocketAddr, time::Instant};
-
+use crate::args::common::IggyBenchArgs;
 use iggy::prelude::TransportProtocol;
 use integration::test_server::{IpAddrKind, SYSTEM_PATH_ENV_VAR, TestServer};
 use serde::Deserialize;
+use std::{collections::HashMap, net::SocketAddr, time::Instant};
 use tokio::net::{TcpStream, UdpSocket};
 use tracing::{info, warn};
-
-use crate::args::common::IggyBenchArgs;
 
 #[derive(Debug, Deserialize)]
 struct ServerConfig {

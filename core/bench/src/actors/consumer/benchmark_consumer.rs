@@ -16,22 +16,20 @@
  * under the License.
  */
 
-use std::{sync::Arc, time::Duration};
-
+use crate::{
+    actors::consumer::client::{BenchmarkConsumerClient, interface::BenchmarkConsumerConfig},
+    analytics::{metrics::individual::from_records, record::BenchmarkRecord},
+    utils::{finish_condition::BenchmarkFinishCondition, rate_limiter::BenchmarkRateLimiter},
+};
 use bench_report::{
     actor_kind::ActorKind, benchmark_kind::BenchmarkKind,
     individual_metrics::BenchmarkIndividualMetrics, numeric_parameter::BenchmarkNumericParameter,
 };
 use human_repr::HumanCount;
 use iggy::prelude::*;
+use std::{sync::Arc, time::Duration};
 use tokio::time::Instant;
 use tracing::info;
-
-use crate::{
-    actors::consumer::client::{BenchmarkConsumerClient, interface::BenchmarkConsumerConfig},
-    analytics::{metrics::individual::from_records, record::BenchmarkRecord},
-    utils::{finish_condition::BenchmarkFinishCondition, rate_limiter::BenchmarkRateLimiter},
-};
 
 pub struct BenchmarkConsumer<C: BenchmarkConsumerClient> {
     pub client: C,

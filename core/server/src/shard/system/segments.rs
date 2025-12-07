@@ -15,10 +15,8 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-use iggy_common::Identifier;
-use iggy_common::IggyError;
-
 use crate::{shard::IggyShard, streaming};
+use iggy_common::{Identifier, IggyError};
 
 impl IggyShard {
     pub async fn delete_segments_bypass_auth(

@@ -15,11 +15,9 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-use std::{net::SocketAddr, num::TryFromIntError};
-
-use socket2::{Domain, Protocol, Socket, Type};
-
 use crate::configs::quic::QuicSocketConfig;
+use socket2::{Domain, Protocol, Socket, Type};
+use std::{net::SocketAddr, num::TryFromIntError};
 
 /// Build a UDP socket for the given address and configure the options that are
 /// required by the server

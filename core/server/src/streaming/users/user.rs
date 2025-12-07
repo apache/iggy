@@ -15,14 +15,12 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-use std::sync::Arc;
-
-use dashmap::DashMap;
-use iggy_common::{IggyTimestamp, Permissions, UserId, UserStatus, defaults::*};
-
 use crate::streaming::{
     personal_access_tokens::personal_access_token::PersonalAccessToken, utils::crypto,
 };
+use dashmap::DashMap;
+use iggy_common::{IggyTimestamp, Permissions, UserId, UserStatus, defaults::*};
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub struct User {

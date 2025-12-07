@@ -16,15 +16,13 @@
  * under the License.
  */
 
-use std::{collections::HashMap, path::PathBuf};
-
+use super::{Transform, TransformType};
+use crate::{DecodedMessage, Error, Payload, Schema, TopicMetadata};
 use base64::Engine;
 use prost::Message;
 use serde::{Deserialize, Serialize};
+use std::{collections::HashMap, path::PathBuf};
 use tracing::{error, info};
-
-use super::{Transform, TransformType};
-use crate::{DecodedMessage, Error, Payload, Schema, TopicMetadata};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProtoConvertConfig {
@@ -118,10 +116,9 @@ impl ProtoConvert {
     }
 
     fn compile_schema_internal(&mut self, schema_path: &PathBuf) -> Result<(), Error> {
-        use std::fs;
-
         use protox::file::GoogleFileResolver;
         use protox_parse::parse;
+        use std::fs;
 
         info!(
             "Compiling protobuf schema for conversion from: {:?}",
@@ -725,10 +722,9 @@ impl Default for ProtoConvert {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, path::PathBuf};
-
     use super::*;
     use crate::{DecodedMessage, TopicMetadata};
+    use std::{collections::HashMap, path::PathBuf};
 
     fn create_test_message(payload: Payload) -> DecodedMessage {
         DecodedMessage {

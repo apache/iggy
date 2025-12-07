@@ -16,11 +16,10 @@
  * under the License.
  */
 
-use simd_json::OwnedValue;
-
 use crate::{
     DecodedMessage, Error, Payload, TopicMetadata, transforms::filter_fields::FilterFields,
 };
+use simd_json::OwnedValue;
 
 impl FilterFields {
     pub(crate) fn transform_json(

@@ -16,16 +16,14 @@
  * under the License.
  */
 
-use std::sync::Arc;
-
+use crate::test_server::ClientFactory;
 use async_trait::async_trait;
 use iggy::{
     http::http_client::HttpClient,
     prelude::{ClientWrapper, HttpClientConfig},
 };
 use iggy_common::TransportProtocol;
-
-use crate::test_server::ClientFactory;
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub struct HttpClientFactory {

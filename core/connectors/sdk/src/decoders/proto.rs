@@ -15,17 +15,15 @@
  * under the License.
  */
 
-use std::{collections::HashMap, fs, path::PathBuf};
-
+use crate::{Error, Payload, Schema, StreamDecoder};
 use base64::Engine;
 use prost::Message;
 use prost_types::{Any, field_descriptor_proto::Type};
 use protox::file::GoogleFileResolver;
 use protox_parse::parse;
 use serde::{Deserialize, Serialize};
+use std::{collections::HashMap, fs, path::PathBuf};
 use tracing::{error, info};
-
-use crate::{Error, Payload, Schema, StreamDecoder};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProtoConfig {
@@ -563,11 +561,9 @@ impl Default for ProtoStreamDecoder {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
-    use prost_types::Any;
-
     use super::*;
+    use prost_types::Any;
+    use std::path::PathBuf;
 
     #[test]
     fn decode_should_succeed_given_valid_protobuf_any_message() {
