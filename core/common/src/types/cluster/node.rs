@@ -16,15 +16,17 @@
  * under the License.
  */
 
+use std::fmt::Display;
+
+use bytes::{BufMut, Bytes, BytesMut};
+use serde::{Deserialize, Serialize};
+
 use crate::{
     BytesSerializable, IggyError,
     types::cluster::{
         role::ClusterNodeRole, status::ClusterNodeStatus, transport_endpoints::TransportEndpoints,
     },
 };
-use bytes::{BufMut, Bytes, BytesMut};
-use serde::{Deserialize, Serialize};
-use std::fmt::Display;
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ClusterNode {

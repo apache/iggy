@@ -16,14 +16,20 @@
  * under the License.
  */
 
-use crate::args::CliOptions;
-use crate::error::{CmdToolError, IggyCmdError};
+use std::env::var;
+
 use anyhow::{Context, bail};
-use iggy::clients::client::IggyClient;
-use iggy::prelude::{Args, IggyError, PersonalAccessTokenClient, UserClient};
+use iggy::{
+    clients::client::IggyClient,
+    prelude::{Args, IggyError, PersonalAccessTokenClient, UserClient},
+};
 use iggy_binary_protocol::cli::binary_system::session::ServerSession;
 use passterm::{Stream, isatty, prompt_password_stdin, prompt_password_tty};
-use std::env::var;
+
+use crate::{
+    args::CliOptions,
+    error::{CmdToolError, IggyCmdError},
+};
 
 #[cfg(feature = "login-session")]
 mod credentials_login_session {

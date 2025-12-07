@@ -16,6 +16,10 @@
  * under the License.
  */
 
+use std::str::FromStr;
+
+use iggy::prelude::GlobalPermissions;
+
 use super::constants::{
     MANAGE_SERVERS_LONG, MANAGE_SERVERS_SHORT, MANAGE_STREAMS_LONG, MANAGE_STREAMS_SHORT,
     MANAGE_TOPICS_LONG, MANAGE_TOPICS_SHORT, MANAGE_USERS_LONG, MANAGE_USERS_SHORT,
@@ -23,8 +27,6 @@ use super::constants::{
     READ_STREAMS_LONG, READ_STREAMS_SHORT, READ_TOPICS_LONG, READ_TOPICS_SHORT, READ_USERS_LONG,
     READ_USERS_SHORT, SEND_MESSAGES_LONG, SEND_MESSAGES_SHORT,
 };
-use iggy::prelude::GlobalPermissions;
-use std::str::FromStr;
 
 #[derive(Debug, PartialEq)]
 pub(super) enum GlobalPermission {

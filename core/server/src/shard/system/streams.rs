@@ -16,14 +16,22 @@
  * under the License.
  */
 
-use super::COMPONENT;
-use crate::shard::IggyShard;
-use crate::slab::traits_ext::{DeleteCell, EntityMarker, InsertCell};
-use crate::streaming::session::Session;
-use crate::streaming::streams::storage::{create_stream_file_hierarchy, delete_stream_from_disk};
-use crate::streaming::streams::{self, stream};
 use err_trail::ErrContext;
 use iggy_common::{Identifier, IggyError};
+
+use super::COMPONENT;
+use crate::{
+    shard::IggyShard,
+    slab::traits_ext::{DeleteCell, EntityMarker, InsertCell},
+    streaming::{
+        session::Session,
+        streams::{
+            self,
+            storage::{create_stream_file_hierarchy, delete_stream_from_disk},
+            stream,
+        },
+    },
+};
 
 impl IggyShard {
     pub async fn create_stream(

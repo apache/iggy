@@ -16,60 +16,33 @@
  * under the License.
  */
 
-use crate::define_server_command_enum;
-use crate::shard::IggyShard;
-use crate::streaming::session::Session;
+use std::rc::Rc;
+
 use bytes::{BufMut, Bytes, BytesMut};
 use enum_dispatch::enum_dispatch;
-use iggy_common::SenderKind;
-use iggy_common::change_password::ChangePassword;
-use iggy_common::create_consumer_group::CreateConsumerGroup;
-use iggy_common::create_partitions::CreatePartitions;
-use iggy_common::create_personal_access_token::CreatePersonalAccessToken;
-use iggy_common::create_stream::CreateStream;
-use iggy_common::create_topic::CreateTopic;
-use iggy_common::create_user::CreateUser;
-use iggy_common::delete_consumer_group::DeleteConsumerGroup;
-use iggy_common::delete_consumer_offset::DeleteConsumerOffset;
-use iggy_common::delete_partitions::DeletePartitions;
-use iggy_common::delete_personal_access_token::DeletePersonalAccessToken;
-use iggy_common::delete_segments::DeleteSegments;
-use iggy_common::delete_stream::DeleteStream;
-use iggy_common::delete_topic::DeleteTopic;
-use iggy_common::delete_user::DeleteUser;
-use iggy_common::get_client::GetClient;
-use iggy_common::get_clients::GetClients;
-use iggy_common::get_cluster_metadata::GetClusterMetadata;
-use iggy_common::get_consumer_group::GetConsumerGroup;
-use iggy_common::get_consumer_groups::GetConsumerGroups;
-use iggy_common::get_consumer_offset::GetConsumerOffset;
-use iggy_common::get_me::GetMe;
-use iggy_common::get_personal_access_tokens::GetPersonalAccessTokens;
-use iggy_common::get_snapshot::GetSnapshot;
-use iggy_common::get_stats::GetStats;
-use iggy_common::get_stream::GetStream;
-use iggy_common::get_streams::GetStreams;
-use iggy_common::get_topic::GetTopic;
-use iggy_common::get_topics::GetTopics;
-use iggy_common::get_user::GetUser;
-use iggy_common::get_users::GetUsers;
-use iggy_common::join_consumer_group::JoinConsumerGroup;
-use iggy_common::leave_consumer_group::LeaveConsumerGroup;
-use iggy_common::login_user::LoginUser;
-use iggy_common::login_with_personal_access_token::LoginWithPersonalAccessToken;
-use iggy_common::logout_user::LogoutUser;
-use iggy_common::ping::Ping;
-use iggy_common::purge_stream::PurgeStream;
-use iggy_common::purge_topic::PurgeTopic;
-use iggy_common::store_consumer_offset::StoreConsumerOffset;
-use iggy_common::update_permissions::UpdatePermissions;
-use iggy_common::update_stream::UpdateStream;
-use iggy_common::update_topic::UpdateTopic;
-use iggy_common::update_user::UpdateUser;
-use iggy_common::*;
-use std::rc::Rc;
+use iggy_common::{
+    SenderKind, change_password::ChangePassword, create_consumer_group::CreateConsumerGroup,
+    create_partitions::CreatePartitions, create_personal_access_token::CreatePersonalAccessToken,
+    create_stream::CreateStream, create_topic::CreateTopic, create_user::CreateUser,
+    delete_consumer_group::DeleteConsumerGroup, delete_consumer_offset::DeleteConsumerOffset,
+    delete_partitions::DeletePartitions, delete_personal_access_token::DeletePersonalAccessToken,
+    delete_segments::DeleteSegments, delete_stream::DeleteStream, delete_topic::DeleteTopic,
+    delete_user::DeleteUser, get_client::GetClient, get_clients::GetClients,
+    get_cluster_metadata::GetClusterMetadata, get_consumer_group::GetConsumerGroup,
+    get_consumer_groups::GetConsumerGroups, get_consumer_offset::GetConsumerOffset, get_me::GetMe,
+    get_personal_access_tokens::GetPersonalAccessTokens, get_snapshot::GetSnapshot,
+    get_stats::GetStats, get_stream::GetStream, get_streams::GetStreams, get_topic::GetTopic,
+    get_topics::GetTopics, get_user::GetUser, get_users::GetUsers,
+    join_consumer_group::JoinConsumerGroup, leave_consumer_group::LeaveConsumerGroup,
+    login_user::LoginUser, login_with_personal_access_token::LoginWithPersonalAccessToken,
+    logout_user::LogoutUser, ping::Ping, purge_stream::PurgeStream, purge_topic::PurgeTopic,
+    store_consumer_offset::StoreConsumerOffset, update_permissions::UpdatePermissions,
+    update_stream::UpdateStream, update_topic::UpdateTopic, update_user::UpdateUser, *,
+};
 use strum::EnumString;
 use tracing::error;
+
+use crate::{define_server_command_enum, shard::IggyShard, streaming::session::Session};
 
 define_server_command_enum! {
     Ping(Ping), PING_CODE, PING, false;

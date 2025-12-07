@@ -16,8 +16,9 @@
  * under the License.
  */
 
-use crate::slab::partitions;
 use iggy_common::Identifier;
+
+use crate::slab::partitions;
 
 // Packed namespace layout (works only on 64bit platforms, but we won't support 32bit anyway)
 // +----------------+----------------+----------------+----------------+

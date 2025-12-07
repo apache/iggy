@@ -17,11 +17,12 @@
  */
 
 use core::fmt;
+use std::str::FromStr;
+
 use serde::{
     Deserialize, Deserializer, Serialize, Serializer,
     de::{self, Visitor},
 };
-use std::str::FromStr;
 
 use super::byte_size::IggyByteSize;
 

@@ -16,12 +16,13 @@
  * under the License.
  */
 
-use crate::clients::client::IggyClient;
-use crate::clients::producer::IggyProducer;
-use crate::clients::producer_config::DirectConfig;
-use crate::prelude::{IggyError, IggyExpiry, MaxTopicSize};
-use crate::stream_builder::IggyProducerConfig;
 use tracing::{error, trace};
+
+use crate::{
+    clients::{client::IggyClient, producer::IggyProducer, producer_config::DirectConfig},
+    prelude::{IggyError, IggyExpiry, MaxTopicSize},
+    stream_builder::IggyProducerConfig,
+};
 
 /// Build a producer from the stream configuration.
 ///

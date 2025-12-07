@@ -16,11 +16,11 @@
  * under the License.
  */
 
-use crate::http::http_client::HttpClient;
-use crate::http::http_transport::HttpTransport;
 use async_trait::async_trait;
 use iggy_binary_protocol::ClusterClient;
 use iggy_common::{ClusterMetadata, IggyError};
+
+use crate::http::{http_client::HttpClient, http_transport::HttpTransport};
 
 #[async_trait]
 impl ClusterClient for HttpClient {

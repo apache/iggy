@@ -16,10 +16,11 @@
  * under the License.
  */
 
-use crate::{BytesSerializable, IggyError};
 use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
 use strum::{AsRefStr, Display as StrumDisplay, EnumString};
+
+use crate::{BytesSerializable, IggyError};
 
 /// Node role within the cluster
 #[derive(

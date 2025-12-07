@@ -15,9 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::state::hardware::use_hardware;
 use gloo::console::log;
 use yew::prelude::*;
+
+use crate::state::hardware::use_hardware;
 
 #[derive(Properties, PartialEq)]
 pub struct HardwareSelectorProps {

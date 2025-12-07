@@ -1,5 +1,3 @@
-use crate::shard::IggyShard;
-use crate::streaming;
 /* Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -19,6 +17,8 @@ use crate::streaming;
  */
 use iggy_common::Identifier;
 use iggy_common::IggyError;
+
+use crate::{shard::IggyShard, streaming};
 
 impl IggyShard {
     pub async fn delete_segments_bypass_auth(

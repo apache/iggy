@@ -16,11 +16,11 @@
  * under the License.
  */
 
-use crate::prelude::IggyClient;
 use async_trait::async_trait;
 use iggy_binary_protocol::StreamClient;
-use iggy_common::locking::IggyRwLockFn;
-use iggy_common::{Identifier, IggyError, Stream, StreamDetails};
+use iggy_common::{Identifier, IggyError, Stream, StreamDetails, locking::IggyRwLockFn};
+
+use crate::prelude::IggyClient;
 
 #[async_trait]
 impl StreamClient for IggyClient {

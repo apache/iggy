@@ -16,17 +16,18 @@
  * under the License.
  */
 
-use crate::cli::common::{
-    CLAP_INDENT, IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestHelpCmd, USAGE_PREFIX,
-};
+use std::time::Duration;
+
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
-use humantime::Duration as HumanDuration;
-use humantime::format_duration;
+use humantime::{Duration as HumanDuration, format_duration};
 use iggy::prelude::Client;
 use predicates::str::starts_with;
 use serial_test::parallel;
-use std::time::Duration;
+
+use crate::cli::common::{
+    CLAP_INDENT, IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestHelpCmd, USAGE_PREFIX,
+};
 
 struct TestPatCreateCmd {
     name: String,

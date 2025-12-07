@@ -15,14 +15,24 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::shard::task_registry::TaskRegistry;
-use crate::streaming::partitions as streaming_partitions;
-use crate::streaming::partitions::consumer_offset::ConsumerOffset;
-use crate::streaming::stats::StreamStats;
+use std::{
+    cell::RefCell,
+    rc::Rc,
+    sync::{Arc, atomic::Ordering},
+};
+
+use ahash::AHashMap;
+use err_trail::ErrContext;
+use iggy_common::{Identifier, IggyError, IggyTimestamp, PollingKind};
+use slab::Slab;
+use tracing::error;
+
 use crate::{
     binary::handlers::messages::poll_messages_handler::IggyPollMetadata,
     configs::{cache_indexes::CacheIndexesConfig, system::SystemConfig},
-    shard::{namespace::IggyFullNamespace, system::messages::PollingArgs},
+    shard::{
+        namespace::IggyFullNamespace, system::messages::PollingArgs, task_registry::TaskRegistry,
+    },
     slab::{
         Keyed,
         consumer_groups::ConsumerGroups,
@@ -35,7 +45,9 @@ use crate::{
         },
     },
     streaming::{
+        partitions as streaming_partitions,
         partitions::{
+            consumer_offset::ConsumerOffset,
             journal::Journal,
             partition::{PartitionRef, PartitionRefMut},
         },
@@ -43,6 +55,7 @@ use crate::{
         segments::{
             IggyMessagesBatchMut, IggyMessagesBatchSet, Segment, storage::create_segment_storage,
         },
+        stats::StreamStats,
         streams::{
             self,
             stream::{self, StreamRef, StreamRefMut},
@@ -55,16 +68,6 @@ use crate::{
         traits::MainOps,
     },
 };
-use ahash::AHashMap;
-use err_trail::ErrContext;
-use iggy_common::{Identifier, IggyError, IggyTimestamp, PollingKind};
-use slab::Slab;
-use std::{
-    cell::RefCell,
-    rc::Rc,
-    sync::{Arc, atomic::Ordering},
-};
-use tracing::error;
 
 const CAPACITY: usize = 1024;
 pub type ContainerId = usize;

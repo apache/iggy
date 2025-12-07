@@ -15,18 +15,23 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::api::fetch_benchmark_report_full;
-use crate::components::chart::{PlotConfig, dispose_chart};
-use crate::components::selectors::measurement_type_selector::MeasurementType;
 use bench_report::report::BenchmarkReport;
-use charming::theme::Theme;
-use charming::{Echarts, WasmRenderer};
-use gloo::console::log;
-use gloo::history::{BrowserHistory, History};
+use charming::{Echarts, WasmRenderer, theme::Theme};
+use gloo::{
+    console::log,
+    history::{BrowserHistory, History},
+};
 use uuid::Uuid;
-use yew::platform::spawn_local;
-use yew::prelude::*;
+use yew::{platform::spawn_local, prelude::*};
 use yew_hooks::use_size;
+
+use crate::{
+    api::fetch_benchmark_report_full,
+    components::{
+        chart::{PlotConfig, dispose_chart},
+        selectors::measurement_type_selector::MeasurementType,
+    },
+};
 
 type CleanupFn = Box<dyn FnOnce()>;
 

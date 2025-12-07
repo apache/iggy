@@ -16,22 +16,23 @@
  * under the License.
  */
 
-use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
-use crate::binary::handlers::consumer_groups::COMPONENT;
-use crate::binary::handlers::utils::receive_and_validate;
+use std::rc::Rc;
 
-use crate::shard::IggyShard;
-use crate::shard::transmission::event::ShardEvent;
-use crate::slab::traits_ext::EntityMarker;
-use crate::state::command::EntryCommand;
-use crate::streaming::polling_consumer::ConsumerGroupId;
-use crate::streaming::session::Session;
 use anyhow::Result;
 use err_trail::ErrContext;
-use iggy_common::delete_consumer_group::DeleteConsumerGroup;
-use iggy_common::{IggyError, SenderKind};
-use std::rc::Rc;
+use iggy_common::{IggyError, SenderKind, delete_consumer_group::DeleteConsumerGroup};
 use tracing::{debug, instrument};
+
+use crate::{
+    binary::{
+        command::{BinaryServerCommand, ServerCommand, ServerCommandHandler},
+        handlers::{consumer_groups::COMPONENT, utils::receive_and_validate},
+    },
+    shard::{IggyShard, transmission::event::ShardEvent},
+    slab::traits_ext::EntityMarker,
+    state::command::EntryCommand,
+    streaming::{polling_consumer::ConsumerGroupId, session::Session},
+};
 
 impl ServerCommandHandler for DeleteConsumerGroup {
     fn code(&self) -> u32 {

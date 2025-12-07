@@ -16,9 +16,11 @@
  * under the License.
  */
 
-use crate::utils::{byte_size::IggyByteSize, duration::IggyDuration, timestamp::IggyTimestamp};
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+
+use serde::{Deserialize, Serialize};
+
+use crate::utils::{byte_size::IggyByteSize, duration::IggyDuration, timestamp::IggyTimestamp};
 
 /// `Stats` represents the statistics and details of the server and running process.
 #[derive(Debug, Serialize, Deserialize)]
@@ -105,9 +107,11 @@ pub struct CacheMetrics {
 }
 
 mod cache_metrics_serializer {
-    use super::*;
-    use serde::{Deserialize, Deserializer, Serializer};
     use std::collections::HashMap;
+
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    use super::*;
 
     pub fn serialize<S>(
         metrics: &HashMap<CacheMetricsKey, CacheMetrics>,

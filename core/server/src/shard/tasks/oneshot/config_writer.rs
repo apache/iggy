@@ -15,12 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::shard::IggyShard;
+use std::rc::Rc;
+
 use compio::io::AsyncWriteAtExt;
 use err_trail::ErrContext;
 use iggy_common::IggyError;
-use std::rc::Rc;
 use tracing::info;
+
+use crate::shard::IggyShard;
 
 pub fn spawn_config_writer_task(shard: &Rc<IggyShard>) {
     let shard_clone = shard.clone();

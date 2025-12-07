@@ -15,8 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use bench_report::hardware::BenchmarkHardware;
 use std::rc::Rc;
+
+use bench_report::hardware::BenchmarkHardware;
 use yew::prelude::*;
 
 #[derive(Clone, Debug, PartialEq, Default)]

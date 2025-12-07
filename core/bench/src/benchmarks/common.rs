@@ -16,6 +16,13 @@
  * under the License.
  */
 
+use std::{future::Future, sync::Arc};
+
+use bench_report::{benchmark_kind::BenchmarkKind, individual_metrics::BenchmarkIndividualMetrics};
+use iggy::prelude::*;
+use integration::test_server::{ClientFactory, login_root};
+use tracing::{error, info};
+
 use super::{CONSUMER_GROUP_BASE_ID, CONSUMER_GROUP_NAME_PREFIX};
 use crate::{
     actors::{
@@ -26,11 +33,6 @@ use crate::{
     args::common::IggyBenchArgs,
     utils::finish_condition::{BenchmarkFinishCondition, BenchmarkFinishConditionMode},
 };
-use bench_report::{benchmark_kind::BenchmarkKind, individual_metrics::BenchmarkIndividualMetrics};
-use iggy::prelude::*;
-use integration::test_server::{ClientFactory, login_root};
-use std::{future::Future, sync::Arc};
-use tracing::{error, info};
 
 pub async fn create_consumer(
     client: &IggyClient,

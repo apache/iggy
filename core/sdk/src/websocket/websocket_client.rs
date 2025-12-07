@@ -16,13 +16,8 @@
  * under the License.
  */
 
-use crate::leader_aware::{LeaderRedirectionState, check_and_redirect_to_leader};
-use crate::websocket::websocket_connection_stream::WebSocketConnectionStream;
-use crate::websocket::websocket_stream_kind::WebSocketStreamKind;
-use crate::websocket::websocket_tls_connection_stream::WebSocketTlsConnectionStream;
-use rustls::{ClientConfig, pki_types::pem::PemObject};
+use std::{net::SocketAddr, sync::Arc};
 
-use crate::prelude::Client;
 use async_broadcast::{Receiver, Sender, broadcast};
 use async_trait::async_trait;
 use bytes::{BufMut, Bytes, BytesMut};
@@ -32,16 +27,23 @@ use iggy_common::{
     IggyError, IggyErrorDiscriminants, IggyTimestamp, WebSocketClientConfig,
     WebSocketConnectionStringOptions,
 };
-use std::net::SocketAddr;
-use std::sync::Arc;
-use tokio::net::TcpStream;
-use tokio::sync::Mutex;
-use tokio::time::sleep;
+use rustls::{ClientConfig, pki_types::pem::PemObject};
+use tokio::{net::TcpStream, sync::Mutex, time::sleep};
 use tokio_tungstenite::{
     Connector, client_async_with_config, connect_async_tls_with_config,
     tungstenite::client::IntoClientRequest,
 };
 use tracing::{debug, error, info, trace, warn};
+
+use crate::{
+    leader_aware::{LeaderRedirectionState, check_and_redirect_to_leader},
+    prelude::Client,
+    websocket::{
+        websocket_connection_stream::WebSocketConnectionStream,
+        websocket_stream_kind::WebSocketStreamKind,
+        websocket_tls_connection_stream::WebSocketTlsConnectionStream,
+    },
+};
 
 const REQUEST_INITIAL_BYTES_LENGTH: usize = 4;
 const RESPONSE_INITIAL_BYTES_LENGTH: usize = 8;
@@ -634,8 +636,9 @@ impl WebSocketClient {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::str::FromStr;
+
+    use super::*;
 
     #[test]
     fn should_be_created_with_default_config() {

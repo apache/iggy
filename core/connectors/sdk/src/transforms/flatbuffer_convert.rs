@@ -16,15 +16,16 @@
  * under the License.
  */
 
+use std::{collections::HashMap, path::PathBuf};
+
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::path::PathBuf;
 
 use super::{Transform, TransformType};
-use crate::decoders::flatbuffer::{FlatBufferConfig, FlatBufferStreamDecoder};
-use crate::encoders::flatbuffer::{FlatBufferEncoderConfig, FlatBufferStreamEncoder};
-use crate::{DecodedMessage, Error, Payload, Schema, TopicMetadata};
-use crate::{StreamDecoder, StreamEncoder};
+use crate::{
+    DecodedMessage, Error, Payload, Schema, StreamDecoder, StreamEncoder, TopicMetadata,
+    decoders::flatbuffer::{FlatBufferConfig, FlatBufferStreamDecoder},
+    encoders::flatbuffer::{FlatBufferEncoderConfig, FlatBufferStreamEncoder},
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FlatBufferConvertConfig {

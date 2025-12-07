@@ -16,13 +16,16 @@
  * under the License.
  */
 
-use crate::clients::consumer::{AutoCommit, AutoCommitAfter, IggyConsumer};
-use crate::consumer_ext::{IggyConsumerMessageExt, MessageConsumer};
-use crate::prelude::IggyError;
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use tokio::sync::oneshot;
 use tracing::{error, info, trace};
+
+use crate::{
+    clients::consumer::{AutoCommit, AutoCommitAfter, IggyConsumer},
+    consumer_ext::{IggyConsumerMessageExt, MessageConsumer},
+    prelude::IggyError,
+};
 
 #[async_trait]
 impl<'a> IggyConsumerMessageExt<'a> for IggyConsumer {

@@ -15,11 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::marker::PhantomData;
+
+use bytes::Bytes;
+
 use crate::types::consensus::header::{
     self, CommitHeader, ConsensusHeader, GenericHeader, PrepareHeader, ReplyHeader,
 };
-use bytes::Bytes;
-use std::marker::PhantomData;
 
 #[derive(Debug, Clone)]
 pub struct Message<H: ConsensusHeader> {

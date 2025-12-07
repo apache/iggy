@@ -16,33 +16,36 @@
  * under the License.
  */
 
-use crate::configs::http::{HttpConfig, HttpCorsConfig};
-use crate::http::diagnostics::request_diagnostics;
-use crate::http::http_shard_wrapper::HttpSafeShard;
-use crate::http::jwt::jwt_manager::JwtManager;
-use crate::http::jwt::middleware::jwt_auth;
-use crate::http::metrics::metrics;
-use crate::http::shared::AppState;
-use crate::http::*;
-use crate::shard::IggyShard;
-use crate::shard::task_registry::ShutdownToken;
-use crate::shard::tasks::periodic::spawn_jwt_token_cleaner;
-use crate::shard::transmission::event::ShardEvent;
-use crate::streaming::persistence::persister::PersisterKind;
-use axum::extract::DefaultBodyLimit;
-use axum::extract::connect_info::Connected;
-use axum::http::Method;
-use axum::{Router, middleware};
+use std::{net::SocketAddr, path::PathBuf, rc::Rc, sync::Arc};
+
+use axum::{
+    Router,
+    extract::{DefaultBodyLimit, connect_info::Connected},
+    http::Method,
+    middleware,
+};
 use axum_server::tls_rustls::RustlsConfig;
 use compio_net::TcpListener;
-use iggy_common::IggyError;
-use iggy_common::TransportProtocol;
-use std::net::SocketAddr;
-use std::path::PathBuf;
-use std::rc::Rc;
-use std::sync::Arc;
+use iggy_common::{IggyError, TransportProtocol};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::{error, info};
+
+use crate::{
+    configs::http::{HttpConfig, HttpCorsConfig},
+    http::{
+        diagnostics::request_diagnostics,
+        http_shard_wrapper::HttpSafeShard,
+        jwt::{jwt_manager::JwtManager, middleware::jwt_auth},
+        metrics::metrics,
+        shared::AppState,
+        *,
+    },
+    shard::{
+        IggyShard, task_registry::ShutdownToken, tasks::periodic::spawn_jwt_token_cleaner,
+        transmission::event::ShardEvent,
+    },
+    streaming::persistence::persister::PersisterKind,
+};
 
 #[derive(Debug, Clone, Copy)]
 pub struct CompioSocketAddr(pub SocketAddr);
@@ -168,8 +171,9 @@ pub async fn start_http_server(
         info!("Started {api_name} on: {address}");
 
         // Notify shard about the bound address
-        use crate::shard::transmission::event::ShardEvent;
         use iggy_common::TransportProtocol;
+
+        use crate::shard::transmission::event::ShardEvent;
         let event = ShardEvent::AddressBound {
             protocol: TransportProtocol::Http,
             address,

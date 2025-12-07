@@ -16,8 +16,9 @@
  * under the License.
  */
 
-use iggy::prelude::*;
 use std::str::FromStr;
+
+use iggy::prelude::*;
 
 const IGGY_URL: &str = "iggy://iggy:iggy@localhost:8090";
 

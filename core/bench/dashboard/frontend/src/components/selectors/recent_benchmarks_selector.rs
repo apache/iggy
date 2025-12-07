@@ -15,15 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::{
-    api,
-    state::benchmark::{BenchmarkAction, use_benchmark},
-};
 use bench_dashboard_shared::BenchmarkReportLight;
 use chrono::{DateTime, Utc};
 use gloo::console::log;
 use yew::prelude::*;
 use yew_hooks::use_async;
+
+use crate::{
+    api,
+    state::benchmark::{BenchmarkAction, use_benchmark},
+};
 
 /// Format a timestamp string as a human-readable relative time (e.g., "2 hours ago")
 fn format_relative_time(timestamp_str: &str) -> String {

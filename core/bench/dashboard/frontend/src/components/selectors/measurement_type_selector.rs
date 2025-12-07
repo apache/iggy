@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::fmt::Display;
-use std::str::FromStr;
+use std::{fmt::Display, str::FromStr};
+
 use yew::prelude::*;
 
 #[derive(Clone, Debug, PartialEq)]

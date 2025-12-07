@@ -16,17 +16,18 @@
  * under the License.
  */
 
-use compio::fs::File;
-use compio::fs::OpenOptions;
-use compio::io::AsyncWriteAtExt;
-use err_trail::ErrContext;
-use iggy_common::INDEX_SIZE;
-use iggy_common::IggyError;
-use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use tracing::trace;
+use std::{
+    rc::Rc,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
-use iggy_common::PooledBuffer;
+use compio::{
+    fs::{File, OpenOptions},
+    io::AsyncWriteAtExt,
+};
+use err_trail::ErrContext;
+use iggy_common::{INDEX_SIZE, IggyError, PooledBuffer};
+use tracing::trace;
 
 /// A dedicated struct for writing to the index file.
 #[derive(Debug)]

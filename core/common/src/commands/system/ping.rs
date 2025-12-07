@@ -16,13 +16,12 @@
  * under the License.
  */
 
-use crate::BytesSerializable;
-use crate::Validatable;
-use crate::error::IggyError;
-use crate::{Command, PING_CODE};
+use std::fmt::Display;
+
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-use std::fmt::Display;
+
+use crate::{BytesSerializable, Command, PING_CODE, Validatable, error::IggyError};
 
 /// `Ping` command is used to check if the server is alive.
 /// It has no additional payload.

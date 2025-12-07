@@ -16,30 +16,30 @@
  * under the License.
  */
 
-use crate::http::COMPONENT;
-use crate::http::error::CustomError;
-use crate::http::jwt::json_web_token::Identity;
-use crate::http::mapper;
-use crate::http::shared::AppState;
-use crate::slab::traits_ext::{EntityComponentSystem, EntityMarker, IntoComponents};
-use crate::state::command::EntryCommand;
-use crate::state::models::CreateConsumerGroupWithId;
-use crate::streaming::polling_consumer::ConsumerGroupId;
-use crate::streaming::session::Session;
-use axum::debug_handler;
-use axum::extract::{Path, State};
-use axum::http::StatusCode;
-use axum::routing::get;
-use axum::{Extension, Json, Router};
-use err_trail::ErrContext;
-use iggy_common::Identifier;
-use iggy_common::Validatable;
-use iggy_common::create_consumer_group::CreateConsumerGroup;
-use iggy_common::delete_consumer_group::DeleteConsumerGroup;
-use iggy_common::{ConsumerGroup, ConsumerGroupDetails};
-use send_wrapper::SendWrapper;
 use std::sync::Arc;
+
+use axum::{
+    Extension, Json, Router, debug_handler,
+    extract::{Path, State},
+    http::StatusCode,
+    routing::get,
+};
+use err_trail::ErrContext;
+use iggy_common::{
+    ConsumerGroup, ConsumerGroupDetails, Identifier, Validatable,
+    create_consumer_group::CreateConsumerGroup, delete_consumer_group::DeleteConsumerGroup,
+};
+use send_wrapper::SendWrapper;
 use tracing::instrument;
+
+use crate::{
+    http::{
+        COMPONENT, error::CustomError, jwt::json_web_token::Identity, mapper, shared::AppState,
+    },
+    slab::traits_ext::{EntityComponentSystem, EntityMarker, IntoComponents},
+    state::{command::EntryCommand, models::CreateConsumerGroupWithId},
+    streaming::{polling_consumer::ConsumerGroupId, session::Session},
+};
 
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()

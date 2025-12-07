@@ -16,13 +16,17 @@
  * under the License.
  */
 
+use std::fmt;
+
+use serde::{
+    Deserialize, Deserializer, Serialize,
+    de::{self, MapAccess, Visitor},
+};
+
 use super::{
     individual_metrics_summary::BenchmarkIndividualMetricsSummary, time_series::TimeSeries,
 };
 use crate::utils::{max, min, std_dev};
-use serde::de::{self, MapAccess, Visitor};
-use serde::{Deserialize, Deserializer, Serialize};
-use std::fmt;
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct BenchmarkIndividualMetrics {

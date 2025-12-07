@@ -16,13 +16,15 @@
  * under the License.
  */
 
-use crate::server::scenarios::create_client;
+use std::sync::Arc;
+
 use futures::future::join_all;
 use iggy::prelude::*;
 use iggy_common::UserInfo;
 use integration::test_server::{ClientFactory, login_root};
-use std::sync::Arc;
 use tokio::sync::Barrier;
+
+use crate::server::scenarios::create_client;
 
 const OPERATIONS_COUNT: usize = 40;
 const MULTIPLE_CLIENT_COUNT: usize = 10;

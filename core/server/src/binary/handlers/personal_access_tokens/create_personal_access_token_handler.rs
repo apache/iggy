@@ -16,22 +16,23 @@
  * under the License.
  */
 
-use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
-use crate::binary::handlers::personal_access_tokens::COMPONENT;
-use crate::binary::handlers::utils::receive_and_validate;
-use crate::binary::mapper;
+use std::rc::Rc;
 
-use crate::shard::IggyShard;
-use crate::shard::transmission::event::ShardEvent;
-use crate::state::command::EntryCommand;
-use crate::state::models::CreatePersonalAccessTokenWithHash;
-use crate::streaming::session::Session;
 use anyhow::Result;
 use err_trail::ErrContext;
-use iggy_common::create_personal_access_token::CreatePersonalAccessToken;
-use iggy_common::{IggyError, SenderKind};
-use std::rc::Rc;
+use iggy_common::{IggyError, SenderKind, create_personal_access_token::CreatePersonalAccessToken};
 use tracing::{debug, instrument};
+
+use crate::{
+    binary::{
+        command::{BinaryServerCommand, ServerCommand, ServerCommandHandler},
+        handlers::{personal_access_tokens::COMPONENT, utils::receive_and_validate},
+        mapper,
+    },
+    shard::{IggyShard, transmission::event::ShardEvent},
+    state::{command::EntryCommand, models::CreatePersonalAccessTokenWithHash},
+    streaming::session::Session,
+};
 
 impl ServerCommandHandler for CreatePersonalAccessToken {
     fn code(&self) -> u32 {

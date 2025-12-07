@@ -16,21 +16,24 @@
  * under the License.
  */
 
-use super::bootstrap_test_environment;
-use crate::streaming::common::test_setup::TestSetup;
+use std::{collections::HashMap, str::FromStr, thread::sleep};
+
 use bytes::BytesMut;
 use iggy::prelude::*;
-use server::configs::cache_indexes::CacheIndexesConfig;
-use server::configs::system::{PartitionConfig, SegmentConfig, SystemConfig};
-use server::shard::namespace::IggyFullNamespace;
-use server::shard::system::messages::PollingArgs;
-use server::streaming::polling_consumer::PollingConsumer;
-use server::streaming::segments::IggyMessagesBatchMut;
-use server::streaming::traits::MainOps;
-use std::collections::HashMap;
-use std::str::FromStr;
-use std::thread::sleep;
+use server::{
+    configs::{
+        cache_indexes::CacheIndexesConfig,
+        system::{PartitionConfig, SegmentConfig, SystemConfig},
+    },
+    shard::{namespace::IggyFullNamespace, system::messages::PollingArgs},
+    streaming::{
+        polling_consumer::PollingConsumer, segments::IggyMessagesBatchMut, traits::MainOps,
+    },
+};
 use test_case::test_matrix;
+
+use super::bootstrap_test_environment;
+use crate::streaming::common::test_setup::TestSetup;
 
 /*
  * Below helper functions are here only to make test function name more readable.

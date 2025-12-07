@@ -16,12 +16,16 @@
  * under the License.
  */
 
-use crate::test_server::ClientFactory;
-use async_trait::async_trait;
-use iggy::prelude::{Client, ClientWrapper, WebSocketClientConfig};
-use iggy::websocket::websocket_client::WebSocketClient;
-use iggy_common::TransportProtocol;
 use std::sync::Arc;
+
+use async_trait::async_trait;
+use iggy::{
+    prelude::{Client, ClientWrapper, WebSocketClientConfig},
+    websocket::websocket_client::WebSocketClient,
+};
+use iggy_common::TransportProtocol;
+
+use crate::test_server::ClientFactory;
 
 #[derive(Debug, Clone)]
 pub struct WebSocketClientFactory {

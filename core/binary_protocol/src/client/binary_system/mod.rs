@@ -16,18 +16,15 @@
  * under the License.
  */
 
-use crate::utils::auth::fail_if_not_authenticated;
-use crate::utils::mapper;
-use crate::{BinaryClient, SystemClient};
-use iggy_common::get_client::GetClient;
-use iggy_common::get_clients::GetClients;
-use iggy_common::get_me::GetMe;
-use iggy_common::get_snapshot::GetSnapshot;
-use iggy_common::get_stats::GetStats;
-use iggy_common::ping::Ping;
 use iggy_common::{
     ClientInfo, ClientInfoDetails, IggyDuration, IggyError, Snapshot, SnapshotCompression, Stats,
-    SystemSnapshotType,
+    SystemSnapshotType, get_client::GetClient, get_clients::GetClients, get_me::GetMe,
+    get_snapshot::GetSnapshot, get_stats::GetStats, ping::Ping,
+};
+
+use crate::{
+    BinaryClient, SystemClient,
+    utils::{auth::fail_if_not_authenticated, mapper},
 };
 
 #[async_trait::async_trait]

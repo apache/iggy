@@ -16,30 +16,28 @@
  * under the License.
  */
 
-use crate::http::COMPONENT;
-use crate::http::error::CustomError;
-use crate::http::jwt::json_web_token::Identity;
-use crate::http::shared::AppState;
-use crate::slab::traits_ext::{EntityComponentSystem, IntoComponents};
-use crate::streaming::session::Session;
-use axum::extract::{Path, State};
-use axum::http::StatusCode;
-use axum::routing::{delete, get};
-use axum::{Extension, Json, Router, debug_handler};
-use err_trail::ErrContext;
-use iggy_common::Identifier;
-use iggy_common::Validatable;
-use iggy_common::create_stream::CreateStream;
-use iggy_common::delete_stream::DeleteStream;
-use iggy_common::purge_stream::PurgeStream;
-use iggy_common::update_stream::UpdateStream;
-use iggy_common::{Stream, StreamDetails};
-use send_wrapper::SendWrapper;
-
-use crate::state::command::EntryCommand;
-use crate::state::models::CreateStreamWithId;
 use std::sync::Arc;
+
+use axum::{
+    Extension, Json, Router, debug_handler,
+    extract::{Path, State},
+    http::StatusCode,
+    routing::{delete, get},
+};
+use err_trail::ErrContext;
+use iggy_common::{
+    Identifier, Stream, StreamDetails, Validatable, create_stream::CreateStream,
+    delete_stream::DeleteStream, purge_stream::PurgeStream, update_stream::UpdateStream,
+};
+use send_wrapper::SendWrapper;
 use tracing::instrument;
+
+use crate::{
+    http::{COMPONENT, error::CustomError, jwt::json_web_token::Identity, shared::AppState},
+    slab::traits_ext::{EntityComponentSystem, IntoComponents},
+    state::{command::EntryCommand, models::CreateStreamWithId},
+    streaming::session::Session,
+};
 
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()

@@ -16,9 +16,10 @@
  * under the License.
  */
 
+use std::str::FromStr;
+
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
-use std::str::FromStr;
 use strum::Display;
 
 #[serde_as]

@@ -17,11 +17,12 @@
  * under the License.
  */
 
+use std::env;
+
 use iggy_common::ConfigProvider;
 use integration::file::get_root_path;
 use serial_test::serial;
 use server::configs::server::ServerConfig;
-use std::env;
 
 #[serial]
 #[tokio::test]

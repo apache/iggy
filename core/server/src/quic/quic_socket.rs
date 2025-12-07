@@ -15,9 +15,9 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+use std::{net::SocketAddr, num::TryFromIntError};
+
 use socket2::{Domain, Protocol, Socket, Type};
-use std::net::SocketAddr;
-use std::num::TryFromIntError;
 
 use crate::configs::quic::QuicSocketConfig;
 

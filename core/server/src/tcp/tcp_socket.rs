@@ -16,8 +16,9 @@
  * under the License.
  */
 
-use socket2::{Domain, Protocol, Socket, Type};
 use std::num::TryFromIntError;
+
+use socket2::{Domain, Protocol, Socket, Type};
 
 use crate::configs::tcp::TcpSocketConfig;
 

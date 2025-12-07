@@ -22,6 +22,8 @@ mod general;
 mod scenarios;
 mod specific;
 
+use std::{collections::HashMap, future::Future, pin::Pin};
+
 use iggy_common::TransportProtocol;
 use integration::{
     http_client::HttpClientFactory,
@@ -37,8 +39,6 @@ use scenarios::{
     consumer_group_with_single_client_polling_messages_scenario, create_message_payload,
     message_headers_scenario, stream_size_validation_scenario, system_scenario, user_scenario,
 };
-use std::pin::Pin;
-use std::{collections::HashMap, future::Future};
 
 type ScenarioFn = fn(&dyn ClientFactory) -> Pin<Box<dyn Future<Output = ()> + '_>>;
 

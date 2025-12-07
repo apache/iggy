@@ -15,8 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::{ConnectionStringOptions, IggyDuration, IggyError, WebSocketClientReconnectionConfig};
 use std::str::FromStr;
+
+use crate::{ConnectionStringOptions, IggyDuration, IggyError, WebSocketClientReconnectionConfig};
 
 #[derive(Debug, Clone)]
 pub struct WebSocketConnectionStringOptions {

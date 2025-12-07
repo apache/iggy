@@ -16,25 +16,25 @@
  * under the License.
  */
 
-use crate::configs::tcp::TcpSocketConfig;
-use crate::shard::IggyShard;
-use crate::shard::task_registry::ShutdownToken;
-use crate::shard::transmission::event::ShardEvent;
-use crate::tcp::connection_handler::{handle_connection, handle_error};
+use std::{io::BufReader, net::SocketAddr, rc::Rc, sync::Arc, time::Duration};
+
 use compio::net::{TcpListener, TcpOpts};
 use compio_tls::TlsAcceptor;
 use err_trail::ErrContext;
 use futures::FutureExt;
 use iggy_common::{IggyError, SenderKind, TransportProtocol};
-use rustls::ServerConfig;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::{
+    ServerConfig,
+    pki_types::{CertificateDer, PrivateKeyDer},
+};
 use rustls_pemfile::{certs, private_key};
-use std::io::BufReader;
-use std::net::SocketAddr;
-use std::rc::Rc;
-use std::sync::Arc;
-use std::time::Duration;
 use tracing::{error, info, trace, warn};
+
+use crate::{
+    configs::tcp::TcpSocketConfig,
+    shard::{IggyShard, task_registry::ShutdownToken, transmission::event::ShardEvent},
+    tcp::connection_handler::{handle_connection, handle_error},
+};
 
 pub(crate) async fn start(
     server_name: &'static str,

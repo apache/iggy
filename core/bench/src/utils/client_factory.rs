@@ -16,15 +16,15 @@
  * under the License.
  */
 
-use crate::args::common::IggyBenchArgs;
-use crate::args::transport::BenchmarkTransportCommand;
-use iggy::prelude::TransportProtocol;
-use integration::http_client::HttpClientFactory;
-use integration::quic_client::QuicClientFactory;
-use integration::tcp_client::TcpClientFactory;
-use integration::test_server::ClientFactory;
-use integration::websocket_client::WebSocketClientFactory;
 use std::sync::Arc;
+
+use iggy::prelude::TransportProtocol;
+use integration::{
+    http_client::HttpClientFactory, quic_client::QuicClientFactory, tcp_client::TcpClientFactory,
+    test_server::ClientFactory, websocket_client::WebSocketClientFactory,
+};
+
+use crate::args::{common::IggyBenchArgs, transport::BenchmarkTransportCommand};
 
 pub fn create_client_factory(args: &IggyBenchArgs) -> Arc<dyn ClientFactory> {
     match &args.transport() {

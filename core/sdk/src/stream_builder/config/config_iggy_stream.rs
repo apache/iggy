@@ -16,9 +16,12 @@
  * under the License.
  */
 
-use crate::prelude::{Identifier, IggyDuration, IggyError};
-use crate::stream_builder::{IggyConsumerConfig, IggyProducerConfig};
 use bon::Builder;
+
+use crate::{
+    prelude::{Identifier, IggyDuration, IggyError},
+    stream_builder::{IggyConsumerConfig, IggyProducerConfig},
+};
 
 #[derive(Builder, Default, Debug, Clone)]
 pub struct IggyStreamConfig {
@@ -106,8 +109,9 @@ impl IggyStreamConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::str::FromStr;
+
+    use super::*;
 
     #[test]
     fn should_be_equal() {

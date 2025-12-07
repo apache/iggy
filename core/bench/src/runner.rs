@@ -16,20 +16,24 @@
  * under the License.
  */
 
-use crate::analytics::report_builder::BenchmarkReportBuilder;
-use crate::args::common::IggyBenchArgs;
-use crate::benchmarks::benchmark::Benchmarkable;
-use crate::plot::{ChartType, plot_chart};
-use crate::utils::cpu_name::append_cpu_name_lowercase;
-use crate::utils::server_starter::start_server_if_needed;
-use crate::utils::{collect_server_logs_and_save_to_file, params_from_args_and_metrics};
+use std::{path::Path, time::Duration};
+
 use bench_report::hardware::BenchmarkHardware;
 use iggy::prelude::IggyError;
 use integration::test_server::TestServer;
-use std::path::Path;
-use std::time::Duration;
 use tokio::time::sleep;
 use tracing::{error, info};
+
+use crate::{
+    analytics::report_builder::BenchmarkReportBuilder,
+    args::common::IggyBenchArgs,
+    benchmarks::benchmark::Benchmarkable,
+    plot::{ChartType, plot_chart},
+    utils::{
+        collect_server_logs_and_save_to_file, cpu_name::append_cpu_name_lowercase,
+        params_from_args_and_metrics, server_starter::start_server_if_needed,
+    },
+};
 
 pub struct BenchmarkRunner {
     pub args: Option<IggyBenchArgs>,

@@ -18,18 +18,19 @@
 
 use std::rc::Rc;
 
-use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
-use crate::binary::handlers::users::COMPONENT;
-use crate::binary::handlers::utils::receive_and_validate;
-
-use crate::shard::IggyShard;
-use crate::streaming::session::Session;
 use anyhow::Result;
 use err_trail::ErrContext;
-use iggy_common::logout_user::LogoutUser;
-use iggy_common::{IggyError, SenderKind};
-use tracing::info;
-use tracing::{debug, instrument};
+use iggy_common::{IggyError, SenderKind, logout_user::LogoutUser};
+use tracing::{debug, info, instrument};
+
+use crate::{
+    binary::{
+        command::{BinaryServerCommand, ServerCommand, ServerCommandHandler},
+        handlers::{users::COMPONENT, utils::receive_and_validate},
+    },
+    shard::IggyShard,
+    streaming::session::Session,
+};
 
 impl ServerCommandHandler for LogoutUser {
     fn code(&self) -> u32 {

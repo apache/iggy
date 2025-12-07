@@ -16,9 +16,6 @@
  * under the License.
  */
 
-use crate::server::scenarios::concurrent_scenario::{
-    self, ResourceType, ScenarioType, barrier_off, barrier_on,
-};
 use iggy_common::TransportProtocol;
 use integration::{
     http_client::HttpClientFactory, quic_client::QuicClientFactory, tcp_client::TcpClientFactory,
@@ -26,6 +23,10 @@ use integration::{
 };
 use serial_test::parallel;
 use test_case::test_matrix;
+
+use crate::server::scenarios::concurrent_scenario::{
+    self, ResourceType, ScenarioType, barrier_off, barrier_on,
+};
 
 // Test matrix for race condition scenarios
 // Tests all combinations of:

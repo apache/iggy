@@ -16,15 +16,15 @@
  * under the License.
  */
 
-use crate::BytesSerializable;
-use crate::Identifier;
-use crate::Sizeable;
-use crate::Validatable;
-use crate::error::IggyError;
-use crate::{Command, PURGE_TOPIC_CODE};
+use std::fmt::Display;
+
 use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
-use std::fmt::Display;
+
+use crate::{
+    BytesSerializable, Command, Identifier, PURGE_TOPIC_CODE, Sizeable, Validatable,
+    error::IggyError,
+};
 
 /// `PurgeTopic` command is used to purge topic data (its messages in all the partitions) from a stream.
 /// It has additional payload:

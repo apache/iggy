@@ -17,15 +17,18 @@
  * under the License.
  */
 
+use std::{
+    collections::HashMap,
+    fs::{self, File, OpenOptions},
+    io::Write,
+    net::{Ipv4Addr, SocketAddr, TcpListener},
+    path::PathBuf,
+    process::{Child, Command, Stdio},
+    time::Duration,
+};
+
 use assert_cmd::prelude::CommandCargoExt;
 use rand::Rng;
-use std::fs::{self, File, OpenOptions};
-use std::io::Write;
-use std::net::{Ipv4Addr, SocketAddr};
-use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
-use std::time::Duration;
-use std::{collections::HashMap, net::TcpListener};
 use tokio::time::sleep;
 use uuid::Uuid;
 
@@ -142,8 +145,7 @@ impl TestConnectorsRuntime {
         if let Some(mut child_handle) = self.child_handle.take() {
             #[cfg(unix)]
             unsafe {
-                use libc::SIGTERM;
-                use libc::kill;
+                use libc::{SIGTERM, kill};
                 kill(child_handle.id() as libc::pid_t, SIGTERM);
             }
 

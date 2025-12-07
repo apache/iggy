@@ -16,13 +16,15 @@
  * under the License.
  */
 
-use crate::prelude::{
-    CompressionAlgorithm, IdKind, Identifier, IggyClient, IggyError, IggyExpiry, MaxTopicSize,
-    StreamClient, TopicClient,
-};
-
-use crate::stream_builder::IggyConsumerConfig;
 use tracing::{trace, warn};
+
+use crate::{
+    prelude::{
+        CompressionAlgorithm, IdKind, Identifier, IggyClient, IggyError, IggyExpiry, MaxTopicSize,
+        StreamClient, TopicClient,
+    },
+    stream_builder::IggyConsumerConfig,
+};
 
 /// Builds an `IggyStream` and `IggyTopic` if any of them does not exists
 /// and if the boolean flags to create them are set to true. In that case it will build

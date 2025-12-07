@@ -16,6 +16,8 @@
  * under the License.
  */
 
+use std::{env, str::FromStr};
+
 use chrono::{DateTime, Days, Utc};
 use iggy::prelude::{
     Client, DirectConfig, IggyClient, IggyClientBuilder, IggyDuration, IggyError, IggyMessage,
@@ -26,7 +28,6 @@ use rand::{
     distr::{Alphanumeric, Uniform},
 };
 use serde::{Deserialize, Serialize};
-use std::{env, str::FromStr};
 use thiserror::Error;
 use tracing::info;
 use tracing_subscriber::{EnvFilter, Registry, layer::SubscriberExt, util::SubscriberInitExt};

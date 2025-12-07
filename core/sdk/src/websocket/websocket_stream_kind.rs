@@ -16,10 +16,12 @@
  * under the License.
  */
 
-use crate::websocket::websocket_connection_stream::WebSocketConnectionStream;
-use crate::websocket::websocket_stream::ConnectionStream;
-use crate::websocket::websocket_tls_connection_stream::WebSocketTlsConnectionStream;
 use iggy_common::IggyError;
+
+use crate::websocket::{
+    websocket_connection_stream::WebSocketConnectionStream, websocket_stream::ConnectionStream,
+    websocket_tls_connection_stream::WebSocketTlsConnectionStream,
+};
 
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]

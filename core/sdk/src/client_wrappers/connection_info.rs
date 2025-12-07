@@ -16,8 +16,9 @@
  * under the License.
  */
 
-use crate::client_wrappers::client_wrapper::ClientWrapper;
 use iggy_common::TransportProtocol;
+
+use crate::client_wrappers::client_wrapper::ClientWrapper;
 
 /// Connection information for the current client connection
 #[derive(Debug, Clone)]

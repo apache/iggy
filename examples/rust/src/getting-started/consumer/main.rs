@@ -16,15 +16,12 @@
  * under the License.
  */
 
+use std::{env, error::Error, str::FromStr};
+
 use iggy::prelude::*;
-use std::env;
-use std::error::Error;
-use std::str::FromStr;
 use tokio::time::sleep;
 use tracing::info;
-use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{EnvFilter, Registry};
+use tracing_subscriber::{EnvFilter, Registry, layer::SubscriberExt, util::SubscriberInitExt};
 
 const STREAM_ID: u32 = 0;
 const TOPIC_ID: u32 = 0;

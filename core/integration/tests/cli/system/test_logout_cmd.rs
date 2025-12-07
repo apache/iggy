@@ -16,12 +16,13 @@
  * under the License.
  */
 
-use crate::cli::common::{IggyCmdCommand, IggyCmdTestCase};
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
 use iggy::prelude::Client;
 use iggy_binary_protocol::cli::binary_system::session::ServerSession;
 use predicates::str::diff;
+
+use crate::cli::common::{IggyCmdCommand, IggyCmdTestCase};
 
 #[derive(Debug)]
 pub(super) struct TestLogoutCmd {

@@ -16,12 +16,12 @@
  * under the License.
  */
 
-use crate::state::command::EntryCommand;
-use bytes::{Buf, BufMut, Bytes, BytesMut};
-use iggy_common::IggyError;
-use iggy_common::IggyTimestamp;
-use iggy_common::{BytesSerializable, calculate_checksum};
 use std::fmt::{Display, Formatter};
+
+use bytes::{Buf, BufMut, Bytes, BytesMut};
+use iggy_common::{BytesSerializable, IggyError, IggyTimestamp, calculate_checksum};
+
+use crate::state::command::EntryCommand;
 
 /// State entry in the log
 /// - `index` - Index (operation number) of the entry in the log

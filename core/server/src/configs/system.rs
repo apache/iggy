@@ -16,21 +16,17 @@
  * under the License.
  */
 
-use crate::configs::server::MemoryPoolConfig;
-use crate::slab::partitions;
-use crate::slab::streams;
-use crate::slab::topics;
-
-use super::cache_indexes::CacheIndexesConfig;
-use super::sharding::ShardingConfig;
-use iggy_common::IggyByteSize;
-use iggy_common::IggyError;
-use iggy_common::IggyExpiry;
-use iggy_common::MaxTopicSize;
-use iggy_common::{CompressionAlgorithm, IggyDuration};
+use iggy_common::{
+    CompressionAlgorithm, IggyByteSize, IggyDuration, IggyError, IggyExpiry, MaxTopicSize,
+};
 use serde::{Deserialize, Serialize};
-use serde_with::DisplayFromStr;
-use serde_with::serde_as;
+use serde_with::{DisplayFromStr, serde_as};
+
+use super::{cache_indexes::CacheIndexesConfig, sharding::ShardingConfig};
+use crate::{
+    configs::server::MemoryPoolConfig,
+    slab::{partitions, streams, topics},
+};
 
 pub const INDEX_EXTENSION: &str = "index";
 pub const LOG_EXTENSION: &str = "log";

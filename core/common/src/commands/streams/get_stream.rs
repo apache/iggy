@@ -16,14 +16,14 @@
  * under the License.
  */
 
-use crate::BytesSerializable;
-use crate::Identifier;
-use crate::Validatable;
-use crate::error::IggyError;
-use crate::{Command, GET_STREAM_CODE};
+use std::fmt::Display;
+
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-use std::fmt::Display;
+
+use crate::{
+    BytesSerializable, Command, GET_STREAM_CODE, Identifier, Validatable, error::IggyError,
+};
 
 /// `GetStream` command is used to retrieve the information about a stream by unique ID.
 /// It has additional payload:

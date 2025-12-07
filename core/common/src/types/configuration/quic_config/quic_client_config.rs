@@ -16,11 +16,12 @@
  * under the License.
  */
 
+use std::str::FromStr;
+
 use crate::{
     AutoLogin, ConnectionString, ConnectionStringOptions, IggyDuration,
     QuicClientReconnectionConfig, QuicConnectionStringOptions,
 };
-use std::str::FromStr;
 
 /// Configuration for the QUIC client.
 #[derive(Debug, Clone)]

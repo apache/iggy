@@ -16,6 +16,8 @@
  * under the License.
  */
 
+use std::{collections::HashMap, str::FromStr};
+
 use bytes::Bytes;
 use iggy::prelude::*;
 use integration::{
@@ -23,7 +25,6 @@ use integration::{
     test_server::{ClientFactory, IpAddrKind, SYSTEM_PATH_ENV_VAR, TestServer, login_root},
 };
 use serial_test::parallel;
-use std::{collections::HashMap, str::FromStr};
 use test_case::test_matrix;
 
 fn encryption_enabled() -> bool {

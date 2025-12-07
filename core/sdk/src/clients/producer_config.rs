@@ -15,12 +15,16 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-use crate::clients::MIB;
-use crate::clients::producer_error_callback::{ErrorCallback, LogErrorCallback};
-use crate::clients::producer_sharding::{BalancedSharding, Sharding};
+use std::sync::Arc;
+
 use bon::Builder;
 use iggy_common::{IggyByteSize, IggyDuration};
-use std::sync::Arc;
+
+use crate::clients::{
+    MIB,
+    producer_error_callback::{ErrorCallback, LogErrorCallback},
+    producer_sharding::{BalancedSharding, Sharding},
+};
 
 /// Determines how the `send_messages` API should behave when problem is encountered
 #[derive(Debug, Clone)]

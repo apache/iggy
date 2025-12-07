@@ -20,8 +20,9 @@ pub(crate) mod common;
 pub(crate) mod helpers;
 pub(crate) mod steps;
 
-use crate::common::global_context::GlobalContext;
 use cucumber::World;
+
+use crate::common::global_context::GlobalContext;
 
 #[tokio::main]
 async fn main() {

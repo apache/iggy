@@ -16,26 +16,30 @@
  * under the License.
  */
 
-use crate::http::COMPONENT;
-use crate::http::error::CustomError;
-use crate::http::jwt::json_web_token::Identity;
-use crate::http::shared::AppState;
-use crate::shard::system::messages::PollingArgs;
-use crate::streaming::segments::{IggyIndexesMut, IggyMessagesBatchMut};
-use crate::streaming::session::Session;
-use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
-use axum::routing::get;
-use axum::{Extension, Json, Router, debug_handler};
-use err_trail::ErrContext;
-use iggy_common::Identifier;
-use iggy_common::PooledBuffer;
-use iggy_common::Validatable;
-use iggy_common::{Consumer, PollMessages, SendMessages};
-use iggy_common::{IggyMessagesBatch, PolledMessages};
-use send_wrapper::SendWrapper;
 use std::sync::Arc;
+
+use axum::{
+    Extension, Json, Router, debug_handler,
+    extract::{Path, Query, State},
+    http::StatusCode,
+    routing::get,
+};
+use err_trail::ErrContext;
+use iggy_common::{
+    Consumer, Identifier, IggyMessagesBatch, PollMessages, PolledMessages, PooledBuffer,
+    SendMessages, Validatable,
+};
+use send_wrapper::SendWrapper;
 use tracing::instrument;
+
+use crate::{
+    http::{COMPONENT, error::CustomError, jwt::json_web_token::Identity, shared::AppState},
+    shard::system::messages::PollingArgs,
+    streaming::{
+        segments::{IggyIndexesMut, IggyMessagesBatchMut},
+        session::Session,
+    },
+};
 
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()

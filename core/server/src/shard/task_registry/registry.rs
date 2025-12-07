@@ -15,15 +15,19 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::shutdown::{Shutdown, ShutdownToken};
+use std::{
+    cell::RefCell,
+    collections::HashMap,
+    ops::{AsyncFn, AsyncFnOnce},
+    time::{Duration, Instant},
+};
+
 use compio::runtime::JoinHandle;
 use futures::future::join_all;
 use iggy_common::IggyError;
-use std::cell::RefCell;
-use std::collections::HashMap;
-use std::ops::{AsyncFn, AsyncFnOnce};
-use std::time::{Duration, Instant};
 use tracing::{debug, error, trace, warn};
+
+use super::shutdown::{Shutdown, ShutdownToken};
 
 #[derive(Debug)]
 enum Kind {

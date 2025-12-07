@@ -16,15 +16,19 @@
  * under the License.
  */
 
-use super::defaults::{
-    DEFAULT_HTTP_SERVER_ADDRESS, DEFAULT_QUIC_CLIENT_ADDRESS, DEFAULT_QUIC_SERVER_ADDRESS,
-    DEFAULT_QUIC_SERVER_NAME, DEFAULT_QUIC_VALIDATE_CERTIFICATE, DEFAULT_TCP_SERVER_ADDRESS,
-    DEFAULT_WEBSOCKET_SERVER_ADDRESS,
-};
-use super::{output::BenchmarkOutputCommand, props::BenchmarkTransportProps};
 use clap::{Parser, Subcommand};
 use iggy::prelude::TransportProtocol;
 use serde::{Serialize, Serializer};
+
+use super::{
+    defaults::{
+        DEFAULT_HTTP_SERVER_ADDRESS, DEFAULT_QUIC_CLIENT_ADDRESS, DEFAULT_QUIC_SERVER_ADDRESS,
+        DEFAULT_QUIC_SERVER_NAME, DEFAULT_QUIC_VALIDATE_CERTIFICATE, DEFAULT_TCP_SERVER_ADDRESS,
+        DEFAULT_WEBSOCKET_SERVER_ADDRESS,
+    },
+    output::BenchmarkOutputCommand,
+    props::BenchmarkTransportProps,
+};
 
 #[derive(Subcommand, Debug, Clone)]
 pub enum BenchmarkTransportCommand {

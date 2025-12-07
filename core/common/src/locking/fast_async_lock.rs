@@ -16,9 +16,11 @@
  * under the License.
  */
 
-use crate::locking::IggyRwLockFn;
-use fast_async_mutex::rwlock::{RwLock as FastAsyncRwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::sync::Arc;
+
+use fast_async_mutex::rwlock::{RwLock as FastAsyncRwLock, RwLockReadGuard, RwLockWriteGuard};
+
+use crate::locking::IggyRwLockFn;
 
 #[derive(Debug)]
 pub struct IggyFastAsyncRwLock<T>(Arc<FastAsyncRwLock<T>>);

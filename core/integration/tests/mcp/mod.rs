@@ -16,6 +16,8 @@
  * under the License.
  */
 
+use std::collections::HashMap;
+
 use iggy::prelude::{Client, DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME, IggyClient};
 use iggy_binary_protocol::{
     ConsumerGroupClient, ConsumerOffsetClient, MessageClient, PersonalAccessTokenClient,
@@ -40,7 +42,6 @@ use rmcp::{
     serde_json::{self, json},
 };
 use serial_test::parallel;
-use std::collections::HashMap;
 
 const STREAM_NAME: &str = "test_stream";
 const TOPIC_NAME: &str = "test_topic";

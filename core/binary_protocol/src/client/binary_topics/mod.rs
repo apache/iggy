@@ -16,17 +16,15 @@
  * under the License.
  */
 
-use crate::utils::auth::fail_if_not_authenticated;
-use crate::utils::mapper;
-use crate::{BinaryClient, TopicClient};
-use iggy_common::create_topic::CreateTopic;
-use iggy_common::delete_topic::DeleteTopic;
-use iggy_common::get_topic::GetTopic;
-use iggy_common::get_topics::GetTopics;
-use iggy_common::purge_topic::PurgeTopic;
-use iggy_common::update_topic::UpdateTopic;
 use iggy_common::{
     CompressionAlgorithm, Identifier, IggyError, IggyExpiry, MaxTopicSize, Topic, TopicDetails,
+    create_topic::CreateTopic, delete_topic::DeleteTopic, get_topic::GetTopic,
+    get_topics::GetTopics, purge_topic::PurgeTopic, update_topic::UpdateTopic,
+};
+
+use crate::{
+    BinaryClient, TopicClient,
+    utils::{auth::fail_if_not_authenticated, mapper},
 };
 
 #[async_trait::async_trait]

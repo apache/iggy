@@ -27,26 +27,6 @@
 //! use iggy::prelude::*;
 //! ```
 
-pub use crate::client_provider;
-pub use crate::client_provider::ClientProviderConfig;
-pub use crate::client_wrappers::client_wrapper::ClientWrapper;
-pub use crate::client_wrappers::connection_info::ConnectionInfo;
-pub use crate::clients::client::IggyClient;
-pub use crate::clients::client_builder::IggyClientBuilder;
-pub use crate::clients::consumer::{
-    AutoCommit, AutoCommitAfter, AutoCommitWhen, IggyConsumer, ReceivedMessage,
-};
-pub use crate::clients::consumer_builder::IggyConsumerBuilder;
-pub use crate::clients::producer::IggyProducer;
-pub use crate::clients::producer_builder::IggyProducerBuilder;
-pub use crate::clients::producer_config::{BackgroundConfig, DirectConfig};
-pub use crate::consumer_ext::IggyConsumerMessageExt;
-pub use crate::stream_builder::IggyConsumerConfig;
-pub use crate::stream_builder::IggyStreamConsumer;
-pub use crate::stream_builder::{IggyProducerConfig, IggyStreamProducer};
-pub use crate::stream_builder::{IggyStream, IggyStreamConfig};
-pub use crate::tcp::tcp_client::TcpClient;
-pub use crate::websocket::websocket_client::WebSocketClient;
 pub use iggy_binary_protocol::{
     Client, ClusterClient, ConsumerGroupClient, ConsumerOffsetClient, MessageClient,
     PartitionClient, PersonalAccessTokenClient, SegmentClient, StreamClient, SystemClient,
@@ -57,22 +37,42 @@ pub use iggy_common::{
     CacheMetricsKey, ClientError, ClientInfoDetails, ClusterMetadata, ClusterNode, ClusterNodeRole,
     ClusterNodeStatus, CompressionAlgorithm, Consumer, ConsumerGroupDetails, ConsumerKind,
     EncryptorKind, FlushUnsavedBuffer, GlobalPermissions, HeaderKey, HeaderValue, HttpClientConfig,
-    HttpClientConfigBuilder, IdKind, Identifier, IdentityInfo, IggyByteSize, IggyDuration,
-    IggyError, IggyExpiry, IggyIndexView, IggyMessage, IggyMessageHeader, IggyMessageHeaderView,
-    IggyMessageView, IggyMessageViewIterator, IggyTimestamp, MaxTopicSize, Partition, Partitioner,
-    Partitioning, Permissions, PersonalAccessTokenExpiry, PollMessages, PolledMessages,
-    PollingKind, PollingStrategy, QuicClientConfig, QuicClientConfigBuilder,
-    QuicClientReconnectionConfig, SendMessages, Sizeable, SnapshotCompression, Stats, Stream,
-    StreamDetails, StreamPermissions, SystemSnapshotType, TcpClientConfig, TcpClientConfigBuilder,
-    TcpClientReconnectionConfig, Topic, TopicDetails, TopicPermissions, TransportEndpoints,
-    TransportProtocol, UserId, UserStatus, Validatable, WebSocketClientConfig,
-    WebSocketClientConfigBuilder, WebSocketClientReconnectionConfig, defaults, locking,
-};
-pub use iggy_common::{
-    IGGY_MESSAGE_CHECKSUM_OFFSET_RANGE, IGGY_MESSAGE_HEADER_SIZE,
+    HttpClientConfigBuilder, IGGY_MESSAGE_CHECKSUM_OFFSET_RANGE, IGGY_MESSAGE_HEADER_SIZE,
     IGGY_MESSAGE_HEADERS_LENGTH_OFFSET_RANGE, IGGY_MESSAGE_ID_OFFSET_RANGE,
     IGGY_MESSAGE_OFFSET_OFFSET_RANGE, IGGY_MESSAGE_ORIGIN_TIMESTAMP_OFFSET_RANGE,
     IGGY_MESSAGE_PAYLOAD_LENGTH_OFFSET_RANGE, IGGY_MESSAGE_TIMESTAMP_OFFSET_RANGE, INDEX_SIZE,
-    MAX_PAYLOAD_SIZE, MAX_USER_HEADERS_SIZE, SEC_IN_MICRO,
+    IdKind, Identifier, IdentityInfo, IggyByteSize, IggyDuration, IggyError, IggyExpiry,
+    IggyIndexView, IggyMessage, IggyMessageHeader, IggyMessageHeaderView, IggyMessageView,
+    IggyMessageViewIterator, IggyTimestamp, MAX_PAYLOAD_SIZE, MAX_USER_HEADERS_SIZE, MaxTopicSize,
+    Partition, Partitioner, Partitioning, Permissions, PersonalAccessTokenExpiry, PollMessages,
+    PolledMessages, PollingKind, PollingStrategy, QuicClientConfig, QuicClientConfigBuilder,
+    QuicClientReconnectionConfig, SEC_IN_MICRO, SendMessages, Sizeable, SnapshotCompression, Stats,
+    Stream, StreamDetails, StreamPermissions, SystemSnapshotType, TcpClientConfig,
+    TcpClientConfigBuilder, TcpClientReconnectionConfig, Topic, TopicDetails, TopicPermissions,
+    TransportEndpoints, TransportProtocol, UserId, UserStatus, Validatable, WebSocketClientConfig,
+    WebSocketClientConfigBuilder, WebSocketClientReconnectionConfig, defaults,
     defaults::{DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USER_ID, DEFAULT_ROOT_USERNAME},
+    locking,
+};
+
+pub use crate::{
+    client_provider,
+    client_provider::ClientProviderConfig,
+    client_wrappers::{client_wrapper::ClientWrapper, connection_info::ConnectionInfo},
+    clients::{
+        client::IggyClient,
+        client_builder::IggyClientBuilder,
+        consumer::{AutoCommit, AutoCommitAfter, AutoCommitWhen, IggyConsumer, ReceivedMessage},
+        consumer_builder::IggyConsumerBuilder,
+        producer::IggyProducer,
+        producer_builder::IggyProducerBuilder,
+        producer_config::{BackgroundConfig, DirectConfig},
+    },
+    consumer_ext::IggyConsumerMessageExt,
+    stream_builder::{
+        IggyConsumerConfig, IggyProducerConfig, IggyStream, IggyStreamConfig, IggyStreamConsumer,
+        IggyStreamProducer,
+    },
+    tcp::tcp_client::TcpClient,
+    websocket::websocket_client::WebSocketClient,
 };

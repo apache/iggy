@@ -16,16 +16,17 @@
  * under the License.
  */
 
-use crate::binary::command::{BinaryServerCommand, ServerCommandHandler};
-use crate::shard::IggyShard;
-use crate::streaming::session::Session;
-use anyhow::Result;
-use iggy_common::IggyError;
-use iggy_common::IggyTimestamp;
-use iggy_common::SenderKind;
-use iggy_common::ping::Ping;
 use std::rc::Rc;
+
+use anyhow::Result;
+use iggy_common::{IggyError, IggyTimestamp, SenderKind, ping::Ping};
 use tracing::debug;
+
+use crate::{
+    binary::command::{BinaryServerCommand, ServerCommandHandler},
+    shard::IggyShard,
+    streaming::session::Session,
+};
 
 impl ServerCommandHandler for Ping {
     fn code(&self) -> u32 {

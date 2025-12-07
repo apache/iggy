@@ -16,15 +16,17 @@
  * under the License.
  */
 
-use crate::context::RuntimeContext;
-use axum::body::Body;
-use axum::extract::State;
+use std::sync::Arc;
+
 use axum::{
+    body::Body,
+    extract::State,
     http::{Request, StatusCode},
     middleware::Next,
     response::Response,
 };
-use std::sync::Arc;
+
+use crate::context::RuntimeContext;
 
 const API_KEY_HEADER: &str = "api-key";
 const PUBLIC_PATHS: &[&str] = &["/", "/health"];

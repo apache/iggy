@@ -16,8 +16,9 @@
  * under the License.
  */
 
-use crate::IggyDuration;
 use std::str::FromStr;
+
+use crate::IggyDuration;
 
 #[derive(Debug, Clone)]
 pub struct QuicClientReconnectionConfig {

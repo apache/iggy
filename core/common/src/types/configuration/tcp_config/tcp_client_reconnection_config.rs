@@ -15,8 +15,9 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-use crate::IggyDuration;
 use std::str::FromStr;
+
+use crate::IggyDuration;
 
 #[derive(Debug, Clone)]
 pub struct TcpClientReconnectionConfig {

@@ -16,36 +16,32 @@
  * under the License.
  */
 
-use crate::http::COMPONENT;
-use crate::http::error::CustomError;
-use crate::http::jwt::json_web_token::Identity;
-use crate::http::mapper;
-use crate::http::mapper::map_generated_access_token_to_identity_info;
-use crate::http::shared::AppState;
-use crate::state::command::EntryCommand;
-use crate::state::models::CreateUserWithId;
-use crate::streaming::session::Session;
-use crate::streaming::users::user::User;
-use crate::streaming::utils::crypto;
-use ::iggy_common::change_password::ChangePassword;
-use ::iggy_common::create_user::CreateUser;
-use ::iggy_common::delete_user::DeleteUser;
-use ::iggy_common::login_user::LoginUser;
-use ::iggy_common::update_permissions::UpdatePermissions;
-use ::iggy_common::update_user::UpdateUser;
-use axum::extract::{Path, State};
-use axum::http::StatusCode;
-use axum::routing::{delete, get, post, put};
-use axum::{Extension, Json, Router, debug_handler};
+use std::sync::Arc;
+
+use ::iggy_common::{
+    change_password::ChangePassword, create_user::CreateUser, delete_user::DeleteUser,
+    login_user::LoginUser, update_permissions::UpdatePermissions, update_user::UpdateUser,
+};
+use axum::{
+    Extension, Json, Router, debug_handler,
+    extract::{Path, State},
+    http::StatusCode,
+    routing::{delete, get, post, put},
+};
 use err_trail::ErrContext;
-use iggy_common::Identifier;
-use iggy_common::IdentityInfo;
-use iggy_common::Validatable;
-use iggy_common::{UserInfo, UserInfoDetails};
+use iggy_common::{Identifier, IdentityInfo, UserInfo, UserInfoDetails, Validatable};
 use send_wrapper::SendWrapper;
 use serde::Deserialize;
-use std::sync::Arc;
 use tracing::instrument;
+
+use crate::{
+    http::{
+        COMPONENT, error::CustomError, jwt::json_web_token::Identity, mapper,
+        mapper::map_generated_access_token_to_identity_info, shared::AppState,
+    },
+    state::{command::EntryCommand, models::CreateUserWithId},
+    streaming::{session::Session, users::user::User, utils::crypto},
+};
 
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()

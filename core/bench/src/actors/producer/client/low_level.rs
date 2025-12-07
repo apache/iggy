@@ -18,6 +18,10 @@
 
 use std::sync::Arc;
 
+use iggy::prelude::*;
+use integration::test_server::{ClientFactory, login_root};
+use tokio::time::Instant;
+
 use crate::{
     actors::{
         ApiLabel, BatchMetrics, BenchmarkInit,
@@ -28,9 +32,6 @@ use crate::{
     },
     utils::batch_generator::BenchmarkBatchGenerator,
 };
-use iggy::prelude::*;
-use integration::test_server::{ClientFactory, login_root};
-use tokio::time::Instant;
 
 pub struct LowLevelProducerClient {
     client_factory: Arc<dyn ClientFactory>,

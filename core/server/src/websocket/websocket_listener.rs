@@ -16,21 +16,21 @@
  * under the License.
  */
 
-use crate::configs::websocket::WebSocketConfig;
-use crate::shard::IggyShard;
-use crate::shard::task_registry::ShutdownToken;
-use crate::shard::transmission::event::ShardEvent;
-use crate::websocket::connection_handler::{handle_connection, handle_error};
+use std::{net::SocketAddr, rc::Rc};
+
 use compio::net::TcpListener;
 use compio_net::TcpOpts;
 use compio_ws::accept_async_with_config;
 use err_trail::ErrContext;
 use futures::FutureExt;
-use iggy_common::TransportProtocol;
-use iggy_common::{IggyError, SenderKind, WebSocketSender};
-use std::net::SocketAddr;
-use std::rc::Rc;
+use iggy_common::{IggyError, SenderKind, TransportProtocol, WebSocketSender};
 use tracing::{debug, error, info};
+
+use crate::{
+    configs::websocket::WebSocketConfig,
+    shard::{IggyShard, task_registry::ShutdownToken, transmission::event::ShardEvent},
+    websocket::connection_handler::{handle_connection, handle_error},
+};
 
 async fn create_listener(addr: SocketAddr) -> Result<TcpListener, std::io::Error> {
     // Required by the thread-per-core model...

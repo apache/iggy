@@ -16,26 +16,23 @@
  * under the License.
  */
 
-use super::kind::BenchmarkKindCommand;
-use super::output::BenchmarkOutputCommand;
-use super::props::{BenchmarkKindProps, BenchmarkTransportProps};
+use std::{net::SocketAddr, num::NonZeroU32, path::Path, str::FromStr};
+
+use bench_report::{benchmark_kind::BenchmarkKind, numeric_parameter::BenchmarkNumericParameter};
+use clap::{CommandFactory, Parser, error::ErrorKind};
+use iggy::prelude::{IggyByteSize, IggyDuration, TransportProtocol};
+
 use super::{
     defaults::{
         DEFAULT_MESSAGE_BATCHES, DEFAULT_MESSAGE_SIZE, DEFAULT_MESSAGES_PER_BATCH,
         DEFAULT_MOVING_AVERAGE_WINDOW, DEFAULT_PERFORM_CLEANUP, DEFAULT_SAMPLING_TIME,
         DEFAULT_SERVER_STDOUT_VISIBILITY, DEFAULT_SKIP_SERVER_START, DEFAULT_WARMUP_TIME,
     },
+    kind::BenchmarkKindCommand,
+    output::BenchmarkOutputCommand,
+    props::{BenchmarkKindProps, BenchmarkTransportProps},
     transport::BenchmarkTransportCommand,
 };
-use bench_report::benchmark_kind::BenchmarkKind;
-use bench_report::numeric_parameter::BenchmarkNumericParameter;
-use clap::error::ErrorKind;
-use clap::{CommandFactory, Parser};
-use iggy::prelude::{IggyByteSize, IggyDuration, TransportProtocol};
-use std::net::SocketAddr;
-use std::num::NonZeroU32;
-use std::path::Path;
-use std::str::FromStr;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]

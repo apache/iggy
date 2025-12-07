@@ -15,10 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::configs::system::SystemConfig;
-use crate::shard::task_registry::TaskRegistry;
-use std::future::Future;
-use std::rc::Rc;
+use std::{future::Future, rc::Rc};
+
+use crate::{configs::system::SystemConfig, shard::task_registry::TaskRegistry};
 
 // TODO: Major revision of this trait.
 pub trait MainOps {

@@ -15,10 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::{cell::RefCell, sync::Arc};
+
 use ahash::AHashMap;
 use iggy_common::Identifier;
 use slab::Slab;
-use std::{cell::RefCell, sync::Arc};
 
 use crate::{
     slab::{

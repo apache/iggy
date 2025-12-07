@@ -16,14 +16,14 @@
  * under the License.
  */
 
-use crate::BytesSerializable;
-use crate::error::IggyError;
+use std::fmt::Display;
+
 use ahash::AHashMap;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use comfy_table::Table;
-use comfy_table::presets::ASCII_NO_BORDERS;
+use comfy_table::{Table, presets::ASCII_NO_BORDERS};
 use serde::{Deserialize, Serialize};
-use std::fmt::Display;
+
+use crate::{BytesSerializable, error::IggyError};
 
 /// `Permissions` is used to define the permissions of a user.
 /// It consists of global permissions and stream permissions.

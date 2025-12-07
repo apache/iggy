@@ -16,16 +16,15 @@
  * under the License.
  */
 
-use super::HeaderValue;
-use super::message_header::*;
-use crate::BytesSerializable;
-use crate::IggyByteSize;
-use crate::Sizeable;
-use crate::error::IggyError;
-use crate::utils::checksum;
-use crate::{HeaderKey, IggyMessageHeaderView};
-use bytes::{Bytes, BytesMut};
 use std::{collections::HashMap, iter::Iterator};
+
+use bytes::{Bytes, BytesMut};
+
+use super::{HeaderValue, message_header::*};
+use crate::{
+    BytesSerializable, HeaderKey, IggyByteSize, IggyMessageHeaderView, Sizeable, error::IggyError,
+    utils::checksum,
+};
 
 /// A immutable view of a message.
 #[derive(Debug)]

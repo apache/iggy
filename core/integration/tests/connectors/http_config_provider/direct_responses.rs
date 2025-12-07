@@ -16,8 +16,9 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-use crate::connectors::http_config_provider::WireMockMode;
 use reqwest::StatusCode;
+
+use crate::connectors::http_config_provider::WireMockMode;
 
 #[tokio::test]
 async fn test_source_configs_list_returns_all_versions() {

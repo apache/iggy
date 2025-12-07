@@ -15,8 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use gloo::console::log;
 use std::rc::Rc;
+
+use gloo::console::log;
 use yew::prelude::*;
 
 #[derive(Clone, Debug, PartialEq, Default)]

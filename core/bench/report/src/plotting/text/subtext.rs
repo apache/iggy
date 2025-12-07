@@ -16,11 +16,12 @@
  * under the License.
  */
 
+use human_repr::HumanCount;
+
 use crate::{
     benchmark_kind::BenchmarkKind, group_metrics::BenchmarkGroupMetrics,
     group_metrics_kind::GroupMetricsKind, report::BenchmarkReport,
 };
-use human_repr::HumanCount;
 
 impl BenchmarkReport {
     pub fn subtext(&self) -> String {

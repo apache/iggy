@@ -16,19 +16,20 @@
  * under the License.
  */
 
-use crate::BytesSerializable;
-use crate::Sizeable;
-use crate::Validatable;
-use crate::error::IggyError;
-use crate::utils::byte_size::IggyByteSize;
+use std::{
+    borrow::Cow,
+    fmt::Display,
+    hash::{Hash, Hasher},
+    str::FromStr,
+};
+
 use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
-use serde_with::base64::Base64;
-use serde_with::serde_as;
-use std::borrow::Cow;
-use std::fmt::Display;
-use std::hash::{Hash, Hasher};
-use std::str::FromStr;
+use serde_with::{base64::Base64, serde_as};
+
+use crate::{
+    BytesSerializable, Sizeable, Validatable, error::IggyError, utils::byte_size::IggyByteSize,
+};
 
 /// `Identifier` represents the unique identifier of the resources such as stream, topic, partition, user etc.
 /// It consists of the following fields:

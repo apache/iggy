@@ -16,22 +16,25 @@
  * under the License.
  */
 
-use super::COMPONENT;
-use crate::shard::IggyShard;
-use crate::slab::consumer_groups;
-use crate::slab::traits_ext::EntityMarker;
-use crate::slab::traits_ext::Insert;
-use crate::streaming::partitions;
-use crate::streaming::session::Session;
-use crate::streaming::streams;
-use crate::streaming::topics;
-use crate::streaming::topics::consumer_group;
-use crate::streaming::topics::consumer_group::MEMBERS_CAPACITY;
 use arcshift::ArcShift;
 use err_trail::ErrContext;
-use iggy_common::Identifier;
-use iggy_common::IggyError;
+use iggy_common::{Identifier, IggyError};
 use slab::Slab;
+
+use super::COMPONENT;
+use crate::{
+    shard::IggyShard,
+    slab::{
+        consumer_groups,
+        traits_ext::{EntityMarker, Insert},
+    },
+    streaming::{
+        partitions,
+        session::Session,
+        streams, topics,
+        topics::{consumer_group, consumer_group::MEMBERS_CAPACITY},
+    },
+};
 
 impl IggyShard {
     pub fn create_consumer_group(

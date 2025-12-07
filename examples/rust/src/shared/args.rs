@@ -16,10 +16,10 @@
  * under the License.
  */
 
-use clap::Parser;
-use iggy::prelude::IggyDuration;
-use iggy::prelude::{DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME};
 use std::str::FromStr;
+
+use clap::Parser;
+use iggy::prelude::{DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME, IggyDuration};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]

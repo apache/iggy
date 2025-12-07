@@ -16,22 +16,24 @@
  * under the License.
  */
 
-use crate::http::http_transport::HttpTransport;
-use crate::prelude::{Client, HttpClientConfig, IggyDuration, IggyError};
+use std::{ops::Deref, str::FromStr, sync::Arc};
+
 use async_broadcast::{Receiver, Sender, broadcast};
 use async_trait::async_trait;
-use iggy_common::locking::{IggyRwLock, IggyRwLockFn};
 use iggy_common::{
     ConnectionString, ConnectionStringUtils, DiagnosticEvent, HttpConnectionStringOptions,
     IdentityInfo, TransportProtocol,
+    locking::{IggyRwLock, IggyRwLockFn},
 };
 use reqwest::{Response, StatusCode, Url};
 use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
 use reqwest_retry::{RetryTransientMiddleware, policies::ExponentialBackoff};
 use serde::Serialize;
-use std::ops::Deref;
-use std::str::FromStr;
-use std::sync::Arc;
+
+use crate::{
+    http::http_transport::HttpTransport,
+    prelude::{Client, HttpClientConfig, IggyDuration, IggyError},
+};
 
 const PUBLIC_PATHS: &[&str] = &[
     "/",

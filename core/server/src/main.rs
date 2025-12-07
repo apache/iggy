@@ -17,6 +17,19 @@
  * under the License.
  */
 
+use std::{
+    collections::HashSet,
+    panic::AssertUnwindSafe,
+    rc::Rc,
+    str::FromStr,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+        mpsc,
+    },
+    thread::JoinHandle,
+};
+
 use anyhow::Result;
 use clap::Parser;
 use dashmap::DashMap;
@@ -24,39 +37,32 @@ use dotenvy::dotenv;
 use err_trail::ErrContext;
 use figlet_rs::FIGfont;
 use iggy_common::{Aes256GcmEncryptor, EncryptorKind, IggyError, MemoryPool};
-use server::SEMANTIC_VERSION;
-use server::args::Args;
-use server::bootstrap::{
-    create_directories, create_shard_connections, create_shard_executor, load_config, load_streams,
-    load_users, resolve_persister, update_system_info,
+use server::{
+    SEMANTIC_VERSION,
+    args::Args,
+    bootstrap::{
+        create_directories, create_shard_connections, create_shard_executor, load_config,
+        load_streams, load_users, resolve_persister, update_system_info,
+    },
+    configs::sharding::CpuAllocation,
+    diagnostics::{print_io_uring_permission_info, print_locked_memory_limit_info},
+    io::fs_utils,
+    log::logger::Logging,
+    server_error::ServerError,
+    shard::{
+        IggyShard, calculate_shard_assignment, namespace::IggyNamespace, system::info::SystemInfo,
+        transmission::id::ShardId,
+    },
+    slab::traits_ext::{EntityComponentSystem, EntityComponentSystemMutCell, IntoComponents},
+    state::{file::FileState, system::SystemState},
+    streaming::{
+        clients::client_manager::{Client, ClientManager},
+        diagnostics::metrics::Metrics,
+        storage::SystemStorage,
+        utils::ptr::EternalPtr,
+    },
+    versioning::SemanticVersion,
 };
-use server::configs::sharding::CpuAllocation;
-use server::diagnostics::{print_io_uring_permission_info, print_locked_memory_limit_info};
-use server::io::fs_utils;
-use server::log::logger::Logging;
-use server::server_error::ServerError;
-use server::shard::namespace::IggyNamespace;
-use server::shard::system::info::SystemInfo;
-use server::shard::transmission::id::ShardId;
-use server::shard::{IggyShard, calculate_shard_assignment};
-use server::slab::traits_ext::{
-    EntityComponentSystem, EntityComponentSystemMutCell, IntoComponents,
-};
-use server::state::file::FileState;
-use server::state::system::SystemState;
-use server::streaming::clients::client_manager::{Client, ClientManager};
-use server::streaming::diagnostics::metrics::Metrics;
-use server::streaming::storage::SystemStorage;
-use server::streaming::utils::ptr::EternalPtr;
-use server::versioning::SemanticVersion;
-use std::collections::HashSet;
-use std::panic::AssertUnwindSafe;
-use std::rc::Rc;
-use std::str::FromStr;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::mpsc;
-use std::thread::JoinHandle;
 use tracing::{error, info, instrument, warn};
 
 const COMPONENT: &str = "MAIN";

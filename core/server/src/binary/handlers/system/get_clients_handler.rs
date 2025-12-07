@@ -16,18 +16,21 @@
  * under the License.
  */
 
-use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
-use crate::binary::handlers::system::COMPONENT;
-use crate::binary::handlers::utils::receive_and_validate;
-use crate::binary::mapper;
-use crate::shard::IggyShard;
-use crate::streaming::session::Session;
-use err_trail::ErrContext;
-use iggy_common::IggyError;
-use iggy_common::SenderKind;
-use iggy_common::get_clients::GetClients;
 use std::rc::Rc;
+
+use err_trail::ErrContext;
+use iggy_common::{IggyError, SenderKind, get_clients::GetClients};
 use tracing::debug;
+
+use crate::{
+    binary::{
+        command::{BinaryServerCommand, ServerCommand, ServerCommandHandler},
+        handlers::{system::COMPONENT, utils::receive_and_validate},
+        mapper,
+    },
+    shard::IggyShard,
+    streaming::session::Session,
+};
 
 impl ServerCommandHandler for GetClients {
     fn code(&self) -> u32 {

@@ -15,18 +15,22 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::logo::Logo;
-use crate::components::selectors::benchmark_search_box::BenchmarkSearchBox;
-use crate::components::selectors::benchmark_selector::BenchmarkSelector;
-use crate::components::selectors::gitref_selector::GitrefSelector;
-use crate::components::selectors::hardware_selector::HardwareSelector;
-use crate::components::selectors::recent_benchmarks_selector::RecentBenchmarksSelector;
-use crate::components::selectors::view_mode_selector::ViewModeSelector;
-use crate::state::benchmark::{BenchmarkAction, use_benchmark};
-use crate::state::gitref::use_gitref;
-use crate::state::ui::{ViewMode, use_ui};
 use bench_report::benchmark_kind::BenchmarkKind;
 use yew::prelude::*;
+
+use super::logo::Logo;
+use crate::{
+    components::selectors::{
+        benchmark_search_box::BenchmarkSearchBox, benchmark_selector::BenchmarkSelector,
+        gitref_selector::GitrefSelector, hardware_selector::HardwareSelector,
+        recent_benchmarks_selector::RecentBenchmarksSelector, view_mode_selector::ViewModeSelector,
+    },
+    state::{
+        benchmark::{BenchmarkAction, use_benchmark},
+        gitref::use_gitref,
+        ui::{ViewMode, use_ui},
+    },
+};
 
 #[derive(Clone, PartialEq)]
 pub enum BenchmarkTab {

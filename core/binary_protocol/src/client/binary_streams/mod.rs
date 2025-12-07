@@ -16,16 +16,16 @@
  * under the License.
  */
 
-use crate::utils::auth::fail_if_not_authenticated;
-use crate::utils::mapper;
-use crate::{BinaryClient, StreamClient};
-use iggy_common::create_stream::CreateStream;
-use iggy_common::delete_stream::DeleteStream;
-use iggy_common::get_stream::GetStream;
-use iggy_common::get_streams::GetStreams;
-use iggy_common::purge_stream::PurgeStream;
-use iggy_common::update_stream::UpdateStream;
-use iggy_common::{Identifier, IggyError, Stream, StreamDetails};
+use iggy_common::{
+    Identifier, IggyError, Stream, StreamDetails, create_stream::CreateStream,
+    delete_stream::DeleteStream, get_stream::GetStream, get_streams::GetStreams,
+    purge_stream::PurgeStream, update_stream::UpdateStream,
+};
+
+use crate::{
+    BinaryClient, StreamClient,
+    utils::{auth::fail_if_not_authenticated, mapper},
+};
 
 #[async_trait::async_trait]
 impl<B: BinaryClient> StreamClient for B {

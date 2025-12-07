@@ -16,11 +16,14 @@
  * under the License.
  */
 
-use crate::IggyError;
-use crate::text;
-use aes_gcm::aead::{Aead, OsRng};
-use aes_gcm::{AeadCore, Aes256Gcm, KeyInit};
 use std::fmt::Debug;
+
+use aes_gcm::{
+    AeadCore, Aes256Gcm, KeyInit,
+    aead::{Aead, OsRng},
+};
+
+use crate::{IggyError, text};
 
 #[derive(Debug, Clone)]
 pub enum EncryptorKind {

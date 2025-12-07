@@ -16,11 +16,12 @@
  * under the License.
  */
 
+use serde::{Deserialize, Serialize};
+
 use super::{
     benchmark_kind::BenchmarkKind, numeric_parameter::BenchmarkNumericParameter,
     transport::BenchmarkTransport,
 };
-use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
 pub struct BenchmarkParams {

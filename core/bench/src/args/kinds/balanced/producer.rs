@@ -16,6 +16,11 @@
  * under the License.
  */
 
+use std::num::NonZeroU32;
+
+use clap::{CommandFactory, Parser, error::ErrorKind};
+use iggy::prelude::IggyByteSize;
+
 use crate::args::{
     common::IggyBenchArgs,
     defaults::{
@@ -25,9 +30,6 @@ use crate::args::{
     props::BenchmarkKindProps,
     transport::BenchmarkTransportCommand,
 };
-use clap::{CommandFactory, Parser, error::ErrorKind};
-use iggy::prelude::IggyByteSize;
-use std::num::NonZeroU32;
 
 /// N producers sending to N separated stream-topic with single partition (one stream per one producer)
 #[derive(Parser, Debug, Clone)]

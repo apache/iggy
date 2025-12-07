@@ -16,9 +16,11 @@
  * under the License.
  */
 
-use axum::Json;
-use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
+use axum::{
+    Json,
+    http::StatusCode,
+    response::{IntoResponse, Response},
+};
 use iggy_common::IggyError;
 use serde::Serialize;
 use thiserror::Error;

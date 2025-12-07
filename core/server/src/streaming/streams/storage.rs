@@ -15,13 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::slab::traits_ext::{DeleteCell, EntityComponentSystem, EntityMarker, IntoComponents};
-use crate::streaming::streams::stream;
-use crate::streaming::topics::storage::delete_topic_from_disk;
-use crate::{configs::system::SystemConfig, io::fs_utils::remove_dir_all};
+use std::path::Path;
+
 use compio::fs::create_dir_all;
 use iggy_common::IggyError;
-use std::path::Path;
+
+use crate::{
+    configs::system::SystemConfig,
+    io::fs_utils::remove_dir_all,
+    slab::traits_ext::{DeleteCell, EntityComponentSystem, EntityMarker, IntoComponents},
+    streaming::{streams::stream, topics::storage::delete_topic_from_disk},
+};
 
 pub async fn create_stream_file_hierarchy(
     id: usize,

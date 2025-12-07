@@ -15,15 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use assert_cmd::prelude::CommandCargoExt;
-use iggy::prelude::*;
-use iggy_common::TransportProtocol;
 use std::{
     fs::{self, File, OpenOptions},
     io::Write,
     process::{Command, Stdio},
     thread::panicking,
 };
+
+use assert_cmd::prelude::CommandCargoExt;
+use iggy::prelude::*;
+use iggy_common::TransportProtocol;
 use uuid::Uuid;
 
 const BENCH_FILES_PREFIX: &str = "bench_";

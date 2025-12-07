@@ -15,10 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::BenchmarkCache;
-use bench_dashboard_shared::BenchmarkReportLight;
 use std::path::PathBuf;
+
+use bench_dashboard_shared::BenchmarkReportLight;
 use uuid::Uuid;
+
+use super::BenchmarkCache;
 
 impl BenchmarkCache {
     pub fn get_benchmark_json_path(&self, uuid: &Uuid) -> Option<PathBuf> {

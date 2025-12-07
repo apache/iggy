@@ -17,6 +17,8 @@
  * under the License.
  */
 
+use std::fmt::Formatter;
+
 use axum::http::Method;
 use figment::{
     Metadata, Profile, Provider,
@@ -26,7 +28,6 @@ use figment::{
 use iggy::prelude::{DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME};
 use iggy_common::{CustomEnvProvider, FileConfigProvider};
 use serde::{Deserialize, Serialize};
-use std::fmt::Formatter;
 use strum::Display;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 

@@ -16,8 +16,9 @@
  * under the License.
  */
 
-use crate::BinaryTransport;
 use iggy_common::{ClientState, IggyError};
+
+use crate::BinaryTransport;
 
 pub(crate) async fn fail_if_not_authenticated<T: BinaryTransport>(
     transport: &T,

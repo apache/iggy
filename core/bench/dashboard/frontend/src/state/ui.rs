@@ -15,9 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::components::selectors::measurement_type_selector::MeasurementType;
 use std::rc::Rc;
+
 use yew::prelude::*;
+
+use crate::components::selectors::measurement_type_selector::MeasurementType;
 
 #[derive(Clone, Debug, PartialEq)]
 #[allow(dead_code)]

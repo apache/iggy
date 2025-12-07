@@ -15,13 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::sync::atomic::AtomicUsize;
+
+use arcshift::ArcShift;
+use slab::Slab;
+
 use crate::slab::{
     Keyed, consumer_groups, partitions,
     traits_ext::{EntityMarker, IntoComponents, IntoComponentsById},
 };
-use arcshift::ArcShift;
-use slab::Slab;
-use std::sync::atomic::AtomicUsize;
 
 pub const MEMBERS_CAPACITY: usize = 128;
 

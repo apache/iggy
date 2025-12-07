@@ -16,8 +16,9 @@
  * under the License.
  */
 
-use crate::{ConnectionStringOptions, IggyDuration, IggyError};
 use std::str::FromStr;
+
+use crate::{ConnectionStringOptions, IggyDuration, IggyError};
 
 #[derive(Debug)]
 pub struct HttpConnectionStringOptions {

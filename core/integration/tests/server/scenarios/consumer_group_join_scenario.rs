@@ -16,20 +16,20 @@
  * under the License.
  */
 
+use iggy::{
+    clients::client::IggyClient,
+    prelude::{
+        ClientInfoDetails, CompressionAlgorithm, ConsumerGroupClient, ConsumerGroupDetails,
+        Identifier, IggyExpiry, MaxTopicSize, StreamClient, SystemClient, TopicClient,
+    },
+};
+use integration::test_server::{
+    ClientFactory, assert_clean_system, create_user, login_root, login_user,
+};
+
 use crate::server::scenarios::{
     CONSUMER_GROUP_NAME, PARTITIONS_COUNT, STREAM_NAME, TOPIC_NAME, USERNAME_1, USERNAME_2,
     USERNAME_3, cleanup, create_client, join_consumer_group,
-};
-use iggy::clients::client::IggyClient;
-use iggy::prelude::ClientInfoDetails;
-use iggy::prelude::CompressionAlgorithm;
-use iggy::prelude::ConsumerGroupDetails;
-use iggy::prelude::Identifier;
-use iggy::prelude::IggyExpiry;
-use iggy::prelude::MaxTopicSize;
-use iggy::prelude::{ConsumerGroupClient, StreamClient, SystemClient, TopicClient};
-use integration::test_server::{
-    ClientFactory, assert_clean_system, create_user, login_root, login_user,
 };
 
 pub async fn run(client_factory: &dyn ClientFactory) {

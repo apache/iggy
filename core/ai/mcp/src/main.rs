@@ -16,6 +16,8 @@
  * under the License.
  */
 
+use std::{env, sync::Arc};
+
 use configs::{McpServerConfig, McpTransport};
 use dotenvy::dotenv;
 use error::McpRuntimeError;
@@ -24,7 +26,6 @@ use iggy::prelude::{Client, Identifier};
 use iggy_common::ConfigProvider;
 use rmcp::{ServiceExt, model::ErrorData, transport::stdio};
 use service::IggyService;
-use std::{env, sync::Arc};
 use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, Registry, layer::SubscriberExt, util::SubscriberInitExt};
 

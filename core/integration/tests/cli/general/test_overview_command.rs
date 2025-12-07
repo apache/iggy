@@ -16,8 +16,9 @@
  * under the License.
  */
 
-use crate::cli::common::{IggyCmdTest, help::TestHelpCmd};
 use serial_test::parallel;
+
+use crate::cli::common::{IggyCmdTest, help::TestHelpCmd};
 
 const FIGLET_INDENT: &str = " ";
 const FIGLET_FILL: &str = "                         ";

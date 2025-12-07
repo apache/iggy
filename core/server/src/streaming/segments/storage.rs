@@ -15,14 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use iggy_common::IggyError;
-use std::rc::Rc;
-use std::sync::atomic::AtomicU64;
+use std::{rc::Rc, sync::atomic::AtomicU64};
 
-use crate::configs::system::SystemConfig;
-use crate::streaming::segments::{
-    indexes::{IndexReader, IndexWriter},
-    messages::{MessagesReader, MessagesWriter},
+use iggy_common::IggyError;
+
+use crate::{
+    configs::system::SystemConfig,
+    streaming::segments::{
+        indexes::{IndexReader, IndexWriter},
+        messages::{MessagesReader, MessagesWriter},
+    },
 };
 
 unsafe impl Send for Storage {}

@@ -15,14 +15,16 @@
  * under the License.
  */
 
-use iggy_connector_sdk::decoders::proto::{ProtoConfig, ProtoStreamDecoder};
-use iggy_connector_sdk::encoders::proto::{ProtoEncoderConfig, ProtoStreamEncoder};
-use iggy_connector_sdk::transforms::{ProtoConvert, ProtoConvertConfig, Transform};
-use iggy_connector_sdk::{Payload, Schema, StreamDecoder, StreamEncoder};
+use std::{collections::HashMap, path::PathBuf};
+
+use iggy_connector_sdk::{
+    Payload, Schema, StreamDecoder, StreamEncoder,
+    decoders::proto::{ProtoConfig, ProtoStreamDecoder},
+    encoders::proto::{ProtoEncoderConfig, ProtoStreamEncoder},
+    transforms::{ProtoConvert, ProtoConvertConfig, Transform},
+};
 use prost::Message;
 use prost_types::Any;
-use std::collections::HashMap;
-use std::path::PathBuf;
 
 #[tokio::test]
 async fn should_transform_with_real_schema_and_field_mapping() {

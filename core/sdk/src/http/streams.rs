@@ -16,15 +16,16 @@
  * under the License.
  */
 
-use crate::http::http_client::HttpClient;
-use crate::http::http_transport::HttpTransport;
-use crate::prelude::Identifier;
-use crate::prelude::IggyError;
 use async_trait::async_trait;
 use iggy_binary_protocol::StreamClient;
-use iggy_common::create_stream::CreateStream;
-use iggy_common::update_stream::UpdateStream;
-use iggy_common::{Stream, StreamDetails};
+use iggy_common::{
+    Stream, StreamDetails, create_stream::CreateStream, update_stream::UpdateStream,
+};
+
+use crate::{
+    http::{http_client::HttpClient, http_transport::HttpTransport},
+    prelude::{Identifier, IggyError},
+};
 
 const PATH: &str = "/streams";
 

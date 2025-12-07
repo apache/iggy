@@ -16,12 +16,14 @@
  * under the License.
  */
 
+use std::ops::{Deref, Index};
+
+use bytes::{BufMut, Bytes, BytesMut};
+
 use crate::{
     BytesSerializable, INDEX_SIZE, IggyByteSize, IggyIndexes, IggyMessage, IggyMessageView,
     IggyMessageViewIterator, MAX_PAYLOAD_SIZE, Sizeable, Validatable, error::IggyError,
 };
-use bytes::{BufMut, Bytes, BytesMut};
-use std::ops::{Deref, Index};
 
 /// An immutable messages container that holds a buffer of messages
 #[derive(Clone, Debug, PartialEq)]

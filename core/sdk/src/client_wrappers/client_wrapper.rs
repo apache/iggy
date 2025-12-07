@@ -16,11 +16,10 @@
  * under the License.
  */
 
-use crate::clients::client::IggyClient;
-use crate::http::http_client::HttpClient;
-use crate::quic::quic_client::QuicClient;
-use crate::tcp::tcp_client::TcpClient;
-use crate::websocket::websocket_client::WebSocketClient;
+use crate::{
+    clients::client::IggyClient, http::http_client::HttpClient, quic::quic_client::QuicClient,
+    tcp::tcp_client::TcpClient, websocket::websocket_client::WebSocketClient,
+};
 
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]

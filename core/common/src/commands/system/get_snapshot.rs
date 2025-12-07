@@ -16,15 +16,16 @@
  * under the License.
  */
 
-use crate::BytesSerializable;
-use crate::Validatable;
-use crate::error::IggyError;
-use crate::{Command, GET_SNAPSHOT_FILE_CODE};
-use crate::{SnapshotCompression, SystemSnapshotType};
+use std::fmt::Display;
+
 use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
-use std::fmt::Display;
 use tracing::error;
+
+use crate::{
+    BytesSerializable, Command, GET_SNAPSHOT_FILE_CODE, SnapshotCompression, SystemSnapshotType,
+    Validatable, error::IggyError,
+};
 
 /// `GetSnapshot` command is used to get snapshot information.
 #[derive(Debug, Serialize, Deserialize, PartialEq)]

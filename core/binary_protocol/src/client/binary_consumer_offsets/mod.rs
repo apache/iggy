@@ -15,14 +15,17 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-use crate::ConsumerOffsetClient;
-use crate::client::binary_clients::BinaryClient;
-use crate::utils::auth::fail_if_not_authenticated;
-use crate::utils::mapper;
-use iggy_common::delete_consumer_offset::DeleteConsumerOffset;
-use iggy_common::get_consumer_offset::GetConsumerOffset;
-use iggy_common::store_consumer_offset::StoreConsumerOffset;
-use iggy_common::{Consumer, ConsumerOffsetInfo, Identifier, IggyError};
+use iggy_common::{
+    Consumer, ConsumerOffsetInfo, Identifier, IggyError,
+    delete_consumer_offset::DeleteConsumerOffset, get_consumer_offset::GetConsumerOffset,
+    store_consumer_offset::StoreConsumerOffset,
+};
+
+use crate::{
+    ConsumerOffsetClient,
+    client::binary_clients::BinaryClient,
+    utils::{auth::fail_if_not_authenticated, mapper},
+};
 
 #[async_trait::async_trait]
 impl<B: BinaryClient> ConsumerOffsetClient for B {

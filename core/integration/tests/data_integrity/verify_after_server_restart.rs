@@ -16,16 +16,19 @@
  * under the License.
  */
 
-use iggy::clients::client::IggyClient;
-use iggy::prelude::{ConsumerGroupClient, Identifier, IggyByteSize, MessageClient, SystemClient};
+use std::{collections::HashMap, str::FromStr};
+
+use iggy::{
+    clients::client::IggyClient,
+    prelude::{ConsumerGroupClient, Identifier, IggyByteSize, MessageClient, SystemClient},
+};
 use iggy_common::TransportProtocol;
-use integration::bench_utils::run_bench_and_wait_for_finish;
 use integration::{
+    bench_utils::run_bench_and_wait_for_finish,
     tcp_client::TcpClientFactory,
     test_server::{ClientFactory, IpAddrKind, SYSTEM_PATH_ENV_VAR, TestServer, login_root},
 };
 use serial_test::parallel;
-use std::{collections::HashMap, str::FromStr};
 use test_case::test_matrix;
 
 fn cache_open_segment() -> &'static str {

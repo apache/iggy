@@ -16,13 +16,12 @@
  * under the License.
  */
 
-use crate::BytesSerializable;
-use crate::Validatable;
-use crate::error::IggyError;
-use crate::{Command, LOGOUT_USER_CODE};
+use std::fmt::Display;
+
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-use std::fmt::Display;
+
+use crate::{BytesSerializable, Command, LOGOUT_USER_CODE, Validatable, error::IggyError};
 
 /// `LogoutUser` command is used to log out the authenticated user.
 /// It has no additional payload.

@@ -16,11 +16,16 @@
  * under the License.
  */
 
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
+
 use async_channel::{Receiver, Sender, bounded};
 use futures::FutureExt;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
 use tracing::trace;
 
 /// Coordinates graceful shutdown across multiple tasks

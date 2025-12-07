@@ -16,22 +16,27 @@
  * under the License.
  */
 
-use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
-use crate::binary::handlers::system::COMPONENT;
-use crate::binary::handlers::utils::receive_and_validate;
-use crate::binary::mapper;
-use crate::shard::IggyShard;
-use crate::shard::transmission::frame::ShardResponse;
-use crate::shard::transmission::message::{
-    ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult,
-};
-use crate::streaming::session::Session;
-use err_trail::ErrContext;
-use iggy_common::SenderKind;
-use iggy_common::get_stats::GetStats;
-use iggy_common::{Identifier, IggyError};
 use std::rc::Rc;
+
+use err_trail::ErrContext;
+use iggy_common::{Identifier, IggyError, SenderKind, get_stats::GetStats};
 use tracing::debug;
+
+use crate::{
+    binary::{
+        command::{BinaryServerCommand, ServerCommand, ServerCommandHandler},
+        handlers::{system::COMPONENT, utils::receive_and_validate},
+        mapper,
+    },
+    shard::{
+        IggyShard,
+        transmission::{
+            frame::ShardResponse,
+            message::{ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult},
+        },
+    },
+    streaming::session::Session,
+};
 
 impl ServerCommandHandler for GetStats {
     fn code(&self) -> u32 {

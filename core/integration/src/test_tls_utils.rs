@@ -16,9 +16,11 @@
  * under the License.
  */
 
-use std::fs::{self, File};
-use std::io::Write;
-use std::path::Path;
+use std::{
+    fs::{self, File},
+    io::Write,
+    path::Path,
+};
 
 /// Generate self-signed certificates for TLS testing
 pub fn generate_test_certificates(cert_dir: &str) -> Result<(), Box<dyn std::error::Error>> {

@@ -15,16 +15,28 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::slab::streams::Streams;
-use crate::slab::topics;
-use crate::slab::traits_ext::{EntityMarker, InsertCell, IntoComponents, IntoComponentsById};
-use crate::slab::{Keyed, consumer_groups::ConsumerGroups, partitions::Partitions};
-use crate::streaming::stats::{StreamStats, TopicStats};
+use std::{
+    cell::{Ref, RefMut},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
+
 use iggy_common::{CompressionAlgorithm, Identifier, IggyExpiry, IggyTimestamp, MaxTopicSize};
 use slab::Slab;
-use std::cell::{Ref, RefMut};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+
+use crate::{
+    slab::{
+        Keyed,
+        consumer_groups::ConsumerGroups,
+        partitions::Partitions,
+        streams::Streams,
+        topics,
+        traits_ext::{EntityMarker, InsertCell, IntoComponents, IntoComponentsById},
+    },
+    streaming::stats::{StreamStats, TopicStats},
+};
 
 #[derive(Debug, Clone)]
 pub struct TopicAuxilary {

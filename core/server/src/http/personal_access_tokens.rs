@@ -16,30 +16,34 @@
  * under the License.
  */
 
-use crate::http::COMPONENT;
-use crate::http::error::CustomError;
-use crate::http::jwt::json_web_token::Identity;
-use crate::http::mapper;
-use crate::http::mapper::map_generated_access_token_to_identity_info;
-use crate::http::shared::AppState;
-use crate::state::command::EntryCommand;
-use crate::state::models::CreatePersonalAccessTokenWithHash;
-use crate::streaming::personal_access_tokens::personal_access_token::PersonalAccessToken;
-use crate::streaming::session::Session;
-use axum::extract::{Path, State};
-use axum::http::StatusCode;
-use axum::routing::{delete, get, post};
-use axum::{Extension, Json, Router, debug_handler};
-use err_trail::ErrContext;
-use iggy_common::IdentityInfo;
-use iggy_common::Validatable;
-use iggy_common::create_personal_access_token::CreatePersonalAccessToken;
-use iggy_common::delete_personal_access_token::DeletePersonalAccessToken;
-use iggy_common::login_with_personal_access_token::LoginWithPersonalAccessToken;
-use iggy_common::{PersonalAccessTokenInfo, RawPersonalAccessToken};
-use send_wrapper::SendWrapper;
 use std::sync::Arc;
+
+use axum::{
+    Extension, Json, Router, debug_handler,
+    extract::{Path, State},
+    http::StatusCode,
+    routing::{delete, get, post},
+};
+use err_trail::ErrContext;
+use iggy_common::{
+    IdentityInfo, PersonalAccessTokenInfo, RawPersonalAccessToken, Validatable,
+    create_personal_access_token::CreatePersonalAccessToken,
+    delete_personal_access_token::DeletePersonalAccessToken,
+    login_with_personal_access_token::LoginWithPersonalAccessToken,
+};
+use send_wrapper::SendWrapper;
 use tracing::instrument;
+
+use crate::{
+    http::{
+        COMPONENT, error::CustomError, jwt::json_web_token::Identity, mapper,
+        mapper::map_generated_access_token_to_identity_info, shared::AppState,
+    },
+    state::{command::EntryCommand, models::CreatePersonalAccessTokenWithHash},
+    streaming::{
+        personal_access_tokens::personal_access_token::PersonalAccessToken, session::Session,
+    },
+};
 
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()

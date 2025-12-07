@@ -15,11 +15,17 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-use crate::types::configuration::auth_config::connection_string::ConnectionString;
-use crate::types::configuration::auth_config::connection_string_options::ConnectionStringOptions;
-use crate::types::configuration::tcp_config::tcp_connection_string_options::TcpConnectionStringOptions;
-use crate::{AutoLogin, IggyDuration, TcpClientReconnectionConfig};
 use std::str::FromStr;
+
+use crate::{
+    AutoLogin, IggyDuration, TcpClientReconnectionConfig,
+    types::configuration::{
+        auth_config::{
+            connection_string::ConnectionString, connection_string_options::ConnectionStringOptions,
+        },
+        tcp_config::tcp_connection_string_options::TcpConnectionStringOptions,
+    },
+};
 
 /// Configuration for the TCP client.
 #[derive(Debug, Clone)]

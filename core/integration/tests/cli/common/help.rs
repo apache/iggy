@@ -16,9 +16,10 @@
  * under the License.
  */
 
-use crate::cli::common::command::IggyCmdCommand;
 use assert_cmd::assert::Assert;
 use predicates::str::diff;
+
+use crate::cli::common::command::IggyCmdCommand;
 
 // Clap long help messages contain set of white spaces between short summary and detailed
 // description. In case of IDE removes help message verification this variable is being used to

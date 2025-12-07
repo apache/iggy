@@ -16,11 +16,11 @@
  * under the License.
  */
 
-use crate::utils::auth::fail_if_not_authenticated;
-use crate::{BinaryClient, PartitionClient};
-use iggy_common::create_partitions::CreatePartitions;
-use iggy_common::delete_partitions::DeletePartitions;
-use iggy_common::{Identifier, IggyError};
+use iggy_common::{
+    Identifier, IggyError, create_partitions::CreatePartitions, delete_partitions::DeletePartitions,
+};
+
+use crate::{BinaryClient, PartitionClient, utils::auth::fail_if_not_authenticated};
 
 #[async_trait::async_trait]
 impl<B: BinaryClient> PartitionClient for B {

@@ -16,13 +16,14 @@
  * under the License.
  */
 
-use crate::prelude::IggyClient;
 use async_trait::async_trait;
 use iggy_binary_protocol::TopicClient;
-use iggy_common::locking::IggyRwLockFn;
 use iggy_common::{
     CompressionAlgorithm, Identifier, IggyError, IggyExpiry, MaxTopicSize, Topic, TopicDetails,
+    locking::IggyRwLockFn,
 };
+
+use crate::prelude::IggyClient;
 
 #[async_trait]
 impl TopicClient for IggyClient {

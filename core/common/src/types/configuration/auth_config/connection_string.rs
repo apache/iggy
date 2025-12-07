@@ -16,8 +16,9 @@
  * under the License.
  */
 
-use crate::{AutoLogin, ConnectionStringOptions, Credentials, IggyError, TransportProtocol};
 use std::str::FromStr;
+
+use crate::{AutoLogin, ConnectionStringOptions, Credentials, IggyError, TransportProtocol};
 
 const DEFAULT_CONNECTION_STRING_PREFIX: &str = "iggy://";
 const CONNECTION_STRING_PREFIX: &str = "iggy+";
@@ -158,8 +159,7 @@ impl ConnectionStringUtils {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::IggyDuration;
-    use crate::TcpConnectionStringOptions;
+    use crate::{IggyDuration, TcpConnectionStringOptions};
 
     #[test]
     fn should_fail_without_username() {

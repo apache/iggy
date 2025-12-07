@@ -17,11 +17,15 @@
  * under the License.
  */
 
-use crate::RuntimeError;
-use crate::configs::connectors::{SharedTransformConfig, TransformsConfig};
+use std::sync::Arc;
+
 use iggy_connector_sdk::transforms::Transform;
 use serde::Deserialize;
-use std::sync::Arc;
+
+use crate::{
+    RuntimeError,
+    configs::connectors::{SharedTransformConfig, TransformsConfig},
+};
 
 pub fn load(config: &TransformsConfig) -> Result<Vec<Arc<dyn Transform>>, RuntimeError> {
     let mut transforms: Vec<Arc<dyn Transform>> = vec![];

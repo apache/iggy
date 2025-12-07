@@ -16,11 +16,9 @@
  * under the License.
  */
 
-use iggy_common::IggyByteSize;
-use iggy_common::IggyDuration;
+use iggy_common::{IggyByteSize, IggyDuration};
 use serde::{Deserialize, Serialize};
-use serde_with::DisplayFromStr;
-use serde_with::serde_as;
+use serde_with::{DisplayFromStr, serde_as};
 
 #[serde_as]
 #[derive(Debug, Deserialize, Serialize, Clone)]

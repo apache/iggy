@@ -15,9 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::state::benchmark::{BenchmarkAction, use_benchmark};
-use crate::state::ui::{UiAction, ViewMode, use_ui};
 use yew::prelude::*;
+
+use crate::state::{
+    benchmark::{BenchmarkAction, use_benchmark},
+    ui::{UiAction, ViewMode, use_ui},
+};
 
 #[function_component(ViewModeSelector)]
 pub fn view_mode_toggle() -> Html {

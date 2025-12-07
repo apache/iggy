@@ -15,8 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::{AutoLogin, IggyDuration, IggyError, TcpClientConfig};
 use std::net::SocketAddr;
+
+use crate::{AutoLogin, IggyDuration, IggyError, TcpClientConfig};
 
 /// Builder for the TCP client configuration.
 /// Allows configuring the TCP client with custom settings or using defaults:

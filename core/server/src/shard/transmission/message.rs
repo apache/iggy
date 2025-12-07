@@ -15,6 +15,10 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+use iggy_common::{
+    CompressionAlgorithm, Identifier, IggyExpiry, MaxTopicSize, Permissions, UserStatus,
+};
+
 use crate::{
     shard::{
         system::messages::PollingArgs,
@@ -22,9 +26,6 @@ use crate::{
     },
     slab::partitions,
     streaming::{polling_consumer::PollingConsumer, segments::IggyMessagesBatchMut},
-};
-use iggy_common::{
-    CompressionAlgorithm, Identifier, IggyExpiry, MaxTopicSize, Permissions, UserStatus,
 };
 
 #[allow(clippy::large_enum_variant)]

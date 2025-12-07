@@ -16,9 +16,10 @@
  * under the License.
  */
 
-use crate::shared::args::Args;
 use iggy::prelude::*;
 use tracing::info;
+
+use crate::shared::args::Args;
 
 type MessageHandler = dyn Fn(&IggyMessage) -> Result<(), Box<dyn std::error::Error>>;
 

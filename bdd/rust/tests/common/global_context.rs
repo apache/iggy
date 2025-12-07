@@ -17,8 +17,10 @@
  */
 
 use cucumber::World;
-use iggy::clients::client::IggyClient;
-use iggy::prelude::{IggyMessage, PolledMessages};
+use iggy::{
+    clients::client::IggyClient,
+    prelude::{IggyMessage, PolledMessages},
+};
 
 #[derive(Debug, World, Default)]
 pub struct GlobalContext {

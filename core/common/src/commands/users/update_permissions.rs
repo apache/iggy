@@ -16,16 +16,15 @@
  * under the License.
  */
 
-use crate::BytesSerializable;
-use crate::Identifier;
-use crate::Permissions;
-use crate::Sizeable;
-use crate::Validatable;
-use crate::error::IggyError;
-use crate::{Command, UPDATE_PERMISSIONS_CODE};
+use std::fmt::Display;
+
 use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
-use std::fmt::Display;
+
+use crate::{
+    BytesSerializable, Command, Identifier, Permissions, Sizeable, UPDATE_PERMISSIONS_CODE,
+    Validatable, error::IggyError,
+};
 
 /// `UpdatePermissions` command is used to update a user's permissions.
 /// It has additional payload:

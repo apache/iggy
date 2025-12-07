@@ -16,14 +16,19 @@
  * under the License.
  */
 
-use crate::Client;
-use crate::cli::cli_command::{CliCommand, PRINT_TARGET};
+use core::fmt;
+
 use anyhow::Context;
 use async_trait::async_trait;
-use core::fmt;
-use iggy_common::create_topic::CreateTopic;
-use iggy_common::{CompressionAlgorithm, Identifier, IggyExpiry, MaxTopicSize};
+use iggy_common::{
+    CompressionAlgorithm, Identifier, IggyExpiry, MaxTopicSize, create_topic::CreateTopic,
+};
 use tracing::{Level, event};
+
+use crate::{
+    Client,
+    cli::cli_command::{CliCommand, PRINT_TARGET},
+};
 
 pub struct CreateTopicCmd {
     create_topic: CreateTopic,

@@ -16,18 +16,21 @@
  * under the License.
  */
 
-use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
-use crate::binary::handlers::consumer_groups::COMPONENT;
-use crate::binary::handlers::utils::receive_and_validate;
+use std::rc::Rc;
 
-use crate::shard::IggyShard;
-use crate::streaming::session::Session;
 use anyhow::Result;
 use err_trail::ErrContext;
-use iggy_common::join_consumer_group::JoinConsumerGroup;
-use iggy_common::{IggyError, SenderKind};
-use std::rc::Rc;
+use iggy_common::{IggyError, SenderKind, join_consumer_group::JoinConsumerGroup};
 use tracing::{debug, instrument};
+
+use crate::{
+    binary::{
+        command::{BinaryServerCommand, ServerCommand, ServerCommandHandler},
+        handlers::{consumer_groups::COMPONENT, utils::receive_and_validate},
+    },
+    shard::IggyShard,
+    streaming::session::Session,
+};
 
 impl ServerCommandHandler for JoinConsumerGroup {
     fn code(&self) -> u32 {

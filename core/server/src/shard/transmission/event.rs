@@ -15,6 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::net::SocketAddr;
+
+use iggy_common::{
+    CompressionAlgorithm, Identifier, IggyExpiry, MaxTopicSize, Permissions, TransportProtocol,
+    UserStatus,
+};
+use strum::Display;
+
 use crate::streaming::{
     partitions::partition,
     personal_access_tokens::personal_access_token::PersonalAccessToken,
@@ -24,12 +32,6 @@ use crate::streaming::{
         topic,
     },
 };
-use iggy_common::{
-    CompressionAlgorithm, Identifier, IggyExpiry, MaxTopicSize, Permissions, TransportProtocol,
-    UserStatus,
-};
-use std::net::SocketAddr;
-use strum::Display;
 
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Display)]

@@ -16,9 +16,7 @@
  * under the License.
  */
 
-use iggy::clients::consumer::ReceivedMessage;
-use iggy::consumer_ext::MessageConsumer;
-use iggy::prelude::IggyError;
+use iggy::{clients::consumer::ReceivedMessage, consumer_ext::MessageConsumer, prelude::IggyError};
 
 #[derive(Debug)]
 pub struct PrintEventConsumer {}

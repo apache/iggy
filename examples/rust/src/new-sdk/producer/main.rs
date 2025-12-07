@@ -16,16 +16,12 @@
  * under the License.
  */
 
+use std::{error::Error, str::FromStr, sync::Arc};
+
 use iggy::prelude::*;
-use iggy_examples::shared::args::Args;
-use iggy_examples::shared::messages_generator::MessagesGenerator;
-use std::error::Error;
-use std::str::FromStr;
-use std::sync::Arc;
+use iggy_examples::shared::{args::Args, messages_generator::MessagesGenerator};
 use tracing::info;
-use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{EnvFilter, Registry};
+use tracing_subscriber::{EnvFilter, Registry, layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<(), Box<dyn Error>> {

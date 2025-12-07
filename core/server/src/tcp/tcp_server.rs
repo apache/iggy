@@ -16,13 +16,15 @@
  * under the License.
  */
 
-use crate::shard::IggyShard;
-use crate::shard::task_registry::ShutdownToken;
-use crate::tcp::{tcp_listener, tcp_tls_listener};
+use std::{net::SocketAddr, rc::Rc};
+
 use iggy_common::IggyError;
-use std::net::SocketAddr;
-use std::rc::Rc;
 use tracing::info;
+
+use crate::{
+    shard::{IggyShard, task_registry::ShutdownToken},
+    tcp::{tcp_listener, tcp_tls_listener},
+};
 
 /// Starts the TCP server.
 pub async fn spawn_tcp_server(

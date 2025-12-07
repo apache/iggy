@@ -16,13 +16,14 @@
  * under the License.
  */
 
-use serde::{
-    Deserialize, Serialize, Serializer,
-    de::{self, Deserializer, Visitor},
-};
 use std::{
     fmt::{Display, Formatter},
     str::FromStr,
+};
+
+use serde::{
+    Deserialize, Serialize, Serializer,
+    de::{self, Deserializer, Visitor},
 };
 
 use crate::error::IggyError;

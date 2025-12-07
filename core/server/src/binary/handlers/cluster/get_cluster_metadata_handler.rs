@@ -18,15 +18,21 @@
 
 use std::rc::Rc;
 
-use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
-use crate::binary::handlers::utils::receive_and_validate;
-use crate::shard::IggyShard;
-use crate::streaming::session::Session;
 //use crate::streaming::systems::system::SharedSystem;
 use anyhow::Result;
-use iggy_common::get_cluster_metadata::GetClusterMetadata;
-use iggy_common::{BytesSerializable, IggyError, SenderKind};
+use iggy_common::{
+    BytesSerializable, IggyError, SenderKind, get_cluster_metadata::GetClusterMetadata,
+};
 use tracing::{debug, instrument};
+
+use crate::{
+    binary::{
+        command::{BinaryServerCommand, ServerCommand, ServerCommandHandler},
+        handlers::utils::receive_and_validate,
+    },
+    shard::IggyShard,
+    streaming::session::Session,
+};
 
 impl ServerCommandHandler for GetClusterMetadata {
     fn code(&self) -> u32 {

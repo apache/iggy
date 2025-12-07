@@ -16,13 +16,18 @@
  * under the License.
  */
 
-use crate::cli::common::IggyCmdTest;
-use crate::cli::message::test_message_poll_to_file_command::TestMessagePollToFileCmd;
-use crate::cli::message::test_message_send_from_file_command::TestMessageSendFromFileCmd;
+use std::{collections::HashMap, str::FromStr};
+
 use iggy::prelude::*;
 use serial_test::parallel;
-use std::collections::HashMap;
-use std::str::FromStr;
+
+use crate::cli::{
+    common::IggyCmdTest,
+    message::{
+        test_message_poll_to_file_command::TestMessagePollToFileCmd,
+        test_message_send_from_file_command::TestMessageSendFromFileCmd,
+    },
+};
 
 #[tokio::test]
 #[parallel]

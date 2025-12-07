@@ -16,10 +16,12 @@
  * under the License.
  */
 
-use crate::shard::IggyShard;
-use iggy_common::{IggyDuration, IggyError, IggyTimestamp};
 use std::rc::Rc;
+
+use iggy_common::{IggyDuration, IggyError, IggyTimestamp};
 use tracing::{debug, info, trace, warn};
+
+use crate::shard::IggyShard;
 
 const MAX_THRESHOLD: f64 = 1.2;
 

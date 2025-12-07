@@ -16,6 +16,11 @@
  * under the License.
  */
 
+use std::num::NonZeroU32;
+
+use clap::{CommandFactory, Parser, error::ErrorKind};
+use iggy::prelude::IggyByteSize;
+
 use crate::args::{
     common::IggyBenchArgs,
     defaults::{
@@ -26,9 +31,6 @@ use crate::args::{
     props::BenchmarkKindProps,
     transport::BenchmarkTransportCommand,
 };
-use clap::{CommandFactory, Parser, error::ErrorKind};
-use iggy::prelude::IggyByteSize;
-use std::num::NonZeroU32;
 
 #[derive(Parser, Debug, Clone)]
 pub struct EndToEndProducingConsumerGroupArgs {

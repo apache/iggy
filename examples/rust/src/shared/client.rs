@@ -16,12 +16,14 @@
  * under the License.
  */
 
-use crate::shared::args::Args;
-use iggy::client_provider;
-use iggy::client_provider::ClientProviderConfig;
-use iggy::clients::client::IggyClient;
-use iggy::prelude::IggyError;
 use std::sync::Arc;
+
+use iggy::{
+    client_provider, client_provider::ClientProviderConfig, clients::client::IggyClient,
+    prelude::IggyError,
+};
+
+use crate::shared::args::Args;
 
 /// Builds an Iggy client using the provided stream and topic identifiers.
 ///

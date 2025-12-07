@@ -16,10 +16,11 @@
  * under the License.
  */
 
-use crate::client_wrappers::client_wrapper::ClientWrapper;
 use async_trait::async_trait;
 use iggy_binary_protocol::SegmentClient;
 use iggy_common::{Identifier, IggyError};
+
+use crate::client_wrappers::client_wrapper::ClientWrapper;
 
 #[async_trait]
 impl SegmentClient for ClientWrapper {

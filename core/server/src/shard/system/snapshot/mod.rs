@@ -18,19 +18,6 @@
 
 mod procdump;
 
-use crate::configs::system::SystemConfig;
-use crate::shard::IggyShard;
-use crate::streaming::session::Session;
-use async_zip::base::write::ZipFileWriter;
-use async_zip::{Compression, ZipEntryBuilder};
-use compio::fs::OpenOptions;
-use compio::io::AsyncWriteAtExt;
-use iggy_common::{IggyDuration, IggyError, Snapshot, SnapshotCompression, SystemSnapshotType};
-use std::path::PathBuf;
-use std::time::Instant;
-use tempfile::NamedTempFile;
-use tracing::{error, info};
-
 // NOTE(hubcio): compio has a `process` module, but it currently blocks the executor when the runtime
 // has thread_pool_limit(0) configured (which we do on non-macOS platforms in bootstrap.rs).
 // To use compio::process::Command, we need to either:
@@ -39,6 +26,15 @@ use tracing::{error, info};
 // 3. Find alternative approach that doesn't rely on thread pool
 // See: https://compio.rs/docs/compio/process and bootstrap::create_shard_executor
 use std::process::Command;
+use std::{path::PathBuf, time::Instant};
+
+use async_zip::{Compression, ZipEntryBuilder, base::write::ZipFileWriter};
+use compio::{fs::OpenOptions, io::AsyncWriteAtExt};
+use iggy_common::{IggyDuration, IggyError, Snapshot, SnapshotCompression, SystemSnapshotType};
+use tempfile::NamedTempFile;
+use tracing::{error, info};
+
+use crate::{configs::system::SystemConfig, shard::IggyShard, streaming::session::Session};
 
 impl IggyShard {
     pub async fn get_snapshot(

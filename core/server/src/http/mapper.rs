@@ -16,20 +16,31 @@
  * under the License.
  */
 
-use crate::http::jwt::json_web_token::GeneratedToken;
-use crate::slab::Keyed;
-use crate::slab::traits_ext::{EntityComponentSystem, IntoComponents};
-use crate::streaming::clients::client_manager::Client;
-use crate::streaming::personal_access_tokens::personal_access_token::PersonalAccessToken;
-use crate::streaming::stats::TopicStats;
-use crate::streaming::topics::consumer_group::{ConsumerGroupMembers, ConsumerGroupRoot};
-use crate::streaming::topics::topic::TopicRoot;
-use crate::streaming::users::user::User;
-use iggy_common::{ConsumerGroupDetails, ConsumerGroupInfo, ConsumerGroupMember, IggyByteSize};
-use iggy_common::{IdentityInfo, PersonalAccessTokenInfo, TokenInfo, TopicDetails};
-use iggy_common::{UserInfo, UserInfoDetails};
-use slab::Slab;
 use std::sync::Arc;
+
+use iggy_common::{
+    ConsumerGroupDetails, ConsumerGroupInfo, ConsumerGroupMember, IdentityInfo, IggyByteSize,
+    PersonalAccessTokenInfo, TokenInfo, TopicDetails, UserInfo, UserInfoDetails,
+};
+use slab::Slab;
+
+use crate::{
+    http::jwt::json_web_token::GeneratedToken,
+    slab::{
+        Keyed,
+        traits_ext::{EntityComponentSystem, IntoComponents},
+    },
+    streaming::{
+        clients::client_manager::Client,
+        personal_access_tokens::personal_access_token::PersonalAccessToken,
+        stats::TopicStats,
+        topics::{
+            consumer_group::{ConsumerGroupMembers, ConsumerGroupRoot},
+            topic::TopicRoot,
+        },
+        users::user::User,
+    },
+};
 
 /// Map TopicRoot with partitions to TopicDetails for HTTP responses
 pub fn map_topic_details(root: &TopicRoot, stats: &TopicStats) -> TopicDetails {

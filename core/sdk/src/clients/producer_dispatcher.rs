@@ -15,16 +15,24 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-use crate::clients::producer::ProducerCoreBackend;
-use crate::clients::producer_config::{BackgroundConfig, BackpressureMode};
-use crate::clients::producer_error_callback::ErrorCtx;
-use crate::clients::producer_sharding::{Shard, ShardMessage, ShardMessageWithPermits};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+
 use futures::FutureExt;
 use iggy_common::{Identifier, IggyError, IggyMessage, Partitioning, Sizeable};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::sync::{Semaphore, broadcast};
-use tokio::task::JoinHandle;
+use tokio::{
+    sync::{Semaphore, broadcast},
+    task::JoinHandle,
+};
+
+use crate::clients::{
+    producer::ProducerCoreBackend,
+    producer_config::{BackgroundConfig, BackpressureMode},
+    producer_error_callback::ErrorCtx,
+    producer_sharding::{Shard, ShardMessage, ShardMessageWithPermits},
+};
 
 pub struct ProducerDispatcher {
     shards: Vec<Shard>,
@@ -232,18 +240,16 @@ impl ProducerDispatcher {
 
 #[cfg(test)]
 mod tests {
-    use std::pin::Pin;
-    use std::sync::atomic::AtomicUsize;
-    use std::time::Duration;
+    use std::{pin::Pin, sync::atomic::AtomicUsize, time::Duration};
 
     use bytes::Bytes;
     use tokio::time::sleep;
 
-    use crate::clients::producer::MockProducerCoreBackend;
-    use crate::clients::producer_error_callback::ErrorCallback;
-    use crate::clients::producer_sharding::Sharding;
-
     use super::*;
+    use crate::clients::{
+        producer::MockProducerCoreBackend, producer_error_callback::ErrorCallback,
+        producer_sharding::Sharding,
+    };
 
     fn dummy_identifier() -> Arc<Identifier> {
         Arc::new(Identifier::numeric(1).unwrap())

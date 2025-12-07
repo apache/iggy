@@ -16,12 +16,15 @@
  * under the License.
  */
 
-use crate::Identifier;
-use crate::utils::topic_size::MaxTopicSize;
-use crate::{IggyMessage, utils::byte_size::IggyByteSize};
 use std::sync::Arc;
+
 use strum::{EnumDiscriminants, FromRepr, IntoStaticStr};
 use thiserror::Error;
+
+use crate::{
+    Identifier, IggyMessage,
+    utils::{byte_size::IggyByteSize, topic_size::MaxTopicSize},
+};
 
 #[derive(Clone, Debug, Error, EnumDiscriminants, IntoStaticStr, FromRepr, Default)]
 #[repr(u32)]

@@ -16,16 +16,15 @@
  * under the License.
  */
 
-use humantime::Duration as HumanDuration;
-use humantime::format_duration;
-use serde::de::Visitor;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::{
     fmt::{Display, Formatter},
     ops::Add,
     str::FromStr,
     time::Duration,
 };
+
+use humantime::{Duration as HumanDuration, format_duration};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Visitor};
 
 pub const SEC_IN_MICRO: u64 = 1_000_000;
 
@@ -200,8 +199,9 @@ impl Visitor<'_> for IggyDurationVisitor {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::time::Duration;
+
+    use super::*;
 
     #[test]
     fn test_new() {

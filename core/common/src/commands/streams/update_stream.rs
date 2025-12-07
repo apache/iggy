@@ -16,17 +16,16 @@
  * under the License.
  */
 
-use super::MAX_NAME_LENGTH;
-use crate::BytesSerializable;
-use crate::Identifier;
-use crate::Sizeable;
-use crate::Validatable;
-use crate::error::IggyError;
-use crate::{Command, UPDATE_STREAM_CODE};
+use std::{fmt::Display, str::from_utf8};
+
 use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
-use std::fmt::Display;
-use std::str::from_utf8;
+
+use super::MAX_NAME_LENGTH;
+use crate::{
+    BytesSerializable, Command, Identifier, Sizeable, UPDATE_STREAM_CODE, Validatable,
+    error::IggyError,
+};
 
 /// `UpdateStream` command is used to update an existing stream.
 /// It has additional payload:

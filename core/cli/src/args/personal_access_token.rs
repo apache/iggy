@@ -16,9 +16,10 @@
  * under the License.
  */
 
-use crate::args::common::ListMode;
 use clap::{Args, Subcommand};
 use iggy::prelude::PersonalAccessTokenExpiry;
+
+use crate::args::common::ListMode;
 
 #[derive(Debug, Clone, Subcommand)]
 pub(crate) enum PersonalAccessTokenAction {

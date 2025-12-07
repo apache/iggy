@@ -15,13 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use iggy_common::TransportProtocol;
+use serial_test::parallel;
+use test_case::test_matrix;
+
 use crate::server::{
     ScenarioFn, bench_scenario, create_message_payload_scenario, message_headers_scenario,
     run_scenario, stream_size_validation_scenario, system_scenario, user_scenario,
 };
-use iggy_common::TransportProtocol;
-use serial_test::parallel;
-use test_case::test_matrix;
 
 #[test_matrix(
     [quic(), tcp(), http(), websocket()],

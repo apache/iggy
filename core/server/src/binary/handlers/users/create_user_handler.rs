@@ -16,27 +16,30 @@
  * under the License.
  */
 
-use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
-use crate::binary::handlers::users::COMPONENT;
-use crate::binary::handlers::utils::receive_and_validate;
-use crate::binary::mapper;
-use crate::shard::IggyShard;
-use crate::shard::transmission::event::ShardEvent;
-use crate::shard::transmission::frame::ShardResponse;
-use crate::shard::transmission::message::{
-    ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult,
-};
-use crate::state::command::EntryCommand;
-use crate::state::models::CreateUserWithId;
-use crate::streaming::session::Session;
-use crate::streaming::utils::crypto;
+use std::rc::Rc;
+
 use anyhow::Result;
 use err_trail::ErrContext;
-use iggy_common::create_user::CreateUser;
-use iggy_common::{Identifier, IggyError, SenderKind};
-use std::rc::Rc;
-use tracing::debug;
-use tracing::instrument;
+use iggy_common::{Identifier, IggyError, SenderKind, create_user::CreateUser};
+use tracing::{debug, instrument};
+
+use crate::{
+    binary::{
+        command::{BinaryServerCommand, ServerCommand, ServerCommandHandler},
+        handlers::{users::COMPONENT, utils::receive_and_validate},
+        mapper,
+    },
+    shard::{
+        IggyShard,
+        transmission::{
+            event::ShardEvent,
+            frame::ShardResponse,
+            message::{ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult},
+        },
+    },
+    state::{command::EntryCommand, models::CreateUserWithId},
+    streaming::{session::Session, utils::crypto},
+};
 
 impl ServerCommandHandler for CreateUser {
     fn code(&self) -> u32 {

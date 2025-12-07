@@ -16,16 +16,18 @@
  * under the License.
  */
 
-use crate::cli::common::{
-    CLAP_INDENT, IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestConsumerId, TestHelpCmd,
-    USAGE_PREFIX,
-};
+use std::str::FromStr;
+
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
 use iggy::prelude::*;
 use predicates::str::{contains, starts_with};
 use serial_test::parallel;
-use std::str::FromStr;
+
+use crate::cli::common::{
+    CLAP_INDENT, IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestConsumerId, TestHelpCmd,
+    USAGE_PREFIX,
+};
 
 struct TestConsumerOffsetGetCmd {
     consumer_id: u32,

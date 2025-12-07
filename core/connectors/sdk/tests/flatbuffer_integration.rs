@@ -16,12 +16,14 @@
  * under the License.
  */
 
-use iggy_connector_sdk::decoders::flatbuffer::{FlatBufferConfig, FlatBufferStreamDecoder};
-use iggy_connector_sdk::encoders::flatbuffer::{FlatBufferEncoderConfig, FlatBufferStreamEncoder};
-use iggy_connector_sdk::transforms::{FlatBufferConvert, FlatBufferConvertConfig, Transform};
-use iggy_connector_sdk::{Payload, Schema, StreamDecoder, StreamEncoder};
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::{collections::HashMap, path::PathBuf};
+
+use iggy_connector_sdk::{
+    Payload, Schema, StreamDecoder, StreamEncoder,
+    decoders::flatbuffer::{FlatBufferConfig, FlatBufferStreamDecoder},
+    encoders::flatbuffer::{FlatBufferEncoderConfig, FlatBufferStreamEncoder},
+    transforms::{FlatBufferConvert, FlatBufferConvertConfig, Transform},
+};
 
 #[tokio::test]
 async fn should_transform_with_real_schema_and_field_mapping() {

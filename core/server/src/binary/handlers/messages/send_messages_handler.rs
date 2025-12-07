@@ -16,20 +16,24 @@
  * under the License.
  */
 
-use crate::binary::command::{BinaryServerCommand, ServerCommandHandler};
-use crate::shard::IggyShard;
-use crate::streaming::segments::{IggyIndexesMut, IggyMessagesBatchMut};
-use crate::streaming::session::Session;
+use std::rc::Rc;
+
 use anyhow::Result;
 use compio::buf::{IntoInner as _, IoBuf};
-use iggy_common::INDEX_SIZE;
-use iggy_common::Identifier;
-use iggy_common::PooledBuffer;
-use iggy_common::SenderKind;
-use iggy_common::Sizeable;
-use iggy_common::{IggyError, Partitioning, SendMessages, Validatable};
-use std::rc::Rc;
+use iggy_common::{
+    INDEX_SIZE, Identifier, IggyError, Partitioning, PooledBuffer, SendMessages, SenderKind,
+    Sizeable, Validatable,
+};
 use tracing::instrument;
+
+use crate::{
+    binary::command::{BinaryServerCommand, ServerCommandHandler},
+    shard::IggyShard,
+    streaming::{
+        segments::{IggyIndexesMut, IggyMessagesBatchMut},
+        session::Session,
+    },
+};
 
 impl ServerCommandHandler for SendMessages {
     fn code(&self) -> u32 {

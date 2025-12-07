@@ -19,10 +19,8 @@
 #![allow(clippy::cast_precision_loss)]
 #![allow(clippy::struct_field_names)]
 
-use crate::analytics::time_series::{
-    calculator::TimeSeriesCalculator,
-    processors::{TimeSeriesProcessor, moving_average::MovingAverageProcessor},
-};
+use std::thread;
+
 use bench_report::{
     actor_kind::ActorKind,
     group_metrics::BenchmarkGroupMetrics,
@@ -32,7 +30,11 @@ use bench_report::{
     time_series::{TimeSeries, TimeSeriesKind},
     utils::{max, min, std_dev},
 };
-use std::thread;
+
+use crate::analytics::time_series::{
+    calculator::TimeSeriesCalculator,
+    processors::{TimeSeriesProcessor, moving_average::MovingAverageProcessor},
+};
 
 pub fn from_producers_and_consumers_statistics(
     producers_stats: &[BenchmarkIndividualMetrics],

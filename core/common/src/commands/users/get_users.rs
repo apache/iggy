@@ -16,13 +16,12 @@
  * under the License.
  */
 
-use crate::BytesSerializable;
-use crate::Validatable;
-use crate::error::IggyError;
-use crate::{Command, GET_USERS_CODE};
+use std::fmt::Display;
+
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-use std::fmt::Display;
+
+use crate::{BytesSerializable, Command, GET_USERS_CODE, Validatable, error::IggyError};
 
 /// `GetUsers` command is used to retrieve the information about all users.
 /// It has no additional payload.

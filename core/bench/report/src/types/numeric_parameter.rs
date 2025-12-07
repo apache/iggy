@@ -15,10 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::{fmt::Display, str::FromStr};
+
 use rand::Rng;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::fmt::Display;
-use std::str::FromStr;
 
 /// Represents a numeric argument that can be either a single value or a range.
 #[derive(Debug, Clone, Copy, PartialEq)]

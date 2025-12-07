@@ -16,31 +16,31 @@
  * under the License.
  */
 
-use crate::leader_aware::{LeaderRedirectionState, check_and_redirect_to_leader};
-use crate::prelude::AutoLogin;
-use iggy_binary_protocol::{
-    BinaryClient, BinaryTransport, Client, PersonalAccessTokenClient, UserClient,
-};
+use std::{net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
 
-use crate::prelude::{IggyDuration, IggyError, IggyTimestamp, QuicClientConfig};
-use crate::quic::skip_server_verification::SkipServerVerification;
 use async_broadcast::{Receiver, Sender, broadcast};
 use async_trait::async_trait;
 use bytes::Bytes;
+use iggy_binary_protocol::{
+    BinaryClient, BinaryTransport, Client, PersonalAccessTokenClient, UserClient,
+};
 use iggy_common::{
     ClientState, Command, ConnectionString, ConnectionStringUtils, Credentials, DiagnosticEvent,
     QuicConnectionStringOptions, TransportProtocol,
 };
-use quinn::crypto::rustls::QuicClientConfig as QuinnQuicClientConfig;
-use quinn::{ClientConfig, Connection, Endpoint, IdleTimeout, RecvStream, VarInt};
+use quinn::{
+    ClientConfig, Connection, Endpoint, IdleTimeout, RecvStream, VarInt,
+    crypto::rustls::QuicClientConfig as QuinnQuicClientConfig,
+};
 use rustls::crypto::CryptoProvider;
-use std::net::SocketAddr;
-use std::str::FromStr;
-use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::Mutex;
-use tokio::time::sleep;
+use tokio::{sync::Mutex, time::sleep};
 use tracing::{error, info, trace, warn};
+
+use crate::{
+    leader_aware::{LeaderRedirectionState, check_and_redirect_to_leader},
+    prelude::{AutoLogin, IggyDuration, IggyError, IggyTimestamp, QuicClientConfig},
+    quic::skip_server_verification::SkipServerVerification,
+};
 
 const REQUEST_INITIAL_BYTES_LENGTH: usize = 4;
 const RESPONSE_INITIAL_BYTES_LENGTH: usize = 8;

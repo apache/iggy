@@ -16,13 +16,15 @@
  * under the License.
  */
 
-use crate::shard::IggyShard;
-use crate::shard::task_registry::ShutdownToken;
-use crate::websocket::websocket_listener;
-use crate::websocket::websocket_tls_listener;
-use iggy_common::IggyError;
 use std::rc::Rc;
+
+use iggy_common::IggyError;
 use tracing::{error, info};
+
+use crate::{
+    shard::{IggyShard, task_registry::ShutdownToken},
+    websocket::{websocket_listener, websocket_tls_listener},
+};
 
 pub async fn spawn_websocket_server(
     shard: Rc<IggyShard>,

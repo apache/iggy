@@ -16,13 +16,15 @@
  * under the License.
  */
 
-use crate::CompressionAlgorithm;
-use crate::Partition;
-use crate::utils::byte_size::IggyByteSize;
-use crate::utils::expiry::IggyExpiry;
-use crate::utils::timestamp::IggyTimestamp;
-use crate::utils::topic_size::MaxTopicSize;
 use serde::{Deserialize, Serialize};
+
+use crate::{
+    CompressionAlgorithm, Partition,
+    utils::{
+        byte_size::IggyByteSize, expiry::IggyExpiry, timestamp::IggyTimestamp,
+        topic_size::MaxTopicSize,
+    },
+};
 
 /// `Topic` represents the medium level of logical separation of data as it's a part of the stream.
 /// It consists of the following fields:

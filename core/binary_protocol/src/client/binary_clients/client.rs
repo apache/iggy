@@ -16,14 +16,16 @@
  * under the License.
  */
 
+use std::fmt::Debug;
+
+use async_broadcast::Receiver;
+use async_trait::async_trait;
+use iggy_common::{DiagnosticEvent, IggyError};
+
 use crate::{
     ConsumerGroupClient, ConsumerOffsetClient, MessageClient, PartitionClient,
     PersonalAccessTokenClient, SegmentClient, StreamClient, SystemClient, TopicClient, UserClient,
 };
-use async_broadcast::Receiver;
-use async_trait::async_trait;
-use iggy_common::{DiagnosticEvent, IggyError};
-use std::fmt::Debug;
 
 /// The client trait which is the main interface to the Iggy server.
 /// It consists of multiple modules, each of which is responsible for a specific set of commands.

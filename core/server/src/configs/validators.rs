@@ -17,23 +17,30 @@
  * under the License.
  */
 
-use super::cluster::ClusterConfig;
-use super::server::{
-    DataMaintenanceConfig, MessageSaverConfig, MessagesMaintenanceConfig, TelemetryConfig,
-};
-use super::sharding::{CpuAllocation, ShardingConfig};
-use super::system::{CompressionConfig, PartitionConfig};
-use crate::configs::COMPONENT;
-use crate::configs::server::{MemoryPoolConfig, PersonalAccessTokenConfig, ServerConfig};
-use crate::configs::system::SegmentConfig;
-use crate::streaming::segments::*;
-use err_trail::ErrContext;
-use iggy_common::IggyExpiry;
-use iggy_common::MaxTopicSize;
-use iggy_common::Validatable;
-use iggy_common::{CompressionAlgorithm, ConfigurationError};
 use std::thread::available_parallelism;
+
+use err_trail::ErrContext;
+use iggy_common::{
+    CompressionAlgorithm, ConfigurationError, IggyExpiry, MaxTopicSize, Validatable,
+};
 use tracing::{error, warn};
+
+use super::{
+    cluster::ClusterConfig,
+    server::{
+        DataMaintenanceConfig, MessageSaverConfig, MessagesMaintenanceConfig, TelemetryConfig,
+    },
+    sharding::{CpuAllocation, ShardingConfig},
+    system::{CompressionConfig, PartitionConfig},
+};
+use crate::{
+    configs::{
+        COMPONENT,
+        server::{MemoryPoolConfig, PersonalAccessTokenConfig, ServerConfig},
+        system::SegmentConfig,
+    },
+    streaming::segments::*,
+};
 
 impl Validatable<ConfigurationError> for ServerConfig {
     fn validate(&self) -> Result<(), ConfigurationError> {

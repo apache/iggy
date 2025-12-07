@@ -16,14 +16,14 @@
  * under the License.
  */
 
-use crate::prelude::IggyClient;
 use async_trait::async_trait;
 use iggy_binary_protocol::SystemClient;
-use iggy_common::locking::IggyRwLockFn;
 use iggy_common::{
     ClientInfo, ClientInfoDetails, IggyDuration, IggyError, Snapshot, SnapshotCompression, Stats,
-    SystemSnapshotType,
+    SystemSnapshotType, locking::IggyRwLockFn,
 };
+
+use crate::prelude::IggyClient;
 
 #[async_trait]
 impl SystemClient for IggyClient {

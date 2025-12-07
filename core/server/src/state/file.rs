@@ -16,24 +16,26 @@
  * under the License.
  */
 
-use crate::state::command::EntryCommand;
-use crate::state::{COMPONENT, StateEntry};
-use crate::streaming::persistence::persister::PersisterKind;
-use crate::streaming::utils::file;
-use crate::versioning::SemanticVersion;
+use std::{
+    fmt::Debug,
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicU32, AtomicU64, Ordering},
+    },
+};
+
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use compio::io::AsyncReadExt;
 use err_trail::ErrContext;
-use iggy_common::BytesSerializable;
-use iggy_common::EncryptorKind;
-use iggy_common::IggyByteSize;
-use iggy_common::IggyError;
-use iggy_common::IggyTimestamp;
-use std::fmt::Debug;
-use std::path::Path;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use iggy_common::{BytesSerializable, EncryptorKind, IggyByteSize, IggyError, IggyTimestamp};
 use tracing::{debug, error, info};
+
+use crate::{
+    state::{COMPONENT, StateEntry, command::EntryCommand},
+    streaming::{persistence::persister::PersisterKind, utils::file},
+    versioning::SemanticVersion,
+};
 
 pub const BUF_CURSOR_CAPACITY_BYTES: usize = 512 * 1000;
 const FILE_STATE_PARSE_ERROR: &str = "STATE - failed to parse file state";

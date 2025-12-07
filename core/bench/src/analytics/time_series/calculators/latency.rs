@@ -19,11 +19,12 @@
 #![allow(clippy::cast_precision_loss)]
 #![allow(clippy::cast_possible_truncation)]
 
-use super::TimeSeriesCalculation;
-use crate::analytics::record::BenchmarkRecord;
 use bench_report::time_series::{TimePoint, TimeSeries, TimeSeriesKind};
 use iggy::prelude::IggyDuration;
 use tracing::warn;
+
+use super::TimeSeriesCalculation;
+use crate::analytics::record::BenchmarkRecord;
 
 /// Calculator for latency time series
 pub struct LatencyTimeSeriesCalculator;

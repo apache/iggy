@@ -16,17 +16,16 @@
  * under the License.
  */
 
-use super::defaults::*;
-use crate::BytesSerializable;
-use crate::Identifier;
-use crate::Sizeable;
-use crate::Validatable;
-use crate::error::IggyError;
-use crate::{CHANGE_PASSWORD_CODE, Command};
+use std::{fmt::Display, str::from_utf8};
+
 use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
-use std::fmt::Display;
-use std::str::from_utf8;
+
+use super::defaults::*;
+use crate::{
+    BytesSerializable, CHANGE_PASSWORD_CODE, Command, Identifier, Sizeable, Validatable,
+    error::IggyError,
+};
 
 /// `ChangePassword` command is used to change a user's password.
 /// It has additional payload:

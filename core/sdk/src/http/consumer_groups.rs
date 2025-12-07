@@ -16,14 +16,16 @@
  * under the License.
  */
 
-use crate::http::http_client::HttpClient;
-use crate::http::http_transport::HttpTransport;
-use crate::prelude::IggyError;
 use async_trait::async_trait;
 use iggy_binary_protocol::ConsumerGroupClient;
-use iggy_common::Identifier;
-use iggy_common::create_consumer_group::CreateConsumerGroup;
-use iggy_common::{ConsumerGroup, ConsumerGroupDetails};
+use iggy_common::{
+    ConsumerGroup, ConsumerGroupDetails, Identifier, create_consumer_group::CreateConsumerGroup,
+};
+
+use crate::{
+    http::{http_client::HttpClient, http_transport::HttpTransport},
+    prelude::IggyError,
+};
 
 #[async_trait]
 impl ConsumerGroupClient for HttpClient {

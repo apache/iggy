@@ -25,9 +25,8 @@ pub mod storage;
 
 pub use indexes::IggyIndexesMut;
 pub use segment::Segment;
-pub use types::IggyMessageHeaderViewMut;
-pub use types::IggyMessageViewMut;
-pub use types::IggyMessagesBatchMut;
-pub use types::IggyMessagesBatchSet;
+pub use types::{
+    IggyMessageHeaderViewMut, IggyMessageViewMut, IggyMessagesBatchMut, IggyMessagesBatchSet,
+};
 
 pub const SEGMENT_MAX_SIZE_BYTES: u64 = 1024 * 1024 * 1024;

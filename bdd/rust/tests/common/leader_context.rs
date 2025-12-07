@@ -16,10 +16,10 @@
  * under the License.
  */
 
-use cucumber::World;
-use iggy::clients::client::IggyClient;
-use iggy::prelude::ClusterNode;
 use std::collections::HashMap;
+
+use cucumber::World;
+use iggy::{clients::client::IggyClient, prelude::ClusterNode};
 
 #[derive(Debug, World, Default)]
 pub struct LeaderContext {

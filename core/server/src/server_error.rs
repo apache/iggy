@@ -17,10 +17,10 @@
  * under the License.
  */
 
+use std::{array::TryFromSliceError, io};
+
 use compio_quic::{ConnectionError as QuicConnectionError, ReadError, WriteError};
 use error_set::error_set;
-use std::array::TryFromSliceError;
-use std::io;
 
 error_set!(
     ServerError := ConfigurationError || ArchiverError || ConnectionError || LogError || CompatError || QuicError || ShardError

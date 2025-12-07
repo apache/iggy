@@ -17,9 +17,13 @@
  * under the License.
  */
 
-use crate::configs::connectors::{ConnectorsConfigProvider, create_connectors_config_provider};
-use configs::connectors::ConfigFormat;
-use configs::runtime::ConnectorsRuntimeConfig;
+use std::{
+    collections::HashMap,
+    env,
+    sync::{Arc, atomic::AtomicU32},
+};
+
+use configs::{connectors::ConfigFormat, runtime::ConnectorsRuntimeConfig};
 use dlopen2::wrapper::{Container, WrapperApi};
 use dotenvy::dotenv;
 use error::RuntimeError;
@@ -34,13 +38,10 @@ use iggy_connector_sdk::{
 };
 use mimalloc::MiMalloc;
 use state::StateStorage;
-use std::{
-    collections::HashMap,
-    env,
-    sync::{Arc, atomic::AtomicU32},
-};
 use tracing::{debug, info};
 use tracing_subscriber::{EnvFilter, Registry, layer::SubscriberExt, util::SubscriberInitExt};
+
+use crate::configs::connectors::{ConnectorsConfigProvider, create_connectors_config_provider};
 
 mod api;
 pub(crate) mod configs;

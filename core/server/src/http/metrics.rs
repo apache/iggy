@@ -16,15 +16,17 @@
  * under the License.
  */
 
-use crate::http::shared::AppState;
-use axum::body::Body;
+use std::sync::Arc;
+
 use axum::{
+    body::Body,
     extract::State,
     http::{Request, StatusCode},
     middleware::Next,
     response::Response,
 };
-use std::sync::Arc;
+
+use crate::http::shared::AppState;
 
 pub async fn metrics(
     State(state): State<Arc<AppState>>,

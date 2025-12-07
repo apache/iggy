@@ -16,13 +16,12 @@
  * under the License.
  */
 
-use crate::BytesSerializable;
-use crate::Validatable;
-use crate::error::IggyError;
-use crate::{Command, GET_STREAMS_CODE};
+use std::fmt::Display;
+
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-use std::fmt::Display;
+
+use crate::{BytesSerializable, Command, GET_STREAMS_CODE, Validatable, error::IggyError};
 
 /// `GetStreams` command is used to retrieve the information about all streams.
 /// It has no additional payload.

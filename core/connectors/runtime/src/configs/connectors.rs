@@ -20,18 +20,24 @@
 pub mod http_provider;
 mod local_provider;
 
-use crate::configs::connectors::http_provider::HttpConnectorsConfigProvider;
-use crate::configs::connectors::local_provider::LocalConnectorsConfigProvider;
-use crate::configs::runtime::ConnectorsConfig as RuntimeConnectorsConfig;
-use crate::error::RuntimeError;
+use std::{collections::HashMap, fmt::Formatter};
+
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use iggy_connector_sdk::Schema;
-use iggy_connector_sdk::transforms::TransformType;
+use iggy_connector_sdk::{Schema, transforms::TransformType};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::fmt::Formatter;
 use strum::Display;
+
+use crate::{
+    configs::{
+        connectors::{
+            http_provider::HttpConnectorsConfigProvider,
+            local_provider::LocalConnectorsConfigProvider,
+        },
+        runtime::ConnectorsConfig as RuntimeConnectorsConfig,
+    },
+    error::RuntimeError,
+};
 
 #[derive(
     Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize, Display,

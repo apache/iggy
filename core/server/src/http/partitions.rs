@@ -16,25 +16,28 @@
  * under the License.
  */
 
-use crate::http::COMPONENT;
-use crate::http::error::CustomError;
-use crate::http::jwt::json_web_token::Identity;
-use crate::http::shared::AppState;
-use crate::shard::transmission::event::ShardEvent;
-use crate::state::command::EntryCommand;
-use crate::streaming::session::Session;
-use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
-use axum::routing::post;
-use axum::{Extension, Json, Router, debug_handler};
-use err_trail::ErrContext;
-use iggy_common::Identifier;
-use iggy_common::Validatable;
-use iggy_common::create_partitions::CreatePartitions;
-use iggy_common::delete_partitions::DeletePartitions;
-use send_wrapper::SendWrapper;
 use std::sync::Arc;
+
+use axum::{
+    Extension, Json, Router, debug_handler,
+    extract::{Path, Query, State},
+    http::StatusCode,
+    routing::post,
+};
+use err_trail::ErrContext;
+use iggy_common::{
+    Identifier, Validatable, create_partitions::CreatePartitions,
+    delete_partitions::DeletePartitions,
+};
+use send_wrapper::SendWrapper;
 use tracing::instrument;
+
+use crate::{
+    http::{COMPONENT, error::CustomError, jwt::json_web_token::Identity, shared::AppState},
+    shard::transmission::event::ShardEvent,
+    state::command::EntryCommand,
+    streaming::session::Session,
+};
 
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()

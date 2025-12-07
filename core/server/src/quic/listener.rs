@@ -16,17 +16,20 @@
  * under the License.
  */
 
-use crate::binary::command::{ServerCommand, ServerCommandHandler};
-use crate::server_error::ConnectionError;
-use crate::shard::IggyShard;
-use crate::shard::task_registry::ShutdownToken;
-use crate::streaming::session::Session;
+use std::rc::Rc;
+
 use anyhow::anyhow;
 use compio_quic::{Connection, Endpoint, RecvStream, SendStream};
 use futures::FutureExt;
 use iggy_common::{GET_CLUSTER_METADATA_CODE, IggyError, SenderKind, TransportProtocol};
-use std::rc::Rc;
 use tracing::{debug, error, info, trace};
+
+use crate::{
+    binary::command::{ServerCommand, ServerCommandHandler},
+    server_error::ConnectionError,
+    shard::{IggyShard, task_registry::ShutdownToken},
+    streaming::session::Session,
+};
 
 const INITIAL_BYTES_LENGTH: usize = 4;
 

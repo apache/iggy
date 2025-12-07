@@ -16,20 +16,32 @@
  * under the License.
  */
 
-use super::examples::print_examples;
-use super::kinds::balanced::producer::BalancedProducerArgs;
-use super::kinds::balanced::producer_and_consumer_group::BalancedProducerAndConsumerGroupArgs;
-use super::kinds::end_to_end::producing_consumer::EndToEndProducingConsumerArgs;
-use super::kinds::end_to_end::producing_consumer_group::EndToEndProducingConsumerGroupArgs;
-use super::props::BenchmarkKindProps;
-use super::transport::BenchmarkTransportCommand;
-use crate::args::kinds::balanced::consumer_group::BalancedConsumerGroupArgs;
-use crate::args::kinds::pinned::consumer::PinnedConsumerArgs;
-use crate::args::kinds::pinned::producer::PinnedProducerArgs;
-use crate::args::kinds::pinned::producer_and_consumer::PinnedProducerAndConsumerArgs;
 use bench_report::benchmark_kind::BenchmarkKind;
 use clap::Subcommand;
 use iggy::prelude::IggyByteSize;
+
+use super::{
+    examples::print_examples,
+    kinds::{
+        balanced::{
+            producer::BalancedProducerArgs,
+            producer_and_consumer_group::BalancedProducerAndConsumerGroupArgs,
+        },
+        end_to_end::{
+            producing_consumer::EndToEndProducingConsumerArgs,
+            producing_consumer_group::EndToEndProducingConsumerGroupArgs,
+        },
+    },
+    props::BenchmarkKindProps,
+    transport::BenchmarkTransportCommand,
+};
+use crate::args::kinds::{
+    balanced::consumer_group::BalancedConsumerGroupArgs,
+    pinned::{
+        consumer::PinnedConsumerArgs, producer::PinnedProducerArgs,
+        producer_and_consumer::PinnedProducerAndConsumerArgs,
+    },
+};
 
 #[derive(Subcommand, Debug)]
 pub enum BenchmarkKindCommand {

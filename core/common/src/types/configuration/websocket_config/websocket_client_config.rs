@@ -16,12 +16,20 @@
  * under the License.
  */
 
-use crate::types::configuration::auth_config::connection_string::ConnectionString;
-use crate::types::configuration::websocket_config::websocket_connection_string_options::WebSocketConnectionStringOptions;
-use crate::{AutoLogin, IggyDuration, WebSocketClientReconnectionConfig};
-use std::fmt::{Display, Formatter};
-use std::str::FromStr;
+use std::{
+    fmt::{Display, Formatter},
+    str::FromStr,
+};
+
 use tungstenite::protocol::WebSocketConfig as TungsteniteConfig;
+
+use crate::{
+    AutoLogin, IggyDuration, WebSocketClientReconnectionConfig,
+    types::configuration::{
+        auth_config::connection_string::ConnectionString,
+        websocket_config::websocket_connection_string_options::WebSocketConnectionStringOptions,
+    },
+};
 
 /// Configuration for the WebSocket client.
 #[derive(Debug, Clone)]

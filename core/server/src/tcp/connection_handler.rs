@@ -16,19 +16,21 @@
  * under the License.
  */
 
-use crate::binary::command;
-use crate::binary::command::ServerCommandHandler;
-use crate::server_error::ConnectionError;
-use crate::shard::IggyShard;
-use crate::streaming::session::Session;
-use crate::tcp::connection_handler::command::ServerCommand;
+use std::{io::ErrorKind, rc::Rc};
+
 use async_channel::Receiver;
 use bytes::BytesMut;
 use futures::FutureExt;
 use iggy_common::{GET_CLUSTER_METADATA_CODE, IggyError, SenderKind};
-use std::io::ErrorKind;
-use std::rc::Rc;
 use tracing::{debug, error, info};
+
+use crate::{
+    binary::{command, command::ServerCommandHandler},
+    server_error::ConnectionError,
+    shard::IggyShard,
+    streaming::session::Session,
+    tcp::connection_handler::command::ServerCommand,
+};
 
 const INITIAL_BYTES_LENGTH: usize = 4;
 

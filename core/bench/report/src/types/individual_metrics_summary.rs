@@ -16,10 +16,10 @@
  * under the License.
  */
 
-use super::actor_kind::ActorKind;
-use crate::benchmark_kind::BenchmarkKind;
-use crate::utils::round_float;
 use serde::{Deserialize, Serialize};
+
+use super::actor_kind::ActorKind;
+use crate::{benchmark_kind::BenchmarkKind, utils::round_float};
 
 #[derive(Debug, Clone, Serialize, PartialEq, Deserialize)]
 pub struct BenchmarkIndividualMetricsSummary {

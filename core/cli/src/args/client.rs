@@ -16,9 +16,9 @@
  * under the License.
  */
 
-use crate::args::common::ListMode;
-
 use clap::{Args, Subcommand};
+
+use crate::args::common::ListMode;
 
 #[derive(Debug, Clone, Subcommand)]
 pub(crate) enum ClientAction {

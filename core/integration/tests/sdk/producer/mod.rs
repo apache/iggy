@@ -19,8 +19,7 @@
 mod background;
 
 use bytes::Bytes;
-use iggy::clients::client::IggyClient;
-use iggy::prelude::*;
+use iggy::{clients::client::IggyClient, prelude::*};
 
 const PARTITION_ID: u32 = 0;
 const STREAM_NAME: &str = "test-stream-producer";

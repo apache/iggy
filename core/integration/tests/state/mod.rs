@@ -16,15 +16,24 @@
  * under the License.
  */
 
+use std::{
+    str::FromStr,
+    sync::{
+        Arc,
+        atomic::{AtomicU32, AtomicU64},
+    },
+};
+
 use compio::fs::create_dir;
 use iggy::prelude::{Aes256GcmEncryptor, EncryptorKind};
-use server::state::file::FileState;
-use server::streaming::persistence::persister::{FileWithSyncPersister, PersisterKind};
-use server::streaming::utils::file::overwrite;
-use server::versioning::SemanticVersion;
-use std::str::FromStr;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64};
+use server::{
+    state::file::FileState,
+    streaming::{
+        persistence::persister::{FileWithSyncPersister, PersisterKind},
+        utils::file::overwrite,
+    },
+    versioning::SemanticVersion,
+};
 use uuid::Uuid;
 
 mod file;

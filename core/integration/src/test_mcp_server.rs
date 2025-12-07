@@ -16,6 +16,16 @@
  * under the License.
  */
 
+use std::{
+    collections::HashMap,
+    fs::{self, File},
+    net::{Ipv4Addr, SocketAddr, TcpListener},
+    path::PathBuf,
+    process::{Child, Command, Stdio},
+    thread::panicking,
+    time::Duration,
+};
+
 use assert_cmd::prelude::CommandCargoExt;
 use rand::Rng;
 use rmcp::{
@@ -24,13 +34,6 @@ use rmcp::{
     service::RunningService,
     transport::StreamableHttpClientTransport,
 };
-use std::fs::{self, File};
-use std::net::{Ipv4Addr, SocketAddr};
-use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
-use std::thread::panicking;
-use std::time::Duration;
-use std::{collections::HashMap, net::TcpListener};
 use tokio::time::sleep;
 
 pub const CONSUMER_NAME: &str = "mcp";
@@ -127,8 +130,7 @@ impl TestMcpServer {
         if let Some(mut child_handle) = self.child_handle.take() {
             #[cfg(unix)]
             unsafe {
-                use libc::SIGTERM;
-                use libc::kill;
+                use libc::{SIGTERM, kill};
                 kill(child_handle.id() as libc::pid_t, SIGTERM);
             }
 

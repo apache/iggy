@@ -16,10 +16,11 @@
  * under the License.
  */
 
-use crate::shard::IggyShard;
-use crate::shard::task_registry::ShutdownToken;
-use iggy_common::IggyError;
 use std::rc::Rc;
+
+use iggy_common::IggyError;
+
+use crate::shard::{IggyShard, task_registry::ShutdownToken};
 
 pub fn spawn_websocket_server(shard: Rc<IggyShard>) {
     let shard_clone = shard.clone();

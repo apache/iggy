@@ -15,13 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::{cache::BenchmarkCache, error::IggyBenchDashboardServerError};
-use actix_web::{HttpRequest, HttpResponse, get, web};
 use std::sync::Arc;
+
+use actix_web::{HttpRequest, HttpResponse, get, web};
 use tracing::{info, warn};
 use uuid::Uuid;
 use walkdir::WalkDir;
 use zip::{ZipWriter, write::FileOptions};
+
+use crate::{cache::BenchmarkCache, error::IggyBenchDashboardServerError};
 
 type Result<T> = std::result::Result<T, IggyBenchDashboardServerError>;
 

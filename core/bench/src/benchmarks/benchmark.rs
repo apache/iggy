@@ -16,26 +16,28 @@
  * under the License.
  */
 
-use crate::args::kind::BenchmarkKindCommand;
-use crate::{args::common::IggyBenchArgs, utils::client_factory::create_client_factory};
-use async_trait::async_trait;
-use bench_report::benchmark_kind::BenchmarkKind;
-use bench_report::individual_metrics::BenchmarkIndividualMetrics;
-use iggy::clients::client::IggyClient;
-use iggy::prelude::*;
-use integration::test_server::{ClientFactory, login_root};
 use std::sync::Arc;
+
+use async_trait::async_trait;
+use bench_report::{benchmark_kind::BenchmarkKind, individual_metrics::BenchmarkIndividualMetrics};
+use iggy::{clients::client::IggyClient, prelude::*};
+use integration::test_server::{ClientFactory, login_root};
 use tokio::task::JoinSet;
 use tracing::info;
 
-use super::balanced_consumer_group::BalancedConsumerGroupBenchmark;
-use super::balanced_producer::BalancedProducerBenchmark;
-use super::balanced_producer_and_consumer_group::BalancedProducerAndConsumerGroupBenchmark;
-use super::end_to_end_producing_consumer::EndToEndProducingConsumerBenchmark;
-use super::end_to_end_producing_consumer_group::EndToEndProducingConsumerGroupBenchmark;
-use super::pinned_consumer::PinnedConsumerBenchmark;
-use super::pinned_producer::PinnedProducerBenchmark;
-use super::pinned_producer_and_consumer::PinnedProducerAndConsumerBenchmark;
+use super::{
+    balanced_consumer_group::BalancedConsumerGroupBenchmark,
+    balanced_producer::BalancedProducerBenchmark,
+    balanced_producer_and_consumer_group::BalancedProducerAndConsumerGroupBenchmark,
+    end_to_end_producing_consumer::EndToEndProducingConsumerBenchmark,
+    end_to_end_producing_consumer_group::EndToEndProducingConsumerGroupBenchmark,
+    pinned_consumer::PinnedConsumerBenchmark, pinned_producer::PinnedProducerBenchmark,
+    pinned_producer_and_consumer::PinnedProducerAndConsumerBenchmark,
+};
+use crate::{
+    args::{common::IggyBenchArgs, kind::BenchmarkKindCommand},
+    utils::client_factory::create_client_factory,
+};
 
 impl From<IggyBenchArgs> for Box<dyn Benchmarkable> {
     fn from(args: IggyBenchArgs) -> Self {

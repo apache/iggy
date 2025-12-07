@@ -16,17 +16,21 @@
  * under the License.
  */
 
-use crate::http::jwt::json_web_token::Identity;
-use crate::http::shared::{AppState, RequestDetails};
-use axum::body::Body;
+use std::sync::Arc;
+
 use axum::{
+    body::Body,
     extract::State,
     http::{Request, StatusCode},
     middleware::Next,
     response::Response,
 };
 use err_trail::ErrContext;
-use std::sync::Arc;
+
+use crate::http::{
+    jwt::json_web_token::Identity,
+    shared::{AppState, RequestDetails},
+};
 
 const COMPONENT: &str = "JWT_MIDDLEWARE";
 const AUTHORIZATION: &str = "authorization";

@@ -16,10 +16,12 @@
  * under the License.
  */
 
-use crate::shard::IggyShard;
-use iggy_common::{Identifier, IggyError};
 use std::rc::Rc;
+
+use iggy_common::{Identifier, IggyError};
 use tracing::{error, info, trace};
+
+use crate::shard::IggyShard;
 
 pub fn spawn_message_saver(shard: Rc<IggyShard>) {
     let period = shard.config.message_saver.interval.get_duration();

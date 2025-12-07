@@ -16,13 +16,11 @@
  * under the License.
  */
 
+use std::{path::Path, process::Command, time::Instant};
+
 use bench_report::report::BenchmarkReport;
-use charming::theme::Theme;
-use charming::{Chart, HtmlRenderer};
+use charming::{Chart, HtmlRenderer, theme::Theme};
 use iggy::prelude::IggyByteSize;
-use std::path::Path;
-use std::process::Command;
-use std::time::Instant;
 use tracing::info;
 
 pub enum ChartType {

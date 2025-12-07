@@ -15,10 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::{DigitallySignedStruct, Error, SignatureScheme};
 use std::sync::Arc;
+
+use rustls::{
+    DigitallySignedStruct, Error, SignatureScheme,
+    client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+    pki_types::{CertificateDer, ServerName, UnixTime},
+};
 
 #[derive(Debug)]
 pub(crate) struct SkipServerVerification;

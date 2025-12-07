@@ -16,14 +16,16 @@
  * under the License.
  */
 
-use crate::BytesSerializable;
-use crate::error::IggyError;
-use crate::types::message::polling_kind::PollingKind;
-use crate::utils::timestamp::IggyTimestamp;
+use std::fmt::Display;
+
 use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
 use serde_with::{DisplayFromStr, serde_as};
-use std::fmt::Display;
+
+use crate::{
+    BytesSerializable, error::IggyError, types::message::polling_kind::PollingKind,
+    utils::timestamp::IggyTimestamp,
+};
 
 /// Default value for the polling strategy.
 const DEFAULT_POLLING_STRATEGY_VALUE: u64 = 0;

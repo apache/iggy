@@ -16,16 +16,18 @@
  * under the License.
  */
 
-use crate::BytesSerializable;
-use crate::Validatable;
-use crate::defaults::*;
-use crate::error::IggyError;
-use crate::utils::expiry::IggyExpiry;
-use crate::{CREATE_PERSONAL_ACCESS_TOKEN_CODE, Command};
+use std::{
+    fmt::{Display, Formatter},
+    str::from_utf8,
+};
+
 use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
-use std::fmt::{Display, Formatter};
-use std::str::from_utf8;
+
+use crate::{
+    BytesSerializable, CREATE_PERSONAL_ACCESS_TOKEN_CODE, Command, Validatable, defaults::*,
+    error::IggyError, utils::expiry::IggyExpiry,
+};
 
 /// `CreatePersonalAccessToken` command is used to create a new personal access token for the authenticated user.
 /// It has additional payload:

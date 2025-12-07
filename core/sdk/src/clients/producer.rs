@@ -15,29 +15,35 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-use super::ORDERING;
-use crate::client_wrappers::client_wrapper::ClientWrapper;
-use crate::clients::MAX_BATCH_LENGTH;
-use crate::clients::producer_builder::SendMode;
-use crate::clients::producer_config::DirectConfig;
-use crate::clients::producer_dispatcher::ProducerDispatcher;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    time::Duration,
+};
+
 use bytes::Bytes;
 use futures_util::StreamExt;
 use iggy_binary_protocol::{Client, MessageClient, StreamClient, TopicClient};
-use iggy_common::locking::{IggyRwLock, IggyRwLockFn};
 use iggy_common::{
     CompressionAlgorithm, DiagnosticEvent, EncryptorKind, IdKind, Identifier, IggyDuration,
     IggyError, IggyExpiry, IggyMessage, IggyTimestamp, MaxTopicSize, Partitioner, Partitioning,
+    locking::{IggyRwLock, IggyRwLockFn},
 };
-use std::sync::Arc;
-use std::sync::atomic::Ordering;
-use std::sync::atomic::{AtomicBool, AtomicU64};
-use std::time::Duration;
+#[cfg(test)]
+use mockall::automock;
 use tokio::time::{Interval, sleep};
 use tracing::{error, info, trace, warn};
 
-#[cfg(test)]
-use mockall::automock;
+use super::ORDERING;
+use crate::{
+    client_wrappers::client_wrapper::ClientWrapper,
+    clients::{
+        MAX_BATCH_LENGTH, producer_builder::SendMode, producer_config::DirectConfig,
+        producer_dispatcher::ProducerDispatcher,
+    },
+};
 
 #[cfg_attr(test, automock)]
 pub trait ProducerCoreBackend: Send + Sync + 'static {

@@ -16,12 +16,13 @@
  * under the License.
  */
 
-use crate::{
-    BytesSerializable, IGGY_MESSAGE_HEADER_SIZE, IggyMessage, IggyMessageHeader, error::IggyError,
-};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use tracing::error;
+
+use crate::{
+    BytesSerializable, IGGY_MESSAGE_HEADER_SIZE, IggyMessage, IggyMessageHeader, error::IggyError,
+};
 
 /// The wrapper on top of the collection of messages that are polled from the partition.
 /// It consists of the following fields:

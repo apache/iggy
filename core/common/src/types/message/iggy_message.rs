@@ -16,21 +16,22 @@
  * under the License.
  */
 
-use super::message_header::{IGGY_MESSAGE_HEADER_SIZE, IggyMessageHeader};
-use super::user_headers::get_user_headers_size;
-use crate::BytesSerializable;
-use crate::Sizeable;
-use crate::error::IggyError;
-use crate::utils::byte_size::IggyByteSize;
-use crate::utils::timestamp::IggyTimestamp;
-use crate::{HeaderKey, HeaderValue};
+use std::{collections::HashMap, convert::TryFrom, str::FromStr};
+
 use bon::bon;
 use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::collections::HashMap;
-use std::convert::TryFrom;
-use std::str::FromStr;
 use tracing::warn;
+
+use super::{
+    message_header::{IGGY_MESSAGE_HEADER_SIZE, IggyMessageHeader},
+    user_headers::get_user_headers_size,
+};
+use crate::{
+    BytesSerializable, HeaderKey, HeaderValue, Sizeable,
+    error::IggyError,
+    utils::{byte_size::IggyByteSize, timestamp::IggyTimestamp},
+};
 
 /// Maximum allowed size in bytes for a message payload.
 ///
@@ -567,8 +568,9 @@ impl<'de> Deserialize<'de> for IggyMessage {
     where
         D: Deserializer<'de>,
     {
-        use serde::de::{self, MapAccess, Visitor};
         use std::fmt;
+
+        use serde::de::{self, MapAccess, Visitor};
 
         struct IggyMessageVisitor;
 

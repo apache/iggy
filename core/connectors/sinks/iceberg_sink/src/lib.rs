@@ -16,10 +16,11 @@
  * under the License.
  */
 
-use crate::router::Router;
 use iggy_connector_sdk::{Error, sink_connector};
 use serde::{Deserialize, Serialize};
 use strum::Display as StrumDisplay;
+
+use crate::router::Router;
 
 mod catalog;
 mod props;

@@ -16,8 +16,9 @@
  * under the License.
  */
 
-use crate::UserId;
 use serde::{Deserialize, Serialize};
+
+use crate::UserId;
 
 /// `IdentityInfo` represents the information about an identity.
 /// It consists of the following fields:

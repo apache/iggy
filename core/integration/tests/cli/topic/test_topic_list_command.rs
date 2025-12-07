@@ -16,17 +16,16 @@
  * under the License.
  */
 
+use assert_cmd::assert::Assert;
+use async_trait::async_trait;
+use iggy::prelude::{Client, IggyExpiry, MaxTopicSize};
+use predicates::str::{contains, starts_with};
+use serial_test::parallel;
+
 use crate::cli::common::{
     CLAP_INDENT, IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, OutputFormat, TestHelpCmd,
     TestStreamId, USAGE_PREFIX,
 };
-use assert_cmd::assert::Assert;
-use async_trait::async_trait;
-use iggy::prelude::Client;
-use iggy::prelude::IggyExpiry;
-use iggy::prelude::MaxTopicSize;
-use predicates::str::{contains, starts_with};
-use serial_test::parallel;
 
 struct TestTopicListCmd {
     stream_id: u32,

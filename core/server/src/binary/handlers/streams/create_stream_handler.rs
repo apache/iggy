@@ -16,27 +16,31 @@
  * under the License.
  */
 
-use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
-use crate::binary::handlers::streams::COMPONENT;
-use crate::binary::handlers::utils::receive_and_validate;
-use crate::binary::mapper;
+use std::rc::Rc;
 
-use crate::shard::IggyShard;
-use crate::shard::transmission::event::ShardEvent;
-use crate::shard::transmission::frame::ShardResponse;
-use crate::shard::transmission::message::{
-    ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult,
-};
-use crate::slab::traits_ext::{EntityComponentSystem, EntityMarker};
-use crate::state::command::EntryCommand;
-use crate::state::models::CreateStreamWithId;
-use crate::streaming::session::Session;
 use anyhow::Result;
 use err_trail::ErrContext;
-use iggy_common::create_stream::CreateStream;
-use iggy_common::{Identifier, IggyError, SenderKind};
-use std::rc::Rc;
+use iggy_common::{Identifier, IggyError, SenderKind, create_stream::CreateStream};
 use tracing::{debug, instrument};
+
+use crate::{
+    binary::{
+        command::{BinaryServerCommand, ServerCommand, ServerCommandHandler},
+        handlers::{streams::COMPONENT, utils::receive_and_validate},
+        mapper,
+    },
+    shard::{
+        IggyShard,
+        transmission::{
+            event::ShardEvent,
+            frame::ShardResponse,
+            message::{ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult},
+        },
+    },
+    slab::traits_ext::{EntityComponentSystem, EntityMarker},
+    state::{command::EntryCommand, models::CreateStreamWithId},
+    streaming::session::Session,
+};
 
 impl ServerCommandHandler for CreateStream {
     fn code(&self) -> u32 {

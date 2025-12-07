@@ -15,14 +15,18 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::client_wrappers::client_wrapper::ClientWrapper;
-use crate::clients::producer_config::{BackgroundConfig, DirectConfig};
-use crate::prelude::IggyProducer;
-use iggy_common::locking::IggyRwLock;
+use std::sync::Arc;
+
 use iggy_common::{
     EncryptorKind, Identifier, IggyDuration, IggyExpiry, MaxTopicSize, Partitioner, Partitioning,
+    locking::IggyRwLock,
 };
-use std::sync::Arc;
+
+use crate::{
+    client_wrappers::client_wrapper::ClientWrapper,
+    clients::producer_config::{BackgroundConfig, DirectConfig},
+    prelude::IggyProducer,
+};
 
 pub enum SendMode {
     Direct(DirectConfig),

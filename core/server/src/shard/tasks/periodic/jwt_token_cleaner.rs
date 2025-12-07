@@ -16,13 +16,12 @@
  * under the License.
  */
 
-use crate::http::shared::AppState;
-use crate::shard::IggyShard;
+use std::{rc::Rc, sync::Arc, time::Duration};
+
 use iggy_common::{IggyError, IggyTimestamp};
-use std::rc::Rc;
-use std::sync::Arc;
-use std::time::Duration;
 use tracing::{error, info, trace};
+
+use crate::{http::shared::AppState, shard::IggyShard};
 
 const JWT_TOKENS_CLEANER_PERIOD: Duration = Duration::from_secs(300);
 

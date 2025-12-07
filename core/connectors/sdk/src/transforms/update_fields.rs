@@ -16,9 +16,10 @@
  * under the License.
  */
 
+use serde::{Deserialize, Serialize};
+
 use super::{FieldValue, Transform, TransformType};
 use crate::{DecodedMessage, Error, Payload, TopicMetadata};
-use serde::{Deserialize, Serialize};
 
 /// A field to be updated in messages
 #[derive(Debug, Serialize, Deserialize)]

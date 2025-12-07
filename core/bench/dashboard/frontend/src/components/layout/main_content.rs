@@ -15,11 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::components::chart::single_chart::SingleChart;
-use crate::components::layout::topbar::TopBar;
-use crate::state::benchmark::use_benchmark;
-use crate::state::ui::{ViewMode, use_ui};
 use yew::prelude::*;
+
+use crate::{
+    components::{chart::single_chart::SingleChart, layout::topbar::TopBar},
+    state::{
+        benchmark::use_benchmark,
+        ui::{ViewMode, use_ui},
+    },
+};
 
 #[derive(Properties, PartialEq)]
 pub struct MainContentProps {

@@ -16,22 +16,19 @@
  * under the License.
  */
 
+use std::{str::FromStr, time::Duration};
+
+use assert_cmd::assert::Assert;
+use async_trait::async_trait;
+use humantime::Duration as HumanDuration;
+use iggy::prelude::{Client, CompressionAlgorithm, IggyByteSize, IggyExpiry, MaxTopicSize};
+use predicates::str::diff;
+use serial_test::parallel;
+
 use crate::cli::common::{
     CLAP_INDENT, IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestHelpCmd, TestStreamId,
     USAGE_PREFIX,
 };
-use assert_cmd::assert::Assert;
-use async_trait::async_trait;
-use humantime::Duration as HumanDuration;
-use iggy::prelude::Client;
-use iggy::prelude::CompressionAlgorithm;
-use iggy::prelude::IggyByteSize;
-use iggy::prelude::IggyExpiry;
-use iggy::prelude::MaxTopicSize;
-use predicates::str::diff;
-use serial_test::parallel;
-use std::str::FromStr;
-use std::time::Duration;
 
 struct TestTopicCreateCmd {
     stream_id: u32,

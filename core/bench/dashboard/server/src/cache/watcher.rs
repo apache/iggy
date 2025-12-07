@@ -15,15 +15,18 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::{
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use tokio::{runtime::Handle, time::sleep};
+use tracing::{error, info};
+
 use super::BenchmarkCache;
 use crate::error::IggyBenchDashboardServerError;
-use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tokio::runtime::Handle;
-use tokio::time::sleep;
-use tracing::{error, info};
 
 pub struct CacheWatcher {
     _watcher: RecommendedWatcher,

@@ -16,9 +16,10 @@
  * under the License.
  */
 
-use crate::common::global_context::GlobalContext;
 use cucumber::{then, when};
 use iggy::prelude::{CompressionAlgorithm, Identifier, IggyExpiry, MaxTopicSize, TopicClient};
+
+use crate::common::global_context::GlobalContext;
 
 #[when(regex = r"^I create a topic with name (.+) in stream (\d+) with (\d+) partitions$")]
 pub async fn when_create_topic(

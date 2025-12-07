@@ -15,13 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::fmt::Debug;
+
+use iggy_common::INDEX_SIZE;
+use ringbuffer::AllocRingBuffer;
+
 use crate::streaming::{
     partitions::journal::Journal,
     segments::{IggyIndexesMut, Segment, storage::Storage},
 };
-use iggy_common::INDEX_SIZE;
-use ringbuffer::AllocRingBuffer;
-use std::fmt::Debug;
 
 const SEGMENTS_CAPACITY: usize = 1024;
 const ACCESS_MAP_CAPACITY: usize = 8;

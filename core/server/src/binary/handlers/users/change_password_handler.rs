@@ -16,22 +16,22 @@
  * under the License.
  */
 
-use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
-use crate::binary::handlers::users::COMPONENT;
-use crate::binary::handlers::utils::receive_and_validate;
+use std::rc::Rc;
 
-use crate::shard::IggyShard;
-use crate::shard::transmission::event::ShardEvent;
-use crate::state::command::EntryCommand;
-use crate::streaming::session::Session;
-use crate::streaming::utils::crypto;
 use anyhow::Result;
 use err_trail::ErrContext;
-use iggy_common::change_password::ChangePassword;
-use iggy_common::{IggyError, SenderKind};
-use std::rc::Rc;
-use tracing::info;
-use tracing::{debug, instrument};
+use iggy_common::{IggyError, SenderKind, change_password::ChangePassword};
+use tracing::{debug, info, instrument};
+
+use crate::{
+    binary::{
+        command::{BinaryServerCommand, ServerCommand, ServerCommandHandler},
+        handlers::{users::COMPONENT, utils::receive_and_validate},
+    },
+    shard::{IggyShard, transmission::event::ShardEvent},
+    state::command::EntryCommand,
+    streaming::{session::Session, utils::crypto},
+};
 
 impl ServerCommandHandler for ChangePassword {
     fn code(&self) -> u32 {

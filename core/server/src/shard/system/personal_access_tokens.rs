@@ -16,16 +16,18 @@
  * under the License.
  */
 
-use super::COMPONENT;
-use crate::shard::IggyShard;
-use crate::streaming::personal_access_tokens::personal_access_token::PersonalAccessToken;
-use crate::streaming::session::Session;
-use crate::streaming::users::user::User;
 use err_trail::ErrContext;
-use iggy_common::IggyError;
-use iggy_common::IggyExpiry;
-use iggy_common::IggyTimestamp;
+use iggy_common::{IggyError, IggyExpiry, IggyTimestamp};
 use tracing::{error, info};
+
+use super::COMPONENT;
+use crate::{
+    shard::IggyShard,
+    streaming::{
+        personal_access_tokens::personal_access_token::PersonalAccessToken, session::Session,
+        users::user::User,
+    },
+};
 
 impl IggyShard {
     pub fn get_personal_access_tokens(

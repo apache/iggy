@@ -16,15 +16,21 @@
  * under the License.
  */
 
-use crate::Client;
-use crate::cli::cli_command::{CliCommand, PRINT_TARGET};
+use std::{
+    fmt::{Display, Formatter, Result},
+    time::Duration,
+};
+
 use anyhow::Context;
 use async_trait::async_trait;
 use iggy_common::ping::Ping;
-use std::fmt::{Display, Formatter, Result};
-use std::time::Duration;
 use tokio::time::{Instant, sleep};
 use tracing::{Level, event};
+
+use crate::{
+    Client,
+    cli::cli_command::{CliCommand, PRINT_TARGET},
+};
 
 pub struct PingCmd {
     _ping: Ping,

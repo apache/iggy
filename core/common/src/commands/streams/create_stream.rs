@@ -16,15 +16,13 @@
  * under the License.
  */
 
-use super::MAX_NAME_LENGTH;
-use crate::BytesSerializable;
-use crate::Validatable;
-use crate::error::IggyError;
-use crate::{CREATE_STREAM_CODE, Command};
+use std::{fmt::Display, str::from_utf8};
+
 use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
-use std::fmt::Display;
-use std::str::from_utf8;
+
+use super::MAX_NAME_LENGTH;
+use crate::{BytesSerializable, CREATE_STREAM_CODE, Command, Validatable, error::IggyError};
 
 /// `CreateStream` command is used to create a new stream.
 /// It has additional payload:

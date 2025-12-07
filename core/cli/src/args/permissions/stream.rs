@@ -16,15 +16,17 @@
  * under the License.
  */
 
+use std::str::FromStr;
+
+use ahash::AHashMap;
+use iggy::prelude::StreamPermissions;
+
 use super::constants::{
     MANAGE_STREAM_LONG, MANAGE_STREAM_SHORT, MANAGE_TOPICS_LONG, MANAGE_TOPICS_SHORT,
     POLL_MESSAGES_LONG, POLL_MESSAGES_SHORT, READ_STREAM_LONG, READ_STREAM_SHORT, READ_TOPICS_LONG,
     READ_TOPICS_SHORT, SEND_MESSAGES_LONG, SEND_MESSAGES_SHORT,
 };
 use crate::args::permissions::topic::TopicPermissionsArg;
-use ahash::AHashMap;
-use iggy::prelude::StreamPermissions;
-use std::str::FromStr;
 
 #[derive(Debug, PartialEq)]
 pub(super) enum StreamPermission {

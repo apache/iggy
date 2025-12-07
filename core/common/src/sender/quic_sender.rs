@@ -16,14 +16,13 @@
  * under the License.
  */
 
-use super::{PooledBuffer, Sender};
-use crate::IggyError;
-use compio::BufResult;
-use compio::buf::IoBufMut;
-use compio::io::AsyncReadExt;
+use compio::{BufResult, buf::IoBufMut, io::AsyncReadExt};
 use compio_quic::{RecvStream, SendStream};
 use err_trail::ErrContext;
 use tracing::{debug, error};
+
+use super::{PooledBuffer, Sender};
+use crate::IggyError;
 
 const COMPONENT: &str = "QUIC";
 const STATUS_OK: &[u8] = &[0; 4];

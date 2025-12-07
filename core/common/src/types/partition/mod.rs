@@ -16,9 +16,9 @@
  * under the License.
  */
 
-use crate::utils::byte_size::IggyByteSize;
-use crate::utils::timestamp::IggyTimestamp;
 use serde::{Deserialize, Serialize};
+
+use crate::utils::{byte_size::IggyByteSize, timestamp::IggyTimestamp};
 
 /// `Partition` represents the information about a partition.
 /// It consists of the following fields:

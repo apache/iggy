@@ -18,9 +18,6 @@
 
 use std::collections::HashMap;
 
-use crate::cli::common::{
-    CLAP_INDENT, IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestHelpCmd, USAGE_PREFIX,
-};
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
 use iggy::prelude::Client;
@@ -29,6 +26,9 @@ use predicates::str::contains;
 use serial_test::parallel;
 
 use super::common::TestIggyContext;
+use crate::cli::common::{
+    CLAP_INDENT, IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestHelpCmd, USAGE_PREFIX,
+};
 
 struct TestContextListCmd {
     test_iggy_context: TestIggyContext,

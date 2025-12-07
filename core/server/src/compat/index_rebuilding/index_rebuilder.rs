@@ -16,13 +16,13 @@
  * under the License.
  */
 
-use crate::server_error::CompatError;
-use crate::streaming::utils::file;
 use compio::{
     fs::File,
     io::{AsyncBufRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter},
 };
 use iggy_common::{IGGY_MESSAGE_HEADER_SIZE, IggyMessageHeader};
+
+use crate::{server_error::CompatError, streaming::utils::file};
 
 pub struct IndexRebuilder {
     pub messages_file_path: String,

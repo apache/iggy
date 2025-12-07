@@ -16,13 +16,14 @@
  * under the License.
  */
 
-use crate::clients::consumer::{AutoCommit, AutoCommitWhen};
-use crate::prelude::{
-    ConsumerKind, EncryptorKind, Identifier, IggyDuration, IggyError, PollingStrategy,
-};
+use std::{str::FromStr, sync::Arc};
+
 use bon::Builder;
-use std::str::FromStr;
-use std::sync::Arc;
+
+use crate::{
+    clients::consumer::{AutoCommit, AutoCommitWhen},
+    prelude::{ConsumerKind, EncryptorKind, Identifier, IggyDuration, IggyError, PollingStrategy},
+};
 
 #[derive(Builder, Debug, Clone)]
 #[builder(on(String, into))]

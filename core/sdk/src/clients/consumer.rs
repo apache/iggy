@@ -16,7 +16,18 @@
  * under the License.
  */
 
-use crate::client_wrappers::client_wrapper::ClientWrapper;
+use std::{
+    collections::VecDeque,
+    future::Future,
+    pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU32, AtomicU64},
+    },
+    task::{Context, Poll},
+    time::Duration,
+};
+
 use bytes::Bytes;
 use dashmap::DashMap;
 use futures::Stream;
@@ -24,21 +35,15 @@ use futures_util::{FutureExt, StreamExt};
 use iggy_binary_protocol::{
     Client, ConsumerGroupClient, ConsumerOffsetClient, MessageClient, StreamClient, TopicClient,
 };
-use iggy_common::locking::{IggyRwLock, IggyRwLockFn};
 use iggy_common::{
     Consumer, ConsumerKind, DiagnosticEvent, EncryptorKind, IdKind, Identifier, IggyDuration,
     IggyError, IggyMessage, IggyTimestamp, PolledMessages, PollingKind, PollingStrategy,
+    locking::{IggyRwLock, IggyRwLockFn},
 };
-use std::collections::VecDeque;
-use std::future::Future;
-use std::pin::Pin;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
-use std::task::{Context, Poll};
-use std::time::Duration;
-use tokio::time;
-use tokio::time::sleep;
+use tokio::{time, time::sleep};
 use tracing::{error, info, trace, warn};
+
+use crate::client_wrappers::client_wrapper::ClientWrapper;
 
 const ORDERING: std::sync::atomic::Ordering = std::sync::atomic::Ordering::SeqCst;
 type PollMessagesFuture = Pin<Box<dyn Future<Output = Result<PolledMessages, IggyError>>>>;

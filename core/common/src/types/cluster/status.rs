@@ -15,10 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::{BytesSerializable, IggyError};
 use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
 use strum::{AsRefStr, Display as StrumDisplay, EnumString};
+
+use crate::{BytesSerializable, IggyError};
 
 /// Current status of a node
 #[derive(

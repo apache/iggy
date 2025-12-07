@@ -16,9 +16,10 @@
  * under the License.
  */
 
+use serde::{Deserialize, Serialize};
+
 use super::group_metrics_kind::GroupMetricsKind;
 use crate::utils::round_float;
-use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Clone, PartialEq, Deserialize)]
 pub struct BenchmarkGroupMetricsSummary {

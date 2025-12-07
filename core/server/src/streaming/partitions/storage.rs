@@ -15,20 +15,22 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::COMPONENT;
-use crate::{
-    configs::system::SystemConfig, io::fs_utils::remove_dir_all,
-    streaming::partitions::consumer_offset::ConsumerOffset,
-    streaming::polling_consumer::ConsumerGroupId,
-};
+use std::{io::Read, path::Path, sync::atomic::AtomicU64};
+
 use compio::{
     fs::{self, OpenOptions, create_dir_all},
     io::AsyncWriteAtExt,
 };
 use err_trail::ErrContext;
 use iggy_common::{ConsumerKind, IggyError};
-use std::{io::Read, path::Path, sync::atomic::AtomicU64};
 use tracing::{error, trace};
+
+use super::COMPONENT;
+use crate::{
+    configs::system::SystemConfig,
+    io::fs_utils::remove_dir_all,
+    streaming::{partitions::consumer_offset::ConsumerOffset, polling_consumer::ConsumerGroupId},
+};
 
 pub async fn create_partition_file_hierarchy(
     stream_id: usize,

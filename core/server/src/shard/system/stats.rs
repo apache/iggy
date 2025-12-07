@@ -16,12 +16,16 @@
  * under the License.
  */
 
-use crate::shard::IggyShard;
-use crate::slab::traits_ext::{EntityComponentSystem, IntoComponents};
-use crate::{SEMANTIC_VERSION, VERSION};
-use iggy_common::{IggyDuration, IggyError, Stats};
 use std::cell::RefCell;
+
+use iggy_common::{IggyDuration, IggyError, Stats};
 use sysinfo::{Pid, ProcessesToUpdate, System as SysinfoSystem};
+
+use crate::{
+    SEMANTIC_VERSION, VERSION,
+    shard::IggyShard,
+    slab::traits_ext::{EntityComponentSystem, IntoComponents},
+};
 
 thread_local! {
     static SYSINFO: RefCell<Option<SysinfoSystem>> = const { RefCell::new(None) };

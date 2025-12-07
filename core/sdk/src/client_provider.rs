@@ -16,22 +16,26 @@
  * under the License.
  */
 
-use crate::client_wrappers::client_wrapper::ClientWrapper;
-use crate::clients::client::IggyClient;
-use crate::http::http_client::HttpClient;
-use crate::prelude::{
-    ClientError, HttpClientConfig, IggyDuration, QuicClientConfig, QuicClientReconnectionConfig,
-    TcpClientConfig, TcpClientReconnectionConfig, WebSocketClient,
-};
-use crate::quic::quic_client::QuicClient;
-use crate::tcp::tcp_client::TcpClient;
+use std::{str::FromStr, sync::Arc};
+
 use iggy_binary_protocol::Client;
 use iggy_common::{
     AutoLogin, Credentials, TransportProtocol, WebSocketClientConfig,
     WebSocketClientReconnectionConfig, WebSocketConfig,
 };
-use std::str::FromStr;
-use std::sync::Arc;
+
+use crate::{
+    client_wrappers::client_wrapper::ClientWrapper,
+    clients::client::IggyClient,
+    http::http_client::HttpClient,
+    prelude::{
+        ClientError, HttpClientConfig, IggyDuration, QuicClientConfig,
+        QuicClientReconnectionConfig, TcpClientConfig, TcpClientReconnectionConfig,
+        WebSocketClient,
+    },
+    quic::quic_client::QuicClient,
+    tcp::tcp_client::TcpClient,
+};
 
 /// Configuration for the `ClientProvider`.
 /// It consists of the following fields:

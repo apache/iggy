@@ -17,14 +17,8 @@
  * under the License.
  */
 
-use super::{
-    config::map_connector_config,
-    error::ApiError,
-    models::{SourceDetailsResponse, SourceInfoResponse, TransformResponse},
-};
-use crate::api::models::SourceConfigResponse;
-use crate::configs::connectors::{ConfigFormat, CreateSourceConfig};
-use crate::{context::RuntimeContext, error::RuntimeError};
+use std::sync::Arc;
+
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
@@ -33,7 +27,18 @@ use axum::{
     routing::get,
 };
 use serde::Deserialize;
-use std::sync::Arc;
+
+use super::{
+    config::map_connector_config,
+    error::ApiError,
+    models::{SourceDetailsResponse, SourceInfoResponse, TransformResponse},
+};
+use crate::{
+    api::models::SourceConfigResponse,
+    configs::connectors::{ConfigFormat, CreateSourceConfig},
+    context::RuntimeContext,
+    error::RuntimeError,
+};
 
 pub fn router(state: Arc<RuntimeContext>) -> Router {
     Router::new()

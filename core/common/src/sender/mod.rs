@@ -22,22 +22,24 @@ mod tcp_tls_sender;
 mod websocket_sender;
 mod websocket_tls_sender;
 
+use std::future::Future;
+
+use compio::{
+    BufResult,
+    buf::IoBufMut,
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpStream,
+};
+use compio_quic::{RecvStream, SendStream};
+use compio_tls::TlsStream;
 pub use quic_sender::QuicSender;
 pub use tcp_sender::TcpSender;
 pub use tcp_tls_sender::TcpTlsSender;
+use tracing::debug;
 pub use websocket_sender::WebSocketSender;
 pub use websocket_tls_sender::WebSocketTlsSender;
 
-use crate::IggyError;
-use crate::alloc::buffer::PooledBuffer;
-use compio::BufResult;
-use compio::buf::IoBufMut;
-use compio::io::{AsyncReadExt, AsyncWriteExt};
-use compio::net::TcpStream;
-use compio_quic::{RecvStream, SendStream};
-use compio_tls::TlsStream;
-use std::future::Future;
-use tracing::debug;
+use crate::{IggyError, alloc::buffer::PooledBuffer};
 
 macro_rules! forward_async_methods {
     (

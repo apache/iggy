@@ -16,8 +16,9 @@
  * under the License.
  */
 
-use crate::{AutoLogin, IggyDuration, IggyError, WebSocketClientConfig};
 use std::net::SocketAddr;
+
+use crate::{AutoLogin, IggyDuration, IggyError, WebSocketClientConfig};
 
 /// Builder for the WebSocket client configuration.
 /// Allows configuring the WebSocket client with custom settings or using defaults:

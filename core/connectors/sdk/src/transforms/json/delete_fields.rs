@@ -16,10 +16,11 @@
  * under the License.
  */
 
+use simd_json::OwnedValue;
+
 use crate::{
     DecodedMessage, Error, Payload, TopicMetadata, transforms::delete_fields::DeleteFields,
 };
-use simd_json::OwnedValue;
 
 impl DeleteFields {
     pub(crate) fn transform_json(
@@ -39,13 +40,13 @@ impl DeleteFields {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transforms::json::test_utils::{
-        create_raw_test_message, create_test_message, create_test_topic_metadata,
-        extract_json_object,
-    };
     use crate::transforms::{
         Transform,
         delete_fields::{DeleteFields, DeleteFieldsConfig},
+        json::test_utils::{
+            create_raw_test_message, create_test_message, create_test_topic_metadata,
+            extract_json_object,
+        },
     };
 
     #[test]

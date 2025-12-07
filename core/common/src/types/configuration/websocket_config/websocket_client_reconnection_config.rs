@@ -16,10 +16,14 @@
  * under the License.
  */
 
-use crate::IggyDuration;
+use std::{
+    fmt::{Display, Formatter},
+    str::FromStr,
+};
+
 use serde::{Deserialize, Serialize};
-use std::fmt::{Display, Formatter};
-use std::str::FromStr;
+
+use crate::IggyDuration;
 
 /// WebSocket client reconnection configuration.
 /// It consists of the following fields:

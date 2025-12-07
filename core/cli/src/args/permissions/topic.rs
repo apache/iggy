@@ -16,8 +16,9 @@
  * under the License.
  */
 
-use iggy::prelude::TopicPermissions;
 use std::str::FromStr;
+
+use iggy::prelude::TopicPermissions;
 
 use super::constants::{
     MANAGE_TOPIC_LONG, MANAGE_TOPIC_SHORT, POLL_MESSAGES_LONG, POLL_MESSAGES_SHORT,

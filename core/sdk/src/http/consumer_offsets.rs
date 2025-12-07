@@ -16,15 +16,17 @@
  * under the License.
  */
 
-use crate::http::http_client::HttpClient;
-use crate::http::http_transport::HttpTransport;
-use crate::prelude::Identifier;
-use crate::prelude::IggyError;
 use async_trait::async_trait;
 use iggy_binary_protocol::ConsumerOffsetClient;
-use iggy_common::get_consumer_offset::GetConsumerOffset;
-use iggy_common::store_consumer_offset::StoreConsumerOffset;
-use iggy_common::{Consumer, ConsumerOffsetInfo};
+use iggy_common::{
+    Consumer, ConsumerOffsetInfo, get_consumer_offset::GetConsumerOffset,
+    store_consumer_offset::StoreConsumerOffset,
+};
+
+use crate::{
+    http::{http_client::HttpClient, http_transport::HttpTransport},
+    prelude::{Identifier, IggyError},
+};
 
 #[async_trait]
 impl ConsumerOffsetClient for HttpClient {

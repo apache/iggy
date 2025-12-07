@@ -16,16 +16,18 @@
  * under the License.
  */
 
-use crate::http::http_client::HttpClient;
-use crate::http::http_transport::HttpTransport;
-use crate::prelude::IggyError;
 use async_trait::async_trait;
 use iggy_binary_protocol::PersonalAccessTokenClient;
-use iggy_common::IdentityInfo;
-use iggy_common::PersonalAccessTokenExpiry;
-use iggy_common::create_personal_access_token::CreatePersonalAccessToken;
-use iggy_common::login_with_personal_access_token::LoginWithPersonalAccessToken;
-use iggy_common::{PersonalAccessTokenInfo, RawPersonalAccessToken};
+use iggy_common::{
+    IdentityInfo, PersonalAccessTokenExpiry, PersonalAccessTokenInfo, RawPersonalAccessToken,
+    create_personal_access_token::CreatePersonalAccessToken,
+    login_with_personal_access_token::LoginWithPersonalAccessToken,
+};
+
+use crate::{
+    http::{http_client::HttpClient, http_transport::HttpTransport},
+    prelude::IggyError,
+};
 
 const PATH: &str = "/personal-access-tokens";
 

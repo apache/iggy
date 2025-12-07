@@ -1,0 +1,12 @@
+# Basic formatting options (stable channel compatible)
+edition = "2021"
+hard_tabs = false
+tab_spaces = 4
+max_width = 100
+use_small_heuristics = "Default"
+reorder_imports = true  # This is stable
+
+# Import organization (requires nightly rustfmt)
+# Uncomment these when using nightly:
+# imports_granularity = "Crate"
+# group_imports = "StdExternalCrate"

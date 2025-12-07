@@ -16,9 +16,8 @@
  * under the License.
  */
 
-use crate::server::scenarios::{
-    delete_segments_scenario, message_size_scenario, tcp_tls_scenario, websocket_tls_scenario,
-};
+use std::collections::HashMap;
+
 use iggy::prelude::*;
 use integration::{
     tcp_client::TcpClientFactory,
@@ -26,7 +25,10 @@ use integration::{
     test_tls_utils::generate_test_certificates,
 };
 use serial_test::parallel;
-use std::collections::HashMap;
+
+use crate::server::scenarios::{
+    delete_segments_scenario, message_size_scenario, tcp_tls_scenario, websocket_tls_scenario,
+};
 
 // This test can run on any transport, but it requires both ClientFactory and
 // TestServer parameters, which doesn't fit the unified matrix approach.

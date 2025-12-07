@@ -18,16 +18,17 @@
 
 use std::path::PathBuf;
 
-use clap::{Args, Command as ClapCommand};
-use clap::{Parser, Subcommand};
+use clap::{Args, Command as ClapCommand, Parser, Subcommand};
 use clap_complete::{Generator, Shell, generate};
 use figlet_rs::FIGfont;
-
 use iggy::prelude::{Args as IggyArgs, ArgsOptional as IggyArgsOptional};
 use iggy_binary_protocol::cli::binary_context::common::ContextConfig;
 use segment::SegmentAction;
 use system::SnapshotArgs;
 
+use self::user::UserAction;
+#[cfg(feature = "login-session")]
+use crate::args::system::LoginArgs;
 use crate::args::{
     client::ClientAction,
     consumer_group::ConsumerGroupAction,
@@ -40,11 +41,6 @@ use crate::args::{
     system::{PingArgs, StatsArgs},
     topic::TopicAction,
 };
-
-#[cfg(feature = "login-session")]
-use crate::args::system::LoginArgs;
-
-use self::user::UserAction;
 
 pub(crate) mod client;
 pub(crate) mod common;

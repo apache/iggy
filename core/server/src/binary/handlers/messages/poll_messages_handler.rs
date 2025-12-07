@@ -16,16 +16,20 @@
  * under the License.
  */
 
-use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
-use crate::binary::handlers::utils::receive_and_validate;
-use crate::shard::IggyShard;
-use crate::shard::system::messages::PollingArgs;
-use crate::streaming::session::Session;
-use anyhow::Result;
-use iggy_common::SenderKind;
-use iggy_common::{IggyError, PollMessages, PooledBuffer};
 use std::rc::Rc;
+
+use anyhow::Result;
+use iggy_common::{IggyError, PollMessages, PooledBuffer, SenderKind};
 use tracing::{debug, trace};
+
+use crate::{
+    binary::{
+        command::{BinaryServerCommand, ServerCommand, ServerCommandHandler},
+        handlers::utils::receive_and_validate,
+    },
+    shard::{IggyShard, system::messages::PollingArgs},
+    streaming::session::Session,
+};
 
 #[derive(Debug)]
 pub struct IggyPollMetadata {

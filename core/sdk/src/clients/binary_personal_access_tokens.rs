@@ -16,14 +16,14 @@
  * under the License.
  */
 
-use crate::prelude::IggyClient;
 use async_trait::async_trait;
 use iggy_binary_protocol::PersonalAccessTokenClient;
-use iggy_common::locking::IggyRwLockFn;
 use iggy_common::{
     IdentityInfo, IggyError, PersonalAccessTokenExpiry, PersonalAccessTokenInfo,
-    RawPersonalAccessToken,
+    RawPersonalAccessToken, locking::IggyRwLockFn,
 };
+
+use crate::prelude::IggyClient;
 
 #[async_trait]
 impl PersonalAccessTokenClient for IggyClient {

@@ -16,14 +16,14 @@
  * under the License.
  */
 
-use crate::BytesSerializable;
-use crate::Identifier;
-use crate::Validatable;
-use crate::error::IggyError;
-use crate::{Command, PURGE_STREAM_CODE};
+use std::fmt::Display;
+
 use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
-use std::fmt::Display;
+
+use crate::{
+    BytesSerializable, Command, Identifier, PURGE_STREAM_CODE, Validatable, error::IggyError,
+};
 
 /// `PurgeStream` command is used to purge stream data (all the messages from its topics).
 /// It has additional payload:

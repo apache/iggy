@@ -16,14 +16,15 @@
  * under the License.
  */
 
-use crate::{
-    BytesSerializable, Identifier, Validatable,
-    error::IggyError,
-    {Command, FLUSH_UNSAVED_BUFFER_CODE},
-};
+use std::fmt::Display;
+
 use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
-use std::fmt::Display;
+
+use crate::{
+    BytesSerializable, Command, FLUSH_UNSAVED_BUFFER_CODE, Identifier, Validatable,
+    error::IggyError,
+};
 
 /// `FlushUnsavedBuffer` command is used to force a flush of `unsaved_buffer` to disk for specific stream -> topic -> partition.
 /// - `stream_id` - stream identifier
@@ -110,8 +111,7 @@ impl Validatable<IggyError> for FlushUnsavedBuffer {
 #[cfg(test)]
 mod test {
     use super::FlushUnsavedBuffer;
-    use crate::BytesSerializable;
-    use crate::Identifier;
+    use crate::{BytesSerializable, Identifier};
 
     #[test]
     fn test_flush_unsaved_buffer_serialization() {

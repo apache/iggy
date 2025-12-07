@@ -16,12 +16,8 @@
  * under the License.
  */
 
-use crate::{
-    Permissions,
-    configs::{HttpConfig, configure_cors},
-    error::McpRuntimeError,
-    service::IggyService,
-};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc};
+
 use axum::{Json, Router, routing::get};
 use axum_server::tls_rustls::RustlsConfig;
 use iggy::prelude::{Consumer, IggyClient};
@@ -31,9 +27,15 @@ use rmcp::{
         StreamableHttpService, streamable_http_server::session::local::LocalSessionManager,
     },
 };
-use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 use tokio::spawn;
 use tracing::{error, info};
+
+use crate::{
+    Permissions,
+    configs::{HttpConfig, configure_cors},
+    error::McpRuntimeError,
+    service::IggyService,
+};
 
 pub async fn init(
     config: HttpConfig,

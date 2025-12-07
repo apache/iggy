@@ -16,8 +16,9 @@
  * under the License.
  */
 
-use iggy::prelude::defaults::{DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME};
 use std::collections::HashMap;
+
+use iggy::prelude::defaults::{DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME};
 
 pub(crate) struct IggyCmdCommand {
     opts: Vec<String>,

@@ -16,27 +16,31 @@
  * under the License.
  */
 
-use crate::router::arrow_streamer::JsonArrowReader;
-use crate::slice_user_table;
+use std::sync::Arc;
+
 use arrow_json::ReaderBuilder;
 use async_trait::async_trait;
-use iceberg::TableIdent;
-use iceberg::arrow::schema_to_arrow_schema;
-use iceberg::spec::{Literal, PrimitiveLiteral, PrimitiveType, Struct, StructType};
-use iceberg::table::Table;
-use iceberg::transaction::{ApplyTransactionAction, Transaction};
-use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
-use iceberg::writer::file_writer::ParquetWriterBuilder;
-use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use iceberg::{
-    Catalog,
-    writer::file_writer::location_generator::{DefaultFileNameGenerator, DefaultLocationGenerator},
+    Catalog, TableIdent,
+    arrow::schema_to_arrow_schema,
+    spec::{Literal, PrimitiveLiteral, PrimitiveType, Struct, StructType},
+    table::Table,
+    transaction::{ApplyTransactionAction, Transaction},
+    writer::{
+        IcebergWriter, IcebergWriterBuilder,
+        base_writer::data_file_writer::DataFileWriterBuilder,
+        file_writer::{
+            ParquetWriterBuilder,
+            location_generator::{DefaultFileNameGenerator, DefaultLocationGenerator},
+        },
+    },
 };
 use iggy_connector_sdk::{ConsumedMessage, Error, MessagesMetadata, Payload, Schema};
 use parquet::file::properties::WriterProperties;
-use std::sync::Arc;
 use tracing::{error, warn};
 use uuid::Uuid;
+
+use crate::{router::arrow_streamer::JsonArrowReader, slice_user_table};
 
 mod arrow_streamer;
 pub mod dynamic_router;

@@ -22,14 +22,13 @@ pub mod utils;
 
 mod prints;
 
-use crate::report::BenchmarkReport;
 use actor_kind::ActorKind;
 use charming::Chart;
 use group_metrics_kind::GroupMetricsKind;
-use plotting::chart::IggyChart;
-use plotting::chart_kind::ChartKind;
-
+use plotting::{chart::IggyChart, chart_kind::ChartKind};
 pub use types::*;
+
+use crate::report::BenchmarkReport;
 
 pub fn create_throughput_chart(
     report: &BenchmarkReport,

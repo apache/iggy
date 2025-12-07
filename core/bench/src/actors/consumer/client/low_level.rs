@@ -16,16 +16,23 @@
  * under the License.
  */
 
-use crate::actors::consumer::client::BenchmarkConsumerClient;
-use crate::actors::consumer::client::interface::{BenchmarkConsumerConfig, ConsumerClient};
-use crate::actors::{ApiLabel, BatchMetrics, BenchmarkInit};
-use crate::benchmarks::common::create_consumer;
-use crate::utils::{batch_total_size_bytes, batch_user_size_bytes};
+use std::{sync::Arc, time::Duration};
+
 use iggy::prelude::*;
 use integration::test_server::{ClientFactory, login_root};
-use std::sync::Arc;
-use std::time::Duration;
 use tokio::time::Instant;
+
+use crate::{
+    actors::{
+        ApiLabel, BatchMetrics, BenchmarkInit,
+        consumer::client::{
+            BenchmarkConsumerClient,
+            interface::{BenchmarkConsumerConfig, ConsumerClient},
+        },
+    },
+    benchmarks::common::create_consumer,
+    utils::{batch_total_size_bytes, batch_user_size_bytes},
+};
 
 pub struct LowLevelConsumerClient {
     client_factory: Arc<dyn ClientFactory>,

@@ -18,19 +18,30 @@
 
 pub(crate) mod command;
 pub(crate) mod help;
-pub(crate) use crate::cli::common::command::IggyCmdCommand;
-pub(crate) use crate::cli::common::help::{CLAP_INDENT, TestHelpCmd, USAGE_PREFIX};
-use assert_cmd::assert::{Assert, OutputAssertExt};
-use assert_cmd::prelude::CommandCargoExt;
+use std::{
+    fmt::{Display, Formatter, Result},
+    io::Write,
+    process::{Command, Stdio},
+    sync::Arc,
+};
+
+use assert_cmd::{
+    assert::{Assert, OutputAssertExt},
+    prelude::CommandCargoExt,
+};
 use async_trait::async_trait;
-use iggy::clients::client::IggyClient;
-use iggy::prelude::defaults::*;
-use iggy::prelude::{Client, ClientWrapper, SystemClient, TcpClient, TcpClientConfig, UserClient};
+use iggy::{
+    clients::client::IggyClient,
+    prelude::{
+        Client, ClientWrapper, SystemClient, TcpClient, TcpClientConfig, UserClient, defaults::*,
+    },
+};
 use integration::test_server::TestServer;
-use std::fmt::{Display, Formatter, Result};
-use std::io::Write;
-use std::process::{Command, Stdio};
-use std::sync::Arc;
+
+pub(crate) use crate::cli::common::{
+    command::IggyCmdCommand,
+    help::{CLAP_INDENT, TestHelpCmd, USAGE_PREFIX},
+};
 
 pub(crate) enum TestIdentifier {
     Numeric,

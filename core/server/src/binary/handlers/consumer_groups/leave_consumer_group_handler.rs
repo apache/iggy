@@ -16,19 +16,22 @@
  * under the License.
  */
 
-use super::COMPONENT;
-use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
-use crate::binary::handlers::utils::receive_and_validate;
-use iggy_common::SenderKind;
+use std::rc::Rc;
 
-use crate::shard::IggyShard;
-use crate::streaming::session::Session;
 use anyhow::Result;
 use err_trail::ErrContext;
-use iggy_common::IggyError;
-use iggy_common::leave_consumer_group::LeaveConsumerGroup;
-use std::rc::Rc;
+use iggy_common::{IggyError, SenderKind, leave_consumer_group::LeaveConsumerGroup};
 use tracing::{debug, instrument};
+
+use super::COMPONENT;
+use crate::{
+    binary::{
+        command::{BinaryServerCommand, ServerCommand, ServerCommandHandler},
+        handlers::utils::receive_and_validate,
+    },
+    shard::IggyShard,
+    streaming::session::Session,
+};
 
 impl ServerCommandHandler for LeaveConsumerGroup {
     fn code(&self) -> u32 {

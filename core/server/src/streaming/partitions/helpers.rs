@@ -15,12 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use err_trail::ErrContext;
-use iggy_common::{ConsumerOffsetInfo, Identifier, IggyByteSize, IggyError};
 use std::{
     ops::AsyncFnOnce,
     sync::{Arc, atomic::Ordering},
 };
+
+use err_trail::ErrContext;
+use iggy_common::{ConsumerOffsetInfo, Identifier, IggyByteSize, IggyError};
 
 use crate::{
     configs::{cache_indexes::CacheIndexesConfig, system::SystemConfig},

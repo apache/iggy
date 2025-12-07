@@ -16,9 +16,12 @@
  * under the License.
  */
 
+use std::{
+    io::{self, BufRead, Cursor, Read},
+    slice::Iter,
+};
+
 use simd_json::OwnedValue;
-use std::io::{self, BufRead, Cursor, Read};
-use std::slice::Iter;
 
 pub struct JsonArrowReader<'a> {
     values: Iter<'a, &'a OwnedValue>,

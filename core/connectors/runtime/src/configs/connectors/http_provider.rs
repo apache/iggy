@@ -20,22 +20,28 @@
 mod response_extractor;
 mod url_builder;
 
-use crate::configs::connectors::http_provider::response_extractor::ResponseExtractor;
-use crate::configs::connectors::http_provider::url_builder::{TemplateKeys, UrlBuilder};
-use crate::configs::connectors::{
-    ConnectorConfigVersions, ConnectorsConfig, ConnectorsConfigProvider, CreateSinkConfig,
-    CreateSourceConfig, SinkConfig, SourceConfig,
-};
-use crate::configs::runtime::{ResponseConfig, RetryConfig};
-use crate::error::RuntimeError;
+use std::{collections::HashMap, str::FromStr, time::Duration};
+
 use async_trait::async_trait;
 use reqwest;
 use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
 use reqwest_retry::{Jitter, RetryTransientMiddleware, policies::ExponentialBackoff};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::str::FromStr;
-use std::time::Duration;
+
+use crate::{
+    configs::{
+        connectors::{
+            ConnectorConfigVersions, ConnectorsConfig, ConnectorsConfigProvider, CreateSinkConfig,
+            CreateSourceConfig, SinkConfig, SourceConfig,
+            http_provider::{
+                response_extractor::ResponseExtractor,
+                url_builder::{TemplateKeys, UrlBuilder},
+            },
+        },
+        runtime::{ResponseConfig, RetryConfig},
+    },
+    error::RuntimeError,
+};
 
 #[derive(Debug, Serialize, Deserialize)]
 struct SetActiveVersionRequest {

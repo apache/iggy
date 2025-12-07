@@ -16,11 +16,13 @@
  * under the License.
  */
 
-use crate::shard::IggyShard;
+use std::rc::Rc;
+
 use human_repr::HumanCount;
 use iggy_common::IggyError;
-use std::rc::Rc;
 use tracing::{error, info, trace};
+
+use crate::shard::IggyShard;
 
 pub fn spawn_sysinfo_printer(shard: Rc<IggyShard>) {
     let period = shard

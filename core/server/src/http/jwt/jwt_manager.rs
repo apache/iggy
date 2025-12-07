@@ -16,23 +16,26 @@
  * under the License.
  */
 
-use crate::configs::http::HttpJwtConfig;
-use crate::http::jwt::COMPONENT;
-use crate::http::jwt::json_web_token::{GeneratedToken, JwtClaims, RevokedAccessToken};
-use crate::http::jwt::storage::TokenStorage;
-use crate::streaming::persistence::persister::PersisterKind;
+use std::sync::Arc;
+
 use ahash::AHashMap;
 use err_trail::ErrContext;
-use iggy_common::IggyDuration;
-use iggy_common::IggyError;
-use iggy_common::IggyExpiry;
-use iggy_common::IggyTimestamp;
-use iggy_common::UserId;
-use iggy_common::locking::IggyRwLock;
-use iggy_common::locking::IggyRwLockFn;
+use iggy_common::{
+    IggyDuration, IggyError, IggyExpiry, IggyTimestamp, UserId,
+    locking::{IggyRwLock, IggyRwLockFn},
+};
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, TokenData, Validation, encode};
-use std::sync::Arc;
 use tracing::{debug, error, info};
+
+use crate::{
+    configs::http::HttpJwtConfig,
+    http::jwt::{
+        COMPONENT,
+        json_web_token::{GeneratedToken, JwtClaims, RevokedAccessToken},
+        storage::TokenStorage,
+    },
+    streaming::persistence::persister::PersisterKind,
+};
 
 pub struct IssuerOptions {
     pub issuer: String,

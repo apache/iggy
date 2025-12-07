@@ -16,10 +16,9 @@
  * under the License.
  */
 
+use std::{cell::Cell, fmt::Display, net::SocketAddr};
+
 use iggy_common::UserId;
-use std::cell::Cell;
-use std::fmt::Display;
-use std::net::SocketAddr;
 
 // This might be extended with more fields in the future e.g. custom name, permissions etc.
 #[derive(Debug, Clone)]

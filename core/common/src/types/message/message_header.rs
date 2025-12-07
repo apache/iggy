@@ -16,10 +16,12 @@
  * under the License.
  */
 
-use crate::{BytesSerializable, Sizeable, error::IggyError, utils::byte_size::IggyByteSize};
+use std::ops::Range;
+
 use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
-use std::ops::Range;
+
+use crate::{BytesSerializable, Sizeable, error::IggyError, utils::byte_size::IggyByteSize};
 
 pub const IGGY_MESSAGE_HEADER_SIZE: usize = 8 + 16 + 8 + 8 + 8 + 4 + 4;
 pub const IGGY_MESSAGE_HEADER_RANGE: Range<usize> = 0..IGGY_MESSAGE_HEADER_SIZE;

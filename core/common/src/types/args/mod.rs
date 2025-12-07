@@ -16,9 +16,10 @@
  * under the License.
  */
 
-use crate::defaults::{DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
+
+use crate::defaults::{DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME};
 
 /// The arguments used by the `ClientProviderConfig` to create a client.
 /// We are not using default values here because we want to be able to

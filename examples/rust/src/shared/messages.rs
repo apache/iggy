@@ -16,9 +16,10 @@
  * under the License.
  */
 
+use std::fmt::{self, Debug};
+
 use iggy::prelude::IggyTimestamp;
 use serde::{Deserialize, Serialize};
-use std::fmt::{self, Debug};
 
 pub const ORDER_CREATED_TYPE: &str = "order_created";
 pub const ORDER_CONFIRMED_TYPE: &str = "order_confirmed";

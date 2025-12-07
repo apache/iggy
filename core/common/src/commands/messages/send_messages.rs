@@ -16,23 +16,24 @@
  * under the License.
  */
 
-use crate::BytesSerializable;
-use crate::Identifier;
-use crate::IggyMessageView;
-use crate::PartitioningKind;
-use crate::Sizeable;
-use crate::Validatable;
-use crate::error::IggyError;
-use crate::types::message::partitioning::Partitioning;
-use crate::{Command, SEND_MESSAGES_CODE};
-use crate::{INDEX_SIZE, IggyMessage, IggyMessagesBatch};
+use std::{
+    collections::HashMap,
+    fmt::{Display, Formatter},
+};
+
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use bytes::{BufMut, Bytes, BytesMut};
-use serde::de::{self, MapAccess, Visitor};
-use serde::ser::SerializeStruct;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::collections::HashMap;
-use std::fmt::{Display, Formatter};
+use serde::{
+    Deserialize, Deserializer, Serialize, Serializer,
+    de::{self, MapAccess, Visitor},
+    ser::SerializeStruct,
+};
+
+use crate::{
+    BytesSerializable, Command, INDEX_SIZE, Identifier, IggyMessage, IggyMessageView,
+    IggyMessagesBatch, PartitioningKind, SEND_MESSAGES_CODE, Sizeable, Validatable,
+    error::IggyError, types::message::partitioning::Partitioning,
+};
 
 /// `SendMessages` command is used to send messages to a topic in a stream.
 /// It has additional payload:

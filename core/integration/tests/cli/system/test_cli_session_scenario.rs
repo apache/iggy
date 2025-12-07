@@ -16,12 +16,17 @@
  * under the License.
  */
 
-use crate::cli::common::IggyCmdTest;
-use crate::cli::system::test_login_cmd::{TestLoginCmd, TestLoginCmdType};
-use crate::cli::system::test_logout_cmd::TestLogoutCmd;
-use crate::cli::system::test_me_command::{Scenario, TestMeCmd};
 use iggy_common::TransportProtocol;
 use serial_test::serial;
+
+use crate::cli::{
+    common::IggyCmdTest,
+    system::{
+        test_login_cmd::{TestLoginCmd, TestLoginCmdType},
+        test_logout_cmd::TestLogoutCmd,
+        test_me_command::{Scenario, TestMeCmd},
+    },
+};
 
 #[tokio::test]
 #[serial]

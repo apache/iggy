@@ -21,29 +21,18 @@ mod credentials;
 mod error;
 mod logging;
 
-use crate::args::{
-    Command, IggyConsoleArgs, client::ClientAction, consumer_group::ConsumerGroupAction,
-    consumer_offset::ConsumerOffsetAction, permissions::PermissionsArgs,
-    personal_access_token::PersonalAccessTokenAction, stream::StreamAction, topic::TopicAction,
+use std::sync::Arc;
+
+use args::{
+    CliOptions, IggyMergedConsoleArgs, context::ContextAction, message::MessageAction,
+    partition::PartitionAction, segment::SegmentAction, user::UserAction,
 };
-use crate::credentials::IggyCredentials;
-use crate::error::{CmdToolError, IggyCmdError};
-use crate::logging::Logging;
-use args::context::ContextAction;
-use args::message::MessageAction;
-use args::partition::PartitionAction;
-use args::segment::SegmentAction;
-use args::user::UserAction;
-use args::{CliOptions, IggyMergedConsoleArgs};
 use clap::Parser;
-use iggy::client_provider::{self, ClientProviderConfig};
-use iggy::clients::client::IggyClient;
-use iggy::prelude::{Aes256GcmEncryptor, Args, EncryptorKind, PersonalAccessTokenExpiry};
-use iggy_binary_protocol::cli::binary_context::common::ContextManager;
-use iggy_binary_protocol::cli::binary_context::use_context::UseContextCmd;
-use iggy_binary_protocol::cli::binary_segments::delete_segments::DeleteSegmentsCmd;
-use iggy_binary_protocol::cli::binary_system::snapshot::GetSnapshotCmd;
-use iggy_binary_protocol::cli::cli_command::{CliCommand, PRINT_TARGET};
+use iggy::{
+    client_provider::{self, ClientProviderConfig},
+    clients::client::IggyClient,
+    prelude::{Aes256GcmEncryptor, Args, EncryptorKind, PersonalAccessTokenExpiry},
+};
 use iggy_binary_protocol::cli::{
     binary_client::{get_client::GetClientCmd, get_clients::GetClientsCmd},
     binary_consumer_groups::{
@@ -54,7 +43,9 @@ use iggy_binary_protocol::cli::{
     binary_consumer_offsets::{
         get_consumer_offset::GetConsumerOffsetCmd, set_consumer_offset::SetConsumerOffsetCmd,
     },
-    binary_context::get_contexts::GetContextsCmd,
+    binary_context::{
+        common::ContextManager, get_contexts::GetContextsCmd, use_context::UseContextCmd,
+    },
     binary_message::{
         flush_messages::FlushMessagesCmd, poll_messages::PollMessagesCmd,
         send_messages::SendMessagesCmd,
@@ -67,11 +58,12 @@ use iggy_binary_protocol::cli::{
         delete_personal_access_tokens::DeletePersonalAccessTokenCmd,
         get_personal_access_tokens::GetPersonalAccessTokensCmd,
     },
+    binary_segments::delete_segments::DeleteSegmentsCmd,
     binary_streams::{
         create_stream::CreateStreamCmd, delete_stream::DeleteStreamCmd, get_stream::GetStreamCmd,
         get_streams::GetStreamsCmd, purge_stream::PurgeStreamCmd, update_stream::UpdateStreamCmd,
     },
-    binary_system::{me::GetMeCmd, ping::PingCmd, stats::GetStatsCmd},
+    binary_system::{me::GetMeCmd, ping::PingCmd, snapshot::GetSnapshotCmd, stats::GetStatsCmd},
     binary_topics::{
         create_topic::CreateTopicCmd, delete_topic::DeleteTopicCmd, get_topic::GetTopicCmd,
         get_topics::GetTopicsCmd, purge_topic::PurgeTopicCmd, update_topic::UpdateTopicCmd,
@@ -85,14 +77,27 @@ use iggy_binary_protocol::cli::{
         update_permissions::UpdatePermissionsCmd,
         update_user::{UpdateUserCmd, UpdateUserType},
     },
+    cli_command::{CliCommand, PRINT_TARGET},
 };
-use std::sync::Arc;
 use tracing::{Level, event};
+
+use crate::{
+    args::{
+        Command, IggyConsoleArgs, client::ClientAction, consumer_group::ConsumerGroupAction,
+        consumer_offset::ConsumerOffsetAction, permissions::PermissionsArgs,
+        personal_access_token::PersonalAccessTokenAction, stream::StreamAction, topic::TopicAction,
+    },
+    credentials::IggyCredentials,
+    error::{CmdToolError, IggyCmdError},
+    logging::Logging,
+};
 
 #[cfg(feature = "login-session")]
 mod main_login_session {
-    pub(crate) use iggy_binary_protocol::cli::binary_system::{login::LoginCmd, logout::LogoutCmd};
-    pub(crate) use iggy_binary_protocol::cli::utils::login_session_expiry::LoginSessionExpiry;
+    pub(crate) use iggy_binary_protocol::cli::{
+        binary_system::{login::LoginCmd, logout::LogoutCmd},
+        utils::login_session_expiry::LoginSessionExpiry,
+    };
 }
 
 #[cfg(feature = "login-session")]

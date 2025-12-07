@@ -18,6 +18,15 @@
 
 use std::{sync::Arc, time::Duration};
 
+use bench_report::{
+    actor_kind::ActorKind, benchmark_kind::BenchmarkKind,
+    individual_metrics::BenchmarkIndividualMetrics, numeric_parameter::BenchmarkNumericParameter,
+};
+use human_repr::HumanCount;
+use iggy::prelude::*;
+use tokio::time::Instant;
+use tracing::info;
+
 use crate::{
     actors::{
         consumer::client::{BenchmarkConsumerClient, interface::BenchmarkConsumerConfig},
@@ -29,14 +38,6 @@ use crate::{
         rate_limiter::BenchmarkRateLimiter,
     },
 };
-use bench_report::{
-    actor_kind::ActorKind, benchmark_kind::BenchmarkKind,
-    individual_metrics::BenchmarkIndividualMetrics, numeric_parameter::BenchmarkNumericParameter,
-};
-use human_repr::HumanCount;
-use iggy::prelude::*;
-use tokio::time::Instant;
-use tracing::info;
 
 pub struct BenchmarkProducingConsumer<P, C>
 where

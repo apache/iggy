@@ -16,21 +16,22 @@
  * under the License.
  */
 
-use crate::state::StateSetup;
 use iggy::prelude::IggyExpiry;
-use iggy_common::create_consumer_group::CreateConsumerGroup;
-use iggy_common::create_partitions::CreatePartitions;
-use iggy_common::create_personal_access_token::CreatePersonalAccessToken;
-use iggy_common::create_stream::CreateStream;
-use iggy_common::create_topic::CreateTopic;
-use iggy_common::create_user::CreateUser;
-use iggy_common::delete_stream::DeleteStream;
-use server::state::command::EntryCommand;
-use server::state::models::{
-    CreateConsumerGroupWithId, CreatePersonalAccessTokenWithHash, CreateStreamWithId,
-    CreateTopicWithId, CreateUserWithId,
+use iggy_common::{
+    create_consumer_group::CreateConsumerGroup, create_partitions::CreatePartitions,
+    create_personal_access_token::CreatePersonalAccessToken, create_stream::CreateStream,
+    create_topic::CreateTopic, create_user::CreateUser, delete_stream::DeleteStream,
 };
-use server::state::system::SystemState;
+use server::state::{
+    command::EntryCommand,
+    models::{
+        CreateConsumerGroupWithId, CreatePersonalAccessTokenWithHash, CreateStreamWithId,
+        CreateTopicWithId, CreateUserWithId,
+    },
+    system::SystemState,
+};
+
+use crate::state::StateSetup;
 
 #[compio::test]
 async fn should_be_initialized_based_on_state_entries() {

@@ -16,11 +16,13 @@
  * under the License.
  */
 
-use crate::test_server::ClientFactory;
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use iggy::prelude::{Client, ClientWrapper, TcpClient, TcpClientConfig};
 use iggy_common::TransportProtocol;
-use std::sync::Arc;
+
+use crate::test_server::ClientFactory;
 
 #[derive(Debug, Clone, Default)]
 pub struct TcpClientFactory {

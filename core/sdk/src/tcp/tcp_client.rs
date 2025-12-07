@@ -16,12 +16,8 @@
  * under the License.
  */
 
-use crate::leader_aware::{LeaderRedirectionState, check_and_redirect_to_leader};
-use crate::prelude::Client;
-use crate::prelude::TcpClientConfig;
-use crate::tcp::tcp_connection_stream::TcpConnectionStream;
-use crate::tcp::tcp_connection_stream_kind::ConnectionStreamKind;
-use crate::tcp::tcp_tls_connection_stream::TcpTlsConnectionStream;
+use std::{net::SocketAddr, str::FromStr, sync::Arc};
+
 use async_broadcast::{Receiver, Sender, broadcast};
 use async_trait::async_trait;
 use bytes::{BufMut, Bytes, BytesMut};
@@ -32,14 +28,19 @@ use iggy_common::{
     TcpConnectionStringOptions, TransportProtocol,
 };
 use rustls::pki_types::{CertificateDer, ServerName, pem::PemObject};
-use std::net::SocketAddr;
-use std::str::FromStr;
-use std::sync::Arc;
-use tokio::net::TcpStream;
-use tokio::sync::Mutex;
-use tokio::time::sleep;
+use tokio::{net::TcpStream, sync::Mutex, time::sleep};
 use tokio_rustls::{TlsConnector, TlsStream};
 use tracing::{error, info, trace, warn};
+
+use crate::{
+    leader_aware::{LeaderRedirectionState, check_and_redirect_to_leader},
+    prelude::{Client, TcpClientConfig},
+    tcp::{
+        tcp_connection_stream::TcpConnectionStream,
+        tcp_connection_stream_kind::ConnectionStreamKind,
+        tcp_tls_connection_stream::TcpTlsConnectionStream,
+    },
+};
 
 const REQUEST_INITIAL_BYTES_LENGTH: usize = 4;
 const RESPONSE_INITIAL_BYTES_LENGTH: usize = 8;

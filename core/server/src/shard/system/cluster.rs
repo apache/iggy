@@ -16,13 +16,18 @@
  * under the License.
  */
 
-use crate::shard::IggyShard;
-use crate::streaming::session::Session;
-use crate::streaming::utils::address::{extract_ip, extract_port};
 use iggy_common::{
     ClusterMetadata, ClusterNode, ClusterNodeRole, ClusterNodeStatus, IggyError, TransportEndpoints,
 };
 use tracing::trace;
+
+use crate::{
+    shard::IggyShard,
+    streaming::{
+        session::Session,
+        utils::address::{extract_ip, extract_port},
+    },
+};
 
 impl IggyShard {
     pub fn get_cluster_metadata(&self, session: &Session) -> Result<ClusterMetadata, IggyError> {

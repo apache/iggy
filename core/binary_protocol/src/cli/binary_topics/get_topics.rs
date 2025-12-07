@@ -16,15 +16,18 @@
  * under the License.
  */
 
-use crate::Client;
-use crate::cli::cli_command::{CliCommand, PRINT_TARGET};
+use std::fmt::{self, Display, Formatter};
+
 use anyhow::Context;
 use async_trait::async_trait;
 use comfy_table::Table;
-use iggy_common::get_topics::GetTopics;
-use iggy_common::{Identifier, IggyExpiry};
-use std::fmt::{self, Display, Formatter};
+use iggy_common::{Identifier, IggyExpiry, get_topics::GetTopics};
 use tracing::{Level, event};
+
+use crate::{
+    Client,
+    cli::cli_command::{CliCommand, PRINT_TARGET},
+};
 
 pub enum GetTopicsOutput {
     Table,

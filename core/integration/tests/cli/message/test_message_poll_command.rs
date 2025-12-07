@@ -16,17 +16,18 @@
  * under the License.
  */
 
-use crate::cli::common::{
-    CLAP_INDENT, IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestHelpCmd, USAGE_PREFIX,
-};
+use std::{collections::HashMap, str::FromStr};
+
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
 use bytes::Bytes;
 use iggy::prelude::*;
 use predicates::str::{contains, starts_with};
 use serial_test::parallel;
-use std::collections::HashMap;
-use std::str::FromStr;
+
+use crate::cli::common::{
+    CLAP_INDENT, IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestHelpCmd, USAGE_PREFIX,
+};
 
 struct TestMessagePollCmd {
     stream_name: String,

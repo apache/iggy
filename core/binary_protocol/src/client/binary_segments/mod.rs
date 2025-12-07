@@ -16,11 +16,9 @@
  * under the License.
  */
 
-use crate::BinaryClient;
-use crate::SegmentClient;
-use crate::utils::auth::fail_if_not_authenticated;
-use iggy_common::delete_segments::DeleteSegments;
-use iggy_common::{Identifier, IggyError};
+use iggy_common::{Identifier, IggyError, delete_segments::DeleteSegments};
+
+use crate::{BinaryClient, SegmentClient, utils::auth::fail_if_not_authenticated};
 
 #[async_trait::async_trait]
 impl<B: BinaryClient> SegmentClient for B {

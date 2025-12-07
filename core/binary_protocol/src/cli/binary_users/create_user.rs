@@ -16,14 +16,15 @@
  * under the License.
  */
 
-use crate::Client;
-use crate::cli::cli_command::{CliCommand, PRINT_TARGET};
 use anyhow::Context;
 use async_trait::async_trait;
-use iggy_common::Permissions;
-use iggy_common::UserStatus;
-use iggy_common::create_user::CreateUser;
+use iggy_common::{Permissions, UserStatus, create_user::CreateUser};
 use tracing::{Level, event};
+
+use crate::{
+    Client,
+    cli::cli_command::{CliCommand, PRINT_TARGET},
+};
 
 pub struct CreateUserCmd {
     create_user: CreateUser,

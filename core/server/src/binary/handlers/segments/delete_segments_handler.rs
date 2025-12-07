@@ -16,24 +16,30 @@
  * under the License.
  */
 
-use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
-use crate::binary::handlers::partitions::COMPONENT;
-use crate::binary::handlers::utils::receive_and_validate;
-use crate::shard::IggyShard;
-use crate::shard::namespace::IggyNamespace;
-use crate::shard::transmission::frame::ShardResponse;
-use crate::shard::transmission::message::{
-    ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult,
-};
-use crate::state::command::EntryCommand;
-use crate::streaming;
-use crate::streaming::session::Session;
+use std::rc::Rc;
+
 use anyhow::Result;
 use err_trail::ErrContext;
-use iggy_common::delete_segments::DeleteSegments;
-use iggy_common::{IggyError, SenderKind};
-use std::rc::Rc;
+use iggy_common::{IggyError, SenderKind, delete_segments::DeleteSegments};
 use tracing::{debug, instrument};
+
+use crate::{
+    binary::{
+        command::{BinaryServerCommand, ServerCommand, ServerCommandHandler},
+        handlers::{partitions::COMPONENT, utils::receive_and_validate},
+    },
+    shard::{
+        IggyShard,
+        namespace::IggyNamespace,
+        transmission::{
+            frame::ShardResponse,
+            message::{ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult},
+        },
+    },
+    state::command::EntryCommand,
+    streaming,
+    streaming::session::Session,
+};
 
 impl ServerCommandHandler for DeleteSegments {
     fn code(&self) -> u32 {

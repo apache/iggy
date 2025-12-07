@@ -16,9 +16,10 @@
  * under the License.
  */
 
+use std::fmt::{Display, Formatter};
+
 use iggy_common::IggyByteSize;
 use serde::{Deserialize, Serialize};
-use std::fmt::{Display, Formatter};
 use tungstenite::protocol::WebSocketConfig as TungsteniteConfig;
 
 #[derive(Debug, Deserialize, Serialize, Clone)]

@@ -17,22 +17,21 @@
  * under the License.
  */
 
-use crate::configs::quic::{QuicCertificateConfig, QuicConfig};
-use crate::configs::server::{
-    DataMaintenanceConfig, HeartbeatConfig, MessagesMaintenanceConfig, TelemetryConfig,
-    TelemetryLogsConfig, TelemetryTracesConfig,
-};
-use crate::configs::system::MessageDeduplicationConfig;
+use std::fmt::{Display, Formatter};
+
 use crate::configs::{
     http::{HttpConfig, HttpCorsConfig, HttpJwtConfig, HttpMetricsConfig, HttpTlsConfig},
-    server::{MessageSaverConfig, ServerConfig},
+    quic::{QuicCertificateConfig, QuicConfig},
+    server::{
+        DataMaintenanceConfig, HeartbeatConfig, MessageSaverConfig, MessagesMaintenanceConfig,
+        ServerConfig, TelemetryConfig, TelemetryLogsConfig, TelemetryTracesConfig,
+    },
     system::{
-        CompressionConfig, EncryptionConfig, LoggingConfig, PartitionConfig, SegmentConfig,
-        StateConfig, StreamConfig, SystemConfig, TopicConfig,
+        CompressionConfig, EncryptionConfig, LoggingConfig, MessageDeduplicationConfig,
+        PartitionConfig, SegmentConfig, StateConfig, StreamConfig, SystemConfig, TopicConfig,
     },
     tcp::{TcpConfig, TcpSocketConfig, TcpTlsConfig},
 };
-use std::fmt::{Display, Formatter};
 
 impl Display for HttpConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {

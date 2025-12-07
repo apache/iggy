@@ -16,29 +16,27 @@
  * under the License.
  */
 
-use crate::client_wrappers::client_wrapper::ClientWrapper;
-use crate::client_wrappers::connection_info::ConnectionInfo;
-use crate::clients::client_builder::IggyClientBuilder;
-use crate::http::http_client::HttpClient;
-use crate::prelude::EncryptorKind;
-use crate::prelude::IggyConsumerBuilder;
-use crate::prelude::IggyError;
-use crate::prelude::IggyProducerBuilder;
-use crate::quic::quic_client::QuicClient;
-use crate::tcp::tcp_client::TcpClient;
-use crate::websocket::websocket_client::WebSocketClient;
+use std::{fmt::Debug, sync::Arc};
+
 use async_broadcast::Receiver;
 use async_trait::async_trait;
 use iggy_binary_protocol::{Client, SystemClient};
-use iggy_common::Consumer;
-use iggy_common::locking::{IggyRwLock, IggyRwLockFn};
-use iggy_common::{ConnectionStringUtils, DiagnosticEvent, Partitioner, TransportProtocol};
-use std::fmt::Debug;
-use std::sync::Arc;
-use tokio::spawn;
-use tokio::time::sleep;
-use tracing::log::warn;
-use tracing::{debug, error, info};
+use iggy_common::{
+    ConnectionStringUtils, Consumer, DiagnosticEvent, Partitioner, TransportProtocol,
+    locking::{IggyRwLock, IggyRwLockFn},
+};
+use tokio::{spawn, time::sleep};
+use tracing::{debug, error, info, log::warn};
+
+use crate::{
+    client_wrappers::{client_wrapper::ClientWrapper, connection_info::ConnectionInfo},
+    clients::client_builder::IggyClientBuilder,
+    http::http_client::HttpClient,
+    prelude::{EncryptorKind, IggyConsumerBuilder, IggyError, IggyProducerBuilder},
+    quic::quic_client::QuicClient,
+    tcp::tcp_client::TcpClient,
+    websocket::websocket_client::WebSocketClient,
+};
 
 /// The main client struct which implements all the `Client` traits and wraps the underlying low-level client for the specific transport.
 ///

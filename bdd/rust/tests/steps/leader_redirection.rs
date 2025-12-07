@@ -16,13 +16,14 @@
  * under the License.
  */
 
-use crate::common::leader_context::LeaderContext;
-use crate::helpers::cluster;
+use std::time::Duration;
+
 use cucumber::{given, then, when};
 use iggy::prelude::*;
 use integration::test_server::login_root;
-use std::time::Duration;
 use tokio::time::sleep;
+
+use crate::{common::leader_context::LeaderContext, helpers::cluster};
 
 // ============================================================================
 // Background steps for cluster configuration

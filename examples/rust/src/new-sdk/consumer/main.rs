@@ -16,20 +16,19 @@
  * under the License.
  */
 
+use std::{error::Error, str::FromStr, sync::Arc};
+
 use futures_util::StreamExt;
 use iggy::prelude::*;
-use iggy_examples::shared::args::Args;
-use iggy_examples::shared::messages::{
-    Envelope, ORDER_CONFIRMED_TYPE, ORDER_CREATED_TYPE, ORDER_REJECTED_TYPE, OrderConfirmed,
-    OrderCreated, OrderRejected,
+use iggy_examples::shared::{
+    args::Args,
+    messages::{
+        Envelope, ORDER_CONFIRMED_TYPE, ORDER_CREATED_TYPE, ORDER_REJECTED_TYPE, OrderConfirmed,
+        OrderCreated, OrderRejected,
+    },
 };
-use std::error::Error;
-use std::str::FromStr;
-use std::sync::Arc;
 use tracing::{error, info, warn};
-use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{EnvFilter, Registry};
+use tracing_subscriber::{EnvFilter, Registry, layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<(), Box<dyn Error>> {

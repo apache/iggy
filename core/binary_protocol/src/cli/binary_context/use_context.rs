@@ -19,10 +19,11 @@
 use async_trait::async_trait;
 use tracing::{Level, event};
 
-use crate::Client;
-use crate::cli::cli_command::{CliCommand, PRINT_TARGET};
-
 use super::common::{ContextManager, DEFAULT_CONTEXT_NAME};
+use crate::{
+    Client,
+    cli::cli_command::{CliCommand, PRINT_TARGET},
+};
 
 pub struct UseContextCmd {
     context_name: String,

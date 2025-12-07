@@ -14,14 +14,16 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use crate::cache::AllocationStrategy;
-use iggy_common::TcpSender;
-use rand::{SeedableRng, rngs::StdRng, seq::SliceRandom};
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
     rc::Rc,
 };
+
+use iggy_common::TcpSender;
+use rand::{SeedableRng, rngs::StdRng, seq::SliceRandom};
+
+use crate::cache::AllocationStrategy;
 
 const MAX_CONNECTIONS_PER_REPLICA: usize = 8;
 

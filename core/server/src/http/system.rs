@@ -16,28 +16,32 @@
  * under the License.
  */
 
-use crate::configs::http::HttpMetricsConfig;
-use crate::http::COMPONENT;
-use crate::http::error::CustomError;
-use crate::http::jwt::json_web_token::Identity;
-use crate::http::mapper;
-use crate::http::shared::AppState;
-use crate::streaming::session::Session;
-use axum::body::Body;
-use axum::extract::{Path, State};
-use axum::http::{HeaderMap, header};
-use axum::response::IntoResponse;
-use axum::routing::{get, post};
-use axum::{Extension, Json, Router, debug_handler};
+use std::sync::Arc;
+
+use axum::{
+    Extension, Json, Router,
+    body::Body,
+    debug_handler,
+    extract::{Path, State},
+    http::{HeaderMap, header},
+    response::IntoResponse,
+    routing::{get, post},
+};
 use bytes::Bytes;
 use chrono::Local;
 use err_trail::ErrContext;
-use iggy_common::Stats;
-use iggy_common::Validatable;
-use iggy_common::get_snapshot::GetSnapshot;
-use iggy_common::{ClientInfo, ClientInfoDetails, ClusterMetadata};
+use iggy_common::{
+    ClientInfo, ClientInfoDetails, ClusterMetadata, Stats, Validatable, get_snapshot::GetSnapshot,
+};
 use send_wrapper::SendWrapper;
-use std::sync::Arc;
+
+use crate::{
+    configs::http::HttpMetricsConfig,
+    http::{
+        COMPONENT, error::CustomError, jwt::json_web_token::Identity, mapper, shared::AppState,
+    },
+    streaming::session::Session,
+};
 
 const NAME: &str = "Iggy API";
 const PONG: &str = "pong";

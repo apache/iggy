@@ -15,9 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::path::Path;
+
 use compio::fs::create_dir_all;
 use iggy_common::IggyError;
-use std::path::Path;
 
 use crate::{
     configs::system::SystemConfig,

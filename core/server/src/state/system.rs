@@ -16,24 +16,21 @@
  * under the License.
  */
 
-use crate::bootstrap::create_root_user;
-use crate::state::file::FileState;
-use crate::state::models::CreateUserWithId;
-use crate::state::{COMPONENT, EntryCommand, StateEntry};
-use crate::streaming::personal_access_tokens::personal_access_token::PersonalAccessToken;
+use std::{collections::BTreeMap, fmt::Display};
+
 use ahash::AHashMap;
 use err_trail::ErrContext;
-use iggy_common::CompressionAlgorithm;
-use iggy_common::IggyError;
-use iggy_common::IggyExpiry;
-use iggy_common::IggyTimestamp;
-use iggy_common::MaxTopicSize;
-use iggy_common::create_user::CreateUser;
-use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
-use iggy_common::{IdKind, Identifier, Permissions, UserStatus};
-use std::collections::BTreeMap;
-use std::fmt::Display;
+use iggy_common::{
+    CompressionAlgorithm, IdKind, Identifier, IggyError, IggyExpiry, IggyTimestamp, MaxTopicSize,
+    Permissions, UserStatus, create_user::CreateUser, defaults::DEFAULT_ROOT_USER_ID,
+};
 use tracing::{debug, error, info};
+
+use crate::{
+    bootstrap::create_root_user,
+    state::{COMPONENT, EntryCommand, StateEntry, file::FileState, models::CreateUserWithId},
+    streaming::personal_access_tokens::personal_access_token::PersonalAccessToken,
+};
 
 #[derive(Debug, Clone)]
 pub struct SystemState {

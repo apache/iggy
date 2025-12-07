@@ -20,6 +20,7 @@ pub mod cli;
 mod client;
 mod utils;
 
-pub use client::binary_clients::binary_client::*;
-pub use client::binary_clients::*;
-pub use client::binary_transport::BinaryTransport;
+pub use client::{
+    binary_clients::{binary_client::*, *},
+    binary_transport::BinaryTransport,
+};

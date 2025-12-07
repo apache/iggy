@@ -16,16 +16,18 @@
  * under the License.
  */
 
-use crate::http::jwt::COMPONENT;
-use crate::{
-    http::jwt::json_web_token::RevokedAccessToken, streaming::persistence::persister::PersisterKind,
-};
+use std::sync::Arc;
+
 use ahash::AHashMap;
 use anyhow::Context;
 use err_trail::ErrContext;
 use iggy_common::IggyError;
-use std::sync::Arc;
 use tracing::{error, info};
+
+use crate::{
+    http::jwt::{COMPONENT, json_web_token::RevokedAccessToken},
+    streaming::persistence::persister::PersisterKind,
+};
 
 #[derive(Debug)]
 pub struct TokenStorage {

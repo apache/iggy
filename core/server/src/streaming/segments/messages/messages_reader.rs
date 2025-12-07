@@ -16,20 +16,23 @@
  * under the License.
  */
 
-use crate::streaming::segments::{IggyIndexesMut, IggyMessagesBatchMut};
-use bytes::BytesMut;
-use compio::buf::{IntoInner, IoBuf};
-use compio::fs::{File, OpenOptions};
-use compio::io::AsyncReadAtExt;
-use err_trail::ErrContext;
-use iggy_common::IggyError;
-use iggy_common::PooledBuffer;
-use std::rc::Rc;
 use std::{
     io::ErrorKind,
+    rc::Rc,
     sync::atomic::{AtomicU64, Ordering},
 };
+
+use bytes::BytesMut;
+use compio::{
+    buf::{IntoInner, IoBuf},
+    fs::{File, OpenOptions},
+    io::AsyncReadAtExt,
+};
+use err_trail::ErrContext;
+use iggy_common::{IggyError, PooledBuffer};
 use tracing::{error, trace};
+
+use crate::streaming::segments::{IggyIndexesMut, IggyMessagesBatchMut};
 
 /// A dedicated struct for reading from the messages file.
 #[derive(Debug)]

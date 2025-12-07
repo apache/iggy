@@ -16,25 +16,29 @@
  * under the License.
  */
 
-use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
-use crate::binary::handlers::topics::COMPONENT;
-use crate::binary::handlers::utils::receive_and_validate;
+use std::rc::Rc;
 
-use crate::shard::IggyShard;
-use crate::shard::transmission::event::ShardEvent;
-use crate::shard::transmission::frame::ShardResponse;
-use crate::shard::transmission::message::{
-    ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult,
-};
-use crate::state::command::EntryCommand;
-use crate::streaming::session::Session;
-use crate::streaming::{streams, topics};
 use anyhow::Result;
 use err_trail::ErrContext;
-use iggy_common::update_topic::UpdateTopic;
-use iggy_common::{Identifier, IggyError, SenderKind};
-use std::rc::Rc;
+use iggy_common::{Identifier, IggyError, SenderKind, update_topic::UpdateTopic};
 use tracing::{debug, instrument};
+
+use crate::{
+    binary::{
+        command::{BinaryServerCommand, ServerCommand, ServerCommandHandler},
+        handlers::{topics::COMPONENT, utils::receive_and_validate},
+    },
+    shard::{
+        IggyShard,
+        transmission::{
+            event::ShardEvent,
+            frame::ShardResponse,
+            message::{ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult},
+        },
+    },
+    state::command::EntryCommand,
+    streaming::{session::Session, streams, topics},
+};
 
 impl ServerCommandHandler for UpdateTopic {
     fn code(&self) -> u32 {

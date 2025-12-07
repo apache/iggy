@@ -16,15 +16,17 @@
  * under the License.
  */
 
-use crate::http::http_client::HttpClient;
-use crate::http::http_transport::HttpTransport;
-use crate::prelude::{
-    Consumer, FlushUnsavedBuffer, Identifier, IggyError, IggyMessage, Partitioning, PollMessages,
-    PolledMessages, PollingStrategy, SendMessages,
-};
 use async_trait::async_trait;
 use iggy_binary_protocol::MessageClient;
 use iggy_common::IggyMessagesBatch;
+
+use crate::{
+    http::{http_client::HttpClient, http_transport::HttpTransport},
+    prelude::{
+        Consumer, FlushUnsavedBuffer, Identifier, IggyError, IggyMessage, Partitioning,
+        PollMessages, PolledMessages, PollingStrategy, SendMessages,
+    },
+};
 
 #[async_trait]
 impl MessageClient for HttpClient {

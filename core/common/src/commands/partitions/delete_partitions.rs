@@ -16,16 +16,16 @@
  * under the License.
  */
 
-use super::MAX_PARTITIONS_COUNT;
-use crate::BytesSerializable;
-use crate::Identifier;
-use crate::Sizeable;
-use crate::Validatable;
-use crate::error::IggyError;
-use crate::{Command, DELETE_PARTITIONS_CODE};
+use std::fmt::Display;
+
 use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
-use std::fmt::Display;
+
+use super::MAX_PARTITIONS_COUNT;
+use crate::{
+    BytesSerializable, Command, DELETE_PARTITIONS_CODE, Identifier, Sizeable, Validatable,
+    error::IggyError,
+};
 
 /// `DeletePartitions` command is used to delete partitions from a topic.
 /// It has additional payload:
@@ -117,8 +117,9 @@ impl Display for DeletePartitions {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use bytes::BufMut;
+
+    use super::*;
 
     #[test]
     fn should_be_serialized_as_bytes() {

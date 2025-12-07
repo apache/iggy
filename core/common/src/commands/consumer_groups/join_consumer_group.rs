@@ -16,15 +16,15 @@
  * under the License.
  */
 
-use crate::BytesSerializable;
-use crate::Identifier;
-use crate::Sizeable;
-use crate::Validatable;
-use crate::error::IggyError;
-use crate::{Command, JOIN_CONSUMER_GROUP_CODE};
+use std::fmt::Display;
+
 use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
-use std::fmt::Display;
+
+use crate::{
+    BytesSerializable, Command, Identifier, JOIN_CONSUMER_GROUP_CODE, Sizeable, Validatable,
+    error::IggyError,
+};
 
 /// `JoinConsumerGroup` command joins the consumer group by currently authenticated user.
 /// It has additional payload:

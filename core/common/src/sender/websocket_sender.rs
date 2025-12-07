@@ -16,16 +16,18 @@
  * under the License.
  */
 
-use super::Sender;
-use crate::IggyError;
-use crate::alloc::buffer::PooledBuffer;
-use bytes::{BufMut, BytesMut};
-use compio::buf::IoBufMut;
-use compio::net::TcpStream;
-use compio_ws::WebSocketStream;
-use compio_ws::tungstenite::{Error as TungsteniteError, Message};
 use std::ptr;
+
+use bytes::{BufMut, BytesMut};
+use compio::{buf::IoBufMut, net::TcpStream};
+use compio_ws::{
+    WebSocketStream,
+    tungstenite::{Error as TungsteniteError, Message},
+};
 use tracing::{debug, warn};
+
+use super::Sender;
+use crate::{IggyError, alloc::buffer::PooledBuffer};
 
 const READ_BUFFER_CAPACITY: usize = 8192;
 const WRITE_BUFFER_CAPACITY: usize = 8192;

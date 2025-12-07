@@ -16,25 +16,33 @@
  * under the License.
  */
 
-use super::COMPONENT;
-use crate::binary::handlers::messages::poll_messages_handler::IggyPollMetadata;
-use crate::shard::IggyShard;
-use crate::shard::namespace::{IggyFullNamespace, IggyNamespace};
-use crate::shard::transmission::frame::ShardResponse;
-use crate::shard::transmission::message::{
-    ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult,
-};
-use crate::streaming::segments::{IggyIndexesMut, IggyMessagesBatchMut, IggyMessagesBatchSet};
-use crate::streaming::traits::MainOps;
-use crate::streaming::{partitions, streams, topics};
+use std::sync::atomic::Ordering;
+
 use err_trail::ErrContext;
-use iggy_common::PooledBuffer;
 use iggy_common::{
     BytesSerializable, Consumer, EncryptorKind, IGGY_MESSAGE_HEADER_SIZE, Identifier, IggyError,
-    Partitioning, PartitioningKind, PollingKind, PollingStrategy,
+    Partitioning, PartitioningKind, PollingKind, PollingStrategy, PooledBuffer,
 };
-use std::sync::atomic::Ordering;
 use tracing::error;
+
+use super::COMPONENT;
+use crate::{
+    binary::handlers::messages::poll_messages_handler::IggyPollMetadata,
+    shard::{
+        IggyShard,
+        namespace::{IggyFullNamespace, IggyNamespace},
+        transmission::{
+            frame::ShardResponse,
+            message::{ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult},
+        },
+    },
+    streaming::{
+        partitions,
+        segments::{IggyIndexesMut, IggyMessagesBatchMut, IggyMessagesBatchSet},
+        streams, topics,
+        traits::MainOps,
+    },
+};
 
 impl IggyShard {
     pub async fn append_messages(

@@ -15,16 +15,24 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::api;
-use crate::components::selectors::measurement_type_selector::MeasurementType;
-use crate::components::theme::theme_toggle::ThemeToggle;
-use crate::components::tooltips::benchmark_info_toggle::BenchmarkInfoToggle;
-use crate::components::tooltips::benchmark_info_tooltip::BenchmarkInfoTooltip;
-use crate::components::tooltips::server_stats_toggle::ServerStatsToggle;
-use crate::components::tooltips::server_stats_tooltip::ServerStatsTooltip;
-use crate::state::benchmark::use_benchmark;
-use crate::state::ui::{UiAction, use_ui};
 use yew::prelude::*;
+
+use crate::{
+    api,
+    components::{
+        selectors::measurement_type_selector::MeasurementType,
+        theme::theme_toggle::ThemeToggle,
+        tooltips::{
+            benchmark_info_toggle::BenchmarkInfoToggle,
+            benchmark_info_tooltip::BenchmarkInfoTooltip, server_stats_toggle::ServerStatsToggle,
+            server_stats_tooltip::ServerStatsTooltip,
+        },
+    },
+    state::{
+        benchmark::use_benchmark,
+        ui::{UiAction, use_ui},
+    },
+};
 
 #[derive(Properties, PartialEq)]
 pub struct TopBarProps {

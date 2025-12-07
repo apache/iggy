@@ -16,20 +16,22 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-use crate::configs::connectors::{ConnectorsConfigProvider, SinkConfig, SourceConfig};
-use crate::configs::runtime::ConnectorsRuntimeConfig;
-use crate::manager::status::ConnectorError;
+use std::{collections::HashMap, sync::Arc};
+
+use tracing::error;
+
 use crate::{
     SinkConnectorWrapper, SourceConnectorWrapper,
+    configs::{
+        connectors::{ConnectorsConfigProvider, SinkConfig, SourceConfig},
+        runtime::ConnectorsRuntimeConfig,
+    },
     manager::{
         sink::{SinkDetails, SinkInfo, SinkManager},
         source::{SourceDetails, SourceInfo, SourceManager},
-        status::ConnectorStatus,
+        status::{ConnectorError, ConnectorStatus},
     },
 };
-use std::collections::HashMap;
-use std::sync::Arc;
-use tracing::error;
 
 pub struct RuntimeContext {
     pub sinks: SinkManager,

@@ -18,18 +18,18 @@
 
 mod seeder;
 
+use std::{error::Error, sync::Arc};
+
 use anyhow::Result;
 use clap::Parser;
-use iggy::client_provider;
-use iggy::client_provider::ClientProviderConfig;
-use iggy::clients::client::IggyClient;
-use iggy::prelude::{Aes256GcmEncryptor, Args, ArgsOptional, Client, EncryptorKind, UserClient};
-use std::error::Error;
-use std::sync::Arc;
+use iggy::{
+    client_provider,
+    client_provider::ClientProviderConfig,
+    clients::client::IggyClient,
+    prelude::{Aes256GcmEncryptor, Args, ArgsOptional, Client, EncryptorKind, UserClient},
+};
 use tracing::info;
-use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{EnvFilter, Registry};
+use tracing_subscriber::{EnvFilter, Registry, layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Parser, Debug, Clone)]
 #[command(author, version, about, long_about = None)]

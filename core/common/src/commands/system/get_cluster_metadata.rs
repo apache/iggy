@@ -16,11 +16,12 @@
  * under the License.
  */
 
-use crate::error::IggyError;
-use crate::{BytesSerializable, Command, GET_CLUSTER_METADATA_CODE, Validatable};
+use std::fmt::Display;
+
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-use std::fmt::Display;
+
+use crate::{BytesSerializable, Command, GET_CLUSTER_METADATA_CODE, Validatable, error::IggyError};
 
 /// `GetClusterMetadata` command is used to retrieve cluster metadata including
 /// available nodes, their roles, and connection information.

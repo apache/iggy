@@ -16,18 +16,20 @@
  * under the License.
  */
 
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use bench_report::{benchmark_kind::BenchmarkKind, individual_metrics::BenchmarkIndividualMetrics};
+use iggy::prelude::*;
+use integration::test_server::ClientFactory;
+use tokio::task::JoinSet;
+use tracing::info;
+
 use super::benchmark::Benchmarkable;
 use crate::{
     args::common::IggyBenchArgs,
     benchmarks::common::{build_consumer_futures, build_producer_futures, init_consumer_groups},
 };
-use async_trait::async_trait;
-use bench_report::{benchmark_kind::BenchmarkKind, individual_metrics::BenchmarkIndividualMetrics};
-use iggy::prelude::*;
-use integration::test_server::ClientFactory;
-use std::sync::Arc;
-use tokio::task::JoinSet;
-use tracing::info;
 
 pub struct BalancedProducerAndConsumerGroupBenchmark {
     args: Arc<IggyBenchArgs>,

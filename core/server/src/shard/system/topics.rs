@@ -16,17 +16,26 @@
  * under the License.
  */
 
-use super::COMPONENT;
-use crate::shard::IggyShard;
-use crate::slab::traits_ext::{EntityComponentSystem, EntityMarker, InsertCell, IntoComponents};
-use crate::streaming::session::Session;
-use crate::streaming::topics::storage::{create_topic_file_hierarchy, delete_topic_from_disk};
-use crate::streaming::topics::topic::{self};
-use crate::streaming::{partitions, streams, topics};
+use std::str::FromStr;
+
 use err_trail::ErrContext;
 use iggy_common::{CompressionAlgorithm, Identifier, IggyError, IggyExpiry, MaxTopicSize};
-use std::str::FromStr;
 use tracing::info;
+
+use super::COMPONENT;
+use crate::{
+    shard::IggyShard,
+    slab::traits_ext::{EntityComponentSystem, EntityMarker, InsertCell, IntoComponents},
+    streaming::{
+        partitions,
+        session::Session,
+        streams, topics,
+        topics::{
+            storage::{create_topic_file_hierarchy, delete_topic_from_disk},
+            topic::{self},
+        },
+    },
+};
 
 impl IggyShard {
     #[allow(clippy::too_many_arguments)]

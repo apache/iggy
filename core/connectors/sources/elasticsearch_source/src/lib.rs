@@ -16,6 +16,8 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+use std::{str::FromStr, sync::Arc, time::Duration};
+
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use elasticsearch::{
@@ -28,15 +30,13 @@ use iggy_connector_sdk::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::str::FromStr;
-use std::sync::Arc;
-use std::time::Duration;
 use tokio::{sync::Mutex, time::sleep};
 use tracing::{info, warn};
 
 mod state_manager;
-use crate::state_manager::{FileStateStorage, SourceState, StateStorage};
 pub use state_manager::{StateInfo, StateManager, StateStats};
+
+use crate::state_manager::{FileStateStorage, SourceState, StateStorage};
 
 source_connector!(ElasticsearchSource);
 

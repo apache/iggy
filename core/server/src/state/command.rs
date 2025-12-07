@@ -16,36 +16,27 @@
  * under the License.
  */
 
+use std::fmt::{Display, Formatter};
+
+use bytes::{Buf, BufMut, Bytes, BytesMut};
+use iggy_common::{
+    BytesSerializable, CHANGE_PASSWORD_CODE, CREATE_CONSUMER_GROUP_CODE, CREATE_PARTITIONS_CODE,
+    CREATE_PERSONAL_ACCESS_TOKEN_CODE, CREATE_STREAM_CODE, CREATE_TOPIC_CODE, CREATE_USER_CODE,
+    Command, DELETE_CONSUMER_GROUP_CODE, DELETE_PARTITIONS_CODE, DELETE_PERSONAL_ACCESS_TOKEN_CODE,
+    DELETE_STREAM_CODE, DELETE_TOPIC_CODE, DELETE_USER_CODE, IggyError, PURGE_STREAM_CODE,
+    PURGE_TOPIC_CODE, UPDATE_PERMISSIONS_CODE, UPDATE_STREAM_CODE, UPDATE_TOPIC_CODE,
+    UPDATE_USER_CODE, change_password::ChangePassword, create_partitions::CreatePartitions,
+    delete_consumer_group::DeleteConsumerGroup, delete_partitions::DeletePartitions,
+    delete_personal_access_token::DeletePersonalAccessToken, delete_segments::DeleteSegments,
+    delete_stream::DeleteStream, delete_topic::DeleteTopic, delete_user::DeleteUser,
+    purge_stream::PurgeStream, purge_topic::PurgeTopic, update_permissions::UpdatePermissions,
+    update_stream::UpdateStream, update_topic::UpdateTopic, update_user::UpdateUser,
+};
+
 use crate::state::models::{
     CreateConsumerGroupWithId, CreatePersonalAccessTokenWithHash, CreateStreamWithId,
     CreateTopicWithId, CreateUserWithId,
 };
-use bytes::{Buf, BufMut, Bytes, BytesMut};
-use iggy_common::BytesSerializable;
-use iggy_common::IggyError;
-use iggy_common::change_password::ChangePassword;
-use iggy_common::create_partitions::CreatePartitions;
-use iggy_common::delete_consumer_group::DeleteConsumerGroup;
-use iggy_common::delete_partitions::DeletePartitions;
-use iggy_common::delete_personal_access_token::DeletePersonalAccessToken;
-use iggy_common::delete_segments::DeleteSegments;
-use iggy_common::delete_stream::DeleteStream;
-use iggy_common::delete_topic::DeleteTopic;
-use iggy_common::delete_user::DeleteUser;
-use iggy_common::purge_stream::PurgeStream;
-use iggy_common::purge_topic::PurgeTopic;
-use iggy_common::update_permissions::UpdatePermissions;
-use iggy_common::update_stream::UpdateStream;
-use iggy_common::update_topic::UpdateTopic;
-use iggy_common::update_user::UpdateUser;
-use iggy_common::{
-    CHANGE_PASSWORD_CODE, CREATE_CONSUMER_GROUP_CODE, CREATE_PARTITIONS_CODE,
-    CREATE_PERSONAL_ACCESS_TOKEN_CODE, CREATE_STREAM_CODE, CREATE_TOPIC_CODE, CREATE_USER_CODE,
-    Command, DELETE_CONSUMER_GROUP_CODE, DELETE_PARTITIONS_CODE, DELETE_PERSONAL_ACCESS_TOKEN_CODE,
-    DELETE_STREAM_CODE, DELETE_TOPIC_CODE, DELETE_USER_CODE, PURGE_STREAM_CODE, PURGE_TOPIC_CODE,
-    UPDATE_PERMISSIONS_CODE, UPDATE_STREAM_CODE, UPDATE_TOPIC_CODE, UPDATE_USER_CODE,
-};
-use std::fmt::{Display, Formatter};
 
 #[derive(Debug, PartialEq)]
 pub enum EntryCommand {

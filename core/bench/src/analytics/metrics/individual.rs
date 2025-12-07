@@ -20,17 +20,23 @@
 #![allow(clippy::cast_possible_truncation)]
 #![allow(clippy::cast_sign_loss)]
 
-use crate::analytics::record::BenchmarkRecord;
-use crate::analytics::time_series::calculator::TimeSeriesCalculator;
-use crate::analytics::time_series::processors::TimeSeriesProcessor;
-use crate::analytics::time_series::processors::moving_average::MovingAverageProcessor;
-use bench_report::actor_kind::ActorKind;
-use bench_report::benchmark_kind::BenchmarkKind;
-use bench_report::individual_metrics::BenchmarkIndividualMetrics;
-use bench_report::individual_metrics_summary::BenchmarkIndividualMetricsSummary;
-use bench_report::time_series::TimeSeries;
-use bench_report::utils::{max, min, std_dev};
+use bench_report::{
+    actor_kind::ActorKind,
+    benchmark_kind::BenchmarkKind,
+    individual_metrics::BenchmarkIndividualMetrics,
+    individual_metrics_summary::BenchmarkIndividualMetricsSummary,
+    time_series::TimeSeries,
+    utils::{max, min, std_dev},
+};
 use iggy::prelude::IggyDuration;
+
+use crate::analytics::{
+    record::BenchmarkRecord,
+    time_series::{
+        calculator::TimeSeriesCalculator,
+        processors::{TimeSeriesProcessor, moving_average::MovingAverageProcessor},
+    },
+};
 
 pub fn from_records(
     records: &[BenchmarkRecord],

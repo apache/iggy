@@ -16,11 +16,13 @@
 // under the License.
 mod cache;
 
+use std::{collections::HashMap, rc::Rc};
+
+use iggy_common::{IggyError, SenderKind, TcpSender, header::GenericHeader, message::Message};
+
 use crate::cache::connection::{
     ConnectionCache, Coordinator, LeastLoadedStrategy, ShardedConnections,
 };
-use iggy_common::{IggyError, SenderKind, TcpSender, header::GenericHeader, message::Message};
-use std::{collections::HashMap, rc::Rc};
 
 /// Message bus parameterized by allocation strategy and sharded state
 pub trait MessageBus {

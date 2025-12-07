@@ -17,24 +17,26 @@
  * under the License.
  */
 
+use std::{
+    collections::HashMap,
+    fs,
+    fs::{File, OpenOptions},
+    io::Write,
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    path::{Path, PathBuf},
+    process::{Child, Command, Stdio},
+    thread::{available_parallelism, panicking, sleep},
+    time::Duration,
+};
+
 use assert_cmd::prelude::CommandCargoExt;
 use async_trait::async_trait;
 use derive_more::Display;
 use futures::executor::block_on;
-use iggy::prelude::UserStatus::Active;
-use iggy::prelude::*;
+use iggy::prelude::{UserStatus::Active, *};
 use iggy_common::{ConfigProvider, TransportProtocol};
 use rand::Rng;
 use server::configs::server::ServerConfig;
-use std::collections::HashMap;
-use std::fs;
-use std::fs::{File, OpenOptions};
-use std::io::Write;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::thread::{available_parallelism, panicking, sleep};
-use std::time::Duration;
 use uuid::Uuid;
 
 pub const SYSTEM_PATH_ENV_VAR: &str = "IGGY_SYSTEM_PATH";
@@ -243,8 +245,7 @@ impl TestServer {
         if let Some(mut child_handle) = self.child_handle.take() {
             #[cfg(unix)]
             unsafe {
-                use libc::SIGTERM;
-                use libc::kill;
+                use libc::{SIGTERM, kill};
                 kill(child_handle.id() as libc::pid_t, SIGTERM);
             }
 

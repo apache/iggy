@@ -16,30 +16,28 @@
  * under the License.
  */
 
-use crate::http::COMPONENT;
-use crate::http::error::CustomError;
-use crate::http::jwt::json_web_token::Identity;
-use crate::http::shared::AppState;
-use crate::slab::traits_ext::{EntityComponentSystem, EntityMarker, IntoComponents};
-use crate::state::command::EntryCommand;
-use crate::state::models::CreateTopicWithId;
-use crate::streaming::session::Session;
-use crate::streaming::{streams, topics};
-use axum::extract::{Path, State};
-use axum::http::StatusCode;
-use axum::routing::{delete, get};
-use axum::{Extension, Json, Router, debug_handler};
-use err_trail::ErrContext;
-use iggy_common::Identifier;
-use iggy_common::Validatable;
-use iggy_common::create_topic::CreateTopic;
-use iggy_common::delete_topic::DeleteTopic;
-use iggy_common::purge_topic::PurgeTopic;
-use iggy_common::update_topic::UpdateTopic;
-use iggy_common::{Topic, TopicDetails};
-use send_wrapper::SendWrapper;
 use std::sync::Arc;
+
+use axum::{
+    Extension, Json, Router, debug_handler,
+    extract::{Path, State},
+    http::StatusCode,
+    routing::{delete, get},
+};
+use err_trail::ErrContext;
+use iggy_common::{
+    Identifier, Topic, TopicDetails, Validatable, create_topic::CreateTopic,
+    delete_topic::DeleteTopic, purge_topic::PurgeTopic, update_topic::UpdateTopic,
+};
+use send_wrapper::SendWrapper;
 use tracing::instrument;
+
+use crate::{
+    http::{COMPONENT, error::CustomError, jwt::json_web_token::Identity, shared::AppState},
+    slab::traits_ext::{EntityComponentSystem, EntityMarker, IntoComponents},
+    state::{command::EntryCommand, models::CreateTopicWithId},
+    streaming::{session::Session, streams, topics},
+};
 
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()

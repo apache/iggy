@@ -16,7 +16,12 @@
  * under the License.
  */
 
-use super::IggyIndexesMut;
+use std::{
+    io::ErrorKind,
+    rc::Rc,
+    sync::atomic::{AtomicU64, Ordering},
+};
+
 use bytes::BytesMut;
 use compio::{
     buf::{IntoInner, IoBuf},
@@ -24,14 +29,10 @@ use compio::{
     io::AsyncReadAtExt,
 };
 use err_trail::ErrContext;
-use iggy_common::PooledBuffer;
-use iggy_common::{INDEX_SIZE, IggyError, IggyIndex, IggyIndexView};
-use std::{
-    io::ErrorKind,
-    rc::Rc,
-    sync::atomic::{AtomicU64, Ordering},
-};
+use iggy_common::{INDEX_SIZE, IggyError, IggyIndex, IggyIndexView, PooledBuffer};
 use tracing::{error, trace};
+
+use super::IggyIndexesMut;
 
 /// A dedicated struct for reading from the index file.
 #[derive(Debug)]

@@ -16,28 +16,30 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-use crate::IGGY_ROOT_PASSWORD_ENV;
-use crate::configs::COMPONENT;
-use crate::configs::cluster::ClusterConfig;
-use crate::configs::http::HttpConfig;
-use crate::configs::quic::QuicConfig;
-use crate::configs::system::SystemConfig;
-use crate::configs::tcp::TcpConfig;
-use crate::configs::websocket::WebSocketConfig;
-use crate::server_error::ConfigurationError;
+use std::{env, str::FromStr, sync::Arc};
+
 use derive_more::Display;
 use err_trail::ErrContext;
-use figment::providers::{Format, Toml};
-use figment::value::Dict;
-use figment::{Metadata, Profile, Provider};
-use iggy_common::{ConfigProvider, IggyByteSize, MemoryPoolConfigOther, Validatable};
-use iggy_common::{CustomEnvProvider, FileConfigProvider, IggyDuration};
+use figment::{
+    Metadata, Profile, Provider,
+    providers::{Format, Toml},
+    value::Dict,
+};
+use iggy_common::{
+    ConfigProvider, CustomEnvProvider, FileConfigProvider, IggyByteSize, IggyDuration,
+    MemoryPoolConfigOther, Validatable,
+};
 use serde::{Deserialize, Serialize};
-use serde_with::DisplayFromStr;
-use serde_with::serde_as;
-use std::env;
-use std::str::FromStr;
-use std::sync::Arc;
+use serde_with::{DisplayFromStr, serde_as};
+
+use crate::{
+    IGGY_ROOT_PASSWORD_ENV,
+    configs::{
+        COMPONENT, cluster::ClusterConfig, http::HttpConfig, quic::QuicConfig,
+        system::SystemConfig, tcp::TcpConfig, websocket::WebSocketConfig,
+    },
+    server_error::ConfigurationError,
+};
 
 const DEFAULT_CONFIG_PATH: &str = "configs/server.toml";
 const SECRET_KEYS: [&str; 6] = [

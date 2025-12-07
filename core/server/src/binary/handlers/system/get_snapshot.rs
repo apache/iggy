@@ -16,16 +16,20 @@
  * under the License.
  */
 
-use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
-use crate::binary::handlers::utils::receive_and_validate;
-use crate::shard::IggyShard;
-use crate::streaming::session::Session;
-use bytes::Bytes;
-use iggy_common::IggyError;
-use iggy_common::SenderKind;
-use iggy_common::get_snapshot::GetSnapshot;
 use std::rc::Rc;
+
+use bytes::Bytes;
+use iggy_common::{IggyError, SenderKind, get_snapshot::GetSnapshot};
 use tracing::debug;
+
+use crate::{
+    binary::{
+        command::{BinaryServerCommand, ServerCommand, ServerCommandHandler},
+        handlers::utils::receive_and_validate,
+    },
+    shard::IggyShard,
+    streaming::session::Session,
+};
 
 impl ServerCommandHandler for GetSnapshot {
     fn code(&self) -> u32 {

@@ -16,15 +16,18 @@
  * under the License.
  */
 
-use crate::BytesSerializable;
-use crate::Validatable;
-use crate::defaults::*;
-use crate::error::IggyError;
-use crate::{Command, LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE};
+use std::{
+    fmt::{Display, Formatter},
+    str::from_utf8,
+};
+
 use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
-use std::fmt::{Display, Formatter};
-use std::str::from_utf8;
+
+use crate::{
+    BytesSerializable, Command, LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE, Validatable, defaults::*,
+    error::IggyError,
+};
 
 /// `LoginWithPersonalAccessToken` command is used to login the user with a personal access token, instead of the username and password.
 /// It has additional payload:

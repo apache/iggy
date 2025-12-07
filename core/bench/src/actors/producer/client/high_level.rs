@@ -16,6 +16,12 @@
  * under the License.
  */
 
+use std::sync::Arc;
+
+use iggy::prelude::*;
+use integration::test_server::{ClientFactory, login_root};
+use tokio::time::Instant;
+
 use crate::actors::{
     ApiLabel, BatchMetrics, BenchmarkInit,
     producer::client::{
@@ -23,10 +29,6 @@ use crate::actors::{
         interface::{BenchmarkProducerConfig, ProducerClient},
     },
 };
-use iggy::prelude::*;
-use integration::test_server::{ClientFactory, login_root};
-use std::sync::Arc;
-use tokio::time::Instant;
 
 pub struct HighLevelProducerClient {
     client_factory: Arc<dyn ClientFactory>,

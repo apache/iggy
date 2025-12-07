@@ -15,6 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::sync::{Arc, atomic::AtomicU64};
+
+use iggy_common::{Identifier, IggyTimestamp};
+use slab::Slab;
+
 use crate::{
     configs::system::SystemConfig,
     slab::{
@@ -33,9 +38,6 @@ use crate::{
         stats::{PartitionStats, TopicStats},
     },
 };
-use iggy_common::{Identifier, IggyTimestamp};
-use slab::Slab;
-use std::sync::{Arc, atomic::AtomicU64};
 
 #[derive(Debug, Clone)]
 pub struct ConsumerOffsets(papaya::HashMap<usize, consumer_offset::ConsumerOffset>);

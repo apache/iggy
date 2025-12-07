@@ -16,15 +16,14 @@
  * under the License.
  */
 
-use crate::BytesSerializable;
-use crate::Identifier;
-use crate::Sizeable;
-use crate::Validatable;
-use crate::error::IggyError;
-use crate::{Command, GET_TOPIC_CODE};
+use std::fmt::Display;
+
 use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
-use std::fmt::Display;
+
+use crate::{
+    BytesSerializable, Command, GET_TOPIC_CODE, Identifier, Sizeable, Validatable, error::IggyError,
+};
 
 /// `GetTopic` command is used to retrieve a topic from a stream.
 /// It has additional payload:

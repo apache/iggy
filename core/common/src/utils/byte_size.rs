@@ -16,16 +16,18 @@
  * under the License.
  */
 
-use super::duration::IggyDuration;
-use crate::IggyError;
-use byte_unit::{Byte, UnitType};
 use core::fmt;
-use serde::{Deserialize, Deserializer, Serialize};
 use std::{
     iter::Sum,
     ops::{Add, AddAssign, Sub, SubAssign},
     str::FromStr,
 };
+
+use byte_unit::{Byte, UnitType};
+use serde::{Deserialize, Deserializer, Serialize};
+
+use super::duration::IggyDuration;
+use crate::IggyError;
 
 /// A struct for representing byte sizes with various utility functions.
 ///

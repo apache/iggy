@@ -15,9 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::streaming::segments::{IggyMessagesBatchMut, IggyMessagesBatchSet};
-use iggy_common::{IggyByteSize, IggyError};
 use std::fmt::Debug;
+
+use iggy_common::{IggyByteSize, IggyError};
+
+use crate::streaming::segments::{IggyMessagesBatchMut, IggyMessagesBatchSet};
 
 // TODO: Will have to revisit this Journal abstraction....
 // I don't like that it has to leak impl detail via the `Inner` struct in order to be functional.

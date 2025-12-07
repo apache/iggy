@@ -15,12 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::{BenchmarkCache, Result};
-use crate::error::IggyBenchDashboardServerError;
-use bench_dashboard_shared::BenchmarkReportLight;
 use std::path::Path;
+
+use bench_dashboard_shared::BenchmarkReportLight;
 use tokio::io::AsyncReadExt;
 use tracing::{error, info};
+
+use super::{BenchmarkCache, Result};
+use crate::error::IggyBenchDashboardServerError;
 
 impl BenchmarkCache {
     pub async fn load(&self) -> Result<()> {

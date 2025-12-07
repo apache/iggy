@@ -18,24 +18,27 @@
 
 use std::rc::Rc;
 
-use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
-use crate::binary::handlers::users::COMPONENT;
-use crate::binary::handlers::utils::receive_and_validate;
-
-use crate::shard::IggyShard;
-use crate::shard::transmission::event::ShardEvent;
-use crate::shard::transmission::frame::ShardResponse;
-use crate::shard::transmission::message::{
-    ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult,
-};
-use crate::state::command::EntryCommand;
-use crate::streaming::session::Session;
 use anyhow::Result;
 use err_trail::ErrContext;
-use iggy_common::delete_user::DeleteUser;
-use iggy_common::{Identifier, IggyError, SenderKind};
-use tracing::info;
-use tracing::{debug, instrument};
+use iggy_common::{Identifier, IggyError, SenderKind, delete_user::DeleteUser};
+use tracing::{debug, info, instrument};
+
+use crate::{
+    binary::{
+        command::{BinaryServerCommand, ServerCommand, ServerCommandHandler},
+        handlers::{users::COMPONENT, utils::receive_and_validate},
+    },
+    shard::{
+        IggyShard,
+        transmission::{
+            event::ShardEvent,
+            frame::ShardResponse,
+            message::{ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult},
+        },
+    },
+    state::command::EntryCommand,
+    streaming::session::Session,
+};
 
 impl ServerCommandHandler for DeleteUser {
     fn code(&self) -> u32 {

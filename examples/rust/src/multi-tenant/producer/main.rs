@@ -16,19 +16,15 @@
  * under the License.
  */
 
+use std::{collections::HashMap, env, error::Error, str::FromStr};
+
 use ahash::AHashMap;
 use futures_util::future::join_all;
 use iggy::prelude::*;
 use iggy_examples::shared::args::Args;
-use std::collections::HashMap;
-use std::env;
-use std::error::Error;
-use std::str::FromStr;
 use tokio::task::JoinHandle;
 use tracing::{error, info};
-use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{EnvFilter, Registry};
+use tracing_subscriber::{EnvFilter, Registry, layer::SubscriberExt, util::SubscriberInitExt};
 
 const TOPICS: &[&str] = &["events", "logs", "notifications"];
 const PASSWORD: &str = "secret";

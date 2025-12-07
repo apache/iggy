@@ -16,13 +16,16 @@
  * under the License.
  */
 
-use crate::bootstrap::resolve_persister;
-use crate::http::http_server::start_http_server;
-use crate::shard::IggyShard;
-use crate::shard::task_registry::ShutdownToken;
-use iggy_common::IggyError;
 use std::rc::Rc;
+
+use iggy_common::IggyError;
 use tracing::info;
+
+use crate::{
+    bootstrap::resolve_persister,
+    http::http_server::start_http_server,
+    shard::{IggyShard, task_registry::ShutdownToken},
+};
 
 pub fn spawn_http_server(shard: Rc<IggyShard>) {
     let shard_clone = shard.clone();

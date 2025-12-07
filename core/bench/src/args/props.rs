@@ -16,8 +16,9 @@
  * under the License.
  */
 
-use super::{output::BenchmarkOutputCommand, transport::BenchmarkTransportCommand};
 use iggy::prelude::{IggyByteSize, TransportProtocol};
+
+use super::{output::BenchmarkOutputCommand, transport::BenchmarkTransportCommand};
 
 pub trait BenchmarkKindProps {
     fn streams(&self) -> u32;

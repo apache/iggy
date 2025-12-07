@@ -17,12 +17,14 @@
  * under the License.
  */
 
-use crate::{ConnectorState, Error, Source, get_runtime};
-use serde::de::DeserializeOwned;
 use std::sync::Arc;
+
+use serde::de::DeserializeOwned;
 use tokio::{sync::watch, task::JoinHandle};
 use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, Registry, layer::SubscriberExt, util::SubscriberInitExt};
+
+use crate::{ConnectorState, Error, Source, get_runtime};
 
 #[repr(C)]
 pub struct RawMessage {
@@ -207,8 +209,7 @@ macro_rules! source_connector {
 
         use dashmap::DashMap;
         use once_cell::sync::Lazy;
-        use $crate::source::SendCallback;
-        use $crate::source::SourceContainer;
+        use $crate::source::{SendCallback, SourceContainer};
 
         static INSTANCES: Lazy<DashMap<u32, SourceContainer<$type>>> = Lazy::new(DashMap::new);
 

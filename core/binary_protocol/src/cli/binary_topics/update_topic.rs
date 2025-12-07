@@ -16,14 +16,19 @@
  * under the License.
  */
 
-use crate::Client;
-use crate::cli::cli_command::{CliCommand, PRINT_TARGET};
+use core::fmt;
+
 use anyhow::Context;
 use async_trait::async_trait;
-use core::fmt;
-use iggy_common::update_topic::UpdateTopic;
-use iggy_common::{CompressionAlgorithm, Identifier, IggyExpiry, MaxTopicSize};
+use iggy_common::{
+    CompressionAlgorithm, Identifier, IggyExpiry, MaxTopicSize, update_topic::UpdateTopic,
+};
 use tracing::{Level, event};
+
+use crate::{
+    Client,
+    cli::cli_command::{CliCommand, PRINT_TARGET},
+};
 
 pub struct UpdateTopicCmd {
     update_topic: UpdateTopic,

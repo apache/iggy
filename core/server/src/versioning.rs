@@ -16,11 +16,11 @@
  * under the License.
  */
 
-use crate::VERSION;
+use std::{borrow::Cow, fmt::Display, str::FromStr};
+
 use iggy_common::IggyError;
-use std::borrow::Cow;
-use std::fmt::Display;
-use std::str::FromStr;
+
+use crate::VERSION;
 
 #[derive(Debug, Clone)]
 pub struct SemanticVersion {

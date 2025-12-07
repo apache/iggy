@@ -16,16 +16,16 @@
  * under the License.
  */
 
-use crate::cli::common::{IggyCmdCommand, IggyCmdTest, IggyCmdTestCase};
+use std::{collections::HashMap, path::Path, str::FromStr};
+
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
 use bytes::Bytes;
 use iggy::prelude::*;
 use predicates::str::{contains, is_match, starts_with};
 use serial_test::parallel;
-use std::collections::HashMap;
-use std::path::Path;
-use std::str::FromStr;
+
+use crate::cli::common::{IggyCmdCommand, IggyCmdTest, IggyCmdTestCase};
 
 pub(super) struct TestMessagePollToFileCmd<'a> {
     stream_name: String,

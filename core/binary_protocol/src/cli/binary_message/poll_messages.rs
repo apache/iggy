@@ -16,8 +16,8 @@
  * under the License.
  */
 
-use crate::Client;
-use crate::cli::cli_command::{CliCommand, PRINT_TARGET};
+use std::collections::{HashMap, HashSet};
+
 use anyhow::Context;
 use async_trait::async_trait;
 use comfy_table::{Cell, CellAlignment, Row, Table};
@@ -25,9 +25,13 @@ use iggy_common::{
     BytesSerializable, Consumer, HeaderKey, HeaderKind, HeaderValue, Identifier, IggyByteSize,
     IggyDuration, IggyMessage, IggyTimestamp, PollMessages, PollingStrategy, Sizeable,
 };
-use std::collections::{HashMap, HashSet};
 use tokio::io::AsyncWriteExt;
 use tracing::{Level, event};
+
+use crate::{
+    Client,
+    cli::cli_command::{CliCommand, PRINT_TARGET},
+};
 
 pub struct PollMessagesCmd {
     poll_messages: PollMessages,

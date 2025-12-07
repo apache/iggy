@@ -16,13 +16,14 @@
  * under the License.
  */
 
-use crate::prelude::IggyClient;
 use async_dropper::AsyncDrop;
 use async_trait::async_trait;
 use iggy_binary_protocol::{ConsumerGroupClient, UserClient};
 use iggy_common::{
     ConsumerGroup, ConsumerGroupDetails, Identifier, IggyError, locking::IggyRwLockFn,
 };
+
+use crate::prelude::IggyClient;
 
 #[async_trait]
 impl ConsumerGroupClient for IggyClient {

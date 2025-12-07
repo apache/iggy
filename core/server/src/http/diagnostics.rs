@@ -16,18 +16,21 @@
  * under the License.
  */
 
-use crate::http::http_server::CompioSocketAddr;
-use crate::http::shared::RequestDetails;
-use crate::streaming::utils::random_id;
-use axum::body::Body;
+use std::time::Instant;
+
 use axum::{
+    body::Body,
     extract::ConnectInfo,
     http::{Request, StatusCode},
     middleware::Next,
     response::Response,
 };
-use std::time::Instant;
 use tracing::{debug, error};
+
+use crate::{
+    http::{http_server::CompioSocketAddr, shared::RequestDetails},
+    streaming::utils::random_id,
+};
 
 pub async fn request_diagnostics(
     ConnectInfo(ip_address): ConnectInfo<CompioSocketAddr>,

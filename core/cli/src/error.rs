@@ -17,6 +17,7 @@
  */
 
 use std::fmt::{Display, Formatter, Result};
+
 use thiserror::Error;
 
 #[derive(Error, Debug)]

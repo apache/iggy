@@ -16,14 +16,13 @@
  * under the License.
  */
 
-use crate::streaming::persistence::COMPONENT;
-use crate::streaming::utils::file;
-use compio::buf::IoBuf;
-use compio::fs::remove_file;
-use compio::io::AsyncWriteAtExt;
+use std::fmt::Debug;
+
+use compio::{buf::IoBuf, fs::remove_file, io::AsyncWriteAtExt};
 use err_trail::ErrContext;
 use iggy_common::IggyError;
-use std::fmt::Debug;
+
+use crate::streaming::{persistence::COMPONENT, utils::file};
 
 #[derive(Debug)]
 pub enum PersisterKind {

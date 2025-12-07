@@ -16,14 +16,11 @@
  * under the License.
  */
 
+use std::{env, error::Error, str::FromStr};
+
 use iggy::prelude::*;
-use std::env;
-use std::error::Error;
-use std::str::FromStr;
 use tracing::{info, warn};
-use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{EnvFilter, Registry};
+use tracing_subscriber::{EnvFilter, Registry, layer::SubscriberExt, util::SubscriberInitExt};
 
 const STREAM_NAME: &str = "sample-stream";
 const TOPIC_NAME: &str = "sample-topic";

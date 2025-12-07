@@ -16,25 +16,30 @@
  * under the License.
  */
 
-use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
-use crate::binary::handlers::streams::COMPONENT;
-use crate::binary::handlers::utils::receive_and_validate;
-use crate::shard::IggyShard;
-use crate::shard::transmission::event::ShardEvent;
-use crate::shard::transmission::frame::ShardResponse;
-use crate::shard::transmission::message::{
-    ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult,
-};
-use crate::slab::traits_ext::EntityMarker;
-use crate::state::command::EntryCommand;
-use crate::streaming::session::Session;
+use std::rc::Rc;
+
 use anyhow::Result;
 use err_trail::ErrContext;
-use iggy_common::delete_stream::DeleteStream;
-use iggy_common::{Identifier, IggyError, SenderKind};
-use std::rc::Rc;
-use tracing::info;
-use tracing::{debug, instrument};
+use iggy_common::{Identifier, IggyError, SenderKind, delete_stream::DeleteStream};
+use tracing::{debug, info, instrument};
+
+use crate::{
+    binary::{
+        command::{BinaryServerCommand, ServerCommand, ServerCommandHandler},
+        handlers::{streams::COMPONENT, utils::receive_and_validate},
+    },
+    shard::{
+        IggyShard,
+        transmission::{
+            event::ShardEvent,
+            frame::ShardResponse,
+            message::{ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult},
+        },
+    },
+    slab::traits_ext::EntityMarker,
+    state::command::EntryCommand,
+    streaming::session::Session,
+};
 
 impl ServerCommandHandler for DeleteStream {
     fn code(&self) -> u32 {

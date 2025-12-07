@@ -17,16 +17,24 @@
  * under the License.
  */
 
-use crate::api::config::HttpConfig;
-use figment::providers::{Format, Toml};
-use figment::value::Dict;
-use figment::{Metadata, Profile, Provider};
-use iggy_common::defaults::{DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME};
-use iggy_common::{CustomEnvProvider, FileConfigProvider, IggyDuration};
+use std::{
+    collections::HashMap,
+    fmt::{Display, Formatter},
+};
+
+use figment::{
+    Metadata, Profile, Provider,
+    providers::{Format, Toml},
+    value::Dict,
+};
+use iggy_common::{
+    CustomEnvProvider, FileConfigProvider, IggyDuration,
+    defaults::{DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME},
+};
 use serde::{Deserialize, Serialize};
 use serde_with::{DisplayFromStr, serde_as};
-use std::collections::HashMap;
-use std::fmt::{Display, Formatter};
+
+use crate::api::config::HttpConfig;
 
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
 #[serde(default)]

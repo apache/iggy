@@ -16,9 +16,12 @@
  * under the License.
  */
 
+use std::{
+    io,
+    path::{Path, PathBuf},
+};
+
 use compio::fs;
-use std::io;
-use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
 pub struct DirEntry {

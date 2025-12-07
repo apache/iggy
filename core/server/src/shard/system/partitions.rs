@@ -16,26 +16,27 @@
  * under the License.
  */
 
-use super::COMPONENT;
-use crate::shard::IggyShard;
-use crate::shard::calculate_shard_assignment;
-use crate::shard::namespace::IggyNamespace;
-use crate::shard::transmission::id::ShardId;
-use crate::slab::traits_ext::EntityMarker;
-use crate::slab::traits_ext::IntoComponents;
-use crate::streaming::partitions;
-use crate::streaming::partitions::partition;
-use crate::streaming::partitions::storage::create_partition_file_hierarchy;
-use crate::streaming::partitions::storage::delete_partitions_from_disk;
-use crate::streaming::segments::Segment;
-use crate::streaming::segments::storage::create_segment_storage;
-use crate::streaming::session::Session;
-use crate::streaming::streams;
-use crate::streaming::topics;
 use err_trail::ErrContext;
-use iggy_common::Identifier;
-use iggy_common::IggyError;
+use iggy_common::{Identifier, IggyError};
 use tracing::info;
+
+use super::COMPONENT;
+use crate::{
+    shard::{
+        IggyShard, calculate_shard_assignment, namespace::IggyNamespace, transmission::id::ShardId,
+    },
+    slab::traits_ext::{EntityMarker, IntoComponents},
+    streaming::{
+        partitions,
+        partitions::{
+            partition,
+            storage::{create_partition_file_hierarchy, delete_partitions_from_disk},
+        },
+        segments::{Segment, storage::create_segment_storage},
+        session::Session,
+        streams, topics,
+    },
+};
 
 impl IggyShard {
     fn validate_partition_permissions(

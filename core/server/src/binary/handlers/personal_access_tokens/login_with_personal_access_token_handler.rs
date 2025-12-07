@@ -15,19 +15,24 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-use crate::shard::IggyShard;
 use std::rc::Rc;
 
-use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
-use crate::binary::handlers::personal_access_tokens::COMPONENT;
-use crate::binary::handlers::utils::receive_and_validate;
-use crate::binary::mapper;
-use crate::streaming::session::Session;
 use anyhow::Result;
 use err_trail::ErrContext;
-use iggy_common::login_with_personal_access_token::LoginWithPersonalAccessToken;
-use iggy_common::{IggyError, SenderKind};
+use iggy_common::{
+    IggyError, SenderKind, login_with_personal_access_token::LoginWithPersonalAccessToken,
+};
 use tracing::{debug, instrument};
+
+use crate::{
+    binary::{
+        command::{BinaryServerCommand, ServerCommand, ServerCommandHandler},
+        handlers::{personal_access_tokens::COMPONENT, utils::receive_and_validate},
+        mapper,
+    },
+    shard::IggyShard,
+    streaming::session::Session,
+};
 
 impl ServerCommandHandler for LoginWithPersonalAccessToken {
     fn code(&self) -> u32 {

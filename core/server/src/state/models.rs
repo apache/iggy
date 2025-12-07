@@ -16,22 +16,22 @@
  * under the License.
  */
 
-use crate::state::COMPONENT;
+use std::{
+    fmt,
+    fmt::{Display, Formatter},
+    str::from_utf8,
+};
+
 use bytes::{BufMut, Bytes, BytesMut};
 use err_trail::ErrContext;
-use iggy_common::BytesSerializable;
-use iggy_common::Command;
-use iggy_common::IggyError;
-use iggy_common::Validatable;
-use iggy_common::create_consumer_group::CreateConsumerGroup;
-use iggy_common::create_personal_access_token::CreatePersonalAccessToken;
-use iggy_common::create_stream::CreateStream;
-use iggy_common::create_topic::CreateTopic;
-use iggy_common::create_user::CreateUser;
+use iggy_common::{
+    BytesSerializable, Command, IggyError, Validatable, create_consumer_group::CreateConsumerGroup,
+    create_personal_access_token::CreatePersonalAccessToken, create_stream::CreateStream,
+    create_topic::CreateTopic, create_user::CreateUser,
+};
 use serde::{Deserialize, Serialize};
-use std::fmt;
-use std::fmt::{Display, Formatter};
-use std::str::from_utf8;
+
+use crate::state::COMPONENT;
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub struct CreateStreamWithId {

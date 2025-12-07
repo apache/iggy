@@ -29,16 +29,11 @@ pub(crate) mod system_client;
 pub(crate) mod topic_client;
 pub(crate) mod user_client;
 
-pub use crate::client::binary_clients::binary_client::BinaryClient;
-pub use crate::client::binary_clients::client::Client;
-pub use crate::client::binary_clients::cluster_client::ClusterClient;
-pub use crate::client::binary_clients::consumer_group_client::ConsumerGroupClient;
-pub use crate::client::binary_clients::consumer_offset_client::ConsumerOffsetClient;
-pub use crate::client::binary_clients::message_client::MessageClient;
-pub use crate::client::binary_clients::partition_client::PartitionClient;
-pub use crate::client::binary_clients::personal_access_token_client::PersonalAccessTokenClient;
-pub use crate::client::binary_clients::segment_client::SegmentClient;
-pub use crate::client::binary_clients::stream_client::StreamClient;
-pub use crate::client::binary_clients::system_client::SystemClient;
-pub use crate::client::binary_clients::topic_client::TopicClient;
-pub use crate::client::binary_clients::user_client::UserClient;
+pub use crate::client::binary_clients::{
+    binary_client::BinaryClient, client::Client, cluster_client::ClusterClient,
+    consumer_group_client::ConsumerGroupClient, consumer_offset_client::ConsumerOffsetClient,
+    message_client::MessageClient, partition_client::PartitionClient,
+    personal_access_token_client::PersonalAccessTokenClient, segment_client::SegmentClient,
+    stream_client::StreamClient, system_client::SystemClient, topic_client::TopicClient,
+    user_client::UserClient,
+};

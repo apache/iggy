@@ -15,12 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::NoShutdown;
-use crate::shard::task_registry::ShutdownToken;
-use crate::shard::task_registry::registry::TaskRegistry;
+use std::{
+    ops::{AsyncFn, AsyncFnOnce},
+    time::Duration,
+};
+
 use iggy_common::IggyError;
-use std::ops::{AsyncFn, AsyncFnOnce};
-use std::time::Duration;
+
+use super::NoShutdown;
+use crate::shard::task_registry::{ShutdownToken, registry::TaskRegistry};
 
 pub struct PeriodicBuilder<'a, Tick, OnShutdown = NoShutdown> {
     reg: &'a TaskRegistry,

@@ -16,26 +16,26 @@
  * under the License.
  */
 
-use crate::http::COMPONENT;
-use crate::http::error::CustomError;
-use crate::http::jwt::json_web_token::Identity;
-use crate::http::shared::AppState;
-use crate::streaming::session::Session;
-use axum::debug_handler;
-use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
-use axum::routing::{delete, get};
-use axum::{Extension, Json, Router};
-use err_trail::ErrContext;
-use iggy_common::Consumer;
-use iggy_common::ConsumerOffsetInfo;
-use iggy_common::Identifier;
-use iggy_common::Validatable;
-use iggy_common::delete_consumer_offset::DeleteConsumerOffset;
-use iggy_common::get_consumer_offset::GetConsumerOffset;
-use iggy_common::store_consumer_offset::StoreConsumerOffset;
-use send_wrapper::SendWrapper;
 use std::sync::Arc;
+
+use axum::{
+    Extension, Json, Router, debug_handler,
+    extract::{Path, Query, State},
+    http::StatusCode,
+    routing::{delete, get},
+};
+use err_trail::ErrContext;
+use iggy_common::{
+    Consumer, ConsumerOffsetInfo, Identifier, Validatable,
+    delete_consumer_offset::DeleteConsumerOffset, get_consumer_offset::GetConsumerOffset,
+    store_consumer_offset::StoreConsumerOffset,
+};
+use send_wrapper::SendWrapper;
+
+use crate::{
+    http::{COMPONENT, error::CustomError, jwt::json_web_token::Identity, shared::AppState},
+    streaming::session::Session,
+};
 
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()

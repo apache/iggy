@@ -16,14 +16,16 @@
  * under the License.
  */
 
-use crate::Client;
-use crate::cli::cli_command::{CliCommand, PRINT_TARGET};
 use anyhow::Context;
 use async_trait::async_trait;
 use comfy_table::{Table, presets::ASCII_NO_BORDERS};
-use iggy_common::Identifier;
-use iggy_common::get_consumer_group::GetConsumerGroup;
+use iggy_common::{Identifier, get_consumer_group::GetConsumerGroup};
 use tracing::{Level, event};
+
+use crate::{
+    Client,
+    cli::cli_command::{CliCommand, PRINT_TARGET},
+};
 
 pub struct GetConsumerGroupCmd {
     get_consumer_group: GetConsumerGroup,

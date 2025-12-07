@@ -16,8 +16,9 @@
  * under the License.
  */
 
-use crate::common::global_context::GlobalContext;
 use cucumber::given;
+
+use crate::common::global_context::GlobalContext;
 
 #[given("I have a running Iggy server")]
 pub async fn given_running_server(world: &mut GlobalContext) {

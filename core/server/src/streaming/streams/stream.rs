@@ -15,12 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use iggy_common::IggyTimestamp;
-use slab::Slab;
 use std::{
     cell::{Ref, RefMut},
     sync::Arc,
 };
+
+use iggy_common::IggyTimestamp;
+use slab::Slab;
 
 use crate::{
     slab::{

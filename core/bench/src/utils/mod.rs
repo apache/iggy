@@ -16,6 +16,8 @@
  * under the License.
  */
 
+use std::{fs, path::Path, sync::Arc};
+
 use bench_report::{
     benchmark_kind::BenchmarkKind, individual_metrics::BenchmarkIndividualMetrics,
     numeric_parameter::BenchmarkNumericParameter, params::BenchmarkParams,
@@ -23,7 +25,6 @@ use bench_report::{
 };
 use iggy::prelude::*;
 use integration::test_server::ClientFactory;
-use std::{fs, path::Path, sync::Arc};
 use tracing::{error, info};
 
 use crate::args::{

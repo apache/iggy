@@ -17,15 +17,16 @@
  * under the License.
  */
 
+use async_trait::async_trait;
+use iceberg::Catalog;
+use iggy_connector_sdk::{ConsumedMessage, Error, MessagesMetadata, Sink, TopicMetadata};
+use tracing::{debug, error, info};
+
 use crate::{
     IcebergSink,
     catalog::init_catalog,
     router::{dynamic_router::DynamicRouter, static_router::StaticRouter},
 };
-use async_trait::async_trait;
-use iceberg::Catalog;
-use iggy_connector_sdk::{ConsumedMessage, Error, MessagesMetadata, Sink, TopicMetadata};
-use tracing::{debug, error, info};
 
 #[async_trait]
 impl Sink for IcebergSink {

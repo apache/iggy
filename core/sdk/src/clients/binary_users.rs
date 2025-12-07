@@ -16,15 +16,15 @@
  * under the License.
  */
 
-use crate::client_wrappers::client_wrapper::ClientWrapper;
-use crate::prelude::IggyClient;
 use async_trait::async_trait;
 use iggy_binary_protocol::{Client, UserClient};
-use iggy_common::locking::IggyRwLockFn;
 use iggy_common::{
     Identifier, IdentityInfo, IggyError, Permissions, UserInfo, UserInfoDetails, UserStatus,
+    locking::IggyRwLockFn,
 };
 use tracing::info;
+
+use crate::{client_wrappers::client_wrapper::ClientWrapper, prelude::IggyClient};
 
 #[async_trait]
 impl UserClient for IggyClient {

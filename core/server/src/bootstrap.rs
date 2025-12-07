@@ -17,6 +17,20 @@
  * under the License.
  */
 
+use std::{collections::HashSet, env, path::Path, sync::Arc};
+
+use ahash::HashMap;
+use compio::{fs::create_dir_all, runtime::Runtime};
+use err_trail::ErrContext;
+use iggy_common::{
+    IggyByteSize, IggyError,
+    defaults::{
+        DEFAULT_ROOT_USERNAME, MAX_PASSWORD_LENGTH, MAX_USERNAME_LENGTH, MIN_PASSWORD_LENGTH,
+        MIN_USERNAME_LENGTH,
+    },
+};
+use tracing::{info, warn};
+
 use crate::{
     IGGY_ROOT_PASSWORD_ENV, IGGY_ROOT_USERNAME_ENV,
     compat::index_rebuilding::index_rebuilder::IndexRebuilder,
@@ -64,18 +78,6 @@ use crate::{
     },
     versioning::SemanticVersion,
 };
-use ahash::HashMap;
-use compio::{fs::create_dir_all, runtime::Runtime};
-use err_trail::ErrContext;
-use iggy_common::{
-    IggyByteSize, IggyError,
-    defaults::{
-        DEFAULT_ROOT_USERNAME, MAX_PASSWORD_LENGTH, MAX_USERNAME_LENGTH, MIN_PASSWORD_LENGTH,
-        MIN_USERNAME_LENGTH,
-    },
-};
-use std::{collections::HashSet, env, path::Path, sync::Arc};
-use tracing::{info, warn};
 
 pub async fn load_streams(
     state: impl IntoIterator<Item = StreamState>,

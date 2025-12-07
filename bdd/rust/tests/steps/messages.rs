@@ -16,13 +16,13 @@
  * under the License.
  */
 
-use crate::common::global_context::GlobalContext;
-use crate::helpers::test_data::create_test_messages;
 use bytes::Bytes;
 use cucumber::{then, when};
 use iggy::prelude::{
     Consumer, ConsumerKind, Identifier, IggyMessage, MessageClient, Partitioning, PollingStrategy,
 };
+
+use crate::{common::global_context::GlobalContext, helpers::test_data::create_test_messages};
 
 #[when(regex = r"^I send (\d+) messages to stream (\d+), topic (\d+), partition (\d+)$")]
 pub async fn when_send_messages(

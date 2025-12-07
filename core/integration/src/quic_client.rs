@@ -16,12 +16,16 @@
  * under the License.
  */
 
-use crate::test_server::ClientFactory;
-use async_trait::async_trait;
-use iggy::prelude::{Client, ClientWrapper, QuicClientConfig};
-use iggy::quic::quic_client::QuicClient;
-use iggy_common::TransportProtocol;
 use std::sync::Arc;
+
+use async_trait::async_trait;
+use iggy::{
+    prelude::{Client, ClientWrapper, QuicClientConfig},
+    quic::quic_client::QuicClient,
+};
+use iggy_common::TransportProtocol;
+
+use crate::test_server::ClientFactory;
 
 #[derive(Debug, Clone)]
 pub struct QuicClientFactory {

@@ -17,6 +17,8 @@
  * under the License.
  */
 
+use std::{str::FromStr, time::Duration};
+
 use async_trait::async_trait;
 use iggy_connector_sdk::{
     ConnectorState, Error, ProducedMessage, ProducedMessages, Schema, Source, source_connector,
@@ -26,7 +28,6 @@ use rand::{
     distr::{Alphanumeric, Uniform},
 };
 use serde::{Deserialize, Serialize};
-use std::{str::FromStr, time::Duration};
 use tokio::{sync::Mutex, time::sleep};
 use tracing::{error, info};
 use uuid::Uuid;

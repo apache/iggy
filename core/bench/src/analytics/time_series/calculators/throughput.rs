@@ -20,10 +20,11 @@
 #![allow(clippy::cast_possible_truncation)]
 #![allow(clippy::cast_sign_loss)]
 
-use super::TimeSeriesCalculation;
-use crate::analytics::record::BenchmarkRecord;
 use bench_report::time_series::{TimePoint, TimeSeries, TimeSeriesKind};
 use iggy::prelude::IggyDuration;
+
+use super::TimeSeriesCalculation;
+use crate::analytics::record::BenchmarkRecord;
 
 /// Common functionality for throughput calculations
 pub trait ThroughputCalculation {

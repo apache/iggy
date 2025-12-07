@@ -16,14 +16,15 @@
  * under the License.
  */
 
-use crate::prelude::IggyClient;
 use async_trait::async_trait;
 use bytes::Bytes;
 use iggy_binary_protocol::MessageClient;
-use iggy_common::locking::IggyRwLockFn;
 use iggy_common::{
     Consumer, Identifier, IggyError, IggyMessage, Partitioning, PolledMessages, PollingStrategy,
+    locking::IggyRwLockFn,
 };
+
+use crate::prelude::IggyClient;
 
 #[async_trait]
 impl MessageClient for IggyClient {

@@ -16,16 +16,17 @@
  * under the License.
  */
 
-use crate::http::http_client::HttpClient;
-use crate::http::http_transport::HttpTransport;
-use crate::prelude::{IggyDuration, IggyError};
 use async_trait::async_trait;
 use iggy_binary_protocol::SystemClient;
-use iggy_common::Snapshot;
-use iggy_common::Stats;
-use iggy_common::get_snapshot::GetSnapshot;
-use iggy_common::{ClientInfo, ClientInfoDetails};
-use iggy_common::{SnapshotCompression, SystemSnapshotType};
+use iggy_common::{
+    ClientInfo, ClientInfoDetails, Snapshot, SnapshotCompression, Stats, SystemSnapshotType,
+    get_snapshot::GetSnapshot,
+};
+
+use crate::{
+    http::{http_client::HttpClient, http_transport::HttpTransport},
+    prelude::{IggyDuration, IggyError},
+};
 
 const PING: &str = "/ping";
 const CLIENTS: &str = "/clients";

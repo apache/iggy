@@ -16,18 +16,22 @@
  * under the License.
  */
 
-use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
-use crate::binary::handlers::users::COMPONENT;
-use crate::binary::handlers::utils::receive_and_validate;
-use crate::binary::mapper;
-use crate::shard::IggyShard;
-use crate::streaming::session::Session;
+use std::rc::Rc;
+
 use anyhow::Result;
 use err_trail::ErrContext;
-use iggy_common::login_user::LoginUser;
-use iggy_common::{IggyError, SenderKind};
-use std::rc::Rc;
+use iggy_common::{IggyError, SenderKind, login_user::LoginUser};
 use tracing::{debug, info, instrument, warn};
+
+use crate::{
+    binary::{
+        command::{BinaryServerCommand, ServerCommand, ServerCommandHandler},
+        handlers::{users::COMPONENT, utils::receive_and_validate},
+        mapper,
+    },
+    shard::IggyShard,
+    streaming::session::Session,
+};
 
 impl ServerCommandHandler for LoginUser {
     fn code(&self) -> u32 {

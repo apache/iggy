@@ -16,15 +16,18 @@
  * under the License.
  */
 
-use crate::Command;
-use crate::Validatable;
-use crate::defaults::*;
-use crate::error::IggyError;
-use crate::{BytesSerializable, DELETE_PERSONAL_ACCESS_TOKEN_CODE};
+use std::{
+    fmt::{Display, Formatter},
+    str::from_utf8,
+};
+
 use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
-use std::fmt::{Display, Formatter};
-use std::str::from_utf8;
+
+use crate::{
+    BytesSerializable, Command, DELETE_PERSONAL_ACCESS_TOKEN_CODE, Validatable, defaults::*,
+    error::IggyError,
+};
 
 /// `DeletePersonalAccessToken` command is used to delete a personal access token for the authenticated user.
 /// It has additional payload:

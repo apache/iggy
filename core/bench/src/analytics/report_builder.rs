@@ -16,10 +16,8 @@
  * under the License.
  */
 
-use std::{collections::HashMap, thread};
+use std::{collections::HashMap, sync::Arc, thread};
 
-use super::metrics::group::{from_individual_metrics, from_producers_and_consumers_statistics};
-use crate::utils::get_server_stats;
 use bench_report::{
     actor_kind::ActorKind,
     benchmark_kind::BenchmarkKind,
@@ -32,7 +30,9 @@ use bench_report::{
 use chrono::{DateTime, Utc};
 use iggy::prelude::{CacheMetrics, CacheMetricsKey, IggyTimestamp, Stats};
 use integration::test_server::ClientFactory;
-use std::sync::Arc;
+
+use super::metrics::group::{from_individual_metrics, from_producers_and_consumers_statistics};
+use crate::utils::get_server_stats;
 
 pub struct BenchmarkReportBuilder;
 

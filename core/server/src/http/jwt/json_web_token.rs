@@ -16,9 +16,10 @@
  * under the License.
  */
 
+use std::net::SocketAddr;
+
 use iggy_common::UserId;
 use serde::{Deserialize, Serialize};
-use std::net::SocketAddr;
 
 #[derive(Debug, Clone)]
 pub struct Identity {

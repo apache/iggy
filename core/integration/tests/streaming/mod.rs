@@ -16,6 +16,8 @@
  * under the License.
  */
 
+use std::rc::Rc;
+
 use iggy_common::{CompressionAlgorithm, Identifier, IggyError, IggyExpiry, MaxTopicSize};
 use server::{
     configs::system::SystemConfig,
@@ -29,7 +31,6 @@ use server::{
         topics::{storage::create_topic_file_hierarchy, topic},
     },
 };
-use std::rc::Rc;
 
 mod common;
 mod get_by_offset;

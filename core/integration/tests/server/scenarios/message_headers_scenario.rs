@@ -16,14 +16,15 @@
  * under the License.
  */
 
-use crate::server::scenarios::{
-    MESSAGES_COUNT, PARTITION_ID, PARTITIONS_COUNT, STREAM_NAME, TOPIC_NAME, cleanup, create_client,
-};
+use std::{collections::HashMap, str::FromStr};
+
 use bytes::Bytes;
 use iggy::prelude::*;
 use integration::test_server::{ClientFactory, assert_clean_system, login_root};
-use std::collections::HashMap;
-use std::str::FromStr;
+
+use crate::server::scenarios::{
+    MESSAGES_COUNT, PARTITION_ID, PARTITIONS_COUNT, STREAM_NAME, TOPIC_NAME, cleanup, create_client,
+};
 
 pub async fn run(client_factory: &dyn ClientFactory) {
     let client = create_client(client_factory).await;

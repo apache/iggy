@@ -17,8 +17,9 @@
 
 use std::sync::atomic::AtomicU64;
 
-use crate::streaming::polling_consumer::ConsumerGroupId;
 use iggy_common::ConsumerKind;
+
+use crate::streaming::polling_consumer::ConsumerGroupId;
 
 #[derive(Debug)]
 pub struct ConsumerOffset {

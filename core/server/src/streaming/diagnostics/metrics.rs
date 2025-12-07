@@ -16,11 +16,13 @@
  * under the License.
  */
 
-use prometheus_client::encoding::text::encode;
-use prometheus_client::metrics::counter::Counter;
-use prometheus_client::metrics::gauge::Gauge;
-use prometheus_client::registry::Registry;
 use std::sync::Arc;
+
+use prometheus_client::{
+    encoding::text::encode,
+    metrics::{counter::Counter, gauge::Gauge},
+    registry::Registry,
+};
 use tracing::error;
 
 #[derive(Debug, Clone)]

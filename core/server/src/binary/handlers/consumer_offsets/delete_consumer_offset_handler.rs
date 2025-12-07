@@ -16,17 +16,21 @@
  * under the License.
  */
 
-use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
-use crate::binary::handlers::consumer_offsets::COMPONENT;
-use crate::binary::handlers::utils::receive_and_validate;
-use crate::shard::IggyShard;
-use crate::streaming::session::Session;
+use std::rc::Rc;
+
 use anyhow::Result;
 use err_trail::ErrContext;
-use iggy_common::delete_consumer_offset::DeleteConsumerOffset;
-use iggy_common::{IggyError, SenderKind};
-use std::rc::Rc;
+use iggy_common::{IggyError, SenderKind, delete_consumer_offset::DeleteConsumerOffset};
 use tracing::debug;
+
+use crate::{
+    binary::{
+        command::{BinaryServerCommand, ServerCommand, ServerCommandHandler},
+        handlers::{consumer_offsets::COMPONENT, utils::receive_and_validate},
+    },
+    shard::IggyShard,
+    streaming::session::Session,
+};
 
 impl ServerCommandHandler for DeleteConsumerOffset {
     fn code(&self) -> u32 {

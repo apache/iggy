@@ -16,15 +16,15 @@
  * under the License.
  */
 
-use crate::BytesSerializable;
-use crate::Identifier;
-use crate::Sizeable;
-use crate::Validatable;
-use crate::error::IggyError;
-use crate::{Command, GET_CONSUMER_GROUPS_CODE};
+use std::fmt::Display;
+
 use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
-use std::fmt::Display;
+
+use crate::{
+    BytesSerializable, Command, GET_CONSUMER_GROUPS_CODE, Identifier, Sizeable, Validatable,
+    error::IggyError,
+};
 
 /// `GetConsumerGroups` command retrieves the consumer groups from the topic.
 /// It has additional payload:

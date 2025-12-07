@@ -15,15 +15,22 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-use crate::clients::producer::ProducerCoreBackend;
-use crate::clients::producer_config::BackgroundConfig;
-use crate::clients::producer_error_callback::ErrorCtx;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+};
+
 use iggy_common::{Identifier, IggyByteSize, IggyError, IggyMessage, Partitioning, Sizeable};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use tokio::sync::{OwnedSemaphorePermit, broadcast};
-use tokio::task::JoinHandle;
+use tokio::{
+    sync::{OwnedSemaphorePermit, broadcast},
+    task::JoinHandle,
+};
 use tracing::{debug, error};
+
+use crate::clients::{
+    producer::ProducerCoreBackend, producer_config::BackgroundConfig,
+    producer_error_callback::ErrorCtx,
+};
 
 /// A strategy for distributing messages across shards.
 ///
@@ -241,12 +248,14 @@ impl Shard {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::clients::producer::MockProducerCoreBackend;
+    use std::time::Duration;
+
     use bytes::Bytes;
     use iggy_common::IggyDuration;
-    use std::time::Duration;
     use tokio::{sync::Semaphore, time::sleep};
+
+    use super::*;
+    use crate::clients::producer::MockProducerCoreBackend;
 
     fn dummy_identifier() -> Arc<Identifier> {
         Arc::new(Identifier::numeric(1).unwrap())

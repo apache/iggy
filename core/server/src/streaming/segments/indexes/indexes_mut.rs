@@ -16,10 +16,12 @@
  * under the License.
  */
 
-use iggy_common::PooledBuffer;
-use iggy_common::{INDEX_SIZE, IggyIndexView};
-use std::fmt;
-use std::ops::{Deref, Index as StdIndex};
+use std::{
+    fmt,
+    ops::{Deref, Index as StdIndex},
+};
+
+use iggy_common::{INDEX_SIZE, IggyIndexView, PooledBuffer};
 
 /// A container for binary-encoded index data.
 /// Optimized for efficient storage and I/O operations.

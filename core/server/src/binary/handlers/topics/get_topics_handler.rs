@@ -16,19 +16,22 @@
  * under the License.
  */
 
-use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
-use crate::binary::handlers::utils::receive_and_validate;
-use crate::binary::mapper;
-use crate::shard::IggyShard;
-use crate::slab::traits_ext::{EntityComponentSystem, IntoComponents};
-use crate::streaming::session::Session;
-use crate::streaming::streams;
-use anyhow::Result;
-use iggy_common::IggyError;
-use iggy_common::SenderKind;
-use iggy_common::get_topics::GetTopics;
 use std::rc::Rc;
+
+use anyhow::Result;
+use iggy_common::{IggyError, SenderKind, get_topics::GetTopics};
 use tracing::debug;
+
+use crate::{
+    binary::{
+        command::{BinaryServerCommand, ServerCommand, ServerCommandHandler},
+        handlers::utils::receive_and_validate,
+        mapper,
+    },
+    shard::IggyShard,
+    slab::traits_ext::{EntityComponentSystem, IntoComponents},
+    streaming::{session::Session, streams},
+};
 
 impl ServerCommandHandler for GetTopics {
     fn code(&self) -> u32 {

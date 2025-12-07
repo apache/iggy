@@ -16,11 +16,15 @@
  * under the License.
  */
 
-use crate::versioning::SemanticVersion;
+use std::{
+    collections::hash_map::DefaultHasher,
+    fmt::Display,
+    hash::{Hash, Hasher},
+};
+
 use serde::{Deserialize, Serialize};
-use std::collections::hash_map::DefaultHasher;
-use std::fmt::Display;
-use std::hash::{Hash, Hasher};
+
+use crate::versioning::SemanticVersion;
 
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct SystemInfo {

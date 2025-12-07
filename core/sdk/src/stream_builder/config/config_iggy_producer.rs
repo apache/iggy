@@ -16,10 +16,11 @@
  * under the License.
  */
 
-use crate::prelude::{EncryptorKind, Identifier, IggyDuration, IggyError, Partitioning};
+use std::{str::FromStr, sync::Arc};
+
 use bon::Builder;
-use std::str::FromStr;
-use std::sync::Arc;
+
+use crate::prelude::{EncryptorKind, Identifier, IggyDuration, IggyError, Partitioning};
 
 #[derive(Builder, Debug, Clone)]
 #[builder(on(String, into))]

@@ -16,14 +16,17 @@
  * under the License.
  */
 
-use crate::binary::handlers::messages::poll_messages_handler::IggyPollMetadata;
-use crate::streaming::segments::IggyIndexesMut;
+use std::ops::Index;
+
 use bytes::Bytes;
 use iggy_common::{IggyByteSize, IggyMessage, IggyMessageView, PolledMessages, Sizeable};
-use std::ops::Index;
 use tracing::trace;
 
 use super::IggyMessagesBatchMut;
+use crate::{
+    binary::handlers::messages::poll_messages_handler::IggyPollMetadata,
+    streaming::segments::IggyIndexesMut,
+};
 
 /// A container for multiple IggyMessagesBatch objects
 #[derive(Debug, Default)]

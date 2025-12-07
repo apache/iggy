@@ -16,17 +16,18 @@
  * under the License.
  */
 
-use crate::cli::common::{
-    CLAP_INDENT, IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestHelpCmd, USAGE_PREFIX,
-};
+use std::{collections::HashMap, str::from_utf8};
+
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
 use iggy::prelude::*;
 use predicates::str::diff;
 use serial_test::parallel;
-use std::collections::HashMap;
-use std::str::from_utf8;
 use twox_hash::XxHash32;
+
+use crate::cli::common::{
+    CLAP_INDENT, IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestHelpCmd, USAGE_PREFIX,
+};
 
 #[derive(Debug)]
 enum PartitionSelection {

@@ -15,11 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::NoShutdown;
-use crate::shard::task_registry::ShutdownToken;
-use crate::shard::task_registry::registry::TaskRegistry;
-use iggy_common::IggyError;
 use std::ops::AsyncFnOnce;
+
+use iggy_common::IggyError;
+
+use super::NoShutdown;
+use crate::shard::task_registry::{ShutdownToken, registry::TaskRegistry};
 
 pub struct ContinuousBuilder<'a, Task, OnShutdown = NoShutdown> {
     reg: &'a TaskRegistry,

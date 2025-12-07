@@ -16,11 +16,16 @@
  * under the License.
  */
 
-use crate::client_wrappers::client_wrapper::ClientWrapper;
-use crate::prelude::{AutoCommit, AutoCommitWhen, IggyConsumer};
-use iggy_common::locking::IggyRwLock;
-use iggy_common::{Consumer, EncryptorKind, Identifier, IggyDuration, PollingStrategy};
 use std::sync::Arc;
+
+use iggy_common::{
+    Consumer, EncryptorKind, Identifier, IggyDuration, PollingStrategy, locking::IggyRwLock,
+};
+
+use crate::{
+    client_wrappers::client_wrapper::ClientWrapper,
+    prelude::{AutoCommit, AutoCommitWhen, IggyConsumer},
+};
 
 #[derive(Debug)]
 pub struct IggyConsumerBuilder {

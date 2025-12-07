@@ -16,11 +16,13 @@
  * under the License.
  */
 
-use crate::server::scenarios::{PARTITION_ID, PARTITIONS_COUNT, create_client};
+use std::str::FromStr;
+
 use bytes::Bytes;
 use iggy::prelude::*;
 use integration::test_server::{ClientFactory, assert_clean_system, login_root};
-use std::str::FromStr;
+
+use crate::server::scenarios::{PARTITION_ID, PARTITIONS_COUNT, create_client};
 
 const S1_NAME: &str = "test-stream-1";
 const T1_NAME: &str = "test-topic-1";

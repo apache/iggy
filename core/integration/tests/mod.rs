@@ -16,14 +16,19 @@
  * under the License.
  */
 
+use std::{
+    collections::{HashMap, HashSet},
+    io::Write,
+    panic,
+    sync::{
+        Arc, Once, RwLock,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
+};
+
 use ctor::{ctor, dtor};
 use lazy_static::lazy_static;
-use std::collections::{HashMap, HashSet};
-use std::io::Write;
-use std::sync::RwLock;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Once};
-use std::{panic, thread};
 
 mod cli;
 mod config_provider;

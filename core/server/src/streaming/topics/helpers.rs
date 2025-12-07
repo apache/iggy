@@ -17,6 +17,9 @@
 
 use std::sync::{Arc, atomic::Ordering};
 
+use iggy_common::{CompressionAlgorithm, Identifier, IggyExpiry, MaxTopicSize};
+use slab::Slab;
+
 use crate::{
     slab::{
         Keyed,
@@ -38,8 +41,6 @@ use crate::{
         utils::hash,
     },
 };
-use iggy_common::{CompressionAlgorithm, Identifier, IggyExpiry, MaxTopicSize};
-use slab::Slab;
 
 pub fn rename_index(
     old_name: &<TopicRoot as Keyed>::Key,

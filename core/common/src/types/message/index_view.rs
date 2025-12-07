@@ -16,10 +16,10 @@
  * under the License.
  */
 
-use crate::INDEX_SIZE;
 use bytes::Buf;
 
 use super::IggyIndex;
+use crate::INDEX_SIZE;
 
 /// View into a single index entry in a binary buffer.
 /// Provides zero-copy access to index data.

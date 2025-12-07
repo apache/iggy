@@ -16,13 +16,15 @@
  * under the License.
  */
 
-use crate::error::IggyError;
-use crate::{BytesSerializable, Identifier, PollingKind, PollingStrategy, Sizeable, Validatable};
-use crate::{Command, POLL_MESSAGES_CODE};
-use crate::{Consumer, ConsumerKind};
+use std::fmt::Display;
+
 use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
-use std::fmt::Display;
+
+use crate::{
+    BytesSerializable, Command, Consumer, ConsumerKind, Identifier, POLL_MESSAGES_CODE,
+    PollingKind, PollingStrategy, Sizeable, Validatable, error::IggyError,
+};
 
 pub const DEFAULT_PARTITION_ID: u32 = 0;
 pub const DEFAULT_NUMBER_OF_MESSAGES_TO_POLL: u32 = 10;

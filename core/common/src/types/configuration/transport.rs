@@ -16,11 +16,13 @@
  * under the License.
  */
 
-use crate::{BytesSerializable, IggyError};
+use std::{fmt, str::FromStr};
+
 use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::{fmt, str::FromStr};
 use strum::{Display, EnumString, IntoStaticStr};
+
+use crate::{BytesSerializable, IggyError};
 
 #[derive(Clone, Copy, Debug, Default, Display, PartialEq, EnumString, IntoStaticStr, Eq)]
 #[repr(u8)]

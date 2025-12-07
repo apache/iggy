@@ -16,16 +16,21 @@
  * under the License.
  */
 
-use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
-use crate::binary::handlers::messages::COMPONENT;
-use crate::binary::handlers::utils::receive_and_validate;
-use crate::shard::IggyShard;
-use crate::streaming::session::Session;
+use std::rc::Rc;
+
 use anyhow::Result;
 use err_trail::ErrContext;
 use iggy_common::{FlushUnsavedBuffer, IggyError, SenderKind};
-use std::rc::Rc;
 use tracing::{debug, instrument};
+
+use crate::{
+    binary::{
+        command::{BinaryServerCommand, ServerCommand, ServerCommandHandler},
+        handlers::{messages::COMPONENT, utils::receive_and_validate},
+    },
+    shard::IggyShard,
+    streaming::session::Session,
+};
 
 impl ServerCommandHandler for FlushUnsavedBuffer {
     fn code(&self) -> u32 {
