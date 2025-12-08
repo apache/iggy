@@ -73,7 +73,7 @@ async_zip = { version = "0.0.18", features = [
     "zstd",
 ] }
 axum = { version = "0.8.7", features = ["macros"] }
-axum-server = { version = "0.7.3", features = ["tls-rustls"] }
+axum-server = { version = "0.8.0", features = ["tls-rustls"] }
 base64 = "0.22.1"
 bench-dashboard-frontend = { path = "core/bench/dashboard/frontend" }
 bench-dashboard-server = { path = "core/bench/dashboard/server" }
