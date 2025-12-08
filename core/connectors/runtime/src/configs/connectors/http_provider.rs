@@ -32,6 +32,7 @@ use async_trait::async_trait;
 use reqwest;
 use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
 use reqwest_retry::{Jitter, RetryTransientMiddleware, policies::ExponentialBackoff};
+use reqwest_tracing::{SpanBackendWithUrl, TracingMiddleware};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -78,7 +79,8 @@ impl HttpConnectorsConfigProvider {
                 RuntimeError::InvalidConfiguration(format!("Failed to build HTTP client: {err}"))
             })?;
 
-        let mut client_with_middleware = ClientBuilder::new(client);
+        let mut client_with_middleware =
+            ClientBuilder::new(client).with(TracingMiddleware::<SpanBackendWithUrl>::new());
 
         if retry_config.enabled {
             tracing::trace!("Apply retry config: {:?}", retry_config);

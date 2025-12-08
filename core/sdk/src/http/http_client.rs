@@ -28,6 +28,7 @@ use iggy_common::{
 use reqwest::{Response, StatusCode, Url};
 use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
 use reqwest_retry::{RetryTransientMiddleware, policies::ExponentialBackoff};
+use reqwest_tracing::{SpanBackendWithUrl, TracingMiddleware};
 use serde::Serialize;
 use std::ops::Deref;
 use std::str::FromStr;
@@ -273,6 +274,7 @@ impl HttpClient {
         let api_url = api_url.unwrap();
         let retry_policy = ExponentialBackoff::builder().build_with_max_retries(config.retries);
         let client = ClientBuilder::new(reqwest::Client::new())
+            .with(TracingMiddleware::<SpanBackendWithUrl>::new())
             .with(RetryTransientMiddleware::new_with_policy(retry_policy))
             .build();
 

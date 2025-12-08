@@ -53,6 +53,7 @@ quinn = { workspace = true }
 reqwest = { workspace = true }
 reqwest-middleware = { workspace = true }
 reqwest-retry = { workspace = true }
+reqwest-tracing = { workspace = true }
 rustls = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true }
