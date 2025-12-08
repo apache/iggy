@@ -48,19 +48,6 @@ domain = "" # Optional domain for TLS connection
 [state]
 path = "local_state"
 
-# [connectors]
-# config_type = "local"
-# config_dir = ""
-
-
-### HTTP config type example
 [connectors]
-config_type = "http"
-base_url = "http://localhost:5050"
-
-[connectors.retry]
-enabled = true
-max_attempts = 3
-initial_backoff = "1 s"
-max_backoff = "30 s"
-backoff_multiplier = 2
+config_type = "local"
+config_dir = ""
