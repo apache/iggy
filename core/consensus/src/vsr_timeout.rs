@@ -101,16 +101,11 @@ impl Timeout {
 pub enum TimeoutKind {
     Ping,
     Prepare,
-    PrimaryAbdicate,
     CommitMessage,
     NormalHeartbeat,
-    StartViewChangeWindow,
     StartViewChangeMessage,
-    ViewChangeStatus,
     DoViewChangeMessage,
     RequestStartViewMessage,
-    Pulse,
-    Upgrade,
 }
 
 /// Manager for all VSR timeouts of a replica.
@@ -118,16 +113,11 @@ pub enum TimeoutKind {
 pub struct TimeoutManager {
     ping: Timeout,
     prepare: Timeout,
-    primary_abdicate: Timeout,
     commit_message: Timeout,
     normal_heartbeat: Timeout,
-    start_view_change_window: Timeout,
     start_view_change_message: Timeout,
-    view_change_status: Timeout,
     do_view_change_message: Timeout,
     request_start_view_message: Timeout,
-    pulse: Timeout,
-    upgrade: Timeout,
     prng: Xoshiro256Plus,
 }
 
@@ -137,30 +127,16 @@ impl TimeoutManager {
     // TODO define 10ms per tick in a separate constant.
     const PING_TICKS: u64 = 100;
     const PREPARE_TICKS: u64 = 25;
-    const PRIMARY_ABDICATE_TICKS: u64 = 1000;
     const COMMIT_MESSAGE_TICKS: u64 = 50;
     const NORMAL_HEARTBEAT_TICKS: u64 = 500;
-    const START_VIEW_CHANGE_WINDOW_TICKS: u64 = 500;
     const START_VIEW_CHANGE_MESSAGE_TICKS: u64 = 50;
-    const VIEW_CHANGE_STATUS_TICKS: u64 = 500;
     const DO_VIEW_CHANGE_MESSAGE_TICKS: u64 = 50;
     const REQUEST_START_VIEW_MESSAGE_TICKS: u64 = 100;
-    const REPAIR_TICKS: u64 = 50;
-    const REPAIR_SYNC_TICKS: u64 = 500;
-    const GRID_REPAIR_MESSAGE_TICKS: u64 = 50;
-    const GRID_SCRUB_TICKS: u64 = 50;
-    const PULSE_TICKS: u64 = 10;
-    const UPGRADE_TICKS: u64 = 500;
 
     pub fn new(replica_id: u128) -> Self {
         Self {
             ping: Timeout::new("ping_timeout", replica_id, Self::PING_TICKS),
             prepare: Timeout::new("prepare_timeout", replica_id, Self::PREPARE_TICKS),
-            primary_abdicate: Timeout::new(
-                "primary_abdicate_timeout",
-                replica_id,
-                Self::PRIMARY_ABDICATE_TICKS,
-            ),
             commit_message: Timeout::new(
                 "commit_message_timeout",
                 replica_id,
@@ -171,20 +147,10 @@ impl TimeoutManager {
                 replica_id,
                 Self::NORMAL_HEARTBEAT_TICKS,
             ),
-            start_view_change_window: Timeout::new(
-                "start_view_change_window_timeout",
-                replica_id,
-                Self::START_VIEW_CHANGE_WINDOW_TICKS,
-            ),
             start_view_change_message: Timeout::new(
                 "start_view_change_message_timeout",
                 replica_id,
                 Self::START_VIEW_CHANGE_MESSAGE_TICKS,
-            ),
-            view_change_status: Timeout::new(
-                "view_change_status_timeout",
-                replica_id,
-                Self::VIEW_CHANGE_STATUS_TICKS,
             ),
             do_view_change_message: Timeout::new(
                 "do_view_change_message_timeout",
@@ -196,8 +162,6 @@ impl TimeoutManager {
                 replica_id,
                 Self::REQUEST_START_VIEW_MESSAGE_TICKS,
             ),
-            pulse: Timeout::new("pulse_timeout", replica_id, Self::PULSE_TICKS),
-            upgrade: Timeout::new("upgrade_timeout", replica_id, Self::UPGRADE_TICKS),
             prng: Xoshiro256Plus::seed_from_u64(replica_id as u64),
         }
     }
@@ -208,16 +172,11 @@ impl TimeoutManager {
     pub fn tick(&mut self) {
         self.ping.tick();
         self.prepare.tick();
-        self.primary_abdicate.tick();
         self.commit_message.tick();
         self.normal_heartbeat.tick();
-        self.start_view_change_window.tick();
         self.start_view_change_message.tick();
-        self.view_change_status.tick();
         self.do_view_change_message.tick();
         self.request_start_view_message.tick();
-        self.pulse.tick();
-        self.upgrade.tick();
     }
 
     pub fn fired(&self, kind: TimeoutKind) -> bool {
@@ -228,16 +187,11 @@ impl TimeoutManager {
         match kind {
             TimeoutKind::Ping => &self.ping,
             TimeoutKind::Prepare => &self.prepare,
-            TimeoutKind::PrimaryAbdicate => &self.primary_abdicate,
             TimeoutKind::CommitMessage => &self.commit_message,
             TimeoutKind::NormalHeartbeat => &self.normal_heartbeat,
-            TimeoutKind::StartViewChangeWindow => &self.start_view_change_window,
             TimeoutKind::StartViewChangeMessage => &self.start_view_change_message,
-            TimeoutKind::ViewChangeStatus => &self.view_change_status,
             TimeoutKind::DoViewChangeMessage => &self.do_view_change_message,
             TimeoutKind::RequestStartViewMessage => &self.request_start_view_message,
-            TimeoutKind::Pulse => &self.pulse,
-            TimeoutKind::Upgrade => &self.upgrade,
         }
     }
 
@@ -245,16 +199,11 @@ impl TimeoutManager {
         match kind {
             TimeoutKind::Ping => &mut self.ping,
             TimeoutKind::Prepare => &mut self.prepare,
-            TimeoutKind::PrimaryAbdicate => &mut self.primary_abdicate,
             TimeoutKind::CommitMessage => &mut self.commit_message,
             TimeoutKind::NormalHeartbeat => &mut self.normal_heartbeat,
-            TimeoutKind::StartViewChangeWindow => &mut self.start_view_change_window,
             TimeoutKind::StartViewChangeMessage => &mut self.start_view_change_message,
-            TimeoutKind::ViewChangeStatus => &mut self.view_change_status,
             TimeoutKind::DoViewChangeMessage => &mut self.do_view_change_message,
             TimeoutKind::RequestStartViewMessage => &mut self.request_start_view_message,
-            TimeoutKind::Pulse => &mut self.pulse,
-            TimeoutKind::Upgrade => &mut self.upgrade,
         }
     }
 
@@ -274,16 +223,11 @@ impl TimeoutManager {
         let timeout = match kind {
             TimeoutKind::Ping => &mut self.ping,
             TimeoutKind::Prepare => &mut self.prepare,
-            TimeoutKind::PrimaryAbdicate => &mut self.primary_abdicate,
             TimeoutKind::CommitMessage => &mut self.commit_message,
             TimeoutKind::NormalHeartbeat => &mut self.normal_heartbeat,
-            TimeoutKind::StartViewChangeWindow => &mut self.start_view_change_window,
             TimeoutKind::StartViewChangeMessage => &mut self.start_view_change_message,
-            TimeoutKind::ViewChangeStatus => &mut self.view_change_status,
             TimeoutKind::DoViewChangeMessage => &mut self.do_view_change_message,
             TimeoutKind::RequestStartViewMessage => &mut self.request_start_view_message,
-            TimeoutKind::Pulse => &mut self.pulse,
-            TimeoutKind::Upgrade => &mut self.upgrade,
         };
         timeout.backoff(&mut self.prng);
     }
@@ -353,22 +297,6 @@ mod tests {
             timeout.tick();
         }
         assert!(!timeout.fired());
-    }
-
-    #[test]
-    fn test_manager_two_phase() {
-        let mut manager = TimeoutManager::new(0);
-
-        manager.start(TimeoutKind::Ping); // 100 ticks
-        manager.start(TimeoutKind::Pulse); // 10 ticks
-
-        for i in 0..10 {
-            manager.tick();
-            if i == 9 {
-                assert!(manager.fired(TimeoutKind::Pulse));
-                assert!(!manager.fired(TimeoutKind::Ping));
-            }
-        }
     }
 
     #[test]
