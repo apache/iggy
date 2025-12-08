@@ -127,7 +127,7 @@ err_trail = "0.10.2"
 error_set = "0.9.0"
 figlet-rs = "0.1.5"
 figment = { version = "0.10.19", features = ["toml", "env"] }
-flume = "0.11.1"
+flume = "0.12.0"
 futures = "0.3.31"
 futures-util = "0.3.31"
 human-repr = "1.1.0"
