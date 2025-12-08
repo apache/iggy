@@ -38,7 +38,6 @@ use rand_xoshiro::rand_core::SeedableRng;
 #[derive(Debug, Clone)]
 #[allow(unused)]
 pub struct Timeout {
-    pub name: &'static str,
     pub id: u128,
     after: u64,
     ticks_remaining: u64,
@@ -47,9 +46,8 @@ pub struct Timeout {
 }
 
 impl Timeout {
-    pub fn new(name: &'static str, id: u128, after: u64) -> Self {
+    pub fn new(id: u128, after: u64) -> Self {
         Self {
-            name,
             id,
             after,
             ticks_remaining: 0,
@@ -135,30 +133,16 @@ impl TimeoutManager {
 
     pub fn new(replica_id: u128) -> Self {
         Self {
-            ping: Timeout::new("ping_timeout", replica_id, Self::PING_TICKS),
-            prepare: Timeout::new("prepare_timeout", replica_id, Self::PREPARE_TICKS),
-            commit_message: Timeout::new(
-                "commit_message_timeout",
-                replica_id,
-                Self::COMMIT_MESSAGE_TICKS,
-            ),
-            normal_heartbeat: Timeout::new(
-                "normal_heartbeat_timeout",
-                replica_id,
-                Self::NORMAL_HEARTBEAT_TICKS,
-            ),
+            ping: Timeout::new(replica_id, Self::PING_TICKS),
+            prepare: Timeout::new(replica_id, Self::PREPARE_TICKS),
+            commit_message: Timeout::new(replica_id, Self::COMMIT_MESSAGE_TICKS),
+            normal_heartbeat: Timeout::new(replica_id, Self::NORMAL_HEARTBEAT_TICKS),
             start_view_change_message: Timeout::new(
-                "start_view_change_message_timeout",
                 replica_id,
                 Self::START_VIEW_CHANGE_MESSAGE_TICKS,
             ),
-            do_view_change_message: Timeout::new(
-                "do_view_change_message_timeout",
-                replica_id,
-                Self::DO_VIEW_CHANGE_MESSAGE_TICKS,
-            ),
+            do_view_change_message: Timeout::new(replica_id, Self::DO_VIEW_CHANGE_MESSAGE_TICKS),
             request_start_view_message: Timeout::new(
-                "request_start_view_message_timeout",
                 replica_id,
                 Self::REQUEST_START_VIEW_MESSAGE_TICKS,
             ),
@@ -243,7 +227,7 @@ mod tests {
 
     #[test]
     fn test_timeout_lifecycle() {
-        let mut timeout = Timeout::new("test", 0, 10);
+        let mut timeout = Timeout::new(0, 10);
 
         assert!(!timeout.ticking);
         assert!(!timeout.fired());
@@ -262,7 +246,7 @@ mod tests {
 
     #[test]
     fn test_timeout_reset() {
-        let mut timeout = Timeout::new("test", 0, 10);
+        let mut timeout = Timeout::new(0, 10);
         timeout.start();
 
         for _ in 0..5 {
@@ -283,7 +267,7 @@ mod tests {
 
     #[test]
     fn test_timeout_stop() {
-        let mut timeout = Timeout::new("test", 0, 10);
+        let mut timeout = Timeout::new(0, 10);
         timeout.start();
 
         for _ in 0..5 {
@@ -301,7 +285,7 @@ mod tests {
 
     #[test]
     fn test_backoff_increases() {
-        let mut timeout = Timeout::new("test", 0, 10);
+        let mut timeout = Timeout::new(0, 10);
         let mut prng = Xoshiro256Plus::seed_from_u64(42);
 
         timeout.start();
