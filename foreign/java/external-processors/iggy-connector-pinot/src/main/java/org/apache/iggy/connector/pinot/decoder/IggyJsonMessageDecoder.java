@@ -46,9 +46,8 @@ public class IggyJsonMessageDecoder implements StreamMessageDecoder<byte[]> {
      * Can be used to set up custom deserialization if needed.
      *
      * @param props decoder properties from streamConfigs
+     * @param fieldsToRead set of fields to read from messages
      * @param topicName topic name
-     * @param decoderClass decoder class name
-     * @param pluginManager plugin manager for loading additional dependencies
      * @throws Exception if initialization fails
      */
     @Override
@@ -83,7 +82,9 @@ public class IggyJsonMessageDecoder implements StreamMessageDecoder<byte[]> {
      * Decodes a JSON message and returns the specified field values.
      *
      * @param payload raw byte array containing JSON
-     * @param columns columns to extract
+     * @param offset offset in the payload to start decoding
+     * @param length length of the message to decode
+     * @param destination destination GenericRow to populate
      * @return GenericRow with requested fields
      */
     @Override

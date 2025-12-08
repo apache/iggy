@@ -97,8 +97,7 @@ public class IggyStreamMetadataProvider implements StreamMetadataProvider {
      * Called by Pinot to discover available partitions in the stream.
      *
      * @param timeoutMillis timeout for the operation
-     * @return list of partition metadata
-     * @throws Exception if metadata retrieval fails
+     * @return number of partitions in the topic
      */
     @Override
     public int fetchPartitionCount(long timeoutMillis) {
