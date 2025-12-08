@@ -34,7 +34,8 @@ public final class MessagesGenerator {
     private final RandomGenerator rng = RandomGeneratorFactory.getDefault().create();
     private long orderId = 0L;
 
-    public MessagesGenerator() {}
+    public MessagesGenerator() {
+    }
 
     public SerializableMessage generate() {
         int choice = rng.nextInt(3);

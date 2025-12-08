@@ -54,7 +54,8 @@ public final class GettingStartedProducer {
 
     private static final Logger log = LoggerFactory.getLogger(GettingStartedProducer.class);
 
-    private GettingStartedProducer() {}
+    private GettingStartedProducer() {
+    }
 
     public static void main(String[] args) {
         var client = new IggyTcpClient("localhost", 8090);
@@ -66,12 +67,7 @@ public final class GettingStartedProducer {
     }
 
     private static void produceMessages(IggyTcpClient client) {
-        log.info(
-                "Messages will be sent to stream: {}, topic: {}, partition: {} with interval {}ms.",
-                STREAM_NAME,
-                TOPIC_NAME,
-                PARTITION_ID,
-                INTERVAL_MS);
+        log.info("Messages will be sent to stream: {}, topic: {}, partition: {} with interval {}ms.", STREAM_NAME, TOPIC_NAME, PARTITION_ID, INTERVAL_MS);
 
         int currentId = 0;
         int sentBatches = 0;
@@ -116,15 +112,7 @@ public final class GettingStartedProducer {
             log.warn("Topic already exists and will not be created again.");
             return;
         }
-        client.topics()
-                .createTopic(
-                        STREAM_ID,
-                        1L,
-                        CompressionAlgorithm.None,
-                        BigInteger.ZERO,
-                        BigInteger.ZERO,
-                        empty(),
-                        TOPIC_NAME);
+        client.topics().createTopic(STREAM_ID, 1L, CompressionAlgorithm.None, BigInteger.ZERO, BigInteger.ZERO, empty(), TOPIC_NAME);
         log.info("Topic {} was created.", TOPIC_NAME);
     }
 }

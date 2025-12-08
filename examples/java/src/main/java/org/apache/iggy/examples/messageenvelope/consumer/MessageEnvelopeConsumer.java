@@ -17,10 +17,18 @@
  * under the License.
  */
 
-package org.apache.iggy.examples.gettingstarted.consumer;
+package org.apache.iggy.examples.messageenvelope.consumer;
 
+import com.fasterxml.jackson.databind.DeserializationFeature;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import org.apache.iggy.client.blocking.tcp.IggyTcpClient;
 import org.apache.iggy.consumergroup.Consumer;
+import org.apache.iggy.examples.shared.Messages;
+import org.apache.iggy.examples.shared.Messages.Envelope;
+import org.apache.iggy.examples.shared.Messages.OrderConfirmed;
+import org.apache.iggy.examples.shared.Messages.OrderCreated;
+import org.apache.iggy.examples.shared.Messages.OrderRejected;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
 import org.apache.iggy.message.Message;
@@ -33,24 +41,26 @@ import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
 import java.util.Optional;
 
-public final class GettingStartedConsumer {
+public final class MessageEnvelopeConsumer {
+    private static final String STREAM_NAME = "envelope-stream";
+    private static final StreamId STREAM_ID = StreamId.of(STREAM_NAME);
 
-    private static final StreamId STREAM_ID = StreamId.of("sample-stream");
-    private static final TopicId TOPIC_ID = TopicId.of("sample-topic");
+    private static final String TOPIC_NAME = "envelope-topic";
+    private static final TopicId TOPIC_ID = TopicId.of(TOPIC_NAME);
 
     private static final long PARTITION_ID = 0L;
+    private static final int BATCHES_LIMIT = 10;
+    private static final long MESSAGES_PER_BATCH = 1L;
+    private static final long INTERVAL_MS = 1;
 
-    private static final int BATCHES_LIMIT = 5;
+    private static final Logger log = LoggerFactory.getLogger(MessageEnvelopeConsumer.class);
 
-    private static final long MESSAGES_PER_BATCH = 10L;
-    private static final long INTERVAL_MS = 500;
+    private static final ObjectMapper MAPPER = new ObjectMapper().registerModule(new JavaTimeModule()).configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
 
-    private static final Logger log = LoggerFactory.getLogger(GettingStartedConsumer.class);
-
-    private GettingStartedConsumer() {
+    private MessageEnvelopeConsumer() {
     }
 
-    public static void main(String[] args) {
+    public static void main(final String[] args) {
         var client = new IggyTcpClient("localhost", 8090);
         client.users().login("iggy", "iggy");
 
@@ -101,7 +111,30 @@ public final class GettingStartedConsumer {
     }
 
     private static void handleMessage(Message message, BigInteger offset) {
-        String payload = new String(message.payload(), StandardCharsets.UTF_8);
-        log.info("Handling message at offset {}, payload: {}...", offset, payload);
+        String json = new String(message.payload(), StandardCharsets.UTF_8);
+        String messageType = "unknown";
+        try {
+            Envelope envelope = MAPPER.readValue(json, Envelope.class);
+            messageType = envelope.messageType();
+            log.info("Handling message type: {} at offset: {}...", messageType, offset);
+
+            switch (messageType) {
+                case Messages.ORDER_CREATED_TYPE -> {
+                    OrderCreated order = MAPPER.readValue(envelope.payload(), OrderCreated.class);
+                    log.info("{}", order);
+                }
+                case Messages.ORDER_CONFIRMED_TYPE -> {
+                    OrderConfirmed order = MAPPER.readValue(envelope.payload(), OrderConfirmed.class);
+                    log.info("{}", order);
+                }
+                case Messages.ORDER_REJECTED_TYPE -> {
+                    OrderRejected order = MAPPER.readValue(envelope.payload(), OrderRejected.class);
+                    log.info("{}", order);
+                }
+                default -> log.warn("Received unknown message type: {}", messageType);
+            }
+        } catch (Exception e) {
+            log.error("Failed to handle message type {} at offset {}", messageType, offset, e);
+        }
     }
 }

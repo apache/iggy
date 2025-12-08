@@ -17,15 +17,13 @@
  * under the License.
  */
 
-package org.apache.iggy.examples.messageheaders.producer;
+package org.apache.iggy.examples.messageenvelope.producer;
 
 import org.apache.iggy.client.blocking.tcp.IggyTcpClient;
 import org.apache.iggy.examples.shared.Messages.SerializableMessage;
 import org.apache.iggy.examples.shared.MessagesGenerator;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
-import org.apache.iggy.message.HeaderKind;
-import org.apache.iggy.message.HeaderValue;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.MessageHeader;
 import org.apache.iggy.message.MessageId;
@@ -39,16 +37,14 @@ import org.slf4j.LoggerFactory;
 import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
 import java.util.Optional;
 
-public final class MessageHeadersProducer {
-    private static final String STREAM_NAME = "headers-stream";
+public final class MessageEnvelopeProducer {
+    private static final String STREAM_NAME = "envelope-stream";
     private static final StreamId STREAM_ID = StreamId.of(STREAM_NAME);
 
-    private static final String TOPIC_NAME = "headers-topic";
+    private static final String TOPIC_NAME = "envelope-topic";
     private static final TopicId TOPIC_ID = TopicId.of(TOPIC_NAME);
 
     private static final long PARTITION_ID = 0L;
@@ -56,9 +52,10 @@ public final class MessageHeadersProducer {
     private static final int MESSAGES_PER_BATCH = 1;
     private static final long INTERVAL_MS = 1;
 
-    private static final Logger log = LoggerFactory.getLogger(MessageHeadersProducer.class);
+    private static final Logger log = LoggerFactory.getLogger(MessageEnvelopeProducer.class);
 
-    private MessageHeadersProducer() {}
+    private MessageEnvelopeProducer() {
+    }
 
     public static void main(String[] args) {
         var client = new IggyTcpClient("localhost", 8090);
@@ -76,15 +73,7 @@ public final class MessageHeadersProducer {
         if (topic.isPresent()) {
             log.warn("Topic already exists and will not be created again.");
         } else {
-            client.topics()
-                    .createTopic(
-                            STREAM_ID,
-                            1L,
-                            CompressionAlgorithm.None,
-                            BigInteger.ZERO,
-                            BigInteger.ZERO,
-                            Optional.empty(),
-                            TOPIC_NAME);
+            client.topics().createTopic(STREAM_ID, 1L, CompressionAlgorithm.None, BigInteger.ZERO, BigInteger.ZERO, Optional.empty(), TOPIC_NAME);
             log.info("Topic {} was created.", TOPIC_NAME);
         }
 
@@ -92,12 +81,7 @@ public final class MessageHeadersProducer {
     }
 
     public static void produceMessages(IggyTcpClient client) {
-        log.info(
-                "Messages will be sent to stream: {}, topic: {}, partition: {} with interval {}ms.",
-                STREAM_NAME,
-                TOPIC_NAME,
-                PARTITION_ID,
-                INTERVAL_MS);
+        log.info("Messages will be sent to stream: {}, topic: {}, partition: {} with interval {}ms.", STREAM_NAME, TOPIC_NAME, PARTITION_ID, INTERVAL_MS);
 
         int sentBatches = 0;
         Partitioning partitioning = Partitioning.partitionId(PARTITION_ID);
@@ -117,22 +101,11 @@ public final class MessageHeadersProducer {
             for (int i = 0; i < MESSAGES_PER_BATCH; i++) {
                 SerializableMessage serializableMessage = generator.generate();
                 String messageType = serializableMessage.getMessageType();
-                String json = serializableMessage.toJson();
-
-                Map<String, HeaderValue> userHeaders = new HashMap<>();
-                userHeaders.put("message_type", new HeaderValue(HeaderKind.String, messageType));
-
+                String json = serializableMessage.toJsonEnvelope();
                 byte[] payload = json.getBytes(StandardCharsets.UTF_8);
 
-                MessageHeader header = new MessageHeader(
-                        BigInteger.ZERO,
-                        MessageId.serverGenerated(),
-                        BigInteger.ZERO,
-                        BigInteger.ZERO,
-                        BigInteger.ZERO,
-                        0L,
-                        (long) payload.length);
-                Message message = new Message(header, payload, Optional.of(userHeaders));
+                MessageHeader header = new MessageHeader(BigInteger.ZERO, MessageId.serverGenerated(), BigInteger.ZERO, BigInteger.ZERO, BigInteger.ZERO, 0L, (long) payload.length);
+                Message message = new Message(header, payload, Optional.empty());
                 messages.add(message);
                 serializableMessages.add(serializableMessage);
             }
