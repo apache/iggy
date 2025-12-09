@@ -33,7 +33,7 @@ async-trait = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
 compio = { workspace = true }
-ctor = "0.6.1"
+ctor = "0.6.3"
 derive_more = { workspace = true }
 env_logger = { workspace = true }
 futures = { workspace = true }
@@ -43,13 +43,13 @@ iggy_binary_protocol = { workspace = true }
 iggy_common = { workspace = true }
 keyring = { workspace = true }
 lazy_static = { workspace = true }
-libc = "0.2.177"
+libc = "0.2.178"
 log = { workspace = true }
 predicates = { workspace = true }
 rand = { workspace = true }
 rcgen = "0.14.5"
 reqwest = { workspace = true }
-rmcp = { version = "0.10.0", features = [
+rmcp = { version = "0.11.0", features = [
     "client",
     "reqwest",
     "transport-streamable-http-client",
