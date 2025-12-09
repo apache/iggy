@@ -18,6 +18,7 @@
 use crate::api::fetch_benchmark_report_full;
 use crate::components::chart::{PlotConfig, dispose_chart};
 use crate::components::selectors::measurement_type_selector::MeasurementType;
+use crate::hooks::use_size;
 use bench_report::report::BenchmarkReport;
 use charming::theme::Theme;
 use charming::{Echarts, WasmRenderer};
@@ -26,7 +27,6 @@ use gloo::history::{BrowserHistory, History};
 use uuid::Uuid;
 use yew::platform::spawn_local;
 use yew::prelude::*;
-use yew_hooks::use_size;
 
 type CleanupFn = Box<dyn FnOnce()>;
 

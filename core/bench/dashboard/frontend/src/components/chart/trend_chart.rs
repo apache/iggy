@@ -19,12 +19,12 @@ use crate::api::fetch_benchmark_trend;
 use crate::components::chart::plot_trend::create_chart;
 use crate::components::chart::{PlotConfig, PlotType, dispose_chart};
 use crate::components::selectors::measurement_type_selector::MeasurementType;
+use crate::hooks::use_size;
 use crate::state::hardware::use_hardware;
 use charming::Echarts;
 use gloo::console::log;
 use yew::platform::spawn_local;
 use yew::prelude::*;
-use yew_hooks::use_size;
 
 #[derive(Properties, PartialEq)]
 #[allow(dead_code)]
