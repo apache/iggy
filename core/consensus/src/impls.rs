@@ -296,6 +296,7 @@ impl Pipeline {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
     Normal,
     ViewChange,
@@ -361,6 +362,31 @@ impl VsrConsensus {
 
     pub fn quorum(&self) -> usize {
         (self.replica_count as usize / 2) + 1
+    }
+
+    pub fn commit(&self) -> u64 {
+        self.commit.get()
+    }
+
+    pub fn is_syncing(&self) -> bool {
+        // for now return false. we have to add syncing related setup to VsrConsensus to make this work.
+        false
+    }
+
+    pub fn replica(&self) -> u8 {
+        self.replica
+    }
+
+    pub fn sequencer(&self) -> &LocalSequencer {
+        &self.sequencer
+    }
+
+    pub fn view(&self) -> u32 {
+        self.view.get()
+    }
+
+    pub fn status(&self) -> Status {
+        self.status.get()
     }
 }
 
@@ -470,5 +496,9 @@ impl Consensus for VsrConsensus {
 
     fn is_follower(&self) -> bool {
         !self.is_primary()
+    }
+
+    fn is_syncing(&self) -> bool {
+        self.is_syncing()
     }
 }

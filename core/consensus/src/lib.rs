@@ -37,6 +37,7 @@ pub trait Consensus {
     fn post_replicate_verify(&self, message: &Self::ReplicateMessage);
 
     fn is_follower(&self) -> bool;
+    fn is_syncing(&self) -> bool;
 }
 
 mod impls;
