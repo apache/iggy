@@ -16,7 +16,9 @@
  * under the License.
  */
 
-use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
+use crate::binary::command::{
+    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
+};
 use crate::binary::handlers::personal_access_tokens::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
@@ -40,7 +42,7 @@ impl ServerCommandHandler for GetPersonalAccessTokens {
         _length: u32,
         session: &Session,
         shard: &Rc<IggyShard>,
-    ) -> Result<(), IggyError> {
+    ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
         let personal_access_tokens = shard
             .get_personal_access_tokens(session)
@@ -49,7 +51,7 @@ impl ServerCommandHandler for GetPersonalAccessTokens {
             })?;
         let personal_access_tokens = mapper::map_personal_access_tokens(personal_access_tokens);
         sender.send_ok_response(&personal_access_tokens).await?;
-        Ok(())
+        Ok(HandlerResult::Finished)
     }
 }
 

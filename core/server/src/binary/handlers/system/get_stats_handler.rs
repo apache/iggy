@@ -16,7 +16,9 @@
  * under the License.
  */
 
-use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
+use crate::binary::command::{
+    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
+};
 use crate::binary::handlers::system::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
@@ -44,7 +46,7 @@ impl ServerCommandHandler for GetStats {
         _length: u32,
         session: &Session,
         shard: &Rc<IggyShard>,
-    ) -> Result<(), IggyError> {
+    ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
 
         // Route GetStats to shard0 only
@@ -82,7 +84,7 @@ impl ServerCommandHandler for GetStats {
             },
         }
 
-        Ok(())
+        Ok(HandlerResult::Finished)
     }
 }
 

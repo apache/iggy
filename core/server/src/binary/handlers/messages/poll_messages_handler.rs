@@ -16,7 +16,9 @@
  * under the License.
  */
 
-use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
+use crate::binary::command::{
+    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
+};
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::shard::IggyShard;
 use crate::shard::system::messages::PollingArgs;
@@ -53,7 +55,7 @@ impl ServerCommandHandler for PollMessages {
         _length: u32,
         session: &Session,
         shard: &Rc<IggyShard>,
-    ) -> Result<(), IggyError> {
+    ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
         let PollMessages {
             consumer,
@@ -111,7 +113,7 @@ impl ServerCommandHandler for PollMessages {
         sender
             .send_ok_response_vectored(&response_length_bytes, bufs)
             .await?;
-        Ok(())
+        Ok(HandlerResult::Finished)
     }
 }
 

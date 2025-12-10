@@ -18,7 +18,9 @@
 
 use std::rc::Rc;
 
-use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
+use crate::binary::command::{
+    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
+};
 use crate::binary::handlers::users::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 
@@ -43,7 +45,7 @@ impl ServerCommandHandler for LogoutUser {
         _length: u32,
         session: &Session,
         shard: &Rc<IggyShard>,
-    ) -> Result<(), IggyError> {
+    ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
         info!("Logging out user with ID: {}...", session.get_user_id());
         shard.logout_user(session).with_error(|error| {
@@ -52,7 +54,7 @@ impl ServerCommandHandler for LogoutUser {
         info!("Logged out user with ID: {}.", session.get_user_id());
         session.clear_user_id();
         sender.send_empty_ok_response().await?;
-        Ok(())
+        Ok(HandlerResult::Finished)
     }
 }
 

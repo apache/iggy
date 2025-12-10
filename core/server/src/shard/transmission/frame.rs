@@ -42,6 +42,7 @@ pub enum ShardResponse {
     CreateUserResponse(User),
     DeletedUser(User),
     GetStatsResponse(Stats),
+    SocketTransferResponse,
     ErrorResponse(IggyError),
 }
 

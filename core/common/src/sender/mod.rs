@@ -37,6 +37,7 @@ use compio::net::TcpStream;
 use compio_quic::{RecvStream, SendStream};
 use compio_tls::TlsStream;
 use std::future::Future;
+use std::os::fd::{AsFd, AsRawFd, RawFd};
 use tracing::debug;
 
 macro_rules! forward_async_methods {
@@ -92,7 +93,9 @@ pub enum SenderKind {
 
 impl SenderKind {
     pub fn get_tcp_sender(stream: TcpStream) -> Self {
-        Self::Tcp(TcpSender { stream })
+        Self::Tcp(TcpSender {
+            stream: Some(stream),
+        })
     }
 
     pub fn get_tcp_tls_sender(stream: TlsStream<TcpStream>) -> Self {
@@ -112,6 +115,22 @@ impl SenderKind {
 
     pub fn get_websocket_tls_sender(stream: WebSocketTlsSender) -> Self {
         Self::WebSocketTls(stream)
+    }
+
+    pub fn take_and_migrate_tcp(&mut self) -> Option<RawFd> {
+        match self {
+            SenderKind::Tcp(tcp_sender) => {
+                tracing::warn!("take_and_migrate_tcp called!");
+                let stream = tcp_sender.stream.take()?;
+                let poll_fd = stream.into_poll_fd().ok()?;
+                let raw_fd = poll_fd.as_fd().as_raw_fd();
+                let dup_fd = unsafe { libc::dup(raw_fd) };
+
+                // std::mem::forget(poll_fd);
+                Some(dup_fd)
+            }
+            _ => None,
+        }
     }
 
     forward_async_methods! {

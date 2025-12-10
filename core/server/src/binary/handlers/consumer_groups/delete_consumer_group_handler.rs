@@ -16,7 +16,9 @@
  * under the License.
  */
 
-use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
+use crate::binary::command::{
+    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
+};
 use crate::binary::handlers::consumer_groups::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 
@@ -45,7 +47,7 @@ impl ServerCommandHandler for DeleteConsumerGroup {
         _length: u32,
         session: &Session,
         shard: &Rc<IggyShard>,
-    ) -> Result<(), IggyError> {
+    ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
         let cg = shard.delete_consumer_group(session, &self.stream_id, &self.topic_id, &self.group_id).with_error(|error| {
             format!(
@@ -123,7 +125,7 @@ impl ServerCommandHandler for DeleteConsumerGroup {
                 )
             })?;
         sender.send_empty_ok_response().await?;
-        Ok(())
+        Ok(HandlerResult::Finished)
     }
 }
 
