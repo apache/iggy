@@ -94,7 +94,9 @@ pub async fn start(
         }
     } else {
         // Non-shard0 just handles the event locally
-        shard.handle_event(event).await.ok();
+        crate::shard::handlers::handle_event(&shard, event)
+            .await
+            .ok();
     }
 
     let ws_config = config.to_tungstenite_config();

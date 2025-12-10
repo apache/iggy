@@ -137,7 +137,7 @@ impl IggyShard {
         }
     }
 
-    fn find_shard(&self, namespace: &IggyNamespace) -> Option<&ShardConnector<ShardFrame>> {
+    pub fn find_shard(&self, namespace: &IggyNamespace) -> Option<&ShardConnector<ShardFrame>> {
         self.shards_table.get(namespace).map(|shard_id| {
             self.shards
                 .iter()

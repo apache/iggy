@@ -16,7 +16,9 @@
  * under the License.
  */
 
-use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
+use crate::binary::command::{
+    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
+};
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
 use crate::shard::IggyShard;
@@ -40,7 +42,7 @@ impl ServerCommandHandler for GetConsumerGroup {
         _length: u32,
         session: &Session,
         shard: &Rc<IggyShard>,
-    ) -> Result<(), IggyError> {
+    ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
         shard.ensure_authenticated(session)?;
         let exists = shard
@@ -48,7 +50,7 @@ impl ServerCommandHandler for GetConsumerGroup {
             .is_ok();
         if !exists {
             sender.send_empty_ok_response().await?;
-            return Ok(());
+            return Ok(HandlerResult::Finished);
         }
         let numeric_topic_id = shard.streams.with_topic_by_id(
             &self.stream_id,
@@ -65,7 +67,7 @@ impl ServerCommandHandler for GetConsumerGroup {
             .is_ok();
         if !has_permission {
             sender.send_empty_ok_response().await?;
-            return Ok(());
+            return Ok(HandlerResult::Finished);
         }
 
         let consumer_group = shard.streams.with_consumer_group_by_id(
@@ -75,7 +77,7 @@ impl ServerCommandHandler for GetConsumerGroup {
             |(root, members)| mapper::map_consumer_group(root, members),
         );
         sender.send_ok_response(&consumer_group).await?;
-        Ok(())
+        Ok(HandlerResult::Finished)
     }
 }
 

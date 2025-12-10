@@ -18,7 +18,9 @@
 
 use std::rc::Rc;
 
-use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
+use crate::binary::command::{
+    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
+};
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
 use crate::shard::IggyShard;
@@ -39,20 +41,20 @@ impl ServerCommandHandler for GetUser {
         _length: u32,
         session: &Session,
         shard: &Rc<IggyShard>,
-    ) -> Result<(), IggyError> {
+    ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
         let Ok(user) = shard.find_user(session, &self.user_id) else {
             sender.send_empty_ok_response().await?;
-            return Ok(());
+            return Ok(HandlerResult::Finished);
         };
         let Some(user) = user else {
             sender.send_empty_ok_response().await?;
-            return Ok(());
+            return Ok(HandlerResult::Finished);
         };
 
         let bytes = mapper::map_user(&user);
         sender.send_ok_response(&bytes).await?;
-        Ok(())
+        Ok(HandlerResult::Finished)
     }
 }
 

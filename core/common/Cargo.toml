@@ -67,6 +67,7 @@ toml = { workspace = true }
 tracing = { workspace = true }
 tungstenite = { workspace = true }
 twox-hash = { workspace = true }
+libc = { workspace = true }
 
 [dev-dependencies]
 serial_test = { workspace = true }

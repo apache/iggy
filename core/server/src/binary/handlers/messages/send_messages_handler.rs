@@ -16,20 +16,23 @@
  * under the License.
  */
 
-use crate::binary::command::{BinaryServerCommand, ServerCommandHandler};
+use crate::binary::command::{BinaryServerCommand, HandlerResult, ServerCommandHandler};
 use crate::shard::IggyShard;
+use crate::shard::namespace::IggyNamespace;
+use crate::shard::transmission::message::{ShardMessage, ShardRequest, ShardRequestPayload};
 use crate::streaming::segments::{IggyIndexesMut, IggyMessagesBatchMut};
 use crate::streaming::session::Session;
+use crate::streaming::{streams, topics};
 use anyhow::Result;
 use compio::buf::{IntoInner as _, IoBuf};
-use iggy_common::INDEX_SIZE;
 use iggy_common::Identifier;
 use iggy_common::PooledBuffer;
 use iggy_common::SenderKind;
 use iggy_common::Sizeable;
+use iggy_common::{INDEX_SIZE, PartitioningKind};
 use iggy_common::{IggyError, Partitioning, SendMessages, Validatable};
 use std::rc::Rc;
-use tracing::instrument;
+use tracing::{error, info, instrument};
 
 impl ServerCommandHandler for SendMessages {
     fn code(&self) -> u32 {
@@ -49,7 +52,9 @@ impl ServerCommandHandler for SendMessages {
         length: u32,
         session: &Session,
         shard: &Rc<IggyShard>,
-    ) -> Result<(), IggyError> {
+    ) -> Result<HandlerResult, IggyError> {
+        tracing::error!("===== SUPER HERRO");
+
         let total_payload_size = length as usize - std::mem::size_of::<u32>();
         let metadata_len_field_size = std::mem::size_of::<u32>();
 
@@ -107,19 +112,103 @@ impl ServerCommandHandler for SendMessages {
         );
         batch.validate()?;
 
+        let numeric_stream_id = shard
+            .streams
+            .with_stream_by_id(&self.stream_id, streams::helpers::get_stream_id());
+
+        let numeric_topic_id = shard.streams.with_topic_by_id(
+            &self.stream_id,
+            &self.topic_id,
+            topics::helpers::get_topic_id(),
+        );
+
+        // TODO(tungtose): dry this code && get partition_id below have a side effect
+        let partition_id = shard.streams.with_topic_by_id(
+            &self.stream_id,
+            &self.topic_id,
+            |(root, auxilary, ..)| match self.partitioning.kind {
+                PartitioningKind::Balanced => {
+                    let upperbound = root.partitions().len();
+                    let pid = auxilary.get_next_partition_id(upperbound);
+                    Ok(pid)
+                }
+                PartitioningKind::PartitionId => Ok(u32::from_le_bytes(
+                    self.partitioning.value[..self.partitioning.length as usize]
+                        .try_into()
+                        .map_err(|_| IggyError::InvalidNumberEncoding)?,
+                ) as usize),
+                PartitioningKind::MessagesKey => {
+                    let upperbound = root.partitions().len();
+                    Ok(
+                        topics::helpers::calculate_partition_id_by_messages_key_hash(
+                            upperbound,
+                            &self.partitioning.value,
+                        ),
+                    )
+                }
+            },
+        )?;
+
+        let namespace = IggyNamespace::new(numeric_stream_id, numeric_topic_id, partition_id);
         let user_id = session.get_user_id();
+
+        let balanced_partitioning = matches!(self.partitioning.kind, PartitioningKind::Balanced);
+
+        if !(session.is_migrated() || balanced_partitioning)
+            && let Some(target_shard) = shard.find_shard(&namespace)
+            && target_shard.id != shard.id
+        {
+            info!(
+                "TCP wrong shared detected: from_shard {}, to_shard {}",
+                shard.id, target_shard.id
+            );
+
+            if let Some(fd) = sender.take_and_migrate_tcp() {
+                // Construct transfer socker
+                let payload = ShardRequestPayload::SocketTransfer {
+                    fd,
+                    from_shard: shard.id,
+                    client_id: session.client_id,
+                    user_id,
+                    address: session.ip_address,
+                    initial_data: batch,
+                };
+
+                let request = ShardRequest::new(
+                    self.stream_id.clone(),
+                    self.topic_id.clone(),
+                    partition_id,
+                    payload,
+                );
+
+                let socket_transfer_msg = ShardMessage::Request(request);
+
+                if let Err(err) = shard
+                    .send_request_to_shard_or_recoil(Some(&namespace), socket_transfer_msg)
+                    .await
+                {
+                    error!(
+                        "Failed to send socket transfer to shard {}, err: {:?}",
+                        target_shard.id, err
+                    );
+
+                    // TODO(tungtose): restore TcpStream to current shard or drop
+                    // connection?
+                }
+
+                info!("Sending socket transfer to shard {}", target_shard.id);
+                return Ok(HandlerResult::Migrated {
+                    to_shard: target_shard.id,
+                });
+            }
+        }
+
         shard
-            .append_messages(
-                user_id,
-                self.stream_id,
-                self.topic_id,
-                &self.partitioning,
-                batch,
-            )
+            .append_messages(user_id, self.stream_id, self.topic_id, partition_id, batch)
             .await?;
 
         sender.send_empty_ok_response().await?;
-        Ok(())
+        Ok(HandlerResult::Finished)
     }
 }
 

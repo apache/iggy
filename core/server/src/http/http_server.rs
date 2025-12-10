@@ -131,7 +131,10 @@ pub async fn start_http_server(
             protocol: TransportProtocol::Http,
             address,
         };
-        shard.handle_event(event).await.ok();
+
+        crate::shard::handlers::handle_event(&shard, event)
+            .await
+            .ok();
 
         let service = app.into_make_service_with_connect_info::<CompioSocketAddr>();
 
@@ -175,7 +178,10 @@ pub async fn start_http_server(
             protocol: TransportProtocol::Http,
             address,
         };
-        shard.handle_event(event).await.ok();
+
+        crate::shard::handlers::handle_event(&shard, event)
+            .await
+            .ok();
 
         let service = app.into_make_service_with_connect_info::<SocketAddr>();
         let handle = axum_server::Handle::new();

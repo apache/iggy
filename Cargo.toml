@@ -142,6 +142,7 @@ integration = { path = "core/integration" }
 keyring = { version = "3.6.3", features = ["sync-secret-service", "vendored"] }
 lazy_static = "1.5.0"
 log = "0.4.29"
+libc = "0.2"
 mimalloc = "0.1"
 mockall = "0.14.0"
 nonzero_lit = "0.1.2"
