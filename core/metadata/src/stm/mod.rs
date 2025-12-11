@@ -15,6 +15,23 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod mux;
-mod stream;
+pub mod consumer_group;
+pub mod stream;
+pub mod user;
+
+pub mod mux;
 // TODO: Add more state machines.
+
+pub trait State {
+    type Output;
+    // Apply the state machine logic and return an optional output.
+    // The output is optional, as we model the `StateMachine`, as an variadic list,
+    // where not all state machines will produce an output for every input event.
+    fn apply(&self) -> Option<Self::Output>;
+}
+
+pub trait StateMachine {
+    type Input;
+    type Output;
+    fn update(&self, input: &Self::Input, output: &mut Vec<Self::Output>);
+}

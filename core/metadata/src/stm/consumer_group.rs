@@ -17,9 +17,9 @@
 
 use crate::stm::State;
 
-pub struct Streams {}
+pub struct ConsumerGroups {}
 
-impl State for Streams {
+impl State for ConsumerGroups {
     type Output = ();
 
     fn apply(&self) -> Option<Self::Output> {
