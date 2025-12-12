@@ -22,6 +22,7 @@ use anyhow::Context;
 use async_trait::async_trait;
 use iggy_common::PersonalAccessTokenExpiry;
 use iggy_common::create_personal_access_token::CreatePersonalAccessToken;
+#[cfg(not(target_env = "musl"))]
 use keyring::Entry;
 use tracing::{Level, event};
 
@@ -82,11 +83,20 @@ impl CliCommand for CreatePersonalAccessTokenCmd {
             })?;
 
         if self.store_token {
-            let server_address = format!("iggy:{}", self.server_address);
-            let entry = Entry::new(&server_address, &self.create_token.name)?;
-            entry.set_password(&token.token)?;
-            event!(target: PRINT_TARGET, Level::DEBUG,"Stored token under service: {} and name: {}", server_address,
-                    self.create_token.name);
+            #[cfg(not(target_env = "musl"))]
+            {
+                let server_address = format!("iggy:{}", self.server_address);
+                let entry = Entry::new(&server_address, &self.create_token.name)?;
+                entry.set_password(&token.token)?;
+                event!(target: PRINT_TARGET, Level::DEBUG,"Stored token under service: {} and name: {}", server_address,
+                        self.create_token.name);
+            }
+            #[cfg(target_env = "musl")]
+            {
+                anyhow::bail!(
+                    "Token storage is not available on musl targets. Use --quiet to print the token instead."
+                );
+            }
             event!(target: PRINT_TARGET, Level::INFO,
                 "Personal access token with name: {} and {} created",
                 self.create_token.name,

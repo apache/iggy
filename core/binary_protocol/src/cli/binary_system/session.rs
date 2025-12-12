@@ -16,9 +16,11 @@
  * under the License.
  */
 
+#[cfg(not(target_env = "musl"))]
 use keyring::{Entry, Result};
 
 const SESSION_TOKEN_NAME: &str = "iggy-cli-session";
+#[cfg(not(target_env = "musl"))]
 const SESSION_KEYRING_SERVICE_NAME: &str = "iggy-cli-session";
 
 pub struct ServerSession {
@@ -34,6 +36,7 @@ impl ServerSession {
         &self.server_address
     }
 
+    #[cfg(not(target_env = "musl"))]
     fn get_service_name(&self) -> String {
         format!("{SESSION_KEYRING_SERVICE_NAME}:{}", self.server_address)
     }
@@ -42,6 +45,7 @@ impl ServerSession {
         String::from(SESSION_TOKEN_NAME)
     }
 
+    #[cfg(not(target_env = "musl"))]
     pub fn is_active(&self) -> bool {
         if let Ok(entry) = Entry::new(&self.get_service_name(), &self.get_token_name()) {
             return entry.get_password().is_ok();
@@ -50,12 +54,26 @@ impl ServerSession {
         false
     }
 
+    #[cfg(target_env = "musl")]
+    pub fn is_active(&self) -> bool {
+        false
+    }
+
+    #[cfg(not(target_env = "musl"))]
     pub fn store(&self, token: &str) -> Result<()> {
         let entry = Entry::new(&self.get_service_name(), &self.get_token_name())?;
         entry.set_password(token)?;
         Ok(())
     }
 
+    #[cfg(target_env = "musl")]
+    pub fn store(&self, _token: &str) -> anyhow::Result<()> {
+        anyhow::bail!(
+            "Session storage is not available on musl targets. Use explicit credentials instead."
+        )
+    }
+
+    #[cfg(not(target_env = "musl"))]
     pub fn get_token(&self) -> Option<String> {
         if let Ok(entry) = Entry::new(&self.get_service_name(), &self.get_token_name())
             && let Ok(token) = entry.get_password()
@@ -66,8 +84,19 @@ impl ServerSession {
         None
     }
 
+    #[cfg(target_env = "musl")]
+    pub fn get_token(&self) -> Option<String> {
+        None
+    }
+
+    #[cfg(not(target_env = "musl"))]
     pub fn delete(&self) -> Result<()> {
         let entry = Entry::new(&self.get_service_name(), &self.get_token_name())?;
         entry.delete_credential()
+    }
+
+    #[cfg(target_env = "musl")]
+    pub fn delete(&self) -> anyhow::Result<()> {
+        Ok(())
     }
 }
