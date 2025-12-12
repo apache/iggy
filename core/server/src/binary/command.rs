@@ -121,6 +121,11 @@ define_server_command_enum! {
     LeaveConsumerGroup(LeaveConsumerGroup), LEAVE_CONSUMER_GROUP_CODE, LEAVE_CONSUMER_GROUP, true;
 }
 
+pub enum HandlerResult {
+    Finished,
+    Migrated { to_shard: u16 },
+}
+
 #[enum_dispatch]
 pub trait ServerCommandHandler {
     /// Return the command code
@@ -134,7 +139,7 @@ pub trait ServerCommandHandler {
         length: u32,
         session: &Session,
         shard: &Rc<IggyShard>,
-    ) -> Result<(), IggyError>;
+    ) -> Result<HandlerResult, IggyError>;
 }
 
 pub trait BinaryServerCommand {

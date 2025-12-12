@@ -17,7 +17,9 @@
  */
 
 use super::COMPONENT;
-use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
+use crate::binary::command::{
+    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
+};
 use crate::binary::handlers::utils::receive_and_validate;
 use iggy_common::SenderKind;
 
@@ -42,7 +44,7 @@ impl ServerCommandHandler for LeaveConsumerGroup {
         _length: u32,
         session: &Session,
         shard: &Rc<IggyShard>,
-    ) -> Result<(), IggyError> {
+    ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
 
         shard
@@ -60,7 +62,7 @@ impl ServerCommandHandler for LeaveConsumerGroup {
             })?;
 
         sender.send_empty_ok_response().await?;
-        Ok(())
+        Ok(HandlerResult::Finished)
     }
 }
 

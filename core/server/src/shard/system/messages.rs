@@ -31,7 +31,7 @@ use err_trail::ErrContext;
 use iggy_common::PooledBuffer;
 use iggy_common::{
     BytesSerializable, Consumer, EncryptorKind, IGGY_MESSAGE_HEADER_SIZE, Identifier, IggyError,
-    Partitioning, PartitioningKind, PollingKind, PollingStrategy,
+    PollingKind, PollingStrategy,
 };
 use std::sync::atomic::Ordering;
 use tracing::error;
@@ -42,7 +42,7 @@ impl IggyShard {
         user_id: u32,
         stream_id: Identifier,
         topic_id: Identifier,
-        partitioning: &Partitioning,
+        partition_id: usize,
         batch: IggyMessagesBatchMut,
     ) -> Result<(), IggyError> {
         self.ensure_topic_exists(&stream_id, &topic_id)?;
@@ -71,34 +71,9 @@ impl IggyShard {
             return Ok(());
         }
 
-        let partition_id =
-            self.streams
-                .with_topic_by_id(
-                    &stream_id,
-                    &topic_id,
-                    |(root, auxilary, ..)| match partitioning.kind {
-                        PartitioningKind::Balanced => {
-                            let upperbound = root.partitions().len();
-                            Ok(auxilary.get_next_partition_id(upperbound))
-                        }
-                        PartitioningKind::PartitionId => Ok(u32::from_le_bytes(
-                            partitioning.value[..partitioning.length as usize]
-                                .try_into()
-                                .map_err(|_| IggyError::InvalidNumberEncoding)?,
-                        ) as usize),
-                        PartitioningKind::MessagesKey => {
-                            let upperbound = root.partitions().len();
-                            Ok(
-                                topics::helpers::calculate_partition_id_by_messages_key_hash(
-                                    upperbound,
-                                    &partitioning.value,
-                                ),
-                            )
-                        }
-                    },
-                )?;
-
         self.ensure_partition_exists(&stream_id, &topic_id, partition_id)?;
+
+        // TODO(tungtose): DRY this code
         let namespace = IggyNamespace::new(numeric_stream_id, numeric_topic_id, partition_id);
         let payload = ShardRequestPayload::SendMessages { batch };
         let request = ShardRequest::new(stream_id.clone(), topic_id.clone(), partition_id, payload);

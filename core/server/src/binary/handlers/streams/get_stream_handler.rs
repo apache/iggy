@@ -16,7 +16,9 @@
  * under the License.
  */
 
-use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
+use crate::binary::command::{
+    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
+};
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
 use crate::shard::IggyShard;
@@ -42,13 +44,13 @@ impl ServerCommandHandler for GetStream {
         _length: u32,
         session: &Session,
         shard: &Rc<IggyShard>,
-    ) -> Result<(), IggyError> {
+    ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
         shard.ensure_authenticated(session)?;
         let exists = shard.ensure_stream_exists(&self.stream_id).is_ok();
         if !exists {
             sender.send_empty_ok_response().await?;
-            return Ok(());
+            return Ok(HandlerResult::Finished);
         }
         let stream_id = shard
             .streams
@@ -67,13 +69,13 @@ impl ServerCommandHandler for GetStream {
             .is_ok();
         if !has_permission {
             sender.send_empty_ok_response().await?;
-            return Ok(());
+            return Ok(HandlerResult::Finished);
         }
         let response = shard
             .streams
             .with_components_by_id(stream_id, |(root, stats)| mapper::map_stream(&root, &stats));
         sender.send_ok_response(&response).await?;
-        Ok(())
+        Ok(HandlerResult::Finished)
     }
 }
 

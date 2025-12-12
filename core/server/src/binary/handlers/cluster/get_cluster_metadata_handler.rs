@@ -18,7 +18,9 @@
 
 use std::rc::Rc;
 
-use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
+use crate::binary::command::{
+    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
+};
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::shard::IggyShard;
 use crate::streaming::session::Session;
@@ -40,14 +42,14 @@ impl ServerCommandHandler for GetClusterMetadata {
         _length: u32,
         session: &Session,
         shard: &Rc<IggyShard>,
-    ) -> Result<(), IggyError> {
+    ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
 
         let cluster_metadata = shard.get_cluster_metadata(session)?;
 
         let response = cluster_metadata.to_bytes();
         sender.send_ok_response(&response).await?;
-        Ok(())
+        Ok(HandlerResult::Finished)
     }
 }
 

@@ -27,34 +27,50 @@ const COMPONENT: &str = "TCP";
 
 #[derive(Debug)]
 pub struct TcpSender {
-    pub(crate) stream: TcpStream,
+    pub(crate) stream: Option<TcpStream>,
 }
 
 impl Sender for TcpSender {
     async fn read<B: IoBufMut>(&mut self, buffer: B) -> (Result<(), IggyError>, B) {
-        super::read(&mut self.stream, buffer).await
+        match self.stream.as_mut() {
+            Some(stream) => super::read(stream, buffer).await,
+            None => (Err(IggyError::ConnectionClosed), buffer),
+        }
     }
 
     async fn send_empty_ok_response(&mut self) -> Result<(), IggyError> {
-        super::send_empty_ok_response(&mut self.stream).await
+        match self.stream.as_mut() {
+            Some(stream) => super::send_empty_ok_response(stream).await,
+            None => Err(IggyError::ConnectionClosed),
+        }
     }
 
     async fn send_ok_response(&mut self, payload: &[u8]) -> Result<(), IggyError> {
-        super::send_ok_response(&mut self.stream, payload).await
+        match self.stream.as_mut() {
+            Some(stream) => super::send_ok_response(stream, payload).await,
+            None => Err(IggyError::ConnectionClosed),
+        }
     }
 
     async fn send_error_response(&mut self, error: IggyError) -> Result<(), IggyError> {
-        super::send_error_response(&mut self.stream, error).await
+        match self.stream.as_mut() {
+            Some(stream) => super::send_error_response(stream, error).await,
+            None => Err(IggyError::ConnectionClosed),
+        }
     }
 
     async fn shutdown(&mut self) -> Result<(), IggyError> {
-        self.stream
-            .shutdown()
-            .await
-            .with_error(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to shutdown TCP stream")
-            })
-            .map_err(|e| IggyError::IoError(e.to_string()))
+        match self.stream.as_mut() {
+            Some(stream) => stream
+                .shutdown()
+                .await
+                .with_error(|error| {
+                    format!("{COMPONENT} (error: {error}) - failed to shutdown TCP stream")
+                })
+                .map_err(|e| IggyError::IoError(e.to_string())),
+
+            None => Err(IggyError::ConnectionClosed),
+        }
     }
 
     async fn send_ok_response_vectored(
@@ -62,6 +78,13 @@ impl Sender for TcpSender {
         length: &[u8],
         slices: Vec<PooledBuffer>,
     ) -> Result<(), IggyError> {
-        super::send_ok_response_vectored(&mut self.stream, length, slices).await
+        if self.stream.is_none() {
+            tracing::error!("Tried to send but stream is None!");
+        }
+        match self.stream.as_mut() {
+            Some(stream) => super::send_ok_response_vectored(stream, length, slices).await,
+
+            None => Err(IggyError::ConnectionClosed),
+        }
     }
 }
