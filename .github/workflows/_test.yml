@@ -34,7 +34,12 @@ permissions:
 
 jobs:
   run:
-    runs-on: ubuntu-latest
+    # Select runner based on build target
+    runs-on: ${{
+      (inputs.task == 'build-aarch64-gnu' || inputs.task == 'build-aarch64-musl') && 'ubuntu-24.04-arm' ||
+      inputs.task == 'build-macos-aarch64' && 'macos-14' ||
+      'ubuntu-latest'
+      }}
     timeout-minutes: 60
     env:
       IGGY_CI_BUILD: true

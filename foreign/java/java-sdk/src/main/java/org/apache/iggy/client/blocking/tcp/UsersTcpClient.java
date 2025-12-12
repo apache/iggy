@@ -23,6 +23,8 @@ import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import org.apache.iggy.client.blocking.UsersClient;
 import org.apache.iggy.identifier.UserId;
+import org.apache.iggy.serde.BytesDeserializer;
+import org.apache.iggy.serde.CommandCode;
 import org.apache.iggy.user.IdentityInfo;
 import org.apache.iggy.user.Permissions;
 import org.apache.iggy.user.UserInfo;
@@ -32,8 +34,7 @@ import org.apache.iggy.user.UserStatus;
 import java.util.List;
 import java.util.Optional;
 
-import static org.apache.iggy.client.blocking.tcp.BytesSerializer.nameToBytes;
-import static org.apache.iggy.client.blocking.tcp.BytesSerializer.toBytes;
+import static org.apache.iggy.serde.BytesSerializer.toBytes;
 
 class UsersTcpClient implements UsersClient {
 
@@ -58,8 +59,8 @@ class UsersTcpClient implements UsersClient {
     public UserInfoDetails createUser(
             String username, String password, UserStatus status, Optional<Permissions> permissions) {
         var payload = Unpooled.buffer();
-        payload.writeBytes(nameToBytes(username));
-        payload.writeBytes(nameToBytes(password));
+        payload.writeBytes(toBytes(username));
+        payload.writeBytes(toBytes(password));
         payload.writeByte(status.asCode());
         permissions.ifPresentOrElse(
                 perms -> {
@@ -85,7 +86,7 @@ class UsersTcpClient implements UsersClient {
         usernameOptional.ifPresentOrElse(
                 (username) -> {
                     payload.writeByte(1);
-                    payload.writeBytes(nameToBytes(username));
+                    payload.writeBytes(toBytes(username));
                 },
                 () -> payload.writeByte(0));
         statusOptional.ifPresentOrElse(
@@ -117,8 +118,8 @@ class UsersTcpClient implements UsersClient {
     @Override
     public void changePassword(UserId userId, String currentPassword, String newPassword) {
         var payload = toBytes(userId);
-        payload.writeBytes(nameToBytes(currentPassword));
-        payload.writeBytes(nameToBytes(newPassword));
+        payload.writeBytes(toBytes(currentPassword));
+        payload.writeBytes(toBytes(newPassword));
 
         tcpClient.send(CommandCode.User.CHANGE_PASSWORD, payload);
     }
@@ -130,8 +131,8 @@ class UsersTcpClient implements UsersClient {
         var payloadSize = 2 + username.length() + password.length() + 4 + version.length() + 4 + context.length();
         var payload = Unpooled.buffer(payloadSize);
 
-        payload.writeBytes(nameToBytes(username));
-        payload.writeBytes(nameToBytes(password));
+        payload.writeBytes(toBytes(username));
+        payload.writeBytes(toBytes(password));
         payload.writeIntLE(version.length());
         payload.writeBytes(version.getBytes());
         payload.writeIntLE(context.length());

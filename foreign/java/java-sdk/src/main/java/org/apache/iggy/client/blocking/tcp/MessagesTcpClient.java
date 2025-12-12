@@ -28,11 +28,13 @@ import org.apache.iggy.message.Message;
 import org.apache.iggy.message.Partitioning;
 import org.apache.iggy.message.PolledMessages;
 import org.apache.iggy.message.PollingStrategy;
+import org.apache.iggy.serde.BytesDeserializer;
+import org.apache.iggy.serde.CommandCode;
 
 import java.util.List;
 import java.util.Optional;
 
-import static org.apache.iggy.client.blocking.tcp.BytesSerializer.toBytes;
+import static org.apache.iggy.serde.BytesSerializer.toBytes;
 
 class MessagesTcpClient implements MessagesClient {
 
