@@ -320,7 +320,6 @@ async fn background_graceful_shutdown() {
     assert_eq!(polled_messages.messages.len() as u32, 0);
 
     producer.shutdown().await;
-
     let polled_messages = client
         .poll_messages(
             &Identifier::named(STREAM_NAME).unwrap(),
@@ -333,7 +332,6 @@ async fn background_graceful_shutdown() {
         )
         .await
         .unwrap();
-
     assert_eq!(polled_messages.messages.len() as u32, 1);
 
     cleanup(&client).await;
