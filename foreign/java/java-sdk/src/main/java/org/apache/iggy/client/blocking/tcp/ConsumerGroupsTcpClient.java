@@ -26,12 +26,14 @@ import org.apache.iggy.consumergroup.ConsumerGroupDetails;
 import org.apache.iggy.identifier.ConsumerId;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
+import org.apache.iggy.serde.BytesDeserializer;
+import org.apache.iggy.serde.BytesSerializer;
+import org.apache.iggy.serde.CommandCode;
 
 import java.util.List;
 import java.util.Optional;
 
-import static org.apache.iggy.client.blocking.tcp.BytesSerializer.nameToBytes;
-import static org.apache.iggy.client.blocking.tcp.BytesSerializer.toBytes;
+import static org.apache.iggy.serde.BytesSerializer.toBytes;
 
 class ConsumerGroupsTcpClient implements ConsumerGroupsClient {
 
@@ -66,7 +68,7 @@ class ConsumerGroupsTcpClient implements ConsumerGroupsClient {
 
         payload.writeBytes(streamIdBytes);
         payload.writeBytes(topicIdBytes);
-        payload.writeBytes(nameToBytes(name));
+        payload.writeBytes(BytesSerializer.toBytes(name));
 
         return tcpClient.exchangeForEntity(
                 CommandCode.ConsumerGroup.CREATE, payload, BytesDeserializer::readConsumerGroupDetails);

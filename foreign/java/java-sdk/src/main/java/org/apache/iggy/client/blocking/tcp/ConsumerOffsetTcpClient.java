@@ -24,12 +24,14 @@ import org.apache.iggy.consumergroup.Consumer;
 import org.apache.iggy.consumeroffset.ConsumerOffsetInfo;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
+import org.apache.iggy.serde.BytesDeserializer;
+import org.apache.iggy.serde.CommandCode;
 
 import java.math.BigInteger;
 import java.util.Optional;
 
-import static org.apache.iggy.client.blocking.tcp.BytesSerializer.toBytes;
-import static org.apache.iggy.client.blocking.tcp.BytesSerializer.toBytesAsU64;
+import static org.apache.iggy.serde.BytesSerializer.toBytes;
+import static org.apache.iggy.serde.BytesSerializer.toBytesAsU64;
 
 class ConsumerOffsetTcpClient implements ConsumerOffsetsClient {
 

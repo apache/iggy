@@ -15,7 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-ARG RUST_VERSION=1.91
+ARG RUST_VERSION=1.92
 
 FROM rust:${RUST_VERSION}-slim-bookworm AS builder
 

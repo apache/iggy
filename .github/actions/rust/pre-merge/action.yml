@@ -122,3 +122,31 @@ runs:
           --pr-ref ${{ github.sha }} \
           --port 8090 --wait-secs 180
       shell: bash
+
+    # aarch64 builds (run on ARM64 runners)
+    - name: Build aarch64-gnu
+      if: inputs.task == 'build-aarch64-gnu'
+      run: cargo build --locked --all-targets
+      shell: bash
+
+    - name: Install musl tools for aarch64-musl
+      if: inputs.task == 'build-aarch64-musl'
+      run: |
+        sudo apt-get update && sudo apt-get install -y musl-tools
+        rustup target add aarch64-unknown-linux-musl
+      shell: bash
+
+    - name: Build aarch64-musl
+      if: inputs.task == 'build-aarch64-musl'
+      run: cargo build --locked --all-targets --target aarch64-unknown-linux-musl
+      shell: bash
+      env:
+        # Disable GCC outline atomics to avoid undefined __aarch64_ldadd4_sync
+        # references when linking dbus-sys (required by keyring crate)
+        CFLAGS: "-mno-outline-atomics"
+
+    # macOS builds
+    - name: Build macOS aarch64
+      if: inputs.task == 'build-macos-aarch64'
+      run: cargo build --locked --all-targets
+      shell: bash

@@ -205,6 +205,26 @@ jobs:
       - name: Check for trailing newline in changed text files
         run: ./scripts/ci/trailing-newline.sh --check --ci
 
+  toml-format:
+    name: Check TOML formatting
+    runs-on: ubuntu-latest
+    env:
+      IGGY_CI_BUILD: true
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Need full history to get diff
+
+      - name: Install taplo
+        run: |
+          curl -fsSL https://github.com/tamasfe/taplo/releases/download/0.10.0/taplo-linux-x86_64.gz | gunzip > taplo
+          chmod +x taplo
+          sudo mv taplo /usr/local/bin/
+
+      - name: Check TOML formatting
+        run: ./scripts/ci/taplo.sh --check --ci
+
   summary:
     name: Common checks summary
     needs:
@@ -217,6 +237,7 @@ jobs:
         shellcheck,
         trailing-whitespace,
         trailing-newline,
+        toml-format,
       ]
     if: always()
     runs-on: ubuntu-latest
@@ -309,6 +330,15 @@ jobs:
             echo "| ❌ Trailing Newline | failure | Missing trailing newlines detected |" >> $GITHUB_STEP_SUMMARY
           else
             echo "| ⏭️ Trailing Newline | $TRAILING_NL | Check skipped |" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          TOML_FORMAT="${{ needs.toml-format.result }}"
+          if [ "$TOML_FORMAT" = "success" ]; then
+            echo "| ✅ TOML Format | success | All TOML files properly formatted |" >> $GITHUB_STEP_SUMMARY
+          elif [ "$TOML_FORMAT" = "failure" ]; then
+            echo "| ❌ TOML Format | failure | TOML formatting issues found |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| ⏭️ TOML Format | $TOML_FORMAT | Check skipped |" >> $GITHUB_STEP_SUMMARY
           fi
 
           echo "" >> $GITHUB_STEP_SUMMARY

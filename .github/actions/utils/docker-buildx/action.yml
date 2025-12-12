@@ -218,8 +218,8 @@ runs:
           echo "RUST_VERSION=$ver" >> "$GITHUB_ENV"
           echo "Using toolchain: $ver"
         else
-          echo "RUST_VERSION=1.91" >> "$GITHUB_ENV"
-          echo "No rust-toolchain.toml found; labeling as 1.91"
+          echo "RUST_VERSION=1.92" >> "$GITHUB_ENV"
+          echo "No rust-toolchain.toml found; labeling as 1.92"
         fi
 
     - name: Compose build args

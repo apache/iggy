@@ -21,6 +21,7 @@ package org.apache.iggy.client.blocking.tcp;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
+import org.apache.iggy.serde.BytesSerializer;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 
@@ -71,6 +72,17 @@ class BytesSerializerTest {
             // when & then
             assertThatThrownBy(() -> BytesSerializer.toBytesAsU64(value)).isInstanceOf(IllegalArgumentException.class);
         }
+
+        @Test
+        void shouldFailForValueLargerThanU64() {
+            // given
+            long maxLong = 0xFFFF_FFFF_FFFF_FFFFL;
+            var maxU64 = new BigInteger(Long.toUnsignedString(maxLong));
+            var value = maxU64.add(BigInteger.ONE);
+
+            // when & then
+            assertThatThrownBy(() -> BytesSerializer.toBytesAsU64(value)).isInstanceOf(IllegalArgumentException.class);
+        }
     }
 
     @Nested
@@ -109,6 +121,18 @@ class BytesSerializerTest {
         void shouldFailForValueBelowZero() {
             // given
             var value = BigInteger.valueOf(-1);
+
+            // when & then
+            assertThatThrownBy(() -> BytesSerializer.toBytesAsU128(value)).isInstanceOf(IllegalArgumentException.class);
+        }
+
+        @Test
+        void shouldFailForValueLargerThanU128() {
+            // given
+            byte[] maxU128 = new byte[17];
+            Arrays.fill(maxU128, 1, 17, (byte) 0xFF);
+            var maxU128Value = new BigInteger(maxU128);
+            var value = maxU128Value.add(BigInteger.ONE);
 
             // when & then
             assertThatThrownBy(() -> BytesSerializer.toBytesAsU128(value)).isInstanceOf(IllegalArgumentException.class);

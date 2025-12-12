@@ -17,7 +17,7 @@
  * under the License.
  */
 
-package org.apache.iggy.client.blocking.tcp;
+package org.apache.iggy.serde;
 
 import io.netty.buffer.ByteBuf;
 import org.apache.commons.lang3.ArrayUtils;
@@ -57,11 +57,15 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
-final class BytesDeserializer {
+/**
+ * Unified deserializer for both blocking and async clients.
+ * Provides deserialization of ByteBuf to domain objects according to Iggy wire protocol.
+ */
+public final class BytesDeserializer {
 
     private BytesDeserializer() {}
 
-    static StreamBase readStreamBase(ByteBuf response) {
+    public static StreamBase readStreamBase(ByteBuf response) {
         var streamId = response.readUnsignedIntLE();
         var createdAt = readU64AsBigInteger(response);
         var topicsCount = response.readUnsignedIntLE();
@@ -73,11 +77,11 @@ final class BytesDeserializer {
         return new StreamBase(streamId, createdAt, name, size.toString(), messagesCount, topicsCount);
     }
 
-    static StreamDetails readStreamDetails(ByteBuf response) {
+    public static StreamDetails readStreamDetails(ByteBuf response) {
         var streamBase = readStreamBase(response);
 
         List<Topic> topics = new ArrayList<>();
-        if (response.isReadable()) {
+        while (response.isReadable()) {
             topics.add(readTopic(response));
         }
 
@@ -95,7 +99,7 @@ final class BytesDeserializer {
         return new TopicDetails(topic, partitions);
     }
 
-    static Partition readPartition(ByteBuf response) {
+    public static Partition readPartition(ByteBuf response) {
         var partitionId = response.readUnsignedIntLE();
         var createdAt = readU64AsBigInteger(response);
         var segmentsCount = response.readUnsignedIntLE();
@@ -141,7 +145,7 @@ final class BytesDeserializer {
         return new ConsumerGroupDetails(consumerGroup, members);
     }
 
-    static ConsumerGroupMember readConsumerGroupMember(ByteBuf response) {
+    public static ConsumerGroupMember readConsumerGroupMember(ByteBuf response) {
         var memberId = response.readUnsignedIntLE();
         var partitionsCount = response.readUnsignedIntLE();
         List<Long> partitionIds = new ArrayList<>();
@@ -178,7 +182,7 @@ final class BytesDeserializer {
         return new PolledMessages(partitionId, currentOffset, messagesCount, messages);
     }
 
-    static Message readPolledMessage(ByteBuf response) {
+    public static Message readPolledMessage(ByteBuf response) {
         var checksum = readU64AsBigInteger(response);
         var id = readBytesMessageId(response);
         var offset = readU64AsBigInteger(response);
@@ -194,7 +198,7 @@ final class BytesDeserializer {
         return new Message(header, payload, Optional.empty());
     }
 
-    static Stats readStats(ByteBuf response) {
+    public static Stats readStats(ByteBuf response) {
         var processId = response.readUnsignedIntLE();
         var cpuUsage = response.readFloatLE();
         var totalCpuUsage = response.readFloatLE();
@@ -251,7 +255,7 @@ final class BytesDeserializer {
                 kernelVersion);
     }
 
-    static ClientInfoDetails readClientInfoDetails(ByteBuf response) {
+    public static ClientInfoDetails readClientInfoDetails(ByteBuf response) {
         var clientInfo = readClientInfo(response);
         var consumerGroups = new ArrayList<ConsumerGroupInfo>();
         for (int i = 0; i < clientInfo.consumerGroupsCount(); i++) {
@@ -261,7 +265,7 @@ final class BytesDeserializer {
         return new ClientInfoDetails(clientInfo, consumerGroups);
     }
 
-    static ClientInfo readClientInfo(ByteBuf response) {
+    public static ClientInfo readClientInfo(ByteBuf response) {
         var clientId = response.readUnsignedIntLE();
         var userId = response.readUnsignedIntLE();
         var userIdOptional = Optional.<Long>empty();
@@ -280,7 +284,7 @@ final class BytesDeserializer {
         return new ClientInfo(clientId, userIdOptional, address, transportString, consumerGroupsCount);
     }
 
-    static ConsumerGroupInfo readConsumerGroupInfo(ByteBuf response) {
+    public static ConsumerGroupInfo readConsumerGroupInfo(ByteBuf response) {
         var streamId = response.readUnsignedIntLE();
         var topicId = response.readUnsignedIntLE();
         var groupId = response.readUnsignedIntLE();
@@ -288,7 +292,7 @@ final class BytesDeserializer {
         return new ConsumerGroupInfo(streamId, topicId, groupId);
     }
 
-    static UserInfoDetails readUserInfoDetails(ByteBuf response) {
+    public static UserInfoDetails readUserInfoDetails(ByteBuf response) {
         var userInfo = readUserInfo(response);
 
         Optional<Permissions> permissionsOptional = Optional.empty();
@@ -300,7 +304,7 @@ final class BytesDeserializer {
         return new UserInfoDetails(userInfo, permissionsOptional);
     }
 
-    static Permissions readPermissions(ByteBuf response) {
+    public static Permissions readPermissions(ByteBuf response) {
         var _permissionsLength = response.readUnsignedIntLE();
         var globalPermissions = readGlobalPermissions(response);
         Map<Long, StreamPermissions> streamPermissionsMap = new HashMap<>();
@@ -312,7 +316,7 @@ final class BytesDeserializer {
         return new Permissions(globalPermissions, streamPermissionsMap);
     }
 
-    static StreamPermissions readStreamPermissions(ByteBuf response) {
+    public static StreamPermissions readStreamPermissions(ByteBuf response) {
         var manageStream = response.readBoolean();
         var readStream = response.readBoolean();
         var manageTopics = response.readBoolean();
@@ -329,7 +333,7 @@ final class BytesDeserializer {
                 manageStream, readStream, manageTopics, readTopics, pollMessages, sendMessages, topicPermissionsMap);
     }
 
-    static TopicPermissions readTopicPermissions(ByteBuf response) {
+    public static TopicPermissions readTopicPermissions(ByteBuf response) {
         var manageTopic = response.readBoolean();
         var readTopic = response.readBoolean();
         var pollMessages = response.readBoolean();
@@ -337,7 +341,7 @@ final class BytesDeserializer {
         return new TopicPermissions(manageTopic, readTopic, pollMessages, sendMessages);
     }
 
-    static GlobalPermissions readGlobalPermissions(ByteBuf response) {
+    public static GlobalPermissions readGlobalPermissions(ByteBuf response) {
         var manageServers = response.readBoolean();
         var readServers = response.readBoolean();
         var manageUsers = response.readBoolean();
@@ -361,7 +365,7 @@ final class BytesDeserializer {
                 sendMessages);
     }
 
-    static UserInfo readUserInfo(ByteBuf response) {
+    public static UserInfo readUserInfo(ByteBuf response) {
         var userId = response.readUnsignedIntLE();
         var createdAt = readU64AsBigInteger(response);
         var statusCode = response.readByte();
@@ -372,14 +376,14 @@ final class BytesDeserializer {
         return new UserInfo(userId, createdAt, status, username);
     }
 
-    static RawPersonalAccessToken readRawPersonalAccessToken(ByteBuf response) {
+    public static RawPersonalAccessToken readRawPersonalAccessToken(ByteBuf response) {
         var tokenLength = response.readByte();
         var token =
                 response.readCharSequence(tokenLength, StandardCharsets.UTF_8).toString();
         return new RawPersonalAccessToken(token);
     }
 
-    static PersonalAccessTokenInfo readPersonalAccessTokenInfo(ByteBuf response) {
+    public static PersonalAccessTokenInfo readPersonalAccessTokenInfo(ByteBuf response) {
         var nameLength = response.readByte();
         var name = response.readCharSequence(nameLength, StandardCharsets.UTF_8).toString();
         var expiry = readU64AsBigInteger(response);
@@ -387,11 +391,11 @@ final class BytesDeserializer {
         return new PersonalAccessTokenInfo(name, expiryOptional);
     }
 
-    private static BigInteger readU64AsBigInteger(ByteBuf buffer) {
+    static BigInteger readU64AsBigInteger(ByteBuf buffer) {
         var bytesArray = new byte[8];
         buffer.readBytes(bytesArray, 0, 8);
         ArrayUtils.reverse(bytesArray);
-        return new BigInteger(bytesArray);
+        return new BigInteger(1, bytesArray);
     }
 
     private static BytesMessageId readBytesMessageId(ByteBuf buffer) {

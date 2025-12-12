@@ -21,9 +21,11 @@ package org.apache.iggy.client.async.tcp;
 
 import io.netty.buffer.Unpooled;
 import org.apache.iggy.client.async.TopicsClient;
-import org.apache.iggy.client.blocking.tcp.CommandCode;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
+import org.apache.iggy.serde.BytesDeserializer;
+import org.apache.iggy.serde.BytesSerializer;
+import org.apache.iggy.serde.CommandCode;
 import org.apache.iggy.topic.CompressionAlgorithm;
 import org.apache.iggy.topic.Topic;
 import org.apache.iggy.topic.TopicDetails;
@@ -34,9 +36,8 @@ import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 
-import static org.apache.iggy.client.async.tcp.AsyncBytesSerializer.nameToBytes;
-import static org.apache.iggy.client.async.tcp.AsyncBytesSerializer.toBytes;
-import static org.apache.iggy.client.async.tcp.AsyncBytesSerializer.toBytesAsU64;
+import static org.apache.iggy.serde.BytesSerializer.toBytes;
+import static org.apache.iggy.serde.BytesSerializer.toBytesAsU64;
 
 /**
  * Async TCP implementation of TopicsClient using Netty for non-blocking I/O.
@@ -58,7 +59,7 @@ public class TopicsTcpClient implements TopicsClient {
         return connection.sendAsync(CommandCode.Topic.GET.getValue(), payload).thenApply(response -> {
             try {
                 if (response.isReadable()) {
-                    return Optional.of(AsyncBytesDeserializer.readTopicDetails(response));
+                    return Optional.of(BytesDeserializer.readTopicDetails(response));
                 }
                 return Optional.<TopicDetails>empty();
             } finally {
@@ -77,7 +78,7 @@ public class TopicsTcpClient implements TopicsClient {
                     try {
                         List<Topic> topics = new ArrayList<>();
                         while (response.isReadable()) {
-                            topics.add(AsyncBytesDeserializer.readTopic(response));
+                            topics.add(BytesDeserializer.readTopic(response));
                         }
                         return topics;
                     } finally {
@@ -105,13 +106,13 @@ public class TopicsTcpClient implements TopicsClient {
         payload.writeBytes(toBytesAsU64(messageExpiry));
         payload.writeBytes(toBytesAsU64(maxTopicSize));
         payload.writeByte(replicationFactor.orElse((short) 0));
-        payload.writeBytes(nameToBytes(name));
+        payload.writeBytes(BytesSerializer.toBytes(name));
 
         return connection
                 .sendAsync(CommandCode.Topic.CREATE.getValue(), payload)
                 .thenApply(response -> {
                     try {
-                        return AsyncBytesDeserializer.readTopicDetails(response);
+                        return BytesDeserializer.readTopicDetails(response);
                     } finally {
                         response.release();
                     }
@@ -135,7 +136,7 @@ public class TopicsTcpClient implements TopicsClient {
         payload.writeBytes(toBytesAsU64(messageExpiry));
         payload.writeBytes(toBytesAsU64(maxTopicSize));
         payload.writeByte(replicationFactor.orElse((short) 0));
-        payload.writeBytes(nameToBytes(name));
+        payload.writeBytes(BytesSerializer.toBytes(name));
 
         return connection
                 .sendAsync(CommandCode.Topic.UPDATE.getValue(), payload)

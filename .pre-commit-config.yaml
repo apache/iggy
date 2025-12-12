@@ -84,6 +84,14 @@ repos:
         types: [text]
         pass_filenames: false
 
+      - id: taplo
+        name: taplo (TOML format)
+        entry: ./scripts/ci/taplo.sh
+        args: ["--fix", "--staged"]
+        language: system
+        types: [toml]
+        pass_filenames: false
+
   # Rust
   - repo: local
     hooks:

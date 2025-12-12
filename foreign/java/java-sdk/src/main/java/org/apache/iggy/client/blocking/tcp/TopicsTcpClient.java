@@ -23,6 +23,9 @@ import io.netty.buffer.Unpooled;
 import org.apache.iggy.client.blocking.TopicsClient;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
+import org.apache.iggy.serde.BytesDeserializer;
+import org.apache.iggy.serde.BytesSerializer;
+import org.apache.iggy.serde.CommandCode;
 import org.apache.iggy.topic.CompressionAlgorithm;
 import org.apache.iggy.topic.Topic;
 import org.apache.iggy.topic.TopicDetails;
@@ -31,9 +34,8 @@ import java.math.BigInteger;
 import java.util.List;
 import java.util.Optional;
 
-import static org.apache.iggy.client.blocking.tcp.BytesSerializer.nameToBytes;
-import static org.apache.iggy.client.blocking.tcp.BytesSerializer.toBytes;
-import static org.apache.iggy.client.blocking.tcp.BytesSerializer.toBytesAsU64;
+import static org.apache.iggy.serde.BytesSerializer.toBytes;
+import static org.apache.iggy.serde.BytesSerializer.toBytesAsU64;
 
 class TopicsTcpClient implements TopicsClient {
 
@@ -74,7 +76,7 @@ class TopicsTcpClient implements TopicsClient {
         payload.writeBytes(toBytesAsU64(messageExpiry));
         payload.writeBytes(toBytesAsU64(maxTopicSize));
         payload.writeByte(replicationFactor.orElse((short) 0));
-        payload.writeBytes(nameToBytes(name));
+        payload.writeBytes(BytesSerializer.toBytes(name));
 
         return tcpClient.exchangeForEntity(CommandCode.Topic.CREATE, payload, BytesDeserializer::readTopicDetails);
     }
@@ -95,7 +97,7 @@ class TopicsTcpClient implements TopicsClient {
         payload.writeBytes(toBytesAsU64(messageExpiry));
         payload.writeBytes(toBytesAsU64(maxTopicSize));
         payload.writeByte(replicationFactor.orElse((short) 0));
-        payload.writeBytes(nameToBytes(name));
+        payload.writeBytes(BytesSerializer.toBytes(name));
 
         tcpClient.send(CommandCode.Topic.UPDATE, payload);
     }

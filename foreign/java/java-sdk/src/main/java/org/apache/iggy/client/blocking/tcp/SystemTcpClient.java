@@ -21,6 +21,8 @@ package org.apache.iggy.client.blocking.tcp;
 
 import io.netty.buffer.Unpooled;
 import org.apache.iggy.client.blocking.SystemClient;
+import org.apache.iggy.serde.BytesDeserializer;
+import org.apache.iggy.serde.CommandCode;
 import org.apache.iggy.system.ClientInfo;
 import org.apache.iggy.system.ClientInfoDetails;
 import org.apache.iggy.system.Stats;

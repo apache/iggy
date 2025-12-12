@@ -21,7 +21,8 @@ package org.apache.iggy.client.async.tcp;
 
 import io.netty.buffer.Unpooled;
 import org.apache.iggy.client.async.UsersClient;
-import org.apache.iggy.client.blocking.tcp.CommandCode;
+import org.apache.iggy.serde.BytesSerializer;
+import org.apache.iggy.serde.CommandCode;
 import org.apache.iggy.user.IdentityInfo;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -47,8 +48,8 @@ public class UsersTcpClient implements UsersClient {
         String context = "java-sdk";
 
         var payload = Unpooled.buffer();
-        var usernameBytes = AsyncBytesSerializer.toBytes(username);
-        var passwordBytes = AsyncBytesSerializer.toBytes(password);
+        var usernameBytes = BytesSerializer.toBytes(username);
+        var passwordBytes = BytesSerializer.toBytes(password);
 
         payload.writeBytes(usernameBytes);
         payload.writeBytes(passwordBytes);

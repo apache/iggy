@@ -23,14 +23,16 @@ import io.netty.buffer.Unpooled;
 import org.apache.iggy.client.blocking.PersonalAccessTokensClient;
 import org.apache.iggy.personalaccesstoken.PersonalAccessTokenInfo;
 import org.apache.iggy.personalaccesstoken.RawPersonalAccessToken;
+import org.apache.iggy.serde.BytesDeserializer;
+import org.apache.iggy.serde.CommandCode;
 import org.apache.iggy.user.IdentityInfo;
 
 import java.math.BigInteger;
 import java.util.List;
 import java.util.Optional;
 
-import static org.apache.iggy.client.blocking.tcp.BytesSerializer.nameToBytes;
-import static org.apache.iggy.client.blocking.tcp.BytesSerializer.toBytesAsU64;
+import static org.apache.iggy.serde.BytesSerializer.toBytes;
+import static org.apache.iggy.serde.BytesSerializer.toBytesAsU64;
 
 class PersonalAccessTokensTcpClient implements PersonalAccessTokensClient {
 
@@ -43,7 +45,7 @@ class PersonalAccessTokensTcpClient implements PersonalAccessTokensClient {
     @Override
     public RawPersonalAccessToken createPersonalAccessToken(String name, BigInteger expiry) {
         var payload = Unpooled.buffer();
-        payload.writeBytes(nameToBytes(name));
+        payload.writeBytes(toBytes(name));
         payload.writeBytes(toBytesAsU64(expiry));
         return tcpClient.exchangeForEntity(
                 CommandCode.PersonalAccessToken.CREATE, payload, BytesDeserializer::readRawPersonalAccessToken);
@@ -57,13 +59,13 @@ class PersonalAccessTokensTcpClient implements PersonalAccessTokensClient {
 
     @Override
     public void deletePersonalAccessToken(String name) {
-        var payload = nameToBytes(name);
+        var payload = toBytes(name);
         tcpClient.send(CommandCode.PersonalAccessToken.DELETE, payload);
     }
 
     @Override
     public IdentityInfo loginWithPersonalAccessToken(String token) {
-        var payload = nameToBytes(token);
+        var payload = toBytes(token);
         return tcpClient.exchangeForEntity(CommandCode.PersonalAccessToken.LOGIN, payload, buf -> {
             var userId = buf.readUnsignedIntLE();
             return new IdentityInfo(userId, Optional.empty());

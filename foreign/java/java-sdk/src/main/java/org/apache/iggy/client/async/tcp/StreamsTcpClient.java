@@ -20,9 +20,11 @@
 package org.apache.iggy.client.async.tcp;
 
 import io.netty.buffer.Unpooled;
+import io.netty.util.ReferenceCounted;
 import org.apache.iggy.client.async.StreamsClient;
-import org.apache.iggy.client.blocking.tcp.CommandCode;
 import org.apache.iggy.identifier.StreamId;
+import org.apache.iggy.serde.BytesSerializer;
+import org.apache.iggy.serde.CommandCode;
 import org.apache.iggy.stream.StreamBase;
 import org.apache.iggy.stream.StreamDetails;
 
@@ -31,10 +33,9 @@ import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 
-import static org.apache.iggy.client.async.tcp.AsyncBytesDeserializer.readStreamBase;
-import static org.apache.iggy.client.async.tcp.AsyncBytesDeserializer.readStreamDetails;
-import static org.apache.iggy.client.async.tcp.AsyncBytesSerializer.nameToBytes;
-import static org.apache.iggy.client.async.tcp.AsyncBytesSerializer.toBytes;
+import static org.apache.iggy.serde.BytesDeserializer.readStreamBase;
+import static org.apache.iggy.serde.BytesDeserializer.readStreamDetails;
+import static org.apache.iggy.serde.BytesSerializer.toBytes;
 
 /**
  * Async TCP implementation of StreamsClient using Netty for non-blocking I/O.
@@ -52,7 +53,7 @@ public class StreamsTcpClient implements StreamsClient {
         var payloadSize = 1 + name.length();
         var payload = Unpooled.buffer(payloadSize);
 
-        payload.writeBytes(nameToBytes(name));
+        payload.writeBytes(BytesSerializer.toBytes(name));
 
         return connection
                 .sendAsync(CommandCode.Stream.CREATE.getValue(), payload)
@@ -100,11 +101,11 @@ public class StreamsTcpClient implements StreamsClient {
         var payload = Unpooled.buffer(payloadSize + idBytes.capacity());
 
         payload.writeBytes(idBytes);
-        payload.writeBytes(nameToBytes(name));
+        payload.writeBytes(BytesSerializer.toBytes(name));
 
         return connection
                 .sendAsync(CommandCode.Stream.UPDATE.getValue(), payload)
-                .thenAccept(response -> response.release());
+                .thenAccept(ReferenceCounted::release);
     }
 
     @Override
@@ -113,6 +114,6 @@ public class StreamsTcpClient implements StreamsClient {
 
         return connection
                 .sendAsync(CommandCode.Stream.DELETE.getValue(), payload)
-                .thenAccept(response -> response.release());
+                .thenAccept(ReferenceCounted::release);
     }
 }

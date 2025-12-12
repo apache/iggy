@@ -387,37 +387,45 @@ impl MainOps for Streams {
                         .map(|cg_offset| cg_offset.stored_offset),
                 };
 
-                if consumer_offset.is_none() {
-                    let batches = self
-                        .get_messages_by_offset(stream_id, topic_id, partition_id, 0, count)
-                        .await?;
-                    Ok(batches)
-                } else {
-                    let consumer_offset = consumer_offset.unwrap();
-                    let offset = consumer_offset + 1;
-                    match consumer {
-                        PollingConsumer::Consumer(consumer_id, _) => {
-                            tracing::trace!(
-                                "Getting next messages for consumer id: {} for partition: {} from offset: {}...",
-                                consumer_id,
-                                partition_id,
-                                offset
-                            );
-                        }
-                        PollingConsumer::ConsumerGroup(consumer_group_id, member_id) => {
-                            tracing::trace!(
-                                "Getting next messages for consumer group: {} member: {} for partition: {} from offset: {}...",
-                                consumer_group_id.0,
-                                member_id.0,
-                                partition_id,
-                                offset
-                            );
-                        }
+                match consumer_offset {
+                    None => {
+                        let batches = self
+                            .get_messages_by_offset(stream_id, topic_id, partition_id, 0, count)
+                            .await?;
+                        Ok(batches)
                     }
-                    let batches = self
-                        .get_messages_by_offset(stream_id, topic_id, partition_id, offset, count)
-                        .await?;
-                    Ok(batches)
+                    Some(consumer_offset) => {
+                        let offset = consumer_offset + 1;
+                        match consumer {
+                            PollingConsumer::Consumer(consumer_id, _) => {
+                                tracing::trace!(
+                                    "Getting next messages for consumer id: {} for partition: {} from offset: {}...",
+                                    consumer_id,
+                                    partition_id,
+                                    offset
+                                );
+                            }
+                            PollingConsumer::ConsumerGroup(consumer_group_id, member_id) => {
+                                tracing::trace!(
+                                    "Getting next messages for consumer group: {} member: {} for partition: {} from offset: {}...",
+                                    consumer_group_id.0,
+                                    member_id.0,
+                                    partition_id,
+                                    offset
+                                );
+                            }
+                        }
+                        let batches = self
+                            .get_messages_by_offset(
+                                stream_id,
+                                topic_id,
+                                partition_id,
+                                offset,
+                                count,
+                            )
+                            .await?;
+                        Ok(batches)
+                    }
                 }
             }
         }?;

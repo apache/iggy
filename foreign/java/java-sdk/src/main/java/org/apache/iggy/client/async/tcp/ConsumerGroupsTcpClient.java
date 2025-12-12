@@ -21,10 +21,11 @@ package org.apache.iggy.client.async.tcp;
 
 import io.netty.buffer.Unpooled;
 import org.apache.iggy.client.async.ConsumerGroupsClient;
-import org.apache.iggy.client.blocking.tcp.CommandCode;
 import org.apache.iggy.identifier.ConsumerId;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
+import org.apache.iggy.serde.BytesSerializer;
+import org.apache.iggy.serde.CommandCode;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -47,13 +48,13 @@ public class ConsumerGroupsTcpClient implements ConsumerGroupsClient {
         var payload = Unpooled.buffer();
 
         // Serialize stream ID
-        payload.writeBytes(AsyncBytesSerializer.toBytes(streamId));
+        payload.writeBytes(BytesSerializer.toBytes(streamId));
 
         // Serialize topic ID
-        payload.writeBytes(AsyncBytesSerializer.toBytes(topicId));
+        payload.writeBytes(BytesSerializer.toBytes(topicId));
 
         // Serialize consumer group ID
-        payload.writeBytes(AsyncBytesSerializer.toBytes(groupId));
+        payload.writeBytes(BytesSerializer.toBytes(groupId));
 
         log.debug("Joining consumer group - Stream: {}, Topic: {}, Group: {}", streamId, topicId, groupId);
 
@@ -70,13 +71,13 @@ public class ConsumerGroupsTcpClient implements ConsumerGroupsClient {
         var payload = Unpooled.buffer();
 
         // Serialize stream ID
-        payload.writeBytes(AsyncBytesSerializer.toBytes(streamId));
+        payload.writeBytes(BytesSerializer.toBytes(streamId));
 
         // Serialize topic ID
-        payload.writeBytes(AsyncBytesSerializer.toBytes(topicId));
+        payload.writeBytes(BytesSerializer.toBytes(topicId));
 
         // Serialize consumer group ID
-        payload.writeBytes(AsyncBytesSerializer.toBytes(groupId));
+        payload.writeBytes(BytesSerializer.toBytes(groupId));
 
         log.debug("Leaving consumer group - Stream: {}, Topic: {}, Group: {}", streamId, topicId, groupId);
 

@@ -98,6 +98,9 @@ components:
       - "machete"
       - "test"
       - "compat"
+      - "build-aarch64-gnu"
+      - "build-aarch64-musl"
+      - "build-macos-aarch64"
 
   # CLI component
   rust-cli:
