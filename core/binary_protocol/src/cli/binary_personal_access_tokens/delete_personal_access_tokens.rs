@@ -21,7 +21,6 @@ use crate::cli::cli_command::{CliCommand, PRINT_TARGET};
 use anyhow::Context;
 use async_trait::async_trait;
 use iggy_common::delete_personal_access_token::DeletePersonalAccessToken;
-#[cfg(not(target_env = "musl"))]
 use keyring::Entry;
 use tracing::{Level, event};
 
@@ -59,16 +58,13 @@ impl CliCommand for DeletePersonalAccessTokenCmd {
                 )
             })?;
 
-        #[cfg(not(target_env = "musl"))]
-        {
-            let server_address = format!("iggy:{}", self.server_address);
-            let entry = Entry::new(&server_address, &self.delete_token.name)?;
-            event!(target: PRINT_TARGET, Level::DEBUG,"Checking token presence under service: {} and name: {}",
-                    server_address, self.delete_token.name);
-            if let Err(e) = entry.delete_credential() {
-                event!(target: PRINT_TARGET, Level::DEBUG, "{}", e);
-            };
-        }
+        let server_address = format!("iggy:{}", self.server_address);
+        let entry = Entry::new(&server_address, &self.delete_token.name)?;
+        event!(target: PRINT_TARGET, Level::DEBUG,"Checking token presence under service: {} and name: {}",
+                server_address, self.delete_token.name);
+        if let Err(e) = entry.delete_credential() {
+            event!(target: PRINT_TARGET, Level::DEBUG, "{}", e);
+        };
 
         event!(target: PRINT_TARGET, Level::INFO,
             "Personal access token with name: {} deleted", self.delete_token.name

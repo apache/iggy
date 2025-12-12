@@ -119,6 +119,12 @@ jobs:
             bin_flags+=(--bin "$name")
           done
 
+          # aarch64 musl: disable GCC outline atomics to avoid undefined __aarch64_ldadd4_sync
+          # references when linking dbus-sys (required by keyring crate)
+          if [[ "${{ matrix.target }}" == "aarch64-unknown-linux-musl" ]]; then
+            export CFLAGS="-mno-outline-atomics"
+          fi
+
           cargo build --locked --release --target ${{ matrix.target }} "${bin_flags[@]}"
 
       - name: Package binaries

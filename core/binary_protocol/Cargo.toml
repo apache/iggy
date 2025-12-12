@@ -37,12 +37,10 @@ chrono = { workspace = true }
 comfy-table = { workspace = true, optional = false }
 dirs = { workspace = true }
 iggy_common = { workspace = true }
+keyring = { workspace = true, optional = false }
 passterm = { workspace = true, optional = false }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
-
-[target.'cfg(not(target_env = "musl"))'.dependencies]
-keyring = { workspace = true }
