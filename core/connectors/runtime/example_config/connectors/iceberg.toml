@@ -44,7 +44,6 @@ store_secret_access_key = "password"
 store_region = "us-east-1"
 store_class = "s3"
 
-
 [transforms.add_fields]
 enabled = true
 
