@@ -15,8 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# .github/workflows/_build_rust_binaries.yml
-name: _build_rust_binaries
+name: _build_rust_artifacts
 on:
   workflow_call:
     inputs:
@@ -38,23 +37,28 @@ on:
         type: string
         required: false
         default: ""
-        description: "Specific commit to checkout for building binaries"
+        description: "Specific commit to checkout for building"
       binaries:
         type: string
         required: false
-        default: "iggy-server,iggy,iggy-bench"
+        default: "iggy-server,iggy,iggy-bench,iggy-connectors"
         description: "Comma-separated list of binaries to build"
+      connector_plugins:
+        type: string
+        required: false
+        default: "iggy_connector_elasticsearch_sink,iggy_connector_elasticsearch_source,iggy_connector_iceberg_sink,iggy_connector_postgres_sink,iggy_connector_postgres_source,iggy_connector_quickwit_sink,iggy_connector_random_source,iggy_connector_stdout_sink"
+        description: "Comma-separated list of connector plugin crates to build as shared libraries"
     outputs:
       artifact_name:
-        description: "Name of the uploaded artifact containing all binaries"
+        description: "Name of the uploaded artifact containing all artifacts"
         value: ${{ jobs.collect.outputs.artifact_name }}
 
 env:
   IGGY_CI_BUILD: true
 
 jobs:
-  linux:
-    name: Linux ${{ matrix.target }}
+  build-binaries:
+    name: Binaries ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     strategy:
@@ -67,12 +71,16 @@ jobs:
           - target: x86_64-unknown-linux-musl
             runner: ubuntu-latest
             libc: musl
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            libc: gnu
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+            libc: musl
     steps:
       - name: Download latest copy script from master
         if: inputs.use_latest_ci
-        shell: bash
         run: |
-          set -euo pipefail
           curl -sSL "https://raw.githubusercontent.com/${{ github.repository }}/master/scripts/copy-latest-from-master.sh" \
             -o /tmp/copy-latest-from-master.sh
           chmod +x /tmp/copy-latest-from-master.sh
@@ -81,11 +89,9 @@ jobs:
         with:
           ref: ${{ inputs.commit || github.sha }}
 
-      - name: Save and apply latest CI from master
+      - name: Apply latest CI from master
         if: inputs.use_latest_ci
-        shell: bash
         run: |
-          set -euo pipefail
           /tmp/copy-latest-from-master.sh save .github scripts
           /tmp/copy-latest-from-master.sh apply
 
@@ -102,10 +108,7 @@ jobs:
         run: rustup target add ${{ matrix.target }}
 
       - name: Build binaries
-        shell: bash
         run: |
-          set -euo pipefail
-
           binaries="${{ inputs.binaries }}"
           bin_flags=()
 
@@ -120,10 +123,7 @@ jobs:
 
       - name: Package binaries
         id: pkg
-        shell: bash
         run: |
-          set -euo pipefail
-
           target="${{ matrix.target }}"
           version="${{ inputs.version }}"
           outdir="dist/${target}"
@@ -139,23 +139,102 @@ jobs:
 
           tarball="iggy-${target}-${version}.tar.gz"
           tar czf "${tarball}" -C "${outdir}" .
-
           echo "tarball=${tarball}" >> "$GITHUB_OUTPUT"
-          echo "Built: ${tarball}"
-          ls -lh "${tarball}"
 
       - name: Upload artifact
         if: inputs.upload_artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: rust-binaries-${{ matrix.target }}
+          name: binaries-${{ matrix.target }}
+          path: ${{ steps.pkg.outputs.tarball }}
+          retention-days: 7
+          if-no-files-found: error
+
+  build-connector-plugins:
+    name: Connector plugins ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Download latest copy script from master
+        if: inputs.use_latest_ci
+        run: |
+          curl -sSL "https://raw.githubusercontent.com/${{ github.repository }}/master/scripts/copy-latest-from-master.sh" \
+            -o /tmp/copy-latest-from-master.sh
+          chmod +x /tmp/copy-latest-from-master.sh
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit || github.sha }}
+
+      - name: Apply latest CI from master
+        if: inputs.use_latest_ci
+        run: |
+          /tmp/copy-latest-from-master.sh save .github scripts
+          /tmp/copy-latest-from-master.sh apply
+
+      - name: Setup Rust with cache
+        uses: ./.github/actions/utils/setup-rust-with-cache
+        with:
+          cache-targets: false
+
+      - name: Add Rust target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Build connector plugins
+        run: |
+          plugins="${{ inputs.connector_plugins }}"
+          pkg_flags=()
+
+          IFS=',' read -ra pkgs <<< "$plugins"
+          for pkg in "${pkgs[@]}"; do
+            name="$(echo "$pkg" | xargs)"
+            [[ -z "$name" ]] && continue
+            pkg_flags+=(--package "$name")
+          done
+
+          cargo build --locked --release --target ${{ matrix.target }} "${pkg_flags[@]}"
+
+      - name: Package connector plugins
+        id: pkg
+        run: |
+          target="${{ matrix.target }}"
+          version="${{ inputs.version }}"
+          outdir="dist/${target}"
+          mkdir -p "${outdir}"
+
+          plugins="${{ inputs.connector_plugins }}"
+          IFS=',' read -ra pkgs <<< "$plugins"
+          for pkg in "${pkgs[@]}"; do
+            lib_name="$(echo "$pkg" | xargs)"
+            [[ -z "$lib_name" ]] && continue
+            so_file="target/${target}/release/lib${lib_name}.so"
+            [[ -f "$so_file" ]] && cp "$so_file" "${outdir}/"
+          done
+
+          tarball="iggy-connectors-${target}-${version}.tar.gz"
+          tar czf "${tarball}" -C "${outdir}" .
+          echo "tarball=${tarball}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact
+        if: inputs.upload_artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: connector-plugins-${{ matrix.target }}
           path: ${{ steps.pkg.outputs.tarball }}
           retention-days: 7
           if-no-files-found: error
 
   collect:
-    name: Collect all binaries
-    needs: [linux]
+    name: Collect artifacts
+    needs: [build-binaries, build-connector-plugins]
     if: inputs.upload_artifacts
     runs-on: ubuntu-latest
     outputs:
@@ -169,59 +248,57 @@ jobs:
         id: meta
         run: |
           chmod +x scripts/extract-version.sh
-          server_version=$(scripts/extract-version.sh rust-server)
-          echo "server_version=${server_version}" >> "$GITHUB_OUTPUT"
+          echo "server_version=$(scripts/extract-version.sh rust-server)" >> "$GITHUB_OUTPUT"
 
-      - name: Download all binaries
+      - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
-          pattern: rust-binaries-*
-          merge-multiple: true
           path: dist
+          merge-multiple: true
 
-      - name: List binaries
-        shell: bash
+      - name: Generate summary
         run: |
-          set -euo pipefail
           shopt -s nullglob
-
           tarballs=(dist/*.tar.gz)
-          if ((${#tarballs[@]} == 0)); then
-            echo "⚠️ No tarballs found in dist/, skipping summary." >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
+          (( ${#tarballs[@]} == 0 )) && exit 0
 
-          echo "## 📦 Built Rust Binaries" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Target | Libc | File | Size |" >> "$GITHUB_STEP_SUMMARY"
-          echo "|--------|------|------|------|" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "## Built Rust Artifacts"
+            echo ""
+            echo "| Type | Target | File | Size |"
+            echo "|------|--------|------|------|"
+          } >> "$GITHUB_STEP_SUMMARY"
 
           for tarball in "${tarballs[@]}"; do
             filename=$(basename "$tarball")
             size=$(ls -lh "$tarball" | awk '{print $5}')
 
-            if [[ "$filename" == *"gnu"* ]]; then libc="glibc"
-            elif [[ "$filename" == *"musl"* ]]; then libc="musl (static)"
-            else libc="unknown"; fi
+            if [[ "$filename" == iggy-connectors-* ]]; then type="plugins"
+            else type="binaries"; fi
 
             if [[ "$filename" == *"x86_64"* ]]; then target="x86_64"
             elif [[ "$filename" == *"aarch64"* ]]; then target="aarch64"
             else target="unknown"; fi
 
-            echo "| $target | $libc | \`$filename\` | $size |" >> "$GITHUB_STEP_SUMMARY"
+            if [[ "$filename" == *"musl"* ]]; then target="$target (musl)"
+            elif [[ "$filename" == *"gnu"* ]]; then target="$target (glibc)"
+            fi
+
+            echo "| $type | $target | \`$filename\` | $size |" >> "$GITHUB_STEP_SUMMARY"
           done
 
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "**Server version:** ${{ steps.meta.outputs.server_version }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "**Binaries included:** ${{ inputs.binaries }}" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo ""
+            echo "**Server version:** ${{ steps.meta.outputs.server_version }}"
+            echo "**Binaries:** ${{ inputs.binaries }}"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload combined artifact
         uses: actions/upload-artifact@v4
         with:
-          name: rust-binaries-all
+          name: rust-artifacts-all
           path: dist
           retention-days: 30
 
       - id: output
-        run: echo "artifact_name=rust-binaries-all" >> $GITHUB_OUTPUT
+        run: echo "artifact_name=rust-artifacts-all" >> "$GITHUB_OUTPUT"

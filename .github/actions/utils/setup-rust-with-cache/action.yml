@@ -56,10 +56,10 @@ runs:
           ~/.cache/sccache
           ~/Library/Caches/sccache
           ~/.local/share/sccache
-        key: sccache-${{ runner.os }}-${{ github.job }}-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+        key: sccache-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
         restore-keys: |
-          sccache-${{ runner.os }}-${{ github.job }}-
-          sccache-${{ runner.os }}-
+          sccache-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
+          sccache-${{ runner.os }}-${{ runner.arch }}-
 
     - name: Install sccache
       if: inputs.enabled == 'true'
@@ -68,11 +68,24 @@ runs:
         if ! command -v sccache &> /dev/null; then
           echo "Installing sccache..."
           SCCACHE_VERSION="v0.8.2"
-          SCCACHE_URL="https://github.com/mozilla/sccache/releases/download/${SCCACHE_VERSION}/sccache-${SCCACHE_VERSION}-x86_64-unknown-linux-musl.tar.gz"
+
+          # Detect architecture
+          ARCH="$(uname -m)"
+          case "$ARCH" in
+            x86_64)  SCCACHE_ARCH="x86_64-unknown-linux-musl" ;;
+            aarch64) SCCACHE_ARCH="aarch64-unknown-linux-musl" ;;
+            *)
+              echo "⚠️ Unsupported architecture: $ARCH, skipping sccache"
+              exit 0
+              ;;
+          esac
+
+          SCCACHE_URL="https://github.com/mozilla/sccache/releases/download/${SCCACHE_VERSION}/sccache-${SCCACHE_VERSION}-${SCCACHE_ARCH}.tar.gz"
+          echo "Downloading sccache for $SCCACHE_ARCH..."
 
           curl -L "$SCCACHE_URL" | tar xz
-          sudo mv sccache-${SCCACHE_VERSION}-x86_64-unknown-linux-musl/sccache /usr/local/bin/
-          rm -rf sccache-${SCCACHE_VERSION}-x86_64-unknown-linux-musl
+          sudo mv "sccache-${SCCACHE_VERSION}-${SCCACHE_ARCH}/sccache" /usr/local/bin/
+          rm -rf "sccache-${SCCACHE_VERSION}-${SCCACHE_ARCH}"
         fi
       shell: bash
       continue-on-error: true
@@ -82,9 +95,20 @@ runs:
         # Check if cargo-nextest is already installed
         if ! command -v cargo-nextest &> /dev/null; then
           echo "Installing cargo-nextest..."
-          # Use the install script for the fastest installation
-          curl -LsSf https://get.nexte.st/latest/linux | tar xzf - -C ${CARGO_HOME:-~/.cargo}/bin
-          echo "✅ cargo-nextest installed successfully"
+
+          # Detect architecture for nextest
+          ARCH="$(uname -m)"
+          case "$ARCH" in
+            x86_64)  NEXTEST_PLATFORM="linux" ;;
+            aarch64) NEXTEST_PLATFORM="linux-arm" ;;
+            *)
+              echo "⚠️ Unsupported architecture: $ARCH, skipping nextest"
+              exit 0
+              ;;
+          esac
+
+          curl -LsSf "https://get.nexte.st/latest/${NEXTEST_PLATFORM}" | tar xzf - -C ${CARGO_HOME:-~/.cargo}/bin
+          echo "✅ cargo-nextest installed successfully for $ARCH"
         else
           echo "✅ cargo-nextest already installed"
         fi
