@@ -17,21 +17,17 @@
  * under the License.
  */
 
-import { typedRoute } from '$lib/types/appRoutes';
-import { tokens } from '$lib/utils/constants/tokens.js';
-import { redirect, type Actions } from '@sveltejs/kit';
+import { clientApi } from '$lib/api/clientApi';
+import { streamDetailsMapper } from '$lib/domain/StreamDetails';
+import type { PageLoad } from './$types';
 
-export const actions = {
-  default({ cookies }) {
-    // eat the cookie
-    cookies.set(tokens.accessToken, '', {
-      path: '/',
-      expires: new Date(0)
-    });
+export const load: PageLoad = async ({ params }) => {
+  const data = await clientApi({
+    method: 'GET',
+    path: `/streams/${+params.streamId}`
+  });
 
-    console.log('deleting cookie');
-
-    // redirect the user
-    redirect(302, typedRoute('/auth/sign-in'));
-  }
-} satisfies Actions;
+  return {
+    streamDetails: streamDetailsMapper(data)
+  };
+};

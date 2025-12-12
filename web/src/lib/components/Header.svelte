@@ -26,11 +26,12 @@
   import DropdownMenu from './DropdownMenu/DropdownMenu.svelte';
   import { theme } from './ThemeController.svelte';
   import { typedRoute } from '$lib/types/appRoutes';
+  import { resolve } from '$app/paths';
   import Button from './Button.svelte';
   import StopPropagation from './StopPropagation.svelte';
 
   interface Props {
-    user: User;
+    user: User | null;
   }
 
   let { user }: Props = $props();
@@ -63,7 +64,7 @@
       {#snippet children({ close: _close })}
         <div class="p-1 min-w-[150px] transition-all duration-200 flex flex-col text-sm text-color">
           <span class="flex items-center justify-between gap-2 border-b px-2 py-3">
-            <span>{user.username}</span>
+            <span>{user?.username ?? 'User'}</span>
             <Icon
               name="user"
               class="w-[24px] h-[24px] stroke-black dark:stroke-white"
@@ -98,15 +99,13 @@
               />
             </label>
           </div>
-          <form class="w-full" method="POST" action={typedRoute('/auth/logout')}>
-            <button
-              class="flex w-full items-center justify-between gap-2 px-2 py-2 hover:bg-shade-l300 dark:hover:bg-shade-d1000 rounded-md my-1 dark:hover:text-white"
-            >
-              <span>Log Out</span>
-
-              <Icon name="logout" />
-            </button>
-          </form>
+          <a
+            href={resolve(typedRoute('/auth/logout'))}
+            class="flex w-full items-center justify-between gap-2 px-2 py-2 hover:bg-shade-l300 dark:hover:bg-shade-d1000 rounded-md my-1 dark:hover:text-white"
+          >
+            <span>Log Out</span>
+            <Icon name="logout" />
+          </a>
         </div>
       {/snippet}
     </DropdownMenu>
