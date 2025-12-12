@@ -110,21 +110,17 @@ impl ServerCommandHandler for SendMessages {
         );
         batch.validate()?;
 
-        error!("SUPER HERRO - 0");
+        shard.ensure_topic_exists(&self.stream_id, &self.topic_id)?;
 
         let numeric_stream_id = shard
             .streams
             .with_stream_by_id(&self.stream_id, streams::helpers::get_stream_id());
-
-        error!("SUPER HERRO - 1");
 
         let numeric_topic_id = shard.streams.with_topic_by_id(
             &self.stream_id,
             &self.topic_id,
             topics::helpers::get_topic_id(),
         );
-
-        error!("SUPER HERRO - 2");
 
         // TODO(tungtose): dry this code && get partition_id below have a side effect
         let partition_id = shard.streams.with_topic_by_id(

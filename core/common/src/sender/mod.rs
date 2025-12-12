@@ -37,7 +37,7 @@ use compio::net::TcpStream;
 use compio_quic::{RecvStream, SendStream};
 use compio_tls::TlsStream;
 use std::future::Future;
-use std::os::fd::{AsFd, AsRawFd, RawFd};
+use std::os::fd::{AsFd, IntoRawFd, RawFd};
 use tracing::{debug, error};
 
 macro_rules! forward_async_methods {
@@ -122,16 +122,16 @@ impl SenderKind {
             SenderKind::Tcp(tcp_sender) => {
                 let stream = tcp_sender.stream.take()?;
                 let poll_fd = stream.into_poll_fd().ok()?;
-                let raw_fd = poll_fd.as_fd().as_raw_fd();
-                tracing::info!("==== dbug: 0");
-                let dup_fd = unsafe { libc::dup(raw_fd) };
 
-                tracing::info!("==== dbug: 1");
+                let raw_fd = poll_fd.as_fd();
+                let Ok(owned_fd) = nix::unistd::dup(raw_fd) else {
+                    // TODO(tungtose): recover tcp stream?
+                    error!("Failed to dup fd");
+                    return None;
+                };
 
-                // let raw_fd = dup_fd.as_raw_fd();
-                // std::mem::forget(dup_fd);
-                //
-                Some(dup_fd)
+                let raw_fd = owned_fd.into_raw_fd();
+                Some(raw_fd)
             }
             _ => None,
         }
