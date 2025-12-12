@@ -642,12 +642,13 @@ impl BytesSerializable for HashMap<HeaderKey, HeaderValue> {
                 return Err(IggyError::InvalidHeaderKey);
             }
             position += 4;
-            let key = String::from_utf8(bytes[position..position + key_length].to_vec());
-            if key.is_err() {
-                tracing::error!("Invalid header key: {}", key.unwrap_err());
-                return Err(IggyError::InvalidHeaderKey);
-            }
-            let key = key.unwrap();
+            let key = match String::from_utf8(bytes[position..position + key_length].to_vec()) {
+                Ok(k) => k,
+                Err(e) => {
+                    tracing::error!("Invalid header key: {e}");
+                    return Err(IggyError::InvalidHeaderKey);
+                }
+            };
             position += key_length;
             let kind = HeaderKind::from_code(bytes[position])?;
             position += 1;
