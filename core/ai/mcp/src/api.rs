@@ -1,4 +1,5 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
  * regarding copyright ownership.  The ASF licenses this file
@@ -121,7 +122,14 @@ pub async fn init(
     );
 
     spawn(async move {
-        if let Err(error) = axum_server::from_tcp_rustls(listener, tls_config)
+        let server = axum_server::from_tcp_rustls(listener, tls_config);
+        if let Err(error) = server {
+            error!("Failed to start HTTP server, error: {error}");
+            return;
+        }
+
+        let server = server.unwrap();
+        if let Err(error) = server
             .serve(app.into_make_service_with_connect_info::<SocketAddr>())
             .await
         {

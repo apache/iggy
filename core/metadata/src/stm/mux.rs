@@ -15,5 +15,85 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#[expect(unused)]
-struct MuxStateMachine {}
+use crate::stm::{State, StateMachine};
+use iggy_common::{header::PrepareHeader, message::Message};
+
+// MuxStateMachine that proxies to an tuple of variadic state machines
+pub struct MuxStateMachine<T>
+where
+    T: StateMachine,
+{
+    inner: T,
+}
+
+impl<T> MuxStateMachine<T>
+where
+    T: StateMachine,
+{
+    pub fn new(inner: T) -> Self {
+        Self { inner }
+    }
+}
+
+impl<T> StateMachine for MuxStateMachine<T>
+where
+    T: StateMachine,
+{
+    type Input = T::Input;
+    type Output = T::Output;
+
+    fn update(&self, input: &Self::Input, output: &mut Vec<Self::Output>) {
+        self.inner.update(input, output);
+    }
+}
+
+//TODO: Move to common
+#[macro_export]
+macro_rules! variadic {
+    () => ( () );
+    (...$a:ident  $(,)? ) => ( $a );
+    (...$a:expr  $(,)? ) => ( $a );
+    ($a:ident  $(,)? ) => ( ($a, ()) );
+    ($a:expr  $(,)? ) => ( ($a, ()) );
+    ($a:ident,  $( $b:tt )+) => ( ($a, variadic!( $( $b )* )) );
+    ($a:expr,  $( $b:tt )+) => ( ($a, variadic!( $( $b )* )) );
+}
+
+// Base case of the recursive resolution.
+impl StateMachine for () {
+    type Input = Message<PrepareHeader>;
+    // TODO: Make sure that the `Output` matches to the output type of the rest of list.
+    type Output = ();
+
+    fn update(&self, _input: &Self::Input, _output: &mut Vec<Self::Output>) {}
+}
+
+// Recursive case: process head and recurse on tail
+impl<O, S, Rest> StateMachine for variadic!(S, ...Rest)
+where
+    S: State<Output = O>,
+    Rest: StateMachine<Input = Message<PrepareHeader>, Output = O>,
+{
+    type Input = Message<PrepareHeader>;
+    type Output = O;
+
+    fn update(&self, input: &Self::Input, output: &mut Vec<Self::Output>) {
+        if let Some(result) = self.0.apply() {
+            output.push(result);
+        }
+        self.1.update(input, output)
+    }
+}
+
+mod tests {
+
+    #[test]
+    fn construct_mux_state_machine_from_states_with_same_output() {
+        use crate::stm::*;
+
+        let users = user::Users {};
+        let streams = stream::Streams {};
+        let cgs = consumer_group::ConsumerGroups {};
+        let _mux = mux::MuxStateMachine::new(variadic!(users, streams, cgs));
+    }
+}

@@ -14,8 +14,11 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use consensus::{Consensus, Project, VsrConsensus};
-use iggy_common::{header::PrepareHeader, message::Message};
+use consensus::{Consensus, Project, Sequencer, Status, VsrConsensus};
+use iggy_common::{
+    header::{Command2, PrepareHeader},
+    message::Message,
+};
 use journal::Journal;
 use tracing::{debug, warn};
 
@@ -25,7 +28,10 @@ trait Metadata {
     type Consensus: Consensus;
     type Journal: Journal<Entry = <Self::Consensus as Consensus>::ReplicateMessage>;
 
+    /// Handle a replicate message (Prepare in VSR).
     fn on_request(&self, message: <Self::Consensus as Consensus>::RequestMessage);
+
+    /// Handle an ack message (PrepareOk in VSR).
     fn on_replicate(
         &self,
         message: <Self::Consensus as Consensus>::ReplicateMessage,
@@ -43,7 +49,7 @@ struct IggyMetadata<M, J, S> {
 
 impl<M, J, S> Metadata for IggyMetadata<M, J, S>
 where
-    J: Journal<Entry = <VsrConsensus as Consensus>::ReplicateMessage>,
+    J: Journal<Entry = <VsrConsensus as Consensus>::ReplicateMessage, Header = PrepareHeader>,
 {
     type Consensus = VsrConsensus;
     type Journal = J;
@@ -55,28 +61,99 @@ where
     }
 
     async fn on_replicate(&self, message: <Self::Consensus as Consensus>::ReplicateMessage) {
+        let header = message.header();
+
+        assert_eq!(header.command, Command2::Prepare);
+
         if !self.fence_old_prepare(&message) {
             self.replicate(message.clone());
         } else {
             warn!("received old prepare, not replicating");
         }
 
+        // If syncing, ignore the replicate message.
+        if self.consensus.is_syncing() {
+            warn!(
+                replica = self.consensus.replica(),
+                "on_replicate: ignoring (sync)"
+            );
+            return;
+        }
+
+        let current_op = self.consensus.sequencer().current_sequence();
+
+        // Old message (handle as repair). Not replicating.
+        if header.view < self.consensus.view()
+            || (self.consensus.status() == Status::Normal
+                && header.view == self.consensus.view()
+                && header.op <= current_op)
+        {
+            debug!(
+                replica = self.consensus.replica(),
+                "on_replicate: ignoring (repair)"
+            );
+            self.on_repair(message);
+            return;
+        }
+
+        // If status is not normal, ignore the replicate.
+        if self.consensus.status() != Status::Normal {
+            warn!(
+                replica = self.consensus.replica(),
+                "on_replicate: ignoring (not normal state)"
+            );
+            return;
+        }
+
+        //if message from future view, we ignore the replicate.
+        if header.view > self.consensus.view() {
+            warn!(
+                replica = self.consensus.replica(),
+                "on_replicate: ignoring (newer view)"
+            );
+            return;
+        }
+
+        // TODO add assertions for valid state here.
+
+        // If we are a follower, we advance the commit number.
         if self.consensus.is_follower() {
             self.consensus
                 .advance_commit_number(message.header().commit);
         }
-        //self.consensus.update_op(header.op());
+
+        // TODO verify that the current prepare fits in the WAL.
+
+        // TODO handle gap in ops.
+
+        // Verify hash chain integrity.
+        if let Some(previous) = self.journal.previous_entry(header) {
+            self.panic_if_hash_chain_would_break_in_same_view(&previous, header);
+        }
+
+        assert_eq!(header.op, current_op + 1);
+
+        self.consensus.sequencer().set_sequence(header.op);
+        self.journal.set_header_as_dirty(header);
+
+        // Append to journal.
         self.journal.append(message).await;
+
+        // If follower, commit any newly committable entries.
+        if self.consensus.is_follower() {
+            self.commit_journal();
+        }
     }
 
     fn on_ack(&self, _message: <Self::Consensus as Consensus>::AckMessage) {
+        // TODO: Implement on_prepare_ok logic
         todo!()
     }
 }
 
 impl<M, J, S> IggyMetadata<M, J, S>
 where
-    J: Journal<Entry = <VsrConsensus as Consensus>::ReplicateMessage>,
+    J: Journal<Entry = <VsrConsensus as Consensus>::ReplicateMessage, Header = PrepareHeader>,
 {
     #[expect(unused)]
     fn pipeline_prepare(&self, prepare: Message<PrepareHeader>) {
@@ -88,12 +165,43 @@ where
         self.consensus.post_replicate_verify(&prepare);
     }
 
-    fn fence_old_prepare(&self, _prepare: &Message<PrepareHeader>) -> bool {
-        // TODO
-        false
+    fn fence_old_prepare(&self, prepare: &Message<PrepareHeader>) -> bool {
+        let header = prepare.header();
+        header.op <= self.consensus.commit() || self.journal.has_prepare(header)
     }
 
     fn replicate(&self, _prepare: Message<PrepareHeader>) {
+        // TODO Forward prepare to next replica in chain.
+        todo!()
+    }
+
+    fn on_repair(&self, _message: Message<PrepareHeader>) {
+        todo!()
+    }
+
+    /// Verify hash chain would not break if we add this header.
+    fn panic_if_hash_chain_would_break_in_same_view(
+        &self,
+        previous: &PrepareHeader,
+        current: &PrepareHeader,
+    ) {
+        // If both headers are in the same view, parent must chain correctly
+        if previous.view == current.view {
+            assert_eq!(
+                current.parent, previous.checksum,
+                "hash chain broken in same view: op={} parent={} expected={}",
+                current.op, current.parent, previous.checksum
+            );
+        }
+    }
+
+    // TODO: Implement jump_to_newer_op
+    // fn jump_to_newer_op(&self, header: &PrepareHeader) {}
+
+    fn commit_journal(&self) {
+        // TODO: Implement commit logic
+        // Walk through journal from last committed to current commit number
+        // Apply each entry to the state machine
         todo!()
     }
 }

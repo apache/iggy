@@ -14,3 +14,15 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+
+use crate::stm::State;
+
+pub struct Streams {}
+
+impl State for Streams {
+    type Output = ();
+
+    fn apply(&self) -> Option<Self::Output> {
+        Some(())
+    }
+}

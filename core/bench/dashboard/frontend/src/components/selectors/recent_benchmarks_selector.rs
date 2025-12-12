@@ -22,8 +22,8 @@ use crate::{
 use bench_dashboard_shared::BenchmarkReportLight;
 use chrono::{DateTime, Utc};
 use gloo::console::log;
+use yew::platform::spawn_local;
 use yew::prelude::*;
-use yew_hooks::use_async;
 
 /// Format a timestamp string as a human-readable relative time (e.g., "2 hours ago")
 fn format_relative_time(timestamp_str: &str) -> String {
@@ -58,38 +58,33 @@ pub fn recent_benchmarks_selector(props: &RecentBenchmarksSelectorProps) -> Html
     let benchmark_ctx = use_benchmark();
 
     let recent_benchmarks = use_state(Vec::<BenchmarkReportLight>::new);
-
-    let fetch_benchmarks = {
-        let recent_benchmarks = recent_benchmarks.clone();
-        let limit = props.limit;
-
-        use_async(async move {
-            match api::fetch_recent_benchmarks(Some(limit)).await {
-                Ok(mut data) => {
-                    data.sort_by(|a, b| {
-                        let parse_a = DateTime::parse_from_rfc3339(&a.timestamp);
-                        let parse_b = DateTime::parse_from_rfc3339(&b.timestamp);
-                        match (parse_a, parse_b) {
-                            (Ok(time_a), Ok(time_b)) => time_b.cmp(&time_a),
-                            _ => std::cmp::Ordering::Equal,
-                        }
-                    });
-                    recent_benchmarks.set(data.clone());
-                    Ok(data)
-                }
-                Err(e) => {
-                    log!(format!("Error fetching recent benchmarks: {}", e));
-                    Err(e)
-                }
-            }
-        })
-    };
+    let is_loading = use_state(|| true);
 
     {
-        let fetch_benchmarks_effect = fetch_benchmarks.clone();
+        let recent_benchmarks = recent_benchmarks.clone();
+        let is_loading = is_loading.clone();
+        let limit = props.limit;
+
         use_effect_with((), move |_| {
-            fetch_benchmarks_effect.run();
-            || ()
+            spawn_local(async move {
+                match api::fetch_recent_benchmarks(Some(limit)).await {
+                    Ok(mut data) => {
+                        data.sort_by(|a, b| {
+                            let parse_a = DateTime::parse_from_rfc3339(&a.timestamp);
+                            let parse_b = DateTime::parse_from_rfc3339(&b.timestamp);
+                            match (parse_a, parse_b) {
+                                (Ok(time_a), Ok(time_b)) => time_b.cmp(&time_a),
+                                _ => std::cmp::Ordering::Equal,
+                            }
+                        });
+                        recent_benchmarks.set(data);
+                    }
+                    Err(e) => {
+                        log!(format!("Error fetching recent benchmarks: {}", e));
+                    }
+                }
+                is_loading.set(false);
+            });
         });
     }
 
@@ -152,7 +147,7 @@ pub fn recent_benchmarks_selector(props: &RecentBenchmarksSelectorProps) -> Html
         <div class="sidebar-tabs">
             <div class="benchmark-list-container close-gap">
                 <div class="benchmark-list-wrapper">
-                if fetch_benchmarks.loading {
+                if *is_loading {
                     <p class="loading-message">{"Loading recent benchmarks..."}</p>
                 } else if filtered_benchmarks.is_empty() {
                     <div class="no-search-results">
