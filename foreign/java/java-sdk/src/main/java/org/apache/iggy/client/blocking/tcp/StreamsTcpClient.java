@@ -22,14 +22,16 @@ package org.apache.iggy.client.blocking.tcp;
 import io.netty.buffer.Unpooled;
 import org.apache.iggy.client.blocking.StreamsClient;
 import org.apache.iggy.identifier.StreamId;
+import org.apache.iggy.serde.BytesDeserializer;
+import org.apache.iggy.serde.BytesSerializer;
+import org.apache.iggy.serde.CommandCode;
 import org.apache.iggy.stream.StreamBase;
 import org.apache.iggy.stream.StreamDetails;
 
 import java.util.List;
 import java.util.Optional;
 
-import static org.apache.iggy.client.blocking.tcp.BytesSerializer.nameToBytes;
-import static org.apache.iggy.client.blocking.tcp.BytesSerializer.toBytes;
+import static org.apache.iggy.serde.BytesSerializer.toBytes;
 
 class StreamsTcpClient implements StreamsClient {
 
@@ -44,7 +46,7 @@ class StreamsTcpClient implements StreamsClient {
         var payloadSize = 1 + name.length();
         var payload = Unpooled.buffer(payloadSize);
 
-        payload.writeBytes(nameToBytes(name));
+        payload.writeBytes(BytesSerializer.toBytes(name));
         return tcpClient.exchangeForEntity(CommandCode.Stream.CREATE, payload, BytesDeserializer::readStreamDetails);
     }
 
@@ -66,7 +68,7 @@ class StreamsTcpClient implements StreamsClient {
         var payload = Unpooled.buffer(payloadSize + idBytes.capacity());
 
         payload.writeBytes(idBytes);
-        payload.writeBytes(nameToBytes(name));
+        payload.writeBytes(BytesSerializer.toBytes(name));
         tcpClient.send(CommandCode.Stream.UPDATE, payload);
     }
 

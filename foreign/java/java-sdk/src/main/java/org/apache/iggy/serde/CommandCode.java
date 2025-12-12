@@ -17,8 +17,12 @@
  * under the License.
  */
 
-package org.apache.iggy.client.blocking.tcp;
+package org.apache.iggy.serde;
 
+/**
+ * TCP command codes for Iggy wire protocol.
+ * Used by both blocking and async TCP clients.
+ */
 public interface CommandCode {
 
     int getValue();

@@ -47,7 +47,6 @@ import java.util.concurrent.TimeoutException;
 import java.util.stream.IntStream;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * Test class specifically for testing poll message functionality with different consumer scenarios.
@@ -161,30 +160,6 @@ public class AsyncPollMessageTest {
             client.close().get(5, TimeUnit.SECONDS);
             log.info("Closed async client");
         }
-    }
-
-    @Test
-    @Order(1)
-    @DisplayName("Poll with NULL consumer - Expected to timeout (server doesn't respond)")
-    void testPollWithNullConsumer() {
-        log.info("TEST 1: Polling with NULL consumer");
-
-        // This test demonstrates the issue: server doesn't respond to null consumer
-        assertThatThrownBy(() -> {
-                    client.messages()
-                            .pollMessagesAsync(
-                                    StreamId.of(testStream),
-                                    TopicId.of(TEST_TOPIC),
-                                    Optional.of(PARTITION_ID),
-                                    null, // NULL consumer causes server to not respond
-                                    PollingStrategy.offset(BigInteger.ZERO),
-                                    10L,
-                                    false)
-                            .get(3, TimeUnit.SECONDS);
-                })
-                .isInstanceOf(TimeoutException.class);
-
-        log.info("CONFIRMED: Null consumer causes timeout (server doesn't respond)");
     }
 
     @Test

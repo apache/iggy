@@ -21,7 +21,6 @@ package org.apache.iggy.client.async.tcp;
 
 import io.netty.buffer.Unpooled;
 import org.apache.iggy.client.async.MessagesClient;
-import org.apache.iggy.client.blocking.tcp.CommandCode;
 import org.apache.iggy.consumergroup.Consumer;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
@@ -29,12 +28,14 @@ import org.apache.iggy.message.Message;
 import org.apache.iggy.message.Partitioning;
 import org.apache.iggy.message.PolledMessages;
 import org.apache.iggy.message.PollingStrategy;
+import org.apache.iggy.serde.BytesDeserializer;
+import org.apache.iggy.serde.CommandCode;
 
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 
-import static org.apache.iggy.client.async.tcp.AsyncBytesSerializer.toBytes;
+import static org.apache.iggy.serde.BytesSerializer.toBytes;
 
 /**
  * Async TCP implementation of MessagesClient using Netty for non-blocking I/O.
@@ -57,7 +58,6 @@ public class MessagesTcpClient implements MessagesClient {
             Long count,
             boolean autoCommit) {
 
-        // Build the request payload
         var payload = Unpooled.buffer();
 
         var consumerBytes = toBytes(consumer);
@@ -83,7 +83,7 @@ public class MessagesTcpClient implements MessagesClient {
                 .sendAsync(CommandCode.Messages.POLL.getValue(), payload)
                 .thenApply(response -> {
                     try {
-                        return AsyncBytesDeserializer.readPolledMessages(response);
+                        return BytesDeserializer.readPolledMessages(response);
                     } finally {
                         response.release();
                     }
