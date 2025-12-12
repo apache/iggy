@@ -289,14 +289,6 @@ impl IggyShard {
         self.shards.len() as u32
     }
 
-    // pub async fn handle_shard_message(&self, message: ShardMessage) -> Option<ShardResponse> {
-    //     handlers::handle_shard_message(self, message).await
-    // }
-
-    // pub(crate) async fn handle_event(&self, event: ShardEvent) -> Result<(), IggyError> {
-    //     handlers::handle_event(self, event).await
-    // }
-
     pub fn ensure_authenticated(&self, session: &Session) -> Result<(), IggyError> {
         if !session.is_active() {
             error!("{COMPONENT} - session is inactive, session: {session}");
