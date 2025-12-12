@@ -129,6 +129,7 @@ impl Default for TcpConfig {
             ipv6: SERVER_CONFIG.tcp.ipv_6,
             tls: TcpTlsConfig::default(),
             socket: TcpSocketConfig::default(),
+            socket_migration: SERVER_CONFIG.tcp.socket_migration,
         }
     }
 }
