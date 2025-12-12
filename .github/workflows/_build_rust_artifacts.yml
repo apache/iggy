@@ -259,6 +259,7 @@ jobs:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
+          pattern: "*-unknown-linux-*"
           path: dist
           merge-multiple: true
 
