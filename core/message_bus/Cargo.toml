@@ -30,5 +30,3 @@ readme = "../../../README.md"
 [dependencies]
 iggy_common = { workspace = true }
 rand = { workspace = true }
-
-
