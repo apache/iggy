@@ -54,6 +54,7 @@ fast-async-mutex = { version = "0.6.7", optional = true }
 figment = { workspace = true }
 human-repr = { workspace = true }
 humantime = { workspace = true }
+libc = { workspace = true }
 once_cell = { workspace = true }
 rcgen = "0.14.5"
 rustls = { workspace = true }
@@ -67,7 +68,6 @@ toml = { workspace = true }
 tracing = { workspace = true }
 tungstenite = { workspace = true }
 twox-hash = { workspace = true }
-libc = { workspace = true }
 
 [dev-dependencies]
 serial_test = { workspace = true }
