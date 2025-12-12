@@ -15,17 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-// TODO: We already have a `Journal` trait inside of the `storage` module `journal.rs` file.
-// But the interface was designed for partition log, not an generic journal.
-pub trait Journal {
-    type Entry;
-    type Header;
+use crate::stm::State;
 
-    fn has_prepare(&self, header: &Self::Header) -> bool;
+pub struct Users {}
 
-    fn previous_entry(&self, header: &Self::Header) -> Option<Self::Header>;
+impl State for Users {
+    type Output = ();
 
-    fn set_header_as_dirty(&self, header: &Self::Header);
-
-    fn append(&self, entry: Self::Entry) -> impl Future<Output = ()>;
+    fn apply(&self) -> Option<Self::Output> {
+        Some(())
+    }
 }

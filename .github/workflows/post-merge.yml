@@ -95,9 +95,9 @@ jobs:
           version: edge
           dry_run: ${{ github.event.repository.fork }} # forks: always dry-run
 
-  build-rust-binaries:
-    name: Build Rust binaries
-    uses: ./.github/workflows/_build_rust_binaries.yml
+  build-artifacts:
+    name: Build artifacts
+    uses: ./.github/workflows/_build_rust_artifacts.yml
     with:
       version: edge
       upload_artifacts: true
@@ -105,8 +105,8 @@ jobs:
   create-prerelease:
     name: Create edge pre-release
     runs-on: ubuntu-latest
-    needs: build-rust-binaries
-    if: needs.build-rust-binaries.result == 'success' && !github.event.repository.fork
+    needs: build-artifacts
+    if: needs.build-artifacts.result == 'success' && !github.event.repository.fork
     permissions:
       contents: write
     steps:
@@ -119,38 +119,32 @@ jobs:
           server_version=$(scripts/extract-version.sh rust-server)
           echo "server_version=${server_version}" >> "$GITHUB_OUTPUT"
 
-      - name: Download edge artifacts
+      - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
-          name: rust-binaries-all
+          name: rust-artifacts-all
           path: ./artifacts
 
-      - name: Delete existing edge release
+      - name: Delete existing edge release and tag
         env:
           GH_TOKEN: ${{ github.token }}
-        shell: bash
         run: |
-          set -euo pipefail
           if gh release view edge &>/dev/null; then
-            echo "Deleting existing edge release..."
-            if ! gh release delete edge --yes; then
-              echo "Release delete failed (likely already deleted by concurrent run), continuing."
-            fi
-          else
-            echo "No existing edge release to delete"
+            echo "Deleting existing edge release and tag..."
+            gh release delete edge --cleanup-tag --yes || echo "Delete failed, continuing..."
           fi
 
       - name: Create edge pre-release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: edge
-          name: Edge (latest)
+          name: edge
           draft: false
           prerelease: true
           make_latest: false
-          files: artifacts/**/*.tar.gz
+          files: artifacts/*.tar.gz
           body: |
-            Rolling edge build of Apache Iggy binaries.
+            Rolling edge build of Apache Iggy binaries and connector plugins.
 
             **This release is automatically updated on every push to master.**
 
@@ -158,13 +152,32 @@ jobs:
             - `iggy-server` - The server binary
             - `iggy` - The command-line interface
             - `iggy-bench` - The benchmarking tool
+            - `iggy-connectors` - The connectors runtime
+
+            ## Connector plugins included (.so)
+            - `iggy_connector_elasticsearch_sink`
+            - `iggy_connector_elasticsearch_source`
+            - `iggy_connector_iceberg_sink`
+            - `iggy_connector_postgres_sink`
+            - `iggy_connector_postgres_source`
+            - `iggy_connector_quickwit_sink`
+            - `iggy_connector_random_source`
+            - `iggy_connector_stdout_sink`
 
             ## Downloads
-            - `iggy-x86_64-unknown-linux-gnu-edge.tar.gz` - Linux (glibc)
-            - `iggy-x86_64-unknown-linux-musl-edge.tar.gz` - Linux (musl, static)
+
+            ### Binaries
+            - `iggy-x86_64-unknown-linux-gnu-edge.tar.gz` - Linux x86_64 (glibc)
+            - `iggy-x86_64-unknown-linux-musl-edge.tar.gz` - Linux x86_64 (musl, static)
+            - `iggy-aarch64-unknown-linux-gnu-edge.tar.gz` - Linux ARM64 (glibc)
+            - `iggy-aarch64-unknown-linux-musl-edge.tar.gz` - Linux ARM64 (musl, static)
+
+            ### Connector plugins
+            - `iggy-connectors-x86_64-unknown-linux-gnu-edge.tar.gz` - Linux x86_64 (glibc)
+            - `iggy-connectors-aarch64-unknown-linux-gnu-edge.tar.gz` - Linux ARM64 (glibc)
 
             ## Build info
             - Server version: ${{ steps.meta.outputs.server_version }}
             - Commit: ${{ github.sha }}
 
-            ⚠️ **Not an official ASF release** - for development/testing only.
+            **Not an official ASF release** - for development/testing only.
