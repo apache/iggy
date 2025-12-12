@@ -30,7 +30,7 @@ use server::bootstrap::{
     create_directories, create_shard_connections, create_shard_executor, load_config, load_streams,
     load_users, resolve_persister, update_system_info,
 };
-use server::configs::sharding::CpuAllocation;
+use server::configs::sharding::ShardAllocator;
 use server::diagnostics::{print_io_uring_permission_info, print_locked_memory_limit_info};
 use server::io::fs_utils;
 use server::log::logger::Logging;
@@ -49,7 +49,6 @@ use server::streaming::diagnostics::metrics::Metrics;
 use server::streaming::storage::SystemStorage;
 use server::streaming::utils::ptr::EternalPtr;
 use server::versioning::SemanticVersion;
-use std::collections::HashSet;
 use std::panic::AssertUnwindSafe;
 use std::rc::Rc;
 use std::str::FromStr;
@@ -284,24 +283,8 @@ fn main() -> Result<(), ServerError> {
         let users = load_users(users_state.into_values());
 
         // ELEVENTH DISCRETE LOADING STEP.
-        let shards_set = config.system.sharding.cpu_allocation.to_shard_set();
-        match &config.system.sharding.cpu_allocation {
-            CpuAllocation::All => {
-                info!(
-                    "Using all available CPU cores ({} shards with affinity)",
-                    shards_set.len()
-                );
-            }
-            CpuAllocation::Count(count) => {
-                info!("Using {count} shards with affinity to cores 0..{count}");
-            }
-            CpuAllocation::Range(start, end) => {
-                info!(
-                    "Using {} shards with affinity to cores {start}..{end}",
-                    end - start
-                );
-            }
-        }
+        let shard_allocator = ShardAllocator::new(&config.system.sharding.cpu_allocation)?;
+        let shard_assignment = shard_allocator.to_shard_assignments()?;
 
         #[cfg(feature = "disable-mimalloc")]
         warn!("Using default system allocator because code was build with `disable-mimalloc` feature");
@@ -313,9 +296,9 @@ fn main() -> Result<(), ServerError> {
         let metrics = Metrics::init();
 
         // TWELFTH DISCRETE LOADING STEP.
-        let shards_count = shards_set.len();
-        info!("Starting {} shard(s)", shards_count);
-        let (connections, shutdown_handles) = create_shard_connections(&shards_set);
+        info!("Starting {} shard(s)", shard_assignment.len());
+        let (connections, shutdown_handles) = create_shard_connections(&shard_assignment);
+        let shards_count = shard_assignment.len();
         let mut handles: Vec<JoinHandle<()>> = Vec::with_capacity(shards_count);
 
         // Channel for shard completion notifications
@@ -348,7 +331,7 @@ fn main() -> Result<(), ServerError> {
                                 let ns = IggyNamespace::new(stream_id, topic_id, partition_id);
                                 let shard_id = ShardId::new(calculate_shard_assignment(
                                     &ns,
-                                    shards_set.len() as u32,
+                                    shard_assignment.len() as u32,
                                 ));
                                 shards_table.insert(ns, shard_id);
                             }
@@ -358,10 +341,10 @@ fn main() -> Result<(), ServerError> {
             }
         });
 
-        for (id, cpu_id) in shards_set
+        for (id, assignment) in shard_assignment
             .into_iter()
             .enumerate()
-            .map(|(idx, cpu)| (idx as u16, cpu))
+            .map(|(idx, assignment)| (idx as u16, assignment))
         {
             let streams = streams.clone();
             let shards_table = shards_table.clone();
@@ -412,8 +395,11 @@ fn main() -> Result<(), ServerError> {
                 .name(format!("shard-{id}"))
                 .spawn(move || {
                     let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                        let affinity_set = HashSet::from([cpu_id]);
-                        let rt = create_shard_executor(affinity_set);
+                        if let Err(e) = assignment.bind_memory() {
+                            error!("Failed to bind memory: {e:?}");
+                        }
+
+                        let rt = create_shard_executor(assignment.cpu_set);
                         rt.block_on(async move {
                             let builder = IggyShard::builder();
                             let shard = builder
@@ -438,6 +424,7 @@ fn main() -> Result<(), ServerError> {
                                 return Err(e.to_string());
                             }
                             info!("Shard {id} run completed");
+
                             Ok(())
                         })
                     }));
