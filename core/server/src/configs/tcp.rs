@@ -28,6 +28,7 @@ pub struct TcpConfig {
     pub ipv6: bool,
     pub tls: TcpTlsConfig,
     pub socket: TcpSocketConfig,
+    pub socket_migration: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
