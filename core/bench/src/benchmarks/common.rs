@@ -169,16 +169,30 @@ pub fn build_consumer_futures(
         PollingKind::Offset
     };
     let origin_timestamp_latency_calculation = match args.kind() {
-        BenchmarkKind::PinnedConsumer
-        | BenchmarkKind::PinnedProducerAndConsumer
-        | BenchmarkKind::BalancedConsumerGroup => false, // TODO(hubcio): in future, PinnedProducerAndConsumer can also be true
-        BenchmarkKind::BalancedProducerAndConsumerGroup => true,
+        BenchmarkKind::PinnedConsumer | BenchmarkKind::BalancedConsumerGroup => false,
+        BenchmarkKind::PinnedProducerAndConsumer
+        | BenchmarkKind::BalancedProducerAndConsumerGroup => true,
         _ => unreachable!(),
     };
 
     let global_finish_condition =
         BenchmarkFinishCondition::new(args, BenchmarkFinishConditionMode::Shared);
-    let rate_limit = rate_limit_per_actor(args.rate_limit(), actors);
+    // When measuring true E2E latency, apply read_amplification multiplier to consumer rate
+    // to ensure they can keep up with producers and not inflate latency due to queue buildup
+    let read_amplification = args.read_amplification().unwrap_or(1.0);
+    let rate_limit = rate_limit_per_actor(args.rate_limit(), actors).map(|rl| {
+        if origin_timestamp_latency_calculation {
+            #[allow(
+                clippy::cast_sign_loss,
+                clippy::cast_possible_truncation,
+                clippy::cast_precision_loss
+            )]
+            let amplified = (rl.as_bytes_u64() as f64 * f64::from(read_amplification)) as u64;
+            IggyByteSize::from(amplified)
+        } else {
+            rl
+        }
+    });
     let use_high_level_api = args.high_level_api();
 
     (1..=consumers)
@@ -252,14 +266,7 @@ pub fn build_producing_consumers_futures(
                 &args,
                 BenchmarkFinishConditionMode::PerProducingConsumer,
             );
-            let origin_timestamp_latency_calculation = match args.kind() {
-                BenchmarkKind::PinnedConsumer
-                | BenchmarkKind::PinnedProducerAndConsumer
-                | BenchmarkKind::BalancedConsumerGroup  // TODO(hubcio): in future, PinnedProducerAndConsumer can also be true
-                | BenchmarkKind::EndToEndProducingConsumer => false,
-                BenchmarkKind::BalancedProducerAndConsumerGroup => true,
-                _ => unreachable!(),
-            };
+            let origin_timestamp_latency_calculation = true;
             let use_high_level_api = args.high_level_api();
             let rate_limit = rate_limit_per_actor(args.rate_limit(), producing_consumers);
 
@@ -344,18 +351,12 @@ pub fn build_producing_consumer_groups_futures(
             };
 
             let consumer_group_id = if should_consume {
-                Some(start_consumer_group_id + 1 + (actor_id % cg_count))
+                // Each stream has exactly one CG, server assigns IDs starting from 0
+                Some(start_consumer_group_id)
             } else {
                 None
             };
-            let origin_timestamp_latency_calculation = match args.kind() {
-                BenchmarkKind::PinnedConsumer
-                | BenchmarkKind::PinnedProducerAndConsumer
-                | BenchmarkKind::BalancedConsumerGroup  // TODO(hubcio): in future, PinnedProducerAndConsumer can also be true
-                | BenchmarkKind::EndToEndProducingConsumer => false,
-                BenchmarkKind::BalancedProducerAndConsumerGroup => true,
-                _ => unreachable!(),
-            };
+            let origin_timestamp_latency_calculation = true;
 
             async move {
                 let actor_type = match (should_produce, should_consume) {
