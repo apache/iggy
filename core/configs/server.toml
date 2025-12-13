@@ -366,6 +366,10 @@ file_enabled = true
 # Maximum size of the log files before rotation.
 max_size = "512 MB"
 
+# Maximum total size of all log files combined.
+# When this size is reached, oldest files will be deleted.
+max_total_size = "10 GB"
+
 # Time to retain log files before deletion.
 retention = "7 days"
 

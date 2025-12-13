@@ -103,8 +103,8 @@ rand = { workspace = true }
 reqwest = { workspace = true, features = ["rustls-tls-no-provider"] }
 ring = "0.17.14"
 ringbuffer = "0.16.0"
-rolling-file = "0.2.0"
 rmp-serde = { workspace = true }
+rolling-file = "0.2.0"
 rust-embed = { version = "8.9.0", optional = true }
 rustls = { workspace = true }
 rustls-pemfile = "2.2.0"

@@ -31,11 +31,13 @@ use opentelemetry_sdk::logs::log_processor_with_async_runtime;
 use opentelemetry_sdk::propagation::TraceContextPropagator;
 use opentelemetry_sdk::trace::span_processor_with_async_runtime;
 use rolling_file::{BasicRollingFileAppender, RollingConditionBasic};
+use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tracing::{info, trace};
+use tracing::{debug, error, info, trace, warn};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_opentelemetry::OpenTelemetryLayer;
 use tracing_subscriber::field::{RecordFields, VisitOutput};
@@ -49,15 +51,17 @@ use tracing_subscriber::{
 };
 
 const IGGY_LOG_FILE_PREFIX: &str = "iggy-server.log";
+const MIN_DISK_SPACE_BYTES: u64 = 10 * 1024 * 1024;
+const LOG_ROTATION_CHECK_INTERVAL_SECONDS: u64 = 3600;
 
 // Writer that does nothing
 struct NullWriter;
 impl Write for NullWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         Ok(buf.len())
     }
 
-    fn flush(&mut self) -> std::io::Result<()> {
+    fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
 }
@@ -65,13 +69,13 @@ impl Write for NullWriter {
 // Wrapper around Arc<Mutex<Vec<String>>> to implement Write
 struct VecStringWriter(Arc<Mutex<Vec<String>>>);
 impl Write for VecStringWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let mut lock = self.0.lock().unwrap();
         lock.push(String::from_utf8_lossy(buf).into_owned());
         Ok(buf.len())
     }
 
-    fn flush(&mut self) -> std::io::Result<()> {
+    fn flush(&mut self) -> io::Result<()> {
         // Just nop, we don't need to flush anything
         Ok(())
     }
@@ -130,6 +134,7 @@ pub struct Logging {
     otel_traces_reload_handle: Option<ReloadHandle<FilteredRegistry>>,
 
     early_logs_buffer: Arc<Mutex<Vec<String>>>,
+    rotation_should_stop: Arc<AtomicBool>,
 }
 
 impl Logging {
@@ -143,6 +148,7 @@ impl Logging {
             otel_logs_reload_handle: None,
             otel_traces_reload_handle: None,
             early_logs_buffer: Arc::new(Mutex::new(vec![])),
+            rotation_should_stop: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -215,7 +221,7 @@ impl Logging {
         // Use the rolling appender to avoid having a huge log file.
         // Make sure logs are dumped to the file during graceful shutdown.
 
-        trace!("Logging config: {}", config);
+        trace!("Logging config: {config}");
 
         // Reload EnvFilter with config level if RUST_LOG is not set.
         // Config level supports EnvFilter syntax (e.g., "warn,server=debug,iggy=trace").
@@ -234,7 +240,7 @@ impl Logging {
         };
 
         // Initialize non-blocking stdout layer
-        let (non_blocking_stdout, stdout_guard) = tracing_appender::non_blocking(std::io::stdout());
+        let (non_blocking_stdout, stdout_guard) = tracing_appender::non_blocking(io::stdout());
         let stdout_layer = fmt::Layer::default()
             .with_ansi(true)
             .event_format(Self::get_log_format())
@@ -254,32 +260,30 @@ impl Logging {
         let logs_path = if config.file_enabled {
             let base_directory = PathBuf::from(base_directory);
             let logs_subdirectory = PathBuf::from(config.path.clone());
-            let logs_path = base_directory.join(logs_subdirectory.clone());
+            let logs_subdirectory = logs_subdirectory
+                .canonicalize()
+                .unwrap_or(logs_subdirectory);
+            let logs_path = base_directory.join(logs_subdirectory);
 
-            if let Err(e) = std::fs::create_dir_all(&logs_path) {
-                tracing::warn!("Failed to create logs directory {:?}: {}", logs_path, e);
+            if let Err(e) = fs::create_dir_all(&logs_path) {
+                warn!("Failed to create logs directory {logs_path:?}: {e}");
                 return Err(LogError::FileReloadFailure);
             }
 
             // Check available disk space (at least 10MB)
-            let min_disk_space: u64 = 10 * 1024 * 1024; // 10MB
+            let min_disk_space: u64 = MIN_DISK_SPACE_BYTES;
             if let Ok(available_space) = fs2::available_space(&logs_path) {
                 if available_space < min_disk_space {
-                    tracing::warn!(
-                        "Low disk space for logs. Available: {} bytes, Recommended: {} bytes",
-                        available_space,
-                        min_disk_space
+                    warn!(
+                        "Low disk space for logs. Available: {available_space} bytes, Recommended: {min_disk_space} bytes"
                     );
                 }
             } else {
-                tracing::warn!(
-                    "Failed to check available disk space for logs directory: {:?}",
-                    logs_path
-                );
+                warn!("Failed to check available disk space for logs directory: {logs_path:?}");
             }
 
             let max_files = Self::calculate_max_files(
-                config.max_size.as_bytes_u64(),
+                config.max_total_size.as_bytes_u64(),
                 config.max_size.as_bytes_u64(),
             );
 
@@ -293,7 +297,7 @@ impl Logging {
                 max_files,
             )
             .map_err(|e| {
-                tracing::error!("Failed to create file appender: {}", e);
+                error!("Failed to create file appender: {e}");
                 LogError::FileReloadFailure
             })?;
 
@@ -431,8 +435,8 @@ impl Logging {
             .expect("Failed to modify telemetry traces layer");
 
         info!(
-            "Telemetry initialized with service name: {}",
-            telemetry_config.service_name
+            "Telemetry initialized with service name: {config_service_name}",
+            config_service_name = telemetry_config.service_name
         );
         Ok(())
     }
@@ -448,8 +452,7 @@ impl Logging {
             let rust_version = option_env!("VERGEN_RUSTC_SEMVER").unwrap_or("unknown");
             let target = option_env!("VERGEN_CARGO_TARGET_TRIPLE").unwrap_or("unknown");
             info!(
-                "Version: {VERSION}, hash: {}, built at: {} using rust version: {} for target: {}",
-                hash, built_at, rust_version, target
+                "Version: {VERSION}, hash: {hash}, built at: {built_at} using rust version: {rust_version} for target: {target}"
             );
         } else {
             info!(
@@ -467,46 +470,42 @@ impl Logging {
         max_files.clamp(1, 1000) as usize
     }
 
-    // Use a mutex lock to ensure log rotation operations do not produce race conditions.
     fn _install_log_rotation_handler(&self, config: &LoggingConfig, logs_path: Option<&PathBuf>) {
         if let Some(logs_path) = logs_path {
             let path = logs_path.to_path_buf();
             let max_size = config.max_size.as_bytes_u64();
             let retention = config.retention.get_duration();
-            let rotation_mutex = Arc::new(Mutex::new(()));
-            let rotation_mutex_clone = Arc::clone(&rotation_mutex);
+            let should_stop = Arc::clone(&self.rotation_should_stop);
+
             std::thread::spawn(move || {
                 loop {
-                    std::thread::sleep(Duration::from_secs(3600));
-                    match rotation_mutex_clone.lock() {
-                        Ok(_guard) => {
-                            Self::cleanup_log_files(&path, retention, max_size);
-                        }
-                        Err(e) => {
-                            tracing::warn!("Failed to acquire log rotation lock: {:?}", e);
-                        }
+                    if should_stop.load(Ordering::Relaxed) {
+                        break;
                     }
+
+                    std::thread::sleep(Duration::from_secs(LOG_ROTATION_CHECK_INTERVAL_SECONDS));
+
+                    if should_stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+
+                    Self::cleanup_log_files(&path, retention, max_size);
                 }
             });
         }
     }
 
-    fn cleanup_log_files(logs_path: &PathBuf, retention: Duration, max_size_bytes: u64) {
+    fn read_log_files(
+        logs_path: &PathBuf,
+    ) -> Vec<(fs::DirEntry, std::time::SystemTime, Duration, u64)> {
         use std::fs;
-        use std::time::{SystemTime, UNIX_EPOCH};
-
-        tracing::debug!(
-            "Starting log cleanup for directory: {:?}, retention: {:?}, max_size: {} bytes",
-            logs_path,
-            retention,
-            max_size_bytes
-        );
+        use std::time::UNIX_EPOCH;
 
         let entries = match fs::read_dir(logs_path) {
             Ok(entries) => entries,
             Err(e) => {
-                tracing::warn!("Failed to read log directory {:?}: {}", logs_path, e);
-                return;
+                warn!("Failed to read log directory {logs_path:?}: {e}");
+                return Vec::new();
             }
         };
 
@@ -516,7 +515,10 @@ impl Logging {
             let metadata = match entry.metadata() {
                 Ok(metadata) => metadata,
                 Err(e) => {
-                    tracing::warn!("Failed to get metadata for {:?}: {}", entry.path(), e);
+                    warn!(
+                        "Failed to get metadata for {entry_path:?}: {e}",
+                        entry_path = entry.path()
+                    );
                     continue;
                 }
             };
@@ -528,10 +530,9 @@ impl Logging {
             let modified = match metadata.modified() {
                 Ok(modified) => modified,
                 Err(e) => {
-                    tracing::warn!(
-                        "Failed to get modification time for {:?}: {}",
-                        entry.path(),
-                        e
+                    warn!(
+                        "Failed to get modification time for {entry_path:?}: {e}",
+                        entry_path = entry.path()
                     );
                     continue;
                 }
@@ -540,10 +541,9 @@ impl Logging {
             let elapsed = match modified.duration_since(UNIX_EPOCH) {
                 Ok(elapsed) => elapsed,
                 Err(e) => {
-                    tracing::warn!(
-                        "Failed to calculate elapsed time for {:?}: {}",
-                        entry.path(),
-                        e
+                    warn!(
+                        "Failed to calculate elapsed time for {entry_path:?}: {e}",
+                        entry_path = entry.path()
                     );
                     continue;
                 }
@@ -553,10 +553,22 @@ impl Logging {
             file_entries.push((entry, modified, elapsed, file_size));
         }
 
-        tracing::debug!(
-            "Processed {} log files from directory: {:?}",
-            file_entries.len(),
-            logs_path
+        file_entries
+    }
+
+    fn cleanup_log_files(logs_path: &PathBuf, retention: Duration, max_size_bytes: u64) {
+        use std::fs;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        debug!(
+            "Starting log cleanup for directory: {logs_path:?}, retention: {retention:?}, max_size: {max_size_bytes} bytes"
+        );
+
+        let mut file_entries = Self::read_log_files(logs_path);
+
+        debug!(
+            "Processed {file_entries_len} log files from directory: {logs_path:?}",
+            file_entries_len = file_entries.len(),
         );
 
         let mut removed_files_count = 0;
@@ -565,7 +577,7 @@ impl Logging {
             let cutoff = match SystemTime::now().duration_since(UNIX_EPOCH) {
                 Ok(now) => now - retention,
                 Err(e) => {
-                    tracing::warn!("Failed to get current time: {}", e);
+                    warn!("Failed to get current time: {e}");
                     return;
                 }
             };
@@ -573,42 +585,56 @@ impl Logging {
             for (entry, _, elapsed, _) in &file_entries {
                 if *elapsed < cutoff {
                     if let Err(e) = fs::remove_file(entry.path()) {
-                        tracing::warn!("Failed to remove old log file {:?}: {}", entry.path(), e);
+                        warn!(
+                            "Failed to remove old log file {entry_path:?}: {e}",
+                            entry_path = entry.path()
+                        );
                     } else {
-                        tracing::debug!("Removed old log file: {:?}", entry.path());
+                        debug!(
+                            "Removed old log file: {entry_path:?}",
+                            entry_path = entry.path()
+                        );
                         removed_files_count += 1;
                     }
                 }
             }
         }
 
-        if max_size_bytes > 0 {
-            let total_size: u64 = file_entries.iter().map(|(_, _, _, size)| *size).sum();
+        if max_size_bytes == 0 {
+            return;
+        }
 
-            if total_size > max_size_bytes {
-                file_entries.sort_by_key(|(_, modified, _, _)| *modified);
+        file_entries = Self::read_log_files(logs_path);
 
-                let mut current_size = total_size;
-                for (entry, _, _, file_size) in file_entries {
-                    if current_size <= max_size_bytes {
-                        break;
-                    }
+        let total_size: u64 = file_entries.iter().map(|(_, _, _, size)| *size).sum();
 
-                    if let Err(e) = fs::remove_file(entry.path()) {
-                        tracing::warn!("Failed to remove log file {:?}: {}", entry.path(), e);
-                    } else {
-                        tracing::debug!("Removed log file to control size: {:?}", entry.path());
-                        current_size = current_size.saturating_sub(file_size);
-                        removed_files_count += 1;
-                    }
+        if total_size > max_size_bytes {
+            file_entries.sort_by_key(|(_, modified, _, _)| *modified);
+
+            let mut current_size = total_size;
+            for (entry, _, _, file_size) in file_entries {
+                if current_size <= max_size_bytes {
+                    break;
+                }
+
+                if let Err(e) = fs::remove_file(entry.path()) {
+                    warn!(
+                        "Failed to remove log file {entry_path:?}: {e}",
+                        entry_path = entry.path()
+                    );
+                } else {
+                    debug!(
+                        "Removed log file to control size: {entry_path:?}",
+                        entry_path = entry.path()
+                    );
+                    current_size = current_size.saturating_sub(file_size);
+                    removed_files_count += 1;
                 }
             }
         }
 
-        tracing::info!(
-            "Completed log cleanup for directory: {:?}. Removed {} files.",
-            logs_path,
-            removed_files_count
+        info!(
+            "Completed log cleanup for directory: {logs_path:?}. Removed {removed_files_count} files."
         );
     }
 }
@@ -616,6 +642,12 @@ impl Logging {
 impl Default for Logging {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for Logging {
+    fn drop(&mut self) {
+        self.rotation_should_stop.store(true, Ordering::Relaxed);
     }
 }
 
@@ -632,5 +664,76 @@ impl<'writer> FormatFields<'writer> for NoAnsiFields {
         let mut a = DefaultVisitor::new(writer, true);
         fields.record(&mut a);
         a.finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_log_directory_creation() {
+        let temp_dir = TempDir::new().expect("Failed to create temporary directory");
+        let base_path = temp_dir.path().to_str().unwrap().to_string();
+        let log_subdir = "test_logs".to_string();
+
+        let log_path = PathBuf::from(&base_path).join(&log_subdir);
+        assert!(!log_path.exists());
+        fs::create_dir_all(&log_path).expect("Failed to create log directory");
+        assert!(log_path.exists());
+    }
+
+    #[test]
+    fn test_disk_space_check() {
+        let temp_dir = TempDir::new().expect("Failed to create temporary directory");
+        let log_path = temp_dir.path();
+        let result = fs2::available_space(log_path);
+        assert!(result.is_ok());
+
+        let available_space = result.unwrap();
+        assert!(available_space > 0);
+    }
+
+    #[test]
+    fn test_calculate_max_files() {
+        assert_eq!(Logging::calculate_max_files(0, 100), 1);
+        assert_eq!(Logging::calculate_max_files(100, 0), 10);
+        assert_eq!(Logging::calculate_max_files(1000, 100), 10);
+        assert_eq!(Logging::calculate_max_files(500, 100), 5);
+        assert_eq!(Logging::calculate_max_files(2000, 100), 20);
+        assert_eq!(Logging::calculate_max_files(1000000, 1), 1000);
+        assert_eq!(Logging::calculate_max_files(50, 100), 1);
+    }
+
+    #[test]
+    fn test_calculate_max_files_with_values() {
+        let total_size = 10 * 1024 * 1024 * 1024; // 10 GB
+        let file_size = 512 * 1024 * 1024; // 512 MB
+        assert_eq!(Logging::calculate_max_files(total_size, file_size), 20);
+
+        let total_size = 5 * 1024 * 1024 * 1024; // 5 GB
+        let file_size = 256 * 1024 * 1024; // 256 MB
+        assert_eq!(Logging::calculate_max_files(total_size, file_size), 20);
+
+        let total_size = 1 * 1024 * 1024 * 1024; // 1 GB
+        let file_size = 100 * 1024 * 1024; // 100 MB
+        assert_eq!(Logging::calculate_max_files(total_size, file_size), 10);
+    }
+
+    #[test]
+    fn test_cleanup_log_files_functions() {
+        use std::time::Duration;
+        let temp_dir = TempDir::new().expect("Failed to create temporary directory");
+        let log_path = temp_dir.path().to_path_buf();
+        Logging::cleanup_log_files(&log_path, Duration::from_secs(3600), 1024 * 1024);
+    }
+
+    #[test]
+    fn test_logging_creation() {
+        let logging = Logging::new();
+        assert!(logging.stdout_guard.is_none());
+        assert!(logging.file_guard.is_none());
+        assert!(logging.env_filter_reload_handle.is_none());
     }
 }

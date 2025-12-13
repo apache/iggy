@@ -88,10 +88,17 @@ pub struct LoggingConfig {
     pub level: String,
     pub file_enabled: bool,
     pub max_size: IggyByteSize,
+    #[serde(default = "default_max_total_log_size")]
+    pub max_total_size: IggyByteSize,
     #[serde_as(as = "DisplayFromStr")]
     pub retention: IggyDuration,
     #[serde_as(as = "DisplayFromStr")]
     pub sysinfo_print_interval: IggyDuration,
+}
+
+fn default_max_total_log_size() -> IggyByteSize {
+    IggyByteSize::from(10 * 1024 * 1024 * 1024)
+    // 10 GiB by default
 }
 
 #[derive(Debug, Deserialize, Serialize)]
