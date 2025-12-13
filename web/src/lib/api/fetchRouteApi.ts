@@ -24,7 +24,7 @@ import { convertBigIntsToStrings } from './convertBigIntsToStrings';
 import { getJson } from './getJson';
 
 export const fetchRouteApi = async (
-  arg: ApiSchema & { queryParams?: Record<string, string> }
+  arg: ApiSchema
 ): Promise<{ data: any; status: number; ok: boolean }> => {
   try {
     const { path, method, queryParams } = arg;
@@ -42,7 +42,8 @@ export const fetchRouteApi = async (
     let fullUrl = `${baseUrl}${path}`;
 
     if (queryParams) {
-      const query = new URLSearchParams(Object.entries(queryParams));
+      const params = Object.entries(queryParams).map(([k, v]) => [k, String(v)]);
+      const query = new URLSearchParams(params);
       fullUrl += '?' + query.toString();
     }
 

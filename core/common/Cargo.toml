@@ -55,7 +55,7 @@ figment = { workspace = true }
 human-repr = { workspace = true }
 humantime = { workspace = true }
 once_cell = { workspace = true }
-rcgen = "0.14.5"
+rcgen = "0.14.6"
 rustls = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
