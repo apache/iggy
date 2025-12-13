@@ -41,25 +41,25 @@
       tab: 'server',
       icon: 'adjustments',
       name: 'Server',
-      href: typedRoute('/dashboard/settings/server')
+      href: resolve(typedRoute('/dashboard/settings/server'))
     },
     {
       tab: 'webUI',
       icon: 'settings',
       name: 'Web UI',
-      href: typedRoute('/dashboard/settings/webUI')
+      href: resolve(typedRoute('/dashboard/settings/webUI'))
     },
     {
       tab: 'users',
       icon: 'usersGroup',
       name: 'Users',
-      href: typedRoute('/dashboard/settings/users')
+      href: resolve(typedRoute('/dashboard/settings/users'))
     }
     // {
     //   name: 'Terminal',
     //   icon: 'terminal',
     //   tab: 'terminal',
-    //   href: typedRoute('/dashboard/settings/terminal')
+    //   href: resolve(typedRoute('/dashboard/settings/terminal'))
     // }
   ] satisfies { tab: Tabs; name: string; icon: iconType; href: string }[];
 </script>
@@ -74,7 +74,7 @@
   {#each tabs as { icon, name, href }, idx (idx)}
     {@const isActive = activeTab === href.split('/').slice(-1)[0]}
     <a
-      href={resolve(href)}
+      {href}
       class={twMerge('pb-3 relative group flex items-center  justify-start gap-2 text-color')}
     >
       <Icon name={icon} class="w-[15px] h-[15px]" />

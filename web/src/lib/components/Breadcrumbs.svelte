@@ -65,7 +65,7 @@
     return { path, label: segment };
   }
 
-  let parts = $derived(page.url.pathname.split('/').filter(Boolean).slice(1));
+  let parts = $derived(page.url.pathname.replace(/^\/ui/, '').split('/').filter(Boolean).slice(1));
 
   let crumbs = $derived(parts.map((segment, index) => formatPathSegment(segment, index, parts)));
 </script>

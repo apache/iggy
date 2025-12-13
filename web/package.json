@@ -5,6 +5,7 @@
   "scripts": {
     "dev": "vite dev --port 3050",
     "build": "vite build",
+    "build:static": "STATIC_BUILD=true PUBLIC_IGGY_API_URL= vite build",
     "preview": "vite preview",
     "server": "vite server",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
@@ -16,6 +17,7 @@
     "@eslint/compat": "^2.0.0",
     "@eslint/js": "^9.39.1",
     "@sveltejs/adapter-node": "^5.4.0",
+    "@sveltejs/adapter-static": "^3.0.0",
     "@sveltejs/kit": "^2.48.5",
     "@sveltejs/vite-plugin-svelte": "^6.2.1",
     "@types/d3-interpolate": "^3.0.4",
@@ -33,7 +35,7 @@
     "prettier-plugin-svelte": "^3.4.0",
     "svelte": "^5.43.6",
     "svelte-check": "^4.3.4",
-    "sveltekit-superforms": "^2.28.1",
+    "sveltekit-superforms": "^2.14.0",
     "tailwindcss": "^4.1.17",
     "ts-toolbelt": "^9.6.0",
     "tslib": "^2.8.1",
@@ -57,7 +59,8 @@
     "uuid": "^13.0.0"
   },
   "overrides": {
-    "cookie": "^0.7.0"
+    "cookie": "^0.7.0",
+    "valibot": "^1.2.0"
   },
   "type": "module"
 }

@@ -17,22 +17,47 @@
  * under the License.
  */
 
-import { fetchIggyApi } from '$lib/api/fetchApi';
-import { handleFetchErrors } from '$lib/api/handleFetchErrors';
+import { browser } from '$app/environment';
+import { goto } from '$app/navigation';
+import { resolve } from '$app/paths';
+import { clientApi } from '$lib/api/clientApi';
+import { authStore } from '$lib/auth/authStore.svelte';
 import { userDetailsMapper } from '$lib/domain/UserDetails';
-import type { LayoutServerLoad } from './$types';
+import { typedRoute } from '$lib/types/appRoutes';
 import { jwtDecode } from 'jwt-decode';
+import type { LayoutLoad } from './$types';
 
-export const load: LayoutServerLoad = async ({ cookies }) => {
+export const load: LayoutLoad = async () => {
+  if (browser) {
+    authStore.initialize();
+  }
+
+  const token = authStore.getAccessToken();
+  if (browser && !token) {
+    goto(resolve(typedRoute('/auth/sign-in')));
+    return { user: null };
+  }
+
   const getDetailedUser = async () => {
-    //always available here, auth hook prevents rendering this page without access_token
-    const accessToken = cookies.get('access_token')!;
-    const userId = jwtDecode(accessToken).sub!;
+    let userId = authStore.userId;
 
-    const userResult = await fetchIggyApi({ method: 'GET', path: `/users/${+userId}`, cookies });
-    const { data } = await handleFetchErrors(userResult, cookies);
+    if (!userId && token) {
+      try {
+        const decoded = jwtDecode(token);
+        userId = decoded.sub ? parseInt(decoded.sub, 10) : null;
+      } catch {
+        return null;
+      }
+    }
 
-    return userDetailsMapper(data);
+    if (!userId) return null;
+
+    try {
+      const data = await clientApi({ method: 'GET', path: `/users/${userId}` });
+      return userDetailsMapper(data);
+    } catch {
+      return null;
+    }
   };
 
   return {

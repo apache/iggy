@@ -17,24 +17,17 @@
  * under the License.
  */
 
-import { fetchIggyApi } from '$lib/api/fetchApi';
-import { handleFetchErrors } from '$lib/api/handleFetchErrors';
-import { topicDetailsMapper } from '$lib/domain/TopicDetails';
+import { clientApi } from '$lib/api/clientApi';
+import { streamMapper, type Stream } from '$lib/domain/Stream';
+import type { LayoutLoad } from './$types';
 
-export const load = async ({ params, cookies }) => {
-  const getTopic = async () => {
-    const result = await fetchIggyApi({
-      method: 'GET',
-      path: `/streams/${+params.streamId}/topics/${+params.topicId}`,
-      cookies
-    });
-
-    const { data } = await handleFetchErrors(result, cookies);
-
-    return topicDetailsMapper(data);
-  };
+export const load: LayoutLoad = async () => {
+  const data = await clientApi<any[]>({
+    method: 'GET',
+    path: '/streams'
+  });
 
   return {
-    topic: await getTopic()
+    streams: (data.map(streamMapper) as Stream[]).sort((a, b) => b.createdAt - a.createdAt)
   };
 };

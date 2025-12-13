@@ -17,22 +17,21 @@
  * under the License.
  */
 
-import { fetchIggyApi } from '$lib/api/fetchApi';
-import { handleFetchErrors } from '$lib/api/handleFetchErrors';
+import { clientApi } from '$lib/api/clientApi';
 import { partitionMessagesDetailsMapper } from '$lib/domain/MessageDetails';
 import { topicDetailsMapper } from '$lib/domain/TopicDetails';
+import type { PageLoad } from './$types';
 
 const MESSAGES_PER_PAGE = 20;
 
-export const load = async ({ params, cookies, url }) => {
-  const offset = url.searchParams.get('offset') || '0';
+export const load: PageLoad = async ({ params, url }) => {
   const direction = url.searchParams.get('direction') || 'desc';
 
   const getPartitionMessages = async () => {
-    const initialResult = await fetchIggyApi({
+    // First, get the initial offset to determine total messages
+    const initialData = await clientApi<any>({
       method: 'GET',
       path: `/streams/${+params.streamId}/topics/${+params.topicId}/messages`,
-      cookies,
       queryParams: {
         kind: 'offset',
         value: '0',
@@ -42,18 +41,15 @@ export const load = async ({ params, cookies, url }) => {
       }
     });
 
-    const { data: initialData } = await handleFetchErrors(initialResult, cookies);
-    const initialMessages = partitionMessagesDetailsMapper(initialData as any);
-
+    const initialMessages = partitionMessagesDetailsMapper(initialData);
     const totalMessages = initialMessages.currentOffset + 1;
     const offset =
       url.searchParams.get('offset') ??
       (direction === 'desc' ? Math.max(0, totalMessages - MESSAGES_PER_PAGE).toString() : '0');
 
-    const result = await fetchIggyApi({
+    const data = await clientApi<any>({
       method: 'GET',
       path: `/streams/${+params.streamId}/topics/${+params.topicId}/messages`,
-      cookies,
       queryParams: {
         kind: 'offset',
         value: offset.toString(),
@@ -63,22 +59,21 @@ export const load = async ({ params, cookies, url }) => {
       }
     });
 
-    const { data } = await handleFetchErrors(result, cookies);
-    return partitionMessagesDetailsMapper(data as any);
+    return partitionMessagesDetailsMapper(data);
   };
 
   const getTopic = async () => {
-    const result = await fetchIggyApi({
+    const data = await clientApi({
       method: 'GET',
-      path: `/streams/${+params.streamId}/topics/${+params.topicId}`,
-      cookies
+      path: `/streams/${+params.streamId}/topics/${+params.topicId}`
     });
 
-    const { data } = await handleFetchErrors(result, cookies);
     return topicDetailsMapper(data);
   };
 
   const [partitionMessages, topic] = await Promise.all([getPartitionMessages(), getTopic()]);
+
+  const offset = url.searchParams.get('offset') || '0';
 
   return {
     partitionMessages,

@@ -183,4 +183,8 @@ type Stats = {
   path: '/stats';
 };
 
-export type ApiSchema = Users | Streams | Stats | Topics | Auth;
+type BaseApiSchema = Users | Streams | Stats | Topics | Auth;
+
+export type ApiSchema = BaseApiSchema & {
+  queryParams?: Record<string, string | number | boolean>;
+};

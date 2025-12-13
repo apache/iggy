@@ -17,23 +17,17 @@
  * under the License.
  */
 
-import { fetchIggyApi } from '$lib/api/fetchApi';
-import { handleFetchErrors } from '$lib/api/handleFetchErrors';
-import { statsMapper } from '$lib/domain/Stats';
+import { clientApi } from '$lib/api/clientApi';
+import { topicDetailsMapper } from '$lib/domain/TopicDetails';
+import type { PageLoad } from './$types';
 
-export const load = async ({ cookies }) => {
-  const getStats = async () => {
-    const result = await fetchIggyApi({
-      method: 'GET',
-      path: '/stats',
-      cookies
-    });
-
-    const { data } = await handleFetchErrors(result, cookies);
-    return statsMapper(data);
-  };
+export const load: PageLoad = async ({ params }) => {
+  const data = await clientApi({
+    method: 'GET',
+    path: `/streams/${+params.streamId}/topics/${+params.topicId}`
+  });
 
   return {
-    serverStats: await getStats()
+    topic: topicDetailsMapper(data)
   };
 };

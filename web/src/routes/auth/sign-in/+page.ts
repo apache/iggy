@@ -17,10 +17,17 @@
  * under the License.
  */
 
-import type { LayoutServerLoad } from './$types';
+import { browser } from '$app/environment';
+import { goto } from '$app/navigation';
+import { resolve } from '$app/paths';
+import { authStore } from '$lib/auth/authStore.svelte';
+import { typedRoute } from '$lib/types/appRoutes';
+import type { PageLoad } from './$types';
 
-export const load: LayoutServerLoad = async ({ locals }) => {
-  return {
-    user: locals.user
-  };
+export const load: PageLoad = async () => {
+  if (browser && authStore.getAccessToken()) {
+    goto(resolve(typedRoute('/dashboard/overview')));
+  }
+
+  return {};
 };

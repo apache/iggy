@@ -17,15 +17,46 @@
  * under the License.
  */
 
+import { env } from '$env/dynamic/public';
+import { authStore } from '$lib/auth/authStore.svelte';
 import type { ApiSchema } from './ApiSchema';
+import { convertBigIntsToStrings } from './convertBigIntsToStrings';
 import { getJson } from './getJson';
 
 export const fetchRouteApi = async (
   arg: ApiSchema
 ): Promise<{ data: any; status: number; ok: boolean }> => {
   try {
-    const res = await fetch('/api/proxy', { body: JSON.stringify(arg), method: 'POST' });
-    return (await getJson(res)) as any;
+    const { path, method, queryParams } = arg;
+
+    const headers = new Headers();
+    headers.set('Content-Type', 'application/json');
+
+    const token = authStore.getAccessToken();
+    if (token) {
+      headers.set('Authorization', `Bearer ${token}`);
+    }
+
+    // Use PUBLIC_IGGY_API_URL if set, otherwise use relative path (for embedded mode)
+    const baseUrl = env.PUBLIC_IGGY_API_URL || '';
+    let fullUrl = `${baseUrl}${path}`;
+
+    if (queryParams) {
+      const params = Object.entries(queryParams).map(([k, v]) => [k, String(v)]);
+      const query = new URLSearchParams(params);
+      fullUrl += '?' + query.toString();
+    }
+
+    const res = await fetch(fullUrl, {
+      headers,
+      method,
+      ...('body' in arg && arg.body ? { body: JSON.stringify(arg.body) } : {})
+    });
+
+    const data = await getJson(res);
+    const safeData = convertBigIntsToStrings(data);
+
+    return { data: safeData, status: res.status, ok: res.ok };
   } catch (err) {
     throw new Error('fetchRouteApi error');
   }

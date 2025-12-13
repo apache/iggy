@@ -17,15 +17,28 @@
  * under the License.
  */
 
-import adapter from '@sveltejs/adapter-node';
+import adapterNode from '@sveltejs/adapter-node';
+import adapterStatic from '@sveltejs/adapter-static';
 import { vitePreprocess } from '@sveltejs/vite-plugin-svelte';
+
+// Use static adapter when STATIC_BUILD env is set (for embedding in Rust server)
+const useStaticAdapter = process.env.STATIC_BUILD === 'true';
 
 /** @type {import('@sveltejs/kit').Config} */
 const config = {
   kit: {
-    adapter: adapter({
-      out: 'build'
-    }),
+    adapter: useStaticAdapter
+      ? adapterStatic({
+          pages: 'build/static',
+          assets: 'build/static',
+          fallback: 'index.html'
+        })
+      : adapterNode({
+          out: 'build'
+        }),
+    paths: {
+      base: useStaticAdapter ? '/ui' : ''
+    },
     csrf: {
       trustedOrigins: ['*']
     }

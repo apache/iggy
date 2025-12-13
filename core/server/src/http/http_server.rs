@@ -117,6 +117,12 @@ pub async fn start_http_server(
 
     app = app.layer(middleware::from_fn(request_diagnostics));
 
+    #[cfg(feature = "iggy-web")]
+    {
+        app = app.merge(web::router());
+        info!("Web UI enabled at /ui");
+    }
+
     if !config.tls.enabled {
         let listener = TcpListener::bind(config.address.clone())
             .await

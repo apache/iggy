@@ -92,8 +92,10 @@
   rowClass="grid grid-cols-[150px_1fr_1fr_1fr_1fr_1fr]"
   data={topic.partitions}
   hrefBuilder={(partition) =>
-    typedRoute(
-      `/dashboard/streams/${+(page.params.streamId || '')}/topics/${topic.id}/partitions/${partition.id}/messages`
+    resolve(
+      typedRoute(
+        `/dashboard/streams/${+(page.params.streamId || '')}/topics/${topic.id}/partitions/${partition.id}/messages`
+      )
     )}
   colNames={{
     id: 'ID',

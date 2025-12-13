@@ -53,7 +53,7 @@ allowed_origins = ["*"]
 
 # Lists allowed headers that can be used in CORS requests.
 # For example, ["content-type"] permits only the content-type header.
-allowed_headers = ["content-type"]
+allowed_headers = ["content-type", "authorization"]
 
 # Headers that browsers are allowed to access in CORS responses.
 # An empty array means no additional headers are exposed to browsers.

@@ -41,7 +41,10 @@
   let filteredData = $derived(data.streams.filter((stream) => stream.name.includes(searchQuery)));
 
   onMount(() => {
-    if (data.streams.length > 0 && page.url.pathname === typedRoute('/dashboard/streams')) {
+    if (
+      data.streams.length > 0 &&
+      page.url.pathname === resolve(typedRoute('/dashboard/streams'))
+    ) {
       goto(resolve(typedRoute(`/dashboard/streams/${data.streams[0].id}`)));
     }
   });

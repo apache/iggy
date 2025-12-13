@@ -17,12 +17,7 @@
  * under the License.
  */
 
-import type { HandleClientError } from '@sveltejs/kit';
+import { authStore } from '$lib/auth/authStore.svelte';
 
-export const handleError: HandleClientError = async ({ error }) => {
-  console.log('client error handler', error);
-  return {
-    message: 'Whoops!',
-    errorId: 1
-  };
-};
+// Initialize auth store when the app loads
+authStore.initialize();

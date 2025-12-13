@@ -17,24 +17,18 @@
  * under the License.
  */
 
-import { fetchIggyApi } from '$lib/api/fetchApi.js';
-import { handleFetchErrors } from '$lib/api/handleFetchErrors';
-import { streamDetailsMapper } from '$lib/domain/StreamDetails';
+import { browser } from '$app/environment';
+import { goto } from '$app/navigation';
+import { resolve } from '$app/paths';
+import { authStore } from '$lib/auth/authStore.svelte';
+import { typedRoute } from '$lib/types/appRoutes';
+import type { PageLoad } from './$types';
 
-export const load = async ({ params, cookies }) => {
-  const getStreamDetails = async () => {
-    const result = await fetchIggyApi({
-      method: 'GET',
-      path: `/streams/${+params.streamId}`,
-      cookies
-    });
+export const load: PageLoad = async () => {
+  if (browser) {
+    authStore.logout();
+    goto(resolve(typedRoute('/auth/sign-in')));
+  }
 
-    const { data } = await handleFetchErrors(result, cookies);
-
-    return streamDetailsMapper(data);
-  };
-
-  return {
-    streamDetails: await getStreamDetails()
-  };
+  return {};
 };

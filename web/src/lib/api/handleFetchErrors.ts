@@ -18,6 +18,7 @@
  */
 
 import { error, type Cookies, redirect } from '@sveltejs/kit';
+import { base } from '$app/paths';
 import { getJson } from './getJson';
 import { tokens } from '$lib/utils/constants/tokens';
 import { typedRoute } from '$lib/types/appRoutes';
@@ -57,15 +58,14 @@ export const handleFetchErrors = async (
       };
     },
     401: () => {
-      // TODO: Refresh token
       console.log(`handleErrorStatus: 401 ${response.url}`);
       removeCookies();
-      redirect(302, typedRoute('/auth/sign-in'));
+      redirect(302, `${base}${typedRoute('/auth/sign-in')}`);
     },
     403: () => {
       console.log(`handleErrorStatus: 403 ${response.url}`);
       removeCookies();
-      redirect(302, typedRoute('/auth/sign-in'));
+      redirect(302, `${base}${typedRoute('/auth/sign-in')}`);
     },
     404: () => {
       console.log(`handleErrorStatus: 404 ${response.url}`);

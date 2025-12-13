@@ -27,7 +27,7 @@ bdd = []
 
 [dev-dependencies]
 bytes = { workspace = true }
-cucumber = "0.21"
+cucumber = "0.22"
 iggy = { workspace = true }
 integration = { workspace = true }
 tokio = { workspace = true }

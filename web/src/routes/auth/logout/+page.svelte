@@ -18,12 +18,18 @@
 -->
 
 <script lang="ts">
-  import { base } from '$app/paths';
-  let className = '';
-  export { className as class };
-  const lightLogo = `${base}/iggy-apache-lightbg.svg`;
-  const darkLogo = `${base}/iggy-apache-darkbg.svg`;
+  import { onMount } from 'svelte';
+  import { goto } from '$app/navigation';
+  import { resolve } from '$app/paths';
+  import { authStore } from '$lib/auth/authStore.svelte';
+  import { typedRoute } from '$lib/types/appRoutes';
+
+  onMount(() => {
+    authStore.logout();
+    goto(resolve(typedRoute('/auth/sign-in')));
+  });
 </script>
 
-<img src={lightLogo} class="{className} block dark:hidden" alt="Apache Iggy" />
-<img src={darkLogo} class="{className} hidden dark:block" alt="Apache Iggy" />
+<div class="flex items-center justify-center h-full">
+  <span class="text-color">Logging out...</span>
+</div>
