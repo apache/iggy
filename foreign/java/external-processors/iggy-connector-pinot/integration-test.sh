@@ -32,7 +32,7 @@ echo -e "\n${YELLOW}Step 3: Waiting for services to be healthy...${NC}"
 
 echo -n "Waiting for Iggy... "
 for i in {1..30}; do
-    if curl -s http://localhost:3000/ > /dev/null 2>&1; then
+    if curl --connect-timeout 3 --max-time 5 -s http://localhost:3000/ > /dev/null 2>&1; then
         echo -e "${GREEN}✓${NC}"
         break
     fi
@@ -42,7 +42,7 @@ done
 
 echo -n "Waiting for Pinot Controller... "
 for i in {1..60}; do
-    if curl -s http://localhost:9000/health > /dev/null 2>&1; then
+    if curl --connect-timeout 3 --max-time 5 -s http://localhost:9000/health > /dev/null 2>&1; then
         echo -e "${GREEN}✓${NC}"
         break
     fi
@@ -52,7 +52,7 @@ done
 
 echo -n "Waiting for Pinot Broker... "
 for i in {1..60}; do
-    if curl -s http://localhost:8099/health > /dev/null 2>&1; then
+    if curl --connect-timeout 3 --max-time 5 -s http://localhost:8099/health > /dev/null 2>&1; then
         echo -e "${GREEN}✓${NC}"
         break
     fi
@@ -62,7 +62,7 @@ done
 
 echo -n "Waiting for Pinot Server... "
 for i in {1..60}; do
-    if curl -s http://localhost:8098/health > /dev/null 2>&1; then
+    if curl --connect-timeout 3 --max-time 5 -s http://localhost:8097/health > /dev/null 2>&1; then
         echo -e "${GREEN}✓${NC}"
         break
     fi

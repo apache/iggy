@@ -11,6 +11,8 @@ services:
       - "8080:8080"  # HTTP API
     environment:
       - IGGY_LOG_LEVEL=info
+    security_opt:
+      - seccomp:unconfined
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:3000/"]
       interval: 10s
@@ -79,12 +81,13 @@ services:
     command: "StartServer -zkAddress zookeeper:2181"
     ports:
       - "8098:8098"
+      - "8097:8097"
     environment:
       JAVA_OPTS: "-Xms1G -Xmx2G -XX:+UseG1GC"
     depends_on:
       - pinot-broker
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8098/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:8097/health"]
       interval: 10s
       timeout: 5s
       retries: 10
