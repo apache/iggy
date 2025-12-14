@@ -71,7 +71,6 @@ futures = { workspace = true }
 hash32 = "1.0.0"
 human-repr = { workspace = true }
 
-hwlocality = { workspace = true }
 iggy_common = { workspace = true }
 jsonwebtoken = { version = "10.2.0", features = ["rust_crypto"] }
 lending-iterator = "0.1.7"
@@ -125,6 +124,10 @@ tungstenite = { workspace = true }
 twox-hash = { workspace = true }
 ulid = "1.2.1"
 uuid = { workspace = true }
+
+[target.'cfg(not(target_env = "musl"))'.dependencies]
+hwlocality = { workspace = true }
+
 [target.'cfg(target_env = "musl")'.dependencies]
 hwlocality = { workspace = true, features = ["vendored"] }
 
