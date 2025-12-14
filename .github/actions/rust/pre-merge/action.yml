@@ -130,7 +130,7 @@ runs:
       shell: bash
 
     - name: Install musl tools for aarch64-musl
-      if: inputs.task == 'build-aarch64-musl'
+      if: inputs.task == 'build-aarch64-musl' && runner.os == 'Linux'
       run: |
         sudo apt-get update && sudo apt-get install -y musl-tools
         rustup target add aarch64-unknown-linux-musl
