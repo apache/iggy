@@ -4581,7 +4581,6 @@ dependencies = [
  "figment",
  "human-repr",
  "humantime",
- "libc",
  "nix",
  "once_cell",
  "rcgen",
