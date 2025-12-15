@@ -130,7 +130,7 @@ runs:
       shell: bash
 
     - name: Install musl tools for aarch64-musl
-      if: inputs.task == 'build-aarch64-musl'
+      if: inputs.task == 'build-aarch64-musl' && runner.os == 'Linux'
       run: |
         sudo apt-get update && sudo apt-get install -y musl-tools
         rustup target add aarch64-unknown-linux-musl
@@ -144,6 +144,8 @@ runs:
         # Disable GCC outline atomics to avoid undefined __aarch64_ldadd4_sync
         # references when linking dbus-sys (required by keyring crate)
         CFLAGS: "-mno-outline-atomics"
+        PKG_CONFIG_ALLOW_CROSS: "1"
+        PKG_CONFIG_ALL_STATIC: "1"
 
     # macOS builds
     - name: Build macOS aarch64

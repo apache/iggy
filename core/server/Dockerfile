@@ -97,6 +97,11 @@ ARG TARGETPLATFORM
 ARG PREBUILT_IGGY_SERVER
 ARG PREBUILT_IGGY_CLI
 WORKDIR /app
+RUN apt-get update && apt-get install -y \
+    libhwloc-dev \
+    libudev-dev \
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
 COPY --from=prebuilt /out/iggy-server /usr/local/bin/iggy-server
 COPY --from=prebuilt /out/iggy        /usr/local/bin/iggy
 RUN echo "═══════════════════════════════════════════════════════════════" && \
@@ -120,6 +125,11 @@ ARG TARGETPLATFORM
 ARG PROFILE=release
 ARG LIBC=musl
 WORKDIR /app
+RUN apt-get update && apt-get install -y \
+    libhwloc15 \
+    libudev1 \
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /app/iggy-server /usr/local/bin/iggy-server
 COPY --from=builder /app/iggy        /usr/local/bin/iggy
 RUN echo "═══════════════════════════════════════════════════════════════" && \

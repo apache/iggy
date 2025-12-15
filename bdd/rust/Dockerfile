@@ -20,6 +20,12 @@ FROM rust:${RUST_VERSION}
 
 WORKDIR /app
 
+RUN apt-get update && apt-get install -y \
+    libhwloc-dev \
+    libudev-dev \
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
 # Copy everything
 COPY . .
 
