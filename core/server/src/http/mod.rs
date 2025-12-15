@@ -34,5 +34,7 @@ pub mod streams;
 pub mod system;
 pub mod topics;
 pub mod users;
+#[cfg(feature = "iggy-web")]
+pub mod web;
 
 pub const COMPONENT: &str = "HTTP";
