@@ -6476,12 +6476,11 @@ dependencies = [
 
 [[package]]
 name = "passterm"
-version = "2.0.1"
+version = "2.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6421520445baa36401ded73e4820ad3a3e04316a0eb1bdb13b94987739de5fa2"
+checksum = "150ca2316c7813c688677784f20bb0a9efab639415ae1961869863ee99a81e51"
 dependencies = [
  "libc",
- "windows-sys 0.48.0",
 ]
 
 [[package]]
@@ -7368,9 +7367,9 @@ dependencies = [
 
 [[package]]
 name = "reqwest"
-version = "0.12.25"
+version = "0.12.26"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6eff9328d40131d43bd911d42d79eb6a47312002a4daefc9e37f17e74a7701a"
+checksum = "3b4c14b2d9afca6a60277086b0cc6a6ae0b568f6f7916c943a8cdc79f8be240f"
 dependencies = [
  "base64 0.22.1",
  "bytes",
