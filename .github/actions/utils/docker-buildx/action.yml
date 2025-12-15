@@ -42,6 +42,10 @@ inputs:
     description: "Libc to use (glibc/musl)"
     required: false
     default: "musl"
+  platform:
+    description: "Single platform to build (e.g., linux/amd64). If set, builds only this platform without QEMU. Leave empty for multi-arch build."
+    required: false
+    default: ""
 
 runs:
   using: "composite"
@@ -112,6 +116,8 @@ runs:
         fi
 
     - name: Set up QEMU
+      # Skip QEMU when building single platform on native runner (no emulation needed)
+      if: inputs.platform == ''
       uses: docker/setup-qemu-action@v3
       with:
         platforms: all
@@ -130,30 +136,56 @@ runs:
         username: ${{ env.DOCKERHUB_USER }}
         password: ${{ env.DOCKERHUB_TOKEN }}
 
+    - name: Compute platform suffix
+      id: suffix
+      shell: bash
+      run: |
+        platform="${{ inputs.platform }}"
+        if [ -n "$platform" ]; then
+          # Extract arch from platform (e.g., linux/amd64 -> amd64)
+          suffix="${platform##*/}"
+          echo "suffix=-${suffix}" >> "$GITHUB_OUTPUT"
+          echo "is_single=true" >> "$GITHUB_OUTPUT"
+          echo "📦 Platform suffix: -${suffix}"
+        else
+          echo "suffix=" >> "$GITHUB_OUTPUT"
+          echo "is_single=false" >> "$GITHUB_OUTPUT"
+          echo "📦 No platform suffix (multi-arch)"
+        fi
+
     - name: Docker meta
       id: meta
       uses: docker/metadata-action@v5
       with:
         images: ${{ steps.config.outputs.image }}
         tags: |
-          type=raw,value=${{ inputs.version }}
-          type=raw,value=latest,enable=${{ steps.config.outputs.should_push == 'true' && inputs.version != 'test' && !contains(inputs.version, 'edge') && !contains(inputs.version, 'rc') && !contains(inputs.version, 'alpha') && !contains(inputs.version, 'beta') }}
+          type=raw,value=${{ inputs.version }}${{ steps.suffix.outputs.suffix }}
+          type=raw,value=latest,enable=${{ steps.suffix.outputs.is_single == 'false' && steps.config.outputs.should_push == 'true' && inputs.version != 'test' && !contains(inputs.version, 'edge') && !contains(inputs.version, 'rc') && !contains(inputs.version, 'alpha') && !contains(inputs.version, 'beta') }}
           type=sha,enable=${{ inputs.version == 'test' }}
 
     - name: Determine platforms
       id: platforms
       shell: bash
       run: |
+        p_input="${{ inputs.platform }}"
         p_cfg="${{ steps.config.outputs.cfg_platforms }}"
-        if [ -n "$p_cfg" ]; then
+
+        # Priority: input platform > config platforms > defaults
+        if [ -n "$p_input" ]; then
+          # Single platform specified - native build on correct runner
+          platforms="$p_input"
+          echo "🚀 Single platform build (native): $platforms"
+        elif [ -n "$p_cfg" ]; then
           platforms="$p_cfg"
+          echo "🖥️ Platforms from config: $platforms"
         elif [ "${{ steps.config.outputs.should_push }}" = "true" ]; then
           platforms="linux/amd64,linux/arm64"
+          echo "🖥️ Multi-arch build: $platforms"
         else
           platforms="linux/amd64"
+          echo "🖥️ Default platform: $platforms"
         fi
         echo "platforms=$platforms" >> "$GITHUB_OUTPUT"
-        echo "🖥️ Platforms: $platforms"
 
     - name: Compose cache config (no registry on dry-run)
       id: cachecfg
@@ -162,36 +194,52 @@ runs:
         set -euo pipefail
         comp="${{ inputs.component }}"
         os="${{ runner.os }}"
+        arch="${{ runner.arch }}"
         img="${{ steps.config.outputs.image }}"
+
+        # Include architecture in cache scope to prevent collisions between
+        # native amd64 and arm64 builds (both have runner.os = "Linux")
+        scope_arch="${comp}-${os}-${arch}"
+        scope_os="${comp}-${os}"
+
+        # Shared deps cache image - apache/iggy has the most deps, others can reuse
+        shared_deps="apache/iggy"
+
         if [ "${{ inputs.dry_run }}" = "true" ]; then
-          # dry-run/forks: avoid Docker Hub completely
+          # dry-run/forks: avoid Docker Hub completely, use shared GHA scope for deps
           CACHE_TO=$(
             printf '%s\n' \
-              "type=gha,scope=buildkit-${comp}-${os},mode=max" \
-              "type=gha,scope=buildkit-${comp},mode=max" \
+              "type=gha,scope=buildkit-deps-${os}-${arch},mode=max" \
+              "type=gha,scope=buildkit-${scope_arch},mode=max" \
               "type=inline"
           )
           CACHE_FROM=$(
             printf '%s\n' \
-              "type=gha,scope=buildkit-${comp}-${os}" \
-              "type=gha,scope=buildkit-${comp}"
+              "type=gha,scope=buildkit-deps-${os}-${arch}" \
+              "type=gha,scope=buildkit-${scope_arch}" \
+              "type=gha,scope=buildkit-${scope_os}"
           )
         else
-          # CI on upstream: use registry + gha + inline
+          # CI on upstream: use shared deps cache + component-specific cache
+          # Order matters: try shared deps first (most likely to have common layers)
           CACHE_TO=$(
             printf '%s\n' \
-              "type=registry,ref=${img}:buildcache,mode=max" \
-              "type=registry,ref=${img}:buildcache-${os},mode=max" \
+              "type=registry,ref=${shared_deps}:buildcache-${arch},mode=max" \
+              "type=registry,ref=${img}:buildcache-${arch},mode=max" \
               "type=inline" \
-              "type=gha,scope=buildkit-${comp}-${os},mode=max"
+              "type=gha,scope=buildkit-deps-${os}-${arch},mode=max" \
+              "type=gha,scope=buildkit-${scope_arch},mode=max"
           )
           CACHE_FROM=$(
             printf '%s\n' \
+              "type=registry,ref=${shared_deps}:buildcache-${arch}" \
+              "type=registry,ref=${shared_deps}:buildcache" \
+              "type=registry,ref=${img}:buildcache-${arch}" \
               "type=registry,ref=${img}:buildcache" \
-              "type=registry,ref=${img}:buildcache-${os}" \
               "type=registry,ref=${img}:latest" \
-              "type=gha,scope=buildkit-${comp}-${os}" \
-              "type=gha,scope=buildkit-${comp}"
+              "type=gha,scope=buildkit-deps-${os}-${arch}" \
+              "type=gha,scope=buildkit-${scope_arch}" \
+              "type=gha,scope=buildkit-${scope_os}"
           )
         fi
 

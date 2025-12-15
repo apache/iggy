@@ -31,6 +31,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     openssl \
     curl \
     ca-certificates \
+    autoconf \
+    automake \
+    libtool \
     && rm -rf /var/lib/apt/lists/*
 
 # Install cargo-binstall

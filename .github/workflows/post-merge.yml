@@ -39,6 +39,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.mk.outputs.matrix }}
+      components: ${{ steps.mk.outputs.components }}
     steps:
       - uses: actions/checkout@v4
 
@@ -63,21 +64,44 @@ jobs:
             const b64 = `${{ steps.cfg.outputs.components_b64 }}` || '';
             if (!b64) {
               core.setOutput('matrix', JSON.stringify({ include: [{ component: 'noop' }] }));
+              core.setOutput('components', JSON.stringify({ include: [{ component: 'noop' }] }));
               return;
             }
             const comps = JSON.parse(Buffer.from(b64, 'base64').toString('utf8'));
-            const include = Object.entries(comps)
+            const components = Object.entries(comps)
               .filter(([_, v]) => v && v.registry === 'dockerhub')
-              .map(([k]) => ({ component: k }));
-            const uniq = Array.from(new Map(include.map(i => [i.component, i])).values());
-            core.setOutput('matrix', JSON.stringify(uniq.length ? { include: uniq } : { include: [{ component: 'noop' }] }));
+              .map(([k]) => k);
+            const uniqComponents = [...new Set(components)];
+
+            // Output just the component list for manifest creation
+            const componentMatrix = uniqComponents.length
+              ? { include: uniqComponents.map(c => ({ component: c })) }
+              : { include: [{ component: 'noop' }] };
+            core.setOutput('components', JSON.stringify(componentMatrix));
+
+            // Build cross-product matrix: components × platforms
+            const platforms = [
+              { platform: 'linux/amd64', arch: 'amd64', runner: 'ubuntu-latest' },
+              { platform: 'linux/arm64', arch: 'arm64', runner: 'ubuntu-24.04-arm' }
+            ];
+
+            const matrix = [];
+            for (const comp of uniqComponents) {
+              for (const p of platforms) {
+                matrix.push({ component: comp, ...p });
+              }
+            }
+
+            core.setOutput('matrix', JSON.stringify(matrix.length ? { include: matrix } : { include: [{ component: 'noop' }] }));
+            console.log(`Components: ${uniqComponents.join(', ')}`);
+            console.log(`Matrix size: ${matrix.length} jobs (${uniqComponents.length} components × 2 platforms)`);
 
   docker-edge:
-    name: ${{ matrix.component }}
+    name: ${{ matrix.component }} (${{ matrix.arch }})
     needs: plan
     if: ${{ fromJson(needs.plan.outputs.matrix).include[0].component != 'noop' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 120
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
@@ -87,13 +111,73 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Determine libc for component
+        id: libc
+        run: |
+          # Connectors runtime must use glibc because it dlopen()s glibc plugins
+          if [ "${{ matrix.component }}" = "rust-connectors" ]; then
+            echo "libc=glibc" >> "$GITHUB_OUTPUT"
+          else
+            echo "libc=musl" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: ./.github/actions/utils/docker-buildx
         with:
           task: publish
-          libc: musl
+          libc: ${{ steps.libc.outputs.libc }}
           component: ${{ matrix.component }}
           version: edge
-          dry_run: ${{ github.event.repository.fork }} # forks: always dry-run
+          platform: ${{ matrix.platform }}
+          dry_run: ${{ github.event.repository.fork }}
+
+  docker-manifests:
+    name: Create manifests
+    needs: [plan, docker-edge]
+    if: ${{ !github.event.repository.fork && fromJson(needs.plan.outputs.components).include[0].component != 'noop' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan.outputs.components) }}
+    env:
+      DOCKERHUB_USER: ${{ secrets.DOCKERHUB_USER }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve image from config
+        id: config
+        shell: bash
+        run: |
+          if ! command -v yq >/dev/null 2>&1; then
+            YQ_VERSION="v4.47.1"
+            YQ_CHECKSUM="0fb28c6680193c41b364193d0c0fc4a03177aecde51cfc04d506b1517158c2fb"
+            curl -sSL -o /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64
+            echo "${YQ_CHECKSUM}  /usr/local/bin/yq" | sha256sum -c - || exit 1
+            chmod +x /usr/local/bin/yq
+          fi
+          image=$(yq ".components.${{ matrix.component }}.image" .github/config/publish.yml)
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+          echo "📦 Image: $image"
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ env.DOCKERHUB_USER }}
+          password: ${{ env.DOCKERHUB_TOKEN }}
+
+      - name: Create and push manifest
+        run: |
+          IMAGE="${{ steps.config.outputs.image }}"
+          VERSION="edge"
+
+          echo "Creating manifest for $IMAGE:$VERSION"
+
+          docker manifest create "${IMAGE}:${VERSION}" \
+            "${IMAGE}:${VERSION}-amd64" \
+            "${IMAGE}:${VERSION}-arm64"
+
+          docker manifest push "${IMAGE}:${VERSION}"
+          echo "✅ Pushed manifest: ${IMAGE}:${VERSION}"
 
   build-artifacts:
     name: Build artifacts

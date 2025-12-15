@@ -136,10 +136,14 @@ jobs:
     outputs:
       targets: ${{ steps.mk.outputs.targets }}
       non_rust_targets: ${{ steps.mk.outputs.non_rust_targets }}
+      non_docker_targets: ${{ steps.mk.outputs.non_docker_targets }}
+      docker_matrix: ${{ steps.mk.outputs.docker_matrix }}
+      docker_components: ${{ steps.mk.outputs.docker_components }}
       count: ${{ steps.mk.outputs.count }}
       go_sdk_version: ${{ steps.mk.outputs.go_sdk_version }}
       has_python: ${{ steps.mk.outputs.has_python }}
       has_rust_crates: ${{ steps.mk.outputs.has_rust_crates }}
+      has_docker: ${{ steps.mk.outputs.has_docker }}
     steps:
       - name: Download latest copy script from master
         if: inputs.use_latest_ci
@@ -263,15 +267,40 @@ jobs:
               }
             }
 
+            // Separate Docker targets from other non-Rust targets
+            const dockerTargets = nonRustTargets.filter(t => t.type === 'docker');
+            const nonDockerTargets = nonRustTargets.filter(t => t.type !== 'docker');
+
             console.log(`Publishing ${targets.length} components:`);
             targets.forEach(t => console.log(`  - ${t.name} (${t.type}) -> ${t.registry || 'N/A'}`));
             console.log(`  (${nonRustTargets.length} non-Rust, ${targets.length - nonRustTargets.length} Rust crates)`);
+            console.log(`  (${dockerTargets.length} Docker, ${nonDockerTargets.length} other SDKs)`);
 
             // Output all targets for reference and tag creation
             core.setOutput('targets', JSON.stringify(targets.length ? { include: targets } : { include: [{ key: 'noop', type: 'noop' }] }));
 
             // Output only non-Rust targets for the parallel publish job
             core.setOutput('non_rust_targets', JSON.stringify(nonRustTargets.length ? { include: nonRustTargets } : { include: [{ key: 'noop', type: 'noop' }] }));
+
+            // Output non-Docker, non-Rust targets (SDKs only)
+            core.setOutput('non_docker_targets', JSON.stringify(nonDockerTargets.length ? { include: nonDockerTargets } : { include: [{ key: 'noop', type: 'noop' }] }));
+
+            // Build Docker matrix: components × platforms for native runner builds
+            const platforms = [
+              { platform: 'linux/amd64', arch: 'amd64', runner: 'ubuntu-latest' },
+              { platform: 'linux/arm64', arch: 'arm64', runner: 'ubuntu-24.04-arm' }
+            ];
+
+            const dockerMatrix = [];
+            for (const t of dockerTargets) {
+              for (const p of platforms) {
+                dockerMatrix.push({ ...t, ...p });
+              }
+            }
+
+            core.setOutput('docker_matrix', JSON.stringify(dockerMatrix.length ? { include: dockerMatrix } : { include: [{ key: 'noop', type: 'noop' }] }));
+            core.setOutput('docker_components', JSON.stringify(dockerTargets.length ? { include: dockerTargets } : { include: [{ key: 'noop', type: 'noop' }] }));
+            core.setOutput('has_docker', String(dockerTargets.length > 0));
 
             core.setOutput('count', String(targets.length));
             core.setOutput('go_sdk_version', goVersion);
@@ -603,24 +632,179 @@ jobs:
         if: always()
         run: echo "status=${{ job.status }}" >> "$GITHUB_OUTPUT"
 
-  publish:
-    name: ${{ matrix.name }}
-    needs:
-      [validate, plan, check-tags, build-python-wheels, publish-rust-crates]
+  # Docker publishing on native runners (no QEMU emulation)
+  publish-docker:
+    name: Docker ${{ matrix.name }} (${{ matrix.arch }})
+    needs: [validate, plan, check-tags, build-python-wheels, publish-rust-crates]
     if: |
       always() &&
       needs.validate.outputs.has_targets == 'true' &&
-      fromJson(needs.plan.outputs.non_rust_targets).include[0].key != 'noop' &&
+      needs.plan.outputs.has_docker == 'true' &&
+      fromJson(needs.plan.outputs.docker_matrix).include[0].key != 'noop' &&
+      (needs.build-python-wheels.result == 'success' || needs.build-python-wheels.result == 'skipped') &&
+      (needs.publish-rust-crates.result == 'success' || needs.publish-rust-crates.result == 'skipped')
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan.outputs.docker_matrix) }}
+    env:
+      DOCKERHUB_USER: ${{ secrets.DOCKERHUB_USER }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+    steps:
+      - name: Download latest copy script from master
+        if: inputs.use_latest_ci
+        run: |
+          curl -sSL "https://raw.githubusercontent.com/${{ github.repository }}/master/scripts/copy-latest-from-master.sh" \
+            -o /tmp/copy-latest-from-master.sh
+          chmod +x /tmp/copy-latest-from-master.sh
+          echo "✅ Downloaded latest copy script from master"
+
+      - name: Checkout at commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+          fetch-depth: 0
+
+      - name: Save and apply latest CI from master
+        if: inputs.use_latest_ci
+        run: |
+          /tmp/copy-latest-from-master.sh save \
+            .github \
+            scripts \
+            web/Dockerfile \
+            core/server/Dockerfile \
+            core/ai/mcp/Dockerfile \
+            core/connectors/runtime/Dockerfile \
+            core/bench/dashboard/server/Dockerfile
+
+          /tmp/copy-latest-from-master.sh apply
+
+      - name: Ensure version extractor is executable
+        run: |
+          test -x scripts/extract-version.sh || chmod +x scripts/extract-version.sh
+
+      - name: Extract version
+        id: ver
+        run: |
+          VERSION=$(scripts/extract-version.sh "${{ matrix.key }}")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "✅ Resolved ${{ matrix.key }} -> version=$VERSION"
+
+      - name: Determine libc for component
+        id: libc
+        run: |
+          # Connectors runtime must use glibc because it dlopen()s glibc plugins
+          if [ "${{ matrix.key }}" = "rust-connectors" ]; then
+            echo "libc=glibc" >> "$GITHUB_OUTPUT"
+          else
+            echo "libc=musl" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish Docker image
+        uses: ./.github/actions/utils/docker-buildx
+        with:
+          task: publish
+          libc: ${{ steps.libc.outputs.libc }}
+          component: ${{ matrix.key }}
+          version: ${{ steps.ver.outputs.version }}
+          platform: ${{ matrix.platform }}
+          dry_run: ${{ inputs.dry_run }}
+
+  # Create multi-arch Docker manifests after platform-specific images are pushed
+  docker-manifests:
+    name: Docker manifests
+    needs: [validate, plan, publish-docker]
+    if: |
+      always() &&
+      needs.validate.outputs.has_targets == 'true' &&
+      needs.plan.outputs.has_docker == 'true' &&
+      fromJson(needs.plan.outputs.docker_components).include[0].key != 'noop' &&
+      needs.publish-docker.result == 'success' &&
+      inputs.dry_run == false
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan.outputs.docker_components) }}
+    env:
+      DOCKERHUB_USER: ${{ secrets.DOCKERHUB_USER }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+
+      - name: Ensure version extractor is executable
+        run: |
+          test -x scripts/extract-version.sh || chmod +x scripts/extract-version.sh
+
+      - name: Extract version
+        id: ver
+        run: |
+          VERSION=$(scripts/extract-version.sh "${{ matrix.key }}")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve image from config
+        id: config
+        run: |
+          if ! command -v yq >/dev/null 2>&1; then
+            YQ_VERSION="v4.47.1"
+            YQ_CHECKSUM="0fb28c6680193c41b364193d0c0fc4a03177aecde51cfc04d506b1517158c2fb"
+            curl -sSL -o /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64
+            echo "${YQ_CHECKSUM}  /usr/local/bin/yq" | sha256sum -c - || exit 1
+            chmod +x /usr/local/bin/yq
+          fi
+          image=$(yq ".components.${{ matrix.key }}.image" .github/config/publish.yml)
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+          echo "📦 Image: $image"
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ env.DOCKERHUB_USER }}
+          password: ${{ env.DOCKERHUB_TOKEN }}
+
+      - name: Create and push manifest
+        run: |
+          IMAGE="${{ steps.config.outputs.image }}"
+          VERSION="${{ steps.ver.outputs.version }}"
+
+          echo "Creating manifest for $IMAGE:$VERSION"
+
+          docker manifest create "${IMAGE}:${VERSION}" \
+            "${IMAGE}:${VERSION}-amd64" \
+            "${IMAGE}:${VERSION}-arm64"
+
+          docker manifest push "${IMAGE}:${VERSION}"
+          echo "✅ Pushed manifest: ${IMAGE}:${VERSION}"
+
+          # Also create 'latest' tag for stable releases (not edge/rc/alpha/beta)
+          if [[ ! "$VERSION" =~ (edge|rc|alpha|beta) ]]; then
+            echo "Creating 'latest' manifest"
+            docker manifest create "${IMAGE}:latest" \
+              "${IMAGE}:${VERSION}-amd64" \
+              "${IMAGE}:${VERSION}-arm64"
+            docker manifest push "${IMAGE}:latest"
+            echo "✅ Pushed manifest: ${IMAGE}:latest"
+          fi
+
+  # Non-Docker, non-Rust publishing (Python, Node, Java, C#, Go SDKs)
+  # Note: This job runs in parallel with Docker publishing - no dependency between them
+  publish:
+    name: ${{ matrix.name }}
+    needs: [validate, plan, check-tags, build-python-wheels, publish-rust-crates]
+    if: |
+      always() &&
+      needs.validate.outputs.has_targets == 'true' &&
+      fromJson(needs.plan.outputs.non_docker_targets).include[0].key != 'noop' &&
       (needs.build-python-wheels.result == 'success' || needs.build-python-wheels.result == 'skipped') &&
       (needs.publish-rust-crates.result == 'success' || needs.publish-rust-crates.result == 'skipped')
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
-      matrix: ${{ fromJson(needs.plan.outputs.non_rust_targets) }}
+      matrix: ${{ fromJson(needs.plan.outputs.non_docker_targets) }}
     env:
       CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-      DOCKERHUB_USER: ${{ secrets.DOCKERHUB_USER }}
-      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
       PYPI_API_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
       NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
       NEXUS_USER: ${{ secrets.NEXUS_USER }}
@@ -667,7 +851,7 @@ jobs:
           test -x scripts/extract-version.sh || chmod +x scripts/extract-version.sh
 
       - name: Setup Rust toolchain (if needed)
-        if: matrix.type == 'rust' || matrix.type == 'docker' || matrix.type == 'python'
+        if: matrix.type == 'rust' || matrix.type == 'python'
         uses: ./.github/actions/utils/setup-rust-with-cache
         with:
           cache-targets: false
@@ -695,18 +879,6 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "tag=$TAG"       >> "$GITHUB_OUTPUT"
           echo "✅ Resolved ${{ matrix.key }} -> version=$VERSION tag=${TAG:-<none>}"
-
-      # ─────────────────────────────────────────
-      # Docker Publishing
-      # ─────────────────────────────────────────
-      - name: Publish Docker image
-        if: matrix.type == 'docker'
-        uses: ./.github/actions/utils/docker-buildx
-        with:
-          task: publish
-          component: ${{ matrix.key }}
-          version: ${{ steps.ver.outputs.version }}
-          dry_run: ${{ inputs.dry_run }}
 
       # ─────────────────────────────────────────
       # Python SDK Publishing
@@ -774,6 +946,8 @@ jobs:
         check-tags,
         build-python-wheels,
         publish-rust-crates,
+        publish-docker,
+        docker-manifests,
         publish,
       ]
     if: |
@@ -783,6 +957,8 @@ jobs:
       inputs.skip_tag_creation == false &&
       (needs.publish.result == 'success' || needs.publish.result == 'skipped') &&
       (needs.publish-rust-crates.result == 'success' || needs.publish-rust-crates.result == 'skipped') &&
+      (needs.publish-docker.result == 'success' || needs.publish-docker.result == 'skipped') &&
+      (needs.docker-manifests.result == 'success' || needs.docker-manifests.result == 'skipped') &&
       (needs.build-python-wheels.result == 'success' || needs.build-python-wheels.result == 'skipped')
     runs-on: ubuntu-latest
     permissions:
@@ -873,6 +1049,8 @@ jobs:
         check-tags,
         build-python-wheels,
         publish-rust-crates,
+        publish-docker,
+        docker-manifests,
         publish,
         create-tags,
       ]
@@ -1021,13 +1199,31 @@ jobs:
               echo
             fi
 
-            # Other publishing status
-            echo "### Other Publishing"
+            # Docker publishing status
+            if [ "${{ needs.plan.outputs.has_docker }}" = "true" ]; then
+              echo "### Docker Publishing (Native Runners)"
+              case "${{ needs.publish-docker.result }}" in
+                success)   echo "✅ **Docker images built and pushed successfully on native runners**" ;;
+                failure)   echo "❌ **Docker image publishing failed - check logs for details**" ;;
+                skipped)   echo "⏭️ **Docker publishing was skipped**" ;;
+              esac
+              echo
+              echo "### Docker Manifests"
+              case "${{ needs.docker-manifests.result }}" in
+                success)   echo "✅ **Multi-arch manifests created successfully**" ;;
+                failure)   echo "❌ **Manifest creation failed - check logs for details**" ;;
+                skipped)   echo "⏭️ **Manifest creation was skipped**" ;;
+              esac
+              echo
+            fi
+
+            # SDK publishing status
+            echo "### SDK Publishing"
             case "${{ needs.publish.result }}" in
-              success)   echo "✅ **Publishing completed successfully**" ;;
-              failure)   echo "❌ **Publishing failed - check logs for details**" ;;
-              cancelled) echo "🚫 **Publishing was cancelled**" ;;
-              *)         echo "⏭️ **Publishing was skipped**" ;;
+              success)   echo "✅ **SDK publishing completed successfully**" ;;
+              failure)   echo "❌ **SDK publishing failed - check logs for details**" ;;
+              cancelled) echo "🚫 **SDK publishing was cancelled**" ;;
+              *)         echo "⏭️ **SDK publishing was skipped**" ;;
             esac
             if [ "${{ inputs.dry_run }}" = "true" ]; then
               echo
@@ -1055,6 +1251,8 @@ jobs:
         plan,
         build-python-wheels,
         publish-rust-crates,
+        publish-docker,
+        docker-manifests,
         publish,
         create-tags,
         summary,

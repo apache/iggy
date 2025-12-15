@@ -18,11 +18,10 @@
 ARG RUST_VERSION=1.92
 ARG ALPINE_VERSION=3.22
 
-# ── from-source path (unchanged) ──────────────────────────────────────────────
+# ── from-source path ─────────────────────────────────────────────────────────
 FROM --platform=$BUILDPLATFORM lukemathwalker/cargo-chef:latest-rust-${RUST_VERSION}-alpine AS chef
 WORKDIR /app
-#RUN apk add --no-cache musl-dev pkgconfig openssl-dev openssl-libs-static
-RUN apk add musl-dev
+RUN apk add --no-cache musl-dev pkgconfig
 
 FROM --platform=$BUILDPLATFORM chef AS planner
 COPY . .
@@ -35,7 +34,7 @@ ARG LIBC=musl
 ARG IGGY_CI_BUILD
 ENV IGGY_CI_BUILD=${IGGY_CI_BUILD}
 
-RUN apk add --no-cache zig && \
+RUN apk add --no-cache zig make autoconf automake libtool pkgconfig && \
     cargo install cargo-zigbuild --locked && \
     rustup target add \
     x86_64-unknown-linux-musl \
@@ -47,6 +46,7 @@ COPY --from=planner /app/recipe.json recipe.json
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry-${TARGETPLATFORM}-${LIBC} \
     --mount=type=cache,target=/usr/local/cargo/git,id=cargo-git-${TARGETPLATFORM}-${LIBC} \
+    --mount=type=cache,target=/app/target,id=cargo-target-${TARGETPLATFORM}-${LIBC} \
     case "$TARGETPLATFORM:$LIBC" in \
     "linux/amd64:musl")  RUST_TARGET="x86_64-unknown-linux-musl" ;; \
     "linux/arm64:musl")  RUST_TARGET="aarch64-unknown-linux-musl" ;; \
@@ -73,11 +73,11 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry-${TARG
     *) echo "Unsupported $TARGETPLATFORM/$LIBC" && exit 1 ;; \
     esac && \
     if [ "$PROFILE" = "debug" ]; then \
-    cargo zigbuild --target ${RUST_TARGET} --bin iggy-server --bin iggy && \
+    cargo zigbuild --locked --target ${RUST_TARGET} --bin iggy-server --bin iggy && \
     cp /app/target/${RUST_TARGET}/debug/iggy-server /app/iggy-server && \
     cp /app/target/${RUST_TARGET}/debug/iggy /app/iggy; \
     else \
-    cargo zigbuild --target ${RUST_TARGET} --bin iggy-server --bin iggy --release && \
+    cargo zigbuild --locked --target ${RUST_TARGET} --bin iggy-server --bin iggy --release && \
     cp /app/target/${RUST_TARGET}/release/iggy-server /app/iggy-server && \
     cp /app/target/${RUST_TARGET}/release/iggy /app/iggy; \
     fi
