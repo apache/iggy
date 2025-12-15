@@ -34,13 +34,16 @@ ARG LIBC=musl
 ARG IGGY_CI_BUILD
 ENV IGGY_CI_BUILD=${IGGY_CI_BUILD}
 
-RUN apk add --no-cache zig make autoconf automake libtool pkgconfig && \
+RUN apk add --no-cache zig make autoconf automake libtool pkgconfig hwloc-dev && \
     cargo install cargo-zigbuild --locked && \
     rustup target add \
     x86_64-unknown-linux-musl \
     aarch64-unknown-linux-musl \
     x86_64-unknown-linux-gnu \
     aarch64-unknown-linux-gnu
+
+# Allow pkg-config to work in cross-compilation mode (needed for hwlocality-sys)
+ENV PKG_CONFIG_ALLOW_CROSS=1
 
 COPY --from=planner /app/recipe.json recipe.json
 

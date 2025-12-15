@@ -222,25 +222,45 @@ runs:
         else
           # CI on upstream: use shared deps cache + component-specific cache
           # Order matters: try shared deps first (most likely to have common layers)
-          CACHE_TO=$(
-            printf '%s\n' \
-              "type=registry,ref=${shared_deps}:buildcache-${arch},mode=max" \
-              "type=registry,ref=${img}:buildcache-${arch},mode=max" \
-              "type=inline" \
-              "type=gha,scope=buildkit-deps-${os}-${arch},mode=max" \
-              "type=gha,scope=buildkit-${scope_arch},mode=max"
-          )
-          CACHE_FROM=$(
-            printf '%s\n' \
-              "type=registry,ref=${shared_deps}:buildcache-${arch}" \
-              "type=registry,ref=${shared_deps}:buildcache" \
-              "type=registry,ref=${img}:buildcache-${arch}" \
-              "type=registry,ref=${img}:buildcache" \
-              "type=registry,ref=${img}:latest" \
-              "type=gha,scope=buildkit-deps-${os}-${arch}" \
-              "type=gha,scope=buildkit-${scope_arch}" \
-              "type=gha,scope=buildkit-${scope_os}"
-          )
+          # Avoid duplicates: if img == shared_deps, skip the component-specific registry cache
+          if [ "$img" = "$shared_deps" ]; then
+            CACHE_TO=$(
+              printf '%s\n' \
+                "type=registry,ref=${shared_deps}:buildcache-${arch},mode=max" \
+                "type=inline" \
+                "type=gha,scope=buildkit-deps-${os}-${arch},mode=max" \
+                "type=gha,scope=buildkit-${scope_arch},mode=max"
+            )
+            CACHE_FROM=$(
+              printf '%s\n' \
+                "type=registry,ref=${shared_deps}:buildcache-${arch}" \
+                "type=registry,ref=${shared_deps}:buildcache" \
+                "type=registry,ref=${img}:latest" \
+                "type=gha,scope=buildkit-deps-${os}-${arch}" \
+                "type=gha,scope=buildkit-${scope_arch}" \
+                "type=gha,scope=buildkit-${scope_os}"
+            )
+          else
+            CACHE_TO=$(
+              printf '%s\n' \
+                "type=registry,ref=${shared_deps}:buildcache-${arch},mode=max" \
+                "type=registry,ref=${img}:buildcache-${arch},mode=max" \
+                "type=inline" \
+                "type=gha,scope=buildkit-deps-${os}-${arch},mode=max" \
+                "type=gha,scope=buildkit-${scope_arch},mode=max"
+            )
+            CACHE_FROM=$(
+              printf '%s\n' \
+                "type=registry,ref=${shared_deps}:buildcache-${arch}" \
+                "type=registry,ref=${shared_deps}:buildcache" \
+                "type=registry,ref=${img}:buildcache-${arch}" \
+                "type=registry,ref=${img}:buildcache" \
+                "type=registry,ref=${img}:latest" \
+                "type=gha,scope=buildkit-deps-${os}-${arch}" \
+                "type=gha,scope=buildkit-${scope_arch}" \
+                "type=gha,scope=buildkit-${scope_os}"
+            )
+          fi
         fi
 
         {
