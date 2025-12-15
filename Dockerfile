@@ -25,7 +25,7 @@ RUN apt-get update && apt-get install -y \
     pkg-config \
     libssl-dev \
     libhwloc-dev \
-    libudev-dev
+    libudev-dev \
     && rm -rf /var/lib/apt/lists/*
 COPY . .
 RUN cargo build --bin iggy --release
@@ -35,6 +35,7 @@ FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y \
     ca-certificates \
     liblzma5 \
+    libhwloc15 \
     && rm -rf /var/lib/apt/lists/*
 COPY ./core/configs ./configs
 COPY --from=builder /build/target/release/iggy .

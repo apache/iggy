@@ -325,12 +325,12 @@ impl Validatable<ConfigurationError> for ShardingConfig {
             CpuAllocation::NumaAware(numa_config) => match NumaTopology::detect() {
                 // TODO: dry the validation, already validate it from the shard allocation
                 Ok(topology) => numa_config.validate(&topology).map_err(|e| {
-                    eprintln!("Invalid NUMA configuration: {}", e);
+                    error!("Invalid NUMA configuration: {}", e);
                     ConfigurationError::InvalidConfigurationValue
                 }),
                 Err(e) => {
-                    eprintln!("Failed to detect NUMA topology: {}", e);
-                    eprintln!("NUMA allocation requested but system doesn't support it");
+                    error!("Failed to detect NUMA topology: {}", e);
+                    error!("NUMA allocation requested but system doesn't support it");
                     Err(ConfigurationError::InvalidConfigurationValue)
                 }
             },
