@@ -29,17 +29,20 @@ RUN cargo chef prepare --recipe-path recipe.json
 FROM --platform=$BUILDPLATFORM chef AS builder
 ARG PROFILE=release
 ARG TARGETPLATFORM
-ARG LIBC=musl
+ARG LIBC=glibc
 ARG IGGY_CI_BUILD
 ENV IGGY_CI_BUILD=${IGGY_CI_BUILD}
 
-RUN apk add --no-cache zig && \
+RUN apk add --no-cache zig make autoconf automake libtool pkgconfig hwloc-dev xz-dev xz-static && \
     cargo install cargo-zigbuild --locked && \
     rustup target add \
     x86_64-unknown-linux-musl \
     aarch64-unknown-linux-musl \
     x86_64-unknown-linux-gnu \
     aarch64-unknown-linux-gnu
+
+# Allow pkg-config to work in cross-compilation mode (needed for hwlocality-sys)
+ENV PKG_CONFIG_ALLOW_CROSS=1
 
 COPY --from=planner /app/recipe.json recipe.json
 
@@ -48,6 +51,7 @@ COPY --from=planner /app/recipe.json recipe.json
 #
 RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry-${TARGETPLATFORM}-${LIBC} \
     --mount=type=cache,target=/usr/local/cargo/git,id=cargo-git-${TARGETPLATFORM}-${LIBC} \
+    --mount=type=cache,target=/app/target,id=cargo-target-${TARGETPLATFORM}-${LIBC} \
     case "$TARGETPLATFORM:$LIBC" in \
     "linux/amd64:musl") RUST_TARGET="x86_64-unknown-linux-musl" ;; \
     "linux/arm64:musl") RUST_TARGET="aarch64-unknown-linux-musl" ;; \
@@ -77,10 +81,10 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry-${TARG
     *) echo "Unsupported platform/libc combination: $TARGETPLATFORM/$LIBC" && exit 1 ;; \
     esac && \
     if [ "$PROFILE" = "debug" ]; then \
-    cargo zigbuild --target ${RUST_TARGET} --bin iggy-connectors && \
+    cargo zigbuild --locked --target ${RUST_TARGET} --bin iggy-connectors && \
     cp /app/target/${RUST_TARGET}/debug/iggy-connectors /app/iggy-connectors; \
     else \
-    cargo zigbuild --target ${RUST_TARGET} --bin iggy-connectors --release && \
+    cargo zigbuild --locked --target ${RUST_TARGET} --bin iggy-connectors --release && \
     cp /app/target/${RUST_TARGET}/release/iggy-connectors /app/iggy-connectors; \
     fi
 
