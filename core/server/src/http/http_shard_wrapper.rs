@@ -300,6 +300,8 @@ impl HttpSafeShard {
         partitioning: &Partitioning,
         batch: IggyMessagesBatchMut,
     ) -> Result<(), IggyError> {
+        self.shard().ensure_topic_exists(&stream_id, &topic_id)?;
+
         let partition_id = self.shard().streams.with_topic_by_id(
             &stream_id,
             &topic_id,
