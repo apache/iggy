@@ -47,8 +47,7 @@ public final class BasicConsumer {
 
     private static final Logger log = LoggerFactory.getLogger(BasicConsumer.class);
 
-    private BasicConsumer() {
-    }
+    private BasicConsumer() {}
 
     public static void main(String[] args) {
         var client = new IggyTcpClient("localhost", 8090);
@@ -58,7 +57,12 @@ public final class BasicConsumer {
     }
 
     private static void consumeMessages(IggyTcpClient client) {
-        log.info("Messages will be consumed from stream: {}, topic: {}, partition: {} with interval {}ms.", STREAM_ID, TOPIC_ID, PARTITION_ID, INTERVAL_MS);
+        log.info(
+                "Messages will be consumed from stream: {}, topic: {}, partition: {} with interval {}ms.",
+                STREAM_ID,
+                TOPIC_ID,
+                PARTITION_ID,
+                INTERVAL_MS);
 
         BigInteger offset = BigInteger.ZERO;
         int consumedBatches = 0;
@@ -72,7 +76,15 @@ public final class BasicConsumer {
             }
 
             try {
-                PolledMessages polledMessages = client.messages().pollMessages(STREAM_ID, TOPIC_ID, Optional.of(PARTITION_ID), consumer, PollingStrategy.offset(offset), MESSAGES_PER_BATCH, false);
+                PolledMessages polledMessages = client.messages()
+                        .pollMessages(
+                                STREAM_ID,
+                                TOPIC_ID,
+                                Optional.of(PARTITION_ID),
+                                consumer,
+                                PollingStrategy.offset(offset),
+                                MESSAGES_PER_BATCH,
+                                false);
 
                 if (polledMessages.messages().isEmpty()) {
                     log.info("No messages found.");

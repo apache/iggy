@@ -31,7 +31,9 @@ public final class Messages {
     public static final String ORDER_CONFIRMED_TYPE = "order_confirmed";
     public static final String ORDER_REJECTED_TYPE = "order_rejected";
 
-    private static final ObjectMapper MAPPER = new ObjectMapper().registerModule(new JavaTimeModule()).disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
+    private static final ObjectMapper MAPPER = new ObjectMapper()
+            .registerModule(new JavaTimeModule())
+            .disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
 
     public interface SerializableMessage {
         String getMessageType();
@@ -75,8 +77,9 @@ public final class Messages {
         }
     }
 
-    public record OrderCreated(long orderId, String currencyPair, double price, double quantity, String side,
-                               Instant timestamp) implements SerializableMessage {
+    public record OrderCreated(
+            long orderId, String currencyPair, double price, double quantity, String side, Instant timestamp)
+            implements SerializableMessage {
         @Override
         public String getMessageType() {
             return ORDER_CREATED_TYPE;

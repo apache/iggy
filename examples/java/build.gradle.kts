@@ -31,7 +31,7 @@ plugins {
 }
 
 dependencies {
-    implementation("org.apache.iggy:iggy:0.6.0-SNAPSHOT")
+    implementation("org.apache.iggy:iggy:0.6.0")
     implementation("org.slf4j:slf4j-simple:2.0.13")
     implementation("com.fasterxml.jackson.core:jackson-databind:2.20.1")
     implementation("com.fasterxml.jackson.datatype:jackson-datatype-jsr310:2.20.1")
@@ -96,4 +96,20 @@ tasks.register<JavaExec>("runMessageEnvelopeProducer") {
 tasks.register<JavaExec>("runMessageEnvelopeConsumer") {
     classpath = sourceSets["main"].runtimeClasspath
     mainClass.set("org.apache.iggy.examples.messageenvelope.consumer.MessageEnvelopeConsumer")
+}
+
+tasks.register<JavaExec>("runSinkDataProducer") {
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("org.apache.iggy.examples.sinkdataproducer.SinkDataProducer")
+}
+
+
+tasks.register<JavaExec>("runMultiTenantProducer") {
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("org.apache.iggy.examples.multitenant.producer.MultiTenantProducer")
+}
+
+tasks.register<JavaExec>("runMultiTenantConsumer") {
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("org.apache.iggy.examples.multitenant.consumer.MultiTenantConsumer")
 }

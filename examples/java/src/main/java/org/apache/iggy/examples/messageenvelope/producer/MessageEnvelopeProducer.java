@@ -54,8 +54,7 @@ public final class MessageEnvelopeProducer {
 
     private static final Logger log = LoggerFactory.getLogger(MessageEnvelopeProducer.class);
 
-    private MessageEnvelopeProducer() {
-    }
+    private MessageEnvelopeProducer() {}
 
     public static void main(String[] args) {
         var client = new IggyTcpClient("localhost", 8090);
@@ -73,7 +72,15 @@ public final class MessageEnvelopeProducer {
         if (topic.isPresent()) {
             log.warn("Topic already exists and will not be created again.");
         } else {
-            client.topics().createTopic(STREAM_ID, 1L, CompressionAlgorithm.None, BigInteger.ZERO, BigInteger.ZERO, Optional.empty(), TOPIC_NAME);
+            client.topics()
+                    .createTopic(
+                            STREAM_ID,
+                            1L,
+                            CompressionAlgorithm.None,
+                            BigInteger.ZERO,
+                            BigInteger.ZERO,
+                            Optional.empty(),
+                            TOPIC_NAME);
             log.info("Topic {} was created.", TOPIC_NAME);
         }
 
@@ -81,7 +88,12 @@ public final class MessageEnvelopeProducer {
     }
 
     public static void produceMessages(IggyTcpClient client) {
-        log.info("Messages will be sent to stream: {}, topic: {}, partition: {} with interval {}ms.", STREAM_NAME, TOPIC_NAME, PARTITION_ID, INTERVAL_MS);
+        log.info(
+                "Messages will be sent to stream: {}, topic: {}, partition: {} with interval {}ms.",
+                STREAM_NAME,
+                TOPIC_NAME,
+                PARTITION_ID,
+                INTERVAL_MS);
 
         int sentBatches = 0;
         Partitioning partitioning = Partitioning.partitionId(PARTITION_ID);
@@ -100,11 +112,17 @@ public final class MessageEnvelopeProducer {
 
             for (int i = 0; i < MESSAGES_PER_BATCH; i++) {
                 SerializableMessage serializableMessage = generator.generate();
-                String messageType = serializableMessage.getMessageType();
                 String json = serializableMessage.toJsonEnvelope();
                 byte[] payload = json.getBytes(StandardCharsets.UTF_8);
 
-                MessageHeader header = new MessageHeader(BigInteger.ZERO, MessageId.serverGenerated(), BigInteger.ZERO, BigInteger.ZERO, BigInteger.ZERO, 0L, (long) payload.length);
+                MessageHeader header = new MessageHeader(
+                        BigInteger.ZERO,
+                        MessageId.serverGenerated(),
+                        BigInteger.ZERO,
+                        BigInteger.ZERO,
+                        BigInteger.ZERO,
+                        0L,
+                        (long) payload.length);
                 Message message = new Message(header, payload, Optional.empty());
                 messages.add(message);
                 serializableMessages.add(serializableMessage);
