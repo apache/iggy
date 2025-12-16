@@ -47,6 +47,14 @@ inputs:
     required: false
     default: ""
 
+outputs:
+  digest:
+    description: "Image digest (sha256:...)"
+    value: ${{ steps.build.outputs.digest }}
+  image:
+    description: "Registry image name"
+    value: ${{ steps.config.outputs.image }}
+
 runs:
   using: "composite"
   steps:
@@ -158,10 +166,10 @@ runs:
       uses: docker/metadata-action@v5
       with:
         images: ${{ steps.config.outputs.image }}
+        # Tags are only used for local builds (dry-run). Push mode always uses digest.
         tags: |
-          type=raw,value=${{ inputs.version }}${{ steps.suffix.outputs.suffix }}
-          type=raw,value=latest,enable=${{ steps.suffix.outputs.is_single == 'false' && steps.config.outputs.should_push == 'true' && inputs.version != 'test' && !contains(inputs.version, 'edge') && !contains(inputs.version, 'rc') && !contains(inputs.version, 'alpha') && !contains(inputs.version, 'beta') }}
-          type=sha,enable=${{ inputs.version == 'test' }}
+          type=raw,value=${{ inputs.version }}${{ steps.suffix.outputs.suffix }},enable=${{ steps.config.outputs.should_push != 'true' }}
+          type=sha,enable=${{ steps.config.outputs.should_push != 'true' && inputs.version == 'test' }}
 
     - name: Determine platforms
       id: platforms
@@ -322,20 +330,43 @@ runs:
         echo "context=$context" >> "$GITHUB_OUTPUT"
         echo "📁 Build context: $context"
 
-    - name: Build and push
-      id: build
+    - name: Build and push (by digest)
+      id: build-push
+      if: steps.config.outputs.should_push == 'true'
       uses: docker/build-push-action@v6
       with:
         context: ${{ steps.ctx.outputs.context }}
         file: ${{ steps.config.outputs.dockerfile }}
         platforms: ${{ steps.platforms.outputs.platforms }}
-        push: ${{ steps.config.outputs.should_push }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: ${{ env.CACHE_FROM }}
+        cache-to: ${{ env.CACHE_TO }}
+        build-args: |
+          ${{ steps.bargs.outputs.all }}
+        outputs: type=image,name=${{ steps.config.outputs.image }},push-by-digest=true,name-canonical=true,push=true
+
+    - name: Build only (dry-run)
+      id: build-only
+      if: steps.config.outputs.should_push != 'true'
+      uses: docker/build-push-action@v6
+      with:
+        context: ${{ steps.ctx.outputs.context }}
+        file: ${{ steps.config.outputs.dockerfile }}
+        platforms: ${{ steps.platforms.outputs.platforms }}
         tags: ${{ steps.meta.outputs.tags }}
         labels: ${{ steps.meta.outputs.labels }}
         cache-from: ${{ env.CACHE_FROM }}
         cache-to: ${{ env.CACHE_TO }}
         build-args: |
           ${{ steps.bargs.outputs.all }}
+        push: false
+
+    - name: Consolidate build output
+      id: build
+      shell: bash
+      run: |
+        # Output digest from push step (dry-run builds don't produce useful digests)
+        echo "digest=${{ steps.build-push.outputs.digest }}" >> "$GITHUB_OUTPUT"
 
     - name: Export image (if not pushing)
       if: steps.config.outputs.should_push == 'false' && inputs.task != 'publish'
@@ -358,12 +389,14 @@ runs:
           echo "| Dockerfile | \`${{ steps.config.outputs.dockerfile }}\` |"
           echo "| Platforms | \`${{ steps.platforms.outputs.platforms }}\` |"
           echo "| Pushed | ${{ steps.config.outputs.should_push }} |"
-          if [ "${{ steps.config.outputs.should_push }}" = "true" ]; then
+          if [ -n "${{ steps.build.outputs.digest }}" ]; then
             echo "| Digest | \`${{ steps.build.outputs.digest }}\` |"
-            echo ""
-            echo "### Pull"
-            echo '```bash'
-            echo "docker pull ${{ steps.config.outputs.image }}:${{ inputs.version }}"
+          fi
+          echo ""
+          if [ "${{ steps.config.outputs.should_push }}" = "true" ]; then
+            echo "### Digest (for manifest creation)"
+            echo '```'
+            echo "${{ steps.config.outputs.image }}@${{ steps.build.outputs.digest }}"
             echo '```'
           fi
         } >> "$GITHUB_STEP_SUMMARY"
