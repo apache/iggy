@@ -296,6 +296,11 @@ fn main() -> Result<(), ServerError> {
         let metrics = Metrics::init();
 
         // TWELFTH DISCRETE LOADING STEP.
+        info!(
+            "Enable TCP socket migration across shards: {}.",
+            config.tcp.socket_migration
+        );
+
         info!("Starting {} shard(s)", shard_assignment.len());
         let (connections, shutdown_handles) = create_shard_connections(&shard_assignment);
         let shards_count = shard_assignment.len();
