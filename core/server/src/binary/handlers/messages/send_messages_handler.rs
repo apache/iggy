@@ -32,7 +32,7 @@ use iggy_common::Sizeable;
 use iggy_common::{INDEX_SIZE, PartitioningKind};
 use iggy_common::{IggyError, Partitioning, SendMessages, Validatable};
 use std::rc::Rc;
-use tracing::{error, info, instrument};
+use tracing::{debug, info, instrument};
 
 impl ServerCommandHandler for SendMessages {
     fn code(&self) -> u32 {
@@ -159,8 +159,8 @@ impl ServerCommandHandler for SendMessages {
             && let Some(target_shard) = shard.find_shard(&namespace)
             && target_shard.id != shard.id
         {
-            info!(
-                "TCP wrong shared detected: from_shard {}, to_shard {}",
+            debug!(
+                "TCP wrong shared detected: migrating from_shard {}, to_shard {}",
                 shard.id, target_shard.id
             );
 
@@ -183,18 +183,9 @@ impl ServerCommandHandler for SendMessages {
 
                 let socket_transfer_msg = ShardMessage::Request(request);
 
-                if let Err(err) = shard
+                shard
                     .send_request_to_shard_or_recoil(Some(&namespace), socket_transfer_msg)
-                    .await
-                {
-                    error!(
-                        "Failed to send socket transfer to shard {}, err: {:?}",
-                        target_shard.id, err
-                    );
-
-                    // TODO(tungtose): restore TcpStream to current shard or drop
-                    // connection?
-                }
+                    .await?;
 
                 info!("Sending socket transfer to shard {}", target_shard.id);
                 return Ok(HandlerResult::Migrated {

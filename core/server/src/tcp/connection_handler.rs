@@ -32,8 +32,12 @@ use tracing::{debug, error, info};
 
 const INITIAL_BYTES_LENGTH: usize = 4;
 
+/// Connection lifecycle action after command handling.
 pub enum ConnectionAction {
+    /// Continue handling connection on current shard.
     Finished,
+
+    /// Connection migrated to another shard, exit without cleanup.
     Migrated { to_shard: u16 },
 }
 

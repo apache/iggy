@@ -62,6 +62,9 @@ impl Session {
         self.active.set(false);
     }
 
+    /// Returns true if this session has been migrated to another shard.
+    ///
+    /// Prevents socket ping-ponging between shards. Subsequent wrong-shard requests use message forwarding instead
     pub fn is_migrated(&self) -> bool {
         self.migrated.get()
     }
