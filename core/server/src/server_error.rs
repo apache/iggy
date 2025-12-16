@@ -23,7 +23,7 @@ use std::array::TryFromSliceError;
 use std::io;
 
 error_set!(
-    ServerError := ConfigurationError || ArchiverError || ConnectionError || LogError || CompatError || QuicError || ShardError
+    ServerError := NumaError || ConfigurationError || ArchiverError || ConnectionError || LogError || CompatError || QuicError || ShardError
 
     IoError := {
         #[display("IO error")]
@@ -34,6 +34,37 @@ error_set!(
 
         #[display("Read error")]
         ReadToEndError(ReadError)
+    }
+
+    NumaError := {
+        #[display("Failed to detect topology: {}", msg)]
+        TopologyDetection {
+            msg: String
+        },
+
+        #[display("There is no NUMA node on this server")]
+        NoNumaNodes,
+
+        #[display("No Topology")]
+        NoTopology,
+
+        #[display("Binding Failed")]
+        BindingFailed,
+
+        #[display("Insufficient cores on node {}: requested {}, only {} available", node, requested, available)]
+        InsufficientCores {
+            requested: usize,
+            available: usize,
+            node: usize,
+        },
+
+        #[display("Invalid NUMA node: requested {}, only available {} node", requested, available)]
+        InvalidNode { requested: usize, available: usize },
+
+        #[display("Other error: {}", msg)]
+        Other {
+            msg: String
+        },
     }
 
     ConfigurationError := {

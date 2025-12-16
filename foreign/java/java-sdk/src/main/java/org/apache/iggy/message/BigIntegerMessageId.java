@@ -20,7 +20,7 @@
 package org.apache.iggy.message;
 
 import io.netty.buffer.ByteBuf;
-import org.apache.iggy.client.blocking.tcp.BytesSerializer;
+import org.apache.iggy.serde.BytesSerializer;
 
 import java.math.BigInteger;
 

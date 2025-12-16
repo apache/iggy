@@ -41,6 +41,7 @@ const PUBLIC_PATHS: &[&str] = &[
     "/users/login",
     "/users/refresh-token",
     "/personal-access-tokens/login",
+    "/ui",
 ];
 
 pub async fn jwt_auth(

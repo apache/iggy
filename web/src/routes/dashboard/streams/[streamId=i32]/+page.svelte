@@ -19,6 +19,7 @@
 
 <script lang="ts">
   import { page } from '$app/state';
+  import { resolve } from '$app/paths';
   import Button from '$lib/components/Button.svelte';
   import Icon from '$lib/components/Icon.svelte';
   import { openModal } from '$lib/components/Modals/AppModals.svelte';
@@ -85,7 +86,7 @@
   rowClass="grid grid-cols-[150px_3fr_2fr_2fr_2fr_2fr_3fr]"
   data={stream.topics}
   hrefBuilder={(topic) =>
-    typedRoute(`/dashboard/streams/${+(page.params.streamId || '')}/topics/${topic.id}`)}
+    resolve(typedRoute(`/dashboard/streams/${+(page.params.streamId || '')}/topics/${topic.id}`))}
   colNames={{
     id: 'ID',
     name: 'Name',

@@ -22,8 +22,9 @@ package org.apache.iggy.client.blocking.tcp;
 import org.apache.iggy.client.blocking.PartitionsClient;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
+import org.apache.iggy.serde.CommandCode;
 
-import static org.apache.iggy.client.blocking.tcp.BytesSerializer.toBytes;
+import static org.apache.iggy.serde.BytesSerializer.toBytes;
 
 class PartitionsTcpClient implements PartitionsClient {
 

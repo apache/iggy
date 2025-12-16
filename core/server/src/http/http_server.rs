@@ -1,4 +1,5 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
  * regarding copyright ownership.  The ASF licenses this file
@@ -116,6 +117,12 @@ pub async fn start_http_server(
 
     app = app.layer(middleware::from_fn(request_diagnostics));
 
+    #[cfg(feature = "iggy-web")]
+    {
+        app = app.merge(web::router());
+        info!("Web UI enabled at /ui");
+    }
+
     if !config.tls.enabled {
         let listener = TcpListener::bind(config.address.clone())
             .await
@@ -192,7 +199,9 @@ pub async fn start_http_server(
             })
             .spawn();
 
-        let server = axum_server::from_tcp_rustls(listener, tls_config).handle(handle);
+        let server = axum_server::from_tcp_rustls(listener, tls_config)
+            .map_err(|err| IggyError::HttpError(err.to_string()))?
+            .handle(handle);
         match server.serve(service).await {
             Ok(()) => {
                 info!("{api_name} shut down gracefully");

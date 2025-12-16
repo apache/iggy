@@ -1,0 +1,318 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: _build_rust_artifacts
+on:
+  workflow_call:
+    inputs:
+      version:
+        type: string
+        required: false
+        default: "edge"
+        description: "Version string for artifact naming (e.g., 'edge', '0.6.253')"
+      upload_artifacts:
+        type: boolean
+        required: false
+        default: true
+      use_latest_ci:
+        type: boolean
+        required: false
+        default: false
+        description: "Use latest CI configuration and scripts from master branch"
+      commit:
+        type: string
+        required: false
+        default: ""
+        description: "Specific commit to checkout for building"
+      binaries:
+        type: string
+        required: false
+        default: "iggy-server,iggy,iggy-bench,iggy-connectors"
+        description: "Comma-separated list of binaries to build"
+      connector_plugins:
+        type: string
+        required: false
+        default: "iggy_connector_elasticsearch_sink,iggy_connector_elasticsearch_source,iggy_connector_iceberg_sink,iggy_connector_postgres_sink,iggy_connector_postgres_source,iggy_connector_quickwit_sink,iggy_connector_random_source,iggy_connector_stdout_sink"
+        description: "Comma-separated list of connector plugin crates to build as shared libraries"
+    outputs:
+      artifact_name:
+        description: "Name of the uploaded artifact containing all artifacts"
+        value: ${{ jobs.collect.outputs.artifact_name }}
+
+env:
+  IGGY_CI_BUILD: true
+
+jobs:
+  build-binaries:
+    name: Binaries ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            libc: gnu
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+            libc: musl
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            libc: gnu
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+            libc: musl
+    steps:
+      - name: Download latest copy script from master
+        if: inputs.use_latest_ci
+        run: |
+          curl -sSL "https://raw.githubusercontent.com/${{ github.repository }}/master/scripts/copy-latest-from-master.sh" \
+            -o /tmp/copy-latest-from-master.sh
+          chmod +x /tmp/copy-latest-from-master.sh
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit || github.sha }}
+
+      - name: Apply latest CI from master
+        if: inputs.use_latest_ci
+        run: |
+          /tmp/copy-latest-from-master.sh save .github scripts
+          /tmp/copy-latest-from-master.sh apply
+
+      - name: Install musl-tools
+        if: matrix.libc == 'musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Setup Rust with cache
+        uses: ./.github/actions/utils/setup-rust-with-cache
+        with:
+          cache-targets: false
+
+      - name: Add Rust target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Build binaries
+        run: |
+          binaries="${{ inputs.binaries }}"
+          bin_flags=()
+
+          IFS=',' read -ra bins <<< "$binaries"
+          for bin in "${bins[@]}"; do
+            name="$(echo "$bin" | xargs)"
+            [[ -z "$name" ]] && continue
+            bin_flags+=(--bin "$name")
+          done
+
+          # musl builds: allow pkg-config to work in cross-compilation mode
+          # (needed for hwlocality-sys vendored build)
+          if [[ "${{ matrix.libc }}" == "musl" ]]; then
+            export PKG_CONFIG_ALLOW_CROSS=1
+            export PKG_CONFIG_ALL_STATIC=1
+          fi
+
+          # aarch64 musl: disable GCC outline atomics to avoid undefined __aarch64_ldadd4_sync
+          # references when linking dbus-sys (required by keyring crate)
+          if [[ "${{ matrix.target }}" == "aarch64-unknown-linux-musl" ]]; then
+            export CFLAGS="-mno-outline-atomics"
+          fi
+
+          cargo build --locked --release --target ${{ matrix.target }} "${bin_flags[@]}"
+
+      - name: Package binaries
+        id: pkg
+        run: |
+          target="${{ matrix.target }}"
+          version="${{ inputs.version }}"
+          outdir="dist/${target}"
+          mkdir -p "${outdir}"
+
+          binaries="${{ inputs.binaries }}"
+          IFS=',' read -ra bins <<< "$binaries"
+          for bin in "${bins[@]}"; do
+            bin_name="$(echo "$bin" | xargs)"
+            [[ -z "$bin_name" ]] && continue
+            cp "target/${target}/release/${bin_name}" "${outdir}/"
+          done
+
+          tarball="iggy-${target}-${version}.tar.gz"
+          tar czf "${tarball}" -C "${outdir}" .
+          echo "tarball=${tarball}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact
+        if: inputs.upload_artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.target }}
+          path: ${{ steps.pkg.outputs.tarball }}
+          retention-days: 7
+          if-no-files-found: error
+
+  build-connector-plugins:
+    name: Connector plugins ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Download latest copy script from master
+        if: inputs.use_latest_ci
+        run: |
+          curl -sSL "https://raw.githubusercontent.com/${{ github.repository }}/master/scripts/copy-latest-from-master.sh" \
+            -o /tmp/copy-latest-from-master.sh
+          chmod +x /tmp/copy-latest-from-master.sh
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit || github.sha }}
+
+      - name: Apply latest CI from master
+        if: inputs.use_latest_ci
+        run: |
+          /tmp/copy-latest-from-master.sh save .github scripts
+          /tmp/copy-latest-from-master.sh apply
+
+      - name: Setup Rust with cache
+        uses: ./.github/actions/utils/setup-rust-with-cache
+        with:
+          cache-targets: false
+
+      - name: Add Rust target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Build connector plugins
+        run: |
+          plugins="${{ inputs.connector_plugins }}"
+          pkg_flags=()
+
+          IFS=',' read -ra pkgs <<< "$plugins"
+          for pkg in "${pkgs[@]}"; do
+            name="$(echo "$pkg" | xargs)"
+            [[ -z "$name" ]] && continue
+            pkg_flags+=(--package "$name")
+          done
+
+          cargo build --locked --release --target ${{ matrix.target }} "${pkg_flags[@]}"
+
+      - name: Package connector plugins
+        id: pkg
+        run: |
+          target="${{ matrix.target }}"
+          version="${{ inputs.version }}"
+          outdir="dist/${target}"
+          mkdir -p "${outdir}"
+
+          plugins="${{ inputs.connector_plugins }}"
+          IFS=',' read -ra pkgs <<< "$plugins"
+          for pkg in "${pkgs[@]}"; do
+            lib_name="$(echo "$pkg" | xargs)"
+            [[ -z "$lib_name" ]] && continue
+            so_file="target/${target}/release/lib${lib_name}.so"
+            [[ -f "$so_file" ]] && cp "$so_file" "${outdir}/"
+          done
+
+          tarball="iggy-connectors-${target}-${version}.tar.gz"
+          tar czf "${tarball}" -C "${outdir}" .
+          echo "tarball=${tarball}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact
+        if: inputs.upload_artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: connector-plugins-${{ matrix.target }}
+          path: ${{ steps.pkg.outputs.tarball }}
+          retention-days: 7
+          if-no-files-found: error
+
+  collect:
+    name: Collect artifacts
+    needs: [build-binaries, build-connector-plugins]
+    if: inputs.upload_artifacts
+    runs-on: ubuntu-latest
+    outputs:
+      artifact_name: ${{ steps.output.outputs.artifact_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit || github.sha }}
+
+      - name: Get server version
+        id: meta
+        run: |
+          chmod +x scripts/extract-version.sh
+          echo "server_version=$(scripts/extract-version.sh rust-server)" >> "$GITHUB_OUTPUT"
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: "*-unknown-linux-*"
+          path: dist
+          merge-multiple: true
+
+      - name: Generate summary
+        run: |
+          shopt -s nullglob
+          tarballs=(dist/*.tar.gz)
+          (( ${#tarballs[@]} == 0 )) && exit 0
+
+          {
+            echo "## Built Rust Artifacts"
+            echo ""
+            echo "| Type | Target | File | Size |"
+            echo "|------|--------|------|------|"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          for tarball in "${tarballs[@]}"; do
+            filename=$(basename "$tarball")
+            size=$(ls -lh "$tarball" | awk '{print $5}')
+
+            if [[ "$filename" == iggy-connectors-* ]]; then type="plugins"
+            else type="binaries"; fi
+
+            if [[ "$filename" == *"x86_64"* ]]; then target="x86_64"
+            elif [[ "$filename" == *"aarch64"* ]]; then target="aarch64"
+            else target="unknown"; fi
+
+            if [[ "$filename" == *"musl"* ]]; then target="$target (musl)"
+            elif [[ "$filename" == *"gnu"* ]]; then target="$target (glibc)"
+            fi
+
+            echo "| $type | $target | \`$filename\` | $size |" >> "$GITHUB_STEP_SUMMARY"
+          done
+
+          {
+            echo ""
+            echo "**Server version:** ${{ steps.meta.outputs.server_version }}"
+            echo "**Binaries:** ${{ inputs.binaries }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload combined artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-artifacts-all
+          path: dist
+          retention-days: 30
+
+      - id: output
+        run: echo "artifact_name=rust-artifacts-all" >> "$GITHUB_OUTPUT"

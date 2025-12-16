@@ -15,7 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-ARG RUST_VERSION=1.91
+ARG RUST_VERSION=1.92
 
 FROM rust:${RUST_VERSION}-slim-bookworm AS builder
 
@@ -24,6 +24,8 @@ RUN apt-get update && apt-get install -y \
     build-essential \
     pkg-config \
     libssl-dev \
+    libhwloc-dev \
+    libudev-dev \
     && rm -rf /var/lib/apt/lists/*
 COPY . .
 RUN cargo build --bin iggy --release
@@ -33,6 +35,7 @@ FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y \
     ca-certificates \
     liblzma5 \
+    libhwloc15 \
     && rm -rf /var/lib/apt/lists/*
 COPY ./core/configs ./configs
 COPY --from=builder /build/target/release/iggy .

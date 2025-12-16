@@ -17,7 +17,7 @@
 
 [package]
 name = "iggy-bench"
-version = "0.3.0"
+version = "0.3.1-edge.1"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/apache/iggy"

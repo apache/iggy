@@ -184,6 +184,7 @@ services:
       - IGGY_TCP_ADDRESS_LEADER=iggy-leader:8091
       - IGGY_TCP_ADDRESS_FOLLOWER=iggy-follower:8092
       - RUST_LOG=debug
+      - RUSTFLAGS=-C linker=gcc
     volumes:
       - ./scenarios/basic_messaging.feature:/app/features/basic_messaging.feature
       - ./scenarios/leader_redirection.feature:/app/features/leader_redirection.feature

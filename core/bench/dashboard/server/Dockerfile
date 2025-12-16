@@ -15,7 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-ARG RUST_VERSION=1.91
+ARG RUST_VERSION=1.92
 
 # Build stage
 FROM rust:${RUST_VERSION}-slim-trixie AS builder
@@ -31,6 +31,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     openssl \
     curl \
     ca-certificates \
+    autoconf \
+    automake \
+    libtool \
     && rm -rf /var/lib/apt/lists/*
 
 # Install cargo-binstall

@@ -31,3 +31,5 @@ readme = "../../../README.md"
 bit-set = { workspace = true }
 iggy_common = { path = "../common" }
 message_bus = { path = "../message_bus" }
+rand = { workspace = true }
+rand_xoshiro = { workspace = true }

@@ -17,7 +17,7 @@
 
 [package]
 name = "iggy_connector_sdk"
-version = "0.1.0"
+version = "0.1.1-edge.1"
 description = "Iggy is the persistent message streaming platform written in Rust, supporting QUIC, TCP and HTTP transport protocols, capable of processing millions of messages per second."
 edition = "2024"
 license = "Apache-2.0"
@@ -42,7 +42,7 @@ once_cell = { workspace = true }
 postcard = { workspace = true }
 prost = "0.14.1"
 prost-types = "0.14.1"
-protox = "0.9.0"
+protox = "0.9.1"
 protox-parse = "0.9.0"
 regex = { workspace = true }
 serde = { workspace = true }
