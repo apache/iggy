@@ -36,6 +36,16 @@ address = "127.0.0.1:3000"
 # Maximum size of the request body in bytes. For security reasons, the default limit is 2 MB.
 max_request_size = "2 MB"
 
+# Enables the embedded Web UI dashboard at '/ui'.
+# When set to `true` and the server is compiled with the 'iggy-web' feature,
+# the Svelte dashboard will be served at the '/ui' endpoint, providing a
+# browser-based interface for managing streams, topics, and viewing messages.
+# If the server is compiled without 'iggy-web' feature and this is set to `true`,
+# a warning will be logged at startup but the server will continue to run.
+# `true` enables the embedded Web UI (requires server built with 'iggy-web' feature).
+# `false` disables the embedded Web UI (default).
+web_ui = false
+
 # Configuration for Cross-Origin Resource Sharing (CORS).
 [http.cors]
 # Controls whether CORS is enabled for the HTTP server.

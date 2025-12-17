@@ -30,6 +30,7 @@ pub struct HttpConfig {
     pub enabled: bool,
     pub address: String,
     pub max_request_size: IggyByteSize,
+    pub web_ui: bool,
     pub cors: HttpCorsConfig,
     pub jwt: HttpJwtConfig,
     pub metrics: HttpMetricsConfig,
