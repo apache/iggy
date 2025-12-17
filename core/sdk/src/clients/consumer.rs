@@ -928,8 +928,9 @@ impl Stream for IggyConsumer {
                         self.polling_strategy = PollingStrategy::offset(message.header.offset + 1);
                     }
                     PollingKind::Timestamp => {
+                        // Adding +1, since the `get_by_timestamp` is inclusive.
                         self.polling_strategy =
-                            PollingStrategy::timestamp(message.header.timestamp.into());
+                            PollingStrategy::timestamp((message.header.timestamp + 1).into());
                     }
                     _ => {}
                 }
@@ -1003,8 +1004,10 @@ impl Stream for IggyConsumer {
                                     PollingStrategy::offset(message.header.offset + 1);
                             }
                             PollingKind::Timestamp => {
-                                self.polling_strategy =
-                                    PollingStrategy::timestamp(message.header.timestamp.into());
+                                // Adding +1, since the `get_by_timestamp` is inclusive.
+                                self.polling_strategy = PollingStrategy::timestamp(
+                                    (message.header.timestamp + 1).into(),
+                                );
                             }
                             _ => {}
                         }
