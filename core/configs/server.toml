@@ -36,6 +36,16 @@ address = "127.0.0.1:3000"
 # Maximum size of the request body in bytes. For security reasons, the default limit is 2 MB.
 max_request_size = "2 MB"
 
+# Enables the embedded Web UI dashboard at '/ui'.
+# When set to `true` and the server is compiled with the 'iggy-web' feature,
+# the Svelte dashboard will be served at the '/ui' endpoint, providing a
+# browser-based interface for managing streams, topics, and viewing messages.
+# If the server is compiled without 'iggy-web' feature and this is set to `true`,
+# a warning will be logged at startup but the server will continue to run.
+# `true` enables the embedded Web UI (requires server built with 'iggy-web' feature).
+# `false` disables the embedded Web UI (default).
+web_ui = false
+
 # Configuration for Cross-Origin Resource Sharing (CORS).
 [http.cors]
 # Controls whether CORS is enabled for the HTTP server.
@@ -53,7 +63,7 @@ allowed_origins = ["*"]
 
 # Lists allowed headers that can be used in CORS requests.
 # For example, ["content-type"] permits only the content-type header.
-allowed_headers = ["content-type"]
+allowed_headers = ["content-type", "authorization"]
 
 # Headers that browsers are allowed to access in CORS responses.
 # An empty array means no additional headers are exposed to browsers.
@@ -556,7 +566,10 @@ ports = { tcp = 8091, quic = 8081, http = 3001, websocket = 8093 }
 # - "all": Use all available CPU cores (default)
 # - numeric value (e.g. 4): Use 4 shards (4 threads pinned to cores 0, 1, 2, 3)
 # - range (e.g. "5..8"): Use 3 shards with affinity to cores 5, 6, 7
-cpu_allocation = "all"
+# - numa settings:
+#     + "numa:auto": Use all available numa node, cores
+#     + "numa:nodes=0,1;cores=4;no_ht=true": Use NUMA node 0 and 1, each nodes use 4 cores, and no hyperthreads
+cpu_allocation = "numa:auto"
 
 [websocket]
 enabled = true

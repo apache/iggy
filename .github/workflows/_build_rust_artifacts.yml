@@ -119,6 +119,19 @@ jobs:
             bin_flags+=(--bin "$name")
           done
 
+          # musl builds: allow pkg-config to work in cross-compilation mode
+          # (needed for hwlocality-sys vendored build)
+          if [[ "${{ matrix.libc }}" == "musl" ]]; then
+            export PKG_CONFIG_ALLOW_CROSS=1
+            export PKG_CONFIG_ALL_STATIC=1
+          fi
+
+          # aarch64 musl: disable GCC outline atomics to avoid undefined __aarch64_ldadd4_sync
+          # references when linking dbus-sys (required by keyring crate)
+          if [[ "${{ matrix.target }}" == "aarch64-unknown-linux-musl" ]]; then
+            export CFLAGS="-mno-outline-atomics"
+          fi
+
           cargo build --locked --release --target ${{ matrix.target }} "${bin_flags[@]}"
 
       - name: Package binaries
@@ -253,6 +266,7 @@ jobs:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
+          pattern: "*-unknown-linux-*"
           path: dist
           merge-multiple: true
 

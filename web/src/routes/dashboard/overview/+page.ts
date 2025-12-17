@@ -17,18 +17,15 @@
  * under the License.
  */
 
-import { fetchIggyApi } from '$lib/api/fetchApi';
-import { handleFetchErrors } from '$lib/api/handleFetchErrors';
+import { clientApi } from '$lib/api/clientApi';
 import { statsMapper } from '$lib/domain/Stats';
+import type { PageLoad } from './$types';
 
-export const load = async ({ cookies }) => {
-  const result = await fetchIggyApi({
+export const load: PageLoad = async () => {
+  const data = await clientApi({
     path: '/stats',
-    method: 'GET',
-    cookies
+    method: 'GET'
   });
-
-  const { data } = await handleFetchErrors(result, cookies);
 
   return {
     stats: statsMapper(data)

@@ -23,6 +23,7 @@ use crate::{
     configs::{
         cache_indexes::CacheIndexesConfig,
         server::ServerConfig,
+        sharding::ShardInfo,
         system::{INDEX_EXTENSION, LOG_EXTENSION, SystemConfig},
     },
     io::fs_utils::{self, DirEntry},
@@ -250,13 +251,16 @@ pub fn load_users(state: impl IntoIterator<Item = UserState>) -> Users {
 }
 
 pub fn create_shard_connections(
-    shards_set: &HashSet<usize>,
+    shard_assignment: &[ShardInfo],
 ) -> (Vec<ShardConnector<ShardFrame>>, Vec<(u16, StopSender)>) {
-    let shards_count = shards_set.len();
-
     // Create connectors with sequential IDs (0, 1, 2, ...) regardless of CPU core numbers
-    let connectors: Vec<ShardConnector<ShardFrame>> = (0..shards_count)
-        .map(|idx| ShardConnector::new(idx as u16))
+    let connectors: Vec<ShardConnector<ShardFrame>> = shard_assignment
+        .iter()
+        .enumerate()
+        .map(|(idx, _assignment)| {
+            // let cpu_id = assignment.cpu_set.iter().next().unwrap_or(&idx);
+            ShardConnector::new(idx as u16)
+        })
         .collect();
 
     let shutdown_handles = connectors

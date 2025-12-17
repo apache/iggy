@@ -21,42 +21,41 @@
   import Icon from './Icon.svelte';
   import type { iconType } from './Icon.svelte';
   import { page } from '$app/state';
+  import { resolve } from '$app/paths';
   import { twMerge } from 'tailwind-merge';
   import { tooltip } from '$lib/actions/tooltip';
   import { typedRoute } from '$lib/types/appRoutes';
   import LogoType from '$lib/components/Logo/LogoType.svelte';
   import LogoMark from '$lib/components/Logo/LogoMark.svelte';
-  import { resolve } from '$app/paths';
-
   let navItems = $derived([
     {
       name: 'Overview',
       icon: 'home',
-      href: typedRoute('/dashboard/overview'),
+      href: resolve(typedRoute('/dashboard/overview')),
       active: page.url.pathname.includes(typedRoute('/dashboard/overview'))
     },
     {
       name: 'Streams',
       icon: 'stream',
-      href: typedRoute('/dashboard/streams'),
+      href: resolve(typedRoute('/dashboard/streams')),
       active: page.url.pathname.includes(typedRoute('/dashboard/streams'))
     },
     // {
     //   name: 'Clients',
     //   icon: 'clients',
-    //   href: typedRoute('/dashboard/clients'),
+    //   href: resolve(typedRoute('/dashboard/clients')),
     //   active: page.url.pathname.includes(typedRoute('/dashboard/clients'))
     // },
     // {
     //   name: 'Logs',
     //   icon: 'logs',
-    //   href: typedRoute('/dashboard/logs'),
+    //   href: resolve(typedRoute('/dashboard/logs')),
     //   active: page.url.pathname.includes(typedRoute('/dashboard/logs'))
     // },
     {
       name: 'Settings',
       icon: 'settings',
-      href: typedRoute('/dashboard/settings/webUI'),
+      href: resolve(typedRoute('/dashboard/settings/webUI')),
       active: page.url.pathname.includes('/dashboard/settings')
     }
   ] satisfies { name: string; icon: iconType; href: string; active: boolean }[]);
@@ -78,7 +77,7 @@
       <li>
         <div use:tooltip={{ placement: 'right' }}>
           <a
-            href={resolve(href)}
+            {href}
             data-trigger
             class={twMerge(
               'p-2 block rounded-xl transition-colors  ring-2 ring-transparent',

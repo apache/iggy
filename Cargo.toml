@@ -132,6 +132,7 @@ futures = "0.3.31"
 futures-util = "0.3.31"
 human-repr = "1.1.0"
 humantime = "2.3.0"
+hwlocality = "1.0.0-alpha.11"
 iceberg = "=0.6.0"
 iceberg-catalog-rest = "=0.6.0"
 iggy = { path = "core/sdk", version = "0.8.1-edge.1" }
@@ -161,7 +162,7 @@ reqwest = { version = "0.12.25", default-features = false, features = [
 reqwest-middleware = { version = "0.4.2", features = ["json"] }
 reqwest-retry = "0.8.0"
 reqwest-tracing = "0.5.8"
-rust-s3 = { version = "0.37.0", default-features = false, features = [
+rust-s3 = { version = "0.37.1", default-features = false, features = [
     "tokio-rustls-tls",
     "tags",
 ] }
