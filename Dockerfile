@@ -26,8 +26,11 @@ RUN apt-get update && apt-get install -y \
     libssl-dev \
     libhwloc-dev \
     libudev-dev \
+    nodejs \
+    npm \
     && rm -rf /var/lib/apt/lists/*
 COPY . .
+RUN npm --prefix web ci && npm --prefix web run build:static
 RUN cargo build --bin iggy --release
 RUN cargo build --bin iggy-server --release
 

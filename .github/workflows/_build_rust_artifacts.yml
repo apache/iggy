@@ -107,6 +107,14 @@ jobs:
       - name: Add Rust target
         run: rustup target add ${{ matrix.target }}
 
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Build Web UI static files
+        run: npm --prefix web ci && npm --prefix web run build:static
+
       - name: Build binaries
         run: |
           binaries="${{ inputs.binaries }}"
