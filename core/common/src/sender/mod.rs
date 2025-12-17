@@ -37,7 +37,7 @@ use compio::net::TcpStream;
 use compio_quic::{RecvStream, SendStream};
 use compio_tls::TlsStream;
 use std::future::Future;
-use std::os::fd::{AsFd, IntoRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, OwnedFd};
 use tracing::{debug, error};
 
 macro_rules! forward_async_methods {

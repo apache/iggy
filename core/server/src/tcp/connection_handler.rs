@@ -16,12 +16,12 @@
  * under the License.
  */
 
-use crate::binary::command;
 use crate::binary::command::ServerCommandHandler;
 use crate::server_error::ConnectionError;
 use crate::shard::IggyShard;
 use crate::streaming::session::Session;
 use crate::tcp::connection_handler::command::ServerCommand;
+use crate::{binary::command, server_error::IoError};
 use async_channel::Receiver;
 use bytes::BytesMut;
 use futures::FutureExt;
@@ -120,6 +120,7 @@ pub(crate) async fn handle_connection(
                     error!(
                         "Command with code {cmd_code} was not handled successfully, session: {session}, error: {error}."
                     );
+
                     if let IggyError::ClientNotFound(_) = error {
                         sender.send_error_response(error).await?;
                         debug!("TCP error response was sent to: {session}.");

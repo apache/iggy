@@ -27,8 +27,7 @@ use iggy_common::{
     CompressionAlgorithm, Identifier, IggyExpiry, MaxTopicSize, Permissions, UserStatus,
 };
 
-use std::net::SocketAddr;
-use std::os::fd::RawFd;
+use std::{net::SocketAddr, os::fd::OwnedFd};
 
 #[allow(clippy::large_enum_variant)]
 pub enum ShardSendRequestResult {
@@ -131,7 +130,7 @@ pub enum ShardRequestPayload {
         segments_count: u32,
     },
     SocketTransfer {
-        fd: RawFd,
+        fd: OwnedFd,
         from_shard: u16,
         client_id: u32,
         user_id: u32,

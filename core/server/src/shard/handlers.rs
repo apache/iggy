@@ -35,7 +35,7 @@ use crate::{
 use compio_net::TcpStream;
 use iggy_common::{Identifier, IggyError, SenderKind, TransportProtocol};
 use nix::sys::stat::SFlag;
-use std::os::fd::{BorrowedFd, FromRawFd};
+use std::os::fd::{FromRawFd, IntoRawFd};
 use tracing::info;
 
 pub(super) async fn handle_shard_message(
@@ -328,20 +328,19 @@ async fn handle_request(
             initial_data,
         } => {
             info!(
-                "Received socket transfer msg, fd: {fd}, from_shard: {from_shard}, address: {address}"
+                "Received socket transfer msg, fd: {fd:?}, from_shard: {from_shard}, address: {address}"
             );
 
             // Safety: The fd already != 1.
-            let borrowed_fd = unsafe { BorrowedFd::borrow_raw(fd) };
-            let stat = nix::sys::stat::fstat(borrowed_fd)
+            let stat = nix::sys::stat::fstat(&fd)
                 .map_err(|e| IggyError::IoError(format!("Invalid fd: {}", e)))?;
 
             if !SFlag::from_bits_truncate(stat.st_mode).contains(SFlag::S_IFSOCK) {
-                return Err(IggyError::IoError(format!("fd {} is not a socket", fd)));
+                return Err(IggyError::IoError(format!("fd {:?} is not a socket", fd)));
             }
 
             // restore TcpStream from fd
-            let tcp_stream = unsafe { TcpStream::from_raw_fd(fd) };
+            let tcp_stream = unsafe { TcpStream::from_raw_fd(fd.into_raw_fd()) };
             let session = shard.add_client(&address, TransportProtocol::Tcp);
             session.set_user_id(user_id);
             session.set_migrated();

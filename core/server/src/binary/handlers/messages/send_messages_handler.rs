@@ -32,7 +32,7 @@ use iggy_common::Sizeable;
 use iggy_common::{INDEX_SIZE, PartitioningKind};
 use iggy_common::{IggyError, Partitioning, SendMessages, Validatable};
 use std::rc::Rc;
-use tracing::{debug, info, instrument};
+use tracing::{debug, error, info, instrument};
 
 impl ServerCommandHandler for SendMessages {
     fn code(&self) -> u32 {
@@ -183,9 +183,13 @@ impl ServerCommandHandler for SendMessages {
 
                 let socket_transfer_msg = ShardMessage::Request(request);
 
-                shard
+                if let Err(e) = shard
                     .send_request_to_shard_or_recoil(Some(&namespace), socket_transfer_msg)
-                    .await?;
+                    .await
+                {
+                    error!("tranfer socket to another shard failed, drop connection. {e:?}");
+                    return Ok(HandlerResult::Finished);
+                }
 
                 info!("Sending socket transfer to shard {}", target_shard.id);
                 return Ok(HandlerResult::Migrated {
