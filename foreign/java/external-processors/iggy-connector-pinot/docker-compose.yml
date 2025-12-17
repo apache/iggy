@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   # Apache Iggy Server (from official Apache repo)
   iggy:
@@ -8,11 +6,23 @@ services:
     ports:
       - "8090:8090"  # TCP
       - "3000:3000"  # HTTP
-      - "8080:8080"  # HTTP API
+      - "8080:8080"  # QUIC
     environment:
-      - IGGY_LOG_LEVEL=info
+      - IGGY_SYSTEM_LOGGING_LEVEL=info
+      - IGGY_TCP_ADDRESS=0.0.0.0:8090
+      - IGGY_HTTP_ENABLED=true
+      - IGGY_HTTP_ADDRESS=0.0.0.0:3000
+      - IGGY_QUIC_ADDRESS=0.0.0.0:8080
+      - IGGY_ROOT_USERNAME=iggy
+      - IGGY_ROOT_PASSWORD=iggy
+    cap_add:
+      - SYS_NICE
     security_opt:
       - seccomp:unconfined
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:3000/"]
       interval: 10s
@@ -51,6 +61,10 @@ services:
       timeout: 5s
       retries: 10
       start_period: 30s
+    volumes:
+      - ./build/libs:/opt/pinot/plugins/pinot-stream-ingestion/iggy-connector
+      - ../../java-sdk/build/libs/iggy-0.6.0.jar:/opt/pinot/plugins/pinot-stream-ingestion/iggy-connector/iggy-0.6.0.jar
+      - ./deployment:/opt/pinot/deployment
     networks:
       - iggy-pinot-network
 
@@ -83,7 +97,7 @@ services:
       - "8098:8098"
       - "8097:8097"
     environment:
-      JAVA_OPTS: "-Xms1G -Xmx2G -XX:+UseG1GC"
+      JAVA_OPTS: "-Xms1G -Xmx2G -XX:+UseG1GC -Dplugins.include=iggy-connector"
     depends_on:
       - pinot-broker
     healthcheck:
@@ -93,7 +107,8 @@ services:
       retries: 10
       start_period: 30s
     volumes:
-      - ./build/libs:/opt/pinot/plugins/iggy-connector
+      - ./build/libs:/opt/pinot/plugins/pinot-stream-ingestion/iggy-connector
+      - ../../java-sdk/build/libs/iggy-0.6.0.jar:/opt/pinot/plugins/pinot-stream-ingestion/iggy-connector/iggy-0.6.0.jar
       - ./deployment:/opt/pinot/deployment
     networks:
       - iggy-pinot-network

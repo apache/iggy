@@ -1,5 +1,5 @@
 {
-  "tableName": "test_events_realtime",
+  "tableName": "test_events",
   "tableType": "REALTIME",
   "segmentsConfig": {
     "timeColumnName": "timestamp",
@@ -18,6 +18,7 @@
       "stream.iggy.topic.name": "test-events",
       "stream.iggy.consumer.type": "lowlevel",
       "stream.iggy.consumer.factory.class.name": "org.apache.iggy.connector.pinot.consumer.IggyConsumerFactory",
+      "realtime.segment.consumer.factory.class.name": "org.apache.iggy.connector.pinot.consumer.IggyConsumerFactory",
       "stream.iggy.decoder.class.name": "org.apache.iggy.connector.pinot.decoder.IggyJsonMessageDecoder",
 
       "stream.iggy.host": "iggy",
@@ -31,6 +32,7 @@
 
       "stream.iggy.poll.batch.size": "100",
       "stream.iggy.connection.pool.size": "4",
+      "stream.iggy.consumer.prop.auto.offset.reset": "smallest",
 
       "realtime.segment.flush.threshold.rows": "1000",
       "realtime.segment.flush.threshold.time": "600000"

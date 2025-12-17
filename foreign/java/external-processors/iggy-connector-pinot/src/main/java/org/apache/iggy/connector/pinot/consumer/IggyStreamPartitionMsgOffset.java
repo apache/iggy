@@ -19,6 +19,7 @@
 
 package org.apache.iggy.connector.pinot.consumer;
 
+import org.apache.pinot.spi.stream.LongMsgOffset;
 import org.apache.pinot.spi.stream.StreamPartitionMsgOffset;
 
 /**
@@ -47,8 +48,12 @@ public class IggyStreamPartitionMsgOffset implements StreamPartitionMsgOffset {
         if (other instanceof IggyStreamPartitionMsgOffset) {
             IggyStreamPartitionMsgOffset otherOffset = (IggyStreamPartitionMsgOffset) other;
             return Long.compare(this.offset, otherOffset.offset);
+        } else if (other instanceof LongMsgOffset) {
+            // Handle comparison with Pinot's LongMsgOffset
+            LongMsgOffset longOffset = (LongMsgOffset) other;
+            return Long.compare(this.offset, longOffset.getOffset());
         }
-        throw new IllegalArgumentException("Cannot compare with non-Iggy offset: " + other.getClass());
+        throw new IllegalArgumentException("Cannot compare with incompatible offset type: " + other.getClass());
     }
 
     @Override

@@ -33,7 +33,10 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 
 /**
  * Metadata provider for Iggy streams.
@@ -227,6 +230,46 @@ public class IggyStreamMetadataProvider implements StreamMetadataProvider {
         } catch (NumberFormatException e) {
             return TopicId.of(topicIdStr);
         }
+    }
+
+    /**
+     * Fetches the latest offsets available for the specified partitions.
+     * Used by Pinot for ingestion delay tracking.
+     * Note: This method is required by Pinot runtime but may not be in compile-time interface.
+     *
+     * @param partitions set of partition IDs to fetch offsets for
+     * @param timeoutMillis timeout for the operation
+     * @return map of partition IDs to their latest offsets
+     */
+    public Map<Integer, StreamPartitionMsgOffset> fetchLatestStreamOffset(Set<Integer> partitions, long timeoutMillis) {
+        Map<Integer, StreamPartitionMsgOffset> offsets = new HashMap<>();
+
+        try {
+            ensureConnected();
+
+            for (Integer partition : partitions) {
+                Partition partitionInfo = getPartitionInfo(partition);
+                long latestOffset = partitionInfo.messagesCount().longValue();
+                log.debug("Latest offset for partition {}: {}", partition, latestOffset);
+                offsets.put(partition, new IggyStreamPartitionMsgOffset(latestOffset));
+            }
+
+            return offsets;
+        } catch (RuntimeException e) {
+            log.error("Error fetching latest offsets: {}", e.getMessage(), e);
+            throw new RuntimeException("Failed to fetch latest offsets", e);
+        }
+    }
+
+    /**
+     * Indicates whether this stream supports offset lag tracking.
+     * Iggy supports offset lag since we can track current vs latest offset.
+     * Note: This method is required by Pinot runtime but may not be in compile-time interface.
+     *
+     * @return true if offset lag is supported
+     */
+    public boolean supportsOffsetLag() {
+        return true;
     }
 
     @Override

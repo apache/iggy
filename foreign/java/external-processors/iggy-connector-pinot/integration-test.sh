@@ -72,58 +72,78 @@ done
 
 sleep 5 # Extra time for services to stabilize
 
-# Step 4: Create Iggy stream and topic
-echo -e "\n${YELLOW}Step 4: Creating Iggy stream and topic...${NC}"
+# Step 4: Login to Iggy and create stream/topic
+echo -e "\n${YELLOW}Step 4: Logging in to Iggy and creating stream/topic...${NC}"
+
+# Login and get JWT token
+TOKEN=$(curl -s -X POST "http://localhost:3000/users/login" \
+  -H "Content-Type: application/json" \
+  -d '{"username": "iggy", "password": "iggy"}' | jq -r '.access_token.token')
+
+if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
+  echo -e "${RED}✗ Failed to get authentication token${NC}"
+  exit 1
+fi
+
+echo -e "${GREEN}✓ Authenticated${NC}"
 
 # Create stream
-curl -X POST "http://localhost:3000/streams" \
+curl -s -X POST "http://localhost:3000/streams" \
+  -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"stream_id": 1, "name": "test-stream"}' \
   && echo -e "${GREEN}✓ Stream created${NC}" || echo -e "${RED}✗ Stream creation failed (may already exist)${NC}"
 
 # Create topic
-curl -X POST "http://localhost:3000/streams/test-stream/topics" \
+TOPIC_RESPONSE=$(curl -s -X POST "http://localhost:3000/streams/test-stream/topics" \
+  -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"topic_id": 1, "name": "test-events", "partitions_count": 2, "message_expiry": 0}' \
-  && echo -e "${GREEN}✓ Topic created${NC}" || echo -e "${RED}✗ Topic creation failed (may already exist)${NC}"
+  -d '{"topic_id": 1, "name": "test-events", "partitions_count": 2, "compression_algorithm": "none", "message_expiry": 0, "max_topic_size": 0}')
 
-# Step 5: Copy connector JARs to Pinot server
-echo -e "\n${YELLOW}Step 5: Deploying connector to Pinot...${NC}"
-docker cp build/libs/iggy-connector-pinot-0.6.0.jar pinot-server:/opt/pinot/plugins/iggy-connector/
-docker cp ../../java-sdk/build/libs/iggy-0.6.0.jar pinot-server:/opt/pinot/plugins/iggy-connector/
-docker restart pinot-server
-echo -e "${GREEN}✓ Connector deployed, Pinot server restarting${NC}"
+if echo "$TOPIC_RESPONSE" | grep -q '"id"'; then
+  echo -e "${GREEN}✓ Topic created${NC}"
+else
+  echo -e "${RED}✗ Topic creation failed: $TOPIC_RESPONSE${NC}"
+  exit 1
+fi
 
-# Wait for server to restart
-echo -n "Waiting for Pinot Server to restart... "
-sleep 10
-for i in {1..30}; do
-    if curl -s http://localhost:8098/health > /dev/null 2>&1; then
-        echo -e "${GREEN}✓${NC}"
-        break
-    fi
-    sleep 2
-    echo -n "."
-done
+# Create consumer group (topic-scoped, not stream-scoped)
+curl -s -X POST "http://localhost:3000/streams/test-stream/topics/test-events/consumer-groups" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "pinot-integration-test"}' \
+  && echo -e "${GREEN}✓ Consumer group created${NC}" || echo -e "${YELLOW}Note: Consumer group may already exist${NC}"
 
-# Step 6: Create Pinot schema
-echo -e "\n${YELLOW}Step 6: Creating Pinot schema...${NC}"
+# Step 5: Create Pinot schema
+echo -e "\n${YELLOW}Step 5: Creating Pinot schema...${NC}"
 curl -X POST "http://localhost:9000/schemas" \
   -H "Content-Type: application/json" \
   -d @deployment/schema.json \
   && echo -e "${GREEN}✓ Schema created${NC}" || echo -e "${RED}✗ Schema creation failed${NC}"
 
-# Step 7: Create Pinot table
-echo -e "\n${YELLOW}Step 7: Creating Pinot realtime table...${NC}"
-curl -X POST "http://localhost:9000/tables" \
+# Step 6: Create Pinot table
+echo -e "\n${YELLOW}Step 6: Creating Pinot realtime table...${NC}"
+TABLE_RESPONSE=$(curl -s -X POST "http://localhost:9000/tables" \
   -H "Content-Type: application/json" \
-  -d @deployment/table.json \
-  && echo -e "${GREEN}✓ Table created${NC}" || echo -e "${RED}✗ Table creation failed${NC}"
+  -d @deployment/table.json)
+
+if echo "$TABLE_RESPONSE" | grep -q '"status":"Table test_events_REALTIME succesfully added"'; then
+  echo -e "${GREEN}✓ Table created${NC}"
+elif echo "$TABLE_RESPONSE" | grep -q '"code":500'; then
+  echo -e "${RED}✗ Table creation failed${NC}"
+  echo "$TABLE_RESPONSE" | jq '.'
+  exit 1
+else
+  echo -e "${GREEN}✓ Table created${NC}"
+fi
 
 sleep 5 # Let table initialize
 
-# Step 8: Send test messages to Iggy
-echo -e "\n${YELLOW}Step 8: Sending test messages to Iggy...${NC}"
+# Step 7: Send test messages to Iggy
+echo -e "\n${YELLOW}Step 7: Sending test messages to Iggy...${NC}"
+
+# Partition value for partition 0 (4-byte little-endian, base64 encoded)
+PARTITION_VALUE=$(printf '\x00\x00\x00\x00' | base64)
 
 for i in {1..10}; do
     TIMESTAMP=$(($(date +%s) * 1000))
@@ -139,23 +159,24 @@ EOF
 )
 
     curl -X POST "http://localhost:3000/streams/test-stream/topics/test-events/messages" \
+      -H "Authorization: Bearer $TOKEN" \
       -H "Content-Type: application/json" \
-      -d "{\"messages\": [{\"payload\": \"$(echo $MESSAGE | base64)\"}]}" \
+      -d "{\"partitioning\": {\"kind\": \"partition_id\", \"value\": \"$PARTITION_VALUE\"}, \"messages\": [{\"payload\": \"$(echo $MESSAGE | base64)\"}]}" \
       > /dev/null 2>&1
     echo -e "${GREEN}✓ Message $i sent${NC}"
     sleep 1
 done
 
-# Step 9: Wait for ingestion
-echo -e "\n${YELLOW}Step 9: Waiting for Pinot to ingest messages...${NC}"
+# Step 8: Wait for ingestion
+echo -e "\n${YELLOW}Step 8: Waiting for Pinot to ingest messages...${NC}"
 sleep 15
 
-# Step 10: Query Pinot and verify data
-echo -e "\n${YELLOW}Step 10: Querying Pinot for ingested data...${NC}"
+# Step 9: Query Pinot and verify data
+echo -e "\n${YELLOW}Step 9: Querying Pinot for ingested data...${NC}"
 
 QUERY_RESULT=$(curl -s -X POST "http://localhost:8099/query/sql" \
   -H "Content-Type: application/json" \
-  -d '{"sql": "SELECT COUNT(*) FROM test_events_realtime"}')
+  -d '{"sql": "SELECT COUNT(*) FROM test_events_REALTIME"}')
 
 echo "Query Result:"
 echo "$QUERY_RESULT" | jq '.'
@@ -173,7 +194,7 @@ if [ "$COUNT" -gt "0" ]; then
     echo -e "\n${YELLOW}Sample data:${NC}"
     curl -s -X POST "http://localhost:8099/query/sql" \
       -H "Content-Type: application/json" \
-      -d '{"sql": "SELECT * FROM test_events_realtime LIMIT 5"}' | jq '.'
+      -d '{"sql": "SELECT * FROM test_events_REALTIME LIMIT 5"}' | jq '.'
 
     EXIT_CODE=0
 else

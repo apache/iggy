@@ -98,19 +98,19 @@ public class IggyPartitionGroupConsumer implements PartitionGroupConsumer {
         try {
             ensureConnected();
 
-            // Join consumer group on first fetch
-            if (!consumerGroupJoined) {
-                joinConsumerGroup();
-            }
+            // No need to join consumer group when using single consumer
 
             // Determine starting offset
             long fetchOffset = determineStartOffset(startOffset);
+            log.debug("Fetching messages from partition {} at offset {}", partitionId, fetchOffset);
 
             // Poll messages from Iggy
             PolledMessages polledMessages = pollMessages(fetchOffset);
+            log.debug("Polled {} messages from partition {}", polledMessages.messages().size(), partitionId);
 
             // Convert to Pinot MessageBatch
-            return convertToMessageBatch(polledMessages);
+            MessageBatch batch = convertToMessageBatch(polledMessages);
+            return batch;
 
         } catch (RuntimeException e) {
             log.error("Error fetching messages from partition {}: {}", partitionId, e.getMessage(), e);
@@ -138,7 +138,8 @@ public class IggyPartitionGroupConsumer implements PartitionGroupConsumer {
             // Parse stream and topic IDs
             streamId = parseStreamId(config.getStreamId());
             topicId = parseTopicId(config.getTopicId());
-            consumer = Consumer.group(ConsumerId.of(config.getConsumerGroup()));
+            // Use single consumer instead of consumer group for explicit offset control
+            consumer = Consumer.of(ConsumerId.of(Long.valueOf(partitionId)));
 
             log.info("Connected to Iggy server successfully");
         }
@@ -194,16 +195,16 @@ public class IggyPartitionGroupConsumer implements PartitionGroupConsumer {
         try {
             Optional<Long> partition = Optional.of((long) partitionId);
 
-            // Use consumer group managed offset with NEXT strategy
-            // This allows Iggy to manage offset advancement automatically
-            PollingStrategy strategy = PollingStrategy.next();
+            // Use explicit offset strategy to fetch from the offset Pinot requested
+            PollingStrategy strategy = PollingStrategy.offset(java.math.BigInteger.valueOf(fetchOffset));
 
             log.debug(
-                    "Polling messages: partition={}, strategy=NEXT, batchSize={}",
+                    "Polling messages: partition={}, offset={}, batchSize={}",
                     partitionId,
+                    fetchOffset,
                     config.getPollBatchSize());
 
-            // Poll with auto-commit enabled (convert int to Long)
+            // Poll with auto-commit disabled (we'll manage offsets via Pinot)
             PolledMessages polledMessages = asyncClient
                     .messages()
                     .pollMessagesAsync(
@@ -213,7 +214,7 @@ public class IggyPartitionGroupConsumer implements PartitionGroupConsumer {
                             consumer,
                             strategy,
                             Long.valueOf(config.getPollBatchSize()),
-                            true)
+                            false)
                     .join();
 
             log.debug(
@@ -222,8 +223,8 @@ public class IggyPartitionGroupConsumer implements PartitionGroupConsumer {
                     partitionId,
                     polledMessages.currentOffset());
 
-            // Update current offset
-            if (polledMessages.currentOffset() != null) {
+            // Update current offset only if we got messages
+            if (!polledMessages.messages().isEmpty() && polledMessages.currentOffset() != null) {
                 currentOffset = polledMessages.currentOffset().longValue() + 1;
             }
 

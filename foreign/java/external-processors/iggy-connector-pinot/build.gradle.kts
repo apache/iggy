@@ -28,8 +28,10 @@ dependencies {
     // Apache Pinot dependencies (provided - not bundled with connector)
     compileOnly("org.apache.pinot:pinot-spi:1.2.0")
 
-    // Serialization support
-    implementation(libs.jackson.databind)
+    // Serialization support - use Jackson 2.x for Pinot compatibility
+    implementation("com.fasterxml.jackson.core:jackson-databind:2.18.2") {
+        exclude(group = "tools.jackson.core")
+    }
 
     // Apache Commons
     implementation(libs.commons.lang3)
@@ -42,6 +44,17 @@ dependencies {
     testImplementation(libs.bundles.testing)
     testImplementation("org.apache.pinot:pinot-spi:1.2.0") // Need Pinot SPI for tests
     testRuntimeOnly(libs.slf4j.simple)
+}
+
+// Task to copy runtime dependencies for Docker deployment (flattened into libs directory)
+tasks.register<Copy>("copyDependencies") {
+    from(configurations.runtimeClasspath)
+    into(layout.buildDirectory.dir("libs"))
+}
+
+// Make jar task depend on copyDependencies
+tasks.named("jar") {
+    finalizedBy("copyDependencies")
 }
 
 publishing {

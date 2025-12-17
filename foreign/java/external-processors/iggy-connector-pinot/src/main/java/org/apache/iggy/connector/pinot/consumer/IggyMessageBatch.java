@@ -20,6 +20,8 @@
 package org.apache.iggy.connector.pinot.consumer;
 
 import org.apache.pinot.spi.stream.MessageBatch;
+import org.apache.pinot.spi.stream.StreamMessage;
+import org.apache.pinot.spi.stream.StreamMessageMetadata;
 import org.apache.pinot.spi.stream.StreamPartitionMsgOffset;
 
 import java.util.List;
@@ -76,6 +78,34 @@ public class IggyMessageBatch implements MessageBatch<byte[]> {
             return messages.get(index).offset;
         }
         return null;
+    }
+
+    @Override
+    public StreamMessage<byte[]> getStreamMessage(int index) {
+        IggyMessageAndOffset messageAndOffset = messages.get(index);
+
+        // Calculate next offset (current + 1)
+        long currentOffset = messageAndOffset.offset.getOffset();
+        IggyStreamPartitionMsgOffset nextOffset = new IggyStreamPartitionMsgOffset(currentOffset + 1);
+
+        // Create metadata with offset information
+        StreamMessageMetadata metadata = new StreamMessageMetadata.Builder()
+                .setRecordIngestionTimeMs(System.currentTimeMillis())
+                .setOffset(messageAndOffset.offset, nextOffset)
+                .build();
+
+        // Create and return StreamMessage
+        return new StreamMessage<>(null, messageAndOffset.message, messageAndOffset.message.length, metadata);
+    }
+
+    @Override
+    public StreamPartitionMsgOffset getOffsetOfNextBatch() {
+        if (messages.isEmpty()) {
+            return new IggyStreamPartitionMsgOffset(0);
+        }
+        // Return the offset after the last message
+        long lastOffset = messages.get(messages.size() - 1).offset.getOffset();
+        return new IggyStreamPartitionMsgOffset(lastOffset + 1);
     }
 
     /**

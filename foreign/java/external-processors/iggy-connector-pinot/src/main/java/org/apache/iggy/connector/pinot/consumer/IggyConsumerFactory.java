@@ -22,6 +22,7 @@ package org.apache.iggy.connector.pinot.consumer;
 import org.apache.iggy.connector.pinot.config.IggyStreamConfig;
 import org.apache.iggy.connector.pinot.metadata.IggyStreamMetadataProvider;
 import org.apache.pinot.spi.stream.PartitionGroupConsumer;
+import org.apache.pinot.spi.stream.PartitionLevelConsumer;
 import org.apache.pinot.spi.stream.StreamConfig;
 import org.apache.pinot.spi.stream.StreamConsumerFactory;
 import org.apache.pinot.spi.stream.StreamMetadataProvider;
@@ -69,6 +70,21 @@ public class IggyConsumerFactory extends StreamConsumerFactory {
     }
 
     /**
+     * Creates a partition-level consumer (newer Pinot API).
+     * Wraps the partition group consumer for compatibility.
+     *
+     * @param clientId unique identifier for this consumer instance
+     * @param partition partition identifier
+     * @return a new partition consumer instance
+     */
+    @Override
+    public PartitionLevelConsumer createPartitionLevelConsumer(String clientId, int partition) {
+        IggyStreamConfig iggyConfig = new IggyStreamConfig(this.streamConfig);
+        IggyPartitionGroupConsumer groupConsumer = new IggyPartitionGroupConsumer(clientId, iggyConfig, partition);
+        return new IggyPartitionLevelConsumer(groupConsumer);
+    }
+
+    /**
      * Creates a metadata provider for querying stream information.
      * Used by Pinot to discover partitions and check offset positions.
      *
@@ -76,6 +92,7 @@ public class IggyConsumerFactory extends StreamConsumerFactory {
      * @param groupId partition group identifier
      * @return a new metadata provider instance
      */
+    @Override
     public StreamMetadataProvider createPartitionMetadataProvider(String clientId, int groupId) {
         IggyStreamConfig iggyConfig = new IggyStreamConfig(this.streamConfig);
         return new IggyStreamMetadataProvider(clientId, iggyConfig, groupId);
@@ -87,6 +104,7 @@ public class IggyConsumerFactory extends StreamConsumerFactory {
      * @param clientId unique identifier for this metadata provider instance
      * @return a new metadata provider instance
      */
+    @Override
     public StreamMetadataProvider createStreamMetadataProvider(String clientId) {
         IggyStreamConfig iggyConfig = new IggyStreamConfig(this.streamConfig);
         return new IggyStreamMetadataProvider(clientId, iggyConfig);

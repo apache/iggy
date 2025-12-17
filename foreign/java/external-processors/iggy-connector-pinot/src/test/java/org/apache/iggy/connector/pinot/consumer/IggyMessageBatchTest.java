@@ -121,3 +121,4 @@ class IggyMessageBatchTest {
         assertEquals(1024, batch.getMessageLengthAtIndex(999));
     }
 }
+

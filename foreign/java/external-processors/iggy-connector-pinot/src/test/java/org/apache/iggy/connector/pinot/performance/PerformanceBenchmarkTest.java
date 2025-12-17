@@ -60,10 +60,6 @@ class PerformanceBenchmarkTest {
         long endTime = System.nanoTime();
         long durationMs = (endTime - startTime) / 1_000_000;
 
-        System.out.printf(
-                "Message Batch Creation: %d messages in %d ms (%.2f msg/sec)%n",
-                messageCount, durationMs, (messageCount * 1000.0 / durationMs));
-
         assertEquals(messageCount, batch.getMessageCount());
         assertTrue(durationMs < 1000, "Batch creation should complete in under 1 second");
     }
@@ -88,13 +84,6 @@ class PerformanceBenchmarkTest {
 
         long endTime = System.nanoTime();
         long durationMs = (endTime - startTime) / 1_000_000;
-
-        System.out.printf(
-                "Message Batch Iteration: %d messages, %d MB in %d ms (%.2f MB/sec)%n",
-                messageCount,
-                totalBytes / 1024 / 1024,
-                durationMs,
-                (totalBytes / 1024.0 / 1024.0 * 1000.0 / durationMs));
 
         assertTrue(durationMs < 500, "Iteration should complete in under 500ms");
     }
@@ -124,10 +113,6 @@ class PerformanceBenchmarkTest {
         long endTime = System.nanoTime();
         long durationMs = (endTime - startTime) / 1_000_000;
 
-        System.out.printf(
-                "Offset Comparisons: %d comparisons in %d ms (%.2f cmp/ms)%n",
-                comparisons, durationMs, (comparisons * 1.0 / durationMs));
-
         assertTrue(durationMs < 100, "Comparisons should complete in under 100ms");
     }
 
@@ -150,10 +135,6 @@ class PerformanceBenchmarkTest {
         long memoryAfter = runtime.totalMemory() - runtime.freeMemory();
         long memoryUsedMB = (memoryAfter - memoryBefore) / 1024 / 1024;
         long expectedMemoryMB = (messageCount * messageSize) / 1024 / 1024;
-
-        System.out.printf(
-                "Memory Usage: %d MB for %d messages (expected ~%d MB)%n",
-                memoryUsedMB, messageCount, expectedMemoryMB);
 
         // Memory usage should be within 2x of actual data size (allowing for object overhead)
         assertTrue(memoryUsedMB < expectedMemoryMB * 2, "Memory usage should be reasonable (< 2x data size)");
@@ -188,9 +169,6 @@ class PerformanceBenchmarkTest {
         long durationMs = (endTime - startTime) / 1_000_000;
         int totalMessages = messagesPerBatch * batchCount;
         double throughput = (totalMessages * 1000.0) / durationMs;
-
-        System.out.printf(
-                "Throughput Test: %d messages in %d ms (%.2f msg/sec)%n", totalMessages, durationMs, throughput);
 
         assertTrue(throughput > 5000, "Should handle > 5000 msg/sec");
     }
@@ -231,10 +209,6 @@ class PerformanceBenchmarkTest {
         long durationMs = (endTime - startTime) / 1_000_000;
         int totalOperations = threadCount * operationsPerThread * 3; // 3 ops per iteration
 
-        System.out.printf(
-                "Concurrent Operations: %d operations across %d threads in %d ms (%.2f ops/ms)%n",
-                totalOperations, threadCount, durationMs, (totalOperations * 1.0 / durationMs));
-
         assertTrue(durationMs < 2000, "Concurrent operations should complete quickly");
     }
 
@@ -263,10 +237,6 @@ class PerformanceBenchmarkTest {
         long endTime = System.nanoTime();
         long totalMs = (endTime - startTime) / 1_000_000;
 
-        System.out.printf(
-                "Large Message Handling: %d x %d MB messages, created in %d ms, total %d ms%n",
-                messageCount, messageSize / 1024 / 1024, creationMs, totalMs);
-
         assertTrue(totalMs < 5000, "Should handle large messages in under 5 seconds");
     }
 
@@ -278,10 +248,6 @@ class PerformanceBenchmarkTest {
     void testBatchSizeImpact() {
         int[] batchSizes = {10, 100, 1000, 5000};
         int messageSize = 1024;
-
-        System.out.println("\nBatch Size Impact Analysis:");
-        System.out.println("Batch Size | Creation (ms) | Iteration (ms) | MB/sec");
-        System.out.println("-----------------------------------------------------------");
 
         for (int batchSize : batchSizes) {
             // Creation
@@ -302,7 +268,9 @@ class PerformanceBenchmarkTest {
 
             double mbPerSec = (totalBytes / 1024.0 / 1024.0 * 1000.0) / Math.max(iterMs, 1);
 
-            System.out.printf("%10d | %13d | %14d | %.2f%n", batchSize, createMs, iterMs, mbPerSec);
+            // Verify performance is reasonable
+            assertTrue(createMs < 1000, "Batch creation should be fast");
+            assertTrue(iterMs < 1000, "Batch iteration should be fast");
         }
     }
 
