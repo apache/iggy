@@ -118,9 +118,18 @@ pub async fn start_http_server(
     app = app.layer(middleware::from_fn(request_diagnostics));
 
     #[cfg(feature = "iggy-web")]
-    {
+    if config.web_ui {
         app = app.merge(web::router());
         info!("Web UI enabled at /ui");
+    }
+
+    #[cfg(not(feature = "iggy-web"))]
+    if config.web_ui {
+        tracing::warn!(
+            "Web UI is enabled in configuration (http.web_ui = true) but the server \
+             was not compiled with 'iggy-web' feature. The Web UI will not be available. \
+             To enable it, rebuild the server with: cargo build --features iggy-web"
+        );
     }
 
     if !config.tls.enabled {
