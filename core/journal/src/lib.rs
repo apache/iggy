@@ -19,5 +19,13 @@
 // But the interface was designed for partition log, not an generic journal.
 pub trait Journal {
     type Entry;
+    type Header;
+
+    fn has_prepare(&self, header: &Self::Header) -> bool;
+
+    fn previous_entry(&self, header: &Self::Header) -> Option<Self::Header>;
+
+    fn set_header_as_dirty(&self, header: &Self::Header);
+
     fn append(&self, entry: Self::Entry) -> impl Future<Output = ()>;
 }

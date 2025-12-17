@@ -19,6 +19,7 @@ mod api;
 mod components;
 mod config;
 mod error;
+mod hooks;
 mod router;
 mod state;
 

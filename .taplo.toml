@@ -1,0 +1,75 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Taplo configuration for TOML formatting
+# https://taplo.tamasfe.dev/configuration/formatter-options.html
+
+[formatting]
+# Align consecutive entries vertically
+align_entries = false
+
+# Don't align inline comments
+align_comments = false
+
+# Put trailing commas in multi-line arrays
+array_trailing_comma = true
+
+# Expand arrays onto multiple lines if they exceed column width
+array_auto_expand = true
+
+# Collapse arrays into single line if they fit
+array_auto_collapse = false
+
+# Maximum column width
+column_width = 100
+
+# Keep inline tables compact (no spaces around braces)
+compact_inline_tables = false
+
+# Indentation string (4 spaces to match Rust convention)
+indent_string = "    "
+
+# Add extra indentation for nested table headers
+indent_tables = false
+
+# Don't reorder keys (preserve manual ordering)
+reorder_keys = false
+
+# Reorder array values alphabetically
+reorder_arrays = false
+
+# Maximum allowed blank lines
+allowed_blank_lines = 1
+
+# Always end files with newline
+trailing_newline = true
+
+# CRLF line endings (false = LF)
+crlf = false
+
+# Files to include
+include = [
+    "**/*.toml",
+]
+
+# Files to exclude
+exclude = [
+    "target/**",
+    "node_modules/**",
+    ".git/**",
+    "venv/**",
+]

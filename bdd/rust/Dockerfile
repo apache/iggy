@@ -15,10 +15,16 @@
 # specific language governing permissions and limitations
 # under the License.
 
-ARG RUST_VERSION=1.91
+ARG RUST_VERSION=1.92
 FROM rust:${RUST_VERSION}
 
 WORKDIR /app
+
+RUN apt-get update && apt-get install -y \
+    libhwloc-dev \
+    libudev-dev \
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
 
 # Copy everything
 COPY . .

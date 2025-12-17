@@ -18,10 +18,11 @@
 -->
 
 <script lang="ts">
+  import { base } from '$app/paths';
   let className = '';
   export { className as class };
-  const lightLogo = '/iggy-apache-lightbg.svg';
-  const darkLogo = '/iggy-apache-darkbg.svg';
+  const lightLogo = `${base}/iggy-apache-lightbg.svg`;
+  const darkLogo = `${base}/iggy-apache-darkbg.svg`;
 </script>
 
 <img src={lightLogo} class="{className} block dark:hidden" alt="Apache Iggy" />

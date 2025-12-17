@@ -17,21 +17,17 @@
  * under the License.
  */
 
-import { fetchIggyApi } from '$lib/api/fetchApi';
-import { handleFetchErrors } from '$lib/api/handleFetchErrors';
-import { streamMapper, type Stream } from '$lib/domain/Stream';
-import type { LayoutServerLoad } from './$types';
+import { clientApi } from '$lib/api/clientApi';
+import { statsMapper } from '$lib/domain/Stats';
+import type { PageLoad } from './$types';
 
-export const load: LayoutServerLoad = async ({ cookies }) => {
-  const result = await fetchIggyApi({
+export const load: PageLoad = async () => {
+  const data = await clientApi({
     method: 'GET',
-    path: '/streams',
-    cookies
+    path: '/stats'
   });
 
-  const { data } = await handleFetchErrors(result, cookies);
-
   return {
-    streams: ((data as any).map(streamMapper) as Stream[]).sort((a, b) => b.createdAt - a.createdAt)
+    serverStats: statsMapper(data)
   };
 };

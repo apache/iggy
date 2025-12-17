@@ -1,4 +1,5 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
  * regarding copyright ownership.  The ASF licenses this file
@@ -83,6 +84,8 @@ pub enum IggyError {
     InvalidClientAddress = 34,
     #[error("Invalid IP address: {0}:{1}")]
     InvalidIpAddress(String, String) = 35,
+    #[error("Http error {0}")]
+    HttpError(String) = 36,
     #[error("Unauthenticated")]
     Unauthenticated = 40,
     #[error("Unauthorized")]
