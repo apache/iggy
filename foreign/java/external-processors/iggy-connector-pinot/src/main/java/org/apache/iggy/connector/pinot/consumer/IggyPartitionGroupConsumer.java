@@ -106,7 +106,10 @@ public class IggyPartitionGroupConsumer implements PartitionGroupConsumer {
 
             // Poll messages from Iggy
             PolledMessages polledMessages = pollMessages(fetchOffset);
-            log.debug("Polled {} messages from partition {}", polledMessages.messages().size(), partitionId);
+            log.debug(
+                    "Polled {} messages from partition {}",
+                    polledMessages.messages().size(),
+                    partitionId);
 
             // Convert to Pinot MessageBatch
             MessageBatch batch = convertToMessageBatch(polledMessages);

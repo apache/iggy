@@ -19,10 +19,11 @@
 
 package org.apache.iggy.connector.pinot.consumer;
 
-import java.util.concurrent.TimeoutException;
 import org.apache.pinot.spi.stream.MessageBatch;
 import org.apache.pinot.spi.stream.PartitionLevelConsumer;
 import org.apache.pinot.spi.stream.StreamPartitionMsgOffset;
+
+import java.util.concurrent.TimeoutException;
 
 /**
  * Wrapper for IggyPartitionGroupConsumer to implement PartitionLevelConsumer interface.
