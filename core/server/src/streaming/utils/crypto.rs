@@ -32,7 +32,6 @@ pub fn hash_password(password: &str) -> String {
 }
 
 pub fn verify_password(password: &str, hash: &str) -> bool {
-    // tracing::error!("Checking password: {password}, hash: {hash}");
     let hash = PasswordHash::new(hash).expect("Failed to parse password hash");
     Argon2::default()
         .verify_password(password.as_bytes(), &hash)

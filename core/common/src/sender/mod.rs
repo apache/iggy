@@ -37,7 +37,7 @@ use compio::net::TcpStream;
 use compio_quic::{RecvStream, SendStream};
 use compio_tls::TlsStream;
 use std::future::Future;
-use std::os::fd::{AsFd, IntoRawFd, RawFd};
+use std::os::fd::{AsFd, IntoRawFd, OwnedFd, RawFd};
 use tracing::{debug, error};
 
 macro_rules! forward_async_methods {
@@ -117,7 +117,7 @@ impl SenderKind {
         Self::WebSocketTls(stream)
     }
 
-    pub fn take_and_migrate_tcp(&mut self) -> Option<RawFd> {
+    pub fn take_and_migrate_tcp(&mut self) -> Option<OwnedFd> {
         match self {
             SenderKind::Tcp(tcp_sender) => {
                 let stream = tcp_sender.stream.take()?;
@@ -130,9 +130,9 @@ impl SenderKind {
                     return None;
                 };
 
-                let raw_fd = owned_fd.into_raw_fd();
-                Some(raw_fd)
+                Some(owned_fd)
             }
+            // TODO(tungtose): support TCP TLS
             _ => None,
         }
     }
