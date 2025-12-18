@@ -28,6 +28,7 @@ under the License.
 ## Quick Start
 
 The connector includes an automated integration test script that:
+
 1. Builds the connector JARs
 2. Starts Iggy and Pinot in Docker (using official Apache images)
 3. Creates Iggy stream and topic
@@ -153,11 +154,13 @@ curl -X POST "http://localhost:8099/query/sql" \
 ## Test Scenarios
 
 ### Scenario 1: Basic Ingestion (Included in automated test)
+
 - **Messages**: 10 test events
 - **Expected**: All 10 messages ingested into Pinot
 - **Verification**: `SELECT COUNT(*) FROM test_events_realtime` returns 10
 
 ### Scenario 2: High Throughput
+
 ```bash
 # Send 1000 messages rapidly
 for i in {1..1000}; do
@@ -180,18 +183,22 @@ curl -X POST "http://localhost:8099/query/sql" \
 ```
 
 ### Scenario 3: Multiple Partitions
+
 The connector automatically handles partition distribution:
+
 - Topic created with 2 partitions
 - Pinot creates one consumer per partition
 - Messages are distributed across partitions by Iggy
 
 Verify partition consumption:
+
 ```bash
 # Check Pinot segment metadata
 curl "http://localhost:9000/segments/test_events_realtime" | jq '.'
 ```
 
 ### Scenario 4: Consumer Group Offset Management
+
 Test that offsets are properly managed:
 
 ```bash
@@ -219,6 +226,7 @@ curl -X POST "http://localhost:8099/query/sql" \
 ```
 
 ### Scenario 5: Large Messages
+
 Test with large payloads (up to 10MB):
 
 ```bash
@@ -273,6 +281,7 @@ curl "http://localhost:3000/streams/test-stream/topics/test-events/consumer-grou
 Access the Pinot web UI at: `http://localhost:9000`
 
 Navigate to:
+
 - **Query Console**: Run SQL queries
 - **Cluster Manager**: View table status
 - **Segment Status**: Check realtime segments
@@ -331,42 +340,49 @@ echo "Throughput: $((10000 / DURATION)) msg/sec"
 ### No Messages in Pinot
 
 1. **Check Pinot server logs**:
-   ```bash
-   docker logs pinot-server --tail 200 | grep -i error
-   ```
 
-2. **Verify connector is loaded**:
-   ```bash
-   docker exec pinot-server ls /opt/pinot/plugins/iggy-connector/
-   ```
+```bash
+docker logs pinot-server --tail 200 | grep -i error
+```
 
-3. **Check Iggy has messages**:
-   ```bash
-   curl "http://localhost:3000/streams/test-stream/topics/test-events/messages"
-   ```
+1. **Verify connector is loaded**:
 
-4. **Verify table configuration**:
-   ```bash
-   curl "http://localhost:9000/tables/test_events_realtime" | jq '.REALTIME.tableIndexConfig.streamConfigs'
-   ```
+```bash
+docker exec pinot-server ls /opt/pinot/plugins/iggy-connector/
+```
+
+1. **Check Iggy has messages**:
+
+```bash
+curl "http://localhost:3000/streams/test-stream/topics/test-events/messages"
+```
+
+1. **Verify table configuration**:
+
+```bash
+curl "http://localhost:9000/tables/test_events_realtime" | jq '.REALTIME.tableIndexConfig.streamConfigs'
+```
 
 ### Connection Errors
 
 If Pinot cannot connect to Iggy:
 
 1. **Verify network connectivity**:
-   ```bash
-   docker exec pinot-server ping -c 3 iggy
-   docker exec pinot-server curl http://iggy:3000/
-   ```
 
-2. **Check Iggy is listening on TCP**:
-   ```bash
-   docker exec iggy netstat -ln | grep 8090
-   ```
+```bash
+docker exec pinot-server ping -c 3 iggy
+docker exec pinot-server curl http://iggy:3000/
+```
 
-3. **Verify credentials**:
-   Check `deployment/table.json` has correct username/password
+1. **Check Iggy is listening on TCP**:
+
+```bash
+docker exec iggy netstat -ln | grep 8090
+```
+
+1. **Verify credentials**:
+
+Check `deployment/table.json` has correct username/password
 
 ### ClassNotFoundException
 
@@ -393,7 +409,7 @@ docker-compose down --rmi all
 
 ### ✅ Successful Integration Test
 
-```
+```text
 =====================================
 ✓ Integration Test PASSED!
 Successfully ingested 10 messages
@@ -447,6 +463,7 @@ After successful integration testing:
 ## Support
 
 For issues during integration testing:
+
 - Check [TEST_REPORT.md](TEST_REPORT.md) for performance benchmarks
 - Review [README.md](README.md) for configuration details
 - See [QUICKSTART.md](QUICKSTART.md) for setup guidance

@@ -40,7 +40,7 @@ This document outlines the architectural design and implementation strategy for 
 
 ### 1.1 High-Level Architecture
 
-```
+```text
 ┌─────────────────────────────────────────────────────────────┐
 │                     Apache Pinot Cluster                     │
 │  ┌───────────┐  ┌───────────┐  ┌───────────────────────┐   │
@@ -80,30 +80,33 @@ This document outlines the architectural design and implementation strategy for 
 
 The connector architecture follows Pinot's plugin model with clear separation of concerns:
 
-| Component | Responsibility | Lifecycle |
-|-----------|----------------|-----------|
-| `IggyConsumerFactory` | Plugin entry point, consumer instantiation | Singleton per server |
-| `IggyPartitionGroupConsumer` | Message polling, partition consumption | One per partition |
-| `IggyStreamMetadataProvider` | Partition discovery, offset resolution | One per partition |
-| `IggyStreamConfig` | Configuration parsing and validation | Created per consumer |
-| `IggyJsonMessageDecoder` | Message payload decoding | Shared across consumers |
-| `IggyMessageBatch` | Batch message container | Created per fetch |
-| `IggyStreamPartitionMsgOffset` | Offset representation | Created per message |
+| Component                       | Responsibility                              | Lifecycle                  |
+| ------------------------------- | ------------------------------------------- | -------------------------- |
+| `IggyConsumerFactory`           | Plugin entry point, consumer instantiation  | Singleton per server       |
+| `IggyPartitionGroupConsumer`    | Message polling, partition consumption      | One per partition          |
+| `IggyStreamMetadataProvider`    | Partition discovery, offset resolution      | One per partition          |
+| `IggyStreamConfig`              | Configuration parsing and validation        | Created per consumer       |
+| `IggyJsonMessageDecoder`        | Message payload decoding                    | Shared across consumers    |
+| `IggyMessageBatch`              | Batch message container                     | Created per fetch          |
+| `IggyStreamPartitionMsgOffset`  | Offset representation                       | Created per message        |
 
 ### 1.3 Design Rationale
 
 **TCP over HTTP Decision:**
+
 - Initial Flink connector used HTTP due to incorrect Docker image during development
 - TCP protocol provides 40-60% lower latency and higher throughput
 - Native protocol alignment with Iggy's core design
 - Connection pooling eliminates per-request overhead
 
 **Consumer Group Strategy:**
+
 - Server-managed offsets eliminate need for external coordination (Zookeeper, etc.)
 - Auto-commit mode simplifies implementation while maintaining reliability
 - Consumer group per table provides isolation and independent scaling
 
 **Partition-Level Consumption:**
+
 - Pinot creates one consumer per partition for maximum parallelism
 - Each consumer maintains independent TCP connection from pool
 - Linear scaling with partition count
@@ -116,6 +119,7 @@ The connector architecture follows Pinot's plugin model with clear separation of
 Serve as the plugin entry point implementing Pinot's `StreamConsumerFactory` interface. The factory pattern enables Pinot to instantiate consumers and metadata providers dynamically based on table configuration.
 
 **API Contract:**
+
 ```java
 public class IggyConsumerFactory extends StreamConsumerFactory {
     // Pinot invokes init() with table's streamConfig
@@ -130,6 +134,7 @@ public class IggyConsumerFactory extends StreamConsumerFactory {
 ```
 
 **Design Decisions:**
+
 - **Stateless Factory:** Factory stores only `StreamConfig`, actual state in consumers
 - **Client ID Format:** `{tableName}-{serverInstance}-partition-{N}` for traceability
 - **Configuration Sharing:** Parse `IggyStreamConfig` once per consumer instantiation
@@ -141,6 +146,7 @@ public class IggyConsumerFactory extends StreamConsumerFactory {
 Implement high-performance partition-level message consumption using Iggy's native TCP protocol with connection pooling and auto-commit offset management.
 
 **Architecture:**
+
 ```java
 public class IggyPartitionGroupConsumer implements PartitionGroupConsumer {
     private AsyncIggyTcpClient asyncClient;     // Async TCP client
@@ -188,6 +194,7 @@ public class IggyPartitionGroupConsumer implements PartitionGroupConsumer {
    - Preserve offset on reconnect (server-managed)
 
 **Performance Targets:**
+
 - Poll latency: <1ms (TCP + local processing)
 - Throughput: >100K msg/sec per partition
 - Memory overhead: 2x message batch size
@@ -198,6 +205,7 @@ public class IggyPartitionGroupConsumer implements PartitionGroupConsumer {
 Provide partition topology discovery and offset resolution for Pinot's stream ingestion framework.
 
 **API Contract:**
+
 ```java
 public class IggyStreamMetadataProvider implements StreamMetadataProvider {
     // Return total partition count for topic
@@ -232,6 +240,7 @@ public class IggyStreamMetadataProvider implements StreamMetadataProvider {
    - No connection pooling needed
 
 **Operational Characteristics:**
+
 - Metadata fetch frequency: Once per table creation, rare during rebalance
 - Expected latency: 5-20ms (TCP round-trip + server processing)
 - Error handling: Fail fast on topic not found (configuration error)
@@ -243,17 +252,17 @@ Parse, validate, and provide type-safe access to Iggy-specific configuration pro
 
 **Configuration Properties:**
 
-| Property | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `stream.iggy.host` | Yes | - | Iggy server hostname |
-| `stream.iggy.port` | No | 8090 | Iggy TCP port |
-| `stream.iggy.username` | Yes | - | Authentication username |
-| `stream.iggy.password` | Yes | - | Authentication password |
-| `stream.iggy.stream.id` | Yes | - | Stream identifier |
-| `stream.iggy.topic.id` | Yes | - | Topic identifier |
-| `stream.iggy.consumer.group` | Yes | - | Consumer group name |
-| `stream.iggy.poll.batch.size` | No | 100 | Messages per poll |
-| `stream.iggy.connection.pool.size` | No | 4 | TCP connection pool size |
+| Property                           | Required | Default | Description                 |
+| ---------------------------------- | -------- | ------- | --------------------------- |
+| `stream.iggy.host`                 | Yes      | -       | Iggy server hostname        |
+| `stream.iggy.port`                 | No       | 8090    | Iggy TCP port               |
+| `stream.iggy.username`             | Yes      | -       | Authentication username     |
+| `stream.iggy.password`             | Yes      | -       | Authentication password     |
+| `stream.iggy.stream.id`            | Yes      | -       | Stream identifier           |
+| `stream.iggy.topic.id`             | Yes      | -       | Topic identifier            |
+| `stream.iggy.consumer.group`       | Yes      | -       | Consumer group name         |
+| `stream.iggy.poll.batch.size`      | No       | 100     | Messages per poll           |
+| `stream.iggy.connection.pool.size` | No       | 4       | TCP connection pool size    |
 
 **Design Decisions:**
 
@@ -273,6 +282,7 @@ Parse, validate, and provide type-safe access to Iggy-specific configuration pro
    - Centralize parsing logic
 
 **Example Configuration:**
+
 ```json
 {
   "streamType": "iggy",
@@ -294,6 +304,7 @@ Parse, validate, and provide type-safe access to Iggy-specific configuration pro
 Decode JSON message payloads from Iggy into Pinot's `GenericRow` format for ingestion pipeline.
 
 **Architecture:**
+
 ```java
 public class IggyJsonMessageDecoder implements StreamMessageDecoder<byte[]> {
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
@@ -327,6 +338,7 @@ public class IggyJsonMessageDecoder implements StreamMessageDecoder<byte[]> {
    - No silent failures
 
 **Performance Characteristics:**
+
 - Decoding latency: 50-200 microseconds per message (depends on JSON size)
 - Throughput: 100K+ msg/sec single-threaded
 - Memory: Minimal (reuses GenericRow)
@@ -337,6 +349,7 @@ public class IggyJsonMessageDecoder implements StreamMessageDecoder<byte[]> {
 Wrap polled messages from Iggy into Pinot's `MessageBatch` interface for ingestion pipeline integration.
 
 **Architecture:**
+
 ```java
 public class IggyMessageBatch implements MessageBatch<byte[]> {
     private final List<IggyMessageAndOffset> messages;
@@ -377,6 +390,7 @@ public class IggyMessageBatch implements MessageBatch<byte[]> {
 Represent message offsets within Iggy partitions with comparison and serialization support.
 
 **Architecture:**
+
 ```java
 public class IggyStreamPartitionMsgOffset implements StreamPartitionMsgOffset {
     private final long offset;
@@ -412,41 +426,46 @@ public class IggyStreamPartitionMsgOffset implements StreamPartitionMsgOffset {
 
 ### 3.1 Performance Requirements
 
-| Metric | Target | Rationale |
-|--------|--------|-----------|
-| Throughput (per partition) | >100K msg/sec | Match Kafka connector baseline |
-| Throughput (aggregate) | >1M msg/sec | 10+ partition scaling |
-| End-to-end latency | <2 seconds | Iggy → Pinot → Queryable |
-| Poll latency | <1ms | TCP + minimal processing |
-| Memory overhead | <2x batch size | JVM heap efficiency |
-| Connection overhead | <10 conn/server | TCP connection pooling |
+| Metric                     | Target          | Rationale                      |
+| -------------------------- | --------------- | ------------------------------ |
+| Throughput (per partition) | >100K msg/sec   | Match Kafka connector baseline |
+| Throughput (aggregate)     | >1M msg/sec     | 10+ partition scaling          |
+| End-to-end latency         | <2 seconds      | Iggy → Pinot → Queryable       |
+| Poll latency               | <1ms            | TCP + minimal processing       |
+| Memory overhead            | <2x batch size  | JVM heap efficiency            |
+| Connection overhead        | <10 conn/server | TCP connection pooling         |
 
 ### 3.2 Performance Optimizations
 
 **1. TCP Connection Pooling:**
+
 - Reuse TCP connections across poll operations
 - Configurable pool size (default 4, recommended 4-8)
 - Reduces handshake overhead (3-way TCP + TLS)
 - Expected savings: 1-5ms per poll
 
 **2. Async I/O:**
+
 - Use `AsyncIggyTcpClient` for non-blocking operations
 - `CompletableFuture`-based API for concurrent polls
 - Minimal thread blocking during network I/O
 - Better CPU utilization
 
 **3. Batch Processing:**
+
 - Poll multiple messages per request (default 100)
 - Amortize network overhead across messages
 - Trade-off: latency vs throughput (configurable)
 - Recommended: 50-500 depending on message size
 
 **4. Zero-Copy Where Possible:**
+
 - Pass byte[] directly to decoder (no intermediate copy)
 - Reuse `GenericRow` instances (Pinot-provided)
 - Minimize object allocation in hot path
 
 **5. Lazy Initialization:**
+
 - Defer connection until first fetch
 - Reduce startup overhead
 - Better failure isolation
@@ -454,7 +473,8 @@ public class IggyStreamPartitionMsgOffset implements StreamPartitionMsgOffset {
 ### 3.3 Scaling Model
 
 **Horizontal Scaling:**
-```
+
+```text
 Partitions: 10
 Pinot Servers: 3
 Consumers per Server: 10 / 3 = ~3-4
@@ -465,6 +485,7 @@ Total Throughput = Partitions × Per-Partition Throughput
 ```
 
 **Vertical Scaling:**
+
 - Increase poll batch size (trade latency for throughput)
 - Increase connection pool size (diminishing returns >8)
 - Add more partitions (linear scaling up to CPU/network limits)
@@ -474,33 +495,37 @@ Total Throughput = Partitions × Per-Partition Throughput
 ### 4.1 Offset Management
 
 **Server-Managed Offsets:**
+
 - Iggy stores consumer group offsets on server
 - Auto-commit on successful poll (transactional)
 - No external coordination required (vs Kafka/Zookeeper)
 
 **Recovery Scenarios:**
 
-| Scenario | Behavior | Recovery |
-|----------|----------|----------|
-| Consumer restart | Rejoin group, resume from last commit | Automatic |
-| Server restart | Consumer group state persisted | Automatic |
-| Network partition | Connection retry with exponential backoff | Automatic |
-| Duplicate messages | Possible if commit fails after processing | Application-level dedup |
-| Message loss | Not possible (commit before acknowledge) | N/A |
+| Scenario            | Behavior                                    | Recovery                 |
+| ------------------- | ------------------------------------------- | ------------------------ |
+| Consumer restart    | Rejoin group, resume from last commit       | Automatic                |
+| Server restart      | Consumer group state persisted              | Automatic                |
+| Network partition   | Connection retry with exponential backoff   | Automatic                |
+| Duplicate messages  | Possible if commit fails after processing   | Application-level dedup  |
+| Message loss        | Not possible (commit before acknowledge)    | N/A                      |
 
 ### 4.2 Error Handling Strategy
 
 **Connection Errors:**
+
 - Retry with exponential backoff (max 3 attempts)
 - Log error and propagate to Pinot
 - Pinot will retry consumer creation
 
 **Message Decoding Errors:**
+
 - Catch `JsonProcessingException`
 - Propagate to Pinot (triggers error handling)
 - Options: DLQ, skip, retry (configured in Pinot)
 
 **Consumer Group Errors:**
+
 - Rejoin group on session expiry
 - Create new consumer ID if evicted
 - Preserve offset (server-managed)
@@ -508,6 +533,7 @@ Total Throughput = Partitions × Per-Partition Throughput
 ### 4.3 Monitoring and Observability
 
 **Metrics to Expose:**
+
 - Messages consumed per partition
 - Poll latency (p50, p99, p999)
 - Connection pool utilization
@@ -515,6 +541,7 @@ Total Throughput = Partitions × Per-Partition Throughput
 - Decoding errors per partition
 
 **Logging Strategy:**
+
 - INFO: Connection events, consumer group join/leave
 - WARN: Retry attempts, temporary failures
 - ERROR: Configuration errors, unrecoverable failures
@@ -570,17 +597,20 @@ Total Throughput = Partitions × Per-Partition Throughput
 ### 5.2 Configuration Best Practices
 
 **Performance Tuning:**
+
 - **High Throughput:** Increase `poll.batch.size` (200-500), `connection.pool.size` (6-8)
 - **Low Latency:** Decrease `poll.batch.size` (10-50), increase poll frequency
 - **Large Messages:** Decrease `poll.batch.size`, increase heap size
 
 **Production Settings:**
+
 - Enable authentication (`username`/`password`)
 - Use DNS names for `host` (not IPs)
 - Set consumer group per table (`tableName-realtime`)
 - Monitor consumer lag via Iggy API
 
 **Resource Planning:**
+
 - CPU: 1 core per 2-3 partitions
 - Memory: 2GB base + (batch_size × avg_msg_size × 2)
 - Network: 100Mbps per 100K msg/sec (assuming 1KB messages)
@@ -590,21 +620,23 @@ Total Throughput = Partitions × Per-Partition Throughput
 ### 6.1 Unit Testing Approach
 
 **Coverage Targets:**
+
 - Code coverage: >90% line coverage
 - Branch coverage: >80% for conditional logic
 - Test categories: Configuration, Consumer, Metadata, Decoding, Performance
 
 **Test Structure:**
 
-| Test Class | Purpose | Test Count |
-|------------|---------|------------|
-| `IggyStreamConfigTest` | Config parsing/validation | 10 tests |
-| `IggyMessageBatchTest` | Batch operations | 5 tests |
-| `IggyStreamPartitionMsgOffsetTest` | Offset comparison | 3 tests |
-| `IggyJsonMessageDecoderTest` | JSON decoding | 5 tests |
-| `PerformanceBenchmarkTest` | Performance validation | 8 tests |
+| Test Class                          | Purpose                   | Test Count |
+| ----------------------------------- | ------------------------- | ---------- |
+| `IggyStreamConfigTest`              | Config parsing/validation | 10 tests   |
+| `IggyMessageBatchTest`              | Batch operations          | 5 tests    |
+| `IggyStreamPartitionMsgOffsetTest`  | Offset comparison         | 3 tests    |
+| `IggyJsonMessageDecoderTest`        | JSON decoding             | 5 tests    |
+| `PerformanceBenchmarkTest`          | Performance validation    | 8 tests    |
 
 **Testing Tools:**
+
 - JUnit 5 for test framework
 - Mockito for mocking (if needed for external dependencies)
 - AssertJ for fluent assertions
@@ -612,6 +644,7 @@ Total Throughput = Partitions × Per-Partition Throughput
 ### 6.2 Integration Testing Strategy
 
 **Test Environment:**
+
 - Docker Compose with official Apache images
 - Apache Iggy (apache/iggy:latest)
 - Apache Pinot (apachepinot/pinot:latest)
@@ -649,6 +682,7 @@ Total Throughput = Partitions × Per-Partition Throughput
    - Monitor memory usage
 
 **Automated Test Script:**
+
 - `integration-test.sh` executes full test suite
 - Exit code 0 on success, 1 on failure
 - Output includes detailed logs and metrics
@@ -656,17 +690,20 @@ Total Throughput = Partitions × Per-Partition Throughput
 ### 6.3 Performance Testing
 
 **Benchmark Tests:**
+
 - Throughput simulation: 10K msg/sec sustained
 - Latency measurement: Poll + decode + batch creation
 - Memory profiling: Track heap usage during processing
 - Concurrency: Simulate 10 concurrent consumers
 
 **Performance Targets:**
+
 - Throughput: >1M msg/sec aggregate (verified)
 - Latency: <1ms poll time (verified)
 - Memory overhead: 2x batch size (verified)
 
 **Competitive Analysis:**
+
 - Compare vs Kafka connector throughput
 - Compare vs Pulsar connector latency
 - Target: Match or exceed existing connectors
@@ -676,18 +713,22 @@ Total Throughput = Partitions × Per-Partition Throughput
 ### 7.1 Plugin Deployment Model
 
 **Installation Steps:**
+
 1. Build connector JAR: `gradle :iggy-connector-pinot:jar`
 2. Build Iggy SDK JAR: `gradle :iggy:jar`
 3. Copy JARs to Pinot plugin directory:
-   ```
+
+   ```text
    /opt/pinot/plugins/iggy-connector/
    ├── iggy-connector-pinot-0.6.0.jar
    └── iggy-0.6.0.jar
    ```
+
 4. Restart Pinot servers to load plugin
 5. Create table with Iggy stream config
 
 **Plugin Discovery:**
+
 - Pinot scans `/opt/pinot/plugins/` on startup
 - Loads classes implementing `StreamConsumerFactory`
 - Registers by `streamType` property (`iggy`)
@@ -695,7 +736,8 @@ Total Throughput = Partitions × Per-Partition Throughput
 ### 7.2 Production Deployment Topology
 
 **Recommended Architecture:**
-```
+
+```text
 ┌─────────────────────────────────────────────────────────┐
 │                    Load Balancer                        │
 │                  (Pinot Broker VIP)                     │
@@ -728,6 +770,7 @@ Total Throughput = Partitions × Per-Partition Throughput
 ```
 
 **Resource Allocation:**
+
 - Pinot Server: 4-8 cores, 8-16GB RAM per server
 - Connection pool: 4-8 connections per server
 - Total connections: Servers × Pool Size (9-24 for 3 servers)
@@ -735,16 +778,19 @@ Total Throughput = Partitions × Per-Partition Throughput
 ### 7.3 High Availability Considerations
 
 **Iggy Cluster:**
+
 - Multi-node deployment with replication
 - Partition leaders distribute across nodes
 - Consumer groups maintained on server
 
 **Pinot Cluster:**
+
 - Multiple servers for partition redundancy
 - Replica groups for segment replication
 - Broker redundancy for query availability
 
 **Failure Scenarios:**
+
 - **Iggy node failure:** Consumer reconnects to replica leader
 - **Pinot server failure:** Partition reassigned to another server
 - **Network partition:** Retry with exponential backoff
@@ -754,11 +800,13 @@ Total Throughput = Partitions × Per-Partition Throughput
 ### 8.1 Authentication
 
 **Credentials Management:**
+
 - Store `username`/`password` in Pinot table config
 - Recommended: Use Pinot's secret management (if available)
 - Alternative: Environment variables, Kubernetes secrets
 
 **Best Practices:**
+
 - Use dedicated service account for Pinot consumers
 - Rotate credentials periodically
 - Minimum required permissions on Iggy topics
@@ -766,11 +814,13 @@ Total Throughput = Partitions × Per-Partition Throughput
 ### 8.2 Network Security
 
 **TLS Encryption:**
+
 - Iggy supports TLS for TCP connections (future enhancement)
 - Configure via additional properties (when available)
 - Certificate management via keystore/truststore
 
 **Network Isolation:**
+
 - Deploy Iggy and Pinot in same VPC/network
 - Use private IP addresses
 - Firewall rules: Allow only Pinot servers → Iggy TCP port
@@ -778,11 +828,13 @@ Total Throughput = Partitions × Per-Partition Throughput
 ### 8.3 Data Security
 
 **Message Encryption:**
+
 - End-to-end encryption at application level (if required)
 - Connector treats messages as opaque byte arrays
 - Decryption in custom decoder implementation
 
 **Access Control:**
+
 - Iggy topic-level permissions for consumer group
 - Pinot table-level access control (separate concern)
 
@@ -791,21 +843,25 @@ Total Throughput = Partitions × Per-Partition Throughput
 ### 9.1 Planned Features
 
 **1. Exactly-Once Semantics:**
+
 - Implement transactional offset commits
 - Coordinate with Pinot segment commits
 - Prevent duplicate ingestion on failure
 
 **2. Custom Decoders:**
+
 - Avro decoder with schema registry
 - Protobuf decoder
 - Custom binary formats
 
 **3. Advanced Offset Management:**
+
 - Support for timestamp-based offset resolution
 - Manual offset reset via Pinot API
 - Consumer lag monitoring integration
 
 **4. Performance Enhancements:**
+
 - Zero-copy message passing (if Pinot supports)
 - Adaptive batch sizing based on message rate
 - Connection pooling optimizations
@@ -813,12 +869,14 @@ Total Throughput = Partitions × Per-Partition Throughput
 ### 9.2 Monitoring Integration
 
 **Prometheus Metrics:**
+
 - Expose JMX metrics for Pinot monitoring
 - Custom metrics for Iggy-specific operations
 - Grafana dashboards for visualization
 
 **Metrics to Expose:**
-```
+
+```text
 iggy_connector_messages_consumed_total{partition, table}
 iggy_connector_poll_latency_seconds{partition, table, quantile}
 iggy_connector_connection_pool_active{table}
@@ -829,11 +887,13 @@ iggy_connector_decode_errors_total{partition, table}
 ### 9.3 Operational Tooling
 
 **Admin CLI:**
+
 - Reset consumer group offsets
 - Pause/resume ingestion per partition
 - Query consumer lag across partitions
 
 **Health Checks:**
+
 - Liveness: TCP connection to Iggy
 - Readiness: Consumer group joined
 - Degraded: High consumer lag (>threshold)
@@ -843,6 +903,7 @@ iggy_connector_decode_errors_total{partition, table}
 ### 10.1 Phase 1: Core Implementation ✅
 
 **Deliverables:**
+
 - [x] All 7 core classes implemented
 - [x] Configuration parsing and validation
 - [x] TCP-based consumer with connection pooling
@@ -850,6 +911,7 @@ iggy_connector_decode_errors_total{partition, table}
 - [x] Build system integration
 
 **Validation:**
+
 - All classes compile successfully
 - No runtime dependencies missing
 - Plugin loads in Pinot
@@ -857,11 +919,13 @@ iggy_connector_decode_errors_total{partition, table}
 ### 10.2 Phase 2: Testing ✅
 
 **Deliverables:**
+
 - [x] 31 unit tests (100% pass rate)
 - [x] Performance benchmarks
 - [x] Test coverage >90%
 
 **Results:**
+
 - All tests passing
 - Performance exceeds targets (1.4M msg/sec)
 - Memory overhead within bounds
@@ -869,12 +933,14 @@ iggy_connector_decode_errors_total{partition, table}
 ### 10.3 Phase 3: Integration Testing ✅
 
 **Deliverables:**
+
 - [x] Docker Compose environment
 - [x] Automated integration test script
 - [x] Test scenarios documented
 - [x] Deployment configurations
 
 **Infrastructure:**
+
 - Docker images: Official Apache repositories
 - Test automation: Bash script with health checks
 - Documentation: INTEGRATION_TEST.md
@@ -882,6 +948,7 @@ iggy_connector_decode_errors_total{partition, table}
 ### 10.4 Phase 4: Documentation ✅
 
 **Deliverables:**
+
 - [x] README.md (400+ lines)
 - [x] QUICKSTART.md (250+ lines)
 - [x] TEST_REPORT.md (330+ lines)
@@ -889,6 +956,7 @@ iggy_connector_decode_errors_total{partition, table}
 - [x] DESIGN.md (this document)
 
 **Quality:**
+
 - Comprehensive coverage of all features
 - Step-by-step guides for operators
 - Performance benchmarks with comparisons
@@ -897,6 +965,7 @@ iggy_connector_decode_errors_total{partition, table}
 ### 10.5 Phase 5: Production Readiness (Future)
 
 **Remaining Tasks:**
+
 - [ ] TLS support for encrypted connections
 - [ ] Prometheus metrics integration
 - [ ] Advanced monitoring dashboards
@@ -907,24 +976,26 @@ iggy_connector_decode_errors_total{partition, table}
 
 ### 11.1 Goals Achievement
 
-| Goal | Status | Evidence |
-|------|--------|----------|
-| Native TCP Protocol | ✅ Complete | AsyncIggyTcpClient with connection pooling |
-| Pinot API Compliance | ✅ Complete | All interfaces implemented, plugin loads |
-| High Performance | ✅ Complete | 1.4M msg/sec throughput, <1ms latency |
-| Partition Parallelism | ✅ Complete | PartitionGroupConsumer per partition |
-| Offset Management | ✅ Complete | Server-managed consumer groups |
-| Production Ready | ✅ Complete | Docs, tests, Docker, monitoring ready |
+| Goal                  | Status       | Evidence                                   |
+| --------------------- | ------------ | ------------------------------------------ |
+| Native TCP Protocol   | ✅ Complete  | AsyncIggyTcpClient with connection pooling |
+| Pinot API Compliance  | ✅ Complete  | All interfaces implemented, plugin loads   |
+| High Performance      | ✅ Complete  | 1.4M msg/sec throughput, <1ms latency      |
+| Partition Parallelism | ✅ Complete  | PartitionGroupConsumer per partition       |
+| Offset Management     | ✅ Complete  | Server-managed consumer groups             |
+| Production Ready      | ✅ Complete  | Docs, tests, Docker, monitoring ready      |
 
 ### 11.2 Performance Validation
 
 **Benchmark Results:**
+
 - **Throughput:** 1.43M msg/sec (14x faster than Kafka connector baseline)
 - **Latency:** <1ms poll + decode (10x better than standard)
 - **Memory:** 2.1x batch size overhead (within target)
 - **Scaling:** Linear with partition count (tested up to 10 partitions)
 
 **Competitive Position:**
+
 - **vs Kafka Connector:** 14x faster throughput
 - **vs Pulsar Connector:** 7x faster throughput
 - **vs Flink Connector (HTTP):** 3x lower latency (TCP advantage)
@@ -946,6 +1017,7 @@ This design document outlines the architecture, implementation strategy, and ope
 4. **Production Ready:** Comprehensive testing, documentation, monitoring, and deployment infrastructure
 
 The implementation follows best practices for distributed systems:
+
 - Clear separation of concerns across components
 - Robust error handling and fault tolerance
 - Comprehensive observability and monitoring
@@ -961,7 +1033,7 @@ See Section 2.4 for complete property list and descriptions.
 
 ### Class Diagram
 
-```
+```text
 StreamConsumerFactory (Pinot API)
         ↑
         │ extends
@@ -1000,4 +1072,5 @@ See README.md Section "Performance Tuning" and TEST_REPORT.md for detailed tunin
 ---
 
 **Document History:**
+
 - v1.0 (December 2025): Initial design document based on completed implementation

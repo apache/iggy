@@ -37,7 +37,8 @@ gradle :iggy-connector-pinot:build
 ```
 
 This produces the JAR at:
-```
+
+```text
 external-processors/iggy-connector-pinot/build/libs/iggy-connector-pinot-<version>.jar
 ```
 
@@ -168,7 +169,7 @@ Send to Iggy (using HTTP endpoint for simplicity):
 
 ```bash
 curl -X POST "http://localhost:3000/streams/analytics/topics/user-events/messages" \
-  -H "Content-Type": application/json" \
+  -H "Content-Type: application/json" \
   -d @test_message.json
 ```
 
@@ -223,20 +224,23 @@ iggy consumer-group get analytics user-events pinot-realtime-consumer
 ### No data appearing in Pinot
 
 1. Check Pinot server logs:
-   ```bash
-   tail -f $PINOT_HOME/logs/pinot-server.log
-   ```
 
-2. Verify Iggy connection:
-   ```bash
-   # Test TCP connectivity
-   telnet localhost 8090
-   ```
+```bash
+tail -f $PINOT_HOME/logs/pinot-server.log
+```
 
-3. Check consumer group membership:
-   ```bash
-   iggy consumer-group get analytics user-events pinot-realtime-consumer
-   ```
+1. Verify Iggy connection:
+
+```bash
+# Test TCP connectivity
+telnet localhost 8090
+```
+
+1. Check consumer group membership:
+
+```bash
+iggy consumer-group get analytics user-events pinot-realtime-consumer
+```
 
 ### Connection errors
 
@@ -273,6 +277,7 @@ Before deploying to production:
 ## Support
 
 For issues and questions:
+
 - GitHub Issues: [iggy/issues](https://github.com/apache/iggy/issues)
 - Pinot Slack: [Apache Pinot Community](https://pinot.apache.org/community)
 - Iggy Discord: [Join Discord](https://iggy.rs/discord)

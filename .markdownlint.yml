@@ -19,6 +19,11 @@ default: true
 MD013:
   line_length: 120
   tables: false
+MD022: false # Headings should be surrounded by blank lines
+MD031: false # Fenced code blocks should be surrounded by blank lines
+MD032: false # Lists should be surrounded by blank lines
 MD033:
   allowed_elements: [details, summary, img]
+MD040: false # Fenced code blocks should have a language specified
 MD041: false # First line in file should be a top level heading
+MD060: false # Table column style

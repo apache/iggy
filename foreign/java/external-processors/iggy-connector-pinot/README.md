@@ -74,23 +74,23 @@ Add the following to your Pinot table configuration's `streamConfigs` section:
 
 #### Connection Properties
 
-| Property | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `stream.iggy.host` | Yes | - | Iggy server hostname |
-| `stream.iggy.port` | No | 8090 | Iggy server TCP port |
-| `stream.iggy.username` | No | iggy | Authentication username |
-| `stream.iggy.password` | No | iggy | Authentication password |
-| `stream.iggy.enable.tls` | No | false | Enable TLS encryption |
-| `stream.iggy.connection.pool.size` | No | 4 | TCP connection pool size |
+| Property                           | Required | Default | Description              |
+| ---------------------------------- | -------- | ------- | ------------------------ |
+| `stream.iggy.host`                 | Yes      | -       | Iggy server hostname     |
+| `stream.iggy.port`                 | No       | 8090    | Iggy server TCP port     |
+| `stream.iggy.username`             | No       | iggy    | Authentication username  |
+| `stream.iggy.password`             | No       | iggy    | Authentication password  |
+| `stream.iggy.enable.tls`           | No       | false   | Enable TLS encryption    |
+| `stream.iggy.connection.pool.size` | No       | 4       | TCP connection pool size |
 
 #### Stream Properties
 
-| Property | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `stream.iggy.stream.id` | Yes | - | Iggy stream identifier (name or numeric ID) |
-| `stream.iggy.topic.id` | Yes | - | Iggy topic identifier (name or numeric ID) |
-| `stream.iggy.consumer.group` | Yes | - | Consumer group name for offset management |
-| `stream.iggy.poll.batch.size` | No | 100 | Number of messages to fetch per poll |
+| Property                      | Required | Default | Description                                 |
+| ----------------------------- | -------- | ------- | ------------------------------------------- |
+| `stream.iggy.stream.id`       | Yes      | -       | Iggy stream identifier (name or numeric ID) |
+| `stream.iggy.topic.id`        | Yes      | -       | Iggy topic identifier (name or numeric ID)  |
+| `stream.iggy.consumer.group`  | Yes      | -       | Consumer group name for offset management   |
+| `stream.iggy.poll.batch.size` | No       | 100     | Number of messages to fetch per poll        |
 
 ## Complete Example
 
@@ -186,7 +186,8 @@ From the `foreign/java` directory:
 ```
 
 This produces a JAR file at:
-```
+
+```text
 foreign/java/external-processors/iggy-connector-pinot/build/libs/iggy-connector-pinot-<version>.jar
 ```
 
@@ -194,10 +195,12 @@ foreign/java/external-processors/iggy-connector-pinot/build/libs/iggy-connector-
 
 1. Build the connector JAR
 2. Copy the JAR to Pinot's plugins directory:
-   ```bash
-   cp build/libs/iggy-connector-pinot-*.jar /path/to/pinot/plugins/
-   ```
-3. Restart Pinot servers to load the plugin
+
+```bash
+cp build/libs/iggy-connector-pinot-*.jar /path/to/pinot/plugins/
+```
+
+1. Restart Pinot servers to load the plugin
 
 ## Message Format
 
@@ -230,9 +233,10 @@ Monitor your Iggy connector through:
 1. **Pinot Metrics**: Check ingestion lag via Pinot's realtime metrics
 2. **Iggy Stats**: Query Iggy for consumer group state and offset positions
 3. **Logs**: Enable DEBUG logging for detailed consumption information:
-   ```
-   log4j.logger.org.apache.iggy.connector.pinot=DEBUG
-   ```
+
+```text
+log4j.logger.org.apache.iggy.connector.pinot=DEBUG
+```
 
 ## Troubleshooting
 
@@ -265,14 +269,14 @@ For optimal performance:
 
 ## Comparison: Iggy vs Kafka for Pinot
 
-| Feature | Iggy Connector | Kafka Connector |
-|---------|----------------|-----------------|
-| Protocol | TCP | Kafka Protocol |
-| Consumer Groups | Native Iggy groups | Kafka consumer groups |
-| Offset Management | Server-managed | Client or server-managed |
-| Partition Discovery | Dynamic via API | Dynamic via metadata |
-| Authentication | Username/password | SASL/SCRAM/etc. |
-| TLS Support | Yes | Yes |
+| Feature             | Iggy Connector         | Kafka Connector          |
+| ------------------- | ---------------------- | ------------------------ |
+| Protocol            | TCP                    | Kafka Protocol           |
+| Consumer Groups     | Native Iggy groups     | Kafka consumer groups    |
+| Offset Management   | Server-managed         | Client or server-managed |
+| Partition Discovery | Dynamic via API        | Dynamic via metadata     |
+| Authentication      | Username/password      | SASL/SCRAM/etc.          |
+| TLS Support         | Yes                    | Yes                      |
 
 ## Related Documentation
 
