@@ -102,6 +102,13 @@ repos:
         types: [rust]
         pass_filenames: false
 
+      - id: cargo-sort
+        name: cargo sort
+        entry: cargo sort --workspace
+        language: system
+        files: (^|/)Cargo\.toml$
+        pass_filenames: false
+
       - id: cargo-clippy
         name: cargo clippy
         entry: cargo clippy
