@@ -178,7 +178,7 @@ EOF
     curl -X POST "http://localhost:3000/streams/test-stream/topics/test-events/messages" \
       -H "Authorization: Bearer $TOKEN" \
       -H "Content-Type: application/json" \
-      -d "{\"partitioning\": {\"kind\": \"partition_id\", \"value\": \"$PARTITION_VALUE\"}, \"messages\": [{\"payload\": \"$(echo $MESSAGE | base64)\"}]}" \
+      -d "{\"partitioning\": {\"kind\": \"partition_id\", \"value\": \"$PARTITION_VALUE\"}, \"messages\": [{\"payload\": \"$(echo "$MESSAGE" | base64)\"}]}" \
       > /dev/null 2>&1
     echo -e "${GREEN}✓ Message $i sent${NC}"
     sleep 1
