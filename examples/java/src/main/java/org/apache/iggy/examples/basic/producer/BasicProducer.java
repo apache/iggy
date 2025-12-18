@@ -57,8 +57,11 @@ public final class BasicProducer {
     private BasicProducer() {}
 
     public static void main(String[] args) {
-        var client = new IggyTcpClient("localhost", 8090);
-        client.users().login("iggy", "iggy");
+        var client = IggyTcpClient.builder()
+                .host("localhost")
+                .port(8090)
+                .credentials("iggy", "iggy")
+                .build();
 
         Optional<StreamDetails> stream = client.streams().getStream(STREAM_ID);
         if (stream.isPresent()) {

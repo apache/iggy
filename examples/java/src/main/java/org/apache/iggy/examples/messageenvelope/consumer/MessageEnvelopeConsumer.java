@@ -62,8 +62,11 @@ public final class MessageEnvelopeConsumer {
     private MessageEnvelopeConsumer() {}
 
     public static void main(final String[] args) {
-        var client = new IggyTcpClient("localhost", 8090);
-        client.users().login("iggy", "iggy");
+        var client = IggyTcpClient.builder()
+                .host("localhost")
+                .port(8090)
+                .credentials("iggy", "iggy")
+                .build();
 
         consumeMessages(client);
     }

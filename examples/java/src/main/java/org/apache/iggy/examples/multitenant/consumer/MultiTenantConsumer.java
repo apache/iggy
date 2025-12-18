@@ -76,8 +76,11 @@ public final class MultiTenantConsumer {
         log.info("Multi-tenant consumer has started, tenants: {}, consumers: {}", TENANTS_COUNT, CONSUMERS_COUNT);
 
         HostAndPort hostAndPort = parseAddress(ADDRESS);
-        IggyTcpClient rootClient = new IggyTcpClient(hostAndPort.host(), hostAndPort.port());
-        rootClient.users().login(ROOT_USERNAME, ROOT_PASSWORD);
+        IggyTcpClient rootClient = IggyTcpClient.builder()
+                .host(hostAndPort.host())
+                .port(hostAndPort.port())
+                .credentials(ROOT_USERNAME, ROOT_PASSWORD)
+                .build();
 
         log.info("Creating users with topic permissions for each tenant");
         Map<String, String> streamsWithUsers = new HashMap<>();
@@ -93,8 +96,11 @@ public final class MultiTenantConsumer {
         List<Tenant> tenants = new ArrayList<>();
         int tenantId = 1;
         for (Map.Entry<String, String> entry : streamsWithUsers.entrySet()) {
-            IggyTcpClient client = new IggyTcpClient(hostAndPort.host(), hostAndPort.port());
-            client.users().login(entry.getValue(), PASSWORD);
+            IggyTcpClient client = IggyTcpClient.builder()
+                    .host(hostAndPort.host())
+                    .port(hostAndPort.port())
+                    .credentials(entry.getValue(), PASSWORD)
+                    .build();
             tenants.add(Tenant.newTenant(tenantId, entry.getKey(), entry.getValue(), client));
             tenantId++;
         }

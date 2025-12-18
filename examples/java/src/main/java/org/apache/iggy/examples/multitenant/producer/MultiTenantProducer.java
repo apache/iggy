@@ -76,8 +76,11 @@ public final class MultiTenantProducer {
                 partitionsCount);
 
         HostAndPort hostAndPort = parseAddress(address);
-        IggyTcpClient rootClient = new IggyTcpClient(hostAndPort.host(), hostAndPort.port());
-        rootClient.users().login(rootUsername, rootPassword);
+        IggyTcpClient rootClient = IggyTcpClient.builder()
+                .host(hostAndPort.host())
+                .port(hostAndPort.port())
+                .credentials(rootUsername, rootPassword)
+                .build();
 
         log.info("Creating streams and users with permissions for each tenant");
         Map<String, String> streamsWithUsers = new HashMap<>();
@@ -93,8 +96,11 @@ public final class MultiTenantProducer {
         List<Tenant> tenants = new ArrayList<>();
         int tenantId = 1;
         for (Map.Entry<String, String> entry : streamsWithUsers.entrySet()) {
-            IggyTcpClient client = new IggyTcpClient(hostAndPort.host(), hostAndPort.port());
-            client.users().login(entry.getValue(), PASSWORD);
+            IggyTcpClient client = IggyTcpClient.builder()
+                    .host(hostAndPort.host())
+                    .port(hostAndPort.port())
+                    .credentials(entry.getValue(), PASSWORD)
+                    .build();
             tenants.add(Tenant.newTenant(tenantId, entry.getKey(), entry.getValue(), client));
             tenantId++;
         }

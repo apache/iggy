@@ -113,3 +113,8 @@ tasks.register<JavaExec>("runMultiTenantConsumer") {
     classpath = sourceSets["main"].runtimeClasspath
     mainClass.set("org.apache.iggy.examples.multitenant.consumer.MultiTenantConsumer")
 }
+
+tasks.register<JavaExec>("runStreamBasic") {
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("org.apache.iggy.examples.streambuilder.StreamBasic")
+}
