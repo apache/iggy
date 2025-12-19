@@ -169,7 +169,6 @@ impl LocalConnectorsConfigProvider<Created> {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_file() {
-
                 if path.extension().and_then(|ext| ext.to_str()) != Some("toml") {
                     debug!("Skipping non-TOML file: {:?}", path);
                     continue;
