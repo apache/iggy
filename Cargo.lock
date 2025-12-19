@@ -3008,6 +3008,9 @@ name = "err_trail"
 version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "85b9e8330eccf84d08fb8efe2f923ddacc9f02c1359edfc33cc0af4100caf764"
+dependencies = [
+ "tracing",
+]
 
 [[package]]
 name = "errno"

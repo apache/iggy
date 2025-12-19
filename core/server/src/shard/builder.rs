@@ -127,25 +127,22 @@ impl IggyShardBuilder {
         let encryptor = self.encryptor;
         let client_manager = self.client_manager.unwrap();
         let version = self.version.unwrap();
-        let (_, stop_receiver, frame_receiver) = connections
+        let (stop_receiver, frame_receiver) = connections
             .iter()
             .filter(|c| c.id == id)
-            .map(|c| {
-                (
-                    c.stop_sender.clone(),
-                    c.stop_receiver.clone(),
-                    c.receiver.clone(),
-                )
-            })
+            .map(|c| (c.stop_receiver.clone(), c.receiver.clone()))
             .next()
             .expect("Failed to find connection with the specified ID");
+
+        // Collect all stop_senders for broadcasting shutdown to all shards
+        let all_stop_senders: Vec<_> = connections.iter().map(|c| c.stop_sender.clone()).collect();
         let shards = connections;
 
         // Initialize metrics
         let metrics = self.metrics.unwrap_or_else(Metrics::init);
 
-        // Create TaskRegistry for this shard
-        let task_registry = Rc::new(TaskRegistry::new(id));
+        // Create TaskRegistry with all stop_senders for critical task failures
+        let task_registry = Rc::new(TaskRegistry::new(id, all_stop_senders));
 
         // Create notification channel for config writer
         let (config_writer_notify, config_writer_receiver) = async_channel::bounded(1);
