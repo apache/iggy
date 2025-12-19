@@ -19,7 +19,7 @@
 use iggy_common::{CompressionAlgorithm, Identifier, IggyError, IggyExpiry, MaxTopicSize};
 use server::{
     configs::system::SystemConfig,
-    shard::task_registry::TaskRegistry,
+    shard::{task_registry::TaskRegistry, transmission::connector::ShardConnector},
     slab::{streams::Streams, traits_ext::EntityMarker},
     streaming::{
         self,
@@ -118,8 +118,9 @@ async fn bootstrap_test_environment(
         });
     }
 
-    // Create a test task registry
-    let task_registry = Rc::new(TaskRegistry::new(shard_id));
+    // Create a test task registry with dummy stop sender from ShardConnector
+    let connector: ShardConnector<()> = ShardConnector::new(shard_id);
+    let task_registry = Rc::new(TaskRegistry::new(shard_id, vec![connector.stop_sender]));
 
     Ok(BootstrapResult {
         streams,

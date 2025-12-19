@@ -16,11 +16,13 @@
 // under the License.
 
 use crate::shard::IggyShard;
+use crate::shard::task_registry::ShutdownToken;
 use compio::io::AsyncWriteAtExt;
 use err_trail::ErrContext;
+use futures::FutureExt;
 use iggy_common::IggyError;
 use std::rc::Rc;
-use tracing::info;
+use tracing::{info, warn};
 
 pub fn spawn_config_writer_task(shard: &Rc<IggyShard>) {
     let shard_clone = shard.clone();
@@ -28,11 +30,14 @@ pub fn spawn_config_writer_task(shard: &Rc<IggyShard>) {
         .task_registry
         .oneshot("config_writer")
         .critical(false)
-        .run(move |_shutdown_token| async move { write_config(shard_clone).await })
+        .run(move |shutdown_token| async move { write_config(shard_clone, shutdown_token).await })
         .spawn();
 }
 
-async fn write_config(shard: Rc<IggyShard>) -> Result<(), IggyError> {
+async fn write_config(
+    shard: Rc<IggyShard>,
+    shutdown_token: ShutdownToken,
+) -> Result<(), IggyError> {
     let shard_clone = shard.clone();
     let tcp_enabled = shard.config.tcp.enabled;
     let quic_enabled = shard.config.quic.enabled;
@@ -41,15 +46,21 @@ async fn write_config(shard: Rc<IggyShard>) -> Result<(), IggyError> {
 
     let notify_receiver = shard_clone.config_writer_receiver.clone();
 
-    // Wait for notifications until all servers have bound
+    // Wait for notifications until all servers have bound, or shutdown is triggered
     loop {
-        notify_receiver
-            .recv()
-            .await
-            .map_err(|_| IggyError::CannotWriteToFile)
-            .with_error(
-                |_| "config_writer: notification channel closed before all servers bound",
-            )?;
+        futures::select! {
+            _ = shutdown_token.wait().fuse() => {
+                warn!("config_writer: shutdown triggered before all servers bound, skipping config write");
+                return Ok(());
+            }
+            result = notify_receiver.recv().fuse() => {
+                if result.is_err() {
+                    return Err(IggyError::CannotWriteToFile).with_error(
+                        |_| "config_writer: notification channel closed before all servers bound",
+                    );
+                }
+            }
+        }
 
         let tcp_ready = !tcp_enabled || shard_clone.tcp_bound_address.get().is_some();
         let quic_ready = !quic_enabled || shard_clone.quic_bound_address.get().is_some();

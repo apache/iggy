@@ -36,6 +36,7 @@ use axum::http::Method;
 use axum::{Router, middleware};
 use axum_server::tls_rustls::RustlsConfig;
 use compio_net::TcpListener;
+use err_trail::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::TransportProtocol;
 use std::net::SocketAddr;
@@ -106,7 +107,7 @@ pub async fn start_http_server(
         .layer(middleware::from_fn_with_state(app_state.clone(), jwt_auth));
 
     if config.cors.enabled {
-        app = app.layer(configure_cors(config.cors));
+        app = app.layer(configure_cors(config.cors)?);
     }
 
     if config.metrics.enabled {
@@ -250,50 +251,73 @@ async fn build_app_state(
     })
 }
 
-fn configure_cors(config: HttpCorsConfig) -> CorsLayer {
+fn configure_cors(config: HttpCorsConfig) -> Result<CorsLayer, IggyError> {
     let allowed_origins = match config.allowed_origins {
-        origins if origins.is_empty() => AllowOrigin::default(),
-        origins if origins.first().unwrap() == "*" => AllowOrigin::any(),
-        origins => AllowOrigin::list(origins.iter().map(|s| s.parse().unwrap())),
+        ref origins if origins.is_empty() => AllowOrigin::default(),
+        ref origins if origins.first().unwrap() == "*" => AllowOrigin::any(),
+        origins => {
+            let parsed: Result<Vec<_>, _> = origins
+                .iter()
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| {
+                    s.parse()
+                        .with_error(|e| format!("Invalid CORS origin '{s}': {e}"))
+                        .map_err(|_| IggyError::InvalidConfiguration)
+                })
+                .collect();
+            AllowOrigin::list(parsed?)
+        }
     };
 
-    let allowed_headers = config
+    let allowed_headers: Result<Vec<_>, _> = config
         .allowed_headers
         .iter()
-        .filter(|s| !s.is_empty())
-        .map(|s| s.parse().unwrap())
-        .collect::<Vec<_>>();
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| {
+            s.parse()
+                .with_error(|e| format!("Invalid CORS header '{s}': {e}"))
+                .map_err(|_| IggyError::InvalidConfiguration)
+        })
+        .collect();
+    let allowed_headers = allowed_headers?;
 
-    let exposed_headers = config
+    let exposed_headers: Result<Vec<_>, _> = config
         .exposed_headers
         .iter()
-        .filter(|s| !s.is_empty())
-        .map(|s| s.parse().unwrap())
-        .collect::<Vec<_>>();
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| {
+            s.parse()
+                .with_error(|e| format!("Invalid CORS exposed header '{s}': {e}"))
+                .map_err(|_| IggyError::InvalidConfiguration)
+        })
+        .collect();
+    let exposed_headers = exposed_headers?;
 
-    let allowed_methods = config
+    let allowed_methods: Result<Vec<_>, _> = config
         .allowed_methods
         .iter()
-        .filter(|s| !s.is_empty())
+        .filter(|s| !s.trim().is_empty())
         .map(|s| match s.to_uppercase().as_str() {
-            "GET" => Method::GET,
-            "POST" => Method::POST,
-            "PUT" => Method::PUT,
-            "DELETE" => Method::DELETE,
-            "HEAD" => Method::HEAD,
-            "OPTIONS" => Method::OPTIONS,
-            "CONNECT" => Method::CONNECT,
-            "PATCH" => Method::PATCH,
-            "TRACE" => Method::TRACE,
-            _ => panic!("Invalid HTTP method: {s}"),
+            "GET" => Ok(Method::GET),
+            "POST" => Ok(Method::POST),
+            "PUT" => Ok(Method::PUT),
+            "DELETE" => Ok(Method::DELETE),
+            "HEAD" => Ok(Method::HEAD),
+            "OPTIONS" => Ok(Method::OPTIONS),
+            "CONNECT" => Ok(Method::CONNECT),
+            "PATCH" => Ok(Method::PATCH),
+            "TRACE" => Ok(Method::TRACE),
+            _ => Err(IggyError::InvalidConfiguration)
+                .with_error(|_| format!("Invalid HTTP method in CORS config: '{s}'")),
         })
-        .collect::<Vec<_>>();
+        .collect();
+    let allowed_methods = allowed_methods?;
 
-    CorsLayer::new()
+    Ok(CorsLayer::new()
         .allow_methods(allowed_methods)
         .allow_origin(allowed_origins)
         .allow_headers(allowed_headers)
         .expose_headers(exposed_headers)
         .allow_credentials(config.allow_credentials)
-        .allow_private_network(config.allow_private_network)
+        .allow_private_network(config.allow_private_network))
 }

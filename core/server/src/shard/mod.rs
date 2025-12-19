@@ -181,10 +181,7 @@ impl IggyShard {
         // Spawn shutdown handler
         compio::runtime::spawn(async move {
             let _ = stop_receiver.recv().await;
-            let shutdown_success = shard_for_shutdown.trigger_shutdown().await;
-            if !shutdown_success {
-                error!("shutdown timed out");
-            }
+            shard_for_shutdown.trigger_shutdown().await;
             let _ = shutdown_complete_tx.send(()).await;
         })
         .detach();
