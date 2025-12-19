@@ -18,6 +18,7 @@
  */
 
 use crate::configs::connectors::{ConnectorsConfigProvider, create_connectors_config_provider};
+use clap::Parser;
 use configs::connectors::ConfigFormat;
 use configs::runtime::ConnectorsRuntimeConfig;
 use dlopen2::wrapper::{Container, WrapperApi};
@@ -56,6 +57,10 @@ mod transform;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
+#[derive(Parser, Debug)]
+#[command(author = "Apache Iggy (Incubating)", version)]
+struct Args {}
+
 static PLUGIN_ID: AtomicU32 = AtomicU32::new(1);
 const ALLOWED_PLUGIN_EXTENSIONS: [&str; 3] = ["so", "dylib", "dll"];
 const DEFAULT_CONFIG_PATH: &str = "core/connectors/runtime/config.toml";
@@ -89,11 +94,16 @@ struct SinkApi {
     close: extern "C" fn(id: u32) -> i32,
 }
 
+fn print_ascii_art(text: &str) {
+    let standard_font = FIGfont::standard().unwrap();
+    let figure = standard_font.convert(text);
+    println!("{}", figure.unwrap());
+}
+
 #[tokio::main]
 async fn main() -> Result<(), RuntimeError> {
-    let standard_font = FIGfont::standard().unwrap();
-    let figure = standard_font.convert("Iggy Connectors");
-    println!("{}", figure.unwrap());
+    Args::parse();
+    print_ascii_art("Iggy Connectors");
 
     if let Ok(env_path) = std::env::var("IGGY_CONNECTORS_ENV_PATH") {
         if dotenvy::from_path(&env_path).is_ok() {

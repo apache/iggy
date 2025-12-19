@@ -4555,6 +4555,7 @@ dependencies = [
  "axum",
  "axum-server",
  "chrono",
+ "clap",
  "dashmap",
  "dlopen2",
  "dotenvy",
