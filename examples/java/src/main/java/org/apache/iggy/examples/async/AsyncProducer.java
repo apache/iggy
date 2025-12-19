@@ -53,7 +53,6 @@ public class AsyncProducer {
 
     private static final String STREAM_NAME = "async-test";
     private static final String TOPIC_NAME = "events";
-    // Iggy partitions are zero-based; use the first (and only) partition.
     private static final long PARTITION_ID = 0L;
 
     private static final int MESSAGE_COUNT = 100;
