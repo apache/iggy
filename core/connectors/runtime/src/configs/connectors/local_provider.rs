@@ -170,7 +170,6 @@ impl LocalConnectorsConfigProvider<Created> {
             let path = entry.path();
             if path.is_file() {
 
-                // Only accept .toml files
                 if path.extension().and_then(|ext| ext.to_str()) != Some("toml") {
                     debug!("Skipping non-TOML file: {:?}", path);
                     continue;
