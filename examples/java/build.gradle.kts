@@ -66,18 +66,12 @@ tasks.register<JavaExec>("runGettingStartedProducer") {
     classpath = sourceSets["main"].runtimeClasspath
     mainClass.set("org.apache.iggy.examples.gettingstarted.producer.GettingStartedProducer")
 }
+
 tasks.register<JavaExec>("runGettingStartedConsumer") {
     classpath = sourceSets["main"].runtimeClasspath
     mainClass.set("org.apache.iggy.examples.gettingstarted.consumer.GettingStartedConsumer")
 }
-tasks.register<JavaExec>("runBasicProducer") {
-    classpath = sourceSets["main"].runtimeClasspath
-    mainClass.set("org.apache.iggy.examples.basic.producer.BasicProducer")
-}
-tasks.register<JavaExec>("runBasicConsumer") {
-    classpath = sourceSets["main"].runtimeClasspath
-    mainClass.set("org.apache.iggy.examples.basic.consumer.BasicConsumer")
-}
+
 tasks.register<JavaExec>("runMessageHeadersProducer") {
     classpath = sourceSets["main"].runtimeClasspath
     mainClass.set("org.apache.iggy.examples.messageheaders.producer.MessageHeadersProducer")
@@ -117,4 +111,14 @@ tasks.register<JavaExec>("runMultiTenantConsumer") {
 tasks.register<JavaExec>("runStreamBasic") {
     classpath = sourceSets["main"].runtimeClasspath
     mainClass.set("org.apache.iggy.examples.streambuilder.StreamBasic")
+}
+
+tasks.register<JavaExec>("runAsyncProducer") {
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("org.apache.iggy.examples.async.AsyncProducer")
+}
+
+tasks.register<JavaExec>("runAsyncConsumerExample") {
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("org.apache.iggy.examples.async.AsyncConsumerExample")
 }

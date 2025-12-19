@@ -73,15 +73,6 @@ A good introduction for newcomers to Iggy:
 ./gradlew runGettingStartedConsumer
 ```
 
-### Basic Usage
-
-Core functionality with detailed configuration options:
-
-```bash
-./gradlew runBasicProducer
-./gradlew runBasicConsumer
-```
-
 ### Message Headers
 
 This example will be created as and when userHeaders serialization/deserialization is implemented in the Java client SDK.
@@ -131,3 +122,19 @@ Building streams with advanced configuration:
 ```
 
 Shows how to use the stream builder API to create and configure streams with custom settings.
+
+## Async Client
+
+The following example demonstrates how to use the asynchronous client:
+
+Async producer example:
+
+```bash
+./gradlew runAsyncProducer
+```
+
+Async consumer example:
+
+```bash
+./gradlew runAsyncConsumerExample
+```

@@ -17,7 +17,7 @@
  * under the License.
  */
 
-package org.apache.iggy.async;
+package org.apache.iggy.examples.async;
 
 import org.apache.iggy.client.async.tcp.AsyncIggyTcpClient;
 import org.apache.iggy.identifier.StreamId;
@@ -53,7 +53,8 @@ public class AsyncProducer {
 
     private static final String STREAM_NAME = "async-test";
     private static final String TOPIC_NAME = "events";
-    private static final long PARTITION_ID = 1L;
+    // Iggy partitions are zero-based; use the first (and only) partition.
+    private static final long PARTITION_ID = 0L;
 
     private static final int MESSAGE_COUNT = 100;
     private static final int MESSAGE_SIZE = 256;
