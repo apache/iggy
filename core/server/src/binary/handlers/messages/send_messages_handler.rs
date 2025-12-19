@@ -151,11 +151,14 @@ impl ServerCommandHandler for SendMessages {
 
         let namespace = IggyNamespace::new(numeric_stream_id, numeric_topic_id, partition_id);
         let user_id = session.get_user_id();
-        let balanced_partitioning = matches!(self.partitioning.kind, PartitioningKind::Balanced);
+        let unsupport_socket_transfer = matches!(
+            self.partitioning.kind,
+            PartitioningKind::Balanced | PartitioningKind::MessagesKey
+        );
         let enabled_socket_migration = shard.config.tcp.socket_migration;
 
         if enabled_socket_migration
-            && !(session.is_migrated() || balanced_partitioning)
+            && !(session.is_migrated() || unsupport_socket_transfer)
             && let Some(target_shard) = shard.find_shard(&namespace)
             && target_shard.id != shard.id
         {
