@@ -252,6 +252,7 @@ components:
       - "sdk-go"
       - "sdk-csharp"
       - "sdk-python"
+      - "sdk-java"
       - "ci-infrastructure" # CI changes trigger full regression
     paths:
       - "examples/**"
