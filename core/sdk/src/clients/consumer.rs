@@ -923,16 +923,8 @@ impl Stream for IggyConsumer {
             }
 
             if self.buffered_messages.is_empty() {
-                match self.polling_strategy.kind {
-                    PollingKind::Offset => {
-                        self.polling_strategy = PollingStrategy::offset(message.header.offset + 1);
-                    }
-                    PollingKind::Timestamp => {
-                        // Adding +1, since the `get_by_timestamp` is inclusive.
-                        self.polling_strategy =
-                            PollingStrategy::timestamp((message.header.timestamp + 1).into());
-                    }
-                    _ => {}
+                if self.polling_strategy.kind != PollingKind::Next {
+                    self.polling_strategy = PollingStrategy::offset(message.header.offset + 1);
                 }
 
                 if self.store_offset_after_all_messages {
@@ -998,18 +990,9 @@ impl Stream for IggyConsumer {
                         let message = polled_messages.messages.remove(0);
                         self.buffered_messages.extend(polled_messages.messages);
 
-                        match self.polling_strategy.kind {
-                            PollingKind::Offset => {
-                                self.polling_strategy =
-                                    PollingStrategy::offset(message.header.offset + 1);
-                            }
-                            PollingKind::Timestamp => {
-                                // Adding +1, since the `get_by_timestamp` is inclusive.
-                                self.polling_strategy = PollingStrategy::timestamp(
-                                    (message.header.timestamp + 1).into(),
-                                );
-                            }
-                            _ => {}
+                        if self.polling_strategy.kind != PollingKind::Next {
+                            self.polling_strategy =
+                                PollingStrategy::offset(message.header.offset + 1);
                         }
 
                         if let Some(last_consumed_offset_entry) =
