@@ -18,7 +18,9 @@
 use crate::shard::IggyShard;
 use std::rc::Rc;
 
-use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
+use crate::binary::command::{
+    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
+};
 use crate::binary::handlers::personal_access_tokens::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
@@ -41,7 +43,7 @@ impl ServerCommandHandler for LoginWithPersonalAccessToken {
         _length: u32,
         session: &Session,
         shard: &Rc<IggyShard>,
-    ) -> Result<(), IggyError> {
+    ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
         let user = shard
             .login_with_personal_access_token(&self.token, Some(session))
@@ -57,7 +59,7 @@ impl ServerCommandHandler for LoginWithPersonalAccessToken {
             })?;
         let identity_info = mapper::map_identity_info(user.id);
         sender.send_ok_response(&identity_info).await?;
-        Ok(())
+        Ok(HandlerResult::Finished)
     }
 }
 

@@ -16,7 +16,9 @@
  * under the License.
  */
 
-use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
+use crate::binary::command::{
+    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
+};
 use crate::binary::handlers::personal_access_tokens::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::shard::IggyShard;
@@ -41,7 +43,7 @@ impl ServerCommandHandler for DeletePersonalAccessToken {
         _length: u32,
         session: &Session,
         shard: &Rc<IggyShard>,
-    ) -> Result<(), IggyError> {
+    ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
         let token_name = self.name.clone();
 
@@ -71,7 +73,7 @@ impl ServerCommandHandler for DeletePersonalAccessToken {
                 "{COMPONENT} (error: {error}) - failed to apply delete personal access token with name: {token_name}, session: {session}"
             )})?;
         sender.send_empty_ok_response().await?;
-        Ok(())
+        Ok(HandlerResult::Finished)
     }
 }
 

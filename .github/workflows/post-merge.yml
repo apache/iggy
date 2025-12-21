@@ -309,3 +309,77 @@ jobs:
             - Commit: ${{ github.sha }}
 
             **Not an official ASF release** - for development/testing only.
+
+  # Check if auto-publish should run for edge/rc versions
+  check-auto-publish:
+    name: Check auto-publish
+    runs-on: ubuntu-latest
+    if: ${{ !github.event.repository.fork }}
+    outputs:
+      should_publish: ${{ steps.check.outputs.should_publish }}
+      crates_to_publish: ${{ steps.check.outputs.crates_to_publish }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check versions and tags for each crate
+        id: check
+        run: |
+          chmod +x scripts/extract-version.sh
+
+          CRATES_TO_PUBLISH=""
+
+          # Check each crate individually
+          for crate in rust-common rust-binary-protocol rust-sdk rust-cli; do
+            VERSION=$(scripts/extract-version.sh "$crate")
+            TAG=$(scripts/extract-version.sh "$crate" --tag)
+
+            echo "Checking $crate: version=$VERSION, tag=$TAG"
+
+            # Skip if version doesn't contain edge or rc
+            if [[ ! "$VERSION" =~ -(edge|rc) ]]; then
+              echo "  ⏭️ Stable version - skipping"
+              continue
+            fi
+
+            # Skip if tag already exists
+            if git rev-parse "$TAG" >/dev/null 2>&1; then
+              echo "  ⏭️ Tag exists - skipping"
+              continue
+            fi
+
+            echo "  ✅ Will publish"
+            if [ -n "$CRATES_TO_PUBLISH" ]; then
+              CRATES_TO_PUBLISH="$CRATES_TO_PUBLISH,$crate"
+            else
+              CRATES_TO_PUBLISH="$crate"
+            fi
+          done
+
+          if [ -z "$CRATES_TO_PUBLISH" ]; then
+            echo ""
+            echo "No crates need publishing"
+            echo "should_publish=false" >> "$GITHUB_OUTPUT"
+            echo "crates_to_publish=" >> "$GITHUB_OUTPUT"
+          else
+            echo ""
+            echo "Crates to publish: $CRATES_TO_PUBLISH"
+            echo "should_publish=true" >> "$GITHUB_OUTPUT"
+            echo "crates_to_publish=$CRATES_TO_PUBLISH" >> "$GITHUB_OUTPUT"
+          fi
+
+  # Auto-publish Rust crates for edge/rc versions
+  publish-rust-crates:
+    name: Auto-publish Rust crates
+    needs: check-auto-publish
+    if: needs.check-auto-publish.outputs.should_publish == 'true'
+    permissions:
+      contents: write # Required for git tag push
+    uses: ./.github/workflows/_publish_rust_crates.yml
+    with:
+      crates: ${{ needs.check-auto-publish.outputs.crates_to_publish }}
+      dry_run: false
+      create_tags: true
+    secrets:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

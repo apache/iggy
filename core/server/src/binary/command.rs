@@ -121,6 +121,15 @@ define_server_command_enum! {
     LeaveConsumerGroup(LeaveConsumerGroup), LEAVE_CONSUMER_GROUP_CODE, LEAVE_CONSUMER_GROUP, true;
 }
 
+/// Indicates whether a command handler completed normally or migrated the connection.
+pub enum HandlerResult {
+    /// Command completed, connection stays on current shard.
+    Finished,
+
+    /// Connection was migrated to another shard. Source shard should exit without cleanup.
+    Migrated { to_shard: u16 },
+}
+
 #[enum_dispatch]
 pub trait ServerCommandHandler {
     /// Return the command code
@@ -134,7 +143,7 @@ pub trait ServerCommandHandler {
         length: u32,
         session: &Session,
         shard: &Rc<IggyShard>,
-    ) -> Result<(), IggyError>;
+    ) -> Result<HandlerResult, IggyError>;
 }
 
 pub trait BinaryServerCommand {

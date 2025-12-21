@@ -101,6 +101,12 @@ fn extract_panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
         .unwrap_or_else(|| "unknown panic".to_string())
 }
 
+fn print_ascii_art(text: &str) {
+    let standard_font = FIGfont::standard().unwrap();
+    let figure = standard_font.convert(text);
+    println!("{}", figure.unwrap());
+}
+
 #[instrument(skip_all, name = "trace_start_server")]
 fn main() -> Result<(), ServerError> {
     let rt = match compio::runtime::Runtime::new() {
@@ -115,14 +121,6 @@ fn main() -> Result<(), ServerError> {
         }
     };
     rt.block_on(async move {
-        let standard_font = FIGfont::standard().unwrap();
-        let figure = standard_font.convert("Iggy Server");
-        println!("{}", figure.unwrap());
-
-        if let Some(sha) = option_env!("VERGEN_GIT_SHA") {
-            println!("Commit SHA: {sha}");
-        }
-
         if let Ok(env_path) = std::env::var("IGGY_ENV_PATH") {
             if dotenvy::from_path(&env_path).is_ok() {
                 println!("Loaded environment variables from path: {env_path}");
@@ -134,6 +132,8 @@ fn main() -> Result<(), ServerError> {
             );
         }
         let args = Args::parse();
+        print_ascii_art("Iggy Server");
+
         let is_follower = args.follower;
 
         // FIRST DISCRETE LOADING STEP.
@@ -296,6 +296,11 @@ fn main() -> Result<(), ServerError> {
         let metrics = Metrics::init();
 
         // TWELFTH DISCRETE LOADING STEP.
+        info!(
+            "Enable TCP socket migration across shards: {}.",
+            config.tcp.socket_migration
+        );
+
         info!("Starting {} shard(s)", shard_assignment.len());
         let (connections, shutdown_handles) = create_shard_connections(&shard_assignment);
         let shards_count = shard_assignment.len();

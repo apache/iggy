@@ -16,7 +16,9 @@
  * under the License.
  */
 
-use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
+use crate::binary::command::{
+    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
+};
 use crate::binary::handlers::partitions::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 
@@ -43,7 +45,7 @@ impl ServerCommandHandler for DeletePartitions {
         _length: u32,
         session: &Session,
         shard: &Rc<IggyShard>,
-    ) -> Result<(), IggyError> {
+    ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
         let stream_id = self.stream_id.clone();
         let topic_id = self.topic_id.clone();
@@ -91,7 +93,7 @@ impl ServerCommandHandler for DeletePartitions {
             )
         })?;
         sender.send_empty_ok_response().await?;
-        Ok(())
+        Ok(HandlerResult::Finished)
     }
 }
 
