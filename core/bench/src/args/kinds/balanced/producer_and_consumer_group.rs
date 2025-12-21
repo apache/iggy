@@ -59,6 +59,12 @@ pub struct BalancedProducerAndConsumerGroupArgs {
     /// Max topic size in human readable format, e.g. "1GiB", "2MiB", "1GiB". If not provided then the server default will be used.
     #[arg(long, short = 'T')]
     pub max_topic_size: Option<IggyByteSize>,
+
+    /// Consumer rate limit multiplier relative to producer rate.
+    /// When measuring E2E latency, consumers may need higher throughput to prevent queue buildup.
+    /// Default is 1.05 (5% higher than producer rate). Set to 1.0 to disable.
+    #[arg(long, short = 'R', default_value_t = 1.05)]
+    pub read_amplification: f32,
 }
 
 impl BenchmarkKindProps for BalancedProducerAndConsumerGroupArgs {
@@ -84,6 +90,10 @@ impl BenchmarkKindProps for BalancedProducerAndConsumerGroupArgs {
 
     fn number_of_consumer_groups(&self) -> u32 {
         self.consumer_groups.get()
+    }
+
+    fn read_amplification(&self) -> Option<f32> {
+        Some(self.read_amplification)
     }
 
     fn validate(&self) {

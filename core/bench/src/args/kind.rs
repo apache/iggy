@@ -149,6 +149,10 @@ impl BenchmarkKindProps for BenchmarkKindCommand {
         self.inner().max_topic_size()
     }
 
+    fn read_amplification(&self) -> Option<f32> {
+        self.inner().read_amplification()
+    }
+
     fn inner(&self) -> &dyn BenchmarkKindProps {
         match self {
             Self::PinnedProducer(args) => args,
