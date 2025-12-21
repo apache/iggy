@@ -24,7 +24,7 @@ pub mod tasks;
 pub mod transmission;
 
 mod communication;
-mod handlers;
+pub mod handlers;
 
 // Re-export for backwards compatibility
 pub use communication::calculate_shard_assignment;
@@ -34,13 +34,7 @@ use crate::{
     configs::server::ServerConfig,
     io::fs_locks::FsLocks,
     shard::{
-        namespace::IggyNamespace,
-        task_registry::TaskRegistry,
-        transmission::{
-            event::ShardEvent,
-            frame::{ShardFrame, ShardResponse},
-            message::ShardMessage,
-        },
+        namespace::IggyNamespace, task_registry::TaskRegistry, transmission::frame::ShardFrame,
     },
     slab::{streams::Streams, traits_ext::EntityMarker, users::Users},
     state::file::FileState,
@@ -290,14 +284,6 @@ impl IggyShard {
 
     pub fn get_available_shards_count(&self) -> u32 {
         self.shards.len() as u32
-    }
-
-    pub async fn handle_shard_message(&self, message: ShardMessage) -> Option<ShardResponse> {
-        handlers::handle_shard_message(self, message).await
-    }
-
-    pub(crate) async fn handle_event(&self, event: ShardEvent) -> Result<(), IggyError> {
-        handlers::handle_event(self, event).await
     }
 
     pub fn ensure_authenticated(&self, session: &Session) -> Result<(), IggyError> {

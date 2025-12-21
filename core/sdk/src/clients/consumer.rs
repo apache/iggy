@@ -41,7 +41,7 @@ use tokio::time::sleep;
 use tracing::{error, info, trace, warn};
 
 const ORDERING: std::sync::atomic::Ordering = std::sync::atomic::Ordering::SeqCst;
-type PollMessagesFuture = Pin<Box<dyn Future<Output = Result<PolledMessages, IggyError>>>>;
+type PollMessagesFuture = Pin<Box<dyn Future<Output = Result<PolledMessages, IggyError>> + Send>>;
 
 /// The auto-commit configuration for storing the offset on the server.
 #[derive(Debug, PartialEq, Copy, Clone)]
@@ -90,11 +90,18 @@ pub enum AutoCommitAfter {
     ConsumingEveryNthMessage(u32),
 }
 
-unsafe impl Send for IggyConsumer {}
+// SAFETY: IggyConsumer is Sync because:
+// 1. The only non-Sync field is `poll_future: Option<PollMessagesFuture>`
+// 2. `poll_future` is only accessed through `poll_next()` which requires `Pin<&mut Self>`
+//    (exclusive mutable access), so concurrent access to `poll_future` is impossible
+// 3. All other fields are inherently Sync (Arc<AtomicX>, Arc<DashMap>, etc.) or
+//    only accessed through `&mut self` methods
+// 4. All `&self` methods only access Sync-safe fields
 unsafe impl Sync for IggyConsumer {}
 
 pub struct IggyConsumer {
     initialized: bool,
+    shutdown: Arc<AtomicBool>,
     can_poll: Arc<AtomicBool>,
     client: IggyRwLock<ClientWrapper>,
     consumer_name: String,
@@ -153,6 +160,7 @@ impl IggyConsumer {
         let (store_offset_sender, _) = flume::unbounded();
         Self {
             initialized: false,
+            shutdown: Arc::new(AtomicBool::new(false)),
             is_consumer_group: consumer.kind == ConsumerKind::ConsumerGroup,
             joined_consumer_group: Arc::new(AtomicBool::new(false)),
             can_poll: Arc::new(AtomicBool::new(true)),
@@ -463,9 +471,14 @@ impl IggyConsumer {
         let topic_id = self.topic_id.clone();
         let last_consumed_offsets = self.last_consumed_offsets.clone();
         let last_stored_offsets = self.last_stored_offsets.clone();
+        let shutdown = self.shutdown.clone();
         tokio::spawn(async move {
             loop {
                 sleep(interval.get_duration()).await;
+                if shutdown.load(ORDERING) {
+                    trace!("Shutdown signal received, stopping background offset storage");
+                    break;
+                }
                 for entry in last_consumed_offsets.iter() {
                     let partition_id = *entry.key();
                     let consumed_offset = entry.load(ORDERING);
@@ -784,14 +797,6 @@ impl IggyConsumer {
             return;
         }
 
-        if now < last_sent_at {
-            warn!(
-                "Returned monotonic time went backwards, now < last_sent_at: ({now} < {last_sent_at})"
-            );
-            sleep(Duration::from_micros(interval)).await;
-            return;
-        }
-
         let elapsed = now - last_sent_at;
         if elapsed >= interval {
             trace!("No need to wait before polling messages. {now} - {last_sent_at} = {elapsed}");
@@ -923,7 +928,7 @@ impl Stream for IggyConsumer {
             }
 
             if self.buffered_messages.is_empty() {
-                if self.polling_strategy.kind == PollingKind::Offset {
+                if self.polling_strategy.kind != PollingKind::Next {
                     self.polling_strategy = PollingStrategy::offset(message.header.offset + 1);
                 }
 
@@ -990,7 +995,7 @@ impl Stream for IggyConsumer {
                         let message = polled_messages.messages.remove(0);
                         self.buffered_messages.extend(polled_messages.messages);
 
-                        if self.polling_strategy.kind == PollingKind::Offset {
+                        if self.polling_strategy.kind != PollingKind::Next {
                             self.polling_strategy =
                                 PollingStrategy::offset(message.header.offset + 1);
                         }
@@ -1033,5 +1038,15 @@ impl Stream for IggyConsumer {
         }
 
         Poll::Pending
+    }
+}
+
+impl Drop for IggyConsumer {
+    fn drop(&mut self) {
+        self.shutdown.store(true, ORDERING);
+        trace!(
+            "Consumer {} has been dropped, shutdown signal sent",
+            self.consumer_name
+        );
     }
 }

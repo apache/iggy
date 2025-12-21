@@ -4442,7 +4442,7 @@ dependencies = [
 
 [[package]]
 name = "iggy"
-version = "0.8.1-edge.1"
+version = "0.8.1-edge.2"
 dependencies = [
  "async-broadcast",
  "async-dropper",
@@ -4657,6 +4657,7 @@ dependencies = [
  "figment",
  "human-repr",
  "humantime",
+ "nix",
  "once_cell",
  "rcgen",
  "rustls",
@@ -5641,6 +5642,7 @@ dependencies = [
  "consensus",
  "iggy_common",
  "journal",
+ "message_bus",
  "tracing",
 ]
 

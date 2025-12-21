@@ -18,8 +18,8 @@
 use std::rc::Rc;
 
 use iggy_common::{
-    Consumer, ConsumerOffsetInfo, Identifier, IggyError, IggyExpiry, Partitioning, Permissions,
-    Stats, UserId, UserStatus,
+    Consumer, ConsumerOffsetInfo, Identifier, IggyError, IggyExpiry, Partitioning,
+    PartitioningKind, Permissions, Stats, UserId, UserStatus,
 };
 use send_wrapper::SendWrapper;
 
@@ -28,6 +28,7 @@ use crate::shard::system::messages::PollingArgs;
 use crate::state::command::EntryCommand;
 use crate::streaming::personal_access_tokens::personal_access_token::PersonalAccessToken;
 use crate::streaming::segments::{IggyMessagesBatchMut, IggyMessagesBatchSet};
+use crate::streaming::topics;
 use crate::streaming::users::user::User;
 use crate::{shard::IggyShard, streaming::session::Session};
 
@@ -299,11 +300,39 @@ impl HttpSafeShard {
         partitioning: &Partitioning,
         batch: IggyMessagesBatchMut,
     ) -> Result<(), IggyError> {
+        self.shard().ensure_topic_exists(&stream_id, &topic_id)?;
+
+        let partition_id = self.shard().streams.with_topic_by_id(
+            &stream_id,
+            &topic_id,
+            |(root, auxilary, ..)| match partitioning.kind {
+                PartitioningKind::Balanced => {
+                    let upperbound = root.partitions().len();
+                    let pid = auxilary.get_next_partition_id(upperbound);
+                    Ok(pid)
+                }
+                PartitioningKind::PartitionId => Ok(u32::from_le_bytes(
+                    partitioning.value[..partitioning.length as usize]
+                        .try_into()
+                        .map_err(|_| IggyError::InvalidNumberEncoding)?,
+                ) as usize),
+                PartitioningKind::MessagesKey => {
+                    let upperbound = root.partitions().len();
+                    Ok(
+                        topics::helpers::calculate_partition_id_by_messages_key_hash(
+                            upperbound,
+                            &partitioning.value,
+                        ),
+                    )
+                }
+            },
+        )?;
+
         let future = SendWrapper::new(self.shard().append_messages(
             user_id,
             stream_id,
             topic_id,
-            partitioning,
+            partition_id,
             batch,
         ));
         future.await

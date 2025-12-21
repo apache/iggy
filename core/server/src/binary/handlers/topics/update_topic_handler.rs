@@ -16,7 +16,9 @@
  * under the License.
  */
 
-use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
+use crate::binary::command::{
+    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
+};
 use crate::binary::handlers::topics::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 
@@ -48,7 +50,7 @@ impl ServerCommandHandler for UpdateTopic {
         _length: u32,
         session: &Session,
         shard: &Rc<IggyShard>,
-    ) -> Result<(), IggyError> {
+    ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
 
         let request = ShardRequest {
@@ -165,7 +167,7 @@ impl ServerCommandHandler for UpdateTopic {
             },
         }
 
-        Ok(())
+        Ok(HandlerResult::Finished)
     }
 }
 
