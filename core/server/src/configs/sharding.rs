@@ -21,8 +21,8 @@ use hwlocality::bitmap::SpecializedBitmapRef;
 use hwlocality::cpu::cpuset::CpuSet;
 use hwlocality::memory::binding::{MemoryBindingFlags, MemoryBindingPolicy};
 use hwlocality::object::types::ObjectType::{self, NUMANode};
-use nix::sched::sched_setaffinity;
-use nix::unistd::Pid;
+#[cfg(target_os = "linux")]
+use nix::{sched::sched_setaffinity, unistd::Pid};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashSet;
 use std::str::FromStr;
