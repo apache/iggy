@@ -294,21 +294,29 @@ pub struct ShardInfo {
 
 impl ShardInfo {
     pub fn bind_cpu(&self) -> Result<(), ServerError> {
-        if self.cpu_set.is_empty() {
-            return Ok(());
+        #[cfg(target_os = "linux")]
+        {
+            if self.cpu_set.is_empty() {
+                return Ok(());
+            }
+
+            let mut cpuset = nix::sched::CpuSet::new();
+            for &cpu in &self.cpu_set {
+                cpuset.set(cpu).map_err(|_| ServerError::BindingFailed)?;
+            }
+
+            sched_setaffinity(Pid::from_raw(0), &cpuset).map_err(|e| {
+                tracing::error!("Failed to set CPU affinity: {:?}", e);
+                ServerError::BindingFailed
+            })?;
+
+            info!("Thread bound to CPUs: {:?}", self.cpu_set);
         }
 
-        let mut cpuset = nix::sched::CpuSet::new();
-        for &cpu in &self.cpu_set {
-            cpuset.set(cpu).map_err(|_| ServerError::BindingFailed)?;
+        #[cfg(not(target_os = "linux"))]
+        {
+            tracing::debug!("CPU affinity binding skipped on non-Linux platform");
         }
-
-        sched_setaffinity(Pid::from_raw(0), &cpuset).map_err(|e| {
-            tracing::error!("Failed to set CPU affinity: {:?}", e);
-            ServerError::BindingFailed
-        })?;
-
-        info!("Thread bound to CPUs: {:?}", self.cpu_set);
 
         Ok(())
     }
