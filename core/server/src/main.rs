@@ -400,11 +400,15 @@ fn main() -> Result<(), ServerError> {
                 .name(format!("shard-{id}"))
                 .spawn(move || {
                     let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                        if let Err(e) = assignment.bind_cpu() {
+                            error!("Failed to bind cpu: {e:?}");
+                        }
+
                         if let Err(e) = assignment.bind_memory() {
                             error!("Failed to bind memory: {e:?}");
                         }
 
-                        let rt = create_shard_executor(assignment.cpu_set);
+                        let rt = create_shard_executor();
                         rt.block_on(async move {
                             let builder = IggyShard::builder();
                             let shard = builder
