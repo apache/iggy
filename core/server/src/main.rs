@@ -23,6 +23,7 @@ use dashmap::DashMap;
 use dotenvy::dotenv;
 use err_trail::ErrContext;
 use figlet_rs::FIGfont;
+use iggy_common::sharding::{IggyNamespace, LocalIdx, PartitionLocation, ShardId};
 use iggy_common::{Aes256GcmEncryptor, EncryptorKind, IggyError, MemoryPool};
 use server::SEMANTIC_VERSION;
 use server::args::Args;
@@ -35,9 +36,7 @@ use server::diagnostics::{print_io_uring_permission_info, print_locked_memory_li
 use server::io::fs_utils;
 use server::log::logger::Logging;
 use server::server_error::ServerError;
-use server::shard::namespace::IggyNamespace;
 use server::shard::system::info::SystemInfo;
-use server::shard::transmission::id::ShardId;
 use server::shard::{IggyShard, calculate_shard_assignment};
 use server::slab::traits_ext::{
     EntityComponentSystem, EntityComponentSystemMutCell, IntoComponents,
@@ -314,7 +313,7 @@ fn main() -> Result<(), ServerError> {
         // Shared resources bootstrap.
         let shards_table = Box::new(DashMap::with_capacity(SHARDS_TABLE_CAPACITY));
         let shards_table = Box::leak(shards_table);
-        let shards_table: EternalPtr<DashMap<IggyNamespace, ShardId>> = shards_table.into();
+        let shards_table: EternalPtr<DashMap<IggyNamespace, PartitionLocation>> = shards_table.into();
 
         let client_manager = Box::new(DashMap::new());
         let client_manager = Box::leak(client_manager);
@@ -338,7 +337,9 @@ fn main() -> Result<(), ServerError> {
                                     &ns,
                                     shard_assignment.len() as u32,
                                 ));
-                                shards_table.insert(ns, shard_id);
+                                // TODO(hubcio): LocalIdx is 0 until IggyPartitions is integratedds
+                                let location = PartitionLocation::new(shard_id, LocalIdx::new(0));
+                                shards_table.insert(ns, location);
                             }
                         });
                     }
