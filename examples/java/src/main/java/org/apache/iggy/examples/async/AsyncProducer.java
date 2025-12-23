@@ -17,7 +17,7 @@
  * under the License.
  */
 
-package org.apache.iggy.async;
+package org.apache.iggy.examples.async;
 
 import org.apache.iggy.client.async.tcp.AsyncIggyTcpClient;
 import org.apache.iggy.identifier.StreamId;
@@ -29,7 +29,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.math.BigInteger;
-import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -53,7 +52,7 @@ public class AsyncProducer {
 
     private static final String STREAM_NAME = "async-test";
     private static final String TOPIC_NAME = "events";
-    private static final long PARTITION_ID = 1L;
+    private static final long PARTITION_ID = 0L;
 
     private static final int MESSAGE_COUNT = 100;
     private static final int MESSAGE_SIZE = 256;
@@ -172,8 +171,6 @@ public class AsyncProducer {
         while (messageContent.length() < MESSAGE_SIZE) {
             messageContent += " ";
         }
-
-        byte[] messageBytes = messageContent.getBytes(StandardCharsets.UTF_8);
 
         // Use the factory method to create a message
         Message message = Message.of(messageContent);

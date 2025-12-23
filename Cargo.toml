@@ -145,7 +145,7 @@ lazy_static = "1.5.0"
 log = "0.4.29"
 mimalloc = "0.1"
 mockall = "0.14.0"
-nix = { version = "0.30.1", features = ["fs", "resource"] }
+nix = { version = "0.30.1", features = ["fs", "resource", "sched"] }
 nonzero_lit = "0.1.2"
 once_cell = "1.21.3"
 parquet = "=55.2.0"

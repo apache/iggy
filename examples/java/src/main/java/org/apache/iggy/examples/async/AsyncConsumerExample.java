@@ -17,7 +17,7 @@
  * under the License.
  */
 
-package org.apache.iggy.async;
+package org.apache.iggy.examples.async;
 
 import org.apache.iggy.client.async.tcp.AsyncIggyTcpClient;
 import org.apache.iggy.client.blocking.tcp.IggyTcpClient;

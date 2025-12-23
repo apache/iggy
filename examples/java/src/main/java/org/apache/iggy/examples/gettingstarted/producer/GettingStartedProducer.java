@@ -17,7 +17,7 @@
  * under the License.
  */
 
-package org.apache.iggy.producer;
+package org.apache.iggy.examples.gettingstarted.producer;
 
 import org.apache.iggy.client.blocking.tcp.IggyTcpClient;
 import org.apache.iggy.identifier.StreamId;
@@ -31,33 +31,77 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.math.BigInteger;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Optional;
 
-import static java.util.Collections.singletonList;
 import static java.util.Optional.empty;
 
-public final class SimpleProducer {
-    private static final String STREAM_NAME = "dev01";
-    private static final StreamId STREAM_ID = StreamId.of(STREAM_NAME);
-    private static final String TOPIC_NAME = "events";
-    private static final TopicId TOPIC_ID = TopicId.of(TOPIC_NAME);
-    private static final Logger log = LoggerFactory.getLogger(SimpleProducer.class);
+public final class GettingStartedProducer {
 
-    private SimpleProducer() {}
+    private static final String STREAM_NAME = "sample-stream";
+    private static final StreamId STREAM_ID = StreamId.of(STREAM_NAME);
+
+    private static final String TOPIC_NAME = "sample-topic";
+    private static final TopicId TOPIC_ID = TopicId.of(TOPIC_NAME);
+
+    private static final long PARTITION_ID = 0L;
+
+    private static final int BATCHES_LIMIT = 5;
+
+    private static final int MESSAGES_PER_BATCH = 10;
+    private static final long INTERVAL_MS = 500;
+
+    private static final Logger log = LoggerFactory.getLogger(GettingStartedProducer.class);
+
+    private GettingStartedProducer() {}
 
     public static void main(String[] args) {
-        var client = new IggyTcpClient("localhost", 8090);
-        client.users().login("iggy", "iggy");
+        var client = IggyTcpClient.builder()
+                .host("localhost")
+                .port(8090)
+                .credentials("iggy", "iggy")
+                .build();
 
         createStream(client);
         createTopic(client);
+        produceMessages(client);
+    }
 
-        int counter = 0;
-        while (counter++ < 1000) {
-            var message = Message.of("message from simple producer " + counter);
-            client.messages().sendMessages(STREAM_ID, TOPIC_ID, Partitioning.balanced(), singletonList(message));
-            log.debug("Message {} sent", counter);
+    private static void produceMessages(IggyTcpClient client) {
+        log.info(
+                "Messages will be sent to stream: {}, topic: {}, partition: {} with interval {}ms.",
+                STREAM_NAME,
+                TOPIC_NAME,
+                PARTITION_ID,
+                INTERVAL_MS);
+
+        int currentId = 0;
+        int sentBatches = 0;
+
+        Partitioning partitioning = Partitioning.partitionId(PARTITION_ID);
+
+        while (sentBatches < BATCHES_LIMIT) {
+            try {
+                Thread.sleep(INTERVAL_MS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+
+            List<Message> messages = new ArrayList<>();
+            for (int i = 0; i < MESSAGES_PER_BATCH; i++) {
+                currentId++;
+                String payload = "message-" + currentId;
+                messages.add(Message.of(payload));
+            }
+
+            client.messages().sendMessages(STREAM_ID, TOPIC_ID, partitioning, messages);
+            sentBatches++;
+            log.info("Sent {} message(s).", MESSAGES_PER_BATCH);
         }
+
+        log.info("Sent {} batches of messages, exiting.", sentBatches);
     }
 
     private static void createStream(IggyTcpClient client) {
@@ -66,11 +110,13 @@ public final class SimpleProducer {
             return;
         }
         client.streams().createStream(STREAM_NAME);
+        log.info("Stream {} was created.", STREAM_NAME);
     }
 
     private static void createTopic(IggyTcpClient client) {
         Optional<TopicDetails> topic = client.topics().getTopic(STREAM_ID, TOPIC_ID);
         if (topic.isPresent()) {
+            log.warn("Topic already exists and will not be created again.");
             return;
         }
         client.topics()
@@ -82,5 +128,6 @@ public final class SimpleProducer {
                         BigInteger.ZERO,
                         empty(),
                         TOPIC_NAME);
+        log.info("Topic {} was created.", TOPIC_NAME);
     }
 }
