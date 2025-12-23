@@ -78,7 +78,7 @@ lending-iterator = "0.1.7"
 mimalloc = { workspace = true, optional = true }
 mime_guess = { version = "2.0", optional = true }
 moka = { version = "0.12.11", features = ["future"] }
-nix = { version = "0.30", features = ["fs", "resource"] }
+nix = { workspace = true }
 opentelemetry = { version = "0.31.0", features = ["trace", "logs"] }
 opentelemetry-appender-tracing = { version = "0.31.1", features = ["log"] }
 opentelemetry-otlp = { version = "0.31.0", features = [

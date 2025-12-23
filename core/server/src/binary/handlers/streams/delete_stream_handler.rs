@@ -16,7 +16,9 @@
  * under the License.
  */
 
-use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
+use crate::binary::command::{
+    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
+};
 use crate::binary::handlers::streams::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::shard::IggyShard;
@@ -48,7 +50,7 @@ impl ServerCommandHandler for DeleteStream {
         _length: u32,
         session: &Session,
         shard: &Rc<IggyShard>,
-    ) -> Result<(), IggyError> {
+    ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
         let stream_id = self.stream_id.clone();
         let request = ShardRequest {
@@ -119,7 +121,7 @@ impl ServerCommandHandler for DeleteStream {
             },
         }
 
-        Ok(())
+        Ok(HandlerResult::Finished)
     }
 }
 

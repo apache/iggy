@@ -164,8 +164,8 @@ impl Shard {
                     _ = tokio::time::sleep_until(deadline) => {
                         if !buffer.is_empty() {
                             Self::flush_buffer(&core, &mut buffer, &mut buffer_bytes, &err_sender).await;
-                            last_flush = tokio::time::Instant::now();
                         }
+                        last_flush = tokio::time::Instant::now();
                     }
                     _ = stop_rx.recv() => {
                         closed_clone.store(true, Ordering::Release);

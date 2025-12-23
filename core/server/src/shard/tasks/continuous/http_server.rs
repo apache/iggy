@@ -29,6 +29,7 @@ pub fn spawn_http_server(shard: Rc<IggyShard>) {
     shard
         .task_registry
         .continuous("http_server")
+        .critical(true)
         .run(move |shutdown| http_server(shard_clone, shutdown))
         .spawn();
 }

@@ -16,7 +16,9 @@
  * under the License.
  */
 
-use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
+use crate::binary::command::{
+    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
+};
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
 use crate::shard::IggyShard;
@@ -41,7 +43,7 @@ impl ServerCommandHandler for GetConsumerGroups {
         _length: u32,
         session: &Session,
         shard: &Rc<IggyShard>,
-    ) -> Result<(), IggyError> {
+    ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
         shard.ensure_authenticated(session)?;
         shard.ensure_topic_exists(&self.stream_id, &self.topic_id)?;
@@ -69,7 +71,7 @@ impl ServerCommandHandler for GetConsumerGroups {
                     })
                 });
         sender.send_ok_response(&consumer_groups).await?;
-        Ok(())
+        Ok(HandlerResult::Finished)
     }
 }
 

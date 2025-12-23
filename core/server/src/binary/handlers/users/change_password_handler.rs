@@ -16,7 +16,9 @@
  * under the License.
  */
 
-use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
+use crate::binary::command::{
+    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
+};
 use crate::binary::handlers::users::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 
@@ -45,7 +47,7 @@ impl ServerCommandHandler for ChangePassword {
         _length: u32,
         session: &Session,
         shard: &Rc<IggyShard>,
-    ) -> Result<(), IggyError> {
+    ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
 
         info!("Changing password for user with ID: {}...", self.user_id);
@@ -91,7 +93,7 @@ impl ServerCommandHandler for ChangePassword {
                 )
             })?;
         sender.send_empty_ok_response().await?;
-        Ok(())
+        Ok(HandlerResult::Finished)
     }
 }
 

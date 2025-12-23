@@ -16,7 +16,7 @@
  * under the License.
  */
 
-use crate::binary::command::{BinaryServerCommand, ServerCommandHandler};
+use crate::binary::command::{BinaryServerCommand, HandlerResult, ServerCommandHandler};
 use crate::shard::IggyShard;
 use crate::streaming::session::Session;
 use anyhow::Result;
@@ -38,7 +38,7 @@ impl ServerCommandHandler for Ping {
         _length: u32,
         session: &Session,
         shard: &Rc<IggyShard>,
-    ) -> Result<(), IggyError> {
+    ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
         if let Some(mut client) = shard.client_manager.try_get_client_mut(session.client_id) {
             let now = IggyTimestamp::now();
@@ -47,7 +47,7 @@ impl ServerCommandHandler for Ping {
         }
 
         sender.send_empty_ok_response().await?;
-        Ok(())
+        Ok(HandlerResult::Finished)
     }
 }
 

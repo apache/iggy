@@ -486,151 +486,20 @@ jobs:
 
   # Sequential Rust crate publishing to handle dependencies properly
   publish-rust-crates:
-    name: Publish Rust Crates
+    name: Publish Rust crates
     needs: [validate, plan, check-tags]
     if: |
       needs.validate.outputs.has_targets == 'true' &&
       contains(inputs.publish_crates, 'rust-')
-    runs-on: ubuntu-latest
-    env:
+    uses: ./.github/workflows/_publish_rust_crates.yml
+    with:
+      crates: ${{ inputs.publish_crates }}
+      dry_run: ${{ inputs.dry_run }}
+      create_tags: false  # publish.yml handles tags separately in create-tags job
+      commit: ${{ needs.validate.outputs.commit }}
+      use_latest_ci: ${{ inputs.use_latest_ci }}
+    secrets:
       CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-      DRY_RUN: ${{ inputs.dry_run }}
-    outputs:
-      status: ${{ steps.final-status.outputs.status }}
-    steps:
-      - name: Download latest copy script from master
-        if: inputs.use_latest_ci
-        run: |
-          curl -sSL "https://raw.githubusercontent.com/${{ github.repository }}/master/scripts/copy-latest-from-master.sh" \
-            -o /tmp/copy-latest-from-master.sh
-          chmod +x /tmp/copy-latest-from-master.sh
-          echo "✅ Downloaded latest copy script from master"
-
-      - name: Checkout at commit
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.validate.outputs.commit }}
-          fetch-depth: 0
-
-      - name: Save and apply latest CI from master
-        if: inputs.use_latest_ci
-        run: |
-          /tmp/copy-latest-from-master.sh save \
-            .github \
-            scripts \
-            web/Dockerfile \
-            core/server/Dockerfile \
-            core/ai/mcp/Dockerfile \
-            core/connectors/runtime/Dockerfile \
-            core/bench/dashboard/server/Dockerfile
-
-          /tmp/copy-latest-from-master.sh apply
-
-      - name: Setup Rust with cache
-        uses: ./.github/actions/utils/setup-rust-with-cache
-        with:
-          cache-targets: false
-          show-stats: false
-
-      - name: Extract versions
-        id: versions
-        run: |
-          # Extract version for each crate
-          chmod +x scripts/extract-version.sh
-
-          echo "common_version=$(scripts/extract-version.sh rust-common)" >> $GITHUB_OUTPUT
-          echo "protocol_version=$(scripts/extract-version.sh rust-binary-protocol)" >> $GITHUB_OUTPUT
-          echo "sdk_version=$(scripts/extract-version.sh rust-sdk)" >> $GITHUB_OUTPUT
-          echo "cli_version=$(scripts/extract-version.sh rust-cli)" >> $GITHUB_OUTPUT
-
-      # Step 1: Publish iggy_common first
-      - name: Publish iggy_common
-        if: contains(inputs.publish_crates, 'rust-common')
-        uses: ./.github/actions/rust/post-merge
-        with:
-          package: iggy_common
-          version: ${{ steps.versions.outputs.common_version }}
-          dry_run: ${{ inputs.dry_run }}
-
-      # Wait for crates.io to index (only in non-dry-run mode)
-      - name: Wait for iggy_common to be available
-        if: |
-          contains(inputs.publish_crates, 'rust-common') &&
-          inputs.dry_run == 'false'
-        run: |
-          echo "⏳ Waiting for iggy_common to be available on crates.io..."
-          for i in {1..30}; do
-            if cargo search iggy_common --limit 1 | grep -q "^iggy_common = \"${{ steps.versions.outputs.common_version }}\""; then
-              echo "✅ iggy_common is now available"
-              break
-            fi
-            echo "Waiting... (attempt $i/30)"
-            sleep 10
-          done
-
-      # Step 2: Publish iggy_binary_protocol (depends on common)
-      - name: Publish iggy_binary_protocol
-        if: contains(inputs.publish_crates, 'rust-binary-protocol')
-        uses: ./.github/actions/rust/post-merge
-        with:
-          package: iggy_binary_protocol
-          version: ${{ steps.versions.outputs.protocol_version }}
-          dry_run: ${{ inputs.dry_run }}
-
-      # Wait for crates.io to index
-      - name: Wait for iggy_binary_protocol to be available
-        if: |
-          contains(inputs.publish_crates, 'rust-binary-protocol') &&
-          inputs.dry_run == 'false'
-        run: |
-          echo "⏳ Waiting for iggy_binary_protocol to be available on crates.io..."
-          for i in {1..30}; do
-            if cargo search iggy_binary_protocol --limit 1 | grep -q "^iggy_binary_protocol = \"${{ steps.versions.outputs.protocol_version }}\""; then
-              echo "✅ iggy_binary_protocol is now available"
-              break
-            fi
-            echo "Waiting... (attempt $i/30)"
-            sleep 10
-          done
-
-      # Step 3: Publish iggy SDK (depends on common and protocol)
-      - name: Publish iggy SDK
-        if: contains(inputs.publish_crates, 'rust-sdk')
-        uses: ./.github/actions/rust/post-merge
-        with:
-          package: iggy
-          version: ${{ steps.versions.outputs.sdk_version }}
-          dry_run: ${{ inputs.dry_run }}
-
-      # Wait for crates.io to index
-      - name: Wait for iggy SDK to be available
-        if: |
-          contains(inputs.publish_crates, 'rust-sdk') &&
-          inputs.dry_run == 'false'
-        run: |
-          echo "⏳ Waiting for iggy to be available on crates.io..."
-          for i in {1..30}; do
-            if cargo search iggy --limit 1 | grep -q "^iggy = \"${{ steps.versions.outputs.sdk_version }}\""; then
-              echo "✅ iggy SDK is now available"
-              break
-            fi
-            echo "Waiting... (attempt $i/30)"
-            sleep 10
-          done
-
-      # Step 4: Publish iggy-cli (depends on SDK and protocol)
-      - name: Publish iggy-cli
-        if: contains(inputs.publish_crates, 'rust-cli')
-        uses: ./.github/actions/rust/post-merge
-        with:
-          package: iggy-cli
-          version: ${{ steps.versions.outputs.cli_version }}
-          dry_run: ${{ inputs.dry_run }}
-
-      - name: Set final status output
-        id: final-status
-        if: always()
-        run: echo "status=${{ job.status }}" >> "$GITHUB_OUTPUT"
 
   # Docker publishing on native runners (no QEMU emulation)
   publish-docker:

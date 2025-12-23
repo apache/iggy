@@ -16,7 +16,9 @@
  * under the License.
  */
 
-use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
+use crate::binary::command::{
+    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
+};
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
 use crate::shard::IggyShard;
@@ -39,7 +41,7 @@ impl ServerCommandHandler for GetConsumerOffset {
         _length: u32,
         session: &Session,
         shard: &Rc<IggyShard>,
-    ) -> Result<(), IggyError> {
+    ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
         let Ok(offset) = shard
             .get_consumer_offset(
@@ -52,17 +54,17 @@ impl ServerCommandHandler for GetConsumerOffset {
             .await
         else {
             sender.send_empty_ok_response().await?;
-            return Ok(());
+            return Ok(HandlerResult::Finished);
         };
 
         let Some(offset) = offset else {
             sender.send_empty_ok_response().await?;
-            return Ok(());
+            return Ok(HandlerResult::Finished);
         };
 
         let offset = mapper::map_consumer_offset(&offset);
         sender.send_ok_response(&offset).await?;
-        Ok(())
+        Ok(HandlerResult::Finished)
     }
 }
 
