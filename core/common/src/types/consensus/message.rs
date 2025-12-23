@@ -16,7 +16,7 @@
 // under the License.
 
 use crate::types::consensus::header::{
-    self, CommitHeader, ConsensusHeader, GenericHeader, PrepareHeader, ReplyHeader,
+    self, CommitHeader, ConsensusHeader, GenericHeader, PrepareHeader, PrepareOkHeader, ReplyHeader,
 };
 use bytes::Bytes;
 use std::marker::PhantomData;
@@ -263,6 +263,7 @@ where
 pub enum MessageBag {
     Generic(Message<GenericHeader>),
     Prepare(Message<PrepareHeader>),
+    PrepareOk(Message<PrepareOkHeader>),
     Commit(Message<CommitHeader>),
     Reply(Message<ReplyHeader>),
 }
@@ -273,6 +274,7 @@ impl MessageBag {
         match self {
             MessageBag::Generic(message) => message.header().command,
             MessageBag::Prepare(message) => message.header().command,
+            MessageBag::PrepareOk(message) => message.header().command,
             MessageBag::Commit(message) => message.header().command,
             MessageBag::Reply(message) => message.header().command,
         }
@@ -283,6 +285,7 @@ impl MessageBag {
         match self {
             MessageBag::Generic(message) => message.header().size(),
             MessageBag::Prepare(message) => message.header().size(),
+            MessageBag::PrepareOk(message) => message.header().size(),
             MessageBag::Commit(message) => message.header().size(),
             MessageBag::Reply(message) => message.header().size(),
         }

@@ -32,12 +32,21 @@ use tracing::{debug, error, info};
 
 const INITIAL_BYTES_LENGTH: usize = 4;
 
+/// Connection lifecycle action after command handling.
+pub enum ConnectionAction {
+    /// Continue handling connection on current shard.
+    Finished,
+
+    /// Connection migrated to another shard, exit without cleanup.
+    Migrated { to_shard: u16 },
+}
+
 pub(crate) async fn handle_connection(
     session: &Session,
     sender: &mut SenderKind,
     shard: &Rc<IggyShard>,
     stop_receiver: Receiver<()>,
-) -> Result<(), ConnectionError> {
+) -> Result<ConnectionAction, ConnectionError> {
     let mut length_buffer = BytesMut::with_capacity(INITIAL_BYTES_LENGTH);
     let mut code_buffer = BytesMut::with_capacity(INITIAL_BYTES_LENGTH);
     loop {
@@ -49,7 +58,7 @@ pub(crate) async fn handle_connection(
             _ = stop_receiver.recv().fuse() => {
                 info!("Connection stop signal received for session: {}", session);
                 let _ = sender.send_error_response(IggyError::Disconnected).await;
-                return Ok(());
+                return Ok(ConnectionAction::Finished);
             }
             result = read_future.fuse() => {
                 match result {
@@ -83,11 +92,20 @@ pub(crate) async fn handle_connection(
         debug!("Received a TCP command: {command}, payload size: {length}");
         let cmd_code = command.code();
         match command.handle(sender, length, session, shard).await {
-            Ok(_) => {
-                debug!(
-                    "Command {cmd_code} was handled successfully, session: {session}. TCP response was sent."
-                );
-            }
+            Ok(handler_result) => match handler_result {
+                command::HandlerResult::Finished => {
+                    debug!(
+                        "Command {cmd_code} was handled successfully, session: {session}. TCP response was sent."
+                    );
+                }
+                command::HandlerResult::Migrated { to_shard } => {
+                    info!(
+                        "Command {cmd_code} was transfer to shard {to_shard}, session: {session}. TCP response was sent."
+                    );
+
+                    return Ok(ConnectionAction::Migrated { to_shard });
+                }
+            },
             Err(error) => {
                 // Special handling for GetClusterMetadata when clustering is disabled
                 if cmd_code == GET_CLUSTER_METADATA_CODE
@@ -102,6 +120,7 @@ pub(crate) async fn handle_connection(
                     error!(
                         "Command with code {cmd_code} was not handled successfully, session: {session}, error: {error}."
                     );
+
                     if let IggyError::ClientNotFound(_) = error {
                         sender.send_error_response(error).await?;
                         debug!("TCP error response was sent to: {session}.");

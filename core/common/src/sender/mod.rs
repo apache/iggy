@@ -37,7 +37,8 @@ use compio::net::TcpStream;
 use compio_quic::{RecvStream, SendStream};
 use compio_tls::TlsStream;
 use std::future::Future;
-use tracing::debug;
+use std::os::fd::{AsFd, OwnedFd};
+use tracing::{debug, error};
 
 macro_rules! forward_async_methods {
     (
@@ -92,7 +93,9 @@ pub enum SenderKind {
 
 impl SenderKind {
     pub fn get_tcp_sender(stream: TcpStream) -> Self {
-        Self::Tcp(TcpSender { stream })
+        Self::Tcp(TcpSender {
+            stream: Some(stream),
+        })
     }
 
     pub fn get_tcp_tls_sender(stream: TlsStream<TcpStream>) -> Self {
@@ -112,6 +115,26 @@ impl SenderKind {
 
     pub fn get_websocket_tls_sender(stream: WebSocketTlsSender) -> Self {
         Self::WebSocketTls(stream)
+    }
+
+    pub fn take_and_migrate_tcp(&mut self) -> Option<OwnedFd> {
+        match self {
+            SenderKind::Tcp(tcp_sender) => {
+                let stream = tcp_sender.stream.take()?;
+                let poll_fd = stream.into_poll_fd().ok()?;
+
+                let raw_fd = poll_fd.as_fd();
+                let Ok(owned_fd) = nix::unistd::dup(raw_fd) else {
+                    // TODO(tungtose): recover tcp stream?
+                    error!("Failed to dup fd");
+                    return None;
+                };
+
+                Some(owned_fd)
+            }
+            // TODO(tungtose): support TCP TLS
+            _ => None,
+        }
     }
 
     forward_async_methods! {

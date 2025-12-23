@@ -27,12 +27,19 @@ use crate::{
         },
     },
     streaming::{session::Session, traits::MainOps},
+    tcp::{
+        connection_handler::{ConnectionAction, handle_connection, handle_error},
+        tcp_listener::cleanup_connection,
+    },
 };
-use iggy_common::{Identifier, IggyError, TransportProtocol};
+use compio_net::TcpStream;
+use iggy_common::{Identifier, IggyError, SenderKind, TransportProtocol};
+use nix::sys::stat::SFlag;
+use std::os::fd::{FromRawFd, IntoRawFd};
 use tracing::info;
 
 pub(super) async fn handle_shard_message(
-    shard: &IggyShard,
+    shard: &Rc<IggyShard>,
     message: ShardMessage,
 ) -> Option<ShardResponse> {
     match message {
@@ -48,7 +55,7 @@ pub(super) async fn handle_shard_message(
 }
 
 async fn handle_request(
-    shard: &IggyShard,
+    shard: &Rc<IggyShard>,
     request: ShardRequest,
 ) -> Result<ShardResponse, IggyError> {
     let stream_id = request.stream_id;
@@ -312,10 +319,88 @@ async fn handle_request(
             shard.broadcast_event_to_all_shards(event).await?;
             Ok(ShardResponse::DeleteStreamResponse(stream))
         }
+        ShardRequestPayload::SocketTransfer {
+            fd,
+            from_shard,
+            client_id,
+            user_id,
+            address,
+            initial_data,
+        } => {
+            info!(
+                "Received socket transfer msg, fd: {fd:?}, from_shard: {from_shard}, address: {address}"
+            );
+
+            // Safety: The fd already != 1.
+            let stat = nix::sys::stat::fstat(&fd)
+                .map_err(|e| IggyError::IoError(format!("Invalid fd: {}", e)))?;
+
+            if !SFlag::from_bits_truncate(stat.st_mode).contains(SFlag::S_IFSOCK) {
+                return Err(IggyError::IoError(format!("fd {:?} is not a socket", fd)));
+            }
+
+            // restore TcpStream from fd
+            let tcp_stream = unsafe { TcpStream::from_raw_fd(fd.into_raw_fd()) };
+            let session = shard.add_client(&address, TransportProtocol::Tcp);
+            session.set_user_id(user_id);
+            session.set_migrated();
+
+            let mut sender = SenderKind::get_tcp_sender(tcp_stream);
+            let conn_stop_receiver = shard.task_registry.add_connection(session.client_id);
+            let shard_for_conn = shard.clone();
+            let registry = shard.task_registry.clone();
+            let registry_clone = registry.clone();
+
+            let ns = IggyFullNamespace::new(stream_id, topic_id, partition_id);
+            let batch = shard.maybe_encrypt_messages(initial_data)?;
+            let messages_count = batch.count();
+
+            shard
+                .streams
+                .append_messages(&shard.config.system, &shard.task_registry, &ns, batch)
+                .await?;
+
+            shard.metrics.increment_messages(messages_count as u64);
+
+            sender.send_empty_ok_response().await?;
+
+            registry.spawn_connection(async move {
+                match handle_connection(&session, &mut sender, &shard_for_conn, conn_stop_receiver)
+                    .await
+                {
+                    Ok(ConnectionAction::Migrated { to_shard }) => {
+                        info!("Migrated to shard {to_shard}, ignore cleanup connection");
+                    }
+                    Ok(ConnectionAction::Finished) => {
+                        cleanup_connection(
+                            &mut sender,
+                            client_id,
+                            address,
+                            &registry_clone,
+                            &shard_for_conn,
+                        )
+                        .await;
+                    }
+                    Err(err) => {
+                        handle_error(err);
+                        cleanup_connection(
+                            &mut sender,
+                            client_id,
+                            address,
+                            &registry_clone,
+                            &shard_for_conn,
+                        )
+                        .await;
+                    }
+                }
+            });
+
+            Ok(ShardResponse::SocketTransferResponse)
+        }
     }
 }
 
-pub(crate) async fn handle_event(shard: &IggyShard, event: ShardEvent) -> Result<(), IggyError> {
+pub async fn handle_event(shard: &Rc<IggyShard>, event: ShardEvent) -> Result<(), IggyError> {
     match event {
         ShardEvent::DeletedPartitions {
             stream_id,
