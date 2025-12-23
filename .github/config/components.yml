@@ -32,29 +32,29 @@ components:
   # Core library components that others depend on
   rust-sdk:
     depends_on:
-      - "rust-workspace"  # SDK is affected by workspace changes
-      - "ci-infrastructure"  # CI changes trigger full regression
+      - "rust-workspace" # SDK is affected by workspace changes
+      - "ci-infrastructure" # CI changes trigger full regression
     paths:
       - "core/sdk/**"
 
   rust-common:
     depends_on:
-      - "rust-workspace"  # Common is affected by workspace changes
-      - "ci-infrastructure"  # CI changes trigger full regression
+      - "rust-workspace" # Common is affected by workspace changes
+      - "ci-infrastructure" # CI changes trigger full regression
     paths:
       - "core/common/**"
 
   rust-binary-protocol:
     depends_on:
-      - "rust-workspace"  # Protocol is affected by workspace changes
-      - "ci-infrastructure"  # CI changes trigger full regression
+      - "rust-workspace" # Protocol is affected by workspace changes
+      - "ci-infrastructure" # CI changes trigger full regression
     paths:
       - "core/binary_protocol/**"
 
   rust-server:
     depends_on:
-      - "rust-workspace"  # Server is affected by workspace changes
-      - "ci-infrastructure"  # CI changes trigger full regression
+      - "rust-workspace" # Server is affected by workspace changes
+      - "ci-infrastructure" # CI changes trigger full regression
       - "rust-common"
       - "rust-binary-protocol"
     paths:
@@ -62,8 +62,8 @@ components:
 
   rust-cluster:
     depends_on:
-      - "rust-workspace"  # Cluster is affected by workspace changes
-      - "ci-infrastructure"  # CI changes trigger full regression
+      - "rust-workspace" # Cluster is affected by workspace changes
+      - "ci-infrastructure" # CI changes trigger full regression
     paths:
       - "core/consensus/"
       - "core/metadata/"
@@ -84,11 +84,11 @@ components:
       - "rust-connectors"
       - "rust-mcp"
       - "rust-integration"
-      - "ci-infrastructure"  # CI changes trigger full regression
+      - "ci-infrastructure" # CI changes trigger full regression
     paths:
       - "Dockerfile*"
-      - "!foreign/**"  # Exclude foreign SDKs
-      - "!web/**"      # Exclude web UI
+      - "!foreign/**" # Exclude foreign SDKs
+      - "!web/**" # Exclude web UI
     tasks:
       - "check"
       - "fmt"
@@ -143,27 +143,27 @@ components:
 
   sdk-python:
     depends_on:
-      - "rust-sdk"  # Python SDK wraps the Rust SDK
-      - "rust-server"    # For integration tests
-      - "ci-infrastructure"  # CI changes trigger full regression
+      - "rust-sdk" # Python SDK wraps the Rust SDK
+      - "rust-server" # For integration tests
+      - "ci-infrastructure" # CI changes trigger full regression
     paths:
       - "foreign/python/**"
     tasks: ["lint", "test", "build"]
 
   sdk-node:
     depends_on:
-      - "rust-sdk"       # Node SDK depends on core SDK
-      - "rust-server"    # For integration tests
-      - "ci-infrastructure"  # CI changes trigger full regression
+      - "rust-sdk" # Node SDK depends on core SDK
+      - "rust-server" # For integration tests
+      - "ci-infrastructure" # CI changes trigger full regression
     paths:
       - "foreign/node/**"
     tasks: ["lint", "test", "build", "e2e"]
 
   sdk-go:
     depends_on:
-      - "rust-sdk"       # Go SDK depends on core SDK
-      - "rust-server"    # For integration tests
-      - "ci-infrastructure"  # CI changes trigger full regression
+      - "rust-sdk" # Go SDK depends on core SDK
+      - "rust-server" # For integration tests
+      - "ci-infrastructure" # CI changes trigger full regression
     paths:
       - "foreign/go/**"
       - "bdd/go/**"
@@ -172,18 +172,19 @@ components:
 
   sdk-java:
     depends_on:
-      - "rust-sdk"       # Java SDK depends on core SDK
-      - "rust-server"    # For integration tests
-      - "ci-infrastructure"  # CI changes trigger full regression
+      - "rust-sdk" # Java SDK depends on core SDK
+      - "rust-server" # For integration tests
+      - "ci-infrastructure" # CI changes trigger full regression
     paths:
       - "foreign/java/**"
+      - "examples/java/**"
     tasks: ["lint", "test", "build"]
 
   sdk-csharp:
     depends_on:
-      - "rust-sdk"       # C# SDK depends on core SDK
-      - "rust-server"    # For integration tests
-      - "ci-infrastructure"  # CI changes trigger full regression
+      - "rust-sdk" # C# SDK depends on core SDK
+      - "rust-server" # For integration tests
+      - "ci-infrastructure" # CI changes trigger full regression
     paths:
       - "foreign/csharp/**"
       - "examples/csharp/**"
@@ -203,7 +204,7 @@ components:
   bdd-python:
     depends_on:
       - "rust-server"
-      - "rust-sdk"  # All SDKs depend on core SDK changes
+      - "rust-sdk" # All SDKs depend on core SDK changes
       - "sdk-python"
       - "ci-infrastructure"
     paths:
@@ -214,7 +215,7 @@ components:
   bdd-go:
     depends_on:
       - "rust-server"
-      - "rust-sdk"  # All SDKs depend on core SDK changes
+      - "rust-sdk" # All SDKs depend on core SDK changes
       - "sdk-go"
       - "ci-infrastructure"
     paths:
@@ -225,7 +226,7 @@ components:
   bdd-node:
     depends_on:
       - "rust-server"
-      - "rust-sdk"  # All SDKs depend on core SDK changes
+      - "rust-sdk" # All SDKs depend on core SDK changes
       - "sdk-node"
       - "ci-infrastructure"
     paths:
@@ -236,7 +237,7 @@ components:
   bdd-csharp:
     depends_on:
       - "rust-server"
-      - "rust-sdk"  # All SDKs depend on core SDK changes
+      - "rust-sdk" # All SDKs depend on core SDK changes
       - "sdk-csharp"
       - "ci-infrastructure"
     paths:
@@ -251,7 +252,8 @@ components:
       - "sdk-go"
       - "sdk-csharp"
       - "sdk-python"
-      - "ci-infrastructure"  # CI changes trigger full regression
+      - "sdk-java"
+      - "ci-infrastructure" # CI changes trigger full regression
     paths:
       - "examples/**"
       - "scripts/run-rust-examples-from-readme.sh"
@@ -259,7 +261,16 @@ components:
       - "scripts/run-csharp-examples-from-readme.sh"
       - "scripts/run-python-examples-from-readme.sh"
       - "scripts/run-node-examples-from-readme.sh"
-    tasks: ["examples-rust", "examples-go", "examples-csharp", "examples-python", "examples-node"]
+      - "scripts/run-java-examples-from-readme.sh"
+    tasks:
+      [
+        "examples-rust",
+        "examples-go",
+        "examples-csharp",
+        "examples-python",
+        "examples-node",
+        "examples-java",
+      ]
 
   web-ui:
     paths:
@@ -285,4 +296,4 @@ components:
       - ".github/workflows/**/*.yml"
       - ".github/actions/**/*.yml"
       - ".github/ci/**/*.yml"
-    tasks: ["validate"]  # Could run workflow validation
+    tasks: ["validate"] # Could run workflow validation

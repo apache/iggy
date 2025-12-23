@@ -72,6 +72,20 @@ jobs:
           path: ~/.cache/pip
           key: pip-${{ runner.os }}-${{ hashFiles('foreign/python/pyproject.toml') }}
 
+      - name: Setup Java
+        if: inputs.component == 'examples-suite' && inputs.task == 'examples-java'
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "17"
+          cache: "gradle"
+
+      - name: Setup Gradle
+        if: inputs.component == 'examples-suite' && inputs.task == 'examples-java'
+        uses: gradle/actions/setup-gradle@af1da67850ed9a4cedd57bfd976089dd991e2582 # v4.0.0
+        with:
+          gradle-version: "9.2.1"
+
       - name: Build common binaries for all examples
         if: inputs.component == 'examples-suite'
         run: |
@@ -140,6 +154,12 @@ jobs:
         run: |
           echo "Running Node.js examples tests..."
           ./scripts/run-node-examples-from-readme.sh
+
+      - name: Run Java examples
+        if: inputs.component == 'examples-suite' && inputs.task == 'examples-java'
+        run: |
+          echo "Running Java examples tests..."
+          ./scripts/run-java-examples-from-readme.sh
 
       - name: Upload reports
         if: always()
