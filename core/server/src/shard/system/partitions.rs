@@ -19,8 +19,6 @@
 use super::COMPONENT;
 use crate::shard::IggyShard;
 use crate::shard::calculate_shard_assignment;
-use crate::shard::namespace::IggyNamespace;
-use crate::shard::transmission::id::ShardId;
 use crate::slab::traits_ext::EntityMarker;
 use crate::slab::traits_ext::IntoComponents;
 use crate::streaming::partitions;
@@ -35,6 +33,7 @@ use crate::streaming::topics;
 use err_trail::ErrContext;
 use iggy_common::Identifier;
 use iggy_common::IggyError;
+use iggy_common::sharding::{IggyNamespace, LocalIdx, PartitionLocation, ShardId};
 use tracing::info;
 
 impl IggyShard {
@@ -105,7 +104,10 @@ impl IggyShard {
             let ns = IggyNamespace::new(numeric_stream_id, numeric_topic_id, partition_id);
             let shard_id = ShardId::new(calculate_shard_assignment(&ns, shards_count));
             let is_current_shard = self.id == *shard_id;
-            self.insert_shard_table_record(ns, shard_id);
+            // TODO(hubcio): LocalIdx(0) is wrong.. When IggyPartitions is integrated into
+            // IggyShard, this should use the actual index returned by IggyPartitions::insert().
+            let location = PartitionLocation::new(shard_id, LocalIdx::new(0));
+            self.insert_shard_table_record(ns, location);
 
             create_partition_file_hierarchy(
                 numeric_stream_id as usize,
@@ -204,11 +206,14 @@ impl IggyShard {
                 "create_partitions_bypass_auth: partition mismatch ID, wrong creation order ?!"
             );
             let ns = IggyNamespace::new(numeric_stream_id, numeric_topic_id, id);
-            let shard_id = self.find_shard_table_record(&ns).unwrap_or_else(|| {
+            // TODO(hubcio): when IggyPartitions is integrated, this fallback path should
+            // either be removed or use proper index resolution.
+            let location = self.find_shard_table_record(&ns).unwrap_or_else(|| {
                 tracing::warn!("WARNING: missing shard table record for namespace: {:?}, in the event handler for `CreatedPartitions` event.", ns);
-                ShardId::new(calculate_shard_assignment(&ns, shards_count))
+                let shard_id = ShardId::new(calculate_shard_assignment(&ns, shards_count));
+                PartitionLocation::new(shard_id, LocalIdx::new(0))
             });
-            if self.id == *shard_id {
+            if self.id == *location.shard_id {
                 self.init_log(stream_id, topic_id, id).await?;
             }
         }
