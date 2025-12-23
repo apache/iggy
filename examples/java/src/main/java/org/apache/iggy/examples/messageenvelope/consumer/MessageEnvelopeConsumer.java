@@ -19,9 +19,6 @@
 
 package org.apache.iggy.examples.messageenvelope.consumer;
 
-import com.fasterxml.jackson.databind.DeserializationFeature;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import org.apache.iggy.client.blocking.tcp.IggyTcpClient;
 import org.apache.iggy.consumergroup.Consumer;
 import org.apache.iggy.examples.shared.Messages;
@@ -36,6 +33,8 @@ import org.apache.iggy.message.PolledMessages;
 import org.apache.iggy.message.PollingStrategy;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import tools.jackson.databind.ObjectMapper;
+import tools.jackson.databind.json.JsonMapper;
 
 import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
@@ -55,9 +54,7 @@ public final class MessageEnvelopeConsumer {
 
     private static final Logger log = LoggerFactory.getLogger(MessageEnvelopeConsumer.class);
 
-    private static final ObjectMapper MAPPER = new ObjectMapper()
-            .registerModule(new JavaTimeModule())
-            .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
+    private static final ObjectMapper MAPPER = JsonMapper.builder().build();
 
     private MessageEnvelopeConsumer() {}
 

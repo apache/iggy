@@ -2,6 +2,8 @@
 
 This directory contains comprehensive sample applications that showcase various usage patterns of the Iggy java client SDK, from basic operations to advanced multi-tenant scenarios.
 
+Java 17 and Gradle 9.2.1 are recommended for running the examples.
+
 ## Running Examples
 
 Iggy requires valid credentials to authenticate client requests. The examples assume that the server is using the default root credentials, which can be enabled in one of two ways:
@@ -69,8 +71,8 @@ IGGY_HTTP_ENABLED=true IGGY_TCP_ADDRESS=0.0.0.0:8090 cargo run --bin iggy-server
 A good introduction for newcomers to Iggy:
 
 ```bash
-./gradlew runGettingStartedProducer
-./gradlew runGettingStartedConsumer
+gradle runGettingStartedProducer
+gradle runGettingStartedConsumer
 ```
 
 ### Message Headers
@@ -82,8 +84,8 @@ This example will be created as and when userHeaders serialization/deserializati
 JSON envelope pattern for polymorphic message handling:
 
 ```bash
-./gradlew runMessageEnvelopeProducer
-./gradlew runMessageEnvelopeConsumer
+gradle runMessageEnvelopeProducer
+gradle runMessageEnvelopeConsumer
 ```
 
 Uses MessagesGenerator to create OrderCreated, OrderConfirmed, and OrderRejected messages wrapped in JSON envelopes for type identification.
@@ -95,8 +97,8 @@ Uses MessagesGenerator to create OrderCreated, OrderConfirmed, and OrderRejected
 Complex example demonstrating enterprise-level isolation:
 
 ```bash
-./gradlew runMultiTenantProducer
-./gradlew runMultiTenantConsumer
+gradle runMultiTenantProducer
+gradle runMultiTenantConsumer
 ```
 
 Features multiple tenant setup, user creation with stream-specific permissions, concurrent producers/consumers across tenants, and security isolation.
@@ -106,7 +108,7 @@ Features multiple tenant setup, user creation with stream-specific permissions, 
 Testing and benchmarking support:
 
 ```bash
-./gradlew runSinkDataProducer
+gradle runSinkDataProducer
 ```
 
 Produces high-throughput data (1000+ messages per batch) with realistic user records.
@@ -118,7 +120,7 @@ Produces high-throughput data (1000+ messages per batch) with realistic user rec
 Building streams with advanced configuration:
 
 ```bash
-./gradlew runStreamBasic
+gradle runStreamBasic
 ```
 
 Shows how to use the stream builder API to create and configure streams with custom settings.
@@ -130,11 +132,11 @@ The following example demonstrates how to use the asynchronous client:
 Async producer example:
 
 ```bash
-./gradlew runAsyncProducer
+gradle runAsyncProducer
 ```
 
 Async consumer example:
 
 ```bash
-./gradlew runAsyncConsumerExample
+gradle runAsyncConsumerExample
 ```

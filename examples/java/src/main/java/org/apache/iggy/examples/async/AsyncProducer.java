@@ -29,7 +29,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.math.BigInteger;
-import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -172,8 +171,6 @@ public class AsyncProducer {
         while (messageContent.length() < MESSAGE_SIZE) {
             messageContent += " ";
         }
-
-        byte[] messageBytes = messageContent.getBytes(StandardCharsets.UTF_8);
 
         // Use the factory method to create a message
         Message message = Message.of(messageContent);

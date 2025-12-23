@@ -19,10 +19,9 @@
 
 package org.apache.iggy.examples.shared;
 
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.SerializationFeature;
-import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
+import tools.jackson.core.JacksonException;
+import tools.jackson.databind.ObjectMapper;
+import tools.jackson.databind.json.JsonMapper;
 
 import java.time.Instant;
 
@@ -31,9 +30,7 @@ public final class Messages {
     public static final String ORDER_CONFIRMED_TYPE = "order_confirmed";
     public static final String ORDER_REJECTED_TYPE = "order_rejected";
 
-    private static final ObjectMapper MAPPER = new ObjectMapper()
-            .registerModule(new JavaTimeModule())
-            .disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
+    private static final ObjectMapper MAPPER = JsonMapper.builder().build();
 
     public interface SerializableMessage {
         String getMessageType();
@@ -45,7 +42,7 @@ public final class Messages {
         default String toJsonEnvelope() {
             try {
                 return MAPPER.writeValueAsString(Envelope.of(getMessageType(), this));
-            } catch (JsonProcessingException e) {
+            } catch (JacksonException e) {
                 throw new IllegalStateException("Failed to serialize envelope", e);
             }
         }
@@ -53,7 +50,7 @@ public final class Messages {
         private String toJsonWith(ObjectMapper mapper) {
             try {
                 return mapper.writeValueAsString(this);
-            } catch (JsonProcessingException e) {
+            } catch (JacksonException e) {
                 throw new IllegalStateException("Failed to serialize message", e);
             }
         }
@@ -63,7 +60,7 @@ public final class Messages {
         public static Envelope of(String messageType, Object payload) {
             try {
                 return new Envelope(messageType, MAPPER.writeValueAsString(payload));
-            } catch (JsonProcessingException e) {
+            } catch (JacksonException e) {
                 throw new IllegalStateException("Failed to serialize payload", e);
             }
         }
@@ -71,7 +68,7 @@ public final class Messages {
         public String toJson() {
             try {
                 return MAPPER.writeValueAsString(this);
-            } catch (JsonProcessingException e) {
+            } catch (JacksonException e) {
                 throw new IllegalStateException("Failed to serialize envelope", e);
             }
         }

@@ -19,10 +19,6 @@
 
 package org.apache.iggy.examples.sinkdataproducer;
 
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.SerializationFeature;
-import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import org.apache.iggy.client.blocking.tcp.IggyTcpClient;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
@@ -31,6 +27,9 @@ import org.apache.iggy.message.Partitioning;
 import org.apache.iggy.topic.CompressionAlgorithm;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import tools.jackson.core.JacksonException;
+import tools.jackson.databind.ObjectMapper;
+import tools.jackson.databind.json.JsonMapper;
 
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
@@ -48,9 +47,7 @@ public final class SinkDataProducer {
     private static final int MAX_BATCHES = 100;
     private static final Logger log = LoggerFactory.getLogger(SinkDataProducer.class);
 
-    private static final ObjectMapper MAPPER = new ObjectMapper()
-            .registerModule(new JavaTimeModule())
-            .disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
+    private static final ObjectMapper MAPPER = JsonMapper.builder().build();
 
     private SinkDataProducer() {}
 
@@ -87,7 +84,7 @@ public final class SinkDataProducer {
                 UserRecord record = randomRecord(random);
                 try {
                     messages.add(Message.of(record.toJson(MAPPER)));
-                } catch (JsonProcessingException e) {
+                } catch (JacksonException e) {
                     log.warn("Failed to serialize record, skipping.", e);
                 }
             }
@@ -179,12 +176,8 @@ public final class SinkDataProducer {
 
     private record UserRecord(
             String userId, int userType, String email, String source, String state, Instant createdAt, String message) {
-        String toJson(ObjectMapper mapper) throws JsonProcessingException {
+        String toJson(ObjectMapper mapper) {
             return mapper.writeValueAsString(this);
-        }
-
-        String summary() {
-            return "%s (%s, %s)".formatted(userId, state, source);
         }
     }
 }
