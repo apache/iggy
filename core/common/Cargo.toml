@@ -31,6 +31,7 @@ readme = "../../README.md"
 default = ["tokio_lock"]
 tokio_lock = []
 fast_async_lock = ["dep:fast-async-mutex"]
+compression = ["dep:flate2", "dep:lz4", "dep:snap", "dep:zstd"]
 
 [dependencies]
 aes-gcm = { workspace = true }
@@ -52,10 +53,12 @@ crossbeam = { workspace = true }
 derive_more = { workspace = true }
 err_trail = { workspace = true }
 fast-async-mutex = { version = "0.6.7", optional = true }
+flate2 = { workspace = true, optional = true }
 figment = { workspace = true }
 human-repr = { workspace = true }
 humantime = { workspace = true }
 nix = { workspace = true }
+lz4 = { workspace = true, optional = true }
 once_cell = { workspace = true }
 rcgen = "0.14.6"
 ring = "0.17.14"
@@ -64,6 +67,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 serde_with = { workspace = true, features = ["base64"] }
 slab = "0.4.11"
+snap = { workspace = true, optional = true }
 strum = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
@@ -71,6 +75,7 @@ toml = { workspace = true }
 tracing = { workspace = true }
 tungstenite = { workspace = true }
 twox-hash = { workspace = true }
+zstd = { workspace = true, optional = true }
 
 [dev-dependencies]
 serial_test = { workspace = true }

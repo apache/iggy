@@ -495,6 +495,11 @@ pub enum IggyError {
 
     #[error("IO error: {0}")]
     IoError(String) = 13000,
+
+    #[error("Client compression failed: {0}")]
+    CompressionError(String) = 14000,
+    #[error("Client decompression failed: {0}")]
+    DecompressionError(String) = 14001,
 }
 
 impl IggyError {

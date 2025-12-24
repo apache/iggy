@@ -4673,9 +4673,11 @@ dependencies = [
  "err_trail",
  "fast-async-mutex",
  "figment",
+ "flate2",
  "human-repr",
  "humantime",
  "nix",
+ "lz4",
  "once_cell",
  "rcgen",
  "ring",
@@ -4685,6 +4687,7 @@ dependencies = [
  "serde_with",
  "serial_test",
  "slab",
+ "snap",
  "strum 0.27.2",
  "thiserror 2.0.17",
  "tokio",
@@ -4692,6 +4695,7 @@ dependencies = [
  "tracing",
  "tungstenite",
  "twox-hash",
+ "zstd",
 ]
 
 [[package]]
@@ -5580,6 +5584,25 @@ name = "lru-slab"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
+
+[[package]]
+name = "lz4"
+version = "1.28.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a20b523e860d03443e98350ceaac5e71c6ba89aea7d960769ec3ce37f4de5af4"
+dependencies = [
+ "lz4-sys",
+]
+
+[[package]]
+name = "lz4-sys"
+version = "1.11.1+lz4-1.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6bd8c0d6c6ed0cd30b3652886bb8711dc4bb01d637a68105a3d5158039b418e6"
+dependencies = [
+ "cc",
+ "libc",
+]
 
 [[package]]
 name = "lz4_flex"
