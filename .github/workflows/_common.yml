@@ -86,6 +86,7 @@ jobs:
             java
             js
             mcp
+            partitions
             proc
             pr_template
             python
