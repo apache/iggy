@@ -26,9 +26,11 @@ use futures_util::StreamExt;
 use iggy_binary_protocol::{Client, MessageClient, StreamClient, TopicClient};
 use iggy_common::locking::{IggyRwLock, IggyRwLockFn};
 use iggy_common::{
-    CompressionAlgorithm, DiagnosticEvent, EncryptorKind, IdKind, Identifier, IggyDuration,
-    IggyError, IggyExpiry, IggyMessage, IggyTimestamp, MaxTopicSize, Partitioner, Partitioning,
+    BytesSerializable, ClientCompressionConfig, CompressionAlgorithm, DiagnosticEvent,
+    EncryptorKind, HeaderKey, HeaderValue, IdKind, Identifier, IggyDuration, IggyError, IggyExpiry,
+    IggyMessage, IggyTimestamp, MaxTopicSize, Partitioner, Partitioning,
 };
+use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::sync::atomic::{AtomicBool, AtomicU64};
@@ -60,6 +62,7 @@ pub struct ProducerCore {
     topic_name: String,
     partitioning: Option<Arc<Partitioning>>,
     encryptor: Option<Arc<EncryptorKind>>,
+    compressor: Option<ClientCompressionConfig>,
     partitioner: Option<Arc<dyn Partitioner>>,
     create_stream_if_not_exists: bool,
     create_topic_if_not_exists: bool,
@@ -306,6 +309,42 @@ impl ProducerCore {
         Ok(())
     }
 
+    #[cfg(feature = "compression")]
+    fn maybe_compress(&self, messages: &mut [IggyMessage]) -> Result<(), IggyError> {
+        if let Some(compressor) = &self.compressor {
+            if compressor.algorithm == CompressionAlgorithm::None {
+                return Ok(());
+            } else {
+                for message in messages {
+                    let payload_size = message.payload.len() as u32;
+                    if payload_size <= compressor.min_size {
+                        continue;
+                    }
+                    let compressed_payload = compressor.algorithm.compress(&message.payload)?;
+                    if compressed_payload.len() >= message.payload.len() {
+                        continue;
+                    }
+                    message.payload = Bytes::from(compressed_payload);
+                    message.header.payload_length = message.payload.len() as u32;
+                    let mut headers_map = message.user_headers_map()?.unwrap_or_default();
+                    headers_map.insert(
+                        HeaderKey::new("iggy-compression").unwrap(),
+                        HeaderValue::from_str(&compressor.algorithm.to_string()).unwrap(),
+                    );
+                    let headers_bytes = headers_map.to_bytes();
+                    message.header.user_headers_length = headers_bytes.len() as u32;
+                    message.user_headers = Some(headers_bytes);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(not(feature = "compression"))]
+    fn maybe_compress(&self, _messages: &mut [IggyMessage]) -> Result<(), IggyError> {
+        Ok(())
+    }
+
     fn get_partitioning(
         &self,
         stream: &Identifier,
@@ -366,6 +405,10 @@ impl ProducerCoreBackend for ProducerCore {
     ) -> Result<(), IggyError> {
         if msgs.is_empty() {
             return Ok(());
+        }
+
+        if let Err(err) = self.maybe_compress(&mut msgs) {
+            return Err(self.make_failed_error(err, msgs));
         }
 
         if let Err(err) = self.encrypt_messages(&mut msgs) {
@@ -438,6 +481,7 @@ impl IggyProducer {
         topic_name: String,
         partitioning: Option<Partitioning>,
         encryptor: Option<Arc<EncryptorKind>>,
+        compressor: Option<ClientCompressionConfig>,
         partitioner: Option<Arc<dyn Partitioner>>,
         create_stream_if_not_exists: bool,
         create_topic_if_not_exists: bool,
@@ -459,6 +503,7 @@ impl IggyProducer {
             topic_name,
             partitioning: partitioning.map(Arc::new),
             encryptor,
+            compressor,
             partitioner,
             create_stream_if_not_exists,
             create_topic_if_not_exists,

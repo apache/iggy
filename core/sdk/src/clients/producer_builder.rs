@@ -20,7 +20,8 @@ use crate::clients::producer_config::{BackgroundConfig, DirectConfig};
 use crate::prelude::IggyProducer;
 use iggy_common::locking::IggyRwLock;
 use iggy_common::{
-    EncryptorKind, Identifier, IggyDuration, IggyExpiry, MaxTopicSize, Partitioner, Partitioning,
+    ClientCompressionConfig, EncryptorKind, Identifier, IggyDuration, IggyExpiry, MaxTopicSize,
+    Partitioner, Partitioning,
 };
 use std::sync::Arc;
 
@@ -42,6 +43,7 @@ pub struct IggyProducerBuilder {
     topic: Identifier,
     topic_name: String,
     encryptor: Option<Arc<EncryptorKind>>,
+    compressor: Option<ClientCompressionConfig>,
     partitioner: Option<Arc<dyn Partitioner>>,
     create_stream_if_not_exists: bool,
     create_topic_if_not_exists: bool,
@@ -64,6 +66,7 @@ impl IggyProducerBuilder {
         topic: Identifier,
         topic_name: String,
         encryptor: Option<Arc<EncryptorKind>>,
+        compressor: Option<ClientCompressionConfig>,
         partitioner: Option<Arc<dyn Partitioner>>,
     ) -> Self {
         Self {
@@ -74,6 +77,7 @@ impl IggyProducerBuilder {
             topic_name,
             partitioning: None,
             encryptor,
+            compressor,
             partitioner,
             create_stream_if_not_exists: true,
             create_topic_if_not_exists: true,
@@ -109,6 +113,22 @@ impl IggyProducerBuilder {
     pub fn without_encryptor(self) -> Self {
         Self {
             encryptor: None,
+            ..self
+        }
+    }
+
+    /// Sets the compressor for compressing the messages' payloads.
+    pub fn compressor(self, compressor: ClientCompressionConfig) -> Self {
+        Self {
+            compressor: Some(compressor),
+            ..self
+        }
+    }
+
+    /// Clears the compressor for compressing the messages' payloads.
+    pub fn without_compressor(self) -> Self {
+        Self {
+            compressor: None,
             ..self
         }
     }
@@ -222,6 +242,7 @@ impl IggyProducerBuilder {
             self.topic_name,
             self.partitioning,
             self.encryptor,
+            self.compressor,
             self.partitioner,
             self.create_stream_if_not_exists,
             self.create_topic_if_not_exists,
