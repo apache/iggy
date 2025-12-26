@@ -26,6 +26,8 @@ import org.apache.iggy.consumergroup.ConsumerGroupDetails;
 import org.apache.iggy.consumergroup.ConsumerGroupMember;
 import org.apache.iggy.consumeroffset.ConsumerOffsetInfo;
 import org.apache.iggy.message.BytesMessageId;
+import org.apache.iggy.message.HeaderKind;
+import org.apache.iggy.message.HeaderValue;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.MessageHeader;
 import org.apache.iggy.message.PolledMessages;
@@ -194,8 +196,26 @@ public final class BytesDeserializer {
                 new MessageHeader(checksum, id, offset, timestamp, originTimestamp, userHeadersLength, payloadLength);
         var payload = newByteArray(payloadLength);
         response.readBytes(payload);
-        // TODO: Add support for user headers.
-        return new Message(header, payload, Optional.empty());
+        Optional<Map<String, HeaderValue>> userHeaders = Optional.empty();
+        if (userHeadersLength > 0) {
+            ByteBuf userHeadersBuffer = response.readSlice(Math.toIntExact(userHeadersLength));
+            Map<String, HeaderValue> headers = new HashMap<>();
+            while (userHeadersBuffer.isReadable()) {
+                long userHeaderKeyLength = userHeadersBuffer.readUnsignedIntLE();
+                byte[] userHeaderKeyBytes = new byte[Math.toIntExact(userHeaderKeyLength)];
+                userHeadersBuffer.readBytes(userHeaderKeyBytes);
+                int userHeaderKindCode = userHeadersBuffer.readUnsignedByte();
+                long userHeaderValueLength = userHeadersBuffer.readUnsignedIntLE();
+                byte[] userHeaderValueBytes = new byte[Math.toIntExact(userHeaderValueLength)];
+                userHeadersBuffer.readBytes(userHeaderValueBytes);
+                String userHeaderKey = new String(userHeaderKeyBytes, StandardCharsets.UTF_8);
+                String userHeaderValue = new String(userHeaderValueBytes, StandardCharsets.UTF_8);
+                headers.put(userHeaderKey, new HeaderValue(HeaderKind.fromCode(userHeaderKindCode), userHeaderValue));
+            }
+            userHeaders = Optional.of(headers);
+        }
+
+        return new Message(header, payload, userHeaders);
     }
 
     public static Stats readStats(ByteBuf response) {

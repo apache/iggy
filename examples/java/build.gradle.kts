@@ -73,6 +73,16 @@ tasks.register<JavaExec>("runMessageEnvelopeConsumer") {
     mainClass.set("org.apache.iggy.examples.messageenvelope.consumer.MessageEnvelopeConsumer")
 }
 
+tasks.register<JavaExec>("runMessageHeadersProducer") {
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("org.apache.iggy.examples.messageheaders.producer.MessageHeadersProducer")
+}
+
+tasks.register<JavaExec>("runMessageHeadersConsumer") {
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("org.apache.iggy.examples.messageheaders.consumer.MessageHeadersConsumer")
+}
+
 tasks.register<JavaExec>("runSinkDataProducer") {
     classpath = sourceSets["main"].runtimeClasspath
     mainClass.set("org.apache.iggy.examples.sinkdataproducer.SinkDataProducer")

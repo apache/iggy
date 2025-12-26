@@ -36,6 +36,7 @@ import org.apache.iggy.user.TopicPermissions;
 
 import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
+import java.util.HashMap;
 import java.util.Map;
 import java.util.Optional;
 
@@ -81,9 +82,10 @@ public final class BytesSerializer {
     }
 
     public static ByteBuf toBytes(Message message) {
-        var buffer = Unpooled.buffer(MessageHeader.SIZE + message.payload().length);
+        var buffer = Unpooled.buffer(message.getSize());
         buffer.writeBytes(toBytes(message.header()));
         buffer.writeBytes(message.payload());
+        buffer.writeBytes(toBytes(message.userHeaders().orElseGet(HashMap::new)));
         return buffer;
     }
 

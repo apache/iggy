@@ -77,7 +77,14 @@ gradle runGettingStartedConsumer
 
 ### Message Headers
 
-This example will be created as and when userHeaders serialization/deserialization is implemented in the Java client SDK.
+Shows metadata management using custom headers:
+
+```bash
+gradle runMessageHeadersProducer
+gradle runMessageHeadersConsumer
+```
+
+Demonstrates using header keys and values for message metadata instead of payload-based typing, with header-based message routing.
 
 ### Message Envelopes
 
