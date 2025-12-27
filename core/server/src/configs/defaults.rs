@@ -403,6 +403,8 @@ impl Default for LoggingConfig {
             level: SERVER_CONFIG.system.logging.level.parse().unwrap(),
             file_enabled: SERVER_CONFIG.system.logging.file_enabled,
             max_size: SERVER_CONFIG.system.logging.max_size.parse().unwrap(),
+            max_total_size: SERVER_CONFIG.system.logging.max_total_size.parse().unwrap(),
+            rotation_check_interval: SERVER_CONFIG.system.logging.rotation_check_interval as u64,
             retention: SERVER_CONFIG.system.logging.retention.parse().unwrap(),
             sysinfo_print_interval: SERVER_CONFIG
                 .system
