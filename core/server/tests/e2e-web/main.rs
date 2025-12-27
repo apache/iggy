@@ -17,22 +17,19 @@
 
 mod utils;
 
-#[tokio::test]
-async fn test_redirects_to_sign_in() {
-    let iggy_container = utils::launch_iggy_container().await;
-    let client = utils::Client::init().await;
-    let iggy_web_ui_root = iggy_container.address.join("ui").unwrap();
+use crate::utils::TestCtx;
+use fantoccini::Locator;
+
+async fn test_redirects_to_sign_in(TestCtx { client, url }: TestCtx) {
     // we are going to the Iggy Web UI dashboard, but ...
-    client.goto(iggy_web_ui_root.as_str()).await.unwrap();
-    let _sign_in_form = client
-        .wait_for_element(fantoccini::Locator::Css("form"))
-        .await
-        .unwrap();
+    client.goto(url.as_str()).await.unwrap();
+    let _sign_in_form = client.wait_for_element(Locator::Css("form")).await.unwrap();
     // ... get redirected (client-side) to the sign-in page
     let current_url = client.current_url().await.unwrap();
-    let iggy_web_ui_auth = iggy_web_ui_root.join("ui/auth/sign-in").unwrap();
-    assert_eq!(current_url, iggy_web_ui_auth);
-    // TODO: we should be performed by our test running logic
-    // and should happen no matter what
-    client.fantoccini.close().await.unwrap();
+    let auth_url = url.join("ui/auth/sign-in").unwrap();
+    assert_eq!(current_url, auth_url);
+}
+
+mod tests {
+    crate::test!(test_redirects_to_sign_in);
 }

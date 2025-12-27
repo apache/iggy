@@ -63,11 +63,8 @@ static WEBDRIVER_CAPABILITIES: LazyLock<Capabilities> = LazyLock::new(|| {
 
 #[derive(Debug)]
 pub(crate) struct IggyContainer {
-    #[allow(unused)]
-    handle: ContainerAsync<GenericImage>,
-    #[allow(unused)]
-    pub port: u16,
-    pub address: Url,
+    _handle: ContainerAsync<GenericImage>,
+    pub url: Url,
 }
 
 /// Launch Iggy server instance in a container.
@@ -137,12 +134,11 @@ pub(crate) async fn launch_iggy_container() -> IggyContainer {
         .expect("post to have been published")
         .map_to_host_port_ipv4(IGGY_HTTP_PORT)
         .expect("host port to have been assigned by OS");
-    let iggy_url = format!("http://127.0.0.1:{}", host_port).parse().unwrap();
+    let url = format!("http://127.0.0.1:{}", host_port).parse().unwrap();
 
     IggyContainer {
-        handle: container,
-        port: host_port,
-        address: iggy_url,
+        _handle: container,
+        url,
     }
 }
 
@@ -179,4 +175,36 @@ impl Deref for Client {
     fn deref(&self) -> &Self::Target {
         &self.fantoccini
     }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct TestCtx {
+    pub client: Client,
+    pub url: Url,
+}
+
+#[macro_export]
+macro_rules! test {
+    ($test_fn:ident) => {
+        #[tokio::test]
+        async fn $test_fn() {
+            // setup
+            let iggy_container = $crate::utils::launch_iggy_container().await;
+            let client = $crate::utils::Client::init().await;
+            let url = iggy_container.url.join("ui").unwrap();
+            let ctx = $crate::utils::TestCtx {
+                client: client.clone(),
+                url,
+            };
+            // run test catching panic
+            let res = tokio::spawn(super::$test_fn(ctx)).await;
+            // teardown
+            client.fantoccini.close().await.unwrap();
+            drop(iggy_container);
+            // unwind (if test panicked)
+            if let Err(caught_panic) = res {
+                std::panic::resume_unwind(Box::new(caught_panic))
+            }
+        }
+    };
 }
