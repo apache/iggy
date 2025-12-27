@@ -43,7 +43,10 @@ static WEBDRIVER_ADDRESS: LazyLock<String> = LazyLock::new(|| {
 static WEBDRIVER_CAPABILITIES: LazyLock<Capabilities> = LazyLock::new(|| {
     let mut args = Vec::new();
     // on CI we want to run end-to-end tests in headless mode
-    if std::env::var("HEADLESS").ok().is_some() {
+    if std::env::var("E2E_TEST_HEADLESS")
+        .ok()
+        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+    {
         args.extend([
             "--headless",
             "--disable-gpu",
@@ -188,6 +191,12 @@ macro_rules! test {
     ($test_fn:ident) => {
         #[tokio::test]
         async fn $test_fn() {
+            let e2e_tests_enabled = std::env::var("E2E_TEST")
+                .ok()
+                .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+            if (!e2e_tests_enabled) {
+                return;
+            }
             // setup
             let iggy_container = $crate::utils::launch_iggy_container().await;
             let client = $crate::utils::Client::init().await;
