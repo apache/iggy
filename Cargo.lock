@@ -8261,6 +8261,7 @@ dependencies = [
  "strum 0.27.2",
  "sysinfo 0.37.2",
  "tempfile",
+ "testcontainers",
  "thiserror 2.0.17",
  "tokio",
  "toml 0.9.8",
@@ -8999,9 +9000,9 @@ dependencies = [
 
 [[package]]
 name = "testcontainers"
-version = "0.26.0"
+version = "0.26.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a347cac4368ba4f1871743adb27dc14829024d26b1763572404726b0b9943eb8"
+checksum = "a81ec0158db5fbb9831e09d1813fe5ea9023a2b5e6e8e0a5fe67e2a820733629"
 dependencies = [
  "astral-tokio-tar",
  "async-trait",

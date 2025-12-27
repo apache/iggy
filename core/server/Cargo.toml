@@ -142,3 +142,6 @@ vergen-git2 = { version = "1.0.7", features = [
     "rustc",
     "si",
 ] }
+
+[dev-dependencies]
+testcontainers = "0.26.3"

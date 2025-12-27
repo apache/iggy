@@ -140,6 +140,8 @@ pub async fn start_http_server(
         let address = listener
             .local_addr()
             .expect("Failed to get local address for HTTP server");
+        // NB: this log is being relied upon in our e2e tests: we are considering
+        // a test container to be ready once this message (verbatim) appears in stdout
         info!("Started {api_name} on: {address}");
 
         // Notify shard about the bound address
