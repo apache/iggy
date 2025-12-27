@@ -15,7 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use fantoccini::Locator;
+use fantoccini::elements::Element;
+use fantoccini::error::CmdError;
+use fantoccini::wd::Capabilities;
 use reqwest::Url;
+use std::ops::Deref;
+use std::sync::LazyLock;
 use std::time::Duration;
 use testcontainers::core::{WaitFor, ports::IntoContainerPort as _};
 use testcontainers::runners::AsyncRunner as _;
@@ -24,6 +30,36 @@ use testcontainers::{ContainerAsync, GenericImage, ImageExt as _};
 const IGGY_HTTP_PORT: u16 = 3000;
 const IGGY_HTTP_ADDRESS: &str = "0.0.0.0:3000";
 const IGGY_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
+
+const DEFAULT_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+
+static WEBDRIVER_ADDRESS: LazyLock<String> = LazyLock::new(|| {
+    let port = std::env::var("WEBDRIVER_PORT")
+        .ok()
+        .unwrap_or("4444".into());
+    format!("http://localhost:{}", port)
+});
+
+static WEBDRIVER_CAPABILITIES: LazyLock<Capabilities> = LazyLock::new(|| {
+    let mut args = Vec::new();
+    // on CI we want to run end-to-end tests in headless mode
+    if std::env::var("HEADLESS").ok().is_some() {
+        args.extend([
+            "--headless",
+            "--disable-gpu",
+            "--disable-dev-shm-usage",
+            "--no-sandbox",
+        ]);
+    }
+    let mut caps = serde_json::map::Map::new();
+    caps.insert(
+        "goog:chromeOptions".to_string(),
+        serde_json::json!({
+            "args": args,
+        }),
+    );
+    caps
+});
 
 #[derive(Debug)]
 pub(crate) struct IggyContainer {
@@ -107,5 +143,40 @@ pub(crate) async fn launch_iggy_container() -> IggyContainer {
         handle: container,
         port: host_port,
         address: iggy_url,
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct Client {
+    pub fantoccini: fantoccini::Client,
+    pub wait_timeout: Duration,
+}
+
+impl Client {
+    pub(crate) async fn init() -> Self {
+        let fantoccini = fantoccini::ClientBuilder::native()
+            .capabilities((*WEBDRIVER_CAPABILITIES).clone())
+            .connect(&WEBDRIVER_ADDRESS)
+            .await
+            .expect("web driver to be available");
+        Client {
+            fantoccini,
+            wait_timeout: DEFAULT_WAIT_TIMEOUT,
+        }
+    }
+
+    /// Wait for an element with this [`Locator`] with [`Client::wait_timeout`].
+    pub(crate) async fn wait_for_element(&self, locator: Locator<'_>) -> Result<Element, CmdError> {
+        self.wait()
+            .at_most(self.wait_timeout)
+            .for_element(locator)
+            .await
+    }
+}
+
+impl Deref for Client {
+    type Target = fantoccini::Client;
+    fn deref(&self) -> &Self::Target {
+        &self.fantoccini
     }
 }

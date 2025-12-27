@@ -144,4 +144,6 @@ vergen-git2 = { version = "1.0.7", features = [
 ] }
 
 [dev-dependencies]
+fantoccini = "0.22.0"
 testcontainers = "0.26.3"
+serde_json = { workspace = true }
