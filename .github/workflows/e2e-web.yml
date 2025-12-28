@@ -54,11 +54,12 @@ jobs:
       - uses: ./.github/actions/utils/docker-buildx
         with:
           task: build
+          platform: linux/amd64
           component: rust-server
-          # since we are not selecting a platform and requesting a dry run, this will result
-          # in an image tagged "apache/iggy:local" which is exactly what our tests expect;
-          # in case we ever decide to put a different version here, we will need to update
-          # the `E2E_TEST_IGGY_IMAGE_TAG` environment variable in the job below accordingly
+          # since we are selecting a platform and requesting a dry run, this will
+          # result in an image tagged "apache/iggy:local-amd64" and so we will need
+          # to set the `E2E_TEST_IGGY_IMAGE_TAG` environment variable incorporate
+          # the job below accordingly (by default tests expect "apache/iggy:local")
           version: local
           dry_run: true
       - name: Launch web driver
@@ -74,5 +75,5 @@ jobs:
           E2E_TEST: true
           E2E_TEST_HEADLESS: true
           E2E_TEST_WAIT_TIMEOUT: 10
-          E2E_TEST_IGGY_IMAGE_TAG: local
+          E2E_TEST_IGGY_IMAGE_TAG: local-amd64
 
