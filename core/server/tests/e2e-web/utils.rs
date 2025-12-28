@@ -33,8 +33,9 @@ const IGGY_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// We normally want to test the current edition of the app, and so having
 /// predefined image name and tag should generally suffice. Having these flexible
-/// allows for more specific tags (if needed), but also gives us an option of
-/// testing other builds (not nencessarilly built and/or stored locally), e.g.:
+/// allows for more specific tags (needed on our CI for example), but also gives
+/// us an option of testing other builds (not necessarilly built and/or stored
+/// locally), e.g. for the latest Iggy Server stored on Dockerhub or locally:
 /// ```console
 /// E2E_TEST_IGGY_IMAGE_TAG=edge E2E_TEST=true cargo t --test e2e-web
 /// ```
@@ -106,8 +107,8 @@ pub(crate) struct IggyContainer {
 /// which keeps the container's handle (whose `Drop` implemention knows how to
 /// clean up) as well as the host port and HTTP url of the Iggy server.
 ///
-/// Note that this relies on the "iggy:local" image to be available, i.e. we need
-/// to build and tag the image prior to running tests which are using this utility.
+/// Note that this relies on the "apache/iggy:local" image to be available, i.e. we
+/// need to build and tag the image prior to running tests which are using this utility.
 /// E.g. with `docker` the image can be built with (from the workspace root):
 ///
 /// ```console

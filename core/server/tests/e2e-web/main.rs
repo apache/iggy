@@ -20,7 +20,7 @@ mod utils;
 use crate::utils::TestCtx;
 use fantoccini::Locator;
 
-async fn test_redirects_to_sign_in(TestCtx { client, url }: TestCtx) {
+async fn test_redirects_unauthenticated_user_to_sign_in(TestCtx { client, url }: TestCtx) {
     // we are going to the Iggy Web UI dashboard, but ...
     client.goto(url.as_str()).await.unwrap();
     let _sign_in_form = client.wait_for_element(Locator::Css("form")).await.unwrap();
@@ -31,5 +31,5 @@ async fn test_redirects_to_sign_in(TestCtx { client, url }: TestCtx) {
 }
 
 mod tests {
-    crate::test!(test_redirects_to_sign_in);
+    crate::test!(test_redirects_unauthenticated_user_to_sign_in);
 }

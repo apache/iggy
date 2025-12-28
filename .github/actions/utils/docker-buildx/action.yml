@@ -46,6 +46,10 @@ inputs:
     description: "Single platform to build (e.g., linux/amd64). If set, builds only this platform without QEMU. Leave empty for multi-arch build."
     required: false
     default: ""
+  load:
+    description: "Load the single-platform build result to docker images."
+    required: false
+    default: "false"
 
 outputs:
   digest:
@@ -360,6 +364,7 @@ runs:
         build-args: |
           ${{ steps.bargs.outputs.all }}
         push: false
+        load: ${{ inputs.load }}
 
     - name: Consolidate build output
       id: build

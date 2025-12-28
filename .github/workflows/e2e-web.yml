@@ -41,7 +41,7 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
-    name: ubuntu-latest / stable
+    name: Iggy Web UI End-To-End Tests
     env:
       WEBDRIVER_PORT: 4444
     steps:
@@ -62,6 +62,9 @@ jobs:
           # the job below accordingly (by default tests expect "apache/iggy:local")
           version: local
           dry_run: true
+          load: true
+      - name: List docker images
+        run: docker image ls
       - name: Launch web driver
         run: chromedriver --port=${{ env.WEBDRIVER_PORT}} &
       - name: Setup Rust & system libs
