@@ -36,13 +36,12 @@ const IGGY_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 /// allows for more specific tags (if needed), but also gives us an option of
 /// testing other builds (not nencessarilly built and/or stored locally), e.g.:
 /// ```console
-/// E2E_TEST_IGGY_IMAGE_NAME=apache/iggy E2E_TEST_IGGY_IMAGE_TAG=edge E2E_TEST=true \
-///     cargo t --test e2e-web
+/// E2E_TEST_IGGY_IMAGE_TAG=edge E2E_TEST=true cargo t --test e2e-web
 /// ```
 static IGGY_IMAGE_NAME: LazyLock<String> = LazyLock::new(|| {
     std::env::var("E2E_TEST_IGGY_IMAGE_NAME")
         .ok()
-        .unwrap_or("iggy".into())
+        .unwrap_or("apache/iggy".into())
 });
 static IGGY_IMAGE_TAG: LazyLock<String> = LazyLock::new(|| {
     std::env::var("E2E_TEST_IGGY_IMAGE_TAG")
@@ -112,7 +111,7 @@ pub(crate) struct IggyContainer {
 /// E.g. with `docker` the image can be built with (from the workspace root):
 ///
 /// ```console
-/// docker build -t iggy:local -f core/server/Dockerfile .
+/// docker build -t apache/iggy:local -f core/server/Dockerfile .
 /// ```
 ///
 /// For debugging/inspecting of what is being done here programmatically, you can
@@ -126,7 +125,7 @@ pub(crate) struct IggyContainer {
 ///     -e IGGY_TCP_ENABLED=false \
 ///     -e IGGY_WEBSOCKET_ENABLED=false \
 ///     -e IGGY_QUIC_ENABLED=false \
-///     -p 0:3000 iggy:local
+///     -p 0:3000 apache/iggy:local
 /// ```
 pub(crate) async fn launch_iggy_container() -> IggyContainer {
     let container = GenericImage::new(&*IGGY_IMAGE_NAME, &*IGGY_IMAGE_TAG)

@@ -2,12 +2,12 @@
 
 ## Prerequisites
 
-Our tests rely on the "iggy:local" image to be available, and so it should
+Our tests rely on the "apache/iggy:local" image to be available, and so it should
 be built and tagged accordingly. With [docker](https://docs.docker.com/engine/install/),
 we can achieve this with (from the workspace root):
 
 ```console
-docker build -t iggy:local -f core/server/Dockerfile .
+docker build -t apache/iggy:local -f core/server/Dockerfile .
 ```
 
 We are getting the app rendered in the Google Chrome browser and using its
