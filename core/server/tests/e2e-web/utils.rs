@@ -31,7 +31,38 @@ const IGGY_HTTP_PORT: u16 = 3000;
 const IGGY_HTTP_ADDRESS: &str = "0.0.0.0:3000";
 const IGGY_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// We normally want to test the current edition of the app, and so having
+/// predefined image name and tag should generally suffice. Having these flexible
+/// allows for more specific tags (if needed), but also gives us an option of
+/// testing other builds (not nencessarilly built and/or stored locally), e.g.:
+/// ```console
+/// E2E_TEST_IGGY_IMAGE_NAME=apache/iggy E2E_TEST_IGGY_IMAGE_TAG=edge E2E_TEST=true \
+///     cargo t --test e2e-web
+/// ```
+static IGGY_IMAGE_NAME: LazyLock<String> = LazyLock::new(|| {
+    std::env::var("E2E_TEST_IGGY_IMAGE_NAME")
+        .ok()
+        .unwrap_or("iggy".into())
+});
+static IGGY_IMAGE_TAG: LazyLock<String> = LazyLock::new(|| {
+    std::env::var("E2E_TEST_IGGY_IMAGE_TAG")
+        .ok()
+        .unwrap_or("local".into())
+});
+
+// On most workstations the wait timeout can actually have a subsecond value for
+// pure rendering operations and just a few seconds when the app needs something
+// from the back-end or N+ seconds when the app is polling the back-end every N
+// seconds. However, on shared CI runners with constraint resources the operation
+// can take much longer and we want to be able to increase the timeout.
 const DEFAULT_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+static WAIT_TIMEOUT: LazyLock<Duration> = LazyLock::new(|| {
+    std::env::var("E2E_TEST_WAIT_TIMEOUT")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_WAIT_TIMEOUT)
+});
 
 static WEBDRIVER_ADDRESS: LazyLock<String> = LazyLock::new(|| {
     let port = std::env::var("WEBDRIVER_PORT")
@@ -98,7 +129,7 @@ pub(crate) struct IggyContainer {
 ///     -p 0:3000 iggy:local
 /// ```
 pub(crate) async fn launch_iggy_container() -> IggyContainer {
-    let container = GenericImage::new("iggy", "local")
+    let container = GenericImage::new(&*IGGY_IMAGE_NAME, &*IGGY_IMAGE_TAG)
         .with_exposed_port(IGGY_HTTP_PORT.tcp())
         // this needle we are looking for in stdout comes from `http_server.rs`,
         // once it's found we know that the server is ready to accept connections
@@ -160,7 +191,7 @@ impl Client {
             .expect("web driver to be available");
         Client {
             fantoccini,
-            wait_timeout: DEFAULT_WAIT_TIMEOUT,
+            wait_timeout: *WAIT_TIMEOUT,
         }
     }
 
