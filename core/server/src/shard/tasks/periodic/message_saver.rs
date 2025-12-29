@@ -54,6 +54,15 @@ async fn save_messages(shard: Rc<IggyShard>) -> Result<(), IggyError> {
         let topic_id = Identifier::numeric(ns.topic_id() as u32).unwrap();
         let partition_id = ns.partition_id();
 
+        // Skip partitions that haven't been lazily created yet
+        // (they have no messages to save anyway)
+        if !shard
+            .streams
+            .partition_exists(&stream_id, &topic_id, partition_id)
+        {
+            continue;
+        }
+
         match shard
             .streams
             .persist_messages(
@@ -101,6 +110,14 @@ async fn fsync_all_segments_on_shutdown(shard: Rc<IggyShard>, result: Result<(),
         let stream_id = Identifier::numeric(ns.stream_id() as u32).unwrap();
         let topic_id = Identifier::numeric(ns.topic_id() as u32).unwrap();
         let partition_id = ns.partition_id();
+
+        // Skip partitions that haven't been lazily created yet
+        if !shard
+            .streams
+            .partition_exists(&stream_id, &topic_id, partition_id)
+        {
+            continue;
+        }
 
         match shard
             .streams

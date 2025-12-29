@@ -21,7 +21,6 @@ use crate::quic::{COMPONENT, listener, quic_socket};
 use crate::server_error::QuicError;
 use crate::shard::IggyShard;
 use crate::shard::task_registry::ShutdownToken;
-use crate::shard::transmission::event::ShardEvent;
 use anyhow::Result;
 use compio_quic::{
     Endpoint, EndpointConfig, IdleTimeout, ServerBuilder, ServerConfig, TransportConfig, VarInt,
@@ -66,7 +65,7 @@ pub async fn spawn_quic_server(
     if shard.id != 0 && addr.port() == 0 {
         info!("Waiting for QUIC address from shard 0...");
         loop {
-            if let Some(bound_addr) = shard.quic_bound_address.get() {
+            if let Some(bound_addr) = shard.shared_metadata.load().bound_addresses.quic {
                 addr = bound_addr;
                 info!("Received QUIC address: {}", addr);
                 break;
@@ -117,19 +116,14 @@ pub async fn spawn_quic_server(
     info!("Iggy QUIC server has started on: {:?}", actual_addr);
 
     if shard.id == 0 {
-        // Store bound address locally
+        // Store in Cell for config_writer backward compat
         shard.quic_bound_address.set(Some(actual_addr));
+        // Store in SharedMetadata (all shards see this immediately via ArcSwap)
+        shard.shared_metadata.set_quic_address(actual_addr);
 
         if addr.port() == 0 {
             // Notify config writer on shard 0
             let _ = shard.config_writer_notify.try_send(());
-
-            // Broadcast to other shards for SO_REUSEPORT binding
-            let event = ShardEvent::AddressBound {
-                protocol: iggy_common::TransportProtocol::Quic,
-                address: actual_addr,
-            };
-            shard.broadcast_event_to_all_shards(event).await?;
         }
     } else {
         shard.quic_bound_address.set(Some(actual_addr));

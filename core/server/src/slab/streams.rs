@@ -71,7 +71,11 @@ pub type ContainerId = usize;
 
 #[derive(Debug, Clone)]
 pub struct Streams {
+    /// Name index: stream name → slab position
     index: RefCell<AHashMap<<stream::StreamRoot as Keyed>::Key, ContainerId>>,
+    /// Numeric ID index: logical stream ID → slab position
+    /// This allows logical IDs to differ from slab positions (needed for lazy creation)
+    numeric_index: RefCell<AHashMap<usize, ContainerId>>,
     root: RefCell<Slab<stream::StreamRoot>>,
     stats: RefCell<Slab<Arc<StreamStats>>>,
 }
@@ -80,6 +84,7 @@ impl Default for Streams {
     fn default() -> Self {
         Self {
             index: RefCell::new(AHashMap::with_capacity(CAPACITY)),
+            numeric_index: RefCell::new(AHashMap::with_capacity(CAPACITY)),
             root: RefCell::new(Slab::with_capacity(CAPACITY)),
             stats: RefCell::new(Slab::with_capacity(CAPACITY)),
         }
@@ -109,20 +114,32 @@ impl InsertCell for Streams {
     fn insert(&self, item: Self::Item) -> Self::Idx {
         let (root, stats) = item.into_components();
         let mut root_container = self.root.borrow_mut();
-        let mut indexes = self.index.borrow_mut();
+        let mut name_index = self.index.borrow_mut();
+        let mut numeric_index = self.numeric_index.borrow_mut();
         let mut stats_container = self.stats.borrow_mut();
 
+        // Check if ID was pre-set (e.g., from metadata during lazy creation)
+        let pre_set_id = root.id();
+
         let key = root.key().clone();
-        let entity_id = root_container.insert(root);
-        let id = stats_container.insert(stats);
+        let slab_pos = root_container.insert(root);
+        let stats_pos = stats_container.insert(stats);
         assert_eq!(
-            entity_id, id,
-            "stream_insert: id mismatch when inserting stats"
+            slab_pos, stats_pos,
+            "stream_insert: position mismatch when inserting stats"
         );
-        let root = root_container.get_mut(entity_id).unwrap();
-        root.update_id(entity_id);
-        indexes.insert(key, entity_id);
-        entity_id
+
+        let root = root_container.get_mut(slab_pos).unwrap();
+
+        // Use pre-set ID if available, otherwise use slab position
+        let logical_id = if pre_set_id > 0 { pre_set_id } else { slab_pos };
+        root.update_id(logical_id);
+
+        // Update both indexes
+        name_index.insert(key, slab_pos);
+        numeric_index.insert(logical_id, slab_pos);
+
+        logical_id
     }
 }
 
@@ -130,19 +147,28 @@ impl DeleteCell for Streams {
     type Idx = ContainerId;
     type Item = stream::Stream;
 
-    fn delete(&self, id: Self::Idx) -> Self::Item {
+    fn delete(&self, logical_id: Self::Idx) -> Self::Item {
         let mut root_container = self.root.borrow_mut();
-        let mut indexes = self.index.borrow_mut();
+        let mut name_index = self.index.borrow_mut();
+        let mut numeric_index = self.numeric_index.borrow_mut();
         let mut stats_container = self.stats.borrow_mut();
 
-        let root = root_container.remove(id);
-        let stats = stats_container.remove(id);
+        // Look up slab position from logical ID
+        let slab_pos = *numeric_index
+            .get(&logical_id)
+            .expect("stream_delete: logical ID not found in numeric index");
 
-        // Remove from index
+        let root = root_container.remove(slab_pos);
+        let stats = stats_container.remove(slab_pos);
+
+        // Remove from both indexes
         let key = root.key();
-        indexes
+        name_index
             .remove(key)
-            .expect("stream_delete: key not found in index");
+            .expect("stream_delete: key not found in name index");
+        numeric_index
+            .remove(&logical_id)
+            .expect("stream_delete: ID not found in numeric index");
 
         stream::Stream::new_with_components(root, stats)
     }
@@ -441,8 +467,8 @@ impl Streams {
     pub fn exists(&self, id: &Identifier) -> bool {
         match id.kind {
             iggy_common::IdKind::Numeric => {
-                let id = id.get_u32_value().unwrap() as usize;
-                self.root.borrow().contains(id)
+                let logical_id = id.get_u32_value().unwrap() as usize;
+                self.numeric_index.borrow().contains_key(&logical_id)
             }
             iggy_common::IdKind::String => {
                 let key = id.get_string_value().unwrap();
@@ -451,12 +477,45 @@ impl Streams {
         }
     }
 
+    /// Check if a partition exists locally (stream, topic, and partition all exist).
+    /// Returns false if any level doesn't exist, without panicking.
+    pub fn partition_exists(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        partition_id: usize,
+    ) -> bool {
+        if !self.exists(stream_id) {
+            return false;
+        }
+
+        let topic_exists = self.with_topics(stream_id, |topics| topics.exists(topic_id));
+        if !topic_exists {
+            return false;
+        }
+
+        self.with_partitions(stream_id, topic_id, |partitions| {
+            partitions.exists(partition_id)
+        })
+    }
+
     pub fn get_index(&self, id: &Identifier) -> usize {
         match id.kind {
-            iggy_common::IdKind::Numeric => id.get_u32_value().unwrap() as usize,
+            iggy_common::IdKind::Numeric => {
+                let logical_id = id.get_u32_value().unwrap() as usize;
+                *self
+                    .numeric_index
+                    .borrow()
+                    .get(&logical_id)
+                    .expect("Stream not found by numeric ID")
+            }
             iggy_common::IdKind::String => {
                 let key = id.get_string_value().unwrap();
-                *self.index.borrow().get(&key).expect("Stream not found")
+                *self
+                    .index
+                    .borrow()
+                    .get(&key)
+                    .expect("Stream not found by name")
             }
         }
     }

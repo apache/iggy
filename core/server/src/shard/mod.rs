@@ -25,6 +25,7 @@ pub mod transmission;
 
 mod communication;
 pub mod handlers;
+mod lazy_init;
 
 // Re-export for backwards compatibility
 pub use communication::calculate_shard_assignment;
@@ -33,7 +34,7 @@ use self::tasks::{continuous, periodic};
 use crate::{
     configs::server::ServerConfig,
     io::fs_locks::FsLocks,
-    metadata::SharedMetadata,
+    metadata::{SharedMetadata, SharedStatsStore},
     shard::{
         namespace::IggyNamespace, task_registry::TaskRegistry, transmission::frame::ShardFrame,
     },
@@ -76,6 +77,9 @@ pub struct IggyShard {
 
     /// Shared metadata accessible by all shards (ArcSwap-based).
     pub(crate) shared_metadata: EternalPtr<SharedMetadata>,
+
+    /// Shared stats store for cross-shard stats visibility.
+    pub(crate) shared_stats: EternalPtr<SharedStatsStore>,
 
     pub(crate) fs_locks: FsLocks,
     pub(crate) encryptor: Option<EncryptorKind>,

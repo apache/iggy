@@ -35,6 +35,7 @@ use crate::streaming::topics;
 use err_trail::ErrContext;
 use iggy_common::Identifier;
 use iggy_common::IggyError;
+use std::sync::Arc;
 use tracing::info;
 
 impl IggyShard {
@@ -107,6 +108,14 @@ impl IggyShard {
 
         let shards_count = self.get_available_shards_count();
         for (partition_id, stats) in partitions.iter().map(|p| (p.id(), p.stats())) {
+            // Register partition stats in SharedStatsStore for cross-shard visibility
+            self.shared_stats.register_partition_stats(
+                numeric_stream_id,
+                numeric_topic_id,
+                partition_id,
+                Arc::clone(stats),
+            );
+
             let ns = IggyNamespace::new(numeric_stream_id, numeric_topic_id, partition_id);
             let shard_id = ShardId::new(calculate_shard_assignment(&ns, shards_count));
             let is_current_shard = self.id == *shard_id;

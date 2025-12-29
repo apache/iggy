@@ -26,6 +26,7 @@ use crate::streaming::{partitions, streams, topics};
 use err_trail::ErrContext;
 use iggy_common::{CompressionAlgorithm, Identifier, IggyError, IggyExpiry, MaxTopicSize};
 use std::str::FromStr;
+use std::sync::Arc;
 use tracing::info;
 
 impl IggyShard {
@@ -81,10 +82,19 @@ impl IggyShard {
         );
         self.metrics.increment_topics(1);
 
-        // Dual-write: also update SharedMetadata
-        let _ = self.shared_metadata.create_topic(
+        // Register stats in SharedStatsStore for cross-shard visibility
+        self.shared_stats.register_topic_stats(
+            numeric_stream_id,
+            topic.id(),
+            Arc::clone(topic.stats()),
+        );
+
+        // Dual-write: also update SharedMetadata with actual topic ID from slab
+        let _ = self.shared_metadata.add_topic(
             stream_id,
+            topic.id(),
             name,
+            topic.root().created_at(),
             replication_factor.unwrap_or(1),
             message_expiry,
             compression,

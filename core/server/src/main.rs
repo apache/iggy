@@ -34,15 +34,21 @@ use server::configs::sharding::ShardAllocator;
 use server::diagnostics::{print_io_uring_permission_info, print_locked_memory_limit_info};
 use server::io::fs_utils;
 use server::log::logger::Logging;
-use server::metadata::SharedMetadata;
+use server::metadata::{
+    ConsumerGroupMeta, MetadataSnapshot, PartitionMeta, SharedMetadata, SharedStatsStore,
+    StreamMeta, TopicMeta, UserMeta,
+};
 use server::server_error::ServerError;
 use server::shard::namespace::IggyNamespace;
 use server::shard::system::info::SystemInfo;
 use server::shard::transmission::id::ShardId;
 use server::shard::{IggyShard, calculate_shard_assignment};
+use server::slab::Keyed;
+use server::slab::streams::Streams;
 use server::slab::traits_ext::{
     EntityComponentSystem, EntityComponentSystemMutCell, IntoComponents,
 };
+use server::slab::users::Users;
 use server::state::file::FileState;
 use server::state::system::SystemState;
 use server::streaming::clients::client_manager::{Client, ClientManager};
@@ -327,6 +333,14 @@ fn main() -> Result<(), ServerError> {
         let shared_metadata = Box::leak(shared_metadata);
         let shared_metadata: EternalPtr<SharedMetadata> = shared_metadata.into();
 
+        // Create shared stats store for cross-shard stats visibility
+        let shared_stats = Box::new(SharedStatsStore::new());
+        let shared_stats = Box::leak(shared_stats);
+        let shared_stats: EternalPtr<SharedStatsStore> = shared_stats.into();
+
+        // Populate SharedMetadata from loaded state (also registers stats in SharedStatsStore)
+        populate_shared_metadata(&shared_metadata, &shared_stats, &streams, &users);
+
         streams.with_components(|components| {
             let (root, ..) = components.into_components();
             for (_, stream) in root.iter() {
@@ -360,6 +374,7 @@ fn main() -> Result<(), ServerError> {
             let streams = streams.clone();
             let shards_table = shards_table.clone();
             let shared_metadata = shared_metadata.clone();
+            let shared_stats = shared_stats.clone();
             let users = users.clone();
             let connections = connections.clone();
             let config = config.clone();
@@ -425,6 +440,7 @@ fn main() -> Result<(), ServerError> {
                                 .users(users)
                                 .shards_table(shards_table)
                                 .shared_metadata(shared_metadata)
+                                .shared_stats(shared_stats)
                                 .connections(connections)
                                 .clients_manager(client_manager)
                                 .config(config)
@@ -551,4 +567,122 @@ fn main() -> Result<(), ServerError> {
 
         Ok(())
     })
+}
+
+/// Populate SharedMetadata with existing streams and users loaded from state.
+/// Also registers stats in SharedStatsStore for cross-shard visibility.
+fn populate_shared_metadata(
+    shared_metadata: &SharedMetadata,
+    shared_stats: &SharedStatsStore,
+    streams: &Streams,
+    users: &Users,
+) {
+    let mut snapshot = MetadataSnapshot::new();
+    let mut max_stream_id: usize = 0;
+    let mut max_user_id: u32 = 0;
+
+    // Populate streams, topics, partitions, consumer groups
+    streams.with_components(|components| {
+        let (root, stats) = components.into_components();
+        for (idx, stream) in root.iter() {
+            max_stream_id = max_stream_id.max(stream.id());
+
+            // Register stream stats in SharedStatsStore
+            let stream_stats = Arc::clone(&stats[idx]);
+            shared_stats.register_stream_stats(stream.id(), stream_stats);
+
+            let mut stream_meta =
+                StreamMeta::new(stream.id(), stream.name().to_string(), stream.created_at());
+
+            stream.topics().with_components(|topic_components| {
+                let (topic_roots, _topic_aux, topic_stats) = topic_components.into_components();
+                for (topic_idx, topic) in topic_roots.iter() {
+                    // Register topic stats in SharedStatsStore
+                    let topic_stats_arc = Arc::clone(&topic_stats[topic_idx]);
+                    shared_stats.register_topic_stats(stream.id(), topic.id(), topic_stats_arc);
+
+                    let mut topic_meta = TopicMeta::new(
+                        topic.id(),
+                        topic.name().to_string(),
+                        topic.created_at(),
+                        topic.replication_factor(),
+                        topic.message_expiry(),
+                        topic.compression_algorithm(),
+                        topic.max_topic_size(),
+                    );
+
+                    // Add partitions
+                    topic.partitions().with_components(|part_components| {
+                        let (part_roots, part_stats, ..) = part_components.into_components();
+                        for (part_idx, partition) in part_roots.iter() {
+                            // Register partition stats in SharedStatsStore
+                            let part_stats_arc = Arc::clone(&part_stats[part_idx]);
+                            shared_stats.register_partition_stats(
+                                stream.id(),
+                                topic.id(),
+                                partition.id(),
+                                part_stats_arc,
+                            );
+
+                            topic_meta.add_partition(PartitionMeta::new(
+                                partition.id(),
+                                partition.created_at(),
+                            ));
+                        }
+                    });
+
+                    // Add consumer groups
+                    topic.consumer_groups().with_components(|cg_components| {
+                        let (cg_roots, ..) = cg_components.into_components();
+                        for (_, cg) in cg_roots.iter() {
+                            let partition_ids = cg.partitions().clone();
+                            topic_meta.add_consumer_group(ConsumerGroupMeta::new(
+                                cg.id(),
+                                cg.key().clone(),
+                                partition_ids,
+                            ));
+                        }
+                    });
+
+                    stream_meta.add_topic(topic_meta);
+                }
+            });
+
+            let name = stream_meta.name.clone();
+            snapshot.streams.insert(stream.id(), stream_meta);
+            snapshot.stream_index.insert(name, stream.id());
+        }
+    });
+
+    // Populate users
+    for user in users.values() {
+        max_user_id = max_user_id.max(user.id);
+
+        let user_meta = UserMeta::new(
+            user.id,
+            user.username.clone(),
+            user.password.clone(),
+            user.created_at,
+            user.status,
+            user.permissions.clone(),
+        );
+
+        let username = user_meta.username.clone();
+        snapshot.users.insert(user.id, user_meta);
+        snapshot.user_index.insert(username, user.id);
+    }
+
+    // Capture counts before consuming snapshot
+    let streams_count = snapshot.streams.len();
+    let users_count = snapshot.users.len();
+    let next_stream = max_stream_id.saturating_add(1);
+    let next_user = max_user_id.saturating_add(1);
+
+    // Initialize with next IDs = max + 1
+    shared_metadata.init_from_snapshot(snapshot, next_stream, next_user);
+
+    info!(
+        "Populated SharedMetadata: {} streams, {} users (next_stream_id={}, next_user_id={})",
+        streams_count, users_count, next_stream, next_user,
+    );
 }

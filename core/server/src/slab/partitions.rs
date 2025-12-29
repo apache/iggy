@@ -42,6 +42,8 @@ pub type ContainerId = usize;
 
 #[derive(Debug)]
 pub struct Partitions {
+    /// Numeric ID index: logical partition ID → slab position
+    numeric_index: ahash::AHashMap<usize, ContainerId>,
     root: Slab<partition::PartitionRoot>,
     stats: Slab<Arc<PartitionStats>>,
     message_deduplicator: Slab<Option<Arc<MessageDeduplicator>>>,
@@ -60,6 +62,7 @@ pub struct Partitions {
 impl Clone for Partitions {
     fn clone(&self) -> Self {
         Self {
+            numeric_index: self.numeric_index.clone(),
             root: self.root.clone(),
             stats: self.stats.clone(),
             message_deduplicator: self.message_deduplicator.clone(),
@@ -79,40 +82,51 @@ impl Insert for Partitions {
         let (root, stats, deduplicator, offset, consumer_offset, consumer_group_offset, log) =
             item.into_components();
 
-        let entity_id = self.root.insert(root);
-        let id = self.stats.insert(stats);
+        // Check if ID was pre-set (e.g., from metadata during lazy creation)
+        let pre_set_id = root.id();
+
+        let slab_pos = self.root.insert(root);
+        let stats_pos = self.stats.insert(stats);
         assert_eq!(
-            entity_id, id,
-            "partition_insert: id mismatch when creating stats"
+            slab_pos, stats_pos,
+            "partition_insert: position mismatch when creating stats"
         );
-        let id = self.log.insert(log);
+        let log_pos = self.log.insert(log);
         assert_eq!(
-            entity_id, id,
-            "partition_insert: id mismatch when creating log"
+            slab_pos, log_pos,
+            "partition_insert: position mismatch when creating log"
         );
-        let id = self.message_deduplicator.insert(deduplicator);
+        let dedup_pos = self.message_deduplicator.insert(deduplicator);
         assert_eq!(
-            entity_id, id,
-            "partition_insert: id mismatch when creating message_deduplicator"
+            slab_pos, dedup_pos,
+            "partition_insert: position mismatch when creating message_deduplicator"
         );
-        let id = self.offset.insert(offset);
+        let offset_pos = self.offset.insert(offset);
         assert_eq!(
-            entity_id, id,
-            "partition_insert: id mismatch when creating offset"
+            slab_pos, offset_pos,
+            "partition_insert: position mismatch when creating offset"
         );
-        let id = self.consumer_offset.insert(consumer_offset);
+        let consumer_pos = self.consumer_offset.insert(consumer_offset);
         assert_eq!(
-            entity_id, id,
-            "partition_insert: id mismatch when creating consumer_offset"
+            slab_pos, consumer_pos,
+            "partition_insert: position mismatch when creating consumer_offset"
         );
-        let id = self.consumer_group_offset.insert(consumer_group_offset);
+        let cg_pos = self.consumer_group_offset.insert(consumer_group_offset);
         assert_eq!(
-            entity_id, id,
-            "partition_insert: id mismatch when creating consumer_group_offset"
+            slab_pos, cg_pos,
+            "partition_insert: position mismatch when creating consumer_group_offset"
         );
-        let root = self.root.get_mut(entity_id).unwrap();
-        root.update_id(entity_id);
-        entity_id
+
+        let root = self.root.get_mut(slab_pos).unwrap();
+
+        // Use pre-set ID if available, otherwise use slab position
+        let logical_id = if pre_set_id > 0 { pre_set_id } else { slab_pos };
+        root.update_id(logical_id);
+
+        // Update numeric index
+        self.numeric_index.insert(logical_id, slab_pos);
+
+        logical_id
     }
 }
 
@@ -120,14 +134,25 @@ impl Delete for Partitions {
     type Idx = ContainerId;
     type Item = Partition;
 
-    fn delete(&mut self, id: Self::Idx) -> Self::Item {
-        let root = self.root.remove(id);
-        let stats = self.stats.remove(id);
-        let message_deduplicator = self.message_deduplicator.remove(id);
-        let offset = self.offset.remove(id);
-        let consumer_offset = self.consumer_offset.remove(id);
-        let consumer_group_offset = self.consumer_group_offset.remove(id);
-        let log = self.log.remove(id);
+    fn delete(&mut self, logical_id: Self::Idx) -> Self::Item {
+        // Look up slab position from logical ID
+        let slab_pos = *self
+            .numeric_index
+            .get(&logical_id)
+            .expect("partition_delete: logical ID not found in numeric index");
+
+        let root = self.root.remove(slab_pos);
+        let stats = self.stats.remove(slab_pos);
+        let message_deduplicator = self.message_deduplicator.remove(slab_pos);
+        let offset = self.offset.remove(slab_pos);
+        let consumer_offset = self.consumer_offset.remove(slab_pos);
+        let consumer_group_offset = self.consumer_group_offset.remove(slab_pos);
+        let log = self.log.remove(slab_pos);
+
+        // Remove from numeric index
+        self.numeric_index
+            .remove(&logical_id)
+            .expect("partition_delete: ID not found in numeric index");
 
         Partition::new_with_components(
             root,
@@ -197,6 +222,7 @@ impl EntityComponentSystemMut for Partitions {
 impl Default for Partitions {
     fn default() -> Self {
         Self {
+            numeric_index: ahash::AHashMap::with_capacity(PARTITIONS_CAPACITY),
             root: Slab::with_capacity(PARTITIONS_CAPACITY),
             stats: Slab::with_capacity(PARTITIONS_CAPACITY),
             log: Slab::with_capacity(PARTITIONS_CAPACITY),
@@ -223,21 +249,29 @@ impl Partitions {
 
     pub fn with_partition_by_id<T>(
         &self,
-        id: ContainerId,
+        logical_id: ContainerId,
         f: impl FnOnce(ComponentsById<PartitionRef>) -> T,
     ) -> T {
-        self.with_components_by_id(id, |components| f(components))
+        let slab_pos = *self
+            .numeric_index
+            .get(&logical_id)
+            .expect("Partition not found by ID");
+        self.with_components_by_id(slab_pos, |components| f(components))
     }
 
     pub fn exists(&self, id: ContainerId) -> bool {
-        self.root.contains(id)
+        self.numeric_index.contains_key(&id)
     }
 
     pub fn with_partition_by_id_mut<T>(
         &mut self,
-        id: ContainerId,
+        logical_id: ContainerId,
         f: impl FnOnce(ComponentsById<PartitionRefMut>) -> T,
     ) -> T {
-        self.with_components_by_id_mut(id, |components| f(components))
+        let slab_pos = *self
+            .numeric_index
+            .get(&logical_id)
+            .expect("Partition not found by ID");
+        self.with_components_by_id_mut(slab_pos, |components| f(components))
     }
 }

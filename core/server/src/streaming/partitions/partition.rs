@@ -157,7 +157,7 @@ impl Partition {
         }
     }
 
-    pub fn stats(&self) -> &PartitionStats {
+    pub fn stats(&self) -> &Arc<PartitionStats> {
         &self.stats
     }
 }

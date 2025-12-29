@@ -63,6 +63,11 @@ async fn handle_request(
     let partition_id = request.partition_id;
     match request.payload {
         ShardRequestPayload::SendMessages { batch } => {
+            // Lazy init: ensure partition exists locally
+            shard
+                .ensure_local_partition(&stream_id, &topic_id, partition_id)
+                .await?;
+
             let ns = IggyFullNamespace::new(stream_id, topic_id, partition_id);
             let batch = shard.maybe_encrypt_messages(batch)?;
             let messages_count = batch.count();
@@ -74,6 +79,11 @@ async fn handle_request(
             Ok(ShardResponse::SendMessages)
         }
         ShardRequestPayload::PollMessages { args, consumer } => {
+            // Lazy init: ensure partition exists locally
+            shard
+                .ensure_local_partition(&stream_id, &topic_id, partition_id)
+                .await?;
+
             let auto_commit = args.auto_commit;
             let ns = IggyFullNamespace::new(stream_id, topic_id, partition_id);
             let (metadata, batches) = shard.streams.poll_messages(&ns, consumer, args).await?;
@@ -97,12 +107,22 @@ async fn handle_request(
             Ok(ShardResponse::PollMessages((metadata, batches)))
         }
         ShardRequestPayload::FlushUnsavedBuffer { fsync } => {
+            // Lazy init: ensure partition exists locally
+            shard
+                .ensure_local_partition(&stream_id, &topic_id, partition_id)
+                .await?;
+
             shard
                 .flush_unsaved_buffer_base(&stream_id, &topic_id, partition_id, fsync)
                 .await?;
             Ok(ShardResponse::FlushUnsavedBuffer)
         }
         ShardRequestPayload::DeleteSegments { segments_count } => {
+            // Lazy init: ensure partition exists locally
+            shard
+                .ensure_local_partition(&stream_id, &topic_id, partition_id)
+                .await?;
+
             shard
                 .delete_segments_base(&stream_id, &topic_id, partition_id, segments_count)
                 .await?;
@@ -296,6 +316,11 @@ async fn handle_request(
             let registry = shard.task_registry.clone();
             let registry_clone = registry.clone();
 
+            // Lazy init: ensure partition exists locally
+            shard
+                .ensure_local_partition(&stream_id, &topic_id, partition_id)
+                .await?;
+
             let ns = IggyFullNamespace::new(stream_id, topic_id, partition_id);
             let batch = shard.maybe_encrypt_messages(initial_data)?;
             let messages_count = batch.count();
@@ -356,31 +381,6 @@ pub async fn handle_event(shard: &Rc<IggyShard>, event: ShardEvent) -> Result<()
             shard
                 .flush_unsaved_buffer_base(&stream_id, &topic_id, partition_id, fsync)
                 .await?;
-            Ok(())
-        }
-        ShardEvent::AddressBound { protocol, address } => {
-            info!(
-                "Received AddressBound event for {:?} with address: {}",
-                protocol, address
-            );
-            match protocol {
-                TransportProtocol::Tcp => {
-                    shard.tcp_bound_address.set(Some(address));
-                    let _ = shard.config_writer_notify.try_send(());
-                }
-                TransportProtocol::Quic => {
-                    shard.quic_bound_address.set(Some(address));
-                    let _ = shard.config_writer_notify.try_send(());
-                }
-                TransportProtocol::Http => {
-                    shard.http_bound_address.set(Some(address));
-                    let _ = shard.config_writer_notify.try_send(());
-                }
-                TransportProtocol::WebSocket => {
-                    shard.websocket_bound_address.set(Some(address));
-                    let _ = shard.config_writer_notify.try_send(());
-                }
-            }
             Ok(())
         }
     }

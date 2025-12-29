@@ -131,16 +131,21 @@ impl SharedMetadata {
 
     // Stream operations
 
-    /// Create a new stream. Returns the created stream metadata.
-    pub fn create_stream(&self, name: String) -> Result<StreamMeta, IggyError> {
+    /// Add a stream with a specific ID (used by dual-write from shard 0).
+    /// The ID should come from the actual slab allocation.
+    pub fn add_stream(
+        &self,
+        id: usize,
+        name: String,
+        created_at: IggyTimestamp,
+    ) -> Result<StreamMeta, IggyError> {
         let current = self.inner.load();
 
         if current.stream_exists_by_name(&name) {
             return Err(IggyError::StreamNameAlreadyExists(name));
         }
 
-        let id = self.next_stream_id.fetch_add(1, Ordering::SeqCst);
-        let stream = StreamMeta::new(id, name.clone(), IggyTimestamp::now());
+        let stream = StreamMeta::new(id, name.clone(), created_at);
 
         let mut new_snapshot = (**current).clone();
         new_snapshot.stream_index.insert(name, id);
@@ -149,6 +154,13 @@ impl SharedMetadata {
         self.inner.store(Arc::new(new_snapshot));
 
         Ok(stream)
+    }
+
+    /// Create a new stream with auto-generated ID.
+    /// Primarily for tests - production code should use `add_stream` with the actual slab ID.
+    pub fn create_stream(&self, name: String) -> Result<StreamMeta, IggyError> {
+        let id = self.next_stream_id.fetch_add(1, Ordering::SeqCst);
+        self.add_stream(id, name, IggyTimestamp::now())
     }
 
     /// Delete a stream. Returns the deleted stream metadata.
@@ -207,12 +219,15 @@ impl SharedMetadata {
 
     // Topic operations
 
-    /// Create a new topic in a stream.
+    /// Add a topic with a specific ID (used by dual-write from shard 0).
+    /// The ID should come from the actual slab allocation.
     #[allow(clippy::too_many_arguments)]
-    pub fn create_topic(
+    pub fn add_topic(
         &self,
         stream_id: &Identifier,
+        topic_id: usize,
         name: String,
+        created_at: IggyTimestamp,
         replication_factor: u8,
         message_expiry: IggyExpiry,
         compression_algorithm: CompressionAlgorithm,
@@ -229,12 +244,10 @@ impl SharedMetadata {
             return Err(IggyError::TopicNameAlreadyExists(name, stream_id.clone()));
         }
 
-        // Topic IDs are sequential within a stream
-        let topic_id = stream.topics.len();
         let topic = TopicMeta::new(
             topic_id,
             name.clone(),
-            IggyTimestamp::now(),
+            created_at,
             replication_factor,
             message_expiry,
             compression_algorithm,
@@ -251,6 +264,37 @@ impl SharedMetadata {
         self.inner.store(Arc::new(new_snapshot));
 
         Ok(topic)
+    }
+
+    /// Create a new topic with auto-generated ID.
+    /// Primarily for tests - production code should use `add_topic` with the actual slab ID.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_topic(
+        &self,
+        stream_id: &Identifier,
+        name: String,
+        replication_factor: u8,
+        message_expiry: IggyExpiry,
+        compression_algorithm: CompressionAlgorithm,
+        max_topic_size: MaxTopicSize,
+    ) -> Result<TopicMeta, IggyError> {
+        let current = self.inner.load();
+        let stream_idx = current
+            .get_stream_id(stream_id)
+            .ok_or_else(|| IggyError::StreamIdNotFound(stream_id.clone()))?;
+        let stream = current.streams.get(&stream_idx).unwrap();
+        let topic_id = stream.topics.len();
+
+        self.add_topic(
+            stream_id,
+            topic_id,
+            name,
+            IggyTimestamp::now(),
+            replication_factor,
+            message_expiry,
+            compression_algorithm,
+            max_topic_size,
+        )
     }
 
     /// Delete a topic from a stream.

@@ -121,7 +121,7 @@ impl Topic {
         &mut self.root
     }
 
-    pub fn stats(&self) -> &TopicStats {
+    pub fn stats(&self) -> &Arc<TopicStats> {
         &self.stats
     }
 }

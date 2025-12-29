@@ -45,8 +45,14 @@ impl IggyShard {
         let stream = stream::create_and_insert_stream_mem(&self.streams, name.clone());
         self.metrics.increment_streams(1);
 
+        // Register stats in SharedStatsStore for cross-shard visibility
+        self.shared_stats
+            .register_stream_stats(stream.id(), stream.stats().clone());
+
         // Dual-write: also update SharedMetadata for consistent cross-shard reads
-        let _ = self.shared_metadata.create_stream(name);
+        let _ = self
+            .shared_metadata
+            .add_stream(stream.id(), name, stream.root().created_at());
 
         create_stream_file_hierarchy(stream.id(), &self.config.system).await?;
         Ok(stream)

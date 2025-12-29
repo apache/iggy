@@ -15,8 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use iggy_common::{Identifier, TransportProtocol};
-use std::net::SocketAddr;
+use iggy_common::Identifier;
 use strum::Display;
 
 #[derive(Debug, Clone, Display)]
@@ -27,9 +26,5 @@ pub enum ShardEvent {
         topic_id: Identifier,
         partition_id: usize,
         fsync: bool,
-    },
-    AddressBound {
-        protocol: TransportProtocol,
-        address: SocketAddr,
     },
 }

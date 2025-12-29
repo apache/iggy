@@ -45,7 +45,10 @@ pub type ContainerId = usize;
 
 #[derive(Debug, Clone)]
 pub struct Topics {
+    /// Name index: topic name → slab position
     index: RefCell<AHashMap<<topic::TopicRoot as Keyed>::Key, ContainerId>>,
+    /// Numeric ID index: logical topic ID → slab position
+    numeric_index: RefCell<AHashMap<usize, ContainerId>>,
     root: RefCell<Slab<topic::TopicRoot>>,
     auxilaries: RefCell<Slab<topic::TopicAuxilary>>,
     stats: RefCell<Slab<Arc<TopicStats>>>,
@@ -59,25 +62,37 @@ impl InsertCell for Topics {
         let (root, auxilary, stats) = item.into_components();
         let mut root_container = self.root.borrow_mut();
         let mut auxilaries = self.auxilaries.borrow_mut();
-        let mut indexes = self.index.borrow_mut();
+        let mut name_index = self.index.borrow_mut();
+        let mut numeric_index = self.numeric_index.borrow_mut();
         let mut stats_container = self.stats.borrow_mut();
 
+        // Check if ID was pre-set (e.g., from metadata during lazy creation)
+        let pre_set_id = root.id();
+
         let key = root.key().clone();
-        let entity_id = root_container.insert(root);
-        let id = stats_container.insert(stats);
+        let slab_pos = root_container.insert(root);
+        let stats_pos = stats_container.insert(stats);
         assert_eq!(
-            entity_id, id,
-            "topic_insert: id mismatch when inserting stats component"
+            slab_pos, stats_pos,
+            "topic_insert: position mismatch when inserting stats component"
         );
-        let id = auxilaries.insert(auxilary);
+        let aux_pos = auxilaries.insert(auxilary);
         assert_eq!(
-            entity_id, id,
-            "topic_insert: id mismatch when inserting auxilary component"
+            slab_pos, aux_pos,
+            "topic_insert: position mismatch when inserting auxilary component"
         );
-        let root = root_container.get_mut(entity_id).unwrap();
-        root.update_id(entity_id);
-        indexes.insert(key, entity_id);
-        entity_id
+
+        let root = root_container.get_mut(slab_pos).unwrap();
+
+        // Use pre-set ID if available, otherwise use slab position
+        let logical_id = if pre_set_id > 0 { pre_set_id } else { slab_pos };
+        root.update_id(logical_id);
+
+        // Update both indexes
+        name_index.insert(key, slab_pos);
+        numeric_index.insert(logical_id, slab_pos);
+
+        logical_id
     }
 }
 
@@ -85,24 +100,33 @@ impl DeleteCell for Topics {
     type Idx = ContainerId;
     type Item = topic::Topic;
 
-    fn delete(&self, id: Self::Idx) -> Self::Item {
+    fn delete(&self, logical_id: Self::Idx) -> Self::Item {
         let mut root_container = self.root.borrow_mut();
         let mut auxilaries = self.auxilaries.borrow_mut();
-        let mut indexes = self.index.borrow_mut();
+        let mut name_index = self.index.borrow_mut();
+        let mut numeric_index = self.numeric_index.borrow_mut();
         let mut stats_container = self.stats.borrow_mut();
 
-        let root = root_container.remove(id);
-        let auxilary = auxilaries.remove(id);
-        let stats = stats_container.remove(id);
+        // Look up slab position from logical ID
+        let slab_pos = *numeric_index
+            .get(&logical_id)
+            .expect("topic_delete: logical ID not found in numeric index");
 
-        // Remove from index
+        let root = root_container.remove(slab_pos);
+        let auxilary = auxilaries.remove(slab_pos);
+        let stats = stats_container.remove(slab_pos);
+
+        // Remove from both indexes
         let key = root.key();
-        indexes.remove(key).unwrap_or_else(|| {
+        name_index.remove(key).unwrap_or_else(|| {
             panic!(
                 "topic_delete: key not found with key: {} and id: {}",
-                key, id
+                key, logical_id
             )
         });
+        numeric_index
+            .remove(&logical_id)
+            .expect("topic_delete: ID not found in numeric index");
 
         topic::Topic::new_with_components(root, auxilary, stats)
     }
@@ -130,6 +154,7 @@ impl Default for Topics {
     fn default() -> Self {
         Self {
             index: RefCell::new(AHashMap::with_capacity(CAPACITY)),
+            numeric_index: RefCell::new(AHashMap::with_capacity(CAPACITY)),
             root: RefCell::new(Slab::with_capacity(CAPACITY)),
             auxilaries: RefCell::new(Slab::with_capacity(CAPACITY)),
             stats: RefCell::new(Slab::with_capacity(CAPACITY)),
@@ -173,8 +198,8 @@ impl Topics {
     pub fn exists(&self, id: &Identifier) -> bool {
         match id.kind {
             iggy_common::IdKind::Numeric => {
-                let id = id.get_u32_value().unwrap() as usize;
-                self.root.borrow().contains(id)
+                let logical_id = id.get_u32_value().unwrap() as usize;
+                self.numeric_index.borrow().contains_key(&logical_id)
             }
             iggy_common::IdKind::String => {
                 let key = id.get_string_value().unwrap();
@@ -185,10 +210,21 @@ impl Topics {
 
     pub fn get_index(&self, id: &Identifier) -> usize {
         match id.kind {
-            iggy_common::IdKind::Numeric => id.get_u32_value().unwrap() as usize,
+            iggy_common::IdKind::Numeric => {
+                let logical_id = id.get_u32_value().unwrap() as usize;
+                *self
+                    .numeric_index
+                    .borrow()
+                    .get(&logical_id)
+                    .expect("Topic not found by numeric ID")
+            }
             iggy_common::IdKind::String => {
                 let key = id.get_string_value().unwrap();
-                *self.index.borrow().get(&key).expect("Topic not found")
+                *self
+                    .index
+                    .borrow()
+                    .get(&key)
+                    .expect("Topic not found by name")
             }
         }
     }
