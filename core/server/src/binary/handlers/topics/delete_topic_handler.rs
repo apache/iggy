@@ -23,7 +23,6 @@ use crate::binary::handlers::topics::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 
 use crate::shard::IggyShard;
-use crate::shard::transmission::event::ShardEvent;
 use crate::shard::transmission::frame::ShardResponse;
 use crate::shard::transmission::message::{
     ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult,
@@ -90,13 +89,6 @@ impl ServerCommandHandler for DeleteTopic {
                         topic_id_num,
                         stream_id_num
                     );
-
-                    let event = ShardEvent::DeletedTopic {
-                        id: topic_id_num,
-                        stream_id: stream_id.clone(),
-                        topic_id: topic_id.clone(),
-                    };
-                    shard.broadcast_event_to_all_shards(event).await?;
 
                     shard
                         .state

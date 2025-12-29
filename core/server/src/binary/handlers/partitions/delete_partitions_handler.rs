@@ -23,7 +23,6 @@ use crate::binary::handlers::partitions::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 
 use crate::shard::IggyShard;
-use crate::shard::transmission::event::ShardEvent;
 use crate::state::command::EntryCommand;
 use crate::streaming::session::Session;
 use anyhow::Result;
@@ -53,7 +52,7 @@ impl ServerCommandHandler for DeletePartitions {
         // Acquire partition lock to serialize filesystem operations
         let _partition_guard = shard.fs_locks.partition_lock.lock().await;
 
-        let deleted_partition_ids = shard
+        let _deleted_partition_ids = shard
             .delete_partitions(
                 session,
                 &self.stream_id,
@@ -61,13 +60,6 @@ impl ServerCommandHandler for DeletePartitions {
                 self.partitions_count,
             )
             .await?;
-        let event = ShardEvent::DeletedPartitions {
-            stream_id: self.stream_id.clone(),
-            topic_id: self.topic_id.clone(),
-            partitions_count: self.partitions_count,
-            partition_ids: deleted_partition_ids,
-        };
-        shard.broadcast_event_to_all_shards(event).await?;
 
         let remaining_partition_ids = shard.streams.with_topic_by_id(
             &self.stream_id,

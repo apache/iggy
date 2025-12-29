@@ -24,7 +24,6 @@ use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
 
 use crate::shard::IggyShard;
-use crate::shard::transmission::event::ShardEvent;
 use crate::shard::transmission::frame::ShardResponse;
 use crate::shard::transmission::message::{
     ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult,
@@ -76,12 +75,6 @@ impl ServerCommandHandler for CreateStream {
 
                     let stream = shard.create_stream(session, name).await?;
                     let created_stream_id = stream.id();
-
-                    let event = ShardEvent::CreatedStream {
-                        id: created_stream_id,
-                        stream: stream.clone(),
-                    };
-                    shard.broadcast_event_to_all_shards(event).await?;
 
                     let response = shard
                         .streams

@@ -20,7 +20,6 @@ use crate::http::COMPONENT;
 use crate::http::error::CustomError;
 use crate::http::jwt::json_web_token::Identity;
 use crate::http::shared::AppState;
-use crate::shard::transmission::event::ShardEvent;
 use crate::state::command::EntryCommand;
 use crate::streaming::session::Session;
 use axum::extract::{Path, Query, State};
@@ -59,7 +58,7 @@ async fn create_partitions(
 
     let _parititon_guard = state.shard.shard().fs_locks.partition_lock.lock().await;
     let session = Session::stateless(identity.user_id, identity.ip_address);
-    let partitions = SendWrapper::new(state.shard.shard().create_partitions(
+    let _partitions = SendWrapper::new(state.shard.shard().create_partitions(
         &session,
         &command.stream_id,
         &command.topic_id,
@@ -67,24 +66,6 @@ async fn create_partitions(
     ))
     .await?;
 
-    let broadcast_future = SendWrapper::new(async {
-        let shard = state.shard.shard();
-
-        let event = ShardEvent::CreatedPartitions {
-            stream_id: command.stream_id.clone(),
-            topic_id: command.topic_id.clone(),
-            partitions,
-        };
-        let _responses = shard.broadcast_event_to_all_shards(event).await;
-        Ok::<(), CustomError>(())
-    });
-
-    broadcast_future.await
-            .with_error(|error| {
-                format!(
-                    "{COMPONENT} (error: {error}) - failed to broadcast partition events, stream ID: {stream_id}, topic ID: {topic_id}"
-                )
-            })?;
     let command = EntryCommand::CreatePartitions(command);
     let state_future =
         SendWrapper::new(state.shard.shard().state.apply(identity.user_id, &command));
@@ -112,7 +93,7 @@ async fn delete_partitions(
     query.validate()?;
 
     let session = Session::stateless(identity.user_id, identity.ip_address);
-    let deleted_partition_ids = {
+    {
         let delete_future = SendWrapper::new(state.shard.shard().delete_partitions(
             &session,
             &query.stream_id,
@@ -126,24 +107,6 @@ async fn delete_partitions(
             )
         })?
     };
-
-    // Send event for partition deletion
-    {
-        let broadcast_future = SendWrapper::new(async {
-            let event = ShardEvent::DeletedPartitions {
-                stream_id: query.stream_id.clone(),
-                topic_id: query.topic_id.clone(),
-                partitions_count: query.partitions_count,
-                partition_ids: deleted_partition_ids,
-            };
-            let _responses = state
-                .shard
-                .shard()
-                .broadcast_event_to_all_shards(event)
-                .await;
-        });
-        broadcast_future.await;
-    }
 
     let command = EntryCommand::DeletePartitions(DeletePartitions {
         stream_id: query.stream_id.clone(),

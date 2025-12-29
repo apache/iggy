@@ -23,7 +23,6 @@ use crate::binary::handlers::partitions::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 
 use crate::shard::IggyShard;
-use crate::shard::transmission::event::ShardEvent;
 use crate::slab::traits_ext::EntityMarker;
 use crate::state::command::EntryCommand;
 use crate::streaming::session::Session;
@@ -62,12 +61,6 @@ impl ServerCommandHandler for CreatePartitions {
             )
             .await?;
         let partition_ids = partitions.iter().map(|p| p.id()).collect::<Vec<_>>();
-        let event = ShardEvent::CreatedPartitions {
-            stream_id: self.stream_id.clone(),
-            topic_id: self.topic_id.clone(),
-            partitions,
-        };
-        shard.broadcast_event_to_all_shards(event).await?;
 
         shard.streams.with_topic_by_id_mut(
             &self.stream_id,

@@ -24,7 +24,6 @@ use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
 
 use crate::shard::IggyShard;
-use crate::shard::transmission::event::ShardEvent;
 use crate::state::command::EntryCommand;
 use crate::state::models::CreatePersonalAccessTokenWithHash;
 use crate::streaming::session::Session;
@@ -60,10 +59,6 @@ impl ServerCommandHandler for CreatePersonalAccessToken {
                 })?;
         let bytes = mapper::map_raw_pat(&token);
         let hash = personal_access_token.token.to_string();
-        let event = ShardEvent::CreatedPersonalAccessToken {
-            personal_access_token: personal_access_token.clone(),
-        };
-        shard.broadcast_event_to_all_shards(event).await?;
 
         shard
             .state

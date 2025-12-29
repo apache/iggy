@@ -22,7 +22,6 @@ use crate::binary::command::{
 use crate::binary::handlers::streams::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::shard::IggyShard;
-use crate::shard::transmission::event::ShardEvent;
 use crate::shard::transmission::frame::ShardResponse;
 use crate::shard::transmission::message::{
     ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult,
@@ -82,12 +81,6 @@ impl ServerCommandHandler for DeleteStream {
                         stream.root().name(),
                         stream.id()
                     );
-
-                    let event = ShardEvent::DeletedStream {
-                        id: stream.id(),
-                        stream_id: stream_id.clone(),
-                    };
-                    shard.broadcast_event_to_all_shards(event).await?;
 
                     shard
                         .state

@@ -23,7 +23,6 @@ use crate::binary::handlers::consumer_groups::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
 use crate::shard::IggyShard;
-use crate::shard::transmission::event::ShardEvent;
 use crate::slab::traits_ext::EntityMarker;
 use crate::state::command::EntryCommand;
 use crate::state::models::CreateConsumerGroupWithId;
@@ -56,13 +55,6 @@ impl ServerCommandHandler for CreateConsumerGroup {
             self.name.clone(),
         )?;
         let cg_id = cg.id();
-
-        let event = ShardEvent::CreatedConsumerGroup {
-            stream_id: self.stream_id.clone(),
-            topic_id: self.topic_id.clone(),
-            cg,
-        };
-        shard.broadcast_event_to_all_shards(event).await?;
 
         let stream_id = self.stream_id.clone();
         let topic_id = self.topic_id.clone();

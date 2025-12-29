@@ -23,7 +23,6 @@ use crate::binary::handlers::topics::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 
 use crate::shard::IggyShard;
-use crate::shard::transmission::event::ShardEvent;
 use crate::shard::transmission::frame::ShardResponse;
 use crate::shard::transmission::message::{
     ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult,
@@ -116,17 +115,6 @@ impl ServerCommandHandler for UpdateTopic {
                     let stream_id_num = shard
                         .streams
                         .with_stream_by_id(&stream_id, streams::helpers::get_stream_id());
-
-                    let event = ShardEvent::UpdatedTopic {
-                        stream_id: stream_id.clone(),
-                        topic_id: topic_id.clone(),
-                        name: name.clone(),
-                        message_expiry: self.message_expiry,
-                        compression_algorithm: self.compression_algorithm,
-                        max_topic_size: self.max_topic_size,
-                        replication_factor: self.replication_factor,
-                    };
-                    shard.broadcast_event_to_all_shards(event).await?;
 
                     shard
                         .state

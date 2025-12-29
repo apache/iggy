@@ -23,7 +23,6 @@ use crate::binary::handlers::consumer_groups::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 
 use crate::shard::IggyShard;
-use crate::shard::transmission::event::ShardEvent;
 use crate::slab::traits_ext::EntityMarker;
 use crate::state::command::EntryCommand;
 use crate::streaming::polling_consumer::ConsumerGroupId;
@@ -102,13 +101,6 @@ impl ServerCommandHandler for DeleteConsumerGroup {
             )
         })?;
 
-        let event = ShardEvent::DeletedConsumerGroup {
-            id: cg_id,
-            stream_id: self.stream_id.clone(),
-            topic_id: self.topic_id.clone(),
-            group_id: self.group_id.clone(),
-        };
-        shard.broadcast_event_to_all_shards(event).await?;
         let stream_id = self.stream_id.clone();
         let topic_id = self.topic_id.clone();
         shard

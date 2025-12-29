@@ -58,12 +58,6 @@ impl ServerCommandHandler for PurgeTopic {
                 )
             })?;
 
-        let event = crate::shard::transmission::event::ShardEvent::PurgedTopic {
-            stream_id: self.stream_id.clone(),
-            topic_id: self.topic_id.clone(),
-        };
-        shard.broadcast_event_to_all_shards(event).await?;
-
         shard
             .state
             .apply(session.get_user_id(), &EntryCommand::PurgeTopic(self))

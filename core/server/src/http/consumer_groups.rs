@@ -180,24 +180,6 @@ async fn create_consumer_group(
 
     let group_id = consumer_group.id();
 
-    // Send event for consumer group creation
-    {
-        let broadcast_future = SendWrapper::new(async {
-            use crate::shard::transmission::event::ShardEvent;
-            let event = ShardEvent::CreatedConsumerGroup {
-                stream_id: command.stream_id.clone(),
-                topic_id: command.topic_id.clone(),
-                cg: consumer_group.clone(),
-            };
-            let _responses = state
-                .shard
-                .shard()
-                .broadcast_event_to_all_shards(event)
-                .await;
-        });
-        broadcast_future.await;
-    }
-
     // Get the created consumer group details
     let group_id_identifier = Identifier::numeric(group_id as u32).unwrap();
     let consumer_group_details = state.shard.shard().streams.with_consumer_group_by_id(
@@ -295,25 +277,6 @@ async fn delete_consumer_group(
                 identifier_topic_id
             )
         })?;
-
-        // Send event for consumer group deletion
-        {
-            let broadcast_future = SendWrapper::new(async {
-                use crate::shard::transmission::event::ShardEvent;
-                let event = ShardEvent::DeletedConsumerGroup {
-                    id: cg_id,
-                    stream_id: identifier_stream_id.clone(),
-                    topic_id: identifier_topic_id.clone(),
-                    group_id: identifier_group_id.clone(),
-                };
-                let _responses = state
-                    .shard
-                    .shard()
-                    .broadcast_event_to_all_shards(event)
-                    .await;
-            });
-            broadcast_future.await;
-        }
 
         // Apply state change
         let entry_command = EntryCommand::DeleteConsumerGroup(DeleteConsumerGroup {

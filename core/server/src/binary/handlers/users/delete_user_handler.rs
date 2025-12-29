@@ -25,7 +25,6 @@ use crate::binary::handlers::users::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 
 use crate::shard::IggyShard;
-use crate::shard::transmission::event::ShardEvent;
 use crate::shard::transmission::frame::ShardResponse;
 use crate::shard::transmission::message::{
     ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult,
@@ -81,8 +80,6 @@ impl ServerCommandHandler for DeleteUser {
                     })?;
 
                     info!("Deleted user: {} with ID: {}.", user.username, user.id);
-                    let event = ShardEvent::DeletedUser { user_id };
-                    shard.broadcast_event_to_all_shards(event).await?;
 
                     shard
                         .state

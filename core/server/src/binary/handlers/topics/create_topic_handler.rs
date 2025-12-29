@@ -24,7 +24,6 @@ use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
 
 use crate::shard::IggyShard;
-use crate::shard::transmission::event::ShardEvent;
 use crate::shard::transmission::frame::ShardResponse;
 use crate::shard::transmission::message::{
     ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult,
@@ -109,13 +108,7 @@ impl ServerCommandHandler for CreateTopic {
                         .with_stream_by_id(&stream_id, streams::helpers::get_stream_id());
                     let topic_id = topic.id();
 
-                    let event = ShardEvent::CreatedTopic {
-                        stream_id: stream_id.clone(),
-                        topic,
-                    };
-
-                    shard.broadcast_event_to_all_shards(event).await?;
-                    let partitions = shard
+                    shard
                         .create_partitions(
                             session,
                             &stream_id,
@@ -123,12 +116,6 @@ impl ServerCommandHandler for CreateTopic {
                             partitions_count,
                         )
                         .await?;
-                    let event = ShardEvent::CreatedPartitions {
-                        stream_id: stream_id.clone(),
-                        topic_id: Identifier::numeric(topic_id as u32).unwrap(),
-                        partitions,
-                    };
-                    shard.broadcast_event_to_all_shards(event).await?;
 
                     let response = shard.streams.with_topic_by_id(
                         &stream_id,
