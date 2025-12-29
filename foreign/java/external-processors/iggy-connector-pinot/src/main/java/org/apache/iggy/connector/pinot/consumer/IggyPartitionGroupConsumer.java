@@ -144,7 +144,6 @@ public class IggyPartitionGroupConsumer implements PartitionGroupConsumer {
         }
     }
 
-
     /**
      * Determines the starting offset for polling.
      */
