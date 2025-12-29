@@ -33,6 +33,7 @@ pub struct MessagesWriter {
     file: File,
     messages_size_bytes: Rc<AtomicU64>,
     fsync: bool,
+    pub lock: tokio::sync::Mutex<()>,
 }
 
 // Safety: We are guaranteeing that MessagesWriter will never be used from multiple threads
@@ -86,6 +87,7 @@ impl MessagesWriter {
             file,
             messages_size_bytes,
             fsync,
+            lock: tokio::sync::Mutex::new(()),
         })
     }
 

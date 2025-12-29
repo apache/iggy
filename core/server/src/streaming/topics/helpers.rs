@@ -281,31 +281,29 @@ fn delete_member(
     members: &mut ConsumerGroupMembers,
     partitions: &[usize],
 ) -> Option<usize> {
-    let member_ids: Vec<usize> = members
-        .inner()
-        .shared_get()
-        .iter()
-        .filter_map(|(_, member)| (member.client_id == client_id).then_some(member.id))
-        .collect();
+    let mut member_id = None;
+    members.inner_mut().rcu(|inner| {
+        let member_ids: Vec<usize> = inner
+            .iter()
+            .filter_map(|(_, member)| (member.client_id == client_id).then_some(member.id))
+            .collect();
 
-    if member_ids.is_empty() {
-        return None;
-    }
-
-    members.inner_mut().rcu(|members| {
-        let mut members = mimic_members(members);
-        for member_id in &member_ids {
-            members.remove(*member_id);
+        let mut members = mimic_members(inner);
+        if !member_ids.is_empty() {
+            member_id = member_ids.first().cloned();
+            for member_id in &member_ids {
+                members.remove(*member_id);
+            }
+            members.compact(|entry, _, idx| {
+                entry.id = idx;
+                true
+            });
+            assign_partitions_to_members(id, &mut members, partitions);
+            return members;
         }
-        members.compact(|entry, _, idx| {
-            entry.id = idx;
-            true
-        });
-        assign_partitions_to_members(id, &mut members, partitions);
         members
     });
-
-    Some(member_ids[0])
+    member_id
 }
 
 fn assign_partitions_to_members(id: usize, members: &mut Slab<Member>, partitions: &[usize]) {
