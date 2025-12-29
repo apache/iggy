@@ -86,7 +86,6 @@ runs:
       uses: ./.github/actions/utils/server-start
       env:
         IGGY_CLUSTER_ENABLED: true
-      continue-on-error: true
 
     - name: E2E tests
       if: inputs.task == 'e2e'
@@ -99,7 +98,7 @@ runs:
       shell: bash
 
     - name: Stop Iggy server
-      if: inputs.task == 'e2e'
+      if: always() && inputs.task == 'e2e'
       uses: ./.github/actions/utils/server-stop
       with:
         pid-file: ${{ steps.iggy.outputs.pid_file }}
