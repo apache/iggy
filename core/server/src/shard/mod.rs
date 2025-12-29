@@ -33,6 +33,7 @@ use self::tasks::{continuous, periodic};
 use crate::{
     configs::server::ServerConfig,
     io::fs_locks::FsLocks,
+    metadata::SharedMetadata,
     shard::{
         namespace::IggyNamespace, task_registry::TaskRegistry, transmission::frame::ShardFrame,
     },
@@ -72,6 +73,9 @@ pub struct IggyShard {
     pub(crate) streams: Streams,
     pub(crate) shards_table: EternalPtr<DashMap<IggyNamespace, ShardId>>,
     pub(crate) state: FileState,
+
+    /// Shared metadata accessible by all shards (ArcSwap-based).
+    pub(crate) shared_metadata: EternalPtr<SharedMetadata>,
 
     pub(crate) fs_locks: FsLocks,
     pub(crate) encryptor: Option<EncryptorKind>,

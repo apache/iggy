@@ -22,6 +22,7 @@ use super::{
 };
 use crate::{
     configs::server::ServerConfig,
+    metadata::SharedMetadata,
     shard::namespace::IggyNamespace,
     slab::{streams::Streams, users::Users},
     state::file::FileState,
@@ -40,6 +41,7 @@ pub struct IggyShardBuilder {
     id: Option<u16>,
     streams: Option<Streams>,
     shards_table: Option<EternalPtr<DashMap<IggyNamespace, ShardId>>>,
+    shared_metadata: Option<EternalPtr<SharedMetadata>>,
     state: Option<FileState>,
     users: Option<Users>,
     client_manager: Option<ClientManager>,
@@ -72,6 +74,11 @@ impl IggyShardBuilder {
         shards_table: EternalPtr<DashMap<IggyNamespace, ShardId>>,
     ) -> Self {
         self.shards_table = Some(shards_table);
+        self
+    }
+
+    pub fn shared_metadata(mut self, shared_metadata: EternalPtr<SharedMetadata>) -> Self {
+        self.shared_metadata = Some(shared_metadata);
         self
     }
 
@@ -120,6 +127,7 @@ impl IggyShardBuilder {
         let id = self.id.unwrap();
         let streams = self.streams.unwrap();
         let shards_table = self.shards_table.unwrap();
+        let shared_metadata = self.shared_metadata.unwrap();
         let state = self.state.unwrap();
         let users = self.users.unwrap();
         let config = self.config.unwrap();
@@ -154,6 +162,7 @@ impl IggyShardBuilder {
             id,
             shards,
             shards_table,
+            shared_metadata,
             streams, // TODO: Fixme
             users,
             fs_locks: Default::default(),

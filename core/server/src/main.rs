@@ -34,6 +34,7 @@ use server::configs::sharding::ShardAllocator;
 use server::diagnostics::{print_io_uring_permission_info, print_locked_memory_limit_info};
 use server::io::fs_utils;
 use server::log::logger::Logging;
+use server::metadata::SharedMetadata;
 use server::server_error::ServerError;
 use server::shard::namespace::IggyNamespace;
 use server::shard::system::info::SystemInfo;
@@ -321,6 +322,11 @@ fn main() -> Result<(), ServerError> {
         let client_manager: EternalPtr<DashMap<u32, Client>> = client_manager.into();
         let client_manager = ClientManager::new(client_manager);
 
+        // Create shared metadata for all shards (ArcSwap-based lock-free reads)
+        let shared_metadata = Box::new(SharedMetadata::new());
+        let shared_metadata = Box::leak(shared_metadata);
+        let shared_metadata: EternalPtr<SharedMetadata> = shared_metadata.into();
+
         streams.with_components(|components| {
             let (root, ..) = components.into_components();
             for (_, stream) in root.iter() {
@@ -353,6 +359,7 @@ fn main() -> Result<(), ServerError> {
         {
             let streams = streams.clone();
             let shards_table = shards_table.clone();
+            let shared_metadata = shared_metadata.clone();
             let users = users.clone();
             let connections = connections.clone();
             let config = config.clone();
@@ -417,6 +424,7 @@ fn main() -> Result<(), ServerError> {
                                 .state(state)
                                 .users(users)
                                 .shards_table(shards_table)
+                                .shared_metadata(shared_metadata)
                                 .connections(connections)
                                 .clients_manager(client_manager)
                                 .config(config)

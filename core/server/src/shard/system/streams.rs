@@ -42,8 +42,12 @@ impl IggyShard {
         if exists {
             return Err(IggyError::StreamNameAlreadyExists(name));
         }
-        let stream = stream::create_and_insert_stream_mem(&self.streams, name);
+        let stream = stream::create_and_insert_stream_mem(&self.streams, name.clone());
         self.metrics.increment_streams(1);
+
+        // Dual-write: also update SharedMetadata for consistent cross-shard reads
+        let _ = self.shared_metadata.create_stream(name);
+
         create_stream_file_hierarchy(stream.id(), &self.config.system).await?;
         Ok(stream)
     }
@@ -100,8 +104,12 @@ impl IggyShard {
         self.streams.with_index_mut(|index| {
             // Rename the key inside of hashmap
             let idx = index.remove(&old_name).expect("Rename key: key not found");
-            index.insert(name, idx);
+            index.insert(name.clone(), idx);
         });
+
+        // Dual-write: also update SharedMetadata
+        let _ = self.shared_metadata.update_stream(id, name);
+
         Ok(())
     }
 
@@ -146,6 +154,9 @@ impl IggyShard {
             })?;
         let mut stream = self.delete_stream_base(id);
         let stream_id_usize = stream.id();
+
+        // Dual-write: also delete from SharedMetadata
+        let _ = self.shared_metadata.delete_stream(id);
 
         // Clean up consumer groups from ClientManager for this stream
         self.client_manager

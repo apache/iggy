@@ -72,7 +72,7 @@ impl IggyShard {
         let topic = topic::create_and_insert_topics_mem(
             &self.streams,
             stream_id,
-            name,
+            name.clone(),
             replication_factor.unwrap_or(1),
             message_expiry,
             compression,
@@ -80,6 +80,16 @@ impl IggyShard {
             parent_stats,
         );
         self.metrics.increment_topics(1);
+
+        // Dual-write: also update SharedMetadata
+        let _ = self.shared_metadata.create_topic(
+            stream_id,
+            name,
+            replication_factor.unwrap_or(1),
+            message_expiry,
+            compression,
+            max_topic_size,
+        );
 
         // Create file hierarchy for the topic.
         create_topic_file_hierarchy(numeric_stream_id, topic.id(), &self.config.system).await?;
@@ -191,9 +201,20 @@ impl IggyShard {
             self.streams
                 .with_topic_by_id_mut(stream_id, topic_id, update_topic_closure);
         if old_name != new_name {
-            let rename_closure = topics::helpers::rename_index(&old_name, new_name);
+            let rename_closure = topics::helpers::rename_index(&old_name, new_name.clone());
             self.streams.with_topics(stream_id, rename_closure);
         }
+
+        // Dual-write: also update SharedMetadata
+        let _ = self.shared_metadata.update_topic(
+            stream_id,
+            topic_id,
+            Some(name),
+            Some(message_expiry),
+            Some(compression_algorithm),
+            Some(max_topic_size),
+            Some(replication_factor),
+        );
     }
 
     pub async fn delete_topic(
@@ -221,6 +242,9 @@ impl IggyShard {
                 })?;
         let mut topic = self.delete_topic_base(stream_id, topic_id);
         let topic_id_numeric = topic.id();
+
+        // Dual-write: also delete from SharedMetadata
+        let _ = self.shared_metadata.delete_topic(stream_id, topic_id);
 
         // Clean up consumer groups from ClientManager for this topic
         self.client_manager

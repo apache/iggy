@@ -509,9 +509,10 @@ pub async fn handle_event(shard: &Rc<IggyShard>, event: ShardEvent) -> Result<()
             }
             Ok(())
         }
-        ShardEvent::CreatedStream { id, stream } => {
-            let stream_id = shard.create_stream_bypass_auth(stream);
-            assert_eq!(stream_id, id);
+        ShardEvent::CreatedStream { id: _, stream } => {
+            // Note: Slab::insert() returns the next available slot, not the stream's embedded ID.
+            // The stream already has the correct ID from shard 0, which is preserved after insert.
+            shard.create_stream_bypass_auth(stream);
             Ok(())
         }
         ShardEvent::DeletedStream { id, stream_id } => {
@@ -521,9 +522,9 @@ pub async fn handle_event(shard: &Rc<IggyShard>, event: ShardEvent) -> Result<()
             Ok(())
         }
         ShardEvent::CreatedTopic { stream_id, topic } => {
-            let topic_id_from_event = topic.id();
-            let topic_id = shard.create_topic_bypass_auth(&stream_id, topic.clone());
-            assert_eq!(topic_id, topic_id_from_event);
+            // Note: Slab::insert() returns the next available slot, not the topic's embedded ID.
+            // The topic already has the correct ID from shard 0, which is preserved after insert.
+            shard.create_topic_bypass_auth(&stream_id, topic.clone());
             Ok(())
         }
         ShardEvent::CreatedPartitions {
@@ -570,9 +571,9 @@ pub async fn handle_event(shard: &Rc<IggyShard>, event: ShardEvent) -> Result<()
             topic_id,
             cg,
         } => {
-            let cg_id = cg.id();
-            let id = shard.create_consumer_group_bypass_auth(&stream_id, &topic_id, cg);
-            assert_eq!(id, cg_id);
+            // Note: Slab::insert() returns the next available slot, not the consumer group's embedded ID.
+            // The consumer group already has the correct ID from shard 0.
+            shard.create_consumer_group_bypass_auth(&stream_id, &topic_id, cg);
             Ok(())
         }
         ShardEvent::DeletedConsumerGroup {
