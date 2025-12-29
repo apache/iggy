@@ -45,9 +45,9 @@ import java.util.Optional;
  * <p>This consumer manages:
  * <ul>
  *   <li>TCP connection to Iggy server</li>
- *   <li>Consumer group membership</li>
- *   <li>Message polling with offset tracking</li>
- *   <li>Automatic offset commit for consumer group</li>
+ *   <li>Single consumer mode (not consumer groups)</li>
+ *   <li>Message polling with explicit offset tracking</li>
+ *   <li>Offset management controlled by Pinot</li>
  * </ul>
  */
 public class IggyPartitionGroupConsumer implements PartitionGroupConsumer {
@@ -155,8 +155,8 @@ public class IggyPartitionGroupConsumer implements PartitionGroupConsumer {
             return currentOffset;
         }
 
-        // Use offset from consumer group state
-        log.debug("Using consumer group managed offset for partition {}", partitionId);
+        // Use current tracked offset when no explicit offset provided
+        log.debug("Using current tracked offset for partition {}: {}", partitionId, currentOffset);
         return currentOffset;
     }
 

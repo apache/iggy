@@ -273,7 +273,7 @@ public class IggyStreamMetadataProvider implements StreamMetadataProvider {
     }
 
     @Override
-    public void close() throws IOException {
+    public void close() {
         if (asyncClient != null) {
             try {
                 log.info("Closing Iggy metadata provider");
