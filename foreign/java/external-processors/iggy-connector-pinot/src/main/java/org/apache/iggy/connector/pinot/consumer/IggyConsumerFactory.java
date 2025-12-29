@@ -22,6 +22,7 @@ package org.apache.iggy.connector.pinot.consumer;
 import org.apache.iggy.connector.pinot.config.IggyStreamConfig;
 import org.apache.iggy.connector.pinot.metadata.IggyStreamMetadataProvider;
 import org.apache.pinot.spi.stream.PartitionGroupConsumer;
+import org.apache.pinot.spi.stream.PartitionGroupConsumptionStatus;
 import org.apache.pinot.spi.stream.PartitionLevelConsumer;
 import org.apache.pinot.spi.stream.StreamConfig;
 import org.apache.pinot.spi.stream.StreamConsumerFactory;
@@ -61,12 +62,15 @@ public class IggyConsumerFactory extends StreamConsumerFactory {
      * Pinot calls this method for each partition that needs to be consumed.
      *
      * @param clientId unique identifier for this consumer instance
-     * @param groupId partition group identifier (partition ID in Iggy)
+     * @param partitionGroupConsumptionStatus consumption status containing partition group ID and offset info
      * @return a new partition consumer instance
      */
-    public PartitionGroupConsumer createPartitionGroupConsumer(String clientId, int groupId) {
+    @Override
+    public PartitionGroupConsumer createPartitionGroupConsumer(
+            String clientId, PartitionGroupConsumptionStatus partitionGroupConsumptionStatus) {
         IggyStreamConfig iggyConfig = new IggyStreamConfig(this.streamConfig);
-        return new IggyPartitionGroupConsumer(clientId, iggyConfig, groupId);
+        int partitionGroupId = partitionGroupConsumptionStatus.getPartitionGroupId();
+        return new IggyPartitionGroupConsumer(clientId, iggyConfig, partitionGroupId);
     }
 
     /**
