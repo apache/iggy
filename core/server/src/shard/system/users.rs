@@ -105,7 +105,16 @@ impl IggyShard {
             return Err(IggyError::UsersLimitReached);
         }
 
-        let user_id = self.create_user_base(username, password, status, permissions)?;
+        let user_id = self.create_user_base(username, password, status, permissions.clone())?;
+
+        // Dual-write: also update SharedMetadata
+        let _ = self.shared_metadata.create_user(
+            username.to_string(),
+            crypto::hash_password(password),
+            status,
+            permissions,
+        );
+
         self.get_user(&(user_id as u32).try_into()?)
             .with_error(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to get user with id: {user_id}")
@@ -159,7 +168,12 @@ impl IggyShard {
                 )
             })?;
 
-        self.delete_user_base(user_id)
+        let user = self.delete_user_base(user_id)?;
+
+        // Dual-write: also update SharedMetadata
+        let _ = self.shared_metadata.delete_user(user_id);
+
+        Ok(user)
     }
 
     pub fn delete_user_bypass_auth(&self, user_id: &Identifier) -> Result<User, IggyError> {
@@ -215,7 +229,12 @@ impl IggyShard {
                 )
             })?;
 
-        self.update_user_base(user_id, username, status)
+        let user = self.update_user_base(user_id, username.clone(), status)?;
+
+        // Dual-write: also update SharedMetadata
+        let _ = self.shared_metadata.update_user(user_id, username, status);
+
+        Ok(user)
     }
 
     pub fn update_user_bypass_auth(
@@ -286,7 +305,14 @@ impl IggyShard {
             }
         }
 
-        self.update_permissions_base(user_id, permissions)
+        self.update_permissions_base(user_id, permissions.clone())?;
+
+        // Dual-write: also update SharedMetadata
+        let _ = self
+            .shared_metadata
+            .update_permissions(user_id, permissions);
+
+        Ok(())
     }
 
     pub fn update_permissions_bypass_auth(
@@ -340,7 +366,14 @@ impl IggyShard {
             }
         }
 
-        self.change_password_base(user_id, current_password, new_password)
+        self.change_password_base(user_id, current_password, new_password)?;
+
+        // Dual-write: also update SharedMetadata
+        let _ = self
+            .shared_metadata
+            .change_password(user_id, crypto::hash_password(new_password));
+
+        Ok(())
     }
 
     pub fn change_password_bypass_auth(

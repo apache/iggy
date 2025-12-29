@@ -100,6 +100,11 @@ impl IggyShard {
         self.metrics.increment_partitions(partitions_count);
         self.metrics.increment_segments(partitions_count);
 
+        // Dual-write: also update SharedMetadata
+        let _ = self
+            .shared_metadata
+            .create_partitions(stream_id, topic_id, partitions_count);
+
         let shards_count = self.get_available_shards_count();
         for (partition_id, stats) in partitions.iter().map(|p| (p.id(), p.stats())) {
             let ns = IggyNamespace::new(numeric_stream_id, numeric_topic_id, partition_id);
@@ -275,6 +280,11 @@ impl IggyShard {
         parent.decrement_messages_count(total_messages_count);
         parent.decrement_size_bytes(total_size_bytes);
         parent.decrement_segments_count(total_segments_count);
+
+        // Dual-write: also update SharedMetadata
+        let _ = self
+            .shared_metadata
+            .delete_partitions(stream_id, topic_id, &deleted_ids);
 
         Ok(deleted_ids)
     }

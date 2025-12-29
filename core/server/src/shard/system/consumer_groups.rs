@@ -69,7 +69,16 @@ impl IggyShard {
                 topic_id,
             ).with_error(|error| format!("{COMPONENT} (error: {error}) - permission denied to create consumer group for user {} on stream ID: {}, topic ID: {}", session.get_user_id(), stream_id, topic_id))?;
         }
-        let cg = self.create_and_insert_consumer_group_mem(stream_id, topic_id, name);
+        let cg = self.create_and_insert_consumer_group_mem(stream_id, topic_id, name.clone());
+
+        // Dual-write: also update SharedMetadata
+        let partition_ids = self.streams.with_topics(stream_id, |topics| {
+            topics.with_partitions(topic_id, partitions::helpers::get_partition_ids())
+        });
+        let _ =
+            self.shared_metadata
+                .create_consumer_group(stream_id, topic_id, name, partition_ids);
+
         Ok(cg)
     }
 
@@ -131,6 +140,12 @@ impl IggyShard {
             ).with_error(|error| format!("{COMPONENT} (error: {error}) - permission denied to delete consumer group for user {} on stream ID: {}, topic ID: {}", session.get_user_id(), stream_id, topic_id))?;
         }
         let cg = self.delete_consumer_group_base(stream_id, topic_id, group_id);
+
+        // Dual-write: also update SharedMetadata
+        let _ = self
+            .shared_metadata
+            .delete_consumer_group(stream_id, topic_id, group_id);
+
         Ok(cg)
     }
 
