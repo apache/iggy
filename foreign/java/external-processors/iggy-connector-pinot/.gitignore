@@ -1,0 +1,3 @@
+# Documentation files (kept locally, not in git)
+*.md
+*.md.tmp
