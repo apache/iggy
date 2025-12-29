@@ -309,7 +309,6 @@ impl ProducerCore {
         Ok(())
     }
 
-    #[cfg(feature = "compression")]
     fn maybe_compress(&self, messages: &mut [IggyMessage]) -> Result<(), IggyError> {
         if let Some(compressor) = &self.compressor {
             if compressor.algorithm == CompressionAlgorithm::None {
@@ -337,11 +336,6 @@ impl ProducerCore {
                 }
             }
         }
-        Ok(())
-    }
-
-    #[cfg(not(feature = "compression"))]
-    fn maybe_compress(&self, _messages: &mut [IggyMessage]) -> Result<(), IggyError> {
         Ok(())
     }
 
