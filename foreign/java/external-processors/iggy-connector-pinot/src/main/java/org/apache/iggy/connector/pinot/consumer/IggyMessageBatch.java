@@ -33,7 +33,6 @@ import java.util.List;
 public class IggyMessageBatch implements MessageBatch<byte[]> {
 
     private final List<IggyMessageAndOffset> messages;
-    private int currentIndex = 0;
 
     /**
      * Creates a new message batch.

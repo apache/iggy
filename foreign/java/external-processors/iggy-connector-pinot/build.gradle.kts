@@ -26,10 +26,10 @@ dependencies {
     api(project(":iggy"))
 
     // Apache Pinot dependencies (provided - not bundled with connector)
-    compileOnly("org.apache.pinot:pinot-spi:1.2.0")
+    compileOnly(libs.pinot.spi)
 
     // Serialization support - use Jackson 2.x for Pinot compatibility
-    implementation("com.fasterxml.jackson.core:jackson-databind:2.18.2") {
+    implementation(libs.jackson2.databind) {
         exclude(group = "tools.jackson.core")
     }
 
@@ -42,7 +42,7 @@ dependencies {
     // Testing
     testImplementation(platform(libs.junit.bom))
     testImplementation(libs.bundles.testing)
-    testImplementation("org.apache.pinot:pinot-spi:1.2.0") // Need Pinot SPI for tests
+    testImplementation(libs.pinot.spi) // Need Pinot SPI for tests
     testRuntimeOnly(libs.slf4j.simple)
 }
 

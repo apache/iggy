@@ -54,7 +54,6 @@ public class IggyPartitionGroupConsumer implements PartitionGroupConsumer {
 
     private static final Logger log = LoggerFactory.getLogger(IggyPartitionGroupConsumer.class);
 
-    private final String clientId;
     private final IggyStreamConfig config;
     private final int partitionId;
 
@@ -62,7 +61,6 @@ public class IggyPartitionGroupConsumer implements PartitionGroupConsumer {
     private StreamId streamId;
     private TopicId topicId;
     private Consumer consumer;
-    private boolean consumerGroupJoined;
     private long currentOffset;
 
     /**
@@ -73,10 +71,8 @@ public class IggyPartitionGroupConsumer implements PartitionGroupConsumer {
      * @param partitionId the partition to consume from
      */
     public IggyPartitionGroupConsumer(String clientId, IggyStreamConfig config, int partitionId) {
-        this.clientId = clientId;
         this.config = config;
         this.partitionId = partitionId;
-        this.consumerGroupJoined = false;
         this.currentOffset = 0;
 
         log.info(
@@ -148,32 +144,6 @@ public class IggyPartitionGroupConsumer implements PartitionGroupConsumer {
         }
     }
 
-    /**
-     * Joins the consumer group for this partition.
-     * This operation is idempotent in Iggy.
-     */
-    private void joinConsumerGroup() {
-        try {
-            log.info(
-                    "Joining consumer group: stream={}, topic={}, group={}, partition={}",
-                    config.getStreamId(),
-                    config.getTopicId(),
-                    config.getConsumerGroup(),
-                    partitionId);
-
-            asyncClient
-                    .consumerGroups()
-                    .joinConsumerGroup(streamId, topicId, consumer.id())
-                    .join();
-
-            consumerGroupJoined = true;
-            log.info("Successfully joined consumer group");
-
-        } catch (RuntimeException e) {
-            log.error("Failed to join consumer group: {}", e.getMessage(), e);
-            throw new RuntimeException("Failed to join consumer group", e);
-        }
-    }
 
     /**
      * Determines the starting offset for polling.
