@@ -17,6 +17,7 @@
  */
 
 mod background;
+mod compression;
 
 use bytes::Bytes;
 use iggy::clients::client::IggyClient;

@@ -999,7 +999,6 @@ impl Stream for IggyConsumer {
                             }
 
                             // maybe decompress
-                            #[cfg(feature = "compression")]
                             if let Ok(Some(algorithm_value)) = message
                                 .get_user_header(&HeaderKey::from_str("iggy-compression").unwrap())
                             {
