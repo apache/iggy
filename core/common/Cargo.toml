@@ -52,8 +52,8 @@ crossbeam = { workspace = true }
 derive_more = { workspace = true }
 err_trail = { workspace = true }
 fast-async-mutex = { version = "0.6.7", optional = true }
-flate2 = { workspace = true }
 figment = { workspace = true }
+flate2 = { workspace = true }
 human-repr = { workspace = true }
 humantime = { workspace = true }
 nix = { workspace = true }
