@@ -184,7 +184,8 @@ pub(crate) struct Client {
 
 impl Client {
     pub(crate) async fn init() -> Self {
-        let fantoccini = fantoccini::ClientBuilder::native()
+        let fantoccini = fantoccini::ClientBuilder::rustls()
+            .unwrap()
             .capabilities((*WEBDRIVER_CAPABILITIES).clone())
             .connect(&WEBDRIVER_ADDRESS)
             .await
@@ -229,6 +230,11 @@ macro_rules! test {
                 return;
             }
             // setup
+            if rustls::crypto::CryptoProvider::get_default().is_none() {
+                rustls::crypto::ring::default_provider()
+                    .install_default()
+                    .ok();
+            }
             let iggy_container = $crate::utils::launch_iggy_container().await;
             let client = $crate::utils::Client::init().await;
             let url = iggy_container.url.join("ui").unwrap();

@@ -144,6 +144,6 @@ vergen-git2 = { version = "1.0.7", features = [
 ] }
 
 [dev-dependencies]
-fantoccini = "0.22.0"
+fantoccini = { version = "0.22.0", default-features = false, features = ["rustls-tls"] }
 serde_json = { workspace = true }
 testcontainers = "0.26.3"

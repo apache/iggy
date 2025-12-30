@@ -136,11 +136,6 @@ runs:
         rustup target add aarch64-unknown-linux-musl
       shell: bash
 
-    - name: Install OpenSSL headers package
-      if: inputs.task == 'build-aarch64-musl' && runner.os == 'Linux'
-      run: sudo apt-get install -y pkg-config libssl-dev
-      shell: bash
-
     - name: Build aarch64-musl
       if: inputs.task == 'build-aarch64-musl'
       run: cargo build --locked --all-targets --target aarch64-unknown-linux-musl
