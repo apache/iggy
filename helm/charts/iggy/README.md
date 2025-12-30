@@ -1,94 +1,194 @@
 # iggy
 
-![Version: 0.2.0](https://img.shields.io/badge/Version-0.2.0-informational?style=flat-square) ![Type: application](https://img.shields.io/badge/Type-application-informational?style=flat-square) ![AppVersion: 0.5.0](https://img.shields.io/badge/AppVersion-0.5.0-informational?style=flat-square)
+A Helm chart for [Apache Iggy](https://github.com/apache/iggy) server and web-ui.
 
-A Helm chart for Apache Iggy server and web-ui
+## Prerequisites
 
-## Source Code
+* Kubernetes 1.19+
+* Helm 3.2.0+
+* PV provisioner support in the underlying infrastructure (if persistence is enabled)
 
-* <https://github.com/apache/iggy>
+### io_uring Requirements
+
+Iggy server uses `io_uring` for high-performance async I/O. This requires:
+
+1. **IPC_LOCK capability** - For locking memory required by io_uring
+2. **Unconfined seccomp profile** - To allow io_uring syscalls
+
+These are configured by default in the chart's `securityContext` and `podSecurityContext`.
+
+## Quick Start
+
+```bash
+# Clone the repository
+git clone https://github.com/apache/iggy.git
+cd iggy
+
+# Install with persistence enabled
+helm install iggy ./helm/charts/iggy \
+  --set server.persistence.enabled=true \
+  --set server.serviceMonitor.enabled=false
+
+# Install with custom root credentials
+helm install iggy ./helm/charts/iggy \
+  --set server.persistence.enabled=true \
+  --set server.serviceMonitor.enabled=false \
+  --set server.users.root.username=admin \
+  --set server.users.root.password=secretpassword
+```
+
+> **Note:** Set `server.serviceMonitor.enabled=false` if Prometheus Operator is not installed.
+
+## Installation
+
+### From Git Repository
+
+```bash
+git clone https://github.com/apache/iggy.git
+cd iggy
+helm install iggy ./helm/charts/iggy
+```
+
+### With Persistence
+
+```bash
+helm install iggy ./helm/charts/iggy \
+  --set server.persistence.enabled=true \
+  --set server.persistence.size=50Gi
+```
+
+### With Custom Values File
+
+```bash
+helm install iggy ./helm/charts/iggy -f custom-values.yaml
+```
+
+## Uninstallation
+
+```bash
+helm uninstall iggy
+```
+
+## Configuration
+
+### Server Configuration
+
+| Key | Type | Default | Description |
+| --- | ---- | ------- | ----------- |
+| `server.enabled` | bool | `true` | Enable the Iggy server deployment |
+| `server.replicaCount` | int | `1` | Number of server replicas |
+| `server.image.repository` | string | `"apache/iggy"` | Server image repository |
+| `server.image.tag` | string | `""` | Server image tag (defaults to chart appVersion) |
+| `server.ports.http` | int | `3000` | HTTP API port |
+| `server.ports.tcp` | int | `8090` | TCP protocol port |
+| `server.ports.quic` | int | `8080` | QUIC protocol port |
+
+### Persistence Configuration
+
+| Key | Type | Default | Description |
+| --- | ---- | ------- | ----------- |
+| `server.persistence.enabled` | bool | `false` | Enable persistence using PVC |
+| `server.persistence.size` | string | `"8Gi"` | PVC storage size |
+| `server.persistence.storageClass` | string | `""` | Storage class (empty = default) |
+| `server.persistence.accessMode` | string | `"ReadWriteOnce"` | PVC access mode |
+| `server.persistence.existingClaim` | string | `""` | Use existing PVC |
+
+### Security Configuration
+
+| Key | Type | Default | Description |
+| --- | ---- | ------- | ----------- |
+| `server.users.root.username` | string | `"iggy"` | Root user username |
+| `server.users.root.password` | string | `"changeit"` | Root user password |
+| `server.users.root.createSecret` | bool | `true` | Create secret for root user |
+| `server.users.root.existingSecret.name` | string | `""` | Use existing secret |
+| `securityContext.capabilities.add` | list | `["IPC_LOCK"]` | Container capabilities (required for io_uring) |
+| `podSecurityContext.seccompProfile.type` | string | `"Unconfined"` | Seccomp profile (required for io_uring) |
+
+### Monitoring Configuration
+
+| Key | Type | Default | Description |
+| --- | ---- | ------- | ----------- |
+| `server.serviceMonitor.enabled` | bool | `true` | Enable ServiceMonitor for Prometheus Operator |
+| `server.serviceMonitor.interval` | string | `"30s"` | Scrape interval |
+| `server.serviceMonitor.path` | string | `"/metrics"` | Metrics endpoint path |
+
+### Web UI Configuration
+
+| Key | Type | Default | Description |
+| --- | ---- | ------- | ----------- |
+| `ui.enabled` | bool | `true` | Enable the Web UI deployment |
+| `ui.replicaCount` | int | `1` | Number of UI replicas |
+| `ui.image.repository` | string | `"apache/iggy-web-ui"` | UI image repository |
+| `ui.ports.http` | int | `3050` | UI HTTP port |
+| `ui.server.endpoint` | string | `""` | Iggy server endpoint (auto-detected if empty) |
+
+## Troubleshooting
+
+### Pod CrashLoopBackOff with "Out of memory" error
+
+If you see:
+
+```text
+Cannot create runtime: Out of memory (os error 12)
+```
+
+This means io_uring cannot lock sufficient memory. Ensure:
+
+1. `securityContext.capabilities.add` includes `IPC_LOCK`
+2. `podSecurityContext.seccompProfile.type` is `Unconfined`
+
+These are set by default but may be overridden.
+
+### ServiceMonitor CRD not found
+
+If you see:
+
+```text
+no matches for kind "ServiceMonitor" in version "monitoring.coreos.com/v1"
+```
+
+Either install Prometheus Operator or disable ServiceMonitor:
+
+```bash
+helm install iggy ./helm/charts/iggy --set server.serviceMonitor.enabled=false
+```
+
+### Server not accessible from other pods
+
+Ensure the server binds to `0.0.0.0` instead of `127.0.0.1`. This is configured by default via environment variables:
+
+* `IGGY_HTTP_ADDRESS=0.0.0.0:3000`
+* `IGGY_TCP_ADDRESS=0.0.0.0:8090`
+* `IGGY_QUIC_ADDRESS=0.0.0.0:8080`
+
+## Accessing the Server
+
+### Port Forward
+
+```bash
+# HTTP API
+kubectl port-forward svc/iggy 3000:3000
+
+# Web UI
+kubectl port-forward svc/iggy-ui 3050:3050
+```
+
+### Using Ingress
+
+Enable ingress in values:
+
+```yaml
+server:
+  ingress:
+    enabled: true
+    className: nginx
+    hosts:
+      - host: iggy.example.com
+        paths:
+          - path: /
+            pathType: Prefix
+```
 
 ## Values
 
-| Key                                          | Type   | Default                                                                                                             | Description                                                                                                                                                                                                                                                                                                             |
-|----------------------------------------------|--------|---------------------------------------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| additionalLabels                             | object | `{}`                                                                                                                | Additional labels to add to all resources                                                                                                                                                                                                                                                                               |
-| autoscaling.enabled                          | bool   | `false`                                                                                                             |                                                                                                                                                                                                                                                                                                                         |
-| autoscaling.maxReplicas                      | int    | `100`                                                                                                               |                                                                                                                                                                                                                                                                                                                         |
-| autoscaling.minReplicas                      | int    | `1`                                                                                                                 |                                                                                                                                                                                                                                                                                                                         |
-| autoscaling.targetCPUUtilizationPercentage   | int    | `80`                                                                                                                |                                                                                                                                                                                                                                                                                                                         |
-| fullnameOverride                             | string | `""`                                                                                                                |                                                                                                                                                                                                                                                                                                                         |
-| imagePullSecrets                             | list   | `[]`                                                                                                                |                                                                                                                                                                                                                                                                                                                         |
-| nameOverride                                 | string | `""`                                                                                                                |                                                                                                                                                                                                                                                                                                                         |
-| podAnnotations                               | object | `{}`                                                                                                                |                                                                                                                                                                                                                                                                                                                         |
-| podSecurityContext                           | object | `{}`                                                                                                                |                                                                                                                                                                                                                                                                                                                         |
-| resources                                    | object | `{}`                                                                                                                |                                                                                                                                                                                                                                                                                                                         |
-| securityContext                              | object | `{}`                                                                                                                |                                                                                                                                                                                                                                                                                                                         |
-| server.affinity                              | object | `{}`                                                                                                                |                                                                                                                                                                                                                                                                                                                         |
-| server.enabled                               | bool   | `true`                                                                                                              |                                                                                                                                                                                                                                                                                                                         |
-| server.env                                   | list   | `[{"name":"RUST_LOG","value":"info"}]`                                                                              | Set up environmental variables to be added to the container                                                                                                                                                                                                                                                             |
-| server.image.pullPolicy                      | string | `"IfNotPresent"`                                                                                                    |                                                                                                                                                                                                                                                                                                                         |
-| server.image.repository                      | string | `"apache/iggy"`                                                                                                     |                                                                                                                                                                                                                                                                                                                         |
-| server.image.tag                             | string | `""`                                                                                                                |                                                                                                                                                                                                                                                                                                                         |
-| server.ingress.annotations                   | object | `{}`                                                                                                                |                                                                                                                                                                                                                                                                                                                         |
-| server.ingress.className                     | string | `""`                                                                                                                |                                                                                                                                                                                                                                                                                                                         |
-| server.ingress.enabled                       | bool   | `false`                                                                                                             |                                                                                                                                                                                                                                                                                                                         |
-| server.ingress.hosts[0].host                 | string | `"chart-example.local"`                                                                                             |                                                                                                                                                                                                                                                                                                                         |
-| server.ingress.hosts[0].paths[0].path        | string | `"/"`                                                                                                               |                                                                                                                                                                                                                                                                                                                         |
-| server.ingress.hosts[0].paths[0].pathType    | string | `"ImplementationSpecific"`                                                                                          |                                                                                                                                                                                                                                                                                                                         |
-| server.ingress.tls                           | list   | `[]`                                                                                                                |                                                                                                                                                                                                                                                                                                                         |
-| server.nodeSelector                          | object | `{}`                                                                                                                |                                                                                                                                                                                                                                                                                                                         |
-| server.persistence                           | object | `{"accessMode":"ReadWriteOnce","annotations":{},"enabled":false,"existingClaim":"","size":"8Gi","storageClass":""}` | Add persistence volume claim configuration                                                                                                                                                                                                                                                                              |
-| server.persistence.accessMode                | string | `"ReadWriteOnce"`                                                                                                   | PVC Access mode                                                                                                                                                                                                                                                                                                         |
-| server.persistence.annotations               | object | `{}`                                                                                                                | PVC annotations                                                                                                                                                                                                                                                                                                         |
-| server.persistence.enabled                   | bool   | `false`                                                                                                             | Enable persistence using a PVC                                                                                                                                                                                                                                                                                          |
-| server.persistence.existingClaim             | string | `""`                                                                                                                | A manually managed Persistent Volume and Claim Requires persistence.enabled: true If defined, PVC must be created manually before volume will be bound                                                                                                                                                                  |
-| server.persistence.size                      | string | `"8Gi"`                                                                                                             | PVC claim size                                                                                                                                                                                                                                                                                                          |
-| server.persistence.storageClass              | string | `""`                                                                                                                | Persistent Volume Storage Class If defined, storageClassName: <storageClass> If set to "-", storageClassName: "", which disables dynamic provisioning If undefined (the default) or set to null, no storageClassName spec is   set, choosing the default provisioner.  (gp2 on AWS, standard on   GKE, AWS & OpenStack) |
-| server.ports.http                            | int    | `3000`                                                                                                              |                                                                                                                                                                                                                                                                                                                         |
-| server.ports.quic                            | int    | `8080`                                                                                                              |                                                                                                                                                                                                                                                                                                                         |
-| server.ports.tcp                             | int    | `8090`                                                                                                              |                                                                                                                                                                                                                                                                                                                         |
-| server.replicaCount                          | int    | `1`                                                                                                                 |                                                                                                                                                                                                                                                                                                                         |
-| server.service.port                          | int    | `3000`                                                                                                              |                                                                                                                                                                                                                                                                                                                         |
-| server.service.type                          | string | `"ClusterIP"`                                                                                                       |                                                                                                                                                                                                                                                                                                                         |
-| server.serviceMonitor.additionalLabels       | object | `{}`                                                                                                                | Add custom labels to the ServiceMonitor resource                                                                                                                                                                                                                                                                        |
-| server.serviceMonitor.enabled                | bool   | `true`                                                                                                              | Enable this if you're using [Prometheus Operator](https://github.com/coreos/prometheus-operator)                                                                                                                                                                                                                        |
-| server.serviceMonitor.honorLabels            | bool   | `false`                                                                                                             |                                                                                                                                                                                                                                                                                                                         |
-| server.serviceMonitor.interval               | string | `"30s"`                                                                                                             | Fallback to the prometheus default unless specified                                                                                                                                                                                                                                                                     |
-| server.serviceMonitor.namespace              | string | `""`                                                                                                                | Namespace to deploy the ServiceMonitor                                                                                                                                                                                                                                                                                  |
-| server.serviceMonitor.path                   | string | `"/metrics"`                                                                                                        | Path to scrape metrics                                                                                                                                                                                                                                                                                                  |
-| server.serviceMonitor.scrapeTimeout          | string | `"10s"`                                                                                                             | Timeout for scrape metrics request                                                                                                                                                                                                                                                                                      |
-| server.tolerations                           | list   | `[]`                                                                                                                |                                                                                                                                                                                                                                                                                                                         |
-| server.users.root.createSecret               | bool   | `true`                                                                                                              | Create a secret for the root user                                                                                                                                                                                                                                                                                       |
-| server.users.root.existingSecret             | object | `{"name":"","passwordKey":"password","usernameKey":"username"}`                                                     | Whether to use an existing secret for the root user                                                                                                                                                                                                                                                                     |
-| server.users.root.existingSecret.passwordKey | string | `"password"`                                                                                                        | Key in the secret to get the root password from                                                                                                                                                                                                                                                                         |
-| server.users.root.existingSecret.usernameKey | string | `"username"`                                                                                                        | Key in the secret to get the root username from                                                                                                                                                                                                                                                                         |
-| server.users.root.password                   | string | `"changeit"`                                                                                                        |                                                                                                                                                                                                                                                                                                                         |
-| server.users.root.username                   | string | `"iggy"`                                                                                                            |                                                                                                                                                                                                                                                                                                                         |
-| serviceAccount.annotations                   | object | `{}`                                                                                                                |                                                                                                                                                                                                                                                                                                                         |
-| serviceAccount.create                        | bool   | `true`                                                                                                              |                                                                                                                                                                                                                                                                                                                         |
-| serviceAccount.name                          | string | `""`                                                                                                                |                                                                                                                                                                                                                                                                                                                         |
-| ui.affinity                                  | object | `{}`                                                                                                                |                                                                                                                                                                                                                                                                                                                         |
-| ui.enabled                                   | bool   | `true`                                                                                                              |                                                                                                                                                                                                                                                                                                                         |
-| ui.env                                       | object | `{}`                                                                                                                | Extra environmental variables to add to the container                                                                                                                                                                                                                                                                   |
-| ui.image.pullPolicy                          | string | `"IfNotPresent"`                                                                                                    |                                                                                                                                                                                                                                                                                                                         |
-| ui.image.repository                          | string | `"apache/iggy-web-ui"`                                                                                              |                                                                                                                                                                                                                                                                                                                         |
-| ui.image.tag                                 | string | `"latest"`                                                                                                          |                                                                                                                                                                                                                                                                                                                         |
-| ui.ingress.annotations                       | object | `{}`                                                                                                                |                                                                                                                                                                                                                                                                                                                         |
-| ui.ingress.className                         | string | `""`                                                                                                                |                                                                                                                                                                                                                                                                                                                         |
-| ui.ingress.enabled                           | bool   | `false`                                                                                                             |                                                                                                                                                                                                                                                                                                                         |
-| ui.ingress.hosts[0].host                     | string | `"chart-example.local"`                                                                                             |                                                                                                                                                                                                                                                                                                                         |
-| ui.ingress.hosts[0].paths[0].path            | string | `"/"`                                                                                                               |                                                                                                                                                                                                                                                                                                                         |
-| ui.ingress.hosts[0].paths[0].pathType        | string | `"ImplementationSpecific"`                                                                                          |                                                                                                                                                                                                                                                                                                                         |
-| ui.ingress.tls                               | list   | `[]`                                                                                                                |                                                                                                                                                                                                                                                                                                                         |
-| ui.nodeSelector                              | object | `{}`                                                                                                                |                                                                                                                                                                                                                                                                                                                         |
-| ui.ports.http                                | int    | `3050`                                                                                                              |                                                                                                                                                                                                                                                                                                                         |
-| ui.replicaCount                              | int    | `1`                                                                                                                 |                                                                                                                                                                                                                                                                                                                         |
-| ui.resources                                 | object | `{}`                                                                                                                |                                                                                                                                                                                                                                                                                                                         |
-| ui.server.endpoint                           | string | `""`                                                                                                                | Set the Iggy server endpoint explicitly. If kept blank, the Iggy service URL will be used                                                                                                                                                                                                                               |
-| ui.service.port                              | int    | `3050`                                                                                                              |                                                                                                                                                                                                                                                                                                                         |
-| ui.service.type                              | string | `"ClusterIP"`                                                                                                       |                                                                                                                                                                                                                                                                                                                         |
-| ui.tolerations                               | list   | `[]`                                                                                                                |                                                                                                                                                                                                                                                                                                                         |
-
-----------------------------------------------
-Autogenerated from chart metadata using [helm-docs v1.14.2](https://github.com/norwoodj/helm-docs/releases/v1.14.2)
+See [values.yaml](values.yaml) for the full list of configurable values.
