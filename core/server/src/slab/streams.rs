@@ -1307,6 +1307,7 @@ impl Streams {
                         .clone(),
                 )
             });
+        let guard = messages_writer.lock.lock().await;
 
         let saved = messages_writer
             .as_ref()
@@ -1350,6 +1351,7 @@ impl Streams {
             streaming_partitions::helpers::update_index_and_increment_stats(saved, config),
         );
 
+        drop(guard);
         Ok(batch_count)
     }
 

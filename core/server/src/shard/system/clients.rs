@@ -37,7 +37,7 @@ impl IggyShard {
         let consumer_groups: Vec<(u32, u32, u32)>;
 
         {
-            let client = self.client_manager.delete_client(client_id);
+            let client = self.client_manager.try_get_client(client_id);
             if client.is_none() {
                 error!("Client with ID: {client_id} was not found in the client manager.",);
                 return;
@@ -65,6 +65,7 @@ impl IggyShard {
                 client_id,
             )
         }
+        self.client_manager.delete_client(client_id);
     }
 
     pub fn get_client(

@@ -49,7 +49,7 @@ predicates = { workspace = true }
 rand = { workspace = true }
 rcgen = "0.14.6"
 reqwest = { workspace = true }
-rmcp = { version = "0.11.0", features = [
+rmcp = { version = "0.12.0", features = [
     "client",
     "reqwest",
     "transport-streamable-http-client",
