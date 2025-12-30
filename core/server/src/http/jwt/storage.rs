@@ -76,11 +76,9 @@ impl TokenStorage {
             return Err(IggyError::CannotReadFile);
         }
 
-        let tokens: AHashMap<String, u64> =
-            bincode::serde::decode_from_slice(&buffer, bincode::config::standard())
-                .with_context(|| "Failed to deserialize revoked access tokens")
-                .map_err(|_| IggyError::CannotDeserializeResource)?
-                .0;
+        let tokens: AHashMap<String, u64> = rmp_serde::from_slice(&buffer)
+            .with_context(|| "Failed to deserialize revoked access tokens")
+            .map_err(|_| IggyError::CannotDeserializeResource)?;
 
         let tokens = tokens
             .into_iter()
@@ -101,7 +99,7 @@ impl TokenStorage {
             .map(|token| (token.id, token.expiry))
             .collect::<AHashMap<_, _>>();
         map.insert(token.id.to_owned(), token.expiry);
-        let bytes = bincode::serde::encode_to_vec(&map, bincode::config::standard())
+        let bytes = rmp_serde::to_vec(&map)
             .with_context(|| "Failed to serialize revoked access tokens")
             .map_err(|_| IggyError::CannotSerializeResource)?;
         self.persister
@@ -135,7 +133,7 @@ impl TokenStorage {
             map.remove(id);
         }
 
-        let bytes = bincode::serde::encode_to_vec(&map, bincode::config::standard())
+        let bytes = rmp_serde::to_vec(&map)
             .with_context(|| "Failed to serialize revoked access tokens")
             .map_err(|_| IggyError::CannotSerializeResource)?;
         self.persister

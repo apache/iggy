@@ -46,7 +46,6 @@ async-channel = { workspace = true }
 async_zip = { workspace = true }
 axum = { workspace = true }
 axum-server = { workspace = true }
-bincode = { workspace = true }
 blake3 = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
@@ -77,7 +76,7 @@ jsonwebtoken = { version = "10.2.0", features = ["rust_crypto"] }
 lending-iterator = "0.1.7"
 mimalloc = { workspace = true, optional = true }
 mime_guess = { version = "2.0", optional = true }
-moka = { version = "0.12.11", features = ["future"] }
+moka = { version = "0.12.12", features = ["future"] }
 nix = { workspace = true }
 opentelemetry = { version = "0.31.0", features = ["trace", "logs"] }
 opentelemetry-appender-tracing = { version = "0.31.1", features = ["log"] }
@@ -103,6 +102,7 @@ rand = { workspace = true }
 reqwest = { workspace = true, features = ["rustls-tls-no-provider"] }
 ring = "0.17.14"
 ringbuffer = "0.16.0"
+rmp-serde = { workspace = true }
 rust-embed = { version = "8.9.0", optional = true }
 rustls = { workspace = true }
 rustls-pemfile = "2.2.0"
