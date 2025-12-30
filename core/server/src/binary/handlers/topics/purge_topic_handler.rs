@@ -51,9 +51,9 @@ impl ServerCommandHandler for PurgeTopic {
         shard
             .purge_topic(session, &self.stream_id, &self.topic_id)
             .await
-            .with_error(|error| {
+            .error(|e: &IggyError| {
                 format!(
-                    "{COMPONENT} (error: {error}) - failed to purge topic with id: {}, stream_id: {}",
+                    "{COMPONENT} (error: {e}) - failed to purge topic with id: {}, stream_id: {}",
                     self.topic_id, self.stream_id
                 )
             })?;
@@ -68,9 +68,9 @@ impl ServerCommandHandler for PurgeTopic {
             .state
             .apply(session.get_user_id(), &EntryCommand::PurgeTopic(self))
             .await
-            .with_error(|error| {
+            .error(|e: &IggyError| {
                 format!(
-                "{COMPONENT} (error: {error}) - failed to apply purge topic with id: {topic_id}, stream_id: {stream_id}",
+                "{COMPONENT} (error: {e}) - failed to apply purge topic with id: {topic_id}, stream_id: {stream_id}",
             )
             })?;
         sender.send_empty_ok_response().await?;

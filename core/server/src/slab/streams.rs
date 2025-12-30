@@ -793,8 +793,8 @@ impl Streams {
                     segment_start_offset,
                 )
                 .await
-                .with_error(|error| {
-                    format!("Failed to load messages from disk, start offset: {offset}, count: {disk_count}, error: {error}")
+                .error(|e: &IggyError| {
+                    format!("Failed to load messages from disk, start offset: {offset}, count: {disk_count}, error: {e}")
                 })?;
 
             if !disk_messages.is_empty() {
@@ -888,12 +888,12 @@ impl Streams {
             .as_ref()
             .load_messages_from_disk(indexes_to_read)
             .await
-            .with_error(|error| format!("Failed to load messages from disk: {error}"))?;
+            .error(|e: &IggyError| format!("Failed to load messages from disk: {e}"))?;
 
         batch
             .validate_checksums_and_offsets(start_offset)
-            .with_error(|error| {
-                format!("Failed to validate messages read from disk! error: {error}")
+            .error(|e: &IggyError| {
+                format!("Failed to validate messages read from disk! error: {e}")
             })?;
 
         Ok(IggyMessagesBatchSet::from(batch))
@@ -1117,8 +1117,8 @@ impl Streams {
             .as_ref()
             .load_messages_from_disk(indexes_to_read)
             .await
-            .with_error(|error| {
-                format!("Failed to load messages from disk by timestamp: {error}")
+            .error(|e: &IggyError| {
+                format!("Failed to load messages from disk by timestamp: {e}")
             })?;
 
         Ok(IggyMessagesBatchSet::from(batch))
@@ -1313,10 +1313,10 @@ impl Streams {
             .as_ref()
             .save_batch_set(batches)
             .await
-            .with_error(|error| {
+            .error(|e: &IggyError| {
                 format!(
                     "Failed to save batch of {batch_count} messages \
-                    ({batch_size} bytes) to stream ID: {stream_id}, topic ID: {topic_id}, partition ID: {partition_id}. {error}",
+                    ({batch_size} bytes) to stream ID: {stream_id}, topic ID: {topic_id}, partition ID: {partition_id}. {e}",
                 )
             })?;
 
@@ -1331,8 +1331,8 @@ impl Streams {
             .as_ref()
             .save_indexes(unsaved_indexes_slice)
             .await
-            .with_error(|error| {
-                format!("Failed to save index of {indexes_len} indexes to stream ID: {stream_id}, topic ID: {topic_id} {partition_id}. {error}",)
+            .error(|e: &IggyError| {
+                format!("Failed to save index of {indexes_len} indexes to stream ID: {stream_id}, topic ID: {topic_id} {partition_id}. {e}",)
             })?;
 
         tracing::trace!(

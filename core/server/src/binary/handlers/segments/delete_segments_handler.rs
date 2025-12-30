@@ -95,9 +95,9 @@ impl ServerCommandHandler for DeleteSegments {
                     shard
                         .delete_segments_base(&stream_id, &topic_id, partition_id, segments_count)
                         .await
-                        .with_error(|error| {
+                        .error(|e: &IggyError| {
                             format!(
-                                "{COMPONENT} (error: {error}) - failed to delete segments for topic with ID: {topic_id} in stream with ID: {stream_id}, session: {session}",
+                                "{COMPONENT} (error: {e}) - failed to delete segments for topic with ID: {topic_id} in stream with ID: {stream_id}, session: {session}",
                             )
                         })?;
                 } else {
@@ -118,9 +118,9 @@ impl ServerCommandHandler for DeleteSegments {
                 &EntryCommand::DeleteSegments(self),
             )
             .await
-            .with_error(|error| {
+            .error(|e: &IggyError| {
                 format!(
-                    "{COMPONENT} (error: {error}) - failed to apply 'delete segments' command for partition with ID: {partition_id} in topic with ID: {topic_id} in stream with ID: {stream_id}, session: {session}",
+                    "{COMPONENT} (error: {e}) - failed to apply 'delete segments' command for partition with ID: {partition_id} in topic with ID: {topic_id} in stream with ID: {stream_id}, session: {session}",
                 )
             })?;
 

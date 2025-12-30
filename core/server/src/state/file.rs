@@ -92,7 +92,7 @@ impl FileState {
         let entries = self
             .load_entries()
             .await
-            .with_error(|error| format!("{COMPONENT} (error: {error}) - failed to load entries"))?;
+            .error(|e: &IggyError| format!("{COMPONENT} (error: {e}) - failed to load entries"))?;
         let entries_count = entries.len() as u64;
         self.entries_count.store(entries_count, Ordering::SeqCst);
         if entries_count == 0 {
@@ -112,9 +112,9 @@ impl FileState {
 
         let file = file::open(&self.path)
             .await
-            .with_error(|error| {
+            .error(|e: &std::io::Error| {
                 format!(
-                    "{COMPONENT} (error: {error}) - failed to open state file, path: {}",
+                    "{COMPONENT} (error: {e}) - failed to open state file, path: {}",
                     self.path
                 )
             })
@@ -122,9 +122,9 @@ impl FileState {
         let file_size = file
             .metadata()
             .await
-            .with_error(|error| {
+            .error(|e: &std::io::Error| {
                 format!(
-                    "{COMPONENT} (error: {error}) - failed to load state file metadata, path: {}",
+                    "{COMPONENT} (error: {e}) - failed to load state file metadata, path: {}",
                     self.path
                 )
             })
@@ -149,7 +149,7 @@ impl FileState {
             let index = cursor
                 .read_u64_le()
                 .await
-                .with_error(|error| format!("{FILE_STATE_PARSE_ERROR} index. {error}"))
+                .error(|e: &std::io::Error| format!("{FILE_STATE_PARSE_ERROR} index. {e}"))
                 .map_err(|_| IggyError::InvalidNumberEncoding)?;
             total_size += 8;
             // Greater than one, because one of the entries after a fresh reboot is the default root user.
@@ -167,52 +167,52 @@ impl FileState {
             let term = cursor
                 .read_u64_le()
                 .await
-                .with_error(|error| format!("{FILE_STATE_PARSE_ERROR} term. {error}"))
+                .error(|e: &std::io::Error| format!("{FILE_STATE_PARSE_ERROR} term. {e}"))
                 .map_err(|_| IggyError::InvalidNumberEncoding)?;
             total_size += 8;
             let leader_id = cursor
                 .read_u32_le()
                 .await
-                .with_error(|error| format!("{FILE_STATE_PARSE_ERROR} leader_id. {error}"))
+                .error(|e: &std::io::Error| format!("{FILE_STATE_PARSE_ERROR} leader_id. {e}"))
                 .map_err(|_| IggyError::InvalidNumberEncoding)?;
             total_size += 4;
             let version = cursor
                 .read_u32_le()
                 .await
-                .with_error(|error| format!("{FILE_STATE_PARSE_ERROR} version. {error}"))
+                .error(|e: &std::io::Error| format!("{FILE_STATE_PARSE_ERROR} version. {e}"))
                 .map_err(|_| IggyError::InvalidNumberEncoding)?;
             total_size += 4;
             let flags = cursor
                 .read_u64_le()
                 .await
-                .with_error(|error| format!("{FILE_STATE_PARSE_ERROR} flags. {error}"))
+                .error(|e: &std::io::Error| format!("{FILE_STATE_PARSE_ERROR} flags. {e}"))
                 .map_err(|_| IggyError::InvalidNumberEncoding)?;
             total_size += 8;
             let timestamp = IggyTimestamp::from(
                 cursor
                     .read_u64_le()
                     .await
-                    .with_error(|error| format!("{FILE_STATE_PARSE_ERROR} timestamp. {error}"))
+                    .error(|e: &std::io::Error| format!("{FILE_STATE_PARSE_ERROR} timestamp. {e}"))
                     .map_err(|_| IggyError::InvalidNumberEncoding)?,
             );
             total_size += 8;
             let user_id = cursor
                 .read_u32_le()
                 .await
-                .with_error(|error| format!("{FILE_STATE_PARSE_ERROR} user_id. {error}"))
+                .error(|e: &std::io::Error| format!("{FILE_STATE_PARSE_ERROR} user_id. {e}"))
                 .map_err(|_| IggyError::InvalidNumberEncoding)?;
             total_size += 4;
             let checksum = cursor
                 .read_u64_le()
                 .await
-                .with_error(|error| format!("{FILE_STATE_PARSE_ERROR} checksum. {error}"))
+                .error(|e: &std::io::Error| format!("{FILE_STATE_PARSE_ERROR} checksum. {e}"))
                 .map_err(|_| IggyError::InvalidNumberEncoding)?;
             total_size += 8;
             let context_length = cursor
                 .read_u32_le()
                 .await
-                .with_error(|error| {
-                    format!("{FILE_STATE_PARSE_ERROR} context context_length. {error}")
+                .error(|e: &std::io::Error| {
+                    format!("{FILE_STATE_PARSE_ERROR} context context_length. {e}")
                 })
                 .map_err(|_| IggyError::InvalidNumberEncoding)?
                 as usize;
@@ -222,20 +222,20 @@ impl FileState {
             let (result, context) = cursor.read_exact(context).await.into();
 
             result
-                .with_error(|error| format!("{FILE_STATE_PARSE_ERROR} code. {error}"))
+                .error(|e: &std::io::Error| format!("{FILE_STATE_PARSE_ERROR} code. {e}"))
                 .map_err(|_| IggyError::CannotReadFile)?;
             let context = context.freeze();
             total_size += context_length as u64;
             let code = cursor
                 .read_u32_le()
                 .await
-                .with_error(|error| format!("{FILE_STATE_PARSE_ERROR} code. {error}"))
+                .error(|e: &std::io::Error| format!("{FILE_STATE_PARSE_ERROR} code. {e}"))
                 .map_err(|_| IggyError::InvalidNumberEncoding)?;
             total_size += 4;
             let mut command_length = cursor
                 .read_u32_le()
                 .await
-                .with_error(|error| format!("{FILE_STATE_PARSE_ERROR} command_length. {error}"))
+                .error(|e: &std::io::Error| format!("{FILE_STATE_PARSE_ERROR} command_length. {e}"))
                 .map_err(|_| IggyError::InvalidNumberEncoding)?
                 as usize;
             total_size += 4;
@@ -243,7 +243,7 @@ impl FileState {
             command.put_bytes(0, command_length);
             let (result, command) = cursor.read_exact(command).await.into();
             result
-                .with_error(|error| format!("{FILE_STATE_PARSE_ERROR} command. {error}"))
+                .error(|e: &std::io::Error| format!("{FILE_STATE_PARSE_ERROR} command. {e}"))
                 .map_err(|_| IggyError::CannotReadFile)?;
             total_size += command_length as u64;
             let command_payload;
@@ -260,8 +260,8 @@ impl FileState {
             entry_command.put_u32_le(command_length as u32);
             entry_command.extend(command_payload);
             let command = entry_command.freeze();
-            EntryCommand::from_bytes(command.clone()).with_error(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to parse entry command from bytes")
+            EntryCommand::from_bytes(command.clone()).error(|e: &IggyError| {
+                format!("{COMPONENT} (error: {e}) - failed to parse entry command from bytes")
             })?;
             let calculated_checksum = StateEntry::calculate_checksum(
                 index, term, leader_id, version, flags, timestamp, user_id, &context, &command,
@@ -330,9 +330,9 @@ impl FileState {
             let command_payload = command.slice(8..8 + command_length);
             let encrypted_command_payload = encryptor
                 .encrypt(&command_payload)
-                .with_error(|error| {
+                .error(|e: &IggyError| {
                     format!(
-                        "{COMPONENT} (error: {error}) - failed to encrypt state entry command, index: {index}"
+                        "{COMPONENT} (error: {e}) - failed to encrypt state entry command, index: {index}"
                     )
                 })?;
             command_length = encrypted_command_payload.len();
@@ -361,9 +361,9 @@ impl FileState {
         self.persister
             .append(&self.path, bytes)
             .await
-            .with_error(|error| {
+            .error(|e: &IggyError| {
                 format!(
-                    "{COMPONENT} (error: {error}) - failed to append state entry data to file, path: {}, data size: {}",
+                    "{COMPONENT} (error: {e}) - failed to append state entry data to file, path: {}, data size: {}",
                     self.path,
                     len
                 )

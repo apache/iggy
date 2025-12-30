@@ -47,9 +47,9 @@ pub async fn start(
     let mut addr: SocketAddr = config
         .address
         .parse()
-        .with_error(|error| {
+        .error(|e: &std::net::AddrParseError| {
             format!(
-                "WebSocket (error: {error}) - failed to parse address: {}",
+                "WebSocket (error: {e}) - failed to parse address: {}",
                 config.address
             )
         })
@@ -70,8 +70,8 @@ pub async fn start(
 
     let listener = create_listener(addr)
         .await
-        .with_error(|error| {
-            format!("WebSocket (error: {error}) - failed to bind to address: {addr}")
+        .error(|e: &std::io::Error| {
+            format!("WebSocket (error: {e}) - failed to bind to address: {addr}")
         })
         .map_err(|_| IggyError::CannotBindToSocket(addr.to_string()))?;
 

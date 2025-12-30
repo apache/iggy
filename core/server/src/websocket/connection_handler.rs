@@ -129,7 +129,7 @@ pub(crate) async fn handle_connection(
 
 pub(crate) fn handle_error(error: ConnectionError) {
     match error {
-        ConnectionError::IoError(error) => match error.kind() {
+        ConnectionError::IoError(e) => match e.kind() {
             ErrorKind::UnexpectedEof => {
                 info!("WebSocket connection has been closed.");
             }
@@ -143,7 +143,7 @@ pub(crate) fn handle_error(error: ConnectionError) {
                 info!("WebSocket connection has been reset.");
             }
             _ => {
-                error!("WebSocket connection has failed: {error}");
+                error!("WebSocket connection has failed: {e}");
             }
         },
         ConnectionError::SdkError(sdk_error) => match sdk_error {

@@ -50,8 +50,8 @@ impl ServerCommandHandler for UpdateStream {
         let stream_id = self.stream_id.clone();
         shard
         .update_stream(session, &self.stream_id, self.name.clone())
-        .with_error(|error| {
-            format!("{COMPONENT} (error: {error}) - failed to update stream with id: {stream_id}, session: {session}")
+        .error(|e: &IggyError| {
+            format!("{COMPONENT} (error: {e}) - failed to update stream with id: {stream_id}, session: {session}")
         })?;
 
         let event = ShardEvent::UpdatedStream {
@@ -63,8 +63,8 @@ impl ServerCommandHandler for UpdateStream {
             .state
             .apply(session.get_user_id(), &EntryCommand::UpdateStream(self))
             .await
-            .with_error(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to apply update stream with id: {stream_id}, session: {session}")
+            .error(|e: &IggyError| {
+                format!("{COMPONENT} (error: {e}) - failed to apply update stream with id: {stream_id}, session: {session}")
             })?;
         sender.send_empty_ok_response().await?;
         Ok(HandlerResult::Finished)
