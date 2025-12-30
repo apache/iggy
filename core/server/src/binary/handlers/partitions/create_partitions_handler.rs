@@ -90,9 +90,9 @@ impl ServerCommandHandler for CreatePartitions {
             &EntryCommand::CreatePartitions(self),
         )
         .await
-        .with_error(|error| {
+        .error(|e: &IggyError| {
             format!(
-                "{COMPONENT} (error: {error}) - failed to apply create partitions for stream_id: {stream_id}, topic_id: {topic_id}, session: {session}"
+                "{COMPONENT} (error: {e}) - failed to apply create partitions for stream_id: {stream_id}, topic_id: {topic_id}, session: {session}"
             )
         })?;
         sender.send_empty_ok_response().await?;

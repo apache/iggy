@@ -144,8 +144,8 @@ fn main() -> Result<(), ServerError> {
         // SECOND DISCRETE LOADING STEP.
         // Load config and create directories.
         // Remove `local_data` directory if run with `--fresh` flag.
-        let config = load_config().await.with_error(|error| {
-            format!("{COMPONENT} (error: {error}) - failed to load config during bootstrap")
+        let config = load_config().await.error(|e: &ServerError| {
+            format!("{COMPONENT} (error: {e}) - failed to load config during bootstrap")
         })?;
         if args.fresh {
             let system_path = config.system.get_system_path();

@@ -53,9 +53,9 @@ impl IggyShard {
                 session.get_user_id(),
                 stream_id,
                 topic_id
-            ).with_error(|error| {
+            ).error(|e: &IggyError| {
                 format!(
-                    "{COMPONENT} (error: {error}) - permission denied to store consumer offset for user with ID: {}, consumer: {consumer} in topic with ID: {topic_id} and stream with ID: {stream_id}",
+                    "{COMPONENT} (error: {e}) - permission denied to store consumer offset for user with ID: {}, consumer: {consumer} in topic with ID: {topic_id} and stream with ID: {stream_id}",
                     session.get_user_id(),
                 )
             })?;
@@ -106,9 +106,9 @@ impl IggyShard {
                 session.get_user_id(),
                 stream_id,
                 topic_id
-            ).with_error(|error| {
+            ).error(|e: &IggyError| {
                 format!(
-                    "{COMPONENT} (error: {error}) - permission denied to get consumer offset for user with ID: {}, consumer: {consumer} in topic with ID: {topic_id} and stream with ID: {stream_id}",
+                    "{COMPONENT} (error: {e}) - permission denied to get consumer offset for user with ID: {}, consumer: {consumer} in topic with ID: {topic_id} and stream with ID: {stream_id}",
                     session.get_user_id()
                 )
             })?;
@@ -166,9 +166,9 @@ impl IggyShard {
                 session.get_user_id(),
                 stream_id,
                 topic_id
-            ).with_error(|error| {
+            ).error(|e: &IggyError| {
             format!(
-                "{COMPONENT} (error: {error}) - permission denied to delete consumer offset for user with ID: {}, consumer: {consumer} in topic with ID: {topic_id} and stream with ID: {stream_id}",
+                "{COMPONENT} (error: {e}) - permission denied to delete consumer offset for user with ID: {}, consumer: {consumer} in topic with ID: {topic_id} and stream with ID: {stream_id}",
                 session.get_user_id(),
             )
         })?;
@@ -216,16 +216,16 @@ impl IggyShard {
 
             let path = self.streams
                 .with_partition_by_id(stream_id, topic_id, partition_id, partitions::helpers::delete_consumer_group_offset(cg_id))
-                .with_error(|error| {
+                .error(|e: &IggyError| {
                     format!(
-                        "{COMPONENT} (error: {error}) - failed to delete consumer group offset for group with ID: {} in partition {} of topic with ID: {} and stream with ID: {}",
+                        "{COMPONENT} (error: {e}) - failed to delete consumer group offset for group with ID: {} in partition {} of topic with ID: {} and stream with ID: {}",
                         cg_id, partition_id, topic_id, stream_id
                     )
                 })?;
 
-            self.delete_consumer_offset_from_disk(&path).await.with_error(|error| {
+            self.delete_consumer_offset_from_disk(&path).await.error(|e: &IggyError| {
                 format!(
-                    "{COMPONENT} (error: {error}) - failed to delete consumer group offset file for group with ID: {} in partition {} of topic with ID: {} and stream with ID: {}",
+                    "{COMPONENT} (error: {e}) - failed to delete consumer group offset file for group with ID: {} in partition {} of topic with ID: {} and stream with ID: {}",
                     cg_id, partition_id, topic_id, stream_id
                 )
             })?;
@@ -293,17 +293,17 @@ impl IggyShard {
         match polling_consumer {
             PollingConsumer::Consumer(id, _) => {
                 self.streams
-                    .with_partition_by_id(stream_id, topic_id, partition_id, partitions::helpers::delete_consumer_offset(*id)).with_error(|error| {
+                    .with_partition_by_id(stream_id, topic_id, partition_id, partitions::helpers::delete_consumer_offset(*id)).error(|e: &IggyError| {
                         format!(
-                            "{COMPONENT} (error: {error}) - failed to delete consumer offset for consumer with ID: {id} in topic with ID: {topic_id} and stream with ID: {stream_id}",
+                            "{COMPONENT} (error: {e}) - failed to delete consumer offset for consumer with ID: {id} in topic with ID: {topic_id} and stream with ID: {stream_id}",
                         )
                     })
             }
             PollingConsumer::ConsumerGroup(consumer_group_id, _) => {
                 self.streams
-                    .with_partition_by_id(stream_id, topic_id, partition_id, partitions::helpers::delete_consumer_group_offset(*consumer_group_id)).with_error(|error| {
+                    .with_partition_by_id(stream_id, topic_id, partition_id, partitions::helpers::delete_consumer_group_offset(*consumer_group_id)).error(|e: &IggyError| {
                         format!(
-                            "{COMPONENT} (error: {error}) - failed to delete consumer group offset for group with ID: {consumer_group_id:?} in topic with ID: {topic_id} and stream with ID: {stream_id}",
+                            "{COMPONENT} (error: {e}) - failed to delete consumer group offset for group with ID: {consumer_group_id:?} in topic with ID: {topic_id} and stream with ID: {stream_id}",
                         )
                     })
             }

@@ -50,9 +50,9 @@ impl FileSystemInfoStorage {
         let file_size = file
             .metadata()
             .await
-            .with_error(|error| {
+            .error(|e: &std::io::Error| {
                 format!(
-                    "{COMPONENT} (error: {error}) - failed to retrieve metadata for file at path: {}",
+                    "{COMPONENT} (error: {e}) - failed to retrieve metadata for file at path: {}",
                     self.path
                 )
             })
@@ -68,9 +68,9 @@ impl FileSystemInfoStorage {
             .await
             .into();
         result
-            .with_error(|error| {
+            .error(|e: &std::io::Error| {
                 format!(
-                    "{COMPONENT} Failed to read system info from file at path: {} (error: {error})",
+                    "{COMPONENT} Failed to read system info from file at path: {} (error: {e})",
                     self.path
                 )
             })
@@ -88,9 +88,9 @@ impl FileSystemInfoStorage {
         self.persister
             .overwrite(&self.path, data)
             .await
-            .with_error(|error| {
+            .error(|e: &IggyError| {
                 format!(
-                    "{COMPONENT} (error: {error}) - failed to overwrite file at path: {}",
+                    "{COMPONENT} (error: {e}) - failed to overwrite file at path: {}",
                     self.path
                 )
             })?;
