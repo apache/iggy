@@ -45,8 +45,8 @@ impl ServerCommandHandler for GetUsers {
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
-        let users = shard.get_users(session).await.with_error(|error| {
-            format!("{COMPONENT} (error: {error}) - failed to get users, session: {session}")
+        let users = shard.get_users(session).await.error(|e: &IggyError| {
+            format!("{COMPONENT} (error: {e}) - failed to get users, session: {session}")
         })?;
         let users = mapper::map_users(users);
         sender.send_ok_response(&users).await?;

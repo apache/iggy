@@ -54,9 +54,9 @@ impl ServerCommandHandler for LeaveConsumerGroup {
                 &self.topic_id,
                 &self.group_id,
             )
-            .with_error(|error| {
+            .error(|e: &IggyError| {
                 format!(
-                    "{COMPONENT} (error: {error}) - failed to leave consumer group for stream_id: {}, topic_id: {}, group_id: {}, session: {}",
+                    "{COMPONENT} (error: {e}) - failed to leave consumer group for stream_id: {}, topic_id: {}, group_id: {}, session: {}",
                     self.stream_id, self.topic_id, self.group_id, session
                 )
             })?;

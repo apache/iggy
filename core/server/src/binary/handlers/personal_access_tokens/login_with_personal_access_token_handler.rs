@@ -47,14 +47,14 @@ impl ServerCommandHandler for LoginWithPersonalAccessToken {
         debug!("session: {session}, command: {self}");
         let user = shard
             .login_with_personal_access_token(&self.token, Some(session))
-            .with_error(|error| {
+            .error(|e: &IggyError| {
                 let redacted_token = if self.token.len() > 4 {
                     format!("{}****", &self.token[..4])
                 } else {
                     "****".to_string()
                 };
                 format!(
-                    "{COMPONENT} (error: {error}) - failed to login with personal access token: {redacted_token}, session: {session}",
+                    "{COMPONENT} (error: {e}) - failed to login with personal access token: {redacted_token}, session: {session}",
                 )
             })?;
         let identity_info = mapper::map_identity_info(user.id);

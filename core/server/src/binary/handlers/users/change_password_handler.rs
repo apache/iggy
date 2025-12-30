@@ -58,9 +58,9 @@ impl ServerCommandHandler for ChangePassword {
                     &self.current_password,
                     &self.new_password,
                 )
-                .with_error(|error| {
+                .error(|e: &IggyError| {
                     format!(
-                        "{COMPONENT} (error: {error}) - failed to change password for user_id: {}, session: {session}",
+                        "{COMPONENT} (error: {e}) - failed to change password for user_id: {}, session: {session}",
                         self.user_id
                     )
                 })?;
@@ -86,9 +86,9 @@ impl ServerCommandHandler for ChangePassword {
                 }),
             )
             .await
-            .with_error(|error| {
+            .error(|e: &IggyError| {
                 format!(
-                    "{COMPONENT} (error: {error}) - failed to apply change password for user_id: {}, session: {session}",
+                    "{COMPONENT} (error: {e}) - failed to apply change password for user_id: {}, session: {session}",
                     self.user_id
                 )
             })?;

@@ -52,9 +52,9 @@ impl IggyShard {
             _ => return Err(IggyError::InvalidCommand),
         };
 
-        result.with_error(|error| {
+        result.error(|e: &IggyError| {
             format!(
-                "{COMPONENT} (error: {error}) - permission denied to {operation} partitions for user {} on stream ID: {}, topic ID: {}",
+                "{COMPONENT} (error: {e}) - permission denied to {operation} partitions for user {} on stream ID: {}, topic ID: {}",
                 session.get_user_id(),
                 stream_id,
                 topic_id
