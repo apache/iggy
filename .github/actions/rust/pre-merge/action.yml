@@ -132,8 +132,13 @@ runs:
     - name: Install musl tools for aarch64-musl
       if: inputs.task == 'build-aarch64-musl' && runner.os == 'Linux'
       run: |
-        sudo apt-get update && sudo apt-get install -y musl-tools libssl-dev
+        sudo apt-get update && sudo apt-get install -y musl-tools
         rustup target add aarch64-unknown-linux-musl
+      shell: bash
+
+    - name: Install OpenSSL headers package
+      if: inputs.task == 'build-aarch64-musl' && runner.os == 'Linux'
+      run: sudo apt-get install -y pkg-config libssl-dev
       shell: bash
 
     - name: Build aarch64-musl
