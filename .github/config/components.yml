@@ -275,7 +275,8 @@ components:
   web-ui:
     paths:
       - "web/**"
-    tasks: ["lint", "build"]
+      - "core/server/**"
+    tasks: ["lint", "build", "e2e"]
 
   rust-bench-dashboard:
     paths:

@@ -15,33 +15,20 @@
 # specific language governing permissions and limitations
 # under the License.
 
-name: E2E Test Web
+name: _test_web_ui_e2e
 on:
-  pull_request:
-    branches: [master]
-  push:
-    paths:
-      - "web/**"
-      - "core/server/tests/e2e-web/**"
-      - ".github/workflows/e2e-web.yml"
-  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
 
 env:
   IGGY_CI_BUILD: true
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ startsWith(github.ref, 'refs/pull/') }}
-
-permissions:
-  contents: read
-  security-events: write
-  pull-requests: read
-
 jobs:
-  test:
+  run:
     runs-on: ubuntu-latest
-    name: Iggy Web UI End-To-End Tests
+    name: Iggy Web UI End-To-End Test Suite
     env:
       WEBDRIVER_PORT: 4444
     steps:

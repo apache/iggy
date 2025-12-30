@@ -111,6 +111,11 @@ jobs:
             npm run build
           fi
 
+      # Web UI E2E
+      - name: Run Web UI E2E Test Suite
+        if: inputs.component == 'web-ui' && inputs.task == 'e2e'
+        uses: ./.github/actions/rust/e2e-web
+
       # CI workflow validation
       - name: Validate CI workflows
         if: inputs.component == 'ci-workflows' && inputs.task == 'validate'
