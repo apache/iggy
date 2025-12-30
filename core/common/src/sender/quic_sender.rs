@@ -21,7 +21,7 @@ use crate::IggyError;
 use compio::BufResult;
 use compio::buf::IoBufMut;
 use compio::io::AsyncReadExt;
-use compio_quic::{RecvStream, SendStream};
+use compio_quic::{ClosedStream, RecvStream, SendStream, WriteError};
 use err_trail::ErrContext;
 use tracing::{debug, error};
 
@@ -76,8 +76,8 @@ impl Sender for QuicSender {
         self.send
             .write_all(&headers)
             .await
-            .with_error(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to write headers to stream")
+            .error(|e: &WriteError| {
+                format!("{COMPONENT} (error: {e}) - failed to write headers to stream")
             })
             .map_err(|_| IggyError::QuicError)?;
 
@@ -89,8 +89,8 @@ impl Sender for QuicSender {
                 self.send
                     .write_all(slice_data)
                     .await
-                    .with_error(|error| {
-                        format!("{COMPONENT} (error: {error}) - failed to write slice to stream")
+                    .error(|e: &WriteError| {
+                        format!("{COMPONENT} (error: {e}) - failed to write slice to stream")
                     })
                     .map_err(|_| IggyError::QuicError)?;
 
@@ -105,8 +105,8 @@ impl Sender for QuicSender {
 
         self.send
             .finish()
-            .with_error(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to finish send stream")
+            .error(|e: &ClosedStream| {
+                format!("{COMPONENT} (error: {e}) - failed to finish send stream")
             })
             .map_err(|_| IggyError::QuicError)?;
 
@@ -126,14 +126,14 @@ impl QuicSender {
         self.send
             .write_all(&[status, &length, payload].as_slice().concat())
             .await
-            .with_error(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to write buffer to the stream")
+            .error(|e: &WriteError| {
+                format!("{COMPONENT} (error: {e}) - failed to write buffer to the stream")
             })
             .map_err(|_| IggyError::QuicError)?;
         self.send
             .finish()
-            .with_error(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to finish send stream")
+            .error(|e: &ClosedStream| {
+                format!("{COMPONENT} (error: {e}) - failed to finish send stream")
             })
             .map_err(|_| IggyError::QuicError)?;
         debug!("Sent response with status: {:?}", status);

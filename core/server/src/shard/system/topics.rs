@@ -47,9 +47,9 @@ impl IggyShard {
             self.permissioner
             .borrow()
                 .create_topic(session.get_user_id(), numeric_stream_id)
-                .with_error(|error| {
+                .error(|e: &IggyError| {
                     format!(
-                        "{COMPONENT} (error: {error}) - permission denied to create topic with name: {name} in stream with ID: {stream_id} for user with ID: {}",
+                        "{COMPONENT} (error: {e}) - permission denied to create topic with name: {name} in stream with ID: {stream_id} for user with ID: {}",
                         session.get_user_id(),
                     )
                 })?;
@@ -116,9 +116,9 @@ impl IggyShard {
                 session.get_user_id(),
                 stream_id_val,
                 topic_id_val
-            ).with_error(|error| {
+            ).error(|e: &IggyError| {
                 format!(
-                    "{COMPONENT} (error: {error}) - permission denied to update topic for user with id: {}, stream ID: {}, topic ID: {}",
+                    "{COMPONENT} (error: {e}) - permission denied to update topic for user with id: {}, stream ID: {}, topic ID: {}",
                     session.get_user_id(),
                     stream_id_val,
                     topic_id_val,
@@ -213,9 +213,9 @@ impl IggyShard {
         self.permissioner
             .borrow()
                 .delete_topic(session.get_user_id(), numeric_stream_id, numeric_topic_id)
-                .with_error(|error| {
+                .error(|e: &IggyError| {
                     format!(
-                        "{COMPONENT} (error: {error}) - permission denied to delete topic with ID: {topic_id} in stream with ID: {stream_id} for user with ID: {}",
+                        "{COMPONENT} (error: {e}) - permission denied to delete topic with ID: {topic_id} in stream with ID: {stream_id} for user with ID: {}",
                         session.get_user_id(),
                     )
                 })?;
@@ -287,9 +287,9 @@ impl IggyShard {
                 session.get_user_id(),
                 stream_id,
                 topic_id
-            ).with_error(|error| {
+            ).error(|e: &IggyError| {
                 format!(
-                    "{COMPONENT} (error: {error}) - permission denied to purge topic with ID: {topic_id} in stream with ID: {stream_id} for user with ID: {}",
+                    "{COMPONENT} (error: {e}) - permission denied to purge topic with ID: {topic_id} in stream with ID: {stream_id} for user with ID: {}",
                     session.get_user_id(),
                 )
             })?;

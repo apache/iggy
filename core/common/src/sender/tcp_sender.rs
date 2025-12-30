@@ -64,8 +64,8 @@ impl Sender for TcpSender {
             Some(stream) => stream
                 .shutdown()
                 .await
-                .with_error(|error| {
-                    format!("{COMPONENT} (error: {error}) - failed to shutdown TCP stream")
+                .error(|e: &std::io::Error| {
+                    format!("{COMPONENT} (error: {e}) - failed to shutdown TCP stream")
                 })
                 .map_err(|e| IggyError::IoError(e.to_string())),
 

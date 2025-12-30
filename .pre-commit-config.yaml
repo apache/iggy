@@ -24,6 +24,7 @@ repos:
     rev: v6.0.0
     hooks:
       - id: check-yaml
+        exclude: ^helm/charts/.*/templates/
       - id: mixed-line-ending
 
   # CI scripts

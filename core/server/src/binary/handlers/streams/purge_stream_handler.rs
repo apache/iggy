@@ -51,8 +51,8 @@ impl ServerCommandHandler for PurgeStream {
 
         shard
             .purge_stream(session, &self.stream_id).await
-            .with_error(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to purge stream with id: {stream_id}, session: {session}")
+            .error(|e: &IggyError| {
+                format!("{COMPONENT} (error: {e}) - failed to purge stream with id: {stream_id}, session: {session}")
             })?;
         let event = ShardEvent::PurgedStream {
             stream_id: self.stream_id.clone(),
@@ -62,8 +62,8 @@ impl ServerCommandHandler for PurgeStream {
             .state
             .apply(session.get_user_id(), &EntryCommand::PurgeStream(self))
             .await
-            .with_error(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to apply purge stream with id: {stream_id}, session: {session}")
+            .error(|e: &IggyError| {
+                format!("{COMPONENT} (error: {e}) - failed to apply purge stream with id: {stream_id}, session: {session}")
             })?;
         sender.send_empty_ok_response().await?;
         Ok(HandlerResult::Finished)

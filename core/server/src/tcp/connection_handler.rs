@@ -140,7 +140,7 @@ pub(crate) async fn handle_connection(
 
 pub(crate) fn handle_error(error: ConnectionError) {
     match error {
-        ConnectionError::IoError(error) => match error.kind() {
+        ConnectionError::IoError(e) => match e.kind() {
             ErrorKind::UnexpectedEof => {
                 info!("Connection has been closed.");
             }
@@ -154,7 +154,7 @@ pub(crate) fn handle_error(error: ConnectionError) {
                 info!("Connection has been reset.");
             }
             _ => {
-                error!("Connection has failed: {error}");
+                error!("Connection has failed: {e}");
             }
         },
         ConnectionError::SdkError(sdk_error) => match sdk_error {
