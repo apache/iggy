@@ -59,6 +59,10 @@ components:
       - "rust-binary-protocol"
     paths:
       - "core/server/**"
+      # if we only detect changes to the Web UI end-to-end test suite,
+      # do not trigger all the workflows: it is "web-ui" component and
+      # its dedicated task that got e2e tests execution covered
+      - "!core/server/tests/e2e-web/**"
 
   rust-cluster:
     depends_on:
