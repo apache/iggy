@@ -52,9 +52,13 @@ static IGGY_IMAGE_TAG: LazyLock<String> = LazyLock::new(|| {
 
 // On most workstations the wait timeout can actually have a subsecond value for
 // pure rendering operations and just a few seconds when the app needs something
-// from the back-end or N+ seconds when the app is polling the back-end every N
-// seconds. However, on shared CI runners with constraint resources the operation
-// can take much longer and we want to be able to increase the timeout.
+// from the back-end (or network in general) or N+ seconds when the app is polling
+// the back-end every N seconds. However, on shared CI runners with constraint
+// resources the operation can take much longer and we want to be able to increase
+// the timeout, e.g.:
+/// ```console
+/// E2E_TEST_WAIT_TIMEOUT=10 E2E_TEST=true cargo t --test e2e-web
+/// ```
 const DEFAULT_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 static WAIT_TIMEOUT: LazyLock<Duration> = LazyLock::new(|| {
     std::env::var("E2E_TEST_WAIT_TIMEOUT")
@@ -136,7 +140,7 @@ pub(crate) async fn launch_iggy_container() -> IggyContainer {
         .with_wait_for(WaitFor::message_on_stdout(format!(
             "Started HTTP API on: {IGGY_HTTP_ADDRESS}"
         )))
-        // Apache Iggy is powered by `io_uring` (find raionale and insights here:
+        // Apache Iggy is powered by `io_uring` (find rationale and insights here:
         // https://www.youtube.com/watch?v=oddHJslao64&t=2649s), but io_uring
         // runtime requires specific syscalls (io_uring_setup, io_uring_enter,
         // io_uring_register) which are by default blocked in containerized
@@ -165,7 +169,7 @@ pub(crate) async fn launch_iggy_container() -> IggyContainer {
     let host_port = container
         .ports()
         .await
-        .expect("post to have been published")
+        .expect("port to have been published")
         .map_to_host_port_ipv4(IGGY_HTTP_PORT)
         .expect("host port to have been assigned by OS");
     let url = format!("http://127.0.0.1:{}", host_port).parse().unwrap();
@@ -185,7 +189,7 @@ pub(crate) struct Client {
 impl Client {
     pub(crate) async fn init() -> Self {
         let fantoccini = fantoccini::ClientBuilder::rustls()
-            .unwrap()
+            .expect("rustls based ClientBuilder to have been instantiated")
             .capabilities((*WEBDRIVER_CAPABILITIES).clone())
             .connect(&WEBDRIVER_ADDRESS)
             .await
@@ -242,7 +246,7 @@ macro_rules! test {
                 client: client.clone(),
                 url,
             };
-            // run test catching panic
+            // run test (catching panic)
             let res = tokio::spawn(super::$test_fn(ctx)).await;
             // teardown
             client.fantoccini.close().await.unwrap();
