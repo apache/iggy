@@ -34,7 +34,7 @@ use rolling_file::{BasicRollingFileAppender, RollingConditionBasic};
 use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::{debug, error, info, trace, warn};
@@ -52,7 +52,6 @@ use tracing_subscriber::{
 
 const IGGY_LOG_FILE_PREFIX: &str = "iggy-server.log";
 const MIN_DISK_SPACE_BYTES: u64 = 10 * 1024 * 1024;
-const LOG_ROTATION_CHECK_INTERVAL_SECONDS: u64 = 3600;
 
 // Writer that does nothing
 struct NullWriter;
@@ -135,6 +134,8 @@ pub struct Logging {
 
     early_logs_buffer: Arc<Mutex<Vec<String>>>,
     rotation_should_stop: Arc<AtomicBool>,
+    rotation_thread: Option<std::thread::JoinHandle<()>>,
+    rotation_stop_sender: Arc<Mutex<Option<std::sync::mpsc::Sender<()>>>>,
 }
 
 impl Logging {
@@ -147,6 +148,8 @@ impl Logging {
             env_filter_reload_handle: None,
             otel_logs_reload_handle: None,
             otel_traces_reload_handle: None,
+            rotation_thread: None,
+            rotation_stop_sender: Arc::new(Mutex::new(None)),
             early_logs_buffer: Arc::new(Mutex::new(vec![])),
             rotation_should_stop: Arc::new(AtomicBool::new(false)),
         }
@@ -284,11 +287,11 @@ impl Logging {
 
             let max_files = Self::calculate_max_files(
                 config.max_total_size.as_bytes_u64(),
-                config.max_size.as_bytes_u64(),
+                config.max_file_size.as_bytes_u64(),
             );
 
             let condition = RollingConditionBasic::new()
-                .max_size(config.max_size.as_bytes_u64())
+                .max_size(config.max_file_size.as_bytes_u64())
                 .hourly();
 
             let file_appender = BasicRollingFileAppender::new(
@@ -330,7 +333,7 @@ impl Logging {
             self.init_telemetry(telemetry_config)?;
         }
 
-        self._install_log_rotation_handler(config, logs_path.as_ref());
+        self.rotation_thread = self.install_log_rotation_handler(config, logs_path.as_ref());
 
         if let Some(logs_path) = logs_path {
             info!(
@@ -470,28 +473,61 @@ impl Logging {
         max_files.clamp(1, 1000) as usize
     }
 
-    fn _install_log_rotation_handler(&self, config: &LoggingConfig, logs_path: Option<&PathBuf>) {
+    fn install_log_rotation_handler(
+        &self,
+        config: &LoggingConfig,
+        logs_path: Option<&PathBuf>,
+    ) -> Option<std::thread::JoinHandle<()>> {
         if let Some(logs_path) = logs_path {
             let path = logs_path.to_path_buf();
-            let max_size = config.max_size.as_bytes_u64();
+            let max_total_size_bytes = config.max_total_size.as_bytes_u64();
+            let max_file_size_bytes = config.max_file_size.as_bytes_u64();
+            let rotation_check_interval = config.rotation_check_interval;
             let retention = config.retention.get_duration();
             let should_stop = Arc::clone(&self.rotation_should_stop);
 
-            std::thread::spawn(move || {
-                loop {
-                    if should_stop.load(Ordering::Relaxed) {
-                        break;
+            let (tx, rx) = std::sync::mpsc::channel::<()>();
+
+            {
+                let mut sender_guard = self.rotation_stop_sender.lock().unwrap();
+                *sender_guard = Some(tx.clone());
+            }
+
+            let handle = std::thread::Builder::new()
+                .name("log-rotation".to_string())
+                .spawn(move || {
+                    loop {
+                        if should_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                            debug!("Log rotation thread detected stop flag, exiting");
+                            break;
+                        }
+
+                        match rx.recv_timeout(rotation_check_interval.get_duration()) {
+                            Ok(_) => {
+                                debug!("Log rotation thread received channel stop signal, exiting");
+                                break;
+                            }
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                                Self::cleanup_log_files(
+                                    &path,
+                                    retention,
+                                    max_total_size_bytes,
+                                    max_file_size_bytes,
+                                );
+                            }
+                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                                warn!("Log rotation channel disconnected, exiting thread");
+                                break;
+                            }
+                        }
                     }
+                    debug!("Log rotation thread exited gracefully");
+                })
+                .expect("Failed to spawn log rotation thread");
 
-                    std::thread::sleep(Duration::from_secs(LOG_ROTATION_CHECK_INTERVAL_SECONDS));
-
-                    if should_stop.load(Ordering::Relaxed) {
-                        break;
-                    }
-
-                    Self::cleanup_log_files(&path, retention, max_size);
-                }
-            });
+            Some(handle)
+        } else {
+            None
         }
     }
 
@@ -512,6 +548,17 @@ impl Logging {
         let mut file_entries = Vec::new();
 
         for entry in entries.flatten() {
+            if let Some(file_name) = entry.file_name().to_str() {
+                if file_name == IGGY_LOG_FILE_PREFIX {
+                    continue;
+                }
+                if !file_name.starts_with(IGGY_LOG_FILE_PREFIX) {
+                    continue;
+                }
+            } else {
+                continue;
+            }
+
             let metadata = match entry.metadata() {
                 Ok(metadata) => metadata,
                 Err(e) => {
@@ -556,79 +603,123 @@ impl Logging {
         file_entries
     }
 
-    fn cleanup_log_files(logs_path: &PathBuf, retention: Duration, max_size_bytes: u64) {
+    fn cleanup_log_files(
+        logs_path: &PathBuf,
+        retention: Duration,
+        max_total_size_bytes: u64,
+        max_file_size_bytes: u64,
+    ) {
         use std::fs;
         use std::time::{SystemTime, UNIX_EPOCH};
 
         debug!(
-            "Starting log cleanup for directory: {logs_path:?}, retention: {retention:?}, max_size: {max_size_bytes} bytes"
+            "Starting log cleanup for directory: {logs_path:?}, retention: {retention:?}, max_total_size: {max_total_size_bytes} bytes, max_single_file_size: {max_file_size_bytes} bytes"
         );
 
         let mut file_entries = Self::read_log_files(logs_path);
-
         debug!(
             "Processed {file_entries_len} log files from directory: {logs_path:?}",
             file_entries_len = file_entries.len(),
         );
 
         let mut removed_files_count = 0;
-
-        if !retention.is_zero() {
-            let cutoff = match SystemTime::now().duration_since(UNIX_EPOCH) {
-                Ok(now) => now - retention,
+        let cutoff = if !retention.is_zero() {
+            match SystemTime::now().duration_since(UNIX_EPOCH) {
+                Ok(now) => Some(now - retention),
                 Err(e) => {
                     warn!("Failed to get current time: {e}");
                     return;
                 }
-            };
+            }
+        } else {
+            None
+        };
 
-            for (entry, _, elapsed, _) in &file_entries {
-                if *elapsed < cutoff {
-                    if let Err(e) = fs::remove_file(entry.path()) {
-                        warn!(
-                            "Failed to remove old log file {entry_path:?}: {e}",
-                            entry_path = entry.path()
-                        );
-                    } else {
-                        debug!(
-                            "Removed old log file: {entry_path:?}",
-                            entry_path = entry.path()
-                        );
-                        removed_files_count += 1;
-                    }
-                }
+        let mut to_remove = Vec::new();
+        for (idx, (entry, _, elapsed, file_size)) in file_entries.iter().enumerate() {
+            let mut need_remove = false;
+            if let Some(cutoff) = &cutoff
+                && *elapsed < *cutoff
+            {
+                need_remove = true;
+                debug!(
+                    "Mark old log file for remove: {entry_path:?}",
+                    entry_path = entry.path()
+                );
+            }
+
+            if !need_remove && max_file_size_bytes > 0 && *file_size > max_file_size_bytes {
+                need_remove = true;
+                debug!(
+                    "Mark oversized log file for remove (size: {} bytes, limit: {} bytes): {entry_path:?}",
+                    file_size,
+                    max_file_size_bytes,
+                    entry_path = entry.path()
+                );
+            }
+
+            if need_remove {
+                to_remove.push(idx);
             }
         }
 
-        if max_size_bytes == 0 {
-            return;
-        }
-
-        file_entries = Self::read_log_files(logs_path);
-
-        let total_size: u64 = file_entries.iter().map(|(_, _, _, size)| *size).sum();
-
-        if total_size > max_size_bytes {
-            file_entries.sort_by_key(|(_, modified, _, _)| *modified);
-
-            let mut current_size = total_size;
-            for (entry, _, _, file_size) in file_entries {
-                if current_size <= max_size_bytes {
+        for &idx in to_remove.iter().rev() {
+            let entry = &file_entries[idx];
+            let mut remove_success = false;
+            for _retry in 1..=3 {
+                if fs::remove_file(entry.0.path()).is_ok() {
+                    remove_success = true;
                     break;
                 }
+                std::thread::sleep(Duration::from_millis(100));
+            }
 
-                if let Err(e) = fs::remove_file(entry.path()) {
-                    warn!(
-                        "Failed to remove log file {entry_path:?}: {e}",
-                        entry_path = entry.path()
-                    );
-                } else {
-                    debug!(
-                        "Removed log file to control size: {entry_path:?}",
-                        entry_path = entry.path()
-                    );
-                    current_size = current_size.saturating_sub(file_size);
-                    removed_files_count += 1;
+            if remove_success {
+                debug!(
+                    "Removed log file: {entry_path:?}",
+                    entry_path = entry.0.path()
+                );
+                removed_files_count += 1;
+                file_entries.remove(idx);
+            } else {
+                warn!(
+                    "Failed to remove log file {entry_path:?} after 3 retries",
+                    entry_path = entry.0.path()
+                );
+            }
+        }
+
+        let skip_size_cleanup = max_total_size_bytes == 0 && max_file_size_bytes == 0;
+        if !skip_size_cleanup && max_total_size_bytes > 0 {
+            let total_size: u64 = file_entries.iter().map(|(_, _, _, size)| *size).sum();
+            if total_size > max_total_size_bytes {
+                file_entries.sort_unstable_by_key(|(_, modified, _, _)| *modified);
+
+                let mut current_size = total_size;
+                let mut to_remove_total = Vec::new();
+                for (idx, (_entry, _, _, file_size)) in file_entries.iter().enumerate() {
+                    if current_size <= max_total_size_bytes {
+                        break;
+                    }
+                    to_remove_total.push((idx, *file_size));
+                    current_size = current_size.saturating_sub(*file_size);
+                }
+
+                for (idx, file_size) in to_remove_total.iter().rev() {
+                    let entry = &file_entries[*idx];
+                    if fs::remove_file(entry.0.path()).is_ok() {
+                        debug!(
+                            "Removed log file to control size: {entry_path:?}  freed {file_size} bytes",
+                            entry_path = entry.0.path(),
+                        );
+                        removed_files_count += 1;
+                        file_entries.remove(*idx);
+                    } else {
+                        warn!(
+                            "Failed to remove log file {entry_path:?} for size control",
+                            entry_path = entry.0.path()
+                        );
+                    }
                 }
             }
         }
@@ -647,7 +738,24 @@ impl Default for Logging {
 
 impl Drop for Logging {
     fn drop(&mut self) {
-        self.rotation_should_stop.store(true, Ordering::Relaxed);
+        self.rotation_should_stop
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        debug!("Set rotation_should_stop to true for log rotation thread");
+
+        if let Ok(sender_guard) = self.rotation_stop_sender.lock()
+            && let Some(ref sender) = *sender_guard
+        {
+            let _ = sender.send(()).map_err(|e| {
+                warn!("Failed to send stop signal to log rotation thread: {e}");
+            });
+        }
+
+        if let Some(handle) = self.rotation_thread.take() {
+            match handle.join() {
+                Ok(_) => debug!("Log rotation thread joined successfully"),
+                Err(e) => warn!("Failed to join log rotation thread: {e:?}"),
+            }
+        }
     }
 }
 
@@ -716,7 +824,7 @@ mod tests {
         let file_size = 256 * 1024 * 1024; // 256 MB
         assert_eq!(Logging::calculate_max_files(total_size, file_size), 20);
 
-        let total_size = 1 * 1024 * 1024 * 1024; // 1 GB
+        let total_size = 1024 * 1024 * 1024; // 1 GB
         let file_size = 100 * 1024 * 1024; // 100 MB
         assert_eq!(Logging::calculate_max_files(total_size, file_size), 10);
     }
@@ -726,7 +834,12 @@ mod tests {
         use std::time::Duration;
         let temp_dir = TempDir::new().expect("Failed to create temporary directory");
         let log_path = temp_dir.path().to_path_buf();
-        Logging::cleanup_log_files(&log_path, Duration::from_secs(3600), 1024 * 1024);
+        Logging::cleanup_log_files(
+            &log_path,
+            Duration::from_secs(3600),
+            2048 * 1024,
+            512 * 1024,
+        );
     }
 
     #[test]

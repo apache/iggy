@@ -67,7 +67,7 @@ error_set = { workspace = true }
 figlet-rs = { workspace = true }
 figment = { workspace = true }
 flume = { workspace = true }
-fs2 = "0.4"
+fs2 = "0.4.3"
 futures = { workspace = true }
 hash32 = "1.0.0"
 human-repr = { workspace = true }
