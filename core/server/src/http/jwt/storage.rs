@@ -57,14 +57,14 @@ impl TokenStorage {
 
         let buffer = compio::fs::read(&self.path)
             .await
-            .with_error(|error| {
+            .error(|e: &std::io::Error| {
                 format!(
-                    "{COMPONENT} (error: {error}) - failed to read file into buffer, path: {}",
+                    "{COMPONENT} (error: {e}) - failed to read file into buffer, path: {}",
                     self.path
                 )
             })
-            .map_err(|error| {
-                error!("Cannot open revoked access tokens file: {error}");
+            .map_err(|e| {
+                error!("Cannot open revoked access tokens file: {e}");
                 IggyError::CannotReadFile
             })?;
 
@@ -105,9 +105,9 @@ impl TokenStorage {
         self.persister
             .overwrite(&self.path, bytes)
             .await
-            .with_error(|error| {
+            .error(|e: &IggyError| {
                 format!(
-                    "{COMPONENT} (error: {error}) - failed to overwrite file, path: {}",
+                    "{COMPONENT} (error: {e}) - failed to overwrite file, path: {}",
                     self.path
                 )
             })?;
@@ -118,8 +118,8 @@ impl TokenStorage {
         let tokens = self
             .load_all_revoked_access_tokens()
             .await
-            .with_error(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to load revoked access tokens")
+            .error(|e: &IggyError| {
+                format!("{COMPONENT} (error: {e}) - failed to load revoked access tokens")
             })?;
         if tokens.is_empty() {
             return Ok(());
@@ -139,9 +139,9 @@ impl TokenStorage {
         self.persister
             .overwrite(&self.path, bytes)
             .await
-            .with_error(|error| {
+            .error(|e: &IggyError| {
                 format!(
-                    "{COMPONENT} (error: {error}) - failed to overwrite file, path: {}",
+                    "{COMPONENT} (error: {e}) - failed to overwrite file, path: {}",
                     self.path
                 )
             })?;

@@ -511,7 +511,7 @@ pub async fn load_segments(
             .unwrap()
             .load_all_indexes_from_disk()
             .await
-            .with_error(|error| format!("Failed to load indexes during startup for stream ID: {}, topic ID: {}, partition_id: {}, {error}", stream_id, topic_id, partition_id))
+            .error(|e: &IggyError| format!("Failed to load indexes during startup for stream ID: {}, topic ID: {}, partition_id: {}, {e}", stream_id, topic_id, partition_id))
             .map_err(|_| IggyError::CannotReadFile)?
         };
 
@@ -567,7 +567,7 @@ pub async fn load_segments(
                     match messages_reader.load_messages_from_disk(batch_indexes).await {
                         Ok(messages_batch) => {
                             if let Err(e) = messages_batch.validate_checksums() {
-                                return Err(IggyError::CannotReadPartitions).with_error(|_| {
+                                return Err(IggyError::CannotReadPartitions).error(|_: &IggyError| {
                                     format!(
                                         "Failed to validate message checksum for segment at offset {} in stream ID: {}, topic ID: {}, partition ID: {}, error: {}",
                                         start_offset, stream_id, topic_id, partition_id, e
@@ -578,7 +578,7 @@ pub async fn load_segments(
                             current_relative_offset += batch_count;
                         }
                         Err(e) => {
-                            return Err(e).with_error(|_| {
+                            return Err(e).error(|_: &IggyError| {
                                 format!(
                                     "Failed to load messages from disk for checksum validation at offset {} in stream ID: {}, topic ID: {}, partition ID: {}",
                                     start_offset, stream_id, topic_id, partition_id

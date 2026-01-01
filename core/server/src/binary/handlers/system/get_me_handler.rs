@@ -42,11 +42,13 @@ impl ServerCommandHandler for GetMe {
         session: &Session,
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {
-        let Some(client) = shard
-            .get_client(session, session.client_id)
-            .with_error(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to get current client for session: {session}")
-            })?
+        let Some(client) = shard.get_client(session, session.client_id).error(
+            |e: &IggyError| {
+                format!(
+                    "{COMPONENT} (error: {e}) - failed to get current client for session: {session}"
+                )
+            },
+        )?
         else {
             return Err(IggyError::ClientNotFound(session.client_id));
         };

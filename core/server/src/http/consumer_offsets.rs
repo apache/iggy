@@ -30,6 +30,7 @@ use err_trail::ErrContext;
 use iggy_common::Consumer;
 use iggy_common::ConsumerOffsetInfo;
 use iggy_common::Identifier;
+use iggy_common::IggyError;
 use iggy_common::Validatable;
 use iggy_common::delete_consumer_offset::DeleteConsumerOffset;
 use iggy_common::get_consumer_offset::GetConsumerOffset;
@@ -106,7 +107,7 @@ async fn store_consumer_offset(
             command.0.offset,
         )
         .await
-        .with_error(|error| format!("{COMPONENT} (error: {error}) - failed to store consumer offset, stream ID: {}, topic ID: {}, partition ID: {:?}", stream_id, topic_id, command.0.partition_id))?;
+        .error(|e: &IggyError| format!("{COMPONENT} (error: {e}) - failed to store consumer offset, stream ID: {}, topic ID: {}, partition ID: {:?}", stream_id, topic_id, command.0.partition_id))?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -129,6 +130,6 @@ async fn delete_consumer_offset(
             query.partition_id,
         )
         .await
-        .with_error(|error| format!("{COMPONENT} (error: {error}) - failed to delete consumer offset, stream ID: {}, topic ID: {}, partition ID: {:?}", stream_id, topic_id, query.partition_id))?;
+        .error(|e: &IggyError| format!("{COMPONENT} (error: {e}) - failed to delete consumer offset, stream ID: {}, topic ID: {}, partition ID: {:?}", stream_id, topic_id, query.partition_id))?;
     Ok(StatusCode::NO_CONTENT)
 }

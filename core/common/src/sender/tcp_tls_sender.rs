@@ -41,7 +41,9 @@ impl Sender for TcpTlsSender {
         self.stream
             .flush()
             .await
-            .with_error(|e| format!("failed to flush TCP stream after sending response: {e}"))
+            .error(|e: &std::io::Error| {
+                format!("failed to flush TCP stream after sending response: {e}")
+            })
             .map_err(|_| IggyError::TcpError)
     }
 
@@ -50,7 +52,9 @@ impl Sender for TcpTlsSender {
         self.stream
             .flush()
             .await
-            .with_error(|e| format!("failed to flush TCP stream after sending response: {e}"))
+            .error(|e: &std::io::Error| {
+                format!("failed to flush TCP stream after sending response: {e}")
+            })
             .map_err(|_| IggyError::TcpError)
     }
 
@@ -59,7 +63,9 @@ impl Sender for TcpTlsSender {
         self.stream
             .flush()
             .await
-            .with_error(|e| format!("failed to flush TCP stream after sending response: {e}"))
+            .error(|e: &std::io::Error| {
+                format!("failed to flush TCP stream after sending response: {e}")
+            })
             .map_err(|_| IggyError::TcpError)
     }
 
@@ -67,8 +73,8 @@ impl Sender for TcpTlsSender {
         self.stream
             .shutdown()
             .await
-            .with_error(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to shutdown TCP TLS stream")
+            .error(|e: &std::io::Error| {
+                format!("{COMPONENT} (error: {e}) - failed to shutdown TCP TLS stream")
             })
             .map_err(|e| IggyError::IoError(e.to_string()))
     }
@@ -82,7 +88,9 @@ impl Sender for TcpTlsSender {
         self.stream
             .flush()
             .await
-            .with_error(|e| format!("failed to flush TCP stream after sending response: {e}"))
+            .error(|e: &std::io::Error| {
+                format!("failed to flush TCP stream after sending response: {e}")
+            })
             .map_err(|_| IggyError::TcpError)
     }
 }
