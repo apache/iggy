@@ -113,7 +113,7 @@ public final class MessageHeadersProducer {
                 String json = serializableMessage.toJson();
                 Map<String, HeaderValue> userHeaders = new HashMap<>();
                 userHeaders.put(MESSAGE_TYPE_HEADER, new HeaderValue(HeaderKind.String, messageType));
-                messages.add(Message.of(json, Optional.of(userHeaders)));
+                messages.add(Message.of(json, userHeaders));
                 serializableMessages.add(serializableMessage);
             }
 

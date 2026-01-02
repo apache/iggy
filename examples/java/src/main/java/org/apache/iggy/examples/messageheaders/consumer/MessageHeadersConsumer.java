@@ -123,13 +123,13 @@ public final class MessageHeadersConsumer {
         String messageType = "unknown";
 
         try {
-            Optional<Map<String, HeaderValue>> userHeaders = message.userHeaders();
+            Map<String, HeaderValue> userHeaders = message.userHeaders();
             if (userHeaders.isEmpty()) {
                 log.warn("Missing headers at offset {}.", message.header().offset());
                 return;
             }
 
-            HeaderValue headerValue = userHeaders.get().get(MESSAGE_TYPE_HEADER);
+            HeaderValue headerValue = userHeaders.get(MESSAGE_TYPE_HEADER);
             if (headerValue == null) {
                 log.warn(
                         "Missing message type header at offset {}.",
