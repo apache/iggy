@@ -21,6 +21,7 @@ mod commands;
 mod configs;
 mod error;
 mod sender;
+pub mod sharding;
 mod traits;
 mod types;
 mod utils;

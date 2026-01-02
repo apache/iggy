@@ -102,8 +102,8 @@ impl ServerCommandHandler for DeleteTopic {
                         .state
                         .apply(session.get_user_id(), &EntryCommand::DeleteTopic(self))
                         .await
-                        .with_error(|error| format!(
-                            "{COMPONENT} (error: {error}) - failed to apply delete topic with ID: {topic_id_num} in stream with ID: {stream_id_num}, session: {session}",
+                        .error(|e: &IggyError| format!(
+                            "{COMPONENT} (error: {e}) - failed to apply delete topic with ID: {topic_id_num} in stream with ID: {stream_id_num}, session: {session}",
                         ))?;
                     sender.send_empty_ok_response().await?;
                 } else {
@@ -118,8 +118,8 @@ impl ServerCommandHandler for DeleteTopic {
                         .state
                         .apply(session.get_user_id(), &EntryCommand::DeleteTopic(self))
                         .await
-                        .with_error(|error| format!(
-                            "{COMPONENT} (error: {error}) - failed to apply delete topic with ID: {}, session: {session}",
+                        .error(|e: &IggyError| format!(
+                            "{COMPONENT} (error: {e}) - failed to apply delete topic with ID: {}, session: {session}",
                             topic.id()
                         ))?;
 
