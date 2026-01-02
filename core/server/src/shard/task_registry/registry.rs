@@ -16,12 +16,16 @@
 // under the License.
 
 use super::shutdown::{Shutdown, ShutdownToken};
+use crate::shard::transmission::connector::StopSender;
 use compio::runtime::JoinHandle;
+use futures::FutureExt;
 use futures::future::join_all;
 use iggy_common::IggyError;
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::future::Future;
 use std::ops::{AsyncFn, AsyncFnOnce};
+use std::panic::AssertUnwindSafe;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, trace, warn};
 
@@ -44,6 +48,7 @@ pub struct TaskRegistry {
     shard_id: u16,
     shutdown: Shutdown,
     shutdown_token: ShutdownToken,
+    all_stop_senders: Vec<StopSender>,
     long_running: RefCell<Vec<TaskHandle>>,
     oneshots: RefCell<Vec<TaskHandle>>,
     connections: RefCell<HashMap<u32, async_channel::Sender<()>>>,
@@ -51,12 +56,13 @@ pub struct TaskRegistry {
 }
 
 impl TaskRegistry {
-    pub fn new(shard_id: u16) -> Self {
+    pub fn new(shard_id: u16, all_stop_senders: Vec<StopSender>) -> Self {
         let (s, t) = Shutdown::new();
         Self {
             shard_id,
             shutdown: s,
             shutdown_token: t,
+            all_stop_senders,
             long_running: RefCell::new(vec![]),
             oneshots: RefCell::new(vec![]),
             connections: RefCell::new(HashMap::new()),
@@ -88,20 +94,56 @@ impl TaskRegistry {
 
         let shutdown = self.shutdown_token.clone();
         let shard_id = self.shard_id;
+        let all_stop_senders = self.all_stop_senders.clone();
 
         let handle = compio::runtime::spawn(async move {
             trace!("continuous '{}' starting on shard {}", name, shard_id);
-            let fut = f(shutdown);
-            let r = fut.await;
-            match &r {
-                Ok(()) => debug!("continuous '{}' completed on shard {}", name, shard_id),
-                Err(e) => error!("continuous '{}' failed on shard {}: {}", name, shard_id, e),
-            }
+
+            let fut = AssertUnwindSafe(f(shutdown)).catch_unwind();
+            let result = fut.await;
+
+            let (r, should_trigger_shutdown) = match result {
+                Ok(r) => {
+                    match &r {
+                        Ok(()) => debug!("continuous '{}' completed on shard {}", name, shard_id),
+                        Err(e) => {
+                            error!("continuous '{}' failed on shard {}: {}", name, shard_id, e);
+                        }
+                    }
+                    // Trigger shutdown for critical task errors
+                    let trigger = critical && r.is_err();
+                    (r, trigger)
+                }
+                Err(panic_payload) => {
+                    let panic_msg = panic_payload
+                        .downcast_ref::<&str>()
+                        .map(|s| s.to_string())
+                        .or_else(|| panic_payload.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "unknown panic".to_string());
+                    error!(
+                        "continuous '{}' panicked on shard {}: {}",
+                        name, shard_id, panic_msg
+                    );
+                    // Trigger shutdown for critical task panics
+                    (Err(IggyError::Error), critical)
+                }
+            };
 
             // Execute on_shutdown callback if provided
             if let Some(shutdown_fn) = on_shutdown {
                 trace!("continuous '{}' executing on_shutdown callback", name);
                 shutdown_fn(r.clone()).await;
+            }
+
+            // Trigger shutdown for ALL shards when critical task fails
+            if should_trigger_shutdown {
+                error!(
+                    "Critical task '{}' failed on shard {}, triggering shutdown for all shards",
+                    name, shard_id
+                );
+                for stop_sender in &all_stop_senders {
+                    let _ = stop_sender.try_send(());
+                }
             }
 
             r
@@ -138,6 +180,7 @@ impl TaskRegistry {
         let shutdown = self.shutdown_token.clone();
         let shutdown_for_task = self.shutdown_token.clone();
         let shard_id = self.shard_id;
+        let all_stop_senders = self.all_stop_senders.clone();
 
         let handle = compio::runtime::spawn(async move {
             trace!(
@@ -150,12 +193,36 @@ impl TaskRegistry {
                     break;
                 }
 
-                let fut = tick_fn(shutdown_for_task.clone());
-                if let Err(e) = fut.await {
-                    error!(
-                        "periodic '{}' tick failed on shard {}: {}",
-                        name, shard_id, e
-                    );
+                let fut = AssertUnwindSafe(tick_fn(shutdown_for_task.clone())).catch_unwind();
+                match fut.await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        error!(
+                            "periodic '{}' tick failed on shard {}: {}",
+                            name, shard_id, e
+                        );
+                    }
+                    Err(panic_payload) => {
+                        let panic_msg = panic_payload
+                            .downcast_ref::<&str>()
+                            .map(|s| s.to_string())
+                            .or_else(|| panic_payload.downcast_ref::<String>().cloned())
+                            .unwrap_or_else(|| "unknown panic".to_string());
+                        error!(
+                            "periodic '{}' tick panicked on shard {}: {}",
+                            name, shard_id, panic_msg
+                        );
+                        if critical {
+                            error!(
+                                "Critical periodic task '{}' panicked on shard {}, triggering shutdown",
+                                name, shard_id
+                            );
+                            for stop_sender in &all_stop_senders {
+                                let _ = stop_sender.try_send(());
+                            }
+                            return Err(IggyError::Error);
+                        }
+                    }
                 }
             }
 
@@ -212,24 +279,63 @@ impl TaskRegistry {
 
         let shutdown = self.shutdown_token.clone();
         let shard_id = self.shard_id;
+        let all_stop_senders = self.all_stop_senders.clone();
 
         let handle = compio::runtime::spawn(async move {
             trace!("oneshot '{}' starting on shard {}", name, shard_id);
-            let fut = f(shutdown);
 
-            let r = if let Some(d) = timeout {
-                match compio::time::timeout(d, fut).await {
-                    Ok(r) => r,
-                    Err(_) => Err(IggyError::TaskTimeout),
+            let fut = if let Some(d) = timeout {
+                let inner_fut = AssertUnwindSafe(f(shutdown)).catch_unwind();
+                match compio::time::timeout(d, inner_fut).await {
+                    Ok(Ok(r)) => Ok(r),
+                    Ok(Err(panic_payload)) => Err(panic_payload),
+                    Err(_) => Ok(Err(IggyError::TaskTimeout)),
                 }
             } else {
-                fut.await
+                AssertUnwindSafe(f(shutdown)).catch_unwind().await
             };
 
-            match &r {
-                Ok(()) => trace!("oneshot '{}' completed on shard {}", name, shard_id),
-                Err(e) => error!("oneshot '{}' failed on shard {}: {}", name, shard_id, e),
-            }
+            let r = match fut {
+                Ok(r) => {
+                    match &r {
+                        Ok(()) => trace!("oneshot '{}' completed on shard {}", name, shard_id),
+                        Err(e) => {
+                            error!("oneshot '{}' failed on shard {}: {}", name, shard_id, e);
+                            if critical {
+                                error!(
+                                    "Critical oneshot task '{}' failed on shard {}, triggering shutdown",
+                                    name, shard_id
+                                );
+                                for stop_sender in &all_stop_senders {
+                                    let _ = stop_sender.try_send(());
+                                }
+                            }
+                        }
+                    }
+                    r
+                }
+                Err(panic_payload) => {
+                    let panic_msg = panic_payload
+                        .downcast_ref::<&str>()
+                        .map(|s| s.to_string())
+                        .or_else(|| panic_payload.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "unknown panic".to_string());
+                    error!(
+                        "oneshot '{}' panicked on shard {}: {}",
+                        name, shard_id, panic_msg
+                    );
+                    if critical {
+                        error!(
+                            "Critical oneshot task '{}' panicked on shard {}, triggering shutdown",
+                            name, shard_id
+                        );
+                        for stop_sender in &all_stop_senders {
+                            let _ = stop_sender.try_send(());
+                        }
+                    }
+                    Err(IggyError::Error)
+                }
+            };
 
             if let Some(on_shutdown) = on_shutdown {
                 on_shutdown(r.clone()).await;
@@ -379,11 +485,34 @@ impl TaskRegistry {
 
     /// Spawn a connection handler that doesn't need to be tracked for shutdown.
     /// These handlers have their own shutdown mechanism via connection channels.
+    /// If the handler panics, shutdown is triggered for all shards.
     pub fn spawn_connection<F>(&self, future: F)
     where
         F: Future<Output = ()> + 'static,
     {
-        compio::runtime::spawn(future).detach();
+        let shard_id = self.shard_id;
+        let all_stop_senders = self.all_stop_senders.clone();
+
+        compio::runtime::spawn(async move {
+            let fut = AssertUnwindSafe(future).catch_unwind();
+            if let Err(panic_payload) = fut.await {
+                let panic_msg = panic_payload
+                    .downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| panic_payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "unknown panic".to_string());
+
+                error!(
+                    "Connection handler panicked on shard {}: {}, triggering shutdown",
+                    shard_id, panic_msg
+                );
+
+                for stop_sender in &all_stop_senders {
+                    let _ = stop_sender.try_send(());
+                }
+            }
+        })
+        .detach();
     }
 }
 
@@ -391,9 +520,14 @@ impl TaskRegistry {
 mod tests {
     use super::*;
 
+    fn create_test_registry(shard_id: u16) -> TaskRegistry {
+        let (stop_sender, _stop_receiver) = async_channel::bounded(1);
+        TaskRegistry::new(shard_id, vec![stop_sender])
+    }
+
     #[compio::test]
     async fn test_oneshot_completion_detection() {
-        let registry = TaskRegistry::new(1);
+        let registry = create_test_registry(1);
 
         // Spawn a failing non-critical task
         registry
@@ -416,7 +550,7 @@ mod tests {
 
     #[compio::test]
     async fn test_oneshot_critical_failure() {
-        let registry = TaskRegistry::new(1);
+        let registry = create_test_registry(1);
 
         // Spawn a failing critical task
         registry
@@ -434,7 +568,7 @@ mod tests {
 
     #[compio::test]
     async fn test_shutdown_prevents_spawning() {
-        let registry = TaskRegistry::new(1);
+        let registry = create_test_registry(1);
 
         // Trigger shutdown
         *registry.shutting_down.borrow_mut() = true;
@@ -453,7 +587,7 @@ mod tests {
 
     #[compio::test]
     async fn test_timeout_error() {
-        let registry = TaskRegistry::new(1);
+        let registry = create_test_registry(1);
 
         // Create a task that will timeout
         let handle = compio::runtime::spawn(async move {
@@ -479,7 +613,7 @@ mod tests {
 
     #[compio::test]
     async fn test_composite_timeout() {
-        let registry = TaskRegistry::new(1);
+        let registry = create_test_registry(1);
 
         // Create a long-running task that takes 100ms
         let long_handle = compio::runtime::spawn(async move {
@@ -516,7 +650,7 @@ mod tests {
 
     #[compio::test]
     async fn test_composite_timeout_insufficient() {
-        let registry = TaskRegistry::new(1);
+        let registry = create_test_registry(1);
 
         // Create a long-running task that takes 50ms
         let long_handle = compio::runtime::spawn(async move {
@@ -555,7 +689,7 @@ mod tests {
     async fn test_periodic_last_tick_timeout() {
         // This test verifies that periodic tasks with last_tick_on_shutdown
         // don't hang shutdown if the final tick takes too long
-        let registry = TaskRegistry::new(1);
+        let registry = create_test_registry(1);
 
         // Create a handle that simulates a periodic task whose final tick will hang
         let handle = compio::runtime::spawn(async move {

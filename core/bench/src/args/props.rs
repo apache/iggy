@@ -28,6 +28,13 @@ pub trait BenchmarkKindProps {
     fn transport_command(&self) -> &BenchmarkTransportCommand;
     fn max_topic_size(&self) -> Option<IggyByteSize>;
     fn validate(&self);
+
+    /// Consumer rate limit multiplier relative to producer rate.
+    /// Only applicable to benchmarks with separate producer/consumer actors.
+    fn read_amplification(&self) -> Option<f32> {
+        None
+    }
+
     fn inner(&self) -> &dyn BenchmarkKindProps
     where
         Self: std::marker::Sized,

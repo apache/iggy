@@ -1,0 +1,214 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: _publish_rust_crates
+on:
+  workflow_call:
+    inputs:
+      crates:
+        type: string
+        required: true
+        description: "Comma-separated list of crates to publish: rust-common,rust-binary-protocol,rust-sdk,rust-cli"
+      dry_run:
+        type: boolean
+        required: false
+        default: false
+        description: "Dry run mode - validate without publishing"
+      create_tags:
+        type: boolean
+        required: false
+        default: true
+        description: "Create git tags after successful publishing"
+      commit:
+        type: string
+        required: false
+        default: ""
+        description: "Specific commit to checkout (defaults to github.sha)"
+      use_latest_ci:
+        type: boolean
+        required: false
+        default: false
+        description: "Use latest CI configuration from master branch"
+    secrets:
+      CARGO_REGISTRY_TOKEN:
+        required: true
+    outputs:
+      status:
+        description: "Publishing status"
+        value: ${{ jobs.publish.outputs.status }}
+
+permissions:
+  contents: write
+
+env:
+  IGGY_CI_BUILD: true
+
+jobs:
+  publish:
+    name: Publish Rust crates
+    runs-on: ubuntu-latest
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+    outputs:
+      status: ${{ steps.final-status.outputs.status }}
+    steps:
+      - name: Download latest copy script from master
+        if: inputs.use_latest_ci
+        run: |
+          curl -sSL "https://raw.githubusercontent.com/${{ github.repository }}/master/scripts/copy-latest-from-master.sh" \
+            -o /tmp/copy-latest-from-master.sh
+          chmod +x /tmp/copy-latest-from-master.sh
+          echo "✅ Downloaded latest copy script from master"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit || github.sha }}
+          fetch-depth: 0
+
+      - name: Save and apply latest CI from master
+        if: inputs.use_latest_ci
+        run: |
+          /tmp/copy-latest-from-master.sh save \
+            .github \
+            scripts \
+            web/Dockerfile \
+            core/server/Dockerfile \
+            core/ai/mcp/Dockerfile \
+            core/connectors/runtime/Dockerfile \
+            core/bench/dashboard/server/Dockerfile
+
+          /tmp/copy-latest-from-master.sh apply
+
+      - name: Setup Rust with cache
+        uses: ./.github/actions/utils/setup-rust-with-cache
+        with:
+          cache-targets: false
+          show-stats: false
+
+      - name: Extract versions
+        id: versions
+        run: |
+          chmod +x scripts/extract-version.sh
+          echo "common=$(scripts/extract-version.sh rust-common)" >> "$GITHUB_OUTPUT"
+          echo "protocol=$(scripts/extract-version.sh rust-binary-protocol)" >> "$GITHUB_OUTPUT"
+          echo "sdk=$(scripts/extract-version.sh rust-sdk)" >> "$GITHUB_OUTPUT"
+          echo "cli=$(scripts/extract-version.sh rust-cli)" >> "$GITHUB_OUTPUT"
+
+          echo "📦 Versions to publish:"
+          echo "  iggy_common: $(scripts/extract-version.sh rust-common)"
+          echo "  iggy_binary_protocol: $(scripts/extract-version.sh rust-binary-protocol)"
+          echo "  iggy: $(scripts/extract-version.sh rust-sdk)"
+          echo "  iggy-cli: $(scripts/extract-version.sh rust-cli)"
+
+      # Step 1: Publish iggy_common
+      - name: Publish iggy_common
+        if: contains(inputs.crates, 'rust-common')
+        uses: ./.github/actions/rust/post-merge
+        with:
+          package: iggy_common
+          version: ${{ steps.versions.outputs.common }}
+          dry_run: ${{ inputs.dry_run }}
+
+      - name: Wait for iggy_common to be available
+        if: contains(inputs.crates, 'rust-common') && inputs.dry_run == false
+        run: |
+          echo "⏳ Waiting for iggy_common to be available on crates.io..."
+          for i in {1..30}; do
+            if cargo search iggy_common --limit 1 | grep -q "^iggy_common = \"${{ steps.versions.outputs.common }}\""; then
+              echo "✅ iggy_common is now available"
+              break
+            fi
+            echo "Waiting... (attempt $i/30)"
+            sleep 10
+          done
+
+      # Step 2: Publish iggy_binary_protocol (depends on common)
+      - name: Publish iggy_binary_protocol
+        if: contains(inputs.crates, 'rust-binary-protocol')
+        uses: ./.github/actions/rust/post-merge
+        with:
+          package: iggy_binary_protocol
+          version: ${{ steps.versions.outputs.protocol }}
+          dry_run: ${{ inputs.dry_run }}
+
+      - name: Wait for iggy_binary_protocol to be available
+        if: contains(inputs.crates, 'rust-binary-protocol') && inputs.dry_run == false
+        run: |
+          echo "⏳ Waiting for iggy_binary_protocol to be available on crates.io..."
+          for i in {1..30}; do
+            if cargo search iggy_binary_protocol --limit 1 | grep -q "^iggy_binary_protocol = \"${{ steps.versions.outputs.protocol }}\""; then
+              echo "✅ iggy_binary_protocol is now available"
+              break
+            fi
+            echo "Waiting... (attempt $i/30)"
+            sleep 10
+          done
+
+      # Step 3: Publish iggy SDK (depends on common and protocol)
+      - name: Publish iggy SDK
+        if: contains(inputs.crates, 'rust-sdk')
+        uses: ./.github/actions/rust/post-merge
+        with:
+          package: iggy
+          version: ${{ steps.versions.outputs.sdk }}
+          dry_run: ${{ inputs.dry_run }}
+
+      - name: Wait for iggy SDK to be available
+        if: contains(inputs.crates, 'rust-sdk') && inputs.dry_run == false
+        run: |
+          echo "⏳ Waiting for iggy to be available on crates.io..."
+          for i in {1..30}; do
+            if cargo search iggy --limit 1 | grep -q "^iggy = \"${{ steps.versions.outputs.sdk }}\""; then
+              echo "✅ iggy SDK is now available"
+              break
+            fi
+            echo "Waiting... (attempt $i/30)"
+            sleep 10
+          done
+
+      # Step 4: Publish iggy-cli (depends on SDK and protocol)
+      - name: Publish iggy-cli
+        if: contains(inputs.crates, 'rust-cli')
+        uses: ./.github/actions/rust/post-merge
+        with:
+          package: iggy-cli
+          version: ${{ steps.versions.outputs.cli }}
+          dry_run: ${{ inputs.dry_run }}
+
+      # Create git tags
+      - name: Create git tags
+        if: inputs.create_tags && inputs.dry_run == false
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          for crate in $(echo "${{ inputs.crates }}" | tr ',' ' '); do
+            TAG=$(scripts/extract-version.sh "$crate" --tag)
+            if ! git rev-parse "$TAG" >/dev/null 2>&1; then
+              git tag -a "$TAG" -m "Release $TAG"
+              git push origin "$TAG"
+              echo "✅ Created tag: $TAG"
+            else
+              echo "⏭️ Tag $TAG already exists"
+            fi
+          done
+
+      - name: Set final status output
+        id: final-status
+        if: always()
+        run: echo "status=${{ job.status }}" >> "$GITHUB_OUTPUT"

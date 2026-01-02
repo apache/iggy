@@ -16,7 +16,9 @@
  * under the License.
  */
 
-use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
+use crate::binary::command::{
+    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
+};
 use crate::binary::handlers::consumer_groups::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 
@@ -41,7 +43,7 @@ impl ServerCommandHandler for JoinConsumerGroup {
         _length: u32,
         session: &Session,
         shard: &Rc<IggyShard>,
-    ) -> Result<(), IggyError> {
+    ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
         shard
             .join_consumer_group(
@@ -50,15 +52,15 @@ impl ServerCommandHandler for JoinConsumerGroup {
                 &self.topic_id,
                 &self.group_id,
             )
-            .with_error(|error| {
+            .error(|e: &IggyError| {
                 format!(
-                    "{COMPONENT} (error: {error}) - failed to join consumer group for stream_id: {}, topic_id: {}, group_id: {}, session: {}",
+                    "{COMPONENT} (error: {e}) - failed to join consumer group for stream_id: {}, topic_id: {}, group_id: {}, session: {}",
                     self.stream_id, self.topic_id, self.group_id, session
                 )
             })?;
 
         sender.send_empty_ok_response().await?;
-        Ok(())
+        Ok(HandlerResult::Finished)
     }
 }
 

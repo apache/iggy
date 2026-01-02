@@ -29,6 +29,7 @@ use axum::routing::post;
 use axum::{Extension, Json, Router, debug_handler};
 use err_trail::ErrContext;
 use iggy_common::Identifier;
+use iggy_common::IggyError;
 use iggy_common::Validatable;
 use iggy_common::create_partitions::CreatePartitions;
 use iggy_common::delete_partitions::DeletePartitions;
@@ -80,9 +81,9 @@ async fn create_partitions(
     });
 
     broadcast_future.await
-            .with_error(|error| {
+            .error(|e: &CustomError| {
                 format!(
-                    "{COMPONENT} (error: {error}) - failed to broadcast partition events, stream ID: {stream_id}, topic ID: {topic_id}"
+                    "{COMPONENT} (error: {e}) - failed to broadcast partition events, stream ID: {stream_id}, topic ID: {topic_id}"
                 )
             })?;
     let command = EntryCommand::CreatePartitions(command);
@@ -90,9 +91,9 @@ async fn create_partitions(
         SendWrapper::new(state.shard.shard().state.apply(identity.user_id, &command));
 
     state_future.await
-        .with_error(|error| {
+        .error(|e: &IggyError| {
             format!(
-                "{COMPONENT} (error: {error}) - failed to apply create partitions, stream ID: {stream_id}, topic ID: {topic_id}"
+                "{COMPONENT} (error: {e}) - failed to apply create partitions, stream ID: {stream_id}, topic ID: {topic_id}"
             )
         })?;
 
@@ -120,9 +121,9 @@ async fn delete_partitions(
             query.partitions_count,
         ));
 
-        delete_future.await.with_error(|error| {
+        delete_future.await.error(|e: &IggyError| {
             format!(
-                "{COMPONENT} (error: {error}) - failed to delete partitions for topic with ID: {topic_id} in stream with ID: {stream_id}"
+                "{COMPONENT} (error: {e}) - failed to delete partitions for topic with ID: {topic_id} in stream with ID: {stream_id}"
             )
         })?
     };
@@ -154,9 +155,9 @@ async fn delete_partitions(
         SendWrapper::new(state.shard.shard().state.apply(identity.user_id, &command));
 
     state_future.await
-        .with_error(|error| {
+        .error(|e: &IggyError| {
             format!(
-                "{COMPONENT} (error: {error}) - failed to apply delete partitions, stream ID: {stream_id}, topic ID: {topic_id}"
+                "{COMPONENT} (error: {e}) - failed to apply delete partitions, stream ID: {stream_id}, topic ID: {topic_id}"
             )
         })?;
 

@@ -18,7 +18,9 @@
 
 use std::rc::Rc;
 
-use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
+use crate::binary::command::{
+    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
+};
 use crate::binary::handlers::users::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 
@@ -49,7 +51,7 @@ impl ServerCommandHandler for DeleteUser {
         _length: u32,
         session: &Session,
         shard: &Rc<IggyShard>,
-    ) -> Result<(), IggyError> {
+    ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
 
         let request = ShardRequest {
@@ -71,9 +73,9 @@ impl ServerCommandHandler for DeleteUser {
                     let _user_guard = shard.fs_locks.user_lock.lock().await;
                     let user = shard
                         .delete_user(session, &user_id)
-                        .with_error(|error| {
+                        .error(|e: &IggyError| {
                         format!(
-                            "{COMPONENT} (error: {error}) - failed to delete user with ID: {}, session: {session}",
+                            "{COMPONENT} (error: {e}) - failed to delete user with ID: {}, session: {session}",
                             user_id
                         )
                     })?;
@@ -86,9 +88,9 @@ impl ServerCommandHandler for DeleteUser {
                         .state
                         .apply(user.id, &EntryCommand::DeleteUser(DeleteUser { user_id: user.id.try_into().unwrap() }))
                         .await
-                        .with_error(|error| {
+                        .error(|e: &IggyError| {
                             format!(
-                                "{COMPONENT} (error: {error}) - failed to apply delete user with ID: {user_id}, session: {session}",
+                                "{COMPONENT} (error: {e}) - failed to apply delete user with ID: {user_id}, session: {session}",
                                 user_id = user.id,
                                 session = session
                             )
@@ -102,9 +104,9 @@ impl ServerCommandHandler for DeleteUser {
                         .state
                         .apply(user.id, &EntryCommand::DeleteUser(DeleteUser { user_id: user.id.try_into().unwrap() }))
                         .await
-                        .with_error(|error| {
+                        .error(|e: &IggyError| {
                             format!(
-                                "{COMPONENT} (error: {error}) - failed to apply delete user with ID: {user_id}, session: {session}",
+                                "{COMPONENT} (error: {e}) - failed to apply delete user with ID: {user_id}, session: {session}",
                                 user_id = user.id,
                                 session = session
                             )
@@ -122,7 +124,7 @@ impl ServerCommandHandler for DeleteUser {
             },
         }
 
-        Ok(())
+        Ok(HandlerResult::Finished)
     }
 }
 

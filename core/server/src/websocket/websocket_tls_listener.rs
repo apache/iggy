@@ -52,9 +52,9 @@ pub async fn start(
     let mut addr: SocketAddr = config
         .address
         .parse()
-        .with_error(|error| {
+        .error(|e: &std::net::AddrParseError| {
             format!(
-                "WebSocket TLS (error: {error}) - failed to parse address: {}",
+                "WebSocket TLS (error: {e}) - failed to parse address: {}",
                 config.address
             )
         })
@@ -74,8 +74,8 @@ pub async fn start(
 
     let listener = create_listener(addr)
         .await
-        .with_error(|error| {
-            format!("WebSocket TLS (error: {error}) - failed to bind to address: {addr}")
+        .error(|e: &std::io::Error| {
+            format!("WebSocket TLS (error: {e}) - failed to bind to address: {addr}")
         })
         .map_err(|_| IggyError::CannotBindToSocket(addr.to_string()))?;
 
@@ -97,7 +97,9 @@ pub async fn start(
         }
     } else {
         // Non-shard0 just handles the event locally
-        shard.handle_event(event).await.ok();
+        crate::shard::handlers::handle_event(&shard, event)
+            .await
+            .ok();
     }
 
     // Ensure rustls crypto provider is installed

@@ -368,7 +368,7 @@ pub async fn load_messages_from_disk_by_timestamp(
         .expect("Messages reader not initialized")
         .load_messages_from_disk(indexes_to_read)
         .await
-        .with_error(|error| format!("Failed to load messages from disk by timestamp: {error}"))?;
+        .error(|e: &IggyError| format!("Failed to load messages from disk by timestamp: {e}"))?;
 
     Ok(IggyMessagesBatchSet::from(batch))
 }
@@ -498,11 +498,11 @@ pub fn persist_batch(
             .expect("Messages writer not initialized")
             .save_batch_set(batches)
             .await
-            .with_error(|error| {
+            .error(|e: &IggyError| {
                 let segment = log.active_segment();
                 format!(
                     "Failed to save batch of {batch_count} messages \
-                                    ({batch_size} bytes) to {segment}. {error}",
+                                    ({batch_size} bytes) to {segment}. {e}",
                 )
             })?;
 
@@ -514,9 +514,9 @@ pub fn persist_batch(
             .expect("Index writer not initialized")
             .save_indexes(unsaved_indexes_slice)
             .await
-            .with_error(|error| {
+            .error(|e: &IggyError| {
                 let segment = log.active_segment();
-                format!("Failed to save index of {len} indexes to {segment}. {error}",)
+                format!("Failed to save index of {len} indexes to {segment}. {e}",)
             })?;
 
         tracing::trace!(

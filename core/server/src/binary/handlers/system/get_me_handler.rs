@@ -16,7 +16,9 @@
  * under the License.
  */
 
-use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
+use crate::binary::command::{
+    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
+};
 use crate::binary::handlers::system::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
@@ -39,12 +41,14 @@ impl ServerCommandHandler for GetMe {
         _length: u32,
         session: &Session,
         shard: &Rc<IggyShard>,
-    ) -> Result<(), IggyError> {
-        let Some(client) = shard
-            .get_client(session, session.client_id)
-            .with_error(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to get current client for session: {session}")
-            })?
+    ) -> Result<HandlerResult, IggyError> {
+        let Some(client) = shard.get_client(session, session.client_id).error(
+            |e: &IggyError| {
+                format!(
+                    "{COMPONENT} (error: {e}) - failed to get current client for session: {session}"
+                )
+            },
+        )?
         else {
             return Err(IggyError::ClientNotFound(session.client_id));
         };
@@ -52,7 +56,7 @@ impl ServerCommandHandler for GetMe {
         let bytes = mapper::map_client(&client);
 
         sender.send_ok_response(&bytes).await?;
-        Ok(())
+        Ok(HandlerResult::Finished)
     }
 }
 

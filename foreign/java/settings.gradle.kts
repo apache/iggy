@@ -22,9 +22,6 @@ rootProject.name = "iggy-java-sdk"
 include("iggy")
 project(":iggy").projectDir = file("java-sdk")
 
-include("iggy-example")
-project(":iggy-example").projectDir = file("examples")
-
 // External processors - Stream processing integrations
 include("iggy-connector-library")
 project(":iggy-connector-library").projectDir = file("external-processors/iggy-connector-flink/iggy-connector-library")

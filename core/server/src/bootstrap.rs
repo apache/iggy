@@ -75,7 +75,7 @@ use iggy_common::{
         MIN_USERNAME_LENGTH,
     },
 };
-use std::{collections::HashSet, env, path::Path, sync::Arc};
+use std::{env, path::Path, sync::Arc};
 use tracing::{info, warn};
 
 pub async fn load_streams(
@@ -351,7 +351,7 @@ pub fn create_root_user() -> User {
     User::root(&username, &password)
 }
 
-pub fn create_shard_executor(_cpu_set: HashSet<usize>) -> Runtime {
+pub fn create_shard_executor() -> Runtime {
     // TODO: The event interval tick, could be configured based on the fact
     // How many clients we expect to have connected.
     // This roughly estimates the number of tasks we will create.
@@ -371,7 +371,6 @@ pub fn create_shard_executor(_cpu_set: HashSet<usize>) -> Runtime {
     compio::runtime::RuntimeBuilder::new()
         .with_proactor(proactor.to_owned())
         .event_interval(128)
-        .thread_affinity(_cpu_set)
         .build()
         .unwrap()
 }
@@ -512,7 +511,7 @@ pub async fn load_segments(
             .unwrap()
             .load_all_indexes_from_disk()
             .await
-            .with_error(|error| format!("Failed to load indexes during startup for stream ID: {}, topic ID: {}, partition_id: {}, {error}", stream_id, topic_id, partition_id))
+            .error(|e: &IggyError| format!("Failed to load indexes during startup for stream ID: {}, topic ID: {}, partition_id: {}, {e}", stream_id, topic_id, partition_id))
             .map_err(|_| IggyError::CannotReadFile)?
         };
 
@@ -568,7 +567,7 @@ pub async fn load_segments(
                     match messages_reader.load_messages_from_disk(batch_indexes).await {
                         Ok(messages_batch) => {
                             if let Err(e) = messages_batch.validate_checksums() {
-                                return Err(IggyError::CannotReadPartitions).with_error(|_| {
+                                return Err(IggyError::CannotReadPartitions).error(|_: &IggyError| {
                                     format!(
                                         "Failed to validate message checksum for segment at offset {} in stream ID: {}, topic ID: {}, partition ID: {}, error: {}",
                                         start_offset, stream_id, topic_id, partition_id, e
@@ -579,7 +578,7 @@ pub async fn load_segments(
                             current_relative_offset += batch_count;
                         }
                         Err(e) => {
-                            return Err(e).with_error(|_| {
+                            return Err(e).error(|_: &IggyError| {
                                 format!(
                                     "Failed to load messages from disk for checksum validation at offset {} in stream ID: {}, topic ID: {}, partition ID: {}",
                                     start_offset, stream_id, topic_id, partition_id

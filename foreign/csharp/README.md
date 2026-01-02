@@ -609,6 +609,34 @@ Integration tests are located in `Iggy_SDK.Tests.Integration/`. Tests can run ag
 - A dockerized Iggy server with TestContainers
 - A local Iggy server (set `IGGY_SERVER_HOST` environment variable)
 
+### Requirements
+
+- .NET 8 SDK
+- Docker (for TestContainers tests)
+
+### Running Integration Tests Locally
+
+#### 1. Dockerization
+
+```bash
+cargo build
+
+docker build --no-cache -f core/server/Dockerfile --platform linux/amd64 --target runtime-prebuilt --build-arg PREBUILT_IGGY_SERVER=target/debug/iggy-server --build-arg PREBUILT_IGGY_CLI=target/debug/iggy -t local-iggy-server .
+```
+
+#### 2. Build the Test Project
+
+```bash
+dotnet build foreign/csharp/Iggy_SDK.Tests.Integration
+```
+
+#### 3. Run test
+
+```bash
+export IGGY_SERVER_DOCKER_IMAGE=local-iggy-server
+dotnet test foreign/csharp/Iggy_SDK.Tests.Integration --no-build --verbosity diagnostic
+```
+
 ## Useful Resources
 
 - [Iggy Documentation](https://iggy.apache.org/docs/)

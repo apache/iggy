@@ -32,7 +32,7 @@ use iggy_common::Identifier;
 use iggy_common::PooledBuffer;
 use iggy_common::Validatable;
 use iggy_common::{Consumer, PollMessages, SendMessages};
-use iggy_common::{IggyMessagesBatch, PolledMessages};
+use iggy_common::{IggyError, IggyMessagesBatch, PolledMessages};
 use send_wrapper::SendWrapper;
 use std::sync::Arc;
 use tracing::instrument;
@@ -76,9 +76,9 @@ async fn poll_messages(
     ));
 
     let (metadata, messages)  = poll_future.await
-        .with_error(|error| {
+        .error(|e: &IggyError| {
             format!(
-                "{COMPONENT} (error: {error}) - failed to poll messages, stream ID: {}, topic ID: {}, partition ID: {:?}",
+                "{COMPONENT} (error: {e}) - failed to poll messages, stream ID: {}, topic ID: {}, partition ID: {:?}",
                 stream_id, topic_id, query.0.partition_id
             )
         })?;
@@ -113,9 +113,9 @@ async fn send_messages(
     ));
 
     append_future.await
-        .with_error(|error| {
+        .error(|e: &IggyError| {
             format!(
-                "{COMPONENT} (error: {error}) - failed to append messages, stream ID: {stream_id}, topic ID: {topic_id}"
+                "{COMPONENT} (error: {e}) - failed to append messages, stream ID: {stream_id}, topic ID: {topic_id}"
             )
         })?;
 

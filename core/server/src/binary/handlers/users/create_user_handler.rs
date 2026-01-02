@@ -16,7 +16,9 @@
  * under the License.
  */
 
-use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
+use crate::binary::command::{
+    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
+};
 use crate::binary::handlers::users::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
@@ -50,7 +52,7 @@ impl ServerCommandHandler for CreateUser {
         _length: u32,
         session: &Session,
         shard: &Rc<IggyShard>,
-    ) -> Result<(), IggyError> {
+    ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
 
         let request = ShardRequest {
@@ -81,9 +83,9 @@ impl ServerCommandHandler for CreateUser {
                     let _user_guard = shard.fs_locks.user_lock.lock().await;
                     let user = shard
                         .create_user(session, &username, &password, status, permissions.clone())
-                        .with_error(|error| {
+                        .error(|e: &IggyError| {
                             format!(
-                                "{COMPONENT} (error: {error}) - failed to create user with name: {}, session: {}",
+                                "{COMPONENT} (error: {e}) - failed to create user with name: {}, session: {}",
                                 username, session
                             )
                         })?;
@@ -116,9 +118,9 @@ impl ServerCommandHandler for CreateUser {
                             }),
                         )
                         .await
-                        .with_error(|error| {
+                        .error(|e: &IggyError| {
                             format!(
-                                "{COMPONENT} (error: {error}) - failed to apply create user with name: {}, session: {session}",
+                                "{COMPONENT} (error: {e}) - failed to apply create user with name: {}, session: {session}",
                                 self.username
                             )
                         })?;
@@ -150,9 +152,9 @@ impl ServerCommandHandler for CreateUser {
                             }),
                         )
                         .await
-                        .with_error(|error| {
+                        .error(|e: &IggyError| {
                             format!(
-                                "{COMPONENT} (error: {error}) - failed to apply create user for user_id: {user_id}, session: {session}"
+                                "{COMPONENT} (error: {e}) - failed to apply create user for user_id: {user_id}, session: {session}"
                             )
                         })?;
 
@@ -167,7 +169,7 @@ impl ServerCommandHandler for CreateUser {
             },
         }
 
-        Ok(())
+        Ok(HandlerResult::Finished)
     }
 }
 

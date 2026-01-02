@@ -17,7 +17,9 @@
  */
 
 use super::COMPONENT;
-use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
+use crate::binary::command::{
+    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
+};
 use crate::binary::handlers::utils::receive_and_validate;
 use iggy_common::SenderKind;
 
@@ -42,7 +44,7 @@ impl ServerCommandHandler for LeaveConsumerGroup {
         _length: u32,
         session: &Session,
         shard: &Rc<IggyShard>,
-    ) -> Result<(), IggyError> {
+    ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
 
         shard
@@ -52,15 +54,15 @@ impl ServerCommandHandler for LeaveConsumerGroup {
                 &self.topic_id,
                 &self.group_id,
             )
-            .with_error(|error| {
+            .error(|e: &IggyError| {
                 format!(
-                    "{COMPONENT} (error: {error}) - failed to leave consumer group for stream_id: {}, topic_id: {}, group_id: {}, session: {}",
+                    "{COMPONENT} (error: {e}) - failed to leave consumer group for stream_id: {}, topic_id: {}, group_id: {}, session: {}",
                     self.stream_id, self.topic_id, self.group_id, session
                 )
             })?;
 
         sender.send_empty_ok_response().await?;
-        Ok(())
+        Ok(HandlerResult::Finished)
     }
 }
 

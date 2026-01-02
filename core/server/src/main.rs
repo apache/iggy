@@ -144,8 +144,8 @@ fn main() -> Result<(), ServerError> {
         // SECOND DISCRETE LOADING STEP.
         // Load config and create directories.
         // Remove `local_data` directory if run with `--fresh` flag.
-        let config = load_config().await.with_error(|error| {
-            format!("{COMPONENT} (error: {error}) - failed to load config during bootstrap")
+        let config = load_config().await.error(|e: &ServerError| {
+            format!("{COMPONENT} (error: {e}) - failed to load config during bootstrap")
         })?;
         if args.fresh {
             let system_path = config.system.get_system_path();
@@ -296,6 +296,11 @@ fn main() -> Result<(), ServerError> {
         let metrics = Metrics::init();
 
         // TWELFTH DISCRETE LOADING STEP.
+        info!(
+            "Enable TCP socket migration across shards: {}.",
+            config.tcp.socket_migration
+        );
+
         info!("Starting {} shard(s)", shard_assignment.len());
         let (connections, shutdown_handles) = create_shard_connections(&shard_assignment);
         let shards_count = shard_assignment.len();
@@ -395,11 +400,15 @@ fn main() -> Result<(), ServerError> {
                 .name(format!("shard-{id}"))
                 .spawn(move || {
                     let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                        if let Err(e) = assignment.bind_cpu() {
+                            error!("Failed to bind cpu: {e:?}");
+                        }
+
                         if let Err(e) = assignment.bind_memory() {
                             error!("Failed to bind memory: {e:?}");
                         }
 
-                        let rt = create_shard_executor(assignment.cpu_set);
+                        let rt = create_shard_executor();
                         rt.block_on(async move {
                             let builder = IggyShard::builder();
                             let shard = builder

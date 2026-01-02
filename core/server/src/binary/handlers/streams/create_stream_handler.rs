@@ -16,7 +16,9 @@
  * under the License.
  */
 
-use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
+use crate::binary::command::{
+    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
+};
 use crate::binary::handlers::streams::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
@@ -50,7 +52,7 @@ impl ServerCommandHandler for CreateStream {
         _length: u32,
         session: &Session,
         shard: &Rc<IggyShard>,
-    ) -> Result<(), IggyError> {
+    ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
 
         let request = ShardRequest {
@@ -94,9 +96,9 @@ impl ServerCommandHandler for CreateStream {
                             command: self
                         }))
                         .await
-                        .with_error(|error| {
+                        .error(|e: &IggyError| {
                             format!(
-                                "{COMPONENT} (error: {error}) - failed to apply create stream for id: {created_stream_id}, session: {session}"
+                                "{COMPONENT} (error: {e}) - failed to apply create stream for id: {created_stream_id}, session: {session}"
                             )
                         })?;
 
@@ -119,9 +121,9 @@ impl ServerCommandHandler for CreateStream {
                             command: self
                         }))
                         .await
-                        .with_error(|error| {
+                        .error(|e: &IggyError| {
                             format!(
-                                "{COMPONENT} (error: {error}) - failed to apply create stream for id: {created_stream_id}, session: {session}"
+                                "{COMPONENT} (error: {e}) - failed to apply create stream for id: {created_stream_id}, session: {session}"
                             )
                         })?;
 
@@ -136,7 +138,7 @@ impl ServerCommandHandler for CreateStream {
             },
         }
 
-        Ok(())
+        Ok(HandlerResult::Finished)
     }
 }
 
