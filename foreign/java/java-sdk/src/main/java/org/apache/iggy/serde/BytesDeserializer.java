@@ -202,10 +202,14 @@ public final class BytesDeserializer {
             Map<String, HeaderValue> headers = new HashMap<>();
             while (userHeadersBuffer.isReadable()) {
                 var userHeaderKeyLength = userHeadersBuffer.readUnsignedIntLE();
-                var userHeaderKey = userHeadersBuffer.readCharSequence(toInt(userHeaderKeyLength), StandardCharsets.UTF_8).toString();
+                var userHeaderKey = userHeadersBuffer
+                        .readCharSequence(toInt(userHeaderKeyLength), StandardCharsets.UTF_8)
+                        .toString();
                 var userHeaderKindCode = userHeadersBuffer.readUnsignedByte();
                 var userHeaderValueLength = userHeadersBuffer.readUnsignedIntLE();
-                String userHeaderValue = userHeadersBuffer.readCharSequence(toInt(userHeaderValueLength), StandardCharsets.UTF_8).toString();
+                String userHeaderValue = userHeadersBuffer
+                        .readCharSequence(toInt(userHeaderValueLength), StandardCharsets.UTF_8)
+                        .toString();
                 headers.put(userHeaderKey, new HeaderValue(HeaderKind.fromCode(userHeaderKindCode), userHeaderValue));
             }
             userHeaders = headers;
