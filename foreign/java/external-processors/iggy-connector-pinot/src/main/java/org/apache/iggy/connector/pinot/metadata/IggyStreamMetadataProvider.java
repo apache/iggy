@@ -237,7 +237,7 @@ public class IggyStreamMetadataProvider implements StreamMetadataProvider {
      *
      * <p>This method is called by Pinot's IngestionDelayTracker to monitor lag between
      * consumed and available offsets. See:
-     * <a href="https://github.com/apache/pinot/blob/master/pinot-core/src/main/java/org/apache/pinot/core/data/manager/realtime/IngestionDelayTracker.java#L303">IngestionDelayTracker.java line 303</a>
+     * <a href="https://github.com/apache/pinot/blob/master/pinot-core/src/main/java/org/apache/pinot/core/data/manager/realtime/IngestionDelayTracker.java#L287">IngestionDelayTracker.java lines 287-289</a>
      *
      * @param partitions set of partition IDs to fetch offsets for
      * @param timeoutMillis timeout for the operation (Pinot uses 5000ms)
@@ -269,7 +269,7 @@ public class IggyStreamMetadataProvider implements StreamMetadataProvider {
      *
      * <p>This method is called by Pinot's IngestionDelayTracker to determine if offset lag
      * metrics should be tracked for this stream. See:
-     * <a href="https://github.com/apache/pinot/blob/master/pinot-core/src/main/java/org/apache/pinot/core/data/manager/realtime/IngestionDelayTracker.java#L246">IngestionDelayTracker.java line 246</a>
+     * <a href="https://github.com/apache/pinot/blob/master/pinot-core/src/main/java/org/apache/pinot/core/data/manager/realtime/IngestionDelayTracker.java#L275">IngestionDelayTracker.java line 275</a>
      *
      * @return true if offset lag is supported
      */
