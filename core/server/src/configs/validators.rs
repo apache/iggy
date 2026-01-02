@@ -22,7 +22,7 @@ use super::server::{
     DataMaintenanceConfig, MessageSaverConfig, MessagesMaintenanceConfig, TelemetryConfig,
 };
 use super::sharding::{CpuAllocation, ShardingConfig};
-use super::system::{CompressionConfig, PartitionConfig};
+use super::system::{CompressionConfig, LoggingConfig, PartitionConfig};
 use crate::configs::COMPONENT;
 use crate::configs::server::{MemoryPoolConfig, PersonalAccessTokenConfig, ServerConfig};
 use crate::configs::sharding::NumaTopology;
@@ -83,6 +83,13 @@ impl Validatable<ConfigurationError> for ServerConfig {
             .validate()
             .error(|e: &iggy_common::ConfigurationError| {
                 format!("{COMPONENT} (error: {e}) - failed to validate cluster config")
+            })?;
+
+        self.system
+            .logging
+            .validate()
+            .error(|e: &iggy_common::ConfigurationError| {
+                format!("{COMPONENT} (error: {e}) - failed to validate logging config")
             })?;
 
         let topic_size = match self.system.topic.max_size {
@@ -248,6 +255,32 @@ impl Validatable<ConfigurationError> for PersonalAccessTokenConfig {
         }
 
         if self.cleaner.enabled && self.cleaner.interval.is_zero() {
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+
+        Ok(())
+    }
+}
+
+impl Validatable<ConfigurationError> for LoggingConfig {
+    fn validate(&self) -> Result<(), ConfigurationError> {
+        if self.level.is_empty() {
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+
+        if self.retention.as_secs() < 1 {
+            error!(
+                "Configured system.logging.retention {} is less than minimum 1 second",
+                self.retention
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+
+        if self.max_total_size.as_bytes_u64() < self.max_file_size.as_bytes_u64() {
+            error!(
+                "Configured system.logging.max_total_size {} is less than system.logging.max_file_size {}",
+                self.max_total_size, self.max_file_size
+            );
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
 
