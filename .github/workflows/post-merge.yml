@@ -269,6 +269,9 @@ jobs:
         env:
           COMPONENTS_TO_PUBLISH: ${{ needs.check-docker-auto-publish.outputs.components_to_publish }}
         run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
           chmod +x scripts/extract-version.sh
 
           for component in $(echo "$COMPONENTS_TO_PUBLISH" | tr ',' ' '); do
