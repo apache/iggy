@@ -19,11 +19,17 @@
 
 package org.apache.iggy.message;
 
+import com.fasterxml.jackson.annotation.JsonSetter;
+import com.fasterxml.jackson.annotation.Nulls;
+
 import java.math.BigInteger;
 import java.util.HashMap;
 import java.util.Map;
 
-public record Message(MessageHeader header, byte[] payload, Map<String, HeaderValue> userHeaders) {
+public record Message(
+        MessageHeader header,
+        byte[] payload,
+        @JsonSetter(nulls = Nulls.AS_EMPTY) Map<String, HeaderValue> userHeaders) {
 
     public static Message of(String payload) {
         return of(payload, new HashMap<>());
