@@ -201,15 +201,11 @@ public final class BytesDeserializer {
             ByteBuf userHeadersBuffer = response.readSlice(toInt(userHeadersLength));
             Map<String, HeaderValue> headers = new HashMap<>();
             while (userHeadersBuffer.isReadable()) {
-                long userHeaderKeyLength = userHeadersBuffer.readUnsignedIntLE();
-                byte[] userHeaderKeyBytes = new byte[toInt(userHeaderKeyLength)];
-                userHeadersBuffer.readBytes(userHeaderKeyBytes);
-                int userHeaderKindCode = userHeadersBuffer.readUnsignedByte();
-                long userHeaderValueLength = userHeadersBuffer.readUnsignedIntLE();
-                byte[] userHeaderValueBytes = new byte[toInt(userHeaderValueLength)];
-                userHeadersBuffer.readBytes(userHeaderValueBytes);
-                String userHeaderKey = new String(userHeaderKeyBytes, StandardCharsets.UTF_8);
-                String userHeaderValue = new String(userHeaderValueBytes, StandardCharsets.UTF_8);
+                var userHeaderKeyLength = userHeadersBuffer.readUnsignedIntLE();
+                var userHeaderKey = userHeadersBuffer.readCharSequence(toInt(userHeaderKeyLength), StandardCharsets.UTF_8).toString();
+                var userHeaderKindCode = userHeadersBuffer.readUnsignedByte();
+                var userHeaderValueLength = userHeadersBuffer.readUnsignedIntLE();
+                String userHeaderValue = userHeadersBuffer.readCharSequence(toInt(userHeaderValueLength), StandardCharsets.UTF_8).toString();
                 headers.put(userHeaderKey, new HeaderValue(HeaderKind.fromCode(userHeaderKindCode), userHeaderValue));
             }
             userHeaders = headers;
