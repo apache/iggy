@@ -22,15 +22,14 @@ package org.apache.iggy.message;
 import java.math.BigInteger;
 import java.util.HashMap;
 import java.util.Map;
-import java.util.Optional;
 
-public record Message(MessageHeader header, byte[] payload, Optional<Map<String, HeaderValue>> userHeaders) {
+public record Message(MessageHeader header, byte[] payload, Map<String, HeaderValue> userHeaders) {
 
     public static Message of(String payload) {
-        return of(payload, Optional.empty());
+        return of(payload, new HashMap<>());
     }
 
-    public static Message of(String payload, Optional<Map<String, HeaderValue>> userHeaders) {
+    public static Message of(String payload, Map<String, HeaderValue> userHeaders) {
         final byte[] payloadBytes = payload.getBytes();
         final long userHeadersLength = getUserHeadersSize(userHeaders);
         final MessageHeader msgHeader = new MessageHeader(
@@ -44,8 +43,8 @@ public record Message(MessageHeader header, byte[] payload, Optional<Map<String,
         return new Message(msgHeader, payloadBytes, userHeaders);
     }
 
-    public Message withUserHeaders(Optional<Map<String, HeaderValue>> userHeaders) {
-        Optional<Map<String, HeaderValue>> mergedHeaders = mergeUserHeaders(userHeaders);
+    public Message withUserHeaders(Map<String, HeaderValue> userHeaders) {
+        Map<String, HeaderValue> mergedHeaders = mergeUserHeaders(userHeaders);
         long userHeadersLength = getUserHeadersSize(mergedHeaders);
         MessageHeader updatedHeader = new MessageHeader(
                 header.checksum(),
@@ -63,7 +62,7 @@ public record Message(MessageHeader header, byte[] payload, Optional<Map<String,
         return Math.toIntExact(MessageHeader.SIZE + payload.length + userHeadersLength);
     }
 
-    private Optional<Map<String, HeaderValue>> mergeUserHeaders(Optional<Map<String, HeaderValue>> userHeaders) {
+    private Map<String, HeaderValue> mergeUserHeaders(Map<String, HeaderValue> userHeaders) {
         if (userHeaders.isEmpty()) {
             return this.userHeaders;
         }
@@ -72,18 +71,18 @@ public record Message(MessageHeader header, byte[] payload, Optional<Map<String,
             return userHeaders;
         }
 
-        Map<String, HeaderValue> mergedHeaders = new HashMap<>(this.userHeaders.get());
-        mergedHeaders.putAll(userHeaders.get());
-        return Optional.of(mergedHeaders);
+        Map<String, HeaderValue> mergedHeaders = new HashMap<>(this.userHeaders);
+        mergedHeaders.putAll(userHeaders);
+        return mergedHeaders;
     }
 
-    private static long getUserHeadersSize(Optional<Map<String, HeaderValue>> userHeaders) {
+    private static long getUserHeadersSize(Map<String, HeaderValue> userHeaders) {
         if (userHeaders.isEmpty()) {
             return 0L;
         }
 
         long size = 0L;
-        for (Map.Entry<String, HeaderValue> entry : userHeaders.get().entrySet()) {
+        for (Map.Entry<String, HeaderValue> entry : userHeaders.entrySet()) {
             byte[] keyBytes = entry.getKey().getBytes();
             byte[] valueBytes = entry.getValue().value().getBytes();
             size += 4L + keyBytes.length + 1L + 4L + valueBytes.length;

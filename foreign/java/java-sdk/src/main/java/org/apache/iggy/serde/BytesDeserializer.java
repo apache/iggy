@@ -196,23 +196,23 @@ public final class BytesDeserializer {
                 new MessageHeader(checksum, id, offset, timestamp, originTimestamp, userHeadersLength, payloadLength);
         var payload = newByteArray(payloadLength);
         response.readBytes(payload);
-        Optional<Map<String, HeaderValue>> userHeaders = Optional.empty();
+        Map<String, HeaderValue> userHeaders = new HashMap<>();
         if (userHeadersLength > 0) {
-            ByteBuf userHeadersBuffer = response.readSlice(Math.toIntExact(userHeadersLength));
+            ByteBuf userHeadersBuffer = response.readSlice(toInt(userHeadersLength));
             Map<String, HeaderValue> headers = new HashMap<>();
             while (userHeadersBuffer.isReadable()) {
                 long userHeaderKeyLength = userHeadersBuffer.readUnsignedIntLE();
-                byte[] userHeaderKeyBytes = new byte[Math.toIntExact(userHeaderKeyLength)];
+                byte[] userHeaderKeyBytes = new byte[toInt(userHeaderKeyLength)];
                 userHeadersBuffer.readBytes(userHeaderKeyBytes);
                 int userHeaderKindCode = userHeadersBuffer.readUnsignedByte();
                 long userHeaderValueLength = userHeadersBuffer.readUnsignedIntLE();
-                byte[] userHeaderValueBytes = new byte[Math.toIntExact(userHeaderValueLength)];
+                byte[] userHeaderValueBytes = new byte[toInt(userHeaderValueLength)];
                 userHeadersBuffer.readBytes(userHeaderValueBytes);
                 String userHeaderKey = new String(userHeaderKeyBytes, StandardCharsets.UTF_8);
                 String userHeaderValue = new String(userHeaderValueBytes, StandardCharsets.UTF_8);
                 headers.put(userHeaderKey, new HeaderValue(HeaderKind.fromCode(userHeaderKindCode), userHeaderValue));
             }
-            userHeaders = Optional.of(headers);
+            userHeaders = headers;
         }
 
         return new Message(header, payload, userHeaders);
@@ -426,7 +426,7 @@ public final class BytesDeserializer {
     }
 
     private static int toInt(Long size) {
-        return size.intValue();
+        return Math.toIntExact(size);
     }
 
     private static byte[] newByteArray(Long size) {
