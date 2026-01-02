@@ -37,7 +37,7 @@ import java.io.IOException;
 import java.math.BigInteger;
 import java.time.Duration;
 import java.util.ArrayList;
-import java.util.HashMap;
+import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
 
@@ -289,6 +289,6 @@ public class IggySinkWriter<T> implements SinkWriter<T> {
                 0L, // userHeadersLength
                 (long) payload.length); // payloadLength
 
-        return new Message(header, payload, new HashMap<>());
+        return new Message(header, payload, Collections.emptyMap());
     }
 }
