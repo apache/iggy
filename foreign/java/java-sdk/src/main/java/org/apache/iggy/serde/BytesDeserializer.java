@@ -26,6 +26,8 @@ import org.apache.iggy.consumergroup.ConsumerGroupDetails;
 import org.apache.iggy.consumergroup.ConsumerGroupMember;
 import org.apache.iggy.consumeroffset.ConsumerOffsetInfo;
 import org.apache.iggy.message.BytesMessageId;
+import org.apache.iggy.message.HeaderKind;
+import org.apache.iggy.message.HeaderValue;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.MessageHeader;
 import org.apache.iggy.message.PolledMessages;
@@ -194,8 +196,26 @@ public final class BytesDeserializer {
                 new MessageHeader(checksum, id, offset, timestamp, originTimestamp, userHeadersLength, payloadLength);
         var payload = newByteArray(payloadLength);
         response.readBytes(payload);
-        // TODO: Add support for user headers.
-        return new Message(header, payload, Optional.empty());
+        Map<String, HeaderValue> userHeaders = new HashMap<>();
+        if (userHeadersLength > 0) {
+            ByteBuf userHeadersBuffer = response.readSlice(toInt(userHeadersLength));
+            Map<String, HeaderValue> headers = new HashMap<>();
+            while (userHeadersBuffer.isReadable()) {
+                var userHeaderKeyLength = userHeadersBuffer.readUnsignedIntLE();
+                var userHeaderKey = userHeadersBuffer
+                        .readCharSequence(toInt(userHeaderKeyLength), StandardCharsets.UTF_8)
+                        .toString();
+                var userHeaderKindCode = userHeadersBuffer.readUnsignedByte();
+                var userHeaderValueLength = userHeadersBuffer.readUnsignedIntLE();
+                String userHeaderValue = userHeadersBuffer
+                        .readCharSequence(toInt(userHeaderValueLength), StandardCharsets.UTF_8)
+                        .toString();
+                headers.put(userHeaderKey, new HeaderValue(HeaderKind.fromCode(userHeaderKindCode), userHeaderValue));
+            }
+            userHeaders = headers;
+        }
+
+        return new Message(header, payload, userHeaders);
     }
 
     public static Stats readStats(ByteBuf response) {
@@ -406,7 +426,7 @@ public final class BytesDeserializer {
     }
 
     private static int toInt(Long size) {
-        return size.intValue();
+        return Math.toIntExact(size);
     }
 
     private static byte[] newByteArray(Long size) {

@@ -17,16 +17,16 @@
  * under the License.
  */
 
-package org.apache.iggy.examples.messageenvelope.producer;
+package org.apache.iggy.examples.messageheaders.producer;
 
 import org.apache.iggy.client.blocking.tcp.IggyTcpClient;
 import org.apache.iggy.examples.shared.Messages.SerializableMessage;
 import org.apache.iggy.examples.shared.MessagesGenerator;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
+import org.apache.iggy.message.HeaderKind;
+import org.apache.iggy.message.HeaderValue;
 import org.apache.iggy.message.Message;
-import org.apache.iggy.message.MessageHeader;
-import org.apache.iggy.message.MessageId;
 import org.apache.iggy.message.Partitioning;
 import org.apache.iggy.stream.StreamDetails;
 import org.apache.iggy.topic.CompressionAlgorithm;
@@ -35,27 +35,28 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.math.BigInteger;
-import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
-public final class MessageEnvelopeProducer {
-    private static final String STREAM_NAME = "envelope-stream";
+public final class MessageHeadersProducer {
+    private static final String STREAM_NAME = "headers-stream";
     private static final StreamId STREAM_ID = StreamId.of(STREAM_NAME);
 
-    private static final String TOPIC_NAME = "envelope-topic";
+    private static final String TOPIC_NAME = "orders";
     private static final TopicId TOPIC_ID = TopicId.of(TOPIC_NAME);
 
     private static final long PARTITION_ID = 0L;
     private static final int BATCHES_LIMIT = 10;
     private static final int MESSAGES_PER_BATCH = 1;
-    private static final long INTERVAL_MS = 1;
 
-    private static final Logger log = LoggerFactory.getLogger(MessageEnvelopeProducer.class);
+    private static final String MESSAGE_TYPE_HEADER = "message_type";
 
-    private MessageEnvelopeProducer() {}
+    private static final Logger log = LoggerFactory.getLogger(MessageHeadersProducer.class);
+
+    private MessageHeadersProducer() {}
 
     public static void main(String[] args) {
         var client = IggyTcpClient.builder()
@@ -93,42 +94,26 @@ public final class MessageEnvelopeProducer {
 
     public static void produceMessages(IggyTcpClient client) {
         log.info(
-                "Messages will be sent to stream: {}, topic: {}, partition: {} with interval {}ms.",
+                "Messages will be sent to stream: {}, topic: {}, partition: {}.",
                 STREAM_NAME,
                 TOPIC_NAME,
-                PARTITION_ID,
-                INTERVAL_MS);
+                PARTITION_ID);
 
         int sentBatches = 0;
         Partitioning partitioning = Partitioning.partitionId(PARTITION_ID);
         MessagesGenerator generator = new MessagesGenerator();
 
         while (sentBatches < BATCHES_LIMIT) {
-            try {
-                Thread.sleep(INTERVAL_MS);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                break;
-            }
-
             List<Message> messages = new ArrayList<>();
             List<SerializableMessage> serializableMessages = new ArrayList<>();
 
             for (int i = 0; i < MESSAGES_PER_BATCH; i++) {
                 SerializableMessage serializableMessage = generator.generate();
-                String json = serializableMessage.toJsonEnvelope();
-                byte[] payload = json.getBytes(StandardCharsets.UTF_8);
-
-                MessageHeader header = new MessageHeader(
-                        BigInteger.ZERO,
-                        MessageId.serverGenerated(),
-                        BigInteger.ZERO,
-                        BigInteger.ZERO,
-                        BigInteger.ZERO,
-                        0L,
-                        (long) payload.length);
-                Message message = new Message(header, payload, new HashMap<>());
-                messages.add(message);
+                String messageType = serializableMessage.getMessageType();
+                String json = serializableMessage.toJson();
+                Map<String, HeaderValue> userHeaders = new HashMap<>();
+                userHeaders.put(MESSAGE_TYPE_HEADER, new HeaderValue(HeaderKind.String, messageType));
+                messages.add(Message.of(json, userHeaders));
                 serializableMessages.add(serializableMessage);
             }
 
