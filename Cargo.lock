@@ -6497,6 +6497,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "partitions"
+version = "0.1.0"
+dependencies = [
+ "iggy_common",
+]
+
+[[package]]
 name = "passterm"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -17,18 +17,17 @@
 
 use crate::shard::{
     BROADCAST_TIMEOUT, COMPONENT, IggyShard,
-    namespace::IggyNamespace,
     transmission::{
         connector::ShardConnector,
         event::ShardEvent,
         frame::ShardFrame,
-        id::ShardId,
         message::{ShardMessage, ShardSendRequestResult},
     },
 };
 use futures::future::join_all;
 use hash32::{Hasher, Murmur3Hasher};
 use iggy_common::IggyError;
+use iggy_common::sharding::{IggyNamespace, PartitionLocation};
 use std::hash::Hasher as _;
 use tracing::{error, info, warn};
 
@@ -138,48 +137,48 @@ impl IggyShard {
     }
 
     pub fn find_shard(&self, namespace: &IggyNamespace) -> Option<&ShardConnector<ShardFrame>> {
-        self.shards_table.get(namespace).map(|shard_id| {
+        self.shards_table.get(namespace).map(|location| {
             self.shards
                 .iter()
-                .find(|shard| shard.id == shard_id.id())
+                .find(|shard| shard.id == *location.shard_id)
                 .expect("Shard not found in the shards table.")
         })
     }
 
-    pub fn find_shard_table_record(&self, namespace: &IggyNamespace) -> Option<ShardId> {
+    pub fn find_shard_table_record(&self, namespace: &IggyNamespace) -> Option<PartitionLocation> {
         self.shards_table.get(namespace).map(|entry| *entry)
     }
 
-    pub fn remove_shard_table_record(&self, namespace: &IggyNamespace) -> ShardId {
+    pub fn remove_shard_table_record(&self, namespace: &IggyNamespace) -> PartitionLocation {
         self.shards_table
             .remove(namespace)
-            .map(|(_, shard_id)| shard_id)
+            .map(|(_, location)| location)
             .expect("remove_shard_table_record: namespace not found")
     }
 
     pub fn remove_shard_table_records(
         &self,
         namespaces: &[IggyNamespace],
-    ) -> Vec<(IggyNamespace, ShardId)> {
+    ) -> Vec<(IggyNamespace, PartitionLocation)> {
         namespaces
             .iter()
             .map(|ns| {
-                let (ns, shard_id) = self.shards_table.remove(ns).unwrap();
-                (ns, shard_id)
+                let (ns, location) = self.shards_table.remove(ns).unwrap();
+                (ns, location)
             })
             .collect()
     }
 
-    pub fn insert_shard_table_record(&self, ns: IggyNamespace, shard_id: ShardId) {
-        self.shards_table.insert(ns, shard_id);
+    pub fn insert_shard_table_record(&self, ns: IggyNamespace, location: PartitionLocation) {
+        self.shards_table.insert(ns, location);
     }
 
     pub fn get_current_shard_namespaces(&self) -> Vec<IggyNamespace> {
         self.shards_table
             .iter()
             .filter_map(|entry| {
-                let (ns, shard_id) = entry.pair();
-                if shard_id.id() == self.id {
+                let (ns, location) = entry.pair();
+                if *location.shard_id == self.id {
                     Some(*ns)
                 } else {
                     None
