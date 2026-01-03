@@ -1,0 +1,47 @@
+{
+  "description": "Sample messages to send to Iggy for testing Pinot ingestion",
+  "messages": [
+    {
+      "userId": "user_12345",
+      "sessionId": "session_abc123",
+      "eventType": "page_view",
+      "pageUrl": "/products/laptop",
+      "deviceType": "desktop",
+      "browser": "Chrome",
+      "country": "USA",
+      "city": "San Francisco",
+      "duration": 45000,
+      "pageLoadTime": 1200,
+      "scrollDepth": 75,
+      "eventTimestamp": 1701234567890
+    },
+    {
+      "userId": "user_67890",
+      "sessionId": "session_def456",
+      "eventType": "click",
+      "pageUrl": "/checkout",
+      "deviceType": "mobile",
+      "browser": "Safari",
+      "country": "UK",
+      "city": "London",
+      "duration": 2000,
+      "pageLoadTime": 800,
+      "scrollDepth": 100,
+      "eventTimestamp": 1701234570000
+    },
+    {
+      "userId": "user_12345",
+      "sessionId": "session_abc123",
+      "eventType": "purchase",
+      "pageUrl": "/confirmation",
+      "deviceType": "desktop",
+      "browser": "Chrome",
+      "country": "USA",
+      "city": "San Francisco",
+      "duration": 10000,
+      "pageLoadTime": 950,
+      "scrollDepth": 50,
+      "eventTimestamp": 1701234580000
+    }
+  ]
+}
