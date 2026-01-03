@@ -915,8 +915,7 @@ public sealed class TcpMessageStream : IIggyClient
 
             return leaderNode;
         }
-        // todo: change after error refactoring, error code 5 is for feature not supported
-        catch (IggyInvalidStatusCodeException e) when (e.StatusCode == 5)
+        catch (IggyInvalidStatusCodeException e) when (e.ErrorCode == IggyErrorCode.FeatureUnavailable)
         {
             return null;
         }
@@ -1022,8 +1021,7 @@ public sealed class TcpMessageStream : IIggyClient
             {
                 if (response.Length == 0)
                 {
-                    throw new IggyInvalidStatusCodeException(response.Status,
-                        $"Invalid response status code: {response.Status}");
+                    throw new IggyInvalidStatusCodeException(response.Status);
                 }
 
                 var errorBuffer = new byte[response.Length];

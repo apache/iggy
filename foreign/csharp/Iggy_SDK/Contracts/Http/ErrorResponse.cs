@@ -18,28 +18,28 @@
 namespace Apache.Iggy.Contracts.Http;
 
 /// <summary>
-/// Represents an error response returned by a service or API.
-/// Contains detailed information about the error that occurred.
+///     Represents an error response returned by a service or API.
+///     Contains detailed information about the error that occurred.
 /// </summary>
 public class ErrorResponse
 {
     /// <summary>
-    /// Unique identifier associated with the error response.
+    ///     Unique identifier associated with the error response.
     /// </summary>
     public int Id { get; set; }
 
     /// <summary>
-    /// Error code that identifies the specific type of error encountered.
+    ///     Error code that identifies the specific type of error encountered.
     /// </summary>
     public string? Code { get; set; }
 
     /// <summary>
-    /// Provides a description of the cause of the error or failure.
+    ///     Provides a description of the cause of the error or failure.
     /// </summary>
     public string? Reason { get; set; }
 
     /// <summary>
-    /// Specifies the field associated with the error in the response.
+    ///     Specifies the field associated with the error in the response.
     /// </summary>
     public string? Field { get; set; }
 }
