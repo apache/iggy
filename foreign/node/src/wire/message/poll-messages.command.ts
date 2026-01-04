@@ -29,16 +29,30 @@ import {
 } from './poll.utils.js';
 
 
+/**
+ * Parameters for the poll messages command.
+ */
 export type PollMessages = {
+  /** Stream identifier */
   streamId: Id,
+  /** Topic identifier */
   topicId: Id,
+  /** Consumer configuration */
   consumer: Consumer,
+  /** Partition ID (null for all partitions) */
   partitionId: number | null,
+  /** Strategy for selecting messages */
   pollingStrategy: PollingStrategy,
+  /** Maximum number of messages to poll */
   count: number,
+  /** Whether to auto-commit offset after polling */
   autocommit: boolean
 };
 
+/**
+ * Poll messages command definition.
+ * Retrieves messages from a topic partition.
+ */
 export const POLL_MESSAGES = {
   code: COMMAND_CODE.PollMessages,
 
@@ -55,4 +69,7 @@ export const POLL_MESSAGES = {
   }
 };
 
+/**
+ * Executable poll messages command function.
+ */
 export const pollMessages = wrapCommand<PollMessages, PollMessagesResponse>(POLL_MESSAGES);
