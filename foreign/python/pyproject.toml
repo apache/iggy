@@ -21,7 +21,7 @@ build-backend = "maturin"
 
 [project]
 name = "apache-iggy"
-requires-python = ">=3.7"
+requires-python = ">=3.10"
 version = "0.6.1.dev1"
 description = "Apache Iggy is the persistent message streaming platform written in Rust, supporting QUIC, TCP and HTTP transport protocols, capable of processing millions of messages per second."
 readme = "README.md"
@@ -37,9 +37,6 @@ classifiers = [
     "License :: OSI Approved :: Apache Software License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.7",
-    "Programming Language :: Python :: 3.8",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",

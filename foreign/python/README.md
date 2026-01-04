@@ -28,7 +28,7 @@ pip install -e ".[dev,testing,examples]"
 
 ### Supported Python Versions
 
-- Python 3.7+
+- Python 3.10+
 
 ## Usage and Examples
 
@@ -64,7 +64,7 @@ pytest tests/ -v
 
 ## Examples
 
-Refer to the [python_examples/](https://github.com/apache/iggy/tree/master/foreign/python/python_examples) directory for usage examples.
+Refer to the [examples/python/](https://github.com/apache/iggy/tree/master/examples/python) directory for usage examples.
 
 ## Contributing
 
