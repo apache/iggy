@@ -19,7 +19,7 @@
 
 
 import type { Id } from '../identifier.utils.js';
-import { ClientProvider } from '../../client/index.js';
+import type { ClientProvider } from '../../client/index.js';
 import { createGroup } from './create-group.command.js';
 import { getGroup } from './get-group.command.js';
 import { joinGroup } from './join-group.command.js';

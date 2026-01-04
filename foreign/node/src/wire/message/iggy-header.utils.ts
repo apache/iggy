@@ -28,7 +28,7 @@ export type IggyMessageHeader = {
   /** Message checksum for integrity verification */
   checksum: bigint,
   /** Unique message identifier (UUID or numeric) */
-  id: string | BigInt,
+  id: string | bigint,
   /** Message offset within the partition */
   offset: bigint,
   /** Server-assigned timestamp */

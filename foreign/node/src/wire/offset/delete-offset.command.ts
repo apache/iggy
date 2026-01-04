@@ -19,7 +19,6 @@
 
 
 import { deserializeVoidResponse } from '../../client/client.utils.js';
-import type { CommandResponse } from '../../client/client.type.js';
 import type { GetOffset } from './get-offset.command.js';
 import { wrapCommand } from '../command.utils.js';
 import { serializeGetOffset } from './offset.utils.js';

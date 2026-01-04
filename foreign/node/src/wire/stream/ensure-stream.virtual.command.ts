@@ -18,7 +18,7 @@
  */
 
 
-import { ClientProvider } from '../../client/index.js';
+import type { ClientProvider } from '../../client/index.js';
 import { createStream } from './create-stream.command.js';
 import { getStream } from './get-stream.command.js';
 

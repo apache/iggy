@@ -18,8 +18,8 @@
  */
 
 
-import { Id } from '../identifier.utils.js';
-import { ClientProvider } from '../../client/index.js';
+import type { Id } from '../identifier.utils.js';
+import type { ClientProvider } from '../../client/index.js';
 import { createTopic } from './create-topic.command.js';
 import { getTopic } from './get-topic.command.js';
 
