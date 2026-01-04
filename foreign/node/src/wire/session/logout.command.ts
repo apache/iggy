@@ -22,6 +22,10 @@ import { deserializeVoidResponse } from '../../client/client.utils.js';
 import { wrapCommand } from '../command.utils.js';
 import { COMMAND_CODE } from '../command.code.js';
 
+/**
+ * Logout command definition.
+ * Ends the current user session.
+ */
 export const LOGOUT = {
   code: COMMAND_CODE.LogoutUser,
 
@@ -33,4 +37,7 @@ export const LOGOUT = {
 };
 
 
+/**
+ * Executable logout command function.
+ */
 export const logout = wrapCommand<void, boolean>(LOGOUT);

@@ -20,31 +20,64 @@
 
 import { toDate } from '../serialize.utils.js';
 
+/**
+ * Response from creating an access token.
+ */
 export type CreateTokenResponse = {
+  /** The generated access token string */
   token: string
 };
 
+/**
+ * Result of deserializing a token creation response.
+ */
 type TokenDeserialized = {
+  /** Number of bytes consumed */
   bytesRead: number,
+  /** Deserialized token response */
   data: CreateTokenResponse
 };
 
+/**
+ * Access token information.
+ */
 export type Token = {
+  /** Token name */
   name: string,
+  /** Token expiry timestamp (null if no expiry) */
   expiry: Date | null
 }
 
+/**
+ * Result of deserializing a token.
+ */
 type TokenSerialized = {
+  /** Number of bytes consumed */
   bytesRead: number,
+  /** Deserialized token data */
   data: Token
 }
 
+/**
+ * Deserializes a token creation response from a buffer.
+ *
+ * @param p - Buffer containing serialized token response
+ * @param pos - Starting position in the buffer
+ * @returns Object with bytes read and token string
+ */
 export const deserializeCreateToken = (p: Buffer, pos = 0): TokenDeserialized => {
   const len = p.readUInt8(pos);
   const token = p.subarray(pos + 1, pos + 1 + len).toString();
   return { bytesRead: 1 + len, data: { token } };
 }
 
+/**
+ * Deserializes a token from a buffer.
+ *
+ * @param p - Buffer containing serialized token data
+ * @param pos - Starting position in the buffer
+ * @returns Object with bytes read and deserialized token data
+ */
 export const deserializeToken = (p: Buffer, pos = 0): TokenSerialized => {
   const nameLength = p.readUInt8(pos);
   const name = p.subarray(pos + 1, pos + 1 + nameLength).toString();
@@ -64,6 +97,13 @@ export const deserializeToken = (p: Buffer, pos = 0): TokenSerialized => {
   };
 }
 
+/**
+ * Deserializes multiple tokens from a buffer.
+ *
+ * @param p - Buffer containing serialized tokens data
+ * @param pos - Starting position in the buffer
+ * @returns Array of deserialized tokens
+ */
 export const deserializeTokens = (p: Buffer, pos = 0): Token[] => {
   const tokens = [];
   const len = p.length;
