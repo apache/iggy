@@ -23,11 +23,20 @@ import { COMMAND_CODE } from '../command.code.js';
 import { deserializeVoidResponse } from '../../client/client.utils.js';
 import { wrapCommand } from '../command.utils.js';
 
+/**
+ * Parameters for the purge topic command.
+ */
 export type PurgeTopic = {
+  /** Stream identifier (ID or name) */
   streamId: Id,
+  /** Topic identifier (ID or name) */
   topicId: Id
 };
 
+/**
+ * Purge topic command definition.
+ * Deletes all messages from a topic while keeping the topic itself.
+ */
 export const PURGE_TOPIC = {
   code: COMMAND_CODE.PurgeTopic,
 
@@ -42,4 +51,7 @@ export const PURGE_TOPIC = {
 };
 
 
+/**
+ * Executable purge topic command function.
+ */
 export const purgeTopic = wrapCommand<PurgeTopic, boolean>(PURGE_TOPIC);

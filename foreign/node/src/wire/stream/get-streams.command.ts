@@ -23,6 +23,10 @@ import { wrapCommand } from '../command.utils.js';
 import { COMMAND_CODE } from '../command.code.js';
 import { deserializeToStream, type Stream } from './stream.utils.js';
 
+/**
+ * Get streams command definition.
+ * Retrieves all streams.
+ */
 export const GET_STREAMS = {
   code: COMMAND_CODE.GetStreams,
   
@@ -42,4 +46,7 @@ export const GET_STREAMS = {
 };
 
 
+/**
+ * Executable get streams command function.
+ */
 export const getStreams = wrapCommand<void, Stream[]>(GET_STREAMS);
