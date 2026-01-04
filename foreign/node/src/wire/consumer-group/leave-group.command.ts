@@ -24,12 +24,22 @@ import { deserializeVoidResponse } from '../../client/client.utils.js';
 import { wrapCommand } from '../command.utils.js';
 import { COMMAND_CODE } from '../command.code.js';
 
+/**
+ * Parameters for the leave consumer group command.
+ */
 export type LeaveGroup = {
+  /** Stream identifier (ID or name) */
   streamId: Id,
+  /** Topic identifier (ID or name) */
   topicId: Id,
+  /** Consumer group identifier (ID or name) */
   groupId: Id
 };
 
+/**
+ * Leave consumer group command definition.
+ * Removes the current client from the consumer group.
+ */
 export const LEAVE_GROUP = {
   code: COMMAND_CODE.LeaveGroup,
 
@@ -40,4 +50,7 @@ export const LEAVE_GROUP = {
   deserialize: deserializeVoidResponse
 };
 
+/**
+ * Executable leave consumer group command function.
+ */
 export const leaveGroup = wrapCommand<LeaveGroup, boolean>(LEAVE_GROUP);

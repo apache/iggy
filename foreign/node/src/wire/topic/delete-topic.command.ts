@@ -24,12 +24,22 @@ import { COMMAND_CODE } from '../command.code.js';
 import { serializeIdentifier, type Id } from '../identifier.utils.js';
 import { uint32ToBuf } from '../number.utils.js';
 
-type DeleteTopic = {
+/**
+ * Parameters for the delete topic command.
+ */
+export type DeleteTopic = {
+  /** Stream identifier (ID or name) */
   streamId: Id,
+  /** Topic identifier (ID or name) */
   topicId: Id,
+  /** Number of partitions in the topic */
   partitionsCount: number
 }
 
+/**
+ * Delete topic command definition.
+ * Permanently removes a topic and all its data from a stream.
+ */
 export const DELETE_TOPIC = {
   code: COMMAND_CODE.DeleteTopic,
 
@@ -45,4 +55,7 @@ export const DELETE_TOPIC = {
 };
 
 
+/**
+ * Executable delete topic command function.
+ */
 export const deleteTopic = wrapCommand<DeleteTopic, boolean>(DELETE_TOPIC);

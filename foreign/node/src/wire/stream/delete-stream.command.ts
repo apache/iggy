@@ -23,10 +23,18 @@ import { wrapCommand } from '../command.utils.js';
 import { COMMAND_CODE } from '../command.code.js';
 import { serializeIdentifier, type Id } from '../identifier.utils.js';
 
+/**
+ * Parameters for the delete stream command.
+ */
 export type DeleteStream = {
+  /** Stream identifier (ID or name) */
   streamId: Id
 };
 
+/**
+ * Delete stream command definition.
+ * Removes a stream and all its topics from the system.
+ */
 export const DELETE_STREAM = {
   code: COMMAND_CODE.DeleteStream,
 
@@ -38,4 +46,7 @@ export const DELETE_STREAM = {
 };
 
 
+/**
+ * Executable delete stream command function.
+ */
 export const deleteStream = wrapCommand<DeleteStream, boolean>(DELETE_STREAM);

@@ -19,6 +19,10 @@
 
 import { type ValueOf, reverseRecord } from "../../type.utils.js";
 
+/**
+ * Enumeration of header value types supported in message headers.
+ * Each type maps to a numeric identifier for wire protocol encoding.
+ */
 export const HeaderKind = {
   Raw: 1,
   String: 2,
@@ -37,81 +41,100 @@ export const HeaderKind = {
   Double: 15
 } as const;
 
+/** Type alias for the HeaderKind object */
 export type HeaderKind = typeof HeaderKind;
+/** String literal type of header kind names */
 export type HeaderKindId = keyof HeaderKind;
+/** Numeric values of header kinds */
 export type HeaderKindValue = ValueOf<HeaderKind>;
+/** Reverse mapping from numeric value to header kind name */
 export const ReverseHeaderKind = reverseRecord(HeaderKind);
 
+/** Raw binary header value */
 export type HeaderValueRaw = {
   kind: HeaderKind['Raw'],
   value: Buffer
 }
 
+/** String header value */
 export type HeaderValueString = {
   kind: HeaderKind['String']
   value: string
 }
 
+/** Boolean header value */
 export type HeaderValueBool = {
   kind: HeaderKind['Bool'],
   value: boolean
 }
 
+/** Signed 8-bit integer header value */
 export type HeaderValueInt8 = {
   kind: HeaderKind['Int8'],
   value: number
 }
 
+/** Signed 16-bit integer header value */
 export type HeaderValueInt16 = {
   kind: HeaderKind['Int16'],
   value: number
 };
 
+/** Signed 32-bit integer header value */
 export type HeaderValueInt32 = {
   kind: HeaderKind['Int32'],
   value: number
 }
 
+/** Signed 64-bit integer header value */
 export type HeaderValueInt64 = {
   kind: HeaderKind['Int64'],
   value: bigint
 }
 
+/** Signed 128-bit integer header value */
 export type HeaderValueInt128 = {
   kind: HeaderKind['Int128'],
   value: Buffer // | ArrayBuffer // ?
 }
 
+/** Unsigned 8-bit integer header value */
 export type HeaderValueUint8 = {
   kind: HeaderKind['Uint8'],
   value: number
 }
 
+/** Unsigned 16-bit integer header value */
 export type HeaderValueUint16 = {
   kind: HeaderKind['Uint16'],
   value: number
 }
 
+/** Unsigned 32-bit integer header value */
 export type HeaderValueUint32 = {
   kind: HeaderKind['Uint32'],
   value: number
 }
 
+/** Unsigned 64-bit integer header value */
 export type HeaderValueUint64 = {
   kind: HeaderKind['Uint64'],
   value: bigint
 }
 
+/** Unsigned 128-bit integer header value */
 export type HeaderValueUint128 = {
   kind: HeaderKind['Uint128'],
   value: Buffer // | ArrayBuffer // ?
 }
 
+/** 32-bit floating point header value */
 export type HeaderValueFloat = {
   kind: HeaderKind['Float'],
   value: number
 }
 
+/** 64-bit floating point (double) header value */
 export type HeaderValueDouble = {
   kind: HeaderKind['Double'],
   value: number

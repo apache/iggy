@@ -23,11 +23,20 @@ import { deserializeCreateToken, type CreateTokenResponse } from './token.utils.
 import { wrapCommand } from '../command.utils.js';
 import { COMMAND_CODE } from '../command.code.js';
 
+/**
+ * Parameters for the create access token command.
+ */
 export type CreateToken = {
+  /** Token name (1-255 bytes) */
   name: string,
+  /** Token expiry time in seconds (default: 600) */
   expiry?: bigint
 }
 
+/**
+ * Create access token command definition.
+ * Creates a new access token for authentication.
+ */
 export const CREATE_TOKEN = {
   code: COMMAND_CODE.CreateAccessToken,
 
@@ -49,4 +58,7 @@ export const CREATE_TOKEN = {
 };
 
 
+/**
+ * Executable create access token command function.
+ */
 export const createToken = wrapCommand<CreateToken, CreateTokenResponse>(CREATE_TOKEN);

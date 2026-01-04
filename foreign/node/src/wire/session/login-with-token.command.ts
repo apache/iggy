@@ -23,10 +23,18 @@ import { serializeLoginWithToken, type LoginResponse } from './login.utils.js';
 import { wrapCommand } from '../command.utils.js';
 import { COMMAND_CODE } from '../command.code.js';
 
+/**
+ * Parameters for the login with token command.
+ */
 export type LoginWithTokenParam = {
+  /** Access token string (1-255 bytes) */
   token: string
 };
 
+/**
+ * Login with token command definition.
+ * Authenticates a user with an access token.
+ */
 export const LOGIN_WITH_TOKEN = {
   code: COMMAND_CODE.LoginWithAccessToken,
 
@@ -38,4 +46,7 @@ export const LOGIN_WITH_TOKEN = {
 };
 
 
+/**
+ * Executable login with token command function.
+ */
 export const loginWithToken = wrapCommand<LoginWithTokenParam, LoginResponse>(LOGIN_WITH_TOKEN);

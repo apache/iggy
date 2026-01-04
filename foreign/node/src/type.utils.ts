@@ -18,6 +18,15 @@
  */
 
 
+/**
+ * Reverses the keys and values of a record object.
+ * Creates a new record where the original values become keys and vice versa.
+ *
+ * @typeParam T - Type of the original keys
+ * @typeParam U - Type of the original values (becomes keys in result)
+ * @param input - Record object to reverse
+ * @returns New record with swapped keys and values
+ */
 export function reverseRecord<
   T extends PropertyKey,
   U extends PropertyKey,
@@ -30,4 +39,9 @@ export function reverseRecord<
   ) as Record<U, T>
 }
 
+/**
+ * Extracts the value types from an object type.
+ *
+ * @typeParam T - Object type to extract values from
+ */
 export type ValueOf<T> = T[keyof T];

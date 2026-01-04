@@ -20,20 +20,42 @@
 
 import { toDate } from '../serialize.utils.js';
 
+/**
+ * Stream information returned from the server.
+ */
 export type Stream = {
+  /** Stream ID */
   id: number,
+  /** Stream name */
   name: string,
+  /** Number of topics in the stream */
   topicsCount: number,
+  /** Total size of the stream in bytes */
   sizeBytes: bigint,
+  /** Total number of messages in the stream */
   messagesCount: bigint,
+  /** Stream creation timestamp */
   createdAt: Date
 }
 
+/**
+ * Result of deserializing a stream.
+ */
 type StreamDeserialized = {
+  /** Number of bytes consumed */
   bytesRead: number,
+  /** Deserialized stream data */
   data: Stream
 };
 
+/**
+ * Deserializes a stream from a buffer.
+ *
+ * @param r - Buffer containing serialized stream data
+ * @param pos - Starting position in the buffer
+ * @returns Object with bytes read and deserialized stream data
+ * @throws Error if the buffer is empty (stream does not exist)
+ */
 export const deserializeToStream = (r: Buffer, pos = 0): StreamDeserialized => {
   if (r.length === 0)
     throw new Error('Steam does not exist');
