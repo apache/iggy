@@ -26,8 +26,16 @@ import { serializeGetOffset } from './offset.utils.js';
 import { COMMAND_CODE } from '../command.code.js';
 
 
+/**
+ * Parameters for the delete offset command.
+ * Same as GetOffset parameters.
+ */
 export type DeleteOffset = GetOffset;
 
+/**
+ * Delete offset command definition.
+ * Removes a stored consumer offset.
+ */
 export const DELETE_OFFSET = {
   code: COMMAND_CODE.DeleteConsumerOffset,
 
@@ -39,4 +47,7 @@ export const DELETE_OFFSET = {
 };
 
 
+/**
+ * Executable delete offset command function.
+ */
 export const deleteOffset = wrapCommand<DeleteOffset, boolean>(DELETE_OFFSET);
