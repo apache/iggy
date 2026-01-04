@@ -24,6 +24,10 @@ import { COMMAND_CODE } from '../command.code.js';
 import { deserializeTokens, type Token } from './token.utils.js';
 
 
+/**
+ * Get access tokens command definition.
+ * Retrieves all access tokens for the current user.
+ */
 export const GET_TOKENS = {
   code: COMMAND_CODE.GetAccessTokens,
 
@@ -33,4 +37,7 @@ export const GET_TOKENS = {
 };
 
 
+/**
+ * Executable get access tokens command function.
+ */
 export const getTokens = wrapCommand<void, Token[]>(GET_TOKENS);

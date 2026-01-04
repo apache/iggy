@@ -23,10 +23,18 @@ import { wrapCommand } from '../command.utils.js';
 import { COMMAND_CODE } from '../command.code.js';
 import { uint8ToBuf } from '../number.utils.js';
 
+/**
+ * Parameters for the delete access token command.
+ */
 export type DeleteToken = {
+  /** Token name (1-255 bytes) */
   name: string
 };
 
+/**
+ * Delete access token command definition.
+ * Removes an existing access token.
+ */
 export const DELETE_TOKEN = {
   code: COMMAND_CODE.DeleteAccessToken,
 
@@ -46,4 +54,7 @@ export const DELETE_TOKEN = {
   deserialize: deserializeVoidResponse
 };
 
+/**
+ * Executable delete access token command function.
+ */
 export const deleteToken = wrapCommand<DeleteToken, boolean>(DELETE_TOKEN);
