@@ -26,7 +26,7 @@ import { Transform, type TransformCallback } from 'node:stream';
 import {
   deserializeIggyMessageHeaders,
   IGGY_MESSAGE_HEADER_SIZE,
-  IggyMessageHeader
+  type IggyMessageHeader
 } from './iggy-header.utils.js';
 
 /**
