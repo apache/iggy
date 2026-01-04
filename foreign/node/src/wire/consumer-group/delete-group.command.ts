@@ -24,12 +24,22 @@ import { deserializeVoidResponse } from '../../client/client.utils.js';
 import { wrapCommand } from '../command.utils.js';
 import { COMMAND_CODE } from '../command.code.js';
 
+/**
+ * Parameters for the delete consumer group command.
+ */
 export type DeleteGroup = {
+  /** Stream identifier (ID or name) */
   streamId: Id,
+  /** Topic identifier (ID or name) */
   topicId: Id,
+  /** Consumer group identifier (ID or name) */
   groupId: Id
 };
 
+/**
+ * Delete consumer group command definition.
+ * Removes a consumer group from a topic.
+ */
 export const DELETE_GROUP = {
   code: COMMAND_CODE.DeleteGroup,
 
@@ -40,4 +50,7 @@ export const DELETE_GROUP = {
   deserialize: deserializeVoidResponse
 };
 
+/**
+ * Executable delete consumer group command function.
+ */
 export const deleteGroup = wrapCommand<DeleteGroup, boolean>(DELETE_GROUP);

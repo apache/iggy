@@ -25,11 +25,20 @@ import { deserializeConsumerGroups } from './group.utils.js';
 import { wrapCommand } from '../command.utils.js';
 import { COMMAND_CODE } from '../command.code.js';
 
+/**
+ * Parameters for the get consumer groups command.
+ */
 export type GetGroups = {
+  /** Stream identifier (ID or name) */
   streamId: Id,
+  /** Topic identifier (ID or name) */
   topicId: Id
 };
 
+/**
+ * Get consumer groups command definition.
+ * Retrieves all consumer groups within a topic.
+ */
 export const GET_GROUPS = {
   code: COMMAND_CODE.GetGroups,
 
@@ -46,4 +55,7 @@ export const GET_GROUPS = {
 };
 
 
+/**
+ * Executable get consumer groups command function.
+ */
 export const getGroups = wrapCommand<GetGroups, ConsumerGroup[]>(GET_GROUPS);
