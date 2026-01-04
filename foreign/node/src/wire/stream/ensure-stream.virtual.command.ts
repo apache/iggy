@@ -23,6 +23,13 @@ import { createStream } from './create-stream.command.js';
 import { getStream } from './get-stream.command.js';
 
 
+/**
+ * Creates a virtual command that ensures a stream exists.
+ * If the stream does not exist, it will be created.
+ *
+ * @param c - Client provider function
+ * @returns Function that ensures a stream exists by name
+ */
 export const ensureStream = (c: ClientProvider) =>
   async function ensureStream(streamName: string) {
     const stream = await getStream(c)({ streamId: streamName });

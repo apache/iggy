@@ -24,10 +24,18 @@ import { COMMAND_CODE } from '../command.code.js';
 import { serializeIdentifier, type Id } from '../identifier.utils.js';
 import { deserializeToStream, type Stream } from './stream.utils.js';
 
+/**
+ * Parameters for the get stream command.
+ */
 export type GetStream = {
+  /** Stream identifier (ID or name) */
   streamId: Id
 };
 
+/**
+ * Get stream command definition.
+ * Retrieves a single stream by ID or name.
+ */
 export const GET_STREAM = {
   code: COMMAND_CODE.GetStream,
 
@@ -43,4 +51,7 @@ export const GET_STREAM = {
 }
 
 
+/**
+ * Executable get stream command function.
+ */
 export const getStream = wrapCommand<GetStream, Stream | null>(GET_STREAM);
