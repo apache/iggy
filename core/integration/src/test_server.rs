@@ -282,6 +282,51 @@ impl TestServer {
         self.child_handle.is_some()
     }
 
+    /// Check if the server process is still running.
+    /// Returns false if the process has exited (crashed or terminated).
+    pub fn is_running(&mut self) -> bool {
+        if let Some(child) = self.child_handle.as_mut() {
+            match child.try_wait() {
+                Ok(Some(_)) => false, // Process has exited
+                Ok(None) => true,     // Still running
+                Err(_) => false,      // Error checking, assume dead
+            }
+        } else {
+            false
+        }
+    }
+
+    /// Assert that the server is still running. If it has crashed,
+    /// panic with server logs included for debugging.
+    pub fn assert_running(&mut self) {
+        if let Some(Ok(Some(exit_status))) = self.child_handle.as_mut().map(|c| c.try_wait()) {
+            let (stdout_content, stderr_content) = self.collect_logs();
+            panic!(
+                "Server process has crashed with exit status: {}\n\n\
+                 === STDOUT ===\n{}\n\n\
+                 === STDERR ===\n{}",
+                exit_status, stdout_content, stderr_content
+            );
+        }
+    }
+
+    /// Collect server stdout and stderr logs from files.
+    pub fn collect_logs(&self) -> (String, String) {
+        let stdout = self
+            .stdout_file_path
+            .as_ref()
+            .and_then(|path| fs::read_to_string(path).ok())
+            .unwrap_or_else(|| "[No stdout log]".to_string());
+
+        let stderr = self
+            .stderr_file_path
+            .as_ref()
+            .and_then(|path| fs::read_to_string(path).ok())
+            .unwrap_or_else(|| "[No stderr log]".to_string());
+
+        (stdout, stderr)
+    }
+
     pub fn pid(&self) -> u32 {
         self.child_handle.as_ref().unwrap().id()
     }
