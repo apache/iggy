@@ -17,12 +17,12 @@
  */
 
 use crate::streaming::session::Session;
-use crate::streaming::utils::{hash, ptr::EternalPtr};
+use crate::streaming::utils::ptr::EternalPtr;
 use dashmap::DashMap;
-use iggy_common::IggyError;
 use iggy_common::IggyTimestamp;
 use iggy_common::TransportProtocol;
 use iggy_common::UserId;
+use iggy_common::{IggyError, calculate_32};
 use std::net::SocketAddr;
 
 pub struct ClientManager {
@@ -61,7 +61,7 @@ pub struct ConsumerGroup {
 
 impl ClientManager {
     pub fn add_client(&self, address: &SocketAddr, transport: TransportProtocol) -> Session {
-        let client_id = hash::calculate_32(address.to_string().as_bytes());
+        let client_id = calculate_32(address.to_string().as_bytes());
         let session = Session::from_client_id(client_id, *address);
         let client = Client {
             user_id: None,

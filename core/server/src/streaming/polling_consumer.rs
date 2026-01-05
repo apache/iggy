@@ -16,8 +16,7 @@
  * under the License.
  */
 
-use crate::streaming::utils::hash;
-use iggy_common::{IdKind, Identifier};
+use iggy_common::{IdKind, Identifier, calculate_32};
 use std::fmt::{Display, Formatter};
 
 #[derive(Debug, PartialEq, Eq, Hash, Copy, Clone)]
@@ -56,7 +55,7 @@ impl PollingConsumer {
     pub fn resolve_consumer_id(identifier: &Identifier) -> usize {
         match identifier.kind {
             IdKind::Numeric => identifier.get_u32_value().unwrap() as usize,
-            IdKind::String => hash::calculate_32(&identifier.value) as usize,
+            IdKind::String => calculate_32(&identifier.value) as usize,
         }
     }
 }

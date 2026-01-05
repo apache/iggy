@@ -21,7 +21,6 @@ pub mod deduplication;
 pub mod diagnostics;
 pub mod partitions;
 pub mod persistence;
-pub mod personal_access_tokens;
 pub mod polling_consumer;
 pub mod segments;
 pub mod session;

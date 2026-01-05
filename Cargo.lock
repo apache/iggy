@@ -4656,6 +4656,7 @@ dependencies = [
  "aes-gcm",
  "ahash 0.8.12",
  "base64 0.22.1",
+ "blake3",
  "bon",
  "byte-unit",
  "bytemuck",
@@ -4677,6 +4678,7 @@ dependencies = [
  "nix",
  "once_cell",
  "rcgen",
+ "ring",
  "rustls",
  "serde",
  "serde_json",
@@ -5656,10 +5658,13 @@ dependencies = [
 name = "metadata"
 version = "0.1.0"
 dependencies = [
+ "ahash 0.8.12",
+ "bytes",
  "consensus",
  "iggy_common",
  "journal",
  "message_bus",
+ "slab",
  "tracing",
 ]
 
