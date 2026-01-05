@@ -30,7 +30,6 @@ pip install -e ".[dev,testing]"
 
 - Python 3.10+
 
-
 ## Testing
 
 ### Quick Test
