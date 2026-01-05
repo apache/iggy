@@ -35,5 +35,5 @@ journal = { path = "../journal" }
 left-right = { workspace = true }
 message_bus = { path = "../message_bus" }
 paste = "1.0"
-slab = "0.4.11"
+slab = { workspace = true }
 tracing = { workspace = true }

@@ -22,7 +22,8 @@ use crate::metadata::{
     ConsumerGroupId, ConsumerGroupMeta, PartitionId, PartitionMeta, StreamId, StreamMeta, TopicId,
     TopicMeta, UserId, UserMeta,
 };
-use crate::streaming::partitions::partition::{ConsumerGroupOffsets, ConsumerOffsets};
+use crate::streaming::partitions::consumer_group_offsets::ConsumerGroupOffsets;
+use crate::streaming::partitions::consumer_offsets::ConsumerOffsets;
 use crate::streaming::stats::{PartitionStats, StreamStats, TopicStats};
 use iggy_common::{
     CompressionAlgorithm, Identifier, IggyError, IggyExpiry, IggyTimestamp, MaxTopicSize,
@@ -481,8 +482,8 @@ impl MetadataWriter {
                 created_at,
                 revision_id: 0,
                 stats: stats.clone(),
-                consumer_offsets: None,
-                consumer_group_offsets: None,
+                consumer_offsets: Arc::new(ConsumerOffsets::with_capacity(0)),
+                consumer_group_offsets: Arc::new(ConsumerGroupOffsets::with_capacity(0)),
             });
             stats_list.push(stats);
         }

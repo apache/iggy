@@ -116,11 +116,7 @@ impl MessagesReader {
             }
         };
 
-        let messages = IggyMessagesBatchMut::from_indexes_and_messages(
-            messages_count,
-            indexes,
-            messages_bytes,
-        );
+        let messages = IggyMessagesBatchMut::from_indexes_and_messages(indexes, messages_bytes);
         let mut ids = Vec::with_capacity(messages_count as usize);
 
         for message in messages.iter() {
@@ -163,7 +159,6 @@ impl MessagesReader {
         };
 
         Ok(IggyMessagesBatchMut::from_indexes_and_messages(
-            messages_count,
             indexes,
             messages_bytes,
         ))

@@ -23,12 +23,13 @@ use crate::binary::handlers::consumer_groups::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
 use crate::shard::IggyShard;
-use crate::shard::transmission::event::ShardEvent;
-use crate::slab::traits_ext::EntityMarker;
+use crate::shard::transmission::frame::ShardResponse;
+use crate::shard::transmission::message::{
+    ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult,
+};
 use crate::state::command::EntryCommand;
 use crate::state::models::CreateConsumerGroupWithId;
 use crate::streaming::session::Session;
-use anyhow::Result;
 use err_trail::ErrContext;
 use iggy_common::create_consumer_group::CreateConsumerGroup;
 use iggy_common::{Identifier, IggyError, SenderKind};
@@ -51,45 +52,93 @@ impl ServerCommandHandler for CreateConsumerGroup {
         debug!("session: {session}, command: {self}");
         shard.ensure_authenticated(session)?;
         let (stream_id, topic_id) = shard.resolve_topic_id(&self.stream_id, &self.topic_id)?;
-        shard.permissioner.borrow().create_consumer_group(
-            session.get_user_id(),
-            stream_id,
-            topic_id,
-        )?;
-        let cg = shard.create_consumer_group(&self.stream_id, &self.topic_id, self.name.clone())?;
-        let cg_id = cg.id();
+        shard
+            .metadata
+            .perm_create_consumer_group(session.get_user_id(), stream_id, topic_id)?;
 
-        let event = ShardEvent::CreatedConsumerGroup {
+        let request = ShardRequest {
             stream_id: self.stream_id.clone(),
             topic_id: self.topic_id.clone(),
-            cg,
+            partition_id: 0,
+            payload: ShardRequestPayload::CreateConsumerGroup {
+                user_id: session.get_user_id(),
+                stream_id: self.stream_id.clone(),
+                topic_id: self.topic_id.clone(),
+                name: self.name.clone(),
+            },
         };
-        shard.broadcast_event_to_all_shards(event).await?;
 
-        let stream_id = self.stream_id.clone();
-        let topic_id = self.topic_id.clone();
-        shard
-            .state
-        .apply(
-            session.get_user_id(),
-           &EntryCommand::CreateConsumerGroup(CreateConsumerGroupWithId {
-                group_id: cg_id as u32,
-                command: self
-            }),
-        )
-            .await
-            .error(|e: &IggyError| {
-                format!(
-                    "{COMPONENT} (error: {e}) - failed to apply create consumer group for stream_id: {stream_id}, topic_id: {topic_id}, group_id: {cg_id}, session: {session}"
-                )
-            })?;
-        let response = shard.streams.with_consumer_group_by_id(
-            &stream_id,
-            &topic_id,
-            &Identifier::numeric(cg_id as u32).unwrap(),
-            |(root, members)| mapper::map_consumer_group(root, members),
-        );
-        sender.send_ok_response(&response).await?;
+        let message = ShardMessage::Request(request);
+        match shard.send_request_to_shard_or_recoil(None, message).await? {
+            ShardSendRequestResult::Recoil(message) => {
+                if let ShardMessage::Request(ShardRequest { payload, .. }) = message
+                    && let ShardRequestPayload::CreateConsumerGroup {
+                        stream_id: recoil_stream_id,
+                        topic_id: recoil_topic_id,
+                        name,
+                        ..
+                    } = payload
+                {
+                    let cg_id =
+                        shard.create_consumer_group(&recoil_stream_id, &recoil_topic_id, name)?;
+
+                    let stream_id = self.stream_id.clone();
+                    let topic_id = self.topic_id.clone();
+                    shard
+                        .state
+                        .apply(
+                            session.get_user_id(),
+                            &EntryCommand::CreateConsumerGroup(CreateConsumerGroupWithId {
+                                group_id: cg_id as u32,
+                                command: self,
+                            }),
+                        )
+                        .await
+                        .error(|e: &IggyError| {
+                            format!(
+                                "{COMPONENT} (error: {e}) - failed to apply create consumer group for stream_id: {stream_id}, topic_id: {topic_id}, group_id: {cg_id}, session: {session}"
+                            )
+                        })?;
+
+                    let (numeric_stream_id, numeric_topic_id) =
+                        shard.resolve_topic_id(&stream_id, &topic_id)?;
+
+                    let cg_identifier = Identifier::numeric(cg_id as u32).unwrap();
+                    let response = shard
+                        .metadata
+                        .get_consumer_group(numeric_stream_id, numeric_topic_id, cg_id)
+                        .map(|cg| mapper::map_consumer_group_from_meta(&cg))
+                        .ok_or_else(|| {
+                            IggyError::ConsumerGroupIdNotFound(cg_identifier, topic_id.clone())
+                        })?;
+                    sender.send_ok_response(&response).await?;
+                } else {
+                    unreachable!(
+                        "Expected a CreateConsumerGroup request inside of CreateConsumerGroup handler"
+                    );
+                }
+            }
+            ShardSendRequestResult::Response(response) => match response {
+                ShardResponse::CreateConsumerGroupResponse(cg_id) => {
+                    let (numeric_stream_id, numeric_topic_id) =
+                        shard.resolve_topic_id(&self.stream_id, &self.topic_id)?;
+
+                    let cg_identifier = Identifier::numeric(cg_id as u32).unwrap();
+                    let response = shard
+                        .metadata
+                        .get_consumer_group(numeric_stream_id, numeric_topic_id, cg_id)
+                        .map(|cg| mapper::map_consumer_group_from_meta(&cg))
+                        .ok_or_else(|| {
+                            IggyError::ConsumerGroupIdNotFound(cg_identifier, self.topic_id.clone())
+                        })?;
+                    sender.send_ok_response(&response).await?;
+                }
+                ShardResponse::ErrorResponse(err) => return Err(err),
+                _ => unreachable!(
+                    "Expected a CreateConsumerGroupResponse inside of CreateConsumerGroup handler"
+                ),
+            },
+        };
         Ok(HandlerResult::Finished)
     }
 }

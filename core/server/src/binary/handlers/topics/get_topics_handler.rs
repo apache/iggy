@@ -20,11 +20,8 @@ use crate::binary::command::{
     BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
 };
 use crate::binary::handlers::utils::receive_and_validate;
-use crate::binary::mapper;
 use crate::shard::IggyShard;
-use crate::slab::traits_ext::{EntityComponentSystem, IntoComponents};
 use crate::streaming::session::Session;
-use anyhow::Result;
 use iggy_common::IggyError;
 use iggy_common::SenderKind;
 use iggy_common::get_topics::GetTopics;
@@ -45,19 +42,17 @@ impl ServerCommandHandler for GetTopics {
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
         shard.ensure_authenticated(session)?;
-        let stream_id = shard.resolve_stream_id(&self.stream_id)?;
+
+        let Some(numeric_stream_id) = shard.metadata.get_stream_id(&self.stream_id) else {
+            sender.send_empty_ok_response().await?;
+            return Ok(HandlerResult::Finished);
+        };
 
         shard
-            .permissioner
-            .borrow()
-            .get_topics(session.get_user_id(), stream_id)?;
+            .metadata
+            .perm_get_topics(session.get_user_id(), numeric_stream_id)?;
 
-        let response = shard.streams.with_topics(&self.stream_id, |topics| {
-            topics.with_components(|topics| {
-                let (roots, _, stats) = topics.into_components();
-                mapper::map_topics(&roots, &stats)
-            })
-        });
+        let response = shard.get_topics_from_metadata(numeric_stream_id);
         sender.send_ok_response(&response).await?;
         Ok(HandlerResult::Finished)
     }

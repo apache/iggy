@@ -17,20 +17,52 @@
  */
 
 use super::COMPONENT;
+use crate::metadata::UserMeta;
 use crate::shard::IggyShard;
 use crate::streaming::session::Session;
 use crate::streaming::users::user::User;
 use crate::streaming::utils::crypto;
+use dashmap::DashMap;
 use err_trail::ErrContext;
 use iggy_common::Identifier;
 use iggy_common::IggyError;
 use iggy_common::Permissions;
 use iggy_common::UserStatus;
+use std::sync::Arc;
 use tracing::{error, warn};
 
 const MAX_USERS: usize = u32::MAX as usize;
 
 impl IggyShard {
+    fn user_from_meta(&self, meta: &UserMeta) -> User {
+        let pats = self.metadata.get_user_personal_access_tokens(meta.id);
+        let pat_map = DashMap::new();
+        for pat in pats {
+            pat_map.insert(pat.token.clone(), pat);
+        }
+        User {
+            id: meta.id,
+            status: meta.status,
+            username: meta.username.to_string(),
+            password: meta.password_hash.to_string(),
+            created_at: meta.created_at,
+            permissions: meta.permissions.as_ref().map(|p| (**p).clone()),
+            personal_access_tokens: pat_map,
+        }
+    }
+
+    fn get_user_from_metadata(&self, identifier: &Identifier) -> Result<Option<User>, IggyError> {
+        let user_id = match self.metadata.get_user_id(identifier) {
+            Some(id) => id,
+            None => return Ok(None),
+        };
+
+        Ok(self
+            .metadata
+            .get_user(user_id)
+            .map(|meta| self.user_from_meta(&meta)))
+    }
+
     pub fn find_user(&self, user_id: &Identifier) -> Result<Option<User>, IggyError> {
         self.try_get_user(user_id)
     }
@@ -41,11 +73,15 @@ impl IggyShard {
     }
 
     pub fn try_get_user(&self, user_id: &Identifier) -> Result<Option<User>, IggyError> {
-        self.users.get_by_identifier(user_id)
+        self.get_user_from_metadata(user_id)
     }
 
     pub fn get_users(&self) -> Vec<User> {
-        self.users.values()
+        self.metadata
+            .get_all_users()
+            .iter()
+            .map(|meta| self.user_from_meta(meta))
+            .collect()
     }
 
     pub fn create_user(
@@ -55,63 +91,32 @@ impl IggyShard {
         status: UserStatus,
         permissions: Option<Permissions>,
     ) -> Result<User, IggyError> {
-        if self.users.username_exists(username) {
-            error!("User: {username} already exists.");
-            return Err(IggyError::UserAlreadyExists);
-        }
+        let password_hash = crypto::hash_password(password);
 
-        if self.users.len() >= MAX_USERS {
-            error!("Available users limit reached.");
-            return Err(IggyError::UsersLimitReached);
-        }
+        let user_id = self
+            .writer()
+            .create_user(
+                &self.metadata,
+                Arc::from(username),
+                Arc::from(password_hash.as_str()),
+                status,
+                permissions.map(Arc::new),
+                MAX_USERS,
+            )
+            .inspect_err(|e| match e {
+                IggyError::UserAlreadyExists => error!("User: {username} already exists."),
+                IggyError::UsersLimitReached => error!("Available users limit reached."),
+                _ => {}
+            })?;
 
-        let user_id = self.create_user_base(username, password, status, permissions)?;
-        self.get_user(&(user_id as u32).try_into()?)
-            .error(|e: &IggyError| {
-                format!("{COMPONENT} (error: {e}) - failed to get user with id: {user_id}")
-            })
-    }
-
-    pub fn create_user_bypass_auth(
-        &self,
-        expected_user_id: u32,
-        username: &str,
-        password: &str,
-        status: UserStatus,
-        permissions: Option<Permissions>,
-    ) -> Result<(), IggyError> {
-        let assigned_user_id = self.create_user_base(username, password, status, permissions)?;
-
-        assert_eq!(
-            assigned_user_id as u32, expected_user_id,
-            "User ID mismatch: expected {}, got {}. This indicates shards are out of sync.",
-            expected_user_id, assigned_user_id
-        );
-
-        Ok(())
-    }
-
-    fn create_user_base(
-        &self,
-        username: &str,
-        password: &str,
-        status: UserStatus,
-        permissions: Option<Permissions>,
-    ) -> Result<usize, IggyError> {
-        let user = User::new(0, username, password, status, permissions.clone());
-        let user_id = self.users.insert(user);
-        self.permissioner
-            .borrow_mut()
-            .init_permissions_for_user(user_id as u32, permissions);
         self.metrics.increment_users(1);
-        Ok(user_id)
+
+        self.get_user(&user_id.try_into()?).error(|e: &IggyError| {
+            format!("{COMPONENT} (error: {e}) - failed to get user with id: {user_id}")
+        })
     }
 
     pub fn delete_user(&self, user_id: &Identifier) -> Result<User, IggyError> {
-        self.delete_user_base(user_id)
-    }
-
-    pub fn delete_user_bypass_auth(&self, user_id: &Identifier) -> Result<User, IggyError> {
         self.delete_user_base(user_id)
     }
 
@@ -125,16 +130,8 @@ impl IggyShard {
             return Err(IggyError::CannotDeleteUser(user.id));
         }
 
-        let user_slab_id = user.id as usize;
         let user_u32_id = user.id;
 
-        let user = self
-            .users
-            .remove(user_slab_id)
-            .ok_or(IggyError::ResourceNotFound(user_id.to_string()))?;
-        self.permissioner
-            .borrow_mut()
-            .delete_permissions_for_user(user_u32_id);
         self.client_manager
             .delete_clients_for_user(user_u32_id)
             .error(|e: &IggyError| {
@@ -143,19 +140,13 @@ impl IggyShard {
                 )
             })?;
         self.metrics.decrement_users(1);
+
+        self.writer().delete_user(user_u32_id);
+
         Ok(user)
     }
 
     pub fn update_user(
-        &self,
-        user_id: &Identifier,
-        username: Option<String>,
-        status: Option<UserStatus>,
-    ) -> Result<User, IggyError> {
-        self.update_user_base(user_id, username, status)
-    }
-
-    pub fn update_user_bypass_auth(
         &self,
         user_id: &Identifier,
         username: Option<String>,
@@ -171,41 +162,19 @@ impl IggyShard {
         status: Option<UserStatus>,
     ) -> Result<User, IggyError> {
         let user = self.get_user(user_id)?;
-        let numeric_user_id = Identifier::numeric(user.id).unwrap();
+        let numeric_user_id = user.id;
 
-        if let Some(ref new_username) = username {
-            let existing_user = self.get_user(&new_username.to_owned().try_into()?);
-            if existing_user.is_ok() && existing_user.unwrap().id != user.id {
-                error!("User: {new_username} already exists.");
-                return Err(IggyError::UserAlreadyExists);
-            }
+        let updated_meta = self.writer().update_user(
+            &self.metadata,
+            numeric_user_id,
+            username.map(|u| Arc::from(u.as_str())),
+            status,
+        )?;
 
-            self.users.update_username(user_id, new_username.clone())?;
-        }
-
-        if let Some(status) = status {
-            self.users.with_user_mut(&numeric_user_id, |user| {
-                user.status = status;
-            }).error(|e: &IggyError| {
-                format!("{COMPONENT} update user (error: {e}) - failed to update user with id: {user_id}")
-            })?;
-        }
-
-        self.get_user(&numeric_user_id)
-            .error(|e: &IggyError| {
-                format!("{COMPONENT} update user (error: {e}) - failed to get updated user with id: {user_id}")
-            })
+        Ok(self.user_from_meta(&updated_meta))
     }
 
     pub fn update_permissions(
-        &self,
-        user_id: &Identifier,
-        permissions: Option<Permissions>,
-    ) -> Result<(), IggyError> {
-        self.update_permissions_base(user_id, permissions)
-    }
-
-    pub fn update_permissions_bypass_auth(
         &self,
         user_id: &Identifier,
         permissions: Option<Permissions>,
@@ -222,29 +191,26 @@ impl IggyShard {
             format!("{COMPONENT} (error: {e}) - failed to get user with id: {user_id}")
         })?;
 
-        self.permissioner
-            .borrow_mut()
-            .update_permissions_for_user(user.id, permissions.clone());
+        let current_meta = self
+            .metadata
+            .get_user(user.id)
+            .ok_or_else(|| IggyError::ResourceNotFound(user_id.to_string()))?;
 
-        self.users.with_user_mut(user_id, |user| {
-            user.permissions = permissions;
-        }).error(|e: &IggyError| {
-            format!(
-                "{COMPONENT} update user permissions (error: {e}) - failed to update permissions for user with id: {user_id}"
-            )
-        })
+        let updated_meta = UserMeta {
+            id: current_meta.id,
+            username: current_meta.username,
+            password_hash: current_meta.password_hash,
+            status: current_meta.status,
+            permissions: permissions.map(Arc::new),
+            created_at: current_meta.created_at,
+        };
+
+        self.writer().update_user_meta(user.id, updated_meta);
+
+        Ok(())
     }
 
     pub fn change_password(
-        &self,
-        user_id: &Identifier,
-        current_password: &str,
-        new_password: &str,
-    ) -> Result<(), IggyError> {
-        self.change_password_base(user_id, current_password, new_password)
-    }
-
-    pub fn change_password_bypass_auth(
         &self,
         user_id: &Identifier,
         current_password: &str,
@@ -259,19 +225,39 @@ impl IggyShard {
         current_password: &str,
         new_password: &str,
     ) -> Result<(), IggyError> {
-        self.users.with_user_mut(user_id, |user| {
-            if !crypto::verify_password(current_password, &user.password) {
-                error!(
-                    "Invalid current password for user: {} with ID: {user_id}.",
-                    user.username
-                );
-                return Err(IggyError::InvalidCredentials);
-            }
-            user.password = crypto::hash_password(new_password);
-            Ok(())
-        }).error(|e: &IggyError| {
-            format!("{COMPONENT} change password (error: {e}) - failed to change password for user with id: {user_id}")
-        })?
+        let user = self.get_user(user_id).error(|e: &IggyError| {
+            format!(
+                "{COMPONENT} change password (error: {e}) - failed to get user with id: {user_id}"
+            )
+        })?;
+
+        // Verify current password
+        if !crypto::verify_password(current_password, &user.password) {
+            error!(
+                "Invalid current password for user: {} with ID: {user_id}.",
+                user.username
+            );
+            return Err(IggyError::InvalidCredentials);
+        }
+
+        let current_meta = self
+            .metadata
+            .get_user(user.id)
+            .ok_or_else(|| IggyError::ResourceNotFound(user_id.to_string()))?;
+
+        let new_password_hash = crypto::hash_password(new_password);
+        let updated_meta = UserMeta {
+            id: current_meta.id,
+            username: current_meta.username,
+            password_hash: Arc::from(new_password_hash.as_str()),
+            status: current_meta.status,
+            permissions: current_meta.permissions,
+            created_at: current_meta.created_at,
+        };
+
+        self.writer().update_user_meta(user.id, updated_meta);
+
+        Ok(())
     }
 
     pub fn login_user(

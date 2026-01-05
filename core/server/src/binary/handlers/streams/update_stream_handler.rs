@@ -21,15 +21,16 @@ use crate::binary::command::{
 };
 use crate::binary::handlers::streams::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
-
 use crate::shard::IggyShard;
-use crate::shard::transmission::event::ShardEvent;
+use crate::shard::transmission::frame::ShardResponse;
+use crate::shard::transmission::message::{
+    ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult,
+};
 use crate::state::command::EntryCommand;
 use crate::streaming::session::Session;
-use anyhow::Result;
 use err_trail::ErrContext;
 use iggy_common::update_stream::UpdateStream;
-use iggy_common::{IggyError, SenderKind};
+use iggy_common::{Identifier, IggyError, SenderKind};
 use std::rc::Rc;
 use tracing::{debug, instrument};
 
@@ -50,29 +51,60 @@ impl ServerCommandHandler for UpdateStream {
         shard.ensure_authenticated(session)?;
         let stream_id = shard.resolve_stream_id(&self.stream_id)?;
         shard
-            .permissioner
-            .borrow()
-            .update_stream(session.get_user_id(), stream_id)?;
-        let stream_id = self.stream_id.clone();
-        shard
-            .update_stream(&self.stream_id, self.name.clone())
-            .error(|e: &IggyError| {
-                format!("{COMPONENT} (error: {e}) - failed to update stream with id: {stream_id}, session: {session}")
-            })?;
+            .metadata
+            .perm_update_stream(session.get_user_id(), stream_id)?;
 
-        let event = ShardEvent::UpdatedStream {
-            stream_id: self.stream_id.clone(),
-            name: self.name.clone(),
+        let request = ShardRequest {
+            stream_id: Identifier::default(),
+            topic_id: Identifier::default(),
+            partition_id: 0,
+            payload: ShardRequestPayload::UpdateStream {
+                user_id: session.get_user_id(),
+                stream_id: self.stream_id.clone(),
+                name: self.name.clone(),
+            },
         };
-        shard.broadcast_event_to_all_shards(event).await?;
-        shard
-            .state
-            .apply(session.get_user_id(), &EntryCommand::UpdateStream(self))
-            .await
-            .error(|e: &IggyError| {
-                format!("{COMPONENT} (error: {e}) - failed to apply update stream with id: {stream_id}, session: {session}")
-            })?;
-        sender.send_empty_ok_response().await?;
+
+        let message = ShardMessage::Request(request);
+        match shard.send_request_to_shard_or_recoil(None, message).await? {
+            ShardSendRequestResult::Recoil(message) => {
+                if let ShardMessage::Request(ShardRequest { payload, .. }) = message
+                    && let ShardRequestPayload::UpdateStream {
+                        stream_id, name, ..
+                    } = payload
+                {
+                    shard.update_stream(&stream_id, name.clone())?;
+
+                    shard
+                        .state
+                        .apply(session.get_user_id(), &EntryCommand::UpdateStream(self))
+                        .await
+                        .error(|e: &IggyError| {
+                            format!(
+                                "{COMPONENT} (error: {e}) - failed to apply update stream with id: {stream_id}, session: {session}"
+                            )
+                        })?;
+
+                    sender.send_empty_ok_response().await?;
+                } else {
+                    unreachable!(
+                        "Expected an UpdateStream request inside of UpdateStream handler, impossible state"
+                    );
+                }
+            }
+            ShardSendRequestResult::Response(response) => match response {
+                ShardResponse::UpdateStreamResponse => {
+                    sender.send_empty_ok_response().await?;
+                }
+                ShardResponse::ErrorResponse(err) => {
+                    return Err(err);
+                }
+                _ => unreachable!(
+                    "Expected an UpdateStreamResponse inside of UpdateStream handler, impossible state"
+                ),
+            },
+        }
+
         Ok(HandlerResult::Finished)
     }
 }

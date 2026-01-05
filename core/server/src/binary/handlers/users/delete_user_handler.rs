@@ -16,26 +16,22 @@
  * under the License.
  */
 
-use std::rc::Rc;
-
 use crate::binary::command::{
     BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
 };
 use crate::binary::handlers::users::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
-
 use crate::shard::IggyShard;
-use crate::shard::transmission::event::ShardEvent;
 use crate::shard::transmission::frame::ShardResponse;
 use crate::shard::transmission::message::{
     ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult,
 };
 use crate::state::command::EntryCommand;
 use crate::streaming::session::Session;
-use anyhow::Result;
 use err_trail::ErrContext;
 use iggy_common::delete_user::DeleteUser;
 use iggy_common::{Identifier, IggyError, SenderKind};
+use std::rc::Rc;
 use tracing::info;
 use tracing::{debug, instrument};
 
@@ -54,10 +50,7 @@ impl ServerCommandHandler for DeleteUser {
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
         shard.ensure_authenticated(session)?;
-        shard
-            .permissioner
-            .borrow()
-            .delete_user(session.get_user_id())?;
+        shard.metadata.perm_delete_user(session.get_user_id())?;
 
         let request = ShardRequest {
             stream_id: Identifier::default(),
@@ -86,8 +79,6 @@ impl ServerCommandHandler for DeleteUser {
                     })?;
 
                     info!("Deleted user: {} with ID: {}.", user.username, user.id);
-                    let event = ShardEvent::DeletedUser { user_id };
-                    shard.broadcast_event_to_all_shards(event).await?;
 
                     shard
                         .state
@@ -104,18 +95,7 @@ impl ServerCommandHandler for DeleteUser {
                 }
             }
             ShardSendRequestResult::Response(response) => match response {
-                ShardResponse::DeletedUser(user) => {
-                    shard
-                        .state
-                        .apply(user.id, &EntryCommand::DeleteUser(DeleteUser { user_id: user.id.try_into().unwrap() }))
-                        .await
-                        .error(|e: &IggyError| {
-                            format!(
-                                "{COMPONENT} (error: {e}) - failed to apply delete user with ID: {user_id}, session: {session}",
-                                user_id = user.id,
-                                session = session
-                            )
-                        })?;
+                ShardResponse::DeletedUser(_user) => {
                     sender.send_empty_ok_response().await?;
                 }
                 ShardResponse::ErrorResponse(err) => {

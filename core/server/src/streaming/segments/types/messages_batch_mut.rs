@@ -38,9 +38,6 @@ use tracing::{error, warn};
 /// and the corresponding index data that allows for efficient message lookup.
 #[derive(Debug, Default)]
 pub struct IggyMessagesBatchMut {
-    /// The number of messages in the batch
-    count: u32,
-
     /// The index data for all messages in the buffer
     indexes: IggyIndexesMut,
 
@@ -58,7 +55,6 @@ impl IggyMessagesBatchMut {
     /// Creates a new empty messages container
     pub fn empty() -> Self {
         Self {
-            count: 0,
             indexes: IggyIndexesMut::empty(),
             messages: PooledBuffer::empty(),
         }
@@ -70,17 +66,8 @@ impl IggyMessagesBatchMut {
     ///
     /// * `indexes` - Preprocessed index data
     /// * `messages` - Serialized message data
-    /// * `count` - Number of messages in the batch
-    pub fn from_indexes_and_messages(
-        count: u32,
-        indexes: IggyIndexesMut,
-        messages: PooledBuffer,
-    ) -> Self {
-        Self {
-            count,
-            indexes,
-            messages,
-        }
+    pub fn from_indexes_and_messages(indexes: IggyIndexesMut, messages: PooledBuffer) -> Self {
+        Self { indexes, messages }
     }
 
     /// Creates a new messages container from a slice of IggyMessage objects.
@@ -105,7 +92,7 @@ impl IggyMessagesBatchMut {
             indexes_buffer.insert(0, position, 0);
         }
 
-        Self::from_indexes_and_messages(messages.len() as u32, indexes_buffer, messages_buffer)
+        Self::from_indexes_and_messages(indexes_buffer, messages_buffer)
     }
 
     /// Creates a lending iterator that yields mutable views of messages.
@@ -270,10 +257,9 @@ impl IggyMessagesBatchMut {
     /// The returned batch uses Arc-backed `Bytes`, allowing cheap clones.
     /// After calling this, the mutable batch becomes empty.
     pub fn freeze(&mut self) -> IggyMessagesBatch {
-        let count = self.count;
+        let count = self.count();
         let indexes = self.indexes.freeze();
         let messages = self.messages.freeze();
-        self.count = 0;
         IggyMessagesBatch::new(indexes, messages, count)
     }
 
@@ -375,7 +361,6 @@ impl IggyMessagesBatchMut {
         sub_buffer.put_slice(&self.messages[first_message_position..last_message_position]);
 
         Some(IggyMessagesBatchMut {
-            count: sub_indexes.count(),
             indexes: sub_indexes,
             messages: sub_buffer,
         })
@@ -821,10 +806,11 @@ impl Index<usize> for IggyMessagesBatchMut {
     type Output = [u8];
 
     fn index(&self, index: usize) -> &Self::Output {
-        if index >= self.count as usize {
+        if index >= self.count() as usize {
             panic!(
                 "Index out of bounds: the len is {} but the index is {}",
-                self.count, index
+                self.count(),
+                index
             );
         }
 

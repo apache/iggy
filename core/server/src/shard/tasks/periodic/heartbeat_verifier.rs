@@ -79,7 +79,7 @@ async fn verify_heartbeats(shard: Rc<IggyShard>) -> Result<(), IggyError> {
     let count = stale_clients.len();
 
     for client_id in stale_clients {
-        shard.delete_client(client_id);
+        shard.delete_client(client_id).await;
     }
     info!("Removed {count} stale clients.");
 
