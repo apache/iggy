@@ -19,57 +19,118 @@
 use std::rc::Rc;
 
 use crate::binary::command::{
-    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
+    AuthenticatedHandler, BinaryServerCommand, HandlerResult, ServerCommand,
 };
 use crate::binary::handlers::users::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
-
 use crate::shard::IggyShard;
-use crate::shard::transmission::event::ShardEvent;
+use crate::shard::transmission::frame::ShardResponse;
+use crate::shard::transmission::message::{
+    ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult,
+};
 use crate::state::command::EntryCommand;
+use crate::streaming::auth::Auth;
 use crate::streaming::session::Session;
-use anyhow::Result;
 use err_trail::ErrContext;
 use iggy_common::update_permissions::UpdatePermissions;
-use iggy_common::{IggyError, SenderKind};
+use iggy_common::{Identifier, IggyError, SenderKind};
 use tracing::info;
 use tracing::{debug, instrument};
 
-impl ServerCommandHandler for UpdatePermissions {
+impl AuthenticatedHandler for UpdatePermissions {
     fn code(&self) -> u32 {
         iggy_common::UPDATE_PERMISSIONS_CODE
     }
 
-    #[instrument(skip_all, name = "trace_update_permissions", fields(iggy_user_id = session.get_user_id(), iggy_client_id = session.client_id))]
+    #[instrument(skip_all, name = "trace_update_permissions", fields(iggy_user_id = auth.user_id(), iggy_client_id = session.client_id))]
     async fn handle(
         self,
         sender: &mut SenderKind,
         _length: u32,
+        auth: Auth,
         session: &Session,
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
 
-        shard
-                .update_permissions(session, &self.user_id, self.permissions.clone())
-                .error(|e: &IggyError| format!("{COMPONENT} (error: {e}) - failed to update permissions for user_id: {}, session: {session}",
-                    self.user_id
-                ))?;
-        info!("Updated permissions for user with ID: {}.", self.user_id);
-        let event = ShardEvent::UpdatedPermissions {
-            user_id: self.user_id.clone(),
-            permissions: self.permissions.clone(),
+        let user_id_for_log = self.user_id.clone();
+        let request = ShardRequest {
+            stream_id: Identifier::default(),
+            topic_id: Identifier::default(),
+            partition_id: 0,
+            payload: ShardRequestPayload::UpdatePermissions {
+                session_user_id: auth.user_id(),
+                user_id: self.user_id.clone(),
+                permissions: self.permissions.clone(),
+            },
         };
-        shard.broadcast_event_to_all_shards(event).await?;
 
-        shard
-            .state
-            .apply(
-                session.get_user_id(),
-                &EntryCommand::UpdatePermissions(self),
-            )
-            .await?;
-        sender.send_empty_ok_response().await?;
+        let message = ShardMessage::Request(request);
+        match shard.send_request_to_shard_or_recoil(None, message).await? {
+            ShardSendRequestResult::Recoil(message) => {
+                if let ShardMessage::Request(ShardRequest { payload, .. }) = message
+                    && let ShardRequestPayload::UpdatePermissions {
+                        user_id,
+                        permissions,
+                        ..
+                    } = payload
+                {
+                    let _user_guard = shard.fs_locks.user_lock.lock().await;
+                    shard
+                        .update_permissions(session, &user_id, permissions)
+                        .error(|e: &IggyError| {
+                            format!(
+                                "{COMPONENT} (error: {e}) - failed to update permissions for user_id: {}, session: {session}",
+                                user_id
+                            )
+                        })?;
+
+                    info!("Updated permissions for user with ID: {}.", user_id_for_log);
+
+                    shard
+                        .state
+                        .apply(auth.user_id(), &EntryCommand::UpdatePermissions(self))
+                        .await
+                        .error(|e: &IggyError| {
+                            format!(
+                                "{COMPONENT} (error: {e}) - failed to apply update permissions for user_id: {}, session: {session}",
+                                user_id_for_log
+                            )
+                        })?;
+
+                    sender.send_empty_ok_response().await?;
+                } else {
+                    unreachable!(
+                        "Expected an UpdatePermissions request inside of UpdatePermissions handler, impossible state"
+                    );
+                }
+            }
+            ShardSendRequestResult::Response(response) => match response {
+                ShardResponse::UpdatePermissionsResponse => {
+                    info!("Updated permissions for user with ID: {}.", user_id_for_log);
+
+                    shard
+                        .state
+                        .apply(auth.user_id(), &EntryCommand::UpdatePermissions(self))
+                        .await
+                        .error(|e: &IggyError| {
+                            format!(
+                                "{COMPONENT} (error: {e}) - failed to apply update permissions for user_id: {}, session: {session}",
+                                user_id_for_log
+                            )
+                        })?;
+
+                    sender.send_empty_ok_response().await?;
+                }
+                ShardResponse::ErrorResponse(err) => {
+                    return Err(err);
+                }
+                _ => unreachable!(
+                    "Expected an UpdatePermissionsResponse inside of UpdatePermissions handler, impossible state"
+                ),
+            },
+        }
+
         Ok(HandlerResult::Finished)
     }
 }

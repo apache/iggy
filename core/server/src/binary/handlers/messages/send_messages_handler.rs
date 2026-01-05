@@ -16,13 +16,13 @@
  * under the License.
  */
 
-use crate::binary::command::{BinaryServerCommand, HandlerResult, ServerCommandHandler};
+use crate::binary::command::{AuthenticatedHandler, BinaryServerCommand, HandlerResult};
 use crate::shard::IggyShard;
 use crate::shard::transmission::message::{ShardMessage, ShardRequest, ShardRequestPayload};
+use crate::streaming::auth::Auth;
 use crate::streaming::segments::{IggyIndexesMut, IggyMessagesBatchMut};
 use crate::streaming::session::Session;
-use crate::streaming::{streams, topics};
-use anyhow::Result;
+use crate::streaming::topics;
 use compio::buf::{IntoInner as _, IoBuf};
 use iggy_common::Identifier;
 use iggy_common::PooledBuffer;
@@ -34,13 +34,13 @@ use iggy_common::{IggyError, Partitioning, SendMessages, Validatable};
 use std::rc::Rc;
 use tracing::{debug, error, info, instrument};
 
-impl ServerCommandHandler for SendMessages {
+impl AuthenticatedHandler for SendMessages {
     fn code(&self) -> u32 {
         iggy_common::SEND_MESSAGES_CODE
     }
 
     #[instrument(skip_all, name = "trace_send_messages", fields(
-        iggy_user_id = session.get_user_id(),
+        iggy_user_id = auth.user_id(),
         iggy_client_id = session.client_id,
         iggy_stream_id = self.stream_id.as_string(),
         iggy_topic_id = self.topic_id.as_string(),
@@ -50,6 +50,7 @@ impl ServerCommandHandler for SendMessages {
         mut self,
         sender: &mut SenderKind,
         length: u32,
+        auth: Auth,
         session: &Session,
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {
@@ -110,47 +111,35 @@ impl ServerCommandHandler for SendMessages {
         );
         batch.validate()?;
 
-        shard.ensure_topic_exists(&self.stream_id, &self.topic_id)?;
+        let (numeric_stream_id, numeric_topic_id) =
+            shard.resolve_topic_id(&self.stream_id, &self.topic_id)?;
 
-        let numeric_stream_id = shard
-            .streams
-            .with_stream_by_id(&self.stream_id, streams::helpers::get_stream_id());
-
-        let numeric_topic_id = shard.streams.with_topic_by_id(
-            &self.stream_id,
-            &self.topic_id,
-            topics::helpers::get_topic_id(),
-        );
-
-        // TODO(tungtose): dry this code && get partition_id below have a side effect
-        let partition_id = shard.streams.with_topic_by_id(
-            &self.stream_id,
-            &self.topic_id,
-            |(root, auxilary, ..)| match self.partitioning.kind {
-                PartitioningKind::Balanced => {
-                    let upperbound = root.partitions().len();
-                    let pid = auxilary.get_next_partition_id(upperbound);
-                    Ok(pid)
-                }
-                PartitioningKind::PartitionId => Ok(u32::from_le_bytes(
-                    self.partitioning.value[..self.partitioning.length as usize]
-                        .try_into()
-                        .map_err(|_| IggyError::InvalidNumberEncoding)?,
-                ) as usize),
-                PartitioningKind::MessagesKey => {
-                    let upperbound = root.partitions().len();
-                    Ok(
-                        topics::helpers::calculate_partition_id_by_messages_key_hash(
-                            upperbound,
-                            &self.partitioning.value,
-                        ),
-                    )
-                }
-            },
-        )?;
+        let partition_id = match self.partitioning.kind {
+            PartitioningKind::Balanced => shard
+                .metadata
+                .get_next_partition_id(numeric_stream_id, numeric_topic_id)
+                .ok_or(IggyError::TopicIdNotFound(
+                    self.stream_id.clone(),
+                    self.topic_id.clone(),
+                ))?,
+            PartitioningKind::PartitionId => u32::from_le_bytes(
+                self.partitioning.value[..self.partitioning.length as usize]
+                    .try_into()
+                    .map_err(|_| IggyError::InvalidNumberEncoding)?,
+            ) as usize,
+            PartitioningKind::MessagesKey => {
+                let partitions_count = shard
+                    .metadata
+                    .partitions_count(numeric_stream_id, numeric_topic_id);
+                topics::helpers::calculate_partition_id_by_messages_key_hash(
+                    partitions_count,
+                    &self.partitioning.value,
+                )
+            }
+        };
 
         let namespace = IggyNamespace::new(numeric_stream_id, numeric_topic_id, partition_id);
-        let user_id = session.get_user_id();
+        let user_id = auth.user_id();
         let unsupport_socket_transfer = matches!(
             self.partitioning.kind,
             PartitioningKind::Balanced | PartitioningKind::MessagesKey

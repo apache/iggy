@@ -16,13 +16,9 @@
  * under the License.
  */
 
-use crate::configs::server::MemoryPoolConfig;
-use crate::slab::partitions;
-use crate::slab::streams;
-use crate::slab::topics;
-
 use super::cache_indexes::CacheIndexesConfig;
 use super::sharding::ShardingConfig;
+use crate::configs::server::MemoryPoolConfig;
 use iggy_common::IggyByteSize;
 use iggy_common::IggyError;
 use iggy_common::IggyExpiry;
@@ -218,9 +214,9 @@ impl SystemConfig {
 
     pub fn get_partition_path(
         &self,
-        stream_id: streams::ContainerId,
-        topic_id: topics::ContainerId,
-        partition_id: partitions::ContainerId,
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
     ) -> String {
         format!(
             "{}/{}",

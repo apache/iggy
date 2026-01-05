@@ -18,35 +18,34 @@
 
 use super::COMPONENT;
 use crate::binary::command::{
-    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
+    AuthenticatedHandler, BinaryServerCommand, HandlerResult, ServerCommand,
 };
 use crate::binary::handlers::utils::receive_and_validate;
-use iggy_common::SenderKind;
-
 use crate::shard::IggyShard;
+use crate::streaming::auth::Auth;
 use crate::streaming::session::Session;
-use anyhow::Result;
 use err_trail::ErrContext;
 use iggy_common::IggyError;
+use iggy_common::SenderKind;
 use iggy_common::leave_consumer_group::LeaveConsumerGroup;
 use std::rc::Rc;
 use tracing::{debug, instrument};
 
-impl ServerCommandHandler for LeaveConsumerGroup {
+impl AuthenticatedHandler for LeaveConsumerGroup {
     fn code(&self) -> u32 {
         iggy_common::LEAVE_CONSUMER_GROUP_CODE
     }
 
-    #[instrument(skip_all, name = "trace_leave_consumer_group", fields(iggy_user_id = session.get_user_id(), iggy_client_id = session.client_id, iggy_stream_id = self.stream_id.as_string(), iggy_topic_id = self.topic_id.as_string(), iggy_group_id = self.group_id.as_string()))]
+    #[instrument(skip_all, name = "trace_leave_consumer_group", fields(iggy_user_id = auth.user_id(), iggy_client_id = session.client_id, iggy_stream_id = self.stream_id.as_string(), iggy_topic_id = self.topic_id.as_string(), iggy_group_id = self.group_id.as_string()))]
     async fn handle(
         self,
         sender: &mut SenderKind,
         _length: u32,
+        auth: Auth,
         session: &Session,
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
-
         shard
             .leave_consumer_group(
                 session,

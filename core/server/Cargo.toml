@@ -40,7 +40,7 @@ iggy-web = ["dep:rust-embed", "dep:mime_guess"]
 [dependencies]
 ahash = { workspace = true }
 anyhow = { workspace = true }
-arcshift = "0.4.2"
+arc-swap = "1.8.0"
 argon2 = { workspace = true }
 async-channel = { workspace = true }
 async_zip = { workspace = true }
@@ -60,7 +60,6 @@ cyper-axum = { workspace = true }
 dashmap = { workspace = true }
 derive_more = { workspace = true }
 dotenvy = { workspace = true }
-enum_dispatch = { workspace = true }
 err_trail = { workspace = true }
 error_set = { workspace = true }
 figlet-rs = { workspace = true }
@@ -69,8 +68,8 @@ flume = { workspace = true }
 futures = { workspace = true }
 hash32 = "1.0.0"
 human-repr = { workspace = true }
-
 iggy_common = { workspace = true }
+imbl = "6.1.0"
 jsonwebtoken = { version = "10.2.0", features = ["rust_crypto"] }
 lending-iterator = "0.1.7"
 mimalloc = { workspace = true, optional = true }
@@ -107,7 +106,6 @@ rustls-pemfile = "2.2.0"
 send_wrapper = "0.6.0"
 serde = { workspace = true }
 serde_with = { workspace = true }
-slab = "0.4.11"
 socket2 = "0.6.1"
 static-toml = "1.3.0"
 strum = { workspace = true }
@@ -139,3 +137,10 @@ vergen-git2 = { version = "1.0.7", features = [
     "rustc",
     "si",
 ] }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "segmented_slab"
+harness = false

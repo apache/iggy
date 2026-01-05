@@ -17,22 +17,19 @@
  */
 
 use crate::binary::command::{
-    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
+    AuthenticatedHandler, BinaryServerCommand, HandlerResult, ServerCommand,
 };
 use crate::binary::handlers::utils::receive_and_validate;
-use crate::binary::mapper;
 use crate::shard::IggyShard;
-use crate::slab::traits_ext::{EntityComponentSystem, IntoComponents};
+use crate::streaming::auth::Auth;
 use crate::streaming::session::Session;
-use crate::streaming::{streams, topics};
-use anyhow::Result;
 use iggy_common::IggyError;
 use iggy_common::SenderKind;
 use iggy_common::get_consumer_groups::GetConsumerGroups;
 use std::rc::Rc;
 use tracing::debug;
 
-impl ServerCommandHandler for GetConsumerGroups {
+impl AuthenticatedHandler for GetConsumerGroups {
     fn code(&self) -> u32 {
         iggy_common::GET_CONSUMER_GROUPS_CODE
     }
@@ -41,35 +38,38 @@ impl ServerCommandHandler for GetConsumerGroups {
         self,
         sender: &mut SenderKind,
         _length: u32,
+        auth: Auth,
         session: &Session,
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
-        shard.ensure_authenticated(session)?;
-        shard.ensure_topic_exists(&self.stream_id, &self.topic_id)?;
-        let numeric_topic_id = shard.streams.with_topic_by_id(
-            &self.stream_id,
-            &self.topic_id,
-            topics::helpers::get_topic_id(),
-        );
-        let numeric_stream_id = shard
-            .streams
-            .with_stream_by_id(&self.stream_id, streams::helpers::get_stream_id());
-        shard.permissioner.borrow().get_consumer_groups(
-            session.get_user_id(),
+        let (numeric_stream_id, numeric_topic_id) =
+            shard.resolve_topic_id(&self.stream_id, &self.topic_id)?;
+        shard.permissioner.get_consumer_groups(
+            auth.user_id(),
             numeric_stream_id,
             numeric_topic_id,
         )?;
 
-        let consumer_groups =
-            shard
-                .streams
-                .with_consumer_groups(&self.stream_id, &self.topic_id, |cgs| {
-                    cgs.with_components(|cgs| {
-                        let (roots, members) = cgs.into_components();
-                        mapper::map_consumer_groups(roots, members)
-                    })
-                });
+        let metadata = shard.metadata.load();
+
+        let consumer_groups = metadata
+            .streams
+            .get(numeric_stream_id)
+            .and_then(|s| s.topics.get(numeric_topic_id))
+            .map(|topic| {
+                use bytes::{BufMut, BytesMut};
+                let mut bytes = BytesMut::new();
+                for (_, cg_meta) in topic.consumer_groups.iter() {
+                    bytes.put_u32_le(cg_meta.id as u32);
+                    bytes.put_u32_le(cg_meta.partitions.len() as u32);
+                    bytes.put_u32_le(cg_meta.members.len() as u32);
+                    bytes.put_u8(cg_meta.name.len() as u8);
+                    bytes.put_slice(cg_meta.name.as_bytes());
+                }
+                bytes.freeze()
+            })
+            .unwrap_or_default();
         sender.send_ok_response(&consumer_groups).await?;
         Ok(HandlerResult::Finished)
     }

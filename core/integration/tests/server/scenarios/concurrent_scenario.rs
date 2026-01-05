@@ -29,15 +29,17 @@ const MULTIPLE_CLIENT_COUNT: usize = 10;
 const OPERATIONS_PER_CLIENT: usize = OPERATIONS_COUNT / MULTIPLE_CLIENT_COUNT;
 const USER_PASSWORD: &str = "secret";
 const TEST_STREAM_NAME: &str = "race-test-stream";
+const TEST_TOPIC_NAME: &str = "race-test-topic";
 const PARTITIONS_COUNT: u32 = 1;
+const PARTITIONS_TO_ADD: u32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResourceType {
     User,
     Stream,
     Topic,
+    Partition,
     // TODO(hubcio): add ConsumerGroup
-    // TODO(hubcio): add Partition
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +72,24 @@ pub async fn run(
         root_client.create_stream(TEST_STREAM_NAME).await.unwrap();
     }
 
+    // For partition tests, create parent stream and topic first
+    if resource_type == ResourceType::Partition {
+        root_client.create_stream(TEST_STREAM_NAME).await.unwrap();
+        let stream_id = Identifier::named(TEST_STREAM_NAME).unwrap();
+        root_client
+            .create_topic(
+                &stream_id,
+                TEST_TOPIC_NAME,
+                PARTITIONS_COUNT,
+                CompressionAlgorithm::default(),
+                None,
+                IggyExpiry::NeverExpire,
+                MaxTopicSize::ServerDefault,
+            )
+            .await
+            .unwrap();
+    }
+
     let results = match (resource_type, scenario_type) {
         (ResourceType::User, ScenarioType::Cold) => {
             execute_multiple_clients_users_cold(client_factory, use_barrier).await
@@ -86,6 +106,11 @@ pub async fn run(
         (ResourceType::Topic, ScenarioType::Cold) => {
             execute_multiple_clients_topics_cold(client_factory, use_barrier).await
         }
+        (ResourceType::Partition, ScenarioType::Hot) => {
+            execute_multiple_clients_partitions_hot(client_factory, use_barrier).await
+        }
+        // Partitions don't have names, so Cold scenario doesn't apply
+        (ResourceType::Partition, ScenarioType::Cold) => vec![],
         _ => vec![],
         // TODO: Figure out why those tests timeout in CI.
         /*
@@ -374,6 +399,51 @@ async fn execute_multiple_clients_topics_cold(
         .collect()
 }
 
+async fn execute_multiple_clients_partitions_hot(
+    client_factory: &dyn ClientFactory,
+    use_barrier: bool,
+) -> Vec<OperationResult> {
+    let mut handles = Vec::with_capacity(MULTIPLE_CLIENT_COUNT);
+    let barrier = if use_barrier {
+        Some(Arc::new(Barrier::new(MULTIPLE_CLIENT_COUNT)))
+    } else {
+        None
+    };
+
+    for _ in 0..MULTIPLE_CLIENT_COUNT {
+        let client = create_client(client_factory).await;
+        login_root(&client).await;
+
+        let barrier_clone = barrier.clone();
+        let handle = tokio::spawn(async move {
+            if let Some(b) = barrier_clone {
+                b.wait().await;
+            }
+
+            let mut results = Vec::with_capacity(OPERATIONS_PER_CLIENT);
+            let stream_id = Identifier::named(TEST_STREAM_NAME).unwrap();
+            let topic_id = Identifier::named(TEST_TOPIC_NAME).unwrap();
+
+            for _ in 0..OPERATIONS_PER_CLIENT {
+                let result = client
+                    .create_partitions(&stream_id, &topic_id, PARTITIONS_TO_ADD)
+                    .await
+                    .map(|_| ());
+                results.push(result);
+            }
+            results
+        });
+
+        handles.push(handle);
+    }
+
+    let all_results = join_all(handles).await;
+    all_results
+        .into_iter()
+        .flat_map(|r| r.expect("Tokio task panicked"))
+        .collect()
+}
+
 fn validate_results(results: &[OperationResult], scenario_type: ScenarioType) {
     let success_count = results.iter().filter(|r| r.is_ok()).count();
     let error_count = results.iter().filter(|r| r.is_err()).count();
@@ -539,6 +609,22 @@ async fn validate_server_state(
                     current_names, first_names,
                     "Client {} sees different topics than client 0",
                     i
+                );
+            }
+        }
+        ResourceType::Partition => {
+            let mut partition_counts = Vec::new();
+            for client in &clients {
+                let count = validate_partitions_state(client).await;
+                partition_counts.push(count);
+            }
+
+            let first_count = partition_counts[0];
+            for (i, count) in partition_counts.iter().enumerate().skip(1) {
+                assert_eq!(
+                    *count, first_count,
+                    "Client {} sees different partition count ({}) than client 0 ({})",
+                    i, count, first_count
                 );
             }
         }
@@ -735,6 +821,26 @@ async fn validate_topics_state(client: &IggyClient, scenario_type: ScenarioType)
     test_topics
 }
 
+async fn validate_partitions_state(client: &IggyClient) -> u32 {
+    let stream_id = Identifier::named(TEST_STREAM_NAME).unwrap();
+    let topic_id = Identifier::named(TEST_TOPIC_NAME).unwrap();
+    let topic = client
+        .get_topic(&stream_id, &topic_id)
+        .await
+        .expect("Failed to get test topic")
+        .expect("Test topic not found");
+
+    // Expected: initial partition + OPERATIONS_COUNT added partitions
+    let expected_partitions = PARTITIONS_COUNT + (OPERATIONS_COUNT as u32 * PARTITIONS_TO_ADD);
+    assert_eq!(
+        topic.partitions_count, expected_partitions,
+        "Hot path: Expected {} partitions (1 initial + {} added), but found {}",
+        expected_partitions, OPERATIONS_COUNT, topic.partitions_count
+    );
+
+    topic.partitions_count
+}
+
 async fn cleanup_resources(client: &IggyClient, resource_type: ResourceType) {
     match resource_type {
         ResourceType::User => {
@@ -755,8 +861,8 @@ async fn cleanup_resources(client: &IggyClient, resource_type: ResourceType) {
                     .await;
             }
         }
-        // Just delete test stream
-        ResourceType::Topic => {
+        // Just delete test stream (also cleans up topics and partitions)
+        ResourceType::Topic | ResourceType::Partition => {
             let _ = client
                 .delete_stream(&Identifier::named(TEST_STREAM_NAME).unwrap())
                 .await;

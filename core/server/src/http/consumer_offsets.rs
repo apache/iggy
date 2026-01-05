@@ -118,6 +118,8 @@ async fn delete_consumer_offset(
     Path((stream_id, topic_id, consumer_id)): Path<(String, String, String)>,
     query: Query<DeleteConsumerOffset>,
 ) -> Result<StatusCode, CustomError> {
+    let stream_id_ident = Identifier::from_str_value(&stream_id)?;
+    let topic_id_ident = Identifier::from_str_value(&topic_id)?;
     let consumer = Consumer::new(consumer_id.try_into()?);
     let session = SendWrapper::new(Session::stateless(identity.user_id, identity.ip_address));
     state
@@ -125,8 +127,8 @@ async fn delete_consumer_offset(
         .delete_consumer_offset(
             &session,
             consumer,
-            &query.stream_id,
-            &query.topic_id,
+            &stream_id_ident,
+            &topic_id_ident,
             query.partition_id,
         )
         .await

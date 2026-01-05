@@ -32,17 +32,15 @@ impl IggyShard {
         &self,
         session: &Session,
     ) -> Result<Vec<PersonalAccessToken>, IggyError> {
-        self.ensure_authenticated(session)?;
         let user_id = session.get_user_id();
-        let user = self.get_user(&user_id.try_into()?).error(|e: &IggyError| {
+
+        let _ = self.get_user(&user_id.try_into()?).error(|e: &IggyError| {
             format!("{COMPONENT} (error: {e}) - failed to get user with id: {user_id}")
         })?;
+
         info!("Loading personal access tokens for user with ID: {user_id}...",);
-        let personal_access_tokens: Vec<_> = user
-            .personal_access_tokens
-            .iter()
-            .map(|pat| pat.clone())
-            .collect();
+
+        let personal_access_tokens = self.metadata.get_user_personal_access_tokens(user_id);
 
         info!(
             "Loaded {} personal access tokens for user with ID: {user_id}.",
@@ -57,23 +55,22 @@ impl IggyShard {
         name: &str,
         expiry: IggyExpiry,
     ) -> Result<(PersonalAccessToken, String), IggyError> {
-        self.ensure_authenticated(session)?;
         let user_id = session.get_user_id();
-        let identifier = user_id.try_into()?;
-        {
-            let user = self.get_user(&identifier).error(|e: &IggyError| {
-                format!("{COMPONENT} (error: {e}) - failed to get user with id: {user_id}")
-            })?;
-            let max_token_per_user = self.config.personal_access_token.max_tokens_per_user;
-            if user.personal_access_tokens.len() as u32 >= max_token_per_user {
-                error!(
-                    "User with ID: {user_id} has reached the maximum number of personal access tokens: {max_token_per_user}.",
-                );
-                return Err(IggyError::PersonalAccessTokensLimitReached(
-                    user_id,
-                    max_token_per_user,
-                ));
-            }
+
+        let _ = self.get_user(&user_id.try_into()?).error(|e: &IggyError| {
+            format!("{COMPONENT} (error: {e}) - failed to get user with id: {user_id}")
+        })?;
+
+        let max_token_per_user = self.config.personal_access_token.max_tokens_per_user;
+        let current_count = self.metadata.user_pat_count(user_id);
+        if current_count as u32 >= max_token_per_user {
+            error!(
+                "User with ID: {user_id} has reached the maximum number of personal access tokens: {max_token_per_user}.",
+            );
+            return Err(IggyError::PersonalAccessTokensLimitReached(
+                user_id,
+                max_token_per_user,
+            ));
         }
 
         let (personal_access_token, token) =
@@ -82,47 +79,24 @@ impl IggyShard {
         Ok((personal_access_token, token))
     }
 
-    pub fn create_personal_access_token_bypass_auth(
-        &self,
-        personal_access_token: PersonalAccessToken,
-    ) -> Result<(), IggyError> {
-        self.create_personal_access_token_base(personal_access_token)
-    }
-
     fn create_personal_access_token_base(
         &self,
         personal_access_token: PersonalAccessToken,
     ) -> Result<(), IggyError> {
         let user_id = personal_access_token.user_id;
         let name = personal_access_token.name.clone();
-        let token_hash = personal_access_token.token.clone();
-        let identifier = user_id.try_into()?;
-        self.users
-            .with_user_mut(&identifier, |user| {
-                if user
-                    .personal_access_tokens
-                    .iter()
-                    .any(|pat| pat.name.as_str() == name.as_str())
-                {
-                    error!(
-                        "Personal access token: {name} for user with ID: {user_id} already exists."
-                    );
-                    return Err(IggyError::PersonalAccessTokenAlreadyExists(
-                        name.to_string(),
-                        user_id,
-                    ));
-                }
 
-                user.personal_access_tokens
-                    .insert(token_hash, personal_access_token);
-                info!("Created personal access token: {name} for user with ID: {user_id}.");
-                Ok(())
-            })
-            .error(|e: &IggyError| {
-                format!(
-                    "{COMPONENT} create PAT (error: {e}) - failed to access user with id: {user_id}"
-                )
-            })??;
+        if self.metadata.user_has_pat_with_name(user_id, &name) {
+            error!("Personal access token: {name} for user with ID: {user_id} already exists.");
+            return Err(IggyError::PersonalAccessTokenAlreadyExists(
+                name.to_string(),
+                user_id,
+            ));
+        }
+
+        self.metadata
+            .add_personal_access_token(user_id, personal_access_token);
+        info!("Created personal access token: {name} for user with ID: {user_id}.");
         Ok(())
     }
 
@@ -131,44 +105,24 @@ impl IggyShard {
         session: &Session,
         name: &str,
     ) -> Result<(), IggyError> {
-        self.ensure_authenticated(session)?;
         let user_id = session.get_user_id();
         self.delete_personal_access_token_base(user_id, name)
     }
 
-    pub fn delete_personal_access_token_bypass_auth(
-        &self,
-        user_id: u32,
-        name: &str,
-    ) -> Result<(), IggyError> {
-        self.delete_personal_access_token_base(user_id, name)
-    }
-
     fn delete_personal_access_token_base(&self, user_id: u32, name: &str) -> Result<(), IggyError> {
-        self.users
-            .with_user_mut(&user_id.try_into()?, |user| {
-                let token = if let Some(pat) = user
-                    .personal_access_tokens
-                    .iter()
-                    .find(|pat| pat.name.as_str() == name)
-                {
-                    pat.token.clone()
-                } else {
+        let token_hash =
+            self.metadata
+                .find_pat_token_hash_by_name(user_id, name)
+                .ok_or_else(|| {
                     error!(
                         "Personal access token: {name} for user with ID: {user_id} does not exist.",
                     );
-                    return Err(IggyError::ResourceNotFound(name.to_owned()));
-                };
+                    IggyError::ResourceNotFound(name.to_owned())
+                })?;
 
-                info!("Deleting personal access token: {name} for user with ID: {user_id}...");
-                user.personal_access_tokens.remove(&token);
-                Ok(())
-            })
-            .error(|e: &IggyError| {
-                format!(
-                    "{COMPONENT} delete PAT (error: {e}) - failed to access user with id: {user_id}"
-                )
-            })??;
+        info!("Deleting personal access token: {name} for user with ID: {user_id}...");
+        self.metadata
+            .delete_personal_access_token(user_id, &token_hash);
         info!("Deleted personal access token: {name} for user with ID: {user_id}.");
         Ok(())
     }
@@ -179,33 +133,27 @@ impl IggyShard {
         session: Option<&Session>,
     ) -> Result<User, IggyError> {
         let token_hash = PersonalAccessToken::hash_token(token);
-        let users = self.users.values();
-        let mut personal_access_token = None;
-        for user in &users {
-            if let Some(pat) = user.personal_access_tokens.get(&token_hash) {
-                personal_access_token = Some(pat);
-                break;
-            }
-        }
 
-        if personal_access_token.is_none() {
-            let redacted_token = if token.len() > 4 {
-                format!("{}****", &token[..4])
-            } else {
-                "****".to_string()
-            };
-            error!("Personal access token: {redacted_token} does not exist.");
-            return Err(IggyError::ResourceNotFound(token.to_owned()));
-        }
+        let personal_access_token = self
+            .metadata
+            .get_personal_access_token_by_hash(&token_hash)
+            .ok_or_else(|| {
+                let redacted_token = if token.len() > 4 {
+                    format!("{}****", &token[..4])
+                } else {
+                    "****".to_string()
+                };
+                error!("Personal access token: {redacted_token} does not exist.");
+                IggyError::ResourceNotFound(token.to_owned())
+            })?;
 
-        let personal_access_token = personal_access_token.unwrap();
         if personal_access_token.is_expired(IggyTimestamp::now()) {
             error!(
                 "Personal access token: {} for user with ID: {} has expired.",
                 personal_access_token.name, personal_access_token.user_id
             );
             return Err(IggyError::PersonalAccessTokenExpired(
-                personal_access_token.name.as_str().to_owned(),
+                (*personal_access_token.name).to_owned(),
                 personal_access_token.user_id,
             ));
         }

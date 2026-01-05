@@ -17,23 +17,25 @@
  */
 
 use super::COMPONENT;
+use crate::metadata::PartitionMeta;
 use crate::shard::IggyShard;
 use crate::shard::calculate_shard_assignment;
-use crate::slab::traits_ext::EntityMarker;
-use crate::slab::traits_ext::IntoComponents;
-use crate::streaming::partitions;
-use crate::streaming::partitions::partition;
+use crate::shard::namespace::IggyNamespace;
+use crate::shard::shard_local_partitions::PartitionData;
+use crate::shard::transmission::event::PartitionInfo;
+use crate::streaming::partitions::partition::{ConsumerGroupOffsets, ConsumerOffsets};
 use crate::streaming::partitions::storage::create_partition_file_hierarchy;
 use crate::streaming::partitions::storage::delete_partitions_from_disk;
 use crate::streaming::segments::Segment;
 use crate::streaming::segments::storage::create_segment_storage;
 use crate::streaming::session::Session;
-use crate::streaming::streams;
-use crate::streaming::topics;
+use crate::streaming::stats::PartitionStats;
 use err_trail::ErrContext;
 use iggy_common::Identifier;
 use iggy_common::IggyError;
-use iggy_common::sharding::{IggyNamespace, LocalIdx, PartitionLocation, ShardId};
+use iggy_common::IggyTimestamp;
+use iggy_common::sharding::{LocalIdx, PartitionLocation, ShardId};
+use std::sync::Arc;
 use tracing::info;
 
 impl IggyShard {
@@ -44,10 +46,15 @@ impl IggyShard {
         topic_id: usize,
         operation: &str,
     ) -> Result<(), IggyError> {
-        let permissioner = self.permissioner.borrow();
         let result = match operation {
-            "create" => permissioner.create_partitions(session.get_user_id(), stream_id, topic_id),
-            "delete" => permissioner.delete_partitions(session.get_user_id(), stream_id, topic_id),
+            "create" => {
+                self.permissioner
+                    .create_partitions(session.get_user_id(), stream_id, topic_id)
+            }
+            "delete" => {
+                self.permissioner
+                    .delete_partitions(session.get_user_id(), stream_id, topic_id)
+            }
             _ => return Err(IggyError::InvalidCommand),
         };
 
@@ -67,41 +74,43 @@ impl IggyShard {
         stream_id: &Identifier,
         topic_id: &Identifier,
         partitions_count: u32,
-    ) -> Result<Vec<partition::Partition>, IggyError> {
-        self.ensure_authenticated(session)?;
-        self.ensure_topic_exists(stream_id, topic_id)?;
-        let numeric_stream_id = self
-            .streams
-            .with_stream_by_id(stream_id, streams::helpers::get_stream_id());
-        let numeric_topic_id =
-            self.streams
-                .with_topic_by_id(stream_id, topic_id, topics::helpers::get_topic_id());
+    ) -> Result<Vec<PartitionInfo>, IggyError> {
+        let (stream, topic) = self.resolve_topic_id(stream_id, topic_id)?;
 
-        // Claude garbage, rework this.
-        self.validate_partition_permissions(
-            session,
-            numeric_stream_id,
-            numeric_topic_id,
-            "create",
-        )?;
-        let parent_stats =
-            self.streams
-                .with_topic_by_id(stream_id, topic_id, topics::helpers::get_stats());
-        let partitions = partition::create_and_insert_partitions_mem(
-            &self.streams,
-            stream_id,
-            topic_id,
-            parent_stats,
-            partitions_count,
-            &self.config.system,
-        );
+        self.validate_partition_permissions(session, stream, topic, "create")?;
+
+        let created_at = IggyTimestamp::now();
+        let shards_count = self.get_available_shards_count();
+
+        let parent_stats = self
+            .metadata
+            .get_topic_stats(stream, topic)
+            .expect("Parent topic stats must exist");
+
+        let metas: Vec<PartitionMeta> = (0..partitions_count)
+            .map(|_| PartitionMeta {
+                id: 0,
+                created_at,
+                revision_id: 0,
+                stats: Arc::new(PartitionStats::new(parent_stats.clone())),
+                consumer_offsets: None,
+                consumer_group_offsets: None,
+            })
+            .collect();
+
+        let assigned_ids = self.metadata.add_partitions(stream, topic, metas);
+
+        let partition_infos: Vec<PartitionInfo> = assigned_ids
+            .iter()
+            .map(|&id| PartitionInfo { id, created_at })
+            .collect();
 
         self.metrics.increment_partitions(partitions_count);
         self.metrics.increment_segments(partitions_count);
 
-        let shards_count = self.get_available_shards_count();
-        for (partition_id, stats) in partitions.iter().map(|p| (p.id(), p.stats())) {
-            let ns = IggyNamespace::new(numeric_stream_id, numeric_topic_id, partition_id);
+        for info in &partition_infos {
+            let partition_id = info.id;
+            let ns = IggyNamespace::new(stream, topic, partition_id);
             let shard_id = ShardId::new(calculate_shard_assignment(&ns, shards_count));
             let is_current_shard = self.id == *shard_id;
             // TODO(hubcio): LocalIdx(0) is wrong.. When IggyPartitions is integrated into
@@ -109,19 +118,15 @@ impl IggyShard {
             let location = PartitionLocation::new(shard_id, LocalIdx::new(0));
             self.insert_shard_table_record(ns, location);
 
-            create_partition_file_hierarchy(
-                numeric_stream_id as usize,
-                numeric_topic_id as usize,
-                partition_id,
-                &self.config.system,
-            )
-            .await?;
-            stats.increment_segments_count(1);
+            create_partition_file_hierarchy(stream, topic, partition_id, &self.config.system)
+                .await?;
+
             if is_current_shard {
-                self.init_log(stream_id, topic_id, partition_id).await?;
+                self.init_partition_directly(stream, topic, partition_id, created_at)
+                    .await?;
             }
         }
-        Ok(partitions)
+        Ok(partition_infos)
     }
 
     pub async fn init_log(
@@ -130,93 +135,182 @@ impl IggyShard {
         topic_id: &Identifier,
         partition_id: usize,
     ) -> Result<(), IggyError> {
-        let numeric_stream_id = self
-            .streams
-            .with_stream_by_id(stream_id, streams::helpers::get_stream_id());
-        let numeric_topic_id =
-            self.streams
-                .with_topic_by_id(stream_id, topic_id, topics::helpers::get_topic_id());
+        let (stream, topic) = self.resolve_topic_id(stream_id, topic_id)?;
 
-        let start_offset = 0;
+        let created_at = self
+            .metadata
+            .load()
+            .streams
+            .get(stream)
+            .and_then(|s| s.topics.get(topic))
+            .and_then(|t| t.partitions.get(partition_id))
+            .map(|meta| meta.created_at)
+            .unwrap_or_else(IggyTimestamp::now);
+
+        self.init_partition_directly(stream, topic, partition_id, created_at)
+            .await
+    }
+
+    /// Thread-safety: Uses `pending_partition_inits` to prevent TOCTOU races where
+    /// multiple tasks could see needs_init=true and all try to initialize. Only the
+    /// first task to mark the partition as pending will proceed; others return early.
+    pub async fn init_partition_directly(
+        &self,
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
+        created_at: IggyTimestamp,
+    ) -> Result<(), IggyError> {
+        let ns = IggyNamespace::new(stream_id, topic_id, partition_id);
+
+        // Check if partition already exists in partition_store
+        // If it does, verify revision_id matches SharedMetadata
+        // If not, the old entry is stale and needs to be removed
+        let needs_init = {
+            let store = self.partition_store.borrow();
+            let metadata = self.metadata.load();
+            let partition_meta = metadata
+                .streams
+                .get(stream_id)
+                .and_then(|s| s.topics.get(topic_id))
+                .and_then(|t| t.partitions.get(partition_id));
+
+            match (store.get(&ns), partition_meta) {
+                (Some(data), Some(meta)) if data.revision_id == meta.revision_id => false,
+                (Some(_), _) => {
+                    // Stale entry with different revision_id
+                    drop(store);
+                    self.partition_store.borrow_mut().remove(&ns);
+                    true
+                }
+                (None, _) => true,
+            }
+        };
+
+        if !needs_init {
+            return Ok(());
+        }
+
+        {
+            let mut pending = self.pending_partition_inits.borrow_mut();
+            if pending.contains(&ns) {
+                return Ok(());
+            }
+            pending.insert(ns);
+        }
+
+        let result = self
+            .init_partition_directly_inner(stream_id, topic_id, partition_id, created_at, ns)
+            .await;
+
+        self.pending_partition_inits.borrow_mut().remove(&ns);
+
+        result
+    }
+
+    async fn init_partition_directly_inner(
+        &self,
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
+        created_at: IggyTimestamp,
+        ns: IggyNamespace,
+    ) -> Result<(), IggyError> {
         info!(
-            "Initializing log for partition ID: {} for topic ID: {} for stream ID: {} with start offset: {}",
-            partition_id, numeric_topic_id, numeric_stream_id, start_offset
+            "Initializing partition in partition_store: partition ID: {} for topic ID: {} for stream ID: {}",
+            partition_id, topic_id, stream_id
         );
 
-        let segment = Segment::new(
-            start_offset,
-            self.config.system.segment.size,
-            self.config.system.segment.message_expiry,
-        );
+        let stats = self
+            .metadata
+            .get_partition_stats_by_ids(stream_id, topic_id, partition_id)
+            .expect("Partition stats must exist in SharedMetadata");
 
-        let numeric_stream_id = self
-            .streams
-            .with_stream_by_id(stream_id, streams::helpers::get_stream_id());
-        let numeric_topic_id =
-            self.streams
-                .with_topic_by_id(stream_id, topic_id, topics::helpers::get_topic_id());
+        let partition_path =
+            self.config
+                .system
+                .get_partition_path(stream_id, topic_id, partition_id);
 
-        let messages_size = 0;
-        let indexes_size = 0;
-        let storage = create_segment_storage(
+        let mut loaded_log = crate::bootstrap::load_segments(
             &self.config.system,
-            numeric_stream_id,
-            numeric_topic_id,
+            stream_id,
+            topic_id,
             partition_id,
-            messages_size,
-            indexes_size,
-            start_offset,
+            partition_path,
+            stats.clone(),
         )
         .await?;
 
-        self.streams
-            .with_partition_by_id_mut(stream_id, topic_id, partition_id, |(.., log)| {
-                log.add_persisted_segment(segment, storage);
-            });
-        info!(
-            "Initialized log for partition ID: {} for topic ID: {} for stream ID: {} with start offset: {}",
-            partition_id, numeric_topic_id, numeric_stream_id, start_offset
-        );
+        // If no segments exist on disk (newly created partition), create an initial segment
+        if !loaded_log.has_segments() {
+            info!(
+                "No segments found on disk for partition ID: {} for topic ID: {} for stream ID: {}, creating initial segment",
+                partition_id, topic_id, stream_id
+            );
 
-        Ok(())
-    }
+            let start_offset = 0;
+            let segment = Segment::new(
+                start_offset,
+                self.config.system.segment.size,
+                self.config.system.segment.message_expiry,
+            );
 
-    pub async fn create_partitions_bypass_auth(
-        &self,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-        partitions: Vec<partition::Partition>,
-    ) -> Result<(), IggyError> {
-        let numeric_stream_id = self
-            .streams
-            .with_stream_by_id(stream_id, streams::helpers::get_stream_id());
-        let numeric_topic_id =
-            self.streams
-                .with_topic_by_id(stream_id, topic_id, topics::helpers::get_topic_id());
-        let shards_count = self.get_available_shards_count();
-        for partition in partitions {
-            let actual_id = partition.id();
-            let id = self.streams.with_partitions_mut(
+            let storage = create_segment_storage(
+                &self.config.system,
                 stream_id,
                 topic_id,
-                partitions::helpers::insert_partition(partition),
-            );
-            assert_eq!(
-                id, actual_id,
-                "create_partitions_bypass_auth: partition mismatch ID, wrong creation order ?!"
-            );
-            let ns = IggyNamespace::new(numeric_stream_id, numeric_topic_id, id);
-            // TODO(hubcio): when IggyPartitions is integrated, this fallback path should
-            // either be removed or use proper index resolution.
-            let location = self.find_shard_table_record(&ns).unwrap_or_else(|| {
-                tracing::warn!("WARNING: missing shard table record for namespace: {:?}, in the event handler for `CreatedPartitions` event.", ns);
-                let shard_id = ShardId::new(calculate_shard_assignment(&ns, shards_count));
-                PartitionLocation::new(shard_id, LocalIdx::new(0))
-            });
-            if self.id == *location.shard_id {
-                self.init_log(stream_id, topic_id, id).await?;
-            }
+                partition_id,
+                0, // messages_size
+                0, // indexes_size
+                start_offset,
+            )
+            .await?;
+
+            loaded_log.add_persisted_segment(segment, storage);
+            stats.increment_segments_count(1);
         }
+
+        let current_offset = loaded_log.active_segment().end_offset;
+
+        let revision_id = self
+            .metadata
+            .load()
+            .streams
+            .get(stream_id)
+            .and_then(|s| s.topics.get(topic_id))
+            .and_then(|t| t.partitions.get(partition_id))
+            .map(|meta| meta.revision_id)
+            .unwrap_or(0);
+
+        let consumer_offsets = Arc::new(ConsumerOffsets::with_capacity(0));
+        let consumer_group_offsets = Arc::new(ConsumerGroupOffsets::with_capacity(0));
+
+        self.metadata.set_partition_offsets(
+            stream_id,
+            topic_id,
+            partition_id,
+            consumer_offsets.clone(),
+            consumer_group_offsets.clone(),
+        );
+
+        let partition_data = PartitionData::with_log(
+            loaded_log,
+            stats,
+            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(current_offset)),
+            consumer_offsets,
+            consumer_group_offsets,
+            None, // message_deduplicator
+            created_at,
+            revision_id,
+            current_offset > 0, // should_increment_offset - true if we have messages
+        );
+
+        self.partition_store.borrow_mut().insert(ns, partition_data);
+
+        info!(
+            "Initialized partition in partition_store: partition ID: {} for topic ID: {} for stream ID: {} with offset: {}",
+            partition_id, topic_id, stream_id, current_offset
+        );
 
         Ok(())
     }
@@ -228,58 +322,77 @@ impl IggyShard {
         topic_id: &Identifier,
         partitions_count: u32,
     ) -> Result<Vec<usize>, IggyError> {
-        self.ensure_authenticated(session)?;
         self.ensure_partitions_exist(stream_id, topic_id, partitions_count)?;
 
-        let numeric_stream_id = self
+        let (stream, topic) = self.resolve_topic_id(stream_id, topic_id)?;
+
+        self.validate_partition_permissions(session, stream, topic, "delete")?;
+
+        let all_partition_ids: Vec<usize> = {
+            let metadata = self.metadata.load();
+            metadata
+                .streams
+                .get(stream)
+                .and_then(|s| s.topics.get(topic))
+                .map(|t| {
+                    let mut ids: Vec<_> = t.partitions.keys().collect();
+                    ids.sort_unstable();
+                    ids
+                })
+                .unwrap_or_default()
+        };
+
+        let partitions_to_delete: Vec<usize> = all_partition_ids
+            .into_iter()
+            .rev()
+            .take(partitions_count as usize)
+            .collect();
+
+        let topic_stats = self
+            .metadata
+            .load()
             .streams
-            .with_stream_by_id(stream_id, streams::helpers::get_stream_id());
-        let numeric_topic_id =
-            self.streams
-                .with_topic_by_id(stream_id, topic_id, topics::helpers::get_topic_id());
+            .get(stream)
+            .and_then(|s| s.topics.get(topic))
+            .map(|t| t.stats.clone());
 
-        self.validate_partition_permissions(
-            session,
-            numeric_stream_id,
-            numeric_topic_id,
-            "delete",
-        )?;
+        let mut deleted_ids = Vec::with_capacity(partitions_to_delete.len());
+        let mut total_messages_count: u64 = 0;
+        let mut total_segments_count: u32 = 0;
+        let mut total_size_bytes: u64 = 0;
 
-        let partitions = self.delete_partitions_base(stream_id, topic_id, partitions_count);
-        let parent = partitions
-            .first()
-            .map(|p| p.stats().parent().clone())
-            .expect("delete_partitions: no partitions to deletion");
-        // Reassign the partitions count as it could get clamped by the `delete_partitions_base` method.
+        for partition_id in &partitions_to_delete {
+            let ns = IggyNamespace::new(stream, topic, *partition_id);
 
-        let mut deleted_ids = Vec::with_capacity(partitions.len());
-        let mut total_messages_count = 0;
-        let mut total_segments_count = 0;
-        let mut total_size_bytes = 0;
+            if let Some(stats) =
+                self.metadata
+                    .get_partition_stats_by_ids(stream, topic, *partition_id)
+            {
+                total_segments_count += stats.segments_count_inconsistent();
+                total_messages_count += stats.messages_count_inconsistent();
+                total_size_bytes += stats.size_bytes_inconsistent();
+            }
 
-        for partition in partitions {
-            let (root, stats, _, _, _, _, _) = partition.into_components();
-            let partition_id = root.id();
-            let ns = IggyNamespace::new(numeric_stream_id, numeric_topic_id, partition_id);
             self.remove_shard_table_record(&ns);
-
-            self.delete_partition_dir(numeric_stream_id, numeric_topic_id, partition_id)
+            self.partition_store.borrow_mut().remove(&ns);
+            self.delete_partition_dir(stream, topic, *partition_id)
                 .await?;
-            let segments_count = stats.segments_count_inconsistent();
-            let messages_count = stats.messages_count_inconsistent();
-            let size_bytes = stats.size_bytes_inconsistent();
-            total_messages_count += messages_count;
-            total_segments_count += segments_count;
-            total_size_bytes += size_bytes;
 
-            deleted_ids.push(partition_id);
+            deleted_ids.push(*partition_id);
         }
 
-        self.metrics.decrement_partitions(partitions_count);
+        self.metadata
+            .delete_partitions(stream, topic, &partitions_to_delete);
+
+        self.metrics
+            .decrement_partitions(partitions_to_delete.len() as u32);
         self.metrics.decrement_segments(total_segments_count);
-        parent.decrement_messages_count(total_messages_count);
-        parent.decrement_size_bytes(total_size_bytes);
-        parent.decrement_segments_count(total_segments_count);
+
+        if let Some(parent) = topic_stats {
+            parent.decrement_messages_count(total_messages_count);
+            parent.decrement_size_bytes(total_size_bytes);
+            parent.decrement_segments_count(total_segments_count);
+        }
 
         Ok(deleted_ids)
     }
@@ -295,15 +408,42 @@ impl IggyShard {
 
     fn delete_partitions_base(
         &self,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
+        stream: usize,
+        topic: usize,
         partitions_count: u32,
-    ) -> Vec<partition::Partition> {
-        self.streams.with_partitions_mut(
-            stream_id,
-            topic_id,
-            partitions::helpers::delete_partitions(partitions_count),
-        )
+    ) -> Vec<usize> {
+        let all_partition_ids: Vec<usize> = {
+            let metadata = self.metadata.load();
+            metadata
+                .streams
+                .get(stream)
+                .and_then(|s| s.topics.get(topic))
+                .map(|t| {
+                    let mut ids: Vec<_> = t.partitions.keys().collect();
+                    ids.sort_unstable();
+                    ids
+                })
+                .unwrap_or_default()
+        };
+
+        let partition_ids: Vec<usize> = all_partition_ids
+            .into_iter()
+            .rev()
+            .take(partitions_count as usize)
+            .collect();
+
+        {
+            let mut store = self.partition_store.borrow_mut();
+            for &partition_id in &partition_ids {
+                let ns = IggyNamespace::new(stream, topic, partition_id);
+                store.remove(&ns);
+            }
+        }
+
+        self.metadata
+            .delete_partitions(stream, topic, &partition_ids);
+
+        partition_ids
     }
 
     pub fn delete_partitions_bypass_auth(
@@ -314,19 +454,18 @@ impl IggyShard {
         partition_ids: Vec<usize>,
     ) -> Result<(), IggyError> {
         self.ensure_partitions_exist(stream_id, topic_id, partitions_count)?;
+        let (stream, topic) = self.resolve_topic_id(stream_id, topic_id)?;
 
         if partitions_count as usize != partition_ids.len() {
             return Err(IggyError::InvalidPartitionsCount);
         }
 
-        let partitions = self.delete_partitions_base(stream_id, topic_id, partitions_count);
-        for (deleted_partition_id, actual_deleted_partition_id) in partitions
-            .iter()
-            .map(|p| p.id())
-            .zip(partition_ids.into_iter())
+        let deleted_ids = self.delete_partitions_base(stream, topic, partitions_count);
+        for (deleted_partition_id, actual_deleted_partition_id) in
+            deleted_ids.iter().zip(partition_ids.iter())
         {
             assert_eq!(
-                deleted_partition_id, actual_deleted_partition_id,
+                *deleted_partition_id, *actual_deleted_partition_id,
                 "delete_partitions_bypass_auth: partition mismatch ID"
             );
         }

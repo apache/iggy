@@ -16,9 +16,11 @@
  * under the License.
  */
 
+pub mod auth;
 pub mod clients;
 pub mod deduplication;
 pub mod diagnostics;
+pub mod partition_ops;
 pub mod partitions;
 pub mod persistence;
 pub mod polling_consumer;

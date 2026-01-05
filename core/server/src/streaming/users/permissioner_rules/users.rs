@@ -29,28 +29,30 @@ impl Permissioner {
     }
 
     pub fn create_user(&self, user_id: u32) -> Result<(), IggyError> {
-        self.manager_users(user_id)
+        self.manage_users(user_id)
     }
 
     pub fn delete_user(&self, user_id: u32) -> Result<(), IggyError> {
-        self.manager_users(user_id)
+        self.manage_users(user_id)
     }
 
     pub fn update_user(&self, user_id: u32) -> Result<(), IggyError> {
-        self.manager_users(user_id)
+        self.manage_users(user_id)
     }
 
     pub fn update_permissions(&self, user_id: u32) -> Result<(), IggyError> {
-        self.manager_users(user_id)
+        self.manage_users(user_id)
     }
 
     pub fn change_password(&self, user_id: u32) -> Result<(), IggyError> {
-        self.manager_users(user_id)
+        self.manage_users(user_id)
     }
 
-    fn manager_users(&self, user_id: u32) -> Result<(), IggyError> {
-        if let Some(global_permissions) = self.users_permissions.get(&user_id)
-            && global_permissions.manage_users
+    fn manage_users(&self, user_id: u32) -> Result<(), IggyError> {
+        let permissions = self.get_permissions(user_id);
+
+        if let Some(ref p) = permissions
+            && p.global.manage_users
         {
             return Ok(());
         }
@@ -59,8 +61,10 @@ impl Permissioner {
     }
 
     fn read_users(&self, user_id: u32) -> Result<(), IggyError> {
-        if let Some(global_permissions) = self.users_permissions.get(&user_id)
-            && (global_permissions.manage_users || global_permissions.read_users)
+        let permissions = self.get_permissions(user_id);
+
+        if let Some(ref p) = permissions
+            && (p.global.manage_users || p.global.read_users)
         {
             return Ok(());
         }

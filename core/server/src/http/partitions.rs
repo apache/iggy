@@ -60,7 +60,7 @@ async fn create_partitions(
 
     let _parititon_guard = state.shard.shard().fs_locks.partition_lock.lock().await;
     let session = Session::stateless(identity.user_id, identity.ip_address);
-    let partitions = SendWrapper::new(state.shard.shard().create_partitions(
+    let partition_infos = SendWrapper::new(state.shard.shard().create_partitions(
         &session,
         &command.stream_id,
         &command.topic_id,
@@ -74,7 +74,7 @@ async fn create_partitions(
         let event = ShardEvent::CreatedPartitions {
             stream_id: command.stream_id.clone(),
             topic_id: command.topic_id.clone(),
-            partitions,
+            partitions: partition_infos,
         };
         let _responses = shard.broadcast_event_to_all_shards(event).await;
         Ok::<(), CustomError>(())

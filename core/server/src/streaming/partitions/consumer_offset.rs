@@ -15,10 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::sync::atomic::AtomicU64;
-
 use crate::streaming::polling_consumer::ConsumerGroupId;
 use iggy_common::ConsumerKind;
+use std::sync::atomic::AtomicU64;
 
 #[derive(Debug)]
 pub struct ConsumerOffset {

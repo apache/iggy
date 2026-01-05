@@ -17,21 +17,14 @@
  */
 
 use super::COMPONENT;
+use crate::metadata::ConsumerGroupMeta;
 use crate::shard::IggyShard;
-use crate::slab::consumer_groups;
-use crate::slab::traits_ext::EntityMarker;
-use crate::slab::traits_ext::Insert;
-use crate::streaming::partitions;
 use crate::streaming::session::Session;
-use crate::streaming::streams;
-use crate::streaming::topics;
-use crate::streaming::topics::consumer_group;
-use crate::streaming::topics::consumer_group::MEMBERS_CAPACITY;
-use arcshift::ArcShift;
 use err_trail::ErrContext;
 use iggy_common::Identifier;
 use iggy_common::IggyError;
-use slab::Slab;
+use iggy_common::collections::SegmentedSlab;
+use std::sync::Arc;
 
 impl IggyShard {
     pub fn create_consumer_group(
@@ -40,72 +33,44 @@ impl IggyShard {
         stream_id: &Identifier,
         topic_id: &Identifier,
         name: String,
-    ) -> Result<consumer_group::ConsumerGroup, IggyError> {
-        self.ensure_authenticated(session)?;
-        self.ensure_topic_exists(stream_id, topic_id)?;
-        let exists = self
-            .streams
-            .with_topic_by_id(stream_id, topic_id, |(root, ..)| {
-                root.consumer_groups()
-                    .exists(&name.clone().try_into().unwrap())
-            });
-        if exists {
-            return Err(IggyError::ConsumerGroupNameAlreadyExists(
-                name,
-                topic_id.clone(),
-            ));
-        }
+    ) -> Result<usize, IggyError> {
+        let (stream, topic) = self.resolve_topic_id(stream_id, topic_id)?;
 
-        {
-            let topic_id =
-                self.streams
-                    .with_topic_by_id(stream_id, topic_id, topics::helpers::get_topic_id());
-            let stream_id = self
+        self.permissioner
+            .create_consumer_group(session.get_user_id(), stream, topic)
+            .error(|e: &IggyError| {
+                format!(
+                    "{COMPONENT} (error: {e}) - permission denied to create consumer group for user {} on stream ID: {}, topic ID: {}",
+                    session.get_user_id(),
+                    stream,
+                    topic
+                )
+            })?;
+
+        let mut partitions: Vec<usize> = {
+            let metadata = self.metadata.load();
+            metadata
                 .streams
-                .with_stream_by_id(stream_id, streams::helpers::get_stream_id());
-            self.permissioner.borrow().create_consumer_group(
-                session.get_user_id(),
-                stream_id,
-                topic_id,
-            ).error(|e: &IggyError| format!("{COMPONENT} (error: {e}) - permission denied to create consumer group for user {} on stream ID: {}, topic ID: {}", session.get_user_id(), stream_id, topic_id))?;
-        }
-        let cg = self.create_and_insert_consumer_group_mem(stream_id, topic_id, name);
-        Ok(cg)
-    }
+                .get(stream)
+                .and_then(|s| s.topics.get(topic))
+                .map(|t| t.partitions.keys().collect())
+                .unwrap_or_default()
+        };
+        partitions.sort_unstable();
 
-    fn create_and_insert_consumer_group_mem(
-        &self,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-        name: String,
-    ) -> consumer_group::ConsumerGroup {
-        let partitions = self.streams.with_topics(stream_id, |topics| {
-            topics.with_partitions(topic_id, partitions::helpers::get_partition_ids())
-        });
-        let members = ArcShift::new(Slab::with_capacity(MEMBERS_CAPACITY));
-        let mut cg = consumer_group::ConsumerGroup::new(name, members, partitions);
-        let id = self.insert_consumer_group_mem(stream_id, topic_id, cg.clone());
-        cg.update_id(id);
-        cg
-    }
+        let id = self
+            .metadata
+            .try_register_consumer_group(stream, topic, Arc::from(name.as_str()), partitions)
+            .map_err(|e| {
+                if let IggyError::ConsumerGroupNameAlreadyExists(_, _) = &e {
+                    // Re-wrap to use caller's topic_id for the error message
+                    IggyError::ConsumerGroupNameAlreadyExists(name.clone(), topic_id.clone())
+                } else {
+                    e
+                }
+            })?;
 
-    fn insert_consumer_group_mem(
-        &self,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-        cg: consumer_group::ConsumerGroup,
-    ) -> consumer_groups::ContainerId {
-        self.streams
-            .with_consumer_groups_mut(stream_id, topic_id, |container| container.insert(cg))
-    }
-
-    pub fn create_consumer_group_bypass_auth(
-        &self,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-        cg: consumer_group::ConsumerGroup,
-    ) -> usize {
-        self.insert_consumer_group_mem(stream_id, topic_id, cg)
+        Ok(id)
     }
 
     pub fn delete_consumer_group(
@@ -114,23 +79,22 @@ impl IggyShard {
         stream_id: &Identifier,
         topic_id: &Identifier,
         group_id: &Identifier,
-    ) -> Result<consumer_group::ConsumerGroup, IggyError> {
-        self.ensure_authenticated(session)?;
-        self.ensure_consumer_group_exists(stream_id, topic_id, group_id)?;
-        {
-            let topic_id =
-                self.streams
-                    .with_topic_by_id(stream_id, topic_id, topics::helpers::get_topic_id());
-            let stream_id = self
-                .streams
-                .with_stream_by_id(stream_id, streams::helpers::get_stream_id());
-            self.permissioner.borrow().delete_consumer_group(
-                session.get_user_id(),
-                stream_id,
-                topic_id,
-            ).error(|e: &IggyError| format!("{COMPONENT} (error: {e}) - permission denied to delete consumer group for user {} on stream ID: {}, topic ID: {}", session.get_user_id(), stream_id, topic_id))?;
-        }
-        let cg = self.delete_consumer_group_base(stream_id, topic_id, group_id);
+    ) -> Result<ConsumerGroupMeta, IggyError> {
+        let (stream, topic, group) =
+            self.resolve_consumer_group_id(stream_id, topic_id, group_id)?;
+
+        self.permissioner
+            .delete_consumer_group(session.get_user_id(), stream, topic)
+            .error(|e: &IggyError| {
+                format!(
+                    "{COMPONENT} (error: {e}) - permission denied to delete consumer group for user {} on stream ID: {}, topic ID: {}",
+                    session.get_user_id(),
+                    stream,
+                    topic
+                )
+            })?;
+
+        let cg = self.delete_consumer_group_base(stream, topic, group);
         Ok(cg)
     }
 
@@ -139,41 +103,40 @@ impl IggyShard {
         stream_id: &Identifier,
         topic_id: &Identifier,
         group_id: &Identifier,
-    ) -> consumer_group::ConsumerGroup {
-        self.delete_consumer_group_base(stream_id, topic_id, group_id)
+    ) -> Result<ConsumerGroupMeta, IggyError> {
+        let (stream, topic, group) =
+            self.resolve_consumer_group_id(stream_id, topic_id, group_id)?;
+        Ok(self.delete_consumer_group_base(stream, topic, group))
     }
 
     fn delete_consumer_group_base(
         &self,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-        group_id: &Identifier,
-    ) -> consumer_group::ConsumerGroup {
-        // Get numeric IDs before deletion for ClientManager cleanup
-        let stream_id_value = self
-            .streams
-            .with_stream_by_id(stream_id, streams::helpers::get_stream_id());
-        let topic_id_value =
-            self.streams
-                .with_topic_by_id(stream_id, topic_id, topics::helpers::get_topic_id());
-        let group_id_value = self.streams.with_consumer_group_by_id(
-            stream_id,
-            topic_id,
-            group_id,
-            topics::helpers::get_consumer_group_id(),
-        );
+        stream: usize,
+        topic: usize,
+        group: usize,
+    ) -> ConsumerGroupMeta {
+        let cg_meta = {
+            let metadata = self.metadata.load();
+            metadata
+                .streams
+                .get(stream)
+                .and_then(|s| s.topics.get(topic))
+                .and_then(|t| t.consumer_groups.get(group))
+                .cloned()
+                .unwrap_or_else(|| ConsumerGroupMeta {
+                    id: group,
+                    name: Arc::from(""),
+                    partitions: Vec::new(),
+                    members: SegmentedSlab::new(),
+                })
+        };
 
-        let cg = self.streams.with_consumer_groups_mut(
-            stream_id,
-            topic_id,
-            topics::helpers::delete_consumer_group(group_id),
-        );
-
-        // Clean up ClientManager state
         self.client_manager
-            .delete_consumer_group(stream_id_value, topic_id_value, group_id_value);
+            .delete_consumer_group(stream, topic, group);
 
-        cg
+        self.metadata.delete_consumer_group(stream, topic, group);
+
+        cg_meta
     }
 
     pub fn join_consumer_group(
@@ -183,55 +146,34 @@ impl IggyShard {
         topic_id: &Identifier,
         group_id: &Identifier,
     ) -> Result<(), IggyError> {
-        self.ensure_authenticated(session)?;
-        self.ensure_consumer_group_exists(stream_id, topic_id, group_id)?;
-        {
-            let topic_id =
-                self.streams
-                    .with_topic_by_id(stream_id, topic_id, topics::helpers::get_topic_id());
-            let stream_id = self
-                .streams
-                .with_stream_by_id(stream_id, streams::helpers::get_stream_id());
-            self.permissioner.borrow().join_consumer_group(
-                session.get_user_id(),
-                stream_id,
-                topic_id,
-            ).error(|e: &IggyError| format!("{COMPONENT} (error: {e}) - permission denied to join consumer group for user {} on stream ID: {}, topic ID: {}", session.get_user_id(), stream_id, topic_id))?;
-        }
+        let (stream, topic, group) =
+            self.resolve_consumer_group_id(stream_id, topic_id, group_id)?;
+
+        self.permissioner
+            .join_consumer_group(session.get_user_id(), stream, topic)
+            .error(|e: &IggyError| {
+                format!(
+                    "{COMPONENT} (error: {e}) - permission denied to join consumer group for user {} on stream ID: {}, topic ID: {}",
+                    session.get_user_id(),
+                    stream,
+                    topic
+                )
+            })?;
+
         let client_id = session.client_id;
-        self.streams.with_consumer_group_by_id_mut(
-            stream_id,
-            topic_id,
-            group_id,
-            topics::helpers::join_consumer_group(client_id),
-        );
 
-        // Update ClientManager state
-        let stream_id_value = self
-            .streams
-            .with_stream_by_id(stream_id, streams::helpers::get_stream_id());
-        let topic_id_value =
-            self.streams
-                .with_topic_by_id(stream_id, topic_id, topics::helpers::get_topic_id());
-        let group_id_value = self.streams.with_consumer_group_by_id(
-            stream_id,
-            topic_id,
-            group_id,
-            topics::helpers::get_consumer_group_id(),
-        );
+        self.metadata
+            .join_consumer_group(stream, topic, group, client_id);
 
-        self.client_manager.join_consumer_group(
-            session.client_id,
-            stream_id_value,
-            topic_id_value,
-            group_id_value,
-        )
-        .error(|e: &IggyError| {
-            format!(
-                "{COMPONENT} (error: {e}) - failed to make client join consumer group for client ID: {}",
-                session.client_id
-            )
-        })?;
+        self.client_manager
+            .join_consumer_group(client_id, stream, topic, group)
+            .error(|e: &IggyError| {
+                format!(
+                    "{COMPONENT} (error: {e}) - failed to make client join consumer group for client ID: {}",
+                    client_id
+                )
+            })?;
+
         Ok(())
     }
 
@@ -242,21 +184,20 @@ impl IggyShard {
         topic_id: &Identifier,
         group_id: &Identifier,
     ) -> Result<(), IggyError> {
-        self.ensure_authenticated(session)?;
-        self.ensure_consumer_group_exists(stream_id, topic_id, group_id)?;
-        {
-            let topic_id =
-                self.streams
-                    .with_topic_by_id(stream_id, topic_id, topics::helpers::get_topic_id());
-            let stream_id = self
-                .streams
-                .with_stream_by_id(stream_id, streams::helpers::get_stream_id());
-            self.permissioner.borrow().leave_consumer_group(
-                session.get_user_id(),
-                stream_id,
-                topic_id,
-            ).error(|e: &IggyError| format!("{COMPONENT} (error: {e}) - permission denied to leave consumer group for user {} on stream ID: {}, topic ID: {}", session.get_user_id(), stream_id, topic_id))?;
-        }
+        let (stream, topic, _group) =
+            self.resolve_consumer_group_id(stream_id, topic_id, group_id)?;
+
+        self.permissioner
+            .leave_consumer_group(session.get_user_id(), stream, topic)
+            .error(|e: &IggyError| {
+                format!(
+                    "{COMPONENT} (error: {e}) - permission denied to leave consumer group for user {} on stream ID: {}, topic ID: {}",
+                    session.get_user_id(),
+                    stream_id,
+                    topic_id
+                )
+            })?;
+
         self.leave_consumer_group_base(stream_id, topic_id, group_id, session.client_id)
     }
 
@@ -267,46 +208,68 @@ impl IggyShard {
         group_id: &Identifier,
         client_id: u32,
     ) -> Result<(), IggyError> {
-        let Some(_) = self.streams.with_consumer_group_by_id_mut(
-            stream_id,
-            topic_id,
-            group_id,
-            topics::helpers::leave_consumer_group(client_id),
-        ) else {
+        let (stream, topic, group) =
+            self.resolve_consumer_group_id(stream_id, topic_id, group_id)?;
+
+        let member_id = self
+            .metadata
+            .leave_consumer_group(stream, topic, group, client_id);
+
+        if member_id.is_none() {
             return Err(IggyError::ConsumerGroupMemberNotFound(
                 client_id,
                 group_id.clone(),
                 topic_id.clone(),
             ));
+        }
+
+        self.client_manager
+            .leave_consumer_group(client_id, stream, topic, group)
+            .error(|e: &IggyError| {
+                format!(
+                    "{COMPONENT} (error: {e}) - failed to make client leave consumer group for client ID: {}",
+                    client_id
+                )
+            })?;
+
+        Ok(())
+    }
+
+    pub fn get_consumer_group_from_shared_metadata(
+        &self,
+        stream_id: usize,
+        topic_id: usize,
+        group_id: usize,
+    ) -> bytes::Bytes {
+        use bytes::{BufMut, BytesMut};
+
+        let metadata = self.metadata.load();
+
+        let Some(cg_meta) = metadata
+            .streams
+            .get(stream_id)
+            .and_then(|s| s.topics.get(topic_id))
+            .and_then(|t| t.consumer_groups.get(group_id))
+        else {
+            return bytes::Bytes::new();
         };
 
-        self.streams.with_consumer_group_by_id_mut(
-            stream_id,
-            topic_id,
-            group_id,
-            topics::helpers::rebalance_consumer_group(),
-        );
+        let mut bytes = BytesMut::new();
 
-        // Update ClientManager state
-        let stream_id_value = self
-            .streams
-            .with_stream_by_id(stream_id, streams::helpers::get_stream_id());
-        let topic_id_value =
-            self.streams
-                .with_topic_by_id(stream_id, topic_id, topics::helpers::get_topic_id());
-        let group_id_value = self.streams.with_consumer_group_by_id(
-            stream_id,
-            topic_id,
-            group_id,
-            topics::helpers::get_consumer_group_id(),
-        );
+        bytes.put_u32_le(cg_meta.id as u32);
+        bytes.put_u32_le(cg_meta.partitions.len() as u32);
+        bytes.put_u32_le(cg_meta.members.len() as u32);
+        bytes.put_u8(cg_meta.name.len() as u8);
+        bytes.put_slice(cg_meta.name.as_bytes());
 
-        self.client_manager.leave_consumer_group(
-            client_id,
-            stream_id_value,
-            topic_id_value,
-            group_id_value,
-        ).error(|e: &IggyError| format!("{COMPONENT} (error: {e}) - failed to make client leave consumer group for client ID: {}", client_id))?;
-        Ok(())
+        for (_, member) in cg_meta.members.iter() {
+            bytes.put_u32_le(member.id as u32);
+            bytes.put_u32_le(member.partitions.len() as u32);
+            for &partition_id in &member.partitions {
+                bytes.put_u32_le(partition_id as u32);
+            }
+        }
+
+        bytes.freeze()
     }
 }
