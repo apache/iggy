@@ -19,10 +19,13 @@ use crate::metadata::{
     ConsumerGroupId, ConsumerGroupMeta, InnerMetadata, MetadataReadHandle, PartitionId,
     PartitionMeta, StreamId, StreamMeta, TopicId, TopicMeta, UserId, UserMeta,
 };
-use crate::streaming::partitions::partition::{ConsumerGroupOffsets, ConsumerOffsets};
+use crate::streaming::partitions::consumer_group_offsets::ConsumerGroupOffsets;
+use crate::streaming::partitions::consumer_offsets::ConsumerOffsets;
 use crate::streaming::stats::{PartitionStats, StreamStats, TopicStats};
 use iggy_common::sharding::IggyNamespace;
-use iggy_common::{IdKind, Identifier, PersonalAccessToken};
+use iggy_common::{
+    IdKind, Identifier, IggyExpiry, IggyTimestamp, MaxTopicSize, PersonalAccessToken,
+};
 use left_right::ReadGuard;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -44,7 +47,7 @@ impl Metadata {
     }
 
     #[inline]
-    pub fn load(&self) -> ReadGuard<'_, InnerMetadata> {
+    pub(super) fn load(&self) -> ReadGuard<'_, InnerMetadata> {
         self.inner
             .enter()
             .expect("metadata not initialized - writer must publish before reads")
@@ -482,4 +485,156 @@ impl Metadata {
             .map(|g| g.members.iter().any(|(_, m)| m.client_id == client_id))
             .unwrap_or(false)
     }
+
+    /// Execute a closure with read access to the metadata snapshot.
+    /// This is the safe way to perform complex read operations that need
+    /// atomic access to multiple metadata fields.
+    ///
+    /// The closure receives an immutable reference to the metadata and must
+    /// return owned data (not references). This ensures the ReadGuard is
+    /// dropped before any async operations can occur.
+    #[inline]
+    pub fn with_metadata<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&InnerMetadata) -> R,
+    {
+        let guard = self.load();
+        f(&guard)
+    }
+
+    /// Get all partition IDs for a topic, sorted.
+    pub fn get_partition_ids(&self, stream_id: StreamId, topic_id: TopicId) -> Vec<PartitionId> {
+        self.with_metadata(|m| {
+            m.streams
+                .get(stream_id)
+                .and_then(|s| s.topics.get(topic_id))
+                .map(|t| {
+                    let mut ids: Vec<_> = t.partitions.iter().enumerate().map(|(k, _)| k).collect();
+                    ids.sort_unstable();
+                    ids
+                })
+                .unwrap_or_default()
+        })
+    }
+
+    /// Get all topic IDs for a stream, sorted.
+    pub fn get_topic_ids(&self, stream_id: StreamId) -> Vec<TopicId> {
+        self.with_metadata(|m| {
+            m.streams
+                .get(stream_id)
+                .map(|s| {
+                    let mut ids: Vec<_> = s.topics.iter().map(|(k, _)| k).collect();
+                    ids.sort_unstable();
+                    ids
+                })
+                .unwrap_or_default()
+        })
+    }
+
+    /// Get all stream IDs, sorted.
+    pub fn get_stream_ids(&self) -> Vec<StreamId> {
+        self.with_metadata(|m| {
+            let mut ids: Vec<_> = m.streams.iter().map(|(k, _)| k).collect();
+            ids.sort_unstable();
+            ids
+        })
+    }
+
+    /// Get all namespaces (stream/topic/partition combinations).
+    pub fn get_all_namespaces(&self) -> Vec<IggyNamespace> {
+        self.with_metadata(|m| {
+            let mut namespaces = Vec::new();
+            for (stream_id, stream) in m.streams.iter() {
+                for (topic_id, topic) in stream.topics.iter() {
+                    for (partition_id, _) in topic.partitions.iter().enumerate() {
+                        namespaces.push(IggyNamespace::new(stream_id, topic_id, partition_id));
+                    }
+                }
+            }
+            namespaces
+        })
+    }
+
+    /// Get topic configuration (message_expiry, max_topic_size).
+    pub fn get_topic_config(
+        &self,
+        stream_id: StreamId,
+        topic_id: TopicId,
+    ) -> Option<(IggyExpiry, MaxTopicSize)> {
+        self.with_metadata(|m| {
+            m.streams
+                .get(stream_id)
+                .and_then(|s| s.topics.get(topic_id))
+                .map(|t| (t.message_expiry, t.max_topic_size))
+        })
+    }
+
+    /// Get partition initialization info needed for LocalPartition setup.
+    pub fn get_partition_init_info(
+        &self,
+        stream_id: StreamId,
+        topic_id: TopicId,
+        partition_id: PartitionId,
+    ) -> Option<PartitionInitInfo> {
+        self.with_metadata(|m| {
+            m.streams
+                .get(stream_id)
+                .and_then(|s| s.topics.get(topic_id))
+                .and_then(|t| t.partitions.get(partition_id))
+                .map(|p| PartitionInitInfo {
+                    created_at: p.created_at,
+                    revision_id: p.revision_id,
+                    stats: p.stats.clone(),
+                    consumer_offsets: p.consumer_offsets.clone(),
+                    consumer_group_offsets: p.consumer_group_offsets.clone(),
+                })
+        })
+    }
+
+    /// Get consumer group member ID for a client.
+    pub fn get_consumer_group_member_id(
+        &self,
+        stream_id: StreamId,
+        topic_id: TopicId,
+        group_id: ConsumerGroupId,
+        client_id: u32,
+    ) -> Option<usize> {
+        self.with_metadata(|m| {
+            m.streams
+                .get(stream_id)
+                .and_then(|s| s.topics.get(topic_id))
+                .and_then(|t| t.consumer_groups.get(group_id))
+                .and_then(|g| {
+                    g.members
+                        .iter()
+                        .find(|(_, member)| member.client_id == client_id)
+                        .map(|(id, _)| id)
+                })
+        })
+    }
+
+    /// Get all consumer groups for a topic.
+    pub fn get_all_consumer_groups(
+        &self,
+        stream_id: StreamId,
+        topic_id: TopicId,
+    ) -> Vec<ConsumerGroupMeta> {
+        self.with_metadata(|m| {
+            m.streams
+                .get(stream_id)
+                .and_then(|s| s.topics.get(topic_id))
+                .map(|t| t.consumer_groups.iter().map(|(_, cg)| cg.clone()).collect())
+                .unwrap_or_default()
+        })
+    }
+}
+
+/// Information needed to initialize a LocalPartition.
+#[derive(Clone, Debug)]
+pub struct PartitionInitInfo {
+    pub created_at: IggyTimestamp,
+    pub revision_id: u64,
+    pub stats: Arc<PartitionStats>,
+    pub consumer_offsets: Option<Arc<ConsumerOffsets>>,
+    pub consumer_group_offsets: Option<Arc<ConsumerGroupOffsets>>,
 }

@@ -19,7 +19,6 @@
 use crate::binary::command::{BinaryServerCommand, HandlerResult, ServerCommandHandler};
 use crate::shard::IggyShard;
 use crate::streaming::session::Session;
-use anyhow::Result;
 use iggy_common::IggyError;
 use iggy_common::IggyTimestamp;
 use iggy_common::SenderKind;

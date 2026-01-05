@@ -121,7 +121,6 @@ derive_more = { version = "2.1.1", features = ["full"] }
 dirs = "6.0.0"
 dlopen2 = "0.8.2"
 dotenvy = "0.15.7"
-enum_dispatch = "0.3.13"
 env_logger = "0.11.8"
 err_trail = { version = "0.11.0", features = ["tracing"] }
 error_set = "0.9.1"
@@ -176,6 +175,7 @@ serde_yaml_ng = "0.10.0"
 serial_test = "3.2.0"
 server = { path = "core/server" }
 simd-json = { version = "0.17.0", features = ["serde_impl"] }
+slab = "0.4"
 strum = { version = "0.27.2", features = ["derive"] }
 strum_macros = "0.27.2"
 sysinfo = "0.37.2"
@@ -210,7 +210,7 @@ uuid = { version = "1.19.0", features = [
     "zerocopy",
 ] }
 webpki-roots = "1.0.4"
-zip = "7.0.0"
+zip = { version = "7.1.0", default-features = false, features = ["deflate"] }
 
 [profile.release]
 lto = true

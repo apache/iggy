@@ -19,20 +19,20 @@ use super::*;
 use crate::{
     shard::{
         IggyShard,
-        namespace::IggyFullNamespace,
         transmission::{
             event::ShardEvent,
             frame::ShardResponse,
             message::{ShardMessage, ShardRequest, ShardRequestPayload},
         },
     },
-    streaming::{session::Session, traits::MainOps},
+    streaming::session::Session,
     tcp::{
         connection_handler::{ConnectionAction, handle_connection, handle_error},
         tcp_listener::cleanup_connection,
     },
 };
 use compio_net::TcpStream;
+use iggy_common::sharding::IggyNamespace;
 use iggy_common::{Identifier, IggyError, SenderKind, TransportProtocol};
 use nix::sys::stat::SFlag;
 use std::os::fd::{FromRawFd, IntoRawFd};
@@ -63,50 +63,144 @@ async fn handle_request(
     let partition_id = request.partition_id;
     match request.payload {
         ShardRequestPayload::SendMessages { batch } => {
-            let ns = IggyFullNamespace::new(stream_id, topic_id, partition_id);
             let batch = shard.maybe_encrypt_messages(batch)?;
             let messages_count = batch.count();
+
+            let (stream, topic) = shard.resolve_topic_id(&stream_id, &topic_id)?;
+            let namespace = IggyNamespace::new(stream, topic, partition_id);
+
+            shard.ensure_partition(&namespace).await?;
+
             shard
-                .streams
-                .append_messages(&shard.config.system, &shard.task_registry, &ns, batch)
+                .append_messages_to_local_partition(&namespace, batch, &shard.config.system)
                 .await?;
+
             shard.metrics.increment_messages(messages_count as u64);
             Ok(ShardResponse::SendMessages)
         }
         ShardRequestPayload::PollMessages { args, consumer } => {
             let auto_commit = args.auto_commit;
-            let ns = IggyFullNamespace::new(stream_id, topic_id, partition_id);
-            let (metadata, batches) = shard.streams.poll_messages(&ns, consumer, args).await?;
+
+            let (stream, topic) = shard.resolve_topic_id(&stream_id, &topic_id)?;
+            let namespace = IggyNamespace::new(stream, topic, partition_id);
+
+            shard.ensure_partition(&namespace).await?;
+
+            let (poll_metadata, batches) = shard
+                .poll_messages_from_local_partition(&namespace, consumer, args)
+                .await?;
 
             if auto_commit && !batches.is_empty() {
                 let offset = batches
                     .last_offset()
                     .expect("Batch set should have at least one batch");
                 shard
-                    .streams
-                    .auto_commit_consumer_offset(
-                        &shard.config.system,
-                        ns.stream_id(),
-                        ns.topic_id(),
-                        partition_id,
-                        consumer,
-                        offset,
-                    )
+                    .auto_commit_consumer_offset_from_local_partition(&namespace, consumer, offset)
                     .await?;
             }
-            Ok(ShardResponse::PollMessages((metadata, batches)))
+            Ok(ShardResponse::PollMessages((poll_metadata, batches)))
         }
         ShardRequestPayload::FlushUnsavedBuffer { fsync } => {
+            let (stream, topic) = shard.resolve_topic_id(&stream_id, &topic_id)?;
             shard
-                .flush_unsaved_buffer_base(&stream_id, &topic_id, partition_id, fsync)
+                .flush_unsaved_buffer_base(stream, topic, partition_id, fsync)
                 .await?;
             Ok(ShardResponse::FlushUnsavedBuffer)
         }
         ShardRequestPayload::DeleteSegments { segments_count } => {
+            let (stream, topic) = shard.resolve_topic_id(&stream_id, &topic_id)?;
             shard
-                .delete_segments_base(&stream_id, &topic_id, partition_id, segments_count)
+                .delete_segments_base(stream, topic, partition_id, segments_count)
                 .await?;
             Ok(ShardResponse::DeleteSegments)
+        }
+        ShardRequestPayload::CreatePartitions {
+            user_id,
+            stream_id,
+            topic_id,
+            partitions_count,
+        } => {
+            assert_eq!(
+                shard.id, 0,
+                "CreatePartitions should only be handled by shard0"
+            );
+
+            let session = Session::stateless(
+                user_id,
+                std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0),
+            );
+
+            let _partition_guard = shard.fs_locks.partition_lock.lock().await;
+
+            let partition_infos = shard
+                .create_partitions(&session, &stream_id, &topic_id, partitions_count)
+                .await?;
+            let partition_ids = partition_infos.iter().map(|p| p.id).collect::<Vec<_>>();
+
+            let event = ShardEvent::CreatedPartitions {
+                stream_id: stream_id.clone(),
+                topic_id: topic_id.clone(),
+                partitions: partition_infos,
+            };
+            shard.broadcast_event_to_all_shards(event).await?;
+
+            // Rebalance consumer groups using SharedMetadata
+            let (numeric_stream_id, numeric_topic_id) =
+                shard.resolve_topic_id(&stream_id, &topic_id)?;
+            shard.writer().rebalance_consumer_groups_for_topic(
+                numeric_stream_id,
+                numeric_topic_id,
+                partition_ids.len() as u32,
+            );
+
+            Ok(ShardResponse::CreatePartitionsResponse(partition_ids))
+        }
+        ShardRequestPayload::DeletePartitions {
+            user_id,
+            stream_id,
+            topic_id,
+            partitions_count,
+        } => {
+            assert_eq!(
+                shard.id, 0,
+                "DeletePartitions should only be handled by shard0"
+            );
+
+            let session = Session::stateless(
+                user_id,
+                std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0),
+            );
+
+            let _partition_guard = shard.fs_locks.partition_lock.lock().await;
+
+            let deleted_partition_ids = shard
+                .delete_partitions(&session, &stream_id, &topic_id, partitions_count)
+                .await?;
+
+            let event = ShardEvent::DeletedPartitions {
+                stream_id: stream_id.clone(),
+                topic_id: topic_id.clone(),
+                partitions_count,
+                partition_ids: deleted_partition_ids.clone(),
+            };
+            shard.broadcast_event_to_all_shards(event).await?;
+
+            // Rebalance consumer groups using SharedMetadata
+            let (numeric_stream_id, numeric_topic_id) =
+                shard.resolve_topic_id(&stream_id, &topic_id)?;
+            let remaining_partition_count = shard
+                .metadata
+                .partitions_count(numeric_stream_id, numeric_topic_id)
+                as u32;
+            shard.writer().rebalance_consumer_groups_for_topic(
+                numeric_stream_id,
+                numeric_topic_id,
+                remaining_partition_count,
+            );
+
+            Ok(ShardResponse::DeletePartitionsResponse(
+                deleted_partition_ids,
+            ))
         }
         ShardRequestPayload::CreateStream { user_id, name } => {
             assert_eq!(shard.id, 0, "CreateStream should only be handled by shard0");
@@ -119,17 +213,9 @@ async fn handle_request(
             // Acquire stream lock to serialize filesystem operations
             let _stream_guard = shard.fs_locks.stream_lock.lock().await;
 
-            let stream = shard.create_stream(&session, name.clone()).await?;
-            let created_stream_id = stream.id();
+            let created_stream_id = shard.create_stream(&session, name.clone()).await?;
 
-            let event = ShardEvent::CreatedStream {
-                id: created_stream_id,
-                stream: stream.clone(),
-            };
-
-            shard.broadcast_event_to_all_shards(event).await?;
-
-            Ok(ShardResponse::CreateStreamResponse(stream))
+            Ok(ShardResponse::CreateStreamResponse(created_stream_id))
         }
         ShardRequestPayload::CreateTopic {
             user_id,
@@ -151,7 +237,7 @@ async fn handle_request(
             // Acquire topic lock to serialize filesystem operations
             let _topic_guard = shard.fs_locks.topic_lock.lock().await;
 
-            let topic = shard
+            let topic_id_num = shard
                 .create_topic(
                     &session,
                     &stream_id,
@@ -163,29 +249,23 @@ async fn handle_request(
                 )
                 .await?;
 
-            let topic_id = topic.id();
-            let event = ShardEvent::CreatedTopic {
-                stream_id: stream_id.clone(),
-                topic: topic.clone(),
-            };
-            shard.broadcast_event_to_all_shards(event).await?;
-            let partitions = shard
+            let partition_infos = shard
                 .create_partitions(
                     &session,
                     &stream_id,
-                    &Identifier::numeric(topic_id as u32).unwrap(),
+                    &Identifier::numeric(topic_id_num as u32).unwrap(),
                     partitions_count,
                 )
                 .await?;
 
             let event = ShardEvent::CreatedPartitions {
                 stream_id: stream_id.clone(),
-                topic_id: Identifier::numeric(topic_id as u32).unwrap(),
-                partitions,
+                topic_id: Identifier::numeric(topic_id_num as u32).unwrap(),
+                partitions: partition_infos,
             };
             shard.broadcast_event_to_all_shards(event).await?;
 
-            Ok(ShardResponse::CreateTopicResponse(topic))
+            Ok(ShardResponse::CreateTopicResponse(topic_id_num))
         }
         ShardRequestPayload::UpdateTopic {
             user_id,
@@ -215,17 +295,6 @@ async fn handle_request(
                 replication_factor,
             )?;
 
-            let event = ShardEvent::UpdatedTopic {
-                stream_id: stream_id.clone(),
-                topic_id: topic_id.clone(),
-                name,
-                message_expiry,
-                compression_algorithm,
-                max_topic_size,
-                replication_factor,
-            };
-            shard.broadcast_event_to_all_shards(event).await?;
-
             Ok(ShardResponse::UpdateTopicResponse)
         }
         ShardRequestPayload::DeleteTopic {
@@ -240,18 +309,29 @@ async fn handle_request(
                 std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0),
             );
 
-            let _topic_guard = shard.fs_locks.topic_lock.lock().await;
-            let topic = shard.delete_topic(&session, &stream_id, &topic_id).await?;
-            let topic_id_num = topic.root().id();
+            // Capture numeric IDs and partition_ids BEFORE deletion for broadcast.
+            // After deletion, the topic won't exist in metadata.
+            let (numeric_stream_id, numeric_topic_id) =
+                shard.resolve_topic_id(&stream_id, &topic_id)?;
+            let partition_ids = shard
+                .metadata
+                .get_partition_ids(numeric_stream_id, numeric_topic_id);
 
-            let event = ShardEvent::DeletedTopic {
-                id: topic_id_num,
-                stream_id: stream_id.clone(),
-                topic_id: topic_id.clone(),
+            let _topic_guard = shard.fs_locks.topic_lock.lock().await;
+            let topic_info = shard.delete_topic(&session, &stream_id, &topic_id).await?;
+            let topic_id_num = topic_info.id;
+
+            // Broadcast to all shards to clean up their local_partitions entries.
+            // Use numeric Identifiers since the topic is already deleted from metadata.
+            let event = ShardEvent::DeletedPartitions {
+                stream_id: Identifier::numeric(numeric_stream_id as u32).unwrap(),
+                topic_id: Identifier::numeric(numeric_topic_id as u32).unwrap(),
+                partitions_count: partition_ids.len() as u32,
+                partition_ids,
             };
             shard.broadcast_event_to_all_shards(event).await?;
 
-            Ok(ShardResponse::DeleteTopicResponse(topic))
+            Ok(ShardResponse::DeleteTopicResponse(topic_id_num))
         }
         ShardRequestPayload::CreateUser {
             user_id,
@@ -270,16 +350,6 @@ async fn handle_request(
             let user =
                 shard.create_user(&session, &username, &password, status, permissions.clone())?;
 
-            let created_user_id = user.id;
-
-            let event = ShardEvent::CreatedUser {
-                user_id: created_user_id,
-                username: username.clone(),
-                password: password.clone(),
-                status,
-                permissions: permissions.clone(),
-            };
-            shard.broadcast_event_to_all_shards(event).await?;
             Ok(ShardResponse::CreateUserResponse(user))
         }
         ShardRequestPayload::GetStats { .. } => {
@@ -299,9 +369,23 @@ async fn handle_request(
             );
             let _user_guard = shard.fs_locks.user_lock.lock().await;
             let user = shard.delete_user(&session, &user_id)?;
-            let event = ShardEvent::DeletedUser { user_id };
-            shard.broadcast_event_to_all_shards(event).await?;
             Ok(ShardResponse::DeletedUser(user))
+        }
+        ShardRequestPayload::UpdateStream {
+            user_id,
+            stream_id,
+            name,
+        } => {
+            assert_eq!(shard.id, 0, "UpdateStream should only be handled by shard0");
+
+            let session = Session::stateless(
+                user_id,
+                std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0),
+            );
+
+            shard.update_stream(&session, &stream_id, name.clone())?;
+
+            Ok(ShardResponse::UpdateStreamResponse)
         }
         ShardRequestPayload::DeleteStream { user_id, stream_id } => {
             assert_eq!(shard.id, 0, "DeleteStream should only be handled by shard0");
@@ -311,13 +395,206 @@ async fn handle_request(
                 std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0),
             );
             let _stream_guard = shard.fs_locks.stream_lock.lock().await;
-            let stream = shard.delete_stream(&session, &stream_id).await?;
-            let event = ShardEvent::DeletedStream {
-                id: stream.id(),
-                stream_id,
-            };
-            shard.broadcast_event_to_all_shards(event).await?;
-            Ok(ShardResponse::DeleteStreamResponse(stream))
+            let stream_info = shard.delete_stream(&session, &stream_id).await?;
+            let stream_id_num = stream_info.id;
+
+            Ok(ShardResponse::DeleteStreamResponse(stream_id_num))
+        }
+        ShardRequestPayload::UpdatePermissions {
+            session_user_id,
+            user_id,
+            permissions,
+        } => {
+            assert_eq!(
+                shard.id, 0,
+                "UpdatePermissions should only be handled by shard0"
+            );
+
+            let session = Session::stateless(
+                session_user_id,
+                std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0),
+            );
+            let _user_guard = shard.fs_locks.user_lock.lock().await;
+            shard.update_permissions(&session, &user_id, permissions)?;
+
+            Ok(ShardResponse::UpdatePermissionsResponse)
+        }
+        ShardRequestPayload::ChangePassword {
+            session_user_id,
+            user_id,
+            current_password,
+            new_password,
+        } => {
+            assert_eq!(
+                shard.id, 0,
+                "ChangePassword should only be handled by shard0"
+            );
+
+            let session = Session::stateless(
+                session_user_id,
+                std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0),
+            );
+            let _user_guard = shard.fs_locks.user_lock.lock().await;
+            shard.change_password(&session, &user_id, &current_password, &new_password)?;
+
+            Ok(ShardResponse::ChangePasswordResponse)
+        }
+        ShardRequestPayload::UpdateUser {
+            session_user_id,
+            user_id,
+            username,
+            status,
+        } => {
+            assert_eq!(shard.id, 0, "UpdateUser should only be handled by shard0");
+
+            let session = Session::stateless(
+                session_user_id,
+                std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0),
+            );
+            let _user_guard = shard.fs_locks.user_lock.lock().await;
+            let user = shard.update_user(&session, &user_id, username, status)?;
+
+            Ok(ShardResponse::UpdateUserResponse(user))
+        }
+        ShardRequestPayload::CreateConsumerGroup {
+            user_id,
+            stream_id,
+            topic_id,
+            name,
+        } => {
+            assert_eq!(
+                shard.id, 0,
+                "CreateConsumerGroup should only be handled by shard0"
+            );
+
+            let session = Session::stateless(
+                user_id,
+                std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0),
+            );
+            let cg_id = shard.create_consumer_group(&session, &stream_id, &topic_id, name)?;
+
+            Ok(ShardResponse::CreateConsumerGroupResponse(cg_id))
+        }
+        ShardRequestPayload::JoinConsumerGroup {
+            user_id,
+            client_id,
+            stream_id,
+            topic_id,
+            group_id,
+        } => {
+            assert_eq!(
+                shard.id, 0,
+                "JoinConsumerGroup should only be handled by shard0"
+            );
+
+            let session = Session::new(
+                client_id,
+                user_id,
+                std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0),
+            );
+            shard.join_consumer_group(&session, &stream_id, &topic_id, &group_id)?;
+
+            Ok(ShardResponse::JoinConsumerGroupResponse)
+        }
+        ShardRequestPayload::LeaveConsumerGroup {
+            user_id,
+            client_id,
+            stream_id,
+            topic_id,
+            group_id,
+        } => {
+            assert_eq!(
+                shard.id, 0,
+                "LeaveConsumerGroup should only be handled by shard0"
+            );
+
+            let session = Session::new(
+                client_id,
+                user_id,
+                std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0),
+            );
+            shard.leave_consumer_group(&session, &stream_id, &topic_id, &group_id)?;
+
+            Ok(ShardResponse::LeaveConsumerGroupResponse)
+        }
+        ShardRequestPayload::DeleteConsumerGroup {
+            user_id,
+            stream_id,
+            topic_id,
+            group_id,
+        } => {
+            assert_eq!(
+                shard.id, 0,
+                "DeleteConsumerGroup should only be handled by shard0"
+            );
+
+            let session = Session::stateless(
+                user_id,
+                std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0),
+            );
+            let cg_meta =
+                shard.delete_consumer_group(&session, &stream_id, &topic_id, &group_id)?;
+
+            // Clean up consumer group offsets from partition metadata
+            let cg_id = crate::streaming::polling_consumer::ConsumerGroupId(cg_meta.id);
+            shard
+                .delete_consumer_group_offsets(cg_id, &stream_id, &topic_id, &cg_meta.partitions)
+                .await?;
+
+            Ok(ShardResponse::DeleteConsumerGroupResponse)
+        }
+        ShardRequestPayload::CreatePersonalAccessToken {
+            user_id,
+            name,
+            expiry,
+        } => {
+            assert_eq!(
+                shard.id, 0,
+                "CreatePersonalAccessToken should only be handled by shard0"
+            );
+
+            let session = Session::stateless(
+                user_id,
+                std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0),
+            );
+            let (personal_access_token, token) =
+                shard.create_personal_access_token(&session, &name, expiry)?;
+
+            Ok(ShardResponse::CreatePersonalAccessTokenResponse(
+                personal_access_token,
+                token,
+            ))
+        }
+        ShardRequestPayload::DeletePersonalAccessToken { user_id, name } => {
+            assert_eq!(
+                shard.id, 0,
+                "DeletePersonalAccessToken should only be handled by shard0"
+            );
+
+            let session = Session::stateless(
+                user_id,
+                std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0),
+            );
+            shard.delete_personal_access_token(&session, &name)?;
+
+            Ok(ShardResponse::DeletePersonalAccessTokenResponse)
+        }
+        ShardRequestPayload::LeaveConsumerGroupMetadataOnly {
+            stream_id,
+            topic_id,
+            group_id,
+            client_id,
+        } => {
+            assert_eq!(
+                shard.id, 0,
+                "LeaveConsumerGroupMetadataOnly should only be handled by shard0"
+            );
+
+            shard
+                .writer()
+                .leave_consumer_group(stream_id, topic_id, group_id, client_id);
+
+            Ok(ShardResponse::LeaveConsumerGroupMetadataOnlyResponse)
         }
         ShardRequestPayload::SocketTransfer {
             fd,
@@ -351,13 +628,18 @@ async fn handle_request(
             let registry = shard.task_registry.clone();
             let registry_clone = registry.clone();
 
-            let ns = IggyFullNamespace::new(stream_id, topic_id, partition_id);
             let batch = shard.maybe_encrypt_messages(initial_data)?;
             let messages_count = batch.count();
 
+            // Get numeric IDs for local_partitions lookup
+            let (numeric_stream_id, numeric_topic_id) =
+                shard.resolve_topic_id(&stream_id, &topic_id)?;
+
+            let namespace = IggyNamespace::new(numeric_stream_id, numeric_topic_id, partition_id);
+            shard.ensure_partition(&namespace).await?;
+
             shard
-                .streams
-                .append_messages(&shard.config.system, &shard.task_registry, &ns, batch)
+                .append_messages_to_local_partition(&namespace, batch, &shard.config.system)
                 .await?;
 
             shard.metrics.increment_messages(messages_count as u64);
@@ -405,19 +687,34 @@ pub async fn handle_event(shard: &Rc<IggyShard>, event: ShardEvent) -> Result<()
         ShardEvent::DeletedPartitions {
             stream_id,
             topic_id,
-            partitions_count,
+            partitions_count: _,
             partition_ids,
         } => {
-            shard.delete_partitions_bypass_auth(
-                &stream_id,
-                &topic_id,
-                partitions_count,
-                partition_ids,
-            )?;
-            Ok(())
-        }
-        ShardEvent::UpdatedStream { stream_id, name } => {
-            shard.update_stream_bypass_auth(&stream_id, &name)?;
+            // SharedMetadata was already updated by the request handler before broadcasting.
+            // Here we only need to clean up local local_partitions entries on all shards.
+            //
+            // For DeleteTopic, the topic is already removed from metadata, so we extract
+            // numeric IDs directly from the Identifier (which must be numeric in that case).
+            // For DeletePartitions, the topic still exists, so metadata lookup works.
+            let numeric_stream_id = stream_id
+                .get_u32_value()
+                .map(|v| v as usize)
+                .unwrap_or_else(|_| shard.metadata.get_stream_id(&stream_id).unwrap_or_default());
+            let numeric_topic_id =
+                topic_id
+                    .get_u32_value()
+                    .map(|v| v as usize)
+                    .unwrap_or_else(|_| {
+                        shard
+                            .metadata
+                            .get_topic_id(numeric_stream_id, &topic_id)
+                            .unwrap_or_default()
+                    });
+            let mut partitions = shard.local_partitions.borrow_mut();
+            for partition_id in partition_ids {
+                let ns = IggyNamespace::new(numeric_stream_id, numeric_topic_id, partition_id);
+                partitions.remove(&ns);
+            }
             Ok(())
         }
         ShardEvent::PurgedStream { stream_id } => {
@@ -429,59 +726,6 @@ pub async fn handle_event(shard: &Rc<IggyShard>, event: ShardEvent) -> Result<()
             topic_id,
         } => {
             shard.purge_topic_bypass_auth(&stream_id, &topic_id).await?;
-            Ok(())
-        }
-        ShardEvent::CreatedUser {
-            user_id,
-            username,
-            password,
-            status,
-            permissions,
-        } => {
-            shard.create_user_bypass_auth(
-                user_id,
-                &username,
-                &password,
-                status,
-                permissions.clone(),
-            )?;
-            Ok(())
-        }
-        ShardEvent::DeletedUser { user_id } => {
-            shard.delete_user_bypass_auth(&user_id)?;
-            Ok(())
-        }
-        ShardEvent::ChangedPassword {
-            user_id,
-            current_password,
-            new_password,
-        } => {
-            shard.change_password_bypass_auth(&user_id, &current_password, &new_password)?;
-            Ok(())
-        }
-        ShardEvent::CreatedPersonalAccessToken {
-            personal_access_token,
-        } => {
-            shard.create_personal_access_token_bypass_auth(personal_access_token.to_owned())?;
-            Ok(())
-        }
-        ShardEvent::DeletedPersonalAccessToken { user_id, name } => {
-            shard.delete_personal_access_token_bypass_auth(user_id, &name)?;
-            Ok(())
-        }
-        ShardEvent::UpdatedUser {
-            user_id,
-            username,
-            status,
-        } => {
-            shard.update_user_bypass_auth(&user_id, username.to_owned(), status)?;
-            Ok(())
-        }
-        ShardEvent::UpdatedPermissions {
-            user_id,
-            permissions,
-        } => {
-            shard.update_permissions_bypass_auth(&user_id, permissions.to_owned())?;
             Ok(())
         }
         ShardEvent::AddressBound { protocol, address } => {
@@ -509,81 +753,42 @@ pub async fn handle_event(shard: &Rc<IggyShard>, event: ShardEvent) -> Result<()
             }
             Ok(())
         }
-        ShardEvent::CreatedStream { id, stream } => {
-            let stream_id = shard.create_stream_bypass_auth(stream);
-            assert_eq!(stream_id, id);
-            Ok(())
-        }
-        ShardEvent::DeletedStream { id, stream_id } => {
-            let stream = shard.delete_stream_bypass_auth(&stream_id);
-            assert_eq!(stream.id(), id);
-
-            Ok(())
-        }
-        ShardEvent::CreatedTopic { stream_id, topic } => {
-            let topic_id_from_event = topic.id();
-            let topic_id = shard.create_topic_bypass_auth(&stream_id, topic.clone());
-            assert_eq!(topic_id, topic_id_from_event);
-            Ok(())
-        }
         ShardEvent::CreatedPartitions {
             stream_id,
             topic_id,
             partitions,
         } => {
-            shard
-                .create_partitions_bypass_auth(&stream_id, &topic_id, partitions)
-                .await?;
-            Ok(())
-        }
-        ShardEvent::DeletedTopic {
-            id,
-            stream_id,
-            topic_id,
-        } => {
-            let topic = shard.delete_topic_bypass_auth(&stream_id, &topic_id);
-            assert_eq!(topic.id(), id);
-            Ok(())
-        }
-        ShardEvent::UpdatedTopic {
-            stream_id,
-            topic_id,
-            name,
-            message_expiry,
-            compression_algorithm,
-            max_topic_size,
-            replication_factor,
-        } => {
-            shard.update_topic_bypass_auth(
-                &stream_id,
-                &topic_id,
-                name.clone(),
-                message_expiry,
-                compression_algorithm,
-                max_topic_size,
-                replication_factor,
-            )?;
-            Ok(())
-        }
-        ShardEvent::CreatedConsumerGroup {
-            stream_id,
-            topic_id,
-            cg,
-        } => {
-            let cg_id = cg.id();
-            let id = shard.create_consumer_group_bypass_auth(&stream_id, &topic_id, cg);
-            assert_eq!(id, cg_id);
-            Ok(())
-        }
-        ShardEvent::DeletedConsumerGroup {
-            id,
-            stream_id,
-            topic_id,
-            group_id,
-        } => {
-            let cg = shard.delete_consumer_group_bypass_auth(&stream_id, &topic_id, &group_id);
-            assert_eq!(cg.id(), id);
+            let numeric_stream_id = match shard.metadata.get_stream_id(&stream_id) {
+                Some(id) => id,
+                None => {
+                    tracing::warn!(
+                        "CreatedPartitions: stream {:?} not found in SharedMetadata",
+                        stream_id
+                    );
+                    return Ok(());
+                }
+            };
+            let numeric_topic_id = match shard.metadata.get_topic_id(numeric_stream_id, &topic_id) {
+                Some(id) => id,
+                None => {
+                    tracing::warn!(
+                        "CreatedPartitions: topic {:?} not found in SharedMetadata for stream {}",
+                        topic_id,
+                        numeric_stream_id
+                    );
+                    return Ok(());
+                }
+            };
 
+            let shards_count = shard.get_available_shards_count();
+            for partition_info in partitions {
+                let ns = IggyNamespace::new(numeric_stream_id, numeric_topic_id, partition_info.id);
+                let owner_shard_id = crate::shard::calculate_shard_assignment(&ns, shards_count);
+
+                if shard.id == owner_shard_id as u16 {
+                    shard.ensure_partition(&ns).await?;
+                }
+            }
             Ok(())
         }
         ShardEvent::FlushUnsavedBuffer {
@@ -592,9 +797,21 @@ pub async fn handle_event(shard: &Rc<IggyShard>, event: ShardEvent) -> Result<()
             partition_id,
             fsync,
         } => {
-            shard
-                .flush_unsaved_buffer_base(&stream_id, &topic_id, partition_id, fsync)
-                .await?;
+            let numeric_stream_id = match shard.metadata.get_stream_id(&stream_id) {
+                Some(id) => id,
+                None => return Ok(()),
+            };
+            let numeric_topic_id = match shard.metadata.get_topic_id(numeric_stream_id, &topic_id) {
+                Some(id) => id,
+                None => return Ok(()),
+            };
+
+            let ns = IggyNamespace::new(numeric_stream_id, numeric_topic_id, partition_id);
+            if shard.local_partitions.borrow().get(&ns).is_some() {
+                shard
+                    .flush_unsaved_buffer_from_local_partitions(&ns, fsync)
+                    .await?;
+            }
             Ok(())
         }
     }
