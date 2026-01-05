@@ -32,7 +32,7 @@ pub struct User {
     pub password: String,
     pub created_at: IggyTimestamp,
     pub permissions: Option<Permissions>,
-    pub personal_access_tokens: DashMap<Arc<String>, PersonalAccessToken>,
+    pub personal_access_tokens: DashMap<Arc<str>, PersonalAccessToken>,
 }
 
 impl Default for User {

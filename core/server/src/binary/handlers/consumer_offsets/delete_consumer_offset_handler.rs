@@ -17,20 +17,20 @@
  */
 
 use crate::binary::command::{
-    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
+    AuthenticatedHandler, BinaryServerCommand, HandlerResult, ServerCommand,
 };
 use crate::binary::handlers::consumer_offsets::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::shard::IggyShard;
+use crate::streaming::auth::Auth;
 use crate::streaming::session::Session;
-use anyhow::Result;
 use err_trail::ErrContext;
 use iggy_common::delete_consumer_offset::DeleteConsumerOffset;
 use iggy_common::{IggyError, SenderKind};
 use std::rc::Rc;
 use tracing::debug;
 
-impl ServerCommandHandler for DeleteConsumerOffset {
+impl AuthenticatedHandler for DeleteConsumerOffset {
     fn code(&self) -> u32 {
         iggy_common::DELETE_CONSUMER_OFFSET_CODE
     }
@@ -39,6 +39,7 @@ impl ServerCommandHandler for DeleteConsumerOffset {
         self,
         sender: &mut SenderKind,
         _length: u32,
+        _auth: Auth,
         session: &Session,
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {

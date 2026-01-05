@@ -17,7 +17,6 @@
  */
 
 use crate::binary::command;
-use crate::binary::command::ServerCommandHandler;
 use crate::server_error::ConnectionError;
 use crate::shard::IggyShard;
 use crate::streaming::session::Session;
@@ -81,7 +80,7 @@ pub(crate) async fn handle_connection(
         let command = ServerCommand::from_code_and_reader(code, sender, length - 4).await?;
         debug!("Received a WebSocket command: {command}, payload size: {length}");
 
-        match command.handle(sender, length, session, shard).await {
+        match command.dispatch(sender, length, session, shard).await {
             Ok(_) => {
                 debug!(
                     "Command was handled successfully, session: {session}. WebSocket response was sent."

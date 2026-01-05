@@ -17,13 +17,13 @@
  */
 
 use crate::binary::command::{
-    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
+    AuthenticatedHandler, BinaryServerCommand, HandlerResult, ServerCommand,
 };
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::shard::IggyShard;
 use crate::shard::system::messages::PollingArgs;
+use crate::streaming::auth::Auth;
 use crate::streaming::session::Session;
-use anyhow::Result;
 use iggy_common::SenderKind;
 use iggy_common::{IggyError, PollMessages, PooledBuffer};
 use std::rc::Rc;
@@ -44,7 +44,7 @@ impl IggyPollMetadata {
     }
 }
 
-impl ServerCommandHandler for PollMessages {
+impl AuthenticatedHandler for PollMessages {
     fn code(&self) -> u32 {
         iggy_common::POLL_MESSAGES_CODE
     }
@@ -53,6 +53,7 @@ impl ServerCommandHandler for PollMessages {
         self,
         sender: &mut SenderKind,
         _length: u32,
+        auth: Auth,
         session: &Session,
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {
@@ -68,7 +69,7 @@ impl ServerCommandHandler for PollMessages {
         } = self;
         let args = PollingArgs::new(strategy, count, auto_commit);
 
-        let user_id = session.get_user_id();
+        let user_id = auth.user_id();
         let client_id = session.client_id;
         let (metadata, mut batch) = shard
             .poll_messages(

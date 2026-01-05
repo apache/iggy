@@ -17,7 +17,7 @@
  */
 
 use crate::binary::command::{
-    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
+    AuthenticatedHandler, BinaryServerCommand, HandlerResult, ServerCommand,
 };
 use crate::binary::handlers::system::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
@@ -27,6 +27,7 @@ use crate::shard::transmission::frame::ShardResponse;
 use crate::shard::transmission::message::{
     ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult,
 };
+use crate::streaming::auth::Auth;
 use crate::streaming::session::Session;
 use err_trail::ErrContext;
 use iggy_common::SenderKind;
@@ -35,7 +36,7 @@ use iggy_common::{Identifier, IggyError};
 use std::rc::Rc;
 use tracing::debug;
 
-impl ServerCommandHandler for GetStats {
+impl AuthenticatedHandler for GetStats {
     fn code(&self) -> u32 {
         iggy_common::GET_STATS_CODE
     }
@@ -44,6 +45,7 @@ impl ServerCommandHandler for GetStats {
         self,
         sender: &mut SenderKind,
         _length: u32,
+        auth: Auth,
         session: &Session,
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {
@@ -55,7 +57,7 @@ impl ServerCommandHandler for GetStats {
             topic_id: Identifier::default(),
             partition_id: 0,
             payload: ShardRequestPayload::GetStats {
-                user_id: session.get_user_id(),
+                user_id: auth.user_id(),
             },
         };
 

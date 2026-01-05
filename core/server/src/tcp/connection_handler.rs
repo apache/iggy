@@ -17,7 +17,6 @@
  */
 
 use crate::binary::command;
-use crate::binary::command::ServerCommandHandler;
 use crate::server_error::ConnectionError;
 use crate::shard::IggyShard;
 use crate::streaming::session::Session;
@@ -91,7 +90,7 @@ pub(crate) async fn handle_connection(
         let command = ServerCommand::from_code_and_reader(code, sender, length - 4).await?;
         debug!("Received a TCP command: {command}, payload size: {length}");
         let cmd_code = command.code();
-        match command.handle(sender, length, session, shard).await {
+        match command.dispatch(sender, length, session, shard).await {
             Ok(handler_result) => match handler_result {
                 command::HandlerResult::Finished => {
                     debug!(

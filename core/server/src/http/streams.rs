@@ -20,7 +20,6 @@ use crate::http::COMPONENT;
 use crate::http::error::CustomError;
 use crate::http::jwt::json_web_token::Identity;
 use crate::http::shared::AppState;
-use crate::slab::traits_ext::{EntityComponentSystem, IntoComponents};
 use crate::streaming::session::Session;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -58,34 +57,29 @@ async fn get_stream(
     Path(stream_id): Path<String>,
 ) -> Result<Json<StreamDetails>, CustomError> {
     let stream_id = Identifier::from_str_value(&stream_id)?;
-    let exists = state.shard.shard().ensure_stream_exists(&stream_id).is_ok();
-    if !exists {
-        return Err(CustomError::ResourceNotFound);
-    }
 
-    // Use direct slab access for thread-safe stream retrieval
-    let stream_details = SendWrapper::new(|| {
-        state
-            .shard
-            .shard()
-            .streams
-            .with_stream_by_id(&stream_id, |(root, stats)| {
-                crate::http::mapper::map_stream_details(&root, &stats)
-            })
-    })();
+    let shard = state.shard.shard();
+    let numeric_stream_id = shard
+        .metadata
+        .get_stream_id(&stream_id)
+        .ok_or(CustomError::ResourceNotFound)?;
+
+    let metadata = shard.metadata.load();
+    let stream_meta = metadata
+        .streams
+        .get(numeric_stream_id)
+        .ok_or(CustomError::ResourceNotFound)?;
+
+    let stream_details = crate::http::mapper::map_stream_details_from_metadata(stream_meta);
 
     Ok(Json(stream_details))
 }
 
 #[debug_handler]
 async fn get_streams(State(state): State<Arc<AppState>>) -> Result<Json<Vec<Stream>>, CustomError> {
-    // Use direct slab access for thread-safe streams retrieval
-    let streams = SendWrapper::new(|| {
-        state.shard.shard().streams.with_components(|stream_ref| {
-            let (roots, stats) = stream_ref.into_components();
-            crate::http::mapper::map_streams_from_slabs(&roots, &stats)
-        })
-    })();
+    let shard = state.shard.shard();
+    let metadata = shard.metadata.load();
+    let streams = crate::http::mapper::map_streams_from_metadata(&metadata);
 
     Ok(Json(streams))
 }
@@ -104,7 +98,7 @@ async fn create_stream(
 
         let _stream_guard = state.shard.shard().fs_locks.stream_lock.lock().await;
         // Create stream using wrapper method
-        let stream = state
+        let created_stream_id = state
             .shard
             .create_stream(&session, command.name.clone())
             .await
@@ -115,23 +109,6 @@ async fn create_stream(
                 )
             })?;
 
-        let created_stream_id = stream.root().id();
-
-        // Send event for stream creation - inlined from wrapper
-        {
-            use crate::shard::transmission::event::ShardEvent;
-            let event = ShardEvent::CreatedStream {
-                id: created_stream_id,
-                stream,
-            };
-            let _responses = state
-                .shard
-                .shard()
-                .broadcast_event_to_all_shards(event)
-                .await;
-        }
-
-        // Apply state change using wrapper method
         let entry_command = EntryCommand::CreateStream(CreateStreamWithId {
             stream_id: created_stream_id as u32,
             command,
@@ -148,16 +125,13 @@ async fn create_stream(
                 )
             })?;
 
-        // Get the created stream details using direct slab access
-        let response = SendWrapper::new(|| {
-            state
-                .shard
-                .shard()
-                .streams
-                .with_components_by_id(created_stream_id, |(root, stats)| {
-                    crate::http::mapper::map_stream_details(&root, &stats)
-                })
-        })();
+        let shard = state.shard.shard();
+        let metadata = shard.metadata.load();
+        let stream_meta = metadata
+            .streams
+            .get(created_stream_id)
+            .expect("Stream must exist after creation");
+        let response = crate::http::mapper::map_stream_details_from_metadata(stream_meta);
 
         Ok::<Json<StreamDetails>, CustomError>(Json(response))
     });
@@ -189,24 +163,6 @@ async fn update_stream(
                 )
             })?;
 
-        // Send event for stream update
-        {
-            let broadcast_future = SendWrapper::new(async {
-                use crate::shard::transmission::event::ShardEvent;
-                let event = ShardEvent::UpdatedStream {
-                    stream_id: command.stream_id.clone(),
-                    name: command.name.clone(),
-                };
-                let _responses = state
-                    .shard
-                    .shard()
-                    .broadcast_event_to_all_shards(event)
-                    .await;
-            });
-            broadcast_future.await;
-        }
-
-        // Apply state change using wrapper method
         let entry_command = EntryCommand::UpdateStream(command);
         state.shard.apply_state(identity.user_id, &entry_command).await.error(|e: &IggyError| {
             format!(
@@ -233,8 +189,8 @@ async fn delete_stream(
             let session = Session::stateless(identity.user_id, identity.ip_address);
 
             let _stream_guard = state.shard.shard().fs_locks.stream_lock.lock().await;
-            // Delete stream and get the stream entity
-            let stream = {
+            // Delete stream
+            {
                 let future = SendWrapper::new(
                     state
                         .shard
@@ -247,26 +203,6 @@ async fn delete_stream(
                 format!("{COMPONENT} (error: {e}) - failed to delete stream with ID: {stream_id}",)
             })?;
 
-            let stream_id_numeric = stream.root().id();
-
-            // Send event for stream deletion
-            {
-                let broadcast_future = SendWrapper::new(async {
-                    use crate::shard::transmission::event::ShardEvent;
-                    let event = ShardEvent::DeletedStream {
-                        id: stream_id_numeric,
-                        stream_id: identifier_stream_id.clone(),
-                    };
-                    let _responses = state
-                        .shard
-                        .shard()
-                        .broadcast_event_to_all_shards(event)
-                        .await;
-                });
-                broadcast_future.await;
-            }
-
-            // Apply state change using wrapper method
             let entry_command = EntryCommand::DeleteStream(DeleteStream {
                 stream_id: identifier_stream_id,
             });
@@ -319,7 +255,6 @@ async fn purge_stream(
             broadcast_future.await;
         }
 
-        // Apply state change using wrapper method
         let entry_command = EntryCommand::PurgeStream(PurgeStream {
             stream_id: identifier_stream_id,
         });

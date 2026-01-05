@@ -17,17 +17,16 @@
  */
 
 use crate::binary::command::{
-    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
+    AuthenticatedHandler, BinaryServerCommand, HandlerResult, ServerCommand,
 };
 use crate::binary::handlers::users::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 
 use crate::shard::IggyShard;
-use crate::shard::transmission::event::ShardEvent;
 use crate::state::command::EntryCommand;
+use crate::streaming::auth::Auth;
 use crate::streaming::session::Session;
 use crate::streaming::utils::crypto;
-use anyhow::Result;
 use err_trail::ErrContext;
 use iggy_common::change_password::ChangePassword;
 use iggy_common::{IggyError, SenderKind};
@@ -35,16 +34,17 @@ use std::rc::Rc;
 use tracing::info;
 use tracing::{debug, instrument};
 
-impl ServerCommandHandler for ChangePassword {
+impl AuthenticatedHandler for ChangePassword {
     fn code(&self) -> u32 {
         iggy_common::CHANGE_PASSWORD_CODE
     }
 
-    #[instrument(skip_all, name = "trace_change_password", fields(iggy_user_id = session.get_user_id(), iggy_client_id = session.client_id))]
+    #[instrument(skip_all, name = "trace_change_password", fields(iggy_user_id = auth.user_id(), iggy_client_id = session.client_id))]
     async fn handle(
         self,
         sender: &mut SenderKind,
         _length: u32,
+        auth: Auth,
         session: &Session,
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {
@@ -67,18 +67,11 @@ impl ServerCommandHandler for ChangePassword {
 
         info!("Changed password for user with ID: {}.", self.user_id);
 
-        let event = ShardEvent::ChangedPassword {
-            user_id: self.user_id.clone(),
-            current_password: self.current_password.clone(),
-            new_password: self.new_password.clone(),
-        };
-        shard.broadcast_event_to_all_shards(event).await?;
-
         // For the security of the system, we hash the password before storing it in metadata.
         shard
             .state
             .apply(
-                session.get_user_id(),
+                auth.user_id(),
                 &EntryCommand::ChangePassword(ChangePassword {
                     user_id: self.user_id.to_owned(),
                     current_password: "".into(),
