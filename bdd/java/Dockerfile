@@ -18,7 +18,7 @@
 ARG RUST_VERSION=1.92
 FROM rust:${RUST_VERSION}
 
-FROM gradle:8.13-jdk17
+FROM gradle:9.2-jdk17
 
 WORKDIR /workspace
 COPY . .
