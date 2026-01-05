@@ -17,8 +17,9 @@
  */
 
 use crate::error::IggyError;
+use crate::types::message::MAX_PAYLOAD_SIZE;
 use flate2::{Compression, read::GzDecoder, write::GzEncoder};
-use lz4::{Decoder, EncoderBuilder};
+use lz4_flex::frame::{FrameDecoder, FrameEncoder};
 use serde::{
     Deserialize, Serialize, Serializer,
     de::{self, Deserializer, Visitor},
@@ -79,16 +80,14 @@ impl CompressionAlgorithm {
                 Ok(compressed_data)
             }
             CompressionAlgorithm::Lz4 => {
-                let compressed_data = Vec::new();
-                let mut encoder = EncoderBuilder::new()
-                    .level(4)
-                    .build(compressed_data)
-                    .map_err(|e| IggyError::CompressionError(e.to_string()))?;
+                let mut compressed_data = Vec::new();
+                let mut encoder = FrameEncoder::new(&mut compressed_data);
                 encoder
                     .write_all(data)
                     .map_err(|e| IggyError::CompressionError(e.to_string()))?;
-                let (compressed_data, result) = encoder.finish();
-                result.map_err(|e| IggyError::CompressionError(e.to_string()))?;
+                encoder
+                    .finish()
+                    .map_err(|e| IggyError::CompressionError(e.to_string()))?;
                 Ok(compressed_data)
             }
             CompressionAlgorithm::Snappy => {
@@ -102,31 +101,75 @@ impl CompressionAlgorithm {
 
     pub fn decompress(&self, data: &[u8]) -> Result<Vec<u8>, IggyError> {
         match self {
-            CompressionAlgorithm::None => Ok(data.to_vec()),
+            CompressionAlgorithm::None => {
+                if data.len() > MAX_PAYLOAD_SIZE as usize {
+                    return Err(IggyError::DecompressionError(format!(
+                        "payload length exceeds MAX_PAYLOAD_SIZE: {}",
+                        MAX_PAYLOAD_SIZE
+                    )));
+                }
+                Ok(data.to_vec())
+            }
             CompressionAlgorithm::Gzip => {
-                let mut decoder = GzDecoder::new(data);
+                let decoder = GzDecoder::new(data);
                 let mut decompressed_data = Vec::new();
-                decoder
+                let read_bytes = decoder
+                    .take(MAX_PAYLOAD_SIZE as u64 + 1)
                     .read_to_end(&mut decompressed_data)
                     .map_err(|e| IggyError::DecompressionError(e.to_string()))?;
+                // has_data_left method currently in experimental nightly
+                if read_bytes > MAX_PAYLOAD_SIZE as usize {
+                    return Err(IggyError::DecompressionError(format!(
+                        "payload length exceeds MAX_PAYLOAD_SIZE: {}",
+                        MAX_PAYLOAD_SIZE
+                    )));
+                }
                 Ok(decompressed_data)
             }
             CompressionAlgorithm::Zstd => {
-                let decompressed_data = zstd::decode_all(data)
+                let decoder = zstd::stream::Decoder::new(data)
                     .map_err(|e| IggyError::DecompressionError(e.to_string()))?;
+                let mut decompressed_data = Vec::new();
+                let bytes_read = decoder
+                    .take(MAX_PAYLOAD_SIZE as u64 + 1)
+                    .read_to_end(&mut decompressed_data)
+                    .map_err(|e| IggyError::DecompressionError(e.to_string()))?;
+
+                if bytes_read > MAX_PAYLOAD_SIZE as usize {
+                    return Err(IggyError::DecompressionError(format!(
+                        "payload length exceeds MAX_PAYLOAD_SIZE: {}",
+                        MAX_PAYLOAD_SIZE
+                    )));
+                }
                 Ok(decompressed_data)
             }
             CompressionAlgorithm::Lz4 => {
-                let mut decoder =
-                    Decoder::new(data).map_err(|e| IggyError::DecompressionError(e.to_string()))?;
+                let decoder = FrameDecoder::new(data);
                 let mut decompressed_data = Vec::new();
-                decoder
+                let bytes_read = decoder
+                    .take(MAX_PAYLOAD_SIZE as u64 + 1)
                     .read_to_end(&mut decompressed_data)
                     .map_err(|e| IggyError::DecompressionError(e.to_string()))?;
+
+                if bytes_read > MAX_PAYLOAD_SIZE as usize {
+                    return Err(IggyError::DecompressionError(format!(
+                        "payload length exceeds MAX_PAYLOAD_SIZE: {}",
+                        MAX_PAYLOAD_SIZE
+                    )));
+                }
                 Ok(decompressed_data)
             }
-
             CompressionAlgorithm::Snappy => {
+                let decompressed_len = snap::raw::decompress_len(data)
+                    .map_err(|e| IggyError::DecompressionError(e.to_string()))?;
+
+                if decompressed_len > MAX_PAYLOAD_SIZE as usize {
+                    return Err(IggyError::DecompressionError(format!(
+                        "payload length exceeds MAX_PAYLOAD_SIZE: {}",
+                        MAX_PAYLOAD_SIZE
+                    )));
+                }
+
                 let mut decoder = snap::raw::Decoder::new();
                 let decompressed_data = decoder
                     .decompress_vec(data)
@@ -396,7 +439,7 @@ mod tests {
     }
 
     #[test]
-    fn test_emtpy_input_compression_decompression() {
+    fn test_empty_input_compression_decompression() {
         for config in ALGORITHM_OPTIONS {
             cycle_with_all_algorithms(config, b"");
         }
@@ -446,5 +489,57 @@ mod tests {
             "All alogrithms produced the same size for compressed data: {:?}",
             sizes
         );
+    }
+
+    #[test]
+    fn test_decompression_exceeds_max_payload_size() {
+        let data = vec![0u8; MAX_PAYLOAD_SIZE as usize + 1];
+
+        for algorithm in ALGORITHM_OPTIONS {
+            let compressed = algorithm
+                .compress(&data)
+                .unwrap_or_else(|_| panic!("compression should succeed for {:?}", algorithm));
+
+            let result = algorithm.decompress(&compressed);
+            assert!(
+                result.is_err(),
+                "decompression should fail for {:?} with data.len() > MAX_PAYLOAD_SIZE",
+                algorithm
+            );
+
+            let message = result.unwrap_err();
+            assert!(
+                message.to_string().contains("MAX_PAYLOAD_SIZE"),
+                "error message should contain MAX_PAYLOAD_SIZE for {:?}",
+                algorithm
+            );
+        }
+    }
+
+    #[test]
+    fn test_decompression_at_max_payload_size() {
+        let data = vec![0u8; MAX_PAYLOAD_SIZE as usize];
+
+        for algorithm in ALGORITHM_OPTIONS {
+            let compressed = algorithm
+                .compress(&data)
+                .unwrap_or_else(|_| panic!("compression should succeed for {:?}", algorithm));
+
+            let decompressed = algorithm
+                .decompress(&compressed)
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "decompression should succeed with data.len() == MAX_PAYLOAD_SIZE for algorithm {:?}",
+                        algorithm
+                    )
+                });
+
+            assert_eq!(
+                decompressed.len(),
+                MAX_PAYLOAD_SIZE as usize,
+                "decompressed size should be equal to MAX_PAYLOAD_SIZE for algorithm {:?}",
+                algorithm
+            );
+        }
     }
 }

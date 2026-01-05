@@ -26,9 +26,9 @@ use iggy_binary_protocol::{
 };
 use iggy_common::locking::{IggyRwLock, IggyRwLockFn};
 use iggy_common::{
-    BytesSerializable, CompressionAlgorithm, Consumer, ConsumerKind, DiagnosticEvent,
-    EncryptorKind, HeaderKey, IdKind, Identifier, IggyDuration, IggyError, IggyMessage,
-    IggyTimestamp, PolledMessages, PollingKind, PollingStrategy,
+    BytesSerializable, COMPRESSION_HEADER_KEY, CompressionAlgorithm, Consumer, ConsumerKind,
+    DiagnosticEvent, EncryptorKind, HeaderKey, IdKind, Identifier, IggyDuration, IggyError,
+    IggyMessage, IggyTimestamp, PolledMessages, PollingKind, PollingStrategy,
 };
 use std::collections::VecDeque;
 use std::future::Future;
@@ -920,6 +920,34 @@ impl ReceivedMessage {
     }
 }
 
+fn maybe_decompress(message: &mut IggyMessage) -> Result<(), IggyError> {
+    if let Ok(Some(algorithm_value)) =
+        message.get_user_header(&HeaderKey::from_str(COMPRESSION_HEADER_KEY).unwrap())
+    {
+        let algorithm_name = algorithm_value.as_str().unwrap();
+        let algorithm = CompressionAlgorithm::from_str(algorithm_name)
+            .expect("compression algorithm in user header should match any of the available CompressionAlgorithms.");
+
+        let decompressed_payload = algorithm.decompress(&message.payload)?;
+        message.payload = Bytes::from(decompressed_payload);
+        message.header.payload_length = message.payload.len() as u32;
+
+        // Remove the compression header since payload is now decompressed
+        if let Ok(Some(mut headers_map)) = message.user_headers_map() {
+            headers_map.remove(&HeaderKey::from_str(COMPRESSION_HEADER_KEY).unwrap());
+            let headers_bytes = headers_map.to_bytes();
+            message.header.user_headers_length = headers_bytes.len() as u32;
+            message.user_headers = if headers_map.is_empty() {
+                None
+            } else {
+                Some(headers_bytes)
+            };
+        }
+    }
+
+    Ok(())
+}
+
 impl Stream for IggyConsumer {
     type Item = Result<ReceivedMessage, IggyError>;
 
@@ -982,6 +1010,7 @@ impl Stream for IggyConsumer {
                         self.poll_future = Some(Box::pin(self.create_poll_messages_future()));
                     } else {
                         for message in &mut polled_messages.messages {
+                            // maybe decrypt message payload
                             if let Some(ref encryptor) = self.encryptor {
                                 let payload = encryptor.decrypt(&message.payload);
                                 if let Err(error) = payload {
@@ -998,46 +1027,14 @@ impl Stream for IggyConsumer {
                                 message.header.payload_length = message.payload.len() as u32;
                             }
 
-                            // maybe decompress
-                            if let Ok(Some(algorithm_value)) = message
-                                .get_user_header(&HeaderKey::from_str("iggy-compression").unwrap())
-                            {
-                                let algorithm_name = algorithm_value.as_str().unwrap();
-                                let algorithm =
-                                    CompressionAlgorithm::from_str(algorithm_name).unwrap();
-
-                                match algorithm.decompress(&message.payload) {
-                                    Ok(decompressed_payload) => {
-                                        message.payload = Bytes::from(decompressed_payload);
-                                        message.header.payload_length =
-                                            message.payload.len() as u32;
-
-                                        // Remove the compression header since payload is now decompressed
-                                        if let Ok(Some(mut headers_map)) =
-                                            message.user_headers_map()
-                                        {
-                                            headers_map.remove(
-                                                &HeaderKey::from_str("iggy-compression").unwrap(),
-                                            );
-                                            let headers_bytes = headers_map.to_bytes();
-                                            message.header.user_headers_length =
-                                                headers_bytes.len() as u32;
-                                            message.user_headers = if headers_map.is_empty() {
-                                                None
-                                            } else {
-                                                Some(headers_bytes)
-                                            };
-                                        }
-                                    }
-                                    Err(error) => {
-                                        self.poll_future = None;
-                                        error!(
-                                            "Failed to decompress message payload at offset: {}, partition ID: {}, algorithm: {}",
-                                            message.header.offset, partition_id, algorithm_name
-                                        );
-                                        return Poll::Ready(Some(Err(error)));
-                                    }
-                                }
+                            // maybe decompress message payload
+                            if let Err(error) = maybe_decompress(message) {
+                                self.poll_future = None;
+                                error!(
+                                    "Failed to decompress message payload at offset: {}, partition ID: {}",
+                                    message.header.offset, partition_id
+                                );
+                                return Poll::Ready(Some(Err(error)));
                             }
                         }
 

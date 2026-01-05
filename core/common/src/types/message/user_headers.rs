@@ -27,6 +27,8 @@ use std::fmt::{Display, Formatter};
 use std::hash::{Hash, Hasher};
 use std::str::FromStr;
 
+pub const COMPRESSION_HEADER_KEY: &str = "iggy-compression";
+
 /// Represents a header key with a unique name. The name is case-insensitive and wraps a string.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct HeaderKey(String);

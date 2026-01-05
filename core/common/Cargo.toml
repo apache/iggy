@@ -57,7 +57,7 @@ flate2 = { workspace = true }
 human-repr = { workspace = true }
 humantime = { workspace = true }
 nix = { workspace = true }
-lz4 = { workspace = true }
+lz4_flex = { workspace = true }
 once_cell = { workspace = true }
 rcgen = "0.14.6"
 ring = "0.17.14"
