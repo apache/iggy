@@ -77,7 +77,6 @@ async fn compression_send_receive_ok(algorithm: CompressionAlgorithm) {
     login_root(&client).await;
     init_system(&client).await;
 
-    client.connect().await.unwrap();
     assert!(client.ping().await.is_ok(), "Failed to ping server");
 
     // producer
