@@ -80,9 +80,6 @@ testing = [
     "pytest-timeout>=2.0,<3.0",
 ]
 
-# For examples and demos
-examples = ["loguru>=0.7.0,<1.0"]
-
 # For containerized testing (CI/CD)
 testing-docker = ["testcontainers[docker]>=3.7.0,<5.0"]
 

@@ -23,24 +23,13 @@ pip install -e ".[testing]"
 For development with all tools:
 
 ```bash
-pip install -e ".[dev,testing,examples]"
+pip install -e ".[dev,testing]"
 ```
 
 ### Supported Python Versions
 
 - Python 3.10+
 
-## Usage and Examples
-
-All examples rely on a running iggy server. To start the server, execute:
-
-```bash
-# Using latest version
-docker run --rm -p 8080:8080 -p 3000:3000 -p 8090:8090 apache/iggy:latest
-
-# Or build from source (recommended for development)
-cd ../../ && cargo run --bin iggy-server
-```
 
 ## Testing
 
