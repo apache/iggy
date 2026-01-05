@@ -20,7 +20,6 @@ use crate::{
         system::messages::PollingArgs,
         transmission::{event::ShardEvent, frame::ShardResponse},
     },
-    slab::partitions,
     streaming::{polling_consumer::PollingConsumer, segments::IggyMessagesBatchMut},
 };
 use iggy_common::{
@@ -55,7 +54,7 @@ impl ShardRequest {
     pub fn new(
         stream_id: Identifier,
         topic_id: Identifier,
-        partition_id: partitions::ContainerId,
+        partition_id: usize,
         payload: ShardRequestPayload,
     ) -> Self {
         Self {

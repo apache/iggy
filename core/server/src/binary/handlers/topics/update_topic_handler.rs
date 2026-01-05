@@ -21,16 +21,13 @@ use crate::binary::command::{
 };
 use crate::binary::handlers::topics::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
-
 use crate::shard::IggyShard;
-use crate::shard::transmission::event::ShardEvent;
 use crate::shard::transmission::frame::ShardResponse;
 use crate::shard::transmission::message::{
     ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult,
 };
 use crate::state::command::EntryCommand;
 use crate::streaming::session::Session;
-use crate::streaming::{streams, topics};
 use anyhow::Result;
 use err_trail::ErrContext;
 use iggy_common::update_topic::UpdateTopic;
@@ -102,31 +99,31 @@ impl ServerCommandHandler for UpdateTopic {
                         topic_id.clone()
                     };
 
-                    self.message_expiry = shard.streams.with_topic_by_id(
-                        &stream_id,
-                        &lookup_topic_id,
-                        topics::helpers::get_message_expiry(),
-                    );
-                    self.max_topic_size = shard.streams.with_topic_by_id(
-                        &stream_id,
-                        &lookup_topic_id,
-                        topics::helpers::get_max_topic_size(),
-                    );
-
+                    // Get stream and topic IDs from SharedMetadata
                     let stream_id_num = shard
-                        .streams
-                        .with_stream_by_id(&stream_id, streams::helpers::get_stream_id());
+                        .shared_metadata
+                        .get_stream_id(&stream_id)
+                        .ok_or_else(|| IggyError::StreamIdNotFound(stream_id.clone()))?;
+                    let topic_id_num = shard
+                        .shared_metadata
+                        .get_topic_id(stream_id_num, &lookup_topic_id)
+                        .ok_or_else(|| {
+                            IggyError::TopicIdNotFound(lookup_topic_id.clone(), stream_id.clone())
+                        })?;
 
-                    let event = ShardEvent::UpdatedTopic {
-                        stream_id: stream_id.clone(),
-                        topic_id: topic_id.clone(),
-                        name: name.clone(),
-                        message_expiry: self.message_expiry,
-                        compression_algorithm: self.compression_algorithm,
-                        max_topic_size: self.max_topic_size,
-                        replication_factor: self.replication_factor,
-                    };
-                    shard.broadcast_event_to_all_shards(event).await?;
+                    // Get topic metadata from SharedMetadata
+                    let snapshot = shard.shared_metadata.load();
+                    let stream_meta = snapshot
+                        .streams
+                        .get(&stream_id_num)
+                        .ok_or_else(|| IggyError::StreamIdNotFound(stream_id.clone()))?;
+                    let topic_meta = stream_meta.get_topic(topic_id_num).ok_or_else(|| {
+                        IggyError::TopicIdNotFound(lookup_topic_id.clone(), stream_id.clone())
+                    })?;
+
+                    self.message_expiry = topic_meta.message_expiry;
+                    self.max_topic_size = topic_meta.max_topic_size;
+                    drop(snapshot);
 
                     shard
                         .state
@@ -144,9 +141,11 @@ impl ServerCommandHandler for UpdateTopic {
             }
             ShardSendRequestResult::Response(response) => match response {
                 ShardResponse::UpdateTopicResponse => {
+                    // Get stream_id from SharedMetadata (don't access local slab)
                     let stream_id = shard
-                        .streams
-                        .with_stream_by_id(&self.stream_id, streams::helpers::get_stream_id());
+                        .shared_metadata
+                        .get_stream_id(&self.stream_id)
+                        .ok_or_else(|| IggyError::StreamIdNotFound(self.stream_id.clone()))?;
 
                     shard
                         .state

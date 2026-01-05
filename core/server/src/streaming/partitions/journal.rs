@@ -107,6 +107,11 @@ impl Journal for MemoryMessageJournal {
     fn inner(&self) -> &Self::Inner {
         &self.inner
     }
+
+    fn clear(&mut self) {
+        self.batches = IggyMessagesBatchSet::empty();
+        self.inner = Inner::default();
+    }
 }
 
 pub trait Journal {
@@ -126,6 +131,9 @@ pub trait Journal {
     fn is_empty(&self) -> bool;
 
     fn inner(&self) -> &Self::Inner;
+
+    /// Clear all data in the journal, resetting it to empty state.
+    fn clear(&mut self);
 
     // `flush` is only useful in case of an journal that has disk backed WAL.
     // This could be merged together with `append`, but not doing this for two reasons.

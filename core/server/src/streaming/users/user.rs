@@ -15,6 +15,7 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+use crate::metadata::UserMeta;
 use crate::streaming::personal_access_tokens::personal_access_token::PersonalAccessToken;
 use crate::streaming::utils::crypto;
 use dashmap::DashMap;
@@ -107,6 +108,26 @@ impl User {
 
     pub fn is_active(&self) -> bool {
         self.status == UserStatus::Active
+    }
+
+    /// Create a User from SharedMetadata's UserMeta.
+    pub fn from_metadata(meta: &UserMeta) -> Self {
+        let personal_access_tokens = DashMap::new();
+        for (_, pat_meta) in meta.personal_access_tokens.iter() {
+            let pat = PersonalAccessToken::from_metadata(meta.id, pat_meta);
+            // pat.token is already Arc<String>, so just clone it
+            personal_access_tokens.insert(pat.token.clone(), pat);
+        }
+
+        Self {
+            id: meta.id,
+            username: meta.username.clone(),
+            password: meta.password_hash.clone(),
+            created_at: meta.created_at,
+            status: meta.status,
+            permissions: meta.permissions.clone(),
+            personal_access_tokens,
+        }
     }
 }
 

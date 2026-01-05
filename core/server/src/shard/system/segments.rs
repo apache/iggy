@@ -1,5 +1,3 @@
-use crate::shard::IggyShard;
-use crate::streaming;
 /* Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -17,21 +15,12 @@ use crate::streaming;
  * specific language governing permissions and limitations
  * under the License.
  */
-use iggy_common::Identifier;
-use iggy_common::IggyError;
+
+use crate::shard::IggyShard;
+use iggy_common::sharding::IggyNamespace;
+use iggy_common::{Identifier, IggyError};
 
 impl IggyShard {
-    pub async fn delete_segments_bypass_auth(
-        &self,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-        partition_id: usize,
-        segments_count: u32,
-    ) -> Result<(), IggyError> {
-        self.delete_segments_base(stream_id, topic_id, partition_id, segments_count)
-            .await
-    }
-
     pub async fn delete_segments_base(
         &self,
         stream_id: &Identifier,
@@ -39,36 +28,43 @@ impl IggyShard {
         partition_id: usize,
         segments_count: u32,
     ) -> Result<(), IggyError> {
-        let (segments, storages, stats) = self.streams.with_partition_by_id_mut(
-            stream_id,
-            topic_id,
-            partition_id,
-            |(_, stats, .., log)| {
-                let upperbound = log.segments().len();
-                let begin = upperbound.saturating_sub(segments_count as usize);
-                let segments = log
-                    .segments_mut()
-                    .drain(begin..upperbound)
-                    .collect::<Vec<_>>();
-                let storages = log
-                    .storages_mut()
-                    .drain(begin..upperbound)
-                    .collect::<Vec<_>>();
-                let _ = log
-                    .indexes_mut()
-                    .drain(begin..upperbound)
-                    .collect::<Vec<_>>();
-                (segments, storages, stats.clone())
-            },
-        );
+        // Resolve identifiers to numeric IDs
         let numeric_stream_id = self
-            .streams
-            .with_stream_by_id(stream_id, streaming::streams::helpers::get_stream_id());
-        let numeric_topic_id = self.streams.with_topic_by_id(
-            stream_id,
-            topic_id,
-            streaming::topics::helpers::get_topic_id(),
-        );
+            .shared_metadata
+            .get_stream_id(stream_id)
+            .ok_or_else(|| IggyError::StreamIdNotFound(stream_id.clone()))?;
+        let numeric_topic_id = self
+            .shared_metadata
+            .get_topic_id(numeric_stream_id, topic_id)
+            .ok_or_else(|| IggyError::TopicIdNotFound(topic_id.clone(), stream_id.clone()))?;
+
+        let namespace = IggyNamespace::new(numeric_stream_id, numeric_topic_id, partition_id);
+
+        // Get partition from partition_store
+        let rc_partition = self.partition_store.borrow().get_rc(&namespace).ok_or(
+            IggyError::PartitionNotFound(partition_id, topic_id.clone(), stream_id.clone()),
+        )?;
+
+        // Extract segments and storages to delete
+        let (segments, storages, stats) = {
+            let mut partition_data = rc_partition.borrow_mut();
+            let log = &mut partition_data.log;
+            let upperbound = log.segments().len();
+            let begin = upperbound.saturating_sub(segments_count as usize);
+            let segments = log
+                .segments_mut()
+                .drain(begin..upperbound)
+                .collect::<Vec<_>>();
+            let storages = log
+                .storages_mut()
+                .drain(begin..upperbound)
+                .collect::<Vec<_>>();
+            let _ = log
+                .indexes_mut()
+                .drain(begin..upperbound)
+                .collect::<Vec<_>>();
+            (segments, storages, partition_data.stats.clone())
+        };
 
         for (mut storage, segment) in storages.into_iter().zip(segments.into_iter()) {
             let (msg_writer, index_writer) = storage.shutdown();

@@ -16,18 +16,17 @@
  * under the License.
  */
 
-use crate::slab::partitions;
 use iggy_common::Identifier;
 
 #[derive(Debug)]
 pub struct IggyFullNamespace {
     stream: Identifier,
     topic: Identifier,
-    partition: partitions::ContainerId,
+    partition: usize,
 }
 
 impl IggyFullNamespace {
-    pub fn new(stream: Identifier, topic: Identifier, partition: partitions::ContainerId) -> Self {
+    pub fn new(stream: Identifier, topic: Identifier, partition: usize) -> Self {
         Self {
             stream,
             topic,
@@ -43,11 +42,11 @@ impl IggyFullNamespace {
         &self.topic
     }
 
-    pub fn partition_id(&self) -> partitions::ContainerId {
+    pub fn partition_id(&self) -> usize {
         self.partition
     }
 
-    pub fn decompose(self) -> (Identifier, Identifier, partitions::ContainerId) {
+    pub fn decompose(self) -> (Identifier, Identifier, usize) {
         (self.stream, self.topic, self.partition)
     }
 }

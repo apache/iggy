@@ -1,23 +1,20 @@
 /* Licensed to the Apache Software Foundation (ASF) under one
-* or more contributor license agreements.  See the NOTICE file
-* distributed with this work for additional information
-* regarding copyright ownership.  The ASF licenses         let consumer = PollingConsumer::consumer(&Identifier::numeric(2).unwrap(), partition_id as usize);
-       let args = PollingArgs::new(PollingStrategy::offset(middle_offset + 1), remaining_messages, false);
-       let (_, middle_messages) = streams
-           .poll_messages(&namespace, consumer, args)s file
-* to you under the Apache License, Version 2.0 (the
-* "License"); you may not use this file except in compliance
-* with the License.  You may obtain a copy of the License at
-*
-*   http://www.apache.org/licenses/LICENSE-2.0
-*
-* Unless required by applicable law or agreed to in writing,
-* software distributed under the License is distributed on an
-* "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-* KIND, either express or implied.  See the License for the
-* specific language governing permissions and limitations
-* under the License.
-*/
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
 
 use super::bootstrap_test_environment;
 use crate::streaming::common::test_setup::TestSetup;
@@ -25,18 +22,12 @@ use bytes::BytesMut;
 use iggy::prelude::*;
 use server::configs::cache_indexes::CacheIndexesConfig;
 use server::configs::system::{PartitionConfig, SegmentConfig, SystemConfig};
-use server::shard::namespace::IggyFullNamespace;
 use server::shard::system::messages::PollingArgs;
 use server::streaming::polling_consumer::PollingConsumer;
 use server::streaming::segments::IggyMessagesBatchMut;
-use server::streaming::traits::MainOps;
 use std::collections::HashMap;
 use std::str::FromStr;
 use test_case::test_matrix;
-
-/*
- * Below helper functions are here only to make test function name more readable.
- */
 
 fn msg_size(size: u64) -> IggyByteSize {
     IggyByteSize::from_str(&format!("{size}B")).unwrap()
@@ -116,22 +107,14 @@ async fn test_get_messages_by_offset(
         ..Default::default()
     };
 
-    // Use the bootstrap method to create streams with proper slab structure
+    // Use the bootstrap method to create metadata and partition store
     let bootstrap_result = bootstrap_test_environment(shard_id as u16, &config)
         .await
         .unwrap();
-    let streams = bootstrap_result.streams;
-    let stream_identifier = bootstrap_result.stream_id;
-    let topic_identifier = bootstrap_result.topic_id;
+    let streaming_helper = bootstrap_result.streaming_helper;
     let partition_id = bootstrap_result.partition_id;
     let task_registry = bootstrap_result.task_registry;
-
-    // Create namespace for MainOps calls
-    let namespace = IggyFullNamespace::new(
-        stream_identifier.clone(),
-        topic_identifier.clone(),
-        partition_id,
-    );
+    let namespace = bootstrap_result.namespace;
 
     let mut all_messages = Vec::with_capacity(total_messages_count as usize);
 
@@ -195,18 +178,13 @@ async fn test_get_messages_by_offset(
 
         let batch = IggyMessagesBatchMut::from_messages(messages_slice_to_append, messages_size);
         assert_eq!(batch.count(), batch_len);
-        streams
+        streaming_helper
             .append_messages(&config, &task_registry, &namespace, batch)
             .await
             .unwrap();
 
         // Get current offset after appending
-        let current_offset = streams.with_partition_by_id(
-            &stream_identifier,
-            &topic_identifier,
-            partition_id,
-            |(_, _, _, offset, ..)| offset.load(std::sync::atomic::Ordering::Relaxed),
-        );
+        let current_offset = streaming_helper.get_current_offset(&namespace).unwrap();
         batch_offsets.push(current_offset);
         current_pos += batch_len as usize;
     }
@@ -215,12 +193,11 @@ async fn test_get_messages_by_offset(
     let total_sent_messages = total_messages_count;
 
     // Create a single consumer to reuse throughout the test
-    let consumer =
-        PollingConsumer::consumer(&Identifier::numeric(1).unwrap(), partition_id as usize);
+    let consumer = PollingConsumer::consumer(&Identifier::numeric(1).unwrap(), partition_id);
 
     // Test 1: All messages from start
     let args = PollingArgs::new(PollingStrategy::offset(0), total_sent_messages, false);
-    let (_, all_loaded_messages) = streams
+    let (_, all_loaded_messages) = streaming_helper
         .poll_messages(&namespace, consumer, args)
         .await
         .unwrap();
@@ -243,7 +220,7 @@ async fn test_get_messages_by_offset(
             remaining_messages,
             false,
         );
-        let (_, middle_messages) = streams
+        let (_, middle_messages) = streaming_helper
             .poll_messages(&namespace, consumer, args)
             .await
             .unwrap();
@@ -261,7 +238,7 @@ async fn test_get_messages_by_offset(
     if !batch_offsets.is_empty() {
         let final_offset = *batch_offsets.last().unwrap();
         let args = PollingArgs::new(PollingStrategy::offset(final_offset + 1), 1, false);
-        let (_, no_messages) = streams
+        let (_, no_messages) = streaming_helper
             .poll_messages(&namespace, consumer, args)
             .await
             .unwrap();
@@ -276,7 +253,7 @@ async fn test_get_messages_by_offset(
     // Test 4: Small subset from start
     let subset_size = std::cmp::min(3, total_sent_messages);
     let args = PollingArgs::new(PollingStrategy::offset(0), subset_size, false);
-    let (_, subset_messages) = streams
+    let (_, subset_messages) = streaming_helper
         .poll_messages(&namespace, consumer, args)
         .await
         .unwrap();
@@ -293,7 +270,7 @@ async fn test_get_messages_by_offset(
         let span_offset = batch_offsets[1] + 1; // Start from middle of 2nd batch
         let span_size = 8; // Should span across 2nd, 3rd, and into 4th batch
         let args = PollingArgs::new(PollingStrategy::offset(span_offset), span_size, false);
-        let (_, batches) = streams
+        let (_, batches) = streaming_helper
             .poll_messages(&namespace, consumer, args)
             .await
             .unwrap();
@@ -371,7 +348,7 @@ async fn test_get_messages_by_offset(
             read_size,
             false,
         );
-        let (_, chunk) = streams
+        let (_, chunk) = streaming_helper
             .poll_messages(&namespace, consumer, args)
             .await
             .unwrap();

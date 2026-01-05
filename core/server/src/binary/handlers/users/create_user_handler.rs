@@ -23,7 +23,6 @@ use crate::binary::handlers::users::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
 use crate::shard::IggyShard;
-use crate::shard::transmission::event::ShardEvent;
 use crate::shard::transmission::frame::ShardResponse;
 use crate::shard::transmission::message::{
     ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult,
@@ -81,7 +80,7 @@ impl ServerCommandHandler for CreateUser {
                     } = payload
                 {
                     let _user_guard = shard.fs_locks.user_lock.lock().await;
-                    let user = shard
+                    let user_meta = shard
                         .create_user(session, &username, &password, status, permissions.clone())
                         .error(|e: &IggyError| {
                             format!(
@@ -90,18 +89,8 @@ impl ServerCommandHandler for CreateUser {
                             )
                         })?;
 
-                    let user_id = user.id;
-
-                    let event = ShardEvent::CreatedUser {
-                        user_id,
-                        username: username.clone(),
-                        password: password.clone(),
-                        status,
-                        permissions: permissions.clone(),
-                    };
-                    shard.broadcast_event_to_all_shards(event).await?;
-
-                    let response = mapper::map_user(&user);
+                    let user_id = user_meta.id;
+                    let response = mapper::map_user_from_metadata(&user_meta);
 
                     shard
                         .state
@@ -133,9 +122,9 @@ impl ServerCommandHandler for CreateUser {
                 }
             }
             ShardSendRequestResult::Response(response) => match response {
-                ShardResponse::CreateUserResponse(user) => {
-                    let user_id = user.id;
-                    let response = mapper::map_user(&user);
+                ShardResponse::CreateUserResponse(user_meta) => {
+                    let user_id = user_meta.id;
+                    let response = mapper::map_user_from_metadata(&user_meta);
 
                     shard
                         .state

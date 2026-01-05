@@ -34,14 +34,19 @@ impl IggyShard {
     ) -> Result<Vec<PersonalAccessToken>, IggyError> {
         self.ensure_authenticated(session)?;
         let user_id = session.get_user_id();
-        let user = self.get_user(&user_id.try_into()?).error(|e: &IggyError| {
-            format!("{COMPONENT} (error: {e}) - failed to get user with id: {user_id}")
-        })?;
+
+        // Read from SharedMetadata for cross-shard consistency
+        let metadata = self.shared_metadata.load();
+        let user_meta = metadata
+            .users
+            .get(&user_id)
+            .ok_or_else(|| IggyError::ResourceNotFound(format!("user with ID {user_id}")))?;
+
         info!("Loading personal access tokens for user with ID: {user_id}...",);
-        let personal_access_tokens: Vec<_> = user
+        let personal_access_tokens: Vec<_> = user_meta
             .personal_access_tokens
             .iter()
-            .map(|pat| pat.clone())
+            .map(|(_, pat_meta)| PersonalAccessToken::from_metadata(user_id, pat_meta))
             .collect();
 
         info!(
@@ -82,13 +87,6 @@ impl IggyShard {
         Ok((personal_access_token, token))
     }
 
-    pub fn create_personal_access_token_bypass_auth(
-        &self,
-        personal_access_token: PersonalAccessToken,
-    ) -> Result<(), IggyError> {
-        self.create_personal_access_token_base(personal_access_token)
-    }
-
     fn create_personal_access_token_base(
         &self,
         personal_access_token: PersonalAccessToken,
@@ -96,33 +94,31 @@ impl IggyShard {
         let user_id = personal_access_token.user_id;
         let name = personal_access_token.name.clone();
         let token_hash = personal_access_token.token.clone();
-        let identifier = user_id.try_into()?;
-        self.users
-            .with_user_mut(&identifier, |user| {
-                if user
-                    .personal_access_tokens
-                    .iter()
-                    .any(|pat| pat.name.as_str() == name.as_str())
-                {
-                    error!(
-                        "Personal access token: {name} for user with ID: {user_id} already exists."
-                    );
-                    return Err(IggyError::PersonalAccessTokenAlreadyExists(
-                        name.to_string(),
-                        user_id,
-                    ));
-                }
+        let expiry_at = personal_access_token.expiry_at;
 
-                user.personal_access_tokens
-                    .insert(token_hash, personal_access_token);
-                info!("Created personal access token: {name} for user with ID: {user_id}.");
-                Ok(())
-            })
-            .error(|e: &IggyError| {
-                format!(
-                    "{COMPONENT} create PAT (error: {e}) - failed to access user with id: {user_id}"
-                )
-            })??;
+        // Check SharedMetadata for existence (source of truth for cross-shard consistency)
+        {
+            let metadata = self.shared_metadata.load();
+            if let Some(user_meta) = metadata.users.get(&user_id)
+                && user_meta.personal_access_tokens.contains_key(name.as_str())
+            {
+                error!("Personal access token: {name} for user with ID: {user_id} already exists.");
+                return Err(IggyError::PersonalAccessTokenAlreadyExists(
+                    name.to_string(),
+                    user_id,
+                ));
+            }
+        }
+
+        // Create in SharedMetadata first (primary store)
+        self.shared_metadata.create_personal_access_token(
+            user_id,
+            name.to_string(),
+            token_hash.to_string(),
+            expiry_at,
+        )?;
+
+        info!("Created personal access token: {name} for user with ID: {user_id}.");
         Ok(())
     }
 
@@ -136,39 +132,25 @@ impl IggyShard {
         self.delete_personal_access_token_base(user_id, name)
     }
 
-    pub fn delete_personal_access_token_bypass_auth(
-        &self,
-        user_id: u32,
-        name: &str,
-    ) -> Result<(), IggyError> {
-        self.delete_personal_access_token_base(user_id, name)
-    }
-
     fn delete_personal_access_token_base(&self, user_id: u32, name: &str) -> Result<(), IggyError> {
-        self.users
-            .with_user_mut(&user_id.try_into()?, |user| {
-                let token = if let Some(pat) = user
-                    .personal_access_tokens
-                    .iter()
-                    .find(|pat| pat.name.as_str() == name)
-                {
-                    pat.token.clone()
-                } else {
-                    error!(
-                        "Personal access token: {name} for user with ID: {user_id} does not exist.",
-                    );
-                    return Err(IggyError::ResourceNotFound(name.to_owned()));
-                };
+        // Check SharedMetadata for existence
+        {
+            let metadata = self.shared_metadata.load();
+            let user_meta = metadata
+                .users
+                .get(&user_id)
+                .ok_or_else(|| IggyError::ResourceNotFound(format!("user with ID {user_id}")))?;
+            if !user_meta.personal_access_tokens.contains_key(name) {
+                error!("Personal access token: {name} for user with ID: {user_id} does not exist.",);
+                return Err(IggyError::ResourceNotFound(name.to_owned()));
+            }
+        };
 
-                info!("Deleting personal access token: {name} for user with ID: {user_id}...");
-                user.personal_access_tokens.remove(&token);
-                Ok(())
-            })
-            .error(|e: &IggyError| {
-                format!(
-                    "{COMPONENT} delete PAT (error: {e}) - failed to access user with id: {user_id}"
-                )
-            })??;
+        info!("Deleting personal access token: {name} for user with ID: {user_id}...");
+
+        self.shared_metadata
+            .delete_personal_access_token(user_id, name)?;
+
         info!("Deleted personal access token: {name} for user with ID: {user_id}.");
         Ok(())
     }
@@ -179,26 +161,38 @@ impl IggyShard {
         session: Option<&Session>,
     ) -> Result<User, IggyError> {
         let token_hash = PersonalAccessToken::hash_token(token);
-        let users = self.users.values();
-        let mut personal_access_token = None;
-        for user in &users {
-            if let Some(pat) = user.personal_access_tokens.get(&token_hash) {
-                personal_access_token = Some(pat);
-                break;
+
+        // Search SharedMetadata for the token by matching token_hash field.
+        // PATs are keyed by name, so we must iterate through all values.
+        let metadata = self.shared_metadata.load();
+        let mut found_user_id = None;
+        let mut found_pat_meta = None;
+
+        'outer: for (user_id, user_meta) in metadata.users.iter() {
+            for pat_meta in user_meta.personal_access_tokens.values() {
+                if pat_meta.token_hash == token_hash {
+                    found_user_id = Some(*user_id);
+                    found_pat_meta = Some(pat_meta.clone());
+                    break 'outer;
+                }
             }
         }
 
-        if personal_access_token.is_none() {
-            let redacted_token = if token.len() > 4 {
-                format!("{}****", &token[..4])
-            } else {
-                "****".to_string()
-            };
-            error!("Personal access token: {redacted_token} does not exist.");
-            return Err(IggyError::ResourceNotFound(token.to_owned()));
-        }
+        let (user_id, pat_meta) = match (found_user_id, found_pat_meta) {
+            (Some(uid), Some(pat)) => (uid, pat),
+            _ => {
+                let redacted_token = if token.len() > 4 {
+                    format!("{}****", &token[..4])
+                } else {
+                    "****".to_string()
+                };
+                error!("Personal access token: {redacted_token} does not exist.");
+                return Err(IggyError::ResourceNotFound(token.to_owned()));
+            }
+        };
 
-        let personal_access_token = personal_access_token.unwrap();
+        // Check expiry
+        let personal_access_token = PersonalAccessToken::from_metadata(user_id, &pat_meta);
         if personal_access_token.is_expired(IggyTimestamp::now()) {
             error!(
                 "Personal access token: {} for user with ID: {} has expired.",

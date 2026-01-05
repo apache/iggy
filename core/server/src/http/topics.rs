@@ -19,12 +19,11 @@
 use crate::http::COMPONENT;
 use crate::http::error::CustomError;
 use crate::http::jwt::json_web_token::Identity;
+use crate::http::mapper;
 use crate::http::shared::AppState;
-use crate::slab::traits_ext::{EntityComponentSystem, EntityMarker, IntoComponents};
 use crate::state::command::EntryCommand;
 use crate::state::models::CreateTopicWithId;
 use crate::streaming::session::Session;
-use crate::streaming::{streams, topics};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::{delete, get};
@@ -92,17 +91,18 @@ async fn get_topic(
     let numeric_stream_id = state
         .shard
         .shard()
-        .streams
-        .with_stream_by_id(&identity_stream_id, streams::helpers::get_stream_id());
-    let numeric_topic_id = state.shard.shard().streams.with_topic_by_id(
-        &identity_stream_id,
-        &identity_topic_id,
-        topics::helpers::get_topic_id(),
-    );
+        .shared_metadata
+        .get_stream_id(&identity_stream_id)
+        .ok_or(CustomError::ResourceNotFound)?;
+    let numeric_topic_id = state
+        .shard
+        .shard()
+        .shared_metadata
+        .get_topic_id(numeric_stream_id, &identity_topic_id)
+        .ok_or(CustomError::ResourceNotFound)?;
 
     state.shard.shard()
         .permissioner
-        .borrow()
         .get_topic(session.get_user_id(), numeric_stream_id, numeric_topic_id)
         .error(|e: &IggyError| {
             format!(
@@ -111,11 +111,46 @@ async fn get_topic(
             )
         })?;
 
-    // Get topic details using the new API
-    let topic_details = state.shard.shard().streams.with_topic_by_id(
-        &identity_stream_id,
-        &identity_topic_id,
-        |(root, _, stats)| crate::http::mapper::map_topic_details(&root, &stats),
+    // Get topic from SharedMetadata
+    let snapshot = state.shard.shard().shared_metadata.load();
+    let stream_meta = snapshot
+        .streams
+        .get(&numeric_stream_id)
+        .ok_or(CustomError::ResourceNotFound)?;
+    let topic_meta = stream_meta
+        .get_topic(numeric_topic_id)
+        .ok_or(CustomError::ResourceNotFound)?;
+
+    // Get topic stats
+    let topic_stats = state
+        .shard
+        .shard()
+        .shared_stats
+        .get_topic_stats(numeric_stream_id, numeric_topic_id);
+
+    // Get partition stats
+    let partition_stats: Vec<_> = topic_meta
+        .partitions
+        .values()
+        .map(|p| {
+            let p_stats = state.shard.shard().shared_stats.get_partition_stats(
+                numeric_stream_id,
+                numeric_topic_id,
+                p.id,
+            );
+            (p, p_stats)
+        })
+        .collect();
+
+    let partition_refs: Vec<_> = partition_stats
+        .iter()
+        .map(|(p, s)| (*p, s.as_ref().map(|arc| arc.as_ref())))
+        .collect();
+
+    let topic_details = mapper::map_topic_details_from_metadata(
+        topic_meta,
+        topic_stats.as_ref().map(|arc| arc.as_ref()),
+        &partition_refs,
     );
 
     Ok(Json(topic_details))
@@ -137,12 +172,12 @@ async fn get_topics(
     let numeric_stream_id = state
         .shard
         .shard()
-        .streams
-        .with_stream_by_id(&stream_id, streams::helpers::get_stream_id());
+        .shared_metadata
+        .get_stream_id(&stream_id)
+        .ok_or(CustomError::ResourceNotFound)?;
 
     state.shard.shard()
         .permissioner
-        .borrow()
         .get_topics(session.get_user_id(), numeric_stream_id)
         .error(|e: &IggyError| {
             format!(
@@ -151,17 +186,32 @@ async fn get_topics(
             )
         })?;
 
-    // Get topics using the new API
-    let topics = state
-        .shard
-        .shard()
+    // Get topics from SharedMetadata
+    let snapshot = state.shard.shard().shared_metadata.load();
+    let stream_meta = snapshot
         .streams
-        .with_topics(&stream_id, |topics| {
-            topics.with_components(|topics| {
-                let (roots, _, stats) = topics.into_components();
-                crate::http::mapper::map_topics_from_components(&roots, &stats)
-            })
-        });
+        .get(&numeric_stream_id)
+        .ok_or(CustomError::ResourceNotFound)?;
+
+    let topics_with_stats: Vec<_> = stream_meta
+        .topics
+        .values()
+        .map(|t| {
+            let stats = state
+                .shard
+                .shard()
+                .shared_stats
+                .get_topic_stats(numeric_stream_id, t.id);
+            (t, stats)
+        })
+        .collect();
+
+    let topics_refs: Vec<_> = topics_with_stats
+        .iter()
+        .map(|(t, s)| (*t, s.as_ref().map(|arc| arc.as_ref())))
+        .collect();
+
+    let topics = mapper::map_topics_from_metadata(&topics_refs);
 
     Ok(Json(topics))
 }
@@ -197,59 +247,55 @@ async fn create_topic(
     })?;
 
     // Update command with actual values from created topic
-    command.message_expiry = topic.root().message_expiry();
-    command.max_topic_size = topic.root().max_topic_size();
+    command.message_expiry = topic.message_expiry;
+    command.max_topic_size = topic.max_topic_size;
 
-    let topic_id = topic.id();
+    let topic_id = topic.id;
 
-    // Send events for topic creation
-    let broadcast_future = SendWrapper::new(async {
-        use crate::shard::transmission::event::ShardEvent;
-
+    // Create partitions
+    {
         let shard = state.shard.shard();
-
-        let event = ShardEvent::CreatedTopic {
-            stream_id: command.stream_id.clone(),
-            topic,
-        };
-        let _responses = shard.broadcast_event_to_all_shards(event).await;
-
-        // Create partitions
-        let partitions = shard
-            .create_partitions(
-                &session,
-                &command.stream_id,
-                &Identifier::numeric(topic_id as u32).unwrap(),
-                command.partitions_count,
-            )
-            .await?;
-
-        let event = ShardEvent::CreatedPartitions {
-            stream_id: command.stream_id.clone(),
-            topic_id: Identifier::numeric(topic_id as u32).unwrap(),
-            partitions,
-        };
-        let _responses = shard.broadcast_event_to_all_shards(event).await;
-
-        Ok::<(), CustomError>(())
-    });
-
-    broadcast_future.await.error(|e: &CustomError| {
-        format!(
-            "{COMPONENT} (error: {e}) - failed to broadcast topic events, stream ID: {stream_id}"
-        )
-    })?;
-
-    // Create response using the same approach as binary handler
-    let response = {
         let topic_identifier = Identifier::numeric(topic_id as u32).unwrap();
-        let topic_response = state.shard.shard().streams.with_topic_by_id(
+        let future = SendWrapper::new(shard.create_partitions(
+            &session,
             &command.stream_id,
             &topic_identifier,
-            |(root, _, stats)| crate::http::mapper::map_topic_details(&root, &stats),
-        );
-        Json(topic_response)
-    };
+            command.partitions_count,
+        ));
+        future.await
+    }
+    .error(|e: &IggyError| {
+        format!("{COMPONENT} (error: {e}) - failed to create partitions, stream ID: {stream_id}")
+    })?;
+
+    // Get numeric stream ID
+    let numeric_stream_id = state
+        .shard
+        .shard()
+        .shared_metadata
+        .get_stream_id(&command.stream_id)
+        .ok_or(CustomError::ResourceNotFound)?;
+
+    // Get topic from SharedMetadata for response
+    let snapshot = state.shard.shard().shared_metadata.load();
+    let stream_meta = snapshot
+        .streams
+        .get(&numeric_stream_id)
+        .ok_or(CustomError::ResourceNotFound)?;
+    let topic_meta = stream_meta
+        .get_topic(topic_id)
+        .ok_or(CustomError::ResourceNotFound)?;
+
+    // Get partition stats for the response
+    let partition_stats: Vec<_> = topic_meta
+        .partitions
+        .values()
+        .map(|p| (p, None::<&crate::streaming::stats::PartitionStats>))
+        .collect();
+
+    let topic_response =
+        mapper::map_topic_details_from_metadata(topic_meta, None, &partition_stats);
+    drop(snapshot);
 
     // Apply state change like in binary handler
     {
@@ -270,7 +316,7 @@ async fn create_topic(
         format!("{COMPONENT} (error: {e}) - failed to apply create topic, stream ID: {stream_id}",)
     })?;
 
-    Ok(response)
+    Ok(Json(topic_response))
 }
 
 #[debug_handler]
@@ -303,44 +349,38 @@ async fn update_topic(
         )
     })?;
 
-    // TODO: Tech debt.
-    let topic_id = if name_changed {
-        Identifier::named(&command.name.clone()).unwrap()
+    let lookup_topic_id = if name_changed {
+        Identifier::named(&command.name).unwrap()
     } else {
         command.topic_id.clone()
     };
 
-    // Get the updated values from the topic
-    let (message_expiry, max_topic_size) = state.shard.shard().streams.with_topic_by_id(
-        &command.stream_id,
-        &topic_id,
-        |(root, _, _)| (root.message_expiry(), root.max_topic_size()),
-    );
+    // Get the updated values from SharedMetadata
+    let numeric_stream_id = state
+        .shard
+        .shard()
+        .shared_metadata
+        .get_stream_id(&command.stream_id)
+        .ok_or(CustomError::ResourceNotFound)?;
+    let numeric_topic_id = state
+        .shard
+        .shard()
+        .shared_metadata
+        .get_topic_id(numeric_stream_id, &lookup_topic_id)
+        .ok_or(CustomError::ResourceNotFound)?;
 
-    // Send event for topic update
-    {
-        let broadcast_future = SendWrapper::new(async {
-            use crate::shard::transmission::event::ShardEvent;
-            let event = ShardEvent::UpdatedTopic {
-                stream_id: command.stream_id.clone(),
-                topic_id: command.topic_id.clone(),
-                name: command.name.clone(),
-                message_expiry: command.message_expiry,
-                compression_algorithm: command.compression_algorithm,
-                max_topic_size: command.max_topic_size,
-                replication_factor: command.replication_factor,
-            };
-            let _responses = state
-                .shard
-                .shard()
-                .broadcast_event_to_all_shards(event)
-                .await;
-        });
-        broadcast_future.await;
-    }
+    let snapshot = state.shard.shard().shared_metadata.load();
+    let stream_meta = snapshot
+        .streams
+        .get(&numeric_stream_id)
+        .ok_or(CustomError::ResourceNotFound)?;
+    let topic_meta = stream_meta
+        .get_topic(numeric_topic_id)
+        .ok_or(CustomError::ResourceNotFound)?;
 
-    command.message_expiry = message_expiry;
-    command.max_topic_size = max_topic_size;
+    command.message_expiry = topic_meta.message_expiry;
+    command.max_topic_size = topic_meta.max_topic_size;
+    drop(snapshot);
 
     {
         let entry_command = EntryCommand::UpdateTopic(command);
@@ -369,7 +409,7 @@ async fn delete_topic(
     let session = Session::stateless(identity.user_id, identity.ip_address);
     let _topic_guard = state.shard.shard().fs_locks.topic_lock.lock().await;
 
-    let topic = {
+    {
         let future = SendWrapper::new(state.shard.shard().delete_topic(
             &session,
             &identifier_stream_id,
@@ -381,26 +421,6 @@ async fn delete_topic(
             "{COMPONENT} (error: {e}) - failed to delete topic with ID: {topic_id} in stream with ID: {stream_id}",
         )
     })?;
-
-    let topic_id_numeric = topic.root().id();
-
-    // Send event for topic deletion
-    {
-        let broadcast_future = SendWrapper::new(async {
-            use crate::shard::transmission::event::ShardEvent;
-            let event = ShardEvent::DeletedTopic {
-                id: topic_id_numeric,
-                stream_id: identifier_stream_id.clone(),
-                topic_id: identifier_topic_id.clone(),
-            };
-            let _responses = state
-                .shard
-                .shard()
-                .broadcast_event_to_all_shards(event)
-                .await;
-        });
-        broadcast_future.await;
-    }
 
     {
         let entry_command = EntryCommand::DeleteTopic(DeleteTopic {
@@ -446,23 +466,6 @@ async fn purge_topic(
             "{COMPONENT} (error: {e}) - failed to purge topic, stream ID: {stream_id}, topic ID: {topic_id}"
         )
     })?;
-
-    // Send event for topic purge
-    {
-        let broadcast_future = SendWrapper::new(async {
-            use crate::shard::transmission::event::ShardEvent;
-            let event = ShardEvent::PurgedTopic {
-                stream_id: identifier_stream_id.clone(),
-                topic_id: identifier_topic_id.clone(),
-            };
-            let _responses = state
-                .shard
-                .shard()
-                .broadcast_event_to_all_shards(event)
-                .await;
-        });
-        broadcast_future.await;
-    }
 
     {
         let entry_command = EntryCommand::PurgeTopic(PurgeTopic {

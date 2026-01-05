@@ -75,7 +75,6 @@ impl IggyShard {
     ) -> Result<Option<Client>, IggyError> {
         self.ensure_authenticated(session)?;
         self.permissioner
-        .borrow()
             .get_client(session.get_user_id())
             .error(|e: &IggyError| {
                 format!(
@@ -90,7 +89,6 @@ impl IggyShard {
     pub fn get_clients(&self, session: &Session) -> Result<Vec<Client>, IggyError> {
         self.ensure_authenticated(session)?;
         self.permissioner
-            .borrow()
             .get_clients(session.get_user_id())
             .error(|e: &IggyError| {
                 format!(

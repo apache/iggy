@@ -23,7 +23,6 @@ use crate::binary::handlers::streams::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
 use crate::shard::IggyShard;
-use crate::slab::traits_ext::{EntityComponentSystem, IntoComponents};
 use crate::streaming::session::Session;
 use anyhow::Result;
 use err_trail::ErrContext;
@@ -49,7 +48,6 @@ impl ServerCommandHandler for GetStreams {
         shard.ensure_authenticated(session)?;
         shard
             .permissioner
-            .borrow()
             .get_streams(session.get_user_id())
             .error(|e: &IggyError| {
                 format!(
@@ -58,10 +56,9 @@ impl ServerCommandHandler for GetStreams {
                 )
             })?;
 
-        let response = shard.streams.with_components(|stream_ref| {
-            let (roots, stats) = stream_ref.into_components();
-            mapper::map_streams(&roots, &stats)
-        });
+        // Read from SharedMetadata for cross-shard consistency
+        let streams = shard.shared_metadata.get_streams();
+        let response = mapper::map_streams_from_metadata(&streams);
         sender.send_ok_response(&response).await?;
         Ok(HandlerResult::Finished)
     }

@@ -21,7 +21,6 @@ use crate::http::error::CustomError;
 use crate::http::jwt::json_web_token::Identity;
 use crate::http::mapper;
 use crate::http::shared::AppState;
-use crate::slab::traits_ext::{EntityComponentSystem, EntityMarker, IntoComponents};
 use crate::state::command::EntryCommand;
 use crate::state::models::CreateConsumerGroupWithId;
 use crate::streaming::polling_consumer::ConsumerGroupId;
@@ -80,31 +79,39 @@ async fn get_consumer_group(
         return Err(CustomError::ResourceNotFound);
     }
 
-    let numeric_topic_id = state.shard.shard().streams.with_topic_by_id(
-        &identifier_stream_id,
-        &identifier_topic_id,
-        crate::streaming::topics::helpers::get_topic_id(),
-    );
-    let numeric_stream_id = state.shard.shard().streams.with_stream_by_id(
-        &identifier_stream_id,
-        crate::streaming::streams::helpers::get_stream_id(),
-    );
-
-    state
+    let numeric_stream_id = state
         .shard
         .shard()
-        .permissioner
-        .borrow()
-        .get_consumer_group(session.get_user_id(), numeric_stream_id, numeric_topic_id)?;
+        .shared_metadata
+        .get_stream_id(&identifier_stream_id)
+        .ok_or(CustomError::ResourceNotFound)?;
+    let numeric_topic_id = state
+        .shard
+        .shard()
+        .shared_metadata
+        .get_topic_id(numeric_stream_id, &identifier_topic_id)
+        .ok_or(CustomError::ResourceNotFound)?;
 
-    let consumer_group = state.shard.shard().streams.with_consumer_group_by_id(
-        &identifier_stream_id,
-        &identifier_topic_id,
-        &identifier_group_id,
-        |(root, members)| mapper::map_consumer_group(root, members),
-    );
+    state.shard.shard().permissioner.get_consumer_group(
+        session.get_user_id(),
+        numeric_stream_id,
+        numeric_topic_id,
+    )?;
 
-    Ok(Json(consumer_group))
+    // Get consumer group from SharedMetadata
+    let consumer_group = state
+        .shard
+        .shard()
+        .shared_metadata
+        .get_consumer_group(
+            &identifier_stream_id,
+            &identifier_topic_id,
+            &identifier_group_id,
+        )
+        .ok_or(CustomError::ResourceNotFound)?;
+
+    let details = mapper::map_consumer_group_details_from_metadata(&consumer_group);
+    Ok(Json(details))
 }
 
 async fn get_consumer_groups(
@@ -124,34 +131,39 @@ async fn get_consumer_groups(
         .shard()
         .ensure_topic_exists(&identifier_stream_id, &identifier_topic_id)?;
 
-    let numeric_topic_id = state.shard.shard().streams.with_topic_by_id(
-        &identifier_stream_id,
-        &identifier_topic_id,
-        crate::streaming::topics::helpers::get_topic_id(),
-    );
-    let numeric_stream_id = state.shard.shard().streams.with_stream_by_id(
-        &identifier_stream_id,
-        crate::streaming::streams::helpers::get_stream_id(),
-    );
-
-    state
+    let numeric_stream_id = state
         .shard
         .shard()
-        .permissioner
-        .borrow()
-        .get_consumer_groups(session.get_user_id(), numeric_stream_id, numeric_topic_id)?;
+        .shared_metadata
+        .get_stream_id(&identifier_stream_id)
+        .ok_or(CustomError::ResourceNotFound)?;
+    let numeric_topic_id = state
+        .shard
+        .shard()
+        .shared_metadata
+        .get_topic_id(numeric_stream_id, &identifier_topic_id)
+        .ok_or(CustomError::ResourceNotFound)?;
 
-    let consumer_groups = state.shard.shard().streams.with_consumer_groups(
-        &identifier_stream_id,
-        &identifier_topic_id,
-        |cgs| {
-            cgs.with_components(|cgs| {
-                let (roots, members) = cgs.into_components();
-                mapper::map_consumer_groups(roots, members)
-            })
-        },
-    );
+    state.shard.shard().permissioner.get_consumer_groups(
+        session.get_user_id(),
+        numeric_stream_id,
+        numeric_topic_id,
+    )?;
 
+    // Get consumer groups from SharedMetadata
+    let snapshot = state.shard.shard().shared_metadata.load();
+    let stream_meta = snapshot
+        .streams
+        .get(&numeric_stream_id)
+        .ok_or(CustomError::ResourceNotFound)?;
+    let topic_meta = stream_meta
+        .get_topic(numeric_topic_id)
+        .ok_or(CustomError::ResourceNotFound)?;
+
+    let groups: Vec<_> = topic_meta.consumer_groups.values().cloned().collect();
+    drop(snapshot);
+
+    let consumer_groups = mapper::map_consumer_groups_from_metadata(&groups);
     Ok(Json(consumer_groups))
 }
 
@@ -178,34 +190,10 @@ async fn create_consumer_group(
     )
     .error(|e: &IggyError| format!("{COMPONENT} (error: {e}) - failed to create consumer group, stream ID: {}, topic ID: {}, name: {}", stream_id, topic_id, command.name))?;
 
-    let group_id = consumer_group.id();
+    let group_id = consumer_group.id;
 
-    // Send event for consumer group creation
-    {
-        let broadcast_future = SendWrapper::new(async {
-            use crate::shard::transmission::event::ShardEvent;
-            let event = ShardEvent::CreatedConsumerGroup {
-                stream_id: command.stream_id.clone(),
-                topic_id: command.topic_id.clone(),
-                cg: consumer_group.clone(),
-            };
-            let _responses = state
-                .shard
-                .shard()
-                .broadcast_event_to_all_shards(event)
-                .await;
-        });
-        broadcast_future.await;
-    }
-
-    // Get the created consumer group details
-    let group_id_identifier = Identifier::numeric(group_id as u32).unwrap();
-    let consumer_group_details = state.shard.shard().streams.with_consumer_group_by_id(
-        &command.stream_id,
-        &command.topic_id,
-        &group_id_identifier,
-        |(root, members)| mapper::map_consumer_group(root, members),
-    );
+    // Map the created consumer group
+    let consumer_group_details = mapper::map_consumer_group_details_from_metadata(&consumer_group);
 
     // Apply state change
     let entry_command = EntryCommand::CreateConsumerGroup(CreateConsumerGroupWithId {
@@ -239,8 +227,48 @@ async fn delete_consumer_group(
     let result = SendWrapper::new(async move {
         let session = Session::stateless(identity.user_id, identity.ip_address);
 
+        // Get stream and topic IDs
+        let stream_id_usize = state
+            .shard
+            .shard()
+            .shared_metadata
+            .get_stream_id(&identifier_stream_id)
+            .ok_or_else(|| IggyError::StreamIdNotFound(identifier_stream_id.clone()))?;
+        let topic_id_usize = state
+            .shard
+            .shard()
+            .shared_metadata
+            .get_topic_id(stream_id_usize, &identifier_topic_id)
+            .ok_or_else(|| {
+                IggyError::TopicIdNotFound(
+                    identifier_topic_id.clone(),
+                    identifier_stream_id.clone(),
+                )
+            })?;
+
+        // Get consumer group metadata before deletion for cleanup
+        let consumer_group = state
+            .shard
+            .shard()
+            .shared_metadata
+            .get_consumer_group(
+                &identifier_stream_id,
+                &identifier_topic_id,
+                &identifier_group_id,
+            )
+            .ok_or_else(|| {
+                IggyError::ConsumerGroupIdNotFound(
+                    identifier_group_id.clone(),
+                    identifier_topic_id.clone(),
+                )
+            })?;
+
+        let cg_id = consumer_group.id;
+        let partition_ids: Vec<usize> = consumer_group.partitions.clone();
+        let member_client_ids: Vec<u32> = consumer_group.members.keys().copied().collect();
+
         // Delete using the new API
-        let consumer_group = state.shard.shard().delete_consumer_group(
+        state.shard.shard().delete_consumer_group(
             &session,
             &identifier_stream_id,
             &identifier_topic_id,
@@ -248,45 +276,29 @@ async fn delete_consumer_group(
         )
         .error(|e: &IggyError| format!("{COMPONENT} (error: {e}) - failed to delete consumer group with ID: {group_id} for topic with ID: {topic_id} in stream with ID: {stream_id}"))?;
 
-        let cg_id = consumer_group.id();
-
         // Remove all consumer group members from ClientManager
-        let stream_id_usize = state.shard.shard().streams.with_stream_by_id(
-            &identifier_stream_id,
-            crate::streaming::streams::helpers::get_stream_id(),
-        );
-        let topic_id_usize = state.shard.shard().streams.with_topic_by_id(
-            &identifier_stream_id,
-            &identifier_topic_id,
-            crate::streaming::topics::helpers::get_topic_id(),
-        );
-
-        // TODO: Tech debt, repeated code from `delete_consumer_group_handler.rs`
-        // Get members from the deleted consumer group and make them leave
-        let slab = consumer_group.members().inner().shared_get();
-        for (_, member) in slab.iter() {
+        for client_id in member_client_ids {
             if let Err(err) = state.shard.shard().client_manager.leave_consumer_group(
-                member.client_id,
+                client_id,
                 stream_id_usize,
                 topic_id_usize,
                 cg_id,
             ) {
                 tracing::warn!(
                     "{COMPONENT} (error: {err}) - failed to make client leave consumer group for client ID: {}, group ID: {}",
-                    member.client_id,
+                    client_id,
                     cg_id
                 );
             }
         }
 
         let cg_id_spez = ConsumerGroupId(cg_id);
-        // Clean up consumer group offsets from all partitions using the specialized method
-        let partition_ids = consumer_group.partitions();
+        // Clean up consumer group offsets from all partitions
         state.shard.shard().delete_consumer_group_offsets(
             cg_id_spez,
             &identifier_stream_id,
             &identifier_topic_id,
-            partition_ids,
+            &partition_ids,
         ).await.error(|e: &IggyError| {
             format!(
                 "{COMPONENT} (error: {e}) - failed to delete consumer group offsets for group ID: {} in stream: {}, topic: {}",
@@ -295,25 +307,6 @@ async fn delete_consumer_group(
                 identifier_topic_id
             )
         })?;
-
-        // Send event for consumer group deletion
-        {
-            let broadcast_future = SendWrapper::new(async {
-                use crate::shard::transmission::event::ShardEvent;
-                let event = ShardEvent::DeletedConsumerGroup {
-                    id: cg_id,
-                    stream_id: identifier_stream_id.clone(),
-                    topic_id: identifier_topic_id.clone(),
-                    group_id: identifier_group_id.clone(),
-                };
-                let _responses = state
-                    .shard
-                    .shard()
-                    .broadcast_event_to_all_shards(event)
-                    .await;
-            });
-            broadcast_future.await;
-        }
 
         // Apply state change
         let entry_command = EntryCommand::DeleteConsumerGroup(DeleteConsumerGroup {

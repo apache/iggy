@@ -17,7 +17,7 @@
  */
 
 use crate::shard::IggyShard;
-use iggy_common::{Identifier, IggyError};
+use iggy_common::IggyError;
 use std::rc::Rc;
 use tracing::{error, info, trace};
 
@@ -50,29 +50,27 @@ async fn save_messages(shard: Rc<IggyShard>) -> Result<(), IggyError> {
     const REASON: &str = "background saver triggered";
 
     for ns in namespaces {
-        let stream_id = Identifier::numeric(ns.stream_id() as u32).unwrap();
-        let topic_id = Identifier::numeric(ns.topic_id() as u32).unwrap();
-        let partition_id = ns.partition_id();
+        // Check if partition exists in partition_store
+        if !shard.partition_store.borrow().contains(&ns) {
+            continue;
+        }
 
-        match shard
-            .streams
-            .persist_messages(
-                &stream_id,
-                &topic_id,
-                partition_id,
-                REASON,
-                &shard.config.system,
-            )
+        // Get partition and persist messages
+        let rc_partition = match shard.partition_store.borrow().get_rc(&ns) {
+            Some(rc) => rc,
+            None => continue,
+        };
+
+        match rc_partition
+            .borrow_mut()
+            .persist_messages(REASON, &shard.config.system)
             .await
         {
             Ok(batch_count) => {
                 total_saved_messages += batch_count;
             }
             Err(err) => {
-                error!(
-                    "Failed to save messages for partition {}: {}",
-                    partition_id, err
-                );
+                error!("Failed to save messages for partition {:?}: {}", ns, err);
             }
         }
     }
@@ -98,25 +96,25 @@ async fn fsync_all_segments_on_shutdown(shard: Rc<IggyShard>, result: Result<(),
     let namespaces = shard.get_current_shard_namespaces();
 
     for ns in namespaces {
-        let stream_id = Identifier::numeric(ns.stream_id() as u32).unwrap();
-        let topic_id = Identifier::numeric(ns.topic_id() as u32).unwrap();
-        let partition_id = ns.partition_id();
+        // Check if partition exists in partition_store
+        if !shard.partition_store.borrow().contains(&ns) {
+            continue;
+        }
 
-        match shard
-            .streams
-            .fsync_all_messages(&stream_id, &topic_id, partition_id)
-            .await
-        {
+        // Get partition and fsync
+        let rc_partition = match shard.partition_store.borrow().get_rc(&ns) {
+            Some(rc) => rc,
+            None => continue,
+        };
+
+        match rc_partition.borrow().fsync_all_messages().await {
             Ok(()) => {
-                trace!(
-                    "Successfully fsynced segment for stream: {}, topic: {}, partition: {} during shutdown",
-                    stream_id, topic_id, partition_id
-                );
+                trace!("Successfully fsynced segment for {:?} during shutdown", ns);
             }
             Err(err) => {
                 error!(
-                    "Failed to fsync segment for stream: {}, topic: {}, partition: {} during shutdown: {}",
-                    stream_id, topic_id, partition_id, err
+                    "Failed to fsync segment for {:?} during shutdown: {}",
+                    ns, err
                 );
             }
         }

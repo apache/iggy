@@ -16,22 +16,15 @@
  * under the License.
  */
 
-use std::sync::{Arc, atomic::AtomicU64};
+use std::sync::Arc;
 
-use crate::slab::Keyed;
-use crate::slab::traits_ext::{EntityComponentSystem, IntoComponents};
+use crate::metadata::{ConsumerGroupMeta, PartitionMeta, StreamMeta, TopicMeta, UserMeta};
 use crate::streaming::clients::client_manager::Client;
-use crate::streaming::partitions::partition::PartitionRoot;
 use crate::streaming::personal_access_tokens::personal_access_token::PersonalAccessToken;
 use crate::streaming::stats::{PartitionStats, StreamStats, TopicStats};
-use crate::streaming::streams::stream;
-use crate::streaming::topics::consumer_group::{ConsumerGroupMembers, ConsumerGroupRoot, Member};
-use crate::streaming::topics::topic::{self, TopicRoot};
 use crate::streaming::users::user::User;
-use arcshift::SharedGetGuard;
 use bytes::{BufMut, Bytes, BytesMut};
 use iggy_common::{BytesSerializable, ConsumerOffsetInfo, Stats, TransportProtocol, UserId};
-use slab::Slab;
 
 pub fn map_stats(stats: &Stats) -> Bytes {
     let mut bytes = BytesMut::with_capacity(104);
@@ -123,6 +116,30 @@ pub fn map_user(user: &User) -> Bytes {
     bytes.freeze()
 }
 
+/// Maps a user from SharedMetadata.
+pub fn map_user_from_metadata(user: &UserMeta) -> Bytes {
+    let mut bytes = BytesMut::new();
+    extend_user_from_metadata(user, &mut bytes);
+    if let Some(permissions) = &user.permissions {
+        bytes.put_u8(1);
+        let permissions = permissions.to_bytes();
+        #[allow(clippy::cast_possible_truncation)]
+        bytes.put_u32_le(permissions.len() as u32);
+        bytes.put_slice(&permissions);
+    } else {
+        bytes.put_u32_le(0);
+    }
+    bytes.freeze()
+}
+
+fn extend_user_from_metadata(user: &UserMeta, bytes: &mut BytesMut) {
+    bytes.put_u32_le(user.id);
+    bytes.put_u64_le(user.created_at.into());
+    bytes.put_u8(user.status.as_code());
+    bytes.put_u8(user.username.len() as u8);
+    bytes.put_slice(user.username.as_bytes());
+}
+
 pub fn map_users(users: Vec<User>) -> Bytes {
     let mut bytes = BytesMut::new();
     for user in users.iter() {
@@ -152,72 +169,200 @@ pub fn map_personal_access_tokens(personal_access_tokens: Vec<PersonalAccessToke
     bytes.freeze()
 }
 
-pub fn map_streams(roots: &Slab<stream::StreamRoot>, stats: &Slab<Arc<StreamStats>>) -> Bytes {
+/// Maps streams from SharedMetadata. Stats are zeros since they're not stored in metadata.
+pub fn map_streams_from_metadata(streams: &[StreamMeta]) -> Bytes {
     let mut bytes = BytesMut::new();
-    for (root, stat) in roots
-        .iter()
-        .map(|(_, val)| val)
-        .zip(stats.iter().map(|(_, val)| val))
-    {
-        extend_stream(root, stat, &mut bytes);
+    for stream in streams {
+        extend_stream_from_metadata(stream, &mut bytes);
     }
     bytes.freeze()
 }
 
-pub fn map_stream(root: &stream::StreamRoot, stats: &StreamStats) -> Bytes {
-    let mut bytes = BytesMut::new();
-    extend_stream(root, stats, &mut bytes);
-    root.topics().with_components(|topics| {
-        let (roots, _, stats, ..) = topics.into_components();
-        for (root, stat) in roots
-            .iter()
-            .map(|(_, val)| val)
-            .zip(stats.iter().map(|(_, val)| val))
-        {
-            extend_topic(root, stat, &mut bytes);
-        }
-    });
-    bytes.freeze()
+fn extend_stream_from_metadata(stream: &StreamMeta, bytes: &mut BytesMut) {
+    bytes.put_u32_le(stream.id as u32);
+    bytes.put_u64_le(stream.created_at.into());
+    bytes.put_u32_le(stream.topics_count() as u32);
+    // Stats are zero since we don't store them in SharedMetadata
+    bytes.put_u64_le(0); // size_bytes
+    bytes.put_u64_le(0); // messages_count
+    bytes.put_u8(stream.name.len() as u8);
+    bytes.put_slice(stream.name.as_bytes());
 }
 
-pub fn map_topics(roots: &Slab<TopicRoot>, stats: &Slab<Arc<TopicStats>>) -> Bytes {
+/// Maps a single stream with topics from SharedMetadata. Stats are zeros.
+pub fn map_stream_from_metadata(stream: &StreamMeta) -> Bytes {
     let mut bytes = BytesMut::new();
-    for (root, stat) in roots
-        .iter()
-        .map(|(_, val)| val)
-        .zip(stats.iter().map(|(_, val)| val))
-    {
-        extend_topic(root, stat, &mut bytes);
+    extend_stream_from_metadata(stream, &mut bytes);
+    // Include topics
+    for topic in stream.topics.values() {
+        extend_topic_from_metadata(topic, &mut bytes);
     }
     bytes.freeze()
 }
 
-pub fn map_topic(root: &topic::TopicRoot, stats: &TopicStats) -> Bytes {
+/// Maps a single stream with topics from SharedMetadata with stats from SharedStatsStore.
+pub fn map_stream_from_metadata_with_stats<F>(
+    stream: &StreamMeta,
+    stream_stats: Option<&StreamStats>,
+    mut get_topic_stats: F,
+) -> Bytes
+where
+    F: FnMut(usize) -> Option<Arc<TopicStats>>,
+{
     let mut bytes = BytesMut::new();
-    extend_topic(root, stats, &mut bytes);
-    root.partitions().with_components(|partitions| {
-        let (roots, stats, _, offsets, _, _, _) = partitions.into_components();
-        for (root, stat, offset) in roots
-            .iter()
-            .map(|(_, val)| val)
-            .zip(stats.iter().map(|(_, val)| val))
-            .zip(offsets.iter().map(|(_, val)| val))
-            .map(|((root, stat), offset)| (root, stat, offset))
-        {
-            extend_partition(root, stat, offset, &mut bytes);
-        }
-    });
 
+    // Extend stream header with stats
+    bytes.put_u32_le(stream.id as u32);
+    bytes.put_u64_le(stream.created_at.into());
+    bytes.put_u32_le(stream.topics_count() as u32);
+    if let Some(stats) = stream_stats {
+        bytes.put_u64_le(stats.size_bytes_inconsistent());
+        bytes.put_u64_le(stats.messages_count_inconsistent());
+    } else {
+        bytes.put_u64_le(0);
+        bytes.put_u64_le(0);
+    }
+    bytes.put_u8(stream.name.len() as u8);
+    bytes.put_slice(stream.name.as_bytes());
+
+    // Include topics with stats
+    for topic in stream.topics.values() {
+        let topic_stats = get_topic_stats(topic.id);
+        extend_topic_from_metadata_with_stats(topic, topic_stats.as_deref(), &mut bytes);
+    }
     bytes.freeze()
 }
 
-pub fn map_consumer_group(root: &ConsumerGroupRoot, members: &ConsumerGroupMembers) -> Bytes {
-    let mut bytes = BytesMut::new();
-    let members = members.inner().shared_get();
-    extend_consumer_group(root, &members, &mut bytes);
+fn extend_topic_from_metadata_with_stats(
+    topic: &TopicMeta,
+    stats: Option<&TopicStats>,
+    bytes: &mut BytesMut,
+) {
+    bytes.put_u32_le(topic.id as u32);
+    bytes.put_u64_le(topic.created_at.into());
+    bytes.put_u32_le(topic.partitions_count());
+    bytes.put_u64_le(topic.message_expiry.into());
+    bytes.put_u8(topic.compression_algorithm.as_code());
+    bytes.put_u64_le(topic.max_topic_size.into());
+    bytes.put_u8(topic.replication_factor);
+    if let Some(s) = stats {
+        bytes.put_u64_le(s.size_bytes_inconsistent());
+        bytes.put_u64_le(s.messages_count_inconsistent());
+    } else {
+        bytes.put_u64_le(0);
+        bytes.put_u64_le(0);
+    }
+    bytes.put_u8(topic.name.len() as u8);
+    bytes.put_slice(topic.name.as_bytes());
+}
 
-    for (_, member) in members.iter() {
-        bytes.put_u32_le(member.id as u32);
+fn extend_topic_from_metadata(topic: &TopicMeta, bytes: &mut BytesMut) {
+    bytes.put_u32_le(topic.id as u32);
+    bytes.put_u64_le(topic.created_at.into());
+    bytes.put_u32_le(topic.partitions_count());
+    bytes.put_u64_le(topic.message_expiry.into());
+    bytes.put_u8(topic.compression_algorithm.as_code());
+    bytes.put_u64_le(topic.max_topic_size.into());
+    bytes.put_u8(topic.replication_factor);
+    // Stats are zero since we don't store them in SharedMetadata
+    bytes.put_u64_le(0); // size_bytes
+    bytes.put_u64_le(0); // messages_count
+    bytes.put_u8(topic.name.len() as u8);
+    bytes.put_slice(topic.name.as_bytes());
+}
+
+pub fn map_topic_from_metadata(topic: &TopicMeta) -> Bytes {
+    let mut bytes = BytesMut::new();
+    extend_topic_from_metadata(topic, &mut bytes);
+    // Include partitions (all with zero stats)
+    for partition in topic.partitions.values() {
+        extend_partition_from_metadata(partition, &mut bytes);
+    }
+    bytes.freeze()
+}
+
+/// Maps a topic from metadata with stats from SharedStatsStore.
+pub fn map_topic_from_metadata_with_stats<F>(
+    topic: &TopicMeta,
+    topic_stats: Option<&TopicStats>,
+    mut get_partition_stats: F,
+) -> Bytes
+where
+    F: FnMut(usize) -> Option<Arc<PartitionStats>>,
+{
+    let mut bytes = BytesMut::new();
+
+    // Extend topic header with stats
+    bytes.put_u32_le(topic.id as u32);
+    bytes.put_u64_le(topic.created_at.into());
+    bytes.put_u32_le(topic.partitions_count());
+    bytes.put_u64_le(topic.message_expiry.into());
+    bytes.put_u8(topic.compression_algorithm.as_code());
+    bytes.put_u64_le(topic.max_topic_size.into());
+    bytes.put_u8(topic.replication_factor);
+    if let Some(stats) = topic_stats {
+        bytes.put_u64_le(stats.size_bytes_inconsistent());
+        bytes.put_u64_le(stats.messages_count_inconsistent());
+    } else {
+        bytes.put_u64_le(0);
+        bytes.put_u64_le(0);
+    }
+    bytes.put_u8(topic.name.len() as u8);
+    bytes.put_slice(topic.name.as_bytes());
+
+    // Include partitions with stats
+    for partition in topic.partitions.values() {
+        let partition_stats = get_partition_stats(partition.id);
+        extend_partition_from_metadata_with_stats(
+            partition,
+            partition_stats.as_deref(),
+            &mut bytes,
+        );
+    }
+    bytes.freeze()
+}
+
+fn extend_partition_from_metadata(partition: &PartitionMeta, bytes: &mut BytesMut) {
+    bytes.put_u32_le(partition.id as u32);
+    bytes.put_u64_le(partition.created_at.into());
+    bytes.put_u32_le(0); // segments_count (not stored in metadata)
+    bytes.put_u64_le(partition.offset.load(std::sync::atomic::Ordering::Relaxed)); // current_offset
+    // Stats are zero since we don't store them in SharedMetadata
+    bytes.put_u64_le(0); // size_bytes
+    bytes.put_u64_le(0); // messages_count
+}
+
+fn extend_partition_from_metadata_with_stats(
+    partition: &PartitionMeta,
+    stats: Option<&PartitionStats>,
+    bytes: &mut BytesMut,
+) {
+    bytes.put_u32_le(partition.id as u32);
+    bytes.put_u64_le(partition.created_at.into());
+    if let Some(s) = stats {
+        bytes.put_u32_le(s.segments_count_inconsistent());
+        bytes.put_u64_le(partition.offset.load(std::sync::atomic::Ordering::Relaxed));
+        bytes.put_u64_le(s.size_bytes_inconsistent());
+        bytes.put_u64_le(s.messages_count_inconsistent());
+    } else {
+        bytes.put_u32_le(0);
+        bytes.put_u64_le(partition.offset.load(std::sync::atomic::Ordering::Relaxed));
+        bytes.put_u64_le(0);
+        bytes.put_u64_le(0);
+    }
+}
+
+/// Map a single consumer group from SharedMetadata to binary format.
+pub fn map_consumer_group_meta(cg: &ConsumerGroupMeta) -> Bytes {
+    let mut bytes = BytesMut::new();
+    bytes.put_u32_le(cg.id as u32);
+    bytes.put_u32_le(cg.partitions.len() as u32);
+    bytes.put_u32_le(cg.members.len() as u32);
+    bytes.put_u8(cg.name.len() as u8);
+    bytes.put_slice(cg.name.as_bytes());
+
+    for (_, member) in cg.members.iter() {
+        bytes.put_u32_le(member.client_id);
         bytes.put_u32_le(member.partitions.len() as u32);
         for partition in &member.partitions {
             bytes.put_u32_le(*partition as u32);
@@ -226,69 +371,64 @@ pub fn map_consumer_group(root: &ConsumerGroupRoot, members: &ConsumerGroupMembe
     bytes.freeze()
 }
 
-pub fn map_consumer_groups(
-    roots: &Slab<ConsumerGroupRoot>,
-    members: &Slab<ConsumerGroupMembers>,
-) -> Bytes {
+/// Map multiple consumer groups from SharedMetadata to binary format.
+pub fn map_consumer_groups_meta(groups: &[ConsumerGroupMeta]) -> Bytes {
     let mut bytes = BytesMut::new();
-    for (root, member) in roots
-        .iter()
-        .map(|(_, val)| val)
-        .zip(members.iter().map(|(_, val)| val.inner().shared_get()))
-    {
-        extend_consumer_group(root, &member, &mut bytes);
+    for cg in groups {
+        bytes.put_u32_le(cg.id as u32);
+        bytes.put_u32_le(cg.partitions.len() as u32);
+        bytes.put_u32_le(cg.members.len() as u32);
+        bytes.put_u8(cg.name.len() as u8);
+        bytes.put_slice(cg.name.as_bytes());
     }
     bytes.freeze()
 }
 
-fn extend_stream(root: &stream::StreamRoot, stats: &StreamStats, bytes: &mut BytesMut) {
-    bytes.put_u32_le(root.id() as u32);
-    bytes.put_u64_le(root.created_at().into());
-    bytes.put_u32_le(root.topics_count() as u32);
-    bytes.put_u64_le(stats.size_bytes_inconsistent());
-    bytes.put_u64_le(stats.messages_count_inconsistent());
-    bytes.put_u8(root.name().len() as u8);
-    bytes.put_slice(root.name().as_bytes());
+/// Map topics from SharedMetadata to binary format.
+pub fn map_topics_meta(topics: &[(&TopicMeta, &TopicStats)]) -> Bytes {
+    let mut bytes = BytesMut::new();
+    for (topic, stats) in topics {
+        extend_topic_meta(topic, stats, &mut bytes);
+    }
+    bytes.freeze()
 }
 
-fn extend_topic(root: &TopicRoot, stats: &TopicStats, bytes: &mut BytesMut) {
-    bytes.put_u32_le(root.id() as u32);
-    bytes.put_u64_le(root.created_at().into());
-    bytes.put_u32_le(root.partitions().len() as u32);
-    bytes.put_u64_le(root.message_expiry().into());
-    bytes.put_u8(root.compression_algorithm().as_code());
-    bytes.put_u64_le(root.max_topic_size().into());
-    bytes.put_u8(root.replication_factor());
-    bytes.put_u64_le(stats.size_bytes_inconsistent());
-    bytes.put_u64_le(stats.messages_count_inconsistent());
-    bytes.put_u8(root.name().len() as u8);
-    bytes.put_slice(root.name().as_bytes());
+/// Map a single topic from SharedMetadata to binary format (with partitions).
+pub fn map_topic_meta(
+    topic: &TopicMeta,
+    stats: &TopicStats,
+    partition_stats: &[(&PartitionMeta, &PartitionStats)],
+) -> Bytes {
+    let mut bytes = BytesMut::new();
+    extend_topic_meta(topic, stats, &mut bytes);
+
+    for (partition, partition_stat) in partition_stats {
+        extend_partition_meta(partition, partition_stat, &mut bytes);
+    }
+    bytes.freeze()
 }
 
-fn extend_partition(
-    root: &PartitionRoot,
-    stats: &PartitionStats,
-    offset: &Arc<AtomicU64>,
-    bytes: &mut BytesMut,
-) {
-    bytes.put_u32_le(root.id() as u32);
-    bytes.put_u64_le(root.created_at().into());
+fn extend_topic_meta(topic: &TopicMeta, stats: &TopicStats, bytes: &mut BytesMut) {
+    bytes.put_u32_le(topic.id as u32);
+    bytes.put_u64_le(topic.created_at.into());
+    bytes.put_u32_le(topic.partitions.len() as u32);
+    bytes.put_u64_le(topic.message_expiry.into());
+    bytes.put_u8(topic.compression_algorithm.as_code());
+    bytes.put_u64_le(topic.max_topic_size.into());
+    bytes.put_u8(topic.replication_factor);
+    bytes.put_u64_le(stats.size_bytes_inconsistent());
+    bytes.put_u64_le(stats.messages_count_inconsistent());
+    bytes.put_u8(topic.name.len() as u8);
+    bytes.put_slice(topic.name.as_bytes());
+}
+
+fn extend_partition_meta(partition: &PartitionMeta, stats: &PartitionStats, bytes: &mut BytesMut) {
+    bytes.put_u32_le(partition.id as u32);
+    bytes.put_u64_le(partition.created_at.into());
     bytes.put_u32_le(stats.segments_count_inconsistent());
-    bytes.put_u64_le(offset.load(std::sync::atomic::Ordering::Relaxed));
+    bytes.put_u64_le(stats.current_offset());
     bytes.put_u64_le(stats.size_bytes_inconsistent());
     bytes.put_u64_le(stats.messages_count_inconsistent());
-}
-
-fn extend_consumer_group(
-    root: &ConsumerGroupRoot,
-    members: &SharedGetGuard<'_, Slab<Member>>,
-    bytes: &mut BytesMut,
-) {
-    bytes.put_u32_le(root.id() as u32);
-    bytes.put_u32_le(root.partitions().len() as u32);
-    bytes.put_u32_le(members.len() as u32);
-    bytes.put_u8(root.key().len() as u8);
-    bytes.put_slice(root.key().as_bytes());
 }
 
 fn extend_client(client: &Client, bytes: &mut BytesMut) {

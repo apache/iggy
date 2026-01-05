@@ -22,9 +22,7 @@ use crate::binary::command::{
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
 use crate::shard::IggyShard;
-use crate::slab::traits_ext::EntityComponentSystem;
 use crate::streaming::session::Session;
-use crate::streaming::streams;
 use anyhow::Result;
 use err_trail::ErrContext;
 use iggy_common::IggyError;
@@ -47,17 +45,19 @@ impl ServerCommandHandler for GetStream {
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
         shard.ensure_authenticated(session)?;
-        let exists = shard.ensure_stream_exists(&self.stream_id).is_ok();
-        if !exists {
-            sender.send_empty_ok_response().await?;
-            return Ok(HandlerResult::Finished);
-        }
-        let stream_id = shard
-            .streams
-            .with_stream_by_id(&self.stream_id, streams::helpers::get_stream_id());
+
+        // Read from SharedMetadata for cross-shard consistency
+        let metadata = shard.shared_metadata.load();
+        let stream_id = match metadata.get_stream_id(&self.stream_id) {
+            Some(id) => id,
+            None => {
+                sender.send_empty_ok_response().await?;
+                return Ok(HandlerResult::Finished);
+            }
+        };
+
         let has_permission = shard
             .permissioner
-            .borrow()
             .get_stream(session.get_user_id(), stream_id)
             .error(|e: &IggyError| {
                 format!(
@@ -71,9 +71,20 @@ impl ServerCommandHandler for GetStream {
             sender.send_empty_ok_response().await?;
             return Ok(HandlerResult::Finished);
         }
-        let response = shard
+
+        let stream_meta = metadata
             .streams
-            .with_components_by_id(stream_id, |(root, stats)| mapper::map_stream(&root, &stats));
+            .get(&stream_id)
+            .ok_or_else(|| IggyError::StreamIdNotFound(self.stream_id.clone()))?;
+
+        // Get stats from SharedStatsStore
+        let stream_stats = shard.shared_stats.get_stream_stats(stream_id);
+
+        let response = mapper::map_stream_from_metadata_with_stats(
+            stream_meta,
+            stream_stats.as_deref(),
+            |topic_id| shard.shared_stats.get_topic_stats(stream_id, topic_id),
+        );
         sender.send_ok_response(&response).await?;
         Ok(HandlerResult::Finished)
     }

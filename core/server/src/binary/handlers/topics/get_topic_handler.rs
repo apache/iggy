@@ -23,7 +23,6 @@ use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
 use crate::shard::IggyShard;
 use crate::streaming::session::Session;
-use crate::streaming::streams;
 use anyhow::Result;
 use iggy_common::IggyError;
 use iggy_common::SenderKind;
@@ -45,41 +44,69 @@ impl ServerCommandHandler for GetTopic {
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
         shard.ensure_authenticated(session)?;
-        let exists = shard
-            .ensure_topic_exists(&self.stream_id, &self.topic_id)
-            .is_ok();
-        if !exists {
-            sender.send_empty_ok_response().await?;
-            return Ok(HandlerResult::Finished);
-        }
 
-        let numeric_stream_id = shard
-            .streams
-            .with_stream_by_id(&self.stream_id, streams::helpers::get_stream_id());
+        // Get numeric stream ID from SharedMetadata
+        let numeric_stream_id = match shard.shared_metadata.get_stream_id(&self.stream_id) {
+            Some(id) => id,
+            None => {
+                sender.send_empty_ok_response().await?;
+                return Ok(HandlerResult::Finished);
+            }
+        };
+
+        // Get numeric topic ID from SharedMetadata
+        let numeric_topic_id = match shard
+            .shared_metadata
+            .get_topic_id(numeric_stream_id, &self.topic_id)
+        {
+            Some(id) => id,
+            None => {
+                sender.send_empty_ok_response().await?;
+                return Ok(HandlerResult::Finished);
+            }
+        };
+
         let has_permission = shard
             .permissioner
-            .borrow()
-            .get_topic(
-                session.get_user_id(),
-                numeric_stream_id,
-                self.topic_id
-                    .get_u32_value()
-                    .unwrap_or(0)
-                    .try_into()
-                    .unwrap(),
-            )
+            .get_topic(session.get_user_id(), numeric_stream_id, numeric_topic_id)
             .is_ok();
         if !has_permission {
             sender.send_empty_ok_response().await?;
             return Ok(HandlerResult::Finished);
         }
 
-        let response =
-            shard
-                .streams
-                .with_topic_by_id(&self.stream_id, &self.topic_id, |(root, _, stats)| {
-                    mapper::map_topic(&root, &stats)
-                });
+        // Get topic from SharedMetadata and map to response
+        let stream = match shard.shared_metadata.get_stream(&self.stream_id) {
+            Some(s) => s,
+            None => {
+                sender.send_empty_ok_response().await?;
+                return Ok(HandlerResult::Finished);
+            }
+        };
+        let topic = match stream.topics.get(&numeric_topic_id) {
+            Some(t) => t,
+            None => {
+                sender.send_empty_ok_response().await?;
+                return Ok(HandlerResult::Finished);
+            }
+        };
+
+        // Get stats from SharedStatsStore
+        let topic_stats = shard
+            .shared_stats
+            .get_topic_stats(numeric_stream_id, numeric_topic_id);
+
+        let response = mapper::map_topic_from_metadata_with_stats(
+            topic,
+            topic_stats.as_deref(),
+            |partition_id| {
+                shard.shared_stats.get_partition_stats(
+                    numeric_stream_id,
+                    numeric_topic_id,
+                    partition_id,
+                )
+            },
+        );
         sender.send_ok_response(&response).await?;
         Ok(HandlerResult::Finished)
     }

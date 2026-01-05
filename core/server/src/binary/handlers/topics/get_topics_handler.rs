@@ -22,9 +22,7 @@ use crate::binary::command::{
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
 use crate::shard::IggyShard;
-use crate::slab::traits_ext::{EntityComponentSystem, IntoComponents};
 use crate::streaming::session::Session;
-use crate::streaming::streams;
 use anyhow::Result;
 use iggy_common::IggyError;
 use iggy_common::SenderKind;
@@ -47,20 +45,41 @@ impl ServerCommandHandler for GetTopics {
         debug!("session: {session}, command: {self}");
         shard.ensure_authenticated(session)?;
         shard.ensure_stream_exists(&self.stream_id)?;
+
+        // Get stream ID from SharedMetadata
         let numeric_stream_id = shard
-            .streams
-            .with_stream_by_id(&self.stream_id, streams::helpers::get_stream_id());
+            .shared_metadata
+            .get_stream_id(&self.stream_id)
+            .ok_or_else(|| IggyError::StreamIdNotFound(self.stream_id.clone()))?;
+
         shard
             .permissioner
-            .borrow()
             .get_topics(session.get_user_id(), numeric_stream_id)?;
 
-        let response = shard.streams.with_topics(&self.stream_id, |topics| {
-            topics.with_components(|topics| {
-                let (roots, _, stats) = topics.into_components();
-                mapper::map_topics(&roots, &stats)
-            })
-        });
+        // Get topics from SharedMetadata
+        let snapshot = shard.shared_metadata.load();
+        let stream_meta = snapshot
+            .streams
+            .get(&numeric_stream_id)
+            .ok_or_else(|| IggyError::StreamIdNotFound(self.stream_id.clone()))?;
+
+        // Collect topics with their stats
+        let mut topics_with_stats: Vec<_> = Vec::new();
+        for (topic_id, topic) in stream_meta.topics.iter() {
+            if let Some(stats) = shard
+                .shared_stats
+                .get_topic_stats(numeric_stream_id, *topic_id)
+            {
+                topics_with_stats.push((topic, stats));
+            }
+        }
+
+        let refs: Vec<_> = topics_with_stats
+            .iter()
+            .map(|(t, s)| (*t, s.as_ref()))
+            .collect();
+        let response = mapper::map_topics_meta(&refs);
+
         sender.send_ok_response(&response).await?;
         Ok(HandlerResult::Finished)
     }

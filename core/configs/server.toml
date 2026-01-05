@@ -152,7 +152,7 @@ enabled = true
 address = "127.0.0.1:8090"
 
 # Enable TCP socket migration across shards.
-socket_migration = true
+socket_migration = false
 
 # Whether to use ipv4 or ipv6
 ipv6 = false

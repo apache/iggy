@@ -24,12 +24,10 @@ use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
 
 use crate::shard::IggyShard;
-use crate::shard::transmission::event::ShardEvent;
 use crate::shard::transmission::frame::ShardResponse;
 use crate::shard::transmission::message::{
     ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult,
 };
-use crate::slab::traits_ext::{EntityComponentSystem, EntityMarker};
 use crate::state::command::EntryCommand;
 use crate::state::models::CreateStreamWithId;
 use crate::streaming::session::Session;
@@ -74,20 +72,11 @@ impl ServerCommandHandler for CreateStream {
                     // Acquire stream lock to serialize filesystem operations
                     let _stream_guard = shard.fs_locks.stream_lock.lock().await;
 
-                    let stream = shard.create_stream(session, name).await?;
-                    let created_stream_id = stream.id();
+                    let stream_meta = shard.create_stream(session, name).await?;
+                    let created_stream_id = stream_meta.id;
 
-                    let event = ShardEvent::CreatedStream {
-                        id: created_stream_id,
-                        stream: stream.clone(),
-                    };
-                    shard.broadcast_event_to_all_shards(event).await?;
-
-                    let response = shard
-                        .streams
-                        .with_components_by_id(created_stream_id, |(root, stats)| {
-                            mapper::map_stream(&root, &stats)
-                        });
+                    // Map response directly from metadata (stats are zeros for new stream)
+                    let response = mapper::map_stream_from_metadata(&stream_meta);
 
                     shard
                         .state
@@ -110,9 +99,11 @@ impl ServerCommandHandler for CreateStream {
                 }
             }
             ShardSendRequestResult::Response(response) => match response {
-                ShardResponse::CreateStreamResponse(stream) => {
-                    let created_stream_id = stream.id();
-                    let response = mapper::map_stream(stream.root(), stream.stats());
+                ShardResponse::CreateStreamResponse(stream_meta) => {
+                    let created_stream_id = stream_meta.id;
+
+                    // Map response directly from metadata (stats are zeros for new stream)
+                    let response = mapper::map_stream_from_metadata(&stream_meta);
 
                     shard
                         .state

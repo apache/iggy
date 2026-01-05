@@ -114,7 +114,6 @@ async fn run_scenario(transport: TransportProtocol, scenario: ScenarioFn) {
     );
     let test_server = TestServer::new(Some(extra_envs), true, None, IpAddrKind::V4);
     let test_server = Arc::new(Mutex::new(test_server));
-
     test_server.lock().unwrap().start();
 
     let client_factory: Box<dyn ClientFactory> = {

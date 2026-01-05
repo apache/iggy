@@ -146,7 +146,7 @@ impl IggyShard {
     }
 
     pub fn find_shard_table_record(&self, namespace: &IggyNamespace) -> Option<PartitionLocation> {
-        self.shards_table.get(namespace).map(|entry| *entry)
+        self.shards_table.get(namespace)
     }
 
     pub fn remove_shard_table_record(&self, namespace: &IggyNamespace) -> PartitionLocation {
@@ -162,10 +162,7 @@ impl IggyShard {
     ) -> Vec<(IggyNamespace, PartitionLocation)> {
         namespaces
             .iter()
-            .map(|ns| {
-                let (ns, location) = self.shards_table.remove(ns).unwrap();
-                (ns, location)
-            })
+            .filter_map(|ns| self.shards_table.remove(ns))
             .collect()
     }
 
@@ -174,17 +171,7 @@ impl IggyShard {
     }
 
     pub fn get_current_shard_namespaces(&self) -> Vec<IggyNamespace> {
-        self.shards_table
-            .iter()
-            .filter_map(|entry| {
-                let (ns, location) = entry.pair();
-                if *location.shard_id == self.id {
-                    Some(*ns)
-                } else {
-                    None
-                }
-            })
-            .collect()
+        self.shards_table.namespaces_for_shard(self.id)
     }
 }
 

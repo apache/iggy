@@ -21,9 +21,7 @@ use crate::binary::command::{
 };
 use crate::binary::handlers::partitions::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
-
 use crate::shard::IggyShard;
-use crate::shard::transmission::event::ShardEvent;
 use crate::state::command::EntryCommand;
 use crate::streaming::session::Session;
 use anyhow::Result;
@@ -53,7 +51,7 @@ impl ServerCommandHandler for DeletePartitions {
         // Acquire partition lock to serialize filesystem operations
         let _partition_guard = shard.fs_locks.partition_lock.lock().await;
 
-        let deleted_partition_ids = shard
+        let _deleted_partition_ids = shard
             .delete_partitions(
                 session,
                 &self.stream_id,
@@ -61,37 +59,49 @@ impl ServerCommandHandler for DeletePartitions {
                 self.partitions_count,
             )
             .await?;
-        let event = ShardEvent::DeletedPartitions {
-            stream_id: self.stream_id.clone(),
-            topic_id: self.topic_id.clone(),
-            partitions_count: self.partitions_count,
-            partition_ids: deleted_partition_ids,
-        };
-        shard.broadcast_event_to_all_shards(event).await?;
 
-        let remaining_partition_ids = shard.streams.with_topic_by_id(
+        // Get remaining partition IDs from SharedMetadata
+        let numeric_stream_id = shard
+            .shared_metadata
+            .get_stream_id(&self.stream_id)
+            .ok_or_else(|| IggyError::StreamIdNotFound(self.stream_id.clone()))?;
+        let numeric_topic_id = shard
+            .shared_metadata
+            .get_topic_id(numeric_stream_id, &self.topic_id)
+            .ok_or_else(|| {
+                IggyError::TopicIdNotFound(self.topic_id.clone(), self.stream_id.clone())
+            })?;
+
+        let snapshot = shard.shared_metadata.load();
+        let stream_meta = snapshot
+            .streams
+            .get(&numeric_stream_id)
+            .ok_or_else(|| IggyError::StreamIdNotFound(self.stream_id.clone()))?;
+        let topic_meta = stream_meta.get_topic(numeric_topic_id).ok_or_else(|| {
+            IggyError::TopicIdNotFound(self.topic_id.clone(), self.stream_id.clone())
+        })?;
+        let remaining_partition_ids: Vec<usize> = topic_meta.partitions.keys().copied().collect();
+        drop(snapshot);
+
+        // Rebalance consumer groups with remaining partition IDs via SharedMetadata
+        shard.shared_metadata.rebalance_consumer_groups(
             &self.stream_id,
             &self.topic_id,
-            crate::streaming::topics::helpers::get_partition_ids(),
-        );
-        shard.streams.with_topic_by_id_mut(
-            &self.stream_id,
-            &self.topic_id,
-            crate::streaming::topics::helpers::rebalance_consumer_groups(&remaining_partition_ids),
-        );
+            &remaining_partition_ids,
+        )?;
 
         shard
-        .state
-        .apply(
-            session.get_user_id(),
-            &EntryCommand::DeletePartitions(self),
-        )
-        .await
-        .error(|e: &IggyError| {
-            format!(
-                "{COMPONENT} (error: {e}) - failed to apply delete partitions for stream_id: {stream_id}, topic_id: {topic_id}, session: {session}"
+            .state
+            .apply(
+                session.get_user_id(),
+                &EntryCommand::DeletePartitions(self),
             )
-        })?;
+            .await
+            .error(|e: &IggyError| {
+                format!(
+                    "{COMPONENT} (error: {e}) - failed to apply delete partitions for stream_id: {stream_id}, topic_id: {topic_id}, session: {session}"
+                )
+            })?;
         sender.send_empty_ok_response().await?;
         Ok(HandlerResult::Finished)
     }

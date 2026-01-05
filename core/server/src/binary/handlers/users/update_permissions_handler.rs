@@ -25,7 +25,6 @@ use crate::binary::handlers::users::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 
 use crate::shard::IggyShard;
-use crate::shard::transmission::event::ShardEvent;
 use crate::state::command::EntryCommand;
 use crate::streaming::session::Session;
 use anyhow::Result;
@@ -56,11 +55,6 @@ impl ServerCommandHandler for UpdatePermissions {
                     self.user_id
                 ))?;
         info!("Updated permissions for user with ID: {}.", self.user_id);
-        let event = ShardEvent::UpdatedPermissions {
-            user_id: self.user_id.clone(),
-            permissions: self.permissions.clone(),
-        };
-        shard.broadcast_event_to_all_shards(event).await?;
 
         shard
             .state

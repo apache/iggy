@@ -21,7 +21,7 @@ use crate::shard::IggyShard;
 use crate::shard::transmission::message::{ShardMessage, ShardRequest, ShardRequestPayload};
 use crate::streaming::segments::{IggyIndexesMut, IggyMessagesBatchMut};
 use crate::streaming::session::Session;
-use crate::streaming::{streams, topics};
+use crate::streaming::topics;
 use anyhow::Result;
 use compio::buf::{IntoInner as _, IoBuf};
 use iggy_common::Identifier;
@@ -112,42 +112,51 @@ impl ServerCommandHandler for SendMessages {
 
         shard.ensure_topic_exists(&self.stream_id, &self.topic_id)?;
 
-        let numeric_stream_id = shard
-            .streams
-            .with_stream_by_id(&self.stream_id, streams::helpers::get_stream_id());
+        // Get IDs from SharedMetadata (source of truth for cross-shard consistency)
+        let metadata = shard.shared_metadata.load();
+        let numeric_stream_id = metadata
+            .get_stream_id(&self.stream_id)
+            .ok_or_else(|| IggyError::StreamIdNotFound(self.stream_id.clone()))?;
 
-        let numeric_topic_id = shard.streams.with_topic_by_id(
-            &self.stream_id,
-            &self.topic_id,
-            topics::helpers::get_topic_id(),
-        );
+        let numeric_topic_id = metadata
+            .get_topic_id(numeric_stream_id, &self.topic_id)
+            .ok_or_else(|| {
+                IggyError::TopicIdNotFound(self.topic_id.clone(), self.stream_id.clone())
+            })?;
 
-        // TODO(tungtose): dry this code && get partition_id below have a side effect
-        let partition_id = shard.streams.with_topic_by_id(
-            &self.stream_id,
-            &self.topic_id,
-            |(root, auxilary, ..)| match self.partitioning.kind {
-                PartitioningKind::Balanced => {
-                    let upperbound = root.partitions().len();
-                    let pid = auxilary.get_next_partition_id(upperbound);
-                    Ok(pid)
-                }
-                PartitioningKind::PartitionId => Ok(u32::from_le_bytes(
+        // Get partition count from SharedMetadata
+        let stream_meta = metadata.streams.get(&numeric_stream_id).unwrap();
+        let topic_meta = stream_meta.topics.get(&numeric_topic_id).unwrap();
+        let partitions_count = topic_meta.partitions.len();
+
+        // Calculate partition_id based on partitioning strategy
+        let partition_id = match self.partitioning.kind {
+            PartitioningKind::Balanced => {
+                // Use per-topic round-robin counter from SharedMetadata
+                let next_pid = topic_meta.get_next_partition_id(partitions_count);
+                drop(metadata);
+                // Increment the counter for next message
+                shard
+                    .shared_metadata
+                    .increment_topic_partition_counter(numeric_stream_id, numeric_topic_id);
+                next_pid
+            }
+            PartitioningKind::PartitionId => {
+                drop(metadata);
+                u32::from_le_bytes(
                     self.partitioning.value[..self.partitioning.length as usize]
                         .try_into()
                         .map_err(|_| IggyError::InvalidNumberEncoding)?,
-                ) as usize),
-                PartitioningKind::MessagesKey => {
-                    let upperbound = root.partitions().len();
-                    Ok(
-                        topics::helpers::calculate_partition_id_by_messages_key_hash(
-                            upperbound,
-                            &self.partitioning.value,
-                        ),
-                    )
-                }
-            },
-        )?;
+                ) as usize
+            }
+            PartitioningKind::MessagesKey => {
+                drop(metadata);
+                topics::helpers::calculate_partition_id_by_messages_key_hash(
+                    partitions_count,
+                    &self.partitioning.value,
+                )
+            }
+        };
 
         let namespace = IggyNamespace::new(numeric_stream_id, numeric_topic_id, partition_id);
         let user_id = session.get_user_id();

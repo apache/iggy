@@ -33,7 +33,7 @@ impl Permissioner {
     }
 
     fn get_server_info(&self, user_id: u32) -> Result<(), IggyError> {
-        if let Some(global_permissions) = self.users_permissions.get(&user_id)
+        if let Some(global_permissions) = self.get_global_permissions(user_id)
             && (global_permissions.manage_servers || global_permissions.read_servers)
         {
             return Ok(());

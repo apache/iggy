@@ -28,7 +28,6 @@ use crate::http::*;
 use crate::shard::IggyShard;
 use crate::shard::task_registry::ShutdownToken;
 use crate::shard::tasks::periodic::spawn_jwt_token_cleaner;
-use crate::shard::transmission::event::ShardEvent;
 use crate::streaming::persistence::persister::PersisterKind;
 use axum::extract::DefaultBodyLimit;
 use axum::extract::connect_info::Connected;
@@ -38,7 +37,6 @@ use axum_server::tls_rustls::RustlsConfig;
 use compio_net::TcpListener;
 use err_trail::ErrContext;
 use iggy_common::IggyError;
-use iggy_common::TransportProtocol;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -142,15 +140,12 @@ pub async fn start_http_server(
             .expect("Failed to get local address for HTTP server");
         info!("Started {api_name} on: {address}");
 
-        // Notify shard about the bound address
-        let event = ShardEvent::AddressBound {
-            protocol: TransportProtocol::Http,
-            address,
-        };
-
-        crate::shard::handlers::handle_event(&shard, event)
-            .await
-            .ok();
+        // Store in Cell for config_writer backward compat
+        shard.http_bound_address.set(Some(address));
+        // Store in SharedMetadata (all shards see this immediately via ArcSwap)
+        shard.shared_metadata.set_http_address(address);
+        // Notify config_writer that HTTP is bound
+        let _ = shard.config_writer_notify.try_send(());
 
         let service = app.into_make_service_with_connect_info::<CompioSocketAddr>();
 
@@ -187,17 +182,12 @@ pub async fn start_http_server(
 
         info!("Started {api_name} on: {address}");
 
-        // Notify shard about the bound address
-        use crate::shard::transmission::event::ShardEvent;
-        use iggy_common::TransportProtocol;
-        let event = ShardEvent::AddressBound {
-            protocol: TransportProtocol::Http,
-            address,
-        };
-
-        crate::shard::handlers::handle_event(&shard, event)
-            .await
-            .ok();
+        // Store in Cell for config_writer backward compat
+        shard.http_bound_address.set(Some(address));
+        // Store in SharedMetadata (all shards see this immediately via ArcSwap)
+        shard.shared_metadata.set_http_address(address);
+        // Notify config_writer that HTTP is bound
+        let _ = shard.config_writer_notify.try_send(());
 
         let service = app.into_make_service_with_connect_info::<SocketAddr>();
         let handle = axum_server::Handle::new();

@@ -24,6 +24,7 @@ use iggy_common::{
 use send_wrapper::SendWrapper;
 
 use crate::binary::handlers::messages::poll_messages_handler::IggyPollMetadata;
+use crate::metadata::{StreamMeta, UserMeta};
 use crate::shard::system::messages::PollingArgs;
 use crate::state::command::EntryCommand;
 use crate::streaming::personal_access_tokens::personal_access_token::PersonalAccessToken;
@@ -153,7 +154,7 @@ impl HttpSafeShard {
         &self,
         session: &Session,
         name: String,
-    ) -> Result<crate::streaming::streams::stream::Stream, IggyError> {
+    ) -> Result<StreamMeta, IggyError> {
         let future = SendWrapper::new(self.shard().create_stream(session, name));
         future.await
     }
@@ -177,12 +178,16 @@ impl HttpSafeShard {
         password: &str,
         status: UserStatus,
         permissions: Option<Permissions>,
-    ) -> Result<User, IggyError> {
+    ) -> Result<UserMeta, IggyError> {
         self.shard()
             .create_user(session, username, password, status, permissions)
     }
 
-    pub fn delete_user(&self, session: &Session, user_id: &Identifier) -> Result<User, IggyError> {
+    pub fn delete_user(
+        &self,
+        session: &Session,
+        user_id: &Identifier,
+    ) -> Result<UserMeta, IggyError> {
         self.shard().delete_user(session, user_id)
     }
 
@@ -302,31 +307,60 @@ impl HttpSafeShard {
     ) -> Result<(), IggyError> {
         self.shard().ensure_topic_exists(&stream_id, &topic_id)?;
 
-        let partition_id = self.shard().streams.with_topic_by_id(
-            &stream_id,
-            &topic_id,
-            |(root, auxilary, ..)| match partitioning.kind {
-                PartitioningKind::Balanced => {
-                    let upperbound = root.partitions().len();
-                    let pid = auxilary.get_next_partition_id(upperbound);
-                    Ok(pid)
-                }
-                PartitioningKind::PartitionId => Ok(u32::from_le_bytes(
-                    partitioning.value[..partitioning.length as usize]
-                        .try_into()
-                        .map_err(|_| IggyError::InvalidNumberEncoding)?,
-                ) as usize),
-                PartitioningKind::MessagesKey => {
-                    let upperbound = root.partitions().len();
-                    Ok(
-                        topics::helpers::calculate_partition_id_by_messages_key_hash(
-                            upperbound,
-                            &partitioning.value,
-                        ),
-                    )
-                }
-            },
-        )?;
+        // Get partition count from SharedMetadata
+        let numeric_stream_id = self
+            .shard()
+            .shared_metadata
+            .get_stream_id(&stream_id)
+            .ok_or_else(|| IggyError::StreamIdNotFound(stream_id.clone()))?;
+        let numeric_topic_id = self
+            .shard()
+            .shared_metadata
+            .get_topic_id(numeric_stream_id, &topic_id)
+            .ok_or_else(|| IggyError::TopicIdNotFound(topic_id.clone(), stream_id.clone()))?;
+
+        let snapshot = self.shard().shared_metadata.load();
+        let stream_meta = snapshot
+            .streams
+            .get(&numeric_stream_id)
+            .ok_or_else(|| IggyError::StreamIdNotFound(stream_id.clone()))?;
+        let topic_meta = stream_meta
+            .get_topic(numeric_topic_id)
+            .ok_or_else(|| IggyError::TopicIdNotFound(topic_id.clone(), stream_id.clone()))?;
+        let partitions_count = topic_meta.partitions.len();
+        drop(snapshot);
+
+        let partition_id = match partitioning.kind {
+            PartitioningKind::Balanced => {
+                // Get topic from metadata and use its round-robin counter
+                let snapshot = self.shard().shared_metadata.load();
+                let stream_meta = snapshot
+                    .streams
+                    .get(&numeric_stream_id)
+                    .ok_or_else(|| IggyError::StreamIdNotFound(stream_id.clone()))?;
+                let topic_meta = stream_meta.get_topic(numeric_topic_id).ok_or_else(|| {
+                    IggyError::TopicIdNotFound(topic_id.clone(), stream_id.clone())
+                })?;
+                let next_pid = topic_meta.get_next_partition_id(partitions_count);
+                drop(snapshot);
+                // Increment the counter
+                self.shard()
+                    .shared_metadata
+                    .increment_topic_partition_counter(numeric_stream_id, numeric_topic_id);
+                next_pid
+            }
+            PartitioningKind::PartitionId => u32::from_le_bytes(
+                partitioning.value[..partitioning.length as usize]
+                    .try_into()
+                    .map_err(|_| IggyError::InvalidNumberEncoding)?,
+            ) as usize,
+            PartitioningKind::MessagesKey => {
+                topics::helpers::calculate_partition_id_by_messages_key_hash(
+                    partitions_count,
+                    &partitioning.value,
+                )
+            }
+        };
 
         let future = SendWrapper::new(self.shard().append_messages(
             user_id,

@@ -19,7 +19,6 @@
 use crate::configs::tcp::TcpSocketConfig;
 use crate::shard::IggyShard;
 use crate::shard::task_registry::ShutdownToken;
-use crate::shard::transmission::event::ShardEvent;
 use crate::tcp::connection_handler::{handle_connection, handle_error};
 use compio::net::{TcpListener, TcpOpts};
 use compio_tls::TlsAcceptor;
@@ -46,7 +45,7 @@ pub(crate) async fn start(
     if shard.id != 0 && addr.port() == 0 {
         info!("Waiting for TCP address from shard 0...");
         loop {
-            if let Some(bound_addr) = shard.tcp_bound_address.get() {
+            if let Some(bound_addr) = shard.shared_metadata.load().bound_addresses.tcp {
                 addr = bound_addr;
                 info!("Received TCP address: {}", addr);
                 break;
@@ -68,16 +67,14 @@ pub(crate) async fn start(
     })?;
 
     if shard.id == 0 {
+        // Store in Cell for config_writer backward compat
         shard.tcp_bound_address.set(Some(actual_addr));
+        // Store in SharedMetadata (all shards see this immediately via ArcSwap)
+        shard.shared_metadata.set_tcp_address(actual_addr);
+
         if addr.port() == 0 {
             // Notify config writer on shard 0
             let _ = shard.config_writer_notify.try_send(());
-
-            let event = ShardEvent::AddressBound {
-                protocol: TransportProtocol::Tcp,
-                address: actual_addr,
-            };
-            shard.broadcast_event_to_all_shards(event).await?;
         }
     }
 

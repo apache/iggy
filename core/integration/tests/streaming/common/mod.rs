@@ -16,4 +16,5 @@
  * under the License.
  */
 
+pub mod streaming_helper;
 pub mod test_setup;

@@ -23,15 +23,13 @@ use crate::binary::handlers::consumer_groups::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
 use crate::shard::IggyShard;
-use crate::shard::transmission::event::ShardEvent;
-use crate::slab::traits_ext::EntityMarker;
 use crate::state::command::EntryCommand;
 use crate::state::models::CreateConsumerGroupWithId;
 use crate::streaming::session::Session;
 use anyhow::Result;
 use err_trail::ErrContext;
 use iggy_common::create_consumer_group::CreateConsumerGroup;
-use iggy_common::{Identifier, IggyError, SenderKind};
+use iggy_common::{IggyError, SenderKind};
 use std::rc::Rc;
 use tracing::{debug, instrument};
 
@@ -55,38 +53,27 @@ impl ServerCommandHandler for CreateConsumerGroup {
             &self.topic_id,
             self.name.clone(),
         )?;
-        let cg_id = cg.id();
-
-        let event = ShardEvent::CreatedConsumerGroup {
-            stream_id: self.stream_id.clone(),
-            topic_id: self.topic_id.clone(),
-            cg,
-        };
-        shard.broadcast_event_to_all_shards(event).await?;
+        let cg_id = cg.id;
 
         let stream_id = self.stream_id.clone();
         let topic_id = self.topic_id.clone();
         shard
             .state
-        .apply(
-            session.get_user_id(),
-           &EntryCommand::CreateConsumerGroup(CreateConsumerGroupWithId {
-                group_id: cg_id as u32,
-                command: self
-            }),
-        )
+            .apply(
+                session.get_user_id(),
+                &EntryCommand::CreateConsumerGroup(CreateConsumerGroupWithId {
+                    group_id: cg_id as u32,
+                    command: self,
+                }),
+            )
             .await
             .error(|e: &IggyError| {
                 format!(
                     "{COMPONENT} (error: {e}) - failed to apply create consumer group for stream_id: {stream_id}, topic_id: {topic_id}, group_id: {cg_id}, session: {session}"
                 )
             })?;
-        let response = shard.streams.with_consumer_group_by_id(
-            &stream_id,
-            &topic_id,
-            &Identifier::numeric(cg_id as u32).unwrap(),
-            |(root, members)| mapper::map_consumer_group(root, members),
-        );
+
+        let response = mapper::map_consumer_group_meta(&cg);
         sender.send_ok_response(&response).await?;
         Ok(HandlerResult::Finished)
     }

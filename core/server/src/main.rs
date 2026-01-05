@@ -28,19 +28,18 @@ use iggy_common::{Aes256GcmEncryptor, EncryptorKind, IggyError, MemoryPool};
 use server::SEMANTIC_VERSION;
 use server::args::Args;
 use server::bootstrap::{
-    create_directories, create_shard_connections, create_shard_executor, load_config, load_streams,
-    load_users, resolve_persister, update_system_info,
+    create_directories, create_shard_connections, create_shard_executor, load_config,
+    load_metadata_into_shared, resolve_persister, update_system_info,
 };
 use server::configs::sharding::ShardAllocator;
 use server::diagnostics::{print_io_uring_permission_info, print_locked_memory_limit_info};
 use server::io::fs_utils;
 use server::log::logger::Logging;
+use server::metadata::{SharedConsumerOffsetsStore, SharedMetadata, SharedStatsStore};
 use server::server_error::ServerError;
+use server::shard::shards_table::ShardsTable;
 use server::shard::system::info::SystemInfo;
 use server::shard::{IggyShard, calculate_shard_assignment};
-use server::slab::traits_ext::{
-    EntityComponentSystem, EntityComponentSystemMutCell, IntoComponents,
-};
 use server::state::file::FileState;
 use server::state::system::SystemState;
 use server::streaming::clients::client_manager::{Client, ClientManager};
@@ -58,7 +57,6 @@ use std::thread::JoinHandle;
 use tracing::{error, info, instrument, warn};
 
 const COMPONENT: &str = "MAIN";
-const SHARDS_TABLE_CAPACITY: usize = 16384;
 
 static SHUTDOWN_START_TIME: AtomicU64 = AtomicU64::new(0);
 static SHUTDOWN_INITIATED: AtomicBool = AtomicBool::new(false);
@@ -277,9 +275,6 @@ fn main() -> Result<(), ServerError> {
             state_term.clone(),
         );
         let state = SystemState::load(state).await?;
-        let (streams_state, users_state) = state.decompose();
-        let streams = load_streams(streams_state.into_values(), &config.system).await?;
-        let users = load_users(users_state.into_values());
 
         // ELEVENTH DISCRETE LOADING STEP.
         let shard_allocator = ShardAllocator::new(&config.system.sharding.cpu_allocation)?;
@@ -311,50 +306,66 @@ fn main() -> Result<(), ServerError> {
         // TODO: Persist the shards table and load it from the disk, so it does not have to be
         // THIRTEENTH DISCRETE LOADING STEP.
         // Shared resources bootstrap.
-        let shards_table = Box::new(DashMap::with_capacity(SHARDS_TABLE_CAPACITY));
+        let shards_table = Box::new(ShardsTable::new());
         let shards_table = Box::leak(shards_table);
-        let shards_table: EternalPtr<DashMap<IggyNamespace, PartitionLocation>> = shards_table.into();
+        let shards_table: EternalPtr<ShardsTable> = shards_table.into();
 
         let client_manager = Box::new(DashMap::new());
         let client_manager = Box::leak(client_manager);
         let client_manager: EternalPtr<DashMap<u32, Client>> = client_manager.into();
         let client_manager = ClientManager::new(client_manager);
 
-        streams.with_components(|components| {
-            let (root, ..) = components.into_components();
-            for (_, stream) in root.iter() {
-                stream.topics().with_components(|components| {
-                    let (root, ..) = components.into_components();
-                    for (_, topic) in root.iter() {
-                        topic.partitions().with_components(|components| {
-                            let (root, ..) = components.into_components();
-                            for (_, partition) in root.iter() {
-                                let stream_id = stream.id();
-                                let topic_id = topic.id();
-                                let partition_id = partition.id();
-                                let ns = IggyNamespace::new(stream_id, topic_id, partition_id);
-                                let shard_id = ShardId::new(calculate_shard_assignment(
-                                    &ns,
-                                    shard_assignment.len() as u32,
-                                ));
-                                // TODO(hubcio): LocalIdx is 0 until IggyPartitions is integratedds
-                                let location = PartitionLocation::new(shard_id, LocalIdx::new(0));
-                                shards_table.insert(ns, location);
-                            }
-                        });
+        // Create shared metadata for all shards (ArcSwap-based lock-free reads)
+        let shared_metadata = Box::new(SharedMetadata::new());
+        let shared_metadata = Box::leak(shared_metadata);
+        let shared_metadata: EternalPtr<SharedMetadata> = shared_metadata.into();
+
+        // Create shared stats store for cross-shard stats visibility
+        let shared_stats = Box::new(SharedStatsStore::new());
+        let shared_stats = Box::leak(shared_stats);
+        let shared_stats: EternalPtr<SharedStatsStore> = shared_stats.into();
+
+        // Create shared consumer offsets store for cross-shard offset visibility
+        let shared_consumer_offsets = Box::new(SharedConsumerOffsetsStore::new());
+        let shared_consumer_offsets = Box::leak(shared_consumer_offsets);
+        let shared_consumer_offsets: EternalPtr<SharedConsumerOffsetsStore> =
+            shared_consumer_offsets.into();
+
+        // Load metadata directly into SharedMetadata (bypasses slab entirely)
+        load_metadata_into_shared(
+            state,
+            &shared_metadata,
+            &shared_stats,
+            &config.system,
+        )?;
+
+        // Populate shards_table from SharedMetadata
+        {
+            let snapshot = shared_metadata.load();
+            for (stream_id, stream) in snapshot.streams.iter() {
+                for (topic_id, topic) in stream.topics.iter() {
+                    for (partition_id, _partition) in topic.partitions.iter() {
+                        let ns = IggyNamespace::new(*stream_id, *topic_id, *partition_id);
+                        let shard_id = ShardId::new(calculate_shard_assignment(
+                            &ns,
+                            shard_assignment.len() as u32,
+                        ));
+                        let location = PartitionLocation::new(shard_id, LocalIdx::new(0));
+                        shards_table.insert(ns, location);
                     }
-                })
+                }
             }
-        });
+        }
 
         for (id, assignment) in shard_assignment
             .into_iter()
             .enumerate()
             .map(|(idx, assignment)| (idx as u16, assignment))
         {
-            let streams = streams.clone();
             let shards_table = shards_table.clone();
-            let users = users.clone();
+            let shared_metadata = shared_metadata.clone();
+            let shared_stats = shared_stats.clone();
+            let shared_consumer_offsets = shared_consumer_offsets.clone();
             let connections = connections.clone();
             let config = config.clone();
             let encryptor = encryptor.clone();
@@ -372,30 +383,6 @@ fn main() -> Result<(), ServerError> {
                 state_term.clone(),
             );
             let client_manager = client_manager.clone();
-
-            // TODO: Explore decoupling the `Log` from `Partition` entity.
-            // Ergh... I knew this will backfire to include `Log` as part of the `Partition` entity,
-            // We have to initialize with a default log for every partition, once we `Clone` the Streams / Topics / Partitions,
-            // because `Clone` impl for `Partition` does not clone the actual log, just creates an empty one.
-            streams.with_components(|components| {
-                let (root, ..) = components.into_components();
-                for (_, stream) in root.iter() {
-                    stream.topics().with_components_mut(|components| {
-                        let (mut root, ..) = components.into_components();
-                        for (_, topic) in root.iter_mut() {
-                            let partitions_count = topic.partitions().len();
-                            for log_id in 0..partitions_count {
-                                let id = topic.partitions_mut().insert_default_log();
-                                assert_eq!(
-                                    id, log_id,
-                                    "main: partition_insert_default_log: id mismatch when creating default log"
-                                );
-                            }
-                        }
-                    })
-                }
-            });
-
             let shard_done_tx = shard_done_tx.clone();
             let handle = std::thread::Builder::new()
                 .name(format!("shard-{id}"))
@@ -414,10 +401,11 @@ fn main() -> Result<(), ServerError> {
                             let builder = IggyShard::builder();
                             let shard = builder
                                 .id(id)
-                                .streams(streams)
                                 .state(state)
-                                .users(users)
                                 .shards_table(shards_table)
+                                .shared_metadata(shared_metadata)
+                                .shared_stats(shared_stats)
+                                .shared_consumer_offsets(shared_consumer_offsets)
                                 .connections(connections)
                                 .clients_manager(client_manager)
                                 .config(config)

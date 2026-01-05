@@ -18,7 +18,7 @@
 use super::{LocalIdx, ShardId};
 
 /// Location of a partition: which shard owns it and its local index within that shard.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PartitionLocation {
     pub shard_id: ShardId,
     pub local_idx: LocalIdx,

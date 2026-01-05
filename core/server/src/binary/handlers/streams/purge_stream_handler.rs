@@ -23,7 +23,6 @@ use crate::binary::handlers::streams::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 
 use crate::shard::IggyShard;
-use crate::shard::transmission::event::ShardEvent;
 use crate::state::command::EntryCommand;
 use crate::streaming::session::Session;
 use anyhow::Result;
@@ -54,10 +53,7 @@ impl ServerCommandHandler for PurgeStream {
             .error(|e: &IggyError| {
                 format!("{COMPONENT} (error: {e}) - failed to purge stream with id: {stream_id}, session: {session}")
             })?;
-        let event = ShardEvent::PurgedStream {
-            stream_id: self.stream_id.clone(),
-        };
-        shard.broadcast_event_to_all_shards(event).await?;
+
         shard
             .state
             .apply(session.get_user_id(), &EntryCommand::PurgeStream(self))

@@ -17,44 +17,44 @@
  */
 
 use super::COMPONENT;
+use crate::io::fs_utils::remove_dir_all;
+use crate::metadata::StreamMeta;
 use crate::shard::IggyShard;
-use crate::slab::traits_ext::{DeleteCell, EntityMarker, InsertCell};
 use crate::streaming::session::Session;
-use crate::streaming::streams::storage::{create_stream_file_hierarchy, delete_stream_from_disk};
-use crate::streaming::streams::{self, stream};
+use crate::streaming::stats::StreamStats;
+use crate::streaming::streams::storage::create_stream_file_hierarchy;
 use err_trail::ErrContext;
 use iggy_common::{Identifier, IggyError};
+use std::sync::Arc;
 
 impl IggyShard {
+    /// Create a stream. Returns the stream metadata.
+    /// Writes only to SharedMetadata (single source of truth).
     pub async fn create_stream(
         &self,
         session: &Session,
         name: String,
-    ) -> Result<stream::Stream, IggyError> {
+    ) -> Result<StreamMeta, IggyError> {
         self.ensure_authenticated(session)?;
-        self.permissioner
-            .borrow()
-            .create_stream(session.get_user_id())?;
-        let exists = self
-            .streams
-            .exists(&Identifier::from_str_value(&name).unwrap());
+        self.permissioner.create_stream(session.get_user_id())?;
 
-        if exists {
+        // Check existence in SharedMetadata (source of truth)
+        if self.shared_metadata.stream_exists_by_name(&name) {
             return Err(IggyError::StreamNameAlreadyExists(name));
         }
-        let stream = stream::create_and_insert_stream_mem(&self.streams, name);
+
+        // Create in SharedMetadata (single source of truth, auto-generates ID)
+        let stream_meta = self.shared_metadata.create_stream(name)?;
+        let stream_id = stream_meta.id;
+
+        // Create and register stats in SharedStatsStore for cross-shard visibility
+        let stats = Arc::new(StreamStats::default());
+        self.shared_stats.register_stream_stats(stream_id, stats);
+
         self.metrics.increment_streams(1);
-        create_stream_file_hierarchy(stream.id(), &self.config.system).await?;
-        Ok(stream)
-    }
 
-    pub fn create_stream_bypass_auth(&self, stream: stream::Stream) -> usize {
-        self.streams.insert(stream)
-    }
-
-    pub fn update_stream_bypass_auth(&self, id: &Identifier, name: &str) -> Result<(), IggyError> {
-        self.update_stream_base(id, name.to_string())?;
-        Ok(())
+        create_stream_file_hierarchy(stream_id, &self.config.system).await?;
+        Ok(stream_meta)
     }
 
     pub fn update_stream(
@@ -65,12 +65,14 @@ impl IggyShard {
     ) -> Result<(), IggyError> {
         self.ensure_authenticated(session)?;
         self.ensure_stream_exists(stream_id)?;
+
+        // Get stream ID from SharedMetadata
         let id = self
-            .streams
-            .with_stream_by_id(stream_id, streams::helpers::get_stream_id());
+            .shared_metadata
+            .get_stream_id(stream_id)
+            .ok_or_else(|| IggyError::StreamIdNotFound(stream_id.clone()))?;
 
         self.permissioner
-            .borrow()
             .update_stream(session.get_user_id(), id)
             .error(|e: &IggyError| {
                 format!(
@@ -84,68 +86,62 @@ impl IggyShard {
     }
 
     fn update_stream_base(&self, id: &Identifier, name: String) -> Result<(), IggyError> {
-        let old_name = self
+        // Get current name from SharedMetadata
+        let snapshot = self.shared_metadata.load();
+        let stream_id = self
+            .shared_metadata
+            .get_stream_id(id)
+            .ok_or_else(|| IggyError::StreamIdNotFound(id.clone()))?;
+        let stream_meta = snapshot
             .streams
-            .with_stream_by_id(id, streams::helpers::get_stream_name());
+            .get(&stream_id)
+            .ok_or_else(|| IggyError::StreamIdNotFound(id.clone()))?;
+        let old_name = stream_meta.name.clone();
+        drop(snapshot);
 
         if old_name == name {
             return Ok(());
         }
-        if self.streams.with_index(|index| index.contains_key(&name)) {
+
+        // Check if new name already exists
+        if self.shared_metadata.stream_exists_by_name(&name) {
             return Err(IggyError::StreamNameAlreadyExists(name.to_string()));
         }
 
-        self.streams
-            .with_stream_by_id_mut(id, streams::helpers::update_stream_name(name.clone()));
-        self.streams.with_index_mut(|index| {
-            // Rename the key inside of hashmap
-            let idx = index.remove(&old_name).expect("Rename key: key not found");
-            index.insert(name, idx);
-        });
+        // Update in SharedMetadata (single source of truth)
+        self.shared_metadata.update_stream(id, name)?;
+
         Ok(())
     }
 
-    pub fn delete_stream_bypass_auth(&self, id: &Identifier) -> stream::Stream {
-        self.delete_stream_base(id)
-    }
-
-    fn delete_stream_base(&self, id: &Identifier) -> stream::Stream {
-        let stream_index = self.streams.get_index(id);
-        let stream = self.streams.delete(stream_index);
-        let stats = stream.stats();
-
-        self.metrics.decrement_streams(1);
-        self.metrics.decrement_topics(0);
-        self.metrics.decrement_partitions(0);
-        self.metrics
-            .decrement_messages(stats.messages_count_inconsistent());
-        self.metrics
-            .decrement_segments(stats.segments_count_inconsistent());
-        stream
-    }
-
+    /// Delete a stream. Returns the deleted stream metadata.
+    /// Writes only to SharedMetadata (single source of truth).
     pub async fn delete_stream(
         &self,
         session: &Session,
         id: &Identifier,
-    ) -> Result<stream::Stream, IggyError> {
+    ) -> Result<StreamMeta, IggyError> {
         self.ensure_authenticated(session)?;
         self.ensure_stream_exists(id)?;
-        let stream_id = self
-            .streams
-            .with_stream_by_id(id, streams::helpers::get_stream_id());
+
+        // Get stream ID from SharedMetadata (source of truth)
+        let stream_id_usize = self
+            .shared_metadata
+            .get_stream_id(id)
+            .ok_or_else(|| IggyError::StreamIdNotFound(id.clone()))?;
+
         self.permissioner
-            .borrow()
-            .delete_stream(session.get_user_id(), stream_id)
+            .delete_stream(session.get_user_id(), stream_id_usize)
             .error(|e: &IggyError| {
                 format!(
                     "{COMPONENT} (error: {e}) - permission denied to delete stream for user {}, stream ID: {}",
                     session.get_user_id(),
-                    stream_id,
+                    stream_id_usize,
                 )
             })?;
-        let mut stream = self.delete_stream_base(id);
-        let stream_id_usize = stream.id();
+
+        // Delete from SharedMetadata (single source of truth) - returns the deleted metadata
+        let stream_meta = self.shared_metadata.delete_stream(id)?;
 
         // Clean up consumer groups from ClientManager for this stream
         self.client_manager
@@ -155,22 +151,68 @@ impl IggyShard {
         let namespaces_to_remove: Vec<_> = self
             .shards_table
             .iter()
-            .filter_map(|entry| {
-                let (ns, _) = entry.pair();
+            .filter_map(|(ns, _)| {
                 if ns.stream_id() == stream_id_usize {
-                    Some(*ns)
+                    Some(ns)
                 } else {
                     None
                 }
             })
             .collect();
 
+        // Collect unique topic_ids for topic stats cleanup
+        let mut topic_ids_to_remove: Vec<usize> = namespaces_to_remove
+            .iter()
+            .map(|ns| ns.topic_id())
+            .collect();
+        topic_ids_to_remove.sort_unstable();
+        topic_ids_to_remove.dedup();
+
         for ns in namespaces_to_remove {
+            // Clean up partition stats from SharedStatsStore
+            self.shared_stats.remove_partition_stats(
+                ns.stream_id(),
+                ns.topic_id(),
+                ns.partition_id(),
+            );
+
+            // Clean up consumer offsets from SharedConsumerOffsetsStore
+            self.shared_consumer_offsets.remove_consumer_offsets(
+                ns.stream_id(),
+                ns.topic_id(),
+                ns.partition_id(),
+            );
+            self.shared_consumer_offsets.remove_consumer_group_offsets(
+                ns.stream_id(),
+                ns.topic_id(),
+                ns.partition_id(),
+            );
+
             self.remove_shard_table_record(&ns);
         }
 
-        delete_stream_from_disk(&mut stream, &self.config.system).await?;
-        Ok(stream)
+        // Clean up topic stats from SharedStatsStore
+        for topic_id in topic_ids_to_remove {
+            self.shared_stats
+                .remove_topic_stats(stream_id_usize, topic_id);
+        }
+
+        // Clean up stream stats from SharedStatsStore
+        self.shared_stats.remove_stream_stats(stream_id_usize);
+
+        // Clean up partition_store for this stream
+        self.partition_store
+            .borrow_mut()
+            .remove_stream_partitions(stream_id_usize);
+
+        // Delete stream directory from disk
+        let stream_path = self.config.system.get_stream_path(stream_id_usize);
+        if let Err(e) = remove_dir_all(&stream_path).await {
+            tracing::warn!("Failed to remove stream directory {}: {}", stream_path, e);
+        }
+
+        self.metrics.decrement_streams(1);
+        Ok(stream_meta)
     }
 
     pub async fn purge_stream(
@@ -180,40 +222,44 @@ impl IggyShard {
     ) -> Result<(), IggyError> {
         self.ensure_authenticated(session)?;
         self.ensure_stream_exists(stream_id)?;
-        {
-            let get_stream_id = crate::streaming::streams::helpers::get_stream_id();
-            let stream_id = self.streams.with_stream_by_id(stream_id, get_stream_id);
-            self.permissioner
-                .borrow()
-                .purge_stream(session.get_user_id(), stream_id)
-                .error(|e: &IggyError| {
+
+        // Get stream ID from SharedMetadata
+        let numeric_stream_id = self
+            .shared_metadata
+            .get_stream_id(stream_id)
+            .ok_or_else(|| IggyError::StreamIdNotFound(stream_id.clone()))?;
+
+        self.permissioner
+            .purge_stream(session.get_user_id(), numeric_stream_id)
+            .error(|e: &IggyError| {
                 format!(
                     "{COMPONENT} (error: {e}) - permission denied to purge stream for user {}, stream ID: {}",
                     session.get_user_id(),
-                    stream_id,
+                    numeric_stream_id,
                 )
             })?;
-        }
 
         self.purge_stream_base(stream_id).await
     }
 
-    pub async fn purge_stream_bypass_auth(&self, stream_id: &Identifier) -> Result<(), IggyError> {
-        self.purge_stream_base(stream_id).await?;
-        Ok(())
-    }
-
     async fn purge_stream_base(&self, stream_id: &Identifier) -> Result<(), IggyError> {
-        // Get all topic IDs in the stream
-        let topic_ids = self
-            .streams
-            .with_stream_by_id(stream_id, streams::helpers::get_topic_ids());
+        // Get topic IDs from SharedMetadata
+        let numeric_stream_id = self
+            .shared_metadata
+            .get_stream_id(stream_id)
+            .ok_or_else(|| IggyError::StreamIdNotFound(stream_id.clone()))?;
 
-        // Purge each topic in the stream using bypass auth
+        let snapshot = self.shared_metadata.load();
+        let stream_meta = snapshot
+            .streams
+            .get(&numeric_stream_id)
+            .ok_or_else(|| IggyError::StreamIdNotFound(stream_id.clone()))?;
+        let topic_ids: Vec<usize> = stream_meta.topics.keys().copied().collect();
+        drop(snapshot);
+
         for topic_id in topic_ids {
             let topic_identifier = Identifier::numeric(topic_id as u32).unwrap();
-            self.purge_topic_bypass_auth(stream_id, &topic_identifier)
-                .await?;
+            self.purge_topic_base(stream_id, &topic_identifier).await?;
         }
 
         Ok(())

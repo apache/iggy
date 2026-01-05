@@ -23,11 +23,8 @@ use crate::binary::handlers::partitions::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 
 use crate::shard::IggyShard;
-use crate::shard::transmission::event::ShardEvent;
-use crate::slab::traits_ext::EntityMarker;
 use crate::state::command::EntryCommand;
 use crate::streaming::session::Session;
-use crate::streaming::{streams, topics};
 use anyhow::Result;
 use err_trail::ErrContext;
 use iggy_common::create_partitions::CreatePartitions;
@@ -53,7 +50,7 @@ impl ServerCommandHandler for CreatePartitions {
         // Acquire partition lock to serialize filesystem operations
         let _partition_guard = shard.fs_locks.partition_lock.lock().await;
 
-        let partitions = shard
+        let _partition_ids = shard
             .create_partitions(
                 session,
                 &self.stream_id,
@@ -61,28 +58,17 @@ impl ServerCommandHandler for CreatePartitions {
                 self.partitions_count,
             )
             .await?;
-        let partition_ids = partitions.iter().map(|p| p.id()).collect::<Vec<_>>();
-        let event = ShardEvent::CreatedPartitions {
-            stream_id: self.stream_id.clone(),
-            topic_id: self.topic_id.clone(),
-            partitions,
-        };
-        shard.broadcast_event_to_all_shards(event).await?;
 
-        shard.streams.with_topic_by_id_mut(
-            &self.stream_id,
-            &self.topic_id,
-            topics::helpers::rebalance_consumer_groups(&partition_ids),
-        );
+        // TODO: Consumer group rebalancing will be handled via SharedMetadata
 
         let stream_id = shard
-            .streams
-            .with_stream_by_id(&self.stream_id, streams::helpers::get_stream_id());
-        let topic_id = shard.streams.with_topic_by_id(
-            &self.stream_id,
-            &self.topic_id,
-            topics::helpers::get_topic_id(),
-        );
+            .shared_metadata
+            .get_stream_id(&self.stream_id)
+            .unwrap_or(0);
+        let topic_id = shard
+            .shared_metadata
+            .get_topic_id(stream_id, &self.topic_id)
+            .unwrap_or(0);
         shard
         .state
         .apply(

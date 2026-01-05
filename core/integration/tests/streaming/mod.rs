@@ -16,20 +16,30 @@
  * under the License.
  */
 
+use common::streaming_helper::StreamingTestHelper;
+use iggy_common::sharding::IggyNamespace;
 use iggy_common::{CompressionAlgorithm, Identifier, IggyError, IggyExpiry, MaxTopicSize};
 use server::{
     configs::system::SystemConfig,
+    metadata::SharedMetadata,
+    partition_store::{PartitionData, PartitionDataStore},
     shard::{task_registry::TaskRegistry, transmission::connector::ShardConnector},
-    slab::{streams::Streams, traits_ext::EntityMarker},
     streaming::{
-        self,
-        partitions::{partition, storage::create_partition_file_hierarchy},
+        partitions::{
+            helpers::create_message_deduplicator,
+            journal::MemoryMessageJournal,
+            log::SegmentedLog,
+            partition::{ConsumerGroupOffsets, ConsumerOffsets},
+            storage::create_partition_file_hierarchy,
+        },
         segments::{Segment, storage::create_segment_storage},
-        streams::{storage::create_stream_file_hierarchy, stream},
-        topics::{storage::create_topic_file_hierarchy, topic},
+        stats::PartitionStats,
+        streams::storage::create_stream_file_hierarchy,
+        topics::storage::create_topic_file_hierarchy,
     },
 };
 use std::rc::Rc;
+use std::sync::Arc;
 
 mod common;
 mod get_by_offset;
@@ -37,11 +47,14 @@ mod get_by_timestamp;
 mod snapshot;
 
 struct BootstrapResult {
-    streams: Streams,
+    #[allow(dead_code)]
+    shared_metadata: SharedMetadata,
+    streaming_helper: StreamingTestHelper,
     stream_id: Identifier,
     topic_id: Identifier,
     partition_id: usize,
     task_registry: Rc<TaskRegistry>,
+    namespace: IggyNamespace,
 }
 
 async fn bootstrap_test_environment(
@@ -54,46 +67,43 @@ async fn bootstrap_test_environment(
     let topic_size = MaxTopicSize::Unlimited;
     let partitions_count = 1;
 
-    let streams = Streams::default();
-    // Create stream together with its dirs
-    let stream = stream::create_and_insert_stream_mem(&streams, stream_name);
-    create_stream_file_hierarchy(stream.id(), config).await?;
-    // Create topic together with its dirs
-    let stream_id = Identifier::numeric(stream.id() as u32).unwrap();
-    let parent_stats = streams.with_stream_by_id(&stream_id, |(_, stats)| stats.clone());
+    // Create SharedMetadata and PartitionDataStore
+    let shared_metadata = SharedMetadata::new();
+    let mut partition_store = PartitionDataStore::new();
+
+    // Create stream in SharedMetadata
+    let stream_meta = shared_metadata.create_stream(stream_name)?;
+    let stream_id_numeric = stream_meta.id;
+    create_stream_file_hierarchy(stream_id_numeric, config).await?;
+
+    // Create topic in SharedMetadata
+    let stream_id = Identifier::numeric(stream_id_numeric as u32).unwrap();
     let message_expiry = config.resolve_message_expiry(topic_expiry);
     let max_topic_size = config.resolve_max_topic_size(topic_size)?;
 
-    let topic = topic::create_and_insert_topics_mem(
-        &streams,
+    let topic_meta = shared_metadata.create_topic(
         &stream_id,
         topic_name,
-        1,
+        1, // replication_factor
         message_expiry,
         CompressionAlgorithm::default(),
         max_topic_size,
-        parent_stats,
-    );
-    create_topic_file_hierarchy(stream.id(), topic.id(), config).await?;
-    // Create partition together with its dirs
-    let topic_id = Identifier::numeric(topic.id() as u32).unwrap();
-    let parent_stats = streams.with_topic_by_id(
-        &stream_id,
-        &topic_id,
-        streaming::topics::helpers::get_stats(),
-    );
-    let partitions = partition::create_and_insert_partitions_mem(
-        &streams,
-        &stream_id,
-        &topic_id,
-        parent_stats,
-        partitions_count,
-        config,
-    );
-    for partition in partitions {
-        create_partition_file_hierarchy(stream.id(), topic.id(), partition.id(), config).await?;
+    )?;
+    let topic_id_numeric = topic_meta.id;
+    create_topic_file_hierarchy(stream_id_numeric, topic_id_numeric, config).await?;
 
-        // Open the log
+    // Create partitions in SharedMetadata
+    let topic_id = Identifier::numeric(topic_id_numeric as u32).unwrap();
+    let partition_metas =
+        shared_metadata.create_partitions(&stream_id, &topic_id, partitions_count)?;
+
+    // For each partition, create file hierarchy and add to partition_store
+    for partition_meta in &partition_metas {
+        let partition_id = partition_meta.id;
+        create_partition_file_hierarchy(stream_id_numeric, topic_id_numeric, partition_id, config)
+            .await?;
+
+        // Create a segment and storage
         let start_offset = 0;
         let segment = Segment::new(
             start_offset,
@@ -104,29 +114,57 @@ async fn bootstrap_test_environment(
         let indexes_size = 0;
         let storage = create_segment_storage(
             config,
-            stream.id(),
-            topic.id(),
-            partition.id(),
+            stream_id_numeric,
+            topic_id_numeric,
+            partition_id,
             messages_size,
             indexes_size,
             start_offset,
         )
         .await?;
 
-        streams.with_partition_by_id_mut(&stream_id, &topic_id, partition.id(), |(.., log)| {
-            log.add_persisted_segment(segment, storage);
-        });
+        // Create SegmentedLog and add the persisted segment
+        let mut log: SegmentedLog<MemoryMessageJournal> = Default::default();
+        log.add_persisted_segment(segment, storage);
+
+        // Create partition stats
+        let stats = Arc::new(PartitionStats::default());
+
+        // Create PartitionData
+        let partition_data = PartitionData::new(
+            log,
+            Arc::clone(&partition_meta.offset),
+            Arc::new(ConsumerOffsets::with_capacity(128)),
+            Arc::new(ConsumerGroupOffsets::with_capacity(128)),
+            create_message_deduplicator(config).map(Arc::new),
+            stats,
+            partition_meta.created_at,
+            partition_meta
+                .should_increment_offset
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
+
+        // Insert into partition_store
+        let namespace = IggyNamespace::new(stream_id_numeric, topic_id_numeric, partition_id);
+        partition_store.insert(namespace, partition_data);
     }
 
     // Create a test task registry with dummy stop sender from ShardConnector
     let connector: ShardConnector<()> = ShardConnector::new(shard_id);
     let task_registry = Rc::new(TaskRegistry::new(shard_id, vec![connector.stop_sender]));
 
+    let namespace = IggyNamespace::new(stream_id_numeric, topic_id_numeric, 0);
+
+    // Create the streaming helper
+    let streaming_helper = StreamingTestHelper::new(partition_store);
+
     Ok(BootstrapResult {
-        streams,
+        shared_metadata,
+        streaming_helper,
         stream_id,
         topic_id,
         partition_id: 0,
         task_registry,
+        namespace,
     })
 }

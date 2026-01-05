@@ -40,6 +40,7 @@ iggy-web = ["dep:rust-embed", "dep:mime_guess"]
 [dependencies]
 ahash = { workspace = true }
 anyhow = { workspace = true }
+arc-swap = "1.8.0"
 arcshift = "0.4.2"
 argon2 = { workspace = true }
 async-channel = { workspace = true }
@@ -70,8 +71,8 @@ flume = { workspace = true }
 futures = { workspace = true }
 hash32 = "1.0.0"
 human-repr = { workspace = true }
-
 iggy_common = { workspace = true }
+imbl = "3"
 jsonwebtoken = { version = "10.2.0", features = ["rust_crypto"] }
 lending-iterator = "0.1.7"
 mimalloc = { workspace = true, optional = true }

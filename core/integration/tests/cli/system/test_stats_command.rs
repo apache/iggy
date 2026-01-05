@@ -133,12 +133,13 @@ impl IggyCmdTestCase for TestStatsCmd {
     }
 
     async fn verify_server_state(&self, client: &dyn Client) {
-        let topic = client
-            .delete_topic(&0.try_into().unwrap(), &0.try_into().unwrap())
-            .await;
+        let stream_id = Identifier::from_str_value("logs").unwrap();
+        let topic_id = Identifier::from_str_value("topic").unwrap();
+
+        let topic = client.delete_topic(&stream_id, &topic_id).await;
         assert!(topic.is_ok());
 
-        let stream = client.delete_stream(&0.try_into().unwrap()).await;
+        let stream = client.delete_stream(&stream_id).await;
         assert!(stream.is_ok());
     }
 }

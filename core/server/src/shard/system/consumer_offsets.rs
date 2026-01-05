@@ -1,34 +1,30 @@
 /* Licensed to the Apache Software Foundation (ASF) under one
-       polling_consumer: &PollingConsumer,
-* or more contributor license agreements.  See the NOTICE file
-* distributed with this work for additional information
-* regarding copyright ownership.  The ASF licenses this file
-* to you under the Apache License, Version 2.0 (the
-* "License"); you may not use this file except in compliance
-* with the License.  You may obtain a copy of the License at
-*
-*   http://www.apache.org/licenses/LICENSE-2.0
-*
-* Unless required by applicable law or agreed to in writing,
-* software distributed under the License is distributed on an
-* "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-* KIND, either express or implied.  See the License for the
-* specific language governing permissions and limitations
-* under the License.
-*/
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
 
 use super::COMPONENT;
-use crate::{
-    shard::IggyShard,
-    streaming::{
-        partitions,
-        polling_consumer::{ConsumerGroupId, PollingConsumer},
-        session::Session,
-        streams, topics,
-    },
-};
+use crate::shard::IggyShard;
+use crate::streaming::partitions::consumer_offset::ConsumerOffset;
+use crate::streaming::partitions::storage;
+use crate::streaming::polling_consumer::{ConsumerGroupId, PollingConsumer};
+use crate::streaming::session::Session;
 use err_trail::ErrContext;
-use iggy_common::{Consumer, ConsumerOffsetInfo, Identifier, IggyError};
+use iggy_common::{Consumer, ConsumerKind, ConsumerOffsetInfo, Identifier, IggyError};
+use std::sync::atomic::Ordering;
 
 impl IggyShard {
     pub async fn store_consumer_offset(
@@ -42,24 +38,26 @@ impl IggyShard {
     ) -> Result<(PollingConsumer, usize), IggyError> {
         self.ensure_authenticated(session)?;
         self.ensure_topic_exists(stream_id, topic_id)?;
-        {
-            let topic_id =
-                self.streams
-                    .with_topic_by_id(stream_id, topic_id, topics::helpers::get_topic_id());
-            let stream_id = self
-                .streams
-                .with_stream_by_id(stream_id, streams::helpers::get_stream_id());
-            self.permissioner.borrow().store_consumer_offset(
-                session.get_user_id(),
-                stream_id,
-                topic_id
-            ).error(|e: &IggyError| {
+
+        // Get numeric IDs from SharedMetadata
+        let numeric_stream_id = self
+            .shared_metadata
+            .get_stream_id(stream_id)
+            .ok_or_else(|| IggyError::StreamIdNotFound(stream_id.clone()))?;
+        let numeric_topic_id = self
+            .shared_metadata
+            .get_topic_id(numeric_stream_id, topic_id)
+            .ok_or_else(|| IggyError::TopicIdNotFound(topic_id.clone(), stream_id.clone()))?;
+
+        self.permissioner
+            .store_consumer_offset(session.get_user_id(), numeric_stream_id, numeric_topic_id)
+            .error(|e: &IggyError| {
                 format!(
-                    "{COMPONENT} (error: {e}) - permission denied to store consumer offset for user with ID: {}, consumer: {consumer} in topic with ID: {topic_id} and stream with ID: {stream_id}",
+                    "{COMPONENT} (error: {e}) - permission denied to store consumer offset for user with ID: {}, consumer: {consumer} in topic with ID: {numeric_topic_id} and stream with ID: {numeric_stream_id}",
                     session.get_user_id(),
                 )
             })?;
-        }
+
         let Some((polling_consumer, partition_id)) = self.resolve_consumer_with_partition_id(
             stream_id,
             topic_id,
@@ -74,14 +72,19 @@ impl IggyShard {
         self.ensure_partition_exists(stream_id, topic_id, partition_id)?;
 
         self.store_consumer_offset_base(
-            stream_id,
-            topic_id,
+            numeric_stream_id,
+            numeric_topic_id,
             &polling_consumer,
             partition_id,
             offset,
         );
-        self.persist_consumer_offset_to_disk(stream_id, topic_id, &polling_consumer, partition_id)
-            .await?;
+        self.persist_consumer_offset_to_disk(
+            numeric_stream_id,
+            numeric_topic_id,
+            &polling_consumer,
+            partition_id,
+        )
+        .await?;
         Ok((polling_consumer, partition_id))
     }
 
@@ -95,24 +98,26 @@ impl IggyShard {
     ) -> Result<Option<ConsumerOffsetInfo>, IggyError> {
         self.ensure_authenticated(session)?;
         self.ensure_topic_exists(stream_id, topic_id)?;
-        {
-            let topic_id =
-                self.streams
-                    .with_topic_by_id(stream_id, topic_id, topics::helpers::get_topic_id());
-            let stream_id = self
-                .streams
-                .with_stream_by_id(stream_id, streams::helpers::get_stream_id());
-            self.permissioner.borrow().get_consumer_offset(
-                session.get_user_id(),
-                stream_id,
-                topic_id
-            ).error(|e: &IggyError| {
+
+        // Get numeric IDs from SharedMetadata
+        let numeric_stream_id = self
+            .shared_metadata
+            .get_stream_id(stream_id)
+            .ok_or_else(|| IggyError::StreamIdNotFound(stream_id.clone()))?;
+        let numeric_topic_id = self
+            .shared_metadata
+            .get_topic_id(numeric_stream_id, topic_id)
+            .ok_or_else(|| IggyError::TopicIdNotFound(topic_id.clone(), stream_id.clone()))?;
+
+        self.permissioner
+            .get_consumer_offset(session.get_user_id(), numeric_stream_id, numeric_topic_id)
+            .error(|e: &IggyError| {
                 format!(
-                    "{COMPONENT} (error: {e}) - permission denied to get consumer offset for user with ID: {}, consumer: {consumer} in topic with ID: {topic_id} and stream with ID: {stream_id}",
+                    "{COMPONENT} (error: {e}) - permission denied to get consumer offset for user with ID: {}, consumer: {consumer} in topic with ID: {numeric_topic_id} and stream with ID: {numeric_stream_id}",
                     session.get_user_id()
                 )
             })?;
-        }
+
         let Some((polling_consumer, partition_id)) = self.resolve_consumer_with_partition_id(
             stream_id,
             topic_id,
@@ -126,20 +131,47 @@ impl IggyShard {
         };
         self.ensure_partition_exists(stream_id, topic_id, partition_id)?;
 
+        // Get the partition's current offset from SharedMetadata
+        use iggy_common::sharding::IggyNamespace;
+        let ns = IggyNamespace::new(numeric_stream_id, numeric_topic_id, partition_id);
+        let partition_current_offset = self
+            .shared_metadata
+            .get_partition(&ns)
+            .map(|p| p.current_offset())
+            .unwrap_or(0);
+
         let offset = match polling_consumer {
-            PollingConsumer::Consumer(id, _) => self.streams.with_partition_by_id(
-                stream_id,
-                topic_id,
-                partition_id,
-                partitions::helpers::get_consumer_offset(id),
-            ),
-            PollingConsumer::ConsumerGroup(consumer_group_id, _) => {
-                self.streams.with_partition_by_id(
-                    stream_id,
-                    topic_id,
+            PollingConsumer::Consumer(id, _) => {
+                let offsets = self.shared_consumer_offsets.get_consumer_offsets(
+                    numeric_stream_id,
+                    numeric_topic_id,
                     partition_id,
-                    partitions::helpers::get_consumer_group_offset(consumer_group_id),
-                )
+                );
+                offsets.and_then(|co| {
+                    let guard = co.pin();
+                    guard.get(&id).map(|offset| ConsumerOffsetInfo {
+                        partition_id: partition_id as u32,
+                        current_offset: partition_current_offset,
+                        stored_offset: offset.offset.load(Ordering::Relaxed),
+                    })
+                })
+            }
+            PollingConsumer::ConsumerGroup(consumer_group_id, _) => {
+                let offsets = self.shared_consumer_offsets.get_consumer_group_offsets(
+                    numeric_stream_id,
+                    numeric_topic_id,
+                    partition_id,
+                );
+                offsets.and_then(|co| {
+                    let guard = co.pin();
+                    guard
+                        .get(&consumer_group_id)
+                        .map(|offset| ConsumerOffsetInfo {
+                            partition_id: partition_id as u32,
+                            current_offset: partition_current_offset,
+                            stored_offset: offset.offset.load(Ordering::Relaxed),
+                        })
+                })
             }
         };
         Ok(offset)
@@ -155,24 +187,26 @@ impl IggyShard {
     ) -> Result<(PollingConsumer, usize), IggyError> {
         self.ensure_authenticated(session)?;
         self.ensure_topic_exists(stream_id, topic_id)?;
-        {
-            let topic_id =
-                self.streams
-                    .with_topic_by_id(stream_id, topic_id, topics::helpers::get_topic_id());
-            let stream_id = self
-                .streams
-                .with_stream_by_id(stream_id, streams::helpers::get_stream_id());
-            self.permissioner.borrow().delete_consumer_offset(
-                session.get_user_id(),
-                stream_id,
-                topic_id
-            ).error(|e: &IggyError| {
-            format!(
-                "{COMPONENT} (error: {e}) - permission denied to delete consumer offset for user with ID: {}, consumer: {consumer} in topic with ID: {topic_id} and stream with ID: {stream_id}",
-                session.get_user_id(),
-            )
-        })?;
-        }
+
+        // Get numeric IDs from SharedMetadata
+        let numeric_stream_id = self
+            .shared_metadata
+            .get_stream_id(stream_id)
+            .ok_or_else(|| IggyError::StreamIdNotFound(stream_id.clone()))?;
+        let numeric_topic_id = self
+            .shared_metadata
+            .get_topic_id(numeric_stream_id, topic_id)
+            .ok_or_else(|| IggyError::TopicIdNotFound(topic_id.clone(), stream_id.clone()))?;
+
+        self.permissioner
+            .delete_consumer_offset(session.get_user_id(), numeric_stream_id, numeric_topic_id)
+            .error(|e: &IggyError| {
+                format!(
+                    "{COMPONENT} (error: {e}) - permission denied to delete consumer offset for user with ID: {}, consumer: {consumer} in topic with ID: {numeric_topic_id} and stream with ID: {numeric_stream_id}",
+                    session.get_user_id(),
+                )
+            })?;
+
         let Some((polling_consumer, partition_id)) = self.resolve_consumer_with_partition_id(
             stream_id,
             topic_id,
@@ -186,8 +220,12 @@ impl IggyShard {
         };
         self.ensure_partition_exists(stream_id, topic_id, partition_id)?;
 
-        let path =
-            self.delete_consumer_offset_base(stream_id, topic_id, &polling_consumer, partition_id)?;
+        let path = self.delete_consumer_offset_base(
+            numeric_stream_id,
+            numeric_topic_id,
+            &polling_consumer,
+            partition_id,
+        )?;
         self.delete_consumer_offset_from_disk(&path).await?;
         Ok((polling_consumer, partition_id))
     }
@@ -199,36 +237,49 @@ impl IggyShard {
         topic_id: &Identifier,
         partition_ids: &[usize],
     ) -> Result<(), IggyError> {
-        for &partition_id in partition_ids {
-            // Skip if offset does not exist.
-            let has_offset = self
-                .streams
-                .with_partition_by_id(
-                    stream_id,
-                    topic_id,
-                    partition_id,
-                    partitions::helpers::get_consumer_group_offset(cg_id),
-                )
-                .is_some();
-            if !has_offset {
-                continue;
-            }
+        // Get numeric IDs from SharedMetadata
+        let numeric_stream_id = self
+            .shared_metadata
+            .get_stream_id(stream_id)
+            .ok_or_else(|| IggyError::StreamIdNotFound(stream_id.clone()))?;
+        let numeric_topic_id = self
+            .shared_metadata
+            .get_topic_id(numeric_stream_id, topic_id)
+            .ok_or_else(|| IggyError::TopicIdNotFound(topic_id.clone(), stream_id.clone()))?;
 
-            let path = self.streams
-                .with_partition_by_id(stream_id, topic_id, partition_id, partitions::helpers::delete_consumer_group_offset(cg_id))
+        for &partition_id in partition_ids {
+            // Get consumer group offsets
+            let offsets = self.shared_consumer_offsets.get_consumer_group_offsets(
+                numeric_stream_id,
+                numeric_topic_id,
+                partition_id,
+            );
+
+            // Skip if offset does not exist
+            let Some(offsets) = offsets else {
+                continue;
+            };
+
+            let path = {
+                let guard = offsets.pin();
+                let item = guard.get(&cg_id);
+                if item.is_none() {
+                    continue;
+                }
+                item.unwrap().path.clone()
+            };
+
+            // Remove from in-memory store
+            offsets.pin().remove(&cg_id);
+
+            self.delete_consumer_offset_from_disk(&path)
+                .await
                 .error(|e: &IggyError| {
                     format!(
-                        "{COMPONENT} (error: {e}) - failed to delete consumer group offset for group with ID: {} in partition {} of topic with ID: {} and stream with ID: {}",
+                        "{COMPONENT} (error: {e}) - failed to delete consumer group offset file for group with ID: {:?} in partition {} of topic with ID: {} and stream with ID: {}",
                         cg_id, partition_id, topic_id, stream_id
                     )
                 })?;
-
-            self.delete_consumer_offset_from_disk(&path).await.error(|e: &IggyError| {
-                format!(
-                    "{COMPONENT} (error: {e}) - failed to delete consumer group offset file for group with ID: {} in partition {} of topic with ID: {} and stream with ID: {}",
-                    cg_id, partition_id, topic_id, stream_id
-                )
-            })?;
         }
 
         Ok(())
@@ -236,144 +287,161 @@ impl IggyShard {
 
     fn store_consumer_offset_base(
         &self,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
+        stream_id: usize,
+        topic_id: usize,
         polling_consumer: &PollingConsumer,
         partition_id: usize,
         offset: u64,
     ) {
-        let stream_id_num = self
-            .streams
-            .with_stream_by_id(stream_id, streams::helpers::get_stream_id());
-        let topic_id_num =
-            self.streams
-                .with_topic_by_id(stream_id, topic_id, topics::helpers::get_topic_id());
-
         match polling_consumer {
             PollingConsumer::Consumer(id, _) => {
-                self.streams.with_partition_by_id(
+                let offsets = self.shared_consumer_offsets.get_consumer_offsets(
                     stream_id,
                     topic_id,
                     partition_id,
-                    partitions::helpers::store_consumer_offset(
-                        *id,
-                        stream_id_num,
-                        topic_id_num,
-                        partition_id,
-                        offset,
-                        &self.config.system,
-                    ),
                 );
+
+                if let Some(offsets) = offsets {
+                    let guard = offsets.pin();
+                    if let Some(existing) = guard.get(id) {
+                        existing.offset.store(offset, Ordering::Relaxed);
+                    } else {
+                        let dir_path = self.config.system.get_consumer_offsets_path(
+                            stream_id,
+                            topic_id,
+                            partition_id,
+                        );
+                        let path = format!("{}/{}", dir_path, id);
+                        let consumer_offset =
+                            ConsumerOffset::new(ConsumerKind::Consumer, *id as u32, offset, path);
+                        drop(guard);
+                        offsets.pin().insert(*id, consumer_offset);
+                    }
+                }
             }
-            PollingConsumer::ConsumerGroup(consumer_group_id, _) => {
-                self.streams.with_partition_by_id(
+            PollingConsumer::ConsumerGroup(cg_id, _) => {
+                let offsets = self.shared_consumer_offsets.get_consumer_group_offsets(
                     stream_id,
                     topic_id,
                     partition_id,
-                    partitions::helpers::store_consumer_group_offset(
-                        *consumer_group_id,
-                        stream_id_num,
-                        topic_id_num,
-                        partition_id,
-                        offset,
-                        &self.config.system,
-                    ),
                 );
+
+                if let Some(offsets) = offsets {
+                    let guard = offsets.pin();
+                    if let Some(existing) = guard.get(cg_id) {
+                        existing.offset.store(offset, Ordering::Relaxed);
+                    } else {
+                        let dir_path = self.config.system.get_consumer_group_offsets_path(
+                            stream_id,
+                            topic_id,
+                            partition_id,
+                        );
+                        let path = format!("{}/{}", dir_path, cg_id.0);
+                        let consumer_offset = ConsumerOffset::new(
+                            ConsumerKind::ConsumerGroup,
+                            cg_id.0 as u32,
+                            offset,
+                            path,
+                        );
+                        drop(guard);
+                        offsets.pin().insert(*cg_id, consumer_offset);
+                    }
+                }
             }
         }
     }
 
     fn delete_consumer_offset_base(
         &self,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
+        stream_id: usize,
+        topic_id: usize,
         polling_consumer: &PollingConsumer,
         partition_id: usize,
     ) -> Result<String, IggyError> {
         match polling_consumer {
             PollingConsumer::Consumer(id, _) => {
-                self.streams
-                    .with_partition_by_id(stream_id, topic_id, partition_id, partitions::helpers::delete_consumer_offset(*id)).error(|e: &IggyError| {
-                        format!(
-                            "{COMPONENT} (error: {e}) - failed to delete consumer offset for consumer with ID: {id} in topic with ID: {topic_id} and stream with ID: {stream_id}",
-                        )
-                    })
+                let offsets = self
+                    .shared_consumer_offsets
+                    .get_consumer_offsets(stream_id, topic_id, partition_id)
+                    .ok_or_else(|| IggyError::ConsumerOffsetNotFound(*id))?;
+
+                let guard = offsets.pin();
+                let item = guard
+                    .get(id)
+                    .ok_or_else(|| IggyError::ConsumerOffsetNotFound(*id))?;
+                let path = item.path.clone();
+                drop(guard);
+
+                offsets.pin().remove(id);
+                Ok(path)
             }
-            PollingConsumer::ConsumerGroup(consumer_group_id, _) => {
-                self.streams
-                    .with_partition_by_id(stream_id, topic_id, partition_id, partitions::helpers::delete_consumer_group_offset(*consumer_group_id)).error(|e: &IggyError| {
-                        format!(
-                            "{COMPONENT} (error: {e}) - failed to delete consumer group offset for group with ID: {consumer_group_id:?} in topic with ID: {topic_id} and stream with ID: {stream_id}",
-                        )
-                    })
+            PollingConsumer::ConsumerGroup(cg_id, _) => {
+                let offsets = self
+                    .shared_consumer_offsets
+                    .get_consumer_group_offsets(stream_id, topic_id, partition_id)
+                    .ok_or_else(|| IggyError::ConsumerOffsetNotFound(cg_id.0))?;
+
+                let guard = offsets.pin();
+                let item = guard
+                    .get(cg_id)
+                    .ok_or_else(|| IggyError::ConsumerOffsetNotFound(cg_id.0))?;
+                let path = item.path.clone();
+                drop(guard);
+
+                offsets.pin().remove(cg_id);
+                Ok(path)
             }
         }
     }
 
     async fn persist_consumer_offset_to_disk(
         &self,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
+        stream_id: usize,
+        topic_id: usize,
         polling_consumer: &PollingConsumer,
         partition_id: usize,
     ) -> Result<(), IggyError> {
         match polling_consumer {
             PollingConsumer::Consumer(id, _) => {
-                let (offset_value, path) = self.streams.with_partition_by_id(
+                let offsets = self.shared_consumer_offsets.get_consumer_offsets(
                     stream_id,
                     topic_id,
                     partition_id,
-                    |(.., offsets, _, _)| {
-                        let hdl = offsets.pin();
-                        let item = hdl
-                            .get(id)
-                            .expect("persist_consumer_offset_to_disk: offset not found");
-                        let offset = item.offset.load(std::sync::atomic::Ordering::Relaxed);
+                );
+
+                if let Some(offsets) = offsets {
+                    let guard = offsets.pin();
+                    if let Some(item) = guard.get(id) {
+                        let offset_value = item.offset.load(Ordering::Relaxed);
                         let path = item.path.clone();
-                        (offset, path)
-                    },
-                );
-                partitions::storage::persist_offset(&path, offset_value).await
+                        drop(guard);
+                        return storage::persist_offset(&path, offset_value).await;
+                    }
+                }
+                Err(IggyError::ConsumerOffsetNotFound(*id))
             }
-            PollingConsumer::ConsumerGroup(consumer_group_id, _) => {
-                let (offset_value, path) = self.streams.with_partition_by_id(
+            PollingConsumer::ConsumerGroup(cg_id, _) => {
+                let offsets = self.shared_consumer_offsets.get_consumer_group_offsets(
                     stream_id,
                     topic_id,
                     partition_id,
-                    move |(.., offsets, _)| {
-                        let hdl = offsets.pin();
-                        let item = hdl
-                            .get(consumer_group_id)
-                            .expect("persist_consumer_offset_to_disk: offset not found");
-                        (
-                            item.offset.load(std::sync::atomic::Ordering::Relaxed),
-                            item.path.clone(),
-                        )
-                    },
                 );
-                partitions::storage::persist_offset(&path, offset_value).await
+
+                if let Some(offsets) = offsets {
+                    let guard = offsets.pin();
+                    if let Some(item) = guard.get(cg_id) {
+                        let offset_value = item.offset.load(Ordering::Relaxed);
+                        let path = item.path.clone();
+                        drop(guard);
+                        return storage::persist_offset(&path, offset_value).await;
+                    }
+                }
+                Err(IggyError::ConsumerOffsetNotFound(cg_id.0))
             }
         }
     }
 
     pub async fn delete_consumer_offset_from_disk(&self, path: &str) -> Result<(), IggyError> {
-        partitions::storage::delete_persisted_offset(path).await
-    }
-
-    pub fn store_consumer_offset_bypass_auth(
-        &self,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-        polling_consumer: &PollingConsumer,
-        partition_id: usize,
-        offset: u64,
-    ) {
-        self.store_consumer_offset_base(
-            stream_id,
-            topic_id,
-            polling_consumer,
-            partition_id,
-            offset,
-        );
+        storage::delete_persisted_offset(path).await
     }
 }

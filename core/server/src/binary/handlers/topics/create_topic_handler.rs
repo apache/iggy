@@ -24,16 +24,13 @@ use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
 
 use crate::shard::IggyShard;
-use crate::shard::transmission::event::ShardEvent;
 use crate::shard::transmission::frame::ShardResponse;
 use crate::shard::transmission::message::{
     ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult,
 };
-use crate::slab::traits_ext::EntityMarker;
 use crate::state::command::EntryCommand;
 use crate::state::models::CreateTopicWithId;
 use crate::streaming::session::Session;
-use crate::streaming::streams;
 use anyhow::Result;
 use err_trail::ErrContext;
 use iggy_common::create_topic::CreateTopic;
@@ -90,7 +87,7 @@ impl ServerCommandHandler for CreateTopic {
                     // Acquire topic lock to serialize filesystem operations
                     let _topic_guard = shard.fs_locks.topic_lock.lock().await;
 
-                    let topic = shard
+                    let topic_meta = shard
                         .create_topic(
                             session,
                             &stream_id,
@@ -101,21 +98,16 @@ impl ServerCommandHandler for CreateTopic {
                             replication_factor,
                         )
                         .await?;
-                    self.message_expiry = topic.root().message_expiry();
-                    self.max_topic_size = topic.root().max_topic_size();
+                    self.message_expiry = topic_meta.message_expiry;
+                    self.max_topic_size = topic_meta.max_topic_size;
 
                     let stream_id_num = shard
-                        .streams
-                        .with_stream_by_id(&stream_id, streams::helpers::get_stream_id());
-                    let topic_id = topic.id();
+                        .shared_metadata
+                        .get_stream_id(&stream_id)
+                        .ok_or_else(|| IggyError::StreamIdNotFound(stream_id.clone()))?;
+                    let topic_id = topic_meta.id;
 
-                    let event = ShardEvent::CreatedTopic {
-                        stream_id: stream_id.clone(),
-                        topic,
-                    };
-
-                    shard.broadcast_event_to_all_shards(event).await?;
-                    let partitions = shard
+                    shard
                         .create_partitions(
                             session,
                             &stream_id,
@@ -123,18 +115,10 @@ impl ServerCommandHandler for CreateTopic {
                             partitions_count,
                         )
                         .await?;
-                    let event = ShardEvent::CreatedPartitions {
-                        stream_id: stream_id.clone(),
-                        topic_id: Identifier::numeric(topic_id as u32).unwrap(),
-                        partitions,
-                    };
-                    shard.broadcast_event_to_all_shards(event).await?;
 
-                    let response = shard.streams.with_topic_by_id(
-                        &stream_id,
-                        &Identifier::numeric(topic_id as u32).unwrap(),
-                        |(root, _, stats)| mapper::map_topic(&root, &stats),
-                    );
+                    // Map response from metadata (stats are zeros for new topic)
+                    let response = mapper::map_topic_from_metadata(&topic_meta);
+
                     shard
                         .state
                         .apply(session.get_user_id(), &EntryCommand::CreateTopic(CreateTopicWithId {
@@ -155,20 +139,19 @@ impl ServerCommandHandler for CreateTopic {
                 }
             }
             ShardSendRequestResult::Response(response) => match response {
-                ShardResponse::CreateTopicResponse(topic) => {
-                    let topic_id = topic.id();
-                    self.message_expiry = topic.root().message_expiry();
-                    self.max_topic_size = topic.root().max_topic_size();
+                ShardResponse::CreateTopicResponse(topic_meta) => {
+                    let topic_id = topic_meta.id;
+                    self.message_expiry = topic_meta.message_expiry;
+                    self.max_topic_size = topic_meta.max_topic_size;
 
+                    // Get stream_id from SharedMetadata
                     let stream_id = shard
-                        .streams
-                        .with_stream_by_id(&self.stream_id, streams::helpers::get_stream_id());
+                        .shared_metadata
+                        .get_stream_id(&self.stream_id)
+                        .ok_or_else(|| IggyError::StreamIdNotFound(self.stream_id.clone()))?;
 
-                    let response = shard.streams.with_topic_by_id(
-                        &self.stream_id,
-                        &Identifier::numeric(topic_id as u32).unwrap(),
-                        |(root, _, stats)| mapper::map_topic(&root, &stats),
-                    );
+                    // Map response from metadata (stats are zeros for new topic)
+                    let response = mapper::map_topic_from_metadata(&topic_meta);
 
                     shard
                         .state

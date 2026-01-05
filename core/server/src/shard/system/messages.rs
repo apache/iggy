@@ -19,14 +19,13 @@
 use super::COMPONENT;
 use crate::binary::handlers::messages::poll_messages_handler::IggyPollMetadata;
 use crate::shard::IggyShard;
-use crate::shard::namespace::IggyFullNamespace;
 use crate::shard::transmission::frame::ShardResponse;
 use crate::shard::transmission::message::{
     ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult,
 };
+use crate::streaming::partitions::journal::Journal;
+use crate::streaming::polling_consumer::PollingConsumer;
 use crate::streaming::segments::{IggyIndexesMut, IggyMessagesBatchMut, IggyMessagesBatchSet};
-use crate::streaming::traits::MainOps;
-use crate::streaming::{partitions, streams, topics};
 use err_trail::ErrContext;
 use iggy_common::PooledBuffer;
 use iggy_common::sharding::IggyNamespace;
@@ -34,8 +33,7 @@ use iggy_common::{
     BytesSerializable, Consumer, EncryptorKind, IGGY_MESSAGE_HEADER_SIZE, Identifier, IggyError,
     PollingKind, PollingStrategy,
 };
-use std::sync::atomic::Ordering;
-use tracing::error;
+use tracing::{error, trace};
 
 impl IggyShard {
     pub async fn append_messages(
@@ -48,17 +46,18 @@ impl IggyShard {
     ) -> Result<(), IggyError> {
         self.ensure_topic_exists(&stream_id, &topic_id)?;
 
-        let numeric_stream_id = self
-            .streams
-            .with_stream_by_id(&stream_id, streams::helpers::get_stream_id());
-
-        let numeric_topic_id =
-            self.streams
-                .with_topic_by_id(&stream_id, &topic_id, topics::helpers::get_topic_id());
+        // Get IDs from SharedMetadata (source of truth for cross-shard consistency)
+        let metadata = self.shared_metadata.load();
+        let numeric_stream_id = metadata
+            .get_stream_id(&stream_id)
+            .ok_or_else(|| IggyError::StreamIdNotFound(stream_id.clone()))?;
+        let numeric_topic_id = metadata
+            .get_topic_id(numeric_stream_id, &topic_id)
+            .ok_or_else(|| IggyError::TopicIdNotFound(topic_id.clone(), stream_id.clone()))?;
+        drop(metadata);
 
         // Validate permissions for given user on stream and topic.
         self.permissioner
-            .borrow()
             .append_messages(
                 user_id,
                 numeric_stream_id,
@@ -92,13 +91,30 @@ impl IggyShard {
                 }) = message
                     && let ShardRequestPayload::SendMessages { batch } = payload
                 {
-                    let ns = IggyFullNamespace::new(stream_id, topic_id, partition_id);
-                    // Encrypt messages if encryptor is enabled in configuration.
+                    // Convert identifiers to numeric IDs using SharedMetadata
+                    let metadata = self.shared_metadata.load();
+                    let numeric_stream_id = metadata
+                        .get_stream_id(&stream_id)
+                        .ok_or_else(|| IggyError::StreamIdNotFound(stream_id.clone()))?;
+                    let numeric_topic_id = metadata
+                        .get_topic_id(numeric_stream_id, &topic_id)
+                        .ok_or_else(|| {
+                            IggyError::TopicIdNotFound(topic_id.clone(), stream_id.clone())
+                        })?;
+                    drop(metadata);
+
+                    let namespace =
+                        IggyNamespace::new(numeric_stream_id, numeric_topic_id, partition_id);
+
+                    // Ensure partition exists in partition_store (lazy init if needed)
+                    if !self.partition_store.borrow().contains(&namespace) {
+                        self.ensure_local_partition(&stream_id, &topic_id, partition_id)
+                            .await?;
+                    }
+
                     let batch = self.maybe_encrypt_messages(batch)?;
                     let messages_count = batch.count();
-                    self.streams
-                        .append_messages(&self.config.system, &self.task_registry, &ns, batch)
-                        .await?;
+                    self.append_to_partition_store(&namespace, batch).await?;
                     self.metrics.increment_messages(messages_count as u64);
                     Ok(())
                 } else {
@@ -132,15 +148,17 @@ impl IggyShard {
     ) -> Result<(IggyPollMetadata, IggyMessagesBatchSet), IggyError> {
         self.ensure_topic_exists(&stream_id, &topic_id)?;
 
-        let numeric_stream_id = self
-            .streams
-            .with_stream_by_id(&stream_id, streams::helpers::get_stream_id());
-        let numeric_topic_id =
-            self.streams
-                .with_topic_by_id(&stream_id, &topic_id, topics::helpers::get_topic_id());
+        // Get IDs from SharedMetadata (source of truth for cross-shard consistency)
+        let metadata = self.shared_metadata.load();
+        let numeric_stream_id = metadata
+            .get_stream_id(&stream_id)
+            .ok_or_else(|| IggyError::StreamIdNotFound(stream_id.clone()))?;
+        let numeric_topic_id = metadata
+            .get_topic_id(numeric_stream_id, &topic_id)
+            .ok_or_else(|| IggyError::TopicIdNotFound(topic_id.clone(), stream_id.clone()))?;
+        drop(metadata);
 
         self.permissioner
-            .borrow()
             .poll_messages(user_id, numeric_stream_id, numeric_topic_id)
             .error(|e: &IggyError| format!(
                 "{COMPONENT} (error: {e}) - permission denied to poll messages for user {} on stream ID: {}, topic ID: {}",
@@ -164,15 +182,12 @@ impl IggyShard {
 
         self.ensure_partition_exists(&stream_id, &topic_id, partition_id)?;
 
-        let current_offset = self.streams.with_partition_by_id(
-            &stream_id,
-            &topic_id,
-            partition_id,
-            |(_, _, _, offset, ..)| offset.load(Ordering::Relaxed),
-        );
-        if args.strategy.kind == PollingKind::Offset && args.strategy.value > current_offset
-            || args.count == 0
-        {
+        // Early return for zero count (this is universal)
+        if args.count == 0 {
+            let current_offset = self
+                .shared_metadata
+                .get_partition_offset(numeric_stream_id, numeric_topic_id, partition_id)
+                .unwrap_or(0);
             return Ok((
                 IggyPollMetadata::new(partition_id as u32, current_offset),
                 IggyMessagesBatchSet::empty(),
@@ -180,6 +195,27 @@ impl IggyShard {
         }
 
         let namespace = IggyNamespace::new(numeric_stream_id, numeric_topic_id, partition_id);
+
+        // Only do the offset range check if this shard owns the partition.
+        // For cross-shard requests, the owning shard will do this check.
+        let owns_partition = self
+            .find_shard(&namespace)
+            .is_some_and(|shard| shard.id == self.id);
+
+        if owns_partition && args.strategy.kind == PollingKind::Offset {
+            let current_offset = self
+                .shared_metadata
+                .get_partition_offset(numeric_stream_id, numeric_topic_id, partition_id)
+                .unwrap_or(0);
+            if args.strategy.value > current_offset {
+                return Ok((
+                    IggyPollMetadata::new(partition_id as u32, current_offset),
+                    IggyMessagesBatchSet::empty(),
+                ));
+            }
+        }
+
+        // Namespace already created above, just reuse it
         let payload = ShardRequestPayload::PollMessages { consumer, args };
         let request = ShardRequest::new(stream_id.clone(), topic_id.clone(), partition_id, payload);
         let message = ShardMessage::Request(request);
@@ -195,29 +231,41 @@ impl IggyShard {
                 }) = message
                     && let ShardRequestPayload::PollMessages { consumer, args } = payload
                 {
-                    let ns = IggyFullNamespace::new(stream_id, topic_id, partition_id);
-                    let auto_commit = args.auto_commit;
-                    let (metadata, batches) =
-                        self.streams.poll_messages(&ns, consumer, args).await?;
-                    let stream_id = ns.stream_id();
-                    let topic_id = ns.topic_id();
+                    // Convert identifiers to numeric IDs using SharedMetadata
+                    let metadata_guard = self.shared_metadata.load();
+                    let numeric_stream_id = metadata_guard
+                        .get_stream_id(&stream_id)
+                        .ok_or_else(|| IggyError::StreamIdNotFound(stream_id.clone()))?;
+                    let numeric_topic_id = metadata_guard
+                        .get_topic_id(numeric_stream_id, &topic_id)
+                        .ok_or_else(|| {
+                            IggyError::TopicIdNotFound(topic_id.clone(), stream_id.clone())
+                        })?;
+                    drop(metadata_guard);
 
+                    let namespace =
+                        IggyNamespace::new(numeric_stream_id, numeric_topic_id, partition_id);
+                    let auto_commit = args.auto_commit;
+
+                    // Ensure partition exists in partition_store (lazy init if needed)
+                    if !self.partition_store.borrow().contains(&namespace) {
+                        self.ensure_local_partition(&stream_id, &topic_id, partition_id)
+                            .await?;
+                    }
+
+                    let (poll_metadata, batches) = self
+                        .poll_from_partition_store(&namespace, partition_id, consumer, args)
+                        .await?;
+
+                    // Handle auto_commit via partition_store
                     if auto_commit && !batches.is_empty() {
                         let offset = batches
                             .last_offset()
                             .expect("Batch set should have at least one batch");
-                        self.streams
-                            .auto_commit_consumer_offset(
-                                &self.config.system,
-                                stream_id,
-                                topic_id,
-                                partition_id,
-                                consumer,
-                                offset,
-                            )
+                        self.store_consumer_offset_in_partition_store(&namespace, consumer, offset)
                             .await?;
                     }
-                    Ok((metadata, batches))
+                    Ok((poll_metadata, batches))
                 } else {
                     unreachable!(
                         "Expected a PollMessages request inside of PollMessages handler, impossible state"
@@ -252,17 +300,18 @@ impl IggyShard {
     ) -> Result<(), IggyError> {
         self.ensure_partition_exists(&stream_id, &topic_id, partition_id)?;
 
-        let numeric_stream_id = self
-            .streams
-            .with_stream_by_id(&stream_id, streams::helpers::get_stream_id());
-
-        let numeric_topic_id =
-            self.streams
-                .with_topic_by_id(&stream_id, &topic_id, topics::helpers::get_topic_id());
+        // Get IDs from SharedMetadata (source of truth for cross-shard consistency)
+        let metadata = self.shared_metadata.load();
+        let numeric_stream_id = metadata
+            .get_stream_id(&stream_id)
+            .ok_or_else(|| IggyError::StreamIdNotFound(stream_id.clone()))?;
+        let numeric_topic_id = metadata
+            .get_topic_id(numeric_stream_id, &topic_id)
+            .ok_or_else(|| IggyError::TopicIdNotFound(topic_id.clone(), stream_id.clone()))?;
+        drop(metadata);
 
         // Validate permissions for given user on stream and topic.
         self.permissioner
-            .borrow()
             .append_messages(user_id, numeric_stream_id, numeric_topic_id)
             .error(|e: &IggyError| {
                 format!("{COMPONENT} (error: {e}) - permission denied to flush unsaved buffer for user {} on stream ID: {}, topic ID: {}", user_id, numeric_stream_id as u32, numeric_topic_id as u32)
@@ -287,8 +336,33 @@ impl IggyShard {
                 }) = message
                     && let ShardRequestPayload::FlushUnsavedBuffer { fsync } = payload
                 {
-                    self.flush_unsaved_buffer_base(&stream_id, &topic_id, partition_id, fsync)
+                    // Ensure partition is lazily loaded (creates slab hierarchy if needed)
+                    self.ensure_local_partition(&stream_id, &topic_id, partition_id)
                         .await?;
+
+                    // Convert identifiers to numeric IDs using SharedMetadata
+                    let metadata_guard = self.shared_metadata.load();
+                    let numeric_stream_id = metadata_guard
+                        .get_stream_id(&stream_id)
+                        .ok_or_else(|| IggyError::StreamIdNotFound(stream_id.clone()))?;
+                    let numeric_topic_id = metadata_guard
+                        .get_topic_id(numeric_stream_id, &topic_id)
+                        .ok_or_else(|| {
+                            IggyError::TopicIdNotFound(topic_id.clone(), stream_id.clone())
+                        })?;
+                    drop(metadata_guard);
+
+                    let stream_ident =
+                        Identifier::numeric(numeric_stream_id as u32).expect("valid stream id");
+                    let topic_ident =
+                        Identifier::numeric(numeric_topic_id as u32).expect("valid topic id");
+                    self.flush_unsaved_buffer_base(
+                        &stream_ident,
+                        &topic_ident,
+                        partition_id,
+                        fsync,
+                    )
+                    .await?;
                     Ok(())
                 } else {
                     unreachable!(
@@ -315,28 +389,35 @@ impl IggyShard {
         partition_id: usize,
         fsync: bool,
     ) -> Result<(), IggyError> {
-        let batches = self.streams.with_partition_by_id_mut(
-            stream_id,
-            topic_id,
-            partition_id,
-            partitions::helpers::commit_journal(),
-        );
+        // Resolve identifiers to numeric IDs
+        let numeric_stream_id = self
+            .shared_metadata
+            .get_stream_id(stream_id)
+            .ok_or_else(|| IggyError::StreamIdNotFound(stream_id.clone()))?;
+        let numeric_topic_id = self
+            .shared_metadata
+            .get_topic_id(numeric_stream_id, topic_id)
+            .ok_or_else(|| IggyError::TopicIdNotFound(topic_id.clone(), stream_id.clone()))?;
 
-        self.streams
-            .persist_messages_to_disk(
-                stream_id,
-                topic_id,
-                partition_id,
-                batches,
-                &self.config.system,
-            )
-            .await?;
+        let namespace = IggyNamespace::new(numeric_stream_id, numeric_topic_id, partition_id);
+
+        // Get partition from partition_store
+        let rc_partition = self.partition_store.borrow().get_rc(&namespace).ok_or(
+            IggyError::PartitionNotFound(partition_id, topic_id.clone(), stream_id.clone()),
+        )?;
+
+        // Persist messages to disk
+        {
+            let mut partition_data = rc_partition.borrow_mut();
+            partition_data
+                .persist_messages("flush_unsaved_buffer", &self.config.system)
+                .await?;
+        }
 
         // Ensure all data is flushed to disk before returning
         if fsync {
-            self.streams
-                .fsync_all_messages(stream_id, topic_id, partition_id)
-                .await?;
+            let partition_data = rc_partition.borrow();
+            partition_data.fsync_all_messages().await?;
         }
 
         Ok(())
@@ -387,6 +468,239 @@ impl IggyShard {
         Ok(IggyMessagesBatchSet::from_vec(decrypted_batches))
     }
 
+    /// Append messages using partition_store for direct data access.
+    ///
+    /// This method uses SharedMetadata for validation (lock-free reads) and
+    /// partition_store for data operations, bypassing the slab closure pattern.
+    pub async fn append_messages_via_store(
+        &self,
+        user_id: u32,
+        stream_id: Identifier,
+        topic_id: Identifier,
+        partition_id: usize,
+        batch: IggyMessagesBatchMut,
+    ) -> Result<(), IggyError> {
+        // Validate and resolve IDs via SharedMetadata
+        let numeric_stream_id = self
+            .shared_metadata
+            .get_stream_id(&stream_id)
+            .ok_or_else(|| IggyError::StreamIdNotFound(stream_id.clone()))?;
+
+        let numeric_topic_id = self
+            .shared_metadata
+            .get_topic_id(numeric_stream_id, &topic_id)
+            .ok_or_else(|| IggyError::TopicIdNotFound(topic_id.clone(), stream_id.clone()))?;
+
+        // Validate partition exists via SharedMetadata
+        let namespace = IggyNamespace::new(numeric_stream_id, numeric_topic_id, partition_id);
+        if !self.shared_metadata.partition_exists(&namespace) {
+            return Err(IggyError::PartitionNotFound(
+                partition_id,
+                topic_id.clone(),
+                stream_id.clone(),
+            ));
+        }
+
+        // Validate permissions
+        self.permissioner
+            .append_messages(user_id, numeric_stream_id, numeric_topic_id)
+            .error(|e: &IggyError| {
+                format!(
+                    "{COMPONENT} (error: {e}) - permission denied to append messages for user {} on stream ID: {}, topic ID: {}",
+                    user_id, numeric_stream_id as u32, numeric_topic_id as u32
+                )
+            })?;
+
+        if batch.count() == 0 {
+            return Ok(());
+        }
+
+        // Route request to owning shard
+        let payload = ShardRequestPayload::SendMessages { batch };
+        let request = ShardRequest::new(stream_id.clone(), topic_id.clone(), partition_id, payload);
+        let message = ShardMessage::Request(request);
+
+        match self
+            .send_request_to_shard_or_recoil(Some(&namespace), message)
+            .await?
+        {
+            ShardSendRequestResult::Recoil(message) => {
+                if let ShardMessage::Request(ShardRequest { payload, .. }) = message
+                    && let ShardRequestPayload::SendMessages { batch } = payload
+                {
+                    // Encrypt if configured
+                    let batch = self.maybe_encrypt_messages(batch)?;
+                    let messages_count = batch.count();
+
+                    // Append directly to partition_store
+                    self.append_to_partition_store(&namespace, batch).await?;
+                    self.metrics.increment_messages(messages_count as u64);
+                    Ok(())
+                } else {
+                    unreachable!(
+                        "Expected a SendMessages request inside of SendMessages handler, impossible state"
+                    );
+                }
+            }
+            ShardSendRequestResult::Response(response) => match response {
+                ShardResponse::SendMessages => Ok(()),
+                ShardResponse::ErrorResponse(err) => Err(err),
+                _ => unreachable!(
+                    "Expected a SendMessages response inside of SendMessages handler, impossible state"
+                ),
+            },
+        }?;
+
+        Ok(())
+    }
+
+    /// Append a batch of messages directly to partition_store.
+    ///
+    /// This bypasses the slab closure pattern for O(1) partition access.
+    /// Used by handlers when processing routed SendMessages requests.
+    ///
+    /// Offset is read/written from SharedMetadata's PartitionMeta.offset,
+    /// ensuring cross-shard consistency.
+    pub(crate) async fn append_to_partition_store(
+        &self,
+        namespace: &IggyNamespace,
+        mut batch: IggyMessagesBatchMut,
+    ) -> Result<(), IggyError> {
+        // Get the shared partition offset from SharedMetadata (source of truth)
+        let partition_meta = self
+            .shared_metadata
+            .get_partition(namespace)
+            .ok_or_else(|| {
+                IggyError::PartitionNotFound(
+                    namespace.partition_id(),
+                    Identifier::numeric(namespace.topic_id() as u32).expect("valid topic id"),
+                    Identifier::numeric(namespace.stream_id() as u32).expect("valid stream id"),
+                )
+            })?;
+
+        // Extract partition data synchronously to get values needed for prepare_for_persistence
+        let (segment_start_offset, current_offset, current_position, deduplicator) = {
+            let store = self.partition_store.borrow();
+            let rc_partition = store.get(namespace).ok_or_else(|| {
+                IggyError::PartitionNotFound(
+                    namespace.partition_id(),
+                    Identifier::numeric(namespace.topic_id() as u32).expect("valid topic id"),
+                    Identifier::numeric(namespace.stream_id() as u32).expect("valid stream id"),
+                )
+            })?;
+
+            let partition_data = rc_partition.borrow();
+            let segment = partition_data.log.active_segment();
+            let segment_start_offset = segment.start_offset;
+            let current_position = segment.current_position;
+            // Use SharedMetadata's offset (not the cached one in partition_data)
+            let current_offset = partition_meta.next_offset();
+            let deduplicator = partition_data.message_deduplicator.clone();
+            (
+                segment_start_offset,
+                current_offset,
+                current_position,
+                deduplicator,
+            )
+        };
+
+        // Prepare messages for persistence (sets offsets, timestamps, checksums)
+        // This is async due to deduplication checks
+        batch
+            .prepare_for_persistence(
+                segment_start_offset,
+                current_offset,
+                current_position,
+                deduplicator.as_ref(),
+            )
+            .await;
+
+        // Now do the actual append synchronously
+        let store = self.partition_store.borrow();
+        let rc_partition = store.get(namespace).ok_or_else(|| {
+            IggyError::PartitionNotFound(
+                namespace.partition_id(),
+                Identifier::numeric(namespace.topic_id() as u32).expect("valid topic id"),
+                Identifier::numeric(namespace.stream_id() as u32).expect("valid stream id"),
+            )
+        })?;
+
+        let mut partition_data = rc_partition.borrow_mut();
+
+        // Extract batch metadata (now with correct offsets from prepare_for_persistence)
+        let batch_messages_size = batch.size();
+        let batch_messages_count = batch.count();
+        let first_timestamp = batch.first_timestamp().unwrap_or(0);
+        let last_timestamp = batch.last_timestamp().unwrap_or(0);
+
+        // Update stats
+        partition_data
+            .stats
+            .increment_size_bytes(batch_messages_size as u64);
+        partition_data
+            .stats
+            .increment_messages_count(batch_messages_count as u64);
+
+        // Append to journal
+        partition_data.log.journal_mut().append(batch)?;
+
+        // Update segment metadata
+        let segment = partition_data.log.active_segment_mut();
+        if segment.start_timestamp == 0 {
+            segment.start_timestamp = first_timestamp;
+        }
+        segment.end_timestamp = last_timestamp;
+        segment.current_position += batch_messages_size;
+
+        // Calculate and store the last offset in SharedMetadata (source of truth)
+        let last_offset = if batch_messages_count == 0 {
+            current_offset
+        } else {
+            current_offset + batch_messages_count as u64 - 1
+        };
+        segment.end_offset = last_offset;
+
+        // Store offset in SharedMetadata's PartitionMeta (shared across all shards)
+        partition_meta.store_offset(last_offset);
+
+        // Update partition stats offset (needed for poll_messages which uses stats.current_offset())
+        partition_data.stats.set_current_offset(last_offset);
+
+        trace!(
+            "Appended {} messages ({} bytes) to partition {:?}, new offset: {}",
+            batch_messages_count, batch_messages_size, namespace, last_offset
+        );
+
+        Ok(())
+    }
+
+    /// Poll messages directly from partition_store.
+    ///
+    /// This bypasses the slab closure pattern for O(1) partition access.
+    /// Used by handlers when processing routed PollMessages requests.
+    #[allow(clippy::await_holding_refcell_ref)]
+    pub(crate) async fn poll_from_partition_store(
+        &self,
+        namespace: &IggyNamespace,
+        partition_id: usize,
+        consumer: PollingConsumer,
+        args: PollingArgs,
+    ) -> Result<(IggyPollMetadata, IggyMessagesBatchSet), IggyError> {
+        let store = self.partition_store.borrow();
+        let rc_partition = store.get(namespace).ok_or_else(|| {
+            IggyError::PartitionNotFound(
+                namespace.partition_id(),
+                Identifier::numeric(namespace.topic_id() as u32).expect("valid topic id"),
+                Identifier::numeric(namespace.stream_id() as u32).expect("valid stream id"),
+            )
+        })?;
+
+        let partition_data = rc_partition.borrow();
+        partition_data
+            .poll_messages(partition_id, consumer, args)
+            .await
+    }
+
     pub fn maybe_encrypt_messages(
         &self,
         batch: IggyMessagesBatchMut,
@@ -434,6 +748,31 @@ impl IggyShard {
             indexes,
             encrypted_messages,
         ))
+    }
+
+    /// Store consumer offset in partition_store for auto_commit.
+    pub(crate) async fn store_consumer_offset_in_partition_store(
+        &self,
+        namespace: &IggyNamespace,
+        consumer: PollingConsumer,
+        offset: u64,
+    ) -> Result<(), IggyError> {
+        let rc_partition = self
+            .partition_store
+            .borrow()
+            .get_rc(namespace)
+            .ok_or_else(|| {
+                IggyError::PartitionNotFound(
+                    namespace.partition_id(),
+                    Identifier::numeric(namespace.topic_id() as u32).expect("valid topic id"),
+                    Identifier::numeric(namespace.stream_id() as u32).expect("valid stream id"),
+                )
+            })?;
+
+        let partition_data = rc_partition.borrow();
+        partition_data
+            .store_consumer_offset(&self.config.system, consumer, offset)
+            .await
     }
 }
 

@@ -15,6 +15,7 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+use crate::metadata::PersonalAccessTokenMeta;
 use crate::streaming::utils::hash;
 use iggy_common::IggyExpiry;
 use iggy_common::IggyTimestamp;
@@ -69,6 +70,11 @@ impl PersonalAccessToken {
             token: Arc::new(token_hash.into()),
             expiry_at,
         }
+    }
+
+    /// Create from SharedMetadata's PersonalAccessTokenMeta.
+    pub fn from_metadata(user_id: UserId, meta: &PersonalAccessTokenMeta) -> Self {
+        Self::raw(user_id, &meta.name, &meta.token_hash, meta.expiry_at)
     }
 
     pub fn is_expired(&self, now: IggyTimestamp) -> bool {

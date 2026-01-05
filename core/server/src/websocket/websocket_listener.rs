@@ -19,7 +19,6 @@
 use crate::configs::websocket::WebSocketConfig;
 use crate::shard::IggyShard;
 use crate::shard::task_registry::ShutdownToken;
-use crate::shard::transmission::event::ShardEvent;
 use crate::websocket::connection_handler::{handle_connection, handle_error};
 use compio::net::TcpListener;
 use compio_net::TcpOpts;
@@ -58,7 +57,7 @@ pub async fn start(
     if shard.id != 0 && addr.port() == 0 {
         info!("Waiting for WebSocket address from shard 0...");
         loop {
-            if let Some(bound_addr) = shard.websocket_bound_address.get() {
+            if let Some(bound_addr) = shard.shared_metadata.load().bound_addresses.websocket {
                 addr = bound_addr;
                 info!("Received WebSocket address from shard 0: {}", addr);
                 break;
@@ -78,25 +77,16 @@ pub async fn start(
     let local_addr = listener.local_addr().unwrap();
     info!("{} has started on: ws://{}", "WebSocket Server", local_addr);
 
-    // Notify shard about the bound address
-    let event = ShardEvent::AddressBound {
-        protocol: TransportProtocol::WebSocket,
-        address: local_addr,
-    };
-
     if shard.id == 0 {
-        // Store bound address locally first
+        // Store in Cell for config_writer backward compat
         shard.websocket_bound_address.set(Some(local_addr));
-
-        if addr.port() == 0 {
-            // Broadcast to other shards for SO_REUSEPORT binding
-            shard.broadcast_event_to_all_shards(event).await?;
-        }
+        // Store in SharedMetadata (all shards see this immediately via ArcSwap)
+        shard.shared_metadata.set_websocket_address(local_addr);
+        // Notify config_writer that WebSocket is bound
+        let _ = shard.config_writer_notify.try_send(());
     } else {
-        // Non-shard0 just handles the event locally
-        crate::shard::handlers::handle_event(&shard, event)
-            .await
-            .ok();
+        // Non-shard-0 just updates local Cell
+        shard.websocket_bound_address.set(Some(local_addr));
     }
 
     let ws_config = config.to_tungstenite_config();

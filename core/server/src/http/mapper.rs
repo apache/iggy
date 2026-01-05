@@ -17,97 +17,26 @@
  */
 
 use crate::http::jwt::json_web_token::GeneratedToken;
-use crate::slab::Keyed;
-use crate::slab::traits_ext::{EntityComponentSystem, IntoComponents};
+use crate::metadata::{ConsumerGroupMeta, PartitionMeta, StreamMeta, TopicMeta, UserMeta};
 use crate::streaming::clients::client_manager::Client;
 use crate::streaming::personal_access_tokens::personal_access_token::PersonalAccessToken;
-use crate::streaming::stats::TopicStats;
-use crate::streaming::topics::consumer_group::{ConsumerGroupMembers, ConsumerGroupRoot};
-use crate::streaming::topics::topic::TopicRoot;
+use crate::streaming::stats::{PartitionStats, StreamStats, TopicStats};
 use crate::streaming::users::user::User;
 use iggy_common::{ConsumerGroupDetails, ConsumerGroupInfo, ConsumerGroupMember, IggyByteSize};
 use iggy_common::{IdentityInfo, PersonalAccessTokenInfo, TokenInfo, TopicDetails};
 use iggy_common::{UserInfo, UserInfoDetails};
-use slab::Slab;
-use std::sync::Arc;
-
-/// Map TopicRoot with partitions to TopicDetails for HTTP responses
-pub fn map_topic_details(root: &TopicRoot, stats: &TopicStats) -> TopicDetails {
-    let mut partitions = Vec::new();
-
-    // Get partition details similar to binary mapper
-    root.partitions().with_components(|partition_components| {
-        let (partition_roots, partition_stats, _, offsets, _, _, _) =
-            partition_components.into_components();
-        for (partition_root, partition_stat, offset) in partition_roots
-            .iter()
-            .map(|(_, val)| val)
-            .zip(partition_stats.iter().map(|(_, val)| val))
-            .zip(offsets.iter().map(|(_, val)| val))
-            .map(|((root, stat), offset)| (root, stat, offset))
-        {
-            partitions.push(iggy_common::Partition {
-                id: partition_root.id() as u32,
-                created_at: partition_root.created_at(),
-                segments_count: partition_stat.segments_count_inconsistent(),
-                current_offset: offset.load(std::sync::atomic::Ordering::Relaxed),
-                size: IggyByteSize::from(partition_stat.size_bytes_inconsistent()),
-                messages_count: partition_stat.messages_count_inconsistent(),
-            });
-        }
-    });
-
-    // Sort partitions by ID
-    partitions.sort_by(|a, b| a.id.cmp(&b.id));
-
-    TopicDetails {
-        id: root.id() as u32,
-        created_at: root.created_at(),
-        name: root.name().clone(),
-        size: stats.size_bytes_inconsistent().into(),
-        messages_count: stats.messages_count_inconsistent(),
-        partitions_count: partitions.len() as u32,
-        partitions,
-        message_expiry: root.message_expiry(),
-        compression_algorithm: root.compression_algorithm(),
-        max_topic_size: root.max_topic_size(),
-        replication_factor: root.replication_factor(),
-    }
-}
-
-/// Map TopicRoot and TopicStats to Topic for HTTP responses
-pub fn map_topic(root: &TopicRoot, stats: &TopicStats) -> iggy_common::Topic {
-    iggy_common::Topic {
-        id: root.id() as u32,
-        created_at: root.created_at(),
-        name: root.name().clone(),
-        size: stats.size_bytes_inconsistent().into(),
-        partitions_count: root.partitions().len() as u32,
-        messages_count: stats.messages_count_inconsistent(),
-        message_expiry: root.message_expiry(),
-        compression_algorithm: root.compression_algorithm(),
-        max_topic_size: root.max_topic_size(),
-        replication_factor: root.replication_factor(),
-    }
-}
-
-/// Map multiple topics from slab components to Vec<Topic> for HTTP responses
-pub fn map_topics_from_components(
-    roots: &Slab<TopicRoot>,
-    stats: &Slab<Arc<TopicStats>>,
-) -> Vec<iggy_common::Topic> {
-    let mut topics = roots
-        .iter()
-        .map(|(_, root)| root)
-        .zip(stats.iter().map(|(_, stat)| stat))
-        .map(|(root, stat)| map_topic(root, stat))
-        .collect::<Vec<_>>();
-
-    topics.sort_by(|a, b| a.id.cmp(&b.id));
-    topics
-}
 
 pub fn map_user(user: &User) -> UserInfoDetails {
+    UserInfoDetails {
+        id: user.id,
+        username: user.username.clone(),
+        created_at: user.created_at,
+        status: user.status,
+        permissions: user.permissions.clone(),
+    }
+}
+
+pub fn map_user_from_metadata(user: &UserMeta) -> UserInfoDetails {
     UserInfoDetails {
         id: user.id,
         username: user.username.clone(),
@@ -183,52 +112,6 @@ pub fn map_clients(clients: &[Client]) -> Vec<iggy_common::ClientInfo> {
     all_clients
 }
 
-pub fn map_consumer_groups(
-    roots: &slab::Slab<ConsumerGroupRoot>,
-    members: &slab::Slab<ConsumerGroupMembers>,
-) -> Vec<iggy_common::ConsumerGroup> {
-    let mut groups = Vec::new();
-    for (root, member) in roots
-        .iter()
-        .map(|(_, val)| val)
-        .zip(members.iter().map(|(_, val)| val))
-    {
-        let members_guard = member.inner().shared_get();
-        let consumer_group = iggy_common::ConsumerGroup {
-            id: root.id() as u32,
-            name: root.key().clone(),
-            partitions_count: root.partitions().len() as u32,
-            members_count: members_guard.len() as u32,
-        };
-        groups.push(consumer_group);
-    }
-    groups.sort_by(|a, b| a.id.cmp(&b.id));
-    groups
-}
-
-pub fn map_consumer_group(
-    root: &ConsumerGroupRoot,
-    members: &ConsumerGroupMembers,
-) -> ConsumerGroupDetails {
-    let members_guard = members.inner().shared_get();
-    let mut consumer_group_details = ConsumerGroupDetails {
-        id: root.id() as u32,
-        name: root.key().clone(),
-        partitions_count: root.partitions().len() as u32,
-        members_count: members_guard.len() as u32,
-        members: Vec::new(),
-    };
-
-    for (_, member) in members_guard.iter() {
-        consumer_group_details.members.push(ConsumerGroupMember {
-            id: member.id as u32,
-            partitions_count: member.partitions.len() as u32,
-            partitions: member.partitions.iter().map(|p| *p as u32).collect(),
-        });
-    }
-    consumer_group_details
-}
-
 pub fn map_generated_access_token_to_identity_info(token: GeneratedToken) -> IdentityInfo {
     IdentityInfo {
         user_id: token.user_id,
@@ -239,69 +122,206 @@ pub fn map_generated_access_token_to_identity_info(token: GeneratedToken) -> Ide
     }
 }
 
-/// Map StreamRoot and StreamStats to StreamDetails for HTTP responses
-pub fn map_stream_details(
-    root: &crate::streaming::streams::stream::StreamRoot,
-    stats: &crate::streaming::stats::StreamStats,
+/// Map StreamMeta to Stream for HTTP responses
+pub fn map_stream_from_metadata(
+    stream: &StreamMeta,
+    stats: Option<&StreamStats>,
+) -> iggy_common::Stream {
+    let (size, messages_count) = stats
+        .map(|s| {
+            (
+                s.size_bytes_inconsistent().into(),
+                s.messages_count_inconsistent(),
+            )
+        })
+        .unwrap_or((0u64.into(), 0));
+
+    iggy_common::Stream {
+        id: stream.id as u32,
+        created_at: stream.created_at,
+        name: stream.name.clone(),
+        topics_count: stream.topics_count() as u32,
+        size,
+        messages_count,
+    }
+}
+
+/// Map StreamMeta to StreamDetails for HTTP responses
+pub fn map_stream_details_from_metadata(
+    stream: &StreamMeta,
+    stream_stats: Option<&StreamStats>,
+    topics_with_stats: &[(&TopicMeta, Option<&TopicStats>)],
 ) -> iggy_common::StreamDetails {
-    // Get topics using the new slab-based API
-    let topics = root.topics().with_components(|topic_ref| {
-        let (topic_roots, _topic_auxiliaries, topic_stats) = topic_ref.into_components();
-        let mut topics_vec = Vec::new();
+    let (size, messages_count) = stream_stats
+        .map(|s| {
+            (
+                s.size_bytes_inconsistent().into(),
+                s.messages_count_inconsistent(),
+            )
+        })
+        .unwrap_or((0u64.into(), 0));
 
-        // Iterate over topics in the stream
-        for (topic_root, topic_stat) in topic_roots
-            .iter()
-            .map(|(_, root)| root)
-            .zip(topic_stats.iter().map(|(_, stat)| stat))
-        {
-            topics_vec.push(map_topic(topic_root, topic_stat));
-        }
-
-        // Sort topics by ID for consistent ordering
-        topics_vec.sort_by(|a, b| a.id.cmp(&b.id));
-        topics_vec
-    });
+    let mut topics: Vec<iggy_common::Topic> = topics_with_stats
+        .iter()
+        .map(|(t, s)| map_topic_from_metadata(t, *s))
+        .collect();
+    topics.sort_by(|a, b| a.id.cmp(&b.id));
 
     iggy_common::StreamDetails {
-        id: root.id() as u32,
-        created_at: root.created_at(),
-        name: root.name().clone(),
-        topics_count: root.topics_count() as u32,
-        size: stats.size_bytes_inconsistent().into(),
-        messages_count: stats.messages_count_inconsistent(),
+        id: stream.id as u32,
+        created_at: stream.created_at,
+        name: stream.name.clone(),
+        topics_count: stream.topics_count() as u32,
+        size,
+        messages_count,
         topics,
     }
 }
 
-/// Map StreamRoot and StreamStats to Stream for HTTP responses
-pub fn map_stream(
-    root: &crate::streaming::streams::stream::StreamRoot,
-    stats: &crate::streaming::stats::StreamStats,
-) -> iggy_common::Stream {
-    iggy_common::Stream {
-        id: root.id() as u32,
-        created_at: root.created_at(),
-        name: root.name().clone(),
-        topics_count: root.topics_count() as u32,
-        size: stats.size_bytes_inconsistent().into(),
-        messages_count: stats.messages_count_inconsistent(),
+/// Map TopicMeta to Topic for HTTP responses
+pub fn map_topic_from_metadata(
+    topic: &TopicMeta,
+    stats: Option<&TopicStats>,
+) -> iggy_common::Topic {
+    let (size, messages_count) = stats
+        .map(|s| {
+            (
+                s.size_bytes_inconsistent().into(),
+                s.messages_count_inconsistent(),
+            )
+        })
+        .unwrap_or((0u64.into(), 0));
+
+    iggy_common::Topic {
+        id: topic.id as u32,
+        created_at: topic.created_at,
+        name: topic.name.clone(),
+        partitions_count: topic.partitions_count(),
+        size,
+        messages_count,
+        message_expiry: topic.message_expiry,
+        compression_algorithm: topic.compression_algorithm,
+        max_topic_size: topic.max_topic_size,
+        replication_factor: topic.replication_factor,
     }
 }
 
-/// Map multiple streams from slabs
-pub fn map_streams_from_slabs(
-    roots: &slab::Slab<crate::streaming::streams::stream::StreamRoot>,
-    stats: &slab::Slab<Arc<crate::streaming::stats::StreamStats>>,
-) -> Vec<iggy_common::Stream> {
-    let mut streams = Vec::new();
-    for (root, stat) in roots
+/// Map TopicMeta to TopicDetails for HTTP responses
+pub fn map_topic_details_from_metadata(
+    topic: &TopicMeta,
+    topic_stats: Option<&TopicStats>,
+    partition_stats: &[(&PartitionMeta, Option<&PartitionStats>)],
+) -> TopicDetails {
+    let (size, messages_count) = topic_stats
+        .map(|s| {
+            (
+                s.size_bytes_inconsistent().into(),
+                s.messages_count_inconsistent(),
+            )
+        })
+        .unwrap_or((0u64.into(), 0));
+
+    let mut partitions: Vec<iggy_common::Partition> = partition_stats
         .iter()
-        .map(|(_, val)| val)
-        .zip(stats.iter().map(|(_, val)| val))
-    {
-        streams.push(map_stream(root, stat));
+        .map(|(p, stats)| {
+            let (p_size, p_messages, p_offset, p_segments) = stats
+                .map(|s| {
+                    (
+                        IggyByteSize::from(s.size_bytes_inconsistent()),
+                        s.messages_count_inconsistent(),
+                        s.current_offset(),
+                        s.segments_count_inconsistent(),
+                    )
+                })
+                .unwrap_or((0u64.into(), 0, 0, 0));
+
+            iggy_common::Partition {
+                id: p.id as u32,
+                created_at: p.created_at,
+                segments_count: p_segments,
+                current_offset: p_offset,
+                size: p_size,
+                messages_count: p_messages,
+            }
+        })
+        .collect();
+
+    partitions.sort_by(|a, b| a.id.cmp(&b.id));
+
+    TopicDetails {
+        id: topic.id as u32,
+        created_at: topic.created_at,
+        name: topic.name.clone(),
+        size,
+        messages_count,
+        partitions_count: partitions.len() as u32,
+        partitions,
+        message_expiry: topic.message_expiry,
+        compression_algorithm: topic.compression_algorithm,
+        max_topic_size: topic.max_topic_size,
+        replication_factor: topic.replication_factor,
     }
-    streams.sort_by(|a, b| a.id.cmp(&b.id));
-    streams
+}
+
+/// Map multiple StreamMeta to Vec<Stream>
+pub fn map_streams_from_metadata(streams: &[StreamMeta]) -> Vec<iggy_common::Stream> {
+    let mut result: Vec<iggy_common::Stream> = streams
+        .iter()
+        .map(|s| map_stream_from_metadata(s, None))
+        .collect();
+    result.sort_by(|a, b| a.id.cmp(&b.id));
+    result
+}
+
+/// Map ConsumerGroupMeta to ConsumerGroup for HTTP responses
+pub fn map_consumer_group_from_metadata(cg: &ConsumerGroupMeta) -> iggy_common::ConsumerGroup {
+    iggy_common::ConsumerGroup {
+        id: cg.id as u32,
+        name: cg.name.clone(),
+        partitions_count: cg.partitions.len() as u32,
+        members_count: cg.members.len() as u32,
+    }
+}
+
+/// Map ConsumerGroupMeta to ConsumerGroupDetails for HTTP responses
+pub fn map_consumer_group_details_from_metadata(cg: &ConsumerGroupMeta) -> ConsumerGroupDetails {
+    let members: Vec<ConsumerGroupMember> = cg
+        .members
+        .values()
+        .map(|m| ConsumerGroupMember {
+            id: m.client_id,
+            partitions_count: m.partitions.len() as u32,
+            partitions: m.partitions.iter().map(|p| *p as u32).collect(),
+        })
+        .collect();
+
+    ConsumerGroupDetails {
+        id: cg.id as u32,
+        name: cg.name.clone(),
+        partitions_count: cg.partitions.len() as u32,
+        members_count: cg.members.len() as u32,
+        members,
+    }
+}
+
+/// Map multiple ConsumerGroupMeta to Vec<ConsumerGroup>
+pub fn map_consumer_groups_from_metadata(
+    cgs: &[ConsumerGroupMeta],
+) -> Vec<iggy_common::ConsumerGroup> {
+    let mut groups: Vec<iggy_common::ConsumerGroup> =
+        cgs.iter().map(map_consumer_group_from_metadata).collect();
+    groups.sort_by(|a, b| a.id.cmp(&b.id));
+    groups
+}
+
+/// Map multiple topics from metadata with stats
+pub fn map_topics_from_metadata(
+    topics: &[(&TopicMeta, Option<&TopicStats>)],
+) -> Vec<iggy_common::Topic> {
+    let mut result: Vec<iggy_common::Topic> = topics
+        .iter()
+        .map(|(t, s)| map_topic_from_metadata(t, *s))
+        .collect();
+    result.sort_by(|a, b| a.id.cmp(&b.id));
+    result
 }

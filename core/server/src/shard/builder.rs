@@ -17,31 +17,35 @@
  */
 
 use super::{
-    IggyShard, TaskRegistry, transmission::connector::ShardConnector,
+    IggyShard, TaskRegistry, shards_table::ShardsTable, transmission::connector::ShardConnector,
     transmission::frame::ShardFrame,
 };
 use crate::{
     configs::server::ServerConfig,
-    slab::{streams::Streams, users::Users},
+    metadata::{SharedConsumerOffsetsStore, SharedMetadata, SharedStatsStore},
+    partition_store::PartitionDataStore,
     state::file::FileState,
     streaming::{
         clients::client_manager::ClientManager, diagnostics::metrics::Metrics,
-        utils::ptr::EternalPtr,
+        users::permissioner::Permissioner, utils::ptr::EternalPtr,
     },
     versioning::SemanticVersion,
 };
-use dashmap::DashMap;
 use iggy_common::EncryptorKind;
-use iggy_common::sharding::{IggyNamespace, PartitionLocation};
-use std::{cell::Cell, rc::Rc, sync::atomic::AtomicBool};
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+    sync::atomic::AtomicBool,
+};
 
 #[derive(Default)]
 pub struct IggyShardBuilder {
     id: Option<u16>,
-    streams: Option<Streams>,
-    shards_table: Option<EternalPtr<DashMap<IggyNamespace, PartitionLocation>>>,
+    shards_table: Option<EternalPtr<ShardsTable>>,
+    shared_metadata: Option<EternalPtr<SharedMetadata>>,
+    shared_stats: Option<EternalPtr<SharedStatsStore>>,
+    shared_consumer_offsets: Option<EternalPtr<SharedConsumerOffsetsStore>>,
     state: Option<FileState>,
-    users: Option<Users>,
     client_manager: Option<ClientManager>,
     connections: Option<Vec<ShardConnector<ShardFrame>>>,
     config: Option<ServerConfig>,
@@ -67,11 +71,26 @@ impl IggyShardBuilder {
         self
     }
 
-    pub fn shards_table(
-        mut self,
-        shards_table: EternalPtr<DashMap<IggyNamespace, PartitionLocation>>,
-    ) -> Self {
+    pub fn shards_table(mut self, shards_table: EternalPtr<ShardsTable>) -> Self {
         self.shards_table = Some(shards_table);
+        self
+    }
+
+    pub fn shared_metadata(mut self, shared_metadata: EternalPtr<SharedMetadata>) -> Self {
+        self.shared_metadata = Some(shared_metadata);
+        self
+    }
+
+    pub fn shared_stats(mut self, shared_stats: EternalPtr<SharedStatsStore>) -> Self {
+        self.shared_stats = Some(shared_stats);
+        self
+    }
+
+    pub fn shared_consumer_offsets(
+        mut self,
+        shared_consumer_offsets: EternalPtr<SharedConsumerOffsetsStore>,
+    ) -> Self {
+        self.shared_consumer_offsets = Some(shared_consumer_offsets);
         self
     }
 
@@ -90,18 +109,8 @@ impl IggyShardBuilder {
         self
     }
 
-    pub fn streams(mut self, streams: Streams) -> Self {
-        self.streams = Some(streams);
-        self
-    }
-
     pub fn state(mut self, state: FileState) -> Self {
         self.state = Some(state);
-        self
-    }
-
-    pub fn users(mut self, users: Users) -> Self {
-        self.users = Some(users);
         self
     }
 
@@ -118,10 +127,11 @@ impl IggyShardBuilder {
     // TODO: Too much happens in there, some of those bootstrapping logic should be moved outside.
     pub fn build(self) -> IggyShard {
         let id = self.id.unwrap();
-        let streams = self.streams.unwrap();
         let shards_table = self.shards_table.unwrap();
+        let shared_metadata = self.shared_metadata.unwrap();
+        let shared_stats = self.shared_stats.unwrap();
+        let shared_consumer_offsets = self.shared_consumer_offsets.unwrap();
         let state = self.state.unwrap();
-        let users = self.users.unwrap();
         let config = self.config.unwrap();
         let connections = self.connections.unwrap();
         let encryptor = self.encryptor;
@@ -150,12 +160,18 @@ impl IggyShardBuilder {
         // Trigger initial check in case servers bind before task starts
         let _ = config_writer_notify.try_send(());
 
+        // Create permissioner with shared_metadata reference
+        let permissioner = Permissioner::new(shared_metadata.clone());
+
         IggyShard {
             id,
             shards,
             shards_table,
-            streams, // TODO: Fixme
-            users,
+            shared_metadata,
+            shared_stats,
+            shared_consumer_offsets,
+            partition_store: RefCell::new(PartitionDataStore::new()),
+            cg_partition_indices: RefCell::new(std::collections::HashMap::new()),
             fs_locks: Default::default(),
             encryptor,
             config,
@@ -173,7 +189,7 @@ impl IggyShardBuilder {
             config_writer_notify,
             config_writer_receiver,
             task_registry,
-            permissioner: Default::default(),
+            permissioner,
             client_manager,
         }
     }
