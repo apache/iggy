@@ -272,7 +272,7 @@ services:
       - IGGY_ROOT_USERNAME=iggy
       - IGGY_ROOT_PASSWORD=iggy
       - IGGY_TCP_ADDRESS=iggy-server:8090
-    command: ["mvn", "test"]
+    command: ["gradle", "--no-daemon", "test"]
     networks:
       - iggy-bdd-network
 
