@@ -21,6 +21,15 @@
 import { serializeIdentifier, type Id } from '../identifier.utils.js';
 import { uint32ToBuf } from '../number.utils.js';
 
+/**
+ * Serializes partition parameters for create/delete operations.
+ *
+ * @param streamId - Stream identifier (ID or name)
+ * @param topicId - Topic identifier (ID or name)
+ * @param partitionCount - Number of partitions (1-1000)
+ * @returns Buffer containing serialized partition request
+ * @throws Error if partitionCount is not between 1 and 1000
+ */
 export const serializePartitionParams = (
   streamId: Id, topicId: Id, partitionCount = 1,
 ) => {

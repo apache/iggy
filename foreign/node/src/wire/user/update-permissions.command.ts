@@ -26,11 +26,20 @@ import { serializeIdentifier, type Id } from '../identifier.utils.js';
 import { serializePermissions, type UserPermissions } from './permissions.utils.js';
 
 
+/**
+ * Parameters for the update permissions command.
+ */
 export type UpdatePermissions = {
+  /** User identifier (ID or username) */
   userId: Id,
+  /** New permissions to set */
   permissions: UserPermissions
 };
 
+/**
+ * Update permissions command definition.
+ * Updates a user's permissions.
+ */
 export const UPDATE_PERMISSIONS = {
   code: COMMAND_CODE.UpdatePermissions,
 
@@ -50,4 +59,7 @@ export const UPDATE_PERMISSIONS = {
 };
 
 
+/**
+ * Executable update permissions command function.
+ */
 export const updatePermissions = wrapCommand<UpdatePermissions, boolean>(UPDATE_PERMISSIONS);

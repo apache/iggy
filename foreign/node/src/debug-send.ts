@@ -19,7 +19,7 @@
 
 
 import assert from 'node:assert/strict';
-import { ClientConfig, SingleClient } from './client/index.js';
+import { type ClientConfig, SingleClient } from './client/index.js';
 import { groupConsumerStream } from './stream/consumer-stream.js';
 import { PollingStrategy, type PollMessagesResponse } from './wire/index.js';
 

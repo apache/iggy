@@ -28,23 +28,44 @@ import { serializeIggyMessageHeader } from './iggy-header.utils.js';
 
 const debug = Debug('iggy:client');
 
-/** index size per messages in bit */
+/** Size of the message index entry in bytes (16 bytes per message) */
 const INDEX_SIZE = 16;
 
+/** Valid types for message ID: numeric, bigint, or UUID string */
 export type MessageIdKind = number | bigint | string;
 
+/**
+ * Message creation parameters.
+ */
 export type CreateMessage = {
-  id?: MessageIdKind, 
+  /** Optional message ID (auto-generated if not provided) */
+  id?: MessageIdKind,
+  /** Optional user-defined headers */
   headers?: Headers,
+  /** Message payload as string or Buffer */
   payload: string | Buffer
 };
 
+/**
+ * Type guard to check if a value is a valid message ID.
+ *
+ * @param x - Value to check
+ * @returns True if the value is a valid MessageIdKind
+ */
 export const isValidMessageId = (x?: unknown): x is MessageIdKind =>
   x === undefined ||
   'string' === typeof x ||
   'bigint' === typeof x ||
   'number' === typeof x;
 
+/**
+ * Serializes a message ID to a 16-byte buffer.
+ * Supports undefined (zero), numeric, bigint, and UUID string formats.
+ *
+ * @param id - Message ID to serialize
+ * @returns 16-byte buffer containing the serialized ID
+ * @throws Error if the ID format is invalid
+ */
 export const serializeMessageId = (id?: unknown) => {
 
   if(!isValidMessageId(id))
@@ -73,6 +94,13 @@ export const serializeMessageId = (id?: unknown) => {
 
 }
 
+/**
+ * Serializes a single message to wire format.
+ * Format: [iggy_header][payload][user_headers]
+ *
+ * @param msg - Message to serialize
+ * @returns Serialized message buffer
+ */
 export const serializeMessage = (msg: CreateMessage) => {
   const { id, headers, payload } = msg;
 
@@ -80,7 +108,7 @@ export const serializeMessage = (msg: CreateMessage) => {
   const bUserHeaders = serializeHeaders(headers);
   const bPayload = 'string' === typeof payload ? Buffer.from(payload) : payload
   const bIggyMessageHeader = serializeIggyMessageHeader(bId, bPayload, bUserHeaders);
-  
+
   const r = Buffer.concat([
     bIggyMessageHeader,
     bPayload,
@@ -94,13 +122,26 @@ export const serializeMessage = (msg: CreateMessage) => {
     'payload', bPayload.length, bPayload.toString('hex'),
     'full len', r.length //, r.toString('hex')
   );
-  
+
   return r;
 };
 
+/**
+ * Serializes multiple messages to an array of buffers.
+ *
+ * @param messages - Array of messages to serialize
+ * @returns Array of serialized message buffers
+ */
 export const serializeMessages = (messages: CreateMessage[]) =>
   messages.map(c => serializeMessage(c));
 
+/**
+ * Creates an index buffer for a batch of messages.
+ * Each index entry is 16 bytes tracking message positions.
+ *
+ * @param messages - Array of serialized message buffers
+ * @returns Index buffer
+ */
 export const createMessagesIndex = (messages: Buffer[]) => {
   const bIndex = Buffer.allocUnsafe(messages.length * INDEX_SIZE);
   let currentIndex = 0;
@@ -115,6 +156,16 @@ export const createMessagesIndex = (messages: Buffer[]) => {
   return bIndex;
 }
 
+/**
+ * Serializes a send messages command payload.
+ * Includes stream/topic identifiers, partitioning, and all messages with index.
+ *
+ * @param streamId - Stream identifier
+ * @param topicId - Topic identifier
+ * @param messages - Array of messages to send
+ * @param partitioning - Optional partitioning strategy
+ * @returns Serialized command payload
+ */
 export const serializeSendMessages = (
   streamId: Id,
   topicId: Id,
@@ -144,6 +195,15 @@ export const serializeSendMessages = (
   ]);
 };
 
+/**
+ * Serializes a flush unsaved buffers command payload.
+ *
+ * @param streamId - Stream identifier
+ * @param topicId - Topic identifier
+ * @param partitionId - Partition ID to flush
+ * @param fsync - Whether to force sync to disk
+ * @returns Serialized command payload
+ */
 export const serializeFlushUnsavedBuffers = (
   streamId: Id,
   topicId: Id,

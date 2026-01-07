@@ -23,11 +23,20 @@ import { wrapCommand } from '../command.utils.js';
 import { COMMAND_CODE } from '../command.code.js';
 import { deserializeToStream, type Stream } from './stream.utils.js';
 
+/**
+ * Parameters for the create stream command.
+ */
 export type CreateStream = {
-  streamId?: number, // Optional - auto-assigned by server if not provided
+  /** Optional stream ID (auto-assigned by server if not provided) */
+  streamId?: number,
+  /** Stream name (1-255 bytes) */
   name: string
 };
 
+/**
+ * Create stream command definition.
+ * Creates a new stream with the specified name.
+ */
 export const CREATE_STREAM = {
   code: COMMAND_CODE.CreateStream,
 
@@ -53,4 +62,7 @@ export const CREATE_STREAM = {
 };
 
 
+/**
+ * Executable create stream command function.
+ */
 export const createStream = wrapCommand<CreateStream, Stream>(CREATE_STREAM);

@@ -121,13 +121,11 @@ pub(crate) async fn handle_connection(
                         "Command with code {cmd_code} was not handled successfully, session: {session}, error: {error}."
                     );
 
-                    if let IggyError::ClientNotFound(_) = error {
-                        sender.send_error_response(error).await?;
+                    if matches!(error, IggyError::ClientNotFound(_) | IggyError::StaleClient) {
+                        sender.send_error_response(error.clone()).await?;
                         debug!("TCP error response was sent to: {session}.");
                         error!("Session: {session} will be deleted.");
-                        return Err(ConnectionError::from(IggyError::ClientNotFound(
-                            session.client_id,
-                        )));
+                        return Err(ConnectionError::from(error));
                     } else {
                         sender.send_error_response(error).await?;
                         debug!("TCP error response was sent to: {session}.");

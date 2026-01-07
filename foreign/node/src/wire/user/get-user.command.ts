@@ -25,10 +25,18 @@ import { serializeIdentifier, type Id } from '../identifier.utils.js';
 import { deserializeUser, type User } from './user.utils.js';
 
 
+/**
+ * Parameters for the get user command.
+ */
 export type GetUser = {
+  /** User identifier (ID or username) */
   userId: Id
 };
 
+/**
+ * Get user command definition.
+ * Retrieves a single user with permissions.
+ */
 export const GET_USER = {
   code: COMMAND_CODE.GetUser,
 
@@ -44,4 +52,7 @@ export const GET_USER = {
 };
 
 
+/**
+ * Executable get user command function.
+ */
 export const getUser = wrapCommand<GetUser, User | null>(GET_USER);
