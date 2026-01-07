@@ -24,14 +24,25 @@ import { wrapCommand } from '../command.utils.js';
 import { COMMAND_CODE } from '../command.code.js';
 import { serializeGetOffset, type Consumer, type OffsetResponse } from './offset.utils.js';
 
+/**
+ * Parameters for the get offset command.
+ */
 export type GetOffset = {
+  /** Stream identifier (ID or name) */
   streamId: Id,
+  /** Topic identifier (ID or name) */
   topicId: Id,
+  /** Consumer identifier (single or group) */
   consumer: Consumer,
+  /** Partition ID (required for single consumer, null for group) */
   partitionId: number | null
 };
 
 
+/**
+ * Get offset command definition.
+ * Retrieves the current and stored offset for a consumer.
+ */
 export const GET_OFFSET = {
   code: COMMAND_CODE.GetOffset,
 
@@ -56,4 +67,7 @@ export const GET_OFFSET = {
 };
 
 
+/**
+ * Executable get offset command function.
+ */
 export const getOffset = wrapCommand<GetOffset, OffsetResponse | null>(GET_OFFSET);

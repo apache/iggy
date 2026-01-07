@@ -24,21 +24,34 @@ import type { Id } from '../identifier.utils.js';
 import { serializePartitionParams } from './partition.utils.js';
 import { COMMAND_CODE } from '../command.code.js';
 
+/**
+ * Parameters for the delete partition command.
+ */
 export type DeletePartition = {
+  /** Stream identifier (ID or name) */
   streamId: Id,
+  /** Topic identifier (ID or name) */
   topicId: Id,
+  /** Number of partitions to delete (1-1000) */
   partitionCount: number
 };
-    
+
+/**
+ * Delete partitions command definition.
+ * Removes partitions from a topic.
+ */
 export const DELETE_PARTITIONS = {
   code: COMMAND_CODE.DeletePartitions,
 
   serialize: ({ streamId, topicId, partitionCount }: DeletePartition) => {
     return serializePartitionParams(streamId, topicId, partitionCount);
   },
-  
+
   deserialize: deserializeVoidResponse
 };
 
 
+/**
+ * Executable delete partition command function.
+ */
 export const deletePartition = wrapCommand<DeletePartition, boolean>(DELETE_PARTITIONS);

@@ -24,11 +24,20 @@ import { COMMAND_CODE } from '../command.code.js';
 import { serializeIdentifier, type Id } from '../identifier.utils.js';
 import { deserializeTopic, type Topic } from './topic.utils.js';
 
-type GetTopic = {
+/**
+ * Parameters for the get topic command.
+ */
+export type GetTopic = {
+  /** Stream identifier (ID or name) */
   streamId: Id,
+  /** Topic identifier (ID or name) */
   topicId: Id
 }
 
+/**
+ * Get topic command definition.
+ * Retrieves detailed information about a specific topic.
+ */
 export const GET_TOPIC = {
   code: COMMAND_CODE.GetTopic,
 
@@ -47,4 +56,7 @@ export const GET_TOPIC = {
 };
 
 
+/**
+ * Executable get topic command function.
+ */
 export const getTopic = wrapCommand<GetTopic, Topic | null>(GET_TOPIC);
