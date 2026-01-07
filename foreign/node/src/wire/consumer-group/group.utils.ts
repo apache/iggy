@@ -20,18 +20,38 @@
 
 import { serializeIdentifier, type Id } from '../identifier.utils.js';
 
+/**
+ * Consumer group information.
+ */
 export type ConsumerGroup = {
+  /** Consumer group ID */
   id: number,
+  /** Consumer group name */
   name: string,
+  /** Number of members in the group */
   membersCount: number,
+  /** Number of partitions assigned to the group */
   partitionsCount: number,
 };
 
+/**
+ * Result of deserializing a consumer group.
+ */
 type ConsumerGroupDeserialized = {
+  /** Number of bytes consumed */
   bytesRead: number,
+  /** Deserialized consumer group data */
   data: ConsumerGroup
 };
 
+/**
+ * Serializes stream, topic, and group identifiers for targeting a consumer group.
+ *
+ * @param streamId - Stream identifier (ID or name)
+ * @param topicId - Topic identifier (ID or name)
+ * @param groupId - Consumer group identifier (ID or name)
+ * @returns Buffer containing serialized identifiers
+ */
 export const serializeTargetGroup = (streamId: Id, topicId: Id, groupId: Id) => {
   return Buffer.concat([
     serializeIdentifier(streamId),
@@ -41,6 +61,13 @@ export const serializeTargetGroup = (streamId: Id, topicId: Id, groupId: Id) => 
 };
 
 
+/**
+ * Deserializes a consumer group from a buffer.
+ *
+ * @param r - Buffer containing serialized consumer group data
+ * @param pos - Starting position in the buffer
+ * @returns Object with bytes read and deserialized consumer group data
+ */
 export const deserializeConsumerGroup = (r: Buffer, pos = 0): ConsumerGroupDeserialized => {
   const id = r.readUInt32LE(pos);
   const partitionsCount = r.readUInt32LE(pos + 4);
@@ -59,6 +86,13 @@ export const deserializeConsumerGroup = (r: Buffer, pos = 0): ConsumerGroupDeser
   }
 };
 
+/**
+ * Deserializes multiple consumer groups from a buffer.
+ *
+ * @param r - Buffer containing serialized consumer groups data
+ * @param pos - Starting position in the buffer
+ * @returns Array of deserialized consumer groups
+ */
 export const deserializeConsumerGroups = (r: Buffer, pos = 0) => {
   const end = r.length;
   const cgroups = [];

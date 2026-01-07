@@ -24,14 +24,26 @@ import { COMMAND_CODE } from '../command.code.js';
 import { type Id } from '../identifier.utils.js';
 import { serializeStoreOffset, type Consumer } from './offset.utils.js';
 
+/**
+ * Parameters for the store offset command.
+ */
 export type StoreOffset = {
+  /** Stream identifier (ID or name) */
   streamId: Id,
+  /** Topic identifier (ID or name) */
   topicId: Id,
+  /** Consumer identifier (single or group) */
   consumer: Consumer,
+  /** Partition ID (required for single consumer, null for group) */
   partitionId: number | null,
+  /** Offset value to store */
   offset: bigint
 };
 
+/**
+ * Store offset command definition.
+ * Persists a consumer's offset for a partition.
+ */
 export const STORE_OFFSET = {
   code: COMMAND_CODE.StoreOffset,
 
@@ -42,4 +54,7 @@ export const STORE_OFFSET = {
 };
 
 
+/**
+ * Executable store offset command function.
+ */
 export const storeOffset = wrapCommand<StoreOffset, boolean>(STORE_OFFSET);
