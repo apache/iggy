@@ -15,7 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::{Consensus, Project};
+use crate::vsr_timeout::TimeoutManager;
+use crate::{Consensus, DvcQuorumArray, Project, dvc_quorum_array_empty};
 use bit_set::BitSet;
 use iggy_common::header::{Command2, PrepareHeader, PrepareOkHeader, RequestHeader};
 use iggy_common::message::Message;
@@ -322,6 +323,23 @@ pub enum Status {
     Recovering,
 }
 
+/// Actions to be taken by the caller after processing a VSR event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VsrAction {
+    /// Send StartViewChange to all replicas.
+    SendStartViewChange { view: u32 },
+    /// Send DoViewChange to primary.
+    SendDoViewChange {
+        view: u32,
+        target: u8,
+        log_view: u32,
+        op: u64,
+        commit: u64,
+    },
+    /// Send StartView to all backups (as new primary).
+    SendStartView { view: u32, op: u64, commit: u64 },
+}
+
 #[allow(unused)]
 pub struct VsrConsensus {
     cluster: u128,
@@ -329,6 +347,15 @@ pub struct VsrConsensus {
     replica_count: u8,
 
     view: Cell<u32>,
+
+    // The latest view where
+    // - the replica was a primary and acquired a DVC quorum, or
+    // - the replica was a backup and processed a SV message.
+    // i.e. the latest view in which this replica changed its head message.
+    // Initialized from the superblock's VSRState.
+    // Invariants:
+    // * `replica.log_view ≥ replica.log_view_durable`
+    // * `replica.log_view = 0` when replica_count=1.
     log_view: Cell<u32>,
     status: Cell<Status>,
     commit: Cell<u64>,
@@ -342,6 +369,20 @@ pub struct VsrConsensus {
 
     message_bus: IggyMessageBus,
     // TODO: Add loopback_queue for messages to self
+    /// Tracks start view change messages received from all replicas (including self)
+    start_view_change_from_all_replicas: RefCell<BitSet<u32>>,
+
+    /// Tracks DVC messages received (only used by primary candidate)
+    /// Stores metadata; actual log comes from message
+    do_view_change_from_all_replicas: RefCell<DvcQuorumArray>,
+    /// Whether DVC quorum has been achieved in current view change
+    do_view_change_quorum: Cell<bool>,
+    /// Whether we've sent our own SVC for current view
+    sent_own_start_view_change: Cell<bool>,
+    /// Whether we've sent our own DVC for current view  
+    sent_own_do_view_change: Cell<bool>,
+
+    timeouts: RefCell<TimeoutManager>,
 }
 
 impl VsrConsensus {
@@ -364,6 +405,12 @@ impl VsrConsensus {
             last_prepare_checksum: Cell::new(0),
             pipeline: RefCell::new(Pipeline::new()),
             message_bus: IggyMessageBus::new(replica_count as usize, replica as u16, 0),
+            start_view_change_from_all_replicas: RefCell::new(BitSet::with_capacity(REPLICAS_MAX)),
+            do_view_change_from_all_replicas: RefCell::new(dvc_quorum_array_empty()),
+            do_view_change_quorum: Cell::new(false),
+            sent_own_start_view_change: Cell::new(false),
+            sent_own_do_view_change: Cell::new(false),
+            timeouts: RefCell::new(TimeoutManager::new(replica as u128)),
         }
     }
 
@@ -408,6 +455,10 @@ impl VsrConsensus {
         self.view.get()
     }
 
+    pub fn set_view(&mut self, view: u32) {
+        self.view.set(view);
+    }
+
     pub fn status(&self) -> Status {
         self.status.get()
     }
@@ -426,6 +477,14 @@ impl VsrConsensus {
 
     pub fn replica_count(&self) -> u8 {
         self.replica_count
+    }
+
+    pub fn log_view(&self) -> u32 {
+        self.log_view.get()
+    }
+
+    pub fn set_log_view(&self, log_view: u32) {
+        self.log_view.set(log_view);
     }
 
     /// Handle a prepare_ok message from a follower.

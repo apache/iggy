@@ -102,6 +102,7 @@ pub enum TimeoutKind {
     CommitMessage,
     NormalHeartbeat,
     StartViewChangeMessage,
+    ViewChangeStatus,
     DoViewChangeMessage,
     RequestStartViewMessage,
 }
@@ -115,6 +116,7 @@ pub struct TimeoutManager {
     normal_heartbeat: Timeout,
     start_view_change_message: Timeout,
     do_view_change_message: Timeout,
+    view_change_status: Timeout,
     request_start_view_message: Timeout,
     prng: Xoshiro256Plus,
 }
@@ -128,6 +130,7 @@ impl TimeoutManager {
     const COMMIT_MESSAGE_TICKS: u64 = 50;
     const NORMAL_HEARTBEAT_TICKS: u64 = 500;
     const START_VIEW_CHANGE_MESSAGE_TICKS: u64 = 50;
+    const VIEW_CHANGE_STATUS_TICKS: u64 = 500;
     const DO_VIEW_CHANGE_MESSAGE_TICKS: u64 = 50;
     const REQUEST_START_VIEW_MESSAGE_TICKS: u64 = 100;
 
@@ -142,6 +145,7 @@ impl TimeoutManager {
                 Self::START_VIEW_CHANGE_MESSAGE_TICKS,
             ),
             do_view_change_message: Timeout::new(replica_id, Self::DO_VIEW_CHANGE_MESSAGE_TICKS),
+            view_change_status: Timeout::new(replica_id, Self::VIEW_CHANGE_STATUS_TICKS),
             request_start_view_message: Timeout::new(
                 replica_id,
                 Self::REQUEST_START_VIEW_MESSAGE_TICKS,
@@ -174,6 +178,7 @@ impl TimeoutManager {
             TimeoutKind::CommitMessage => &self.commit_message,
             TimeoutKind::NormalHeartbeat => &self.normal_heartbeat,
             TimeoutKind::StartViewChangeMessage => &self.start_view_change_message,
+            TimeoutKind::ViewChangeStatus => &self.view_change_status,
             TimeoutKind::DoViewChangeMessage => &self.do_view_change_message,
             TimeoutKind::RequestStartViewMessage => &self.request_start_view_message,
         }
@@ -186,6 +191,7 @@ impl TimeoutManager {
             TimeoutKind::CommitMessage => &mut self.commit_message,
             TimeoutKind::NormalHeartbeat => &mut self.normal_heartbeat,
             TimeoutKind::StartViewChangeMessage => &mut self.start_view_change_message,
+            TimeoutKind::ViewChangeStatus => &mut self.view_change_status,
             TimeoutKind::DoViewChangeMessage => &mut self.do_view_change_message,
             TimeoutKind::RequestStartViewMessage => &mut self.request_start_view_message,
         }
@@ -210,6 +216,7 @@ impl TimeoutManager {
             TimeoutKind::CommitMessage => &mut self.commit_message,
             TimeoutKind::NormalHeartbeat => &mut self.normal_heartbeat,
             TimeoutKind::StartViewChangeMessage => &mut self.start_view_change_message,
+            TimeoutKind::ViewChangeStatus => &mut self.view_change_status,
             TimeoutKind::DoViewChangeMessage => &mut self.do_view_change_message,
             TimeoutKind::RequestStartViewMessage => &mut self.request_start_view_message,
         };
