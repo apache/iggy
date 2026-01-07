@@ -32,7 +32,7 @@ export const GET_USERS = {
   code: COMMAND_CODE.GetUsers,
 
   serialize: () =>  Buffer.alloc(0),
-  
+
   deserialize: (r: CommandResponse) => deserializeUsers(r.data)
 };
 

@@ -29,9 +29,9 @@ import { deserializeToStream, type Stream } from './stream.utils.js';
  */
 export const GET_STREAMS = {
   code: COMMAND_CODE.GetStreams,
-  
+
   serialize: () => Buffer.alloc(0),
-  
+
   deserialize: (r: CommandResponse) => {
     const payloadSize = r.data.length;
     const streams = [];

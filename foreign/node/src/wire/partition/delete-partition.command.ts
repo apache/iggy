@@ -46,7 +46,7 @@ export const DELETE_PARTITIONS = {
   serialize: ({ streamId, topicId, partitionCount }: DeletePartition) => {
     return serializePartitionParams(streamId, topicId, partitionCount);
   },
-  
+
   deserialize: deserializeVoidResponse
 };
 
