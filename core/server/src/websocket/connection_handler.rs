@@ -96,7 +96,7 @@ pub(crate) async fn handle_connection(
                         );
                         return Err(ConnectionError::from(IggyError::ConnectionClosed));
                     }
-                    IggyError::ClientNotFound(_) => {
+                    IggyError::ClientNotFound(_) | IggyError::StaleClient => {
                         error!("Command failed for session: {session}, error: {error}.");
                         sender.send_error_response(error.clone()).await?;
                         return Err(ConnectionError::from(error));
