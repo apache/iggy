@@ -54,11 +54,10 @@ RUN maturin build
 RUN find target/wheels/ -name "*.whl" -exec pip install {} \;
 
 # Install test dependencies from pyproject.toml
-RUN pip install --no-cache-dir -e ".[testing,examples]"
+RUN pip install --no-cache-dir -e ".[testing]"
 
 # Copy test files
 COPY foreign/python/tests/ ./tests/
-COPY foreign/python/python_examples/ ./examples/
 
 # Create test script
 COPY foreign/python/scripts/test.sh ./scripts/test.sh
