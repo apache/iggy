@@ -31,6 +31,7 @@ pub struct BenchmarkProducerConfig {
     pub messages_per_batch: BenchmarkNumericParameter,
     pub message_size: BenchmarkNumericParameter,
     pub warmup_time: IggyDuration,
+    pub compression_config: Option<ClientCompressionConfig>,
 }
 
 pub trait ProducerClient: Send + Sync {

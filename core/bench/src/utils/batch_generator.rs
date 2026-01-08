@@ -18,7 +18,6 @@
 use bench_report::numeric_parameter::BenchmarkNumericParameter;
 use bytes::Bytes;
 use iggy::prelude::*;
-use rand::{Rng, distr::Alphanumeric};
 
 pub struct BenchmarkMessagesBatch {
     pub messages: Vec<IggyMessage>,
@@ -39,16 +38,22 @@ impl BenchmarkBatchGenerator {
         message_size: BenchmarkNumericParameter,
         messages_per_batch: BenchmarkNumericParameter,
     ) -> Self {
-        let distr = Alphanumeric; // generate random payload consisting of alphanumeric characters
         let max_len = message_size.max() as usize;
         let is_fixed = message_size.is_fixed() && messages_per_batch.is_fixed();
 
-        let random: Vec<u8> = rand::rng().sample_iter(distr).take(max_len).collect();
+        let template = r#"{"name": "example messasge payload", "description": "simulating realistic compressible data", "user": "test-user", "id": 42, "trace_id": "812Fr%210"}"#;
+        let payload_bytes = template
+            .as_bytes()
+            .iter()
+            .cycle()
+            .take(max_len)
+            .copied()
+            .collect();
 
         let mut batch_generator = Self {
             message_size,
             messages_per_batch,
-            full_payload: Bytes::from(random),
+            full_payload: payload_bytes,
             batch: BenchmarkMessagesBatch {
                 messages: Vec::with_capacity(messages_per_batch.max() as usize),
                 user_data_bytes: 0,
