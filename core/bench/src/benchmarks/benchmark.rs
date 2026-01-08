@@ -172,6 +172,12 @@ pub trait Benchmarkable: Send {
             .map(|rl| format!(" global rate limit: {rl}/s"))
             .unwrap_or_default();
 
-        format!("{message_size}{messages_per_batch}{data}{rate_limit}",)
+        let compression = format!(
+            " compression algorithm used: {} with min. bytes size: {}b ",
+            self.args().compression_algorithm,
+            self.args().compression_min_size
+        );
+
+        format!("{message_size}{messages_per_batch}{data}{compression}{rate_limit}",)
     }
 }

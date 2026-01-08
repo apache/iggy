@@ -30,6 +30,7 @@ use crate::args::{
     common::IggyBenchArgs,
     defaults::{
         DEFAULT_BALANCED_NUMBER_OF_PARTITIONS, DEFAULT_BALANCED_NUMBER_OF_STREAMS,
+        DEFAULT_COMPRESSION_ALGORITHM, DEFAULT_COMPRESSION_MIN_PAYLOAD_SIZE,
         DEFAULT_HTTP_SERVER_ADDRESS, DEFAULT_MESSAGE_BATCHES, DEFAULT_MESSAGE_SIZE,
         DEFAULT_MESSAGES_PER_BATCH, DEFAULT_NUMBER_OF_CONSUMER_GROUPS, DEFAULT_NUMBER_OF_CONSUMERS,
         DEFAULT_NUMBER_OF_PRODUCERS, DEFAULT_PINNED_NUMBER_OF_PARTITIONS,
@@ -135,6 +136,8 @@ pub fn params_from_args_and_metrics(
     let rate_limit = args.rate_limit().map(|limit| limit.to_string());
     let pretty_name = args.generate_pretty_name();
     let bench_command = recreate_bench_command(args);
+    let compression_algorithm = args.compression_config().map(|c| c.algorithm.to_string());
+    let compression_min_size = args.compression_config().map(|c| c.min_size);
 
     let remark_for_identifier = remark
         .clone()
@@ -143,7 +146,7 @@ pub fn params_from_args_and_metrics(
 
     let data_volume_identifier = args.data_volume_identifier();
 
-    let params_identifier = vec![
+    let mut params_identifier = vec![
         benchmark_kind.to_string(),
         transport.to_string(),
         remark_for_identifier,
@@ -156,6 +159,11 @@ pub fn params_from_args_and_metrics(
         partitions.to_string(),
         consumer_groups.to_string(),
     ];
+
+    if let Some(algorithm) = &compression_algorithm {
+        params_identifier.push(algorithm.clone());
+        params_identifier.push(compression_min_size.unwrap().to_string());
+    }
 
     let params_identifier = params_identifier.join("_");
 
@@ -179,6 +187,8 @@ pub fn params_from_args_and_metrics(
         pretty_name,
         bench_command,
         params_identifier,
+        compression_algorithm,
+        compression_min_size,
     }
 }
 
@@ -243,6 +253,20 @@ fn add_basic_arguments(parts: &mut Vec<String>, args: &IggyBenchArgs) {
 
     if args.warmup_time().to_string() != DEFAULT_WARMUP_TIME {
         parts.push(format!("--warmup-time \'{}\'", args.warmup_time()));
+    }
+
+    if args.compression_algorithm != DEFAULT_COMPRESSION_ALGORITHM {
+        parts.push(format!(
+            "--compression-algorithm {}",
+            args.compression_algorithm
+        ));
+    }
+
+    if args.compression_min_size != DEFAULT_COMPRESSION_MIN_PAYLOAD_SIZE {
+        parts.push(format!(
+            "--compression-min-size {}",
+            args.compression_min_size
+        ));
     }
 }
 

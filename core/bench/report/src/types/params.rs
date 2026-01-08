@@ -43,6 +43,8 @@ pub struct BenchmarkParams {
     pub pretty_name: String,
     pub bench_command: String,
     pub params_identifier: String,
+    pub compression_algorithm: Option<String>,
+    pub compression_min_size: Option<u32>,
 }
 
 impl BenchmarkParams {

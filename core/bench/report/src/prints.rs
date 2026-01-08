@@ -40,6 +40,12 @@ impl BenchmarkReport {
         let messages_per_batch = format!("{} messages per batch, ", self.params.messages_per_batch);
         let message_batches = format!("{} message batches, ", self.params.message_batches);
         let message_size = format!("{} bytes per message, ", self.params.message_size);
+        let compression = if let Some(algorithm) = &self.params.compression_algorithm {
+            let min_size = self.params.compression_min_size.unwrap_or(0);
+            format!("compression: {} (min {} bytes), ", algorithm, min_size)
+        } else {
+            "compression: none, ".to_owned()
+        };
         let producers = if self.params.producers == 0 {
             "".to_owned()
         } else if self.params.benchmark_kind == BenchmarkKind::EndToEndProducingConsumerGroup
@@ -65,7 +71,7 @@ impl BenchmarkReport {
             format!("{} consumer groups, ", self.params.consumer_groups)
         };
         println!();
-        let params_print = format!("Benchmark: {kind}, {producers}{consumers}{streams}{topics}{partitions}{consumer_groups}{total_messages}{messages_per_batch}{message_batches}{message_size}{total_size}\n",).blue();
+        let params_print = format!("Benchmark: {kind}, {producers}{consumers}{streams}{topics}{partitions}{consumer_groups}{compression}{total_messages}{messages_per_batch}{message_batches}{message_size}{total_size}\n",).blue();
 
         info!("{}", params_print);
 

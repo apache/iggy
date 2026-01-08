@@ -94,19 +94,22 @@ impl BenchmarkInit for HighLevelProducerClient {
             _ => Partitioning::balanced(),
         };
 
-        self.producer = Some(
-            client
-                .producer(&stream_id_str, topic_id_str)?
-                .partitioning(partitioning)
-                .create_stream_if_not_exists()
-                .create_topic_if_not_exists(
-                    self.config.partitions,
-                    Some(1),
-                    IggyExpiry::NeverExpire,
-                    MaxTopicSize::ServerDefault,
-                )
-                .build(),
-        );
+        let mut builder = client
+            .producer(&stream_id_str, topic_id_str)?
+            .partitioning(partitioning)
+            .create_stream_if_not_exists()
+            .create_topic_if_not_exists(
+                self.config.partitions,
+                Some(1),
+                IggyExpiry::NeverExpire,
+                MaxTopicSize::ServerDefault,
+            );
+
+        if let Some(compression_config) = self.config.compression_config {
+            builder = builder.compressor(compression_config);
+        }
+
+        self.producer = Some(builder.build());
         self.producer.as_mut().unwrap().init().await?;
         Ok(())
     }

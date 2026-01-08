@@ -115,6 +115,7 @@ pub fn build_producer_futures(
         BenchmarkFinishCondition::new(args, BenchmarkFinishConditionMode::Shared);
     let rate_limit = rate_limit_per_actor(args.rate_limit(), actors);
     let use_high_level_api = args.high_level_api();
+    let compression_config = args.compression_config();
 
     (1..=producers)
         .map(|producer_id| {
@@ -144,6 +145,7 @@ pub fn build_producer_futures(
                     sampling_time,
                     moving_average_window,
                     rate_limit,
+                    compression_config,
                 );
                 producer.run().await
             }
@@ -269,6 +271,7 @@ pub fn build_producing_consumers_futures(
             let origin_timestamp_latency_calculation = true;
             let use_high_level_api = args.high_level_api();
             let rate_limit = rate_limit_per_actor(args.rate_limit(), producing_consumers);
+            let compression_config = args.compression_config();
 
             async move {
                 info!(
@@ -293,6 +296,7 @@ pub fn build_producing_consumers_futures(
                     rate_limit,
                     polling_kind,
                     origin_timestamp_latency_calculation,
+                    compression_config,
                 );
                 actor.run().await
             }
@@ -306,6 +310,7 @@ pub fn build_producing_consumer_groups_futures(
     args: Arc<IggyBenchArgs>,
 ) -> Vec<impl Future<Output = Result<BenchmarkIndividualMetrics, IggyError>> + Send> {
     let producers = args.producers();
+    let compression_config = args.compression_config();
     let consumers = args.consumers();
     let total_actors = producers.max(consumers);
     let partitions = args.number_of_partitions();
@@ -395,6 +400,7 @@ pub fn build_producing_consumer_groups_futures(
                     rate_limit,
                     polling_kind,
                     origin_timestamp_latency_calculation,
+                    compression_config,
                 );
 
                 actor.run().await

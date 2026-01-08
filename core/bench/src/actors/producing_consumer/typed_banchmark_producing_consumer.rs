@@ -64,6 +64,7 @@ impl TypedBenchmarkProducingConsumer {
         limit_bytes_per_second: Option<IggyByteSize>,
         polling_kind: PollingKind,
         origin_timestamp_latency_calculation: bool,
+        compression_config: Option<ClientCompressionConfig>,
     ) -> Self {
         let producer_config = BenchmarkProducerConfig {
             producer_id: actor_id,
@@ -72,6 +73,7 @@ impl TypedBenchmarkProducingConsumer {
             messages_per_batch,
             message_size,
             warmup_time,
+            compression_config,
         };
 
         let consumer_config = BenchmarkConsumerConfig {

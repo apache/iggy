@@ -55,6 +55,7 @@ impl TypedBenchmarkProducer {
         sampling_time: IggyDuration,
         moving_average_window: u32,
         limit_bytes_per_second: Option<IggyByteSize>,
+        compression_config: Option<ClientCompressionConfig>,
     ) -> Self {
         let config = BenchmarkProducerConfig {
             producer_id,
@@ -63,6 +64,7 @@ impl TypedBenchmarkProducer {
             messages_per_batch,
             message_size,
             warmup_time,
+            compression_config,
         };
 
         if use_high_level_api {

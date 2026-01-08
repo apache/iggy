@@ -16,9 +16,12 @@
  * under the License.
  */
 
-use iggy::prelude::IggyByteSize;
+use iggy::prelude::{CompressionAlgorithm, IggyByteSize};
 use nonzero_lit::u32;
 use std::num::NonZeroU32;
+
+pub const DEFAULT_COMPRESSION_ALGORITHM: CompressionAlgorithm = CompressionAlgorithm::None;
+pub const DEFAULT_COMPRESSION_MIN_PAYLOAD_SIZE: NonZeroU32 = u32!(2048);
 
 pub const DEFAULT_HTTP_SERVER_ADDRESS: &str = "127.0.0.1:3000";
 
