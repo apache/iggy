@@ -4459,7 +4459,7 @@ dependencies = [
 
 [[package]]
 name = "iggy"
-version = "0.8.1-edge.2"
+version = "0.8.1-edge.3"
 dependencies = [
  "async-broadcast",
  "async-dropper",
@@ -8246,7 +8246,7 @@ dependencies = [
 
 [[package]]
 name = "server"
-version = "0.6.1-edge.2"
+version = "0.6.1-edge.3"
 dependencies = [
  "ahash 0.8.12",
  "anyhow",

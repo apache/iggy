@@ -22,59 +22,94 @@ import { uint32ToBuf, uint64ToBuf } from '../number.utils.js';
 import type { ValueOf } from '../../type.utils.js';
 
 
+/**
+ * Enumeration of partition selection strategies.
+ */
 export const PartitionKind = {
+  /** Server selects partition using round-robin */
   Balanced : 1,
+  /** Client specifies exact partition ID */
   PartitionId : 2,
+  /** Client provides a key for consistent hashing */
   MessageKey : 3
 } as const;
 
-
+/** Type alias for the PartitionKind object */
 export type PartitionKind = typeof PartitionKind;
+/** String literal type of partition kind names */
 export type PartitionKindId = keyof PartitionKind;
+/** Numeric values of partition kinds */
 export type PartitionKindValue = ValueOf<PartitionKind>
 
+/** Balanced partitioning (server selects partition) */
 export type Balanced = {
   kind: PartitionKind['Balanced'],
   value: null
 };
 
+/** Explicit partition ID selection */
 export type PartitionId = {
   kind: PartitionKind['PartitionId'],
-  value: number // uint32
+  /** Partition ID (uint32) */
+  value: number
 };
 
-// string | uint32/64/128
+/** Possible types for message key values */
 export type MessageKeyValue = string | number | bigint | Buffer;
 
+/** Message key-based partitioning for consistent hashing */
 export type MessageKey = {
   kind: PartitionKind['MessageKey'],
   value: MessageKeyValue
 };
 
+/** Union of all partitioning strategies */
 export type Partitioning = Balanced | PartitionId | MessageKey;
 
+/** Balanced partitioning constant */
 const Balanced: Balanced = {
   kind: PartitionKind.Balanced,
   value: null
 };
 
+/**
+ * Creates a partition ID partitioning strategy.
+ *
+ * @param id - Partition ID to target
+ * @returns PartitionId partitioning object
+ */
 const PartitionId = (id: number): PartitionId => ({
   kind: PartitionKind.PartitionId,
   value: id
 });
 
+/**
+ * Creates a message key partitioning strategy.
+ *
+ * @param key - Key for consistent hashing
+ * @returns MessageKey partitioning object
+ */
 const MessageKey = (key: MessageKeyValue): MessageKey => ({
   kind: PartitionKind.MessageKey,
   value: key
 });
 
-// Helper
+/**
+ * Factory object for creating partitioning strategies.
+ */
 export const Partitioning = {
   Balanced,
   PartitionId,
   MessageKey
 };
 
+/**
+ * Serializes a message key value to a buffer.
+ *
+ * @param v - Message key value
+ * @returns Serialized buffer
+ * @throws Error if the value type is not supported
+ */
 export const serializeMessageKey = (v: MessageKeyValue) => {
   if (v instanceof Buffer) return v;
   if ('string' === typeof v) return Buffer.from(v);
@@ -83,6 +118,12 @@ export const serializeMessageKey = (v: MessageKeyValue) => {
   throw new Error(`cannot serialize messageKey ${v}, ${typeof v}`);
 };
 
+/**
+ * Serializes the value portion of a partitioning strategy.
+ *
+ * @param part - Partitioning strategy
+ * @returns Serialized value buffer
+ */
 export const serializePartitioningValue = (part: Partitioning): Buffer => {
   const { kind, value } = part;
   switch (kind) {
@@ -92,11 +133,19 @@ export const serializePartitioningValue = (part: Partitioning): Buffer => {
   }
 };
 
+/** Default partitioning strategy (balanced) */
 export const default_partionning: Balanced = {
   kind: PartitionKind.Balanced,
   value: null
 };
 
+/**
+ * Serializes a partitioning strategy to wire format.
+ * Format: [kind (1 byte)][value_length (1 byte)][value]
+ *
+ * @param p - Optional partitioning strategy (defaults to balanced)
+ * @returns Serialized partitioning buffer
+ */
 export const serializePartitioning = (p?: Partitioning) => {
   const part = p || default_partionning;
   const b = Buffer.alloc(2);

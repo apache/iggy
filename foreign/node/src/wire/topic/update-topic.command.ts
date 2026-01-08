@@ -29,16 +29,30 @@ import {
 } from './topic.utils.js';
 
 
+/**
+ * Parameters for the update topic command.
+ */
 export type UpdateTopic = {
+  /** Stream identifier (ID or name) */
   streamId: Id,
+  /** Topic identifier (ID or name) */
   topicId: Id,
+  /** New topic name (1-255 bytes) */
   name: string,
+  /** Compression algorithm (None or Gzip) */
   compressionAlgorithm?: CompressionAlgorithmT,
+  /** Message expiry time in microseconds (0 = unlimited) */
   messageExpiry?: bigint,
+  /** Maximum topic size in bytes (0 = unlimited) */
   maxTopicSize?: bigint,
+  /** Replication factor (1-255) */
   replicationFactor?: number,
 };
 
+/**
+ * Update topic command definition.
+ * Updates a topic's configuration.
+ */
 export const UPDATE_TOPIC = {
   code: COMMAND_CODE.UpdateTopic,
 
@@ -79,4 +93,7 @@ export const UPDATE_TOPIC = {
 };
 
 
+/**
+ * Executable update topic command function.
+ */
 export const updateTopic = wrapCommand<UpdateTopic, boolean>(UPDATE_TOPIC);
