@@ -72,15 +72,15 @@ impl Permissioner {
                 return Ok(());
             }
 
-            if let Some(topic_permissions) =
-                stream_permissions.topics.as_ref().unwrap().get(&stream_id)
-                && (topic_permissions.manage_topic || topic_permissions.read_topic)
-            {
-                return Ok(());
+            if let Some(topic_permissions) = stream_permissions.topics.as_ref() {
+                for (topic_id, topic_permissions) in topic_permissions {
+                    if !topic_permissions.manage_topic || !topic_permissions.read_topic {
+                        return Err(IggyError::Unauthorized);
+                    }
+                }
             }
         }
-
-        Err(IggyError::Unauthorized)
+        Ok(())
     }
 
     pub fn create_topic(&self, user_id: u32, stream_id: usize) -> Result<(), IggyError> {
