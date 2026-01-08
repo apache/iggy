@@ -171,3 +171,30 @@ impl Default for ConsumerGroups {
         }
     }
 }
+
+impl ConsumerGroups {
+    /// Construct from pre-built entries with specific IDs.
+    pub fn from_entries(
+        entries: impl IntoIterator<Item = (usize, consumer_group::ConsumerGroup)>,
+    ) -> Self {
+        let entries: Vec<_> = entries.into_iter().collect();
+
+        let mut index = AHashMap::with_capacity(entries.len());
+        let mut root_entries = Vec::with_capacity(entries.len());
+        let mut members_entries = Vec::with_capacity(entries.len());
+
+        for (id, cg) in entries {
+            let (mut root, members) = cg.into_components();
+            root.update_id(id);
+            index.insert(root.key().clone(), id);
+            root_entries.push((id, root));
+            members_entries.push((id, members));
+        }
+
+        Self {
+            index,
+            root: root_entries.into_iter().collect(),
+            members: members_entries.into_iter().collect(),
+        }
+    }
+}

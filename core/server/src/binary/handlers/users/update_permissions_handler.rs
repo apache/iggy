@@ -18,7 +18,9 @@
 
 use std::rc::Rc;
 
-use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
+use crate::binary::command::{
+    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
+};
 use crate::binary::handlers::users::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 
@@ -45,12 +47,12 @@ impl ServerCommandHandler for UpdatePermissions {
         _length: u32,
         session: &Session,
         shard: &Rc<IggyShard>,
-    ) -> Result<(), IggyError> {
+    ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
 
         shard
                 .update_permissions(session, &self.user_id, self.permissions.clone())
-                .with_error(|error| format!("{COMPONENT} (error: {error}) - failed to update permissions for user_id: {}, session: {session}",
+                .error(|e: &IggyError| format!("{COMPONENT} (error: {e}) - failed to update permissions for user_id: {}, session: {session}",
                     self.user_id
                 ))?;
         info!("Updated permissions for user with ID: {}.", self.user_id);
@@ -68,7 +70,7 @@ impl ServerCommandHandler for UpdatePermissions {
             )
             .await?;
         sender.send_empty_ok_response().await?;
-        Ok(())
+        Ok(HandlerResult::Finished)
     }
 }
 

@@ -16,7 +16,9 @@
  * under the License.
  */
 
-use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
+use crate::binary::command::{
+    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
+};
 use crate::binary::handlers::personal_access_tokens::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
@@ -45,14 +47,14 @@ impl ServerCommandHandler for CreatePersonalAccessToken {
         _length: u32,
         session: &Session,
         shard: &Rc<IggyShard>,
-    ) -> Result<(), IggyError> {
+    ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
 
         let (personal_access_token, token) = shard
                 .create_personal_access_token(session, &self.name, self.expiry)
-                .with_error(|error| {
+                .error(|e: &IggyError| {
                     format!(
-                        "{COMPONENT} (error: {error}) - failed to create personal access token with name: {}, session: {session}",
+                        "{COMPONENT} (error: {e}) - failed to create personal access token with name: {}, session: {session}",
                         self.name
                     )
                 })?;
@@ -76,14 +78,14 @@ impl ServerCommandHandler for CreatePersonalAccessToken {
                 }),
             )
             .await
-            .with_error(|error| {
+            .error(|e: &IggyError| {
                 format!(
-                    "{COMPONENT} (error: {error}) - failed to create personal access token with name: {}, session: {session}",
+                    "{COMPONENT} (error: {e}) - failed to create personal access token with name: {}, session: {session}",
                     self.name
                 )
             })?;
         sender.send_ok_response(&bytes).await?;
-        Ok(())
+        Ok(HandlerResult::Finished)
     }
 }
 

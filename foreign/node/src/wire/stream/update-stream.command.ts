@@ -23,11 +23,20 @@ import { COMMAND_CODE } from '../command.code.js';
 import { serializeIdentifier, type Id } from '../identifier.utils.js';
 import { uint8ToBuf } from '../number.utils.js';
 
+/**
+ * Parameters for the update stream command.
+ */
 export type UpdateStream = {
+  /** Stream identifier (ID or name) */
   streamId: Id,
+  /** New stream name (1-255 bytes) */
   name: string
 }
 
+/**
+ * Update stream command definition.
+ * Updates a stream's name.
+ */
 export const UPDATE_STREAM = {
   code: COMMAND_CODE.UpdateStream,
 
@@ -49,4 +58,7 @@ export const UPDATE_STREAM = {
 };
 
 
+/**
+ * Executable update stream command function.
+ */
 export const updateStream = wrapCommand<UpdateStream, boolean>(UPDATE_STREAM);

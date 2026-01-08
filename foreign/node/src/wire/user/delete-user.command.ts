@@ -23,10 +23,18 @@ import { wrapCommand } from '../command.utils.js';
 import { COMMAND_CODE } from '../command.code.js';
 import { serializeIdentifier, type Id } from '../identifier.utils.js';
 
+/**
+ * Parameters for the delete user command.
+ */
 export type DeleteUser = {
+  /** User identifier (ID or username) */
   userId: Id
 }
 
+/**
+ * Delete user command definition.
+ * Removes a user from the system.
+ */
 export const DELETE_USER = {
   code: COMMAND_CODE.DeleteUser,
 
@@ -38,4 +46,7 @@ export const DELETE_USER = {
 };
 
 
+/**
+ * Executable delete user command function.
+ */
 export const deleteUser = wrapCommand<DeleteUser, boolean>(DELETE_USER);

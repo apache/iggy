@@ -23,6 +23,7 @@ use dashmap::DashMap;
 use dotenvy::dotenv;
 use err_trail::ErrContext;
 use figlet_rs::FIGfont;
+use iggy_common::sharding::{IggyNamespace, LocalIdx, PartitionLocation, ShardId};
 use iggy_common::{Aes256GcmEncryptor, EncryptorKind, IggyError, MemoryPool};
 use server::SEMANTIC_VERSION;
 use server::args::Args;
@@ -35,9 +36,7 @@ use server::diagnostics::{print_io_uring_permission_info, print_locked_memory_li
 use server::io::fs_utils;
 use server::log::logger::Logging;
 use server::server_error::ServerError;
-use server::shard::namespace::IggyNamespace;
 use server::shard::system::info::SystemInfo;
-use server::shard::transmission::id::ShardId;
 use server::shard::{IggyShard, calculate_shard_assignment};
 use server::slab::traits_ext::{
     EntityComponentSystem, EntityComponentSystemMutCell, IntoComponents,
@@ -144,8 +143,8 @@ fn main() -> Result<(), ServerError> {
         // SECOND DISCRETE LOADING STEP.
         // Load config and create directories.
         // Remove `local_data` directory if run with `--fresh` flag.
-        let config = load_config().await.with_error(|error| {
-            format!("{COMPONENT} (error: {error}) - failed to load config during bootstrap")
+        let config = load_config().await.error(|e: &ServerError| {
+            format!("{COMPONENT} (error: {e}) - failed to load config during bootstrap")
         })?;
         if args.fresh {
             let system_path = config.system.get_system_path();
@@ -296,6 +295,11 @@ fn main() -> Result<(), ServerError> {
         let metrics = Metrics::init();
 
         // TWELFTH DISCRETE LOADING STEP.
+        info!(
+            "Enable TCP socket migration across shards: {}.",
+            config.tcp.socket_migration
+        );
+
         info!("Starting {} shard(s)", shard_assignment.len());
         let (connections, shutdown_handles) = create_shard_connections(&shard_assignment);
         let shards_count = shard_assignment.len();
@@ -309,7 +313,7 @@ fn main() -> Result<(), ServerError> {
         // Shared resources bootstrap.
         let shards_table = Box::new(DashMap::with_capacity(SHARDS_TABLE_CAPACITY));
         let shards_table = Box::leak(shards_table);
-        let shards_table: EternalPtr<DashMap<IggyNamespace, ShardId>> = shards_table.into();
+        let shards_table: EternalPtr<DashMap<IggyNamespace, PartitionLocation>> = shards_table.into();
 
         let client_manager = Box::new(DashMap::new());
         let client_manager = Box::leak(client_manager);
@@ -333,7 +337,9 @@ fn main() -> Result<(), ServerError> {
                                     &ns,
                                     shard_assignment.len() as u32,
                                 ));
-                                shards_table.insert(ns, shard_id);
+                                // TODO(hubcio): LocalIdx is 0 until IggyPartitions is integratedds
+                                let location = PartitionLocation::new(shard_id, LocalIdx::new(0));
+                                shards_table.insert(ns, location);
                             }
                         });
                     }
@@ -395,11 +401,15 @@ fn main() -> Result<(), ServerError> {
                 .name(format!("shard-{id}"))
                 .spawn(move || {
                     let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                        if let Err(e) = assignment.bind_cpu() {
+                            error!("Failed to bind cpu: {e:?}");
+                        }
+
                         if let Err(e) = assignment.bind_memory() {
                             error!("Failed to bind memory: {e:?}");
                         }
 
-                        let rt = create_shard_executor(assignment.cpu_set);
+                        let rt = create_shard_executor();
                         rt.block_on(async move {
                             let builder = IggyShard::builder();
                             let shard = builder

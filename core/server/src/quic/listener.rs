@@ -210,12 +210,12 @@ async fn handle_stream(
                     "Command was not handled successfully, session: {:?}, error: {e}.",
                     session
                 );
-                // Only return a connection-terminating error for client not found
-                if let IggyError::ClientNotFound(_) = e {
+                // Only return a connection-terminating error for client not found or stale
+                if matches!(e, IggyError::ClientNotFound(_) | IggyError::StaleClient) {
                     sender.send_error_response(e.clone()).await?;
                     trace!("QUIC error response was sent.");
                     error!("Session will be deleted.");
-                    Err(anyhow!("Client not found: {e}"))
+                    Err(anyhow!("Client invalid: {e}"))
                 } else {
                     // For all other errors, send response and continue the connection
                     sender.send_error_response(e).await?;

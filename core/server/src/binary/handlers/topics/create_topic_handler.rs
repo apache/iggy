@@ -16,7 +16,9 @@
  * under the License.
  */
 
-use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
+use crate::binary::command::{
+    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
+};
 use crate::binary::handlers::topics::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
@@ -51,7 +53,7 @@ impl ServerCommandHandler for CreateTopic {
         _length: u32,
         session: &Session,
         shard: &Rc<IggyShard>,
-    ) -> Result<(), IggyError> {
+    ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
 
         let request = ShardRequest {
@@ -140,9 +142,9 @@ impl ServerCommandHandler for CreateTopic {
                             command: self
                         }))
                         .await
-                        .with_error(|error| {
+                        .error(|e: &IggyError| {
                             format!(
-                                "{COMPONENT} (error: {error}) - failed to apply create topic for stream_id: {stream_id_num}, topic_id: {topic_id:?}"
+                                "{COMPONENT} (error: {e}) - failed to apply create topic for stream_id: {stream_id_num}, topic_id: {topic_id:?}"
                             )
                         })?;
                     sender.send_ok_response(&response).await?;
@@ -175,9 +177,9 @@ impl ServerCommandHandler for CreateTopic {
                             command: self
                         }))
                         .await
-                        .with_error(|error| {
+                        .error(|e: &IggyError| {
                             format!(
-                                "{COMPONENT} (error: {error}) - failed to apply create topic for stream_id: {stream_id}, topic_id: {topic_id:?}"
+                                "{COMPONENT} (error: {e}) - failed to apply create topic for stream_id: {stream_id}, topic_id: {topic_id:?}"
                             )
                         })?;
 
@@ -192,7 +194,7 @@ impl ServerCommandHandler for CreateTopic {
             },
         }
 
-        Ok(())
+        Ok(HandlerResult::Finished)
     }
 }
 

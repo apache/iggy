@@ -53,19 +53,19 @@ impl IndexWriter {
             .write(true)
             .open(file_path)
             .await
-            .with_error(|error| format!("Failed to open index file: {file_path}. {error}"))
+            .error(|e: &std::io::Error| format!("Failed to open index file: {file_path}. {e}"))
             .map_err(|_| IggyError::CannotReadFile)?;
 
         if file_exists {
-            let _ = file.sync_all().await.with_error(|error| {
-                format!("Failed to fsync index file after creation: {file_path}. {error}",)
+            let _ = file.sync_all().await.error(|e: &std::io::Error| {
+                format!("Failed to fsync index file after creation: {file_path}. {e}",)
             });
 
             let actual_index_size = file
                 .metadata()
                 .await
-                .with_error(|error| {
-                    format!("Failed to get metadata of index file: {file_path}. {error}")
+                .error(|e: &std::io::Error| {
+                    format!("Failed to get metadata of index file: {file_path}. {e}")
                 })
                 .map_err(|_| IggyError::CannotReadFileMetadata)?
                 .len();
@@ -99,9 +99,9 @@ impl IndexWriter {
             .write_all_at(indexes, position)
             .await
             .0
-            .with_error(|error| {
+            .error(|e: &std::io::Error| {
                 format!(
-                    "Failed to write {} indexes to file: {}. {error}",
+                    "Failed to write {} indexes to file: {}. {e}",
                     count, self.file_path
                 )
             })
@@ -126,7 +126,9 @@ impl IndexWriter {
         self.file
             .sync_all()
             .await
-            .with_error(|error| format!("Failed to fsync index file: {}. {error}", self.file_path))
+            .error(|e: &std::io::Error| {
+                format!("Failed to fsync index file: {}. {e}", self.file_path)
+            })
             .map_err(|_| IggyError::CannotWriteToFile)?;
         Ok(())
     }

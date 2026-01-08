@@ -21,6 +21,8 @@ use hwlocality::bitmap::SpecializedBitmapRef;
 use hwlocality::cpu::cpuset::CpuSet;
 use hwlocality::memory::binding::{MemoryBindingFlags, MemoryBindingPolicy};
 use hwlocality::object::types::ObjectType::{self, NUMANode};
+#[cfg(target_os = "linux")]
+use nix::{sched::sched_setaffinity, unistd::Pid};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashSet;
 use std::str::FromStr;
@@ -291,6 +293,34 @@ pub struct ShardInfo {
 }
 
 impl ShardInfo {
+    pub fn bind_cpu(&self) -> Result<(), ServerError> {
+        #[cfg(target_os = "linux")]
+        {
+            if self.cpu_set.is_empty() {
+                return Ok(());
+            }
+
+            let mut cpuset = nix::sched::CpuSet::new();
+            for &cpu in &self.cpu_set {
+                cpuset.set(cpu).map_err(|_| ServerError::BindingFailed)?;
+            }
+
+            sched_setaffinity(Pid::from_raw(0), &cpuset).map_err(|e| {
+                tracing::error!("Failed to set CPU affinity: {:?}", e);
+                ServerError::BindingFailed
+            })?;
+
+            info!("Thread bound to CPUs: {:?}", self.cpu_set);
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            tracing::debug!("CPU affinity binding skipped on non-Linux platform");
+        }
+
+        Ok(())
+    }
+
     pub fn bind_memory(&self) -> Result<(), ServerError> {
         if let Some(node_id) = self.numa_node {
             let topology = Topology::new().map_err(|err| ServerError::TopologyDetection {

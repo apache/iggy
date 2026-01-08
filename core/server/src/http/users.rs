@@ -41,7 +41,7 @@ use err_trail::ErrContext;
 use iggy_common::Identifier;
 use iggy_common::IdentityInfo;
 use iggy_common::Validatable;
-use iggy_common::{UserInfo, UserInfoDetails};
+use iggy_common::{IggyError, UserInfo, UserInfoDetails};
 use send_wrapper::SendWrapper;
 use serde::Deserialize;
 use std::sync::Arc;
@@ -94,9 +94,9 @@ async fn get_users(
         let future = SendWrapper::new(state.shard.shard().get_users(&session));
         future.await
     }
-    .with_error(|error| {
+    .error(|e: &IggyError| {
         format!(
-            "{COMPONENT} (error: {error}) - failed to get users, user ID: {}",
+            "{COMPONENT} (error: {e}) - failed to get users, user ID: {}",
             identity.user_id
         )
     })?;
@@ -127,9 +127,9 @@ async fn create_user(
             command.status,
             command.permissions.clone(),
         )
-        .with_error(|error| {
+        .error(|e: &IggyError| {
             format!(
-                "{COMPONENT} (error: {error}) - failed to create user, username: {}",
+                "{COMPONENT} (error: {e}) - failed to create user, username: {}",
                 command.username
             )
         })?;
@@ -175,9 +175,9 @@ async fn create_user(
                 .state
                 .apply(identity.user_id, &entry_command),
         );
-        future.await.with_error(|error| {
+        future.await.error(|e: &IggyError| {
             format!(
-                "{COMPONENT} (error: {error}) - failed to apply create user, username: {}",
+                "{COMPONENT} (error: {e}) - failed to apply create user, username: {}",
                 username
             )
         })?;
@@ -208,8 +208,8 @@ async fn update_user(
             command.username.clone(),
             command.status,
         )
-        .with_error(|error| {
-            format!("{COMPONENT} (error: {error}) - failed to update user, user ID: {user_id}")
+        .error(|e: &IggyError| {
+            format!("{COMPONENT} (error: {e}) - failed to update user, user ID: {user_id}")
         })?;
 
     // Send event for user update
@@ -240,9 +240,9 @@ async fn update_user(
                 .state
                 .apply(identity.user_id, &entry_command),
         );
-        future.await.with_error(|error| {
+        future.await.error(|e: &IggyError| {
             format!(
-                "{COMPONENT} (error: {error}) - failed to apply update user, username: {}",
+                "{COMPONENT} (error: {e}) - failed to apply update user, username: {}",
                 username.unwrap()
             )
         })?;
@@ -267,10 +267,8 @@ async fn update_permissions(
         .shard
         .shard()
         .update_permissions(&session, &command.user_id, command.permissions.clone())
-        .with_error(|error| {
-            format!(
-                "{COMPONENT} (error: {error}) - failed to update permissions, user ID: {user_id}"
-            )
+        .error(|e: &IggyError| {
+            format!("{COMPONENT} (error: {e}) - failed to update permissions, user ID: {user_id}")
         })?;
 
     // Send event for permissions update
@@ -299,9 +297,9 @@ async fn update_permissions(
                 .state
                 .apply(identity.user_id, &entry_command),
         );
-        future.await.with_error(|error| {
+        future.await.error(|e: &IggyError| {
             format!(
-                "{COMPONENT} (error: {error}) - failed to apply update permissions, user ID: {user_id}"
+                "{COMPONENT} (error: {e}) - failed to apply update permissions, user ID: {user_id}"
             )
         })?;
     }
@@ -330,8 +328,8 @@ async fn change_password(
             &command.current_password,
             &command.new_password,
         )
-        .with_error(|error| {
-            format!("{COMPONENT} (error: {error}) - failed to change password, user ID: {user_id}")
+        .error(|e: &IggyError| {
+            format!("{COMPONENT} (error: {e}) - failed to change password, user ID: {user_id}")
         })?;
 
     // Send event for password change
@@ -361,9 +359,9 @@ async fn change_password(
                 .state
                 .apply(identity.user_id, &entry_command),
         );
-        future.await.with_error(|error| {
+        future.await.error(|e: &IggyError| {
             format!(
-                "{COMPONENT} (error: {error}) - failed to apply change password, user ID: {user_id}"
+                "{COMPONENT} (error: {e}) - failed to apply change password, user ID: {user_id}"
             )
         })?;
     }
@@ -386,8 +384,8 @@ async fn delete_user(
         .shard
         .shard()
         .delete_user(&session, &identifier_user_id)
-        .with_error(|error| {
-            format!("{COMPONENT} (error: {error}) - failed to delete user with ID: {user_id}")
+        .error(|e: &IggyError| {
+            format!("{COMPONENT} (error: {e}) - failed to delete user with ID: {user_id}")
         })?;
 
     // Send event for user deletion
@@ -417,8 +415,8 @@ async fn delete_user(
                 .state
                 .apply(identity.user_id, &entry_command),
         );
-        future.await.with_error(|error| {
-            format!("{COMPONENT} (error: {error}) - failed to apply delete user with ID: {user_id}")
+        future.await.error(|e: &IggyError| {
+            format!("{COMPONENT} (error: {e}) - failed to apply delete user with ID: {user_id}")
         })?;
     }
 
@@ -436,9 +434,9 @@ async fn login_user(
         .shard
         .shard()
         .login_user(&command.username, &command.password, None)
-        .with_error(|error| {
+        .error(|e: &IggyError| {
             format!(
-                "{COMPONENT} (error: {error}) - failed to login, username: {}",
+                "{COMPONENT} (error: {e}) - failed to login, username: {}",
                 command.username
             )
         })?;
@@ -457,9 +455,9 @@ async fn logout_user(
         .shard
         .shard()
         .logout_user(&session)
-        .with_error(|error| {
+        .error(|e: &IggyError| {
             format!(
-                "{COMPONENT} (error: {error}) - failed to logout, user ID: {}",
+                "{COMPONENT} (error: {e}) - failed to logout, user ID: {}",
                 identity.user_id
             )
         })?;
@@ -471,9 +469,9 @@ async fn logout_user(
                 .revoke_token(&identity.token_id, identity.token_expiry),
         );
 
-        revoke_token_future.await.with_error(|error| {
+        revoke_token_future.await.error(|e: &IggyError| {
             format!(
-                "{COMPONENT} (error: {error}) - failed to revoke token, user ID: {}",
+                "{COMPONENT} (error: {e}) - failed to revoke token, user ID: {}",
                 identity.user_id
             )
         })?;
@@ -493,7 +491,7 @@ async fn refresh_token(
 
         refresh_token_future
             .await
-            .with_error(|error| format!("{COMPONENT} (error: {error}) - failed to refresh token"))?
+            .error(|e: &IggyError| format!("{COMPONENT} (error: {e}) - failed to refresh token"))?
     };
 
     Ok(Json(map_generated_access_token_to_identity_info(token)))

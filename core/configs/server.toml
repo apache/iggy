@@ -151,6 +151,9 @@ enabled = true
 # For example, "127.0.0.1:8090" listens on localhost only on port 8090.
 address = "127.0.0.1:8090"
 
+# Enable TCP socket migration across shards.
+socket_migration = true
+
 # Whether to use ipv4 or ipv6
 ipv6 = false
 

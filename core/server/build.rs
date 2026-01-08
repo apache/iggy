@@ -73,7 +73,7 @@ fn verify_web_assets_if_enabled() {
 
     if !assets_dir.exists() || !index_file.exists() {
         println!(
-            "cargo:warning=Web UI assets not found at {}. \
+            "cargo:info=Web UI assets not found at {}. \
              To build them, run: npm --prefix web ci && npm --prefix web run build:static",
             assets_dir.display()
         );

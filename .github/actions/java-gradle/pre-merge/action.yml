@@ -71,7 +71,6 @@ runs:
       if: inputs.task == 'test'
       id: iggy
       uses: ./.github/actions/utils/server-start
-      continue-on-error: true
 
     - name: Test
       if: inputs.task == 'test'
@@ -97,7 +96,7 @@ runs:
         fi
 
     - name: Stop Iggy server
-      if: inputs.task == 'test'
+      if: always() && inputs.task == 'test'
       uses: ./.github/actions/utils/server-stop
       with:
         pid-file: ${{ steps.iggy.outputs.pid_file }}

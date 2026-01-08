@@ -263,8 +263,8 @@ impl Display for TcpConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ enabled: {}, address: {}, ipv6: {}, tls: {}, socket: {} }}",
-            self.enabled, self.address, self.ipv6, self.tls, self.socket,
+            "{{ enabled: {}, address: {}, ipv6: {}, tls: {}, socket: {}, socket_migration: {} }}",
+            self.enabled, self.address, self.ipv6, self.tls, self.socket, self.socket_migration
         )
     }
 }

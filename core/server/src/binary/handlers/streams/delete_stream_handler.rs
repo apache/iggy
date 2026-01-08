@@ -16,7 +16,9 @@
  * under the License.
  */
 
-use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
+use crate::binary::command::{
+    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
+};
 use crate::binary::handlers::streams::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::shard::IggyShard;
@@ -48,7 +50,7 @@ impl ServerCommandHandler for DeleteStream {
         _length: u32,
         session: &Session,
         shard: &Rc<IggyShard>,
-    ) -> Result<(), IggyError> {
+    ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
         let stream_id = self.stream_id.clone();
         let request = ShardRequest {
@@ -72,8 +74,8 @@ impl ServerCommandHandler for DeleteStream {
                     let stream = shard
                             .delete_stream(session, &stream_id)
                             .await
-                            .with_error(|error| {
-                                format!("{COMPONENT} (error: {error}) - failed to delete stream with ID: {stream_id}, session: {session}")
+                            .error(|e: &IggyError| {
+                                format!("{COMPONENT} (error: {e}) - failed to delete stream with ID: {stream_id}, session: {session}")
                             })?;
                     info!(
                         "Deleted stream with name: {}, ID: {}",
@@ -91,8 +93,8 @@ impl ServerCommandHandler for DeleteStream {
                         .state
                         .apply(session.get_user_id(), &EntryCommand::DeleteStream(DeleteStream { stream_id: stream_id.clone() }))
                         .await
-                        .with_error(|error| {
-                            format!("{COMPONENT} (error: {error}) - failed to apply delete stream with ID: {stream_id}, session: {session}")
+                        .error(|e: &IggyError| {
+                            format!("{COMPONENT} (error: {e}) - failed to apply delete stream with ID: {stream_id}, session: {session}")
                         })?;
                     sender.send_empty_ok_response().await?;
                 }
@@ -103,8 +105,8 @@ impl ServerCommandHandler for DeleteStream {
                         .state
                         .apply(session.get_user_id(), &EntryCommand::DeleteStream(DeleteStream { stream_id: (stream.id() as u32).try_into().unwrap() }))
                         .await
-                        .with_error(|error| {
-                            format!("{COMPONENT} (error: {error}) - failed to apply delete stream with ID: {stream_id}, session: {session}")
+                        .error(|e: &IggyError| {
+                            format!("{COMPONENT} (error: {e}) - failed to apply delete stream with ID: {stream_id}, session: {session}")
                         })?;
                     sender.send_empty_ok_response().await?;
                 }
@@ -119,7 +121,7 @@ impl ServerCommandHandler for DeleteStream {
             },
         }
 
-        Ok(())
+        Ok(HandlerResult::Finished)
     }
 }
 

@@ -134,7 +134,7 @@ impl ClientManager {
         let mut client = self
             .clients
             .get_mut(&client_id)
-            .ok_or(IggyError::ClientNotFound(client_id))?;
+            .ok_or(IggyError::StaleClient)?;
         client.last_heartbeat = IggyTimestamp::now();
         Ok(())
     }
@@ -153,7 +153,7 @@ impl ClientManager {
         let mut client = self
             .clients
             .get_mut(&client_id)
-            .ok_or(IggyError::ClientNotFound(client_id))?;
+            .ok_or(IggyError::StaleClient)?;
 
         if client.consumer_groups.iter().any(|consumer_group| {
             consumer_group.group_id == group_id
@@ -185,7 +185,7 @@ impl ClientManager {
         let mut client = self
             .clients
             .get_mut(&client_id)
-            .ok_or(IggyError::ClientNotFound(client_id))?;
+            .ok_or(IggyError::StaleClient)?;
 
         if let Some(index) = client.consumer_groups.iter().position(|consumer_group| {
             consumer_group.stream_id == stream_id

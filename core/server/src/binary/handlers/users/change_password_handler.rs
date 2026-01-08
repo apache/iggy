@@ -16,7 +16,9 @@
  * under the License.
  */
 
-use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
+use crate::binary::command::{
+    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
+};
 use crate::binary::handlers::users::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 
@@ -45,7 +47,7 @@ impl ServerCommandHandler for ChangePassword {
         _length: u32,
         session: &Session,
         shard: &Rc<IggyShard>,
-    ) -> Result<(), IggyError> {
+    ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
 
         info!("Changing password for user with ID: {}...", self.user_id);
@@ -56,9 +58,9 @@ impl ServerCommandHandler for ChangePassword {
                     &self.current_password,
                     &self.new_password,
                 )
-                .with_error(|error| {
+                .error(|e: &IggyError| {
                     format!(
-                        "{COMPONENT} (error: {error}) - failed to change password for user_id: {}, session: {session}",
+                        "{COMPONENT} (error: {e}) - failed to change password for user_id: {}, session: {session}",
                         self.user_id
                     )
                 })?;
@@ -84,14 +86,14 @@ impl ServerCommandHandler for ChangePassword {
                 }),
             )
             .await
-            .with_error(|error| {
+            .error(|e: &IggyError| {
                 format!(
-                    "{COMPONENT} (error: {error}) - failed to apply change password for user_id: {}, session: {session}",
+                    "{COMPONENT} (error: {e}) - failed to apply change password for user_id: {}, session: {session}",
                     self.user_id
                 )
             })?;
         sender.send_empty_ok_response().await?;
-        Ok(())
+        Ok(HandlerResult::Finished)
     }
 }
 

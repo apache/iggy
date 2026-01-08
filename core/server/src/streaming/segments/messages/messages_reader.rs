@@ -52,7 +52,7 @@ impl MessagesReader {
             .read(true)
             .open(file_path)
             .await
-            .with_error(|error| format!("Failed to open messages file: {file_path}. {error}"))
+            .error(|e: &std::io::Error| format!("Failed to open messages file: {file_path}. {e}"))
             .map_err(|_| IggyError::CannotReadFile)?;
 
         // posix_fadvise() doesn't exist on MacOS
@@ -64,9 +64,9 @@ impl MessagesReader {
                 0, // 0 means the entire file
                 nix::fcntl::PosixFadviseAdvice::POSIX_FADV_SEQUENTIAL,
             )
-            .with_info(|error| {
+            .info(|e: &nix::errno::Errno| {
                 format!(
-                    "Failed to set sequential access pattern on messages file: {file_path}. {error}"
+                    "Failed to set sequential access pattern on messages file: {file_path}. {e}"
                 )
             });
         }
@@ -104,12 +104,12 @@ impl MessagesReader {
 
         let messages_bytes = match self.read_at(0, file_size, false).await {
             Ok(buf) => buf,
-            Err(error) if error.kind() == ErrorKind::UnexpectedEof => {
+            Err(e) if e.kind() == ErrorKind::UnexpectedEof => {
                 return Ok(vec![]);
             }
-            Err(error) => {
+            Err(e) => {
                 error!(
-                    "Error reading {messages_count} messages at position 0 in file {} of size {}: {error}",
+                    "Error reading {messages_count} messages at position 0 in file {} of size {}: {e}",
                     self.file_path, file_size
                 );
                 return Err(IggyError::CannotReadMessage);
@@ -150,12 +150,12 @@ impl MessagesReader {
 
         let messages_bytes = match self.read_at(start_pos, count_bytes, true).await {
             Ok(buf) => buf,
-            Err(error) if error.kind() == ErrorKind::UnexpectedEof => {
+            Err(e) if e.kind() == ErrorKind::UnexpectedEof => {
                 return Ok(IggyMessagesBatchMut::empty());
             }
-            Err(error) => {
+            Err(e) => {
                 error!(
-                    "Error reading {messages_count} messages at position {start_pos} in file {} of size {}: {error}",
+                    "Error reading {messages_count} messages at position {start_pos} in file {} of size {}: {e}",
                     self.file_path, file_size
                 );
                 return Err(IggyError::CannotReadMessage);

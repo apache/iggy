@@ -24,7 +24,7 @@ pub mod tasks;
 pub mod transmission;
 
 mod communication;
-mod handlers;
+pub mod handlers;
 
 // Re-export for backwards compatibility
 pub use communication::calculate_shard_assignment;
@@ -33,15 +33,7 @@ use self::tasks::{continuous, periodic};
 use crate::{
     configs::server::ServerConfig,
     io::fs_locks::FsLocks,
-    shard::{
-        namespace::IggyNamespace,
-        task_registry::TaskRegistry,
-        transmission::{
-            event::ShardEvent,
-            frame::{ShardFrame, ShardResponse},
-            message::ShardMessage,
-        },
-    },
+    shard::{task_registry::TaskRegistry, transmission::frame::ShardFrame},
     slab::{streams::Streams, traits_ext::EntityMarker, users::Users},
     state::file::FileState,
     streaming::{
@@ -52,6 +44,7 @@ use crate::{
 };
 use builder::IggyShardBuilder;
 use dashmap::DashMap;
+use iggy_common::sharding::{IggyNamespace, PartitionLocation};
 use iggy_common::{EncryptorKind, Identifier, IggyError};
 use std::{
     cell::{Cell, RefCell},
@@ -61,10 +54,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tracing::{debug, error, info, instrument};
-use transmission::{
-    connector::{Receiver, ShardConnector, StopReceiver},
-    id::ShardId,
-};
+use transmission::connector::{Receiver, ShardConnector, StopReceiver};
 
 pub const COMPONENT: &str = "SHARD";
 pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
@@ -76,7 +66,7 @@ pub struct IggyShard {
     _version: SemanticVersion,
 
     pub(crate) streams: Streams,
-    pub(crate) shards_table: EternalPtr<DashMap<IggyNamespace, ShardId>>,
+    pub(crate) shards_table: EternalPtr<DashMap<IggyNamespace, PartitionLocation>>,
     pub(crate) state: FileState,
 
     pub(crate) fs_locks: FsLocks,
@@ -196,9 +186,9 @@ impl IggyShard {
     async fn load_segments(&self) -> Result<(), IggyError> {
         use crate::bootstrap::load_segments;
         for shard_entry in self.shards_table.iter() {
-            let (namespace, shard_id) = shard_entry.pair();
+            let (namespace, location) = shard_entry.pair();
 
-            if **shard_id == self.id {
+            if *location.shard_id == self.id {
                 let stream_id = namespace.stream_id();
                 let topic_id: usize = namespace.topic_id();
                 let partition_id = namespace.partition_id();
@@ -290,14 +280,6 @@ impl IggyShard {
 
     pub fn get_available_shards_count(&self) -> u32 {
         self.shards.len() as u32
-    }
-
-    pub async fn handle_shard_message(&self, message: ShardMessage) -> Option<ShardResponse> {
-        handlers::handle_shard_message(self, message).await
-    }
-
-    pub(crate) async fn handle_event(&self, event: ShardEvent) -> Result<(), IggyError> {
-        handlers::handle_event(self, event).await
     }
 
     pub fn ensure_authenticated(&self, session: &Session) -> Result<(), IggyError> {

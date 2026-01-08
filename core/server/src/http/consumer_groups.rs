@@ -36,7 +36,7 @@ use iggy_common::Identifier;
 use iggy_common::Validatable;
 use iggy_common::create_consumer_group::CreateConsumerGroup;
 use iggy_common::delete_consumer_group::DeleteConsumerGroup;
-use iggy_common::{ConsumerGroup, ConsumerGroupDetails};
+use iggy_common::{ConsumerGroup, ConsumerGroupDetails, IggyError};
 use send_wrapper::SendWrapper;
 use std::sync::Arc;
 use tracing::instrument;
@@ -176,7 +176,7 @@ async fn create_consumer_group(
         &command.topic_id,
         command.name.clone(),
     )
-    .with_error(|error| format!("{COMPONENT} (error: {error}) - failed to create consumer group, stream ID: {}, topic ID: {}, name: {}", stream_id, topic_id, command.name))?;
+    .error(|e: &IggyError| format!("{COMPONENT} (error: {e}) - failed to create consumer group, stream ID: {}, topic ID: {}, name: {}", stream_id, topic_id, command.name))?;
 
     let group_id = consumer_group.id();
 
@@ -246,7 +246,7 @@ async fn delete_consumer_group(
             &identifier_topic_id,
             &identifier_group_id
         )
-        .with_error(|error| format!("{COMPONENT} (error: {error}) - failed to delete consumer group with ID: {group_id} for topic with ID: {topic_id} in stream with ID: {stream_id}"))?;
+        .error(|e: &IggyError| format!("{COMPONENT} (error: {e}) - failed to delete consumer group with ID: {group_id} for topic with ID: {topic_id} in stream with ID: {stream_id}"))?;
 
         let cg_id = consumer_group.id();
 
@@ -287,9 +287,9 @@ async fn delete_consumer_group(
             &identifier_stream_id,
             &identifier_topic_id,
             partition_ids,
-        ).await.with_error(|error| {
+        ).await.error(|e: &IggyError| {
             format!(
-                "{COMPONENT} (error: {error}) - failed to delete consumer group offsets for group ID: {} in stream: {}, topic: {}",
+                "{COMPONENT} (error: {e}) - failed to delete consumer group offsets for group ID: {} in stream: {}, topic: {}",
                 cg_id_spez,
                 identifier_stream_id,
                 identifier_topic_id

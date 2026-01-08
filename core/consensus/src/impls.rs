@@ -255,6 +255,25 @@ impl Pipeline {
         self.prepare_queue.get(index)
     }
 
+    /// Get mutable reference to a prepare entry by op number.
+    /// Returns None if op is not in the pipeline.
+    pub fn prepare_by_op_mut(&mut self, op: u64) -> Option<&mut PipelineEntry> {
+        let head_op = self.prepare_queue.front()?.message.header().op;
+        if op < head_op {
+            return None;
+        }
+        let index = (op - head_op) as usize;
+        if index >= self.prepare_queue.len() {
+            return None;
+        }
+        self.prepare_queue.get_mut(index)
+    }
+
+    /// Get the entry at the head of the prepare queue (oldest uncommitted).
+    pub fn head(&self) -> Option<&PipelineEntry> {
+        self.prepare_queue.front()
+    }
+
     /// Search prepare queue for a message from the given client.
     ///
     /// If there are multiple messages (possible in prepare_queue after view change),
@@ -320,6 +339,9 @@ pub struct VsrConsensus {
     last_prepare_checksum: Cell<u128>,
 
     pipeline: RefCell<Pipeline>,
+
+    message_bus: IggyMessageBus,
+    // TODO: Add loopback_queue for messages to self
 }
 
 impl VsrConsensus {
@@ -341,6 +363,7 @@ impl VsrConsensus {
             last_timestamp: Cell::new(0),
             last_prepare_checksum: Cell::new(0),
             pipeline: RefCell::new(Pipeline::new()),
+            message_bus: IggyMessageBus::new(replica_count as usize, replica as u16, 0),
         }
     }
 
@@ -387,6 +410,100 @@ impl VsrConsensus {
 
     pub fn status(&self) -> Status {
         self.status.get()
+    }
+
+    pub fn pipeline(&self) -> &RefCell<Pipeline> {
+        &self.pipeline
+    }
+
+    pub fn pipeline_mut(&mut self) -> &mut RefCell<Pipeline> {
+        &mut self.pipeline
+    }
+
+    pub fn cluster(&self) -> u128 {
+        self.cluster
+    }
+
+    pub fn replica_count(&self) -> u8 {
+        self.replica_count
+    }
+
+    /// Handle a prepare_ok message from a follower.
+    /// Called on the primary when a follower acknowledges a prepare.
+    ///
+    /// Returns true if quorum was just reached for this op.
+    pub fn handle_prepare_ok(&self, message: Message<PrepareOkHeader>) -> bool {
+        let header = message.header();
+
+        assert_eq!(header.command, Command2::PrepareOk);
+        assert!(
+            header.replica < self.replica_count,
+            "handle_prepare_ok: invalid replica {}",
+            header.replica
+        );
+
+        // Ignore if not in normal status
+        if self.status() != Status::Normal {
+            return false;
+        }
+
+        // Ignore if from older view
+        if header.view < self.view() {
+            return false;
+        }
+
+        // Ignore if from newer view. This shouldn't happen if we're primary
+        if header.view > self.view() {
+            return false;
+        }
+
+        // We must be primary to process prepare_ok
+        if !self.is_primary() {
+            return false;
+        }
+
+        // Ignore if syncing
+        if self.is_syncing() {
+            return false;
+        }
+
+        // Find the prepare in our pipeline
+        let mut pipeline = self.pipeline.borrow_mut();
+
+        let Some(entry) = pipeline.prepare_by_op_mut(header.op) else {
+            // Not in pipeline - could be old/duplicate or already committed
+            return false;
+        };
+
+        // Verify checksum matches
+        if entry.message.header().checksum != header.prepare_checksum {
+            return false;
+        }
+
+        // Verify the prepare is for a valid op range
+        let _commit = self.commit();
+
+        // Check for duplicate ack
+        if entry.has_ack(header.replica) {
+            return false;
+        }
+
+        // Record the ack from this replica
+        let ack_count = entry.add_ack(header.replica);
+        let quorum = self.quorum();
+
+        // Check if we've reached quorum
+        if ack_count >= quorum && !entry.ok_quorum_received {
+            entry.ok_quorum_received = true;
+
+            return true;
+        }
+
+        false
+    }
+
+    pub fn message_bus(&self) -> &IggyMessageBus {
+        &self.message_bus
     }
 }
 

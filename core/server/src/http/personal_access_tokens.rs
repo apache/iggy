@@ -36,7 +36,7 @@ use iggy_common::Validatable;
 use iggy_common::create_personal_access_token::CreatePersonalAccessToken;
 use iggy_common::delete_personal_access_token::DeletePersonalAccessToken;
 use iggy_common::login_with_personal_access_token::LoginWithPersonalAccessToken;
-use iggy_common::{PersonalAccessTokenInfo, RawPersonalAccessToken};
+use iggy_common::{IggyError, PersonalAccessTokenInfo, RawPersonalAccessToken};
 use send_wrapper::SendWrapper;
 use std::sync::Arc;
 use tracing::instrument;
@@ -67,9 +67,9 @@ async fn get_personal_access_tokens(
         .shard
         .shard()
         .get_personal_access_tokens(&Session::stateless(identity.user_id, identity.ip_address))
-        .with_error(|error| {
+        .error(|e: &IggyError| {
             format!(
-                "{COMPONENT} (error: {error}) - failed to get personal access tokens, user ID: {}",
+                "{COMPONENT} (error: {e}) - failed to get personal access tokens, user ID: {}",
                 identity.user_id
             )
         })?;
@@ -85,18 +85,19 @@ async fn create_personal_access_token(
     Json(command): Json<CreatePersonalAccessToken>,
 ) -> Result<Json<RawPersonalAccessToken>, CustomError> {
     command.validate()?;
-    let (_personal_access_token, token) = state.shard
-            .create_personal_access_token(
-                &Session::stateless(identity.user_id, identity.ip_address),
-                &command.name,
-                command.expiry,
+    let (_personal_access_token, token) = state
+        .shard
+        .create_personal_access_token(
+            &Session::stateless(identity.user_id, identity.ip_address),
+            &command.name,
+            command.expiry,
+        )
+        .error(|e: &IggyError| {
+            format!(
+                "{COMPONENT} (error: {e}) - failed to create personal access token, user ID: {}",
+                identity.user_id
             )
-            .with_error(|error| {
-                format!(
-                    "{COMPONENT} (error: {error}) - failed to create personal access token, user ID: {}",
-                    identity.user_id
-                )
-            })?;
+        })?;
 
     let token_hash = PersonalAccessToken::hash_token(&token);
     let command = EntryCommand::CreatePersonalAccessToken(CreatePersonalAccessTokenWithHash {
@@ -107,9 +108,9 @@ async fn create_personal_access_token(
         SendWrapper::new(state.shard.shard().state.apply(identity.user_id, &command));
 
     state_future.await
-        .with_error(|error| {
+        .error(|e: &IggyError| {
             format!(
-                "{COMPONENT} (error: {error}) - failed to apply create personal access token with hash, user ID: {}",
+                "{COMPONENT} (error: {e}) - failed to apply create personal access token with hash, user ID: {}",
                 identity.user_id
             )
         })?;
@@ -123,14 +124,15 @@ async fn delete_personal_access_token(
     Extension(identity): Extension<Identity>,
     Path(name): Path<String>,
 ) -> Result<StatusCode, CustomError> {
-    state.shard
+    state
+        .shard
         .delete_personal_access_token(
             &Session::stateless(identity.user_id, identity.ip_address),
             &name,
         )
-        .with_error(|error| {
+        .error(|e: &IggyError| {
             format!(
-                "{COMPONENT} (error: {error}) - failed to delete personal access token, user ID: {}",
+                "{COMPONENT} (error: {e}) - failed to delete personal access token, user ID: {}",
                 identity.user_id
             )
         })?;
@@ -139,13 +141,12 @@ async fn delete_personal_access_token(
     let state_future =
         SendWrapper::new(state.shard.shard().state.apply(identity.user_id, &command));
 
-    state_future.await
-        .with_error(|error| {
-            format!(
-                "{COMPONENT} (error: {error}) - failed to apply delete personal access token, user ID: {}",
-                identity.user_id
-            )
-        })?;
+    state_future.await.error(|e: &IggyError| {
+        format!(
+            "{COMPONENT} (error: {e}) - failed to apply delete personal access token, user ID: {}",
+            identity.user_id
+        )
+    })?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -159,8 +160,8 @@ async fn login_with_personal_access_token(
         .shard
         .shard()
         .login_with_personal_access_token(&command.token, None)
-        .with_error(|error| {
-            format!("{COMPONENT} (error: {error}) - failed to login with personal access token")
+        .error(|e: &IggyError| {
+            format!("{COMPONENT} (error: {e}) - failed to login with personal access token")
         })?;
     let tokens = state.jwt_manager.generate(user.id)?;
     Ok(Json(map_generated_access_token_to_identity_info(tokens)))

@@ -194,16 +194,16 @@ pub fn load_consumer_offsets(path: &str) -> Result<Vec<ConsumerOffset>, IggyErro
 
         let path = path.unwrap().to_string();
         let file = std::fs::File::open(&path)
-            .with_error(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to open offset file, path: {path}")
+            .error(|e: &std::io::Error| {
+                format!("{COMPONENT} (error: {e}) - failed to open offset file, path: {path}")
             })
             .map_err(|_| IggyError::CannotReadFile)?;
         let mut cursor = std::io::Cursor::new(file);
         let mut offset = [0; 8];
         cursor
             .get_mut().read_exact(&mut offset)
-            .with_error(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to read consumer offset from file, path: {path}")
+            .error(|e: &std::io::Error| {
+                format!("{COMPONENT} (error: {e}) - failed to read consumer offset from file, path: {path}")
             })
             .map_err(|_| IggyError::CannotReadFile)?;
         let offset = AtomicU64::new(u64::from_le_bytes(offset));
@@ -264,16 +264,16 @@ pub fn load_consumer_group_offsets(
 
         let path = path.unwrap().to_string();
         let file = std::fs::File::open(&path)
-            .with_error(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to open offset file, path: {path}")
+            .error(|e: &std::io::Error| {
+                format!("{COMPONENT} (error: {e}) - failed to open offset file, path: {path}")
             })
             .map_err(|_| IggyError::CannotReadFile)?;
         let mut cursor = std::io::Cursor::new(file);
         let mut offset = [0; 8];
         cursor
             .get_mut().read_exact(&mut offset)
-            .with_error(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to read consumer group offset from file, path: {path}")
+            .error(|e: &std::io::Error| {
+                format!("{COMPONENT} (error: {e}) - failed to read consumer group offset from file, path: {path}")
             })
             .map_err(|_| IggyError::CannotReadFile)?;
         let offset = AtomicU64::new(u64::from_le_bytes(offset));

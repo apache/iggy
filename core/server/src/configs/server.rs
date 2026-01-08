@@ -177,12 +177,17 @@ impl ServerConfig {
             env::var("IGGY_CONFIG_PATH").unwrap_or_else(|_| DEFAULT_CONFIG_PATH.to_string());
         let config_provider = ServerConfig::config_provider(&config_path);
         let server_config: ServerConfig =
-            config_provider.load_config().await.with_error(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to load config provider config")
+            config_provider
+                .load_config()
+                .await
+                .error(|e: &iggy_common::ConfigurationError| {
+                    format!("{COMPONENT} (error: {e}) - failed to load config provider config")
+                })?;
+        server_config
+            .validate()
+            .error(|e: &iggy_common::ConfigurationError| {
+                format!("{COMPONENT} (error: {e}) - failed to validate server config")
             })?;
-        server_config.validate().with_error(|error| {
-            format!("{COMPONENT} (error: {error}) - failed to validate server config")
-        })?;
         Ok(server_config)
     }
 

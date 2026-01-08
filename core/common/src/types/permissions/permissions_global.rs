@@ -232,7 +232,7 @@ impl BytesSerializable for Permissions {
         bytes.put_u8(if self.global.read_topics { 1 } else { 0 });
         bytes.put_u8(if self.global.poll_messages { 1 } else { 0 });
         bytes.put_u8(if self.global.send_messages { 1 } else { 0 });
-        if let Some(streams) = &self.streams {
+        if let Some(streams) = self.streams.as_ref().filter(|s| !s.is_empty()) {
             bytes.put_u8(1);
             let streams_count = streams.len();
             let mut current_stream = 1;
@@ -244,7 +244,7 @@ impl BytesSerializable for Permissions {
                 bytes.put_u8(if stream.read_topics { 1 } else { 0 });
                 bytes.put_u8(if stream.poll_messages { 1 } else { 0 });
                 bytes.put_u8(if stream.send_messages { 1 } else { 0 });
-                if let Some(topics) = &stream.topics {
+                if let Some(topics) = stream.topics.as_ref().filter(|t| !t.is_empty()) {
                     bytes.put_u8(1);
                     let topics_count = topics.len();
                     let mut current_topic = 1;
@@ -541,5 +541,43 @@ mod tests {
         let deserialized_permissions = Permissions::from_bytes(bytes).unwrap();
 
         assert_eq!(permissions, deserialized_permissions);
+    }
+
+    #[test]
+    fn should_handle_empty_streams_map() {
+        let permissions = Permissions {
+            global: GlobalPermissions::default(),
+            streams: Some(AHashMap::new()),
+        };
+
+        let bytes = permissions.to_bytes();
+        let deserialized = Permissions::from_bytes(bytes).unwrap();
+
+        assert!(deserialized.streams.is_none());
+    }
+
+    #[test]
+    fn should_handle_empty_topics_map() {
+        let permissions = Permissions {
+            global: GlobalPermissions::default(),
+            streams: Some(AHashMap::from([(
+                1,
+                StreamPermissions {
+                    manage_stream: true,
+                    read_stream: true,
+                    manage_topics: false,
+                    read_topics: false,
+                    poll_messages: false,
+                    send_messages: false,
+                    topics: Some(AHashMap::new()),
+                },
+            )])),
+        };
+
+        let bytes = permissions.to_bytes();
+        let deserialized = Permissions::from_bytes(bytes).unwrap();
+
+        let stream = deserialized.streams.as_ref().unwrap().get(&1).unwrap();
+        assert!(stream.topics.is_none());
     }
 }

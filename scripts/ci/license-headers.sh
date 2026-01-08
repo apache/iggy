@@ -128,7 +128,7 @@ else
     file_count=$(wc -l < "$TEMP_FILE")
     echo "❌ Found $file_count files missing license headers:"
     echo ""
-    cat "$TEMP_FILE" | sed 's/^/  • /'
+    sed 's/^/  • /' < "$TEMP_FILE"
     echo ""
     echo "💡 Run '$0 --fix' to add license headers automatically"
 

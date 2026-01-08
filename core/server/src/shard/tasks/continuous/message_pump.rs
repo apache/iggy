@@ -16,9 +16,9 @@
  * under the License.
  */
 
-use crate::shard::IggyShard;
 use crate::shard::task_registry::ShutdownToken;
 use crate::shard::transmission::frame::ShardFrame;
+use crate::shard::{IggyShard, handlers::handle_shard_message};
 use futures::FutureExt;
 use std::rc::Rc;
 use tracing::{debug, info};
@@ -57,7 +57,7 @@ async fn message_pump(
                 match frame {
                     Ok(ShardFrame { message, response_sender }) => {
                         if let (Some(response), Some(tx)) =
-                            (shard.handle_shard_message(message).await, response_sender)
+                            (handle_shard_message(&shard, message).await, response_sender)
                         {
                              let _ = tx.send(response).await;
                         }

@@ -30,16 +30,30 @@ import {
 } from './topic.utils.js';
 
 
+/**
+ * Parameters for the create topic command.
+ */
 export type CreateTopic = {
+  /** Stream identifier (ID or name) */
   streamId: Id,
+  /** Topic name (1-255 bytes) */
   name: string,
+  /** Number of partitions to create */
   partitionCount: number,
+  /** Compression algorithm (None or Gzip) */
   compressionAlgorithm: CompressionAlgorithmT,
+  /** Message expiry time in microseconds (0 = unlimited) */
   messageExpiry?: bigint,
+  /** Maximum topic size in bytes (0 = unlimited) */
   maxTopicSize?: bigint,
+  /** Replication factor (1-255) */
   replicationFactor?: number
 };
 
+/**
+ * Create topic command definition.
+ * Creates a new topic within a stream.
+ */
 export const CREATE_TOPIC = {
   code: COMMAND_CODE.CreateTopic,
 
@@ -85,4 +99,7 @@ export const CREATE_TOPIC = {
 };
 
 
+/**
+ * Executable create topic command function.
+ */
 export const createTopic = wrapCommand<CreateTopic, Topic>(CREATE_TOPIC);

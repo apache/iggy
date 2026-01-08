@@ -26,12 +26,22 @@ import { serializeIdentifier, type Id } from '../identifier.utils.js';
 import { uint8ToBuf } from '../number.utils.js';
 
 
+/**
+ * Parameters for the update user command.
+ */
 export type UpdateUser = {
+  /** User identifier (ID or username) */
   userId: Id,
+  /** Optional new username (1-255 bytes) */
   username?: string,
+  /** Optional new status */
   status?: UserStatus
 };
 
+/**
+ * Update user command definition.
+ * Updates a user's username and/or status.
+ */
 export const UPDATE_USER = {
   code: COMMAND_CODE.UpdateUser,
 
@@ -70,4 +80,7 @@ export const UPDATE_USER = {
 };
 
 
+/**
+ * Executable update user command function.
+ */
 export const updateUser = wrapCommand<UpdateUser, boolean>(UPDATE_USER);

@@ -19,9 +19,9 @@
 use crate::configs::tcp::TcpSocketConfig;
 
 use crate::shard::IggyShard;
-use crate::shard::task_registry::ShutdownToken;
+use crate::shard::task_registry::{ShutdownToken, TaskRegistry};
 use crate::shard::transmission::event::ShardEvent;
-use crate::tcp::connection_handler::{handle_connection, handle_error};
+use crate::tcp::connection_handler::{ConnectionAction, handle_connection, handle_error};
 use compio::net::{TcpListener, TcpOpts};
 use err_trail::ErrContext;
 use futures::FutureExt;
@@ -84,7 +84,7 @@ pub async fn start(
     let listener = create_listener(addr, config)
         .await
         .map_err(|_| IggyError::CannotBindToSocket(addr.to_string()))
-        .with_error(|err| {
+        .error(|err: &IggyError| {
             format!("Failed to bind {server_name} server to address: {addr}, {err}")
         })?;
     let actual_addr = listener.local_addr().map_err(|e| {
@@ -150,16 +150,17 @@ async fn accept_loop(
                         let registry = shard.task_registry.clone();
                         let registry_clone = registry.clone();
                         registry.spawn_connection(async move {
-                            if let Err(error) = handle_connection(&session, &mut sender, &shard_for_conn, conn_stop_receiver).await {
-                                handle_error(error);
-                            }
-
-                            registry_clone.remove_connection(&client_id);
-                            shard_for_conn.delete_client(session.client_id);
-                            if let Err(error) = sender.shutdown().await {
-                                error!("Failed to shutdown TCP stream for client: {}, address: {}. {}", client_id, address, error);
-                            } else {
-                                info!("Successfully closed TCP stream for client: {}, address: {}.", client_id, address);
+                            match handle_connection(&session, &mut sender, &shard_for_conn, conn_stop_receiver).await {
+                                Ok(ConnectionAction::Migrated { to_shard }) => {
+                                    info!("Migrated to shard {to_shard}, ignore cleanup connection");
+                                }
+                                Ok(ConnectionAction::Finished) => {
+                                   cleanup_connection(&mut sender, client_id, address, &registry_clone, &shard_for_conn).await;
+                                }
+                                Err(err) => {
+                                    handle_error(err);
+                                    cleanup_connection(&mut sender, client_id, address, &registry_clone, &shard_for_conn).await;
+                                },
                             }
                         });
                     }
@@ -169,4 +170,26 @@ async fn accept_loop(
         }
     }
     Ok(())
+}
+
+pub async fn cleanup_connection(
+    sender: &mut SenderKind,
+    client_id: u32,
+    address: SocketAddr,
+    registry: &Rc<TaskRegistry>,
+    shard: &IggyShard,
+) {
+    registry.remove_connection(&client_id);
+    shard.delete_client(client_id);
+    if let Err(error) = sender.shutdown().await {
+        error!(
+            "Failed to shutdown for client {}, address {}: {}",
+            client_id, address, error
+        );
+    } else {
+        info!(
+            "Successfully closed for client {}, address {}",
+            client_id, address
+        );
+    }
 }

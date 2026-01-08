@@ -16,7 +16,9 @@
  * under the License.
  */
 
-use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
+use crate::binary::command::{
+    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
+};
 use crate::binary::handlers::users::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
@@ -41,7 +43,7 @@ impl ServerCommandHandler for LoginUser {
         _length: u32,
         session: &Session,
         shard: &Rc<IggyShard>,
-    ) -> Result<(), IggyError> {
+    ) -> Result<HandlerResult, IggyError> {
         if shard.is_shutting_down() {
             warn!("Rejecting login request during shutdown");
             return Err(IggyError::Disconnected);
@@ -54,9 +56,9 @@ impl ServerCommandHandler for LoginUser {
         info!("Logging in user: {} ...", &username);
         let user = shard
             .login_user(&username, &password, Some(session))
-            .with_error(|error| {
+            .error(|e: &IggyError| {
                 format!(
-                    "{COMPONENT} (error: {error}) - failed to login user with name: {}, session: {session}",
+                    "{COMPONENT} (error: {e}) - failed to login user with name: {}, session: {session}",
                     username
                 )
             })?;
@@ -64,7 +66,7 @@ impl ServerCommandHandler for LoginUser {
 
         let identity_info = mapper::map_identity_info(user.id);
         sender.send_ok_response(&identity_info).await?;
-        Ok(())
+        Ok(HandlerResult::Finished)
     }
 }
 

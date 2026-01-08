@@ -24,12 +24,22 @@ import { deserializeVoidResponse } from '../../client/client.utils.js';
 import { wrapCommand } from '../command.utils.js';
 import { COMMAND_CODE } from '../command.code.js';
 
+/**
+ * Parameters for the flush unsaved buffers command.
+ */
 export type FlushUnsavedBuffer = {
+  /** Stream identifier */
   streamId: Id,
+  /** Topic identifier */
   topicId: Id,
+  /** Partition ID to flush */
   partitionId: number,
 };
 
+/**
+ * Flush unsaved buffers command definition.
+ * Forces buffered messages to be persisted to disk.
+ */
 export const FLUSH_UNSAVED_BUFFERS = {
   code: COMMAND_CODE.FlushUnsavedBuffers,
 
@@ -40,4 +50,7 @@ export const FLUSH_UNSAVED_BUFFERS = {
   deserialize: deserializeVoidResponse
 };
 
+/**
+ * Executable flush unsaved buffers command function.
+ */
 export const flushUnsavedBuffers = wrapCommand<FlushUnsavedBuffer, boolean>(FLUSH_UNSAVED_BUFFERS);

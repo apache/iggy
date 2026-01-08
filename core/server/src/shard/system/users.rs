@@ -43,9 +43,9 @@ impl IggyShard {
 
         let session_user_id = session.get_user_id();
         if user.id != session_user_id {
-            self.permissioner.borrow().get_user(session_user_id).with_error(|error| {
+            self.permissioner.borrow().get_user(session_user_id).error(|e: &IggyError| {
                 format!(
-                    "{COMPONENT} (error: {error}) - permission denied to get user with ID: {user_id} for current user with ID: {session_user_id}"
+                    "{COMPONENT} (error: {e}) - permission denied to get user with ID: {user_id} for current user with ID: {session_user_id}"
                 )
             })?;
         }
@@ -67,9 +67,9 @@ impl IggyShard {
         self.permissioner
         .borrow()
             .get_users(session.get_user_id())
-            .with_error(|error| {
+            .error(|e: &IggyError| {
                 format!(
-                    "{COMPONENT} (error: {error}) - permission denied to get users for user with id: {}",
+                    "{COMPONENT} (error: {e}) - permission denied to get users for user with id: {}",
                     session.get_user_id()
                 )
             })?;
@@ -88,9 +88,9 @@ impl IggyShard {
         self.permissioner
             .borrow()
             .create_user(session.get_user_id())
-            .with_error(|error| {
+            .error(|e: &IggyError| {
                 format!(
-                    "{COMPONENT} (error: {error}) - permission denied to create user for user with id: {}",
+                    "{COMPONENT} (error: {e}) - permission denied to create user for user with id: {}",
                     session.get_user_id()
                 )
             })?;
@@ -107,8 +107,8 @@ impl IggyShard {
 
         let user_id = self.create_user_base(username, password, status, permissions)?;
         self.get_user(&(user_id as u32).try_into()?)
-            .with_error(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to get user with id: {user_id}")
+            .error(|e: &IggyError| {
+                format!("{COMPONENT} (error: {e}) - failed to get user with id: {user_id}")
             })
     }
 
@@ -152,9 +152,9 @@ impl IggyShard {
         self.permissioner
             .borrow()
             .delete_user(session.get_user_id())
-            .with_error(|error| {
+            .error(|e: &IggyError| {
                 format!(
-                    "{COMPONENT} (error: {error}) - permission denied to delete user for user with id: {}",
+                    "{COMPONENT} (error: {e}) - permission denied to delete user for user with id: {}",
                     session.get_user_id()
                 )
             })?;
@@ -167,8 +167,8 @@ impl IggyShard {
     }
 
     fn delete_user_base(&self, user_id: &Identifier) -> Result<User, IggyError> {
-        let user = self.get_user(user_id).with_error(|error| {
-            format!("{COMPONENT} (error: {error}) - failed to get user with id: {user_id}")
+        let user = self.get_user(user_id).error(|e: &IggyError| {
+            format!("{COMPONENT} (error: {e}) - failed to get user with id: {user_id}")
         })?;
 
         if user.is_root() {
@@ -188,9 +188,9 @@ impl IggyShard {
             .delete_permissions_for_user(user_u32_id);
         self.client_manager
             .delete_clients_for_user(user_u32_id)
-            .with_error(|error| {
+            .error(|e: &IggyError| {
                 format!(
-                    "{COMPONENT} (error: {error}) - failed to delete clients for user with ID: {user_u32_id}"
+                    "{COMPONENT} (error: {e}) - failed to delete clients for user with ID: {user_u32_id}"
                 )
             })?;
         self.metrics.decrement_users(1);
@@ -208,9 +208,9 @@ impl IggyShard {
         self.permissioner
         .borrow()
             .update_user(session.get_user_id())
-            .with_error(|error| {
+            .error(|e: &IggyError| {
                 format!(
-                    "{COMPONENT} (error: {error}) - permission denied to update user for user with id: {}",
+                    "{COMPONENT} (error: {e}) - permission denied to update user for user with id: {}",
                     session.get_user_id()
                 )
             })?;
@@ -249,14 +249,14 @@ impl IggyShard {
         if let Some(status) = status {
             self.users.with_user_mut(&numeric_user_id, |user| {
                 user.status = status;
-            }).with_error(|error| {
-                format!("{COMPONENT} update user (error: {error}) - failed to update user with id: {user_id}")
+            }).error(|e: &IggyError| {
+                format!("{COMPONENT} update user (error: {e}) - failed to update user with id: {user_id}")
             })?;
         }
 
         self.get_user(&numeric_user_id)
-            .with_error(|error| {
-                format!("{COMPONENT} update user (error: {error}) - failed to get updated user with id: {user_id}")
+            .error(|e: &IggyError| {
+                format!("{COMPONENT} update user (error: {e}) - failed to get updated user with id: {user_id}")
             })
     }
 
@@ -272,13 +272,13 @@ impl IggyShard {
             self.permissioner
             .borrow()
                 .update_permissions(session.get_user_id())
-                .with_error(|error| {
+                .error(|e: &IggyError| {
                     format!(
-                        "{COMPONENT} (error: {error}) - permission denied to update permissions for user with id: {}", session.get_user_id()
+                        "{COMPONENT} (error: {e}) - permission denied to update permissions for user with id: {}", session.get_user_id()
                     )
                 })?;
-            let user: User = self.get_user(user_id).with_error(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to get user with id: {user_id}")
+            let user: User = self.get_user(user_id).error(|e: &IggyError| {
+                format!("{COMPONENT} (error: {e}) - failed to get user with id: {user_id}")
             })?;
             if user.is_root() {
                 error!("Cannot change the root user permissions.");
@@ -302,8 +302,8 @@ impl IggyShard {
         user_id: &Identifier,
         permissions: Option<Permissions>,
     ) -> Result<(), IggyError> {
-        let user: User = self.get_user(user_id).with_error(|error| {
-            format!("{COMPONENT} (error: {error}) - failed to get user with id: {user_id}")
+        let user: User = self.get_user(user_id).error(|e: &IggyError| {
+            format!("{COMPONENT} (error: {e}) - failed to get user with id: {user_id}")
         })?;
 
         self.permissioner
@@ -312,9 +312,9 @@ impl IggyShard {
 
         self.users.with_user_mut(user_id, |user| {
             user.permissions = permissions;
-        }).with_error(|error| {
+        }).error(|e: &IggyError| {
             format!(
-                "{COMPONENT} update user permissions (error: {error}) - failed to update permissions for user with id: {user_id}"
+                "{COMPONENT} update user permissions (error: {e}) - failed to update permissions for user with id: {user_id}"
             )
         })
     }
@@ -329,8 +329,8 @@ impl IggyShard {
         self.ensure_authenticated(session)?;
 
         {
-            let user = self.get_user(user_id).with_error(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to get user with id: {user_id}")
+            let user = self.get_user(user_id).error(|e: &IggyError| {
+                format!("{COMPONENT} (error: {e}) - failed to get user with id: {user_id}")
             })?;
             let session_user_id = session.get_user_id();
             if user.id != session_user_id {
@@ -368,8 +368,8 @@ impl IggyShard {
             }
             user.password = crypto::hash_password(new_password);
             Ok(())
-        }).with_error(|error| {
-            format!("{COMPONENT} change password (error: {error}) - failed to change password for user with id: {user_id}")
+        }).error(|e: &IggyError| {
+            format!("{COMPONENT} change password (error: {e}) - failed to change password for user with id: {user_id}")
         })?
     }
 
@@ -427,9 +427,9 @@ impl IggyShard {
         session.set_user_id(user.id);
         self.client_manager
             .set_user_id(session.client_id, user.id)
-            .with_error(|error| {
+            .error(|e: &IggyError| {
                 format!(
-                    "{COMPONENT} (error: {error}) - failed to set user_id to client, client ID: {}, user ID: {}",
+                    "{COMPONENT} (error: {e}) - failed to set user_id to client, client ID: {}, user ID: {}",
                     session.client_id, user.id
                 )
             })?;

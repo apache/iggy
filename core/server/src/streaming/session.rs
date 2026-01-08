@@ -28,6 +28,7 @@ pub struct Session {
     user_id: Cell<UserId>,
     active: Cell<bool>,
     pub ip_address: SocketAddr,
+    pub migrated: Cell<bool>,
 }
 
 impl Session {
@@ -36,6 +37,7 @@ impl Session {
             client_id,
             user_id: Cell::new(user_id),
             active: Cell::new(true),
+            migrated: Cell::new(false),
             ip_address,
         }
     }
@@ -58,6 +60,17 @@ impl Session {
 
     pub fn set_stale(&self) {
         self.active.set(false);
+    }
+
+    /// Returns true if this session has been migrated to another shard.
+    ///
+    /// Prevents socket ping-ponging between shards. Subsequent wrong-shard requests use message forwarding instead
+    pub fn is_migrated(&self) -> bool {
+        self.migrated.get()
+    }
+
+    pub fn set_migrated(&self) {
+        self.migrated.set(true)
     }
 
     pub fn clear_user_id(&self) {

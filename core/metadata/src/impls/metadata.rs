@@ -16,10 +16,11 @@
 // under the License.
 use consensus::{Consensus, Project, Sequencer, Status, VsrConsensus};
 use iggy_common::{
-    header::{Command2, PrepareHeader},
+    header::{Command2, PrepareHeader, PrepareOkHeader},
     message::Message,
 };
 use journal::Journal;
+use message_bus::MessageBus;
 use tracing::{debug, warn};
 
 // TODO: Define a trait (probably in some external crate)
@@ -66,7 +67,7 @@ where
         assert_eq!(header.command, Command2::Prepare);
 
         if !self.fence_old_prepare(&message) {
-            self.replicate(message.clone());
+            self.replicate(message.clone()).await;
         } else {
             warn!("received old prepare, not replicating");
         }
@@ -137,7 +138,10 @@ where
         self.journal.set_header_as_dirty(header);
 
         // Append to journal.
-        self.journal.append(message).await;
+        self.journal.append(message.clone()).await;
+
+        // After successful journal write, send prepare_ok to primary.
+        self.send_prepare_ok(header).await;
 
         // If follower, commit any newly committable entries.
         if self.consensus.is_follower() {
@@ -145,9 +149,49 @@ where
         }
     }
 
-    fn on_ack(&self, _message: <Self::Consensus as Consensus>::AckMessage) {
-        // TODO: Implement on_prepare_ok logic
-        todo!()
+    fn on_ack(&self, message: <Self::Consensus as Consensus>::AckMessage) {
+        let header = message.header();
+
+        if !self.consensus.is_primary() {
+            warn!("on_ack: ignoring (not primary)");
+            return;
+        }
+
+        if self.consensus.status() != Status::Normal {
+            warn!("on_ack: ignoring (not normal)");
+            return;
+        }
+
+        // Find the prepare in pipeline
+        let Some(mut pipeline) = self.consensus.pipeline().try_borrow_mut().ok() else {
+            warn!("on_ack: could not borrow pipeline (already mutably borrowed)");
+            return;
+        };
+
+        let Some(entry) = pipeline.prepare_by_op_and_checksum(header.op, header.prepare_checksum)
+        else {
+            debug!("on_ack: prepare not in pipeline op={}", header.op);
+            return;
+        };
+
+        // Verify checksum matches
+        if entry.message.header().checksum != header.prepare_checksum {
+            warn!("on_ack: checksum mismatch");
+            return;
+        }
+
+        // Record ack
+        let count = entry.add_ack(header.replica);
+
+        // Check quorum
+        if count >= self.consensus.quorum() && !entry.ok_quorum_received {
+            entry.ok_quorum_received = true;
+            debug!("on_ack: quorum received for op={}", header.op);
+
+            // Advance commit number and trigger commit journal
+            self.consensus.advance_commit_number(header.op);
+            self.commit_journal();
+        }
     }
 }
 
@@ -170,9 +214,49 @@ where
         header.op <= self.consensus.commit() || self.journal.has_prepare(header)
     }
 
-    fn replicate(&self, _prepare: Message<PrepareHeader>) {
-        // TODO Forward prepare to next replica in chain.
-        todo!()
+    /// Replicate a prepare message to the next replica in the chain.
+    ///
+    /// Chain replication pattern:
+    /// - Primary sends to first backup
+    /// - Each backup forwards to the next
+    /// - Stops when we would forward back to primary
+    async fn replicate(&self, message: Message<PrepareHeader>) {
+        let header = message.header();
+
+        assert_eq!(header.command, Command2::Prepare);
+        assert!(
+            !self.journal.has_prepare(header),
+            "replicate: must not already have prepare"
+        );
+        assert!(header.op > self.consensus.commit());
+
+        let next = (self.consensus.replica() + 1) % self.consensus.replica_count();
+
+        let primary = self.consensus.primary_index(header.view);
+        if next == primary {
+            debug!(
+                replica = self.consensus.replica(),
+                op = header.op,
+                "replicate: not replicating (ring complete)"
+            );
+            return;
+        }
+
+        assert_ne!(next, self.consensus.replica());
+
+        debug!(
+            replica = self.consensus.replica(),
+            to = next,
+            op = header.op,
+            "replicate: forwarding"
+        );
+
+        let message = message.into_generic();
+        self.consensus
+            .message_bus()
+            .send_to_replica(next, message)
+            .await
+            .unwrap();
     }
 
     fn on_repair(&self, _message: Message<PrepareHeader>) {
@@ -203,6 +287,108 @@ where
         // Walk through journal from last committed to current commit number
         // Apply each entry to the state machine
         todo!()
+    }
+
+    /// Send a prepare_ok message to the primary.
+    /// Called after successfully writing a prepare to the journal.
+    async fn send_prepare_ok(&self, header: &PrepareHeader) {
+        assert_eq!(header.command, Command2::Prepare);
+
+        if self.consensus.status() != Status::Normal {
+            debug!(
+                replica = self.consensus.replica(),
+                status = ?self.consensus.status(),
+                "send_prepare_ok: not sending (not normal)"
+            );
+            return;
+        }
+
+        if self.consensus.is_syncing() {
+            debug!(
+                replica = self.consensus.replica(),
+                "send_prepare_ok: not sending (syncing)"
+            );
+            return;
+        }
+
+        // Verify we have the prepare and it's persisted (not dirty).
+        if !self.journal.has_prepare(header) {
+            debug!(
+                replica = self.consensus.replica(),
+                op = header.op,
+                "send_prepare_ok: not sending (not persisted or missing)"
+            );
+            return;
+        }
+
+        assert!(
+            header.view <= self.consensus.view(),
+            "send_prepare_ok: prepare view {} > our view {}",
+            header.view,
+            self.consensus.view()
+        );
+
+        if header.op > self.consensus.sequencer().current_sequence() {
+            debug!(
+                replica = self.consensus.replica(),
+                op = header.op,
+                our_op = self.consensus.sequencer().current_sequence(),
+                "send_prepare_ok: not sending (op ahead)"
+            );
+            return;
+        }
+
+        debug!(
+            replica = self.consensus.replica(),
+            op = header.op,
+            checksum = header.checksum,
+            "send_prepare_ok: sending"
+        );
+
+        // Use current view, not the prepare's view.
+        let prepare_ok_header = PrepareOkHeader {
+            command: Command2::PrepareOk,
+            cluster: self.consensus.cluster(),
+            replica: self.consensus.replica(),
+            view: self.consensus.view(),
+            epoch: header.epoch,
+            op: header.op,
+            commit: self.consensus.commit(),
+            timestamp: header.timestamp,
+            parent: header.parent,
+            prepare_checksum: header.checksum,
+            request: header.request,
+            operation: header.operation,
+            size: std::mem::size_of::<PrepareOkHeader>() as u32,
+            ..Default::default()
+        };
+
+        let message: Message<PrepareOkHeader> =
+            Message::<PrepareOkHeader>::new(std::mem::size_of::<PrepareOkHeader>())
+                .replace_header(|_prev: &PrepareOkHeader| prepare_ok_header);
+        let generic_message = message.into_generic();
+        let primary = self.consensus.primary_index(self.consensus.view());
+
+        if primary == self.consensus.replica() {
+            debug!(
+                replica = self.consensus.replica(),
+                "send_prepare_ok: loopback to self"
+            );
+            // TODO: Queue for self-processing or call handle_prepare_ok directly
+        } else {
+            debug!(
+                replica = self.consensus.replica(),
+                to = primary,
+                op = header.op,
+                "send_prepare_ok: sending to primary"
+            );
+
+            self.consensus
+                .message_bus()
+                .send_to_replica(primary, generic_message)
+                .await
+                .unwrap();
+        }
     }
 }
 

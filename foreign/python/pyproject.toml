@@ -21,7 +21,7 @@ build-backend = "maturin"
 
 [project]
 name = "apache-iggy"
-requires-python = ">=3.7"
+requires-python = ">=3.10"
 version = "0.6.1.dev1"
 description = "Apache Iggy is the persistent message streaming platform written in Rust, supporting QUIC, TCP and HTTP transport protocols, capable of processing millions of messages per second."
 readme = "README.md"
@@ -37,9 +37,6 @@ classifiers = [
     "License :: OSI Approved :: Apache Software License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.7",
-    "Programming Language :: Python :: 3.8",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
@@ -82,9 +79,6 @@ testing = [
     "pytest-xdist>=3.0,<4.0",
     "pytest-timeout>=2.0,<3.0",
 ]
-
-# For examples and demos
-examples = ["loguru>=0.7.0,<1.0"]
 
 # For containerized testing (CI/CD)
 testing-docker = ["testcontainers[docker]>=3.7.0,<5.0"]

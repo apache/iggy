@@ -16,7 +16,9 @@
  * under the License.
  */
 
-use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
+use crate::binary::command::{
+    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
+};
 use crate::binary::handlers::streams::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
@@ -42,16 +44,16 @@ impl ServerCommandHandler for GetStreams {
         _length: u32,
         session: &Session,
         shard: &Rc<IggyShard>,
-    ) -> Result<(), IggyError> {
+    ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
         shard.ensure_authenticated(session)?;
         shard
             .permissioner
             .borrow()
             .get_streams(session.get_user_id())
-            .with_error(|error| {
+            .error(|e: &IggyError| {
                 format!(
-                    "{COMPONENT} (error: {error}) - permission denied to get streams for user {}",
+                    "{COMPONENT} (error: {e}) - permission denied to get streams for user {}",
                     session.get_user_id()
                 )
             })?;
@@ -61,7 +63,7 @@ impl ServerCommandHandler for GetStreams {
             mapper::map_streams(&roots, &stats)
         });
         sender.send_ok_response(&response).await?;
-        Ok(())
+        Ok(HandlerResult::Finished)
     }
 }
 

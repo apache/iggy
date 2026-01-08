@@ -24,12 +24,22 @@ import { deserializeVoidResponse } from '../../client/client.utils.js';
 import { wrapCommand } from '../command.utils.js';
 import { COMMAND_CODE } from '../command.code.js';
 
+/**
+ * Parameters for the join consumer group command.
+ */
 export type JoinGroup = {
+  /** Stream identifier (ID or name) */
   streamId: Id,
+  /** Topic identifier (ID or name) */
   topicId: Id,
+  /** Consumer group identifier (ID or name) */
   groupId: Id
 };
 
+/**
+ * Join consumer group command definition.
+ * Adds the current client as a member of the consumer group.
+ */
 export const JOIN_GROUP = {
   code: COMMAND_CODE.JoinGroup,
 
@@ -41,4 +51,7 @@ export const JOIN_GROUP = {
 };
 
 
+/**
+ * Executable join consumer group command function.
+ */
 export const joinGroup = wrapCommand<JoinGroup, boolean>(JOIN_GROUP);

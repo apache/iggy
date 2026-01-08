@@ -28,6 +28,11 @@ use serde_with::{DisplayFromStr, serde_as};
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 
+const SECRET_KEYS: [&str; 2] = [
+    "IGGY_CONNECTORS_IGGY_PASSWORD",
+    "IGGY_CONNECTORS_IGGY_TOKEN",
+];
+
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ConnectorsRuntimeConfig {
@@ -257,7 +262,7 @@ pub struct ConnectorsEnvProvider {
 impl Default for ConnectorsEnvProvider {
     fn default() -> Self {
         Self {
-            provider: CustomEnvProvider::new("IGGY_CONNECTORS_", &[]),
+            provider: CustomEnvProvider::new("IGGY_CONNECTORS_", &SECRET_KEYS),
         }
     }
 }

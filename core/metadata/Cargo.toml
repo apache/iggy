@@ -31,4 +31,5 @@ readme = "../../../README.md"
 consensus = { path = "../consensus" }
 iggy_common = { path = "../common" }
 journal = { path = "../journal" }
+message_bus = { path = "../message_bus" }
 tracing = { workspace = true }

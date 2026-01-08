@@ -67,7 +67,7 @@ impl IggyShard {
                 session.get_user_id(),
                 stream_id,
                 topic_id,
-            ).with_error(|error| format!("{COMPONENT} (error: {error}) - permission denied to create consumer group for user {} on stream ID: {}, topic ID: {}", session.get_user_id(), stream_id, topic_id))?;
+            ).error(|e: &IggyError| format!("{COMPONENT} (error: {e}) - permission denied to create consumer group for user {} on stream ID: {}, topic ID: {}", session.get_user_id(), stream_id, topic_id))?;
         }
         let cg = self.create_and_insert_consumer_group_mem(stream_id, topic_id, name);
         Ok(cg)
@@ -128,7 +128,7 @@ impl IggyShard {
                 session.get_user_id(),
                 stream_id,
                 topic_id,
-            ).with_error(|error| format!("{COMPONENT} (error: {error}) - permission denied to delete consumer group for user {} on stream ID: {}, topic ID: {}", session.get_user_id(), stream_id, topic_id))?;
+            ).error(|e: &IggyError| format!("{COMPONENT} (error: {e}) - permission denied to delete consumer group for user {} on stream ID: {}, topic ID: {}", session.get_user_id(), stream_id, topic_id))?;
         }
         let cg = self.delete_consumer_group_base(stream_id, topic_id, group_id);
         Ok(cg)
@@ -196,7 +196,7 @@ impl IggyShard {
                 session.get_user_id(),
                 stream_id,
                 topic_id,
-            ).with_error(|error| format!("{COMPONENT} (error: {error}) - permission denied to join consumer group for user {} on stream ID: {}, topic ID: {}", session.get_user_id(), stream_id, topic_id))?;
+            ).error(|e: &IggyError| format!("{COMPONENT} (error: {e}) - permission denied to join consumer group for user {} on stream ID: {}, topic ID: {}", session.get_user_id(), stream_id, topic_id))?;
         }
         let client_id = session.client_id;
         self.streams.with_consumer_group_by_id_mut(
@@ -226,9 +226,9 @@ impl IggyShard {
             topic_id_value,
             group_id_value,
         )
-        .with_error(|error| {
+        .error(|e: &IggyError| {
             format!(
-                "{COMPONENT} (error: {error}) - failed to make client join consumer group for client ID: {}",
+                "{COMPONENT} (error: {e}) - failed to make client join consumer group for client ID: {}",
                 session.client_id
             )
         })?;
@@ -255,7 +255,7 @@ impl IggyShard {
                 session.get_user_id(),
                 stream_id,
                 topic_id,
-            ).with_error(|error| format!("{COMPONENT} (error: {error}) - permission denied to leave consumer group for user {} on stream ID: {}, topic ID: {}", session.get_user_id(), stream_id, topic_id))?;
+            ).error(|e: &IggyError| format!("{COMPONENT} (error: {e}) - permission denied to leave consumer group for user {} on stream ID: {}, topic ID: {}", session.get_user_id(), stream_id, topic_id))?;
         }
         self.leave_consumer_group_base(stream_id, topic_id, group_id, session.client_id)
     }
@@ -306,7 +306,7 @@ impl IggyShard {
             stream_id_value,
             topic_id_value,
             group_id_value,
-        ).with_error(|error| format!("{COMPONENT} (error: {error}) - failed to make client leave consumer group for client ID: {}", client_id))?;
+        ).error(|e: &IggyError| format!("{COMPONENT} (error: {e}) - failed to make client leave consumer group for client ID: {}", client_id))?;
         Ok(())
     }
 }

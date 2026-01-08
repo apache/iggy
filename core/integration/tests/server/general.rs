@@ -16,8 +16,9 @@
 // under the License.
 
 use crate::server::{
-    ScenarioFn, bench_scenario, create_message_payload_scenario, message_headers_scenario,
-    run_scenario, stream_size_validation_scenario, system_scenario, user_scenario,
+    ScenarioFn, bench_scenario, consumer_timestamp_polling_scenario,
+    create_message_payload_scenario, message_headers_scenario, run_scenario,
+    stream_size_validation_scenario, system_scenario, user_scenario,
 };
 use iggy_common::TransportProtocol;
 use serial_test::parallel;
@@ -32,6 +33,7 @@ use test_case::test_matrix;
         create_message_payload_scenario(),
         stream_size_validation_scenario(),
         bench_scenario(),
+        consumer_timestamp_polling_scenario(),
     ]
 )]
 #[tokio::test]

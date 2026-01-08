@@ -1,0 +1,49 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use std::ops::Deref;
+
+/// Index of a partition within a shard's local partition collection.
+///
+/// This is NOT the same as partition_id. A shard may have partitions with
+/// IDs [0, 2, 4] but their local indices would be [0, 1, 2].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct LocalIdx(usize);
+
+impl LocalIdx {
+    pub fn new(idx: usize) -> Self {
+        Self(idx)
+    }
+
+    pub fn idx(&self) -> usize {
+        self.0
+    }
+}
+
+impl Deref for LocalIdx {
+    type Target = usize;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl From<usize> for LocalIdx {
+    fn from(idx: usize) -> Self {
+        Self(idx)
+    }
+}

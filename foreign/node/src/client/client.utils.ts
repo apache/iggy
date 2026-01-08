@@ -24,6 +24,13 @@ import { translateCommandCode } from '../wire/command.code.js';
 import { debug } from './client.debug.js';
 
 
+/**
+ * Parses a raw response buffer into a structured CommandResponse.
+ * Extracts status code, length, and payload data from the buffer.
+ *
+ * @param r - Raw response buffer from the server
+ * @returns Parsed command response with status, length, and data
+ */
 export const handleResponse = (r: Buffer) => {
   const status = r.readUint32LE(0);
   const length = r.readUint32LE(4);
@@ -33,6 +40,12 @@ export const handleResponse = (r: Buffer) => {
   }
 };
 
+/**
+ * Creates a Transform stream that parses response buffers.
+ * Transforms raw server responses into just the data payload.
+ *
+ * @returns Transform stream for processing server responses
+ */
 export const handleResponseTransform = () => new Transform({
   transform(chunk: Buffer, encoding: BufferEncoding, cb: TransformCallback) {
     try {
@@ -45,11 +58,27 @@ export const handleResponseTransform = () => new Transform({
   }
 });
 
+/**
+ * Deserializes a void response from the server.
+ * Returns true if the command succeeded with no data.
+ *
+ * @param r - Command response to check
+ * @returns True if the response indicates success with no data
+ */
 export const deserializeVoidResponse =
   (r: CommandResponse) => r.status === 0 && r.data.length === 0;
 
+/** Length of the command code in bytes */
 const COMMAND_LENGTH = 4;
 
+/**
+ * Serializes a command and its payload into a buffer for sending to the server.
+ * Creates the wire format: [payload_size (4 bytes)][command (4 bytes)][payload]
+ *
+ * @param command - Command code to send
+ * @param payload - Command payload buffer
+ * @returns Buffer ready to be sent to the server
+ */
 export const serializeCommand = (command: number, payload: Buffer) => {
   const payloadSize = payload.length + COMMAND_LENGTH;
   const data = Buffer.allocUnsafe(8 + payload.length);

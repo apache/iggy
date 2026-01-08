@@ -16,7 +16,9 @@
  * under the License.
  */
 
-use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
+use crate::binary::command::{
+    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
+};
 use crate::binary::handlers::consumer_groups::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 
@@ -45,11 +47,11 @@ impl ServerCommandHandler for DeleteConsumerGroup {
         _length: u32,
         session: &Session,
         shard: &Rc<IggyShard>,
-    ) -> Result<(), IggyError> {
+    ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
-        let cg = shard.delete_consumer_group(session, &self.stream_id, &self.topic_id, &self.group_id).with_error(|error| {
+        let cg = shard.delete_consumer_group(session, &self.stream_id, &self.topic_id, &self.group_id).error(|e: &IggyError| {
             format!(
-                "{COMPONENT} (error: {error}) - failed to delete consumer group with ID: {} for topic with ID: {} in stream with ID: {} for session: {}",
+                "{COMPONENT} (error: {e}) - failed to delete consumer group with ID: {} for topic with ID: {} in stream with ID: {} for session: {}",
                 self.group_id, self.topic_id, self.stream_id, session
             )
         })?;
@@ -91,9 +93,9 @@ impl ServerCommandHandler for DeleteConsumerGroup {
             &self.stream_id,
             &self.topic_id,
             partition_ids,
-        ).await.with_error(|error| {
+        ).await.error(|e: &IggyError| {
             format!(
-                "{COMPONENT} (error: {error}) - failed to delete consumer group offsets for group ID: {} in stream: {}, topic: {}",
+                "{COMPONENT} (error: {e}) - failed to delete consumer group offsets for group ID: {} in stream: {}, topic: {}",
                 cg_id_spez,
                 self.stream_id,
                 self.topic_id
@@ -116,14 +118,14 @@ impl ServerCommandHandler for DeleteConsumerGroup {
                 &EntryCommand::DeleteConsumerGroup(self),
             )
             .await
-            .with_error(|error| {
+            .error(|e: &IggyError| {
                 format!(
-                    "{COMPONENT} (error: {error}) - failed to apply delete consumer group for stream_id: {}, topic_id: {}, group_id: {cg_id}, session: {session}",
+                    "{COMPONENT} (error: {e}) - failed to apply delete consumer group for stream_id: {}, topic_id: {}, group_id: {cg_id}, session: {session}",
                     stream_id, topic_id
                 )
             })?;
         sender.send_empty_ok_response().await?;
-        Ok(())
+        Ok(HandlerResult::Finished)
     }
 }
 

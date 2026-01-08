@@ -328,6 +328,14 @@ impl TopicRoot {
         &mut self.consumer_groups
     }
 
+    pub fn set_partitions(&mut self, partitions: Partitions) {
+        self.partitions = partitions;
+    }
+
+    pub fn set_consumer_groups(&mut self, consumer_groups: ConsumerGroups) {
+        self.consumer_groups = consumer_groups;
+    }
+
     pub fn created_at(&self) -> IggyTimestamp {
         self.created_at
     }

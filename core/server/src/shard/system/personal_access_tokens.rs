@@ -34,8 +34,8 @@ impl IggyShard {
     ) -> Result<Vec<PersonalAccessToken>, IggyError> {
         self.ensure_authenticated(session)?;
         let user_id = session.get_user_id();
-        let user = self.get_user(&user_id.try_into()?).with_error(|error| {
-            format!("{COMPONENT} (error: {error}) - failed to get user with id: {user_id}")
+        let user = self.get_user(&user_id.try_into()?).error(|e: &IggyError| {
+            format!("{COMPONENT} (error: {e}) - failed to get user with id: {user_id}")
         })?;
         info!("Loading personal access tokens for user with ID: {user_id}...",);
         let personal_access_tokens: Vec<_> = user
@@ -61,8 +61,8 @@ impl IggyShard {
         let user_id = session.get_user_id();
         let identifier = user_id.try_into()?;
         {
-            let user = self.get_user(&identifier).with_error(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to get user with id: {user_id}")
+            let user = self.get_user(&identifier).error(|e: &IggyError| {
+                format!("{COMPONENT} (error: {e}) - failed to get user with id: {user_id}")
             })?;
             let max_token_per_user = self.config.personal_access_token.max_tokens_per_user;
             if user.personal_access_tokens.len() as u32 >= max_token_per_user {
@@ -97,26 +97,32 @@ impl IggyShard {
         let name = personal_access_token.name.clone();
         let token_hash = personal_access_token.token.clone();
         let identifier = user_id.try_into()?;
-        self.users.with_user_mut(&identifier, |user| {
-            if user
-                .personal_access_tokens
-                .iter()
-                .any(|pat| pat.name.as_str() == name.as_str())
-            {
-                error!("Personal access token: {name} for user with ID: {user_id} already exists.");
-                return Err(IggyError::PersonalAccessTokenAlreadyExists(
-                    name.to_string(),
-                    user_id,
-                ));
-            }
+        self.users
+            .with_user_mut(&identifier, |user| {
+                if user
+                    .personal_access_tokens
+                    .iter()
+                    .any(|pat| pat.name.as_str() == name.as_str())
+                {
+                    error!(
+                        "Personal access token: {name} for user with ID: {user_id} already exists."
+                    );
+                    return Err(IggyError::PersonalAccessTokenAlreadyExists(
+                        name.to_string(),
+                        user_id,
+                    ));
+                }
 
-            user.personal_access_tokens
-                .insert(token_hash, personal_access_token);
-            info!("Created personal access token: {name} for user with ID: {user_id}.");
-            Ok(())
-        }).with_error(|error| {
-            format!("{COMPONENT} create PAT (error: {error}) - failed to access user with id: {user_id}")
-        })??;
+                user.personal_access_tokens
+                    .insert(token_hash, personal_access_token);
+                info!("Created personal access token: {name} for user with ID: {user_id}.");
+                Ok(())
+            })
+            .error(|e: &IggyError| {
+                format!(
+                    "{COMPONENT} create PAT (error: {e}) - failed to access user with id: {user_id}"
+                )
+            })??;
         Ok(())
     }
 
@@ -139,26 +145,30 @@ impl IggyShard {
     }
 
     fn delete_personal_access_token_base(&self, user_id: u32, name: &str) -> Result<(), IggyError> {
-        self.users.with_user_mut(&user_id.try_into()?, |user| {
-            let token = if let Some(pat) = user
-                .personal_access_tokens
-                .iter()
-                .find(|pat| pat.name.as_str() == name)
-            {
-                pat.token.clone()
-            } else {
-                error!("Personal access token: {name} for user with ID: {user_id} does not exist.",);
-                return Err(IggyError::ResourceNotFound(name.to_owned()));
-            };
+        self.users
+            .with_user_mut(&user_id.try_into()?, |user| {
+                let token = if let Some(pat) = user
+                    .personal_access_tokens
+                    .iter()
+                    .find(|pat| pat.name.as_str() == name)
+                {
+                    pat.token.clone()
+                } else {
+                    error!(
+                        "Personal access token: {name} for user with ID: {user_id} does not exist.",
+                    );
+                    return Err(IggyError::ResourceNotFound(name.to_owned()));
+                };
 
-            info!("Deleting personal access token: {name} for user with ID: {user_id}...");
-            user.personal_access_tokens.remove(&token);
-            Ok(())
-        }).with_error(|error| {
-            format!(
-                "{COMPONENT} delete PAT (error: {error}) - failed to access user with id: {user_id}"
-            )
-        })??;
+                info!("Deleting personal access token: {name} for user with ID: {user_id}...");
+                user.personal_access_tokens.remove(&token);
+                Ok(())
+            })
+            .error(|e: &IggyError| {
+                format!(
+                    "{COMPONENT} delete PAT (error: {e}) - failed to access user with id: {user_id}"
+                )
+            })??;
         info!("Deleted personal access token: {name} for user with ID: {user_id}.");
         Ok(())
     }
@@ -202,9 +212,9 @@ impl IggyShard {
 
         let user = self
             .get_user(&personal_access_token.user_id.try_into()?)
-            .with_error(|error| {
+            .error(|e: &IggyError| {
                 format!(
-                    "{COMPONENT} (error: {error}) - failed to get user with id: {}",
+                    "{COMPONENT} (error: {e}) - failed to get user with id: {}",
                     personal_access_token.user_id
                 )
             })?;

@@ -23,10 +23,18 @@ import { COMMAND_CODE } from '../command.code.js';
 import { deserializeVoidResponse } from '../../client/client.utils.js';
 import { serializeIdentifier, type Id } from '../identifier.utils.js';
 
+/**
+ * Parameters for the purge stream command.
+ */
 export type PurgeStream = {
+  /** Stream identifier (ID or name) */
   streamId: Id
 };
 
+/**
+ * Purge stream command definition.
+ * Deletes all messages from a stream while keeping the stream itself.
+ */
 export const PURGE_STREAM = {
   code: COMMAND_CODE.PurgeStream,
 
@@ -38,4 +46,7 @@ export const PURGE_STREAM = {
 };
 
 
+/**
+ * Executable purge stream command function.
+ */
 export const purgeStream = wrapCommand<PurgeStream, boolean>(PURGE_STREAM);

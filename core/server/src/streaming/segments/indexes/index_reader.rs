@@ -51,7 +51,7 @@ impl IndexReader {
             .read(true)
             .open(file_path)
             .await
-            .with_error(|error| format!("Failed to open index file: {file_path}. {error}"))
+            .error(|e: &std::io::Error| format!("Failed to open index file: {file_path}. {e}"))
             .map_err(|_| IggyError::CannotReadFile)?;
 
         trace!(
@@ -81,12 +81,12 @@ impl IndexReader {
 
         let buf = match self.read_at(0, file_size, false).await {
             Ok(buf) => buf,
-            Err(error) if error.kind() == ErrorKind::UnexpectedEof => {
+            Err(e) if e.kind() == ErrorKind::UnexpectedEof => {
                 return Ok(IggyIndexesMut::empty());
             }
-            Err(error) => {
+            Err(e) => {
                 error!(
-                    "Error reading batch header at offset 0 in file {}: {error}",
+                    "Error reading batch header at offset 0 in file {}: {e}",
                     self.file_path
                 );
                 return Err(IggyError::CannotReadFile);
@@ -153,13 +153,13 @@ impl IndexReader {
             .await
         {
             Ok(buf) => buf,
-            Err(error) if error.kind() == ErrorKind::UnexpectedEof => {
+            Err(e) if e.kind() == ErrorKind::UnexpectedEof => {
                 error!("Unexpected EOF while reading indexes");
                 return Ok(None);
             }
-            Err(error) => {
+            Err(e) => {
                 error!(
-                    "Error reading {actual_count} indexes at position {relative_start_offset} in file {} of size {file_size}: {error}",
+                    "Error reading {actual_count} indexes at position {relative_start_offset} in file {} of size {file_size}: {e}",
                     self.file_path
                 );
                 return Err(IggyError::CannotReadFile);
@@ -235,10 +235,10 @@ impl IndexReader {
             .await
         {
             Ok(buf) => buf,
-            Err(error) if error.kind() == ErrorKind::UnexpectedEof => return Ok(None),
-            Err(error) => {
+            Err(e) if e.kind() == ErrorKind::UnexpectedEof => return Ok(None),
+            Err(e) => {
                 error!(
-                    "Error reading {actual_count} indexes at position {start_index_pos} in file {}: {error}",
+                    "Error reading {actual_count} indexes at position {start_index_pos} in file {}: {e}",
                     self.file_path
                 );
                 return Err(IggyError::CannotReadFile);
@@ -381,12 +381,12 @@ impl IndexReader {
 
         let buf = match self.read_at(offset, INDEX_SIZE as u32, true).await {
             Ok(buf) => buf,
-            Err(error) if error.kind() == ErrorKind::UnexpectedEof => {
+            Err(e) if e.kind() == ErrorKind::UnexpectedEof => {
                 return Ok(None);
             }
-            Err(error) => {
+            Err(e) => {
                 error!(
-                    "Error reading index at position {} (offset {}) in file {}: {error}",
+                    "Error reading index at position {} (offset {}) in file {}: {e}",
                     position, offset, self.file_path
                 );
                 return Err(IggyError::CannotReadFile);

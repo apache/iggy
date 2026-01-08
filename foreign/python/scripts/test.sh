@@ -84,22 +84,5 @@ else
     echo "❌ Some tests failed (exit code: $TEST_EXIT_CODE)"
 fi
 
-# Run examples if tests pass
-if [ $TEST_EXIT_CODE -eq 0 ] && [ "${RUN_EXAMPLES:-false}" = "true" ]; then
-    echo "🚀 Running example scripts..."
-
-    # Note: Examples might run indefinitely, so we'll just test they start correctly
-    timeout 10 python3 examples/producer.py &
-    PRODUCER_PID=$!
-    sleep 5
-
-    if kill -0 $PRODUCER_PID 2>/dev/null; then
-        echo "✅ Producer example started successfully"
-        kill $PRODUCER_PID
-    else
-        echo "❌ Producer example failed to start"
-    fi
-fi
-
 echo "📊 Test results saved to test-results/"
 exit $TEST_EXIT_CODE
