@@ -200,7 +200,15 @@ impl IggyShard {
         partition_ids: &[usize],
     ) -> Result<(), IggyError> {
         for &partition_id in partition_ids {
-            // Skip if offset does not exist.
+            // Skip if partition was deleted
+            let partition_exists = self
+                .streams
+                .with_partitions(stream_id, topic_id, |p| p.exists(partition_id));
+            if !partition_exists {
+                continue;
+            }
+
+            // Skip if offset does not exist
             let has_offset = self
                 .streams
                 .with_partition_by_id(

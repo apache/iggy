@@ -86,6 +86,31 @@ impl Default for Streams {
     }
 }
 
+impl Streams {
+    /// Construct from pre-built entries with specific IDs.
+    pub fn from_entries(entries: impl IntoIterator<Item = (usize, stream::Stream)>) -> Self {
+        let entries: Vec<_> = entries.into_iter().collect();
+
+        let mut index = AHashMap::with_capacity(entries.len());
+        let mut root_entries = Vec::with_capacity(entries.len());
+        let mut stats_entries = Vec::with_capacity(entries.len());
+
+        for (id, stream) in entries {
+            let (mut root, stats) = stream.into_components();
+            root.update_id(id);
+            index.insert(root.key().clone(), id);
+            root_entries.push((id, root));
+            stats_entries.push((id, stats));
+        }
+
+        Self {
+            index: RefCell::new(index),
+            root: RefCell::new(root_entries.into_iter().collect()),
+            stats: RefCell::new(stats_entries.into_iter().collect()),
+        }
+    }
+}
+
 impl<'a> From<&'a Streams> for stream::StreamRef<'a> {
     fn from(value: &'a Streams) -> Self {
         let root = value.root.borrow();
