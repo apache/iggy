@@ -209,6 +209,44 @@ impl Default for Partitions {
 }
 
 impl Partitions {
+    /// Construct from pre-built entries with specific IDs.
+    pub fn from_entries(entries: impl IntoIterator<Item = (usize, partition::Partition)>) -> Self {
+        let entries: Vec<_> = entries.into_iter().collect();
+
+        let mut root_entries = Vec::with_capacity(entries.len());
+        let mut stats_entries = Vec::with_capacity(entries.len());
+        let mut dedup_entries = Vec::with_capacity(entries.len());
+        let mut offset_entries = Vec::with_capacity(entries.len());
+        let mut consumer_offset_entries = Vec::with_capacity(entries.len());
+        let mut consumer_group_offset_entries = Vec::with_capacity(entries.len());
+        let mut log_entries = Vec::with_capacity(entries.len());
+
+        for (id, partition) in entries {
+            let (mut root, stats, dedup, offset, consumer_offset, consumer_group_offset, log) =
+                partition.into_components();
+            root.update_id(id);
+            root_entries.push((id, root));
+            stats_entries.push((id, stats));
+            dedup_entries.push((id, dedup));
+            offset_entries.push((id, offset));
+            consumer_offset_entries.push((id, consumer_offset));
+            consumer_group_offset_entries.push((id, consumer_group_offset));
+            log_entries.push((id, log));
+        }
+
+        Self {
+            root: root_entries.into_iter().collect(),
+            stats: stats_entries.into_iter().collect(),
+            message_deduplicator: dedup_entries.into_iter().collect(),
+            offset: offset_entries.into_iter().collect(),
+            consumer_offset: consumer_offset_entries.into_iter().collect(),
+            consumer_group_offset: consumer_group_offset_entries.into_iter().collect(),
+            log: log_entries.into_iter().collect(),
+        }
+    }
+}
+
+impl Partitions {
     pub fn len(&self) -> usize {
         self.root.len()
     }
