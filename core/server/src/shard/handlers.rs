@@ -17,23 +17,30 @@
 
 use super::*;
 use crate::{
+    binary::handlers::messages::poll_messages_handler::{
+        IggyPollMetadata, prepare_message_batch_buffers,
+    },
     shard::{
         IggyShard,
         namespace::IggyFullNamespace,
+        system::messages::PollingArgs,
         transmission::{
             event::ShardEvent,
             frame::ShardResponse,
-            message::{ShardMessage, ShardRequest, ShardRequestPayload},
+            message::{ShardMessage, ShardRequest, ShardRequestPayload, SocketTransferPayload},
         },
     },
-    streaming::{session::Session, traits::MainOps},
+    streaming::{
+        polling_consumer::PollingConsumer, segments::IggyMessagesBatchSet, session::Session,
+        streams, topics, traits::MainOps,
+    },
     tcp::{
         connection_handler::{ConnectionAction, handle_connection, handle_error},
         tcp_listener::cleanup_connection,
     },
 };
 use compio_net::TcpStream;
-use iggy_common::{Identifier, IggyError, SenderKind, TransportProtocol};
+use iggy_common::{Identifier, IggyError, PollingKind, SenderKind, TransportProtocol};
 use nix::sys::stat::SFlag;
 use std::os::fd::{FromRawFd, IntoRawFd};
 use tracing::info;
@@ -52,6 +59,38 @@ pub(super) async fn handle_shard_message(
             Err(err) => Some(ShardResponse::ErrorResponse(err)),
         },
     }
+}
+
+async fn poll_messages_with_auto_commit(
+    shard: &Rc<IggyShard>,
+    stream_id: Identifier,
+    topic_id: Identifier,
+    partition_id: usize,
+    consumer: PollingConsumer,
+    args: PollingArgs,
+) -> Result<(IggyPollMetadata, IggyMessagesBatchSet), IggyError> {
+    let auto_commit = args.auto_commit;
+    let ns = IggyFullNamespace::new(stream_id, topic_id, partition_id);
+    let (metadata, batches) = shard.streams.poll_messages(&ns, consumer, args).await?;
+
+    if auto_commit && !batches.is_empty() {
+        let offset = batches
+            .last_offset()
+            .expect("Batch set should have at least one batch");
+        shard
+            .streams
+            .auto_commit_consumer_offset(
+                &shard.config.system,
+                ns.stream_id(),
+                ns.topic_id(),
+                partition_id,
+                consumer,
+                offset,
+            )
+            .await?;
+    }
+
+    Ok((metadata, batches))
 }
 
 async fn handle_request(
@@ -74,26 +113,16 @@ async fn handle_request(
             Ok(ShardResponse::SendMessages)
         }
         ShardRequestPayload::PollMessages { args, consumer } => {
-            let auto_commit = args.auto_commit;
-            let ns = IggyFullNamespace::new(stream_id, topic_id, partition_id);
-            let (metadata, batches) = shard.streams.poll_messages(&ns, consumer, args).await?;
+            let (metadata, batches) = poll_messages_with_auto_commit(
+                shard,
+                stream_id,
+                topic_id,
+                partition_id,
+                consumer,
+                args,
+            )
+            .await?;
 
-            if auto_commit && !batches.is_empty() {
-                let offset = batches
-                    .last_offset()
-                    .expect("Batch set should have at least one batch");
-                shard
-                    .streams
-                    .auto_commit_consumer_offset(
-                        &shard.config.system,
-                        ns.stream_id(),
-                        ns.topic_id(),
-                        partition_id,
-                        consumer,
-                        offset,
-                    )
-                    .await?;
-            }
             Ok(ShardResponse::PollMessages((metadata, batches)))
         }
         ShardRequestPayload::FlushUnsavedBuffer { fsync } => {
@@ -351,18 +380,90 @@ async fn handle_request(
             let registry = shard.task_registry.clone();
             let registry_clone = registry.clone();
 
-            let ns = IggyFullNamespace::new(stream_id, topic_id, partition_id);
-            let batch = shard.maybe_encrypt_messages(initial_data)?;
-            let messages_count = batch.count();
+            let ns = IggyFullNamespace::new(stream_id.clone(), topic_id.clone(), partition_id);
 
-            shard
-                .streams
-                .append_messages(&shard.config.system, &shard.task_registry, &ns, batch)
-                .await?;
+            info!("DBG PollMessage: -1");
 
-            shard.metrics.increment_messages(messages_count as u64);
+            match initial_data {
+                SocketTransferPayload::SendMessages { batch } => {
+                    let batch = shard.maybe_encrypt_messages(batch)?;
+                    let messages_count = batch.count();
 
-            sender.send_empty_ok_response().await?;
+                    shard
+                        .streams
+                        .append_messages(&shard.config.system, &shard.task_registry, &ns, batch)
+                        .await?;
+
+                    shard.metrics.increment_messages(messages_count as u64);
+
+                    sender.send_empty_ok_response().await?;
+                }
+                SocketTransferPayload::PollMessages { consumer, args } => {
+                    let numeric_stream_id = shard
+                        .streams
+                        .with_stream_by_id(&stream_id, streams::helpers::get_stream_id());
+                    let numeric_topic_id = shard.streams.with_topic_by_id(
+                        &stream_id,
+                        &topic_id,
+                        topics::helpers::get_topic_id(),
+                    );
+
+                    shard.permissioner.borrow().poll_messages(
+                        user_id,
+                        numeric_stream_id,
+                        numeric_topic_id,
+                    )?;
+
+                    let current_offset = shard.streams.with_partition_by_id(
+                        &stream_id,
+                        &topic_id,
+                        partition_id,
+                        |(_, _, _, offset, ..)| offset.load(Ordering::Relaxed),
+                    );
+
+                    if args.strategy.kind == PollingKind::Offset
+                        && args.strategy.value > current_offset
+                        || args.count == 0
+                    {
+                        let metadata = IggyPollMetadata::new(partition_id as u32, current_offset);
+                        let mut batch = IggyMessagesBatchSet::empty();
+
+                        let (response_length_bytes, bufs) =
+                            prepare_message_batch_buffers(&metadata, &mut batch);
+
+                        sender
+                            .send_ok_response_vectored(&response_length_bytes, bufs)
+                            .await?;
+                    } else {
+                        let (metadata, batches) = poll_messages_with_auto_commit(
+                            shard,
+                            stream_id,
+                            topic_id,
+                            partition_id,
+                            consumer,
+                            args,
+                        )
+                        .await?;
+
+                        let mut batches = if let Some(encryptor) = &shard.encryptor {
+                            shard.decrypt_messages(batches, encryptor).await?
+                        } else {
+                            batches
+                        };
+
+                        let (response_length_bytes, bufs) =
+                            prepare_message_batch_buffers(&metadata, &mut batches);
+
+                        sender
+                            .send_ok_response_vectored(&response_length_bytes, bufs)
+                            .await?;
+
+                        info!("DBG PollMessage: 2");
+                    }
+                }
+            }
+
+            info!("DBG PollMessage: 3");
 
             registry.spawn_connection(async move {
                 match handle_connection(&session, &mut sender, &shard_for_conn, conn_stop_receiver)
@@ -395,6 +496,7 @@ async fn handle_request(
                 }
             });
 
+            info!("DBG PollMessage: 4");
             Ok(ShardResponse::SocketTransferResponse)
         }
     }
