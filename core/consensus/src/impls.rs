@@ -387,7 +387,7 @@ pub struct VsrConsensus {
     do_view_change_quorum: Cell<bool>,
     /// Whether we've sent our own SVC for current view
     sent_own_start_view_change: Cell<bool>,
-    /// Whether we've sent our own DVC for current view  
+    /// Whether we've sent our own DVC for current view
     sent_own_do_view_change: Cell<bool>,
 
     timeouts: RefCell<TimeoutManager>,
