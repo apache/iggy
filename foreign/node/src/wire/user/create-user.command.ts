@@ -26,13 +26,24 @@ import { uint8ToBuf, uint32ToBuf, boolToBuf } from '../number.utils.js';
 import { serializePermissions, type UserPermissions } from './permissions.utils.js';
 
 
+/**
+ * Parameters for the create user command.
+ */
 export type CreateUser = {
+  /** Username (1-255 bytes) */
   username: string,
+  /** Password (1-255 bytes) */
   password: string,
+  /** User status (Active or Inactive) */
   status: UserStatus
+  /** Optional user permissions */
   permissions?: UserPermissions
 };
 
+/**
+ * Create user command definition.
+ * Creates a new user with the specified credentials and permissions.
+ */
 export const CREATE_USER = {
   code: COMMAND_CODE.CreateUser,
 
@@ -64,4 +75,7 @@ export const CREATE_USER = {
 };
 
 
+/**
+ * Executable create user command function.
+ */
 export const createUser = wrapCommand<CreateUser, User>(CREATE_USER);

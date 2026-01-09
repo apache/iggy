@@ -19,12 +19,19 @@
 
 
 import type { Id } from '../identifier.utils.js';
-import { ClientProvider } from '../../client/index.js';
+import type { ClientProvider } from '../../client/index.js';
 import { createGroup } from './create-group.command.js';
 import { getGroup } from './get-group.command.js';
 import { joinGroup } from './join-group.command.js';
 
 
+/**
+ * Creates a virtual command that ensures a consumer group exists.
+ * If the group does not exist, it will be created.
+ *
+ * @param c - Client provider function
+ * @returns Function that ensures a consumer group exists by name
+ */
 export const ensureConsumerGroup = (c: ClientProvider) =>
   async function ensureConsumerGroup(
     streamId: Id,
@@ -37,6 +44,13 @@ export const ensureConsumerGroup = (c: ClientProvider) =>
     return group;
   }
 
+/**
+ * Creates a virtual command that ensures a consumer group exists and joins it.
+ * If the group does not exist, it will be created, then the client joins the group.
+ *
+ * @param c - Client provider function
+ * @returns Function that ensures a consumer group exists and joins it
+ */
 export const ensureConsumerGroupAndJoin = (c: ClientProvider) =>
   async function ensureConsumerGroupAndJoin(
     streamId: Id,

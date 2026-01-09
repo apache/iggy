@@ -4459,7 +4459,7 @@ dependencies = [
 
 [[package]]
 name = "iggy"
-version = "0.8.1-edge.2"
+version = "0.8.1-edge.3"
 dependencies = [
  "async-broadcast",
  "async-dropper",
@@ -4656,6 +4656,7 @@ dependencies = [
  "aes-gcm",
  "ahash 0.8.12",
  "base64 0.22.1",
+ "blake3",
  "bon",
  "byte-unit",
  "bytemuck",
@@ -4677,11 +4678,13 @@ dependencies = [
  "nix",
  "once_cell",
  "rcgen",
+ "ring",
  "rustls",
  "serde",
  "serde_json",
  "serde_with",
  "serial_test",
+ "slab",
  "strum 0.27.2",
  "thiserror 2.0.17",
  "tokio",
@@ -5656,10 +5659,13 @@ dependencies = [
 name = "metadata"
 version = "0.1.0"
 dependencies = [
+ "ahash 0.8.12",
+ "bytes",
  "consensus",
  "iggy_common",
  "journal",
  "message_bus",
+ "slab",
  "tracing",
 ]
 
@@ -8246,7 +8252,7 @@ dependencies = [
 
 [[package]]
 name = "server"
-version = "0.6.1-edge.2"
+version = "0.6.1-edge.3"
 dependencies = [
  "ahash 0.8.12",
  "anyhow",
@@ -8256,7 +8262,6 @@ dependencies = [
  "async_zip",
  "axum",
  "axum-server",
- "blake3",
  "bytes",
  "chrono",
  "clap",
@@ -8297,7 +8302,6 @@ dependencies = [
  "prometheus-client",
  "rand 0.9.2",
  "reqwest",
- "ring",
  "ringbuffer",
  "rmp-serde",
  "rust-embed",
@@ -8321,7 +8325,6 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "tungstenite",
- "twox-hash",
  "ulid",
  "uuid",
  "vergen-git2",

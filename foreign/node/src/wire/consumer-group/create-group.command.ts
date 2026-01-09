@@ -24,12 +24,22 @@ import { wrapCommand } from '../command.utils.js';
 import { COMMAND_CODE } from '../command.code.js';
 import { deserializeConsumerGroup, type ConsumerGroup } from './group.utils.js';
 
+/**
+ * Parameters for the create consumer group command.
+ */
 export type CreateGroup = {
+  /** Stream identifier (ID or name) */
   streamId: Id,
+  /** Topic identifier (ID or name) */
   topicId: Id,
+  /** Consumer group name (1-255 bytes) */
   name: string,
 };
 
+/**
+ * Create consumer group command definition.
+ * Creates a new consumer group within a topic.
+ */
 export const CREATE_GROUP = {
   code: COMMAND_CODE.CreateGroup,
 
@@ -57,4 +67,7 @@ export const CREATE_GROUP = {
 };
 
 
+/**
+ * Executable create consumer group command function.
+ */
 export const createGroup = wrapCommand<CreateGroup, ConsumerGroup>(CREATE_GROUP);

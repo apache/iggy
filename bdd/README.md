@@ -20,6 +20,10 @@ bdd/
 │   └── Dockerfile              # Node BDD test container
 ├── csharp/                     # csharp SDK BDD implementation
 │   └── Dockerfile              # csharp BDD test container
+├── java/                       # Java SDK BDD implementation
+│   ├── Dockerfile              # Java BDD test container
+│   ├── src/test/
+│   └── build.gradle.kts
 ├── docker-compose.yml          # Orchestrates server + SDK containers
 ├── Dockerfile                  # Debug build of Iggy server
 └── README.md
@@ -39,6 +43,7 @@ bdd/
 ../scripts/run-bdd-tests.sh go
 ../scripts/run-bdd-tests.sh node
 ../scripts/run-bdd-tests.sh csharp
+../scripts/run-bdd-tests.sh java
 
 # Clean up Docker resources
 ../scripts/run-bdd-tests.sh clean
@@ -88,6 +93,10 @@ The node.js BDD test are run by cucumber-js, bdd test code is located at [foreig
 ### For csharp SDK
 
 The csharp implementation is located at [foreign/csharp/Iggy_SDK.Tests.BDD](../foreign/csharp/Iggy_SDK.Tests.BDD)
+
+### For Java SDK
+
+The Java implementation is located in `java/src/test/`
 
 ### Adding New Scenarios
 

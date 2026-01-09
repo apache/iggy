@@ -29,6 +29,7 @@ pub mod delete_segments_scenario;
 pub mod encryption_scenario;
 pub mod message_headers_scenario;
 pub mod message_size_scenario;
+pub mod stale_client_consumer_group_scenario;
 pub mod stream_size_validation_scenario;
 pub mod system_scenario;
 pub mod tcp_tls_scenario;
