@@ -16,6 +16,7 @@
  * under the License.
  */
 
+pub mod auth;
 pub mod clients;
 pub mod deduplication;
 pub mod diagnostics;

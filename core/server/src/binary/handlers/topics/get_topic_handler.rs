@@ -17,21 +17,21 @@
  */
 
 use crate::binary::command::{
-    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
+    AuthenticatedHandler, BinaryServerCommand, HandlerResult, ServerCommand,
 };
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
 use crate::shard::IggyShard;
+use crate::streaming::auth::Auth;
 use crate::streaming::session::Session;
 use crate::streaming::streams;
-use anyhow::Result;
 use iggy_common::IggyError;
 use iggy_common::SenderKind;
 use iggy_common::get_topic::GetTopic;
 use std::rc::Rc;
 use tracing::debug;
 
-impl ServerCommandHandler for GetTopic {
+impl AuthenticatedHandler for GetTopic {
     fn code(&self) -> u32 {
         iggy_common::GET_TOPIC_CODE
     }
@@ -40,11 +40,11 @@ impl ServerCommandHandler for GetTopic {
         self,
         sender: &mut SenderKind,
         _length: u32,
+        auth: Auth,
         session: &Session,
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
-        shard.ensure_authenticated(session)?;
         let exists = shard
             .ensure_topic_exists(&self.stream_id, &self.topic_id)
             .is_ok();
@@ -60,7 +60,7 @@ impl ServerCommandHandler for GetTopic {
             .permissioner
             .borrow()
             .get_topic(
-                session.get_user_id(),
+                auth.user_id(),
                 numeric_stream_id,
                 self.topic_id
                     .get_u32_value()

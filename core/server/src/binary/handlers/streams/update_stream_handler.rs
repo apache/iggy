@@ -17,32 +17,32 @@
  */
 
 use crate::binary::command::{
-    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
+    AuthenticatedHandler, BinaryServerCommand, HandlerResult, ServerCommand,
 };
 use crate::binary::handlers::streams::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
-
 use crate::shard::IggyShard;
 use crate::shard::transmission::event::ShardEvent;
 use crate::state::command::EntryCommand;
+use crate::streaming::auth::Auth;
 use crate::streaming::session::Session;
-use anyhow::Result;
 use err_trail::ErrContext;
 use iggy_common::update_stream::UpdateStream;
 use iggy_common::{IggyError, SenderKind};
 use std::rc::Rc;
 use tracing::{debug, instrument};
 
-impl ServerCommandHandler for UpdateStream {
+impl AuthenticatedHandler for UpdateStream {
     fn code(&self) -> u32 {
         iggy_common::UPDATE_STREAM_CODE
     }
 
-    #[instrument(skip_all, name = "trace_update_stream", fields(iggy_user_id = session.get_user_id(), iggy_client_id = session.client_id, iggy_stream_id = self.stream_id.as_string()))]
+    #[instrument(skip_all, name = "trace_update_stream", fields(iggy_user_id = auth.user_id(), iggy_client_id = session.client_id, iggy_stream_id = self.stream_id.as_string()))]
     async fn handle(
         self,
         sender: &mut SenderKind,
         _length: u32,
+        auth: Auth,
         session: &Session,
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {
@@ -61,7 +61,7 @@ impl ServerCommandHandler for UpdateStream {
         shard.broadcast_event_to_all_shards(event).await?;
         shard
             .state
-            .apply(session.get_user_id(), &EntryCommand::UpdateStream(self))
+            .apply(auth.user_id(), &EntryCommand::UpdateStream(self))
             .await
             .error(|e: &IggyError| {
                 format!("{COMPONENT} (error: {e}) - failed to apply update stream with id: {stream_id}, session: {session}")

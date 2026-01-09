@@ -17,7 +17,7 @@
  */
 
 use crate::binary::command::{
-    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
+    AuthenticatedHandler, BinaryServerCommand, HandlerResult, ServerCommand,
 };
 use crate::binary::handlers::users::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
@@ -30,9 +30,9 @@ use crate::shard::transmission::message::{
 };
 use crate::state::command::EntryCommand;
 use crate::state::models::CreateUserWithId;
+use crate::streaming::auth::Auth;
 use crate::streaming::session::Session;
 use crate::streaming::utils::crypto;
-use anyhow::Result;
 use err_trail::ErrContext;
 use iggy_common::create_user::CreateUser;
 use iggy_common::{Identifier, IggyError, SenderKind};
@@ -40,16 +40,17 @@ use std::rc::Rc;
 use tracing::debug;
 use tracing::instrument;
 
-impl ServerCommandHandler for CreateUser {
+impl AuthenticatedHandler for CreateUser {
     fn code(&self) -> u32 {
         iggy_common::CREATE_USER_CODE
     }
 
-    #[instrument(skip_all, name = "trace_create_user", fields(iggy_user_id = session.get_user_id(), iggy_client_id = session.client_id))]
+    #[instrument(skip_all, name = "trace_create_user", fields(iggy_user_id = auth.user_id(), iggy_client_id = session.client_id))]
     async fn handle(
         self,
         sender: &mut SenderKind,
         _length: u32,
+        auth: Auth,
         session: &Session,
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {
@@ -60,7 +61,7 @@ impl ServerCommandHandler for CreateUser {
             topic_id: Identifier::default(),
             partition_id: 0,
             payload: ShardRequestPayload::CreateUser {
-                user_id: session.get_user_id(),
+                user_id: auth.user_id(),
                 username: self.username.clone(),
                 password: self.password.clone(),
                 status: self.status,
@@ -106,7 +107,7 @@ impl ServerCommandHandler for CreateUser {
                     shard
                         .state
                         .apply(
-                            session.get_user_id(),
+                            auth.user_id(),
                             &EntryCommand::CreateUser(CreateUserWithId {
                                 user_id,
                                 command: CreateUser {
@@ -140,7 +141,7 @@ impl ServerCommandHandler for CreateUser {
                     shard
                         .state
                         .apply(
-                            session.get_user_id(),
+                            auth.user_id(),
                             &EntryCommand::CreateUser(CreateUserWithId {
                                 user_id,
                                 command: CreateUser {

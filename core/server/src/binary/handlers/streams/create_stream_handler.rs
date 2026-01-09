@@ -17,12 +17,11 @@
  */
 
 use crate::binary::command::{
-    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
+    AuthenticatedHandler, BinaryServerCommand, HandlerResult, ServerCommand,
 };
 use crate::binary::handlers::streams::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
-
 use crate::shard::IggyShard;
 use crate::shard::transmission::event::ShardEvent;
 use crate::shard::transmission::frame::ShardResponse;
@@ -32,24 +31,25 @@ use crate::shard::transmission::message::{
 use crate::slab::traits_ext::{EntityComponentSystem, EntityMarker};
 use crate::state::command::EntryCommand;
 use crate::state::models::CreateStreamWithId;
+use crate::streaming::auth::Auth;
 use crate::streaming::session::Session;
-use anyhow::Result;
 use err_trail::ErrContext;
 use iggy_common::create_stream::CreateStream;
 use iggy_common::{Identifier, IggyError, SenderKind};
 use std::rc::Rc;
 use tracing::{debug, instrument};
 
-impl ServerCommandHandler for CreateStream {
+impl AuthenticatedHandler for CreateStream {
     fn code(&self) -> u32 {
         iggy_common::CREATE_STREAM_CODE
     }
 
-    #[instrument(skip_all, name = "trace_create_stream", fields(iggy_user_id = session.get_user_id(), iggy_client_id = session.client_id))]
+    #[instrument(skip_all, name = "trace_create_stream", fields(iggy_user_id = auth.user_id(), iggy_client_id = session.client_id))]
     async fn handle(
         self,
         sender: &mut SenderKind,
         _length: u32,
+        auth: Auth,
         session: &Session,
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {
@@ -60,7 +60,7 @@ impl ServerCommandHandler for CreateStream {
             topic_id: Identifier::default(),
             partition_id: 0,
             payload: ShardRequestPayload::CreateStream {
-                user_id: session.get_user_id(),
+                user_id: auth.user_id(),
                 name: self.name.clone(),
             },
         };
@@ -91,7 +91,7 @@ impl ServerCommandHandler for CreateStream {
 
                     shard
                         .state
-                        .apply(session.get_user_id(), &EntryCommand::CreateStream(CreateStreamWithId {
+                        .apply(auth.user_id(), &EntryCommand::CreateStream(CreateStreamWithId {
                             stream_id: created_stream_id as u32,
                             command: self
                         }))
@@ -116,7 +116,7 @@ impl ServerCommandHandler for CreateStream {
 
                     shard
                         .state
-                        .apply(session.get_user_id(), &EntryCommand::CreateStream(CreateStreamWithId {
+                        .apply(auth.user_id(), &EntryCommand::CreateStream(CreateStreamWithId {
                             stream_id: created_stream_id as u32,
                             command: self
                         }))

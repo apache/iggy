@@ -17,30 +17,31 @@
  */
 
 use crate::binary::command::{
-    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
+    AuthenticatedHandler, BinaryServerCommand, HandlerResult, ServerCommand,
 };
 use crate::binary::handlers::personal_access_tokens::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::shard::IggyShard;
 use crate::state::command::EntryCommand;
+use crate::streaming::auth::Auth;
 use crate::streaming::session::Session;
-use anyhow::Result;
 use err_trail::ErrContext;
 use iggy_common::delete_personal_access_token::DeletePersonalAccessToken;
 use iggy_common::{IggyError, SenderKind};
 use std::rc::Rc;
 use tracing::{debug, instrument};
 
-impl ServerCommandHandler for DeletePersonalAccessToken {
+impl AuthenticatedHandler for DeletePersonalAccessToken {
     fn code(&self) -> u32 {
         iggy_common::DELETE_PERSONAL_ACCESS_TOKEN_CODE
     }
 
-    #[instrument(skip_all, name = "trace_delete_personal_access_token", fields(iggy_user_id = session.get_user_id(), iggy_client_id = session.client_id))]
+    #[instrument(skip_all, name = "trace_delete_personal_access_token", fields(iggy_user_id = auth.user_id(), iggy_client_id = session.client_id))]
     async fn handle(
         self,
         sender: &mut SenderKind,
         _length: u32,
+        auth: Auth,
         session: &Session,
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {
@@ -55,7 +56,7 @@ impl ServerCommandHandler for DeletePersonalAccessToken {
 
         // Broadcast the event to other shards
         let event = crate::shard::transmission::event::ShardEvent::DeletedPersonalAccessToken {
-            user_id: session.get_user_id(),
+            user_id: auth.user_id(),
             name: self.name.clone(),
         };
         shard.broadcast_event_to_all_shards(event).await?;
@@ -63,7 +64,7 @@ impl ServerCommandHandler for DeletePersonalAccessToken {
         shard
             .state
             .apply(
-                session.get_user_id(),
+                auth.user_id(),
                 &EntryCommand::DeletePersonalAccessToken(DeletePersonalAccessToken {
                     name: self.name,
                 }),

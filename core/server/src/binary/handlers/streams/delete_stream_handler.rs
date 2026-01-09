@@ -17,7 +17,7 @@
  */
 
 use crate::binary::command::{
-    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
+    AuthenticatedHandler, BinaryServerCommand, HandlerResult, ServerCommand,
 };
 use crate::binary::handlers::streams::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
@@ -29,8 +29,8 @@ use crate::shard::transmission::message::{
 };
 use crate::slab::traits_ext::EntityMarker;
 use crate::state::command::EntryCommand;
+use crate::streaming::auth::Auth;
 use crate::streaming::session::Session;
-use anyhow::Result;
 use err_trail::ErrContext;
 use iggy_common::delete_stream::DeleteStream;
 use iggy_common::{Identifier, IggyError, SenderKind};
@@ -38,16 +38,17 @@ use std::rc::Rc;
 use tracing::info;
 use tracing::{debug, instrument};
 
-impl ServerCommandHandler for DeleteStream {
+impl AuthenticatedHandler for DeleteStream {
     fn code(&self) -> u32 {
         iggy_common::DELETE_STREAM_CODE
     }
 
-    #[instrument(skip_all, name = "trace_delete_stream", fields(iggy_user_id = session.get_user_id(), iggy_client_id = session.client_id, iggy_stream_id = self.stream_id.as_string()))]
+    #[instrument(skip_all, name = "trace_delete_stream", fields(iggy_user_id = auth.user_id(), iggy_client_id = session.client_id, iggy_stream_id = self.stream_id.as_string()))]
     async fn handle(
         self,
         sender: &mut SenderKind,
         _length: u32,
+        auth: Auth,
         session: &Session,
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {
@@ -58,7 +59,7 @@ impl ServerCommandHandler for DeleteStream {
             topic_id: Identifier::default(),
             partition_id: 0,
             payload: ShardRequestPayload::DeleteStream {
-                user_id: session.get_user_id(),
+                user_id: auth.user_id(),
                 stream_id: self.stream_id,
             },
         };
@@ -91,7 +92,7 @@ impl ServerCommandHandler for DeleteStream {
 
                     shard
                         .state
-                        .apply(session.get_user_id(), &EntryCommand::DeleteStream(DeleteStream { stream_id: stream_id.clone() }))
+                        .apply(auth.user_id(), &EntryCommand::DeleteStream(DeleteStream { stream_id: stream_id.clone() }))
                         .await
                         .error(|e: &IggyError| {
                             format!("{COMPONENT} (error: {e}) - failed to apply delete stream with ID: {stream_id}, session: {session}")
@@ -103,7 +104,7 @@ impl ServerCommandHandler for DeleteStream {
                 ShardResponse::DeleteStreamResponse(stream) => {
                     shard
                         .state
-                        .apply(session.get_user_id(), &EntryCommand::DeleteStream(DeleteStream { stream_id: (stream.id() as u32).try_into().unwrap() }))
+                        .apply(auth.user_id(), &EntryCommand::DeleteStream(DeleteStream { stream_id: (stream.id() as u32).try_into().unwrap() }))
                         .await
                         .error(|e: &IggyError| {
                             format!("{COMPONENT} (error: {e}) - failed to apply delete stream with ID: {stream_id}, session: {session}")

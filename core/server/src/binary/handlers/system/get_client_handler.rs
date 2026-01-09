@@ -17,11 +17,12 @@
  */
 
 use crate::binary::command::{
-    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
+    AuthenticatedHandler, BinaryServerCommand, HandlerResult, ServerCommand,
 };
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
 use crate::shard::IggyShard;
+use crate::streaming::auth::Auth;
 use crate::streaming::session::Session;
 use iggy_common::IggyError;
 use iggy_common::SenderKind;
@@ -29,7 +30,7 @@ use iggy_common::get_client::GetClient;
 use std::rc::Rc;
 use tracing::debug;
 
-impl ServerCommandHandler for GetClient {
+impl AuthenticatedHandler for GetClient {
     fn code(&self) -> u32 {
         iggy_common::GET_CLIENT_CODE
     }
@@ -38,6 +39,7 @@ impl ServerCommandHandler for GetClient {
         self,
         sender: &mut SenderKind,
         _length: u32,
+        _auth: Auth,
         session: &Session,
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {

@@ -17,7 +17,7 @@
  */
 
 use crate::binary::command::{
-    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
+    AuthenticatedHandler, BinaryServerCommand, HandlerResult, ServerCommand,
 };
 use crate::binary::handlers::partitions::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
@@ -28,8 +28,8 @@ use crate::shard::transmission::message::{
 };
 use crate::state::command::EntryCommand;
 use crate::streaming;
+use crate::streaming::auth::Auth;
 use crate::streaming::session::Session;
-use anyhow::Result;
 use err_trail::ErrContext;
 use iggy_common::delete_segments::DeleteSegments;
 use iggy_common::sharding::IggyNamespace;
@@ -37,16 +37,17 @@ use iggy_common::{IggyError, SenderKind};
 use std::rc::Rc;
 use tracing::{debug, instrument};
 
-impl ServerCommandHandler for DeleteSegments {
+impl AuthenticatedHandler for DeleteSegments {
     fn code(&self) -> u32 {
         iggy_common::DELETE_SEGMENTS_CODE
     }
 
-    #[instrument(skip_all, name = "trace_delete_segments", fields(iggy_user_id = session.get_user_id(), iggy_client_id = session.client_id, iggy_stream_id = self.stream_id.as_string(), iggy_topic_id = self.topic_id.as_string()))]
+    #[instrument(skip_all, name = "trace_delete_segments", fields(iggy_user_id = auth.user_id(), iggy_client_id = session.client_id, iggy_stream_id = self.stream_id.as_string(), iggy_topic_id = self.topic_id.as_string()))]
     async fn handle(
         self,
         sender: &mut SenderKind,
         _length: u32,
+        auth: Auth,
         session: &Session,
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {
@@ -57,8 +58,6 @@ impl ServerCommandHandler for DeleteSegments {
         let partition_id = self.partition_id as usize;
         let segments_count = self.segments_count;
 
-        // Ensure authentication and topic exists
-        shard.ensure_authenticated(session)?;
         shard.ensure_topic_exists(&stream_id, &topic_id)?;
         shard.ensure_partition_exists(&stream_id, &topic_id, partition_id)?;
 
@@ -114,7 +113,7 @@ impl ServerCommandHandler for DeleteSegments {
         shard
             .state
             .apply(
-                session.get_user_id(),
+                auth.user_id(),
                 &EntryCommand::DeleteSegments(self),
             )
             .await

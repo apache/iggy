@@ -16,37 +16,54 @@
  * under the License.
  */
 
-/// This macro does 4 expansions in one go:
-///
-/// 1) The `#[enum_dispatch(ServerCommandHandler)] pub enum ServerCommand`
-///    with all variants.
-/// 2) The `from_code_and_payload(code, payload)` function that matches each code.
-/// 3) The `to_bytes()` function that matches each variant.
-/// 4) The `validate()` function that matches each variant.
+/// Generates `ServerCommand` enum with `@unauth`/`@auth` split and `dispatch()` method.
+/// For `@auth` commands, `dispatch()` calls `shard.auth(session)?` before handler.
 #[macro_export]
 macro_rules! define_server_command_enum {
     (
-                $(
-            // Macro pattern:
-            // variant name     inner type    numeric code   display string   show_payload?
-            $variant:ident ( $ty:ty ), $code:ident, $display_str:expr, $show_payload:expr
-        );* $(;)?
+        @unauth {
+            $(
+                $unauth_variant:ident ( $unauth_ty:ty ), $unauth_code:ident, $unauth_display:expr, $unauth_show_payload:expr
+            );* $(;)?
+        }
+        @auth {
+            $(
+                $auth_variant:ident ( $auth_ty:ty ), $auth_code:ident, $auth_display:expr, $auth_show_payload:expr
+            );* $(;)?
+        }
     ) => {
-        #[enum_dispatch(ServerCommandHandler)]
         #[derive(Debug, PartialEq, EnumString)]
         pub enum ServerCommand {
             $(
-                $variant($ty),
+                $unauth_variant($unauth_ty),
+            )*
+            $(
+                $auth_variant($auth_ty),
             )*
         }
 
         impl ServerCommand {
-            /// Constructs a `ServerCommand` from its numeric code and payload.
+            pub fn code(&self) -> u32 {
+                match self {
+                    $(
+                        ServerCommand::$unauth_variant(_) => $unauth_code,
+                    )*
+                    $(
+                        ServerCommand::$auth_variant(_) => $auth_code,
+                    )*
+                }
+            }
+
             pub fn from_code_and_payload(code: u32, payload: Bytes) -> Result<Self, IggyError> {
                 match code {
                     $(
-                        $code => Ok(ServerCommand::$variant(
-                            <$ty>::from_bytes(payload)?
+                        $unauth_code => Ok(ServerCommand::$unauth_variant(
+                            <$unauth_ty>::from_bytes(payload)?
+                        )),
+                    )*
+                    $(
+                        $auth_code => Ok(ServerCommand::$auth_variant(
+                            <$auth_ty>::from_bytes(payload)?
                         )),
                     )*
                     _ => {
@@ -56,7 +73,6 @@ macro_rules! define_server_command_enum {
                 }
             }
 
-            /// Constructs a ServerCommand from its numeric code by reading from the provided async reader.
             pub async fn from_code_and_reader(
                 code: u32,
                 sender: &mut SenderKind,
@@ -64,28 +80,72 @@ macro_rules! define_server_command_enum {
             ) -> Result<Self, IggyError> {
                 match code {
                     $(
-                        $code => Ok(ServerCommand::$variant(
-                            <$ty as BinaryServerCommand>::from_sender(sender, code, length).await?
+                        $unauth_code => Ok(ServerCommand::$unauth_variant(
+                            <$unauth_ty as BinaryServerCommand>::from_sender(sender, code, length).await?
+                        )),
+                    )*
+                    $(
+                        $auth_code => Ok(ServerCommand::$auth_variant(
+                            <$auth_ty as BinaryServerCommand>::from_sender(sender, code, length).await?
                         )),
                     )*
                     _ => Err(IggyError::InvalidCommand),
                 }
             }
 
-            /// Converts the command into raw bytes.
             pub fn to_bytes(&self) -> Bytes {
                 match self {
                     $(
-                        ServerCommand::$variant(payload) => as_bytes(payload),
+                        ServerCommand::$unauth_variant(payload) => as_bytes(payload),
+                    )*
+                    $(
+                        ServerCommand::$auth_variant(payload) => as_bytes(payload),
                     )*
                 }
             }
 
-            /// Validate the command by delegating to the inner command’s implementation.
             pub fn validate(&self) -> Result<(), IggyError> {
                 match self {
                     $(
-                        ServerCommand::$variant(cmd) => <$ty as iggy_common::Validatable<iggy_common::IggyError>>::validate(cmd),
+                        ServerCommand::$unauth_variant(cmd) => <$unauth_ty as iggy_common::Validatable<iggy_common::IggyError>>::validate(cmd),
+                    )*
+                    $(
+                        ServerCommand::$auth_variant(cmd) => <$auth_ty as iggy_common::Validatable<iggy_common::IggyError>>::validate(cmd),
+                    )*
+                }
+            }
+
+            pub async fn dispatch(
+                self,
+                sender: &mut SenderKind,
+                length: u32,
+                session: &Session,
+                shard: &Rc<IggyShard>,
+            ) -> Result<HandlerResult, IggyError> {
+                match self {
+                    $(
+                        ServerCommand::$unauth_variant(cmd) => {
+                            <$unauth_ty as UnauthenticatedHandler>::handle(
+                                cmd,
+                                sender,
+                                length,
+                                session,
+                                shard,
+                            ).await
+                        }
+                    )*
+                    $(
+                        ServerCommand::$auth_variant(cmd) => {
+                            let auth = shard.auth(session)?;
+                            <$auth_ty as AuthenticatedHandler>::handle(
+                                cmd,
+                                sender,
+                                length,
+                                auth,
+                                session,
+                                shard,
+                            ).await
+                        }
                     )*
                 }
             }
@@ -96,13 +156,20 @@ macro_rules! define_server_command_enum {
             fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 match self {
                     $(
-                        // If $show_payload is true, we display the command name + payload;
-                        // otherwise, we just display the command name.
-                        ServerCommand::$variant(payload) => {
-                            if $show_payload {
-                                write!(formatter, "{}|{payload:?}", $display_str)
+                        ServerCommand::$unauth_variant(payload) => {
+                            if $unauth_show_payload {
+                                write!(formatter, "{}|{payload:?}", $unauth_display)
                             } else {
-                                write!(formatter, "{}", $display_str)
+                                write!(formatter, "{}", $unauth_display)
+                            }
+                        },
+                    )*
+                    $(
+                        ServerCommand::$auth_variant(payload) => {
+                            if $auth_show_payload {
+                                write!(formatter, "{}|{payload:?}", $auth_display)
+                            } else {
+                                write!(formatter, "{}", $auth_display)
                             }
                         },
                     )*
@@ -110,5 +177,4 @@ macro_rules! define_server_command_enum {
             }
         }
     };
-
 }

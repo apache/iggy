@@ -17,34 +17,34 @@
  */
 
 use crate::binary::command::{
-    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
+    AuthenticatedHandler, BinaryServerCommand, HandlerResult, ServerCommand,
 };
 use crate::binary::handlers::personal_access_tokens::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
-
 use crate::shard::IggyShard;
 use crate::shard::transmission::event::ShardEvent;
 use crate::state::command::EntryCommand;
 use crate::state::models::CreatePersonalAccessTokenWithHash;
+use crate::streaming::auth::Auth;
 use crate::streaming::session::Session;
-use anyhow::Result;
 use err_trail::ErrContext;
 use iggy_common::create_personal_access_token::CreatePersonalAccessToken;
 use iggy_common::{IggyError, SenderKind};
 use std::rc::Rc;
 use tracing::{debug, instrument};
 
-impl ServerCommandHandler for CreatePersonalAccessToken {
+impl AuthenticatedHandler for CreatePersonalAccessToken {
     fn code(&self) -> u32 {
         iggy_common::CREATE_PERSONAL_ACCESS_TOKEN_CODE
     }
 
-    #[instrument(skip_all, name = "trace_create_personal_access_token", fields(iggy_user_id = session.get_user_id(), iggy_client_id = session.client_id))]
+    #[instrument(skip_all, name = "trace_create_personal_access_token", fields(iggy_user_id = auth.user_id(), iggy_client_id = session.client_id))]
     async fn handle(
         self,
         sender: &mut SenderKind,
         _length: u32,
+        auth: Auth,
         session: &Session,
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {
@@ -68,7 +68,7 @@ impl ServerCommandHandler for CreatePersonalAccessToken {
         shard
             .state
             .apply(
-                session.get_user_id(),
+                auth.user_id(),
                 &EntryCommand::CreatePersonalAccessToken(CreatePersonalAccessTokenWithHash {
                     command: CreatePersonalAccessToken {
                         name: self.name.to_owned(),
