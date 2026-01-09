@@ -295,4 +295,18 @@ impl IggyShard {
             Err(IggyError::Unauthenticated)
         }
     }
+
+    pub fn auth(&self, session: &Session) -> Result<crate::streaming::auth::Auth, IggyError> {
+        if !session.is_active() {
+            error!("{COMPONENT} - session is inactive, session: {session}");
+            return Err(IggyError::StaleClient);
+        }
+
+        if !session.is_authenticated() {
+            error!("{COMPONENT} - unauthenticated access attempt, session: {session}");
+            return Err(IggyError::Unauthenticated);
+        }
+
+        Ok(crate::streaming::auth::Auth::new(session.get_user_id()))
+    }
 }

@@ -16,13 +16,13 @@
  * under the License.
  */
 
-use crate::binary::command::{BinaryServerCommand, HandlerResult, ServerCommandHandler};
+use crate::binary::command::{AuthenticatedHandler, BinaryServerCommand, HandlerResult};
 use crate::shard::IggyShard;
 use crate::shard::transmission::message::{ShardMessage, ShardRequest, ShardRequestPayload};
+use crate::streaming::auth::Auth;
 use crate::streaming::segments::{IggyIndexesMut, IggyMessagesBatchMut};
 use crate::streaming::session::Session;
 use crate::streaming::{streams, topics};
-use anyhow::Result;
 use compio::buf::{IntoInner as _, IoBuf};
 use iggy_common::Identifier;
 use iggy_common::PooledBuffer;
@@ -34,13 +34,13 @@ use iggy_common::{IggyError, Partitioning, SendMessages, Validatable};
 use std::rc::Rc;
 use tracing::{debug, error, info, instrument};
 
-impl ServerCommandHandler for SendMessages {
+impl AuthenticatedHandler for SendMessages {
     fn code(&self) -> u32 {
         iggy_common::SEND_MESSAGES_CODE
     }
 
     #[instrument(skip_all, name = "trace_send_messages", fields(
-        iggy_user_id = session.get_user_id(),
+        iggy_user_id = auth.user_id(),
         iggy_client_id = session.client_id,
         iggy_stream_id = self.stream_id.as_string(),
         iggy_topic_id = self.topic_id.as_string(),
@@ -50,6 +50,7 @@ impl ServerCommandHandler for SendMessages {
         mut self,
         sender: &mut SenderKind,
         length: u32,
+        auth: Auth,
         session: &Session,
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {
@@ -150,7 +151,7 @@ impl ServerCommandHandler for SendMessages {
         )?;
 
         let namespace = IggyNamespace::new(numeric_stream_id, numeric_topic_id, partition_id);
-        let user_id = session.get_user_id();
+        let user_id = auth.user_id();
         let unsupport_socket_transfer = matches!(
             self.partitioning.kind,
             PartitioningKind::Balanced | PartitioningKind::MessagesKey

@@ -17,10 +17,11 @@
  */
 
 use crate::binary::command::{
-    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
+    AuthenticatedHandler, BinaryServerCommand, HandlerResult, ServerCommand,
 };
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::shard::IggyShard;
+use crate::streaming::auth::Auth;
 use crate::streaming::session::Session;
 use bytes::Bytes;
 use iggy_common::IggyError;
@@ -29,7 +30,7 @@ use iggy_common::get_snapshot::GetSnapshot;
 use std::rc::Rc;
 use tracing::debug;
 
-impl ServerCommandHandler for GetSnapshot {
+impl AuthenticatedHandler for GetSnapshot {
     fn code(&self) -> u32 {
         iggy_common::GET_SNAPSHOT_FILE_CODE
     }
@@ -38,6 +39,7 @@ impl ServerCommandHandler for GetSnapshot {
         self,
         sender: &mut SenderKind,
         _length: u32,
+        _auth: Auth,
         session: &Session,
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {

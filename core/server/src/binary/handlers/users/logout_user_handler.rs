@@ -19,39 +19,39 @@
 use std::rc::Rc;
 
 use crate::binary::command::{
-    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
+    AuthenticatedHandler, BinaryServerCommand, HandlerResult, ServerCommand,
 };
 use crate::binary::handlers::users::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
-
 use crate::shard::IggyShard;
+use crate::streaming::auth::Auth;
 use crate::streaming::session::Session;
-use anyhow::Result;
 use err_trail::ErrContext;
 use iggy_common::logout_user::LogoutUser;
 use iggy_common::{IggyError, SenderKind};
 use tracing::info;
 use tracing::{debug, instrument};
 
-impl ServerCommandHandler for LogoutUser {
+impl AuthenticatedHandler for LogoutUser {
     fn code(&self) -> u32 {
         iggy_common::LOGOUT_USER_CODE
     }
 
-    #[instrument(skip_all, name = "trace_logout_user", fields(iggy_user_id = session.get_user_id(), iggy_client_id = session.client_id))]
+    #[instrument(skip_all, name = "trace_logout_user", fields(iggy_user_id = auth.user_id(), iggy_client_id = session.client_id))]
     async fn handle(
         self,
         sender: &mut SenderKind,
         _length: u32,
+        auth: Auth,
         session: &Session,
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
-        info!("Logging out user with ID: {}...", session.get_user_id());
+        info!("Logging out user with ID: {}...", auth.user_id());
         shard.logout_user(session).error(|e: &IggyError| {
             format!("{COMPONENT} (error: {e}) - failed to logout user, session: {session}")
         })?;
-        info!("Logged out user with ID: {}.", session.get_user_id());
+        info!("Logged out user with ID: {}.", auth.user_id());
         session.clear_user_id();
         sender.send_empty_ok_response().await?;
         Ok(HandlerResult::Finished)

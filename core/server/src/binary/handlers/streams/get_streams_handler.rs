@@ -17,15 +17,15 @@
  */
 
 use crate::binary::command::{
-    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
+    AuthenticatedHandler, BinaryServerCommand, HandlerResult, ServerCommand,
 };
 use crate::binary::handlers::streams::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
 use crate::shard::IggyShard;
 use crate::slab::traits_ext::{EntityComponentSystem, IntoComponents};
+use crate::streaming::auth::Auth;
 use crate::streaming::session::Session;
-use anyhow::Result;
 use err_trail::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::SenderKind;
@@ -33,7 +33,7 @@ use iggy_common::get_streams::GetStreams;
 use std::rc::Rc;
 use tracing::debug;
 
-impl ServerCommandHandler for GetStreams {
+impl AuthenticatedHandler for GetStreams {
     fn code(&self) -> u32 {
         iggy_common::GET_STREAMS_CODE
     }
@@ -42,19 +42,19 @@ impl ServerCommandHandler for GetStreams {
         self,
         sender: &mut SenderKind,
         _length: u32,
+        auth: Auth,
         session: &Session,
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
-        shard.ensure_authenticated(session)?;
         shard
             .permissioner
             .borrow()
-            .get_streams(session.get_user_id())
+            .get_streams(auth.user_id())
             .error(|e: &IggyError| {
                 format!(
                     "{COMPONENT} (error: {e}) - permission denied to get streams for user {}",
-                    session.get_user_id()
+                    auth.user_id()
                 )
             })?;
 

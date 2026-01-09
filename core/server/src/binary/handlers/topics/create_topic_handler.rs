@@ -17,12 +17,11 @@
  */
 
 use crate::binary::command::{
-    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
+    AuthenticatedHandler, BinaryServerCommand, HandlerResult, ServerCommand,
 };
 use crate::binary::handlers::topics::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
-
 use crate::shard::IggyShard;
 use crate::shard::transmission::event::ShardEvent;
 use crate::shard::transmission::frame::ShardResponse;
@@ -32,25 +31,26 @@ use crate::shard::transmission::message::{
 use crate::slab::traits_ext::EntityMarker;
 use crate::state::command::EntryCommand;
 use crate::state::models::CreateTopicWithId;
+use crate::streaming::auth::Auth;
 use crate::streaming::session::Session;
 use crate::streaming::streams;
-use anyhow::Result;
 use err_trail::ErrContext;
 use iggy_common::create_topic::CreateTopic;
 use iggy_common::{Identifier, IggyError, SenderKind};
 use std::rc::Rc;
 use tracing::{debug, instrument};
 
-impl ServerCommandHandler for CreateTopic {
+impl AuthenticatedHandler for CreateTopic {
     fn code(&self) -> u32 {
         iggy_common::CREATE_TOPIC_CODE
     }
 
-    #[instrument(skip_all, name = "trace_create_topic", fields(iggy_user_id = session.get_user_id(), iggy_client_id = session.client_id, iggy_stream_id = self.stream_id.as_string()))]
+    #[instrument(skip_all, name = "trace_create_topic", fields(iggy_user_id = auth.user_id(), iggy_client_id = session.client_id, iggy_stream_id = self.stream_id.as_string()))]
     async fn handle(
         mut self,
         sender: &mut SenderKind,
         _length: u32,
+        auth: Auth,
         session: &Session,
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {
@@ -61,7 +61,7 @@ impl ServerCommandHandler for CreateTopic {
             topic_id: Identifier::default(),
             partition_id: 0,
             payload: ShardRequestPayload::CreateTopic {
-                user_id: session.get_user_id(),
+                user_id: auth.user_id(),
                 stream_id: self.stream_id.clone(),
                 name: self.name.clone(),
                 partitions_count: self.partitions_count,
@@ -137,7 +137,7 @@ impl ServerCommandHandler for CreateTopic {
                     );
                     shard
                         .state
-                        .apply(session.get_user_id(), &EntryCommand::CreateTopic(CreateTopicWithId {
+                        .apply(auth.user_id(), &EntryCommand::CreateTopic(CreateTopicWithId {
                             topic_id: topic_id as u32,
                             command: self
                         }))
@@ -172,7 +172,7 @@ impl ServerCommandHandler for CreateTopic {
 
                     shard
                         .state
-                        .apply(session.get_user_id(), &EntryCommand::CreateTopic(CreateTopicWithId {
+                        .apply(auth.user_id(), &EntryCommand::CreateTopic(CreateTopicWithId {
                             topic_id: topic_id as u32,
                             command: self
                         }))

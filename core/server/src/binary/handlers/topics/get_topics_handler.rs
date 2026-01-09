@@ -17,22 +17,22 @@
  */
 
 use crate::binary::command::{
-    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
+    AuthenticatedHandler, BinaryServerCommand, HandlerResult, ServerCommand,
 };
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
 use crate::shard::IggyShard;
 use crate::slab::traits_ext::{EntityComponentSystem, IntoComponents};
+use crate::streaming::auth::Auth;
 use crate::streaming::session::Session;
 use crate::streaming::streams;
-use anyhow::Result;
 use iggy_common::IggyError;
 use iggy_common::SenderKind;
 use iggy_common::get_topics::GetTopics;
 use std::rc::Rc;
 use tracing::debug;
 
-impl ServerCommandHandler for GetTopics {
+impl AuthenticatedHandler for GetTopics {
     fn code(&self) -> u32 {
         iggy_common::GET_TOPICS_CODE
     }
@@ -41,11 +41,11 @@ impl ServerCommandHandler for GetTopics {
         self,
         sender: &mut SenderKind,
         _length: u32,
+        auth: Auth,
         session: &Session,
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
-        shard.ensure_authenticated(session)?;
         shard.ensure_stream_exists(&self.stream_id)?;
         let numeric_stream_id = shard
             .streams
@@ -53,7 +53,7 @@ impl ServerCommandHandler for GetTopics {
         shard
             .permissioner
             .borrow()
-            .get_topics(session.get_user_id(), numeric_stream_id)?;
+            .get_topics(auth.user_id(), numeric_stream_id)?;
 
         let response = shard.streams.with_topics(&self.stream_id, |topics| {
             topics.with_components(|topics| {

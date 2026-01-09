@@ -17,7 +17,7 @@
  */
 
 use crate::binary::command::{
-    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
+    AuthenticatedHandler, BinaryServerCommand, HandlerResult, ServerCommand,
 };
 use crate::binary::handlers::consumer_groups::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
@@ -27,24 +27,25 @@ use crate::shard::transmission::event::ShardEvent;
 use crate::slab::traits_ext::EntityMarker;
 use crate::state::command::EntryCommand;
 use crate::state::models::CreateConsumerGroupWithId;
+use crate::streaming::auth::Auth;
 use crate::streaming::session::Session;
-use anyhow::Result;
 use err_trail::ErrContext;
 use iggy_common::create_consumer_group::CreateConsumerGroup;
 use iggy_common::{Identifier, IggyError, SenderKind};
 use std::rc::Rc;
 use tracing::{debug, instrument};
 
-impl ServerCommandHandler for CreateConsumerGroup {
+impl AuthenticatedHandler for CreateConsumerGroup {
     fn code(&self) -> u32 {
         iggy_common::CREATE_CONSUMER_GROUP_CODE
     }
 
-    #[instrument(skip_all, name = "trace_create_consumer_group", fields(iggy_user_id = session.get_user_id(), iggy_client_id = session.client_id, iggy_stream_id = self.stream_id.as_string(), iggy_topic_id = self.topic_id.as_string()))]
+    #[instrument(skip_all, name = "trace_create_consumer_group", fields(iggy_user_id = auth.user_id(), iggy_client_id = session.client_id, iggy_stream_id = self.stream_id.as_string(), iggy_topic_id = self.topic_id.as_string()))]
     async fn handle(
         self,
         sender: &mut SenderKind,
         _length: u32,
+        auth: Auth,
         session: &Session,
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {
@@ -69,7 +70,7 @@ impl ServerCommandHandler for CreateConsumerGroup {
         shard
             .state
         .apply(
-            session.get_user_id(),
+            auth.user_id(),
            &EntryCommand::CreateConsumerGroup(CreateConsumerGroupWithId {
                 group_id: cg_id as u32,
                 command: self

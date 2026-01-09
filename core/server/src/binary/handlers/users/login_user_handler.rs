@@ -17,21 +17,20 @@
  */
 
 use crate::binary::command::{
-    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
+    BinaryServerCommand, HandlerResult, ServerCommand, UnauthenticatedHandler,
 };
 use crate::binary::handlers::users::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
 use crate::shard::IggyShard;
 use crate::streaming::session::Session;
-use anyhow::Result;
 use err_trail::ErrContext;
 use iggy_common::login_user::LoginUser;
 use iggy_common::{IggyError, SenderKind};
 use std::rc::Rc;
 use tracing::{debug, info, instrument, warn};
 
-impl ServerCommandHandler for LoginUser {
+impl UnauthenticatedHandler for LoginUser {
     fn code(&self) -> u32 {
         iggy_common::LOGIN_USER_CODE
     }

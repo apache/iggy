@@ -17,11 +17,10 @@
  */
 
 use crate::binary::command::{
-    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
+    AuthenticatedHandler, BinaryServerCommand, HandlerResult, ServerCommand,
 };
 use crate::binary::handlers::topics::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
-
 use crate::shard::IggyShard;
 use crate::shard::transmission::event::ShardEvent;
 use crate::shard::transmission::frame::ShardResponse;
@@ -29,25 +28,26 @@ use crate::shard::transmission::message::{
     ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult,
 };
 use crate::state::command::EntryCommand;
+use crate::streaming::auth::Auth;
 use crate::streaming::session::Session;
 use crate::streaming::{streams, topics};
-use anyhow::Result;
 use err_trail::ErrContext;
 use iggy_common::update_topic::UpdateTopic;
 use iggy_common::{Identifier, IggyError, SenderKind};
 use std::rc::Rc;
 use tracing::{debug, instrument};
 
-impl ServerCommandHandler for UpdateTopic {
+impl AuthenticatedHandler for UpdateTopic {
     fn code(&self) -> u32 {
         iggy_common::UPDATE_TOPIC_CODE
     }
 
-    #[instrument(skip_all, name = "trace_update_topic", fields(iggy_user_id = session.get_user_id(), iggy_client_id = session.client_id, iggy_stream_id = self.stream_id.as_string(), iggy_topic_id = self.topic_id.as_string()))]
+    #[instrument(skip_all, name = "trace_update_topic", fields(iggy_user_id = auth.user_id(), iggy_client_id = session.client_id, iggy_stream_id = self.stream_id.as_string(), iggy_topic_id = self.topic_id.as_string()))]
     async fn handle(
         mut self,
         sender: &mut SenderKind,
         _length: u32,
+        auth: Auth,
         session: &Session,
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {
@@ -58,7 +58,7 @@ impl ServerCommandHandler for UpdateTopic {
             topic_id: Identifier::default(),
             partition_id: 0,
             payload: ShardRequestPayload::UpdateTopic {
-                user_id: session.get_user_id(),
+                user_id: auth.user_id(),
                 stream_id: self.stream_id.clone(),
                 topic_id: self.topic_id.clone(),
                 name: self.name.clone(),
@@ -130,7 +130,7 @@ impl ServerCommandHandler for UpdateTopic {
 
                     shard
                         .state
-                        .apply(session.get_user_id(), &EntryCommand::UpdateTopic(self))
+                        .apply(auth.user_id(), &EntryCommand::UpdateTopic(self))
                         .await
                         .error(|e: &IggyError| format!(
                             "{COMPONENT} (error: {e}) - failed to apply update topic with id: {topic_id} in stream with ID: {stream_id_num}, session: {session}"
@@ -150,7 +150,7 @@ impl ServerCommandHandler for UpdateTopic {
 
                     shard
                         .state
-                        .apply(session.get_user_id(), &EntryCommand::UpdateTopic(self))
+                        .apply(auth.user_id(), &EntryCommand::UpdateTopic(self))
                         .await
                         .error(|e: &IggyError| format!(
                             "{COMPONENT} (error: {e}) - failed to apply update topic in stream with ID: {stream_id}, session: {session}"

@@ -17,22 +17,22 @@
  */
 
 use crate::binary::command::{
-    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
+    AuthenticatedHandler, BinaryServerCommand, HandlerResult, ServerCommand,
 };
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
 use crate::shard::IggyShard;
 use crate::slab::traits_ext::{EntityComponentSystem, IntoComponents};
+use crate::streaming::auth::Auth;
 use crate::streaming::session::Session;
 use crate::streaming::{streams, topics};
-use anyhow::Result;
 use iggy_common::IggyError;
 use iggy_common::SenderKind;
 use iggy_common::get_consumer_groups::GetConsumerGroups;
 use std::rc::Rc;
 use tracing::debug;
 
-impl ServerCommandHandler for GetConsumerGroups {
+impl AuthenticatedHandler for GetConsumerGroups {
     fn code(&self) -> u32 {
         iggy_common::GET_CONSUMER_GROUPS_CODE
     }
@@ -41,11 +41,11 @@ impl ServerCommandHandler for GetConsumerGroups {
         self,
         sender: &mut SenderKind,
         _length: u32,
+        auth: Auth,
         session: &Session,
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
-        shard.ensure_authenticated(session)?;
         shard.ensure_topic_exists(&self.stream_id, &self.topic_id)?;
         let numeric_topic_id = shard.streams.with_topic_by_id(
             &self.stream_id,
@@ -56,7 +56,7 @@ impl ServerCommandHandler for GetConsumerGroups {
             .streams
             .with_stream_by_id(&self.stream_id, streams::helpers::get_stream_id());
         shard.permissioner.borrow().get_consumer_groups(
-            session.get_user_id(),
+            auth.user_id(),
             numeric_stream_id,
             numeric_topic_id,
         )?;

@@ -16,7 +16,7 @@
  * under the License.
  */
 
-use crate::binary::command::{ServerCommand, ServerCommandHandler};
+use crate::binary::command::ServerCommand;
 use crate::server_error::ConnectionError;
 use crate::shard::IggyShard;
 use crate::shard::task_registry::ShutdownToken;
@@ -187,7 +187,7 @@ async fn handle_stream(
 
     trace!("Received a QUIC command: {command}, payload size: {length}");
 
-    match command.handle(&mut sender, length, session, &shard).await {
+    match command.dispatch(&mut sender, length, session, &shard).await {
         Ok(_) => {
             trace!(
                 "Command was handled successfully, session: {:?}. QUIC response was sent.",
