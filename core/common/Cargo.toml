@@ -36,6 +36,7 @@ fast_async_lock = ["dep:fast-async-mutex"]
 aes-gcm = { workspace = true }
 ahash = { workspace = true }
 base64 = { workspace = true }
+blake3 = { workspace = true }
 bon = { workspace = true }
 byte-unit = { workspace = true }
 bytemuck = { workspace = true }
@@ -57,6 +58,7 @@ humantime = { workspace = true }
 nix = { workspace = true }
 once_cell = { workspace = true }
 rcgen = "0.14.6"
+ring = "0.17.14"
 rustls = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

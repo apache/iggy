@@ -46,7 +46,6 @@ async-channel = { workspace = true }
 async_zip = { workspace = true }
 axum = { workspace = true }
 axum-server = { workspace = true }
-blake3 = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
@@ -100,7 +99,6 @@ papaya = "0.2.3"
 prometheus-client = "0.24.0"
 rand = { workspace = true }
 reqwest = { workspace = true, features = ["rustls-tls-no-provider"] }
-ring = "0.17.14"
 ringbuffer = "0.16.0"
 rmp-serde = { workspace = true }
 rust-embed = { version = "8.9.0", optional = true }
@@ -124,7 +122,6 @@ tracing-appender = { workspace = true }
 tracing-opentelemetry = "0.32.0"
 tracing-subscriber = { workspace = true }
 tungstenite = { workspace = true }
-twox-hash = { workspace = true }
 ulid = "1.2.1"
 uuid = { workspace = true }
 

@@ -18,13 +18,13 @@
 
 use super::COMPONENT;
 use crate::shard::IggyShard;
-use crate::streaming::personal_access_tokens::personal_access_token::PersonalAccessToken;
 use crate::streaming::session::Session;
 use crate::streaming::users::user::User;
 use err_trail::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::IggyExpiry;
 use iggy_common::IggyTimestamp;
+use iggy_common::PersonalAccessToken;
 use tracing::{error, info};
 
 impl IggyShard {

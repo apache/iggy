@@ -22,7 +22,6 @@ use crate::slab::Keyed;
 use crate::slab::traits_ext::{EntityComponentSystem, IntoComponents};
 use crate::streaming::clients::client_manager::Client;
 use crate::streaming::partitions::partition::PartitionRoot;
-use crate::streaming::personal_access_tokens::personal_access_token::PersonalAccessToken;
 use crate::streaming::stats::{PartitionStats, StreamStats, TopicStats};
 use crate::streaming::streams::stream;
 use crate::streaming::topics::consumer_group::{ConsumerGroupMembers, ConsumerGroupRoot, Member};
@@ -30,7 +29,9 @@ use crate::streaming::topics::topic::{self, TopicRoot};
 use crate::streaming::users::user::User;
 use arcshift::SharedGetGuard;
 use bytes::{BufMut, Bytes, BytesMut};
-use iggy_common::{BytesSerializable, ConsumerOffsetInfo, Stats, TransportProtocol, UserId};
+use iggy_common::{
+    BytesSerializable, ConsumerOffsetInfo, PersonalAccessToken, Stats, TransportProtocol, UserId,
+};
 use slab::Slab;
 
 pub fn map_stats(stats: &Stats) -> Bytes {
