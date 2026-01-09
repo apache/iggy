@@ -63,6 +63,7 @@ rustls = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_with = { workspace = true, features = ["base64"] }
+slab = "0.4.11"
 strum = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
