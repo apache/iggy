@@ -15,10 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::vsr_timeout::TimeoutManager;
-use crate::{Consensus, DvcQuorumArray, Project, dvc_quorum_array_empty};
+use crate::vsr_timeout::{TimeoutKind, TimeoutManager};
+use crate::{
+    Consensus, DvcQuorumArray, Project, StoredDvc, dvc_count, dvc_max_commit,
+    dvc_quorum_array_empty, dvc_record, dvc_reset, dvc_select_winner,
+};
 use bit_set::BitSet;
-use iggy_common::header::{Command2, PrepareHeader, PrepareOkHeader, RequestHeader};
+use iggy_common::header::{
+    Command2, DoViewChangeHeader, PrepareHeader, PrepareOkHeader, RequestHeader,
+    StartViewChangeHeader, StartViewHeader,
+};
 use iggy_common::message::Message;
 use message_bus::IggyMessageBus;
 use std::cell::{Cell, RefCell};
@@ -338,6 +344,8 @@ pub enum VsrAction {
     },
     /// Send StartView to all backups (as new primary).
     SendStartView { view: u32, op: u64, commit: u64 },
+    /// Send PrepareOK to primary.
+    SendPrepareOk { view: u32, op: u64, target: u8 },
 }
 
 #[allow(unused)]
@@ -430,8 +438,15 @@ impl VsrConsensus {
         assert!(self.commit.get() >= commit);
     }
 
+    /// Maximum number of faulty replicas that can be tolerated.
+    /// For a cluster of 2f+1 replicas, this returns f.
+    pub fn max_faulty(&self) -> usize {
+        (self.replica_count as usize - 1) / 2
+    }
+
+    /// Quorum size = f + 1 = max_faulty + 1
     pub fn quorum(&self) -> usize {
-        (self.replica_count as usize / 2) + 1
+        self.max_faulty() + 1
     }
 
     pub fn commit(&self) -> u64 {
@@ -485,6 +500,458 @@ impl VsrConsensus {
 
     pub fn set_log_view(&self, log_view: u32) {
         self.log_view.set(log_view);
+    }
+
+    pub fn is_primary_for_view(&self, view: u32) -> bool {
+        self.primary_index(view) == self.replica
+    }
+
+    /// Count SVCs from OTHER replicas (excluding self).
+    fn svc_count_excluding_self(&self) -> usize {
+        let svc = self.start_view_change_from_all_replicas.borrow();
+        let total = svc.len();
+        if svc.contains(self.replica as usize) {
+            total.saturating_sub(1)
+        } else {
+            total
+        }
+    }
+
+    /// Reset SVC quorum tracking.
+    fn reset_svc_quorum(&self) {
+        self.start_view_change_from_all_replicas
+            .borrow_mut()
+            .clear();
+    }
+
+    /// Reset DVC quorum tracking.
+    fn reset_dvc_quorum(&self) {
+        dvc_reset(&mut self.do_view_change_from_all_replicas.borrow_mut());
+        self.do_view_change_quorum.set(false);
+    }
+
+    /// Reset all view change state for a new view.
+    fn reset_view_change_state(&self) {
+        self.reset_svc_quorum();
+        self.reset_dvc_quorum();
+        self.sent_own_start_view_change.set(false);
+        self.sent_own_do_view_change.set(false);
+    }
+
+    /// Process one tick. Call this periodically (e.g., every 10ms).
+    ///
+    /// Returns a list of actions to take based on fired timeouts.
+    /// Empty vec means no actions needed.
+    pub fn tick(&self, current_op: u64, current_commit: u64) -> Vec<VsrAction> {
+        let mut actions = Vec::new();
+        let mut timeouts = self.timeouts.borrow_mut();
+
+        // Phase 1: Tick all timeouts
+        timeouts.tick();
+
+        // Phase 2: Handle fired timeouts
+        if timeouts.fired(TimeoutKind::NormalHeartbeat) {
+            drop(timeouts);
+            actions.extend(self.handle_normal_heartbeat_timeout());
+            timeouts = self.timeouts.borrow_mut();
+        }
+
+        if timeouts.fired(TimeoutKind::StartViewChangeMessage) {
+            drop(timeouts);
+            actions.extend(self.handle_start_view_change_message_timeout());
+            timeouts = self.timeouts.borrow_mut();
+        }
+
+        if timeouts.fired(TimeoutKind::DoViewChangeMessage) {
+            drop(timeouts);
+            actions.extend(self.handle_do_view_change_message_timeout(current_op, current_commit));
+            timeouts = self.timeouts.borrow_mut();
+        }
+
+        if timeouts.fired(TimeoutKind::ViewChangeStatus) {
+            drop(timeouts);
+            actions.extend(self.handle_view_change_status_timeout());
+            // timeouts = self.timeouts.borrow_mut(); // Not needed if last
+        }
+
+        actions
+    }
+
+    /// Called when normal_heartbeat timeout fires.
+    /// Backup hasn't heard from primary - start view change.
+    fn handle_normal_heartbeat_timeout(&self) -> Vec<VsrAction> {
+        // Only backups trigger view change on heartbeat timeout
+        if self.is_primary() {
+            return Vec::new();
+        }
+
+        // Already in view change
+        if self.status.get() == Status::ViewChange {
+            return Vec::new();
+        }
+
+        // Advance to new view and transition to view change
+        let new_view = self.view.get() + 1;
+
+        self.view.set(new_view);
+        self.status.set(Status::ViewChange);
+        self.reset_view_change_state();
+        self.sent_own_start_view_change.set(true);
+        self.start_view_change_from_all_replicas
+            .borrow_mut()
+            .insert(self.replica as usize);
+
+        // Update timeouts for view change status
+        {
+            let mut timeouts = self.timeouts.borrow_mut();
+            timeouts.stop(TimeoutKind::NormalHeartbeat);
+            timeouts.start(TimeoutKind::StartViewChangeMessage);
+            timeouts.start(TimeoutKind::ViewChangeStatus);
+        }
+
+        vec![VsrAction::SendStartViewChange { view: new_view }]
+    }
+
+    /// Resend SVC message if we've started view change.
+    fn handle_start_view_change_message_timeout(&self) -> Vec<VsrAction> {
+        if !self.sent_own_start_view_change.get() {
+            return Vec::new();
+        }
+
+        self.timeouts
+            .borrow_mut()
+            .reset(TimeoutKind::StartViewChangeMessage);
+
+        vec![VsrAction::SendStartViewChange {
+            view: self.view.get(),
+        }]
+    }
+
+    /// Resend DVC message if we've sent one.
+    fn handle_do_view_change_message_timeout(
+        &self,
+        current_op: u64,
+        current_commit: u64,
+    ) -> Vec<VsrAction> {
+        if self.status.get() != Status::ViewChange {
+            return Vec::new();
+        }
+
+        if !self.sent_own_do_view_change.get() {
+            return Vec::new();
+        }
+
+        // If we're primary candidate with quorum, don't resend
+        if self.is_primary() && self.do_view_change_quorum.get() {
+            return Vec::new();
+        }
+
+        self.timeouts
+            .borrow_mut()
+            .reset(TimeoutKind::DoViewChangeMessage);
+
+        vec![VsrAction::SendDoViewChange {
+            view: self.view.get(),
+            target: self.primary_index(self.view.get()),
+            log_view: self.log_view.get(),
+            op: current_op,
+            commit: current_commit,
+        }]
+    }
+
+    /// Escalate to next view if stuck in view change.
+    fn handle_view_change_status_timeout(&self) -> Vec<VsrAction> {
+        if self.status.get() != Status::ViewChange {
+            return Vec::new();
+        }
+
+        // Escalate: try next view
+        let next_view = self.view.get() + 1;
+
+        self.view.set(next_view);
+        self.reset_view_change_state();
+        self.sent_own_start_view_change.set(true);
+        self.start_view_change_from_all_replicas
+            .borrow_mut()
+            .insert(self.replica as usize);
+
+        self.timeouts
+            .borrow_mut()
+            .reset(TimeoutKind::ViewChangeStatus);
+
+        vec![VsrAction::SendStartViewChange { view: next_view }]
+    }
+
+    /// Handle a received StartViewChange message.
+    ///
+    /// "When replica i receives STARTVIEWCHANGE messages for its view-number
+    /// from f OTHER replicas, it sends a DOVIEWCHANGE message to the node
+    /// that will be the primary in the new view."
+    pub fn handle_start_view_change(&self, header: &StartViewChangeHeader) -> Vec<VsrAction> {
+        let from_replica = header.replica;
+        let msg_view = header.view;
+
+        // Ignore SVCs for old views
+        if msg_view < self.view.get() {
+            return Vec::new();
+        }
+
+        let mut actions = Vec::new();
+
+        // If SVC is for a higher view, advance to that view
+        if msg_view > self.view.get() {
+            self.view.set(msg_view);
+            self.status.set(Status::ViewChange);
+            self.reset_view_change_state();
+            self.sent_own_start_view_change.set(true);
+            self.start_view_change_from_all_replicas
+                .borrow_mut()
+                .insert(self.replica as usize);
+
+            // Update timeouts
+            {
+                let mut timeouts = self.timeouts.borrow_mut();
+                timeouts.stop(TimeoutKind::NormalHeartbeat);
+                timeouts.start(TimeoutKind::StartViewChangeMessage);
+                timeouts.start(TimeoutKind::ViewChangeStatus);
+            }
+
+            // Send our own SVC
+            actions.push(VsrAction::SendStartViewChange { view: msg_view });
+        }
+
+        // Record the SVC from sender
+        self.start_view_change_from_all_replicas
+            .borrow_mut()
+            .insert(from_replica as usize);
+
+        // Check if we have f SVCs from OTHER replicas
+        // We need f SVCs from others to send DVC
+        if !self.sent_own_do_view_change.get()
+            && self.svc_count_excluding_self() >= self.max_faulty()
+        {
+            self.sent_own_do_view_change.set(true);
+
+            let primary_candidate = self.primary_index(self.view.get());
+            let current_op = self.sequencer.current_sequence();
+            let current_commit = self.commit.get();
+
+            // Start DVC timeout
+            self.timeouts
+                .borrow_mut()
+                .start(TimeoutKind::DoViewChangeMessage);
+
+            actions.push(VsrAction::SendDoViewChange {
+                view: self.view.get(),
+                target: primary_candidate,
+                log_view: self.log_view.get(),
+                op: current_op,
+                commit: current_commit,
+            });
+
+            // If we are the primary candidate, record our own DVC
+            if primary_candidate == self.replica {
+                let own_dvc = StoredDvc {
+                    replica: self.replica,
+                    log_view: self.log_view.get(),
+                    op: current_op,
+                    commit: current_commit,
+                };
+                dvc_record(
+                    &mut self.do_view_change_from_all_replicas.borrow_mut(),
+                    own_dvc,
+                );
+
+                // Check if we now have quorum
+                if dvc_count(&self.do_view_change_from_all_replicas.borrow()) >= self.quorum() {
+                    self.do_view_change_quorum.set(true);
+                    actions.extend(self.complete_view_change_as_primary());
+                }
+            }
+        }
+
+        actions
+    }
+
+    /// Handle a received DoViewChange message (only relevant for primary candidate).
+    ///
+    /// "When the new primary receives f + 1 DOVIEWCHANGE messages from different
+    /// replicas (including itself), it sets its view-number to that in the messages
+    /// and selects as the new log the one contained in the message with the largest v'..."
+    pub fn handle_do_view_change(&self, header: &DoViewChangeHeader) -> Vec<VsrAction> {
+        let from_replica = header.replica;
+        let msg_view = header.view;
+        let msg_log_view = header.log_view;
+        let msg_op = header.op;
+        let msg_commit = header.commit;
+
+        // Ignore DVCs for old views
+        if msg_view < self.view.get() {
+            return Vec::new();
+        }
+
+        let mut actions = Vec::new();
+
+        // If DVC is for a higher view, advance to that view
+        if msg_view > self.view.get() {
+            self.view.set(msg_view);
+            self.status.set(Status::ViewChange);
+            self.reset_view_change_state();
+            self.sent_own_start_view_change.set(true);
+            self.start_view_change_from_all_replicas
+                .borrow_mut()
+                .insert(self.replica as usize);
+
+            // Update timeouts
+            {
+                let mut timeouts = self.timeouts.borrow_mut();
+                timeouts.stop(TimeoutKind::NormalHeartbeat);
+                timeouts.start(TimeoutKind::StartViewChangeMessage);
+                timeouts.start(TimeoutKind::ViewChangeStatus);
+            }
+
+            // Send our own SVC
+            actions.push(VsrAction::SendStartViewChange { view: msg_view });
+        }
+
+        // Only the primary candidate processes DVCs for quorum
+        if !self.is_primary_for_view(self.view.get()) {
+            return actions;
+        }
+
+        // Must be in view change to process DVCs
+        if self.status.get() != Status::ViewChange {
+            return actions;
+        }
+
+        let current_op = self.sequencer.current_sequence();
+        let current_commit = self.commit.get();
+
+        // If we haven't sent our own DVC yet, record it
+        if !self.sent_own_do_view_change.get() {
+            self.sent_own_do_view_change.set(true);
+
+            let own_dvc = StoredDvc {
+                replica: self.replica,
+                log_view: self.log_view.get(),
+                op: current_op,
+                commit: current_commit,
+            };
+            dvc_record(
+                &mut self.do_view_change_from_all_replicas.borrow_mut(),
+                own_dvc,
+            );
+        }
+
+        // Record the received DVC
+        let dvc = StoredDvc {
+            replica: from_replica,
+            log_view: msg_log_view,
+            op: msg_op,
+            commit: msg_commit,
+        };
+        dvc_record(&mut self.do_view_change_from_all_replicas.borrow_mut(), dvc);
+
+        // Check if quorum achieved
+        if !self.do_view_change_quorum.get()
+            && dvc_count(&self.do_view_change_from_all_replicas.borrow()) >= self.quorum()
+        {
+            self.do_view_change_quorum.set(true);
+            actions.extend(self.complete_view_change_as_primary());
+        }
+
+        actions
+    }
+
+    /// Handle a received StartView message (backups only).
+    ///
+    /// "When other replicas receive the STARTVIEW message, they replace their log
+    /// with the one in the message, set their op-number to that of the latest entry
+    /// in the log, set their view-number to the view number in the message, change
+    /// their status to normal, and send PrepareOK for any uncommitted ops."
+    pub fn handle_start_view(&self, header: &StartViewHeader) -> Vec<VsrAction> {
+        let from_replica = header.replica;
+        let msg_view = header.view;
+        let msg_op = header.op;
+        let msg_commit = header.commit;
+
+        // Verify sender is the primary for this view
+        if self.primary_index(msg_view) != from_replica {
+            return Vec::new();
+        }
+
+        // Ignore old views
+        if msg_view < self.view.get() {
+            return Vec::new();
+        }
+
+        // We shouldn't process our own StartView
+        if from_replica == self.replica {
+            return Vec::new();
+        }
+
+        // Accept the StartView and transition to normal
+        self.view.set(msg_view);
+        self.log_view.set(msg_view);
+        self.status.set(Status::Normal);
+        self.advance_commit_number(msg_commit);
+        self.reset_view_change_state();
+
+        // Update our op to match the new primary's log
+        self.sequencer.set_sequence(msg_op);
+
+        // Update timeouts for normal backup operation
+        {
+            let mut timeouts = self.timeouts.borrow_mut();
+            timeouts.stop(TimeoutKind::ViewChangeStatus);
+            timeouts.stop(TimeoutKind::DoViewChangeMessage);
+            timeouts.stop(TimeoutKind::RequestStartViewMessage);
+            timeouts.start(TimeoutKind::NormalHeartbeat);
+        }
+
+        // Send PrepareOK for uncommitted ops (commit+1 to op)
+        let mut actions = Vec::new();
+        for op_num in (msg_commit + 1)..=msg_op {
+            actions.push(VsrAction::SendPrepareOk {
+                view: msg_view,
+                op: op_num,
+                target: from_replica, // Send to new primary
+            });
+        }
+
+        actions
+    }
+
+    /// Complete view change as the new primary after collecting DVC quorum.
+    fn complete_view_change_as_primary(&self) -> Vec<VsrAction> {
+        let dvc_array = self.do_view_change_from_all_replicas.borrow();
+
+        let Some(winner) = dvc_select_winner(&dvc_array) else {
+            return Vec::new();
+        };
+
+        let new_op = winner.op;
+        let max_commit = dvc_max_commit(&dvc_array);
+
+        // Update state
+        self.log_view.set(self.view.get());
+        self.status.set(Status::Normal);
+        self.advance_commit_number(max_commit);
+
+        // Update timeouts for normal primary operation
+        {
+            let mut timeouts = self.timeouts.borrow_mut();
+            timeouts.stop(TimeoutKind::ViewChangeStatus);
+            timeouts.stop(TimeoutKind::DoViewChangeMessage);
+            timeouts.stop(TimeoutKind::StartViewChangeMessage);
+            timeouts.start(TimeoutKind::CommitMessage);
+        }
+
+        vec![VsrAction::SendStartView {
+            view: self.view.get(),
+            op: new_op,
+            commit: max_commit,
+        }]
     }
 
     /// Handle a prepare_ok message from a follower.
