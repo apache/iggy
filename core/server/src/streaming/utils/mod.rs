@@ -21,3 +21,5 @@ pub mod crypto;
 pub mod file;
 pub mod ptr;
 pub mod random_id;
+
+pub mod aligned_buffer;
