@@ -137,6 +137,34 @@ impl Default for Topics {
     }
 }
 
+impl Topics {
+    /// Construct from pre-built entries with specific IDs.
+    pub fn from_entries(entries: impl IntoIterator<Item = (usize, topic::Topic)>) -> Self {
+        let entries: Vec<_> = entries.into_iter().collect();
+
+        let mut index = AHashMap::with_capacity(entries.len());
+        let mut root_entries = Vec::with_capacity(entries.len());
+        let mut auxilary_entries = Vec::with_capacity(entries.len());
+        let mut stats_entries = Vec::with_capacity(entries.len());
+
+        for (id, topic) in entries {
+            let (mut root, auxilary, stats) = topic.into_components();
+            root.update_id(id);
+            index.insert(root.key().clone(), id);
+            root_entries.push((id, root));
+            auxilary_entries.push((id, auxilary));
+            stats_entries.push((id, stats));
+        }
+
+        Self {
+            index: RefCell::new(index),
+            root: RefCell::new(root_entries.into_iter().collect()),
+            auxilaries: RefCell::new(auxilary_entries.into_iter().collect()),
+            stats: RefCell::new(stats_entries.into_iter().collect()),
+        }
+    }
+}
+
 impl EntityComponentSystem<InteriorMutability> for Topics {
     type Idx = ContainerId;
     type Entity = topic::Topic;

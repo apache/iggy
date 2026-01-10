@@ -142,9 +142,9 @@ impl ServerCommandHandler for CreateTopic {
                             command: self
                         }))
                         .await
-                        .with_error(|error| {
+                        .error(|e: &IggyError| {
                             format!(
-                                "{COMPONENT} (error: {error}) - failed to apply create topic for stream_id: {stream_id_num}, topic_id: {topic_id:?}"
+                                "{COMPONENT} (error: {e}) - failed to apply create topic for stream_id: {stream_id_num}, topic_id: {topic_id:?}"
                             )
                         })?;
                     sender.send_ok_response(&response).await?;
@@ -177,9 +177,9 @@ impl ServerCommandHandler for CreateTopic {
                             command: self
                         }))
                         .await
-                        .with_error(|error| {
+                        .error(|e: &IggyError| {
                             format!(
-                                "{COMPONENT} (error: {error}) - failed to apply create topic for stream_id: {stream_id}, topic_id: {topic_id:?}"
+                                "{COMPONENT} (error: {e}) - failed to apply create topic for stream_id: {stream_id}, topic_id: {topic_id:?}"
                             )
                         })?;
 

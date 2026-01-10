@@ -157,8 +157,8 @@ where
     let BufResult(result, buffer) = stream.read_exact(buffer).await;
     match (result, buffer) {
         (Ok(_), buffer) => (Ok(()), buffer),
-        (Err(error), buffer) => {
-            if error.kind() == std::io::ErrorKind::UnexpectedEof {
+        (Err(e), buffer) => {
+            if e.kind() == std::io::ErrorKind::UnexpectedEof {
                 (Err(IggyError::ConnectionClosed), buffer)
             } else {
                 (Err(IggyError::TcpError), buffer)

@@ -57,14 +57,14 @@ impl TokenStorage {
 
         let buffer = compio::fs::read(&self.path)
             .await
-            .with_error(|error| {
+            .error(|e: &std::io::Error| {
                 format!(
-                    "{COMPONENT} (error: {error}) - failed to read file into buffer, path: {}",
+                    "{COMPONENT} (error: {e}) - failed to read file into buffer, path: {}",
                     self.path
                 )
             })
-            .map_err(|error| {
-                error!("Cannot open revoked access tokens file: {error}");
+            .map_err(|e| {
+                error!("Cannot open revoked access tokens file: {e}");
                 IggyError::CannotReadFile
             })?;
 
@@ -76,11 +76,9 @@ impl TokenStorage {
             return Err(IggyError::CannotReadFile);
         }
 
-        let tokens: AHashMap<String, u64> =
-            bincode::serde::decode_from_slice(&buffer, bincode::config::standard())
-                .with_context(|| "Failed to deserialize revoked access tokens")
-                .map_err(|_| IggyError::CannotDeserializeResource)?
-                .0;
+        let tokens: AHashMap<String, u64> = rmp_serde::from_slice(&buffer)
+            .with_context(|| "Failed to deserialize revoked access tokens")
+            .map_err(|_| IggyError::CannotDeserializeResource)?;
 
         let tokens = tokens
             .into_iter()
@@ -101,15 +99,15 @@ impl TokenStorage {
             .map(|token| (token.id, token.expiry))
             .collect::<AHashMap<_, _>>();
         map.insert(token.id.to_owned(), token.expiry);
-        let bytes = bincode::serde::encode_to_vec(&map, bincode::config::standard())
+        let bytes = rmp_serde::to_vec(&map)
             .with_context(|| "Failed to serialize revoked access tokens")
             .map_err(|_| IggyError::CannotSerializeResource)?;
         self.persister
             .overwrite(&self.path, bytes)
             .await
-            .with_error(|error| {
+            .error(|e: &IggyError| {
                 format!(
-                    "{COMPONENT} (error: {error}) - failed to overwrite file, path: {}",
+                    "{COMPONENT} (error: {e}) - failed to overwrite file, path: {}",
                     self.path
                 )
             })?;
@@ -120,8 +118,8 @@ impl TokenStorage {
         let tokens = self
             .load_all_revoked_access_tokens()
             .await
-            .with_error(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to load revoked access tokens")
+            .error(|e: &IggyError| {
+                format!("{COMPONENT} (error: {e}) - failed to load revoked access tokens")
             })?;
         if tokens.is_empty() {
             return Ok(());
@@ -135,15 +133,15 @@ impl TokenStorage {
             map.remove(id);
         }
 
-        let bytes = bincode::serde::encode_to_vec(&map, bincode::config::standard())
+        let bytes = rmp_serde::to_vec(&map)
             .with_context(|| "Failed to serialize revoked access tokens")
             .map_err(|_| IggyError::CannotSerializeResource)?;
         self.persister
             .overwrite(&self.path, bytes)
             .await
-            .with_error(|error| {
+            .error(|e: &IggyError| {
                 format!(
-                    "{COMPONENT} (error: {error}) - failed to overwrite file, path: {}",
+                    "{COMPONENT} (error: {e}) - failed to overwrite file, path: {}",
                     self.path
                 )
             })?;

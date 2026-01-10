@@ -121,13 +121,11 @@ pub(crate) async fn handle_connection(
                         "Command with code {cmd_code} was not handled successfully, session: {session}, error: {error}."
                     );
 
-                    if let IggyError::ClientNotFound(_) = error {
-                        sender.send_error_response(error).await?;
+                    if matches!(error, IggyError::ClientNotFound(_) | IggyError::StaleClient) {
+                        sender.send_error_response(error.clone()).await?;
                         debug!("TCP error response was sent to: {session}.");
                         error!("Session: {session} will be deleted.");
-                        return Err(ConnectionError::from(IggyError::ClientNotFound(
-                            session.client_id,
-                        )));
+                        return Err(ConnectionError::from(error));
                     } else {
                         sender.send_error_response(error).await?;
                         debug!("TCP error response was sent to: {session}.");
@@ -140,7 +138,7 @@ pub(crate) async fn handle_connection(
 
 pub(crate) fn handle_error(error: ConnectionError) {
     match error {
-        ConnectionError::IoError(error) => match error.kind() {
+        ConnectionError::IoError(e) => match e.kind() {
             ErrorKind::UnexpectedEof => {
                 info!("Connection has been closed.");
             }
@@ -154,7 +152,7 @@ pub(crate) fn handle_error(error: ConnectionError) {
                 info!("Connection has been reset.");
             }
             _ => {
-                error!("Connection has failed: {error}");
+                error!("Connection has failed: {e}");
             }
         },
         ConnectionError::SdkError(sdk_error) => match sdk_error {

@@ -20,4 +20,8 @@
 
 import Debug from 'debug';
 
+/**
+ * Debug logger for the Iggy client.
+ * Enable with DEBUG=iggy:client environment variable.
+ */
 export const debug = Debug('iggy:client');

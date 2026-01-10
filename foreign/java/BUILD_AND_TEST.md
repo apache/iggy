@@ -31,23 +31,23 @@ READ the README.md and start iggy-server as prescribed there.
 cd iggy/foreign/java/java-sdk
 
 # Clean previous builds
-../gradlew clean
+gradle clean
 
 # Build without running tests
-../gradlew build -x test
+gradle build -x test
 
 # Or build with tests (skip checkstyle)
-../gradlew build -x checkstyleMain -x checkstyleTest
+gradle build -x checkstyleMain -x checkstyleTest
 ```
 
 ### 2. Compile Only
 
 ```bash
 # Compile main source code
-../gradlew compileJava
+gradle compileJava
 
 # Compile test code
-../gradlew compileTestJava
+gradle compileTestJava
 ```
 
 ## Running Tests
@@ -56,24 +56,24 @@ cd iggy/foreign/java/java-sdk
 
 ```bash
 # Run all tests (skip checkstyle)
-../gradlew test -x checkstyleMain -x checkstyleTest
+gradle test -x checkstyleMain -x checkstyleTest
 ```
 
 ### 2. Run Specific Test Class
 
 ```bash
 # Run AsyncPollMessageTest specifically
-../gradlew test --tests AsyncPollMessageTest -x checkstyleMain -x checkstyleTest
+gradle test --tests AsyncPollMessageTest -x checkstyleMain -x checkstyleTest
 
 # Run with detailed output
-../gradlew test --tests AsyncPollMessageTest --info -x checkstyleMain -x checkstyleTest
+gradle test --tests AsyncPollMessageTest --info -x checkstyleMain -x checkstyleTest
 ```
 
 ### 3. Run Test Suite by Package
 
 ```bash
 # Run all async client tests
-../gradlew test --tests "org.apache.iggy.client.async.*" -x checkstyleMain -x checkstyleTest
+gradle test --tests "org.apache.iggy.client.async.*" -x checkstyleMain -x checkstyleTest
 ```
 
 ### 4. View Test Results
@@ -103,7 +103,7 @@ This test validates the async client's polling functionality and demonstrates im
 ```bash
 # Run with full output
 cd iggy/foreign/java/java-sdk
-../gradlew test --tests AsyncPollMessageTest -x checkstyleMain -x checkstyleTest --info
+gradle test --tests AsyncPollMessageTest -x checkstyleMain -x checkstyleTest --info
 ```
 
 Expected output:
@@ -220,17 +220,17 @@ vim src/main/java/org/apache/iggy/client/async/...
 ### 2. Compile
 
 ```bash
-../gradlew compileJava
+gradle compileJava
 ```
 
 ### 3. Test
 
 ```bash
 # Run specific test
-../gradlew test --tests AsyncPollMessageTest -x checkstyleMain -x checkstyleTest
+gradle test --tests AsyncPollMessageTest -x checkstyleMain -x checkstyleTest
 
 # Or run all async tests
-../gradlew test --tests "org.apache.iggy.client.async.*" -x checkstyleMain -x checkstyleTest
+gradle test --tests "org.apache.iggy.client.async.*" -x checkstyleMain -x checkstyleTest
 ```
 
 ### 4. View Results
@@ -261,19 +261,19 @@ When contributing changes:
 1. **Always compile after changes**
 
    ```bash
-   ../gradlew compileJava compileTestJava
+   gradle compileJava compileTestJava
    ```
 
 2. **Run relevant tests**
 
    ```bash
-   ../gradlew test --tests "*Test" -x checkstyleMain -x checkstyleTest
+   gradle test --tests "*Test" -x checkstyleMain -x checkstyleTest
    ```
 
 3. **Check for warnings**
 
    ```bash
-   ../gradlew build 2>&1 | grep -i warning
+   gradle build 2>&1 | grep -i warning
    ```
 
 4. **Clean up test files**

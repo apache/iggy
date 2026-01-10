@@ -37,7 +37,7 @@ impl IggyShard {
         let consumer_groups: Vec<(u32, u32, u32)>;
 
         {
-            let client = self.client_manager.delete_client(client_id);
+            let client = self.client_manager.try_get_client(client_id);
             if client.is_none() {
                 error!("Client with ID: {client_id} was not found in the client manager.",);
                 return;
@@ -65,6 +65,7 @@ impl IggyShard {
                 client_id,
             )
         }
+        self.client_manager.delete_client(client_id);
     }
 
     pub fn get_client(
@@ -76,9 +77,9 @@ impl IggyShard {
         self.permissioner
         .borrow()
             .get_client(session.get_user_id())
-            .with_error(|error| {
+            .error(|e: &IggyError| {
                 format!(
-                    "{COMPONENT} (error: {error}) - permission denied to get client with ID: {client_id} by user ID: {}",
+                    "{COMPONENT} (error: {e}) - permission denied to get client with ID: {client_id} by user ID: {}",
                     session.get_user_id()
                 )
             })?;
@@ -91,9 +92,9 @@ impl IggyShard {
         self.permissioner
             .borrow()
             .get_clients(session.get_user_id())
-            .with_error(|error| {
+            .error(|e: &IggyError| {
                 format!(
-                    "{COMPONENT} (error: {error}) - failed to get clients by user ID {}",
+                    "{COMPONENT} (error: {e}) - failed to get clients by user ID {}",
                     session.get_user_id()
                 )
             })?;

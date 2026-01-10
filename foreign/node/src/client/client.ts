@@ -25,7 +25,12 @@ import { CommandAPI } from '../wire/command-set.js';
 import { debug } from './client.debug.js';
 
 
-// create & destroy must be async
+/**
+ * Creates a pool factory for managing RawClient instances.
+ *
+ * @param config - Client configuration
+ * @returns Pool factory with create and destroy methods
+ */
 const createPoolFactory = (config: ClientConfig) => ({
   create: async function () {
     return getRawClient(config);
@@ -35,6 +40,13 @@ const createPoolFactory = (config: ClientConfig) => ({
   }
 });
 
+/**
+ * Creates a client provider that uses connection pooling.
+ * Automatically acquires and releases clients from the pool.
+ *
+ * @param config - Client configuration including pool size options
+ * @returns Client provider function with attached pool reference
+ */
 const poolClientProvider = (config: ClientConfig) => {
   const min = config.poolSize?.min || 1;
   const max = config.poolSize?.max || 4;
@@ -53,10 +65,21 @@ const poolClientProvider = (config: ClientConfig) => {
 };
 
 
+/**
+ * Iggy client with connection pooling support.
+ * Manages a pool of connections for efficient resource utilization.
+ */
 export class Client extends CommandAPI {
+  /** Client configuration */
   _config: ClientConfig
+  /** Connection pool instance */
   _pool: Pool<RawClient>
 
+  /**
+   * Creates a new pooled client.
+   *
+   * @param config - Client configuration
+   */
   constructor(config: ClientConfig) {
     const pcp = poolClientProvider(config);
     super(pcp);
@@ -64,6 +87,9 @@ export class Client extends CommandAPI {
     this._pool = pcp._pool;
   };
 
+  /**
+   * Destroys the client and drains all connections from the pool.
+   */
   async destroy() {
     debug('destroying client pool. pool size is', this._pool.size);
     await this._pool.drain();
@@ -72,6 +98,12 @@ export class Client extends CommandAPI {
   }
 }
 
+/**
+ * Creates a client provider that reuses a single connection.
+ *
+ * @param config - Client configuration
+ * @returns Client provider function that always returns the same client
+ */
 const singleClientProvider = (config: ClientConfig) => {
   const c = getRawClient(config);
   return async function singleClientProvider() {
@@ -79,14 +111,27 @@ const singleClientProvider = (config: ClientConfig) => {
   }
 }
 
+/**
+ * Iggy client that uses a single persistent connection.
+ * Suitable for applications that don't need connection pooling.
+ */
 export class SingleClient extends CommandAPI {
+  /** Client configuration */
   _config: ClientConfig
 
+  /**
+   * Creates a new single-connection client.
+   *
+   * @param config - Client configuration
+   */
   constructor(config: ClientConfig) {
     super(singleClientProvider(config));
     this._config = config;
   }
 
+  /**
+   * Destroys the client connection.
+   */
   async destroy() {
     const s = await this.clientProvider();
     s.destroy();
@@ -94,11 +139,23 @@ export class SingleClient extends CommandAPI {
 };
 
 
+/**
+ * Simple Iggy client wrapper around an existing RawClient.
+ * Useful when you already have a RawClient instance.
+ */
 export class SimpleClient extends CommandAPI {
+  /**
+   * Creates a new simple client from an existing RawClient.
+   *
+   * @param client - Existing RawClient instance
+   */
   constructor(client: RawClient) {
     super(() => Promise.resolve(client));
   }
 
+  /**
+   * Destroys the underlying client connection.
+   */
   async destroy() {
     const s = await this.clientProvider();
     s.destroy();
@@ -106,6 +163,13 @@ export class SimpleClient extends CommandAPI {
 
 };
 
+/**
+ * Creates a SimpleClient with the given configuration.
+ * Convenience function for quickly creating a client.
+ *
+ * @param config - Client configuration
+ * @returns SimpleClient instance
+ */
 export const getClient = async (config: ClientConfig) => {
   const cli = getRawClient(config);
   return new SimpleClient(cli);

@@ -19,6 +19,5 @@
 pub mod address;
 pub mod crypto;
 pub mod file;
-pub mod hash;
 pub mod ptr;
 pub mod random_id;

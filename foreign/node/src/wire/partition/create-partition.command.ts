@@ -24,12 +24,22 @@ import { deserializeVoidResponse } from '../../client/client.utils.js';
 import type { Id } from '../identifier.utils.js';
 import { serializePartitionParams } from './partition.utils.js';
 
+/**
+ * Parameters for the create partition command.
+ */
 export type CreatePartition = {
+  /** Stream identifier (ID or name) */
   streamId: Id,
+  /** Topic identifier (ID or name) */
   topicId: Id,
+  /** Number of partitions to create (1-1000, default: 1) */
   partitionCount?: number
 };
 
+/**
+ * Create partition command definition.
+ * Adds new partitions to a topic.
+ */
 export const CREATE_PARTITION = {
   code: COMMAND_CODE.CreatePartitions,
 
@@ -41,4 +51,7 @@ export const CREATE_PARTITION = {
 };
 
 
+/**
+ * Executable create partition command function.
+ */
 export const createPartition = wrapCommand<CreatePartition, boolean>(CREATE_PARTITION);

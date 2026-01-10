@@ -21,19 +21,41 @@ import { toDate } from "../serialize.utils.js";
 import { u128LEBufToBigint } from "../number.utils.js";
 
 
+/**
+ * Iggy message header containing metadata for each message.
+ */
 export type IggyMessageHeader = {
+  /** Message checksum for integrity verification */
   checksum: bigint,
-  id: string | BigInt,
+  /** Unique message identifier (UUID or numeric) */
+  id: string | bigint,
+  /** Message offset within the partition */
   offset: bigint,
+  /** Server-assigned timestamp */
   timestamp: Date,
+  /** Client-provided origin timestamp */
   originTimestamp: Date,
+  /** Length of user-defined headers in bytes */
   userHeadersLength: number,
+  /** Length of message payload in bytes */
   payloadLength: number
 };
 
-// u64 + u128 + u64 + u64 + u64 + u32 + u32
+/**
+ * Size of the Iggy message header in bytes.
+ * Layout: u64 (checksum) + u128 (id) + u64 (offset) + u64 (timestamp) + u64 (originTimestamp) + u32 (userHeadersLength) + u32 (payloadLength)
+ */
 export const IGGY_MESSAGE_HEADER_SIZE = 8 + 16 + 8 + 8 + 8 + 4 + 4;
 
+/**
+ * Serializes an Iggy message header to wire format.
+ * Sets checksum, offset, and timestamp to zero (filled by server).
+ *
+ * @param id - Message ID as 16-byte buffer
+ * @param payload - Message payload
+ * @param userHeaders - Serialized user headers
+ * @returns Serialized header buffer
+ */
 export const serializeIggyMessageHeader = (
   id: Buffer,
   payload: Buffer,
@@ -50,8 +72,21 @@ export const serializeIggyMessageHeader = (
   return b;
 };
 
+/**
+ * Deserializes a message ID from a 16-byte buffer to BigInt.
+ *
+ * @param b - 16-byte buffer containing the message ID
+ * @returns Message ID as BigInt
+ */
 export const deserialiseMessageId = (b: Buffer) => u128LEBufToBigint(b);
 
+/**
+ * Deserializes Iggy message headers from a buffer.
+ *
+ * @param b - Buffer containing the serialized header
+ * @returns Parsed IggyMessageHeader object
+ * @throws Error if buffer length doesn't match expected header size
+ */
 export const deserializeIggyMessageHeaders = (b: Buffer) => {
   if(b.length !== IGGY_MESSAGE_HEADER_SIZE)
     throw new Error(

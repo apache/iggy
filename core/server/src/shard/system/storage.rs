@@ -50,9 +50,9 @@ impl FileSystemInfoStorage {
         let file_size = file
             .metadata()
             .await
-            .with_error(|error| {
+            .error(|e: &std::io::Error| {
                 format!(
-                    "{COMPONENT} (error: {error}) - failed to retrieve metadata for file at path: {}",
+                    "{COMPONENT} (error: {e}) - failed to retrieve metadata for file at path: {}",
                     self.path
                 )
             })
@@ -68,30 +68,29 @@ impl FileSystemInfoStorage {
             .await
             .into();
         result
-            .with_error(|error| {
+            .error(|e: &std::io::Error| {
                 format!(
-                    "{COMPONENT} Failed to read system info from file at path: {} (error: {error})",
+                    "{COMPONENT} Failed to read system info from file at path: {} (error: {e})",
                     self.path
                 )
             })
             .map_err(|_| IggyError::CannotReadFile)?;
-        let (system_info, _) =
-            bincode::serde::decode_from_slice(&buffer, bincode::config::standard())
-                .with_context(|| "Failed to deserialize system info")
-                .map_err(|_| IggyError::CannotDeserializeResource)?;
+        let system_info = rmp_serde::from_slice(&buffer)
+            .with_context(|| "Failed to deserialize system info")
+            .map_err(|_| IggyError::CannotDeserializeResource)?;
         Ok(system_info)
     }
 
     pub async fn save(&self, system_info: &SystemInfo) -> Result<(), IggyError> {
-        let data = bincode::serde::encode_to_vec(system_info, bincode::config::standard())
+        let data = rmp_serde::to_vec(system_info)
             .with_context(|| "Failed to serialize system info")
             .map_err(|_| IggyError::CannotSerializeResource)?;
         self.persister
             .overwrite(&self.path, data)
             .await
-            .with_error(|error| {
+            .error(|e: &IggyError| {
                 format!(
-                    "{COMPONENT} (error: {error}) - failed to overwrite file at path: {}",
+                    "{COMPONENT} (error: {e}) - failed to overwrite file at path: {}",
                     self.path
                 )
             })?;

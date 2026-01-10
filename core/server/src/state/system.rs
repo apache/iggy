@@ -20,7 +20,6 @@ use crate::bootstrap::create_root_user;
 use crate::state::file::FileState;
 use crate::state::models::CreateUserWithId;
 use crate::state::{COMPONENT, EntryCommand, StateEntry};
-use crate::streaming::personal_access_tokens::personal_access_token::PersonalAccessToken;
 use ahash::AHashMap;
 use err_trail::ErrContext;
 use iggy_common::CompressionAlgorithm;
@@ -28,6 +27,7 @@ use iggy_common::IggyError;
 use iggy_common::IggyExpiry;
 use iggy_common::IggyTimestamp;
 use iggy_common::MaxTopicSize;
+use iggy_common::PersonalAccessToken;
 use iggy_common::create_user::CreateUser;
 use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
 use iggy_common::{IdKind, Identifier, Permissions, UserStatus};
@@ -100,8 +100,8 @@ pub struct ConsumerGroupState {
 
 impl SystemState {
     pub async fn load(state: FileState) -> Result<Self, IggyError> {
-        let mut state_entries = state.init().await.with_error(|error| {
-            format!("{COMPONENT} (error: {error}) - failed to initialize state entries")
+        let mut state_entries = state.init().await.error(|e: &IggyError| {
+            format!("{COMPONENT} (error: {e}) - failed to initialize state entries")
         })?;
 
         // Create root user if does not exist.
@@ -132,19 +132,19 @@ impl SystemState {
                     command
                 }))
                 .await
-                .with_error(|error| {
+                .error(|e: &IggyError| {
                     format!(
-                        "{COMPONENT} (error: {error}) - failed to apply create user command, username: {}",
+                        "{COMPONENT} (error: {e}) - failed to apply create user command, username: {}",
                         root.username
                     )
                 })?;
-            state_entries = state.init().await.with_error(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to initialize state entries")
+            state_entries = state.init().await.error(|e: &IggyError| {
+                format!("{COMPONENT} (error: {e}) - failed to initialize state entries")
             })?;
         }
 
-        let system_state = Self::init(state_entries).await.with_error(|error| {
-            format!("{COMPONENT} (error: {error}) - failed to initialize system state")
+        let system_state = Self::init(state_entries).await.error(|e: &IggyError| {
+            format!("{COMPONENT} (error: {e}) - failed to initialize system state")
         })?;
         Ok(system_state)
     }
@@ -154,9 +154,9 @@ impl SystemState {
         let mut users = AHashMap::new();
         for entry in entries {
             debug!("Processing state entry: {entry}",);
-            match entry.command().with_error(|error| {
+            match entry.command().error(|e: &IggyError| {
                 format!(
-                    "{COMPONENT} (error: {error}) - failed to retrieve state entry command: {entry}"
+                    "{COMPONENT} (error: {e}) - failed to retrieve state entry command: {entry}"
                 )
             })? {
                 EntryCommand::CreateStream(command) => {
@@ -421,9 +421,9 @@ impl SystemState {
                     let token_hash = command.hash;
                     let user_id = find_user_id(
                         &users,
-                        &entry.user_id.try_into().with_error(|error| {
+                        &entry.user_id.try_into().error(|e: &IggyError| {
                             format!(
-                                "{COMPONENT} (error: {error}) - failed to find user, user ID: {}",
+                                "{COMPONENT} (error: {e}) - failed to find user, user ID: {}",
                                 entry.user_id
                             )
                         })?,
@@ -454,9 +454,9 @@ impl SystemState {
                 EntryCommand::DeletePersonalAccessToken(command) => {
                     let user_id = find_user_id(
                         &users,
-                        &entry.user_id.try_into().with_error(|error| {
+                        &entry.user_id.try_into().error(|e: &IggyError| {
                             format!(
-                                "{COMPONENT} (error: {error}) - failed to find user, user ID: {}",
+                                "{COMPONENT} (error: {e}) - failed to find user, user ID: {}",
                                 entry.user_id
                             )
                         })?,

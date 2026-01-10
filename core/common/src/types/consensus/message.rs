@@ -89,24 +89,25 @@ where
         }
     }
 
-    /// Replace the header with a new one, using the provided function to generate it.
-    pub fn replace_header<T: ConsensusHeader>(self, f: impl FnOnce(&H) -> T) -> Message<T> {
+    /// Transmute the header to a different type, using the provided function to modify the new header.
+    pub fn transmute_header<T: ConsensusHeader>(self, f: impl FnOnce(H, &mut T)) -> Message<T> {
         assert_eq!(size_of::<H>(), size_of::<T>());
-        let prev = self.header();
-        let header = f(prev);
 
-        let header_bytes = bytemuck::bytes_of(&header);
-        let buffer = self.into_inner();
+        // Copy old header to stack to avoid UB.
+        let old_header = *self.header();
+
         // Safety: We ensured that size_of::<H>() == size_of::<T>()
         // On top of that, there is going to be only one reference to buffer during this function call
         // so no other references can observe the mutation.
         // In the future we can replace the `Bytes` buffer with something that does not allow sharing between different threads.
+        let buffer = self.into_inner();
         unsafe {
             let ptr = buffer.as_ptr() as *mut u8;
-            let slice = std::slice::from_raw_parts_mut(ptr, buffer.len());
-            slice[..size_of::<H>()].copy_from_slice(header_bytes);
+            let slice = std::slice::from_raw_parts_mut(ptr, size_of::<T>());
+            let new_header = bytemuck::from_bytes_mut(slice);
+            f(old_header, new_header);
         }
-        // TODO: Recalculate checksums
+
         Message {
             buffer,
             _marker: PhantomData,

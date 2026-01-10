@@ -72,9 +72,9 @@ impl IggyShard {
         self.permissioner
             .borrow()
             .update_stream(session.get_user_id(), id)
-            .with_error(|error| {
+            .error(|e: &IggyError| {
                 format!(
-                    "{COMPONENT} (error: {error}) - failed to update stream, user ID: {}, stream ID: {}",
+                    "{COMPONENT} (error: {e}) - failed to update stream, user ID: {}, stream ID: {}",
                     session.get_user_id(),
                     stream_id
                 )
@@ -137,9 +137,9 @@ impl IggyShard {
         self.permissioner
             .borrow()
             .delete_stream(session.get_user_id(), stream_id)
-            .with_error(|error| {
+            .error(|e: &IggyError| {
                 format!(
-                    "{COMPONENT} (error: {error}) - permission denied to delete stream for user {}, stream ID: {}",
+                    "{COMPONENT} (error: {e}) - permission denied to delete stream for user {}, stream ID: {}",
                     session.get_user_id(),
                     stream_id,
                 )
@@ -186,9 +186,9 @@ impl IggyShard {
             self.permissioner
                 .borrow()
                 .purge_stream(session.get_user_id(), stream_id)
-                .with_error(|error| {
+                .error(|e: &IggyError| {
                 format!(
-                    "{COMPONENT} (error: {error}) - permission denied to purge stream for user {}, stream ID: {}",
+                    "{COMPONENT} (error: {e}) - permission denied to purge stream for user {}, stream ID: {}",
                     session.get_user_id(),
                     stream_id,
                 )

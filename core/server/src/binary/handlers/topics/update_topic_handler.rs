@@ -132,8 +132,8 @@ impl ServerCommandHandler for UpdateTopic {
                         .state
                         .apply(session.get_user_id(), &EntryCommand::UpdateTopic(self))
                         .await
-                        .with_error(|error| format!(
-                            "{COMPONENT} (error: {error}) - failed to apply update topic with id: {topic_id} in stream with ID: {stream_id_num}, session: {session}"
+                        .error(|e: &IggyError| format!(
+                            "{COMPONENT} (error: {e}) - failed to apply update topic with id: {topic_id} in stream with ID: {stream_id_num}, session: {session}"
                         ))?;
                     sender.send_empty_ok_response().await?;
                 } else {
@@ -152,8 +152,8 @@ impl ServerCommandHandler for UpdateTopic {
                         .state
                         .apply(session.get_user_id(), &EntryCommand::UpdateTopic(self))
                         .await
-                        .with_error(|error| format!(
-                            "{COMPONENT} (error: {error}) - failed to apply update topic in stream with ID: {stream_id}, session: {session}"
+                        .error(|e: &IggyError| format!(
+                            "{COMPONENT} (error: {e}) - failed to apply update topic in stream with ID: {stream_id}, session: {session}"
                         ))?;
 
                     sender.send_empty_ok_response().await?;

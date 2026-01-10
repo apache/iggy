@@ -18,11 +18,19 @@
  */
 
 
-import { Id } from '../identifier.utils.js';
-import { ClientProvider } from '../../client/index.js';
+import type { Id } from '../identifier.utils.js';
+import type { ClientProvider } from '../../client/index.js';
 import { createTopic } from './create-topic.command.js';
 import { getTopic } from './get-topic.command.js';
 
+
+/**
+ * Creates a virtual command that ensures a topic exists.
+ * If the topic does not exist, it will be created with default settings.
+ *
+ * @param c - Client provider function
+ * @returns Function that ensures a topic exists by name
+ */
 export const ensureTopic = (c: ClientProvider) =>
   async function ensureTopic(
     streamId: Id,
