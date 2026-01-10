@@ -50,6 +50,9 @@ classifiers = [
     "Topic :: System :: Networking",
     "Topic :: System :: Distributed Computing",
 ]
+dependencies = [
+    "maturin[patchelf]>=1.10.2",
+]
 
 [project.urls]
 "Homepage" = "https://iggy.apache.org"
