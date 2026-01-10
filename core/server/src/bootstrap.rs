@@ -212,7 +212,7 @@ pub fn load_users(state: impl IntoIterator<Item = UserState>) -> Users {
             .into_values()
             .map(|token| {
                 (
-                    Arc::new(token.token_hash.clone()),
+                    Arc::from(token.token_hash.as_str()),
                     PersonalAccessToken::raw(id, &token.name, &token.token_hash, token.expiry_at),
                 )
             })
