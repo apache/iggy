@@ -365,7 +365,7 @@ where
 
         let message: Message<PrepareOkHeader> =
             Message::<PrepareOkHeader>::new(std::mem::size_of::<PrepareOkHeader>())
-                .replace_header(|_prev: &PrepareOkHeader| prepare_ok_header);
+                .transmute_header(|_, new| *new = prepare_ok_header);
         let generic_message = message.into_generic();
         let primary = self.consensus.primary_index(self.consensus.view());
 

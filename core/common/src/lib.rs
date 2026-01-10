@@ -17,6 +17,7 @@
 
 mod alloc;
 mod certificates;
+pub mod collections;
 mod commands;
 mod configs;
 mod error;
@@ -88,6 +89,7 @@ pub use types::message::*;
 pub use types::partition::*;
 pub use types::permissions::permissions_global::*;
 pub use types::permissions::personal_access_token::*;
+pub use types::personal_access_tokens::*;
 pub use types::snapshot::*;
 pub use types::stats::*;
 pub use types::stream::*;
@@ -100,6 +102,7 @@ pub use utils::checksum::*;
 pub use utils::crypto::*;
 pub use utils::duration::{IggyDuration, SEC_IN_MICRO};
 pub use utils::expiry::IggyExpiry;
+pub use utils::hash::*;
 pub use utils::personal_access_token_expiry::PersonalAccessTokenExpiry;
 pub use utils::text;
 pub use utils::timestamp::*;

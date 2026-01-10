@@ -16,4 +16,12 @@
  * under the License.
  */
 
-pub mod personal_access_token;
+mod consumer_groups;
+pub mod consumer_offsets;
+mod messages;
+mod partitions;
+mod segments;
+mod streams;
+mod system;
+mod topics;
+mod users;

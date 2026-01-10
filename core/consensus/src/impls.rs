@@ -513,22 +513,22 @@ impl Project<Message<PrepareHeader>> for Message<RequestHeader> {
     fn project(self, consensus: &Self::Consensus) -> Message<PrepareHeader> {
         let op = consensus.sequencer.current_sequence() + 1;
 
-        self.replace_header(|prev| {
-            PrepareHeader {
+        self.transmute_header(|old, new| {
+            *new = PrepareHeader {
                 cluster: consensus.cluster,
-                size: prev.size,
+                size: old.size,
                 epoch: 0,
                 view: consensus.view.get(),
-                release: prev.release,
+                release: old.release,
                 command: Command2::Prepare,
                 replica: consensus.replica,
                 parent: 0, // TODO: Get parent checksum from the previous entry in the journal (figure out how to pass that ctx here)
-                request_checksum: prev.request_checksum,
-                request: prev.request,
+                request_checksum: old.request_checksum,
+                request: old.request,
                 commit: consensus.commit.get(),
                 op,
                 timestamp: 0, // 0 for now. Implement correct way to get timestamp later
-                operation: prev.operation,
+                operation: old.operation,
                 ..Default::default()
             }
         })
@@ -537,25 +537,26 @@ impl Project<Message<PrepareHeader>> for Message<RequestHeader> {
 
 impl Project<Message<PrepareOkHeader>> for Message<PrepareHeader> {
     type Consensus = VsrConsensus;
+
     fn project(self, consensus: &Self::Consensus) -> Message<PrepareOkHeader> {
-        self.replace_header(|prev| {
-            PrepareOkHeader {
+        self.transmute_header(|old, new| {
+            *new = PrepareOkHeader {
                 command: Command2::PrepareOk,
-                parent: prev.parent,
-                prepare_checksum: prev.checksum,
-                request: prev.request,
+                parent: old.parent,
+                prepare_checksum: old.checksum,
+                request: old.request,
                 cluster: consensus.cluster,
                 replica: consensus.replica,
                 epoch: 0, // TODO: consensus.epoch
                 // It's important to use the view of the replica, not the received prepare!
                 view: consensus.view.get(),
-                op: prev.op,
+                op: old.op,
                 commit: consensus.commit.get(),
-                timestamp: prev.timestamp,
-                operation: prev.operation,
+                timestamp: old.timestamp,
+                operation: old.operation,
                 // PrepareOks are only header no body
                 ..Default::default()
-            }
+            };
         })
     }
 }

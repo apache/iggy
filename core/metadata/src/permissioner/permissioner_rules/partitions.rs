@@ -16,8 +16,29 @@
  * under the License.
  */
 
-pub mod address;
-pub mod crypto;
-pub mod file;
-pub mod ptr;
-pub mod random_id;
+#![expect(
+    unused,
+    reason = "Methods are part of the state API and will be used once the implementation is complete"
+)]
+use crate::permissioner::Permissioner;
+use iggy_common::IggyError;
+
+impl Permissioner {
+    pub fn create_partitions(
+        &self,
+        user_id: u32,
+        stream_id: usize,
+        topic_id: usize,
+    ) -> Result<(), IggyError> {
+        self.update_topic(user_id, stream_id, topic_id)
+    }
+
+    pub fn delete_partitions(
+        &self,
+        user_id: u32,
+        stream_id: usize,
+        topic_id: usize,
+    ) -> Result<(), IggyError> {
+        self.update_topic(user_id, stream_id, topic_id)
+    }
+}

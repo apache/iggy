@@ -15,8 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::stm::{State, StateMachine};
 use iggy_common::{header::PrepareHeader, message::Message};
+
+use crate::stm::{State, StateMachine};
 
 // MuxStateMachine that proxies to an tuple of variadic state machines
 pub struct MuxStateMachine<T>
@@ -59,6 +60,8 @@ macro_rules! variadic {
     ($a:expr,  $( $b:tt )+) => ( ($a, variadic!( $( $b )* )) );
 }
 
+// TODO: Figure out how to get around the fact that we need to hardcode the Input/Output type for base case.
+// TODO: I think we could move the base case to the impl site of `State`, so this way we know the `Input` and `Output` types.
 // Base case of the recursive resolution.
 impl StateMachine for () {
     type Input = Message<PrepareHeader>;
@@ -72,13 +75,13 @@ impl StateMachine for () {
 impl<O, S, Rest> StateMachine for variadic!(S, ...Rest)
 where
     S: State<Output = O>,
-    Rest: StateMachine<Input = Message<PrepareHeader>, Output = O>,
+    Rest: StateMachine<Input = S::Input, Output = O>,
 {
-    type Input = Message<PrepareHeader>;
+    type Input = Rest::Input;
     type Output = O;
 
     fn update(&self, input: &Self::Input, output: &mut Vec<Self::Output>) {
-        if let Some(result) = self.0.apply() {
+        if let Some(result) = self.0.apply(input) {
             output.push(result);
         }
         self.1.update(input, output)
@@ -90,10 +93,17 @@ mod tests {
     #[test]
     fn construct_mux_state_machine_from_states_with_same_output() {
         use crate::stm::*;
+        use iggy_common::header::PrepareHeader;
+        use iggy_common::message::Message;
 
-        let users = user::Users {};
-        let streams = stream::Streams {};
-        let cgs = consumer_group::ConsumerGroups {};
-        let _mux = mux::MuxStateMachine::new(variadic!(users, streams, cgs));
+        let users = user::Users::new();
+        let streams = stream::Streams::new();
+        let cgs = consumer_group::ConsumerGroups::new();
+        let mux = mux::MuxStateMachine::new(variadic!(users, streams, cgs));
+
+        let input = Message::new(std::mem::size_of::<PrepareHeader>());
+        let mut output = Vec::new();
+
+        mux.update(&input, &mut output);
     }
 }

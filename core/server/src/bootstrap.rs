@@ -50,7 +50,6 @@ use crate::{
             storage::{load_consumer_group_offsets, load_consumer_offsets},
         },
         persistence::persister::{FilePersister, FileWithSyncPersister, PersisterKind},
-        personal_access_tokens::personal_access_token::PersonalAccessToken,
         polling_consumer::ConsumerGroupId,
         segments::{Segment, storage::Storage},
         stats::{PartitionStats, StreamStats, TopicStats},
@@ -66,7 +65,7 @@ use ahash::HashMap;
 use compio::{fs::create_dir_all, runtime::Runtime};
 use err_trail::ErrContext;
 use iggy_common::{
-    IggyByteSize, IggyError,
+    IggyByteSize, IggyError, PersonalAccessToken,
     defaults::{
         DEFAULT_ROOT_USERNAME, MAX_PASSWORD_LENGTH, MAX_USERNAME_LENGTH, MIN_PASSWORD_LENGTH,
         MIN_USERNAME_LENGTH,
