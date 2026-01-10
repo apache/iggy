@@ -27,7 +27,6 @@ import uuid
 from datetime import timedelta
 
 import pytest
-
 from apache_iggy import AutoCommit, IggyClient, PollingStrategy, ReceiveMessage
 from apache_iggy import SendMessage as Message
 

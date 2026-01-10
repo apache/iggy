@@ -26,7 +26,6 @@ import asyncio
 import os
 
 import pytest
-
 from apache_iggy import IggyClient
 
 from .utils import get_server_config, wait_for_ping, wait_for_server
