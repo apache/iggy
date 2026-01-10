@@ -17,82 +17,135 @@
  */
 
 use crate::binary::command::{
-    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
+    AuthenticatedHandler, BinaryServerCommand, HandlerResult, ServerCommand,
 };
 use crate::binary::handlers::partitions::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
-
 use crate::shard::IggyShard;
-use crate::shard::transmission::event::ShardEvent;
+use crate::shard::transmission::frame::ShardResponse;
+use crate::shard::transmission::message::{
+    ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult,
+};
 use crate::state::command::EntryCommand;
+use crate::streaming::auth::Auth;
 use crate::streaming::session::Session;
-use anyhow::Result;
 use err_trail::ErrContext;
 use iggy_common::delete_partitions::DeletePartitions;
-use iggy_common::{IggyError, SenderKind};
+use iggy_common::{Identifier, IggyError, SenderKind};
 use std::rc::Rc;
 use tracing::{debug, instrument};
 
-impl ServerCommandHandler for DeletePartitions {
+impl AuthenticatedHandler for DeletePartitions {
     fn code(&self) -> u32 {
         iggy_common::DELETE_PARTITIONS_CODE
     }
 
-    #[instrument(skip_all, name = "trace_delete_partitions", fields(iggy_user_id = session.get_user_id(), iggy_client_id = session.client_id, iggy_stream_id = self.stream_id.as_string(), iggy_topic_id = self.topic_id.as_string()))]
+    #[instrument(skip_all, name = "trace_delete_partitions", fields(iggy_user_id = auth.user_id(), iggy_client_id = session.client_id, iggy_stream_id = self.stream_id.as_string(), iggy_topic_id = self.topic_id.as_string()))]
     async fn handle(
         self,
         sender: &mut SenderKind,
         _length: u32,
+        auth: Auth,
         session: &Session,
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
-        let stream_id = self.stream_id.clone();
-        let topic_id = self.topic_id.clone();
 
-        // Acquire partition lock to serialize filesystem operations
-        let _partition_guard = shard.fs_locks.partition_lock.lock().await;
-
-        let deleted_partition_ids = shard
-            .delete_partitions(
-                session,
-                &self.stream_id,
-                &self.topic_id,
-                self.partitions_count,
-            )
-            .await?;
-        let event = ShardEvent::DeletedPartitions {
-            stream_id: self.stream_id.clone(),
-            topic_id: self.topic_id.clone(),
-            partitions_count: self.partitions_count,
-            partition_ids: deleted_partition_ids,
+        let request = ShardRequest {
+            stream_id: Identifier::default(),
+            topic_id: Identifier::default(),
+            partition_id: 0,
+            payload: ShardRequestPayload::DeletePartitions {
+                user_id: auth.user_id(),
+                stream_id: self.stream_id.clone(),
+                topic_id: self.topic_id.clone(),
+                partitions_count: self.partitions_count,
+            },
         };
-        shard.broadcast_event_to_all_shards(event).await?;
 
-        let remaining_partition_ids = shard.streams.with_topic_by_id(
-            &self.stream_id,
-            &self.topic_id,
-            crate::streaming::topics::helpers::get_partition_ids(),
-        );
-        shard.streams.with_topic_by_id_mut(
-            &self.stream_id,
-            &self.topic_id,
-            crate::streaming::topics::helpers::rebalance_consumer_groups(&remaining_partition_ids),
-        );
+        let message = ShardMessage::Request(request);
+        match shard.send_request_to_shard_or_recoil(None, message).await? {
+            ShardSendRequestResult::Recoil(message) => {
+                if let ShardMessage::Request(ShardRequest { payload, .. }) = message
+                    && let ShardRequestPayload::DeletePartitions {
+                        stream_id,
+                        topic_id,
+                        partitions_count,
+                        ..
+                    } = payload
+                {
+                    let _partition_guard = shard.fs_locks.partition_lock.lock().await;
 
-        shard
-        .state
-        .apply(
-            session.get_user_id(),
-            &EntryCommand::DeletePartitions(self),
-        )
-        .await
-        .error(|e: &IggyError| {
-            format!(
-                "{COMPONENT} (error: {e}) - failed to apply delete partitions for stream_id: {stream_id}, topic_id: {topic_id}, session: {session}"
-            )
-        })?;
-        sender.send_empty_ok_response().await?;
+                    // Get numeric IDs BEFORE delete
+                    let (numeric_stream_id, numeric_topic_id) =
+                        shard.resolve_topic_id(&stream_id, &topic_id)?;
+
+                    let deleted_partition_ids = shard
+                        .delete_partitions(session, &stream_id, &topic_id, partitions_count)
+                        .await?;
+
+                    let event = crate::shard::transmission::event::ShardEvent::DeletedPartitions {
+                        stream_id: stream_id.clone(),
+                        topic_id: topic_id.clone(),
+                        partitions_count,
+                        partition_ids: deleted_partition_ids,
+                    };
+                    shard.broadcast_event_to_all_shards(event).await?;
+
+                    // Rebalance consumer groups using SharedMetadata
+                    let remaining_partition_ids: Vec<_> = shard
+                        .metadata
+                        .load()
+                        .streams
+                        .get(numeric_stream_id)
+                        .and_then(|s| s.topics.get(numeric_topic_id))
+                        .map(|t| t.partitions.iter().map(|(id, _)| id).collect())
+                        .unwrap_or_default();
+                    shard.metadata.rebalance_consumer_groups_for_topic(
+                        numeric_stream_id,
+                        numeric_topic_id,
+                        &remaining_partition_ids,
+                    );
+
+                    shard
+                        .state
+                        .apply(auth.user_id(), &EntryCommand::DeletePartitions(self))
+                        .await
+                        .error(|e: &IggyError| {
+                            format!(
+                                "{COMPONENT} (error: {e}) - failed to apply delete partitions for stream_id: {}, topic_id: {}, session: {session}",
+                                stream_id, topic_id
+                            )
+                        })?;
+
+                    sender.send_empty_ok_response().await?;
+                } else {
+                    unreachable!(
+                        "Expected a DeletePartitions request inside of DeletePartitions handler, impossible state"
+                    );
+                }
+            }
+            ShardSendRequestResult::Response(response) => match response {
+                ShardResponse::DeletePartitionsResponse(_partition_ids) => {
+                    // Consumer group rebalancing is handled via the DeletedPartitions event
+                    // broadcast in the shard-0 handler, so we don't need to do it here.
+                    // Apply state for WAL replay.
+                    shard
+                        .state
+                        .apply(auth.user_id(), &EntryCommand::DeletePartitions(self))
+                        .await?;
+
+                    sender.send_empty_ok_response().await?;
+                }
+                ShardResponse::ErrorResponse(err) => {
+                    return Err(err);
+                }
+                _ => unreachable!(
+                    "Expected a DeletePartitionsResponse inside of DeletePartitions handler, impossible state"
+                ),
+            },
+        }
+
         Ok(HandlerResult::Finished)
     }
 }

@@ -247,6 +247,14 @@ impl<T: Clone, const SEGMENT_CAPACITY: usize> SegmentedSlab<T, SEGMENT_CAPACITY>
         (self, true)
     }
 
+    /// Set value at key, returning new slab. Ignores success/failure.
+    ///
+    /// Convenience method for RCU patterns where the key is known to exist.
+    #[inline]
+    pub fn set(self, key: usize, value: T) -> Self {
+        self.update(key, value).0
+    }
+
     /// Remove entry at key, returning (new_slab, removed_value).
     ///
     /// Freed slot will be reused by future inserts.
@@ -332,6 +340,16 @@ mod tests {
         // Update non-existent key returns false
         let (_, success) = slab.update(999, "nope");
         assert!(!success);
+    }
+
+    #[test]
+    fn test_set() {
+        let slab = TestSlab::new();
+        let (slab, key) = slab.insert("original");
+
+        let slab = slab.set(key, "updated");
+        assert_eq!(slab.get(key), Some(&"updated"));
+        assert_eq!(slab.len(), 1);
     }
 
     #[test]

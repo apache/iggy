@@ -16,10 +16,9 @@
  * under the License.
  */
 
-use crate::binary::command::{BinaryServerCommand, HandlerResult, ServerCommandHandler};
+use crate::binary::command::{BinaryServerCommand, HandlerResult, UnauthenticatedHandler};
 use crate::shard::IggyShard;
 use crate::streaming::session::Session;
-use anyhow::Result;
 use iggy_common::IggyError;
 use iggy_common::IggyTimestamp;
 use iggy_common::SenderKind;
@@ -27,7 +26,7 @@ use iggy_common::ping::Ping;
 use std::rc::Rc;
 use tracing::debug;
 
-impl ServerCommandHandler for Ping {
+impl UnauthenticatedHandler for Ping {
     fn code(&self) -> u32 {
         iggy_common::PING_CODE
     }

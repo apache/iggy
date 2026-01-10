@@ -17,76 +17,74 @@
  */
 
 use crate::binary::command::{
-    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
+    AuthenticatedHandler, BinaryServerCommand, HandlerResult, ServerCommand,
 };
 use crate::binary::handlers::consumer_groups::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
 use crate::shard::IggyShard;
-use crate::shard::transmission::event::ShardEvent;
-use crate::slab::traits_ext::EntityMarker;
 use crate::state::command::EntryCommand;
 use crate::state::models::CreateConsumerGroupWithId;
+use crate::streaming::auth::Auth;
 use crate::streaming::session::Session;
-use anyhow::Result;
 use err_trail::ErrContext;
 use iggy_common::create_consumer_group::CreateConsumerGroup;
 use iggy_common::{Identifier, IggyError, SenderKind};
 use std::rc::Rc;
 use tracing::{debug, instrument};
 
-impl ServerCommandHandler for CreateConsumerGroup {
+impl AuthenticatedHandler for CreateConsumerGroup {
     fn code(&self) -> u32 {
         iggy_common::CREATE_CONSUMER_GROUP_CODE
     }
 
-    #[instrument(skip_all, name = "trace_create_consumer_group", fields(iggy_user_id = session.get_user_id(), iggy_client_id = session.client_id, iggy_stream_id = self.stream_id.as_string(), iggy_topic_id = self.topic_id.as_string()))]
+    #[instrument(skip_all, name = "trace_create_consumer_group", fields(iggy_user_id = auth.user_id(), iggy_client_id = session.client_id, iggy_stream_id = self.stream_id.as_string(), iggy_topic_id = self.topic_id.as_string()))]
     async fn handle(
         self,
         sender: &mut SenderKind,
         _length: u32,
+        auth: Auth,
         session: &Session,
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
-        let cg = shard.create_consumer_group(
+        let cg_id = shard.create_consumer_group(
             session,
             &self.stream_id,
             &self.topic_id,
             self.name.clone(),
         )?;
-        let cg_id = cg.id();
-
-        let event = ShardEvent::CreatedConsumerGroup {
-            stream_id: self.stream_id.clone(),
-            topic_id: self.topic_id.clone(),
-            cg,
-        };
-        shard.broadcast_event_to_all_shards(event).await?;
 
         let stream_id = self.stream_id.clone();
         let topic_id = self.topic_id.clone();
         shard
             .state
-        .apply(
-            session.get_user_id(),
-           &EntryCommand::CreateConsumerGroup(CreateConsumerGroupWithId {
-                group_id: cg_id as u32,
-                command: self
-            }),
-        )
+            .apply(
+                auth.user_id(),
+                &EntryCommand::CreateConsumerGroup(CreateConsumerGroupWithId {
+                    group_id: cg_id as u32,
+                    command: self,
+                }),
+            )
             .await
             .error(|e: &IggyError| {
                 format!(
                     "{COMPONENT} (error: {e}) - failed to apply create consumer group for stream_id: {stream_id}, topic_id: {topic_id}, group_id: {cg_id}, session: {session}"
                 )
             })?;
-        let response = shard.streams.with_consumer_group_by_id(
-            &stream_id,
-            &topic_id,
-            &Identifier::numeric(cg_id as u32).unwrap(),
-            |(root, members)| mapper::map_consumer_group(root, members),
-        );
+
+        let (numeric_stream_id, numeric_topic_id) =
+            shard.resolve_topic_id(&stream_id, &topic_id)?;
+
+        let cg_identifier = Identifier::numeric(cg_id as u32).unwrap();
+        let metadata = shard.metadata.load();
+        let response = metadata
+            .streams
+            .get(numeric_stream_id)
+            .and_then(|s| s.topics.get(numeric_topic_id))
+            .and_then(|t| t.consumer_groups.get(cg_id))
+            .map(mapper::map_consumer_group_from_meta)
+            .ok_or_else(|| IggyError::ConsumerGroupIdNotFound(cg_identifier, topic_id.clone()))?;
         sender.send_ok_response(&response).await?;
         Ok(HandlerResult::Finished)
     }

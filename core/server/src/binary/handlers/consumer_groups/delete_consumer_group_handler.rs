@@ -17,65 +17,52 @@
  */
 
 use crate::binary::command::{
-    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
+    AuthenticatedHandler, BinaryServerCommand, HandlerResult, ServerCommand,
 };
 use crate::binary::handlers::consumer_groups::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
-
 use crate::shard::IggyShard;
-use crate::shard::transmission::event::ShardEvent;
-use crate::slab::traits_ext::EntityMarker;
 use crate::state::command::EntryCommand;
+use crate::streaming::auth::Auth;
 use crate::streaming::polling_consumer::ConsumerGroupId;
 use crate::streaming::session::Session;
-use anyhow::Result;
 use err_trail::ErrContext;
 use iggy_common::delete_consumer_group::DeleteConsumerGroup;
 use iggy_common::{IggyError, SenderKind};
 use std::rc::Rc;
 use tracing::{debug, instrument};
 
-impl ServerCommandHandler for DeleteConsumerGroup {
+impl AuthenticatedHandler for DeleteConsumerGroup {
     fn code(&self) -> u32 {
         iggy_common::DELETE_CONSUMER_GROUP_CODE
     }
 
-    #[instrument(skip_all, name = "trace_delete_consumer_group", fields(iggy_user_id = session.get_user_id(), iggy_client_id = session.client_id, iggy_stream_id = self.stream_id.as_string(), iggy_topic_id = self.topic_id.as_string()))]
+    #[instrument(skip_all, name = "trace_delete_consumer_group", fields(iggy_user_id = auth.user_id(), iggy_client_id = session.client_id, iggy_stream_id = self.stream_id.as_string(), iggy_topic_id = self.topic_id.as_string()))]
     async fn handle(
         self,
         sender: &mut SenderKind,
         _length: u32,
+        auth: Auth,
         session: &Session,
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
-        let cg = shard.delete_consumer_group(session, &self.stream_id, &self.topic_id, &self.group_id).error(|e: &IggyError| {
+        let (numeric_stream_id, numeric_topic_id) =
+            shard.resolve_topic_id(&self.stream_id, &self.topic_id)?;
+
+        let cg_meta = shard.delete_consumer_group(session, &self.stream_id, &self.topic_id, &self.group_id).error(|e: &IggyError| {
             format!(
                 "{COMPONENT} (error: {e}) - failed to delete consumer group with ID: {} for topic with ID: {} in stream with ID: {} for session: {}",
                 self.group_id, self.topic_id, self.stream_id, session
             )
         })?;
-        let cg_id = cg.id();
-        let partition_ids = cg.partitions();
+        let cg_id = cg_meta.id;
 
-        // Remove all consumer group members from ClientManager using helper functions to resolve identifiers
-        let stream_id_usize = shard.streams.with_stream_by_id(
-            &self.stream_id,
-            crate::streaming::streams::helpers::get_stream_id(),
-        );
-        let topic_id_usize = shard.streams.with_topic_by_id(
-            &self.stream_id,
-            &self.topic_id,
-            crate::streaming::topics::helpers::get_topic_id(),
-        );
-
-        // Get members from the deleted consumer group and make them leave
-        let slab = cg.members().inner().shared_get();
-        for (_, member) in slab.iter() {
+        for (_, member) in cg_meta.members.iter() {
             if let Err(err) = shard.client_manager.leave_consumer_group(
                 member.client_id,
-                stream_id_usize,
-                topic_id_usize,
+                numeric_stream_id,
+                numeric_topic_id,
                 cg_id,
             ) {
                 tracing::warn!(
@@ -87,12 +74,11 @@ impl ServerCommandHandler for DeleteConsumerGroup {
         }
 
         let cg_id_spez = ConsumerGroupId(cg_id);
-        // Delete all consumer group offsets for this group using the specialized method
         shard.delete_consumer_group_offsets(
             cg_id_spez,
             &self.stream_id,
             &self.topic_id,
-            partition_ids,
+            &cg_meta.partitions,
         ).await.error(|e: &IggyError| {
             format!(
                 "{COMPONENT} (error: {e}) - failed to delete consumer group offsets for group ID: {} in stream: {}, topic: {}",
@@ -102,19 +88,12 @@ impl ServerCommandHandler for DeleteConsumerGroup {
             )
         })?;
 
-        let event = ShardEvent::DeletedConsumerGroup {
-            id: cg_id,
-            stream_id: self.stream_id.clone(),
-            topic_id: self.topic_id.clone(),
-            group_id: self.group_id.clone(),
-        };
-        shard.broadcast_event_to_all_shards(event).await?;
         let stream_id = self.stream_id.clone();
         let topic_id = self.topic_id.clone();
         shard
             .state
             .apply(
-                session.get_user_id(),
+                auth.user_id(),
                 &EntryCommand::DeleteConsumerGroup(self),
             )
             .await

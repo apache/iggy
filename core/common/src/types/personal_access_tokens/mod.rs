@@ -28,8 +28,8 @@ const SIZE: usize = 50;
 #[derive(Clone, Debug)]
 pub struct PersonalAccessToken {
     pub user_id: UserId,
-    pub name: Arc<String>,
-    pub token: Arc<String>,
+    pub name: Arc<str>,
+    pub token: Arc<str>,
     pub expiry_at: Option<IggyTimestamp>,
 }
 
@@ -49,8 +49,8 @@ impl PersonalAccessToken {
         (
             Self {
                 user_id,
-                name: Arc::new(name.to_string()),
-                token: Arc::new(token_hash),
+                name: Arc::from(name),
+                token: Arc::from(token_hash),
                 expiry_at: Self::calculate_expiry_at(now, expiry),
             },
             token,
@@ -65,8 +65,8 @@ impl PersonalAccessToken {
     ) -> Self {
         Self {
             user_id,
-            name: Arc::new(name.into()),
-            token: Arc::new(token_hash.into()),
+            name: Arc::from(name),
+            token: Arc::from(token_hash),
             expiry_at,
         }
     }
@@ -106,12 +106,12 @@ mod tests {
         let name = "test_token";
         let (personal_access_token, raw_token) =
             PersonalAccessToken::new(user_id, name, now, IggyExpiry::NeverExpire);
-        assert_eq!(personal_access_token.name.as_str(), name);
+        assert_eq!(&*personal_access_token.name, name);
         assert!(!personal_access_token.token.is_empty());
         assert!(!raw_token.is_empty());
-        assert_ne!(personal_access_token.token.as_str(), raw_token);
+        assert_ne!(&*personal_access_token.token, raw_token);
         assert_eq!(
-            personal_access_token.token.as_str(),
+            &*personal_access_token.token,
             PersonalAccessToken::hash_token(&raw_token)
         );
     }

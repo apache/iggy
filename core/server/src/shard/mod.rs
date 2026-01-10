@@ -18,6 +18,7 @@ inner() * or more contributor license agreements.  See the NOTICE file
 
 pub mod builder;
 pub mod namespace;
+pub mod shard_local_partitions;
 pub mod system;
 pub mod task_registry;
 pub mod tasks;
@@ -33,8 +34,11 @@ use self::tasks::{continuous, periodic};
 use crate::{
     configs::server::ServerConfig,
     io::fs_locks::FsLocks,
-    shard::{task_registry::TaskRegistry, transmission::frame::ShardFrame},
-    slab::{streams::Streams, traits_ext::EntityMarker, users::Users},
+    metadata::Metadata,
+    shard::{
+        namespace::IggyNamespace, shard_local_partitions::ShardLocalPartitions,
+        task_registry::TaskRegistry, transmission::frame::ShardFrame,
+    },
     state::file::FileState,
     streaming::{
         clients::client_manager::ClientManager, diagnostics::metrics::Metrics, session::Session,
@@ -44,13 +48,16 @@ use crate::{
 };
 use builder::IggyShardBuilder;
 use dashmap::DashMap;
-use iggy_common::sharding::{IggyNamespace, PartitionLocation};
-use iggy_common::{EncryptorKind, Identifier, IggyError};
+use iggy_common::sharding::PartitionLocation;
+use iggy_common::{EncryptorKind, IggyError};
 use std::{
     cell::{Cell, RefCell},
     net::SocketAddr,
     rc::Rc,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 use tracing::{debug, error, info, instrument};
@@ -65,7 +72,11 @@ pub struct IggyShard {
     shards: Vec<ShardConnector<ShardFrame>>,
     _version: SemanticVersion,
 
-    pub(crate) streams: Streams,
+    // Shared metadata structures (source of truth)
+    pub(crate) metadata: EternalPtr<Metadata>,
+    pub(crate) partition_store: RefCell<ShardLocalPartitions>,
+    pub(crate) pending_partition_inits: RefCell<std::collections::HashSet<IggyNamespace>>,
+
     pub(crate) shards_table: EternalPtr<DashMap<IggyNamespace, PartitionLocation>>,
     pub(crate) state: FileState,
 
@@ -73,8 +84,7 @@ pub struct IggyShard {
     pub(crate) encryptor: Option<EncryptorKind>,
     pub(crate) config: ServerConfig,
     pub(crate) client_manager: ClientManager,
-    pub(crate) permissioner: RefCell<Permissioner>,
-    pub(crate) users: Users,
+    pub(crate) permissioner: Permissioner,
     pub(crate) metrics: Metrics,
     pub(crate) is_follower: bool,
     pub messages_receiver: Cell<Option<Receiver<ShardFrame>>>,
@@ -185,6 +195,8 @@ impl IggyShard {
 
     async fn load_segments(&self) -> Result<(), IggyError> {
         use crate::bootstrap::load_segments;
+        use crate::shard::shard_local_partitions::PartitionData;
+
         for shard_entry in self.shards_table.iter() {
             let (namespace, location) = shard_entry.pair();
 
@@ -202,33 +214,98 @@ impl IggyShard {
                     self.config
                         .system
                         .get_partition_path(stream_id, topic_id, partition_id);
-                let stats = self.streams.with_partition_by_id(
-                    &Identifier::numeric(stream_id as u32).unwrap(),
-                    &Identifier::numeric(topic_id as u32).unwrap(),
-                    partition_id,
-                    |(_, stats, ..)| stats.clone(),
+
+                let metadata = self.metadata.load();
+                let partition_meta = metadata
+                    .streams
+                    .get(stream_id)
+                    .and_then(|s| s.topics.get(topic_id))
+                    .and_then(|t| t.partitions.get(partition_id))
+                    .expect("Partition must exist in SharedMetadata");
+                let created_at = partition_meta.created_at;
+                let stats = partition_meta.stats.clone();
+                drop(metadata);
+
+                use crate::streaming::partitions::helpers::create_message_deduplicator;
+                use crate::streaming::partitions::storage::{
+                    load_consumer_group_offsets, load_consumer_offsets,
+                };
+                use ahash::HashMap;
+
+                let consumer_offset_path =
+                    self.config
+                        .system
+                        .get_consumer_offsets_path(stream_id, topic_id, partition_id);
+                let consumer_group_offsets_path = self
+                    .config
+                    .system
+                    .get_consumer_group_offsets_path(stream_id, topic_id, partition_id);
+
+                let consumer_offsets = Arc::new(
+                    load_consumer_offsets(&consumer_offset_path)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|offset| (offset.consumer_id as usize, offset))
+                        .collect::<HashMap<usize, _>>()
+                        .into(),
                 );
+
+                let consumer_group_offsets = Arc::new(
+                    load_consumer_group_offsets(&consumer_group_offsets_path)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .collect::<HashMap<_, _>>()
+                        .into(),
+                );
+
+                let message_deduplicator =
+                    create_message_deduplicator(&self.config.system).map(Arc::new);
+
                 match load_segments(
                     &self.config.system,
                     stream_id,
                     topic_id,
                     partition_id,
                     partition_path,
-                    stats,
+                    stats.clone(),
                 )
                 .await
                 {
                     Ok(loaded_log) => {
-                        self.streams.with_partition_by_id_mut(
-                            &Identifier::numeric(stream_id as u32).unwrap(),
-                            &Identifier::numeric(topic_id as u32).unwrap(),
-                            partition_id,
-                            |(_, _, _, offset, .., log)| {
-                                *log = loaded_log;
-                                let current_offset = log.active_segment().end_offset;
-                                offset.store(current_offset, Ordering::Relaxed);
-                            },
+                        let current_offset = loaded_log.active_segment().end_offset;
+                        stats.set_current_offset(current_offset);
+
+                        // Only increment offset if we have messages (current_offset > 0).
+                        // When current_offset is 0 and we have no messages, first message
+                        // should get offset 0.
+                        let should_increment_offset = current_offset > 0;
+
+                        let revision_id = self
+                            .metadata
+                            .load()
+                            .streams
+                            .get(stream_id)
+                            .and_then(|s| s.topics.get(topic_id))
+                            .and_then(|t| t.partitions.get(partition_id))
+                            .map(|meta| meta.revision_id)
+                            .unwrap_or(0);
+
+                        let partition_data = PartitionData::with_log(
+                            loaded_log,
+                            stats,
+                            Arc::new(AtomicU64::new(current_offset)),
+                            consumer_offsets,
+                            consumer_group_offsets,
+                            message_deduplicator,
+                            created_at,
+                            revision_id,
+                            should_increment_offset,
                         );
+
+                        self.partition_store
+                            .borrow_mut()
+                            .insert(*namespace, partition_data);
+
                         info!(
                             "Successfully loaded segments for stream: {}, topic: {}, partition: {}",
                             stream_id, topic_id, partition_id
@@ -249,11 +326,8 @@ impl IggyShard {
     }
 
     async fn load_users(&self) -> Result<(), IggyError> {
-        let users_list = self.users.values();
-        let users_count = users_list.len();
-        self.permissioner
-            .borrow_mut()
-            .init(&users_list.iter().collect::<Vec<_>>());
+        // Permissioner reads directly from SharedMetadata, no initialization needed
+        let users_count = self.metadata.users_count();
         self.metrics.increment_users(users_count as u32);
         info!("Initialized {} user(s).", users_count);
         Ok(())
@@ -294,5 +368,28 @@ impl IggyShard {
             error!("{COMPONENT} - unauthenticated access attempt, session: {session}");
             Err(IggyError::Unauthenticated)
         }
+    }
+
+    /// Authenticates a session and returns a proof token.
+    ///
+    /// This is the ONLY way to create an [`Auth`] token. The returned token
+    /// proves that authentication was successful and can be passed to shard
+    /// methods that require authentication.
+    ///
+    /// # Errors
+    /// - [`IggyError::StaleClient`] if the session is inactive
+    /// - [`IggyError::Unauthenticated`] if the session is not authenticated
+    pub fn auth(&self, session: &Session) -> Result<crate::streaming::auth::Auth, IggyError> {
+        if !session.is_active() {
+            error!("{COMPONENT} - session is inactive, session: {session}");
+            return Err(IggyError::StaleClient);
+        }
+
+        if !session.is_authenticated() {
+            error!("{COMPONENT} - unauthenticated access attempt, session: {session}");
+            return Err(IggyError::Unauthenticated);
+        }
+
+        Ok(crate::streaming::auth::Auth::new(session.get_user_id()))
     }
 }

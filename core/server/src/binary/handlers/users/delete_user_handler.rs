@@ -16,39 +16,37 @@
  * under the License.
  */
 
-use std::rc::Rc;
-
 use crate::binary::command::{
-    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
+    AuthenticatedHandler, BinaryServerCommand, HandlerResult, ServerCommand,
 };
 use crate::binary::handlers::users::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
-
 use crate::shard::IggyShard;
-use crate::shard::transmission::event::ShardEvent;
 use crate::shard::transmission::frame::ShardResponse;
 use crate::shard::transmission::message::{
     ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult,
 };
 use crate::state::command::EntryCommand;
+use crate::streaming::auth::Auth;
 use crate::streaming::session::Session;
-use anyhow::Result;
 use err_trail::ErrContext;
 use iggy_common::delete_user::DeleteUser;
 use iggy_common::{Identifier, IggyError, SenderKind};
+use std::rc::Rc;
 use tracing::info;
 use tracing::{debug, instrument};
 
-impl ServerCommandHandler for DeleteUser {
+impl AuthenticatedHandler for DeleteUser {
     fn code(&self) -> u32 {
         iggy_common::DELETE_USER_CODE
     }
 
-    #[instrument(skip_all, name = "trace_delete_user", fields(iggy_user_id = session.get_user_id(), iggy_client_id = session.client_id))]
+    #[instrument(skip_all, name = "trace_delete_user", fields(iggy_user_id = auth.user_id(), iggy_client_id = session.client_id))]
     async fn handle(
         self,
         sender: &mut SenderKind,
         _length: u32,
+        auth: Auth,
         session: &Session,
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {
@@ -59,7 +57,7 @@ impl ServerCommandHandler for DeleteUser {
             topic_id: Identifier::default(),
             partition_id: 0,
             payload: ShardRequestPayload::DeleteUser {
-                session_user_id: session.get_user_id(),
+                session_user_id: auth.user_id(),
                 user_id: self.user_id,
             },
         };
@@ -81,8 +79,6 @@ impl ServerCommandHandler for DeleteUser {
                     })?;
 
                     info!("Deleted user: {} with ID: {}.", user.username, user.id);
-                    let event = ShardEvent::DeletedUser { user_id };
-                    shard.broadcast_event_to_all_shards(event).await?;
 
                     shard
                         .state

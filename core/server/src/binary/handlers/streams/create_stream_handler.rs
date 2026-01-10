@@ -17,39 +17,36 @@
  */
 
 use crate::binary::command::{
-    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
+    AuthenticatedHandler, BinaryServerCommand, HandlerResult, ServerCommand,
 };
 use crate::binary::handlers::streams::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
-use crate::binary::mapper;
-
 use crate::shard::IggyShard;
-use crate::shard::transmission::event::ShardEvent;
 use crate::shard::transmission::frame::ShardResponse;
 use crate::shard::transmission::message::{
     ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult,
 };
-use crate::slab::traits_ext::{EntityComponentSystem, EntityMarker};
 use crate::state::command::EntryCommand;
 use crate::state::models::CreateStreamWithId;
+use crate::streaming::auth::Auth;
 use crate::streaming::session::Session;
-use anyhow::Result;
 use err_trail::ErrContext;
 use iggy_common::create_stream::CreateStream;
 use iggy_common::{Identifier, IggyError, SenderKind};
 use std::rc::Rc;
 use tracing::{debug, instrument};
 
-impl ServerCommandHandler for CreateStream {
+impl AuthenticatedHandler for CreateStream {
     fn code(&self) -> u32 {
         iggy_common::CREATE_STREAM_CODE
     }
 
-    #[instrument(skip_all, name = "trace_create_stream", fields(iggy_user_id = session.get_user_id(), iggy_client_id = session.client_id))]
+    #[instrument(skip_all, name = "trace_create_stream", fields(iggy_user_id = auth.user_id(), iggy_client_id = session.client_id))]
     async fn handle(
         self,
         sender: &mut SenderKind,
         _length: u32,
+        auth: Auth,
         session: &Session,
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {
@@ -60,7 +57,7 @@ impl ServerCommandHandler for CreateStream {
             topic_id: Identifier::default(),
             partition_id: 0,
             payload: ShardRequestPayload::CreateStream {
-                user_id: session.get_user_id(),
+                user_id: auth.user_id(),
                 name: self.name.clone(),
             },
         };
@@ -71,27 +68,19 @@ impl ServerCommandHandler for CreateStream {
                 if let ShardMessage::Request(ShardRequest { payload, .. }) = message
                     && let ShardRequestPayload::CreateStream { name, .. } = payload
                 {
+                    // TODO(hubcio): investigate if we can process commands on the shard that the
+                    // command arrived on, without sending it to shard 0 (use fs locks)
+
                     // Acquire stream lock to serialize filesystem operations
                     let _stream_guard = shard.fs_locks.stream_lock.lock().await;
 
-                    let stream = shard.create_stream(session, name).await?;
-                    let created_stream_id = stream.id();
+                    let created_stream_id = shard.create_stream(session, name).await?;
 
-                    let event = ShardEvent::CreatedStream {
-                        id: created_stream_id,
-                        stream: stream.clone(),
-                    };
-                    shard.broadcast_event_to_all_shards(event).await?;
-
-                    let response = shard
-                        .streams
-                        .with_components_by_id(created_stream_id, |(root, stats)| {
-                            mapper::map_stream(&root, &stats)
-                        });
+                    let response = shard.get_stream_from_shared_metadata(created_stream_id);
 
                     shard
                         .state
-                        .apply(session.get_user_id(), &EntryCommand::CreateStream(CreateStreamWithId {
+                        .apply(auth.user_id(), &EntryCommand::CreateStream(CreateStreamWithId {
                             stream_id: created_stream_id as u32,
                             command: self
                         }))
@@ -110,13 +99,12 @@ impl ServerCommandHandler for CreateStream {
                 }
             }
             ShardSendRequestResult::Response(response) => match response {
-                ShardResponse::CreateStreamResponse(stream) => {
-                    let created_stream_id = stream.id();
-                    let response = mapper::map_stream(stream.root(), stream.stats());
+                ShardResponse::CreateStreamResponse(created_stream_id) => {
+                    let response = shard.get_stream_from_shared_metadata(created_stream_id);
 
                     shard
                         .state
-                        .apply(session.get_user_id(), &EntryCommand::CreateStream(CreateStreamWithId {
+                        .apply(auth.user_id(), &EntryCommand::CreateStream(CreateStreamWithId {
                             stream_id: created_stream_id as u32,
                             command: self
                         }))

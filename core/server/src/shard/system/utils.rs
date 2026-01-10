@@ -17,19 +17,67 @@
 
 use iggy_common::{Consumer, ConsumerKind, Identifier, IggyError};
 
-use crate::{
-    shard::IggyShard,
-    streaming::{
-        polling_consumer::PollingConsumer,
-        topics::{self},
-    },
-};
+use crate::{shard::IggyShard, streaming::polling_consumer::PollingConsumer};
 
 impl IggyShard {
-    pub fn ensure_stream_exists(&self, stream_id: &Identifier) -> Result<(), IggyError> {
-        if !self.streams.exists(stream_id) {
-            return Err(IggyError::StreamIdNotFound(stream_id.clone()));
+    /// Resolves stream identifier to numeric ID, returning error if not found.
+    pub fn resolve_stream_id(&self, stream_id: &Identifier) -> Result<usize, IggyError> {
+        self.metadata
+            .get_stream_id(stream_id)
+            .ok_or_else(|| IggyError::StreamIdNotFound(stream_id.clone()))
+    }
+
+    /// Resolves topic identifier to (stream_id, topic_id), returning error if not found.
+    pub fn resolve_topic_id(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+    ) -> Result<(usize, usize), IggyError> {
+        let stream = self.resolve_stream_id(stream_id)?;
+        let topic = self
+            .metadata
+            .get_topic_id(stream, topic_id)
+            .ok_or_else(|| IggyError::TopicIdNotFound(stream_id.clone(), topic_id.clone()))?;
+        Ok((stream, topic))
+    }
+
+    /// Resolves partition identifier to (stream_id, topic_id, partition_id), returning error if not found.
+    pub fn resolve_partition_id(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        partition_id: usize,
+    ) -> Result<(usize, usize, usize), IggyError> {
+        let (stream, topic) = self.resolve_topic_id(stream_id, topic_id)?;
+        if !self.metadata.partition_exists(stream, topic, partition_id) {
+            return Err(IggyError::PartitionNotFound(
+                partition_id,
+                topic_id.clone(),
+                stream_id.clone(),
+            ));
         }
+        Ok((stream, topic, partition_id))
+    }
+
+    /// Resolves consumer group identifier to (stream_id, topic_id, group_id), returning error if not found.
+    pub fn resolve_consumer_group_id(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        group_id: &Identifier,
+    ) -> Result<(usize, usize, usize), IggyError> {
+        let (stream, topic) = self.resolve_topic_id(stream_id, topic_id)?;
+        let group = self
+            .metadata
+            .get_consumer_group_id(stream, topic, group_id)
+            .ok_or_else(|| {
+                IggyError::ConsumerGroupIdNotFound(group_id.clone(), topic_id.clone())
+            })?;
+        Ok((stream, topic, group))
+    }
+
+    pub fn ensure_stream_exists(&self, stream_id: &Identifier) -> Result<(), IggyError> {
+        self.resolve_stream_id(stream_id)?;
         Ok(())
     }
 
@@ -38,16 +86,7 @@ impl IggyShard {
         stream_id: &Identifier,
         topic_id: &Identifier,
     ) -> Result<(), IggyError> {
-        self.ensure_stream_exists(stream_id)?;
-        let exists = self
-            .streams
-            .with_topics(stream_id, topics::helpers::exists(topic_id));
-        if !exists {
-            return Err(IggyError::TopicIdNotFound(
-                stream_id.clone(),
-                topic_id.clone(),
-            ));
-        }
+        self.resolve_topic_id(stream_id, topic_id)?;
         Ok(())
     }
 
@@ -57,19 +96,7 @@ impl IggyShard {
         topic_id: &Identifier,
         group_id: &Identifier,
     ) -> Result<(), IggyError> {
-        self.ensure_stream_exists(stream_id)?;
-        self.ensure_topic_exists(stream_id, topic_id)?;
-        let exists = self.streams.with_topic_by_id(
-            stream_id,
-            topic_id,
-            topics::helpers::cg_exists(group_id),
-        );
-        if !exists {
-            return Err(IggyError::ConsumerGroupIdNotFound(
-                group_id.clone(),
-                topic_id.clone(),
-            ));
-        }
+        self.resolve_consumer_group_id(stream_id, topic_id, group_id)?;
         Ok(())
     }
 
@@ -79,10 +106,8 @@ impl IggyShard {
         topic_id: &Identifier,
         partitions_count: u32,
     ) -> Result<(), IggyError> {
-        self.ensure_topic_exists(stream_id, topic_id)?;
-        let actual_partitions_count =
-            self.streams
-                .with_partitions(stream_id, topic_id, |partitions| partitions.len());
+        let (stream, topic) = self.resolve_topic_id(stream_id, topic_id)?;
+        let actual_partitions_count = self.metadata.partitions_count(stream, topic);
 
         if partitions_count > actual_partitions_count as u32 {
             return Err(IggyError::InvalidPartitionsCount);
@@ -97,21 +122,7 @@ impl IggyShard {
         topic_id: &Identifier,
         partition_id: usize,
     ) -> Result<(), IggyError> {
-        self.ensure_topic_exists(stream_id, topic_id)?;
-        let partition_exists = self
-            .streams
-            .with_topic_by_id(stream_id, topic_id, |(root, ..)| {
-                root.partitions().exists(partition_id)
-            });
-
-        if !partition_exists {
-            return Err(IggyError::PartitionNotFound(
-                partition_id,
-                topic_id.clone(),
-                stream_id.clone(),
-            ));
-        }
-
+        self.resolve_partition_id(stream_id, topic_id, partition_id)?;
         Ok(())
     }
 
@@ -138,29 +149,37 @@ impl IggyShard {
                     return Err(IggyError::StaleClient);
                 }
 
-                self.ensure_consumer_group_exists(stream_id, topic_id, &consumer.id)?;
-                let cg_id = self.streams.with_consumer_group_by_id(
-                    stream_id,
-                    topic_id,
-                    &consumer.id,
-                    topics::helpers::get_consumer_group_id(),
-                );
-                let Some(member_id) = self.streams.with_consumer_group_by_id(
-                    stream_id,
-                    topic_id,
-                    &consumer.id,
-                    topics::helpers::get_consumer_group_member_id(client_id),
-                ) else {
-                    // Client might have been removed between check above and here
-                    if self.client_manager.try_get_client(client_id).is_none() {
-                        return Err(IggyError::StaleClient);
-                    }
-                    return Err(IggyError::ConsumerGroupMemberNotFound(
-                        client_id,
-                        consumer.id.clone(),
-                        topic_id.clone(),
-                    ));
-                };
+                let (stream, topic, cg_id) =
+                    self.resolve_consumer_group_id(stream_id, topic_id, &consumer.id)?;
+
+                let metadata = self.metadata.load();
+                let cg_meta = metadata
+                    .streams
+                    .get(stream)
+                    .and_then(|s| s.topics.get(topic))
+                    .and_then(|t| t.consumer_groups.get(cg_id))
+                    .ok_or_else(|| {
+                        IggyError::ConsumerGroupIdNotFound(consumer.id.clone(), topic_id.clone())
+                    })?;
+
+                let (member_id, _member) = cg_meta
+                    .members
+                    .iter()
+                    .find(|(_, m)| m.client_id == client_id)
+                    .ok_or_else(|| {
+                        // Client might have been removed between check above and here
+                        if self.client_manager.try_get_client(client_id).is_none() {
+                            return IggyError::StaleClient;
+                        }
+                        IggyError::ConsumerGroupMemberNotFound(
+                            client_id,
+                            consumer.id.clone(),
+                            topic_id.clone(),
+                        )
+                    })?;
+
+                drop(metadata);
+
                 if let Some(partition_id) = partition_id {
                     return Ok(Some((
                         PollingConsumer::consumer_group(cg_id, member_id),
@@ -168,29 +187,21 @@ impl IggyShard {
                     )));
                 }
 
-                let partition_id = if calculate_partition_id {
-                    self.streams.with_consumer_group_by_id(
-                        stream_id,
-                        topic_id,
-                        &consumer.id,
-                        topics::helpers::calculate_partition_id_unchecked(member_id),
-                    )
-                } else {
-                    self.streams.with_consumer_group_by_id(
-                        stream_id,
-                        topic_id,
-                        &consumer.id,
-                        topics::helpers::get_current_partition_id_unchecked(member_id),
-                    )
-                };
-                let Some(partition_id) = partition_id else {
-                    return Ok(None);
-                };
+                let partition_id = self.metadata.get_next_member_partition_id(
+                    stream,
+                    topic,
+                    cg_id,
+                    member_id,
+                    calculate_partition_id,
+                );
 
-                Ok(Some((
-                    PollingConsumer::consumer_group(cg_id, member_id),
-                    partition_id,
-                )))
+                match partition_id {
+                    Some(partition_id) => Ok(Some((
+                        PollingConsumer::consumer_group(cg_id, member_id),
+                        partition_id,
+                    ))),
+                    None => Ok(None),
+                }
             }
         }
     }
