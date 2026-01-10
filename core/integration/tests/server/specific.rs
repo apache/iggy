@@ -1,4 +1,5 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
  * regarding copyright ownership.  The ASF licenses this file
@@ -19,7 +20,7 @@
 use crate::server::scenarios::{
     cross_protocol_pat_scenario, delete_segments_scenario, message_size_scenario,
     segment_rotation_race_scenario, single_message_per_batch_scenario, tcp_tls_scenario,
-    websocket_tls_scenario,
+    websocket_tls_scenario, log_rotation_scenario,
 };
 use iggy::prelude::*;
 use integration::{
@@ -30,6 +31,7 @@ use integration::{
     test_tls_utils::generate_test_certificates,
     websocket_client::WebSocketClientFactory,
 };
+use log_rotation_scenario::{LOG_ROTATION_CHECK_INTERVAL, MAX_SINGLE_LOG_SIZE, MAX_TOTAL_LOG_SIZE};
 use serial_test::parallel;
 use std::collections::HashMap;
 
@@ -130,9 +132,44 @@ async fn tcp_tls_self_signed_scenario_should_be_valid() {
         .await
         .expect("Failed to connect TLS client with self-signed cert");
 
-    let client = iggy::clients::client::IggyClient::create(ClientWrapper::Iggy(client), None, None);
+    let client = IggyClient::create(ClientWrapper::Iggy(client), None, None);
 
     tcp_tls_scenario::run(&client).await;
+}
+
+#[tokio::test]
+#[parallel]
+async fn log_rotation_should_launch() {
+    let mut extra_envs = HashMap::new();
+    extra_envs.insert(
+        "IGGY_SYSTEM_LOGGING_MAX_FILE_SIZE".to_string(),
+        format!("{}", MAX_SINGLE_LOG_SIZE),
+    );
+    extra_envs.insert(
+        "IGGY_SYSTEM_LOGGING_MAX_TOTAL_SIZE".to_string(),
+        format!("{}", MAX_TOTAL_LOG_SIZE),
+    );
+    extra_envs.insert(
+        "IGGY_SYSTEM_LOGGING_ROTATION_CHECK_INTERVAL".to_string(),
+        format!("{}", LOG_ROTATION_CHECK_INTERVAL),
+    );
+
+    let mut test_server = TestServer::new(Some(extra_envs), true, None, IpAddrKind::V4);
+    test_server.start();
+
+    let server_addr = test_server.get_raw_tcp_addr().unwrap();
+    let client_factory = TcpClientFactory {
+        server_addr,
+        ..Default::default()
+    };
+
+    // Give the server some time to start and for log rotation thread to be initialized
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+    let log_path = format!("{}/logs", test_server.get_local_data_path());
+
+    test_server.assert_running();
+    log_rotation_scenario::run(&client_factory, &log_path).await;
 }
 
 #[tokio::test]
