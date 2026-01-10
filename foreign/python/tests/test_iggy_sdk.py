@@ -27,6 +27,7 @@ import uuid
 from datetime import timedelta
 
 import pytest
+
 from apache_iggy import AutoCommit, IggyClient, PollingStrategy, ReceiveMessage
 from apache_iggy import SendMessage as Message
 
@@ -521,7 +522,6 @@ class TestConsumerGroup:
 
         # Setup
         received_messages = []
-        shutdown_event = asyncio.Event()
         await iggy_client.create_stream(stream_name)
         await iggy_client.create_topic(
             stream=stream_name, name=topic_name, partitions_count=1

@@ -17,9 +17,10 @@
 
 import asyncio
 
+from loguru import logger
+
 # Assuming there's a Python module for iggy with similar functionalities.
 from apache_iggy import IggyClient, PollingStrategy, ReceiveMessage
-from loguru import logger
 
 STREAM_NAME = "sample-stream"
 TOPIC_NAME = "sample-topic"
