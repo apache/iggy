@@ -26,14 +26,13 @@ use iggy_binary_protocol::{
 };
 use iggy_common::locking::{IggyRwLock, IggyRwLockFn};
 use iggy_common::{
-    BytesSerializable, COMPRESSION_HEADER_KEY, CompressionAlgorithm, Consumer, ConsumerKind,
-    DiagnosticEvent, EncryptorKind, HeaderKey, IdKind, Identifier, IggyDuration, IggyError,
-    IggyMessage, IggyTimestamp, PolledMessages, PollingKind, PollingStrategy,
+    BytesSerializable, CompressionAlgorithm, Consumer, ConsumerKind, DiagnosticEvent,
+    EncryptorKind, IdKind, Identifier, IggyDuration, IggyError, IggyMessage, IggyTimestamp,
+    PolledMessages, PollingKind, PollingStrategy,
 };
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
-use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
 use std::task::{Context, Poll};
@@ -921,12 +920,9 @@ impl ReceivedMessage {
 }
 
 fn maybe_decompress(message: &mut IggyMessage) -> Result<(), IggyError> {
-    if let Ok(Some(algorithm_value)) =
-        message.get_user_header(&HeaderKey::from_str(COMPRESSION_HEADER_KEY).unwrap())
+    if let Ok(Some(algorithm_value)) = message.get_user_header(&CompressionAlgorithm::header_key())
     {
-        let algorithm_name = algorithm_value.as_str().unwrap();
-        let algorithm = CompressionAlgorithm::from_str(algorithm_name)
-            .expect("compression algorithm in user header should match any of the available CompressionAlgorithms.");
+        let algorithm = CompressionAlgorithm::from_header_value(&algorithm_value)?;
 
         let decompressed_payload = algorithm.decompress(&message.payload)?;
         message.payload = Bytes::from(decompressed_payload);
@@ -934,7 +930,7 @@ fn maybe_decompress(message: &mut IggyMessage) -> Result<(), IggyError> {
 
         // Remove the compression header since payload is now decompressed
         if let Ok(Some(mut headers_map)) = message.user_headers_map() {
-            headers_map.remove(&HeaderKey::from_str(COMPRESSION_HEADER_KEY).unwrap());
+            headers_map.remove(&CompressionAlgorithm::header_key());
             let headers_bytes = headers_map.to_bytes();
             message.header.user_headers_length = headers_bytes.len() as u32;
             message.user_headers = if headers_map.is_empty() {

@@ -18,6 +18,7 @@
 
 use crate::error::IggyError;
 use crate::types::message::MAX_PAYLOAD_SIZE;
+use crate::{COMPRESSION_HEADER_KEY, HeaderKey, HeaderValue};
 use flate2::{Compression, read::GzDecoder, write::GzEncoder};
 use lz4_flex::frame::{FrameDecoder, FrameEncoder};
 use serde::{
@@ -60,6 +61,25 @@ impl FromStr for CompressionAlgorithm {
 }
 
 impl CompressionAlgorithm {
+    pub fn header_key() -> HeaderKey {
+        HeaderKey::new(COMPRESSION_HEADER_KEY)
+            .expect("COMPRESSION_HEADER_KEY is an InvalidHeaderKey")
+    }
+
+    pub fn to_header_value(&self) -> HeaderValue {
+        HeaderValue::from_str(&self.to_string())
+            .expect("algorithm name is not a valid CompressionAlgorithm")
+    }
+
+    pub fn from_header_value(value: &HeaderValue) -> Result<Self, IggyError> {
+        let name = value.as_str().map_err(|_| {
+            IggyError::DecompressionError("HeaderValue not of type HeaderKind::String".into())
+        })?;
+        Self::from_str(name).map_err(|_| {
+            IggyError::DecompressionError(format!("unknown compression algorithm: {}", name))
+        })
+    }
+
     pub fn compress(&self, data: &[u8]) -> Result<Vec<u8>, IggyError> {
         match self {
             CompressionAlgorithm::None => Ok(data.to_vec()),
@@ -294,6 +314,32 @@ mod tests {
             "compression/ decompression mismatch for algorithm {:?}",
             config
         );
+    }
+
+    #[test]
+    fn test_produce_header_key() {
+        let test_header_key = CompressionAlgorithm::header_key();
+        assert_eq!(
+            test_header_key,
+            HeaderKey::new(COMPRESSION_HEADER_KEY).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_produce_header_value() {
+        let test_compression = CompressionAlgorithm::Gzip;
+        assert_eq!(
+            test_compression.to_header_value(),
+            HeaderValue::from_kind_str_and_value_str("string", "gzip").unwrap()
+        );
+    }
+
+    #[test]
+    fn test_from_header_value() {
+        let algorithm_target = CompressionAlgorithm::Gzip;
+        let header_value = algorithm_target.to_header_value();
+        let algorithm_test = CompressionAlgorithm::from_header_value(&header_value).unwrap();
+        assert_eq!(algorithm_test, algorithm_target);
     }
 
     #[test]

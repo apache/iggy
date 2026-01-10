@@ -26,11 +26,10 @@ use futures_util::StreamExt;
 use iggy_binary_protocol::{Client, MessageClient, StreamClient, TopicClient};
 use iggy_common::locking::{IggyRwLock, IggyRwLockFn};
 use iggy_common::{
-    BytesSerializable, COMPRESSION_HEADER_KEY, ClientCompressionConfig, CompressionAlgorithm,
-    DiagnosticEvent, EncryptorKind, HeaderKey, HeaderValue, IdKind, Identifier, IggyDuration,
-    IggyError, IggyExpiry, IggyMessage, IggyTimestamp, MaxTopicSize, Partitioner, Partitioning,
+    BytesSerializable, ClientCompressionConfig, CompressionAlgorithm, DiagnosticEvent,
+    EncryptorKind, IdKind, Identifier, IggyDuration, IggyError, IggyExpiry, IggyMessage,
+    IggyTimestamp, MaxTopicSize, Partitioner, Partitioning,
 };
-use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::sync::atomic::{AtomicBool, AtomicU64};
@@ -327,8 +326,8 @@ impl ProducerCore {
                     message.header.payload_length = message.payload.len() as u32;
                     let mut headers_map = message.user_headers_map()?.unwrap_or_default();
                     headers_map.insert(
-                        HeaderKey::new(COMPRESSION_HEADER_KEY).unwrap(),
-                        HeaderValue::from_str(&compressor.algorithm.to_string()).unwrap(),
+                        CompressionAlgorithm::header_key(),
+                        compressor.algorithm.to_header_value(),
                     );
                     let headers_bytes = headers_map.to_bytes();
                     message.header.user_headers_length = headers_bytes.len() as u32;
