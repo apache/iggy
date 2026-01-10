@@ -21,6 +21,7 @@ use super::output::BenchmarkOutputCommand;
 use super::props::{BenchmarkKindProps, BenchmarkTransportProps};
 use super::{
     defaults::{
+        DEFAULT_COMPRESSION_ALGORITHM, DEFAULT_COMPRESSION_MIN_PAYLOAD_SIZE,
         DEFAULT_MESSAGE_BATCHES, DEFAULT_MESSAGE_SIZE, DEFAULT_MESSAGES_PER_BATCH,
         DEFAULT_MOVING_AVERAGE_WINDOW, DEFAULT_PERFORM_CLEANUP, DEFAULT_SAMPLING_TIME,
         DEFAULT_SERVER_STDOUT_VISIBILITY, DEFAULT_SKIP_SERVER_START, DEFAULT_WARMUP_TIME,
@@ -31,7 +32,9 @@ use bench_report::benchmark_kind::BenchmarkKind;
 use bench_report::numeric_parameter::BenchmarkNumericParameter;
 use clap::error::ErrorKind;
 use clap::{CommandFactory, Parser};
-use iggy::prelude::{IggyByteSize, IggyDuration, TransportProtocol};
+use iggy::prelude::{
+    ClientCompressionConfig, CompressionAlgorithm, IggyByteSize, IggyDuration, TransportProtocol,
+};
 use std::net::SocketAddr;
 use std::num::NonZeroU32;
 use std::path::Path;
@@ -57,6 +60,15 @@ pub struct IggyBenchArgs {
     /// This argument is mutually exclusive with `total_messages_size`.
     #[arg(long, short = 'b', group = "data_to_process")]
     pub message_batches: Option<NonZeroU32>,
+
+    /// Message compression algorithm (requires high-level API)
+    /// Available algorithms: gzip, lz4, zstd, snappy
+    #[arg(long, short = 'c', value_parser = CompressionAlgorithm::from_str, default_value_t = DEFAULT_COMPRESSION_ALGORITHM)]
+    pub compression_algorithm: CompressionAlgorithm,
+
+    /// Minimum payload size (bytes) for compression. Messages smaller than `compression_min_size` are not compressed.
+    #[arg(long, default_value_t = DEFAULT_COMPRESSION_MIN_PAYLOAD_SIZE)]
+    pub compression_min_size: NonZeroU32,
 
     /// Total size of all messages to process in bytes (aggregate, for all actors).
     /// This argument is mutually exclusive with `message_batches`.
@@ -186,6 +198,15 @@ impl IggyBenchArgs {
                 .exit();
         }
 
+        if self.compression_algorithm != CompressionAlgorithm::None && !self.high_level_api {
+            Self::command()
+                .error(
+                    ErrorKind::ArgumentConflict,
+                    "Compression requires --high-level-api flag",
+                )
+                .exit();
+        }
+
         self.benchmark_kind.inner().validate();
     }
 
@@ -199,6 +220,17 @@ impl IggyBenchArgs {
 
     pub const fn message_size(&self) -> BenchmarkNumericParameter {
         self.message_size
+    }
+
+    pub fn compression_config(&self) -> Option<ClientCompressionConfig> {
+        if self.compression_algorithm == CompressionAlgorithm::None {
+            None
+        } else {
+            Some(ClientCompressionConfig {
+                algorithm: self.compression_algorithm,
+                min_size: self.compression_min_size.into(),
+            })
+        }
     }
 
     pub const fn total_data(&self) -> Option<IggyByteSize> {
@@ -396,6 +428,11 @@ impl IggyBenchArgs {
             transport.to_string(),
         ];
 
+        if self.compression_algorithm != CompressionAlgorithm::None {
+            parts.push(self.compression_algorithm.to_string());
+            parts.push(self.compression_min_size.to_string());
+        }
+
         if let Some(remark) = &self.remark() {
             parts.push(remark.clone());
         }
@@ -446,6 +483,14 @@ impl IggyBenchArgs {
             self.message_size(),
             self.messages_per_batch(),
         );
+
+        if self.compression_algorithm != CompressionAlgorithm::None {
+            let compression_str = format!(
+                " compression algorithm {} and min. byte size to realize compression {}",
+                self.compression_algorithm, self.compression_min_size
+            );
+            name.push_str(&compression_str);
+        }
 
         if let Some(remark) = &self.remark() {
             name = format!("{name} ({remark})");

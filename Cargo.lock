@@ -4673,8 +4673,10 @@ dependencies = [
  "err_trail",
  "fast-async-mutex",
  "figment",
+ "flate2",
  "human-repr",
  "humantime",
+ "lz4_flex 0.12.0",
  "nix",
  "once_cell",
  "rcgen",
@@ -4684,6 +4686,7 @@ dependencies = [
  "serde_json",
  "serde_with",
  "serial_test",
+ "snap",
  "slab",
  "strum 0.27.2",
  "thiserror 2.0.17",
@@ -4692,6 +4695,7 @@ dependencies = [
  "tracing",
  "tungstenite",
  "twox-hash",
+ "zstd",
 ]
 
 [[package]]
@@ -5591,6 +5595,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "lz4_flex"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ab6473172471198271ff72e9379150e9dfd70d8e533e0752a27e515b48dd375e"
+dependencies = [
+ "twox-hash",
+]
+
+[[package]]
 name = "lzma-rust2"
 version = "0.15.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6464,7 +6477,7 @@ dependencies = [
  "futures",
  "half",
  "hashbrown 0.15.5",
- "lz4_flex",
+ "lz4_flex 0.11.5",
  "num",
  "num-bigint",
  "paste",

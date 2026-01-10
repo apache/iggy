@@ -118,8 +118,15 @@ impl BenchmarkReport {
         };
         let streams = format!("{} Streams", self.params.streams);
 
+        let compression = if let Some(algorithm) = &self.params.compression_algorithm {
+            let min_size = self.params.compression_min_size.unwrap_or(0);
+            format!("Compression: {} (min {} bytes)", algorithm, min_size)
+        } else {
+            "Compression: none".to_owned()
+        };
+
         format!(
-            "{actors_info}  •  {streams}  •  {topics}{partitions}  •  {messages_per_batch} Msg/batch  •  {message_batches} Batches  •  {message_size} Bytes/msg  •  {user_data_print}",
+            "{actors_info}  •  {streams}  •  {topics}{partitions}  • {compression}  • {messages_per_batch} Msg/batch  •  {message_batches} Batches  •  {message_size} Bytes/msg  •  {user_data_print}",
         )
     }
 }
