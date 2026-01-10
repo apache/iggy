@@ -545,7 +545,7 @@ class TestConsumerGroup:
             [Message(m) for m in test_messages],
         )
 
-        async for message in consumer.iter():
+        async for message in consumer.iter_messages():
             received_messages.append(message.payload().decode())
             if len(received_messages) == 5:
                 break
