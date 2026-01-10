@@ -131,11 +131,11 @@ impl IggyConsumer {
     }
 
     /// Asynchronously iterate over `ReceiveMessage`s.
-    /// 
+    ///
     /// Returns an async iterator that raises `StopAsyncIteration` when no more messages are available
     /// or a `PyRuntimeError` on failure.
-    /// 
-    /// Note: This method does not currently support `AutoCommit.After`. 
+    ///
+    /// Note: This method does not currently support `AutoCommit.After`.
     /// For `AutoCommit.IntervalOrAfter(datetime.timedelta, AutoCommitAfter)`,
     /// only the interval part is applied; the `after` mode is ignored.
     /// Use `consume_messages()` if you need commit-after-processing semantics.
