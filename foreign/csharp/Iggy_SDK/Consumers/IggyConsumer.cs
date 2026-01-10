@@ -110,7 +110,6 @@ public partial class IggyConsumer : IAsyncDisposable
         _consumerErrorEvents.Clear();
         _pollingSemaphore.Dispose();
         _connectionStateSemaphore.Dispose();
-
     }
 
     /// <summary>
@@ -308,8 +307,7 @@ public partial class IggyConsumer : IAsyncDisposable
         }
         catch (IggyInvalidStatusCodeException ex)
         {
-            // 5004 - Consumer group already exists TODO: refactor errors
-            if (ex.StatusCode != 5004)
+            if (ex.ErrorCode != IggyErrorCode.ConsumerGroupNameAlreadyExists)
             {
                 LogFailedToCreateConsumerGroup(ex, groupName);
                 return false;
