@@ -138,7 +138,7 @@ pub fn map_personal_access_tokens(
     let mut personal_access_tokens_data = Vec::with_capacity(personal_access_tokens.len());
     for personal_access_token in personal_access_tokens {
         let personal_access_token = PersonalAccessTokenInfo {
-            name: personal_access_token.name.as_str().to_owned(),
+            name: (*personal_access_token.name).to_owned(),
             expiry_at: personal_access_token.expiry_at,
         };
         personal_access_tokens_data.push(personal_access_token);
