@@ -265,6 +265,7 @@ impl Validatable<ConfigurationError> for PersonalAccessTokenConfig {
 impl Validatable<ConfigurationError> for LoggingConfig {
     fn validate(&self) -> Result<(), ConfigurationError> {
         if self.level.is_empty() {
+            error!("system.logging.level is supposed be configured");
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
 
@@ -272,6 +273,14 @@ impl Validatable<ConfigurationError> for LoggingConfig {
             error!(
                 "Configured system.logging.retention {} is less than minimum 1 second",
                 self.retention
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+
+        if self.rotation_check_interval.as_secs() < 1 {
+            error!(
+                "Configured system.logging.rotation_check_interval {} is less than minimum 1 second",
+                self.rotation_check_interval
             );
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
