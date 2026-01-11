@@ -1,4 +1,5 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
  * regarding copyright ownership.  The ASF licenses this file
@@ -20,7 +21,7 @@ use iggy::prelude::*;
 use iggy_common::{
     CompressionAlgorithm, Identifier, IggyByteSize, IggyDuration, IggyExpiry, MaxTopicSize,
 };
-use integration::test_server::ClientFactory;
+use integration::test_server::{ClientFactory, login_root};
 use std::path::Path;
 use std::time::Duration;
 use tokio::fs;
@@ -30,8 +31,8 @@ pub const MAX_SINGLE_LOG_SIZE: IggyByteSize = IggyByteSize::new(2 * 1000 * 1000)
 pub const MAX_TOTAL_LOG_SIZE: IggyByteSize = IggyByteSize::new(10 * 1000 * 1000);
 pub const LOG_ROTATION_CHECK_INTERVAL: IggyDuration = IggyDuration::ONE_SECOND;
 const OPERATION_TIMEOUT_SECS: u64 = 10;
-const OPERATION_LOOP_COUNT: usize = 2000;
-const OPERATION_BATCH_SIZE: usize = 200;
+const OPERATION_LOOP_COUNT: usize = 3000;
+const OPERATION_BATCH_SIZE: usize = 500;
 const IGGY_LOG_BASE_NAME: &str = "iggy-server.log";
 
 pub async fn run(client_factory: &dyn ClientFactory, log_dir: &str) {
@@ -78,7 +79,6 @@ async fn init_valid_client(client_factory: &dyn ClientFactory) -> Result<IggyCli
         .map_err(|e| format!("Client connection failed: {e:?}"))?;
 
     let client = IggyClient::create(client_wrapper, None, None);
-    use integration::test_server::login_root;
     timeout(operation_timeout.get_duration(), login_root(&client))
         .await
         .map_err(|e| format!("Root user login timed out: {e:?}"))?;
@@ -111,6 +111,9 @@ async fn generate_enough_logs(client: &IggyClient) -> Result<(), String> {
         .await
         .map_err(|e| format!("Failed to create topic {topic_name}: {e}"))?;
 
+    let topic_identifier = Identifier::named(topic_name)
+        .map_err(|e| format!("Failed to create topic label for {topic_name}: {e}"))?;
+
     for batch in 0..(OPERATION_LOOP_COUNT / OPERATION_BATCH_SIZE) {
         let mut messages = Vec::new();
         for msg_idx in 0..OPERATION_BATCH_SIZE {
@@ -129,9 +132,6 @@ async fn generate_enough_logs(client: &IggyClient) -> Result<(), String> {
             messages.push(message);
         }
 
-        let topic_identifier = Identifier::named(topic_name)
-            .map_err(|e| format!("Failed to create topic label for {topic_name}: {e}"))?;
-
         client
             .send_messages(
                 &stream_identifier,
@@ -143,8 +143,8 @@ async fn generate_enough_logs(client: &IggyClient) -> Result<(), String> {
             .map_err(|e| format!("Failed to send messages: {e}"))?;
     }
 
-    // Wait for writing
-    sleep(Duration::from_millis(100)).await;
+    // Wait for server to flush log buffer to disk
+    sleep(Duration::from_millis(200)).await;
 
     client
         .delete_stream(&stream_identifier)
@@ -194,12 +194,10 @@ async fn validate_log_rotation_rules(log_dir: &Path) -> Result<(), String> {
         ));
     }
 
+    let from_mb_to_bytes: u64 = 1000 * 1000;
     let mut total_log_size = IggyByteSize::new(0);
-    let max_single_file_bytes = MAX_SINGLE_LOG_SIZE.as_bytes_u64();
-    let max_total_file_bytes = MAX_TOTAL_LOG_SIZE.as_bytes_u64();
-
-    let max_single_mb = max_single_file_bytes / (1000 * 1000);
-    let max_total_mb = max_total_file_bytes / (1000 * 1000);
+    let max_single_mb = MAX_SINGLE_LOG_SIZE.as_bytes_u64() / from_mb_to_bytes;
+    let max_total_mb = MAX_TOTAL_LOG_SIZE.as_bytes_u64() / from_mb_to_bytes;
 
     for log_file in valid_log_files {
         let file_metadata = fs::metadata(&log_file).await.map_err(|e| {
@@ -211,9 +209,11 @@ async fn validate_log_rotation_rules(log_dir: &Path) -> Result<(), String> {
         })?;
 
         let file_size_bytes = file_metadata.len();
-        let file_size = IggyByteSize::new(file_size_bytes);
 
-        let current_single_mb = file_size_bytes / (1000 * 1000);
+        // In fact,  due to the write cache mechanism,  the actual size  of  the  logs
+        // written to the file will be slightly larger than expected, so there ignores
+        // tiny minor overflow by comparing integer  MB  values instead of exact bytes
+        let current_single_mb = file_size_bytes / from_mb_to_bytes;
         if current_single_mb > max_single_mb {
             return Err(format!(
                 "Single log file exceeds maximum allowed size: '{}'",
@@ -221,10 +221,10 @@ async fn validate_log_rotation_rules(log_dir: &Path) -> Result<(), String> {
             ));
         }
 
-        total_log_size += file_size;
+        total_log_size += IggyByteSize::new(file_size_bytes);
     }
 
-    let current_total_mb = total_log_size.as_bytes_u64() / (1000 * 1000);
+    let current_total_mb = total_log_size.as_bytes_u64() / from_mb_to_bytes;
     if current_total_mb > max_total_mb {
         return Err(format!(
             "Total size of all log files exceeds maximum allowed size: '{}'",
