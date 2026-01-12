@@ -41,14 +41,20 @@ impl BenchmarkBatchGenerator {
         let max_len = message_size.max() as usize;
         let is_fixed = message_size.is_fixed() && messages_per_batch.is_fixed();
 
-        let template = r#"{"name": "example messasge payload", "description": "simulating realistic compressible data", "user": "test-user", "id": 42, "trace_id": "812Fr%210"}"#;
-        let payload_bytes = template
-            .as_bytes()
-            .iter()
-            .cycle()
-            .take(max_len)
-            .copied()
-            .collect();
+        let mut buf = Vec::with_capacity(max_len);
+        let mut i = 0;
+        while buf.len() < max_len {
+            buf.extend_from_slice(
+                format!(
+                    r#"{{"ts": "2000-01-{:02}T{:02}:{:02}:{:02}Z", "level": "info", "trace":{}, "command": "command-{}", "status": 200, "latency_ms": {}}}"#,
+                    i % 28, i % 24, i % 60, i % 60, i, i % 1000, i % 120
+                )
+                .as_bytes(),
+            );
+            i += 1;
+        }
+        buf.truncate(max_len);
+        let payload_bytes: Bytes = Bytes::from(buf);
 
         let mut batch_generator = Self {
             message_size,

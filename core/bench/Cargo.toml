@@ -47,7 +47,6 @@ human-repr = { workspace = true }
 iggy = { workspace = true }
 integration = { workspace = true }
 nonzero_lit = { workspace = true }
-rand = { workspace = true }
 rayon = "1.11.0"
 serde = { workspace = true }
 sysinfo = { workspace = true }
