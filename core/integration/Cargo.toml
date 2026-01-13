@@ -28,7 +28,7 @@ ci-qemu = []
 
 [dependencies]
 ahash = { workspace = true }
-assert_cmd = "2.1.1"
+assert_cmd = "2.1.2"
 async-trait = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
@@ -43,7 +43,7 @@ iggy_binary_protocol = { workspace = true }
 iggy_common = { workspace = true }
 keyring = { workspace = true }
 lazy_static = { workspace = true }
-libc = "0.2.178"
+libc = "0.2.180"
 log = { workspace = true }
 predicates = { workspace = true }
 rand = { workspace = true }

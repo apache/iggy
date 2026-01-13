@@ -119,7 +119,7 @@ toml = { workspace = true }
 tower-http = { workspace = true }
 tracing = { workspace = true }
 tracing-appender = { workspace = true }
-tracing-opentelemetry = "0.32.0"
+tracing-opentelemetry = "0.32.1"
 tracing-subscriber = { workspace = true }
 tungstenite = { workspace = true }
 ulid = "1.2.1"
