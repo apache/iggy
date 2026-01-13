@@ -87,7 +87,7 @@ include_metadata = false
 ## Configuration Reference
 
 | Property | Type | Required | Default | Description |
-|----------|------|----------|---------|-------------|
+| -------- | ---- | -------- | ------- | ----------- |
 | `connection_string` | String | Yes | - | Redshift connection string in PostgreSQL format |
 | `target_table` | String | Yes | - | Target table name (can include schema) |
 | `s3_bucket` | String | Yes | - | S3 bucket for staging CSV files |
@@ -210,6 +210,7 @@ The connector implements retry logic with exponential backoff for transient fail
 - **Cleanup failures**: Logged as warnings, do not block processing
 
 Use `max_errors` to control COPY behavior:
+
 - `0`: Fail on first error (strict mode)
 - `N`: Allow up to N errors per COPY operation
 
@@ -217,7 +218,7 @@ Use `max_errors` to control COPY behavior:
 
 The connector logs statistics on close:
 
-```
+```text
 Closing Redshift sink connector ID: 1. Stats: 150000 messages processed, 15 batches loaded, 0 errors
 ```
 
