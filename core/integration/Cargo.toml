@@ -61,7 +61,7 @@ server = { workspace = true }
 strum_macros = { workspace = true }
 tempfile = { workspace = true }
 test-case = { workspace = true }
-testcontainers-modules = { version = "0.14.0", features = ["postgres"] }
+testcontainers-modules = { version = "0.14.0", features = ["postgres", "localstack"] }
 tokio = { workspace = true }
 twox-hash = { workspace = true }
 uuid = { workspace = true }

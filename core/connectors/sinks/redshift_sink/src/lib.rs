@@ -97,11 +97,14 @@ impl RedshiftSink {
             &self.config.s3_region,
             self.config.aws_access_key_id.as_deref(),
             self.config.aws_secret_access_key.as_deref(),
+            self.config.s3_endpoint.as_deref(),
         )?;
         self.s3_uploader = Some(uploader);
         info!(
-            "Initialized S3 uploader for bucket: {}, region: {}",
-            self.config.s3_bucket, self.config.s3_region
+            "Initialized S3 uploader for bucket: {}, region: {}{}",
+            self.config.s3_bucket,
+            self.config.s3_region,
+            self.config.s3_endpoint.as_ref().map_or(String::new(), |e| format!(", endpoint: {}", e))
         );
         Ok(())
     }

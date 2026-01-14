@@ -38,10 +38,17 @@ impl S3Uploader {
         region: &str,
         access_key_id: Option<&str>,
         secret_access_key: Option<&str>,
+        endpoint: Option<&str>,
     ) -> Result<Self, Error> {
-        let region = Region::Custom {
-            region: region.to_string(),
-            endpoint: format!("https://s3.{}.amazonaws.com", region),
+        let region = match endpoint {
+            Some(ep) => Region::Custom {
+                region: region.to_string(),
+                endpoint: ep.to_string(),
+            },
+            None => Region::Custom {
+                region: region.to_string(),
+                endpoint: format!("https://s3.{}.amazonaws.com", region),
+            },
         };
 
         let credentials = match (access_key_id, secret_access_key) {
@@ -60,10 +67,15 @@ impl S3Uploader {
             }
         };
 
-        let bucket = Bucket::new(bucket_name, region, credentials).map_err(|e| {
+        let mut bucket = Bucket::new(bucket_name, region, credentials).map_err(|e| {
             error!("Failed to create S3 bucket client: {}", e);
             Error::InitError(format!("Failed to initialize S3 bucket: {e}"))
         })?;
+
+        // Use path-style access for custom endpoints (LocalStack, MinIO, etc.)
+        if endpoint.is_some() {
+            bucket = bucket.with_path_style();
+        }
 
         let prefix = prefix.trim_end_matches('/').to_string();
 

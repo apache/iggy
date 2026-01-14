@@ -48,6 +48,11 @@ pub struct RedshiftSinkConfig {
     /// Example: `us-east-1`
     pub s3_region: String,
 
+    /// Custom S3 endpoint URL for testing with LocalStack or MinIO.
+    /// If not specified, uses the default AWS S3 endpoint.
+    /// Example: `http://localhost:4566`
+    pub s3_endpoint: Option<String>,
+
     /// AWS access key ID. Required if IAM role is not specified.
     pub aws_access_key_id: Option<String>,
 
@@ -161,6 +166,7 @@ mod tests {
             s3_bucket: "bucket".to_string(),
             s3_prefix: None,
             s3_region: "us-east-1".to_string(),
+            s3_endpoint: None,
             aws_access_key_id: None,
             aws_secret_access_key: None,
             batch_size: None,
