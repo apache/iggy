@@ -45,6 +45,7 @@ impl ServerCommandHandler for StoreConsumerOffset {
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
+        shard.ensure_authenticated(session)?;
         shard
             .store_consumer_offset(
                 session,

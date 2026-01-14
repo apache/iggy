@@ -36,7 +36,6 @@ impl IggyShard {
         session: &Session,
         user_id: &Identifier,
     ) -> Result<Option<User>, IggyError> {
-        self.ensure_authenticated(session)?;
         let Some(user) = self.try_get_user(user_id)? else {
             return Ok(None);
         };
@@ -63,7 +62,6 @@ impl IggyShard {
     }
 
     pub async fn get_users(&self, session: &Session) -> Result<Vec<User>, IggyError> {
-        self.ensure_authenticated(session)?;
         self.permissioner
         .borrow()
             .get_users(session.get_user_id())
@@ -84,7 +82,6 @@ impl IggyShard {
         status: UserStatus,
         permissions: Option<Permissions>,
     ) -> Result<User, IggyError> {
-        self.ensure_authenticated(session)?;
         self.permissioner
             .borrow()
             .create_user(session.get_user_id())
@@ -148,7 +145,6 @@ impl IggyShard {
     }
 
     pub fn delete_user(&self, session: &Session, user_id: &Identifier) -> Result<User, IggyError> {
-        self.ensure_authenticated(session)?;
         self.permissioner
             .borrow()
             .delete_user(session.get_user_id())
@@ -204,7 +200,6 @@ impl IggyShard {
         username: Option<String>,
         status: Option<UserStatus>,
     ) -> Result<User, IggyError> {
-        self.ensure_authenticated(session)?;
         self.permissioner
         .borrow()
             .update_user(session.get_user_id())
@@ -266,8 +261,6 @@ impl IggyShard {
         user_id: &Identifier,
         permissions: Option<Permissions>,
     ) -> Result<(), IggyError> {
-        self.ensure_authenticated(session)?;
-
         {
             self.permissioner
             .borrow()
@@ -326,8 +319,6 @@ impl IggyShard {
         current_password: &str,
         new_password: &str,
     ) -> Result<(), IggyError> {
-        self.ensure_authenticated(session)?;
-
         {
             let user = self.get_user(user_id).error(|e: &IggyError| {
                 format!("{COMPONENT} (error: {e}) - failed to get user with id: {user_id}")
@@ -437,7 +428,6 @@ impl IggyShard {
     }
 
     pub fn logout_user(&self, session: &Session) -> Result<(), IggyError> {
-        self.ensure_authenticated(session)?;
         let client_id = session.client_id;
         self.logout_user_base(client_id)?;
         Ok(())

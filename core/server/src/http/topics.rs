@@ -69,8 +69,6 @@ async fn get_topic(
 
     let session = Session::stateless(identity.user_id, identity.ip_address);
 
-    // Check permissions and stream existence
-    state.shard.shard().ensure_authenticated(&session)?;
     let stream_exists = state
         .shard
         .shard()
@@ -130,8 +128,6 @@ async fn get_topics(
     let stream_id = Identifier::from_str_value(&stream_id)?;
     let session = Session::stateless(identity.user_id, identity.ip_address);
 
-    // Check permissions and stream existence
-    state.shard.shard().ensure_authenticated(&session)?;
     state.shard.shard().ensure_stream_exists(&stream_id)?;
 
     let numeric_stream_id = state

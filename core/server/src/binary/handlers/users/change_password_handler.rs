@@ -49,6 +49,7 @@ impl ServerCommandHandler for ChangePassword {
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
+        shard.ensure_authenticated(session)?;
 
         info!("Changing password for user with ID: {}...", self.user_id);
         shard

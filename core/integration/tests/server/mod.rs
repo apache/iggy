@@ -32,8 +32,8 @@ use integration::{
     websocket_client::WebSocketClientFactory,
 };
 use scenarios::{
-    bench_scenario, consumer_group_auto_commit_reconnection_scenario, consumer_group_join_scenario,
-    consumer_group_offset_cleanup_scenario,
+    authentication_scenario, bench_scenario, consumer_group_auto_commit_reconnection_scenario,
+    consumer_group_join_scenario, consumer_group_offset_cleanup_scenario,
     consumer_group_with_multiple_clients_polling_messages_scenario,
     consumer_group_with_single_client_polling_messages_scenario,
     consumer_timestamp_polling_scenario, create_message_payload, message_headers_scenario,
@@ -45,6 +45,10 @@ use std::time::Duration;
 use std::{collections::HashMap, future::Future};
 
 type ScenarioFn = fn(&dyn ClientFactory) -> Pin<Box<dyn Future<Output = ()> + '_>>;
+
+fn authentication_scenario() -> ScenarioFn {
+    |factory| Box::pin(authentication_scenario::run(factory))
+}
 
 fn system_scenario() -> ScenarioFn {
     |factory| Box::pin(system_scenario::run(factory))

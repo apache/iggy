@@ -49,6 +49,7 @@ impl ServerCommandHandler for UpdateUser {
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
+        shard.ensure_authenticated(session)?;
 
         let user =shard
                 .update_user(

@@ -41,7 +41,6 @@ impl IggyShard {
         topic_id: &Identifier,
         name: String,
     ) -> Result<consumer_group::ConsumerGroup, IggyError> {
-        self.ensure_authenticated(session)?;
         self.ensure_topic_exists(stream_id, topic_id)?;
         let exists = self
             .streams
@@ -115,7 +114,6 @@ impl IggyShard {
         topic_id: &Identifier,
         group_id: &Identifier,
     ) -> Result<consumer_group::ConsumerGroup, IggyError> {
-        self.ensure_authenticated(session)?;
         self.ensure_consumer_group_exists(stream_id, topic_id, group_id)?;
         {
             let topic_id =
@@ -183,7 +181,6 @@ impl IggyShard {
         topic_id: &Identifier,
         group_id: &Identifier,
     ) -> Result<(), IggyError> {
-        self.ensure_authenticated(session)?;
         self.ensure_consumer_group_exists(stream_id, topic_id, group_id)?;
         {
             let topic_id =
@@ -242,7 +239,6 @@ impl IggyShard {
         topic_id: &Identifier,
         group_id: &Identifier,
     ) -> Result<(), IggyError> {
-        self.ensure_authenticated(session)?;
         self.ensure_consumer_group_exists(stream_id, topic_id, group_id)?;
         {
             let topic_id =

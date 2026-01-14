@@ -5035,6 +5035,7 @@ dependencies = [
  "serde_json",
  "serial_test",
  "server",
+ "strum 0.27.2",
  "strum_macros 0.27.2",
  "tempfile",
  "test-case",
@@ -8290,7 +8291,7 @@ dependencies = [
 
 [[package]]
 name = "server"
-version = "0.6.1-edge.3"
+version = "0.6.1-edge.4"
 dependencies = [
  "ahash 0.8.12",
  "anyhow",

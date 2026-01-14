@@ -65,11 +65,18 @@ async fn get_metrics(State(state): State<Arc<AppState>>) -> Result<String, Custo
 }
 
 #[debug_handler]
-async fn get_stats(State(state): State<Arc<AppState>>) -> Result<Json<Stats>, CustomError> {
+async fn get_stats(
+    State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<Identity>,
+) -> Result<Json<Stats>, CustomError> {
+    let _session = Session::stateless(identity.user_id, identity.ip_address);
     let stats_future = SendWrapper::new(state.shard.shard().get_stats());
-    let stats = stats_future
-        .await
-        .error(|e: &IggyError| format!("{COMPONENT} (error: {e}) - failed to get stats"))?;
+    let stats = stats_future.await.error(|e: &IggyError| {
+        format!(
+            "{COMPONENT} (error: {e}) - failed to get stats, user ID: {}",
+            identity.user_id
+        )
+    })?;
     Ok(Json(stats))
 }
 

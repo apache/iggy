@@ -42,6 +42,7 @@ impl ServerCommandHandler for GetMe {
         session: &Session,
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {
+        shard.ensure_authenticated(session)?;
         let Some(client) = shard.get_client(session, session.client_id).error(
             |e: &IggyError| {
                 format!(

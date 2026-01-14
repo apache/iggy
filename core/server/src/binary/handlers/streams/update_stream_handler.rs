@@ -47,6 +47,7 @@ impl ServerCommandHandler for UpdateStream {
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
+        shard.ensure_authenticated(session)?;
         let stream_id = self.stream_id.clone();
         shard
         .update_stream(session, &self.stream_id, self.name.clone())

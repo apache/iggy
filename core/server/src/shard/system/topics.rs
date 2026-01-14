@@ -40,7 +40,6 @@ impl IggyShard {
         max_topic_size: MaxTopicSize,
         replication_factor: Option<u8>,
     ) -> Result<topic::Topic, IggyError> {
-        self.ensure_authenticated(session)?;
         self.ensure_stream_exists(stream_id)?;
         let numeric_stream_id = self.streams.get_index(stream_id);
         {
@@ -103,7 +102,6 @@ impl IggyShard {
         max_topic_size: MaxTopicSize,
         replication_factor: Option<u8>,
     ) -> Result<(), IggyError> {
-        self.ensure_authenticated(session)?;
         self.ensure_topic_exists(stream_id, topic_id)?;
         {
             let topic_id_val =
@@ -202,7 +200,6 @@ impl IggyShard {
         stream_id: &Identifier,
         topic_id: &Identifier,
     ) -> Result<topic::Topic, IggyError> {
-        self.ensure_authenticated(session)?;
         self.ensure_topic_exists(stream_id, topic_id)?;
         let numeric_topic_id =
             self.streams
@@ -274,7 +271,6 @@ impl IggyShard {
         stream_id: &Identifier,
         topic_id: &Identifier,
     ) -> Result<(), IggyError> {
-        self.ensure_authenticated(session)?;
         self.ensure_topic_exists(stream_id, topic_id)?;
         {
             let topic_id =
