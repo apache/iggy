@@ -167,6 +167,7 @@ public class AsyncTcpConnection {
 
     /**
      * Sends a command asynchronously and returns the response.
+     * Uses Netty's EventLoop to ensure thread-safe sequential request processing with FIFO response matching.
      */
     public CompletableFuture<ByteBuf> sendAsync(int commandCode, ByteBuf payload) {
         if (isClosed.get()) {
@@ -179,8 +180,6 @@ public class AsyncTcpConnection {
         // Starting the response clock
         long starttime = System.nanoTime();
 
-        // Since Iggy doesn't use request IDs, we'll just use a simple queue
-        // Each request will get the next response in order
         CompletableFuture<ByteBuf> responseFuture = new CompletableFuture<>();
 
         channelPool.acquire().addListener((FutureListener<Channel>) f -> {
