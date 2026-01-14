@@ -22,18 +22,18 @@
 //!
 //! # Architecture
 //!
-//! - `GlobalMetadata` (snapshot.rs): Immutable snapshot with all metadata
-//! - `SharedMetadata` (shared.rs): Thread-safe wrapper with ArcSwap
+//! - `InnerMetadata` (inner.rs): Immutable snapshot with all metadata
+//! - `Metadata` (reader.rs): Thread-safe read handle for querying metadata
 //! - Entity types: `StreamMeta`, `TopicMeta`, `PartitionMeta`, `UserMeta`, `ConsumerGroupMeta`
 //! - Consumer offsets are stored in `PartitionMeta` for cross-shard visibility
 
 mod absorb;
 mod consumer_group;
 mod consumer_group_member;
+mod inner;
 pub mod ops;
 mod partition;
-mod shared;
-mod snapshot;
+mod reader;
 mod stream;
 mod topic;
 mod user;
@@ -41,10 +41,10 @@ mod writer;
 
 pub use consumer_group::ConsumerGroupMeta;
 pub use consumer_group_member::ConsumerGroupMemberMeta;
+pub use inner::InnerMetadata;
 pub use ops::MetadataOp;
 pub use partition::PartitionMeta;
-pub use shared::Metadata;
-pub use snapshot::InnerMetadata;
+pub use reader::Metadata;
 pub use stream::StreamMeta;
 pub use topic::TopicMeta;
 pub use user::UserMeta;

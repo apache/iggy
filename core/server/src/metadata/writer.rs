@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::metadata::inner::InnerMetadata;
 use crate::metadata::ops::MetadataOp;
-use crate::metadata::shared::Metadata;
-use crate::metadata::snapshot::InnerMetadata;
+use crate::metadata::reader::Metadata;
 use crate::metadata::{
     ConsumerGroupId, ConsumerGroupMeta, PartitionId, PartitionMeta, StreamId, StreamMeta, TopicId,
     TopicMeta, UserId, UserMeta,
@@ -141,7 +141,7 @@ impl MetadataWriter {
 
         let count_before = reader
             .get_partitions_count(stream_id, topic_id)
-            .unwrap_or(0);
+            .expect("stream and topic must exist when adding partitions");
         let count = partitions.len();
 
         let revision_id = self.next_revision();

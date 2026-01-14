@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::metadata::snapshot::InnerMetadata;
+use crate::metadata::inner::InnerMetadata;
 use crate::metadata::{
     ConsumerGroupId, ConsumerGroupMeta, PartitionId, PartitionMeta, StreamId, StreamMeta, TopicId,
     TopicMeta, UserId, UserMeta,

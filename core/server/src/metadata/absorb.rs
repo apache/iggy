@@ -16,8 +16,8 @@
 // under the License.
 
 use crate::metadata::ConsumerGroupMemberMeta;
+use crate::metadata::inner::InnerMetadata;
 use crate::metadata::ops::MetadataOp;
-use crate::metadata::snapshot::InnerMetadata;
 use left_right::Absorb;
 use std::sync::atomic::Ordering;
 
