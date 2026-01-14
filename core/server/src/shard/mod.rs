@@ -18,6 +18,7 @@ inner() * or more contributor license agreements.  See the NOTICE file
 
 pub mod builder;
 pub mod namespace;
+pub mod shard_local_partitions;
 pub mod system;
 pub mod task_registry;
 pub mod tasks;
