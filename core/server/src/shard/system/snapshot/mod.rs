@@ -43,12 +43,10 @@ use std::process::Command;
 impl IggyShard {
     pub async fn get_snapshot(
         &self,
-        session: &Session,
+        _session: &Session,
         compression: SnapshotCompression,
         snapshot_types: &Vec<SystemSnapshotType>,
     ) -> Result<Snapshot, IggyError> {
-        self.ensure_authenticated(session)?;
-
         let snapshot_types = if snapshot_types.contains(&SystemSnapshotType::All) {
             if snapshot_types.len() > 1 {
                 error!("When using 'All' snapshot type, no other types can be specified");

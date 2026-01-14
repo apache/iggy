@@ -43,6 +43,7 @@ impl ServerCommandHandler for GetUser {
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
+        shard.ensure_authenticated(session)?;
         let Ok(user) = shard.find_user(session, &self.user_id) else {
             sender.send_empty_ok_response().await?;
             return Ok(HandlerResult::Finished);

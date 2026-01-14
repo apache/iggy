@@ -43,6 +43,7 @@ impl ServerCommandHandler for DeleteConsumerOffset {
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
+        shard.ensure_authenticated(session)?;
         shard
             .delete_consumer_offset(
                 session,

@@ -16,6 +16,7 @@
  * under the License.
  */
 
+pub mod authentication_scenario;
 pub mod bench_scenario;
 pub mod concurrent_scenario;
 pub mod consumer_group_auto_commit_reconnection_scenario;

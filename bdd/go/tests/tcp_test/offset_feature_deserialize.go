@@ -183,15 +183,14 @@ var _ = ginkgo.Describe("GET CONSUMER OFFSET:", func() {
 			consumer := iggcon.NewGroupConsumer(randomU32Identifier())
 			partitionId := uint32(1)
 
-			offset, err := client.GetConsumerOffset(
+			_, err := client.GetConsumerOffset(
 				consumer,
 				randomU32Identifier(),
 				randomU32Identifier(),
 				&partitionId,
 			)
 
-			itShouldNotReturnError(err)
-			itShouldReturnNilOffsetForNewConsumerGroup(offset)
+			itShouldReturnUnauthenticatedError(err)
 		})
 	})
 })

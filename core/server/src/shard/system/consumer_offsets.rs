@@ -40,7 +40,6 @@ impl IggyShard {
         partition_id: Option<u32>,
         offset: u64,
     ) -> Result<(PollingConsumer, usize), IggyError> {
-        self.ensure_authenticated(session)?;
         self.ensure_topic_exists(stream_id, topic_id)?;
         {
             let topic_id =
@@ -93,7 +92,6 @@ impl IggyShard {
         topic_id: &Identifier,
         partition_id: Option<u32>,
     ) -> Result<Option<ConsumerOffsetInfo>, IggyError> {
-        self.ensure_authenticated(session)?;
         self.ensure_topic_exists(stream_id, topic_id)?;
         {
             let topic_id =
@@ -153,7 +151,6 @@ impl IggyShard {
         topic_id: &Identifier,
         partition_id: Option<u32>,
     ) -> Result<(PollingConsumer, usize), IggyError> {
-        self.ensure_authenticated(session)?;
         self.ensure_topic_exists(stream_id, topic_id)?;
         {
             let topic_id =

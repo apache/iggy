@@ -57,6 +57,7 @@ impl ServerCommandHandler for PollMessages {
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
+        shard.ensure_authenticated(session)?;
         let PollMessages {
             consumer,
             partition_id,
