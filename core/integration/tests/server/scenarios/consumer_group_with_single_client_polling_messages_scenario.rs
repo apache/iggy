@@ -175,7 +175,6 @@ async fn execute_using_none_key(client: &IggyClient) {
         let message = &polled_messages.messages[0];
         assert_eq!(message.header.offset, offset);
         let payload = from_utf8(&message.payload).unwrap();
-
         assert_eq!(
             payload,
             &create_extended_message_payload(partition_id, entity_id)

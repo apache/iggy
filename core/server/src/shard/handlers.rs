@@ -382,8 +382,6 @@ async fn handle_request(
 
             let ns = IggyFullNamespace::new(stream_id.clone(), topic_id.clone(), partition_id);
 
-            info!("DBG PollMessage: -1");
-
             match initial_data {
                 SocketTransferPayload::SendMessages { batch } => {
                     let batch = shard.maybe_encrypt_messages(batch)?;
@@ -457,13 +455,9 @@ async fn handle_request(
                         sender
                             .send_ok_response_vectored(&response_length_bytes, bufs)
                             .await?;
-
-                        info!("DBG PollMessage: 2");
                     }
                 }
             }
-
-            info!("DBG PollMessage: 3");
 
             registry.spawn_connection(async move {
                 match handle_connection(&session, &mut sender, &shard_for_conn, conn_stop_receiver)
@@ -496,7 +490,6 @@ async fn handle_request(
                 }
             });
 
-            info!("DBG PollMessage: 4");
             Ok(ShardResponse::SocketTransferResponse)
         }
     }
