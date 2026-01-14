@@ -102,7 +102,7 @@ impl IggyShard {
                 if user
                     .personal_access_tokens
                     .iter()
-                    .any(|pat| pat.name.as_str() == name.as_str())
+                    .any(|pat| pat.name == name)
                 {
                     error!(
                         "Personal access token: {name} for user with ID: {user_id} already exists."
@@ -150,7 +150,7 @@ impl IggyShard {
                 let token = if let Some(pat) = user
                     .personal_access_tokens
                     .iter()
-                    .find(|pat| pat.name.as_str() == name)
+                    .find(|pat| &*pat.name == name)
                 {
                     pat.token.clone()
                 } else {
@@ -182,7 +182,7 @@ impl IggyShard {
         let users = self.users.values();
         let mut personal_access_token = None;
         for user in &users {
-            if let Some(pat) = user.personal_access_tokens.get(&token_hash) {
+            if let Some(pat) = user.personal_access_tokens.get(token_hash.as_str()) {
                 personal_access_token = Some(pat);
                 break;
             }
@@ -205,7 +205,7 @@ impl IggyShard {
                 personal_access_token.name, personal_access_token.user_id
             );
             return Err(IggyError::PersonalAccessTokenExpired(
-                personal_access_token.name.as_str().to_owned(),
+                (*personal_access_token.name).to_owned(),
                 personal_access_token.user_id,
             ));
         }
