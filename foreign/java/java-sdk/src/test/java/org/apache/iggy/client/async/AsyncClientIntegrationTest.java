@@ -341,10 +341,7 @@ class AsyncClientIntegrationTest {
         log.info("Successfully deleted topic: {}", tempTopic);
     }
 
-    // TODO: Re-enable when server supports null consumer polling
-    // This test uses null consumer in concurrent poll operations which causes timeout
     @Test
-    @Disabled
     @Order(10)
     void testConcurrentOperations() throws Exception {
         log.info("Testing concurrent async operations");
@@ -372,14 +369,15 @@ class AsyncClientIntegrationTest {
             operations.add(future);
         }
 
-        // Poll messages concurrently
+        // Poll messages concurrently using valid consumer
         for (int i = 0; i < 3; i++) {
+            final long consumerId = 10000L + i;
             var future = client.messages()
                     .pollMessagesAsync(
                             StreamId.of(TEST_STREAM),
                             TopicId.of(TEST_TOPIC),
                             Optional.of(PARTITION_ID),
-                            null,
+                            Consumer.of(consumerId),
                             PollingStrategy.last(),
                             10L,
                             false);

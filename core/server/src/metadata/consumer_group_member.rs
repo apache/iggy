@@ -15,6 +15,25 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod segmented_slab;
+use crate::metadata::{ClientId, ConsumerGroupMemberId, PartitionId};
+use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 
-pub use segmented_slab::SegmentedSlab;
+#[derive(Clone, Debug)]
+pub struct ConsumerGroupMemberMeta {
+    pub id: ConsumerGroupMemberId,
+    pub client_id: ClientId,
+    pub partitions: Vec<PartitionId>,
+    pub partition_index: Arc<AtomicUsize>,
+}
+
+impl ConsumerGroupMemberMeta {
+    pub fn new(id: ConsumerGroupMemberId, client_id: ClientId) -> Self {
+        Self {
+            id,
+            client_id,
+            partitions: Vec::new(),
+            partition_index: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}

@@ -17,7 +17,6 @@
 
 mod alloc;
 mod certificates;
-pub mod collections;
 mod commands;
 mod configs;
 mod error;
