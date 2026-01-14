@@ -58,6 +58,7 @@ rmcp = { version = "0.12.0", features = [
 serde_json = { workspace = true }
 serial_test = { workspace = true }
 server = { workspace = true }
+strum = { workspace = true }
 strum_macros = { workspace = true }
 tempfile = { workspace = true }
 test-case = { workspace = true }

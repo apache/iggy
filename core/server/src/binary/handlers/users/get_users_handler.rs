@@ -45,6 +45,7 @@ impl ServerCommandHandler for GetUsers {
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
+        shard.ensure_authenticated(session)?;
         let users = shard.get_users(session).await.error(|e: &IggyError| {
             format!("{COMPONENT} (error: {e}) - failed to get users, session: {session}")
         })?;

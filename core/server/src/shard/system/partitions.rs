@@ -68,7 +68,6 @@ impl IggyShard {
         topic_id: &Identifier,
         partitions_count: u32,
     ) -> Result<Vec<partition::Partition>, IggyError> {
-        self.ensure_authenticated(session)?;
         self.ensure_topic_exists(stream_id, topic_id)?;
         let numeric_stream_id = self
             .streams
@@ -228,7 +227,6 @@ impl IggyShard {
         topic_id: &Identifier,
         partitions_count: u32,
     ) -> Result<Vec<usize>, IggyError> {
-        self.ensure_authenticated(session)?;
         self.ensure_partitions_exist(stream_id, topic_id, partitions_count)?;
 
         let numeric_stream_id = self

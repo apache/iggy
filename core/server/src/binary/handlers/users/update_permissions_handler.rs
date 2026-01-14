@@ -49,6 +49,7 @@ impl ServerCommandHandler for UpdatePermissions {
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
+        shard.ensure_authenticated(session)?;
 
         shard
                 .update_permissions(session, &self.user_id, self.permissions.clone())

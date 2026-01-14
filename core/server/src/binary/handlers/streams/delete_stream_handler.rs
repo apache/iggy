@@ -52,6 +52,7 @@ impl ServerCommandHandler for DeleteStream {
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
+        shard.ensure_authenticated(session)?;
         let stream_id = self.stream_id.clone();
         let request = ShardRequest {
             stream_id: Identifier::default(),

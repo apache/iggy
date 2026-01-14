@@ -43,6 +43,7 @@ impl ServerCommandHandler for GetConsumerOffset {
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
+        shard.ensure_authenticated(session)?;
         let Ok(offset) = shard
             .get_consumer_offset(
                 session,

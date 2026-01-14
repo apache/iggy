@@ -46,6 +46,7 @@ impl ServerCommandHandler for LeaveConsumerGroup {
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
+        shard.ensure_authenticated(session)?;
 
         shard
             .leave_consumer_group(
