@@ -22,7 +22,6 @@ use crate::http::error::CustomError;
 use crate::http::jwt::json_web_token::Identity;
 use crate::http::mapper;
 use crate::http::shared::AppState;
-use crate::streaming::session::Session;
 use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, header};
@@ -69,7 +68,12 @@ async fn get_stats(
     State(state): State<Arc<AppState>>,
     Extension(identity): Extension<Identity>,
 ) -> Result<Json<Stats>, CustomError> {
-    let _session = Session::stateless(identity.user_id, identity.ip_address);
+    state
+        .shard
+        .shard()
+        .permissioner
+        .borrow()
+        .get_stats(identity.user_id)?;
     let stats_future = SendWrapper::new(state.shard.shard().get_stats());
     let stats = stats_future.await.error(|e: &IggyError| {
         format!(
@@ -84,16 +88,8 @@ async fn get_cluster_metadata(
     State(state): State<Arc<AppState>>,
     Extension(identity): Extension<Identity>,
 ) -> Result<Json<ClusterMetadata>, CustomError> {
-    let shard = state.shard.shard();
-    let session = Session::stateless(identity.user_id, identity.ip_address);
-    let cluster_metadata = shard
-        .get_cluster_metadata(&session)
-        .error(|e: &IggyError| {
-            format!(
-                "{COMPONENT} (error: {e}) - failed to get cluster metadata, user ID: {}",
-                identity.user_id
-            )
-        })?;
+    let _ = identity; // authenticated via middleware
+    let cluster_metadata = state.shard.shard().get_cluster_metadata();
     Ok(Json(cluster_metadata))
 }
 
@@ -102,23 +98,13 @@ async fn get_client(
     Extension(identity): Extension<Identity>,
     Path(client_id): Path<u32>,
 ) -> Result<Json<ClientInfoDetails>, CustomError> {
-    let Ok(client) = state
+    state
         .shard
         .shard()
-        .get_client(
-            &Session::stateless(identity.user_id, identity.ip_address),
-            client_id,
-        )
-        .error(|e: &IggyError| {
-            format!(
-                "{COMPONENT} (error: {e}) - failed to get client, user ID: {}",
-                identity.user_id
-            )
-        })
-    else {
-        return Err(CustomError::ResourceNotFound);
-    };
-    let Some(client) = client else {
+        .permissioner
+        .borrow()
+        .get_client(identity.user_id)?;
+    let Some(client) = state.shard.shard().get_client(client_id) else {
         return Err(CustomError::ResourceNotFound);
     };
 
@@ -131,16 +117,13 @@ async fn get_clients(
     State(state): State<Arc<AppState>>,
     Extension(identity): Extension<Identity>,
 ) -> Result<Json<Vec<ClientInfo>>, CustomError> {
-    let clients = state
+    state
         .shard
         .shard()
-        .get_clients(&Session::stateless(identity.user_id, identity.ip_address))
-        .error(|e: &IggyError| {
-            format!(
-                "{COMPONENT} (error: {e}) - failed to get clients, user ID: {}",
-                identity.user_id
-            )
-        })?;
+        .permissioner
+        .borrow()
+        .get_clients(identity.user_id)?;
+    let clients = state.shard.shard().get_clients();
     let clients = mapper::map_clients(&clients);
     Ok(Json(clients))
 }
@@ -148,17 +131,17 @@ async fn get_clients(
 #[debug_handler]
 async fn get_snapshot(
     State(state): State<Arc<AppState>>,
-    Extension(identity): Extension<Identity>,
+    Extension(_identity): Extension<Identity>,
     Json(command): Json<GetSnapshot>,
 ) -> Result<impl IntoResponse, CustomError> {
     command.validate()?;
 
-    let session = Session::stateless(identity.user_id, identity.ip_address);
-    let snapshot_future = SendWrapper::new(state.shard.shard().get_snapshot(
-        &session,
-        command.compression,
-        &command.snapshot_types,
-    ));
+    let snapshot_future = SendWrapper::new(
+        state
+            .shard
+            .shard()
+            .get_snapshot(command.compression, &command.snapshot_types),
+    );
 
     let snapshot = snapshot_future
         .await

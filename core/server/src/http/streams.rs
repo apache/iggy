@@ -21,7 +21,6 @@ use crate::http::error::CustomError;
 use crate::http::jwt::json_web_token::Identity;
 use crate::http::shared::AppState;
 use crate::slab::traits_ext::{EntityComponentSystem, IntoComponents};
-use crate::streaming::session::Session;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::{delete, get};
@@ -59,12 +58,14 @@ async fn get_stream(
     Path(stream_id): Path<String>,
 ) -> Result<Json<StreamDetails>, CustomError> {
     let stream_id = Identifier::from_str_value(&stream_id)?;
-    let exists = state.shard.shard().ensure_stream_exists(&stream_id).is_ok();
-    if !exists {
-        return Err(CustomError::ResourceNotFound);
-    }
 
-    let _session = Session::stateless(identity.user_id, identity.ip_address);
+    let stream_id_numeric = state.shard.shard().resolve_stream_id(&stream_id)?;
+    state
+        .shard
+        .shard()
+        .permissioner
+        .borrow()
+        .get_stream(identity.user_id, stream_id_numeric)?;
 
     // Use direct slab access for thread-safe stream retrieval
     let stream_details = SendWrapper::new(|| {
@@ -85,7 +86,12 @@ async fn get_streams(
     State(state): State<Arc<AppState>>,
     Extension(identity): Extension<Identity>,
 ) -> Result<Json<Vec<Stream>>, CustomError> {
-    let _session = Session::stateless(identity.user_id, identity.ip_address);
+    state
+        .shard
+        .shard()
+        .permissioner
+        .borrow()
+        .get_streams(identity.user_id)?;
 
     // Use direct slab access for thread-safe streams retrieval
     let streams = SendWrapper::new(|| {
@@ -106,15 +112,19 @@ async fn create_stream(
     Json(command): Json<CreateStream>,
 ) -> Result<Json<StreamDetails>, CustomError> {
     command.validate()?;
+    state
+        .shard
+        .shard()
+        .permissioner
+        .borrow()
+        .create_stream(identity.user_id)?;
 
     let result = SendWrapper::new(async move {
-        let session = Session::stateless(identity.user_id, identity.ip_address);
-
         let _stream_guard = state.shard.shard().fs_locks.stream_lock.lock().await;
         // Create stream using wrapper method
         let stream = state
             .shard
-            .create_stream(&session, command.name.clone())
+            .create_stream(command.name.clone())
             .await
             .error(|e: &IggyError| {
                 format!(
@@ -184,13 +194,19 @@ async fn update_stream(
     command.stream_id = Identifier::from_str_value(&stream_id)?;
     command.validate()?;
 
-    let result = SendWrapper::new(async move {
-        let session = Session::stateless(identity.user_id, identity.ip_address);
+    let stream_id_numeric = state.shard.shard().resolve_stream_id(&command.stream_id)?;
+    state
+        .shard
+        .shard()
+        .permissioner
+        .borrow()
+        .update_stream(identity.user_id, stream_id_numeric)?;
 
+    let result = SendWrapper::new(async move {
         // Update stream using wrapper method
         state
             .shard
-            .update_stream(&session, &command.stream_id, command.name.clone())
+            .update_stream(&command.stream_id, command.name.clone())
             .error(|e: &IggyError| {
                 format!(
                     "{COMPONENT} (error: {e}) - failed to update stream, stream ID: {stream_id}"
@@ -236,19 +252,24 @@ async fn delete_stream(
 ) -> Result<StatusCode, CustomError> {
     let identifier_stream_id = Identifier::from_str_value(&stream_id)?;
 
+    let stream_id_numeric = state
+        .shard
+        .shard()
+        .resolve_stream_id(&identifier_stream_id)?;
+    state
+        .shard
+        .shard()
+        .permissioner
+        .borrow()
+        .delete_stream(identity.user_id, stream_id_numeric)?;
+
     let result =
         SendWrapper::new(async move {
-            let session = Session::stateless(identity.user_id, identity.ip_address);
-
             let _stream_guard = state.shard.shard().fs_locks.stream_lock.lock().await;
             // Delete stream and get the stream entity
             let stream = {
-                let future = SendWrapper::new(
-                    state
-                        .shard
-                        .shard()
-                        .delete_stream(&session, &identifier_stream_id),
-                );
+                let future =
+                    SendWrapper::new(state.shard.shard().delete_stream(&identifier_stream_id));
                 future.await
             }
             .error(|e: &IggyError| {
@@ -299,13 +320,22 @@ async fn purge_stream(
 ) -> Result<StatusCode, CustomError> {
     let identifier_stream_id = Identifier::from_str_value(&stream_id)?;
 
-    let result = SendWrapper::new(async move {
-        let session = Session::stateless(identity.user_id, identity.ip_address);
+    let stream_id_numeric = state
+        .shard
+        .shard()
+        .resolve_stream_id(&identifier_stream_id)?;
+    state
+        .shard
+        .shard()
+        .permissioner
+        .borrow()
+        .purge_stream(identity.user_id, stream_id_numeric)?;
 
+    let result = SendWrapper::new(async move {
         // Purge stream using wrapper method
         state
             .shard
-            .purge_stream(&session, &identifier_stream_id)
+            .purge_stream(&identifier_stream_id)
             .await
             .error(|e: &IggyError| {
                 format!("{COMPONENT} (error: {e}) - failed to purge stream, stream ID: {stream_id}")

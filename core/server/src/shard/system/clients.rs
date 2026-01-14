@@ -16,12 +16,9 @@
  * under the License.
  */
 
-use super::COMPONENT;
 use crate::shard::IggyShard;
 use crate::streaming::clients::client_manager::Client;
 use crate::streaming::session::Session;
-use err_trail::ErrContext;
-use iggy_common::IggyError;
 use iggy_common::{Identifier, TransportProtocol};
 use std::net::SocketAddr;
 use tracing::{error, info};
@@ -68,35 +65,11 @@ impl IggyShard {
         self.client_manager.delete_client(client_id);
     }
 
-    pub fn get_client(
-        &self,
-        session: &Session,
-        client_id: u32,
-    ) -> Result<Option<Client>, IggyError> {
-        self.permissioner
-        .borrow()
-            .get_client(session.get_user_id())
-            .error(|e: &IggyError| {
-                format!(
-                    "{COMPONENT} (error: {e}) - permission denied to get client with ID: {client_id} by user ID: {}",
-                    session.get_user_id()
-                )
-            })?;
-
-        Ok(self.client_manager.try_get_client(client_id))
+    pub fn get_client(&self, client_id: u32) -> Option<Client> {
+        self.client_manager.try_get_client(client_id)
     }
 
-    pub fn get_clients(&self, session: &Session) -> Result<Vec<Client>, IggyError> {
-        self.permissioner
-            .borrow()
-            .get_clients(session.get_user_id())
-            .error(|e: &IggyError| {
-                format!(
-                    "{COMPONENT} (error: {e}) - failed to get clients by user ID {}",
-                    session.get_user_id()
-                )
-            })?;
-
-        Ok(self.client_manager.get_clients())
+    pub fn get_clients(&self) -> Vec<Client> {
+        self.client_manager.get_clients()
     }
 }

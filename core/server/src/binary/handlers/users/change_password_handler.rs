@@ -51,20 +51,24 @@ impl ServerCommandHandler for ChangePassword {
         debug!("session: {session}, command: {self}");
         shard.ensure_authenticated(session)?;
 
+        // Check if user is changing someone else's password
+        let target_user = shard.get_user(&self.user_id)?;
+        if target_user.id != session.get_user_id() {
+            shard
+                .permissioner
+                .borrow()
+                .change_password(session.get_user_id())?;
+        }
+
         info!("Changing password for user with ID: {}...", self.user_id);
         shard
-                .change_password(
-                    session,
-                    &self.user_id,
-                    &self.current_password,
-                    &self.new_password,
+            .change_password(&self.user_id, &self.current_password, &self.new_password)
+            .error(|e: &IggyError| {
+                format!(
+                    "{COMPONENT} (error: {e}) - failed to change password for user_id: {}, session: {session}",
+                    self.user_id
                 )
-                .error(|e: &IggyError| {
-                    format!(
-                        "{COMPONENT} (error: {e}) - failed to change password for user_id: {}, session: {session}",
-                        self.user_id
-                    )
-                })?;
+            })?;
 
         info!("Changed password for user with ID: {}.", self.user_id);
 

@@ -327,14 +327,20 @@ async fn ensure_stream_topics_access(
             .unwrap_or_else(|| panic!("No access to topic: {topic} in stream: {available_stream}"));
         info!("Ensured access to topic: {topic} in stream: {available_stream}");
         for stream in unavailable_streams {
-            if client
+            match client
                 .get_topic(&Identifier::named(stream)?, &topic_id)
-                .await?
-                .is_none()
+                .await
             {
-                info!("Ensured no access to topic: {topic} in stream: {stream}");
-            } else {
-                panic!("Access to topic: {topic} in stream: {stream} should not be allowed");
+                Err(IggyError::Unauthorized) => {
+                    info!("Ensured no access to topic: {topic} in stream: {stream} (unauthorized)");
+                }
+                Ok(None) => {
+                    info!("Ensured no access to topic: {topic} in stream: {stream} (not visible)");
+                }
+                Ok(Some(_)) => {
+                    panic!("Access to topic: {topic} in stream: {stream} should not be allowed");
+                }
+                Err(e) => return Err(e),
             }
         }
     }

@@ -16,24 +16,14 @@
  * under the License.
  */
 
-use super::COMPONENT;
 use crate::shard::IggyShard;
 use crate::slab::traits_ext::{DeleteCell, EntityMarker, InsertCell};
-use crate::streaming::session::Session;
 use crate::streaming::streams::storage::{create_stream_file_hierarchy, delete_stream_from_disk};
 use crate::streaming::streams::{self, stream};
-use err_trail::ErrContext;
 use iggy_common::{Identifier, IggyError};
 
 impl IggyShard {
-    pub async fn create_stream(
-        &self,
-        session: &Session,
-        name: String,
-    ) -> Result<stream::Stream, IggyError> {
-        self.permissioner
-            .borrow()
-            .create_stream(session.get_user_id())?;
+    pub async fn create_stream(&self, name: String) -> Result<stream::Stream, IggyError> {
         let exists = self
             .streams
             .exists(&Identifier::from_str_value(&name).unwrap());
@@ -56,27 +46,8 @@ impl IggyShard {
         Ok(())
     }
 
-    pub fn update_stream(
-        &self,
-        session: &Session,
-        stream_id: &Identifier,
-        name: String,
-    ) -> Result<(), IggyError> {
+    pub fn update_stream(&self, stream_id: &Identifier, name: String) -> Result<(), IggyError> {
         self.ensure_stream_exists(stream_id)?;
-        let id = self
-            .streams
-            .with_stream_by_id(stream_id, streams::helpers::get_stream_id());
-
-        self.permissioner
-            .borrow()
-            .update_stream(session.get_user_id(), id)
-            .error(|e: &IggyError| {
-                format!(
-                    "{COMPONENT} (error: {e}) - failed to update stream, user ID: {}, stream ID: {}",
-                    session.get_user_id(),
-                    stream_id
-                )
-            })?;
         self.update_stream_base(stream_id, name)?;
         Ok(())
     }
@@ -122,31 +93,14 @@ impl IggyShard {
         stream
     }
 
-    pub async fn delete_stream(
-        &self,
-        session: &Session,
-        id: &Identifier,
-    ) -> Result<stream::Stream, IggyError> {
+    pub async fn delete_stream(&self, id: &Identifier) -> Result<stream::Stream, IggyError> {
         self.ensure_stream_exists(id)?;
-        let stream_id = self
-            .streams
-            .with_stream_by_id(id, streams::helpers::get_stream_id());
-        self.permissioner
-            .borrow()
-            .delete_stream(session.get_user_id(), stream_id)
-            .error(|e: &IggyError| {
-                format!(
-                    "{COMPONENT} (error: {e}) - permission denied to delete stream for user {}, stream ID: {}",
-                    session.get_user_id(),
-                    stream_id,
-                )
-            })?;
         let mut stream = self.delete_stream_base(id);
-        let stream_id_usize = stream.id();
+        let stream_id_numeric = stream.id();
 
         // Clean up consumer groups from ClientManager for this stream
         self.client_manager
-            .delete_consumer_groups_for_stream(stream_id_usize);
+            .delete_consumer_groups_for_stream(stream_id_numeric);
 
         // Remove all entries from shards_table for this stream (all topics and partitions)
         let namespaces_to_remove: Vec<_> = self
@@ -154,7 +108,7 @@ impl IggyShard {
             .iter()
             .filter_map(|entry| {
                 let (ns, _) = entry.pair();
-                if ns.stream_id() == stream_id_usize {
+                if ns.stream_id() == stream_id_numeric {
                     Some(*ns)
                 } else {
                     None
@@ -170,27 +124,8 @@ impl IggyShard {
         Ok(stream)
     }
 
-    pub async fn purge_stream(
-        &self,
-        session: &Session,
-        stream_id: &Identifier,
-    ) -> Result<(), IggyError> {
+    pub async fn purge_stream(&self, stream_id: &Identifier) -> Result<(), IggyError> {
         self.ensure_stream_exists(stream_id)?;
-        {
-            let get_stream_id = crate::streaming::streams::helpers::get_stream_id();
-            let stream_id = self.streams.with_stream_by_id(stream_id, get_stream_id);
-            self.permissioner
-                .borrow()
-                .purge_stream(session.get_user_id(), stream_id)
-                .error(|e: &IggyError| {
-                format!(
-                    "{COMPONENT} (error: {e}) - permission denied to purge stream for user {}, stream ID: {}",
-                    session.get_user_id(),
-                    stream_id,
-                )
-            })?;
-        }
-
         self.purge_stream_base(stream_id).await
     }
 

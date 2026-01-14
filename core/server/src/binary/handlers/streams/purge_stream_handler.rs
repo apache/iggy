@@ -48,10 +48,16 @@ impl ServerCommandHandler for PurgeStream {
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
         shard.ensure_authenticated(session)?;
+        let stream_id = shard.resolve_stream_id(&self.stream_id)?;
+        shard
+            .permissioner
+            .borrow()
+            .purge_stream(session.get_user_id(), stream_id)?;
         let stream_id = self.stream_id.clone();
 
         shard
-            .purge_stream(session, &self.stream_id).await
+            .purge_stream(&self.stream_id)
+            .await
             .error(|e: &IggyError| {
                 format!("{COMPONENT} (error: {e}) - failed to purge stream with id: {stream_id}, session: {session}")
             })?;
