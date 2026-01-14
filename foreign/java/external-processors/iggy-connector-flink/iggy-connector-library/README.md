@@ -6,6 +6,43 @@ Core connector library for integrating Apache Iggy with stream processing engine
 
 This library provides framework-agnostic abstractions and Flink-specific implementations for reading from and writing to Iggy streams.
 
+### Transport Protocols
+
+The connector supports two transport protocols for communicating with the Iggy server:
+
+| Transport            | Default Port | Use Case                                                     |
+| -------------------- | ------------ | ------------------------------------------------------------ |
+| **HTTP** (default)   | 3000         | Development, debugging, environments with HTTP proxies       |
+| **TCP**              | 8090         | Production workloads requiring high throughput and low latency |
+
+#### HTTP Transport (Default)
+
+HTTP transport uses the REST API and is the default for backward compatibility:
+
+```java
+IggyConnectionConfig config = IggyConnectionConfig.builder()
+    .serverAddress("localhost")
+    .transportType(TransportType.HTTP)  // Optional, HTTP is default
+    .httpPort(3000)                      // Optional, 3000 is default
+    .username("iggy")
+    .password("iggy")
+    .build();
+```
+
+#### TCP Transport
+
+TCP transport provides persistent connections with lower latency, ideal for high-throughput streaming workloads:
+
+```java
+IggyConnectionConfig config = IggyConnectionConfig.builder()
+    .serverAddress("localhost")
+    .transportType(TransportType.TCP)
+    .tcpPort(8090)                       // Optional, 8090 is default
+    .username("iggy")
+    .password("iggy")
+    .build();
+```
+
 ### Package Structure
 
 ```text
@@ -59,6 +96,53 @@ dependencies {
 ```bash
 cd iggy-connector-flink
 ./gradlew :iggy-connector-library:build
+```
+
+## Configuration Reference
+
+### IggyConnectionConfig Options
+
+| Option              | Type          | Default      | Description                              |
+| ------------------- | ------------- | ------------ | ---------------------------------------- |
+| `serverAddress`     | String        | *required*   | Iggy server hostname or IP address       |
+| `transportType`     | TransportType | `HTTP`       | Transport protocol: `HTTP` or `TCP`      |
+| `httpPort`          | int           | `3000`       | HTTP API port                            |
+| `tcpPort`           | int           | `8090`       | TCP API port                             |
+| `username`          | String        | *required*   | Authentication username                  |
+| `password`          | String        | *required*   | Authentication password                  |
+| `connectionTimeout` | Duration      | `30s`        | Connection timeout                       |
+| `requestTimeout`    | Duration      | `30s`        | Request timeout                          |
+| `maxRetries`        | int           | `3`          | Maximum retry attempts                   |
+| `retryBackoff`      | Duration      | `100ms`      | Backoff between retries                  |
+| `enableTls`         | boolean       | `false`      | Enable TLS/SSL encryption                |
+
+### Example: Complete Sink Configuration
+
+```java
+// TCP transport for high-throughput production workloads
+IggyConnectionConfig config = IggyConnectionConfig.builder()
+    .serverAddress("iggy-server.example.com")
+    .transportType(TransportType.TCP)
+    .tcpPort(8090)
+    .username("iggy")
+    .password("secret")
+    .connectionTimeout(Duration.ofSeconds(10))
+    .requestTimeout(Duration.ofSeconds(30))
+    .maxRetries(5)
+    .enableTls(true)
+    .build();
+
+IggySink<Event> sink = IggySink.<Event>builder()
+    .setConnectionConfig(config)
+    .setStreamId("events")
+    .setTopicId("user-events")
+    .setSerializer(new JsonSerializationSchema<>())
+    .setBatchSize(1000)
+    .setFlushInterval(Duration.ofSeconds(1))
+    .withBalancedPartitioning()
+    .build();
+
+dataStream.sinkTo(sink);
 ```
 
 ## Future Evolution

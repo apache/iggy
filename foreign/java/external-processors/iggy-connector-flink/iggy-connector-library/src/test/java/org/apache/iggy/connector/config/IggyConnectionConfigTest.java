@@ -64,6 +64,106 @@ class IggyConnectionConfigTest {
         assertThat(config.getMaxRetries()).isEqualTo(3);
         assertThat(config.getRetryBackoff()).isEqualTo(Duration.ofMillis(100));
         assertThat(config.isEnableTls()).isFalse();
+        // Transport defaults
+        assertThat(config.getTransportType()).isEqualTo(TransportType.HTTP);
+        assertThat(config.getHttpPort()).isEqualTo(3000);
+        assertThat(config.getTcpPort()).isEqualTo(8090);
+    }
+
+    @Test
+    void shouldBuildConfigWithTcpTransport() {
+        IggyConnectionConfig config = IggyConnectionConfig.builder()
+                .serverAddress("localhost")
+                .transportType(TransportType.TCP)
+                .tcpPort(9090)
+                .username("iggy")
+                .password("iggy")
+                .build();
+
+        assertThat(config.getTransportType()).isEqualTo(TransportType.TCP);
+        assertThat(config.getTcpPort()).isEqualTo(9090);
+        assertThat(config.getEffectivePort()).isEqualTo(9090);
+    }
+
+    @Test
+    void shouldBuildConfigWithHttpTransport() {
+        IggyConnectionConfig config = IggyConnectionConfig.builder()
+                .serverAddress("localhost")
+                .transportType(TransportType.HTTP)
+                .httpPort(8000)
+                .username("iggy")
+                .password("iggy")
+                .build();
+
+        assertThat(config.getTransportType()).isEqualTo(TransportType.HTTP);
+        assertThat(config.getHttpPort()).isEqualTo(8000);
+        assertThat(config.getEffectivePort()).isEqualTo(8000);
+    }
+
+    @Test
+    void shouldReturnCorrectEffectivePort() {
+        IggyConnectionConfig httpConfig = IggyConnectionConfig.builder()
+                .serverAddress("localhost")
+                .transportType(TransportType.HTTP)
+                .httpPort(3001)
+                .tcpPort(8091)
+                .username("iggy")
+                .password("iggy")
+                .build();
+
+        IggyConnectionConfig tcpConfig = IggyConnectionConfig.builder()
+                .serverAddress("localhost")
+                .transportType(TransportType.TCP)
+                .httpPort(3001)
+                .tcpPort(8091)
+                .username("iggy")
+                .password("iggy")
+                .build();
+
+        assertThat(httpConfig.getEffectivePort()).isEqualTo(3001);
+        assertThat(tcpConfig.getEffectivePort()).isEqualTo(8091);
+    }
+
+    @Test
+    void shouldThrowExceptionForInvalidHttpPort() {
+        assertThatThrownBy(() -> IggyConnectionConfig.builder()
+                        .serverAddress("localhost")
+                        .httpPort(0)
+                        .username("iggy")
+                        .password("iggy")
+                        .build())
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("httpPort must be between 1 and 65535");
+
+        assertThatThrownBy(() -> IggyConnectionConfig.builder()
+                        .serverAddress("localhost")
+                        .httpPort(65536)
+                        .username("iggy")
+                        .password("iggy")
+                        .build())
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("httpPort must be between 1 and 65535");
+    }
+
+    @Test
+    void shouldThrowExceptionForInvalidTcpPort() {
+        assertThatThrownBy(() -> IggyConnectionConfig.builder()
+                        .serverAddress("localhost")
+                        .tcpPort(0)
+                        .username("iggy")
+                        .password("iggy")
+                        .build())
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("tcpPort must be between 1 and 65535");
+
+        assertThatThrownBy(() -> IggyConnectionConfig.builder()
+                        .serverAddress("localhost")
+                        .tcpPort(-1)
+                        .username("iggy")
+                        .password("iggy")
+                        .build())
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("tcpPort must be between 1 and 65535");
     }
 
     @Test
@@ -160,6 +260,9 @@ class IggyConnectionConfigTest {
     void shouldImplementEqualsCorrectly() {
         IggyConnectionConfig config1 = IggyConnectionConfig.builder()
                 .serverAddress("localhost:8080")
+                .transportType(TransportType.TCP)
+                .httpPort(3000)
+                .tcpPort(8090)
                 .username("iggy")
                 .password("iggy")
                 .connectionTimeout(Duration.ofSeconds(30))
@@ -171,6 +274,9 @@ class IggyConnectionConfigTest {
 
         IggyConnectionConfig config2 = IggyConnectionConfig.builder()
                 .serverAddress("localhost:8080")
+                .transportType(TransportType.TCP)
+                .httpPort(3000)
+                .tcpPort(8090)
                 .username("iggy")
                 .password("iggy")
                 .connectionTimeout(Duration.ofSeconds(30))
@@ -186,9 +292,17 @@ class IggyConnectionConfigTest {
                 .password("iggy")
                 .build();
 
+        IggyConnectionConfig config4 = IggyConnectionConfig.builder()
+                .serverAddress("localhost:8080")
+                .transportType(TransportType.HTTP) // Different transport type
+                .username("iggy")
+                .password("iggy")
+                .build();
+
         assertThat(config1).isEqualTo(config2);
         assertThat(config1).hasSameHashCodeAs(config2);
         assertThat(config1).isNotEqualTo(config3);
+        assertThat(config1).isNotEqualTo(config4);
         assertThat(config1).isEqualTo(config1);
         assertThat(config1).isNotEqualTo(null);
         assertThat(config1).isNotEqualTo(new Object());
@@ -198,6 +312,7 @@ class IggyConnectionConfigTest {
     void shouldImplementToStringCorrectly() {
         IggyConnectionConfig config = IggyConnectionConfig.builder()
                 .serverAddress("localhost:8080")
+                .transportType(TransportType.TCP)
                 .username("iggy")
                 .password("iggy")
                 .build();
@@ -206,6 +321,9 @@ class IggyConnectionConfigTest {
         assertThat(toString).contains("IggyConnectionConfig");
         assertThat(toString).contains("localhost:8080");
         assertThat(toString).contains("iggy");
+        assertThat(toString).contains("transportType=TCP");
+        assertThat(toString).contains("httpPort=");
+        assertThat(toString).contains("tcpPort=");
         assertThat(toString).doesNotContain("password=iggy"); // Password should not be in toString
     }
 
