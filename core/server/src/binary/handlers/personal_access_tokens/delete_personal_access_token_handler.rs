@@ -45,6 +45,7 @@ impl ServerCommandHandler for DeletePersonalAccessToken {
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
+        shard.ensure_authenticated(session)?;
         let token_name = self.name.clone();
 
         shard

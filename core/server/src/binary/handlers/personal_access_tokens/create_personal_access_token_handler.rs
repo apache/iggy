@@ -49,6 +49,7 @@ impl ServerCommandHandler for CreatePersonalAccessToken {
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
+        shard.ensure_authenticated(session)?;
 
         let (personal_access_token, token) = shard
                 .create_personal_access_token(session, &self.name, self.expiry)

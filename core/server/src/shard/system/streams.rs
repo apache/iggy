@@ -31,7 +31,6 @@ impl IggyShard {
         session: &Session,
         name: String,
     ) -> Result<stream::Stream, IggyError> {
-        self.ensure_authenticated(session)?;
         self.permissioner
             .borrow()
             .create_stream(session.get_user_id())?;
@@ -63,7 +62,6 @@ impl IggyShard {
         stream_id: &Identifier,
         name: String,
     ) -> Result<(), IggyError> {
-        self.ensure_authenticated(session)?;
         self.ensure_stream_exists(stream_id)?;
         let id = self
             .streams
@@ -129,7 +127,6 @@ impl IggyShard {
         session: &Session,
         id: &Identifier,
     ) -> Result<stream::Stream, IggyError> {
-        self.ensure_authenticated(session)?;
         self.ensure_stream_exists(id)?;
         let stream_id = self
             .streams
@@ -178,7 +175,6 @@ impl IggyShard {
         session: &Session,
         stream_id: &Identifier,
     ) -> Result<(), IggyError> {
-        self.ensure_authenticated(session)?;
         self.ensure_stream_exists(stream_id)?;
         {
             let get_stream_id = crate::streaming::streams::helpers::get_stream_id();

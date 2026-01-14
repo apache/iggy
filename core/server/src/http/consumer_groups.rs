@@ -65,8 +65,6 @@ async fn get_consumer_group(
 
     let session = Session::stateless(identity.user_id, identity.ip_address);
 
-    // Check permissions and existence
-    state.shard.shard().ensure_authenticated(&session)?;
     let exists = state
         .shard
         .shard()
@@ -117,8 +115,6 @@ async fn get_consumer_groups(
 
     let session = Session::stateless(identity.user_id, identity.ip_address);
 
-    // Check permissions and existence
-    state.shard.shard().ensure_authenticated(&session)?;
     state
         .shard
         .shard()

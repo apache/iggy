@@ -49,6 +49,7 @@ impl ServerCommandHandler for CreatePartitions {
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
+        shard.ensure_authenticated(session)?;
 
         // Acquire partition lock to serialize filesystem operations
         let _partition_guard = shard.fs_locks.partition_lock.lock().await;

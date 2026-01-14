@@ -49,6 +49,7 @@ impl ServerCommandHandler for CreateConsumerGroup {
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
+        shard.ensure_authenticated(session)?;
         let cg = shard.create_consumer_group(
             session,
             &self.stream_id,

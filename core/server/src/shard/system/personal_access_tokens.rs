@@ -32,7 +32,6 @@ impl IggyShard {
         &self,
         session: &Session,
     ) -> Result<Vec<PersonalAccessToken>, IggyError> {
-        self.ensure_authenticated(session)?;
         let user_id = session.get_user_id();
         let user = self.get_user(&user_id.try_into()?).error(|e: &IggyError| {
             format!("{COMPONENT} (error: {e}) - failed to get user with id: {user_id}")
@@ -57,7 +56,6 @@ impl IggyShard {
         name: &str,
         expiry: IggyExpiry,
     ) -> Result<(PersonalAccessToken, String), IggyError> {
-        self.ensure_authenticated(session)?;
         let user_id = session.get_user_id();
         let identifier = user_id.try_into()?;
         {
@@ -131,7 +129,6 @@ impl IggyShard {
         session: &Session,
         name: &str,
     ) -> Result<(), IggyError> {
-        self.ensure_authenticated(session)?;
         let user_id = session.get_user_id();
         self.delete_personal_access_token_base(user_id, name)
     }

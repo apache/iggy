@@ -49,6 +49,7 @@ impl ServerCommandHandler for DeleteConsumerGroup {
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
+        shard.ensure_authenticated(session)?;
         let cg = shard.delete_consumer_group(session, &self.stream_id, &self.topic_id, &self.group_id).error(|e: &IggyError| {
             format!(
                 "{COMPONENT} (error: {e}) - failed to delete consumer group with ID: {} for topic with ID: {} in stream with ID: {} for session: {}",

@@ -52,6 +52,7 @@ impl ServerCommandHandler for UpdateTopic {
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
+        shard.ensure_authenticated(session)?;
 
         let request = ShardRequest {
             stream_id: Identifier::default(),

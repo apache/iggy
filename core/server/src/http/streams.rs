@@ -55,6 +55,7 @@ pub fn router(state: Arc<AppState>) -> Router {
 #[debug_handler]
 async fn get_stream(
     State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<Identity>,
     Path(stream_id): Path<String>,
 ) -> Result<Json<StreamDetails>, CustomError> {
     let stream_id = Identifier::from_str_value(&stream_id)?;
@@ -62,6 +63,8 @@ async fn get_stream(
     if !exists {
         return Err(CustomError::ResourceNotFound);
     }
+
+    let _session = Session::stateless(identity.user_id, identity.ip_address);
 
     // Use direct slab access for thread-safe stream retrieval
     let stream_details = SendWrapper::new(|| {
@@ -78,7 +81,12 @@ async fn get_stream(
 }
 
 #[debug_handler]
-async fn get_streams(State(state): State<Arc<AppState>>) -> Result<Json<Vec<Stream>>, CustomError> {
+async fn get_streams(
+    State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<Identity>,
+) -> Result<Json<Vec<Stream>>, CustomError> {
+    let _session = Session::stateless(identity.user_id, identity.ip_address);
+
     // Use direct slab access for thread-safe streams retrieval
     let streams = SendWrapper::new(|| {
         state.shard.shard().streams.with_components(|stream_ref| {

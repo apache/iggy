@@ -45,6 +45,7 @@ impl ServerCommandHandler for PurgeTopic {
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
+        shard.ensure_authenticated(session)?;
         let topic_id = self.topic_id.clone();
         let stream_id = self.stream_id.clone();
 

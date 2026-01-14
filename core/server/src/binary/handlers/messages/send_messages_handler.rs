@@ -53,6 +53,7 @@ impl ServerCommandHandler for SendMessages {
         session: &Session,
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {
+        shard.ensure_authenticated(session)?;
         let total_payload_size = length as usize - std::mem::size_of::<u32>();
         let metadata_len_field_size = std::mem::size_of::<u32>();
 

@@ -45,6 +45,7 @@ impl ServerCommandHandler for JoinConsumerGroup {
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
+        shard.ensure_authenticated(session)?;
         shard
             .join_consumer_group(
                 session,

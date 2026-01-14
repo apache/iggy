@@ -47,6 +47,7 @@ impl ServerCommandHandler for DeletePartitions {
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
+        shard.ensure_authenticated(session)?;
         let stream_id = self.stream_id.clone();
         let topic_id = self.topic_id.clone();
 
