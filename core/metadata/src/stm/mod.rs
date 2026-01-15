@@ -20,7 +20,14 @@ pub mod mux;
 pub mod stream;
 pub mod user;
 
-use std::cell::UnsafeCell;
+use std::{cell::UnsafeCell, default};
+
+use iggy_common::Stream;
+
+use crate::stm::{
+    stream::{Streams, StreamsInner},
+    user::{Users, UsersInner},
+};
 
 // ============================================================================
 // WriteCell - Interior mutability wrapper for WriteHandle
@@ -83,33 +90,24 @@ pub trait ApplyState {
     fn do_apply(&self, cmd: <Self::Inner as Command>::Cmd) -> Self::Output;
 }
 
-// TODO: Move the factory shiet to different crate.
-pub trait AbstractFactory<T> {
-    type Inner;
-
-    fn factory<F>(&self) -> F
-    where
-        F: Factory<Constructable<Self::Inner> = T> + Default,
-    {
-        F::default()
-    }
-}
-
-pub struct StateFactory<S> {
-    _marker: std::marker::PhantomData<S>,
-}
-
-impl<S> AbstractFactory<S> for StateFactory<S>
+// TODO: Move the factory shiet out of there.
+fn create_factory<S, F>() -> F
 where
     S: ApplyState,
+    F: Factory<Constructable<S::Inner> = S> + Default,
 {
-    type Inner = S::Inner;
+    F::default()
 }
 
 pub trait Factory {
     type Constructable<T>;
 
-    fn finish<T>(&self, inner: impl FnOnce() -> T) -> Self::Constructable<T>;
+    fn finish<T>(&self, inner: impl FnOnce() -> T) -> Self::Constructable<T>
+    where
+        T: Into<Self::Constructable<T>>,
+    {
+        inner().into()
+    }
 }
 
 /// Public interface for state machines.
