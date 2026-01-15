@@ -10,10 +10,10 @@ This library provides framework-agnostic abstractions and Flink-specific impleme
 
 The connector supports two transport protocols for communicating with the Iggy server:
 
-| Transport            | Default Port | Use Case                                                     |
-| -------------------- | ------------ | ------------------------------------------------------------ |
-| **HTTP** (default)   | 3000         | Development, debugging, environments with HTTP proxies       |
-| **TCP**              | 8090         | Production workloads requiring high throughput and low latency |
+| Transport          | Default Port | Use Case                                                     |
+| ------------------ | ------------ | ------------------------------------------------------------ |
+| **HTTP** (default) | 3000         | Development, debugging, environments with HTTP proxies       |
+| **TCP**            | 8090         | Production workloads requiring high throughput and low latency |
 
 #### HTTP Transport (Default)
 
