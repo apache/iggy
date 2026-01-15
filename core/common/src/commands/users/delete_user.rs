@@ -28,7 +28,7 @@ use std::fmt::Display;
 /// `DeleteUser` command is used to delete a user by unique ID.
 /// It has additional payload:
 /// - `user_id` - unique user ID (numeric or name).
-#[derive(Debug, Serialize, Deserialize, PartialEq, Default)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Default, Clone)]
 pub struct DeleteUser {
     /// Unique user ID (numeric or name).
     #[serde(skip)]

@@ -5702,6 +5702,7 @@ dependencies = [
  "consensus",
  "iggy_common",
  "journal",
+ "left-right",
  "message_bus",
  "slab",
  "tracing",

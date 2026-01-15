@@ -33,6 +33,7 @@ bytes = { workspace = true }
 consensus = { path = "../consensus" }
 iggy_common = { path = "../common" }
 journal = { path = "../journal" }
+left-right = { workspace = true }
 message_bus = { path = "../message_bus" }
 slab = "0.4.11"
 tracing = { workspace = true }

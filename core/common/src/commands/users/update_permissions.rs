@@ -31,7 +31,7 @@ use std::fmt::Display;
 /// It has additional payload:
 /// - `user_id` - unique user ID (numeric or name).
 /// - `permissions` - new permissions (optional)
-#[derive(Debug, Serialize, Deserialize, PartialEq, Default)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Default, Clone)]
 pub struct UpdatePermissions {
     /// Unique user ID (numeric or name).
     #[serde(skip)]

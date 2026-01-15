@@ -34,7 +34,7 @@ use std::str::from_utf8;
 /// - `user_id` - unique user ID (numeric or name).
 /// - `username` - new username (optional), if provided, must be between 3 and 50 characters long.
 /// - `status` - new status (optional)
-#[derive(Debug, Serialize, Deserialize, PartialEq, Default)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Default, Clone)]
 pub struct UpdateUser {
     #[serde(skip)]
     pub user_id: Identifier,

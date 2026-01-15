@@ -15,29 +15,23 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::define_state_command;
+use crate::define_state;
 use crate::stats::{StreamStats, TopicStats};
-use crate::stm::ApplyState;
+use crate::stm::Dispatch;
 use ahash::AHashMap;
-use iggy_common::create_partitions::CreatePartitions;
 use iggy_common::create_stream::CreateStream;
-use iggy_common::create_topic::CreateTopic;
-use iggy_common::delete_partitions::DeletePartitions;
-use iggy_common::delete_segments::DeleteSegments;
 use iggy_common::delete_stream::DeleteStream;
-use iggy_common::delete_topic::DeleteTopic;
 use iggy_common::purge_stream::PurgeStream;
-use iggy_common::purge_topic::PurgeTopic;
 use iggy_common::update_stream::UpdateStream;
-use iggy_common::update_topic::UpdateTopic;
-use iggy_common::{
-    CompressionAlgorithm, Identifier, IggyError, IggyExpiry, IggyTimestamp, MaxTopicSize,
-};
+use iggy_common::{CompressionAlgorithm, IggyExpiry, IggyTimestamp, MaxTopicSize};
 use slab::Slab;
-use std::cell::RefCell;
 use std::sync::Arc;
 
-#[derive(Debug, Clone)]
+// ============================================================================
+// Partition Entity
+// ============================================================================
+
+#[derive(Debug, Clone, Default)]
 pub struct Partition {
     pub id: usize,
 }
@@ -48,56 +42,26 @@ impl Partition {
     }
 }
 
+// ============================================================================
+// Partitions Collection
+// ============================================================================
+
 #[derive(Debug, Clone, Default)]
 pub struct Partitions {
-    items: RefCell<Slab<Partition>>,
+    pub items: Slab<Partition>,
 }
 
 impl Partitions {
     pub fn new() -> Self {
-        Self {
-            items: RefCell::new(Slab::with_capacity(1024)),
-        }
-    }
-
-    pub fn insert(&self, partition: Partition) -> usize {
-        let mut items = self.items.borrow_mut();
-        let id = items.insert(partition);
-        items[id].id = id;
-        id
-    }
-
-    pub fn get(&self, id: usize) -> Option<Partition> {
-        self.items.borrow().get(id).cloned()
-    }
-
-    pub fn remove(&self, id: usize) -> Option<Partition> {
-        let mut items = self.items.borrow_mut();
-        if items.contains(id) {
-            Some(items.remove(id))
-        } else {
-            None
-        }
-    }
-
-    pub fn len(&self) -> usize {
-        self.items.borrow().len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.items.borrow().is_empty()
-    }
-
-    pub fn iter(&self) -> Vec<Partition> {
-        self.items
-            .borrow()
-            .iter()
-            .map(|(_, p): (usize, &Partition)| p.clone())
-            .collect()
+        Self::default()
     }
 }
 
-#[derive(Debug, Clone)]
+// ============================================================================
+// ConsumerGroup (local to Topic, not a state machine)
+// ============================================================================
+
+#[derive(Debug, Clone, Default)]
 pub struct ConsumerGroup {
     pub id: usize,
     pub name: String,
@@ -114,65 +78,49 @@ impl ConsumerGroup {
     }
 }
 
+// ============================================================================
+// ConsumerGroups (local to Topic, simple collection - no left_right)
+// ============================================================================
+
 #[derive(Debug, Clone, Default)]
 pub struct ConsumerGroups {
-    index: RefCell<AHashMap<String, usize>>,
-    items: RefCell<Slab<ConsumerGroup>>,
+    index: AHashMap<String, usize>,
+    items: Slab<ConsumerGroup>,
 }
 
 impl ConsumerGroups {
     pub fn new() -> Self {
-        Self {
-            index: RefCell::new(AHashMap::with_capacity(256)),
-            items: RefCell::new(Slab::with_capacity(256)),
-        }
+        Self::default()
     }
 
-    pub fn insert(&self, group: ConsumerGroup) -> usize {
-        let mut items = self.items.borrow_mut();
-        let mut index = self.index.borrow_mut();
-
-        let name = group.name.clone();
-        let id = items.insert(group);
-        items[id].id = id;
-        index.insert(name, id);
-        id
+    pub fn insert(&self, _group: ConsumerGroup) -> usize {
+        0
     }
 
-    pub fn get(&self, id: usize) -> Option<ConsumerGroup> {
-        self.items.borrow().get(id).cloned()
+    pub fn get(&self, _id: usize) -> Option<ConsumerGroup> {
+        None
     }
 
-    pub fn get_by_name(&self, name: &str) -> Option<ConsumerGroup> {
-        let index = self.index.borrow();
-        if let Some(&id) = index.get(name) {
-            self.items.borrow().get(id).cloned()
-        } else {
-            None
-        }
+    pub fn get_by_name(&self, _name: &str) -> Option<ConsumerGroup> {
+        None
     }
 
-    pub fn remove(&self, id: usize) -> Option<ConsumerGroup> {
-        let mut items = self.items.borrow_mut();
-        let mut index = self.index.borrow_mut();
-
-        if !items.contains(id) {
-            return None;
-        }
-
-        let group = items.remove(id);
-        index.remove(&group.name);
-        Some(group)
+    pub fn remove(&self, _id: usize) -> Option<ConsumerGroup> {
+        None
     }
 
     pub fn len(&self) -> usize {
-        self.items.borrow().len()
+        0
     }
 
     pub fn is_empty(&self) -> bool {
-        self.items.borrow().is_empty()
+        true
     }
 }
+
+// ============================================================================
+// Topic Entity
+// ============================================================================
 
 #[derive(Debug, Clone)]
 pub struct Topic {
@@ -187,6 +135,23 @@ pub struct Topic {
     pub stats: Arc<TopicStats>,
     pub partitions: Partitions,
     pub consumer_groups: ConsumerGroups,
+}
+
+impl Default for Topic {
+    fn default() -> Self {
+        Self {
+            id: 0,
+            name: String::new(),
+            created_at: IggyTimestamp::default(),
+            replication_factor: 1,
+            message_expiry: IggyExpiry::default(),
+            compression_algorithm: CompressionAlgorithm::default(),
+            max_topic_size: MaxTopicSize::default(),
+            stats: Arc::new(TopicStats::default()),
+            partitions: Partitions::new(),
+            consumer_groups: ConsumerGroups::new(),
+        }
+    }
 }
 
 impl Topic {
@@ -214,86 +179,27 @@ impl Topic {
     }
 }
 
+// ============================================================================
+// Topics Collection
+// ============================================================================
+
 #[derive(Debug, Clone, Default)]
 pub struct Topics {
-    index: RefCell<AHashMap<String, usize>>,
-    items: RefCell<Slab<Topic>>,
+    pub index: AHashMap<String, usize>,
+    pub items: Slab<Topic>,
 }
 
 impl Topics {
     pub fn new() -> Self {
-        Self {
-            index: RefCell::new(AHashMap::with_capacity(1024)),
-            items: RefCell::new(Slab::with_capacity(1024)),
-        }
-    }
-
-    pub fn insert(&self, topic: Topic) -> usize {
-        let mut items = self.items.borrow_mut();
-        let mut index = self.index.borrow_mut();
-
-        let name = topic.name.clone();
-        let id = items.insert(topic);
-        items[id].id = id;
-        index.insert(name, id);
-        id
-    }
-
-    pub fn get(&self, id: usize) -> Option<Topic> {
-        self.items.borrow().get(id).cloned()
-    }
-
-    pub fn get_by_name(&self, name: &str) -> Option<Topic> {
-        let index = self.index.borrow();
-        if let Some(&id) = index.get(name) {
-            self.items.borrow().get(id).cloned()
-        } else {
-            None
-        }
-    }
-
-    pub fn get_by_identifier(&self, identifier: &Identifier) -> Option<Topic> {
-        match identifier.kind {
-            iggy_common::IdKind::Numeric => {
-                if let Ok(id) = identifier.get_u32_value() {
-                    self.get(id as usize)
-                } else {
-                    None
-                }
-            }
-            iggy_common::IdKind::String => {
-                if let Ok(name) = identifier.get_string_value() {
-                    self.get_by_name(&name)
-                } else {
-                    None
-                }
-            }
-        }
-    }
-
-    pub fn remove(&self, id: usize) -> Option<Topic> {
-        let mut items = self.items.borrow_mut();
-        let mut index = self.index.borrow_mut();
-
-        if !items.contains(id) {
-            return None;
-        }
-
-        let topic = items.remove(id);
-        index.remove(&topic.name);
-        Some(topic)
-    }
-
-    pub fn len(&self) -> usize {
-        self.items.borrow().len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.items.borrow().is_empty()
+        Self::default()
     }
 }
 
-#[derive(Debug, Clone)]
+// ============================================================================
+// Stream Entity
+// ============================================================================
+
+#[derive(Debug)]
 pub struct Stream {
     pub id: usize,
     pub name: String,
@@ -301,6 +207,30 @@ pub struct Stream {
 
     pub stats: Arc<StreamStats>,
     pub topics: Topics,
+}
+
+impl Default for Stream {
+    fn default() -> Self {
+        Self {
+            id: 0,
+            name: String::new(),
+            created_at: IggyTimestamp::default(),
+            stats: Arc::new(StreamStats::default()),
+            topics: Topics::new(),
+        }
+    }
+}
+
+impl Clone for Stream {
+    fn clone(&self) -> Self {
+        Self {
+            id: self.id,
+            name: self.name.clone(),
+            created_at: self.created_at,
+            stats: self.stats.clone(),
+            topics: self.topics.clone(),
+        }
+    }
 }
 
 impl Stream {
@@ -315,186 +245,37 @@ impl Stream {
     }
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct Streams {
-    index: RefCell<AHashMap<String, usize>>,
-    items: RefCell<Slab<Stream>>,
-}
+// ============================================================================
+// Streams State Machine
+// ============================================================================
 
-impl Streams {
-    pub fn new() -> Self {
-        Self {
-            index: RefCell::new(AHashMap::with_capacity(256)),
-            items: RefCell::new(Slab::with_capacity(256)),
-        }
-    }
-
-    pub fn insert(&self, stream: Stream) -> usize {
-        let mut items = self.items.borrow_mut();
-        let mut index = self.index.borrow_mut();
-
-        let name = stream.name.clone();
-        let id = items.insert(stream);
-        items[id].id = id;
-        index.insert(name, id);
-        id
-    }
-
-    pub fn get(&self, id: usize) -> Option<Stream> {
-        self.items.borrow().get(id).cloned()
-    }
-
-    pub fn get_by_name(&self, name: &str) -> Option<Stream> {
-        let index = self.index.borrow();
-        if let Some(&id) = index.get(name) {
-            self.items.borrow().get(id).cloned()
-        } else {
-            None
-        }
-    }
-
-    pub fn get_by_identifier(&self, identifier: &Identifier) -> Option<Stream> {
-        match identifier.kind {
-            iggy_common::IdKind::Numeric => {
-                if let Ok(id) = identifier.get_u32_value() {
-                    self.get(id as usize)
-                } else {
-                    None
-                }
-            }
-            iggy_common::IdKind::String => {
-                if let Ok(name) = identifier.get_string_value() {
-                    self.get_by_name(&name)
-                } else {
-                    None
-                }
-            }
-        }
-    }
-
-    pub fn remove(&self, id: usize) -> Option<Stream> {
-        let mut items = self.items.borrow_mut();
-        let mut index = self.index.borrow_mut();
-
-        if !items.contains(id) {
-            return None;
-        }
-
-        let stream = items.remove(id);
-        index.remove(&stream.name);
-        Some(stream)
-    }
-
-    pub fn update_name(&self, identifier: &Identifier, new_name: String) -> Result<(), IggyError> {
-        let stream = self.get_by_identifier(identifier);
-        if let Some(stream) = stream {
-            let mut items = self.items.borrow_mut();
-            let mut index = self.index.borrow_mut();
-
-            index.remove(&stream.name);
-            if let Some(s) = items.get_mut(stream.id) {
-                s.name = new_name.clone();
-            }
-            index.insert(new_name, stream.id);
-            Ok(())
-        } else {
-            Err(IggyError::ResourceNotFound("Stream".to_string()))
-        }
-    }
-
-    pub fn purge(&self, id: usize) -> Result<(), IggyError> {
-        let items = self.items.borrow();
-        if let Some(_stream) = items.get(id) {
-            // TODO: Purge all topics in the stream
-            Ok(())
-        } else {
-            Err(IggyError::ResourceNotFound("Stream".to_string()))
-        }
-    }
-
-    pub fn len(&self) -> usize {
-        self.items.borrow().len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.items.borrow().is_empty()
-    }
-
-    pub fn iter(&self) -> Vec<Stream> {
-        self.items
-            .borrow()
-            .iter()
-            .map(|(_, s): (usize, &Stream)| s.clone())
-            .collect()
-    }
-}
-
-// Define StreamsCommand enum and StateCommand implementation using the macro
-define_state_command! {
+define_state! {
     Streams,
+    StreamsInner {
+        index: AHashMap<String, usize>,
+        items: Slab<Stream>,
+    },
     StreamsCommand,
     [CreateStream, UpdateStream, DeleteStream, PurgeStream]
 }
 
-impl ApplyState for Streams {
+impl Dispatch for StreamsInner {
+    type Cmd = StreamsCommand;
     type Output = ();
 
-    fn do_apply(&self, cmd: Self::Command) -> Self::Output {
+    fn dispatch(&self, cmd: &Self::Cmd) -> Self::Output {
         match cmd {
-            StreamsCommand::CreateStream(payload) => {
-                todo!("Handle Create stream with {:?}", payload)
+            StreamsCommand::CreateStream(_payload) => {
+                // Actual mutation logic will be implemented later
             }
-            StreamsCommand::UpdateStream(payload) => {
-                todo!("Handle Update stream with {:?}", payload)
+            StreamsCommand::UpdateStream(_payload) => {
+                // Actual mutation logic will be implemented later
             }
-            StreamsCommand::DeleteStream(payload) => {
-                todo!("Handle Delete stream with {:?}", payload)
+            StreamsCommand::DeleteStream(_payload) => {
+                // Actual mutation logic will be implemented later
             }
-            StreamsCommand::PurgeStream(payload) => todo!("Handle Purge stream with {:?}", payload),
-        }
-    }
-}
-
-// Define TopicsCommand enum and StateCommand implementation using the macro
-define_state_command! {
-    Topics,
-    TopicsCommand,
-    [CreateTopic, UpdateTopic, DeleteTopic, PurgeTopic]
-}
-
-impl ApplyState for Topics {
-    type Output = ();
-
-    fn do_apply(&self, cmd: Self::Command) -> Self::Output {
-        match cmd {
-            TopicsCommand::CreateTopic(payload) => todo!("Handle Create topic with {:?}", payload),
-            TopicsCommand::UpdateTopic(payload) => todo!("Handle Update topic with {:?}", payload),
-            TopicsCommand::DeleteTopic(payload) => todo!("Handle Delete topic with {:?}", payload),
-            TopicsCommand::PurgeTopic(payload) => todo!("Handle Purge topic with {:?}", payload),
-        }
-    }
-}
-
-// Define PartitionsCommand enum and StateCommand implementation using the macro
-define_state_command! {
-    Partitions,
-    PartitionsCommand,
-    [CreatePartitions, DeletePartitions, DeleteSegments]
-}
-
-impl ApplyState for Partitions {
-    type Output = ();
-
-    fn do_apply(&self, cmd: Self::Command) -> Self::Output {
-        match cmd {
-            PartitionsCommand::CreatePartitions(payload) => {
-                todo!("Handle Create partitions with {:?}", payload)
-            }
-            PartitionsCommand::DeletePartitions(payload) => {
-                todo!("Handle Delete partitions with {:?}", payload)
-            }
-            PartitionsCommand::DeleteSegments(payload) => {
-                todo!("Handle Delete segments with {:?}", payload)
+            StreamsCommand::PurgeStream(_payload) => {
+                // Actual mutation logic will be implemented later
             }
         }
     }
