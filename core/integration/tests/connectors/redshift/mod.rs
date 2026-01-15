@@ -34,6 +34,7 @@ struct RedshiftTestContainers {
 }
 
 /// Setup result containing both runtime and containers.
+#[allow(dead_code)]
 struct RedshiftTestSetup {
     runtime: ConnectorsRuntime,
     _containers: RedshiftTestContainers,
