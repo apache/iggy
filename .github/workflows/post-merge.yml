@@ -138,6 +138,7 @@ jobs:
           version: ${{ steps.ver.outputs.version }}
           platform: ${{ matrix.platform }}
           dry_run: ${{ github.event.repository.fork }}
+          gha-cache: "false"  # Use registry cache only to save GHA cache space
 
       - name: Export digest
         if: ${{ !github.event.repository.fork }}
