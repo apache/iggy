@@ -101,7 +101,7 @@ include_metadata = false
 | `csv_delimiter` | Char | No | `,` | CSV field delimiter |
 | `csv_quote` | Char | No | `"` | CSV quote character |
 | `max_errors` | Integer | No | `0` | Max errors before COPY fails |
-| `compression` | String | No | `none` | Compression: `gzip`, `lzop`, `bzip2`, `zstd` |
+| `compression` | String | No | `none` | Compression: `gzip`, `lzop`, `bzip2` |
 | `delete_staged_files` | Boolean | No | `true` | Delete S3 files after successful COPY |
 | `max_connections` | Integer | No | `5` | Max Redshift connections |
 | `max_retries` | Integer | No | `3` | Max retry attempts for failures |

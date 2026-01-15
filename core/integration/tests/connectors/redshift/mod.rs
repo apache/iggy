@@ -67,7 +67,11 @@ async fn setup() -> RedshiftTestSetup {
     // Create the bucket via LocalStack S3 API using path-style URL
     let client = reqwest::Client::new();
     let create_bucket_url = format!("{s3_endpoint}/{bucket_name}");
-    let _ = client.put(&create_bucket_url).send().await;
+    client
+        .put(&create_bucket_url)
+        .send()
+        .await
+        .expect("Failed to create S3 bucket in LocalStack");
 
     let mut envs = HashMap::new();
     let iggy_setup = IggySetup::default();

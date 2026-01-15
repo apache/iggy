@@ -144,7 +144,7 @@ impl RedshiftSinkConfig {
 
         // Validate compression if specified
         if let Some(compression) = &self.compression {
-            let valid = ["gzip", "lzop", "bzip2", "none", "zstd"];
+            let valid = ["gzip", "lzop", "bzip2", "none"];
             if !valid.contains(&compression.to_lowercase().as_str()) {
                 return Err(Error::InvalidConfig);
             }
@@ -230,7 +230,7 @@ mod tests {
 
     #[test]
     fn test_valid_compression_options() {
-        for comp in ["gzip", "GZIP", "lzop", "bzip2", "none", "zstd"] {
+        for comp in ["gzip", "GZIP", "lzop", "bzip2", "none"] {
             let mut config = valid_config();
             config.compression = Some(comp.to_string());
             assert!(

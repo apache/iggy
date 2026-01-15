@@ -19,7 +19,7 @@
 name = "iggy_connector_redshift_sink"
 version = "0.1.0"
 description = "Iggy Redshift sink connector for loading stream messages into Amazon Redshift via S3 staging"
-edition = "2024"
+edition = "2021"
 license = "Apache-2.0"
 keywords = ["iggy", "messaging", "streaming", "redshift", "sink", "aws"]
 categories = ["command-line-utilities", "database", "network-programming"]

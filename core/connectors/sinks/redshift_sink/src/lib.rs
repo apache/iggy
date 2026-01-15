@@ -22,10 +22,10 @@ mod s3;
 use async_trait::async_trait;
 use config::RedshiftSinkConfig;
 use iggy_connector_sdk::{
-    ConsumedMessage, Error, MessagesMetadata, Payload, Sink, TopicMetadata, sink_connector,
+    sink_connector, ConsumedMessage, Error, MessagesMetadata, Payload, Sink, TopicMetadata,
 };
 use s3::S3Uploader;
-use sqlx::{Pool, Postgres, postgres::PgPoolOptions};
+use sqlx::{postgres::PgPoolOptions, Pool, Postgres};
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
@@ -194,13 +194,14 @@ impl RedshiftSink {
         // Execute COPY command
         let copy_result = self.execute_copy(pool, &s3_path).await;
 
-        // Cleanup S3 file if configured
-        if self.config.delete_staged_files.unwrap_or(true)
-            && let Err(e) = s3_uploader.delete_file(&s3_key).await
-        {
-            warn!("Failed to delete staged file {}: {}", s3_key, e);
+        // Cleanup S3 file if configured - always attempt cleanup regardless of COPY result
+        if self.config.delete_staged_files.unwrap_or(true) {
+            if let Err(e) = s3_uploader.delete_file(&s3_key).await {
+                warn!("Failed to delete staged file {}: {}", s3_key, e);
+            }
         }
 
+        // Return COPY result after cleanup
         copy_result?;
 
         let mut state = self.state.lock().await;
@@ -230,10 +231,18 @@ impl RedshiftSink {
         let include_metadata = self.config.include_metadata.unwrap_or(false);
 
         let mut csv_output = Vec::new();
+        // Pre-allocate the escaped quote string for performance
+        let escaped_quote = format!("{quote}{quote}");
 
         for message in messages {
             let payload_str = match &message.payload {
-                Payload::Json(value) => simd_json::to_string(value).unwrap_or_default(),
+                Payload::Json(value) => simd_json::to_string(value).unwrap_or_else(|e| {
+                    warn!(
+                        "Failed to serialize JSON payload for message {}: {}",
+                        message.id, e
+                    );
+                    String::new()
+                }),
                 Payload::Text(text) => text.clone(),
                 Payload::Raw(bytes) => String::from_utf8_lossy(bytes).to_string(),
                 _ => {
@@ -246,7 +255,7 @@ impl RedshiftSink {
             };
 
             // Escape quotes in payload
-            let escaped_payload = payload_str.replace(quote, &format!("{quote}{quote}"));
+            let escaped_payload = payload_str.replace(quote, &escaped_quote);
 
             let mut row = format!(
                 "{}{delim}{quote}{payload}{quote}",
