@@ -17,7 +17,7 @@
 
 [package]
 name = "iggy-mcp"
-version = "0.2.1-edge.1"
+version = "0.2.1-edge.2"
 description = "MCP Server for Iggy message streaming platform"
 edition = "2024"
 license = "Apache-2.0"
@@ -29,6 +29,7 @@ readme = "README.md"
 [dependencies]
 axum = { workspace = true }
 axum-server = { workspace = true }
+dirs = { workspace = true }
 dotenvy = { workspace = true }
 figlet-rs = { workspace = true }
 figment = { workspace = true }
@@ -47,3 +48,6 @@ tokio = { workspace = true }
 tower-http = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
