@@ -4584,7 +4584,7 @@ dependencies = [
 
 [[package]]
 name = "iggy-connectors"
-version = "0.2.1-edge.1"
+version = "0.2.1-edge.2"
 dependencies = [
  "async-trait",
  "axum",
@@ -4614,6 +4614,7 @@ dependencies = [
  "serde_with",
  "serde_yaml_ng",
  "strum 0.27.2",
+ "tempfile",
  "thiserror 2.0.17",
  "tokio",
  "toml 0.9.10+spec-1.1.0",
@@ -4624,7 +4625,7 @@ dependencies = [
 
 [[package]]
 name = "iggy-mcp"
-version = "0.2.1-edge.1"
+version = "0.2.1-edge.2"
 dependencies = [
  "axum",
  "axum-server",
@@ -4638,6 +4639,7 @@ dependencies = [
  "serde",
  "serde_json",
  "strum 0.27.2",
+ "tempfile",
  "thiserror 2.0.17",
  "tokio",
  "tower-http",

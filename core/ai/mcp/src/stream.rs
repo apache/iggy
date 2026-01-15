@@ -120,3 +120,107 @@ pub async fn init(config: IggyConfig) -> Result<IggyClient, McpRuntimeError> {
     client.connect().await?;
     Ok(client)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    #[test]
+    fn test_expand_home_with_tilde_prefix() {
+        let path = "~/some/path";
+        let result = expand_home(path);
+
+        if let Some(home) = dirs::home_dir() {
+            assert_eq!(result, home.join("some/path"));
+        } else {
+            assert_eq!(result, PathBuf::from(path));
+        }
+    }
+
+    #[test]
+    fn test_expand_home_with_only_tilde() {
+        let path = "~";
+        let result = expand_home(path);
+
+        if let Some(home) = dirs::home_dir() {
+            assert_eq!(result, home);
+        } else {
+            assert_eq!(result, PathBuf::from(path));
+        }
+    }
+
+    #[test]
+    fn test_expand_home_without_tilde() {
+        let path = "/absolute/path";
+        let result = expand_home(path);
+        assert_eq!(result, PathBuf::from("/absolute/path"));
+    }
+
+    #[test]
+    fn test_expand_home_relative_path() {
+        let path = "relative/path";
+        let result = expand_home(path);
+        assert_eq!(result, PathBuf::from("relative/path"));
+    }
+
+    #[test]
+    fn test_resolve_token_direct_value() {
+        let token = "my-secret-token";
+        let result = resolve_token(token).unwrap();
+        assert_eq!(result, "my-secret-token");
+    }
+
+    #[test]
+    fn test_resolve_token_from_file() {
+        let mut temp_file = NamedTempFile::new().unwrap();
+        writeln!(temp_file, "token-from-file").unwrap();
+
+        let token = format!("file:{}", temp_file.path().display());
+        let result = resolve_token(&token).unwrap();
+        assert_eq!(result, "token-from-file");
+    }
+
+    #[test]
+    fn test_resolve_token_from_file_trims_whitespace() {
+        let mut temp_file = NamedTempFile::new().unwrap();
+        writeln!(temp_file, "  token-with-spaces  \n\n").unwrap();
+
+        let token = format!("file:{}", temp_file.path().display());
+        let result = resolve_token(&token).unwrap();
+        assert_eq!(result, "token-with-spaces");
+    }
+
+    #[test]
+    fn test_resolve_token_file_not_found() {
+        let token = "file:/nonexistent/path/to/token.txt";
+        let result = resolve_token(token);
+
+        assert!(result.is_err());
+        assert!(matches!(result, Err(McpRuntimeError::TokenFileNotFound(_))));
+    }
+
+    #[test]
+    fn test_resolve_token_empty_file() {
+        let temp_file = NamedTempFile::new().unwrap();
+
+        let token = format!("file:{}", temp_file.path().display());
+        let result = resolve_token(&token);
+
+        assert!(result.is_err());
+        assert!(matches!(result, Err(McpRuntimeError::TokenFileEmpty(_))));
+    }
+
+    #[test]
+    fn test_resolve_token_file_with_only_whitespace() {
+        let mut temp_file = NamedTempFile::new().unwrap();
+        writeln!(temp_file, "   \n\t\n   ").unwrap();
+
+        let token = format!("file:{}", temp_file.path().display());
+        let result = resolve_token(&token);
+
+        assert!(result.is_err());
+        assert!(matches!(result, Err(McpRuntimeError::TokenFileEmpty(_))));
+    }
+}
