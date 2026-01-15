@@ -25,14 +25,18 @@ inputs:
     description: "Whether to enable caching"
     required: false
     default: "true"
-  show-stats:
-    description: "Whether to show sccache statistics at the end"
-    required: false
-    default: "false"
   cache-targets:
     description: "Whether to cache target directory (passed to rust-cache)"
     required: false
     default: "false"
+  profile:
+    description: "Build profile for cache separation (dev or release)"
+    required: false
+    default: "dev"
+  save-cache:
+    description: "Whether to save cache at end of job (set false for jobs that don't compile much)"
+    required: false
+    default: "true"
 
 runs:
   using: "composite"
@@ -60,18 +64,36 @@ runs:
       uses: Swatinem/rust-cache@v2
       with:
         cache-targets: ${{ inputs.cache-targets }}
+        shared-key: rust-deps  # All jobs share same dependency cache (profile doesn't affect downloads)
 
-    - name: Setup sccache cache
-      if: inputs.enabled == 'true'
+    - name: Get current date
+      id: date
+      run: echo "date=$(date +'%Y-%m-%d')" >> $GITHUB_OUTPUT
+      shell: bash
+
+    - name: Setup sccache cache (restore and save)
+      if: inputs.enabled == 'true' && inputs.save-cache == 'true'
       uses: actions/cache@v4
       with:
         path: |
           ~/.cache/sccache
           ~/Library/Caches/sccache
           ~/.local/share/sccache
-        key: sccache-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+        key: sccache-${{ runner.os }}-${{ runner.arch }}-${{ inputs.profile }}-${{ steps.date.outputs.date }}-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
         restore-keys: |
-          sccache-${{ runner.os }}-${{ runner.arch }}-
+          sccache-${{ runner.os }}-${{ runner.arch }}-${{ inputs.profile }}-
+
+    - name: Setup sccache cache (restore only)
+      if: inputs.enabled == 'true' && inputs.save-cache != 'true'
+      uses: actions/cache/restore@v4
+      with:
+        path: |
+          ~/.cache/sccache
+          ~/Library/Caches/sccache
+          ~/.local/share/sccache
+        key: sccache-${{ runner.os }}-${{ runner.arch }}-${{ inputs.profile }}-${{ steps.date.outputs.date }}-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+        restore-keys: |
+          sccache-${{ runner.os }}-${{ runner.arch }}-${{ inputs.profile }}-
 
     - name: Install sccache
       if: inputs.enabled == 'true'
@@ -160,7 +182,7 @@ runs:
           mkdir -p "$SCCACHE_DIR"
 
           echo "SCCACHE_DIR=$SCCACHE_DIR" >> $GITHUB_ENV
-          echo "SCCACHE_CACHE_SIZE=5G" >> $GITHUB_ENV
+          echo "SCCACHE_CACHE_SIZE=2G" >> $GITHUB_ENV
           echo "SCCACHE_ERROR_BEHAVIOR=warn" >> $GITHUB_ENV
           echo "SCCACHE_IGNORE_SERVER_IO_ERROR=1" >> $GITHUB_ENV
 
@@ -194,14 +216,5 @@ runs:
           fi
         else
           echo "⚠️ sccache not available, continuing without cache"
-        fi
-      shell: bash
-
-    - name: Show sccache stats on completion
-      if: always() && inputs.enabled == 'true' && inputs.show-stats == 'true'
-      run: |
-        if command -v sccache &> /dev/null; then
-          echo "### Final sccache Statistics ###"
-          sccache --show-stats || true
         fi
       shell: bash

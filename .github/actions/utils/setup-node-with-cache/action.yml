@@ -44,18 +44,8 @@ runs:
       uses: actions/setup-node@v4
       with:
         node-version: ${{ inputs.node-version }}
-        cache: "npm"
+        cache: ${{ inputs.enabled == 'true' && 'npm' || '' }}
         cache-dependency-path: ${{ inputs.cache-dependency-path }}
-
-    - name: Setup npm cache
-      if: inputs.enabled == 'true'
-      uses: actions/cache@v4
-      with:
-        path: ~/.npm
-        key: npm-${{ runner.os }}-${{ hashFiles(inputs.cache-dependency-path) }}
-        restore-keys: |
-          npm-${{ runner.os }}-
-
 
     - name: Install dependencies
       if: inputs.enabled == 'true'
