@@ -4474,7 +4474,7 @@ dependencies = [
 
 [[package]]
 name = "iggy"
-version = "0.8.1-edge.3"
+version = "0.8.1-edge.4"
 dependencies = [
  "async-broadcast",
  "async-dropper",
@@ -4584,7 +4584,7 @@ dependencies = [
 
 [[package]]
 name = "iggy-connectors"
-version = "0.2.1-edge.2"
+version = "0.2.1-edge.3"
 dependencies = [
  "async-trait",
  "axum",
@@ -4625,7 +4625,7 @@ dependencies = [
 
 [[package]]
 name = "iggy-mcp"
-version = "0.2.1-edge.2"
+version = "0.2.1-edge.3"
 dependencies = [
  "axum",
  "axum-server",
@@ -4649,7 +4649,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_binary_protocol"
-version = "0.8.1-edge.1"
+version = "0.8.1-edge.2"
 dependencies = [
  "anyhow",
  "async-broadcast",
