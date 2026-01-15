@@ -69,9 +69,8 @@ runs:
           ~/.cache/sccache
           ~/Library/Caches/sccache
           ~/.local/share/sccache
-        key: sccache-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+        key: sccache-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
         restore-keys: |
-          sccache-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
           sccache-${{ runner.os }}-${{ runner.arch }}-
 
     - name: Install sccache
@@ -80,24 +79,44 @@ runs:
         # Check if sccache is already installed
         if ! command -v sccache &> /dev/null; then
           echo "Installing sccache..."
-          SCCACHE_VERSION="v0.8.2"
+          SCCACHE_VERSION="v0.13.0"
 
-          # Detect architecture
+          # Detect OS and architecture
+          OS="$(uname -s)"
           ARCH="$(uname -m)"
-          case "$ARCH" in
-            x86_64)  SCCACHE_ARCH="x86_64-unknown-linux-musl" ;;
-            aarch64) SCCACHE_ARCH="aarch64-unknown-linux-musl" ;;
-            *)
-              echo "⚠️ Unsupported architecture: $ARCH, skipping sccache"
-              exit 0
-              ;;
-          esac
+
+          if [[ "$OS" == "Linux" ]]; then
+            case "$ARCH" in
+              x86_64)  SCCACHE_ARCH="x86_64-unknown-linux-musl" ;;
+              aarch64) SCCACHE_ARCH="aarch64-unknown-linux-musl" ;;
+              *)
+                echo "⚠️ Unsupported Linux architecture: $ARCH, skipping sccache"
+                exit 0
+                ;;
+            esac
+          elif [[ "$OS" == "Darwin" ]]; then
+            case "$ARCH" in
+              x86_64) SCCACHE_ARCH="x86_64-apple-darwin" ;;
+              arm64)  SCCACHE_ARCH="aarch64-apple-darwin" ;;
+              *)
+                echo "⚠️ Unsupported macOS architecture: $ARCH, skipping sccache"
+                exit 0
+                ;;
+            esac
+          else
+            echo "⚠️ Unsupported OS: $OS, skipping sccache"
+            exit 0
+          fi
 
           SCCACHE_URL="https://github.com/mozilla/sccache/releases/download/${SCCACHE_VERSION}/sccache-${SCCACHE_VERSION}-${SCCACHE_ARCH}.tar.gz"
-          echo "Downloading sccache for $SCCACHE_ARCH..."
+          echo "Downloading sccache $SCCACHE_VERSION for $SCCACHE_ARCH..."
 
           curl -L "$SCCACHE_URL" | tar xz
-          sudo mv "sccache-${SCCACHE_VERSION}-${SCCACHE_ARCH}/sccache" /usr/local/bin/
+          if [[ "$OS" == "Darwin" ]]; then
+            mv "sccache-${SCCACHE_VERSION}-${SCCACHE_ARCH}/sccache" /usr/local/bin/
+          else
+            sudo mv "sccache-${SCCACHE_VERSION}-${SCCACHE_ARCH}/sccache" /usr/local/bin/
+          fi
           rm -rf "sccache-${SCCACHE_VERSION}-${SCCACHE_ARCH}"
         fi
       shell: bash
@@ -141,13 +160,23 @@ runs:
           mkdir -p "$SCCACHE_DIR"
 
           echo "SCCACHE_DIR=$SCCACHE_DIR" >> $GITHUB_ENV
-          echo "SCCACHE_CACHE_SIZE=2G" >> $GITHUB_ENV
+          echo "SCCACHE_CACHE_SIZE=5G" >> $GITHUB_ENV
           echo "SCCACHE_ERROR_BEHAVIOR=warn" >> $GITHUB_ENV
           echo "SCCACHE_IGNORE_SERVER_IO_ERROR=1" >> $GITHUB_ENV
 
           # Don't use GHA cache backend - use local disk cache with actions/cache
           # This provides better control and persistence
           echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
+
+          # Disable incremental compilation - not useful in CI with sccache
+          echo "CARGO_INCREMENTAL=0" >> $GITHUB_ENV
+
+          # Disable debug info in dev/test builds - faster compilation, smaller cache
+          echo "CARGO_PROFILE_DEV_DEBUG=0" >> $GITHUB_ENV
+          echo "CARGO_PROFILE_TEST_DEBUG=0" >> $GITHUB_ENV
+
+          # Use sparse registry protocol for faster dependency resolution
+          echo "CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse" >> $GITHUB_ENV
 
           # Start sccache server
           sccache --stop-server 2>/dev/null || true
