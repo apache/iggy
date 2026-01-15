@@ -4592,6 +4592,7 @@ dependencies = [
  "chrono",
  "clap",
  "dashmap",
+ "dirs",
  "dlopen2",
  "dotenvy",
  "figlet-rs",
@@ -4627,6 +4628,7 @@ version = "0.2.1-edge.1"
 dependencies = [
  "axum",
  "axum-server",
+ "dirs",
  "dotenvy",
  "figlet-rs",
  "figment",

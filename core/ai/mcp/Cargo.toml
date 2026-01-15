@@ -29,6 +29,7 @@ readme = "README.md"
 [dependencies]
 axum = { workspace = true }
 axum-server = { workspace = true }
+dirs = { workspace = true }
 dotenvy = { workspace = true }
 figlet-rs = { workspace = true }
 figment = { workspace = true }

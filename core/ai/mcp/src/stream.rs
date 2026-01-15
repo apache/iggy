@@ -19,15 +19,62 @@
 
 use crate::{configs::IggyConfig, error::McpRuntimeError};
 use iggy::prelude::{Client, IggyClient, IggyClientBuilder};
+use std::path::PathBuf;
 use tracing::{error, info};
+
+const TOKEN_FILE_PREFIX: &str = "file:";
+
+fn expand_home(path: &str) -> PathBuf {
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    } else if path == "~"
+        && let Some(home) = dirs::home_dir()
+    {
+        return home;
+    }
+    PathBuf::from(path)
+}
+
+fn resolve_token(token: &str) -> Result<String, McpRuntimeError> {
+    if let Some(path) = token.strip_prefix(TOKEN_FILE_PREFIX) {
+        let file_path = expand_home(path);
+
+        if !file_path.exists() {
+            error!("Token file does not exist: {}", path);
+            return Err(McpRuntimeError::TokenFileNotFound(path.to_string()));
+        }
+
+        let content = std::fs::read_to_string(&file_path).map_err(|e| {
+            error!("Failed to read token file '{}': {}", path, e);
+            McpRuntimeError::TokenFileReadError(path.to_string(), e.to_string())
+        })?;
+
+        let trimmed = content.trim().to_string();
+
+        if trimmed.is_empty() {
+            error!("Token file is empty: {}", path);
+            return Err(McpRuntimeError::TokenFileEmpty(path.to_string()));
+        }
+
+        Ok(trimmed)
+    } else {
+        Ok(token.to_string())
+    }
+}
 
 pub async fn init(config: IggyConfig) -> Result<IggyClient, McpRuntimeError> {
     let address = config.address;
     let username = config.username;
     let password = config.password;
-    let token = config.token;
+    let token = if config.token.is_empty() {
+        None
+    } else {
+        Some(resolve_token(&config.token)?)
+    };
 
-    let connection_string = if !token.is_empty() {
+    let connection_string = if let Some(token) = token {
         let redacted_token = token.chars().take(3).collect::<String>();
         info!("Using token: {redacted_token}*** for Iggy authentication");
         format!("iggy://{token}@{address}")

@@ -18,10 +18,53 @@
  */
 
 use iggy::prelude::{Client, IggyClient, IggyClientBuilder};
+use std::path::PathBuf;
 use tracing::{error, info};
 
 use crate::configs::runtime::IggyConfig;
 use crate::error::RuntimeError;
+
+const TOKEN_FILE_PREFIX: &str = "file:";
+
+fn expand_home(path: &str) -> PathBuf {
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    } else if path == "~"
+        && let Some(home) = dirs::home_dir()
+    {
+        return home;
+    }
+    PathBuf::from(path)
+}
+
+fn resolve_token(token: &str) -> Result<String, RuntimeError> {
+    if let Some(path) = token.strip_prefix(TOKEN_FILE_PREFIX) {
+        let file_path = expand_home(path);
+
+        if !file_path.exists() {
+            error!("Token file does not exist: {}", path);
+            return Err(RuntimeError::TokenFileNotFound(path.to_string()));
+        }
+
+        let content = std::fs::read_to_string(&file_path).map_err(|e| {
+            error!("Failed to read token file '{}': {}", path, e);
+            RuntimeError::TokenFileReadError(path.to_string(), e.to_string())
+        })?;
+
+        let trimmed = content.trim().to_string();
+
+        if trimmed.is_empty() {
+            error!("Token file is empty: {}", path);
+            return Err(RuntimeError::TokenFileEmpty(path.to_string()));
+        }
+
+        Ok(trimmed)
+    } else {
+        Ok(token.to_string())
+    }
+}
 
 pub struct IggyClients {
     pub producer: IggyClient,
@@ -29,19 +72,27 @@ pub struct IggyClients {
 }
 
 pub async fn init(config: IggyConfig) -> Result<IggyClients, RuntimeError> {
-    let consumer = create_client(&config).await?;
-    let producer = create_client(&config).await?;
+    let token = if config.token.is_empty() {
+        None
+    } else {
+        Some(resolve_token(&config.token)?)
+    };
+
+    let consumer = create_client(&config, token.as_deref()).await?;
+    let producer = create_client(&config, token.as_deref()).await?;
     let iggy_clients = IggyClients { producer, consumer };
     Ok(iggy_clients)
 }
 
-async fn create_client(config: &IggyConfig) -> Result<IggyClient, RuntimeError> {
+async fn create_client(
+    config: &IggyConfig,
+    token: Option<&str>,
+) -> Result<IggyClient, RuntimeError> {
     let address = config.address.to_owned();
     let username = config.username.to_owned();
     let password = config.password.to_owned();
-    let token = config.token.to_owned();
 
-    let connection_string = if !token.is_empty() {
+    let connection_string = if let Some(token) = token {
         let redacted_token = token.chars().take(3).collect::<String>();
         info!("Using token: {redacted_token}*** for Iggy authentication");
         format!("iggy://{token}@{address}")
