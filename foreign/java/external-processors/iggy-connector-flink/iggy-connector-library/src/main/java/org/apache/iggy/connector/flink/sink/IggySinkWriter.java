@@ -144,7 +144,7 @@ public class IggySinkWriter<T> implements SinkWriter<T> {
 
     private static void validatePositiveDuration(Duration value, String name) {
         if (value == null || value.isNegative()) {
-            throw new IllegalArgumentException(name + " must be positive");
+            throw new IllegalArgumentException(name + " must be non-negative");
         }
     }
 
@@ -212,13 +212,10 @@ public class IggySinkWriter<T> implements SinkWriter<T> {
         // Flush any remaining buffered records
         flush(true);
 
-        // Close TCP client if applicable (TCP clients need explicit close)
-        if (iggyClient instanceof IggyTcpClient) {
-            log.debug("Closing TCP client connection");
-            // TCP client connections are managed internally and closed when JVM exits
-            // or when connection pool is explicitly closed
-        }
-        // HTTP client doesn't need explicit close - connections managed by Java HttpClient pool
+        // TODO: If TCP clients require cleanup in the future, add explicit close logic here
+        // Underlying Iggy clients manage their own connections; no explicit close required here.
+        // HTTP client connections are managed by Java HttpClient pool.
+        // If TCP client cleanup becomes necessary, add: iggyClient.close() if applicable
 
         log.info("IggySinkWriter closed. Total messages written: {}", totalWritten);
     }

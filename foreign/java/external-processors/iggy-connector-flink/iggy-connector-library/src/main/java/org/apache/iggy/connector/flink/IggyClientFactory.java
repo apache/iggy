@@ -173,10 +173,20 @@ public final class IggyClientFactory implements Serializable {
         }
 
         // If it contains a port separator, extract the host part
+        // Handle IPv6 addresses (contain multiple colons) by splitting from the right
         if (address.contains(":")) {
-            String[] parts = address.split(":");
-            if (parts.length >= 1 && !parts[0].isBlank()) {
-                return parts[0];
+            // For IPv6 addresses, the last colon separates the port
+            // For IPv4 addresses, the last colon separates the port
+            int lastColonIndex = address.lastIndexOf(':');
+            if (lastColonIndex > 0) {
+                String host = address.substring(0, lastColonIndex);
+                // Remove brackets from IPv6 addresses if present
+                if (host.startsWith("[") && host.endsWith("]")) {
+                    host = host.substring(1, host.length() - 1);
+                }
+                if (!host.isBlank()) {
+                    return host;
+                }
             }
             throw new IllegalArgumentException("Cannot extract host from address: " + serverAddress);
         }
