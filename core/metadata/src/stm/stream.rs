@@ -17,7 +17,7 @@
 
 use crate::define_state;
 use crate::stats::{StreamStats, TopicStats};
-use crate::stm::Dispatch;
+use crate::stm::Handle;
 use ahash::AHashMap;
 use iggy_common::create_stream::CreateStream;
 use iggy_common::delete_stream::DeleteStream;
@@ -259,11 +259,8 @@ define_state! {
     [CreateStream, UpdateStream, DeleteStream, PurgeStream]
 }
 
-impl Dispatch for StreamsInner {
-    type Cmd = StreamsCommand;
-    type Output = ();
-
-    fn dispatch(&self, cmd: &Self::Cmd) -> Self::Output {
+impl Handle for StreamsInner {
+    fn handle(&mut self, cmd: &StreamsCommand) {
         match cmd {
             StreamsCommand::CreateStream(_payload) => {
                 // Actual mutation logic will be implemented later

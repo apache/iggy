@@ -17,7 +17,7 @@
 
 use crate::define_state;
 use crate::permissioner::Permissioner;
-use crate::stm::Dispatch;
+use crate::stm::Handle;
 use ahash::AHashMap;
 use iggy_common::change_password::ChangePassword;
 use iggy_common::create_user::CreateUser;
@@ -77,11 +77,8 @@ define_state! {
     [CreateUser, UpdateUser, DeleteUser, ChangePassword, UpdatePermissions]
 }
 
-impl Dispatch for UsersInner {
-    type Cmd = UsersCommand;
-    type Output = ();
-
-    fn dispatch(&self, cmd: &Self::Cmd) -> Self::Output {
+impl Handle for UsersInner {
+    fn handle(&mut self, cmd: &UsersCommand) {
         match cmd {
             UsersCommand::CreateUser(_payload) => {
                 // Actual mutation logic will be implemented later

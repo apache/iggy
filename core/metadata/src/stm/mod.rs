@@ -37,19 +37,14 @@ impl<T: left_right::Absorb<O>, O> WriteCell<T, O> {
         }
     }
 
-    pub fn with<F, R>(&self, f: F) -> R
-    where
-        F: FnOnce(&mut left_right::WriteHandle<T, O>) -> R,
-    {
+    pub fn apply(&self, cmd: O) {
         // SAFETY: WriteCell is !Sync (via UnsafeCell), so only one thread can access.
         // The caller ensures exclusive access through the &self borrow.
-        unsafe { f(&mut *self.inner.get()) }
+        unsafe {
+            (*self.inner.get()).append(cmd).publish();
+        }
     }
 }
-
-// ============================================================================
-// Traits - All use &self, implementations use interior mutability
-// ============================================================================
 
 /// Parses input into a command.
 pub trait Command {
@@ -59,27 +54,20 @@ pub trait Command {
     fn into_command(input: &Self::Input) -> Option<Self::Cmd>;
 }
 
-/// Dispatches a command to mutate state.
-/// Takes `&mut self` - implementations use interior mutability.
-pub trait Dispatch {
-    type Cmd;
-    type Output;
-
-    fn dispatch(&self, cmd: &Self::Cmd) -> Self::Output;
+/// Handles a command to mutate state.
+pub trait Handle: Command {
+    fn handle(&mut self, cmd: &<Self as Command>::Cmd);
 }
 
 /// Applies a command through a state wrapper.
-/// Takes `&self` - implementations use interior mutability.
 pub trait ApplyState {
-    type Cmd;
+    type Inner: Command;
     type Output;
-    type Inner: Command<Cmd = Self::Cmd>;
 
-    fn do_apply(&self, cmd: Self::Cmd) -> Option<Self::Output>;
+    fn do_apply(&self, cmd: <Self::Inner as Command>::Cmd) -> Self::Output;
 }
 
 /// Public interface for state machines.
-/// Takes `&self` - implementations use interior mutability.
 pub trait State {
     type Output;
     type Input;
@@ -87,16 +75,12 @@ pub trait State {
     fn apply(&self, input: &Self::Input) -> Option<Self::Output>;
 }
 
-impl<T> State for T
-where
-    T: ApplyState,
-{
+impl<T: ApplyState> State for T {
     type Output = T::Output;
     type Input = <T::Inner as Command>::Input;
 
     fn apply(&self, input: &Self::Input) -> Option<Self::Output> {
-        let cmd = T::Inner::into_command(input)?;
-        self.do_apply(cmd)
+        T::Inner::into_command(input).map(|cmd| self.do_apply(cmd))
     }
 }
 
@@ -168,15 +152,12 @@ macro_rules! define_state {
 
         impl From<$inner> for $state {
             fn from(inner: $inner) -> Self {
-                let (write, read) = ::left_right::new_from_empty(inner);
-                let write = Some($crate::stm::WriteCell::new(write));
-                let read = ::std::sync::Arc::new(read);
+                let (write, read) = { let (w, r) = ::left_right::new_from_empty(inner); (Some($crate::stm::WriteCell::new(w)), ::std::sync::Arc::new(r)) };
                 Self { write, read }
             }
         }
 
         impl From<::std::sync::Arc<::left_right::ReadHandle<$inner>>> for $state {
-            /// Create a read-only instance from a read handle.
             fn from(read: ::std::sync::Arc<::left_right::ReadHandle<$inner>>) -> Self {
                 Self { write: None, read }
             }
@@ -218,16 +199,16 @@ macro_rules! define_state {
 
         impl ::left_right::Absorb<$command> for $inner
         where
-            $inner: $crate::stm::Dispatch<Cmd = $command>,
+            $inner: $crate::stm::Handle,
         {
             fn absorb_first(&mut self, cmd: &mut $command, _other: &Self) {
-                use $crate::stm::Dispatch;
-                self.dispatch(cmd);
+                use $crate::stm::Handle;
+                self.handle(cmd);
             }
 
             fn absorb_second(&mut self, cmd: $command, _other: &Self) {
-                use $crate::stm::Dispatch;
-                self.dispatch(&cmd);
+                use $crate::stm::Handle;
+                self.handle(&cmd);
             }
 
             fn sync_with(&mut self, first: &Self) {
@@ -241,18 +222,13 @@ macro_rules! define_state {
 
         impl $crate::stm::ApplyState for $state
         where
-            $inner: $crate::stm::Dispatch<Cmd = $command>,
+            $inner: $crate::stm::Handle,
         {
-            type Cmd = $command;
-            type Output = ();
             type Inner = $inner;
+            type Output = ();
 
-            fn do_apply(&self, cmd: Self::Cmd) -> Option<Self::Output> {
-                let write_cell = self.write.as_ref()?;
-                write_cell.with(|write| {
-                    write.append(cmd).publish();
-                });
-                Some(())
+            fn do_apply(&self, cmd: $command) -> Self::Output {
+                self.write.as_ref().expect("[do_apply]: no write handle").apply(cmd);
             }
         }
     };
