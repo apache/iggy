@@ -163,6 +163,7 @@ mod tests {
             "us-east-1",
             Some("AKIAIOSFODNN7EXAMPLE"),
             Some("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"),
+            None,
         );
         assert!(result.is_ok());
     }
@@ -175,6 +176,7 @@ mod tests {
             "us-east-1",
             Some("AKIAIOSFODNN7EXAMPLE"),
             Some("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"),
+            None,
         )
         .unwrap();
 
@@ -189,6 +191,7 @@ mod tests {
             "us-east-1",
             Some("AKIAIOSFODNN7EXAMPLE"),
             Some("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"),
+            None,
         )
         .unwrap();
 

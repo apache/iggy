@@ -104,7 +104,10 @@ impl RedshiftSink {
             "Initialized S3 uploader for bucket: {}, region: {}{}",
             self.config.s3_bucket,
             self.config.s3_region,
-            self.config.s3_endpoint.as_ref().map_or(String::new(), |e| format!(", endpoint: {}", e))
+            self.config
+                .s3_endpoint
+                .as_ref()
+                .map_or(String::new(), |e| format!(", endpoint: {}", e))
         );
         Ok(())
     }
@@ -427,6 +430,7 @@ mod tests {
             s3_bucket: "test-bucket".to_string(),
             s3_prefix: Some("staging/".to_string()),
             s3_region: "us-east-1".to_string(),
+            s3_endpoint: None,
             aws_access_key_id: None,
             aws_secret_access_key: None,
             batch_size: Some(1000),
