@@ -15,15 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::define_state;
 use crate::stats::{StreamStats, TopicStats};
-use crate::stm::Handle;
+use crate::stm::{Handler, LeftRight};
+use crate::{define_state, impl_absorb};
 use ahash::AHashMap;
 use iggy_common::create_stream::CreateStream;
 use iggy_common::delete_stream::DeleteStream;
 use iggy_common::purge_stream::PurgeStream;
 use iggy_common::update_stream::UpdateStream;
 use iggy_common::{CompressionAlgorithm, IggyExpiry, IggyTimestamp, MaxTopicSize};
+use left_right::Absorb;
 use slab::Slab;
 use std::sync::Arc;
 
@@ -245,9 +246,15 @@ impl Stream {
     }
 }
 
-// ============================================================================
-// Streams State Machine
-// ============================================================================
+fn foo() {
+    let streams_inner = StreamsInner {
+        index: AHashMap::new(),
+        items: Slab::new(),
+    };
+
+    let streams: LeftRight<StreamsInner, StreamsCommand> = streams_inner.into();
+    let streams_2: Streams<LeftRight<StreamsInner, StreamsCommand>> = streams.into();
+}
 
 define_state! {
     Streams,
@@ -258,8 +265,9 @@ define_state! {
     StreamsCommand,
     [CreateStream, UpdateStream, DeleteStream, PurgeStream]
 }
+impl_absorb!(StreamsInner, StreamsCommand);
 
-impl Handle for StreamsInner {
+impl Handler for StreamsInner {
     fn handle(&mut self, cmd: &StreamsCommand) {
         match cmd {
             StreamsCommand::CreateStream(_payload) => {

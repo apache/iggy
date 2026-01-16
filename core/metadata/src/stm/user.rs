@@ -17,7 +17,7 @@
 
 use crate::define_state;
 use crate::permissioner::Permissioner;
-use crate::stm::Handle;
+use crate::stm::{Handle, Handler};
 use ahash::AHashMap;
 use iggy_common::change_password::ChangePassword;
 use iggy_common::create_user::CreateUser;
@@ -62,10 +62,6 @@ impl User {
     }
 }
 
-// ============================================================================
-// Users State Machine
-// ============================================================================
-
 define_state! {
     Users,
     UsersInner {
@@ -77,7 +73,7 @@ define_state! {
     [CreateUser, UpdateUser, DeleteUser, ChangePassword, UpdatePermissions]
 }
 
-impl Handle for UsersInner {
+impl Handler for UsersInner {
     fn handle(&mut self, cmd: &UsersCommand) {
         match cmd {
             UsersCommand::CreateUser(_payload) => {
