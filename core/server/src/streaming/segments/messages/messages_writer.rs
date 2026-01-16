@@ -16,10 +16,13 @@
  * under the License.
  */
 
-use crate::streaming::segments::{IggyMessagesBatchSet, messages::write_batch};
+use crate::streaming::segments::{
+    IggyMessagesBatchSet,
+    messages::{write_batch, write_batch_frozen},
+};
 use compio::fs::{File, OpenOptions};
 use err_trail::ErrContext;
-use iggy_common::{IggyByteSize, IggyError};
+use iggy_common::{IggyByteSize, IggyError, IggyMessagesBatch};
 use std::{
     rc::Rc,
     sync::atomic::{AtomicU64, Ordering},
@@ -128,6 +131,37 @@ impl MessagesWriter {
         );
 
         Ok(IggyByteSize::from(messages_size as u64))
+    }
+
+    /// Append frozen (immutable) batches to the messages file.
+    ///
+    /// Unlike `save_batch_set`, this method does not take ownership of the batches.
+    /// The caller retains the batches (for use in in-flight buffer) while disk I/O proceeds.
+    pub async fn save_frozen_batches(
+        &self,
+        batches: &[IggyMessagesBatch],
+    ) -> Result<IggyByteSize, IggyError> {
+        let messages_size: u64 = batches.iter().map(|b| b.size() as u64).sum();
+
+        let position = self.messages_size_bytes.load(Ordering::Relaxed);
+        let file = &self.file;
+        write_batch_frozen(file, position, batches)
+            .await
+            .error(|e: &IggyError| {
+                format!(
+                    "Failed to write frozen batch to messages file: {}. {e}",
+                    self.file_path
+                )
+            })?;
+
+        if self.fsync {
+            let _ = self.fsync().await;
+        }
+
+        self.messages_size_bytes
+            .fetch_add(messages_size, Ordering::Release);
+
+        Ok(IggyByteSize::from(messages_size))
     }
 
     pub fn path(&self) -> String {
