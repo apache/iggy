@@ -19,7 +19,7 @@
 mod messages_reader;
 mod messages_writer;
 
-use super::IggyMessagesBatchSet;
+use super::IggyMessagesBatchSetMut;
 use bytes::Bytes;
 use compio::{fs::File, io::AsyncWriteAtExt};
 use iggy_common::{IggyError, IggyMessagesBatch};
@@ -31,7 +31,7 @@ pub use messages_writer::MessagesWriter;
 async fn write_batch(
     file: &File,
     position: u64,
-    mut batches: IggyMessagesBatchSet,
+    mut batches: IggyMessagesBatchSetMut,
 ) -> Result<usize, IggyError> {
     let total_written = batches.iter().map(|b| b.size() as usize).sum();
     let batches = batches

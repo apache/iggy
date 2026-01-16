@@ -323,7 +323,8 @@ async fn test_get_messages_by_timestamp(
         let span_timestamp_micros = span_timestamp.as_micros();
 
         // Test 6: Validate message content and ordering
-        for batch in spanning_messages.iter() {
+        let mutable_spanning = spanning_messages.into_mutable();
+        for batch in mutable_spanning.iter() {
             for msg in batch.iter() {
                 let msg_timestamp = msg.header().timestamp();
                 assert!(

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::streaming::segments::{IggyMessagesBatchMut, IggyMessagesBatchSet};
+use crate::streaming::segments::{IggyMessagesBatchMut, IggyMessagesBatchSetMut};
 use iggy_common::{IggyByteSize, IggyError};
 use std::fmt::Debug;
 
@@ -34,7 +34,7 @@ pub struct Inner {
 
 #[derive(Default, Debug)]
 pub struct MemoryMessageJournal {
-    batches: IggyMessagesBatchSet,
+    batches: IggyMessagesBatchSetMut,
     inner: Inner,
 }
 
@@ -48,7 +48,7 @@ impl Clone for MemoryMessageJournal {
 }
 
 impl Journal for MemoryMessageJournal {
-    type Container = IggyMessagesBatchSet;
+    type Container = IggyMessagesBatchSetMut;
     type Entry = IggyMessagesBatchMut;
     type Inner = Inner;
     type AppendResult = Result<(u32, u32), IggyError>;

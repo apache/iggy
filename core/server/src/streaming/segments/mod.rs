@@ -29,5 +29,7 @@ pub use types::IggyMessageHeaderViewMut;
 pub use types::IggyMessageViewMut;
 pub use types::IggyMessagesBatchMut;
 pub use types::IggyMessagesBatchSet;
+pub use types::IggyMessagesBatchSetMut;
+pub use types::PolledBatches;
 
 pub const SEGMENT_MAX_SIZE_BYTES: u64 = 1024 * 1024 * 1024;

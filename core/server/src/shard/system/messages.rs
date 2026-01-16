@@ -24,7 +24,9 @@ use crate::shard::transmission::frame::ShardResponse;
 use crate::shard::transmission::message::{
     ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult,
 };
-use crate::streaming::segments::{IggyIndexesMut, IggyMessagesBatchMut, IggyMessagesBatchSet};
+use crate::streaming::segments::{
+    IggyIndexesMut, IggyMessagesBatchMut, IggyMessagesBatchSetMut, PolledBatches,
+};
 use crate::streaming::traits::MainOps;
 use crate::streaming::{partitions, streams, topics};
 use err_trail::ErrContext;
@@ -129,7 +131,7 @@ impl IggyShard {
         consumer: Consumer,
         maybe_partition_id: Option<u32>,
         args: PollingArgs,
-    ) -> Result<(IggyPollMetadata, IggyMessagesBatchSet), IggyError> {
+    ) -> Result<(IggyPollMetadata, PolledBatches), IggyError> {
         self.ensure_topic_exists(&stream_id, &topic_id)?;
 
         let numeric_stream_id = self
@@ -159,7 +161,7 @@ impl IggyShard {
             true,
         )?
         else {
-            return Ok((IggyPollMetadata::new(0, 0), IggyMessagesBatchSet::empty()));
+            return Ok((IggyPollMetadata::new(0, 0), PolledBatches::empty()));
         };
 
         self.ensure_partition_exists(&stream_id, &topic_id, partition_id)?;
@@ -175,7 +177,7 @@ impl IggyShard {
         {
             return Ok((
                 IggyPollMetadata::new(partition_id as u32, current_offset),
-                IggyMessagesBatchSet::empty(),
+                PolledBatches::empty(),
             ));
         }
 
@@ -234,7 +236,10 @@ impl IggyShard {
         }?;
 
         let batch = if let Some(encryptor) = &self.encryptor {
-            self.decrypt_messages(batch, encryptor).await?
+            // Decryption requires mutable access, so convert to mutable
+            let mutable = batch.into_mutable();
+            let decrypted = self.decrypt_messages(mutable, encryptor).await?;
+            PolledBatches::Mutable(decrypted)
         } else {
             batch
         };
@@ -344,9 +349,9 @@ impl IggyShard {
 
     async fn decrypt_messages(
         &self,
-        batches: IggyMessagesBatchSet,
+        batches: IggyMessagesBatchSetMut,
         encryptor: &EncryptorKind,
-    ) -> Result<IggyMessagesBatchSet, IggyError> {
+    ) -> Result<IggyMessagesBatchSetMut, IggyError> {
         let mut decrypted_batches = Vec::with_capacity(batches.containers_count());
         for batch in batches.iter() {
             let count = batch.count();
@@ -384,7 +389,7 @@ impl IggyShard {
             decrypted_batches.push(decrypted_batch);
         }
 
-        Ok(IggyMessagesBatchSet::from_vec(decrypted_batches))
+        Ok(IggyMessagesBatchSetMut::from_vec(decrypted_batches))
     }
 
     pub fn maybe_encrypt_messages(

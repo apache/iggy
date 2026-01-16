@@ -120,6 +120,65 @@ impl IggyMessagesBatch {
         self.iter().last().map(|msg| msg.header().timestamp())
     }
 
+    /// Slice the batch by message offset. Returns messages starting at `start_offset` up to `count`.
+    ///
+    /// Uses `Bytes::slice()` internally for zero-copy slicing.
+    /// Returns `None` if the offset range doesn't overlap with this batch.
+    pub fn slice_by_offset(&self, start_offset: u64, count: u32) -> Option<Self> {
+        if self.is_empty() || count == 0 {
+            return None;
+        }
+
+        let first_offset = self.first_offset()?;
+
+        // If requested offset is before this batch, start from beginning
+        if start_offset < first_offset {
+            return self.slice_by_index(0, count);
+        }
+
+        let last_offset = self.last_offset()?;
+        if start_offset > last_offset {
+            return None;
+        }
+
+        // Offsets are contiguous within a batch
+        let start_index = (start_offset - first_offset) as u32;
+        self.slice_by_index(start_index, count)
+    }
+
+    /// Slice the batch to return messages starting at `start_index` up to `count`.
+    ///
+    /// Uses `Bytes::slice()` internally for zero-copy slicing.
+    /// Returns `None` if `start_index` is out of bounds or no messages match.
+    pub fn slice_by_index(&self, start_index: u32, count: u32) -> Option<Self> {
+        if start_index >= self.count || count == 0 {
+            return None;
+        }
+
+        let available = self.count - start_index;
+        let actual_count = count.min(available);
+
+        // Slice indexes (zero-copy via Bytes::slice)
+        let sliced_indexes = self.indexes.slice_by_offset(start_index, actual_count)?;
+
+        // Calculate message buffer slice boundaries
+        let msg_start = self.message_start_position(start_index as usize);
+        let msg_end = self.message_end_position((start_index + actual_count - 1) as usize);
+
+        if msg_start > msg_end || msg_end > self.messages.len() {
+            return None;
+        }
+
+        // Slice messages (zero-copy via Bytes::slice)
+        let sliced_messages = self.messages.slice(msg_start..msg_end);
+
+        Some(Self {
+            count: actual_count,
+            indexes: sliced_indexes,
+            messages: sliced_messages,
+        })
+    }
+
     /// Calculates the start position of a message at the given index in the buffer
     fn message_start_position(&self, index: usize) -> usize {
         if index == 0 {

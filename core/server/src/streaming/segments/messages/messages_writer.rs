@@ -17,7 +17,7 @@
  */
 
 use crate::streaming::segments::{
-    IggyMessagesBatchSet,
+    IggyMessagesBatchSetMut,
     messages::{write_batch, write_batch_frozen},
 };
 use compio::fs::{File, OpenOptions};
@@ -99,7 +99,7 @@ impl MessagesWriter {
     /// Append a batch of messages to the messages file.
     pub async fn save_batch_set(
         &self,
-        batch_set: IggyMessagesBatchSet,
+        batch_set: IggyMessagesBatchSetMut,
     ) -> Result<IggyByteSize, IggyError> {
         let messages_size = batch_set.size();
         let messages_count = batch_set.count();

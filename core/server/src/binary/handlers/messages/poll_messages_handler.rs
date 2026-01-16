@@ -22,6 +22,7 @@ use crate::binary::command::{
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::shard::IggyShard;
 use crate::shard::system::messages::PollingArgs;
+use crate::streaming::segments::PolledBatches;
 use crate::streaming::session::Session;
 use anyhow::Result;
 use iggy_common::SenderKind;
@@ -71,7 +72,7 @@ impl ServerCommandHandler for PollMessages {
 
         let user_id = session.get_user_id();
         let client_id = session.client_id;
-        let (metadata, mut batch) = shard
+        let (metadata, batch) = shard
             .poll_messages(
                 client_id,
                 user_id,
@@ -91,26 +92,39 @@ impl ServerCommandHandler for PollMessages {
         // 4 bytes for partition_id + 8 bytes for current_offset + 4 bytes for messages_count + size of all batches.
         let response_length = 4 + 8 + 4 + batch.size();
         let response_length_bytes = response_length.to_le_bytes();
+        let msg_count = batch.count();
 
         let mut bufs = Vec::with_capacity(batch.containers_count() + 3);
         let mut partition_id_buf = PooledBuffer::with_capacity(4);
         let mut current_offset_buf = PooledBuffer::with_capacity(8);
-        let mut count_buf = PooledBuffer::with_capacity(4);
+        let mut msg_count_buf = PooledBuffer::with_capacity(4);
         partition_id_buf.put_u32_le(metadata.partition_id);
         current_offset_buf.put_u64_le(metadata.current_offset);
-        count_buf.put_u32_le(batch.count());
+        msg_count_buf.put_u32_le(msg_count);
 
         bufs.push(partition_id_buf);
         bufs.push(current_offset_buf);
-        bufs.push(count_buf);
+        bufs.push(msg_count_buf);
 
-        batch.iter_mut().for_each(|m| {
-            bufs.push(m.take_messages());
-        });
+        match batch {
+            PolledBatches::Mutable(mut mutable_set) => {
+                for msg_batch in mutable_set.iter_mut() {
+                    bufs.push(msg_batch.take_messages());
+                }
+            }
+            PolledBatches::Frozen(frozen_set) => {
+                // For frozen batches, wrap Bytes in PooledBuffer for socket send.
+                // This copies at the handler level but avoids copies in the storage layer
+                // during concurrent reads while async disk I/O is in progress.
+                for msg_batch in frozen_set.iter() {
+                    bufs.push(PooledBuffer::from(msg_batch.buffer()));
+                }
+            }
+        }
+
         trace!(
             "Sending {} messages to client ({} bytes) to client",
-            batch.count(),
-            response_length
+            msg_count, response_length
         );
 
         sender

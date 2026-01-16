@@ -26,7 +26,7 @@ use send_wrapper::SendWrapper;
 use crate::binary::handlers::messages::poll_messages_handler::IggyPollMetadata;
 use crate::shard::system::messages::PollingArgs;
 use crate::state::command::EntryCommand;
-use crate::streaming::segments::{IggyMessagesBatchMut, IggyMessagesBatchSet};
+use crate::streaming::segments::{IggyMessagesBatchMut, PolledBatches};
 use crate::streaming::topics;
 use crate::streaming::users::user::User;
 use crate::{shard::IggyShard, streaming::session::Session};
@@ -278,7 +278,7 @@ impl HttpSafeShard {
         consumer: Consumer,
         maybe_partition_id: Option<u32>,
         args: PollingArgs,
-    ) -> Result<(IggyPollMetadata, IggyMessagesBatchSet), IggyError> {
+    ) -> Result<(IggyPollMetadata, PolledBatches), IggyError> {
         let future = SendWrapper::new(self.shard().poll_messages(
             client_id,
             user_id,

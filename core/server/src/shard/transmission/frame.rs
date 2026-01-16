@@ -21,15 +21,13 @@ use iggy_common::{IggyError, Stats};
 use crate::{
     binary::handlers::messages::poll_messages_handler::IggyPollMetadata,
     shard::transmission::message::ShardMessage,
-    streaming::{
-        segments::IggyMessagesBatchSet, streams::stream, topics::topic, users::user::User,
-    },
+    streaming::{segments::PolledBatches, streams::stream, topics::topic, users::user::User},
 };
 
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum ShardResponse {
-    PollMessages((IggyPollMetadata, IggyMessagesBatchSet)),
+    PollMessages((IggyPollMetadata, PolledBatches)),
     SendMessages,
     FlushUnsavedBuffer,
     DeleteSegments,

@@ -32,7 +32,9 @@ use crate::{
             storage,
         },
         polling_consumer::ConsumerGroupId,
-        segments::{IggyIndexesMut, IggyMessagesBatchMut, IggyMessagesBatchSet, storage::Storage},
+        segments::{
+            IggyIndexesMut, IggyMessagesBatchMut, IggyMessagesBatchSetMut, storage::Storage,
+        },
     },
 };
 use err_trail::ErrContext;
@@ -334,7 +336,7 @@ pub async fn load_messages_from_disk_by_timestamp(
     index: &Option<IggyIndexesMut>,
     timestamp: u64,
     count: u32,
-) -> Result<IggyMessagesBatchSet, IggyError> {
+) -> Result<IggyMessagesBatchSetMut, IggyError> {
     let indexes_to_read = if let Some(indexes) = index {
         if !indexes.is_empty() {
             indexes.slice_by_timestamp(timestamp, count)
@@ -356,7 +358,7 @@ pub async fn load_messages_from_disk_by_timestamp(
     };
 
     if indexes_to_read.is_none() {
-        return Ok(IggyMessagesBatchSet::empty());
+        return Ok(IggyMessagesBatchSetMut::empty());
     }
 
     let indexes_to_read = indexes_to_read.unwrap();
@@ -369,7 +371,7 @@ pub async fn load_messages_from_disk_by_timestamp(
         .await
         .error(|e: &IggyError| format!("Failed to load messages from disk by timestamp: {e}"))?;
 
-    Ok(IggyMessagesBatchSet::from(batch))
+    Ok(IggyMessagesBatchSetMut::from(batch))
 }
 
 pub fn calculate_current_offset() -> impl FnOnce(ComponentsById<PartitionRef>) -> u64 {
@@ -430,7 +432,7 @@ pub fn append_to_journal(
     }
 }
 
-pub fn commit_journal() -> impl FnOnce(ComponentsById<PartitionRefMut>) -> IggyMessagesBatchSet {
+pub fn commit_journal() -> impl FnOnce(ComponentsById<PartitionRefMut>) -> IggyMessagesBatchSetMut {
     |(.., log)| {
         let batches = log.journal_mut().commit();
         log.ensure_indexes();
@@ -475,7 +477,7 @@ pub fn persist_batch(
     stream_id: &Identifier,
     topic_id: &Identifier,
     partition_id: usize,
-    batches: IggyMessagesBatchSet,
+    batches: IggyMessagesBatchSetMut,
     reason: String,
 ) -> impl AsyncFnOnce(ComponentsById<PartitionRef>) -> Result<(IggyByteSize, u32), IggyError> {
     async move |(.., log)| {

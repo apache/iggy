@@ -307,8 +307,9 @@ async fn test_get_messages_by_offset(
 
         // Test 6: Validate message content and ordering for all messages
         let mut i = 0;
+        let mutable_batches = batches.into_mutable();
 
-        for batch in batches.iter() {
+        for batch in mutable_batches.iter() {
             for msg in batch.iter() {
                 let expected_offset = span_offset + i as u64;
                 assert!(

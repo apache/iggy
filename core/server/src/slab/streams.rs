@@ -41,7 +41,8 @@ use crate::{
         },
         polling_consumer::PollingConsumer,
         segments::{
-            IggyMessagesBatchMut, IggyMessagesBatchSet, Segment, storage::create_segment_storage,
+            IggyMessagesBatchMut, IggyMessagesBatchSet, IggyMessagesBatchSetMut, PolledBatches,
+            Segment, storage::create_segment_storage,
         },
         streams::{
             self,
@@ -202,7 +203,7 @@ impl MainOps for Streams {
     type PollingArgs = PollingArgs;
     type Consumer = PollingConsumer;
     type In = IggyMessagesBatchMut;
-    type Out = (IggyPollMetadata, IggyMessagesBatchSet);
+    type Out = (IggyPollMetadata, PolledBatches);
     type Error = IggyError;
 
     async fn append_messages(
@@ -317,13 +318,11 @@ impl MainOps for Streams {
                 // We have to remember to keep the invariant from the if that is on line 290.
                 // Alternatively a better design would be to get rid of that if and move the validations here.
                 if offset > current_offset {
-                    return Ok((metadata, IggyMessagesBatchSet::default()));
+                    return Ok((metadata, PolledBatches::default()));
                 }
 
-                let batches = self
-                    .get_messages_by_offset(stream_id, topic_id, partition_id, offset, count)
-                    .await?;
-                Ok(batches)
+                self.get_messages_by_offset(stream_id, topic_id, partition_id, offset, count)
+                    .await?
             }
             PollingKind::Timestamp => {
                 let timestamp = IggyTimestamp::from(value);
@@ -343,7 +342,7 @@ impl MainOps for Streams {
                         count,
                     )
                     .await?;
-                Ok(batches)
+                PolledBatches::Mutable(batches)
             }
             PollingKind::First => {
                 let first_offset = self.with_partition_by_id(
@@ -358,10 +357,8 @@ impl MainOps for Streams {
                     },
                 );
 
-                let batches = self
-                    .get_messages_by_offset(stream_id, topic_id, partition_id, first_offset, count)
-                    .await?;
-                Ok(batches)
+                self.get_messages_by_offset(stream_id, topic_id, partition_id, first_offset, count)
+                    .await?
             }
             PollingKind::Last => {
                 let (start_offset, actual_count) = self.with_partition_by_id(
@@ -379,16 +376,14 @@ impl MainOps for Streams {
                     },
                 );
 
-                let batches = self
-                    .get_messages_by_offset(
-                        stream_id,
-                        topic_id,
-                        partition_id,
-                        start_offset,
-                        actual_count,
-                    )
-                    .await?;
-                Ok(batches)
+                self.get_messages_by_offset(
+                    stream_id,
+                    topic_id,
+                    partition_id,
+                    start_offset,
+                    actual_count,
+                )
+                .await?
             }
             PollingKind::Next => {
                 let consumer_offset = match consumer {
@@ -414,10 +409,8 @@ impl MainOps for Streams {
 
                 match consumer_offset {
                     None => {
-                        let batches = self
-                            .get_messages_by_offset(stream_id, topic_id, partition_id, 0, count)
-                            .await?;
-                        Ok(batches)
+                        self.get_messages_by_offset(stream_id, topic_id, partition_id, 0, count)
+                            .await?
                     }
                     Some(consumer_offset) => {
                         let offset = consumer_offset + 1;
@@ -440,20 +433,18 @@ impl MainOps for Streams {
                                 );
                             }
                         }
-                        let batches = self
-                            .get_messages_by_offset(
-                                stream_id,
-                                topic_id,
-                                partition_id,
-                                offset,
-                                count,
-                            )
-                            .await?;
-                        Ok(batches)
+                        self.get_messages_by_offset(
+                            stream_id,
+                            topic_id,
+                            partition_id,
+                            offset,
+                            count,
+                        )
+                        .await?
                     }
                 }
             }
-        }?;
+        };
         Ok((metadata, batches))
     }
 }
@@ -649,9 +640,9 @@ impl Streams {
         partition_id: partitions::ContainerId,
         offset: u64,
         count: u32,
-    ) -> Result<IggyMessagesBatchSet, IggyError> {
+    ) -> Result<PolledBatches, IggyError> {
         if count == 0 {
-            return Ok(IggyMessagesBatchSet::default());
+            return Ok(PolledBatches::default());
         }
 
         use crate::streaming::partitions::helpers;
@@ -663,7 +654,7 @@ impl Streams {
         );
 
         let mut remaining_count = count;
-        let mut batches = IggyMessagesBatchSet::empty();
+        let mut batches: Option<IggyMessagesBatchSetMut> = None;
         let mut current_offset = offset;
 
         for idx in range {
@@ -719,10 +710,22 @@ impl Streams {
                 current_offset += messages_count as u64;
             }
 
-            batches.add_batch_set(messages);
+            // If this is the only/first result and we're done, return directly (preserves Frozen)
+            if batches.is_none() && remaining_count == 0 {
+                return Ok(messages);
+            }
+
+            // Need to accumulate, convert to mutable if necessary
+            let mutable_set = messages.into_mutable();
+            match &mut batches {
+                Some(existing) => existing.add_batch_set(mutable_set),
+                None => batches = Some(mutable_set),
+            }
         }
 
-        Ok(batches)
+        Ok(PolledBatches::Mutable(
+            batches.unwrap_or_else(IggyMessagesBatchSetMut::empty),
+        ))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -736,7 +739,7 @@ impl Streams {
         end_offset: u64,
         count: u32,
         segment_start_offset: u64,
-    ) -> Result<IggyMessagesBatchSet, IggyError> {
+    ) -> Result<PolledBatches, IggyError> {
         let (
             is_journal_empty,
             journal_first_offset,
@@ -765,7 +768,6 @@ impl Streams {
         // Case 0: Journal is empty, check in-flight buffer or disk
         if is_journal_empty {
             if !in_flight_empty && offset >= in_flight_first && offset <= in_flight_last {
-                let mut result = IggyMessagesBatchSet::empty();
                 let in_flight_batches = self.with_partition_by_id(
                     stream_id,
                     topic_id,
@@ -773,13 +775,13 @@ impl Streams {
                     |(_, _, _, _, _, _, log)| log.in_flight().get_by_offset(offset, count).to_vec(),
                 );
                 if !in_flight_batches.is_empty() {
-                    result.add_immutable_batches(&in_flight_batches);
-                    let final_result = result.get_by_offset(offset, count);
-                    return Ok(final_result);
+                    let batches =
+                        PolledBatches::Frozen(IggyMessagesBatchSet::from_vec(in_flight_batches));
+                    return Ok(batches.filter_by_offset(offset, count));
                 }
             }
 
-            return self
+            let disk_batches = self
                 .load_messages_from_disk_by_offset(
                     stream_id,
                     topic_id,
@@ -789,7 +791,8 @@ impl Streams {
                     count,
                     segment_start_offset,
                 )
-                .await;
+                .await?;
+            return Ok(PolledBatches::Mutable(disk_batches));
         }
 
         // Case 1: All messages are in accumulator buffer
@@ -803,12 +806,12 @@ impl Streams {
                         .get(|batches| batches.get_by_offset(offset, count))
                 },
             );
-            return Ok(batches);
+            return Ok(PolledBatches::Mutable(batches));
         }
 
         // Case 2: All messages are on disk
         if end_offset < journal_first_offset {
-            return self
+            let disk_batches = self
                 .load_messages_from_disk_by_offset(
                     stream_id,
                     topic_id,
@@ -818,7 +821,8 @@ impl Streams {
                     count,
                     segment_start_offset,
                 )
-                .await;
+                .await?;
+            return Ok(PolledBatches::Mutable(disk_batches));
         }
 
         // Case 3: Messages span disk and accumulator buffer boundary
@@ -828,7 +832,7 @@ impl Streams {
         } else {
             0
         };
-        let mut combined_batch_set = IggyMessagesBatchSet::empty();
+        let mut combined_batch_set = IggyMessagesBatchSetMut::empty();
 
         // Load messages from disk if needed
         if disk_count > 0 {
@@ -873,7 +877,7 @@ impl Streams {
             }
         }
 
-        Ok(combined_batch_set)
+        Ok(PolledBatches::Mutable(combined_batch_set))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -886,7 +890,7 @@ impl Streams {
         start_offset: u64,
         count: u32,
         segment_start_offset: u64,
-    ) -> Result<IggyMessagesBatchSet, IggyError> {
+    ) -> Result<IggyMessagesBatchSetMut, IggyError> {
         let relative_start_offset = (start_offset - segment_start_offset) as u32;
 
         let (index_reader, messages_reader, indexes) = self.with_partition_by_id(
@@ -930,7 +934,7 @@ impl Streams {
         };
 
         if indexes_to_read.is_none() {
-            return Ok(IggyMessagesBatchSet::empty());
+            return Ok(IggyMessagesBatchSetMut::empty());
         }
 
         let indexes_to_read = indexes_to_read.unwrap();
@@ -946,7 +950,7 @@ impl Streams {
                 format!("Failed to validate messages read from disk! error: {e}")
             })?;
 
-        Ok(IggyMessagesBatchSet::from(batch))
+        Ok(IggyMessagesBatchSetMut::from(batch))
     }
 
     pub async fn get_messages_by_timestamp(
@@ -956,7 +960,7 @@ impl Streams {
         partition_id: partitions::ContainerId,
         timestamp: u64,
         count: u32,
-    ) -> Result<IggyMessagesBatchSet, IggyError> {
+    ) -> Result<IggyMessagesBatchSetMut, IggyError> {
         use crate::streaming::partitions::helpers;
         let Ok(range) = self.with_partition_by_id(
             stream_id,
@@ -964,11 +968,11 @@ impl Streams {
             partition_id,
             helpers::get_segment_range_by_timestamp(timestamp),
         ) else {
-            return Ok(IggyMessagesBatchSet::default());
+            return Ok(IggyMessagesBatchSetMut::default());
         };
 
         let mut remaining_count = count;
-        let mut batches = IggyMessagesBatchSet::empty();
+        let mut batches = IggyMessagesBatchSetMut::empty();
 
         for idx in range {
             if remaining_count == 0 {
@@ -1020,9 +1024,9 @@ impl Streams {
         idx: usize,
         timestamp: u64,
         count: u32,
-    ) -> Result<IggyMessagesBatchSet, IggyError> {
+    ) -> Result<IggyMessagesBatchSetMut, IggyError> {
         if count == 0 {
-            return Ok(IggyMessagesBatchSet::default());
+            return Ok(IggyMessagesBatchSetMut::default());
         }
 
         let (is_journal_empty, journal_first_timestamp, journal_last_timestamp) = self
@@ -1056,7 +1060,7 @@ impl Streams {
 
         // Case 1: All messages are in accumulator buffer (timestamp is after journal ends)
         if timestamp > journal_last_timestamp {
-            return Ok(IggyMessagesBatchSet::empty());
+            return Ok(IggyMessagesBatchSetMut::empty());
         }
 
         // Case 1b: Timestamp is within journal range
@@ -1116,7 +1120,7 @@ impl Streams {
         idx: usize,
         timestamp: u64,
         count: u32,
-    ) -> Result<IggyMessagesBatchSet, IggyError> {
+    ) -> Result<IggyMessagesBatchSetMut, IggyError> {
         let (index_reader, messages_reader, indexes) = self.with_partition_by_id(
             stream_id,
             topic_id,
@@ -1158,7 +1162,7 @@ impl Streams {
         };
 
         if indexes_to_read.is_none() {
-            return Ok(IggyMessagesBatchSet::empty());
+            return Ok(IggyMessagesBatchSetMut::empty());
         }
 
         let indexes_to_read = indexes_to_read.unwrap();
@@ -1171,7 +1175,7 @@ impl Streams {
                 format!("Failed to load messages from disk by timestamp: {e}")
             })?;
 
-        Ok(IggyMessagesBatchSet::from(batch))
+        Ok(IggyMessagesBatchSetMut::from(batch))
     }
 
     pub async fn handle_full_segment(
@@ -1322,7 +1326,7 @@ impl Streams {
         stream_id: &Identifier,
         topic_id: &Identifier,
         partition_id: usize,
-        mut batches: IggyMessagesBatchSet,
+        mut batches: IggyMessagesBatchSetMut,
         config: &SystemConfig,
     ) -> Result<u32, IggyError> {
         let batch_count = batches.count();
