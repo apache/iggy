@@ -68,6 +68,17 @@ impl ShardRequest {
 }
 
 #[derive(Debug)]
+pub enum SocketTransferPayload {
+    SendMessages {
+        batch: IggyMessagesBatchMut,
+    },
+    PollMessages {
+        consumer: PollingConsumer,
+        args: PollingArgs,
+    },
+}
+
+#[derive(Debug)]
 pub enum ShardRequestPayload {
     SendMessages {
         batch: IggyMessagesBatchMut,
@@ -135,7 +146,7 @@ pub enum ShardRequestPayload {
         client_id: u32,
         user_id: u32,
         address: SocketAddr,
-        initial_data: IggyMessagesBatchMut,
+        initial_data: SocketTransferPayload,
     },
 }
 

@@ -342,7 +342,7 @@ impl IggyShard {
         Ok(())
     }
 
-    async fn decrypt_messages(
+    pub async fn decrypt_messages(
         &self,
         batches: IggyMessagesBatchSet,
         encryptor: &EncryptorKind,
@@ -437,7 +437,7 @@ impl IggyShard {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PollingArgs {
     pub strategy: PollingStrategy,
     pub count: u32,

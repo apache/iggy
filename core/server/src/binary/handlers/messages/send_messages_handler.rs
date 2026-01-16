@@ -18,7 +18,9 @@
 
 use crate::binary::command::{BinaryServerCommand, HandlerResult, ServerCommandHandler};
 use crate::shard::IggyShard;
-use crate::shard::transmission::message::{ShardMessage, ShardRequest, ShardRequestPayload};
+use crate::shard::transmission::message::{
+    ShardMessage, ShardRequest, ShardRequestPayload, SocketTransferPayload,
+};
 use crate::streaming::segments::{IggyIndexesMut, IggyMessagesBatchMut};
 use crate::streaming::session::Session;
 use crate::streaming::{streams, topics};
@@ -32,7 +34,7 @@ use iggy_common::sharding::IggyNamespace;
 use iggy_common::{INDEX_SIZE, PartitioningKind};
 use iggy_common::{IggyError, Partitioning, SendMessages, Validatable};
 use std::rc::Rc;
-use tracing::{debug, error, info, instrument};
+use tracing::{debug, error, instrument};
 
 impl ServerCommandHandler for SendMessages {
     fn code(&self) -> u32 {
@@ -164,7 +166,7 @@ impl ServerCommandHandler for SendMessages {
             && target_shard.id != shard.id
         {
             debug!(
-                "TCP wrong shared detected: migrating from_shard {}, to_shard {}",
+                "TCP wrong shard detected: migrating from_shard {}, to_shard {}",
                 shard.id, target_shard.id
             );
 
@@ -175,7 +177,7 @@ impl ServerCommandHandler for SendMessages {
                     client_id: session.client_id,
                     user_id,
                     address: session.ip_address,
-                    initial_data: batch,
+                    initial_data: SocketTransferPayload::SendMessages { batch },
                 };
 
                 let request = ShardRequest::new(
@@ -195,7 +197,7 @@ impl ServerCommandHandler for SendMessages {
                     return Ok(HandlerResult::Finished);
                 }
 
-                info!("Sending socket transfer to shard {}", target_shard.id);
+                debug!("Sending socket transfer to shard {}", target_shard.id);
                 return Ok(HandlerResult::Migrated {
                     to_shard: target_shard.id,
                 });
