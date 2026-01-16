@@ -265,9 +265,13 @@ impl RedshiftSink {
             );
 
             if include_metadata {
-                let timestamp_secs = message.timestamp / 1_000_000;
-                let timestamp = chrono::DateTime::from_timestamp(timestamp_secs as i64, 0)
-                    .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+                // `message.timestamp` is in microseconds. Preserve microsecond precision
+                // by converting to seconds and nanoseconds for `from_timestamp`.
+                let timestamp_micros = message.timestamp;
+                let timestamp_secs = (timestamp_micros / 1_000_000) as i64;
+                let timestamp_nanos = ((timestamp_micros % 1_000_000) as u32) * 1_000;
+                let timestamp = chrono::DateTime::from_timestamp(timestamp_secs, timestamp_nanos)
+                    .map(|dt| dt.format("%Y-%m-%d %H:%M:%S%.6f").to_string())
                     .unwrap_or_default();
 
                 row.push_str(&format!(
