@@ -131,7 +131,7 @@ async fn handle_connection(
         }
     }
 
-    shard.delete_client(client_id);
+    shard.delete_client(client_id).await;
     shard.task_registry.remove_connection(&client_id);
     info!("QUIC connection {} closed", client_id);
     Ok(())

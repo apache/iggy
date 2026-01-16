@@ -27,9 +27,7 @@ use crate::shard::transmission::message::{
     ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult,
 };
 use crate::state::command::EntryCommand;
-use crate::streaming;
 use crate::streaming::session::Session;
-use anyhow::Result;
 use err_trail::ErrContext;
 use iggy_common::delete_segments::DeleteSegments;
 use iggy_common::sharding::IggyNamespace;
@@ -51,29 +49,17 @@ impl ServerCommandHandler for DeleteSegments {
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
+        shard.ensure_authenticated(session)?;
 
         let stream_id = self.stream_id.clone();
         let topic_id = self.topic_id.clone();
         let partition_id = self.partition_id as usize;
         let segments_count = self.segments_count;
-
-        // Ensure authentication and topic exists
-        shard.ensure_authenticated(session)?;
-        shard.ensure_topic_exists(&stream_id, &topic_id)?;
         shard.ensure_partition_exists(&stream_id, &topic_id, partition_id)?;
 
-        // Get numeric IDs for namespace
-        let numeric_stream_id = shard
-            .streams
-            .with_stream_by_id(&stream_id, streaming::streams::helpers::get_stream_id());
+        let (numeric_stream_id, numeric_topic_id) =
+            shard.resolve_topic_id(&stream_id, &topic_id)?;
 
-        let numeric_topic_id = shard.streams.with_topic_by_id(
-            &stream_id,
-            &topic_id,
-            streaming::topics::helpers::get_topic_id(),
-        );
-
-        // Route request to the correct shard
         let namespace = IggyNamespace::new(numeric_stream_id, numeric_topic_id, partition_id);
         let payload = ShardRequestPayload::DeleteSegments { segments_count };
         let request = ShardRequest::new(stream_id.clone(), topic_id.clone(), partition_id, payload);
@@ -92,8 +78,9 @@ impl ServerCommandHandler for DeleteSegments {
                 }) = message
                     && let ShardRequestPayload::DeleteSegments { segments_count } = payload
                 {
+                    let (stream, topic) = shard.resolve_topic_id(&stream_id, &topic_id)?;
                     shard
-                        .delete_segments_base(&stream_id, &topic_id, partition_id, segments_count)
+                        .delete_segments_base(stream, topic, partition_id, segments_count)
                         .await
                         .error(|e: &IggyError| {
                             format!(

@@ -23,8 +23,6 @@ use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
 use crate::shard::IggyShard;
 use crate::streaming::session::Session;
-use crate::streaming::{streams, topics};
-use anyhow::Result;
 use iggy_common::IggyError;
 use iggy_common::SenderKind;
 use iggy_common::get_consumer_group::GetConsumerGroup;
@@ -52,17 +50,11 @@ impl ServerCommandHandler for GetConsumerGroup {
             sender.send_empty_ok_response().await?;
             return Ok(HandlerResult::Finished);
         }
-        let numeric_topic_id = shard.streams.with_topic_by_id(
-            &self.stream_id,
-            &self.topic_id,
-            topics::helpers::get_topic_id(),
-        );
-        let numeric_stream_id = shard
-            .streams
-            .with_stream_by_id(&self.stream_id, streams::helpers::get_stream_id());
+
+        let (numeric_stream_id, numeric_topic_id) =
+            shard.resolve_topic_id(&self.stream_id, &self.topic_id)?;
         let has_permission = shard
             .permissioner
-            .borrow()
             .get_consumer_group(session.get_user_id(), numeric_stream_id, numeric_topic_id)
             .is_ok();
         if !has_permission {
@@ -70,12 +62,20 @@ impl ServerCommandHandler for GetConsumerGroup {
             return Ok(HandlerResult::Finished);
         }
 
-        let consumer_group = shard.streams.with_consumer_group_by_id(
-            &self.stream_id,
-            &self.topic_id,
-            &self.group_id,
-            |(root, members)| mapper::map_consumer_group(root, members),
-        );
+        let numeric_group_id = shard
+            .metadata
+            .get_consumer_group_id(numeric_stream_id, numeric_topic_id, &self.group_id)
+            .ok_or_else(|| {
+                IggyError::ConsumerGroupIdNotFound(self.group_id.clone(), self.topic_id.clone())
+            })?;
+
+        let consumer_group = shard
+            .metadata
+            .get_consumer_group(numeric_stream_id, numeric_topic_id, numeric_group_id)
+            .map(|cg| mapper::map_consumer_group_from_meta(&cg))
+            .ok_or_else(|| {
+                IggyError::ConsumerGroupIdNotFound(self.group_id.clone(), self.topic_id.clone())
+            })?;
         sender.send_ok_response(&consumer_group).await?;
         Ok(HandlerResult::Finished)
     }

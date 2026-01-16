@@ -26,23 +26,29 @@ impl Permissioner {
         stream_id: usize,
         topic_id: usize,
     ) -> Result<(), IggyError> {
-        if let Some(global_permissions) = self.users_permissions.get(&user_id)
-            && (global_permissions.read_streams
-                || global_permissions.manage_streams
-                || global_permissions.manage_topics
-                || global_permissions.read_topics)
+        let permissions = self.get_permissions(user_id);
+
+        // Check global permissions
+        if let Some(ref p) = permissions
+            && (p.global.read_streams
+                || p.global.manage_streams
+                || p.global.manage_topics
+                || p.global.read_topics)
         {
             return Ok(());
         }
 
-        if let Some(stream_permissions) = self.users_streams_permissions.get(&(user_id, stream_id))
-        {
+        // Check stream-specific permissions
+        if let Some(stream_permissions) = self.get_stream_permissions(user_id, stream_id) {
             if stream_permissions.manage_topics || stream_permissions.read_topics {
                 return Ok(());
             }
 
-            if let Some(topic_permissions) =
-                stream_permissions.topics.as_ref().unwrap().get(&topic_id)
+            // Check topic-specific permissions
+            if let Some(topic_permissions) = stream_permissions
+                .topics
+                .as_ref()
+                .and_then(|t| t.get(&topic_id))
                 && (topic_permissions.manage_topic || topic_permissions.read_topic)
             {
                 return Ok(());
@@ -53,40 +59,40 @@ impl Permissioner {
     }
 
     pub fn get_topics(&self, user_id: u32, stream_id: usize) -> Result<(), IggyError> {
-        if let Some(global_permissions) = self.users_permissions.get(&user_id)
-            && (global_permissions.read_streams
-                || global_permissions.manage_streams
-                || global_permissions.manage_topics
-                || global_permissions.read_topics)
+        let permissions = self.get_permissions(user_id);
+
+        // Check global permissions
+        if let Some(ref p) = permissions
+            && (p.global.read_streams
+                || p.global.manage_streams
+                || p.global.manage_topics
+                || p.global.read_topics)
         {
             return Ok(());
         }
 
-        if let Some(stream_permissions) = self.users_streams_permissions.get(&(user_id, stream_id))
+        // Check stream-specific permissions
+        if let Some(stream_permissions) = self.get_stream_permissions(user_id, stream_id)
+            && (stream_permissions.manage_topics || stream_permissions.read_topics)
         {
-            if stream_permissions.manage_topics || stream_permissions.read_topics {
-                return Ok(());
-            }
-
-            if let Some(topic_permissions) =
-                stream_permissions.topics.as_ref().unwrap().get(&stream_id)
-                && (topic_permissions.manage_topic || topic_permissions.read_topic)
-            {
-                return Ok(());
-            }
+            return Ok(());
         }
 
         Err(IggyError::Unauthorized)
     }
 
     pub fn create_topic(&self, user_id: u32, stream_id: usize) -> Result<(), IggyError> {
-        if let Some(global_permissions) = self.users_permissions.get(&user_id)
-            && (global_permissions.manage_streams || global_permissions.manage_topics)
+        let permissions = self.get_permissions(user_id);
+
+        // Check global permissions
+        if let Some(ref p) = permissions
+            && (p.global.manage_streams || p.global.manage_topics)
         {
             return Ok(());
         }
 
-        if let Some(stream_permissions) = self.users_streams_permissions.get(&(user_id, stream_id))
+        // Check stream-specific permissions
+        if let Some(stream_permissions) = self.get_stream_permissions(user_id, stream_id)
             && stream_permissions.manage_topics
         {
             return Ok(());
@@ -128,20 +134,26 @@ impl Permissioner {
         stream_id: usize,
         topic_id: usize,
     ) -> Result<(), IggyError> {
-        if let Some(global_permissions) = self.users_permissions.get(&user_id)
-            && (global_permissions.manage_streams || global_permissions.manage_topics)
+        let permissions = self.get_permissions(user_id);
+
+        // Check global permissions
+        if let Some(ref p) = permissions
+            && (p.global.manage_streams || p.global.manage_topics)
         {
             return Ok(());
         }
 
-        if let Some(stream_permissions) = self.users_streams_permissions.get(&(user_id, stream_id))
-        {
+        // Check stream-specific permissions
+        if let Some(stream_permissions) = self.get_stream_permissions(user_id, stream_id) {
             if stream_permissions.manage_topics {
                 return Ok(());
             }
 
-            if let Some(topic_permissions) =
-                stream_permissions.topics.as_ref().unwrap().get(&topic_id)
+            // Check topic-specific permissions
+            if let Some(topic_permissions) = stream_permissions
+                .topics
+                .as_ref()
+                .and_then(|t| t.get(&topic_id))
                 && topic_permissions.manage_topic
             {
                 return Ok(());

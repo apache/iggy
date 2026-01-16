@@ -16,26 +16,22 @@
  * under the License.
  */
 
-use std::rc::Rc;
-
 use crate::binary::command::{
     BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
 };
 use crate::binary::handlers::users::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
-
 use crate::shard::IggyShard;
-use crate::shard::transmission::event::ShardEvent;
 use crate::shard::transmission::frame::ShardResponse;
 use crate::shard::transmission::message::{
     ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult,
 };
 use crate::state::command::EntryCommand;
 use crate::streaming::session::Session;
-use anyhow::Result;
 use err_trail::ErrContext;
 use iggy_common::delete_user::DeleteUser;
 use iggy_common::{Identifier, IggyError, SenderKind};
+use std::rc::Rc;
 use tracing::info;
 use tracing::{debug, instrument};
 
@@ -82,8 +78,6 @@ impl ServerCommandHandler for DeleteUser {
                     })?;
 
                     info!("Deleted user: {} with ID: {}.", user.username, user.id);
-                    let event = ShardEvent::DeletedUser { user_id };
-                    shard.broadcast_event_to_all_shards(event).await?;
 
                     shard
                         .state

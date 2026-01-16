@@ -24,8 +24,6 @@ use crate::binary::command::{
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::shard::IggyShard;
 use crate::streaming::session::Session;
-//use crate::streaming::systems::system::SharedSystem;
-use anyhow::Result;
 use iggy_common::get_cluster_metadata::GetClusterMetadata;
 use iggy_common::{BytesSerializable, IggyError, SenderKind};
 use tracing::{debug, instrument};

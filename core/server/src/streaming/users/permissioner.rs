@@ -16,86 +16,58 @@
  * under the License.
  */
 
-use crate::streaming::users::user::User;
-use ahash::{AHashMap, AHashSet};
-use iggy_common::UserId;
-use iggy_common::{GlobalPermissions, Permissions, StreamPermissions};
+use crate::metadata::Metadata;
+use iggy_common::{Permissions, UserId};
 
-#[derive(Debug, Default)]
+/// Permissioner reads permissions directly from SharedMetadata.
+/// No caching - SharedMetadata is the single source of truth.
 pub struct Permissioner {
-    pub(super) users_permissions: AHashMap<UserId, GlobalPermissions>,
-    pub(super) users_streams_permissions: AHashMap<(UserId, usize), StreamPermissions>,
-    pub(super) users_that_can_poll_messages_from_all_streams: AHashSet<UserId>,
-    pub(super) users_that_can_send_messages_to_all_streams: AHashSet<UserId>,
-    pub(super) users_that_can_poll_messages_from_specific_streams: AHashSet<(UserId, usize)>,
-    pub(super) users_that_can_send_messages_to_specific_streams: AHashSet<(UserId, usize)>,
+    metadata: Metadata,
+}
+
+impl std::fmt::Debug for Permissioner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Permissioner")
+            .field("metadata", &"<SharedMetadata>")
+            .finish()
+    }
 }
 
 impl Permissioner {
-    pub fn init(&mut self, users: &[&User]) {
-        for user in users {
-            self.init_permissions_for_user(user.id, user.permissions.clone());
-        }
+    pub fn new(metadata: Metadata) -> Self {
+        Self { metadata }
     }
 
-    pub fn init_permissions_for_user(&mut self, user_id: UserId, permissions: Option<Permissions>) {
-        if permissions.is_none() {
-            return;
-        }
-
-        let permissions = permissions.unwrap();
-        if permissions.global.poll_messages {
-            self.users_that_can_poll_messages_from_all_streams
-                .insert(user_id);
-        }
-
-        if permissions.global.send_messages {
-            self.users_that_can_send_messages_to_all_streams
-                .insert(user_id);
-        }
-
-        self.users_permissions.insert(user_id, permissions.global);
-        if permissions.streams.is_none() {
-            return;
-        }
-
-        let streams = permissions.streams.unwrap();
-        for (stream_id, stream) in streams {
-            if stream.poll_messages {
-                self.users_that_can_poll_messages_from_specific_streams
-                    .insert((user_id, stream_id));
-            }
-
-            if stream.send_messages {
-                self.users_that_can_send_messages_to_specific_streams
-                    .insert((user_id, stream_id));
-            }
-
-            self.users_streams_permissions
-                .insert((user_id, stream_id), stream);
-        }
+    /// Get permissions for a user from SharedMetadata.
+    /// Returns None if user doesn't exist or has no permissions.
+    pub(super) fn get_permissions(&self, user_id: UserId) -> Option<Permissions> {
+        self.metadata
+            .get_user(user_id)
+            .and_then(|user| user.permissions.as_ref().map(|p| (**p).clone()))
     }
 
-    pub fn update_permissions_for_user(
-        &mut self,
+    /// Check if user has global permission to poll messages from all streams.
+    pub(super) fn can_poll_messages_globally(&self, user_id: UserId) -> bool {
+        self.get_permissions(user_id)
+            .map(|p| p.global.poll_messages)
+            .unwrap_or(false)
+    }
+
+    /// Check if user has global permission to send messages to all streams.
+    pub(super) fn can_send_messages_globally(&self, user_id: UserId) -> bool {
+        self.get_permissions(user_id)
+            .map(|p| p.global.send_messages)
+            .unwrap_or(false)
+    }
+
+    /// Get stream-specific permissions for a user.
+    pub(super) fn get_stream_permissions(
+        &self,
         user_id: UserId,
-        permissions: Option<Permissions>,
-    ) {
-        self.delete_permissions_for_user(user_id);
-        self.init_permissions_for_user(user_id, permissions);
-    }
-
-    pub fn delete_permissions_for_user(&mut self, user_id: UserId) {
-        self.users_permissions.remove(&user_id);
-        self.users_that_can_poll_messages_from_all_streams
-            .remove(&user_id);
-        self.users_that_can_send_messages_to_all_streams
-            .remove(&user_id);
-        self.users_streams_permissions
-            .retain(|(id, _), _| *id != user_id);
-        self.users_that_can_poll_messages_from_specific_streams
-            .retain(|(id, _)| *id != user_id);
-        self.users_that_can_send_messages_to_specific_streams
-            .retain(|(id, _)| *id != user_id);
+        stream_id: usize,
+    ) -> Option<iggy_common::StreamPermissions> {
+        self.get_permissions(user_id)
+            .and_then(|p| p.streams)
+            .and_then(|streams| streams.get(&stream_id).cloned())
     }
 }

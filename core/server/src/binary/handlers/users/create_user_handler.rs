@@ -23,7 +23,6 @@ use crate::binary::handlers::users::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
 use crate::shard::IggyShard;
-use crate::shard::transmission::event::ShardEvent;
 use crate::shard::transmission::frame::ShardResponse;
 use crate::shard::transmission::message::{
     ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult,
@@ -32,7 +31,6 @@ use crate::state::command::EntryCommand;
 use crate::state::models::CreateUserWithId;
 use crate::streaming::session::Session;
 use crate::streaming::utils::crypto;
-use anyhow::Result;
 use err_trail::ErrContext;
 use iggy_common::create_user::CreateUser;
 use iggy_common::{Identifier, IggyError, SenderKind};
@@ -92,16 +90,6 @@ impl ServerCommandHandler for CreateUser {
                         })?;
 
                     let user_id = user.id;
-
-                    let event = ShardEvent::CreatedUser {
-                        user_id,
-                        username: username.clone(),
-                        password: password.clone(),
-                        status,
-                        permissions: permissions.clone(),
-                    };
-                    shard.broadcast_event_to_all_shards(event).await?;
-
                     let response = mapper::map_user(&user);
 
                     shard
