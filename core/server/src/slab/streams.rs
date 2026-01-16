@@ -1414,6 +1414,102 @@ impl Streams {
         Ok(batch_count)
     }
 
+    /// Persist frozen (immutable) batches to disk.
+    /// Assumes in-flight buffer is already set by caller.
+    /// Clears in-flight buffer after successful persist.
+    pub async fn persist_frozen_messages_to_disk(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        partition_id: usize,
+        frozen_batches: &[IggyMessagesBatch],
+        config: &SystemConfig,
+    ) -> Result<u32, IggyError> {
+        let (batch_count, batch_size): (u32, u32) = frozen_batches
+            .iter()
+            .fold((0u32, 0u32), |(count_acc, size_acc), b| {
+                (count_acc + b.count(), size_acc + b.size())
+            });
+
+        if batch_count == 0 {
+            return Ok(0);
+        }
+
+        let has_segments =
+            self.with_partition_by_id(stream_id, topic_id, partition_id, |(.., log)| {
+                log.has_segments()
+            });
+
+        if !has_segments {
+            return Ok(0);
+        }
+
+        let (messages_writer, index_writer) =
+            self.with_partition_by_id(stream_id, topic_id, partition_id, |(.., log)| {
+                (
+                    log.active_storage()
+                        .messages_writer
+                        .as_ref()
+                        .expect("Messages writer not initialized")
+                        .clone(),
+                    log.active_storage()
+                        .index_writer
+                        .as_ref()
+                        .expect("Index writer not initialized")
+                        .clone(),
+                )
+            });
+        let guard = messages_writer.lock.lock().await;
+
+        let saved = messages_writer
+            .as_ref()
+            .save_frozen_batches(frozen_batches)
+            .await
+            .error(|e: &IggyError| {
+                format!(
+                    "Failed to save batch of {batch_count} messages \
+                    ({batch_size} bytes) to stream ID: {stream_id}, topic ID: {topic_id}, partition ID: {partition_id}. {e}",
+                )
+            })?;
+
+        let unsaved_indexes_slice =
+            self.with_partition_by_id(stream_id, topic_id, partition_id, |(.., log)| {
+                log.active_indexes().unwrap().unsaved_slice()
+            });
+
+        let indexes_len = unsaved_indexes_slice.len();
+        index_writer
+            .as_ref()
+            .save_indexes(unsaved_indexes_slice)
+            .await
+            .error(|e: &IggyError| {
+                format!("Failed to save index of {indexes_len} indexes to stream ID: {stream_id}, topic ID: {topic_id} {partition_id}. {e}",)
+            })?;
+
+        tracing::trace!(
+            "Persisted {} frozen messages on disk for stream ID: {}, topic ID: {}, for partition with ID: {}, total bytes written: {}.",
+            batch_count,
+            stream_id,
+            topic_id,
+            partition_id,
+            saved
+        );
+
+        self.with_partition_by_id_mut(
+            stream_id,
+            topic_id,
+            partition_id,
+            streaming_partitions::helpers::update_index_and_increment_stats(saved, config),
+        );
+
+        self.with_partition_by_id_mut(stream_id, topic_id, partition_id, |(.., log)| {
+            log.clear_in_flight();
+        });
+
+        drop(guard);
+        Ok(batch_count)
+    }
+
     pub async fn fsync_all_messages(
         &self,
         stream_id: &Identifier,

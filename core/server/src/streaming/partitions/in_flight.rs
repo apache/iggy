@@ -58,8 +58,10 @@ impl IggyMessagesBatchSetInFlight {
         self.last_offset = 0;
     }
 
+    /// Get batches that overlap with the requested offset range.
+    /// Returns only the batches that contain messages within [start_offset, start_offset + count).
     pub fn get_by_offset(&self, start_offset: u64, count: u32) -> &[IggyMessagesBatch] {
-        if self.is_empty() || start_offset > self.last_offset {
+        if self.is_empty() || start_offset > self.last_offset || count == 0 {
             return &[];
         }
 
@@ -68,7 +70,28 @@ impl IggyMessagesBatchSetInFlight {
             return &[];
         }
 
-        &self.batches
+        let start_idx = self
+            .batches
+            .iter()
+            .position(|b| {
+                b.last_offset()
+                    .map(|last| last >= start_offset)
+                    .unwrap_or(false)
+            })
+            .unwrap_or(0);
+
+        let end_idx = self
+            .batches
+            .iter()
+            .rposition(|b| {
+                b.first_offset()
+                    .map(|first| first <= end_offset)
+                    .unwrap_or(false)
+            })
+            .map(|i| i + 1)
+            .unwrap_or(self.batches.len());
+
+        &self.batches[start_idx..end_idx]
     }
 
     pub fn batches(&self) -> &[IggyMessagesBatch] {
