@@ -258,6 +258,7 @@ class AsyncClientIntegrationTest {
         log.info("Successfully sent {} messages in batches", messageCount);
 
         // Poll all messages
+        // var consumer = Consumer.of(5321L);
         var polledMessages = client.messages()
                 .pollMessagesAsync(
                         StreamId.of(TEST_STREAM),
@@ -374,12 +375,13 @@ class AsyncClientIntegrationTest {
 
         // Poll messages concurrently
         for (int i = 0; i < 3; i++) {
+            var consumer = Consumer.of(9000L + i);
             var future = client.messages()
                     .pollMessagesAsync(
                             StreamId.of(TEST_STREAM),
                             TopicId.of(TEST_TOPIC),
                             Optional.of(PARTITION_ID),
-                            null,
+                            consumer,
                             PollingStrategy.last(),
                             10L,
                             false);
@@ -390,5 +392,29 @@ class AsyncClientIntegrationTest {
         CompletableFuture.allOf(operations.toArray(new CompletableFuture[0])).get(15, TimeUnit.SECONDS);
 
         log.info("Successfully completed {} concurrent operations", operations.size());
+    }
+
+    @Test
+    @Order(11)
+    public void testConnectionPoolMetrics() {
+        log.info("Testing Connection Pool Metrics");
+
+        // Retrieves the pool metrics object
+        var metrics = client.getTcpConnectionMetrics();
+
+        assertThat(metrics).isNotNull();
+
+        // By Now We must Have Some Aquire Requests
+        assertThat(metrics.getTotalAcquireRequests()).isGreaterThan(0);
+
+        // Active connections should be 0 (or low) because all previous tests finished
+        // Note: It might not be exactly 0 if Netty hasn't fully released everything instantly,
+        // but it should be less than the default pool size (5).
+        assertThat(metrics.getActiveConnections()).isLessThanOrEqualTo(5);
+
+        log.info(
+                "Metrics Verified: Requests={}, AvgWait={}µs",
+                metrics.getTotalAcquireRequests(),
+                metrics.getAverageWaitTimeMicros());
     }
 }
