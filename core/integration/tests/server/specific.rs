@@ -17,14 +17,17 @@
  */
 
 use crate::server::scenarios::{
-    delete_segments_scenario, message_size_scenario, single_message_per_batch_scenario,
-    tcp_tls_scenario, websocket_tls_scenario,
+    delete_segments_scenario, message_size_scenario, segment_rotation_race_scenario,
+    single_message_per_batch_scenario, tcp_tls_scenario, websocket_tls_scenario,
 };
 use iggy::prelude::*;
 use integration::{
+    http_client::HttpClientFactory,
+    quic_client::QuicClientFactory,
     tcp_client::TcpClientFactory,
     test_server::{IpAddrKind, TestServer},
     test_tls_utils::generate_test_certificates,
+    websocket_client::WebSocketClientFactory,
 };
 use serial_test::parallel;
 use std::collections::HashMap;
@@ -211,4 +214,81 @@ async fn should_handle_single_message_per_batch_with_delayed_persistence() {
     };
 
     single_message_per_batch_scenario::run(&client_factory, 5).await;
+}
+
+/// This test configures the server to trigger frequent segment rotations and runs
+/// multiple concurrent producers across all protocols (TCP, HTTP, QUIC, WebSocket)
+/// to maximize the chance of hitting the race condition between persist_messages_to_disk
+/// and handle_full_segment.
+///
+/// Server configuration:
+/// - Very small segment size (512B) to trigger frequent rotations
+/// - Short message_saver interval (1s) to add concurrent persist operations
+/// - Small messages_required_to_save (32) to trigger more frequent saves
+/// - cache_indexes = none to trigger clear_active_indexes path
+///
+/// Test configuration:
+/// - 8 producers total (2 per protocol: TCP, HTTP, QUIC, WebSocket)
+/// - All producers write to the same partition for maximum lock contention
+#[tokio::test]
+#[parallel]
+async fn segment_rotation_scenario() {
+    let mut extra_envs = HashMap::new();
+
+    // Very small segment to trigger frequent rotations
+    extra_envs.insert("IGGY_SYSTEM_SEGMENT_SIZE".to_string(), "512B".to_string());
+
+    // Short message saver interval to add concurrent persist operations
+    extra_envs.insert("IGGY_MESSAGE_SAVER_INTERVAL".to_string(), "1s".to_string());
+
+    // Small threshold to trigger more frequent saves
+    extra_envs.insert(
+        "IGGY_SYSTEM_PARTITION_MESSAGES_REQUIRED_TO_SAVE".to_string(),
+        "32".to_string(),
+    );
+
+    // cache_indexes = none triggers clear_active_indexes in handle_full_segment
+    extra_envs.insert(
+        "IGGY_SYSTEM_SEGMENT_CACHE_INDEXES".to_string(),
+        "none".to_string(),
+    );
+
+    // Disable socket migration to keep all connections on same shard
+    extra_envs.insert("IGGY_TCP_SOCKET_MIGRATION".to_string(), "false".to_string());
+
+    // Enable TCP nodelay for faster message throughput
+    extra_envs.insert(
+        "IGGY_TCP_SOCKET_OVERRIDE_DEFAULTS".to_string(),
+        "true".to_string(),
+    );
+    extra_envs.insert("IGGY_TCP_SOCKET_NODELAY".to_string(), "true".to_string());
+
+    let mut test_server = TestServer::new(Some(extra_envs), true, None, IpAddrKind::V4);
+    test_server.start();
+
+    let tcp_factory = TcpClientFactory {
+        server_addr: test_server.get_raw_tcp_addr().unwrap(),
+        ..Default::default()
+    };
+
+    let http_factory = HttpClientFactory {
+        server_addr: test_server.get_http_api_addr().unwrap(),
+    };
+
+    let quic_factory = QuicClientFactory {
+        server_addr: test_server.get_quic_udp_addr().unwrap(),
+    };
+
+    let websocket_factory = WebSocketClientFactory {
+        server_addr: test_server.get_websocket_addr().unwrap(),
+    };
+
+    let factories: Vec<&dyn integration::test_server::ClientFactory> = vec![
+        &tcp_factory,
+        &http_factory,
+        &quic_factory,
+        &websocket_factory,
+    ];
+
+    segment_rotation_race_scenario::run(&factories).await;
 }

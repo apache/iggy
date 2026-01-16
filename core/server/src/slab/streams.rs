@@ -57,7 +57,7 @@ use crate::{
 };
 use ahash::AHashMap;
 use err_trail::ErrContext;
-use iggy_common::{Identifier, IggyError, IggyMessagesBatch, IggyTimestamp, PollingKind};
+use iggy_common::{Identifier, IggyError, IggyTimestamp, PollingKind};
 use slab::Slab;
 use std::{
     cell::RefCell,
@@ -216,23 +216,59 @@ impl MainOps for Streams {
         let topic_id = ns.topic_id();
         let partition_id = ns.partition_id();
 
-        let current_offset = self.with_partition_by_id(
-            stream_id,
-            topic_id,
-            partition_id,
-            streaming_partitions::helpers::calculate_current_offset(),
-        );
+        // Acquire the lock on the current active segment's writer.
+        // We must verify the segment hasn't rotated between reading state and acquiring the lock.
+        // The writer must be stored outside the lock acquisition to keep it alive.
+        let mut messages_writer;
+        let mut current_offset;
+        let mut current_position;
+        let mut segment_start_offset;
+        let mut message_deduplicator;
 
-        let current_position =
-            self.with_partition_by_id(stream_id, topic_id, partition_id, |(.., log)| {
-                log.active_segment().current_position
-            });
-        let (segment_start_offset, message_deduplicator) = self.with_partition_by_id(
-            stream_id,
-            topic_id,
-            partition_id,
-            streaming_partitions::helpers::get_segment_start_offset_and_deduplicator(),
-        );
+        let _write_guard = loop {
+            (
+                messages_writer,
+                current_offset,
+                current_position,
+                segment_start_offset,
+                message_deduplicator,
+            ) = self.with_partition_by_id(
+                stream_id,
+                topic_id,
+                partition_id,
+                |(root, _, deduplicator, offset, _, _, log)| {
+                    let current_offset = if !root.should_increment_offset() {
+                        0
+                    } else {
+                        offset.load(std::sync::atomic::Ordering::Relaxed) + 1
+                    };
+                    let segment = log.active_segment();
+                    let writer = log
+                        .active_storage()
+                        .messages_writer
+                        .clone()
+                        .expect("Messages writer must exist for active segment");
+                    (
+                        writer,
+                        current_offset,
+                        segment.current_position,
+                        segment.start_offset,
+                        deduplicator.clone(),
+                    )
+                },
+            );
+
+            let write_guard = messages_writer.lock.lock().await;
+
+            let current_segment_start =
+                self.with_partition_by_id(stream_id, topic_id, partition_id, |(.., log)| {
+                    log.active_segment().start_offset
+                });
+
+            if current_segment_start == segment_start_offset {
+                break write_guard;
+            }
+        };
 
         input
             .prepare_for_persistence(
@@ -250,6 +286,16 @@ impl MainOps for Streams {
             streaming_partitions::helpers::append_to_journal(current_offset, input),
         )?;
 
+        let is_full = self.with_partition_by_id(
+            stream_id,
+            topic_id,
+            partition_id,
+            streaming_partitions::helpers::is_segment_full(),
+        );
+
+        // Release write lock before persistence I/O (persist_messages acquires it again)
+        drop(_write_guard);
+
         let unsaved_messages_count_exceeded =
             journal_messages_count >= config.partition.messages_required_to_save;
         let unsaved_messages_size_exceeded = journal_size
@@ -257,13 +303,6 @@ impl MainOps for Streams {
                 .partition
                 .size_of_messages_required_to_save
                 .as_bytes_u64() as u32;
-
-        let is_full = self.with_partition_by_id(
-            stream_id,
-            topic_id,
-            partition_id,
-            streaming_partitions::helpers::is_segment_full(),
-        );
 
         // Try committing the journal
         if is_full || unsaved_messages_count_exceeded || unsaved_messages_size_exceeded {
@@ -1187,22 +1226,93 @@ impl Streams {
         let numeric_topic_id =
             self.with_topic_by_id(stream_id, topic_id, topics::helpers::get_topic_id());
 
-        if config.segment.cache_indexes == CacheIndexesConfig::OpenSegment
-            || config.segment.cache_indexes == CacheIndexesConfig::None
-        {
-            self.with_partition_by_id_mut(stream_id, topic_id, partition_id, |(.., log)| {
-                log.clear_active_indexes();
-            });
-        }
+        let clear_indexes = config.segment.cache_indexes == CacheIndexesConfig::OpenSegment
+            || config.segment.cache_indexes == CacheIndexesConfig::None;
 
-        self.with_partition_by_id_mut(stream_id, topic_id, partition_id, |(.., log)| {
-            log.active_segment_mut().sealed = true;
-        });
-        let (log_writer, index_writer) =
-            self.with_partition_by_id_mut(stream_id, topic_id, partition_id, |(.., log)| {
-                let (msg, index) = log.active_storage_mut().shutdown();
-                (msg.unwrap(), index.unwrap())
+        let segment_info =
+            self.with_partition_by_id(stream_id, topic_id, partition_id, |(.., log)| {
+                if log.active_segment().sealed {
+                    return None;
+                }
+                let segment = log.active_segment();
+                Some((
+                    segment.end_offset,
+                    segment.start_offset,
+                    segment.size,
+                    log.active_storage().messages_writer.clone(),
+                ))
             });
+
+        let Some((end_offset, start_offset, size, writer_for_lock)) = segment_info else {
+            return Ok(());
+        };
+
+        let Some(writer_for_lock) = writer_for_lock else {
+            return Ok(());
+        };
+
+        // CRITICAL: Create the new segment storage FIRST, before any modifications.
+        // This ensures there's always a valid active segment with writers available,
+        // preventing race conditions where commit_journal finds None writers.
+        let messages_size = 0;
+        let indexes_size = 0;
+        let new_segment = Segment::new(
+            end_offset + 1,
+            config.segment.size,
+            config.segment.message_expiry,
+        );
+
+        let new_storage = create_segment_storage(
+            config,
+            numeric_stream_id,
+            numeric_topic_id,
+            partition_id,
+            messages_size,
+            indexes_size,
+            end_offset + 1,
+        )
+        .await?;
+
+        let _write_guard = writer_for_lock.lock.lock().await;
+
+        // Atomically seal old segment, shutdown storage, and add new segment
+        let writers =
+            self.with_partition_by_id_mut(stream_id, topic_id, partition_id, |(.., log)| {
+                if log.active_segment().sealed {
+                    return None;
+                }
+                if log.active_segment().start_offset != start_offset {
+                    return None;
+                }
+                if !log.active_segment().is_full() {
+                    return None;
+                }
+
+                if clear_indexes {
+                    log.clear_active_indexes();
+                }
+                log.active_segment_mut().sealed = true;
+                let (msg, index) = log.active_storage_mut().shutdown();
+                log.add_persisted_segment(new_segment, new_storage);
+
+                Some((msg, index))
+            });
+
+        drop(_write_guard);
+
+        let Some((Some(log_writer), Some(index_writer))) = writers else {
+            return Ok(());
+        };
+
+        tracing::info!(
+            "Closed segment for stream: {}, topic: {} with start offset: {}, end offset: {}, size: {} for partition with ID: {}.",
+            stream_id,
+            topic_id,
+            start_offset,
+            end_offset,
+            size,
+            partition_id
+        );
 
         registry
             .oneshot("fsync:segment-close-log")
@@ -1236,47 +1346,6 @@ impl Streams {
             })
             .spawn();
 
-        let (start_offset, size, end_offset) =
-            self.with_partition_by_id(stream_id, topic_id, partition_id, |(.., log)| {
-                (
-                    log.active_segment().start_offset,
-                    log.active_segment().size,
-                    log.active_segment().end_offset,
-                )
-            });
-
-        tracing::info!(
-            "Closed segment for stream: {}, topic: {} with start offset: {}, end offset: {}, size: {} for partition with ID: {}.",
-            stream_id,
-            topic_id,
-            start_offset,
-            end_offset,
-            size,
-            partition_id
-        );
-
-        let messages_size = 0;
-        let indexes_size = 0;
-        let segment = Segment::new(
-            end_offset + 1,
-            config.segment.size,
-            config.segment.message_expiry,
-        );
-
-        let storage = create_segment_storage(
-            config,
-            numeric_stream_id,
-            numeric_topic_id,
-            partition_id,
-            messages_size,
-            indexes_size,
-            end_offset + 1,
-        )
-        .await?;
-        self.with_partition_by_id_mut(stream_id, topic_id, partition_id, |(.., log)| {
-            log.add_persisted_segment(segment, storage);
-        });
-
         Ok(())
     }
 
@@ -1295,7 +1364,7 @@ impl Streams {
             return Ok(0);
         }
 
-        let batches = self.with_partition_by_id_mut(
+        let committed = self.with_partition_by_id_mut(
             stream_id,
             topic_id,
             partition_id,
@@ -1311,7 +1380,7 @@ impl Streams {
         );
 
         let batch_count = self
-            .persist_messages_to_disk(stream_id, topic_id, partition_id, batches, config)
+            .persist_messages_to_disk(stream_id, topic_id, partition_id, committed, config)
             .await?;
 
         Ok(batch_count)
@@ -1322,15 +1391,23 @@ impl Streams {
         stream_id: &Identifier,
         topic_id: &Identifier,
         partition_id: usize,
-        mut batches: IggyMessagesBatchSet,
+        committed: streaming_partitions::helpers::CommittedBatch,
         config: &SystemConfig,
     ) -> Result<u32, IggyError> {
-        let batch_count = batches.count();
-        let batch_size = batches.size();
+        let streaming_partitions::helpers::CommittedBatch {
+            segment_idx,
+            messages_writer,
+            index_writer,
+            unsaved_indexes,
+            frozen,
+        } = committed;
 
+        let batch_count = frozen.len() as u32;
         if batch_count == 0 {
             return Ok(0);
         }
+
+        let batch_size: u64 = frozen.iter().map(|b| b.size() as u64).sum();
 
         let has_segments =
             self.with_partition_by_id(stream_id, topic_id, partition_id, |(.., log)| {
@@ -1341,27 +1418,6 @@ impl Streams {
             return Ok(0);
         }
 
-        // Store frozen batches in in-flight buffer for reads during async I/O
-        let frozen: Vec<IggyMessagesBatch> = batches.iter_mut().map(|b| b.freeze()).collect();
-        self.with_partition_by_id_mut(stream_id, topic_id, partition_id, |(.., log)| {
-            log.set_in_flight(frozen.clone());
-        });
-
-        let (messages_writer, index_writer) =
-            self.with_partition_by_id(stream_id, topic_id, partition_id, |(.., log)| {
-                (
-                    log.active_storage()
-                        .messages_writer
-                        .as_ref()
-                        .expect("Messages writer not initialized")
-                        .clone(),
-                    log.active_storage()
-                        .index_writer
-                        .as_ref()
-                        .expect("Index writer not initialized")
-                        .clone(),
-                )
-            });
         let guard = messages_writer.lock.lock().await;
 
         let saved = messages_writer
@@ -1375,20 +1431,16 @@ impl Streams {
                 )
             })?;
 
-        // Extract unsaved indexes before async operation
-        let unsaved_indexes_slice =
-            self.with_partition_by_id(stream_id, topic_id, partition_id, |(.., log)| {
-                log.active_indexes().unwrap().unsaved_slice()
-            });
-
-        let indexes_len = unsaved_indexes_slice.len();
-        index_writer
-            .as_ref()
-            .save_indexes(unsaved_indexes_slice)
-            .await
-            .error(|e: &IggyError| {
-                format!("Failed to save index of {indexes_len} indexes to stream ID: {stream_id}, topic ID: {topic_id} {partition_id}. {e}",)
-            })?;
+        if !unsaved_indexes.is_empty() {
+            let indexes_len = unsaved_indexes.len();
+            index_writer
+                .as_ref()
+                .save_indexes(unsaved_indexes)
+                .await
+                .error(|e: &IggyError| {
+                    format!("Failed to save index of {indexes_len} indexes to stream ID: {stream_id}, topic ID: {topic_id} {partition_id}. {e}",)
+                })?;
+        }
 
         tracing::trace!(
             "Persisted {} messages on disk for stream ID: {}, topic ID: {}, for partition with ID: {}, total bytes written: {}.",
@@ -1403,103 +1455,11 @@ impl Streams {
             stream_id,
             topic_id,
             partition_id,
-            streaming_partitions::helpers::update_index_and_increment_stats(saved, config),
-        );
-
-        self.with_partition_by_id_mut(stream_id, topic_id, partition_id, |(.., log)| {
-            log.clear_in_flight();
-        });
-
-        drop(guard);
-        Ok(batch_count)
-    }
-
-    /// Persist frozen (immutable) batches to disk.
-    /// Assumes in-flight buffer is already set by caller.
-    /// Clears in-flight buffer after successful persist.
-    pub async fn persist_frozen_messages_to_disk(
-        &self,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-        partition_id: usize,
-        frozen_batches: &[IggyMessagesBatch],
-        config: &SystemConfig,
-    ) -> Result<u32, IggyError> {
-        let (batch_count, batch_size): (u32, u32) = frozen_batches
-            .iter()
-            .fold((0u32, 0u32), |(count_acc, size_acc), b| {
-                (count_acc + b.count(), size_acc + b.size())
-            });
-
-        if batch_count == 0 {
-            return Ok(0);
-        }
-
-        let has_segments =
-            self.with_partition_by_id(stream_id, topic_id, partition_id, |(.., log)| {
-                log.has_segments()
-            });
-
-        if !has_segments {
-            return Ok(0);
-        }
-
-        let (messages_writer, index_writer) =
-            self.with_partition_by_id(stream_id, topic_id, partition_id, |(.., log)| {
-                (
-                    log.active_storage()
-                        .messages_writer
-                        .as_ref()
-                        .expect("Messages writer not initialized")
-                        .clone(),
-                    log.active_storage()
-                        .index_writer
-                        .as_ref()
-                        .expect("Index writer not initialized")
-                        .clone(),
-                )
-            });
-        let guard = messages_writer.lock.lock().await;
-
-        let saved = messages_writer
-            .as_ref()
-            .save_frozen_batches(frozen_batches)
-            .await
-            .error(|e: &IggyError| {
-                format!(
-                    "Failed to save batch of {batch_count} messages \
-                    ({batch_size} bytes) to stream ID: {stream_id}, topic ID: {topic_id}, partition ID: {partition_id}. {e}",
-                )
-            })?;
-
-        let unsaved_indexes_slice =
-            self.with_partition_by_id(stream_id, topic_id, partition_id, |(.., log)| {
-                log.active_indexes().unwrap().unsaved_slice()
-            });
-
-        let indexes_len = unsaved_indexes_slice.len();
-        index_writer
-            .as_ref()
-            .save_indexes(unsaved_indexes_slice)
-            .await
-            .error(|e: &IggyError| {
-                format!("Failed to save index of {indexes_len} indexes to stream ID: {stream_id}, topic ID: {topic_id} {partition_id}. {e}",)
-            })?;
-
-        tracing::trace!(
-            "Persisted {} frozen messages on disk for stream ID: {}, topic ID: {}, for partition with ID: {}, total bytes written: {}.",
-            batch_count,
-            stream_id,
-            topic_id,
-            partition_id,
-            saved
-        );
-
-        self.with_partition_by_id_mut(
-            stream_id,
-            topic_id,
-            partition_id,
-            streaming_partitions::helpers::update_index_and_increment_stats(saved, config),
+            streaming_partitions::helpers::update_index_and_increment_stats(
+                segment_idx,
+                saved,
+                config,
+            ),
         );
 
         self.with_partition_by_id_mut(stream_id, topic_id, partition_id, |(.., log)| {
