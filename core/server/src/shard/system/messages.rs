@@ -315,7 +315,7 @@ impl IggyShard {
         partition_id: usize,
         fsync: bool,
     ) -> Result<(), IggyError> {
-        let batches = self.streams.with_partition_by_id_mut(
+        let committed = self.streams.with_partition_by_id_mut(
             stream_id,
             topic_id,
             partition_id,
@@ -327,7 +327,7 @@ impl IggyShard {
                 stream_id,
                 topic_id,
                 partition_id,
-                batches,
+                committed,
                 &self.config.system,
             )
             .await?;

@@ -32,11 +32,15 @@ use crate::{
             storage,
         },
         polling_consumer::ConsumerGroupId,
-        segments::{IggyIndexesMut, IggyMessagesBatchMut, IggyMessagesBatchSet, storage::Storage},
+        segments::{
+            IggyIndexesMut, IggyMessagesBatchMut, IggyMessagesBatchSet, IndexWriter,
+            MessagesWriter, storage::Storage,
+        },
     },
 };
 use err_trail::ErrContext;
-use iggy_common::{ConsumerOffsetInfo, Identifier, IggyByteSize, IggyError};
+use iggy_common::{ConsumerOffsetInfo, Identifier, IggyByteSize, IggyError, PooledBuffer};
+use std::rc::Rc;
 use std::{
     ops::AsyncFnOnce,
     sync::{Arc, atomic::Ordering},
@@ -430,12 +434,51 @@ pub fn append_to_journal(
     }
 }
 
-pub fn commit_journal() -> impl FnOnce(ComponentsById<PartitionRefMut>) -> IggyMessagesBatchSet {
+/// Result of committing journal batches for a specific segment.
+/// Captures writers and indexes at commit time to prevent race conditions with segment rotation.
+pub struct CommittedBatch {
+    pub batches: IggyMessagesBatchSet,
+    pub segment_idx: usize,
+    pub messages_writer: Rc<MessagesWriter>,
+    pub index_writer: Rc<IndexWriter>,
+    /// Indexes captured at commit time, before any rotation can clear them.
+    pub unsaved_indexes: PooledBuffer,
+}
+
+/// Commits the journal and returns the batches along with the segment's writers and indexes.
+/// By capturing writers and indexes at commit time (within the same lock acquisition), we ensure
+/// that even if segment rotation happens after this call, we still have valid data
+/// to complete the persistence operation.
+pub fn commit_journal() -> impl FnOnce(ComponentsById<PartitionRefMut>) -> CommittedBatch {
     |(.., log)| {
+        let segment_idx = log.segments().len().saturating_sub(1);
         let batches = log.journal_mut().commit();
         log.ensure_indexes();
         batches.append_indexes_to(log.active_indexes_mut().unwrap());
-        batches
+
+        // Capture writers NOW before any rotation can happen
+        let storage = log.active_storage();
+        let messages_writer = storage
+            .messages_writer
+            .as_ref()
+            .expect("Messages writer must exist at commit time")
+            .clone();
+        let index_writer = storage
+            .index_writer
+            .as_ref()
+            .expect("Index writer must exist at commit time")
+            .clone();
+
+        // Capture indexes NOW before any rotation can clear them
+        let unsaved_indexes = log.active_indexes().unwrap().unsaved_slice();
+
+        CommittedBatch {
+            batches,
+            segment_idx,
+            messages_writer,
+            index_writer,
+            unsaved_indexes,
+        }
     }
 }
 
@@ -531,16 +574,26 @@ pub fn persist_batch(
     }
 }
 
+/// Updates segment size and marks indexes as saved for a specific segment.
+/// Uses segment_idx to ensure we update the correct segment even after rotation.
+/// Gracefully handles the case where indexes were cleared during segment rotation.
 pub fn update_index_and_increment_stats(
+    segment_idx: usize,
     saved: IggyByteSize,
     config: &SystemConfig,
 ) -> impl FnOnce(ComponentsById<PartitionRefMut>) {
     move |(.., log)| {
-        let segment = log.active_segment_mut();
-        segment.size = IggyByteSize::from(segment.size.as_bytes_u64() + saved.as_bytes_u64());
-        log.active_indexes_mut().unwrap().mark_saved();
-        if config.segment.cache_indexes == CacheIndexesConfig::None {
-            log.active_indexes_mut().unwrap().clear();
+        // Update the specific segment we wrote to, not "active" which may have changed
+        if let Some(segment) = log.segments_mut().get_mut(segment_idx) {
+            segment.size = IggyByteSize::from(segment.size.as_bytes_u64() + saved.as_bytes_u64());
+        }
+
+        // Handle indexes - may be None if segment was rotated and indexes cleared
+        if let Some(Some(indexes)) = log.indexes_mut().get_mut(segment_idx) {
+            indexes.mark_saved();
+            if config.segment.cache_indexes == CacheIndexesConfig::None {
+                indexes.clear();
+            }
         }
     }
 }

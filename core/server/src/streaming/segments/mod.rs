@@ -24,6 +24,8 @@ mod types;
 pub mod storage;
 
 pub use indexes::IggyIndexesMut;
+pub use indexes::IndexWriter;
+pub use messages::MessagesWriter;
 pub use segment::Segment;
 pub use types::IggyMessageHeaderViewMut;
 pub use types::IggyMessageViewMut;
