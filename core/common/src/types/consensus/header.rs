@@ -45,6 +45,8 @@ pub enum Command2 {
     Commit = 9,
 
     StartViewChange = 10,
+    DoViewChange = 11,
+    StartView = 12,
 }
 
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
@@ -52,11 +54,17 @@ pub enum ConsensusError {
     #[error("invalid command: expected {expected:?}, found {found:?}")]
     InvalidCommand { expected: Command2, found: Command2 },
 
+    #[error("invalid size: expected {expected:?}, found {found:?}")]
+    InvalidSize { expected: u32, found: u32 },
+
     #[error("invalid checksum")]
     InvalidChecksum,
 
     #[error("invalid cluster ID")]
     InvalidCluster,
+
+    #[error("invalid field: {0}")]
+    InvalidField(String),
 
     #[error("parent_padding must be 0")]
     PrepareParentPaddingNonZero,
@@ -381,6 +389,200 @@ impl ConsensusHeader for ReplyHeader {
         }
         if self.context_padding != 0 {
             return Err(ConsensusError::ReplyContextPaddingNonZero);
+        }
+        Ok(())
+    }
+
+    fn size(&self) -> u32 {
+        self.size
+    }
+}
+
+/// StartViewChange message header.
+///
+/// Sent by a replica when it suspects the primary has failed.
+/// This is a header-only message with no body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct StartViewChangeHeader {
+    pub checksum: u128,
+    pub checksum_padding: u128,
+    pub checksum_body: u128,
+    pub checksum_body_padding: u128,
+    pub cluster: u128,
+    pub size: u32,
+    pub epoch: u32,
+    pub view: u32,
+    pub release: u32,
+    pub protocol: u16,
+    pub command: Command2,
+    pub replica: u8,
+    pub reserved_frame: [u8; 12],
+
+    pub reserved: [u8; 128],
+}
+
+unsafe impl Pod for StartViewChangeHeader {}
+unsafe impl Zeroable for StartViewChangeHeader {}
+
+impl ConsensusHeader for StartViewChangeHeader {
+    const COMMAND: Command2 = Command2::StartViewChange;
+
+    fn validate(&self) -> Result<(), ConsensusError> {
+        if self.command != Command2::StartViewChange {
+            return Err(ConsensusError::InvalidCommand {
+                expected: Command2::StartViewChange,
+                found: self.command,
+            });
+        }
+
+        if self.release != 0 {
+            return Err(ConsensusError::InvalidField("release != 0".to_string()));
+        }
+        Ok(())
+    }
+
+    fn size(&self) -> u32 {
+        self.size
+    }
+}
+
+/// DoViewChange message header.
+///
+/// Sent by replicas to the primary candidate after collecting a quorum of
+/// StartViewChange messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct DoViewChangeHeader {
+    pub checksum: u128,
+    pub checksum_padding: u128,
+    pub checksum_body: u128,
+    pub checksum_body_padding: u128,
+    pub cluster: u128,
+    pub size: u32,
+    pub epoch: u32,
+    pub view: u32,
+    pub release: u32,
+    pub protocol: u16,
+    pub command: Command2,
+    pub replica: u8,
+    pub reserved_frame: [u8; 12],
+
+    /// The highest op-number in this replica's log.
+    /// Used to select the most complete log when log_view values are equal.
+    pub op: u64,
+
+    /// The replica's commit number (highest committed op).
+    /// The new primary sets its commit to max(commit) across all DVCs.
+    pub commit: u64,
+
+    /// The view number when this replica's status was last normal.
+    /// This is the key field for log selection: the replica with the
+    /// highest log_view has the most authoritative log.
+    pub log_view: u32,
+
+    pub reserved: [u8; 108],
+}
+
+unsafe impl Pod for DoViewChangeHeader {}
+unsafe impl Zeroable for DoViewChangeHeader {}
+
+impl ConsensusHeader for DoViewChangeHeader {
+    const COMMAND: Command2 = Command2::DoViewChange;
+
+    fn validate(&self) -> Result<(), ConsensusError> {
+        if self.command != Command2::DoViewChange {
+            return Err(ConsensusError::InvalidCommand {
+                expected: Command2::DoViewChange,
+                found: self.command,
+            });
+        }
+
+        if self.release != 0 {
+            return Err(ConsensusError::InvalidField(
+                "release must be 0".to_string(),
+            ));
+        }
+
+        // log_view must be <= view (can't have been normal in a future view)
+        if self.log_view > self.view {
+            return Err(ConsensusError::InvalidField(
+                "log_view cannot exceed view".to_string(),
+            ));
+        }
+
+        // commit must be <= op (can't commit what we haven't seen)
+        if self.commit > self.op {
+            return Err(ConsensusError::InvalidField(
+                "commit cannot exceed op".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn size(&self) -> u32 {
+        self.size
+    }
+}
+
+/// StartView message header.
+///
+/// Sent by the new primary to all replicas after collecting a quorum of
+/// DoViewChange messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct StartViewHeader {
+    pub checksum: u128,
+    pub checksum_padding: u128,
+    pub checksum_body: u128,
+    pub checksum_body_padding: u128,
+    pub cluster: u128,
+    pub size: u32,
+    pub epoch: u32,
+    pub view: u32,
+    pub release: u32,
+    pub protocol: u16,
+    pub command: Command2,
+    pub replica: u8,
+    pub reserved_frame: [u8; 12],
+
+    /// The op-number of the highest entry in the new primary's log.
+    /// Backups set their op to this value.
+    pub op: u64,
+
+    /// The commit number.
+    /// This is max(commit) from all DVCs received by the primary.
+    /// Backups set their commit to this value.
+    pub commit: u64,
+
+    pub reserved: [u8; 112],
+}
+
+unsafe impl Pod for StartViewHeader {}
+unsafe impl Zeroable for StartViewHeader {}
+
+impl ConsensusHeader for StartViewHeader {
+    const COMMAND: Command2 = Command2::StartView;
+
+    fn validate(&self) -> Result<(), ConsensusError> {
+        if self.command != Command2::StartView {
+            return Err(ConsensusError::InvalidCommand {
+                expected: Command2::StartView,
+                found: self.command,
+            });
+        }
+
+        if self.release != 0 {
+            return Err(ConsensusError::InvalidField(
+                "release must be 0".to_string(),
+            ));
+        }
+
+        // commit must be <= op
+        if self.commit > self.op {
+            return Err(ConsensusError::InvalidField(
+                "commit cannot exceed op".to_string(),
+            ));
         }
         Ok(())
     }

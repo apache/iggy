@@ -17,7 +17,6 @@
 
 use crate::streaming::{
     partitions::partition,
-    personal_access_tokens::personal_access_token::PersonalAccessToken,
     streams::stream,
     topics::{
         consumer_group::{self},
@@ -25,8 +24,8 @@ use crate::streaming::{
     },
 };
 use iggy_common::{
-    CompressionAlgorithm, Identifier, IggyExpiry, MaxTopicSize, Permissions, TransportProtocol,
-    UserStatus,
+    CompressionAlgorithm, Identifier, IggyExpiry, MaxTopicSize, Permissions, PersonalAccessToken,
+    TransportProtocol, UserStatus,
 };
 use std::net::SocketAddr;
 use strum::Display;

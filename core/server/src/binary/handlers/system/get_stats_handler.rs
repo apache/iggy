@@ -48,6 +48,7 @@ impl ServerCommandHandler for GetStats {
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
+        shard.ensure_authenticated(session)?;
 
         // Route GetStats to shard0 only
         let request = ShardRequest {
@@ -62,10 +63,8 @@ impl ServerCommandHandler for GetStats {
         let message = ShardMessage::Request(request);
         match shard.send_request_to_shard_or_recoil(None, message).await? {
             ShardSendRequestResult::Recoil(_) => {
-                let stats = shard.get_stats().await.with_error(|error| {
-                    format!(
-                        "{COMPONENT} (error: {error}) - failed to get stats, session: {session}"
-                    )
+                let stats = shard.get_stats().await.error(|e: &IggyError| {
+                    format!("{COMPONENT} (error: {e}) - failed to get stats, session: {session}")
                 })?;
                 let bytes = mapper::map_stats(&stats);
                 sender.send_ok_response(&bytes).await?;

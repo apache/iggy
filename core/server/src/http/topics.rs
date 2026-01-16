@@ -36,7 +36,7 @@ use iggy_common::create_topic::CreateTopic;
 use iggy_common::delete_topic::DeleteTopic;
 use iggy_common::purge_topic::PurgeTopic;
 use iggy_common::update_topic::UpdateTopic;
-use iggy_common::{Topic, TopicDetails};
+use iggy_common::{IggyError, Topic, TopicDetails};
 use send_wrapper::SendWrapper;
 use std::sync::Arc;
 use tracing::instrument;
@@ -69,8 +69,6 @@ async fn get_topic(
 
     let session = Session::stateless(identity.user_id, identity.ip_address);
 
-    // Check permissions and stream existence
-    state.shard.shard().ensure_authenticated(&session)?;
     let stream_exists = state
         .shard
         .shard()
@@ -104,9 +102,9 @@ async fn get_topic(
         .permissioner
         .borrow()
         .get_topic(session.get_user_id(), numeric_stream_id, numeric_topic_id)
-        .with_error(|error| {
+        .error(|e: &IggyError| {
             format!(
-                "{COMPONENT} (error: {error}) - permission denied to get topic with ID: {topic_id} in stream with ID: {stream_id} for user with ID: {}",
+                "{COMPONENT} (error: {e}) - permission denied to get topic with ID: {topic_id} in stream with ID: {stream_id} for user with ID: {}",
                 session.get_user_id(),
             )
         })?;
@@ -130,8 +128,6 @@ async fn get_topics(
     let stream_id = Identifier::from_str_value(&stream_id)?;
     let session = Session::stateless(identity.user_id, identity.ip_address);
 
-    // Check permissions and stream existence
-    state.shard.shard().ensure_authenticated(&session)?;
     state.shard.shard().ensure_stream_exists(&stream_id)?;
 
     let numeric_stream_id = state
@@ -144,9 +140,9 @@ async fn get_topics(
         .permissioner
         .borrow()
         .get_topics(session.get_user_id(), numeric_stream_id)
-        .with_error(|error| {
+        .error(|e: &IggyError| {
             format!(
-                "{COMPONENT} (error: {error}) - permission denied to get topics in stream with ID: {stream_id} for user with ID: {}",
+                "{COMPONENT} (error: {e}) - permission denied to get topics in stream with ID: {stream_id} for user with ID: {}",
                 session.get_user_id(),
             )
         })?;
@@ -192,8 +188,8 @@ async fn create_topic(
         ));
         future.await
     }
-    .with_error(|error| {
-        format!("{COMPONENT} (error: {error}) - failed to create topic, stream ID: {stream_id}")
+    .error(|e: &IggyError| {
+        format!("{COMPONENT} (error: {e}) - failed to create topic, stream ID: {stream_id}")
     })?;
 
     // Update command with actual values from created topic
@@ -234,12 +230,11 @@ async fn create_topic(
         Ok::<(), CustomError>(())
     });
 
-    broadcast_future.await
-        .with_error(|error| {
-            format!(
-                "{COMPONENT} (error: {error}) - failed to broadcast topic events, stream ID: {stream_id}"
-            )
-        })?;
+    broadcast_future.await.error(|e: &CustomError| {
+        format!(
+            "{COMPONENT} (error: {e}) - failed to broadcast topic events, stream ID: {stream_id}"
+        )
+    })?;
 
     // Create response using the same approach as binary handler
     let response = {
@@ -267,10 +262,8 @@ async fn create_topic(
         );
         future.await
     }
-    .with_error(|error| {
-        format!(
-            "{COMPONENT} (error: {error}) - failed to apply create topic, stream ID: {stream_id}",
-        )
+    .error(|e: &IggyError| {
+        format!("{COMPONENT} (error: {e}) - failed to apply create topic, stream ID: {stream_id}",)
     })?;
 
     Ok(response)
@@ -300,9 +293,9 @@ async fn update_topic(
         command.compression_algorithm,
         command.max_topic_size,
         command.replication_factor,
-    ).with_error(|error| {
+    ).error(|e: &IggyError| {
         format!(
-            "{COMPONENT} (error: {error}) - failed to update topic, stream ID: {stream_id}, topic ID: {topic_id}"
+            "{COMPONENT} (error: {e}) - failed to update topic, stream ID: {stream_id}, topic ID: {topic_id}"
         )
     })?;
 
@@ -350,9 +343,9 @@ async fn update_topic(
         let future = SendWrapper::new(state.shard.shard().state
             .apply(identity.user_id, &entry_command));
         future.await
-    }.with_error(|error| {
+    }.error(|e: &IggyError| {
         format!(
-            "{COMPONENT} (error: {error}) - failed to apply update topic, stream ID: {stream_id}, topic ID: {topic_id}"
+            "{COMPONENT} (error: {e}) - failed to apply update topic, stream ID: {stream_id}, topic ID: {topic_id}"
         )
     })?;
 
@@ -379,9 +372,9 @@ async fn delete_topic(
             &identifier_topic_id,
         ));
         future.await
-    }.with_error(|error| {
+    }.error(|e: &IggyError| {
         format!(
-            "{COMPONENT} (error: {error}) - failed to delete topic with ID: {topic_id} in stream with ID: {stream_id}",
+            "{COMPONENT} (error: {e}) - failed to delete topic with ID: {topic_id} in stream with ID: {stream_id}",
         )
     })?;
 
@@ -416,9 +409,9 @@ async fn delete_topic(
                 &entry_command,
             ));
         future.await
-    }.with_error(|error| {
+    }.error(|e: &IggyError| {
         format!(
-            "{COMPONENT} (error: {error}) - failed to apply delete topic, stream ID: {stream_id}, topic ID: {topic_id}"
+            "{COMPONENT} (error: {e}) - failed to apply delete topic, stream ID: {stream_id}, topic ID: {topic_id}"
         )
     })?;
 
@@ -444,9 +437,9 @@ async fn purge_topic(
             &identifier_topic_id,
         ));
         future.await
-    }.with_error(|error| {
+    }.error(|e: &IggyError| {
         format!(
-            "{COMPONENT} (error: {error}) - failed to purge topic, stream ID: {stream_id}, topic ID: {topic_id}"
+            "{COMPONENT} (error: {e}) - failed to purge topic, stream ID: {stream_id}, topic ID: {topic_id}"
         )
     })?;
 
@@ -478,9 +471,9 @@ async fn purge_topic(
                 &entry_command,
             ));
         future.await
-    }.with_error(|error| {
+    }.error(|e: &IggyError| {
         format!(
-            "{COMPONENT} (error: {error}) - failed to apply purge topic, stream ID: {stream_id}, topic ID: {topic_id}"
+            "{COMPONENT} (error: {e}) - failed to apply purge topic, stream ID: {stream_id}, topic ID: {topic_id}"
         )
     })?;
 

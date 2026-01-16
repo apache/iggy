@@ -655,14 +655,22 @@ impl IggyConsumer {
         let last_stored_offset = self.last_stored_offsets.clone();
         let last_consumed_offset = self.last_consumed_offsets.clone();
         let allow_replay = self.allow_replay;
+        let is_consumer_group = self.is_consumer_group;
+        let joined_consumer_group = self.joined_consumer_group.clone();
 
         async move {
             if interval > 0 {
                 Self::wait_before_polling(interval, last_polled_at.load(ORDERING)).await;
             }
 
-            if !can_poll.load(ORDERING) {
-                trace!("Trying to poll messages in {retry_interval}...");
+            while !can_poll.load(ORDERING)
+                || (is_consumer_group && !joined_consumer_group.load(ORDERING))
+            {
+                trace!(
+                    "Cannot poll yet (can_poll={}, joined_cg={}), waiting {retry_interval}...",
+                    can_poll.load(ORDERING),
+                    joined_consumer_group.load(ORDERING)
+                );
                 sleep(retry_interval.get_duration()).await;
             }
 
@@ -772,10 +780,17 @@ impl IggyConsumer {
 
             let error = polled_messages.unwrap_err();
             error!("Failed to poll messages: {error}");
+
+            // Handle connection/auth errors - disable polling until event task re-enables
+            // it after reconnection and rejoin complete
             if matches!(
                 error,
                 IggyError::Disconnected | IggyError::Unauthenticated | IggyError::StaleClient
             ) {
+                can_poll.store(false, ORDERING);
+                if is_consumer_group {
+                    joined_consumer_group.store(false, ORDERING);
+                }
                 trace!("Retrying to poll messages in {retry_interval}...");
                 sleep(retry_interval.get_duration()).await;
             }

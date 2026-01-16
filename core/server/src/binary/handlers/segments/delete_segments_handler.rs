@@ -22,7 +22,6 @@ use crate::binary::command::{
 use crate::binary::handlers::partitions::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::shard::IggyShard;
-use crate::shard::namespace::IggyNamespace;
 use crate::shard::transmission::frame::ShardResponse;
 use crate::shard::transmission::message::{
     ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult,
@@ -33,6 +32,7 @@ use crate::streaming::session::Session;
 use anyhow::Result;
 use err_trail::ErrContext;
 use iggy_common::delete_segments::DeleteSegments;
+use iggy_common::sharding::IggyNamespace;
 use iggy_common::{IggyError, SenderKind};
 use std::rc::Rc;
 use tracing::{debug, instrument};
@@ -95,9 +95,9 @@ impl ServerCommandHandler for DeleteSegments {
                     shard
                         .delete_segments_base(&stream_id, &topic_id, partition_id, segments_count)
                         .await
-                        .with_error(|error| {
+                        .error(|e: &IggyError| {
                             format!(
-                                "{COMPONENT} (error: {error}) - failed to delete segments for topic with ID: {topic_id} in stream with ID: {stream_id}, session: {session}",
+                                "{COMPONENT} (error: {e}) - failed to delete segments for topic with ID: {topic_id} in stream with ID: {stream_id}, session: {session}",
                             )
                         })?;
                 } else {
@@ -118,9 +118,9 @@ impl ServerCommandHandler for DeleteSegments {
                 &EntryCommand::DeleteSegments(self),
             )
             .await
-            .with_error(|error| {
+            .error(|e: &IggyError| {
                 format!(
-                    "{COMPONENT} (error: {error}) - failed to apply 'delete segments' command for partition with ID: {partition_id} in topic with ID: {topic_id} in stream with ID: {stream_id}, session: {session}",
+                    "{COMPONENT} (error: {e}) - failed to apply 'delete segments' command for partition with ID: {partition_id} in topic with ID: {topic_id} in stream with ID: {stream_id}, session: {session}",
                 )
             })?;
 

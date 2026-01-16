@@ -19,5 +19,4 @@
 pub mod connector;
 pub mod event;
 pub mod frame;
-pub mod id;
 pub mod message;

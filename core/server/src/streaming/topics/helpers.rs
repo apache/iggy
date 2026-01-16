@@ -35,10 +35,9 @@ use crate::{
             },
             topic::{Topic, TopicRef, TopicRefMut, TopicRoot},
         },
-        utils::hash,
     },
 };
-use iggy_common::{CompressionAlgorithm, Identifier, IggyExpiry, MaxTopicSize};
+use iggy_common::{CompressionAlgorithm, Identifier, IggyExpiry, MaxTopicSize, calculate_32};
 use slab::Slab;
 
 pub fn rename_index(
@@ -100,7 +99,7 @@ pub fn calculate_partition_id_by_messages_key_hash(
     upperbound: usize,
     messages_key: &[u8],
 ) -> usize {
-    let messages_key_hash = hash::calculate_32(messages_key) as usize;
+    let messages_key_hash = calculate_32(messages_key) as usize;
     let partition_id = messages_key_hash % upperbound;
     tracing::trace!(
         "Calculated partition ID: {} for messages key: {:?}, hash: {}",

@@ -31,7 +31,6 @@ impl IggyShard {
         session: &Session,
         name: String,
     ) -> Result<stream::Stream, IggyError> {
-        self.ensure_authenticated(session)?;
         self.permissioner
             .borrow()
             .create_stream(session.get_user_id())?;
@@ -63,7 +62,6 @@ impl IggyShard {
         stream_id: &Identifier,
         name: String,
     ) -> Result<(), IggyError> {
-        self.ensure_authenticated(session)?;
         self.ensure_stream_exists(stream_id)?;
         let id = self
             .streams
@@ -72,9 +70,9 @@ impl IggyShard {
         self.permissioner
             .borrow()
             .update_stream(session.get_user_id(), id)
-            .with_error(|error| {
+            .error(|e: &IggyError| {
                 format!(
-                    "{COMPONENT} (error: {error}) - failed to update stream, user ID: {}, stream ID: {}",
+                    "{COMPONENT} (error: {e}) - failed to update stream, user ID: {}, stream ID: {}",
                     session.get_user_id(),
                     stream_id
                 )
@@ -129,7 +127,6 @@ impl IggyShard {
         session: &Session,
         id: &Identifier,
     ) -> Result<stream::Stream, IggyError> {
-        self.ensure_authenticated(session)?;
         self.ensure_stream_exists(id)?;
         let stream_id = self
             .streams
@@ -137,9 +134,9 @@ impl IggyShard {
         self.permissioner
             .borrow()
             .delete_stream(session.get_user_id(), stream_id)
-            .with_error(|error| {
+            .error(|e: &IggyError| {
                 format!(
-                    "{COMPONENT} (error: {error}) - permission denied to delete stream for user {}, stream ID: {}",
+                    "{COMPONENT} (error: {e}) - permission denied to delete stream for user {}, stream ID: {}",
                     session.get_user_id(),
                     stream_id,
                 )
@@ -178,7 +175,6 @@ impl IggyShard {
         session: &Session,
         stream_id: &Identifier,
     ) -> Result<(), IggyError> {
-        self.ensure_authenticated(session)?;
         self.ensure_stream_exists(stream_id)?;
         {
             let get_stream_id = crate::streaming::streams::helpers::get_stream_id();
@@ -186,9 +182,9 @@ impl IggyShard {
             self.permissioner
                 .borrow()
                 .purge_stream(session.get_user_id(), stream_id)
-                .with_error(|error| {
+                .error(|e: &IggyError| {
                 format!(
-                    "{COMPONENT} (error: {error}) - permission denied to purge stream for user {}, stream ID: {}",
+                    "{COMPONENT} (error: {e}) - permission denied to purge stream for user {}, stream ID: {}",
                     session.get_user_id(),
                     stream_id,
                 )

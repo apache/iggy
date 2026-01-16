@@ -88,6 +88,7 @@ jobs:
         uses: ./.github/actions/utils/setup-rust-with-cache
         with:
           cache-targets: false
+          profile: release
 
       - name: Build wheels
         uses: PyO3/maturin-action@v1

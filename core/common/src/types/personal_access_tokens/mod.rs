@@ -15,11 +15,11 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-use crate::streaming::utils::hash;
-use iggy_common::IggyExpiry;
-use iggy_common::IggyTimestamp;
-use iggy_common::UserId;
-use iggy_common::text::as_base64;
+use crate::IggyExpiry;
+use crate::IggyTimestamp;
+use crate::UserId;
+use crate::text::as_base64;
+use crate::utils::hash;
 use ring::rand::SecureRandom;
 use std::sync::Arc;
 
@@ -28,8 +28,8 @@ const SIZE: usize = 50;
 #[derive(Clone, Debug)]
 pub struct PersonalAccessToken {
     pub user_id: UserId,
-    pub name: Arc<String>,
-    pub token: Arc<String>,
+    pub name: Arc<str>,
+    pub token: Arc<str>,
     pub expiry_at: Option<IggyTimestamp>,
 }
 
@@ -49,8 +49,8 @@ impl PersonalAccessToken {
         (
             Self {
                 user_id,
-                name: Arc::new(name.to_string()),
-                token: Arc::new(token_hash),
+                name: Arc::from(name),
+                token: Arc::from(token_hash),
                 expiry_at: Self::calculate_expiry_at(now, expiry),
             },
             token,
@@ -65,8 +65,8 @@ impl PersonalAccessToken {
     ) -> Self {
         Self {
             user_id,
-            name: Arc::new(name.into()),
-            token: Arc::new(token_hash.into()),
+            name: Arc::from(name),
+            token: Arc::from(token_hash),
             expiry_at,
         }
     }
@@ -96,8 +96,8 @@ impl PersonalAccessToken {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iggy_common::IggyDuration;
-    use iggy_common::IggyTimestamp;
+    use crate::IggyDuration;
+    use crate::IggyTimestamp;
 
     #[test]
     fn personal_access_token_should_be_created_with_random_secure_value_and_hashed_successfully() {
@@ -106,12 +106,12 @@ mod tests {
         let name = "test_token";
         let (personal_access_token, raw_token) =
             PersonalAccessToken::new(user_id, name, now, IggyExpiry::NeverExpire);
-        assert_eq!(personal_access_token.name.as_str(), name);
+        assert_eq!(&*personal_access_token.name, name);
         assert!(!personal_access_token.token.is_empty());
         assert!(!raw_token.is_empty());
-        assert_ne!(personal_access_token.token.as_str(), raw_token);
+        assert_ne!(&*personal_access_token.token, raw_token);
         assert_eq!(
-            personal_access_token.token.as_str(),
+            &*personal_access_token.token,
             PersonalAccessToken::hash_token(&raw_token)
         );
     }

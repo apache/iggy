@@ -40,16 +40,15 @@ impl IggyShard {
         max_topic_size: MaxTopicSize,
         replication_factor: Option<u8>,
     ) -> Result<topic::Topic, IggyError> {
-        self.ensure_authenticated(session)?;
         self.ensure_stream_exists(stream_id)?;
         let numeric_stream_id = self.streams.get_index(stream_id);
         {
             self.permissioner
             .borrow()
                 .create_topic(session.get_user_id(), numeric_stream_id)
-                .with_error(|error| {
+                .error(|e: &IggyError| {
                     format!(
-                        "{COMPONENT} (error: {error}) - permission denied to create topic with name: {name} in stream with ID: {stream_id} for user with ID: {}",
+                        "{COMPONENT} (error: {e}) - permission denied to create topic with name: {name} in stream with ID: {stream_id} for user with ID: {}",
                         session.get_user_id(),
                     )
                 })?;
@@ -103,7 +102,6 @@ impl IggyShard {
         max_topic_size: MaxTopicSize,
         replication_factor: Option<u8>,
     ) -> Result<(), IggyError> {
-        self.ensure_authenticated(session)?;
         self.ensure_topic_exists(stream_id, topic_id)?;
         {
             let topic_id_val =
@@ -116,9 +114,9 @@ impl IggyShard {
                 session.get_user_id(),
                 stream_id_val,
                 topic_id_val
-            ).with_error(|error| {
+            ).error(|e: &IggyError| {
                 format!(
-                    "{COMPONENT} (error: {error}) - permission denied to update topic for user with id: {}, stream ID: {}, topic ID: {}",
+                    "{COMPONENT} (error: {e}) - permission denied to update topic for user with id: {}, stream ID: {}, topic ID: {}",
                     session.get_user_id(),
                     stream_id_val,
                     topic_id_val,
@@ -202,7 +200,6 @@ impl IggyShard {
         stream_id: &Identifier,
         topic_id: &Identifier,
     ) -> Result<topic::Topic, IggyError> {
-        self.ensure_authenticated(session)?;
         self.ensure_topic_exists(stream_id, topic_id)?;
         let numeric_topic_id =
             self.streams
@@ -213,9 +210,9 @@ impl IggyShard {
         self.permissioner
             .borrow()
                 .delete_topic(session.get_user_id(), numeric_stream_id, numeric_topic_id)
-                .with_error(|error| {
+                .error(|e: &IggyError| {
                     format!(
-                        "{COMPONENT} (error: {error}) - permission denied to delete topic with ID: {topic_id} in stream with ID: {stream_id} for user with ID: {}",
+                        "{COMPONENT} (error: {e}) - permission denied to delete topic with ID: {topic_id} in stream with ID: {stream_id} for user with ID: {}",
                         session.get_user_id(),
                     )
                 })?;
@@ -274,7 +271,6 @@ impl IggyShard {
         stream_id: &Identifier,
         topic_id: &Identifier,
     ) -> Result<(), IggyError> {
-        self.ensure_authenticated(session)?;
         self.ensure_topic_exists(stream_id, topic_id)?;
         {
             let topic_id =
@@ -287,9 +283,9 @@ impl IggyShard {
                 session.get_user_id(),
                 stream_id,
                 topic_id
-            ).with_error(|error| {
+            ).error(|e: &IggyError| {
                 format!(
-                    "{COMPONENT} (error: {error}) - permission denied to purge topic with ID: {topic_id} in stream with ID: {stream_id} for user with ID: {}",
+                    "{COMPONENT} (error: {e}) - permission denied to purge topic with ID: {topic_id} in stream with ID: {stream_id} for user with ID: {}",
                     session.get_user_id(),
                 )
             })?;

@@ -56,19 +56,21 @@ impl MessagesWriter {
             .write(true)
             .open(file_path)
             .await
-            .with_error(|err| format!("Failed to open messages file: {file_path}, error: {err}"))
+            .error(|err: &std::io::Error| {
+                format!("Failed to open messages file: {file_path}, error: {err}")
+            })
             .map_err(|_| IggyError::CannotReadFile)?;
 
         if file_exists {
-            let _ = file.sync_all().await.with_error(|error| {
-                format!("Failed to fsync messages file after creation: {file_path}, error: {error}")
+            let _ = file.sync_all().await.error(|e: &std::io::Error| {
+                format!("Failed to fsync messages file after creation: {file_path}, error: {e}")
             });
 
             let actual_messages_size = file
                 .metadata()
                 .await
-                .with_error(|error| {
-                    format!("Failed to get metadata of messages file: {file_path}, error: {error}")
+                .error(|e: &std::io::Error| {
+                    format!("Failed to get metadata of messages file: {file_path}, error: {e}")
                 })
                 .map_err(|_| IggyError::CannotReadFileMetadata)?
                 .len();
@@ -107,9 +109,9 @@ impl MessagesWriter {
         let file = &self.file;
         write_batch(file, position, batch_set)
             .await
-            .with_error(|error| {
+            .error(|e: &IggyError| {
                 format!(
-                    "Failed to write batch to messages file: {}. {error}",
+                    "Failed to write batch to messages file: {}. {e}",
                     self.file_path
                 )
             })?;
@@ -136,8 +138,8 @@ impl MessagesWriter {
         self.file
             .sync_all()
             .await
-            .with_error(|error| {
-                format!("Failed to fsync messages file: {}. {error}", self.file_path)
+            .error(|e: &std::io::Error| {
+                format!("Failed to fsync messages file: {}. {e}", self.file_path)
             })
             .map_err(|_| IggyError::CannotWriteToFile)?;
         Ok(())

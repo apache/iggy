@@ -49,10 +49,11 @@ impl ServerCommandHandler for UpdatePermissions {
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
+        shard.ensure_authenticated(session)?;
 
         shard
                 .update_permissions(session, &self.user_id, self.permissions.clone())
-                .with_error(|error| format!("{COMPONENT} (error: {error}) - failed to update permissions for user_id: {}, session: {session}",
+                .error(|e: &IggyError| format!("{COMPONENT} (error: {e}) - failed to update permissions for user_id: {}, session: {session}",
                     self.user_id
                 ))?;
         info!("Updated permissions for user with ID: {}.", self.user_id);

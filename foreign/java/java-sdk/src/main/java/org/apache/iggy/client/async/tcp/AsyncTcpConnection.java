@@ -167,6 +167,7 @@ public class AsyncTcpConnection {
 
     /**
      * Sends a command asynchronously and returns the response.
+     * Uses Netty's EventLoop to ensure thread-safe sequential request processing with FIFO response matching.
      */
     public CompletableFuture<ByteBuf> sendAsync(int commandCode, ByteBuf payload) {
         if (isClosed.get()) {

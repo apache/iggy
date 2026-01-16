@@ -49,6 +49,7 @@ impl ServerCommandHandler for CreatePartitions {
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
+        shard.ensure_authenticated(session)?;
 
         // Acquire partition lock to serialize filesystem operations
         let _partition_guard = shard.fs_locks.partition_lock.lock().await;
@@ -90,9 +91,9 @@ impl ServerCommandHandler for CreatePartitions {
             &EntryCommand::CreatePartitions(self),
         )
         .await
-        .with_error(|error| {
+        .error(|e: &IggyError| {
             format!(
-                "{COMPONENT} (error: {error}) - failed to apply create partitions for stream_id: {stream_id}, topic_id: {topic_id}, session: {session}"
+                "{COMPONENT} (error: {e}) - failed to apply create partitions for stream_id: {stream_id}, topic_id: {topic_id}, session: {session}"
             )
         })?;
         sender.send_empty_ok_response().await?;

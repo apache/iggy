@@ -43,6 +43,7 @@ impl ServerCommandHandler for FlushUnsavedBuffer {
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
+        shard.ensure_authenticated(session)?;
 
         let user_id = session.get_user_id();
         let stream_id = self.stream_id.clone();
@@ -59,9 +60,9 @@ impl ServerCommandHandler for FlushUnsavedBuffer {
                 fsync,
             )
             .await
-            .with_error(|error| {
+            .error(|e: &IggyError| {
                 format!(
-                    "{COMPONENT} (error: {error}) - failed to flush unsaved buffer for stream_id: {}, topic_id: {}, partition_id: {}, session: {}",
+                    "{COMPONENT} (error: {e}) - failed to flush unsaved buffer for stream_id: {}, topic_id: {}, partition_id: {}, session: {}",
                     stream_id, topic_id, partition_id, session
                 )
             })?;

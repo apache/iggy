@@ -26,6 +26,7 @@ use axum::{
     response::Response,
 };
 use err_trail::ErrContext;
+use iggy_common::IggyError;
 use std::sync::Arc;
 
 const COMPONENT: &str = "JWT_MIDDLEWARE";
@@ -37,7 +38,6 @@ const PUBLIC_PATHS: &[&str] = &[
     "/",
     "/metrics",
     "/ping",
-    "/stats",
     "/users/login",
     "/users/refresh-token",
     "/personal-access-tokens/login",
@@ -57,12 +57,12 @@ pub async fn jwt_auth(
         .headers()
         .get(AUTHORIZATION)
         .ok_or(UNAUTHORIZED)
-        .with_error(|error| {
-            format!("{COMPONENT} (error: {error}) - missing or inaccessible Authorization header")
+        .error(|e: &StatusCode| {
+            format!("{COMPONENT} (error: {e}) - missing or inaccessible Authorization header")
         })?
         .to_str()
-        .with_error(|error| {
-            format!("{COMPONENT} (error: {error}) - invalid authorization header format")
+        .error(|e: &axum::http::header::ToStrError| {
+            format!("{COMPONENT} (error: {e}) - invalid authorization header format")
         })
         .map_err(|_| UNAUTHORIZED)?;
 
@@ -72,13 +72,15 @@ pub async fn jwt_auth(
 
     let jwt_token = &bearer[BEARER.len()..];
     let token_header = jsonwebtoken::decode_header(jwt_token)
-        .with_error(|error| format!("{COMPONENT} (error: {error}) - failed to decode JWT header"))
+        .error(|e: &jsonwebtoken::errors::Error| {
+            format!("{COMPONENT} (error: {e}) - failed to decode JWT header")
+        })
         .map_err(|_| UNAUTHORIZED)?;
     let jwt_claims = state
         .jwt_manager
         .decode(jwt_token, token_header.alg)
-        .with_error(|error| {
-            format!("{COMPONENT} (error: {error}) - failed to decode JWT with provided algorithm")
+        .error(|e: &IggyError| {
+            format!("{COMPONENT} (error: {e}) - failed to decode JWT with provided algorithm")
         })
         .map_err(|_| UNAUTHORIZED)?;
     if state

@@ -36,8 +36,7 @@ runs:
     - name: Setup Rust with cache
       uses: ./.github/actions/utils/setup-rust-with-cache
       with:
-        cache-targets: false  # Only cache registry and git deps, not target dir (sccache handles that)
-        show-stats: false  # Don't need stats for publishing
+        enabled: "false"  # Post-merge runs infrequently, no need to cache
 
     - name: Validate package
       run: |

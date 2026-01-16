@@ -33,7 +33,7 @@ macro_rules! define_server_command_enum {
         );* $(;)?
     ) => {
         #[enum_dispatch(ServerCommandHandler)]
-        #[derive(Debug, PartialEq, EnumString)]
+        #[derive(Debug, PartialEq, EnumString, EnumIter)]
         pub enum ServerCommand {
             $(
                 $variant($ty),

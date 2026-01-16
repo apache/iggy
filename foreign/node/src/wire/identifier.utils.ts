@@ -18,14 +18,27 @@
  */
 
 
+/** Identifier kind for numeric IDs */
 const NUMERIC = 1;
+/** Identifier kind for string IDs */
 const STRING = 2;
 
 type NUMERIC = typeof NUMERIC;
 type STRING = typeof STRING;
 
+/**
+ * Identifier type that can be either a numeric ID or a string name.
+ * Used to identify streams, topics, partitions, and other resources.
+ */
 export type Id = number | string;
 
+/**
+ * Serializes an identifier (numeric or string) to a Buffer for wire protocol.
+ *
+ * @param id - Numeric ID or string name to serialize
+ * @returns Buffer containing the serialized identifier
+ * @throws Error if the identifier type is not supported
+ */
 export const serializeIdentifier = (id: Id): Buffer => {
   if ('string' === typeof id) {
     return serializeStringId(id);
@@ -33,9 +46,16 @@ export const serializeIdentifier = (id: Id): Buffer => {
   if ('number' === typeof id) {
     return serializeNumericId(id);
   }
-  throw new Error(`Unsuported id type (${id} - ${typeof id})`);
+  throw new Error(`Unsupported id type (${id} - ${typeof id})`);
 };
 
+/**
+ * Serializes a string identifier to a Buffer.
+ *
+ * @param id - String name to serialize (1-255 bytes)
+ * @returns Buffer containing kind, length, and string bytes
+ * @throws Error if the string length is not between 1 and 255 bytes
+ */
 const serializeStringId = (id: string): Buffer => {
   const b = Buffer.alloc(1 + 1);
   const bId = Buffer.from(id);
@@ -49,6 +69,12 @@ const serializeStringId = (id: string): Buffer => {
   ]);
 };
 
+/**
+ * Serializes a numeric identifier to a Buffer.
+ *
+ * @param id - Numeric ID to serialize (32-bit unsigned integer)
+ * @returns Buffer containing kind, length, and ID bytes in little-endian format
+ */
 const serializeNumericId = (id: number): Buffer => {
   const b = Buffer.alloc(1 + 1 + 4);
   b.writeUInt8(NUMERIC);

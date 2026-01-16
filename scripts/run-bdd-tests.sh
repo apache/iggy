@@ -53,18 +53,20 @@ case "$SDK" in
   go)     run_suite go-bdd     "🐹"   "Running Go BDD tests"     ;;
   node)   run_suite node-bdd   "🐢🚀" "Running Node BDD tests"   ;;
   csharp) run_suite csharp-bdd "🔷"   "Running C# BDD tests"     ;;
+  java)   run_suite java-bdd   "☕"   "Running Java BDD tests"   ;;
   all)
     run_suite rust-bdd   "🦀"   "Running Rust BDD tests"   || exit $?
     run_suite python-bdd "🐍"   "Running Python BDD tests" || exit $?
     run_suite go-bdd     "🐹"   "Running Go BDD tests"     || exit $?
     run_suite node-bdd   "🐢🚀" "Running Node BDD tests"   || exit $?
     run_suite csharp-bdd "🔷"   "Running C# BDD tests"     || exit $?
+    run_suite java-bdd   "☕"   "Running Java BDD tests"   || exit $?
     ;;
   clean)
     cleanup; exit 0 ;;
   *)
     log "❌ Unknown SDK: ${SDK}"
-    log "📖 Usage: $0 [rust|python|go|node|csharp|all|clean] [feature_file]"
+    log "📖 Usage: $0 [rust|python|go|node|csharp|java|all|clean] [feature_file]"
     exit 2 ;;
 esac
 

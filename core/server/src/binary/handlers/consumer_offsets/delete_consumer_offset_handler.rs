@@ -43,6 +43,7 @@ impl ServerCommandHandler for DeleteConsumerOffset {
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
+        shard.ensure_authenticated(session)?;
         shard
             .delete_consumer_offset(
                 session,
@@ -52,7 +53,7 @@ impl ServerCommandHandler for DeleteConsumerOffset {
                 self.partition_id,
             )
             .await
-            .with_error(|error| format!("{COMPONENT} (error: {error}) - failed to delete consumer offset for topic with ID: {} in stream with ID: {} partition ID: {:#?}, session: {}",
+            .error(|e: &IggyError| format!("{COMPONENT} (error: {e}) - failed to delete consumer offset for topic with ID: {} in stream with ID: {} partition ID: {:#?}, session: {}",
                 self.topic_id, self.stream_id, self.partition_id, session
             ))?;
         sender.send_empty_ok_response().await?;

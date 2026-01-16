@@ -54,6 +54,7 @@ impl ServerCommandHandler for CreateStream {
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
+        shard.ensure_authenticated(session)?;
 
         let request = ShardRequest {
             stream_id: Identifier::default(),
@@ -96,9 +97,9 @@ impl ServerCommandHandler for CreateStream {
                             command: self
                         }))
                         .await
-                        .with_error(|error| {
+                        .error(|e: &IggyError| {
                             format!(
-                                "{COMPONENT} (error: {error}) - failed to apply create stream for id: {created_stream_id}, session: {session}"
+                                "{COMPONENT} (error: {e}) - failed to apply create stream for id: {created_stream_id}, session: {session}"
                             )
                         })?;
 
@@ -121,9 +122,9 @@ impl ServerCommandHandler for CreateStream {
                             command: self
                         }))
                         .await
-                        .with_error(|error| {
+                        .error(|e: &IggyError| {
                             format!(
-                                "{COMPONENT} (error: {error}) - failed to apply create stream for id: {created_stream_id}, session: {session}"
+                                "{COMPONENT} (error: {e}) - failed to apply create stream for id: {created_stream_id}, session: {session}"
                             )
                         })?;
 

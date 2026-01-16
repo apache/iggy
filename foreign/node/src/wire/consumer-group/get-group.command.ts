@@ -27,12 +27,22 @@ import {
   type ConsumerGroup
 } from './group.utils.js';
 
+/**
+ * Parameters for the get consumer group command.
+ */
 export type GetGroup = {
+  /** Stream identifier (ID or name) */
   streamId: Id,
+  /** Topic identifier (ID or name) */
   topicId: Id,
+  /** Consumer group identifier (ID or name) */
   groupId: Id
 };
 
+/**
+ * Get consumer group command definition.
+ * Retrieves information about a specific consumer group.
+ */
 export const GET_GROUP = {
   code: COMMAND_CODE.GetGroup,
 
@@ -48,4 +58,7 @@ export const GET_GROUP = {
 };
 
 
+/**
+ * Executable get consumer group command function.
+ */
 export const getGroup = wrapCommand<GetGroup, ConsumerGroup | null>(GET_GROUP);

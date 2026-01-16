@@ -3022,9 +3022,9 @@ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 
 [[package]]
 name = "err_trail"
-version = "0.10.2"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "85b9e8330eccf84d08fb8efe2f923ddacc9f02c1359edfc33cc0af4100caf764"
+checksum = "0364ccf1c57e1e4e22f47418b0197163424aa97037b07fc3626a855d94549503"
 dependencies = [
  "tracing",
 ]
@@ -3503,6 +3503,21 @@ dependencies = [
  "pin-project-lite",
  "pin-utils",
  "slab",
+]
+
+[[package]]
+name = "generator"
+version = "0.8.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "52f04ae4152da20c76fe800fa48659201d5cf627c5149ca0b707b69d7eef6cf9"
+dependencies = [
+ "cc",
+ "cfg-if",
+ "libc",
+ "log",
+ "rustversion",
+ "windows-link 0.2.1",
+ "windows-result 0.4.1",
 ]
 
 [[package]]
@@ -4459,7 +4474,7 @@ dependencies = [
 
 [[package]]
 name = "iggy"
-version = "0.8.1-edge.2"
+version = "0.8.1-edge.4"
 dependencies = [
  "async-broadcast",
  "async-dropper",
@@ -4569,7 +4584,7 @@ dependencies = [
 
 [[package]]
 name = "iggy-connectors"
-version = "0.2.1-edge.1"
+version = "0.2.1-edge.3"
 dependencies = [
  "async-trait",
  "axum",
@@ -4577,6 +4592,7 @@ dependencies = [
  "chrono",
  "clap",
  "dashmap",
+ "dirs",
  "dlopen2",
  "dotenvy",
  "figlet-rs",
@@ -4598,6 +4614,7 @@ dependencies = [
  "serde_with",
  "serde_yaml_ng",
  "strum 0.27.2",
+ "tempfile",
  "thiserror 2.0.17",
  "tokio",
  "toml 0.9.10+spec-1.1.0",
@@ -4608,10 +4625,11 @@ dependencies = [
 
 [[package]]
 name = "iggy-mcp"
-version = "0.2.1-edge.1"
+version = "0.2.1-edge.3"
 dependencies = [
  "axum",
  "axum-server",
+ "dirs",
  "dotenvy",
  "figlet-rs",
  "figment",
@@ -4621,6 +4639,7 @@ dependencies = [
  "serde",
  "serde_json",
  "strum 0.27.2",
+ "tempfile",
  "thiserror 2.0.17",
  "tokio",
  "tower-http",
@@ -4630,7 +4649,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_binary_protocol"
-version = "0.8.1-edge.1"
+version = "0.8.1-edge.2"
 dependencies = [
  "anyhow",
  "async-broadcast",
@@ -4656,6 +4675,7 @@ dependencies = [
  "aes-gcm",
  "ahash 0.8.12",
  "base64 0.22.1",
+ "blake3",
  "bon",
  "byte-unit",
  "bytemuck",
@@ -4677,6 +4697,7 @@ dependencies = [
  "nix",
  "once_cell",
  "rcgen",
+ "ring",
  "rustls",
  "serde",
  "serde_json",
@@ -5018,6 +5039,7 @@ dependencies = [
  "serde_json",
  "serial_test",
  "server",
+ "strum 0.27.2",
  "strum_macros 0.27.2",
  "tempfile",
  "test-case",
@@ -5262,6 +5284,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 dependencies = [
  "spin",
+]
+
+[[package]]
+name = "left-right"
+version = "0.11.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0f0c21e4c8ff95f487fb34e6f9182875f42c84cef966d29216bf115d9bba835a"
+dependencies = [
+ "crossbeam-utils",
+ "loom",
+ "slab",
 ]
 
 [[package]]
@@ -5573,6 +5606,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "loom"
+version = "0.7.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "419e0dc8046cb947daa77eb95ae174acfbddb7673b4151f56d1eed8e93fbfaca"
+dependencies = [
+ "cfg-if",
+ "generator",
+ "scoped-tls",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "lru-slab"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5656,10 +5702,13 @@ dependencies = [
 name = "metadata"
 version = "0.1.0"
 dependencies = [
+ "ahash 0.8.12",
+ "bytes",
  "consensus",
  "iggy_common",
  "journal",
  "message_bus",
+ "slab",
  "tracing",
 ]
 
@@ -6494,6 +6543,13 @@ dependencies = [
  "regex-syntax",
  "structmeta",
  "syn 2.0.111",
+]
+
+[[package]]
+name = "partitions"
+version = "0.1.0"
+dependencies = [
+ "iggy_common",
 ]
 
 [[package]]
@@ -8239,7 +8295,7 @@ dependencies = [
 
 [[package]]
 name = "server"
-version = "0.6.1-edge.2"
+version = "0.6.1-edge.4"
 dependencies = [
  "ahash 0.8.12",
  "anyhow",
@@ -8249,7 +8305,6 @@ dependencies = [
  "async_zip",
  "axum",
  "axum-server",
- "blake3",
  "bytes",
  "chrono",
  "clap",
@@ -8276,6 +8331,7 @@ dependencies = [
  "hwlocality",
  "iggy_common",
  "jsonwebtoken",
+ "left-right",
  "lending-iterator",
  "mimalloc",
  "mime_guess",
@@ -8290,7 +8346,6 @@ dependencies = [
  "prometheus-client",
  "rand 0.9.2",
  "reqwest",
- "ring",
  "ringbuffer",
  "rmp-serde",
  "rust-embed",
@@ -8314,7 +8369,6 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "tungstenite",
- "twox-hash",
  "ulid",
  "uuid",
  "vergen-git2",
@@ -9623,9 +9677,11 @@ dependencies = [
  "once_cell",
  "regex-automata",
  "sharded-slab",
+ "smallvec",
  "thread_local",
  "tracing",
  "tracing-core",
+ "tracing-log",
 ]
 
 [[package]]

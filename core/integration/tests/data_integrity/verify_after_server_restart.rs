@@ -16,9 +16,7 @@
  * under the License.
  */
 
-use iggy::clients::client::IggyClient;
-use iggy::prelude::{ConsumerGroupClient, Identifier, IggyByteSize, MessageClient, SystemClient};
-use iggy_common::TransportProtocol;
+use iggy::prelude::*;
 use integration::bench_utils::run_bench_and_wait_for_finish;
 use integration::{
     tcp_client::TcpClientFactory,
@@ -317,5 +315,211 @@ async fn should_fill_data_and_verify_after_restart(cache_setting: &'static str) 
     );
 
     // 16. Manual cleanup
+    std::fs::remove_dir_all(local_data_path).unwrap();
+}
+
+/// Test that verifies server correctly handles ID gaps after deletions at all levels:
+/// streams, topics, partitions, and consumer groups.
+///
+/// Creates a hierarchy with gaps from deletions:
+/// - Streams: 0, 2 (1 deleted)
+/// - Topics per stream: 0, 2 (1 deleted)
+/// - Partitions per topic: 0, 2 (1 deleted)
+/// - Consumer groups per topic: 0, 2 (1 deleted)
+#[tokio::test]
+#[parallel]
+async fn should_handle_resource_deletion_and_restart() {
+    let env_vars = HashMap::from([(
+        SYSTEM_PATH_ENV_VAR.to_owned(),
+        TestServer::get_random_path(),
+    )]);
+
+    let mut test_server = TestServer::new(Some(env_vars.clone()), false, None, IpAddrKind::V4);
+    test_server.start();
+    let server_addr = test_server.get_raw_tcp_addr().unwrap();
+    let local_data_path = test_server.get_local_data_path().to_owned();
+
+    let client = IggyClient::create(
+        TcpClientFactory {
+            server_addr: server_addr.clone(),
+            ..Default::default()
+        }
+        .create_client()
+        .await,
+        None,
+        None,
+    );
+    login_root(&client).await;
+
+    // Create 3 streams
+    let stream_0 = client.create_stream("stream-0").await.unwrap();
+    let stream_1 = client.create_stream("stream-1").await.unwrap();
+    let stream_2 = client.create_stream("stream-2").await.unwrap();
+
+    assert_eq!(stream_0.id, 0);
+    assert_eq!(stream_1.id, 1);
+    assert_eq!(stream_2.id, 2);
+
+    // For streams 0 and 2, create topics, partitions, and consumer groups with gaps
+    for stream_id in [0u32, 2u32] {
+        let stream_ident = Identifier::numeric(stream_id).unwrap();
+
+        // Create 3 topics per stream (each with 3 partitions initially)
+        for topic_idx in 0..3 {
+            let topic = client
+                .create_topic(
+                    &stream_ident,
+                    &format!("topic-{}", topic_idx),
+                    3,
+                    CompressionAlgorithm::None,
+                    None,
+                    IggyExpiry::NeverExpire,
+                    MaxTopicSize::Unlimited,
+                )
+                .await
+                .unwrap();
+            assert_eq!(topic.id, topic_idx);
+
+            let topic_ident = Identifier::numeric(topic_idx).unwrap();
+
+            // Create 3 consumer groups per topic
+            for cg_idx in 0..3 {
+                client
+                    .create_consumer_group(&stream_ident, &topic_ident, &format!("cg-{}", cg_idx))
+                    .await
+                    .unwrap();
+            }
+        }
+
+        // Delete middle topic (topic 1)
+        client
+            .delete_topic(&stream_ident, &Identifier::numeric(1).unwrap())
+            .await
+            .unwrap();
+
+        // For remaining topics (0 and 2), delete middle partition then middle consumer group
+        // This order tests that the server handles partition deletion before consumer group deletion
+        for topic_id in [0u32, 2u32] {
+            let topic_ident = Identifier::numeric(topic_id).unwrap();
+
+            client
+                .delete_partitions(&stream_ident, &topic_ident, 1)
+                .await
+                .unwrap();
+
+            client
+                .delete_consumer_group(
+                    &stream_ident,
+                    &topic_ident,
+                    &Identifier::numeric(1).unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    // Delete middle stream (stream 1)
+    client
+        .delete_stream(&Identifier::numeric(1).unwrap())
+        .await
+        .unwrap();
+
+    // Verify state before restart
+    let streams = client.get_streams().await.unwrap();
+    assert_eq!(streams.len(), 2);
+    let stream_ids: Vec<u32> = streams.iter().map(|s| s.id).collect();
+    assert!(stream_ids.contains(&0) && stream_ids.contains(&2));
+
+    drop(client);
+    test_server.stop();
+    drop(test_server);
+
+    // Restart server
+    let mut test_server = TestServer::new(Some(env_vars.clone()), false, None, IpAddrKind::V4);
+    test_server.start();
+    let server_addr = test_server.get_raw_tcp_addr().unwrap();
+
+    let client = IggyClient::create(
+        TcpClientFactory {
+            server_addr,
+            ..Default::default()
+        }
+        .create_client()
+        .await,
+        None,
+        None,
+    );
+    login_root(&client).await;
+
+    // Verify streams after restart
+    let streams = client.get_streams().await.unwrap();
+    assert_eq!(streams.len(), 2, "Expected 2 streams after restart");
+    let stream_ids: Vec<u32> = streams.iter().map(|s| s.id).collect();
+    assert!(
+        stream_ids.contains(&0) && stream_ids.contains(&2),
+        "Expected streams 0 and 2, got: {:?}",
+        stream_ids
+    );
+
+    // Verify topics, partitions, and consumer groups for each stream
+    for stream_id in [0u32, 2u32] {
+        let stream_ident = Identifier::numeric(stream_id).unwrap();
+        let stream = client.get_stream(&stream_ident).await.unwrap().unwrap();
+
+        assert_eq!(
+            stream.topics_count, 2,
+            "Stream {} should have 2 topics",
+            stream_id
+        );
+
+        // Verify topics have correct IDs (0 and 2, not 0 and 1)
+        let topics = client.get_topics(&stream_ident).await.unwrap();
+        let topic_ids: Vec<u32> = topics.iter().map(|t| t.id).collect();
+        assert!(
+            topic_ids.contains(&0) && topic_ids.contains(&2),
+            "Stream {} should have topics 0 and 2, got: {:?}",
+            stream_id,
+            topic_ids
+        );
+
+        for topic_id in [0u32, 2u32] {
+            let topic_ident = Identifier::numeric(topic_id).unwrap();
+            let topic = client
+                .get_topic(&stream_ident, &topic_ident)
+                .await
+                .unwrap()
+                .unwrap();
+
+            assert_eq!(
+                topic.partitions_count, 2,
+                "Topic {} in stream {} should have 2 partitions",
+                topic_id, stream_id
+            );
+
+            // Verify consumer groups have correct IDs (0 and 2)
+            let cgs = client
+                .get_consumer_groups(&stream_ident, &topic_ident)
+                .await
+                .unwrap();
+            assert_eq!(
+                cgs.len(),
+                2,
+                "Topic {} in stream {} should have 2 consumer groups",
+                topic_id,
+                stream_id
+            );
+            let cg_ids: Vec<u32> = cgs.iter().map(|c| c.id).collect();
+            assert!(
+                cg_ids.contains(&0) && cg_ids.contains(&2),
+                "Topic {} in stream {} should have consumer groups 0 and 2, got: {:?}",
+                topic_id,
+                stream_id,
+                cg_ids
+            );
+        }
+    }
+
+    drop(client);
+    test_server.stop();
     std::fs::remove_dir_all(local_data_path).unwrap();
 }

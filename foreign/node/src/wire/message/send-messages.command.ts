@@ -25,13 +25,24 @@ import { deserializeVoidResponse } from '../../client/client.utils.js';
 import { wrapCommand } from '../command.utils.js';
 import { COMMAND_CODE } from '../command.code.js';
 
+/**
+ * Parameters for the send messages command.
+ */
 export type SendMessages = {
+  /** Stream identifier */
   streamId: Id,
+  /** Topic identifier */
   topicId: Id,
+  /** Array of messages to send */
   messages: CreateMessage[],
+  /** Optional partitioning strategy */
   partition?: Partitioning,
 };
 
+/**
+ * Send messages command definition.
+ * Publishes messages to a topic.
+ */
 export const SEND_MESSAGES = {
   code: COMMAND_CODE.SendMessages,
 
@@ -42,4 +53,7 @@ export const SEND_MESSAGES = {
   deserialize: deserializeVoidResponse
 };
 
+/**
+ * Executable send messages command function.
+ */
 export const sendMessages = wrapCommand<SendMessages, boolean>(SEND_MESSAGES);

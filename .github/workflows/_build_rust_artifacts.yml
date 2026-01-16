@@ -103,6 +103,7 @@ jobs:
         uses: ./.github/actions/utils/setup-rust-with-cache
         with:
           cache-targets: false
+          profile: release
 
       - name: Add Rust target
         run: rustup target add ${{ matrix.target }}
@@ -205,6 +206,7 @@ jobs:
         uses: ./.github/actions/utils/setup-rust-with-cache
         with:
           cache-targets: false
+          profile: release
 
       - name: Add Rust target
         run: rustup target add ${{ matrix.target }}

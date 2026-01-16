@@ -25,13 +25,23 @@ import { wrapCommand } from '../command.utils.js';
 import { COMMAND_CODE } from '../command.code.js';
 
 
+/**
+ * Parameters for the change password command.
+ */
 export type ChangePassword = {
+  /** User ID */
   userId: number,
+  /** Current password (1-255 bytes) */
   currentPassword: string,
+  /** New password (1-255 bytes) */
   newPassword: string
 };
 
 
+/**
+ * Change password command definition.
+ * Changes a user's password.
+ */
 export const CHANGE_PASSWORD = {
   code: COMMAND_CODE.ChangePassword,
 
@@ -60,4 +70,7 @@ export const CHANGE_PASSWORD = {
 };
 
 
+/**
+ * Executable change password command function.
+ */
 export const changePassword = wrapCommand<ChangePassword, boolean>(CHANGE_PASSWORD);

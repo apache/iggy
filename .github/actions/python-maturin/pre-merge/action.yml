@@ -35,6 +35,7 @@ runs:
       uses: ./.github/actions/utils/setup-rust-with-cache
       with:
         cache-targets: false # Only cache registry and git deps, not target dir (sccache handles that)
+        save-cache: "false"  # Only builds wheel, let Rust test job save comprehensive cache
 
     - name: Cache pip
       uses: actions/cache@v4
@@ -51,7 +52,7 @@ runs:
 
         # Install testing dependencies from pyproject.toml
         cd foreign/python
-        pip install -e ".[testing,examples,dev]"
+        pip install -e ".[testing,dev]"
         cd ../..
 
         # Install additional CI dependencies for Docker testing if needed
@@ -97,11 +98,6 @@ runs:
           # Install the built wheel for testing
           echo "Installing built wheel..."
           pip install dist/*.whl --force-reinstall
-
-          # Create symlink for examples directory if needed
-          if [ -d "python_examples" ] && [ ! -e "examples" ]; then
-            ln -s python_examples examples
-          fi
         fi
 
         if [ "${{ inputs.task }}" = "build" ]; then

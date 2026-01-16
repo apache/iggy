@@ -580,6 +580,7 @@ jobs:
           version: ${{ steps.ver.outputs.version }}
           platform: ${{ matrix.platform }}
           dry_run: ${{ inputs.dry_run }}
+          gha-cache: "false"  # Use registry cache only to save GHA cache space
 
       - name: Export digest
         if: ${{ !inputs.dry_run }}
@@ -768,7 +769,7 @@ jobs:
         uses: ./.github/actions/utils/setup-rust-with-cache
         with:
           cache-targets: false
-          show-stats: false
+          profile: release
 
       - name: Debug matrix
         run: echo '${{ toJson(matrix) }}'

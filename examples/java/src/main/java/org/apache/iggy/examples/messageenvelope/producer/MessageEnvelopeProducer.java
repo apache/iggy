@@ -37,6 +37,7 @@ import org.slf4j.LoggerFactory;
 import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Optional;
 
@@ -126,7 +127,7 @@ public final class MessageEnvelopeProducer {
                         BigInteger.ZERO,
                         0L,
                         (long) payload.length);
-                Message message = new Message(header, payload, Optional.empty());
+                Message message = new Message(header, payload, new HashMap<>());
                 messages.add(message);
                 serializableMessages.add(serializableMessage);
             }

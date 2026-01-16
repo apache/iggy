@@ -24,13 +24,20 @@ import { COMMAND_CODE } from '../command.code.js';
 import { deserializeUsers, type BaseUser } from './user.utils.js';
 
 
+/**
+ * Get users command definition.
+ * Retrieves all users (without permissions).
+ */
 export const GET_USERS = {
   code: COMMAND_CODE.GetUsers,
 
   serialize: () =>  Buffer.alloc(0),
-  
+
   deserialize: (r: CommandResponse) => deserializeUsers(r.data)
 };
 
 
+/**
+ * Executable get users command function.
+ */
 export const getUsers = wrapCommand<void, BaseUser[]>(GET_USERS);

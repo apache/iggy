@@ -68,7 +68,7 @@ use iggy_common::update_topic::UpdateTopic;
 use iggy_common::update_user::UpdateUser;
 use iggy_common::*;
 use std::rc::Rc;
-use strum::EnumString;
+use strum::{EnumIter, EnumString};
 use tracing::error;
 
 define_server_command_enum! {

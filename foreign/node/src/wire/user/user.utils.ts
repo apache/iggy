@@ -21,25 +21,49 @@
 import { toDate } from '../serialize.utils.js';
 import { deserializePermissions, type UserPermissions } from './permissions.utils.js';
 
+/**
+ * Basic user information without permissions.
+ */
 export type BaseUser = {
+  /** User ID */
   id: number,
+  /** User creation timestamp */
   createdAt: Date,
+  /** User status (Active/Inactive) */
   status: string,
+  /** Username */
   userName: string
 };
 
+/**
+ * Result of deserializing a base user.
+ */
 type BaseUserDeserialized = {
+  /** Number of bytes consumed */
   bytesRead: number,
+  /** Deserialized user data */
   data: BaseUser
 };
 
+/** User with permissions information */
 export type User = BaseUser & { permissions: UserPermissions | null };
 
+/**
+ * User status enumeration.
+ */
 export enum UserStatus {
+  /** Active user */
   Active = 1,
+  /** Inactive user */
   Inactive = 2,
 };
 
+/**
+ * Converts a numeric status code to a status string.
+ *
+ * @param t - Numeric status code
+ * @returns Status string ('Active', 'Inactive', or unknown)
+ */
 const statusString = (t: number): string => {
   switch (t.toString()) {
     case '1': return 'Active';
@@ -49,6 +73,14 @@ const statusString = (t: number): string => {
   }
 }
 
+/**
+ * Deserializes a base user from a buffer.
+ *
+ * @param p - Buffer containing serialized user data
+ * @param pos - Starting position in the buffer
+ * @returns Object with bytes read and deserialized user data
+ * @throws Error if the buffer is empty (user does not exist)
+ */
 export const deserializeBaseUser = (p: Buffer, pos = 0): BaseUserDeserialized => {
   if (p.length === 0)
     throw new Error('User does not exist');
@@ -70,6 +102,13 @@ export const deserializeBaseUser = (p: Buffer, pos = 0): BaseUserDeserialized =>
   }
 };
 
+/**
+ * Deserializes a user with permissions from a buffer.
+ *
+ * @param p - Buffer containing serialized user data
+ * @param pos - Starting position in the buffer
+ * @returns Deserialized user with permissions
+ */
 export const deserializeUser = (p: Buffer, pos = 0): User => {
   const { bytesRead, data } = deserializeBaseUser(p, pos);
   pos += bytesRead;
@@ -87,6 +126,13 @@ export const deserializeUser = (p: Buffer, pos = 0): User => {
 };
 
 
+/**
+ * Deserializes multiple base users from a buffer.
+ *
+ * @param p - Buffer containing serialized users data
+ * @param pos - Starting position in the buffer
+ * @returns Array of deserialized base users
+ */
 export const deserializeUsers = (p: Buffer, pos = 0): BaseUser[] => {
   const users = [];
   const end = p.length;

@@ -45,12 +45,13 @@ impl ServerCommandHandler for DeletePersonalAccessToken {
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
+        shard.ensure_authenticated(session)?;
         let token_name = self.name.clone();
 
         shard
                 .delete_personal_access_token(session, &self.name)
-                .with_error(|error| {format!(
-                    "{COMPONENT} (error: {error}) - failed to delete personal access token with name: {token_name}, session: {session}"
+                .error(|e: &IggyError| {format!(
+                    "{COMPONENT} (error: {e}) - failed to delete personal access token with name: {token_name}, session: {session}"
                 )})?;
 
         // Broadcast the event to other shards
@@ -69,8 +70,8 @@ impl ServerCommandHandler for DeletePersonalAccessToken {
                 }),
             )
             .await
-            .with_error(|error| {format!(
-                "{COMPONENT} (error: {error}) - failed to apply delete personal access token with name: {token_name}, session: {session}"
+            .error(|e: &IggyError| {format!(
+                "{COMPONENT} (error: {e}) - failed to apply delete personal access token with name: {token_name}, session: {session}"
             )})?;
         sender.send_empty_ok_response().await?;
         Ok(HandlerResult::Finished)

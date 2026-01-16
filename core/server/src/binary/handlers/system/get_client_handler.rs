@@ -42,6 +42,7 @@ impl ServerCommandHandler for GetClient {
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
+        shard.ensure_authenticated(session)?;
 
         let Ok(client) = shard.get_client(session, self.client_id) else {
             sender.send_empty_ok_response().await?;

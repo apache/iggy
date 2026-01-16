@@ -19,7 +19,7 @@
 use super::COMPONENT;
 use crate::binary::handlers::messages::poll_messages_handler::IggyPollMetadata;
 use crate::shard::IggyShard;
-use crate::shard::namespace::{IggyFullNamespace, IggyNamespace};
+use crate::shard::namespace::IggyFullNamespace;
 use crate::shard::transmission::frame::ShardResponse;
 use crate::shard::transmission::message::{
     ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult,
@@ -29,6 +29,7 @@ use crate::streaming::traits::MainOps;
 use crate::streaming::{partitions, streams, topics};
 use err_trail::ErrContext;
 use iggy_common::PooledBuffer;
+use iggy_common::sharding::IggyNamespace;
 use iggy_common::{
     BytesSerializable, Consumer, EncryptorKind, IGGY_MESSAGE_HEADER_SIZE, Identifier, IggyError,
     PollingKind, PollingStrategy,
@@ -63,8 +64,8 @@ impl IggyShard {
                 numeric_stream_id,
                 numeric_topic_id,
             )
-            .with_error(|error| {
-                format!("{COMPONENT} (error: {error}) - permission denied to append messages for user {} on stream ID: {}, topic ID: {}", user_id, numeric_stream_id as u32, numeric_topic_id as u32)
+            .error(|e: &IggyError| {
+                format!("{COMPONENT} (error: {e}) - permission denied to append messages for user {} on stream ID: {}, topic ID: {}", user_id, numeric_stream_id as u32, numeric_topic_id as u32)
             })?;
 
         if batch.count() == 0 {
@@ -141,8 +142,8 @@ impl IggyShard {
         self.permissioner
             .borrow()
             .poll_messages(user_id, numeric_stream_id, numeric_topic_id)
-            .with_error(|error| format!(
-                "{COMPONENT} (error: {error}) - permission denied to poll messages for user {} on stream ID: {}, topic ID: {}",
+            .error(|e: &IggyError| format!(
+                "{COMPONENT} (error: {e}) - permission denied to poll messages for user {} on stream ID: {}, topic ID: {}",
                 user_id,
                 stream_id,
                 numeric_topic_id
@@ -263,8 +264,8 @@ impl IggyShard {
         self.permissioner
             .borrow()
             .append_messages(user_id, numeric_stream_id, numeric_topic_id)
-            .with_error(|error| {
-                format!("{COMPONENT} (error: {error}) - permission denied to flush unsaved buffer for user {} on stream ID: {}, topic ID: {}", user_id, numeric_stream_id as u32, numeric_topic_id as u32)
+            .error(|e: &IggyError| {
+                format!("{COMPONENT} (error: {e}) - permission denied to flush unsaved buffer for user {} on stream ID: {}, topic ID: {}", user_id, numeric_stream_id as u32, numeric_topic_id as u32)
             })?;
 
         self.ensure_partition_exists(&stream_id, &topic_id, partition_id)?;

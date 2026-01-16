@@ -242,8 +242,8 @@ async fn build_app_state(
     }
 
     let jwt_manager = JwtManager::from_config(persister, &tokens_path, &config.jwt);
-    if let Err(error) = jwt_manager {
-        panic!("Failed to initialize JWT manager: {error}");
+    if let Err(e) = jwt_manager {
+        panic!("Failed to initialize JWT manager: {e}");
     }
 
     let jwt_manager = jwt_manager.unwrap();
@@ -267,7 +267,9 @@ fn configure_cors(config: HttpCorsConfig) -> Result<CorsLayer, IggyError> {
                 .filter(|s| !s.trim().is_empty())
                 .map(|s| {
                     s.parse()
-                        .with_error(|e| format!("Invalid CORS origin '{s}': {e}"))
+                        .error(|e: &axum::http::header::InvalidHeaderValue| {
+                            format!("Invalid CORS origin '{s}': {e}")
+                        })
                         .map_err(|_| IggyError::InvalidConfiguration)
                 })
                 .collect();
@@ -281,7 +283,9 @@ fn configure_cors(config: HttpCorsConfig) -> Result<CorsLayer, IggyError> {
         .filter(|s| !s.trim().is_empty())
         .map(|s| {
             s.parse()
-                .with_error(|e| format!("Invalid CORS header '{s}': {e}"))
+                .error(|e: &axum::http::header::InvalidHeaderName| {
+                    format!("Invalid CORS header '{s}': {e}")
+                })
                 .map_err(|_| IggyError::InvalidConfiguration)
         })
         .collect();
@@ -293,7 +297,9 @@ fn configure_cors(config: HttpCorsConfig) -> Result<CorsLayer, IggyError> {
         .filter(|s| !s.trim().is_empty())
         .map(|s| {
             s.parse()
-                .with_error(|e| format!("Invalid CORS exposed header '{s}': {e}"))
+                .error(|e: &axum::http::header::InvalidHeaderName| {
+                    format!("Invalid CORS exposed header '{s}': {e}")
+                })
                 .map_err(|_| IggyError::InvalidConfiguration)
         })
         .collect();
@@ -314,7 +320,7 @@ fn configure_cors(config: HttpCorsConfig) -> Result<CorsLayer, IggyError> {
             "PATCH" => Ok(Method::PATCH),
             "TRACE" => Ok(Method::TRACE),
             _ => Err(IggyError::InvalidConfiguration)
-                .with_error(|_| format!("Invalid HTTP method in CORS config: '{s}'")),
+                .error(|_: &IggyError| format!("Invalid HTTP method in CORS config: '{s}'")),
         })
         .collect();
     let allowed_methods = allowed_methods?;

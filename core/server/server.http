@@ -43,10 +43,28 @@ GET {{url}}
 GET {{url}}/ping
 
 ###
+POST {{url}}/users/login
+Content-Type: application/json
+
+{
+  "username": "{{root_username}}",
+  "password": "{{root_password}}"
+}
+
+###
+POST {{url}}/personal-access-tokens/login
+Content-Type: application/json
+
+{
+  "token": "{{pat_raw_token}}"
+}
+
+###
 GET {{url}}/metrics
 
 ###
 GET {{url}}/stats
+Authorization: Bearer {{access_token}}
 
 ###
 GET {{url}}/cluster/metadata
@@ -59,16 +77,6 @@ Authorization: Bearer {{access_token}}
 ###
 GET {{url}}/clients/{{client_id}}
 Authorization: Bearer {{access_token}}
-
-
-###
-POST {{url}}/users/login
-Content-Type: application/json
-
-{
-  "username": "{{root_username}}",
-  "password": "{{root_password}}"
-}
 
 ###
 POST {{url}}/users/refresh-token
@@ -183,12 +191,7 @@ Content-Type: application/json
 }
 
 ###
-POST {{url}}/personal-access-tokens/login
-Content-Type: application/json
 
-{
-  "token": "{{pat_raw_token}}"
-}
 
 ###
 DELETE {{url}}/personal-access-tokens/{{pat_name}}

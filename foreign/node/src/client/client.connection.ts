@@ -27,15 +27,33 @@ import { serializeCommand } from './client.utils.js';
 import { debug } from './client.debug.js';
 
 
+/**
+ * Creates a TCP socket connection.
+ *
+ * @param options - TCP connection options
+ * @returns TCP socket
+ */
 const createTcpSocket = (options: TcpOption): Socket => {
   return createConnection(options);
 };
 
+/**
+ * Creates a TLS socket connection.
+ *
+ * @param options - TLS connection options including port
+ * @returns TLS socket
+ */
 const createTlsSocket = ({ port, ...options }: TlsOption): Socket => {
   const socket = TLSConnect(port, options);
   return socket;
 };
 
+/**
+ * Creates a socket based on the transport type in the configuration.
+ *
+ * @param config - Client configuration with transport type
+ * @returns Socket for the specified transport
+ */
 const getTransport = (config: ClientConfig): Socket => {
   const { transport, options } = config;
   switch (transport) {
@@ -46,12 +64,24 @@ const getTransport = (config: ClientConfig): Socket => {
   }
 };
 
+/**
+ * Default reconnection settings.
+ * Attempts reconnection every 5 seconds, up to 12 times.
+ */
 const DefaultReconnectOption: ReconnectOption = {
   enabled: true,
   interval: 5 * 1000,
   maxRetries: 12
 }
 
+/**
+ * Recreates a socket after a delay.
+ * Used for reconnection attempts.
+ *
+ * @param option - Client configuration
+ * @param timer - Delay in milliseconds before recreating
+ * @returns Promise resolving to a new socket
+ */
 function recreate(option: ClientConfig, timer = 1000): Promise<Socket> {
   return new Promise((resolve) => {
     setTimeout(() => {
@@ -60,21 +90,40 @@ function recreate(option: ClientConfig, timer = 1000): Promise<Socket> {
   });
 }
 
+/** Socket error with optional error code */
 type SocketError = Error & { code?: string };
 
+/**
+ * Manages the low-level TCP/TLS connection to the Iggy server.
+ * Handles connection lifecycle, reconnection, and data buffering.
+ */
 export class IggyConnection extends EventEmitter {
+  /** Client configuration */
   public config: ClientConfig
+  /** Underlying socket connection */
   public socket: Socket;
 
+  /** Whether the connection is established */
   public connected: boolean;
+  /** Whether a connection attempt is in progress */
   public connecting: boolean;
+  /** Whether the connection is being intentionally closed */
   public ending: boolean;
+  /** Whether waiting for more data to complete a response */
   private waitingResponseEnd: boolean;
+  /** Reconnection configuration */
   private reconnectOption: ReconnectOption;
+  /** Number of reconnection attempts made */
   private reconnectCount: number;
 
+  /** Buffer for incomplete response data */
   private readBuffers: Buffer;
 
+  /**
+   * Creates a new IggyConnection.
+   *
+   * @param config - Client configuration
+   */
   constructor(config: ClientConfig) {
     super();
     this.config = config;
@@ -88,6 +137,12 @@ export class IggyConnection extends EventEmitter {
     this.readBuffers = Buffer.allocUnsafe(0);
   }
 
+  /**
+   * Establishes the connection to the server.
+   * Sets up event handlers for data, errors, and disconnection.
+   *
+   * @returns Promise that resolves when connected
+   */
   connect() {
     this.connecting = true;
 
@@ -122,6 +177,12 @@ export class IggyConnection extends EventEmitter {
     });
   }
 
+  /**
+   * Attempts to reconnect to the server.
+   * Respects maxRetries limit and emits error when exceeded.
+   *
+   * @param err - Optional error that triggered the reconnection
+   */
   async reconnect(err?: Error) {
     const { enabled, interval, maxRetries } = this.reconnectOption
     debug(
@@ -149,16 +210,28 @@ export class IggyConnection extends EventEmitter {
     this.connect();
   }
 
+  /**
+   * Destroys the connection and marks it as ending.
+   */
   _destroy() {
     this.ending = true;
     this.socket.destroy();
   }
 
+  /**
+   * Clears the response buffer and resets the waiting state.
+   */
   _endResponseWait() {
     this.readBuffers = Buffer.allocUnsafe(0);
     this.waitingResponseEnd = false;
   }
 
+  /**
+   * Handles incoming data from the socket.
+   * Buffers incomplete responses and emits complete ones.
+   *
+   * @param data - Incoming data buffer
+   */
   _onData(data: Buffer) {
     debug(
       'ONDATA',
@@ -211,6 +284,13 @@ export class IggyConnection extends EventEmitter {
     this._endResponseWait();
   }
 
+  /**
+   * Writes a command to the socket.
+   *
+   * @param command - Command code
+   * @param payload - Command payload
+   * @returns True if the write was successful
+   */
   writeCommand(command: number, payload: Buffer): boolean {
     const cmd = serializeCommand(command, payload);
     return this.socket.write(cmd);

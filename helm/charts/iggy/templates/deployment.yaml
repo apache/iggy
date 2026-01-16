@@ -93,7 +93,7 @@ spec:
             {{ end }}
           volumeMounts:
             - name: iggy-server-data
-              mountPath: /local_data
+              mountPath: /app/local_data
               subPath: {{ ternary "root" (printf "%s/root" .Values.server.persistence.subPath) (empty .Values.server.persistence.subPath) }}
 
           livenessProbe:

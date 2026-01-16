@@ -49,6 +49,7 @@ impl ServerCommandHandler for UpdateUser {
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
+        shard.ensure_authenticated(session)?;
 
         let user =shard
                 .update_user(
@@ -57,9 +58,9 @@ impl ServerCommandHandler for UpdateUser {
                     self.username.clone(),
                     self.status,
                 )
-                .with_error(|error| {
+                .error(|e: &IggyError| {
                     format!(
-                        "{COMPONENT} (error: {error}) - failed to update user with user_id: {}, session: {session}",
+                        "{COMPONENT} (error: {e}) - failed to update user with user_id: {}, session: {session}",
                         self.user_id
                     )
                 })?;
@@ -78,9 +79,9 @@ impl ServerCommandHandler for UpdateUser {
             .state
             .apply(session.get_user_id(), &EntryCommand::UpdateUser(self))
             .await
-            .with_error(|error| {
+            .error(|e: &IggyError| {
                 format!(
-                    "{COMPONENT} (error: {error}) - failed to apply update user with user_id: {user_id}, session: {session}"
+                    "{COMPONENT} (error: {e}) - failed to apply update user with user_id: {user_id}, session: {session}"
                 )
             })?;
         sender.send_empty_ok_response().await?;

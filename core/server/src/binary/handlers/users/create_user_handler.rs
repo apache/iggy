@@ -54,6 +54,7 @@ impl ServerCommandHandler for CreateUser {
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
+        shard.ensure_authenticated(session)?;
 
         let request = ShardRequest {
             stream_id: Identifier::default(),
@@ -83,9 +84,9 @@ impl ServerCommandHandler for CreateUser {
                     let _user_guard = shard.fs_locks.user_lock.lock().await;
                     let user = shard
                         .create_user(session, &username, &password, status, permissions.clone())
-                        .with_error(|error| {
+                        .error(|e: &IggyError| {
                             format!(
-                                "{COMPONENT} (error: {error}) - failed to create user with name: {}, session: {}",
+                                "{COMPONENT} (error: {e}) - failed to create user with name: {}, session: {}",
                                 username, session
                             )
                         })?;
@@ -118,9 +119,9 @@ impl ServerCommandHandler for CreateUser {
                             }),
                         )
                         .await
-                        .with_error(|error| {
+                        .error(|e: &IggyError| {
                             format!(
-                                "{COMPONENT} (error: {error}) - failed to apply create user with name: {}, session: {session}",
+                                "{COMPONENT} (error: {e}) - failed to apply create user with name: {}, session: {session}",
                                 self.username
                             )
                         })?;
@@ -152,9 +153,9 @@ impl ServerCommandHandler for CreateUser {
                             }),
                         )
                         .await
-                        .with_error(|error| {
+                        .error(|e: &IggyError| {
                             format!(
-                                "{COMPONENT} (error: {error}) - failed to apply create user for user_id: {user_id}, session: {session}"
+                                "{COMPONENT} (error: {e}) - failed to apply create user for user_id: {user_id}, session: {session}"
                             )
                         })?;
 

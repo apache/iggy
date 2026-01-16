@@ -84,7 +84,7 @@ pub async fn start(
     let listener = create_listener(addr, config)
         .await
         .map_err(|_| IggyError::CannotBindToSocket(addr.to_string()))
-        .with_error(|err| {
+        .error(|err: &IggyError| {
             format!("Failed to bind {server_name} server to address: {addr}, {err}")
         })?;
     let actual_addr = listener.local_addr().map_err(|e| {

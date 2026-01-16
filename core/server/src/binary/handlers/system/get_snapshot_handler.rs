@@ -42,6 +42,7 @@ impl ServerCommandHandler for GetSnapshot {
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
+        shard.ensure_authenticated(session)?;
 
         let snapshot = shard
             .get_snapshot(session, self.compression, &self.snapshot_types)

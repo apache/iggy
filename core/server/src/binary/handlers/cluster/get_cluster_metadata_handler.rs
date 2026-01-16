@@ -44,6 +44,7 @@ impl ServerCommandHandler for GetClusterMetadata {
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
+        shard.ensure_authenticated(session)?;
 
         let cluster_metadata = shard.get_cluster_metadata(session)?;
 

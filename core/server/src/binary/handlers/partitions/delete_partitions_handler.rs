@@ -47,6 +47,7 @@ impl ServerCommandHandler for DeletePartitions {
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
+        shard.ensure_authenticated(session)?;
         let stream_id = self.stream_id.clone();
         let topic_id = self.topic_id.clone();
 
@@ -87,9 +88,9 @@ impl ServerCommandHandler for DeletePartitions {
             &EntryCommand::DeletePartitions(self),
         )
         .await
-        .with_error(|error| {
+        .error(|e: &IggyError| {
             format!(
-                "{COMPONENT} (error: {error}) - failed to apply delete partitions for stream_id: {stream_id}, topic_id: {topic_id}, session: {session}"
+                "{COMPONENT} (error: {e}) - failed to apply delete partitions for stream_id: {stream_id}, topic_id: {topic_id}, session: {session}"
             )
         })?;
         sender.send_empty_ok_response().await?;

@@ -245,6 +245,17 @@ components:
       - "bdd/scenarios/**"
     tasks: ["bdd-csharp"]
 
+  bdd-java:
+    depends_on:
+      - "rust-server"
+      - "rust-sdk" # All SDKs depend on core SDK changes
+      - "sdk-java"
+      - "ci-infrastructure"
+    paths:
+      - "bdd/java/**"
+      - "bdd/scenarios/**"
+    tasks: ["bdd-java"]
+
   examples-suite:
     depends_on:
       - "rust-sdk"

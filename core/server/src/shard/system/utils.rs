@@ -133,6 +133,11 @@ impl IggyShard {
                 )))
             }
             ConsumerKind::ConsumerGroup => {
+                // Client may have been removed by heartbeat verifier while request was in-flight
+                if self.client_manager.try_get_client(client_id).is_none() {
+                    return Err(IggyError::StaleClient);
+                }
+
                 self.ensure_consumer_group_exists(stream_id, topic_id, &consumer.id)?;
                 let cg_id = self.streams.with_consumer_group_by_id(
                     stream_id,
@@ -146,6 +151,10 @@ impl IggyShard {
                     &consumer.id,
                     topics::helpers::get_consumer_group_member_id(client_id),
                 ) else {
+                    // Client might have been removed between check above and here
+                    if self.client_manager.try_get_client(client_id).is_none() {
+                        return Err(IggyError::StaleClient);
+                    }
                     return Err(IggyError::ConsumerGroupMemberNotFound(
                         client_id,
                         consumer.id.clone(),

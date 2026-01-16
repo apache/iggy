@@ -53,6 +53,7 @@ impl ServerCommandHandler for DeleteUser {
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
+        shard.ensure_authenticated(session)?;
 
         let request = ShardRequest {
             stream_id: Identifier::default(),
@@ -73,9 +74,9 @@ impl ServerCommandHandler for DeleteUser {
                     let _user_guard = shard.fs_locks.user_lock.lock().await;
                     let user = shard
                         .delete_user(session, &user_id)
-                        .with_error(|error| {
+                        .error(|e: &IggyError| {
                         format!(
-                            "{COMPONENT} (error: {error}) - failed to delete user with ID: {}, session: {session}",
+                            "{COMPONENT} (error: {e}) - failed to delete user with ID: {}, session: {session}",
                             user_id
                         )
                     })?;
@@ -88,9 +89,9 @@ impl ServerCommandHandler for DeleteUser {
                         .state
                         .apply(user.id, &EntryCommand::DeleteUser(DeleteUser { user_id: user.id.try_into().unwrap() }))
                         .await
-                        .with_error(|error| {
+                        .error(|e: &IggyError| {
                             format!(
-                                "{COMPONENT} (error: {error}) - failed to apply delete user with ID: {user_id}, session: {session}",
+                                "{COMPONENT} (error: {e}) - failed to apply delete user with ID: {user_id}, session: {session}",
                                 user_id = user.id,
                                 session = session
                             )
@@ -104,9 +105,9 @@ impl ServerCommandHandler for DeleteUser {
                         .state
                         .apply(user.id, &EntryCommand::DeleteUser(DeleteUser { user_id: user.id.try_into().unwrap() }))
                         .await
-                        .with_error(|error| {
+                        .error(|e: &IggyError| {
                             format!(
-                                "{COMPONENT} (error: {error}) - failed to apply delete user with ID: {user_id}, session: {session}",
+                                "{COMPONENT} (error: {e}) - failed to apply delete user with ID: {user_id}, session: {session}",
                                 user_id = user.id,
                                 session = session
                             )

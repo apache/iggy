@@ -20,11 +20,11 @@ use crate::http::jwt::json_web_token::GeneratedToken;
 use crate::slab::Keyed;
 use crate::slab::traits_ext::{EntityComponentSystem, IntoComponents};
 use crate::streaming::clients::client_manager::Client;
-use crate::streaming::personal_access_tokens::personal_access_token::PersonalAccessToken;
 use crate::streaming::stats::TopicStats;
 use crate::streaming::topics::consumer_group::{ConsumerGroupMembers, ConsumerGroupRoot};
 use crate::streaming::topics::topic::TopicRoot;
 use crate::streaming::users::user::User;
+use iggy_common::PersonalAccessToken;
 use iggy_common::{ConsumerGroupDetails, ConsumerGroupInfo, ConsumerGroupMember, IggyByteSize};
 use iggy_common::{IdentityInfo, PersonalAccessTokenInfo, TokenInfo, TopicDetails};
 use iggy_common::{UserInfo, UserInfoDetails};
@@ -138,7 +138,7 @@ pub fn map_personal_access_tokens(
     let mut personal_access_tokens_data = Vec::with_capacity(personal_access_tokens.len());
     for personal_access_token in personal_access_tokens {
         let personal_access_token = PersonalAccessTokenInfo {
-            name: personal_access_token.name.as_str().to_owned(),
+            name: (*personal_access_token.name).to_owned(),
             expiry_at: personal_access_token.expiry_at,
         };
         personal_access_tokens_data.push(personal_access_token);
