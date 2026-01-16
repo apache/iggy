@@ -20,56 +20,42 @@ pub mod mux;
 pub mod stream;
 pub mod user;
 
-use std::{cell::UnsafeCell, default};
-
-use iggy_common::Stream;
-
-use crate::stm::{
-    stream::{Streams, StreamsInner},
-    user::{Users, UsersInner},
-};
-
-// ============================================================================
-// WriteCell - Interior mutability wrapper for WriteHandle
-// ============================================================================
+use left_right::*;
+use std::cell::UnsafeCell;
+use std::sync::Arc;
 
 pub struct WriteCell<T, O>
 where
-    T: left_right::Absorb<O>,
+    T: Absorb<O>,
 {
-    inner: UnsafeCell<left_right::WriteHandle<T, O>>,
+    inner: UnsafeCell<WriteHandle<T, O>>,
 }
 
 impl<T, O> WriteCell<T, O>
 where
-    T: left_right::Absorb<O>,
+    T: Absorb<O>,
 {
-    pub fn new(write: left_right::WriteHandle<T, O>) -> Self {
+    pub fn new(write: WriteHandle<T, O>) -> Self {
         Self {
             inner: UnsafeCell::new(write),
         }
     }
 
     pub fn apply(&self, cmd: O) {
-        // SAFETY: This method is called from the `Inner` struct of the `State` wrapper, we cover it beind an `Option`
-        // where only one shard owns the `Some` type, thus all of the accesses are single-threaded.
-        unsafe {
-            (*self.inner.get()).append(cmd).publish();
-        }
+        let hdl = unsafe {
+            self.inner
+                .get()
+                .as_mut()
+                .expect("[apply]: called on uninit writer, for cmd: {cmd}")
+        };
+        hdl.append(cmd).publish();
     }
 }
 
-impl<T, O> std::fmt::Debug for WriteCell<T, O>
-where
-    T: left_right::Absorb<O> + std::fmt::Debug,
-{
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // SAFETY: Only reading for debug purposes
-        unsafe { (*self.inner.get()).fmt(f) }
-    }
+pub trait Container {
+    type Inner;
 }
 
-/// Parses input into a command.
 pub trait Command {
     type Cmd;
     type Input;
@@ -77,36 +63,86 @@ pub trait Command {
     fn into_command(input: &Self::Input) -> Option<Self::Cmd>;
 }
 
-/// Handles a command to mutate state.
 pub trait Handle: Command {
-    fn handle(&mut self, cmd: &<Self as Command>::Cmd);
+    fn handle(&mut self, cmd: &Self::Cmd);
 }
 
-/// Applies a command through a state wrapper.
-pub trait ApplyState {
-    type Inner: Command;
+pub trait ApplyState: Container {
     type Output;
 
-    fn do_apply(&self, cmd: <Self::Inner as Command>::Cmd) -> Self::Output;
-}
-
-// TODO: Move the factory shiet out of there.
-fn create_factory<S, F>() -> F
-where
-    S: ApplyState,
-    F: Factory<Constructable<S::Inner> = S> + Default,
-{
-    F::default()
-}
-
-pub trait Factory {
-    type Constructable<T>;
-
-    fn finish<T>(&self, inner: impl FnOnce() -> T) -> Self::Constructable<T>
+    fn apply_cmd(&self, cmd: <<Self as Container>::Inner as Command>::Cmd) -> Self::Output
     where
-        T: Into<Self::Constructable<T>>,
-    {
-        inner().into()
+        <Self as Container>::Inner: Command;
+}
+
+pub trait Factory<T> {
+    type Constructable;
+
+    fn create(&self, inner: impl FnOnce() -> T) -> Self::Constructable;
+}
+
+pub struct LeftRight<T, C>
+where
+    T: Absorb<C>,
+{
+    write: Option<WriteCell<T, C>>,
+    read: Arc<ReadHandle<T>>,
+}
+
+impl<T> From<T> for LeftRight<T, <T as Command>::Cmd>
+where
+    T: Absorb<<T as Command>::Cmd> + Clone + Command,
+{
+    fn from(inner: T) -> Self {
+        let (write, read) = {
+            let (w, r) = left_right::new_from_empty(inner);
+            (WriteCell::new(w).into(), r.into())
+        };
+        Self { write, read }
+    }
+}
+
+impl<T, C> LeftRight<T, C>
+where
+    T: Absorb<C>,
+{
+    pub fn read(&self) -> Arc<ReadHandle<T>> {
+        self.read.clone()
+    }
+}
+
+impl<T, C> Container for LeftRight<T, C>
+where
+    T: Absorb<C>,
+{
+    type Inner = T;
+}
+
+impl<T, C> ApplyState for LeftRight<T, C>
+where
+    T: Command<Cmd = C> + Absorb<C>,
+{
+    type Output = ();
+
+    fn apply_cmd(&self, cmd: C) -> Self::Output {
+        self.write
+            .as_ref()
+            .expect("no write handle - not the owner shard")
+            .apply(cmd);
+    }
+}
+
+#[derive(Default)]
+pub struct LeftRightFactory;
+
+impl<T> Factory<T> for LeftRightFactory
+where
+    T: Absorb<<T as Command>::Cmd> + Clone + Command,
+{
+    type Constructable = LeftRight<T, <T as Command>::Cmd>;
+
+    fn create(&self, inner: impl FnOnce() -> T) -> Self::Constructable {
+        LeftRight::new(inner())
     }
 }
 
@@ -116,15 +152,6 @@ pub trait State {
     type Input;
 
     fn apply(&self, input: &Self::Input) -> Option<Self::Output>;
-}
-
-impl<T: ApplyState> State for T {
-    type Output = T::Output;
-    type Input = <T::Inner as Command>::Input;
-
-    fn apply(&self, input: &Self::Input) -> Option<Self::Output> {
-        T::Inner::into_command(input).map(|cmd| self.do_apply(cmd))
-    }
 }
 
 pub trait StateMachine {
