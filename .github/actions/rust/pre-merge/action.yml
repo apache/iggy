@@ -45,7 +45,8 @@ runs:
       uses: ./.github/actions/utils/setup-rust-with-cache
       with:
         cache-targets: false # Only cache registry and git deps, not target dir (sccache handles that)
-        show-stats: true
+        # Only test (most comprehensive) and build-* tasks should save cache
+        save-cache: ${{ inputs.task == 'test' || startsWith(inputs.task, 'build-') }}
 
     - name: Install tools for specific tasks
       run: |
@@ -125,14 +126,6 @@ runs:
         echo "Test time:  ${test_duration}s ($(date -ud @${test_duration} +'%M:%S'))"
         echo "Total time: $((build_duration + test_duration))s ($(date -ud @$((build_duration + test_duration)) +'%M:%S'))"
         echo "========================================="
-
-        if command -v sccache &> /dev/null; then
-          echo ""
-          echo "========================================="
-          echo "sccache statistics:"
-          echo "========================================="
-          sccache --show-stats
-        fi
       shell: bash
 
     - name: Backwards compatibility check
@@ -172,4 +165,15 @@ runs:
     - name: Build macOS aarch64
       if: inputs.task == 'build-macos-aarch64'
       run: cargo build --locked --all-targets
+      shell: bash
+
+    - name: Show sccache statistics
+      if: always()
+      run: |
+        if command -v sccache &> /dev/null; then
+          echo "========================================="
+          echo "sccache statistics:"
+          echo "========================================="
+          sccache --show-stats
+        fi
       shell: bash
