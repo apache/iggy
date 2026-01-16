@@ -57,7 +57,7 @@ use crate::{
 };
 use ahash::AHashMap;
 use err_trail::ErrContext;
-use iggy_common::{Identifier, IggyError, IggyTimestamp, PollingKind};
+use iggy_common::{Identifier, IggyError, IggyMessagesBatch, IggyTimestamp, PollingKind};
 use slab::Slab;
 use std::{
     cell::RefCell,
@@ -737,23 +737,48 @@ impl Streams {
         count: u32,
         segment_start_offset: u64,
     ) -> Result<IggyMessagesBatchSet, IggyError> {
-        let (is_journal_empty, journal_first_offset, journal_last_offset) = self
-            .with_partition_by_id(
-                stream_id,
-                topic_id,
-                partition_id,
-                |(_, _, _, _, _, _, log)| {
-                    let journal = log.journal();
-                    (
-                        journal.is_empty(),
-                        journal.inner().base_offset,
-                        journal.inner().current_offset,
-                    )
-                },
-            );
+        let (
+            is_journal_empty,
+            journal_first_offset,
+            journal_last_offset,
+            in_flight_empty,
+            in_flight_first,
+            in_flight_last,
+        ) = self.with_partition_by_id(
+            stream_id,
+            topic_id,
+            partition_id,
+            |(_, _, _, _, _, _, log)| {
+                let journal = log.journal();
+                let in_flight = log.in_flight();
+                (
+                    journal.is_empty(),
+                    journal.inner().base_offset,
+                    journal.inner().current_offset,
+                    in_flight.is_empty(),
+                    in_flight.first_offset(),
+                    in_flight.last_offset(),
+                )
+            },
+        );
 
-        // Case 0: Accumulator is empty, so all messages have to be on disk
+        // Case 0: Journal is empty, check in-flight buffer or disk
         if is_journal_empty {
+            if !in_flight_empty && offset >= in_flight_first && offset <= in_flight_last {
+                let mut result = IggyMessagesBatchSet::empty();
+                let in_flight_batches = self.with_partition_by_id(
+                    stream_id,
+                    topic_id,
+                    partition_id,
+                    |(_, _, _, _, _, _, log)| log.in_flight().get_by_offset(offset, count).to_vec(),
+                );
+                if !in_flight_batches.is_empty() {
+                    result.add_immutable_batches(&in_flight_batches);
+                    let final_result = result.get_by_offset(offset, count);
+                    return Ok(final_result);
+                }
+            }
+
             return self
                 .load_messages_from_disk_by_offset(
                     stream_id,
@@ -1297,7 +1322,7 @@ impl Streams {
         stream_id: &Identifier,
         topic_id: &Identifier,
         partition_id: usize,
-        batches: IggyMessagesBatchSet,
+        mut batches: IggyMessagesBatchSet,
         config: &SystemConfig,
     ) -> Result<u32, IggyError> {
         let batch_count = batches.count();
@@ -1316,7 +1341,12 @@ impl Streams {
             return Ok(0);
         }
 
-        // Extract storage before async operations
+        // Store frozen batches in in-flight buffer for reads during async I/O
+        let frozen: Vec<IggyMessagesBatch> = batches.iter_mut().map(|b| b.freeze()).collect();
+        self.with_partition_by_id_mut(stream_id, topic_id, partition_id, |(.., log)| {
+            log.set_in_flight(frozen.clone());
+        });
+
         let (messages_writer, index_writer) =
             self.with_partition_by_id(stream_id, topic_id, partition_id, |(.., log)| {
                 (
@@ -1336,7 +1366,7 @@ impl Streams {
 
         let saved = messages_writer
             .as_ref()
-            .save_batch_set(batches)
+            .save_frozen_batches(&frozen)
             .await
             .error(|e: &IggyError| {
                 format!(
@@ -1375,6 +1405,10 @@ impl Streams {
             partition_id,
             streaming_partitions::helpers::update_index_and_increment_stats(saved, config),
         );
+
+        self.with_partition_by_id_mut(stream_id, topic_id, partition_id, |(.., log)| {
+            log.clear_in_flight();
+        });
 
         drop(guard);
         Ok(batch_count)

@@ -15,13 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use err_trail::ErrContext;
-use iggy_common::{ConsumerOffsetInfo, Identifier, IggyByteSize, IggyError};
-use std::{
-    ops::AsyncFnOnce,
-    sync::{Arc, atomic::Ordering},
-};
-
 use crate::{
     configs::{cache_indexes::CacheIndexesConfig, system::SystemConfig},
     slab::{
@@ -41,6 +34,12 @@ use crate::{
         polling_consumer::ConsumerGroupId,
         segments::{IggyIndexesMut, IggyMessagesBatchMut, IggyMessagesBatchSet, storage::Storage},
     },
+};
+use err_trail::ErrContext;
+use iggy_common::{ConsumerOffsetInfo, Identifier, IggyByteSize, IggyError};
+use std::{
+    ops::AsyncFnOnce,
+    sync::{Arc, atomic::Ordering},
 };
 
 pub fn get_partition_ids() -> impl FnOnce(&Partitions) -> Vec<usize> {
