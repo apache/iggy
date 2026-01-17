@@ -55,9 +55,11 @@ rmcp = { version = "0.12.0", features = [
     "transport-streamable-http-client",
     "transport-streamable-http-client-reqwest",
 ] }
+serde = { workspace = true }
 serde_json = { workspace = true }
 serial_test = { workspace = true }
 server = { workspace = true }
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "chrono"] }
 strum = { workspace = true }
 strum_macros = { workspace = true }
 tempfile = { workspace = true }
