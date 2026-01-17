@@ -52,7 +52,7 @@ cdc_backend = "builtin"
 ## Configuration Options
 
 | Option | Type | Default | Description |
-|--------|------|---------|-------------|
+| ------ | ---- | ------- | ----------- |
 | `connection_string` | string | required | PostgreSQL connection string |
 | `mode` | string | required | `polling` or `cdc` |
 | `tables` | array | required | List of tables to monitor |
@@ -105,7 +105,7 @@ The stream config should use `schema = "json"`.
 When `payload_column` is set, the connector extracts that column directly as the Iggy message payload. The `payload_format` option determines how the column is read:
 
 | Format | Column Type | Schema | Description |
-|--------|-------------|--------|-------------|
+| ------ | ----------- | ------ | ----------- |
 | `bytea` / `raw` | `BYTEA` | `raw` | Raw bytes passthrough |
 | `text` | `TEXT` | `text` | UTF-8 text |
 | `json_direct` / `jsonb` | `JSONB` | `json` | JSON object serialized to bytes |
@@ -192,7 +192,7 @@ payload_format = "json_direct"
 When using `custom_query`, these placeholders are available:
 
 | Placeholder | Replaced With |
-|-------------|---------------|
+| ----------- | ------------- |
 | `$table` | Current table name |
 | `$offset` | Last processed offset (or `initial_offset`) |
 | `$limit` | `batch_size` value |
@@ -200,11 +200,12 @@ When using `custom_query`, these placeholders are available:
 | `$now_unix` | Current Unix timestamp (seconds) |
 
 Example:
+
 ```sql
-SELECT * FROM $table 
-WHERE created_at > '$offset' 
+SELECT * FROM $table
+WHERE created_at > '$offset'
   AND (scheduled_at IS NULL OR scheduled_at <= '$now')
-ORDER BY created_at 
+ORDER BY created_at
 LIMIT $limit
 ```
 
@@ -231,6 +232,7 @@ primary_key_column = "id"
 ```
 
 Your table needs the boolean column:
+
 ```sql
 ALTER TABLE users ADD COLUMN is_processed BOOLEAN DEFAULT false;
 ```
@@ -242,7 +244,7 @@ When `processed_column` is set, the connector automatically adds a `WHERE is_pro
 The connector handles these PostgreSQL types in JSON mode:
 
 | PostgreSQL Type | JSON Output |
-|-----------------|-------------|
+| --------------- | ----------- |
 | `BOOL` | boolean |
 | `INT2`, `INT4`, `INT8` | number |
 | `FLOAT4`, `FLOAT8` | number |
@@ -362,9 +364,11 @@ All table names, column names, and identifiers are properly quoted to prevent SQ
 The source and sink connectors can work together for pass-through scenarios:
 
 ### Raw Bytes Pass-through
+
 1. **Sink** with `payload_format = "bytea"` stores messages as BYTEA
 2. **Source** with `payload_column = "payload"` and `payload_format = "bytea"` reads them back
 
 ### JSON Pass-through
+
 1. **Sink** with `payload_format = "json"` stores messages as JSONB
 2. **Source** with `payload_column = "payload"` and `payload_format = "json_direct"` reads JSONB directly

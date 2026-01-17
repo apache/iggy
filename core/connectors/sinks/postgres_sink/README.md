@@ -37,7 +37,7 @@ payload_format = "bytea"
 ## Configuration Options
 
 | Option | Type | Default | Description |
-|--------|------|---------|-------------|
+| ------ | ---- | ------- | ----------- |
 | `connection_string` | string | required | PostgreSQL connection string |
 | `target_table` | string | required | Target table name |
 | `batch_size` | u32 | `100` | Messages per insert batch |
@@ -56,7 +56,7 @@ payload_format = "bytea"
 The `payload_format` option determines how the payload is stored in PostgreSQL:
 
 | Format | Column Type | Description |
-|--------|-------------|-------------|
+| ------ | ----------- | ----------- |
 | `bytea` | `BYTEA` | Raw bytes (default). Preserves exact binary content. |
 | `json` / `jsonb` | `JSONB` | Native JSON. Enables JSON queries and indexing. Payload must be valid JSON. |
 | `text` | `TEXT` | UTF-8 text. Payload must be valid UTF-8. |
@@ -80,9 +80,10 @@ payload_format = "json"
 ```
 
 Query example:
+
 ```sql
-SELECT id, payload->>'user_id' as user_id 
-FROM iggy_messages 
+SELECT id, payload->>'user_id' as user_id
+FROM iggy_messages
 WHERE payload->>'status' = 'active';
 
 CREATE INDEX idx_payload_gin ON iggy_messages USING GIN (payload);
@@ -98,6 +99,7 @@ payload_format = "text"
 ```
 
 Query example:
+
 ```sql
 SELECT id, payload FROM iggy_messages WHERE payload LIKE '%error%';
 ```
@@ -221,5 +223,6 @@ The sink can work with the source connector for pass-through scenarios:
 2. **Source** with `payload_column = "payload"` and `payload_format = "bytea"` reads them back
 
 For JSON data:
+
 1. **Sink** with `payload_format = "json"` stores as JSONB
 2. **Source** with `payload_column = "data"` and `payload_format = "json_direct"` reads JSONB directly

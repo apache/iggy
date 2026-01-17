@@ -35,7 +35,7 @@ figlet-rs = { workspace = true }
 figment = { workspace = true }
 iggy = { workspace = true }
 iggy_common = { workspace = true }
-rmcp = { version = "0.12.0", features = [
+rmcp = { version = "0.13.0", features = [
     "server",
     "transport-io",
     "transport-streamable-http-server",
