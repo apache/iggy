@@ -20,8 +20,9 @@ mod messages_reader;
 mod messages_writer;
 
 use super::IggyMessagesBatchSet;
+use bytes::Bytes;
 use compio::{fs::File, io::AsyncWriteAtExt};
-use iggy_common::IggyError;
+use iggy_common::{IggyError, IggyMessagesBatch};
 
 pub use messages_reader::MessagesReader;
 pub use messages_writer::MessagesWriter;
@@ -39,6 +40,26 @@ async fn write_batch(
         .collect::<Vec<_>>();
     let (result, _) = (&*file)
         .write_vectored_all_at(batches, position)
+        .await
+        .into();
+    result.map_err(|_| IggyError::CannotWriteToFile)?;
+    Ok(total_written)
+}
+
+/// Vectored write frozen (immutable) batches to file.
+///
+/// This function writes `IggyMessagesBatch` (immutable, Arc-backed) directly
+/// without transferring ownership. The caller retains the batches for reads
+/// during the async I/O operation.
+pub async fn write_batch_frozen(
+    file: &File,
+    position: u64,
+    batches: &[IggyMessagesBatch],
+) -> Result<usize, IggyError> {
+    let total_written: usize = batches.iter().map(|b| b.size() as usize).sum();
+    let buffers: Vec<Bytes> = batches.iter().map(|b| b.messages_bytes()).collect();
+    let (result, _) = (&*file)
+        .write_vectored_all_at(buffers, position)
         .await
         .into();
     result.map_err(|_| IggyError::CannotWriteToFile)?;

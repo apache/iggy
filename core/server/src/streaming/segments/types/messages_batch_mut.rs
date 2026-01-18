@@ -24,8 +24,8 @@ use bytes::{BufMut, BytesMut};
 use iggy_common::PooledBuffer;
 use iggy_common::{
     BytesSerializable, IGGY_MESSAGE_HEADER_SIZE, INDEX_SIZE, IggyByteSize, IggyError,
-    IggyIndexView, IggyMessage, IggyMessageView, IggyMessageViewIterator, IggyTimestamp,
-    MAX_PAYLOAD_SIZE, MAX_USER_HEADERS_SIZE, Sizeable, Validatable,
+    IggyIndexView, IggyMessage, IggyMessageView, IggyMessageViewIterator, IggyMessagesBatch,
+    IggyTimestamp, MAX_PAYLOAD_SIZE, MAX_USER_HEADERS_SIZE, Sizeable, Validatable,
 };
 use lending_iterator::prelude::*;
 use std::ops::{Deref, Index};
@@ -263,6 +263,18 @@ impl IggyMessagesBatchMut {
         let messages = std::mem::take(&mut self.messages);
 
         (indexes, messages)
+    }
+
+    /// Freezes the batch, converting to an immutable `IggyMessagesBatch`.
+    ///
+    /// The returned batch uses Arc-backed `Bytes`, allowing cheap clones.
+    /// After calling this, the mutable batch becomes empty.
+    pub fn freeze(&mut self) -> IggyMessagesBatch {
+        let count = self.count;
+        let indexes = self.indexes.freeze();
+        let messages = self.messages.freeze();
+        self.count = 0;
+        IggyMessagesBatch::new(indexes, messages, count)
     }
 
     pub fn take_messages(&mut self) -> PooledBuffer {

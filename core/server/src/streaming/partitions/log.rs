@@ -16,16 +16,17 @@
 // under the License.
 
 use crate::streaming::{
-    partitions::journal::Journal,
+    partitions::{in_flight::IggyMessagesBatchSetInFlight, journal::Journal},
     segments::{IggyIndexesMut, Segment, storage::Storage},
 };
-use iggy_common::INDEX_SIZE;
+use iggy_common::{INDEX_SIZE, IggyMessagesBatch};
 use ringbuffer::AllocRingBuffer;
 use std::fmt::Debug;
 
 const SEGMENTS_CAPACITY: usize = 1024;
 const ACCESS_MAP_CAPACITY: usize = 8;
 const SIZE_16MB: usize = 16 * 1024 * 1024;
+
 #[derive(Debug)]
 pub struct SegmentedLog<J>
 where
@@ -39,6 +40,7 @@ where
     segments: Vec<Segment>,
     indexes: Vec<Option<IggyIndexesMut>>,
     storage: Vec<Storage>,
+    in_flight: IggyMessagesBatchSetInFlight,
 }
 
 impl<J> Default for SegmentedLog<J>
@@ -53,6 +55,7 @@ where
             segments: Vec::with_capacity(SEGMENTS_CAPACITY),
             storage: Vec::with_capacity(SEGMENTS_CAPACITY),
             indexes: Vec::with_capacity(SEGMENTS_CAPACITY),
+            in_flight: IggyMessagesBatchSetInFlight::default(),
         }
     }
 }
@@ -156,6 +159,22 @@ where
         if let Some(segment_indexes) = self.indexes.get_mut(segment_index) {
             *segment_indexes = Some(indexes);
         }
+    }
+
+    pub fn in_flight(&self) -> &IggyMessagesBatchSetInFlight {
+        &self.in_flight
+    }
+
+    pub fn in_flight_mut(&mut self) -> &mut IggyMessagesBatchSetInFlight {
+        &mut self.in_flight
+    }
+
+    pub fn set_in_flight(&mut self, batches: Vec<IggyMessagesBatch>) {
+        self.in_flight.set(batches);
+    }
+
+    pub fn clear_in_flight(&mut self) {
+        self.in_flight.clear();
     }
 }
 

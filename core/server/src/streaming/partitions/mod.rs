@@ -18,6 +18,7 @@
 
 pub mod consumer_offset;
 pub mod helpers;
+pub mod in_flight;
 pub mod journal;
 pub mod log;
 pub mod partition;

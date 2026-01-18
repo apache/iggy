@@ -75,8 +75,18 @@ impl IggyMessagesBatch {
         &self.messages
     }
 
+    /// Get the messages as a cloned `Bytes` (cheap Arc increment).
+    pub fn messages_bytes(&self) -> Bytes {
+        self.messages.clone()
+    }
+
     /// Get the indexes slice
     pub fn indexes_slice(&self) -> &[u8] {
+        &self.indexes
+    }
+
+    /// Get a reference to the indexes
+    pub fn indexes(&self) -> &IggyIndexes {
         &self.indexes
     }
 

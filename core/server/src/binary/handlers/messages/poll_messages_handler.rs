@@ -92,7 +92,7 @@ impl ServerCommandHandler for PollMessages {
         let response_length = 4 + 8 + 4 + batch.size();
         let response_length_bytes = response_length.to_le_bytes();
 
-        let mut bufs = Vec::with_capacity(batch.containers_count() + 5);
+        let mut bufs = Vec::with_capacity(batch.containers_count() + 3);
         let mut partition_id_buf = PooledBuffer::with_capacity(4);
         let mut current_offset_buf = PooledBuffer::with_capacity(8);
         let mut count_buf = PooledBuffer::with_capacity(4);
@@ -104,7 +104,9 @@ impl ServerCommandHandler for PollMessages {
         bufs.push(current_offset_buf);
         bufs.push(count_buf);
 
-        batch.iter_mut().for_each(|m| bufs.push(m.take_messages()));
+        batch.iter_mut().for_each(|m| {
+            bufs.push(m.take_messages());
+        });
         trace!(
             "Sending {} messages to client ({} bytes) to client",
             batch.count(),

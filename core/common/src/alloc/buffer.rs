@@ -17,7 +17,7 @@
  */
 
 use super::memory_pool::{BytesMutExt, memory_pool};
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use compio::buf::{IoBuf, IoBufMut, SetBufInit};
 use std::ops::{Deref, DerefMut};
 
@@ -196,6 +196,27 @@ impl PooledBuffer {
     pub fn into_inner(self) -> BytesMut {
         let mut this = std::mem::ManuallyDrop::new(self);
         std::mem::take(&mut this.inner)
+    }
+
+    /// Freezes the buffer, converting it to an immutable `Bytes`.
+    ///
+    /// After calling this method, the PooledBuffer becomes empty and will not
+    /// return memory to the pool on drop (the frozen Bytes owns the allocation).
+    /// The returned `Bytes` is Arc-backed, allowing cheap clones.
+    pub fn freeze(&mut self) -> Bytes {
+        // Decrement pool counter since memory is transferred to Bytes
+        // and won't be returned to the pool.
+        if self.from_pool
+            && let Some(bucket_idx) = self.original_bucket_idx
+        {
+            memory_pool().dec_bucket_in_use(bucket_idx);
+        }
+
+        let inner = std::mem::take(&mut self.inner);
+        self.from_pool = false;
+        self.original_capacity = 0;
+        self.original_bucket_idx = None;
+        inner.freeze()
     }
 }
 
