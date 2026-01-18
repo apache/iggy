@@ -53,7 +53,7 @@ use tracing_subscriber::{
 };
 
 const IGGY_LOG_FILE_PREFIX: &str = "iggy-server.log";
-const MIN_DISK_SPACE_BYTES: u64 = 10 * 1024 * 1024;
+const ONE_HUNDRED_THOUSAND: u64 = 100_000;
 
 // Writer that does nothing
 struct NullWriter;
@@ -275,8 +275,8 @@ impl Logging {
                 return Err(LogError::FileReloadFailure);
             }
 
-            // Check available disk space (at least 10MB)
-            let min_disk_space: u64 = MIN_DISK_SPACE_BYTES;
+            // Check available disk space, at least 10MB
+            let min_disk_space: u64 = ONE_HUNDRED_THOUSAND * 100;
             if let Ok(available_space) = fs2::available_space(&logs_path) {
                 if available_space < min_disk_space {
                     warn!(
@@ -469,15 +469,18 @@ impl Logging {
     fn calculate_max_files(max_total_size_bytes: u64, max_file_size_bytes: u64) -> usize {
         if max_file_size_bytes == 0 {
             // In terms of Iggy's log generation speed, it is
-            // rapid even at the info level.  Maybe we do not
-            // need an option like "unlimited" per log. So if
-            // the user sets it to 0, then let it remain 0 so
+            // pretty rapid when level higher than info.Maybe
+            // we do not need an option like  "unlimited" per
+            // log. So if the user sets it to zero,  then let
+            // it remain zero.
             0
         } else if max_total_size_bytes == 0 {
-            99999 //usize::MAX
+            // If the third attribute of BasicRollingFileAppender::new()
+            // is `usize::MAX` then it would reach iter capability.
+            ONE_HUNDRED_THOUSAND as usize
         } else {
             let max_files = max_total_size_bytes / max_file_size_bytes;
-            max_files.clamp(1, 32768) as usize
+            max_files.clamp(1, ONE_HUNDRED_THOUSAND) as usize
         }
     }
 
