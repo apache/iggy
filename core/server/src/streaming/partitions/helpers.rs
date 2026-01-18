@@ -430,6 +430,29 @@ pub fn append_to_journal(
     }
 }
 
+/// Commit journal and set in-flight buffer with frozen batches.
+/// Returns frozen batches for persisting to disk.
+pub fn commit_journal_with_in_flight()
+-> impl FnOnce(ComponentsById<PartitionRefMut>) -> Vec<iggy_common::IggyMessagesBatch> {
+    |(.., log)| {
+        let mut batches = log.journal_mut().commit();
+        if batches.is_empty() {
+            return Vec::new();
+        }
+        log.ensure_indexes();
+        batches.append_indexes_to(log.active_indexes_mut().unwrap());
+        let frozen: Vec<_> = batches.iter_mut().map(|b| b.freeze()).collect();
+        log.set_in_flight(frozen.clone());
+        frozen
+    }
+}
+
+pub fn clear_in_flight() -> impl FnOnce(ComponentsById<PartitionRefMut>) {
+    |(.., log)| {
+        log.clear_in_flight();
+    }
+}
+
 pub fn commit_journal() -> impl FnOnce(ComponentsById<PartitionRefMut>) -> IggyMessagesBatchSet {
     |(.., log)| {
         let batches = log.journal_mut().commit();
