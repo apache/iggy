@@ -22,6 +22,8 @@ Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "SolutionFolder", "SolutionF
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Iggy_SDK.Tests.BDD", "Iggy_SDK.Tests.BDD\Iggy_SDK.Tests.BDD.csproj", "{91BFFAE1-1252-4061-BF40-C7E7296F82BC}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Iggy_SDK.Tools.ErrorCodeGenerator", "Iggy_SDK.Tools.ErrorCodeGenerator\Iggy_SDK.Tools.ErrorCodeGenerator.csproj", "{B8A3D5E2-7F4C-4A9B-8D1E-2C6F3A8B9D0E}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -52,5 +54,9 @@ Global
 		{91BFFAE1-1252-4061-BF40-C7E7296F82BC}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{91BFFAE1-1252-4061-BF40-C7E7296F82BC}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{91BFFAE1-1252-4061-BF40-C7E7296F82BC}.Release|Any CPU.Build.0 = Release|Any CPU
+		{B8A3D5E2-7F4C-4A9B-8D1E-2C6F3A8B9D0E}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{B8A3D5E2-7F4C-4A9B-8D1E-2C6F3A8B9D0E}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{B8A3D5E2-7F4C-4A9B-8D1E-2C6F3A8B9D0E}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{B8A3D5E2-7F4C-4A9B-8D1E-2C6F3A8B9D0E}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 EndGlobal

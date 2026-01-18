@@ -644,5 +644,4 @@ dotnet test foreign/csharp/Iggy_SDK.Tests.Integration --no-build --verbosity dia
 
 ## ROADMAP - TODO
 
-- [ ] Error handling with status codes and descriptions
 - [ ] Add support for `ASP.NET Core` Dependency Injection
