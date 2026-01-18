@@ -292,9 +292,15 @@ impl Logging {
                 config.max_file_size.as_bytes_u64(),
             );
 
-            let condition = RollingConditionBasic::new()
-                .max_size(config.max_file_size.as_bytes_u64())
-                .hourly();
+            // If max_file_size == 0, then keep interpreting behavior as same
+            // as fn IggyByteSize::as_human_string_with_zero_as_unlimited do.
+            let mut condition_builder = RollingConditionBasic::new();
+            let max_file_size_bytes = config.max_file_size.as_bytes_u64();
+
+            if max_file_size_bytes != 0 {
+                condition_builder = condition_builder.max_size(max_file_size_bytes).hourly();
+            }
+            let condition = condition_builder;
 
             let file_appender = BasicRollingFileAppender::new(
                 logs_path.join(IGGY_LOG_FILE_PREFIX),
@@ -467,17 +473,12 @@ impl Logging {
     }
 
     fn calculate_max_files(max_total_size_bytes: u64, max_file_size_bytes: u64) -> usize {
-        if max_file_size_bytes == 0 {
-            // In terms of Iggy's log generation speed, it is
-            // pretty rapid when level higher than info.Maybe
-            // we do not need an option like  "unlimited" per
-            // log. So if the user sets it to zero,  then let
-            // it remain zero.
-            0
-        } else if max_total_size_bytes == 0 {
+        if max_total_size_bytes == 0 {
             // If the third attribute of BasicRollingFileAppender::new()
             // is `usize::MAX` then it would reach iter capability.
             ONE_HUNDRED_THOUSAND as usize
+        } else if max_file_size_bytes == 0 {
+            1
         } else {
             let max_files = max_total_size_bytes / max_file_size_bytes;
             max_files.clamp(1, ONE_HUNDRED_THOUSAND) as usize
