@@ -196,8 +196,14 @@ impl LocalConnectorsConfigProvider<Created> {
 
                 let created_at: DateTime<Utc> = entry.metadata()?.created()?.into();
                 let connector_id: ConnectorId = (&connector_config).into();
-                match connector_config.clone() {
-                    ConnectorConfig::Sink(sink_config) => {
+                let version = connector_config.version();
+
+                match connector_config {
+                    ConnectorConfig::Sink(mut sink_config) => {
+                        Self::apply_plugin_config_env_overrides(
+                            &mut sink_config.plugin_config,
+                            &base_config,
+                        );
                         sinks.insert(
                             connector_id,
                             SinkConfigFile {
@@ -207,7 +213,11 @@ impl LocalConnectorsConfigProvider<Created> {
                             },
                         );
                     }
-                    ConnectorConfig::Source(source_config) => {
+                    ConnectorConfig::Source(mut source_config) => {
+                        Self::apply_plugin_config_env_overrides(
+                            &mut source_config.plugin_config,
+                            &base_config,
+                        );
                         sources.insert(
                             connector_id,
                             SourceConfigFile {
@@ -222,7 +232,7 @@ impl LocalConnectorsConfigProvider<Created> {
                 debug!(
                     "Loaded connector configuration with key {}, version {}, created at {}",
                     base_config.key(),
-                    connector_config.version(),
+                    version,
                     created_at.to_rfc3339()
                 );
             }
@@ -298,6 +308,31 @@ impl<S: ProviderState> LocalConnectorsConfigProvider<S> {
                 err.message()
             ))
         })
+    }
+
+    fn apply_plugin_config_env_overrides(
+        plugin_config: &mut Option<serde_json::Value>,
+        base_config: &BaseConnectorConfig,
+    ) {
+        let connector_type = base_config.connector_type().to_uppercase();
+        let key = base_config.key().to_uppercase();
+        let prefix = format!("IGGY_CONNECTORS_{connector_type}_{key}_PLUGIN_CONFIG_");
+
+        for (env_key, env_value) in std::env::vars() {
+            let env_key_upper = env_key.to_uppercase();
+            if !env_key_upper.starts_with(&prefix) {
+                continue;
+            }
+
+            let field_path = &env_key_upper[prefix.len()..];
+            let field_name = field_path.to_lowercase();
+            let parsed_value = iggy_common::parse_env_value_to_json(&env_value);
+
+            let config = plugin_config.get_or_insert_with(|| serde_json::json!({}));
+            if let serde_json::Value::Object(map) = config {
+                map.insert(field_name, parsed_value);
+            }
+        }
     }
 }
 

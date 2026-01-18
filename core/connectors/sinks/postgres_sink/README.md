@@ -1,45 +1,112 @@
 # PostgreSQL Sink Connector
 
-The PostgreSQL sink connector allows you to consume messages from Iggy topics and store them in PostgreSQL databases.
+The PostgreSQL sink connector consumes messages from Iggy topics and stores them in PostgreSQL databases. Supports multiple payload storage formats including BYTEA, JSONB, and TEXT.
 
 ## Features
 
-- **Automatic Table Creation**: Optionally create tables automatically
-- **Batch Processing**: Insert messages in configurable batches for performance
+- **Flexible Payload Storage**: Store payloads as BYTEA (raw bytes), JSONB, or TEXT
+- **Automatic Table Creation**: Optionally create the target table on startup
 - **Metadata Storage**: Store Iggy message metadata (offset, timestamp, topic, etc.)
-- **Raw Payload Storage**: Store original message payload as raw bytes
-- **Flexible Data Handling**: Works with any payload type (JSON, text, binary, protobuf, etc.)
+- **Batch Processing**: Insert messages in configurable batches
 - **Connection Pooling**: Efficient database connection management
+- **Any Payload Type**: Works with JSON, text, binary, protobuf, or any byte format
 
 ## Configuration
 
-```json
-{
-  "connection_string": "postgresql://username:password@localhost:5432/database",
-  "target_table": "iggy_messages",
-  "batch_size": 100,
-  "max_connections": 10,
-  "auto_create_table": true,
-  "include_metadata": true,
-  "include_checksum": true,
-  "include_origin_timestamp": true
-}
+```toml
+[[streams]]
+stream = "user_events"
+topics = ["users", "orders"]
+schema = "json"
+batch_length = 100
+poll_interval = "5ms"
+consumer_group = "postgres_sink"
+
+[plugin_config]
+connection_string = "postgresql://user:pass@localhost:5432/database"
+target_table = "iggy_messages"
+batch_size = 100
+max_connections = 10
+auto_create_table = true
+include_metadata = true
+include_checksum = true
+include_origin_timestamp = true
+payload_format = "bytea"
 ```
 
-### Configuration Options
+## Configuration Options
 
-- `connection_string`: PostgreSQL connection string
-- `target_table`: Name of the table to insert messages into
-- `batch_size`: Number of messages to insert in each batch (default: 100)
-- `max_connections`: Maximum database connections (default: 10)
-- `auto_create_table`: Automatically create the target table if it doesn't exist (default: false)
-- `include_metadata`: Include Iggy metadata columns (default: true)
-- `include_checksum`: Include message checksum (default: true)
-- `include_origin_timestamp`: Include original message timestamp (default: true)
+| Option | Type | Default | Description |
+| ------ | ---- | ------- | ----------- |
+| `connection_string` | string | required | PostgreSQL connection string |
+| `target_table` | string | required | Target table name |
+| `batch_size` | u32 | `100` | Messages per insert batch |
+| `max_connections` | u32 | `10` | Max database connections |
+| `auto_create_table` | bool | `false` | Create table if not exists |
+| `include_metadata` | bool | `true` | Include Iggy metadata columns |
+| `include_checksum` | bool | `true` | Include message checksum |
+| `include_origin_timestamp` | bool | `true` | Include original timestamp |
+| `payload_format` | string | `bytea` | Payload column type: `bytea`, `json`, or `text` |
+| `verbose_logging` | bool | `false` | Log at info level instead of debug |
+| `max_retries` | u32 | `3` | Max retry attempts for transient errors |
+| `retry_delay` | string | `1s` | Base delay between retries (e.g., `500ms`, `2s`) |
+
+## Payload Format
+
+The `payload_format` option determines how the payload is stored in PostgreSQL:
+
+| Format | Column Type | Description |
+| ------ | ----------- | ----------- |
+| `bytea` | `BYTEA` | Raw bytes (default). Preserves exact binary content. |
+| `json` / `jsonb` | `JSONB` | Native JSON. Enables JSON queries and indexing. Payload must be valid JSON. |
+| `text` | `TEXT` | UTF-8 text. Payload must be valid UTF-8. |
+
+### BYTEA (Default)
+
+Stores the exact bytes from the Iggy message. Use for binary data, protobuf, or when you want to preserve the original format.
+
+```toml
+[plugin_config]
+payload_format = "bytea"
+```
+
+### JSONB
+
+Stores payload as native PostgreSQL JSONB. Enables efficient JSON queries and GIN indexing. The incoming message payload must be valid JSON.
+
+```toml
+[plugin_config]
+payload_format = "json"
+```
+
+Query example:
+
+```sql
+SELECT id, payload->>'user_id' as user_id
+FROM iggy_messages
+WHERE payload->>'status' = 'active';
+
+CREATE INDEX idx_payload_gin ON iggy_messages USING GIN (payload);
+```
+
+### TEXT
+
+Stores payload as UTF-8 text. Use for plain text messages or logs.
+
+```toml
+[plugin_config]
+payload_format = "text"
+```
+
+Query example:
+
+```sql
+SELECT id, payload FROM iggy_messages WHERE payload LIKE '%error%';
+```
 
 ## Table Schema
 
-When `auto_create_table` is enabled, the following table structure is created:
+When `auto_create_table` is enabled, the table is created with the appropriate payload column type:
 
 ```sql
 CREATE TABLE iggy_messages (
@@ -51,138 +118,111 @@ CREATE TABLE iggy_messages (
     iggy_partition_id INTEGER,
     iggy_checksum BIGINT,
     iggy_origin_timestamp TIMESTAMP WITH TIME ZONE,
-    payload BYTEA,
+    payload BYTEA,  -- or JSONB or TEXT based on payload_format
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 ```
 
-## Data Storage
+## Performance
 
-The payload is stored as raw bytes in the `payload` column, regardless of the original format:
-
-### JSON Messages
-
-JSON payloads are stored as UTF-8 encoded bytes. You can query them using PostgreSQL's JSON functions:
-
-```sql
-SELECT id, payload::text::jsonb->>'user_id' as user_id 
-FROM iggy_messages 
-WHERE payload::text::jsonb->>'user_id' IS NOT NULL;
-```
-
-### Text Messages
-
-Text payloads are stored as UTF-8 encoded bytes:
-
-```sql
-SELECT id, convert_from(payload, 'UTF8') as message_text
-FROM iggy_messages;
-```
-
-### Binary Messages
-
-Binary data is stored directly as bytes:
-
-```sql
-SELECT id, encode(payload, 'base64') as payload_base64
-FROM iggy_messages;
-```
-
-### Protocol Buffer Messages
-
-Protobuf messages are stored as raw bytes and can be processed by your application:
-
-```sql
-SELECT id, payload, length(payload) as payload_size
-FROM iggy_messages;
-```
-
-## Usage Example
-
-1. Configure the sink connector in your Iggy connectors runtime
-2. Messages consumed from the specified topics will be inserted into PostgreSQL
-3. Query the data using standard SQL:
-
-```sql
--- Get all messages from a specific stream
-SELECT * FROM iggy_messages WHERE iggy_stream = 'user_events';
-
--- Get messages with their payload as text (for text/JSON payloads)
-SELECT id, iggy_offset, convert_from(payload, 'UTF8') as payload_text
-FROM iggy_messages 
-WHERE iggy_stream = 'user_events';
-
--- Get messages from a specific time range
-SELECT * FROM iggy_messages 
-WHERE created_at >= '2024-01-01' 
-AND created_at < '2024-02-01';
-
--- Get payload size statistics
-SELECT 
-    iggy_stream,
-    iggy_topic,
-    COUNT(*) as message_count,
-    AVG(length(payload)) as avg_payload_size,
-    MAX(length(payload)) as max_payload_size
-FROM iggy_messages 
-GROUP BY iggy_stream, iggy_topic;
-```
-
-## Performance Considerations
-
-- Use appropriate `batch_size` for your workload (larger batches = better throughput)
-- Consider creating indexes on frequently queried columns
-- Monitor connection pool usage with `max_connections`
-- Create indexes for efficient queries:
+### Recommended Indexes
 
 ```sql
 CREATE INDEX idx_iggy_messages_stream ON iggy_messages (iggy_stream);
 CREATE INDEX idx_iggy_messages_topic ON iggy_messages (iggy_topic);
-CREATE INDEX idx_iggy_messages_created_at ON iggy_messages (created_at);
 CREATE INDEX idx_iggy_messages_offset ON iggy_messages (iggy_offset);
+CREATE INDEX idx_iggy_messages_created_at ON iggy_messages (created_at);
+
+-- For JSONB payload_format
+CREATE INDEX idx_payload_gin ON iggy_messages USING GIN (payload);
 ```
 
-## Working with Different Payload Types
+### Tuning Tips
 
-### JSON Payloads
+- Increase `batch_size` for higher throughput (larger batches = fewer round trips)
+- Adjust `max_connections` based on PostgreSQL's `max_connections` setting
+- Use `poll_interval` to control how often the sink checks for new messages
+- Use `payload_format = "json"` for JSON data to enable native querying
 
-For JSON data, you can use PostgreSQL's JSON operators:
+## Example Configs
 
-```sql
--- Extract JSON fields (assuming payload is JSON)
-SELECT 
-    id,
-    payload::text::jsonb->>'name' as name,
-    payload::text::jsonb->>'email' as email
-FROM iggy_messages 
-WHERE payload::text::jsonb->>'name' IS NOT NULL;
+### JSON Messages with JSONB Storage
 
--- Create a GIN index for faster JSON queries
-CREATE INDEX idx_iggy_messages_payload_gin ON iggy_messages USING GIN ((payload::text::jsonb));
+```toml
+[[streams]]
+stream = "events"
+topics = ["user_events"]
+schema = "json"
+batch_length = 100
+poll_interval = "10ms"
+consumer_group = "pg_sink"
+
+[plugin_config]
+connection_string = "postgresql://user:pass@localhost:5432/analytics"
+target_table = "events"
+auto_create_table = true
+batch_size = 500
+payload_format = "json"
 ```
 
-### Text Payloads
+### Binary/Raw Messages
 
-For text data, convert bytes to text:
+```toml
+[[streams]]
+stream = "binary_data"
+topics = ["images", "files"]
+schema = "raw"
+batch_length = 50
+poll_interval = "100ms"
+consumer_group = "pg_sink"
 
-```sql
--- Full-text search on text payloads
-SELECT id, convert_from(payload, 'UTF8') as message
-FROM iggy_messages 
-WHERE convert_from(payload, 'UTF8') LIKE '%error%';
+[plugin_config]
+connection_string = "postgresql://user:pass@localhost:5432/storage"
+target_table = "binary_messages"
+auto_create_table = true
+batch_size = 100
+payload_format = "bytea"
 ```
 
-### Binary Payloads
+### Text Logs
 
-For binary data, work with raw bytes or encode as needed:
+```toml
+[[streams]]
+stream = "logs"
+topics = ["app_logs"]
+schema = "text"
+batch_length = 1000
+poll_interval = "5ms"
+consumer_group = "pg_sink"
 
-```sql
--- Get binary payload as hex
-SELECT id, encode(payload, 'hex') as payload_hex
-FROM iggy_messages;
-
--- Get payload size
-SELECT id, length(payload) as payload_size
-FROM iggy_messages
-ORDER BY payload_size DESC;
+[plugin_config]
+connection_string = "postgresql://user:pass@localhost:5432/logs"
+target_table = "log_messages"
+auto_create_table = true
+include_checksum = false
+include_origin_timestamp = false
+batch_size = 1000
+payload_format = "text"
 ```
+
+## Reliability Features
+
+### Automatic Retries
+
+The connector automatically retries transient database errors (connection issues, deadlocks, serialization failures) with exponential backoff. Configure with `max_retries` (default: 3) and `retry_delay` (default: `1s`). The actual delay is `retry_delay * attempt_number`. Non-transient errors fail immediately.
+
+### Connection Pool Management
+
+The connection pool is properly closed when the connector shuts down, ensuring clean resource cleanup.
+
+## Usage with Source Connector
+
+The sink can work with the source connector for pass-through scenarios:
+
+1. **Sink** with `payload_format = "bytea"` stores messages as raw bytes
+2. **Source** with `payload_column = "payload"` and `payload_format = "bytea"` reads them back
+
+For JSON data:
+
+1. **Sink** with `payload_format = "json"` stores as JSONB
+2. **Source** with `payload_column = "data"` and `payload_format = "json_direct"` reads JSONB directly

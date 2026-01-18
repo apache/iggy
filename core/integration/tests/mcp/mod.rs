@@ -701,6 +701,7 @@ impl TestMcpClient {
             .call_tool(CallToolRequestParam {
                 name: method.to_owned().into(),
                 arguments: data.and_then(|value| value.as_object().cloned()),
+                task: None,
             })
             .await
     }
