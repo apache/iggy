@@ -315,19 +315,23 @@ impl IggyShard {
         partition_id: usize,
         fsync: bool,
     ) -> Result<(), IggyError> {
-        let batches = self.streams.with_partition_by_id_mut(
+        let frozen_batches = self.streams.with_partition_by_id_mut(
             stream_id,
             topic_id,
             partition_id,
-            partitions::helpers::commit_journal(),
+            partitions::helpers::commit_journal_with_in_flight(),
         );
 
+        if frozen_batches.is_empty() {
+            return Ok(());
+        }
+
         self.streams
-            .persist_messages_to_disk(
+            .persist_frozen_messages_to_disk(
                 stream_id,
                 topic_id,
                 partition_id,
-                batches,
+                &frozen_batches,
                 &self.config.system,
             )
             .await?;

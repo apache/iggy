@@ -28,15 +28,21 @@ use std::time::{Duration, Instant};
 
 const STREAM_NAME: &str = "eventual-consistency-stream";
 const TOPIC_NAME: &str = "eventual-consistency-topic";
-const TEST_DURATION_SECS: u64 = 10;
 
-/// Test with two separate clients - one for sending, one for polling.
+/// Test that specifically targets the background message_saver race condition.
 ///
-/// This should expose the race condition where messages are in-flight during
-/// disk write and unavailable for polling.
+/// Setup:
+/// - HIGH inline persistence thresholds (messages stay in journal during send)
+/// - SHORT message_saver interval (background flushes happen frequently)
+///
+/// The race occurs when:
+/// 1. Messages are in journal
+/// 2. Background saver calls commit() - journal becomes EMPTY
+/// 3. Background saver starts async disk write
+/// 4. Poll arrives - sees empty journal, data not yet on disk
 #[tokio::test]
 #[parallel]
-async fn should_read_messages_immediately_after_send_with_aggressive_persistence() {
+async fn should_read_messages_during_background_saver_flush() {
     let env_vars = HashMap::from([
         (
             SYSTEM_PATH_ENV_VAR.to_owned(),
@@ -44,16 +50,18 @@ async fn should_read_messages_immediately_after_send_with_aggressive_persistence
         ),
         (
             "IGGY_SYSTEM_PARTITION_MESSAGES_REQUIRED_TO_SAVE".to_owned(),
-            "32".to_owned(),
+            "100000".to_owned(),
         ),
         (
             "IGGY_SYSTEM_PARTITION_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE".to_owned(),
-            "512B".to_owned(),
+            "1GB".to_owned(),
         ),
         (
             "IGGY_SYSTEM_PARTITION_ENFORCE_FSYNC".to_owned(),
             "false".to_owned(),
         ),
+        ("IGGY_MESSAGE_SAVER_INTERVAL".to_owned(), "100ms".to_owned()),
+        ("IGGY_MESSAGE_SAVER_ENABLED".to_owned(), "true".to_owned()),
     ]);
 
     let mut test_server = TestServer::new(Some(env_vars), true, None, IpAddrKind::V4);
@@ -96,21 +104,23 @@ async fn should_read_messages_immediately_after_send_with_aggressive_persistence
     let topic_id = Identifier::named(TOPIC_NAME).unwrap();
     let consumer_kind = Consumer::default();
 
-    let test_duration = Duration::from_secs(TEST_DURATION_SECS);
-    let messages_per_batch = 32u32;
-    let payload = "X".repeat(1024);
+    let test_duration = Duration::from_secs(10);
+    let messages_per_batch = 10u32;
+    let payload = "X".repeat(512);
 
     let start = Instant::now();
     let mut batches_sent = 0u64;
-    let mut messages_sent = 0u64;
+    let mut next_offset = 0u64;
 
     println!(
-        "Starting test: 1KB messages, {} msgs/batch, duration: {}s",
-        messages_per_batch, TEST_DURATION_SECS
+        "Starting background saver race test: {} msgs/batch, duration: {}s",
+        messages_per_batch,
+        test_duration.as_secs()
     );
+    println!("Inline persistence DISABLED (high thresholds), background saver every 100ms");
 
     while start.elapsed() < test_duration {
-        let base_offset = batches_sent * messages_per_batch as u64;
+        let base_offset = next_offset;
 
         let mut messages: Vec<IggyMessage> = (0..messages_per_batch)
             .map(|i| {
@@ -125,68 +135,61 @@ async fn should_read_messages_immediately_after_send_with_aggressive_persistence
             })
             .collect();
 
-        println!("Sending batch {}", batches_sent);
-        let send_result = producer
+        producer
             .send_messages(
                 &stream_id,
                 &topic_id,
                 &Partitioning::partition_id(0),
                 &mut messages,
             )
-            .await;
-        match &send_result {
-            Ok(_) => println!("Batch {} sent successfully", batches_sent),
-            Err(e) => println!("Batch {} send error: {:?}", batches_sent, e),
-        }
-        send_result.unwrap();
+            .await
+            .unwrap();
 
         batches_sent += 1;
-        messages_sent += messages_per_batch as u64;
 
-        println!("Calling poll_messages after batch {}", batches_sent);
         let poll_result = consumer
             .poll_messages(
                 &stream_id,
                 &topic_id,
                 Some(0),
                 &consumer_kind,
-                &PollingStrategy::offset(0),
-                messages_sent as u32,
+                &PollingStrategy::offset(next_offset),
+                messages_per_batch,
                 false,
             )
             .await;
 
         let polled_count = match &poll_result {
-            Ok(polled) => polled.messages.len() as u64,
+            Ok(polled) => polled.messages.len() as u32,
             Err(e) => {
                 println!("Poll error: {:?}", e);
                 0
             }
         };
 
-        if polled_count < messages_sent {
-            let missing = messages_sent - polled_count;
+        if polled_count < messages_per_batch {
+            let missing = messages_per_batch - polled_count;
             let elapsed_ms = start.elapsed().as_millis();
 
             panic!(
-                "RACE CONDITION DETECTED after {:.2}s/{}s ({} batches, {} messages), expected {} messages, got {}. Missing: {}",
+                "RACE CONDITION DETECTED after {:.2}s ({} batches), polled from offset {}, expected {}, got {}. Missing: {}",
                 elapsed_ms as f64 / 1000.0,
-                TEST_DURATION_SECS,
                 batches_sent,
-                messages_sent,
-                messages_sent,
+                next_offset,
+                messages_per_batch,
                 polled_count,
                 missing
             );
         }
 
-        if batches_sent.is_multiple_of(1000) {
+        next_offset += messages_per_batch as u64;
+
+        if batches_sent.is_multiple_of(500) {
             println!(
-                "Progress: {} batches, {} messages, elapsed: {:.2}s/{}s",
+                "Progress: {} batches, {} messages, elapsed: {:.2}s",
                 batches_sent,
-                messages_sent,
+                next_offset,
                 start.elapsed().as_secs_f64(),
-                TEST_DURATION_SECS
             );
         }
     }
