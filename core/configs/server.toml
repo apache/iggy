@@ -363,8 +363,19 @@ level = "info"
 # When enabled, logs are stored in {system.path}/{system.logging.path} (default: local_data/logs).
 file_enabled = true
 
-# Maximum size of the log files before rotation.
-max_size = "512 MB"
+# Maximum size of a single log file before rotation occurs.
+# When a log file reaches this size, it will be rotated (closed and a new file created).
+# This setting works together with max_total_size to control log storage.
+# You can set it to 0 to enable unlimited size of single log.
+max_file_size = "500 MB"
+
+# Maximum total size of all log files combined.
+# When this size is reached, oldest files will be deleted.
+# You can set it to 0 to allow an unlimited number of archived logs.
+max_total_size = "4 GB"
+
+# Time interval for checking log file size and rotation.
+rotation_check_interval = "1 h"
 
 # Time to retain log files before deletion.
 retention = "7 days"
