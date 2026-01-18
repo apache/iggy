@@ -16,9 +16,6 @@
  * under the License.
  */
 
-use std::str::FromStr;
-use std::sync::Arc;
-
 use iggy::prelude::{
     Consumer as RustConsumer, IggyClient as RustIggyClient, IggyMessage as RustMessage,
     PollingStrategy as RustPollingStrategy, *,
@@ -28,6 +25,8 @@ use pyo3::types::{PyDelta, PyList, PyType};
 use pyo3_async_runtimes::tokio::future_into_py;
 use pyo3_stub_gen::define_stub_info_gatherer;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
+use std::str::FromStr;
+use std::sync::Arc;
 
 use crate::consumer::{py_delta_to_iggy_duration, AutoCommit, IggyConsumer};
 use crate::identifier::PyIdentifier;
@@ -314,7 +313,10 @@ impl IggyClient {
             let messages = polled_messages
                 .messages
                 .into_iter()
-                .map(ReceiveMessage::from_rust_message)
+                .map(|m| ReceiveMessage {
+                    inner: m,
+                    partition_id,
+                })
                 .collect::<Vec<_>>();
             Ok(messages)
         })
@@ -340,8 +342,10 @@ impl IggyClient {
         init_retry_interval=None,
         allow_replay=false,
     ))]
-    fn consumer_group(
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[IggyConsumer]", imports=("collections.abc")))]
+    fn consumer_group<'a>(
         &self,
+        py: Python<'a>,
         name: &str,
         stream: &str,
         topic: &str,
@@ -356,7 +360,7 @@ impl IggyClient {
         init_retries: Option<u32>,
         init_retry_interval: Option<Py<PyDelta>>,
         allow_replay: bool,
-    ) -> PyResult<IggyConsumer> {
+    ) -> PyResult<Bound<'a, PyAny>> {
         let mut builder = self
             .inner
             .consumer_group(name, stream, topic)
@@ -412,10 +416,16 @@ impl IggyClient {
         if allow_replay {
             builder = builder.allow_replay()
         }
-        let consumer = builder.build();
+        let mut consumer = builder.build();
 
-        Ok(IggyConsumer {
-            inner: Arc::new(Mutex::new(consumer)),
+        future_into_py(py, async move {
+            consumer
+                .init()
+                .await
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{e:?}")))?;
+            Ok(IggyConsumer {
+                inner: Arc::new(Mutex::new(consumer)),
+            })
         })
     }
 }
