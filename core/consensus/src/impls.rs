@@ -17,7 +17,7 @@
 
 use crate::vsr_timeout::{TimeoutKind, TimeoutManager};
 use crate::{
-    Consensus, DvcQuorumArray, Project, StoredDvc, dvc_count, dvc_max_commit,
+    Consensus, DvcQuorumArray, Pipeline, Project, StoredDvc, dvc_count, dvc_max_commit,
     dvc_quorum_array_empty, dvc_record, dvc_reset, dvc_select_winner,
 };
 use bit_set::BitSet;
@@ -133,18 +133,18 @@ impl RequestEntry {
     }
 }
 
-pub struct Pipeline {
+pub struct LocalPipeline {
     /// Messages being prepared (uncommitted and being replicated).
     prepare_queue: VecDeque<PipelineEntry>,
 }
 
-impl Default for Pipeline {
+impl Default for LocalPipeline {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Pipeline {
+impl LocalPipeline {
     pub fn new() -> Self {
         Self {
             prepare_queue: VecDeque::with_capacity(PIPELINE_PREPARE_QUEUE_MAX),
@@ -322,6 +322,43 @@ impl Pipeline {
     }
 }
 
+impl Pipeline for LocalPipeline {
+    type Message = Message<PrepareHeader>;
+    type Entry = PipelineEntry;
+
+    fn push_prepare(&mut self, message: Self::Message) {
+        LocalPipeline::push_prepare(self, message)
+    }
+
+    fn pop_prepare(&mut self) -> Option<Self::Entry> {
+        LocalPipeline::pop_prepare(self)
+    }
+
+    fn clear(&mut self) {
+        LocalPipeline::clear(self)
+    }
+
+    fn prepare_by_op_mut(&mut self, op: u64) -> Option<&mut Self::Entry> {
+        LocalPipeline::prepare_by_op_mut(self, op)
+    }
+
+    fn prepare_by_op_and_checksum(&mut self, op: u64, checksum: u128) -> Option<&mut Self::Entry> {
+        LocalPipeline::prepare_by_op_and_checksum(self, op, checksum)
+    }
+
+    fn is_full(&self) -> bool {
+        LocalPipeline::is_full(self)
+    }
+
+    fn is_empty(&self) -> bool {
+        LocalPipeline::is_empty(self)
+    }
+
+    fn verify(&self) {
+        LocalPipeline::verify(self)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
     Normal,
@@ -373,7 +410,7 @@ pub struct VsrConsensus {
     last_timestamp: Cell<u64>,
     last_prepare_checksum: Cell<u128>,
 
-    pipeline: RefCell<Pipeline>,
+    pipeline: RefCell<LocalPipeline>,
 
     message_bus: IggyMessageBus,
     // TODO: Add loopback_queue for messages to self
@@ -411,7 +448,7 @@ impl VsrConsensus {
             commit: Cell::new(0),
             last_timestamp: Cell::new(0),
             last_prepare_checksum: Cell::new(0),
-            pipeline: RefCell::new(Pipeline::new()),
+            pipeline: RefCell::new(LocalPipeline::new()),
             message_bus: IggyMessageBus::new(replica_count as usize, replica as u16, 0),
             start_view_change_from_all_replicas: RefCell::new(BitSet::with_capacity(REPLICAS_MAX)),
             do_view_change_from_all_replicas: RefCell::new(dvc_quorum_array_empty()),
@@ -478,11 +515,11 @@ impl VsrConsensus {
         self.status.get()
     }
 
-    pub fn pipeline(&self) -> &RefCell<Pipeline> {
+    pub fn pipeline(&self) -> &RefCell<LocalPipeline> {
         &self.pipeline
     }
 
-    pub fn pipeline_mut(&mut self) -> &mut RefCell<Pipeline> {
+    pub fn pipeline_mut(&mut self) -> &mut RefCell<LocalPipeline> {
         &mut self.pipeline
     }
 
@@ -1094,6 +1131,7 @@ impl Consensus for VsrConsensus {
     type ReplicateMessage = Message<PrepareHeader>;
     type AckMessage = Message<PrepareOkHeader>;
     type Sequencer = LocalSequencer;
+    type Pipeline = LocalPipeline;
 
     fn pipeline_message(&self, message: Self::ReplicateMessage) {
         assert!(self.is_primary(), "only primary can pipeline messages");
