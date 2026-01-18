@@ -35,9 +35,9 @@ use scenarios::{
     authentication_scenario, bench_scenario, consumer_group_auto_commit_reconnection_scenario,
     consumer_group_join_scenario, consumer_group_offset_cleanup_scenario,
     consumer_group_with_multiple_clients_polling_messages_scenario,
-    consumer_group_with_single_client_polling_messages_scenario, consumer_timestamp_polling_scenario,
-    create_message_payload, message_headers_scenario, stream_size_validation_scenario,
-    system_scenario, user_scenario,
+    consumer_group_with_single_client_polling_messages_scenario,
+    consumer_timestamp_polling_scenario, create_message_payload, message_headers_scenario,
+    stream_size_validation_scenario, system_scenario, user_scenario,
 };
 use std::pin::Pin;
 use std::{collections::HashMap, future::Future};

@@ -37,7 +37,7 @@ fn large_batches() -> Vec<u32> {
 }
 
 fn very_large_batches() -> Vec<u32> {
-    vec![500, 1000, 1500, 1000]
+    vec![500, 1000, 1500, 2000]
 }
 
 fn all_batch_patterns() -> Vec<(&'static str, Vec<u32>)> {
