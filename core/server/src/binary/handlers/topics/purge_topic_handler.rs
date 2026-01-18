@@ -46,11 +46,16 @@ impl ServerCommandHandler for PurgeTopic {
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
         shard.ensure_authenticated(session)?;
+        let (stream_id, topic_id) = shard.resolve_topic_id(&self.stream_id, &self.topic_id)?;
+        shard
+            .permissioner
+            .borrow()
+            .purge_topic(session.get_user_id(), stream_id, topic_id)?;
         let topic_id = self.topic_id.clone();
         let stream_id = self.stream_id.clone();
 
         shard
-            .purge_topic(session, &self.stream_id, &self.topic_id)
+            .purge_topic(&self.stream_id, &self.topic_id)
             .await
             .error(|e: &IggyError| {
                 format!(

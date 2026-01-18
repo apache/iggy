@@ -30,9 +30,8 @@ use tracing::{error, info};
 impl IggyShard {
     pub fn get_personal_access_tokens(
         &self,
-        session: &Session,
+        user_id: u32,
     ) -> Result<Vec<PersonalAccessToken>, IggyError> {
-        let user_id = session.get_user_id();
         let user = self.get_user(&user_id.try_into()?).error(|e: &IggyError| {
             format!("{COMPONENT} (error: {e}) - failed to get user with id: {user_id}")
         })?;
@@ -52,11 +51,10 @@ impl IggyShard {
 
     pub fn create_personal_access_token(
         &self,
-        session: &Session,
+        user_id: u32,
         name: &str,
         expiry: IggyExpiry,
     ) -> Result<(PersonalAccessToken, String), IggyError> {
-        let user_id = session.get_user_id();
         let identifier = user_id.try_into()?;
         {
             let user = self.get_user(&identifier).error(|e: &IggyError| {
@@ -124,12 +122,7 @@ impl IggyShard {
         Ok(())
     }
 
-    pub fn delete_personal_access_token(
-        &self,
-        session: &Session,
-        name: &str,
-    ) -> Result<(), IggyError> {
-        let user_id = session.get_user_id();
+    pub fn delete_personal_access_token(&self, user_id: u32, name: &str) -> Result<(), IggyError> {
         self.delete_personal_access_token_base(user_id, name)
     }
 

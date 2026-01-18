@@ -48,6 +48,13 @@ impl ServerCommandHandler for DeletePartitions {
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
         shard.ensure_authenticated(session)?;
+        let (stream_id_numeric, topic_id_numeric) =
+            shard.resolve_topic_id(&self.stream_id, &self.topic_id)?;
+        shard.permissioner.borrow().delete_partitions(
+            session.get_user_id(),
+            stream_id_numeric,
+            topic_id_numeric,
+        )?;
         let stream_id = self.stream_id.clone();
         let topic_id = self.topic_id.clone();
 
@@ -55,12 +62,7 @@ impl ServerCommandHandler for DeletePartitions {
         let _partition_guard = shard.fs_locks.partition_lock.lock().await;
 
         let deleted_partition_ids = shard
-            .delete_partitions(
-                session,
-                &self.stream_id,
-                &self.topic_id,
-                self.partitions_count,
-            )
+            .delete_partitions(&self.stream_id, &self.topic_id, self.partitions_count)
             .await?;
         let event = ShardEvent::DeletedPartitions {
             stream_id: self.stream_id.clone(),

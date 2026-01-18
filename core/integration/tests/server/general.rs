@@ -17,7 +17,7 @@
 
 use crate::server::{
     ScenarioFn, authentication_scenario, bench_scenario, consumer_timestamp_polling_scenario,
-    create_message_payload_scenario, message_headers_scenario, run_scenario,
+    create_message_payload_scenario, message_headers_scenario, permissions_scenario, run_scenario,
     stream_size_validation_scenario, system_scenario, user_scenario,
 };
 use iggy_common::TransportProtocol;
@@ -30,6 +30,7 @@ use test_case::test_matrix;
         authentication_scenario(),
         system_scenario(),
         user_scenario(),
+        permissions_scenario(),
         message_headers_scenario(),
         create_message_payload_scenario(),
         stream_size_validation_scenario(),

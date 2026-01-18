@@ -185,7 +185,7 @@ impl Users {
     pub fn init_permissions(&self, user_id: UserId, permissions: Option<Permissions>) {
         self.permissioner
             .borrow_mut()
-            .init_permissions(user_id, permissions);
+            .init_permissions_for_user(user_id, permissions);
     }
 
     /// Update permissions for a user
@@ -197,7 +197,9 @@ impl Users {
 
     /// Delete permissions for a user
     pub fn delete_permissions(&self, user_id: UserId) {
-        self.permissioner.borrow_mut().delete_permissions(user_id);
+        self.permissioner
+            .borrow_mut()
+            .delete_permissions_for_user(user_id);
     }
 
     /// Update username

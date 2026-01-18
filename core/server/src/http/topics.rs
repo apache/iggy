@@ -23,8 +23,6 @@ use crate::http::shared::AppState;
 use crate::slab::traits_ext::{EntityComponentSystem, EntityMarker, IntoComponents};
 use crate::state::command::EntryCommand;
 use crate::state::models::CreateTopicWithId;
-use crate::streaming::session::Session;
-use crate::streaming::{streams, topics};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::{delete, get};
@@ -67,45 +65,20 @@ async fn get_topic(
     let identity_stream_id = Identifier::from_str_value(&stream_id)?;
     let identity_topic_id = Identifier::from_str_value(&topic_id)?;
 
-    let session = Session::stateless(identity.user_id, identity.ip_address);
-
-    let stream_exists = state
+    let (numeric_stream_id, numeric_topic_id) = state
         .shard
         .shard()
-        .ensure_stream_exists(&identity_stream_id)
-        .is_ok();
-    if !stream_exists {
-        return Err(CustomError::ResourceNotFound);
-    }
-
-    let topic_exists = state
+        .resolve_topic_id(&identity_stream_id, &identity_topic_id)?;
+    state
         .shard
         .shard()
-        .ensure_topic_exists(&identity_stream_id, &identity_topic_id)
-        .is_ok();
-    if !topic_exists {
-        return Err(CustomError::ResourceNotFound);
-    }
-
-    let numeric_stream_id = state
-        .shard
-        .shard()
-        .streams
-        .with_stream_by_id(&identity_stream_id, streams::helpers::get_stream_id());
-    let numeric_topic_id = state.shard.shard().streams.with_topic_by_id(
-        &identity_stream_id,
-        &identity_topic_id,
-        topics::helpers::get_topic_id(),
-    );
-
-    state.shard.shard()
         .permissioner
         .borrow()
-        .get_topic(session.get_user_id(), numeric_stream_id, numeric_topic_id)
+        .get_topic(identity.user_id, numeric_stream_id, numeric_topic_id)
         .error(|e: &IggyError| {
             format!(
                 "{COMPONENT} (error: {e}) - permission denied to get topic with ID: {topic_id} in stream with ID: {stream_id} for user with ID: {}",
-                session.get_user_id(),
+                identity.user_id,
             )
         })?;
 
@@ -126,24 +99,18 @@ async fn get_topics(
     Path(stream_id): Path<String>,
 ) -> Result<Json<Vec<Topic>>, CustomError> {
     let stream_id = Identifier::from_str_value(&stream_id)?;
-    let session = Session::stateless(identity.user_id, identity.ip_address);
 
-    state.shard.shard().ensure_stream_exists(&stream_id)?;
-
-    let numeric_stream_id = state
+    let numeric_stream_id = state.shard.shard().resolve_stream_id(&stream_id)?;
+    state
         .shard
         .shard()
-        .streams
-        .with_stream_by_id(&stream_id, streams::helpers::get_stream_id());
-
-    state.shard.shard()
         .permissioner
         .borrow()
-        .get_topics(session.get_user_id(), numeric_stream_id)
+        .get_topics(identity.user_id, numeric_stream_id)
         .error(|e: &IggyError| {
             format!(
                 "{COMPONENT} (error: {e}) - permission denied to get topics in stream with ID: {stream_id} for user with ID: {}",
-                session.get_user_id(),
+                identity.user_id,
             )
         })?;
 
@@ -173,12 +140,17 @@ async fn create_topic(
     command.stream_id = Identifier::from_str_value(&stream_id)?;
     command.validate()?;
 
-    let session = SendWrapper::new(Session::stateless(identity.user_id, identity.ip_address));
+    let numeric_stream_id = state.shard.shard().resolve_stream_id(&command.stream_id)?;
+    state
+        .shard
+        .shard()
+        .permissioner
+        .borrow()
+        .create_topic(identity.user_id, numeric_stream_id)?;
 
     let _topic_guard = state.shard.shard().fs_locks.topic_lock.lock().await;
     let topic = {
         let future = SendWrapper::new(state.shard.shard().create_topic(
-            &session,
             &command.stream_id,
             command.name.clone(),
             command.message_expiry,
@@ -213,7 +185,6 @@ async fn create_topic(
         // Create partitions
         let partitions = shard
             .create_partitions(
-                &session,
                 &command.stream_id,
                 &Identifier::numeric(topic_id as u32).unwrap(),
                 command.partitions_count,
@@ -281,11 +252,18 @@ async fn update_topic(
     command.topic_id = Identifier::from_str_value(&topic_id)?;
     command.validate()?;
 
-    let session = Session::stateless(identity.user_id, identity.ip_address);
+    let (numeric_stream_id, numeric_topic_id) = state
+        .shard
+        .shard()
+        .resolve_topic_id(&command.stream_id, &command.topic_id)?;
+    state.shard.shard().permissioner.borrow().update_topic(
+        identity.user_id,
+        numeric_stream_id,
+        numeric_topic_id,
+    )?;
 
     let name_changed = !command.name.is_empty();
     state.shard.shard().update_topic(
-        &session,
         &command.stream_id,
         &command.topic_id,
         command.name.clone(),
@@ -362,12 +340,19 @@ async fn delete_topic(
     let identifier_stream_id = Identifier::from_str_value(&stream_id)?;
     let identifier_topic_id = Identifier::from_str_value(&topic_id)?;
 
-    let session = Session::stateless(identity.user_id, identity.ip_address);
+    let (numeric_stream_id, numeric_topic_id) = state
+        .shard
+        .shard()
+        .resolve_topic_id(&identifier_stream_id, &identifier_topic_id)?;
+    state.shard.shard().permissioner.borrow().delete_topic(
+        identity.user_id,
+        numeric_stream_id,
+        numeric_topic_id,
+    )?;
     let _topic_guard = state.shard.shard().fs_locks.topic_lock.lock().await;
 
     let topic = {
         let future = SendWrapper::new(state.shard.shard().delete_topic(
-            &session,
             &identifier_stream_id,
             &identifier_topic_id,
         ));
@@ -428,11 +413,18 @@ async fn purge_topic(
     let identifier_stream_id = Identifier::from_str_value(&stream_id)?;
     let identifier_topic_id = Identifier::from_str_value(&topic_id)?;
 
-    let session = Session::stateless(identity.user_id, identity.ip_address);
+    let (numeric_stream_id, numeric_topic_id) = state
+        .shard
+        .shard()
+        .resolve_topic_id(&identifier_stream_id, &identifier_topic_id)?;
+    state.shard.shard().permissioner.borrow().purge_topic(
+        identity.user_id,
+        numeric_stream_id,
+        numeric_topic_id,
+    )?;
 
     {
         let future = SendWrapper::new(state.shard.shard().purge_topic(
-            &session,
             &identifier_stream_id,
             &identifier_topic_id,
         ));

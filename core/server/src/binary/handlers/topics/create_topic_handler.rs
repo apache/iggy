@@ -56,6 +56,11 @@ impl ServerCommandHandler for CreateTopic {
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
         shard.ensure_authenticated(session)?;
+        let stream_id = shard.resolve_stream_id(&self.stream_id)?;
+        shard
+            .permissioner
+            .borrow()
+            .create_topic(session.get_user_id(), stream_id)?;
 
         let request = ShardRequest {
             stream_id: Identifier::default(),
@@ -93,7 +98,6 @@ impl ServerCommandHandler for CreateTopic {
 
                     let topic = shard
                         .create_topic(
-                            session,
                             &stream_id,
                             name,
                             message_expiry,
@@ -118,7 +122,6 @@ impl ServerCommandHandler for CreateTopic {
                     shard.broadcast_event_to_all_shards(event).await?;
                     let partitions = shard
                         .create_partitions(
-                            session,
                             &stream_id,
                             &Identifier::numeric(topic_id as u32).unwrap(),
                             partitions_count,

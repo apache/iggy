@@ -8333,6 +8333,7 @@ dependencies = [
  "jsonwebtoken",
  "left-right",
  "lending-iterator",
+ "metadata",
  "mimalloc",
  "mime_guess",
  "moka",

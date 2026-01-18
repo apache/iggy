@@ -48,12 +48,17 @@ impl ServerCommandHandler for UpdateStream {
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
         shard.ensure_authenticated(session)?;
+        let stream_id = shard.resolve_stream_id(&self.stream_id)?;
+        shard
+            .permissioner
+            .borrow()
+            .update_stream(session.get_user_id(), stream_id)?;
         let stream_id = self.stream_id.clone();
         shard
-        .update_stream(session, &self.stream_id, self.name.clone())
-        .error(|e: &IggyError| {
-            format!("{COMPONENT} (error: {e}) - failed to update stream with id: {stream_id}, session: {session}")
-        })?;
+            .update_stream(&self.stream_id, self.name.clone())
+            .error(|e: &IggyError| {
+                format!("{COMPONENT} (error: {e}) - failed to update stream with id: {stream_id}, session: {session}")
+            })?;
 
         let event = ShardEvent::UpdatedStream {
             stream_id: self.stream_id.clone(),

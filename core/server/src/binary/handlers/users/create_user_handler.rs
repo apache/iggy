@@ -55,6 +55,10 @@ impl ServerCommandHandler for CreateUser {
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
         shard.ensure_authenticated(session)?;
+        shard
+            .permissioner
+            .borrow()
+            .create_user(session.get_user_id())?;
 
         let request = ShardRequest {
             stream_id: Identifier::default(),
@@ -83,7 +87,7 @@ impl ServerCommandHandler for CreateUser {
                 {
                     let _user_guard = shard.fs_locks.user_lock.lock().await;
                     let user = shard
-                        .create_user(session, &username, &password, status, permissions.clone())
+                        .create_user(&username, &password, status, permissions.clone())
                         .error(|e: &IggyError| {
                             format!(
                                 "{COMPONENT} (error: {e}) - failed to create user with name: {}, session: {}",

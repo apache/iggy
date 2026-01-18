@@ -16,10 +16,6 @@
  * under the License.
  */
 
-#![expect(
-    unused,
-    reason = "Methods are part of the state API and will be used once the implementation is complete"
-)]
 use crate::permissioner::Permissioner;
 use iggy_common::IggyError;
 

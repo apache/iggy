@@ -21,7 +21,7 @@ use crate::shard::IggyShard;
 use crate::shard::transmission::message::{ShardMessage, ShardRequest, ShardRequestPayload};
 use crate::streaming::segments::{IggyIndexesMut, IggyMessagesBatchMut};
 use crate::streaming::session::Session;
-use crate::streaming::{streams, topics};
+use crate::streaming::topics;
 use anyhow::Result;
 use compio::buf::{IntoInner as _, IoBuf};
 use iggy_common::Identifier;
@@ -111,17 +111,13 @@ impl ServerCommandHandler for SendMessages {
         );
         batch.validate()?;
 
-        shard.ensure_topic_exists(&self.stream_id, &self.topic_id)?;
-
-        let numeric_stream_id = shard
-            .streams
-            .with_stream_by_id(&self.stream_id, streams::helpers::get_stream_id());
-
-        let numeric_topic_id = shard.streams.with_topic_by_id(
-            &self.stream_id,
-            &self.topic_id,
-            topics::helpers::get_topic_id(),
-        );
+        let (numeric_stream_id, numeric_topic_id) =
+            shard.resolve_topic_id(&self.stream_id, &self.topic_id)?;
+        shard.permissioner.borrow().append_messages(
+            session.get_user_id(),
+            numeric_stream_id,
+            numeric_topic_id,
+        )?;
 
         // TODO(tungtose): dry this code && get partition_id below have a side effect
         let partition_id = shard.streams.with_topic_by_id(

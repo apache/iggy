@@ -24,7 +24,6 @@ use crate::http::mapper::map_generated_access_token_to_identity_info;
 use crate::http::shared::AppState;
 use crate::state::command::EntryCommand;
 use crate::state::models::CreatePersonalAccessTokenWithHash;
-use crate::streaming::session::Session;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::{delete, get, post};
@@ -66,7 +65,7 @@ async fn get_personal_access_tokens(
     let personal_access_tokens = state
         .shard
         .shard()
-        .get_personal_access_tokens(&Session::stateless(identity.user_id, identity.ip_address))
+        .get_personal_access_tokens(identity.user_id)
         .error(|e: &IggyError| {
             format!(
                 "{COMPONENT} (error: {e}) - failed to get personal access tokens, user ID: {}",
@@ -87,11 +86,7 @@ async fn create_personal_access_token(
     command.validate()?;
     let (_personal_access_token, token) = state
         .shard
-        .create_personal_access_token(
-            &Session::stateless(identity.user_id, identity.ip_address),
-            &command.name,
-            command.expiry,
-        )
+        .create_personal_access_token(identity.user_id, &command.name, command.expiry)
         .error(|e: &IggyError| {
             format!(
                 "{COMPONENT} (error: {e}) - failed to create personal access token, user ID: {}",
@@ -126,10 +121,7 @@ async fn delete_personal_access_token(
 ) -> Result<StatusCode, CustomError> {
     state
         .shard
-        .delete_personal_access_token(
-            &Session::stateless(identity.user_id, identity.ip_address),
-            &name,
-        )
+        .delete_personal_access_token(identity.user_id, &name)
         .error(|e: &IggyError| {
             format!(
                 "{COMPONENT} (error: {e}) - failed to delete personal access token, user ID: {}",

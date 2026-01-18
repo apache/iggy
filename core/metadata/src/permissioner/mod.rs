@@ -35,7 +35,7 @@ impl Permissioner {
         Self::default()
     }
 
-    pub fn init_permissions(&mut self, user_id: UserId, permissions: Option<Permissions>) {
+    pub fn init_permissions_for_user(&mut self, user_id: UserId, permissions: Option<Permissions>) {
         if permissions.is_none() {
             return;
         }
@@ -78,11 +78,11 @@ impl Permissioner {
         user_id: UserId,
         permissions: Option<Permissions>,
     ) {
-        self.delete_permissions(user_id);
-        self.init_permissions(user_id, permissions);
+        self.delete_permissions_for_user(user_id);
+        self.init_permissions_for_user(user_id, permissions);
     }
 
-    pub fn delete_permissions(&mut self, user_id: UserId) {
+    pub fn delete_permissions_for_user(&mut self, user_id: UserId) {
         self.users_permissions.remove(&user_id);
         self.users_that_can_poll_messages_from_all_streams
             .remove(&user_id);

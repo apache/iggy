@@ -31,25 +31,8 @@ use tracing::{error, warn};
 const MAX_USERS: usize = u32::MAX as usize;
 
 impl IggyShard {
-    pub fn find_user(
-        &self,
-        session: &Session,
-        user_id: &Identifier,
-    ) -> Result<Option<User>, IggyError> {
-        let Some(user) = self.try_get_user(user_id)? else {
-            return Ok(None);
-        };
-
-        let session_user_id = session.get_user_id();
-        if user.id != session_user_id {
-            self.permissioner.borrow().get_user(session_user_id).error(|e: &IggyError| {
-                format!(
-                    "{COMPONENT} (error: {e}) - permission denied to get user with ID: {user_id} for current user with ID: {session_user_id}"
-                )
-            })?;
-        }
-
-        Ok(Some(user))
+    pub fn find_user(&self, user_id: &Identifier) -> Result<Option<User>, IggyError> {
+        self.try_get_user(user_id)
     }
 
     pub fn get_user(&self, user_id: &Identifier) -> Result<User, IggyError> {
@@ -61,37 +44,17 @@ impl IggyShard {
         self.users.get_by_identifier(user_id)
     }
 
-    pub async fn get_users(&self, session: &Session) -> Result<Vec<User>, IggyError> {
-        self.permissioner
-        .borrow()
-            .get_users(session.get_user_id())
-            .error(|e: &IggyError| {
-                format!(
-                    "{COMPONENT} (error: {e}) - permission denied to get users for user with id: {}",
-                    session.get_user_id()
-                )
-            })?;
-        Ok(self.users.values())
+    pub fn get_users(&self) -> Vec<User> {
+        self.users.values()
     }
 
     pub fn create_user(
         &self,
-        session: &Session,
         username: &str,
         password: &str,
         status: UserStatus,
         permissions: Option<Permissions>,
     ) -> Result<User, IggyError> {
-        self.permissioner
-            .borrow()
-            .create_user(session.get_user_id())
-            .error(|e: &IggyError| {
-                format!(
-                    "{COMPONENT} (error: {e}) - permission denied to create user for user with id: {}",
-                    session.get_user_id()
-                )
-            })?;
-
         if self.users.username_exists(username) {
             error!("User: {username} already exists.");
             return Err(IggyError::UserAlreadyExists);
@@ -144,17 +107,7 @@ impl IggyShard {
         Ok(user_id)
     }
 
-    pub fn delete_user(&self, session: &Session, user_id: &Identifier) -> Result<User, IggyError> {
-        self.permissioner
-            .borrow()
-            .delete_user(session.get_user_id())
-            .error(|e: &IggyError| {
-                format!(
-                    "{COMPONENT} (error: {e}) - permission denied to delete user for user with id: {}",
-                    session.get_user_id()
-                )
-            })?;
-
+    pub fn delete_user(&self, user_id: &Identifier) -> Result<User, IggyError> {
         self.delete_user_base(user_id)
     }
 
@@ -195,21 +148,10 @@ impl IggyShard {
 
     pub fn update_user(
         &self,
-        session: &Session,
         user_id: &Identifier,
         username: Option<String>,
         status: Option<UserStatus>,
     ) -> Result<User, IggyError> {
-        self.permissioner
-        .borrow()
-            .update_user(session.get_user_id())
-            .error(|e: &IggyError| {
-                format!(
-                    "{COMPONENT} (error: {e}) - permission denied to update user for user with id: {}",
-                    session.get_user_id()
-                )
-            })?;
-
         self.update_user_base(user_id, username, status)
     }
 
@@ -257,28 +199,9 @@ impl IggyShard {
 
     pub fn update_permissions(
         &self,
-        session: &Session,
         user_id: &Identifier,
         permissions: Option<Permissions>,
     ) -> Result<(), IggyError> {
-        {
-            self.permissioner
-            .borrow()
-                .update_permissions(session.get_user_id())
-                .error(|e: &IggyError| {
-                    format!(
-                        "{COMPONENT} (error: {e}) - permission denied to update permissions for user with id: {}", session.get_user_id()
-                    )
-                })?;
-            let user: User = self.get_user(user_id).error(|e: &IggyError| {
-                format!("{COMPONENT} (error: {e}) - failed to get user with id: {user_id}")
-            })?;
-            if user.is_root() {
-                error!("Cannot change the root user permissions.");
-                return Err(IggyError::CannotChangePermissions(user.id));
-            }
-        }
-
         self.update_permissions_base(user_id, permissions)
     }
 
@@ -314,23 +237,10 @@ impl IggyShard {
 
     pub fn change_password(
         &self,
-        session: &Session,
         user_id: &Identifier,
         current_password: &str,
         new_password: &str,
     ) -> Result<(), IggyError> {
-        {
-            let user = self.get_user(user_id).error(|e: &IggyError| {
-                format!("{COMPONENT} (error: {e}) - failed to get user with id: {user_id}")
-            })?;
-            let session_user_id = session.get_user_id();
-            if user.id != session_user_id {
-                self.permissioner
-                    .borrow()
-                    .change_password(session_user_id)?;
-            }
-        }
-
         self.change_password_base(user_id, current_password, new_password)
     }
 

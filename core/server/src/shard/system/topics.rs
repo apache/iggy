@@ -16,14 +16,11 @@
  * under the License.
  */
 
-use super::COMPONENT;
 use crate::shard::IggyShard;
 use crate::slab::traits_ext::{EntityComponentSystem, EntityMarker, InsertCell, IntoComponents};
-use crate::streaming::session::Session;
 use crate::streaming::topics::storage::{create_topic_file_hierarchy, delete_topic_from_disk};
 use crate::streaming::topics::topic::{self};
 use crate::streaming::{partitions, streams, topics};
-use err_trail::ErrContext;
 use iggy_common::{CompressionAlgorithm, Identifier, IggyError, IggyExpiry, MaxTopicSize};
 use std::str::FromStr;
 use tracing::info;
@@ -32,7 +29,6 @@ impl IggyShard {
     #[allow(clippy::too_many_arguments)]
     pub async fn create_topic(
         &self,
-        session: &Session,
         stream_id: &Identifier,
         name: String,
         message_expiry: IggyExpiry,
@@ -42,17 +38,6 @@ impl IggyShard {
     ) -> Result<topic::Topic, IggyError> {
         self.ensure_stream_exists(stream_id)?;
         let numeric_stream_id = self.streams.get_index(stream_id);
-        {
-            self.permissioner
-            .borrow()
-                .create_topic(session.get_user_id(), numeric_stream_id)
-                .error(|e: &IggyError| {
-                    format!(
-                        "{COMPONENT} (error: {e}) - permission denied to create topic with name: {name} in stream with ID: {stream_id} for user with ID: {}",
-                        session.get_user_id(),
-                    )
-                })?;
-        }
         let exists = self.streams.with_topics(
             stream_id,
             topics::helpers::exists(&Identifier::from_str(&name).unwrap()),
@@ -93,7 +78,6 @@ impl IggyShard {
     #[allow(clippy::too_many_arguments)]
     pub fn update_topic(
         &self,
-        session: &Session,
         stream_id: &Identifier,
         topic_id: &Identifier,
         name: String,
@@ -103,26 +87,6 @@ impl IggyShard {
         replication_factor: Option<u8>,
     ) -> Result<(), IggyError> {
         self.ensure_topic_exists(stream_id, topic_id)?;
-        {
-            let topic_id_val =
-                self.streams
-                    .with_topic_by_id(stream_id, topic_id, topics::helpers::get_topic_id());
-            let stream_id_val = self
-                .streams
-                .with_stream_by_id(stream_id, streams::helpers::get_stream_id());
-            self.permissioner.borrow().update_topic(
-                session.get_user_id(),
-                stream_id_val,
-                topic_id_val
-            ).error(|e: &IggyError| {
-                format!(
-                    "{COMPONENT} (error: {e}) - permission denied to update topic for user with id: {}, stream ID: {}, topic ID: {}",
-                    session.get_user_id(),
-                    stream_id_val,
-                    topic_id_val,
-                )
-            })?;
-        }
 
         let exists = self.streams.with_topics(
             stream_id,
@@ -196,26 +160,13 @@ impl IggyShard {
 
     pub async fn delete_topic(
         &self,
-        session: &Session,
         stream_id: &Identifier,
         topic_id: &Identifier,
     ) -> Result<topic::Topic, IggyError> {
         self.ensure_topic_exists(stream_id, topic_id)?;
-        let numeric_topic_id =
-            self.streams
-                .with_topic_by_id(stream_id, topic_id, topics::helpers::get_topic_id());
         let numeric_stream_id = self
             .streams
             .with_stream_by_id(stream_id, streams::helpers::get_stream_id());
-        self.permissioner
-            .borrow()
-                .delete_topic(session.get_user_id(), numeric_stream_id, numeric_topic_id)
-                .error(|e: &IggyError| {
-                    format!(
-                        "{COMPONENT} (error: {e}) - permission denied to delete topic with ID: {topic_id} in stream with ID: {stream_id} for user with ID: {}",
-                        session.get_user_id(),
-                    )
-                })?;
         let mut topic = self.delete_topic_base(stream_id, topic_id);
         let topic_id_numeric = topic.id();
 
@@ -267,29 +218,10 @@ impl IggyShard {
 
     pub async fn purge_topic(
         &self,
-        session: &Session,
         stream_id: &Identifier,
         topic_id: &Identifier,
     ) -> Result<(), IggyError> {
         self.ensure_topic_exists(stream_id, topic_id)?;
-        {
-            let topic_id =
-                self.streams
-                    .with_topic_by_id(stream_id, topic_id, topics::helpers::get_topic_id());
-            let stream_id = self
-                .streams
-                .with_stream_by_id(stream_id, streams::helpers::get_stream_id());
-            self.permissioner.borrow().purge_topic(
-                session.get_user_id(),
-                stream_id,
-                topic_id
-            ).error(|e: &IggyError| {
-                format!(
-                    "{COMPONENT} (error: {e}) - permission denied to purge topic with ID: {topic_id} in stream with ID: {stream_id} for user with ID: {}",
-                    session.get_user_id(),
-                )
-            })?;
-        }
 
         let (consumer_offset_paths, consumer_group_offset_paths) = self.streams.with_partitions(
             stream_id,

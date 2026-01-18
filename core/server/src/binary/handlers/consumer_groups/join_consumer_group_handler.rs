@@ -21,7 +21,6 @@ use crate::binary::command::{
 };
 use crate::binary::handlers::consumer_groups::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
-
 use crate::shard::IggyShard;
 use crate::streaming::session::Session;
 use anyhow::Result;
@@ -46,9 +45,16 @@ impl ServerCommandHandler for JoinConsumerGroup {
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
         shard.ensure_authenticated(session)?;
+        let (stream_id, topic_id) = shard.resolve_topic_id(&self.stream_id, &self.topic_id)?;
+        shard.permissioner.borrow().join_consumer_group(
+            session.get_user_id(),
+            stream_id,
+            topic_id,
+        )?;
+        shard.ensure_consumer_group_exists(&self.stream_id, &self.topic_id, &self.group_id)?;
         shard
             .join_consumer_group(
-                session,
+                session.client_id,
                 &self.stream_id,
                 &self.topic_id,
                 &self.group_id,

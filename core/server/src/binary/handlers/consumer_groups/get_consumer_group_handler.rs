@@ -23,7 +23,6 @@ use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
 use crate::shard::IggyShard;
 use crate::streaming::session::Session;
-use crate::streaming::{streams, topics};
 use anyhow::Result;
 use iggy_common::IggyError;
 use iggy_common::SenderKind;
@@ -45,31 +44,27 @@ impl ServerCommandHandler for GetConsumerGroup {
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
         shard.ensure_authenticated(session)?;
-        let exists = shard
+        let Ok((stream_id, topic_id)) = shard.resolve_topic_id(&self.stream_id, &self.topic_id)
+        else {
+            sender.send_empty_ok_response().await?;
+            return Ok(HandlerResult::Finished);
+        };
+        if shard
             .ensure_consumer_group_exists(&self.stream_id, &self.topic_id, &self.group_id)
-            .is_ok();
-        if !exists {
+            .is_err()
+        {
             sender.send_empty_ok_response().await?;
             return Ok(HandlerResult::Finished);
         }
-        let numeric_topic_id = shard.streams.with_topic_by_id(
-            &self.stream_id,
-            &self.topic_id,
-            topics::helpers::get_topic_id(),
-        );
-        let numeric_stream_id = shard
-            .streams
-            .with_stream_by_id(&self.stream_id, streams::helpers::get_stream_id());
-        let has_permission = shard
+        if shard
             .permissioner
             .borrow()
-            .get_consumer_group(session.get_user_id(), numeric_stream_id, numeric_topic_id)
-            .is_ok();
-        if !has_permission {
+            .get_consumer_group(session.get_user_id(), stream_id, topic_id)
+            .is_err()
+        {
             sender.send_empty_ok_response().await?;
             return Ok(HandlerResult::Finished);
         }
-
         let consumer_group = shard.streams.with_consumer_group_by_id(
             &self.stream_id,
             &self.topic_id,

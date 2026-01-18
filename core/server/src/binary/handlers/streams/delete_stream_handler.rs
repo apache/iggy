@@ -53,6 +53,11 @@ impl ServerCommandHandler for DeleteStream {
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
         shard.ensure_authenticated(session)?;
+        let stream_id = shard.resolve_stream_id(&self.stream_id)?;
+        shard
+            .permissioner
+            .borrow()
+            .delete_stream(session.get_user_id(), stream_id)?;
         let stream_id = self.stream_id.clone();
         let request = ShardRequest {
             stream_id: Identifier::default(),
@@ -73,11 +78,11 @@ impl ServerCommandHandler for DeleteStream {
                     // Acquire stream lock to serialize filesystem operations
                     let _stream_guard = shard.fs_locks.stream_lock.lock().await;
                     let stream = shard
-                            .delete_stream(session, &stream_id)
-                            .await
-                            .error(|e: &IggyError| {
-                                format!("{COMPONENT} (error: {e}) - failed to delete stream with ID: {stream_id}, session: {session}")
-                            })?;
+                        .delete_stream(&stream_id)
+                        .await
+                        .error(|e: &IggyError| {
+                            format!("{COMPONENT} (error: {e}) - failed to delete stream with ID: {stream_id}, session: {session}")
+                        })?;
                     info!(
                         "Deleted stream with name: {}, ID: {}",
                         stream.root().name(),
