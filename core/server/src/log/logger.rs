@@ -468,11 +468,17 @@ impl Logging {
 
     fn calculate_max_files(max_total_size_bytes: u64, max_file_size_bytes: u64) -> usize {
         if max_file_size_bytes == 0 {
-            return 10;
+            // In terms of Iggy's log generation speed, it is
+            // rapid even at the info level.  Maybe we do not
+            // need an option like "unlimited" per log. So if
+            // the user sets it to 0, then let it remain 0 so
+            0
+        } else if max_total_size_bytes == 0 {
+            99999 //usize::MAX
+        } else {
+            let max_files = max_total_size_bytes / max_file_size_bytes;
+            max_files.clamp(1, 32768) as usize
         }
-
-        let max_files = max_total_size_bytes / max_file_size_bytes;
-        max_files.clamp(1, 1000) as usize
     }
 
     fn install_log_rotation_handler(
@@ -484,7 +490,7 @@ impl Logging {
         let path = logs_path.to_path_buf();
         let max_total_size_bytes = config.max_total_size.as_bytes_u64();
         let max_file_size_bytes = config.max_file_size.as_bytes_u64();
-        let check_interval = config.rotation_check_interval;
+        let rotation_check_interval = config.rotation_check_interval;
         let retention = config.retention;
         let should_stop = Arc::clone(&self.rotation_should_stop);
 
@@ -499,7 +505,7 @@ impl Logging {
                     retention,
                     max_total_size_bytes,
                     max_file_size_bytes,
-                    check_interval,
+                    rotation_check_interval,
                     should_stop,
                     rx,
                 )
@@ -620,8 +626,9 @@ impl Logging {
         max_total_size_bytes: u64,
         max_file_size_bytes: u64,
     ) {
+        debug!("Starting log cleanup for directory: {logs_path:?}");
         debug!(
-            "Starting log cleanup for directory: {logs_path:?}, retention: {retention:?}, max_total_size: {max_total_size_bytes} bytes, max_single_file_size: {max_file_size_bytes} bytes"
+            "retention: {retention:?}, max_total_size: {max_total_size_bytes} bytes, max_single_file_size: {max_file_size_bytes} bytes"
         );
 
         let mut file_entries = Self::read_log_files(logs_path);
@@ -681,49 +688,55 @@ impl Logging {
             }
         }
 
-        let skip_size_check = max_total_size_bytes == 0 && max_file_size_bytes == 0;
-        if !skip_size_check && max_total_size_bytes > 0 {
-            let total_size: u64 = file_entries.iter().map(|(_, _, _, size)| *size).sum();
+        let total_size: u64 = file_entries.iter().map(|(_, _, _, size)| *size).sum();
+        let notification = |path: &PathBuf, count: &i32| {
+            if count > &0 {
+                info!("Logs cleaned up for directory: {path:?}. Removed {count} files.");
+            }
+        };
 
-            if total_size > max_total_size_bytes {
-                file_entries.sort_unstable_by_key(|(_, mtime, _, _)| *mtime);
+        // Setting total max log size to 0 disables only total size
+        // rotation,  with other limits remain effective, including
+        // per-file size limitation,  preserving structural order.
+        if max_total_size_bytes == 0 {
+            notification(logs_path, &removed_files_count);
+            return;
+        }
 
-                let mut remaining_size = total_size;
-                let mut to_remove = Vec::new();
+        if total_size > max_total_size_bytes {
+            file_entries.sort_unstable_by_key(|(_, mtime, _, _)| *mtime);
 
-                for (idx, (_entry, _, _, fsize)) in file_entries.iter().enumerate() {
-                    if remaining_size <= max_total_size_bytes {
-                        break;
-                    }
-                    to_remove.push((idx, *fsize));
-                    remaining_size = remaining_size.saturating_sub(*fsize);
+            let mut remaining_size = total_size;
+            let mut to_remove = Vec::new();
+
+            for (idx, (_entry, _, _, fsize)) in file_entries.iter().enumerate() {
+                if remaining_size <= max_total_size_bytes {
+                    break;
                 }
+                to_remove.push((idx, *fsize));
+                remaining_size = remaining_size.saturating_sub(*fsize);
+            }
 
-                for (idx, fsize) in to_remove.iter().rev() {
-                    let entry = &file_entries[*idx];
-                    if fs::remove_file(entry.0.path()).is_ok() {
-                        debug!(
-                            "Removed log file (size control): {:?} freed {:.2} MiB",
-                            entry.0.path(),
-                            *fsize as f64 / 1_048_576.0
-                        );
-                        removed_files_count += 1;
-                        file_entries.remove(*idx);
-                    } else {
-                        warn!(
-                            "Failed to remove log file for size control: {:?}",
-                            entry.0.path()
-                        );
-                    }
+            for (idx, fsize) in to_remove.iter().rev() {
+                let entry = &file_entries[*idx];
+                if fs::remove_file(entry.0.path()).is_ok() {
+                    debug!(
+                        "Removed log file (size control): {:?} freed {:.2} MiB",
+                        entry.0.path(),
+                        *fsize as f64 / 1_048_576.0
+                    );
+                    removed_files_count += 1;
+                    file_entries.remove(*idx);
+                } else {
+                    warn!(
+                        "Failed to remove log file for size control: {:?}",
+                        entry.0.path()
+                    );
                 }
             }
         }
 
-        if removed_files_count > 0 {
-            info!(
-                "Completed log cleanup for directory: {logs_path:?}. Removed {removed_files_count} files."
-            );
-        }
+        notification(logs_path, &removed_files_count);
     }
 }
 
