@@ -159,9 +159,6 @@ async fn log_rotation_should_launch() {
         ..Default::default()
     };
 
-    // Give the server some time to start and for log rotation thread to be initialized
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-
     let log_path = format!("{}/logs", test_server.get_local_data_path());
 
     test_server.assert_running();

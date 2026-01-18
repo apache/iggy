@@ -17,6 +17,7 @@
  * under the License.
  */
 
+use crate::server::scenarios::{PARTITIONS_COUNT, STREAM_NAME, TOPIC_NAME};
 use iggy::prelude::*;
 use iggy_common::{
     CompressionAlgorithm, Identifier, IggyByteSize, IggyDuration, IggyExpiry, MaxTopicSize,
@@ -27,11 +28,11 @@ use std::time::Duration;
 use tokio::fs;
 use tokio::time::{sleep, timeout};
 
-pub const MAX_SINGLE_LOG_SIZE: IggyByteSize = IggyByteSize::new(1_000_000); // 1MB 
-pub const MAX_TOTAL_LOG_SIZE: IggyByteSize = IggyByteSize::new(3_000_000); // 3MB
+pub const MAX_SINGLE_LOG_SIZE: IggyByteSize = IggyByteSize::new(1_000_000); //1MB
+pub const MAX_TOTAL_LOG_SIZE: IggyByteSize = IggyByteSize::new(3_000_000); //3MB
 pub const LOG_ROTATION_CHECK_INTERVAL: IggyDuration = IggyDuration::ONE_SECOND;
 const OPERATION_TIMEOUT_SECS: u64 = 10;
-const OPERATION_LOOP_COUNT: usize = 2000;
+const OPERATION_LOOP_COUNT: usize = 2500;
 const FROM_BYTES_TO_KB: u64 = 1000;
 const IGGY_LOG_BASE_NAME: &str = "iggy-server.log";
 
@@ -91,8 +92,8 @@ async fn init_valid_client(client_factory: &dyn ClientFactory) -> Result<IggyCli
 
 async fn generate_enough_logs(client: &IggyClient) -> Result<(), String> {
     for i in 0..OPERATION_LOOP_COUNT {
-        let stream_name = format!("stream_log_rotation_{i}");
-        let topic_name = format!("topic_log_rotation_{i}");
+        let stream_name = format!("{STREAM_NAME}-{i}");
+        let topic_name = format!("{TOPIC_NAME}-{i}");
 
         client
             .create_stream(&stream_name)
@@ -101,11 +102,12 @@ async fn generate_enough_logs(client: &IggyClient) -> Result<(), String> {
 
         let stream_identifier = Identifier::named(&stream_name)
             .map_err(|e| format!("Failed to create stream label {e}"))?;
+
         client
             .create_topic(
                 &stream_identifier,
                 &topic_name,
-                1,
+                PARTITIONS_COUNT,
                 CompressionAlgorithm::default(),
                 None,
                 IggyExpiry::NeverExpire,
@@ -178,6 +180,7 @@ async fn validate_log_rotation_rules(log_dir: &Path) -> Result<(), String> {
 
         let file_size_bytes = file_metadata.len();
 
+        // logger.rs => tracing_appender::non_blocking(file_appender);
         // The delay in log writing in Iggy mainly depends on the processing speed
         // of background threads and the operating system's I/O scheduling,  which
         // means that the actual size of written logs may be slightly larger  than

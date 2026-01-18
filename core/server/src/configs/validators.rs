@@ -285,7 +285,10 @@ impl Validatable<ConfigurationError> for LoggingConfig {
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
 
-        if self.max_total_size.as_bytes_u64() < self.max_file_size.as_bytes_u64() {
+        let max_total_size_unlimited = self.max_total_size.as_bytes_u64() == 0;
+        if !max_total_size_unlimited
+            && self.max_file_size.as_bytes_u64() > self.max_total_size.as_bytes_u64()
+        {
             error!(
                 "Configured system.logging.max_total_size {} is less than system.logging.max_file_size {}",
                 self.max_total_size, self.max_file_size
