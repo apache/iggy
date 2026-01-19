@@ -102,7 +102,7 @@ rand = { workspace = true }
 reqwest = { workspace = true, features = ["rustls-tls-no-provider"] }
 ringbuffer = "0.16.0"
 rmp-serde = { workspace = true }
-rust-embed = { version = "8.9.0", optional = true }
+rust-embed = { version = "8.11.0", optional = true }
 rustls = { workspace = true }
 rustls-pemfile = "2.2.0"
 send_wrapper = "0.6.0"
@@ -120,7 +120,7 @@ toml = { workspace = true }
 tower-http = { workspace = true }
 tracing = { workspace = true }
 tracing-appender = { workspace = true }
-tracing-opentelemetry = "0.32.0"
+tracing-opentelemetry = "0.32.1"
 tracing-subscriber = { workspace = true }
 tungstenite = { workspace = true }
 ulid = "1.2.1"
@@ -134,7 +134,7 @@ hwlocality = { workspace = true, features = ["vendored"] }
 
 [build-dependencies]
 figment = { version = "0.10.19", features = ["json", "toml", "env"] }
-vergen-git2 = { version = "1.0.7", features = [
+vergen-git2 = { version = "9.1.0", features = [
     "build",
     "cargo",
     "rustc",
