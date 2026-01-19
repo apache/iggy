@@ -26,26 +26,21 @@ use iggy_common::update_stream::UpdateStream;
 use iggy_common::{CompressionAlgorithm, IggyExpiry, IggyTimestamp, MaxTopicSize};
 use slab::Slab;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 
-#[derive(Debug, Clone, Default)]
+// ============================================================================
+// Partition Entity
+// ============================================================================
+
+#[derive(Debug, Clone)]
 pub struct Partition {
     pub id: usize,
+    pub created_at: IggyTimestamp,
 }
 
 impl Partition {
-    pub fn new(id: usize) -> Self {
-        Self { id }
-    }
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct Partitions {
-    pub items: Slab<Partition>,
-}
-
-impl Partitions {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(id: usize, created_at: IggyTimestamp) -> Self {
+        Self { id, created_at }
     }
 }
 
@@ -56,7 +51,7 @@ impl Partitions {
 #[derive(Debug, Clone)]
 pub struct Topic {
     pub id: usize,
-    pub name: String,
+    pub name: Arc<str>,
     pub created_at: IggyTimestamp,
     pub replication_factor: u8,
     pub message_expiry: IggyExpiry,
@@ -64,28 +59,30 @@ pub struct Topic {
     pub max_topic_size: MaxTopicSize,
 
     pub stats: Arc<TopicStats>,
-    pub partitions: Partitions,
+    pub partitions: Vec<Partition>,
+    pub round_robin_counter: Arc<AtomicUsize>,
 }
 
 impl Default for Topic {
     fn default() -> Self {
         Self {
             id: 0,
-            name: String::new(),
+            name: Arc::from(""),
             created_at: IggyTimestamp::default(),
             replication_factor: 1,
             message_expiry: IggyExpiry::default(),
             compression_algorithm: CompressionAlgorithm::default(),
             max_topic_size: MaxTopicSize::default(),
             stats: Arc::new(TopicStats::default()),
-            partitions: Partitions::new(),
+            partitions: Vec::new(),
+            round_robin_counter: Arc::new(AtomicUsize::new(0)),
         }
     }
 }
 
 impl Topic {
     pub fn new(
-        name: String,
+        name: Arc<str>,
         created_at: IggyTimestamp,
         replication_factor: u8,
         message_expiry: IggyExpiry,
@@ -102,41 +99,36 @@ impl Topic {
             compression_algorithm,
             max_topic_size,
             stats: Arc::new(TopicStats::new(stream_stats)),
-            partitions: Partitions::new(),
+            partitions: Vec::new(),
+            round_robin_counter: Arc::new(AtomicUsize::new(0)),
         }
     }
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct Topics {
-    pub index: AHashMap<String, usize>,
-    pub items: Slab<Topic>,
-}
-
-impl Topics {
-    pub fn new() -> Self {
-        Self::default()
-    }
-}
+// ============================================================================
+// Stream Entity
+// ============================================================================
 
 #[derive(Debug)]
 pub struct Stream {
     pub id: usize,
-    pub name: String,
+    pub name: Arc<str>,
     pub created_at: IggyTimestamp,
 
     pub stats: Arc<StreamStats>,
-    pub topics: Topics,
+    pub topics: Slab<Topic>,
+    pub topic_index: AHashMap<Arc<str>, usize>,
 }
 
 impl Default for Stream {
     fn default() -> Self {
         Self {
             id: 0,
-            name: String::new(),
+            name: Arc::from(""),
             created_at: IggyTimestamp::default(),
             stats: Arc::new(StreamStats::default()),
-            topics: Topics::new(),
+            topics: Slab::new(),
+            topic_index: AHashMap::default(),
         }
     }
 }
@@ -149,25 +141,42 @@ impl Clone for Stream {
             created_at: self.created_at,
             stats: self.stats.clone(),
             topics: self.topics.clone(),
+            topic_index: self.topic_index.clone(),
         }
     }
 }
 
 impl Stream {
-    pub fn new(name: String, created_at: IggyTimestamp) -> Self {
+    pub fn new(name: Arc<str>, created_at: IggyTimestamp) -> Self {
         Self {
             id: 0,
             name,
             created_at,
             stats: Arc::new(StreamStats::default()),
-            topics: Topics::new(),
+            topics: Slab::new(),
+            topic_index: AHashMap::default(),
+        }
+    }
+
+    pub fn with_stats(name: Arc<str>, created_at: IggyTimestamp, stats: Arc<StreamStats>) -> Self {
+        Self {
+            id: 0,
+            name,
+            created_at,
+            stats,
+            topics: Slab::new(),
+            topic_index: AHashMap::default(),
         }
     }
 }
 
+// ============================================================================
+// Streams State Machine
+// ============================================================================
+
 define_state! {
     Streams {
-        index: AHashMap<String, usize>,
+        index: AHashMap<Arc<str>, usize>,
         items: Slab<Stream>,
     },
     [CreateStream, UpdateStream, DeleteStream, PurgeStream]

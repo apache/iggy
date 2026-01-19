@@ -26,42 +26,63 @@ use iggy_common::update_permissions::UpdatePermissions;
 use iggy_common::update_user::UpdateUser;
 use iggy_common::{IggyTimestamp, Permissions, PersonalAccessToken, UserId, UserStatus};
 use slab::Slab;
+use std::sync::Arc;
 
-#[derive(Debug, Clone, Default)]
+// ============================================================================
+// User Entity
+// ============================================================================
+
+#[derive(Debug, Clone)]
 pub struct User {
     pub id: UserId,
-    pub username: String,
-    pub password: String,
+    pub username: Arc<str>,
+    pub password_hash: Arc<str>,
     pub status: UserStatus,
     pub created_at: IggyTimestamp,
-    pub permissions: Option<Permissions>,
-    pub personal_access_tokens: AHashMap<String, PersonalAccessToken>,
+    pub permissions: Option<Arc<Permissions>>,
 }
 
-impl User {
-    pub fn new(
-        username: String,
-        password: String,
-        status: UserStatus,
-        created_at: IggyTimestamp,
-        permissions: Option<Permissions>,
-    ) -> Self {
+impl Default for User {
+    fn default() -> Self {
         Self {
             id: 0,
-            username,
-            password,
-            status,
-            created_at,
-            permissions,
-            personal_access_tokens: AHashMap::new(),
+            username: Arc::from(""),
+            password_hash: Arc::from(""),
+            status: UserStatus::default(),
+            created_at: IggyTimestamp::default(),
+            permissions: None,
         }
     }
 }
 
+impl User {
+    pub fn new(
+        username: Arc<str>,
+        password_hash: Arc<str>,
+        status: UserStatus,
+        created_at: IggyTimestamp,
+        permissions: Option<Arc<Permissions>>,
+    ) -> Self {
+        Self {
+            id: 0,
+            username,
+            password_hash,
+            status,
+            created_at,
+            permissions,
+        }
+    }
+}
+
+// ============================================================================
+// Users State Machine
+// ============================================================================
+
 define_state! {
     Users {
-        index: AHashMap<String, usize>,
+        index: AHashMap<Arc<str>, UserId>,
         items: Slab<User>,
+        personal_access_tokens: AHashMap<UserId, AHashMap<Arc<str>, PersonalAccessToken>>,
         permissioner: Permissioner,
     },
     [CreateUser, UpdateUser, DeleteUser, ChangePassword, UpdatePermissions]

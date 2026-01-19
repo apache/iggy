@@ -18,66 +18,98 @@
 use crate::stm::Handler;
 use crate::{define_state, impl_absorb};
 use ahash::AHashMap;
-use iggy_common::IggyTimestamp;
 use iggy_common::create_consumer_group::CreateConsumerGroup;
 use iggy_common::delete_consumer_group::DeleteConsumerGroup;
 use slab::Slab;
+use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 
-#[derive(Debug, Clone, Default)]
+// ============================================================================
+// ConsumerGroupMember Entity
+// ============================================================================
+
+#[derive(Debug, Clone)]
 pub struct ConsumerGroupMember {
-    pub id: u32,
-    pub joined_at: IggyTimestamp,
+    pub id: usize,
+    pub client_id: u32,
+    pub partitions: Vec<usize>,
+    pub partition_index: Arc<AtomicUsize>,
 }
 
 impl ConsumerGroupMember {
-    pub fn new(id: u32, joined_at: IggyTimestamp) -> Self {
-        Self { id, joined_at }
+    pub fn new(id: usize, client_id: u32) -> Self {
+        Self {
+            id,
+            client_id,
+            partitions: Vec::new(),
+            partition_index: Arc::new(AtomicUsize::new(0)),
+        }
     }
 }
 
-#[derive(Debug, Clone, Default)]
+// ============================================================================
+// ConsumerGroup Entity
+// ============================================================================
+
+#[derive(Debug, Clone)]
 pub struct ConsumerGroup {
     pub id: usize,
     pub stream_id: usize,
     pub topic_id: usize,
-    pub name: String,
-    pub created_at: IggyTimestamp,
-    pub members: Vec<ConsumerGroupMember>,
+    pub name: Arc<str>,
+    pub partitions: Vec<usize>,
+    pub members: Slab<ConsumerGroupMember>,
 }
 
 impl ConsumerGroup {
-    pub fn new(stream_id: usize, topic_id: usize, name: String, created_at: IggyTimestamp) -> Self {
+    pub fn new(stream_id: usize, topic_id: usize, name: Arc<str>) -> Self {
         Self {
             id: 0,
             stream_id,
             topic_id,
             name,
-            created_at,
-            members: Vec::new(),
+            partitions: Vec::new(),
+            members: Slab::new(),
         }
     }
 
-    pub fn add_member(&mut self, member: ConsumerGroupMember) {
-        self.members.push(member);
-    }
+    /// Rebalance partition assignments among members (round-robin).
+    pub fn rebalance_members(&mut self) {
+        let partition_count = self.partitions.len();
+        let member_count = self.members.len();
 
-    pub fn remove_member(&mut self, member_id: u32) -> Option<ConsumerGroupMember> {
-        if let Some(pos) = self.members.iter().position(|m| m.id == member_id) {
-            Some(self.members.remove(pos))
-        } else {
-            None
+        if member_count == 0 || partition_count == 0 {
+            return;
         }
-    }
 
-    pub fn members_count(&self) -> usize {
-        self.members.len()
+        // Clear all member partitions
+        let member_ids: Vec<usize> = self.members.iter().map(|(id, _)| id).collect();
+        for &member_id in &member_ids {
+            if let Some(member) = self.members.get_mut(member_id) {
+                member.partitions.clear();
+            }
+        }
+
+        // Rebuild assignments (round-robin)
+        for (i, &partition_id) in self.partitions.iter().enumerate() {
+            let member_idx = i % member_count;
+            if let Some(&member_id) = member_ids.get(member_idx)
+                && let Some(member) = self.members.get_mut(member_id)
+            {
+                member.partitions.push(partition_id);
+            }
+        }
     }
 }
 
+// ============================================================================
+// ConsumerGroups State Machine
+// ============================================================================
+
 define_state! {
     ConsumerGroups {
-        ns_index: AHashMap<(usize, usize), Vec<usize>>,
-        name_index: AHashMap<String, usize>,
+        name_index: AHashMap<Arc<str>, usize>,
+        topic_index: AHashMap<(usize, usize), Vec<usize>>,
         items: Slab<ConsumerGroup>,
     },
     [CreateConsumerGroup, DeleteConsumerGroup]
