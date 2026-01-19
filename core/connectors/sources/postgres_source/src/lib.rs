@@ -17,20 +17,26 @@
  * under the License.
  */
 
-use std::{collections::HashMap, str::FromStr, time::Duration};
-
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use humantime::Duration as HumanDuration;
 use iggy_connector_sdk::{
     ConnectorState, Error, ProducedMessage, ProducedMessages, Schema, Source, source_connector,
 };
 use serde::{Deserialize, Serialize};
-use sqlx::{Column, Pool, Postgres, Row, TypeInfo, postgres::PgPoolOptions};
+use sqlx::postgres::PgPoolOptions;
+use sqlx::{Column, Pool, Postgres, Row, TypeInfo};
+use std::collections::HashMap;
+use std::str::FromStr;
+use std::time::Duration;
 use tokio::sync::Mutex;
-use tracing::{error, info};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 source_connector!(PostgresSource);
+
+const DEFAULT_MAX_RETRIES: u32 = 3;
+const DEFAULT_RETRY_DELAY: &str = "1s";
 
 #[derive(Debug)]
 pub struct PostgresSource {
@@ -38,6 +44,7 @@ pub struct PostgresSource {
     pool: Option<Pool<Postgres>>,
     config: PostgresSourceConfig,
     state: Mutex<State>,
+    verbose: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,8 +63,36 @@ pub struct PostgresSourceConfig {
     pub include_metadata: Option<bool>,
     pub replication_slot: Option<String>,
     pub publication_name: Option<String>,
-    pub capture_operations: Option<Vec<String>>, // INSERT, UPDATE, DELETE
-    pub cdc_backend: Option<String>,             // "builtin" | "pg_replicate"
+    pub capture_operations: Option<Vec<String>>,
+    pub cdc_backend: Option<String>,
+    pub delete_after_read: Option<bool>,
+    pub processed_column: Option<String>,
+    pub primary_key_column: Option<String>,
+    pub payload_column: Option<String>,
+    pub payload_format: Option<String>,
+    pub verbose_logging: Option<bool>,
+    pub max_retries: Option<u32>,
+    pub retry_delay: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PayloadFormat {
+    #[default]
+    Json,
+    Bytea,
+    Text,
+    JsonDirect,
+}
+
+impl PayloadFormat {
+    fn from_config(s: Option<&str>) -> Self {
+        match s.map(|s| s.to_lowercase()).as_deref() {
+            Some("bytea") | Some("raw") => PayloadFormat::Bytea,
+            Some("text") => PayloadFormat::Text,
+            Some("json_direct") | Some("jsonb") | Some("jsonb_direct") => PayloadFormat::JsonDirect,
+            _ => PayloadFormat::Json,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -70,7 +105,7 @@ struct State {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DatabaseRecord {
     pub table_name: String,
-    pub operation_type: String, // INSERT, UPDATE, DELETE
+    pub operation_type: String,
     pub timestamp: DateTime<Utc>,
     pub data: serde_json::Value,
     pub old_data: Option<serde_json::Value>,
@@ -78,6 +113,7 @@ pub struct DatabaseRecord {
 
 impl PostgresSource {
     pub fn new(id: u32, config: PostgresSourceConfig, _state: Option<ConnectorState>) -> Self {
+        let verbose = config.verbose_logging.unwrap_or(false);
         PostgresSource {
             id,
             pool: None,
@@ -87,11 +123,119 @@ impl PostgresSource {
                 tracking_offsets: HashMap::new(),
                 processed_rows: 0,
             }),
+            verbose,
         }
     }
+}
 
+#[async_trait]
+impl Source for PostgresSource {
+    async fn open(&mut self) -> Result<(), Error> {
+        info!(
+            "Opening PostgreSQL source connector with ID: {}. Mode: {}, Tables: {:?}",
+            self.id, self.config.mode, self.config.tables
+        );
+
+        self.connect().await?;
+
+        match self.config.mode.as_str() {
+            "cdc" => {
+                self.setup_cdc().await?;
+                let backend = self.config.cdc_backend.as_deref().unwrap_or("builtin");
+                info!(
+                    "PostgreSQL CDC mode enabled (backend: {backend}) for connector ID: {}",
+                    self.id
+                );
+            }
+            "polling" => {
+                info!(
+                    "PostgreSQL polling mode enabled for connector ID: {}",
+                    self.id
+                );
+                info!("Poll interval: {:?}", self.get_poll_interval());
+            }
+            _ => {
+                return Err(Error::InitError(format!(
+                    "Invalid mode '{}'. Supported modes: 'polling', 'cdc'",
+                    self.config.mode
+                )));
+            }
+        }
+
+        info!(
+            "PostgreSQL source connector with ID: {} opened successfully",
+            self.id
+        );
+        Ok(())
+    }
+
+    async fn poll(&self) -> Result<ProducedMessages, Error> {
+        let poll_interval = self.get_poll_interval();
+        tokio::time::sleep(poll_interval).await;
+
+        let messages = match self.config.mode.as_str() {
+            "polling" => self.poll_tables().await?,
+            "cdc" => self.poll_cdc().await?,
+            _ => {
+                error!("Invalid mode: {}", self.config.mode);
+                return Err(Error::InvalidConfig);
+            }
+        };
+
+        let state = self.state.lock().await;
+        if self.verbose {
+            info!(
+                "PostgreSQL source connector ID: {} produced {} messages. Total processed: {}",
+                self.id,
+                messages.len(),
+                state.processed_rows
+            );
+        } else {
+            debug!(
+                "PostgreSQL source connector ID: {} produced {} messages. Total processed: {}",
+                self.id,
+                messages.len(),
+                state.processed_rows
+            );
+        }
+
+        let schema = match self.payload_format() {
+            PayloadFormat::Bytea => Schema::Raw,
+            PayloadFormat::Text => Schema::Text,
+            PayloadFormat::JsonDirect | PayloadFormat::Json => Schema::Json,
+        };
+
+        Ok(ProducedMessages {
+            schema,
+            messages,
+            state: None,
+        })
+    }
+
+    async fn close(&mut self) -> Result<(), Error> {
+        if let Some(pool) = self.pool.take() {
+            pool.close().await;
+            info!(
+                "PostgreSQL connection pool closed for connector ID: {}",
+                self.id
+            );
+        }
+
+        let state = self.state.lock().await;
+        info!(
+            "PostgreSQL source connector ID: {} closed. Total rows processed: {}",
+            self.id, state.processed_rows
+        );
+        Ok(())
+    }
+}
+
+impl PostgresSource {
     async fn connect(&mut self) -> Result<(), Error> {
         let max_connections = self.config.max_connections.unwrap_or(10);
+        let redacted = redact_connection_string(&self.config.connection_string);
+
+        info!("Connecting to PostgreSQL with max {max_connections} connections: {redacted}");
 
         let pool = PgPoolOptions::new()
             .max_connections(max_connections)
@@ -105,10 +249,7 @@ impl PostgresSource {
             .map_err(|e| Error::InitError(format!("Database connectivity test failed: {e}")))?;
 
         self.pool = Some(pool);
-        info!(
-            "Connected to PostgreSQL database with {} max connections",
-            max_connections
-        );
+        info!("Connected to PostgreSQL database with {max_connections} max connections");
         Ok(())
     }
 
@@ -117,10 +258,7 @@ impl PostgresSource {
             return Ok(());
         }
 
-        let pool = self
-            .pool
-            .as_ref()
-            .ok_or_else(|| Error::InitError("Database not connected".to_string()))?;
+        let pool = self.get_pool()?;
 
         let wal_level: String = sqlx::query_scalar("SHOW wal_level")
             .fetch_one(pool)
@@ -166,10 +304,7 @@ impl PostgresSource {
             .await
             .map_err(|e| Error::InitError(format!("Failed to create replication slot: {e}")))?;
 
-        info!(
-            "PostgreSQL CDC setup completed. Publication: {}, Slot: {}",
-            publication_name, slot_name
-        );
+        info!("PostgreSQL CDC setup completed. Publication: {publication_name}, Slot: {slot_name}");
         Ok(())
     }
 
@@ -192,17 +327,13 @@ impl PostgresSource {
                 }
             }
             other => Err(Error::InitError(format!(
-                "Unsupported cdc_backend '{}'. Use 'builtin' or 'pg_replicate'",
-                other
+                "Unsupported cdc_backend '{other}'. Use 'builtin' or 'pg_replicate'"
             ))),
         }
     }
 
     async fn poll_cdc_builtin(&self) -> Result<Vec<ProducedMessage>, Error> {
-        let pool = self
-            .pool
-            .as_ref()
-            .ok_or_else(|| Error::InitError("Database not connected".to_string()))?;
+        let pool = self.get_pool()?;
 
         let slot_name = self
             .config
@@ -229,7 +360,7 @@ impl PostgresSource {
             .fetch_all(pool)
             .await
             .map_err(|e| {
-                error!("Failed to fetch CDC changes: {}", e);
+                error!("Failed to fetch CDC changes: {e}");
                 Error::InvalidRecord
             })?;
 
@@ -248,8 +379,8 @@ impl PostgresSource {
                     id: Some(Uuid::new_v4().as_u128()),
                     headers: None,
                     checksum: None,
-                    timestamp: Some(chrono::Utc::now().timestamp_millis() as u64),
-                    origin_timestamp: Some(chrono::Utc::now().timestamp_millis() as u64),
+                    timestamp: Some(Utc::now().timestamp_millis() as u64),
+                    origin_timestamp: Some(Utc::now().timestamp_millis() as u64),
                     payload,
                 };
 
@@ -258,8 +389,329 @@ impl PostgresSource {
             }
         }
 
-        info!("CDC: Fetched {} change records", messages.len());
+        if self.verbose {
+            info!("CDC: Fetched {} change records", messages.len());
+        } else {
+            debug!("CDC: Fetched {} change records", messages.len());
+        }
         Ok(messages)
+    }
+
+    async fn poll_tables(&self) -> Result<Vec<ProducedMessage>, Error> {
+        let pool = self.get_pool()?;
+        let mut state = self.state.lock().await;
+        let mut messages = Vec::new();
+
+        let batch_size = self.config.batch_size.unwrap_or(1000);
+        let tracking_column = self.config.tracking_column.as_deref().unwrap_or("id");
+        let pk_column = self
+            .config
+            .primary_key_column
+            .as_deref()
+            .unwrap_or(tracking_column);
+        let payload_format = self.payload_format();
+        let payload_col = self.config.payload_column.as_deref().unwrap_or("");
+
+        for table in &self.config.tables {
+            let last_offset = state.tracking_offsets.get(table).cloned();
+
+            let query = if let Some(custom_query) = &self.config.custom_query {
+                self.validate_custom_query(custom_query)?;
+                self.substitute_query_params(custom_query, table, &last_offset, batch_size)
+            } else {
+                self.build_polling_query(table, tracking_column, &last_offset, batch_size)?
+            };
+
+            let rows = with_retry(
+                || sqlx::query(&query).fetch_all(pool),
+                self.get_max_retries(),
+                self.get_retry_delay().as_millis() as u64,
+            )
+            .await?;
+
+            let mut max_offset: Option<String> = None;
+            let mut processed_ids: Vec<String> = Vec::new();
+
+            for row in rows {
+                let mut row_pk: Option<String> = None;
+                let mut extracted_payload: Option<Vec<u8>> = None;
+                let mut data = serde_json::Map::new();
+
+                for (i, column) in row.columns().iter().enumerate() {
+                    let column_name = if self.config.snake_case_columns.unwrap_or(false) {
+                        to_snake_case(column.name())
+                    } else {
+                        column.name().to_string()
+                    };
+
+                    if !payload_col.is_empty() && column.name() == payload_col {
+                        extracted_payload =
+                            Some(self.extract_payload_column(&row, i, payload_format)?);
+                        continue;
+                    }
+
+                    let value = self.extract_column_value(&row, i)?;
+                    data.insert(column_name.clone(), value.clone());
+
+                    if column.name() == tracking_column {
+                        if let serde_json::Value::String(ref s) = value {
+                            max_offset = Some(s.clone());
+                        } else if let serde_json::Value::Number(ref n) = value {
+                            max_offset = Some(n.to_string());
+                        }
+                    }
+
+                    if column.name() == pk_column {
+                        if let serde_json::Value::String(ref s) = value {
+                            row_pk = Some(s.clone());
+                        } else if let serde_json::Value::Number(ref n) = value {
+                            row_pk = Some(n.to_string());
+                        }
+                    }
+                }
+
+                if let Some(pk) = row_pk {
+                    processed_ids.push(pk);
+                }
+
+                let payload = if let Some(bytes) = extracted_payload {
+                    bytes
+                } else {
+                    let record = if self.config.include_metadata.unwrap_or(true) {
+                        DatabaseRecord {
+                            table_name: table.clone(),
+                            operation_type: "SELECT".to_string(),
+                            timestamp: Utc::now(),
+                            data: serde_json::Value::Object(data),
+                            old_data: None,
+                        }
+                    } else {
+                        let mut simple_record = serde_json::Map::new();
+                        simple_record.insert("data".to_string(), serde_json::Value::Object(data));
+                        DatabaseRecord {
+                            table_name: table.clone(),
+                            operation_type: "SELECT".to_string(),
+                            timestamp: Utc::now(),
+                            data: serde_json::Value::Object(simple_record),
+                            old_data: None,
+                        }
+                    };
+                    simd_json::to_vec(&record).map_err(|_| Error::InvalidRecord)?
+                };
+
+                let message = ProducedMessage {
+                    id: Some(Uuid::new_v4().as_u128()),
+                    headers: None,
+                    checksum: None,
+                    timestamp: Some(Utc::now().timestamp_millis() as u64),
+                    origin_timestamp: Some(Utc::now().timestamp_millis() as u64),
+                    payload,
+                };
+
+                messages.push(message);
+                state.processed_rows += 1;
+            }
+
+            if !processed_ids.is_empty() {
+                self.mark_or_delete_processed_rows(pool, table, pk_column, &processed_ids)
+                    .await?;
+            }
+
+            if let Some(offset) = max_offset {
+                state.tracking_offsets.insert(table.clone(), offset);
+            }
+
+            if self.verbose {
+                info!("Fetched {} rows from table '{table}'", messages.len());
+            } else {
+                debug!("Fetched {} rows from table '{table}'", messages.len());
+            }
+        }
+
+        state.last_poll_time = Utc::now();
+        Ok(messages)
+    }
+
+    async fn mark_or_delete_processed_rows(
+        &self,
+        pool: &Pool<Postgres>,
+        table: &str,
+        pk_column: &str,
+        ids: &[String],
+    ) -> Result<(), Error> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+
+        let quoted_table = quote_identifier(table)?;
+        let quoted_pk = quote_identifier(pk_column)?;
+
+        let ids_list = ids
+            .iter()
+            .map(|id| {
+                if id.parse::<i64>().is_ok() {
+                    id.clone()
+                } else {
+                    format!("'{}'", id.replace('\'', "''"))
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        if self.config.delete_after_read.unwrap_or(false) {
+            let delete_query =
+                format!("DELETE FROM {quoted_table} WHERE {quoted_pk} IN ({ids_list})");
+
+            if self.verbose {
+                info!("Deleting {} processed rows from '{table}'", ids.len());
+            } else {
+                debug!("Deleting {} processed rows from '{table}'", ids.len());
+            }
+
+            sqlx::query(&delete_query)
+                .execute(pool)
+                .await
+                .map_err(|e| {
+                    error!("Failed to delete processed rows: {e}");
+                    Error::InvalidRecord
+                })?;
+        } else if let Some(processed_col) = &self.config.processed_column {
+            let quoted_processed = quote_identifier(processed_col)?;
+            let update_query = format!(
+                "UPDATE {quoted_table} SET {quoted_processed} = TRUE WHERE {quoted_pk} IN ({ids_list})"
+            );
+
+            if self.verbose {
+                info!("Marking {} rows as processed in '{table}'", ids.len());
+            } else {
+                debug!("Marking {} rows as processed in '{table}'", ids.len());
+            }
+
+            sqlx::query(&update_query)
+                .execute(pool)
+                .await
+                .map_err(|e| {
+                    error!("Failed to mark rows as processed: {e}");
+                    Error::InvalidRecord
+                })?;
+        }
+
+        Ok(())
+    }
+
+    fn get_pool(&self) -> Result<&Pool<Postgres>, Error> {
+        self.pool
+            .as_ref()
+            .ok_or_else(|| Error::InitError("Database not connected".to_string()))
+    }
+
+    fn payload_format(&self) -> PayloadFormat {
+        if let Some(ref payload_col) = self.config.payload_column
+            && !payload_col.is_empty()
+        {
+            return PayloadFormat::from_config(self.config.payload_format.as_deref());
+        }
+        PayloadFormat::Json
+    }
+
+    fn get_poll_interval(&self) -> Duration {
+        let interval_str = self.config.poll_interval.as_deref().unwrap_or("10s");
+        HumanDuration::from_str(interval_str)
+            .unwrap_or_else(|_| std::time::Duration::from_secs(10).into())
+            .into()
+    }
+
+    fn get_max_retries(&self) -> u32 {
+        self.config.max_retries.unwrap_or(DEFAULT_MAX_RETRIES)
+    }
+
+    fn get_retry_delay(&self) -> Duration {
+        let delay_str = self
+            .config
+            .retry_delay
+            .as_deref()
+            .unwrap_or(DEFAULT_RETRY_DELAY);
+        HumanDuration::from_str(delay_str)
+            .unwrap_or_else(|e| panic!("Invalid retry_delay '{delay_str}': {e}"))
+            .into()
+    }
+
+    fn build_polling_query(
+        &self,
+        table: &str,
+        tracking_column: &str,
+        last_offset: &Option<String>,
+        batch_size: u32,
+    ) -> Result<String, Error> {
+        let quoted_table = quote_identifier(table)?;
+        let quoted_tracking = quote_identifier(tracking_column)?;
+
+        let base_query = format!("SELECT * FROM {quoted_table}");
+
+        let mut conditions = Vec::new();
+
+        if let Some(offset) = last_offset {
+            conditions.push(format!(
+                "{quoted_tracking} > {}",
+                format_offset_value(offset)
+            ));
+        } else if let Some(initial) = &self.config.initial_offset {
+            conditions.push(format!(
+                "{quoted_tracking} > {}",
+                format_offset_value(initial)
+            ));
+        }
+
+        if let Some(processed_col) = &self.config.processed_column {
+            let quoted_processed = quote_identifier(processed_col)?;
+            conditions.push(format!("{quoted_processed} = FALSE"));
+        }
+
+        let where_clause = if conditions.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", conditions.join(" AND "))
+        };
+
+        let order_clause = format!(" ORDER BY {quoted_tracking} ASC");
+        let limit_clause = format!(" LIMIT {batch_size}");
+
+        Ok(format!(
+            "{base_query}{where_clause}{order_clause}{limit_clause}"
+        ))
+    }
+
+    fn validate_custom_query(&self, query: &str) -> Result<(), Error> {
+        let query_upper = query.to_uppercase();
+        if !query_upper.contains("SELECT") {
+            warn!("Custom query should contain SELECT statement");
+        }
+        if query.contains("$table") && self.config.tables.is_empty() {
+            return Err(Error::InvalidConfig);
+        }
+        Ok(())
+    }
+
+    fn substitute_query_params(
+        &self,
+        query: &str,
+        table: &str,
+        last_offset: &Option<String>,
+        batch_size: u32,
+    ) -> String {
+        let offset_value = last_offset
+            .clone()
+            .or_else(|| self.config.initial_offset.clone())
+            .unwrap_or_default();
+
+        let now = Utc::now();
+
+        query
+            .replace("$table", table)
+            .replace("$offset", &offset_value)
+            .replace("$limit", &batch_size.to_string())
+            .replace("$now", &now.to_rfc3339())
+            .replace("$now_unix", &now.timestamp().to_string())
     }
 
     fn parse_logical_replication_message(
@@ -298,7 +750,7 @@ impl PostgresSource {
                 .to_string();
 
             let data_part = &data[table_start + colon_pos + 1..];
-            let parsed_data = self.parse_record_data(data_part);
+            let parsed_data = parse_record_data(data_part);
 
             return Some(DatabaseRecord {
                 table_name,
@@ -323,7 +775,7 @@ impl PostgresSource {
                 .to_string();
 
             let data_part = &data[table_start + colon_pos + 1..];
-            let parsed_data = self.parse_record_data(data_part);
+            let parsed_data = parse_record_data(data_part);
 
             return Some(DatabaseRecord {
                 table_name,
@@ -348,7 +800,7 @@ impl PostgresSource {
                 .to_string();
 
             let data_part = &data[table_start + colon_pos + 1..];
-            let parsed_data = self.parse_record_data(data_part);
+            let parsed_data = parse_record_data(data_part);
 
             return Some(DatabaseRecord {
                 table_name,
@@ -361,167 +813,39 @@ impl PostgresSource {
         None
     }
 
-    fn parse_record_data(&self, data: &str) -> serde_json::Map<String, serde_json::Value> {
-        let mut result = serde_json::Map::new();
-
-        let parts = data.split_whitespace();
-
-        for part in parts {
-            if let Some(bracket_pos) = part.find('[')
-                && let Some(_close_bracket) = part.find(']')
-                && let Some(colon_pos) = part.find(':')
-            {
-                let column_name = &part[..bracket_pos];
-                let value_str = &part[colon_pos + 1..];
-
-                let cleaned_value = if value_str.starts_with('\'') && value_str.ends_with('\'') {
-                    &value_str[1..value_str.len() - 1]
-                } else {
-                    value_str
-                };
-
-                let value = if let Ok(num) = cleaned_value.parse::<i64>() {
-                    serde_json::Value::Number(serde_json::Number::from(num))
-                } else if let Ok(float) = cleaned_value.parse::<f64>() {
-                    serde_json::Value::Number(
-                        serde_json::Number::from_f64(float).unwrap_or(serde_json::Number::from(0)),
-                    )
-                } else if cleaned_value.eq_ignore_ascii_case("true") {
-                    serde_json::Value::Bool(true)
-                } else if cleaned_value.eq_ignore_ascii_case("false") {
-                    serde_json::Value::Bool(false)
-                } else {
-                    serde_json::Value::String(cleaned_value.to_string())
-                };
-
-                result.insert(column_name.to_string(), value);
-            }
-        }
-
-        result
-    }
-
-    async fn poll_tables(&self) -> Result<Vec<ProducedMessage>, Error> {
-        let pool = self
-            .pool
-            .as_ref()
-            .ok_or_else(|| Error::InitError("Database not connected".to_string()))?;
-        let mut state = self.state.lock().await;
-        let mut messages = Vec::new();
-
-        let batch_size = self.config.batch_size.unwrap_or(1000);
-        let tracking_column = self.config.tracking_column.as_deref().unwrap_or("id");
-
-        for table in &self.config.tables {
-            let last_offset = state.tracking_offsets.get(table).cloned();
-
-            let query = if let Some(custom_query) = &self.config.custom_query {
-                custom_query.clone()
-            } else {
-                self.build_polling_query(table, tracking_column, &last_offset, batch_size)
-            };
-
-            info!("Executing query for table '{}': {}", table, query);
-
-            let rows = sqlx::query(&query)
-                .fetch_all(pool)
-                .await
-                .map_err(|_| Error::InvalidRecord)?;
-
-            let mut max_offset: Option<String> = None;
-
-            for row in rows {
-                let mut data = serde_json::Map::new();
-
-                for (i, column) in row.columns().iter().enumerate() {
-                    let column_name = if self.config.snake_case_columns.unwrap_or(false) {
-                        self.to_snake_case(column.name())
-                    } else {
-                        column.name().to_string()
-                    };
-
-                    let value = self.extract_column_value(&row, i)?;
-                    data.insert(column_name.clone(), value);
-
-                    if column.name() == tracking_column {
-                        if let Some(serde_json::Value::String(offset_str)) = data.get(&column_name)
-                        {
-                            max_offset = Some(offset_str.clone());
-                        } else if let Some(serde_json::Value::Number(offset_num)) =
-                            data.get(&column_name)
-                        {
-                            max_offset = Some(offset_num.to_string());
-                        }
-                    }
-                }
-
-                let record = if self.config.include_metadata.unwrap_or(true) {
-                    DatabaseRecord {
-                        table_name: table.clone(),
-                        operation_type: "SELECT".to_string(),
-                        timestamp: Utc::now(),
-                        data: serde_json::Value::Object(data),
-                        old_data: None,
-                    }
-                } else {
-                    let mut simple_record = serde_json::Map::new();
-                    simple_record.insert("data".to_string(), serde_json::Value::Object(data));
-                    DatabaseRecord {
-                        table_name: table.clone(),
-                        operation_type: "SELECT".to_string(),
-                        timestamp: Utc::now(),
-                        data: serde_json::Value::Object(simple_record),
-                        old_data: None,
-                    }
-                };
-
-                let payload = simd_json::to_vec(&record).map_err(|_| Error::InvalidRecord)?;
-
-                let message = ProducedMessage {
-                    id: Some(Uuid::new_v4().as_u128()),
-                    headers: None,
-                    checksum: None,
-                    timestamp: Some(chrono::Utc::now().timestamp_millis() as u64),
-                    origin_timestamp: Some(chrono::Utc::now().timestamp_millis() as u64),
-                    payload,
-                };
-
-                messages.push(message);
-                state.processed_rows += 1;
-            }
-
-            if let Some(offset) = max_offset {
-                state.tracking_offsets.insert(table.clone(), offset);
-            }
-
-            info!("Fetched {} rows from table '{}'", messages.len(), table);
-        }
-
-        state.last_poll_time = Utc::now();
-        Ok(messages)
-    }
-
-    fn build_polling_query(
+    fn extract_payload_column(
         &self,
-        table: &str,
-        tracking_column: &str,
-        last_offset: &Option<String>,
-        batch_size: u32,
-    ) -> String {
-        let base_query = format!("SELECT * FROM {table}");
-
-        let where_clause = if let Some(offset) = last_offset {
-            format!(" WHERE {tracking_column} > '{offset}'")
-        } else if let Some(initial) = &self.config.initial_offset {
-            format!(" WHERE {tracking_column} > '{initial}'")
-        } else {
-            String::new()
-        };
-
-        let order_clause = format!(" ORDER BY {tracking_column} ASC");
-        let limit_clause = format!(" LIMIT {batch_size}");
-
-        format!("{base_query}{where_clause}{order_clause}{limit_clause}")
+        row: &sqlx::postgres::PgRow,
+        column_index: usize,
+        format: PayloadFormat,
+    ) -> Result<Vec<u8>, Error> {
+        match format {
+            PayloadFormat::Bytea => {
+                let bytes: Option<Vec<u8>> = row
+                    .try_get(column_index)
+                    .map_err(|_| Error::InvalidRecord)?;
+                Ok(bytes.unwrap_or_default())
+            }
+            PayloadFormat::Text => {
+                let text: Option<String> = row
+                    .try_get(column_index)
+                    .map_err(|_| Error::InvalidRecord)?;
+                Ok(text.unwrap_or_default().into_bytes())
+            }
+            PayloadFormat::JsonDirect => {
+                let json_value: Option<serde_json::Value> = row
+                    .try_get(column_index)
+                    .map_err(|_| Error::InvalidRecord)?;
+                simd_json::to_vec(&json_value.unwrap_or(serde_json::Value::Null))
+                    .map_err(|_| Error::InvalidRecord)
+            }
+            PayloadFormat::Json => {
+                let bytes: Option<Vec<u8>> = row
+                    .try_get(column_index)
+                    .map_err(|_| Error::InvalidRecord)?;
+                Ok(bytes.unwrap_or_default())
+            }
+        }
     }
 
     fn extract_column_value(
@@ -541,7 +865,23 @@ impl PostgresSource {
                     .map(serde_json::Value::Bool)
                     .unwrap_or(serde_json::Value::Null))
             }
-            "INT2" | "INT4" | "INT8" => {
+            "INT2" => {
+                let value: Option<i16> = row
+                    .try_get(column_index)
+                    .map_err(|_| Error::InvalidRecord)?;
+                Ok(value
+                    .map(|v| serde_json::Value::from(v as i64))
+                    .unwrap_or(serde_json::Value::Null))
+            }
+            "INT4" => {
+                let value: Option<i32> = row
+                    .try_get(column_index)
+                    .map_err(|_| Error::InvalidRecord)?;
+                Ok(value
+                    .map(|v| serde_json::Value::from(v as i64))
+                    .unwrap_or(serde_json::Value::Null))
+            }
+            "INT8" => {
                 let value: Option<i64> = row
                     .try_get(column_index)
                     .map_err(|_| Error::InvalidRecord)?;
@@ -549,11 +889,28 @@ impl PostgresSource {
                     .map(serde_json::Value::from)
                     .unwrap_or(serde_json::Value::Null))
             }
-            "FLOAT4" | "FLOAT8" | "NUMERIC" => {
+            "FLOAT4" => {
+                let value: Option<f32> = row
+                    .try_get(column_index)
+                    .map_err(|_| Error::InvalidRecord)?;
+                Ok(value
+                    .map(|v| serde_json::Value::from(v as f64))
+                    .unwrap_or(serde_json::Value::Null))
+            }
+            "FLOAT8" => {
                 let value: Option<f64> = row
                     .try_get(column_index)
                     .map_err(|_| Error::InvalidRecord)?;
                 Ok(value
+                    .map(serde_json::Value::from)
+                    .unwrap_or(serde_json::Value::Null))
+            }
+            "NUMERIC" => {
+                let value: Option<String> = row
+                    .try_get(column_index)
+                    .map_err(|_| Error::InvalidRecord)?;
+                Ok(value
+                    .and_then(|s| s.parse::<f64>().ok())
                     .map(serde_json::Value::from)
                     .unwrap_or(serde_json::Value::Null))
             }
@@ -587,6 +944,19 @@ impl PostgresSource {
                     .map_err(|_| Error::InvalidRecord)?;
                 Ok(value.unwrap_or(serde_json::Value::Null))
             }
+            "BYTEA" => {
+                let value: Option<Vec<u8>> = row
+                    .try_get(column_index)
+                    .map_err(|_| Error::InvalidRecord)?;
+                Ok(value
+                    .map(|bytes| {
+                        use base64::Engine;
+                        serde_json::Value::String(
+                            base64::engine::general_purpose::STANDARD.encode(&bytes),
+                        )
+                    })
+                    .unwrap_or(serde_json::Value::Null))
+            }
             _ => {
                 let value: Option<String> = row
                     .try_get(column_index)
@@ -597,217 +967,238 @@ impl PostgresSource {
             }
         }
     }
+}
 
-    fn to_snake_case(&self, input: &str) -> String {
-        let mut result = String::new();
-        let mut prev_was_uppercase = false;
-
-        for (i, ch) in input.chars().enumerate() {
-            if ch.is_uppercase() {
-                if i > 0 && !prev_was_uppercase {
-                    result.push('_');
-                }
-                if let Some(lowercase_ch) = ch.to_lowercase().next() {
-                    result.push(lowercase_ch);
-                } else {
-                    result.push(ch);
-                }
-                prev_was_uppercase = true;
-            } else {
-                result.push(ch);
-                prev_was_uppercase = false;
-            }
-        }
-
-        result
+fn quote_identifier(name: &str) -> Result<String, Error> {
+    if name.is_empty() {
+        return Err(Error::InvalidConfig);
     }
+    if name.contains('\0') {
+        return Err(Error::InvalidConfig);
+    }
+    let escaped = name.replace('"', "\"\"");
+    Ok(format!("\"{escaped}\""))
+}
 
-    fn get_poll_interval(&self) -> Duration {
-        let interval_str = self.config.poll_interval.as_deref().unwrap_or("10s");
-        humantime::Duration::from_str(interval_str)
-            .unwrap_or_else(|_| std::time::Duration::from_secs(10).into())
-            .into()
+fn format_offset_value(value: &str) -> String {
+    if value.parse::<i64>().is_ok() || value.parse::<f64>().is_ok() {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "''"))
     }
 }
 
-#[async_trait]
-impl Source for PostgresSource {
-    async fn open(&mut self) -> Result<(), Error> {
-        info!(
-            "Opening PostgreSQL source connector with ID: {}. Mode: {}, Tables: {:?}",
-            self.id, self.config.mode, self.config.tables
-        );
+fn to_snake_case(input: &str) -> String {
+    let mut result = String::new();
+    let mut prev_was_uppercase = false;
 
-        self.connect().await?;
+    for (i, ch) in input.chars().enumerate() {
+        if ch.is_uppercase() {
+            if i > 0 && !prev_was_uppercase {
+                result.push('_');
+            }
+            if let Some(lowercase_ch) = ch.to_lowercase().next() {
+                result.push(lowercase_ch);
+            } else {
+                result.push(ch);
+            }
+            prev_was_uppercase = true;
+        } else {
+            result.push(ch);
+            prev_was_uppercase = false;
+        }
+    }
 
-        match self.config.mode.as_str() {
-            "cdc" => {
-                self.setup_cdc().await?;
-                let backend = self.config.cdc_backend.as_deref().unwrap_or("builtin");
-                info!(
-                    "PostgreSQL CDC mode enabled (backend: {}) for connector ID: {}",
-                    backend, self.id
+    result
+}
+
+fn parse_record_data(data: &str) -> serde_json::Map<String, serde_json::Value> {
+    let mut result = serde_json::Map::new();
+
+    for part in data.split_whitespace() {
+        if let Some(bracket_pos) = part.find('[')
+            && let Some(_close_bracket) = part.find(']')
+            && let Some(colon_pos) = part.find(':')
+        {
+            let column_name = &part[..bracket_pos];
+            let value_str = &part[colon_pos + 1..];
+
+            let cleaned_value = if value_str.starts_with('\'') && value_str.ends_with('\'') {
+                &value_str[1..value_str.len() - 1]
+            } else {
+                value_str
+            };
+
+            let value = if let Ok(num) = cleaned_value.parse::<i64>() {
+                serde_json::Value::Number(serde_json::Number::from(num))
+            } else if let Ok(float) = cleaned_value.parse::<f64>() {
+                serde_json::Value::Number(
+                    serde_json::Number::from_f64(float).unwrap_or(serde_json::Number::from(0)),
+                )
+            } else if cleaned_value.eq_ignore_ascii_case("true") {
+                serde_json::Value::Bool(true)
+            } else if cleaned_value.eq_ignore_ascii_case("false") {
+                serde_json::Value::Bool(false)
+            } else {
+                serde_json::Value::String(cleaned_value.to_string())
+            };
+
+            result.insert(column_name.to_string(), value);
+        }
+    }
+
+    result
+}
+
+async fn with_retry<T, F, Fut>(operation: F, max_retries: u32, delay_ms: u64) -> Result<T, Error>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<T, sqlx::Error>>,
+{
+    let mut attempts = 0;
+    loop {
+        match operation().await {
+            Ok(result) => return Ok(result),
+            Err(e) => {
+                attempts += 1;
+                if attempts >= max_retries || !is_transient_error(&e) {
+                    error!("Database operation failed after {attempts} attempts: {e}");
+                    return Err(Error::InvalidRecord);
+                }
+                warn!(
+                    "Transient database error (attempt {attempts}/{max_retries}): {e}. Retrying in {delay_ms}ms..."
                 );
-            }
-            "polling" => {
-                info!(
-                    "PostgreSQL polling mode enabled for connector ID: {}",
-                    self.id
-                );
-                info!("Poll interval: {:?}", self.get_poll_interval());
-            }
-            _ => {
-                return Err(Error::InitError(format!(
-                    "Invalid mode '{}'. Supported modes: 'polling', 'cdc'",
-                    self.config.mode
-                )));
+                tokio::time::sleep(Duration::from_millis(delay_ms * attempts as u64)).await;
             }
         }
-
-        info!(
-            "PostgreSQL source connector with ID: {} opened successfully",
-            self.id
-        );
-        Ok(())
     }
+}
 
-    async fn poll(&self) -> Result<ProducedMessages, Error> {
-        let poll_interval = self.get_poll_interval();
-        tokio::time::sleep(poll_interval).await;
-
-        let messages = match self.config.mode.as_str() {
-            "polling" => self.poll_tables().await?,
-            "cdc" => self.poll_cdc().await?,
-            _ => {
-                error!("Invalid mode: {}", self.config.mode);
-                return Err(Error::InvalidConfig);
-            }
-        };
-
-        let state = self.state.lock().await;
-        info!(
-            "PostgreSQL source connector ID: {} produced {} messages. Total processed: {}",
-            self.id,
-            messages.len(),
-            state.processed_rows
-        );
-
-        Ok(ProducedMessages {
-            schema: Schema::Json,
-            messages,
-            state: None,
-        })
+fn is_transient_error(e: &sqlx::Error) -> bool {
+    match e {
+        sqlx::Error::Io(_) => true,
+        sqlx::Error::PoolTimedOut => true,
+        sqlx::Error::PoolClosed => false,
+        sqlx::Error::Protocol(_) => false,
+        sqlx::Error::Database(db_err) => db_err.code().is_some_and(|code| {
+            matches!(
+                code.as_ref(),
+                "40001" | "40P01" | "57P01" | "57P02" | "57P03" | "08000" | "08003" | "08006"
+            )
+        }),
+        _ => false,
     }
+}
 
-    async fn close(&mut self) -> Result<(), Error> {
-        if let Some(pool) = self.pool.take() {
-            pool.close().await;
-            info!(
-                "PostgreSQL connection pool closed for connector ID: {}",
-                self.id
-            );
-        }
-
-        let state = self.state.lock().await;
-        info!(
-            "PostgreSQL source connector ID: {} closed. Total rows processed: {}",
-            self.id, state.processed_rows
-        );
-        Ok(())
+fn redact_connection_string(conn_str: &str) -> String {
+    if let Some(scheme_end) = conn_str.find("://") {
+        let scheme = &conn_str[..scheme_end + 3];
+        let rest = &conn_str[scheme_end + 3..];
+        let preview: String = rest.chars().take(3).collect();
+        return format!("{scheme}{preview}***");
     }
+    let preview: String = conn_str.chars().take(3).collect();
+    format!("{preview}***")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn test_config() -> PostgresSourceConfig {
+        PostgresSourceConfig {
+            connection_string: "postgres://localhost/db".to_string(),
+            mode: "polling".to_string(),
+            tables: vec!["users".to_string()],
+            poll_interval: Some("5s".to_string()),
+            batch_size: Some(500),
+            tracking_column: Some("updated_at".to_string()),
+            initial_offset: None,
+            max_connections: None,
+            enable_wal_cdc: None,
+            custom_query: None,
+            snake_case_columns: None,
+            include_metadata: None,
+            replication_slot: None,
+            publication_name: None,
+            capture_operations: None,
+            cdc_backend: None,
+            delete_after_read: None,
+            processed_column: None,
+            primary_key_column: None,
+            payload_column: None,
+            payload_format: None,
+            verbose_logging: None,
+            max_retries: None,
+            retry_delay: None,
+        }
+    }
+
     #[test]
     fn given_last_offset_polling_query_should_be_built() {
-        let src = PostgresSource::new(
-            1,
-            PostgresSourceConfig {
-                connection_string: "postgres://localhost/db".to_string(),
-                mode: "polling".to_string(),
-                tables: vec!["users".to_string()],
-                poll_interval: Some("5s".to_string()),
-                batch_size: Some(500),
-                tracking_column: Some("updated_at".to_string()),
-                initial_offset: None,
-                max_connections: None,
-                enable_wal_cdc: None,
-                custom_query: None,
-                snake_case_columns: None,
-                include_metadata: None,
-                replication_slot: None,
-                publication_name: None,
-                capture_operations: None,
-                cdc_backend: None,
-            },
-            None,
-        );
-        let query =
-            src.build_polling_query("users", "updated_at", &Some("2024-01-01".to_string()), 500);
+        let src = PostgresSource::new(1, test_config(), None);
+        let query = src
+            .build_polling_query("users", "updated_at", &Some("2024-01-01".to_string()), 500)
+            .expect("Failed to build query");
         assert_eq!(
             query,
-            "SELECT * FROM users WHERE updated_at > '2024-01-01' ORDER BY updated_at ASC LIMIT 500"
+            "SELECT * FROM \"users\" WHERE \"updated_at\" > '2024-01-01' ORDER BY \"updated_at\" ASC LIMIT 500"
         );
     }
 
     #[test]
     fn given_initial_offset_polling_query_should_be_built() {
-        let src = PostgresSource::new(
-            1,
-            PostgresSourceConfig {
-                connection_string: "postgres://localhost/db".to_string(),
-                mode: "polling".to_string(),
-                tables: vec!["users".to_string()],
-                poll_interval: Some("5s".to_string()),
-                batch_size: Some(1000),
-                tracking_column: Some("id".to_string()),
-                initial_offset: Some("100".to_string()),
-                max_connections: None,
-                enable_wal_cdc: None,
-                custom_query: None,
-                snake_case_columns: None,
-                include_metadata: None,
-                replication_slot: None,
-                publication_name: None,
-                capture_operations: None,
-                cdc_backend: None,
-            },
-            None,
-        );
-        let query = src.build_polling_query("users", "id", &None, 1000);
+        let mut config = test_config();
+        config.tracking_column = Some("id".to_string());
+        config.initial_offset = Some("100".to_string());
+        let src = PostgresSource::new(1, config, None);
+        let query = src
+            .build_polling_query("users", "id", &None, 1000)
+            .expect("Failed to build query");
         assert_eq!(
             query,
-            "SELECT * FROM users WHERE id > '100' ORDER BY id ASC LIMIT 1000"
+            "SELECT * FROM \"users\" WHERE \"id\" > 100 ORDER BY \"id\" ASC LIMIT 1000"
         );
     }
 
     #[test]
+    fn given_processed_column_polling_query_should_include_filter() {
+        let mut config = test_config();
+        config.processed_column = Some("is_processed".to_string());
+        let src = PostgresSource::new(1, config, None);
+        let query = src
+            .build_polling_query("events", "id", &None, 100)
+            .expect("Failed to build query");
+        assert!(query.contains("\"is_processed\" = FALSE"));
+    }
+
+    #[test]
+    fn given_numeric_offset_should_not_quote_value() {
+        let src = PostgresSource::new(1, test_config(), None);
+        let query = src
+            .build_polling_query("users", "id", &Some("42".to_string()), 100)
+            .expect("Failed to build query");
+        assert!(query.contains("\"id\" > 42"));
+        assert!(!query.contains("'42'"));
+    }
+
+    #[test]
+    fn given_special_chars_in_identifier_should_escape() {
+        let result = quote_identifier("table\"name").expect("Failed to quote");
+        assert_eq!(result, "\"table\"\"name\"");
+    }
+
+    #[test]
+    fn given_empty_identifier_should_fail() {
+        let result = quote_identifier("");
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn given_insert_message_should_parse_correctly() {
-        let src = PostgresSource::new(
-            1,
-            PostgresSourceConfig {
-                connection_string: String::new(),
-                mode: "cdc".to_string(),
-                tables: vec![],
-                poll_interval: None,
-                batch_size: None,
-                tracking_column: None,
-                initial_offset: None,
-                max_connections: None,
-                enable_wal_cdc: None,
-                custom_query: None,
-                snake_case_columns: None,
-                include_metadata: None,
-                replication_slot: None,
-                publication_name: None,
-                capture_operations: None,
-                cdc_backend: None,
-            },
-            None,
-        );
+        let mut config = test_config();
+        config.mode = "cdc".to_string();
+        let src = PostgresSource::new(1, config, None);
 
         let data = "INSERT: table public.users: id[1] name['Alice'] active[true]";
         let rec = src
@@ -819,28 +1210,9 @@ mod tests {
 
     #[test]
     fn given_update_message_should_parse_correctly() {
-        let src = PostgresSource::new(
-            1,
-            PostgresSourceConfig {
-                connection_string: String::new(),
-                mode: "cdc".to_string(),
-                tables: vec![],
-                poll_interval: None,
-                batch_size: None,
-                tracking_column: None,
-                initial_offset: None,
-                max_connections: None,
-                enable_wal_cdc: None,
-                custom_query: None,
-                snake_case_columns: None,
-                include_metadata: None,
-                replication_slot: None,
-                publication_name: None,
-                capture_operations: None,
-                cdc_backend: None,
-            },
-            None,
-        );
+        let mut config = test_config();
+        config.mode = "cdc".to_string();
+        let src = PostgresSource::new(1, config, None);
 
         let data = "UPDATE: table public.orders: id[42] total[99.5]";
         let rec = src
@@ -852,28 +1224,9 @@ mod tests {
 
     #[test]
     fn given_delete_message_should_parse_correctly() {
-        let src = PostgresSource::new(
-            1,
-            PostgresSourceConfig {
-                connection_string: String::new(),
-                mode: "cdc".to_string(),
-                tables: vec![],
-                poll_interval: None,
-                batch_size: None,
-                tracking_column: None,
-                initial_offset: None,
-                max_connections: None,
-                enable_wal_cdc: None,
-                custom_query: None,
-                snake_case_columns: None,
-                include_metadata: None,
-                replication_slot: None,
-                publication_name: None,
-                capture_operations: None,
-                cdc_backend: None,
-            },
-            None,
-        );
+        let mut config = test_config();
+        config.mode = "cdc".to_string();
+        let src = PostgresSource::new(1, config, None);
 
         let data = "DELETE: table public.products: id[7]";
         let rec = src
@@ -881,5 +1234,63 @@ mod tests {
             .unwrap();
         assert_eq!(rec.table_name, "products");
         assert_eq!(rec.operation_type, "DELETE");
+    }
+
+    #[test]
+    fn given_custom_query_params_should_substitute_correctly() {
+        let mut config = test_config();
+        config.initial_offset = Some("0".to_string());
+        let src = PostgresSource::new(1, config, None);
+
+        let query = "SELECT * FROM $table WHERE id > $offset ORDER BY id LIMIT $limit";
+        let result = src.substitute_query_params(query, "events", &Some("100".to_string()), 50);
+
+        assert!(result.contains("FROM events"));
+        assert!(result.contains("id > 100"));
+        assert!(result.contains("LIMIT 50"));
+    }
+
+    #[test]
+    fn given_custom_query_with_time_params_should_substitute_correctly() {
+        let src = PostgresSource::new(1, test_config(), None);
+
+        let query = "SELECT * FROM $table WHERE created_at < '$now'";
+        let result = src.substitute_query_params(query, "logs", &None, 100);
+
+        assert!(result.contains("FROM logs"));
+        assert!(!result.contains("$now"));
+    }
+
+    #[test]
+    fn given_no_last_offset_should_use_initial_offset() {
+        let mut config = test_config();
+        config.initial_offset = Some("500".to_string());
+        let src = PostgresSource::new(1, config, None);
+
+        let query = "SELECT * FROM $table WHERE id > $offset";
+        let result = src.substitute_query_params(query, "data", &None, 100);
+
+        assert!(result.contains("id > 500"));
+    }
+
+    #[test]
+    fn given_connection_string_with_credentials_should_redact() {
+        let conn = "postgres://user:password@localhost:5432/db";
+        let redacted = redact_connection_string(conn);
+        assert_eq!(redacted, "postgres://use***");
+    }
+
+    #[test]
+    fn given_connection_string_without_scheme_should_redact() {
+        let conn = "localhost:5432/db";
+        let redacted = redact_connection_string(conn);
+        assert_eq!(redacted, "loc***");
+    }
+
+    #[test]
+    fn given_postgresql_scheme_should_redact() {
+        let conn = "postgresql://admin:secret123@db.example.com:5432/mydb";
+        let redacted = redact_connection_string(conn);
+        assert_eq!(redacted, "postgresql://adm***");
     }
 }

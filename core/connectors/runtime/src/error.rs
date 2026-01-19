@@ -57,6 +57,12 @@ pub enum RuntimeError {
     IoError(#[from] std::io::Error),
     #[error("HTTP request failed: {0}")]
     HttpRequestFailed(String),
+    #[error("Token file not found: {0}")]
+    TokenFileNotFound(String),
+    #[error("Failed to read token file '{0}': {1}")]
+    TokenFileReadError(String, String),
+    #[error("Token file is empty: {0}")]
+    TokenFileEmpty(String),
 }
 
 impl RuntimeError {
@@ -69,6 +75,9 @@ impl RuntimeError {
             RuntimeError::MissingIggyCredentials => "invalid_configuration",
             RuntimeError::InvalidConfiguration(_) => "invalid_configuration",
             RuntimeError::HttpRequestFailed(_) => "http_request_failed",
+            RuntimeError::TokenFileNotFound(_) => "invalid_configuration",
+            RuntimeError::TokenFileReadError(_, _) => "invalid_configuration",
+            RuntimeError::TokenFileEmpty(_) => "invalid_configuration",
             _ => "error",
         }
     }

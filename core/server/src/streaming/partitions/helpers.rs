@@ -15,13 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use err_trail::ErrContext;
-use iggy_common::{ConsumerOffsetInfo, Identifier, IggyByteSize, IggyError};
-use std::{
-    ops::AsyncFnOnce,
-    sync::{Arc, atomic::Ordering},
-};
-
 use crate::{
     configs::{cache_indexes::CacheIndexesConfig, system::SystemConfig},
     slab::{
@@ -41,6 +34,12 @@ use crate::{
         polling_consumer::ConsumerGroupId,
         segments::{IggyIndexesMut, IggyMessagesBatchMut, IggyMessagesBatchSet, storage::Storage},
     },
+};
+use err_trail::ErrContext;
+use iggy_common::{ConsumerOffsetInfo, Identifier, IggyByteSize, IggyError};
+use std::{
+    ops::AsyncFnOnce,
+    sync::{Arc, atomic::Ordering},
 };
 
 pub fn get_partition_ids() -> impl FnOnce(&Partitions) -> Vec<usize> {
@@ -428,6 +427,29 @@ pub fn append_to_journal(
         log.active_segment_mut().current_position += batch_messages_size;
 
         Ok((journal_messages_count, journal_size))
+    }
+}
+
+/// Commit journal and set in-flight buffer with frozen batches.
+/// Returns frozen batches for persisting to disk.
+pub fn commit_journal_with_in_flight()
+-> impl FnOnce(ComponentsById<PartitionRefMut>) -> Vec<iggy_common::IggyMessagesBatch> {
+    |(.., log)| {
+        let mut batches = log.journal_mut().commit();
+        if batches.is_empty() {
+            return Vec::new();
+        }
+        log.ensure_indexes();
+        batches.append_indexes_to(log.active_indexes_mut().unwrap());
+        let frozen: Vec<_> = batches.iter_mut().map(|b| b.freeze()).collect();
+        log.set_in_flight(frozen.clone());
+        frozen
+    }
+}
+
+pub fn clear_in_flight() -> impl FnOnce(ComponentsById<PartitionRefMut>) {
+    |(.., log)| {
+        log.clear_in_flight();
     }
 }
 

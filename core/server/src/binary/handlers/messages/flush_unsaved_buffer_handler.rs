@@ -43,6 +43,7 @@ impl ServerCommandHandler for FlushUnsavedBuffer {
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
+        shard.ensure_authenticated(session)?;
 
         let user_id = session.get_user_id();
         let stream_id = self.stream_id.clone();

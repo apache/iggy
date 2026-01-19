@@ -22,7 +22,6 @@ mod general;
 mod scenarios;
 mod specific;
 
-use futures::FutureExt;
 use iggy_common::TransportProtocol;
 use integration::{
     http_client::HttpClientFactory,
@@ -32,19 +31,21 @@ use integration::{
     websocket_client::WebSocketClientFactory,
 };
 use scenarios::{
-    bench_scenario, consumer_group_auto_commit_reconnection_scenario, consumer_group_join_scenario,
-    consumer_group_offset_cleanup_scenario,
+    authentication_scenario, bench_scenario, consumer_group_auto_commit_reconnection_scenario,
+    consumer_group_join_scenario, consumer_group_offset_cleanup_scenario,
     consumer_group_with_multiple_clients_polling_messages_scenario,
     consumer_group_with_single_client_polling_messages_scenario,
     consumer_timestamp_polling_scenario, create_message_payload, message_headers_scenario,
-    stream_size_validation_scenario, system_scenario, user_scenario,
+    permissions_scenario, stream_size_validation_scenario, system_scenario, user_scenario,
 };
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
 use std::{collections::HashMap, future::Future};
 
 type ScenarioFn = fn(&dyn ClientFactory) -> Pin<Box<dyn Future<Output = ()> + '_>>;
+
+fn authentication_scenario() -> ScenarioFn {
+    |factory| Box::pin(authentication_scenario::run(factory))
+}
 
 fn system_scenario() -> ScenarioFn {
     |factory| Box::pin(system_scenario::run(factory))
@@ -94,6 +95,10 @@ fn bench_scenario() -> ScenarioFn {
     |factory| Box::pin(bench_scenario::run(factory))
 }
 
+fn permissions_scenario() -> ScenarioFn {
+    |factory| Box::pin(permissions_scenario::run(factory))
+}
+
 fn consumer_timestamp_polling_scenario() -> ScenarioFn {
     |factory| Box::pin(consumer_timestamp_polling_scenario::run(factory))
 }
@@ -112,67 +117,30 @@ async fn run_scenario(transport: TransportProtocol, scenario: ScenarioFn) {
         "IGGY_QUIC_KEEP_ALIVE_INTERVAL".to_string(),
         "15s".to_string(),
     );
-    let test_server = TestServer::new(Some(extra_envs), true, None, IpAddrKind::V4);
-    let test_server = Arc::new(Mutex::new(test_server));
+    let mut test_server = TestServer::new(Some(extra_envs), true, None, IpAddrKind::V4);
+    test_server.start();
 
-    test_server.lock().unwrap().start();
-
-    let client_factory: Box<dyn ClientFactory> = {
-        let server = test_server.lock().unwrap();
-        match transport {
-            TransportProtocol::Tcp => {
-                let server_addr = server.get_raw_tcp_addr().unwrap();
-                Box::new(TcpClientFactory {
-                    server_addr,
-                    ..Default::default()
-                })
-            }
-            TransportProtocol::Quic => {
-                let server_addr = server.get_quic_udp_addr().unwrap();
-                Box::new(QuicClientFactory { server_addr })
-            }
-            TransportProtocol::Http => {
-                let server_addr = server.get_http_api_addr().unwrap();
-                Box::new(HttpClientFactory { server_addr })
-            }
-            TransportProtocol::WebSocket => {
-                let server_addr = server.get_websocket_addr().unwrap();
-                Box::new(WebSocketClientFactory { server_addr })
-            }
+    let client_factory: Box<dyn ClientFactory> = match transport {
+        TransportProtocol::Tcp => {
+            let server_addr = test_server.get_raw_tcp_addr().unwrap();
+            Box::new(TcpClientFactory {
+                server_addr,
+                ..Default::default()
+            })
+        }
+        TransportProtocol::Quic => {
+            let server_addr = test_server.get_quic_udp_addr().unwrap();
+            Box::new(QuicClientFactory { server_addr })
+        }
+        TransportProtocol::Http => {
+            let server_addr = test_server.get_http_api_addr().unwrap();
+            Box::new(HttpClientFactory { server_addr })
+        }
+        TransportProtocol::WebSocket => {
+            let server_addr = test_server.get_websocket_addr().unwrap();
+            Box::new(WebSocketClientFactory { server_addr })
         }
     };
 
-    let monitor_server = test_server.clone();
-    let crash_monitor = async move {
-        loop {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            let mut server = monitor_server.lock().unwrap();
-            if !server.is_running() {
-                let (stdout, stderr) = server.collect_logs();
-                return (stdout, stderr);
-            }
-        }
-    };
-
-    tokio::select! {
-        biased;
-
-        (stdout, stderr) = crash_monitor => {
-            panic!(
-                "Server crashed during test!\n\n\
-                 === STDOUT ===\n{}\n\n\
-                 === STDERR ===\n{}",
-                stdout, stderr
-            );
-        }
-
-        result = std::panic::AssertUnwindSafe(scenario(&*client_factory)).catch_unwind() => {
-            test_server.lock().unwrap().assert_running();
-
-            // Re-raise any panic from the scenario
-            if let Err(panic_payload) = result {
-                std::panic::resume_unwind(panic_payload);
-            }
-        }
-    }
+    scenario(&*client_factory).await;
 }

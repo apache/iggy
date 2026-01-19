@@ -111,12 +111,16 @@ fn messages_from_bytes_and_count(buffer: Bytes, count: u32) -> Result<Vec<IggyMe
         let payload = buffer.slice(position..payload_end);
         position = payload_end;
 
+        let user_headers_end = position + header.user_headers_length as usize;
+        if user_headers_end > buf_len {
+            break;
+        }
         let user_headers = if header.user_headers_length > 0 {
-            Some(buffer.slice(position..position + header.user_headers_length as usize))
+            Some(buffer.slice(position..user_headers_end))
         } else {
             None
         };
-        position += header.user_headers_length as usize;
+        position = user_headers_end;
 
         messages.push(IggyMessage {
             header,

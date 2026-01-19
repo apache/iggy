@@ -43,7 +43,8 @@ impl ServerCommandHandler for GetUser {
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
-        let Ok(user) = shard.find_user(session, &self.user_id) else {
+        shard.ensure_authenticated(session)?;
+        let Ok(user) = shard.find_user(&self.user_id) else {
             sender.send_empty_ok_response().await?;
             return Ok(HandlerResult::Finished);
         };
@@ -51,6 +52,14 @@ impl ServerCommandHandler for GetUser {
             sender.send_empty_ok_response().await?;
             return Ok(HandlerResult::Finished);
         };
+
+        // Permission check: only required if user is looking for someone else
+        if user.id != session.get_user_id() {
+            shard
+                .permissioner
+                .borrow()
+                .get_user(session.get_user_id())?;
+        }
 
         let bytes = mapper::map_user(&user);
         sender.send_ok_response(&bytes).await?;

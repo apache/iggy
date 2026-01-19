@@ -17,17 +17,14 @@
  */
 
 use crate::shard::IggyShard;
-use crate::streaming::session::Session;
 use crate::streaming::utils::address::{extract_ip, extract_port};
 use iggy_common::{
-    ClusterMetadata, ClusterNode, ClusterNodeRole, ClusterNodeStatus, IggyError, TransportEndpoints,
+    ClusterMetadata, ClusterNode, ClusterNodeRole, ClusterNodeStatus, TransportEndpoints,
 };
 use tracing::trace;
 
 impl IggyShard {
-    pub fn get_cluster_metadata(&self, session: &Session) -> Result<ClusterMetadata, IggyError> {
-        trace!("Getting cluster metadata for session: {session}");
-
+    pub fn get_cluster_metadata(&self) -> ClusterMetadata {
         let mut nodes = Vec::new();
 
         // Determine cluster name and current node name based on whether clustering is enabled
@@ -105,10 +102,10 @@ impl IggyShard {
             }
         }
 
-        Ok(ClusterMetadata {
+        ClusterMetadata {
             name: cluster_name,
             nodes,
-        })
+        }
     }
 
     /// Get actual bound ports from the shard's bound addresses

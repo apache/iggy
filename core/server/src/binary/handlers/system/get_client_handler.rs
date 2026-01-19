@@ -42,13 +42,13 @@ impl ServerCommandHandler for GetClient {
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
+        shard.ensure_authenticated(session)?;
+        shard
+            .permissioner
+            .borrow()
+            .get_client(session.get_user_id())?;
 
-        let Ok(client) = shard.get_client(session, self.client_id) else {
-            sender.send_empty_ok_response().await?;
-            return Ok(HandlerResult::Finished);
-        };
-
-        let Some(client) = client else {
+        let Some(client) = shard.get_client(self.client_id) else {
             sender.send_empty_ok_response().await?;
             return Ok(HandlerResult::Finished);
         };

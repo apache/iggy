@@ -45,7 +45,8 @@ runs:
       uses: ./.github/actions/utils/setup-rust-with-cache
       with:
         cache-targets: false # Only cache registry and git deps, not target dir (sccache handles that)
-        show-stats: true
+        # Only test (most comprehensive) and build-* tasks should save cache
+        save-cache: ${{ inputs.task == 'test' || startsWith(inputs.task, 'build-') }}
 
     - name: Install tools for specific tasks
       run: |
@@ -103,15 +104,28 @@ runs:
     - name: Build and test
       if: inputs.task == 'test'
       run: |
-        # Build all targets first
+        build_start=$(date +%s)
         cargo build --locked --all-targets
+        build_end=$(date +%s)
+        build_duration=$((build_end - build_start))
+        echo "::notice::Build completed in ${build_duration}s ($(date -ud @${build_duration} +'%M:%S'))"
 
-        # Use nextest if available, otherwise use cargo test
+        test_start=$(date +%s)
         if command -v cargo-nextest &> /dev/null; then
           cargo nextest run --locked --no-fail-fast
         else
           cargo test --locked --no-fail-fast
         fi
+        test_end=$(date +%s)
+        test_duration=$((test_end - test_start))
+        echo "::notice::Tests completed in ${test_duration}s ($(date -ud @${test_duration} +'%M:%S'))"
+
+        echo ""
+        echo "========================================="
+        echo "Build time: ${build_duration}s ($(date -ud @${build_duration} +'%M:%S'))"
+        echo "Test time:  ${test_duration}s ($(date -ud @${test_duration} +'%M:%S'))"
+        echo "Total time: $((build_duration + test_duration))s ($(date -ud @$((build_duration + test_duration)) +'%M:%S'))"
+        echo "========================================="
       shell: bash
 
     - name: Backwards compatibility check
@@ -151,4 +165,15 @@ runs:
     - name: Build macOS aarch64
       if: inputs.task == 'build-macos-aarch64'
       run: cargo build --locked --all-targets
+      shell: bash
+
+    - name: Show sccache statistics
+      if: always()
+      run: |
+        if command -v sccache &> /dev/null; then
+          echo "========================================="
+          echo "sccache statistics:"
+          echo "========================================="
+          sccache --show-stats
+        fi
       shell: bash

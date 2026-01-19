@@ -25,14 +25,18 @@ inputs:
     description: "Whether to enable caching"
     required: false
     default: "true"
-  show-stats:
-    description: "Whether to show sccache statistics at the end"
-    required: false
-    default: "false"
   cache-targets:
     description: "Whether to cache target directory (passed to rust-cache)"
     required: false
     default: "false"
+  profile:
+    description: "Build profile for cache separation (dev or release)"
+    required: false
+    default: "dev"
+  save-cache:
+    description: "Whether to save cache at end of job (set false for jobs that don't compile much)"
+    required: false
+    default: "true"
 
 runs:
   using: "composite"
@@ -60,19 +64,36 @@ runs:
       uses: Swatinem/rust-cache@v2
       with:
         cache-targets: ${{ inputs.cache-targets }}
+        shared-key: rust-deps  # All jobs share same dependency cache (profile doesn't affect downloads)
 
-    - name: Setup sccache cache
-      if: inputs.enabled == 'true'
+    - name: Get current date
+      id: date
+      run: echo "date=$(date +'%Y-%m-%d')" >> $GITHUB_OUTPUT
+      shell: bash
+
+    - name: Setup sccache cache (restore and save)
+      if: inputs.enabled == 'true' && inputs.save-cache == 'true'
       uses: actions/cache@v4
       with:
         path: |
           ~/.cache/sccache
           ~/Library/Caches/sccache
           ~/.local/share/sccache
-        key: sccache-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+        key: sccache-${{ runner.os }}-${{ runner.arch }}-${{ inputs.profile }}-${{ steps.date.outputs.date }}-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
         restore-keys: |
-          sccache-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
-          sccache-${{ runner.os }}-${{ runner.arch }}-
+          sccache-${{ runner.os }}-${{ runner.arch }}-${{ inputs.profile }}-
+
+    - name: Setup sccache cache (restore only)
+      if: inputs.enabled == 'true' && inputs.save-cache != 'true'
+      uses: actions/cache/restore@v4
+      with:
+        path: |
+          ~/.cache/sccache
+          ~/Library/Caches/sccache
+          ~/.local/share/sccache
+        key: sccache-${{ runner.os }}-${{ runner.arch }}-${{ inputs.profile }}-${{ steps.date.outputs.date }}-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+        restore-keys: |
+          sccache-${{ runner.os }}-${{ runner.arch }}-${{ inputs.profile }}-
 
     - name: Install sccache
       if: inputs.enabled == 'true'
@@ -80,24 +101,44 @@ runs:
         # Check if sccache is already installed
         if ! command -v sccache &> /dev/null; then
           echo "Installing sccache..."
-          SCCACHE_VERSION="v0.8.2"
+          SCCACHE_VERSION="v0.13.0"
 
-          # Detect architecture
+          # Detect OS and architecture
+          OS="$(uname -s)"
           ARCH="$(uname -m)"
-          case "$ARCH" in
-            x86_64)  SCCACHE_ARCH="x86_64-unknown-linux-musl" ;;
-            aarch64) SCCACHE_ARCH="aarch64-unknown-linux-musl" ;;
-            *)
-              echo "⚠️ Unsupported architecture: $ARCH, skipping sccache"
-              exit 0
-              ;;
-          esac
+
+          if [[ "$OS" == "Linux" ]]; then
+            case "$ARCH" in
+              x86_64)  SCCACHE_ARCH="x86_64-unknown-linux-musl" ;;
+              aarch64) SCCACHE_ARCH="aarch64-unknown-linux-musl" ;;
+              *)
+                echo "⚠️ Unsupported Linux architecture: $ARCH, skipping sccache"
+                exit 0
+                ;;
+            esac
+          elif [[ "$OS" == "Darwin" ]]; then
+            case "$ARCH" in
+              x86_64) SCCACHE_ARCH="x86_64-apple-darwin" ;;
+              arm64)  SCCACHE_ARCH="aarch64-apple-darwin" ;;
+              *)
+                echo "⚠️ Unsupported macOS architecture: $ARCH, skipping sccache"
+                exit 0
+                ;;
+            esac
+          else
+            echo "⚠️ Unsupported OS: $OS, skipping sccache"
+            exit 0
+          fi
 
           SCCACHE_URL="https://github.com/mozilla/sccache/releases/download/${SCCACHE_VERSION}/sccache-${SCCACHE_VERSION}-${SCCACHE_ARCH}.tar.gz"
-          echo "Downloading sccache for $SCCACHE_ARCH..."
+          echo "Downloading sccache $SCCACHE_VERSION for $SCCACHE_ARCH..."
 
           curl -L "$SCCACHE_URL" | tar xz
-          sudo mv "sccache-${SCCACHE_VERSION}-${SCCACHE_ARCH}/sccache" /usr/local/bin/
+          if [[ "$OS" == "Darwin" ]]; then
+            mv "sccache-${SCCACHE_VERSION}-${SCCACHE_ARCH}/sccache" /usr/local/bin/
+          else
+            sudo mv "sccache-${SCCACHE_VERSION}-${SCCACHE_ARCH}/sccache" /usr/local/bin/
+          fi
           rm -rf "sccache-${SCCACHE_VERSION}-${SCCACHE_ARCH}"
         fi
       shell: bash
@@ -149,6 +190,16 @@ runs:
           # This provides better control and persistence
           echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
 
+          # Disable incremental compilation - not useful in CI with sccache
+          echo "CARGO_INCREMENTAL=0" >> $GITHUB_ENV
+
+          # Disable debug info in dev/test builds - faster compilation, smaller cache
+          echo "CARGO_PROFILE_DEV_DEBUG=0" >> $GITHUB_ENV
+          echo "CARGO_PROFILE_TEST_DEBUG=0" >> $GITHUB_ENV
+
+          # Use sparse registry protocol for faster dependency resolution
+          echo "CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse" >> $GITHUB_ENV
+
           # Start sccache server
           sccache --stop-server 2>/dev/null || true
           sccache --start-server || true
@@ -165,14 +216,5 @@ runs:
           fi
         else
           echo "⚠️ sccache not available, continuing without cache"
-        fi
-      shell: bash
-
-    - name: Show sccache stats on completion
-      if: always() && inputs.enabled == 'true' && inputs.show-stats == 'true'
-      run: |
-        if command -v sccache &> /dev/null; then
-          echo "### Final sccache Statistics ###"
-          sccache --show-stats || true
         fi
       shell: bash
