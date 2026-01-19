@@ -69,15 +69,22 @@ async fn get_user(
     Path(user_id): Path<String>,
 ) -> Result<Json<UserInfoDetails>, CustomError> {
     let identifier_user_id = Identifier::from_str_value(&user_id)?;
-    let Ok(user) = state.shard.shard().find_user(
-        &Session::stateless(identity.user_id, identity.ip_address),
-        &identifier_user_id,
-    ) else {
+    let Ok(user) = state.shard.shard().find_user(&identifier_user_id) else {
         return Err(CustomError::ResourceNotFound);
     };
     let Some(user) = user else {
         return Err(CustomError::ResourceNotFound);
     };
+
+    // Permission check: only required if user is looking for someone else
+    if user.id != identity.user_id {
+        state
+            .shard
+            .shard()
+            .permissioner
+            .borrow()
+            .get_user(identity.user_id)?;
+    }
 
     let user = mapper::map_user(&user);
     Ok(Json(user))
@@ -88,19 +95,14 @@ async fn get_users(
     State(state): State<Arc<AppState>>,
     Extension(identity): Extension<Identity>,
 ) -> Result<Json<Vec<UserInfo>>, CustomError> {
-    let session = SendWrapper::new(Session::stateless(identity.user_id, identity.ip_address));
+    state
+        .shard
+        .shard()
+        .permissioner
+        .borrow()
+        .get_users(identity.user_id)?;
 
-    let users = {
-        let future = SendWrapper::new(state.shard.shard().get_users(&session));
-        future.await
-    }
-    .error(|e: &IggyError| {
-        format!(
-            "{COMPONENT} (error: {e}) - failed to get users, user ID: {}",
-            identity.user_id
-        )
-    })?;
-
+    let users = state.shard.shard().get_users();
     let user_refs: Vec<&User> = users.iter().collect();
     let users = mapper::map_users(&user_refs);
     Ok(Json(users))
@@ -114,14 +116,17 @@ async fn create_user(
     Json(command): Json<CreateUser>,
 ) -> Result<Json<UserInfoDetails>, CustomError> {
     command.validate()?;
-
-    let session = SendWrapper::new(Session::stateless(identity.user_id, identity.ip_address));
+    state
+        .shard
+        .shard()
+        .permissioner
+        .borrow()
+        .create_user(identity.user_id)?;
 
     let user = state
         .shard
         .shard()
         .create_user(
-            &session,
             &command.username,
             &command.password,
             command.status,
@@ -196,18 +201,17 @@ async fn update_user(
 ) -> Result<StatusCode, CustomError> {
     command.user_id = Identifier::from_str_value(&user_id)?;
     command.validate()?;
-
-    let session = Session::stateless(identity.user_id, identity.ip_address);
+    state
+        .shard
+        .shard()
+        .permissioner
+        .borrow()
+        .update_user(identity.user_id)?;
 
     state
         .shard
         .shard()
-        .update_user(
-            &session,
-            &command.user_id,
-            command.username.clone(),
-            command.status,
-        )
+        .update_user(&command.user_id, command.username.clone(), command.status)
         .error(|e: &IggyError| {
             format!("{COMPONENT} (error: {e}) - failed to update user, user ID: {user_id}")
         })?;
@@ -261,12 +265,25 @@ async fn update_permissions(
 ) -> Result<StatusCode, CustomError> {
     command.user_id = Identifier::from_str_value(&user_id)?;
     command.validate()?;
-
-    let session = Session::stateless(identity.user_id, identity.ip_address);
     state
         .shard
         .shard()
-        .update_permissions(&session, &command.user_id, command.permissions.clone())
+        .permissioner
+        .borrow()
+        .update_permissions(identity.user_id)?;
+
+    // Check if target user is root - cannot change root user permissions
+    let target_user = state.shard.shard().get_user(&command.user_id)?;
+    if target_user.is_root() {
+        return Err(CustomError::from(IggyError::CannotChangePermissions(
+            target_user.id,
+        )));
+    }
+
+    state
+        .shard
+        .shard()
+        .update_permissions(&command.user_id, command.permissions.clone())
         .error(|e: &IggyError| {
             format!("{COMPONENT} (error: {e}) - failed to update permissions, user ID: {user_id}")
         })?;
@@ -318,12 +335,21 @@ async fn change_password(
     command.user_id = Identifier::from_str_value(&user_id)?;
     command.validate()?;
 
-    let session = Session::stateless(identity.user_id, identity.ip_address);
+    // Check if user is changing someone else's password
+    let target_user = state.shard.shard().get_user(&command.user_id)?;
+    if target_user.id != identity.user_id {
+        state
+            .shard
+            .shard()
+            .permissioner
+            .borrow()
+            .change_password(identity.user_id)?;
+    }
+
     state
         .shard
         .shard()
         .change_password(
-            &session,
             &command.user_id,
             &command.current_password,
             &command.new_password,
@@ -377,13 +403,17 @@ async fn delete_user(
     Path(user_id): Path<String>,
 ) -> Result<StatusCode, CustomError> {
     let identifier_user_id = Identifier::from_str_value(&user_id)?;
-
-    let session = Session::stateless(identity.user_id, identity.ip_address);
+    state
+        .shard
+        .shard()
+        .permissioner
+        .borrow()
+        .delete_user(identity.user_id)?;
 
     state
         .shard
         .shard()
-        .delete_user(&session, &identifier_user_id)
+        .delete_user(&identifier_user_id)
         .error(|e: &IggyError| {
             format!("{COMPONENT} (error: {e}) - failed to delete user with ID: {user_id}")
         })?;

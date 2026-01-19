@@ -75,7 +75,8 @@ async fn poll_messages(
         PollingArgs::new(query.0.strategy, query.0.count, query.0.auto_commit),
     ));
 
-    let (metadata, messages)  = poll_future.await
+    let (metadata, messages) = poll_future
+        .await
         .error(|e: &IggyError| {
             format!(
                 "{COMPONENT} (error: {e}) - failed to poll messages, stream ID: {}, topic ID: {}, partition ID: {:?}",
@@ -112,7 +113,8 @@ async fn send_messages(
         batch,
     ));
 
-    append_future.await
+    append_future
+        .await
         .error(|e: &IggyError| {
             format!(
                 "{COMPONENT} (error: {e}) - failed to append messages, stream ID: {stream_id}, topic ID: {topic_id}"

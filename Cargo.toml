@@ -143,6 +143,7 @@ integration = { path = "core/integration" }
 keyring = { version = "3.6.3", features = ["sync-secret-service", "vendored"] }
 lazy_static = "1.5.0"
 log = "0.4.29"
+metadata = { path = "core/metadata" }
 mimalloc = "0.1"
 mockall = "0.14.0"
 nix = { version = "0.30.1", features = ["fs", "resource", "sched"] }

@@ -21,13 +21,12 @@ use crate::binary::command::{
     BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
 };
 use crate::binary::handlers::utils::receive_and_validate;
-use iggy_common::SenderKind;
-
 use crate::shard::IggyShard;
 use crate::streaming::session::Session;
 use anyhow::Result;
 use err_trail::ErrContext;
 use iggy_common::IggyError;
+use iggy_common::SenderKind;
 use iggy_common::leave_consumer_group::LeaveConsumerGroup;
 use std::rc::Rc;
 use tracing::{debug, instrument};
@@ -47,10 +46,16 @@ impl ServerCommandHandler for LeaveConsumerGroup {
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
         shard.ensure_authenticated(session)?;
-
+        let (stream_id, topic_id) = shard.resolve_topic_id(&self.stream_id, &self.topic_id)?;
+        shard.permissioner.borrow().leave_consumer_group(
+            session.get_user_id(),
+            stream_id,
+            topic_id,
+        )?;
+        shard.ensure_consumer_group_exists(&self.stream_id, &self.topic_id, &self.group_id)?;
         shard
             .leave_consumer_group(
-                session,
+                session.client_id,
                 &self.stream_id,
                 &self.topic_id,
                 &self.group_id,
