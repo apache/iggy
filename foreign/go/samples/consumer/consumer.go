@@ -23,24 +23,24 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/apache/iggy/foreign/go/client"
+	"github.com/apache/iggy/foreign/go/client/tcp"
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
-	"github.com/apache/iggy/foreign/go/iggycli"
 	sharedDemoContracts "github.com/apache/iggy/foreign/go/samples/shared"
-	"github.com/apache/iggy/foreign/go/tcp"
 )
 
 // config
 const (
-    DefaultStreamId = uint32(0)
-    TopicId         = uint32(0)
-    Partition       = 0
-    Interval        = 1000
-    ConsumerId      = uint32(0)
+	DefaultStreamId = uint32(0)
+	TopicId         = uint32(0)
+	Partition       = 0
+	Interval        = 1000
+	ConsumerId      = uint32(0)
 )
 
 func main() {
-	cli, err := iggycli.NewIggyClient(
-		iggycli.WithTcp(
+	cli, err := client.NewIggyClient(
+		client.WithTcp(
 			tcp.WithServerAddress("127.0.0.1:8090"),
 		),
 	)
@@ -61,10 +61,10 @@ func main() {
 	}
 }
 
-func EnsureInfrastructureIsInitialized(cli iggycli.Client) error {
+func EnsureInfrastructureIsInitialized(cli iggcon.Client) error {
 	streamIdentifier, _ := iggcon.NewIdentifier(DefaultStreamId)
-    if _, streamErr := cli.GetStream(streamIdentifier); streamErr != nil {
-        _, streamErr = cli.CreateStream("Test Producer Stream")
+	if _, streamErr := cli.GetStream(streamIdentifier); streamErr != nil {
+		_, streamErr = cli.CreateStream("Test Producer Stream")
 
 		if streamErr != nil {
 			panic(streamErr)
@@ -76,15 +76,15 @@ func EnsureInfrastructureIsInitialized(cli iggycli.Client) error {
 	fmt.Printf("Stream with ID: %d exists.\n", DefaultStreamId)
 
 	topicIdentifier, _ := iggcon.NewIdentifier(TopicId)
-    if _, topicErr := cli.GetTopic(streamIdentifier, topicIdentifier); topicErr != nil {
-        _, topicErr = cli.CreateTopic(
+	if _, topicErr := cli.GetTopic(streamIdentifier, topicIdentifier); topicErr != nil {
+		_, topicErr = cli.CreateTopic(
 			streamIdentifier,
 			"Test Topic From Producer Sample",
 			12,
 			0,
 			0,
 			0,
-            nil)
+			nil)
 
 		if topicErr != nil {
 			panic(topicErr)
@@ -98,7 +98,7 @@ func EnsureInfrastructureIsInitialized(cli iggycli.Client) error {
 	return nil
 }
 
-func ConsumeMessages(cli iggycli.Client) error {
+func ConsumeMessages(cli iggcon.Client) error {
 	fmt.Printf("Messages will be polled from stream '%d', topic '%d', partition '%d' with interval %d ms.\n", DefaultStreamId, TopicId, Partition, Interval)
 
 	for {

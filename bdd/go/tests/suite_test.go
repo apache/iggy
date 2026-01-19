@@ -15,24 +15,33 @@
 // specific language governing permissions and limitations
 // under the License.
 
-package tcp_test
+package tests
 
 import (
-	iggcon "github.com/apache/iggy/foreign/go/contracts"
-	"github.com/onsi/ginkgo/v2"
-	"github.com/onsi/gomega"
+	"testing"
+
+	"github.com/cucumber/godog"
 )
 
-func itShouldHaveExpectedNumberOfPartitions(streamId uint32, topicId uint32, expectedPartitions uint32, client iggcon.Client) {
-	streamIdentifier, _ := iggcon.NewIdentifier(streamId)
-	topicIdentifier, _ := iggcon.NewIdentifier(topicId)
-	topic, err := client.GetTopic(streamIdentifier, topicIdentifier)
-
-	ginkgo.It("should have "+string(rune(expectedPartitions))+" partitions", func() {
-		gomega.Expect(topic).NotTo(gomega.BeNil())
-		gomega.Expect(topic.PartitionsCount).To(gomega.Equal(expectedPartitions))
-		gomega.Expect(len(topic.Partitions)).To(gomega.Equal(int(expectedPartitions)))
-	})
-
-	itShouldNotReturnError(err)
+func TestFeatures(t *testing.T) {
+	suites := []godog.TestSuite{{
+		ScenarioInitializer: initBasicMessagingScenario,
+		Options: &godog.Options{
+			Format:   "pretty",
+			Paths:    []string{"../../scenarios/basic_messaging.feature"},
+			TestingT: t,
+		},
+	}, {
+		ScenarioInitializer: initLeaderRedirectionScenario,
+		Options: &godog.Options{
+			Format:   "pretty",
+			Paths:    []string{"../../scenarios/leader_redirection.feature"},
+			TestingT: t,
+		},
+	}}
+	for _, s := range suites {
+		if s.Run() != 0 {
+			t.Fatal("failing feature tests")
+		}
+	}
 }

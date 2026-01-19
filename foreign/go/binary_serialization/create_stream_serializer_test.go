@@ -25,7 +25,7 @@ import (
 func TestSerialize_TcpCreateStreamRequest(t *testing.T) {
 	// Create a sample TcpCreateStreamRequest
 	request := TcpCreateStreamRequest{
-		Name:     "test_stream",
+		Name: "test_stream",
 	}
 
 	// Serialize the request
