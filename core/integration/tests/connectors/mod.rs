@@ -30,6 +30,7 @@ use std::collections::HashMap;
 mod http_config_provider;
 mod postgres;
 mod random;
+mod redshift;
 
 const DEFAULT_TEST_STREAM: &str = "test_stream";
 const DEFAULT_TEST_TOPIC: &str = "test_topic";
