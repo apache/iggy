@@ -5704,6 +5704,7 @@ dependencies = [
  "journal",
  "left-right",
  "message_bus",
+ "paste",
  "slab",
  "tracing",
 ]

@@ -64,14 +64,6 @@ pub trait Handler: Command {
     fn handle(&mut self, cmd: &Self::Cmd);
 }
 
-/// Storage abstraction: applies commands to inner state.
-pub trait ApplyState {
-    type Inner: Handler;
-    type Output;
-
-    fn do_apply(&self, cmd: <Self::Inner as Command>::Cmd) -> Self::Output;
-}
-
 pub struct LeftRight<T, C>
 where
     T: Absorb<C>,
@@ -93,14 +85,11 @@ where
     }
 }
 
-impl<T> ApplyState for LeftRight<T, <T as Command>::Cmd>
+impl<T> LeftRight<T, <T as Command>::Cmd>
 where
     T: Absorb<<T as Command>::Cmd> + Clone + Handler,
 {
-    type Inner = T;
-    type Output = ();
-
-    fn do_apply(&self, cmd: <Self::Inner as Command>::Cmd) -> Self::Output {
+    pub fn do_apply(&self, cmd: <T as Command>::Cmd) {
         self.write
             .as_ref()
             .expect("no write handle - not the owner shard")
@@ -122,29 +111,27 @@ pub trait StateMachine {
     fn update(&self, input: &Self::Input, output: &mut Vec<Self::Output>);
 }
 
-/// Generates a state machine with pluggable storage.
+/// Generates a state machine with convention-based storage.
 ///
 /// # Generated items
-/// - `$inner` struct with the specified fields (the data)
-/// - `$command` enum with variants for each operation
-/// - `$state<S: ApplyState<Inner = $inner>>` wrapper struct (storage-agnostic)
-/// - `Command` impl for `$inner` (parsing)
-/// - `Absorb` impl for `$inner` (delegates to `Handler::handle`)
-/// - `State` impl for `$state<S>`
-/// - `From<S>` impl for `$state<S>`
+/// - `{$state}Inner` struct with the specified fields (the data)
+/// - `{$state}Command` enum with variants for each operation
+/// - `$state` wrapper struct (non-generic, contains LeftRight storage)
+/// - `Command` impl for `{$state}Inner` (parsing)
+/// - `State` impl for `$state`
+/// - `From<LeftRight<...>>` impl for `$state`
 ///
 /// # User must implement
-/// - `Handler` for `$inner` (business logic)
+/// - `Handler` for `{$state}Inner` (business logic)
+/// - `impl_absorb!` for `{$state}Inner` and `{$state}Command`
 ///
 /// # Example
 /// ```ignore
 /// define_state! {
-///     Streams,
-///     StreamsInner {
+///     Streams {
 ///         index: AHashMap<String, usize>,
 ///         items: Slab<Stream>,
 ///     },
-///     StreamsCommand,
 ///     [CreateStream, UpdateStream, DeleteStream]
 /// }
 ///
@@ -157,97 +144,89 @@ pub trait StateMachine {
 ///         }
 ///     }
 /// }
+///
+/// // User implements Absorb via macro:
+/// impl_absorb!(StreamsInner, StreamsCommand);
 /// ```
+// TODO: The `operation` argument can be removed, once we create an trait for mapping.
 #[macro_export]
 macro_rules! define_state {
     (
-        $state:ident,
-        $inner:ident {
+        $state:ident {
             $($field_name:ident : $field_type:ty),* $(,)?
         },
-        $command:ident,
         [$($operation:ident),* $(,)?]
     ) => {
-        #[derive(Debug, Clone, Default)]
-        pub struct $inner {
-            $(
-                pub $field_name: $field_type,
-            )*
-        }
-
-        #[derive(Debug, Clone)]
-        pub enum $command {
-            $(
-                $operation($operation),
-            )*
-        }
-
-        pub struct $state<S: $crate::stm::ApplyState<Inner = $inner>> {
-            inner: S,
-        }
-
-        impl<S: $crate::stm::ApplyState<Inner = $inner>> From<S> for $state<S> {
-            fn from(storage: S) -> Self {
-                Self { inner: storage }
+        paste::paste! {
+            #[derive(Debug, Clone, Default)]
+            pub struct [<$state Inner>] {
+                $(
+                    pub $field_name: $field_type,
+                )*
             }
-        }
 
-        impl<S> $crate::stm::State for $state<S>
-        where
-            S: $crate::stm::ApplyState<Inner = $inner>,
-        {
-            type Input = <$inner as $crate::stm::Command>::Input;
-            type Output = S::Output;
-
-            fn apply(&self, input: &Self::Input) -> Option<Self::Output> {
-                <$inner as $crate::stm::Command>::parse(input)
-                    .map(|cmd| self.inner.do_apply(cmd))
+            impl [<$state Inner>] {
+                pub fn new() -> Self {
+                    Self::default()
+                }
             }
-        }
 
-        impl $crate::stm::Command for $inner {
-            type Cmd = $command;
-            type Input = ::iggy_common::message::Message<::iggy_common::header::PrepareHeader>;
+            #[derive(Debug, Clone)]
+            pub enum [<$state Command>] {
+                $(
+                    $operation($operation),
+                )*
+            }
 
-            fn parse(input: &Self::Input) -> Option<Self::Cmd> {
-                use ::iggy_common::BytesSerializable;
-                use ::iggy_common::header::Operation;
+            pub struct $state {
+                inner: $crate::stm::LeftRight<[<$state Inner>], [<$state Command>]>,
+            }
 
-                let body = input.body_bytes();
-                match input.header().operation {
-                    $(
-                        Operation::$operation => {
-                            Some($command::$operation(
-                                $operation::from_bytes(body).unwrap()
-                            ))
-                        },
-                    )*
-                    _ => None,
+            impl From<$crate::stm::LeftRight<[<$state Inner>], [<$state Command>]>> for $state {
+                fn from(storage: $crate::stm::LeftRight<[<$state Inner>], [<$state Command>]>) -> Self {
+                    Self { inner: storage }
+                }
+            }
+
+            impl From<[<$state Inner>]> for $state {
+                fn from(inner: [<$state Inner>]) -> Self {
+                    let left_right: $crate::stm::LeftRight<[<$state Inner>], [<$state Command>]> = inner.into();
+                    left_right.into()
+                }
+            }
+
+            impl $crate::stm::State for $state {
+                type Input = <[<$state Inner>] as $crate::stm::Command>::Input;
+                type Output = ();
+
+                fn apply(&self, input: &Self::Input) -> Option<Self::Output> {
+                    <[<$state Inner>] as $crate::stm::Command>::parse(input)
+                        .map(|cmd| self.inner.do_apply(cmd))
+                }
+            }
+
+            impl $crate::stm::Command for [<$state Inner>] {
+                type Cmd = [<$state Command>];
+                type Input = ::iggy_common::message::Message<::iggy_common::header::PrepareHeader>;
+
+                fn parse(input: &Self::Input) -> Option<Self::Cmd> {
+                    use ::iggy_common::BytesSerializable;
+                    use ::iggy_common::header::Operation;
+
+                    let body = input.body_bytes();
+                    match input.header().operation {
+                        $(
+                            Operation::$operation => {
+                                Some([<$state Command>]::$operation(
+                                    $operation::from_bytes(body).unwrap()
+                                ))
+                            },
+                        )*
+                        _ => None,
+                    }
                 }
             }
         }
-
-        /*
-        impl ::left_right::Absorb<$command> for $inner
-        where
-            $inner: $crate::stm::Handler,
-        {
-            fn absorb_first(&mut self, cmd: &mut $command, _other: &Self) {
-                <Self as $crate::stm::Handler>::handle(self, cmd);
-            }
-
-            fn absorb_second(&mut self, cmd: $command, _other: &Self) {
-                <Self as $crate::stm::Handler>::handle(self, &cmd);
-            }
-
-            fn sync_with(&mut self, first: &Self) {
-                *self = first.clone();
-            }
-
-            fn drop_first(self: Box<Self>) {}
-            fn drop_second(self: Box<Self>) {}
-        }
-        */
     };
 }
 
@@ -290,6 +269,3 @@ macro_rules! impl_absorb {
         }
     };
 }
-
-/*
-*/

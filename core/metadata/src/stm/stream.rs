@@ -16,7 +16,7 @@
 // under the License.
 
 use crate::stats::{StreamStats, TopicStats};
-use crate::stm::{Handler, LeftRight};
+use crate::stm::Handler;
 use crate::{define_state, impl_absorb};
 use ahash::AHashMap;
 use iggy_common::create_stream::CreateStream;
@@ -24,13 +24,8 @@ use iggy_common::delete_stream::DeleteStream;
 use iggy_common::purge_stream::PurgeStream;
 use iggy_common::update_stream::UpdateStream;
 use iggy_common::{CompressionAlgorithm, IggyExpiry, IggyTimestamp, MaxTopicSize};
-use left_right::Absorb;
 use slab::Slab;
 use std::sync::Arc;
-
-// ============================================================================
-// Partition Entity
-// ============================================================================
 
 #[derive(Debug, Clone, Default)]
 pub struct Partition {
@@ -43,10 +38,6 @@ impl Partition {
     }
 }
 
-// ============================================================================
-// Partitions Collection
-// ============================================================================
-
 #[derive(Debug, Clone, Default)]
 pub struct Partitions {
     pub items: Slab<Partition>,
@@ -55,67 +46,6 @@ pub struct Partitions {
 impl Partitions {
     pub fn new() -> Self {
         Self::default()
-    }
-}
-
-// ============================================================================
-// ConsumerGroup (local to Topic, not a state machine)
-// ============================================================================
-
-#[derive(Debug, Clone, Default)]
-pub struct ConsumerGroup {
-    pub id: usize,
-    pub name: String,
-    pub created_at: IggyTimestamp,
-}
-
-impl ConsumerGroup {
-    pub fn new(name: String, created_at: IggyTimestamp) -> Self {
-        Self {
-            id: 0,
-            name,
-            created_at,
-        }
-    }
-}
-
-// ============================================================================
-// ConsumerGroups (local to Topic, simple collection - no left_right)
-// ============================================================================
-
-#[derive(Debug, Clone, Default)]
-pub struct ConsumerGroups {
-    index: AHashMap<String, usize>,
-    items: Slab<ConsumerGroup>,
-}
-
-impl ConsumerGroups {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn insert(&self, _group: ConsumerGroup) -> usize {
-        0
-    }
-
-    pub fn get(&self, _id: usize) -> Option<ConsumerGroup> {
-        None
-    }
-
-    pub fn get_by_name(&self, _name: &str) -> Option<ConsumerGroup> {
-        None
-    }
-
-    pub fn remove(&self, _id: usize) -> Option<ConsumerGroup> {
-        None
-    }
-
-    pub fn len(&self) -> usize {
-        0
-    }
-
-    pub fn is_empty(&self) -> bool {
-        true
     }
 }
 
@@ -135,7 +65,6 @@ pub struct Topic {
 
     pub stats: Arc<TopicStats>,
     pub partitions: Partitions,
-    pub consumer_groups: ConsumerGroups,
 }
 
 impl Default for Topic {
@@ -150,7 +79,6 @@ impl Default for Topic {
             max_topic_size: MaxTopicSize::default(),
             stats: Arc::new(TopicStats::default()),
             partitions: Partitions::new(),
-            consumer_groups: ConsumerGroups::new(),
         }
     }
 }
@@ -175,14 +103,9 @@ impl Topic {
             max_topic_size,
             stats: Arc::new(TopicStats::new(stream_stats)),
             partitions: Partitions::new(),
-            consumer_groups: ConsumerGroups::new(),
         }
     }
 }
-
-// ============================================================================
-// Topics Collection
-// ============================================================================
 
 #[derive(Debug, Clone, Default)]
 pub struct Topics {
@@ -195,10 +118,6 @@ impl Topics {
         Self::default()
     }
 }
-
-// ============================================================================
-// Stream Entity
-// ============================================================================
 
 #[derive(Debug)]
 pub struct Stream {
@@ -246,23 +165,11 @@ impl Stream {
     }
 }
 
-fn foo() {
-    let streams_inner = StreamsInner {
-        index: AHashMap::new(),
-        items: Slab::new(),
-    };
-
-    let streams: LeftRight<StreamsInner, StreamsCommand> = streams_inner.into();
-    let streams_2: Streams<LeftRight<StreamsInner, StreamsCommand>> = streams.into();
-}
-
 define_state! {
-    Streams,
-    StreamsInner {
+    Streams {
         index: AHashMap<String, usize>,
         items: Slab<Stream>,
     },
-    StreamsCommand,
     [CreateStream, UpdateStream, DeleteStream, PurgeStream]
 }
 impl_absorb!(StreamsInner, StreamsCommand);

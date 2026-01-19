@@ -15,13 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::stm::Handler;
+use crate::{define_state, impl_absorb};
 use ahash::AHashMap;
 use iggy_common::IggyTimestamp;
+use iggy_common::create_consumer_group::CreateConsumerGroup;
+use iggy_common::delete_consumer_group::DeleteConsumerGroup;
 use slab::Slab;
-
-// ============================================================================
-// ConsumerGroupMember - Individual member of a consumer group
-// ============================================================================
 
 #[derive(Debug, Clone, Default)]
 pub struct ConsumerGroupMember {
@@ -34,10 +34,6 @@ impl ConsumerGroupMember {
         Self { id, joined_at }
     }
 }
-
-// ============================================================================
-// ConsumerGroup - A group of consumers
-// ============================================================================
 
 #[derive(Debug, Clone, Default)]
 pub struct ConsumerGroup {
@@ -78,18 +74,25 @@ impl ConsumerGroup {
     }
 }
 
-// ============================================================================
-// ConsumerGroups Collection
-// ============================================================================
-
-#[derive(Debug, Clone, Default)]
-pub struct ConsumerGroups {
-    pub index: AHashMap<(usize, usize, String), usize>,
-    pub items: Slab<ConsumerGroup>,
+define_state! {
+    ConsumerGroups {
+        ns_index: AHashMap<(usize, usize), Vec<usize>>,
+        name_index: AHashMap<String, usize>,
+        items: Slab<ConsumerGroup>,
+    },
+    [CreateConsumerGroup, DeleteConsumerGroup]
 }
+impl_absorb!(ConsumerGroupsInner, ConsumerGroupsCommand);
 
-impl ConsumerGroups {
-    pub fn new() -> Self {
-        Self::default()
+impl Handler for ConsumerGroupsInner {
+    fn handle(&mut self, cmd: &ConsumerGroupsCommand) {
+        match cmd {
+            ConsumerGroupsCommand::CreateConsumerGroup(_payload) => {
+                // Actual mutation logic will be implemented later
+            }
+            ConsumerGroupsCommand::DeleteConsumerGroup(_payload) => {
+                // Actual mutation logic will be implemented later
+            }
+        }
     }
 }

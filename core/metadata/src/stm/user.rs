@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::define_state;
 use crate::permissioner::Permissioner;
-use crate::stm::{Handle, Handler};
+use crate::stm::Handler;
+use crate::{define_state, impl_absorb};
 use ahash::AHashMap;
 use iggy_common::change_password::ChangePassword;
 use iggy_common::create_user::CreateUser;
@@ -26,10 +26,6 @@ use iggy_common::update_permissions::UpdatePermissions;
 use iggy_common::update_user::UpdateUser;
 use iggy_common::{IggyTimestamp, Permissions, PersonalAccessToken, UserId, UserStatus};
 use slab::Slab;
-
-// ============================================================================
-// User Entity
-// ============================================================================
 
 #[derive(Debug, Clone, Default)]
 pub struct User {
@@ -63,15 +59,14 @@ impl User {
 }
 
 define_state! {
-    Users,
-    UsersInner {
+    Users {
         index: AHashMap<String, usize>,
         items: Slab<User>,
         permissioner: Permissioner,
     },
-    UsersCommand,
     [CreateUser, UpdateUser, DeleteUser, ChangePassword, UpdatePermissions]
 }
+impl_absorb!(UsersInner, UsersCommand);
 
 impl Handler for UsersInner {
     fn handle(&mut self, cmd: &UsersCommand) {
