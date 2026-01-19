@@ -51,8 +51,37 @@ const FETCH_INTERVAL_MS: u64 = 10;
 const TABLE_WAIT_INTERVAL_MS: u64 = 50;
 const ENV_SINK_CONNECTION_STRING: &str =
     "IGGY_CONNECTORS_SINK_POSTGRES_PLUGIN_CONFIG_CONNECTION_STRING";
+const ENV_SINK_TARGET_TABLE: &str = "IGGY_CONNECTORS_SINK_POSTGRES_PLUGIN_CONFIG_TARGET_TABLE";
+const ENV_SINK_PAYLOAD_FORMAT: &str = "IGGY_CONNECTORS_SINK_POSTGRES_PLUGIN_CONFIG_PAYLOAD_FORMAT";
+const ENV_SINK_STREAMS_0_STREAM: &str = "IGGY_CONNECTORS_SINK_POSTGRES_STREAMS_0_STREAM";
+const ENV_SINK_STREAMS_0_TOPICS: &str = "IGGY_CONNECTORS_SINK_POSTGRES_STREAMS_0_TOPICS";
+const ENV_SINK_STREAMS_0_SCHEMA: &str = "IGGY_CONNECTORS_SINK_POSTGRES_STREAMS_0_SCHEMA";
+const ENV_SINK_STREAMS_0_CONSUMER_GROUP: &str =
+    "IGGY_CONNECTORS_SINK_POSTGRES_STREAMS_0_CONSUMER_GROUP";
 const ENV_SOURCE_CONNECTION_STRING: &str =
     "IGGY_CONNECTORS_SOURCE_POSTGRES_PLUGIN_CONFIG_CONNECTION_STRING";
+const ENV_SOURCE_TABLES: &str = "IGGY_CONNECTORS_SOURCE_POSTGRES_PLUGIN_CONFIG_TABLES";
+const ENV_SOURCE_TRACKING_COLUMN: &str =
+    "IGGY_CONNECTORS_SOURCE_POSTGRES_PLUGIN_CONFIG_TRACKING_COLUMN";
+const ENV_SOURCE_PAYLOAD_COLUMN: &str =
+    "IGGY_CONNECTORS_SOURCE_POSTGRES_PLUGIN_CONFIG_PAYLOAD_COLUMN";
+const ENV_SOURCE_PAYLOAD_FORMAT: &str =
+    "IGGY_CONNECTORS_SOURCE_POSTGRES_PLUGIN_CONFIG_PAYLOAD_FORMAT";
+const ENV_SOURCE_DELETE_AFTER_READ: &str =
+    "IGGY_CONNECTORS_SOURCE_POSTGRES_PLUGIN_CONFIG_DELETE_AFTER_READ";
+const ENV_SOURCE_PRIMARY_KEY_COLUMN: &str =
+    "IGGY_CONNECTORS_SOURCE_POSTGRES_PLUGIN_CONFIG_PRIMARY_KEY_COLUMN";
+const ENV_SOURCE_PROCESSED_COLUMN: &str =
+    "IGGY_CONNECTORS_SOURCE_POSTGRES_PLUGIN_CONFIG_PROCESSED_COLUMN";
+const ENV_SOURCE_INCLUDE_METADATA: &str =
+    "IGGY_CONNECTORS_SOURCE_POSTGRES_PLUGIN_CONFIG_INCLUDE_METADATA";
+const ENV_SOURCE_STREAMS_0_STREAM: &str = "IGGY_CONNECTORS_SOURCE_POSTGRES_STREAMS_0_STREAM";
+const ENV_SOURCE_STREAMS_0_TOPIC: &str = "IGGY_CONNECTORS_SOURCE_POSTGRES_STREAMS_0_TOPIC";
+const ENV_SOURCE_STREAMS_0_SCHEMA: &str = "IGGY_CONNECTORS_SOURCE_POSTGRES_STREAMS_0_SCHEMA";
+const ENV_SOURCE_POLL_INTERVAL: &str =
+    "IGGY_CONNECTORS_SOURCE_POSTGRES_PLUGIN_CONFIG_POLL_INTERVAL";
+const ENV_SINK_PATH: &str = "IGGY_CONNECTORS_SINK_POSTGRES_PATH";
+const ENV_SOURCE_PATH: &str = "IGGY_CONNECTORS_SOURCE_POSTGRES_PATH";
 
 type SinkRow = (i64, String, String, Vec<u8>);
 type SinkJsonRow = (i64, serde_json::Value);
@@ -93,29 +122,50 @@ async fn create_pool(connection_string: &str) -> Pool<Postgres> {
 }
 
 async fn setup_sink() -> PostgresTestSetup {
-    setup_sink_with_config("postgres/sink.toml").await
+    let mut envs = HashMap::new();
+    envs.insert(ENV_SINK_STREAMS_0_SCHEMA.to_owned(), "json".to_owned());
+    setup_sink_with_envs(envs).await
 }
 
 async fn setup_sink_bytea() -> PostgresTestSetup {
-    setup_sink_with_config("postgres/sink_raw.toml").await
+    let mut envs = HashMap::new();
+    envs.insert(ENV_SINK_STREAMS_0_SCHEMA.to_owned(), "raw".to_owned());
+    envs.insert(ENV_SINK_PAYLOAD_FORMAT.to_owned(), "bytea".to_owned());
+    setup_sink_with_envs(envs).await
 }
 
 async fn setup_sink_json() -> PostgresTestSetup {
-    setup_sink_with_config("postgres/sink_json.toml").await
+    let mut envs = HashMap::new();
+    envs.insert(ENV_SINK_STREAMS_0_SCHEMA.to_owned(), "json".to_owned());
+    envs.insert(ENV_SINK_PAYLOAD_FORMAT.to_owned(), "json".to_owned());
+    setup_sink_with_envs(envs).await
 }
 
-async fn setup_sink_with_config(config_path: &str) -> PostgresTestSetup {
+async fn setup_sink_with_envs(mut extra_envs: HashMap<String, String>) -> PostgresTestSetup {
     let (container, connection_string) = start_container().await;
 
-    let mut envs = HashMap::new();
-    envs.insert(
+    extra_envs.insert(
         ENV_SINK_CONNECTION_STRING.to_owned(),
         connection_string.clone(),
+    );
+    extra_envs.insert(ENV_SINK_TARGET_TABLE.to_owned(), SINK_TABLE.to_owned());
+    extra_envs.insert(ENV_SINK_STREAMS_0_STREAM.to_owned(), TEST_STREAM.to_owned());
+    extra_envs.insert(
+        ENV_SINK_STREAMS_0_TOPICS.to_owned(),
+        format!("[{TEST_TOPIC}]"),
+    );
+    extra_envs.insert(
+        ENV_SINK_STREAMS_0_CONSUMER_GROUP.to_owned(),
+        "test".to_owned(),
+    );
+    extra_envs.insert(
+        ENV_SINK_PATH.to_owned(),
+        "../../target/debug/libiggy_connector_postgres_sink".to_owned(),
     );
 
     let mut runtime = setup_runtime();
     runtime
-        .init(config_path, Some(envs), IggySetup::default())
+        .init("postgres/sink.toml", Some(extra_envs), IggySetup::default())
         .await;
 
     PostgresTestSetup {
@@ -145,21 +195,11 @@ async fn setup_source() -> PostgresTestSetup {
     pool.close().await;
 
     let mut envs = HashMap::new();
-    envs.insert(
-        ENV_SOURCE_CONNECTION_STRING.to_owned(),
-        connection_string.clone(),
-    );
+    envs.insert(ENV_SOURCE_TABLES.to_owned(), format!("[{SOURCE_TABLE}]"));
+    envs.insert(ENV_SOURCE_INCLUDE_METADATA.to_owned(), "true".to_owned());
+    envs.insert(ENV_SOURCE_STREAMS_0_SCHEMA.to_owned(), "json".to_owned());
 
-    let mut runtime = setup_runtime();
-    runtime
-        .init("postgres/source.toml", Some(envs), IggySetup::default())
-        .await;
-
-    PostgresTestSetup {
-        runtime,
-        connection_string,
-        container,
-    }
+    setup_source_with_envs(container, connection_string, envs).await
 }
 
 async fn setup_source_bytea() -> PostgresTestSetup {
@@ -179,24 +219,14 @@ async fn setup_source_bytea() -> PostgresTestSetup {
 
     let mut envs = HashMap::new();
     envs.insert(
-        ENV_SOURCE_CONNECTION_STRING.to_owned(),
-        connection_string.clone(),
+        ENV_SOURCE_TABLES.to_owned(),
+        format!("[{SOURCE_TABLE_BYTEA}]"),
     );
+    envs.insert(ENV_SOURCE_PAYLOAD_COLUMN.to_owned(), "payload".to_owned());
+    envs.insert(ENV_SOURCE_PAYLOAD_FORMAT.to_owned(), "bytea".to_owned());
+    envs.insert(ENV_SOURCE_STREAMS_0_SCHEMA.to_owned(), "raw".to_owned());
 
-    let mut runtime = setup_runtime();
-    runtime
-        .init(
-            "postgres/source_bytea.toml",
-            Some(envs),
-            IggySetup::default(),
-        )
-        .await;
-
-    PostgresTestSetup {
-        runtime,
-        connection_string,
-        container,
-    }
+    setup_source_with_envs(container, connection_string, envs).await
 }
 
 async fn setup_source_json() -> PostgresTestSetup {
@@ -216,24 +246,17 @@ async fn setup_source_json() -> PostgresTestSetup {
 
     let mut envs = HashMap::new();
     envs.insert(
-        ENV_SOURCE_CONNECTION_STRING.to_owned(),
-        connection_string.clone(),
+        ENV_SOURCE_TABLES.to_owned(),
+        format!("[{SOURCE_TABLE_JSON}]"),
     );
+    envs.insert(ENV_SOURCE_PAYLOAD_COLUMN.to_owned(), "data".to_owned());
+    envs.insert(
+        ENV_SOURCE_PAYLOAD_FORMAT.to_owned(),
+        "json_direct".to_owned(),
+    );
+    envs.insert(ENV_SOURCE_STREAMS_0_SCHEMA.to_owned(), "json".to_owned());
 
-    let mut runtime = setup_runtime();
-    runtime
-        .init(
-            "postgres/source_json.toml",
-            Some(envs),
-            IggySetup::default(),
-        )
-        .await;
-
-    PostgresTestSetup {
-        runtime,
-        connection_string,
-        container,
-    }
+    setup_source_with_envs(container, connection_string, envs).await
 }
 
 async fn setup_source_delete() -> PostgresTestSetup {
@@ -254,24 +277,15 @@ async fn setup_source_delete() -> PostgresTestSetup {
 
     let mut envs = HashMap::new();
     envs.insert(
-        ENV_SOURCE_CONNECTION_STRING.to_owned(),
-        connection_string.clone(),
+        ENV_SOURCE_TABLES.to_owned(),
+        format!("[{SOURCE_TABLE_DELETE}]"),
     );
+    envs.insert(ENV_SOURCE_PRIMARY_KEY_COLUMN.to_owned(), "id".to_owned());
+    envs.insert(ENV_SOURCE_DELETE_AFTER_READ.to_owned(), "true".to_owned());
+    envs.insert(ENV_SOURCE_INCLUDE_METADATA.to_owned(), "true".to_owned());
+    envs.insert(ENV_SOURCE_STREAMS_0_SCHEMA.to_owned(), "json".to_owned());
 
-    let mut runtime = setup_runtime();
-    runtime
-        .init(
-            "postgres/source_delete.toml",
-            Some(envs),
-            IggySetup::default(),
-        )
-        .await;
-
-    PostgresTestSetup {
-        runtime,
-        connection_string,
-        container,
-    }
+    setup_source_with_envs(container, connection_string, envs).await
 }
 
 async fn setup_source_mark() -> PostgresTestSetup {
@@ -293,15 +307,46 @@ async fn setup_source_mark() -> PostgresTestSetup {
 
     let mut envs = HashMap::new();
     envs.insert(
+        ENV_SOURCE_TABLES.to_owned(),
+        format!("[{SOURCE_TABLE_MARK}]"),
+    );
+    envs.insert(ENV_SOURCE_PRIMARY_KEY_COLUMN.to_owned(), "id".to_owned());
+    envs.insert(
+        ENV_SOURCE_PROCESSED_COLUMN.to_owned(),
+        "is_processed".to_owned(),
+    );
+    envs.insert(ENV_SOURCE_INCLUDE_METADATA.to_owned(), "true".to_owned());
+    envs.insert(ENV_SOURCE_STREAMS_0_SCHEMA.to_owned(), "json".to_owned());
+
+    setup_source_with_envs(container, connection_string, envs).await
+}
+
+async fn setup_source_with_envs(
+    container: ContainerAsync<postgres::Postgres>,
+    connection_string: String,
+    mut extra_envs: HashMap<String, String>,
+) -> PostgresTestSetup {
+    extra_envs.insert(
         ENV_SOURCE_CONNECTION_STRING.to_owned(),
         connection_string.clone(),
+    );
+    extra_envs.insert(ENV_SOURCE_TRACKING_COLUMN.to_owned(), "id".to_owned());
+    extra_envs.insert(
+        ENV_SOURCE_STREAMS_0_STREAM.to_owned(),
+        TEST_STREAM.to_owned(),
+    );
+    extra_envs.insert(ENV_SOURCE_STREAMS_0_TOPIC.to_owned(), TEST_TOPIC.to_owned());
+    extra_envs.insert(ENV_SOURCE_POLL_INTERVAL.to_owned(), "10ms".to_owned());
+    extra_envs.insert(
+        ENV_SOURCE_PATH.to_owned(),
+        "../../target/debug/libiggy_connector_postgres_source".to_owned(),
     );
 
     let mut runtime = setup_runtime();
     runtime
         .init(
-            "postgres/source_mark.toml",
-            Some(envs),
+            "postgres/source.toml",
+            Some(extra_envs),
             IggySetup::default(),
         )
         .await;

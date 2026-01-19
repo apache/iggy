@@ -15,6 +15,28 @@
 # specific language governing permissions and limitations
 # under the License.
 
-[connectors]
-config_type = "local"
-config_dir = "tests/connectors/postgres/source_mark_config"
+type = "source"
+key = "postgres"
+enabled = true
+version = 0
+name = "Postgres source"
+path = "../../../target/debug/libiggy_connector_postgres_source"
+verbose = false
+
+[[streams]]
+stream = "user_events"
+topic = "users"
+schema = "json"
+batch_length = 100
+
+[plugin_config]
+connection_string = "postgresql://user:pass@localhost:5432/database"
+mode = "polling"
+tables = ["users", "orders"]
+poll_interval = "1s"
+batch_size = 1000
+tracking_column = "id"
+initial_offset = "0"
+max_connections = 10
+snake_case_columns = false
+include_metadata = true

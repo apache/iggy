@@ -21,7 +21,7 @@ The PostgreSQL source connector fetches data from PostgreSQL databases and strea
 connection_string = "postgresql://user:pass@localhost:5432/database"
 mode = "polling"
 tables = ["users", "orders"]
-poll_interval = "30s"
+poll_interval = "1s"
 batch_size = 1000
 tracking_column = "id"
 initial_offset = "0"
@@ -56,7 +56,7 @@ cdc_backend = "builtin"
 | `connection_string` | string | required | PostgreSQL connection string |
 | `mode` | string | required | `polling` or `cdc` |
 | `tables` | array | required | List of tables to monitor |
-| `poll_interval` | string | `10s` | How often to poll (e.g., `30s`, `5m`) |
+| `poll_interval` | string | `1s` | How often to poll (e.g., `1s`, `5m`) |
 | `batch_size` | u32 | `1000` | Max rows per poll |
 | `tracking_column` | string | `id` | Column for incremental updates |
 | `initial_offset` | string | none | Starting value for tracking column |
@@ -289,7 +289,7 @@ batch_length = 100
 connection_string = "postgresql://user:pass@localhost:5432/mydb"
 mode = "polling"
 tables = ["users"]
-poll_interval = "10s"
+poll_interval = "1s"
 tracking_column = "updated_at"
 ```
 
@@ -326,7 +326,7 @@ batch_length = 100
 connection_string = "postgresql://user:pass@localhost:5432/mydb"
 mode = "polling"
 tables = ["events"]
-poll_interval = "10s"
+poll_interval = "1s"
 tracking_column = "id"
 payload_column = "data"
 payload_format = "json_direct"

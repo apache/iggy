@@ -164,24 +164,36 @@ impl LocalConnectorsConfigProvider<Created> {
 
         let sinks: DashMap<ConnectorId, SinkConfigFile> = DashMap::new();
         let sources: DashMap<ConnectorId, SourceConfigFile> = DashMap::new();
-        info!("Loading connectors configuration from: {}", self.config_dir);
+        let cwd = match std::env::current_dir() {
+            Ok(path) => path.display().to_string(),
+            Err(_) => "unknown".to_string(),
+        };
+        info!(
+            "Loading connectors configuration from: {}, current directory: {cwd}",
+            self.config_dir
+        );
         let entries = std::fs::read_dir(&self.config_dir)?;
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_file() {
                 if path.extension().and_then(|ext| ext.to_str()) != Some("toml") {
-                    debug!("Skipping non-TOML file: {:?}", path);
+                    debug!("Skipping non-TOML file: {}", path.display());
                     continue;
                 }
 
-                if let Some(file_name) = path.file_name().and_then(|n| n.to_str())
-                    && file_name.starts_with('.')
-                {
-                    debug!("Skipping hidden file: {:?}", path);
-                    continue;
+                if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
+                    if file_name.starts_with('.') {
+                        debug!("Skipping hidden file: {}", path.display());
+                        continue;
+                    }
+                    let file_name_lower = file_name.to_lowercase();
+                    if file_name_lower == "cargo.toml" {
+                        debug!("Skipping Cargo.toml: {}", path.display());
+                        continue;
+                    }
                 }
 
-                debug!("Loading connector configuration from: {:?}", path);
+                info!("Loading connector configuration from: {}", path.display());
                 let base_config = Self::read_base_config(&path)?;
                 debug!("Loaded base configuration: {:?}", base_config);
                 let path = path
@@ -229,8 +241,8 @@ impl LocalConnectorsConfigProvider<Created> {
                     }
                 }
 
-                debug!(
-                    "Loaded connector configuration with key {}, version {}, created at {}",
+                info!(
+                    "Loaded connector configuration with key: {}, version: {}, created at {}",
                     base_config.key(),
                     version,
                     created_at.to_rfc3339()

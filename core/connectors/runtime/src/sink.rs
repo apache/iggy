@@ -40,7 +40,7 @@ use std::{
     sync::{Arc, atomic::Ordering},
     time::Instant,
 };
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 pub async fn init(
     sink_configs: HashMap<String, SinkConfig>,
@@ -78,6 +78,7 @@ pub async fn init(
                 config_format: config.plugin_config_format,
                 consumers: vec![],
                 error: init_error.clone(),
+                verbose: config.verbose,
             });
         } else {
             let container: Container<SinkApi> =
@@ -102,6 +103,7 @@ pub async fn init(
                         config_format: config.plugin_config_format,
                         consumers: vec![],
                         error: init_error.clone(),
+                        verbose: config.verbose,
                     }],
                 },
             );
@@ -205,6 +207,7 @@ pub fn consume(sinks: Vec<SinkConnectorWrapper>, context: Arc<RuntimeContext>) {
                         sink.callback,
                         consumer.transforms,
                         consumer.consumer,
+                        plugin.verbose,
                     )
                     .await
                     {
@@ -233,6 +236,7 @@ async fn consume_messages(
     consume: ConsumeCallback,
     transforms: Vec<Arc<dyn Transform>>,
     mut consumer: IggyConsumer,
+    verbose: bool,
 ) -> Result<(), RuntimeError> {
     info!("Started consuming messages for sink connector with ID: {plugin_id}");
     let batch_size = batch_size as usize;
@@ -263,10 +267,17 @@ async fn consume_messages(
             current_offset,
             schema: decoder.schema(),
         };
-        info!(
-            "Processing {messages_count} messages for sink connector with ID: {}",
-            plugin_id
-        );
+        if verbose {
+            info!(
+                "Processing {messages_count} messages for sink connector with ID: {}",
+                plugin_id
+            );
+        } else {
+            debug!(
+                "Processing {messages_count} messages for sink connector with ID: {}",
+                plugin_id
+            );
+        }
         let start = Instant::now();
         if let Err(error) = process_messages(
             plugin_id,
@@ -286,10 +297,17 @@ async fn consume_messages(
         }
 
         let elapsed = start.elapsed();
-        info!(
-            "Consumed {messages_count} messages in {:#?} for sink connector with ID: {plugin_id}",
-            elapsed
-        );
+        if verbose {
+            info!(
+                "Consumed {messages_count} messages in {:#?} for sink connector with ID: {plugin_id}",
+                elapsed
+            );
+        } else {
+            debug!(
+                "Consumed {messages_count} messages in {:#?} for sink connector with ID: {plugin_id}",
+                elapsed
+            );
+        }
     }
     info!("Stopped consuming messages for sink connector with ID: {plugin_id}");
     Ok(())

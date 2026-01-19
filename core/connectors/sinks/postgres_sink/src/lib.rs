@@ -180,12 +180,13 @@ impl PostgresSink {
 
         let pool = self.get_pool()?;
         let table_name = &self.config.target_table;
+        let quoted_table = quote_identifier(table_name)?;
         let include_metadata = self.config.include_metadata.unwrap_or(true);
         let include_checksum = self.config.include_checksum.unwrap_or(true);
         let include_origin_timestamp = self.config.include_origin_timestamp.unwrap_or(true);
         let payload_type = self.payload_format().sql_type();
 
-        let mut sql = format!("CREATE TABLE IF NOT EXISTS {table_name} (");
+        let mut sql = format!("CREATE TABLE IF NOT EXISTS {quoted_table} (");
         sql.push_str("id DECIMAL(39, 0) PRIMARY KEY");
 
         if include_metadata {
@@ -263,110 +264,160 @@ impl PostgresSink {
         messages_metadata: &MessagesMetadata,
         pool: &Pool<Postgres>,
     ) -> Result<(), Error> {
+        if messages.is_empty() {
+            return Ok(());
+        }
+
         let table_name = &self.config.target_table;
         let include_metadata = self.config.include_metadata.unwrap_or(true);
         let include_checksum = self.config.include_checksum.unwrap_or(true);
         let include_origin_timestamp = self.config.include_origin_timestamp.unwrap_or(true);
         let payload_format = self.payload_format();
 
-        for message in messages {
-            let payload_bytes = message.payload.clone().try_into_vec().map_err(|e| {
-                error!("Failed to convert payload to bytes: {e}");
-                Error::InvalidRecord
-            })?;
+        let (query, _params_per_row) = self.build_batch_insert_query(
+            table_name,
+            include_metadata,
+            include_checksum,
+            include_origin_timestamp,
+            messages.len(),
+        )?;
 
-            let json_value = self.parse_json_payload(&payload_bytes, payload_format)?;
-            let text_value = self.parse_text_payload(&payload_bytes, payload_format)?;
-
-            let (query, _) = self.build_insert_query(
-                table_name,
-                include_metadata,
-                include_checksum,
-                include_origin_timestamp,
-            );
-
-            let timestamp = self.parse_timestamp(message.timestamp);
-            let origin_timestamp = self.parse_timestamp(message.origin_timestamp);
-
-            self.execute_insert_with_retry(
-                pool,
-                &query,
-                message,
-                topic_metadata,
-                messages_metadata,
-                include_metadata,
-                include_checksum,
-                include_origin_timestamp,
-                timestamp,
-                origin_timestamp,
-                payload_format,
-                &payload_bytes,
-                &json_value,
-                &text_value,
-            )
-            .await?;
-        }
-
-        Ok(())
+        self.execute_batch_insert_with_retry(
+            pool,
+            &query,
+            messages,
+            topic_metadata,
+            messages_metadata,
+            include_metadata,
+            include_checksum,
+            include_origin_timestamp,
+            payload_format,
+        )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn execute_insert_with_retry(
+    async fn execute_batch_insert_with_retry(
         &self,
         pool: &Pool<Postgres>,
         query: &str,
-        message: &ConsumedMessage,
+        messages: &[ConsumedMessage],
         topic_metadata: &TopicMetadata,
         messages_metadata: &MessagesMetadata,
         include_metadata: bool,
         include_checksum: bool,
         include_origin_timestamp: bool,
-        timestamp: DateTime<Utc>,
-        origin_timestamp: DateTime<Utc>,
         payload_format: PayloadFormat,
-        payload_bytes: &[u8],
-        json_value: &Option<serde_json::Value>,
-        text_value: &Option<String>,
     ) -> Result<(), Error> {
         let max_retries = self.get_max_retries();
         let retry_delay = self.get_retry_delay();
         let mut attempts = 0u32;
 
         loop {
-            let mut query_obj = sqlx::query(query).bind(message.id.to_string());
+            let result = self
+                .bind_and_execute_batch(
+                    pool,
+                    query,
+                    messages,
+                    topic_metadata,
+                    messages_metadata,
+                    include_metadata,
+                    include_checksum,
+                    include_origin_timestamp,
+                    payload_format,
+                )
+                .await;
 
-            if include_metadata {
-                query_obj = query_obj
-                    .bind(message.offset as i64)
-                    .bind(timestamp)
-                    .bind(&topic_metadata.stream)
-                    .bind(&topic_metadata.topic)
-                    .bind(messages_metadata.partition_id as i32);
-            }
-
-            if include_checksum {
-                query_obj = query_obj.bind(message.checksum as i64);
-            }
-
-            if include_origin_timestamp {
-                query_obj = query_obj.bind(origin_timestamp);
-            }
-
-            query_obj = match payload_format {
-                PayloadFormat::Bytea => query_obj.bind(payload_bytes.to_vec()),
-                PayloadFormat::Json => query_obj.bind(json_value.clone()),
-                PayloadFormat::Text => query_obj.bind(text_value.clone()),
-            };
-
-            match query_obj.execute(pool).await {
+            match result {
                 Ok(_) => return Ok(()),
-                Err(e) => {
+                Err((e, is_transient)) => {
                     attempts += 1;
-                    handle_retry_error(e, attempts, max_retries)?;
+                    if !is_transient || attempts >= max_retries {
+                        error!("Batch insert failed after {attempts} attempts: {e}");
+                        return Err(Error::CannotStoreData(format!(
+                            "Batch insert failed after {attempts} attempts: {e}"
+                        )));
+                    }
+                    warn!(
+                        "Transient database error (attempt {attempts}/{max_retries}): {e}. Retrying..."
+                    );
                     tokio::time::sleep(retry_delay * attempts).await;
                 }
             }
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn bind_and_execute_batch(
+        &self,
+        pool: &Pool<Postgres>,
+        query: &str,
+        messages: &[ConsumedMessage],
+        topic_metadata: &TopicMetadata,
+        messages_metadata: &MessagesMetadata,
+        include_metadata: bool,
+        include_checksum: bool,
+        include_origin_timestamp: bool,
+        payload_format: PayloadFormat,
+    ) -> Result<(), (sqlx::Error, bool)> {
+        let mut query_builder = sqlx::query(query);
+
+        for message in messages {
+            let payload_bytes = message.payload.clone().try_into_vec().map_err(|e| {
+                let err_msg = format!("Failed to convert payload to bytes: {e}");
+                (sqlx::Error::Protocol(err_msg), false)
+            })?;
+
+            let timestamp = self.parse_timestamp(message.timestamp);
+            let origin_timestamp_val = self.parse_timestamp(message.origin_timestamp);
+
+            query_builder = query_builder.bind(message.id.to_string());
+
+            if include_metadata {
+                query_builder = query_builder
+                    .bind(message.offset as i64)
+                    .bind(timestamp)
+                    .bind(topic_metadata.stream.clone())
+                    .bind(topic_metadata.topic.clone())
+                    .bind(messages_metadata.partition_id as i32);
+            }
+
+            if include_checksum {
+                query_builder = query_builder.bind(message.checksum as i64);
+            }
+
+            if include_origin_timestamp {
+                query_builder = query_builder.bind(origin_timestamp_val);
+            }
+
+            query_builder = match payload_format {
+                PayloadFormat::Bytea => query_builder.bind(payload_bytes),
+                PayloadFormat::Json => {
+                    let json_value: serde_json::Value = serde_json::from_slice(&payload_bytes)
+                        .map_err(|e| {
+                            let err_msg = format!("Failed to parse payload as JSON: {e}");
+                            error!("{err_msg}");
+                            (sqlx::Error::Protocol(err_msg), false)
+                        })?;
+                    query_builder.bind(json_value)
+                }
+                PayloadFormat::Text => {
+                    let text_value = String::from_utf8(payload_bytes).map_err(|e| {
+                        let err_msg = format!("Failed to parse payload as UTF-8 text: {e}");
+                        error!("{err_msg}");
+                        (sqlx::Error::Protocol(err_msg), false)
+                    })?;
+                    query_builder.bind(text_value)
+                }
+            };
+        }
+
+        query_builder.execute(pool).await.map_err(|e| {
+            let is_transient = is_transient_error(&e);
+            (e, is_transient)
+        })?;
+
+        Ok(())
     }
 
     fn get_pool(&self) -> Result<&Pool<Postgres>, Error> {
@@ -402,90 +453,56 @@ impl PostgresSink {
         .unwrap_or_else(Utc::now)
     }
 
-    fn parse_json_payload(
-        &self,
-        payload_bytes: &[u8],
-        format: PayloadFormat,
-    ) -> Result<Option<serde_json::Value>, Error> {
-        match format {
-            PayloadFormat::Json => {
-                let value = serde_json::from_slice(payload_bytes).map_err(|e| {
-                    error!("Failed to parse payload as JSON: {e}");
-                    Error::InvalidRecord
-                })?;
-                Ok(Some(value))
-            }
-            _ => Ok(None),
-        }
-    }
-
-    fn parse_text_payload(
-        &self,
-        payload_bytes: &[u8],
-        format: PayloadFormat,
-    ) -> Result<Option<String>, Error> {
-        match format {
-            PayloadFormat::Text => {
-                let value = String::from_utf8(payload_bytes.to_vec()).map_err(|e| {
-                    error!("Failed to parse payload as UTF-8 text: {e}");
-                    Error::InvalidRecord
-                })?;
-                Ok(Some(value))
-            }
-            _ => Ok(None),
-        }
-    }
-
-    fn build_insert_query(
+    fn build_batch_insert_query(
         &self,
         table_name: &str,
         include_metadata: bool,
         include_checksum: bool,
         include_origin_timestamp: bool,
-    ) -> (String, u32) {
-        let mut query = format!("INSERT INTO {table_name} (id");
-        let mut values = "($1::numeric".to_string();
-        let mut param_count = 1;
+        row_count: usize,
+    ) -> Result<(String, u32), Error> {
+        let quoted_table = quote_identifier(table_name)?;
+        let mut query = format!("INSERT INTO {quoted_table} (id");
+
+        let mut params_per_row: u32 = 1; // id
 
         if include_metadata {
             query.push_str(
                 ", iggy_offset, iggy_timestamp, iggy_stream, iggy_topic, iggy_partition_id",
             );
-            for i in 2..=6 {
-                values.push_str(&format!(", ${i}"));
-            }
-            param_count = 6;
+            params_per_row += 5;
         }
 
         if include_checksum {
-            param_count += 1;
             query.push_str(", iggy_checksum");
-            values.push_str(&format!(", ${param_count}"));
+            params_per_row += 1;
         }
 
         if include_origin_timestamp {
-            param_count += 1;
             query.push_str(", iggy_origin_timestamp");
-            values.push_str(&format!(", ${param_count}"));
+            params_per_row += 1;
         }
 
-        param_count += 1;
         query.push_str(", payload");
-        values.push_str(&format!(", ${param_count}"));
+        params_per_row += 1;
 
-        query.push_str(&format!(") VALUES {values})"));
+        query.push_str(") VALUES ");
 
-        (query, param_count)
+        let mut value_groups = Vec::with_capacity(row_count);
+        for row_idx in 0..row_count {
+            let base_param = (row_idx as u32) * params_per_row;
+            let mut values = format!("(${}::numeric", base_param + 1);
+            for i in 2..=params_per_row {
+                values.push_str(&format!(", ${}", base_param + i));
+            }
+            values.push(')');
+            value_groups.push(values);
+        }
+
+        query.push_str(&value_groups.join(", "));
+
+        Ok((query, params_per_row))
     }
-}
-
-fn handle_retry_error(e: sqlx::Error, attempts: u32, max_retries: u32) -> Result<bool, Error> {
-    if attempts >= max_retries || !is_transient_error(&e) {
-        error!("Database operation failed after {attempts} attempts: {e}");
-        return Err(Error::InvalidRecord);
-    }
-    warn!("Transient database error (attempt {attempts}/{max_retries}): {e}. Retrying...");
-    Ok(true)
 }
 
 fn is_transient_error(e: &sqlx::Error) -> bool {
@@ -502,6 +519,19 @@ fn is_transient_error(e: &sqlx::Error) -> bool {
         }),
         _ => false,
     }
+}
+
+fn quote_identifier(name: &str) -> Result<String, Error> {
+    if name.is_empty() {
+        return Err(Error::InitError("Table name cannot be empty".to_string()));
+    }
+    if name.contains('\0') {
+        return Err(Error::InitError(
+            "Table name cannot contain null characters".to_string(),
+        ));
+    }
+    let escaped = name.replace('"', "\"\"");
+    Ok(format!("\"{escaped}\""))
 }
 
 fn redact_connection_string(conn_str: &str) -> String {
@@ -587,9 +617,11 @@ mod tests {
     #[test]
     fn given_all_options_enabled_should_build_full_insert_query() {
         let sink = PostgresSink::new(1, test_config());
-        let (query, param_count) = sink.build_insert_query("messages", true, true, true);
+        let (query, param_count) = sink
+            .build_batch_insert_query("messages", true, true, true, 1)
+            .expect("Failed to build query");
 
-        assert!(query.contains("INSERT INTO messages"));
+        assert!(query.contains("INSERT INTO \"messages\""));
         assert!(query.contains("iggy_offset"));
         assert!(query.contains("iggy_timestamp"));
         assert!(query.contains("iggy_stream"));
@@ -604,9 +636,11 @@ mod tests {
     #[test]
     fn given_metadata_disabled_should_build_minimal_insert_query() {
         let sink = PostgresSink::new(1, test_config());
-        let (query, param_count) = sink.build_insert_query("messages", false, false, false);
+        let (query, param_count) = sink
+            .build_batch_insert_query("messages", false, false, false, 1)
+            .expect("Failed to build query");
 
-        assert!(query.contains("INSERT INTO messages"));
+        assert!(query.contains("INSERT INTO \"messages\""));
         assert!(!query.contains("iggy_offset"));
         assert!(!query.contains("iggy_checksum"));
         assert!(!query.contains("iggy_origin_timestamp"));
@@ -617,7 +651,9 @@ mod tests {
     #[test]
     fn given_only_checksum_enabled_should_include_checksum() {
         let sink = PostgresSink::new(1, test_config());
-        let (query, param_count) = sink.build_insert_query("messages", false, true, false);
+        let (query, param_count) = sink
+            .build_batch_insert_query("messages", false, true, false, 1)
+            .expect("Failed to build query");
 
         assert!(!query.contains("iggy_offset"));
         assert!(query.contains("iggy_checksum"));
@@ -695,5 +731,73 @@ mod tests {
         let conn = "postgresql://admin:secret123@db.example.com:5432/mydb";
         let redacted = redact_connection_string(conn);
         assert_eq!(redacted, "postgresql://adm***");
+    }
+
+    #[test]
+    fn given_special_chars_in_identifier_should_escape() {
+        let result = quote_identifier("table\"name").expect("Failed to quote");
+        assert_eq!(result, "\"table\"\"name\"");
+    }
+
+    #[test]
+    fn given_empty_identifier_should_fail() {
+        let result = quote_identifier("");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn given_null_char_in_identifier_should_fail() {
+        let result = quote_identifier("table\0name");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn given_normal_identifier_should_quote() {
+        let result = quote_identifier("my_table").expect("Failed to quote");
+        assert_eq!(result, "\"my_table\"");
+    }
+
+    #[test]
+    fn given_identifier_with_spaces_should_quote() {
+        let result = quote_identifier("my table").expect("Failed to quote");
+        assert_eq!(result, "\"my table\"");
+    }
+
+    #[test]
+    fn given_identifier_with_sql_injection_should_escape() {
+        let result = quote_identifier("messages\"; DROP TABLE users; --").expect("Failed to quote");
+        assert_eq!(result, "\"messages\"\"; DROP TABLE users; --\"");
+    }
+
+    #[test]
+    fn given_batch_of_3_rows_should_build_multi_row_insert_query() {
+        let sink = PostgresSink::new(1, test_config());
+        let (query, params_per_row) = sink
+            .build_batch_insert_query("messages", true, true, true, 3)
+            .expect("Failed to build batch query");
+
+        // With all options: id + 5 metadata + checksum + origin_timestamp + payload = 9 params per row
+        assert_eq!(params_per_row, 9);
+
+        // Should have 3 value groups
+        assert!(query.contains("($1::numeric, $2, $3, $4, $5, $6, $7, $8, $9)"));
+        assert!(query.contains("($10::numeric, $11, $12, $13, $14, $15, $16, $17, $18)"));
+        assert!(query.contains("($19::numeric, $20, $21, $22, $23, $24, $25, $26, $27)"));
+    }
+
+    #[test]
+    fn given_batch_of_2_rows_minimal_should_build_correct_query() {
+        let sink = PostgresSink::new(1, test_config());
+        let (query, params_per_row) = sink
+            .build_batch_insert_query("messages", false, false, false, 2)
+            .expect("Failed to build batch query");
+
+        // With minimal options: id + payload = 2 params per row
+        assert_eq!(params_per_row, 2);
+
+        // Should have 2 value groups
+        assert!(query.contains("($1::numeric, $2)"));
+        assert!(query.contains("($3::numeric, $4)"));
+        assert!(!query.contains("$5"));
     }
 }
