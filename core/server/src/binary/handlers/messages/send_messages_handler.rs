@@ -187,7 +187,7 @@ impl ServerCommandHandler for SendMessages {
                     .send_request_to_shard_or_recoil(Some(&namespace), socket_transfer_msg)
                     .await
                 {
-                    error!("tranfer socket to another shard failed, drop connection. {e:?}");
+                    error!("transfer socket to another shard failed, drop connection. {e:?}");
                     return Ok(HandlerResult::Finished);
                 }
 
