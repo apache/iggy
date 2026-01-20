@@ -28,6 +28,8 @@ pub mod consumer_timestamp_polling_scenario;
 pub mod create_message_payload;
 pub mod delete_segments_scenario;
 pub mod encryption_scenario;
+pub mod get_messages_by_offset_api;
+pub mod get_messages_by_timestamp_api;
 pub mod message_headers_scenario;
 pub mod message_size_scenario;
 pub mod permissions_scenario;
