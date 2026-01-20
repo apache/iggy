@@ -16,40 +16,28 @@
  * under the License.
  */
 
-//TODO: Fix me use shard instead of system
-/*
-use crate::streaming::common::test_setup::TestSetup;
-use iggy::prelude::{SnapshotCompression, SystemSnapshotType};
-use server::configs::cluster::ClusterConfig;
-use server::configs::server::{DataMaintenanceConfig, PersonalAccessTokenConfig};
-use server::streaming::session::Session;
+use iggy::prelude::*;
+use integration::test_server::{ClientFactory, assert_clean_system};
 use std::io::{Cursor, Read};
-use std::net::{Ipv4Addr, SocketAddr};
 use zip::ZipArchive;
 
+pub async fn run(client_factory: &dyn ClientFactory) {
+    let client = client_factory.create_client().await;
+    let client = IggyClient::create(client, None, None);
 
-#[tokio::test]
-async fn should_create_snapshot_file() {
-    let setup = TestSetup::init().await;
-    let mut system = System::new(
-        setup.config.clone(),
-        ClusterConfig::default(),
-        DataMaintenanceConfig::default(),
-        PersonalAccessTokenConfig::default(),
-    );
+    client
+        .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+        .await
+        .unwrap();
 
-    system.init().await.unwrap();
-
-    let session = Session::new(1, 1, SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 1234));
-
-    let snapshot = system
-        .get_snapshot(
-            &session,
+    let snapshot = client
+        .snapshot(
             SnapshotCompression::Deflated,
-            &vec![SystemSnapshotType::Test],
+            vec![SystemSnapshotType::Test],
         )
         .await
         .unwrap();
+
     assert!(!snapshot.0.is_empty());
 
     let cursor = Cursor::new(snapshot.0);
@@ -57,7 +45,7 @@ async fn should_create_snapshot_file() {
     let mut test_file = zip.by_name("test.txt").unwrap();
     let mut test_content = String::new();
     test_file.read_to_string(&mut test_content).unwrap();
-    assert_eq!(test_content, "test\n");
-}
+    assert_eq!(test_content.trim(), "test");
 
-*/
+    assert_clean_system(&client).await;
+}

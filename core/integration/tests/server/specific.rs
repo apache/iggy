@@ -17,8 +17,9 @@
  */
 
 use crate::server::scenarios::{
-    delete_segments_scenario, message_size_scenario, segment_rotation_race_scenario,
-    single_message_per_batch_scenario, tcp_tls_scenario, websocket_tls_scenario,
+    cross_protocol_pat_scenario, delete_segments_scenario, message_size_scenario,
+    segment_rotation_race_scenario, single_message_per_batch_scenario, tcp_tls_scenario,
+    websocket_tls_scenario,
 };
 use iggy::prelude::*;
 use integration::{
@@ -291,4 +292,22 @@ async fn segment_rotation_scenario() {
     ];
 
     segment_rotation_race_scenario::run(&factories).await;
+}
+
+#[tokio::test]
+#[parallel]
+async fn should_see_pat_created_via_http_when_listing_via_tcp() {
+    cross_protocol_pat_scenario::run().await;
+}
+
+#[tokio::test]
+#[parallel]
+async fn should_see_pat_created_via_tcp_when_listing_via_http() {
+    cross_protocol_pat_scenario::run_tcp_to_http().await;
+}
+
+#[tokio::test]
+#[parallel]
+async fn should_not_see_pat_deleted_via_http_when_listing_via_tcp() {
+    cross_protocol_pat_scenario::run_delete_visibility().await;
 }
