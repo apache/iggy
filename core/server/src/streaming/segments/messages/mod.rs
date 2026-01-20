@@ -19,10 +19,10 @@
 mod messages_reader;
 mod messages_writer;
 
-use super::IggyMessagesBatchSet;
 use bytes::Bytes;
 use compio::{fs::File, io::AsyncWriteAtExt};
-use iggy_common::{IggyError, IggyMessagesBatch, PooledBuffer};
+use iggy_common::{IggyError, IggyMessagesBatch};
+use tracing::error;
 
 pub use messages_reader::MessagesReader;
 pub use messages_writer::MessagesWriter;
@@ -32,30 +32,7 @@ pub use messages_writer::MessagesWriter;
 /// cross-platform compatibility and leave room for any internal overhead.
 const MAX_IOV_COUNT: usize = 1024;
 
-/// Vectored write a batches of messages to file
-async fn write_batch(
-    file: &File,
-    position: u64,
-    mut batches: IggyMessagesBatchSet,
-) -> Result<usize, IggyError> {
-    let (total_written, buffers) =
-        batches
-            .iter_mut()
-            .fold((0usize, Vec::new()), |(size, mut bufs), batch| {
-                let batch_size = batch.size() as usize;
-                bufs.push(batch.take_messages());
-                (size + batch_size, bufs)
-            });
-
-    write_vectored_chunked_pooled(file, position, buffers).await?;
-    Ok(total_written)
-}
-
 /// Vectored write frozen (immutable) batches to file.
-///
-/// This function writes `IggyMessagesBatch` (immutable, Arc-backed) directly
-/// without transferring ownership. The caller retains the batches for reads
-/// during the async I/O operation.
 pub async fn write_batch_frozen(
     file: &File,
     position: u64,
@@ -73,26 +50,6 @@ pub async fn write_batch_frozen(
     Ok(total_written)
 }
 
-/// Writes PooledBuffer buffers to file using vectored I/O, chunking to respect IOV_MAX limits.
-async fn write_vectored_chunked_pooled(
-    file: &File,
-    mut position: u64,
-    buffers: Vec<PooledBuffer>,
-) -> Result<(), IggyError> {
-    let mut iter = buffers.into_iter().peekable();
-
-    while iter.peek().is_some() {
-        let chunk: Vec<PooledBuffer> = iter.by_ref().take(MAX_IOV_COUNT).collect();
-        let chunk_size: usize = chunk.iter().map(|b| b.len()).sum();
-
-        let (result, _) = (&*file).write_vectored_all_at(chunk, position).await.into();
-        result.map_err(|_| IggyError::CannotWriteToFile)?;
-
-        position += chunk_size as u64;
-    }
-    Ok(())
-}
-
 /// Writes Bytes buffers to file using vectored I/O, chunking to respect IOV_MAX limits.
 async fn write_vectored_chunked_bytes(
     file: &File,
@@ -107,7 +64,10 @@ async fn write_vectored_chunked_bytes(
             .write_vectored_all_at(chunk_vec, position)
             .await
             .into();
-        result.map_err(|_| IggyError::CannotWriteToFile)?;
+        result.map_err(|e| {
+            error!("Failed to write frozen batch to messages file: {e}");
+            IggyError::CannotWriteToFile
+        })?;
 
         position += chunk_size as u64;
     }

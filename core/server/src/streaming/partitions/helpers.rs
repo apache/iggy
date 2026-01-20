@@ -32,11 +32,15 @@ use crate::{
             storage,
         },
         polling_consumer::ConsumerGroupId,
-        segments::{IggyIndexesMut, IggyMessagesBatchMut, IggyMessagesBatchSet, storage::Storage},
+        segments::{
+            IggyIndexesMut, IggyMessagesBatchMut, IggyMessagesBatchSet, IndexWriter,
+            MessagesWriter, storage::Storage,
+        },
     },
 };
 use err_trail::ErrContext;
-use iggy_common::{ConsumerOffsetInfo, Identifier, IggyByteSize, IggyError};
+use iggy_common::{ConsumerOffsetInfo, IggyByteSize, IggyError, IggyMessagesBatch, PooledBuffer};
+use std::rc::Rc;
 use std::{
     ops::AsyncFnOnce,
     sync::{Arc, atomic::Ordering},
@@ -430,35 +434,63 @@ pub fn append_to_journal(
     }
 }
 
-/// Commit journal and set in-flight buffer with frozen batches.
-/// Returns frozen batches for persisting to disk.
-pub fn commit_journal_with_in_flight()
--> impl FnOnce(ComponentsById<PartitionRefMut>) -> Vec<iggy_common::IggyMessagesBatch> {
-    |(.., log)| {
-        let mut batches = log.journal_mut().commit();
-        if batches.is_empty() {
-            return Vec::new();
-        }
-        log.ensure_indexes();
-        batches.append_indexes_to(log.active_indexes_mut().unwrap());
-        let frozen: Vec<_> = batches.iter_mut().map(|b| b.freeze()).collect();
-        log.set_in_flight(frozen.clone());
-        frozen
-    }
-}
-
 pub fn clear_in_flight() -> impl FnOnce(ComponentsById<PartitionRefMut>) {
     |(.., log)| {
         log.clear_in_flight();
     }
 }
 
-pub fn commit_journal() -> impl FnOnce(ComponentsById<PartitionRefMut>) -> IggyMessagesBatchSet {
+/// Result of committing journal batches for a specific segment.
+/// Captures writers, indexes, and frozen batches at commit time to prevent race conditions.
+/// The in-flight buffer is set atomically during commit to ensure polls can always find data.
+pub struct CommittedBatch {
+    pub segment_idx: usize,
+    pub messages_writer: Rc<MessagesWriter>,
+    pub index_writer: Rc<IndexWriter>,
+    /// Indexes captured at commit time, before any rotation can clear them.
+    pub unsaved_indexes: PooledBuffer,
+    /// Frozen (immutable) batches ready for disk persistence.
+    /// These are also stored in the in-flight buffer for reads during async I/O.
+    pub frozen: Vec<IggyMessagesBatch>,
+}
+
+/// Commits the journal and returns the batches along with the segment's writers and indexes.
+/// By capturing writers, indexes, and frozen batches at commit time (within the same lock
+/// acquisition), we ensure that even if segment rotation happens after this call, we still
+/// have valid data to complete the persistence operation.
+///
+/// CRITICAL: This function also sets the in-flight buffer atomically. This prevents a race
+/// condition where a poll could arrive after journal commit but before in-flight is set,
+/// finding both journal and in-flight empty while data is not yet on disk.
+pub fn commit_journal() -> impl FnOnce(ComponentsById<PartitionRefMut>) -> CommittedBatch {
     |(.., log)| {
-        let batches = log.journal_mut().commit();
+        let segment_idx = log.segments().len().saturating_sub(1);
+        let mut batches = log.journal_mut().commit();
         log.ensure_indexes();
         batches.append_indexes_to(log.active_indexes_mut().unwrap());
-        batches
+
+        let storage = log.active_storage();
+        let messages_writer = storage
+            .messages_writer
+            .as_ref()
+            .expect("Messages writer must exist at commit time")
+            .clone();
+        let index_writer = storage
+            .index_writer
+            .as_ref()
+            .expect("Index writer must exist at commit time")
+            .clone();
+        let unsaved_indexes = log.active_indexes().unwrap().unsaved_slice();
+        let frozen: Vec<IggyMessagesBatch> = batches.iter_mut().map(|b| b.freeze()).collect();
+        log.set_in_flight(frozen.clone());
+
+        CommittedBatch {
+            segment_idx,
+            messages_writer,
+            index_writer,
+            unsaved_indexes,
+            frozen,
+        }
     }
 }
 
@@ -494,76 +526,22 @@ pub fn persist_reason(
     }
 }
 
-pub fn persist_batch(
-    stream_id: &Identifier,
-    topic_id: &Identifier,
-    partition_id: usize,
-    batches: IggyMessagesBatchSet,
-    reason: String,
-) -> impl AsyncFnOnce(ComponentsById<PartitionRef>) -> Result<(IggyByteSize, u32), IggyError> {
-    async move |(.., log)| {
-        tracing::trace!(
-            "Persisting messages on disk for stream ID: {}, topic ID: {}, partition ID: {} because {}...",
-            stream_id,
-            topic_id,
-            partition_id,
-            reason
-        );
-
-        let batch_count = batches.count();
-        let batch_size = batches.size();
-
-        let storage = log.active_storage();
-        let saved = storage
-            .messages_writer
-            .as_ref()
-            .expect("Messages writer not initialized")
-            .save_batch_set(batches)
-            .await
-            .error(|e: &IggyError| {
-                let segment = log.active_segment();
-                format!(
-                    "Failed to save batch of {batch_count} messages \
-                                    ({batch_size} bytes) to {segment}. {e}",
-                )
-            })?;
-
-        let unsaved_indexes_slice = log.active_indexes().unwrap().unsaved_slice();
-        let len = unsaved_indexes_slice.len();
-        storage
-            .index_writer
-            .as_ref()
-            .expect("Index writer not initialized")
-            .save_indexes(unsaved_indexes_slice)
-            .await
-            .error(|e: &IggyError| {
-                let segment = log.active_segment();
-                format!("Failed to save index of {len} indexes to {segment}. {e}",)
-            })?;
-
-        tracing::trace!(
-            "Persisted {} messages on disk for stream ID: {}, topic ID: {}, for partition with ID: {}, total bytes written: {}.",
-            batch_count,
-            stream_id,
-            topic_id,
-            partition_id,
-            saved
-        );
-
-        Ok((saved, batch_count))
-    }
-}
-
+/// Updates segment size and marks indexes as saved for a specific segment.
+/// Uses segment_idx to ensure we update the correct segment even after rotation.
 pub fn update_index_and_increment_stats(
+    segment_idx: usize,
     saved: IggyByteSize,
     config: &SystemConfig,
 ) -> impl FnOnce(ComponentsById<PartitionRefMut>) {
     move |(.., log)| {
-        let segment = log.active_segment_mut();
-        segment.size = IggyByteSize::from(segment.size.as_bytes_u64() + saved.as_bytes_u64());
-        log.active_indexes_mut().unwrap().mark_saved();
-        if config.segment.cache_indexes == CacheIndexesConfig::None {
-            log.active_indexes_mut().unwrap().clear();
+        if let Some(segment) = log.segments_mut().get_mut(segment_idx) {
+            segment.size = IggyByteSize::from(segment.size.as_bytes_u64() + saved.as_bytes_u64());
+        }
+        if let Some(Some(indexes)) = log.indexes_mut().get_mut(segment_idx) {
+            indexes.mark_saved();
+            if config.segment.cache_indexes == CacheIndexesConfig::None {
+                indexes.clear();
+            }
         }
     }
 }
