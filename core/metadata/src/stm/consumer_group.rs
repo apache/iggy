@@ -20,13 +20,10 @@ use crate::{define_state, impl_absorb};
 use ahash::AHashMap;
 use iggy_common::create_consumer_group::CreateConsumerGroup;
 use iggy_common::delete_consumer_group::DeleteConsumerGroup;
+use iggy_common::{IdKind, Identifier};
 use slab::Slab;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
-
-// ============================================================================
-// ConsumerGroupMember Entity
-// ============================================================================
 
 #[derive(Debug, Clone)]
 pub struct ConsumerGroupMember {
@@ -47,33 +44,24 @@ impl ConsumerGroupMember {
     }
 }
 
-// ============================================================================
-// ConsumerGroup Entity
-// ============================================================================
-
 #[derive(Debug, Clone)]
 pub struct ConsumerGroup {
     pub id: usize,
-    pub stream_id: usize,
-    pub topic_id: usize,
     pub name: Arc<str>,
     pub partitions: Vec<usize>,
     pub members: Slab<ConsumerGroupMember>,
 }
 
 impl ConsumerGroup {
-    pub fn new(stream_id: usize, topic_id: usize, name: Arc<str>) -> Self {
+    pub fn new(name: Arc<str>) -> Self {
         Self {
             id: 0,
-            stream_id,
-            topic_id,
             name,
             partitions: Vec::new(),
             members: Slab::new(),
         }
     }
 
-    /// Rebalance partition assignments among members (round-robin).
     pub fn rebalance_members(&mut self) {
         let partition_count = self.partitions.len();
         let member_count = self.members.len();
@@ -82,7 +70,6 @@ impl ConsumerGroup {
             return;
         }
 
-        // Clear all member partitions
         let member_ids: Vec<usize> = self.members.iter().map(|(id, _)| id).collect();
         for &member_id in &member_ids {
             if let Some(member) = self.members.get_mut(member_id) {
@@ -90,7 +77,6 @@ impl ConsumerGroup {
             }
         }
 
-        // Rebuild assignments (round-robin)
         for (i, &partition_id) in self.partitions.iter().enumerate() {
             let member_idx = i % member_count;
             if let Some(&member_id) = member_ids.get(member_idx)
@@ -102,28 +88,139 @@ impl ConsumerGroup {
     }
 }
 
-// ============================================================================
-// ConsumerGroups State Machine
-// ============================================================================
-
 define_state! {
     ConsumerGroups {
         name_index: AHashMap<Arc<str>, usize>,
         topic_index: AHashMap<(usize, usize), Vec<usize>>,
+        topic_name_index: AHashMap<(Arc<str>, Arc<str>), Vec<usize>>,
         items: Slab<ConsumerGroup>,
     },
     [CreateConsumerGroup, DeleteConsumerGroup]
 }
 impl_absorb!(ConsumerGroupsInner, ConsumerGroupsCommand);
 
+impl ConsumerGroupsInner {
+    fn resolve_consumer_group_id_by_identifiers(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        group_id: &Identifier,
+    ) -> Option<usize> {
+        // Resolve by numeric IDs
+        if let (Ok(s), Ok(t)) = (stream_id.get_u32_value(), topic_id.get_u32_value()) {
+            let groups_in_topic = self.topic_index.get(&(s as usize, t as usize))?;
+
+            return match group_id.kind {
+                IdKind::Numeric => {
+                    let g_id = group_id.get_u32_value().ok()? as usize;
+                    groups_in_topic.contains(&g_id).then_some(g_id)
+                }
+                IdKind::String => {
+                    let g_name = group_id.get_string_value().ok()?;
+                    groups_in_topic
+                        .iter()
+                        .find(|&&id| {
+                            self.items
+                                .get(id)
+                                .is_some_and(|g| g.name.as_ref() == g_name)
+                        })
+                        .copied()
+                }
+            };
+        }
+
+        // Resolve by string names
+        if let (Ok(s), Ok(t)) = (stream_id.get_string_value(), topic_id.get_string_value()) {
+            let key = (Arc::from(s.as_str()), Arc::from(t.as_str()));
+            let groups_in_topic = self.topic_name_index.get(&key)?;
+
+            return match group_id.kind {
+                IdKind::Numeric => {
+                    let g_id = group_id.get_u32_value().ok()? as usize;
+                    groups_in_topic.contains(&g_id).then_some(g_id)
+                }
+                IdKind::String => {
+                    let g_name = group_id.get_string_value().ok()?;
+                    groups_in_topic
+                        .iter()
+                        .find(|&&id| {
+                            self.items
+                                .get(id)
+                                .is_some_and(|g| g.name.as_ref() == g_name)
+                        })
+                        .copied()
+                }
+            };
+        }
+
+        None
+    }
+}
+
 impl Handler for ConsumerGroupsInner {
-    fn handle(&mut self, cmd: &ConsumerGroupsCommand) {
+    fn handle(&mut self, cmd: &Self::Cmd) {
+        // TODO: This is all an hack, we need to figure out how to do this, in a way where `Identifier` does not reach
+        // this stage of execution.
         match cmd {
-            ConsumerGroupsCommand::CreateConsumerGroup(_payload) => {
-                // Actual mutation logic will be implemented later
+            ConsumerGroupsCommand::CreateConsumerGroup(payload) => {
+                let name: Arc<str> = Arc::from(payload.name.as_str());
+                if self.name_index.contains_key(&name) {
+                    return;
+                }
+
+                let group = ConsumerGroup::new(name.clone());
+                let id = self.items.insert(group);
+                self.items[id].id = id;
+
+                self.name_index.insert(name.clone(), id);
+
+                if let (Ok(s), Ok(t)) = (
+                    payload.stream_id.get_u32_value(),
+                    payload.topic_id.get_u32_value(),
+                ) {
+                    self.topic_index
+                        .entry((s as usize, t as usize))
+                        .or_default()
+                        .push(id);
+                }
+
+                if let (Ok(s), Ok(t)) = (
+                    payload.stream_id.get_string_value(),
+                    payload.topic_id.get_string_value(),
+                ) {
+                    let key = (Arc::from(s.as_str()), Arc::from(t.as_str()));
+                    self.topic_name_index.entry(key).or_default().push(id);
+                }
             }
-            ConsumerGroupsCommand::DeleteConsumerGroup(_payload) => {
-                // Actual mutation logic will be implemented later
+
+            ConsumerGroupsCommand::DeleteConsumerGroup(payload) => {
+                if let Some(id) = self.resolve_consumer_group_id_by_identifiers(
+                    &payload.stream_id,
+                    &payload.topic_id,
+                    &payload.group_id,
+                ) {
+                    let group = self.items.remove(id);
+
+                    self.name_index.remove(&group.name);
+
+                    if let (Ok(s), Ok(t)) = (
+                        payload.stream_id.get_u32_value(),
+                        payload.topic_id.get_u32_value(),
+                    )
+                        && let Some(vec) = self.topic_index.get_mut(&(s as usize, t as usize)) {
+                            vec.retain(|&x| x != id);
+                        }
+
+                    if let (Ok(s), Ok(t)) = (
+                        payload.stream_id.get_string_value(),
+                        payload.topic_id.get_string_value(),
+                    ) {
+                        let key = (Arc::from(s.as_str()), Arc::from(t.as_str()));
+                        if let Some(vec) = self.topic_name_index.get_mut(&key) {
+                            vec.retain(|&x| x != id);
+                        }
+                    }
+                }
             }
         }
     }

@@ -69,6 +69,7 @@ where
     T: Absorb<C>,
 {
     write: Option<WriteCell<T, C>>,
+    #[allow(unused)]
     read: Arc<ReadHandle<T>>,
 }
 
@@ -183,8 +184,8 @@ macro_rules! define_state {
             }
 
             impl From<$crate::stm::LeftRight<[<$state Inner>], [<$state Command>]>> for $state {
-                fn from(storage: $crate::stm::LeftRight<[<$state Inner>], [<$state Command>]>) -> Self {
-                    Self { inner: storage }
+                fn from(inner: $crate::stm::LeftRight<[<$state Inner>], [<$state Command>]>) -> Self {
+                    Self { inner }
                 }
             }
 

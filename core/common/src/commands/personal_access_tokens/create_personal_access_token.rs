@@ -31,7 +31,7 @@ use std::str::from_utf8;
 /// It has additional payload:
 /// - `name` - unique name of the token, must be between 3 and 30 characters long.
 /// - `expiry` - expiry of the token.
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CreatePersonalAccessToken {
     /// Unique name of the token, must be between 3 and 30 characters long.
     pub name: String,
