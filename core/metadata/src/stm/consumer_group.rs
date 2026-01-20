@@ -206,10 +206,10 @@ impl Handler for ConsumerGroupsInner {
                     if let (Ok(s), Ok(t)) = (
                         payload.stream_id.get_u32_value(),
                         payload.topic_id.get_u32_value(),
-                    )
-                        && let Some(vec) = self.topic_index.get_mut(&(s as usize, t as usize)) {
-                            vec.retain(|&x| x != id);
-                        }
+                    ) && let Some(vec) = self.topic_index.get_mut(&(s as usize, t as usize))
+                    {
+                        vec.retain(|&x| x != id);
+                    }
 
                     if let (Ok(s), Ok(t)) = (
                         payload.stream_id.get_string_value(),

@@ -26,9 +26,7 @@ use iggy_common::delete_personal_access_token::DeletePersonalAccessToken;
 use iggy_common::delete_user::DeleteUser;
 use iggy_common::update_permissions::UpdatePermissions;
 use iggy_common::update_user::UpdateUser;
-use iggy_common::{
-    IggyTimestamp, Permissions, PersonalAccessToken, UserId, UserStatus,
-};
+use iggy_common::{IggyTimestamp, Permissions, PersonalAccessToken, UserId, UserStatus};
 use slab::Slab;
 use std::sync::Arc;
 
@@ -156,9 +154,10 @@ impl Handler for UsersInner {
                 if let Some(new_username) = &payload.username {
                     let new_username_arc: Arc<str> = Arc::from(new_username.as_str());
                     if let Some(&existing_id) = self.index.get(&new_username_arc)
-                        && existing_id != user_id as UserId {
-                            return;
-                        }
+                        && existing_id != user_id as UserId
+                    {
+                        return;
+                    }
 
                     self.index.remove(&user.username);
                     user.username = new_username_arc.clone();
@@ -202,10 +201,7 @@ impl Handler for UsersInner {
             UsersCommand::CreatePersonalAccessToken(payload) => {
                 // TODO: Stub untill protocol gets adjusted.
                 let user_id = 0;
-                let user_tokens = self
-                    .personal_access_tokens
-                    .entry(user_id)
-                    .or_default();
+                let user_tokens = self.personal_access_tokens.entry(user_id).or_default();
                 let name_arc: Arc<str> = Arc::from(payload.name.as_str());
                 if user_tokens.contains_key(&name_arc) {
                     return;

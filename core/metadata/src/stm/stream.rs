@@ -262,9 +262,10 @@ impl Handler for StreamsInner {
 
                 let new_name_arc: Arc<str> = Arc::from(payload.name.as_str());
                 if let Some(&existing_id) = self.index.get(&new_name_arc)
-                    && existing_id != stream_id {
-                        return;
-                    }
+                    && existing_id != stream_id
+                {
+                    return;
+                }
 
                 self.index.remove(&stream.name);
                 stream.name = new_name_arc.clone();
@@ -344,9 +345,10 @@ impl Handler for StreamsInner {
 
                 let new_name_arc: Arc<str> = Arc::from(payload.name.as_str());
                 if let Some(&existing_id) = stream.topic_index.get(&new_name_arc)
-                    && existing_id != topic_id {
-                        return;
-                    }
+                    && existing_id != topic_id
+                {
+                    return;
+                }
 
                 stream.topic_index.remove(&topic.name);
                 topic.name = new_name_arc.clone();
