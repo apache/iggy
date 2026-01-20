@@ -107,6 +107,7 @@ async fn run_offset_test(
         &batch_offsets,
     )
     .await;
+    verify_sequential_chunk_reads(client, &stream_name, &topic_name, total_messages_count).await;
 
     cleanup(client, &stream_name).await;
 }
@@ -414,6 +415,48 @@ async fn verify_message_content(
             }
         }
     }
+}
+
+async fn verify_sequential_chunk_reads(
+    client: &IggyClient,
+    stream_name: &str,
+    topic_name: &str,
+    total_messages: u32,
+) {
+    let chunk_size = 500u32;
+    let mut verified_count = 0u32;
+
+    for chunk_start in (0..total_messages).step_by(chunk_size as usize) {
+        let read_size = std::cmp::min(chunk_size, total_messages - chunk_start);
+
+        let polled = client
+            .poll_messages(
+                &Identifier::named(stream_name).unwrap(),
+                &Identifier::named(topic_name).unwrap(),
+                Some(PARTITION_ID),
+                &Consumer::default(),
+                &PollingStrategy::offset(chunk_start as u64),
+                read_size,
+                false,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            polled.messages.len() as u32,
+            read_size,
+            "Failed to read chunk at offset {} with size {}",
+            chunk_start,
+            read_size
+        );
+
+        verified_count += polled.messages.len() as u32;
+    }
+
+    assert_eq!(
+        verified_count, total_messages,
+        "Sequential chunk reads didn't cover all messages"
+    );
 }
 
 async fn cleanup(client: &IggyClient, stream_name: &str) {
