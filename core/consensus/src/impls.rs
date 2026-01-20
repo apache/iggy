@@ -168,12 +168,12 @@ impl LocalPipeline {
         self.prepare_queue.is_empty()
     }
 
-    /// Push a new prepare to the pipeline.
+    /// Push a new message to the pipeline.
     ///
     /// # Panics
-    /// - If prepare queue is full.
-    /// - If the prepare doesn't chain correctly to the previous entry.
-    pub fn push_prepare(&mut self, message: Message<PrepareHeader>) {
+    /// - If message queue is full.
+    /// - If the message doesn't chain correctly to the previous entry.
+    pub fn push_message(&mut self, message: Message<PrepareHeader>) {
         assert!(!self.prepare_queue_full(), "prepare queue is full");
 
         let header = message.header();
@@ -198,9 +198,9 @@ impl LocalPipeline {
         self.prepare_queue.push_back(PipelineEntry::new(message));
     }
 
-    /// Pop the oldest prepare (after it's been committed).
+    /// Pop the oldest message (after it's been committed).
     ///
-    pub fn pop_prepare(&mut self) -> Option<PipelineEntry> {
+    pub fn pop_message(&mut self) -> Option<PipelineEntry> {
         self.prepare_queue.pop_front()
     }
 
@@ -218,8 +218,8 @@ impl LocalPipeline {
         self.prepare_queue.back()
     }
 
-    /// Find a prepare by op number and checksum.
-    pub fn prepare_by_op_and_checksum(
+    /// Find a message by op number and checksum.
+    pub fn message_by_op_and_checksum(
         &mut self,
         op: u64,
         checksum: u128,
@@ -250,8 +250,8 @@ impl LocalPipeline {
         }
     }
 
-    /// Find a prepare by op number only.
-    pub fn prepare_by_op(&self, op: u64) -> Option<&PipelineEntry> {
+    /// Find a message by op number only.
+    pub fn message_by_op(&self, op: u64) -> Option<&PipelineEntry> {
         let head_op = self.prepare_queue.front()?.message.header().op;
 
         if op < head_op {
@@ -262,9 +262,9 @@ impl LocalPipeline {
         self.prepare_queue.get(index)
     }
 
-    /// Get mutable reference to a prepare entry by op number.
+    /// Get mutable reference to a message entry by op number.
     /// Returns None if op is not in the pipeline.
-    pub fn prepare_by_op_mut(&mut self, op: u64) -> Option<&mut PipelineEntry> {
+    pub fn message_by_op_mut(&mut self, op: u64) -> Option<&mut PipelineEntry> {
         let head_op = self.prepare_queue.front()?.message.header().op;
         if op < head_op {
             return None;
@@ -326,24 +326,24 @@ impl Pipeline for LocalPipeline {
     type Message = Message<PrepareHeader>;
     type Entry = PipelineEntry;
 
-    fn push_prepare(&mut self, message: Self::Message) {
-        LocalPipeline::push_prepare(self, message)
+    fn push_message(&mut self, message: Self::Message) {
+        LocalPipeline::push_message(self, message)
     }
 
-    fn pop_prepare(&mut self) -> Option<Self::Entry> {
-        LocalPipeline::pop_prepare(self)
+    fn pop_message(&mut self) -> Option<Self::Entry> {
+        LocalPipeline::pop_message(self)
     }
 
     fn clear(&mut self) {
         LocalPipeline::clear(self)
     }
 
-    fn prepare_by_op_mut(&mut self, op: u64) -> Option<&mut Self::Entry> {
-        LocalPipeline::prepare_by_op_mut(self, op)
+    fn message_by_op_mut(&mut self, op: u64) -> Option<&mut Self::Entry> {
+        LocalPipeline::message_by_op_mut(self, op)
     }
 
-    fn prepare_by_op_and_checksum(&mut self, op: u64, checksum: u128) -> Option<&mut Self::Entry> {
-        LocalPipeline::prepare_by_op_and_checksum(self, op, checksum)
+    fn message_by_op_and_checksum(&mut self, op: u64, checksum: u128) -> Option<&mut Self::Entry> {
+        LocalPipeline::message_by_op_and_checksum(self, op, checksum)
     }
 
     fn is_full(&self) -> bool {
@@ -1033,7 +1033,7 @@ impl VsrConsensus {
         // Find the prepare in our pipeline
         let mut pipeline = self.pipeline.borrow_mut();
 
-        let Some(entry) = pipeline.prepare_by_op_mut(header.op) else {
+        let Some(entry) = pipeline.message_by_op_mut(header.op) else {
             // Not in pipeline - could be old/duplicate or already committed
             return false;
         };
@@ -1137,7 +1137,7 @@ impl Consensus for VsrConsensus {
         assert!(self.is_primary(), "only primary can pipeline messages");
 
         let mut pipeline = self.pipeline.borrow_mut();
-        pipeline.push_prepare(message);
+        pipeline.push_message(message);
     }
 
     fn verify_pipeline(&self) {

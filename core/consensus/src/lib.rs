@@ -26,15 +26,15 @@ pub trait Pipeline {
     type Message;
     type Entry;
 
-    fn push_prepare(&mut self, message: Self::Message);
+    fn push_message(&mut self, message: Self::Message);
 
-    fn pop_prepare(&mut self) -> Option<Self::Entry>;
+    fn pop_message(&mut self) -> Option<Self::Entry>;
 
     fn clear(&mut self);
 
-    fn prepare_by_op_mut(&mut self, op: u64) -> Option<&mut Self::Entry>;
+    fn message_by_op_mut(&mut self, op: u64) -> Option<&mut Self::Entry>;
 
-    fn prepare_by_op_and_checksum(&mut self, op: u64, checksum: u128) -> Option<&mut Self::Entry>;
+    fn message_by_op_and_checksum(&mut self, op: u64, checksum: u128) -> Option<&mut Self::Entry>;
 
     fn is_full(&self) -> bool;
 
