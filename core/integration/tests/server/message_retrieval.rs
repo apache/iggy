@@ -16,7 +16,7 @@
  * under the License.
  */
 
-use crate::server::scenarios::{get_messages_by_offset_api, get_messages_by_timestamp_api};
+use crate::server::scenarios::{offset_scenario, timestamp_scenario};
 use integration::{
     tcp_client::TcpClientFactory,
     test_server::{IpAddrKind, TestServer},
@@ -72,7 +72,7 @@ fn msgs_req_9984() -> u32 {
 )]
 #[tokio::test]
 #[parallel]
-async fn test_get_messages_by_offset_api(
+async fn get_by_offset_scenario(
     segment_size: &str,
     cache_indexes: &str,
     messages_required_to_save: u32,
@@ -105,7 +105,7 @@ async fn test_get_messages_by_offset_api(
         ..Default::default()
     };
 
-    get_messages_by_offset_api::run(&client_factory).await;
+    offset_scenario::run(&client_factory).await;
 }
 
 #[test_matrix(
@@ -115,7 +115,7 @@ async fn test_get_messages_by_offset_api(
 )]
 #[tokio::test]
 #[parallel]
-async fn test_get_messages_by_timestamp_api(
+async fn get_by_timestamp_scenario(
     segment_size: &str,
     cache_indexes: &str,
     messages_required_to_save: u32,
@@ -148,5 +148,5 @@ async fn test_get_messages_by_timestamp_api(
         ..Default::default()
     };
 
-    get_messages_by_timestamp_api::run(&client_factory).await;
+    timestamp_scenario::run(&client_factory).await;
 }

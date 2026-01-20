@@ -33,7 +33,6 @@ mod mcp;
 mod sdk;
 mod server;
 mod state;
-mod streaming;
 
 lazy_static! {
     static ref TESTS_FAILED: AtomicBool = AtomicBool::new(false);
