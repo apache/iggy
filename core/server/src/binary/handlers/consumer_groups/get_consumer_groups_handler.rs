@@ -24,7 +24,6 @@ use crate::binary::mapper;
 use crate::shard::IggyShard;
 use crate::slab::traits_ext::{EntityComponentSystem, IntoComponents};
 use crate::streaming::session::Session;
-use crate::streaming::{streams, topics};
 use anyhow::Result;
 use iggy_common::IggyError;
 use iggy_common::SenderKind;
@@ -46,19 +45,11 @@ impl ServerCommandHandler for GetConsumerGroups {
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
         shard.ensure_authenticated(session)?;
-        shard.ensure_topic_exists(&self.stream_id, &self.topic_id)?;
-        let numeric_topic_id = shard.streams.with_topic_by_id(
-            &self.stream_id,
-            &self.topic_id,
-            topics::helpers::get_topic_id(),
-        );
-        let numeric_stream_id = shard
-            .streams
-            .with_stream_by_id(&self.stream_id, streams::helpers::get_stream_id());
+        let (stream_id, topic_id) = shard.resolve_topic_id(&self.stream_id, &self.topic_id)?;
         shard.permissioner.borrow().get_consumer_groups(
             session.get_user_id(),
-            numeric_stream_id,
-            numeric_topic_id,
+            stream_id,
+            topic_id,
         )?;
 
         let consumer_groups =

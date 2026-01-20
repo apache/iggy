@@ -157,7 +157,8 @@ impl<T: ConfigurationType> CustomEnvProvider<T> {
                 .map(|k| k.to_lowercase())
                 .collect();
 
-            let env_var_value = Self::parse_environment_value(&value);
+            let expected_type = Self::find_expected_type(&source_dict, &keys);
+            let env_var_value = Self::parse_environment_value_typed(&value, expected_type);
 
             if self.secret_keys.contains(&env_key) {
                 value = SECRET_MASK.to_string();
@@ -686,45 +687,131 @@ impl<T: ConfigurationType> CustomEnvProvider<T> {
         }
     }
 
-    /// Parse environment variable value with type inference
-    fn parse_environment_value(value: &str) -> FigmentValue {
-        // Handle array syntax
+    fn parse_environment_value_typed(
+        value: &str,
+        expected_type: Option<&FigmentValue>,
+    ) -> FigmentValue {
         if value.starts_with('[') && value.ends_with(']') {
             let inner_value = value.trim_start_matches('[').trim_end_matches(']');
-            let values: Vec<FigmentValue> = inner_value
-                .split(',')
-                .map(|s| Self::parse_environment_value(s.trim()))
+            let element_type = match expected_type {
+                Some(FigmentValue::Array(_, arr)) => arr.first(),
+                _ => None,
+            };
+            let values: Vec<FigmentValue> = split_array_elements(inner_value)
+                .into_iter()
+                .map(|s| Self::parse_environment_value_typed(strip_quotes(s), element_type))
                 .collect();
             return FigmentValue::from(values);
         }
 
-        // Handle boolean values
+        if let Some(FigmentValue::String(..)) = expected_type {
+            return FigmentValue::from(value);
+        }
+
         match value.to_lowercase().as_str() {
             "true" => return FigmentValue::from(true),
             "false" => return FigmentValue::from(false),
             _ => {}
         }
 
-        // Try u64 first for most numeric values (ports, byte sizes, etc.)
         if let Ok(uint_val) = value.parse::<u64>() {
             return FigmentValue::from(uint_val);
         }
-        // Fall back to i64 for signed integers
         if let Ok(int_val) = value.parse::<i64>() {
             return FigmentValue::from(int_val);
         }
 
-        // Try parsing as float
         if let Ok(float_val) = value.parse::<f64>() {
             return FigmentValue::from(float_val);
         }
 
-        // Default to string
         FigmentValue::from(value)
+    }
+
+    fn find_expected_type<'a>(source: &'a Dict, keys: &[String]) -> Option<&'a FigmentValue> {
+        if keys.is_empty() {
+            return None;
+        }
+
+        let mut current = source;
+        let mut combined_keys = Vec::new();
+
+        for (i, key) in keys.iter().enumerate() {
+            combined_keys.push(key.clone());
+            let key_to_check = combined_keys.join("_");
+
+            match current.get(&key_to_check) {
+                Some(FigmentValue::Dict(_, inner)) => {
+                    current = inner;
+                    combined_keys.clear();
+                }
+                Some(value) if i == keys.len() - 1 => {
+                    return Some(value);
+                }
+                _ => continue,
+            }
+        }
+
+        let final_key = combined_keys.join("_");
+        current.get(&final_key)
     }
 }
 
-/// Check if a file exists using the same logic as Figment
+fn split_array_elements(s: &str) -> Vec<&str> {
+    let mut elements = Vec::new();
+    let mut start = 0;
+    let mut in_quotes = false;
+    for (i, c) in s.char_indices() {
+        match c {
+            '"' => in_quotes = !in_quotes,
+            ',' if !in_quotes => {
+                elements.push(s[start..i].trim());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    if start < s.len() {
+        elements.push(s[start..].trim());
+    }
+    elements
+}
+
+fn strip_quotes(s: &str) -> &str {
+    s.trim_matches('"')
+}
+
+pub fn parse_env_value_to_json(value: &str) -> serde_json::Value {
+    if value.starts_with('[') && value.ends_with(']') {
+        let inner = value.trim_start_matches('[').trim_end_matches(']');
+        let values: Vec<serde_json::Value> = split_array_elements(inner)
+            .into_iter()
+            .map(|s| parse_env_value_to_json(strip_quotes(s)))
+            .collect();
+        return serde_json::Value::Array(values);
+    }
+
+    match value.to_lowercase().as_str() {
+        "true" => return serde_json::Value::Bool(true),
+        "false" => return serde_json::Value::Bool(false),
+        _ => {}
+    }
+
+    if let Ok(n) = value.parse::<u64>() {
+        return serde_json::Value::Number(n.into());
+    }
+    if let Ok(n) = value.parse::<i64>() {
+        return serde_json::Value::Number(n.into());
+    }
+    if let Ok(n) = value.parse::<f64>()
+        && let Some(num) = serde_json::Number::from_f64(n)
+    {
+        return serde_json::Value::Number(num);
+    }
+
+    serde_json::Value::String(value.to_owned())
+}
+
 fn file_exists<P: AsRef<Path>>(path: P) -> bool {
     let path = path.as_ref();
 

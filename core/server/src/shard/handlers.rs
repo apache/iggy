@@ -26,7 +26,7 @@ use crate::{
             message::{ShardMessage, ShardRequest, ShardRequestPayload},
         },
     },
-    streaming::{session::Session, traits::MainOps},
+    streaming::traits::MainOps,
     tcp::{
         connection_handler::{ConnectionAction, handle_connection, handle_error},
         tcp_listener::cleanup_connection,
@@ -108,18 +108,13 @@ async fn handle_request(
                 .await?;
             Ok(ShardResponse::DeleteSegments)
         }
-        ShardRequestPayload::CreateStream { user_id, name } => {
+        ShardRequestPayload::CreateStream { user_id: _, name } => {
             assert_eq!(shard.id, 0, "CreateStream should only be handled by shard0");
-
-            let session = Session::stateless(
-                user_id,
-                std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0),
-            );
 
             // Acquire stream lock to serialize filesystem operations
             let _stream_guard = shard.fs_locks.stream_lock.lock().await;
 
-            let stream = shard.create_stream(&session, name.clone()).await?;
+            let stream = shard.create_stream(name.clone()).await?;
             let created_stream_id = stream.id();
 
             let event = ShardEvent::CreatedStream {
@@ -132,7 +127,7 @@ async fn handle_request(
             Ok(ShardResponse::CreateStreamResponse(stream))
         }
         ShardRequestPayload::CreateTopic {
-            user_id,
+            user_id: _,
             stream_id,
             name,
             partitions_count,
@@ -143,17 +138,11 @@ async fn handle_request(
         } => {
             assert_eq!(shard.id, 0, "CreateTopic should only be handled by shard0");
 
-            let session = Session::stateless(
-                user_id,
-                std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0),
-            );
-
             // Acquire topic lock to serialize filesystem operations
             let _topic_guard = shard.fs_locks.topic_lock.lock().await;
 
             let topic = shard
                 .create_topic(
-                    &session,
                     &stream_id,
                     name.clone(),
                     message_expiry,
@@ -171,7 +160,6 @@ async fn handle_request(
             shard.broadcast_event_to_all_shards(event).await?;
             let partitions = shard
                 .create_partitions(
-                    &session,
                     &stream_id,
                     &Identifier::numeric(topic_id as u32).unwrap(),
                     partitions_count,
@@ -188,7 +176,7 @@ async fn handle_request(
             Ok(ShardResponse::CreateTopicResponse(topic))
         }
         ShardRequestPayload::UpdateTopic {
-            user_id,
+            user_id: _,
             stream_id,
             topic_id,
             name,
@@ -199,13 +187,7 @@ async fn handle_request(
         } => {
             assert_eq!(shard.id, 0, "UpdateTopic should only be handled by shard0");
 
-            let session = Session::stateless(
-                user_id,
-                std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0),
-            );
-
             shard.update_topic(
-                &session,
                 &stream_id,
                 &topic_id,
                 name.clone(),
@@ -229,19 +211,14 @@ async fn handle_request(
             Ok(ShardResponse::UpdateTopicResponse)
         }
         ShardRequestPayload::DeleteTopic {
-            user_id,
+            user_id: _,
             stream_id,
             topic_id,
         } => {
             assert_eq!(shard.id, 0, "DeleteTopic should only be handled by shard0");
 
-            let session = Session::stateless(
-                user_id,
-                std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0),
-            );
-
             let _topic_guard = shard.fs_locks.topic_lock.lock().await;
-            let topic = shard.delete_topic(&session, &stream_id, &topic_id).await?;
+            let topic = shard.delete_topic(&stream_id, &topic_id).await?;
             let topic_id_num = topic.root().id();
 
             let event = ShardEvent::DeletedTopic {
@@ -254,7 +231,7 @@ async fn handle_request(
             Ok(ShardResponse::DeleteTopicResponse(topic))
         }
         ShardRequestPayload::CreateUser {
-            user_id,
+            user_id: _,
             username,
             password,
             status,
@@ -262,13 +239,8 @@ async fn handle_request(
         } => {
             assert_eq!(shard.id, 0, "CreateUser should only be handled by shard0");
 
-            let session = Session::stateless(
-                user_id,
-                std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0),
-            );
             let _user_guard = shard.fs_locks.user_lock.lock().await;
-            let user =
-                shard.create_user(&session, &username, &password, status, permissions.clone())?;
+            let user = shard.create_user(&username, &password, status, permissions.clone())?;
 
             let created_user_id = user.id;
 
@@ -288,30 +260,25 @@ async fn handle_request(
             Ok(ShardResponse::GetStatsResponse(stats))
         }
         ShardRequestPayload::DeleteUser {
-            session_user_id,
+            session_user_id: _,
             user_id,
         } => {
-            assert_eq!(shard.id, 0, "CreateUser should only be handled by shard0");
+            assert_eq!(shard.id, 0, "DeleteUser should only be handled by shard0");
 
-            let session = Session::stateless(
-                session_user_id,
-                std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0),
-            );
             let _user_guard = shard.fs_locks.user_lock.lock().await;
-            let user = shard.delete_user(&session, &user_id)?;
+            let user = shard.delete_user(&user_id)?;
             let event = ShardEvent::DeletedUser { user_id };
             shard.broadcast_event_to_all_shards(event).await?;
             Ok(ShardResponse::DeletedUser(user))
         }
-        ShardRequestPayload::DeleteStream { user_id, stream_id } => {
+        ShardRequestPayload::DeleteStream {
+            user_id: _,
+            stream_id,
+        } => {
             assert_eq!(shard.id, 0, "DeleteStream should only be handled by shard0");
 
-            let session = Session::stateless(
-                user_id,
-                std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0),
-            );
             let _stream_guard = shard.fs_locks.stream_lock.lock().await;
-            let stream = shard.delete_stream(&session, &stream_id).await?;
+            let stream = shard.delete_stream(&stream_id).await?;
             let event = ShardEvent::DeletedStream {
                 id: stream.id(),
                 stream_id,
@@ -571,7 +538,7 @@ pub async fn handle_event(shard: &Rc<IggyShard>, event: ShardEvent) -> Result<()
             cg,
         } => {
             let cg_id = cg.id();
-            let id = shard.create_consumer_group_bypass_auth(&stream_id, &topic_id, cg);
+            let id = shard.insert_consumer_group(&stream_id, &topic_id, cg);
             assert_eq!(id, cg_id);
             Ok(())
         }
@@ -581,7 +548,7 @@ pub async fn handle_event(shard: &Rc<IggyShard>, event: ShardEvent) -> Result<()
             topic_id,
             group_id,
         } => {
-            let cg = shard.delete_consumer_group_bypass_auth(&stream_id, &topic_id, &group_id);
+            let cg = shard.delete_consumer_group(&stream_id, &topic_id, &group_id)?;
             assert_eq!(cg.id(), id);
 
             Ok(())

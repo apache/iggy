@@ -49,12 +49,14 @@ impl ServerCommandHandler for CreateConsumerGroup {
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
-        let cg = shard.create_consumer_group(
-            session,
-            &self.stream_id,
-            &self.topic_id,
-            self.name.clone(),
+        shard.ensure_authenticated(session)?;
+        let (stream_id, topic_id) = shard.resolve_topic_id(&self.stream_id, &self.topic_id)?;
+        shard.permissioner.borrow().create_consumer_group(
+            session.get_user_id(),
+            stream_id,
+            topic_id,
         )?;
+        let cg = shard.create_consumer_group(&self.stream_id, &self.topic_id, self.name.clone())?;
         let cg_id = cg.id();
 
         let event = ShardEvent::CreatedConsumerGroup {

@@ -17,7 +17,8 @@
  */
 
 use crate::server::scenarios::{
-    delete_segments_scenario, message_size_scenario, tcp_tls_scenario, websocket_tls_scenario,
+    delete_segments_scenario, message_size_scenario, single_message_per_batch_scenario,
+    tcp_tls_scenario, websocket_tls_scenario,
 };
 use iggy::prelude::*;
 use integration::{
@@ -189,4 +190,25 @@ async fn message_size_scenario() {
     };
 
     message_size_scenario::run(&client_factory).await;
+}
+
+#[tokio::test]
+#[parallel]
+async fn should_handle_single_message_per_batch_with_delayed_persistence() {
+    let mut extra_envs = HashMap::new();
+    extra_envs.insert(
+        "IGGY_SYSTEM_PARTITION_MESSAGES_REQUIRED_TO_SAVE".to_string(),
+        "10000".to_string(),
+    );
+
+    let mut test_server = TestServer::new(Some(extra_envs), true, None, IpAddrKind::V4);
+    test_server.start();
+
+    let server_addr = test_server.get_raw_tcp_addr().unwrap();
+    let client_factory = TcpClientFactory {
+        server_addr,
+        ..Default::default()
+    };
+
+    single_message_per_batch_scenario::run(&client_factory, 5).await;
 }

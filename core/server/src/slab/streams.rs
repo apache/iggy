@@ -57,7 +57,7 @@ use crate::{
 };
 use ahash::AHashMap;
 use err_trail::ErrContext;
-use iggy_common::{Identifier, IggyError, IggyTimestamp, PollingKind};
+use iggy_common::{Identifier, IggyError, IggyMessagesBatch, IggyTimestamp, PollingKind};
 use slab::Slab;
 use std::{
     cell::RefCell,
@@ -737,23 +737,48 @@ impl Streams {
         count: u32,
         segment_start_offset: u64,
     ) -> Result<IggyMessagesBatchSet, IggyError> {
-        let (is_journal_empty, journal_first_offset, journal_last_offset) = self
-            .with_partition_by_id(
-                stream_id,
-                topic_id,
-                partition_id,
-                |(_, _, _, _, _, _, log)| {
-                    let journal = log.journal();
-                    (
-                        journal.is_empty(),
-                        journal.inner().base_offset,
-                        journal.inner().current_offset,
-                    )
-                },
-            );
+        let (
+            is_journal_empty,
+            journal_first_offset,
+            journal_last_offset,
+            in_flight_empty,
+            in_flight_first,
+            in_flight_last,
+        ) = self.with_partition_by_id(
+            stream_id,
+            topic_id,
+            partition_id,
+            |(_, _, _, _, _, _, log)| {
+                let journal = log.journal();
+                let in_flight = log.in_flight();
+                (
+                    journal.is_empty(),
+                    journal.inner().base_offset,
+                    journal.inner().current_offset,
+                    in_flight.is_empty(),
+                    in_flight.first_offset(),
+                    in_flight.last_offset(),
+                )
+            },
+        );
 
-        // Case 0: Accumulator is empty, so all messages have to be on disk
+        // Case 0: Journal is empty, check in-flight buffer or disk
         if is_journal_empty {
+            if !in_flight_empty && offset >= in_flight_first && offset <= in_flight_last {
+                let mut result = IggyMessagesBatchSet::empty();
+                let in_flight_batches = self.with_partition_by_id(
+                    stream_id,
+                    topic_id,
+                    partition_id,
+                    |(_, _, _, _, _, _, log)| log.in_flight().get_by_offset(offset, count).to_vec(),
+                );
+                if !in_flight_batches.is_empty() {
+                    result.add_immutable_batches(&in_flight_batches);
+                    let final_result = result.get_by_offset(offset, count);
+                    return Ok(final_result);
+                }
+            }
+
             return self
                 .load_messages_from_disk_by_offset(
                     stream_id,
@@ -1297,7 +1322,7 @@ impl Streams {
         stream_id: &Identifier,
         topic_id: &Identifier,
         partition_id: usize,
-        batches: IggyMessagesBatchSet,
+        mut batches: IggyMessagesBatchSet,
         config: &SystemConfig,
     ) -> Result<u32, IggyError> {
         let batch_count = batches.count();
@@ -1316,7 +1341,12 @@ impl Streams {
             return Ok(0);
         }
 
-        // Extract storage before async operations
+        // Store frozen batches in in-flight buffer for reads during async I/O
+        let frozen: Vec<IggyMessagesBatch> = batches.iter_mut().map(|b| b.freeze()).collect();
+        self.with_partition_by_id_mut(stream_id, topic_id, partition_id, |(.., log)| {
+            log.set_in_flight(frozen.clone());
+        });
+
         let (messages_writer, index_writer) =
             self.with_partition_by_id(stream_id, topic_id, partition_id, |(.., log)| {
                 (
@@ -1336,7 +1366,7 @@ impl Streams {
 
         let saved = messages_writer
             .as_ref()
-            .save_batch_set(batches)
+            .save_frozen_batches(&frozen)
             .await
             .error(|e: &IggyError| {
                 format!(
@@ -1375,6 +1405,106 @@ impl Streams {
             partition_id,
             streaming_partitions::helpers::update_index_and_increment_stats(saved, config),
         );
+
+        self.with_partition_by_id_mut(stream_id, topic_id, partition_id, |(.., log)| {
+            log.clear_in_flight();
+        });
+
+        drop(guard);
+        Ok(batch_count)
+    }
+
+    /// Persist frozen (immutable) batches to disk.
+    /// Assumes in-flight buffer is already set by caller.
+    /// Clears in-flight buffer after successful persist.
+    pub async fn persist_frozen_messages_to_disk(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        partition_id: usize,
+        frozen_batches: &[IggyMessagesBatch],
+        config: &SystemConfig,
+    ) -> Result<u32, IggyError> {
+        let (batch_count, batch_size): (u32, u32) = frozen_batches
+            .iter()
+            .fold((0u32, 0u32), |(count_acc, size_acc), b| {
+                (count_acc + b.count(), size_acc + b.size())
+            });
+
+        if batch_count == 0 {
+            return Ok(0);
+        }
+
+        let has_segments =
+            self.with_partition_by_id(stream_id, topic_id, partition_id, |(.., log)| {
+                log.has_segments()
+            });
+
+        if !has_segments {
+            return Ok(0);
+        }
+
+        let (messages_writer, index_writer) =
+            self.with_partition_by_id(stream_id, topic_id, partition_id, |(.., log)| {
+                (
+                    log.active_storage()
+                        .messages_writer
+                        .as_ref()
+                        .expect("Messages writer not initialized")
+                        .clone(),
+                    log.active_storage()
+                        .index_writer
+                        .as_ref()
+                        .expect("Index writer not initialized")
+                        .clone(),
+                )
+            });
+        let guard = messages_writer.lock.lock().await;
+
+        let saved = messages_writer
+            .as_ref()
+            .save_frozen_batches(frozen_batches)
+            .await
+            .error(|e: &IggyError| {
+                format!(
+                    "Failed to save batch of {batch_count} messages \
+                    ({batch_size} bytes) to stream ID: {stream_id}, topic ID: {topic_id}, partition ID: {partition_id}. {e}",
+                )
+            })?;
+
+        let unsaved_indexes_slice =
+            self.with_partition_by_id(stream_id, topic_id, partition_id, |(.., log)| {
+                log.active_indexes().unwrap().unsaved_slice()
+            });
+
+        let indexes_len = unsaved_indexes_slice.len();
+        index_writer
+            .as_ref()
+            .save_indexes(unsaved_indexes_slice)
+            .await
+            .error(|e: &IggyError| {
+                format!("Failed to save index of {indexes_len} indexes to stream ID: {stream_id}, topic ID: {topic_id} {partition_id}. {e}",)
+            })?;
+
+        tracing::trace!(
+            "Persisted {} frozen messages on disk for stream ID: {}, topic ID: {}, for partition with ID: {}, total bytes written: {}.",
+            batch_count,
+            stream_id,
+            topic_id,
+            partition_id,
+            saved
+        );
+
+        self.with_partition_by_id_mut(
+            stream_id,
+            topic_id,
+            partition_id,
+            streaming_partitions::helpers::update_index_and_increment_stats(saved, config),
+        );
+
+        self.with_partition_by_id_mut(stream_id, topic_id, partition_id, |(.., log)| {
+            log.clear_in_flight();
+        });
 
         drop(guard);
         Ok(batch_count)

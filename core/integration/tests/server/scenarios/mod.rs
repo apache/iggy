@@ -16,6 +16,7 @@
  * under the License.
  */
 
+pub mod authentication_scenario;
 pub mod bench_scenario;
 pub mod concurrent_scenario;
 pub mod consumer_group_auto_commit_reconnection_scenario;
@@ -29,6 +30,9 @@ pub mod delete_segments_scenario;
 pub mod encryption_scenario;
 pub mod message_headers_scenario;
 pub mod message_size_scenario;
+pub mod permissions_scenario;
+pub mod read_during_persistence_scenario;
+pub mod single_message_per_batch_scenario;
 pub mod stale_client_consumer_group_scenario;
 pub mod stream_size_validation_scenario;
 pub mod system_scenario;

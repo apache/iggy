@@ -66,6 +66,7 @@ runs:
       uses: ./.github/actions/utils/setup-rust-with-cache
       with:
         cache-targets: false # Only cache registry and git deps, not target dir (sccache handles that)
+        save-cache: "false"  # Only builds server, let Rust test job save comprehensive cache
 
     - name: Start Iggy server
       if: inputs.task == 'test'

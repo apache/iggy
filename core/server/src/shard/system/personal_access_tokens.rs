@@ -30,10 +30,8 @@ use tracing::{error, info};
 impl IggyShard {
     pub fn get_personal_access_tokens(
         &self,
-        session: &Session,
+        user_id: u32,
     ) -> Result<Vec<PersonalAccessToken>, IggyError> {
-        self.ensure_authenticated(session)?;
-        let user_id = session.get_user_id();
         let user = self.get_user(&user_id.try_into()?).error(|e: &IggyError| {
             format!("{COMPONENT} (error: {e}) - failed to get user with id: {user_id}")
         })?;
@@ -53,12 +51,10 @@ impl IggyShard {
 
     pub fn create_personal_access_token(
         &self,
-        session: &Session,
+        user_id: u32,
         name: &str,
         expiry: IggyExpiry,
     ) -> Result<(PersonalAccessToken, String), IggyError> {
-        self.ensure_authenticated(session)?;
-        let user_id = session.get_user_id();
         let identifier = user_id.try_into()?;
         {
             let user = self.get_user(&identifier).error(|e: &IggyError| {
@@ -102,7 +98,7 @@ impl IggyShard {
                 if user
                     .personal_access_tokens
                     .iter()
-                    .any(|pat| pat.name.as_str() == name.as_str())
+                    .any(|pat| pat.name == name)
                 {
                     error!(
                         "Personal access token: {name} for user with ID: {user_id} already exists."
@@ -126,13 +122,7 @@ impl IggyShard {
         Ok(())
     }
 
-    pub fn delete_personal_access_token(
-        &self,
-        session: &Session,
-        name: &str,
-    ) -> Result<(), IggyError> {
-        self.ensure_authenticated(session)?;
-        let user_id = session.get_user_id();
+    pub fn delete_personal_access_token(&self, user_id: u32, name: &str) -> Result<(), IggyError> {
         self.delete_personal_access_token_base(user_id, name)
     }
 
@@ -150,7 +140,7 @@ impl IggyShard {
                 let token = if let Some(pat) = user
                     .personal_access_tokens
                     .iter()
-                    .find(|pat| pat.name.as_str() == name)
+                    .find(|pat| &*pat.name == name)
                 {
                     pat.token.clone()
                 } else {
@@ -182,7 +172,7 @@ impl IggyShard {
         let users = self.users.values();
         let mut personal_access_token = None;
         for user in &users {
-            if let Some(pat) = user.personal_access_tokens.get(&token_hash) {
+            if let Some(pat) = user.personal_access_tokens.get(token_hash.as_str()) {
                 personal_access_token = Some(pat);
                 break;
             }
@@ -205,7 +195,7 @@ impl IggyShard {
                 personal_access_token.name, personal_access_token.user_id
             );
             return Err(IggyError::PersonalAccessTokenExpired(
-                personal_access_token.name.as_str().to_owned(),
+                (*personal_access_token.name).to_owned(),
                 personal_access_token.user_id,
             ));
         }

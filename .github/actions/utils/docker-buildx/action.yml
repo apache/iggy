@@ -46,6 +46,10 @@ inputs:
     description: "Single platform to build (e.g., linux/amd64). If set, builds only this platform without QEMU. Leave empty for multi-arch build."
     required: false
     default: ""
+  gha-cache:
+    description: "Whether to use GitHub Actions cache for Docker layers (disable to save cache space)"
+    required: false
+    default: "true"
 
 outputs:
   digest:
@@ -269,6 +273,12 @@ runs:
                 "type=gha,scope=buildkit-${scope_os}"
             )
           fi
+        fi
+
+        # Filter out GHA cache entries if gha-cache is disabled
+        if [ "${{ inputs.gha-cache }}" = "false" ]; then
+          CACHE_TO=$(echo "$CACHE_TO" | grep -v "type=gha" || true)
+          CACHE_FROM=$(echo "$CACHE_FROM" | grep -v "type=gha" || true)
         fi
 
         {
