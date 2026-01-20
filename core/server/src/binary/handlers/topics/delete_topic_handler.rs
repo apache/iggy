@@ -55,6 +55,11 @@ impl ServerCommandHandler for DeleteTopic {
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
         shard.ensure_authenticated(session)?;
+        let (stream_id, topic_id) = shard.resolve_topic_id(&self.stream_id, &self.topic_id)?;
+        shard
+            .permissioner
+            .borrow()
+            .delete_topic(session.get_user_id(), stream_id, topic_id)?;
 
         let request = ShardRequest {
             stream_id: Identifier::default(),
@@ -80,7 +85,7 @@ impl ServerCommandHandler for DeleteTopic {
                     // Acquire topic lock to serialize filesystem operations
                     let _topic_guard = shard.fs_locks.topic_lock.lock().await;
 
-                    let topic = shard.delete_topic(session, &stream_id, &topic_id).await?;
+                    let topic = shard.delete_topic(&stream_id, &topic_id).await?;
                     let stream_id_num = shard
                         .streams
                         .with_stream_by_id(&stream_id, streams::helpers::get_stream_id());

@@ -28,7 +28,7 @@ ci-qemu = []
 
 [dependencies]
 ahash = { workspace = true }
-assert_cmd = "2.1.1"
+assert_cmd = "2.1.2"
 async-trait = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
@@ -43,21 +43,23 @@ iggy_binary_protocol = { workspace = true }
 iggy_common = { workspace = true }
 keyring = { workspace = true }
 lazy_static = { workspace = true }
-libc = "0.2.178"
+libc = "0.2.180"
 log = { workspace = true }
 predicates = { workspace = true }
 rand = { workspace = true }
 rcgen = "0.14.6"
 reqwest = { workspace = true }
-rmcp = { version = "0.12.0", features = [
+rmcp = { version = "0.13.0", features = [
     "client",
     "reqwest",
     "transport-streamable-http-client",
     "transport-streamable-http-client-reqwest",
 ] }
+serde = { workspace = true }
 serde_json = { workspace = true }
 serial_test = { workspace = true }
 server = { workspace = true }
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "chrono"] }
 strum = { workspace = true }
 strum_macros = { workspace = true }
 tempfile = { workspace = true }

@@ -25,7 +25,6 @@ use crate::slab::traits_ext::{EntityComponentSystem, EntityMarker, IntoComponent
 use crate::state::command::EntryCommand;
 use crate::state::models::CreateConsumerGroupWithId;
 use crate::streaming::polling_consumer::ConsumerGroupId;
-use crate::streaming::session::Session;
 use axum::debug_handler;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -63,7 +62,16 @@ async fn get_consumer_group(
     let identifier_topic_id = Identifier::from_str_value(&topic_id)?;
     let identifier_group_id = Identifier::from_str_value(&group_id)?;
 
-    let session = Session::stateless(identity.user_id, identity.ip_address);
+    let (numeric_stream_id, numeric_topic_id) = state
+        .shard
+        .shard()
+        .resolve_topic_id(&identifier_stream_id, &identifier_topic_id)?;
+    state
+        .shard
+        .shard()
+        .permissioner
+        .borrow()
+        .get_consumer_group(identity.user_id, numeric_stream_id, numeric_topic_id)?;
 
     let exists = state
         .shard
@@ -77,23 +85,6 @@ async fn get_consumer_group(
     if !exists {
         return Err(CustomError::ResourceNotFound);
     }
-
-    let numeric_topic_id = state.shard.shard().streams.with_topic_by_id(
-        &identifier_stream_id,
-        &identifier_topic_id,
-        crate::streaming::topics::helpers::get_topic_id(),
-    );
-    let numeric_stream_id = state.shard.shard().streams.with_stream_by_id(
-        &identifier_stream_id,
-        crate::streaming::streams::helpers::get_stream_id(),
-    );
-
-    state
-        .shard
-        .shard()
-        .permissioner
-        .borrow()
-        .get_consumer_group(session.get_user_id(), numeric_stream_id, numeric_topic_id)?;
 
     let consumer_group = state.shard.shard().streams.with_consumer_group_by_id(
         &identifier_stream_id,
@@ -113,29 +104,16 @@ async fn get_consumer_groups(
     let identifier_stream_id = Identifier::from_str_value(&stream_id)?;
     let identifier_topic_id = Identifier::from_str_value(&topic_id)?;
 
-    let session = Session::stateless(identity.user_id, identity.ip_address);
-
-    state
+    let (numeric_stream_id, numeric_topic_id) = state
         .shard
         .shard()
-        .ensure_topic_exists(&identifier_stream_id, &identifier_topic_id)?;
-
-    let numeric_topic_id = state.shard.shard().streams.with_topic_by_id(
-        &identifier_stream_id,
-        &identifier_topic_id,
-        crate::streaming::topics::helpers::get_topic_id(),
-    );
-    let numeric_stream_id = state.shard.shard().streams.with_stream_by_id(
-        &identifier_stream_id,
-        crate::streaming::streams::helpers::get_stream_id(),
-    );
-
+        .resolve_topic_id(&identifier_stream_id, &identifier_topic_id)?;
     state
         .shard
         .shard()
         .permissioner
         .borrow()
-        .get_consumer_groups(session.get_user_id(), numeric_stream_id, numeric_topic_id)?;
+        .get_consumer_groups(identity.user_id, numeric_stream_id, numeric_topic_id)?;
 
     let consumer_groups = state.shard.shard().streams.with_consumer_groups(
         &identifier_stream_id,
@@ -163,11 +141,18 @@ async fn create_consumer_group(
     command.topic_id = Identifier::from_str_value(&topic_id)?;
     command.validate()?;
 
-    let session = Session::stateless(identity.user_id, identity.ip_address);
+    let (numeric_stream_id, numeric_topic_id) = state
+        .shard
+        .shard()
+        .resolve_topic_id(&command.stream_id, &command.topic_id)?;
+    state
+        .shard
+        .shard()
+        .permissioner
+        .borrow()
+        .create_consumer_group(identity.user_id, numeric_stream_id, numeric_topic_id)?;
 
-    // Create consumer group using the new API
     let consumer_group = state.shard.shard().create_consumer_group(
-        &session,
         &command.stream_id,
         &command.topic_id,
         command.name.clone(),
@@ -233,11 +218,25 @@ async fn delete_consumer_group(
     let identifier_group_id = Identifier::from_str_value(&group_id)?;
 
     let result = SendWrapper::new(async move {
-        let session = Session::stateless(identity.user_id, identity.ip_address);
+        let (stream_id_numeric, topic_id_numeric) = state
+            .shard
+            .shard()
+            .resolve_topic_id(&identifier_stream_id, &identifier_topic_id)?;
+        state
+            .shard
+            .shard()
+            .permissioner
+            .borrow()
+            .delete_consumer_group(identity.user_id, stream_id_numeric, topic_id_numeric)?;
 
-        // Delete using the new API
+        // Now check if consumer group exists
+        state.shard.shard().ensure_consumer_group_exists(
+            &identifier_stream_id,
+            &identifier_topic_id,
+            &identifier_group_id,
+        )?;
+
         let consumer_group = state.shard.shard().delete_consumer_group(
-            &session,
             &identifier_stream_id,
             &identifier_topic_id,
             &identifier_group_id
@@ -246,25 +245,14 @@ async fn delete_consumer_group(
 
         let cg_id = consumer_group.id();
 
-        // Remove all consumer group members from ClientManager
-        let stream_id_usize = state.shard.shard().streams.with_stream_by_id(
-            &identifier_stream_id,
-            crate::streaming::streams::helpers::get_stream_id(),
-        );
-        let topic_id_usize = state.shard.shard().streams.with_topic_by_id(
-            &identifier_stream_id,
-            &identifier_topic_id,
-            crate::streaming::topics::helpers::get_topic_id(),
-        );
-
         // TODO: Tech debt, repeated code from `delete_consumer_group_handler.rs`
         // Get members from the deleted consumer group and make them leave
         let slab = consumer_group.members().inner().shared_get();
         for (_, member) in slab.iter() {
             if let Err(err) = state.shard.shard().client_manager.leave_consumer_group(
                 member.client_id,
-                stream_id_usize,
-                topic_id_usize,
+                stream_id_numeric,
+                topic_id_numeric,
                 cg_id,
             ) {
                 tracing::warn!(

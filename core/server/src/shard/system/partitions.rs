@@ -16,7 +16,6 @@
  * under the License.
  */
 
-use super::COMPONENT;
 use crate::shard::IggyShard;
 use crate::shard::calculate_shard_assignment;
 use crate::slab::traits_ext::EntityMarker;
@@ -27,43 +26,16 @@ use crate::streaming::partitions::storage::create_partition_file_hierarchy;
 use crate::streaming::partitions::storage::delete_partitions_from_disk;
 use crate::streaming::segments::Segment;
 use crate::streaming::segments::storage::create_segment_storage;
-use crate::streaming::session::Session;
 use crate::streaming::streams;
 use crate::streaming::topics;
-use err_trail::ErrContext;
 use iggy_common::Identifier;
 use iggy_common::IggyError;
 use iggy_common::sharding::{IggyNamespace, LocalIdx, PartitionLocation, ShardId};
 use tracing::info;
 
 impl IggyShard {
-    fn validate_partition_permissions(
-        &self,
-        session: &Session,
-        stream_id: usize,
-        topic_id: usize,
-        operation: &str,
-    ) -> Result<(), IggyError> {
-        let permissioner = self.permissioner.borrow();
-        let result = match operation {
-            "create" => permissioner.create_partitions(session.get_user_id(), stream_id, topic_id),
-            "delete" => permissioner.delete_partitions(session.get_user_id(), stream_id, topic_id),
-            _ => return Err(IggyError::InvalidCommand),
-        };
-
-        result.error(|e: &IggyError| {
-            format!(
-                "{COMPONENT} (error: {e}) - permission denied to {operation} partitions for user {} on stream ID: {}, topic ID: {}",
-                session.get_user_id(),
-                stream_id,
-                topic_id
-            )
-        })
-    }
-
     pub async fn create_partitions(
         &self,
-        session: &Session,
         stream_id: &Identifier,
         topic_id: &Identifier,
         partitions_count: u32,
@@ -76,13 +48,6 @@ impl IggyShard {
             self.streams
                 .with_topic_by_id(stream_id, topic_id, topics::helpers::get_topic_id());
 
-        // Claude garbage, rework this.
-        self.validate_partition_permissions(
-            session,
-            numeric_stream_id,
-            numeric_topic_id,
-            "create",
-        )?;
         let parent_stats =
             self.streams
                 .with_topic_by_id(stream_id, topic_id, topics::helpers::get_stats());
@@ -222,7 +187,6 @@ impl IggyShard {
 
     pub async fn delete_partitions(
         &self,
-        session: &Session,
         stream_id: &Identifier,
         topic_id: &Identifier,
         partitions_count: u32,
@@ -235,13 +199,6 @@ impl IggyShard {
         let numeric_topic_id =
             self.streams
                 .with_topic_by_id(stream_id, topic_id, topics::helpers::get_topic_id());
-
-        self.validate_partition_permissions(
-            session,
-            numeric_stream_id,
-            numeric_topic_id,
-            "delete",
-        )?;
 
         let partitions = self.delete_partitions_base(stream_id, topic_id, partitions_count);
         let parent = partitions

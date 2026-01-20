@@ -53,6 +53,11 @@ impl ServerCommandHandler for UpdateTopic {
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
         shard.ensure_authenticated(session)?;
+        let (stream_id, topic_id) = shard.resolve_topic_id(&self.stream_id, &self.topic_id)?;
+        shard
+            .permissioner
+            .borrow()
+            .update_topic(session.get_user_id(), stream_id, topic_id)?;
 
         let request = ShardRequest {
             stream_id: Identifier::default(),
@@ -86,7 +91,6 @@ impl ServerCommandHandler for UpdateTopic {
                     } = payload
                 {
                     shard.update_topic(
-                        session,
                         &stream_id,
                         &topic_id,
                         name.clone(),

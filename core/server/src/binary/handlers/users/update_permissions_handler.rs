@@ -50,12 +50,25 @@ impl ServerCommandHandler for UpdatePermissions {
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
         shard.ensure_authenticated(session)?;
+        shard
+            .permissioner
+            .borrow()
+            .update_permissions(session.get_user_id())?;
+
+        // Check if target user is root - cannot change root user permissions
+        let target_user = shard.get_user(&self.user_id)?;
+        if target_user.is_root() {
+            return Err(IggyError::CannotChangePermissions(target_user.id));
+        }
 
         shard
-                .update_permissions(session, &self.user_id, self.permissions.clone())
-                .error(|e: &IggyError| format!("{COMPONENT} (error: {e}) - failed to update permissions for user_id: {}, session: {session}",
+            .update_permissions(&self.user_id, self.permissions.clone())
+            .error(|e: &IggyError| {
+                format!(
+                    "{COMPONENT} (error: {e}) - failed to update permissions for user_id: {}, session: {session}",
                     self.user_id
-                ))?;
+                )
+            })?;
         info!("Updated permissions for user with ID: {}.", self.user_id);
         let event = ShardEvent::UpdatedPermissions {
             user_id: self.user_id.clone(),
