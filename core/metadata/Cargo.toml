@@ -29,7 +29,6 @@ readme = "../../../README.md"
 
 [dependencies]
 ahash = { workspace = true }
-bytes = { workspace = true }
 consensus = { path = "../consensus" }
 iggy_common = { path = "../common" }
 journal = { path = "../journal" }
