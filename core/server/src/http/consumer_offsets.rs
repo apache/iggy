@@ -20,7 +20,6 @@ use crate::http::COMPONENT;
 use crate::http::error::CustomError;
 use crate::http::jwt::json_web_token::Identity;
 use crate::http::shared::AppState;
-use crate::streaming::session::Session;
 use axum::debug_handler;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -35,7 +34,6 @@ use iggy_common::Validatable;
 use iggy_common::delete_consumer_offset::DeleteConsumerOffset;
 use iggy_common::get_consumer_offset::GetConsumerOffset;
 use iggy_common::store_consumer_offset::StoreConsumerOffset;
-use send_wrapper::SendWrapper;
 use std::sync::Arc;
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -62,12 +60,23 @@ async fn get_consumer_offset(
     query.stream_id = Identifier::from_str_value(&stream_id)?;
     query.topic_id = Identifier::from_str_value(&topic_id)?;
     query.validate()?;
+
+    let (stream_id_numeric, topic_id_numeric) = state
+        .shard
+        .shard()
+        .resolve_topic_id(&query.stream_id, &query.topic_id)?;
+    state
+        .shard
+        .shard()
+        .permissioner
+        .borrow()
+        .get_consumer_offset(identity.user_id, stream_id_numeric, topic_id_numeric)?;
+
     let consumer = Consumer::new(query.0.consumer.id);
-    let session = SendWrapper::new(Session::stateless(identity.user_id, identity.ip_address));
     let Ok(offset) = state
         .shard
         .get_consumer_offset(
-            &session,
+            0, // HTTP uses client_id 0 as it doesn't have persistent sessions
             consumer,
             &query.0.stream_id,
             &query.0.topic_id,
@@ -95,11 +104,22 @@ async fn store_consumer_offset(
     command.stream_id = Identifier::from_str_value(&stream_id)?;
     command.topic_id = Identifier::from_str_value(&topic_id)?;
     command.validate()?;
-    let session = SendWrapper::new(Session::stateless(identity.user_id, identity.ip_address));
+
+    let (stream_id_numeric, topic_id_numeric) = state
+        .shard
+        .shard()
+        .resolve_topic_id(&command.stream_id, &command.topic_id)?;
+    state
+        .shard
+        .shard()
+        .permissioner
+        .borrow()
+        .store_consumer_offset(identity.user_id, stream_id_numeric, topic_id_numeric)?;
+
     let consumer = Consumer::new(command.0.consumer.id);
     state.shard
         .store_consumer_offset(
-            &session,
+            0, // HTTP uses client_id 0 as it doesn't have persistent sessions
             consumer,
             &command.0.stream_id,
             &command.0.topic_id,
@@ -118,12 +138,22 @@ async fn delete_consumer_offset(
     Path((stream_id, topic_id, consumer_id)): Path<(String, String, String)>,
     query: Query<DeleteConsumerOffset>,
 ) -> Result<StatusCode, CustomError> {
+    let (stream_id_numeric, topic_id_numeric) = state
+        .shard
+        .shard()
+        .resolve_topic_id(&query.stream_id, &query.topic_id)?;
+    state
+        .shard
+        .shard()
+        .permissioner
+        .borrow()
+        .delete_consumer_offset(identity.user_id, stream_id_numeric, topic_id_numeric)?;
+
     let consumer = Consumer::new(consumer_id.try_into()?);
-    let session = SendWrapper::new(Session::stateless(identity.user_id, identity.ip_address));
     state
         .shard
         .delete_consumer_offset(
-            &session,
+            0, // HTTP uses client_id 0 as it doesn't have persistent sessions
             consumer,
             &query.stream_id,
             &query.topic_id,

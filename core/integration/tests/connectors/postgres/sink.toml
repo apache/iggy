@@ -15,27 +15,6 @@
 # specific language governing permissions and limitations
 # under the License.
 
-type = "sink"
-key = "postgres"
-enabled = true
-version = 0
-name = "Postgres sink"
-path = "../../target/debug/libiggy_connector_postgres_sink"
-
-[[streams]]
-stream = "test_stream"
-topics = ["test_topic"]
-schema = "json"
-batch_length = 100
-poll_interval = "5ms"
-consumer_group = "test"
-
-[plugin_config]
-connection_string = ""
-target_table = "iggy_messages"
-batch_size = 100
-max_connections = 10
-auto_create_table = true
-include_metadata = true
-include_checksum = true
-include_origin_timestamp = true
+[connectors]
+config_type = "local"
+config_dir = "../connectors/sinks/postgres_sink"

@@ -50,17 +50,19 @@ impl ServerCommandHandler for CreatePartitions {
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
         shard.ensure_authenticated(session)?;
+        let (stream_id_numeric, topic_id_numeric) =
+            shard.resolve_topic_id(&self.stream_id, &self.topic_id)?;
+        shard.permissioner.borrow().create_partitions(
+            session.get_user_id(),
+            stream_id_numeric,
+            topic_id_numeric,
+        )?;
 
         // Acquire partition lock to serialize filesystem operations
         let _partition_guard = shard.fs_locks.partition_lock.lock().await;
 
         let partitions = shard
-            .create_partitions(
-                session,
-                &self.stream_id,
-                &self.topic_id,
-                self.partitions_count,
-            )
+            .create_partitions(&self.stream_id, &self.topic_id, self.partitions_count)
             .await?;
         let partition_ids = partitions.iter().map(|p| p.id()).collect::<Vec<_>>();
         let event = ShardEvent::CreatedPartitions {

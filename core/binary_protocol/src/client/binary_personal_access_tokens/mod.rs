@@ -1,4 +1,5 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
  * regarding copyright ownership.  The ASF licenses this file
@@ -24,8 +25,8 @@ use iggy_common::delete_personal_access_token::DeletePersonalAccessToken;
 use iggy_common::get_personal_access_tokens::GetPersonalAccessTokens;
 use iggy_common::login_with_personal_access_token::LoginWithPersonalAccessToken;
 use iggy_common::{
-    ClientState, IdentityInfo, IggyError, PersonalAccessTokenExpiry, PersonalAccessTokenInfo,
-    RawPersonalAccessToken,
+    ClientState, DiagnosticEvent, IdentityInfo, IggyError, PersonalAccessTokenExpiry,
+    PersonalAccessTokenInfo, RawPersonalAccessToken,
 };
 
 #[async_trait::async_trait]
@@ -70,6 +71,7 @@ impl<B: BinaryClient> PersonalAccessTokenClient for B {
             })
             .await?;
         self.set_state(ClientState::Authenticated).await;
+        self.publish_event(DiagnosticEvent::SignedIn).await;
         mapper::map_identity_info(response)
     }
 }

@@ -21,12 +21,10 @@ use std::rc::Rc;
 use crate::binary::command::{
     BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
 };
-use crate::binary::handlers::users::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
 use crate::shard::IggyShard;
 use crate::streaming::session::Session;
-use err_trail::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::SenderKind;
 use iggy_common::get_users::GetUsers;
@@ -46,9 +44,11 @@ impl ServerCommandHandler for GetUsers {
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
         shard.ensure_authenticated(session)?;
-        let users = shard.get_users(session).await.error(|e: &IggyError| {
-            format!("{COMPONENT} (error: {e}) - failed to get users, session: {session}")
-        })?;
+        shard
+            .permissioner
+            .borrow()
+            .get_users(session.get_user_id())?;
+        let users = shard.get_users();
         let users = mapper::map_users(users);
         sender.send_ok_response(&users).await?;
         Ok(HandlerResult::Finished)

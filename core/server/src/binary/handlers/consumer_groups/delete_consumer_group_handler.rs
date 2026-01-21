@@ -50,7 +50,16 @@ impl ServerCommandHandler for DeleteConsumerGroup {
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
         shard.ensure_authenticated(session)?;
-        let cg = shard.delete_consumer_group(session, &self.stream_id, &self.topic_id, &self.group_id).error(|e: &IggyError| {
+        let (stream_id_numeric, topic_id_numeric) =
+            shard.resolve_topic_id(&self.stream_id, &self.topic_id)?;
+        shard.permissioner.borrow().delete_consumer_group(
+            session.get_user_id(),
+            stream_id_numeric,
+            topic_id_numeric,
+        )?;
+        shard.ensure_consumer_group_exists(&self.stream_id, &self.topic_id, &self.group_id)?;
+
+        let cg = shard.delete_consumer_group(&self.stream_id, &self.topic_id, &self.group_id).error(|e: &IggyError| {
             format!(
                 "{COMPONENT} (error: {e}) - failed to delete consumer group with ID: {} for topic with ID: {} in stream with ID: {} for session: {}",
                 self.group_id, self.topic_id, self.stream_id, session
@@ -59,24 +68,13 @@ impl ServerCommandHandler for DeleteConsumerGroup {
         let cg_id = cg.id();
         let partition_ids = cg.partitions();
 
-        // Remove all consumer group members from ClientManager using helper functions to resolve identifiers
-        let stream_id_usize = shard.streams.with_stream_by_id(
-            &self.stream_id,
-            crate::streaming::streams::helpers::get_stream_id(),
-        );
-        let topic_id_usize = shard.streams.with_topic_by_id(
-            &self.stream_id,
-            &self.topic_id,
-            crate::streaming::topics::helpers::get_topic_id(),
-        );
-
         // Get members from the deleted consumer group and make them leave
         let slab = cg.members().inner().shared_get();
         for (_, member) in slab.iter() {
             if let Err(err) = shard.client_manager.leave_consumer_group(
                 member.client_id,
-                stream_id_usize,
-                topic_id_usize,
+                stream_id_numeric,
+                topic_id_numeric,
                 cg_id,
             ) {
                 tracing::warn!(

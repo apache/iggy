@@ -20,7 +20,6 @@ mod procdump;
 
 use crate::configs::system::SystemConfig;
 use crate::shard::IggyShard;
-use crate::streaming::session::Session;
 use async_zip::base::write::ZipFileWriter;
 use async_zip::{Compression, ZipEntryBuilder};
 use compio::fs::OpenOptions;
@@ -43,7 +42,6 @@ use std::process::Command;
 impl IggyShard {
     pub async fn get_snapshot(
         &self,
-        _session: &Session,
         compression: SnapshotCompression,
         snapshot_types: &Vec<SystemSnapshotType>,
     ) -> Result<Snapshot, IggyError> {

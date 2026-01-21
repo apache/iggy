@@ -16,14 +16,11 @@
  * under the License.
  */
 
-#![expect(
-    unused,
-    reason = "Methods are part of the state API and will be used once the implementation is complete"
-)]
 use crate::permissioner::Permissioner;
 use iggy_common::IggyError;
 
 impl Permissioner {
+    /// Inheritance: manage_streams → read_streams → read_topics → poll_messages
     pub fn poll_messages(
         &self,
         user_id: u32,
@@ -37,6 +34,15 @@ impl Permissioner {
             return Ok(());
         }
 
+        if let Some(global) = self.users_permissions.get(&user_id)
+            && (global.read_topics
+                || global.manage_topics
+                || global.read_streams
+                || global.manage_streams)
+        {
+            return Ok(());
+        }
+
         if self
             .users_that_can_poll_messages_from_specific_streams
             .contains(&(user_id, stream_id))
@@ -44,21 +50,16 @@ impl Permissioner {
             return Ok(());
         }
 
-        let stream_permissions = self.users_streams_permissions.get(&(user_id, stream_id));
-        if stream_permissions.is_none() {
+        let Some(stream_permissions) = self.users_streams_permissions.get(&(user_id, stream_id))
+        else {
             return Err(IggyError::Unauthorized);
-        }
+        };
 
-        let stream_permissions = stream_permissions.unwrap();
-        if stream_permissions.read_stream {
+        if stream_permissions.manage_stream || stream_permissions.read_stream {
             return Ok(());
         }
 
-        if stream_permissions.manage_topics {
-            return Ok(());
-        }
-
-        if stream_permissions.read_topics {
+        if stream_permissions.manage_topics || stream_permissions.read_topics {
             return Ok(());
         }
 
@@ -66,24 +67,19 @@ impl Permissioner {
             return Ok(());
         }
 
-        if stream_permissions.topics.is_none() {
-            return Err(IggyError::Unauthorized);
-        }
-
-        let topic_permissions = stream_permissions.topics.as_ref().unwrap();
-        if let Some(topic_permissions) = topic_permissions.get(&topic_id) {
-            return match topic_permissions.poll_messages
-                | topic_permissions.read_topic
-                | topic_permissions.manage_topic
-            {
-                true => Ok(()),
-                false => Err(IggyError::Unauthorized),
-            };
+        if let Some(topics) = &stream_permissions.topics
+            && let Some(topic_permissions) = topics.get(&topic_id)
+            && (topic_permissions.manage_topic
+                || topic_permissions.read_topic
+                || topic_permissions.poll_messages)
+        {
+            return Ok(());
         }
 
         Err(IggyError::Unauthorized)
     }
 
+    /// Inheritance: manage_streams → manage_topics → send_messages
     pub fn append_messages(
         &self,
         user_id: u32,
@@ -97,6 +93,12 @@ impl Permissioner {
             return Ok(());
         }
 
+        if let Some(global) = self.users_permissions.get(&user_id)
+            && (global.manage_streams || global.manage_topics)
+        {
+            return Ok(());
+        }
+
         if self
             .users_that_can_send_messages_to_specific_streams
             .contains(&(user_id, stream_id))
@@ -104,17 +106,12 @@ impl Permissioner {
             return Ok(());
         }
 
-        let stream_permissions = self.users_streams_permissions.get(&(user_id, stream_id));
-        if stream_permissions.is_none() {
+        let Some(stream_permissions) = self.users_streams_permissions.get(&(user_id, stream_id))
+        else {
             return Err(IggyError::Unauthorized);
-        }
+        };
 
-        let stream_permissions = stream_permissions.unwrap();
-        if stream_permissions.manage_stream {
-            return Ok(());
-        }
-
-        if stream_permissions.manage_topics {
+        if stream_permissions.manage_stream || stream_permissions.manage_topics {
             return Ok(());
         }
 
@@ -122,16 +119,11 @@ impl Permissioner {
             return Ok(());
         }
 
-        if stream_permissions.topics.is_none() {
-            return Err(IggyError::Unauthorized);
-        }
-
-        let topic_permissions = stream_permissions.topics.as_ref().unwrap();
-        if let Some(topic_permissions) = topic_permissions.get(&topic_id) {
-            return match topic_permissions.send_messages | topic_permissions.manage_topic {
-                true => Ok(()),
-                false => Err(IggyError::Unauthorized),
-            };
+        if let Some(topics) = &stream_permissions.topics
+            && let Some(topic_permissions) = topics.get(&topic_id)
+            && (topic_permissions.manage_topic || topic_permissions.send_messages)
+        {
+            return Ok(());
         }
 
         Err(IggyError::Unauthorized)

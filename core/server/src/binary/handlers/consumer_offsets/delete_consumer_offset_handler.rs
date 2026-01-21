@@ -44,9 +44,15 @@ impl ServerCommandHandler for DeleteConsumerOffset {
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
         shard.ensure_authenticated(session)?;
+        let (stream_id, topic_id) = shard.resolve_topic_id(&self.stream_id, &self.topic_id)?;
+        shard.permissioner.borrow().delete_consumer_offset(
+            session.get_user_id(),
+            stream_id,
+            topic_id,
+        )?;
         shard
             .delete_consumer_offset(
-                session,
+                session.client_id,
                 self.consumer,
                 &self.stream_id,
                 &self.topic_id,
