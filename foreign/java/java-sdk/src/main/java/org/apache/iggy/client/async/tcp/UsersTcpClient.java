@@ -60,7 +60,7 @@ public class UsersTcpClient implements UsersClient {
 
         log.debug("Logging in user: {}", username);
 
-        return connection.sendAsync(CommandCode.User.LOGIN.getValue(), payload).thenApply(response -> {
+        return connection.broadcastAsync(CommandCode.User.LOGIN.getValue(), payload).thenApply(response -> {
             try {
                 // Read the user ID from response (4-byte unsigned int LE)
                 var userId = response.readUnsignedIntLE();
@@ -77,7 +77,7 @@ public class UsersTcpClient implements UsersClient {
 
         log.debug("Logging out");
 
-        return connection.sendAsync(CommandCode.User.LOGOUT.getValue(), payload).thenAccept(response -> {
+        return connection.broadcastAsync(CommandCode.User.LOGOUT.getValue(), payload).thenAccept(response -> {
             response.release();
             log.debug("Logged out successfully");
         });
