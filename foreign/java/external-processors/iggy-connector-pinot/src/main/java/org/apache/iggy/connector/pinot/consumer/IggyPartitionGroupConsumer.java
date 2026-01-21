@@ -90,7 +90,8 @@ public class IggyPartitionGroupConsumer implements PartitionGroupConsumer {
      * @param timeoutMillis timeout for the fetch operation
      * @return batch of messages, or empty batch if no messages available
      */
-    public MessageBatch fetchMessages(StreamPartitionMsgOffset startOffset, long timeoutMillis) {
+    @Override
+    public MessageBatch fetchMessages(StreamPartitionMsgOffset startOffset, int timeoutMillis) {
         try {
             ensureConnected();
 

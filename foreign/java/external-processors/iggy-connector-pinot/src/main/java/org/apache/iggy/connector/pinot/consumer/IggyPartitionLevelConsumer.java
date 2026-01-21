@@ -39,7 +39,7 @@ public class IggyPartitionLevelConsumer implements PartitionLevelConsumer {
 
     @Override
     public MessageBatch fetchMessages(StreamPartitionMsgOffset startOffset, int timeoutMs) throws TimeoutException {
-        return delegate.fetchMessages(startOffset, (long) timeoutMs);
+        return delegate.fetchMessages(startOffset, timeoutMs);
     }
 
     @Override

@@ -32,10 +32,7 @@ import org.apache.pinot.spi.stream.StreamPartitionMsgOffset;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.util.HashMap;
-import java.util.Map;
 import java.util.Optional;
-import java.util.Set;
 
 /**
  * Metadata provider for Iggy streams.
@@ -55,7 +52,6 @@ public class IggyStreamMetadataProvider implements StreamMetadataProvider {
 
     private static final long DETAILS_CACHE_MS = 5000; // 5 seconds cache
 
-    private final String clientId;
     private final IggyStreamConfig config;
     private final Integer partitionId; // null for stream-level, non-null for partition-level
 
@@ -83,7 +79,6 @@ public class IggyStreamMetadataProvider implements StreamMetadataProvider {
      * @param partitionId specific partition ID
      */
     public IggyStreamMetadataProvider(String clientId, IggyStreamConfig config, Integer partitionId) {
-        this.clientId = clientId;
         this.config = config;
         this.partitionId = partitionId;
 
@@ -229,52 +224,6 @@ public class IggyStreamMetadataProvider implements StreamMetadataProvider {
         } catch (NumberFormatException e) {
             return TopicId.of(topicIdStr);
         }
-    }
-
-    /**
-     * Fetches the latest offsets available for the specified partitions.
-     * Used by Pinot for ingestion delay tracking.
-     *
-     * <p>This method is called by Pinot's IngestionDelayTracker to monitor lag between
-     * consumed and available offsets. See:
-     * <a href="https://github.com/apache/pinot/blob/master/pinot-core/src/main/java/org/apache/pinot/core/data/manager/realtime/IngestionDelayTracker.java#L287">IngestionDelayTracker.java lines 287-289</a>
-     *
-     * @param partitions set of partition IDs to fetch offsets for
-     * @param timeoutMillis timeout for the operation (Pinot uses 5000ms)
-     * @return map of partition IDs to their latest offsets
-     */
-    public Map<Integer, StreamPartitionMsgOffset> fetchLatestStreamOffset(Set<Integer> partitions, long timeoutMillis) {
-        Map<Integer, StreamPartitionMsgOffset> offsets = new HashMap<>();
-
-        try {
-            ensureConnected();
-
-            for (Integer partition : partitions) {
-                Partition partitionInfo = getPartitionInfo(partition);
-                long latestOffset = partitionInfo.messagesCount().longValue();
-                log.debug("Latest offset for partition {}: {}", partition, latestOffset);
-                offsets.put(partition, new IggyStreamPartitionMsgOffset(latestOffset));
-            }
-
-            return offsets;
-        } catch (RuntimeException e) {
-            log.error("Error fetching latest offsets: {}", e.getMessage(), e);
-            throw new RuntimeException("Failed to fetch latest offsets", e);
-        }
-    }
-
-    /**
-     * Indicates whether this stream supports offset lag tracking.
-     * Iggy supports offset lag since we can track current vs latest offset.
-     *
-     * <p>This method is called by Pinot's IngestionDelayTracker to determine if offset lag
-     * metrics should be tracked for this stream. See:
-     * <a href="https://github.com/apache/pinot/blob/master/pinot-core/src/main/java/org/apache/pinot/core/data/manager/realtime/IngestionDelayTracker.java#L275">IngestionDelayTracker.java line 275</a>
-     *
-     * @return true if offset lag is supported
-     */
-    public boolean supportsOffsetLag() {
-        return true;
     }
 
     @Override

@@ -20,7 +20,7 @@
 flink = "2.1.1"
 
 # Pinot
-pinot = "1.2.0"
+pinot = "1.4.0"
 
 # Jackson
 jackson = "3.0.2"
