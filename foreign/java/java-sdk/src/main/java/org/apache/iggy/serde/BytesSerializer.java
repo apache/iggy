@@ -81,9 +81,10 @@ public final class BytesSerializer {
     }
 
     public static ByteBuf toBytes(Message message) {
-        var buffer = Unpooled.buffer(MessageHeader.SIZE + message.payload().length);
+        var buffer = Unpooled.buffer(message.getSize());
         buffer.writeBytes(toBytes(message.header()));
         buffer.writeBytes(message.payload());
+        buffer.writeBytes(toBytes(message.userHeaders()));
         return buffer;
     }
 

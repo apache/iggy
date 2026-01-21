@@ -22,17 +22,16 @@ use crate::binary::command::{
 use crate::binary::handlers::partitions::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::shard::IggyShard;
-use crate::shard::namespace::IggyNamespace;
 use crate::shard::transmission::frame::ShardResponse;
 use crate::shard::transmission::message::{
     ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult,
 };
 use crate::state::command::EntryCommand;
-use crate::streaming;
 use crate::streaming::session::Session;
 use anyhow::Result;
 use err_trail::ErrContext;
 use iggy_common::delete_segments::DeleteSegments;
+use iggy_common::sharding::IggyNamespace;
 use iggy_common::{IggyError, SenderKind};
 use std::rc::Rc;
 use tracing::{debug, instrument};
@@ -57,21 +56,14 @@ impl ServerCommandHandler for DeleteSegments {
         let partition_id = self.partition_id as usize;
         let segments_count = self.segments_count;
 
-        // Ensure authentication and topic exists
         shard.ensure_authenticated(session)?;
-        shard.ensure_topic_exists(&stream_id, &topic_id)?;
-        shard.ensure_partition_exists(&stream_id, &topic_id, partition_id)?;
-
-        // Get numeric IDs for namespace
-        let numeric_stream_id = shard
-            .streams
-            .with_stream_by_id(&stream_id, streaming::streams::helpers::get_stream_id());
-
-        let numeric_topic_id = shard.streams.with_topic_by_id(
-            &stream_id,
-            &topic_id,
-            streaming::topics::helpers::get_topic_id(),
-        );
+        let (numeric_stream_id, numeric_topic_id, _) =
+            shard.resolve_partition_id(&stream_id, &topic_id, partition_id)?;
+        shard.permissioner.borrow().delete_segments(
+            session.get_user_id(),
+            numeric_stream_id,
+            numeric_topic_id,
+        )?;
 
         // Route request to the correct shard
         let namespace = IggyNamespace::new(numeric_stream_id, numeric_topic_id, partition_id);

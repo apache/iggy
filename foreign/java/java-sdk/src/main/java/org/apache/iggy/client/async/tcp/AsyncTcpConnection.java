@@ -135,57 +135,65 @@ public class AsyncTcpConnection {
 
     /**
      * Sends a command asynchronously and returns the response.
+     * Uses Netty's EventLoop to ensure thread-safe sequential request processing with FIFO response matching.
      */
     public CompletableFuture<ByteBuf> sendAsync(int commandCode, ByteBuf payload) {
         if (channel == null || !channel.isActive()) {
+            payload.release();
             return CompletableFuture.failedFuture(new IllegalStateException("Connection not established or closed"));
         }
 
-        // Since Iggy doesn't use request IDs, we'll just use a simple queue
-        // Each request will get the next response in order
         CompletableFuture<ByteBuf> responseFuture = new CompletableFuture<>();
-        long requestId = requestIdGenerator.incrementAndGet();
-        pendingRequests.put(requestId, responseFuture);
 
-        // Build the request frame exactly like the blocking client
-        // Frame format: [payload_size:4][command:4][payload:N]
-        // where payload_size = 4 (command size) + N (payload size)
-        int payloadSize = payload.readableBytes();
-        int framePayloadSize = 4 + payloadSize; // command (4 bytes) + payload
+        // Execute on channel's EventLoop to ensure sequential processing
+        // This is necessary because Iggy protocol doesn't include request IDs,
+        // and responses are matched using FIFO order
+        channel.eventLoop().execute(() -> {
+            // Since Iggy doesn't use request IDs, we'll just use a simple queue
+            // Each request will get the next response in order
+            long requestId = requestIdGenerator.incrementAndGet();
+            pendingRequests.put(requestId, responseFuture);
 
-        ByteBuf frame = channel.alloc().buffer(4 + framePayloadSize);
-        frame.writeIntLE(framePayloadSize); // Length field (includes command)
-        frame.writeIntLE(commandCode); // Command
-        frame.writeBytes(payload, payload.readerIndex(), payloadSize); // Payload
+            // Build the request frame exactly like the blocking client
+            // Frame format: [payload_size:4][command:4][payload:N]
+            // where payload_size = 4 (command size) + N (payload size)
+            int payloadSize = payload.readableBytes();
+            int framePayloadSize = 4 + payloadSize; // command (4 bytes) + payload
 
-        // Debug: print frame bytes
-        byte[] frameBytes = new byte[Math.min(frame.readableBytes(), 30)];
-        if (log.isTraceEnabled()) {
-            frame.getBytes(0, frameBytes);
-            StringBuilder hex = new StringBuilder();
-            for (byte b : frameBytes) {
-                hex.append(String.format("%02x ", b));
+            ByteBuf frame = channel.alloc().buffer(4 + framePayloadSize);
+            frame.writeIntLE(framePayloadSize); // Length field (includes command)
+            frame.writeIntLE(commandCode); // Command
+            frame.writeBytes(payload, payload.readerIndex(), payloadSize); // Payload
+
+            // Debug: print frame bytes
+            if (log.isTraceEnabled()) {
+                byte[] frameBytes = new byte[Math.min(frame.readableBytes(), 30)];
+                frame.getBytes(0, frameBytes);
+                StringBuilder hex = new StringBuilder();
+                for (byte b : frameBytes) {
+                    hex.append(String.format("%02x ", b));
+                }
+                log.trace(
+                        "Sending frame with command: {}, payload size: {}, frame payload size (with command): {}, total frame size: {}",
+                        commandCode,
+                        payloadSize,
+                        framePayloadSize,
+                        frame.readableBytes());
+                log.trace("Frame bytes (hex): {}", hex.toString());
             }
-            log.trace(
-                    "Sending frame with command: {}, payload size: {}, frame payload size (with command): {}, total frame size: {}",
-                    commandCode,
-                    payloadSize,
-                    framePayloadSize,
-                    frame.readableBytes());
-            log.trace("Frame bytes (hex): {}", hex.toString());
-        }
 
-        payload.release();
+            payload.release();
 
-        // Send the frame
-        channel.writeAndFlush(frame).addListener((ChannelFutureListener) future -> {
-            if (!future.isSuccess()) {
-                log.error("Failed to send frame: {}", future.cause().getMessage());
-                pendingRequests.remove(requestId);
-                responseFuture.completeExceptionally(future.cause());
-            } else {
-                log.trace("Frame sent successfully to {}", channel.remoteAddress());
-            }
+            // Send the frame
+            channel.writeAndFlush(frame).addListener((ChannelFutureListener) future -> {
+                if (!future.isSuccess()) {
+                    log.error("Failed to send frame: {}", future.cause().getMessage());
+                    pendingRequests.remove(requestId);
+                    responseFuture.completeExceptionally(future.cause());
+                } else {
+                    log.trace("Frame sent successfully to {}", channel.remoteAddress());
+                }
+            });
         });
 
         return responseFuture;

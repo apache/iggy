@@ -23,7 +23,6 @@ use crate::{
     streaming::{
         partitions,
         polling_consumer::{ConsumerGroupId, PollingConsumer},
-        session::Session,
         streams, topics,
     },
 };
@@ -33,38 +32,19 @@ use iggy_common::{Consumer, ConsumerOffsetInfo, Identifier, IggyError};
 impl IggyShard {
     pub async fn store_consumer_offset(
         &self,
-        session: &Session,
+        client_id: u32,
         consumer: Consumer,
         stream_id: &Identifier,
         topic_id: &Identifier,
         partition_id: Option<u32>,
         offset: u64,
     ) -> Result<(PollingConsumer, usize), IggyError> {
-        self.ensure_authenticated(session)?;
         self.ensure_topic_exists(stream_id, topic_id)?;
-        {
-            let topic_id =
-                self.streams
-                    .with_topic_by_id(stream_id, topic_id, topics::helpers::get_topic_id());
-            let stream_id = self
-                .streams
-                .with_stream_by_id(stream_id, streams::helpers::get_stream_id());
-            self.permissioner.borrow().store_consumer_offset(
-                session.get_user_id(),
-                stream_id,
-                topic_id
-            ).error(|e: &IggyError| {
-                format!(
-                    "{COMPONENT} (error: {e}) - permission denied to store consumer offset for user with ID: {}, consumer: {consumer} in topic with ID: {topic_id} and stream with ID: {stream_id}",
-                    session.get_user_id(),
-                )
-            })?;
-        }
         let Some((polling_consumer, partition_id)) = self.resolve_consumer_with_partition_id(
             stream_id,
             topic_id,
             &consumer,
-            session.client_id,
+            client_id,
             partition_id,
             false,
         )?
@@ -87,37 +67,18 @@ impl IggyShard {
 
     pub async fn get_consumer_offset(
         &self,
-        session: &Session,
+        client_id: u32,
         consumer: Consumer,
         stream_id: &Identifier,
         topic_id: &Identifier,
         partition_id: Option<u32>,
     ) -> Result<Option<ConsumerOffsetInfo>, IggyError> {
-        self.ensure_authenticated(session)?;
         self.ensure_topic_exists(stream_id, topic_id)?;
-        {
-            let topic_id =
-                self.streams
-                    .with_topic_by_id(stream_id, topic_id, topics::helpers::get_topic_id());
-            let stream_id = self
-                .streams
-                .with_stream_by_id(stream_id, streams::helpers::get_stream_id());
-            self.permissioner.borrow().get_consumer_offset(
-                session.get_user_id(),
-                stream_id,
-                topic_id
-            ).error(|e: &IggyError| {
-                format!(
-                    "{COMPONENT} (error: {e}) - permission denied to get consumer offset for user with ID: {}, consumer: {consumer} in topic with ID: {topic_id} and stream with ID: {stream_id}",
-                    session.get_user_id()
-                )
-            })?;
-        }
         let Some((polling_consumer, partition_id)) = self.resolve_consumer_with_partition_id(
             stream_id,
             topic_id,
             &consumer,
-            session.client_id,
+            client_id,
             partition_id,
             false,
         )?
@@ -147,37 +108,18 @@ impl IggyShard {
 
     pub async fn delete_consumer_offset(
         &self,
-        session: &Session,
+        client_id: u32,
         consumer: Consumer,
         stream_id: &Identifier,
         topic_id: &Identifier,
         partition_id: Option<u32>,
     ) -> Result<(PollingConsumer, usize), IggyError> {
-        self.ensure_authenticated(session)?;
         self.ensure_topic_exists(stream_id, topic_id)?;
-        {
-            let topic_id =
-                self.streams
-                    .with_topic_by_id(stream_id, topic_id, topics::helpers::get_topic_id());
-            let stream_id = self
-                .streams
-                .with_stream_by_id(stream_id, streams::helpers::get_stream_id());
-            self.permissioner.borrow().delete_consumer_offset(
-                session.get_user_id(),
-                stream_id,
-                topic_id
-            ).error(|e: &IggyError| {
-            format!(
-                "{COMPONENT} (error: {e}) - permission denied to delete consumer offset for user with ID: {}, consumer: {consumer} in topic with ID: {topic_id} and stream with ID: {stream_id}",
-                session.get_user_id(),
-            )
-        })?;
-        }
         let Some((polling_consumer, partition_id)) = self.resolve_consumer_with_partition_id(
             stream_id,
             topic_id,
             &consumer,
-            session.client_id,
+            client_id,
             partition_id,
             false,
         )?
@@ -200,7 +142,15 @@ impl IggyShard {
         partition_ids: &[usize],
     ) -> Result<(), IggyError> {
         for &partition_id in partition_ids {
-            // Skip if offset does not exist.
+            // Skip if partition was deleted
+            let partition_exists = self
+                .streams
+                .with_partitions(stream_id, topic_id, |p| p.exists(partition_id));
+            if !partition_exists {
+                continue;
+            }
+
+            // Skip if offset does not exist
             let has_offset = self
                 .streams
                 .with_partition_by_id(

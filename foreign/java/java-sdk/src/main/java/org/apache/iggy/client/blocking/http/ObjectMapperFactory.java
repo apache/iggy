@@ -19,11 +19,15 @@
 
 package org.apache.iggy.client.blocking.http;
 
+import com.fasterxml.jackson.annotation.JsonSetter;
+import com.fasterxml.jackson.annotation.Nulls;
 import tools.jackson.databind.DeserializationFeature;
 import tools.jackson.databind.MapperFeature;
 import tools.jackson.databind.ObjectMapper;
 import tools.jackson.databind.PropertyNamingStrategies;
 import tools.jackson.databind.json.JsonMapper;
+
+import java.util.Map;
 
 final class ObjectMapperFactory {
 
@@ -31,6 +35,7 @@ final class ObjectMapperFactory {
             .enable(MapperFeature.ACCEPT_CASE_INSENSITIVE_ENUMS)
             .enable(DeserializationFeature.FAIL_ON_NULL_CREATOR_PROPERTIES)
             .propertyNamingStrategy(PropertyNamingStrategies.SNAKE_CASE)
+            .withConfigOverride(Map.class, map -> map.setNullHandling(JsonSetter.Value.forValueNulls(Nulls.AS_EMPTY)))
             .build();
 
     private ObjectMapperFactory() {}

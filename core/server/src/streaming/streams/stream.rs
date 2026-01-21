@@ -90,6 +90,10 @@ impl StreamRoot {
         &mut self.topics
     }
 
+    pub fn set_topics(&mut self, topics: Topics) {
+        self.topics = topics;
+    }
+
     pub fn created_at(&self) -> IggyTimestamp {
         self.created_at
     }

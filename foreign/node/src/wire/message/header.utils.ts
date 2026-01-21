@@ -55,6 +55,9 @@ import {
 } from './header.type.js';
 
 
+/**
+ * Union type of all possible header value types.
+ */
 export type HeaderValue =
   HeaderValueRaw |
   HeaderValueString |
@@ -72,14 +75,28 @@ export type HeaderValue =
   HeaderValueFloat |
   HeaderValueDouble;
 
+/**
+ * Map of header names to header values.
+ */
 export type Headers = Record<string, HeaderValue>;
 
 
+/**
+ * Internal representation of a header value in binary format.
+ */
 type BinaryHeaderValue = {
+  /** Header kind identifier */
   kind: number,// HeaderKind,
+  /** Serialized value as Buffer */
   value: Buffer
 }
 
+/**
+ * Serializes a header value to a Buffer based on its kind.
+ *
+ * @param header - Header value to serialize
+ * @returns Serialized value as Buffer
+ */
 export const serializeHeaderValue = (header: HeaderValue) => {
   const { kind, value } = header;
   switch (kind) {
@@ -102,6 +119,14 @@ export const serializeHeaderValue = (header: HeaderValue) => {
 };
 
 
+/**
+ * Serializes a single header key-value pair to wire format.
+ * Format: [key_length][key][kind][value_length][value]
+ *
+ * @param key - Header key name
+ * @param v - Binary header value
+ * @returns Serialized header as Buffer
+ */
 export const serializeHeader = (key: string, v: BinaryHeaderValue) => {
   const bKey = Buffer.from(key)
   const b1 = uint32ToBuf(bKey.length);
@@ -127,13 +152,26 @@ export const serializeHeader = (key: string, v: BinaryHeaderValue) => {
   ]);
 };
 
+/** Empty headers buffer constant */
 export const EMPTY_HEADERS = Buffer.alloc(0);
 
+/**
+ * Creates a binary header value from a typed header value.
+ *
+ * @param header - Typed header value
+ * @returns Binary header value
+ */
 const createHeaderValue = (header: HeaderValue): BinaryHeaderValue => ({
   kind: header.kind,
   value: serializeHeaderValue(header)
 });
 
+/**
+ * Serializes all headers to a single buffer.
+ *
+ * @param headers - Optional headers map
+ * @returns Serialized headers buffer (empty if no headers)
+ */
 export const serializeHeaders = (headers?: Headers) => {
   if (!headers)
     return EMPTY_HEADERS;
@@ -145,28 +183,56 @@ export const serializeHeaders = (headers?: Headers) => {
 
 // deserialize ...
 
+/** Possible JavaScript types for deserialized header values */
 export type ParsedHeaderValue = boolean | string | number | bigint | Buffer;
 
+/**
+ * Deserialized header with kind and value.
+ */
 export type ParsedHeader = {
+  /** Header kind identifier */
   kind: ParsedHeaderValue,
+  /** Deserialized value */
   value: ParsedHeaderValue
 }
 
+/** Header with its key included */
 type HeaderWithKey = ParsedHeader & { key: string };
 
+/** Map of header keys to parsed headers */
 export type HeadersMap = Record<string, ParsedHeader>;
 
+/**
+ * Result of deserializing a single header.
+ */
 type ParsedHeaderDeserialized = {
+  /** Number of bytes consumed */
   bytesRead: number,
+  /** Deserialized header data with key */
   data: HeaderWithKey
 }
 
+/**
+ * Maps a numeric header kind to its string identifier.
+ *
+ * @param k - Numeric header kind value
+ * @returns Header kind identifier string
+ * @throws Error if the header kind is unknown
+ */
 export const mapHeaderKind = (k: number): HeaderKindId => {
   if (!ReverseHeaderKind[k as HeaderKindValue])
     throw new Error(`unknow header kind: ${k}`);
   return ReverseHeaderKind[k as HeaderKindValue];
 }
 
+/**
+ * Deserializes a header value buffer based on its kind.
+ *
+ * @param kind - Numeric header kind
+ * @param value - Raw value buffer
+ * @returns Deserialized value
+ * @throws Error if the header kind is invalid
+ */
 export const deserializeHeaderValue =
   (kind: number, value: Buffer): ParsedHeaderValue => {
     switch (kind) {
@@ -189,13 +255,20 @@ export const deserializeHeaderValue =
     }
   };
 
+/**
+ * Deserializes a single header from a buffer.
+ *
+ * @param p - Buffer containing serialized headers
+ * @param pos - Starting position in the buffer
+ * @returns Object with bytes read and deserialized header data
+ */
 export const deserializeHeader = (p: Buffer, pos = 0): ParsedHeaderDeserialized => {
   const keyLength = p.readUInt32LE(pos);
   const key = p.subarray(pos + 4, pos + 4 + keyLength).toString();
   pos += keyLength + 4;
   const rawKind = p.readUInt8(pos);
   // @TODO ?
-  // const kind = mapHeaderKind(rawKind); 
+  // const kind = mapHeaderKind(rawKind);
   const valueLength = p.readUInt32LE(pos + 1);
   const value = deserializeHeaderValue(rawKind, p.subarray(pos + 5, pos + 5 + valueLength));
 
@@ -209,6 +282,13 @@ export const deserializeHeader = (p: Buffer, pos = 0): ParsedHeaderDeserialized 
   };
 }
 
+/**
+ * Deserializes all headers from a buffer.
+ *
+ * @param p - Buffer containing serialized headers
+ * @param pos - Starting position in the buffer
+ * @returns Map of header keys to parsed headers
+ */
 export const deserializeHeaders = (p: Buffer, pos = 0) => {
   const headers: HeadersMap = {};
   const len = p.length;
@@ -220,85 +300,109 @@ export const deserializeHeaders = (p: Buffer, pos = 0) => {
   return headers;
 }
 
-/** HeaderValue Helper */
+/**
+ * HeaderValue factory functions and utilities.
+ * Provides type-safe constructors for each header value type.
+ */
+
+/** Creates a raw binary header value */
 const Raw = (value: Buffer): HeaderValueRaw => ({
   kind: HeaderKind.Raw,
   value
 });
 
+/** Creates a string header value */
 const String = (value: string): HeaderValueString => ({
   kind: HeaderKind.String,
   value
 });
 
+/** Creates a boolean header value */
 const Bool = (value: boolean): HeaderValueBool => ({
   kind: HeaderKind.Bool,
   value
 });
 
+/** Creates an Int8 header value */
 const Int8 = (value: number): HeaderValueInt8 => ({
   kind: HeaderKind.Int8,
   value
 });
 
+/** Creates an Int16 header value */
 const Int16 = (value: number): HeaderValueInt16 => ({
   kind: HeaderKind.Int16,
   value
 });
 
+/** Creates an Int32 header value */
 const Int32 = (value: number): HeaderValueInt32 => ({
   kind: HeaderKind.Int32,
   value
 });
 
+/** Creates an Int64 header value */
 const Int64 = (value: bigint): HeaderValueInt64 => ({
   kind: HeaderKind.Int64,
   value
 });
 
+/** Creates an Int128 header value */
 const Int128 = (value: Buffer): HeaderValueInt128 => ({
   kind: HeaderKind.Int128,
   value
 });
 
+/** Creates a Uint8 header value */
 const Uint8 = (value: number): HeaderValueUint8 => ({
   kind: HeaderKind.Uint8,
   value
 });
 
+/** Creates a Uint16 header value */
 const Uint16 = (value: number): HeaderValueUint16 => ({
   kind: HeaderKind.Uint16,
   value
 });
 
+/** Creates a Uint32 header value */
 const Uint32 = (value: number): HeaderValueUint32 => ({
   kind: HeaderKind.Uint32,
   value
 });
 
+/** Creates a Uint64 header value */
 const Uint64 = (value: bigint): HeaderValueUint64 => ({
   kind: HeaderKind.Uint64,
   value
 });
 
+/** Creates a Uint128 header value */
 const Uint128 = (value: Buffer): HeaderValueUint128 => ({
   kind: HeaderKind.Uint128,
   value
 });
 
+/** Creates a Float header value */
 const Float = (value: number): HeaderValueFloat => ({
   kind: HeaderKind.Float,
   value
 });
 
+/** Creates a Double header value */
 const Double = (value: number): HeaderValueDouble => ({
   kind: HeaderKind.Double,
   value
 });
 
+/** Gets the kind identifier string of a header value */
 const getKind = (h: HeaderValue) => mapHeaderKind(h.kind);
+/** Gets the value from a header value */
 const getValue = (h: HeaderValue) => h.value;
 
+/**
+ * HeaderValue factory object with constructors for all header types.
+ */
 export const HeaderValue = {
   Raw,
   String,

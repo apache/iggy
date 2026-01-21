@@ -20,8 +20,20 @@
 
 import { uuidv7, UUID } from "uuidv7";
 
+/**
+ * Parses a UUID string into a UUID object.
+ *
+ * @param uid - UUID string to parse
+ * @returns Parsed UUID object
+ */
 export const parse = (uid: string) => UUID.parse(uid);
 
 
-// https://github.com/LiosK/uuidv7
+/**
+ * Generates a new UUID v7 (time-ordered) string.
+ * UUID v7 is a time-ordered UUID that provides better database indexing performance.
+ *
+ * @returns UUID v7 string
+ * @see https://github.com/LiosK/uuidv7
+ */
 export const v7 = () => uuidv7();

@@ -24,14 +24,13 @@ use crate::http::mapper::map_generated_access_token_to_identity_info;
 use crate::http::shared::AppState;
 use crate::state::command::EntryCommand;
 use crate::state::models::CreatePersonalAccessTokenWithHash;
-use crate::streaming::personal_access_tokens::personal_access_token::PersonalAccessToken;
-use crate::streaming::session::Session;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::{delete, get, post};
 use axum::{Extension, Json, Router, debug_handler};
 use err_trail::ErrContext;
 use iggy_common::IdentityInfo;
+use iggy_common::PersonalAccessToken;
 use iggy_common::Validatable;
 use iggy_common::create_personal_access_token::CreatePersonalAccessToken;
 use iggy_common::delete_personal_access_token::DeletePersonalAccessToken;
@@ -66,7 +65,7 @@ async fn get_personal_access_tokens(
     let personal_access_tokens = state
         .shard
         .shard()
-        .get_personal_access_tokens(&Session::stateless(identity.user_id, identity.ip_address))
+        .get_personal_access_tokens(identity.user_id)
         .error(|e: &IggyError| {
             format!(
                 "{COMPONENT} (error: {e}) - failed to get personal access tokens, user ID: {}",
@@ -85,19 +84,30 @@ async fn create_personal_access_token(
     Json(command): Json<CreatePersonalAccessToken>,
 ) -> Result<Json<RawPersonalAccessToken>, CustomError> {
     command.validate()?;
-    let (_personal_access_token, token) = state
+    let (personal_access_token, token) = state
         .shard
-        .create_personal_access_token(
-            &Session::stateless(identity.user_id, identity.ip_address),
-            &command.name,
-            command.expiry,
-        )
+        .create_personal_access_token(identity.user_id, &command.name, command.expiry)
         .error(|e: &IggyError| {
             format!(
                 "{COMPONENT} (error: {e}) - failed to create personal access token, user ID: {}",
                 identity.user_id
             )
         })?;
+
+    {
+        let broadcast_future = SendWrapper::new(async {
+            use crate::shard::transmission::event::ShardEvent;
+            let event = ShardEvent::CreatedPersonalAccessToken {
+                personal_access_token: personal_access_token.clone(),
+            };
+            let _ = state
+                .shard
+                .shard()
+                .broadcast_event_to_all_shards(event)
+                .await;
+        });
+        broadcast_future.await;
+    }
 
     let token_hash = PersonalAccessToken::hash_token(&token);
     let command = EntryCommand::CreatePersonalAccessToken(CreatePersonalAccessTokenWithHash {
@@ -124,18 +134,32 @@ async fn delete_personal_access_token(
     Extension(identity): Extension<Identity>,
     Path(name): Path<String>,
 ) -> Result<StatusCode, CustomError> {
+    let token_name = name.clone();
     state
         .shard
-        .delete_personal_access_token(
-            &Session::stateless(identity.user_id, identity.ip_address),
-            &name,
-        )
+        .delete_personal_access_token(identity.user_id, &name)
         .error(|e: &IggyError| {
             format!(
                 "{COMPONENT} (error: {e}) - failed to delete personal access token, user ID: {}",
                 identity.user_id
             )
         })?;
+
+    {
+        let broadcast_future = SendWrapper::new(async {
+            use crate::shard::transmission::event::ShardEvent;
+            let event = ShardEvent::DeletedPersonalAccessToken {
+                user_id: identity.user_id,
+                name: token_name,
+            };
+            let _ = state
+                .shard
+                .shard()
+                .broadcast_event_to_all_shards(event)
+                .await;
+        });
+        broadcast_future.await;
+    }
 
     let command = EntryCommand::DeletePersonalAccessToken(DeletePersonalAccessToken { name });
     let state_future =

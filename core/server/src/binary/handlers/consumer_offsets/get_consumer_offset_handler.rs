@@ -43,9 +43,24 @@ impl ServerCommandHandler for GetConsumerOffset {
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
+        shard.ensure_authenticated(session)?;
+        let Ok((stream_id, topic_id)) = shard.resolve_topic_id(&self.stream_id, &self.topic_id)
+        else {
+            sender.send_empty_ok_response().await?;
+            return Ok(HandlerResult::Finished);
+        };
+        if shard
+            .permissioner
+            .borrow()
+            .get_consumer_offset(session.get_user_id(), stream_id, topic_id)
+            .is_err()
+        {
+            sender.send_empty_ok_response().await?;
+            return Ok(HandlerResult::Finished);
+        }
         let Ok(offset) = shard
             .get_consumer_offset(
-                session,
+                session.client_id,
                 self.consumer,
                 &self.stream_id,
                 &self.topic_id,

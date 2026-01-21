@@ -59,6 +59,7 @@ jobs:
         uses: ./.github/actions/utils/setup-rust-with-cache
         with:
           cache-targets: false # Only cache registry and git deps, not target dir (sccache handles that)
+          save-cache: "false"  # Only builds server+cli, let Rust test job save comprehensive cache
 
       - name: Build server for BDD tests
         if: startsWith(inputs.component, 'bdd-') && startsWith(inputs.task, 'bdd-')

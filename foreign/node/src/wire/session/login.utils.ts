@@ -19,17 +19,35 @@
 
 import { uint32ToBuf, uint8ToBuf } from "../number.utils.js";
 
+/**
+ * Response from a successful login.
+ */
 export type LoginResponse = {
+  /** The authenticated user's ID */
   userId: number
 }
 
+/**
+ * Credentials for user login.
+ */
 export type LoginCredentials = {
+  /** Username (1-255 bytes) */
   username: string,
+  /** Password (1-255 bytes) */
   password: string,
+  /** Optional client version string */
   version?: string,
+  /** Optional client context string */
   context?: string
 }
 
+/**
+ * Serializes login credentials for the login command.
+ *
+ * @param credentials - Login credentials object
+ * @returns Buffer containing serialized login request
+ * @throws Error if username or password is not between 1 and 255 bytes
+ */
 export const serializeLoginUser = ({
   username,
   password,
@@ -64,6 +82,13 @@ export const serializeLoginUser = ({
 };
 
 
+/**
+ * Serializes a token for the login with token command.
+ *
+ * @param token - Access token string (1-255 bytes)
+ * @returns Buffer containing serialized token login request
+ * @throws Error if token is not between 1 and 255 bytes
+ */
 export const serializeLoginWithToken = (token: string) => {
   const bToken = Buffer.from(token);
 

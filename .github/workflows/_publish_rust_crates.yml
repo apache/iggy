@@ -98,7 +98,7 @@ jobs:
         uses: ./.github/actions/utils/setup-rust-with-cache
         with:
           cache-targets: false
-          show-stats: false
+          profile: release
 
       - name: Extract versions
         id: versions

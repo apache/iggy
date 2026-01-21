@@ -20,15 +20,31 @@
 
 import type { CommandResponse, ClientProvider } from '../client/client.type.js';
 
-// export type ArgTypes<F extends Function> = F extends (...args: infer A) => any ? A : never;
-
+/**
+ * Represents a command that can be sent to the Iggy server.
+ *
+ * @typeParam I - Input type for the command arguments
+ * @typeParam O - Output type for the command response
+ */
 export type Command<I, O> = {
+  /** Command code identifying the operation */
   code: number,
+  /** Function to serialize command arguments to a Buffer */
   serialize: (args: I) => Buffer,
+  /** Function to deserialize the server response */
   deserialize: (r: CommandResponse) => O
 }
 
 
+/**
+ * Wraps a command definition into an executable function.
+ * Creates a function that handles serialization, sending, and deserialization.
+ *
+ * @typeParam I - Input type for the command arguments
+ * @typeParam O - Output type for the command response
+ * @param cmd - Command definition with code, serialize, and deserialize functions
+ * @returns A function that takes a ClientProvider and returns an async command executor
+ */
 export function wrapCommand<I, O>(cmd: Command<I, O>) {
   return (getClient: ClientProvider) =>
     async (arg: I) => cmd.deserialize(

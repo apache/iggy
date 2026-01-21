@@ -47,6 +47,7 @@ impl ServerCommandHandler for LogoutUser {
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
+        shard.ensure_authenticated(session)?;
         info!("Logging out user with ID: {}...", session.get_user_id());
         shard.logout_user(session).error(|e: &IggyError| {
             format!("{COMPONENT} (error: {e}) - failed to logout user, session: {session}")

@@ -53,6 +53,11 @@ impl ServerCommandHandler for DeleteUser {
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
+        shard.ensure_authenticated(session)?;
+        shard
+            .permissioner
+            .borrow()
+            .delete_user(session.get_user_id())?;
 
         let request = ShardRequest {
             stream_id: Identifier::default(),
@@ -72,7 +77,7 @@ impl ServerCommandHandler for DeleteUser {
                     info!("Deleting user with ID: {}...", user_id);
                     let _user_guard = shard.fs_locks.user_lock.lock().await;
                     let user = shard
-                        .delete_user(session, &user_id)
+                        .delete_user(&user_id)
                         .error(|e: &IggyError| {
                         format!(
                             "{COMPONENT} (error: {e}) - failed to delete user with ID: {}, session: {session}",

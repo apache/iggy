@@ -19,6 +19,7 @@
 mod cg;
 mod concurrent_addition;
 mod general;
+mod message_retrieval;
 mod scenarios;
 mod specific;
 
@@ -31,17 +32,22 @@ use integration::{
     websocket_client::WebSocketClientFactory,
 };
 use scenarios::{
-    bench_scenario, consumer_group_auto_commit_reconnection_scenario, consumer_group_join_scenario,
-    consumer_group_offset_cleanup_scenario,
+    authentication_scenario, bench_scenario, consumer_group_auto_commit_reconnection_scenario,
+    consumer_group_join_scenario, consumer_group_offset_cleanup_scenario,
     consumer_group_with_multiple_clients_polling_messages_scenario,
     consumer_group_with_single_client_polling_messages_scenario,
     consumer_timestamp_polling_scenario, create_message_payload, message_headers_scenario,
-    stream_size_validation_scenario, system_scenario, user_scenario,
+    permissions_scenario, snapshot_scenario, stream_size_validation_scenario, system_scenario,
+    user_scenario,
 };
 use std::pin::Pin;
 use std::{collections::HashMap, future::Future};
 
 type ScenarioFn = fn(&dyn ClientFactory) -> Pin<Box<dyn Future<Output = ()> + '_>>;
+
+fn authentication_scenario() -> ScenarioFn {
+    |factory| Box::pin(authentication_scenario::run(factory))
+}
 
 fn system_scenario() -> ScenarioFn {
     |factory| Box::pin(system_scenario::run(factory))
@@ -89,6 +95,14 @@ fn offset_cleanup_scenario() -> ScenarioFn {
 
 fn bench_scenario() -> ScenarioFn {
     |factory| Box::pin(bench_scenario::run(factory))
+}
+
+fn permissions_scenario() -> ScenarioFn {
+    |factory| Box::pin(permissions_scenario::run(factory))
+}
+
+fn snapshot_scenario() -> ScenarioFn {
+    |factory| Box::pin(snapshot_scenario::run(factory))
 }
 
 fn consumer_timestamp_polling_scenario() -> ScenarioFn {

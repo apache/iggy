@@ -28,6 +28,10 @@ import {
 } from './login.utils.js';
 
 
+/**
+ * Login command definition.
+ * Authenticates a user with username and password.
+ */
 export const LOGIN = {
   code: COMMAND_CODE.LoginUser,
 
@@ -39,4 +43,7 @@ export const LOGIN = {
 };
 
 
+/**
+ * Executable login command function.
+ */
 export const login = wrapCommand<LoginCredentials, LoginResponse>(LOGIN);

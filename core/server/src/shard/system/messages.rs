@@ -19,7 +19,7 @@
 use super::COMPONENT;
 use crate::binary::handlers::messages::poll_messages_handler::IggyPollMetadata;
 use crate::shard::IggyShard;
-use crate::shard::namespace::{IggyFullNamespace, IggyNamespace};
+use crate::shard::namespace::IggyFullNamespace;
 use crate::shard::transmission::frame::ShardResponse;
 use crate::shard::transmission::message::{
     ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult,
@@ -29,6 +29,7 @@ use crate::streaming::traits::MainOps;
 use crate::streaming::{partitions, streams, topics};
 use err_trail::ErrContext;
 use iggy_common::PooledBuffer;
+use iggy_common::sharding::IggyNamespace;
 use iggy_common::{
     BytesSerializable, Consumer, EncryptorKind, IGGY_MESSAGE_HEADER_SIZE, Identifier, IggyError,
     PollingKind, PollingStrategy,
@@ -314,24 +315,27 @@ impl IggyShard {
         partition_id: usize,
         fsync: bool,
     ) -> Result<(), IggyError> {
-        let batches = self.streams.with_partition_by_id_mut(
+        let committed = self.streams.with_partition_by_id_mut(
             stream_id,
             topic_id,
             partition_id,
             partitions::helpers::commit_journal(),
         );
 
+        if committed.frozen.is_empty() {
+            return Ok(());
+        }
+
         self.streams
             .persist_messages_to_disk(
                 stream_id,
                 topic_id,
                 partition_id,
-                batches,
+                committed,
                 &self.config.system,
             )
             .await?;
 
-        // Ensure all data is flushed to disk before returning
         if fsync {
             self.streams
                 .fsync_all_messages(stream_id, topic_id, partition_id)

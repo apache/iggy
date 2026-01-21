@@ -18,10 +18,30 @@
  */
 
 
+/**
+ * Converts a microsecond timestamp (BigInt) to a JavaScript Date object.
+ *
+ * @param n - Timestamp in microseconds as BigInt
+ * @returns JavaScript Date object
+ */
 export const toDate = (n: bigint): Date => new Date(Number(n / BigInt(1000)));
 
+/**
+ * Serializes a UUID string to a 16-byte Buffer.
+ * Removes dashes from the UUID and converts to binary format.
+ *
+ * @param id - UUID string (e.g., "550e8400-e29b-41d4-a716-446655440000")
+ * @returns 16-byte Buffer containing the UUID
+ */
 export const serializeUUID = (id: string) => Buffer.from(id.replaceAll('-', ''), 'hex');
 
+/**
+ * Deserializes a 16-byte Buffer to a UUID string.
+ * Converts binary format to standard UUID string with dashes.
+ *
+ * @param p - 16-byte Buffer containing the UUID
+ * @returns UUID string (e.g., "550e8400-e29b-41d4-a716-446655440000")
+ */
 export const deserializeUUID = (p: Buffer) => {
   const v = p.toString('hex');
   return `${v.slice(0, 8)}-` +

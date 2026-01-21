@@ -16,11 +16,8 @@
  * under the License.
  */
 
-use super::COMPONENT;
 use crate::shard::IggyShard;
 use crate::shard::calculate_shard_assignment;
-use crate::shard::namespace::IggyNamespace;
-use crate::shard::transmission::id::ShardId;
 use crate::slab::traits_ext::EntityMarker;
 use crate::slab::traits_ext::IntoComponents;
 use crate::streaming::partitions;
@@ -29,47 +26,20 @@ use crate::streaming::partitions::storage::create_partition_file_hierarchy;
 use crate::streaming::partitions::storage::delete_partitions_from_disk;
 use crate::streaming::segments::Segment;
 use crate::streaming::segments::storage::create_segment_storage;
-use crate::streaming::session::Session;
 use crate::streaming::streams;
 use crate::streaming::topics;
-use err_trail::ErrContext;
 use iggy_common::Identifier;
 use iggy_common::IggyError;
+use iggy_common::sharding::{IggyNamespace, LocalIdx, PartitionLocation, ShardId};
 use tracing::info;
 
 impl IggyShard {
-    fn validate_partition_permissions(
-        &self,
-        session: &Session,
-        stream_id: usize,
-        topic_id: usize,
-        operation: &str,
-    ) -> Result<(), IggyError> {
-        let permissioner = self.permissioner.borrow();
-        let result = match operation {
-            "create" => permissioner.create_partitions(session.get_user_id(), stream_id, topic_id),
-            "delete" => permissioner.delete_partitions(session.get_user_id(), stream_id, topic_id),
-            _ => return Err(IggyError::InvalidCommand),
-        };
-
-        result.error(|e: &IggyError| {
-            format!(
-                "{COMPONENT} (error: {e}) - permission denied to {operation} partitions for user {} on stream ID: {}, topic ID: {}",
-                session.get_user_id(),
-                stream_id,
-                topic_id
-            )
-        })
-    }
-
     pub async fn create_partitions(
         &self,
-        session: &Session,
         stream_id: &Identifier,
         topic_id: &Identifier,
         partitions_count: u32,
     ) -> Result<Vec<partition::Partition>, IggyError> {
-        self.ensure_authenticated(session)?;
         self.ensure_topic_exists(stream_id, topic_id)?;
         let numeric_stream_id = self
             .streams
@@ -78,13 +48,6 @@ impl IggyShard {
             self.streams
                 .with_topic_by_id(stream_id, topic_id, topics::helpers::get_topic_id());
 
-        // Claude garbage, rework this.
-        self.validate_partition_permissions(
-            session,
-            numeric_stream_id,
-            numeric_topic_id,
-            "create",
-        )?;
         let parent_stats =
             self.streams
                 .with_topic_by_id(stream_id, topic_id, topics::helpers::get_stats());
@@ -105,7 +68,10 @@ impl IggyShard {
             let ns = IggyNamespace::new(numeric_stream_id, numeric_topic_id, partition_id);
             let shard_id = ShardId::new(calculate_shard_assignment(&ns, shards_count));
             let is_current_shard = self.id == *shard_id;
-            self.insert_shard_table_record(ns, shard_id);
+            // TODO(hubcio): LocalIdx(0) is wrong.. When IggyPartitions is integrated into
+            // IggyShard, this should use the actual index returned by IggyPartitions::insert().
+            let location = PartitionLocation::new(shard_id, LocalIdx::new(0));
+            self.insert_shard_table_record(ns, location);
 
             create_partition_file_hierarchy(
                 numeric_stream_id as usize,
@@ -204,11 +170,14 @@ impl IggyShard {
                 "create_partitions_bypass_auth: partition mismatch ID, wrong creation order ?!"
             );
             let ns = IggyNamespace::new(numeric_stream_id, numeric_topic_id, id);
-            let shard_id = self.find_shard_table_record(&ns).unwrap_or_else(|| {
+            // TODO(hubcio): when IggyPartitions is integrated, this fallback path should
+            // either be removed or use proper index resolution.
+            let location = self.find_shard_table_record(&ns).unwrap_or_else(|| {
                 tracing::warn!("WARNING: missing shard table record for namespace: {:?}, in the event handler for `CreatedPartitions` event.", ns);
-                ShardId::new(calculate_shard_assignment(&ns, shards_count))
+                let shard_id = ShardId::new(calculate_shard_assignment(&ns, shards_count));
+                PartitionLocation::new(shard_id, LocalIdx::new(0))
             });
-            if self.id == *shard_id {
+            if self.id == *location.shard_id {
                 self.init_log(stream_id, topic_id, id).await?;
             }
         }
@@ -218,12 +187,10 @@ impl IggyShard {
 
     pub async fn delete_partitions(
         &self,
-        session: &Session,
         stream_id: &Identifier,
         topic_id: &Identifier,
         partitions_count: u32,
     ) -> Result<Vec<usize>, IggyError> {
-        self.ensure_authenticated(session)?;
         self.ensure_partitions_exist(stream_id, topic_id, partitions_count)?;
 
         let numeric_stream_id = self
@@ -232,13 +199,6 @@ impl IggyShard {
         let numeric_topic_id =
             self.streams
                 .with_topic_by_id(stream_id, topic_id, topics::helpers::get_topic_id());
-
-        self.validate_partition_permissions(
-            session,
-            numeric_stream_id,
-            numeric_topic_id,
-            "delete",
-        )?;
 
         let partitions = self.delete_partitions_base(stream_id, topic_id, partitions_count);
         let parent = partitions

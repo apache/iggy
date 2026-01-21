@@ -177,7 +177,7 @@ info "Waiting for $HOST:$PORT to be ready (up to ${WAIT_SECS}s)"
 if ! wait_for_port "$HOST" "$PORT"; then
   err "server did not become ready in ${WAIT_SECS}s"
   print_logs_if_any "$MASTER_DIR"
-  [[ -f "$MASTER_LOG" ]] && tail -n 200 "$MASTER_LOG" || true
+  [[ -f "$MASTER_LOG" ]] && { tail -n 200 "$MASTER_LOG" || true; }
   exit 1
 fi
 ok "server is ready"
@@ -242,7 +242,7 @@ info "Waiting for $HOST:$PORT to be ready (up to ${WAIT_SECS}s)"
 if ! wait_for_port "$HOST" "$PORT"; then
   err "PR server did not become ready in ${WAIT_SECS}s"
   print_logs_if_any "$PR_DIR"
-  [[ -f "$PR_LOG" ]] && tail -n 200 "$PR_LOG" || true
+  [[ -f "$PR_LOG" ]] && { tail -n 200 "$PR_LOG" || true; }
   exit 1
 fi
 ok "PR server is ready"

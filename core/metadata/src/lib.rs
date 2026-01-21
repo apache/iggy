@@ -18,4 +18,7 @@
 //! Iggy metadata module
 
 mod impls;
+pub mod permissioner;
 pub mod stm;
+
+mod stats;
