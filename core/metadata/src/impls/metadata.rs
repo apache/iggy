@@ -198,7 +198,7 @@ where
 
         // Find the prepare in pipeline
         let mut pipeline = consensus.pipeline().borrow_mut();
-        let Some(entry) = pipeline.prepare_by_op_and_checksum(header.op, header.prepare_checksum)
+        let Some(entry) = pipeline.message_by_op_and_checksum(header.op, header.prepare_checksum)
         else {
             debug!("on_ack: prepare not in pipeline op={}", header.op);
             return;
