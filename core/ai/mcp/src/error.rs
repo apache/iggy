@@ -37,4 +37,10 @@ pub enum McpRuntimeError {
     FailedToCreateConsumerId,
     #[error("Invalid API path")]
     InvalidApiPath,
+    #[error("Token file not found: {0}")]
+    TokenFileNotFound(String),
+    #[error("Failed to read token file '{0}': {1}")]
+    TokenFileReadError(String, String),
+    #[error("Token file is empty: {0}")]
+    TokenFileEmpty(String),
 }

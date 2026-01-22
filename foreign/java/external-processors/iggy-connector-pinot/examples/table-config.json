@@ -1,0 +1,43 @@
+{
+  "tableName": "user_events_realtime",
+  "tableType": "REALTIME",
+  "segmentsConfig": {
+    "timeColumnName": "eventTimestamp",
+    "timeType": "MILLISECONDS",
+    "replication": "1",
+    "schemaName": "user_events"
+  },
+  "tenants": {
+    "broker": "DefaultTenant",
+    "server": "DefaultTenant"
+  },
+  "tableIndexConfig": {
+    "loadMode": "MMAP",
+    "streamConfigs": {
+      "streamType": "iggy",
+      "stream.iggy.consumer.type": "lowlevel",
+      "stream.iggy.consumer.factory.class.name": "org.apache.iggy.connector.pinot.consumer.IggyConsumerFactory",
+      "stream.iggy.decoder.class.name": "org.apache.iggy.connector.pinot.decoder.IggyJsonMessageDecoder",
+
+      "stream.iggy.host": "localhost",
+      "stream.iggy.port": "8090",
+      "stream.iggy.username": "iggy",
+      "stream.iggy.password": "iggy",
+      "stream.iggy.enable.tls": "false",
+
+      "stream.iggy.stream.id": "analytics",
+      "stream.iggy.topic.id": "user-events",
+      "stream.iggy.consumer.group": "pinot-realtime-consumer",
+
+      "stream.iggy.poll.batch.size": "1000",
+      "stream.iggy.connection.pool.size": "8",
+
+      "realtime.segment.flush.threshold.rows": "50000",
+      "realtime.segment.flush.threshold.time": "3600000",
+      "realtime.segment.flush.threshold.segment.size": "100M"
+    }
+  },
+  "metadata": {
+    "customConfigs": {}
+  }
+}

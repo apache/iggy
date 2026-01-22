@@ -38,7 +38,7 @@ use crate::{
     state::file::FileState,
     streaming::{
         clients::client_manager::ClientManager, diagnostics::metrics::Metrics, session::Session,
-        users::permissioner::Permissioner, utils::ptr::EternalPtr,
+        utils::ptr::EternalPtr,
     },
     versioning::SemanticVersion,
 };
@@ -46,6 +46,7 @@ use builder::IggyShardBuilder;
 use dashmap::DashMap;
 use iggy_common::sharding::{IggyNamespace, PartitionLocation};
 use iggy_common::{EncryptorKind, Identifier, IggyError};
+use metadata::permissioner::Permissioner;
 use std::{
     cell::{Cell, RefCell},
     net::SocketAddr,
@@ -251,9 +252,10 @@ impl IggyShard {
     async fn load_users(&self) -> Result<(), IggyError> {
         let users_list = self.users.values();
         let users_count = users_list.len();
-        self.permissioner
-            .borrow_mut()
-            .init(&users_list.iter().collect::<Vec<_>>());
+        let mut permissioner = self.permissioner.borrow_mut();
+        for user in &users_list {
+            permissioner.init_permissions_for_user(user.id, user.permissions.clone());
+        }
         self.metrics.increment_users(users_count as u32);
         info!("Initialized {} user(s).", users_count);
         Ok(())
