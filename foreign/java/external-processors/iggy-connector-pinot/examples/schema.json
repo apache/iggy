@@ -1,0 +1,59 @@
+{
+  "schemaName": "user_events",
+  "dimensionFieldSpecs": [
+    {
+      "name": "userId",
+      "dataType": "STRING"
+    },
+    {
+      "name": "sessionId",
+      "dataType": "STRING"
+    },
+    {
+      "name": "eventType",
+      "dataType": "STRING"
+    },
+    {
+      "name": "pageUrl",
+      "dataType": "STRING"
+    },
+    {
+      "name": "deviceType",
+      "dataType": "STRING"
+    },
+    {
+      "name": "browser",
+      "dataType": "STRING"
+    },
+    {
+      "name": "country",
+      "dataType": "STRING"
+    },
+    {
+      "name": "city",
+      "dataType": "STRING"
+    }
+  ],
+  "metricFieldSpecs": [
+    {
+      "name": "duration",
+      "dataType": "LONG"
+    },
+    {
+      "name": "pageLoadTime",
+      "dataType": "INT"
+    },
+    {
+      "name": "scrollDepth",
+      "dataType": "INT"
+    }
+  ],
+  "dateTimeFieldSpecs": [
+    {
+      "name": "eventTimestamp",
+      "dataType": "LONG",
+      "format": "1:MILLISECONDS:EPOCH",
+      "granularity": "1:MILLISECONDS"
+    }
+  ]
+}

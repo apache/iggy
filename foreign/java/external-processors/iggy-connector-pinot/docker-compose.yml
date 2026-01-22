@@ -1,0 +1,135 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+services:
+  # Apache Iggy Server (from official Apache repo)
+  iggy:
+    image: apache/iggy:latest
+    container_name: iggy-server
+    ports:
+      - "8090:8090"  # TCP
+      - "3000:3000"  # HTTP
+      - "8080:8080"  # QUIC
+    environment:
+      - IGGY_SYSTEM_LOGGING_LEVEL=info
+      - IGGY_TCP_ADDRESS=0.0.0.0:8090
+      - IGGY_HTTP_ENABLED=true
+      - IGGY_HTTP_ADDRESS=0.0.0.0:3000
+      - IGGY_QUIC_ADDRESS=0.0.0.0:8080
+      - IGGY_ROOT_USERNAME=iggy
+      - IGGY_ROOT_PASSWORD=iggy
+    cap_add:
+      - SYS_NICE
+    security_opt:
+      - seccomp:unconfined
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - iggy-pinot-network
+
+  # Zookeeper (required by Pinot)
+  zookeeper:
+    image: zookeeper:3.9
+    container_name: pinot-zookeeper
+    ports:
+      - "2181:2181"
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    networks:
+      - iggy-pinot-network
+
+  # Apache Pinot Controller
+  pinot-controller:
+    image: apachepinot/pinot:latest
+    container_name: pinot-controller
+    command: "StartController -zkAddress zookeeper:2181"
+    ports:
+      - "9000:9000"
+    environment:
+      JAVA_OPTS: "-Xms1G -Xmx2G -XX:+UseG1GC"
+    depends_on:
+      - zookeeper
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    volumes:
+      - ./build/libs:/opt/pinot/plugins/pinot-stream-ingestion/iggy-connector
+      - ../../java-sdk/build/libs/iggy-0.6.0.jar:/opt/pinot/plugins/pinot-stream-ingestion/iggy-connector/iggy-0.6.0.jar
+      - ./deployment:/opt/pinot/deployment
+    networks:
+      - iggy-pinot-network
+
+  # Apache Pinot Broker
+  pinot-broker:
+    image: apachepinot/pinot:latest
+    container_name: pinot-broker
+    command: "StartBroker -zkAddress zookeeper:2181"
+    ports:
+      - "8099:8099"
+    environment:
+      JAVA_OPTS: "-Xms512M -Xmx1G -XX:+UseG1GC"
+    depends_on:
+      - pinot-controller
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8099/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - iggy-pinot-network
+
+  # Apache Pinot Server
+  pinot-server:
+    image: apachepinot/pinot:latest
+    container_name: pinot-server
+    command: "StartServer -zkAddress zookeeper:2181"
+    ports:
+      - "8098:8098"
+      - "8097:8097"
+    environment:
+      JAVA_OPTS: "-Xms1G -Xmx2G -XX:+UseG1GC -Dplugins.include=iggy-connector"
+    depends_on:
+      - pinot-broker
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8097/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    volumes:
+      - ./build/libs:/opt/pinot/plugins/pinot-stream-ingestion/iggy-connector
+      - ../../java-sdk/build/libs/iggy-0.6.0.jar:/opt/pinot/plugins/pinot-stream-ingestion/iggy-connector/iggy-0.6.0.jar
+      - ./deployment:/opt/pinot/deployment
+    networks:
+      - iggy-pinot-network
+
+networks:
+  iggy-pinot-network:
+    driver: bridge

@@ -28,3 +28,6 @@ project(":iggy-connector-library").projectDir = file("external-processors/iggy-c
 
 include("iggy-flink-examples")
 project(":iggy-flink-examples").projectDir = file("external-processors/iggy-connector-flink/iggy-flink-examples")
+
+include("iggy-connector-pinot")
+project(":iggy-connector-pinot").projectDir = file("external-processors/iggy-connector-pinot")

@@ -19,8 +19,12 @@
 # Flink
 flink = "2.1.1"
 
+# Pinot
+pinot = "1.4.0"
+
 # Jackson
 jackson = "3.0.2"
+jackson2 = "2.18.2"
 
 # Apache Commons
 commons-lang3 = "3.20.0"
@@ -58,6 +62,10 @@ checkstyle = "12.1.2"
 [libraries]
 # Jackson
 jackson-databind = { module = "tools.jackson.core:jackson-databind", version.ref = "jackson" }
+jackson2-databind = { module = "com.fasterxml.jackson.core:jackson-databind", version.ref = "jackson2" }
+
+# Pinot
+pinot-spi = { module = "org.apache.pinot:pinot-spi", version.ref = "pinot" }
 
 # Apache HTTP Client
 httpclient5 = { module = "org.apache.httpcomponents.client5:httpclient5", version.ref = "httpclient5" }
