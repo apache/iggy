@@ -150,6 +150,24 @@ mockall = "0.14.0"
 nix = { version = "0.30.1", features = ["fs", "resource", "sched"] }
 nonzero_lit = "0.1.2"
 once_cell = "1.21.3"
+opentelemetry = { version = "0.31.0", features = ["trace", "logs"] }
+opentelemetry-appender-tracing = { version = "0.31.1", features = ["log"] }
+opentelemetry-otlp = { version = "0.31.0", features = [
+    "logs",
+    "trace",
+    "grpc-tonic",
+    "http",
+    "http-proto",
+    "reqwest-client",
+] }
+opentelemetry-semantic-conventions = "0.31.0"
+opentelemetry_sdk = { version = "0.31.0", features = [
+    "logs",
+    "trace",
+    "experimental_async_runtime",
+    "experimental_logs_batch_log_processor_with_async_runtime",
+    "experimental_trace_batch_span_processor_with_async_runtime",
+] }
 parquet = "=55.2.0"
 passterm = "=2.0.1"
 postcard = { version = "1.1.3", features = ["alloc"] }
@@ -197,6 +215,7 @@ tower-http = { version = "0.6.8", features = [
 ] }
 tracing = "0.1.44"
 tracing-appender = "0.2.4"
+tracing-opentelemetry = "0.32.1"
 tracing-subscriber = { version = "0.3.22", default-features = false, features = [
     "fmt",
     "env-filter",

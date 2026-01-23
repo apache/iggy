@@ -19,6 +19,7 @@
 
 use crate::configs::connectors::SinkConfig;
 use crate::context::RuntimeContext;
+use crate::log::LOG_CALLBACK;
 use crate::manager::status::ConnectorStatus;
 use crate::{
     PLUGIN_ID, RuntimeError, SinkApi, SinkConnector, SinkConnectorConsumer, SinkConnectorPlugin,
@@ -319,7 +320,12 @@ fn init_sink(
     id: u32,
 ) -> Result<(), RuntimeError> {
     let plugin_config = serde_json::to_string(plugin_config).expect("Invalid sink plugin config.");
-    let result = (container.open)(id, plugin_config.as_ptr(), plugin_config.len());
+    let result = (container.open)(
+        id,
+        plugin_config.as_ptr(),
+        plugin_config.len(),
+        LOG_CALLBACK,
+    );
     if result != 0 {
         let err = format!("Plugin initialization failed (ID: {id})");
         error!("{err}");

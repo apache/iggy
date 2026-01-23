@@ -26,7 +26,8 @@ use figment::{
 use iggy::prelude::{DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME};
 use iggy_common::{CustomEnvProvider, FileConfigProvider};
 use serde::{Deserialize, Serialize};
-use std::fmt::Formatter;
+use std::fmt::{Display as FmtDisplay, Formatter};
+use std::str::FromStr;
 use strum::Display;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
@@ -37,6 +38,7 @@ pub struct McpServerConfig {
     pub iggy: IggyConfig,
     pub permissions: PermissionsConfig,
     pub transport: McpTransport,
+    pub telemetry: TelemetryConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -101,6 +103,105 @@ pub enum McpTransport {
     Stdio,
 }
 
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct TelemetryConfig {
+    pub enabled: bool,
+    pub service_name: String,
+    pub logs: TelemetryLogsConfig,
+    pub traces: TelemetryTracesConfig,
+}
+
+impl Default for TelemetryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            service_name: "iggy-mcp".to_owned(),
+            logs: TelemetryLogsConfig::default(),
+            traces: TelemetryTracesConfig::default(),
+        }
+    }
+}
+
+impl FmtDisplay for TelemetryConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{{ enabled: {}, service_name: {}, logs: {}, traces: {} }}",
+            self.enabled, self.service_name, self.logs, self.traces
+        )
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct TelemetryLogsConfig {
+    pub transport: TelemetryTransport,
+    pub endpoint: String,
+}
+
+impl Default for TelemetryLogsConfig {
+    fn default() -> Self {
+        Self {
+            transport: TelemetryTransport::Grpc,
+            endpoint: "http://localhost:4317".to_owned(),
+        }
+    }
+}
+
+impl FmtDisplay for TelemetryLogsConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{{ transport: {}, endpoint: {} }}",
+            self.transport, self.endpoint
+        )
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct TelemetryTracesConfig {
+    pub transport: TelemetryTransport,
+    pub endpoint: String,
+}
+
+impl Default for TelemetryTracesConfig {
+    fn default() -> Self {
+        Self {
+            transport: TelemetryTransport::Grpc,
+            endpoint: "http://localhost:4317".to_owned(),
+        }
+    }
+}
+
+impl FmtDisplay for TelemetryTracesConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{{ transport: {}, endpoint: {} }}",
+            self.transport, self.endpoint
+        )
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Display, Copy, Clone)]
+#[serde(rename_all = "lowercase")]
+pub enum TelemetryTransport {
+    #[strum(to_string = "grpc")]
+    Grpc,
+    #[strum(to_string = "http")]
+    Http,
+}
+
+impl FromStr for TelemetryTransport {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "grpc" => Ok(TelemetryTransport::Grpc),
+            "http" => Ok(TelemetryTransport::Http),
+            _ => Err(format!("Invalid telemetry transport: {s}")),
+        }
+    }
+}
+
 impl Default for McpServerConfig {
     fn default() -> Self {
         Self {
@@ -108,6 +209,7 @@ impl Default for McpServerConfig {
             iggy: IggyConfig::default(),
             permissions: PermissionsConfig::default(),
             transport: McpTransport::Http,
+            telemetry: TelemetryConfig::default(),
         }
     }
 }
@@ -238,8 +340,8 @@ impl std::fmt::Display for McpServerConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ http: {}, iggy: {}, permissions: {:?}, transport: {} }}",
-            self.http, self.iggy, self.permissions, self.transport
+            "{{ http: {}, iggy: {}, permissions: {:?}, transport: {}, telemetry: {} }}",
+            self.http, self.iggy, self.permissions, self.transport, self.telemetry
         )
     }
 }
