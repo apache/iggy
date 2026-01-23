@@ -58,8 +58,12 @@ public class StreamsTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task CreateStream_Duplicate_Should_Throw_InvalidResponse(Protocol protocol)
     {
-        await Should.ThrowAsync<IggyInvalidStatusCodeException>(Fixture.Clients[protocol]
+        var exception = await Should.ThrowAsync<IggyInvalidStatusCodeException>(Fixture.Clients[protocol]
             .CreateStreamAsync(Name.GetWithProtocol(protocol)));
+
+        exception.ShouldNotBeNull();
+        exception.ErrorCode.ShouldBe(IggyErrorCode.StreamNameAlreadyExists);
+        exception.Message.ShouldBe("Invalid status code: 1012 (StreamNameAlreadyExists)");
     }
 
     [Test]
@@ -229,8 +233,12 @@ public class StreamsTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task DeleteStream_NotExists_Should_Throw_InvalidResponse(Protocol protocol)
     {
-        await Should.ThrowAsync<IggyInvalidStatusCodeException>(() =>
+        var exception = await Should.ThrowAsync<IggyInvalidStatusCodeException>(() =>
             Fixture.Clients[protocol].DeleteStreamAsync(Identifier.String("stream-to-delete".GetWithProtocol(protocol))));
+
+        exception.ShouldNotBeNull();
+        exception.ErrorCode.ShouldBe(IggyErrorCode.StreamIdNotFound);
+        exception.Message.ShouldBe("Invalid status code: 1009 (StreamIdNotFound)");
     }
 
     [Test]

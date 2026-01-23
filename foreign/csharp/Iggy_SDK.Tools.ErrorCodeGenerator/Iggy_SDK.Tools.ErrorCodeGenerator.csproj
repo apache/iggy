@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <OutputType>Exe</OutputType>
+        <TargetFramework>net8.0</TargetFramework>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <Nullable>enable</Nullable>
+        <RootNamespace>Apache.Iggy.Tools.ErrorCodeGenerator</RootNamespace>
+        <AssemblyName>iggy-error-codegen</AssemblyName>
+
+        <!-- Dotnet Tool Configuration -->
+        <PackAsTool>true</PackAsTool>
+        <ToolCommandName>iggy-error-codegen</ToolCommandName>
+        <PackageId>Apache.Iggy.Tools.ErrorCodeGenerator</PackageId>
+        <PackageVersion>1.0.0</PackageVersion>
+        <Description>Generates C# IggyErrorCode enum from Rust iggy_error.rs file</Description>
+        <Authors>Apache Iggy</Authors>
+        <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+        <IsPackable>true</IsPackable>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <PackageReference Include="System.CommandLine" />
+    </ItemGroup>
+
+</Project>
