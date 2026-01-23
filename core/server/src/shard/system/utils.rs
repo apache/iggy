@@ -75,11 +75,6 @@ impl IggyShard {
         Ok((stream, topic, group))
     }
 
-    pub fn ensure_stream_exists(&self, stream_id: &Identifier) -> Result<(), IggyError> {
-        self.resolve_stream_id(stream_id)?;
-        Ok(())
-    }
-
     pub fn ensure_topic_exists(
         &self,
         stream_id: &Identifier,

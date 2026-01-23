@@ -129,29 +129,6 @@ impl IggyShard {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn update_topic_bypass_auth(
-        &self,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-        name: String,
-        message_expiry: IggyExpiry,
-        compression_algorithm: CompressionAlgorithm,
-        max_topic_size: MaxTopicSize,
-        replication_factor: Option<u8>,
-    ) -> Result<(), IggyError> {
-        let (stream, topic) = self.resolve_topic_id(stream_id, topic_id)?;
-        self.update_topic_base(
-            stream,
-            topic,
-            name,
-            message_expiry,
-            compression_algorithm,
-            max_topic_size,
-            replication_factor.unwrap_or(1),
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
     fn update_topic_base(
         &self,
         stream: usize,
@@ -227,15 +204,6 @@ impl IggyShard {
         parent_stats.decrement_segments_count(segments_count);
         self.metrics.decrement_topics(1);
         Ok(topic_info)
-    }
-
-    pub fn delete_topic_bypass_auth(
-        &self,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-    ) -> Result<DeletedTopicInfo, IggyError> {
-        let (stream, topic) = self.resolve_topic_id(stream_id, topic_id)?;
-        Ok(self.delete_topic_base(stream, topic))
     }
 
     fn delete_topic_base(&self, stream: usize, topic: usize) -> DeletedTopicInfo {

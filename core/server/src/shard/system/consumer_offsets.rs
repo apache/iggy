@@ -320,17 +320,4 @@ impl IggyShard {
     pub async fn delete_consumer_offset_from_disk(&self, path: &str) -> Result<(), IggyError> {
         crate::streaming::partitions::storage::delete_persisted_offset(path).await
     }
-
-    pub fn store_consumer_offset_bypass_auth(
-        &self,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-        polling_consumer: &PollingConsumer,
-        partition_id: usize,
-        offset: u64,
-    ) -> Result<(), IggyError> {
-        let (stream, topic) = self.resolve_topic_id(stream_id, topic_id)?;
-        self.store_consumer_offset_base(stream, topic, polling_consumer, partition_id, offset);
-        Ok(())
-    }
 }

@@ -176,14 +176,6 @@ impl SystemConfig {
         format!("{}/{}", self.get_system_path(), self.backup.path)
     }
 
-    pub fn get_compatibility_backup_path(&self) -> String {
-        format!(
-            "{}/{}",
-            self.get_backup_path(),
-            self.backup.compatibility.path
-        )
-    }
-
     pub fn get_runtime_path(&self) -> String {
         format!("{}/{}", self.get_system_path(), self.runtime.path)
     }

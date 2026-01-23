@@ -17,22 +17,10 @@
  */
 use crate::shard::IggyShard;
 use crate::streaming::segments::Segment;
+use iggy_common::IggyError;
 use iggy_common::sharding::IggyNamespace;
-use iggy_common::{Identifier, IggyError};
 
 impl IggyShard {
-    pub async fn delete_segments_bypass_auth(
-        &self,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-        partition_id: usize,
-        segments_count: u32,
-    ) -> Result<(), IggyError> {
-        let (stream, topic) = self.resolve_topic_id(stream_id, topic_id)?;
-        self.delete_segments_base(stream, topic, partition_id, segments_count)
-            .await
-    }
-
     pub(crate) async fn delete_segments_base(
         &self,
         stream: usize,

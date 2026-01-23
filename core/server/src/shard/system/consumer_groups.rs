@@ -19,8 +19,6 @@
 use super::COMPONENT;
 use crate::metadata::ConsumerGroupMeta;
 use crate::shard::IggyShard;
-use bytes::BufMut;
-use bytes::BytesMut;
 use err_trail::ErrContext;
 use iggy_common::Identifier;
 use iggy_common::IggyError;
@@ -69,17 +67,6 @@ impl IggyShard {
 
         let cg = self.delete_consumer_group_base(stream, topic, group);
         Ok(cg)
-    }
-
-    pub fn delete_consumer_group_bypass_auth(
-        &self,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-        group_id: &Identifier,
-    ) -> Result<ConsumerGroupMeta, IggyError> {
-        let (stream, topic, group) =
-            self.resolve_consumer_group_id(stream_id, topic_id, group_id)?;
-        Ok(self.delete_consumer_group_base(stream, topic, group))
     }
 
     fn delete_consumer_group_base(
@@ -176,37 +163,5 @@ impl IggyShard {
             })?;
 
         Ok(())
-    }
-
-    pub fn get_consumer_group_from_metadata(
-        &self,
-        stream_id: usize,
-        topic_id: usize,
-        group_id: usize,
-    ) -> bytes::Bytes {
-        let Some(cg_meta) = self
-            .metadata
-            .get_consumer_group(stream_id, topic_id, group_id)
-        else {
-            return bytes::Bytes::new();
-        };
-
-        let mut bytes = BytesMut::new();
-
-        bytes.put_u32_le(cg_meta.id as u32);
-        bytes.put_u32_le(cg_meta.partitions.len() as u32);
-        bytes.put_u32_le(cg_meta.members.len() as u32);
-        bytes.put_u8(cg_meta.name.len() as u8);
-        bytes.put_slice(cg_meta.name.as_bytes());
-
-        for (_, member) in cg_meta.members.iter() {
-            bytes.put_u32_le(member.id as u32);
-            bytes.put_u32_le(member.partitions.len() as u32);
-            for &partition_id in &member.partitions {
-                bytes.put_u32_le(partition_id as u32);
-            }
-        }
-
-        bytes.freeze()
     }
 }
