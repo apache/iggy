@@ -66,13 +66,15 @@ impl MetadataWriter {
     }
 
     pub fn add_stream(&mut self, meta: StreamMeta) -> StreamId {
-        let assigned_id = Arc::new(AtomicUsize::new(0));
+        let assigned_id = Arc::new(AtomicUsize::new(usize::MAX));
         self.append(MetadataOp::AddStream {
             meta,
             assigned_id: assigned_id.clone(),
         });
         self.publish();
-        assigned_id.load(Ordering::Acquire)
+        let id = assigned_id.load(Ordering::Acquire);
+        debug_assert_ne!(id, usize::MAX, "add_stream should always succeed");
+        id
     }
 
     pub fn update_stream(&mut self, id: StreamId, new_name: Arc<str>) {
@@ -189,13 +191,15 @@ impl MetadataWriter {
     }
 
     pub fn add_user(&mut self, meta: UserMeta) -> UserId {
-        let assigned_id = Arc::new(AtomicUsize::new(0));
+        let assigned_id = Arc::new(AtomicUsize::new(usize::MAX));
         self.append(MetadataOp::AddUser {
             meta,
             assigned_id: assigned_id.clone(),
         });
         self.publish();
-        assigned_id.load(Ordering::Acquire) as UserId
+        let id = assigned_id.load(Ordering::Acquire);
+        debug_assert_ne!(id, usize::MAX, "add_user should always succeed");
+        id as UserId
     }
 
     pub fn update_user_meta(&mut self, id: UserId, meta: UserMeta) {
