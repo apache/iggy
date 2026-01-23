@@ -21,9 +21,6 @@ on:
     branches: [master]
   workflow_dispatch:
 
-env:
-  IGGY_CI_BUILD: true
-
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ startsWith(github.ref, 'refs/pull/') }}

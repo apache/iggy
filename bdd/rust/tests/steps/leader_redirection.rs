@@ -20,7 +20,7 @@ use crate::common::leader_context::LeaderContext;
 use crate::helpers::cluster;
 use cucumber::{given, then, when};
 use iggy::prelude::*;
-use integration::test_server::login_root;
+use integration::harness::login_root;
 use std::time::Duration;
 use tokio::time::sleep;
 

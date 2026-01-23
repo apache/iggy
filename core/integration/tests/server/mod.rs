@@ -16,137 +16,79 @@
  * under the License.
  */
 
-mod cg;
-mod concurrent_addition;
-mod general;
-mod message_retrieval;
-mod scenarios;
-mod specific;
+mod authentication_scenario;
+mod bench_scenario;
+mod concurrent_scenario;
+mod consumer_group_auto_commit_reconnection_scenario;
+mod consumer_group_join_scenario;
+mod consumer_group_multiple_clients_polling_messages_scenario;
+mod consumer_group_offset_cleanup_scenario;
+mod consumer_group_single_client_polling_messages_scenario;
+mod consumer_timestamp_polling_scenario;
+mod create_message_payload;
+mod cross_protocol_pat_scenario;
+mod delete_segments_scenario;
+pub mod encryption_scenario;
+mod message_headers_scenario;
+mod message_size_scenario;
+mod offset_retrieval_scenario;
+mod permissions_scenario;
+pub mod read_during_persistence_scenario;
+mod segment_rotation_race_scenario;
+mod single_message_per_batch_scenario;
+pub mod stale_client_consumer_group_scenario;
+mod stream_size_validation_scenario;
+mod system_scenario;
+mod timestamp_retrieval_scenario;
+mod tls_scenario;
+mod user_scenario;
 
-use iggy_common::TransportProtocol;
-use integration::{
-    http_client::HttpClientFactory,
-    quic_client::QuicClientFactory,
-    tcp_client::TcpClientFactory,
-    test_server::{ClientFactory, IpAddrKind, TestServer},
-    websocket_client::WebSocketClientFactory,
-};
-use scenarios::{
-    authentication_scenario, bench_scenario, consumer_group_auto_commit_reconnection_scenario,
-    consumer_group_join_scenario, consumer_group_offset_cleanup_scenario,
-    consumer_group_with_multiple_clients_polling_messages_scenario,
-    consumer_group_with_single_client_polling_messages_scenario,
-    consumer_timestamp_polling_scenario, create_message_payload, message_headers_scenario,
-    permissions_scenario, snapshot_scenario, stream_size_validation_scenario, system_scenario,
-    user_scenario,
-};
-use std::pin::Pin;
-use std::{collections::HashMap, future::Future};
+use iggy::prelude::*;
+use integration::harness::delete_user;
 
-type ScenarioFn = fn(&dyn ClientFactory) -> Pin<Box<dyn Future<Output = ()> + '_>>;
+pub(crate) const PARTITION_ID: u32 = 0;
+pub(crate) const STREAM_NAME: &str = "test-stream";
+pub(crate) const TOPIC_NAME: &str = "test-topic";
+pub(crate) const PARTITIONS_COUNT: u32 = 3;
+pub(crate) const CONSUMER_GROUP_NAME: &str = "test-consumer-group";
+pub(crate) const USERNAME_1: &str = "user1";
+pub(crate) const USERNAME_2: &str = "user2";
+pub(crate) const USERNAME_3: &str = "user3";
+#[allow(dead_code)]
+pub(crate) const CONSUMER_KIND: ConsumerKind = ConsumerKind::Consumer;
+pub(crate) const MESSAGES_COUNT: u32 = 1337;
 
-fn authentication_scenario() -> ScenarioFn {
-    |factory| Box::pin(authentication_scenario::run(factory))
+pub(crate) async fn get_consumer_group(client: &IggyClient) -> ConsumerGroupDetails {
+    client
+        .get_consumer_group(
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
+            &Identifier::named(CONSUMER_GROUP_NAME).unwrap(),
+        )
+        .await
+        .unwrap()
+        .expect("Failed to get consumer group")
 }
 
-fn system_scenario() -> ScenarioFn {
-    |factory| Box::pin(system_scenario::run(factory))
+pub(crate) async fn join_consumer_group(client: &IggyClient) {
+    client
+        .join_consumer_group(
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
+            &Identifier::named(CONSUMER_GROUP_NAME).unwrap(),
+        )
+        .await
+        .unwrap();
 }
 
-fn user_scenario() -> ScenarioFn {
-    |factory| Box::pin(user_scenario::run(factory))
-}
-
-fn message_headers_scenario() -> ScenarioFn {
-    |factory| Box::pin(message_headers_scenario::run(factory))
-}
-
-fn create_message_payload_scenario() -> ScenarioFn {
-    |factory| Box::pin(create_message_payload::run(factory))
-}
-
-fn join_scenario() -> ScenarioFn {
-    |factory| Box::pin(consumer_group_join_scenario::run(factory))
-}
-
-fn stream_size_validation_scenario() -> ScenarioFn {
-    |factory| Box::pin(stream_size_validation_scenario::run(factory))
-}
-
-fn single_client_scenario() -> ScenarioFn {
-    |factory| Box::pin(consumer_group_with_single_client_polling_messages_scenario::run(factory))
-}
-
-fn multiple_clients_scenario() -> ScenarioFn {
-    |factory| Box::pin(consumer_group_with_multiple_clients_polling_messages_scenario::run(factory))
-}
-
-fn auto_commit_reconnection_scenario() -> ScenarioFn {
-    |factory| {
-        Box::pin(consumer_group_auto_commit_reconnection_scenario::run(
-            factory,
-        ))
+pub(crate) async fn cleanup(system_client: &IggyClient, delete_users: bool) {
+    if delete_users {
+        delete_user(system_client, USERNAME_1).await;
+        delete_user(system_client, USERNAME_2).await;
+        delete_user(system_client, USERNAME_3).await;
     }
-}
-
-fn offset_cleanup_scenario() -> ScenarioFn {
-    |factory| Box::pin(consumer_group_offset_cleanup_scenario::run(factory))
-}
-
-fn bench_scenario() -> ScenarioFn {
-    |factory| Box::pin(bench_scenario::run(factory))
-}
-
-fn permissions_scenario() -> ScenarioFn {
-    |factory| Box::pin(permissions_scenario::run(factory))
-}
-
-fn snapshot_scenario() -> ScenarioFn {
-    |factory| Box::pin(snapshot_scenario::run(factory))
-}
-
-fn consumer_timestamp_polling_scenario() -> ScenarioFn {
-    |factory| Box::pin(consumer_timestamp_polling_scenario::run(factory))
-}
-
-async fn run_scenario(transport: TransportProtocol, scenario: ScenarioFn) {
-    // TODO: Need to enable `TCP_NODELAY` flag for TCP transports, due to small messages being used in the test.
-    // For some reason TCP in compio can't deal with it, but in tokio it works fine.
-    let mut extra_envs = HashMap::new();
-    extra_envs.insert(
-        "IGGY_TCP_SOCKET_OVERRIDE_DEFAULTS".to_string(),
-        "true".to_string(),
-    );
-    extra_envs.insert("IGGY_TCP_SOCKET_NODELAY".to_string(), "true".to_string());
-    extra_envs.insert("IGGY_QUIC_MAX_IDLE_TIMEOUT".to_string(), "500s".to_string());
-    extra_envs.insert(
-        "IGGY_QUIC_KEEP_ALIVE_INTERVAL".to_string(),
-        "15s".to_string(),
-    );
-    let mut test_server = TestServer::new(Some(extra_envs), true, None, IpAddrKind::V4);
-    test_server.start();
-
-    let client_factory: Box<dyn ClientFactory> = match transport {
-        TransportProtocol::Tcp => {
-            let server_addr = test_server.get_raw_tcp_addr().unwrap();
-            Box::new(TcpClientFactory {
-                server_addr,
-                ..Default::default()
-            })
-        }
-        TransportProtocol::Quic => {
-            let server_addr = test_server.get_quic_udp_addr().unwrap();
-            Box::new(QuicClientFactory { server_addr })
-        }
-        TransportProtocol::Http => {
-            let server_addr = test_server.get_http_api_addr().unwrap();
-            Box::new(HttpClientFactory { server_addr })
-        }
-        TransportProtocol::WebSocket => {
-            let server_addr = test_server.get_websocket_addr().unwrap();
-            Box::new(WebSocketClientFactory { server_addr })
-        }
-    };
-
-    scenario(&*client_factory).await;
+    system_client
+        .delete_stream(&Identifier::named(STREAM_NAME).unwrap())
+        .await
+        .unwrap();
 }

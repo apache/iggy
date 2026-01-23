@@ -20,8 +20,9 @@ use crate::common::global_context::GlobalContext;
 use cucumber::given;
 use iggy::clients::client::IggyClient;
 use iggy::prelude::SystemClient;
+use integration::harness::login_root;
 use integration::tcp_client::TcpClientFactory;
-use integration::test_server::{ClientFactory, login_root};
+use integration::test_server::ClientFactory;
 
 #[given("I am authenticated as the root user")]
 pub async fn given_authenticated_as_root(world: &mut GlobalContext) {

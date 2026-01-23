@@ -17,13 +17,19 @@
  */
 
 use ctor::{ctor, dtor};
+use integration::harness::get_test_directory;
 use lazy_static::lazy_static;
 use std::collections::{HashMap, HashSet};
+use std::fs::File;
 use std::io::Write;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Once};
 use std::{panic, thread};
+use tracing_subscriber::fmt::MakeWriter;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{EnvFilter, fmt};
 
 mod cli;
 mod config_provider;
@@ -48,24 +54,32 @@ static UNKNOWN_TEST_NAME: &str = "unknown";
 fn setup() {
     let log_buffer = LOGS_BUFFER.clone();
 
-    let mut logger = env_logger::builder();
-    logger.is_test(true);
-    logger.filter(None, log::LevelFilter::Info);
-    logger.target(env_logger::Target::Pipe(Box::new(LogWriter(log_buffer))));
-    logger.format(move |buf, record| {
-        let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.6f");
-        let level = record.level();
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
-        writeln!(buf, "{timestamp} {level:>5} - {}", record.args())
-    });
-    logger.init();
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(
+            fmt::layer()
+                .with_thread_names(true)
+                .with_writer(ThreadBufferWriter(log_buffer)),
+        )
+        .init();
 
-    // Set up a custom panic hook to catch test failures
+    // Set up a custom panic hook to catch test failures and capture panic info
+    let panic_buffer = LOGS_BUFFER.clone();
     let default_hook = panic::take_hook();
     panic::set_hook(Box::new(move |info| {
-        // store failed test name
         let thread = thread::current();
         let thread_name = thread.name().unwrap_or(UNKNOWN_TEST_NAME);
+
+        // Write panic info to the log buffer
+        if let Ok(mut map) = panic_buffer.write() {
+            let buffer = map.entry(thread_name.to_string()).or_default();
+            let panic_msg = format!("\nPANIC: {info}\n");
+            buffer.extend_from_slice(panic_msg.as_bytes());
+        }
+
+        // Store failed test name
         let failed_tests = FAILED_TEST_CASES.clone();
         failed_tests
             .write()
@@ -78,6 +92,16 @@ fn setup() {
         // Call the default panic hook to continue normal behavior
         default_hook(info);
     }));
+}
+
+struct ThreadBufferWriter(Arc<RwLock<HashMap<String, Vec<u8>>>>);
+
+impl<'a> MakeWriter<'a> for ThreadBufferWriter {
+    type Writer = LogWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        LogWriter(self.0.clone())
+    }
 }
 
 struct LogWriter(Arc<RwLock<HashMap<String, Vec<u8>>>>);
@@ -100,14 +124,26 @@ impl Write for LogWriter {
 }
 
 fn teardown() {
-    if TESTS_FAILED.load(Ordering::SeqCst)
-        && let Ok(buffer) = LOGS_BUFFER.read()
-        && let Ok(failed) = FAILED_TEST_CASES.read()
-    {
-        for test in failed.iter() {
-            if let Some(logs) = buffer.get(test) {
-                eprintln!("Logs for failed test '{test}':");
-                eprintln!("{}", String::from_utf8_lossy(logs));
+    if let Ok(buffer) = LOGS_BUFFER.read() {
+        // Write all test logs to files
+        for (test_name, logs) in buffer.iter() {
+            if let Some(dir) = get_test_directory(test_name) {
+                let log_path = dir.join("test_stdout.log");
+                if let Ok(mut file) = File::create(&log_path) {
+                    let _ = file.write_all(logs);
+                }
+            }
+        }
+
+        // Print logs for failed tests to stderr
+        if TESTS_FAILED.load(Ordering::SeqCst)
+            && let Ok(failed) = FAILED_TEST_CASES.read()
+        {
+            for test in failed.iter() {
+                if let Some(logs) = buffer.get(test) {
+                    eprintln!("Logs for failed test '{test}':");
+                    eprintln!("{}", String::from_utf8_lossy(logs));
+                }
             }
         }
     }

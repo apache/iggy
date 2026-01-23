@@ -23,14 +23,12 @@ pub(crate) use crate::cli::common::help::{CLAP_INDENT, TestHelpCmd, USAGE_PREFIX
 use assert_cmd::assert::{Assert, OutputAssertExt};
 use assert_cmd::prelude::CommandCargoExt;
 use async_trait::async_trait;
-use iggy::clients::client::IggyClient;
-use iggy::prelude::defaults::*;
-use iggy::prelude::{Client, ClientWrapper, SystemClient, TcpClient, TcpClientConfig, UserClient};
-use integration::test_server::TestServer;
+use iggy::prelude::Client;
+use integration::harness::handle::ServerHandle;
+use integration::harness::{TestBinary, TestHarness, TestServerConfig};
 use std::fmt::{Display, Formatter, Result};
 use std::io::Write;
 use std::process::{Command, Stdio};
-use std::sync::Arc;
 
 pub(crate) enum TestIdentifier {
     Numeric,
@@ -82,33 +80,30 @@ pub(crate) trait IggyCmdTestCase {
     }
     fn verify_command(&self, command_state: Assert);
     async fn verify_server_state(&self, client: &dyn Client);
-    fn protocol(&self, server: &TestServer) -> Vec<String> {
+    fn protocol(&self, server: &ServerHandle) -> Vec<String> {
         vec![
             "--tcp-server-address".into(),
-            server.get_raw_tcp_addr().unwrap(),
+            server.raw_tcp_addr().unwrap(),
         ]
     }
 }
 
 pub(crate) struct IggyCmdTest {
-    server: TestServer,
-    client: IggyClient,
+    harness: TestHarness,
+    started: bool,
 }
 
 impl IggyCmdTest {
     pub(crate) fn new(start_server: bool) -> Self {
-        let mut server = TestServer::default();
-        if start_server {
-            server.start();
-        }
-        let tcp_client_config = TcpClientConfig {
-            server_address: server.get_raw_tcp_addr().unwrap(),
-            ..TcpClientConfig::default()
-        };
-        let client = ClientWrapper::Tcp(TcpClient::create(Arc::new(tcp_client_config)).unwrap());
-        let client = IggyClient::create(client, None, None);
+        let harness = TestHarness::builder()
+            .server(TestServerConfig::default())
+            .build()
+            .expect("Failed to build test harness");
 
-        Self { server, client }
+        Self {
+            harness,
+            started: start_server,
+        }
     }
 
     pub(crate) fn help_message() -> Self {
@@ -116,46 +111,33 @@ impl IggyCmdTest {
     }
 
     pub(crate) async fn setup(&mut self) {
-        self.client.connect().await.unwrap();
-
-        let ping_result = self.client.ping().await;
-
-        assert!(ping_result.is_ok());
-
-        let identity_info = self
-            .client
-            .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
-            .await
-            .unwrap();
-
-        assert_eq!(identity_info.user_id, 0);
+        if self.started && !self.harness.server().is_running() {
+            self.harness
+                .start()
+                .await
+                .expect("Failed to start test harness");
+        }
     }
 
     pub(crate) async fn execute_test(&mut self, mut test_case: impl IggyCmdTestCase) {
-        // Make sure server is started
         assert!(
-            self.server.is_started(),
+            self.harness.server().is_running(),
             "Server is not running, make sure it has been started with IggyCmdTest::setup()"
         );
-        // Prepare iggy server state before test
-        test_case.prepare_server_state(&self.client).await;
-        // Get iggy tool
+
+        let client = self.harness.tcp_root_client().await.unwrap();
+
+        test_case.prepare_server_state(&client).await;
+
         #[allow(deprecated)]
         let mut command = Command::cargo_bin("iggy").unwrap();
-        // Get command line arguments and environment variables from test case and execute command
+
         let command_args = test_case.get_command();
-        // Set environment variables for the command
         command.envs(command_args.get_env());
-        // Set a fixed terminal width for consistent help output formatting
         command.env("COLUMNS", "500");
-        // Set server address for the command - it's randomized for each test
-        command.args(test_case.protocol(&self.server));
-        // Set COLUMNS environment variable to 200 to avoid truncation of output
+        command.args(test_case.protocol(self.harness.server()));
         command.env("COLUMNS", "200");
 
-        // Print used environment variables and command with all arguments.
-        // By default, it will not be visible but once test is executed with
-        // --nocapture flag, it will be visible.
         println!(
             "Running: {} {} {}",
             command
@@ -193,30 +175,21 @@ impl IggyCmdTest {
                 .expect("Failed to read stdout")
                 .assert()
         } else {
-            // Execute test command
             command.assert()
         };
 
-        // Verify command output, exit code, etc in the test (if needed)
         test_case.verify_command(assert);
-        // Verify iggy server state after the test
-        test_case.verify_server_state(&self.client).await;
+        test_case.verify_server_state(&client).await;
     }
 
     pub(crate) async fn execute_test_for_help_command(&mut self, test_case: TestHelpCmd) {
-        // Get iggy tool
         #[allow(deprecated)]
         let mut command = Command::cargo_bin("iggy").unwrap();
-        // Get command line arguments and environment variables from test case and execute command
+
         let command_args = test_case.get_command();
-        // Set environment variables for the command
         command.envs(command_args.get_env());
-        // Set COLUMNS environment variable to 200 to avoid truncation of output
         command.env("COLUMNS", "200");
 
-        // Print used environment variables and command with all arguments.
-        // By default, it will not be visible but once test is executed with
-        // --nocapture flag, it will be visible.
         println!(
             "Running: {} {} {}",
             command
@@ -232,16 +205,13 @@ impl IggyCmdTest {
             command_args.get_opts_and_args().join(" ")
         );
 
-        // Execute test command
-
         let assert = command.args(command_args.get_opts_and_args()).assert();
-        // Verify command output, exit code, etc in the test (if needed)
         test_case.verify_command(assert);
     }
 
     #[cfg(not(target_os = "macos"))]
     pub(crate) fn get_tcp_server_address(&self) -> Option<String> {
-        self.server.get_raw_tcp_addr()
+        self.harness.server().raw_tcp_addr()
     }
 }
 

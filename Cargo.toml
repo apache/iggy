@@ -42,6 +42,7 @@ members = [
     "core/connectors/sources/postgres_source",
     "core/connectors/sources/random_source",
     "core/consensus",
+    "core/harness_derive",
     "core/integration",
     "core/journal",
     "core/message_bus",
@@ -135,6 +136,7 @@ figment = { version = "0.10.19", features = ["toml", "env"] }
 flume = "0.12.0"
 futures = "0.3.31"
 futures-util = "0.3.31"
+harness_derive = { path = "core/harness_derive" }
 human-repr = "1.1.0"
 humantime = "2.3.0"
 hwlocality = "1.0.0-alpha.11"
@@ -207,7 +209,7 @@ simd-json = { version = "0.17.0", features = ["serde_impl"] }
 slab = "0.4.11"
 strum = { version = "0.27.2", features = ["derive"] }
 strum_macros = "0.27.2"
-syn = { version = "2", features = ["full", "extra-traits"] }
+syn = { version = "2", features = ["full", "parsing", "extra-traits"] }
 sysinfo = "0.38.0"
 tempfile = "3.24.0"
 test-case = "3.3.1"

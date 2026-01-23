@@ -17,21 +17,59 @@
  * under the License.
  */
 
-use super::{
-    SINK_TABLE, TEST_MESSAGE_COUNT, TEST_STREAM, TEST_TOPIC, setup_sink, setup_sink_bytea,
-    setup_sink_json,
-};
-use crate::connectors::{TestMessage, create_test_messages};
 use bytes::Bytes;
 use iggy::prelude::IggyMessage;
+use iggy_binary_protocol::MessageClient;
+use iggy_common::{Identifier, Partitioning};
+use integration::harness::fixtures::{
+    PostgresSinkByteaFixture, PostgresSinkFixture, PostgresSinkJsonFixture,
+};
+use integration::harness::seeds;
+use integration::iggy_harness;
+// IggyClient is used in the function signature for macro parameter detection
+#[allow(unused_imports)]
+use iggy::prelude::IggyClient;
 
-#[tokio::test]
-async fn given_json_messages_sink_connector_should_store_as_bytea() {
-    let setup = setup_sink().await;
-    let client = setup.runtime.create_client().await;
-    let pool = setup.create_pool().await;
+const SINK_TABLE: &str = "iggy_messages";
+const TEST_STREAM: &str = "test_stream";
+const TEST_TOPIC: &str = "test_topic";
+const TEST_MESSAGE_COUNT: usize = 3;
 
-    setup.wait_for_table(&pool, SINK_TABLE).await;
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct TestMessage {
+    pub id: u64,
+    pub name: String,
+    pub count: u32,
+    pub amount: f64,
+    pub active: bool,
+    pub timestamp: i64,
+}
+
+fn create_test_messages(count: usize) -> Vec<TestMessage> {
+    let base_timestamp = iggy_common::IggyTimestamp::now().as_micros();
+    let one_day_micros: u64 = 24 * 60 * 60 * 1_000_000;
+    (1..=count)
+        .map(|i| TestMessage {
+            id: i as u64,
+            name: format!("user_{}", i - 1),
+            count: ((i - 1) * 10) as u32,
+            amount: (i - 1) as f64 * 99.99,
+            active: (i - 1) % 2 == 0,
+            timestamp: (base_timestamp + (i - 1) as u64 * one_day_micros) as i64,
+        })
+        .collect()
+}
+
+type SinkRow = (i64, String, String, Vec<u8>);
+type SinkJsonRow = (i64, serde_json::Value);
+
+#[iggy_harness(
+    server(connector(config_path = "tests/connectors/postgres/sink.toml")),
+    seed = seeds::connector_stream
+)]
+async fn json_messages_sink_stores_as_bytea(client: &IggyClient, fixture: PostgresSinkFixture) {
+    let pool = fixture.create_pool().await.expect("Failed to create pool");
+    fixture.wait_for_table(&pool, SINK_TABLE).await;
 
     let messages_data = create_test_messages(TEST_MESSAGE_COUNT);
     let mut messages: Vec<IggyMessage> = messages_data
@@ -47,9 +85,26 @@ async fn given_json_messages_sink_connector_should_store_as_bytea() {
         })
         .collect();
 
-    client.send_messages(&mut messages).await;
+    let stream_id: Identifier = TEST_STREAM.try_into().unwrap();
+    let topic_id: Identifier = TEST_TOPIC.try_into().unwrap();
 
-    let rows = setup.fetch_sink_rows(&pool, TEST_MESSAGE_COUNT).await;
+    client
+        .send_messages(
+            &stream_id,
+            &topic_id,
+            &Partitioning::partition_id(0),
+            &mut messages,
+        )
+        .await
+        .expect("Failed to send messages");
+
+    let query = format!(
+        "SELECT iggy_offset, iggy_stream, iggy_topic, payload FROM {} ORDER BY iggy_offset",
+        SINK_TABLE
+    );
+    let rows: Vec<SinkRow> = fixture
+        .fetch_rows_as(&pool, &query, TEST_MESSAGE_COUNT)
+        .await;
 
     assert_eq!(
         rows.len(),
@@ -68,13 +123,16 @@ async fn given_json_messages_sink_connector_should_store_as_bytea() {
     }
 }
 
-#[tokio::test]
-async fn given_binary_messages_sink_connector_should_store_as_bytea() {
-    let setup = setup_sink_bytea().await;
-    let client = setup.runtime.create_client().await;
-    let pool = setup.create_pool().await;
-
-    setup.wait_for_table(&pool, SINK_TABLE).await;
+#[iggy_harness(
+    server(connector(config_path = "tests/connectors/postgres/sink.toml")),
+    seed = seeds::connector_stream
+)]
+async fn binary_messages_sink_stores_as_bytea(
+    client: &IggyClient,
+    fixture: PostgresSinkByteaFixture,
+) {
+    let pool = fixture.create_pool().await.expect("Failed to create pool");
+    fixture.wait_for_table(&pool, SINK_TABLE).await;
 
     let raw_payloads: Vec<Vec<u8>> = vec![
         b"plain text message".to_vec(),
@@ -94,9 +152,26 @@ async fn given_binary_messages_sink_connector_should_store_as_bytea() {
         })
         .collect();
 
-    client.send_messages(&mut messages).await;
+    let stream_id: Identifier = TEST_STREAM.try_into().unwrap();
+    let topic_id: Identifier = TEST_TOPIC.try_into().unwrap();
 
-    let rows = setup.fetch_sink_rows(&pool, TEST_MESSAGE_COUNT).await;
+    client
+        .send_messages(
+            &stream_id,
+            &topic_id,
+            &Partitioning::partition_id(0),
+            &mut messages,
+        )
+        .await
+        .expect("Failed to send messages");
+
+    let query = format!(
+        "SELECT iggy_offset, iggy_stream, iggy_topic, payload FROM {} ORDER BY iggy_offset",
+        SINK_TABLE
+    );
+    let rows: Vec<SinkRow> = fixture
+        .fetch_rows_as(&pool, &query, TEST_MESSAGE_COUNT)
+        .await;
 
     assert_eq!(
         rows.len(),
@@ -110,13 +185,13 @@ async fn given_binary_messages_sink_connector_should_store_as_bytea() {
     }
 }
 
-#[tokio::test]
-async fn given_json_messages_sink_connector_should_store_as_jsonb() {
-    let setup = setup_sink_json().await;
-    let client = setup.runtime.create_client().await;
-    let pool = setup.create_pool().await;
-
-    setup.wait_for_table(&pool, SINK_TABLE).await;
+#[iggy_harness(
+    server(connector(config_path = "tests/connectors/postgres/sink.toml")),
+    seed = seeds::connector_stream
+)]
+async fn json_messages_sink_stores_as_jsonb(client: &IggyClient, fixture: PostgresSinkJsonFixture) {
+    let pool = fixture.create_pool().await.expect("Failed to create pool");
+    fixture.wait_for_table(&pool, SINK_TABLE).await;
 
     let json_payloads: Vec<serde_json::Value> = vec![
         serde_json::json!({"name": "Alice", "age": 30}),
@@ -137,9 +212,26 @@ async fn given_json_messages_sink_connector_should_store_as_jsonb() {
         })
         .collect();
 
-    client.send_messages(&mut messages).await;
+    let stream_id: Identifier = TEST_STREAM.try_into().unwrap();
+    let topic_id: Identifier = TEST_TOPIC.try_into().unwrap();
 
-    let rows = setup.fetch_sink_json_rows(&pool, TEST_MESSAGE_COUNT).await;
+    client
+        .send_messages(
+            &stream_id,
+            &topic_id,
+            &Partitioning::partition_id(0),
+            &mut messages,
+        )
+        .await
+        .expect("Failed to send messages");
+
+    let query = format!(
+        "SELECT iggy_offset, payload FROM {} ORDER BY iggy_offset",
+        SINK_TABLE
+    );
+    let rows: Vec<SinkJsonRow> = fixture
+        .fetch_rows_as(&pool, &query, TEST_MESSAGE_COUNT)
+        .await;
 
     assert_eq!(
         rows.len(),
