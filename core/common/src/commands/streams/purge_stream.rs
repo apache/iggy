@@ -28,7 +28,7 @@ use std::fmt::Display;
 /// `PurgeStream` command is used to purge stream data (all the messages from its topics).
 /// It has additional payload:
 /// - `stream_id` - unique stream ID (numeric or name).
-#[derive(Debug, Serialize, Deserialize, PartialEq, Default)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Default, Clone)]
 pub struct PurgeStream {
     /// Unique stream ID (numeric or name).
     #[serde(skip)]

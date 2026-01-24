@@ -142,6 +142,7 @@ iggy_connector_sdk = { path = "core/connectors/sdk", version = "0.1.1-edge.1" }
 integration = { path = "core/integration" }
 keyring = { version = "3.6.3", features = ["sync-secret-service", "vendored"] }
 lazy_static = "1.5.0"
+left-right = "0.11"
 log = "0.4.29"
 metadata = { path = "core/metadata" }
 mimalloc = "0.1"

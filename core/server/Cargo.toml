@@ -71,7 +71,7 @@ hash32 = "1.0.0"
 human-repr = { workspace = true }
 iggy_common = { workspace = true }
 jsonwebtoken = { version = "10.2.0", features = ["rust_crypto"] }
-left-right = "0.11"
+left-right = { workspace = true }
 lending-iterator = "0.1.7"
 metadata = { workspace = true }
 mimalloc = { workspace = true, optional = true }

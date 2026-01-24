@@ -31,7 +31,7 @@ use std::fmt::Display;
 /// - `stream_id` - unique stream ID (numeric or name).
 /// - `topic_id` - unique topic ID (numeric or name).
 /// - `group_id` - unique consumer group ID (numeric or name).
-#[derive(Debug, Serialize, Deserialize, PartialEq, Default)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Default, Clone)]
 pub struct DeleteConsumerGroup {
     /// Unique stream ID (numeric or name).
     #[serde(skip)]

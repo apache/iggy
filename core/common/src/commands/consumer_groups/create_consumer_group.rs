@@ -33,7 +33,7 @@ use std::str::from_utf8;
 /// - `stream_id` - unique stream ID (numeric or name).
 /// - `topic_id` - unique topic ID (numeric or name).
 /// - `name` - unique consumer group name, max length is 255 characters.
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 pub struct CreateConsumerGroup {
     /// Unique stream ID (numeric or name).
     #[serde(skip)]

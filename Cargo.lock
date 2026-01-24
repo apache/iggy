@@ -5676,11 +5676,12 @@ name = "metadata"
 version = "0.1.0"
 dependencies = [
  "ahash 0.8.12",
- "bytes",
  "consensus",
  "iggy_common",
  "journal",
+ "left-right",
  "message_bus",
+ "paste",
  "slab",
  "tracing",
 ]

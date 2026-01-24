@@ -22,6 +22,27 @@ pub trait Project<T> {
     fn project(self, consensus: &Self::Consensus) -> T;
 }
 
+pub trait Pipeline {
+    type Message;
+    type Entry;
+
+    fn push_message(&mut self, message: Self::Message);
+
+    fn pop_message(&mut self) -> Option<Self::Entry>;
+
+    fn clear(&mut self);
+
+    fn message_by_op_mut(&mut self, op: u64) -> Option<&mut Self::Entry>;
+
+    fn message_by_op_and_checksum(&mut self, op: u64, checksum: u128) -> Option<&mut Self::Entry>;
+
+    fn is_full(&self) -> bool;
+
+    fn is_empty(&self) -> bool;
+
+    fn verify(&self);
+}
+
 pub trait Consensus {
     type MessageBus: MessageBus;
     // I am wondering, whether we should create a dedicated trait for cloning, so it's explicit that we do ref counting.
@@ -29,6 +50,7 @@ pub trait Consensus {
     type ReplicateMessage: Project<Self::AckMessage, Consensus = Self> + Clone;
     type AckMessage;
     type Sequencer: Sequencer;
+    type Pipeline: Pipeline<Message = Self::ReplicateMessage>;
 
     fn pipeline_message(&self, message: Self::ReplicateMessage);
     fn verify_pipeline(&self);
