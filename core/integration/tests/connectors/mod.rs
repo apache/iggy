@@ -36,6 +36,7 @@ use std::collections::HashMap;
 mod api;
 mod http_config_provider;
 mod postgres;
+mod quickwit;
 mod random;
 
 pub const DEFAULT_TEST_STREAM: &str = "test_stream";
