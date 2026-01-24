@@ -28,15 +28,26 @@ use std::time::Duration;
 use tokio::fs;
 use tokio::time::{sleep, timeout};
 
-pub const MAX_SINGLE_LOG_SIZE: IggyByteSize = IggyByteSize::new(1_000_000); //1MB
-pub const MAX_TOTAL_LOG_SIZE: IggyByteSize = IggyByteSize::new(3_000_000); //3MB
-pub const LOG_ROTATION_CHECK_INTERVAL: IggyDuration = IggyDuration::ONE_SECOND;
 const OPERATION_TIMEOUT_SECS: u64 = 10;
-const OPERATION_LOOP_COUNT: usize = 2500;
+const OPERATION_LOOP_COUNT: usize = 500;
 const FROM_BYTES_TO_KB: u64 = 1000;
 const IGGY_LOG_BASE_NAME: &str = "iggy-server.log";
 
-pub async fn run(client_factory: &dyn ClientFactory, log_dir: &str) {
+#[derive(Debug)]
+pub struct LogRotationTestConfig {
+    pub name: String,
+    pub max_single_log_size: IggyByteSize,
+    pub max_total_log_size: IggyByteSize,
+    pub rotation_check_interval: IggyDuration,
+    pub retention: IggyDuration,
+}
+
+pub async fn run(
+    client_factory: &dyn ClientFactory,
+    log_dir: &str,
+    present_log_config: LogRotationTestConfig,
+) {
+    let present_log_test_title = present_log_config.name.clone();
     let log_path = Path::new(log_dir);
     assert!(
         log_path.exists() && log_path.is_dir(),
@@ -57,17 +68,46 @@ pub async fn run(client_factory: &dyn ClientFactory, log_dir: &str) {
         generator_result.unwrap_err()
     );
 
-    nocapture_observer(log_path).await;
-    sleep(LOG_ROTATION_CHECK_INTERVAL.get_duration()).await;
-    let rotation_result = validate_log_rotation_rules(log_path).await;
+    nocapture_observer(log_path, &present_log_test_title).await;
+    sleep(present_log_config.rotation_check_interval.get_duration()).await;
+    let rotation_result = validate_log_rotation_rules(log_path, present_log_config).await;
     assert!(
         rotation_result.is_ok(),
         "failed::rotation_check => {}",
         rotation_result.unwrap_err()
     );
-    nocapture_observer(log_path).await;
+    nocapture_observer(log_path, &present_log_test_title).await;
+    eprintln!(
+        "\n [Passed] <-> {:<25} <{:->45}>\n",
+        present_log_test_title, ""
+    );
 }
 
+pub fn get_configurations() -> Vec<LogRotationTestConfig> {
+    vec![
+        LogRotationTestConfig {
+            name: "log_regular_rotation".to_string(),
+            max_single_log_size: IggyByteSize::new(200_000),
+            max_total_log_size: IggyByteSize::new(800_000),
+            rotation_check_interval: IggyDuration::ONE_SECOND,
+            retention: IggyDuration::new_from_secs(30),
+        },
+        LogRotationTestConfig {
+            name: "log_unlimited_size".to_string(),
+            max_single_log_size: IggyByteSize::new(0),
+            max_total_log_size: IggyByteSize::new(800_000),
+            rotation_check_interval: IggyDuration::ONE_SECOND,
+            retention: IggyDuration::new_from_secs(30),
+        },
+        LogRotationTestConfig {
+            name: "log_unlimited_archives".to_string(),
+            max_single_log_size: IggyByteSize::new(200_000),
+            max_total_log_size: IggyByteSize::new(0),
+            rotation_check_interval: IggyDuration::ONE_SECOND,
+            retention: IggyDuration::new_from_secs(30),
+        },
+    ]
+}
 async fn init_valid_client(client_factory: &dyn ClientFactory) -> Result<IggyClient, String> {
     let operation_timeout = IggyDuration::new(Duration::from_secs(OPERATION_TIMEOUT_SECS));
     let client_wrapper = timeout(
@@ -125,7 +165,10 @@ async fn generate_enough_logs(client: &IggyClient) -> Result<(), String> {
     Ok(())
 }
 
-async fn validate_log_rotation_rules(log_dir: &Path) -> Result<(), String> {
+async fn validate_log_rotation_rules(
+    log_dir: &Path,
+    present_log_config: LogRotationTestConfig,
+) -> Result<(), String> {
     let mut dir_entries = fs::read_dir(log_dir).await.map_err(|e| {
         format!(
             "Failed to read log directory '{log_dir}': {e}",
@@ -165,40 +208,56 @@ async fn validate_log_rotation_rules(log_dir: &Path) -> Result<(), String> {
         ));
     }
 
+    // logger.rs => tracing_appender::non_blocking(file_appender);
+    // The delay in log writing in Iggy mainly depends on the processing speed
+    // of background threads and the operating system's I/O scheduling,  which
+    // means that the actual size of written logs may be slightly larger  than
+    // expected. So there ignores tiny minor overflow by comparing integer  KB
+    // values instead of exact bytes.
+
     let mut total_log_size = IggyByteSize::new(0);
-    let max_single_kb = MAX_SINGLE_LOG_SIZE.as_bytes_u64() / FROM_BYTES_TO_KB;
-    let max_total_kb = MAX_TOTAL_LOG_SIZE.as_bytes_u64() / FROM_BYTES_TO_KB;
+    let max_single_kb = present_log_config.max_single_log_size.as_bytes_u64() / FROM_BYTES_TO_KB;
+    let max_total_kb = present_log_config.max_total_log_size.as_bytes_u64() / FROM_BYTES_TO_KB;
 
-    for log_file in valid_log_files {
-        let file_metadata = fs::metadata(&log_file).await.map_err(|e| {
-            format!(
-                "Failed to get metadata for file '{}': {}",
-                log_file.display(),
-                e
-            )
-        })?;
-
-        let file_size_bytes = file_metadata.len();
-
-        // logger.rs => tracing_appender::non_blocking(file_appender);
-        // The delay in log writing in Iggy mainly depends on the processing speed
-        // of background threads and the operating system's I/O scheduling,  which
-        // means that the actual size of written logs may be slightly larger  than
-        // expected. So there ignores tiny minor overflow by comparing integer  KB
-        // values instead of exact bytes.
-        let current_single_kb = file_size_bytes / FROM_BYTES_TO_KB;
-        if current_single_kb > max_single_kb {
+    if max_single_kb == 0 && valid_log_files.len() > 1 {
+        return Err(format!(
+            "Log size should be unlimited if `max_file_size` is set to 0, found {} files.",
+            valid_log_files.len()
+        ));
+    } else if max_total_kb == 0 && max_single_kb != 0 {
+        if valid_log_files.len() as u64 <= 1 {
             return Err(format!(
-                "Single log file exceeds maximum allowed size: '{}'",
-                log_file.display()
+                "Archives should be unlimited if `max_total_size` is set to 0, found {} files.",
+                valid_log_files.len(),
             ));
         }
+    } else {
+        for log_file in valid_log_files {
+            let file_metadata = fs::metadata(&log_file).await.map_err(|e| {
+                format!(
+                    "Failed to get metadata for file '{}': {}",
+                    log_file.display(),
+                    e
+                )
+            })?;
 
-        total_log_size += IggyByteSize::new(file_size_bytes);
+            let file_size_bytes = file_metadata.len();
+            if max_single_kb != 0 {
+                let current_single_kb = file_size_bytes / FROM_BYTES_TO_KB;
+                if current_single_kb > max_single_kb {
+                    return Err(format!(
+                        "Single log file exceeds maximum allowed size: '{}'",
+                        log_file.display()
+                    ));
+                }
+            }
+
+            total_log_size += IggyByteSize::new(file_size_bytes);
+        }
     }
 
     let current_total_kb = total_log_size.as_bytes_u64() / FROM_BYTES_TO_KB;
-    if current_total_kb > max_total_kb {
+    if max_total_kb != 0 && max_single_kb != 0 && current_total_kb > max_total_kb {
         return Err(format!(
             "Total log size exceeds maximum allowed size: '{}'",
             log_dir.display()
@@ -222,22 +281,21 @@ fn is_valid_iggy_log_file(file_name: &str) -> bool {
 }
 
 /// Solely for manual && direct observation of file status to reduce debugging overhead.
-async fn nocapture_observer(log_path: &Path) -> () {
-    println!(
-        "\n{:>4} Size <-> Path && server::specific::log_rotation_should_launch::nocapture_observer",
-        ""
+async fn nocapture_observer(log_path: &Path, title: &str) -> () {
+    eprintln!(
+        "\n{:>4} Size <-> Path && server::specific::log_rotation_be_valid::{}",
+        "", title,
     );
     let mut dir_entries = fs::read_dir(log_path).await.unwrap();
     while let Some(entry) = dir_entries.next_entry().await.unwrap() {
         let file_path = entry.path();
         if file_path.is_file() {
             let meta = fs::metadata(&file_path).await.unwrap();
-            println!(
+            eprintln!(
                 "{:>6} KB <-> {:<50}",
                 meta.len() / FROM_BYTES_TO_KB,
                 file_path.display()
             );
         }
     }
-    println!();
 }
