@@ -18,9 +18,9 @@
  */
 
 use crate::server::scenarios::{
-    cross_protocol_pat_scenario, delete_segments_scenario, message_size_scenario,
-    segment_rotation_race_scenario, single_message_per_batch_scenario, tcp_tls_scenario,
-    websocket_tls_scenario, log_rotation_scenario,
+    cross_protocol_pat_scenario, delete_segments_scenario, log_rotation_scenario,
+    message_size_scenario, segment_rotation_race_scenario, single_message_per_batch_scenario,
+    tcp_tls_scenario, websocket_tls_scenario,
 };
 use iggy::prelude::*;
 use integration::{
