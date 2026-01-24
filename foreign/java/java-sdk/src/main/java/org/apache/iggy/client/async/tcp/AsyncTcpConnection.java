@@ -49,7 +49,6 @@ import java.util.Queue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.stream.Collectors;
 
 /**
  * Async TCP connection using Netty for non-blocking I/O.
@@ -168,11 +167,10 @@ public class AsyncTcpConnection {
         return this.poolMetrics;
     }
 
-
-     /**
+    /**
      * BroadCast Command to each connection
      * (Mainly for login so that each connection in the pool is Authenticated)
-     * Returns the result of the LAST connection's execution, allowing the caller 
+     * Returns the result of the LAST connection's execution, allowing the caller
      * to treat this like a single request.
      */
     public CompletableFuture<ByteBuf> broadcastAsync(int commandCode, ByteBuf payload) {
@@ -181,20 +179,18 @@ public class AsyncTcpConnection {
         }
         if (channelPool == null) {
             return CompletableFuture.failedFuture(new IllegalStateException("Client not connected call connect first"));
-        } 
+        }
         List<CompletableFuture<ByteBuf>> lastFuture = new ArrayList<>();
 
         int poolSize = poolConfig.getMaxConnections();
 
         // 1. Drain the Pool (Acquire all connections)
         for (int i = 0; i < poolSize; i++) {
-         lastFuture.add(sendAsync(commandCode, payload.retainedDuplicate()));
+            lastFuture.add(sendAsync(commandCode, payload.retainedDuplicate()));
         }
         // 2. Return the last Future (caller can treat this like a single request)
         return lastFuture.get(lastFuture.size() - 1);
-
     }
-
 
     /**
      * Sends a command asynchronously and returns the response.

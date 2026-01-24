@@ -60,15 +60,17 @@ public class UsersTcpClient implements UsersClient {
 
         log.debug("Logging in user: {}", username);
 
-        return connection.broadcastAsync(CommandCode.User.LOGIN.getValue(), payload).thenApply(response -> {
-            try {
-                // Read the user ID from response (4-byte unsigned int LE)
-                var userId = response.readUnsignedIntLE();
-                return new IdentityInfo(userId, Optional.empty());
-            } finally {
-                response.release();
-            }
-        });
+        return connection
+                .broadcastAsync(CommandCode.User.LOGIN.getValue(), payload)
+                .thenApply(response -> {
+                    try {
+                        // Read the user ID from response (4-byte unsigned int LE)
+                        var userId = response.readUnsignedIntLE();
+                        return new IdentityInfo(userId, Optional.empty());
+                    } finally {
+                        response.release();
+                    }
+                });
     }
 
     @Override
@@ -77,9 +79,11 @@ public class UsersTcpClient implements UsersClient {
 
         log.debug("Logging out");
 
-        return connection.broadcastAsync(CommandCode.User.LOGOUT.getValue(), payload).thenAccept(response -> {
-            response.release();
-            log.debug("Logged out successfully");
-        });
+        return connection
+                .broadcastAsync(CommandCode.User.LOGOUT.getValue(), payload)
+                .thenAccept(response -> {
+                    response.release();
+                    log.debug("Logged out successfully");
+                });
     }
 }
