@@ -819,12 +819,21 @@ mod tests {
 
     #[test]
     fn test_calculate_max_files() {
-        assert_eq!(Logging::calculate_max_files(0, 100), 1);
-        assert_eq!(Logging::calculate_max_files(100, 0), 10);
+        assert_eq!(
+            Logging::calculate_max_files(100, 0),
+            1 // Enable unlimited size of single log, the value won't be used actually
+        );
+        assert_eq!(
+            Logging::calculate_max_files(0, 100),
+            ONE_HUNDRED_THOUSAND as usize // Allow an unlimited number of archived logs
+        );
+        assert_eq!(
+            Logging::calculate_max_files(ONE_HUNDRED_THOUSAND * 10, 1),
+            ONE_HUNDRED_THOUSAND as usize // Result should be limited to ONE_HUNDRED_THOUSAND by clamp
+        );
         assert_eq!(Logging::calculate_max_files(1000, 100), 10);
         assert_eq!(Logging::calculate_max_files(500, 100), 5);
         assert_eq!(Logging::calculate_max_files(2000, 100), 20);
-        assert_eq!(Logging::calculate_max_files(1000000, 1), 1000);
         assert_eq!(Logging::calculate_max_files(50, 100), 1);
     }
 
