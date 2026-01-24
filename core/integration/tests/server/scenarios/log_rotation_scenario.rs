@@ -51,35 +51,37 @@ pub async fn run(
     let log_path = Path::new(log_dir);
     assert!(
         log_path.exists() && log_path.is_dir(),
-        "failed::no_such_directory => {log_dir}"
+        "failed::no_such_directory => {log_dir}",
     );
 
     let client = init_valid_client(client_factory).await;
     assert!(
         client.is_ok(),
-        "failed::client_initialize => {}",
-        client.unwrap_err()
+        "failed::client_initialize => {:?}",
+        client.as_ref().err(),
     );
 
     let generator_result = generate_enough_logs(client.as_ref().unwrap()).await;
     assert!(
         generator_result.is_ok(),
-        "failed::generate_logs => {}",
-        generator_result.unwrap_err()
+        "failed::generate_logs => {:?}",
+        generator_result.as_ref().err(),
     );
 
     nocapture_observer(log_path, &present_log_test_title).await;
     sleep(present_log_config.rotation_check_interval.get_duration()).await;
+
     let rotation_result = validate_log_rotation_rules(log_path, present_log_config).await;
     assert!(
         rotation_result.is_ok(),
-        "failed::rotation_check => {}",
-        rotation_result.unwrap_err()
+        "failed::rotation_check => {:?}",
+        rotation_result.as_ref().err(),
     );
+
     nocapture_observer(log_path, &present_log_test_title).await;
     eprintln!(
         "\n [Passed] <-> {:<25} <{:->45}>\n",
-        present_log_test_title, ""
+        present_log_test_title, "",
     );
 }
 
@@ -106,8 +108,16 @@ pub fn get_configurations() -> Vec<LogRotationTestConfig> {
             rotation_check_interval: IggyDuration::ONE_SECOND,
             retention: IggyDuration::new_from_secs(30),
         },
+        LogRotationTestConfig {
+            name: "log_special_scenario".to_string(),
+            max_single_log_size: IggyByteSize::new(0),
+            max_total_log_size: IggyByteSize::new(0),
+            rotation_check_interval: IggyDuration::ONE_SECOND,
+            retention: IggyDuration::new_from_secs(30),
+        },
     ]
 }
+
 async fn init_valid_client(client_factory: &dyn ClientFactory) -> Result<IggyClient, String> {
     let operation_timeout = IggyDuration::new(Duration::from_secs(OPERATION_TIMEOUT_SECS));
     let client_wrapper = timeout(
