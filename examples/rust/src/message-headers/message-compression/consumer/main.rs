@@ -16,63 +16,73 @@
  * under the License.
  */
 
-use anyhow::Result;
+// The compression and decompression utilities are shared between the producer and consumer compression examples.
+// Hence, we import them here.
+#[path = "../codec.rs"]
+mod codec;
+use codec::{CONSUMER_NAME, Codec, NUM_MESSAGES, STREAM_NAME, TOPIC_NAME};
+
+use bytes::Bytes;
+use futures_util::stream::StreamExt;
 use iggy::prelude::*;
-use iggy_examples::shared::args::Args;
-use iggy_examples::shared::messages::*;
-use iggy_examples::shared::system;
-use std::error::Error;
-use std::sync::Arc;
-use tracing::{info, warn};
-use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{EnvFilter, Registry};
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
-    let args = Args::parse_with_defaults("message-headers-consumer");
-    Registry::default()
-        .with(tracing_subscriber::fmt::layer())
-        .with(EnvFilter::try_from_default_env().unwrap_or(EnvFilter::new("INFO")))
-        .init();
-    info!(
-        "Message headers consumer has started, selected transport: {}",
-        args.transport
-    );
-    let client_provider_config = Arc::new(ClientProviderConfig::from_args(args.to_sdk_args())?);
-    let client = client_provider::get_raw_client(client_provider_config, false).await?;
-    let client = IggyClient::new(client);
+async fn main() -> Result<(), IggyError> {
+    let client = IggyClientBuilder::new()
+        .with_tcp()
+        .with_server_address("127.0.0.1:8090".to_string())
+        .build()?;
+
     client.connect().await?;
-    system::init_by_consumer(&args, &client).await;
-    system::consume_messages(&args, &client, &handle_message).await
+
+    client
+        .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+        .await?;
+
+    let mut consumer = client
+        .consumer(CONSUMER_NAME, STREAM_NAME, TOPIC_NAME, 0)?
+        .build();
+
+    consumer.init().await?;
+
+    let mut consumed_messages = 0;
+    while let Some(message) = consumer.next().await {
+        let mut received_message = message.expect("Message was not received from server.");
+        handle_payload_compression(&mut received_message)?;
+        consumed_messages += 1;
+        println!(
+            "Message payload was decompressed and reads: {:?}",
+            received_message.message.payload
+        );
+        if consumed_messages == NUM_MESSAGES {
+            return Ok(());
+        }
+    }
+
+    Ok(())
 }
 
-fn handle_message(message: &IggyMessage) -> Result<(), Box<dyn Error>> {
-    // The payload can be of any type as it is a raw byte array. In this case it's a JSON string.
-    let payload = std::str::from_utf8(&message.payload)?;
-    // The message type is stored in the custom message header.
-    let header_key = HeaderKey::new("message_type").unwrap();
-    let headers_map = message.user_headers_map()?.unwrap();
-    let message_type = headers_map.get(&header_key).unwrap().as_str()?;
-    info!(
-        "Handling message type: {} at offset: {}...",
-        message_type, message.header.offset
-    );
-    match message_type {
-        ORDER_CREATED_TYPE => {
-            let order_created = serde_json::from_str::<OrderCreated>(payload)?;
-            info!("{:#?}", order_created);
-        }
-        ORDER_CONFIRMED_TYPE => {
-            let order_confirmed = serde_json::from_str::<OrderConfirmed>(payload)?;
-            info!("{:#?}", order_confirmed);
-        }
-        ORDER_REJECTED_TYPE => {
-            let order_rejected = serde_json::from_str::<OrderRejected>(payload)?;
-            info!("{:#?}", order_rejected);
-        }
-        _ => {
-            warn!("Received unknown message type: {}", message_type);
+fn handle_payload_compression(msg: &mut ReceivedMessage) -> Result<(), IggyError> {
+    // check if the message payload is compressed by inspecting the user-header
+    if let Ok(Some(algorithm)) = msg.message.get_user_header(&Codec::header_key()) {
+        // setup the codec with the compression algorithm defined in the user-header (value)
+        let codec = Codec::from_header_value(&algorithm);
+
+        // decompress the payload and update the payload length
+        let decompressed_payload = codec.decompress(&msg.message.payload)?;
+        msg.message.payload = Bytes::from(decompressed_payload);
+        msg.message.header.payload_length = msg.message.payload.len() as u32;
+
+        // remove the compression header since payload is now decompressed
+        if let Ok(Some(mut headers_map)) = msg.message.user_headers_map() {
+            headers_map.remove(&Codec::header_key());
+            let headers_bytes = headers_map.to_bytes();
+            msg.message.header.user_headers_length = headers_bytes.len() as u32;
+            msg.message.user_headers = if headers_map.is_empty() {
+                None
+            } else {
+                Some(headers_bytes)
+            };
         }
     }
     Ok(())

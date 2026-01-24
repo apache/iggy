@@ -15,7 +15,7 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-use bytes::Bytes;
+
 /// In the following couple of lines, we will write a small program, that connects and sends a couple of messages to an Iggy server.
 /// The messages are then consumed by another small program for which the code sits in ` ../consumer/main.rs`.
 ///
@@ -32,17 +32,15 @@ use bytes::Bytes;
 /// 4. Compress payloads
 /// 5. Transform payloads into Iggy messages to be send to the server
 /// 6. Send Iggy messages to the server
-use iggy::prelude::*;
-use lz4_flex::frame::{FrameDecoder, FrameEncoder};
-use std::collections::HashMap;
-use std::fmt::{Display, Formatter};
-use std::io::{Read, Write};
-use std::str::FromStr;
+// The compression and decompression utilities are shared between the producer and consumer compression examples.
+// Hence, we import them here.
+#[path = "../codec.rs"]
+mod codec;
 
-const STREAM: &str = "compression_stream";
-const TOPIC: &str = "compression_topic";
-const NUM_MESSAGES: u32 = 1000;
-const COMPRESSION_HEADER: &str = "iggy-compression";
+use bytes::Bytes;
+use codec::{Codec, NUM_MESSAGES, STREAM_NAME, TOPIC_NAME};
+use iggy::prelude::*;
+use std::collections::HashMap;
 
 /// Since we are communicating with a server, a lot of network I/O operations will happen.
 /// We do not want to block ourselves while waiting for responses until we can do the next bit of work.
@@ -61,14 +59,14 @@ async fn main() -> Result<(), IggyError> {
         .await?;
 
     client
-        .create_stream(STREAM)
+        .create_stream(STREAM_NAME)
         .await
         .expect("Stream was NOT created! Start a fresh server to run this example.");
 
     client
         .create_topic(
-            &Identifier::named(STREAM).unwrap(),
-            TOPIC,
+            &Identifier::named(STREAM_NAME).unwrap(),
+            TOPIC_NAME,
             1,
             CompressionAlgorithm::None, // NOTE: This configures the compression on the server, not the actual messages in transit!
             None,
@@ -79,11 +77,9 @@ async fn main() -> Result<(), IggyError> {
         .expect("Topic was NOT created! Start a fresh server to run this example.");
 
     // Uncompressed messages
-    let compressor = PayloadCompression::Lz4;
-    let key =
-        HeaderKey::from_str(COMPRESSION_HEADER).expect("Compression header should be parseable.");
-    let value = HeaderValue::from_str(&compressor.to_string())
-        .expect("Compression algorithm should be parseable.");
+    let codec = Codec::Lz4;
+    let key = Codec::header_key();
+    let value = codec.to_header_value();
     let compression_headers = HashMap::from([(key, value)]);
 
     let mut messages = Vec::new();
@@ -99,7 +95,7 @@ async fn main() -> Result<(), IggyError> {
             i % 120
         );
         let payload = Bytes::from(payload);
-        let compressed_payload = compressor
+        let compressed_payload = codec
             .compress(&payload)
             .expect("Payload should be compressable.");
         let compressed_bytes = Bytes::from(compressed_payload);
@@ -111,55 +107,10 @@ async fn main() -> Result<(), IggyError> {
             .expect("IggyMessage should be buildable.");
         messages.push(msg);
     }
-    let producer = client.producer(STREAM, TOPIC)?.build();
+    let producer = client.producer(STREAM_NAME, TOPIC_NAME)?.build();
     producer
         .send(messages)
         .await
         .expect("Message sending failed.");
     Ok(())
-}
-
-enum PayloadCompression {
-    None,
-    Lz4,
-}
-
-impl Display for PayloadCompression {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            PayloadCompression::None => write!(f, "none"),
-            PayloadCompression::Lz4 => write!(f, "lz4"),
-        }
-    }
-}
-
-impl PayloadCompression {
-    pub fn compress(&self, data: &[u8]) -> Result<Vec<u8>, IggyError> {
-        match self {
-            PayloadCompression::None => Ok(data.to_vec()),
-            PayloadCompression::Lz4 => {
-                let mut compressed_data = Vec::new();
-                let mut encoder = FrameEncoder::new(&mut compressed_data);
-                encoder
-                    .write_all(data)
-                    .expect("Cannot write into buffer using Lz4 compression.");
-                encoder.finish().expect("Cannot finish Lz4 compression.");
-                Ok(compressed_data)
-            }
-        }
-    }
-
-    pub fn decompress(&self, data: &[u8]) -> Result<Vec<u8>, IggyError> {
-        match self {
-            PayloadCompression::None => Ok(data.to_vec()),
-            PayloadCompression::Lz4 => {
-                let mut decoder = FrameDecoder::new(data);
-                let mut decompressed_data = Vec::new();
-                decoder
-                    .read_to_end(&mut decompressed_data)
-                    .expect("Cannot decode message payload using Lz4.");
-                Ok(decompressed_data)
-            }
-        }
-    }
 }
