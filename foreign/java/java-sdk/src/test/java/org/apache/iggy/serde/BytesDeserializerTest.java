@@ -32,7 +32,29 @@ import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
 import java.util.HexFormat;
 
-import static org.apache.iggy.serde.BytesDeserializer.*;
+import static org.apache.iggy.serde.BytesDeserializer.readClientInfo;
+import static org.apache.iggy.serde.BytesDeserializer.readConsumerGroup;
+import static org.apache.iggy.serde.BytesDeserializer.readConsumerGroupDetails;
+import static org.apache.iggy.serde.BytesDeserializer.readConsumerGroupInfo;
+import static org.apache.iggy.serde.BytesDeserializer.readConsumerGroupMember;
+import static org.apache.iggy.serde.BytesDeserializer.readConsumerOffsetInfo;
+import static org.apache.iggy.serde.BytesDeserializer.readGlobalPermissions;
+import static org.apache.iggy.serde.BytesDeserializer.readPartition;
+import static org.apache.iggy.serde.BytesDeserializer.readPermissions;
+import static org.apache.iggy.serde.BytesDeserializer.readPersonalAccessTokenInfo;
+import static org.apache.iggy.serde.BytesDeserializer.readPolledMessage;
+import static org.apache.iggy.serde.BytesDeserializer.readPolledMessages;
+import static org.apache.iggy.serde.BytesDeserializer.readRawPersonalAccessToken;
+import static org.apache.iggy.serde.BytesDeserializer.readStats;
+import static org.apache.iggy.serde.BytesDeserializer.readStreamBase;
+import static org.apache.iggy.serde.BytesDeserializer.readStreamDetails;
+import static org.apache.iggy.serde.BytesDeserializer.readStreamPermissions;
+import static org.apache.iggy.serde.BytesDeserializer.readTopic;
+import static org.apache.iggy.serde.BytesDeserializer.readTopicDetails;
+import static org.apache.iggy.serde.BytesDeserializer.readTopicPermissions;
+import static org.apache.iggy.serde.BytesDeserializer.readU64AsBigInteger;
+import static org.apache.iggy.serde.BytesDeserializer.readUserInfo;
+import static org.apache.iggy.serde.BytesDeserializer.readUserInfoDetails;
 import static org.assertj.core.api.Assertions.assertThat;
 
 class BytesDeserializerTest {
@@ -551,15 +573,15 @@ class BytesDeserializerTest {
         void shouldDeserializeGlobalPermissions() {
             // given
             ByteBuf buffer = Unpooled.buffer();
-            buffer.writeBoolean(true);  // manageServers
+            buffer.writeBoolean(true); // manageServers
             buffer.writeBoolean(false); // readServers
-            buffer.writeBoolean(true);  // manageUsers
+            buffer.writeBoolean(true); // manageUsers
             buffer.writeBoolean(false); // readUsers
-            buffer.writeBoolean(true);  // manageStreams
+            buffer.writeBoolean(true); // manageStreams
             buffer.writeBoolean(false); // readStreams
-            buffer.writeBoolean(true);  // manageTopics
+            buffer.writeBoolean(true); // manageTopics
             buffer.writeBoolean(false); // readTopics
-            buffer.writeBoolean(true);  // pollMessages
+            buffer.writeBoolean(true); // pollMessages
             buffer.writeBoolean(false); // sendMessages
 
             // when

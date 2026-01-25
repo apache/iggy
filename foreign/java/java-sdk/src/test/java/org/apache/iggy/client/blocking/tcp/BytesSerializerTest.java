@@ -509,8 +509,8 @@ class BytesSerializerTest {
                     BigInteger.valueOf(1000), // timestamp
                     BigInteger.valueOf(1000), // originTimestamp
                     0L, // userHeadersLength
-                    5L  // payloadLength
-            );
+                    5L // payloadLength
+                    );
             byte[] payload = "hello".getBytes();
             var message = new Message(header, payload, new HashMap<>());
 
@@ -540,7 +540,7 @@ class BytesSerializerTest {
                     BigInteger.valueOf(1000),
                     (long) userHeadersLength,
                     3L // "abc".length()
-            );
+                    );
             byte[] payload = "abc".getBytes();
             var message = new Message(header, payload, userHeaders);
 
@@ -567,7 +567,7 @@ class BytesSerializerTest {
                     BigInteger.valueOf(1999), // originTimestamp
                     10L, // userHeadersLength
                     100L // payloadLength
-            );
+                    );
 
             // when
             ByteBuf result = BytesSerializer.toBytes(header);
@@ -597,26 +597,23 @@ class BytesSerializerTest {
         @Test
         void shouldSerializeGlobalPermissions() {
             // given
-            var permissions = new GlobalPermissions(
-                    true, false, true, false, true,
-                    false, true, false, true, false
-            );
+            var permissions = new GlobalPermissions(true, false, true, false, true, false, true, false, true, false);
 
             // when
             ByteBuf result = BytesSerializer.toBytes(permissions);
 
             // then
             assertThat(result.readableBytes()).isEqualTo(10); // 10 booleans
-            assertThat(result.readBoolean()).isTrue();   // manageServers
-            assertThat(result.readBoolean()).isFalse();  // readServers
-            assertThat(result.readBoolean()).isTrue();   // manageUsers
-            assertThat(result.readBoolean()).isFalse();  // readUsers
-            assertThat(result.readBoolean()).isTrue();   // manageStreams
-            assertThat(result.readBoolean()).isFalse();  // readStreams
-            assertThat(result.readBoolean()).isTrue();   // manageTopics
-            assertThat(result.readBoolean()).isFalse();  // readTopics
-            assertThat(result.readBoolean()).isTrue();   // pollMessages
-            assertThat(result.readBoolean()).isFalse();  // sendMessages
+            assertThat(result.readBoolean()).isTrue(); // manageServers
+            assertThat(result.readBoolean()).isFalse(); // readServers
+            assertThat(result.readBoolean()).isTrue(); // manageUsers
+            assertThat(result.readBoolean()).isFalse(); // readUsers
+            assertThat(result.readBoolean()).isTrue(); // manageStreams
+            assertThat(result.readBoolean()).isFalse(); // readStreams
+            assertThat(result.readBoolean()).isTrue(); // manageTopics
+            assertThat(result.readBoolean()).isFalse(); // readTopics
+            assertThat(result.readBoolean()).isTrue(); // pollMessages
+            assertThat(result.readBoolean()).isFalse(); // sendMessages
         }
 
         @Test
@@ -629,29 +626,26 @@ class BytesSerializerTest {
 
             // then
             assertThat(result.readableBytes()).isEqualTo(4); // 4 booleans
-            assertThat(result.readBoolean()).isTrue();  // manageTopic
+            assertThat(result.readBoolean()).isTrue(); // manageTopic
             assertThat(result.readBoolean()).isFalse(); // readTopic
-            assertThat(result.readBoolean()).isTrue();  // pollMessages
+            assertThat(result.readBoolean()).isTrue(); // pollMessages
             assertThat(result.readBoolean()).isFalse(); // sendMessages
         }
 
         @Test
         void shouldSerializeStreamPermissionsWithoutTopics() {
             // given
-            var permissions = new StreamPermissions(
-                    true, false, true, false, true, false,
-                    new HashMap<>()
-            );
+            var permissions = new StreamPermissions(true, false, true, false, true, false, new HashMap<>());
 
             // when
             ByteBuf result = BytesSerializer.toBytes(permissions);
 
             // then
-            assertThat(result.readBoolean()).isTrue();  // manageStream
+            assertThat(result.readBoolean()).isTrue(); // manageStream
             assertThat(result.readBoolean()).isFalse(); // readStream
-            assertThat(result.readBoolean()).isTrue();  // manageTopics
+            assertThat(result.readBoolean()).isTrue(); // manageTopics
             assertThat(result.readBoolean()).isFalse(); // readTopics
-            assertThat(result.readBoolean()).isTrue();  // pollMessages
+            assertThat(result.readBoolean()).isTrue(); // pollMessages
             assertThat(result.readBoolean()).isFalse(); // sendMessages
             assertThat(result.readByte()).isEqualTo((byte) 0); // no topics marker
         }
@@ -661,10 +655,7 @@ class BytesSerializerTest {
             // given
             Map<Long, TopicPermissions> topicPerms = new HashMap<>();
             topicPerms.put(1L, new TopicPermissions(true, true, true, true));
-            var permissions = new StreamPermissions(
-                    true, true, true, true, true, true,
-                    topicPerms
-            );
+            var permissions = new StreamPermissions(true, true, true, true, true, true, topicPerms);
 
             // when
             ByteBuf result = BytesSerializer.toBytes(permissions);
@@ -680,10 +671,7 @@ class BytesSerializerTest {
         @Test
         void shouldSerializeFullPermissionsWithoutStreams() {
             // given
-            var globalPerms = new GlobalPermissions(
-                    true, true, true, true, true,
-                    true, true, true, true, true
-            );
+            var globalPerms = new GlobalPermissions(true, true, true, true, true, true, true, true, true, true);
             var permissions = new Permissions(globalPerms, new HashMap<>());
 
             // when
@@ -697,14 +685,10 @@ class BytesSerializerTest {
         @Test
         void shouldSerializeFullPermissionsWithStreams() {
             // given
-            var globalPerms = new GlobalPermissions(
-                    false, false, false, false, false,
-                    false, false, false, false, false
-            );
+            var globalPerms =
+                    new GlobalPermissions(false, false, false, false, false, false, false, false, false, false);
             Map<Long, StreamPermissions> streamPerms = new HashMap<>();
-            streamPerms.put(1L, new StreamPermissions(
-                    true, true, true, true, true, true, new HashMap<>()
-            ));
+            streamPerms.put(1L, new StreamPermissions(true, true, true, true, true, true, new HashMap<>()));
             var permissions = new Permissions(globalPerms, streamPerms);
 
             // when

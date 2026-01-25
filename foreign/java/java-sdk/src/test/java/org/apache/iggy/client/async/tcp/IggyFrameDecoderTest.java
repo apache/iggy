@@ -32,7 +32,6 @@ import static org.assertj.core.api.Assertions.assertThat;
  * Helper method to read inbound message and assert it's null.
  * This avoids ambiguous method reference issues with assertThat.
  */
-
 class IggyFrameDecoderTest {
 
     private EmbeddedChannel channel;
