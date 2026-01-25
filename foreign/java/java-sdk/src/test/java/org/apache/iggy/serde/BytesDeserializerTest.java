@@ -37,6 +37,39 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 class BytesDeserializerTest {
 
+    // Helper methods for writing test data
+    private static void writeU64(ByteBuf buffer, BigInteger value) {
+        byte[] bytes = value.toByteArray();
+        ArrayUtils.reverse(bytes);
+        buffer.writeBytes(bytes, 0, Math.min(8, bytes.length));
+        if (bytes.length < 8) {
+            buffer.writeZero(8 - bytes.length);
+        }
+    }
+
+    private static void writeTopicData(ByteBuf buffer) {
+        buffer.writeIntLE(10); // topic ID
+        writeU64(buffer, BigInteger.valueOf(1000)); // created at
+        buffer.writeIntLE(4); // partitions count
+        writeU64(buffer, BigInteger.ZERO); // message expiry
+        buffer.writeByte(CompressionAlgorithm.None.asCode()); // compression
+        writeU64(buffer, BigInteger.valueOf(10000)); // max topic size
+        buffer.writeByte(1); // replication factor
+        writeU64(buffer, BigInteger.valueOf(500)); // size
+        writeU64(buffer, BigInteger.valueOf(50)); // messages count
+        buffer.writeByte(4); // name length
+        buffer.writeBytes("test".getBytes());
+    }
+
+    private static void writePartitionData(ByteBuf buffer) {
+        buffer.writeIntLE(1); // partition ID
+        writeU64(buffer, BigInteger.valueOf(1000)); // created at
+        buffer.writeIntLE(5); // segments count
+        writeU64(buffer, BigInteger.valueOf(99)); // current offset
+        writeU64(buffer, BigInteger.valueOf(200)); // size
+        writeU64(buffer, BigInteger.valueOf(20)); // messages count
+    }
+
     @Nested
     class U64 {
 
@@ -693,38 +726,5 @@ class BytesDeserializerTest {
             assertThat(tokenInfo.name()).isEqualTo("mytoken");
             assertThat(tokenInfo.expiryAt()).isEmpty();
         }
-    }
-
-    // Helper methods for writing test data
-    private static void writeU64(ByteBuf buffer, BigInteger value) {
-        byte[] bytes = value.toByteArray();
-        ArrayUtils.reverse(bytes);
-        buffer.writeBytes(bytes, 0, Math.min(8, bytes.length));
-        if (bytes.length < 8) {
-            buffer.writeZero(8 - bytes.length);
-        }
-    }
-
-    private static void writeTopicData(ByteBuf buffer) {
-        buffer.writeIntLE(10); // topic ID
-        writeU64(buffer, BigInteger.valueOf(1000)); // created at
-        buffer.writeIntLE(4); // partitions count
-        writeU64(buffer, BigInteger.ZERO); // message expiry
-        buffer.writeByte(CompressionAlgorithm.None.asCode()); // compression
-        writeU64(buffer, BigInteger.valueOf(10000)); // max topic size
-        buffer.writeByte(1); // replication factor
-        writeU64(buffer, BigInteger.valueOf(500)); // size
-        writeU64(buffer, BigInteger.valueOf(50)); // messages count
-        buffer.writeByte(4); // name length
-        buffer.writeBytes("test".getBytes());
-    }
-
-    private static void writePartitionData(ByteBuf buffer) {
-        buffer.writeIntLE(1); // partition ID
-        writeU64(buffer, BigInteger.valueOf(1000)); // created at
-        buffer.writeIntLE(5); // segments count
-        writeU64(buffer, BigInteger.valueOf(99)); // current offset
-        writeU64(buffer, BigInteger.valueOf(200)); // size
-        writeU64(buffer, BigInteger.valueOf(20)); // messages count
     }
 }
