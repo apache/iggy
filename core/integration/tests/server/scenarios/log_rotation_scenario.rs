@@ -309,6 +309,7 @@ async fn nocapture_observer(log_path: &Path, title: &str, done: bool) -> () {
         "\n{:>4}\x1b[33m Size\x1b[0m <-> \x1b[33mPath\x1b[0m && server::specific::log_rotation_be_valid::\x1b[33m{}\x1b[0m",
         "", title,
     );
+
     let mut dir_entries = fs::read_dir(log_path).await.unwrap();
     while let Some(entry) = dir_entries.next_entry().await.unwrap() {
         let file_path = entry.path();
@@ -321,6 +322,7 @@ async fn nocapture_observer(log_path: &Path, title: &str, done: bool) -> () {
             );
         }
     }
+
     if done {
         eprintln!(
             "\n\x1b[32m [Passed]\x1b[0m <-> {:<25} <{:->45}>\n",

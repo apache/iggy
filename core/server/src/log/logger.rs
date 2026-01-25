@@ -494,8 +494,8 @@ impl Logging {
     ) -> Option<std::thread::JoinHandle<()>> {
         let logs_path = logs_path?;
         let path = logs_path.to_path_buf();
-        let max_total_size_bytes = config.max_total_size.as_bytes_u64();
-        let max_file_size_bytes = config.max_file_size.as_bytes_u64();
+        let max_total_size = config.max_total_size;
+        let max_file_size = config.max_file_size;
         let rotation_check_interval = config.rotation_check_interval;
         let retention = config.retention;
         let should_stop = Arc::clone(&self.rotation_should_stop);
@@ -509,8 +509,8 @@ impl Logging {
                 Self::run_log_rotation_loop(
                     path,
                     retention,
-                    max_total_size_bytes,
-                    max_file_size_bytes,
+                    max_total_size,
+                    max_file_size,
                     rotation_check_interval,
                     should_stop,
                     rx,
@@ -524,8 +524,8 @@ impl Logging {
     fn run_log_rotation_loop(
         path: PathBuf,
         retention: IggyDuration,
-        max_total_size_bytes: u64,
-        max_file_size_bytes: u64,
+        max_total_size: IggyByteSize,
+        max_file_size: IggyByteSize,
         check_interval: IggyDuration,
         should_stop: Arc<AtomicBool>,
         rx: std::sync::mpsc::Receiver<()>,
@@ -542,12 +542,7 @@ impl Logging {
                     break;
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    Self::cleanup_log_files(
-                        &path,
-                        retention,
-                        max_total_size_bytes,
-                        max_file_size_bytes,
-                    );
+                    Self::cleanup_log_files(&path, retention, max_total_size, max_file_size);
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                     warn!("Log rotation channel disconnected, exiting thread");
@@ -630,12 +625,12 @@ impl Logging {
     fn cleanup_log_files(
         logs_path: &PathBuf,
         retention: IggyDuration,
-        max_total_size_bytes: u64,
-        max_file_size_bytes: u64,
+        max_total_size: IggyByteSize,
+        max_file_size: IggyByteSize,
     ) {
         debug!("Starting log cleanup for directory: {logs_path:?}");
         debug!(
-            "retention: {retention:?}, max_total_size: {max_total_size_bytes} bytes, max_single_file_size: {max_file_size_bytes} bytes"
+            "retention: {retention:?}, max_total_size: {max_total_size} bytes, max_single_file_size: {max_file_size} bytes"
         );
 
         let mut file_entries = Self::read_log_files(logs_path);
@@ -695,7 +690,11 @@ impl Logging {
             }
         }
 
-        let total_size: u64 = file_entries.iter().map(|(_, _, _, size)| *size).sum();
+        let total_size = file_entries
+            .iter()
+            .map(|(_, _, _, size)| IggyByteSize::new(*size))
+            .sum::<IggyByteSize>();
+
         let notification = |path: &PathBuf, count: &i32| {
             if count > &0 {
                 info!("Logs cleaned up for directory: {path:?}. Removed {count} files.");
@@ -705,23 +704,23 @@ impl Logging {
         // Setting total max log size to 0 disables only total size
         // rotation,  with other limits remain effective, including
         // per-file size limitation,  preserving structural order.
-        if max_total_size_bytes == 0 {
+        if max_total_size == 0 {
             notification(logs_path, &removed_files_count);
             return;
         }
 
-        if total_size > max_total_size_bytes {
+        if total_size > max_total_size {
             file_entries.sort_unstable_by_key(|(_, mtime, _, _)| *mtime);
 
             let mut remaining_size = total_size;
             let mut to_remove = Vec::new();
 
             for (idx, (_entry, _, _, fsize)) in file_entries.iter().enumerate() {
-                if remaining_size <= max_total_size_bytes {
+                if remaining_size <= max_total_size {
                     break;
                 }
                 to_remove.push((idx, *fsize));
-                remaining_size = remaining_size.saturating_sub(*fsize);
+                remaining_size = remaining_size.saturating_sub(&IggyByteSize::from(*fsize));
             }
 
             for (idx, fsize) in to_remove.iter().rev() {
@@ -863,8 +862,8 @@ mod tests {
         Logging::cleanup_log_files(
             &log_path,
             IggyDuration::new(Duration::from_secs(3600)),
-            2048 * 1024,
-            512 * 1024,
+            IggyByteSize::from(2048 * 1024),
+            IggyByteSize::from(512 * 1024),
         );
     }
 
