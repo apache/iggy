@@ -18,11 +18,13 @@
  */
 
 use crate::server::scenarios::{PARTITIONS_COUNT, STREAM_NAME, TOPIC_NAME};
+use futures::lock::Mutex;
 use iggy::prelude::*;
 use iggy_common::{
     CompressionAlgorithm, Identifier, IggyByteSize, IggyDuration, IggyExpiry, MaxTopicSize,
 };
 use integration::test_server::{ClientFactory, login_root};
+use once_cell::sync::Lazy;
 use std::path::Path;
 use std::time::Duration;
 use tokio::fs;
@@ -32,6 +34,8 @@ const OPERATION_TIMEOUT_SECS: u64 = 10;
 const OPERATION_LOOP_COUNT: usize = 500;
 const FROM_BYTES_TO_KB: u64 = 1000;
 const IGGY_LOG_BASE_NAME: &str = "iggy-server.log";
+
+static PRINT_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
 #[derive(Debug)]
 pub struct LogRotationTestConfig {
@@ -79,8 +83,9 @@ pub async fn run(
     );
 
     nocapture_observer(log_path, &present_log_test_title).await;
+    let _lock = PRINT_LOCK.lock().await;
     eprintln!(
-        "\n [Passed] <-> {:<25} <{:->45}>\n",
+        "\n\x1b[32m [Passed]\x1b[0m <-> {:<25} <{:->45}>\n",
         present_log_test_title, "",
     );
 }
@@ -228,17 +233,18 @@ async fn validate_log_rotation_rules(
     let mut total_log_size = IggyByteSize::new(0);
     let max_single_kb = present_log_config.max_single_log_size.as_bytes_u64() / FROM_BYTES_TO_KB;
     let max_total_kb = present_log_config.max_total_log_size.as_bytes_u64() / FROM_BYTES_TO_KB;
+    let present_file_amount = valid_log_files.len();
 
-    if max_single_kb == 0 && valid_log_files.len() > 1 {
+    if max_single_kb == 0 && present_file_amount > 1 {
         return Err(format!(
             "Log size should be unlimited if `max_file_size` is set to 0, found {} files.",
-            valid_log_files.len()
+            present_file_amount,
         ));
     } else if max_total_kb == 0 && max_single_kb != 0 {
-        if valid_log_files.len() as u64 <= 1 {
+        if present_file_amount as u64 <= 1 {
             return Err(format!(
                 "Archives should be unlimited if `max_total_size` is set to 0, found {} files.",
-                valid_log_files.len(),
+                present_file_amount,
             ));
         }
     } else {
@@ -269,8 +275,18 @@ async fn validate_log_rotation_rules(
     let current_total_kb = total_log_size.as_bytes_u64() / FROM_BYTES_TO_KB;
     if max_total_kb != 0 && max_single_kb != 0 && current_total_kb > max_total_kb {
         return Err(format!(
-            "Total log size exceeds maximum allowed size: '{}'",
-            log_dir.display()
+            "Total log size exceeds maximum:{} expected: '{}'KB",
+            log_dir.display(),
+            max_total_kb,
+        ));
+    } else if max_total_kb != 0
+        && max_single_kb != 0
+        && present_file_amount as u64 > max_total_kb / max_single_kb
+    {
+        return Err(format!(
+            "Total log file amount exceeds:{} expected: '{}'",
+            log_dir.display(),
+            max_total_kb / max_single_kb,
         ));
     }
 
@@ -292,8 +308,9 @@ fn is_valid_iggy_log_file(file_name: &str) -> bool {
 
 /// Solely for manual && direct observation of file status to reduce debugging overhead.
 async fn nocapture_observer(log_path: &Path, title: &str) -> () {
+    let _lock = PRINT_LOCK.lock().await;
     eprintln!(
-        "\n{:>4} Size <-> Path && server::specific::log_rotation_be_valid::{}",
+        "\n{:>4}\x1b[33m Size\x1b[0m <-> \x1b[33mPath\x1b[0m && server::specific::log_rotation_be_valid::\x1b[33m{}\x1b[0m",
         "", title,
     );
     let mut dir_entries = fs::read_dir(log_path).await.unwrap();
