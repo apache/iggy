@@ -839,16 +839,16 @@ mod tests {
 
     #[test]
     fn test_calculate_max_files_with_values() {
-        let total_size = 10 * 1024 * 1024 * 1024; // 10 GB
-        let file_size = 512 * 1024 * 1024; // 512 MB
+        let total_size = 10 * 1024 * 1024 * 1024; // 10 GiB
+        let file_size = 512 * 1024 * 1024; // 512 MiB
         assert_eq!(Logging::calculate_max_files(total_size, file_size), 20);
 
-        let total_size = 5 * 1024 * 1024 * 1024; // 5 GB
-        let file_size = 256 * 1024 * 1024; // 256 MB
+        let total_size = 5 * 1024 * 1024 * 1024; // 5 GiB
+        let file_size = 256 * 1024 * 1024; // 256 MiB
         assert_eq!(Logging::calculate_max_files(total_size, file_size), 20);
 
-        let total_size = 1024 * 1024 * 1024; // 1 GB
-        let file_size = 100 * 1024 * 1024; // 100 MB
+        let total_size = 1024 * 1024 * 1024; // 1 GiB
+        let file_size = 100 * 1024 * 1024; // 100 MiB
         assert_eq!(Logging::calculate_max_files(total_size, file_size), 10);
     }
 

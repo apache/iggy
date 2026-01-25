@@ -31,7 +31,7 @@ use tokio::fs;
 use tokio::time::{sleep, timeout};
 
 const OPERATION_TIMEOUT_SECS: u64 = 10;
-const OPERATION_LOOP_COUNT: usize = 500;
+const OPERATION_LOOP_COUNT: usize = 300;
 const FROM_BYTES_TO_KB: u64 = 1000;
 const IGGY_LOG_BASE_NAME: &str = "iggy-server.log";
 
@@ -94,21 +94,21 @@ pub fn get_configurations() -> Vec<LogRotationTestConfig> {
     vec![
         LogRotationTestConfig {
             name: "log_regular_rotation".to_string(),
-            max_single_log_size: IggyByteSize::new(200_000),
-            max_total_log_size: IggyByteSize::new(800_000),
+            max_single_log_size: IggyByteSize::new(100_000),
+            max_total_log_size: IggyByteSize::new(400_000),
             rotation_check_interval: IggyDuration::ONE_SECOND,
             retention: IggyDuration::new_from_secs(30),
         },
         LogRotationTestConfig {
             name: "log_unlimited_size".to_string(),
             max_single_log_size: IggyByteSize::new(0),
-            max_total_log_size: IggyByteSize::new(800_000),
+            max_total_log_size: IggyByteSize::new(400_000),
             rotation_check_interval: IggyDuration::ONE_SECOND,
             retention: IggyDuration::new_from_secs(30),
         },
         LogRotationTestConfig {
             name: "log_unlimited_archives".to_string(),
-            max_single_log_size: IggyByteSize::new(200_000),
+            max_single_log_size: IggyByteSize::new(100_000),
             max_total_log_size: IggyByteSize::new(0),
             rotation_check_interval: IggyDuration::ONE_SECOND,
             retention: IggyDuration::new_from_secs(30),
