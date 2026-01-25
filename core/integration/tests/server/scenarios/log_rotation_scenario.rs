@@ -142,6 +142,10 @@ async fn init_valid_client(client_factory: &dyn ClientFactory) -> Result<IggyCli
     Ok(client)
 }
 
+/// Loop through the creation and deletion of streams / topics
+/// to trigger server business operations,  thereby generating
+/// sufficient log data to meet the trigger conditions for the
+/// log rotation test.
 async fn generate_enough_logs(client: &IggyClient) -> Result<(), String> {
     for i in 0..OPERATION_LOOP_COUNT {
         let stream_name = format!("{STREAM_NAME}-{i}");
@@ -295,7 +299,10 @@ fn is_valid_iggy_log_file(file_name: &str) -> bool {
     false
 }
 
-/// Solely for manual && direct observation of file status to reduce debugging overhead.
+/// Solely for manual && direct observation of file status to
+/// reduce debugging overhead. Due to the different nature of
+/// asynchronous tasks,  the output order of scenarios may be
+/// mixed, but the mutex can prevent messy terminal output.
 async fn nocapture_observer(log_path: &Path, title: &str, done: bool) -> () {
     let _lock = PRINT_LOCK.lock().await;
     eprintln!(

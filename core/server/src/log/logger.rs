@@ -22,7 +22,7 @@ use crate::configs::server::{TelemetryConfig, TelemetryTransport};
 use crate::configs::system::LoggingConfig;
 use crate::log::runtime::CompioRuntime;
 use crate::server_error::LogError;
-use iggy_common::IggyDuration;
+use iggy_common::{IggyByteSize, IggyDuration};
 use opentelemetry::KeyValue;
 use opentelemetry::global;
 use opentelemetry::trace::TracerProvider;
@@ -287,13 +287,11 @@ impl Logging {
                 warn!("Failed to check available disk space for logs directory: {logs_path:?}");
             }
 
-            let max_files = Self::calculate_max_files(
-                config.max_total_size.as_bytes_u64(),
-                config.max_file_size.as_bytes_u64(),
-            );
+            let max_files = Self::calculate_max_files(config.max_total_size, config.max_file_size);
 
             // If max_file_size == 0, then keep interpreting behavior as same
             // as fn IggyByteSize::as_human_string_with_zero_as_unlimited do.
+            // This will cover all log rotations if expecting unlimited.
             let mut condition_builder = RollingConditionBasic::new();
             let max_file_size_bytes = config.max_file_size.as_bytes_u64();
 
@@ -472,7 +470,10 @@ impl Logging {
         }
     }
 
-    fn calculate_max_files(max_total_size_bytes: u64, max_file_size_bytes: u64) -> usize {
+    fn calculate_max_files(
+        max_total_size_bytes: IggyByteSize,
+        max_file_size_bytes: IggyByteSize,
+    ) -> usize {
         if max_total_size_bytes == 0 {
             // If the third attribute of BasicRollingFileAppender::new()
             // is `usize::MAX` then it would reach iter capability.
@@ -480,7 +481,8 @@ impl Logging {
         } else if max_file_size_bytes == 0 {
             1
         } else {
-            let max_files = max_total_size_bytes / max_file_size_bytes;
+            let max_files =
+                max_total_size_bytes.as_bytes_u64() / max_file_size_bytes.as_bytes_u64();
             max_files.clamp(1, ONE_HUNDRED_THOUSAND) as usize
         }
     }
@@ -571,6 +573,7 @@ impl Logging {
         for entry in entries.flatten() {
             if let Some(file_name) = entry.file_name().to_str() {
                 if file_name == IGGY_LOG_FILE_PREFIX {
+                    // Skip the actively written primary log file
                     continue;
                 }
                 if !file_name.starts_with(IGGY_LOG_FILE_PREFIX) {
@@ -820,36 +823,36 @@ mod tests {
     #[test]
     fn test_calculate_max_files() {
         assert_eq!(
-            Logging::calculate_max_files(100, 0),
+            Logging::calculate_max_files(IggyByteSize::from(100), IggyByteSize::from(0)),
             1 // Enable unlimited size of single log, the value won't be used actually
         );
         assert_eq!(
-            Logging::calculate_max_files(0, 100),
+            Logging::calculate_max_files(IggyByteSize::from(0), IggyByteSize::from(100)),
             ONE_HUNDRED_THOUSAND as usize // Allow an unlimited number of archived logs
         );
         assert_eq!(
-            Logging::calculate_max_files(ONE_HUNDRED_THOUSAND * 10, 1),
+            Logging::calculate_max_files(
+                IggyByteSize::from(ONE_HUNDRED_THOUSAND * 10),
+                IggyByteSize::from(1)
+            ),
             ONE_HUNDRED_THOUSAND as usize // Result should be limited to ONE_HUNDRED_THOUSAND by clamp
         );
-        assert_eq!(Logging::calculate_max_files(1000, 100), 10);
-        assert_eq!(Logging::calculate_max_files(500, 100), 5);
-        assert_eq!(Logging::calculate_max_files(2000, 100), 20);
-        assert_eq!(Logging::calculate_max_files(50, 100), 1);
-    }
-
-    #[test]
-    fn test_calculate_max_files_with_values() {
-        let total_size = 10 * 1024 * 1024 * 1024; // 10 GiB
-        let file_size = 512 * 1024 * 1024; // 512 MiB
-        assert_eq!(Logging::calculate_max_files(total_size, file_size), 20);
-
-        let total_size = 5 * 1024 * 1024 * 1024; // 5 GiB
-        let file_size = 256 * 1024 * 1024; // 256 MiB
-        assert_eq!(Logging::calculate_max_files(total_size, file_size), 20);
-
-        let total_size = 1024 * 1024 * 1024; // 1 GiB
-        let file_size = 100 * 1024 * 1024; // 100 MiB
-        assert_eq!(Logging::calculate_max_files(total_size, file_size), 10);
+        assert_eq!(
+            Logging::calculate_max_files(IggyByteSize::from(1000), IggyByteSize::from(100)),
+            10
+        );
+        assert_eq!(
+            Logging::calculate_max_files(IggyByteSize::from(500), IggyByteSize::from(100)),
+            5
+        );
+        assert_eq!(
+            Logging::calculate_max_files(IggyByteSize::from(2000), IggyByteSize::from(100)),
+            20
+        );
+        assert_eq!(
+            Logging::calculate_max_files(IggyByteSize::from(50), IggyByteSize::from(100)),
+            1
+        );
     }
 
     #[test]
