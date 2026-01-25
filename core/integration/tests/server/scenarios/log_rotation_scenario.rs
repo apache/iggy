@@ -18,7 +18,6 @@
  */
 
 use crate::server::scenarios::{PARTITIONS_COUNT, STREAM_NAME, TOPIC_NAME};
-use futures::lock::Mutex;
 use iggy::prelude::*;
 use iggy_common::{
     CompressionAlgorithm, Identifier, IggyByteSize, IggyDuration, IggyExpiry, MaxTopicSize,
@@ -28,8 +27,10 @@ use once_cell::sync::Lazy;
 use std::path::Path;
 use std::time::Duration;
 use tokio::fs;
+use tokio::sync::Mutex;
 use tokio::time::{sleep, timeout};
 
+const RETENTION_SECS: u64 = 30;
 const OPERATION_TIMEOUT_SECS: u64 = 10;
 const OPERATION_LOOP_COUNT: usize = 300;
 const FROM_BYTES_TO_KB: u64 = 1000;
@@ -51,6 +52,7 @@ pub async fn run(
     log_dir: &str,
     present_log_config: LogRotationTestConfig,
 ) {
+    let done_status = false;
     let present_log_test_title = present_log_config.name.clone();
     let log_path = Path::new(log_dir);
     assert!(
@@ -72,7 +74,7 @@ pub async fn run(
         generator_result.as_ref().err(),
     );
 
-    nocapture_observer(log_path, &present_log_test_title).await;
+    nocapture_observer(log_path, &present_log_test_title, done_status).await;
     sleep(present_log_config.rotation_check_interval.get_duration()).await;
 
     let rotation_result = validate_log_rotation_rules(log_path, present_log_config).await;
@@ -82,12 +84,7 @@ pub async fn run(
         rotation_result.as_ref().err(),
     );
 
-    nocapture_observer(log_path, &present_log_test_title).await;
-    let _lock = PRINT_LOCK.lock().await;
-    eprintln!(
-        "\n\x1b[32m [Passed]\x1b[0m <-> {:<25} <{:->45}>\n",
-        present_log_test_title, "",
-    );
+    nocapture_observer(log_path, &present_log_test_title, !done_status).await;
 }
 
 pub fn get_configurations() -> Vec<LogRotationTestConfig> {
@@ -97,28 +94,28 @@ pub fn get_configurations() -> Vec<LogRotationTestConfig> {
             max_single_log_size: IggyByteSize::new(100_000),
             max_total_log_size: IggyByteSize::new(400_000),
             rotation_check_interval: IggyDuration::ONE_SECOND,
-            retention: IggyDuration::new_from_secs(30),
+            retention: IggyDuration::new_from_secs(RETENTION_SECS),
         },
         LogRotationTestConfig {
             name: "log_unlimited_size".to_string(),
             max_single_log_size: IggyByteSize::new(0),
             max_total_log_size: IggyByteSize::new(400_000),
             rotation_check_interval: IggyDuration::ONE_SECOND,
-            retention: IggyDuration::new_from_secs(30),
+            retention: IggyDuration::new_from_secs(RETENTION_SECS),
         },
         LogRotationTestConfig {
             name: "log_unlimited_archives".to_string(),
             max_single_log_size: IggyByteSize::new(100_000),
             max_total_log_size: IggyByteSize::new(0),
             rotation_check_interval: IggyDuration::ONE_SECOND,
-            retention: IggyDuration::new_from_secs(30),
+            retention: IggyDuration::new_from_secs(RETENTION_SECS),
         },
         LogRotationTestConfig {
             name: "log_special_scenario".to_string(),
             max_single_log_size: IggyByteSize::new(0),
             max_total_log_size: IggyByteSize::new(0),
             rotation_check_interval: IggyDuration::ONE_SECOND,
-            retention: IggyDuration::new_from_secs(30),
+            retention: IggyDuration::new_from_secs(RETENTION_SECS),
         },
     ]
 }
@@ -184,19 +181,14 @@ async fn validate_log_rotation_rules(
     log_dir: &Path,
     present_log_config: LogRotationTestConfig,
 ) -> Result<(), String> {
-    let mut dir_entries = fs::read_dir(log_dir).await.map_err(|e| {
-        format!(
-            "Failed to read log directory '{log_dir}': {e}",
-            log_dir = log_dir.display()
-        )
-    })?;
+    let log_dir_display = log_dir.display();
+    let mut dir_entries = fs::read_dir(log_dir)
+        .await
+        .map_err(|e| format!("Failed to read log directory '{log_dir_display}': {e}",))?;
 
     let mut valid_log_files = Vec::new();
     while let Some(entry) = dir_entries.next_entry().await.map_err(|e| {
-        format!(
-            "Failed to read next entry in log directory '{log_dir}': {e}",
-            log_dir = log_dir.display()
-        )
+        format!("Failed to read next entry in log directory '{log_dir_display}': {e}",)
     })? {
         let file_path = entry.path();
 
@@ -217,9 +209,7 @@ async fn validate_log_rotation_rules(
     if valid_log_files.is_empty() {
         return Err(format!(
             "No valid Iggy log files found in directory '{}'. Expected files matching '{}' (original) or '{}.<numeric>' (archived).",
-            log_dir.display(),
-            IGGY_LOG_BASE_NAME,
-            IGGY_LOG_BASE_NAME
+            log_dir_display, IGGY_LOG_BASE_NAME, IGGY_LOG_BASE_NAME
         ));
     }
 
@@ -276,8 +266,7 @@ async fn validate_log_rotation_rules(
     if max_total_kb != 0 && max_single_kb != 0 && current_total_kb > max_total_kb {
         return Err(format!(
             "Total log size exceeds maximum:{} expected: '{}'KB",
-            log_dir.display(),
-            max_total_kb,
+            log_dir_display, max_total_kb,
         ));
     } else if max_total_kb != 0
         && max_single_kb != 0
@@ -285,7 +274,7 @@ async fn validate_log_rotation_rules(
     {
         return Err(format!(
             "Total log file amount exceeds:{} expected: '{}'",
-            log_dir.display(),
+            log_dir_display,
             max_total_kb / max_single_kb,
         ));
     }
@@ -307,7 +296,7 @@ fn is_valid_iggy_log_file(file_name: &str) -> bool {
 }
 
 /// Solely for manual && direct observation of file status to reduce debugging overhead.
-async fn nocapture_observer(log_path: &Path, title: &str) -> () {
+async fn nocapture_observer(log_path: &Path, title: &str, done: bool) -> () {
     let _lock = PRINT_LOCK.lock().await;
     eprintln!(
         "\n{:>4}\x1b[33m Size\x1b[0m <-> \x1b[33mPath\x1b[0m && server::specific::log_rotation_be_valid::\x1b[33m{}\x1b[0m",
@@ -324,5 +313,11 @@ async fn nocapture_observer(log_path: &Path, title: &str) -> () {
                 file_path.display()
             );
         }
+    }
+    if done {
+        eprintln!(
+            "\n\x1b[32m [Passed]\x1b[0m <-> {:<25} <{:->45}>\n",
+            title, "",
+        );
     }
 }
