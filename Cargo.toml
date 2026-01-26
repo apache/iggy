@@ -169,7 +169,7 @@ opentelemetry_sdk = { version = "0.31.0", features = [
     "experimental_trace_batch_span_processor_with_async_runtime",
 ] }
 parquet = "=55.2.0"
-passterm = "=2.0.1"
+passterm = "=2.0.5"
 postcard = { version = "1.1.3", features = ["alloc"] }
 predicates = "3.1.3"
 quinn = "0.11.9"
@@ -202,7 +202,7 @@ strum_macros = "0.27.2"
 sysinfo = "0.37.2"
 tempfile = "3.24.0"
 test-case = "3.3.1"
-thiserror = "2.0.17"
+thiserror = "2.0.18"
 tokio = { version = "1.49.0", features = ["full"] }
 tokio-rustls = "0.26.4"
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
@@ -224,7 +224,7 @@ tracing-subscriber = { version = "0.3.22", default-features = false, features = 
 trait-variant = "0.1.2"
 tungstenite = "0.28.0"
 twox-hash = { version = "2.1.2", features = ["xxhash32"] }
-uuid = { version = "1.19.0", features = [
+uuid = { version = "1.20.0", features = [
     "v4",
     "v7",
     "fast-rng",
@@ -232,7 +232,7 @@ uuid = { version = "1.19.0", features = [
     "zerocopy",
 ] }
 webpki-roots = "1.0.5"
-zip = { version = "7.1.0", default-features = false, features = ["deflate"] }
+zip = { version = "7.2.0", default-features = false, features = ["deflate"] }
 
 [profile.release]
 lto = true

@@ -57,7 +57,7 @@ human-repr = { workspace = true }
 humantime = { workspace = true }
 nix = { workspace = true }
 once_cell = { workspace = true }
-rcgen = "0.14.6"
+rcgen = "0.14.7"
 ring = "0.17.14"
 rustls = { workspace = true }
 serde = { workspace = true }
