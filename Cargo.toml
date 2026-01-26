@@ -150,7 +150,6 @@ mockall = "0.14.0"
 nix = { version = "0.30.1", features = ["fs", "resource", "sched"] }
 nonzero_lit = "0.1.2"
 once_cell = "1.21.3"
-parquet = "57.0.0"
 opentelemetry = { version = "0.31.0", features = ["trace", "logs"] }
 opentelemetry-appender-tracing = { version = "0.31.1", features = ["log"] }
 opentelemetry-otlp = { version = "0.31.0", features = [
@@ -169,6 +168,7 @@ opentelemetry_sdk = { version = "0.31.0", features = [
     "experimental_logs_batch_log_processor_with_async_runtime",
     "experimental_trace_batch_span_processor_with_async_runtime",
 ] }
+parquet = "57.0.0"
 
 passterm = "=2.0.1"
 postcard = { version = "1.1.3", features = ["alloc"] }
