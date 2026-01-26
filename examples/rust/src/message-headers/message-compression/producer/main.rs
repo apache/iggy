@@ -16,24 +16,6 @@
  * under the License.
  */
 
-/// In the following couple of lines, we will write a small program, that connects and sends a couple of messages to an Iggy server.
-/// The messages are then consumed by another small program for which the code sits in ` ../consumer/main.rs`.
-///
-/// The goal of this example is to illustrate how message user-headers can be used to implement additional special features or logic.
-/// Specifically, we will compress our messages before sending to the server and `../consumer/main.rs` will decompress those messages
-/// after reading them back from the server.
-///
-/// Troughout this example we will use the high-level API from the Iggy SDK.
-///
-/// Step-by-step guide
-/// 1. Setup a client
-/// 2. Connect to the iggy-server
-/// 3. Generate payloads
-/// 4. Compress payloads
-/// 5. Transform payloads into Iggy messages to be send to the server
-/// 6. Send Iggy messages to the server
-// The compression and decompression utilities are shared between the producer and consumer compression examples.
-// Hence, we import them here.
 #[path = "../codec.rs"]
 mod codec;
 
@@ -42,48 +24,48 @@ use codec::{Codec, NUM_MESSAGES, STREAM_NAME, TOPIC_NAME};
 use iggy::prelude::*;
 use std::collections::HashMap;
 
-/// Since we are communicating with a server, a lot of network I/O operations will happen.
-/// We do not want to block ourselves while waiting for responses until we can do the next bit of work.
-/// The Iggy SDK is mostly asynchronous by using tokio. Hence, we setup a tokio runtime for our main function.
 #[tokio::main]
 async fn main() -> Result<(), IggyError> {
-    // Setup a server client to create a stream and topic to send messages to.
-    let client = IggyClientBuilder::new()
-        .with_tcp()
-        .with_server_address("127.0.0.1:8090".to_string())
-        .build()?;
+    // Setup a client to connect to the iggy-server via TCP.
+    let client = IggyClientBuilder::new().with_tcp().build()?;
     client.connect().await?;
 
+    // Login using default credentials.
     client
         .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
         .await?;
 
+    // Create a Stream.
     client
         .create_stream(STREAM_NAME)
         .await
         .expect("Stream was NOT created! Start a fresh server to run this example.");
 
+    // Create a Topic on that Stream.
     client
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
             TOPIC_NAME,
-            1,
+            1,                           // Number of partitions.
             CompressionAlgorithm::None, // NOTE: This configures the compression on the server, not the actual messages in transit!
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            None,                       // Replication factor.
+            IggyExpiry::NeverExpire,    // Time until messages expire on the server.
+            MaxTopicSize::ServerDefault, // Defined in server/config.toml. Defaults to "unlimited".
         )
         .await
         .expect("Topic was NOT created! Start a fresh server to run this example.");
 
-    // Uncompressed messages
+    // The Codec from ../compression.rs implements the compression and decompression utilities.
     let codec = Codec::Lz4;
+    // NOTE: This is where the Codec is used to prepare the compression user-header for the IggyMessage.
     let key = Codec::header_key();
     let value = codec.to_header_value();
     let compression_headers = HashMap::from([(key, value)]);
 
+    // Generate artificial example messages to send to the server.
     let mut messages = Vec::new();
     for i in 0..NUM_MESSAGES {
+        // For illustration purposes a log-like pattern is resembled.
         let payload = format!(
             r#"{{"ts": "2000-01-{:02}T{:02}:{:02}:{:02}Z", "level": "info", "trace":{}, "command": "command-{}", "status": 200, "latency_ms": {}}}"#,
             i % 28,
@@ -102,11 +84,14 @@ async fn main() -> Result<(), IggyError> {
 
         let msg = IggyMessage::builder()
             .payload(compressed_bytes)
+            // NOTE: This is where the user_headers of IggyMessages are used to indicate, that a payload is compressed.
             .user_headers(compression_headers.clone())
             .build()
             .expect("IggyMessage should be buildable.");
         messages.push(msg);
     }
+
+    // Send all compressed messages to the server.
     let producer = client.producer(STREAM_NAME, TOPIC_NAME)?.build();
     producer
         .send(messages)

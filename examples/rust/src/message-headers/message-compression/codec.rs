@@ -22,12 +22,12 @@ use std::fmt::{Display, Formatter};
 use std::io::{Read, Write};
 use std::str::FromStr;
 
-pub const CONSUMER_NAME: &str = "example-consumer";
 pub const STREAM_NAME: &str = "compression-stream";
 pub const TOPIC_NAME: &str = "compression-topic";
 pub const COMPRESSION_HEADER_KEY: &str = "iggy-compression";
 pub const NUM_MESSAGES: u32 = 1000;
 
+// Codec that defines available compression algorithms.
 pub enum Codec {
     None,
     Lz4,
@@ -55,16 +55,18 @@ impl FromStr for Codec {
 }
 
 impl Codec {
+    /// Returns the key to indicate compressed messages as HeaderKey.
     pub fn header_key() -> HeaderKey {
         HeaderKey::new(COMPRESSION_HEADER_KEY)
-            .expect("COMPRESSION_HEADER_KEY is an InvalidHeaderKey")
+            .expect("COMPRESSION_HEADER_KEY is an InvalidHeaderKey.")
     }
 
+    /// Returns the compression algorithm type as HeaderValue.
     pub fn to_header_value(&self) -> HeaderValue {
-        HeaderValue::from_str(&self.to_string())
-            .expect("algorithm name is not a valid CompressionAlgorithm")
+        HeaderValue::from_str(&self.to_string()).expect("failed generating HeaderValue.")
     }
 
+    /// Returns a Codec from a HeaderValue. Used when reading messages from the server.
     pub fn from_header_value(value: &HeaderValue) -> Self {
         let name = value
             .as_str()
@@ -72,6 +74,7 @@ impl Codec {
         Self::from_str(name).expect("compression algorithm not available.")
     }
 
+    /// Takes a message payload and compresses it using the algorithm from Codec.
     pub fn compress(&self, data: &[u8]) -> Result<Vec<u8>, IggyError> {
         match self {
             Codec::None => Ok(data.to_vec()),
@@ -87,6 +90,7 @@ impl Codec {
         }
     }
 
+    /// Takes a compressed message payload and decompresses it using the algorithm from Codec.
     pub fn decompress(&self, data: &[u8]) -> Result<Vec<u8>, IggyError> {
         match self {
             Codec::None => Ok(data.to_vec()),
