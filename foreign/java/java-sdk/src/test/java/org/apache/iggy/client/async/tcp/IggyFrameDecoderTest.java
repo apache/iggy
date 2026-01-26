@@ -28,10 +28,6 @@ import org.junit.jupiter.api.Test;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-/**
- * Helper method to read inbound message and assert it's null.
- * This avoids ambiguous method reference issues with assertThat.
- */
 class IggyFrameDecoderTest {
 
     private EmbeddedChannel channel;
@@ -303,18 +299,15 @@ class IggyFrameDecoderTest {
             // given
             channel = new EmbeddedChannel(new IggyFrameDecoder());
             ByteBuf input = Unpooled.buffer();
-            int initialWriterIndex = input.writerIndex();
             input.writeIntLE(0);
             input.writeIntLE(100); // expects 100 bytes
             input.writeBytes(new byte[50]); // only 50 bytes
 
-            int readerIndexBefore = input.readerIndex();
-
             // when
-            channel.writeInbound(input);
+            boolean hasMessage = channel.writeInbound(input);
 
-            // then - decoder should have reset reader index
-            // Since input is consumed by channel, we verify no message was produced
+            // then - decoder should wait for complete payload
+            assertThat(hasMessage).isFalse();
             ByteBuf decoded = channel.readInbound();
             assertThat(decoded).isNull();
         }

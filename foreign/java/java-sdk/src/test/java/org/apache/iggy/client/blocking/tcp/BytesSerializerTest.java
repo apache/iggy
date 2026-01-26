@@ -198,11 +198,10 @@ class BytesSerializerTest {
 
             // then
             byte[] expectedBytes = input.getBytes(StandardCharsets.UTF_8);
-            // Note: serializer writes character count, not byte count as length prefix
-            assertThat(result.readByte()).isEqualTo((byte) input.length()); // 7 characters
+            assertThat(result.readByte()).isEqualTo((byte) expectedBytes.length);
             byte[] stringBytes = new byte[expectedBytes.length];
             result.readBytes(stringBytes);
-            assertThat(stringBytes).isEqualTo(expectedBytes); // but writes 11 bytes
+            assertThat(stringBytes).isEqualTo(expectedBytes);
         }
     }
 
@@ -239,12 +238,6 @@ class BytesSerializerTest {
             assertThat(new String(nameBytes)).isEqualTo("test-stream");
         }
 
-        @Test
-        void shouldFailForUnknownIdentifierKind() {
-            // given - create an identifier with invalid kind via reflection would be complex
-            // This is actually tested implicitly by the Identifier class constraints
-            // Testing the serializer with valid inputs is sufficient
-        }
     }
 
     @Nested
@@ -482,16 +475,14 @@ class BytesSerializerTest {
         void shouldSerializeMultipleHeaders() {
             // given
             Map<String, HeaderValue> headers = new HashMap<>();
-            headers.put("k1", new HeaderValue(HeaderKind.Raw, "v1"));
-            headers.put("k2", new HeaderValue(HeaderKind.String, "v2"));
+            headers.put("k1", new HeaderValue(HeaderKind.Raw, "v1")); // 13 bytes
+            headers.put("k2", new HeaderValue(HeaderKind.String, "v2")); // 13 bytes
 
             // when
             ByteBuf result = BytesSerializer.toBytes(headers);
 
             // then - verify buffer contains data for both headers
-            assertThat(result.readableBytes()).isGreaterThan(0);
-            // Note: HashMap doesn't guarantee order, so we can't test exact byte sequence
-            // We just verify we have content
+            assertThat(result.readableBytes()).isEqualTo(26);
         }
     }
 
