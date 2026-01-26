@@ -134,7 +134,7 @@ human-repr = "1.1.0"
 humantime = "2.3.0"
 hwlocality = "1.0.0-alpha.11"
 iceberg = "0.8.0"
-iceberg-catalog-rest = "=0.8.0"
+iceberg-catalog-rest = "0.8.0"
 iggy = { path = "core/sdk", version = "0.8.1-edge.1" }
 iggy_binary_protocol = { path = "core/binary_protocol", version = "0.8.1-edge.1" }
 iggy_common = { path = "core/common", version = "0.8.1-edge.1" }

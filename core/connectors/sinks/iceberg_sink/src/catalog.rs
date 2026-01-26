@@ -20,14 +20,15 @@ use super::{Error, IcebergSinkConfig, IcebergSinkTypes};
 use crate::props::init_props;
 use iceberg::{Catalog, CatalogBuilder};
 use iceberg_catalog_rest::{
-    REST_CATALOG_PROP_URI, REST_CATALOG_PROP_WAREHOUSE, RestCatalog, RestCatalogBuilder,
+    REST_CATALOG_PROP_URI, REST_CATALOG_PROP_WAREHOUSE, RestCatalogBuilder,
 };
+
 use std::collections::HashMap;
 
 pub async fn init_catalog(config: &IcebergSinkConfig) -> Result<Box<dyn Catalog>, Error> {
     let props = init_props(config)?;
     match config.catalog_type {
-        IcebergSinkTypes::REST => Ok(Box::new(get_rest_catalog(config, props).await)),
+        IcebergSinkTypes::REST => get_rest_catalog(config, props).await,
     }
 }
 
@@ -35,7 +36,7 @@ pub async fn init_catalog(config: &IcebergSinkConfig) -> Result<Box<dyn Catalog>
 async fn get_rest_catalog(
     config: &IcebergSinkConfig,
     props: HashMap<String, String>,
-) -> RestCatalog {
+) -> Result<Box<dyn Catalog>, Error> {
     let mut new_props = HashMap::from([
         (REST_CATALOG_PROP_URI.to_string(), config.uri.clone()),
         (
@@ -45,8 +46,13 @@ async fn get_rest_catalog(
     ]);
     new_props.extend(props);
 
-    RestCatalogBuilder::default()
+    let catalog = RestCatalogBuilder::default()
         .load("rest", new_props)
         .await
-        .unwrap()
+        .map_err(|err| {
+            let error = format!("Failed to initialize REST catalog: {}", err);
+            Error::InitError(error)
+        })?;
+
+    Ok(Box::new(catalog))
 }
