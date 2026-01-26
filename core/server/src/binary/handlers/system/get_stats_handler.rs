@@ -49,10 +49,7 @@ impl ServerCommandHandler for GetStats {
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
         shard.ensure_authenticated(session)?;
-        shard
-            .permissioner
-            .borrow()
-            .get_stats(session.get_user_id())?;
+        shard.metadata.perm_get_stats(session.get_user_id())?;
 
         // Route GetStats to shard0 only
         let request = ShardRequest {

@@ -60,8 +60,7 @@ public class IggyServerFixture : IAsyncInitializer, IAsyncDisposable
 
     public IggyServerFixture()
     {
-        var builder = new ContainerBuilder()
-            .WithImage(DockerImage)
+        var builder = new ContainerBuilder(DockerImage)
             .WithPortBinding(3000, true)
             .WithPortBinding(8090, true)
             .WithOutputConsumer(Consume.RedirectStdoutAndStderrToConsole())

@@ -15,7 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-FROM mcr.microsoft.com/dotnet/sdk:8.0
+FROM mcr.microsoft.com/dotnet/sdk:10.0
 
 COPY ./foreign/csharp ./foreign/csharp
 COPY ./bdd/scenarios ./bdd/scenarios

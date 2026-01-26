@@ -41,7 +41,6 @@ pub mod metadata;
 pub mod quic;
 pub mod server_error;
 pub mod shard;
-pub mod slab;
 pub mod state;
 pub mod streaming;
 pub mod tcp;

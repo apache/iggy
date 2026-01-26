@@ -18,6 +18,8 @@
 use crate::metadata::ConsumerGroupMemberMeta;
 use crate::metadata::inner::InnerMetadata;
 use crate::metadata::ops::MetadataOp;
+use crate::metadata::{StreamId, UserId};
+use iggy_common::Permissions;
 use left_right::Absorb;
 use std::sync::atomic::Ordering;
 
@@ -39,6 +41,7 @@ fn apply_op(metadata: &mut InnerMetadata, op: &MetadataOp, populate_ids: bool) {
     match op {
         MetadataOp::Initialize(initial) => {
             *metadata = (**initial).clone();
+            rebuild_all_permission_indexes(metadata);
         }
 
         MetadataOp::AddStream { meta, assigned_id } => {
@@ -67,6 +70,7 @@ fn apply_op(metadata: &mut InnerMetadata, op: &MetadataOp, populate_ids: bool) {
             if metadata.streams.contains(*id) {
                 let stream = metadata.streams.remove(*id);
                 metadata.stream_index.remove(&stream.name);
+                clear_stream_permission_indexes(metadata, *id);
             }
         }
 
@@ -176,8 +180,8 @@ fn apply_op(metadata: &mut InnerMetadata, op: &MetadataOp, populate_ids: bool) {
                 && let Some(topic) = stream.topics.get_mut(*topic_id)
                 && let Some(partition) = topic.partitions.get_mut(*partition_id)
             {
-                partition.consumer_offsets = Some(consumer_offsets.clone());
-                partition.consumer_group_offsets = Some(consumer_group_offsets.clone());
+                partition.consumer_offsets = consumer_offsets.clone();
+                partition.consumer_group_offsets = consumer_group_offsets.clone();
             }
         }
 
@@ -190,8 +194,10 @@ fn apply_op(metadata: &mut InnerMetadata, op: &MetadataOp, populate_ids: bool) {
             let mut meta = meta.clone();
             meta.id = id as u32;
             let username = meta.username.clone();
+            let permissions = meta.permissions.clone();
             entry.insert(meta);
             metadata.user_index.insert(username, id as u32);
+            update_permission_indexes(metadata, id as u32, permissions.as_deref());
         }
 
         MetadataOp::UpdateUserMeta { id, meta } => {
@@ -203,7 +209,9 @@ fn apply_op(metadata: &mut InnerMetadata, op: &MetadataOp, populate_ids: bool) {
                 metadata.user_index.insert(meta.username.clone(), *id);
             }
             if metadata.users.contains(user_id) {
+                let permissions = meta.permissions.clone();
                 metadata.users[user_id] = meta.clone();
+                update_permission_indexes(metadata, *id, permissions.as_deref());
             }
         }
 
@@ -214,6 +222,7 @@ fn apply_op(metadata: &mut InnerMetadata, op: &MetadataOp, populate_ids: bool) {
                 metadata.user_index.remove(&user.username);
             }
             metadata.personal_access_tokens.remove(id);
+            clear_permission_indexes(metadata, *id);
         }
 
         MetadataOp::AddPersonalAccessToken { user_id, pat } => {
@@ -344,5 +353,93 @@ fn apply_op(metadata: &mut InnerMetadata, op: &MetadataOp, populate_ids: bool) {
                 }
             }
         }
+    }
+}
+
+fn clear_permission_indexes(metadata: &mut InnerMetadata, user_id: UserId) {
+    metadata.users_global_permissions.remove(&user_id);
+    metadata.users_can_poll_all_streams.remove(&user_id);
+    metadata.users_can_send_all_streams.remove(&user_id);
+    metadata
+        .users_stream_permissions
+        .retain(|(uid, _), _| *uid != user_id);
+    metadata
+        .users_can_poll_stream
+        .retain(|(uid, _)| *uid != user_id);
+    metadata
+        .users_can_send_stream
+        .retain(|(uid, _)| *uid != user_id);
+}
+
+fn clear_stream_permission_indexes(metadata: &mut InnerMetadata, stream_id: StreamId) {
+    metadata
+        .users_stream_permissions
+        .retain(|(_, sid), _| *sid != stream_id);
+    metadata
+        .users_can_poll_stream
+        .retain(|(_, sid)| *sid != stream_id);
+    metadata
+        .users_can_send_stream
+        .retain(|(_, sid)| *sid != stream_id);
+}
+
+fn update_permission_indexes(
+    metadata: &mut InnerMetadata,
+    user_id: UserId,
+    permissions: Option<&Permissions>,
+) {
+    clear_permission_indexes(metadata, user_id);
+
+    let Some(permissions) = permissions else {
+        return;
+    };
+
+    if permissions.global.poll_messages {
+        metadata.users_can_poll_all_streams.insert(user_id);
+    }
+
+    if permissions.global.send_messages {
+        metadata.users_can_send_all_streams.insert(user_id);
+    }
+
+    metadata
+        .users_global_permissions
+        .insert(user_id, permissions.global.clone());
+
+    let Some(streams) = &permissions.streams else {
+        return;
+    };
+
+    for (stream_id, stream_perm) in streams {
+        if stream_perm.poll_messages {
+            metadata.users_can_poll_stream.insert((user_id, *stream_id));
+        }
+
+        if stream_perm.send_messages {
+            metadata.users_can_send_stream.insert((user_id, *stream_id));
+        }
+
+        metadata
+            .users_stream_permissions
+            .insert((user_id, *stream_id), stream_perm.clone());
+    }
+}
+
+fn rebuild_all_permission_indexes(metadata: &mut InnerMetadata) {
+    metadata.users_global_permissions.clear();
+    metadata.users_stream_permissions.clear();
+    metadata.users_can_poll_all_streams.clear();
+    metadata.users_can_send_all_streams.clear();
+    metadata.users_can_poll_stream.clear();
+    metadata.users_can_send_stream.clear();
+
+    let user_permissions: Vec<_> = metadata
+        .users
+        .iter()
+        .map(|(_, user)| (user.id, user.permissions.clone()))
+        .collect();
+
+    for (user_id, permissions) in user_permissions {
+        update_permission_indexes(metadata, user_id, permissions.as_deref());
     }
 }

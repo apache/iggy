@@ -21,15 +21,17 @@ use crate::binary::command::{
 };
 use crate::binary::handlers::partitions::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
-
 use crate::shard::IggyShard;
 use crate::shard::transmission::event::ShardEvent;
+use crate::shard::transmission::frame::ShardResponse;
+use crate::shard::transmission::message::{
+    ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult,
+};
 use crate::state::command::EntryCommand;
 use crate::streaming::session::Session;
-use anyhow::Result;
 use err_trail::ErrContext;
 use iggy_common::delete_partitions::DeletePartitions;
-use iggy_common::{IggyError, SenderKind};
+use iggy_common::{Identifier, IggyError, SenderKind};
 use std::rc::Rc;
 use tracing::{debug, instrument};
 
@@ -50,52 +52,94 @@ impl ServerCommandHandler for DeletePartitions {
         shard.ensure_authenticated(session)?;
         let (stream_id_numeric, topic_id_numeric) =
             shard.resolve_topic_id(&self.stream_id, &self.topic_id)?;
-        shard.permissioner.borrow().delete_partitions(
+        shard.metadata.perm_delete_partitions(
             session.get_user_id(),
             stream_id_numeric,
             topic_id_numeric,
         )?;
-        let stream_id = self.stream_id.clone();
-        let topic_id = self.topic_id.clone();
 
-        // Acquire partition lock to serialize filesystem operations
-        let _partition_guard = shard.fs_locks.partition_lock.lock().await;
-
-        let deleted_partition_ids = shard
-            .delete_partitions(&self.stream_id, &self.topic_id, self.partitions_count)
-            .await?;
-        let event = ShardEvent::DeletedPartitions {
-            stream_id: self.stream_id.clone(),
-            topic_id: self.topic_id.clone(),
-            partitions_count: self.partitions_count,
-            partition_ids: deleted_partition_ids,
+        let request = ShardRequest {
+            stream_id: Identifier::default(),
+            topic_id: Identifier::default(),
+            partition_id: 0,
+            payload: ShardRequestPayload::DeletePartitions {
+                user_id: session.get_user_id(),
+                stream_id: self.stream_id.clone(),
+                topic_id: self.topic_id.clone(),
+                partitions_count: self.partitions_count,
+            },
         };
-        shard.broadcast_event_to_all_shards(event).await?;
 
-        let remaining_partition_ids = shard.streams.with_topic_by_id(
-            &self.stream_id,
-            &self.topic_id,
-            crate::streaming::topics::helpers::get_partition_ids(),
-        );
-        shard.streams.with_topic_by_id_mut(
-            &self.stream_id,
-            &self.topic_id,
-            crate::streaming::topics::helpers::rebalance_consumer_groups(&remaining_partition_ids),
-        );
+        let message = ShardMessage::Request(request);
+        match shard.send_request_to_shard_or_recoil(None, message).await? {
+            ShardSendRequestResult::Recoil(message) => {
+                if let ShardMessage::Request(ShardRequest { payload, .. }) = message
+                    && let ShardRequestPayload::DeletePartitions {
+                        stream_id,
+                        topic_id,
+                        partitions_count,
+                        ..
+                    } = payload
+                {
+                    let _partition_guard = shard.fs_locks.partition_lock.lock().await;
 
-        shard
-        .state
-        .apply(
-            session.get_user_id(),
-            &EntryCommand::DeletePartitions(self),
-        )
-        .await
-        .error(|e: &IggyError| {
-            format!(
-                "{COMPONENT} (error: {e}) - failed to apply delete partitions for stream_id: {stream_id}, topic_id: {topic_id}, session: {session}"
-            )
-        })?;
-        sender.send_empty_ok_response().await?;
+                    // Get numeric IDs BEFORE delete
+                    let (numeric_stream_id, numeric_topic_id) =
+                        shard.resolve_topic_id(&stream_id, &topic_id)?;
+
+                    let deleted_partition_ids = shard
+                        .delete_partitions(&stream_id, &topic_id, partitions_count)
+                        .await?;
+
+                    let event = ShardEvent::DeletedPartitions {
+                        stream_id: stream_id.clone(),
+                        topic_id: topic_id.clone(),
+                        partitions_count,
+                        partition_ids: deleted_partition_ids,
+                    };
+                    shard.broadcast_event_to_all_shards(event).await?;
+
+                    let remaining_partition_count = shard
+                        .metadata
+                        .partitions_count(numeric_stream_id, numeric_topic_id)
+                        as u32;
+                    shard.writer().rebalance_consumer_groups_for_topic(
+                        numeric_stream_id,
+                        numeric_topic_id,
+                        remaining_partition_count,
+                    );
+
+                    shard
+                        .state
+                        .apply(session.get_user_id(), &EntryCommand::DeletePartitions(self))
+                        .await
+                        .error(|e: &IggyError| {
+                            format!(
+                                "{COMPONENT} (error: {e}) - failed to apply delete partitions for stream_id: {}, topic_id: {}, session: {session}",
+                                stream_id, topic_id
+                            )
+                        })?;
+
+                    sender.send_empty_ok_response().await?;
+                } else {
+                    unreachable!(
+                        "Expected a DeletePartitions request inside of DeletePartitions handler, impossible state"
+                    );
+                }
+            }
+            ShardSendRequestResult::Response(response) => match response {
+                ShardResponse::DeletePartitionsResponse(_partition_ids) => {
+                    sender.send_empty_ok_response().await?;
+                }
+                ShardResponse::ErrorResponse(err) => {
+                    return Err(err);
+                }
+                _ => unreachable!(
+                    "Expected a DeletePartitionsResponse inside of DeletePartitions handler, impossible state"
+                ),
+            },
+        }
+
         Ok(HandlerResult::Finished)
     }
 }

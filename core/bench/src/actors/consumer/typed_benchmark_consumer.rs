@@ -18,6 +18,7 @@
 
 use std::sync::Arc;
 
+use crate::utils::ClientFactory;
 use crate::{
     actors::consumer::{
         BenchmarkConsumer,
@@ -33,7 +34,6 @@ use bench_report::{
     numeric_parameter::BenchmarkNumericParameter,
 };
 use iggy::prelude::*;
-use integration::test_server::ClientFactory;
 
 pub enum TypedBenchmarkConsumer {
     High(BenchmarkConsumer<HighLevelConsumerClient>),

@@ -16,23 +16,14 @@
  * under the License.
  */
 
+use super::COMPONENT;
+use crate::metadata::ConsumerGroupMeta;
 use crate::shard::IggyShard;
-use crate::slab::consumer_groups;
-use crate::slab::traits_ext::EntityMarker;
-use crate::slab::traits_ext::Insert;
-use crate::streaming::partitions;
-use crate::streaming::streams::helpers::get_stream_id;
-use crate::streaming::topics::consumer_group;
-use crate::streaming::topics::consumer_group::MEMBERS_CAPACITY;
-use crate::streaming::topics::helpers::get_topic_id;
-use crate::streaming::{streams, topics};
-use arcshift::ArcShift;
 use err_trail::ErrContext;
 use iggy_common::Identifier;
 use iggy_common::IggyError;
 use slab::Slab;
-
-use super::COMPONENT;
+use std::sync::Arc;
 
 impl IggyShard {
     pub fn create_consumer_group(
@@ -40,48 +31,29 @@ impl IggyShard {
         stream_id: &Identifier,
         topic_id: &Identifier,
         name: String,
-    ) -> Result<consumer_group::ConsumerGroup, IggyError> {
-        let exists = self
-            .streams
-            .with_topic_by_id(stream_id, topic_id, |(root, ..)| {
-                root.consumer_groups()
-                    .exists(&name.clone().try_into().unwrap())
-            });
-        if exists {
-            return Err(IggyError::ConsumerGroupNameAlreadyExists(
-                name,
-                topic_id.clone(),
-            ));
-        }
+    ) -> Result<usize, IggyError> {
+        let (stream, topic) = self.resolve_topic_id(stream_id, topic_id)?;
 
-        let cg = self.create_and_insert_consumer_group_mem(stream_id, topic_id, name);
-        Ok(cg)
-    }
+        let partitions_count = self.metadata.partitions_count(stream, topic) as u32;
 
-    fn create_and_insert_consumer_group_mem(
-        &self,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-        name: String,
-    ) -> consumer_group::ConsumerGroup {
-        let partitions = self.streams.with_topics(stream_id, |topics| {
-            topics.with_partitions(topic_id, partitions::helpers::get_partition_ids())
-        });
-        let members = ArcShift::new(Slab::with_capacity(MEMBERS_CAPACITY));
-        let mut cg = consumer_group::ConsumerGroup::new(name, members, partitions);
-        let id = self.insert_consumer_group(stream_id, topic_id, cg.clone());
-        cg.update_id(id);
-        cg
-    }
+        let id = self
+            .writer()
+            .create_consumer_group(
+                &self.metadata,
+                stream,
+                topic,
+                Arc::from(name.as_str()),
+                partitions_count,
+            )
+            .map_err(|e| {
+                if let IggyError::ConsumerGroupNameAlreadyExists(_, _) = &e {
+                    IggyError::ConsumerGroupNameAlreadyExists(name.clone(), topic_id.clone())
+                } else {
+                    e
+                }
+            })?;
 
-    pub fn insert_consumer_group(
-        &self,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-        cg: consumer_group::ConsumerGroup,
-    ) -> consumer_groups::ContainerId {
-        self.streams
-            .with_consumer_groups_mut(stream_id, topic_id, |container| container.insert(cg))
+        Ok(id)
     }
 
     pub fn delete_consumer_group(
@@ -89,44 +61,36 @@ impl IggyShard {
         stream_id: &Identifier,
         topic_id: &Identifier,
         group_id: &Identifier,
-    ) -> Result<consumer_group::ConsumerGroup, IggyError> {
-        self.ensure_consumer_group_exists(stream_id, topic_id, group_id)?;
-        let cg = self.delete_consumer_group_base(stream_id, topic_id, group_id);
+    ) -> Result<ConsumerGroupMeta, IggyError> {
+        let (stream, topic, group) =
+            self.resolve_consumer_group_id(stream_id, topic_id, group_id)?;
+
+        let cg = self.delete_consumer_group_base(stream, topic, group);
         Ok(cg)
     }
 
     fn delete_consumer_group_base(
         &self,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-        group_id: &Identifier,
-    ) -> consumer_group::ConsumerGroup {
-        // Get numeric IDs before deletion for ClientManager cleanup
-        let stream_id_numeric = self.streams.with_stream_by_id(stream_id, get_stream_id());
-        let topic_id_numeric = self
-            .streams
-            .with_topic_by_id(stream_id, topic_id, get_topic_id());
-        let group_id_numeric = self.streams.with_consumer_group_by_id(
-            stream_id,
-            topic_id,
-            group_id,
-            topics::helpers::get_consumer_group_id(),
-        );
+        stream: usize,
+        topic: usize,
+        group: usize,
+    ) -> ConsumerGroupMeta {
+        let cg_meta = self
+            .metadata
+            .get_consumer_group(stream, topic, group)
+            .unwrap_or_else(|| ConsumerGroupMeta {
+                id: group,
+                name: Arc::from(""),
+                partitions: Vec::new(),
+                members: Slab::new(),
+            });
 
-        let cg = self.streams.with_consumer_groups_mut(
-            stream_id,
-            topic_id,
-            topics::helpers::delete_consumer_group(group_id),
-        );
+        self.client_manager
+            .delete_consumer_group(stream, topic, group);
 
-        // Clean up ClientManager state
-        self.client_manager.delete_consumer_group(
-            stream_id_numeric,
-            topic_id_numeric,
-            group_id_numeric,
-        );
+        self.writer().delete_consumer_group(stream, topic, group);
 
-        cg
+        cg_meta
     }
 
     pub fn join_consumer_group(
@@ -136,40 +100,21 @@ impl IggyShard {
         topic_id: &Identifier,
         group_id: &Identifier,
     ) -> Result<(), IggyError> {
-        self.ensure_consumer_group_exists(stream_id, topic_id, group_id)?;
-        self.streams.with_consumer_group_by_id_mut(
-            stream_id,
-            topic_id,
-            group_id,
-            topics::helpers::join_consumer_group(client_id),
-        );
+        let (stream, topic, group) =
+            self.resolve_consumer_group_id(stream_id, topic_id, group_id)?;
 
-        // Update ClientManager state
-        let stream_id_value = self
-            .streams
-            .with_stream_by_id(stream_id, streams::helpers::get_stream_id());
-        let topic_id_value =
-            self.streams
-                .with_topic_by_id(stream_id, topic_id, topics::helpers::get_topic_id());
-        let group_id_value = self.streams.with_consumer_group_by_id(
-            stream_id,
-            topic_id,
-            group_id,
-            topics::helpers::get_consumer_group_id(),
-        );
+        self.writer()
+            .join_consumer_group(stream, topic, group, client_id);
 
-        self.client_manager.join_consumer_group(
-            client_id,
-            stream_id_value,
-            topic_id_value,
-            group_id_value,
-        )
-        .error(|e: &IggyError| {
-            format!(
-                "{COMPONENT} (error: {e}) - failed to make client join consumer group for client ID: {}",
-                client_id
-            )
-        })?;
+        self.client_manager
+            .join_consumer_group(client_id, stream, topic, group)
+            .error(|e: &IggyError| {
+                format!(
+                    "{COMPONENT} (error: {e}) - failed to make client join consumer group for client ID: {}",
+                    client_id
+                )
+            })?;
+
         Ok(())
     }
 
@@ -180,7 +125,9 @@ impl IggyShard {
         topic_id: &Identifier,
         group_id: &Identifier,
     ) -> Result<(), IggyError> {
-        self.ensure_consumer_group_exists(stream_id, topic_id, group_id)?;
+        let (_stream, _topic, _group) =
+            self.resolve_consumer_group_id(stream_id, topic_id, group_id)?;
+
         self.leave_consumer_group_base(stream_id, topic_id, group_id, client_id)
     }
 
@@ -191,46 +138,30 @@ impl IggyShard {
         group_id: &Identifier,
         client_id: u32,
     ) -> Result<(), IggyError> {
-        let Some(_) = self.streams.with_consumer_group_by_id_mut(
-            stream_id,
-            topic_id,
-            group_id,
-            topics::helpers::leave_consumer_group(client_id),
-        ) else {
+        let (stream, topic, group) =
+            self.resolve_consumer_group_id(stream_id, topic_id, group_id)?;
+
+        let member_id = self
+            .writer()
+            .leave_consumer_group(stream, topic, group, client_id);
+
+        if member_id.is_none() {
             return Err(IggyError::ConsumerGroupMemberNotFound(
                 client_id,
                 group_id.clone(),
                 topic_id.clone(),
             ));
-        };
+        }
 
-        self.streams.with_consumer_group_by_id_mut(
-            stream_id,
-            topic_id,
-            group_id,
-            topics::helpers::rebalance_consumer_group(),
-        );
+        self.client_manager
+            .leave_consumer_group(client_id, stream, topic, group)
+            .error(|e: &IggyError| {
+                format!(
+                    "{COMPONENT} (error: {e}) - failed to make client leave consumer group for client ID: {}",
+                    client_id
+                )
+            })?;
 
-        // Update ClientManager state
-        let stream_id_value = self
-            .streams
-            .with_stream_by_id(stream_id, streams::helpers::get_stream_id());
-        let topic_id_value =
-            self.streams
-                .with_topic_by_id(stream_id, topic_id, topics::helpers::get_topic_id());
-        let group_id_value = self.streams.with_consumer_group_by_id(
-            stream_id,
-            topic_id,
-            group_id,
-            topics::helpers::get_consumer_group_id(),
-        );
-
-        self.client_manager.leave_consumer_group(
-            client_id,
-            stream_id_value,
-            topic_id_value,
-            group_id_value,
-        ).error(|e: &IggyError| format!("{COMPONENT} (error: {e}) - failed to make client leave consumer group for client ID: {}", client_id))?;
         Ok(())
     }
 }

@@ -19,11 +19,11 @@
 use super::benchmark::Benchmarkable;
 use crate::args::common::IggyBenchArgs;
 use crate::benchmarks::common::build_producer_futures;
+use crate::utils::ClientFactory;
 use async_trait::async_trait;
 use bench_report::benchmark_kind::BenchmarkKind;
 use bench_report::individual_metrics::BenchmarkIndividualMetrics;
 use iggy::prelude::*;
-use integration::test_server::ClientFactory;
 use std::sync::Arc;
 use tokio::task::JoinSet;
 use tracing::info;

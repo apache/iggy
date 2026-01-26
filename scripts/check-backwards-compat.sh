@@ -184,13 +184,13 @@ ok "server is ready"
 
 # Producer bench (baseline)
 info "Running producer bench on baseline"
-BENCH_CMD=( target/debug/iggy-bench --verbose --message-batches "$BATCHES" --messages-per-batch "$MSGS_PER_BATCH" pinned-producer tcp )
+BENCH_CMD=( target/debug/iggy-bench --message-batches "$BATCHES" --messages-per-batch "$MSGS_PER_BATCH" pinned-producer tcp )
 if command -v timeout >/dev/null 2>&1; then timeout 60s "${BENCH_CMD[@]}"; else "${BENCH_CMD[@]}"; fi
 ok "producer bench done"
 
 # Consumer bench (baseline)
 info "Running consumer bench on baseline"
-BENCH_CMD=( target/debug/iggy-bench --verbose --message-batches "$BATCHES" --messages-per-batch "$MSGS_PER_BATCH" pinned-consumer tcp )
+BENCH_CMD=( target/debug/iggy-bench --message-batches "$BATCHES" --messages-per-batch "$MSGS_PER_BATCH" pinned-consumer tcp )
 if command -v timeout >/dev/null 2>&1; then timeout 60s "${BENCH_CMD[@]}"; else "${BENCH_CMD[@]}"; fi
 ok "consumer bench done (baseline)"
 
@@ -249,7 +249,7 @@ ok "PR server is ready"
 
 # Only consumer bench against PR
 info "Running consumer bench on PR (compat check)"
-BENCH_CMD=( target/debug/iggy-bench --verbose --message-batches "$BATCHES" --messages-per-batch "$MSGS_PER_BATCH" pinned-consumer tcp )
+BENCH_CMD=( target/debug/iggy-bench --message-batches "$BATCHES" --messages-per-batch "$MSGS_PER_BATCH" pinned-consumer tcp )
 if command -v timeout >/dev/null 2>&1; then timeout 60s "${BENCH_CMD[@]}"; else "${BENCH_CMD[@]}"; fi
 ok "consumer bench done (PR)"
 

@@ -178,6 +178,7 @@ serde_yaml_ng = "0.10.0"
 serial_test = "3.3.1"
 server = { path = "core/server" }
 simd-json = { version = "0.17.0", features = ["serde_impl"] }
+slab = "0.4.1"
 strum = { version = "0.27.2", features = ["derive"] }
 strum_macros = "0.27.2"
 sysinfo = "0.37.2"
@@ -212,7 +213,7 @@ uuid = { version = "1.19.0", features = [
     "zerocopy",
 ] }
 webpki-roots = "1.0.5"
-zip = "=7.0.0"
+zip = { version = "7.1.0", default-features = false, features = ["deflate"] }
 
 [profile.release]
 lto = true

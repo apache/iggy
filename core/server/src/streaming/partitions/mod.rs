@@ -16,12 +16,16 @@
  * under the License.
  */
 
+pub mod consumer_group_offsets;
 pub mod consumer_offset;
+pub mod consumer_offsets;
 pub mod helpers;
 pub mod in_flight;
 pub mod journal;
+pub mod local_partition;
+pub mod local_partitions;
 pub mod log;
-pub mod partition;
+pub mod ops;
 pub mod segments;
 pub mod storage;
 

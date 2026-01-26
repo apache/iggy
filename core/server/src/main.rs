@@ -28,19 +28,17 @@ use iggy_common::{Aes256GcmEncryptor, EncryptorKind, IggyError, MemoryPool};
 use server::SEMANTIC_VERSION;
 use server::args::Args;
 use server::bootstrap::{
-    create_directories, create_shard_connections, create_shard_executor, load_config, load_streams,
-    load_users, resolve_persister, update_system_info,
+    create_directories, create_shard_connections, create_shard_executor, load_config,
+    load_metadata, resolve_persister, update_system_info,
 };
 use server::configs::sharding::ShardAllocator;
 use server::diagnostics::{print_io_uring_permission_info, print_locked_memory_limit_info};
 use server::io::fs_utils;
 use server::log::logger::Logging;
+use server::metadata::{Metadata, create_metadata_handles};
 use server::server_error::ServerError;
 use server::shard::system::info::SystemInfo;
 use server::shard::{IggyShard, calculate_shard_assignment};
-use server::slab::traits_ext::{
-    EntityComponentSystem, EntityComponentSystemMutCell, IntoComponents,
-};
 use server::state::file::FileState;
 use server::state::system::SystemState;
 use server::streaming::clients::client_manager::{Client, ClientManager};
@@ -278,8 +276,19 @@ fn main() -> Result<(), ServerError> {
         );
         let state = SystemState::load(state).await?;
         let (streams_state, users_state) = state.decompose();
-        let streams = load_streams(streams_state.into_values(), &config.system).await?;
-        let users = load_users(users_state.into_values());
+
+        // Create left-right handles for metadata
+        let (mut metadata_writer, metadata_reader) = create_metadata_handles();
+
+        // Create shared metadata reader - each shard will get a clone
+        let metadata = Metadata::new(metadata_reader);
+
+        // Load initial metadata using the writer
+        load_metadata(
+            users_state.into_values(),
+            streams_state.into_values(),
+            &mut metadata_writer,
+        );
 
         // ELEVENTH DISCRETE LOADING STEP.
         let shard_allocator = ShardAllocator::new(&config.system.sharding.cpu_allocation)?;
@@ -320,41 +329,33 @@ fn main() -> Result<(), ServerError> {
         let client_manager: EternalPtr<DashMap<u32, Client>> = client_manager.into();
         let client_manager = ClientManager::new(client_manager);
 
-        streams.with_components(|components| {
-            let (root, ..) = components.into_components();
-            for (_, stream) in root.iter() {
-                stream.topics().with_components(|components| {
-                    let (root, ..) = components.into_components();
-                    for (_, topic) in root.iter() {
-                        topic.partitions().with_components(|components| {
-                            let (root, ..) = components.into_components();
-                            for (_, partition) in root.iter() {
-                                let stream_id = stream.id();
-                                let topic_id = topic.id();
-                                let partition_id = partition.id();
-                                let ns = IggyNamespace::new(stream_id, topic_id, partition_id);
-                                let shard_id = ShardId::new(calculate_shard_assignment(
-                                    &ns,
-                                    shard_assignment.len() as u32,
-                                ));
-                                // TODO(hubcio): LocalIdx is 0 until IggyPartitions is integratedds
-                                let location = PartitionLocation::new(shard_id, LocalIdx::new(0));
-                                shards_table.insert(ns, location);
-                            }
-                        });
+        // Populate shards_table from SharedMetadata partitions (hierarchical traversal)
+        metadata.with_metadata(|metadata| {
+            for (stream_id, stream_meta) in metadata.streams.iter() {
+                for (topic_id, topic_meta) in stream_meta.topics.iter() {
+                    for (partition_id, _partition_meta) in topic_meta.partitions.iter().enumerate() {
+                        let ns = IggyNamespace::new(stream_id, topic_id, partition_id);
+                        let shard_id = ShardId::new(calculate_shard_assignment(
+                            &ns,
+                            shard_assignment.len() as u32,
+                        ));
+                        // TODO(hubcio): LocalIdx is 0 until IggyPartitions is integrated
+                        let location = PartitionLocation::new(shard_id, LocalIdx::new(0));
+                        shards_table.insert(ns, location);
                     }
-                })
+                }
             }
         });
+
+        // Wrap metadata_writer in Option so we can take it for shard 0
+        let mut metadata_writer_opt = Some(metadata_writer);
 
         for (id, assignment) in shard_assignment
             .into_iter()
             .enumerate()
             .map(|(idx, assignment)| (idx as u16, assignment))
         {
-            let streams = streams.clone();
             let shards_table = shards_table.clone();
-            let users = users.clone();
             let connections = connections.clone();
             let config = config.clone();
             let encryptor = encryptor.clone();
@@ -372,29 +373,14 @@ fn main() -> Result<(), ServerError> {
                 state_term.clone(),
             );
             let client_manager = client_manager.clone();
+            let shard_metadata = metadata.clone();
 
-            // TODO: Explore decoupling the `Log` from `Partition` entity.
-            // Ergh... I knew this will backfire to include `Log` as part of the `Partition` entity,
-            // We have to initialize with a default log for every partition, once we `Clone` the Streams / Topics / Partitions,
-            // because `Clone` impl for `Partition` does not clone the actual log, just creates an empty one.
-            streams.with_components(|components| {
-                let (root, ..) = components.into_components();
-                for (_, stream) in root.iter() {
-                    stream.topics().with_components_mut(|components| {
-                        let (mut root, ..) = components.into_components();
-                        for (_, topic) in root.iter_mut() {
-                            let partitions_count = topic.partitions().len();
-                            for log_id in 0..partitions_count {
-                                let id = topic.partitions_mut().insert_default_log();
-                                assert_eq!(
-                                    id, log_id,
-                                    "main: partition_insert_default_log: id mismatch when creating default log"
-                                );
-                            }
-                        }
-                    })
-                }
-            });
+            // Take metadata_writer for shard 0 only
+            let shard_metadata_writer = if id == 0 {
+                metadata_writer_opt.take()
+            } else {
+                None
+            };
 
             let shard_done_tx = shard_done_tx.clone();
             let handle = std::thread::Builder::new()
@@ -411,12 +397,10 @@ fn main() -> Result<(), ServerError> {
 
                         let rt = create_shard_executor();
                         rt.block_on(async move {
-                            let builder = IggyShard::builder();
-                            let shard = builder
+                            let mut builder = IggyShard::builder();
+                            builder = builder
                                 .id(id)
-                                .streams(streams)
                                 .state(state)
-                                .users(users)
                                 .shards_table(shards_table)
                                 .connections(connections)
                                 .clients_manager(client_manager)
@@ -425,7 +409,13 @@ fn main() -> Result<(), ServerError> {
                                 .version(current_version)
                                 .metrics(metrics)
                                 .is_follower(is_follower)
-                                .build();
+                                .metadata(shard_metadata);
+
+                            if let Some(writer) = shard_metadata_writer {
+                                builder = builder.metadata_writer(writer);
+                            }
+
+                            let shard = builder.build();
 
                             let shard = Rc::new(shard);
 
