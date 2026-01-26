@@ -16,15 +16,12 @@
  * under the License.
  */
 
-// The compression and decompression utilities are shared between the producer and consumer compression examples.
-// Hence, we import them here.
-#[path = "../codec.rs"]
-mod codec;
-use codec::{Codec, NUM_MESSAGES, STREAM_NAME, TOPIC_NAME};
-
 use bytes::Bytes;
 use futures_util::stream::StreamExt;
 use iggy::prelude::*;
+// The compression and decompression utilities are shared between the producer and consumer compression examples.
+// Hence, we import them here.
+use iggy_examples::shared::codec::{Codec, NUM_MESSAGES, STREAM_NAME, TOPIC_NAME};
 
 pub const CONSUMER_NAME: &str = "example-consumer";
 

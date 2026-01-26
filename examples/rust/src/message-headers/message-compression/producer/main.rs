@@ -16,13 +16,12 @@
  * under the License.
  */
 
-#[path = "../codec.rs"]
-mod codec;
-
 use bytes::Bytes;
-use codec::{Codec, NUM_MESSAGES, STREAM_NAME, TOPIC_NAME};
 use iggy::prelude::*;
 use std::collections::HashMap;
+// The compression and decompression utilities are shared between the producer and consumer compression examples.
+// Hence, we import them here.
+use iggy_examples::shared::codec::{Codec, NUM_MESSAGES, STREAM_NAME, TOPIC_NAME};
 
 #[tokio::main]
 async fn main() -> Result<(), IggyError> {
@@ -97,5 +96,8 @@ async fn main() -> Result<(), IggyError> {
         .send(messages)
         .await
         .expect("Message sending failed.");
+
+    println!("All messages sent to server.");
+
     Ok(())
 }

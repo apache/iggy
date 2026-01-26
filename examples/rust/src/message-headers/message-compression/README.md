@@ -37,7 +37,7 @@ Run the following commands
 
 ## The Codec
 
-The **co**mpression and **dec**compression utilities are implemented in `../compression.rs` and used when sending messages to the server and reading them from the server.
+The **co**mpression and **dec**compression utilities are implemented in `examples/rust/src/shared/codec.rs` and used when sending messages to the server and reading them from the server.
 
 First, define a stream and a topic name.
 The producer will first initiate the stream and the topic on that stream and then write the example messages to that topic wihtin that stream.

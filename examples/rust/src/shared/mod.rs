@@ -18,6 +18,7 @@
 
 pub mod args;
 pub mod client;
+pub mod codec;
 pub mod messages;
 pub mod messages_generator;
 pub mod stream;
