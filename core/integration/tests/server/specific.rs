@@ -1,4 +1,5 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
  * regarding copyright ownership.  The ASF licenses this file
@@ -17,9 +18,9 @@
  */
 
 use crate::server::scenarios::{
-    cross_protocol_pat_scenario, delete_segments_scenario, message_size_scenario,
-    segment_rotation_race_scenario, single_message_per_batch_scenario, tcp_tls_scenario,
-    websocket_tls_scenario,
+    cross_protocol_pat_scenario, delete_segments_scenario, log_rotation_scenario,
+    message_size_scenario, segment_rotation_race_scenario, single_message_per_batch_scenario,
+    tcp_tls_scenario, websocket_tls_scenario,
 };
 use iggy::prelude::*;
 use integration::{
@@ -130,9 +131,53 @@ async fn tcp_tls_self_signed_scenario_should_be_valid() {
         .await
         .expect("Failed to connect TLS client with self-signed cert");
 
-    let client = iggy::clients::client::IggyClient::create(ClientWrapper::Iggy(client), None, None);
+    let client = IggyClient::create(ClientWrapper::Iggy(client), None, None);
 
     tcp_tls_scenario::run(&client).await;
+}
+
+#[tokio::test]
+#[parallel]
+async fn log_rotation_should_be_valid() {
+    let test_configs = log_rotation_scenario::get_configurations();
+    let mut tasks = Vec::new();
+    for present_log_config in test_configs {
+        let task = tokio::spawn(async move {
+            let mut extra_envs = HashMap::new();
+            extra_envs.insert(
+                "IGGY_SYSTEM_LOGGING_MAX_FILE_SIZE".to_string(),
+                format!("{}", present_log_config.max_single_log_size),
+            );
+            extra_envs.insert(
+                "IGGY_SYSTEM_LOGGING_MAX_TOTAL_SIZE".to_string(),
+                format!("{}", present_log_config.max_total_log_size),
+            );
+            extra_envs.insert(
+                "IGGY_SYSTEM_LOGGING_ROTATION_CHECK_INTERVAL".to_string(),
+                format!("{}", present_log_config.rotation_check_interval),
+            );
+            extra_envs.insert(
+                "IGGY_SYSTEM_LOGGING_RETENTION".to_string(),
+                format!("{}", present_log_config.retention),
+            );
+
+            let mut test_server = TestServer::new(Some(extra_envs), true, None, IpAddrKind::V4);
+            test_server.start();
+
+            let server_addr = test_server.get_raw_tcp_addr().unwrap();
+            let client_factory = TcpClientFactory {
+                server_addr,
+                ..Default::default()
+            };
+
+            let log_dir = format!("{}/logs", test_server.get_local_data_path());
+
+            test_server.assert_running();
+            log_rotation_scenario::run(&client_factory, &log_dir, present_log_config).await;
+        });
+        tasks.push(task);
+    }
+    futures::future::join_all(tasks).await;
 }
 
 #[tokio::test]

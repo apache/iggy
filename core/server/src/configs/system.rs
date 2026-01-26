@@ -16,13 +16,12 @@
  * under the License.
  */
 
+use super::cache_indexes::CacheIndexesConfig;
+use super::sharding::ShardingConfig;
 use crate::configs::server::MemoryPoolConfig;
 use crate::slab::partitions;
 use crate::slab::streams;
 use crate::slab::topics;
-
-use super::cache_indexes::CacheIndexesConfig;
-use super::sharding::ShardingConfig;
 use iggy_common::IggyByteSize;
 use iggy_common::IggyError;
 use iggy_common::IggyExpiry;
@@ -87,7 +86,10 @@ pub struct LoggingConfig {
     pub path: String,
     pub level: String,
     pub file_enabled: bool,
-    pub max_size: IggyByteSize,
+    pub max_file_size: IggyByteSize,
+    pub max_total_size: IggyByteSize,
+    #[serde_as(as = "DisplayFromStr")]
+    pub rotation_check_interval: IggyDuration,
     #[serde_as(as = "DisplayFromStr")]
     pub retention: IggyDuration,
     #[serde_as(as = "DisplayFromStr")]

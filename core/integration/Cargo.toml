@@ -45,6 +45,7 @@ keyring = { workspace = true }
 lazy_static = { workspace = true }
 libc = "0.2.180"
 log = { workspace = true }
+once_cell = "1.21.3"
 predicates = { workspace = true }
 rand = { workspace = true }
 rcgen = "0.14.6"
