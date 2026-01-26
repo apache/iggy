@@ -38,10 +38,12 @@ use tokio::runtime::Runtime;
 
 pub mod decoders;
 pub mod encoders;
+pub mod log;
 pub mod sink;
 pub mod source;
 pub mod transforms;
 
+pub use log::LogCallback;
 pub use transforms::Transform;
 
 static RUNTIME: OnceCell<Runtime> = OnceCell::new();

@@ -41,18 +41,20 @@ use std::{
     sync::{Arc, atomic::AtomicU32},
 };
 use tracing::{debug, info};
-use tracing_subscriber::{EnvFilter, Registry, layer::SubscriberExt, util::SubscriberInitExt};
 
 mod api;
 pub(crate) mod configs;
 pub(crate) mod context;
 pub(crate) mod error;
+mod log;
 mod manager;
 mod sink;
 mod source;
 mod state;
 mod stream;
 mod transform;
+
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
@@ -73,6 +75,7 @@ struct SourceApi {
         config_len: usize,
         state_ptr: *const u8,
         state_len: usize,
+        log_callback: iggy_connector_sdk::LogCallback,
     ) -> i32,
     handle: extern "C" fn(id: u32, callback: SendCallback) -> i32,
     close: extern "C" fn(id: u32) -> i32,
@@ -80,7 +83,12 @@ struct SourceApi {
 
 #[derive(WrapperApi)]
 struct SinkApi {
-    open: extern "C" fn(id: u32, config_ptr: *const u8, config_len: usize) -> i32,
+    open: extern "C" fn(
+        id: u32,
+        config_ptr: *const u8,
+        config_len: usize,
+        log_callback: iggy_connector_sdk::LogCallback,
+    ) -> i32,
     #[allow(clippy::too_many_arguments)]
     consume: extern "C" fn(
         id: u32,
@@ -116,19 +124,16 @@ async fn main() -> Result<(), RuntimeError> {
         );
     }
 
-    Registry::default()
-        .with(tracing_subscriber::fmt::layer())
-        .with(EnvFilter::try_from_default_env().unwrap_or(EnvFilter::new("INFO")))
-        .init();
-
     let config_path =
         env::var("IGGY_CONNECTORS_CONFIG_PATH").unwrap_or_else(|_| DEFAULT_CONFIG_PATH.to_string());
-    info!("Starting Iggy Connectors Runtime, loading configuration from: {config_path}...");
+    println!("Starting Iggy Connectors Runtime, loading configuration from: {config_path}...");
 
     let config: ConnectorsRuntimeConfig = ConnectorsRuntimeConfig::config_provider(config_path)
         .load_config()
         .await
         .expect("Failed to load configuration");
+
+    log::init_logging(&config.telemetry, VERSION);
 
     std::fs::create_dir_all(&config.state.path).expect("Failed to create state directory");
 
