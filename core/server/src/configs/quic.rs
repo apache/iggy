@@ -16,6 +16,7 @@
  * under the License.
  */
 
+use iggy_common::ConfigEnv;
 use iggy_common::IggyByteSize;
 use iggy_common::IggyDuration;
 use serde::{Deserialize, Serialize};
@@ -23,32 +24,40 @@ use serde_with::DisplayFromStr;
 use serde_with::serde_as;
 
 #[serde_as]
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
 pub struct QuicConfig {
     pub enabled: bool,
     pub address: String,
     pub max_concurrent_bidi_streams: u64,
+    #[config_env(leaf)]
     pub datagram_send_buffer_size: IggyByteSize,
+    #[config_env(leaf)]
     pub initial_mtu: IggyByteSize,
+    #[config_env(leaf)]
     pub send_window: IggyByteSize,
+    #[config_env(leaf)]
     pub receive_window: IggyByteSize,
+    #[config_env(leaf)]
     #[serde_as(as = "DisplayFromStr")]
     pub keep_alive_interval: IggyDuration,
+    #[config_env(leaf)]
     #[serde_as(as = "DisplayFromStr")]
     pub max_idle_timeout: IggyDuration,
     pub certificate: QuicCertificateConfig,
     pub socket: QuicSocketConfig,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
 pub struct QuicSocketConfig {
     pub override_defaults: bool,
+    #[config_env(leaf)]
     pub recv_buffer_size: IggyByteSize,
+    #[config_env(leaf)]
     pub send_buffer_size: IggyByteSize,
     pub keepalive: bool,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
 pub struct QuicCertificateConfig {
     pub self_signed: bool,
     pub cert_file: String,

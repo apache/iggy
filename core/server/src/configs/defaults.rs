@@ -42,8 +42,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 static_toml::static_toml! {
-    // static_toml crate always starts from CARGO_MANIFEST_DIR (in this case iggy-server root directory)
-    pub static SERVER_CONFIG = include_toml!("../configs/server.toml");
+    // static_toml crate always starts from CARGO_MANIFEST_DIR (core/server)
+    pub static SERVER_CONFIG = include_toml!("config.toml");
 }
 
 impl Default for ServerConfig {

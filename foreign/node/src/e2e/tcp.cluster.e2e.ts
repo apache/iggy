@@ -22,7 +22,7 @@ import assert from "node:assert/strict";
 import { getTestClient } from "./test-client.utils.js";
 
 // cluster mode still in dev atm
-// response is mocked from /core/configs/server.toml
+// response is mocked from /core/server/config.toml
 const expectedMeta = {
   name: "iggy-cluster",
   nodes: [

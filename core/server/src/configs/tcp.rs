@@ -16,12 +16,12 @@
  * under the License.
  */
 
-use iggy_common::{IggyByteSize, IggyDuration};
+use iggy_common::{ConfigEnv, IggyByteSize, IggyDuration};
 use serde::{Deserialize, Serialize};
 use serde_with::DisplayFromStr;
 use serde_with::serde_as;
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
 pub struct TcpConfig {
     pub enabled: bool,
     pub address: String,
@@ -31,7 +31,7 @@ pub struct TcpConfig {
     pub socket_migration: bool,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
 pub struct TcpTlsConfig {
     pub enabled: bool,
     pub self_signed: bool,
@@ -40,13 +40,16 @@ pub struct TcpTlsConfig {
 }
 
 #[serde_as]
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
 pub struct TcpSocketConfig {
     pub override_defaults: bool,
+    #[config_env(leaf)]
     pub recv_buffer_size: IggyByteSize,
+    #[config_env(leaf)]
     pub send_buffer_size: IggyByteSize,
     pub keepalive: bool,
     pub nodelay: bool,
+    #[config_env(leaf)]
     #[serde_as(as = "DisplayFromStr")]
     pub linger: IggyDuration,
 }
