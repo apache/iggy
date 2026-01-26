@@ -199,7 +199,7 @@ simd-json = { version = "0.17.0", features = ["serde_impl"] }
 slab = "0.4.1"
 strum = { version = "0.27.2", features = ["derive"] }
 strum_macros = "0.27.2"
-sysinfo = "0.37.2"
+sysinfo = "0.38.0"
 tempfile = "3.24.0"
 test-case = "3.3.1"
 thiserror = "2.0.17"
