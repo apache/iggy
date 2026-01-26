@@ -4460,7 +4460,7 @@ dependencies = [
 
 [[package]]
 name = "iggy"
-version = "0.8.1-edge.4"
+version = "0.8.1-edge.5"
 dependencies = [
  "async-broadcast",
  "async-dropper",
