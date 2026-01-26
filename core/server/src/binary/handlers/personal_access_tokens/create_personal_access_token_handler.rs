@@ -51,11 +51,12 @@ impl ServerCommandHandler for CreatePersonalAccessToken {
         debug!("session: {session}, command: {self}");
         shard.ensure_authenticated(session)?;
 
+        let user_id = session.get_user_id();
         let (personal_access_token, token) = shard
-                .create_personal_access_token(session, &self.name, self.expiry)
+                .create_personal_access_token(user_id, &self.name, self.expiry)
                 .error(|e: &IggyError| {
                     format!(
-                        "{COMPONENT} (error: {e}) - failed to create personal access token with name: {}, session: {session}",
+                        "{COMPONENT} (error: {e}) - failed to create personal access token with name: {}, user: {user_id}",
                         self.name
                     )
                 })?;

@@ -29,7 +29,7 @@ use std::str::from_utf8;
 /// `CreateStream` command is used to create a new stream.
 /// It has additional payload:
 /// - `name` - unique stream name (string), max length is 255 characters.
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 pub struct CreateStream {
     /// Unique stream name (string), max length is 255 characters.
     pub name: String,

@@ -47,11 +47,12 @@ impl ServerCommandHandler for DeletePersonalAccessToken {
         debug!("session: {session}, command: {self}");
         shard.ensure_authenticated(session)?;
         let token_name = self.name.clone();
+        let user_id = session.get_user_id();
 
         shard
-                .delete_personal_access_token(session, &self.name)
+                .delete_personal_access_token(user_id, &self.name)
                 .error(|e: &IggyError| {format!(
-                    "{COMPONENT} (error: {e}) - failed to delete personal access token with name: {token_name}, session: {session}"
+                    "{COMPONENT} (error: {e}) - failed to delete personal access token with name: {token_name}, user: {user_id}"
                 )})?;
 
         // Broadcast the event to other shards

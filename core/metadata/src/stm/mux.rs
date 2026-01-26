@@ -92,14 +92,16 @@ mod tests {
 
     #[test]
     fn construct_mux_state_machine_from_states_with_same_output() {
-        use crate::stm::*;
+        use crate::stm::StateMachine;
+        use crate::stm::mux::MuxStateMachine;
+        use crate::stm::stream::{Streams, StreamsInner};
+        use crate::stm::user::{Users, UsersInner};
         use iggy_common::header::PrepareHeader;
         use iggy_common::message::Message;
 
-        let users = user::Users::new();
-        let streams = stream::Streams::new();
-        let cgs = consumer_group::ConsumerGroups::new();
-        let mux = mux::MuxStateMachine::new(variadic!(users, streams, cgs));
+        let users: Users = UsersInner::new().into();
+        let streams: Streams = StreamsInner::new().into();
+        let mux = MuxStateMachine::new(variadic!(users, streams));
 
         let input = Message::new(std::mem::size_of::<PrepareHeader>());
         let mut output = Vec::new();

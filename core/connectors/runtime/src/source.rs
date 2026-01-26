@@ -91,6 +91,7 @@ pub async fn init(
                 transforms: vec![],
                 state_storage,
                 error: init_error.clone(),
+                verbose: config.verbose,
             });
         } else {
             let container: Container<SourceApi> =
@@ -118,6 +119,7 @@ pub async fn init(
                         transforms: vec![],
                         state_storage,
                         error: init_error.clone(),
+                        verbose: config.verbose,
                     }],
                 },
             );
@@ -267,7 +269,11 @@ pub fn handle(sources: Vec<SourceConnectorWrapper>, context: Arc<RuntimeContext>
 
                 while let Ok(produced_messages) = receiver.recv_async().await {
                     let count = produced_messages.messages.len();
-                    info!("Source connector with ID: {plugin_id} received {count} messages",);
+                    if plugin.verbose {
+                        info!("Source connector with ID: {plugin_id} received {count} messages",);
+                    } else {
+                        debug!("Source connector with ID: {plugin_id} received {count} messages",);
+                    }
                     let schema = produced_messages.schema;
                     let mut messages: Vec<DecodedMessage> = Vec::with_capacity(count);
                     for message in produced_messages.messages {
@@ -322,11 +328,19 @@ pub fn handle(sources: Vec<SourceConnectorWrapper>, context: Arc<RuntimeContext>
                         continue;
                     }
 
-                    info!(
-                        "Sent {count} messages to stream: {}, topic: {} by source connector with ID: {plugin_id}",
-                        producer.stream(),
-                        producer.topic()
-                    );
+                    if plugin.verbose {
+                        info!(
+                            "Sent {count} messages to stream: {}, topic: {} by source connector with ID: {plugin_id}",
+                            producer.stream(),
+                            producer.topic()
+                        );
+                    } else {
+                        debug!(
+                            "Sent {count} messages to stream: {}, topic: {} by source connector with ID: {plugin_id}",
+                            producer.stream(),
+                            producer.topic()
+                        );
+                    }
 
                     let Some(state) = produced_messages.state else {
                         debug!("No state provided for source connector with ID: {plugin_id}");

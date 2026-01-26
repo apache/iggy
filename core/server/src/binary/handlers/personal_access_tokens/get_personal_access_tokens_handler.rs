@@ -46,9 +46,12 @@ impl ServerCommandHandler for GetPersonalAccessTokens {
         debug!("session: {session}, command: {self}");
         shard.ensure_authenticated(session)?;
         let personal_access_tokens = shard
-            .get_personal_access_tokens(session)
+            .get_personal_access_tokens(session.get_user_id())
             .error(|e: &IggyError| {
-                format!("{COMPONENT} (error: {e}) - failed to get personal access tokens with session: {session}")
+                format!(
+                    "{COMPONENT} (error: {e}) - failed to get personal access tokens for user: {}",
+                    session.get_user_id()
+                )
             })?;
         let personal_access_tokens = mapper::map_personal_access_tokens(personal_access_tokens);
         sender.send_ok_response(&personal_access_tokens).await?;

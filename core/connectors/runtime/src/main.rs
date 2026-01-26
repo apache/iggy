@@ -276,6 +276,7 @@ struct SinkConnectorPlugin {
     config_format: Option<ConfigFormat>,
     consumers: Vec<SinkConnectorConsumer>,
     error: Option<String>,
+    verbose: bool,
 }
 
 struct SinkConnectorConsumer {
@@ -310,6 +311,7 @@ struct SourceConnectorPlugin {
     producer: Option<SourceConnectorProducer>,
     state_storage: StateStorage,
     error: Option<String>,
+    verbose: bool,
 }
 
 struct SourceConnectorProducer {

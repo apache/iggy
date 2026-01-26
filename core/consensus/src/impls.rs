@@ -17,7 +17,7 @@
 
 use crate::vsr_timeout::{TimeoutKind, TimeoutManager};
 use crate::{
-    Consensus, DvcQuorumArray, Project, StoredDvc, dvc_count, dvc_max_commit,
+    Consensus, DvcQuorumArray, Pipeline, Project, StoredDvc, dvc_count, dvc_max_commit,
     dvc_quorum_array_empty, dvc_record, dvc_reset, dvc_select_winner,
 };
 use bit_set::BitSet;
@@ -133,18 +133,18 @@ impl RequestEntry {
     }
 }
 
-pub struct Pipeline {
+pub struct LocalPipeline {
     /// Messages being prepared (uncommitted and being replicated).
     prepare_queue: VecDeque<PipelineEntry>,
 }
 
-impl Default for Pipeline {
+impl Default for LocalPipeline {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Pipeline {
+impl LocalPipeline {
     pub fn new() -> Self {
         Self {
             prepare_queue: VecDeque::with_capacity(PIPELINE_PREPARE_QUEUE_MAX),
@@ -168,12 +168,12 @@ impl Pipeline {
         self.prepare_queue.is_empty()
     }
 
-    /// Push a new prepare to the pipeline.
+    /// Push a new message to the pipeline.
     ///
     /// # Panics
-    /// - If prepare queue is full.
-    /// - If the prepare doesn't chain correctly to the previous entry.
-    pub fn push_prepare(&mut self, message: Message<PrepareHeader>) {
+    /// - If message queue is full.
+    /// - If the message doesn't chain correctly to the previous entry.
+    pub fn push_message(&mut self, message: Message<PrepareHeader>) {
         assert!(!self.prepare_queue_full(), "prepare queue is full");
 
         let header = message.header();
@@ -198,9 +198,9 @@ impl Pipeline {
         self.prepare_queue.push_back(PipelineEntry::new(message));
     }
 
-    /// Pop the oldest prepare (after it's been committed).
+    /// Pop the oldest message (after it's been committed).
     ///
-    pub fn pop_prepare(&mut self) -> Option<PipelineEntry> {
+    pub fn pop_message(&mut self) -> Option<PipelineEntry> {
         self.prepare_queue.pop_front()
     }
 
@@ -218,8 +218,8 @@ impl Pipeline {
         self.prepare_queue.back()
     }
 
-    /// Find a prepare by op number and checksum.
-    pub fn prepare_by_op_and_checksum(
+    /// Find a message by op number and checksum.
+    pub fn message_by_op_and_checksum(
         &mut self,
         op: u64,
         checksum: u128,
@@ -250,8 +250,8 @@ impl Pipeline {
         }
     }
 
-    /// Find a prepare by op number only.
-    pub fn prepare_by_op(&self, op: u64) -> Option<&PipelineEntry> {
+    /// Find a message by op number only.
+    pub fn message_by_op(&self, op: u64) -> Option<&PipelineEntry> {
         let head_op = self.prepare_queue.front()?.message.header().op;
 
         if op < head_op {
@@ -262,9 +262,9 @@ impl Pipeline {
         self.prepare_queue.get(index)
     }
 
-    /// Get mutable reference to a prepare entry by op number.
+    /// Get mutable reference to a message entry by op number.
     /// Returns None if op is not in the pipeline.
-    pub fn prepare_by_op_mut(&mut self, op: u64) -> Option<&mut PipelineEntry> {
+    pub fn message_by_op_mut(&mut self, op: u64) -> Option<&mut PipelineEntry> {
         let head_op = self.prepare_queue.front()?.message.header().op;
         if op < head_op {
             return None;
@@ -322,6 +322,43 @@ impl Pipeline {
     }
 }
 
+impl Pipeline for LocalPipeline {
+    type Message = Message<PrepareHeader>;
+    type Entry = PipelineEntry;
+
+    fn push_message(&mut self, message: Self::Message) {
+        LocalPipeline::push_message(self, message)
+    }
+
+    fn pop_message(&mut self) -> Option<Self::Entry> {
+        LocalPipeline::pop_message(self)
+    }
+
+    fn clear(&mut self) {
+        LocalPipeline::clear(self)
+    }
+
+    fn message_by_op_mut(&mut self, op: u64) -> Option<&mut Self::Entry> {
+        LocalPipeline::message_by_op_mut(self, op)
+    }
+
+    fn message_by_op_and_checksum(&mut self, op: u64, checksum: u128) -> Option<&mut Self::Entry> {
+        LocalPipeline::message_by_op_and_checksum(self, op, checksum)
+    }
+
+    fn is_full(&self) -> bool {
+        LocalPipeline::is_full(self)
+    }
+
+    fn is_empty(&self) -> bool {
+        LocalPipeline::is_empty(self)
+    }
+
+    fn verify(&self) {
+        LocalPipeline::verify(self)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
     Normal,
@@ -373,7 +410,7 @@ pub struct VsrConsensus {
     last_timestamp: Cell<u64>,
     last_prepare_checksum: Cell<u128>,
 
-    pipeline: RefCell<Pipeline>,
+    pipeline: RefCell<LocalPipeline>,
 
     message_bus: IggyMessageBus,
     // TODO: Add loopback_queue for messages to self
@@ -411,7 +448,7 @@ impl VsrConsensus {
             commit: Cell::new(0),
             last_timestamp: Cell::new(0),
             last_prepare_checksum: Cell::new(0),
-            pipeline: RefCell::new(Pipeline::new()),
+            pipeline: RefCell::new(LocalPipeline::new()),
             message_bus: IggyMessageBus::new(replica_count as usize, replica as u16, 0),
             start_view_change_from_all_replicas: RefCell::new(BitSet::with_capacity(REPLICAS_MAX)),
             do_view_change_from_all_replicas: RefCell::new(dvc_quorum_array_empty()),
@@ -478,11 +515,11 @@ impl VsrConsensus {
         self.status.get()
     }
 
-    pub fn pipeline(&self) -> &RefCell<Pipeline> {
+    pub fn pipeline(&self) -> &RefCell<LocalPipeline> {
         &self.pipeline
     }
 
-    pub fn pipeline_mut(&mut self) -> &mut RefCell<Pipeline> {
+    pub fn pipeline_mut(&mut self) -> &mut RefCell<LocalPipeline> {
         &mut self.pipeline
     }
 
@@ -996,7 +1033,7 @@ impl VsrConsensus {
         // Find the prepare in our pipeline
         let mut pipeline = self.pipeline.borrow_mut();
 
-        let Some(entry) = pipeline.prepare_by_op_mut(header.op) else {
+        let Some(entry) = pipeline.message_by_op_mut(header.op) else {
             // Not in pipeline - could be old/duplicate or already committed
             return false;
         };
@@ -1094,12 +1131,13 @@ impl Consensus for VsrConsensus {
     type ReplicateMessage = Message<PrepareHeader>;
     type AckMessage = Message<PrepareOkHeader>;
     type Sequencer = LocalSequencer;
+    type Pipeline = LocalPipeline;
 
     fn pipeline_message(&self, message: Self::ReplicateMessage) {
         assert!(self.is_primary(), "only primary can pipeline messages");
 
         let mut pipeline = self.pipeline.borrow_mut();
-        pipeline.push_prepare(message);
+        pipeline.push_message(message);
     }
 
     fn verify_pipeline(&self) {

@@ -80,6 +80,8 @@ pub struct CreateSinkConfig {
     pub streams: Vec<StreamConsumerConfig>,
     pub plugin_config_format: Option<ConfigFormat>,
     pub plugin_config: Option<serde_json::Value>,
+    #[serde(default)]
+    pub verbose: bool,
 }
 
 impl CreateSinkConfig {
@@ -94,6 +96,7 @@ impl CreateSinkConfig {
             streams: self.streams.clone(),
             plugin_config_format: self.plugin_config_format,
             plugin_config: self.plugin_config.clone(),
+            verbose: self.verbose,
         }
     }
 }
@@ -109,6 +112,8 @@ pub struct SinkConfig {
     pub streams: Vec<StreamConsumerConfig>,
     pub plugin_config_format: Option<ConfigFormat>,
     pub plugin_config: Option<serde_json::Value>,
+    #[serde(default)]
+    pub verbose: bool,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -120,6 +125,8 @@ pub struct CreateSourceConfig {
     pub streams: Vec<StreamProducerConfig>,
     pub plugin_config_format: Option<ConfigFormat>,
     pub plugin_config: Option<serde_json::Value>,
+    #[serde(default)]
+    pub verbose: bool,
 }
 
 impl CreateSourceConfig {
@@ -134,6 +141,7 @@ impl CreateSourceConfig {
             streams: self.streams.clone(),
             plugin_config_format: self.plugin_config_format,
             plugin_config: self.plugin_config.clone(),
+            verbose: self.verbose,
         }
     }
 }
@@ -149,6 +157,8 @@ pub struct SourceConfig {
     pub streams: Vec<StreamProducerConfig>,
     pub plugin_config_format: Option<ConfigFormat>,
     pub plugin_config: Option<serde_json::Value>,
+    #[serde(default)]
+    pub verbose: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

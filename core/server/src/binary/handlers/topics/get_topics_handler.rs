@@ -24,7 +24,6 @@ use crate::binary::mapper;
 use crate::shard::IggyShard;
 use crate::slab::traits_ext::{EntityComponentSystem, IntoComponents};
 use crate::streaming::session::Session;
-use crate::streaming::streams;
 use anyhow::Result;
 use iggy_common::IggyError;
 use iggy_common::SenderKind;
@@ -46,14 +45,12 @@ impl ServerCommandHandler for GetTopics {
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
         shard.ensure_authenticated(session)?;
-        shard.ensure_stream_exists(&self.stream_id)?;
-        let numeric_stream_id = shard
-            .streams
-            .with_stream_by_id(&self.stream_id, streams::helpers::get_stream_id());
+        let stream_id = shard.resolve_stream_id(&self.stream_id)?;
+
         shard
             .permissioner
             .borrow()
-            .get_topics(session.get_user_id(), numeric_stream_id)?;
+            .get_topics(session.get_user_id(), stream_id)?;
 
         let response = shard.streams.with_topics(&self.stream_id, |topics| {
             topics.with_components(|topics| {

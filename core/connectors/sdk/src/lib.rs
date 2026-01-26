@@ -324,4 +324,6 @@ pub enum Error {
     InvalidState,
     #[error("Connection error: {0}")]
     Connection(String),
+    #[error("Cannot store data: {0}")]
+    CannotStoreData(String),
 }

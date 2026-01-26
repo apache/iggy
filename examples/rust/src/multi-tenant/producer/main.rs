@@ -298,14 +298,17 @@ async fn ensure_stream_access(
         .unwrap_or_else(|| panic!("No access to stream: {available_stream}"));
     info!("Ensured access to stream: {available_stream}");
     for stream in unavailable_streams {
-        if client
-            .get_stream(&Identifier::named(stream)?)
-            .await?
-            .is_none()
-        {
-            info!("Ensured no access to stream: {stream}");
-        } else {
-            panic!("Access to stream: {stream} should not be allowed");
+        match client.get_stream(&Identifier::named(stream)?).await {
+            Err(IggyError::Unauthorized) => {
+                info!("Ensured no access to stream: {stream} (unauthorized)");
+            }
+            Ok(None) => {
+                info!("Ensured no access to stream: {stream} (not visible)");
+            }
+            Ok(Some(_)) => {
+                panic!("Access to stream: {stream} should not be allowed");
+            }
+            Err(e) => return Err(e),
         }
     }
     Ok(())

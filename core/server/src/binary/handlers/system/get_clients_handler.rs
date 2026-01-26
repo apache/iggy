@@ -19,12 +19,10 @@
 use crate::binary::command::{
     BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
 };
-use crate::binary::handlers::system::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
 use crate::shard::IggyShard;
 use crate::streaming::session::Session;
-use err_trail::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::SenderKind;
 use iggy_common::get_clients::GetClients;
@@ -45,10 +43,12 @@ impl ServerCommandHandler for GetClients {
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
         shard.ensure_authenticated(session)?;
+        shard
+            .permissioner
+            .borrow()
+            .get_clients(session.get_user_id())?;
 
-        let clients = shard.get_clients(session).error(|e: &IggyError| {
-            format!("{COMPONENT} (error: {e}) - failed to get clients, session: {session}")
-        })?;
+        let clients = shard.get_clients();
         let clients = mapper::map_clients(clients).await;
         sender.send_ok_response(&clients).await?;
         Ok(HandlerResult::Finished)

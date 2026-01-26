@@ -28,7 +28,7 @@ use std::fmt::Display;
 /// `DeleteStream` command is used to delete an existing stream.
 /// It has additional payload:
 /// - `stream_id` - unique stream ID (numeric or name).
-#[derive(Debug, Serialize, Deserialize, PartialEq, Default)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Default, Clone)]
 pub struct DeleteStream {
     /// Unique stream ID (numeric or name).
     #[serde(skip)]

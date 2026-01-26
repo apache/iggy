@@ -30,7 +30,7 @@ use std::fmt::Display;
 /// It has additional payload:
 /// - `stream_id` - unique stream ID (numeric or name).
 /// - `topic_id` - unique topic ID (numeric or name).
-#[derive(Debug, Serialize, Deserialize, PartialEq, Default)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Default, Clone)]
 pub struct PurgeTopic {
     /// Unique stream ID (numeric or name).
     #[serde(skip)]

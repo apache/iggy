@@ -19,12 +19,10 @@
 use crate::binary::command::{
     BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
 };
-use crate::binary::handlers::system::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
 use crate::shard::IggyShard;
 use crate::streaming::session::Session;
-use err_trail::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::SenderKind;
 use iggy_common::get_me::GetMe;
@@ -43,14 +41,7 @@ impl ServerCommandHandler for GetMe {
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {
         shard.ensure_authenticated(session)?;
-        let Some(client) = shard.get_client(session, session.client_id).error(
-            |e: &IggyError| {
-                format!(
-                    "{COMPONENT} (error: {e}) - failed to get current client for session: {session}"
-                )
-            },
-        )?
-        else {
+        let Some(client) = shard.get_client(session.client_id) else {
             return Err(IggyError::ClientNotFound(session.client_id));
         };
 

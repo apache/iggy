@@ -40,6 +40,7 @@ pub struct SinkConfig {
     pub streams: Vec<StreamConsumerConfig>,
     pub plugin_config_format: Option<ConfigFormat>,
     pub plugin_config: Option<serde_json::Value>,
+    pub verbose: bool, // Log message processing at info level instead of debug (default: false)
 }
 ```
 
@@ -64,6 +65,7 @@ version = 0
 name = "Stdout sink"
 path = "target/release/libiggy_connector_stdout_sink"
 plugin_config_format = "toml"
+verbose = false # Log message processing at info level instead of debug
 
 # Collection of the streams from which messages are consumed
 [[streams]]

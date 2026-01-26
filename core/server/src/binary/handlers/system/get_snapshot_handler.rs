@@ -45,7 +45,7 @@ impl ServerCommandHandler for GetSnapshot {
         shard.ensure_authenticated(session)?;
 
         let snapshot = shard
-            .get_snapshot(session, self.compression, &self.snapshot_types)
+            .get_snapshot(self.compression, &self.snapshot_types)
             .await?;
         let bytes = Bytes::copy_from_slice(&snapshot.0);
         sender.send_ok_response(&bytes).await?;

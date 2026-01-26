@@ -16,10 +16,7 @@
  * under the License.
  */
 
-use crate::streaming::segments::{
-    IggyMessagesBatchSet,
-    messages::{write_batch, write_batch_frozen},
-};
+use crate::streaming::segments::messages::write_batch_frozen;
 use compio::fs::{File, OpenOptions};
 use err_trail::ErrContext;
 use iggy_common::{IggyByteSize, IggyError, IggyMessagesBatch};
@@ -96,46 +93,7 @@ impl MessagesWriter {
         })
     }
 
-    /// Append a batch of messages to the messages file.
-    pub async fn save_batch_set(
-        &self,
-        batch_set: IggyMessagesBatchSet,
-    ) -> Result<IggyByteSize, IggyError> {
-        let messages_size = batch_set.size();
-        let messages_count = batch_set.count();
-        let containers_count = batch_set.containers_count();
-        trace!(
-            "Saving batch set of size {messages_size} bytes ({containers_count} containers, {messages_count} messages) to messages file: {}",
-            self.file_path
-        );
-        let position = self.messages_size_bytes.load(Ordering::Relaxed);
-        let file = &self.file;
-        write_batch(file, position, batch_set)
-            .await
-            .error(|e: &IggyError| {
-                format!(
-                    "Failed to write batch to messages file: {}. {e}",
-                    self.file_path
-                )
-            })?;
-
-        if self.fsync {
-            let _ = self.fsync().await;
-        }
-
-        self.messages_size_bytes
-            .fetch_add(messages_size as u64, Ordering::Release);
-        trace!(
-            "Written batch set of size {messages_size} bytes ({containers_count} containers, {messages_count} messages) to disk messages file: {}",
-            self.file_path
-        );
-
-        Ok(IggyByteSize::from(messages_size as u64))
-    }
-
     /// Append frozen (immutable) batches to the messages file.
-    ///
-    /// Unlike `save_batch_set`, this method does not take ownership of the batches.
     /// The caller retains the batches (for use in in-flight buffer) while disk I/O proceeds.
     pub async fn save_frozen_batches(
         &self,

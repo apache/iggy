@@ -445,7 +445,7 @@ class TestConsumerGroup:
         await iggy_client.create_topic(
             stream=stream_name, name=topic_name, partitions_count=1
         )
-        consumer = iggy_client.consumer_group(
+        consumer = await iggy_client.consumer_group(
             consumer_name,
             stream_name,
             topic_name,
@@ -482,7 +482,7 @@ class TestConsumerGroup:
             stream=stream_name, name=topic_name, partitions_count=1
         )
 
-        consumer = iggy_client.consumer_group(
+        consumer = await iggy_client.consumer_group(
             consumer_name,
             stream_name,
             topic_name,
@@ -511,6 +511,47 @@ class TestConsumerGroup:
         assert received_messages == test_messages
 
     @pytest.mark.asyncio
+    async def test_iter_messages(self, iggy_client: IggyClient, consumer_group_setup):
+        """Test that the consumer group can consume messages."""
+        consumer_name = consumer_group_setup["consumer"]
+        stream_name = consumer_group_setup["stream"]
+        topic_name = consumer_group_setup["topic"]
+        partition_id = consumer_group_setup["partition_id"]
+        test_messages = consumer_group_setup["messages"]
+
+        # Setup
+        received_messages = []
+        await iggy_client.create_stream(stream_name)
+        await iggy_client.create_topic(
+            stream=stream_name, name=topic_name, partitions_count=1
+        )
+
+        consumer = await iggy_client.consumer_group(
+            consumer_name,
+            stream_name,
+            topic_name,
+            partition_id,
+            PollingStrategy.Next(),
+            10,
+            auto_commit=AutoCommit.Interval(timedelta(seconds=5)),
+            poll_interval=timedelta(seconds=1),
+        )
+
+        await iggy_client.send_messages(
+            stream_name,
+            topic_name,
+            partition_id,
+            [Message(m) for m in test_messages],
+        )
+
+        async for message in consumer.iter_messages():
+            received_messages.append(message.payload().decode())
+            if len(received_messages) == 5:
+                break
+
+        assert received_messages == test_messages
+
+    @pytest.mark.asyncio
     async def test_shutdown(self, iggy_client: IggyClient, consumer_group_setup):
         """Test that the consumer group can be signaled to shutdown."""
         consumer_name = consumer_group_setup["consumer"]
@@ -525,7 +566,7 @@ class TestConsumerGroup:
             stream=stream_name, name=topic_name, partitions_count=1
         )
 
-        consumer = iggy_client.consumer_group(
+        consumer = await iggy_client.consumer_group(
             consumer_name,
             stream_name,
             topic_name,

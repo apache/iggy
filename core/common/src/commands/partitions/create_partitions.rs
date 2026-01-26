@@ -32,7 +32,7 @@ use std::fmt::Display;
 /// - `stream_id` - unique stream ID (numeric or name).
 /// - `topic_id` - unique topic ID (numeric or name).
 /// - `partitions_count` - number of partitions in the topic to create, max value is 1000.
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 pub struct CreatePartitions {
     /// Unique stream ID (numeric or name).
     #[serde(skip)]

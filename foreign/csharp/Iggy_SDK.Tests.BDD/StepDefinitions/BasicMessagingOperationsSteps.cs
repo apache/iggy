@@ -22,11 +22,10 @@ using Apache.Iggy.Enums;
 using Apache.Iggy.Factory;
 using Apache.Iggy.Kinds;
 using Apache.Iggy.Messages;
-using Apache.Iggy.Tests.BDD.Context;
-using Microsoft.Extensions.Logging.Abstractions;
 using Reqnroll;
 using Shouldly;
 using Partitioning = Apache.Iggy.Kinds.Partitioning;
+using TestContext = Apache.Iggy.Tests.BDD.Context.TestContext;
 
 namespace Apache.Iggy.Tests.BDD.StepDefinitions;
 

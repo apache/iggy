@@ -17,69 +17,41 @@
  * under the License.
  */
 
-use iggy::prelude::{Client, DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME, IggyClient};
+use iggy::prelude::{
+    Client, DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME, IggyClient, IggyMessage, Partitioning,
+};
 use iggy_binary_protocol::{MessageClient, StreamClient, TopicClient, UserClient};
-use iggy_common::{CompressionAlgorithm, IggyExpiry, MaxTopicSize, PolledMessages};
+use iggy_common::{
+    CompressionAlgorithm, Consumer, Identifier, IggyExpiry, IggyTimestamp, MaxTopicSize,
+    PolledMessages, PollingStrategy,
+};
 use integration::{
     tcp_client::TcpClientFactory,
     test_connectors_runtime::TestConnectorsRuntime,
     test_server::{ClientFactory, IpAddrKind, TestServer},
 };
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 mod http_config_provider;
 mod postgres;
 mod random;
 
-const DEFAULT_TEST_STREAM: &str = "test_stream";
-const DEFAULT_TEST_TOPIC: &str = "test_topic";
+pub const DEFAULT_TEST_STREAM: &str = "test_stream";
+pub const DEFAULT_TEST_TOPIC: &str = "test_topic";
+const TEST_CONSUMER_NAME: &str = "test_consumer";
+const ONE_DAY_MICROS: u64 = 24 * 60 * 60 * 1_000_000;
 
-fn setup_runtime() -> ConnectorsRuntime {
-    let mut iggy_envs = HashMap::new();
-    iggy_envs.insert("IGGY_QUIC_ENABLED".to_owned(), "false".to_owned());
-    iggy_envs.insert("IGGY_WEBSOCKET_ENABLED".to_owned(), "false".to_owned());
-    let mut test_server = TestServer::new(Some(iggy_envs), true, None, IpAddrKind::V4);
-    test_server.start();
-    ConnectorsRuntime {
-        iggy_server: test_server,
-        connectors_runtime: None,
-        stream: "".to_owned(),
-        topic: "".to_owned(),
-    }
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TestMessage {
+    pub id: u64,
+    pub name: String,
+    pub count: u32,
+    pub amount: f64,
+    pub active: bool,
+    pub timestamp: i64,
 }
 
-#[derive(Debug)]
-struct ConnectorsRuntime {
-    stream: String,
-    topic: String,
-    iggy_server: TestServer,
-    connectors_runtime: Option<TestConnectorsRuntime>,
-}
-
-#[derive(Debug)]
-struct ConnectorsIggyClient {
-    stream: String,
-    topic: String,
-    client: IggyClient,
-}
-
-impl ConnectorsIggyClient {
-    async fn get_messages(&self) -> Result<PolledMessages, iggy_common::IggyError> {
-        self.client
-            .poll_messages(
-                &self.stream.clone().try_into().unwrap(),
-                &self.topic.clone().try_into().unwrap(),
-                None,
-                &iggy_common::Consumer::new("test_consumer".try_into().unwrap()),
-                &iggy_common::PollingStrategy::next(),
-                10,
-                true,
-            )
-            .await
-    }
-}
-
-#[derive(Debug)]
 pub struct IggySetup {
     pub stream: String,
     pub topic: String,
@@ -94,8 +66,45 @@ impl Default for IggySetup {
     }
 }
 
+struct ConnectorsRuntime {
+    iggy_server: TestServer,
+    connectors_runtime: Option<TestConnectorsRuntime>,
+}
+
+struct ConnectorsIggyClient {
+    stream_id: Identifier,
+    topic_id: Identifier,
+    client: IggyClient,
+}
+
+fn create_test_messages(count: usize) -> Vec<TestMessage> {
+    let base_timestamp = IggyTimestamp::now().as_micros();
+    (1..=count)
+        .map(|i| TestMessage {
+            id: i as u64,
+            name: format!("user_{}", i - 1),
+            count: ((i - 1) * 10) as u32,
+            amount: (i - 1) as f64 * 99.99,
+            active: (i - 1) % 2 == 0,
+            timestamp: (base_timestamp + (i - 1) as u64 * ONE_DAY_MICROS) as i64,
+        })
+        .collect()
+}
+
+fn setup_runtime() -> ConnectorsRuntime {
+    let mut iggy_envs = HashMap::new();
+    iggy_envs.insert("IGGY_QUIC_ENABLED".to_owned(), "false".to_owned());
+    iggy_envs.insert("IGGY_WEBSOCKET_ENABLED".to_owned(), "false".to_owned());
+    let mut test_server = TestServer::new(Some(iggy_envs), true, None, IpAddrKind::V4);
+    test_server.start();
+    ConnectorsRuntime {
+        iggy_server: test_server,
+        connectors_runtime: None,
+    }
+}
+
 impl ConnectorsRuntime {
-    pub async fn init(
+    async fn init(
         &mut self,
         config_path: &str,
         envs: Option<HashMap<String, String>>,
@@ -123,10 +132,10 @@ impl ConnectorsRuntime {
             .create_stream(&iggy_setup.stream)
             .await
             .expect("Failed to create stream");
-        let stream_id = iggy_setup
+        let stream_id: Identifier = iggy_setup
             .stream
             .try_into()
-            .expect("Invalid stream name in Iggy setup");
+            .expect("Failed to parse stream identifier");
         client
             .create_topic(
                 &stream_id,
@@ -149,15 +158,19 @@ impl ConnectorsRuntime {
             TestConnectorsRuntime::with_iggy_address(&iggy_server_address, Some(all_envs));
         connectors_runtime.start();
         connectors_runtime.ensure_started().await;
-        self.stream = self.stream.clone();
-        self.topic = self.topic.clone();
         self.connectors_runtime = Some(connectors_runtime);
     }
 
-    pub async fn create_client(&self) -> ConnectorsIggyClient {
+    async fn create_client(&self) -> ConnectorsIggyClient {
+        let stream_id: Identifier = DEFAULT_TEST_STREAM
+            .try_into()
+            .expect("Failed to parse stream identifier");
+        let topic_id: Identifier = DEFAULT_TEST_TOPIC
+            .try_into()
+            .expect("Failed to parse topic identifier");
         ConnectorsIggyClient {
-            stream: DEFAULT_TEST_STREAM.to_owned(),
-            topic: DEFAULT_TEST_TOPIC.to_owned(),
+            stream_id,
+            topic_id,
             client: self.create_iggy_client().await,
         }
     }
@@ -180,9 +193,40 @@ impl ConnectorsRuntime {
         IggyClient::create(client, None, None)
     }
 
-    pub fn connectors_api_address(&self) -> Option<String> {
+    fn connectors_api_address(&self) -> Option<String> {
         self.connectors_runtime
             .as_ref()
-            .map(|connectors_runtime| connectors_runtime.get_http_api_address())
+            .map(|r| r.get_http_api_address())
+    }
+}
+
+impl ConnectorsIggyClient {
+    async fn send_messages(&self, messages: &mut [IggyMessage]) {
+        self.client
+            .send_messages(
+                &self.stream_id,
+                &self.topic_id,
+                &Partitioning::partition_id(0),
+                messages,
+            )
+            .await
+            .expect("Failed to send messages to Iggy");
+    }
+
+    async fn poll_messages(&self) -> Result<PolledMessages, iggy_common::IggyError> {
+        let consumer_id: Identifier = TEST_CONSUMER_NAME
+            .try_into()
+            .expect("Failed to parse consumer identifier");
+        self.client
+            .poll_messages(
+                &self.stream_id,
+                &self.topic_id,
+                None,
+                &Consumer::new(consumer_id),
+                &PollingStrategy::next(),
+                10,
+                true,
+            )
+            .await
     }
 }

@@ -36,6 +36,7 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
 use crate::identifier::PyIdentifier;
+use crate::iterator::ReceiveMessageIterator;
 use crate::receive_message::ReceiveMessage;
 
 /// A Python class representing the Iggy consumer.
@@ -129,6 +130,21 @@ impl IggyConsumer {
         })
     }
 
+    /// Asynchronously iterate over `ReceiveMessage`s.
+    ///
+    /// Returns an async iterator that raises `StopAsyncIteration` when no more messages are available
+    /// or a `PyRuntimeError` on failure.
+    ///
+    /// Note: This method does not currently support `AutoCommit.After`.
+    /// For `AutoCommit.IntervalOrAfter(datetime.timedelta, AutoCommitAfter)`,
+    /// only the interval part is applied; the `after` mode is ignored.
+    /// Use `consume_messages()` if you need commit-after-processing semantics.
+    #[gen_stub(override_return_type(type_repr="collections.abc.AsyncIterator[ReceiveMessage]", imports=("collections.abc")))]
+    fn iter_messages<'a>(&self) -> ReceiveMessageIterator {
+        let inner = self.inner.clone();
+        ReceiveMessageIterator { inner }
+    }
+
     /// Consumes messages continuously using a callback function and an optional `asyncio.Event` for signaling shutdown.
     ///
     /// Returns an awaitable that completes when shutdown is signaled or a PyRuntimeError on failure.
@@ -147,14 +163,6 @@ impl IggyConsumer {
 
         future_into_py(py, async {
             let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-
-            let inner_init = inner.clone();
-            let mut inner_init = inner_init.lock().await;
-            inner_init
-                .init()
-                .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{e:?}")))?;
-            drop(inner_init);
 
             let task_locals = Python::with_gil(pyo3_async_runtimes::tokio::get_current_locals)?;
             let handle_consume = get_runtime().spawn(scope(task_locals, async move {
@@ -219,7 +227,10 @@ impl MessageConsumer for PyCallbackConsumer {
         let callback = self.callback.clone();
         let task_locals = self.task_locals.clone().lock_owned().await;
         let task_locals = Python::with_gil(|py| task_locals.clone_ref(py));
-        let message = ReceiveMessage::from_rust_message(received.message);
+        let message = ReceiveMessage {
+            inner: received.message,
+            partition_id: received.partition_id,
+        };
         get_runtime()
             .spawn(scope(task_locals, async move {
                 Python::with_gil(|py| {

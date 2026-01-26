@@ -164,24 +164,36 @@ impl LocalConnectorsConfigProvider<Created> {
 
         let sinks: DashMap<ConnectorId, SinkConfigFile> = DashMap::new();
         let sources: DashMap<ConnectorId, SourceConfigFile> = DashMap::new();
-        info!("Loading connectors configuration from: {}", self.config_dir);
+        let cwd = match std::env::current_dir() {
+            Ok(path) => path.display().to_string(),
+            Err(_) => "unknown".to_string(),
+        };
+        info!(
+            "Loading connectors configuration from: {}, current directory: {cwd}",
+            self.config_dir
+        );
         let entries = std::fs::read_dir(&self.config_dir)?;
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_file() {
                 if path.extension().and_then(|ext| ext.to_str()) != Some("toml") {
-                    debug!("Skipping non-TOML file: {:?}", path);
+                    debug!("Skipping non-TOML file: {}", path.display());
                     continue;
                 }
 
-                if let Some(file_name) = path.file_name().and_then(|n| n.to_str())
-                    && file_name.starts_with('.')
-                {
-                    debug!("Skipping hidden file: {:?}", path);
-                    continue;
+                if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
+                    if file_name.starts_with('.') {
+                        debug!("Skipping hidden file: {}", path.display());
+                        continue;
+                    }
+                    let file_name_lower = file_name.to_lowercase();
+                    if file_name_lower == "cargo.toml" {
+                        debug!("Skipping Cargo.toml: {}", path.display());
+                        continue;
+                    }
                 }
 
-                debug!("Loading connector configuration from: {:?}", path);
+                info!("Loading connector configuration from: {}", path.display());
                 let base_config = Self::read_base_config(&path)?;
                 debug!("Loaded base configuration: {:?}", base_config);
                 let path = path
@@ -196,8 +208,14 @@ impl LocalConnectorsConfigProvider<Created> {
 
                 let created_at: DateTime<Utc> = entry.metadata()?.created()?.into();
                 let connector_id: ConnectorId = (&connector_config).into();
-                match connector_config.clone() {
-                    ConnectorConfig::Sink(sink_config) => {
+                let version = connector_config.version();
+
+                match connector_config {
+                    ConnectorConfig::Sink(mut sink_config) => {
+                        Self::apply_plugin_config_env_overrides(
+                            &mut sink_config.plugin_config,
+                            &base_config,
+                        );
                         sinks.insert(
                             connector_id,
                             SinkConfigFile {
@@ -207,7 +225,11 @@ impl LocalConnectorsConfigProvider<Created> {
                             },
                         );
                     }
-                    ConnectorConfig::Source(source_config) => {
+                    ConnectorConfig::Source(mut source_config) => {
+                        Self::apply_plugin_config_env_overrides(
+                            &mut source_config.plugin_config,
+                            &base_config,
+                        );
                         sources.insert(
                             connector_id,
                             SourceConfigFile {
@@ -219,10 +241,10 @@ impl LocalConnectorsConfigProvider<Created> {
                     }
                 }
 
-                debug!(
-                    "Loaded connector configuration with key {}, version {}, created at {}",
+                info!(
+                    "Loaded connector configuration with key: {}, version: {}, created at {}",
                     base_config.key(),
-                    connector_config.version(),
+                    version,
                     created_at.to_rfc3339()
                 );
             }
@@ -298,6 +320,31 @@ impl<S: ProviderState> LocalConnectorsConfigProvider<S> {
                 err.message()
             ))
         })
+    }
+
+    fn apply_plugin_config_env_overrides(
+        plugin_config: &mut Option<serde_json::Value>,
+        base_config: &BaseConnectorConfig,
+    ) {
+        let connector_type = base_config.connector_type().to_uppercase();
+        let key = base_config.key().to_uppercase();
+        let prefix = format!("IGGY_CONNECTORS_{connector_type}_{key}_PLUGIN_CONFIG_");
+
+        for (env_key, env_value) in std::env::vars() {
+            let env_key_upper = env_key.to_uppercase();
+            if !env_key_upper.starts_with(&prefix) {
+                continue;
+            }
+
+            let field_path = &env_key_upper[prefix.len()..];
+            let field_name = field_path.to_lowercase();
+            let parsed_value = iggy_common::parse_env_value_to_json(&env_value);
+
+            let config = plugin_config.get_or_insert_with(|| serde_json::json!({}));
+            if let serde_json::Value::Object(map) = config {
+                map.insert(field_name, parsed_value);
+            }
+        }
     }
 }
 

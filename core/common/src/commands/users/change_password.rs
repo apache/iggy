@@ -33,7 +33,7 @@ use std::str::from_utf8;
 /// - `user_id` - unique user ID (numeric or name).
 /// - `current_password` - current password, must be between 3 and 100 characters long.
 /// - `new_password` - new password, must be between 3 and 100 characters long.
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 pub struct ChangePassword {
     /// Unique user ID (numeric or name).
     #[serde(skip)]

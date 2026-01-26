@@ -35,6 +35,7 @@ pub struct SourceConfig {
     pub streams: Vec<StreamProducerConfig>,
     pub plugin_config_format: Option<ConfigFormat>,
     pub plugin_config: Option<serde_json::Value>,
+    pub verbose: bool, // Log message processing at info level instead of debug (default: false)
 }
 ```
 
@@ -59,6 +60,7 @@ version = 0
 name = "Random source" # Name of the source
 path = "libiggy_connector_random_source" # Path to the source connector
 config_format = "toml"
+verbose = false # Log message processing at info level instead of debug
 
 # Collection of the streams to which the produced messages are sent
 [[streams]]
