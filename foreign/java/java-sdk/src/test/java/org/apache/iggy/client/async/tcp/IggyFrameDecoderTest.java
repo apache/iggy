@@ -302,6 +302,7 @@ class IggyFrameDecoderTest {
             input.writeIntLE(0);
             input.writeIntLE(100); // expects 100 bytes
             input.writeBytes(new byte[50]); // only 50 bytes
+            int readerIndexBefore = input.readerIndex();
 
             // when
             boolean hasMessage = channel.writeInbound(input);
@@ -310,6 +311,7 @@ class IggyFrameDecoderTest {
             assertThat(hasMessage).isFalse();
             ByteBuf decoded = channel.readInbound();
             assertThat(decoded).isNull();
+            assertThat(input.readerIndex()).isEqualTo(readerIndexBefore);
         }
 
         @Test
