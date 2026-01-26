@@ -36,15 +36,15 @@ use crate::connectors::{
 };
 
 mod quickwit_container {
-    pub static REPOSITORY: &'static str = "quickwit/quickwit";
-    pub static VERSION: &'static str = "0.8.1";
-    pub static LISTENING_IPV4: &'static str = "0.0.0.0";
+    pub static REPOSITORY: &str = "quickwit/quickwit";
+    pub static VERSION: &str = "0.8.1";
+    pub static LISTENING_IPV4: &str = "0.0.0.0";
     pub static LISTENING_PORT: u16 = 7280;
-    pub static READY_MESSAGE: &'static str = "REST server is ready";
+    pub static READY_MESSAGE: &str = "REST server is ready";
 }
 
 mod quickwit_paths {
-    pub static INDEXES: &'static str = "api/v1/indexes";
+    pub static INDEXES: &str = "api/v1/indexes";
 
     pub fn index_ingest(index_id: &str) -> String {
         format!("api/v1/{index_id}/ingest")
@@ -161,7 +161,7 @@ async fn get_mapped_quickwit_port(
     Ok(mapped_port)
 }
 
-static INDEX_TIMESTAMP_FIELD: &'static str = "timestamp";
+static INDEX_TIMESTAMP_FIELD: &str = "timestamp";
 
 fn get_quickwit_index_config() -> String {
     format!(
@@ -232,7 +232,7 @@ async fn create_quickwit_test_index(
     Ok(())
 }
 
-static NETWORK_NAME_PREFIX: &'static str = "iggy-quickwit-sink";
+static NETWORK_NAME_PREFIX: &str = "iggy-quickwit-sink";
 static CONTAINER_NETWORK_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 async fn start_quickwit_container() -> ContainerAsync<GenericImage> {
@@ -272,7 +272,7 @@ async fn start_iggy_with_quickwit_connector(
         ),
         (
             format!("{PLUGIN_KEY_PREFIX}_INDEX"),
-            String::from(get_quickwit_index_config()),
+            get_quickwit_index_config(),
         ),
     ]);
     let mut extra_envs = HashMap::new();

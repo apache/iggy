@@ -58,7 +58,6 @@ rmcp = { version = "0.14.0", features = [
     "transport-streamable-http-client",
     "transport-streamable-http-client-reqwest",
 ] }
-rmp-serde = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serial_test = { workspace = true }
@@ -70,7 +69,6 @@ tempfile = { workspace = true }
 test-case = { workspace = true }
 testcontainers-modules = { version = "0.14.0", features = ["postgres"] }
 tokio = { workspace = true }
-toml = { workspace = true }
 tracing = { workspace = true }
 twox-hash = { workspace = true }
 uuid = { workspace = true }
