@@ -22,7 +22,8 @@ use crate::metadata::{
     ConsumerGroupId, ConsumerGroupMeta, PartitionId, PartitionMeta, StreamId, StreamMeta, TopicId,
     TopicMeta, UserId, UserMeta,
 };
-use crate::streaming::partitions::partition::{ConsumerGroupOffsets, ConsumerOffsets};
+use crate::streaming::partitions::consumer_group_offsets::ConsumerGroupOffsets;
+use crate::streaming::partitions::consumer_offsets::ConsumerOffsets;
 use crate::streaming::stats::{PartitionStats, StreamStats, TopicStats};
 use iggy_common::{
     CompressionAlgorithm, Identifier, IggyError, IggyExpiry, IggyTimestamp, MaxTopicSize,
@@ -65,13 +66,15 @@ impl MetadataWriter {
     }
 
     pub fn add_stream(&mut self, meta: StreamMeta) -> StreamId {
-        let assigned_id = Arc::new(AtomicUsize::new(0));
+        let assigned_id = Arc::new(AtomicUsize::new(usize::MAX));
         self.append(MetadataOp::AddStream {
             meta,
             assigned_id: assigned_id.clone(),
         });
         self.publish();
-        assigned_id.load(Ordering::Acquire)
+        let id = assigned_id.load(Ordering::Acquire);
+        debug_assert_ne!(id, usize::MAX, "add_stream should always succeed");
+        id
     }
 
     pub fn update_stream(&mut self, id: StreamId, new_name: Arc<str>) {
@@ -188,13 +191,15 @@ impl MetadataWriter {
     }
 
     pub fn add_user(&mut self, meta: UserMeta) -> UserId {
-        let assigned_id = Arc::new(AtomicUsize::new(0));
+        let assigned_id = Arc::new(AtomicUsize::new(usize::MAX));
         self.append(MetadataOp::AddUser {
             meta,
             assigned_id: assigned_id.clone(),
         });
         self.publish();
-        assigned_id.load(Ordering::Acquire) as UserId
+        let id = assigned_id.load(Ordering::Acquire);
+        debug_assert_ne!(id, usize::MAX, "add_user should always succeed");
+        id as UserId
     }
 
     pub fn update_user_meta(&mut self, id: UserId, meta: UserMeta) {
@@ -481,8 +486,8 @@ impl MetadataWriter {
                 created_at,
                 revision_id: 0,
                 stats: stats.clone(),
-                consumer_offsets: None,
-                consumer_group_offsets: None,
+                consumer_offsets: Arc::new(ConsumerOffsets::with_capacity(0)),
+                consumer_group_offsets: Arc::new(ConsumerGroupOffsets::with_capacity(0)),
             });
             stats_list.push(stats);
         }

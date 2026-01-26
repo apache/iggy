@@ -30,16 +30,17 @@ use test_case::test_matrix;
 // Test matrix for race condition scenarios
 // Tests all combinations of:
 // - Transport: TCP, HTTP, QUIC, WebSocket (4)
-// - Resource: User, Stream, Topic (3)
+// - Resource: User, Stream, Topic, Partition, ConsumerGroup (5)
 // - Path: Hot (unique names), Cold (duplicate names) (2)
 // - Barrier: On (synchronized), Off (unsynchronized) (2)
-// Total: 4 × 3 × 2 × 2 = 48 test cases
+// Total: 4 × 5 × 2 × 2 = 80 test cases
+// Note: Partition + Cold is skipped (partitions don't have names)
 
 // TODO: Websocket fails for the `cold` type, cold means that we are creating resources with the same name.
 // It fails with the error assertion, instead of `AlreadyExist`, we get generic `Error`.
 #[test_matrix(
     [tcp(), http(), quic(), websocket()],
-    [user(), stream(), topic()],
+    [user(), stream(), topic(), partition(), consumer_group()],
     [hot(), cold()],
     [barrier_on(), barrier_off()]
 )]
@@ -117,6 +118,14 @@ fn stream() -> ResourceType {
 
 fn topic() -> ResourceType {
     ResourceType::Topic
+}
+
+fn partition() -> ResourceType {
+    ResourceType::Partition
+}
+
+fn consumer_group() -> ResourceType {
+    ResourceType::ConsumerGroup
 }
 
 fn hot() -> ScenarioType {

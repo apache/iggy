@@ -17,7 +17,7 @@
  */
 
 use crate::shard::IggyShard;
-use iggy_common::{Identifier, IggyError};
+use iggy_common::IggyError;
 use std::rc::Rc;
 use tracing::{error, info, trace};
 
@@ -46,45 +46,35 @@ async fn save_messages(shard: Rc<IggyShard>) -> Result<(), IggyError> {
     trace!("Saving buffered messages...");
 
     let namespaces = shard.get_current_shard_namespaces();
-    let mut total_saved_messages = 0u32;
-    const REASON: &str = "background saver triggered";
+    let mut total_saved_messages = 0u64;
+    let mut partitions_flushed = 0u32;
 
     for ns in namespaces {
-        let stream_id = Identifier::numeric(ns.stream_id() as u32).unwrap();
-        let topic_id = Identifier::numeric(ns.topic_id() as u32).unwrap();
-        let partition_id = ns.partition_id();
-
-        match shard
-            .streams
-            .persist_messages(
-                &stream_id,
-                &topic_id,
-                partition_id,
-                REASON,
-                &shard.config.system,
-            )
-            .await
-        {
-            Ok(batch_count) => {
-                total_saved_messages += batch_count;
-            }
-            Err(err) => {
-                error!(
-                    "Failed to save messages for partition {}: {}",
-                    partition_id, err
-                );
+        if shard.local_partitions.borrow().get(&ns).is_some() {
+            match shard
+                .flush_unsaved_buffer_from_local_partitions(&ns, false)
+                .await
+            {
+                Ok(saved) => {
+                    if saved > 0 {
+                        total_saved_messages += saved as u64;
+                        partitions_flushed += 1;
+                    }
+                }
+                Err(err) => {
+                    error!("Failed to save messages for partition {:?}: {}", ns, err);
+                }
             }
         }
     }
 
     if total_saved_messages > 0 {
-        info!("Saved {} buffered messages on disk.", total_saved_messages);
+        info!("Saved {total_saved_messages} messages from {partitions_flushed} partitions.");
     }
     Ok(())
 }
 
 async fn fsync_all_segments_on_shutdown(shard: Rc<IggyShard>, result: Result<(), IggyError>) {
-    // Only fsync if the last save_messages tick succeeded
     if result.is_err() {
         error!(
             "Last save_messages tick failed, skipping fsync: {:?}",
@@ -98,26 +88,20 @@ async fn fsync_all_segments_on_shutdown(shard: Rc<IggyShard>, result: Result<(),
     let namespaces = shard.get_current_shard_namespaces();
 
     for ns in namespaces {
-        let stream_id = Identifier::numeric(ns.stream_id() as u32).unwrap();
-        let topic_id = Identifier::numeric(ns.topic_id() as u32).unwrap();
-        let partition_id = ns.partition_id();
-
-        match shard
-            .streams
-            .fsync_all_messages(&stream_id, &topic_id, partition_id)
-            .await
-        {
-            Ok(()) => {
-                trace!(
-                    "Successfully fsynced segment for stream: {}, topic: {}, partition: {} during shutdown",
-                    stream_id, topic_id, partition_id
-                );
-            }
-            Err(err) => {
-                error!(
-                    "Failed to fsync segment for stream: {}, topic: {}, partition: {} during shutdown: {}",
-                    stream_id, topic_id, partition_id, err
-                );
+        if shard.local_partitions.borrow().get(&ns).is_some() {
+            match shard.fsync_all_messages_from_local_partitions(&ns).await {
+                Ok(()) => {
+                    trace!(
+                        "Successfully fsynced segment for partition {:?} during shutdown",
+                        ns
+                    );
+                }
+                Err(err) => {
+                    error!(
+                        "Failed to fsync segment for partition {:?} during shutdown: {}",
+                        ns, err
+                    );
+                }
             }
         }
     }

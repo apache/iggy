@@ -16,8 +16,6 @@
  * under the License.
  */
 
-pub mod helpers;
 pub mod storage;
-pub mod stream;
 
 pub const COMPONENT: &str = "STREAMING_STREAMS";

@@ -101,17 +101,6 @@ impl NumaConfig {
 
         Ok(())
     }
-
-    // pub fn or_fallback(&self, topology: &NumaTopology) -> CpuAllocation {
-    //     if topology.node_count < 2 {
-    //         tracing::warn!(
-    //             "NUMA requested but only {} node detected, falling back to count",
-    //             topology.node_count
-    //         );
-    //     }
-    //
-    //     todo!()
-    // }
 }
 
 impl CpuAllocation {

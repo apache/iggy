@@ -20,7 +20,6 @@ use crate::{
         system::messages::PollingArgs,
         transmission::{event::ShardEvent, frame::ShardResponse},
     },
-    slab::partitions,
     streaming::{polling_consumer::PollingConsumer, segments::IggyMessagesBatchMut},
 };
 use iggy_common::{
@@ -55,7 +54,7 @@ impl ShardRequest {
     pub fn new(
         stream_id: Identifier,
         topic_id: Identifier,
-        partition_id: partitions::ContainerId,
+        partition_id: usize,
         payload: ShardRequestPayload,
     ) -> Self {
         Self {
@@ -67,6 +66,7 @@ impl ShardRequest {
     }
 }
 
+// cleanup this shit
 #[derive(Debug)]
 pub enum ShardRequestPayload {
     SendMessages {
@@ -129,6 +129,23 @@ pub enum ShardRequestPayload {
     DeleteSegments {
         segments_count: u32,
     },
+    CreatePartitions {
+        user_id: u32,
+        stream_id: Identifier,
+        topic_id: Identifier,
+        partitions_count: u32,
+    },
+    DeletePartitions {
+        user_id: u32,
+        stream_id: Identifier,
+        topic_id: Identifier,
+        partitions_count: u32,
+    },
+    UpdateStream {
+        user_id: u32,
+        stream_id: Identifier,
+        name: String,
+    },
     SocketTransfer {
         fd: OwnedFd,
         from_shard: u16,
@@ -136,6 +153,73 @@ pub enum ShardRequestPayload {
         user_id: u32,
         address: SocketAddr,
         initial_data: IggyMessagesBatchMut,
+    },
+    UpdatePermissions {
+        session_user_id: u32,
+        user_id: Identifier,
+        permissions: Option<Permissions>,
+    },
+    ChangePassword {
+        session_user_id: u32,
+        user_id: Identifier,
+        current_password: String,
+        new_password: String,
+    },
+    UpdateUser {
+        session_user_id: u32,
+        user_id: Identifier,
+        username: Option<String>,
+        status: Option<UserStatus>,
+    },
+    CreateConsumerGroup {
+        user_id: u32,
+        stream_id: Identifier,
+        topic_id: Identifier,
+        name: String,
+    },
+    JoinConsumerGroup {
+        user_id: u32,
+        client_id: u32,
+        stream_id: Identifier,
+        topic_id: Identifier,
+        group_id: Identifier,
+    },
+    LeaveConsumerGroup {
+        user_id: u32,
+        client_id: u32,
+        stream_id: Identifier,
+        topic_id: Identifier,
+        group_id: Identifier,
+    },
+    DeleteConsumerGroup {
+        user_id: u32,
+        stream_id: Identifier,
+        topic_id: Identifier,
+        group_id: Identifier,
+    },
+    CreatePersonalAccessToken {
+        user_id: u32,
+        name: String,
+        expiry: IggyExpiry,
+    },
+    DeletePersonalAccessToken {
+        user_id: u32,
+        name: String,
+    },
+    LeaveConsumerGroupMetadataOnly {
+        stream_id: usize,
+        topic_id: usize,
+        group_id: usize,
+        client_id: u32,
+    },
+    PurgeStream {
+        user_id: u32,
+        stream_id: Identifier,
+    },
+    PurgeTopic {
+        user_id: u32,
+        stream_id: Identifier,
+        topic_id: Identifier,
     },
 }
 

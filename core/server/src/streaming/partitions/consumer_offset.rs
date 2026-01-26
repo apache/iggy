@@ -15,10 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::sync::atomic::AtomicU64;
-
 use crate::streaming::polling_consumer::ConsumerGroupId;
 use iggy_common::ConsumerKind;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug)]
 pub struct ConsumerOffset {
@@ -33,7 +32,7 @@ impl Clone for ConsumerOffset {
         Self {
             kind: self.kind,
             consumer_id: self.consumer_id,
-            offset: AtomicU64::new(0),
+            offset: AtomicU64::new(self.offset.load(Ordering::Relaxed)),
             path: self.path.clone(),
         }
     }
@@ -65,5 +64,20 @@ impl ConsumerOffset {
             offset: AtomicU64::new(offset),
             path,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clone_preserves_offset_value() {
+        let offset = ConsumerOffset::new(ConsumerKind::Consumer, 42, 12345, "path".to_string());
+        let cloned = offset.clone();
+        assert_eq!(
+            offset.offset.load(Ordering::Relaxed),
+            cloned.offset.load(Ordering::Relaxed)
+        );
     }
 }

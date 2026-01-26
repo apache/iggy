@@ -40,7 +40,6 @@ iggy-web = ["dep:rust-embed", "dep:mime_guess"]
 [dependencies]
 ahash = { workspace = true }
 anyhow = { workspace = true }
-arcshift = "0.4.2"
 argon2 = { workspace = true }
 async-channel = { workspace = true }
 async_zip = { workspace = true }
@@ -108,7 +107,7 @@ rustls-pemfile = "2.2.0"
 send_wrapper = "0.6.0"
 serde = { workspace = true }
 serde_with = { workspace = true }
-slab = "0.4.11"
+slab = { workspace = true }
 socket2 = "0.6.1"
 static-toml = "1.3.0"
 strum = { workspace = true }
