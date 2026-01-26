@@ -237,7 +237,6 @@ class BytesSerializerTest {
             result.readBytes(nameBytes);
             assertThat(new String(nameBytes)).isEqualTo("test-stream");
         }
-
     }
 
     @Nested
