@@ -28,11 +28,12 @@ use crate::configs::server::{MemoryPoolConfig, PersonalAccessTokenConfig, Server
 use crate::configs::sharding::NumaTopology;
 use crate::configs::system::SegmentConfig;
 use crate::streaming::segments::*;
+use configs::ConfigurationError;
 use err_trail::ErrContext;
+use iggy_common::CompressionAlgorithm;
 use iggy_common::IggyExpiry;
 use iggy_common::MaxTopicSize;
 use iggy_common::Validatable;
-use iggy_common::{CompressionAlgorithm, ConfigurationError};
 use std::thread::available_parallelism;
 use tracing::{error, warn};
 
@@ -41,17 +42,17 @@ impl Validatable<ConfigurationError> for ServerConfig {
         self.system
             .memory_pool
             .validate()
-            .error(|e: &iggy_common::ConfigurationError| {
+            .error(|e: &ConfigurationError| {
                 format!("{COMPONENT} (error: {e}) - failed to validate memory pool config")
             })?;
         self.data_maintenance
             .validate()
-            .error(|e: &iggy_common::ConfigurationError| {
+            .error(|e: &ConfigurationError| {
                 format!("{COMPONENT} (error: {e}) - failed to validate data maintenance config")
             })?;
         self.personal_access_token
             .validate()
-            .error(|e: &iggy_common::ConfigurationError| {
+            .error(|e: &ConfigurationError| {
                 format!(
                     "{COMPONENT} (error: {e}) - failed to validate personal access token config"
                 )
@@ -59,31 +60,27 @@ impl Validatable<ConfigurationError> for ServerConfig {
         self.system
             .segment
             .validate()
-            .error(|e: &iggy_common::ConfigurationError| {
+            .error(|e: &ConfigurationError| {
                 format!("{COMPONENT} (error: {e}) - failed to validate segment config")
             })?;
         self.system
             .compression
             .validate()
-            .error(|e: &iggy_common::ConfigurationError| {
+            .error(|e: &ConfigurationError| {
                 format!("{COMPONENT} (error: {e}) - failed to validate compression config")
             })?;
-        self.telemetry
-            .validate()
-            .error(|e: &iggy_common::ConfigurationError| {
-                format!("{COMPONENT} (error: {e}) - failed to validate telemetry config")
-            })?;
+        self.telemetry.validate().error(|e: &ConfigurationError| {
+            format!("{COMPONENT} (error: {e}) - failed to validate telemetry config")
+        })?;
         self.system
             .sharding
             .validate()
-            .error(|e: &iggy_common::ConfigurationError| {
+            .error(|e: &ConfigurationError| {
                 format!("{COMPONENT} (error: {e}) - failed to validate sharding config")
             })?;
-        self.cluster
-            .validate()
-            .error(|e: &iggy_common::ConfigurationError| {
-                format!("{COMPONENT} (error: {e}) - failed to validate cluster config")
-            })?;
+        self.cluster.validate().error(|e: &ConfigurationError| {
+            format!("{COMPONENT} (error: {e}) - failed to validate cluster config")
+        })?;
 
         let topic_size = match self.system.topic.max_size {
             MaxTopicSize::Custom(size) => Ok(size.as_bytes_u64()),
@@ -222,11 +219,9 @@ impl Validatable<ConfigurationError> for MessageSaverConfig {
 
 impl Validatable<ConfigurationError> for DataMaintenanceConfig {
     fn validate(&self) -> Result<(), ConfigurationError> {
-        self.messages
-            .validate()
-            .error(|e: &iggy_common::ConfigurationError| {
-                format!("{COMPONENT} (error: {e}) - failed to validate messages maintenance config")
-            })?;
+        self.messages.validate().error(|e: &ConfigurationError| {
+            format!("{COMPONENT} (error: {e}) - failed to validate messages maintenance config")
+        })?;
         Ok(())
     }
 }

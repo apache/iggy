@@ -16,6 +16,7 @@
  * under the License.
  */
 
+use iggy_common::ConfigEnv;
 use iggy_common::IggyByteSize;
 use iggy_common::IggyDuration;
 use iggy_common::IggyError;
@@ -25,10 +26,11 @@ use serde::{Deserialize, Serialize};
 use serde_with::DisplayFromStr;
 use serde_with::serde_as;
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
 pub struct HttpConfig {
     pub enabled: bool,
     pub address: String,
+    #[config_env(leaf)]
     pub max_request_size: IggyByteSize,
     pub web_ui: bool,
     pub cors: HttpCorsConfig,
@@ -37,7 +39,7 @@ pub struct HttpConfig {
     pub tls: HttpTlsConfig,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
 pub struct HttpCorsConfig {
     pub enabled: bool,
     pub allowed_methods: Vec<String>,
@@ -49,25 +51,30 @@ pub struct HttpCorsConfig {
 }
 
 #[serde_as]
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
 pub struct HttpJwtConfig {
     pub algorithm: String,
     pub issuer: String,
     pub audience: String,
     pub valid_issuers: Vec<String>,
     pub valid_audiences: Vec<String>,
+    #[config_env(leaf)]
     #[serde_as(as = "DisplayFromStr")]
     pub access_token_expiry: IggyExpiry,
+    #[config_env(leaf)]
     #[serde_as(as = "DisplayFromStr")]
     pub clock_skew: IggyDuration,
+    #[config_env(leaf)]
     #[serde_as(as = "DisplayFromStr")]
     pub not_before: IggyDuration,
+    #[config_env(secret)]
     pub encoding_secret: String,
+    #[config_env(secret)]
     pub decoding_secret: String,
     pub use_base64_secret: bool,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
 pub struct HttpMetricsConfig {
     pub enabled: bool,
     pub endpoint: String,
@@ -79,7 +86,7 @@ pub enum JwtSecret {
     Base64(String),
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
 pub struct HttpTlsConfig {
     pub enabled: bool,
     pub cert_file: String,
