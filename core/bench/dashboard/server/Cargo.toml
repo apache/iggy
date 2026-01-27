@@ -30,7 +30,7 @@ bench-report = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
 clap = { workspace = true }
 dashmap = { workspace = true }
-file-operation = "0.8.11"
+file-operation = "0.8.17"
 notify = "8.2.0"
 octocrab = "0.49.5"
 serde = { workspace = true, features = ["derive"] }
