@@ -58,6 +58,7 @@ typesafe-config = "1.4.5"
 spotless = "8.1.0"
 shadow = "9.2.2"
 checkstyle = "12.1.2"
+jacoco = "0.8.14"
 
 [libraries]
 # Jackson
