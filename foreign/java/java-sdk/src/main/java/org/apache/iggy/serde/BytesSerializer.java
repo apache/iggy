@@ -207,7 +207,8 @@ public final class BytesSerializer {
     }
 
     public static ByteBuf toBytes(String value) {
-        ByteBuf buffer = Unpooled.buffer(1 + value.length());
+        int bufferLength = 1 + value.length();
+        ByteBuf buffer = Unpooled.buffer(bufferLength);
         byte[] stringBytes = value.getBytes(StandardCharsets.UTF_8);
         buffer.writeByte(stringBytes.length);
         buffer.writeBytes(stringBytes);
