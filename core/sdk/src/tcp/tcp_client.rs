@@ -120,6 +120,8 @@ impl BinaryTransport for TcpClient {
                 | IggyError::EmptyResponse
                 | IggyError::Unauthenticated
                 | IggyError::StaleClient
+                | IggyError::NotConnected
+                | IggyError::CannotEstablishConnection
         ) {
             return Err(error);
         }

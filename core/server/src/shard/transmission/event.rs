@@ -15,121 +15,54 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::streaming::{
-    partitions::partition,
-    streams::stream,
-    topics::{
-        consumer_group::{self},
-        topic,
-    },
-};
-use iggy_common::{
-    CompressionAlgorithm, Identifier, IggyExpiry, MaxTopicSize, Permissions, PersonalAccessToken,
-    TransportProtocol, UserStatus,
-};
+use iggy_common::{Identifier, IggyTimestamp, TransportProtocol};
 use std::net::SocketAddr;
 use strum::Display;
 
-#[allow(clippy::large_enum_variant)]
+/// Minimal partition info for event broadcasting (no slab dependency)
+#[derive(Debug, Clone)]
+pub struct PartitionInfo {
+    pub id: usize,
+    pub created_at: IggyTimestamp,
+}
+
+/// Events that require broadcasting between shards.
+///
+/// Note: Metadata events (CreatedStream, DeletedStream, CreatedTopic, DeletedTopic,
+/// UpdatedStream, UpdatedTopic, CreatedConsumerGroup, DeletedConsumerGroup) are NOT
+/// broadcast because SharedMetadata is already visible to all shards via LeftRight.
+/// Only events that require per-shard local actions are broadcast.
 #[derive(Debug, Clone, Display)]
 #[strum(serialize_all = "PascalCase")]
 pub enum ShardEvent {
+    /// Flush unsaved buffer to disk for a specific partition
     FlushUnsavedBuffer {
         stream_id: Identifier,
         topic_id: Identifier,
         partition_id: usize,
         fsync: bool,
     },
-    CreatedStream {
-        id: usize,
-        stream: stream::Stream,
-    },
-    DeletedStream {
-        id: usize,
+    /// Purge all messages from a stream (requires per-shard log truncation)
+    PurgedStream { stream_id: Identifier },
+    /// Purge all messages from a topic (requires per-shard log truncation)
+    PurgedTopic {
         stream_id: Identifier,
+        topic_id: Identifier,
     },
-    UpdatedStream {
-        stream_id: Identifier,
-        name: String,
-    },
-    PurgedStream {
-        stream_id: Identifier,
-    },
+    /// New partitions created (requires per-shard log initialization)
     CreatedPartitions {
         stream_id: Identifier,
         topic_id: Identifier,
-        partitions: Vec<partition::Partition>,
+        partitions: Vec<PartitionInfo>,
     },
+    /// Partitions deleted (requires per-shard log cleanup)
     DeletedPartitions {
         stream_id: Identifier,
         topic_id: Identifier,
         partitions_count: u32,
         partition_ids: Vec<usize>,
     },
-    CreatedTopic {
-        stream_id: Identifier,
-        topic: topic::Topic,
-    },
-    CreatedConsumerGroup {
-        stream_id: Identifier,
-        topic_id: Identifier,
-        cg: consumer_group::ConsumerGroup,
-    },
-    DeletedConsumerGroup {
-        id: usize,
-        stream_id: Identifier,
-        topic_id: Identifier,
-        group_id: Identifier,
-    },
-    UpdatedTopic {
-        stream_id: Identifier,
-        topic_id: Identifier,
-        name: String,
-        message_expiry: IggyExpiry,
-        compression_algorithm: CompressionAlgorithm,
-        max_topic_size: MaxTopicSize,
-        replication_factor: Option<u8>,
-    },
-    PurgedTopic {
-        stream_id: Identifier,
-        topic_id: Identifier,
-    },
-    DeletedTopic {
-        id: usize,
-        stream_id: Identifier,
-        topic_id: Identifier,
-    },
-    CreatedUser {
-        user_id: u32,
-        username: String,
-        password: String,
-        status: UserStatus,
-        permissions: Option<Permissions>,
-    },
-    UpdatedPermissions {
-        user_id: Identifier,
-        permissions: Option<Permissions>,
-    },
-    DeletedUser {
-        user_id: Identifier,
-    },
-    UpdatedUser {
-        user_id: Identifier,
-        username: Option<String>,
-        status: Option<UserStatus>,
-    },
-    ChangedPassword {
-        user_id: Identifier,
-        current_password: String,
-        new_password: String,
-    },
-    CreatedPersonalAccessToken {
-        personal_access_token: PersonalAccessToken,
-    },
-    DeletedPersonalAccessToken {
-        user_id: u32,
-        name: String,
-    },
+    /// Transport address bound (for config file writing)
     AddressBound {
         protocol: TransportProtocol,
         address: SocketAddr,

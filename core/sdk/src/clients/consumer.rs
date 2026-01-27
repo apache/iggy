@@ -475,10 +475,6 @@ impl IggyConsumer {
         tokio::spawn(async move {
             loop {
                 sleep(interval.get_duration()).await;
-                if shutdown.load(ORDERING) {
-                    trace!("Shutdown signal received, stopping background offset storage");
-                    break;
-                }
                 for entry in last_consumed_offsets.iter() {
                     let partition_id = *entry.key();
                     let consumed_offset = entry.load(ORDERING);
@@ -493,6 +489,10 @@ impl IggyConsumer {
                         false,
                     )
                     .await;
+                }
+                if shutdown.load(ORDERING) {
+                    trace!("Shutdown signal received, stopping background offset storage");
+                    break;
                 }
             }
         });
@@ -1053,6 +1053,69 @@ impl Stream for IggyConsumer {
         }
 
         Poll::Pending
+    }
+}
+
+impl IggyConsumer {
+    pub async fn shutdown(&mut self) -> Result<(), IggyError> {
+        if self.shutdown.swap(true, ORDERING) {
+            return Ok(());
+        }
+
+        info!("Shutting down consumer: {}...", self.consumer_name);
+
+        for entry in self.last_consumed_offsets.iter() {
+            let partition_id = *entry.key();
+            let consumed_offset = entry.load(ORDERING);
+
+            let stored_offset = self
+                .last_stored_offsets
+                .get(&partition_id)
+                .map(|e| e.load(ORDERING))
+                .unwrap_or(0);
+
+            if consumed_offset > stored_offset {
+                trace!(
+                    "Flushing final offset: {consumed_offset} for partition: {partition_id}, stream: {}, topic: {}",
+                    self.stream_id, self.topic_id
+                );
+                let _ = Self::store_consumer_offset(
+                    &self.client,
+                    &self.consumer,
+                    &self.stream_id,
+                    &self.topic_id,
+                    partition_id,
+                    consumed_offset,
+                    &self.last_stored_offsets,
+                    self.allow_replay,
+                )
+                .await;
+            }
+        }
+
+        if self.is_consumer_group && self.joined_consumer_group.load(ORDERING) {
+            let group_id = self.consumer.id.clone();
+            trace!(
+                "Leaving consumer group: {group_id} for stream: {}, topic: {}",
+                self.stream_id, self.topic_id
+            );
+
+            let client = self.client.read().await;
+            if let Err(error) = client
+                .leave_consumer_group(&self.stream_id, &self.topic_id, &group_id)
+                .await
+            {
+                warn!(
+                    "Failed to leave consumer group: {group_id} for stream: {}, topic: {}. {error}",
+                    self.stream_id, self.topic_id
+                );
+            } else {
+                self.joined_consumer_group.store(false, ORDERING);
+            }
+        }
+
+        info!("Consumer: {} has been shut down.", self.consumer_name);
+        Ok(())
     }
 }
 

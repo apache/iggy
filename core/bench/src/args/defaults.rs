@@ -46,11 +46,7 @@ pub const DEFAULT_NUMBER_OF_CONSUMERS: NonZeroU32 = u32!(8);
 pub const DEFAULT_NUMBER_OF_CONSUMER_GROUPS: NonZeroU32 = u32!(1);
 pub const DEFAULT_NUMBER_OF_PRODUCERS: NonZeroU32 = u32!(8);
 
-pub const DEFAULT_PERFORM_CLEANUP: bool = false;
-pub const DEFAULT_SERVER_STDOUT_VISIBILITY: bool = false;
-
 pub const DEFAULT_WARMUP_TIME: &str = "0s";
-pub const DEFAULT_SKIP_SERVER_START: bool = false;
 
 pub const DEFAULT_SAMPLING_TIME: &str = "10ms";
 pub const DEFAULT_MOVING_AVERAGE_WINDOW: u32 = 20;

@@ -22,7 +22,6 @@ use bench_report::{
     transport::BenchmarkTransport,
 };
 use iggy::prelude::*;
-use integration::test_server::ClientFactory;
 use std::{fs, path::Path, sync::Arc};
 use tracing::{error, info};
 
@@ -38,12 +37,13 @@ use crate::args::{
     },
 };
 
+pub use client_factory::{ClientFactory, login_root};
+
 pub mod batch_generator;
 pub mod client_factory;
 pub mod cpu_name;
 pub mod finish_condition;
 pub mod rate_limiter;
-pub mod server_starter;
 
 pub fn batch_total_size_bytes(polled_messages: &PolledMessages) -> u64 {
     polled_messages

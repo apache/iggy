@@ -27,6 +27,7 @@ use crate::{
         system::{INDEX_EXTENSION, LOG_EXTENSION, SystemConfig},
     },
     io::fs_utils::{self, DirEntry},
+    metadata::{ConsumerGroupMeta, MetadataWriter, PartitionMeta, StreamMeta, TopicMeta, UserMeta},
     server_error::ServerError,
     shard::{
         system::info::SystemInfo,
@@ -35,33 +36,21 @@ use crate::{
             frame::ShardFrame,
         },
     },
-    slab::{
-        consumer_groups::ConsumerGroups, partitions::Partitions, streams::Streams, topics::Topics,
-        traits_ext::IntoComponents, users::Users,
-    },
-    state::system::{StreamState, UserState},
+    state::system::{StreamState, TopicState, UserState},
     streaming::{
         partitions::{
-            consumer_offset::ConsumerOffset,
-            helpers::create_message_deduplicator,
-            journal::MemoryMessageJournal,
-            log::SegmentedLog,
-            partition,
-            storage::{load_consumer_group_offsets, load_consumer_offsets},
+            consumer_group_offsets::ConsumerGroupOffsets, consumer_offsets::ConsumerOffsets,
+            journal::MemoryMessageJournal, log::SegmentedLog,
         },
         persistence::persister::{FilePersister, FileWithSyncPersister, PersisterKind},
-        polling_consumer::ConsumerGroupId,
         segments::{Segment, storage::Storage},
         stats::{PartitionStats, StreamStats, TopicStats},
         storage::SystemStorage,
-        streams::stream,
-        topics::{consumer_group, topic},
         users::user::User,
         utils::{crypto, file::overwrite},
     },
     versioning::SemanticVersion,
 };
-use ahash::HashMap;
 use compio::{fs::create_dir_all, runtime::Runtime};
 use err_trail::ErrContext;
 use iggy_common::{
@@ -71,156 +60,9 @@ use iggy_common::{
         MIN_USERNAME_LENGTH,
     },
 };
+use slab::Slab;
 use std::{env, path::Path, sync::Arc};
 use tracing::{info, warn};
-
-pub async fn load_streams(
-    state: impl IntoIterator<Item = StreamState>,
-    config: &SystemConfig,
-) -> Result<Streams, IggyError> {
-    let state: Vec<StreamState> = state.into_iter().collect();
-    let mut stream_entries = Vec::with_capacity(state.len());
-
-    for stream_state in state {
-        let stream_id = stream_state.id as usize;
-        info!(
-            "Loading stream with ID: {}, name: {} from state...",
-            stream_state.id, stream_state.name
-        );
-
-        let stream_stats = Arc::new(StreamStats::default());
-        let mut topic_entries = Vec::new();
-
-        for topic_state in stream_state.topics.into_values() {
-            let topic_id = topic_state.id as usize;
-            info!(
-                "Loading topic with ID: {}, name: {} from state...",
-                topic_state.id, topic_state.name
-            );
-
-            let topic_stats = Arc::new(TopicStats::new(stream_stats.clone()));
-
-            // Build partitions
-            let mut partition_entries = Vec::new();
-            for partition_state in topic_state.partitions.into_values() {
-                let partition_id = partition_state.id as usize;
-                info!(
-                    "Loading partition with ID: {}, for topic with ID: {} from state...",
-                    partition_id, topic_id
-                );
-
-                let partition = load_partition(
-                    config,
-                    stream_id,
-                    topic_id,
-                    partition_state,
-                    topic_stats.clone(),
-                )
-                .await?;
-                partition_entries.push((partition_id, partition));
-
-                info!(
-                    "Loaded partition with ID: {}, for topic with ID: {} from state...",
-                    partition_id, topic_id
-                );
-            }
-
-            // Build consumer groups
-            let partition_ids: Vec<_> = partition_entries.iter().map(|(id, _)| *id).collect();
-            let cg_entries: Vec<_> = topic_state
-                .consumer_groups
-                .into_values()
-                .map(|cg_state| {
-                    info!(
-                        "Loading consumer group with ID: {}, name: {} for topic with ID: {} from state...",
-                        cg_state.id, cg_state.name, topic_id
-                    );
-                    let cg = consumer_group::ConsumerGroup::new(
-                        cg_state.name.clone(),
-                        Default::default(),
-                        partition_ids.clone(),
-                    );
-                    info!(
-                        "Loaded consumer group with ID: {}, name: {} for topic with ID: {} from state...",
-                        cg_state.id, cg_state.name, topic_id
-                    );
-                    (cg_state.id as usize, cg)
-                })
-                .collect();
-
-            // Build topic with pre-built partitions and consumer groups
-            let mut topic = topic::Topic::new(
-                topic_state.name.clone(),
-                topic_stats,
-                topic_state.created_at,
-                topic_state.replication_factor.unwrap_or(1),
-                topic_state.message_expiry,
-                topic_state.compression_algorithm,
-                topic_state.max_topic_size,
-            );
-
-            // Decompose, set nested containers, recompose
-            let (mut root, auxilary, stats) = topic.into_components();
-            root.set_partitions(Partitions::from_entries(partition_entries));
-            root.set_consumer_groups(ConsumerGroups::from_entries(cg_entries));
-            topic = topic::Topic::new_with_components(root, auxilary, stats);
-
-            topic_entries.push((topic_id, topic));
-            info!(
-                "Loaded topic with ID: {}, name: {} from state...",
-                topic_state.id, topic_state.name
-            );
-        }
-
-        // Build stream with pre-built topics
-        let mut stream = stream::Stream::new(
-            stream_state.name.clone(),
-            stream_stats,
-            stream_state.created_at,
-        );
-
-        // Decompose, set nested containers, recompose
-        let (mut root, stats) = stream.into_components();
-        root.set_topics(Topics::from_entries(topic_entries));
-        stream = stream::Stream::new_with_components(root, stats);
-
-        stream_entries.push((stream_id, stream));
-        info!(
-            "Loaded stream with ID: {}, name: {} from state...",
-            stream_state.id, stream_state.name
-        );
-    }
-
-    Ok(Streams::from_entries(stream_entries))
-}
-
-pub fn load_users(state: impl IntoIterator<Item = UserState>) -> Users {
-    let users = Users::new();
-    for user_state in state {
-        let UserState {
-            id,
-            username,
-            password_hash,
-            status,
-            created_at,
-            permissions,
-            personal_access_tokens,
-        } = user_state;
-        let mut user = User::with_password(id, &username, password_hash, status, permissions);
-        user.created_at = created_at;
-        user.personal_access_tokens = personal_access_tokens
-            .into_values()
-            .map(|token| {
-                (
-                    Arc::from(token.token_hash.as_str()),
-                    PersonalAccessToken::raw(id, &token.name, &token.token_hash, token.expiry_at),
-                )
-            })
-            .collect();
-        users.insert(user);
-    }
-    users
-}
 
 pub fn create_shard_connections(
     shard_assignment: &[ShardInfo],
@@ -620,86 +462,215 @@ pub async fn load_segments(
     Ok(log)
 }
 
-async fn load_partition(
-    config: &SystemConfig,
-    stream_id: usize,
-    topic_id: usize,
-    partition_state: crate::state::system::PartitionState,
-    parent_stats: Arc<TopicStats>,
-) -> Result<partition::Partition, IggyError> {
-    let stats = Arc::new(PartitionStats::new(parent_stats));
-    let partition_id = partition_state.id;
+/// Builds `InnerMetadata` from persisted user and stream state.
+pub fn build_inner_metadata(
+    users_state: impl IntoIterator<Item = UserState>,
+    streams_state: impl IntoIterator<Item = StreamState>,
+) -> crate::metadata::InnerMetadata {
+    use crate::metadata::InnerMetadata;
+    use std::sync::atomic::AtomicUsize;
 
-    let partition_path = config.get_partition_path(stream_id, topic_id, partition_id as usize);
-    let log_files = collect_log_files(&partition_path).await?;
-    let should_increment_offset = !log_files.is_empty()
-        && log_files
-            .first()
-            .map(|entry| {
-                let log_file_name = entry
-                    .path
-                    .file_stem()
-                    .unwrap()
-                    .to_string_lossy()
-                    .to_string();
+    let mut user_entries = Vec::new();
+    let mut user_index = ahash::AHashMap::default();
+    let mut personal_access_tokens: ahash::AHashMap<
+        u32,
+        ahash::AHashMap<Arc<str>, PersonalAccessToken>,
+    > = ahash::AHashMap::default();
+    let mut users_count = 0;
+    let mut pats_count = 0;
 
-                let start_offset = log_file_name.parse::<u64>().unwrap();
+    for UserState {
+        id,
+        username,
+        password_hash,
+        status,
+        created_at,
+        permissions,
+        personal_access_tokens: user_pats,
+    } in users_state
+    {
+        let username_arc: Arc<str> = Arc::from(username.as_str());
+        let user_meta = UserMeta {
+            id,
+            username: username_arc.clone(),
+            password_hash: Arc::from(password_hash.as_str()),
+            status,
+            permissions: permissions.map(Arc::new),
+            created_at,
+        };
+        user_entries.push((id as usize, user_meta));
+        user_index.insert(username_arc, id);
 
-                let messages_file_path = config.get_messages_file_path(
-                    stream_id,
-                    topic_id,
-                    partition_id as usize,
-                    start_offset,
+        if !user_pats.is_empty() {
+            let user_pat_map: ahash::AHashMap<Arc<str>, PersonalAccessToken> = user_pats
+                .into_values()
+                .map(|token| {
+                    let pat = PersonalAccessToken::raw(
+                        id,
+                        &token.name,
+                        &token.token_hash,
+                        token.expiry_at,
+                    );
+                    (Arc::from(token.token_hash.as_str()), pat)
+                })
+                .collect();
+            pats_count += user_pat_map.len();
+            personal_access_tokens.insert(id, user_pat_map);
+        }
+
+        users_count += 1;
+    }
+    info!(
+        "Building metadata: {} users, {} personal access tokens",
+        users_count, pats_count
+    );
+
+    let mut stream_entries = Vec::new();
+    let mut stream_index = ahash::AHashMap::default();
+    let mut streams_count = 0;
+    let mut topics_count = 0;
+    let mut partitions_count = 0;
+    let mut consumer_groups_count = 0;
+
+    for StreamState {
+        name,
+        created_at,
+        id,
+        topics,
+    } in streams_state
+    {
+        info!(
+            "Building stream with ID: {}, name: {} metadata...",
+            id, name
+        );
+        let stream_id = id as usize;
+        let stream_name: Arc<str> = Arc::from(name.as_str());
+
+        let stream_stats = Arc::new(StreamStats::default());
+
+        let mut topic_entries = Vec::new();
+        let mut topic_index = ahash::AHashMap::default();
+
+        for TopicState {
+            id,
+            name,
+            created_at,
+            compression_algorithm,
+            message_expiry,
+            max_topic_size,
+            replication_factor,
+            consumer_groups,
+            partitions,
+        } in topics.into_values()
+        {
+            info!("Building topic with ID: {}, name: {} metadata...", id, name);
+            let topic_id = id as usize;
+            let topic_name: Arc<str> = Arc::from(name.as_str());
+
+            let topic_stats = Arc::new(TopicStats::new(stream_stats.clone()));
+
+            let mut partition_entries = Vec::new();
+            let mut partition_ids = Vec::new();
+
+            for partition_state in partitions.into_values() {
+                let partition_id = partition_state.id as usize;
+                partition_ids.push(partition_id);
+
+                let partition_stats = Arc::new(PartitionStats::new(topic_stats.clone()));
+                let partition_meta = PartitionMeta {
+                    id: partition_id,
+                    created_at: partition_state.created_at,
+                    revision_id: 0,
+                    stats: partition_stats,
+                    consumer_offsets: Arc::new(ConsumerOffsets::with_capacity(0)),
+                    consumer_group_offsets: Arc::new(ConsumerGroupOffsets::with_capacity(0)),
+                };
+                partition_entries.push((partition_id, partition_meta));
+                partitions_count += 1;
+            }
+
+            partition_ids.sort_unstable();
+
+            let mut cg_entries = Vec::new();
+            let mut cg_index = ahash::AHashMap::default();
+
+            for cg_state in consumer_groups.into_values() {
+                info!(
+                    "Building consumer group with ID: {}, name: {} for topic with ID: {} metadata...",
+                    cg_state.id, cg_state.name, topic_id
                 );
-                let metadata = std::fs::metadata(&messages_file_path)
-                    .expect("failed to get metadata for first segment in log");
-                metadata.len() > 0
-            })
-            .unwrap_or_else(|| false);
+                let group_id = cg_state.id as usize;
+                let group_name: Arc<str> = Arc::from(cg_state.name.as_str());
+                let cg_meta = ConsumerGroupMeta {
+                    id: group_id,
+                    name: group_name.clone(),
+                    partitions: partition_ids.clone(),
+                    members: Slab::new(),
+                };
+                cg_entries.push((group_id, cg_meta));
+                cg_index.insert(group_name, group_id);
+                consumer_groups_count += 1;
+            }
+
+            let topic_meta = TopicMeta {
+                id: topic_id,
+                name: topic_name.clone(),
+                created_at,
+                message_expiry,
+                compression_algorithm,
+                max_topic_size,
+                replication_factor: replication_factor.unwrap_or(1),
+                stats: topic_stats,
+                partitions: partition_entries.into_iter().map(|(_, p)| p).collect(),
+                consumer_groups: cg_entries.into_iter().collect(),
+                consumer_group_index: cg_index,
+                round_robin_counter: Arc::new(AtomicUsize::new(0)),
+            };
+            topic_entries.push((topic_id, topic_meta));
+            topic_index.insert(topic_name, topic_id);
+            topics_count += 1;
+        }
+
+        let stream_meta = StreamMeta {
+            id: stream_id,
+            name: stream_name.clone(),
+            created_at,
+            stats: stream_stats,
+            topics: topic_entries.into_iter().collect(),
+            topic_index,
+        };
+        stream_entries.push((stream_id, stream_meta));
+        stream_index.insert(stream_name, stream_id);
+        streams_count += 1;
+    }
 
     info!(
-        "Loading partition with ID: {} for stream with ID: {} and topic with ID: {}, for path: {} from disk...",
-        partition_id, stream_id, topic_id, partition_path
+        "Built metadata: {} streams, {} topics, {} partitions, {} consumer groups",
+        streams_count, topics_count, partitions_count, consumer_groups_count
     );
 
-    // Load consumer offsets
-    let message_deduplicator = create_message_deduplicator(config);
-    let consumer_offset_path =
-        config.get_consumer_offsets_path(stream_id, topic_id, partition_id as usize);
-    let consumer_group_offsets_path =
-        config.get_consumer_group_offsets_path(stream_id, topic_id, partition_id as usize);
+    InnerMetadata {
+        streams: stream_entries.into_iter().collect(),
+        users: user_entries.into_iter().collect(),
+        stream_index,
+        user_index,
+        personal_access_tokens,
+        users_global_permissions: Default::default(),
+        users_stream_permissions: Default::default(),
+        users_can_poll_all_streams: Default::default(),
+        users_can_send_all_streams: Default::default(),
+        users_can_poll_stream: Default::default(),
+        users_can_send_stream: Default::default(),
+    }
+}
 
-    let consumer_offset = Arc::new(
-        load_consumer_offsets(&consumer_offset_path)?
-            .into_iter()
-            .map(|offset| (offset.consumer_id as usize, offset))
-            .collect::<HashMap<usize, ConsumerOffset>>()
-            .into(),
-    );
-
-    let consumer_group_offset = Arc::new(
-        load_consumer_group_offsets(&consumer_group_offsets_path)?
-            .into_iter()
-            .collect::<HashMap<ConsumerGroupId, ConsumerOffset>>()
-            .into(),
-    );
-
-    let log = Default::default();
-    let partition = partition::Partition::new(
-        partition_state.created_at,
-        should_increment_offset,
-        stats,
-        message_deduplicator,
-        Arc::new(Default::default()),
-        consumer_offset,
-        consumer_group_offset,
-        log,
-    );
-
-    info!(
-        "Loaded partition with ID: {} for stream with ID: {} and topic with ID: {}",
-        partition_id, stream_id, topic_id
-    );
-
-    Ok(partition)
+/// Loads all metadata from persisted state into metadata writer.
+/// Single atomic initialization via `Initialize` operation.
+pub fn load_metadata(
+    users_state: impl IntoIterator<Item = UserState>,
+    streams_state: impl IntoIterator<Item = StreamState>,
+    writer: &mut MetadataWriter,
+) {
+    let inner = build_inner_metadata(users_state, streams_state);
+    writer.initialize(inner);
 }

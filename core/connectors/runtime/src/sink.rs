@@ -19,6 +19,7 @@
 
 use crate::configs::connectors::SinkConfig;
 use crate::context::RuntimeContext;
+use crate::log::LOG_CALLBACK;
 use crate::manager::status::ConnectorStatus;
 use crate::{
     PLUGIN_ID, RuntimeError, SinkApi, SinkConnector, SinkConnectorConsumer, SinkConnectorPlugin,
@@ -180,16 +181,14 @@ pub async fn init(
 pub fn consume(sinks: Vec<SinkConnectorWrapper>, context: Arc<RuntimeContext>) {
     for sink in sinks {
         for plugin in sink.plugins {
-            if plugin.error.is_none() {
-                info!("Starting consume for sink with ID: {}...", plugin.id);
-            } else {
+            if let Some(error) = &plugin.error {
                 error!(
-                    "Failed to initialize sink connector with ID: {}: {}. Skipping...",
+                    "Failed to initialize sink connector with ID: {}: {error}. Skipping...",
                     plugin.id,
-                    plugin.error.as_ref().expect("Error should be present")
                 );
                 continue;
             }
+            info!("Starting consume for sink with ID: {}...", plugin.id);
             for consumer in plugin.consumers {
                 let plugin_key = plugin.key.clone();
                 let context = context.clone();
@@ -319,7 +318,12 @@ fn init_sink(
     id: u32,
 ) -> Result<(), RuntimeError> {
     let plugin_config = serde_json::to_string(plugin_config).expect("Invalid sink plugin config.");
-    let result = (container.open)(id, plugin_config.as_ptr(), plugin_config.len());
+    let result = (container.open)(
+        id,
+        plugin_config.as_ptr(),
+        plugin_config.len(),
+        LOG_CALLBACK,
+    );
     if result != 0 {
         let err = format!("Plugin initialization failed (ID: {id})");
         error!("{err}");

@@ -136,10 +136,7 @@ impl HttpSafeShard {
         future.await
     }
 
-    pub async fn create_stream(
-        &self,
-        name: String,
-    ) -> Result<crate::streaming::streams::stream::Stream, IggyError> {
+    pub async fn create_stream(&self, name: String) -> Result<usize, IggyError> {
         let future = SendWrapper::new(self.shard().create_stream(name));
         future.await
     }
@@ -279,31 +276,41 @@ impl HttpSafeShard {
     ) -> Result<(), IggyError> {
         self.shard().ensure_topic_exists(&stream_id, &topic_id)?;
 
-        let partition_id = self.shard().streams.with_topic_by_id(
-            &stream_id,
-            &topic_id,
-            |(root, auxilary, ..)| match partitioning.kind {
-                PartitioningKind::Balanced => {
-                    let upperbound = root.partitions().len();
-                    let pid = auxilary.get_next_partition_id(upperbound);
-                    Ok(pid)
-                }
-                PartitioningKind::PartitionId => Ok(u32::from_le_bytes(
-                    partitioning.value[..partitioning.length as usize]
-                        .try_into()
-                        .map_err(|_| IggyError::InvalidNumberEncoding)?,
-                ) as usize),
-                PartitioningKind::MessagesKey => {
-                    let upperbound = root.partitions().len();
-                    Ok(
-                        topics::helpers::calculate_partition_id_by_messages_key_hash(
-                            upperbound,
-                            &partitioning.value,
-                        ),
-                    )
-                }
-            },
-        )?;
+        let numeric_stream_id = self
+            .shard()
+            .metadata
+            .get_stream_id(&stream_id)
+            .expect("Stream existence already verified");
+        let numeric_topic_id = self
+            .shard()
+            .metadata
+            .get_topic_id(numeric_stream_id, &topic_id)
+            .expect("Topic existence already verified");
+        let partition_id = match partitioning.kind {
+            PartitioningKind::Balanced => self
+                .shard()
+                .metadata
+                .get_next_partition_id(numeric_stream_id, numeric_topic_id)
+                .ok_or(IggyError::TopicIdNotFound(
+                    stream_id.clone(),
+                    topic_id.clone(),
+                ))?,
+            PartitioningKind::PartitionId => u32::from_le_bytes(
+                partitioning.value[..partitioning.length as usize]
+                    .try_into()
+                    .map_err(|_| IggyError::InvalidNumberEncoding)?,
+            ) as usize,
+            PartitioningKind::MessagesKey => {
+                let partitions_count = self
+                    .shard()
+                    .metadata
+                    .partitions_count(numeric_stream_id, numeric_topic_id);
+                topics::helpers::calculate_partition_id_by_messages_key_hash(
+                    partitions_count,
+                    &partitioning.value,
+                )
+            }
+        };
 
         let future = SendWrapper::new(self.shard().append_messages(
             user_id,
@@ -313,5 +320,37 @@ impl HttpSafeShard {
             batch,
         ));
         future.await
+    }
+
+    pub fn create_consumer_group(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        name: String,
+    ) -> Result<usize, IggyError> {
+        self.shard()
+            .create_consumer_group(stream_id, topic_id, name)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_topic(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        name: String,
+        message_expiry: iggy_common::IggyExpiry,
+        compression_algorithm: iggy_common::CompressionAlgorithm,
+        max_topic_size: iggy_common::MaxTopicSize,
+        replication_factor: Option<u8>,
+    ) -> Result<(), IggyError> {
+        self.shard().update_topic(
+            stream_id,
+            topic_id,
+            name,
+            message_expiry,
+            compression_algorithm,
+            max_topic_size,
+            replication_factor,
+        )
     }
 }

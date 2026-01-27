@@ -28,11 +28,9 @@ use crate::shard::transmission::frame::ShardResponse;
 use crate::shard::transmission::message::{
     ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult,
 };
-use crate::slab::traits_ext::EntityMarker;
+
 use crate::state::command::EntryCommand;
 use crate::streaming::session::Session;
-use crate::streaming::streams;
-use anyhow::Result;
 use err_trail::ErrContext;
 use iggy_common::delete_topic::DeleteTopic;
 use iggy_common::{Identifier, IggyError, SenderKind};
@@ -57,9 +55,8 @@ impl ServerCommandHandler for DeleteTopic {
         shard.ensure_authenticated(session)?;
         let (stream_id, topic_id) = shard.resolve_topic_id(&self.stream_id, &self.topic_id)?;
         shard
-            .permissioner
-            .borrow()
-            .delete_topic(session.get_user_id(), stream_id, topic_id)?;
+            .metadata
+            .perm_delete_topic(session.get_user_id(), stream_id, topic_id)?;
 
         let request = ShardRequest {
             stream_id: Identifier::default(),
@@ -82,25 +79,32 @@ impl ServerCommandHandler for DeleteTopic {
                         ..
                     } = payload
                 {
+                    // Capture numeric IDs and partition_ids BEFORE deletion for broadcast.
+                    // After deletion, the topic won't exist in metadata.
+                    let (numeric_stream_id, numeric_topic_id) =
+                        shard.resolve_topic_id(&stream_id, &topic_id)?;
+                    let partition_ids = shard
+                        .metadata
+                        .get_partition_ids(numeric_stream_id, numeric_topic_id);
+
                     // Acquire topic lock to serialize filesystem operations
                     let _topic_guard = shard.fs_locks.topic_lock.lock().await;
 
-                    let topic = shard.delete_topic(&stream_id, &topic_id).await?;
-                    let stream_id_num = shard
-                        .streams
-                        .with_stream_by_id(&stream_id, streams::helpers::get_stream_id());
-                    let topic_id_num = topic.root().id();
+                    let topic_info = shard.delete_topic(&stream_id, &topic_id).await?;
+                    let topic_id_num = topic_info.id;
+                    let stream_id_num = topic_info.stream_id;
                     info!(
                         "Deleted topic with name: {}, ID: {} in stream with ID: {}",
-                        topic.root().name(),
-                        topic_id_num,
-                        stream_id_num
+                        topic_info.name, topic_id_num, stream_id_num
                     );
 
-                    let event = ShardEvent::DeletedTopic {
-                        id: topic_id_num,
-                        stream_id: stream_id.clone(),
-                        topic_id: topic_id.clone(),
+                    // Broadcast to all shards to clean up their local_partitions entries.
+                    // Use numeric Identifiers since the topic is already deleted from metadata.
+                    let event = ShardEvent::DeletedPartitions {
+                        stream_id: Identifier::numeric(numeric_stream_id as u32).unwrap(),
+                        topic_id: Identifier::numeric(numeric_topic_id as u32).unwrap(),
+                        partitions_count: partition_ids.len() as u32,
+                        partition_ids,
                     };
                     shard.broadcast_event_to_all_shards(event).await?;
 
@@ -119,16 +123,7 @@ impl ServerCommandHandler for DeleteTopic {
                 }
             }
             ShardSendRequestResult::Response(response) => match response {
-                ShardResponse::DeleteTopicResponse(topic) => {
-                    shard
-                        .state
-                        .apply(session.get_user_id(), &EntryCommand::DeleteTopic(self))
-                        .await
-                        .error(|e: &IggyError| format!(
-                            "{COMPONENT} (error: {e}) - failed to apply delete topic with ID: {}, session: {session}",
-                            topic.id()
-                        ))?;
-
+                ShardResponse::DeleteTopicResponse(_topic_id_num) => {
                     sender.send_empty_ok_response().await?;
                 }
                 ShardResponse::ErrorResponse(err) => {
