@@ -34,6 +34,8 @@ axum = { workspace = true }
 axum-server = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
+configs = { workspace = true }
+configs_derive = { workspace = true }
 dashmap = { workspace = true }
 derive_more = { workspace = true }
 dirs = { workspace = true }

@@ -15,10 +15,16 @@
 # specific language governing permissions and limitations
 # under the License.
 
-default: true
-MD013:
-  line_length: 120
-  tables: false
-MD033:
-  allowed_elements: [details, summary, img]
-MD041: false
+[package]
+name = "configs"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+configs_derive = { workspace = true }
+figment = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }

@@ -20,6 +20,7 @@
 use crate::configs::connectors::ConfigFormat;
 use crate::error::RuntimeError;
 use axum::http::{HeaderValue, Method};
+use configs_derive::ConfigEnv;
 use serde::{Deserialize, Serialize};
 use std::fmt::Formatter;
 use tower_http::cors::{AllowOrigin, CorsLayer};
@@ -30,16 +31,17 @@ pub const YAML_HEADER: HeaderValue = HeaderValue::from_static("application/yaml"
 pub const TOML_HEADER: HeaderValue = HeaderValue::from_static("application/toml");
 pub const TEXT_HEADER: HeaderValue = HeaderValue::from_static("text/plain");
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, ConfigEnv)]
 pub struct HttpConfig {
     pub enabled: bool,
     pub address: String,
+    #[config_env(secret)]
     pub api_key: String,
     pub cors: HttpCorsConfig,
     pub tls: HttpTlsConfig,
 }
 
-#[derive(Debug, Default, Deserialize, Serialize, Clone)]
+#[derive(Debug, Default, Deserialize, Serialize, Clone, ConfigEnv)]
 pub struct HttpCorsConfig {
     pub enabled: bool,
     pub allowed_methods: Vec<String>,
@@ -50,7 +52,7 @@ pub struct HttpCorsConfig {
     pub allow_private_network: bool,
 }
 
-#[derive(Debug, Default, Deserialize, Serialize, Clone)]
+#[derive(Debug, Default, Deserialize, Serialize, Clone, ConfigEnv)]
 pub struct HttpTlsConfig {
     pub enabled: bool,
     pub cert_file: String,

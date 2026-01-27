@@ -19,11 +19,12 @@
 
 use assert_cmd::prelude::CommandCargoExt;
 use async_trait::async_trait;
+use configs::ConfigProvider;
 use derive_more::Display;
 use futures::executor::block_on;
 use iggy::prelude::UserStatus::Active;
 use iggy::prelude::*;
-use iggy_common::{ConfigProvider, TransportProtocol};
+use iggy_common::TransportProtocol;
 use rand::Rng;
 use server::configs::server::ServerConfig;
 use std::collections::HashMap;

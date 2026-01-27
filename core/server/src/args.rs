@@ -38,12 +38,12 @@ DOCUMENTATION:
     https://iggy.apache.org/docs
 
 CONFIGURATION:
-    The server uses a TOML configuration file. By default, it looks for 'configs/server.toml'
+    The server uses a TOML configuration file. By default, it looks for 'core/server/config.toml'
     in the current working directory. You can override this with the IGGY_CONFIG_PATH environment
     variable or use the --config-provider flag.
 
     Examples:
-        iggy-server                                    # Uses default file provider (configs/server.toml)
+        iggy-server                                    # Uses default file provider (core/server/config.toml)
         iggy-server --config-provider file             # Explicitly use file provider
         IGGY_CONFIG_PATH=custom.toml iggy-server       # Use custom config file path
 
