@@ -95,11 +95,16 @@ impl Codec {
         match self {
             Codec::None => data.to_vec(),
             Codec::Lz4 => {
-                let mut decoder = FrameDecoder::new(data);
+                let decoder = FrameDecoder::new(data);
                 let mut decompressed_data = Vec::new();
-                decoder
+                let bytes_read = decoder
+                    .take(MAX_PAYLOAD_SIZE as u64 + 1)
                     .read_to_end(&mut decompressed_data)
-                    .expect("Cannot decode message payload using Lz4.");
+                    .expect("Cannot decode payload using Lz4.");
+
+                if bytes_read > MAX_PAYLOAD_SIZE as usize {
+                    panic!("Decompressed message exceeds MAX_PAYLOAD_SIZE!")
+                }
                 decompressed_data
             }
         }

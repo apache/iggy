@@ -140,6 +140,14 @@ impl Codec {
 The other two methods implement the compression and decompression logic, which is specifc to the actual Codec instance, dependent on the enum's variant.
 The example Codec implements two. *None*, where data is not compressed and *Lz4* (using the lz4_flex crate).
 Note, that this can be easily extended to more algorithms.
+It might be reasonable to limit the number of bytes that can be decompressed to avoid large memory footprints, or even crashing the consumer.
+The `decompress` method, therefore takes one more byte as defined by the `MAX_PAYLOAD_SIZE` which is [64MB](https://github.com/apache/iggy/blob/05243138255349a78bd1e086a0d7fb264682f980/core/common/src/types/message/iggy_message.rs#L46).
+If the decoder read the full `MAX_PAYLOAD_SIZE` + 1 bytes, the payload exceeds the limit and the program panics.
+Note, that only the Lz4 branch in the match statement applies this logic.
+This is safe, because an `IggyMessage` ensures that the payload does not exceed `MAX_PAYLOAD_SIZE`, when using the builder.
+A compressed message that meets the limit of `MAX_PAYLOAD_SIZE`, however, can decompress into much more bytes.
+In a productive environment panics would be replaced with informative errors that can be properly handled.
+You would most likely want to continue reading messages from the server, even if one of them exceeds the limit.
 
 ```rust
 impl Codec {
@@ -160,14 +168,19 @@ impl Codec {
 
     pub fn decompress(&self, data: &[u8]) -> Vec<u8> {
         match self {
-            Codec::None => Ok(data.to_vec()),
+            Codec::None => data.to_vec(),
             Codec::Lz4 => {
-                let mut decoder = FrameDecoder::new(data);
+                let decoder = FrameDecoder::new(data);
                 let mut decompressed_data = Vec::new();
-                decoder
+                let bytes_read = decoder
+                    .take(MAX_PAYLOAD_SIZE as u64 + 1)
                     .read_to_end(&mut decompressed_data)
-                    .expect("Cannot decode message payload using Lz4.");
-                Ok(decompressed_data)
+                    .expect("Cannot decode payload using Lz4.");
+
+                if bytes_read > MAX_PAYLOAD_SIZE as usize {
+                    panic!("Decompressed message exceeds MAX_PAYLOAD_SIZE!")
+                }
+                decompressed_data
             }
         }
     }
