@@ -22,11 +22,14 @@ use arrow_json::ReaderBuilder;
 use async_trait::async_trait;
 use iceberg::TableIdent;
 use iceberg::arrow::schema_to_arrow_schema;
-use iceberg::spec::{Literal, PrimitiveLiteral, PrimitiveType, Struct, StructType};
+use iceberg::spec::{
+    Literal, PartitionKey, PartitionSpec, PrimitiveLiteral, PrimitiveType, Struct, StructType,
+};
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 use iceberg::writer::file_writer::ParquetWriterBuilder;
+use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use iceberg::{
     Catalog,
@@ -121,21 +124,37 @@ async fn write_data(
     let parquet_writer_builder = ParquetWriterBuilder::new(
         WriterProperties::default(),
         table.metadata().current_schema().clone(),
-        table.file_io().clone(),
-        location,
-        file_name_gen,
     );
 
-    let data_file_writer_builder = DataFileWriterBuilder::new(
+    let rolling_file_writer_builder = RollingFileWriterBuilder::new_with_default_file_size(
         parquet_writer_builder,
-        get_partition_type_value(table.metadata().default_partition_type())?,
-        table.metadata().default_partition_spec_id(),
+        table.file_io().clone(),
+        location.clone(),
+        file_name_gen.clone(),
     );
 
-    let mut writer = data_file_writer_builder.build().await.map_err(|err| {
-        error!("Error while constructing data file writer: {}", err);
-        Error::InitError(err.to_string())
-    })?;
+    let data_file_writer_builder = DataFileWriterBuilder::new(rolling_file_writer_builder);
+
+    let partition_spec = PartitionSpec::builder(table.current_schema_ref());
+
+    let partition_type = get_partition_type_value(table.metadata().default_partition_type())?;
+
+    let mut writer = data_file_writer_builder
+        .build(match partition_type {
+            None => None,
+            Some(p_type) => Some(PartitionKey::new(
+                partition_spec
+                    .build()
+                    .map_err(|err| Error::InitError(err.to_string()))?,
+                table.current_schema_ref(),
+                p_type,
+            )),
+        })
+        .await
+        .map_err(|err| {
+            error!("Error while constructing data file writer: {}", err);
+            Error::InitError(err.to_string())
+        })?;
 
     let msgs: Vec<&simd_json::OwnedValue> = messages
         .iter()

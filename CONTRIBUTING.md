@@ -1,111 +1,106 @@
-# Contributing
+# Contributing to Apache Iggy
 
-First, thank you for contributing to Iggy! The goal of this document is to provide everything you need to start contributing to Iggy. The following TOC is sorted progressively, starting with the basics and expanding into more specifics.
+## Issue First
 
-## Your First Contribution
+Every new PR that introduces new functionality must link to an approved issue.
+PRs without one may be closed at maintainer's discretion.
 
-1. Ensure your change has an issue! Find an [existing issue](https://github.com/apache/iggy/issues) or open a new issue.
-2. [Fork the Iggy repository](https://github.com/apache/Iggy/fork) in your own GitHub account.
-3. [Create a new Git branch](https://help.github.com/en/github/collaborating-with-issues-and-pull-requests/creating-and-deleting-branches-within-your-repository).
-4. Make your changes.
-5. [Submit the branch as a pull request](https://help.github.com/en/github/collaborating-with-issues-and-pull-requests/creating-a-pull-request-from-a-fork) to the master Iggy repo. An Iggy team member should comment and/or review your pull request within a few days. Although, depending on the circumstances, it may take longer.
+1. Create an issue or comment under existing
+2. Wait for maintainer approval (`good-first-issue` label or comment)
+    - Maintainer may request for more details or a different approach
+3. Then code
 
-## Workflow
+## Size Limits
 
-### Git Branches
+For new contributors we require to keep PRs under 500 lines of code, unless explicitly approved by a maintainer under linked issue.
 
-*All* changes must be made in a branch and submitted as [pull requests](#github-pull-requests). Iggy does not adopt any type of branch naming style, but please use something descriptive of your changes.
+## High-Risk Areas
 
-### GitHub Pull Requests
+These require design discussion in the issue before coding:
 
-Once your changes are ready you must submit your branch as a [pull request](https://github.com/apache/Iggy/pulls).
+- Persistence (segments, indexes, state, crash recovery)
+- Protocol (binary format, wire encoding)
+- Concurrency (shards, inter-shard)
+- Public API (HTTP, SDKs, CLI)
+- Connectors
 
-#### Title
+## PR Requirements
 
-The pull request title must follow the format outlined in the [conventional commits spec](https://www.conventionalcommits.org). [Conventional commits](https://www.conventionalcommits.org) is a standardized format for commit messages. Iggy only requires this format for commits on the `master` branch. And because Iggy squashes commits before merging branches, this means that only the pull request title must conform to this format.
+### Run It Locally
 
-The following are all good examples of pull request titles:
+**If you can't run it, you can't submit it.**
 
-```text
-fix(ci): add Cross.toml for CI builds
-chore(repo): add ASF license header to all the files
-refactor(server): remove redundant sha1 print
-chore(docs): add contributing guide
-refactor(server): remove redundant sha1 print
+Authors of PRs must run the code locally. "Relying on CI" is not acceptable.
+
+### Single Purpose
+
+One PR = one thing. Bug fix, refactor, feature - separate PRs. Mixed PRs will be closed.
+
+### Quality Checks
+
+For Rust code:
+
+```bash
+cargo fmt --all
+cargo clippy --all-targets --all-features -- -D warnings
+cargo build
+cargo test
+cargo machete
+cargo sort --workspace
 ```
 
-#### Reviews & Approvals
+For other languages, check the README in `foreign/{language}/` (e.g., `foreign/go/`, `foreign/java/`).
 
-All pull requests should be reviewed by at least two Iggy committers.
+### Pre-commit Hooks
 
-#### Merge Style
+We use [prek](https://github.com/j178/prek):
 
-All pull requests are squash merged.
-We generally discourage large pull requests that are over 300–500 lines of diff.
-If you would like to propose a change that is larger, we suggest
-coming onto our [Discussions](https://github.com/apache/Iggy/discussions) and discussing it with us.
-This way we can talk through the solution and discuss if a change that large is even needed!
-This will produce a quicker response to the change and likely produce code that aligns better with our process.
-
-### CI
-
-Currently, Iggy uses GitHub Actions to run tests. The workflows are defined in `.github/workflows`.
-
-## Setup
-
-### Bring your own toolbox
-
-Iggy is primarily a Rust project. To build Iggy, you will need to set up Rust development first. We highly recommend using [rustup](https://rustup.rs/) for the setup process.
-
-For Linux or macOS, use the following command:
-
-```shell
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-```
-
-For Windows, download `rustup-init.exe` from [the Windows installer](https://win.rustup.rs/x86_64) instead.
-
-Rustup will read Iggy's `Cargo.toml` and set up everything else automatically. To ensure that everything works correctly, run `cargo version` under Iggy's root directory:
-
-```shell
-$ cargo version
-cargo 1.86.0 (adf9b6ad1 2025-02-28)
-```
-
-### Pre-commit Hooks (Recommended)
-
-Iggy uses [prek](https://github.com/9999years/prek) for pre-commit hooks to ensure code quality before commits. Setting up hooks is optional but strongly recommended to catch issues early.
-
-#### Setup
-
-```shell
+```bash
 cargo install prek
 prek install
 ```
 
-This will install git hooks that automatically run on `pre-commit` and `pre-push` events.
+## Code Style
 
-#### Manual hook execution
+### Comments: WHY, Not WHAT
 
-You can manually run specific hooks:
+```rust
+// Bad: Increment counter
+counter += 1;
 
-```shell
-# Run all pre-commit hooks
-prek run
-
-# Run specific hook
-prek run cargo-fmt
-prek run cargo-clippy
+// Good: Offset by 1 because segment IDs are 1-indexed in the wire protocol
+counter += 1;
 ```
 
-#### Skip hooks (when necessary)
+Don't comment obvious code. Do explain non-obvious decisions, invariants, and constraints.
 
-If you need to skip hooks for a specific commit:
+### Commit Messages
 
-```shell
-git commit --no-verify -m "your message"
+Format: `type(scope): subject`
+
+**Good examples from this repo:**
+
+```none
+fix(server): prevent panic when segment rotates during async persistence
+fix(server): chunk vectored writes to avoid exceeding IOV_MAX limit
+feat(server): add SegmentedSlab collection
+refactor(server): consolidate permissions into metadata crate
+chore(integration): remove streaming tests superseded by API-level coverage
 ```
 
-## How to build
+Keep subject under 72 chars. Use body for details if needed.
 
-See [Quick Start](https://github.com/apache/iggy?tab=readme-ov-file#quick-start)
+## Close Policy
+
+PRs may be closed if:
+
+- Maintainer feels like proxy between maintainer and LLM
+- No approved issue or no approval from a maintainer
+- Code not ran and tested locally
+- Mixed purposes or purposes not clear
+- Can't answer questions about the change
+- Inactivity for longer than 7 days
+
+## Questions?
+
+[Discussions](https://github.com/apache/iggy/discussions) or [Discord](https://discord.gg/apache-iggy)

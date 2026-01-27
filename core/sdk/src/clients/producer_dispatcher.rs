@@ -38,7 +38,12 @@ pub struct ProducerDispatcher {
 
 impl ProducerDispatcher {
     pub fn new(core: Arc<impl ProducerCoreBackend>, config: BackgroundConfig) -> Self {
-        let mut shards = Vec::with_capacity(config.num_shards);
+        let num_shards = if config.num_shards == 0 {
+            1
+        } else {
+            config.num_shards
+        };
+        let mut shards = Vec::with_capacity(num_shards);
         let config = Arc::new(config);
 
         let (err_tx, err_rx) = flume::unbounded::<ErrorCtx>();
@@ -70,7 +75,7 @@ impl ProducerDispatcher {
             }
         });
 
-        for _ in 0..config.num_shards {
+        for _ in 0..num_shards {
             let stop_rx = stop_tx.subscribe();
             shards.push(Shard::new(
                 core.clone(),

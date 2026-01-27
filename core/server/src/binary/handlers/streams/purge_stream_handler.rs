@@ -21,15 +21,17 @@ use crate::binary::command::{
 };
 use crate::binary::handlers::streams::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
-
 use crate::shard::IggyShard;
 use crate::shard::transmission::event::ShardEvent;
+use crate::shard::transmission::frame::ShardResponse;
+use crate::shard::transmission::message::{
+    ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult,
+};
 use crate::state::command::EntryCommand;
 use crate::streaming::session::Session;
-use anyhow::Result;
 use err_trail::ErrContext;
 use iggy_common::purge_stream::PurgeStream;
-use iggy_common::{IggyError, SenderKind};
+use iggy_common::{Identifier, IggyError, SenderKind};
 use std::rc::Rc;
 use tracing::{debug, instrument};
 
@@ -50,29 +52,67 @@ impl ServerCommandHandler for PurgeStream {
         shard.ensure_authenticated(session)?;
         let stream_id = shard.resolve_stream_id(&self.stream_id)?;
         shard
-            .permissioner
-            .borrow()
-            .purge_stream(session.get_user_id(), stream_id)?;
-        let stream_id = self.stream_id.clone();
+            .metadata
+            .perm_purge_stream(session.get_user_id(), stream_id)?;
 
-        shard
-            .purge_stream(&self.stream_id)
-            .await
-            .error(|e: &IggyError| {
-                format!("{COMPONENT} (error: {e}) - failed to purge stream with id: {stream_id}, session: {session}")
-            })?;
-        let event = ShardEvent::PurgedStream {
-            stream_id: self.stream_id.clone(),
+        let request = ShardRequest {
+            stream_id: Identifier::default(),
+            topic_id: Identifier::default(),
+            partition_id: 0,
+            payload: ShardRequestPayload::PurgeStream {
+                user_id: session.get_user_id(),
+                stream_id: self.stream_id.clone(),
+            },
         };
-        shard.broadcast_event_to_all_shards(event).await?;
-        shard
-            .state
-            .apply(session.get_user_id(), &EntryCommand::PurgeStream(self))
-            .await
-            .error(|e: &IggyError| {
-                format!("{COMPONENT} (error: {e}) - failed to apply purge stream with id: {stream_id}, session: {session}")
-            })?;
-        sender.send_empty_ok_response().await?;
+
+        let stream_id_for_log = self.stream_id.clone();
+        let message = ShardMessage::Request(request);
+        match shard.send_request_to_shard_or_recoil(None, message).await? {
+            ShardSendRequestResult::Recoil(message) => {
+                if let ShardMessage::Request(ShardRequest { payload, .. }) = message
+                    && let ShardRequestPayload::PurgeStream { stream_id, .. } = payload
+                {
+                    shard.purge_stream(&stream_id).await.error(|e: &IggyError| {
+                        format!(
+                            "{COMPONENT} (error: {e}) - failed to purge stream with id: {stream_id_for_log}, session: {session}"
+                        )
+                    })?;
+
+                    let event = ShardEvent::PurgedStream {
+                        stream_id: stream_id.clone(),
+                    };
+                    shard.broadcast_event_to_all_shards(event).await?;
+
+                    shard
+                        .state
+                        .apply(session.get_user_id(), &EntryCommand::PurgeStream(self))
+                        .await
+                        .error(|e: &IggyError| {
+                            format!(
+                                "{COMPONENT} (error: {e}) - failed to apply purge stream with id: {stream_id_for_log}, session: {session}"
+                            )
+                        })?;
+
+                    sender.send_empty_ok_response().await?;
+                } else {
+                    unreachable!(
+                        "Expected a PurgeStream request inside of PurgeStream handler, impossible state"
+                    );
+                }
+            }
+            ShardSendRequestResult::Response(response) => match response {
+                ShardResponse::PurgeStreamResponse => {
+                    sender.send_empty_ok_response().await?;
+                }
+                ShardResponse::ErrorResponse(err) => {
+                    return Err(err);
+                }
+                _ => unreachable!(
+                    "Expected a PurgeStreamResponse inside of PurgeStream handler, impossible state"
+                ),
+            },
+        }
+
         Ok(HandlerResult::Finished)
     }
 }

@@ -84,7 +84,7 @@ async fn create_personal_access_token(
     Json(command): Json<CreatePersonalAccessToken>,
 ) -> Result<Json<RawPersonalAccessToken>, CustomError> {
     command.validate()?;
-    let (personal_access_token, token) = state
+    let (_, token) = state
         .shard
         .create_personal_access_token(identity.user_id, &command.name, command.expiry)
         .error(|e: &IggyError| {
@@ -93,21 +93,6 @@ async fn create_personal_access_token(
                 identity.user_id
             )
         })?;
-
-    {
-        let broadcast_future = SendWrapper::new(async {
-            use crate::shard::transmission::event::ShardEvent;
-            let event = ShardEvent::CreatedPersonalAccessToken {
-                personal_access_token: personal_access_token.clone(),
-            };
-            let _ = state
-                .shard
-                .shard()
-                .broadcast_event_to_all_shards(event)
-                .await;
-        });
-        broadcast_future.await;
-    }
 
     let token_hash = PersonalAccessToken::hash_token(&token);
     let command = EntryCommand::CreatePersonalAccessToken(CreatePersonalAccessTokenWithHash {
@@ -134,7 +119,6 @@ async fn delete_personal_access_token(
     Extension(identity): Extension<Identity>,
     Path(name): Path<String>,
 ) -> Result<StatusCode, CustomError> {
-    let token_name = name.clone();
     state
         .shard
         .delete_personal_access_token(identity.user_id, &name)
@@ -145,23 +129,8 @@ async fn delete_personal_access_token(
             )
         })?;
 
-    {
-        let broadcast_future = SendWrapper::new(async {
-            use crate::shard::transmission::event::ShardEvent;
-            let event = ShardEvent::DeletedPersonalAccessToken {
-                user_id: identity.user_id,
-                name: token_name,
-            };
-            let _ = state
-                .shard
-                .shard()
-                .broadcast_event_to_all_shards(event)
-                .await;
-        });
-        broadcast_future.await;
-    }
-
-    let command = EntryCommand::DeletePersonalAccessToken(DeletePersonalAccessToken { name });
+    let command =
+        EntryCommand::DeletePersonalAccessToken(DeletePersonalAccessToken { name: name.clone() });
     let state_future =
         SendWrapper::new(state.shard.shard().state.apply(identity.user_id, &command));
 

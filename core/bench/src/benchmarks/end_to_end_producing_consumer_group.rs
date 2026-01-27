@@ -18,11 +18,11 @@
 
 use crate::args::common::IggyBenchArgs;
 use crate::benchmarks::common::{build_producing_consumer_groups_futures, init_consumer_groups};
+use crate::utils::ClientFactory;
 use async_trait::async_trait;
 use bench_report::benchmark_kind::BenchmarkKind;
 use bench_report::individual_metrics::BenchmarkIndividualMetrics;
 use iggy::prelude::*;
-use integration::test_server::ClientFactory;
 use std::sync::Arc;
 use tokio::task::JoinSet;
 use tracing::info;

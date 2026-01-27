@@ -226,11 +226,6 @@ impl IggyIndexesMut {
         self.buffer.clear();
     }
 
-    /// Gets the number of unsaved indexes
-    pub fn unsaved_count(&self) -> u32 {
-        self.count().saturating_sub(self.saved_count)
-    }
-
     /// Gets the unsaved part of the index buffer
     pub fn unsaved_slice(&self) -> PooledBuffer {
         let start_pos = self.saved_count as usize * INDEX_SIZE;

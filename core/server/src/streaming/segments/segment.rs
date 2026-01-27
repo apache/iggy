@@ -76,10 +76,6 @@ impl Segment {
         self.is_expired(IggyTimestamp::now())
     }
 
-    pub fn is_sealed(&self) -> bool {
-        self.sealed
-    }
-
     pub fn is_expired(&self, now: IggyTimestamp) -> bool {
         if !self.sealed {
             return false;

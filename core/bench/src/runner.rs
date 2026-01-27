@@ -21,34 +21,27 @@ use crate::args::common::IggyBenchArgs;
 use crate::benchmarks::benchmark::Benchmarkable;
 use crate::plot::{ChartType, plot_chart};
 use crate::utils::cpu_name::append_cpu_name_lowercase;
-use crate::utils::server_starter::start_server_if_needed;
 use crate::utils::{collect_server_logs_and_save_to_file, params_from_args_and_metrics};
 use bench_report::hardware::BenchmarkHardware;
 use iggy::prelude::IggyError;
-use integration::test_server::TestServer;
 use std::path::Path;
 use std::time::Duration;
 use tokio::time::sleep;
 use tracing::{error, info};
 
 pub struct BenchmarkRunner {
-    pub args: Option<IggyBenchArgs>,
-    pub test_server: Option<TestServer>,
+    args: Option<IggyBenchArgs>,
 }
 
 impl BenchmarkRunner {
     pub const fn new(args: IggyBenchArgs) -> Self {
-        Self {
-            args: Some(args),
-            test_server: None,
-        }
+        Self { args: Some(args) }
     }
 
     #[allow(clippy::cognitive_complexity)]
     pub async fn run(mut self) -> Result<(), IggyError> {
         let args = self.args.take().unwrap();
         let should_open_charts = args.open_charts();
-        self.test_server = start_server_if_needed(&args).await;
 
         let transport = args.transport();
         let server_addr = args.server_address();

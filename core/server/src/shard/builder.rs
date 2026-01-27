@@ -20,9 +20,10 @@ use super::{
     IggyShard, TaskRegistry, transmission::connector::ShardConnector,
     transmission::frame::ShardFrame,
 };
+use crate::metadata::{Metadata, MetadataWriter};
+use crate::streaming::partitions::local_partitions::LocalPartitions;
 use crate::{
     configs::server::ServerConfig,
-    slab::{streams::Streams, users::Users},
     state::file::FileState,
     streaming::{
         clients::client_manager::ClientManager, diagnostics::metrics::Metrics,
@@ -30,18 +31,21 @@ use crate::{
     },
     versioning::SemanticVersion,
 };
+use ahash::AHashSet;
 use dashmap::DashMap;
 use iggy_common::EncryptorKind;
 use iggy_common::sharding::{IggyNamespace, PartitionLocation};
-use std::{cell::Cell, rc::Rc, sync::atomic::AtomicBool};
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+    sync::atomic::AtomicBool,
+};
 
 #[derive(Default)]
 pub struct IggyShardBuilder {
     id: Option<u16>,
-    streams: Option<Streams>,
     shards_table: Option<EternalPtr<DashMap<IggyNamespace, PartitionLocation>>>,
     state: Option<FileState>,
-    users: Option<Users>,
     client_manager: Option<ClientManager>,
     connections: Option<Vec<ShardConnector<ShardFrame>>>,
     config: Option<ServerConfig>,
@@ -49,6 +53,8 @@ pub struct IggyShardBuilder {
     version: Option<SemanticVersion>,
     metrics: Option<Metrics>,
     is_follower: bool,
+    metadata: Option<Metadata>,
+    metadata_writer: Option<MetadataWriter>,
 }
 
 impl IggyShardBuilder {
@@ -90,18 +96,8 @@ impl IggyShardBuilder {
         self
     }
 
-    pub fn streams(mut self, streams: Streams) -> Self {
-        self.streams = Some(streams);
-        self
-    }
-
     pub fn state(mut self, state: FileState) -> Self {
         self.state = Some(state);
-        self
-    }
-
-    pub fn users(mut self, users: Users) -> Self {
-        self.users = Some(users);
         self
     }
 
@@ -115,18 +111,27 @@ impl IggyShardBuilder {
         self
     }
 
+    pub fn metadata(mut self, metadata: Metadata) -> Self {
+        self.metadata = Some(metadata);
+        self
+    }
+
+    pub fn metadata_writer(mut self, metadata_writer: MetadataWriter) -> Self {
+        self.metadata_writer = Some(metadata_writer);
+        self
+    }
+
     // TODO: Too much happens in there, some of those bootstrapping logic should be moved outside.
     pub fn build(self) -> IggyShard {
         let id = self.id.unwrap();
-        let streams = self.streams.unwrap();
         let shards_table = self.shards_table.unwrap();
         let state = self.state.unwrap();
-        let users = self.users.unwrap();
         let config = self.config.unwrap();
         let connections = self.connections.unwrap();
         let encryptor = self.encryptor;
         let client_manager = self.client_manager.unwrap();
         let version = self.version.unwrap();
+        let metadata = self.metadata.expect("metadata is required");
         let (stop_receiver, frame_receiver) = connections
             .iter()
             .filter(|c| c.id == id)
@@ -150,12 +155,17 @@ impl IggyShardBuilder {
         // Trigger initial check in case servers bind before task starts
         let _ = config_writer_notify.try_send(());
 
+        // Create per-shard stores (wrapped in RefCell for interior mutability)
+        let local_partitions = RefCell::new(LocalPartitions::new());
+
         IggyShard {
             id,
             shards,
             shards_table,
-            streams, // TODO: Fixme
-            users,
+            metadata,
+            metadata_writer: self.metadata_writer.map(RefCell::new),
+            local_partitions,
+            pending_partition_inits: RefCell::new(AHashSet::new()),
             fs_locks: Default::default(),
             encryptor,
             config,
@@ -173,7 +183,6 @@ impl IggyShardBuilder {
             config_writer_notify,
             config_writer_receiver,
             task_registry,
-            permissioner: Default::default(),
             client_manager,
         }
     }

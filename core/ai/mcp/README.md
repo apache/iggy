@@ -69,3 +69,21 @@ Here's the example configuration to be used with Claude Desktop:
 **Remember to use the appropriate Iggy account credentials for your environment** (e.g. create the user with read-only permissions to avoid modifying the data). On top of this, you can also configure the `permissions` for the MCP server to control which operations are allowed (this will be checked first, before forwarding the actual request to the Iggy server).
 
 ![MCP](../../../assets/iggy_mcp_server.png)
+
+## Telemetry
+
+The MCP server supports OpenTelemetry for logs and traces. To enable telemetry, add the following configuration:
+
+```toml
+[telemetry]
+enabled = true
+service_name = "iggy-mcp"
+
+[telemetry.logs]
+transport = "grpc" # Options: "grpc", "http"
+endpoint = "http://localhost:4317"
+
+[telemetry.traces]
+transport = "grpc" # Options: "grpc", "http"
+endpoint = "http://localhost:4317"
+```

@@ -20,14 +20,11 @@ use crate::binary::command::{
     BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
 };
 use crate::binary::handlers::utils::receive_and_validate;
-use crate::binary::mapper;
 use crate::shard::IggyShard;
-use crate::slab::traits_ext::{EntityComponentSystem, IntoComponents};
 use crate::streaming::session::Session;
-use anyhow::Result;
-use iggy_common::IggyError;
-use iggy_common::SenderKind;
+use bytes::{BufMut, BytesMut};
 use iggy_common::get_consumer_groups::GetConsumerGroups;
+use iggy_common::{IggyError, SenderKind};
 use std::rc::Rc;
 use tracing::debug;
 
@@ -46,21 +43,27 @@ impl ServerCommandHandler for GetConsumerGroups {
         debug!("session: {session}, command: {self}");
         shard.ensure_authenticated(session)?;
         let (stream_id, topic_id) = shard.resolve_topic_id(&self.stream_id, &self.topic_id)?;
-        shard.permissioner.borrow().get_consumer_groups(
-            session.get_user_id(),
-            stream_id,
-            topic_id,
-        )?;
+        shard
+            .metadata
+            .perm_get_consumer_groups(session.get_user_id(), stream_id, topic_id)?;
 
-        let consumer_groups =
-            shard
-                .streams
-                .with_consumer_groups(&self.stream_id, &self.topic_id, |cgs| {
-                    cgs.with_components(|cgs| {
-                        let (roots, members) = cgs.into_components();
-                        mapper::map_consumer_groups(roots, members)
-                    })
-                });
+        let consumer_groups = shard.metadata.with_metadata(|m| {
+            m.streams
+                .get(stream_id)
+                .and_then(|s| s.topics.get(topic_id))
+                .map(|topic| {
+                    let mut bytes = BytesMut::new();
+                    for (_, cg_meta) in topic.consumer_groups.iter() {
+                        bytes.put_u32_le(cg_meta.id as u32);
+                        bytes.put_u32_le(cg_meta.partitions.len() as u32);
+                        bytes.put_u32_le(cg_meta.members.len() as u32);
+                        bytes.put_u8(cg_meta.name.len() as u8);
+                        bytes.put_slice(cg_meta.name.as_bytes());
+                    }
+                    bytes.freeze()
+                })
+                .unwrap_or_default()
+        });
         sender.send_ok_response(&consumer_groups).await?;
         Ok(HandlerResult::Finished)
     }

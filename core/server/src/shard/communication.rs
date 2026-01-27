@@ -145,28 +145,11 @@ impl IggyShard {
         })
     }
 
-    pub fn find_shard_table_record(&self, namespace: &IggyNamespace) -> Option<PartitionLocation> {
-        self.shards_table.get(namespace).map(|entry| *entry)
-    }
-
     pub fn remove_shard_table_record(&self, namespace: &IggyNamespace) -> PartitionLocation {
         self.shards_table
             .remove(namespace)
             .map(|(_, location)| location)
             .expect("remove_shard_table_record: namespace not found")
-    }
-
-    pub fn remove_shard_table_records(
-        &self,
-        namespaces: &[IggyNamespace],
-    ) -> Vec<(IggyNamespace, PartitionLocation)> {
-        namespaces
-            .iter()
-            .map(|ns| {
-                let (ns, location) = self.shards_table.remove(ns).unwrap();
-                (ns, location)
-            })
-            .collect()
     }
 
     pub fn insert_shard_table_record(&self, ns: IggyNamespace, location: PartitionLocation) {
