@@ -65,12 +65,11 @@ async fn get_consumer_offset(
         .shard
         .shard()
         .resolve_topic_id(&query.stream_id, &query.topic_id)?;
-    state
-        .shard
-        .shard()
-        .permissioner
-        .borrow()
-        .get_consumer_offset(identity.user_id, stream_id_numeric, topic_id_numeric)?;
+    state.shard.shard().metadata.perm_get_consumer_offset(
+        identity.user_id,
+        stream_id_numeric,
+        topic_id_numeric,
+    )?;
 
     let consumer = Consumer::new(query.0.consumer.id);
     let Ok(offset) = state
@@ -109,12 +108,11 @@ async fn store_consumer_offset(
         .shard
         .shard()
         .resolve_topic_id(&command.stream_id, &command.topic_id)?;
-    state
-        .shard
-        .shard()
-        .permissioner
-        .borrow()
-        .store_consumer_offset(identity.user_id, stream_id_numeric, topic_id_numeric)?;
+    state.shard.shard().metadata.perm_store_consumer_offset(
+        identity.user_id,
+        stream_id_numeric,
+        topic_id_numeric,
+    )?;
 
     let consumer = Consumer::new(command.0.consumer.id);
     state.shard
@@ -138,16 +136,18 @@ async fn delete_consumer_offset(
     Path((stream_id, topic_id, consumer_id)): Path<(String, String, String)>,
     query: Query<DeleteConsumerOffset>,
 ) -> Result<StatusCode, CustomError> {
+    let stream_id_ident = Identifier::from_str_value(&stream_id)?;
+    let topic_id_ident = Identifier::from_str_value(&topic_id)?;
+
     let (stream_id_numeric, topic_id_numeric) = state
         .shard
         .shard()
-        .resolve_topic_id(&query.stream_id, &query.topic_id)?;
-    state
-        .shard
-        .shard()
-        .permissioner
-        .borrow()
-        .delete_consumer_offset(identity.user_id, stream_id_numeric, topic_id_numeric)?;
+        .resolve_topic_id(&stream_id_ident, &topic_id_ident)?;
+    state.shard.shard().metadata.perm_delete_consumer_offset(
+        identity.user_id,
+        stream_id_numeric,
+        topic_id_numeric,
+    )?;
 
     let consumer = Consumer::new(consumer_id.try_into()?);
     state
@@ -155,8 +155,8 @@ async fn delete_consumer_offset(
         .delete_consumer_offset(
             0, // HTTP uses client_id 0 as it doesn't have persistent sessions
             consumer,
-            &query.stream_id,
-            &query.topic_id,
+            &stream_id_ident,
+            &topic_id_ident,
             query.partition_id,
         )
         .await

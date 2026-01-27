@@ -55,10 +55,7 @@ impl ServerCommandHandler for GetUser {
 
         // Permission check: only required if user is looking for someone else
         if user.id != session.get_user_id() {
-            shard
-                .permissioner
-                .borrow()
-                .get_user(session.get_user_id())?;
+            shard.metadata.perm_get_user(session.get_user_id())?;
         }
 
         let bytes = mapper::map_user(&user);

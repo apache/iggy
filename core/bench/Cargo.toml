@@ -29,8 +29,6 @@ readme = "../../README.md"
 [[bin]]
 name = "iggy-bench"
 path = "src/main.rs"
-# Due to dependency to integration, which has a dependency to server, setting
-# mimalloc on server is also setting it on bench.
 
 [dependencies]
 async-trait = { workspace = true }
@@ -45,14 +43,12 @@ governor = "0.10.4"
 hostname = "0.4.2"
 human-repr = { workspace = true }
 iggy = { workspace = true }
-integration = { workspace = true }
 nonzero_lit = { workspace = true }
 rand = { workspace = true }
 rayon = "1.11.0"
 serde = { workspace = true }
 sysinfo = { workspace = true }
 tokio = { workspace = true }
-toml = { workspace = true }
 tracing = { workspace = true }
 tracing-appender = { workspace = true }
 tracing-subscriber = { workspace = true }

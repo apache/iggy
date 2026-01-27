@@ -17,8 +17,8 @@
  */
 
 use crate::shard::IggyShard;
-use crate::streaming::topics::helpers as topics_helpers;
-use iggy_common::{Identifier, IggyError, IggyTimestamp};
+use iggy_common::sharding::IggyNamespace;
+use iggy_common::{IggyError, IggyTimestamp, MaxTopicSize};
 use std::rc::Rc;
 use tracing::{debug, error, info, trace, warn};
 
@@ -70,22 +70,13 @@ async fn clean_expired_messages(shard: Rc<IggyShard>) -> Result<(), IggyError> {
     let mut total_deleted_messages = 0u64;
 
     for ((stream_id, topic_id), partition_ids) in topics {
-        let stream_identifier = Identifier::numeric(stream_id as u32).unwrap();
-        let topic_identifier = Identifier::numeric(topic_id as u32).unwrap();
-
         let mut topic_deleted_segments = 0u64;
         let mut topic_deleted_messages = 0u64;
 
         for partition_id in partition_ids {
             // Handle expired segments
-            let expired_result = handle_expired_segments(
-                &shard,
-                &stream_identifier,
-                &topic_identifier,
-                partition_id,
-                now,
-            )
-            .await;
+            let expired_result =
+                handle_expired_segments(&shard, stream_id, topic_id, partition_id, now).await;
 
             match expired_result {
                 Ok(deleted) => {
@@ -102,13 +93,8 @@ async fn clean_expired_messages(shard: Rc<IggyShard>) -> Result<(), IggyError> {
 
             // Handle oldest segments if topic size management is enabled
             if delete_oldest_segments {
-                let oldest_result = handle_oldest_segments(
-                    &shard,
-                    &stream_identifier,
-                    &topic_identifier,
-                    partition_id,
-                )
-                .await;
+                let oldest_result =
+                    handle_oldest_segments(&shard, stream_id, topic_id, partition_id).await;
 
                 match oldest_result {
                     Ok(deleted) => {
@@ -164,24 +150,27 @@ struct DeletedSegments {
 
 async fn handle_expired_segments(
     shard: &Rc<IggyShard>,
-    stream_id: &Identifier,
-    topic_id: &Identifier,
+    stream_id: usize,
+    topic_id: usize,
     partition_id: usize,
     now: IggyTimestamp,
 ) -> Result<DeletedSegments, IggyError> {
-    // Get expired segments
-    let expired_segment_offsets =
-        shard
-            .streams
-            .with_partition_by_id(stream_id, topic_id, partition_id, |(.., log)| {
-                let mut expired = Vec::new();
-                for segment in log.segments() {
-                    if segment.is_expired(now) {
-                        expired.push(segment.start_offset);
-                    }
-                }
-                expired
-            });
+    let ns = IggyNamespace::new(stream_id, topic_id, partition_id);
+
+    // Scope the borrow to avoid holding across await
+    let expired_segment_offsets: Vec<u64> = {
+        let partitions = shard.local_partitions.borrow();
+        let Some(partition) = partitions.get(&ns) else {
+            return Ok(DeletedSegments::default());
+        };
+        partition
+            .log
+            .segments()
+            .iter()
+            .filter(|segment| segment.is_expired(now))
+            .map(|segment| segment.start_offset)
+            .collect()
+    };
 
     if expired_segment_offsets.is_empty() {
         return Ok(DeletedSegments::default());
@@ -207,16 +196,20 @@ async fn handle_expired_segments(
 
 async fn handle_oldest_segments(
     shard: &Rc<IggyShard>,
-    stream_id: &Identifier,
-    topic_id: &Identifier,
+    stream_id: usize,
+    topic_id: usize,
     partition_id: usize,
 ) -> Result<DeletedSegments, IggyError> {
-    let topic_info =
-        shard
-            .streams
-            .with_topic_by_id(stream_id, topic_id, topics_helpers::get_topic_size_info());
+    let Some((max_size, current_size)) = shard.metadata.with_metadata(|m| {
+        m.streams
+            .get(stream_id)
+            .and_then(|s| s.topics.get(topic_id))
+            .map(|t| (t.max_topic_size, t.stats.size_bytes_inconsistent()))
+    }) else {
+        return Ok(DeletedSegments::default());
+    };
 
-    let (is_unlimited, is_almost_full) = topic_info;
+    let is_unlimited = matches!(max_size, MaxTopicSize::Unlimited);
 
     if is_unlimited {
         debug!(
@@ -226,6 +219,9 @@ async fn handle_oldest_segments(
         return Ok(DeletedSegments::default());
     }
 
+    let max_bytes = max_size.as_bytes_u64();
+    let is_almost_full = current_size >= (max_bytes * 9 / 10);
+
     if !is_almost_full {
         debug!(
             "Topic is not almost full, oldest segments will not be deleted for stream ID: {}, topic ID: {}, partition ID: {}",
@@ -234,19 +230,22 @@ async fn handle_oldest_segments(
         return Ok(DeletedSegments::default());
     }
 
-    let oldest_segment_offset =
-        shard
-            .streams
-            .with_partition_by_id(stream_id, topic_id, partition_id, |(.., log)| {
-                let segments = log.segments();
-                // Find the first closed segment (not the active one)
-                if segments.len() > 1 {
-                    // The last segment is always active, so we look at earlier ones
-                    segments.first().map(|s| s.start_offset)
-                } else {
-                    None
-                }
-            });
+    let ns = IggyNamespace::new(stream_id, topic_id, partition_id);
+
+    // Scope the borrow to avoid holding across await
+    let oldest_segment_offset = {
+        let partitions = shard.local_partitions.borrow();
+        partitions.get(&ns).and_then(|partition| {
+            let segments = partition.log.segments();
+            // Find the first closed segment (not the active one)
+            if segments.len() > 1 {
+                // The last segment is always active, so we look at earlier ones
+                segments.first().map(|s| s.start_offset)
+            } else {
+                None
+            }
+        })
+    };
 
     if let Some(start_offset) = oldest_segment_offset {
         info!(
@@ -266,8 +265,8 @@ async fn handle_oldest_segments(
 
 async fn delete_segments(
     shard: &Rc<IggyShard>,
-    stream_id: &Identifier,
-    topic_id: &Identifier,
+    stream_id: usize,
+    topic_id: usize,
     partition_id: usize,
     segment_offsets: &[u64],
 ) -> Result<DeletedSegments, IggyError> {
@@ -286,40 +285,46 @@ async fn delete_segments(
     let mut segments_count = 0u64;
     let mut messages_count = 0u64;
 
-    let to_delete = shard.streams.with_partition_by_id_mut(
-        stream_id,
-        topic_id,
-        partition_id,
-        |(_, stats, .., log)| {
-            let mut segments_to_remove = Vec::new();
-            let mut storages_to_remove = Vec::new();
+    let ns = IggyNamespace::new(stream_id, topic_id, partition_id);
 
-            let mut indices_to_remove: Vec<usize> = Vec::new();
-            for &start_offset in segment_offsets {
-                if let Some(idx) = log
-                    .segments()
-                    .iter()
-                    .position(|s| s.start_offset == start_offset)
-                {
-                    indices_to_remove.push(idx);
-                }
+    // Extract segments and storages to delete from local_partitions
+    let (stats, segments_to_delete, mut storages_to_delete) = {
+        let mut partitions = shard.local_partitions.borrow_mut();
+        let Some(partition) = partitions.get_mut(&ns) else {
+            return Ok(DeletedSegments::default());
+        };
+
+        let log = &mut partition.log;
+        let mut segments_to_remove = Vec::new();
+        let mut storages_to_remove = Vec::new();
+
+        let mut indices_to_remove: Vec<usize> = Vec::new();
+        for &start_offset in segment_offsets {
+            if let Some(idx) = log
+                .segments()
+                .iter()
+                .position(|s| s.start_offset == start_offset)
+            {
+                indices_to_remove.push(idx);
             }
+        }
 
-            indices_to_remove.sort_by(|a, b| b.cmp(a));
-            for idx in indices_to_remove {
-                let segment = log.segments_mut().remove(idx);
-                let storage = log.storages_mut().remove(idx);
-                log.indexes_mut().remove(idx);
+        indices_to_remove.sort_by(|a, b| b.cmp(a));
+        for idx in indices_to_remove {
+            let segment = log.segments_mut().remove(idx);
+            let storage = log.storages_mut().remove(idx);
+            log.indexes_mut().remove(idx);
 
-                segments_to_remove.push(segment);
-                storages_to_remove.push(storage);
-            }
+            segments_to_remove.push(segment);
+            storages_to_remove.push(storage);
+        }
 
-            (stats.clone(), segments_to_remove, storages_to_remove)
-        },
-    );
-
-    let (stats, segments_to_delete, mut storages_to_delete) = to_delete;
+        (
+            partition.stats.clone(),
+            segments_to_remove,
+            storages_to_remove,
+        )
+    };
 
     for (segment, storage) in segments_to_delete
         .into_iter()

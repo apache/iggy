@@ -162,3 +162,21 @@ Currently, it does expose the following endpoints:
 - `PUT /sources/{key}/configs/active`: activate a specific configuration version for the source.
 - `GET /sources/{key}/configs/plugin`: source plugin config, including the optional `format` query parameter to specify the config format.
 - `GET /sources/{key}/transforms`: source transforms to be applied to the fields.
+
+## Telemetry
+
+The connector runtime supports OpenTelemetry for logs and traces. To enable telemetry, add the following configuration:
+
+```toml
+[telemetry]
+enabled = true
+service_name = "iggy-connectors"
+
+[telemetry.logs]
+transport = "grpc" # Options: "grpc", "http"
+endpoint = "http://localhost:4317"
+
+[telemetry.traces]
+transport = "grpc" # Options: "grpc", "http"
+endpoint = "http://localhost:4317"
+```

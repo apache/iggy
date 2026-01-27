@@ -97,13 +97,12 @@ impl IggyMessagesBatchSet {
     ///
     /// This requires copying the Bytes into a PooledBuffer.
     fn immutable_to_mutable(batch: &IggyMessagesBatch) -> IggyMessagesBatchMut {
-        let count = batch.count();
         let base_position = batch.indexes().base_position();
         let indexes_buffer = PooledBuffer::from(batch.indexes_slice());
         let indexes = IggyIndexesMut::from_bytes(indexes_buffer, base_position);
         let messages = PooledBuffer::from(batch.buffer());
 
-        IggyMessagesBatchMut::from_indexes_and_messages(count, indexes, messages)
+        IggyMessagesBatchMut::from_indexes_and_messages(indexes, messages)
     }
 
     /// Extract indexes from all batches in the set
