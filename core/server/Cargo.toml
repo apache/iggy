@@ -77,24 +77,11 @@ mimalloc = { workspace = true, optional = true }
 mime_guess = { version = "2.0", optional = true }
 moka = { version = "0.12.12", features = ["future"] }
 nix = { workspace = true }
-opentelemetry = { version = "0.31.0", features = ["trace", "logs"] }
-opentelemetry-appender-tracing = { version = "0.31.1", features = ["log"] }
-opentelemetry-otlp = { version = "0.31.0", features = [
-    "logs",
-    "trace",
-    "grpc-tonic",
-    "http",
-    "http-proto",
-    "reqwest-client",
-] }
-opentelemetry-semantic-conventions = "0.31.0"
-opentelemetry_sdk = { version = "0.31.0", features = [
-    "logs",
-    "trace",
-    "experimental_async_runtime",
-    "experimental_logs_batch_log_processor_with_async_runtime",
-    "experimental_trace_batch_span_processor_with_async_runtime",
-] }
+opentelemetry = { workspace = true }
+opentelemetry-appender-tracing = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+opentelemetry-semantic-conventions = { workspace = true }
+opentelemetry_sdk = { workspace = true }
 papaya = "0.2.3"
 prometheus-client = "0.24.0"
 rand = { workspace = true }
@@ -119,7 +106,7 @@ toml = { workspace = true }
 tower-http = { workspace = true }
 tracing = { workspace = true }
 tracing-appender = { workspace = true }
-tracing-opentelemetry = "0.32.1"
+tracing-opentelemetry = { workspace = true }
 tracing-subscriber = { workspace = true }
 tungstenite = { workspace = true }
 ulid = "1.2.1"

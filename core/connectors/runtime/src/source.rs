@@ -37,6 +37,7 @@ use tracing::{debug, error, info, trace, warn};
 
 use crate::configs::connectors::SourceConfig;
 use crate::context::RuntimeContext;
+use crate::log::LOG_CALLBACK;
 use crate::manager::status::ConnectorStatus;
 use crate::{
     PLUGIN_ID, RuntimeError, SourceApi, SourceConnector, SourceConnectorPlugin,
@@ -202,6 +203,7 @@ fn init_source(
         plugin_config.len(),
         state_ptr,
         state_len,
+        LOG_CALLBACK,
     );
     if result != 0 {
         let err = format!("Plugin initialization failed (ID: {id})");

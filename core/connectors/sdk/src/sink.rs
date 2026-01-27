@@ -1,4 +1,5 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
  * regarding copyright ownership.  The ASF licenses this file
@@ -21,6 +22,7 @@ use tokio::sync::watch;
 use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, Registry, layer::SubscriberExt, util::SubscriberInitExt};
 
+use crate::log::{CallbackLayer, LogCallback};
 use crate::{ConsumedMessage, MessagesMetadata, RawMessages, Sink, TopicMetadata, get_runtime};
 
 pub type ConsumeCallback = extern "C" fn(
@@ -56,6 +58,7 @@ impl<T: Sink + std::fmt::Debug> SinkContainer<T> {
         id: u32,
         config_ptr: *const u8,
         config_len: usize,
+        log_callback: LogCallback,
         factory: F,
     ) -> i32
     where
@@ -64,7 +67,7 @@ impl<T: Sink + std::fmt::Debug> SinkContainer<T> {
     {
         unsafe {
             _ = Registry::default()
-                .with(tracing_subscriber::fmt::layer())
+                .with(CallbackLayer::new(log_callback))
                 .with(EnvFilter::try_from_default_env().unwrap_or(EnvFilter::new("INFO")))
                 .try_init();
             let slice = std::slice::from_raw_parts(config_ptr, config_len);
@@ -219,15 +222,21 @@ macro_rules! sink_connector {
 
         use dashmap::DashMap;
         use once_cell::sync::Lazy;
+        use $crate::LogCallback;
         use $crate::sink::SinkContainer;
 
         static INSTANCES: Lazy<DashMap<u32, SinkContainer<$type>>> = Lazy::new(DashMap::new);
 
         #[cfg(not(test))]
         #[unsafe(no_mangle)]
-        unsafe extern "C" fn open(id: u32, config_ptr: *const u8, config_len: usize) -> i32 {
+        unsafe extern "C" fn open(
+            id: u32,
+            config_ptr: *const u8,
+            config_len: usize,
+            log_callback: LogCallback,
+        ) -> i32 {
             let mut container = SinkContainer::new(id);
-            let result = container.open(id, config_ptr, config_len, <$type>::new);
+            let result = container.open(id, config_ptr, config_len, log_callback, <$type>::new);
             INSTANCES.insert(id, container);
             result
         }
