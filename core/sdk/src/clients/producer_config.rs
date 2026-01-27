@@ -17,7 +17,7 @@
  */
 use crate::clients::MIB;
 use crate::clients::producer_error_callback::{ErrorCallback, LogErrorCallback};
-use crate::clients::producer_sharding::{BalancedSharding, Sharding};
+use crate::clients::producer_sharding::{OrderedSharding, Sharding};
 use bon::Builder;
 use iggy_common::{IggyByteSize, IggyDuration};
 use std::sync::Arc;
@@ -67,10 +67,13 @@ pub enum BackpressureMode {
 pub struct BackgroundConfig {
     /// Number of shard-workers that run in parallel.
     ///
-    /// The default is `num_cpus::get().clamp(2, 16)`.  
-    /// More shards increase throughput by parallelising
-    /// serialisation, compression and network I/O, but consume more memory.
-    #[builder(default = default_shard_count())]
+    /// With the default `OrderedSharding` strategy, messages to the same
+    /// stream/topic are always routed to the same shard, preserving ordering.
+    /// Increasing shards improves throughput only when sending to multiple streams/topics.
+    ///
+    /// With `BalancedSharding`, messages are distributed round-robin across all shards
+    /// for maximum single-destination throughput, but ordering is **not** preserved.
+    #[builder(default = 1)]
     pub num_shards: usize,
     /// How long a shard may wait before flushing an *incomplete* batch.
     ///
@@ -84,26 +87,36 @@ pub struct BackgroundConfig {
     #[builder(default = Arc::new(Box::new(LogErrorCallback)))]
     pub error_callback: Arc<Box<dyn ErrorCallback + Send + Sync>>,
     /// Strategy that maps a message to a shard.
-    #[builder(default = Box::new(BalancedSharding::default()))]
+    ///
+    /// Default is `OrderedSharding` which routes all messages for the same
+    /// stream/topic to the same shard, preserving message ordering.
+    ///
+    /// Use `BalancedSharding` for maximum throughput when ordering doesn't matter.
+    #[builder(default = Box::new(OrderedSharding))]
     pub sharding: Box<dyn Sharding + Send + Sync>,
-    /// Maximum **total size in bytes** of a batch.  
+    /// Maximum **total size in bytes** of a batch.
     /// `0` ⇒ unlimited (size-based batching disabled).
     #[builder(default = MIB)]
     pub batch_size: usize,
-    /// Maximum **number of messages** per batch.  
+    /// Maximum **number of messages** per batch.
     /// `0` ⇒ unlimited (length-based batching disabled).
     #[builder(default = 1000)]
     pub batch_length: usize,
     /// Action to apply when back-pressure limits are reached
     #[builder(default = BackpressureMode::Block)]
     pub failure_mode: BackpressureMode,
-    /// Upper bound for the **bytes held in memory** across *all* shards.  
+    /// Upper bound for the **bytes held in memory** across *all* shards.
     /// `IggyByteSize::from(0)` ⇒ unlimited.
     #[builder(default = IggyByteSize::from(32 * MIB as u64))]
     pub max_buffer_size: IggyByteSize,
-    /// Maximum number of **in-flight requests** (batches being sent).  
-    /// `0` ⇒ unlimited.
-    #[builder(default = default_shard_count() * 2)]
+    /// Maximum number of **in-flight requests** (batches being sent).
+    ///
+    /// **WARNING**: Using more than 1 may cause message reordering if retries occur.
+    /// With max_in_flight > 1, a failed batch could be retried after later batches succeed.
+    ///
+    /// The default is `1` to preserve message ordering.
+    /// `0` ⇒ unlimited (no ordering guarantee).
+    #[builder(default = 1)]
     pub max_in_flight: usize,
 }
 
@@ -134,11 +147,6 @@ pub struct DirectConfig {
     #[builder(default = 1000)]
     pub batch_length: u32,
     /// How long to wait for more messages before flushing the current set.
-    #[builder(default = IggyDuration::from(1000))]
+    #[builder(default = IggyDuration::from(0))]
     pub linger_time: IggyDuration,
-}
-
-fn default_shard_count() -> usize {
-    let cpus = num_cpus::get();
-    cpus.clamp(2, 64)
 }

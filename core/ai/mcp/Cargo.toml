@@ -17,7 +17,7 @@
 
 [package]
 name = "iggy-mcp"
-version = "0.2.1-edge.4"
+version = "0.2.1-edge.5"
 description = "MCP Server for Iggy message streaming platform"
 edition = "2024"
 license = "Apache-2.0"
@@ -41,7 +41,7 @@ opentelemetry-otlp = { workspace = true }
 opentelemetry-semantic-conventions = { workspace = true }
 opentelemetry_sdk = { workspace = true, features = ["rt-tokio"] }
 reqwest = { workspace = true }
-rmcp = { version = "0.13.0", features = [
+rmcp = { version = "0.14.0", features = [
     "server",
     "transport-io",
     "transport-streamable-http-server",
