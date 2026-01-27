@@ -30,6 +30,7 @@ ci-qemu = []
 ahash = { workspace = true }
 assert_cmd = "2.1.2"
 async-trait = { workspace = true }
+bon = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
 compio = { workspace = true }
@@ -48,6 +49,7 @@ keyring = { workspace = true }
 lazy_static = { workspace = true }
 libc = "0.2.180"
 log = { workspace = true }
+once_cell = { workspace = true }
 predicates = { workspace = true }
 rand = { workspace = true }
 rcgen = "0.14.7"
@@ -62,6 +64,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 serial_test = { workspace = true }
 server = { workspace = true }
+socket2 = "0.6.2"
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "chrono"] }
 strum = { workspace = true }
 strum_macros = { workspace = true }

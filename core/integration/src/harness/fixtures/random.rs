@@ -1,4 +1,5 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
  * regarding copyright ownership.  The ASF licenses this file
@@ -16,22 +17,20 @@
  * under the License.
  */
 
-pub mod bench_utils;
-pub mod file;
-pub mod harness;
-#[allow(deprecated)]
-pub mod http_client;
-#[allow(deprecated)]
-pub mod quic_client;
-#[allow(deprecated)]
-pub mod tcp_client;
-#[allow(deprecated)]
-pub mod websocket_client;
+use super::TestFixture;
+use crate::harness::error::TestBinaryError;
+use async_trait::async_trait;
+use std::collections::HashMap;
 
-#[allow(deprecated)]
-pub mod test_connectors_runtime;
-#[allow(deprecated)]
-pub mod test_mcp_server;
-#[allow(deprecated)]
-pub mod test_server;
-pub mod test_tls_utils;
+pub struct RandomSourceFixture;
+
+#[async_trait]
+impl TestFixture for RandomSourceFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        Ok(Self)
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        HashMap::new()
+    }
+}

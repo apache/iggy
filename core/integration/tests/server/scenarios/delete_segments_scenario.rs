@@ -17,23 +17,15 @@
 
 use bytes::Bytes;
 use iggy::prelude::*;
-use integration::test_server::{ClientFactory, TestServer};
 use std::fs::{DirEntry, read_dir};
+use std::path::Path;
 
 const STREAM_NAME: &str = "test_stream";
 const TOPIC_NAME: &str = "test_topic";
 const PARTITION_ID: u32 = 0;
 const LOG_EXTENSION: &str = "log";
 
-pub async fn run(client_factory: &dyn ClientFactory, test_server: &TestServer) {
-    let client = client_factory.create_client().await;
-    let client = IggyClient::create(client, None, None);
-
-    client
-        .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
-        .await
-        .unwrap();
-
+pub async fn run(client: &IggyClient, data_path: &Path) {
     let stream = client.create_stream(STREAM_NAME).await.unwrap();
     let stream_id = stream.id;
 
@@ -77,9 +69,12 @@ pub async fn run(client_factory: &dyn ClientFactory, test_server: &TestServer) {
     tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
 
     // Check initial segment count on filesystem
-    let data_path = test_server.get_local_data_path();
-    let partition_path =
-        format!("{data_path}/streams/{stream_id}/topics/{topic_id}/partitions/{PARTITION_ID}");
+    let partition_path = data_path
+        .join(format!(
+            "streams/{stream_id}/topics/{topic_id}/partitions/{PARTITION_ID}"
+        ))
+        .display()
+        .to_string();
 
     let initial_segments = get_segment_paths_for_partition(&partition_path);
     println!(
