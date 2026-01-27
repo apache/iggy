@@ -75,9 +75,9 @@ impl Codec {
     }
 
     /// Takes a message payload and compresses it using the algorithm from Codec.
-    pub fn compress(&self, data: &[u8]) -> Result<Vec<u8>, IggyError> {
+    pub fn compress(&self, data: &[u8]) -> Vec<u8> {
         match self {
-            Codec::None => Ok(data.to_vec()),
+            Codec::None => data.to_vec(),
             Codec::Lz4 => {
                 let mut compressed_data = Vec::new();
                 let mut encoder = FrameEncoder::new(&mut compressed_data);
@@ -85,22 +85,22 @@ impl Codec {
                     .write_all(data)
                     .expect("Cannot write into buffer using Lz4 compression.");
                 encoder.finish().expect("Cannot finish Lz4 compression.");
-                Ok(compressed_data)
+                compressed_data
             }
         }
     }
 
     /// Takes a compressed message payload and decompresses it using the algorithm from Codec.
-    pub fn decompress(&self, data: &[u8]) -> Result<Vec<u8>, IggyError> {
+    pub fn decompress(&self, data: &[u8]) -> Vec<u8> {
         match self {
-            Codec::None => Ok(data.to_vec()),
+            Codec::None => data.to_vec(),
             Codec::Lz4 => {
                 let mut decoder = FrameDecoder::new(data);
                 let mut decompressed_data = Vec::new();
                 decoder
                     .read_to_end(&mut decompressed_data)
                     .expect("Cannot decode message payload using Lz4.");
-                Ok(decompressed_data)
+                decompressed_data
             }
         }
     }

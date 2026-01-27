@@ -8,39 +8,32 @@ Details on how to run the examples for the Rust Iggy SDK can be found in the par
 
 Run the following commands
 
-1. Set root credentials in your environment
-
-  ```bash
-  export IGGY_ROOT_USERNAME=iggy
-  export IGGY_ROOT_PASSWORD=iggy
-  ```
-
 1. Start the server
 
-  ```bash
-  cargo run --bin iggy-server -- --with-default-root-credentials
-  ```
+    ```bash
+    cargo run --bin iggy-server -- --with-default-root-credentials
+    ```
 
-  **NOTE**: In case the server was running before, make sure to run `rm -rf local_data/` to delete server state data from prior runs.
+    **NOTE**: In case the server was running before, make sure to run `rm -rf local_data/` to delete server state data from prior runs.
 
-1. Run the producer to write compressed messages to the server
+2. Run the producer to write compressed messages to the server
 
-  ```bash
-  cargo run --example message-headers-compression-producer
-  ```
+    ```bash
+    cargo run --example message-headers-compression-producer
+    ```
 
-1. Run the consumer to read and decompress messages from the server
+3. Run the consumer to read and decompress messages from the server
 
-  ```bash
-  cargo run --example message-headers-compression-consumer
-  ```
+    ```bash
+    cargo run --example message-headers-compression-consumer
+    ```
 
 ## The Codec
 
 The **co**mpression and **dec**compression utilities are implemented in `examples/rust/src/shared/codec.rs` and used when sending messages to the server and reading them from the server.
 
 First, define a stream and a topic name.
-The producer will first initiate the stream and the topic on that stream and then write the example messages to that topic wihtin that stream.
+The producer will first initiate the stream and the topic on that stream and then write the example messages to that topic within that stream.
 The consumer will use the names as identifier to read messages from that topic on that stream.
 
 ```rust
@@ -60,7 +53,7 @@ In order to add functionality to compress and decompress messages during transit
 Iggy implements two important types, that we need to know.
 
 * [IggyMessage](https://github.com/apache/iggy/blob/e46f294b7af4f86b0d7e26d984205a019a8885f8/core/common/src/types/message/iggy_message.rs#L108)
-* [ReceivedMessage]
+* [ReceivedMessage](https://github.com/apache/iggy/blob/b26246252502ba6f5d6cad2895e7c468d9f959e4/core/sdk/src/clients/consumer.rs#L905)
 
 A message send to the server needs to be of type `IggyMessage`.
 
@@ -75,7 +68,7 @@ pub struct IggyMessage {
 }
 ```
 
-The important bits in context of this example are the *payload* and the *user-headers*.
+The important bits in context of this example are the *payload* and the *user_headers*.
 Payload is of type Bytes and corresponds to the actual message that we want to send to the server.
 
 Let's suppose our example is an abstraction over a real world scenario, where some application sends it's application logs to the iggy-server. This application is therefore the producer.
@@ -83,14 +76,14 @@ We also have a monitoring service, that inspects the logs of our application to 
 
 Further suppose, the application logs are quite large and repetitive, since they follow a structured pattern (as logs usually do).
 It may be a good idea to reduce bandwidth by trading of some idle CPU time to compress the logs before sending them to the server.
-We go straight ahead, implement some compression functionalitis and send the compressed messages to the server.
+We go straight ahead, implement some compression functionalities and send the compressed messages to the server.
 If the monitoring service now consumes these messages we have a problem. The logs are still compressed.
-Even if we know that the messages are compressed we do not know what algorithm was used.
+Even if we know that the messages are compressed we do not know how to decompress them because the algorithm that was used for compression is unknown.
 
 This is where `user_headers` become handy.
 The definition above tells us, that user_headers are (optional) Bytes. But thats because finally everything is serialized before sending to the server.
-Looking at the implementation of `IggyMessage` we see that user-headers are a serialized `HashMap` with Iggy specific types `HeaderKey` and `HeaderValue`.
-So the user_headers are basically a set of metadata defined by the us, the user, using a key and a value.
+Looking at the implementation of `IggyMessage` we see that user_headers are a serialized `HashMap` with Iggy specific types `HeaderKey` and `HeaderValue`.
+So the user_headers are basically a set of metadata defined by us, the user, using a key and a value.
 
 Thus, for the compression scenario the user_headers can be used to signal to a consumer that a message was compressed before it was sent to the server.
 The key to highlight message compression in this example is defined as:
@@ -186,7 +179,7 @@ impl Codec {
 The example `/producer/main.rs` sets up a basic client that connects via TCP to a running iggy-server.
 Since the plain server on start-up does not have any, it creates a stream and a topic to which it writes the compressed messages.
 
-This is how the Codec described above is the used to setup the user_headers entry to signal message compression.
+This is how the Codec described above is used to setup the user_headers entry to signal message compression.
 
 ```rust
 let codec = Codec::Lz4;

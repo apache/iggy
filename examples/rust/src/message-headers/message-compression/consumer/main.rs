@@ -69,7 +69,7 @@ fn handle_payload_compression(msg: &mut ReceivedMessage) -> Result<(), IggyError
         let codec = Codec::from_header_value(&algorithm);
 
         // decompress the payload and update the payload length
-        let decompressed_payload = codec.decompress(&msg.message.payload)?;
+        let decompressed_payload = codec.decompress(&msg.message.payload);
         msg.message.payload = Bytes::from(decompressed_payload);
         msg.message.header.payload_length = msg.message.payload.len() as u32;
 

@@ -38,7 +38,7 @@ async fn main() -> Result<(), IggyError> {
     client
         .create_stream(STREAM_NAME)
         .await
-        .expect("Stream was NOT created! Start a fresh server to run this example.");
+        .expect("Stream was NOT created! Remove /local_data or start a fresh server with the --fresh flag to run this example.");
 
     // Create a Topic on that Stream.
     client
@@ -76,9 +76,7 @@ async fn main() -> Result<(), IggyError> {
             i % 120
         );
         let payload = Bytes::from(payload);
-        let compressed_payload = codec
-            .compress(&payload)
-            .expect("Payload should be compressable.");
+        let compressed_payload = codec.compress(&payload);
         let compressed_bytes = Bytes::from(compressed_payload);
 
         let msg = IggyMessage::builder()
