@@ -19,34 +19,98 @@
 
 package org.apache.iggy.client.blocking.http;
 
+import org.apache.commons.lang3.StringUtils;
+import org.apache.hc.client5.http.config.ConnectionConfig;
+import org.apache.hc.client5.http.config.RequestConfig;
+import org.apache.hc.client5.http.impl.classic.CloseableHttpClient;
 import org.apache.hc.client5.http.impl.classic.HttpClients;
+import org.apache.hc.client5.http.impl.io.PoolingHttpClientConnectionManagerBuilder;
+import org.apache.hc.client5.http.ssl.DefaultClientTlsStrategy;
 import org.apache.hc.core5.http.ClassicHttpRequest;
 import org.apache.hc.core5.http.ClassicHttpResponse;
 import org.apache.hc.core5.http.NameValuePair;
 import org.apache.hc.core5.http.io.HttpClientResponseHandler;
 import org.apache.hc.core5.http.io.support.ClassicRequestBuilder;
-import org.apache.iggy.client.blocking.http.error.IggyHttpError;
-import org.apache.iggy.client.blocking.http.error.IggyHttpException;
+import org.apache.hc.core5.ssl.SSLContextBuilder;
+import org.apache.hc.core5.util.Timeout;
+import org.apache.iggy.exception.IggyConnectionException;
+import org.apache.iggy.exception.IggyInvalidArgumentException;
+import org.apache.iggy.exception.IggyServerException;
+import org.apache.iggy.exception.IggyTlsException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import tools.jackson.core.type.TypeReference;
 import tools.jackson.databind.JavaType;
 import tools.jackson.databind.ObjectMapper;
+import tools.jackson.databind.node.ObjectNode;
 
+import java.io.Closeable;
+import java.io.File;
 import java.io.IOException;
+import java.security.GeneralSecurityException;
+import java.time.Duration;
 import java.util.Optional;
 
-final class InternalHttpClient {
+final class InternalHttpClient implements Closeable {
 
     private static final Logger log = LoggerFactory.getLogger(InternalHttpClient.class);
 
     private static final String AUTHORIZATION = "Authorization";
     private final String url;
     private final ObjectMapper objectMapper = ObjectMapperFactory.getInstance();
+    private final CloseableHttpClient httpClient;
     private Optional<String> token = Optional.empty();
 
-    InternalHttpClient(String url) {
+    InternalHttpClient(
+            String url,
+            Optional<Duration> connectionTimeout,
+            Optional<Duration> requestTimeout,
+            Optional<File> tlsCertificate) {
+        validateUrl(url);
         this.url = url;
+        this.httpClient = createHttpClient(connectionTimeout, requestTimeout, tlsCertificate);
+    }
+
+    private static void validateUrl(String url) {
+        if (StringUtils.isBlank(url)) {
+            throw new IggyInvalidArgumentException("URL cannot be null or empty");
+        }
+        if (!url.startsWith("http://") && !url.startsWith("https://")) {
+            throw new IggyInvalidArgumentException("URL must start with http:// or https://");
+        }
+    }
+
+    private static CloseableHttpClient createHttpClient(
+            Optional<Duration> connectionTimeout, Optional<Duration> requestTimeout, Optional<File> tlsCertificate) {
+        var connectionConfigBuilder = ConnectionConfig.custom();
+        connectionTimeout.ifPresent(timeout -> connectionConfigBuilder.setConnectTimeout(Timeout.of(timeout)));
+
+        var connectionManagerBuilder = PoolingHttpClientConnectionManagerBuilder.create()
+                .setDefaultConnectionConfig(connectionConfigBuilder.build());
+
+        tlsCertificate.ifPresent(cert -> {
+            try {
+                var sslContext =
+                        SSLContextBuilder.create().loadTrustMaterial(cert, null).build();
+                var tlsStrategy = new DefaultClientTlsStrategy(sslContext);
+                connectionManagerBuilder.setTlsSocketStrategy(tlsStrategy);
+            } catch (GeneralSecurityException | IOException e) {
+                throw new IggyTlsException("Failed to configure TLS certificate", e);
+            }
+        });
+
+        var requestConfigBuilder = RequestConfig.custom();
+        requestTimeout.ifPresent(timeout -> requestConfigBuilder.setResponseTimeout(Timeout.of(timeout)));
+
+        return HttpClients.custom()
+                .setConnectionManager(connectionManagerBuilder.build())
+                .setDefaultRequestConfig(requestConfigBuilder.build())
+                .build();
+    }
+
+    @Override
+    public void close() throws IOException {
+        httpClient.close();
     }
 
     void setToken(Optional<String> token) {
@@ -93,10 +157,10 @@ final class InternalHttpClient {
     }
 
     private <T> T executeRequest(ClassicHttpRequest request, HttpClientResponseHandler<T> responseHandler) {
-        try (var client = HttpClients.createDefault()) {
-            return client.execute(request, responseHandler);
+        try {
+            return httpClient.execute(request, responseHandler);
         } catch (IOException e) {
-            throw new RuntimeException(e);
+            throw new IggyConnectionException("HTTP request failed", e);
         }
     }
 
@@ -140,8 +204,12 @@ final class InternalHttpClient {
 
     private void handleErrorResponse(ClassicHttpResponse response) throws IOException {
         if (!isSuccessful(response.getCode())) {
-            var error = objectMapper.readValue(response.getEntity().getContent(), IggyHttpError.class);
-            throw new IggyHttpException(error);
+            var errorNode = objectMapper.readValue(response.getEntity().getContent(), ObjectNode.class);
+            String id = errorNode.has("id") ? errorNode.get("id").asText() : null;
+            String code = errorNode.has("code") ? errorNode.get("code").asText() : null;
+            String reason = errorNode.has("reason") ? errorNode.get("reason").asText() : null;
+            String field = errorNode.has("field") ? errorNode.get("field").asText() : null;
+            throw IggyServerException.fromHttpResponse(id, code, reason, field);
         }
     }
 

@@ -28,12 +28,16 @@ final class TcpClientFactory {
     private TcpClientFactory() {}
 
     static IggyTcpClient create(GenericContainer<?> iggyServer) {
+        IggyTcpClient client;
         if (iggyServer == null) {
             // Server is running externally
-            return new IggyTcpClient("127.0.0.1", TCP_PORT);
+            client = new IggyTcpClient("127.0.0.1", TCP_PORT);
+        } else {
+            String address = iggyServer.getHost();
+            Integer port = iggyServer.getMappedPort(TCP_PORT);
+            client = new IggyTcpClient(address, port);
         }
-        String address = iggyServer.getHost();
-        Integer port = iggyServer.getMappedPort(TCP_PORT);
-        return new IggyTcpClient(address, port);
+        client.connect();
+        return client;
     }
 }

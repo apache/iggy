@@ -29,9 +29,19 @@ import org.apache.iggy.client.blocking.StreamsClient;
 import org.apache.iggy.client.blocking.SystemClient;
 import org.apache.iggy.client.blocking.TopicsClient;
 import org.apache.iggy.client.blocking.UsersClient;
+import org.apache.iggy.exception.IggyMissingCredentialsException;
 
-public class IggyHttpClient implements IggyBaseClient {
+import java.io.Closeable;
+import java.io.File;
+import java.io.IOException;
+import java.time.Duration;
+import java.util.Optional;
 
+public class IggyHttpClient implements IggyBaseClient, Closeable {
+
+    static final int DEFAULT_HTTP_PORT = 3000;
+
+    private final InternalHttpClient internalHttpClient;
     private final SystemHttpClient systemClient;
     private final StreamsHttpClient streamsClient;
     private final UsersHttpClient usersClient;
@@ -41,18 +51,57 @@ public class IggyHttpClient implements IggyBaseClient {
     private final ConsumerOffsetsHttpClient consumerOffsetsClient;
     private final MessagesHttpClient messagesClient;
     private final PersonalAccessTokensHttpClient personalAccessTokensHttpClient;
+    private final Optional<String> username;
+    private final Optional<String> password;
 
     public IggyHttpClient(String url) {
-        InternalHttpClient httpClient = new InternalHttpClient(url);
-        systemClient = new SystemHttpClient(httpClient);
-        streamsClient = new StreamsHttpClient(httpClient);
-        usersClient = new UsersHttpClient(httpClient);
-        topicsClient = new TopicsHttpClient(httpClient);
-        partitionsClient = new PartitionsHttpClient(httpClient);
-        consumerGroupsClient = new ConsumerGroupsHttpClient(httpClient);
-        consumerOffsetsClient = new ConsumerOffsetsHttpClient(httpClient);
-        messagesClient = new MessagesHttpClient(httpClient);
-        personalAccessTokensHttpClient = new PersonalAccessTokensHttpClient(httpClient);
+        this(url, null, null, null, null, null);
+    }
+
+    IggyHttpClient(
+            String url,
+            String username,
+            String password,
+            Duration connectionTimeout,
+            Duration requestTimeout,
+            File tlsCertificate) {
+        this.username = Optional.ofNullable(username);
+        this.password = Optional.ofNullable(password);
+        internalHttpClient = new InternalHttpClient(
+                url,
+                Optional.ofNullable(connectionTimeout),
+                Optional.ofNullable(requestTimeout),
+                Optional.ofNullable(tlsCertificate));
+        systemClient = new SystemHttpClient(internalHttpClient);
+        streamsClient = new StreamsHttpClient(internalHttpClient);
+        usersClient = new UsersHttpClient(internalHttpClient);
+        topicsClient = new TopicsHttpClient(internalHttpClient);
+        partitionsClient = new PartitionsHttpClient(internalHttpClient);
+        consumerGroupsClient = new ConsumerGroupsHttpClient(internalHttpClient);
+        consumerOffsetsClient = new ConsumerOffsetsHttpClient(internalHttpClient);
+        messagesClient = new MessagesHttpClient(internalHttpClient);
+        personalAccessTokensHttpClient = new PersonalAccessTokensHttpClient(internalHttpClient);
+    }
+
+    /**
+     * Creates a new builder for configuring IggyHttpClient.
+     *
+     * @return a new Builder instance
+     */
+    public static IggyHttpClientBuilder builder() {
+        return new IggyHttpClientBuilder();
+    }
+
+    /**
+     * Logs in using the credentials provided during client construction.
+     *
+     * @throws IggyMissingCredentialsException if no credentials were provided
+     */
+    public void login() {
+        if (username.isEmpty() || password.isEmpty()) {
+            throw new IggyMissingCredentialsException();
+        }
+        usersClient.login(username.get(), password.get());
     }
 
     @Override
@@ -98,5 +147,10 @@ public class IggyHttpClient implements IggyBaseClient {
     @Override
     public PersonalAccessTokensClient personalAccessTokens() {
         return personalAccessTokensHttpClient;
+    }
+
+    @Override
+    public void close() throws IOException {
+        internalHttpClient.close();
     }
 }
