@@ -163,12 +163,12 @@ public class EventAggregatorTests
 
         eventAggregator.Publish("test");
 
-        await Task.Delay(200);
+        await Task.Delay(200, TestContext.Current.CancellationToken);
 
         Assert.False(executed);
         Assert.Equal(string.Empty, executedEventValue);
 
-        await Task.Delay(400);
+        await Task.Delay(400, TestContext.Current.CancellationToken);
         Assert.True(executed);
         Assert.Equal("test", executedEventValue);
     }
