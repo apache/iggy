@@ -17,48 +17,53 @@
  * under the License.
  */
 
+use ::configs::{FileConfigProvider, TypedEnvProvider};
 use axum::http::Method;
+use configs_derive::ConfigEnv;
 use figment::{
     Metadata, Profile, Provider,
     providers::{Format, Toml},
     value::Dict,
 };
 use iggy::prelude::{DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME};
-use iggy_common::{CustomEnvProvider, FileConfigProvider};
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display as FmtDisplay, Formatter};
 use std::str::FromStr;
 use strum::Display;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, ConfigEnv)]
+#[config_env(prefix = "IGGY_MCP_", name = "iggy-mcp-server-config")]
 #[serde(default)]
 pub struct McpServerConfig {
     pub http: HttpConfig,
     pub iggy: IggyConfig,
     pub permissions: PermissionsConfig,
+    #[config_env(leaf)]
     pub transport: McpTransport,
     pub telemetry: TelemetryConfig,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ConfigEnv)]
 pub struct IggyConfig {
     pub address: String,
     pub username: String,
+    #[config_env(secret)]
     pub password: String,
+    #[config_env(secret)]
     pub token: String,
     pub consumer: String,
     pub tls: IggyTlsConfig,
 }
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize, ConfigEnv)]
 pub struct IggyTlsConfig {
     pub enabled: bool,
     pub ca_file: String,
     pub domain: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, ConfigEnv)]
 pub struct PermissionsConfig {
     pub create: bool,
     pub read: bool,
@@ -66,7 +71,7 @@ pub struct PermissionsConfig {
     pub delete: bool,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, ConfigEnv)]
 pub struct HttpConfig {
     pub address: String,
     pub path: String,
@@ -74,14 +79,14 @@ pub struct HttpConfig {
     pub tls: HttpTlsConfig,
 }
 
-#[derive(Debug, Default, Deserialize, Serialize, Clone)]
+#[derive(Debug, Default, Deserialize, Serialize, Clone, ConfigEnv)]
 pub struct HttpTlsConfig {
     pub enabled: bool,
     pub cert_file: String,
     pub key_file: String,
 }
 
-#[derive(Debug, Default, Deserialize, Serialize, Clone)]
+#[derive(Debug, Default, Deserialize, Serialize, Clone, ConfigEnv)]
 pub struct HttpCorsConfig {
     pub enabled: bool,
     pub allowed_methods: Vec<String>,
@@ -103,7 +108,7 @@ pub enum McpTransport {
     Stdio,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
 pub struct TelemetryConfig {
     pub enabled: bool,
     pub service_name: String,
@@ -132,8 +137,9 @@ impl FmtDisplay for TelemetryConfig {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
 pub struct TelemetryLogsConfig {
+    #[config_env(leaf)]
     pub transport: TelemetryTransport,
     pub endpoint: String,
 }
@@ -157,8 +163,9 @@ impl FmtDisplay for TelemetryLogsConfig {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
 pub struct TelemetryTracesConfig {
+    #[config_env(leaf)]
     pub transport: TelemetryTransport,
     pub endpoint: String,
 }
@@ -396,25 +403,23 @@ impl McpServerConfig {
 
 #[derive(Debug, Clone)]
 pub struct McpServerEnvProvider {
-    provider: CustomEnvProvider<McpServerConfig>,
+    provider: TypedEnvProvider<McpServerConfig>,
 }
 
 impl Default for McpServerEnvProvider {
     fn default() -> Self {
         Self {
-            provider: CustomEnvProvider::new("IGGY_MCP_", &[]),
+            provider: TypedEnvProvider::from_config(McpServerConfig::ENV_PREFIX),
         }
     }
 }
 
 impl Provider for McpServerEnvProvider {
     fn metadata(&self) -> Metadata {
-        Metadata::named("iggy-mcp-server-config")
+        Metadata::named(McpServerConfig::ENV_PROVIDER_NAME)
     }
 
     fn data(&self) -> Result<figment::value::Map<Profile, Dict>, figment::Error> {
-        self.provider.deserialize().map_err(|_| {
-            figment::Error::from("Cannot deserialize environment variables for MCP config")
-        })
+        self.provider.data()
     }
 }

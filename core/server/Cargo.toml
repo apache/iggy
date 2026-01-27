@@ -53,6 +53,7 @@ compio-net = { workspace = true }
 compio-quic = { workspace = true }
 compio-tls = { workspace = true }
 compio-ws = { workspace = true }
+configs = { workspace = true }
 ctrlc = { version = "3.5", features = ["termination"] }
 cyper = { workspace = true }
 cyper-axum = { workspace = true }

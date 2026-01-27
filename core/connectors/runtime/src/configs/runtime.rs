@@ -18,24 +18,21 @@
  */
 
 use crate::api::config::HttpConfig;
+use ::configs::{FileConfigProvider, TypedEnvProvider};
+use configs_derive::ConfigEnv;
 use derive_more::Display;
 use figment::providers::{Format, Toml};
 use figment::value::Dict;
 use figment::{Metadata, Profile, Provider};
+use iggy_common::IggyDuration;
 use iggy_common::defaults::{DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME};
-use iggy_common::{CustomEnvProvider, FileConfigProvider, IggyDuration};
 use serde::{Deserialize, Serialize};
 use serde_with::{DisplayFromStr, serde_as};
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use std::str::FromStr;
 
-const SECRET_KEYS: [&str; 2] = [
-    "IGGY_CONNECTORS_IGGY_PASSWORD",
-    "IGGY_CONNECTORS_IGGY_TOKEN",
-];
-
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
 pub struct TelemetryConfig {
     pub enabled: bool,
     pub service_name: String,
@@ -64,8 +61,9 @@ impl Display for TelemetryConfig {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
 pub struct TelemetryLogsConfig {
+    #[config_env(leaf)]
     pub transport: TelemetryTransport,
     pub endpoint: String,
 }
@@ -89,8 +87,9 @@ impl Display for TelemetryLogsConfig {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
 pub struct TelemetryTracesConfig {
+    #[config_env(leaf)]
     pub transport: TelemetryTransport,
     pub endpoint: String,
 }
@@ -134,7 +133,8 @@ impl FromStr for TelemetryTransport {
     }
 }
 
-#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+#[derive(Debug, Default, Clone, Deserialize, Serialize, ConfigEnv)]
+#[config_env(prefix = "IGGY_CONNECTORS_", name = "iggy-connectors-config")]
 #[serde(default)]
 pub struct ConnectorsRuntimeConfig {
     pub http: HttpConfig,
@@ -144,16 +144,18 @@ pub struct ConnectorsRuntimeConfig {
     pub telemetry: TelemetryConfig,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ConfigEnv)]
 pub struct IggyConfig {
     pub address: String,
     pub username: String,
+    #[config_env(secret)]
     pub password: String,
+    #[config_env(secret)]
     pub token: String,
     pub tls: IggyTlsConfig,
 }
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize, ConfigEnv)]
 pub struct IggyTlsConfig {
     pub enabled: bool,
     pub ca_file: String,
@@ -161,12 +163,14 @@ pub struct IggyTlsConfig {
 }
 
 #[serde_as]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ConfigEnv)]
 pub struct RetryConfig {
     pub enabled: bool,
     pub max_attempts: u32,
+    #[config_env(leaf)]
     #[serde_as(as = "DisplayFromStr")]
     pub initial_backoff: IggyDuration,
+    #[config_env(leaf)]
     #[serde_as(as = "DisplayFromStr")]
     pub max_backoff: IggyDuration,
     pub backoff_multiplier: u32,
@@ -198,21 +202,24 @@ impl Display for RetryConfig {
     }
 }
 
-#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+#[derive(Debug, Default, Clone, Deserialize, Serialize, ConfigEnv)]
 #[serde(default)]
 pub struct LocalConnectorsConfig {
     pub config_dir: String,
 }
 
 #[serde_as]
-#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+#[derive(Debug, Default, Clone, Deserialize, Serialize, ConfigEnv)]
 pub struct HttpConnectorsConfig {
     pub base_url: String,
+    #[config_env(leaf)]
     #[serde_as(as = "DisplayFromStr")]
     #[serde(default = "default_from_secs")]
     pub timeout: IggyDuration,
+    #[config_env(skip)]
     #[serde(default)]
     pub request_headers: HashMap<String, String>,
+    #[config_env(skip)]
     #[serde(default)]
     pub url_templates: HashMap<String, String>,
     #[serde(default)]
@@ -240,7 +247,7 @@ fn default_from_secs() -> IggyDuration {
     IggyDuration::new_from_secs(10)
 }
 
-#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+#[derive(Debug, Default, Clone, Deserialize, Serialize, ConfigEnv)]
 #[serde(default)]
 pub struct ResponseConfig {
     pub data_path: Option<String>,
@@ -248,7 +255,7 @@ pub struct ResponseConfig {
 }
 
 #[allow(clippy::large_enum_variant)]
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, ConfigEnv)]
 #[serde(tag = "config_type", rename_all = "lowercase")]
 pub enum ConnectorsConfig {
     Local(LocalConnectorsConfig),
@@ -261,7 +268,7 @@ impl Default for ConnectorsConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ConfigEnv)]
 pub struct StateConfig {
     pub path: String,
 }
@@ -358,25 +365,23 @@ impl ConnectorsRuntimeConfig {
 
 #[derive(Debug, Clone)]
 pub struct ConnectorsEnvProvider {
-    provider: CustomEnvProvider<ConnectorsRuntimeConfig>,
+    provider: TypedEnvProvider<ConnectorsRuntimeConfig>,
 }
 
 impl Default for ConnectorsEnvProvider {
     fn default() -> Self {
         Self {
-            provider: CustomEnvProvider::new("IGGY_CONNECTORS_", &SECRET_KEYS),
+            provider: TypedEnvProvider::from_config(ConnectorsRuntimeConfig::ENV_PREFIX),
         }
     }
 }
 
 impl Provider for ConnectorsEnvProvider {
     fn metadata(&self) -> Metadata {
-        Metadata::named("iggy-connectors-config")
+        Metadata::named(ConnectorsRuntimeConfig::ENV_PROVIDER_NAME)
     }
 
     fn data(&self) -> Result<figment::value::Map<Profile, Dict>, figment::Error> {
-        self.provider.deserialize().map_err(|_| {
-            figment::Error::from("Cannot deserialize environment variables for connectors config")
-        })
+        self.provider.data()
     }
 }

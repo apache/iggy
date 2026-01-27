@@ -33,6 +33,7 @@ async-trait = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
 compio = { workspace = true }
+configs = { workspace = true }
 ctor = "0.6.3"
 derive_more = { workspace = true }
 env_logger = { workspace = true }

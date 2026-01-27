@@ -37,10 +37,17 @@ components:
     paths:
       - "core/sdk/**"
 
+  rust-configs:
+    depends_on:
+      - "rust-workspace"
+    paths:
+      - "core/configs/**"
+      - "core/configs_derive/**"
+
   rust-common:
     depends_on:
-      - "rust-workspace" # Common is affected by workspace changes
-      - "ci-infrastructure" # CI changes trigger full regression
+      - "rust-workspace"
+      - "rust-configs"
     paths:
       - "core/common/**"
 
@@ -51,28 +58,52 @@ components:
     paths:
       - "core/binary_protocol/**"
 
+  rust-clock:
+    depends_on:
+      - "rust-workspace"
+    paths:
+      - "core/clock/**"
+
+  rust-journal:
+    depends_on:
+      - "rust-workspace"
+    paths:
+      - "core/journal/**"
+
+  rust-partitions:
+    depends_on:
+      - "rust-workspace"
+    paths:
+      - "core/partitions/**"
+
   rust-server:
     depends_on:
-      - "rust-workspace" # Server is affected by workspace changes
-      - "ci-infrastructure" # CI changes trigger full regression
+      - "rust-workspace"
+      - "rust-configs"
       - "rust-common"
       - "rust-binary-protocol"
+      - "rust-journal"
+      - "rust-partitions"
     paths:
       - "core/server/**"
 
   rust-cluster:
     depends_on:
-      - "rust-workspace" # Cluster is affected by workspace changes
-      - "ci-infrastructure" # CI changes trigger full regression
+      - "rust-workspace"
+      - "rust-clock"
     paths:
-      - "core/consensus/"
-      - "core/metadata/"
-      - "core/message_bus/"
+      - "core/consensus/**"
+      - "core/metadata/**"
+      - "core/message_bus/**"
 
   # Main Rust workspace testing
   rust:
     depends_on:
       - "rust-workspace"
+      - "rust-configs"
+      - "rust-clock"
+      - "rust-journal"
+      - "rust-partitions"
       - "rust-sdk"
       - "rust-common"
       - "rust-binary-protocol"
@@ -84,7 +115,7 @@ components:
       - "rust-connectors"
       - "rust-mcp"
       - "rust-integration"
-      - "ci-infrastructure" # CI changes trigger full regression
+      - "ci-infrastructure"
     paths:
       - "Dockerfile*"
       - "!foreign/**" # Exclude foreign SDKs
@@ -121,6 +152,7 @@ components:
   rust-connectors:
     depends_on:
       - "rust-sdk"
+      - "rust-configs"
     paths:
       - "core/connectors/**"
 
@@ -128,6 +160,7 @@ components:
   rust-mcp:
     depends_on:
       - "rust-sdk"
+      - "rust-configs"
     paths:
       - "core/ai/mcp/**"
 
@@ -138,6 +171,7 @@ components:
       - "rust-common"
       - "rust-binary-protocol"
       - "rust-server"
+      - "rust-configs"
     paths:
       - "core/integration/**"
 

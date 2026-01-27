@@ -31,10 +31,12 @@ use std::thread::available_parallelism;
 use tracing::info;
 
 use crate::server_error::ServerError;
+use iggy_common::ConfigEnv;
 
-#[derive(Debug, Deserialize, Serialize, Default)]
+#[derive(Debug, Deserialize, Serialize, Default, ConfigEnv)]
 pub struct ShardingConfig {
     #[serde(default)]
+    #[config_env(leaf)]
     pub cpu_allocation: CpuAllocation,
 }
 

@@ -17,12 +17,12 @@
  * under the License.
  */
 
+use ::configs::ConfigProvider;
 use configs::{McpServerConfig, McpTransport};
 use dotenvy::dotenv;
 use error::McpRuntimeError;
 use figlet_rs::FIGfont;
 use iggy::prelude::{Client, Identifier};
-use iggy_common::ConfigProvider;
 use rmcp::{ServiceExt, model::ErrorData, transport::stdio};
 use service::IggyService;
 use std::{env, sync::Arc};

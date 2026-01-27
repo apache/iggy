@@ -52,7 +52,7 @@ async fn should_fill_data_and_verify_after_restart(cache_setting: &'static str) 
             TestServer::get_random_path(),
         ),
         (
-            "IGGY_SEGMENT_CACHE_INDEXES".to_string(),
+            "IGGY_SYSTEM_SEGMENT_CACHE_INDEXES".to_string(),
             cache_setting.to_string(),
         ),
     ]);
