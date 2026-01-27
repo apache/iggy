@@ -143,7 +143,7 @@ Note, that this can be easily extended to more algorithms.
 
 ```rust
 impl Codec {
-    pub fn compress(&self, data: &[u8]) -> Result<Vec<u8>, IggyError> {
+    pub fn compress(&self, data: &[u8]) -> Vec<u8> {
         match self {
             Codec::None => Ok(data.to_vec()),
             Codec::Lz4 => {
@@ -158,7 +158,7 @@ impl Codec {
         }
     }
 
-    pub fn decompress(&self, data: &[u8]) -> Result<Vec<u8>, IggyError> {
+    pub fn decompress(&self, data: &[u8]) -> Vec<u8> {
         match self {
             Codec::None => Ok(data.to_vec()),
             Codec::Lz4 => {
