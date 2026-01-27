@@ -46,6 +46,10 @@ pub struct ConfigEnvOpts {
     /// Metadata name for figment Provider (e.g., "iggy-server-config"). Only needed on root config.
     #[darling(default)]
     name: Option<String>,
+
+    /// Tag field name for internally-tagged serde enums (mirrors `#[serde(tag = "...")]`).
+    #[darling(default)]
+    tag: Option<String>,
 }
 
 /// Variant-level attributes for `#[config_env(...)]` on enums
@@ -134,6 +138,7 @@ fn generate_from_opts(opts: ConfigEnvOpts) -> TokenStream2 {
             impl_generics,
             ty_generics,
             where_clause,
+            opts.tag,
             variants,
         ),
     }
@@ -146,6 +151,7 @@ fn generate_enum_impl(
     impl_generics: syn::ImplGenerics,
     ty_generics: syn::TypeGenerics,
     where_clause: Option<&syn::WhereClause>,
+    tag: Option<String>,
     variants: Vec<VariantOpts>,
 ) -> TokenStream2 {
     // Collect inner types from newtype variants (single unnamed field)
@@ -164,7 +170,18 @@ fn generate_enum_impl(
         })
         .collect();
 
-    if variant_types.is_empty() {
+    let tag_mapping = tag.map(|tag_name| {
+        let env_segment = tag_name.to_uppercase();
+        quote! {
+            all_mappings.push(configs::EnvVarMapping {
+                env_name: #env_segment,
+                config_path: #tag_name,
+                is_secret: false,
+            });
+        }
+    });
+
+    if variant_types.is_empty() && tag_mapping.is_none() {
         return quote! {
             impl #impl_generics configs::ConfigEnvMappings for #enum_name #ty_generics #where_clause {
                 fn env_mappings() -> &'static [configs::EnvVarMapping] {
@@ -190,6 +207,7 @@ fn generate_enum_impl(
                 static MAPPINGS: std::sync::OnceLock<Vec<configs::EnvVarMapping>> = std::sync::OnceLock::new();
                 MAPPINGS.get_or_init(|| {
                     let mut all_mappings: Vec<configs::EnvVarMapping> = Vec::new();
+                    #tag_mapping
                     #(#extends)*
                     all_mappings
                 })

@@ -163,8 +163,8 @@ impl<T: ConfigEnvMappings> TypedEnvProvider<T> {
             };
 
             let env_value = match env::var(&env_name) {
-                Ok(val) => val,
-                Err(_) => continue,
+                Ok(val) if !val.is_empty() => val,
+                _ => continue,
             };
 
             let is_secret = mapping.is_secret
