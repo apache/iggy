@@ -61,7 +61,7 @@ public final class GettingStartedProducer {
                 .host("localhost")
                 .port(8090)
                 .credentials("iggy", "iggy")
-                .build();
+                .buildAndLogin();
 
         createStream(client);
         createTopic(client);

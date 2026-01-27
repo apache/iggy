@@ -129,11 +129,8 @@ public class IggyPartitionGroupConsumer implements PartitionGroupConsumer {
                     .host(config.getHost())
                     .port(config.getPort())
                     .credentials(config.getUsername(), config.getPassword())
-                    .connectionPoolSize(config.getConnectionPoolSize())
-                    .build();
-
-            // Connect and authenticate
-            asyncClient.connect().join();
+                    .buildAndLogin()
+                    .join();
 
             // Parse stream and topic IDs
             streamId = parseStreamId(config.getStreamId());
@@ -180,7 +177,7 @@ public class IggyPartitionGroupConsumer implements PartitionGroupConsumer {
             // Poll with auto-commit disabled (we'll manage offsets via Pinot)
             PolledMessages polledMessages = asyncClient
                     .messages()
-                    .pollMessagesAsync(
+                    .pollMessages(
                             streamId,
                             topicId,
                             partition,

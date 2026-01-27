@@ -17,8 +17,26 @@
  * under the License.
  */
 
+import java.time.Instant
+
 plugins {
     id("iggy.java-library-conventions")
+}
+
+val gitCommit: Provider<String> = providers.exec {
+    commandLine("git", "rev-parse", "--short", "HEAD")
+    isIgnoreExitValue = true
+}.standardOutput.asText.map { it.trim() }.orElse("unknown")
+
+val expandProperties = mapOf(
+    "version" to version.toString(),
+    "buildTime" to Instant.now().toString(),
+    "gitCommit" to gitCommit.get()
+)
+
+tasks.processResources {
+    inputs.properties(expandProperties)
+    expand(expandProperties)
 }
 
 dependencies {

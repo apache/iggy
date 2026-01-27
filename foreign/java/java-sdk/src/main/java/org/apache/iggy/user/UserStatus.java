@@ -20,6 +20,7 @@
 package org.apache.iggy.user;
 
 import com.fasterxml.jackson.annotation.JsonProperty;
+import org.apache.iggy.exception.IggyInvalidArgumentException;
 
 public enum UserStatus {
     @JsonProperty("active")
@@ -39,7 +40,7 @@ public enum UserStatus {
                 return userStatus;
             }
         }
-        throw new IllegalArgumentException("Invalid user status: " + code);
+        throw new IggyInvalidArgumentException("Invalid user status: " + code);
     }
 
     public int asCode() {

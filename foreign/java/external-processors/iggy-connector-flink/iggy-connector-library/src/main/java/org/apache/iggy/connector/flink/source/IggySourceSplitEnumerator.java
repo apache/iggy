@@ -157,7 +157,7 @@ public class IggySourceSplitEnumerator implements SplitEnumerator<IggySourceSpli
 
             // Get topic details including partitions
             Optional<TopicDetails> topicDetailsOpt =
-                    asyncClient.topics().getTopicAsync(stream, topic).join();
+                    asyncClient.topics().getTopic(stream, topic).join();
 
             if (topicDetailsOpt.isPresent()) {
                 TopicDetails topicDetails = topicDetailsOpt.get();

@@ -20,6 +20,7 @@
 package org.apache.iggy.identifier;
 
 import org.apache.commons.lang3.StringUtils;
+import org.apache.iggy.exception.IggyInvalidArgumentException;
 
 import javax.annotation.Nullable;
 
@@ -30,10 +31,10 @@ public abstract class Identifier {
 
     protected Identifier(@Nullable String name, @Nullable Long id) {
         if (StringUtils.isBlank(name) && id == null) {
-            throw new IllegalArgumentException("Name and id cannot be blank");
+            throw new IggyInvalidArgumentException("Name and id cannot be blank");
         }
         if (StringUtils.isNotBlank(name) && id != null) {
-            throw new IllegalArgumentException("Name and id cannot be both present");
+            throw new IggyInvalidArgumentException("Name and id cannot be both present");
         }
         if (StringUtils.isNotBlank(name)) {
             this.name = name;

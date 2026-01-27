@@ -167,18 +167,14 @@ public class IggySource<T> implements Source<T, IggySourceSplit, IggySourceEnume
                 host = serverAddress;
             }
 
-            // Create async TCP client using builder pattern
-            AsyncIggyTcpClient asyncClient = AsyncIggyTcpClient.builder()
+            // Create async TCP client using builder pattern with auto connect and login
+            return AsyncIggyTcpClient.builder()
                     .host(host)
                     .port(port)
                     .credentials(connectionConfig.getUsername(), connectionConfig.getPassword())
                     .connectionPoolSize(4)
-                    .build();
-
-            // Connect and block (auto-login happens during connect)
-            asyncClient.connect().join();
-
-            return asyncClient;
+                    .buildAndLogin()
+                    .join();
 
         } catch (RuntimeException e) {
             throw new RuntimeException("Failed to create async Iggy client", e);

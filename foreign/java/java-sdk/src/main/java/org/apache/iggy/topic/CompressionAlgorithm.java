@@ -19,6 +19,8 @@
 
 package org.apache.iggy.topic;
 
+import org.apache.iggy.exception.IggyInvalidArgumentException;
+
 public enum CompressionAlgorithm {
     None(1),
     Gzip(2);
@@ -35,7 +37,7 @@ public enum CompressionAlgorithm {
                 return algorithm;
             }
         }
-        throw new IllegalArgumentException();
+        throw new IggyInvalidArgumentException("Unknown compression algorithm code: " + code);
     }
 
     public Integer asCode() {

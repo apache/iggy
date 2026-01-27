@@ -42,7 +42,7 @@ public interface TopicsClient {
      * @param topicId  The topic identifier
      * @return CompletableFuture with Optional TopicDetails
      */
-    CompletableFuture<Optional<TopicDetails>> getTopicAsync(StreamId streamId, TopicId topicId);
+    CompletableFuture<Optional<TopicDetails>> getTopic(StreamId streamId, TopicId topicId);
 
     /**
      * Gets all topics in a stream.
@@ -50,7 +50,7 @@ public interface TopicsClient {
      * @param streamId The stream identifier
      * @return CompletableFuture with list of Topics
      */
-    CompletableFuture<List<Topic>> getTopicsAsync(StreamId streamId);
+    CompletableFuture<List<Topic>> getTopics(StreamId streamId);
 
     /**
      * Creates a new topic.
@@ -64,7 +64,7 @@ public interface TopicsClient {
      * @param name                 Topic name
      * @return CompletableFuture with created TopicDetails
      */
-    CompletableFuture<TopicDetails> createTopicAsync(
+    CompletableFuture<TopicDetails> createTopic(
             StreamId streamId,
             Long partitionsCount,
             CompressionAlgorithm compressionAlgorithm,
@@ -85,7 +85,7 @@ public interface TopicsClient {
      * @param name                 Topic name
      * @return CompletableFuture that completes when update is done
      */
-    CompletableFuture<Void> updateTopicAsync(
+    CompletableFuture<Void> updateTopic(
             StreamId streamId,
             TopicId topicId,
             CompressionAlgorithm compressionAlgorithm,
@@ -101,5 +101,5 @@ public interface TopicsClient {
      * @param topicId  The topic identifier
      * @return CompletableFuture that completes when deletion is done
      */
-    CompletableFuture<Void> deleteTopicAsync(StreamId streamId, TopicId topicId);
+    CompletableFuture<Void> deleteTopic(StreamId streamId, TopicId topicId);
 }

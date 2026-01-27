@@ -60,7 +60,7 @@ public final class StreamBasic {
                 .host("localhost")
                 .port(8090)
                 .credentials("iggy", "iggy")
-                .build();
+                .buildAndLogin();
 
         try {
             ensureStreamAndTopic(client);

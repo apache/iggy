@@ -34,6 +34,9 @@ import io.netty.channel.socket.SocketChannel;
 import io.netty.channel.socket.nio.NioSocketChannel;
 import io.netty.handler.ssl.SslContext;
 import io.netty.handler.ssl.SslContextBuilder;
+import org.apache.iggy.exception.IggyNotConnectedException;
+import org.apache.iggy.exception.IggyServerException;
+import org.apache.iggy.exception.IggyTlsException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -79,7 +82,7 @@ public class AsyncTcpConnection {
                 this.tlsCertificate.ifPresent(builder::trustManager);
                 this.sslContext = builder.build();
             } catch (SSLException e) {
-                throw new RuntimeException("Failed to build SSL context for AsyncTcpConnection", e);
+                throw new IggyTlsException("Failed to build SSL context for AsyncTcpConnection", e);
             }
         } else {
             this.sslContext = null;
@@ -137,10 +140,11 @@ public class AsyncTcpConnection {
      * Sends a command asynchronously and returns the response.
      * Uses Netty's EventLoop to ensure thread-safe sequential request processing with FIFO response matching.
      */
-    public CompletableFuture<ByteBuf> sendAsync(int commandCode, ByteBuf payload) {
+    public CompletableFuture<ByteBuf> send(int commandCode, ByteBuf payload) {
         if (channel == null || !channel.isActive()) {
             payload.release();
-            return CompletableFuture.failedFuture(new IllegalStateException("Connection not established or closed"));
+            return CompletableFuture.failedFuture(
+                    new IggyNotConnectedException("Connection not established or closed"));
         }
 
         CompletableFuture<ByteBuf> responseFuture = new CompletableFuture<>();
@@ -252,14 +256,11 @@ public class AsyncTcpConnection {
                         future.complete(msg.retainedSlice());
                     } else {
                         // Error - the payload contains the error message
+                        byte[] errorBytes = length > 0 ? new byte[length] : new byte[0];
                         if (length > 0) {
-                            byte[] errorBytes = new byte[length];
                             msg.readBytes(errorBytes);
-                            future.completeExceptionally(
-                                    new RuntimeException("Server error: " + new String(errorBytes)));
-                        } else {
-                            future.completeExceptionally(new RuntimeException("Server error with status: " + status));
                         }
+                        future.completeExceptionally(IggyServerException.fromTcpResponse(status, errorBytes));
                     }
                 }
             }
