@@ -211,11 +211,11 @@ ulimits:
 
 ## Configuration
 
-The default configuration can be found in `server.toml` file in `configs` directory.
+The default configuration can be found in `config.toml` file in `core/server` directory.
 
-The configuration file is loaded from the current working directory, but you can specify the path to the configuration file by setting `IGGY_CONFIG_PATH` environment variable, for example `export IGGY_CONFIG_PATH=configs/server.toml` (or other command depending on OS).
+The configuration file is loaded from the current working directory, but you can specify the path to the configuration file by setting `IGGY_CONFIG_PATH` environment variable, for example `export IGGY_CONFIG_PATH=core/server/config.toml` (or other command depending on OS).
 
-When config file is not found, the default values from embedded `server.toml` file are used.
+When config file is not found, the default values from embedded `config.toml` file are used.
 
 For the detailed documentation of the configuration file, please refer to the [configuration](https://iggy.apache.org/docs/server/configuration) section.
 
@@ -257,7 +257,7 @@ Start the server:
 
 `cargo run --bin iggy-server`
 
-All the data used by the server will be persisted under the `local_data` directory by default, unless specified differently in the configuration (see `system.path` in `server.toml`).
+All the data used by the server will be persisted under the `local_data` directory by default, unless specified differently in the configuration (see `system.path` in `config.toml`).
 
 One can use default root credentials with optional `--with-default-root-credentials`.
 This flag is equivalent to setting `IGGY_ROOT_USERNAME=iggy` and `IGGY_ROOT_PASSWORD=iggy`, plus

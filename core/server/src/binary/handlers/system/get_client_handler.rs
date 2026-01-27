@@ -43,10 +43,7 @@ impl ServerCommandHandler for GetClient {
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
         shard.ensure_authenticated(session)?;
-        shard
-            .permissioner
-            .borrow()
-            .get_client(session.get_user_id())?;
+        shard.metadata.perm_get_client(session.get_user_id())?;
 
         let Some(client) = shard.get_client(self.client_id) else {
             sender.send_empty_ok_response().await?;

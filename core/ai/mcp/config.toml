@@ -52,3 +52,15 @@ create = true
 read = true
 update = true
 delete = true
+
+[telemetry]
+enabled = false
+service_name = "iggy-mcp"
+
+[telemetry.logs]
+transport = "grpc"
+endpoint = "http://localhost:4317"
+
+[telemetry.traces]
+transport = "grpc"
+endpoint = "http://localhost:4317"

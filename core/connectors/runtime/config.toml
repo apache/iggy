@@ -51,3 +51,15 @@ path = "local_state"
 [connectors]
 config_type = "local"
 config_dir = ""
+
+[telemetry]
+enabled = false
+service_name = "iggy-connectors"
+
+[telemetry.logs]
+transport = "grpc"
+endpoint = "http://localhost:4317"
+
+[telemetry.traces]
+transport = "grpc"
+endpoint = "http://localhost:4317"

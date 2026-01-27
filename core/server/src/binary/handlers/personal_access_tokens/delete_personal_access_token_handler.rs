@@ -22,12 +22,15 @@ use crate::binary::command::{
 use crate::binary::handlers::personal_access_tokens::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::shard::IggyShard;
+use crate::shard::transmission::frame::ShardResponse;
+use crate::shard::transmission::message::{
+    ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult,
+};
 use crate::state::command::EntryCommand;
 use crate::streaming::session::Session;
-use anyhow::Result;
 use err_trail::ErrContext;
 use iggy_common::delete_personal_access_token::DeletePersonalAccessToken;
-use iggy_common::{IggyError, SenderKind};
+use iggy_common::{Identifier, IggyError, SenderKind};
 use std::rc::Rc;
 use tracing::{debug, instrument};
 
@@ -49,32 +52,62 @@ impl ServerCommandHandler for DeletePersonalAccessToken {
         let token_name = self.name.clone();
         let user_id = session.get_user_id();
 
-        shard
-                .delete_personal_access_token(user_id, &self.name)
-                .error(|e: &IggyError| {format!(
-                    "{COMPONENT} (error: {e}) - failed to delete personal access token with name: {token_name}, user: {user_id}"
-                )})?;
-
-        // Broadcast the event to other shards
-        let event = crate::shard::transmission::event::ShardEvent::DeletedPersonalAccessToken {
-            user_id: session.get_user_id(),
-            name: self.name.clone(),
+        let request = ShardRequest {
+            stream_id: Identifier::default(),
+            topic_id: Identifier::default(),
+            partition_id: 0,
+            payload: ShardRequestPayload::DeletePersonalAccessToken {
+                user_id,
+                name: self.name.clone(),
+            },
         };
-        shard.broadcast_event_to_all_shards(event).await?;
 
-        shard
-            .state
-            .apply(
-                session.get_user_id(),
-                &EntryCommand::DeletePersonalAccessToken(DeletePersonalAccessToken {
-                    name: self.name,
-                }),
-            )
-            .await
-            .error(|e: &IggyError| {format!(
-                "{COMPONENT} (error: {e}) - failed to apply delete personal access token with name: {token_name}, session: {session}"
-            )})?;
-        sender.send_empty_ok_response().await?;
+        let message = ShardMessage::Request(request);
+        match shard.send_request_to_shard_or_recoil(None, message).await? {
+            ShardSendRequestResult::Recoil(message) => {
+                if let ShardMessage::Request(ShardRequest { payload, .. }) = message
+                    && let ShardRequestPayload::DeletePersonalAccessToken { name, .. } = payload
+                {
+                    shard.delete_personal_access_token(user_id, &name).error(
+                        |e: &IggyError| {
+                            format!(
+                                "{COMPONENT} (error: {e}) - failed to delete personal access token with name: {name}, user: {user_id}"
+                            )
+                        },
+                    )?;
+
+                    shard
+                        .state
+                        .apply(
+                            session.get_user_id(),
+                            &EntryCommand::DeletePersonalAccessToken(DeletePersonalAccessToken {
+                                name: self.name,
+                            }),
+                        )
+                        .await
+                        .error(|e: &IggyError| {
+                            format!(
+                                "{COMPONENT} (error: {e}) - failed to apply delete personal access token with name: {token_name}, session: {session}"
+                            )
+                        })?;
+
+                    sender.send_empty_ok_response().await?;
+                } else {
+                    unreachable!(
+                        "Expected a DeletePersonalAccessToken request inside of DeletePersonalAccessToken handler"
+                    );
+                }
+            }
+            ShardSendRequestResult::Response(response) => match response {
+                ShardResponse::DeletePersonalAccessTokenResponse => {
+                    sender.send_empty_ok_response().await?;
+                }
+                ShardResponse::ErrorResponse(err) => return Err(err),
+                _ => unreachable!(
+                    "Expected a DeletePersonalAccessTokenResponse inside of DeletePersonalAccessToken handler"
+                ),
+            },
+        }
         Ok(HandlerResult::Finished)
     }
 }

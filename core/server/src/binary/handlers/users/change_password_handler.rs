@@ -21,16 +21,17 @@ use crate::binary::command::{
 };
 use crate::binary::handlers::users::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
-
 use crate::shard::IggyShard;
-use crate::shard::transmission::event::ShardEvent;
+use crate::shard::transmission::frame::ShardResponse;
+use crate::shard::transmission::message::{
+    ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult,
+};
 use crate::state::command::EntryCommand;
 use crate::streaming::session::Session;
 use crate::streaming::utils::crypto;
-use anyhow::Result;
 use err_trail::ErrContext;
 use iggy_common::change_password::ChangePassword;
-use iggy_common::{IggyError, SenderKind};
+use iggy_common::{Identifier, IggyError, SenderKind};
 use std::rc::Rc;
 use tracing::info;
 use tracing::{debug, instrument};
@@ -54,50 +55,87 @@ impl ServerCommandHandler for ChangePassword {
         // Check if user is changing someone else's password
         let target_user = shard.get_user(&self.user_id)?;
         if target_user.id != session.get_user_id() {
-            shard
-                .permissioner
-                .borrow()
-                .change_password(session.get_user_id())?;
+            shard.metadata.perm_change_password(session.get_user_id())?;
         }
 
-        info!("Changing password for user with ID: {}...", self.user_id);
-        shard
-            .change_password(&self.user_id, &self.current_password, &self.new_password)
-            .error(|e: &IggyError| {
-                format!(
-                    "{COMPONENT} (error: {e}) - failed to change password for user_id: {}, session: {session}",
-                    self.user_id
-                )
-            })?;
-
-        info!("Changed password for user with ID: {}.", self.user_id);
-
-        let event = ShardEvent::ChangedPassword {
-            user_id: self.user_id.clone(),
-            current_password: self.current_password.clone(),
-            new_password: self.new_password.clone(),
+        let user_id_for_log = self.user_id.clone();
+        let new_password_hash = crypto::hash_password(&self.new_password);
+        let request = ShardRequest {
+            stream_id: Identifier::default(),
+            topic_id: Identifier::default(),
+            partition_id: 0,
+            payload: ShardRequestPayload::ChangePassword {
+                session_user_id: session.get_user_id(),
+                user_id: self.user_id.clone(),
+                current_password: self.current_password.clone(),
+                new_password: self.new_password.clone(),
+            },
         };
-        shard.broadcast_event_to_all_shards(event).await?;
 
-        // For the security of the system, we hash the password before storing it in metadata.
-        shard
-            .state
-            .apply(
-                session.get_user_id(),
-                &EntryCommand::ChangePassword(ChangePassword {
-                    user_id: self.user_id.to_owned(),
-                    current_password: "".into(),
-                    new_password: crypto::hash_password(&self.new_password),
-                }),
-            )
-            .await
-            .error(|e: &IggyError| {
-                format!(
-                    "{COMPONENT} (error: {e}) - failed to apply change password for user_id: {}, session: {session}",
-                    self.user_id
-                )
-            })?;
-        sender.send_empty_ok_response().await?;
+        let message = ShardMessage::Request(request);
+        match shard.send_request_to_shard_or_recoil(None, message).await? {
+            ShardSendRequestResult::Recoil(message) => {
+                if let ShardMessage::Request(ShardRequest { payload, .. }) = message
+                    && let ShardRequestPayload::ChangePassword {
+                        user_id,
+                        current_password,
+                        new_password,
+                        ..
+                    } = payload
+                {
+                    info!("Changing password for user with ID: {}...", user_id);
+
+                    let _user_guard = shard.fs_locks.user_lock.lock().await;
+                    shard
+                        .change_password(&user_id, &current_password, &new_password)
+                        .error(|e: &IggyError| {
+                            format!(
+                                "{COMPONENT} (error: {e}) - failed to change password for user_id: {}, session: {session}",
+                                user_id
+                            )
+                        })?;
+
+                    info!("Changed password for user with ID: {}.", user_id_for_log);
+
+                    shard
+                        .state
+                        .apply(
+                            session.get_user_id(),
+                            &EntryCommand::ChangePassword(ChangePassword {
+                                user_id: user_id_for_log.clone(),
+                                current_password: "".into(),
+                                new_password: new_password_hash.clone(),
+                            }),
+                        )
+                        .await
+                        .error(|e: &IggyError| {
+                            format!(
+                                "{COMPONENT} (error: {e}) - failed to apply change password for user_id: {}, session: {session}",
+                                user_id_for_log
+                            )
+                        })?;
+
+                    sender.send_empty_ok_response().await?;
+                } else {
+                    unreachable!(
+                        "Expected a ChangePassword request inside of ChangePassword handler, impossible state"
+                    );
+                }
+            }
+            ShardSendRequestResult::Response(response) => match response {
+                ShardResponse::ChangePasswordResponse => {
+                    info!("Changed password for user with ID: {}.", user_id_for_log);
+                    sender.send_empty_ok_response().await?;
+                }
+                ShardResponse::ErrorResponse(err) => {
+                    return Err(err);
+                }
+                _ => unreachable!(
+                    "Expected a ChangePasswordResponse inside of ChangePassword handler, impossible state"
+                ),
+            },
+        }
+
         Ok(HandlerResult::Finished)
     }
 }

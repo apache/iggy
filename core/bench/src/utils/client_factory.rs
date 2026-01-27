@@ -18,13 +18,164 @@
 
 use crate::args::common::IggyBenchArgs;
 use crate::args::transport::BenchmarkTransportCommand;
-use iggy::prelude::TransportProtocol;
-use integration::http_client::HttpClientFactory;
-use integration::quic_client::QuicClientFactory;
-use integration::tcp_client::TcpClientFactory;
-use integration::test_server::ClientFactory;
-use integration::websocket_client::WebSocketClientFactory;
+use async_trait::async_trait;
+use iggy::http::http_client::HttpClient;
+use iggy::prelude::{
+    Client, ClientWrapper, DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME, HttpClientConfig,
+    IdentityInfo, IggyClient, QuicClientConfig, TcpClient, TcpClientConfig, TransportProtocol,
+    UserClient, WebSocketClientConfig,
+};
+use iggy::quic::quic_client::QuicClient;
+use iggy::websocket::websocket_client::WebSocketClient;
 use std::sync::Arc;
+
+#[async_trait]
+pub trait ClientFactory: Sync + Send {
+    async fn create_client(&self) -> ClientWrapper;
+    fn transport(&self) -> TransportProtocol;
+    fn server_addr(&self) -> String;
+}
+
+pub async fn login_root(client: &IggyClient) -> IdentityInfo {
+    client
+        .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+        .await
+        .unwrap()
+}
+
+#[derive(Debug, Clone)]
+pub struct HttpClientFactory {
+    pub server_addr: String,
+}
+
+#[async_trait]
+impl ClientFactory for HttpClientFactory {
+    async fn create_client(&self) -> ClientWrapper {
+        let config = HttpClientConfig {
+            api_url: format!("http://{}", self.server_addr.clone()),
+            ..HttpClientConfig::default()
+        };
+        let client = HttpClient::create(Arc::new(config)).unwrap();
+        ClientWrapper::Http(client)
+    }
+
+    fn transport(&self) -> TransportProtocol {
+        TransportProtocol::Http
+    }
+
+    fn server_addr(&self) -> String {
+        self.server_addr.clone()
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TcpClientFactory {
+    pub server_addr: String,
+    pub nodelay: bool,
+    pub tls_enabled: bool,
+    pub tls_domain: String,
+    pub tls_ca_file: Option<String>,
+    pub tls_validate_certificate: bool,
+}
+
+#[async_trait]
+impl ClientFactory for TcpClientFactory {
+    async fn create_client(&self) -> ClientWrapper {
+        let config = TcpClientConfig {
+            server_address: self.server_addr.clone(),
+            nodelay: self.nodelay,
+            tls_enabled: self.tls_enabled,
+            tls_domain: self.tls_domain.clone(),
+            tls_ca_file: self.tls_ca_file.clone(),
+            tls_validate_certificate: self.tls_validate_certificate,
+            ..TcpClientConfig::default()
+        };
+        let client = TcpClient::create(Arc::new(config)).unwrap_or_else(|e| {
+            panic!(
+                "Failed to create TcpClient, iggy-server has address {}, error: {:?}",
+                self.server_addr, e
+            )
+        });
+        Client::connect(&client).await.unwrap_or_else(|e| {
+            if self.tls_enabled {
+                panic!(
+                    "Failed to connect to iggy-server at {} with TLS enabled, error: {:?}\n\
+                    Hint: Make sure the server is started with TLS enabled and self-signed certificate:\n\
+                    IGGY_TCP_TLS_ENABLED=true IGGY_TCP_TLS_SELF_SIGNED=true\n
+                    or start iggy-bench with relevant tcp tls arguments: --tls --tls-domain <domain> --tls-ca-file <ca_file>\n",
+                    self.server_addr, e
+                )
+            } else {
+                panic!(
+                    "Failed to connect to iggy-server at {}, error: {:?}",
+                    self.server_addr, e
+                )
+            }
+        });
+        ClientWrapper::Tcp(client)
+    }
+
+    fn transport(&self) -> TransportProtocol {
+        TransportProtocol::Tcp
+    }
+
+    fn server_addr(&self) -> String {
+        self.server_addr.clone()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct QuicClientFactory {
+    pub server_addr: String,
+}
+
+#[async_trait]
+impl ClientFactory for QuicClientFactory {
+    async fn create_client(&self) -> ClientWrapper {
+        let config = QuicClientConfig {
+            server_address: self.server_addr.clone(),
+            max_idle_timeout: 2_000_000,
+            ..QuicClientConfig::default()
+        };
+        let client = QuicClient::create(Arc::new(config)).unwrap();
+        Client::connect(&client).await.unwrap();
+        ClientWrapper::Quic(client)
+    }
+
+    fn transport(&self) -> TransportProtocol {
+        TransportProtocol::Quic
+    }
+
+    fn server_addr(&self) -> String {
+        self.server_addr.clone()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct WebSocketClientFactory {
+    pub server_addr: String,
+}
+
+#[async_trait]
+impl ClientFactory for WebSocketClientFactory {
+    async fn create_client(&self) -> ClientWrapper {
+        let config = WebSocketClientConfig {
+            server_address: self.server_addr.clone(),
+            ..WebSocketClientConfig::default()
+        };
+        let client = WebSocketClient::create(Arc::new(config)).unwrap();
+        Client::connect(&client).await.unwrap();
+        ClientWrapper::WebSocket(client)
+    }
+
+    fn transport(&self) -> TransportProtocol {
+        TransportProtocol::WebSocket
+    }
+
+    fn server_addr(&self) -> String {
+        self.server_addr.clone()
+    }
+}
 
 pub fn create_client_factory(args: &IggyBenchArgs) -> Arc<dyn ClientFactory> {
     match &args.transport() {

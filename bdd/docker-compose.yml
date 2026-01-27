@@ -28,7 +28,7 @@ services:
         PREBUILT_IGGY_CLI: ${IGGY_CLI_PATH:-target/debug/iggy}
         LIBC: glibc
         PROFILE: debug
-    command: ["--fresh", "--with-default-root-credentials"]
+    command: [ "--fresh", "--with-default-root-credentials" ]
     cap_add:
       - SYS_NICE
     security_opt:
@@ -38,7 +38,7 @@ services:
         soft: -1
         hard: -1
     healthcheck:
-      test: ["CMD", "/usr/local/bin/iggy", "--tcp-server-address", "127.0.0.1:8090", "ping"]
+      test: [ "CMD", "/usr/local/bin/iggy", "--tcp-server-address", "127.0.0.1:8090", "ping" ]
       interval: 20s
       timeout: 3s
       retries: 30
@@ -68,7 +68,7 @@ services:
         LIBC: glibc
         PROFILE: debug
     # Leader runs without --follower flag
-    command: ["--fresh", "--with-default-root-credentials"]
+    command: [ "--fresh", "--with-default-root-credentials" ]
     cap_add:
       - SYS_NICE
     security_opt:
@@ -78,7 +78,7 @@ services:
         soft: -1
         hard: -1
     healthcheck:
-      test: ["CMD", "/usr/local/bin/iggy", "--tcp-server-address", "127.0.0.1:8091", "ping"]
+      test: [ "CMD", "/usr/local/bin/iggy", "--tcp-server-address", "127.0.0.1:8091", "ping" ]
       interval: 20s
       timeout: 3s
       retries: 30
@@ -94,7 +94,6 @@ services:
       # Cluster configuration
       - IGGY_CLUSTER_ENABLED=true
       - IGGY_CLUSTER_NAME=test-cluster
-      - IGGY_CLUSTER_ID=1
       # Current node identity
       - IGGY_CLUSTER_NODE_CURRENT_NAME=leader-node
       - IGGY_CLUSTER_NODE_CURRENT_IP=iggy-leader
@@ -123,7 +122,7 @@ services:
         LIBC: glibc
         PROFILE: debug
     # Follower runs with --follower flag
-    command: ["--fresh", "--with-default-root-credentials", "--follower"]
+    command: [ "--fresh", "--with-default-root-credentials", "--follower" ]
     cap_add:
       - SYS_NICE
     security_opt:
@@ -133,7 +132,7 @@ services:
         soft: -1
         hard: -1
     healthcheck:
-      test: ["CMD", "/usr/local/bin/iggy", "--tcp-server-address", "127.0.0.1:8092", "ping"]
+      test: [ "CMD", "/usr/local/bin/iggy", "--tcp-server-address", "127.0.0.1:8092", "ping" ]
       interval: 20s
       timeout: 3s
       retries: 30
@@ -149,7 +148,6 @@ services:
       # Cluster configuration (same as leader)
       - IGGY_CLUSTER_ENABLED=true
       - IGGY_CLUSTER_NAME=test-cluster
-      - IGGY_CLUSTER_ID=1
       # Current node identity (different from leader)
       - IGGY_CLUSTER_NODE_CURRENT_NAME=follower-node
       - IGGY_CLUSTER_NODE_CURRENT_IP=iggy-follower
@@ -188,15 +186,7 @@ services:
     volumes:
       - ./scenarios/basic_messaging.feature:/app/features/basic_messaging.feature
       - ./scenarios/leader_redirection.feature:/app/features/leader_redirection.feature
-    command:
-      [
-        "cargo",
-        "test",
-        "-p",
-        "bdd",
-        "--features",
-        "bdd",
-      ]
+    command: [ "cargo", "test", "-p", "bdd", "--features", "bdd" ]
     networks:
       - iggy-bdd-network
 
@@ -213,7 +203,7 @@ services:
     volumes:
       - ./scenarios/basic_messaging.feature:/app/features/basic_messaging.feature
     working_dir: /app
-    command: ["pytest", "tests/", "-v"]
+    command: [ "pytest", "tests/", "-v" ]
     networks:
       - iggy-bdd-network
 
@@ -229,7 +219,7 @@ services:
       - IGGY_TCP_ADDRESS=iggy-server:8090
     volumes:
       - ./scenarios/basic_messaging.feature:/app/features/basic_messaging.feature
-    command: ["go", "test", "-v", "./..."]
+    command: [ "go", "test", "-v", "./..." ]
     networks:
       - iggy-bdd-network
 
@@ -244,7 +234,7 @@ services:
       - IGGY_ROOT_USERNAME=iggy
       - IGGY_ROOT_PASSWORD=iggy
       - IGGY_TCP_ADDRESS=iggy-server:8090
-    command: ["npm", "run", "test:bdd"]
+    command: [ "npm", "run", "test:bdd" ]
     networks:
       - iggy-bdd-network
 
@@ -258,7 +248,7 @@ services:
       - IGGY_ROOT_USERNAME=iggy
       - IGGY_ROOT_PASSWORD=iggy
       - IGGY_TCP_ADDRESS=iggy-server:8090
-    command: ["dotnet", "test"]
+    command: [ "dotnet", "test" ]
     networks:
       - iggy-bdd-network
 
@@ -275,7 +265,7 @@ services:
       - IGGY_TCP_ADDRESS=iggy-server:8090
     volumes:
       - ./scenarios/basic_messaging.feature:/app/features/basic_messaging.feature
-    command: ["gradle", "--no-daemon", "test"]
+    command: [ "gradle", "--no-daemon", "test" ]
     networks:
       - iggy-bdd-network
 

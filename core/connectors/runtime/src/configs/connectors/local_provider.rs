@@ -22,12 +22,12 @@ use crate::configs::connectors::{
     ConnectorsConfigProvider, CreateSinkConfig, CreateSourceConfig, SinkConfig, SourceConfig,
 };
 use crate::error::RuntimeError;
+use ::configs::{ConfigProvider, FileConfigProvider, TypedEnvProvider};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use figment::value::Dict;
 use figment::{Metadata, Profile, Provider};
-use iggy_common::{ConfigProvider, CustomEnvProvider, FileConfigProvider};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
@@ -338,7 +338,7 @@ impl<S: ProviderState> LocalConnectorsConfigProvider<S> {
 
             let field_path = &env_key_upper[prefix.len()..];
             let field_name = field_path.to_lowercase();
-            let parsed_value = iggy_common::parse_env_value_to_json(&env_value);
+            let parsed_value = ::configs::parse_env_value_to_json(&env_value);
 
             let config = plugin_config.get_or_insert_with(|| serde_json::json!({}));
             if let serde_json::Value::Object(map) = config {
@@ -783,9 +783,15 @@ impl ConnectorsConfigProvider for LocalConnectorsConfigProvider<Initialized> {
 }
 
 #[derive(Debug, Clone)]
-pub struct ConnectorEnvProvider {
-    connector_name: String,
-    provider: CustomEnvProvider<ConnectorConfig>,
+pub enum ConnectorEnvProvider {
+    Sink {
+        connector_name: String,
+        provider: TypedEnvProvider<SinkConfig>,
+    },
+    Source {
+        connector_name: String,
+        provider: TypedEnvProvider<SourceConfig>,
+    },
 }
 
 impl ConnectorEnvProvider {
@@ -793,24 +799,38 @@ impl ConnectorEnvProvider {
         let connector_type = base_config.connector_type().to_uppercase();
         let key = base_config.key().to_uppercase();
         let prefix = format!("IGGY_CONNECTORS_{}_{}_", connector_type, key);
-        Self {
-            connector_name: base_config.key().to_owned(),
-            provider: CustomEnvProvider::new(&prefix, &[]),
+        let connector_name = base_config.key().to_owned();
+
+        match base_config {
+            BaseConnectorConfig::Sink { .. } => Self::Sink {
+                connector_name,
+                provider: TypedEnvProvider::with_runtime_prefix(&prefix, &[]),
+            },
+            BaseConnectorConfig::Source { .. } => Self::Source {
+                connector_name,
+                provider: TypedEnvProvider::with_runtime_prefix(&prefix, &[]),
+            },
         }
     }
 }
 
 impl Provider for ConnectorEnvProvider {
     fn metadata(&self) -> Metadata {
-        Metadata::named(format!("iggy-connectors-{}-config", self.connector_name))
+        let name = match self {
+            Self::Sink { connector_name, .. } => connector_name,
+            Self::Source { connector_name, .. } => connector_name,
+        };
+        Metadata::named(format!("iggy-connectors-{}-config", name))
     }
 
     fn data(&self) -> Result<figment::value::Map<Profile, Dict>, figment::Error> {
-        self.provider.deserialize().map_err(|_| {
-            figment::Error::from(format!(
-                "Cannot deserialize environment variables for connector config {}",
-                self.connector_name
-            ))
-        })
+        match self {
+            Self::Sink { provider, .. } => provider
+                .deserialize_with_runtime_prefix()
+                .map_err(|e| figment::Error::from(format!("Failed to deserialize env vars: {e}"))),
+            Self::Source { provider, .. } => provider
+                .deserialize_with_runtime_prefix()
+                .map_err(|e| figment::Error::from(format!("Failed to deserialize env vars: {e}"))),
+        }
     }
 }

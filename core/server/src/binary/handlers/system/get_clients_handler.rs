@@ -43,10 +43,7 @@ impl ServerCommandHandler for GetClients {
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
         shard.ensure_authenticated(session)?;
-        shard
-            .permissioner
-            .borrow()
-            .get_clients(session.get_user_id())?;
+        shard.metadata.perm_get_clients(session.get_user_id())?;
 
         let clients = shard.get_clients();
         let clients = mapper::map_clients(clients).await;

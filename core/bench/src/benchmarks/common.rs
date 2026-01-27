@@ -17,6 +17,7 @@
  */
 
 use super::{CONSUMER_GROUP_BASE_ID, CONSUMER_GROUP_NAME_PREFIX};
+use crate::utils::{ClientFactory, login_root};
 use crate::{
     actors::{
         consumer::typed_benchmark_consumer::TypedBenchmarkConsumer,
@@ -28,7 +29,6 @@ use crate::{
 };
 use bench_report::{benchmark_kind::BenchmarkKind, individual_metrics::BenchmarkIndividualMetrics};
 use iggy::prelude::*;
-use integration::test_server::{ClientFactory, login_root};
 use std::{future::Future, sync::Arc};
 use tracing::{error, info};
 

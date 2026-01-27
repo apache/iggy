@@ -81,7 +81,7 @@ macro_rules! define_server_command_enum {
                 }
             }
 
-            /// Validate the command by delegating to the inner command’s implementation.
+            /// Validate the command by delegating to the inner command's implementation.
             pub fn validate(&self) -> Result<(), IggyError> {
                 match self {
                     $(

@@ -21,12 +21,9 @@ use iggy_common::{IggyError, Stats};
 use crate::{
     binary::handlers::messages::poll_messages_handler::IggyPollMetadata,
     shard::transmission::message::ShardMessage,
-    streaming::{
-        segments::IggyMessagesBatchSet, streams::stream, topics::topic, users::user::User,
-    },
+    streaming::{segments::IggyMessagesBatchSet, users::user::User},
 };
 
-#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum ShardResponse {
     PollMessages((IggyPollMetadata, IggyMessagesBatchSet)),
@@ -34,15 +31,30 @@ pub enum ShardResponse {
     FlushUnsavedBuffer,
     DeleteSegments,
     Event,
-    CreateStreamResponse(stream::Stream),
-    DeleteStreamResponse(stream::Stream),
-    CreateTopicResponse(topic::Topic),
+    CreateStreamResponse(usize),
+    DeleteStreamResponse(usize),
+    CreateTopicResponse(usize),
     UpdateTopicResponse,
-    DeleteTopicResponse(topic::Topic),
+    DeleteTopicResponse(usize),
     CreateUserResponse(User),
     DeletedUser(User),
     GetStatsResponse(Stats),
+    CreatePartitionsResponse(Vec<usize>),
+    DeletePartitionsResponse(Vec<usize>),
+    UpdateStreamResponse,
     SocketTransferResponse,
+    UpdatePermissionsResponse,
+    ChangePasswordResponse,
+    UpdateUserResponse(User),
+    CreateConsumerGroupResponse(usize),
+    JoinConsumerGroupResponse,
+    LeaveConsumerGroupResponse,
+    DeleteConsumerGroupResponse,
+    CreatePersonalAccessTokenResponse(iggy_common::PersonalAccessToken, String),
+    DeletePersonalAccessTokenResponse,
+    LeaveConsumerGroupMetadataOnlyResponse,
+    PurgeStreamResponse,
+    PurgeTopicResponse,
     ErrorResponse(IggyError),
 }
 

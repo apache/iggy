@@ -16,8 +16,8 @@
 // under the License.
 
 use crate::metadata::{StreamId, StreamMeta, UserId, UserMeta};
-use ahash::AHashMap;
-use iggy_common::PersonalAccessToken;
+use ahash::{AHashMap, AHashSet};
+use iggy_common::{GlobalPermissions, PersonalAccessToken, StreamPermissions};
 use slab::Slab;
 use std::sync::Arc;
 
@@ -35,6 +35,16 @@ pub struct InnerMetadata {
 
     /// user_id -> (token_hash -> PAT)
     pub personal_access_tokens: AHashMap<UserId, AHashMap<Arc<str>, PersonalAccessToken>>,
+
+    // Permission indexes (auto-maintained by absorb)
+    pub users_global_permissions: AHashMap<UserId, GlobalPermissions>,
+    pub users_stream_permissions: AHashMap<(UserId, StreamId), StreamPermissions>,
+
+    // Hot-path optimizations for message send/poll
+    pub users_can_poll_all_streams: AHashSet<UserId>,
+    pub users_can_send_all_streams: AHashSet<UserId>,
+    pub users_can_poll_stream: AHashSet<(UserId, StreamId)>,
+    pub users_can_send_stream: AHashSet<(UserId, StreamId)>,
 }
 
 impl InnerMetadata {

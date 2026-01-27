@@ -71,9 +71,8 @@ async fn get_stats(
     state
         .shard
         .shard()
-        .permissioner
-        .borrow()
-        .get_stats(identity.user_id)?;
+        .metadata
+        .perm_get_stats(identity.user_id)?;
     let stats_future = SendWrapper::new(state.shard.shard().get_stats());
     let stats = stats_future.await.error(|e: &IggyError| {
         format!(
@@ -101,9 +100,8 @@ async fn get_client(
     state
         .shard
         .shard()
-        .permissioner
-        .borrow()
-        .get_client(identity.user_id)?;
+        .metadata
+        .perm_get_client(identity.user_id)?;
     let Some(client) = state.shard.shard().get_client(client_id) else {
         return Err(CustomError::ResourceNotFound);
     };
@@ -120,9 +118,8 @@ async fn get_clients(
     state
         .shard
         .shard()
-        .permissioner
-        .borrow()
-        .get_clients(identity.user_id)?;
+        .metadata
+        .perm_get_clients(identity.user_id)?;
     let clients = state.shard.shard().get_clients();
     let clients = mapper::map_clients(&clients);
     Ok(Json(clients))

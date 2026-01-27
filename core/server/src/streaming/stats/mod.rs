@@ -223,6 +223,7 @@ pub struct PartitionStats {
     messages_count: AtomicU64,
     size_bytes: AtomicU64,
     segments_count: AtomicU32,
+    current_offset: AtomicU64,
 }
 
 impl PartitionStats {
@@ -232,6 +233,7 @@ impl PartitionStats {
             messages_count: AtomicU64::new(0),
             size_bytes: AtomicU64::new(0),
             segments_count: AtomicU32::new(0),
+            current_offset: AtomicU64::new(0),
         }
     }
 
@@ -309,6 +311,14 @@ impl PartitionStats {
         self.segments_count.load(Ordering::Relaxed)
     }
 
+    pub fn current_offset(&self) -> u64 {
+        self.current_offset.load(Ordering::Relaxed)
+    }
+
+    pub fn set_current_offset(&self, offset: u64) {
+        self.current_offset.store(offset, Ordering::Relaxed);
+    }
+
     pub fn zero_out_parent_size_bytes(&self) {
         self.parent.zero_out_size_bytes();
     }
@@ -340,10 +350,15 @@ impl PartitionStats {
         self.zero_out_parent_segments_count();
     }
 
+    pub fn zero_out_current_offset(&self) {
+        self.current_offset.store(0, Ordering::Relaxed);
+    }
+
     pub fn zero_out_all(&self) {
         self.zero_out_size_bytes();
         self.zero_out_messages_count();
         self.zero_out_segments_count();
+        self.zero_out_current_offset();
         self.zero_out_parent_all();
     }
 }

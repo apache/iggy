@@ -88,48 +88,6 @@ impl MessagesReader {
         self.file_path.clone()
     }
 
-    /// Loads and returns all message IDs from the messages file.
-    /// Note that this function does not use the pool, as the messages are not cached.
-    /// This is expected - this method is called at startup and we want to preserve
-    /// memory pool usage.
-    pub async fn load_all_message_ids_from_disk(
-        &self,
-        indexes: IggyIndexesMut,
-        messages_count: u32,
-    ) -> Result<Vec<u128>, IggyError> {
-        let file_size = self.file_size();
-        if file_size == 0 {
-            return Ok(vec![]);
-        }
-
-        let messages_bytes = match self.read_at(0, file_size, false).await {
-            Ok(buf) => buf,
-            Err(e) if e.kind() == ErrorKind::UnexpectedEof => {
-                return Ok(vec![]);
-            }
-            Err(e) => {
-                error!(
-                    "Error reading {messages_count} messages at position 0 in file {} of size {}: {e}",
-                    self.file_path, file_size
-                );
-                return Err(IggyError::CannotReadMessage);
-            }
-        };
-
-        let messages = IggyMessagesBatchMut::from_indexes_and_messages(
-            messages_count,
-            indexes,
-            messages_bytes,
-        );
-        let mut ids = Vec::with_capacity(messages_count as usize);
-
-        for message in messages.iter() {
-            ids.push(message.header().id());
-        }
-
-        Ok(ids)
-    }
-
     /// Loads and returns a batch of messages from the messages file.
     pub async fn load_messages_from_disk(
         &self,
@@ -163,7 +121,6 @@ impl MessagesReader {
         };
 
         Ok(IggyMessagesBatchMut::from_indexes_and_messages(
-            messages_count,
             indexes,
             messages_bytes,
         ))

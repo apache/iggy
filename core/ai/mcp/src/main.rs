@@ -1,4 +1,5 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
  * regarding copyright ownership.  The ASF licenses this file
@@ -16,23 +17,25 @@
  * under the License.
  */
 
+use ::configs::ConfigProvider;
 use configs::{McpServerConfig, McpTransport};
 use dotenvy::dotenv;
 use error::McpRuntimeError;
 use figlet_rs::FIGfont;
 use iggy::prelude::{Client, Identifier};
-use iggy_common::ConfigProvider;
 use rmcp::{ServiceExt, model::ErrorData, transport::stdio};
 use service::IggyService;
 use std::{env, sync::Arc};
 use tracing::{error, info};
-use tracing_subscriber::{EnvFilter, Registry, layer::SubscriberExt, util::SubscriberInitExt};
 
 mod api;
 mod configs;
 mod error;
+mod log;
 mod service;
 mod stream;
+
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const DEFAULT_CONFIG_PATH: &str = "core/ai/mcp/config.toml";
 
@@ -62,18 +65,7 @@ async fn main() -> Result<(), McpRuntimeError> {
         .expect("Failed to load configuration");
 
     let transport = config.transport;
-    if transport == McpTransport::Stdio {
-        tracing_subscriber::fmt()
-            .with_env_filter(EnvFilter::try_from_default_env().unwrap_or(EnvFilter::new("DEBUG")))
-            .with_writer(std::io::stderr)
-            .with_ansi(false)
-            .init();
-    } else {
-        Registry::default()
-            .with(tracing_subscriber::fmt::layer())
-            .with(EnvFilter::try_from_default_env().unwrap_or(EnvFilter::new("INFO")))
-            .init();
-    }
+    log::init_logging(&config.telemetry, transport, VERSION);
 
     info!("Starting Iggy MCP Server, transport: {transport}...");
 

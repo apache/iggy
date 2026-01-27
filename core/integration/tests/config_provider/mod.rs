@@ -17,7 +17,7 @@
  * under the License.
  */
 
-use iggy_common::ConfigProvider;
+use configs::ConfigProvider;
 use integration::file::get_root_path;
 use serial_test::serial;
 use server::configs::server::ServerConfig;
@@ -44,13 +44,13 @@ async fn validate_config_env_override() {
         );
     }
 
-    let config_path = get_root_path().join("../configs/server.toml");
+    let config_path = get_root_path().join("../server/config.toml");
     let file_config_provider =
         ServerConfig::config_provider(&config_path.as_path().display().to_string());
     let config: ServerConfig = file_config_provider
         .load_config()
         .await
-        .expect("Failed to load server.toml config");
+        .expect("Failed to load config.toml config");
 
     assert_eq!(config.http.enabled, expected_http);
     assert_eq!(config.tcp.enabled, expected_tcp);
@@ -86,13 +86,13 @@ async fn validate_socket_override() {
         );
     }
 
-    let config_path = get_root_path().join("../configs/server.toml");
+    let config_path = get_root_path().join("../server/config.toml");
     let file_config_provider =
         ServerConfig::config_provider(&config_path.as_path().display().to_string());
     let config: ServerConfig = file_config_provider
         .load_config()
         .await
-        .expect("Failed to load server.toml config with socket override");
+        .expect("Failed to load config.toml config with socket override");
 
     assert!(config.tcp.socket.override_defaults);
     // Verify the buffer sizes match the expected byte counts
@@ -115,13 +115,13 @@ async fn validate_socket_override() {
 #[serial]
 #[tokio::test]
 async fn validate_socket_no_override() {
-    let config_path = get_root_path().join("../configs/server.toml");
+    let config_path = get_root_path().join("../server/config.toml");
     let file_config_provider =
         ServerConfig::config_provider(&config_path.as_path().display().to_string());
     let config: ServerConfig = file_config_provider
         .load_config()
         .await
-        .expect("Failed to load server.toml config without socket override");
+        .expect("Failed to load config.toml config without socket override");
 
     assert!(!config.tcp.socket.override_defaults);
 }
@@ -201,13 +201,13 @@ async fn validate_cluster_config_env_override() {
         );
     }
 
-    let config_path = get_root_path().join("../configs/server.toml");
+    let config_path = get_root_path().join("../server/config.toml");
     let file_config_provider =
         ServerConfig::config_provider(&config_path.as_path().display().to_string());
     let config: ServerConfig = file_config_provider
         .load_config()
         .await
-        .expect("Failed to load server.toml config with cluster env overrides");
+        .expect("Failed to load config.toml config with cluster env overrides");
 
     // Verify cluster configuration
     assert_eq!(config.cluster.enabled, expected_cluster_enabled);
@@ -270,7 +270,6 @@ async fn validate_cluster_config_env_override() {
     unsafe {
         // Clean up environment variables
         env::remove_var("IGGY_CLUSTER_ENABLED");
-        env::remove_var("IGGY_CLUSTER_ID");
         env::remove_var("IGGY_CLUSTER_NAME");
         env::remove_var("IGGY_CLUSTER_NODE_CURRENT_NAME");
 
@@ -392,13 +391,13 @@ async fn validate_four_node_cluster_config_env_override() {
         // IGGY_CLUSTER_NODE_OTHERS_2_PORTS_WEBSOCKET is NOT set - should use default (8092)
     }
 
-    let config_path = get_root_path().join("../configs/server.toml");
+    let config_path = get_root_path().join("../server/config.toml");
     let file_config_provider =
         ServerConfig::config_provider(&config_path.as_path().display().to_string());
     let config: ServerConfig = file_config_provider
         .load_config()
         .await
-        .expect("Failed to load server.toml config with 4-node cluster env overrides");
+        .expect("Failed to load config.toml config with 4-node cluster env overrides");
 
     // Verify cluster configuration
     assert_eq!(config.cluster.enabled, expected_cluster_enabled);

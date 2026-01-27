@@ -23,7 +23,6 @@ use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
 use crate::shard::IggyShard;
 use crate::streaming::session::Session;
-use anyhow::Result;
 use iggy_common::IggyError;
 use iggy_common::SenderKind;
 use iggy_common::get_consumer_group::GetConsumerGroup;
@@ -44,33 +43,28 @@ impl ServerCommandHandler for GetConsumerGroup {
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
         shard.ensure_authenticated(session)?;
-        let Ok((stream_id, topic_id)) = shard.resolve_topic_id(&self.stream_id, &self.topic_id)
+        let Ok((stream_id, topic_id, numeric_group_id)) =
+            shard.resolve_consumer_group_id(&self.stream_id, &self.topic_id, &self.group_id)
         else {
             sender.send_empty_ok_response().await?;
             return Ok(HandlerResult::Finished);
         };
         if shard
-            .ensure_consumer_group_exists(&self.stream_id, &self.topic_id, &self.group_id)
+            .metadata
+            .perm_get_consumer_group(session.get_user_id(), stream_id, topic_id)
             .is_err()
         {
             sender.send_empty_ok_response().await?;
             return Ok(HandlerResult::Finished);
         }
-        if shard
-            .permissioner
-            .borrow()
-            .get_consumer_group(session.get_user_id(), stream_id, topic_id)
-            .is_err()
-        {
-            sender.send_empty_ok_response().await?;
-            return Ok(HandlerResult::Finished);
-        }
-        let consumer_group = shard.streams.with_consumer_group_by_id(
-            &self.stream_id,
-            &self.topic_id,
-            &self.group_id,
-            |(root, members)| mapper::map_consumer_group(root, members),
-        );
+
+        let consumer_group = shard
+            .metadata
+            .get_consumer_group(stream_id, topic_id, numeric_group_id)
+            .map(|cg| mapper::map_consumer_group_from_meta(&cg))
+            .ok_or_else(|| {
+                IggyError::ConsumerGroupIdNotFound(self.group_id.clone(), self.topic_id.clone())
+            })?;
         sender.send_ok_response(&consumer_group).await?;
         Ok(HandlerResult::Finished)
     }

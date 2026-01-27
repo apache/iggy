@@ -185,6 +185,7 @@ impl ProducerCore {
         messages: &mut [IggyMessage],
     ) -> Result<(), IggyError> {
         let client = self.client.read().await;
+
         let Some(max_retries) = self.send_retries_count else {
             return client
                 .send_messages(stream, topic, partitioning, messages)
@@ -197,25 +198,10 @@ impl ProducerCore {
                 .await;
         }
 
-        let mut timer = if let Some(interval) = self.send_retries_interval {
-            let mut timer = tokio::time::interval(interval.get_duration());
-            timer.tick().await;
-            Some(timer)
-        } else {
-            None
-        };
-
-        self.wait_until_connected(max_retries, stream, topic, &mut timer)
+        self.wait_until_connected(max_retries, stream, topic)
             .await?;
-        self.send_with_retries(
-            max_retries,
-            stream,
-            topic,
-            partitioning,
-            messages,
-            &mut timer,
-        )
-        .await
+        self.send_with_retries(&client, max_retries, stream, topic, partitioning, messages)
+            .await
     }
 
     async fn wait_until_connected(
@@ -223,9 +209,10 @@ impl ProducerCore {
         max_retries: u32,
         stream: &Identifier,
         topic: &Identifier,
-        timer: &mut Option<Interval>,
     ) -> Result<(), IggyError> {
         let mut retries = 0;
+        let mut timer: Option<Interval> = None;
+
         while !self.can_send.load(ORDERING) {
             retries += 1;
             if retries > max_retries {
@@ -241,7 +228,9 @@ impl ProducerCore {
                  but the client is disconnected. Retrying {retries}/{max_retries}..."
             );
 
-            if let Some(timer) = timer.as_mut() {
+            if let Some(interval) = self.send_retries_interval {
+                let timer =
+                    timer.get_or_insert_with(|| tokio::time::interval(interval.get_duration()));
                 trace!(
                     "Waiting for the next retry to send messages to topic: {topic}, \
                      stream: {stream} for disconnected client..."
@@ -254,15 +243,16 @@ impl ProducerCore {
 
     async fn send_with_retries(
         &self,
+        client: &ClientWrapper,
         max_retries: u32,
         stream: &Identifier,
         topic: &Identifier,
         partitioning: &Arc<Partitioning>,
         messages: &mut [IggyMessage],
-        timer: &mut Option<Interval>,
     ) -> Result<(), IggyError> {
-        let client = self.client.read().await;
         let mut retries = 0;
+        let mut timer: Option<Interval> = None;
+
         loop {
             match client
                 .send_messages(stream, topic, partitioning, messages)
@@ -284,12 +274,14 @@ impl ProducerCore {
                          {error} Retrying {retries}/{max_retries}..."
                     );
 
-                    if let Some(t) = timer.as_mut() {
+                    if let Some(interval) = self.send_retries_interval {
+                        let timer = timer
+                            .get_or_insert_with(|| tokio::time::interval(interval.get_duration()));
                         trace!(
                             "Waiting for the next retry to send messages to topic: {topic}, \
                              stream: {stream}..."
                         );
-                        t.tick().await;
+                        timer.tick().await;
                     }
                 }
             }
@@ -570,8 +562,8 @@ impl IggyProducer {
     }
 
     pub async fn shutdown(self) {
-        if let Some(disp) = self.dispatcher {
-            disp.shutdown().await;
+        if let Some(dispatcher) = self.dispatcher {
+            dispatcher.shutdown().await;
         }
     }
 }

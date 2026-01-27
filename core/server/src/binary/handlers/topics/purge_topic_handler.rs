@@ -22,12 +22,16 @@ use crate::binary::command::{
 use crate::binary::handlers::topics::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::shard::IggyShard;
+use crate::shard::transmission::event::ShardEvent;
+use crate::shard::transmission::frame::ShardResponse;
+use crate::shard::transmission::message::{
+    ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult,
+};
 use crate::state::command::EntryCommand;
 use crate::streaming::session::Session;
-use anyhow::Result;
 use err_trail::ErrContext;
 use iggy_common::purge_topic::PurgeTopic;
-use iggy_common::{IggyError, SenderKind};
+use iggy_common::{Identifier, IggyError, SenderKind};
 use std::rc::Rc;
 use tracing::{debug, instrument};
 
@@ -48,38 +52,77 @@ impl ServerCommandHandler for PurgeTopic {
         shard.ensure_authenticated(session)?;
         let (stream_id, topic_id) = shard.resolve_topic_id(&self.stream_id, &self.topic_id)?;
         shard
-            .permissioner
-            .borrow()
-            .purge_topic(session.get_user_id(), stream_id, topic_id)?;
-        let topic_id = self.topic_id.clone();
-        let stream_id = self.stream_id.clone();
+            .metadata
+            .perm_purge_topic(session.get_user_id(), stream_id, topic_id)?;
 
-        shard
-            .purge_topic(&self.stream_id, &self.topic_id)
-            .await
-            .error(|e: &IggyError| {
-                format!(
-                    "{COMPONENT} (error: {e}) - failed to purge topic with id: {}, stream_id: {}",
-                    self.topic_id, self.stream_id
-                )
-            })?;
-
-        let event = crate::shard::transmission::event::ShardEvent::PurgedTopic {
-            stream_id: self.stream_id.clone(),
-            topic_id: self.topic_id.clone(),
+        let request = ShardRequest {
+            stream_id: Identifier::default(),
+            topic_id: Identifier::default(),
+            partition_id: 0,
+            payload: ShardRequestPayload::PurgeTopic {
+                user_id: session.get_user_id(),
+                stream_id: self.stream_id.clone(),
+                topic_id: self.topic_id.clone(),
+            },
         };
-        shard.broadcast_event_to_all_shards(event).await?;
 
-        shard
-            .state
-            .apply(session.get_user_id(), &EntryCommand::PurgeTopic(self))
-            .await
-            .error(|e: &IggyError| {
-                format!(
-                "{COMPONENT} (error: {e}) - failed to apply purge topic with id: {topic_id}, stream_id: {stream_id}",
-            )
-            })?;
-        sender.send_empty_ok_response().await?;
+        let stream_id_for_log = self.stream_id.clone();
+        let topic_id_for_log = self.topic_id.clone();
+        let message = ShardMessage::Request(request);
+        match shard.send_request_to_shard_or_recoil(None, message).await? {
+            ShardSendRequestResult::Recoil(message) => {
+                if let ShardMessage::Request(ShardRequest { payload, .. }) = message
+                    && let ShardRequestPayload::PurgeTopic {
+                        stream_id,
+                        topic_id,
+                        ..
+                    } = payload
+                {
+                    shard
+                        .purge_topic(&stream_id, &topic_id)
+                        .await
+                        .error(|e: &IggyError| {
+                            format!(
+                                "{COMPONENT} (error: {e}) - failed to purge topic with id: {topic_id_for_log}, stream_id: {stream_id_for_log}"
+                            )
+                        })?;
+
+                    let event = ShardEvent::PurgedTopic {
+                        stream_id: stream_id.clone(),
+                        topic_id: topic_id.clone(),
+                    };
+                    shard.broadcast_event_to_all_shards(event).await?;
+
+                    shard
+                        .state
+                        .apply(session.get_user_id(), &EntryCommand::PurgeTopic(self))
+                        .await
+                        .error(|e: &IggyError| {
+                            format!(
+                                "{COMPONENT} (error: {e}) - failed to apply purge topic with id: {topic_id_for_log}, stream_id: {stream_id_for_log}"
+                            )
+                        })?;
+
+                    sender.send_empty_ok_response().await?;
+                } else {
+                    unreachable!(
+                        "Expected a PurgeTopic request inside of PurgeTopic handler, impossible state"
+                    );
+                }
+            }
+            ShardSendRequestResult::Response(response) => match response {
+                ShardResponse::PurgeTopicResponse => {
+                    sender.send_empty_ok_response().await?;
+                }
+                ShardResponse::ErrorResponse(err) => {
+                    return Err(err);
+                }
+                _ => unreachable!(
+                    "Expected a PurgeTopicResponse inside of PurgeTopic handler, impossible state"
+                ),
+            },
+        }
+
         Ok(HandlerResult::Finished)
     }
 }

@@ -31,7 +31,7 @@ Iggy requires valid credentials to authenticate client requests. The examples as
 > **Note** <br>
 > This setup is intended only for development and testing, not production use.
 
-By default, all server data is stored in the `local_data` directory (this can be changed via `system.path` in `server.toml`).
+By default, all server data is stored in the `local_data` directory (this can be changed via `system.path` in `config.toml`).
 
 Root credentials are applied **only on the very first startup**, when no data directory exists yet.
 Once the server has created and populated the data directory, the existing stored credentials will always be used, and supplying the `--with-default-root-credentials` flag or setting the environment variables will no longer override them.

@@ -68,7 +68,7 @@ error_set!(
     }
 
     ConfigurationError := {
-        ConfigurationError(iggy_common::ConfigurationError),
+        ConfigurationError(configs::ConfigurationError),
     }
 
     ArchiverError := {

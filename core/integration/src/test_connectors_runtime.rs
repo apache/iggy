@@ -31,7 +31,6 @@ use uuid::Uuid;
 
 pub const STATE_PATH_ENV_VAR: &str = "IGGY_CONNECTORS_STATE_PATH";
 pub const TEST_VERBOSITY_ENV_VAR: &str = "IGGY_TEST_VERBOSE";
-pub const CONSUMER_NAME: &str = "connectors";
 const LOCAL_STATE_PREFIX: &str = "local_state_";
 
 #[derive(Debug)]
@@ -69,10 +68,6 @@ impl TestConnectorsRuntime {
         envs.insert(
             "IGGY_CONNECTORS_IGGY_ADDRESS".to_string(),
             iggy_tcp_server_address.to_string(),
-        );
-        envs.insert(
-            "IGGY_CONNECTORS_IGGY_CONSUMER".to_string(),
-            CONSUMER_NAME.to_string(),
         );
         Self::create(envs, server_executable_path)
     }

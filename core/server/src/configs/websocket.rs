@@ -16,12 +16,13 @@
  * under the License.
  */
 
+use iggy_common::ConfigEnv;
 use iggy_common::IggyByteSize;
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
 use tungstenite::protocol::WebSocketConfig as TungsteniteConfig;
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
 pub struct WebSocketConfig {
     pub enabled: bool,
     pub address: String,
@@ -41,7 +42,7 @@ pub struct WebSocketConfig {
     pub tls: WebSocketTlsConfig,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
 pub struct WebSocketTlsConfig {
     pub enabled: bool,
     pub self_signed: bool,

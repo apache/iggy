@@ -35,7 +35,7 @@ use integration::{
 use lazy_static::lazy_static;
 use rmcp::{
     ServiceError,
-    model::{CallToolRequestParam, CallToolResult, ListToolsResult},
+    model::{CallToolRequestParams, CallToolResult, ListToolsResult},
     serde::de::DeserializeOwned,
     serde_json::{self, json},
 };
@@ -698,10 +698,11 @@ impl TestMcpClient {
         data: Option<serde_json::Value>,
     ) -> Result<CallToolResult, ServiceError> {
         self.mcp_client
-            .call_tool(CallToolRequestParam {
+            .call_tool(CallToolRequestParams {
                 name: method.to_owned().into(),
                 arguments: data.and_then(|value| value.as_object().cloned()),
                 task: None,
+                meta: None,
             })
             .await
     }

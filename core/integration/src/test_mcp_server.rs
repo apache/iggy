@@ -182,6 +182,7 @@ impl TestMcpServer {
         let client_info = ClientInfo {
             protocol_version: Default::default(),
             capabilities: ClientCapabilities::default(),
+            meta: None,
             client_info: Implementation {
                 name: "test-mcp-client".to_string(),
                 version: "1.0.0".to_string(),

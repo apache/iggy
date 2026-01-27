@@ -17,13 +17,13 @@
  */
 
 use crate::args::kind::BenchmarkKindCommand;
+use crate::utils::{ClientFactory, login_root};
 use crate::{args::common::IggyBenchArgs, utils::client_factory::create_client_factory};
 use async_trait::async_trait;
 use bench_report::benchmark_kind::BenchmarkKind;
 use bench_report::individual_metrics::BenchmarkIndividualMetrics;
 use iggy::clients::client::IggyClient;
 use iggy::prelude::*;
-use integration::test_server::{ClientFactory, login_root};
 use std::sync::Arc;
 use tokio::task::JoinSet;
 use tracing::info;

@@ -177,7 +177,7 @@ async fn run_producer(
                 batch_num += 1;
             }
             Err(e) => {
-                eprintln!("Producer {} send error: {}", producer_name, e);
+                panic!("Producer {} send error: {}", producer_name, e);
             }
         }
     }

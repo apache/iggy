@@ -16,7 +16,8 @@
 // under the License.
 
 use crate::metadata::PartitionId;
-use crate::streaming::partitions::partition::{ConsumerGroupOffsets, ConsumerOffsets};
+use crate::streaming::partitions::consumer_group_offsets::ConsumerGroupOffsets;
+use crate::streaming::partitions::consumer_offsets::ConsumerOffsets;
 use crate::streaming::stats::PartitionStats;
 use iggy_common::IggyTimestamp;
 use std::sync::Arc;
@@ -25,12 +26,10 @@ use std::sync::Arc;
 pub struct PartitionMeta {
     pub id: PartitionId,
     pub created_at: IggyTimestamp,
-    /// Monotonically increasing version to detect stale partition_store entries.
+    /// Monotonically increasing version to detect stale local_partitions entries.
     /// Set to the Metadata version when the partition was created.
     pub revision_id: u64,
     pub stats: Arc<PartitionStats>,
-    /// Consumer offsets for this partition // TODO: move to partition store
-    pub consumer_offsets: Option<Arc<ConsumerOffsets>>,
-    /// Consumer group offsets for this partition // TODO: move to partition store
-    pub consumer_group_offsets: Option<Arc<ConsumerGroupOffsets>>,
+    pub consumer_offsets: Arc<ConsumerOffsets>,
+    pub consumer_group_offsets: Arc<ConsumerGroupOffsets>,
 }

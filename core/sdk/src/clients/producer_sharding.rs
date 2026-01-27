@@ -19,6 +19,8 @@ use crate::clients::producer::ProducerCoreBackend;
 use crate::clients::producer_config::BackgroundConfig;
 use crate::clients::producer_error_callback::ErrorCtx;
 use iggy_common::{Identifier, IggyByteSize, IggyError, IggyMessage, Partitioning, Sizeable};
+use std::hash::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tokio::sync::{OwnedSemaphorePermit, broadcast};
@@ -42,13 +44,16 @@ pub trait Sharding: Send + Sync + std::fmt::Debug + 'static {
 
 /// A simple round-robin sharding strategy.
 /// Distributes messages evenly across all shards by incrementing an atomic counter.
+///
+/// **WARNING**: This strategy does NOT preserve message ordering across shards.
+/// Messages to the same stream/topic may be processed out of order.
+/// Use `OrderedSharding` if message ordering is required.
 #[derive(Default, Debug)]
 pub struct BalancedSharding {
     counter: AtomicUsize,
 }
 
 impl Sharding for BalancedSharding {
-    /// Picks the next shard in a round-robin fashion.
     fn pick_shard(
         &self,
         num_shards: usize,
@@ -57,6 +62,29 @@ impl Sharding for BalancedSharding {
         _: &Identifier,
     ) -> usize {
         self.counter.fetch_add(1, Ordering::Relaxed) % num_shards
+    }
+}
+
+/// A sharding strategy that preserves message ordering by routing all messages
+/// for the same stream/topic combination to the same shard.
+///
+/// This ensures that messages sent to the same destination are processed
+/// in the order they were dispatched, even when using multiple shards.
+#[derive(Default, Debug)]
+pub struct OrderedSharding;
+
+impl Sharding for OrderedSharding {
+    fn pick_shard(
+        &self,
+        num_shards: usize,
+        _: &[IggyMessage],
+        stream: &Identifier,
+        topic: &Identifier,
+    ) -> usize {
+        let mut hasher = DefaultHasher::new();
+        stream.hash(&mut hasher);
+        topic.hash(&mut hasher);
+        (hasher.finish() as usize) % num_shards
     }
 }
 
@@ -169,6 +197,10 @@ impl Shard {
                     }
                     _ = stop_rx.recv() => {
                         closed_clone.store(true, Ordering::Release);
+                        while let Ok(msg) = rx.try_recv() {
+                            buffer_bytes += msg.inner.get_size_bytes().as_bytes_usize();
+                            buffer.push(msg);
+                        }
                         if !buffer.is_empty() {
                             Self::flush_buffer(&core, &mut buffer, &mut buffer_bytes, &err_sender).await;
                         }
@@ -191,7 +223,22 @@ impl Shard {
         buffer_bytes: &mut usize,
         err_sender: &flume::Sender<ErrorCtx>,
     ) {
+        if buffer.is_empty() {
+            return;
+        }
+
+        let mut merged_batches: Vec<ShardMessageWithPermits> = Vec::new();
         for msg in buffer.drain(..) {
+            if let Some(last) = merged_batches.last_mut()
+                && Self::same_destination(&last.inner, &msg.inner)
+            {
+                last.inner.messages.extend(msg.inner.messages);
+                continue;
+            }
+            merged_batches.push(msg);
+        }
+
+        for msg in merged_batches {
             let result = core
                 .send_internal(
                     &msg.inner.stream,
@@ -201,13 +248,13 @@ impl Shard {
                 )
                 .await;
 
-            if let Err(err) = result {
+            if let Err(error) = result {
                 if let IggyError::ProducerSendFailed {
                     failed,
                     cause,
                     stream_name,
                     topic_name,
-                } = &err
+                } = &error
                 {
                     let ctx = ErrorCtx {
                         cause: cause.to_owned(),
@@ -220,7 +267,7 @@ impl Shard {
                     };
                     let _ = err_sender.send_async(ctx).await;
                 } else {
-                    tracing::error!("background send failed: {err}");
+                    error!("Background send failed. {error}");
                 }
             }
         }
@@ -236,6 +283,12 @@ impl Shard {
             error!("Failed to send_async: {e}");
             IggyError::BackgroundSendError
         })
+    }
+
+    fn same_destination(first: &ShardMessage, second: &ShardMessage) -> bool {
+        first.stream == second.stream
+            && first.topic == second.topic
+            && first.partitioning == second.partitioning
     }
 }
 
