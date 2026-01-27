@@ -26,6 +26,7 @@ use std::sync::{Arc, Once};
 use std::{panic, thread};
 
 mod cli;
+mod cluster;
 mod config_provider;
 mod connectors;
 mod data_integrity;

@@ -42,6 +42,7 @@ members = [
     "core/connectors/sources/postgres_source",
     "core/connectors/sources/random_source",
     "core/consensus",
+    "core/harness_derive",
     "core/integration",
     "core/journal",
     "core/message_bus",
@@ -153,6 +154,7 @@ getrandom = { version = "0.3", features = ["wasm_js"] }
 git2 = { version = "0.20.3", default-features = false, features = ["vendored-libgit2"] }
 gloo = "0.11"
 governor = "0.10.4"
+harness_derive = { path = "core/harness_derive" }
 hash32 = "1.0.0"
 hostname = "0.4.2"
 human-repr = "1.1.0"

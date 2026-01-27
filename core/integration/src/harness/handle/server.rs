@@ -17,14 +17,15 @@
  * under the License.
  */
 
+use super::client_builder::{ClientBuilder, ServerConnection};
 use crate::harness::config::{IpAddrKind, TestServerConfig};
 use crate::harness::context::TestContext;
 use crate::harness::error::TestBinaryError;
 use crate::harness::port_reserver::PortReserver;
 use crate::harness::traits::{Restartable, TestBinary};
 use assert_cmd::prelude::CommandCargoExt;
-use iggy::prelude::DEFAULT_ROOT_PASSWORD;
-use iggy::prelude::DEFAULT_ROOT_USERNAME;
+use iggy::prelude::{DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME};
+use iggy_common::TransportProtocol;
 use rand::Rng as _;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
@@ -73,6 +74,7 @@ pub struct ServerHandle {
     watchdog_stop: Arc<AtomicBool>,
     generated_cert_dir: Option<PathBuf>,
     port_reserver: Option<PortReserver>,
+    test_transport: Option<iggy_common::TransportProtocol>,
 }
 
 impl std::fmt::Debug for ServerHandle {
@@ -144,6 +146,51 @@ impl ServerHandle {
 
     pub fn collect_logs(&self) -> (String, String) {
         super::common::collect_logs(&self.stdout_path, &self.stderr_path)
+    }
+
+    /// Returns a `ClientBuilder` using the test transport.
+    ///
+    /// Returns an error if no test transport is configured.
+    pub fn test_client(&self) -> Result<ClientBuilder, TestBinaryError> {
+        let transport = self
+            .test_transport
+            .ok_or_else(|| TestBinaryError::InvalidState {
+                message: "No test transport configured".to_string(),
+            })?;
+        Ok(self.client_builder(transport))
+    }
+
+    /// Returns a TCP `ClientBuilder`. Call `.connect()` to create the client.
+    pub fn tcp_client(&self) -> Result<ClientBuilder, TestBinaryError> {
+        Ok(self.client_builder(TransportProtocol::Tcp))
+    }
+
+    /// Returns an HTTP `ClientBuilder`. Call `.connect()` to create the client.
+    pub fn http_client(&self) -> Result<ClientBuilder, TestBinaryError> {
+        Ok(self.client_builder(TransportProtocol::Http))
+    }
+
+    /// Returns a QUIC `ClientBuilder`. Call `.connect()` to create the client.
+    pub fn quic_client(&self) -> Result<ClientBuilder, TestBinaryError> {
+        Ok(self.client_builder(TransportProtocol::Quic))
+    }
+
+    /// Returns a WebSocket `ClientBuilder`. Call `.connect()` to create the client.
+    pub fn websocket_client(&self) -> Result<ClientBuilder, TestBinaryError> {
+        Ok(self.client_builder(TransportProtocol::WebSocket))
+    }
+
+    fn client_builder(&self, transport: TransportProtocol) -> ClientBuilder {
+        let connection = ServerConnection {
+            tcp_addr: self.addrs.tcp,
+            http_addr: self.addrs.http,
+            quic_addr: self.addrs.quic,
+            websocket_addr: self.addrs.websocket,
+            tls: self.config.tls.clone(),
+            websocket_tls: self.config.websocket_tls.clone(),
+            tls_ca_cert_path: self.tls_ca_cert_path(),
+        };
+        ClientBuilder::new(transport, connection)
     }
 
     fn build_envs(&mut self) -> Result<(), TestBinaryError> {
@@ -263,38 +310,67 @@ impl ServerHandle {
     }
 
     fn set_protocol_addresses(&mut self) -> Result<(), TestBinaryError> {
+        // Cluster mode: port reserver and addresses are pre-set by builder
+        if self.port_reserver.is_some() {
+            debug_assert!(
+                self.addrs.tcp.is_some()
+                    || self.addrs.http.is_some()
+                    || self.addrs.quic.is_some()
+                    || self.addrs.websocket.is_some(),
+                "port_reserver set but no addresses configured"
+            );
+            return Ok(());
+        }
+
+        // Restart case: reuse existing addresses to maintain consistency
+        if self.addrs.tcp.is_some()
+            || self.addrs.http.is_some()
+            || self.addrs.quic.is_some()
+            || self.addrs.websocket.is_some()
+        {
+            if let Some(tcp) = self.addrs.tcp {
+                self.envs
+                    .insert("IGGY_TCP_ADDRESS".to_string(), tcp.to_string());
+            }
+            if let Some(http) = self.addrs.http {
+                self.envs
+                    .insert("IGGY_HTTP_ADDRESS".to_string(), http.to_string());
+            }
+            if let Some(quic) = self.addrs.quic {
+                self.envs
+                    .insert("IGGY_QUIC_ADDRESS".to_string(), quic.to_string());
+            }
+            if let Some(websocket) = self.addrs.websocket {
+                self.envs
+                    .insert("IGGY_WEBSOCKET_ADDRESS".to_string(), websocket.to_string());
+            }
+            return Ok(());
+        }
+
         let reserver = PortReserver::reserve(self.config.ip_kind, &self.config)?;
         let addrs = reserver.addresses();
 
         if let Some(tcp) = addrs.tcp {
-            if !self.envs.contains_key("IGGY_TCP_ADDRESS") {
-                self.envs
-                    .insert("IGGY_TCP_ADDRESS".to_string(), tcp.to_string());
-            }
+            self.envs
+                .insert("IGGY_TCP_ADDRESS".to_string(), tcp.to_string());
             self.addrs.tcp = Some(tcp);
         }
 
         if let Some(http) = addrs.http {
-            if !self.envs.contains_key("IGGY_HTTP_ADDRESS") {
-                self.envs
-                    .insert("IGGY_HTTP_ADDRESS".to_string(), http.to_string());
-            }
+            self.envs
+                .insert("IGGY_HTTP_ADDRESS".to_string(), http.to_string());
             self.addrs.http = Some(http);
         }
 
         if let Some(quic) = addrs.quic {
-            if !self.envs.contains_key("IGGY_QUIC_ADDRESS") {
-                self.envs
-                    .insert("IGGY_QUIC_ADDRESS".to_string(), quic.to_string());
-            }
+            self.envs
+                .insert("IGGY_QUIC_ADDRESS".to_string(), quic.to_string());
             self.addrs.quic = Some(quic);
         }
 
         if let Some(websocket) = addrs.websocket {
-            if !self.envs.contains_key("IGGY_WEBSOCKET_ADDRESS") {
-                self.envs
-                    .insert("IGGY_WEBSOCKET_ADDRESS".to_string(), websocket.to_string());
-            }
+            self.envs
+                .insert("IGGY_WEBSOCKET_ADDRESS".to_string(), websocket.to_string());
             self.addrs.websocket = Some(websocket);
         }
 
@@ -323,11 +399,6 @@ impl ServerHandle {
             }
 
             if config_path.exists() {
-                // Server has written config file - it has bound to ports successfully.
-                // Release pre-reserved ports so server has exclusive access.
-                if let Some(reserver) = self.port_reserver.take() {
-                    reserver.release();
-                }
                 return Ok(());
             }
 
@@ -407,6 +478,47 @@ impl ServerHandle {
     }
 }
 
+impl ServerHandle {
+    /// Create a server handle with custom ID and cluster configuration.
+    pub fn with_cluster_config(
+        config: TestServerConfig,
+        context: Arc<TestContext>,
+        server_id: u32,
+        cluster_envs: HashMap<String, String>,
+    ) -> Self {
+        Self {
+            server_id,
+            config,
+            context,
+            envs: cluster_envs,
+            child_handle: None,
+            addrs: ServerProtocolAddr::empty(),
+            stdout_path: None,
+            stderr_path: None,
+            watchdog_handle: None,
+            watchdog_stop: Arc::new(AtomicBool::new(false)),
+            generated_cert_dir: None,
+            port_reserver: None,
+            test_transport: None,
+        }
+    }
+
+    /// Set a pre-reserved port reserver (used by cluster builder).
+    pub fn set_port_reserver(&mut self, reserver: crate::harness::port_reserver::PortReserver) {
+        let addrs = reserver.addresses();
+        self.addrs.tcp = addrs.tcp;
+        self.addrs.http = addrs.http;
+        self.addrs.quic = addrs.quic;
+        self.addrs.websocket = addrs.websocket;
+        self.port_reserver = Some(reserver);
+    }
+
+    /// Set the test transport (used by harness builder).
+    pub fn set_test_transport(&mut self, transport: iggy_common::TransportProtocol) {
+        self.test_transport = Some(transport);
+    }
+}
+
 impl TestBinary for ServerHandle {
     type Config = TestServerConfig;
 
@@ -424,6 +536,7 @@ impl TestBinary for ServerHandle {
             watchdog_stop: Arc::new(AtomicBool::new(false)),
             generated_cert_dir: None,
             port_reserver: None,
+            test_transport: None,
         }
     }
 
@@ -475,6 +588,11 @@ impl TestBinary for ServerHandle {
         command.env("IGGY_SYSTEM_PATH", data_path.display().to_string());
         command.envs(&self.envs);
 
+        // TODO(hubcio): Remove --follower flag when proper clustering is implemented
+        if self.server_id > 0 {
+            command.arg("--follower");
+        }
+
         let verbose = std::env::var(TEST_VERBOSITY_ENV_VAR).is_ok()
             || self.envs.contains_key(TEST_VERBOSITY_ENV_VAR);
 
@@ -511,6 +629,13 @@ impl TestBinary for ServerHandle {
         self.watchdog_stop = Arc::new(AtomicBool::new(false));
 
         self.wait_for_server_ready()?;
+
+        // Release port reservation after server has written config file (bound to ports).
+        // This avoids SO_REUSEPORT load-balancing conflicts during startup.
+        if let Some(reserver) = self.port_reserver.take() {
+            reserver.release();
+        }
+
         self.start_watchdog();
 
         Ok(())

@@ -42,6 +42,7 @@ derive_more = { workspace = true }
 env_logger = { workspace = true }
 figment = { workspace = true }
 futures = { workspace = true }
+harness_derive = { workspace = true }
 humantime = { workspace = true }
 iggy = { workspace = true }
 iggy_binary_protocol = { workspace = true }
