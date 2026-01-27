@@ -226,15 +226,13 @@ pub fn handle(sources: Vec<SourceConnectorWrapper>, context: Arc<RuntimeContext>
             let plugin_key = plugin.key.clone();
             let context = context.clone();
 
-            if plugin.error.is_none() {
-                info!("Starting handler for source connector with ID: {plugin_id}...");
-            } else {
+            if let Some(error) = &plugin.error {
                 error!(
-                    "Failed to initialize source connector with ID: {plugin_id}: {}. Skipping...",
-                    plugin.error.as_ref().expect("Error should be present")
+                    "Failed to initialize source connector with ID: {plugin_id}: {error}. Skipping...",
                 );
                 continue;
             }
+            info!("Starting handler for source connector with ID: {plugin_id}...");
 
             let handle = source.callback;
             tokio::task::spawn_blocking(move || {

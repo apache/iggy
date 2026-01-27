@@ -493,3 +493,146 @@ async fn background_linger_time_respected_after_idle() {
     producer.shutdown().await;
     cleanup(&client).await;
 }
+
+#[tokio::test]
+#[parallel]
+async fn background_preserves_message_ordering() {
+    let mut test_server = TestServer::default();
+    test_server.start();
+
+    let tcp_client_config = TcpClientConfig {
+        server_address: test_server.get_raw_tcp_addr().unwrap(),
+        ..TcpClientConfig::default()
+    };
+    let client = ClientWrapper::Tcp(TcpClient::create(Arc::new(tcp_client_config)).unwrap());
+    let client = IggyClient::create(client, None, None);
+
+    client.connect().await.unwrap();
+    login_root(&client).await;
+    init_system(&client).await;
+
+    let messages_count = 1000u32;
+
+    let cfg = BackgroundConfig::builder()
+        .linger_time(IggyDuration::from(50_000))
+        .build();
+
+    let producer = client
+        .producer(STREAM_NAME, TOPIC_NAME)
+        .unwrap()
+        .partitioning(Partitioning::partition_id(PARTITION_ID))
+        .background(cfg)
+        .build();
+
+    for i in 0..messages_count {
+        let payload = Bytes::from(i.to_le_bytes().to_vec());
+        let msg = IggyMessage::builder()
+            .id(i as u128 + 1)
+            .payload(payload)
+            .build()
+            .unwrap();
+        producer.send(vec![msg]).await.unwrap();
+    }
+
+    producer.shutdown().await;
+
+    let consumer = Consumer::default();
+    let polled_messages = client
+        .poll_messages(
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
+            Some(PARTITION_ID),
+            &consumer,
+            &PollingStrategy::offset(0),
+            messages_count,
+            false,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(polled_messages.messages.len() as u32, messages_count);
+
+    for (idx, msg) in polled_messages.messages.iter().enumerate() {
+        let expected = idx as u32;
+        let actual = u32::from_le_bytes(msg.payload[..4].try_into().unwrap());
+        assert_eq!(
+            actual, expected,
+            "Message at position {} has wrong order: expected {}, got {}",
+            idx, expected, actual
+        );
+    }
+
+    cleanup(&client).await;
+}
+
+#[tokio::test]
+#[parallel]
+async fn background_preserves_ordering_with_multiple_shards() {
+    let mut test_server = TestServer::default();
+    test_server.start();
+
+    let tcp_client_config = TcpClientConfig {
+        server_address: test_server.get_raw_tcp_addr().unwrap(),
+        ..TcpClientConfig::default()
+    };
+    let client = ClientWrapper::Tcp(TcpClient::create(Arc::new(tcp_client_config)).unwrap());
+    let client = IggyClient::create(client, None, None);
+
+    client.connect().await.unwrap();
+    login_root(&client).await;
+    init_system(&client).await;
+
+    let messages_count = 1000u32;
+
+    let cfg = BackgroundConfig::builder()
+        .num_shards(4)
+        .linger_time(IggyDuration::from(50_000))
+        .build();
+
+    let producer = client
+        .producer(STREAM_NAME, TOPIC_NAME)
+        .unwrap()
+        .partitioning(Partitioning::partition_id(PARTITION_ID))
+        .background(cfg)
+        .build();
+
+    for i in 0..messages_count {
+        let payload = Bytes::from(i.to_le_bytes().to_vec());
+        let msg = IggyMessage::builder()
+            .id(i as u128 + 1)
+            .payload(payload)
+            .build()
+            .unwrap();
+        producer.send(vec![msg]).await.unwrap();
+    }
+
+    producer.shutdown().await;
+
+    let consumer = Consumer::default();
+    let polled_messages = client
+        .poll_messages(
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
+            Some(PARTITION_ID),
+            &consumer,
+            &PollingStrategy::offset(0),
+            messages_count,
+            false,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(polled_messages.messages.len() as u32, messages_count);
+
+    for (idx, msg) in polled_messages.messages.iter().enumerate() {
+        let expected = idx as u32;
+        let actual = u32::from_le_bytes(msg.payload[..4].try_into().unwrap());
+        assert_eq!(
+            actual, expected,
+            "Message at position {} has wrong order: expected {}, got {}",
+            idx, expected, actual
+        );
+    }
+
+    cleanup(&client).await;
+}
