@@ -19,15 +19,222 @@ mod iggy_partition;
 mod iggy_partitions;
 mod types;
 
+use iggy_common::sharding::IggyNamespace;
 pub use iggy_partition::IggyPartition;
 pub use iggy_partitions::IggyPartitions;
-pub use types::{PollMetadata, PollingArgs, PollingConsumer, SendMessagesResult};
+pub use types::{
+    AppendResult, PartitionOffsets, PollMetadata, PollingArgs, PollingConsumer, SendMessagesResult,
+};
 
-/// The core abstraction for partition operations in clustering.
+/// High-level partition operations for request handlers.
 ///
-/// This trait defines the data-plane operations for partitions that
-/// need to be coordinated across a cluster using viewstamped replication.
-/// Implementations can vary between single-node and clustered deployments.
+/// This trait abstracts over both single-node vs clustered modes.
+///
+/// # Implementation:
+///
+/// ## Single-node:
+///
+/// ```text
+/// send_messages() ──► storage.append_prepared()
+///                           │
+///                           ▼
+///                     storage.advance_commit()
+///                           │
+///                           ▼
+///                     Return success
+/// ```
+///
+/// ## Clustered
+///
+/// ```text
+/// send_messages() ──► Create Prepare(messages)
+///                           │
+///                           ▼
+///                     Broadcast to replicas
+///                           │
+///                           ▼
+///                     Replicas: storage.append_prepared()
+///                           │
+///                           ▼
+///                     Wait for quorum PrepareOk
+///                           │
+///                           ▼
+///                     storage.advance_commit()
+///                           │
+///                           ▼
+///                     Return success
+/// ```
 pub trait Partitions {
-    // TODO(hubcio): define partition operations like poll, send, create, delete, etc.
+    /// The message batch type for write operations.
+    type MessageBatch;
+
+    /// The result type returned from poll operations.
+    type PollResult;
+
+    type Error;
+
+    /// Send messages to a partition.
+    ///
+    /// Messages are appended atomically as a batch with sequentially assigned
+    /// offsets. Returns only:
+    /// - Single-node: after durable local write (fsync)
+    /// - Clustered: after VSR quorum acknowledgment
+    fn send_messages(
+        &self,
+        namespace: IggyNamespace,
+        batch: Self::MessageBatch,
+    ) -> impl Future<Output = Result<SendMessagesResult, Self::Error>>;
+
+    /// Store consumer offset for progress tracking.
+    ///
+    /// Persists the consumer's position, enabling resumption after restarts.
+    fn store_consumer_offset(
+        &self,
+        consumer: PollingConsumer,
+        namespace: IggyNamespace,
+        offset: u64,
+    ) -> impl Future<Output = Result<(), Self::Error>>;
+
+    /// Poll messages from a partition.
+    ///
+    /// Returns only **committed** messages according to the polling strategy.
+    /// Messages that are prepared but not yet committed are not visible.
+    fn poll_messages(
+        &self,
+        consumer: PollingConsumer,
+        namespace: IggyNamespace,
+        args: PollingArgs,
+    ) -> impl Future<Output = Result<(Self::PollResult, PollMetadata), Self::Error>>;
+
+    /// Get stored consumer offset.
+    ///
+    /// Returns the last stored offset, or 0 if none exists.
+    fn get_consumer_offset(
+        &self,
+        consumer: PollingConsumer,
+        namespace: IggyNamespace,
+    ) -> impl Future<Output = Result<u64, Self::Error>>;
+
+    /// Get partition's current commit offset.
+    ///
+    /// Returns the highest committed offset (visible to consumers).
+    /// In clustered mode, may lag slightly behind the primary.
+    fn get_offset(
+        &self,
+        namespace: IggyNamespace,
+    ) -> impl Future<Output = Result<u64, Self::Error>>;
+
+    /// Initialize storage for a new partition.
+    ///
+    /// Sets up segments directory, initial segment, and offset tracking.
+    fn create_partition(
+        &self,
+        namespace: IggyNamespace,
+    ) -> impl Future<Output = Result<(), Self::Error>>;
+
+    /// Delete partition and all its data.
+    ///
+    /// Removes messages, segments, indexes, and consumer offsets.
+    fn delete_partition(
+        &self,
+        namespace: IggyNamespace,
+    ) -> impl Future<Output = Result<(), Self::Error>>;
+
+    /// Purge all messages, preserving partition structure.
+    ///
+    /// Resets offset to 0. Consumer offsets become invalid.
+    fn purge_partition(
+        &self,
+        namespace: IggyNamespace,
+    ) -> impl Future<Output = Result<(), Self::Error>>;
+}
+
+/// Low-level partition storage operations for the consensus layer.
+///
+/// This trait is the interface between VSR consensus and the underlying
+/// storage engine. It provides the primitives needed for:
+///
+/// - **Prepare phase**: Durably storing messages before acknowledgment
+/// - **Commit phase**: Advancing the visibility boundary
+/// - **Read path**: Reading committed messages for consumers
+/// - **Recovery**: Reconstructing consensus state after restart
+pub trait PartitionStorage {
+    /// The message batch type for append operations.
+    type MessageBatch;
+
+    /// The message batch type returned from read operations.
+    type ReadBatch;
+
+    /// The error type for storage operations.
+    type Error;
+
+    /// Append messages during the PREPARE phase.
+    ///
+    /// Messages are written durably to storage but are NOT yet visible to
+    /// consumers. This method MUST fsync before returning to ensure durability.
+    fn append_prepared(
+        &self,
+        namespace: IggyNamespace,
+        batch: Self::MessageBatch,
+    ) -> impl Future<Output = Result<AppendResult, Self::Error>>;
+
+    /// Advance the commit offset after quorum acknowledgment.
+    ///
+    /// Messages up to and including `commit_offset` become visible to consumers.
+    /// This is the "commit" in the VSR sense - marking data as durably replicated.
+    ///
+    /// # Invariants
+    ///
+    /// - `commit_offset` must be >= current commit offset (monotonic)
+    /// - `commit_offset` must be <= current write offset (can't commit unwritten)
+    fn advance_commit(
+        &self,
+        namespace: IggyNamespace,
+        commit_offset: u64,
+    ) -> impl Future<Output = Result<(), Self::Error>>;
+
+    /// Read committed messages from a partition.
+    ///
+    /// Returns messages starting from `start_offset` up to the current
+    /// `commit_offset`. Messages that are prepared but not yet committed
+    /// are NOT returned.
+    fn read_committed(
+        &self,
+        namespace: IggyNamespace,
+        start_offset: u64,
+        max_count: u32,
+    ) -> impl Future<Output = Result<Self::ReadBatch, Self::Error>>;
+
+    /// Get current partition offsets.
+    ///
+    /// Returns both commit and write offsets, useful for:
+    /// - Consensus state reconstruction after recovery
+    /// - Determining if there are uncommitted messages
+    /// - Consumer offset validation
+    fn get_offsets(
+        &self,
+        namespace: IggyNamespace,
+    ) -> impl Future<Output = Result<PartitionOffsets, Self::Error>>;
+
+    /// Check if a partition exists in storage.
+    fn exists(&self, namespace: IggyNamespace) -> impl Future<Output = Result<bool, Self::Error>>;
+
+    /// Truncate uncommitted messages (recovery/view change).
+    ///
+    /// Removes all messages with offset > `commit_offset`. Used when:
+    /// - Recovering from a crash with uncommitted prepared messages
+    /// - View change determines a different log should be authoritative
+    ///
+    /// # Safety
+    ///
+    /// This operation discards data! Only call during controlled recovery
+    /// scenarios, never during normal operation.
+    ///
+    /// # Invariants
+    ///
+    /// After truncation: `write_offset == commit_offset`
+    fn truncate_uncommitted(
+        &self,
+        namespace: IggyNamespace,
+    ) -> impl Future<Output = Result<(), Self::Error>>;
 }
