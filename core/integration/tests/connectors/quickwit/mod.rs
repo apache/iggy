@@ -142,7 +142,7 @@ impl QuickwitTestSetup {
 }
 
 fn get_http_client_with_retries() -> HttpClient {
-    let max_retries = 5;
+    let max_retries = 3;
     let retry_policy = ExponentialBackoff::builder().build_with_max_retries(max_retries);
     reqwest_middleware::ClientBuilder::new(reqwest::Client::new())
         .with(RetryTransientMiddleware::new_with_policy(retry_policy))
