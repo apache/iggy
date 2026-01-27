@@ -22,8 +22,7 @@ use super::props::{BenchmarkKindProps, BenchmarkTransportProps};
 use super::{
     defaults::{
         DEFAULT_MESSAGE_BATCHES, DEFAULT_MESSAGE_SIZE, DEFAULT_MESSAGES_PER_BATCH,
-        DEFAULT_MOVING_AVERAGE_WINDOW, DEFAULT_PERFORM_CLEANUP, DEFAULT_SAMPLING_TIME,
-        DEFAULT_SERVER_STDOUT_VISIBILITY, DEFAULT_SKIP_SERVER_START, DEFAULT_WARMUP_TIME,
+        DEFAULT_MOVING_AVERAGE_WINDOW, DEFAULT_SAMPLING_TIME, DEFAULT_WARMUP_TIME,
     },
     transport::BenchmarkTransportCommand,
 };
@@ -32,9 +31,7 @@ use bench_report::numeric_parameter::BenchmarkNumericParameter;
 use clap::error::ErrorKind;
 use clap::{CommandFactory, Parser};
 use iggy::prelude::{IggyByteSize, IggyDuration, TransportProtocol};
-use std::net::SocketAddr;
 use std::num::NonZeroU32;
-use std::path::Path;
 use std::str::FromStr;
 
 #[derive(Parser, Debug)]
@@ -72,10 +69,6 @@ pub struct IggyBenchArgs {
     #[arg(long, short = 'w', default_value_t = IggyDuration::from_str(DEFAULT_WARMUP_TIME).unwrap())]
     pub warmup_time: IggyDuration,
 
-    /// Server stdout visibility
-    #[arg(long, short = 'v', default_value_t = DEFAULT_SERVER_STDOUT_VISIBILITY)]
-    pub verbose: bool,
-
     /// Sampling time for metrics collection. It is also used as bucket size for time series calculations.
     #[arg(long, short = 't', default_value_t = IggyDuration::from_str(DEFAULT_SAMPLING_TIME).unwrap(), value_parser = IggyDuration::from_str)]
     pub sampling_time: IggyDuration,
@@ -84,32 +77,9 @@ pub struct IggyBenchArgs {
     #[arg(long, short = 'W', default_value_t = DEFAULT_MOVING_AVERAGE_WINDOW)]
     pub moving_average_window: u32,
 
-    /// Shutdown iggy-server and remove server `local_data` directory after the benchmark is finished.
-    /// Only applicable to local benchmarks.
-    #[arg(long, default_value_t = DEFAULT_PERFORM_CLEANUP, verbatim_doc_comment)]
-    pub cleanup: bool,
-
-    /// iggy-server executable path.
-    /// Only applicable to local benchmarks.
-    #[arg(long, short='e', default_value = None, value_parser = validate_server_executable_path)]
-    pub server_executable_path: Option<String>,
-
-    /// Skip server start.
-    /// Only applicable to local benchmarks.
-    #[arg(long, short = 'k', default_value_t = DEFAULT_SKIP_SERVER_START, verbatim_doc_comment)]
-    pub skip_server_start: bool,
-
     /// Use high-level API for actors
     #[arg(long, short = 'H', default_value_t = false)]
     pub high_level_api: bool,
-}
-
-fn validate_server_executable_path(v: &str) -> Result<String, String> {
-    if Path::new(v).exists() {
-        Ok(v.to_owned())
-    } else {
-        Err(format!("Provided server executable '{v}' does not exist."))
-    }
 }
 
 impl IggyBenchArgs {
@@ -133,19 +103,6 @@ impl IggyBenchArgs {
     }
 
     pub fn validate(&mut self) {
-        let server_address = self.server_address().parse::<SocketAddr>().unwrap();
-        if (self.cleanup || self.verbose) && !server_address.ip().is_loopback() {
-            Self::command()
-                .error(
-                    ErrorKind::ArgumentConflict,
-                    format!(
-                        "Cannot use cleanup or verbose flags with a non-loopback server address: {}",
-                        self.server_address()
-                    ),
-                )
-                .exit();
-        }
-
         if self.output_dir().is_none()
             && (self.gitref().is_some()
                 || self.identifier().is_some()

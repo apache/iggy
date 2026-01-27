@@ -24,9 +24,9 @@ use crate::actors::{
     },
 };
 
+use crate::utils::{ClientFactory, login_root};
 use futures_util::StreamExt;
 use iggy::prelude::*;
-use integration::test_server::{ClientFactory, login_root};
 use std::{sync::Arc, time::Duration};
 use tokio::time::{Instant, timeout};
 use tracing::{error, warn};

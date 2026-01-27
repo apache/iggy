@@ -4,7 +4,7 @@
         <PackageId>Apache.Iggy</PackageId>
         <ImplicitUsings>enable</ImplicitUsings>
         <Nullable>enable</Nullable>
-        <TargetFramework>net8.0</TargetFramework>
+        <TargetFrameworks>net8.0;net10.0</TargetFrameworks>
         <AssemblyName>Apache.Iggy</AssemblyName>
         <RootNamespace>Apache.Iggy</RootNamespace>
         <PackageVersion>0.6.1-edge.1</PackageVersion>
@@ -16,9 +16,15 @@
         <Authors>Apache Iggy</Authors>
         <IsPackable>true</IsPackable>
         <PackageTags>SDK Iggy Messaging</PackageTags>
+        <RepositoryType>git</RepositoryType>
         <RepositoryUrl>https://github.com/apache/iggy</RepositoryUrl>
+        <PackageProjectUrl>https://github.com/apache/iggy</PackageProjectUrl>
         <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
         <PackageReadmeFile>README.md</PackageReadmeFile>
+
+        <PublishRepositoryUrl>true</PublishRepositoryUrl>
+        <IncludeSymbols>true</IncludeSymbols>
+        <SymbolPackageFormat>snupkg</SymbolPackageFormat>
     </PropertyGroup>
 
     <PropertyGroup Condition=" '$(Configuration)' == 'Debug' ">

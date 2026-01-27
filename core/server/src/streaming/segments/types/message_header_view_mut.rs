@@ -89,19 +89,4 @@ impl<'a> IggyMessageHeaderViewMut<'a> {
         let bytes = value.to_le_bytes();
         self.data[IGGY_MESSAGE_TIMESTAMP_OFFSET_RANGE].copy_from_slice(&bytes);
     }
-
-    pub fn set_origin_timestamp(&mut self, value: u64) {
-        let bytes = value.to_le_bytes();
-        self.data[IGGY_MESSAGE_ORIGIN_TIMESTAMP_OFFSET_RANGE].copy_from_slice(&bytes);
-    }
-
-    pub fn set_headers_length(&mut self, value: u32) {
-        let bytes = value.to_le_bytes();
-        self.data[IGGY_MESSAGE_HEADERS_LENGTH_OFFSET_RANGE].copy_from_slice(&bytes);
-    }
-
-    pub fn set_payload_length(&mut self, value: u32) {
-        let bytes = value.to_le_bytes();
-        self.data[IGGY_MESSAGE_PAYLOAD_LENGTH_OFFSET_RANGE].copy_from_slice(&bytes);
-    }
 }

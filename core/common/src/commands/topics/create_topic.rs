@@ -40,7 +40,7 @@ use std::str::from_utf8;
 ///   Can't be lower than segment size in the config.
 /// - `replication_factor` - replication factor for the topic.
 /// - `name` - unique topic name, max length is 255 characters.
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 pub struct CreateTopic {
     /// Unique stream ID (numeric or name).
     #[serde(skip)]

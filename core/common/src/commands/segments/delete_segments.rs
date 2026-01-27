@@ -31,7 +31,7 @@ use std::fmt::Display;
 /// - `topic_id` - unique topic ID (numeric or name).
 /// - `partition_id` - unique partition ID (numeric or name).
 /// - `segments_count` - number of segments in the partition to delete.
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 pub struct DeleteSegments {
     /// Unique stream ID (numeric or name).
     #[serde(skip)]

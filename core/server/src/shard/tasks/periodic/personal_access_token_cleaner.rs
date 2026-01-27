@@ -19,10 +19,12 @@
 use crate::shard::IggyShard;
 use iggy_common::{IggyError, IggyTimestamp};
 use std::rc::Rc;
-use std::sync::Arc;
 use tracing::{info, trace};
 
 pub fn spawn_personal_access_token_cleaner(shard: Rc<IggyShard>) {
+    if shard.id != 0 {
+        return;
+    }
     let period = shard
         .config
         .personal_access_token
@@ -48,23 +50,31 @@ async fn clear_personal_access_tokens(shard: Rc<IggyShard>) -> Result<(), IggyEr
     let now = IggyTimestamp::now();
     let mut total_removed = 0;
 
-    let users = shard.users.values();
-    for user in &users {
-        let expired_tokens: Vec<Arc<str>> = user
-            .personal_access_tokens
+    let user_ids: Vec<u32> = shard
+        .metadata
+        .get_all_users()
+        .iter()
+        .map(|u| u.id)
+        .collect();
+
+    for user_id in user_ids {
+        let pats = shard.metadata.get_user_personal_access_tokens(user_id);
+
+        let expired_tokens: Vec<_> = pats
             .iter()
-            .filter(|entry| entry.value().is_expired(now))
-            .map(|entry| entry.key().clone())
+            .filter(|pat| pat.is_expired(now))
+            .map(|pat| (pat.name.clone(), pat.token.clone()))
             .collect();
 
-        for token_hash in expired_tokens {
-            if let Some((_, pat)) = user.personal_access_tokens.remove(&token_hash) {
-                info!(
-                    "Removed expired personal access token '{}' for user ID {}",
-                    pat.name, user.id
-                );
-                total_removed += 1;
-            }
+        for (name, token_hash) in expired_tokens {
+            shard
+                .writer()
+                .delete_personal_access_token(user_id, token_hash);
+            info!(
+                "Removed expired personal access token '{}' for user ID {}",
+                name, user_id
+            );
+            total_removed += 1;
         }
     }
 

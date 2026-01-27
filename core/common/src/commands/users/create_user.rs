@@ -34,7 +34,7 @@ use std::str::from_utf8;
 /// - `password` - password of the user, must be between 3 and 100 characters long.
 /// - `status` - status of the user, can be either `active` or `inactive`.
 /// - `permissions` - optional permissions of the user. If not provided, user will have no permissions.
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 pub struct CreateUser {
     /// Unique name of the user, must be between 3 and 50 characters long.
     pub username: String,

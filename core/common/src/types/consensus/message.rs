@@ -141,6 +141,22 @@ where
         }
     }
 
+    /// Get the message body as zero-copy `Bytes`.
+    ///
+    /// Returns an empty `Bytes` if there is no body.
+    #[inline]
+    #[allow(unused)]
+    pub fn body_bytes(&self) -> Bytes {
+        let header_size = size_of::<H>();
+        let total_size = self.header().size() as usize;
+
+        if total_size > header_size {
+            self.buffer.slice(header_size..total_size)
+        } else {
+            Bytes::new()
+        }
+    }
+
     /// Get the complete message as bytes (header + body).
     #[inline]
     #[allow(unused)]

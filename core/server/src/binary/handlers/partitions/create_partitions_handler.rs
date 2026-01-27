@@ -21,17 +21,17 @@ use crate::binary::command::{
 };
 use crate::binary::handlers::partitions::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
-
 use crate::shard::IggyShard;
 use crate::shard::transmission::event::ShardEvent;
-use crate::slab::traits_ext::EntityMarker;
+use crate::shard::transmission::frame::ShardResponse;
+use crate::shard::transmission::message::{
+    ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult,
+};
 use crate::state::command::EntryCommand;
 use crate::streaming::session::Session;
-use crate::streaming::{streams, topics};
-use anyhow::Result;
 use err_trail::ErrContext;
 use iggy_common::create_partitions::CreatePartitions;
-use iggy_common::{IggyError, SenderKind};
+use iggy_common::{Identifier, IggyError, SenderKind};
 use std::rc::Rc;
 use tracing::{debug, instrument};
 
@@ -52,53 +52,92 @@ impl ServerCommandHandler for CreatePartitions {
         shard.ensure_authenticated(session)?;
         let (stream_id_numeric, topic_id_numeric) =
             shard.resolve_topic_id(&self.stream_id, &self.topic_id)?;
-        shard.permissioner.borrow().create_partitions(
+        shard.metadata.perm_create_partitions(
             session.get_user_id(),
             stream_id_numeric,
             topic_id_numeric,
         )?;
 
-        // Acquire partition lock to serialize filesystem operations
-        let _partition_guard = shard.fs_locks.partition_lock.lock().await;
-
-        let partitions = shard
-            .create_partitions(&self.stream_id, &self.topic_id, self.partitions_count)
-            .await?;
-        let partition_ids = partitions.iter().map(|p| p.id()).collect::<Vec<_>>();
-        let event = ShardEvent::CreatedPartitions {
-            stream_id: self.stream_id.clone(),
-            topic_id: self.topic_id.clone(),
-            partitions,
+        let request = ShardRequest {
+            stream_id: Identifier::default(),
+            topic_id: Identifier::default(),
+            partition_id: 0,
+            payload: ShardRequestPayload::CreatePartitions {
+                user_id: session.get_user_id(),
+                stream_id: self.stream_id.clone(),
+                topic_id: self.topic_id.clone(),
+                partitions_count: self.partitions_count,
+            },
         };
-        shard.broadcast_event_to_all_shards(event).await?;
 
-        shard.streams.with_topic_by_id_mut(
-            &self.stream_id,
-            &self.topic_id,
-            topics::helpers::rebalance_consumer_groups(&partition_ids),
-        );
+        let message = ShardMessage::Request(request);
+        match shard.send_request_to_shard_or_recoil(None, message).await? {
+            ShardSendRequestResult::Recoil(message) => {
+                if let ShardMessage::Request(ShardRequest { payload, .. }) = message
+                    && let ShardRequestPayload::CreatePartitions {
+                        stream_id,
+                        topic_id,
+                        partitions_count,
+                        ..
+                    } = payload
+                {
+                    let _partition_guard = shard.fs_locks.partition_lock.lock().await;
 
-        let stream_id = shard
-            .streams
-            .with_stream_by_id(&self.stream_id, streams::helpers::get_stream_id());
-        let topic_id = shard.streams.with_topic_by_id(
-            &self.stream_id,
-            &self.topic_id,
-            topics::helpers::get_topic_id(),
-        );
-        shard
-        .state
-        .apply(
-            session.get_user_id(),
-            &EntryCommand::CreatePartitions(self),
-        )
-        .await
-        .error(|e: &IggyError| {
-            format!(
-                "{COMPONENT} (error: {e}) - failed to apply create partitions for stream_id: {stream_id}, topic_id: {topic_id}, session: {session}"
-            )
-        })?;
-        sender.send_empty_ok_response().await?;
+                    // Get numeric IDs BEFORE create (for rebalance operation)
+                    let (numeric_stream_id, numeric_topic_id) =
+                        shard.resolve_topic_id(&stream_id, &topic_id)?;
+
+                    let partition_infos = shard
+                        .create_partitions(&stream_id, &topic_id, partitions_count)
+                        .await?;
+
+                    let event = ShardEvent::CreatedPartitions {
+                        stream_id: stream_id.clone(),
+                        topic_id: topic_id.clone(),
+                        partitions: partition_infos,
+                    };
+                    shard.broadcast_event_to_all_shards(event).await?;
+
+                    let total_partition_count = shard
+                        .metadata
+                        .partitions_count(numeric_stream_id, numeric_topic_id)
+                        as u32;
+                    shard.writer().rebalance_consumer_groups_for_topic(
+                        numeric_stream_id,
+                        numeric_topic_id,
+                        total_partition_count,
+                    );
+
+                    shard
+                        .state
+                        .apply(session.get_user_id(), &EntryCommand::CreatePartitions(self))
+                        .await
+                        .error(|e: &IggyError| {
+                            format!(
+                                "{COMPONENT} (error: {e}) - failed to apply create partitions for stream_id: {numeric_stream_id}, topic_id: {numeric_topic_id}, session: {session}"
+                            )
+                        })?;
+
+                    sender.send_empty_ok_response().await?;
+                } else {
+                    unreachable!(
+                        "Expected a CreatePartitions request inside of CreatePartitions handler, impossible state"
+                    );
+                }
+            }
+            ShardSendRequestResult::Response(response) => match response {
+                ShardResponse::CreatePartitionsResponse(_partitions) => {
+                    sender.send_empty_ok_response().await?;
+                }
+                ShardResponse::ErrorResponse(err) => {
+                    return Err(err);
+                }
+                _ => unreachable!(
+                    "Expected a CreatePartitionsResponse inside of CreatePartitions handler, impossible state"
+                ),
+            },
+        }
+
         Ok(HandlerResult::Finished)
     }
 }

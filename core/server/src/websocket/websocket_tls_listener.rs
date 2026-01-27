@@ -209,7 +209,7 @@ async fn accept_loop(
                                             if let Err(error) = handle_connection(&session, &mut sender_kind, &shard_clone, client_stop_receiver).await {
                                                 handle_error(error);
                                             }
-                                            shard_clone.delete_client(session.client_id);
+                                            shard_clone.delete_client(session.client_id).await;
                                             registry_clone.remove_connection(&client_id);
 
                                             match sender_kind.shutdown().await {

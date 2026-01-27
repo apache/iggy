@@ -17,7 +17,6 @@
  */
 
 use crate::shard::IggyShard;
-use crate::slab::traits_ext::{EntityComponentSystem, IntoComponents};
 use crate::{SEMANTIC_VERSION, VERSION};
 use iggy_common::{IggyDuration, IggyError, Stats};
 use std::cell::RefCell;
@@ -90,42 +89,34 @@ impl IggyShard {
                 stats.written_bytes = disk_usage.total_written_bytes.into();
             }
 
-            self.streams.with_components(|stream_components| {
-                let (stream_roots, stream_stats) = stream_components.into_components();
-                // Iterate through all streams
-                for (stream_id, stream_root) in stream_roots.iter() {
-                    stats.streams_count += 1;
-
-                    // Get stream-level stats
-                    if let Some(stream_stat) = stream_stats.get(stream_id) {
-                        stats.messages_count += stream_stat.messages_count_inconsistent();
-                        stats.segments_count += stream_stat.segments_count_inconsistent();
-                        stats.messages_size_bytes += stream_stat.size_bytes_inconsistent().into();
-                    }
-
-                    // Access topics within this stream
-                    stream_root.topics().with_components(|topic_components| {
-                        let (topic_roots, ..) = topic_components.into_components();
-                        stats.topics_count += topic_roots.len() as u32;
-
-                        // Iterate through all topics in this stream
-                        for (_, topic_root) in topic_roots.iter() {
-                            // Count partitions in this topic
-                            topic_root
-                                .partitions()
-                                .with_components(|partition_components| {
-                                    let (partition_roots, ..) =
-                                        partition_components.into_components();
-                                    stats.partitions_count += partition_roots.len() as u32;
-                                });
-
-                            // Count consumer groups in this topic
-                            stats.consumer_groups_count +=
-                                topic_root.consumer_groups().len() as u32;
+            let (streams_count, topics_count, partitions_count, consumer_groups_count, stream_ids) =
+                self.metadata.with_metadata(|m| {
+                    let mut topics = 0u32;
+                    let mut partitions = 0u32;
+                    let mut cg = 0u32;
+                    let ids: Vec<_> = m.streams.iter().map(|(k, _)| k).collect();
+                    for (_, stream) in m.streams.iter() {
+                        topics += stream.topics.len() as u32;
+                        for (_, topic) in stream.topics.iter() {
+                            partitions += topic.partitions.len() as u32;
+                            cg += topic.consumer_groups.len() as u32;
                         }
-                    });
+                    }
+                    (m.streams.len() as u32, topics, partitions, cg, ids)
+                });
+
+            stats.streams_count = streams_count;
+            stats.topics_count = topics_count;
+            stats.partitions_count = partitions_count;
+            stats.consumer_groups_count = consumer_groups_count;
+
+            for stream_id in stream_ids {
+                if let Some(stream_stat) = self.metadata.get_stream_stats(stream_id) {
+                    stats.messages_count += stream_stat.messages_count_inconsistent();
+                    stats.segments_count += stream_stat.segments_count_inconsistent();
+                    stats.messages_size_bytes += stream_stat.size_bytes_inconsistent().into();
                 }
-            });
+            }
 
             Ok(stats)
         })

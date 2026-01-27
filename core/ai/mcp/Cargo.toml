@@ -17,7 +17,7 @@
 
 [package]
 name = "iggy-mcp"
-version = "0.2.1-edge.3"
+version = "0.2.1-edge.4"
 description = "MCP Server for Iggy message streaming platform"
 edition = "2024"
 license = "Apache-2.0"
@@ -35,6 +35,12 @@ figlet-rs = { workspace = true }
 figment = { workspace = true }
 iggy = { workspace = true }
 iggy_common = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry-appender-tracing = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+opentelemetry-semantic-conventions = { workspace = true }
+opentelemetry_sdk = { workspace = true, features = ["rt-tokio"] }
+reqwest = { workspace = true }
 rmcp = { version = "0.13.0", features = [
     "server",
     "transport-io",
@@ -47,6 +53,7 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tower-http = { workspace = true }
 tracing = { workspace = true }
+tracing-opentelemetry = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]

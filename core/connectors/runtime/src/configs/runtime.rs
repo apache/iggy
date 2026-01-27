@@ -18,6 +18,7 @@
  */
 
 use crate::api::config::HttpConfig;
+use derive_more::Display;
 use figment::providers::{Format, Toml};
 use figment::value::Dict;
 use figment::{Metadata, Profile, Provider};
@@ -27,11 +28,111 @@ use serde::{Deserialize, Serialize};
 use serde_with::{DisplayFromStr, serde_as};
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
+use std::str::FromStr;
 
 const SECRET_KEYS: [&str; 2] = [
     "IGGY_CONNECTORS_IGGY_PASSWORD",
     "IGGY_CONNECTORS_IGGY_TOKEN",
 ];
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct TelemetryConfig {
+    pub enabled: bool,
+    pub service_name: String,
+    pub logs: TelemetryLogsConfig,
+    pub traces: TelemetryTracesConfig,
+}
+
+impl Default for TelemetryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            service_name: "iggy-connectors".to_owned(),
+            logs: TelemetryLogsConfig::default(),
+            traces: TelemetryTracesConfig::default(),
+        }
+    }
+}
+
+impl Display for TelemetryConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{{ enabled: {}, service_name: {}, logs: {}, traces: {} }}",
+            self.enabled, self.service_name, self.logs, self.traces
+        )
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct TelemetryLogsConfig {
+    pub transport: TelemetryTransport,
+    pub endpoint: String,
+}
+
+impl Default for TelemetryLogsConfig {
+    fn default() -> Self {
+        Self {
+            transport: TelemetryTransport::Grpc,
+            endpoint: "http://localhost:4317".to_owned(),
+        }
+    }
+}
+
+impl Display for TelemetryLogsConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{{ transport: {}, endpoint: {} }}",
+            self.transport, self.endpoint
+        )
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct TelemetryTracesConfig {
+    pub transport: TelemetryTransport,
+    pub endpoint: String,
+}
+
+impl Default for TelemetryTracesConfig {
+    fn default() -> Self {
+        Self {
+            transport: TelemetryTransport::Grpc,
+            endpoint: "http://localhost:4317".to_owned(),
+        }
+    }
+}
+
+impl Display for TelemetryTracesConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{{ transport: {}, endpoint: {} }}",
+            self.transport, self.endpoint
+        )
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Display, Copy, Clone)]
+#[serde(rename_all = "lowercase")]
+pub enum TelemetryTransport {
+    #[display("grpc")]
+    Grpc,
+    #[display("http")]
+    Http,
+}
+
+impl FromStr for TelemetryTransport {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "grpc" => Ok(TelemetryTransport::Grpc),
+            "http" => Ok(TelemetryTransport::Http),
+            _ => Err(format!("Invalid telemetry transport: {s}")),
+        }
+    }
+}
 
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
 #[serde(default)]
@@ -40,6 +141,7 @@ pub struct ConnectorsRuntimeConfig {
     pub iggy: IggyConfig,
     pub connectors: ConnectorsConfig,
     pub state: StateConfig,
+    pub telemetry: TelemetryConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -174,8 +276,8 @@ impl Display for ConnectorsRuntimeConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ http: {}, iggy: {}, connectors: {}, state: {:} }}",
-            self.http, self.iggy, self.connectors, self.state
+            "{{ http: {}, iggy: {}, connectors: {}, state: {}, telemetry: {} }}",
+            self.http, self.iggy, self.connectors, self.state, self.telemetry
         )
     }
 }

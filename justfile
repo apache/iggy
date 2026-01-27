@@ -48,8 +48,8 @@ nextest: build
 nextests TEST: build
   cargo nextest run --nocapture -- {{TEST}}
 
-server:
-  cargo run --bin iggy-server
+server *ARGS:
+  cargo run --bin iggy-server {{ARGS}}
 
 run-benches:
   ./scripts/run-benches.sh
