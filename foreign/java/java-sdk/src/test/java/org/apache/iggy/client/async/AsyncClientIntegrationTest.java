@@ -389,6 +389,7 @@ class AsyncClientIntegrationTest {
 
         log.info("Successfully completed {} concurrent operations", operations.size());
     }
+
     @Test
     @Order(11)
     public void testConnectionPoolMetrics() {
