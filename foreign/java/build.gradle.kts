@@ -24,6 +24,10 @@ plugins {
     jacoco
 }
 
+repositories {
+    mavenCentral()
+}
+
 subprojects {
     apply(plugin = "com.diffplug.spotless")
 
