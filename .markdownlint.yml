@@ -21,4 +21,4 @@ MD013:
   tables: false
 MD033:
   allowed_elements: [details, summary, img]
-MD041: false # First line in file should be a top level heading
+MD041: false
