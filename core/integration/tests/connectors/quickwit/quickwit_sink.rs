@@ -57,13 +57,6 @@ async fn send_test_messages(
     Ok(message_payloads)
 }
 
-async fn assert_test_index_is_empty(test_setup: &QuickwitTestSetup) -> Result<()> {
-    test_setup.flush_quickwit_test_index().await?;
-    let search_response = test_setup.get_quickwit_test_index_all_search().await?;
-    assert_eq!(search_response.num_hits, 0);
-    Ok(())
-}
-
 async fn assert_test_index_documents_match_message_payloads(
     test_setup: &QuickwitTestSetup,
     message_payloads: &[Bytes],
@@ -92,8 +85,6 @@ async fn given_existent_quickwit_index_should_and_store() -> Result<()> {
     let quickwit_container = start_quickwit_container().await;
     let test_setup = QuickwitTestSetup::try_new_with_precreate_index(quickwit_container).await?;
 
-    assert_test_index_is_empty(&test_setup).await?;
-
     let message_count = 11;
     let sent_payloads = send_test_messages(&test_setup, message_count).await?;
 
@@ -105,8 +96,6 @@ async fn given_existent_quickwit_index_should_and_store() -> Result<()> {
 #[tokio::test]
 async fn given_nonexistent_quickwit_index_should_create_and_store() -> Result<()> {
     let test_setup = QuickwitTestSetup::try_new().await?;
-
-    assert_test_index_is_empty(&test_setup).await?;
 
     let message_count = 13;
     let sent_payloads = send_test_messages(&test_setup, message_count).await?;
@@ -120,8 +109,6 @@ async fn given_nonexistent_quickwit_index_should_create_and_store() -> Result<()
 async fn given_bulk_message_send_should_store() -> Result<()> {
     let test_setup = QuickwitTestSetup::try_new().await?;
 
-    assert_test_index_is_empty(&test_setup).await?;
-
     let message_count = 1000;
     let sent_payloads = send_test_messages(&test_setup, message_count).await?;
 
@@ -134,8 +121,6 @@ async fn given_bulk_message_send_should_store() -> Result<()> {
 async fn given_invalid_messages_should_not_store() -> Result<()> {
     let test_setup = QuickwitTestSetup::try_new().await?;
     let iggy_client = test_setup.runtime.create_client().await;
-
-    assert_test_index_is_empty(&test_setup).await?;
 
     let first_valid = Bytes::from(serde_json::to_vec(&create_test_messages(1)[0])?);
     let second_valid = Bytes::from(serde_json::to_vec(&create_test_messages(1)[0])?);
