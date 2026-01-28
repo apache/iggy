@@ -71,36 +71,24 @@ impl IggyShard {
 
         let (personal_access_token, token) =
             PersonalAccessToken::new(user_id, name, IggyTimestamp::now(), expiry);
-        self.create_personal_access_token_base(personal_access_token.clone())?;
-        Ok((personal_access_token, token))
-    }
 
-    fn create_personal_access_token_base(
-        &self,
-        personal_access_token: PersonalAccessToken,
-    ) -> Result<(), IggyError> {
-        let user_id = personal_access_token.user_id;
-        let name = personal_access_token.name.clone();
-
-        if self.metadata.user_has_pat_with_name(user_id, &name) {
-            error!("Personal access token: {name} for user with ID: {user_id} already exists.");
+        let pat_name = personal_access_token.name.clone();
+        if self.metadata.user_has_pat_with_name(user_id, &pat_name) {
+            error!("Personal access token: {pat_name} for user with ID: {user_id} already exists.");
             return Err(IggyError::PersonalAccessTokenAlreadyExists(
-                name.to_string(),
+                pat_name.to_string(),
                 user_id,
             ));
         }
 
         self.writer()
-            .add_personal_access_token(user_id, personal_access_token);
-        info!("Created personal access token: {name} for user with ID: {user_id}.");
-        Ok(())
+            .add_personal_access_token(user_id, personal_access_token.clone());
+        info!("Created personal access token: {pat_name} for user with ID: {user_id}.");
+
+        Ok((personal_access_token, token))
     }
 
     pub fn delete_personal_access_token(&self, user_id: u32, name: &str) -> Result<(), IggyError> {
-        self.delete_personal_access_token_base(user_id, name)
-    }
-
-    fn delete_personal_access_token_base(&self, user_id: u32, name: &str) -> Result<(), IggyError> {
         let token_hash =
             self.metadata
                 .find_pat_token_hash_by_name(user_id, name)

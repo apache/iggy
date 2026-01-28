@@ -20,6 +20,7 @@ use crate::binary::command::{
     BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
 };
 use crate::binary::handlers::utils::receive_and_validate;
+use crate::binary::mapper;
 use crate::shard::IggyShard;
 use crate::streaming::session::Session;
 use iggy_common::IggyError;
@@ -43,16 +44,15 @@ impl ServerCommandHandler for GetTopics {
         debug!("session: {session}, command: {self}");
         shard.ensure_authenticated(session)?;
 
-        let Some(numeric_stream_id) = shard.metadata.get_stream_id(&self.stream_id) else {
+        let Some(topics) = shard
+            .metadata
+            .query_topics(session.get_user_id(), &self.stream_id)?
+        else {
             sender.send_empty_ok_response().await?;
             return Ok(HandlerResult::Finished);
         };
 
-        shard
-            .metadata
-            .perm_get_topics(session.get_user_id(), numeric_stream_id)?;
-
-        let response = shard.get_topics_from_metadata(numeric_stream_id);
+        let response = mapper::map_topics(&topics);
         sender.send_ok_response(&response).await?;
         Ok(HandlerResult::Finished)
     }

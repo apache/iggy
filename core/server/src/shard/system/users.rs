@@ -117,10 +117,6 @@ impl IggyShard {
     }
 
     pub fn delete_user(&self, user_id: &Identifier) -> Result<User, IggyError> {
-        self.delete_user_base(user_id)
-    }
-
-    fn delete_user_base(&self, user_id: &Identifier) -> Result<User, IggyError> {
         let user = self.get_user(user_id).error(|e: &IggyError| {
             format!("{COMPONENT} (error: {e}) - failed to get user with id: {user_id}")
         })?;
@@ -152,15 +148,6 @@ impl IggyShard {
         username: Option<String>,
         status: Option<UserStatus>,
     ) -> Result<User, IggyError> {
-        self.update_user_base(user_id, username, status)
-    }
-
-    fn update_user_base(
-        &self,
-        user_id: &Identifier,
-        username: Option<String>,
-        status: Option<UserStatus>,
-    ) -> Result<User, IggyError> {
         let user = self.get_user(user_id)?;
         let numeric_user_id = user.id;
 
@@ -175,14 +162,6 @@ impl IggyShard {
     }
 
     pub fn update_permissions(
-        &self,
-        user_id: &Identifier,
-        permissions: Option<Permissions>,
-    ) -> Result<(), IggyError> {
-        self.update_permissions_base(user_id, permissions)
-    }
-
-    fn update_permissions_base(
         &self,
         user_id: &Identifier,
         permissions: Option<Permissions>,
@@ -216,22 +195,12 @@ impl IggyShard {
         current_password: &str,
         new_password: &str,
     ) -> Result<(), IggyError> {
-        self.change_password_base(user_id, current_password, new_password)
-    }
-
-    fn change_password_base(
-        &self,
-        user_id: &Identifier,
-        current_password: &str,
-        new_password: &str,
-    ) -> Result<(), IggyError> {
         let user = self.get_user(user_id).error(|e: &IggyError| {
             format!(
                 "{COMPONENT} change password (error: {e}) - failed to get user with id: {user_id}"
             )
         })?;
 
-        // Verify current password
         if !crypto::verify_password(current_password, &user.password) {
             error!(
                 "Invalid current password for user: {} with ID: {user_id}.",
@@ -325,11 +294,6 @@ impl IggyShard {
 
     pub fn logout_user(&self, session: &Session) -> Result<(), IggyError> {
         let client_id = session.client_id;
-        self.logout_user_base(client_id)?;
-        Ok(())
-    }
-
-    fn logout_user_base(&self, client_id: u32) -> Result<(), IggyError> {
         if client_id > 0 {
             self.client_manager.clear_user_id(client_id)?;
         }

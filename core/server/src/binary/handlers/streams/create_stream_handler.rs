@@ -19,19 +19,14 @@
 use crate::binary::command::{
     BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
 };
-use crate::binary::handlers::streams::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
+use crate::binary::mapper;
 use crate::shard::IggyShard;
 use crate::shard::transmission::frame::ShardResponse;
-use crate::shard::transmission::message::{
-    ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult,
-};
-use crate::state::command::EntryCommand;
-use crate::state::models::CreateStreamWithId;
+use crate::shard::transmission::message::{ShardRequest, ShardRequestPayload};
 use crate::streaming::session::Session;
-use err_trail::ErrContext;
 use iggy_common::create_stream::CreateStream;
-use iggy_common::{Identifier, IggyError, SenderKind};
+use iggy_common::{IggyError, SenderKind};
 use std::rc::Rc;
 use tracing::{debug, instrument};
 
@@ -50,63 +45,20 @@ impl ServerCommandHandler for CreateStream {
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
         shard.ensure_authenticated(session)?;
-        shard.metadata.perm_create_stream(session.get_user_id())?;
 
-        let request = ShardRequest {
-            stream_id: Identifier::default(),
-            topic_id: Identifier::default(),
-            partition_id: 0,
-            payload: ShardRequestPayload::CreateStream {
-                user_id: session.get_user_id(),
-                name: self.name.clone(),
-            },
-        };
+        let request = ShardRequest::control_plane(ShardRequestPayload::CreateStreamRequest {
+            user_id: session.get_user_id(),
+            command: self,
+        });
 
-        let message = ShardMessage::Request(request);
-        match shard.send_request_to_shard_or_recoil(None, message).await? {
-            ShardSendRequestResult::Recoil(message) => {
-                if let ShardMessage::Request(ShardRequest { payload, .. }) = message
-                    && let ShardRequestPayload::CreateStream { name, .. } = payload
-                {
-                    // Acquire stream lock to serialize filesystem operations
-                    let _stream_guard = shard.fs_locks.stream_lock.lock().await;
-
-                    let created_stream_id = shard.create_stream(name).await?;
-
-                    let response = shard.get_stream_from_metadata(created_stream_id);
-
-                    shard
-                        .state
-                        .apply(session.get_user_id(), &EntryCommand::CreateStream(CreateStreamWithId {
-                            stream_id: created_stream_id as u32,
-                            command: self
-                        }))
-                        .await
-                        .error(|e: &IggyError| {
-                            format!(
-                                "{COMPONENT} (error: {e}) - failed to apply create stream for id: {created_stream_id}, session: {session}"
-                            )
-                        })?;
-
-                    sender.send_ok_response(&response).await?;
-                } else {
-                    unreachable!(
-                        "Expected a CreateStream request inside of CreateStream handler, impossible state"
-                    );
-                }
+        match shard.send_to_control_plane(request).await? {
+            ShardResponse::CreateStreamResponse(data) => {
+                sender
+                    .send_ok_response(&mapper::map_stream_from_response(&data))
+                    .await?;
             }
-            ShardSendRequestResult::Response(response) => match response {
-                ShardResponse::CreateStreamResponse(created_stream_id) => {
-                    let response = shard.get_stream_from_metadata(created_stream_id);
-                    sender.send_ok_response(&response).await?;
-                }
-                ShardResponse::ErrorResponse(err) => {
-                    return Err(err);
-                }
-                _ => unreachable!(
-                    "Expected a CreateStreamResponse inside of CreateStream handler, impossible state"
-                ),
-            },
+            ShardResponse::ErrorResponse(err) => return Err(err),
+            _ => unreachable!("Expected CreateStreamResponse"),
         }
 
         Ok(HandlerResult::Finished)

@@ -19,19 +19,13 @@
 use crate::binary::command::{
     BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
 };
-use crate::binary::handlers::topics::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
-
 use crate::shard::IggyShard;
 use crate::shard::transmission::frame::ShardResponse;
-use crate::shard::transmission::message::{
-    ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult,
-};
-use crate::state::command::EntryCommand;
+use crate::shard::transmission::message::{ShardRequest, ShardRequestPayload};
 use crate::streaming::session::Session;
-use err_trail::ErrContext;
 use iggy_common::update_topic::UpdateTopic;
-use iggy_common::{Identifier, IggyError, SenderKind};
+use iggy_common::{IggyError, SenderKind};
 use std::rc::Rc;
 use tracing::{debug, instrument};
 
@@ -42,7 +36,7 @@ impl ServerCommandHandler for UpdateTopic {
 
     #[instrument(skip_all, name = "trace_update_topic", fields(iggy_user_id = session.get_user_id(), iggy_client_id = session.client_id, iggy_stream_id = self.stream_id.as_string(), iggy_topic_id = self.topic_id.as_string()))]
     async fn handle(
-        mut self,
+        self,
         sender: &mut SenderKind,
         _length: u32,
         session: &Session,
@@ -50,90 +44,18 @@ impl ServerCommandHandler for UpdateTopic {
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
         shard.ensure_authenticated(session)?;
-        let (stream_id, topic_id) = shard.resolve_topic_id(&self.stream_id, &self.topic_id)?;
-        shard
-            .metadata
-            .perm_update_topic(session.get_user_id(), stream_id, topic_id)?;
 
-        let request = ShardRequest {
-            stream_id: Identifier::default(),
-            topic_id: Identifier::default(),
-            partition_id: 0,
-            payload: ShardRequestPayload::UpdateTopic {
-                user_id: session.get_user_id(),
-                stream_id: self.stream_id.clone(),
-                topic_id: self.topic_id.clone(),
-                name: self.name.clone(),
-                message_expiry: self.message_expiry,
-                compression_algorithm: self.compression_algorithm,
-                max_topic_size: self.max_topic_size,
-                replication_factor: self.replication_factor,
-            },
-        };
+        let request = ShardRequest::control_plane(ShardRequestPayload::UpdateTopicRequest {
+            user_id: session.get_user_id(),
+            command: self,
+        });
 
-        let message = ShardMessage::Request(request);
-        match shard.send_request_to_shard_or_recoil(None, message).await? {
-            ShardSendRequestResult::Recoil(message) => {
-                if let ShardMessage::Request(ShardRequest { payload, .. }) = message
-                    && let ShardRequestPayload::UpdateTopic {
-                        stream_id,
-                        topic_id,
-                        name,
-                        message_expiry,
-                        compression_algorithm,
-                        max_topic_size,
-                        replication_factor,
-                        ..
-                    } = payload
-                {
-                    // Get numeric IDs BEFORE update (name might change during update)
-                    let (stream_id_num, topic_id_num) =
-                        shard.resolve_topic_id(&stream_id, &topic_id)?;
-
-                    shard.update_topic(
-                        &stream_id,
-                        &topic_id,
-                        name.clone(),
-                        message_expiry,
-                        compression_algorithm,
-                        max_topic_size,
-                        replication_factor,
-                    )?;
-
-                    let (expiry, max_size) = shard
-                        .metadata
-                        .get_topic_config(stream_id_num, topic_id_num)
-                        .ok_or_else(|| {
-                            IggyError::TopicIdNotFound(topic_id.clone(), stream_id.clone())
-                        })?;
-                    self.message_expiry = expiry;
-                    self.max_topic_size = max_size;
-
-                    shard
-                        .state
-                        .apply(session.get_user_id(), &EntryCommand::UpdateTopic(self))
-                        .await
-                        .error(|e: &IggyError| format!(
-                            "{COMPONENT} (error: {e}) - failed to apply update topic with id: {topic_id} in stream with ID: {stream_id_num}, session: {session}"
-                        ))?;
-                    sender.send_empty_ok_response().await?;
-                } else {
-                    unreachable!(
-                        "Expected an UpdateTopic request inside of UpdateTopic handler, impossible state"
-                    );
-                }
+        match shard.send_to_control_plane(request).await? {
+            ShardResponse::UpdateTopicResponse => {
+                sender.send_empty_ok_response().await?;
             }
-            ShardSendRequestResult::Response(response) => match response {
-                ShardResponse::UpdateTopicResponse => {
-                    sender.send_empty_ok_response().await?;
-                }
-                ShardResponse::ErrorResponse(err) => {
-                    return Err(err);
-                }
-                _ => unreachable!(
-                    "Expected an UpdateTopicResponse inside of UpdateTopic handler, impossible state"
-                ),
-            },
+            ShardResponse::ErrorResponse(err) => return Err(err),
+            _ => unreachable!("Expected UpdateTopicResponse"),
         }
 
         Ok(HandlerResult::Finished)
