@@ -250,7 +250,6 @@ pub async fn load_segments(
 
         let messages_file_path = format!("{}/{}.{}", partition_path, log_file_name, LOG_EXTENSION);
         let index_file_path = format!("{}/{}.{}", partition_path, log_file_name, INDEX_EXTENSION);
-        let time_index_path = index_file_path.replace(INDEX_EXTENSION, "timeindex");
 
         async fn try_exists(path: &str) -> Result<bool, std::io::Error> {
             match compio::fs::metadata(path).await {
@@ -263,13 +262,12 @@ pub async fn load_segments(
         }
 
         let index_path_exists = try_exists(&index_file_path).await.unwrap();
-        let time_index_path_exists = try_exists(&time_index_path).await.unwrap();
         let index_cache_enabled = matches!(
             config.segment.cache_indexes,
             CacheIndexesConfig::All | CacheIndexesConfig::OpenSegment
         );
 
-        if index_cache_enabled && (!index_path_exists || time_index_path_exists) {
+        if index_cache_enabled && !index_path_exists {
             warn!(
                 "Index at path {} does not exist, rebuilding it based on {}...",
                 index_file_path, messages_file_path
@@ -291,10 +289,6 @@ pub async fn load_segments(
                 index_file_path,
                 now.elapsed().as_millis()
             );
-        }
-
-        if time_index_path_exists {
-            compio::fs::remove_file(&time_index_path).await.unwrap();
         }
 
         let messages_metadata = compio::fs::metadata(&messages_file_path)

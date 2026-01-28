@@ -362,14 +362,6 @@ async fn delete_segments(
             } else {
                 trace!("Deleted index file: {}", path);
             }
-
-            let time_index_path = path.replace(".index", ".timeindex");
-            if let Err(e) = compio::fs::remove_file(&time_index_path).await {
-                trace!(
-                    "Could not delete time index file {}: {}",
-                    time_index_path, e
-                );
-            }
         } else {
             warn!(
                 "Index writer path not found for segment starting at offset {}",
