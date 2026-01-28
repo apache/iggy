@@ -43,18 +43,13 @@ impl ServerCommandHandler for DeleteConsumerOffset {
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
         shard.ensure_authenticated(session)?;
-        let (stream_id, topic_id) = shard.resolve_topic_id(&self.stream_id, &self.topic_id)?;
+        let topic = shard.resolve_topic_for_delete_consumer_offset(
+            session.get_user_id(),
+            &self.stream_id,
+            &self.topic_id,
+        )?;
         shard
-            .metadata
-            .perm_delete_consumer_offset(session.get_user_id(), stream_id, topic_id)?;
-        shard
-            .delete_consumer_offset(
-                session.client_id,
-                self.consumer,
-                &self.stream_id,
-                &self.topic_id,
-                self.partition_id,
-            )
+            .delete_consumer_offset(session.client_id, self.consumer, topic, self.partition_id)
             .await
             .error(|e: &IggyError| format!("{COMPONENT} (error: {e}) - failed to delete consumer offset for topic with ID: {} in stream with ID: {} partition ID: {:#?}, session: {}",
                 self.topic_id, self.stream_id, self.partition_id, session

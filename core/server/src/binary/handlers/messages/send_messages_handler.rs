@@ -18,7 +18,7 @@
 
 use crate::binary::command::{BinaryServerCommand, HandlerResult, ServerCommandHandler};
 use crate::shard::IggyShard;
-use crate::shard::transmission::message::{ShardMessage, ShardRequest, ShardRequestPayload};
+use crate::shard::transmission::message::{ResolvedPartition, ShardRequest, ShardRequestPayload};
 use crate::streaming::segments::{IggyIndexesMut, IggyMessagesBatchMut};
 use crate::streaming::session::Session;
 use crate::streaming::topics;
@@ -107,18 +107,16 @@ impl ServerCommandHandler for SendMessages {
         let batch = IggyMessagesBatchMut::from_indexes_and_messages(indexes, messages_buffer);
         batch.validate()?;
 
-        let (numeric_stream_id, numeric_topic_id) =
-            shard.resolve_topic_id(&self.stream_id, &self.topic_id)?;
-        shard.metadata.perm_append_messages(
+        let topic = shard.resolve_topic_for_append(
             session.get_user_id(),
-            numeric_stream_id,
-            numeric_topic_id,
+            &self.stream_id,
+            &self.topic_id,
         )?;
 
         let partition_id = match self.partitioning.kind {
             PartitioningKind::Balanced => shard
                 .metadata
-                .get_next_partition_id(numeric_stream_id, numeric_topic_id)
+                .get_next_partition_id(topic.stream_id, topic.topic_id)
                 .ok_or(IggyError::TopicIdNotFound(
                     self.stream_id.clone(),
                     self.topic_id.clone(),
@@ -131,7 +129,7 @@ impl ServerCommandHandler for SendMessages {
             PartitioningKind::MessagesKey => {
                 let partitions_count = shard
                     .metadata
-                    .partitions_count(numeric_stream_id, numeric_topic_id);
+                    .partitions_count(topic.stream_id, topic.topic_id);
                 topics::helpers::calculate_partition_id_by_messages_key_hash(
                     partitions_count,
                     &self.partitioning.value,
@@ -139,7 +137,7 @@ impl ServerCommandHandler for SendMessages {
             }
         };
 
-        let namespace = IggyNamespace::new(numeric_stream_id, numeric_topic_id, partition_id);
+        let namespace = IggyNamespace::new(topic.stream_id, topic.topic_id, partition_id);
         let user_id = session.get_user_id();
         let unsupport_socket_transfer = matches!(
             self.partitioning.kind,
@@ -167,19 +165,9 @@ impl ServerCommandHandler for SendMessages {
                     initial_data: batch,
                 };
 
-                let request = ShardRequest::new(
-                    self.stream_id.clone(),
-                    self.topic_id.clone(),
-                    partition_id,
-                    payload,
-                );
+                let request = ShardRequest::data_plane(namespace, payload);
 
-                let socket_transfer_msg = ShardMessage::Request(request);
-
-                if let Err(e) = shard
-                    .send_request_to_shard_or_recoil(Some(&namespace), socket_transfer_msg)
-                    .await
-                {
+                if let Err(e) = shard.send_to_data_plane(request).await {
                     error!("transfer socket to another shard failed, drop connection. {e:?}");
                     return Ok(HandlerResult::Finished);
                 }
@@ -191,9 +179,12 @@ impl ServerCommandHandler for SendMessages {
             }
         }
 
-        shard
-            .append_messages(user_id, self.stream_id, self.topic_id, partition_id, batch)
-            .await?;
+        let partition = ResolvedPartition {
+            stream_id: topic.stream_id,
+            topic_id: topic.topic_id,
+            partition_id,
+        };
+        shard.append_messages(partition, batch).await?;
 
         sender.send_empty_ok_response().await?;
         Ok(HandlerResult::Finished)

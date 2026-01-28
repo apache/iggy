@@ -16,26 +16,22 @@
  * under the License.
  */
 
-use crate::http::COMPONENT;
 use crate::http::error::CustomError;
 use crate::http::jwt::json_web_token::Identity;
 use crate::http::shared::AppState;
+use crate::shard::transmission::frame::ShardResponse;
+use crate::shard::transmission::message::{ShardRequest, ShardRequestPayload};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::{delete, get};
 use axum::{Extension, Json, Router, debug_handler};
-use err_trail::ErrContext;
 use iggy_common::Identifier;
 use iggy_common::Validatable;
 use iggy_common::create_stream::CreateStream;
 use iggy_common::delete_stream::DeleteStream;
 use iggy_common::purge_stream::PurgeStream;
 use iggy_common::update_stream::UpdateStream;
-use iggy_common::{IggyError, Stream, StreamDetails};
-use send_wrapper::SendWrapper;
-
-use crate::state::command::EntryCommand;
-use crate::state::models::CreateStreamWithId;
+use iggy_common::{Stream, StreamDetails};
 use std::sync::Arc;
 use tracing::instrument;
 
@@ -102,53 +98,26 @@ async fn create_stream(
     Json(command): Json<CreateStream>,
 ) -> Result<Json<StreamDetails>, CustomError> {
     command.validate()?;
-    state
-        .shard
-        .shard()
-        .metadata
-        .perm_create_stream(identity.user_id)?;
 
-    let result = SendWrapper::new(async move {
-        let _stream_guard = state.shard.shard().fs_locks.stream_lock.lock().await;
-        // Create stream using wrapper method
-        let created_stream_id = state
-            .shard
-            .create_stream(command.name.clone())
-            .await
-            .error(|e: &IggyError| {
-                format!(
-                    "{COMPONENT} (error: {e}) - failed to create stream with name: {}",
-                    command.name
-                )
-            })?;
-
-        let entry_command = EntryCommand::CreateStream(CreateStreamWithId {
-            stream_id: created_stream_id as u32,
-            command,
-        });
-
-        state
-            .shard
-            .apply_state(identity.user_id, &entry_command)
-            .await
-            .error(|e: &IggyError| {
-                format!(
-                    "{COMPONENT} (error: {e}) - failed to apply create stream for id: {:?}",
-                    created_stream_id
-                )
-            })?;
-
-        let shard = state.shard.shard();
-        let stream_meta = shard
-            .metadata
-            .get_stream(created_stream_id)
-            .expect("Stream must exist after creation");
-        let response = crate::http::mapper::map_stream_details_from_metadata(&stream_meta);
-
-        Ok::<Json<StreamDetails>, CustomError>(Json(response))
+    let request = ShardRequest::control_plane(ShardRequestPayload::CreateStreamRequest {
+        user_id: identity.user_id,
+        command,
     });
 
-    result.await
+    match state.shard.send_to_control_plane(request).await? {
+        ShardResponse::CreateStreamResponse(data) => {
+            let stream_meta = state
+                .shard
+                .shard()
+                .metadata
+                .get_stream(data.id as usize)
+                .expect("Stream must exist after creation");
+            let response = crate::http::mapper::map_stream_details_from_metadata(&stream_meta);
+            Ok(Json(response))
+        }
+        ShardResponse::ErrorResponse(err) => Err(err.into()),
+        _ => unreachable!("Expected CreateStreamResponse"),
+    }
 }
 
 #[debug_handler]
@@ -162,34 +131,16 @@ async fn update_stream(
     command.stream_id = Identifier::from_str_value(&stream_id)?;
     command.validate()?;
 
-    let stream_id_numeric = state.shard.shard().resolve_stream_id(&command.stream_id)?;
-    state
-        .shard
-        .shard()
-        .metadata
-        .perm_update_stream(identity.user_id, stream_id_numeric)?;
-
-    let result = SendWrapper::new(async move {
-        // Update stream using wrapper method
-        state
-            .shard
-            .update_stream(&command.stream_id, command.name.clone())
-            .error(|e: &IggyError| {
-                format!(
-                    "{COMPONENT} (error: {e}) - failed to update stream, stream ID: {stream_id}"
-                )
-            })?;
-
-        let entry_command = EntryCommand::UpdateStream(command);
-        state.shard.apply_state(identity.user_id, &entry_command).await.error(|e: &IggyError| {
-            format!(
-                "{COMPONENT} (error: {e}) - failed to apply update stream, stream ID: {stream_id}"
-            )
-        })?;
-        Ok::<StatusCode, CustomError>(StatusCode::NO_CONTENT)
+    let request = ShardRequest::control_plane(ShardRequestPayload::UpdateStreamRequest {
+        user_id: identity.user_id,
+        command,
     });
 
-    result.await
+    match state.shard.send_to_control_plane(request).await? {
+        ShardResponse::UpdateStreamResponse => Ok(StatusCode::NO_CONTENT),
+        ShardResponse::ErrorResponse(err) => Err(err.into()),
+        _ => unreachable!("Expected UpdateStreamResponse"),
+    }
 }
 
 #[debug_handler]
@@ -199,43 +150,18 @@ async fn delete_stream(
     Extension(identity): Extension<Identity>,
     Path(stream_id): Path<String>,
 ) -> Result<StatusCode, CustomError> {
-    let identifier_stream_id = Identifier::from_str_value(&stream_id)?;
+    let stream_id = Identifier::from_str_value(&stream_id)?;
 
-    let stream_id_numeric = state
-        .shard
-        .shard()
-        .resolve_stream_id(&identifier_stream_id)?;
-    state
-        .shard
-        .shard()
-        .metadata
-        .perm_delete_stream(identity.user_id, stream_id_numeric)?;
+    let request = ShardRequest::control_plane(ShardRequestPayload::DeleteStreamRequest {
+        user_id: identity.user_id,
+        command: DeleteStream { stream_id },
+    });
 
-    let result =
-        SendWrapper::new(async move {
-            let _stream_guard = state.shard.shard().fs_locks.stream_lock.lock().await;
-            {
-                let future =
-                    SendWrapper::new(state.shard.shard().delete_stream(&identifier_stream_id));
-                future.await
-            }
-            .error(|e: &IggyError| {
-                format!("{COMPONENT} (error: {e}) - failed to delete stream with ID: {stream_id}",)
-            })?;
-
-            let entry_command = EntryCommand::DeleteStream(DeleteStream {
-                stream_id: identifier_stream_id,
-            });
-            state.shard.apply_state(identity.user_id, &entry_command).await
-            .error(|e: &IggyError| {
-                format!(
-                    "{COMPONENT} (error: {e}) - failed to apply delete stream with ID: {stream_id}",
-                )
-            })?;
-            Ok::<StatusCode, CustomError>(StatusCode::NO_CONTENT)
-        });
-
-    result.await
+    match state.shard.send_to_control_plane(request).await? {
+        ShardResponse::DeleteStreamResponse(_) => Ok(StatusCode::NO_CONTENT),
+        ShardResponse::ErrorResponse(err) => Err(err.into()),
+        _ => unreachable!("Expected DeleteStreamResponse"),
+    }
 }
 
 #[debug_handler]
@@ -245,55 +171,16 @@ async fn purge_stream(
     Extension(identity): Extension<Identity>,
     Path(stream_id): Path<String>,
 ) -> Result<StatusCode, CustomError> {
-    let identifier_stream_id = Identifier::from_str_value(&stream_id)?;
+    let stream_id = Identifier::from_str_value(&stream_id)?;
 
-    let stream_id_numeric = state
-        .shard
-        .shard()
-        .resolve_stream_id(&identifier_stream_id)?;
-    state
-        .shard
-        .shard()
-        .metadata
-        .perm_purge_stream(identity.user_id, stream_id_numeric)?;
-
-    let result = SendWrapper::new(async move {
-        // Purge stream using wrapper method
-        state
-            .shard
-            .purge_stream(&identifier_stream_id)
-            .await
-            .error(|e: &IggyError| {
-                format!("{COMPONENT} (error: {e}) - failed to purge stream, stream ID: {stream_id}")
-            })?;
-
-        // Send event for stream purge
-        {
-            let broadcast_future = SendWrapper::new(async {
-                use crate::shard::transmission::event::ShardEvent;
-                let event = ShardEvent::PurgedStream {
-                    stream_id: identifier_stream_id.clone(),
-                };
-                let _responses = state
-                    .shard
-                    .shard()
-                    .broadcast_event_to_all_shards(event)
-                    .await;
-            });
-            broadcast_future.await;
-        }
-
-        let entry_command = EntryCommand::PurgeStream(PurgeStream {
-            stream_id: identifier_stream_id,
-        });
-        state.shard.apply_state(identity.user_id, &entry_command).await
-            .error(|e: &IggyError| {
-                format!(
-                    "{COMPONENT} (error: {e}) - failed to apply purge stream, stream ID: {stream_id}"
-                )
-            })?;
-        Ok::<StatusCode, CustomError>(StatusCode::NO_CONTENT)
+    let request = ShardRequest::control_plane(ShardRequestPayload::PurgeStreamRequest {
+        user_id: identity.user_id,
+        command: PurgeStream { stream_id },
     });
 
-    result.await
+    match state.shard.send_to_control_plane(request).await? {
+        ShardResponse::PurgeStreamResponse => Ok(StatusCode::NO_CONTENT),
+        ShardResponse::ErrorResponse(err) => Err(err.into()),
+        _ => unreachable!("Expected PurgeStreamResponse"),
+    }
 }
