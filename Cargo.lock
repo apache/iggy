@@ -4536,7 +4536,7 @@ dependencies = [
 
 [[package]]
 name = "iggy-connectors"
-version = "0.2.1-edge.5"
+version = "0.2.1-edge.6"
 dependencies = [
  "async-trait",
  "axum",
@@ -4565,6 +4565,7 @@ dependencies = [
  "opentelemetry-semantic-conventions",
  "opentelemetry_sdk",
  "postcard",
+ "prometheus-client",
  "reqwest",
  "reqwest-middleware",
  "reqwest-retry",
@@ -4574,6 +4575,7 @@ dependencies = [
  "serde_with",
  "serde_yaml_ng",
  "strum",
+ "sysinfo 0.38.0",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",

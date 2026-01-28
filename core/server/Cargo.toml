@@ -84,7 +84,7 @@ opentelemetry-otlp = { workspace = true }
 opentelemetry-semantic-conventions = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 papaya = "0.2.3"
-prometheus-client = "0.24.0"
+prometheus-client = { workspace = true }
 rand = { workspace = true }
 reqwest = { workspace = true, features = ["rustls-tls-no-provider"] }
 ringbuffer = "0.16.0"

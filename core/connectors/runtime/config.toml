@@ -29,6 +29,10 @@ exposed_headers = [""]
 allow_credentials = false
 allow_private_network = false
 
+[http.metrics] # Optional Prometheus metrics configuration
+enabled = false
+endpoint = "/metrics"
+
 [http.tls] # Optional TLS configuration for HTTP API
 enabled = false
 cert_file = "core/certs/iggy_cert.pem"

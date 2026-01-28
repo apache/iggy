@@ -33,6 +33,7 @@ use integration::{
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+mod api;
 mod http_config_provider;
 mod postgres;
 mod random;

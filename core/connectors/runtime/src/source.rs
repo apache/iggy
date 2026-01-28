@@ -39,6 +39,7 @@ use crate::configs::connectors::SourceConfig;
 use crate::context::RuntimeContext;
 use crate::log::LOG_CALLBACK;
 use crate::manager::status::ConnectorStatus;
+use crate::metrics::ConnectorType;
 use crate::{
     PLUGIN_ID, RuntimeError, SourceApi, SourceConnector, SourceConnectorPlugin,
     SourceConnectorProducer, SourceConnectorWrapper, resolve_plugin_path,
@@ -256,7 +257,11 @@ pub fn handle(sources: Vec<SourceConnectorWrapper>, context: Arc<RuntimeContext>
 
                 context
                     .sources
-                    .update_status(&plugin_key, ConnectorStatus::Running)
+                    .update_status(
+                        &plugin_key,
+                        ConnectorStatus::Running,
+                        Some(&context.metrics),
+                    )
                     .await;
                 let encoder = producer.encoder.clone();
                 let producer = &producer.producer;
@@ -269,6 +274,9 @@ pub fn handle(sources: Vec<SourceConnectorWrapper>, context: Arc<RuntimeContext>
 
                 while let Ok(produced_messages) = receiver.recv_async().await {
                     let count = produced_messages.messages.len();
+                    context
+                        .metrics
+                        .increment_messages_produced(&plugin_key, count as u64);
                     if plugin.verbose {
                         info!("Source connector with ID: {plugin_id} received {count} messages",);
                     } else {
@@ -313,6 +321,9 @@ pub fn handle(sources: Vec<SourceConnectorWrapper>, context: Arc<RuntimeContext>
                             producer.topic()
                         );
                         error!(err);
+                        context
+                            .metrics
+                            .increment_errors(&plugin_key, ConnectorType::Source);
                         context.sources.set_error(&plugin_key, &err).await;
                         continue;
                     };
@@ -324,9 +335,16 @@ pub fn handle(sources: Vec<SourceConnectorWrapper>, context: Arc<RuntimeContext>
                             producer.topic(),
                         );
                         error!(err);
+                        context
+                            .metrics
+                            .increment_errors(&plugin_key, ConnectorType::Source);
                         context.sources.set_error(&plugin_key, &err).await;
                         continue;
                     }
+
+                    context
+                        .metrics
+                        .increment_messages_sent(&plugin_key, count as u64);
 
                     if plugin.verbose {
                         info!(
@@ -365,7 +383,11 @@ pub fn handle(sources: Vec<SourceConnectorWrapper>, context: Arc<RuntimeContext>
                 info!("Source connector with ID: {plugin_id} stopped.");
                 context
                     .sources
-                    .update_status(&plugin_key, ConnectorStatus::Stopped)
+                    .update_status(
+                        &plugin_key,
+                        ConnectorStatus::Stopped,
+                        Some(&context.metrics),
+                    )
                     .await;
             });
         }

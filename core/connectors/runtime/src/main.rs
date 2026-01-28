@@ -48,9 +48,11 @@ pub(crate) mod context;
 pub(crate) mod error;
 mod log;
 mod manager;
+pub(crate) mod metrics;
 mod sink;
 mod source;
 mod state;
+pub(crate) mod stats;
 mod stream;
 mod transform;
 
