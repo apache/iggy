@@ -19,6 +19,7 @@
 use crate::configs::connectors::{ConnectorsConfigProvider, SinkConfig, SourceConfig};
 use crate::configs::runtime::ConnectorsRuntimeConfig;
 use crate::manager::status::ConnectorError;
+use crate::metrics::Metrics;
 use crate::{
     SinkConnectorWrapper, SourceConnectorWrapper,
     manager::{
@@ -27,6 +28,7 @@ use crate::{
         status::ConnectorStatus,
     },
 };
+use iggy_common::IggyTimestamp;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::error;
@@ -36,6 +38,8 @@ pub struct RuntimeContext {
     pub sources: SourceManager,
     pub api_key: String,
     pub config_provider: Arc<dyn ConnectorsConfigProvider>,
+    pub metrics: Arc<Metrics>,
+    pub start_time: IggyTimestamp,
 }
 
 pub fn init(
@@ -46,11 +50,20 @@ pub fn init(
     source_wrappers: &[SourceConnectorWrapper],
     config_provider: Box<dyn ConnectorsConfigProvider>,
 ) -> RuntimeContext {
+    let metrics = Arc::new(Metrics::init());
+    let sinks = SinkManager::new(map_sinks(sinks_config, sink_wrappers));
+    let sources = SourceManager::new(map_sources(sources_config, source_wrappers));
+
+    metrics.set_sinks_total(sinks_config.len() as u32);
+    metrics.set_sources_total(sources_config.len() as u32);
+
     RuntimeContext {
-        sinks: SinkManager::new(map_sinks(sinks_config, sink_wrappers)),
-        sources: SourceManager::new(map_sources(sources_config, source_wrappers)),
+        sinks,
+        sources,
         api_key: config.http.api_key.to_owned(),
         config_provider: Arc::from(config_provider),
+        metrics,
+        start_time: IggyTimestamp::now(),
     }
 }
 

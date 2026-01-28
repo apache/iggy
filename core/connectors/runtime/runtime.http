@@ -28,6 +28,12 @@ GET {{url}}
 GET {{url}}/health
 
 ###
+GET {{url}}/stats
+
+###
+GET {{url}}/metrics
+
+###
 GET {{url}}/sinks
 
 ###

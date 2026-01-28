@@ -17,7 +17,7 @@
 
 [package]
 name = "iggy-connectors"
-version = "0.2.1-edge.5"
+version = "0.2.1-edge.6"
 description = "Connectors runtime for Iggy message streaming platform"
 edition = "2024"
 license = "Apache-2.0"
@@ -56,6 +56,7 @@ opentelemetry-otlp = { workspace = true }
 opentelemetry-semantic-conventions = { workspace = true }
 opentelemetry_sdk = { workspace = true, features = ["rt-tokio"] }
 postcard = { workspace = true }
+prometheus-client = { workspace = true }
 reqwest = { workspace = true }
 reqwest-middleware = { workspace = true }
 reqwest-retry = { workspace = true }
@@ -65,6 +66,7 @@ serde_json = { workspace = true }
 serde_with = { workspace = true }
 serde_yaml_ng = { workspace = true }
 strum = { workspace = true }
+sysinfo = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 toml = { workspace = true }

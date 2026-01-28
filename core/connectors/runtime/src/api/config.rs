@@ -39,6 +39,13 @@ pub struct HttpConfig {
     pub api_key: String,
     pub cors: HttpCorsConfig,
     pub tls: HttpTlsConfig,
+    pub metrics: HttpMetricsConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, ConfigEnv)]
+pub struct HttpMetricsConfig {
+    pub enabled: bool,
+    pub endpoint: String,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize, Clone, ConfigEnv)]
@@ -135,6 +142,25 @@ pub fn configure_cors(config: &HttpCorsConfig) -> CorsLayer {
         .allow_private_network(config.allow_private_network)
 }
 
+impl Default for HttpMetricsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: "/metrics".to_owned(),
+        }
+    }
+}
+
+impl std::fmt::Display for HttpMetricsConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{{ enabled: {}, endpoint: {} }}",
+            self.enabled, self.endpoint
+        )
+    }
+}
+
 impl Default for HttpConfig {
     fn default() -> Self {
         Self {
@@ -143,6 +169,7 @@ impl Default for HttpConfig {
             api_key: "".to_owned(),
             cors: HttpCorsConfig::default(),
             tls: HttpTlsConfig::default(),
+            metrics: HttpMetricsConfig::default(),
         }
     }
 }
@@ -151,8 +178,8 @@ impl std::fmt::Display for HttpConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ address: {}, api_key: {}, cors: {}, tls: {} }}",
-            self.address, self.api_key, self.cors, self.tls
+            "{{ address: {}, api_key: {}, cors: {}, tls: {}, metrics: {} }}",
+            self.address, self.api_key, self.cors, self.tls, self.metrics
         )
     }
 }
