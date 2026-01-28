@@ -24,8 +24,8 @@ use reqwest_middleware::ClientWithMiddleware as HttpClient;
 use reqwest_retry::RetryTransientMiddleware;
 use reqwest_retry::policies::ExponentialBackoff;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::info;
+use uuid::Uuid;
 
 use testcontainers_modules::testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
@@ -233,13 +233,9 @@ async fn create_quickwit_test_index(
 }
 
 static NETWORK_NAME_PREFIX: &str = "iggy-quickwit-sink";
-static CONTAINER_NETWORK_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 async fn start_quickwit_container() -> ContainerAsync<GenericImage> {
-    let unique_network = format!(
-        "{NETWORK_NAME_PREFIX}-{}",
-        CONTAINER_NETWORK_COUNTER.fetch_add(1, Ordering::Relaxed)
-    );
+    let unique_network = format!("{NETWORK_NAME_PREFIX}-{}", Uuid::new_v4());
     let random_host = 0;
     let quickwit_container =
         GenericImage::new(quickwit_container::REPOSITORY, quickwit_container::VERSION)
