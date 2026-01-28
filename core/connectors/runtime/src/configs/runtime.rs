@@ -256,6 +256,7 @@ pub struct ResponseConfig {
 
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Deserialize, Serialize, ConfigEnv)]
+#[config_env(tag = "config_type")]
 #[serde(tag = "config_type", rename_all = "lowercase")]
 pub enum ConnectorsConfig {
     Local(LocalConnectorsConfig),

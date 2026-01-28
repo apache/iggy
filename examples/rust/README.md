@@ -97,8 +97,15 @@ Demonstrates fundamental client connection, authentication, batch message sendin
 Shows metadata management using custom headers:
 
 ```bash
-cargo run --example message-headers-producer
-cargo run --example message-headers-consumer
+cargo run --example message-headers-type-producer
+cargo run --example message-headers-type-consumer
+```
+
+Shows how user headers can be used for message compression in transit:
+
+```bash
+cargo run --example message-headers-compression-producer
+cargo run --example message-headers-compression-consumer
 ```
 
 Demonstrates using HeaderKey/HeaderValue for message metadata instead of payload-based typing, with header-based message routing.

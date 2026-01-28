@@ -34,9 +34,11 @@ bytes = { workspace = true }
 chrono = { workspace = true }
 compio = { workspace = true }
 configs = { workspace = true }
+configs_derive = { workspace = true }
 ctor = "0.6.3"
 derive_more = { workspace = true }
 env_logger = { workspace = true }
+figment = { workspace = true }
 futures = { workspace = true }
 humantime = { workspace = true }
 iggy = { workspace = true }
