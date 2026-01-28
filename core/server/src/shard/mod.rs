@@ -17,31 +17,22 @@
  * under the License.
  */
 
-pub mod builder;
-pub mod system;
-pub mod task_registry;
-pub mod tasks;
-pub mod transmission;
-
-mod communication;
-pub mod handlers;
-
-use ahash::AHashSet;
-pub use communication::calculate_shard_assignment;
-
 use self::tasks::{continuous, periodic};
 use crate::{
+    bootstrap::load_segments,
     configs::server::ServerConfig,
-    io::fs_locks::FsLocks,
     metadata::{Metadata, MetadataWriter},
     shard::{task_registry::TaskRegistry, transmission::frame::ShardFrame},
     state::file::FileState,
-    streaming::partitions::local_partitions::LocalPartitions,
     streaming::{
-        clients::client_manager::ClientManager, diagnostics::metrics::Metrics, session::Session,
+        clients::client_manager::ClientManager,
+        diagnostics::metrics::Metrics,
+        partitions::{local_partition::LocalPartition, local_partitions::LocalPartitions},
+        session::Session,
         utils::ptr::EternalPtr,
     },
 };
+use ahash::AHashSet;
 use builder::IggyShardBuilder;
 use dashmap::DashMap;
 use iggy_common::SemanticVersion;
@@ -60,6 +51,18 @@ use std::{
 use tracing::{debug, error, info, instrument};
 use transmission::connector::{Receiver, ShardConnector, StopReceiver};
 
+pub mod builder;
+pub mod execution;
+pub mod handlers;
+pub mod system;
+pub mod task_registry;
+pub mod tasks;
+pub mod transmission;
+
+mod communication;
+
+pub use communication::calculate_shard_assignment;
+
 pub const COMPONENT: &str = "SHARD";
 pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 pub const BROADCAST_TIMEOUT: Duration = Duration::from_secs(500);
@@ -77,7 +80,6 @@ pub struct IggyShard {
     pub(crate) shards_table: EternalPtr<DashMap<IggyNamespace, PartitionLocation>>,
     pub(crate) state: FileState,
 
-    pub(crate) fs_locks: FsLocks,
     pub(crate) encryptor: Option<EncryptorKind>,
     pub(crate) config: ServerConfig,
     pub(crate) client_manager: ClientManager,
@@ -197,9 +199,6 @@ impl IggyShard {
     }
 
     async fn load_segments(&self) -> Result<(), IggyError> {
-        use crate::bootstrap::load_segments;
-        use crate::streaming::partitions::local_partition::LocalPartition;
-
         for shard_entry in self.shards_table.iter() {
             let (namespace, location) = shard_entry.pair();
 

@@ -43,29 +43,20 @@ impl ServerCommandHandler for GetConsumerGroup {
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
         shard.ensure_authenticated(session)?;
-        let Ok((stream_id, topic_id, numeric_group_id)) =
-            shard.resolve_consumer_group_id(&self.stream_id, &self.topic_id, &self.group_id)
+
+        let Some(consumer_group) = shard.metadata.query_consumer_group(
+            session.get_user_id(),
+            &self.stream_id,
+            &self.topic_id,
+            &self.group_id,
+        )?
         else {
             sender.send_empty_ok_response().await?;
             return Ok(HandlerResult::Finished);
         };
-        if shard
-            .metadata
-            .perm_get_consumer_group(session.get_user_id(), stream_id, topic_id)
-            .is_err()
-        {
-            sender.send_empty_ok_response().await?;
-            return Ok(HandlerResult::Finished);
-        }
 
-        let consumer_group = shard
-            .metadata
-            .get_consumer_group(stream_id, topic_id, numeric_group_id)
-            .map(|cg| mapper::map_consumer_group_from_meta(&cg))
-            .ok_or_else(|| {
-                IggyError::ConsumerGroupIdNotFound(self.group_id.clone(), self.topic_id.clone())
-            })?;
-        sender.send_ok_response(&consumer_group).await?;
+        let response = mapper::map_consumer_group_from_meta(&consumer_group);
+        sender.send_ok_response(&response).await?;
         Ok(HandlerResult::Finished)
     }
 }

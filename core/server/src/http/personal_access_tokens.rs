@@ -22,21 +22,20 @@ use crate::http::jwt::json_web_token::Identity;
 use crate::http::mapper;
 use crate::http::mapper::map_generated_access_token_to_identity_info;
 use crate::http::shared::AppState;
-use crate::state::command::EntryCommand;
-use crate::state::models::CreatePersonalAccessTokenWithHash;
+use crate::shard::transmission::frame::ShardResponse;
+use crate::shard::transmission::message::{ShardRequest, ShardRequestPayload};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::{delete, get, post};
 use axum::{Extension, Json, Router, debug_handler};
 use err_trail::ErrContext;
 use iggy_common::IdentityInfo;
-use iggy_common::PersonalAccessToken;
+use iggy_common::PersonalAccessTokenInfo;
 use iggy_common::Validatable;
 use iggy_common::create_personal_access_token::CreatePersonalAccessToken;
 use iggy_common::delete_personal_access_token::DeletePersonalAccessToken;
 use iggy_common::login_with_personal_access_token::LoginWithPersonalAccessToken;
-use iggy_common::{IggyError, PersonalAccessTokenInfo, RawPersonalAccessToken};
-use send_wrapper::SendWrapper;
+use iggy_common::{IggyError, RawPersonalAccessToken};
 use std::sync::Arc;
 use tracing::instrument;
 
@@ -84,32 +83,20 @@ async fn create_personal_access_token(
     Json(command): Json<CreatePersonalAccessToken>,
 ) -> Result<Json<RawPersonalAccessToken>, CustomError> {
     command.validate()?;
-    let (_, token) = state
-        .shard
-        .create_personal_access_token(identity.user_id, &command.name, command.expiry)
-        .error(|e: &IggyError| {
-            format!(
-                "{COMPONENT} (error: {e}) - failed to create personal access token, user ID: {}",
-                identity.user_id
-            )
-        })?;
 
-    let token_hash = PersonalAccessToken::hash_token(&token);
-    let command = EntryCommand::CreatePersonalAccessToken(CreatePersonalAccessTokenWithHash {
-        command,
-        hash: token_hash,
-    });
-    let state_future =
-        SendWrapper::new(state.shard.shard().state.apply(identity.user_id, &command));
+    let request =
+        ShardRequest::control_plane(ShardRequestPayload::CreatePersonalAccessTokenRequest {
+            user_id: identity.user_id,
+            command,
+        });
 
-    state_future.await
-        .error(|e: &IggyError| {
-            format!(
-                "{COMPONENT} (error: {e}) - failed to apply create personal access token with hash, user ID: {}",
-                identity.user_id
-            )
-        })?;
-    Ok(Json(RawPersonalAccessToken { token }))
+    match state.shard.send_to_control_plane(request).await? {
+        ShardResponse::CreatePersonalAccessTokenResponse(_, token) => {
+            Ok(Json(RawPersonalAccessToken { token }))
+        }
+        ShardResponse::ErrorResponse(err) => Err(err.into()),
+        _ => unreachable!("Expected CreatePersonalAccessTokenResponse"),
+    }
 }
 
 #[debug_handler]
@@ -119,28 +106,18 @@ async fn delete_personal_access_token(
     Extension(identity): Extension<Identity>,
     Path(name): Path<String>,
 ) -> Result<StatusCode, CustomError> {
-    state
-        .shard
-        .delete_personal_access_token(identity.user_id, &name)
-        .error(|e: &IggyError| {
-            format!(
-                "{COMPONENT} (error: {e}) - failed to delete personal access token, user ID: {}",
-                identity.user_id
-            )
-        })?;
+    let command = DeletePersonalAccessToken { name };
+    let request =
+        ShardRequest::control_plane(ShardRequestPayload::DeletePersonalAccessTokenRequest {
+            user_id: identity.user_id,
+            command,
+        });
 
-    let command =
-        EntryCommand::DeletePersonalAccessToken(DeletePersonalAccessToken { name: name.clone() });
-    let state_future =
-        SendWrapper::new(state.shard.shard().state.apply(identity.user_id, &command));
-
-    state_future.await.error(|e: &IggyError| {
-        format!(
-            "{COMPONENT} (error: {e}) - failed to apply delete personal access token, user ID: {}",
-            identity.user_id
-        )
-    })?;
-    Ok(StatusCode::NO_CONTENT)
+    match state.shard.send_to_control_plane(request).await? {
+        ShardResponse::DeletePersonalAccessTokenResponse => Ok(StatusCode::NO_CONTENT),
+        ShardResponse::ErrorResponse(err) => Err(err.into()),
+        _ => unreachable!("Expected DeletePersonalAccessTokenResponse"),
+    }
 }
 
 #[instrument(skip_all, name = "trace_login_with_personal_access_token")]
