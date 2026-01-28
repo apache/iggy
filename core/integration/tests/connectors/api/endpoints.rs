@@ -17,32 +17,19 @@
  * under the License.
  */
 
-use integration::test_connectors_runtime::TestConnectorsRuntime;
+use crate::connectors::api::setup;
 use reqwest::Client;
-use std::collections::HashMap;
 
 const API_KEY: &str = "test-api-key";
 
-async fn setup_runtime() -> TestConnectorsRuntime {
-    let mut envs = HashMap::new();
-    envs.insert(
-        "IGGY_CONNECTORS_CONFIG_PATH".to_owned(),
-        "tests/connectors/api/config.toml".to_owned(),
-    );
-
-    let mut runtime = TestConnectorsRuntime::create(envs, None);
-    runtime.start();
-    runtime.ensure_started().await;
-    runtime
-}
-
 #[tokio::test]
 async fn test_root_endpoint_returns_welcome_message() {
-    let runtime = setup_runtime().await;
+    let runtime = setup().await;
+    let api_address = runtime.connectors_api_address().unwrap();
     let client = Client::new();
 
     let response = client
-        .get(format!("{}/", runtime.get_http_api_address()))
+        .get(format!("{}/", api_address))
         .send()
         .await
         .unwrap();
@@ -54,11 +41,12 @@ async fn test_root_endpoint_returns_welcome_message() {
 
 #[tokio::test]
 async fn test_health_endpoint_returns_healthy() {
-    let runtime = setup_runtime().await;
+    let runtime = setup().await;
+    let api_address = runtime.connectors_api_address().unwrap();
     let client = Client::new();
 
     let response = client
-        .get(format!("{}/health", runtime.get_http_api_address()))
+        .get(format!("{}/health", api_address))
         .send()
         .await
         .unwrap();
@@ -70,11 +58,12 @@ async fn test_health_endpoint_returns_healthy() {
 
 #[tokio::test]
 async fn test_stats_endpoint_returns_runtime_stats() {
-    let runtime = setup_runtime().await;
+    let runtime = setup().await;
+    let api_address = runtime.connectors_api_address().unwrap();
     let client = Client::new();
 
     let response = client
-        .get(format!("{}/stats", runtime.get_http_api_address()))
+        .get(format!("{}/stats", api_address))
         .header("api-key", API_KEY)
         .send()
         .await
@@ -103,11 +92,12 @@ async fn test_stats_endpoint_returns_runtime_stats() {
 
 #[tokio::test]
 async fn test_metrics_endpoint_returns_prometheus_format() {
-    let runtime = setup_runtime().await;
+    let runtime = setup().await;
+    let api_address = runtime.connectors_api_address().unwrap();
     let client = Client::new();
 
     let response = client
-        .get(format!("{}/metrics", runtime.get_http_api_address()))
+        .get(format!("{}/metrics", api_address))
         .header("api-key", API_KEY)
         .send()
         .await
@@ -124,11 +114,12 @@ async fn test_metrics_endpoint_returns_prometheus_format() {
 
 #[tokio::test]
 async fn test_sources_endpoint_returns_list() {
-    let runtime = setup_runtime().await;
+    let runtime = setup().await;
+    let api_address = runtime.connectors_api_address().unwrap();
     let client = Client::new();
 
     let response = client
-        .get(format!("{}/sources", runtime.get_http_api_address()))
+        .get(format!("{}/sources", api_address))
         .header("api-key", API_KEY)
         .send()
         .await
@@ -143,11 +134,12 @@ async fn test_sources_endpoint_returns_list() {
 
 #[tokio::test]
 async fn test_sinks_endpoint_returns_list() {
-    let runtime = setup_runtime().await;
+    let runtime = setup().await;
+    let api_address = runtime.connectors_api_address().unwrap();
     let client = Client::new();
 
     let response = client
-        .get(format!("{}/sinks", runtime.get_http_api_address()))
+        .get(format!("{}/sinks", api_address))
         .header("api-key", API_KEY)
         .send()
         .await
@@ -162,11 +154,12 @@ async fn test_sinks_endpoint_returns_list() {
 
 #[tokio::test]
 async fn test_api_key_authentication_required() {
-    let runtime = setup_runtime().await;
+    let runtime = setup().await;
+    let api_address = runtime.connectors_api_address().unwrap();
     let client = Client::new();
 
     let response = client
-        .get(format!("{}/stats", runtime.get_http_api_address()))
+        .get(format!("{}/stats", api_address))
         .send()
         .await
         .unwrap();
@@ -174,7 +167,7 @@ async fn test_api_key_authentication_required() {
     assert_eq!(response.status(), 401);
 
     let response = client
-        .get(format!("{}/metrics", runtime.get_http_api_address()))
+        .get(format!("{}/metrics", api_address))
         .send()
         .await
         .unwrap();
@@ -182,7 +175,7 @@ async fn test_api_key_authentication_required() {
     assert_eq!(response.status(), 401);
 
     let response = client
-        .get(format!("{}/sources", runtime.get_http_api_address()))
+        .get(format!("{}/sources", api_address))
         .send()
         .await
         .unwrap();
@@ -190,7 +183,7 @@ async fn test_api_key_authentication_required() {
     assert_eq!(response.status(), 401);
 
     let response = client
-        .get(format!("{}/sinks", runtime.get_http_api_address()))
+        .get(format!("{}/sinks", api_address))
         .send()
         .await
         .unwrap();
@@ -200,11 +193,12 @@ async fn test_api_key_authentication_required() {
 
 #[tokio::test]
 async fn test_api_key_authentication_rejected_with_invalid_key() {
-    let runtime = setup_runtime().await;
+    let runtime = setup().await;
+    let api_address = runtime.connectors_api_address().unwrap();
     let client = Client::new();
 
     let response = client
-        .get(format!("{}/stats", runtime.get_http_api_address()))
+        .get(format!("{}/stats", api_address))
         .header("api-key", "invalid-key")
         .send()
         .await
@@ -213,7 +207,7 @@ async fn test_api_key_authentication_rejected_with_invalid_key() {
     assert_eq!(response.status(), 401);
 
     let response = client
-        .get(format!("{}/metrics", runtime.get_http_api_address()))
+        .get(format!("{}/metrics", api_address))
         .header("api-key", "wrong-api-key")
         .send()
         .await

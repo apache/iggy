@@ -17,4 +17,13 @@
  * under the License.
  */
 
+use crate::connectors::{ConnectorsRuntime, IggySetup, setup_runtime};
+
 mod endpoints;
+
+pub(crate) async fn setup() -> ConnectorsRuntime {
+    let iggy_setup = IggySetup::default();
+    let mut runtime = setup_runtime();
+    runtime.init("api/config.toml", None, iggy_setup).await;
+    runtime
+}
