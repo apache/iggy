@@ -19,12 +19,32 @@
 
 package org.apache.iggy.message;
 
+import com.fasterxml.jackson.annotation.JsonCreator;
+import com.fasterxml.jackson.annotation.JsonProperty;
+
 import java.math.BigInteger;
+import java.util.Base64;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 public record Message(MessageHeader header, byte[] payload, Map<HeaderKey, HeaderValue> userHeaders) {
+    @JsonCreator
+    public static Message fromJson(
+            @JsonProperty("header") MessageHeader header,
+            @JsonProperty("payload") String base64Payload,
+            @JsonProperty("user_headers") List<HeaderEntry> userHeadersList) {
+        byte[] decodedPayload = Base64.getDecoder().decode(base64Payload);
+        Map<HeaderKey, HeaderValue> headersMap = new HashMap<>();
+        if (userHeadersList != null) {
+            for (HeaderEntry entry : userHeadersList) {
+                headersMap.put(entry.key(), entry.value());
+            }
+        }
+        return new Message(header, decodedPayload, headersMap);
+    }
+
     public static Message of(String payload) {
         return of(payload, Collections.emptyMap());
     }

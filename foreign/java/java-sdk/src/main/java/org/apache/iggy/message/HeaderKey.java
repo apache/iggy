@@ -19,10 +19,20 @@
 
 package org.apache.iggy.message;
 
+import com.fasterxml.jackson.annotation.JsonCreator;
+import com.fasterxml.jackson.annotation.JsonProperty;
+
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
+import java.util.Base64;
 
 public record HeaderKey(HeaderKind kind, byte[] value) {
+    @JsonCreator
+    public static HeaderKey fromJson(@JsonProperty("kind") HeaderKind kind, @JsonProperty("value") String base64Value) {
+        byte[] decodedValue = Base64.getDecoder().decode(base64Value);
+        return new HeaderKey(kind, decodedValue);
+    }
+
     public static HeaderKey fromString(String val) {
         if (val.isEmpty() || val.length() > 255) {
             throw new IllegalArgumentException("Value has incorrect size, must be between 1 and 255");
