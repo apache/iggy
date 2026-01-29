@@ -24,60 +24,45 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
 
-public record Message(
-    MessageHeader header,
-    byte[] payload,
-    Map<HeaderKey, HeaderValue> userHeaders
-) {
+public record Message(MessageHeader header, byte[] payload, Map<HeaderKey, HeaderValue> userHeaders) {
     public static Message of(String payload) {
         return of(payload, Collections.emptyMap());
     }
 
-    public static Message of(
-        String payload,
-        Map<HeaderKey, HeaderValue> userHeaders
-    ) {
+    public static Message of(String payload, Map<HeaderKey, HeaderValue> userHeaders) {
         final byte[] payloadBytes = payload.getBytes();
         final long userHeadersLength = getUserHeadersSize(userHeaders);
         final MessageHeader msgHeader = new MessageHeader(
-            BigInteger.ZERO,
-            MessageId.serverGenerated(),
-            BigInteger.ZERO,
-            BigInteger.ZERO,
-            BigInteger.ZERO,
-            userHeadersLength,
-            (long) payloadBytes.length
-        );
+                BigInteger.ZERO,
+                MessageId.serverGenerated(),
+                BigInteger.ZERO,
+                BigInteger.ZERO,
+                BigInteger.ZERO,
+                userHeadersLength,
+                (long) payloadBytes.length);
         return new Message(msgHeader, payloadBytes, userHeaders);
     }
 
     public Message withUserHeaders(Map<HeaderKey, HeaderValue> userHeaders) {
-        Map<HeaderKey, HeaderValue> mergedHeaders = mergeUserHeaders(
-            userHeaders
-        );
+        Map<HeaderKey, HeaderValue> mergedHeaders = mergeUserHeaders(userHeaders);
         long userHeadersLength = getUserHeadersSize(mergedHeaders);
         MessageHeader updatedHeader = new MessageHeader(
-            header.checksum(),
-            header.id(),
-            header.offset(),
-            header.timestamp(),
-            header.originTimestamp(),
-            userHeadersLength,
-            (long) payload.length
-        );
+                header.checksum(),
+                header.id(),
+                header.offset(),
+                header.timestamp(),
+                header.originTimestamp(),
+                userHeadersLength,
+                (long) payload.length);
         return new Message(updatedHeader, payload, mergedHeaders);
     }
 
     public int getSize() {
         long userHeadersLength = getUserHeadersSize(userHeaders);
-        return Math.toIntExact(
-            MessageHeader.SIZE + payload.length + userHeadersLength
-        );
+        return Math.toIntExact(MessageHeader.SIZE + payload.length + userHeadersLength);
     }
 
-    private Map<HeaderKey, HeaderValue> mergeUserHeaders(
-        Map<HeaderKey, HeaderValue> userHeaders
-    ) {
+    private Map<HeaderKey, HeaderValue> mergeUserHeaders(Map<HeaderKey, HeaderValue> userHeaders) {
         if (userHeaders.isEmpty()) {
             return this.userHeaders;
         }
@@ -86,16 +71,12 @@ public record Message(
             return userHeaders;
         }
 
-        Map<HeaderKey, HeaderValue> mergedHeaders = new HashMap<>(
-            this.userHeaders
-        );
+        Map<HeaderKey, HeaderValue> mergedHeaders = new HashMap<>(this.userHeaders);
         mergedHeaders.putAll(userHeaders);
         return mergedHeaders;
     }
 
-    private static long getUserHeadersSize(
-        Map<HeaderKey, HeaderValue> userHeaders
-    ) {
+    private static long getUserHeadersSize(Map<HeaderKey, HeaderValue> userHeaders) {
         if (userHeaders.isEmpty()) {
             return 0L;
         }

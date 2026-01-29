@@ -20,13 +20,6 @@
 package org.apache.iggy.serde;
 
 import io.netty.buffer.ByteBuf;
-import java.math.BigInteger;
-import java.nio.charset.StandardCharsets;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Optional;
 import org.apache.commons.lang3.ArrayUtils;
 import org.apache.iggy.consumergroup.ConsumerGroup;
 import org.apache.iggy.consumergroup.ConsumerGroupDetails;
@@ -59,6 +52,14 @@ import org.apache.iggy.user.UserInfo;
 import org.apache.iggy.user.UserInfoDetails;
 import org.apache.iggy.user.UserStatus;
 
+import java.math.BigInteger;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+
 /**
  * Unified deserializer for both blocking and async clients.
  * Provides deserialization of ByteBuf to domain objects according to Iggy wire protocol.
@@ -74,18 +75,9 @@ public final class BytesDeserializer {
         var size = readU64AsBigInteger(response);
         var messagesCount = readU64AsBigInteger(response);
         var nameLength = response.readByte();
-        var name = response
-            .readCharSequence(nameLength, StandardCharsets.UTF_8)
-            .toString();
+        var name = response.readCharSequence(nameLength, StandardCharsets.UTF_8).toString();
 
-        return new StreamBase(
-            streamId,
-            createdAt,
-            name,
-            size.toString(),
-            messagesCount,
-            topicsCount
-        );
+        return new StreamBase(streamId, createdAt, name, size.toString(), messagesCount, topicsCount);
     }
 
     public static StreamDetails readStreamDetails(ByteBuf response) {
@@ -117,14 +109,7 @@ public final class BytesDeserializer {
         var currentOffset = readU64AsBigInteger(response);
         var size = readU64AsBigInteger(response);
         var messagesCount = readU64AsBigInteger(response);
-        return new Partition(
-            partitionId,
-            createdAt,
-            segmentsCount,
-            currentOffset,
-            size.toString(),
-            messagesCount
-        );
+        return new Partition(partitionId, createdAt, segmentsCount, currentOffset, size.toString(), messagesCount);
     }
 
     public static Topic readTopic(ByteBuf response) {
@@ -138,26 +123,21 @@ public final class BytesDeserializer {
         var size = readU64AsBigInteger(response);
         var messagesCount = readU64AsBigInteger(response);
         var nameLength = response.readByte();
-        var name = response
-            .readCharSequence(nameLength, StandardCharsets.UTF_8)
-            .toString();
+        var name = response.readCharSequence(nameLength, StandardCharsets.UTF_8).toString();
         return new Topic(
-            topicId,
-            createdAt,
-            name,
-            size.toString(),
-            messageExpiry,
-            CompressionAlgorithm.fromCode(compressionAlgorithmCode),
-            maxTopicSize,
-            (short) replicationFactor,
-            messagesCount,
-            partitionsCount
-        );
+                topicId,
+                createdAt,
+                name,
+                size.toString(),
+                messageExpiry,
+                CompressionAlgorithm.fromCode(compressionAlgorithmCode),
+                maxTopicSize,
+                (short) replicationFactor,
+                messagesCount,
+                partitionsCount);
     }
 
-    public static ConsumerGroupDetails readConsumerGroupDetails(
-        ByteBuf response
-    ) {
+    public static ConsumerGroupDetails readConsumerGroupDetails(ByteBuf response) {
         var consumerGroup = readConsumerGroup(response);
 
         List<ConsumerGroupMember> members = new ArrayList<>();
@@ -168,9 +148,7 @@ public final class BytesDeserializer {
         return new ConsumerGroupDetails(consumerGroup, members);
     }
 
-    public static ConsumerGroupMember readConsumerGroupMember(
-        ByteBuf response
-    ) {
+    public static ConsumerGroupMember readConsumerGroupMember(ByteBuf response) {
         var memberId = response.readUnsignedIntLE();
         var partitionsCount = response.readUnsignedIntLE();
         List<Long> partitionIds = new ArrayList<>();
@@ -185,9 +163,7 @@ public final class BytesDeserializer {
         var partitionsCount = response.readUnsignedIntLE();
         var membersCount = response.readUnsignedIntLE();
         var nameLength = response.readByte();
-        var name = response
-            .readCharSequence(nameLength, StandardCharsets.UTF_8)
-            .toString();
+        var name = response.readCharSequence(nameLength, StandardCharsets.UTF_8).toString();
         return new ConsumerGroup(groupId, name, partitionsCount, membersCount);
     }
 
@@ -206,12 +182,7 @@ public final class BytesDeserializer {
         while (response.isReadable()) {
             messages.add(readPolledMessage(response));
         }
-        return new PolledMessages(
-            partitionId,
-            currentOffset,
-            messagesCount,
-            messages
-        );
+        return new PolledMessages(partitionId, currentOffset, messagesCount, messages);
     }
 
     public static Message readPolledMessage(ByteBuf response) {
@@ -222,53 +193,28 @@ public final class BytesDeserializer {
         var originTimestamp = readU64AsBigInteger(response);
         var userHeadersLength = response.readUnsignedIntLE();
         var payloadLength = response.readUnsignedIntLE();
-        var header = new MessageHeader(
-            checksum,
-            id,
-            offset,
-            timestamp,
-            originTimestamp,
-            userHeadersLength,
-            payloadLength
-        );
+        var header =
+                new MessageHeader(checksum, id, offset, timestamp, originTimestamp, userHeadersLength, payloadLength);
         var payload = newByteArray(payloadLength);
         response.readBytes(payload);
         Map<HeaderKey, HeaderValue> userHeaders = new HashMap<>();
         if (userHeadersLength > 0) {
-            ByteBuf userHeadersBuffer = response.readSlice(
-                toInt(userHeadersLength)
-            );
+            ByteBuf userHeadersBuffer = response.readSlice(toInt(userHeadersLength));
             Map<HeaderKey, HeaderValue> headers = new HashMap<>();
             while (userHeadersBuffer.isReadable()) {
-                var userHeaderKeyKindCode =
-                    userHeadersBuffer.readUnsignedByte();
+                var userHeaderKeyKindCode = userHeadersBuffer.readUnsignedByte();
                 var userHeaderKeyLength = userHeadersBuffer.readUnsignedIntLE();
-                byte[] userHeaderKeyBytes = new byte[toInt(
-                    userHeaderKeyLength
-                )];
+                byte[] userHeaderKeyBytes = new byte[toInt(userHeaderKeyLength)];
                 userHeadersBuffer.readBytes(userHeaderKeyBytes);
-                var userHeaderKey = new HeaderKey(
-                    HeaderKind.fromCode(userHeaderKeyKindCode),
-                    userHeaderKeyBytes
-                );
+                var userHeaderKey = new HeaderKey(HeaderKind.fromCode(userHeaderKeyKindCode), userHeaderKeyBytes);
 
-                var userHeaderValueKindCode =
-                    userHeadersBuffer.readUnsignedByte();
-                var userHeaderValueLength =
-                    userHeadersBuffer.readUnsignedIntLE();
+                var userHeaderValueKindCode = userHeadersBuffer.readUnsignedByte();
+                var userHeaderValueLength = userHeadersBuffer.readUnsignedIntLE();
                 String userHeaderValue = userHeadersBuffer
-                    .readCharSequence(
-                        toInt(userHeaderValueLength),
-                        StandardCharsets.UTF_8
-                    )
-                    .toString();
+                        .readCharSequence(toInt(userHeaderValueLength), StandardCharsets.UTF_8)
+                        .toString();
                 headers.put(
-                    userHeaderKey,
-                    new HeaderValue(
-                        HeaderKind.fromCode(userHeaderValueKindCode),
-                        userHeaderValue
-                    )
-                );
+                        userHeaderKey, new HeaderValue(HeaderKind.fromCode(userHeaderValueKindCode), userHeaderValue));
             }
             userHeaders = headers;
         }
@@ -296,49 +242,41 @@ public final class BytesDeserializer {
         var clientsCount = response.readUnsignedIntLE();
         var consumerGroupsCount = response.readUnsignedIntLE();
         var hostnameLength = response.readUnsignedIntLE();
-        var hostname = response
-            .readCharSequence(toInt(hostnameLength), StandardCharsets.UTF_8)
-            .toString();
+        var hostname = response.readCharSequence(toInt(hostnameLength), StandardCharsets.UTF_8)
+                .toString();
         var osNameLength = response.readUnsignedIntLE();
-        var osName = response
-            .readCharSequence(toInt(osNameLength), StandardCharsets.UTF_8)
-            .toString();
+        var osName = response.readCharSequence(toInt(osNameLength), StandardCharsets.UTF_8)
+                .toString();
         var osVersionLength = response.readUnsignedIntLE();
-        var osVersion = response
-            .readCharSequence(toInt(osVersionLength), StandardCharsets.UTF_8)
-            .toString();
+        var osVersion = response.readCharSequence(toInt(osVersionLength), StandardCharsets.UTF_8)
+                .toString();
         var kernelVersionLength = response.readUnsignedIntLE();
-        var kernelVersion = response
-            .readCharSequence(
-                toInt(kernelVersionLength),
-                StandardCharsets.UTF_8
-            )
-            .toString();
+        var kernelVersion = response.readCharSequence(toInt(kernelVersionLength), StandardCharsets.UTF_8)
+                .toString();
 
         return new Stats(
-            processId,
-            cpuUsage,
-            totalCpuUsage,
-            memoryUsage.toString(),
-            totalMemory.toString(),
-            availableMemory.toString(),
-            runTime,
-            startTime,
-            readBytes.toString(),
-            writtenBytes.toString(),
-            messagesSizeBytes.toString(),
-            streamsCount,
-            topicsCount,
-            partitionsCount,
-            segmentsCount,
-            messagesCount,
-            clientsCount,
-            consumerGroupsCount,
-            hostname,
-            osName,
-            osVersion,
-            kernelVersion
-        );
+                processId,
+                cpuUsage,
+                totalCpuUsage,
+                memoryUsage.toString(),
+                totalMemory.toString(),
+                availableMemory.toString(),
+                runTime,
+                startTime,
+                readBytes.toString(),
+                writtenBytes.toString(),
+                messagesSizeBytes.toString(),
+                streamsCount,
+                topicsCount,
+                partitionsCount,
+                segmentsCount,
+                messagesCount,
+                clientsCount,
+                consumerGroupsCount,
+                hostname,
+                osName,
+                osVersion,
+                kernelVersion);
     }
 
     public static ClientInfoDetails readClientInfoDetails(ByteBuf response) {
@@ -364,17 +302,10 @@ public final class BytesDeserializer {
             transportString = "Quic";
         }
         var addressLength = response.readUnsignedIntLE();
-        var address = response
-            .readCharSequence(toInt(addressLength), StandardCharsets.UTF_8)
-            .toString();
+        var address = response.readCharSequence(toInt(addressLength), StandardCharsets.UTF_8)
+                .toString();
         var consumerGroupsCount = response.readUnsignedIntLE();
-        return new ClientInfo(
-            clientId,
-            userIdOptional,
-            address,
-            transportString,
-            consumerGroupsCount
-        );
+        return new ClientInfo(clientId, userIdOptional, address, transportString, consumerGroupsCount);
     }
 
     public static ConsumerGroupInfo readConsumerGroupInfo(ByteBuf response) {
@@ -423,14 +354,7 @@ public final class BytesDeserializer {
             topicPermissionsMap.put(topicId, topicPermissions);
         }
         return new StreamPermissions(
-            manageStream,
-            readStream,
-            manageTopics,
-            readTopics,
-            pollMessages,
-            sendMessages,
-            topicPermissionsMap
-        );
+                manageStream, readStream, manageTopics, readTopics, pollMessages, sendMessages, topicPermissionsMap);
     }
 
     public static TopicPermissions readTopicPermissions(ByteBuf response) {
@@ -438,12 +362,7 @@ public final class BytesDeserializer {
         var readTopic = response.readBoolean();
         var pollMessages = response.readBoolean();
         var sendMessages = response.readBoolean();
-        return new TopicPermissions(
-            manageTopic,
-            readTopic,
-            pollMessages,
-            sendMessages
-        );
+        return new TopicPermissions(manageTopic, readTopic, pollMessages, sendMessages);
     }
 
     public static GlobalPermissions readGlobalPermissions(ByteBuf response) {
@@ -458,17 +377,16 @@ public final class BytesDeserializer {
         var pollMessages = response.readBoolean();
         var sendMessages = response.readBoolean();
         return new GlobalPermissions(
-            manageServers,
-            readServers,
-            manageUsers,
-            readUsers,
-            manageStreams,
-            readStreams,
-            manageTopics,
-            readTopics,
-            pollMessages,
-            sendMessages
-        );
+                manageServers,
+                readServers,
+                manageUsers,
+                readUsers,
+                manageStreams,
+                readStreams,
+                manageTopics,
+                readTopics,
+                pollMessages,
+                sendMessages);
     }
 
     public static UserInfo readUserInfo(ByteBuf response) {
@@ -477,33 +395,23 @@ public final class BytesDeserializer {
         var statusCode = response.readByte();
         var status = UserStatus.fromCode(statusCode);
         var usernameLength = response.readByte();
-        var username = response
-            .readCharSequence(usernameLength, StandardCharsets.UTF_8)
-            .toString();
+        var username = response.readCharSequence(usernameLength, StandardCharsets.UTF_8)
+                .toString();
         return new UserInfo(userId, createdAt, status, username);
     }
 
-    public static RawPersonalAccessToken readRawPersonalAccessToken(
-        ByteBuf response
-    ) {
+    public static RawPersonalAccessToken readRawPersonalAccessToken(ByteBuf response) {
         var tokenLength = response.readByte();
-        var token = response
-            .readCharSequence(tokenLength, StandardCharsets.UTF_8)
-            .toString();
+        var token =
+                response.readCharSequence(tokenLength, StandardCharsets.UTF_8).toString();
         return new RawPersonalAccessToken(token);
     }
 
-    public static PersonalAccessTokenInfo readPersonalAccessTokenInfo(
-        ByteBuf response
-    ) {
+    public static PersonalAccessTokenInfo readPersonalAccessTokenInfo(ByteBuf response) {
         var nameLength = response.readByte();
-        var name = response
-            .readCharSequence(nameLength, StandardCharsets.UTF_8)
-            .toString();
+        var name = response.readCharSequence(nameLength, StandardCharsets.UTF_8).toString();
         var expiry = readU64AsBigInteger(response);
-        Optional<BigInteger> expiryOptional = expiry.equals(BigInteger.ZERO)
-            ? Optional.empty()
-            : Optional.of(expiry);
+        Optional<BigInteger> expiryOptional = expiry.equals(BigInteger.ZERO) ? Optional.empty() : Optional.of(expiry);
         return new PersonalAccessTokenInfo(name, expiryOptional);
     }
 

@@ -19,17 +19,8 @@
 
 package org.apache.iggy.client.blocking.tcp;
 
-import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.assertThatThrownBy;
-
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
-import java.math.BigInteger;
-import java.nio.charset.StandardCharsets;
-import java.util.Arrays;
-import java.util.HashMap;
-import java.util.Map;
-import java.util.Optional;
 import org.apache.iggy.consumergroup.Consumer;
 import org.apache.iggy.identifier.ConsumerId;
 import org.apache.iggy.identifier.StreamId;
@@ -49,6 +40,16 @@ import org.apache.iggy.user.TopicPermissions;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 
+import java.math.BigInteger;
+import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Optional;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+
 class BytesSerializerTest {
 
     @Nested
@@ -65,9 +66,7 @@ class BytesSerializerTest {
             ByteBuf bytesAsU64 = BytesSerializer.toBytesAsU64(value);
 
             // then
-            assertThat(bytesAsU64).isEqualByComparingTo(
-                Unpooled.copyLong(maxLong)
-            );
+            assertThat(bytesAsU64).isEqualByComparingTo(Unpooled.copyLong(maxLong));
         }
 
         @Test
@@ -90,9 +89,7 @@ class BytesSerializerTest {
             var value = BigInteger.valueOf(-1);
 
             // when & then
-            assertThatThrownBy(() ->
-                BytesSerializer.toBytesAsU64(value)
-            ).isInstanceOf(IllegalArgumentException.class);
+            assertThatThrownBy(() -> BytesSerializer.toBytesAsU64(value)).isInstanceOf(IllegalArgumentException.class);
         }
 
         @Test
@@ -103,9 +100,7 @@ class BytesSerializerTest {
             var value = maxU64.add(BigInteger.ONE);
 
             // when & then
-            assertThatThrownBy(() ->
-                BytesSerializer.toBytesAsU64(value)
-            ).isInstanceOf(IllegalArgumentException.class);
+            assertThatThrownBy(() -> BytesSerializer.toBytesAsU64(value)).isInstanceOf(IllegalArgumentException.class);
         }
     }
 
@@ -124,9 +119,7 @@ class BytesSerializerTest {
             ByteBuf bytesAsU128 = BytesSerializer.toBytesAsU128(value);
 
             // then
-            assertThat(bytesAsU128).isEqualByComparingTo(
-                Unpooled.wrappedBuffer(maxU128, 1, 16)
-            );
+            assertThat(bytesAsU128).isEqualByComparingTo(Unpooled.wrappedBuffer(maxU128, 1, 16));
         }
 
         @Test
@@ -149,9 +142,7 @@ class BytesSerializerTest {
             var value = BigInteger.valueOf(-1);
 
             // when & then
-            assertThatThrownBy(() ->
-                BytesSerializer.toBytesAsU128(value)
-            ).isInstanceOf(IllegalArgumentException.class);
+            assertThatThrownBy(() -> BytesSerializer.toBytesAsU128(value)).isInstanceOf(IllegalArgumentException.class);
         }
 
         @Test
@@ -163,9 +154,7 @@ class BytesSerializerTest {
             var value = maxU128Value.add(BigInteger.ONE);
 
             // when & then
-            assertThatThrownBy(() ->
-                BytesSerializer.toBytesAsU128(value)
-            ).isInstanceOf(IllegalArgumentException.class);
+            assertThatThrownBy(() -> BytesSerializer.toBytesAsU128(value)).isInstanceOf(IllegalArgumentException.class);
         }
     }
 
@@ -184,9 +173,7 @@ class BytesSerializerTest {
             assertThat(result.readByte()).isEqualTo((byte) 4); // length
             byte[] stringBytes = new byte[4];
             result.readBytes(stringBytes);
-            assertThat(
-                new String(stringBytes, StandardCharsets.UTF_8)
-            ).isEqualTo("test");
+            assertThat(new String(stringBytes, StandardCharsets.UTF_8)).isEqualTo("test");
         }
 
         @Test
@@ -212,9 +199,7 @@ class BytesSerializerTest {
 
             // then
             byte[] expectedBytes = input.getBytes(StandardCharsets.UTF_8);
-            assertThat(result.readByte()).isEqualTo(
-                (byte) expectedBytes.length
-            );
+            assertThat(result.readByte()).isEqualTo((byte) expectedBytes.length);
             byte[] stringBytes = new byte[expectedBytes.length];
             result.readBytes(stringBytes);
             assertThat(stringBytes).isEqualTo(expectedBytes);
@@ -409,9 +394,7 @@ class BytesSerializerTest {
         @Test
         void shouldSerializeTimestampStrategy() {
             // given
-            var strategy = PollingStrategy.timestamp(
-                BigInteger.valueOf(1234567890)
-            );
+            var strategy = PollingStrategy.timestamp(BigInteger.valueOf(1234567890));
 
             // when
             ByteBuf result = BytesSerializer.toBytes(strategy);
@@ -471,10 +454,7 @@ class BytesSerializerTest {
         void shouldSerializeSingleHeader() {
             // given
             Map<HeaderKey, HeaderValue> headers = new HashMap<>();
-            headers.put(
-                HeaderKey.fromString("key1"),
-                new HeaderValue(HeaderKind.Raw, "value1")
-            );
+            headers.put(HeaderKey.fromString("key1"), new HeaderValue(HeaderKind.Raw, "value1"));
 
             // when
             ByteBuf result = BytesSerializer.toBytes(headers);
@@ -496,14 +476,8 @@ class BytesSerializerTest {
         void shouldSerializeMultipleHeaders() {
             // given
             Map<HeaderKey, HeaderValue> headers = new HashMap<>();
-            headers.put(
-                HeaderKey.fromString("k1"),
-                new HeaderValue(HeaderKind.Raw, "v1")
-            );
-            headers.put(
-                HeaderKey.fromString("k2"),
-                new HeaderValue(HeaderKind.String, "v2")
-            );
+            headers.put(HeaderKey.fromString("k1"), new HeaderValue(HeaderKind.Raw, "v1"));
+            headers.put(HeaderKey.fromString("k2"), new HeaderValue(HeaderKind.String, "v2"));
 
             // when
             ByteBuf result = BytesSerializer.toBytes(headers);
@@ -521,14 +495,14 @@ class BytesSerializerTest {
             // given
             var messageId = new BytesMessageId(new byte[16]);
             var header = new MessageHeader(
-                BigInteger.valueOf(123), // checksum
-                messageId,
-                BigInteger.valueOf(0), // offset
-                BigInteger.valueOf(1000), // timestamp
-                BigInteger.valueOf(1000), // originTimestamp
-                0L, // userHeadersLength
-                5L // payloadLength
-            );
+                    BigInteger.valueOf(123), // checksum
+                    messageId,
+                    BigInteger.valueOf(0), // offset
+                    BigInteger.valueOf(1000), // timestamp
+                    BigInteger.valueOf(1000), // originTimestamp
+                    0L, // userHeadersLength
+                    5L // payloadLength
+                    );
             byte[] payload = "hello".getBytes();
             var message = new Message(header, payload, new HashMap<>());
 
@@ -536,9 +510,7 @@ class BytesSerializerTest {
             ByteBuf result = BytesSerializer.toBytes(message);
 
             // then
-            assertThat(result.readableBytes()).isEqualTo(
-                MessageHeader.SIZE + 5
-            ); // header + payload, no user headers
+            assertThat(result.readableBytes()).isEqualTo(MessageHeader.SIZE + 5); // header + payload, no user headers
         }
 
         @Test
@@ -546,24 +518,21 @@ class BytesSerializerTest {
             // given
             var messageId = new BytesMessageId(new byte[16]);
             Map<HeaderKey, HeaderValue> userHeaders = new HashMap<>();
-            userHeaders.put(
-                HeaderKey.fromString("key"),
-                new HeaderValue(HeaderKind.Raw, "val")
-            );
+            userHeaders.put(HeaderKey.fromString("key"), new HeaderValue(HeaderKind.Raw, "val"));
 
             // Calculate user headers size
             ByteBuf headersBuf = BytesSerializer.toBytes(userHeaders);
             int userHeadersLength = headersBuf.readableBytes();
 
             var header = new MessageHeader(
-                BigInteger.ZERO,
-                messageId,
-                BigInteger.ZERO,
-                BigInteger.valueOf(1000),
-                BigInteger.valueOf(1000),
-                (long) userHeadersLength,
-                3L // "abc".length()
-            );
+                    BigInteger.ZERO,
+                    messageId,
+                    BigInteger.ZERO,
+                    BigInteger.valueOf(1000),
+                    BigInteger.valueOf(1000),
+                    (long) userHeadersLength,
+                    3L // "abc".length()
+                    );
             byte[] payload = "abc".getBytes();
             var message = new Message(header, payload, userHeaders);
 
@@ -571,9 +540,7 @@ class BytesSerializerTest {
             ByteBuf result = BytesSerializer.toBytes(message);
 
             // then
-            assertThat(result.readableBytes()).isEqualTo(
-                MessageHeader.SIZE + 3 + userHeadersLength
-            );
+            assertThat(result.readableBytes()).isEqualTo(MessageHeader.SIZE + 3 + userHeadersLength);
         }
     }
 
@@ -585,14 +552,14 @@ class BytesSerializerTest {
             // given
             var messageId = new BytesMessageId(new byte[16]);
             var header = new MessageHeader(
-                BigInteger.valueOf(999), // checksum
-                messageId,
-                BigInteger.valueOf(42), // offset
-                BigInteger.valueOf(2000), // timestamp
-                BigInteger.valueOf(1999), // originTimestamp
-                10L, // userHeadersLength
-                100L // payloadLength
-            );
+                    BigInteger.valueOf(999), // checksum
+                    messageId,
+                    BigInteger.valueOf(42), // offset
+                    BigInteger.valueOf(2000), // timestamp
+                    BigInteger.valueOf(1999), // originTimestamp
+                    10L, // userHeadersLength
+                    100L // payloadLength
+                    );
 
             // when
             ByteBuf result = BytesSerializer.toBytes(header);
@@ -622,18 +589,7 @@ class BytesSerializerTest {
         @Test
         void shouldSerializeGlobalPermissions() {
             // given
-            var permissions = new GlobalPermissions(
-                true,
-                false,
-                true,
-                false,
-                true,
-                false,
-                true,
-                false,
-                true,
-                false
-            );
+            var permissions = new GlobalPermissions(true, false, true, false, true, false, true, false, true, false);
 
             // when
             ByteBuf result = BytesSerializer.toBytes(permissions);
@@ -671,15 +627,7 @@ class BytesSerializerTest {
         @Test
         void shouldSerializeStreamPermissionsWithoutTopics() {
             // given
-            var permissions = new StreamPermissions(
-                true,
-                false,
-                true,
-                false,
-                true,
-                false,
-                new HashMap<>()
-            );
+            var permissions = new StreamPermissions(true, false, true, false, true, false, new HashMap<>());
 
             // when
             ByteBuf result = BytesSerializer.toBytes(permissions);
@@ -699,15 +647,7 @@ class BytesSerializerTest {
             // given
             Map<Long, TopicPermissions> topicPerms = new HashMap<>();
             topicPerms.put(1L, new TopicPermissions(true, true, true, true));
-            var permissions = new StreamPermissions(
-                true,
-                true,
-                true,
-                true,
-                true,
-                true,
-                topicPerms
-            );
+            var permissions = new StreamPermissions(true, true, true, true, true, true, topicPerms);
 
             // when
             ByteBuf result = BytesSerializer.toBytes(permissions);
@@ -723,18 +663,7 @@ class BytesSerializerTest {
         @Test
         void shouldSerializeFullPermissionsWithoutStreams() {
             // given
-            var globalPerms = new GlobalPermissions(
-                true,
-                true,
-                true,
-                true,
-                true,
-                true,
-                true,
-                true,
-                true,
-                true
-            );
+            var globalPerms = new GlobalPermissions(true, true, true, true, true, true, true, true, true, true);
             var permissions = new Permissions(globalPerms, new HashMap<>());
 
             // when
@@ -748,31 +677,10 @@ class BytesSerializerTest {
         @Test
         void shouldSerializeFullPermissionsWithStreams() {
             // given
-            var globalPerms = new GlobalPermissions(
-                false,
-                false,
-                false,
-                false,
-                false,
-                false,
-                false,
-                false,
-                false,
-                false
-            );
+            var globalPerms =
+                    new GlobalPermissions(false, false, false, false, false, false, false, false, false, false);
             Map<Long, StreamPermissions> streamPerms = new HashMap<>();
-            streamPerms.put(
-                1L,
-                new StreamPermissions(
-                    true,
-                    true,
-                    true,
-                    true,
-                    true,
-                    true,
-                    new HashMap<>()
-                )
-            );
+            streamPerms.put(1L, new StreamPermissions(true, true, true, true, true, true, new HashMap<>()));
             var permissions = new Permissions(globalPerms, streamPerms);
 
             // when

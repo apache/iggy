@@ -25,14 +25,9 @@ import java.util.Arrays;
 public record HeaderKey(HeaderKind kind, byte[] value) {
     public static HeaderKey fromString(String val) {
         if (val.isEmpty() || val.length() > 255) {
-            throw new IllegalArgumentException(
-                "Value has incorrect size, must be between 1 and 255"
-            );
+            throw new IllegalArgumentException("Value has incorrect size, must be between 1 and 255");
         }
-        return new HeaderKey(
-            HeaderKind.String,
-            val.getBytes(StandardCharsets.UTF_8)
-        );
+        return new HeaderKey(HeaderKind.String, val.getBytes(StandardCharsets.UTF_8));
     }
 
     @Override
