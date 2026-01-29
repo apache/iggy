@@ -545,24 +545,25 @@ impl Serialize for IggyMessage {
         use base64::{Engine as _, engine::general_purpose::STANDARD};
         use serde::ser::SerializeStruct;
 
-        let field_count = 2 + self.user_headers.is_some() as usize;
-
-        let mut state = serializer.serialize_struct("IggyMessage", field_count)?;
+        let mut state = serializer.serialize_struct("IggyMessage", 3)?;
         state.serialize_field("header", &self.header)?;
 
         let base64_payload = STANDARD.encode(&self.payload);
         state.serialize_field("payload", &base64_payload)?;
 
-        if self.user_headers.is_some() {
+        let entries: Vec<HeaderEntry> = if self.user_headers.is_some() {
             let headers_map = self.user_headers_map().map_err(serde::ser::Error::custom)?;
             if let Some(map) = headers_map {
-                let entries: Vec<HeaderEntry> = map
-                    .into_iter()
+                map.into_iter()
                     .map(|(key, value)| HeaderEntry { key, value })
-                    .collect();
-                state.serialize_field("user_headers", &entries)?;
+                    .collect()
+            } else {
+                Vec::new()
             }
-        }
+        } else {
+            Vec::new()
+        };
+        state.serialize_field("user_headers", &entries)?;
 
         state.end()
     }
@@ -730,6 +731,28 @@ mod tests {
 
         assert_eq!(original.header.id, decoded.header.id);
         assert_eq!(original.payload, decoded.payload);
+    }
+
+    #[test]
+    fn test_json_serialization_without_headers() {
+        let original = IggyMessage::builder()
+            .id(1)
+            .payload(Bytes::from("test"))
+            .build()
+            .expect("Message creation should not fail");
+
+        let json = serde_json::to_string(&original).expect("JSON serialization should not fail");
+
+        assert!(json.contains("\"user_headers\":[]"));
+
+        let deserialized: IggyMessage =
+            serde_json::from_str(&json).expect("JSON deserialization should not fail");
+
+        assert_eq!(original.header.id, deserialized.header.id);
+        assert_eq!(original.payload, deserialized.payload);
+
+        let headers_map = deserialized.user_headers_map().unwrap();
+        assert!(headers_map.map(|m| m.is_empty()).unwrap_or(true));
     }
 
     #[test]
