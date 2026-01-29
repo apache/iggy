@@ -51,7 +51,7 @@ fn handle_message(message: &IggyMessage) -> Result<(), Box<dyn Error>> {
     // The payload can be of any type as it is a raw byte array. In this case it's a JSON string.
     let payload = std::str::from_utf8(&message.payload)?;
     // The message type is stored in the custom message header.
-    let header_key = HeaderKey::from_string("message_type").unwrap();
+    let header_key = HeaderKey::try_from("message_type").unwrap();
     let headers_map = message.user_headers_map()?.unwrap();
     let message_type = headers_map.get(&header_key).unwrap().as_str()?;
     info!(

@@ -19,7 +19,6 @@
 use iggy::prelude::*;
 use rand::Rng;
 use std::collections::HashMap;
-use std::str::FromStr;
 
 const PROD_STREAM_NAME: &str = "prod";
 const TEST_STREAM_NAME: &str = "test";
@@ -158,17 +157,11 @@ async fn send_messages(client: &IggyClient, streams: &[(String, u32)]) -> Result
                         true => {
                             let mut headers = HashMap::new();
                             headers.insert(
-                                HeaderKey::from_string("key 1")?,
-                                HeaderValue::from_str("value1")?,
+                                HeaderKey::try_from("key 1")?,
+                                HeaderValue::try_from("value1")?,
                             );
-                            headers.insert(
-                                HeaderKey::from_string("key-2")?,
-                                HeaderValue::from_bool(true)?,
-                            );
-                            headers.insert(
-                                HeaderKey::from_string("key_3")?,
-                                HeaderValue::from_uint64(123456)?,
-                            );
+                            headers.insert(HeaderKey::try_from("key-2")?, true.into());
+                            headers.insert(HeaderKey::try_from("key_3")?, 123456u64.into());
                             Some(headers)
                         }
                     };

@@ -20,7 +20,6 @@ use bytes::Bytes;
 use iggy::prelude::*;
 use integration::test_server::{ClientFactory, assert_clean_system, login_root};
 use std::collections::HashMap;
-use std::str::FromStr;
 
 const STREAM_NAME: &str = "test-stream";
 const TOPIC_NAME: &str = "test-topic";
@@ -222,8 +221,8 @@ fn create_message_header_of_size(target_size: usize) -> HashMap<HeaderKey, Heade
             remaining_size - header_overhead
         };
 
-        let key = HeaderKey::from_raw(&key_bytes).unwrap();
-        let value = HeaderValue::from_str(create_string_of_size(value_size).as_str()).unwrap();
+        let key = HeaderKey::try_from(key_bytes.as_slice()).unwrap();
+        let value = HeaderValue::try_from(create_string_of_size(value_size).as_str()).unwrap();
 
         let actual_header_size = header_overhead + value_size;
         current_size += actual_header_size;

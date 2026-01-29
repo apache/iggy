@@ -80,28 +80,22 @@ async fn produce_messages(args: &Args, client: &IggyClient) -> Result<(), Box<dy
 
             let mut headers = HashMap::new();
             headers.insert(
-                HeaderKey::from_string("event_type")?,
-                HeaderValue::from_string("user_action")?,
+                HeaderKey::try_from("event_type")?,
+                HeaderValue::try_from("user_action")?,
+            );
+            headers.insert(1u32.into(), message_id.into());
+            headers.insert(
+                HeaderKey::try_from("important")?,
+                message_id.is_multiple_of(5).into(),
+            );
+            headers.insert(44u32.into(), (message_id as f64 * 2.0).into());
+            headers.insert(
+                HeaderKey::try_from("trace_id")?,
+                (message_id as i128 * 1_000_000_000_000).into(),
             );
             headers.insert(
-                HeaderKey::from_uint32(1)?,
-                HeaderValue::from_uint64(message_id)?,
-            );
-            headers.insert(
-                HeaderKey::from_string("important")?,
-                HeaderValue::from_bool(message_id.is_multiple_of(5))?,
-            );
-            headers.insert(
-                HeaderKey::from_uint32(44)?,
-                HeaderValue::from_float64(message_id as f64 * 2.0)?,
-            );
-            headers.insert(
-                HeaderKey::from_string("trace_id")?,
-                HeaderValue::from_int128(message_id as i128 * 1_000_000_000_000)?,
-            );
-            headers.insert(
-                HeaderKey::from_raw(&[0xDE, 0xAD])?,
-                HeaderValue::from_raw(&[0xBE, 0xEF, 0xCA, 0xFE])?,
+                HeaderKey::try_from([0xDE, 0xAD].as_slice())?,
+                HeaderValue::try_from([0xBE, 0xEF, 0xCA, 0xFE].as_slice())?,
             );
 
             let payload =

@@ -24,7 +24,6 @@ use iggy_examples::shared::messages_generator::MessagesGenerator;
 use iggy_examples::shared::system;
 use std::collections::HashMap;
 use std::error::Error;
-use std::str::FromStr;
 use std::sync::Arc;
 use tracing::info;
 use tracing_subscriber::layer::SubscriberExt;
@@ -86,8 +85,8 @@ async fn produce_messages(args: &Args, client: &IggyClient) -> Result<(), Box<dy
             // The message type will be stored in the custom message header.
             let mut headers = HashMap::new();
             headers.insert(
-                HeaderKey::from_string("message_type").unwrap(),
-                HeaderValue::from_str(message_type).unwrap(),
+                HeaderKey::try_from("message_type").unwrap(),
+                HeaderValue::try_from(message_type).unwrap(),
             );
 
             let message = IggyMessage::builder()

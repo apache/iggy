@@ -195,7 +195,10 @@ impl IggyCmdTestCase for TestMessagePollCmd {
 
         if self.show_headers {
             status = status
-                .stdout(contains(format!("Header: {}", self.headers.0)))
+                .stdout(contains(format!(
+                    "Header: {}",
+                    self.headers.0.to_string_value()
+                )))
                 .stdout(contains(self.headers.1.kind.to_string()))
                 .stdout(contains(self.headers.1.to_string_value()).count(self.message_count))
         }

@@ -54,11 +54,11 @@ internal sealed class MessageConverter : JsonConverter<Message>
     {
         if (userHeaders is null)
         {
-            writer.WriteNull("headers");
+            writer.WriteNull("user_headers");
             return;
         }
 
-        writer.WriteStartArray("headers");
+        writer.WriteStartArray("user_headers");
 
         foreach (var (headerKey, headerValue) in userHeaders)
         {

@@ -680,8 +680,8 @@ mod tests {
     fn test_create_with_headers() {
         let mut headers = HashMap::new();
         headers.insert(
-            HeaderKey::from_string("content-type").unwrap(),
-            HeaderValue::from_str("text/plain").unwrap(),
+            HeaderKey::try_from("content-type").unwrap(),
+            HeaderValue::try_from("text/plain").unwrap(),
         );
 
         let message = IggyMessage::builder()
@@ -694,7 +694,7 @@ mod tests {
 
         let headers_map = message.user_headers_map().unwrap().unwrap();
         assert_eq!(headers_map.len(), 1);
-        assert!(headers_map.contains_key(&HeaderKey::from_string("content-type").unwrap()));
+        assert!(headers_map.contains_key(&HeaderKey::try_from("content-type").unwrap()));
     }
 
     #[test]
@@ -736,12 +736,12 @@ mod tests {
     fn test_json_serialization_with_headers() {
         let mut headers = HashMap::new();
         headers.insert(
-            HeaderKey::from_string("content-type").unwrap(),
-            HeaderValue::from_str("text/plain").unwrap(),
+            HeaderKey::try_from("content-type").unwrap(),
+            HeaderValue::try_from("text/plain").unwrap(),
         );
         headers.insert(
-            HeaderKey::from_string("correlation-id").unwrap(),
-            HeaderValue::from_str("123456").unwrap(),
+            HeaderKey::try_from("correlation-id").unwrap(),
+            HeaderValue::try_from("123456").unwrap(),
         );
 
         let original = IggyMessage::builder()
@@ -785,12 +785,12 @@ mod tests {
 
         assert_eq!(original_map.len(), deserialized_map.len());
         assert_eq!(
-            original_map.get(&HeaderKey::from_string("content-type").unwrap()),
-            deserialized_map.get(&HeaderKey::from_string("content-type").unwrap())
+            original_map.get(&HeaderKey::try_from("content-type").unwrap()),
+            deserialized_map.get(&HeaderKey::try_from("content-type").unwrap())
         );
         assert_eq!(
-            original_map.get(&HeaderKey::from_string("correlation-id").unwrap()),
-            deserialized_map.get(&HeaderKey::from_string("correlation-id").unwrap())
+            original_map.get(&HeaderKey::try_from("correlation-id").unwrap()),
+            deserialized_map.get(&HeaderKey::try_from("correlation-id").unwrap())
         );
     }
 }
