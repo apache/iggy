@@ -22,6 +22,7 @@ package org.apache.iggy.serde;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import org.apache.commons.lang3.ArrayUtils;
+import org.apache.iggy.message.HeaderKey;
 import org.apache.iggy.message.HeaderKind;
 import org.apache.iggy.topic.CompressionAlgorithm;
 import org.apache.iggy.user.UserStatus;
@@ -364,10 +365,11 @@ class BytesDeserializerTest {
 
             // Calculate and write user headers
             ByteBuf headersBuffer = Unpooled.buffer();
-            headersBuffer.writeIntLE(3); // key length
+            headersBuffer.writeByte(HeaderKind.String.asCode());
+            headersBuffer.writeIntLE(3);
             headersBuffer.writeBytes("key".getBytes());
             headersBuffer.writeByte(HeaderKind.Raw.asCode());
-            headersBuffer.writeIntLE(3); // value length
+            headersBuffer.writeIntLE(3);
             headersBuffer.writeBytes("val".getBytes());
 
             buffer.writeIntLE(headersBuffer.readableBytes()); // user headers length
@@ -380,7 +382,8 @@ class BytesDeserializerTest {
 
             // then
             assertThat(message.userHeaders()).hasSize(1);
-            assertThat(message.userHeaders().get("key").value()).isEqualTo("val");
+            assertThat(message.userHeaders().get(HeaderKey.fromString("key")).value())
+                    .isEqualTo("val");
         }
 
         @Test

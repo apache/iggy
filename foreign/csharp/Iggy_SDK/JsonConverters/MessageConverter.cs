@@ -58,17 +58,26 @@ internal sealed class MessageConverter : JsonConverter<Message>
             return;
         }
 
-        writer.WriteStartObject("headers");
+        writer.WriteStartArray("headers");
 
         foreach (var (headerKey, headerValue) in userHeaders)
         {
-            writer.WriteStartObject(headerKey.Value);
+            writer.WriteStartObject();
+
+            writer.WriteStartObject("key");
+            writer.WriteString("kind", GetHeaderKindString(headerKey.Kind));
+            writer.WriteBase64String("value", headerKey.Value);
+            writer.WriteEndObject();
+
+            writer.WriteStartObject("value");
             writer.WriteString("kind", GetHeaderKindString(headerValue.Kind));
             writer.WriteBase64String("value", headerValue.Value);
             writer.WriteEndObject();
+
+            writer.WriteEndObject();
         }
 
-        writer.WriteEndObject();
+        writer.WriteEndArray();
     }
 
     private static string GetHeaderKindString(HeaderKind kind)

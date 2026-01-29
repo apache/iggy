@@ -19,11 +19,18 @@
 
 package org.apache.iggy.examples.messageheaders.producer;
 
+import java.math.BigInteger;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
 import org.apache.iggy.client.blocking.tcp.IggyTcpClient;
 import org.apache.iggy.examples.shared.Messages.SerializableMessage;
 import org.apache.iggy.examples.shared.MessagesGenerator;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
+import org.apache.iggy.message.HeaderKey;
 import org.apache.iggy.message.HeaderKind;
 import org.apache.iggy.message.HeaderValue;
 import org.apache.iggy.message.Message;
@@ -34,14 +41,8 @@ import org.apache.iggy.topic.TopicDetails;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.math.BigInteger;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Optional;
-
 public final class MessageHeadersProducer {
+
     private static final String STREAM_NAME = "headers-stream";
     private static final StreamId STREAM_ID = StreamId.of(STREAM_NAME);
 
@@ -54,38 +55,47 @@ public final class MessageHeadersProducer {
 
     private static final String MESSAGE_TYPE_HEADER = "message_type";
 
-    private static final Logger log = LoggerFactory.getLogger(MessageHeadersProducer.class);
+    private static final Logger log = LoggerFactory.getLogger(
+        MessageHeadersProducer.class
+    );
 
     private MessageHeadersProducer() {}
 
     public static void main(String[] args) {
         var client = IggyTcpClient.builder()
-                .host("localhost")
-                .port(8090)
-                .credentials("iggy", "iggy")
-                .build();
+            .host("localhost")
+            .port(8090)
+            .credentials("iggy", "iggy")
+            .build();
 
         Optional<StreamDetails> stream = client.streams().getStream(STREAM_ID);
         if (stream.isPresent()) {
-            log.warn("Stream {} already exists and will not be created again.", STREAM_NAME);
+            log.warn(
+                "Stream {} already exists and will not be created again.",
+                STREAM_NAME
+            );
         } else {
             client.streams().createStream(STREAM_NAME);
             log.info("Stream {} was created.", STREAM_NAME);
         }
 
-        Optional<TopicDetails> topic = client.topics().getTopic(STREAM_ID, TOPIC_ID);
+        Optional<TopicDetails> topic = client
+            .topics()
+            .getTopic(STREAM_ID, TOPIC_ID);
         if (topic.isPresent()) {
             log.warn("Topic already exists and will not be created again.");
         } else {
-            client.topics()
-                    .createTopic(
-                            STREAM_ID,
-                            1L,
-                            CompressionAlgorithm.None,
-                            BigInteger.ZERO,
-                            BigInteger.ZERO,
-                            Optional.empty(),
-                            TOPIC_NAME);
+            client
+                .topics()
+                .createTopic(
+                    STREAM_ID,
+                    1L,
+                    CompressionAlgorithm.None,
+                    BigInteger.ZERO,
+                    BigInteger.ZERO,
+                    Optional.empty(),
+                    TOPIC_NAME
+                );
             log.info("Topic {} was created.", TOPIC_NAME);
         }
 
@@ -94,10 +104,11 @@ public final class MessageHeadersProducer {
 
     public static void produceMessages(IggyTcpClient client) {
         log.info(
-                "Messages will be sent to stream: {}, topic: {}, partition: {}.",
-                STREAM_NAME,
-                TOPIC_NAME,
-                PARTITION_ID);
+            "Messages will be sent to stream: {}, topic: {}, partition: {}.",
+            STREAM_NAME,
+            TOPIC_NAME,
+            PARTITION_ID
+        );
 
         int sentBatches = 0;
         Partitioning partitioning = Partitioning.partitionId(PARTITION_ID);
@@ -111,13 +122,18 @@ public final class MessageHeadersProducer {
                 SerializableMessage serializableMessage = generator.generate();
                 String messageType = serializableMessage.getMessageType();
                 String json = serializableMessage.toJson();
-                Map<String, HeaderValue> userHeaders = new HashMap<>();
-                userHeaders.put(MESSAGE_TYPE_HEADER, new HeaderValue(HeaderKind.String, messageType));
+                Map<HeaderKey, HeaderValue> userHeaders = new HashMap<>();
+                userHeaders.put(
+                    HeaderKey.fromString(MESSAGE_TYPE_HEADER),
+                    new HeaderValue(HeaderKind.String, messageType)
+                );
                 messages.add(Message.of(json, userHeaders));
                 serializableMessages.add(serializableMessage);
             }
 
-            client.messages().sendMessages(STREAM_ID, TOPIC_ID, partitioning, messages);
+            client
+                .messages()
+                .sendMessages(STREAM_ID, TOPIC_ID, partitioning, messages);
             sentBatches++;
             log.info("Sent messages: {}", serializableMessages);
         }
