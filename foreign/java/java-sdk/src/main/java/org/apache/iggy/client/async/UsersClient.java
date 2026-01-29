@@ -35,12 +35,12 @@ public interface UsersClient {
      * @param password The password to login with
      * @return A CompletableFuture that completes with the user's identity information
      */
-    CompletableFuture<IdentityInfo> loginAsync(String username, String password);
+    CompletableFuture<IdentityInfo> login(String username, String password);
 
     /**
      * Logs out from the server.
      *
      * @return A CompletableFuture that completes when logout is successful
      */
-    CompletableFuture<Void> logoutAsync();
+    CompletableFuture<Void> logout();
 }

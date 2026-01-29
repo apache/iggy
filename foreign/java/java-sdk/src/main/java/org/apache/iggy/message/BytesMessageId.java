@@ -21,6 +21,7 @@ package org.apache.iggy.message;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
+import org.apache.iggy.exception.IggyInvalidArgumentException;
 
 import java.math.BigInteger;
 import java.util.Arrays;
@@ -31,7 +32,7 @@ public class BytesMessageId implements MessageId {
 
     public BytesMessageId(byte[] value) {
         if (value.length != 16) {
-            throw new IllegalArgumentException("Message id must have 16 bytes");
+            throw new IggyInvalidArgumentException("Message id must have 16 bytes");
         }
         this.value = value;
     }

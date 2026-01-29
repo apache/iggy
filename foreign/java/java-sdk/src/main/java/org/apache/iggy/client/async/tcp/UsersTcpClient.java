@@ -20,6 +20,7 @@
 package org.apache.iggy.client.async.tcp;
 
 import io.netty.buffer.Unpooled;
+import org.apache.iggy.IggyVersion;
 import org.apache.iggy.client.async.UsersClient;
 import org.apache.iggy.serde.BytesSerializer;
 import org.apache.iggy.serde.CommandCode;
@@ -43,9 +44,9 @@ public class UsersTcpClient implements UsersClient {
     }
 
     @Override
-    public CompletableFuture<IdentityInfo> loginAsync(String username, String password) {
-        String version = "0.6.30";
-        String context = "java-sdk";
+    public CompletableFuture<IdentityInfo> login(String username, String password) {
+        String version = IggyVersion.getInstance().getUserAgent();
+        String context = IggyVersion.getInstance().toString();
 
         var payload = Unpooled.buffer();
         var usernameBytes = BytesSerializer.toBytes(username);
@@ -60,7 +61,7 @@ public class UsersTcpClient implements UsersClient {
 
         log.debug("Logging in user: {}", username);
 
-        return connection.sendAsync(CommandCode.User.LOGIN.getValue(), payload).thenApply(response -> {
+        return connection.send(CommandCode.User.LOGIN.getValue(), payload).thenApply(response -> {
             try {
                 // Read the user ID from response (4-byte unsigned int LE)
                 var userId = response.readUnsignedIntLE();
@@ -72,12 +73,12 @@ public class UsersTcpClient implements UsersClient {
     }
 
     @Override
-    public CompletableFuture<Void> logoutAsync() {
+    public CompletableFuture<Void> logout() {
         var payload = Unpooled.buffer(0); // Empty payload for logout
 
         log.debug("Logging out");
 
-        return connection.sendAsync(CommandCode.User.LOGOUT.getValue(), payload).thenAccept(response -> {
+        return connection.send(CommandCode.User.LOGOUT.getValue(), payload).thenAccept(response -> {
             response.release();
             log.debug("Logged out successfully");
         });

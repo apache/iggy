@@ -63,7 +63,7 @@ public final class SinkDataProducer {
                 .host(hostAndPort.host())
                 .port(hostAndPort.port())
                 .credentials(username, password)
-                .build();
+                .buildAndLogin();
 
         StreamId streamId = StreamId.of(stream);
         TopicId topicId = TopicId.of(topic);

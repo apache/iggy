@@ -62,7 +62,7 @@ public final class MessageEnvelopeProducer {
                 .host("localhost")
                 .port(8090)
                 .credentials("iggy", "iggy")
-                .build();
+                .buildAndLogin();
 
         Optional<StreamDetails> stream = client.streams().getStream(STREAM_ID);
         if (stream.isPresent()) {

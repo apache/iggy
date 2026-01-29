@@ -19,6 +19,8 @@
 
 package org.apache.iggy.message;
 
+import org.apache.iggy.exception.IggyInvalidArgumentException;
+
 public enum HeaderKind {
     Raw(1),
     String(2),
@@ -48,7 +50,7 @@ public enum HeaderKind {
                 return kind;
             }
         }
-        throw new IllegalArgumentException("Unknown header kind: " + code);
+        throw new IggyInvalidArgumentException("Unknown header kind: " + code);
     }
 
     public int asCode() {

@@ -49,7 +49,7 @@ public class MessagesTcpClient implements MessagesClient {
     }
 
     @Override
-    public CompletableFuture<PolledMessages> pollMessagesAsync(
+    public CompletableFuture<PolledMessages> pollMessages(
             StreamId streamId,
             TopicId topicId,
             Optional<Long> partitionId,
@@ -79,19 +79,17 @@ public class MessagesTcpClient implements MessagesClient {
         payload.writeByte(autoCommit ? 1 : 0);
 
         // Send async request and transform response
-        return connection
-                .sendAsync(CommandCode.Messages.POLL.getValue(), payload)
-                .thenApply(response -> {
-                    try {
-                        return BytesDeserializer.readPolledMessages(response);
-                    } finally {
-                        response.release();
-                    }
-                });
+        return connection.send(CommandCode.Messages.POLL.getValue(), payload).thenApply(response -> {
+            try {
+                return BytesDeserializer.readPolledMessages(response);
+            } finally {
+                response.release();
+            }
+        });
     }
 
     @Override
-    public CompletableFuture<Void> sendMessagesAsync(
+    public CompletableFuture<Void> sendMessages(
             StreamId streamId, TopicId topicId, Partitioning partitioning, List<Message> messages) {
 
         // Build metadata section following the blocking client pattern
@@ -125,11 +123,9 @@ public class MessagesTcpClient implements MessagesClient {
         }
 
         // Send async request (no response data expected for send)
-        return connection
-                .sendAsync(CommandCode.Messages.SEND.getValue(), payload)
-                .thenAccept(response -> {
-                    // Response received, messages sent successfully
-                    response.release(); // Release the buffer
-                });
+        return connection.send(CommandCode.Messages.SEND.getValue(), payload).thenAccept(response -> {
+            // Response received, messages sent successfully
+            response.release(); // Release the buffer
+        });
     }
 }

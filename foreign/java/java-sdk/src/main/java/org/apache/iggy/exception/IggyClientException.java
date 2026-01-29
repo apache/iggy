@@ -17,17 +17,32 @@
  * under the License.
  */
 
-package org.apache.iggy.client.blocking.http.error;
+package org.apache.iggy.exception;
 
-public class IggyHttpException extends RuntimeException {
-    private final IggyHttpError error;
+/**
+ * Exception thrown for client-side errors.
+ *
+ * <p>This is the base class for client-side exceptions that are not related
+ * to server responses or connection issues.
+ */
+public class IggyClientException extends IggyException {
 
-    public IggyHttpException(IggyHttpError error) {
-        super(error.reason());
-        this.error = error;
+    /**
+     * Constructs a new IggyClientException with the specified message.
+     *
+     * @param message the detail message
+     */
+    public IggyClientException(String message) {
+        super(message);
     }
 
-    public IggyHttpError getError() {
-        return error;
+    /**
+     * Constructs a new IggyClientException with the specified message and cause.
+     *
+     * @param message the detail message
+     * @param cause the cause of the exception
+     */
+    public IggyClientException(String message, Throwable cause) {
+        super(message, cause);
     }
 }

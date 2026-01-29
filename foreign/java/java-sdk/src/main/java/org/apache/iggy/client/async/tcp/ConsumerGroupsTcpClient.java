@@ -59,7 +59,7 @@ public class ConsumerGroupsTcpClient implements ConsumerGroupsClient {
         log.debug("Joining consumer group - Stream: {}, Topic: {}, Group: {}", streamId, topicId, groupId);
 
         return connection
-                .sendAsync(CommandCode.ConsumerGroup.JOIN.getValue(), payload)
+                .send(CommandCode.ConsumerGroup.JOIN.getValue(), payload)
                 .thenAccept(response -> {
                     log.debug("Successfully joined consumer group");
                     response.release();
@@ -82,7 +82,7 @@ public class ConsumerGroupsTcpClient implements ConsumerGroupsClient {
         log.debug("Leaving consumer group - Stream: {}, Topic: {}, Group: {}", streamId, topicId, groupId);
 
         return connection
-                .sendAsync(CommandCode.ConsumerGroup.LEAVE.getValue(), payload)
+                .send(CommandCode.ConsumerGroup.LEAVE.getValue(), payload)
                 .thenAccept(response -> {
                     log.debug("Successfully left consumer group");
                     response.release();

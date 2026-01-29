@@ -21,6 +21,7 @@ package org.apache.iggy.client.blocking.tcp;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
+import org.apache.iggy.IggyVersion;
 import org.apache.iggy.client.blocking.UsersClient;
 import org.apache.iggy.identifier.UserId;
 import org.apache.iggy.serde.BytesDeserializer;
@@ -126,8 +127,8 @@ class UsersTcpClient implements UsersClient {
 
     @Override
     public IdentityInfo login(String username, String password) {
-        String version = "0.6.30";
-        String context = "java-sdk";
+        String version = IggyVersion.getInstance().getUserAgent();
+        String context = IggyVersion.getInstance().toString();
         var payloadSize = 2 + username.length() + password.length() + 4 + version.length() + 4 + context.length();
         var payload = Unpooled.buffer(payloadSize);
 

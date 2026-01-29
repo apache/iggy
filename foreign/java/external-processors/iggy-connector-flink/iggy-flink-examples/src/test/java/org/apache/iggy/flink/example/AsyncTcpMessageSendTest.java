@@ -72,15 +72,13 @@ class AsyncTcpMessageSendTest {
     void setUp() {
         log.info("Setting up Async TCP Client...");
 
-        // Create client with credentials for auto-login
+        // Create client with auto connect and login
         client = AsyncIggyTcpClient.builder()
                 .host(IGGY_SERVER_HOST)
                 .port(IGGY_SERVER_TCP_PORT)
                 .credentials(USERNAME, PASSWORD)
-                .build();
-
-        // Connect - this will also auto-login with the provided credentials
-        client.connect().join();
+                .buildAndLogin()
+                .join();
         log.info("Connected to Iggy server at {}:{}", IGGY_SERVER_HOST, IGGY_SERVER_TCP_PORT);
     }
 
@@ -88,7 +86,7 @@ class AsyncTcpMessageSendTest {
     void tearDown() {
         if (client != null) {
             try {
-                client.users().logoutAsync().join();
+                client.users().logout().join();
                 log.info("Logged out successfully");
             } catch (RuntimeException e) {
                 log.warn("Error during logout: {}", e.getMessage());
@@ -119,7 +117,7 @@ class AsyncTcpMessageSendTest {
         messages.add(message);
 
         CompletableFuture<Void> sendFuture =
-                client.messages().sendMessagesAsync(streamId, topicId, Partitioning.balanced(), messages);
+                client.messages().sendMessages(streamId, topicId, Partitioning.balanced(), messages);
 
         sendFuture.get();
 
@@ -145,7 +143,7 @@ class AsyncTcpMessageSendTest {
         }
 
         CompletableFuture<Void> sendFuture =
-                client.messages().sendMessagesAsync(streamId, topicId, Partitioning.balanced(), messages);
+                client.messages().sendMessages(streamId, topicId, Partitioning.balanced(), messages);
         sendFuture.get();
 
         log.info("Successfully sent batch of {} messages", batchSize);
@@ -168,8 +166,8 @@ class AsyncTcpMessageSendTest {
         List<Message> messages = new ArrayList<>();
         messages.add(message);
 
-        CompletableFuture<Void> sendFuture = client.messages()
-                .sendMessagesAsync(streamId, topicId, Partitioning.partitionId(targetPartition), messages);
+        CompletableFuture<Void> sendFuture =
+                client.messages().sendMessages(streamId, topicId, Partitioning.partitionId(targetPartition), messages);
         sendFuture.get();
 
         log.info("Successfully sent message to partition {}", targetPartition);
@@ -193,7 +191,7 @@ class AsyncTcpMessageSendTest {
 
         String messageKey = "test-key-123";
         CompletableFuture<Void> sendFuture =
-                client.messages().sendMessagesAsync(streamId, topicId, Partitioning.messagesKey(messageKey), messages);
+                client.messages().sendMessages(streamId, topicId, Partitioning.messagesKey(messageKey), messages);
         sendFuture.get();
 
         log.info("Successfully sent message with key: {}", messageKey);
@@ -217,7 +215,7 @@ class AsyncTcpMessageSendTest {
         messages.add(message);
 
         CompletableFuture<Void> sendFuture =
-                client.messages().sendMessagesAsync(streamId, topicId, Partitioning.balanced(), messages);
+                client.messages().sendMessages(streamId, topicId, Partitioning.balanced(), messages);
         sendFuture.get();
 
         log.info("Successfully sent JSON message: {}", jsonPayload);
@@ -243,7 +241,7 @@ class AsyncTcpMessageSendTest {
             messages.add(message);
 
             CompletableFuture<Void> future =
-                    client.messages().sendMessagesAsync(streamId, topicId, Partitioning.balanced(), messages);
+                    client.messages().sendMessages(streamId, topicId, Partitioning.balanced(), messages);
             futures.add(future);
         }
 
@@ -272,7 +270,7 @@ class AsyncTcpMessageSendTest {
 
         long startTime = System.currentTimeMillis();
         CompletableFuture<Void> sendFuture =
-                client.messages().sendMessagesAsync(streamId, topicId, Partitioning.balanced(), messages);
+                client.messages().sendMessages(streamId, topicId, Partitioning.balanced(), messages);
         sendFuture.get();
         long duration = System.currentTimeMillis() - startTime;
 

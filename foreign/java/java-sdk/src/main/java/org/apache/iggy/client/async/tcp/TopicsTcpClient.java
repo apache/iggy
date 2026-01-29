@@ -51,12 +51,12 @@ public class TopicsTcpClient implements TopicsClient {
     }
 
     @Override
-    public CompletableFuture<Optional<TopicDetails>> getTopicAsync(StreamId streamId, TopicId topicId) {
+    public CompletableFuture<Optional<TopicDetails>> getTopic(StreamId streamId, TopicId topicId) {
         var payload = Unpooled.buffer();
         payload.writeBytes(toBytes(streamId));
         payload.writeBytes(toBytes(topicId));
 
-        return connection.sendAsync(CommandCode.Topic.GET.getValue(), payload).thenApply(response -> {
+        return connection.send(CommandCode.Topic.GET.getValue(), payload).thenApply(response -> {
             try {
                 if (response.isReadable()) {
                     return Optional.of(BytesDeserializer.readTopicDetails(response));
@@ -69,26 +69,24 @@ public class TopicsTcpClient implements TopicsClient {
     }
 
     @Override
-    public CompletableFuture<List<Topic>> getTopicsAsync(StreamId streamId) {
+    public CompletableFuture<List<Topic>> getTopics(StreamId streamId) {
         var payload = toBytes(streamId);
 
-        return connection
-                .sendAsync(CommandCode.Topic.GET_ALL.getValue(), payload)
-                .thenApply(response -> {
-                    try {
-                        List<Topic> topics = new ArrayList<>();
-                        while (response.isReadable()) {
-                            topics.add(BytesDeserializer.readTopic(response));
-                        }
-                        return topics;
-                    } finally {
-                        response.release();
-                    }
-                });
+        return connection.send(CommandCode.Topic.GET_ALL.getValue(), payload).thenApply(response -> {
+            try {
+                List<Topic> topics = new ArrayList<>();
+                while (response.isReadable()) {
+                    topics.add(BytesDeserializer.readTopic(response));
+                }
+                return topics;
+            } finally {
+                response.release();
+            }
+        });
     }
 
     @Override
-    public CompletableFuture<TopicDetails> createTopicAsync(
+    public CompletableFuture<TopicDetails> createTopic(
             StreamId streamId,
             Long partitionsCount,
             CompressionAlgorithm compressionAlgorithm,
@@ -108,19 +106,17 @@ public class TopicsTcpClient implements TopicsClient {
         payload.writeByte(replicationFactor.orElse((short) 0));
         payload.writeBytes(BytesSerializer.toBytes(name));
 
-        return connection
-                .sendAsync(CommandCode.Topic.CREATE.getValue(), payload)
-                .thenApply(response -> {
-                    try {
-                        return BytesDeserializer.readTopicDetails(response);
-                    } finally {
-                        response.release();
-                    }
-                });
+        return connection.send(CommandCode.Topic.CREATE.getValue(), payload).thenApply(response -> {
+            try {
+                return BytesDeserializer.readTopicDetails(response);
+            } finally {
+                response.release();
+            }
+        });
     }
 
     @Override
-    public CompletableFuture<Void> updateTopicAsync(
+    public CompletableFuture<Void> updateTopic(
             StreamId streamId,
             TopicId topicId,
             CompressionAlgorithm compressionAlgorithm,
@@ -138,19 +134,15 @@ public class TopicsTcpClient implements TopicsClient {
         payload.writeByte(replicationFactor.orElse((short) 0));
         payload.writeBytes(BytesSerializer.toBytes(name));
 
-        return connection
-                .sendAsync(CommandCode.Topic.UPDATE.getValue(), payload)
-                .thenAccept(response -> response.release());
+        return connection.send(CommandCode.Topic.UPDATE.getValue(), payload).thenAccept(response -> response.release());
     }
 
     @Override
-    public CompletableFuture<Void> deleteTopicAsync(StreamId streamId, TopicId topicId) {
+    public CompletableFuture<Void> deleteTopic(StreamId streamId, TopicId topicId) {
         var payload = Unpooled.buffer();
         payload.writeBytes(toBytes(streamId));
         payload.writeBytes(toBytes(topicId));
 
-        return connection
-                .sendAsync(CommandCode.Topic.DELETE.getValue(), payload)
-                .thenAccept(response -> response.release());
+        return connection.send(CommandCode.Topic.DELETE.getValue(), payload).thenAccept(response -> response.release());
     }
 }

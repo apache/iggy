@@ -17,21 +17,32 @@
  * under the License.
  */
 
-package org.apache.iggy.client.blocking;
+package org.apache.iggy.exception;
 
-public class IggyClientBuilder {
+/**
+ * Exception thrown when a protocol-level error occurs.
+ *
+ * <p>This is the base class for protocol-related exceptions, including
+ * empty responses and malformed responses.
+ */
+public class IggyProtocolException extends IggyException {
 
-    private IggyBaseClient client;
-
-    public IggyClientBuilder withBaseClient(IggyBaseClient client) {
-        this.client = client;
-        return this;
+    /**
+     * Constructs a new IggyProtocolException with the specified message.
+     *
+     * @param message the detail message
+     */
+    public IggyProtocolException(String message) {
+        super(message);
     }
 
-    public IggyClient build() {
-        if (client == null) {
-            throw new IllegalArgumentException("Base client not provided");
-        }
-        return new IggyClient(client);
+    /**
+     * Constructs a new IggyProtocolException with the specified message and cause.
+     *
+     * @param message the detail message
+     * @param cause the cause of the exception
+     */
+    public IggyProtocolException(String message, Throwable cause) {
+        super(message, cause);
     }
 }
