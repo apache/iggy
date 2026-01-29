@@ -22,9 +22,7 @@ mod types;
 use iggy_common::sharding::IggyNamespace;
 pub use iggy_partition::IggyPartition;
 pub use iggy_partitions::IggyPartitions;
-pub use types::{
-    AppendResult, PartitionOffsets, PollMetadata, PollingArgs, PollingConsumer, SendMessagesResult,
-};
+pub use types::{AppendResult, PartitionOffsets, PollingArgs, PollingConsumer, SendMessagesResult};
 
 /// High-level partition operations for request handlers.
 ///
@@ -104,7 +102,7 @@ pub trait Partitions {
         consumer: PollingConsumer,
         namespace: IggyNamespace,
         args: PollingArgs,
-    ) -> impl Future<Output = Result<(Self::PollResult, PollMetadata), Self::Error>>;
+    ) -> impl Future<Output = Result<Self::PollResult, Self::Error>>;
 
     /// Get stored consumer offset.
     ///

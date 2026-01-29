@@ -35,22 +35,6 @@ impl PollingArgs {
     }
 }
 
-/// Metadata returned from a poll operation.
-#[derive(Debug, Clone)]
-pub struct PollMetadata {
-    pub partition_id: u32,
-    pub current_offset: u64,
-}
-
-impl PollMetadata {
-    pub fn new(partition_id: u32, current_offset: u64) -> Self {
-        Self {
-            partition_id,
-            current_offset,
-        }
-    }
-}
-
 /// Result of sending messages.
 #[derive(Debug)]
 pub struct SendMessagesResult {
