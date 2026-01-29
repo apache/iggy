@@ -30,6 +30,7 @@ pub mod cross_protocol_pat_scenario;
 pub mod delete_segments_scenario;
 pub mod encryption_scenario;
 pub mod log_rotation_scenario;
+pub mod message_cleanup_scenario;
 pub mod message_headers_scenario;
 pub mod message_size_scenario;
 pub mod offset_scenario;

@@ -443,7 +443,7 @@ impl Default for TopicConfig {
         TopicConfig {
             path: SERVER_CONFIG.system.topic.path.parse().unwrap(),
             max_size: SERVER_CONFIG.system.topic.max_size.parse().unwrap(),
-            delete_oldest_segments: SERVER_CONFIG.system.topic.delete_oldest_segments,
+            message_expiry: SERVER_CONFIG.system.topic.message_expiry.parse().unwrap(),
         }
     }
 }
@@ -471,7 +471,6 @@ impl Default for SegmentConfig {
         SegmentConfig {
             size: SERVER_CONFIG.system.segment.size.parse().unwrap(),
             cache_indexes: SERVER_CONFIG.system.segment.cache_indexes.parse().unwrap(),
-            message_expiry: SERVER_CONFIG.system.segment.message_expiry.parse().unwrap(),
             archive_expired: SERVER_CONFIG.system.segment.archive_expired,
         }
     }

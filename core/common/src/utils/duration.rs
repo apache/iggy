@@ -101,7 +101,7 @@ impl IggyDuration {
     }
 
     pub fn is_zero(&self) -> bool {
-        self.duration.as_secs() == 0
+        self.duration.is_zero()
     }
 
     pub fn abs_diff(&self, other: IggyDuration) -> IggyDuration {

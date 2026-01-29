@@ -241,11 +241,7 @@ impl IggyShard {
             );
 
             let start_offset = 0;
-            let segment = Segment::new(
-                start_offset,
-                self.config.system.segment.size,
-                self.config.system.segment.message_expiry,
-            );
+            let segment = Segment::new(start_offset, self.config.system.segment.size);
 
             let storage = create_segment_storage(
                 &self.config.system,

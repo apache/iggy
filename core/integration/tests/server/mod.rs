@@ -19,6 +19,7 @@
 mod cg;
 mod concurrent_addition;
 mod general;
+mod message_cleanup;
 mod message_retrieval;
 mod scenarios;
 mod specific;

@@ -205,8 +205,8 @@ impl Display for TopicConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ path: {}, max_size: {}, delete_oldest_segments: {} }}",
-            self.path, self.max_size, self.delete_oldest_segments
+            "{{ path: {}, max_size: {}, message_expiry: {} }}",
+            self.path, self.max_size, self.message_expiry
         )
     }
 }
@@ -239,8 +239,8 @@ impl Display for SegmentConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ size_bytes: {}, cache_indexes: {}, message_expiry: {}, archive_expired: {} }}",
-            self.size, self.cache_indexes, self.message_expiry, self.archive_expired,
+            "{{ size_bytes: {}, cache_indexes: {}, archive_expired: {} }}",
+            self.size, self.cache_indexes, self.archive_expired,
         )
     }
 }

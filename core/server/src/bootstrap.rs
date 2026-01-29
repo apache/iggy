@@ -339,11 +339,7 @@ pub async fn load_segments(
             )
         };
 
-        let mut segment = Segment::new(
-            start_offset,
-            config.segment.size,
-            config.segment.message_expiry,
-        );
+        let mut segment = Segment::new(start_offset, config.segment.size);
 
         segment.start_timestamp = start_timestamp;
         segment.end_timestamp = end_timestamp;
@@ -430,6 +426,11 @@ pub async fn load_segments(
             let segment_index = log.segments().len() - 1;
             log.set_segment_indexes(segment_index, loaded_indexes);
         }
+    }
+
+    // The last segment is the active one and must remain unsealed for writes
+    if log.has_segments() {
+        log.segments_mut().last_mut().unwrap().sealed = false;
     }
 
     if matches!(
