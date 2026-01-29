@@ -17,15 +17,33 @@
 
 // TODO: We already have a `Journal` trait inside of the `storage` module `journal.rs` file.
 // But the interface was designed for partition log, not an generic journal.
-pub trait Journal {
-    type Entry;
+pub trait Journal<S>
+where
+    S: Storage,
+{
     type Header;
+    type Entry;
 
-    fn has_prepare(&self, header: &Self::Header) -> bool;
+    fn entry(&self, header: &Self::Header) -> Option<&Self::Entry>;
 
     fn previous_entry(&self, header: &Self::Header) -> Option<Self::Header>;
 
     fn set_header_as_dirty(&self, header: &Self::Header);
 
     fn append(&self, entry: Self::Entry) -> impl Future<Output = ()>;
+}
+
+// TODO: Move to other crate.
+pub trait Storage {
+    type Buffer;
+
+    fn write(&self, buf: Self::Buffer) -> usize;
+    fn read(&self, offset: u64, buffer: Self::Buffer) -> Self::Buffer;
+}
+
+pub trait JournalHandle {
+    type Storage: Storage;
+    type Target: Journal<Self::Storage>;
+
+    fn handle(&self) -> &Self::Target;
 }
