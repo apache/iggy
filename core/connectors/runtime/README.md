@@ -134,6 +134,10 @@ exposed_headers = [""]
 allow_credentials = false
 allow_private_network = false
 
+[http.metrics] # Optional Prometheus metrics configuration
+enabled = false
+endpoint = "/metrics"
+
 [http.tls] # Optional TLS configuration for HTTP API
 enabled = false
 cert_file = "core/certs/iggy_cert.pem"
@@ -144,6 +148,8 @@ Currently, it does expose the following endpoints:
 
 - `GET /`: welcome message.
 - `GET /health`: health status of the runtime.
+- `GET /stats`: runtime statistics including process info, memory/CPU usage, and connector status.
+- `GET /metrics`: Prometheus-formatted metrics (when `http.metrics.enabled` is `true`).
 - `GET /sinks`: list of sinks.
 - `GET /sinks/{key}`: sink details.
 - `GET /sinks/{key}/configs`: list of configuration versions for the sink.
@@ -180,3 +186,22 @@ endpoint = "http://localhost:4317"
 transport = "grpc" # Options: "grpc", "http"
 endpoint = "http://localhost:4317"
 ```
+
+## Metrics
+
+The runtime exposes Prometheus-compatible metrics via the `/metrics` endpoint when enabled. The following metrics are available:
+
+### Runtime Gauges
+
+- `iggy_connectors_sources_total`: Total configured source connectors
+- `iggy_connectors_sources_running`: Sources currently in Running status
+- `iggy_connectors_sinks_total`: Total configured sink connectors
+- `iggy_connectors_sinks_running`: Sinks currently in Running status
+
+### Per-Connector Counters (labeled with `connector_key` and `connector_type`)
+
+- `iggy_connector_messages_produced_total`: Messages received from source plugin
+- `iggy_connector_messages_sent_total`: Messages sent to Iggy (source)
+- `iggy_connector_messages_consumed_total`: Messages consumed from Iggy (sink)
+- `iggy_connector_messages_processed_total`: Messages processed and sent to sink plugin
+- `iggy_connector_errors_total`: Errors encountered

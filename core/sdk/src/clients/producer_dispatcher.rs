@@ -18,7 +18,7 @@
 use crate::clients::producer::ProducerCoreBackend;
 use crate::clients::producer_config::{BackgroundConfig, BackpressureMode};
 use crate::clients::producer_error_callback::ErrorCtx;
-use crate::clients::producer_sharding::{Shard, ShardMessage, ShardMessageWithPermits};
+use crate::clients::producer_sharding::{Shard, ShardMessage, ShardMessageWithPermit};
 use futures::FutureExt;
 use iggy_common::{Identifier, IggyError, IggyMessage, Partitioning, Sizeable};
 use std::sync::Arc;
@@ -30,7 +30,6 @@ pub struct ProducerDispatcher {
     shards: Vec<Shard>,
     config: Arc<BackgroundConfig>,
     closed: AtomicBool,
-    slots_permit: Arc<Semaphore>,
     bytes_permit: Arc<Semaphore>,
     stop_tx: broadcast::Sender<()>,
     _join_handle: JoinHandle<()>,
@@ -75,33 +74,33 @@ impl ProducerDispatcher {
             }
         });
 
-        for _ in 0..num_shards {
-            let stop_rx = stop_tx.subscribe();
-            shards.push(Shard::new(
-                core.clone(),
-                config.clone(),
-                err_tx.clone(),
-                stop_rx,
-            ));
-        }
-
         let bytes_permit = {
             let bytes = config.max_buffer_size.as_bytes_usize();
             if bytes == 0 { usize::MAX } else { bytes }
         };
 
-        let slot_permit = if config.max_in_flight == 0 {
+        let slots_permit = Arc::new(Semaphore::new(if config.max_in_flight == 0 {
             usize::MAX
         } else {
             config.max_in_flight
-        };
+        }));
+
+        for _ in 0..num_shards {
+            let stop_rx = stop_tx.subscribe();
+            shards.push(Shard::new(
+                core.clone(),
+                config.clone(),
+                slots_permit.clone(),
+                err_tx.clone(),
+                stop_rx,
+            ));
+        }
 
         Self {
             shards,
             config,
             closed: AtomicBool::new(false),
             bytes_permit: Arc::new(Semaphore::new(bytes_permit)),
-            slots_permit: Arc::new(Semaphore::new(slot_permit)),
             stop_tx,
             _join_handle: handle,
         }
@@ -163,41 +162,6 @@ impl ProducerDispatcher {
             },
         };
 
-        let permit_slot = match self.slots_permit.clone().try_acquire_owned() {
-            Ok(perm) => perm,
-            Err(_) => match self.config.failure_mode {
-                BackpressureMode::FailImmediately => {
-                    drop(permit_bytes);
-                    return Err(IggyError::BackgroundSendError);
-                }
-                BackpressureMode::Block => match self.slots_permit.clone().acquire_owned().await {
-                    Ok(perm) => perm,
-                    Err(_) => {
-                        drop(permit_bytes);
-                        return Err(IggyError::BackgroundSendError);
-                    }
-                },
-                BackpressureMode::BlockWithTimeout(timeout_dur) => {
-                    match tokio::time::timeout(
-                        timeout_dur.get_duration(),
-                        self.slots_permit.clone().acquire_owned(),
-                    )
-                    .await
-                    {
-                        Ok(Ok(perm)) => perm,
-                        Ok(Err(_)) => {
-                            drop(permit_bytes);
-                            return Err(IggyError::BackgroundSendError);
-                        }
-                        Err(_) => {
-                            drop(permit_bytes);
-                            return Err(IggyError::BackgroundSendTimeout);
-                        }
-                    }
-                }
-            },
-        };
-
         let shard_ix = self.config.sharding.pick_shard(
             self.shards.len(),
             &shard_message.messages,
@@ -208,11 +172,7 @@ impl ProducerDispatcher {
         let shard = &self.shards[shard_ix];
 
         shard
-            .send(ShardMessageWithPermits::new(
-                shard_message,
-                permit_bytes,
-                permit_slot,
-            ))
+            .send(ShardMessageWithPermit::new(shard_message, permit_bytes))
             .await
     }
 

@@ -23,9 +23,13 @@ use iggy::websocket::websocket_client::WebSocketClient;
 use iggy_common::TransportProtocol;
 use std::sync::Arc;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct WebSocketClientFactory {
     pub server_addr: String,
+    pub tls_enabled: bool,
+    pub tls_domain: String,
+    pub tls_ca_file: Option<String>,
+    pub tls_validate_certificate: bool,
 }
 
 #[async_trait]
@@ -33,10 +37,32 @@ impl ClientFactory for WebSocketClientFactory {
     async fn create_client(&self) -> ClientWrapper {
         let config = WebSocketClientConfig {
             server_address: self.server_addr.clone(),
+            tls_enabled: self.tls_enabled,
+            tls_domain: self.tls_domain.clone(),
+            tls_ca_file: self.tls_ca_file.clone(),
+            tls_validate_certificate: self.tls_validate_certificate,
             ..WebSocketClientConfig::default()
         };
-        let client = WebSocketClient::create(Arc::new(config)).unwrap();
-        Client::connect(&client).await.unwrap();
+        let client = WebSocketClient::create(Arc::new(config)).unwrap_or_else(|e| {
+            panic!(
+                "Failed to create WebSocketClient, iggy-server has address {}, error: {:?}",
+                self.server_addr, e
+            )
+        });
+        Client::connect(&client).await.unwrap_or_else(|e| {
+            if self.tls_enabled {
+                panic!(
+                    "Failed to connect to iggy-server at {} with TLS enabled, error: {:?}\n\
+                    Hint: Make sure the server is started with WebSocket TLS enabled.",
+                    self.server_addr, e
+                )
+            } else {
+                panic!(
+                    "Failed to connect to iggy-server at {}, error: {:?}",
+                    self.server_addr, e
+                )
+            }
+        });
         ClientWrapper::WebSocket(client)
     }
 
@@ -48,6 +74,3 @@ impl ClientFactory for WebSocketClientFactory {
         self.server_addr.clone()
     }
 }
-
-unsafe impl Send for WebSocketClientFactory {}
-unsafe impl Sync for WebSocketClientFactory {}

@@ -4429,7 +4429,7 @@ dependencies = [
 
 [[package]]
 name = "iggy"
-version = "0.8.1-edge.6"
+version = "0.8.1-edge.7"
 dependencies = [
  "async-broadcast",
  "async-dropper",
@@ -4536,7 +4536,7 @@ dependencies = [
 
 [[package]]
 name = "iggy-connectors"
-version = "0.2.1-edge.5"
+version = "0.2.1-edge.6"
 dependencies = [
  "async-trait",
  "axum",
@@ -4565,6 +4565,7 @@ dependencies = [
  "opentelemetry-semantic-conventions",
  "opentelemetry_sdk",
  "postcard",
+ "prometheus-client",
  "reqwest",
  "reqwest-middleware",
  "reqwest-retry",
@@ -4574,6 +4575,7 @@ dependencies = [
  "serde_with",
  "serde_yaml_ng",
  "strum",
+ "sysinfo 0.38.0",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -4859,6 +4861,7 @@ dependencies = [
  "clap",
  "futures-util",
  "iggy",
+ "lz4_flex",
  "rand 0.9.2",
  "serde",
  "serde_json",
@@ -4987,13 +4990,16 @@ dependencies = [
  "ahash 0.8.12",
  "assert_cmd",
  "async-trait",
+ "bon",
  "bytes",
  "chrono",
  "compio",
  "configs",
+ "configs_derive",
  "ctor",
  "derive_more",
  "env_logger",
+ "figment",
  "futures",
  "humantime",
  "iggy",
@@ -5003,6 +5009,7 @@ dependencies = [
  "lazy_static",
  "libc",
  "log",
+ "once_cell",
  "predicates",
  "rand 0.9.2",
  "rcgen",
@@ -5012,6 +5019,7 @@ dependencies = [
  "serde_json",
  "serial_test",
  "server",
+ "socket2 0.6.2",
  "sqlx",
  "strum",
  "strum_macros",

@@ -29,6 +29,7 @@ chrono = { workspace = true }
 clap = { workspace = true }
 futures-util = { workspace = true }
 iggy = { workspace = true }
+lz4_flex = "0.12.0"
 rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -62,12 +63,20 @@ name = "message-envelope-producer"
 path = "src/message-envelope/producer/main.rs"
 
 [[example]]
-name = "message-headers-consumer"
-path = "src/message-headers/consumer/main.rs"
+name = "message-headers-type-consumer"
+path = "src/message-headers/message-type/consumer/main.rs"
 
 [[example]]
-name = "message-headers-producer"
-path = "src/message-headers/producer/main.rs"
+name = "message-headers-type-producer"
+path = "src/message-headers/message-type/producer/main.rs"
+
+[[example]]
+name = "message-headers-compression-consumer"
+path = "src/message-headers/message-compression/consumer/main.rs"
+
+[[example]]
+name = "message-headers-compression-producer"
+path = "src/message-headers/message-compression/producer/main.rs"
 
 [[example]]
 name = "multi-tenant-consumer"

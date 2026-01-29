@@ -18,8 +18,9 @@
  */
 
 use crate::context::RuntimeContext;
+use crate::stats;
 use auth::resolve_api_key;
-use axum::{Json, Router, middleware, routing::get};
+use axum::{Json, Router, extract::State, middleware, routing::get};
 use axum_server::tls_rustls::RustlsConfig;
 use config::{HttpConfig, configure_cors};
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
@@ -41,12 +42,21 @@ pub async fn init(config: &HttpConfig, context: Arc<RuntimeContext>) {
         return;
     }
 
+    let mut system_router = Router::new().route("/stats", get(get_stats));
+
+    if config.metrics.enabled {
+        system_router = system_router.route(&config.metrics.endpoint, get(get_metrics));
+    }
+
+    let system_router = system_router.with_state(context.clone());
+
     let mut app = Router::new()
         .route("/", get(|| async { "Connector Runtime API" }))
         .route(
             "/health",
             get(|| async { Json(serde_json::json!({ "status": "healthy" })) }),
         )
+        .merge(system_router)
         .merge(sink::router(context.clone()))
         .merge(source::router(context.clone()));
 
@@ -110,4 +120,14 @@ pub async fn init(config: &HttpConfig, context: Arc<RuntimeContext>) {
             error!("Failed to start {NAME} HTTP API, error: {error}");
         }
     });
+}
+
+async fn get_metrics(State(context): State<Arc<RuntimeContext>>) -> String {
+    context.metrics.get_formatted_output()
+}
+
+async fn get_stats(
+    State(context): State<Arc<RuntimeContext>>,
+) -> Json<stats::ConnectorRuntimeStats> {
+    Json(stats::get_runtime_stats(&context).await)
 }

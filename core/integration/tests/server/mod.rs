@@ -144,7 +144,10 @@ async fn run_scenario(transport: TransportProtocol, scenario: ScenarioFn) {
         }
         TransportProtocol::WebSocket => {
             let server_addr = test_server.get_websocket_addr().unwrap();
-            Box::new(WebSocketClientFactory { server_addr })
+            Box::new(WebSocketClientFactory {
+                server_addr,
+                ..Default::default()
+            })
         }
     };
 

@@ -23,7 +23,7 @@ use std::hash::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use tokio::sync::{OwnedSemaphorePermit, broadcast};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast};
 use tokio::task::JoinHandle;
 use tracing::{debug, error};
 
@@ -108,28 +108,22 @@ impl Sizeable for ShardMessage {
     }
 }
 
-pub struct ShardMessageWithPermits {
+pub struct ShardMessageWithPermit {
     pub inner: ShardMessage,
     _bytes_permit: Option<OwnedSemaphorePermit>,
-    _slot_permit: Option<OwnedSemaphorePermit>,
 }
 
-impl ShardMessageWithPermits {
-    pub fn new(
-        msg: ShardMessage,
-        permit_bytes: OwnedSemaphorePermit,
-        permit_slot: OwnedSemaphorePermit,
-    ) -> Self {
+impl ShardMessageWithPermit {
+    pub fn new(msg: ShardMessage, permit_bytes: OwnedSemaphorePermit) -> Self {
         Self {
             inner: msg,
             _bytes_permit: Some(permit_bytes),
-            _slot_permit: Some(permit_slot),
         }
     }
 }
 
 pub struct Shard {
-    tx: flume::Sender<ShardMessageWithPermits>,
+    tx: flume::Sender<ShardMessageWithPermit>,
     closed: Arc<AtomicBool>,
     pub(crate) _handle: JoinHandle<()>,
 }
@@ -138,10 +132,11 @@ impl Shard {
     pub fn new(
         core: Arc<impl ProducerCoreBackend>,
         config: Arc<BackgroundConfig>,
+        slots_permit: Arc<Semaphore>,
         err_sender: flume::Sender<ErrorCtx>,
         mut stop_rx: broadcast::Receiver<()>,
     ) -> Self {
-        let (tx, rx) = flume::bounded::<ShardMessageWithPermits>(256);
+        let (tx, rx) = flume::bounded::<ShardMessageWithPermit>(256);
         let closed = Arc::new(AtomicBool::new(false));
 
         let closed_clone = closed.clone();
@@ -176,7 +171,7 @@ impl Shard {
                                         exceed_batch_size,
                                     );
 
-                                    Self::flush_buffer(&core, &mut buffer, &mut buffer_bytes, &err_sender).await;
+                                    Self::flush_buffer(&core, &slots_permit, &mut buffer, &mut buffer_bytes, &err_sender).await;
                                     debug!(
                                         new_buffer_len = buffer.len(),
                                         new_buffer_bytes = buffer_bytes,
@@ -191,7 +186,7 @@ impl Shard {
                     }
                     _ = tokio::time::sleep_until(deadline) => {
                         if !buffer.is_empty() {
-                            Self::flush_buffer(&core, &mut buffer, &mut buffer_bytes, &err_sender).await;
+                            Self::flush_buffer(&core, &slots_permit, &mut buffer, &mut buffer_bytes, &err_sender).await;
                         }
                         last_flush = tokio::time::Instant::now();
                     }
@@ -202,7 +197,7 @@ impl Shard {
                             buffer.push(msg);
                         }
                         if !buffer.is_empty() {
-                            Self::flush_buffer(&core, &mut buffer, &mut buffer_bytes, &err_sender).await;
+                            Self::flush_buffer(&core, &slots_permit, &mut buffer, &mut buffer_bytes, &err_sender).await;
                         }
                         break;
                     }
@@ -219,7 +214,8 @@ impl Shard {
 
     async fn flush_buffer(
         core: &Arc<impl ProducerCoreBackend>,
-        buffer: &mut Vec<ShardMessageWithPermits>,
+        slots_permit: &Arc<Semaphore>,
+        buffer: &mut Vec<ShardMessageWithPermit>,
         buffer_bytes: &mut usize,
         err_sender: &flume::Sender<ErrorCtx>,
     ) {
@@ -227,7 +223,7 @@ impl Shard {
             return;
         }
 
-        let mut merged_batches: Vec<ShardMessageWithPermits> = Vec::new();
+        let mut merged_batches: Vec<ShardMessageWithPermit> = Vec::new();
         for msg in buffer.drain(..) {
             if let Some(last) = merged_batches.last_mut()
                 && Self::same_destination(&last.inner, &msg.inner)
@@ -239,6 +235,8 @@ impl Shard {
         }
 
         for msg in merged_batches {
+            let _slot_permit = slots_permit.acquire().await;
+
             let result = core
                 .send_internal(
                     &msg.inner.stream,
@@ -274,7 +272,7 @@ impl Shard {
         *buffer_bytes = 0;
     }
 
-    pub(crate) async fn send(&self, message: ShardMessageWithPermits) -> Result<(), IggyError> {
+    pub(crate) async fn send(&self, message: ShardMessageWithPermit) -> Result<(), IggyError> {
         if self.closed.load(Ordering::Acquire) {
             return Err(IggyError::ProducerClosed);
         }
@@ -299,7 +297,7 @@ mod tests {
     use bytes::Bytes;
     use iggy_common::IggyDuration;
     use std::time::Duration;
-    use tokio::{sync::Semaphore, time::sleep};
+    use tokio::time::sleep;
 
     fn dummy_identifier() -> Arc<Identifier> {
         Arc::new(Identifier::numeric(1).unwrap())
@@ -325,13 +323,17 @@ mod tests {
             .batch_size(10_000);
         let config = Arc::new(bb.build());
 
-        let (permit_bytes, permit_slot) = (
-            Arc::new(Semaphore::new(100_000)),
-            Arc::new(Semaphore::new(100)),
-        );
+        let permit_bytes = Arc::new(Semaphore::new(100_000));
+        let slots_permit = Arc::new(Semaphore::new(100));
 
         let (_stop_tx, stop_rx) = broadcast::channel(1);
-        let shard = Shard::new(Arc::new(mock), config, flume::unbounded().0, stop_rx);
+        let shard = Shard::new(
+            Arc::new(mock),
+            config,
+            slots_permit,
+            flume::unbounded().0,
+            stop_rx,
+        );
 
         for _ in 0..10 {
             let message = ShardMessage {
@@ -340,10 +342,9 @@ mod tests {
                 messages: vec![dummy_message(1)],
                 partitioning: None,
             };
-            let wrapped = ShardMessageWithPermits::new(
+            let wrapped = ShardMessageWithPermit::new(
                 message,
                 permit_bytes.clone().acquire_many_owned(1).await.unwrap(),
-                permit_slot.clone().acquire_owned().await.unwrap(),
             );
             shard.send(wrapped).await.unwrap();
         }
@@ -364,13 +365,17 @@ mod tests {
             .batch_size(10_000);
         let config = Arc::new(bb.build());
 
-        let (permit_bytes, permit_slot) = (
-            Arc::new(Semaphore::new(10_000)),
-            Arc::new(Semaphore::new(100)),
-        );
+        let permit_bytes = Arc::new(Semaphore::new(10_000));
+        let slots_permit = Arc::new(Semaphore::new(100));
 
         let (_stop_tx, stop_rx) = broadcast::channel(1);
-        let shard = Shard::new(Arc::new(mock), config, flume::unbounded().0, stop_rx);
+        let shard = Shard::new(
+            Arc::new(mock),
+            config,
+            slots_permit,
+            flume::unbounded().0,
+            stop_rx,
+        );
 
         let message = ShardMessage {
             stream: dummy_identifier(),
@@ -378,14 +383,13 @@ mod tests {
             messages: vec![dummy_message(10_000)],
             partitioning: None,
         };
-        let wrapped = ShardMessageWithPermits::new(
+        let wrapped = ShardMessageWithPermit::new(
             message,
             permit_bytes
                 .clone()
                 .acquire_many_owned(10_000)
                 .await
                 .unwrap(),
-            permit_slot.clone().acquire_owned().await.unwrap(),
         );
         shard.send(wrapped).await.unwrap();
 
@@ -405,13 +409,17 @@ mod tests {
             .batch_size(10_000);
         let config = Arc::new(bb.build());
 
-        let (permit_bytes, permit_slot) = (
-            Arc::new(Semaphore::new(10_000)),
-            Arc::new(Semaphore::new(100)),
-        );
+        let permit_bytes = Arc::new(Semaphore::new(10_000));
+        let slots_permit = Arc::new(Semaphore::new(100));
 
         let (_stop_tx, stop_rx) = broadcast::channel(1);
-        let shard = Shard::new(Arc::new(mock), config, flume::unbounded().0, stop_rx);
+        let shard = Shard::new(
+            Arc::new(mock),
+            config,
+            slots_permit,
+            flume::unbounded().0,
+            stop_rx,
+        );
 
         let message = ShardMessage {
             stream: dummy_identifier(),
@@ -419,10 +427,9 @@ mod tests {
             messages: vec![dummy_message(1)],
             partitioning: None,
         };
-        let wrapped = ShardMessageWithPermits::new(
+        let wrapped = ShardMessageWithPermit::new(
             message,
             permit_bytes.clone().acquire_many_owned(1).await.unwrap(),
-            permit_slot.clone().acquire_owned().await.unwrap(),
         );
         shard.send(wrapped).await.unwrap();
 
@@ -448,13 +455,11 @@ mod tests {
         let bb = BackgroundConfig::builder();
         let config = Arc::new(bb.build());
 
-        let (permit_bytes, permit_slot) = (
-            Arc::new(Semaphore::new(10_000)),
-            Arc::new(Semaphore::new(100)),
-        );
+        let permit_bytes = Arc::new(Semaphore::new(10_000));
+        let slots_permit = Arc::new(Semaphore::new(100));
 
         let (_stop_tx, stop_rx) = broadcast::channel(1);
-        let shard = Shard::new(Arc::new(mock), config, err_tx, stop_rx);
+        let shard = Shard::new(Arc::new(mock), config, slots_permit, err_tx, stop_rx);
 
         let message = ShardMessage {
             stream: dummy_identifier(),
@@ -462,10 +467,9 @@ mod tests {
             messages: vec![dummy_message(1)],
             partitioning: None,
         };
-        let wrapped = ShardMessageWithPermits::new(
+        let wrapped = ShardMessageWithPermit::new(
             message,
             permit_bytes.clone().acquire_many_owned(1).await.unwrap(),
-            permit_slot.clone().acquire_owned().await.unwrap(),
         );
         shard.send(wrapped).await.unwrap();
 
@@ -476,7 +480,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_shard_send_error_on_closed_channel() {
-        let (tx, rx) = flume::bounded::<ShardMessageWithPermits>(1);
+        let (tx, rx) = flume::bounded::<ShardMessageWithPermit>(1);
         drop(rx);
 
         let shard = Shard {
@@ -485,10 +489,7 @@ mod tests {
             _handle: tokio::spawn(async {}),
         };
 
-        let (permit_bytes, permit_slot) = (
-            Arc::new(Semaphore::new(10_000)),
-            Arc::new(Semaphore::new(100)),
-        );
+        let permit_bytes = Arc::new(Semaphore::new(10_000));
 
         let message = ShardMessage {
             stream: dummy_identifier(),
@@ -496,10 +497,9 @@ mod tests {
             messages: vec![dummy_message(1)],
             partitioning: None,
         };
-        let wrapped = ShardMessageWithPermits::new(
+        let wrapped = ShardMessageWithPermit::new(
             message,
             permit_bytes.clone().acquire_many_owned(1).await.unwrap(),
-            permit_slot.clone().acquire_owned().await.unwrap(),
         );
 
         let result = shard.send(wrapped).await;
