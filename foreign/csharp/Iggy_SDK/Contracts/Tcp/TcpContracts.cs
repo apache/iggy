@@ -554,7 +554,7 @@ internal static class TcpContracts
             return [];
         }
 
-        var headersLength = headers.Sum(header => 4 + header.Key.Value.Length + 1 + 4 + header.Value.Value.Length);
+        var headersLength = headers.Sum(header => 1 + 4 + header.Key.Value.Length + 1 + 4 + header.Value.Value.Length);
         Span<byte> headersBytes = stackalloc byte[headersLength];
         var position = 0;
         foreach (var (headerKey, headerValue) in headers)
@@ -589,19 +589,22 @@ internal static class TcpContracts
 
     private static byte[] GetBytesFromHeader(HeaderKey headerKey, HeaderValue headerValue)
     {
-        var headerBytesLength = 4 + headerKey.Value.Length + 1 + 4 + headerValue.Value.Length;
+        var headerBytesLength = 1 + 4 + headerKey.Value.Length + 1 + 4 + headerValue.Value.Length;
         Span<byte> headerBytes = stackalloc byte[headerBytesLength];
+        var pos = 0;
 
-        BinaryPrimitives.WriteInt32LittleEndian(headerBytes[..4], headerKey.Value.Length);
-        var headerKeyBytes = Encoding.UTF8.GetBytes(headerKey.Value);
-        headerKeyBytes.CopyTo(headerBytes[4..(4 + headerKey.Value.Length)]);
+        headerBytes[pos++] = HeaderKindToByte(headerKey.Kind);
 
-        headerBytes[4 + headerKey.Value.Length] = HeaderKindToByte(headerValue.Kind);
+        BinaryPrimitives.WriteInt32LittleEndian(headerBytes[pos..(pos + 4)], headerKey.Value.Length);
+        pos += 4;
+        headerKey.Value.CopyTo(headerBytes[pos..(pos + headerKey.Value.Length)]);
+        pos += headerKey.Value.Length;
 
-        BinaryPrimitives.WriteInt32LittleEndian(
-            headerBytes[(4 + headerKey.Value.Length + 1)..(4 + headerKey.Value.Length + 1 + 4)],
-            headerValue.Value.Length);
-        headerValue.Value.CopyTo(headerBytes[(4 + headerKey.Value.Length + 1 + 4)..]);
+        headerBytes[pos++] = HeaderKindToByte(headerValue.Kind);
+
+        BinaryPrimitives.WriteInt32LittleEndian(headerBytes[pos..(pos + 4)], headerValue.Value.Length);
+        pos += 4;
+        headerValue.Value.CopyTo(headerBytes[pos..]);
 
         return headerBytes.ToArray();
     }

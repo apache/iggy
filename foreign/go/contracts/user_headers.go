@@ -28,14 +28,15 @@ type HeaderValue struct {
 }
 
 type HeaderKey struct {
+	Kind  HeaderKind
 	Value string
 }
 
-func NewHeaderKey(val string) (HeaderKey, error) {
+func NewHeaderKeyString(val string) (HeaderKey, error) {
 	if len(val) == 0 || len(val) > 255 {
 		return HeaderKey{}, errors.New("value has incorrect size, must be between 1 and 255")
 	}
-	return HeaderKey{Value: val}, nil
+	return HeaderKey{Kind: String, Value: val}, nil
 }
 
 type HeaderKind int
@@ -61,7 +62,7 @@ const (
 func GetHeadersBytes(headers map[HeaderKey]HeaderValue) []byte {
 	headersLength := 0
 	for key, header := range headers {
-		headersLength += 4 + len(key.Value) + 1 + 4 + len(header.Value)
+		headersLength += 1 + 4 + len([]byte(key.Value)) + 1 + 4 + len(header.Value)
 	}
 	headersBytes := make([]byte, headersLength)
 	position := 0
@@ -74,16 +75,25 @@ func GetHeadersBytes(headers map[HeaderKey]HeaderValue) []byte {
 }
 
 func getBytesFromHeader(key HeaderKey, value HeaderValue) []byte {
-	headerBytesLength := 4 + len(key.Value) + 1 + 4 + len(value.Value)
+	keyBytes := []byte(key.Value)
+	headerBytesLength := 1 + 4 + len(keyBytes) + 1 + 4 + len(value.Value)
 	headerBytes := make([]byte, headerBytesLength)
+	pos := 0
 
-	binary.LittleEndian.PutUint32(headerBytes[:4], uint32(len(key.Value)))
-	copy(headerBytes[4:4+len(key.Value)], key.Value)
+	headerBytes[pos] = byte(key.Kind)
+	pos++
 
-	headerBytes[4+len(key.Value)] = byte(value.Kind)
+	binary.LittleEndian.PutUint32(headerBytes[pos:pos+4], uint32(len(keyBytes)))
+	pos += 4
+	copy(headerBytes[pos:pos+len(keyBytes)], keyBytes)
+	pos += len(keyBytes)
 
-	binary.LittleEndian.PutUint32(headerBytes[4+len(key.Value)+1:4+len(key.Value)+1+4], uint32(len(value.Value)))
-	copy(headerBytes[4+len(key.Value)+1+4:], value.Value)
+	headerBytes[pos] = byte(value.Kind)
+	pos++
+
+	binary.LittleEndian.PutUint32(headerBytes[pos:pos+4], uint32(len(value.Value)))
+	pos += 4
+	copy(headerBytes[pos:], value.Value)
 
 	return headerBytes
 }
@@ -93,6 +103,12 @@ func DeserializeHeaders(userHeadersBytes []byte) (map[HeaderKey]HeaderValue, err
 	position := 0
 
 	for position < len(userHeadersBytes) {
+		keyKind, err := deserializeHeaderKind(userHeadersBytes, position)
+		if err != nil {
+			return nil, err
+		}
+		position++
+
 		if len(userHeadersBytes) <= position+4 {
 			return nil, errors.New("invalid header key length")
 		}
@@ -107,10 +123,10 @@ func DeserializeHeaders(userHeadersBytes []byte) (map[HeaderKey]HeaderValue, err
 			return nil, errors.New("invalid header key")
 		}
 
-		key := string(userHeadersBytes[position : position+int(keyLength)])
+		keyValue := string(userHeadersBytes[position : position+int(keyLength)])
 		position += int(keyLength)
 
-		headerKind, err := deserializeHeaderKind(userHeadersBytes, position)
+		valueKind, err := deserializeHeaderKind(userHeadersBytes, position)
 		if err != nil {
 			return nil, err
 		}
@@ -134,8 +150,8 @@ func DeserializeHeaders(userHeadersBytes []byte) (map[HeaderKey]HeaderValue, err
 		value := userHeadersBytes[position : position+int(valueLength)]
 		position += int(valueLength)
 
-		headers[HeaderKey{Value: key}] = HeaderValue{
-			Kind:  headerKind,
+		headers[HeaderKey{Kind: keyKind, Value: keyValue}] = HeaderValue{
+			Kind:  valueKind,
 			Value: value,
 		}
 	}

@@ -21,9 +21,14 @@ package org.apache.iggy.serde;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
+import java.math.BigInteger;
+import java.nio.charset.StandardCharsets;
+import java.util.Map;
+import java.util.Optional;
 import org.apache.commons.lang3.ArrayUtils;
 import org.apache.iggy.consumergroup.Consumer;
 import org.apache.iggy.identifier.Identifier;
+import org.apache.iggy.message.HeaderKey;
 import org.apache.iggy.message.HeaderValue;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.MessageHeader;
@@ -33,11 +38,6 @@ import org.apache.iggy.user.GlobalPermissions;
 import org.apache.iggy.user.Permissions;
 import org.apache.iggy.user.StreamPermissions;
 import org.apache.iggy.user.TopicPermissions;
-
-import java.math.BigInteger;
-import java.nio.charset.StandardCharsets;
-import java.util.Map;
-import java.util.Optional;
 
 /**
  * Unified serializer for both blocking and async clients.
@@ -68,7 +68,9 @@ public final class BytesSerializer {
             buffer.writeBytes(identifier.getName().getBytes());
             return buffer;
         } else {
-            throw new IllegalArgumentException("Unknown identifier kind: " + identifier.getKind());
+            throw new IllegalArgumentException(
+                "Unknown identifier kind: " + identifier.getKind()
+            );
         }
     }
 
@@ -119,15 +121,16 @@ public final class BytesSerializer {
         return buffer;
     }
 
-    public static ByteBuf toBytes(Map<String, HeaderValue> headers) {
+    public static ByteBuf toBytes(Map<HeaderKey, HeaderValue> headers) {
         if (headers.isEmpty()) {
             return Unpooled.EMPTY_BUFFER;
         }
         var buffer = Unpooled.buffer();
-        for (Map.Entry<String, HeaderValue> entry : headers.entrySet()) {
-            String key = entry.getKey();
-            buffer.writeIntLE(key.length());
-            buffer.writeBytes(key.getBytes());
+        for (Map.Entry<HeaderKey, HeaderValue> entry : headers.entrySet()) {
+            HeaderKey key = entry.getKey();
+            buffer.writeByte(key.kind().asCode());
+            buffer.writeIntLE(key.value().length);
+            buffer.writeBytes(key.value());
 
             HeaderValue value = entry.getValue();
             buffer.writeByte(value.kind().asCode());
@@ -143,8 +146,9 @@ public final class BytesSerializer {
         if (permissions.streams().isEmpty()) {
             buffer.writeByte(0);
         } else {
-            for (Map.Entry<Long, StreamPermissions> entry :
-                    permissions.streams().entrySet()) {
+            for (Map.Entry<Long, StreamPermissions> entry : permissions
+                .streams()
+                .entrySet()) {
                 buffer.writeByte(1);
                 buffer.writeIntLE(entry.getKey().intValue());
                 buffer.writeBytes(toBytes(entry.getValue()));
@@ -182,7 +186,9 @@ public final class BytesSerializer {
         if (permissions.topics().isEmpty()) {
             buffer.writeByte(0);
         } else {
-            for (Map.Entry<Long, TopicPermissions> entry : permissions.topics().entrySet()) {
+            for (Map.Entry<Long, TopicPermissions> entry : permissions
+                .topics()
+                .entrySet()) {
                 buffer.writeByte(1);
                 buffer.writeIntLE(entry.getKey().intValue());
                 buffer.writeBytes(toBytes(entry.getValue()));
@@ -212,12 +218,19 @@ public final class BytesSerializer {
 
     public static ByteBuf toBytesAsU64(BigInteger value) {
         if (value.signum() == -1) {
-            throw new IllegalArgumentException("Negative value cannot be serialized to unsigned 64: " + value);
+            throw new IllegalArgumentException(
+                "Negative value cannot be serialized to unsigned 64: " + value
+            );
         }
         ByteBuf buffer = Unpooled.buffer(8, 8);
         byte[] valueAsBytes = value.toByteArray();
-        if (valueAsBytes.length > 9 || valueAsBytes.length == 9 && valueAsBytes[0] != 0) {
-            throw new IllegalArgumentException("Value too large for U64: " + value);
+        if (
+            valueAsBytes.length > 9 ||
+            (valueAsBytes.length == 9 && valueAsBytes[0] != 0)
+        ) {
+            throw new IllegalArgumentException(
+                "Value too large for U64: " + value
+            );
         }
         ArrayUtils.reverse(valueAsBytes);
         buffer.writeBytes(valueAsBytes, 0, Math.min(8, valueAsBytes.length));
@@ -229,12 +242,19 @@ public final class BytesSerializer {
 
     public static ByteBuf toBytesAsU128(BigInteger value) {
         if (value.signum() == -1) {
-            throw new IllegalArgumentException("Negative value cannot be serialized to unsigned 128: " + value);
+            throw new IllegalArgumentException(
+                "Negative value cannot be serialized to unsigned 128: " + value
+            );
         }
         ByteBuf buffer = Unpooled.buffer(16, 16);
         byte[] valueAsBytes = value.toByteArray();
-        if (valueAsBytes.length > 17 || valueAsBytes.length == 17 && valueAsBytes[0] != 0) {
-            throw new IllegalArgumentException("Value too large for U128: " + value);
+        if (
+            valueAsBytes.length > 17 ||
+            (valueAsBytes.length == 17 && valueAsBytes[0] != 0)
+        ) {
+            throw new IllegalArgumentException(
+                "Value too large for U128: " + value
+            );
         }
         ArrayUtils.reverse(valueAsBytes);
         buffer.writeBytes(valueAsBytes, 0, Math.min(16, valueAsBytes.length));

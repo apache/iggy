@@ -428,17 +428,22 @@ internal static class BinaryMapper
 
         while (position < payload.Length)
         {
+            var keyKind = MapHeaderKind(payload, position);
+            position++;
+
             var keyLength = BinaryPrimitives.ReadInt32LittleEndian(payload[position..(position + 4)]);
             if (keyLength is 0 or > 255)
             {
                 throw new ArgumentException("Key has incorrect size, must be between 1 and 255", nameof(keyLength));
             }
 
-            var key = Encoding.UTF8.GetString(payload[(position + 4)..(position + 4 + keyLength)]);
-            position += 4 + keyLength;
+            position += 4;
+            var keyValue = payload[position..(position + keyLength)].ToArray();
+            position += keyLength;
 
-            var headerKind = MapHeaderKind(payload, position);
+            var valueKind = MapHeaderKind(payload, position);
             position++;
+
             var valueLength = BinaryPrimitives.ReadInt32LittleEndian(payload[position..(position + 4)]);
             if (valueLength is 0 or > 255)
             {
@@ -448,9 +453,10 @@ internal static class BinaryMapper
             position += 4;
             ReadOnlySpan<byte> value = payload[position..(position + valueLength)];
             position += valueLength;
-            headers.Add(HeaderKey.New(key), new HeaderValue
+
+            headers.Add(new HeaderKey { Kind = keyKind, Value = keyValue }, new HeaderValue
             {
-                Kind = headerKind,
+                Kind = valueKind,
                 Value = value.ToArray()
             });
         }

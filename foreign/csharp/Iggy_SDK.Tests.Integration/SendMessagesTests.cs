@@ -59,14 +59,14 @@ public class SendMessagesTests
             new Message(Guid.NewGuid(), Encoding.UTF8.GetBytes(dummyJson),
                 new Dictionary<HeaderKey, HeaderValue>
                 {
-                    { HeaderKey.New("header1"), HeaderValue.FromString("value1") },
-                    { HeaderKey.New("header2"), HeaderValue.FromInt32(444) }
+                    { HeaderKey.FromString("header1"), HeaderValue.FromString("value1") },
+                    { HeaderKey.FromString("header2"), HeaderValue.FromInt32(444) }
                 }),
             new Message(Guid.NewGuid(), Encoding.UTF8.GetBytes(dummyJson),
                 new Dictionary<HeaderKey, HeaderValue>
                 {
-                    { HeaderKey.New("header1"), HeaderValue.FromString("value1") },
-                    { HeaderKey.New("header2"), HeaderValue.FromInt32(444) }
+                    { HeaderKey.FromString("header1"), HeaderValue.FromString("value1") },
+                    { HeaderKey.FromString("header2"), HeaderValue.FromInt32(444) }
                 })
         ];
 
