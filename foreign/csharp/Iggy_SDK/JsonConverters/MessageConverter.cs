@@ -84,17 +84,21 @@ internal sealed class MessageConverter : JsonConverter<Message>
     {
         return kind switch
         {
+            HeaderKind.Raw => "raw",
+            HeaderKind.String => "string",
             HeaderKind.Bool => "bool",
+            HeaderKind.Int8 => "int8",
+            HeaderKind.Int16 => "int16",
             HeaderKind.Int32 => "int32",
             HeaderKind.Int64 => "int64",
             HeaderKind.Int128 => "int128",
+            HeaderKind.Uint8 => "uint8",
+            HeaderKind.Uint16 => "uint16",
             HeaderKind.Uint32 => "uint32",
             HeaderKind.Uint64 => "uint64",
             HeaderKind.Uint128 => "uint128",
             HeaderKind.Float => "float32",
             HeaderKind.Double => "float64",
-            HeaderKind.String => "string",
-            HeaderKind.Raw => "raw",
             _ => throw new ArgumentOutOfRangeException(nameof(kind), kind, "Invalid header kind")
         };
     }

@@ -19,10 +19,6 @@
 
 package org.apache.iggy.examples.messageheaders.consumer;
 
-import java.math.BigInteger;
-import java.nio.charset.StandardCharsets;
-import java.util.Map;
-import java.util.Optional;
 import org.apache.iggy.client.blocking.tcp.IggyTcpClient;
 import org.apache.iggy.consumergroup.Consumer;
 import org.apache.iggy.examples.shared.Messages;
@@ -41,6 +37,11 @@ import org.slf4j.LoggerFactory;
 import tools.jackson.databind.ObjectMapper;
 import tools.jackson.databind.json.JsonMapper;
 
+import java.math.BigInteger;
+import java.nio.charset.StandardCharsets;
+import java.util.Map;
+import java.util.Optional;
+
 public final class MessageHeadersConsumer {
 
     private static final String STREAM_NAME = "headers-stream";
@@ -55,30 +56,27 @@ public final class MessageHeadersConsumer {
 
     private static final String MESSAGE_TYPE_HEADER = "message_type";
 
-    private static final Logger log = LoggerFactory.getLogger(
-        MessageHeadersConsumer.class
-    );
+    private static final Logger log = LoggerFactory.getLogger(MessageHeadersConsumer.class);
     private static final ObjectMapper MAPPER = JsonMapper.builder().build();
 
     private MessageHeadersConsumer() {}
 
     public static void main(final String[] args) {
         var client = IggyTcpClient.builder()
-            .host("localhost")
-            .port(8090)
-            .credentials("iggy", "iggy")
-            .build();
+                .host("localhost")
+                .port(8090)
+                .credentials("iggy", "iggy")
+                .build();
 
         consumeMessages(client);
     }
 
     private static void consumeMessages(IggyTcpClient client) {
         log.info(
-            "Messages will be consumed from stream: {}, topic: {}, partition: {}.",
-            STREAM_ID,
-            TOPIC_ID,
-            PARTITION_ID
-        );
+                "Messages will be consumed from stream: {}, topic: {}, partition: {}.",
+                STREAM_ID,
+                TOPIC_ID,
+                PARTITION_ID);
 
         BigInteger offset = BigInteger.ZERO;
         int consumedBatches = 0;
@@ -87,25 +85,20 @@ public final class MessageHeadersConsumer {
 
         while (true) {
             if (consumedBatches == BATCHES_LIMIT) {
-                log.info(
-                    "Consumed {} batches of messages, exiting.",
-                    consumedBatches
-                );
+                log.info("Consumed {} batches of messages, exiting.", consumedBatches);
                 return;
             }
 
             try {
-                PolledMessages polledMessages = client
-                    .messages()
-                    .pollMessages(
-                        STREAM_ID,
-                        TOPIC_ID,
-                        Optional.of(PARTITION_ID),
-                        consumer,
-                        PollingStrategy.offset(offset),
-                        MESSAGES_PER_BATCH,
-                        false
-                    );
+                PolledMessages polledMessages = client.messages()
+                        .pollMessages(
+                                STREAM_ID,
+                                TOPIC_ID,
+                                Optional.of(PARTITION_ID),
+                                consumer,
+                                PollingStrategy.offset(offset),
+                                MESSAGES_PER_BATCH,
+                                false);
 
                 if (polledMessages.messages().isEmpty()) {
                     log.info("No messages found.");
@@ -118,9 +111,7 @@ public final class MessageHeadersConsumer {
 
                 consumedBatches++;
 
-                offset = offset.add(
-                    BigInteger.valueOf(polledMessages.messages().size())
-                );
+                offset = offset.add(BigInteger.valueOf(polledMessages.messages().size()));
             } catch (Exception e) {
                 log.error("Error polling messages", e);
                 break;
@@ -135,65 +126,45 @@ public final class MessageHeadersConsumer {
         try {
             Map<HeaderKey, HeaderValue> userHeaders = message.userHeaders();
             if (userHeaders.isEmpty()) {
-                log.warn(
-                    "Missing headers at offset {}.",
-                    message.header().offset()
-                );
+                log.warn("Missing headers at offset {}.", message.header().offset());
                 return;
             }
 
-            HeaderValue headerValue = userHeaders.get(
-                HeaderKey.fromString(MESSAGE_TYPE_HEADER)
-            );
+            HeaderValue headerValue = userHeaders.get(HeaderKey.fromString(MESSAGE_TYPE_HEADER));
             if (headerValue == null) {
                 log.warn(
-                    "Missing message type header at offset {}.",
-                    message.header().offset()
-                );
+                        "Missing message type header at offset {}.",
+                        message.header().offset());
                 return;
             }
 
             messageType = headerValue.value();
             log.info(
-                "Handling message type: {} at offset: {}...",
-                messageType,
-                message.header().offset()
-            );
+                    "Handling message type: {} at offset: {}...",
+                    messageType,
+                    message.header().offset());
 
             switch (messageType) {
                 case Messages.ORDER_CREATED_TYPE -> {
-                    OrderCreated order = MAPPER.readValue(
-                        payload,
-                        OrderCreated.class
-                    );
+                    OrderCreated order = MAPPER.readValue(payload, OrderCreated.class);
                     log.info("{}", order);
                 }
                 case Messages.ORDER_CONFIRMED_TYPE -> {
-                    OrderConfirmed order = MAPPER.readValue(
-                        payload,
-                        OrderConfirmed.class
-                    );
+                    OrderConfirmed order = MAPPER.readValue(payload, OrderConfirmed.class);
                     log.info("{}", order);
                 }
                 case Messages.ORDER_REJECTED_TYPE -> {
-                    OrderRejected order = MAPPER.readValue(
-                        payload,
-                        OrderRejected.class
-                    );
+                    OrderRejected order = MAPPER.readValue(payload, OrderRejected.class);
                     log.info("{}", order);
                 }
-                default -> log.warn(
-                    "Received unknown message type: {}",
-                    messageType
-                );
+                default -> log.warn("Received unknown message type: {}", messageType);
             }
         } catch (Exception e) {
             log.error(
-                "Failed to handle message type {} at offset {}",
-                messageType,
-                message.header().offset(),
-                e
-            );
+                    "Failed to handle message type {} at offset {}",
+                    messageType,
+                    message.header().offset(),
+                    e);
         }
     }
 }

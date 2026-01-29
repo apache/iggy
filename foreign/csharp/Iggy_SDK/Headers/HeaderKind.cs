@@ -38,7 +38,17 @@ public enum HeaderKind
     Bool,
 
     /// <summary>
-    ///     Integer header.
+    ///     Signed 8-bit integer header.
+    /// </summary>
+    Int8,
+
+    /// <summary>
+    ///     Signed 16-bit integer header.
+    /// </summary>
+    Int16,
+
+    /// <summary>
+    ///     Signed 32-bit integer header.
     /// </summary>
     Int32,
 
@@ -53,7 +63,17 @@ public enum HeaderKind
     Int128,
 
     /// <summary>
-    ///     Unsigned integer header.
+    ///     Unsigned 8-bit integer header.
+    /// </summary>
+    Uint8,
+
+    /// <summary>
+    ///     Unsigned 16-bit integer header.
+    /// </summary>
+    Uint16,
+
+    /// <summary>
+    ///     Unsigned 32-bit integer header.
     /// </summary>
     Uint32,
 
