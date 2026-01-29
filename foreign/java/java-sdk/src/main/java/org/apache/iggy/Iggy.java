@@ -21,8 +21,6 @@ package org.apache.iggy;
 
 import org.apache.iggy.builder.HttpClientBuilder;
 import org.apache.iggy.builder.TcpClientBuilder;
-import org.apache.iggy.client.blocking.http.IggyHttpClient;
-import org.apache.iggy.client.blocking.tcp.IggyTcpClient;
 
 /**
  * Main entry point for creating Iggy clients.
@@ -78,10 +76,6 @@ import org.apache.iggy.client.blocking.tcp.IggyTcpClient;
  */
 public final class Iggy {
 
-    private static final String DEFAULT_HOST = "localhost";
-    private static final int DEFAULT_TCP_PORT = 8090;
-    private static final int DEFAULT_HTTP_PORT = 3000;
-
     private Iggy() {}
 
     /**
@@ -91,7 +85,7 @@ public final class Iggy {
      *
      * @return a TCP client builder
      */
-    public static TcpClientBuilder tcp() {
+    public static TcpClientBuilder tcpClientBuilder() {
         return new TcpClientBuilder();
     }
 
@@ -102,35 +96,8 @@ public final class Iggy {
      *
      * @return an HTTP client builder
      */
-    public static HttpClientBuilder http() {
+    public static HttpClientBuilder httpClientBuilder() {
         return new HttpClientBuilder();
-    }
-
-    /**
-     * Creates a local blocking TCP client connected to localhost:8090.
-     *
-     * <p>This is a convenience method for local development and testing.
-     * Call {@code client.users().login(username, password)} to authenticate.
-     *
-     * @return a connected IggyTcpClient
-     */
-    public static IggyTcpClient localTcp() {
-        IggyTcpClient client =
-                tcp().blocking().host(DEFAULT_HOST).port(DEFAULT_TCP_PORT).build();
-        client.connect();
-        return client;
-    }
-
-    /**
-     * Creates a local blocking HTTP client connected to localhost:3000.
-     *
-     * <p>This is a convenience method for local development and testing.
-     * Call {@code client.users().login(username, password)} to authenticate.
-     *
-     * @return an IggyHttpClient
-     */
-    public static IggyHttpClient localHttp() {
-        return http().blocking().host(DEFAULT_HOST).port(DEFAULT_HTTP_PORT).build();
     }
 
     /**

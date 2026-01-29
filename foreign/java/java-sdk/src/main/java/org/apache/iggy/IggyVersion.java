@@ -19,6 +19,9 @@
 
 package org.apache.iggy;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.Properties;
@@ -30,6 +33,7 @@ import java.util.Properties;
  */
 public final class IggyVersion {
 
+    private static final Logger log = LoggerFactory.getLogger(IggyVersion.class);
     private static final String PROPERTIES_FILE = "/iggy-version.properties";
     private static final String UNKNOWN = "unknown";
 
@@ -49,7 +53,7 @@ public final class IggyVersion {
                 gitCommit = props.getProperty("gitCommit", UNKNOWN);
             }
         } catch (IOException e) {
-            // Use default values
+            log.warn("Failed to read version information from {}", PROPERTIES_FILE, e);
         }
 
         INSTANCE = new IggyVersion(version, buildTime, gitCommit);

@@ -63,6 +63,9 @@ import java.time.Duration;
  * @see IggyHttpClient#builder()
  */
 public final class IggyHttpClientBuilder {
+    private static final String HTTPS_PROTOCOL = "https";
+    private static final String HTTP_PROTOCOL = "http";
+
     private String url;
     private String host = "localhost";
     private Integer port = IggyHttpClient.DEFAULT_HTTP_PORT;
@@ -207,7 +210,7 @@ public final class IggyHttpClientBuilder {
             if (port == null || port <= 0) {
                 throw new IggyInvalidArgumentException("Port must be a positive integer");
             }
-            String protocol = enableTls ? "https" : "http";
+            String protocol = enableTls ? HTTPS_PROTOCOL : HTTP_PROTOCOL;
             finalUrl = protocol + "://" + host + ":" + port;
         }
         return new IggyHttpClient(finalUrl, username, password, connectionTimeout, requestTimeout, tlsCertificate);

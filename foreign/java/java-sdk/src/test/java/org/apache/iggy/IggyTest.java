@@ -32,7 +32,7 @@ class IggyTest {
 
     @Test
     void tcpBuilderReturnsCorrectTypes() {
-        TcpClientBuilder tcpBuilder = Iggy.tcp();
+        TcpClientBuilder tcpBuilder = Iggy.tcpClientBuilder();
         assertThat(tcpBuilder).isNotNull();
 
         IggyTcpClientBuilder blockingBuilder = tcpBuilder.blocking();
@@ -44,7 +44,7 @@ class IggyTest {
 
     @Test
     void httpBuilderReturnsCorrectTypes() {
-        HttpClientBuilder httpBuilder = Iggy.http();
+        HttpClientBuilder httpBuilder = Iggy.httpClientBuilder();
         assertThat(httpBuilder).isNotNull();
 
         IggyHttpClientBuilder blockingBuilder = httpBuilder.blocking();
@@ -67,7 +67,7 @@ class IggyTest {
 
     @Test
     void tcpBlockingBuilderHasFluentApi() {
-        IggyTcpClientBuilder builder = Iggy.tcp().blocking();
+        IggyTcpClientBuilder builder = Iggy.tcpClientBuilder().blocking();
 
         // Verify fluent API returns same builder
         assertThat(builder.host("localhost")).isSameAs(builder);
@@ -78,7 +78,7 @@ class IggyTest {
 
     @Test
     void tcpAsyncBuilderHasFluentApi() {
-        AsyncIggyTcpClientBuilder builder = Iggy.tcp().async();
+        AsyncIggyTcpClientBuilder builder = Iggy.tcpClientBuilder().async();
 
         // Verify fluent API returns same builder
         assertThat(builder.host("localhost")).isSameAs(builder);
@@ -89,7 +89,7 @@ class IggyTest {
 
     @Test
     void httpBlockingBuilderHasFluentApi() {
-        IggyHttpClientBuilder builder = Iggy.http().blocking();
+        IggyHttpClientBuilder builder = Iggy.httpClientBuilder().blocking();
 
         // Verify fluent API returns same builder
         assertThat(builder.host("localhost")).isSameAs(builder);

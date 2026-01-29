@@ -22,9 +22,7 @@ package org.apache.iggy.exception;
 import org.apache.commons.lang3.StringUtils;
 
 import java.nio.charset.StandardCharsets;
-import java.util.EnumSet;
 import java.util.Optional;
-import java.util.Set;
 
 /**
  * Exception thrown when the server returns an error response.
@@ -34,59 +32,6 @@ import java.util.Set;
  * more specific exception subclasses where appropriate.
  */
 public class IggyServerException extends IggyException {
-
-    private static final Set<IggyErrorCode> NOT_FOUND_CODES = EnumSet.of(
-            IggyErrorCode.RESOURCE_NOT_FOUND,
-            IggyErrorCode.CANNOT_LOAD_RESOURCE,
-            IggyErrorCode.STREAM_ID_NOT_FOUND,
-            IggyErrorCode.STREAM_NAME_NOT_FOUND,
-            IggyErrorCode.TOPIC_ID_NOT_FOUND,
-            IggyErrorCode.TOPIC_NAME_NOT_FOUND,
-            IggyErrorCode.PARTITION_NOT_FOUND,
-            IggyErrorCode.SEGMENT_NOT_FOUND,
-            IggyErrorCode.CLIENT_NOT_FOUND,
-            IggyErrorCode.CONSUMER_GROUP_ID_NOT_FOUND,
-            IggyErrorCode.CONSUMER_GROUP_NAME_NOT_FOUND,
-            IggyErrorCode.CONSUMER_GROUP_NOT_JOINED,
-            IggyErrorCode.MESSAGE_NOT_FOUND);
-
-    private static final Set<IggyErrorCode> AUTHENTICATION_CODES = EnumSet.of(
-            IggyErrorCode.UNAUTHENTICATED,
-            IggyErrorCode.INVALID_CREDENTIALS,
-            IggyErrorCode.INVALID_USERNAME,
-            IggyErrorCode.INVALID_PASSWORD,
-            IggyErrorCode.INVALID_PAT_TOKEN,
-            IggyErrorCode.PASSWORD_DOES_NOT_MATCH,
-            IggyErrorCode.PASSWORD_HASH_INTERNAL_ERROR);
-
-    private static final Set<IggyErrorCode> AUTHORIZATION_CODES = EnumSet.of(IggyErrorCode.UNAUTHORIZED);
-
-    private static final Set<IggyErrorCode> CONFLICT_CODES = EnumSet.of(
-            IggyErrorCode.USER_ALREADY_EXISTS,
-            IggyErrorCode.CLIENT_ALREADY_EXISTS,
-            IggyErrorCode.STREAM_ALREADY_EXISTS,
-            IggyErrorCode.TOPIC_ALREADY_EXISTS,
-            IggyErrorCode.CONSUMER_GROUP_ALREADY_EXISTS,
-            IggyErrorCode.PAT_NAME_ALREADY_EXISTS);
-
-    private static final Set<IggyErrorCode> VALIDATION_CODES = EnumSet.of(
-            IggyErrorCode.INVALID_COMMAND,
-            IggyErrorCode.INVALID_FORMAT,
-            IggyErrorCode.FEATURE_UNAVAILABLE,
-            IggyErrorCode.CANNOT_PARSE_INT,
-            IggyErrorCode.CANNOT_PARSE_SLICE,
-            IggyErrorCode.CANNOT_PARSE_UTF8,
-            IggyErrorCode.INVALID_STREAM_NAME,
-            IggyErrorCode.CANNOT_CREATE_STREAM_DIRECTORY,
-            IggyErrorCode.INVALID_TOPIC_NAME,
-            IggyErrorCode.INVALID_REPLICATION_FACTOR,
-            IggyErrorCode.CANNOT_CREATE_TOPIC_DIRECTORY,
-            IggyErrorCode.CONSUMER_GROUP_MEMBER_NOT_FOUND,
-            IggyErrorCode.INVALID_CONSUMER_GROUP_NAME,
-            IggyErrorCode.TOO_MANY_MESSAGES,
-            IggyErrorCode.EMPTY_MESSAGES,
-            IggyErrorCode.TOO_BIG_MESSAGE,
-            IggyErrorCode.INVALID_MESSAGE_CHECKSUM);
 
     private final IggyErrorCode errorCode;
     private final int rawErrorCode;
@@ -123,7 +68,7 @@ public class IggyServerException extends IggyException {
      * @param rawErrorCode the raw numeric error code from the server
      */
     public IggyServerException(int rawErrorCode) {
-        this(IggyErrorCode.fromCode(rawErrorCode), rawErrorCode, "Server error", Optional.empty(), Optional.empty());
+        this(IggyErrorCode.fromCode(rawErrorCode), rawErrorCode, "", Optional.empty(), Optional.empty());
     }
 
     /**
@@ -201,35 +146,38 @@ public class IggyServerException extends IggyException {
         IggyErrorCode errorCode = IggyErrorCode.fromString(code);
         int rawCode = errorCode.getCode();
         if (rawCode == -1) {
-            // Try parsing code as integer
-            try {
-                rawCode = Integer.parseInt(code);
-            } catch (NumberFormatException e) {
-                rawCode = -1;
-            }
+            rawCode = parseIntOrDefault(code, rawCode);
         }
         Optional<String> fieldOpt = Optional.ofNullable(StringUtils.stripToNull(field));
         Optional<String> errorIdOpt = Optional.ofNullable(StringUtils.stripToNull(id));
-        return createFromCode(rawCode, reason != null ? reason : "Server error", fieldOpt, errorIdOpt);
+        return createFromCode(rawCode, StringUtils.stripToEmpty(reason), fieldOpt, errorIdOpt);
+    }
+
+    private static int parseIntOrDefault(String code, int rawCode) {
+        try {
+            return Integer.parseInt(code);
+        } catch (NumberFormatException e) {
+            return rawCode;
+        }
     }
 
     private static IggyServerException createFromCode(
             int code, String reason, Optional<String> field, Optional<String> errorId) {
         IggyErrorCode errorCode = IggyErrorCode.fromCode(code);
 
-        if (NOT_FOUND_CODES.contains(errorCode)) {
+        if (IggyResourceNotFoundException.matches(errorCode)) {
             return new IggyResourceNotFoundException(errorCode, code, reason, field, errorId);
         }
-        if (AUTHENTICATION_CODES.contains(errorCode)) {
+        if (IggyAuthenticationException.matches(errorCode)) {
             return new IggyAuthenticationException(errorCode, code, reason, field, errorId);
         }
-        if (AUTHORIZATION_CODES.contains(errorCode)) {
+        if (IggyAuthorizationException.matches(errorCode)) {
             return new IggyAuthorizationException(errorCode, code, reason, field, errorId);
         }
-        if (CONFLICT_CODES.contains(errorCode)) {
+        if (IggyConflictException.matches(errorCode)) {
             return new IggyConflictException(errorCode, code, reason, field, errorId);
         }
-        if (VALIDATION_CODES.contains(errorCode)) {
+        if (IggyValidationException.matches(errorCode)) {
             return new IggyValidationException(errorCode, code, reason, field, errorId);
         }
 
@@ -247,7 +195,10 @@ public class IggyServerException extends IggyException {
         if (errorCode != IggyErrorCode.UNKNOWN) {
             sb.append(" (").append(errorCode.name()).append(")");
         }
-        sb.append("]: ").append(reason);
+        sb.append("]");
+        if (StringUtils.isNotBlank(reason)) {
+            sb.append(": ").append(reason);
+        }
         field.ifPresent(f -> sb.append(" (field: ").append(f).append(")"));
         errorId.ifPresent(id -> sb.append(" [errorId: ").append(id).append("]"));
         return sb.toString();

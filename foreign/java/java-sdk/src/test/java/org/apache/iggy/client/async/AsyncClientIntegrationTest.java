@@ -45,6 +45,8 @@ import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 
+import static org.apache.iggy.client.blocking.IntegrationTest.LOCALHOST_IP;
+import static org.apache.iggy.client.blocking.IntegrationTest.TCP_PORT;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
@@ -55,8 +57,6 @@ import static org.assertj.core.api.Assertions.assertThat;
 class AsyncClientIntegrationTest {
     private static final Logger log = LoggerFactory.getLogger(AsyncClientIntegrationTest.class);
 
-    private static final String HOST = "127.0.0.1";
-    private static final int PORT = 8090;
     private static final String USERNAME = "iggy";
     private static final String PASSWORD = "iggy";
 
@@ -69,7 +69,7 @@ class AsyncClientIntegrationTest {
     @BeforeAll
     public static void setup() throws Exception {
         log.info("Setting up async client for integration tests");
-        client = new AsyncIggyTcpClient(HOST, PORT);
+        client = new AsyncIggyTcpClient(LOCALHOST_IP, TCP_PORT);
 
         // Connect and login
         client.connect()

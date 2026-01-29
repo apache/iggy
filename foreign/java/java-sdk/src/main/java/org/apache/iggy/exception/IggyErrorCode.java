@@ -152,7 +152,6 @@ public enum IggyErrorCode {
             int numericCode = Integer.parseInt(code);
             return fromCode(numericCode);
         } catch (NumberFormatException e) {
-            // Try to match by name
             try {
                 return valueOf(code.toUpperCase().replace(".", "_").replace(" ", "_"));
             } catch (IllegalArgumentException ex) {

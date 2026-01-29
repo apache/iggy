@@ -19,7 +19,9 @@
 
 package org.apache.iggy.exception;
 
+import java.util.EnumSet;
 import java.util.Optional;
+import java.util.Set;
 
 /**
  * Exception thrown when authentication fails.
@@ -28,6 +30,15 @@ import java.util.Optional;
  * requests, invalid username/password, etc.
  */
 public class IggyAuthenticationException extends IggyServerException {
+
+    private static final Set<IggyErrorCode> CODES = EnumSet.of(
+            IggyErrorCode.UNAUTHENTICATED,
+            IggyErrorCode.INVALID_CREDENTIALS,
+            IggyErrorCode.INVALID_USERNAME,
+            IggyErrorCode.INVALID_PASSWORD,
+            IggyErrorCode.INVALID_PAT_TOKEN,
+            IggyErrorCode.PASSWORD_DOES_NOT_MATCH,
+            IggyErrorCode.PASSWORD_HASH_INTERNAL_ERROR);
 
     /**
      * Constructs a new IggyAuthenticationException.
@@ -45,5 +56,15 @@ public class IggyAuthenticationException extends IggyServerException {
             Optional<String> field,
             Optional<String> errorId) {
         super(errorCode, rawErrorCode, reason, field, errorId);
+    }
+
+    /**
+     * Returns whether the given error code should map to this exception type.
+     *
+     * @param code the error code to check
+     * @return true if this exception type handles the given error code
+     */
+    public static boolean matches(IggyErrorCode code) {
+        return CODES.contains(code);
     }
 }

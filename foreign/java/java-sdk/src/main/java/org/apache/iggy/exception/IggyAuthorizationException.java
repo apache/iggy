@@ -19,7 +19,9 @@
 
 package org.apache.iggy.exception;
 
+import java.util.EnumSet;
 import java.util.Optional;
+import java.util.Set;
 
 /**
  * Exception thrown when the user is not authorized to perform an operation.
@@ -28,6 +30,8 @@ import java.util.Optional;
  * lacks the necessary permissions.
  */
 public class IggyAuthorizationException extends IggyServerException {
+
+    private static final Set<IggyErrorCode> CODES = EnumSet.of(IggyErrorCode.UNAUTHORIZED);
 
     /**
      * Constructs a new IggyAuthorizationException.
@@ -45,5 +49,15 @@ public class IggyAuthorizationException extends IggyServerException {
             Optional<String> field,
             Optional<String> errorId) {
         super(errorCode, rawErrorCode, reason, field, errorId);
+    }
+
+    /**
+     * Returns whether the given error code should map to this exception type.
+     *
+     * @param code the error code to check
+     * @return true if this exception type handles the given error code
+     */
+    public static boolean matches(IggyErrorCode code) {
+        return CODES.contains(code);
     }
 }

@@ -19,7 +19,9 @@
 
 package org.apache.iggy.exception;
 
+import java.util.EnumSet;
 import java.util.Optional;
+import java.util.Set;
 
 /**
  * Exception thrown when a requested resource is not found on the server.
@@ -28,6 +30,21 @@ import java.util.Optional;
  * partition not found, consumer group not found, etc.
  */
 public class IggyResourceNotFoundException extends IggyServerException {
+
+    private static final Set<IggyErrorCode> CODES = EnumSet.of(
+            IggyErrorCode.RESOURCE_NOT_FOUND,
+            IggyErrorCode.CANNOT_LOAD_RESOURCE,
+            IggyErrorCode.STREAM_ID_NOT_FOUND,
+            IggyErrorCode.STREAM_NAME_NOT_FOUND,
+            IggyErrorCode.TOPIC_ID_NOT_FOUND,
+            IggyErrorCode.TOPIC_NAME_NOT_FOUND,
+            IggyErrorCode.PARTITION_NOT_FOUND,
+            IggyErrorCode.SEGMENT_NOT_FOUND,
+            IggyErrorCode.CLIENT_NOT_FOUND,
+            IggyErrorCode.CONSUMER_GROUP_ID_NOT_FOUND,
+            IggyErrorCode.CONSUMER_GROUP_NAME_NOT_FOUND,
+            IggyErrorCode.CONSUMER_GROUP_NOT_JOINED,
+            IggyErrorCode.MESSAGE_NOT_FOUND);
 
     /**
      * Constructs a new IggyResourceNotFoundException.
@@ -45,5 +62,15 @@ public class IggyResourceNotFoundException extends IggyServerException {
             Optional<String> field,
             Optional<String> errorId) {
         super(errorCode, rawErrorCode, reason, field, errorId);
+    }
+
+    /**
+     * Returns whether the given error code should map to this exception type.
+     *
+     * @param code the error code to check
+     * @return true if this exception type handles the given error code
+     */
+    public static boolean matches(IggyErrorCode code) {
+        return CODES.contains(code);
     }
 }

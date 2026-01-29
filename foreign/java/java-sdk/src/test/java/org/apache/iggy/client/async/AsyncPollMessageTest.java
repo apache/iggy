@@ -20,6 +20,7 @@
 package org.apache.iggy.client.async;
 
 import org.apache.iggy.client.async.tcp.AsyncIggyTcpClient;
+import org.apache.iggy.client.blocking.IntegrationTest;
 import org.apache.iggy.consumergroup.Consumer;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
@@ -79,7 +80,7 @@ public class AsyncPollMessageTest {
                     // Ignore close errors
                 }
             }
-            client = new AsyncIggyTcpClient("127.0.0.1", 8090);
+            client = new AsyncIggyTcpClient(IntegrationTest.LOCALHOST_IP, IntegrationTest.TCP_PORT);
             client.connect().get(5, TimeUnit.SECONDS);
             client.users().login("iggy", "iggy").get(5, TimeUnit.SECONDS);
             log.info("Client reconnected successfully");
@@ -101,7 +102,7 @@ public class AsyncPollMessageTest {
         log.info("Setting up async client for poll message tests");
 
         // Initialize client
-        client = new AsyncIggyTcpClient("127.0.0.1", 8090);
+        client = new AsyncIggyTcpClient(IntegrationTest.LOCALHOST_IP, IntegrationTest.TCP_PORT);
         client.connect().get(5, TimeUnit.SECONDS);
         client.users().login("iggy", "iggy").get(5, TimeUnit.SECONDS);
         log.info("Successfully connected and logged in");

@@ -19,7 +19,9 @@
 
 package org.apache.iggy.exception;
 
+import java.util.EnumSet;
 import java.util.Optional;
+import java.util.Set;
 
 /**
  * Exception thrown when input validation fails.
@@ -28,6 +30,25 @@ import java.util.Optional;
  * message validation failures, etc.
  */
 public class IggyValidationException extends IggyServerException {
+
+    private static final Set<IggyErrorCode> CODES = EnumSet.of(
+            IggyErrorCode.INVALID_COMMAND,
+            IggyErrorCode.INVALID_FORMAT,
+            IggyErrorCode.FEATURE_UNAVAILABLE,
+            IggyErrorCode.CANNOT_PARSE_INT,
+            IggyErrorCode.CANNOT_PARSE_SLICE,
+            IggyErrorCode.CANNOT_PARSE_UTF8,
+            IggyErrorCode.INVALID_STREAM_NAME,
+            IggyErrorCode.CANNOT_CREATE_STREAM_DIRECTORY,
+            IggyErrorCode.INVALID_TOPIC_NAME,
+            IggyErrorCode.INVALID_REPLICATION_FACTOR,
+            IggyErrorCode.CANNOT_CREATE_TOPIC_DIRECTORY,
+            IggyErrorCode.CONSUMER_GROUP_MEMBER_NOT_FOUND,
+            IggyErrorCode.INVALID_CONSUMER_GROUP_NAME,
+            IggyErrorCode.TOO_MANY_MESSAGES,
+            IggyErrorCode.EMPTY_MESSAGES,
+            IggyErrorCode.TOO_BIG_MESSAGE,
+            IggyErrorCode.INVALID_MESSAGE_CHECKSUM);
 
     /**
      * Constructs a new IggyValidationException.
@@ -45,5 +66,15 @@ public class IggyValidationException extends IggyServerException {
             Optional<String> field,
             Optional<String> errorId) {
         super(errorCode, rawErrorCode, reason, field, errorId);
+    }
+
+    /**
+     * Returns whether the given error code should map to this exception type.
+     *
+     * @param code the error code to check
+     * @return true if this exception type handles the given error code
+     */
+    public static boolean matches(IggyErrorCode code) {
+        return CODES.contains(code);
     }
 }

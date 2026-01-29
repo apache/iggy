@@ -19,7 +19,6 @@
 
 package org.apache.iggy.client.blocking.http;
 
-import org.apache.commons.lang3.StringUtils;
 import org.apache.hc.client5.http.config.ConnectionConfig;
 import org.apache.hc.client5.http.config.RequestConfig;
 import org.apache.hc.client5.http.impl.classic.CloseableHttpClient;
@@ -34,7 +33,6 @@ import org.apache.hc.core5.http.io.support.ClassicRequestBuilder;
 import org.apache.hc.core5.ssl.SSLContextBuilder;
 import org.apache.hc.core5.util.Timeout;
 import org.apache.iggy.exception.IggyConnectionException;
-import org.apache.iggy.exception.IggyInvalidArgumentException;
 import org.apache.iggy.exception.IggyServerException;
 import org.apache.iggy.exception.IggyTlsException;
 import org.slf4j.Logger;
@@ -66,18 +64,9 @@ final class InternalHttpClient implements Closeable {
             Optional<Duration> connectionTimeout,
             Optional<Duration> requestTimeout,
             Optional<File> tlsCertificate) {
-        validateUrl(url);
+        UrlValidator.validateHttpUrl(url);
         this.url = url;
         this.httpClient = createHttpClient(connectionTimeout, requestTimeout, tlsCertificate);
-    }
-
-    private static void validateUrl(String url) {
-        if (StringUtils.isBlank(url)) {
-            throw new IggyInvalidArgumentException("URL cannot be null or empty");
-        }
-        if (!url.startsWith("http://") && !url.startsWith("https://")) {
-            throw new IggyInvalidArgumentException("URL must start with http:// or https://");
-        }
     }
 
     private static CloseableHttpClient createHttpClient(
@@ -205,10 +194,10 @@ final class InternalHttpClient implements Closeable {
     private void handleErrorResponse(ClassicHttpResponse response) throws IOException {
         if (!isSuccessful(response.getCode())) {
             var errorNode = objectMapper.readValue(response.getEntity().getContent(), ObjectNode.class);
-            String id = errorNode.has("id") ? errorNode.get("id").asText() : null;
-            String code = errorNode.has("code") ? errorNode.get("code").asText() : null;
-            String reason = errorNode.has("reason") ? errorNode.get("reason").asText() : null;
-            String field = errorNode.has("field") ? errorNode.get("field").asText() : null;
+            String id = errorNode.has("id") ? errorNode.get("id").asString() : null;
+            String code = errorNode.has("code") ? errorNode.get("code").asString() : null;
+            String reason = errorNode.has("reason") ? errorNode.get("reason").asString() : null;
+            String field = errorNode.has("field") ? errorNode.get("field").asString() : null;
             throw IggyServerException.fromHttpResponse(id, code, reason, field);
         }
     }
