@@ -21,9 +21,9 @@ mod container;
 mod sink;
 mod source;
 
-pub use container::{PostgresContainer, SinkPayloadFormat, SinkSchema};
+pub use container::{PostgresOps, PostgresSourceOps};
 pub use sink::{PostgresSinkByteaFixture, PostgresSinkFixture, PostgresSinkJsonFixture};
 pub use source::{
-    PostgresSourceByteaFixture, PostgresSourceDeleteFixture, PostgresSourceFixture,
-    PostgresSourceJsonFixture, PostgresSourceJsonbFixture, PostgresSourceMarkFixture,
+    PostgresSourceByteaFixture, PostgresSourceDeleteFixture, PostgresSourceJsonFixture,
+    PostgresSourceJsonbFixture, PostgresSourceMarkFixture,
 };

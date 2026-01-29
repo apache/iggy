@@ -476,7 +476,7 @@ fn generate_harness_setup(
         #config_resolution
         let mut __harness = ::integration::harness::TestHarness::builder()
             .server(#server_config)
-            .primary_client(#client_config)
+            .client(#client_config)
             #mcp_builder_call
             #connectors_runtime_builder_call
             #cluster_builder_call
@@ -526,6 +526,12 @@ fn generate_start_and_seed(attrs: &IggyTestAttrs, fixture_seed: TokenStream) -> 
     }
 }
 
+fn fixture_var_ident(name: &syn::Ident) -> syn::Ident {
+    let name_str = name.to_string();
+    let clean_name = name_str.trim_start_matches('_');
+    format_ident!("__fixture_{}", clean_name)
+}
+
 /// Generate fixture setup calls (before harness setup).
 fn generate_fixture_setup(params: &[DetectedParam]) -> TokenStream {
     let fixtures = fixture_params(params);
@@ -537,7 +543,7 @@ fn generate_fixture_setup(params: &[DetectedParam]) -> TokenStream {
         .iter()
         .filter_map(|p| {
             if let DetectedParam::Fixture { name, ty } = p {
-                let var_name = format_ident!("__fixture_{}", name);
+                let var_name = fixture_var_ident(name);
                 Some(quote! {
                     let #var_name = <#ty as ::integration::harness::TestFixture>::setup()
                         .await
@@ -563,7 +569,7 @@ fn generate_fixture_envs_collection(params: &[DetectedParam]) -> TokenStream {
         .iter()
         .filter_map(|p| {
             if let DetectedParam::Fixture { name, .. } = p {
-                let var_name = format_ident!("__fixture_{}", name);
+                let var_name = fixture_var_ident(name);
                 Some(quote! {
                     __fixture_envs.extend(
                         ::integration::harness::TestFixture::connectors_runtime_envs(&#var_name)
@@ -622,7 +628,7 @@ fn generate_param_bindings(params: &[DetectedParam]) -> TokenStream {
                 });
             }
             DetectedParam::Fixture { name, .. } => {
-                let fixture_var = format_ident!("__fixture_{}", name);
+                let fixture_var = fixture_var_ident(name);
                 bindings.push(quote! {
                     let #name = #fixture_var;
                 });

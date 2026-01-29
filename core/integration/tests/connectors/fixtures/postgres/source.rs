@@ -23,118 +23,12 @@ use super::container::{
     ENV_SOURCE_PAYLOAD_COLUMN, ENV_SOURCE_PAYLOAD_FORMAT, ENV_SOURCE_POLL_INTERVAL,
     ENV_SOURCE_PRIMARY_KEY_COLUMN, ENV_SOURCE_PROCESSED_COLUMN, ENV_SOURCE_STREAMS_0_SCHEMA,
     ENV_SOURCE_STREAMS_0_STREAM, ENV_SOURCE_STREAMS_0_TOPIC, ENV_SOURCE_TABLES,
-    ENV_SOURCE_TRACKING_COLUMN, PostgresContainer, PostgresOps, PostgresSourceOps, SinkSchema,
+    ENV_SOURCE_TRACKING_COLUMN, PostgresContainer, PostgresOps, PostgresSourceOps,
 };
-use crate::harness::error::TestBinaryError;
-use crate::harness::fixtures::TestFixture;
 use async_trait::async_trait;
+use integration::harness::{TestBinaryError, TestFixture};
 use sqlx::{Pool, Postgres};
 use std::collections::HashMap;
-
-/// PostgreSQL source connector fixture.
-///
-/// Starts a PostgreSQL container and provides environment variables
-/// for the source connector to connect to it.
-pub struct PostgresSourceFixture {
-    container: PostgresContainer,
-    table_name: String,
-    schema: SinkSchema,
-}
-
-impl PostgresSourceFixture {
-    pub fn connection_string(&self) -> &str {
-        self.container.connection_string()
-    }
-
-    pub async fn create_pool(&self) -> Result<Pool<Postgres>, TestBinaryError> {
-        self.container.create_pool().await
-    }
-
-    pub fn table_name(&self) -> &str {
-        &self.table_name
-    }
-
-    pub async fn execute(&self, pool: &Pool<Postgres>, query: &str) {
-        sqlx::query(query)
-            .execute(pool)
-            .await
-            .unwrap_or_else(|e| panic!("Failed to execute query: {e}"));
-    }
-
-    pub async fn count_rows(&self, pool: &Pool<Postgres>, table: &str) -> i64 {
-        let query = format!("SELECT COUNT(*) as count FROM {table}");
-        let row: (i64,) = sqlx::query_as(&query)
-            .fetch_one(pool)
-            .await
-            .unwrap_or_else(|e| panic!("Failed to count rows: {e}"));
-        row.0
-    }
-
-    pub async fn count_rows_where(
-        &self,
-        pool: &Pool<Postgres>,
-        table: &str,
-        condition: &str,
-    ) -> i64 {
-        let query = format!("SELECT COUNT(*) as count FROM {table} WHERE {condition}");
-        let row: (i64,) = sqlx::query_as(&query)
-            .fetch_one(pool)
-            .await
-            .unwrap_or_else(|e| panic!("Failed to count rows: {e}"));
-        row.0
-    }
-}
-
-#[async_trait]
-impl TestFixture for PostgresSourceFixture {
-    async fn setup() -> Result<Self, TestBinaryError> {
-        let container = PostgresContainer::start().await?;
-        let table_name = "test_messages".to_string();
-        Ok(Self {
-            container,
-            table_name,
-            schema: SinkSchema::Json,
-        })
-    }
-
-    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
-        let mut envs = HashMap::new();
-
-        envs.insert(
-            ENV_SOURCE_CONNECTION_STRING.to_string(),
-            self.container.connection_string.clone(),
-        );
-        envs.insert(
-            ENV_SOURCE_TABLES.to_string(),
-            format!("[{}]", self.table_name),
-        );
-        envs.insert(ENV_SOURCE_TRACKING_COLUMN.to_string(), "id".to_string());
-        envs.insert(
-            ENV_SOURCE_STREAMS_0_STREAM.to_string(),
-            DEFAULT_TEST_STREAM.to_string(),
-        );
-        envs.insert(
-            ENV_SOURCE_STREAMS_0_TOPIC.to_string(),
-            DEFAULT_TEST_TOPIC.to_string(),
-        );
-        envs.insert(ENV_SOURCE_POLL_INTERVAL.to_string(), "10ms".to_string());
-        envs.insert(
-            ENV_SOURCE_PATH.to_string(),
-            "../../target/debug/libiggy_connector_postgres_source".to_string(),
-        );
-
-        let schema_str = match self.schema {
-            SinkSchema::Json => "json",
-            SinkSchema::Raw => "raw",
-        };
-        envs.insert(
-            ENV_SOURCE_STREAMS_0_SCHEMA.to_string(),
-            schema_str.to_string(),
-        );
-
-        envs
-    }
-}
 
 /// PostgreSQL source fixture for JSON rows with metadata.
 ///

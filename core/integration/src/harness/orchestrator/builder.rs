@@ -23,7 +23,7 @@ use crate::harness::config::{
 };
 use crate::harness::context::TestContext;
 use crate::harness::error::TestBinaryError;
-use crate::harness::handle::{ConnectorsRuntimeHandle, McpHandle, ServerHandle};
+use crate::harness::handle::ServerHandle;
 use crate::harness::port_reserver::ClusterPortReserver;
 use crate::harness::traits::TestBinary;
 use std::collections::HashMap;
@@ -198,21 +198,21 @@ impl TestHarnessBuilder {
         context.ensure_created()?;
         let context = Arc::new(context);
 
-        let servers = build_servers(self.server_config, self.cluster_node_count, &context)?;
+        let mut servers = build_servers(self.server_config, self.cluster_node_count, &context)?;
 
-        let mcp = self
-            .mcp_config
-            .map(|config| McpHandle::with_config(config, context.clone()));
-
-        let connectors_runtime = self
-            .connectors_runtime_config
-            .map(|config| ConnectorsRuntimeHandle::with_config(config, context.clone()));
+        // Attach MCP and connectors runtime to the first server (primary)
+        if let Some(server) = servers.first_mut() {
+            if let Some(config) = self.mcp_config {
+                server.set_mcp_config(config);
+            }
+            if let Some(config) = self.connectors_runtime_config {
+                server.set_connectors_runtime_config(config);
+            }
+        }
 
         Ok(TestHarness {
             context,
             servers,
-            mcp,
-            connectors_runtime,
             clients: Vec::new(),
             client_configs: self.clients,
             primary_transport: self.primary_transport,
@@ -383,7 +383,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(harness.servers.len(), 1);
-        assert!(harness.mcp.is_some());
+        assert!(harness.mcp().is_some());
     }
 
     #[test]

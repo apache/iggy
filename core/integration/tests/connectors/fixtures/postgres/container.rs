@@ -17,7 +17,7 @@
  * under the License.
  */
 
-use crate::harness::error::TestBinaryError;
+use integration::harness::TestBinaryError;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{Pool, Postgres};
 use testcontainers_modules::{
@@ -90,13 +90,8 @@ pub enum SinkSchema {
 }
 
 /// Trait for PostgreSQL fixtures with common container operations.
-#[allow(dead_code)]
 pub trait PostgresOps: Sync {
     fn container(&self) -> &PostgresContainer;
-
-    fn connection_string(&self) -> &str {
-        self.container().connection_string()
-    }
 
     fn create_pool(
         &self,
@@ -106,22 +101,8 @@ pub trait PostgresOps: Sync {
 }
 
 /// Extension of `PostgresOps` for source fixtures that operate on a specific table.
-#[allow(dead_code)]
 pub trait PostgresSourceOps: PostgresOps {
     fn table_name(&self) -> &str;
-
-    fn execute<'a>(
-        &'a self,
-        pool: &'a Pool<Postgres>,
-        query: &'a str,
-    ) -> impl std::future::Future<Output = ()> + Send + 'a {
-        async move {
-            sqlx::query(query)
-                .execute(pool)
-                .await
-                .unwrap_or_else(|e| panic!("Failed to execute query: {e}"));
-        }
-    }
 
     fn count_rows<'a>(
         &'a self,
@@ -168,10 +149,6 @@ impl PostgresContainer {
             container,
             connection_string,
         })
-    }
-
-    pub fn connection_string(&self) -> &str {
-        &self.connection_string
     }
 
     pub async fn create_pool(&self) -> Result<Pool<Postgres>, TestBinaryError> {
