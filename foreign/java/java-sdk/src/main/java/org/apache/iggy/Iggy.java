@@ -30,7 +30,7 @@ import org.apache.iggy.builder.TcpClientBuilder;
  * <h2>TCP Clients (recommended for performance)</h2>
  * <pre>{@code
  * // Blocking TCP client
- * var client = Iggy.tcp().blocking()
+ * var client = Iggy.tcpClientBuilder().blocking()
  *     .host("localhost")
  *     .port(8090)
  *     .build();
@@ -38,7 +38,7 @@ import org.apache.iggy.builder.TcpClientBuilder;
  * client.users().login("iggy", "iggy");
  *
  * // Async TCP client
- * var asyncClient = Iggy.tcp().async()
+ * var asyncClient = Iggy.tcpClientBuilder().async()
  *     .host("localhost")
  *     .build();
  * asyncClient.connect().join();
@@ -47,21 +47,12 @@ import org.apache.iggy.builder.TcpClientBuilder;
  *
  * <h2>HTTP Clients</h2>
  * <pre>{@code
- * var httpClient = Iggy.http().blocking()
+ * var httpClient = Iggy.httpClientBuilder().blocking()
  *     .url("http://localhost:3000")
  *     .build();
  *
  * // Login after creating the client
  * httpClient.users().login("iggy", "iggy");
- * }</pre>
- *
- * <h2>Quick Factory Methods</h2>
- * <pre>{@code
- * // Local TCP client (localhost:8090)
- * var client = Iggy.localTcp();
- *
- * // Local HTTP client (localhost:3000)
- * var httpClient = Iggy.localHttp();
  * }</pre>
  *
  * <h2>Version Information</h2>

@@ -28,20 +28,20 @@ import org.apache.iggy.client.blocking.http.IggyHttpClientBuilder;
  * <p>Use this builder to create blocking HTTP clients:
  * <pre>{@code
  * // HTTP client - manual login
- * var client = Iggy.http().blocking()
+ * var client = Iggy.httpClientBuilder().blocking()
  *     .url("http://localhost:3000")
  *     .build();
  * client.users().login("iggy", "iggy");
  *
  * // HTTP client - convenience method with auto-login
- * var client = Iggy.http().blocking()
+ * var client = Iggy.httpClientBuilder().blocking()
  *     .host("localhost")
  *     .port(3000)
  *     .credentials("iggy", "iggy")
  *     .buildAndLogin();
  *
  * // HTTPS client with auto-login
- * var secureClient = Iggy.http().blocking()
+ * var secureClient = Iggy.httpClientBuilder().blocking()
  *     .host("iggy-server.example.com")
  *     .port(443)
  *     .enableTls()

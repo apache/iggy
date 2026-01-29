@@ -30,7 +30,7 @@ import org.apache.iggy.client.blocking.tcp.IggyTcpClientBuilder;
  * <p>Use this builder to choose between blocking and async TCP clients:
  * <pre>{@code
  * // Blocking TCP client - manual connect and login
- * var client = Iggy.tcp().blocking()
+ * var client = Iggy.tcpClientBuilder().blocking()
  *     .host("localhost")
  *     .port(8090)
  *     .build();
@@ -38,21 +38,21 @@ import org.apache.iggy.client.blocking.tcp.IggyTcpClientBuilder;
  * client.users().login("iggy", "iggy");
  *
  * // Blocking TCP client - convenience method with auto-login
- * var client = Iggy.tcp().blocking()
+ * var client = Iggy.tcpClientBuilder().blocking()
  *     .host("localhost")
  *     .port(8090)
  *     .credentials("iggy", "iggy")
  *     .buildAndLogin();
  *
  * // Async TCP client - manual connect and login
- * var asyncClient = Iggy.tcp().async()
+ * var asyncClient = Iggy.tcpClientBuilder().async()
  *     .host("localhost")
  *     .build();
  * asyncClient.connect().join();
  * asyncClient.users().login("iggy", "iggy").join();
  *
  * // Async TCP client - convenience method with auto-login
- * var asyncClient = Iggy.tcp().async()
+ * var asyncClient = Iggy.tcpClientBuilder().async()
  *     .host("localhost")
  *     .credentials("iggy", "iggy")
  *     .buildAndLogin()

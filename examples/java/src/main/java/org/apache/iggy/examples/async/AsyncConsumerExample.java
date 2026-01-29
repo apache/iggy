@@ -21,7 +21,6 @@ package org.apache.iggy.examples.async;
 
 import org.apache.iggy.Iggy;
 import org.apache.iggy.client.async.tcp.AsyncIggyTcpClient;
-import org.apache.iggy.client.blocking.tcp.IggyTcpClient;
 import org.apache.iggy.consumergroup.Consumer;
 import org.apache.iggy.consumergroup.ConsumerGroupDetails;
 import org.apache.iggy.identifier.ConsumerId;
@@ -68,8 +67,8 @@ public final class AsyncConsumerExample {
     private static void setupWithBlockingClient() {
         log.info("Setting up stream, topic, and consumer group...");
 
-        var blockingClient = Iggy.localTcp();
-        blockingClient.users().login("iggy", "iggy");
+        var blockingClient =
+                Iggy.tcpClientBuilder().blocking().credentials("iggy", "iggy").buildAndLogin();
 
         // Create stream if needed
         Optional<StreamDetails> stream = blockingClient.streams().getStream(STREAM_ID);
