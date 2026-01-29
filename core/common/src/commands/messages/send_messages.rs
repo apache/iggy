@@ -208,7 +208,7 @@ impl Serialize for SendMessages {
                         .into_iter()
                         .map(|(k, v)| HeaderEntry { key: k, value: v })
                         .collect();
-                    map.insert("headers", serde_json::to_value(&entries).unwrap());
+                    map.insert("user_headers", serde_json::to_value(&entries).unwrap());
                 }
 
                 map
@@ -310,7 +310,7 @@ impl<'de> Deserialize<'de> for SendMessages {
                                     .decode(payload)
                                     .map_err(|_| de::Error::custom("Invalid base64 payload"))?;
 
-                                let headers_map = if let Some(headers) = msg.get("headers") {
+                                let headers_map = if let Some(headers) = msg.get("user_headers") {
                                     if headers.is_null() {
                                         None
                                     } else {
