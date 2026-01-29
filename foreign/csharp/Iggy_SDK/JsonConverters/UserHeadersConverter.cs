@@ -32,7 +32,7 @@ internal class UserHeadersConverter : JsonConverter<Dictionary<HeaderKey, Header
 
         if (reader.TokenType != JsonTokenType.StartArray)
         {
-            throw new JsonException("Expected start of array for headers.");
+            throw new JsonException($"Expected start of array for headers but got {reader.TokenType}.");
         }
 
         var result = new Dictionary<HeaderKey, HeaderValue>();
@@ -41,7 +41,7 @@ internal class UserHeadersConverter : JsonConverter<Dictionary<HeaderKey, Header
         {
             if (reader.TokenType == JsonTokenType.EndArray)
             {
-                break;
+                return result.Count == 0 ? null : result;
             }
 
             if (reader.TokenType != JsonTokenType.StartObject)
@@ -70,7 +70,7 @@ internal class UserHeadersConverter : JsonConverter<Dictionary<HeaderKey, Header
                 switch (propertyName)
                 {
                     case "key":
-                        key = ReadHeaderField(ref reader);
+                        key = ReadHeaderKey(ref reader);
                         break;
                     case "value":
                         value = ReadHeaderValue(ref reader);
@@ -89,7 +89,7 @@ internal class UserHeadersConverter : JsonConverter<Dictionary<HeaderKey, Header
         return result;
     }
 
-    private static HeaderKey ReadHeaderField(ref Utf8JsonReader reader)
+    private static HeaderKey ReadHeaderKey(ref Utf8JsonReader reader)
     {
         if (reader.TokenType != JsonTokenType.StartObject)
         {
@@ -212,18 +212,18 @@ internal class UserHeadersConverter : JsonConverter<Dictionary<HeaderKey, Header
 
         writer.WriteStartArray();
 
-        foreach (var (headerKey, headerValue) in value)
+        foreach (var kvp in value)
         {
             writer.WriteStartObject();
 
             writer.WriteStartObject("key");
-            writer.WriteString("kind", GetHeaderKindString(headerKey.Kind));
-            writer.WriteBase64String("value", headerKey.Value);
+            writer.WriteString("kind", GetHeaderKindString(kvp.Key.Kind));
+            writer.WriteBase64String("value", kvp.Key.Value);
             writer.WriteEndObject();
 
             writer.WriteStartObject("value");
-            writer.WriteString("kind", GetHeaderKindString(headerValue.Kind));
-            writer.WriteBase64String("value", headerValue.Value);
+            writer.WriteString("kind", GetHeaderKindString(kvp.Value.Kind));
+            writer.WriteBase64String("value", kvp.Value.Value);
             writer.WriteEndObject();
 
             writer.WriteEndObject();

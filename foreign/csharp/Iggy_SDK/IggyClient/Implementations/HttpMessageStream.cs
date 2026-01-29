@@ -55,7 +55,11 @@ public class HttpMessageStream : IIggyClient
         _jsonSerializerOptions = new JsonSerializerOptions
         {
             PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower,
-            Converters = { new JsonStringEnumConverter(JsonNamingPolicy.SnakeCaseLower) }
+            Converters =
+            {
+                new JsonStringEnumConverter(JsonNamingPolicy.SnakeCaseLower),
+                new JsonConverters.UserHeadersConverter()
+            }
         };
     }
 

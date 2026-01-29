@@ -15,32 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using System.Text.Json.Serialization;
-using Apache.Iggy.Headers;
-using Apache.Iggy.JsonConverters;
-using Apache.Iggy.Messages;
-
-namespace Apache.Iggy.Contracts;
+namespace Apache.Iggy.Headers;
 
 /// <summary>
-///     Response from the server containing a message payload.
+///     Represents a single header entry with key and value.
 /// </summary>
-public sealed class MessageResponse
-{
-    /// <summary>
-    ///     Message header.
-    /// </summary>
-    public required MessageHeader Header { get; set; }
-
-    /// <summary>
-    ///     Message payload.
-    /// </summary>
-    public required byte[] Payload { get; set; } = [];
-
-    /// <summary>
-    ///     Headers defined by the user.
-    /// </summary>
-    [JsonPropertyName("user_headers")]
-    [JsonConverter(typeof(UserHeadersConverter))]
-    public Dictionary<HeaderKey, HeaderValue>? UserHeaders { get; init; }
-}
+/// <param name="Key">The header key.</param>
+/// <param name="Value">The header value.</param>
+public readonly record struct HeaderEntry(HeaderKey Key, HeaderValue Value);

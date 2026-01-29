@@ -554,12 +554,12 @@ internal static class TcpContracts
             return [];
         }
 
-        var headersLength = headers.Sum(header => 1 + 4 + header.Key.Value.Length + 1 + 4 + header.Value.Value.Length);
+        var headersLength = headers.Sum(kvp => 1 + 4 + kvp.Key.Value.Length + 1 + 4 + kvp.Value.Value.Length);
         Span<byte> headersBytes = stackalloc byte[headersLength];
         var position = 0;
-        foreach (var (headerKey, headerValue) in headers)
+        foreach (var kvp in headers)
         {
-            var headerBytes = GetBytesFromHeader(headerKey, headerValue);
+            var headerBytes = GetBytesFromHeader(kvp.Key, kvp.Value);
             headerBytes.CopyTo(headersBytes[position..(position + headerBytes.Length)]);
             position += headerBytes.Length;
         }

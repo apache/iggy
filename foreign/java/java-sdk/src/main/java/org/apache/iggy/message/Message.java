@@ -23,6 +23,9 @@ import com.fasterxml.jackson.annotation.JsonCreator;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.annotation.JsonSetter;
 import com.fasterxml.jackson.annotation.Nulls;
+import org.apache.iggy.serde.Base64Serializer;
+import org.apache.iggy.serde.UserHeadersSerializer;
+import tools.jackson.databind.annotation.JsonSerialize;
 
 import java.math.BigInteger;
 import java.util.Base64;
@@ -31,7 +34,10 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
-public record Message(MessageHeader header, byte[] payload, Map<HeaderKey, HeaderValue> userHeaders) {
+public record Message(
+        MessageHeader header,
+        @JsonSerialize(using = Base64Serializer.class) byte[] payload,
+        @JsonSerialize(using = UserHeadersSerializer.class) Map<HeaderKey, HeaderValue> userHeaders) {
     @JsonCreator
     public static Message fromJson(
             @JsonProperty("header") MessageHeader header,

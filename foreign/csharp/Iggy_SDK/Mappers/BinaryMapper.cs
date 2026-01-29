@@ -454,11 +454,8 @@ internal static class BinaryMapper
             ReadOnlySpan<byte> value = payload[position..(position + valueLength)];
             position += valueLength;
 
-            headers.Add(new HeaderKey { Kind = keyKind, Value = keyValue }, new HeaderValue
-            {
-                Kind = valueKind,
-                Value = value.ToArray()
-            });
+            headers[new HeaderKey { Kind = keyKind, Value = keyValue }] =
+                new HeaderValue { Kind = valueKind, Value = value.ToArray() };
         }
 
         return headers;
