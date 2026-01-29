@@ -157,11 +157,16 @@ async fn send_messages(client: &IggyClient, streams: &[(String, u32)]) -> Result
                         false => None,
                         true => {
                             let mut headers = HashMap::new();
-                            headers
-                                .insert(HeaderKey::new("key 1")?, HeaderValue::from_str("value1")?);
-                            headers.insert(HeaderKey::new("key-2")?, HeaderValue::from_bool(true)?);
                             headers.insert(
-                                HeaderKey::new("key_3")?,
+                                HeaderKey::from_string("key 1")?,
+                                HeaderValue::from_str("value1")?,
+                            );
+                            headers.insert(
+                                HeaderKey::from_string("key-2")?,
+                                HeaderValue::from_bool(true)?,
+                            );
+                            headers.insert(
+                                HeaderKey::from_string("key_3")?,
                                 HeaderValue::from_uint64(123456)?,
                             );
                             Some(headers)

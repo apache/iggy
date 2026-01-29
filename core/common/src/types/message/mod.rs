@@ -55,4 +55,7 @@ pub use partitioning_kind::PartitioningKind;
 pub use polled_messages::PolledMessages;
 pub use polling_kind::PollingKind;
 pub use polling_strategy::PollingStrategy;
-pub use user_headers::{HeaderKey, HeaderKind, HeaderValue};
+pub use user_headers::{
+    HeaderEntry, HeaderField, HeaderKey, HeaderKind, HeaderValue, KeyMarker, UserHeaders,
+    ValueMarker, deserialize_headers, serialize_headers,
+};

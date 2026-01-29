@@ -113,7 +113,7 @@ impl PollMessagesCmd {
         let message_headers = header_key_set
             .iter()
             .map(|(key, kind)| {
-                Cell::new(format!("Header: {}\n{}", key.as_str(), kind))
+                Cell::new(format!("Header: {}\n{}", key.to_string_value(), kind))
                     .set_alignment(CellAlignment::Center)
             })
             .collect::<Vec<_>>();
@@ -147,7 +147,7 @@ impl PollMessagesCmd {
                             .map(|h| {
                                 h.get(key)
                                     .filter(|v| v.kind == *kind)
-                                    .map(|v| v.value_only_to_string())
+                                    .map(|v| v.to_string_value())
                                     .unwrap_or_default()
                             })
                             .unwrap_or_default()

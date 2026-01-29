@@ -57,7 +57,7 @@ impl FromStr for Codec {
 impl Codec {
     /// Returns the key to indicate compressed messages as HeaderKey.
     pub fn header_key() -> HeaderKey {
-        HeaderKey::new(COMPRESSION_HEADER_KEY)
+        HeaderKey::from_string(COMPRESSION_HEADER_KEY)
             .expect("COMPRESSION_HEADER_KEY is an InvalidHeaderKey.")
     }
 

@@ -98,19 +98,19 @@ async fn should_fill_data_with_headers_and_verify_after_restart_using_api(encryp
     for i in 0..messages_per_batch {
         let mut headers = HashMap::new();
         headers.insert(
-            HeaderKey::new("batch").unwrap(),
+            HeaderKey::from_string("batch").unwrap(),
             HeaderValue::from_uint64(1).unwrap(),
         );
         headers.insert(
-            HeaderKey::new("index").unwrap(),
+            HeaderKey::from_string("index").unwrap(),
             HeaderValue::from_uint64(i).unwrap(),
         );
         headers.insert(
-            HeaderKey::new("type").unwrap(),
+            HeaderKey::from_string("type").unwrap(),
             HeaderValue::from_str("test-message").unwrap(),
         );
         headers.insert(
-            HeaderKey::new("encrypted").unwrap(),
+            HeaderKey::from_string("encrypted").unwrap(),
             HeaderValue::from_bool(encryption).unwrap(),
         );
 
@@ -195,7 +195,7 @@ async fn should_fill_data_with_headers_and_verify_after_restart_using_api(encryp
         let headers = msg.user_headers_map().unwrap().unwrap();
         assert_eq!(
             headers
-                .get(&HeaderKey::new("batch").unwrap())
+                .get(&HeaderKey::from_string("batch").unwrap())
                 .unwrap()
                 .as_uint64()
                 .unwrap(),
@@ -203,7 +203,7 @@ async fn should_fill_data_with_headers_and_verify_after_restart_using_api(encryp
         );
         assert_eq!(
             headers
-                .get(&HeaderKey::new("type").unwrap())
+                .get(&HeaderKey::from_string("type").unwrap())
                 .unwrap()
                 .as_str()
                 .unwrap(),
@@ -211,7 +211,7 @@ async fn should_fill_data_with_headers_and_verify_after_restart_using_api(encryp
         );
         assert_eq!(
             headers
-                .get(&HeaderKey::new("encrypted").unwrap())
+                .get(&HeaderKey::from_string("encrypted").unwrap())
                 .unwrap()
                 .as_bool()
                 .unwrap(),
@@ -243,19 +243,19 @@ async fn should_fill_data_with_headers_and_verify_after_restart_using_api(encryp
     for i in 0..messages_per_batch {
         let mut headers = HashMap::new();
         headers.insert(
-            HeaderKey::new("batch").unwrap(),
+            HeaderKey::from_string("batch").unwrap(),
             HeaderValue::from_uint64(2).unwrap(),
         );
         headers.insert(
-            HeaderKey::new("index").unwrap(),
+            HeaderKey::from_string("index").unwrap(),
             HeaderValue::from_uint64(i).unwrap(),
         );
         headers.insert(
-            HeaderKey::new("type").unwrap(),
+            HeaderKey::from_string("type").unwrap(),
             HeaderValue::from_str("test-message-after-restart").unwrap(),
         );
         headers.insert(
-            HeaderKey::new("encrypted").unwrap(),
+            HeaderKey::from_string("encrypted").unwrap(),
             HeaderValue::from_bool(encryption).unwrap(),
         );
 
@@ -322,7 +322,7 @@ async fn should_fill_data_with_headers_and_verify_after_restart_using_api(encryp
         assert!(msg.user_headers.is_some());
         let headers = msg.user_headers_map().unwrap().unwrap();
         let batch_num = headers
-            .get(&HeaderKey::new("batch").unwrap())
+            .get(&HeaderKey::from_string("batch").unwrap())
             .unwrap()
             .as_uint64()
             .unwrap();
@@ -331,7 +331,7 @@ async fn should_fill_data_with_headers_and_verify_after_restart_using_api(encryp
             batch_1_count += 1;
             assert_eq!(
                 headers
-                    .get(&HeaderKey::new("type").unwrap())
+                    .get(&HeaderKey::from_string("type").unwrap())
                     .unwrap()
                     .as_str()
                     .unwrap(),
@@ -339,7 +339,7 @@ async fn should_fill_data_with_headers_and_verify_after_restart_using_api(encryp
             );
             assert_eq!(
                 headers
-                    .get(&HeaderKey::new("encrypted").unwrap())
+                    .get(&HeaderKey::from_string("encrypted").unwrap())
                     .unwrap()
                     .as_bool()
                     .unwrap(),
@@ -349,7 +349,7 @@ async fn should_fill_data_with_headers_and_verify_after_restart_using_api(encryp
             batch_2_count += 1;
             assert_eq!(
                 headers
-                    .get(&HeaderKey::new("type").unwrap())
+                    .get(&HeaderKey::from_string("type").unwrap())
                     .unwrap()
                     .as_str()
                     .unwrap(),

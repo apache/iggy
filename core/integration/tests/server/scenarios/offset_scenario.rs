@@ -174,15 +174,15 @@ fn create_single_message(id: u32, message_size: u64) -> IggyMessage {
 
     let mut headers = HashMap::new();
     headers.insert(
-        HeaderKey::new("key_1").unwrap(),
+        HeaderKey::from_string("key_1").unwrap(),
         HeaderValue::from_str("Value 1").unwrap(),
     );
     headers.insert(
-        HeaderKey::new("key 2").unwrap(),
+        HeaderKey::from_string("key 2").unwrap(),
         HeaderValue::from_bool(true).unwrap(),
     );
     headers.insert(
-        HeaderKey::new("key-3").unwrap(),
+        HeaderKey::from_string("key-3").unwrap(),
         HeaderValue::from_uint64(123456).unwrap(),
     );
 

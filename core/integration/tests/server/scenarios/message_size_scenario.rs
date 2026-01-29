@@ -221,7 +221,7 @@ fn create_message_header_of_size(target_size: usize) -> HashMap<HeaderKey, Heade
             remaining_size - total_overhead
         };
 
-        let key = HeaderKey::new(key_str.as_str()).unwrap();
+        let key = HeaderKey::from_string(key_str.as_str()).unwrap();
         let value = HeaderValue::from_str(create_string_of_size(value_size).as_str()).unwrap();
 
         let actual_header_size = 4 + key_str.len() + 1 + 4 + value_size;

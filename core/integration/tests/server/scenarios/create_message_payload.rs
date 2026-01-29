@@ -82,7 +82,7 @@ pub async fn run(client_factory: &dyn ClientFactory) {
         assert_eq!(headers.len(), 3);
         assert_eq!(
             headers
-                .get(&HeaderKey::new("key_1").unwrap())
+                .get(&HeaderKey::from_string("key_1").unwrap())
                 .unwrap()
                 .as_str()
                 .unwrap(),
@@ -90,14 +90,14 @@ pub async fn run(client_factory: &dyn ClientFactory) {
         );
         assert!(
             headers
-                .get(&HeaderKey::new("key 2").unwrap())
+                .get(&HeaderKey::from_string("key 2").unwrap())
                 .unwrap()
                 .as_bool()
                 .unwrap(),
         );
         assert_eq!(
             headers
-                .get(&HeaderKey::new("key-3").unwrap())
+                .get(&HeaderKey::from_string("key-3").unwrap())
                 .unwrap()
                 .as_uint64()
                 .unwrap(),
@@ -141,15 +141,15 @@ fn create_message_payload(offset: u64) -> Bytes {
 fn create_message_headers() -> HashMap<HeaderKey, HeaderValue> {
     let mut headers = HashMap::new();
     headers.insert(
-        HeaderKey::new("key_1").unwrap(),
+        HeaderKey::from_string("key_1").unwrap(),
         HeaderValue::from_str("Value 1").unwrap(),
     );
     headers.insert(
-        HeaderKey::new("key 2").unwrap(),
+        HeaderKey::from_string("key 2").unwrap(),
         HeaderValue::from_bool(true).unwrap(),
     );
     headers.insert(
-        HeaderKey::new("key-3").unwrap(),
+        HeaderKey::from_string("key-3").unwrap(),
         HeaderValue::from_uint64(123456).unwrap(),
     );
     headers

@@ -19,24 +19,23 @@
 use anyhow::Result;
 use iggy::prelude::*;
 use iggy_examples::shared::args::Args;
-use iggy_examples::shared::messages::*;
 use iggy_examples::shared::system;
 use std::error::Error;
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::info;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Registry};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let args = Args::parse_with_defaults("message-headers-consumer");
+    let args = Args::parse_with_defaults("typed-headers-consumer");
     Registry::default()
         .with(tracing_subscriber::fmt::layer())
         .with(EnvFilter::try_from_default_env().unwrap_or(EnvFilter::new("INFO")))
         .init();
     info!(
-        "Message headers consumer has started, selected transport: {}",
+        "Typed headers consumer has started, selected transport: {}",
         args.transport
     );
     let client_provider_config = Arc::new(ClientProviderConfig::from_args(args.to_sdk_args())?);
@@ -48,32 +47,25 @@ async fn main() -> Result<(), Box<dyn Error>> {
 }
 
 fn handle_message(message: &IggyMessage) -> Result<(), Box<dyn Error>> {
-    // The payload can be of any type as it is a raw byte array. In this case it's a JSON string.
     let payload = std::str::from_utf8(&message.payload)?;
-    // The message type is stored in the custom message header.
-    let header_key = HeaderKey::from_string("message_type").unwrap();
-    let headers_map = message.user_headers_map()?.unwrap();
-    let message_type = headers_map.get(&header_key).unwrap().as_str()?;
+
     info!(
-        "Handling message type: {} at offset: {}...",
-        message_type, message.header.offset
+        "Message at offset: {}, payload: {}",
+        message.header.offset, payload
     );
-    match message_type {
-        ORDER_CREATED_TYPE => {
-            let order_created = serde_json::from_str::<OrderCreated>(payload)?;
-            info!("{:#?}", order_created);
-        }
-        ORDER_CONFIRMED_TYPE => {
-            let order_confirmed = serde_json::from_str::<OrderConfirmed>(payload)?;
-            info!("{:#?}", order_confirmed);
-        }
-        ORDER_REJECTED_TYPE => {
-            let order_rejected = serde_json::from_str::<OrderRejected>(payload)?;
-            info!("{:#?}", order_rejected);
-        }
-        _ => {
-            warn!("Received unknown message type: {}", message_type);
+
+    if let Some(headers_map) = message.user_headers_map()? {
+        info!("Headers ({}):", headers_map.len());
+        for (key, value) in &headers_map {
+            info!(
+                "  key: [kind={}, value={}] -> value: [kind={}, value={}]",
+                key.kind,
+                key.to_string_value(),
+                value.kind,
+                value.to_string_value()
+            );
         }
     }
+
     Ok(())
 }

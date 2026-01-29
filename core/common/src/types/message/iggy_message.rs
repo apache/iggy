@@ -541,6 +541,7 @@ impl Serialize for IggyMessage {
     where
         S: Serializer,
     {
+        use super::user_headers::HeaderEntry;
         use base64::{Engine as _, engine::general_purpose::STANDARD};
         use serde::ser::SerializeStruct;
 
@@ -554,8 +555,13 @@ impl Serialize for IggyMessage {
 
         if self.user_headers.is_some() {
             let headers_map = self.user_headers_map().map_err(serde::ser::Error::custom)?;
-
-            state.serialize_field("user_headers", &headers_map)?;
+            if let Some(map) = headers_map {
+                let entries: Vec<HeaderEntry> = map
+                    .into_iter()
+                    .map(|(key, value)| HeaderEntry { key, value })
+                    .collect();
+                state.serialize_field("user_headers", &entries)?;
+            }
         }
 
         state.end()
@@ -567,6 +573,7 @@ impl<'de> Deserialize<'de> for IggyMessage {
     where
         D: Deserializer<'de>,
     {
+        use super::user_headers::HeaderEntry;
         use serde::de::{self, MapAccess, Visitor};
         use std::fmt;
 
@@ -601,7 +608,12 @@ impl<'de> Deserialize<'de> for IggyMessage {
                             payload = Some(Bytes::from(decoded));
                         }
                         "user_headers" => {
-                            user_headers = Some(map.next_value()?);
+                            let entries: Vec<HeaderEntry> = map.next_value()?;
+                            let mut headers_map = HashMap::new();
+                            for entry in entries {
+                                headers_map.insert(entry.key, entry.value);
+                            }
+                            user_headers = Some(headers_map);
                         }
                         _ => {
                             let _ = map.next_value::<de::IgnoredAny>()?;
@@ -668,7 +680,7 @@ mod tests {
     fn test_create_with_headers() {
         let mut headers = HashMap::new();
         headers.insert(
-            HeaderKey::new("content-type").unwrap(),
+            HeaderKey::from_string("content-type").unwrap(),
             HeaderValue::from_str("text/plain").unwrap(),
         );
 
@@ -682,7 +694,7 @@ mod tests {
 
         let headers_map = message.user_headers_map().unwrap().unwrap();
         assert_eq!(headers_map.len(), 1);
-        assert!(headers_map.contains_key(&HeaderKey::new("content-type").unwrap()));
+        assert!(headers_map.contains_key(&HeaderKey::from_string("content-type").unwrap()));
     }
 
     #[test]
@@ -724,11 +736,11 @@ mod tests {
     fn test_json_serialization_with_headers() {
         let mut headers = HashMap::new();
         headers.insert(
-            HeaderKey::new("content-type").unwrap(),
+            HeaderKey::from_string("content-type").unwrap(),
             HeaderValue::from_str("text/plain").unwrap(),
         );
         headers.insert(
-            HeaderKey::new("correlation-id").unwrap(),
+            HeaderKey::from_string("correlation-id").unwrap(),
             HeaderValue::from_str("123456").unwrap(),
         );
 
@@ -773,12 +785,12 @@ mod tests {
 
         assert_eq!(original_map.len(), deserialized_map.len());
         assert_eq!(
-            original_map.get(&HeaderKey::new("content-type").unwrap()),
-            deserialized_map.get(&HeaderKey::new("content-type").unwrap())
+            original_map.get(&HeaderKey::from_string("content-type").unwrap()),
+            deserialized_map.get(&HeaderKey::from_string("content-type").unwrap())
         );
         assert_eq!(
-            original_map.get(&HeaderKey::new("correlation-id").unwrap()),
-            deserialized_map.get(&HeaderKey::new("correlation-id").unwrap())
+            original_map.get(&HeaderKey::from_string("correlation-id").unwrap()),
+            deserialized_map.get(&HeaderKey::from_string("correlation-id").unwrap())
         );
     }
 }

@@ -34,7 +34,7 @@ export type Message = {
   user_headers_length: number;
   payload_length: number;
   formattedTimestamp: string;
-  user_headers: Record<string, HeaderField>;
+  user_headers: HeaderEntry[];
   payload: string;
   truncatedPayload: string;
 };
@@ -42,6 +42,11 @@ export type Message = {
 export type HeaderField = {
   kind: string;
   value: string;
+};
+
+export type HeaderEntry = {
+  key: HeaderField;
+  value: HeaderField;
 };
 
 export function messageMapper(item: any): Message {

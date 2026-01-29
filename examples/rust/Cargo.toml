@@ -17,7 +17,7 @@
 
 [package]
 name = "iggy_examples"
-version = "0.0.5"
+version = "0.0.6"
 edition = "2024"
 license = "Apache-2.0"
 
@@ -77,6 +77,14 @@ path = "src/message-headers/message-compression/consumer/main.rs"
 [[example]]
 name = "message-headers-compression-producer"
 path = "src/message-headers/message-compression/producer/main.rs"
+
+[[example]]
+name = "typed-headers-consumer"
+path = "src/message-headers/typed-headers/consumer/main.rs"
+
+[[example]]
+name = "typed-headers-producer"
+path = "src/message-headers/typed-headers/producer/main.rs"
 
 [[example]]
 name = "multi-tenant-consumer"

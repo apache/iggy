@@ -140,10 +140,10 @@ humantime = "2.3.0"
 hwlocality = "1.0.0-alpha.11"
 iceberg = "0.8.0"
 iceberg-catalog-rest = "0.8.0"
-iggy = { path = "core/sdk", version = "0.8.1-edge.6" }
-iggy_binary_protocol = { path = "core/binary_protocol", version = "0.8.1-edge.3" }
-iggy_common = { path = "core/common", version = "0.8.1-edge.2" }
-iggy_connector_sdk = { path = "core/connectors/sdk", version = "0.1.1-edge.3" }
+iggy = { path = "core/sdk", version = "0.8.2-edge.1" }
+iggy_binary_protocol = { path = "core/binary_protocol", version = "0.8.2-edge.1" }
+iggy_common = { path = "core/common", version = "0.8.2-edge.1" }
+iggy_connector_sdk = { path = "core/connectors/sdk", version = "0.1.2-edge.1" }
 integration = { path = "core/integration" }
 keyring = { version = "3.6.3", features = ["sync-secret-service", "vendored"] }
 lazy_static = "1.5.0"

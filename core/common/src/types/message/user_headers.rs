@@ -25,67 +25,29 @@ use serde_with::serde_as;
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use std::hash::{Hash, Hasher};
+use std::marker::PhantomData;
 use std::str::FromStr;
 
-/// Represents a header key with a unique name. The name is case-insensitive and wraps a string.
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
-pub struct HeaderKey(String);
+pub type HeaderKey = HeaderField<KeyMarker>;
+pub type HeaderValue = HeaderField<ValueMarker>;
+pub type UserHeaders = HashMap<HeaderKey, HeaderValue>;
 
-impl HeaderKey {
-    pub fn new(key: &str) -> Result<Self, IggyError> {
-        if key.is_empty() || key.len() > 255 {
-            return Err(IggyError::InvalidHeaderKey);
-        }
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct KeyMarker;
 
-        Ok(Self(key.to_lowercase().to_string()))
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ValueMarker;
 
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl Display for HeaderKey {
-    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
-        write!(f, "{}", self.as_str())
-    }
-}
-
-impl Hash for HeaderKey {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.0.hash(state);
-    }
-}
-
-impl FromStr for HeaderKey {
-    type Err = IggyError;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Self::new(s)
-    }
-}
-
-impl TryFrom<&str> for HeaderKey {
-    type Error = IggyError;
-    fn try_from(value: &str) -> Result<Self, Self::Error> {
-        Self::new(value)
-    }
-}
-
-/// Represents a header value of a specific kind.
-/// It consists of the following fields:
-/// - `kind`: the kind of the header value.
-/// - `value`: the value of the header.
 #[serde_as]
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
-pub struct HeaderValue {
-    /// The kind of the header value.
+pub struct HeaderField<T> {
     pub kind: HeaderKind,
-    /// The binary value of the header payload.
     #[serde_as(as = "Base64")]
     pub value: Bytes,
+    #[serde(skip)]
+    _marker: PhantomData<T>,
 }
 
-/// Represents the kind of a header value.
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum HeaderKind {
@@ -107,7 +69,6 @@ pub enum HeaderKind {
 }
 
 impl HeaderKind {
-    /// Returns the code of the header kind.
     pub fn as_code(&self) -> u8 {
         match self {
             HeaderKind::Raw => 1,
@@ -128,7 +89,6 @@ impl HeaderKind {
         }
     }
 
-    /// Returns the header kind from the code.
     pub fn from_code(code: u8) -> Result<Self, IggyError> {
         match code {
             1 => Ok(HeaderKind::Raw),
@@ -175,13 +135,6 @@ impl FromStr for HeaderKind {
     }
 }
 
-impl Display for HeaderValue {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}: ", self.kind)?;
-        write!(f, "{}", self.value_only_to_string())
-    }
-}
-
 impl Display for HeaderKind {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         match *self {
@@ -204,28 +157,44 @@ impl Display for HeaderKind {
     }
 }
 
-impl FromStr for HeaderValue {
-    type Err = IggyError;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Self::from(HeaderKind::String, s.as_bytes())
+impl<T> Display for HeaderField<T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: ", self.kind)?;
+        write!(f, "{}", self.to_string_value())
     }
 }
 
-impl HeaderValue {
-    /// Creates a new header value from the specified kind and value.
-    /// The kind is parsed from the string representation.
-    /// The value is parsed from the string representation.
+impl<T> Hash for HeaderField<T> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.kind.hash(state);
+        self.value.hash(state);
+    }
+}
+
+impl<T> FromStr for HeaderField<T> {
+    type Err = IggyError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::from_string(s)
+    }
+}
+
+impl<T> TryFrom<&str> for HeaderField<T> {
+    type Error = IggyError;
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        Self::from_string(value)
+    }
+}
+
+impl<T> HeaderField<T> {
     pub fn from_kind_str_and_value_str(kind: &str, value: &str) -> Result<Self, IggyError> {
         let kind = HeaderKind::from_str(kind)?;
         Self::from_kind_and_value_str(kind, value)
     }
 
-    /// Creates a new header value from the specified kind and value.
-    /// The value is parsed from the string representation.
     pub fn from_kind_and_value_str(kind: HeaderKind, value: &str) -> Result<Self, IggyError> {
         match kind {
             HeaderKind::Raw => Self::from_raw(value.as_bytes()),
-            HeaderKind::String => Self::from_str(value),
+            HeaderKind::String => Self::from_string(value),
             HeaderKind::Bool => {
                 Self::from_bool(value.parse().map_err(|_| IggyError::InvalidBooleanValue)?)
             }
@@ -267,40 +236,37 @@ impl HeaderValue {
             }
         }
     }
-    /// Creates a new header value from the specified raw bytes.
+
     pub fn from_raw(value: &[u8]) -> Result<Self, IggyError> {
         Self::from(HeaderKind::Raw, value)
     }
 
-    /// Returns the raw bytes of the header value.
     pub fn as_raw(&self) -> Result<&[u8], IggyError> {
         if self.kind != HeaderKind::Raw {
             return Err(IggyError::InvalidHeaderValue);
         }
-
         Ok(&self.value)
     }
 
-    /// Returns the string representation of the header value.
+    pub fn from_string(value: &str) -> Result<Self, IggyError> {
+        Self::from(HeaderKind::String, value.as_bytes())
+    }
+
     pub fn as_str(&self) -> Result<&str, IggyError> {
         if self.kind != HeaderKind::String {
             return Err(IggyError::InvalidHeaderValue);
         }
-
         std::str::from_utf8(&self.value).map_err(|_| IggyError::InvalidUtf8)
     }
 
-    /// Creates a new header value from the specified string.
     pub fn from_bool(value: bool) -> Result<Self, IggyError> {
         Self::from(HeaderKind::Bool, if value { &[1] } else { &[0] })
     }
 
-    /// Returns the boolean representation of the header value.
     pub fn as_bool(&self) -> Result<bool, IggyError> {
         if self.kind != HeaderKind::Bool {
             return Err(IggyError::InvalidHeaderValue);
         }
-
         match self.value[0] {
             0 => Ok(false),
             1 => Ok(true),
@@ -308,246 +274,186 @@ impl HeaderValue {
         }
     }
 
-    /// Creates a new header value from the specified boolean.
     pub fn from_int8(value: i8) -> Result<Self, IggyError> {
         Self::from(HeaderKind::Int8, &value.to_le_bytes())
     }
 
-    /// Returns the i8 representation of the header value.
     pub fn as_int8(&self) -> Result<i8, IggyError> {
         if self.kind != HeaderKind::Int8 {
             return Err(IggyError::InvalidHeaderValue);
         }
-
         let value = self.value.to_vec().try_into();
         if value.is_err() {
             return Err(IggyError::InvalidHeaderValue);
         }
-
         Ok(i8::from_le_bytes(value.unwrap()))
     }
 
-    /// Creates a new header value from the specified i8.
     pub fn from_int16(value: i16) -> Result<Self, IggyError> {
         Self::from(HeaderKind::Int16, &value.to_le_bytes())
     }
 
-    /// Returns the i16 representation of the header value.
     pub fn as_int16(&self) -> Result<i16, IggyError> {
         if self.kind != HeaderKind::Int16 {
             return Err(IggyError::InvalidHeaderValue);
         }
-
         let value = self.value.to_vec().try_into();
         if value.is_err() {
             return Err(IggyError::InvalidHeaderValue);
         }
-
         Ok(i16::from_le_bytes(value.unwrap()))
     }
 
-    /// Creates a new header value from the specified i16.
     pub fn from_int32(value: i32) -> Result<Self, IggyError> {
         Self::from(HeaderKind::Int32, &value.to_le_bytes())
     }
 
-    /// Returns the i32 representation of the header value.
     pub fn as_int32(&self) -> Result<i32, IggyError> {
         if self.kind != HeaderKind::Int32 {
             return Err(IggyError::InvalidHeaderValue);
         }
-
         let value = self.value.to_vec().try_into();
         if value.is_err() {
             return Err(IggyError::InvalidHeaderValue);
         }
-
         Ok(i32::from_le_bytes(value.unwrap()))
     }
 
-    /// Creates a new header value from the specified i32.
     pub fn from_int64(value: i64) -> Result<Self, IggyError> {
         Self::from(HeaderKind::Int64, &value.to_le_bytes())
     }
 
-    /// Returns the i64 representation of the header value.
     pub fn as_int64(&self) -> Result<i64, IggyError> {
         if self.kind != HeaderKind::Int64 {
             return Err(IggyError::InvalidHeaderValue);
         }
-
         let value = self.value.to_vec().try_into();
         if value.is_err() {
             return Err(IggyError::InvalidHeaderValue);
         }
-
         Ok(i64::from_le_bytes(value.unwrap()))
     }
 
-    /// Creates a new header value from the specified i128.
     pub fn from_int128(value: i128) -> Result<Self, IggyError> {
         Self::from(HeaderKind::Int128, &value.to_le_bytes())
     }
 
-    /// Returns the i128 representation of the header value.
     pub fn as_int128(&self) -> Result<i128, IggyError> {
         if self.kind != HeaderKind::Int128 {
             return Err(IggyError::InvalidHeaderValue);
         }
-
         let value = self.value.to_vec().try_into();
         if value.is_err() {
             return Err(IggyError::InvalidHeaderValue);
         }
-
         Ok(i128::from_le_bytes(value.unwrap()))
     }
 
-    /// Creates a new header value from the specified u8.
     pub fn from_uint8(value: u8) -> Result<Self, IggyError> {
         Self::from(HeaderKind::Uint8, &value.to_le_bytes())
     }
 
-    /// Returns the u8 representation of the header value.
     pub fn as_uint8(&self) -> Result<u8, IggyError> {
         if self.kind != HeaderKind::Uint8 {
             return Err(IggyError::InvalidHeaderValue);
         }
-
         Ok(self.value[0])
     }
 
-    /// Creates a new header value from the specified u16.
     pub fn from_uint16(value: u16) -> Result<Self, IggyError> {
         Self::from(HeaderKind::Uint16, &value.to_le_bytes())
     }
 
-    /// Returns the u16 representation of the header value.
     pub fn as_uint16(&self) -> Result<u16, IggyError> {
         if self.kind != HeaderKind::Uint16 {
             return Err(IggyError::InvalidHeaderValue);
         }
-
         let value = self.value.to_vec().try_into();
         if value.is_err() {
             return Err(IggyError::InvalidHeaderValue);
         }
-
         Ok(u16::from_le_bytes(value.unwrap()))
     }
 
-    /// Creates a new header value from the specified u32.
     pub fn from_uint32(value: u32) -> Result<Self, IggyError> {
         Self::from(HeaderKind::Uint32, &value.to_le_bytes())
     }
 
-    /// Returns the u32 representation of the header value.
     pub fn as_uint32(&self) -> Result<u32, IggyError> {
         if self.kind != HeaderKind::Uint32 {
             return Err(IggyError::InvalidHeaderValue);
         }
-
         let value = self.value.to_vec().try_into();
         if value.is_err() {
             return Err(IggyError::InvalidHeaderValue);
         }
-
         Ok(u32::from_le_bytes(value.unwrap()))
     }
 
-    /// Creates a new header value from the specified u64.
     pub fn from_uint64(value: u64) -> Result<Self, IggyError> {
         Self::from(HeaderKind::Uint64, &value.to_le_bytes())
     }
 
-    /// Returns the u64 representation of the header value.
     pub fn as_uint64(&self) -> Result<u64, IggyError> {
         if self.kind != HeaderKind::Uint64 {
             return Err(IggyError::InvalidHeaderValue);
         }
-
         let value = self.value.to_vec().try_into();
         if value.is_err() {
             return Err(IggyError::InvalidHeaderValue);
         }
-
         Ok(u64::from_le_bytes(value.unwrap()))
     }
 
-    /// Creates a new header value from the specified u128.
     pub fn from_uint128(value: u128) -> Result<Self, IggyError> {
         Self::from(HeaderKind::Uint128, &value.to_le_bytes())
     }
 
-    /// Returns the u128 representation of the header value.
     pub fn as_uint128(&self) -> Result<u128, IggyError> {
         if self.kind != HeaderKind::Uint128 {
             return Err(IggyError::InvalidHeaderValue);
         }
-
         let value = self.value.to_vec().try_into();
         if value.is_err() {
             return Err(IggyError::InvalidHeaderValue);
         }
-
         Ok(u128::from_le_bytes(value.unwrap()))
     }
 
-    /// Creates a new header value from the specified f32.
     pub fn from_float32(value: f32) -> Result<Self, IggyError> {
         Self::from(HeaderKind::Float32, &value.to_le_bytes())
     }
 
-    /// Returns the f32 representation of the header value.
     pub fn as_float32(&self) -> Result<f32, IggyError> {
         if self.kind != HeaderKind::Float32 {
             return Err(IggyError::InvalidHeaderValue);
         }
-
         let value = self.value.to_vec().try_into();
         if value.is_err() {
             return Err(IggyError::InvalidHeaderValue);
         }
-
         Ok(f32::from_le_bytes(value.unwrap()))
     }
 
-    /// Creates a new header value from the specified f64.
     pub fn from_float64(value: f64) -> Result<Self, IggyError> {
         Self::from(HeaderKind::Float64, &value.to_le_bytes())
     }
 
-    /// Returns the f64 representation of the header value.
     pub fn as_float64(&self) -> Result<f64, IggyError> {
         if self.kind != HeaderKind::Float64 {
             return Err(IggyError::InvalidHeaderValue);
         }
-
         let value = self.value.to_vec().try_into();
         if value.is_err() {
             return Err(IggyError::InvalidHeaderValue);
         }
-
         Ok(f64::from_le_bytes(value.unwrap()))
     }
 
-    /// Creates a new header value from the specified kind and value.
-    fn from(kind: HeaderKind, value: &[u8]) -> Result<Self, IggyError> {
-        if value.is_empty() || value.len() > 255 {
-            return Err(IggyError::InvalidHeaderValue);
-        }
-
-        Ok(Self {
-            kind,
-            value: Bytes::from(value.to_vec()),
-        })
-    }
-
-    /// Returns the string representation of the header value without the kind.
-    pub fn value_only_to_string(&self) -> String {
+    pub fn to_string_value(&self) -> String {
         match self.kind {
             HeaderKind::Raw => format!("{:?}", self.value),
-            HeaderKind::String => format!("{}", String::from_utf8_lossy(&self.value)),
+            HeaderKind::String => String::from_utf8_lossy(&self.value).to_string(),
             HeaderKind::Bool => format!("{}", self.value[0] != 0),
             HeaderKind::Int8 => format!(
                 "{}",
@@ -599,6 +505,17 @@ impl HeaderValue {
             ),
         }
     }
+
+    fn from(kind: HeaderKind, value: &[u8]) -> Result<Self, IggyError> {
+        if value.is_empty() || value.len() > 255 {
+            return Err(IggyError::InvalidHeaderValue);
+        }
+        Ok(Self {
+            kind,
+            value: Bytes::from(value.to_vec()),
+            _marker: PhantomData,
+        })
+    }
 }
 
 impl BytesSerializable for HashMap<HeaderKey, HeaderValue> {
@@ -609,9 +526,10 @@ impl BytesSerializable for HashMap<HeaderKey, HeaderValue> {
 
         let mut bytes = BytesMut::new();
         for (key, value) in self {
+            bytes.put_u8(key.kind.as_code());
             #[allow(clippy::cast_possible_truncation)]
-            bytes.put_u32_le(key.0.len() as u32);
-            bytes.put_slice(key.0.as_bytes());
+            bytes.put_u32_le(key.value.len() as u32);
+            bytes.put_slice(&key.value);
             bytes.put_u8(value.kind.as_code());
             #[allow(clippy::cast_possible_truncation)]
             bytes.put_u32_le(value.value.len() as u32);
@@ -632,6 +550,8 @@ impl BytesSerializable for HashMap<HeaderKey, HeaderValue> {
         let mut headers = Self::new();
         let mut position = 0;
         while position < bytes.len() {
+            let key_kind = HeaderKind::from_code(bytes[position])?;
+            position += 1;
             let key_length = u32::from_le_bytes(
                 bytes[position..position + 4]
                     .try_into()
@@ -642,15 +562,10 @@ impl BytesSerializable for HashMap<HeaderKey, HeaderValue> {
                 return Err(IggyError::InvalidHeaderKey);
             }
             position += 4;
-            let key = match String::from_utf8(bytes[position..position + key_length].to_vec()) {
-                Ok(k) => k,
-                Err(e) => {
-                    tracing::error!("Invalid header key: {e}");
-                    return Err(IggyError::InvalidHeaderKey);
-                }
-            };
+            let key_value = bytes[position..position + key_length].to_vec();
             position += key_length;
-            let kind = HeaderKind::from_code(bytes[position])?;
+
+            let value_kind = HeaderKind::from_code(bytes[position])?;
             position += 1;
             let value_length = u32::from_le_bytes(
                 bytes[position..position + 4]
@@ -662,13 +577,19 @@ impl BytesSerializable for HashMap<HeaderKey, HeaderValue> {
                 return Err(IggyError::InvalidHeaderValue);
             }
             position += 4;
-            let value = bytes[position..position + value_length].to_vec();
+            let value_value = bytes[position..position + value_length].to_vec();
             position += value_length;
+
             headers.insert(
-                HeaderKey(key),
+                HeaderKey {
+                    kind: key_kind,
+                    value: Bytes::from(key_value),
+                    _marker: PhantomData,
+                },
                 HeaderValue {
-                    kind,
-                    value: Bytes::from(value),
+                    kind: value_kind,
+                    value: Bytes::from(value_value),
+                    _marker: PhantomData,
                 },
             );
         }
@@ -677,15 +598,58 @@ impl BytesSerializable for HashMap<HeaderKey, HeaderValue> {
     }
 }
 
-/// Returns the size in bytes of the specified headers.
 pub fn get_user_headers_size(headers: &Option<HashMap<HeaderKey, HeaderValue>>) -> Option<u32> {
     let mut size = 0;
     if let Some(headers) = headers {
         for (key, value) in headers {
-            size += 4 + key.as_str().len() as u32 + 1 + 4 + value.value.len() as u32;
+            size += 1 + 4 + key.value.len() as u32 + 1 + 4 + value.value.len() as u32;
         }
     }
     Some(size)
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct HeaderEntry {
+    pub key: HeaderKey,
+    pub value: HeaderValue,
+}
+
+pub fn serialize_headers<S>(headers: &Option<UserHeaders>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    use serde::ser::SerializeSeq;
+
+    match headers {
+        Some(map) => {
+            let mut seq = serializer.serialize_seq(Some(map.len()))?;
+            for (key, value) in map {
+                seq.serialize_element(&HeaderEntry {
+                    key: key.clone(),
+                    value: value.clone(),
+                })?;
+            }
+            seq.end()
+        }
+        None => serializer.serialize_none(),
+    }
+}
+
+pub fn deserialize_headers<'de, D>(deserializer: D) -> Result<Option<UserHeaders>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let entries: Option<Vec<HeaderEntry>> = Option::deserialize(deserializer)?;
+    match entries {
+        Some(vec) => {
+            let mut map = UserHeaders::new();
+            for entry in vec {
+                map.insert(entry.key, entry.value);
+            }
+            Ok(Some(map))
+        }
+        None => Ok(None),
+    }
 }
 
 #[cfg(test)]
@@ -695,32 +659,44 @@ mod tests {
     #[test]
     fn header_key_should_be_created_for_valid_value() {
         let value = "key-1";
-        let header_key = HeaderKey::new(value);
+        let header_key = HeaderKey::from_string(value);
         assert!(header_key.is_ok());
-        assert_eq!(header_key.unwrap().0, value);
+        let header_key = header_key.unwrap();
+        assert_eq!(header_key.kind, HeaderKind::String);
+        assert_eq!(header_key.as_str().unwrap(), value);
     }
 
     #[test]
     fn header_key_should_not_be_created_for_empty_value() {
         let value = "";
-        let header_key = HeaderKey::new(value);
+        let header_key = HeaderKey::from_string(value);
         assert!(header_key.is_err());
         let error = header_key.unwrap_err();
-        assert_eq!(error.as_code(), IggyError::InvalidHeaderKey.as_code());
+        assert_eq!(error.as_code(), IggyError::InvalidHeaderValue.as_code());
     }
 
     #[test]
     fn header_key_should_not_be_created_for_too_long_value() {
         let value = "a".repeat(256);
-        let header_key = HeaderKey::new(&value);
+        let header_key = HeaderKey::from_string(&value);
         assert!(header_key.is_err());
         let error = header_key.unwrap_err();
-        assert_eq!(error.as_code(), IggyError::InvalidHeaderKey.as_code());
+        assert_eq!(error.as_code(), IggyError::InvalidHeaderValue.as_code());
+    }
+
+    #[test]
+    fn header_key_should_be_created_from_int32() {
+        let value = 12345i32;
+        let header_key = HeaderKey::from_int32(value);
+        assert!(header_key.is_ok());
+        let header_key = header_key.unwrap();
+        assert_eq!(header_key.kind, HeaderKind::Int32);
+        assert_eq!(header_key.as_int32().unwrap(), value);
     }
 
     #[test]
     fn header_value_should_not_be_created_for_empty_value() {
-        let header_value = HeaderValue::from(HeaderKind::Raw, &[]);
+        let header_value = HeaderValue::from_raw(&[]);
         assert!(header_value.is_err());
         let error = header_value.unwrap_err();
         assert_eq!(error.as_code(), IggyError::InvalidHeaderValue.as_code());
@@ -729,7 +705,7 @@ mod tests {
     #[test]
     fn header_value_should_not_be_created_for_too_long_value() {
         let value = b"a".repeat(256);
-        let header_value = HeaderValue::from(HeaderKind::Raw, &value);
+        let header_value = HeaderValue::from_raw(&value);
         assert!(header_value.is_err());
         let error = header_value.unwrap_err();
         assert_eq!(error.as_code(), IggyError::InvalidHeaderValue.as_code());
@@ -1133,102 +1109,102 @@ mod tests {
     }
 
     #[test]
-    fn value_only_to_string_for_string_kind() {
+    fn to_string_value_for_string_kind() {
         let header_value = HeaderValue::from_str("Hello").unwrap();
-        assert_eq!(header_value.value_only_to_string(), "Hello");
+        assert_eq!(header_value.to_string_value(), "Hello");
     }
 
     #[test]
-    fn value_only_to_string_for_bool_kind() {
+    fn to_string_value_for_bool_kind() {
         let header_value = HeaderValue::from_bool(true).unwrap();
-        assert_eq!(header_value.value_only_to_string(), "true");
+        assert_eq!(header_value.to_string_value(), "true");
     }
 
     #[test]
-    fn value_only_to_string_for_int8_kind() {
+    fn to_string_value_for_int8_kind() {
         let header_value = HeaderValue::from_int8(123).unwrap();
-        assert_eq!(header_value.value_only_to_string(), "123");
+        assert_eq!(header_value.to_string_value(), "123");
     }
 
     #[test]
-    fn value_only_to_string_for_int16_kind() {
+    fn to_string_value_for_int16_kind() {
         let header_value = HeaderValue::from_int16(12345).unwrap();
-        assert_eq!(header_value.value_only_to_string(), "12345");
+        assert_eq!(header_value.to_string_value(), "12345");
     }
 
     #[test]
-    fn value_only_to_string_for_int32_kind() {
+    fn to_string_value_for_int32_kind() {
         let header_value = HeaderValue::from_int32(123456).unwrap();
-        assert_eq!(header_value.value_only_to_string(), "123456");
+        assert_eq!(header_value.to_string_value(), "123456");
     }
 
     #[test]
-    fn value_only_to_string_for_int64_kind() {
+    fn to_string_value_for_int64_kind() {
         let header_value = HeaderValue::from_int64(123456789).unwrap();
-        assert_eq!(header_value.value_only_to_string(), "123456789");
+        assert_eq!(header_value.to_string_value(), "123456789");
     }
 
     #[test]
-    fn value_only_to_string_for_int128_kind() {
+    fn to_string_value_for_int128_kind() {
         let header_value = HeaderValue::from_int128(123456789123456789).unwrap();
-        assert_eq!(header_value.value_only_to_string(), "123456789123456789");
+        assert_eq!(header_value.to_string_value(), "123456789123456789");
     }
 
     #[test]
-    fn value_only_to_string_for_uint8_kind() {
+    fn to_string_value_for_uint8_kind() {
         let header_value = HeaderValue::from_uint8(123).unwrap();
-        assert_eq!(header_value.value_only_to_string(), "123");
+        assert_eq!(header_value.to_string_value(), "123");
     }
 
     #[test]
-    fn value_only_to_string_for_uint16_kind() {
+    fn to_string_value_for_uint16_kind() {
         let header_value = HeaderValue::from_uint16(12345).unwrap();
-        assert_eq!(header_value.value_only_to_string(), "12345");
+        assert_eq!(header_value.to_string_value(), "12345");
     }
 
     #[test]
-    fn value_only_to_string_for_uint32_kind() {
+    fn to_string_value_for_uint32_kind() {
         let header_value = HeaderValue::from_uint32(123456).unwrap();
-        assert_eq!(header_value.value_only_to_string(), "123456");
+        assert_eq!(header_value.to_string_value(), "123456");
     }
 
     #[test]
-    fn value_only_to_string_for_uint64_kind() {
+    fn to_string_value_for_uint64_kind() {
         let header_value = HeaderValue::from_uint64(123456789).unwrap();
-        assert_eq!(header_value.value_only_to_string(), "123456789");
+        assert_eq!(header_value.to_string_value(), "123456789");
     }
 
     #[test]
-    fn value_only_to_string_for_uint128_kind() {
+    fn to_string_value_for_uint128_kind() {
         let header_value = HeaderValue::from_uint128(123456789123456789).unwrap();
-        assert_eq!(header_value.value_only_to_string(), "123456789123456789");
+        assert_eq!(header_value.to_string_value(), "123456789123456789");
     }
 
     #[test]
-    fn value_only_to_string_for_float32_kind() {
+    fn to_string_value_for_float32_kind() {
         let header_value = HeaderValue::from_float32(123.01).unwrap();
-        assert_eq!(header_value.value_only_to_string(), "123.01");
+        assert_eq!(header_value.to_string_value(), "123.01");
     }
 
     #[test]
-    fn value_only_to_string_for_float64_kind() {
+    fn to_string_value_for_float64_kind() {
         let header_value = HeaderValue::from_float64(1234.01234).unwrap();
-        assert_eq!(header_value.value_only_to_string(), "1234.01234");
+        assert_eq!(header_value.to_string_value(), "1234.01234");
     }
 
     #[test]
     fn should_be_serialized_as_bytes() {
         let mut headers = HashMap::new();
         headers.insert(
-            HeaderKey::new("key-1").unwrap(),
+            HeaderKey::from_string("key-1").unwrap(),
             HeaderValue::from_str("Value 1").unwrap(),
         );
         headers.insert(
-            HeaderKey::new("key 1").unwrap(),
+            HeaderKey::from_string("key 1").unwrap(),
             HeaderValue::from_uint64(12345).unwrap(),
         );
         headers.insert(
-            HeaderKey::new("key_3").unwrap(),
+            HeaderKey::from_string("key_3").unwrap(),
             HeaderValue::from_bool(true).unwrap(),
         );
 
@@ -1237,22 +1213,31 @@ mod tests {
         let mut position = 0;
         let mut headers_count = 0;
         while position < bytes.len() {
+            let key_kind = HeaderKind::from_code(bytes[position]).unwrap();
+            position += 1;
             let key_length =
                 u32::from_le_bytes(bytes[position..position + 4].try_into().unwrap()) as usize;
             position += 4;
-            let key = String::from_utf8(bytes[position..position + key_length].to_vec()).unwrap();
+            let key_value = bytes[position..position + key_length].to_vec();
             position += key_length;
-            let kind = HeaderKind::from_code(bytes[position]).unwrap();
+
+            let value_kind = HeaderKind::from_code(bytes[position]).unwrap();
             position += 1;
             let value_length =
                 u32::from_le_bytes(bytes[position..position + 4].try_into().unwrap()) as usize;
             position += 4;
             let value = bytes[position..position + value_length].to_vec();
             position += value_length;
-            let header = headers.get(&HeaderKey::new(&key).unwrap());
+
+            let key = HeaderKey {
+                kind: key_kind,
+                value: Bytes::from(key_value),
+                _marker: PhantomData,
+            };
+            let header = headers.get(&key);
             assert!(header.is_some());
             let header = header.unwrap();
-            assert_eq!(header.kind, kind);
+            assert_eq!(header.kind, value_kind);
             assert_eq!(header.value, value);
             headers_count += 1;
         }
@@ -1264,22 +1249,23 @@ mod tests {
     fn should_be_deserialized_from_bytes() {
         let mut headers = HashMap::new();
         headers.insert(
-            HeaderKey::new("key-1").unwrap(),
+            HeaderKey::from_string("key-1").unwrap(),
             HeaderValue::from_str("Value 1").unwrap(),
         );
         headers.insert(
-            HeaderKey::new("key 2").unwrap(),
+            HeaderKey::from_string("key 2").unwrap(),
             HeaderValue::from_uint64(12345).unwrap(),
         );
         headers.insert(
-            HeaderKey::new("key_3").unwrap(),
+            HeaderKey::from_string("key_3").unwrap(),
             HeaderValue::from_bool(true).unwrap(),
         );
 
         let mut bytes = BytesMut::new();
         for (key, value) in &headers {
-            bytes.put_u32_le(key.0.len() as u32);
-            bytes.put_slice(key.0.as_bytes());
+            bytes.put_u8(key.kind.as_code());
+            bytes.put_u32_le(key.value.len() as u32);
+            bytes.put_slice(&key.value);
             bytes.put_u8(value.kind.as_code());
             bytes.put_u32_le(value.value.len() as u32);
             bytes.put_slice(&value.value);
@@ -1293,6 +1279,31 @@ mod tests {
 
         for (key, value) in &headers {
             let deserialized_value = deserialized_headers.get(key);
+            assert!(deserialized_value.is_some());
+            let deserialized_value = deserialized_value.unwrap();
+            assert_eq!(deserialized_value.kind, value.kind);
+            assert_eq!(deserialized_value.value, value.value);
+        }
+    }
+
+    #[test]
+    fn should_serialize_and_deserialize_typed_keys() {
+        let mut headers = HashMap::new();
+        headers.insert(
+            HeaderKey::from_int32(123).unwrap(),
+            HeaderValue::from_str("Value for int key").unwrap(),
+        );
+        headers.insert(
+            HeaderKey::from_uint64(999).unwrap(),
+            HeaderValue::from_bool(true).unwrap(),
+        );
+
+        let bytes = headers.to_bytes();
+        let deserialized = HashMap::<HeaderKey, HeaderValue>::from_bytes(bytes).unwrap();
+
+        assert_eq!(deserialized.len(), headers.len());
+        for (key, value) in &headers {
+            let deserialized_value = deserialized.get(key);
             assert!(deserialized_value.is_some());
             let deserialized_value = deserialized_value.unwrap();
             assert_eq!(deserialized_value.kind, value.kind);
