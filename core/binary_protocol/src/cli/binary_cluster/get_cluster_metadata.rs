@@ -80,20 +80,6 @@ impl CliCommand for GetClusterMetadataCmd {
                 ]);
 
                 cluster_metadata.nodes.iter().for_each(|node| {
-                    let role = match node.role {
-                        ClusterNodeRole::Leader => "Leader",
-                        ClusterNodeRole::Follower => "Follower",
-                    };
-
-                    let status = match node.status {
-                        ClusterNodeStatus::Healthy => "Healthy",
-                        ClusterNodeStatus::Starting => "Starting",
-                        ClusterNodeStatus::Stopping => "Stopping",
-                        ClusterNodeStatus::Unreachable => "Unreachable",
-                        ClusterNodeStatus::Maintenance => "Maintenance",
-                        ClusterNodeStatus::Unknown => "Unknown",
-                    };
-
                     table.add_row(vec![
                         node.name.clone(),
                         node.ip.clone(),
@@ -101,8 +87,8 @@ impl CliCommand for GetClusterMetadataCmd {
                         format!("{}", node.endpoints.quic),
                         format!("{}", node.endpoints.http),
                         format!("{}", node.endpoints.websocket),
-                        role.to_string(),
-                        status.to_string(),
+                        node.role.to_string(),
+                        node.status.to_string(),
                     ]);
                 });
 
@@ -110,20 +96,6 @@ impl CliCommand for GetClusterMetadataCmd {
             }
             GetClusterMetadataOutput::List => {
                 cluster_metadata.nodes.iter().for_each(|node| {
-                    let role = match node.role {
-                        ClusterNodeRole::Leader => "Leader",
-                        ClusterNodeRole::Follower => "Follower",
-                    };
-
-                    let status = match node.status {
-                        ClusterNodeStatus::Healthy => "Healthy",
-                        ClusterNodeStatus::Starting => "Starting",
-                        ClusterNodeStatus::Stopping => "Stopping",
-                        ClusterNodeStatus::Unreachable => "Unreachable",
-                        ClusterNodeStatus::Maintenance => "Maintenance",
-                        ClusterNodeStatus::Unknown => "Unknown",
-                    };
-
                     event!(target: PRINT_TARGET, Level::INFO,
                         "{}|{}|{}|{}|{}|{}|{}|{}",
                         node.name,
@@ -132,8 +104,8 @@ impl CliCommand for GetClusterMetadataCmd {
                         node.endpoints.quic,
                         node.endpoints.http,
                         node.endpoints.websocket,
-                        role,
-                        status
+                        node.role,
+                        node.status
                     );
                 });
             }
