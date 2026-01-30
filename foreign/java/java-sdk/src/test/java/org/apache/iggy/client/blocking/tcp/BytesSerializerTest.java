@@ -22,6 +22,7 @@ package org.apache.iggy.client.blocking.tcp;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import org.apache.iggy.consumergroup.Consumer;
+import org.apache.iggy.exception.IggyInvalidArgumentException;
 import org.apache.iggy.identifier.ConsumerId;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.message.BytesMessageId;
@@ -88,7 +89,8 @@ class BytesSerializerTest {
             var value = BigInteger.valueOf(-1);
 
             // when & then
-            assertThatThrownBy(() -> BytesSerializer.toBytesAsU64(value)).isInstanceOf(IllegalArgumentException.class);
+            assertThatThrownBy(() -> BytesSerializer.toBytesAsU64(value))
+                    .isInstanceOf(IggyInvalidArgumentException.class);
         }
 
         @Test
@@ -99,7 +101,8 @@ class BytesSerializerTest {
             var value = maxU64.add(BigInteger.ONE);
 
             // when & then
-            assertThatThrownBy(() -> BytesSerializer.toBytesAsU64(value)).isInstanceOf(IllegalArgumentException.class);
+            assertThatThrownBy(() -> BytesSerializer.toBytesAsU64(value))
+                    .isInstanceOf(IggyInvalidArgumentException.class);
         }
     }
 
@@ -141,7 +144,8 @@ class BytesSerializerTest {
             var value = BigInteger.valueOf(-1);
 
             // when & then
-            assertThatThrownBy(() -> BytesSerializer.toBytesAsU128(value)).isInstanceOf(IllegalArgumentException.class);
+            assertThatThrownBy(() -> BytesSerializer.toBytesAsU128(value))
+                    .isInstanceOf(IggyInvalidArgumentException.class);
         }
 
         @Test
@@ -153,7 +157,8 @@ class BytesSerializerTest {
             var value = maxU128Value.add(BigInteger.ONE);
 
             // when & then
-            assertThatThrownBy(() -> BytesSerializer.toBytesAsU128(value)).isInstanceOf(IllegalArgumentException.class);
+            assertThatThrownBy(() -> BytesSerializer.toBytesAsU128(value))
+                    .isInstanceOf(IggyInvalidArgumentException.class);
         }
     }
 

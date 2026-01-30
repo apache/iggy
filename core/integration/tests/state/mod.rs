@@ -1,4 +1,5 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
  * regarding copyright ownership.  The ASF licenses this file
@@ -18,10 +19,10 @@
 
 use compio::fs::create_dir;
 use iggy::prelude::{Aes256GcmEncryptor, EncryptorKind};
+use iggy_common::SemanticVersion;
 use server::state::file::FileState;
 use server::streaming::persistence::persister::{FileWithSyncPersister, PersisterKind};
 use server::streaming::utils::file::overwrite;
-use server::versioning::SemanticVersion;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64};

@@ -80,7 +80,7 @@ public final class MultiTenantProducer {
                 .host(hostAndPort.host())
                 .port(hostAndPort.port())
                 .credentials(rootUsername, rootPassword)
-                .build();
+                .buildAndLogin();
 
         log.info("Creating streams and users with permissions for each tenant");
         Map<String, String> streamsWithUsers = new HashMap<>();
@@ -100,7 +100,7 @@ public final class MultiTenantProducer {
                     .host(hostAndPort.host())
                     .port(hostAndPort.port())
                     .credentials(entry.getValue(), PASSWORD)
-                    .build();
+                    .buildAndLogin();
             tenants.add(Tenant.newTenant(tenantId, entry.getKey(), entry.getValue(), client));
             tenantId++;
         }

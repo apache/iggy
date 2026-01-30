@@ -18,17 +18,26 @@
  */
 
 use crate::context::RuntimeContext;
+use crate::manager::status::ConnectorStatus;
 use crate::metrics::ConnectorType;
-use iggy_common::IggyTimestamp;
+use iggy_common::{IggyTimestamp, SemanticVersion};
 use serde::Serialize;
 use std::sync::Arc;
 use sysinfo::System;
 
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+const SEMANTIC_VERSION: SemanticVersion = SemanticVersion::parse_const(VERSION);
+
 #[derive(Debug, Serialize)]
 pub struct ConnectorRuntimeStats {
+    pub connectors_runtime_version: String,
+    pub connectors_runtime_version_semver: Option<u32>,
     pub process_id: u32,
     pub cpu_usage: f32,
+    pub total_cpu_usage: f32,
     pub memory_usage: u64,
+    pub total_memory: u64,
+    pub available_memory: u64,
     pub run_time: u64,
     pub start_time: u64,
     pub sources_total: u32,
@@ -43,7 +52,7 @@ pub struct ConnectorStats {
     pub key: String,
     pub name: String,
     pub connector_type: String,
-    pub status: String,
+    pub status: ConnectorStatus,
     pub enabled: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub messages_produced: Option<u64>,
@@ -59,11 +68,17 @@ pub struct ConnectorStats {
 pub async fn get_runtime_stats(context: &Arc<RuntimeContext>) -> ConnectorRuntimeStats {
     let pid = std::process::id();
 
-    let mut system = System::new();
+    let mut system = System::new_all();
+    system.refresh_cpu_all();
+    system.refresh_memory();
     system.refresh_processes(
         sysinfo::ProcessesToUpdate::Some(&[sysinfo::Pid::from_u32(pid)]),
         true,
     );
+
+    let total_cpu_usage = system.global_cpu_usage();
+    let total_memory = system.total_memory();
+    let available_memory = system.available_memory();
 
     let (cpu_usage, memory_usage) = system
         .process(sysinfo::Pid::from_u32(pid))
@@ -84,7 +99,7 @@ pub async fn get_runtime_stats(context: &Arc<RuntimeContext>) -> ConnectorRuntim
             key: source.key.clone(),
             name: source.name.clone(),
             connector_type: "source".to_owned(),
-            status: source.status.to_string(),
+            status: source.status,
             enabled: source.enabled,
             messages_produced: Some(context.metrics.get_messages_produced(&source.key)),
             messages_sent: Some(context.metrics.get_messages_sent(&source.key)),
@@ -100,7 +115,7 @@ pub async fn get_runtime_stats(context: &Arc<RuntimeContext>) -> ConnectorRuntim
             key: sink.key.clone(),
             name: sink.name.clone(),
             connector_type: "sink".to_owned(),
-            status: sink.status.to_string(),
+            status: sink.status,
             enabled: sink.enabled,
             messages_produced: None,
             messages_sent: None,
@@ -115,9 +130,14 @@ pub async fn get_runtime_stats(context: &Arc<RuntimeContext>) -> ConnectorRuntim
     let run_time = now.saturating_sub(start);
 
     ConnectorRuntimeStats {
+        connectors_runtime_version: VERSION.to_owned(),
+        connectors_runtime_version_semver: SEMANTIC_VERSION.get_numeric_version().ok(),
         process_id: pid,
         cpu_usage,
+        total_cpu_usage,
         memory_usage,
+        total_memory,
+        available_memory,
         run_time,
         start_time: start,
         sources_total,

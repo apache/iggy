@@ -45,6 +45,8 @@ import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 
+import static org.apache.iggy.client.blocking.IntegrationTest.LOCALHOST_IP;
+import static org.apache.iggy.client.blocking.IntegrationTest.TCP_PORT;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
@@ -55,8 +57,6 @@ import static org.assertj.core.api.Assertions.assertThat;
 class AsyncClientIntegrationTest {
     private static final Logger log = LoggerFactory.getLogger(AsyncClientIntegrationTest.class);
 
-    private static final String HOST = "127.0.0.1";
-    private static final int PORT = 8090;
     private static final String USERNAME = "iggy";
     private static final String PASSWORD = "iggy";
 
@@ -69,13 +69,13 @@ class AsyncClientIntegrationTest {
     @BeforeAll
     public static void setup() throws Exception {
         log.info("Setting up async client for integration tests");
-        client = new AsyncIggyTcpClient(HOST, PORT);
+        client = new AsyncIggyTcpClient(LOCALHOST_IP, TCP_PORT);
 
         // Connect and login
         client.connect()
                 .thenCompose(v -> {
                     log.info("Connected to Iggy server");
-                    return client.users().loginAsync(USERNAME, PASSWORD);
+                    return client.users().login(USERNAME, PASSWORD);
                 })
                 .get(5, TimeUnit.SECONDS);
 
@@ -88,7 +88,7 @@ class AsyncClientIntegrationTest {
 
         try {
             // Clean up test stream if it exists
-            client.streams().deleteStreamAsync(StreamId.of(TEST_STREAM)).get(5, TimeUnit.SECONDS);
+            client.streams().deleteStream(StreamId.of(TEST_STREAM)).get(5, TimeUnit.SECONDS);
             log.info("Deleted test stream: {}", TEST_STREAM);
         } catch (RuntimeException e) {
             // Stream may not exist, which is fine
@@ -107,7 +107,7 @@ class AsyncClientIntegrationTest {
     public void testCreateStream() throws Exception {
         log.info("Testing stream creation");
 
-        var streamDetails = client.streams().createStreamAsync(TEST_STREAM).get(5, TimeUnit.SECONDS);
+        var streamDetails = client.streams().createStream(TEST_STREAM).get(5, TimeUnit.SECONDS);
 
         assertThat(streamDetails).isNotNull();
         assertThat(streamDetails.name()).isEqualTo(TEST_STREAM);
@@ -119,8 +119,7 @@ class AsyncClientIntegrationTest {
     public void testGetStream() throws Exception {
         log.info("Testing stream retrieval");
 
-        var streamOpt =
-                client.streams().getStreamAsync(StreamId.of(TEST_STREAM)).get(5, TimeUnit.SECONDS);
+        var streamOpt = client.streams().getStream(StreamId.of(TEST_STREAM)).get(5, TimeUnit.SECONDS);
 
         assertThat(streamOpt).isPresent();
         assertThat(streamOpt.get().name()).isEqualTo(TEST_STREAM);
@@ -133,7 +132,7 @@ class AsyncClientIntegrationTest {
         log.info("Testing topic creation");
 
         var topicDetails = client.topics()
-                .createTopicAsync(
+                .createTopic(
                         StreamId.of(TEST_STREAM),
                         2L, // 2 partitions
                         CompressionAlgorithm.None,
@@ -158,7 +157,7 @@ class AsyncClientIntegrationTest {
         log.info("Testing topic retrieval");
 
         var topicOpt = client.topics()
-                .getTopicAsync(StreamId.of(TEST_STREAM), TopicId.of(TEST_TOPIC))
+                .getTopic(StreamId.of(TEST_STREAM), TopicId.of(TEST_TOPIC))
                 .get(5, TimeUnit.SECONDS);
 
         assertThat(topicOpt).isPresent();
@@ -179,7 +178,7 @@ class AsyncClientIntegrationTest {
 
         // Send messages to partition 1
         client.messages()
-                .sendMessagesAsync(
+                .sendMessages(
                         StreamId.of(TEST_STREAM),
                         TopicId.of(TEST_TOPIC),
                         Partitioning.partitionId(PARTITION_ID),
@@ -197,7 +196,7 @@ class AsyncClientIntegrationTest {
         // Poll messages from partition 1 - Use valid consumer instead of null
         var consumer = Consumer.of(12345L); // Create consumer with ID
         var polledMessages = client.messages()
-                .pollMessagesAsync(
+                .pollMessages(
                         StreamId.of(TEST_STREAM),
                         TopicId.of(TEST_TOPIC),
                         Optional.of(PARTITION_ID),
@@ -244,7 +243,7 @@ class AsyncClientIntegrationTest {
             }
 
             var future = client.messages()
-                    .sendMessagesAsync(
+                    .sendMessages(
                             StreamId.of(TEST_STREAM),
                             TopicId.of(TEST_TOPIC),
                             Partitioning.partitionId(PARTITION_ID),
@@ -259,7 +258,7 @@ class AsyncClientIntegrationTest {
 
         // Poll all messages
         var polledMessages = client.messages()
-                .pollMessagesAsync(
+                .pollMessages(
                         StreamId.of(TEST_STREAM),
                         TopicId.of(TEST_TOPIC),
                         Optional.of(PARTITION_ID),
@@ -284,7 +283,7 @@ class AsyncClientIntegrationTest {
 
         // Update topic with new compression algorithm
         client.topics()
-                .updateTopicAsync(
+                .updateTopic(
                         StreamId.of(TEST_STREAM),
                         TopicId.of(TEST_TOPIC),
                         CompressionAlgorithm.Gzip,
@@ -296,7 +295,7 @@ class AsyncClientIntegrationTest {
 
         // Verify the update
         var updatedTopic = client.topics()
-                .getTopicAsync(StreamId.of(TEST_STREAM), TopicId.of(TEST_TOPIC))
+                .getTopic(StreamId.of(TEST_STREAM), TopicId.of(TEST_TOPIC))
                 .get(5, TimeUnit.SECONDS);
 
         assertThat(updatedTopic).isPresent();
@@ -317,7 +316,7 @@ class AsyncClientIntegrationTest {
         // Create a temporary topic to delete
         String tempTopic = "temp-topic-" + UUID.randomUUID();
         client.topics()
-                .createTopicAsync(
+                .createTopic(
                         StreamId.of(TEST_STREAM),
                         1L,
                         CompressionAlgorithm.None,
@@ -329,12 +328,12 @@ class AsyncClientIntegrationTest {
 
         // Delete the topic
         client.topics()
-                .deleteTopicAsync(StreamId.of(TEST_STREAM), TopicId.of(tempTopic))
+                .deleteTopic(StreamId.of(TEST_STREAM), TopicId.of(tempTopic))
                 .get(5, TimeUnit.SECONDS);
 
         // Verify deletion
         var deletedTopic = client.topics()
-                .getTopicAsync(StreamId.of(TEST_STREAM), TopicId.of(tempTopic))
+                .getTopic(StreamId.of(TEST_STREAM), TopicId.of(tempTopic))
                 .get(5, TimeUnit.SECONDS);
 
         assertThat(deletedTopic).isNotPresent();
@@ -361,7 +360,7 @@ class AsyncClientIntegrationTest {
                         return messages;
                     })
                     .thenCompose(messages -> client.messages()
-                            .sendMessagesAsync(
+                            .sendMessages(
                                     StreamId.of(TEST_STREAM),
                                     TopicId.of(TEST_TOPIC),
                                     Partitioning.partitionId(PARTITION_ID),
@@ -373,7 +372,7 @@ class AsyncClientIntegrationTest {
         for (int i = 0; i < 3; i++) {
             final long consumerId = 10000L + i;
             var future = client.messages()
-                    .pollMessagesAsync(
+                    .pollMessages(
                             StreamId.of(TEST_STREAM),
                             TopicId.of(TEST_TOPIC),
                             Optional.of(PARTITION_ID),

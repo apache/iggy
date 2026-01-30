@@ -49,7 +49,7 @@ public interface MessagesClient {
      * @param autoCommit whether to auto-commit offsets
      * @return CompletableFuture that will complete with the polled messages
      */
-    CompletableFuture<PolledMessages> pollMessagesAsync(
+    CompletableFuture<PolledMessages> pollMessages(
             StreamId streamId,
             TopicId topicId,
             Optional<Long> partitionId,
@@ -70,7 +70,7 @@ public interface MessagesClient {
      * @param autoCommit whether to auto-commit offsets
      * @return CompletableFuture that will complete with the polled messages
      */
-    default CompletableFuture<PolledMessages> pollMessagesAsync(
+    default CompletableFuture<PolledMessages> pollMessages(
             Long streamId,
             Long topicId,
             Optional<Long> partitionId,
@@ -78,7 +78,7 @@ public interface MessagesClient {
             PollingStrategy strategy,
             Long count,
             boolean autoCommit) {
-        return pollMessagesAsync(
+        return pollMessages(
                 StreamId.of(streamId),
                 TopicId.of(topicId),
                 partitionId,
@@ -97,7 +97,7 @@ public interface MessagesClient {
      * @param messages the messages to send
      * @return CompletableFuture that will complete when messages are sent
      */
-    CompletableFuture<Void> sendMessagesAsync(
+    CompletableFuture<Void> sendMessages(
             StreamId streamId, TopicId topicId, Partitioning partitioning, List<Message> messages);
 
     /**
@@ -109,8 +109,8 @@ public interface MessagesClient {
      * @param messages the messages to send
      * @return CompletableFuture that will complete when messages are sent
      */
-    default CompletableFuture<Void> sendMessagesAsync(
+    default CompletableFuture<Void> sendMessages(
             Long streamId, Long topicId, Partitioning partitioning, List<Message> messages) {
-        return sendMessagesAsync(StreamId.of(streamId), TopicId.of(topicId), partitioning, messages);
+        return sendMessages(StreamId.of(streamId), TopicId.of(topicId), partitioning, messages);
     }
 }
