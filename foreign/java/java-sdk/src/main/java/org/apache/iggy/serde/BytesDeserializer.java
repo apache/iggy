@@ -210,11 +210,11 @@ public final class BytesDeserializer {
 
                 var userHeaderValueKindCode = userHeadersBuffer.readUnsignedByte();
                 var userHeaderValueLength = userHeadersBuffer.readUnsignedIntLE();
-                String userHeaderValue = userHeadersBuffer
-                        .readCharSequence(toInt(userHeaderValueLength), StandardCharsets.UTF_8)
-                        .toString();
+                byte[] userHeaderValueBytes = new byte[toInt(userHeaderValueLength)];
+                userHeadersBuffer.readBytes(userHeaderValueBytes);
                 headers.put(
-                        userHeaderKey, new HeaderValue(HeaderKind.fromCode(userHeaderValueKindCode), userHeaderValue));
+                        userHeaderKey,
+                        new HeaderValue(HeaderKind.fromCode(userHeaderValueKindCode), userHeaderValueBytes));
             }
             userHeaders = headers;
         }

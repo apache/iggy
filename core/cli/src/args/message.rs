@@ -120,15 +120,14 @@ pub(crate) struct SendMessagesArgs {
 
 /// Parse Header Key, Kind and Value from the string separated by a ':'
 fn parse_key_val(s: &str) -> Result<(HeaderKey, HeaderValue), IggyError> {
-    let lower = s.to_lowercase();
-    let parts = lower.split(':').collect::<Vec<_>>();
+    let parts = s.splitn(3, ':').collect::<Vec<_>>();
 
     if parts.len() != 3 {
         return Err(IggyError::InvalidFormat);
     }
 
     let key = HeaderKey::from_str(parts[0])?;
-    let kind = HeaderKind::from_str(parts[1])?;
+    let kind = HeaderKind::from_str(&parts[1].to_lowercase())?;
     let value_str = parts[2];
 
     let value = match kind {
@@ -350,5 +349,24 @@ mod tests {
     fn parse_key_val_no_matching_value_should_return_err() {
         let result = parse_key_val("key:uint8:69.42");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_key_val_should_preserve_value_case() {
+        let expected_value = "HelloWorld";
+        let result = parse_key_val(&format!("key:string:{expected_value}"));
+        assert!(result.is_ok());
+        let (_, value) = result.unwrap();
+        assert_eq!(value.as_str().unwrap(), expected_value);
+    }
+
+    #[test]
+    fn parse_key_val_should_preserve_colons_in_value() {
+        let expected_value = "http://example.com:8080";
+        let result = parse_key_val(&format!("url:string:{expected_value}"));
+        assert!(result.is_ok());
+        let (key, value) = result.unwrap();
+        assert_eq!(key, HeaderKey::from_str("url").unwrap());
+        assert_eq!(value.as_str().unwrap(), expected_value);
     }
 }

@@ -278,6 +278,7 @@ export const deserializeHeaderValue = (
  * @param p - Buffer containing serialized headers
  * @param pos - Starting position in the buffer
  * @returns Object with bytes read and deserialized header data
+ * @throws Error if header key or value length is invalid (must be 1-255)
  */
 export const deserializeHeader = (
   p: Buffer,
@@ -285,11 +286,21 @@ export const deserializeHeader = (
 ): ParsedHeaderDeserialized => {
   const _keyKind = p.readUInt8(pos);
   const keyLength = p.readUInt32LE(pos + 1);
+  if (keyLength < 1 || keyLength > 255) {
+    throw new Error(
+      `Invalid header key length: ${keyLength}, must be between 1 and 255`,
+    );
+  }
   const key = p.subarray(pos + 5, pos + 5 + keyLength).toString();
   pos += 5 + keyLength;
 
   const valueKind = p.readUInt8(pos);
   const valueLength = p.readUInt32LE(pos + 1);
+  if (valueLength < 1 || valueLength > 255) {
+    throw new Error(
+      `Invalid header value length: ${valueLength}, must be between 1 and 255`,
+    );
+  }
   const value = deserializeHeaderValue(
     valueKind,
     p.subarray(pos + 5, pos + 5 + valueLength),

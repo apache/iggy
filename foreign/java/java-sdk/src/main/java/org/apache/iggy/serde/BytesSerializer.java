@@ -134,8 +134,8 @@ public final class BytesSerializer {
 
             HeaderValue value = entry.getValue();
             buffer.writeByte(value.kind().asCode());
-            buffer.writeIntLE(value.value().length());
-            buffer.writeBytes(value.value().getBytes());
+            buffer.writeIntLE(value.value().length);
+            buffer.writeBytes(value.value());
         }
         return buffer;
     }

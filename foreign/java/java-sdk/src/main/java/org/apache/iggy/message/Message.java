@@ -113,7 +113,7 @@ public record Message(
         long size = 0L;
         for (Map.Entry<HeaderKey, HeaderValue> entry : userHeaders.entrySet()) {
             byte[] keyBytes = entry.getKey().value();
-            byte[] valueBytes = entry.getValue().value().getBytes();
+            byte[] valueBytes = entry.getValue().value();
             size += 1L + 4L + keyBytes.length + 1L + 4L + valueBytes.length;
         }
         return size;

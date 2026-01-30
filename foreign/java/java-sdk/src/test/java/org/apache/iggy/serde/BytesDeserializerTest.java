@@ -382,8 +382,8 @@ class BytesDeserializerTest {
 
             // then
             assertThat(message.userHeaders()).hasSize(1);
-            assertThat(message.userHeaders().get(HeaderKey.fromString("key")).value())
-                    .isEqualTo("val");
+            assertThat(message.userHeaders().get(HeaderKey.fromString("key")).asRaw())
+                    .isEqualTo("val".getBytes());
         }
 
         @Test

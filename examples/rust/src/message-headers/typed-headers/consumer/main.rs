@@ -59,9 +59,9 @@ fn handle_message(message: &IggyMessage) -> Result<(), Box<dyn Error>> {
         for (key, value) in &headers_map {
             info!(
                 "  key: [kind={}, value={}] -> value: [kind={}, value={}]",
-                key.kind,
+                key.kind(),
                 key.to_string_value(),
-                value.kind,
+                value.kind(),
                 value.to_string_value()
             );
         }

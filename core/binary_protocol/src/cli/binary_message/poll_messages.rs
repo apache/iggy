@@ -88,7 +88,7 @@ impl PollMessagesCmd {
                     match HashMap::<HeaderKey, HeaderValue>::from_bytes(user_headers.clone()) {
                         Ok(headers) => headers
                             .iter()
-                            .map(|(k, v)| (k.clone(), v.kind))
+                            .map(|(k, v)| (k.clone(), v.kind()))
                             .collect::<Vec<_>>(),
                         Err(e) => {
                             tracing::error!("Failed to parse user headers, error: {e}");
@@ -146,7 +146,7 @@ impl PollMessagesCmd {
                             .as_ref()
                             .map(|h| {
                                 h.get(key)
-                                    .filter(|v| v.kind == *kind)
+                                    .filter(|v| v.kind() == *kind)
                                     .map(|v| v.to_string_value())
                                     .unwrap_or_default()
                             })

@@ -146,13 +146,28 @@ pub struct ValueMarker;
 #[serde_as]
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct HeaderField<T> {
-    /// The type of value stored in this header field.
-    pub kind: HeaderKind,
-    /// The raw bytes of the value, encoded according to `kind`.
+    kind: HeaderKind,
     #[serde_as(as = "Base64")]
-    pub value: Bytes,
+    value: Bytes,
     #[serde(skip)]
     _marker: PhantomData<T>,
+}
+
+impl<T> HeaderField<T> {
+    /// Returns the kind of this header field.
+    pub fn kind(&self) -> HeaderKind {
+        self.kind
+    }
+
+    /// Returns a clone of the raw bytes value.
+    pub fn value(&self) -> Bytes {
+        self.value.clone()
+    }
+
+    /// Returns a reference to the raw bytes value.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.value
+    }
 }
 
 /// Indicates the type of value stored in a [`HeaderField`].
@@ -923,14 +938,14 @@ impl BytesSerializable for HashMap<HeaderKey, HeaderValue> {
 
         let mut bytes = BytesMut::new();
         for (key, value) in self {
-            bytes.put_u8(key.kind.as_code());
+            bytes.put_u8(key.kind().as_code());
             #[allow(clippy::cast_possible_truncation)]
-            bytes.put_u32_le(key.value.len() as u32);
-            bytes.put_slice(&key.value);
-            bytes.put_u8(value.kind.as_code());
+            bytes.put_u32_le(key.as_bytes().len() as u32);
+            bytes.put_slice(key.as_bytes());
+            bytes.put_u8(value.kind().as_code());
             #[allow(clippy::cast_possible_truncation)]
-            bytes.put_u32_le(value.value.len() as u32);
-            bytes.put_slice(&value.value);
+            bytes.put_u32_le(value.as_bytes().len() as u32);
+            bytes.put_slice(value.as_bytes());
         }
 
         bytes.freeze()
@@ -1005,16 +1020,8 @@ impl BytesSerializable for HashMap<HeaderKey, HeaderValue> {
             position += value_length;
 
             headers.insert(
-                HeaderKey {
-                    kind: key_kind,
-                    value: Bytes::from(key_value),
-                    _marker: PhantomData,
-                },
-                HeaderValue {
-                    kind: value_kind,
-                    value: Bytes::from(value_value),
-                    _marker: PhantomData,
-                },
+                HeaderKey::new_unchecked(key_kind, &key_value),
+                HeaderValue::new_unchecked(value_kind, &value_value),
             );
         }
 
@@ -1026,7 +1033,7 @@ pub fn get_user_headers_size(headers: &Option<HashMap<HeaderKey, HeaderValue>>) 
     let mut size = 0;
     if let Some(headers) = headers {
         for (key, value) in headers {
-            size += 1 + 4 + key.value.len() as u32 + 1 + 4 + value.value.len() as u32;
+            size += 1 + 4 + key.as_bytes().len() as u32 + 1 + 4 + value.as_bytes().len() as u32;
         }
     }
     Some(size)

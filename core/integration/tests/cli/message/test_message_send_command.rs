@@ -110,7 +110,12 @@ impl TestMessageSendCmd {
                 header
                     .iter()
                     .map(|(k, v)| {
-                        format!("{}:{}:{}", k.to_string_value(), v.kind, v.to_string_value())
+                        format!(
+                            "{}:{}:{}",
+                            k.to_string_value(),
+                            v.kind(),
+                            v.to_string_value()
+                        )
                     })
                     .collect::<Vec<_>>()
                     .join(","),

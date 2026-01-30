@@ -27,7 +27,6 @@ import org.apache.iggy.identifier.ConsumerId;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.message.BytesMessageId;
 import org.apache.iggy.message.HeaderKey;
-import org.apache.iggy.message.HeaderKind;
 import org.apache.iggy.message.HeaderValue;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.MessageHeader;
@@ -459,7 +458,7 @@ class BytesSerializerTest {
         void shouldSerializeSingleHeader() {
             // given
             Map<HeaderKey, HeaderValue> headers = new HashMap<>();
-            headers.put(HeaderKey.fromString("key1"), new HeaderValue(HeaderKind.Raw, "value1"));
+            headers.put(HeaderKey.fromString("key1"), HeaderValue.fromRaw("value1".getBytes()));
 
             // when
             ByteBuf result = BytesSerializer.toBytes(headers);
@@ -481,8 +480,8 @@ class BytesSerializerTest {
         void shouldSerializeMultipleHeaders() {
             // given
             Map<HeaderKey, HeaderValue> headers = new HashMap<>();
-            headers.put(HeaderKey.fromString("k1"), new HeaderValue(HeaderKind.Raw, "v1"));
-            headers.put(HeaderKey.fromString("k2"), new HeaderValue(HeaderKind.String, "v2"));
+            headers.put(HeaderKey.fromString("k1"), HeaderValue.fromRaw("v1".getBytes()));
+            headers.put(HeaderKey.fromString("k2"), HeaderValue.fromString("v2"));
 
             // when
             ByteBuf result = BytesSerializer.toBytes(headers);
@@ -523,7 +522,7 @@ class BytesSerializerTest {
             // given
             var messageId = new BytesMessageId(new byte[16]);
             Map<HeaderKey, HeaderValue> userHeaders = new HashMap<>();
-            userHeaders.put(HeaderKey.fromString("key"), new HeaderValue(HeaderKind.Raw, "val"));
+            userHeaders.put(HeaderKey.fromString("key"), HeaderValue.fromRaw("val".getBytes()));
 
             // Calculate user headers size
             ByteBuf headersBuf = BytesSerializer.toBytes(userHeaders);
