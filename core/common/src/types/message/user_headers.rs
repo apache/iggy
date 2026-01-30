@@ -255,6 +255,17 @@ impl HeaderKind {
             _ => Err(IggyError::InvalidCommand),
         }
     }
+
+    fn expected_size(&self) -> Option<usize> {
+        match self {
+            HeaderKind::Raw | HeaderKind::String => None,
+            HeaderKind::Bool | HeaderKind::Int8 | HeaderKind::Uint8 => Some(1),
+            HeaderKind::Int16 | HeaderKind::Uint16 => Some(2),
+            HeaderKind::Int32 | HeaderKind::Uint32 | HeaderKind::Float32 => Some(4),
+            HeaderKind::Int64 | HeaderKind::Uint64 | HeaderKind::Float64 => Some(8),
+            HeaderKind::Int128 | HeaderKind::Uint128 => Some(16),
+        }
+    }
 }
 
 impl FromStr for HeaderKind {
@@ -343,7 +354,12 @@ impl<T> HeaderField<T> {
         if self.kind != HeaderKind::Bool {
             return Err(IggyError::InvalidHeaderValue);
         }
-        match self.value[0] {
+        let bytes: [u8; 1] = self
+            .value
+            .as_ref()
+            .try_into()
+            .map_err(|_| IggyError::InvalidHeaderValue)?;
+        match bytes[0] {
             0 => Ok(false),
             1 => Ok(true),
             _ => Err(IggyError::InvalidHeaderValue),
@@ -409,7 +425,11 @@ impl<T> HeaderField<T> {
         if self.kind != HeaderKind::Uint8 {
             return Err(IggyError::InvalidHeaderValue);
         }
-        Ok(self.value[0])
+        self.value
+            .as_ref()
+            .try_into()
+            .map(u8::from_le_bytes)
+            .map_err(|_| IggyError::InvalidHeaderValue)
     }
 
     pub fn as_uint16(&self) -> Result<u16, IggyError> {
@@ -482,55 +502,85 @@ impl<T> HeaderField<T> {
         match self.kind {
             HeaderKind::Raw => format!("{:?}", self.value),
             HeaderKind::String => String::from_utf8_lossy(&self.value).to_string(),
-            HeaderKind::Bool => format!("{}", self.value[0] != 0),
-            HeaderKind::Int8 => format!(
-                "{}",
-                i8::from_le_bytes(self.value.as_ref().try_into().unwrap())
-            ),
-            HeaderKind::Int16 => format!(
-                "{}",
-                i16::from_le_bytes(self.value.as_ref().try_into().unwrap())
-            ),
-            HeaderKind::Int32 => format!(
-                "{}",
-                i32::from_le_bytes(self.value.as_ref().try_into().unwrap())
-            ),
-            HeaderKind::Int64 => format!(
-                "{}",
-                i64::from_le_bytes(self.value.as_ref().try_into().unwrap())
-            ),
-            HeaderKind::Int128 => format!(
-                "{}",
-                i128::from_le_bytes(self.value.as_ref().try_into().unwrap())
-            ),
-            HeaderKind::Uint8 => format!(
-                "{}",
-                u8::from_le_bytes(self.value.as_ref().try_into().unwrap())
-            ),
-            HeaderKind::Uint16 => format!(
-                "{}",
-                u16::from_le_bytes(self.value.as_ref().try_into().unwrap())
-            ),
-            HeaderKind::Uint32 => format!(
-                "{}",
-                u32::from_le_bytes(self.value.as_ref().try_into().unwrap())
-            ),
-            HeaderKind::Uint64 => format!(
-                "{}",
-                u64::from_le_bytes(self.value.as_ref().try_into().unwrap())
-            ),
-            HeaderKind::Uint128 => format!(
-                "{}",
-                u128::from_le_bytes(self.value.as_ref().try_into().unwrap())
-            ),
-            HeaderKind::Float32 => format!(
-                "{}",
-                f32::from_le_bytes(self.value.as_ref().try_into().unwrap())
-            ),
-            HeaderKind::Float64 => format!(
-                "{}",
-                f64::from_le_bytes(self.value.as_ref().try_into().unwrap())
-            ),
+            HeaderKind::Bool => {
+                if self.value.is_empty() {
+                    "<malformed bool>".to_string()
+                } else {
+                    format!("{}", self.value[0] != 0)
+                }
+            }
+            HeaderKind::Int8 => self
+                .value
+                .as_ref()
+                .try_into()
+                .map(|b| i8::from_le_bytes(b).to_string())
+                .unwrap_or_else(|_| "<malformed int8>".to_string()),
+            HeaderKind::Int16 => self
+                .value
+                .as_ref()
+                .try_into()
+                .map(|b| i16::from_le_bytes(b).to_string())
+                .unwrap_or_else(|_| "<malformed int16>".to_string()),
+            HeaderKind::Int32 => self
+                .value
+                .as_ref()
+                .try_into()
+                .map(|b| i32::from_le_bytes(b).to_string())
+                .unwrap_or_else(|_| "<malformed int32>".to_string()),
+            HeaderKind::Int64 => self
+                .value
+                .as_ref()
+                .try_into()
+                .map(|b| i64::from_le_bytes(b).to_string())
+                .unwrap_or_else(|_| "<malformed int64>".to_string()),
+            HeaderKind::Int128 => self
+                .value
+                .as_ref()
+                .try_into()
+                .map(|b| i128::from_le_bytes(b).to_string())
+                .unwrap_or_else(|_| "<malformed int128>".to_string()),
+            HeaderKind::Uint8 => self
+                .value
+                .as_ref()
+                .try_into()
+                .map(|b| u8::from_le_bytes(b).to_string())
+                .unwrap_or_else(|_| "<malformed uint8>".to_string()),
+            HeaderKind::Uint16 => self
+                .value
+                .as_ref()
+                .try_into()
+                .map(|b| u16::from_le_bytes(b).to_string())
+                .unwrap_or_else(|_| "<malformed uint16>".to_string()),
+            HeaderKind::Uint32 => self
+                .value
+                .as_ref()
+                .try_into()
+                .map(|b| u32::from_le_bytes(b).to_string())
+                .unwrap_or_else(|_| "<malformed uint32>".to_string()),
+            HeaderKind::Uint64 => self
+                .value
+                .as_ref()
+                .try_into()
+                .map(|b| u64::from_le_bytes(b).to_string())
+                .unwrap_or_else(|_| "<malformed uint64>".to_string()),
+            HeaderKind::Uint128 => self
+                .value
+                .as_ref()
+                .try_into()
+                .map(|b| u128::from_le_bytes(b).to_string())
+                .unwrap_or_else(|_| "<malformed uint128>".to_string()),
+            HeaderKind::Float32 => self
+                .value
+                .as_ref()
+                .try_into()
+                .map(|b| f32::from_le_bytes(b).to_string())
+                .unwrap_or_else(|_| "<malformed float32>".to_string()),
+            HeaderKind::Float64 => self
+                .value
+                .as_ref()
+                .try_into()
+                .map(|b| f64::from_le_bytes(b).to_string())
+                .unwrap_or_else(|_| "<malformed float64>".to_string()),
         }
     }
 
@@ -899,31 +949,58 @@ impl BytesSerializable for HashMap<HeaderKey, HeaderValue> {
         while position < bytes.len() {
             let key_kind = HeaderKind::from_code(bytes[position])?;
             position += 1;
+
+            if position + 4 > bytes.len() {
+                return Err(IggyError::InvalidHeaderKey);
+            }
             let key_length = u32::from_le_bytes(
                 bytes[position..position + 4]
                     .try_into()
                     .map_err(|_| IggyError::InvalidNumberEncoding)?,
             ) as usize;
             if key_length == 0 || key_length > 255 {
-                tracing::error!("Invalid header key length: {key_length}");
                 return Err(IggyError::InvalidHeaderKey);
             }
             position += 4;
+
+            if position + key_length > bytes.len() {
+                return Err(IggyError::InvalidHeaderKey);
+            }
+            if let Some(expected) = key_kind.expected_size()
+                && key_length != expected
+            {
+                return Err(IggyError::InvalidHeaderKey);
+            }
             let key_value = bytes[position..position + key_length].to_vec();
             position += key_length;
 
+            if position >= bytes.len() {
+                return Err(IggyError::InvalidHeaderValue);
+            }
             let value_kind = HeaderKind::from_code(bytes[position])?;
             position += 1;
+
+            if position + 4 > bytes.len() {
+                return Err(IggyError::InvalidHeaderValue);
+            }
             let value_length = u32::from_le_bytes(
                 bytes[position..position + 4]
                     .try_into()
                     .map_err(|_| IggyError::InvalidNumberEncoding)?,
             ) as usize;
             if value_length == 0 || value_length > 255 {
-                tracing::error!("Invalid header value length: {value_length}");
                 return Err(IggyError::InvalidHeaderValue);
             }
             position += 4;
+
+            if position + value_length > bytes.len() {
+                return Err(IggyError::InvalidHeaderValue);
+            }
+            if let Some(expected) = value_kind.expected_size()
+                && value_length != expected
+            {
+                return Err(IggyError::InvalidHeaderValue);
+            }
             let value_value = bytes[position..position + value_length].to_vec();
             position += value_length;
 
@@ -1538,5 +1615,98 @@ mod tests {
         let extracted: i32 = (&header_value).try_into().unwrap();
         assert_eq!(extracted, value);
         assert_eq!(header_value.as_int32().unwrap(), value);
+    }
+
+    #[test]
+    fn to_string_value_handles_malformed_int32() {
+        let field = HeaderField::<ValueMarker> {
+            kind: HeaderKind::Int32,
+            value: Bytes::from(vec![1, 2, 3]), // 3 bytes, needs 4
+            _marker: PhantomData,
+        };
+        assert_eq!(field.to_string_value(), "<malformed int32>");
+    }
+
+    #[test]
+    fn as_bool_returns_error_on_empty_value() {
+        let field = HeaderField::<ValueMarker> {
+            kind: HeaderKind::Bool,
+            value: Bytes::new(),
+            _marker: PhantomData,
+        };
+        assert!(field.as_bool().is_err());
+    }
+
+    #[test]
+    fn as_uint8_returns_error_on_empty_value() {
+        let field = HeaderField::<ValueMarker> {
+            kind: HeaderKind::Uint8,
+            value: Bytes::new(),
+            _marker: PhantomData,
+        };
+        assert!(field.as_uint8().is_err());
+    }
+
+    #[test]
+    fn from_bytes_returns_error_on_truncated_input() {
+        let mut bytes = BytesMut::new();
+        bytes.put_u8(2); // key_kind = String
+        bytes.put_u32_le(100); // key_len = 100 (lie!)
+        bytes.put_slice(b"abc"); // only 3 bytes of key data
+
+        let result = HashMap::<HeaderKey, HeaderValue>::from_bytes(bytes.freeze());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn display_handles_malformed_data() {
+        let field = HeaderField::<ValueMarker> {
+            kind: HeaderKind::Float64,
+            value: Bytes::from(vec![1, 2]), // 2 bytes, needs 8
+            _marker: PhantomData,
+        };
+        let display = format!("{}", field);
+        assert!(display.contains("<malformed float64>"));
+    }
+
+    #[test]
+    fn from_bytes_returns_error_on_wrong_size_for_fixed_type() {
+        let mut bytes = BytesMut::new();
+        // Key: Int32 with correct size
+        bytes.put_u8(6); // key_kind = Int32
+        bytes.put_u32_le(4); // key_len = 4 (correct)
+        bytes.put_slice(&42i32.to_le_bytes());
+        // Value: Int16 with wrong size
+        bytes.put_u8(5); // value_kind = Int16
+        bytes.put_u32_le(4); // value_len = 4 (wrong, should be 2)
+        bytes.put_slice(&[1, 2, 3, 4]);
+
+        let result = HashMap::<HeaderKey, HeaderValue>::from_bytes(bytes.freeze());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn from_bytes_returns_error_on_truncated_value_length() {
+        let mut bytes = BytesMut::new();
+        // Key: String
+        bytes.put_u8(2); // key_kind = String
+        bytes.put_u32_le(3); // key_len = 3
+        bytes.put_slice(b"abc");
+        // Value kind but no length bytes
+        bytes.put_u8(6); // value_kind = Int32
+        // Missing value length bytes
+
+        let result = HashMap::<HeaderKey, HeaderValue>::from_bytes(bytes.freeze());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn to_string_value_handles_empty_bool() {
+        let field = HeaderField::<ValueMarker> {
+            kind: HeaderKind::Bool,
+            value: Bytes::new(),
+            _marker: PhantomData,
+        };
+        assert_eq!(field.to_string_value(), "<malformed bool>");
     }
 }
