@@ -15,7 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-ARG RUST_VERSION=1.92
+ARG RUST_VERSION=1.93
 FROM rust:${RUST_VERSION}
 
 FROM gradle:9.2-jdk17

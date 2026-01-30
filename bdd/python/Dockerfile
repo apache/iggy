@@ -16,7 +16,7 @@
 # under the License.
 
 # syntax=docker/dockerfile:1
-ARG RUST_VERSION=1.92
+ARG RUST_VERSION=1.93
 FROM rust:${RUST_VERSION}-slim-trixie
 
 RUN apt-get update && \
