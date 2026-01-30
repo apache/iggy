@@ -757,10 +757,7 @@ class BytesDeserializerTest {
     class JsonDeserialization {
 
         private static final tools.jackson.databind.ObjectMapper MAPPER =
-                tools.jackson.databind.json.JsonMapper.builder()
-                        .enable(tools.jackson.databind.MapperFeature.ACCEPT_CASE_INSENSITIVE_ENUMS)
-                        .propertyNamingStrategy(tools.jackson.databind.PropertyNamingStrategies.SNAKE_CASE)
-                        .build();
+                org.apache.iggy.client.blocking.http.ObjectMapperFactory.getInstance();
 
         @Test
         void shouldDeserializePolledMessagesWithEmptyUserHeaders() throws Exception {

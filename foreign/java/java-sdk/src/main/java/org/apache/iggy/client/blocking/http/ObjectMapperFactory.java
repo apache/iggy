@@ -29,7 +29,7 @@ import tools.jackson.databind.json.JsonMapper;
 
 import java.util.Map;
 
-final class ObjectMapperFactory {
+public final class ObjectMapperFactory {
 
     private static final ObjectMapper INSTANCE = JsonMapper.builder()
             .enable(MapperFeature.ACCEPT_CASE_INSENSITIVE_ENUMS)
@@ -40,7 +40,7 @@ final class ObjectMapperFactory {
 
     private ObjectMapperFactory() {}
 
-    static ObjectMapper getInstance() {
+    public static ObjectMapper getInstance() {
         return INSTANCE;
     }
 }
