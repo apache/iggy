@@ -81,7 +81,7 @@ async fn assert_test_index_documents_match_message_payloads(
 }
 
 #[tokio::test]
-async fn given_existent_quickwit_index_should_and_store() -> Result<()> {
+async fn given_existent_quickwit_index_should_store() -> Result<()> {
     let quickwit_container = start_quickwit_container().await;
     let test_setup = QuickwitTestSetup::try_new_with_precreate_index(quickwit_container).await?;
 
