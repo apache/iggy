@@ -38,9 +38,9 @@ crate-type = ["cdylib", "lib"]
 async-trait = { workspace = true }
 chrono = { workspace = true }
 dashmap = { workspace = true }
-elasticsearch = { version = "9.1.0-alpha.1", features = ["rustls-tls"], default-features = false }
+elasticsearch = { workspace = true }
 humantime = { workspace = true }
-iggy_connector_sdk = { path = "../../sdk" }
+iggy_connector_sdk = { workspace = true }
 once_cell = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

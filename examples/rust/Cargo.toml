@@ -29,7 +29,7 @@ chrono = { workspace = true }
 clap = { workspace = true }
 futures-util = { workspace = true }
 iggy = { workspace = true }
-lz4_flex = "0.12.0"
+lz4_flex = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

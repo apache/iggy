@@ -29,7 +29,7 @@ readme = "../../../README.md"
 
 [dependencies]
 bit-set = { workspace = true }
-iggy_common = { path = "../common" }
-message_bus = { path = "../message_bus" }
+iggy_common = { workspace = true }
+message_bus = { workspace = true }
 rand = { workspace = true }
 rand_xoshiro = { workspace = true }

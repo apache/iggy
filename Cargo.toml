@@ -56,6 +56,9 @@ exclude = ["foreign/python"]
 resolver = "2"
 
 [workspace.dependencies]
+actix-cors = "0.7.1"
+actix-files = "0.6.9"
+actix-web = "4.12.1"
 aes-gcm = "0.10.3"
 ahash = { version = "0.8.12", features = ["serde"] }
 anyhow = "1.0.100"
@@ -63,6 +66,7 @@ argon2 = "0.5.3"
 arrow = "57.2.0"
 arrow-array = "57.2.0"
 arrow-json = "57.2.0"
+assert_cmd = "2.1.2"
 async-broadcast = "0.7.2"
 async-channel = "2.5.0"
 async-dropper = { version = "0.3.1", features = ["tokio", "simple"] }
@@ -96,6 +100,8 @@ bytes = "1.11.0"
 charming = "0.6.0"
 chrono = { version = "0.4.43", features = ["serde"] }
 clap = { version = "4.5.54", features = ["derive", "wrap_help"] }
+clap_complete = "4.5.65"
+clock = { path = "core/clock" }
 colored = "3.1.1"
 comfy-table = "7.2.2"
 compio = { version = "0.17.0", features = [
@@ -114,8 +120,12 @@ compio-tls = { version = "0.8.0", features = [
 compio-ws = "0.2.0"
 configs = { path = "core/configs", version = "0.1.0" }
 configs_derive = { path = "core/configs_derive", version = "0.1.0" }
+consensus = { path = "core/consensus" }
 console-subscriber = "0.5.0"
 crossbeam = "0.8.4"
+ctor = "0.6.3"
+ctrlc = { version = "3.5", features = ["termination"] }
+cucumber = "0.22"
 cyper = { version = "0.7.1", features = ["rustls"], default-features = false }
 cyper-axum = { version = "0.7.1" }
 darling = "0.20"
@@ -123,18 +133,28 @@ dashmap = "6.1.0"
 derive-new = "0.7.0"
 derive_builder = "0.20.2"
 derive_more = { version = "2.1.1", features = ["full"] }
+dircpy = "0.3.19"
 dirs = "6.0.0"
 dlopen2 = "0.8.2"
 dotenvy = "0.15.7"
+elasticsearch = { version = "9.1.0-alpha.1", features = ["rustls-tls"], default-features = false }
 enum_dispatch = "0.3.13"
 env_logger = "0.11.8"
 err_trail = { version = "0.11.0", features = ["tracing"] }
 error_set = "0.9.1"
 figlet-rs = "0.1.5"
 figment = { version = "0.10.19", features = ["toml", "env"] }
+file-operation = "0.8.17"
+flatbuffers = "25.12.19"
 flume = "0.12.0"
 futures = "0.3.31"
 futures-util = "0.3.31"
+getrandom = { version = "0.3", features = ["wasm_js"] }
+git2 = { version = "0.20.3", default-features = false, features = ["vendored-libgit2"] }
+gloo = "0.11"
+governor = "0.10.4"
+hash32 = "1.0.0"
+hostname = "0.4.2"
 human-repr = "1.1.0"
 humantime = "2.3.0"
 hwlocality = "1.0.0-alpha.11"
@@ -145,15 +165,26 @@ iggy_binary_protocol = { path = "core/binary_protocol", version = "0.8.2-edge.2"
 iggy_common = { path = "core/common", version = "0.8.2-edge.2" }
 iggy_connector_sdk = { path = "core/connectors/sdk", version = "0.1.2-edge.1" }
 integration = { path = "core/integration" }
+journal = { path = "core/journal" }
+js-sys = "0.3"
+jsonwebtoken = { version = "10.2.0", features = ["rust_crypto"] }
 keyring = { version = "3.6.3", features = ["sync-secret-service", "vendored"] }
 lazy_static = "1.5.0"
 left-right = "0.11"
+lending-iterator = "0.1.7"
+libc = "0.2.180"
 log = "0.4.29"
+lz4_flex = "0.12.0"
+message_bus = { path = "core/message_bus" }
 metadata = { path = "core/metadata" }
 mimalloc = "0.1"
+mime_guess = "2.0"
 mockall = "0.14.0"
+moka = { version = "0.12.13", features = ["future"] }
 nix = { version = "0.31.1", features = ["fs", "resource", "sched"] }
 nonzero_lit = "0.1.2"
+notify = "8.2.0"
+octocrab = "0.49.5"
 once_cell = "1.21.3"
 opentelemetry = { version = "0.31.0", features = ["trace", "logs"] }
 opentelemetry-appender-tracing = { version = "0.31.1", features = ["log"] }
@@ -173,17 +204,26 @@ opentelemetry_sdk = { version = "0.31.0", features = [
     "experimental_logs_batch_log_processor_with_async_runtime",
     "experimental_trace_batch_span_processor_with_async_runtime",
 ] }
+papaya = "0.2.3"
 parquet = "57.2.0"
+partitions = { path = "core/partitions" }
 
 passterm = "=2.0.1"
+paste = "1.0"
 postcard = { version = "1.1.3", features = ["alloc"] }
 predicates = "3.1.3"
 proc-macro2 = "1"
 prometheus-client = "0.24.0"
+prost = "0.14.3"
+prost-types = "0.14.3"
+protox = "0.9.1"
+protox-parse = "0.9.0"
 quinn = "0.11.9"
 quote = "1"
 rand = "0.9.2"
 rand_xoshiro = "0.7.0"
+rayon = "1.11.0"
+rcgen = "0.14.7"
 regex = "1.12.2"
 reqwest = { version = "=0.12.28", default-features = false, features = [
     "json",
@@ -192,12 +232,18 @@ reqwest = { version = "=0.12.28", default-features = false, features = [
 reqwest-middleware = { version = "=0.4.2", features = ["json"] }
 reqwest-retry = "=0.8.0"
 reqwest-tracing = "=0.5.8"
+ring = "0.17.14"
+ringbuffer = "0.16.0"
+rmcp = "0.14.0"
 rmp-serde = "1.3.1"
+rust-embed = "8.11.0"
 rust-s3 = { version = "0.37.1", default-features = false, features = [
     "tokio-rustls-tls",
     "tags",
 ] }
 rustls = { version = "0.23.36", features = ["ring"] }
+rustls-pemfile = "2.2.0"
+send_wrapper = "0.6.0"
 serde = { version = "1.0.228", features = ["derive", "rc"] }
 serde_json = "1.0.149"
 serde_with = { version = "3.16.1", features = ["base64", "macros"] }
@@ -206,12 +252,22 @@ serial_test = "3.3.1"
 server = { path = "core/server" }
 simd-json = { version = "0.17.0", features = ["serde_impl"] }
 slab = "0.4.11"
+socket2 = "0.6.2"
+sqlx = { version = "0.8.6", features = [
+    "runtime-tokio-rustls",
+    "postgres",
+    "chrono",
+    "uuid",
+    "json",
+] }
+static-toml = "1.3.0"
 strum = { version = "0.27.2", features = ["derive"] }
 strum_macros = "0.27.2"
 syn = { version = "2", features = ["full", "extra-traits"] }
 sysinfo = "0.38.0"
 tempfile = "3.24.0"
 test-case = "3.3.1"
+testcontainers-modules = { version = "0.14.0", features = ["postgres"] }
 thiserror = "2.0.18"
 tokio = { version = "1.49.0", features = ["full"] }
 tokio-rustls = "0.26.4"
@@ -234,6 +290,7 @@ tracing-subscriber = { version = "0.3.22", default-features = false, features = 
 trait-variant = "0.1.2"
 tungstenite = "0.28.0"
 twox-hash = { version = "2.1.2", features = ["xxhash32"] }
+ulid = "1.2.1"
 uuid = { version = "1.20.0", features = [
     "v4",
     "v7",
@@ -241,16 +298,33 @@ uuid = { version = "1.20.0", features = [
     "serde",
     "zerocopy",
 ] }
+vergen-git2 = { version = "9.1.0", features = ["build", "cargo", "rustc", "si"] }
+walkdir = "2.5.0"
+wasm-bindgen = "0.2"
+web-sys = { version = "0.3", features = [
+    "Window",
+    "Location",
+    "HtmlSelectElement",
+    "Clipboard",
+    "Navigator",
+    "ResizeObserver",
+    "ResizeObserverEntry",
+] }
 webpki-roots = "1.0.5"
+yew = { version = "0.22", features = ["csr"] }
+yew-router = "0.19"
 zip = { version = "7.2.0", default-features = false, features = ["deflate"] }
 
 [profile.release]
 lto = true
 codegen-units = 1
 
-# [profile.dev]
-# opt-level = 1
-
+# Selectively optimize CPU-intensive dependencies in dev profile:
+# - argon2: password hashing
+# - twox-hash: checksum calculation
+# - rand_chacha: random number generation
+# - iggy_common: wrapper functions for above
+# This is faster than global opt-level=1 which adds significant compile time.
 [profile.dev.package.argon2]
 opt-level = 3
 

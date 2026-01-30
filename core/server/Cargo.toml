@@ -54,7 +54,7 @@ compio-quic = { workspace = true }
 compio-tls = { workspace = true }
 compio-ws = { workspace = true }
 configs = { workspace = true }
-ctrlc = { version = "3.5", features = ["termination"] }
+ctrlc = { workspace = true }
 cyper = { workspace = true }
 cyper-axum = { workspace = true }
 dashmap = { workspace = true }
@@ -67,37 +67,37 @@ figlet-rs = { workspace = true }
 figment = { workspace = true }
 flume = { workspace = true }
 futures = { workspace = true }
-hash32 = "1.0.0"
+hash32 = { workspace = true }
 human-repr = { workspace = true }
 iggy_common = { workspace = true }
-jsonwebtoken = { version = "10.2.0", features = ["rust_crypto"] }
+jsonwebtoken = { workspace = true }
 left-right = { workspace = true }
-lending-iterator = "0.1.7"
+lending-iterator = { workspace = true }
 metadata = { workspace = true }
 mimalloc = { workspace = true, optional = true }
-mime_guess = { version = "2.0", optional = true }
-moka = { version = "0.12.13", features = ["future"] }
+mime_guess = { workspace = true, optional = true }
+moka = { workspace = true }
 nix = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry-appender-tracing = { workspace = true }
 opentelemetry-otlp = { workspace = true }
 opentelemetry-semantic-conventions = { workspace = true }
 opentelemetry_sdk = { workspace = true }
-papaya = "0.2.3"
+papaya = { workspace = true }
 prometheus-client = { workspace = true }
 rand = { workspace = true }
 reqwest = { workspace = true, features = ["rustls-tls-no-provider"] }
-ringbuffer = "0.16.0"
+ringbuffer = { workspace = true }
 rmp-serde = { workspace = true }
-rust-embed = { version = "8.11.0", optional = true }
+rust-embed = { workspace = true, optional = true }
 rustls = { workspace = true }
-rustls-pemfile = "2.2.0"
-send_wrapper = "0.6.0"
+rustls-pemfile = { workspace = true }
+send_wrapper = { workspace = true }
 serde = { workspace = true }
 serde_with = { workspace = true }
 slab = { workspace = true }
-socket2 = "0.6.2"
-static-toml = "1.3.0"
+socket2 = { workspace = true }
+static-toml = { workspace = true }
 strum = { workspace = true }
 sysinfo = { workspace = true }
 tempfile = { workspace = true }
@@ -110,7 +110,7 @@ tracing-appender = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 tracing-subscriber = { workspace = true }
 tungstenite = { workspace = true }
-ulid = "1.2.1"
+ulid = { workspace = true }
 uuid = { workspace = true }
 
 [target.'cfg(not(target_env = "musl"))'.dependencies]
@@ -120,10 +120,5 @@ hwlocality = { workspace = true }
 hwlocality = { workspace = true, features = ["vendored"] }
 
 [build-dependencies]
-figment = { version = "0.10.19", features = ["json", "toml", "env"] }
-vergen-git2 = { version = "9.1.0", features = [
-    "build",
-    "cargo",
-    "rustc",
-    "si",
-] }
+figment = { workspace = true, features = ["json", "toml", "env"] }
+vergen-git2 = { workspace = true }

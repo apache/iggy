@@ -39,13 +39,13 @@ chrono = { workspace = true }
 clap = { workspace = true }
 figlet-rs = { workspace = true }
 futures-util = { workspace = true }
-governor = "0.10.4"
-hostname = "0.4.2"
+governor = { workspace = true }
+hostname = { workspace = true }
 human-repr = { workspace = true }
 iggy = { workspace = true }
 nonzero_lit = { workspace = true }
 rand = { workspace = true }
-rayon = "1.11.0"
+rayon = { workspace = true }
 serde = { workspace = true }
 sysinfo = { workspace = true }
 tokio = { workspace = true }

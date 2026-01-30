@@ -33,17 +33,17 @@ ignored = ["prost"]
 
 [dependencies]
 async-trait = { workspace = true }
-base64 = "0.22.1"
+base64 = { workspace = true }
 chrono = { workspace = true }
 dashmap = { workspace = true }
-flatbuffers = "25.12.19"
+flatbuffers = { workspace = true }
 iggy = { workspace = true }
 once_cell = { workspace = true }
 postcard = { workspace = true }
-prost = "0.14.3"
-prost-types = "0.14.3"
-protox = "0.9.1"
-protox-parse = "0.9.0"
+prost = { workspace = true }
+prost-types = { workspace = true }
+protox = { workspace = true }
+protox-parse = { workspace = true }
 regex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
