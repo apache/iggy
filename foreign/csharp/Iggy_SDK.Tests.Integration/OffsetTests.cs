@@ -89,7 +89,7 @@ public class OffsetTests
     }
 
     [Test]
-    [DependsOn(nameof(StoreOffset_ConsumerGroup_Should_StoreOffset_Successfully))]
+    [DependsOn(nameof(GetOffset_ConsumerGroup_Should_GetOffset_Successfully))]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task GetOffset_ConsumerGroup_ByName_Should_GetOffset_Successfully(Protocol protocol)
     {
