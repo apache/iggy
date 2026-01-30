@@ -53,8 +53,7 @@ pub enum PollingConsumer {
 
 /// Result of appending messages during the prepare phase.
 ///
-/// Returned by `PartitionStorage::append_prepared` to indicate the
-/// offset range assigned to the appended messages.
+/// Indicates the offset range assigned to the appended messages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AppendResult {
     /// First offset assigned to the batch.
