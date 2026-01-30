@@ -28,6 +28,7 @@ namespace Apache.Iggy.Tests.Integrations.Fixtures;
 
 public class IggyServerFixture : IAsyncInitializer, IAsyncDisposable
 {
+    private readonly string _containerId = Guid.NewGuid().ToString();
     protected IContainer? IggyContainer;
 
     /// <summary>
@@ -51,21 +52,27 @@ public class IggyServerFixture : IAsyncInitializer, IAsyncDisposable
     /// <summary>
     ///     Enables iggy server trace logs.
     /// </summary>
-    protected bool EnabledServerTraceLogs => false;
+    protected bool EnabledServerTraceLogs => true;
 
     /// <summary>
     ///     Resource mappings (volumes, etc.) for the container. Override in subclasses to add custom mappings.
     /// </summary>
     protected virtual ResourceMapping[] ResourceMappings => [];
 
+    /// <summary>
+    ///     Directory for container log files. Set via IGGY_TEST_LOGS_DIR environment variable.
+    ///     If not set, container logs will not be saved to file.
+    /// </summary>
+    private static string? LogDirectory =>
+        Environment.GetEnvironmentVariable("IGGY_TEST_LOGS_DIR");
+
     public IggyServerFixture()
     {
         var builder = new ContainerBuilder(DockerImage)
             .WithPortBinding(3000, true)
             .WithPortBinding(8090, true)
-            .WithOutputConsumer(Consume.RedirectStdoutAndStderrToConsole())
             .WithWaitStrategy(Wait.ForUnixContainer().UntilInternalTcpPortIsAvailable(8090))
-            .WithName($"{Guid.NewGuid()}")
+            .WithName(_containerId)
             .WithPrivileged(true)
             .WithCleanUp(true);
 
@@ -79,7 +86,6 @@ public class IggyServerFixture : IAsyncInitializer, IAsyncDisposable
             builder = builder
                 .WithEnvironment("IGGY_SYSTEM_LOGGING_LEVEL", "trace")
                 .WithEnvironment("RUST_LOG", "trace");
-
         }
 
         foreach (var mapping in ResourceMappings)
@@ -97,6 +103,7 @@ public class IggyServerFixture : IAsyncInitializer, IAsyncDisposable
             return;
         }
 
+        await SaveContainerLogsAsync();
         await IggyContainer.StopAsync();
     }
 
@@ -106,6 +113,40 @@ public class IggyServerFixture : IAsyncInitializer, IAsyncDisposable
 
         await CreateTcpClient();
         await CreateHttpClient();
+    }
+
+    private async Task SaveContainerLogsAsync()
+    {
+        if (string.IsNullOrEmpty(LogDirectory))
+        {
+            return;
+        }
+
+        try
+        {
+            Directory.CreateDirectory(LogDirectory);
+            var dotnetVersion = $"net{Environment.Version.Major}.{Environment.Version.Minor}";
+            var logFilePath = Path.Combine(LogDirectory, $"iggy-server-{dotnetVersion}-{_containerId}.log");
+
+            var (stdout, stderr) = await IggyContainer!.GetLogsAsync();
+
+            await using var writer = new StreamWriter(logFilePath);
+            if (!string.IsNullOrEmpty(stdout))
+            {
+                await writer.WriteLineAsync("=== STDOUT ===");
+                await writer.WriteLineAsync(stdout);
+            }
+
+            if (!string.IsNullOrEmpty(stderr))
+            {
+                await writer.WriteLineAsync("=== STDERR ===");
+                await writer.WriteLineAsync(stderr);
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Failed to save container logs: {ex.Message}");
+        }
     }
 
     public async Task<Dictionary<Protocol, IIggyClient>> CreateClients()
