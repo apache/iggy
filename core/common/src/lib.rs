@@ -45,7 +45,6 @@ pub use commands::system::get_cluster_metadata::*;
 pub use commands::system::*;
 pub use commands::topics::*;
 pub use commands::users::*;
-pub use configs_derive::ConfigEnv;
 pub use sender::{
     QuicSender, Sender, SenderKind, TcpSender, TcpTlsSender, WebSocketSender, WebSocketTlsSender,
 };

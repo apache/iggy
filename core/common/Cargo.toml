@@ -48,7 +48,6 @@ compio = { workspace = true }
 compio-quic = { workspace = true }
 compio-tls = { workspace = true }
 compio-ws = { workspace = true }
-configs_derive = { workspace = true }
 crossbeam = { workspace = true }
 derive_more = { workspace = true }
 err_trail = { workspace = true }

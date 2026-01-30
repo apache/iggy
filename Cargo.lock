@@ -4658,7 +4658,6 @@ dependencies = [
  "compio-quic",
  "compio-tls",
  "compio-ws",
- "configs_derive",
  "crossbeam",
  "derive_more",
  "err_trail",

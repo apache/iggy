@@ -16,7 +16,7 @@
  * under the License.
  */
 
-use iggy_common::ConfigEnv;
+use configs::ConfigEnv;
 use iggy_common::IggyByteSize;
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
