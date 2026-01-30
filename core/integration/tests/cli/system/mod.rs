@@ -22,6 +22,7 @@
 mod test_cli_session_scenario;
 #[cfg(not(any(target_os = "macos", target_env = "musl")))]
 mod test_login_cmd;
+mod test_cluster_metadata_command;
 mod test_login_command;
 #[cfg(not(any(target_os = "macos", target_env = "musl")))]
 mod test_logout_cmd;
