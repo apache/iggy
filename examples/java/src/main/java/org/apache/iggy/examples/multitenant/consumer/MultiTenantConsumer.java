@@ -80,7 +80,7 @@ public final class MultiTenantConsumer {
                 .host(hostAndPort.host())
                 .port(hostAndPort.port())
                 .credentials(ROOT_USERNAME, ROOT_PASSWORD)
-                .build();
+                .buildAndLogin();
 
         log.info("Creating users with topic permissions for each tenant");
         Map<String, String> streamsWithUsers = new HashMap<>();
@@ -100,7 +100,7 @@ public final class MultiTenantConsumer {
                     .host(hostAndPort.host())
                     .port(hostAndPort.port())
                     .credentials(entry.getValue(), PASSWORD)
-                    .build();
+                    .buildAndLogin();
             tenants.add(Tenant.newTenant(tenantId, entry.getKey(), entry.getValue(), client));
             tenantId++;
         }

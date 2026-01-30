@@ -19,6 +19,8 @@
 
 package org.apache.iggy.message;
 
+import org.apache.iggy.exception.IggyInvalidArgumentException;
+
 public enum MessageState {
     Available(1),
     Unavailable(10),
@@ -37,6 +39,6 @@ public enum MessageState {
                 return state;
             }
         }
-        throw new IllegalArgumentException("Unknown message state code: " + code);
+        throw new IggyInvalidArgumentException("Unknown message state code: " + code);
     }
 }

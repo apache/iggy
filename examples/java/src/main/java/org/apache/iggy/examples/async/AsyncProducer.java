@@ -71,7 +71,7 @@ public class AsyncProducer {
         return client.connect()
                 .thenCompose(v -> {
                     log.info("Connected to Iggy server at {}:{}", HOST, PORT);
-                    return client.users().loginAsync(USERNAME, PASSWORD);
+                    return client.users().login(USERNAME, PASSWORD);
                 })
                 .thenCompose(v -> {
                     log.info("Logged in successfully as user: {}", USERNAME);
@@ -94,12 +94,12 @@ public class AsyncProducer {
         log.info("Checking stream: {}", STREAM_NAME);
 
         return client.streams()
-                .getStreamAsync(StreamId.of(STREAM_NAME))
+                .getStream(StreamId.of(STREAM_NAME))
                 .thenCompose(stream -> {
                     if (stream.isEmpty()) {
                         log.info("Creating stream: {}", STREAM_NAME);
                         return client.streams()
-                                .createStreamAsync(STREAM_NAME)
+                                .createStream(STREAM_NAME)
                                 .thenAccept(created -> log.info("Stream created: {}", created.name()));
                     } else {
                         log.info("Stream exists: {}", STREAM_NAME);
@@ -108,13 +108,13 @@ public class AsyncProducer {
                 })
                 .thenCompose(v -> {
                     log.info("Checking topic: {}", TOPIC_NAME);
-                    return client.topics().getTopicAsync(StreamId.of(STREAM_NAME), TopicId.of(TOPIC_NAME));
+                    return client.topics().getTopic(StreamId.of(STREAM_NAME), TopicId.of(TOPIC_NAME));
                 })
                 .thenCompose(topic -> {
                     if (topic.isEmpty()) {
                         log.info("Creating topic: {}", TOPIC_NAME);
                         return client.topics()
-                                .createTopicAsync(
+                                .createTopic(
                                         StreamId.of(STREAM_NAME),
                                         1L, // 1 partition
                                         CompressionAlgorithm.None,
@@ -180,7 +180,7 @@ public class AsyncProducer {
 
         // Send message using async client
         return client.messages()
-                .sendMessagesAsync(StreamId.of(STREAM_NAME), TopicId.of(TOPIC_NAME), partitioning, List.of(message));
+                .sendMessages(StreamId.of(STREAM_NAME), TopicId.of(TOPIC_NAME), partitioning, List.of(message));
     }
 
     public CompletableFuture<Void> stop() {

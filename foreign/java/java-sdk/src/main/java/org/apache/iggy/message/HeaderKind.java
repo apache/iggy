@@ -20,6 +20,7 @@
 package org.apache.iggy.message;
 
 import com.fasterxml.jackson.annotation.JsonProperty;
+import org.apache.iggy.exception.IggyInvalidArgumentException;
 
 public enum HeaderKind {
     @JsonProperty("raw")
@@ -65,7 +66,7 @@ public enum HeaderKind {
                 return kind;
             }
         }
-        throw new IllegalArgumentException("Unknown header kind: " + code);
+        throw new IggyInvalidArgumentException("Unknown header kind: " + code);
     }
 
     public int asCode() {

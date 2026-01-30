@@ -58,9 +58,8 @@ class SendTextDataTest {
                 .host(IGGY_SERVER_HOST)
                 .port(IGGY_SERVER_TCP_PORT)
                 .credentials(USERNAME, PASSWORD)
-                .build();
-
-        client.connect().join();
+                .buildAndLogin()
+                .join();
         log.info("Connected to Iggy server at {}:{}", IGGY_SERVER_HOST, IGGY_SERVER_TCP_PORT);
     }
 
@@ -68,7 +67,7 @@ class SendTextDataTest {
     void tearDown() {
         if (client != null) {
             try {
-                client.users().logoutAsync().join();
+                client.users().logout().join();
                 log.info("Logged out successfully");
             } catch (RuntimeException e) {
                 log.warn("Error during logout: {}", e.getMessage());
@@ -109,7 +108,7 @@ class SendTextDataTest {
         }
 
         client.messages()
-                .sendMessagesAsync(streamId, topicId, Partitioning.balanced(), messages)
+                .sendMessages(streamId, topicId, Partitioning.balanced(), messages)
                 .get();
 
         log.info("Successfully sent {} text lines to stream 'text-input', topic 'lines'", messages.size());
@@ -124,7 +123,7 @@ class SendTextDataTest {
             }
 
             client.messages()
-                    .sendMessagesAsync(streamId, topicId, Partitioning.balanced(), batchMessages)
+                    .sendMessages(streamId, topicId, Partitioning.balanced(), batchMessages)
                     .get();
 
             log.info("Sent batch {} with {} messages", batch, batchMessages.size());
