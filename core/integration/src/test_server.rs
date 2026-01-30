@@ -295,7 +295,7 @@ impl TestServer {
                     .and_then(|p| fs::read_to_string(p).ok())
                     .unwrap_or_else(|| "[No stderr log]".to_string());
 
-                eprintln!(
+                panic!(
                     "\n\n=== SERVER CRASHED ===\n\
                      The iggy-server process (PID {}) has died unexpectedly!\n\
                      This usually indicates a bug in the server.\n\n\
@@ -303,7 +303,6 @@ impl TestServer {
                      === STDERR ===\n{}\n",
                     pid, stdout_content, stderr_content
                 );
-                std::process::abort();
             }
 
             thread::sleep(CHECK_INTERVAL);

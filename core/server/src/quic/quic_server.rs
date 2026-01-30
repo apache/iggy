@@ -23,7 +23,7 @@ use crate::shard::IggyShard;
 use crate::shard::task_registry::ShutdownToken;
 use crate::shard::transmission::event::ShardEvent;
 use anyhow::Result;
-use compio_quic::{
+use compio::quic::{
     Endpoint, EndpointConfig, IdleTimeout, ServerBuilder, ServerConfig, TransportConfig, VarInt,
 };
 use err_trail::ErrContext;
@@ -97,7 +97,7 @@ pub async fn spawn_quic_server(
     })?;
 
     let std_socket: std::net::UdpSocket = socket.into();
-    let socket = compio_net::UdpSocket::from_std(std_socket).map_err(|e| {
+    let socket = compio::net::UdpSocket::from_std(std_socket).map_err(|e| {
         error!("Failed to convert std socket to compio socket: {:?}", e);
         iggy_common::IggyError::QuicError
     })?;
