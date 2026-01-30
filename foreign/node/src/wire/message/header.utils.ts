@@ -49,8 +49,13 @@ import {
   type HeaderValueDouble,
   type HeaderKindId,
   type HeaderKindValue,
+  type HeaderKey,
+  type HeaderKeyRaw,
+  type HeaderKeyString,
+  type HeaderKeyInt32,
   HeaderKind,
   ReverseHeaderKind,
+  expectedSize,
 } from "./header.type.js";
 
 /**
@@ -73,10 +78,14 @@ export type HeaderValue =
   | HeaderValueFloat
   | HeaderValueDouble;
 
-/**
- * Map of header names to header values.
- */
-export type Headers = Record<string, HeaderValue>;
+/** Header entry with key and value */
+export type HeaderEntry = {
+  key: HeaderKey;
+  value: HeaderValue;
+};
+
+/** Array of header entries */
+export type Headers = HeaderEntry[];
 
 /**
  * Internal representation of a header value in binary format.
@@ -131,17 +140,35 @@ export const serializeHeaderValue = (header: HeaderValue) => {
 };
 
 /**
+ * Serializes a header key to a Buffer based on its kind.
+ *
+ * @param key - Header key to serialize
+ * @returns Serialized key as Buffer
+ */
+export const serializeHeaderKey = (key: HeaderKey): Buffer => {
+  const { kind, value } = key;
+  switch (kind) {
+    case HeaderKind.Raw:
+      return value;
+    case HeaderKind.String:
+      return Buffer.from(value);
+    case HeaderKind.Int32:
+      return int32ToBuf(value);
+  }
+};
+
+/**
  * Serializes a single header key-value pair to wire format.
  * Format: [key_kind][key_length][key][value_kind][value_length][value]
  *
- * @param key - Header key name
+ * @param key - Header key
  * @param v - Binary header value
  * @returns Serialized header as Buffer
  */
-export const serializeHeader = (key: string, v: BinaryHeaderValue) => {
-  const bKey = Buffer.from(key);
+export const serializeHeader = (key: HeaderKey, v: BinaryHeaderValue) => {
+  const bKey = serializeHeaderKey(key);
   const keyHeader = Buffer.alloc(5);
-  keyHeader.writeUInt8(HeaderKind.String);
+  keyHeader.writeUInt8(key.kind);
   keyHeader.writeUInt32LE(bKey.length, 1);
 
   const valueHeader = Buffer.alloc(5);
@@ -168,15 +195,15 @@ const createHeaderValue = (header: HeaderValue): BinaryHeaderValue => ({
 /**
  * Serializes all headers to a single buffer.
  *
- * @param headers - Optional headers map
+ * @param headers - Optional headers array
  * @returns Serialized headers buffer (empty if no headers)
  */
 export const serializeHeaders = (headers?: Headers) => {
-  if (!headers) return EMPTY_HEADERS;
+  if (!headers || headers.length === 0) return EMPTY_HEADERS;
 
   return Buffer.concat(
-    Object.keys(headers).map((c: string) =>
-      serializeHeader(c, createHeaderValue(headers[c])),
+    headers.map((entry) =>
+      serializeHeader(entry.key, createHeaderValue(entry.value)),
     ),
   );
 };
@@ -186,21 +213,23 @@ export const serializeHeaders = (headers?: Headers) => {
 /** Possible JavaScript types for deserialized header values */
 export type ParsedHeaderValue = boolean | string | number | bigint | Buffer;
 
-/**
- * Deserialized header with kind and value.
- */
-export type ParsedHeader = {
-  /** Header kind identifier */
-  kind: ParsedHeaderValue;
-  /** Deserialized value */
+/** Deserialized header key with kind and value */
+export type ParsedHeaderKey = {
+  kind: number;
   value: ParsedHeaderValue;
 };
 
-/** Header with its key included */
-type HeaderWithKey = ParsedHeader & { key: string };
+/** Deserialized header value with kind and value */
+export type ParsedHeaderVal = {
+  kind: number;
+  value: ParsedHeaderValue;
+};
 
-/** Map of header keys to parsed headers */
-export type HeadersMap = Record<string, ParsedHeader>;
+/** Deserialized header entry */
+export type ParsedHeaderEntry = {
+  key: ParsedHeaderKey;
+  value: ParsedHeaderVal;
+};
 
 /**
  * Result of deserializing a single header.
@@ -208,8 +237,8 @@ export type HeadersMap = Record<string, ParsedHeader>;
 type ParsedHeaderDeserialized = {
   /** Number of bytes consumed */
   bytesRead: number;
-  /** Deserialized header data with key */
-  data: HeaderWithKey;
+  /** Deserialized header entry */
+  data: ParsedHeaderEntry;
 };
 
 /**
@@ -284,14 +313,23 @@ export const deserializeHeader = (
   p: Buffer,
   pos = 0,
 ): ParsedHeaderDeserialized => {
-  const _keyKind = p.readUInt8(pos);
+  const keyKind = p.readUInt8(pos);
   const keyLength = p.readUInt32LE(pos + 1);
   if (keyLength < 1 || keyLength > 255) {
     throw new Error(
       `Invalid header key length: ${keyLength}, must be between 1 and 255`,
     );
   }
-  const key = p.subarray(pos + 5, pos + 5 + keyLength).toString();
+  const keyExpected = expectedSize(keyKind);
+  if (keyExpected !== -1 && keyLength !== keyExpected) {
+    throw new Error(
+      `Invalid header key size for kind ${keyKind}: expected ${keyExpected}, got ${keyLength}`,
+    );
+  }
+  const keyValue = deserializeHeaderValue(
+    keyKind,
+    p.subarray(pos + 5, pos + 5 + keyLength),
+  );
   pos += 5 + keyLength;
 
   const valueKind = p.readUInt8(pos);
@@ -299,6 +337,12 @@ export const deserializeHeader = (
   if (valueLength < 1 || valueLength > 255) {
     throw new Error(
       `Invalid header value length: ${valueLength}, must be between 1 and 255`,
+    );
+  }
+  const valueExpected = expectedSize(valueKind);
+  if (valueExpected !== -1 && valueLength !== valueExpected) {
+    throw new Error(
+      `Invalid header value size for kind ${valueKind}: expected ${valueExpected}, got ${valueLength}`,
     );
   }
   const value = deserializeHeaderValue(
@@ -309,9 +353,8 @@ export const deserializeHeader = (
   return {
     bytesRead: 5 + keyLength + 5 + valueLength,
     data: {
-      key,
-      kind: valueKind,
-      value,
+      key: { kind: keyKind, value: keyValue },
+      value: { kind: valueKind, value },
     },
   };
 };
@@ -321,17 +364,14 @@ export const deserializeHeader = (
  *
  * @param p - Buffer containing serialized headers
  * @param pos - Starting position in the buffer
- * @returns Map of header keys to parsed headers
+ * @returns Array of parsed header entries
  */
-export const deserializeHeaders = (p: Buffer, pos = 0) => {
-  const headers: HeadersMap = {};
+export const deserializeHeaders = (p: Buffer, pos = 0): ParsedHeaderEntry[] => {
+  const headers: ParsedHeaderEntry[] = [];
   const len = p.length;
   while (pos < len) {
-    const {
-      bytesRead,
-      data: { kind, key, value },
-    } = deserializeHeader(p, pos);
-    headers[key] = { kind, value };
+    const { bytesRead, data } = deserializeHeader(p, pos);
+    headers.push(data);
     pos += bytesRead;
   }
   return headers;
@@ -458,6 +498,30 @@ export const HeaderValue = {
   Double,
   getKind,
   getValue,
+};
+
+/** Creates a raw binary header key */
+const keyRaw = (value: Buffer): HeaderKeyRaw => ({
+  kind: HeaderKind.Raw,
+  value,
+});
+
+/** Creates a string header key */
+const keyString = (value: string): HeaderKeyString => ({
+  kind: HeaderKind.String,
+  value,
+});
+
+/** Creates an Int32 header key */
+const keyInt32 = (value: number): HeaderKeyInt32 => ({
+  kind: HeaderKind.Int32,
+  value,
+});
+
+export const HeaderKeyFactory = {
+  Raw: keyRaw,
+  String: keyString,
+  Int32: keyInt32,
 };
 
 // export type InputHeaderValue = boolean | number | string | bigint | Buffer;

@@ -17,14 +17,14 @@
  * under the License.
  */
 
-
 export {
   type Id,
   PollingStrategy,
   Consumer,
   Partitioning,
   HeaderValue,
-} from './wire/index.js';
+  HeaderKeyFactory,
+} from "./wire/index.js";
 
-export * from './client/index.js';
-export * from './stream/index.js';
+export * from "./client/index.js";
+export * from "./stream/index.js";

@@ -29,14 +29,32 @@ type HeaderValue struct {
 
 type HeaderKey struct {
 	Kind  HeaderKind
-	Value string
+	Value []byte
+}
+
+type HeaderEntry struct {
+	Key   HeaderKey
+	Value HeaderValue
 }
 
 func NewHeaderKeyString(val string) (HeaderKey, error) {
 	if len(val) == 0 || len(val) > 255 {
 		return HeaderKey{}, errors.New("value has incorrect size, must be between 1 and 255")
 	}
-	return HeaderKey{Kind: String, Value: val}, nil
+	return HeaderKey{Kind: String, Value: []byte(val)}, nil
+}
+
+func NewHeaderKeyRaw(val []byte) (HeaderKey, error) {
+	if len(val) == 0 || len(val) > 255 {
+		return HeaderKey{}, errors.New("value has incorrect size, must be between 1 and 255")
+	}
+	return HeaderKey{Kind: Raw, Value: val}, nil
+}
+
+func NewHeaderKeyInt32(val int32) HeaderKey {
+	buf := make([]byte, 4)
+	binary.LittleEndian.PutUint32(buf, uint32(val))
+	return HeaderKey{Kind: Int32, Value: buf}
 }
 
 type HeaderKind int
@@ -59,15 +77,32 @@ const (
 	Double  HeaderKind = 15
 )
 
-func GetHeadersBytes(headers map[HeaderKey]HeaderValue) []byte {
+func (k HeaderKind) ExpectedSize() int {
+	switch k {
+	case Bool, Int8, Uint8:
+		return 1
+	case Int16, Uint16:
+		return 2
+	case Int32, Uint32, Float:
+		return 4
+	case Int64, Uint64, Double:
+		return 8
+	case Int128, Uint128:
+		return 16
+	default:
+		return -1
+	}
+}
+
+func GetHeadersBytes(headers []HeaderEntry) []byte {
 	headersLength := 0
-	for key, header := range headers {
-		headersLength += 1 + 4 + len([]byte(key.Value)) + 1 + 4 + len(header.Value)
+	for _, entry := range headers {
+		headersLength += 1 + 4 + len(entry.Key.Value) + 1 + 4 + len(entry.Value.Value)
 	}
 	headersBytes := make([]byte, headersLength)
 	position := 0
-	for key, value := range headers {
-		headerBytes := getBytesFromHeader(key, value)
+	for _, entry := range headers {
+		headerBytes := getBytesFromHeader(entry.Key, entry.Value)
 		copy(headersBytes[position:position+len(headerBytes)], headerBytes)
 		position += len(headerBytes)
 	}
@@ -75,18 +110,17 @@ func GetHeadersBytes(headers map[HeaderKey]HeaderValue) []byte {
 }
 
 func getBytesFromHeader(key HeaderKey, value HeaderValue) []byte {
-	keyBytes := []byte(key.Value)
-	headerBytesLength := 1 + 4 + len(keyBytes) + 1 + 4 + len(value.Value)
+	headerBytesLength := 1 + 4 + len(key.Value) + 1 + 4 + len(value.Value)
 	headerBytes := make([]byte, headerBytesLength)
 	pos := 0
 
 	headerBytes[pos] = byte(key.Kind)
 	pos++
 
-	binary.LittleEndian.PutUint32(headerBytes[pos:pos+4], uint32(len(keyBytes)))
+	binary.LittleEndian.PutUint32(headerBytes[pos:pos+4], uint32(len(key.Value)))
 	pos += 4
-	copy(headerBytes[pos:pos+len(keyBytes)], keyBytes)
-	pos += len(keyBytes)
+	copy(headerBytes[pos:pos+len(key.Value)], key.Value)
+	pos += len(key.Value)
 
 	headerBytes[pos] = byte(value.Kind)
 	pos++
@@ -98,8 +132,8 @@ func getBytesFromHeader(key HeaderKey, value HeaderValue) []byte {
 	return headerBytes
 }
 
-func DeserializeHeaders(userHeadersBytes []byte) (map[HeaderKey]HeaderValue, error) {
-	headers := make(map[HeaderKey]HeaderValue)
+func DeserializeHeaders(userHeadersBytes []byte) ([]HeaderEntry, error) {
+	var headers []HeaderEntry
 	position := 0
 
 	for position < len(userHeadersBytes) {
@@ -123,7 +157,12 @@ func DeserializeHeaders(userHeadersBytes []byte) (map[HeaderKey]HeaderValue, err
 			return nil, errors.New("invalid header key")
 		}
 
-		keyValue := string(userHeadersBytes[position : position+int(keyLength)])
+		if expected := keyKind.ExpectedSize(); expected != -1 && int(keyLength) != expected {
+			return nil, errors.New("invalid header key size for kind")
+		}
+
+		keyValue := make([]byte, keyLength)
+		copy(keyValue, userHeadersBytes[position:position+int(keyLength)])
 		position += int(keyLength)
 
 		valueKind, err := deserializeHeaderKind(userHeadersBytes, position)
@@ -147,13 +186,18 @@ func DeserializeHeaders(userHeadersBytes []byte) (map[HeaderKey]HeaderValue, err
 			return nil, errors.New("invalid header value")
 		}
 
-		value := userHeadersBytes[position : position+int(valueLength)]
+		if expected := valueKind.ExpectedSize(); expected != -1 && int(valueLength) != expected {
+			return nil, errors.New("invalid header value size for kind")
+		}
+
+		valueBytes := make([]byte, valueLength)
+		copy(valueBytes, userHeadersBytes[position:position+int(valueLength)])
 		position += int(valueLength)
 
-		headers[HeaderKey{Kind: keyKind, Value: keyValue}] = HeaderValue{
-			Kind:  valueKind,
-			Value: value,
-		}
+		headers = append(headers, HeaderEntry{
+			Key:   HeaderKey{Kind: keyKind, Value: keyValue},
+			Value: HeaderValue{Kind: valueKind, Value: valueBytes},
+		})
 	}
 
 	return headers, nil

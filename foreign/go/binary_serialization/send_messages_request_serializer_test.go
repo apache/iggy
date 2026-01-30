@@ -66,10 +66,10 @@ func TestSerialize_SendMessagesRequest(t *testing.T) {
 	}
 }
 
-func createDefaultMessageHeaders() map[iggcon.HeaderKey]iggcon.HeaderValue {
-	return map[iggcon.HeaderKey]iggcon.HeaderValue{
-		{Kind: iggcon.String, Value: "HeaderKey1"}: {Kind: iggcon.String, Value: []byte("Value 1")},
-		{Kind: iggcon.String, Value: "HeaderKey2"}: {Kind: iggcon.Uint32, Value: []byte{0x01, 0x02, 0x03, 0x04}},
+func createDefaultMessageHeaders() []iggcon.HeaderEntry {
+	return []iggcon.HeaderEntry{
+		{Key: iggcon.HeaderKey{Kind: iggcon.String, Value: []byte("HeaderKey1")}, Value: iggcon.HeaderValue{Kind: iggcon.String, Value: []byte("Value 1")}},
+		{Key: iggcon.HeaderKey{Kind: iggcon.String, Value: []byte("HeaderKey2")}, Value: iggcon.HeaderValue{Kind: iggcon.Uint32, Value: []byte{0x01, 0x02, 0x03, 0x04}}},
 	}
 }
 
