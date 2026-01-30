@@ -1,4 +1,5 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
  * regarding copyright ownership.  The ASF licenses this file
@@ -16,8 +17,7 @@
  * under the License.
  */
 
-use crate::VERSION;
-use iggy_common::IggyError;
+use crate::IggyError;
 use std::borrow::Cow;
 use std::fmt::Display;
 use std::str::FromStr;
@@ -150,11 +150,7 @@ impl FromStr for SemanticVersion {
 }
 
 impl SemanticVersion {
-    pub const fn current() -> Self {
-        Self::parse_const(VERSION)
-    }
-
-    const fn parse_const(s: &'static str) -> Self {
+    pub const fn parse_const(s: &'static str) -> Self {
         let bytes = s.as_bytes();
 
         // Split on '+' to ignore build metadata
@@ -325,21 +321,6 @@ mod tests {
         assert_eq!(SEMVER_3.minor, 2);
         assert_eq!(SEMVER_3.patch, 1);
         assert_eq!(SEMVER_3.prerelease, Some(Cow::Borrowed("alpha.2")));
-    }
-
-    #[test]
-    fn test_semantic_version_current() {
-        let version = SemanticVersion::current();
-
-        assert!(version.major < 1000);
-        assert!(version.minor < 1000);
-        assert!(version.patch < 1000);
-    }
-
-    #[test]
-    fn should_load_the_expected_version_from_package_definition() {
-        const CARGO_TOML_VERSION: &str = env!("CARGO_PKG_VERSION");
-        assert_eq!(crate::VERSION, CARGO_TOML_VERSION);
     }
 
     #[test]

@@ -49,10 +49,10 @@ use crate::{
         users::user::User,
         utils::{crypto, file::overwrite},
     },
-    versioning::SemanticVersion,
 };
 use compio::{fs::create_dir_all, runtime::Runtime};
 use err_trail::ErrContext;
+use iggy_common::SemanticVersion;
 use iggy_common::{
     IggyByteSize, IggyError, PersonalAccessToken,
     defaults::{
