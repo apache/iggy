@@ -1,5 +1,6 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
-inner() * or more contributor license agreements.  See the NOTICE file
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
  * regarding copyright ownership.  The ASF licenses this file
  * to you under the Apache License, Version 2.0 (the
@@ -40,10 +41,10 @@ use crate::{
         clients::client_manager::ClientManager, diagnostics::metrics::Metrics, session::Session,
         utils::ptr::EternalPtr,
     },
-    versioning::SemanticVersion,
 };
 use builder::IggyShardBuilder;
 use dashmap::DashMap;
+use iggy_common::SemanticVersion;
 use iggy_common::sharding::{IggyNamespace, PartitionLocation};
 use iggy_common::{EncryptorKind, IggyError};
 use std::{

@@ -78,15 +78,13 @@ class AsyncTcpMessagePollTest {
     void setUp() throws Exception {
         log.info("Setting up Async TCP Client for polling...");
 
-        // Create client with credentials for auto-login
+        // Create client with auto connect and login
         client = AsyncIggyTcpClient.builder()
                 .host(IGGY_SERVER_HOST)
                 .port(IGGY_SERVER_TCP_PORT)
                 .credentials(USERNAME, PASSWORD)
-                .build();
-
-        // Connect - this will also auto-login with the provided credentials
-        client.connect().join();
+                .buildAndLogin()
+                .join();
         log.info("Connected to Iggy server at {}:{}", IGGY_SERVER_HOST, IGGY_SERVER_TCP_PORT);
 
         // Send some test messages to ensure we have data to poll
@@ -97,7 +95,7 @@ class AsyncTcpMessagePollTest {
     void tearDown() {
         if (client != null) {
             try {
-                client.users().logoutAsync().join();
+                client.users().logout().join();
                 log.info("Logged out successfully");
             } catch (RuntimeException e) {
                 log.warn("Error during logout: {}", e.getMessage());
@@ -125,7 +123,7 @@ class AsyncTcpMessagePollTest {
         }
 
         client.messages()
-                .sendMessagesAsync(streamId, topicId, Partitioning.balanced(), messages)
+                .sendMessages(streamId, topicId, Partitioning.balanced(), messages)
                 .get();
         log.info("Seeded {} test messages", messages.size());
     }
@@ -144,7 +142,7 @@ class AsyncTcpMessagePollTest {
         Consumer consumer = Consumer.of(1L);
 
         CompletableFuture<PolledMessages> pollFuture = client.messages()
-                .pollMessagesAsync(
+                .pollMessages(
                         streamId,
                         topicId,
                         Optional.of(1L), // partition 1
@@ -182,7 +180,7 @@ class AsyncTcpMessagePollTest {
         Consumer consumer = Consumer.of(2L);
 
         CompletableFuture<PolledMessages> pollFuture = client.messages()
-                .pollMessagesAsync(
+                .pollMessages(
                         streamId,
                         topicId,
                         Optional.of(1L), // partition 1
@@ -219,7 +217,7 @@ class AsyncTcpMessagePollTest {
         Consumer consumer = Consumer.of(3L);
 
         CompletableFuture<PolledMessages> pollFuture = client.messages()
-                .pollMessagesAsync(
+                .pollMessages(
                         streamId,
                         topicId,
                         Optional.empty(), // all partitions
@@ -251,7 +249,7 @@ class AsyncTcpMessagePollTest {
         Consumer consumer = Consumer.of(4L);
 
         PolledMessages polledMessages = client.messages()
-                .pollMessagesAsync(streamId, topicId, Optional.of(1L), consumer, pollingStrategy, 3L, false)
+                .pollMessages(streamId, topicId, Optional.of(1L), consumer, pollingStrategy, 3L, false)
                 .get();
 
         log.info("Polled {} messages from offset {}", polledMessages.messages().size(), specificOffset);
@@ -276,11 +274,11 @@ class AsyncTcpMessagePollTest {
 
         // Poll from partition 1
         CompletableFuture<PolledMessages> future1 =
-                client.messages().pollMessagesAsync(streamId, topicId, Optional.of(1L), consumer, strategy, 5L, false);
+                client.messages().pollMessages(streamId, topicId, Optional.of(1L), consumer, strategy, 5L, false);
 
         // Poll from partition 2
         CompletableFuture<PolledMessages> future2 =
-                client.messages().pollMessagesAsync(streamId, topicId, Optional.of(2L), consumer, strategy, 5L, false);
+                client.messages().pollMessages(streamId, topicId, Optional.of(2L), consumer, strategy, 5L, false);
 
         // Wait for both
         CompletableFuture.allOf(future1, future2).get();
@@ -309,7 +307,7 @@ class AsyncTcpMessagePollTest {
         Consumer consumer = Consumer.of(6L);
 
         PolledMessages polledMessages = client.messages()
-                .pollMessagesAsync(streamId, topicId, Optional.of(1L), consumer, pollingStrategy, 3L, false)
+                .pollMessages(streamId, topicId, Optional.of(1L), consumer, pollingStrategy, 3L, false)
                 .get();
 
         log.info(
@@ -339,7 +337,7 @@ class AsyncTcpMessagePollTest {
         Consumer consumer = Consumer.of(7L);
 
         PolledMessages polledMessages = client.messages()
-                .pollMessagesAsync(streamId, topicId, Optional.of(1L), consumer, pollingStrategy, 3L, false)
+                .pollMessages(streamId, topicId, Optional.of(1L), consumer, pollingStrategy, 3L, false)
                 .get();
 
         log.info(
@@ -373,7 +371,7 @@ class AsyncTcpMessagePollTest {
             PollingStrategy pollingStrategy = PollingStrategy.next();
 
             PolledMessages polledMessages = client.messages()
-                    .pollMessagesAsync(
+                    .pollMessages(
                             streamId, topicId, Optional.of(1L), consumer, pollingStrategy, 5L, true // autoCommit
                             )
                     .get();

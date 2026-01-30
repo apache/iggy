@@ -42,6 +42,7 @@ import static org.apache.iggy.TestConstants.TOPIC_NAME;
 @Testcontainers
 public abstract class IntegrationTest {
 
+    public static final String LOCALHOST_IP = "127.0.0.1";
     public static final int HTTP_PORT = 3000;
     public static final int TCP_PORT = 8090;
     protected static GenericContainer<?> iggyServer;

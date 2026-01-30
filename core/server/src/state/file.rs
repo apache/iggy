@@ -1,4 +1,5 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
  * regarding copyright ownership.  The ASF licenses this file
@@ -20,7 +21,6 @@ use crate::state::command::EntryCommand;
 use crate::state::{COMPONENT, StateEntry};
 use crate::streaming::persistence::persister::PersisterKind;
 use crate::streaming::utils::file;
-use crate::versioning::SemanticVersion;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use compio::io::AsyncReadExt;
 use err_trail::ErrContext;
@@ -29,6 +29,7 @@ use iggy_common::EncryptorKind;
 use iggy_common::IggyByteSize;
 use iggy_common::IggyError;
 use iggy_common::IggyTimestamp;
+use iggy_common::SemanticVersion;
 use std::fmt::Debug;
 use std::path::Path;
 use std::sync::Arc;

@@ -20,6 +20,7 @@
 package org.apache.iggy.client.blocking.http;
 
 import org.apache.iggy.client.blocking.SystemClient;
+import org.apache.iggy.exception.IggyOperationNotSupportedException;
 import org.apache.iggy.system.ClientInfo;
 import org.apache.iggy.system.ClientInfoDetails;
 import org.apache.iggy.system.Stats;
@@ -46,7 +47,7 @@ class SystemHttpClient implements SystemClient {
 
     @Override
     public ClientInfoDetails getMe() {
-        throw new UnsupportedOperationException("Method not available in HTTP client");
+        throw new IggyOperationNotSupportedException("getMe", "HTTP");
     }
 
     @Override

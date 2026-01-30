@@ -159,11 +159,8 @@ public class IggyStreamMetadataProvider implements StreamMetadataProvider {
                     .host(config.getHost())
                     .port(config.getPort())
                     .credentials(config.getUsername(), config.getPassword())
-                    .connectionPoolSize(config.getConnectionPoolSize())
-                    .build();
-
-            // Connect and authenticate
-            asyncClient.connect().join();
+                    .buildAndLogin()
+                    .join();
 
             // Parse stream and topic IDs
             streamId = parseStreamId(config.getStreamId());
@@ -181,7 +178,7 @@ public class IggyStreamMetadataProvider implements StreamMetadataProvider {
         if (cachedTopicDetails == null || (now - lastDetailsRefresh) > DETAILS_CACHE_MS) {
             try {
                 Optional<TopicDetails> details =
-                        asyncClient.topics().getTopicAsync(streamId, topicId).join();
+                        asyncClient.topics().getTopic(streamId, topicId).join();
                 cachedTopicDetails =
                         details.orElseThrow(() -> new RuntimeException("Topic not found: " + config.getTopicId()));
                 lastDetailsRefresh = now;
