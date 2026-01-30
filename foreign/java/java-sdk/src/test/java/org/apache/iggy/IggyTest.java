@@ -19,7 +19,11 @@
 
 package org.apache.iggy;
 
-import org.apache.iggy.client.blocking.http.IggyHttpClient;
+import org.apache.iggy.builder.HttpClientBuilder;
+import org.apache.iggy.builder.TcpClientBuilder;
+import org.apache.iggy.client.async.tcp.AsyncIggyTcpClientBuilder;
+import org.apache.iggy.client.blocking.http.IggyHttpClientBuilder;
+import org.apache.iggy.client.blocking.tcp.IggyTcpClientBuilder;
 import org.junit.jupiter.api.Test;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -27,11 +31,71 @@ import static org.assertj.core.api.Assertions.assertThat;
 class IggyTest {
 
     @Test
-    void test() {
-        var baseClient = new IggyHttpClient("http://localhost:8080");
+    void tcpBuilderReturnsCorrectTypes() {
+        TcpClientBuilder tcpBuilder = Iggy.tcpClientBuilder();
+        assertThat(tcpBuilder).isNotNull();
 
-        var client = Iggy.clientBuilder().withBaseClient(baseClient).build();
+        IggyTcpClientBuilder blockingBuilder = tcpBuilder.blocking();
+        assertThat(blockingBuilder).isNotNull();
 
-        assertThat(client).isNotNull();
+        AsyncIggyTcpClientBuilder asyncBuilder = tcpBuilder.async();
+        assertThat(asyncBuilder).isNotNull();
+    }
+
+    @Test
+    void httpBuilderReturnsCorrectTypes() {
+        HttpClientBuilder httpBuilder = Iggy.httpClientBuilder();
+        assertThat(httpBuilder).isNotNull();
+
+        IggyHttpClientBuilder blockingBuilder = httpBuilder.blocking();
+        assertThat(blockingBuilder).isNotNull();
+    }
+
+    @Test
+    void versionMethodsReturnValues() {
+        String version = Iggy.version();
+        assertThat(version).isNotNull();
+        assertThat(version).isNotEqualTo("unknown");
+
+        IggyVersion versionInfo = Iggy.versionInfo();
+        assertThat(versionInfo).isNotNull();
+        assertThat(versionInfo.getVersion()).isNotNull().isNotEqualTo("unknown");
+        assertThat(versionInfo.getBuildTime()).isNotNull().isNotEqualTo("unknown");
+        assertThat(versionInfo.getGitCommit()).isNotNull().isNotEqualTo("unknown");
+        assertThat(versionInfo.getUserAgent()).startsWith("iggy-java-sdk/");
+    }
+
+    @Test
+    void tcpBlockingBuilderHasFluentApi() {
+        IggyTcpClientBuilder builder = Iggy.tcpClientBuilder().blocking();
+
+        // Verify fluent API returns same builder
+        assertThat(builder.host("localhost")).isSameAs(builder);
+        assertThat(builder.port(8090)).isSameAs(builder);
+        assertThat(builder.enableTls()).isSameAs(builder);
+        assertThat(builder.tls(false)).isSameAs(builder);
+    }
+
+    @Test
+    void tcpAsyncBuilderHasFluentApi() {
+        AsyncIggyTcpClientBuilder builder = Iggy.tcpClientBuilder().async();
+
+        // Verify fluent API returns same builder
+        assertThat(builder.host("localhost")).isSameAs(builder);
+        assertThat(builder.port(8090)).isSameAs(builder);
+        assertThat(builder.enableTls()).isSameAs(builder);
+        assertThat(builder.tls(false)).isSameAs(builder);
+    }
+
+    @Test
+    void httpBlockingBuilderHasFluentApi() {
+        IggyHttpClientBuilder builder = Iggy.httpClientBuilder().blocking();
+
+        // Verify fluent API returns same builder
+        assertThat(builder.host("localhost")).isSameAs(builder);
+        assertThat(builder.port(3000)).isSameAs(builder);
+        assertThat(builder.url("http://localhost:3000")).isSameAs(builder);
+        assertThat(builder.enableTls()).isSameAs(builder);
+        assertThat(builder.tls(false)).isSameAs(builder);
     }
 }

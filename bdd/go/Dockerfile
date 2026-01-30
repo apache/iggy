@@ -21,7 +21,7 @@ WORKDIR /app
 COPY . .
 
 # Install Ginkgo
-RUN go install github.com/onsi/ginkgo/v2/ginkgo@latest
+RUN go install github.com/onsi/ginkgo/v2/ginkgo@v2.23.4
 
 # Change workdir to bdd/go
 WORKDIR /app/bdd/go

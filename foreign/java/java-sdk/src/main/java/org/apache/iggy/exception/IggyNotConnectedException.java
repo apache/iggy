@@ -17,6 +17,26 @@
  * under the License.
  */
 
-package org.apache.iggy.client.blocking.http.error;
+package org.apache.iggy.exception;
 
-public record IggyHttpError(String id, String code, String reason, String field) {}
+/**
+ * Exception thrown when an operation is attempted on a client that is not connected.
+ */
+public class IggyNotConnectedException extends IggyClientException {
+
+    /**
+     * Constructs a new IggyNotConnectedException with a default message.
+     */
+    public IggyNotConnectedException() {
+        super("Client not connected. Call connect() first.");
+    }
+
+    /**
+     * Constructs a new IggyNotConnectedException with the specified message.
+     *
+     * @param message the detail message
+     */
+    public IggyNotConnectedException(String message) {
+        super(message);
+    }
+}

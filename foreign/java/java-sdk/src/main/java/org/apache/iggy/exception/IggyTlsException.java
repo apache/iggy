@@ -17,17 +17,32 @@
  * under the License.
  */
 
-package org.apache.iggy.client.blocking;
+package org.apache.iggy.exception;
 
-public class IggyClient {
+/**
+ * Exception thrown when a TLS/SSL-related error occurs.
+ *
+ * <p>This includes errors during TLS context setup, certificate validation,
+ * and SSL handshake failures.
+ */
+public class IggyTlsException extends IggyConnectionException {
 
-    private final IggyBaseClient baseClient;
-
-    public IggyClient(IggyBaseClient baseClient) {
-        this.baseClient = baseClient;
+    /**
+     * Constructs a new IggyTlsException with the specified message.
+     *
+     * @param message the detail message
+     */
+    public IggyTlsException(String message) {
+        super(message);
     }
 
-    public IggyBaseClient getBaseClient() {
-        return baseClient;
+    /**
+     * Constructs a new IggyTlsException with the specified message and cause.
+     *
+     * @param message the detail message
+     * @param cause the cause of the exception
+     */
+    public IggyTlsException(String message, Throwable cause) {
+        super(message, cause);
     }
 }

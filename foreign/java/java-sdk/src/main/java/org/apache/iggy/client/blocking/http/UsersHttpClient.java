@@ -19,6 +19,7 @@
 
 package org.apache.iggy.client.blocking.http;
 
+import org.apache.iggy.IggyVersion;
 import org.apache.iggy.client.blocking.UsersClient;
 import org.apache.iggy.identifier.UserId;
 import org.apache.iggy.user.IdentityInfo;
@@ -88,8 +89,8 @@ class UsersHttpClient implements UsersClient {
 
     @Override
     public IdentityInfo login(String username, String password) {
-        String version = "0.6.30";
-        String context = "java-sdk";
+        String version = IggyVersion.getInstance().getUserAgent();
+        String context = IggyVersion.getInstance().toString();
         var request = httpClient.preparePostRequest(USERS + "/login", new Login(username, password, version, context));
         var response = httpClient.execute(request, IdentityInfo.class);
         httpClient.setToken(response.accessToken().map(TokenInfo::token));

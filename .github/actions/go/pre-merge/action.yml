@@ -138,7 +138,7 @@ runs:
 
         # Install ginkgo
         echo "Installing ginkgo..."
-        go install github.com/onsi/ginkgo/v2/ginkgo@latest
+        go install github.com/onsi/ginkgo/v2/ginkgo@v2.23.4
 
         # Ensure ginkgo is in PATH
         export PATH="${PATH}:$(go env GOPATH)/bin"

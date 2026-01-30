@@ -49,26 +49,24 @@ public class StreamsTcpClient implements StreamsClient {
     }
 
     @Override
-    public CompletableFuture<StreamDetails> createStreamAsync(String name) {
+    public CompletableFuture<StreamDetails> createStream(String name) {
         var payloadSize = 1 + name.length();
         var payload = Unpooled.buffer(payloadSize);
 
         payload.writeBytes(BytesSerializer.toBytes(name));
 
-        return connection
-                .sendAsync(CommandCode.Stream.CREATE.getValue(), payload)
-                .thenApply(response -> {
-                    StreamDetails details = readStreamDetails(response);
-                    response.release();
-                    return details;
-                });
+        return connection.send(CommandCode.Stream.CREATE.getValue(), payload).thenApply(response -> {
+            StreamDetails details = readStreamDetails(response);
+            response.release();
+            return details;
+        });
     }
 
     @Override
-    public CompletableFuture<Optional<StreamDetails>> getStreamAsync(StreamId streamId) {
+    public CompletableFuture<Optional<StreamDetails>> getStream(StreamId streamId) {
         var payload = toBytes(streamId);
 
-        return connection.sendAsync(CommandCode.Stream.GET.getValue(), payload).thenApply(response -> {
+        return connection.send(CommandCode.Stream.GET.getValue(), payload).thenApply(response -> {
             Optional<StreamDetails> result;
             if (response.isReadable()) {
                 result = Optional.of(readStreamDetails(response));
@@ -81,9 +79,9 @@ public class StreamsTcpClient implements StreamsClient {
     }
 
     @Override
-    public CompletableFuture<List<StreamBase>> getStreamsAsync() {
+    public CompletableFuture<List<StreamBase>> getStreams() {
         return connection
-                .sendAsync(CommandCode.Stream.GET_ALL.getValue(), Unpooled.EMPTY_BUFFER)
+                .send(CommandCode.Stream.GET_ALL.getValue(), Unpooled.EMPTY_BUFFER)
                 .thenApply(response -> {
                     List<StreamBase> streams = new ArrayList<>();
                     while (response.isReadable()) {
@@ -95,7 +93,7 @@ public class StreamsTcpClient implements StreamsClient {
     }
 
     @Override
-    public CompletableFuture<Void> updateStreamAsync(StreamId streamId, String name) {
+    public CompletableFuture<Void> updateStream(StreamId streamId, String name) {
         var payloadSize = 1 + name.length();
         var idBytes = toBytes(streamId);
         var payload = Unpooled.buffer(payloadSize + idBytes.capacity());
@@ -103,17 +101,13 @@ public class StreamsTcpClient implements StreamsClient {
         payload.writeBytes(idBytes);
         payload.writeBytes(BytesSerializer.toBytes(name));
 
-        return connection
-                .sendAsync(CommandCode.Stream.UPDATE.getValue(), payload)
-                .thenAccept(ReferenceCounted::release);
+        return connection.send(CommandCode.Stream.UPDATE.getValue(), payload).thenAccept(ReferenceCounted::release);
     }
 
     @Override
-    public CompletableFuture<Void> deleteStreamAsync(StreamId streamId) {
+    public CompletableFuture<Void> deleteStream(StreamId streamId) {
         var payload = toBytes(streamId);
 
-        return connection
-                .sendAsync(CommandCode.Stream.DELETE.getValue(), payload)
-                .thenAccept(ReferenceCounted::release);
+        return connection.send(CommandCode.Stream.DELETE.getValue(), payload).thenAccept(ReferenceCounted::release);
     }
 }
