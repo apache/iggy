@@ -102,6 +102,7 @@ jobs:
             metadata
             message_bus
             storage
+            configs
 
   license-headers:
     name: Check license headers

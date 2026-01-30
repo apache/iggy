@@ -31,7 +31,7 @@ Iggy requires valid credentials to authenticate client requests. The examples as
 > **Note** <br>
 > This setup is intended only for development and testing, not production use.
 
-By default, all server data is stored in the `local_data` directory (this can be changed via `system.path` in `server.toml`).
+By default, all server data is stored in the `local_data` directory (this can be changed via `system.path` in `config.toml`).
 
 Root credentials are applied **only on the very first startup**, when no data directory exists yet.
 Once the server has created and populated the data directory, the existing stored credentials will always be used, and supplying the `--with-default-root-credentials` flag or setting the environment variables will no longer override them.
@@ -97,8 +97,15 @@ Demonstrates fundamental client connection, authentication, batch message sendin
 Shows metadata management using custom headers:
 
 ```bash
-cargo run --example message-headers-producer
-cargo run --example message-headers-consumer
+cargo run --example message-headers-type-producer
+cargo run --example message-headers-type-consumer
+```
+
+Shows how user headers can be used for message compression in transit:
+
+```bash
+cargo run --example message-headers-compression-producer
+cargo run --example message-headers-compression-consumer
 ```
 
 Demonstrates using HeaderKey/HeaderValue for message metadata instead of payload-based typing, with header-based message routing.

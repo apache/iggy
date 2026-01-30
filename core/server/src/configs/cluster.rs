@@ -16,35 +16,36 @@
  * under the License.
  */
 
+use iggy_common::ConfigEnv;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
 pub struct ClusterConfig {
     pub enabled: bool,
     pub name: String,
     pub node: NodeConfig,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
 pub struct NodeConfig {
     pub current: CurrentNodeConfig,
     pub others: Vec<OtherNodeConfig>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
 pub struct CurrentNodeConfig {
     pub name: String,
     pub ip: String,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
 pub struct OtherNodeConfig {
     pub name: String,
     pub ip: String,
     pub ports: TransportPorts,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default, ConfigEnv)]
 pub struct TransportPorts {
     pub tcp: Option<u16>,
     pub quic: Option<u16>,

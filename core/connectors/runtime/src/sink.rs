@@ -21,6 +21,7 @@ use crate::configs::connectors::SinkConfig;
 use crate::context::RuntimeContext;
 use crate::log::LOG_CALLBACK;
 use crate::manager::status::ConnectorStatus;
+use crate::metrics::{ConnectorType, Metrics};
 use crate::{
     PLUGIN_ID, RuntimeError, SinkApi, SinkConnector, SinkConnectorConsumer, SinkConnectorPlugin,
     SinkConnectorWrapper, resolve_plugin_path, transform,
@@ -196,7 +197,11 @@ pub fn consume(sinks: Vec<SinkConnectorWrapper>, context: Arc<RuntimeContext>) {
                 tokio::spawn(async move {
                     context
                         .sinks
-                        .update_status(&plugin_key, ConnectorStatus::Running)
+                        .update_status(
+                            &plugin_key,
+                            ConnectorStatus::Running,
+                            Some(&context.metrics),
+                        )
                         .await;
 
                     if let Err(error) = consume_messages(
@@ -207,6 +212,8 @@ pub fn consume(sinks: Vec<SinkConnectorWrapper>, context: Arc<RuntimeContext>) {
                         consumer.transforms,
                         consumer.consumer,
                         plugin.verbose,
+                        &plugin_key,
+                        &context.metrics,
                     )
                     .await
                     {
@@ -215,6 +222,9 @@ pub fn consume(sinks: Vec<SinkConnectorWrapper>, context: Arc<RuntimeContext>) {
                             plugin.id
                         );
                         error!(err);
+                        context
+                            .metrics
+                            .increment_errors(&plugin_key, ConnectorType::Sink);
                         context.sinks.set_error(&plugin_key, &err).await;
                         return;
                     }
@@ -228,6 +238,7 @@ pub fn consume(sinks: Vec<SinkConnectorWrapper>, context: Arc<RuntimeContext>) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn consume_messages(
     plugin_id: u32,
     decoder: Arc<dyn StreamDecoder>,
@@ -236,6 +247,8 @@ async fn consume_messages(
     transforms: Vec<Arc<dyn Transform>>,
     mut consumer: IggyConsumer,
     verbose: bool,
+    plugin_key: &str,
+    metrics: &Arc<Metrics>,
 ) -> Result<(), RuntimeError> {
     info!("Started consuming messages for sink connector with ID: {plugin_id}");
     let batch_size = batch_size as usize;
@@ -261,6 +274,7 @@ async fn consume_messages(
 
         let messages = std::mem::take(&mut batch);
         let messages_count = messages.len();
+        metrics.increment_messages_consumed(plugin_key, messages_count as u64);
         let messages_metadata = MessagesMetadata {
             partition_id,
             current_offset,
@@ -278,7 +292,7 @@ async fn consume_messages(
             );
         }
         let start = Instant::now();
-        if let Err(error) = process_messages(
+        let processed_count = match process_messages(
             plugin_id,
             messages_metadata,
             &topic_metadata,
@@ -289,12 +303,17 @@ async fn consume_messages(
         )
         .await
         {
-            error!(
-                "Failed to process {messages_count} messages for sink connector with ID: {plugin_id}. {error}",
-            );
-            return Err(error);
-        }
+            Ok(count) => count,
+            Err(error) => {
+                error!(
+                    "Failed to process {messages_count} messages for sink connector with ID: {plugin_id}. {error}",
+                );
+                metrics.increment_errors(plugin_key, ConnectorType::Sink);
+                return Err(error);
+            }
+        };
 
+        metrics.increment_messages_processed(plugin_key, processed_count as u64);
         let elapsed = start.elapsed();
         if verbose {
             info!(
@@ -341,7 +360,7 @@ async fn process_messages(
     consume: &ConsumeCallback,
     transforms: &Vec<Arc<dyn Transform>>,
     decoder: &Arc<dyn StreamDecoder>,
-) -> Result<(), RuntimeError> {
+) -> Result<usize, RuntimeError> {
     let messages = messages.into_iter().map(|message| ReceivedMessage {
         id: message.header.id,
         offset: message.header.offset,
@@ -453,6 +472,8 @@ async fn process_messages(
         });
     }
 
+    let processed_count = messages.len();
+
     let topic_meta = postcard::to_allocvec(topic_metadata).map_err(|error| {
         error!(
             "Failed to serialize topic metadata for sink connector with ID: {plugin_id}. {error}"
@@ -486,5 +507,5 @@ async fn process_messages(
         messages.len(),
     );
 
-    Ok(())
+    Ok(processed_count)
 }

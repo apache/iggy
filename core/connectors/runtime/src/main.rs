@@ -18,6 +18,7 @@
  */
 
 use crate::configs::connectors::{ConnectorsConfigProvider, create_connectors_config_provider};
+use ::configs::ConfigProvider;
 use clap::Parser;
 use configs::connectors::ConfigFormat;
 use configs::runtime::ConnectorsRuntimeConfig;
@@ -26,7 +27,6 @@ use dotenvy::dotenv;
 use error::RuntimeError;
 use figlet_rs::FIGfont;
 use iggy::prelude::{Client, IggyConsumer, IggyProducer};
-use iggy_common::ConfigProvider;
 use iggy_connector_sdk::{
     StreamDecoder, StreamEncoder,
     sink::ConsumeCallback,
@@ -48,9 +48,11 @@ pub(crate) mod context;
 pub(crate) mod error;
 mod log;
 mod manager;
+pub(crate) mod metrics;
 mod sink;
 mod source;
 mod state;
+pub(crate) mod stats;
 mod stream;
 mod transform;
 

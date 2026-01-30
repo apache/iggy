@@ -35,10 +35,12 @@ use axum::extract::connect_info::Connected;
 use axum::http::Method;
 use axum::{Router, middleware};
 use axum_server::tls_rustls::RustlsConfig;
-use compio_net::TcpListener;
+use compio::net::TcpListener;
+use compio_net::TcpOpts;
 use err_trail::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::TransportProtocol;
+use socket2::{Domain, Protocol, Socket, Type};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -134,7 +136,8 @@ pub async fn start_http_server(
     }
 
     if !config.tls.enabled {
-        let listener = TcpListener::bind(config.address.clone())
+        let opts = TcpOpts::new().reuse_port(true).reuse_address(true);
+        let listener = TcpListener::bind_with_options(config.address.clone(), opts)
             .await
             .unwrap_or_else(|_| panic!("Failed to bind to HTTP address {}", config.address));
         let address = listener
@@ -177,7 +180,31 @@ pub async fn start_http_server(
         .await
         .unwrap();
 
-        let listener = std::net::TcpListener::bind(config.address).unwrap();
+        let addr: SocketAddr = config
+            .address
+            .parse()
+            .unwrap_or_else(|e| panic!("Invalid HTTPS address '{}': {e}", config.address));
+        let domain = if addr.is_ipv6() {
+            Domain::IPV6
+        } else {
+            Domain::IPV4
+        };
+        let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))
+            .unwrap_or_else(|e| panic!("Failed to create HTTPS socket: {e}"));
+        socket
+            .set_reuse_address(true)
+            .unwrap_or_else(|e| panic!("Failed to set SO_REUSEADDR: {e}"));
+        #[cfg(unix)]
+        socket
+            .set_reuse_port(true)
+            .unwrap_or_else(|e| panic!("Failed to set SO_REUSEPORT: {e}"));
+        socket
+            .bind(&addr.into())
+            .unwrap_or_else(|e| panic!("Failed to bind to HTTPS address {}: {e}", config.address));
+        socket
+            .listen(128)
+            .unwrap_or_else(|e| panic!("Failed to listen on HTTPS: {e}"));
+        let listener: std::net::TcpListener = socket.into();
         listener
             .set_nonblocking(true)
             .expect("Failed to set TLS listener to non-blocking");

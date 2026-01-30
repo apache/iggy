@@ -18,6 +18,7 @@
  */
 use super::status::{ConnectorError, ConnectorStatus};
 use crate::configs::connectors::{ConfigFormat, SinkConfig};
+use crate::metrics::Metrics;
 use dashmap::DashMap;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -63,12 +64,27 @@ impl SinkManager {
         results
     }
 
-    pub async fn update_status(&self, key: &str, status: ConnectorStatus) {
+    pub async fn update_status(
+        &self,
+        key: &str,
+        status: ConnectorStatus,
+        metrics: Option<&Arc<Metrics>>,
+    ) {
         if let Some(sink) = self.sinks.get(key) {
             let mut sink = sink.lock().await;
+            let old_status = sink.info.status;
             sink.info.status = status;
             if matches!(status, ConnectorStatus::Running | ConnectorStatus::Stopped) {
                 sink.info.last_error = None;
+            }
+            if let Some(metrics) = metrics {
+                if old_status != ConnectorStatus::Running && status == ConnectorStatus::Running {
+                    metrics.increment_sinks_running();
+                } else if old_status == ConnectorStatus::Running
+                    && status != ConnectorStatus::Running
+                {
+                    metrics.decrement_sinks_running();
+                }
             }
         }
     }

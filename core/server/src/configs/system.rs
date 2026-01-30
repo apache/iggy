@@ -19,6 +19,7 @@
 use super::cache_indexes::CacheIndexesConfig;
 use super::sharding::ShardingConfig;
 use crate::configs::server::MemoryPoolConfig;
+use iggy_common::ConfigEnv;
 use iggy_common::IggyByteSize;
 use iggy_common::IggyError;
 use iggy_common::IggyExpiry;
@@ -31,7 +32,7 @@ use serde_with::serde_as;
 pub const INDEX_EXTENSION: &str = "index";
 pub const LOG_EXTENSION: &str = "log";
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, ConfigEnv)]
 pub struct SystemConfig {
     pub path: String,
     pub backup: BackupConfig,
@@ -50,104 +51,116 @@ pub struct SystemConfig {
     pub sharding: ShardingConfig,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, ConfigEnv)]
 pub struct BackupConfig {
     pub path: String,
     pub compatibility: CompatibilityConfig,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, ConfigEnv)]
 pub struct CompatibilityConfig {
     pub path: String,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, ConfigEnv)]
 pub struct DatabaseConfig {
     pub path: String,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, ConfigEnv)]
 pub struct RuntimeConfig {
     pub path: String,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, ConfigEnv)]
 pub struct CompressionConfig {
     pub allow_override: bool,
+    #[config_env(leaf)]
     pub default_algorithm: CompressionAlgorithm,
 }
 
 #[serde_as]
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, ConfigEnv)]
 pub struct LoggingConfig {
     pub path: String,
     pub level: String,
     pub file_enabled: bool,
+    #[config_env(leaf)]
     pub max_size: IggyByteSize,
+    #[config_env(leaf)]
     #[serde_as(as = "DisplayFromStr")]
     pub retention: IggyDuration,
+    #[config_env(leaf)]
     #[serde_as(as = "DisplayFromStr")]
     pub sysinfo_print_interval: IggyDuration,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, ConfigEnv)]
 pub struct EncryptionConfig {
     pub enabled: bool,
+    #[config_env(secret)]
     pub key: String,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, ConfigEnv)]
 pub struct StreamConfig {
     pub path: String,
 }
 
 #[serde_as]
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, ConfigEnv)]
 pub struct TopicConfig {
     pub path: String,
+    #[config_env(leaf)]
     #[serde_as(as = "DisplayFromStr")]
     pub max_size: MaxTopicSize,
     pub delete_oldest_segments: bool,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, ConfigEnv)]
 pub struct PartitionConfig {
     pub path: String,
     pub messages_required_to_save: u32,
+    #[config_env(leaf)]
     pub size_of_messages_required_to_save: IggyByteSize,
     pub enforce_fsync: bool,
     pub validate_checksum: bool,
 }
 
 #[serde_as]
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, ConfigEnv)]
 pub struct MessageDeduplicationConfig {
     pub enabled: bool,
     pub max_entries: u64,
+    #[config_env(leaf)]
     #[serde_as(as = "DisplayFromStr")]
     pub expiry: IggyDuration,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, ConfigEnv)]
 pub struct RecoveryConfig {
     pub recreate_missing_state: bool,
 }
 
 #[serde_as]
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, ConfigEnv)]
 pub struct SegmentConfig {
+    #[config_env(leaf)]
     pub size: IggyByteSize,
+    #[config_env(leaf)]
     pub cache_indexes: CacheIndexesConfig,
+    #[config_env(leaf)]
     #[serde_as(as = "DisplayFromStr")]
     pub message_expiry: IggyExpiry,
     pub archive_expired: bool,
 }
 
 #[serde_as]
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, ConfigEnv)]
 pub struct StateConfig {
     pub enforce_fsync: bool,
     pub max_file_operation_retries: u32,
+    #[config_env(leaf)]
     #[serde_as(as = "DisplayFromStr")]
     pub retry_delay: IggyDuration,
 }

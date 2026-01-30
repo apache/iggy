@@ -20,6 +20,7 @@
 use crate::configs::connectors::ConfigFormat;
 use crate::error::RuntimeError;
 use axum::http::{HeaderValue, Method};
+use configs_derive::ConfigEnv;
 use serde::{Deserialize, Serialize};
 use std::fmt::Formatter;
 use tower_http::cors::{AllowOrigin, CorsLayer};
@@ -30,16 +31,24 @@ pub const YAML_HEADER: HeaderValue = HeaderValue::from_static("application/yaml"
 pub const TOML_HEADER: HeaderValue = HeaderValue::from_static("application/toml");
 pub const TEXT_HEADER: HeaderValue = HeaderValue::from_static("text/plain");
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, ConfigEnv)]
 pub struct HttpConfig {
     pub enabled: bool,
     pub address: String,
+    #[config_env(secret)]
     pub api_key: String,
     pub cors: HttpCorsConfig,
     pub tls: HttpTlsConfig,
+    pub metrics: HttpMetricsConfig,
 }
 
-#[derive(Debug, Default, Deserialize, Serialize, Clone)]
+#[derive(Debug, Clone, Deserialize, Serialize, ConfigEnv)]
+pub struct HttpMetricsConfig {
+    pub enabled: bool,
+    pub endpoint: String,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize, Clone, ConfigEnv)]
 pub struct HttpCorsConfig {
     pub enabled: bool,
     pub allowed_methods: Vec<String>,
@@ -50,7 +59,7 @@ pub struct HttpCorsConfig {
     pub allow_private_network: bool,
 }
 
-#[derive(Debug, Default, Deserialize, Serialize, Clone)]
+#[derive(Debug, Default, Deserialize, Serialize, Clone, ConfigEnv)]
 pub struct HttpTlsConfig {
     pub enabled: bool,
     pub cert_file: String,
@@ -133,6 +142,25 @@ pub fn configure_cors(config: &HttpCorsConfig) -> CorsLayer {
         .allow_private_network(config.allow_private_network)
 }
 
+impl Default for HttpMetricsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: "/metrics".to_owned(),
+        }
+    }
+}
+
+impl std::fmt::Display for HttpMetricsConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{{ enabled: {}, endpoint: {} }}",
+            self.enabled, self.endpoint
+        )
+    }
+}
+
 impl Default for HttpConfig {
     fn default() -> Self {
         Self {
@@ -141,6 +169,7 @@ impl Default for HttpConfig {
             api_key: "".to_owned(),
             cors: HttpCorsConfig::default(),
             tls: HttpTlsConfig::default(),
+            metrics: HttpMetricsConfig::default(),
         }
     }
 }
@@ -149,8 +178,8 @@ impl std::fmt::Display for HttpConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ address: {}, api_key: {}, cors: {}, tls: {} }}",
-            self.address, self.api_key, self.cors, self.tls
+            "{{ address: {}, api_key: {}, cors: {}, tls: {}, metrics: {} }}",
+            self.address, self.api_key, self.cors, self.tls, self.metrics
         )
     }
 }

@@ -23,6 +23,7 @@ use crate::server::scenarios::{
 };
 use iggy::prelude::*;
 use integration::{
+    harness::{TestHarness, TestServerConfig},
     http_client::HttpClientFactory,
     quic_client::QuicClientFactory,
     tcp_client::TcpClientFactory,
@@ -33,24 +34,27 @@ use integration::{
 use serial_test::parallel;
 use std::collections::HashMap;
 
-// This test can run on any transport, but it requires both ClientFactory and
-// TestServer parameters, which doesn't fit the unified matrix approach.
 #[tokio::test]
 #[parallel]
 async fn should_delete_segments_and_validate_filesystem() {
-    let mut extra_envs = HashMap::new();
-    extra_envs.insert("IGGY_SYSTEM_SEGMENT_SIZE".to_string(), "1MiB".to_string());
+    let mut harness = TestHarness::builder()
+        .server(
+            TestServerConfig::builder()
+                .extra_envs(HashMap::from([(
+                    "IGGY_SYSTEM_SEGMENT_SIZE".to_string(),
+                    "1MiB".to_string(),
+                )]))
+                .build(),
+        )
+        .build()
+        .unwrap();
 
-    let mut test_server = TestServer::new(Some(extra_envs), true, None, IpAddrKind::V4);
-    test_server.start();
+    harness.start().await.unwrap();
 
-    let server_addr = test_server.get_raw_tcp_addr().unwrap();
-    let client_factory = TcpClientFactory {
-        server_addr,
-        ..Default::default()
-    };
+    let client = harness.tcp_root_client().await.unwrap();
+    let data_path = harness.server().data_path();
 
-    delete_segments_scenario::run(&client_factory, &test_server).await;
+    delete_segments_scenario::run(&client, &data_path).await;
 }
 
 // TCP TLS scenario is obviously specific to TCP transport, and requires special
@@ -282,6 +286,7 @@ async fn segment_rotation_scenario() {
 
     let websocket_factory = WebSocketClientFactory {
         server_addr: test_server.get_websocket_addr().unwrap(),
+        ..Default::default()
     };
 
     let factories: Vec<&dyn integration::test_server::ClientFactory> = vec![

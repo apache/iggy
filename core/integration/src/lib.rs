@@ -18,6 +18,7 @@
 
 pub mod bench_utils;
 pub mod file;
+pub mod harness;
 #[allow(deprecated)]
 pub mod http_client;
 #[allow(deprecated)]
