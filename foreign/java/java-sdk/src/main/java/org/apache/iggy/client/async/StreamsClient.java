@@ -29,25 +29,25 @@ import java.util.concurrent.CompletableFuture;
 
 public interface StreamsClient {
 
-    default CompletableFuture<Optional<StreamDetails>> getStreamAsync(Long streamId) {
-        return getStreamAsync(StreamId.of(streamId));
+    default CompletableFuture<Optional<StreamDetails>> getStream(Long streamId) {
+        return getStream(StreamId.of(streamId));
     }
 
-    CompletableFuture<Optional<StreamDetails>> getStreamAsync(StreamId streamId);
+    CompletableFuture<Optional<StreamDetails>> getStream(StreamId streamId);
 
-    CompletableFuture<List<StreamBase>> getStreamsAsync();
+    CompletableFuture<List<StreamBase>> getStreams();
 
-    CompletableFuture<StreamDetails> createStreamAsync(String name);
+    CompletableFuture<StreamDetails> createStream(String name);
 
-    default CompletableFuture<Void> updateStreamAsync(Long streamId, String name) {
-        return updateStreamAsync(StreamId.of(streamId), name);
+    default CompletableFuture<Void> updateStream(Long streamId, String name) {
+        return updateStream(StreamId.of(streamId), name);
     }
 
-    CompletableFuture<Void> updateStreamAsync(StreamId streamId, String name);
+    CompletableFuture<Void> updateStream(StreamId streamId, String name);
 
-    default CompletableFuture<Void> deleteStreamAsync(Long streamId) {
-        return deleteStreamAsync(StreamId.of(streamId));
+    default CompletableFuture<Void> deleteStream(Long streamId) {
+        return deleteStream(StreamId.of(streamId));
     }
 
-    CompletableFuture<Void> deleteStreamAsync(StreamId streamId);
+    CompletableFuture<Void> deleteStream(StreamId streamId);
 }
