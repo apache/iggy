@@ -134,6 +134,7 @@ pub(crate) struct CliOptions {
 
 #[derive(Debug, Clone, Subcommand)]
 pub(crate) enum Command {
+    /// cluster operations
     #[command(subcommand, visible_alias = "cl")]
     Cluster(ClusterAction),
     /// stream operations

@@ -21,6 +21,7 @@ use clap::{Args, Subcommand};
 
 #[derive(Debug, Clone, Subcommand)]
 pub(crate) enum ClusterAction {
+    /// Get cluster metadata
     #[clap(visible_alias = "m")]
     Metadata(ClusterMetadataArgs),
 }

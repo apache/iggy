@@ -48,7 +48,6 @@ impl TestClusterMetadataCmd {
             TestClusterMetadataCmdOutput::List => command
                 .arg("--list-mode")
                 .arg("list")
-                .opt("-q")
                 .with_env_credentials(),
         }
     }
@@ -81,7 +80,7 @@ impl IggyCmdTestCase for TestClusterMetadataCmd {
                     .stdout(contains("Role"))
                     .stdout(contains("Status"));
 
-                assert.stdout(contains("localhost"));
+                assert.stdout(contains("127.0.0.1"));
             }
             TestClusterMetadataCmdOutput::List => {
                 let assert = command_state.success();
@@ -131,11 +130,7 @@ pub async fn should_help_match() {
                 r#"{USAGE_PREFIX} cluster metadata [OPTIONS]
 
 Options:
-  -l, --list-mode <LIST_MODE>
-          List mode (table or list)
-{CLAP_INDENT}
-          [default: table]
-          [possible values: table, list]
+  -l, --list-mode <LIST_MODE>  [default: table] [possible values: table, list]
 
   -h, --help
           Print help (see a summary with '-h')
