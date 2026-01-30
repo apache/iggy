@@ -16,15 +16,12 @@
 // under the License.
 
 using System.Text;
-using System.Text.Json.Serialization;
-using Apache.Iggy.JsonConverters;
 
 namespace Apache.Iggy.Headers;
 
 /// <summary>
 /// Represents a message header key with a kind and binary value.
 /// </summary>
-[JsonConverter(typeof(HeaderKeyConverter))]
 public readonly struct HeaderKey : IEquatable<HeaderKey>
 {
     /// <summary>
