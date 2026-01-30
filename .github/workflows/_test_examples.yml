@@ -35,8 +35,6 @@ jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 60
-    env:
-      IGGY_CI_BUILD: true
     steps:
       - name: Checkout code
         uses: actions/checkout@v4

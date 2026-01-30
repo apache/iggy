@@ -248,5 +248,17 @@ zip = { version = "7.2.0", default-features = false, features = ["deflate"] }
 lto = true
 codegen-units = 1
 
-[profile.dev]
-opt-level = 1
+# [profile.dev]
+# opt-level = 1
+
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.twox-hash]
+opt-level = 3
+
+[profile.dev.package.rand_chacha]
+opt-level = 3
+
+[profile.dev.package.iggy_common]
+opt-level = 3

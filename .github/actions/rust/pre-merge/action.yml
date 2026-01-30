@@ -104,11 +104,17 @@ runs:
     - name: Build and test
       if: inputs.task == 'test'
       run: |
-        build_start=$(date +%s)
+        bins_start=$(date +%s)
         cargo build --locked --all-targets
-        build_end=$(date +%s)
-        build_duration=$((build_end - build_start))
-        echo "::notice::Build completed in ${build_duration}s ($(date -ud @${build_duration} +'%M:%S'))"
+        bins_end=$(date +%s)
+        bins_duration=$((bins_end - bins_start))
+        echo "::notice::All targets built in ${bins_duration}s ($(date -ud @${bins_duration} +'%M:%S'))"
+
+        compile_start=$(date +%s)
+        cargo test --locked --no-run
+        compile_end=$(date +%s)
+        compile_duration=$((compile_end - compile_start))
+        echo "::notice::Tests compiled in ${compile_duration}s ($(date -ud @${compile_duration} +'%M:%S'))"
 
         test_start=$(date +%s)
         if command -v cargo-nextest &> /dev/null; then
@@ -118,13 +124,18 @@ runs:
         fi
         test_end=$(date +%s)
         test_duration=$((test_end - test_start))
-        echo "::notice::Tests completed in ${test_duration}s ($(date -ud @${test_duration} +'%M:%S'))"
+        echo "::notice::Tests executed in ${test_duration}s ($(date -ud @${test_duration} +'%M:%S'))"
 
+        build_duration=$((bins_duration + compile_duration))
+        total_duration=$((build_duration + test_duration))
         echo ""
         echo "========================================="
-        echo "Build time: ${build_duration}s ($(date -ud @${build_duration} +'%M:%S'))"
-        echo "Test time:  ${test_duration}s ($(date -ud @${test_duration} +'%M:%S'))"
-        echo "Total time: $((build_duration + test_duration))s ($(date -ud @$((build_duration + test_duration)) +'%M:%S'))"
+        echo "All targets build:             ${bins_duration}s ($(date -ud @${bins_duration} +'%M:%S'))"
+        echo "Tests compile:                 ${compile_duration}s ($(date -ud @${compile_duration} +'%M:%S'))"
+        echo "Tests execute:                 ${test_duration}s ($(date -ud @${test_duration} +'%M:%S'))"
+        echo "-----------------------------------------"
+        echo "Total build:                   ${build_duration}s ($(date -ud @${build_duration} +'%M:%S'))"
+        echo "Total time:                    ${total_duration}s ($(date -ud @${total_duration} +'%M:%S'))"
         echo "========================================="
       shell: bash
 

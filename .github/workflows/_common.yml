@@ -33,8 +33,6 @@ jobs:
   rust-versions:
     name: Check Rust versions sync
     runs-on: ubuntu-latest
-    env:
-      IGGY_CI_BUILD: true
     steps:
       - uses: actions/checkout@v4
 
@@ -45,8 +43,6 @@ jobs:
     name: Check PR Title
     if: github.event_name == 'pull_request' && !inputs.skip_pr_title
     runs-on: ubuntu-latest
-    env:
-      IGGY_CI_BUILD: true
     steps:
       - name: Validate PR Title
         uses: amannn/action-semantic-pull-request@v5
@@ -107,8 +103,6 @@ jobs:
   license-headers:
     name: Check license headers
     runs-on: ubuntu-latest
-    env:
-      IGGY_CI_BUILD: true
     steps:
       - uses: actions/checkout@v4
 
@@ -127,8 +121,6 @@ jobs:
   license-list:
     name: Check licenses list
     runs-on: ubuntu-latest
-    env:
-      IGGY_CI_BUILD: true
     steps:
       - uses: actions/checkout@v4
 
@@ -145,8 +137,6 @@ jobs:
   markdown:
     name: Markdown lint
     runs-on: ubuntu-latest
-    env:
-      IGGY_CI_BUILD: true
     steps:
       - uses: actions/checkout@v4
 
@@ -164,8 +154,6 @@ jobs:
   shellcheck:
     name: Shell scripts lint
     runs-on: ubuntu-latest
-    env:
-      IGGY_CI_BUILD: true
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -182,8 +170,6 @@ jobs:
   trailing-whitespace:
     name: Check trailing whitespace
     runs-on: ubuntu-latest
-    env:
-      IGGY_CI_BUILD: true
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -196,8 +182,6 @@ jobs:
   trailing-newline:
     name: Check trailing newline
     runs-on: ubuntu-latest
-    env:
-      IGGY_CI_BUILD: true
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -210,8 +194,6 @@ jobs:
   toml-format:
     name: Check TOML formatting
     runs-on: ubuntu-latest
-    env:
-      IGGY_CI_BUILD: true
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -243,8 +225,6 @@ jobs:
       ]
     if: always()
     runs-on: ubuntu-latest
-    env:
-      IGGY_CI_BUILD: true
     steps:
       - name: Summary
         run: |
