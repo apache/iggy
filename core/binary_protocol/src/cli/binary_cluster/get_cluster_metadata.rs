@@ -75,7 +75,14 @@ impl CliCommand for GetClusterMetadataCmd {
                 let mut table = Table::new();
 
                 table.set_header(vec![
-                    "Name", "IP", "TCP", "QUIC", "HTTP", "WebSocket", "Role", "Status",
+                    "Name",
+                    "IP",
+                    "TCP",
+                    "QUIC",
+                    "HTTP",
+                    "WebSocket",
+                    "Role",
+                    "Status",
                 ]);
 
                 cluster_metadata.nodes.iter().for_each(|node| {

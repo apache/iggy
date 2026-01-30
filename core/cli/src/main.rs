@@ -23,9 +23,9 @@ mod logging;
 
 use crate::args::{
     Command, IggyConsoleArgs, client::ClientAction, cluster::ClusterAction,
-    consumer_group::ConsumerGroupAction,
-    consumer_offset::ConsumerOffsetAction, permissions::PermissionsArgs,
-    personal_access_token::PersonalAccessTokenAction, stream::StreamAction, topic::TopicAction,
+    consumer_group::ConsumerGroupAction, consumer_offset::ConsumerOffsetAction,
+    permissions::PermissionsArgs, personal_access_token::PersonalAccessTokenAction,
+    stream::StreamAction, topic::TopicAction,
 };
 use crate::credentials::IggyCredentials;
 use crate::error::{CmdToolError, IggyCmdError};

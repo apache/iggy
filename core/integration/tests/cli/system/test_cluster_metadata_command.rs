@@ -17,7 +17,7 @@
  */
 
 use crate::cli::common::{
-    IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestHelpCmd, CLAP_INDENT, USAGE_PREFIX,
+    CLAP_INDENT, IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestHelpCmd, USAGE_PREFIX,
 };
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
@@ -65,9 +65,9 @@ impl IggyCmdTestCase for TestClusterMetadataCmd {
     fn verify_command(&self, command_state: Assert) {
         match self.output_mode {
             TestClusterMetadataCmdOutput::Table => {
-                let assert = command_state
-                    .success()
-                    .stdout(starts_with("Executing get cluster metadata in table mode\n"));
+                let assert = command_state.success().stdout(starts_with(
+                    "Executing get cluster metadata in table mode\n",
+                ));
 
                 let assert = assert.stdout(contains("Cluster name:"));
 
@@ -102,7 +102,9 @@ pub async fn should_be_successful_table_mode() {
     let mut iggy_cmd_test = IggyCmdTest::default();
     iggy_cmd_test.setup().await;
     iggy_cmd_test
-        .execute_test(TestClusterMetadataCmd::new(TestClusterMetadataCmdOutput::Table))
+        .execute_test(TestClusterMetadataCmd::new(
+            TestClusterMetadataCmdOutput::Table,
+        ))
         .await;
 }
 
@@ -112,7 +114,9 @@ pub async fn should_be_successful_list_mode() {
     let mut iggy_cmd_test = IggyCmdTest::default();
     iggy_cmd_test.setup().await;
     iggy_cmd_test
-        .execute_test(TestClusterMetadataCmd::new(TestClusterMetadataCmdOutput::List))
+        .execute_test(TestClusterMetadataCmd::new(
+            TestClusterMetadataCmdOutput::List,
+        ))
         .await;
 }
 
