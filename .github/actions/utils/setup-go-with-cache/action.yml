@@ -1,0 +1,104 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# NOTE: this action sets up the Go toolchain + caching for dependencies,
+#       it is a convenience wrapper, so that we can use it in all workflows.
+
+name: setup-go-with-cache
+description: Setup Go toolchain and comprehensive caching (go mod cache + golangci-lint cache)
+inputs:
+  go-version:
+    description: "Go version to use"
+    required: false
+    default: "1.23.0"
+  enabled:
+    description: "Whether to enable caching"
+    required: false
+    default: "true"
+  cache-dependency-path:
+    description: "Paths to go.sum files for caching (newline separated)"
+    required: false
+    default: |
+      foreign/go/go.sum
+      bdd/go/go.sum
+      examples/go/go.sum
+  download-deps:
+    description: "Whether to download module dependencies"
+    required: false
+    default: "true"
+  golangci-lint-version:
+    description: "golangci-lint version for cache key"
+    required: false
+    default: "v1.61"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Setup Go toolchain
+      uses: actions/setup-go@v5
+      with:
+        go-version: ${{ inputs.go-version }}
+        cache: ${{ inputs.enabled }}
+        cache-dependency-path: ${{ inputs.cache-dependency-path }}
+
+    - name: Setup additional Go module cache
+      if: inputs.enabled == 'true'
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/go/pkg/mod
+          ~/.cache/go-build
+        key: go-mod-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/go.sum') }}
+        restore-keys: |
+          go-mod-${{ runner.os }}-${{ runner.arch }}-
+
+    - name: Setup golangci-lint cache
+      if: inputs.enabled == 'true'
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/golangci-lint
+        key: golangci-lint-${{ runner.os }}-${{ inputs.golangci-lint-version }}-${{ hashFiles('**/go.sum') }}
+        restore-keys: |
+          golangci-lint-${{ runner.os }}-${{ inputs.golangci-lint-version }}-
+
+    - name: Download Go module dependencies
+      if: inputs.download-deps == 'true'
+      run: |
+        echo "📦 Downloading Go module dependencies..."
+
+        download_if_exists() {
+          local dir="$1"
+          if [ -f "${dir}/go.mod" ]; then
+            echo "  → ${dir}"
+            cd "${dir}" && go mod download && cd - > /dev/null
+          fi
+        }
+
+        download_if_exists "foreign/go"
+        download_if_exists "bdd/go"
+        download_if_exists "examples/go"
+
+        echo "✅ Go dependencies downloaded"
+      shell: bash
+
+    - name: Verify Go installation
+      run: |
+        echo "✅ Go setup complete"
+        go version
+        echo "GOPATH: $(go env GOPATH)"
+        echo "GOCACHE: $(go env GOCACHE)"
+      shell: bash
