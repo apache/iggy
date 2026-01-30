@@ -138,7 +138,7 @@ public final class MessageHeadersConsumer {
                 return;
             }
 
-            messageType = headerValue.value();
+            messageType = headerValue.asString();
             log.info(
                     "Handling message type: {} at offset: {}...",
                     messageType,

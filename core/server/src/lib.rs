@@ -1,4 +1,5 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
  * regarding copyright ownership.  The ASF licenses this file
@@ -19,7 +20,7 @@
 #[cfg(not(feature = "disable-mimalloc"))]
 use mimalloc::MiMalloc;
 
-use crate::versioning::SemanticVersion;
+use iggy_common::SemanticVersion;
 
 #[cfg(not(feature = "disable-mimalloc"))]
 #[global_allocator]
@@ -44,10 +45,9 @@ pub mod shard;
 pub mod state;
 pub mod streaming;
 pub mod tcp;
-pub mod versioning;
 pub mod websocket;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-pub const SEMANTIC_VERSION: SemanticVersion = SemanticVersion::current();
+pub const SEMANTIC_VERSION: SemanticVersion = SemanticVersion::parse_const(VERSION);
 pub const IGGY_ROOT_USERNAME_ENV: &str = "IGGY_ROOT_USERNAME";
 pub const IGGY_ROOT_PASSWORD_ENV: &str = "IGGY_ROOT_PASSWORD";

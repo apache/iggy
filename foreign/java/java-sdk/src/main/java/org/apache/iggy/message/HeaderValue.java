@@ -215,9 +215,21 @@ public record HeaderValue(HeaderKind kind, byte[] value) {
 
     @Override
     public String toString() {
+        return toStringValue();
+    }
+
+    private String toStringValue() {
+        if (kind == HeaderKind.String) {
+            return asString();
+        }
+        if (kind == HeaderKind.Bool) {
+            return String.valueOf(asBool());
+        }
+        return numericOrRawToString();
+    }
+
+    private String numericOrRawToString() {
         return switch (kind) {
-            case String -> asString();
-            case Bool -> String.valueOf(asBool());
             case Int8 -> String.valueOf(asInt8());
             case Int16 -> String.valueOf(asInt16());
             case Int32 -> String.valueOf(asInt32());
@@ -227,7 +239,7 @@ public record HeaderValue(HeaderKind kind, byte[] value) {
             case Uint32 -> String.valueOf(asUint32());
             case Float32 -> String.valueOf(asFloat32());
             case Float64 -> String.valueOf(asFloat64());
-            case Raw, Int128, Uint64, Uint128 -> Base64.getEncoder().encodeToString(value);
+            default -> Base64.getEncoder().encodeToString(value);
         };
     }
 }

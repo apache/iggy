@@ -25,7 +25,6 @@ import org.apache.iggy.examples.shared.MessagesGenerator;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
 import org.apache.iggy.message.HeaderKey;
-import org.apache.iggy.message.HeaderKind;
 import org.apache.iggy.message.HeaderValue;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.Partitioning;
@@ -114,8 +113,7 @@ public final class MessageHeadersProducer {
                 String messageType = serializableMessage.getMessageType();
                 String json = serializableMessage.toJson();
                 Map<HeaderKey, HeaderValue> userHeaders = new HashMap<>();
-                userHeaders.put(
-                        HeaderKey.fromString(MESSAGE_TYPE_HEADER), new HeaderValue(HeaderKind.String, messageType));
+                userHeaders.put(HeaderKey.fromString(MESSAGE_TYPE_HEADER), HeaderValue.fromString(messageType));
                 messages.add(Message.of(json, userHeaders));
                 serializableMessages.add(serializableMessage);
             }
