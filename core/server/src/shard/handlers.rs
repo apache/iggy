@@ -32,7 +32,7 @@ use crate::{
         tcp_listener::cleanup_connection,
     },
 };
-use compio_net::TcpStream;
+use compio::net::TcpStream;
 use iggy_common::sharding::IggyNamespace;
 use iggy_common::{Identifier, IggyError, SenderKind, TransportProtocol};
 use nix::sys::stat::SFlag;

@@ -49,10 +49,6 @@ bytes = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
 compio = { workspace = true }
-compio-net = { workspace = true }
-compio-quic = { workspace = true }
-compio-tls = { workspace = true }
-compio-ws = { workspace = true }
 configs = { workspace = true }
 ctrlc = { workspace = true }
 cyper = { workspace = true }
