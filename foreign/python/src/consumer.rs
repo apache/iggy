@@ -140,7 +140,7 @@ impl IggyConsumer {
     /// only the interval part is applied; the `after` mode is ignored.
     /// Use `consume_messages()` if you need commit-after-processing semantics.
     #[gen_stub(override_return_type(type_repr="collections.abc.AsyncIterator[ReceiveMessage]", imports=("collections.abc")))]
-    fn iter_messages<'a>(&self) -> ReceiveMessageIterator {
+    fn iter_messages(&self) -> ReceiveMessageIterator {
         let inner = self.inner.clone();
         ReceiveMessageIterator { inner }
     }
@@ -164,10 +164,10 @@ impl IggyConsumer {
         future_into_py(py, async {
             let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
-            let task_locals = Python::with_gil(pyo3_async_runtimes::tokio::get_current_locals)?;
+            let task_locals = Python::attach(pyo3_async_runtimes::tokio::get_current_locals)?;
             let handle_consume = get_runtime().spawn(scope(task_locals, async move {
                 let task_locals =
-                    Python::with_gil(pyo3_async_runtimes::tokio::get_current_locals).unwrap();
+                    Python::attach(pyo3_async_runtimes::tokio::get_current_locals).unwrap();
                 let consumer = PyCallbackConsumer {
                     callback: Arc::new(callback),
                     task_locals: Arc::new(Mutex::new(task_locals)),
@@ -178,12 +178,12 @@ impl IggyConsumer {
             let consume_result;
 
             if let Some(shutdown_event) = shutdown_event {
-                let task_locals = Python::with_gil(pyo3_async_runtimes::tokio::get_current_locals)?;
+                let task_locals = Python::attach(pyo3_async_runtimes::tokio::get_current_locals)?;
                 async fn shutdown_impl(
                     shutdown_event: Py<PyAny>,
                     shutdown_tx: Sender<()>,
                 ) -> PyResult<()> {
-                    Python::with_gil(|py| {
+                    Python::attach(|py| {
                         into_future(
                             shutdown_event
                                 .bind(py)
@@ -226,14 +226,14 @@ impl MessageConsumer for PyCallbackConsumer {
     async fn consume(&self, received: ReceivedMessage) -> Result<(), IggyError> {
         let callback = self.callback.clone();
         let task_locals = self.task_locals.clone().lock_owned().await;
-        let task_locals = Python::with_gil(|py| task_locals.clone_ref(py));
+        let task_locals = task_locals.clone();
         let message = ReceiveMessage {
             inner: received.message,
             partition_id: received.partition_id,
         };
         get_runtime()
             .spawn(scope(task_locals, async move {
-                Python::with_gil(|py| {
+                Python::attach(|py| {
                     let callback = callback.bind(py);
                     let result = callback.as_any().call1((message,))?;
                     into_future(result)
@@ -344,7 +344,7 @@ impl From<&AutoCommitAfter> for RustAutoCommitAfter {
 }
 
 pub fn py_delta_to_iggy_duration(delta1: &Py<PyDelta>) -> IggyDuration {
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         let delta = delta1.bind(py);
         let seconds = (delta.get_days() * 60 * 60 * 24 + delta.get_seconds()) as u64;
         let nanos = (delta.get_microseconds() * 1_000) as u32;
