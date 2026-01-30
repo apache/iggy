@@ -57,13 +57,13 @@ impl FromStr for Codec {
 impl Codec {
     /// Returns the key to indicate compressed messages as HeaderKey.
     pub fn header_key() -> HeaderKey {
-        HeaderKey::new(COMPRESSION_HEADER_KEY)
+        HeaderKey::try_from(COMPRESSION_HEADER_KEY)
             .expect("COMPRESSION_HEADER_KEY is an InvalidHeaderKey.")
     }
 
     /// Returns the compression algorithm type as HeaderValue.
     pub fn to_header_value(&self) -> HeaderValue {
-        HeaderValue::from_str(&self.to_string()).expect("failed generating HeaderValue.")
+        HeaderValue::try_from(self.to_string()).expect("failed generating HeaderValue.")
     }
 
     /// Returns a Codec from a HeaderValue. Used when reading messages from the server.

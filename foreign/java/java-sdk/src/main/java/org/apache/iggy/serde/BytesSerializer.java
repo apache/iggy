@@ -25,6 +25,7 @@ import org.apache.commons.lang3.ArrayUtils;
 import org.apache.iggy.consumergroup.Consumer;
 import org.apache.iggy.exception.IggyInvalidArgumentException;
 import org.apache.iggy.identifier.Identifier;
+import org.apache.iggy.message.HeaderKey;
 import org.apache.iggy.message.HeaderValue;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.MessageHeader;
@@ -120,20 +121,21 @@ public final class BytesSerializer {
         return buffer;
     }
 
-    public static ByteBuf toBytes(Map<String, HeaderValue> headers) {
+    public static ByteBuf toBytes(Map<HeaderKey, HeaderValue> headers) {
         if (headers.isEmpty()) {
             return Unpooled.EMPTY_BUFFER;
         }
         var buffer = Unpooled.buffer();
-        for (Map.Entry<String, HeaderValue> entry : headers.entrySet()) {
-            String key = entry.getKey();
-            buffer.writeIntLE(key.length());
-            buffer.writeBytes(key.getBytes());
+        for (Map.Entry<HeaderKey, HeaderValue> entry : headers.entrySet()) {
+            HeaderKey key = entry.getKey();
+            buffer.writeByte(key.kind().asCode());
+            buffer.writeIntLE(key.value().length);
+            buffer.writeBytes(key.value());
 
             HeaderValue value = entry.getValue();
             buffer.writeByte(value.kind().asCode());
-            buffer.writeIntLE(value.value().length());
-            buffer.writeBytes(value.value().getBytes());
+            buffer.writeIntLE(value.value().length);
+            buffer.writeBytes(value.value());
         }
         return buffer;
     }
@@ -217,7 +219,7 @@ public final class BytesSerializer {
         }
         ByteBuf buffer = Unpooled.buffer(8, 8);
         byte[] valueAsBytes = value.toByteArray();
-        if (valueAsBytes.length > 9 || valueAsBytes.length == 9 && valueAsBytes[0] != 0) {
+        if (valueAsBytes.length > 9 || (valueAsBytes.length == 9 && valueAsBytes[0] != 0)) {
             throw new IggyInvalidArgumentException("Value too large for U64: " + value);
         }
         ArrayUtils.reverse(valueAsBytes);
@@ -234,7 +236,7 @@ public final class BytesSerializer {
         }
         ByteBuf buffer = Unpooled.buffer(16, 16);
         byte[] valueAsBytes = value.toByteArray();
-        if (valueAsBytes.length > 17 || valueAsBytes.length == 17 && valueAsBytes[0] != 0) {
+        if (valueAsBytes.length > 17 || (valueAsBytes.length == 17 && valueAsBytes[0] != 0)) {
             throw new IggyInvalidArgumentException("Value too large for U128: " + value);
         }
         ArrayUtils.reverse(valueAsBytes);

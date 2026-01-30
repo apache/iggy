@@ -17,109 +17,146 @@
  * under the License.
  */
 
+import { describe, it } from "node:test";
+import assert from "node:assert/strict";
+import { uuidv7, uuidv4 } from "uuidv7";
+import { SEND_MESSAGES, type SendMessages } from "./send-messages.command.js";
+import { HeaderValue, HeaderKeyFactory } from "./header.utils.js";
 
-import { describe, it } from 'node:test';
-import assert from 'node:assert/strict';
-import { uuidv7, uuidv4 } from 'uuidv7'
-import { SEND_MESSAGES, type SendMessages } from './send-messages.command.js';
-import { HeaderValue } from './header.utils.js';
-
-describe('SendMessages', () => {
-
-  describe('serialize', () => {
-
+describe("SendMessages", () => {
+  describe("serialize", () => {
     const t1 = {
       streamId: 911,
       topicId: 213,
       messages: [
-        { payload: 'a' },
-        { id: 0, payload: 'b' },
-        { id: 123, payload: 'X' },
-        { id: 0n, payload: 'c' },
-        { id: 1236234534554n, payload: 'X' },
-        { id: uuidv4(), payload: 'd' },
-        { id: uuidv7(), payload: 'e' },
+        { payload: "a" },
+        { id: 0, payload: "b" },
+        { id: 123, payload: "X" },
+        { id: 0n, payload: "c" },
+        { id: 1236234534554n, payload: "X" },
+        { id: uuidv4(), payload: "d" },
+        { id: uuidv7(), payload: "e" },
       ],
     };
 
-    it('serialize SendMessages into a buffer', () => {
-      assert.deepEqual(
-        SEND_MESSAGES.serialize(t1).length,
-        533
-      );
+    it("serialize SendMessages into a buffer", () => {
+      assert.deepEqual(SEND_MESSAGES.serialize(t1).length, 533);
     });
 
-    it('serialize all kinds of messageId', () => {
-      assert.doesNotThrow(
-        () => SEND_MESSAGES.serialize(t1),
-      );
+    it("serialize all kinds of messageId", () => {
+      assert.doesNotThrow(() => SEND_MESSAGES.serialize(t1));
     });
 
-    
-    it('does not throw on number message id', () => {
-      const t = { ...t1, messages: [{ id: 42, payload: 'm' }] };
-      assert.doesNotThrow(
-        () => SEND_MESSAGES.serialize(t)
-      );
+    it("does not throw on number message id", () => {
+      const t = { ...t1, messages: [{ id: 42, payload: "m" }] };
+      assert.doesNotThrow(() => SEND_MESSAGES.serialize(t));
     });
 
-    it('does not throw on bigint message id', () => {
-      const t = { ...t1, messages: [{ id: 123n, payload: 'm' }] };
-      assert.doesNotThrow(
-        () => SEND_MESSAGES.serialize(t)
-      );
+    it("does not throw on bigint message id", () => {
+      const t = { ...t1, messages: [{ id: 123n, payload: "m" }] };
+      assert.doesNotThrow(() => SEND_MESSAGES.serialize(t));
     });
 
-    it('does not throw on uuid message id', () => {
-      const t = { ...t1, messages: [{ id: uuidv4(), payload: 'uuid' }] };
-      assert.doesNotThrow(
-        () => SEND_MESSAGES.serialize(t)
-      );
+    it("does not throw on uuid message id", () => {
+      const t = { ...t1, messages: [{ id: uuidv4(), payload: "uuid" }] };
+      assert.doesNotThrow(() => SEND_MESSAGES.serialize(t));
     });
 
-    it('throw on invalid string message id', () => {
-      const t = { ...t1, messages: [{ id: 'foo', payload: 'm' }] };
-      assert.throws(
-        () => SEND_MESSAGES.serialize(t)
-      );
+    it("throw on invalid string message id", () => {
+      const t = { ...t1, messages: [{ id: "foo", payload: "m" }] };
+      assert.throws(() => SEND_MESSAGES.serialize(t));
     });
 
-    it('throw on invalid number message id', () => {
-      const t = { ...t1, messages: [{ id: -12, payload: 'n' }] };
-      assert.throws(
-        () => SEND_MESSAGES.serialize(t)
-      );
+    it("throw on invalid number message id", () => {
+      const t = { ...t1, messages: [{ id: -12, payload: "n" }] };
+      assert.throws(() => SEND_MESSAGES.serialize(t));
     });
 
-    it('throw on invalid bigint message id', () => {
-      const t = { ...t1, messages: [{ id: -12n, payload: 'bn' }] };
-      assert.throws(
-        () => SEND_MESSAGES.serialize(t)
-      );
+    it("throw on invalid bigint message id", () => {
+      const t = { ...t1, messages: [{ id: -12n, payload: "bn" }] };
+      assert.throws(() => SEND_MESSAGES.serialize(t));
     });
 
-    
-    it('serialize message with headers', () => {
+    it("serialize message with headers", () => {
       const t: SendMessages = {
         streamId: 911,
         topicId: 213,
         messages: [
-          { payload: 'm', headers: { p: HeaderValue.Bool(true) } },
-          { payload: 'q', headers: { 'v-aze': HeaderValue.Uint8(128) } },
-          { payload: 'x', headers: { q: HeaderValue.Double(1/3) } },
-          { payload: 's', headers: { x: HeaderValue.Uint32(123) } },
-          { payload: 'r', headers: { y: HeaderValue.Uint64(42n) } },
-          { payload: 'g', headers: { y: HeaderValue.Float(42.3) } },
-          { payload: 'c', headers: { ID: HeaderValue.String(uuidv7()) } },
-          { payload: 'l', headers: { val: HeaderValue.Raw(Buffer.from(uuidv4())) } }
-        ]
+          {
+            payload: "m",
+            headers: [
+              {
+                key: HeaderKeyFactory.String("p"),
+                value: HeaderValue.Bool(true),
+              },
+            ],
+          },
+          {
+            payload: "q",
+            headers: [
+              {
+                key: HeaderKeyFactory.String("v-aze"),
+                value: HeaderValue.Uint8(128),
+              },
+            ],
+          },
+          {
+            payload: "x",
+            headers: [
+              {
+                key: HeaderKeyFactory.String("q"),
+                value: HeaderValue.Double(1 / 3),
+              },
+            ],
+          },
+          {
+            payload: "s",
+            headers: [
+              {
+                key: HeaderKeyFactory.String("x"),
+                value: HeaderValue.Uint32(123),
+              },
+            ],
+          },
+          {
+            payload: "r",
+            headers: [
+              {
+                key: HeaderKeyFactory.String("y"),
+                value: HeaderValue.Uint64(42n),
+              },
+            ],
+          },
+          {
+            payload: "g",
+            headers: [
+              {
+                key: HeaderKeyFactory.String("y"),
+                value: HeaderValue.Float(42.3),
+              },
+            ],
+          },
+          {
+            payload: "c",
+            headers: [
+              {
+                key: HeaderKeyFactory.String("ID"),
+                value: HeaderValue.String(uuidv7()),
+              },
+            ],
+          },
+          {
+            payload: "l",
+            headers: [
+              {
+                key: HeaderKeyFactory.String("val"),
+                value: HeaderValue.Raw(Buffer.from(uuidv4())),
+              },
+            ],
+          },
+        ],
       };
-      assert.doesNotThrow(
-        () => SEND_MESSAGES.serialize(t)
-      );
+      assert.doesNotThrow(() => SEND_MESSAGES.serialize(t));
     });
-
-
-
   });
 });

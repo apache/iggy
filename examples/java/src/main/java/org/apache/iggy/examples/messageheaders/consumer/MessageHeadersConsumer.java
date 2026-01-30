@@ -27,6 +27,7 @@ import org.apache.iggy.examples.shared.Messages.OrderCreated;
 import org.apache.iggy.examples.shared.Messages.OrderRejected;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
+import org.apache.iggy.message.HeaderKey;
 import org.apache.iggy.message.HeaderValue;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.PolledMessages;
@@ -42,6 +43,7 @@ import java.util.Map;
 import java.util.Optional;
 
 public final class MessageHeadersConsumer {
+
     private static final String STREAM_NAME = "headers-stream";
     private static final StreamId STREAM_ID = StreamId.of(STREAM_NAME);
 
@@ -110,7 +112,6 @@ public final class MessageHeadersConsumer {
                 consumedBatches++;
 
                 offset = offset.add(BigInteger.valueOf(polledMessages.messages().size()));
-
             } catch (Exception e) {
                 log.error("Error polling messages", e);
                 break;
@@ -123,13 +124,13 @@ public final class MessageHeadersConsumer {
         String messageType = "unknown";
 
         try {
-            Map<String, HeaderValue> userHeaders = message.userHeaders();
+            Map<HeaderKey, HeaderValue> userHeaders = message.userHeaders();
             if (userHeaders.isEmpty()) {
                 log.warn("Missing headers at offset {}.", message.header().offset());
                 return;
             }
 
-            HeaderValue headerValue = userHeaders.get(MESSAGE_TYPE_HEADER);
+            HeaderValue headerValue = userHeaders.get(HeaderKey.fromString(MESSAGE_TYPE_HEADER));
             if (headerValue == null) {
                 log.warn(
                         "Missing message type header at offset {}.",
@@ -137,7 +138,7 @@ public final class MessageHeadersConsumer {
                 return;
             }
 
-            messageType = headerValue.value();
+            messageType = headerValue.asString();
             log.info(
                     "Handling message type: {} at offset: {}...",
                     messageType,

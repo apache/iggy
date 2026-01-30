@@ -23,7 +23,7 @@ use integration::{
     test_server::{ClientFactory, IpAddrKind, SYSTEM_PATH_ENV_VAR, TestServer, login_root},
 };
 use serial_test::parallel;
-use std::{collections::HashMap, str::FromStr};
+use std::collections::HashMap;
 use test_case::test_matrix;
 
 fn encryption_enabled() -> bool {
@@ -97,22 +97,13 @@ async fn should_fill_data_with_headers_and_verify_after_restart_using_api(encryp
 
     for i in 0..messages_per_batch {
         let mut headers = HashMap::new();
+        headers.insert(HeaderKey::try_from("batch").unwrap(), 1u64.into());
+        headers.insert(HeaderKey::try_from("index").unwrap(), i.into());
         headers.insert(
-            HeaderKey::new("batch").unwrap(),
-            HeaderValue::from_uint64(1).unwrap(),
+            HeaderKey::try_from("type").unwrap(),
+            HeaderValue::try_from("test-message").unwrap(),
         );
-        headers.insert(
-            HeaderKey::new("index").unwrap(),
-            HeaderValue::from_uint64(i).unwrap(),
-        );
-        headers.insert(
-            HeaderKey::new("type").unwrap(),
-            HeaderValue::from_str("test-message").unwrap(),
-        );
-        headers.insert(
-            HeaderKey::new("encrypted").unwrap(),
-            HeaderValue::from_bool(encryption).unwrap(),
-        );
+        headers.insert(HeaderKey::try_from("encrypted").unwrap(), encryption.into());
 
         let message = IggyMessage::builder()
             .id((i + 1) as u128)
@@ -195,7 +186,7 @@ async fn should_fill_data_with_headers_and_verify_after_restart_using_api(encryp
         let headers = msg.user_headers_map().unwrap().unwrap();
         assert_eq!(
             headers
-                .get(&HeaderKey::new("batch").unwrap())
+                .get(&HeaderKey::try_from("batch").unwrap())
                 .unwrap()
                 .as_uint64()
                 .unwrap(),
@@ -203,7 +194,7 @@ async fn should_fill_data_with_headers_and_verify_after_restart_using_api(encryp
         );
         assert_eq!(
             headers
-                .get(&HeaderKey::new("type").unwrap())
+                .get(&HeaderKey::try_from("type").unwrap())
                 .unwrap()
                 .as_str()
                 .unwrap(),
@@ -211,7 +202,7 @@ async fn should_fill_data_with_headers_and_verify_after_restart_using_api(encryp
         );
         assert_eq!(
             headers
-                .get(&HeaderKey::new("encrypted").unwrap())
+                .get(&HeaderKey::try_from("encrypted").unwrap())
                 .unwrap()
                 .as_bool()
                 .unwrap(),
@@ -242,22 +233,13 @@ async fn should_fill_data_with_headers_and_verify_after_restart_using_api(encryp
 
     for i in 0..messages_per_batch {
         let mut headers = HashMap::new();
+        headers.insert(HeaderKey::try_from("batch").unwrap(), 2u64.into());
+        headers.insert(HeaderKey::try_from("index").unwrap(), i.into());
         headers.insert(
-            HeaderKey::new("batch").unwrap(),
-            HeaderValue::from_uint64(2).unwrap(),
+            HeaderKey::try_from("type").unwrap(),
+            HeaderValue::try_from("test-message-after-restart").unwrap(),
         );
-        headers.insert(
-            HeaderKey::new("index").unwrap(),
-            HeaderValue::from_uint64(i).unwrap(),
-        );
-        headers.insert(
-            HeaderKey::new("type").unwrap(),
-            HeaderValue::from_str("test-message-after-restart").unwrap(),
-        );
-        headers.insert(
-            HeaderKey::new("encrypted").unwrap(),
-            HeaderValue::from_bool(encryption).unwrap(),
-        );
+        headers.insert(HeaderKey::try_from("encrypted").unwrap(), encryption.into());
 
         let message = IggyMessage::builder()
             .id((messages_per_batch + i + 1) as u128)
@@ -322,7 +304,7 @@ async fn should_fill_data_with_headers_and_verify_after_restart_using_api(encryp
         assert!(msg.user_headers.is_some());
         let headers = msg.user_headers_map().unwrap().unwrap();
         let batch_num = headers
-            .get(&HeaderKey::new("batch").unwrap())
+            .get(&HeaderKey::try_from("batch").unwrap())
             .unwrap()
             .as_uint64()
             .unwrap();
@@ -331,7 +313,7 @@ async fn should_fill_data_with_headers_and_verify_after_restart_using_api(encryp
             batch_1_count += 1;
             assert_eq!(
                 headers
-                    .get(&HeaderKey::new("type").unwrap())
+                    .get(&HeaderKey::try_from("type").unwrap())
                     .unwrap()
                     .as_str()
                     .unwrap(),
@@ -339,7 +321,7 @@ async fn should_fill_data_with_headers_and_verify_after_restart_using_api(encryp
             );
             assert_eq!(
                 headers
-                    .get(&HeaderKey::new("encrypted").unwrap())
+                    .get(&HeaderKey::try_from("encrypted").unwrap())
                     .unwrap()
                     .as_bool()
                     .unwrap(),
@@ -349,7 +331,7 @@ async fn should_fill_data_with_headers_and_verify_after_restart_using_api(encryp
             batch_2_count += 1;
             assert_eq!(
                 headers
-                    .get(&HeaderKey::new("type").unwrap())
+                    .get(&HeaderKey::try_from("type").unwrap())
                     .unwrap()
                     .as_str()
                     .unwrap(),

@@ -26,6 +26,7 @@ import org.apache.iggy.consumergroup.ConsumerGroupDetails;
 import org.apache.iggy.consumergroup.ConsumerGroupMember;
 import org.apache.iggy.consumeroffset.ConsumerOffsetInfo;
 import org.apache.iggy.message.BytesMessageId;
+import org.apache.iggy.message.HeaderKey;
 import org.apache.iggy.message.HeaderKind;
 import org.apache.iggy.message.HeaderValue;
 import org.apache.iggy.message.Message;
@@ -196,21 +197,24 @@ public final class BytesDeserializer {
                 new MessageHeader(checksum, id, offset, timestamp, originTimestamp, userHeadersLength, payloadLength);
         var payload = newByteArray(payloadLength);
         response.readBytes(payload);
-        Map<String, HeaderValue> userHeaders = new HashMap<>();
+        Map<HeaderKey, HeaderValue> userHeaders = new HashMap<>();
         if (userHeadersLength > 0) {
             ByteBuf userHeadersBuffer = response.readSlice(toInt(userHeadersLength));
-            Map<String, HeaderValue> headers = new HashMap<>();
+            Map<HeaderKey, HeaderValue> headers = new HashMap<>();
             while (userHeadersBuffer.isReadable()) {
+                var userHeaderKeyKindCode = userHeadersBuffer.readUnsignedByte();
                 var userHeaderKeyLength = userHeadersBuffer.readUnsignedIntLE();
-                var userHeaderKey = userHeadersBuffer
-                        .readCharSequence(toInt(userHeaderKeyLength), StandardCharsets.UTF_8)
-                        .toString();
-                var userHeaderKindCode = userHeadersBuffer.readUnsignedByte();
+                byte[] userHeaderKeyBytes = new byte[toInt(userHeaderKeyLength)];
+                userHeadersBuffer.readBytes(userHeaderKeyBytes);
+                var userHeaderKey = new HeaderKey(HeaderKind.fromCode(userHeaderKeyKindCode), userHeaderKeyBytes);
+
+                var userHeaderValueKindCode = userHeadersBuffer.readUnsignedByte();
                 var userHeaderValueLength = userHeadersBuffer.readUnsignedIntLE();
-                String userHeaderValue = userHeadersBuffer
-                        .readCharSequence(toInt(userHeaderValueLength), StandardCharsets.UTF_8)
-                        .toString();
-                headers.put(userHeaderKey, new HeaderValue(HeaderKind.fromCode(userHeaderKindCode), userHeaderValue));
+                byte[] userHeaderValueBytes = new byte[toInt(userHeaderValueLength)];
+                userHeadersBuffer.readBytes(userHeaderValueBytes);
+                headers.put(
+                        userHeaderKey,
+                        new HeaderValue(HeaderKind.fromCode(userHeaderValueKindCode), userHeaderValueBytes));
             }
             userHeaders = headers;
         }

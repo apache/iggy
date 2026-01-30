@@ -26,7 +26,7 @@ import org.apache.iggy.exception.IggyInvalidArgumentException;
 import org.apache.iggy.identifier.ConsumerId;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.message.BytesMessageId;
-import org.apache.iggy.message.HeaderKind;
+import org.apache.iggy.message.HeaderKey;
 import org.apache.iggy.message.HeaderValue;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.MessageHeader;
@@ -445,7 +445,7 @@ class BytesSerializerTest {
         @Test
         void shouldSerializeEmptyHeaders() {
             // given
-            Map<String, HeaderValue> headers = new HashMap<>();
+            Map<HeaderKey, HeaderValue> headers = new HashMap<>();
 
             // when
             ByteBuf result = BytesSerializer.toBytes(headers);
@@ -457,13 +457,14 @@ class BytesSerializerTest {
         @Test
         void shouldSerializeSingleHeader() {
             // given
-            Map<String, HeaderValue> headers = new HashMap<>();
-            headers.put("key1", new HeaderValue(HeaderKind.Raw, "value1"));
+            Map<HeaderKey, HeaderValue> headers = new HashMap<>();
+            headers.put(HeaderKey.fromString("key1"), HeaderValue.fromRaw("value1".getBytes()));
 
             // when
             ByteBuf result = BytesSerializer.toBytes(headers);
 
             // then
+            assertThat(result.readByte()).isEqualTo((byte) 2); // String kind
             assertThat(result.readIntLE()).isEqualTo(4); // "key1".length()
             byte[] keyBytes = new byte[4];
             result.readBytes(keyBytes);
@@ -478,15 +479,15 @@ class BytesSerializerTest {
         @Test
         void shouldSerializeMultipleHeaders() {
             // given
-            Map<String, HeaderValue> headers = new HashMap<>();
-            headers.put("k1", new HeaderValue(HeaderKind.Raw, "v1")); // 13 bytes
-            headers.put("k2", new HeaderValue(HeaderKind.String, "v2")); // 13 bytes
+            Map<HeaderKey, HeaderValue> headers = new HashMap<>();
+            headers.put(HeaderKey.fromString("k1"), HeaderValue.fromRaw("v1".getBytes()));
+            headers.put(HeaderKey.fromString("k2"), HeaderValue.fromString("v2"));
 
             // when
             ByteBuf result = BytesSerializer.toBytes(headers);
 
             // then - verify buffer contains data for both headers
-            assertThat(result.readableBytes()).isEqualTo(26);
+            assertThat(result.readableBytes()).isEqualTo(28);
         }
     }
 
@@ -520,8 +521,8 @@ class BytesSerializerTest {
         void shouldSerializeMessageWithUserHeaders() {
             // given
             var messageId = new BytesMessageId(new byte[16]);
-            Map<String, HeaderValue> userHeaders = new HashMap<>();
-            userHeaders.put("key", new HeaderValue(HeaderKind.Raw, "val"));
+            Map<HeaderKey, HeaderValue> userHeaders = new HashMap<>();
+            userHeaders.put(HeaderKey.fromString("key"), HeaderValue.fromRaw("val".getBytes()));
 
             // Calculate user headers size
             ByteBuf headersBuf = BytesSerializer.toBytes(userHeaders);

@@ -17,17 +17,16 @@
  * under the License.
  */
 
-
-import { type Id } from '../identifier.utils.js';
-import { type ValueOf, reverseRecord } from '../../type.utils.js';
-import { serializeGetOffset, type Consumer } from '../offset/offset.utils.js';
-import { deserializeHeaders, type HeadersMap } from './header.utils.js';
-import { Transform, type TransformCallback } from 'node:stream';
+import { type Id } from "../identifier.utils.js";
+import { type ValueOf, reverseRecord } from "../../type.utils.js";
+import { serializeGetOffset, type Consumer } from "../offset/offset.utils.js";
+import { deserializeHeaders, type ParsedHeaderEntry } from "./header.utils.js";
+import { Transform, type TransformCallback } from "node:stream";
 import {
   deserializeIggyMessageHeaders,
   IGGY_MESSAGE_HEADER_SIZE,
-  type IggyMessageHeader
-} from './iggy-header.utils.js';
+  type IggyMessageHeader,
+} from "./iggy-header.utils.js";
 
 /**
  * Enumeration of message polling strategies.
@@ -42,7 +41,7 @@ export const PollingStrategyKind = {
   /** Poll from the last message */
   Last: 4,
   /** Poll the next unconsumed message */
-  Next: 5
+  Next: 5,
 } as const;
 
 /** Type alias for the PollingStrategyKind object */
@@ -50,65 +49,64 @@ export type PollingStrategyKind = typeof PollingStrategyKind;
 /** String literal type of polling strategy names */
 export type PollingStrategyKindId = keyof PollingStrategyKind;
 /** Numeric values of polling strategies */
-export type PollingStrategyKindValue = ValueOf<PollingStrategyKind>
+export type PollingStrategyKindValue = ValueOf<PollingStrategyKind>;
 
 /** Polling from a specific offset */
 export type OffsetPollingStrategy = {
-  kind: PollingStrategyKind['Offset'],
+  kind: PollingStrategyKind["Offset"];
   /** Offset to start polling from */
-  value: bigint
-}
+  value: bigint;
+};
 
 /** Polling from a specific timestamp */
 export type TimestampPollingStrategy = {
-  kind: PollingStrategyKind['Timestamp'],
+  kind: PollingStrategyKind["Timestamp"];
   /** Timestamp in microseconds */
-  value: bigint
-}
+  value: bigint;
+};
 
 /** Polling from the first message */
 export type FirstPollingStrategy = {
-  kind: PollingStrategyKind['First'],
-  value: 0n
-}
+  kind: PollingStrategyKind["First"];
+  value: 0n;
+};
 
 /** Polling from the last message */
 export type LastPollingStrategy = {
-  kind: PollingStrategyKind['Last'],
-  value: 0n
-}
+  kind: PollingStrategyKind["Last"];
+  value: 0n;
+};
 
 /** Polling the next unconsumed message */
 export type NextPollingStrategy = {
-  kind: PollingStrategyKind['Next'],
-  value: 0n
-}
+  kind: PollingStrategyKind["Next"];
+  value: 0n;
+};
 
 /** Union of all polling strategy types */
 export type PollingStrategy =
-  OffsetPollingStrategy |
-  TimestampPollingStrategy |
-  FirstPollingStrategy |
-  LastPollingStrategy |
-  NextPollingStrategy;
-
+  | OffsetPollingStrategy
+  | TimestampPollingStrategy
+  | FirstPollingStrategy
+  | LastPollingStrategy
+  | NextPollingStrategy;
 
 /** Next polling strategy constant */
 const Next: NextPollingStrategy = {
   kind: PollingStrategyKind.Next,
-  value:0n
+  value: 0n,
 };
 
 /** First polling strategy constant */
 const First: FirstPollingStrategy = {
   kind: PollingStrategyKind.First,
-  value:0n
+  value: 0n,
 };
 
 /** Last polling strategy constant */
 const Last: LastPollingStrategy = {
   kind: PollingStrategyKind.Last,
-  value:0n
+  value: 0n,
 };
 
 /**
@@ -119,7 +117,7 @@ const Last: LastPollingStrategy = {
  */
 const Offset = (n: bigint): OffsetPollingStrategy => ({
   kind: PollingStrategyKind.Offset,
-  value: n
+  value: n,
 });
 
 /**
@@ -130,7 +128,7 @@ const Offset = (n: bigint): OffsetPollingStrategy => ({
  */
 const Timestamp = (n: bigint): TimestampPollingStrategy => ({
   kind: PollingStrategyKind.Timestamp,
-  value: n
+  value: n,
 });
 
 /**
@@ -141,9 +139,8 @@ export const PollingStrategy = {
   First,
   Last,
   Offset,
-  Timestamp
+  Timestamp,
 };
-
 
 /**
  * Serializes a poll messages command payload.
@@ -174,7 +171,7 @@ export const serializePollMessages = (
 
   return Buffer.concat([
     serializeGetOffset(streamId, topicId, consumer, partitionId),
-    b
+    b,
   ]);
 };
 
@@ -189,8 +186,8 @@ export const MessageState = {
   /** Message processing failed */
   Poisoned: 20,
   /** Message is scheduled for deletion */
-  MarkedForDeletion: 30
-}
+  MarkedForDeletion: 30,
+};
 
 /** Type alias for the MessageState object */
 type MessageState = typeof MessageState;
@@ -209,21 +206,21 @@ const ReverseMessageState = reverseRecord(MessageState);
  * @throws Error if the state is unknown
  */
 export const mapMessageState = (k: number): MessageStateId => {
-  if(!ReverseMessageState[k as MessageStateValue])
+  if (!ReverseMessageState[k as MessageStateValue])
     throw new Error(`unknow message state: ${k}`);
   return ReverseMessageState[k as MessageStateValue];
-}
+};
 
 /**
  * A polled message with headers, payload, and user headers.
  */
 export type Message = {
   /** Iggy message header metadata */
-  headers: IggyMessageHeader,
+  headers: IggyMessageHeader;
   /** Message payload data */
-  payload: Buffer,
+  payload: Buffer;
   /** User-defined headers */
-  userHeaders: HeadersMap
+  userHeaders: ParsedHeaderEntry[];
 };
 
 /**
@@ -231,13 +228,13 @@ export type Message = {
  */
 export type PollMessagesResponse = {
   /** Partition the messages came from */
-  partitionId: number,
+  partitionId: number;
   /** Current offset in the partition */
-  currentOffset: bigint,
+  currentOffset: bigint;
   /** Number of messages returned */
-  count: number,
+  count: number;
   /** Array of polled messages */
-  messages: Message[]
+  messages: Message[];
 };
 
 /**
@@ -251,29 +248,32 @@ export const deserializeMessages = (b: Buffer) => {
   let pos = 0;
   const len = b.length;
   while (pos < len) {
-    if(pos + IGGY_MESSAGE_HEADER_SIZE > len)
-      break;
+    if (pos + IGGY_MESSAGE_HEADER_SIZE > len) break;
     const bHead = b.subarray(pos, pos + IGGY_MESSAGE_HEADER_SIZE);
     const headers = deserializeIggyMessageHeaders(bHead);
     pos += IGGY_MESSAGE_HEADER_SIZE;
     const plEnd = pos + headers.payloadLength;
-    if(plEnd > len)
-      break;
+    if (plEnd > len) break;
     const payload = b.subarray(pos, plEnd);
     pos += headers.payloadLength;
-    let userHeaders: HeadersMap = {};
-    if(headers.userHeadersLength > 0 && plEnd + headers.userHeadersLength <= len) {
-      userHeaders = deserializeHeaders(b.subarray(plEnd, plEnd + headers.userHeadersLength));
+    let userHeaders: ParsedHeaderEntry[] = [];
+    if (
+      headers.userHeadersLength > 0 &&
+      plEnd + headers.userHeadersLength <= len
+    ) {
+      userHeaders = deserializeHeaders(
+        b.subarray(plEnd, plEnd + headers.userHeadersLength),
+      );
       pos += headers.userHeadersLength;
     }
     messages.push({
       headers,
       payload,
-      userHeaders
+      userHeaders,
     });
   }
   return messages;
-}
+};
 
 /**
  * Deserializes a poll messages response from a buffer.
@@ -292,8 +292,8 @@ export const deserializePollMessages = (r: Buffer, pos = 0) => {
     partitionId,
     currentOffset,
     count,
-    messages
-  }
+    messages,
+  };
 };
 
 /**
@@ -301,13 +301,17 @@ export const deserializePollMessages = (r: Buffer, pos = 0) => {
  *
  * @returns Transform stream that outputs PollMessagesResponse objects
  */
-export const deserializePollMessagesTransform = () => new Transform({
-  objectMode: true,
-  transform(chunk: Buffer, encoding: BufferEncoding, cb: TransformCallback) {
-    try {
-      return cb(null, deserializePollMessages(chunk));
-    } catch (err: unknown) {
-      cb(new Error('deserializePollMessage::transform error', { cause: err }), null);
-    }
-  }
-})
+export const deserializePollMessagesTransform = () =>
+  new Transform({
+    objectMode: true,
+    transform(chunk: Buffer, encoding: BufferEncoding, cb: TransformCallback) {
+      try {
+        return cb(null, deserializePollMessages(chunk));
+      } catch (err: unknown) {
+        cb(
+          new Error("deserializePollMessage::transform error", { cause: err }),
+          null,
+        );
+      }
+    },
+  });

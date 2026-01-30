@@ -428,17 +428,22 @@ internal static class BinaryMapper
 
         while (position < payload.Length)
         {
+            var keyKind = MapHeaderKind(payload, position);
+            position++;
+
             var keyLength = BinaryPrimitives.ReadInt32LittleEndian(payload[position..(position + 4)]);
             if (keyLength is 0 or > 255)
             {
                 throw new ArgumentException("Key has incorrect size, must be between 1 and 255", nameof(keyLength));
             }
 
-            var key = Encoding.UTF8.GetString(payload[(position + 4)..(position + 4 + keyLength)]);
-            position += 4 + keyLength;
+            position += 4;
+            var keyValue = payload[position..(position + keyLength)].ToArray();
+            position += keyLength;
 
-            var headerKind = MapHeaderKind(payload, position);
+            var valueKind = MapHeaderKind(payload, position);
             position++;
+
             var valueLength = BinaryPrimitives.ReadInt32LittleEndian(payload[position..(position + 4)]);
             if (valueLength is 0 or > 255)
             {
@@ -448,11 +453,9 @@ internal static class BinaryMapper
             position += 4;
             ReadOnlySpan<byte> value = payload[position..(position + valueLength)];
             position += valueLength;
-            headers.Add(HeaderKey.New(key), new HeaderValue
-            {
-                Kind = headerKind,
-                Value = value.ToArray()
-            });
+
+            headers[new HeaderKey { Kind = keyKind, Value = keyValue }] =
+                new HeaderValue { Kind = valueKind, Value = value.ToArray() };
         }
 
         return headers;
@@ -465,9 +468,13 @@ internal static class BinaryMapper
             1 => HeaderKind.Raw,
             2 => HeaderKind.String,
             3 => HeaderKind.Bool,
+            4 => HeaderKind.Int8,
+            5 => HeaderKind.Int16,
             6 => HeaderKind.Int32,
             7 => HeaderKind.Int64,
             8 => HeaderKind.Int128,
+            9 => HeaderKind.Uint8,
+            10 => HeaderKind.Uint16,
             11 => HeaderKind.Uint32,
             12 => HeaderKind.Uint64,
             13 => HeaderKind.Uint128,

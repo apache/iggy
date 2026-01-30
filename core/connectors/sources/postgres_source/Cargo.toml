@@ -17,7 +17,7 @@
 
 [package]
 name = "iggy_connector_postgres_source"
-version = "0.2.0-edge.1"
+version = "0.2.1-edge.1"
 description = "Iggy PostgreSQL source connector supporting CDC and table polling for message streaming platform"
 edition = "2024"
 license = "Apache-2.0"

@@ -22,6 +22,7 @@ package org.apache.iggy.serde;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import org.apache.commons.lang3.ArrayUtils;
+import org.apache.iggy.message.HeaderKey;
 import org.apache.iggy.message.HeaderKind;
 import org.apache.iggy.topic.CompressionAlgorithm;
 import org.apache.iggy.user.UserStatus;
@@ -364,10 +365,11 @@ class BytesDeserializerTest {
 
             // Calculate and write user headers
             ByteBuf headersBuffer = Unpooled.buffer();
-            headersBuffer.writeIntLE(3); // key length
+            headersBuffer.writeByte(HeaderKind.String.asCode());
+            headersBuffer.writeIntLE(3);
             headersBuffer.writeBytes("key".getBytes());
             headersBuffer.writeByte(HeaderKind.Raw.asCode());
-            headersBuffer.writeIntLE(3); // value length
+            headersBuffer.writeIntLE(3);
             headersBuffer.writeBytes("val".getBytes());
 
             buffer.writeIntLE(headersBuffer.readableBytes()); // user headers length
@@ -380,7 +382,8 @@ class BytesDeserializerTest {
 
             // then
             assertThat(message.userHeaders()).hasSize(1);
-            assertThat(message.userHeaders().get("key").value()).isEqualTo("val");
+            assertThat(message.userHeaders().get(HeaderKey.fromString("key")).asRaw())
+                    .isEqualTo("val".getBytes());
         }
 
         @Test
@@ -747,6 +750,82 @@ class BytesDeserializerTest {
             // then
             assertThat(tokenInfo.name()).isEqualTo("mytoken");
             assertThat(tokenInfo.expiryAt()).isEmpty();
+        }
+    }
+
+    @Nested
+    class JsonDeserialization {
+
+        private static final tools.jackson.databind.ObjectMapper MAPPER =
+                org.apache.iggy.client.blocking.http.ObjectMapperFactory.getInstance();
+
+        @Test
+        void shouldDeserializePolledMessagesWithEmptyUserHeaders() throws Exception {
+            String json = """
+                {
+                  "partition_id": 1,
+                  "current_offset": 10,
+                  "count": 1,
+                  "messages": [
+                    {
+                      "header": {
+                        "checksum": 0,
+                        "id": 42,
+                        "offset": 0,
+                        "timestamp": 0,
+                        "origin_timestamp": 1000,
+                        "user_headers_length": 0,
+                        "payload_length": 4
+                      },
+                      "payload": "dGVzdA==",
+                      "user_headers": []
+                    }
+                  ]
+                }
+                """;
+
+            var polledMessages = MAPPER.readValue(json, org.apache.iggy.message.PolledMessages.class);
+
+            assertThat(polledMessages).isNotNull();
+            assertThat(polledMessages.messages()).hasSize(1);
+            assertThat(polledMessages.messages().get(0).userHeaders()).isEmpty();
+        }
+
+        @Test
+        void shouldDeserializePolledMessagesWithUserHeaders() throws Exception {
+            String json = """
+                {
+                  "partition_id": 1,
+                  "current_offset": 10,
+                  "count": 1,
+                  "messages": [
+                    {
+                      "header": {
+                        "checksum": 0,
+                        "id": 42,
+                        "offset": 0,
+                        "timestamp": 0,
+                        "origin_timestamp": 1000,
+                        "user_headers_length": 62,
+                        "payload_length": 4
+                      },
+                      "payload": "dGVzdA==",
+                      "user_headers": [
+                        {
+                          "key": {"kind": "string", "value": "Y29udGVudC10eXBl"},
+                          "value": {"kind": "string", "value": "dGV4dC9wbGFpbg=="}
+                        }
+                      ]
+                    }
+                  ]
+                }
+                """;
+
+            var polledMessages = MAPPER.readValue(json, org.apache.iggy.message.PolledMessages.class);
+
+            assertThat(polledMessages).isNotNull();
+            assertThat(polledMessages.messages()).hasSize(1);
+            assertThat(polledMessages.messages().get(0).userHeaders()).hasSize(1);
         }
     }
 }

@@ -17,7 +17,7 @@
 
 [package]
 name = "apache-iggy"
-version = "0.6.1-dev1"
+version = "0.6.2-dev1"
 edition = "2021"
 authors = [
     "Dario Lencina Talarico <darioalessandrolencina@gmail.com>",
@@ -31,7 +31,7 @@ repository = "https://github.com/apache/iggy"
 [dependencies]
 bytes = "1.10.1"
 futures = "0.3.31"
-iggy = { path = "../../core/sdk", version = "0.8.1-edge.1" }
+iggy = { path = "../../core/sdk", version = "0.8.2-edge.1" }
 pyo3 = "0.26.0"
 pyo3-async-runtimes = { version = "0.26.0", features = [
     "attributes",

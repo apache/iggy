@@ -20,9 +20,9 @@
 <script lang="ts">
   import ModalBase from './ModalBase.svelte';
   import type { CloseModalFn } from '$lib/types/utilTypes';
-  import { type Message, type HeaderField } from '$lib/domain/Message';
+  import { type Message, type HeaderEntry, type HeaderField } from '$lib/domain/Message';
   import MessageDecoder from '$lib/components/MessageDecoder/MessageDecoder.svelte';
-  import { decodeBase64 } from '$lib/utils/base64Utils';
+
   import { formatMessageId } from '$lib/utils/formatters/uuidFormatter';
 
   interface Props {
@@ -34,22 +34,85 @@
 
   const formattedId = $derived(message?.id ? formatMessageId(message.id) : 'N/A');
 
-  const formatHeaders = (headers: Record<string, HeaderField> | null | undefined) => {
-    if (!headers || Object.keys(headers).length === 0) {
-      return 'No headers';
-    }
+  const decodeHeaderValue = (kind: string, base64Value: string): string => {
     try {
-      return JSON.stringify(headers, null, 2);
+      const binaryString = atob(base64Value);
+      const bytes = new Uint8Array(binaryString.length);
+      for (let i = 0; i < binaryString.length; i++) {
+        bytes[i] = binaryString.charCodeAt(i);
+      }
+      const view = new DataView(bytes.buffer);
+
+      switch (kind.toLowerCase()) {
+        case 'string':
+          return new TextDecoder().decode(bytes);
+        case 'bool':
+          return bytes[0] !== 0 ? 'true' : 'false';
+        case 'int8':
+          return view.getInt8(0).toString();
+        case 'int16':
+          return view.getInt16(0, true).toString();
+        case 'int32':
+          return view.getInt32(0, true).toString();
+        case 'int64':
+          return view.getBigInt64(0, true).toString();
+        case 'int128': {
+          const lo = view.getBigUint64(0, true);
+          const hi = view.getBigInt64(8, true);
+          return (hi * BigInt(2 ** 64) + lo).toString();
+        }
+        case 'uint8':
+          return view.getUint8(0).toString();
+        case 'uint16':
+          return view.getUint16(0, true).toString();
+        case 'uint32':
+          return view.getUint32(0, true).toString();
+        case 'uint64':
+          return view.getBigUint64(0, true).toString();
+        case 'uint128': {
+          const lo = view.getBigUint64(0, true);
+          const hi = view.getBigUint64(8, true);
+          return (hi * BigInt(2 ** 64) + lo).toString();
+        }
+        case 'float32':
+          return view.getFloat32(0, true).toString();
+        case 'float64':
+          return view.getFloat64(0, true).toString();
+        default:
+          return base64Value;
+      }
     } catch {
-      return 'Invalid headers format';
+      return base64Value;
     }
   };
 
-  // TODO: whether all header values should be decoded?
+  let expandedHeaders: Set<number> = $state(new Set());
+
+  const toggleHeaderExpand = (index: number) => {
+    if (expandedHeaders.has(index)) {
+      expandedHeaders.delete(index);
+    } else {
+      expandedHeaders.add(index);
+    }
+    expandedHeaders = new Set(expandedHeaders);
+  };
+
+  const findHeaderByStringKey = (
+    headers: HeaderEntry[] | undefined,
+    keyName: string
+  ): HeaderField | undefined => {
+    if (!headers) return undefined;
+    const entry = headers.find(
+      (e) => e.key.kind === 'string' && decodeHeaderValue('string', e.key.value) === keyName
+    );
+    return entry?.value;
+  };
+
   let codec = $derived(
-    message?.user_headers?.['codec']?.value
-      ? decodeBase64(message.user_headers['codec'].value)
-      : undefined
+    (() => {
+      const codecHeader = findHeaderByStringKey(message?.user_headers, 'codec');
+      return codecHeader ? decodeHeaderValue(codecHeader.kind, codecHeader.value) : undefined;
+    })()
   );
 </script>
 
@@ -75,7 +138,16 @@
 
       <div class="bg-shade-l200 dark:bg-shade-d400 p-3 lg:p-4 rounded-md">
         <span class="text-xs text-shade-l900 dark:text-shade-l700 block mb-1">Checksum</span>
-        <div class="text-sm text-color font-medium">{message?.checksum ?? 'N/A'}</div>
+        <div class="text-sm text-color font-medium font-mono">
+          {#if message?.checksum != null}
+            0x{BigInt(message.checksum).toString(16).toUpperCase()}
+            <span class="text-xs text-shade-l900 dark:text-shade-l700 ml-2">
+              ({message.checksum})
+            </span>
+          {:else}
+            N/A
+          {/if}
+        </div>
       </div>
 
       <div class="bg-shade-l200 dark:bg-shade-d400 p-3 lg:p-4 rounded-md">
@@ -90,8 +162,38 @@
 
       <div class="bg-shade-l200 dark:bg-shade-d400 p-3 lg:p-4 rounded-md">
         <span class="text-xs text-shade-l900 dark:text-shade-l700 block mb-1">Headers</span>
-        <div class="text-sm text-color font-medium font-mono whitespace-pre-wrap">
-          {formatHeaders(message?.user_headers)}
+        <div class="text-sm text-color font-medium font-mono max-h-48 overflow-y-auto">
+          {#if !message?.user_headers || message.user_headers.length === 0}
+            <span class="text-shade-l900 dark:text-shade-l700">No headers</span>
+          {:else}
+            <div class="flex flex-col gap-1">
+              {#each message.user_headers as entry, index}
+                {@const keyValue = decodeHeaderValue(entry.key.kind, entry.key.value)}
+                {@const valueValue = decodeHeaderValue(entry.value.kind, entry.value.value)}
+                {@const isExpanded = expandedHeaders.has(index)}
+                <div class="flex flex-col">
+                  <div class="flex items-center gap-1">
+                    <button
+                      type="button"
+                      onclick={() => toggleHeaderExpand(index)}
+                      class="text-shade-l900 dark:text-shade-l700 hover:text-color transition-colors text-xs w-4"
+                      title="Show type details"
+                    >
+                      {isExpanded ? '▼' : '▶'}
+                    </button>
+                    <span class="text-color">{keyValue}</span>
+                    <span class="text-shade-l900 dark:text-shade-l700 mx-1">→</span>
+                    <span class="text-color">{valueValue}</span>
+                  </div>
+                  {#if isExpanded}
+                    <div class="ml-5 text-xs text-shade-l900 dark:text-shade-l700">
+                      key: {entry.key.kind}, value: {entry.value.kind}
+                    </div>
+                  {/if}
+                </div>
+              {/each}
+            </div>
+          {/if}
         </div>
       </div>
     </div>

@@ -101,6 +101,8 @@ cargo run --example message-headers-type-producer
 cargo run --example message-headers-type-consumer
 ```
 
+Demonstrates using HeaderKey/HeaderValue for message metadata instead of payload-based typing, with header-based message routing.
+
 Shows how user headers can be used for message compression in transit:
 
 ```bash
@@ -108,7 +110,12 @@ cargo run --example message-headers-compression-producer
 cargo run --example message-headers-compression-consumer
 ```
 
-Demonstrates using HeaderKey/HeaderValue for message metadata instead of payload-based typing, with header-based message routing.
+Demonstrates typed header keys and values with various data types (strings, integers, floats, booleans, raw bytes):
+
+```bash
+cargo run --example typed-headers-producer
+cargo run --example typed-headers-consumer
+```
 
 ### Message Envelopes
 

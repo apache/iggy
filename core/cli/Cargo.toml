@@ -17,7 +17,7 @@
 
 [package]
 name = "iggy-cli"
-version = "0.10.1-edge.1"
+version = "0.10.2-edge.1"
 edition = "2024"
 authors = ["bartosz.ciesla@gmail.com"]
 repository = "https://github.com/apache/iggy"

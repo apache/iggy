@@ -25,7 +25,10 @@
 @partition_id_payload_base64 = AAAAAA==
 @message_1_payload_base64 = aGVsbG8=
 @message_2_payload_base64 = d29ybGQ=
-@header_1_payload_base_64 = dmFsdWUgMQ==
+@header_key_1_base64 = a2V5XzE=
+@header_value_1_base64 = dmFsdWUgMQ==
+@header_key_2_base64 = Kg==
+@header_value_2_base64 = AAAA
 @root_username = iggy
 @root_password = iggy
 @user1_username = user1
@@ -301,12 +304,25 @@ Content-Type: application/json
   }, {
     "id": 0,
     "payload": "{{message_2_payload_base64}}",
-    "headers": {
-      "key_1": {
+    "user_headers": [{
+      "key": {
         "kind": "string",
-        "value": "{{header_1_payload_base_64}}"
+        "value": "{{header_key_1_base64}}"
+      },
+      "value": {
+        "kind": "string",
+        "value": "{{header_value_1_base64}}"
       }
-    }
+    }, {
+      "key": {
+        "kind": "uint32",
+        "value": "{{header_key_2_base64}}"
+      },
+      "value": {
+        "kind": "int32",
+        "value": "{{header_value_2_base64}}"
+      }
+    }]
   }]
 }
 

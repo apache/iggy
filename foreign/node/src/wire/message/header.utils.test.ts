@@ -17,28 +17,54 @@
  * under the License.
  */
 
+import { describe, it } from "node:test";
+import assert from "node:assert/strict";
+import { uuidv7, uuidv4 } from "uuidv7";
+import {
+  serializeHeaders,
+  deserializeHeaders,
+  HeaderValue,
+  HeaderKeyFactory,
+} from "./header.utils.js";
+import { HeaderKind } from "./header.type.js";
 
-import { describe, it } from 'node:test';
-import assert from 'node:assert/strict';
-import { uuidv7, uuidv4 } from 'uuidv7'
-import { serializeHeaders, deserializeHeaders, HeaderValue } from './header.utils.js';
+describe("Headers", () => {
+  const headers = [
+    { key: HeaderKeyFactory.String("p"), value: HeaderValue.Bool(true) },
+    { key: HeaderKeyFactory.String("x"), value: HeaderValue.Uint32(123) },
+    { key: HeaderKeyFactory.String("y"), value: HeaderValue.Uint64(42n) },
+    {
+      key: HeaderKeyFactory.String("z"),
+      value: HeaderValue.Float(42.20000076293945),
+    },
+    { key: HeaderKeyFactory.String("a"), value: HeaderValue.Double(1 / 3) },
+    { key: HeaderKeyFactory.String("ID"), value: HeaderValue.String(uuidv7()) },
+    {
+      key: HeaderKeyFactory.String("val"),
+      value: HeaderValue.Raw(Buffer.from(uuidv4())),
+    },
+  ];
 
-describe('Headers', () => {
-
-  const headers = {
-    'p': HeaderValue.Bool(true),
-    'x': HeaderValue.Uint32(123),
-    'y': HeaderValue.Uint64(42n),
-    'z': HeaderValue.Float(42.20000076293945),
-    'a': HeaderValue.Double(1/3),
-    'ID': HeaderValue.String(uuidv7()),
-    'val': HeaderValue.Raw(Buffer.from(uuidv4()))
-  };
-
-  it('serialize/deserialize', () => {
+  it("serialize/deserialize string keys", () => {
     const s = serializeHeaders(headers);
     const d = deserializeHeaders(s);
-    assert.deepEqual(headers, d);
+    assert.equal(d.length, headers.length);
+    for (let i = 0; i < headers.length; i++) {
+      assert.equal(d[i].key.kind, headers[i].key.kind);
+      assert.equal(d[i].value.kind, headers[i].value.kind);
+    }
   });
 
+  it("serialize/deserialize int32 key", () => {
+    const int32Headers = [
+      { key: HeaderKeyFactory.Int32(42), value: HeaderValue.String("test") },
+    ];
+    const s = serializeHeaders(int32Headers);
+    const d = deserializeHeaders(s);
+    assert.equal(d.length, 1);
+    assert.equal(d[0].key.kind, HeaderKind.Int32);
+    assert.equal(d[0].key.value, 42);
+    assert.equal(d[0].value.kind, HeaderKind.String);
+    assert.equal(d[0].value.value, "test");
+  });
 });

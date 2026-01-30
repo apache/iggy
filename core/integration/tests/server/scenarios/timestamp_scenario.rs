@@ -21,7 +21,6 @@ use bytes::BytesMut;
 use iggy::prelude::*;
 use integration::test_server::{ClientFactory, login_root};
 use std::collections::HashMap;
-use std::str::FromStr;
 use tokio::time::{Duration, sleep};
 
 fn small_batches() -> Vec<u32> {
@@ -198,17 +197,11 @@ fn create_single_message(id: u32, message_size: u64) -> IggyMessage {
 
     let mut headers = HashMap::new();
     headers.insert(
-        HeaderKey::new("key_1").unwrap(),
-        HeaderValue::from_str("Value 1").unwrap(),
+        HeaderKey::try_from("key_1").unwrap(),
+        HeaderValue::try_from("Value 1").unwrap(),
     );
-    headers.insert(
-        HeaderKey::new("key 2").unwrap(),
-        HeaderValue::from_bool(true).unwrap(),
-    );
-    headers.insert(
-        HeaderKey::new("key-3").unwrap(),
-        HeaderValue::from_uint64(123456).unwrap(),
-    );
+    headers.insert(HeaderKey::try_from("key 2").unwrap(), true.into());
+    headers.insert(HeaderKey::try_from("key-3").unwrap(), 123456u64.into());
 
     IggyMessage::builder()
         .id(id as u128)
