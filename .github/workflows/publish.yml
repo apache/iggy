@@ -54,6 +54,62 @@ on:
         required: false
         default: ""
 
+  workflow_call:
+    inputs:
+      dry_run:
+        description: "Dry run (build/test only, no actual publish)"
+        type: boolean
+        default: false
+      commit:
+        description: "Commit SHA (defaults to github.sha)"
+        type: string
+        default: ""
+      publish_crates:
+        description: "Rust crates to publish (comma-separated)"
+        type: string
+        default: ""
+      publish_dockerhub:
+        description: "Docker images to publish (comma-separated)"
+        type: string
+        default: ""
+      publish_other:
+        description: "Other SDKs to publish (comma-separated)"
+        type: string
+        default: ""
+      skip_tag_creation:
+        description: "Skip git tag creation"
+        type: boolean
+        default: false
+      use_latest_ci:
+        description: "Use latest CI from master"
+        type: boolean
+        default: false
+      create_edge_docker_tag:
+        description: "Create rolling :edge Docker tag"
+        type: boolean
+        default: false
+    secrets:
+      CARGO_REGISTRY_TOKEN:
+        required: false
+      DOCKERHUB_USER:
+        required: false
+      DOCKERHUB_TOKEN:
+        required: false
+      PYPI_API_TOKEN:
+        required: false
+      NPM_TOKEN:
+        required: false
+      NEXUS_USER:
+        required: false
+      NEXUS_PW:
+        required: false
+      JAVA_GPG_SIGNING_KEY:
+        required: false
+      JAVA_GPG_PASSWORD:
+        required: false
+      NUGET_API_KEY:
+        required: false
+
 env:
   IGGY_CI_BUILD: true
 
@@ -73,10 +129,23 @@ jobs:
     outputs:
       commit: ${{ steps.resolve.outputs.commit }}
       has_targets: ${{ steps.check.outputs.has_targets }}
+      is_workflow_call: ${{ steps.detect.outputs.is_workflow_call }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Detect trigger type
+        id: detect
+        run: |
+          # workflow_call sets github.event_name to 'workflow_call'
+          if [ "${{ github.event_name }}" = "workflow_call" ]; then
+            echo "is_workflow_call=true" >> "$GITHUB_OUTPUT"
+            echo "📞 Triggered via workflow_call"
+          else
+            echo "is_workflow_call=false" >> "$GITHUB_OUTPUT"
+            echo "🖱️ Triggered via workflow_dispatch"
+          fi
 
       - name: Check if any targets specified
         id: check
@@ -94,8 +163,8 @@ jobs:
         run: |
           COMMIT="${{ inputs.commit }}"
           if [ -z "$COMMIT" ]; then
-            echo "❌ No commit specified"
-            exit 1
+            COMMIT="${{ github.sha }}"
+            echo "ℹ️ No commit specified, using github.sha: $COMMIT"
           fi
 
           if ! git rev-parse --verify "$COMMIT^{commit}" >/dev/null 2>&1; then
@@ -103,23 +172,27 @@ jobs:
             exit 1
           fi
 
-          # Verify commit is on master branch
-          echo "🔍 Verifying commit is on master branch..."
-          git fetch origin master --depth=1000
-
-          if ${{ inputs.dry_run }}; then
+          # Skip master branch check for workflow_call (caller already verified on master)
+          if [ "${{ steps.detect.outputs.is_workflow_call }}" = "true" ]; then
+            echo "✅ Called from workflow, skipping master check"
+          elif ${{ inputs.dry_run }}; then
             echo "🌵 Dry run, skipping master branch check"
-          elif git merge-base --is-ancestor "$COMMIT" origin/master; then
-            echo "✅ Commit is on master branch"
           else
-            echo "❌ ERROR: Commit $COMMIT is not on the master branch!"
-            echo ""
-            echo "Publishing is only allowed from commits on the master branch."
-            echo "Please ensure your commit has been merged to master before publishing."
-            echo ""
-            echo "To check which branch contains this commit, run:"
-            echo "  git branch -r --contains $COMMIT"
-            exit 1
+            echo "🔍 Verifying commit is on master branch..."
+            git fetch origin master --depth=1000
+
+            if git merge-base --is-ancestor "$COMMIT" origin/master; then
+              echo "✅ Commit is on master branch"
+            else
+              echo "❌ ERROR: Commit $COMMIT is not on the master branch!"
+              echo ""
+              echo "Publishing is only allowed from commits on the master branch."
+              echo "Please ensure your commit has been merged to master before publishing."
+              echo ""
+              echo "To check which branch contains this commit, run:"
+              echo "  git branch -r --contains $COMMIT"
+              exit 1
+            fi
           fi
 
           echo "commit=$COMMIT" >> "$GITHUB_OUTPUT"
@@ -680,17 +753,40 @@ jobs:
           IMAGE="${{ steps.config.outputs.image }}"
           VERSION="${{ steps.ver.outputs.version }}"
 
-          echo "Creating manifest for $IMAGE:$VERSION from digests:"
+          echo "Creating manifests for $IMAGE from digests:"
           ls -la
 
-          docker buildx imagetools create \
-            -t "${IMAGE}:${VERSION}" \
-            $(printf "${IMAGE}@sha256:%s " *)
+          # Create :edge tag if requested (for auto-publish from post-merge)
+          if [ "${{ inputs.create_edge_docker_tag }}" = "true" ]; then
+            docker buildx imagetools create \
+              -t "${IMAGE}:edge" \
+              $(printf "${IMAGE}@sha256:%s " *)
+            echo "✅ Pushed manifest: ${IMAGE}:edge"
+          fi
 
-          echo "✅ Pushed manifest: ${IMAGE}:${VERSION}"
+          # Create versioned tag
+          # When called from auto-publish (create_edge_docker_tag=true), only create
+          # versioned tag for pre-release versions to match original post-merge behavior.
+          # Manual publish always creates versioned tag.
+          if [ "${{ inputs.create_edge_docker_tag }}" = "true" ]; then
+            if [[ "$VERSION" =~ -(edge|rc) ]]; then
+              docker buildx imagetools create \
+                -t "${IMAGE}:${VERSION}" \
+                $(printf "${IMAGE}@sha256:%s " *)
+              echo "✅ Pushed manifest: ${IMAGE}:${VERSION}"
+            else
+              echo "ℹ️ Skipping versioned tag for stable version in auto-publish mode"
+            fi
+          else
+            docker buildx imagetools create \
+              -t "${IMAGE}:${VERSION}" \
+              $(printf "${IMAGE}@sha256:%s " *)
+            echo "✅ Pushed manifest: ${IMAGE}:${VERSION}"
+          fi
 
-          # Also create 'latest' tag for stable releases (not edge/rc/alpha/beta)
-          if [[ ! "$VERSION" =~ (edge|rc|alpha|beta) ]]; then
+          # Create :latest for stable releases (not edge/rc)
+          # Only create :latest in manual publish mode - auto-publish should never update :latest
+          if [ "${{ inputs.create_edge_docker_tag }}" != "true" ] && [[ ! "$VERSION" =~ -(edge|rc) ]]; then
             echo "Creating 'latest' manifest"
             docker buildx imagetools create \
               -t "${IMAGE}:latest" \
@@ -700,7 +796,16 @@ jobs:
 
       - name: Inspect manifest
         run: |
-          docker buildx imagetools inspect "${{ steps.config.outputs.image }}:${{ steps.ver.outputs.version }}"
+          IMAGE="${{ steps.config.outputs.image }}"
+          VERSION="${{ steps.ver.outputs.version }}"
+
+          # In auto-publish mode with stable version, we only pushed :edge
+          if [ "${{ inputs.create_edge_docker_tag }}" = "true" ] && [[ ! "$VERSION" =~ -(edge|rc) ]]; then
+            echo "Inspecting :edge manifest (versioned tag was skipped for stable version)"
+            docker buildx imagetools inspect "${IMAGE}:edge"
+          else
+            docker buildx imagetools inspect "${IMAGE}:${VERSION}"
+          fi
 
   # Non-Docker, non-Rust publishing (Python, Node, Java, C#, Go SDKs)
   # Note: This job runs in parallel with Docker publishing - no dependency between them
@@ -915,6 +1020,7 @@ jobs:
           set -euo pipefail
           TARGETS_JSON='${{ needs.plan.outputs.targets }}'
           GO_SDK_VERSION='${{ needs.plan.outputs.go_sdk_version }}'
+          CREATE_EDGE_DOCKER_TAG="${{ inputs.create_edge_docker_tag }}"
 
           echo "$TARGETS_JSON" | jq -r '.include[] | select(.key!="noop") | @base64' | while read -r row; do
             _jq() { echo "$row" | base64 -d | jq -r "$1"; }
@@ -922,6 +1028,7 @@ jobs:
             KEY=$(_jq '.key')
             NAME=$(_jq '.name')
             TAG_PATTERN=$(_jq '.tag_pattern')
+            REGISTRY=$(_jq '.registry')
 
             # Only components that define tag_pattern will be tagged
             if [ -z "$TAG_PATTERN" ] || [ "$TAG_PATTERN" = "null" ]; then
@@ -933,7 +1040,18 @@ jobs:
               GO_FLAG="--go-sdk-version $GO_SDK_VERSION"
             fi
 
+            VERSION=$(scripts/extract-version.sh "$KEY" $GO_FLAG)
             TAG=$(scripts/extract-version.sh "$KEY" $GO_FLAG --tag)
+
+            # In auto-publish mode (create_edge_docker_tag=true), skip Docker components
+            # with stable versions - only pre-release versions should get versioned tags.
+            # This matches the behavior where versioned Docker manifests are also skipped.
+            if [ "$CREATE_EDGE_DOCKER_TAG" = "true" ] && [ "$REGISTRY" = "dockerhub" ]; then
+              if [[ ! "$VERSION" =~ -(edge|rc) ]]; then
+                echo "ℹ️ Skipping git tag for $NAME (stable Docker version in auto-publish mode)"
+                continue
+              fi
+            fi
 
             echo "Creating tag: $TAG for $NAME"
 
