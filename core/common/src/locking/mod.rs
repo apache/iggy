@@ -18,22 +18,9 @@
 
 use std::ops::{Deref, DerefMut};
 
-/// This module provides a trait and implementations for a shared mutable reference configurable via feature flags.
-#[cfg(feature = "tokio_lock")]
-#[cfg(not(any(feature = "fast_async_lock")))]
 mod tokio_lock;
 
-// this can be used in the future to provide different locking mechanisms
-#[cfg(feature = "fast_async_lock")]
-mod fast_async_lock;
-
-#[cfg(feature = "tokio_lock")]
-#[cfg(not(any(feature = "fast_async_lock")))]
 pub type IggyRwLock<T> = tokio_lock::IggyTokioRwLock<T>;
-
-//this can be used in the future to provide different locking mechanisms
-#[cfg(feature = "fast_async_lock")]
-pub type IggyRwLock<T> = fast_async_lock::IggyFastAsyncRwLock<T>;
 
 #[allow(async_fn_in_trait)]
 pub trait IggyRwLockFn<T> {

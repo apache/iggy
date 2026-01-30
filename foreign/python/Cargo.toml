@@ -31,7 +31,7 @@ repository = "https://github.com/apache/iggy"
 [dependencies]
 bytes = "1.11.0"
 futures = "0.3.31"
-iggy = { path = "../../core/sdk", version = "0.8.2-edge.1" }
+iggy = { path = "../../core/sdk", version = "0.8.2-edge.2" }
 pyo3 = "0.27.2"
 pyo3-async-runtimes = { version = "0.27.0", features = [
     "attributes",

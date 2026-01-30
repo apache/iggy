@@ -3096,12 +3096,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "fast-async-mutex"
-version = "0.6.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b877ceff2e3d2922823bab7960826ce198181f9c25f75d67b913fde9237e2da6"
-
-[[package]]
 name = "fastbloom"
 version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4429,7 +4423,7 @@ dependencies = [
 
 [[package]]
 name = "iggy"
-version = "0.8.2-edge.1"
+version = "0.8.2-edge.2"
 dependencies = [
  "async-broadcast",
  "async-dropper",
@@ -4620,7 +4614,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_binary_protocol"
-version = "0.8.2-edge.1"
+version = "0.8.2-edge.2"
 dependencies = [
  "anyhow",
  "async-broadcast",
@@ -4641,7 +4635,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_common"
-version = "0.8.2-edge.1"
+version = "0.8.2-edge.2"
 dependencies = [
  "aes-gcm",
  "ahash 0.8.12",
@@ -4661,7 +4655,6 @@ dependencies = [
  "crossbeam",
  "derive_more",
  "err_trail",
- "fast-async-mutex",
  "human-repr",
  "humantime",
  "nix 0.31.1",

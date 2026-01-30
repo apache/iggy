@@ -17,7 +17,7 @@
 
 [package]
 name = "iggy"
-version = "0.8.2-edge.1"
+version = "0.8.2-edge.2"
 description = "Iggy is the persistent message streaming platform written in Rust, supporting QUIC, TCP and HTTP transport protocols, capable of processing millions of messages per second."
 edition = "2024"
 license = "Apache-2.0"
@@ -28,12 +28,6 @@ documentation = "https://iggy.apache.org/docs"
 repository = "https://github.com/apache/iggy"
 readme = "../../README.md"
 
-[features]
-default = ["tokio_lock"]
-tokio_lock = []
-# Moved to common crate. Not sure if this is even needed anymore
-#fast_async_lock = ["dep:fast-async-mutex"]
-
 [dependencies]
 async-broadcast = { workspace = true }
 async-dropper = { workspace = true }
@@ -41,8 +35,6 @@ async-trait = { workspace = true }
 bon = { workspace = true }
 bytes = { workspace = true }
 dashmap = { workspace = true }
-# Can be removed if the feature above gets removed.
-#fast-async-mutex = { version = "0.6.7", optional = true }
 flume = { workspace = true }
 futures = { workspace = true }
 futures-util = { workspace = true }

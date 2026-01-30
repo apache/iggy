@@ -16,7 +16,7 @@
 # under the License.
 [package]
 name = "iggy_common"
-version = "0.8.2-edge.1"
+version = "0.8.2-edge.2"
 description = "Iggy is the persistent message streaming platform written in Rust, supporting QUIC, TCP and HTTP transport protocols, capable of processing millions of messages per second."
 edition = "2024"
 license = "Apache-2.0"
@@ -26,11 +26,6 @@ homepage = "https://iggy.apache.org"
 documentation = "https://iggy.apache.org/docs"
 repository = "https://github.com/apache/iggy"
 readme = "../../README.md"
-
-[features]
-default = ["tokio_lock"]
-tokio_lock = []
-fast_async_lock = ["dep:fast-async-mutex"]
 
 [dependencies]
 aes-gcm = { workspace = true }
@@ -51,7 +46,6 @@ compio-ws = { workspace = true }
 crossbeam = { workspace = true }
 derive_more = { workspace = true }
 err_trail = { workspace = true }
-fast-async-mutex = { version = "0.6.7", optional = true }
 human-repr = { workspace = true }
 humantime = { workspace = true }
 nix = { workspace = true }
