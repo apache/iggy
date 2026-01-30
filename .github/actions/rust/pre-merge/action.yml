@@ -45,8 +45,9 @@ runs:
       uses: ./.github/actions/utils/setup-rust-with-cache
       with:
         cache-targets: false # Only cache registry and git deps, not target dir (sccache handles that)
-        # Only test (most comprehensive) and build-* tasks should save cache
-        save-cache: ${{ inputs.task == 'test' || startsWith(inputs.task, 'build-') }}
+        # Only test (most comprehensive) and macOS builds should save cache;
+        # aarch64-linux builds are fast enough and we don't want to bloat the cache with platform-specific artifacts
+        save-cache: ${{ inputs.task == 'test' || inputs.task == 'build-macos-aarch64' }}
 
     - name: Install tools for specific tasks
       run: |

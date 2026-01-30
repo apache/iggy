@@ -26,31 +26,10 @@ inputs:
 runs:
   using: "composite"
   steps:
-    - name: Setup Go
-      uses: actions/setup-go@v5
+    - name: Setup Go with cache
+      uses: ./.github/actions/utils/setup-go-with-cache
       with:
-        go-version: "1.23.0"
-        cache-dependency-path: |
-          foreign/go/go.sum
-          bdd/go/go.sum
-          examples/go/go.sum
-
-    - name: Download dependencies
-      run: |
-        if [ -f "foreign/go/go.mod" ]; then
-          cd foreign/go && go mod download
-          cd ..
-        fi
-
-        if [ -f "bdd/go/go.mod" ]; then
-          cd bdd/go && go mod download
-          cd ..
-        fi
-
-        if [ -f "examples/go/go.mod" ]; then
-          cd examples/go && go mod download
-        fi
-      shell: bash
+        enabled: "false"
 
     - name: Tidy Check
       shell: bash
