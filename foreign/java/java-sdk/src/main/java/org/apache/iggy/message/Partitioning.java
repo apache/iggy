@@ -20,6 +20,7 @@
 package org.apache.iggy.message;
 
 import org.apache.commons.lang3.ArrayUtils;
+import org.apache.iggy.exception.IggyInvalidArgumentException;
 
 import java.nio.ByteBuffer;
 
@@ -39,7 +40,7 @@ public record Partitioning(PartitioningKind kind, byte[] value) {
 
     public static Partitioning messagesKey(String key) {
         if (key == null || key.isBlank() || key.length() > 255) {
-            throw new IllegalArgumentException("Key must be non-empty and less than 255 characters long");
+            throw new IggyInvalidArgumentException("Key must be non-empty and less than 255 characters long");
         }
         return new Partitioning(PartitioningKind.MessagesKey, key.getBytes());
     }

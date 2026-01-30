@@ -59,6 +59,7 @@ public class BasicMessagingSteps {
                 .port(hostPort.port)
                 .build();
 
+        client.connect();
         client.system().ping();
         context.client = client;
     }
