@@ -80,29 +80,29 @@ async fn setup() -> RedshiftTestSetup {
     // Redshift connection (using PostgreSQL as simulator)
     let connection_string = format!("postgres://postgres:postgres@localhost:{postgres_port}");
     envs.insert(
-        "IGGY_CONNECTORS_SINK_REDSHIFT_CONFIG_CONNECTION_STRING".to_owned(),
+        "IGGY_CONNECTORS_SINK_REDSHIFT_PLUGIN_CONFIG_CONNECTION_STRING".to_owned(),
         connection_string,
     );
 
     // S3 configuration for staging
     envs.insert(
-        "IGGY_CONNECTORS_SINK_REDSHIFT_CONFIG_S3_BUCKET".to_owned(),
+        "IGGY_CONNECTORS_SINK_REDSHIFT_PLUGIN_CONFIG_S3_BUCKET".to_owned(),
         bucket_name.to_owned(),
     );
     envs.insert(
-        "IGGY_CONNECTORS_SINK_REDSHIFT_CONFIG_S3_REGION".to_owned(),
+        "IGGY_CONNECTORS_SINK_REDSHIFT_PLUGIN_CONFIG_S3_REGION".to_owned(),
         "us-east-1".to_owned(),
     );
     envs.insert(
-        "IGGY_CONNECTORS_SINK_REDSHIFT_CONFIG_S3_ENDPOINT".to_owned(),
+        "IGGY_CONNECTORS_SINK_REDSHIFT_PLUGIN_CONFIG_S3_ENDPOINT".to_owned(),
         s3_endpoint,
     );
     envs.insert(
-        "IGGY_CONNECTORS_SINK_REDSHIFT_CONFIG_AWS_ACCESS_KEY_ID".to_owned(),
+        "IGGY_CONNECTORS_SINK_REDSHIFT_PLUGIN_CONFIG_AWS_ACCESS_KEY_ID".to_owned(),
         "test".to_owned(),
     );
     envs.insert(
-        "IGGY_CONNECTORS_SINK_REDSHIFT_CONFIG_AWS_SECRET_ACCESS_KEY".to_owned(),
+        "IGGY_CONNECTORS_SINK_REDSHIFT_PLUGIN_CONFIG_AWS_SECRET_ACCESS_KEY".to_owned(),
         "test".to_owned(),
     );
 
@@ -112,12 +112,16 @@ async fn setup() -> RedshiftTestSetup {
         iggy_setup.stream.to_owned(),
     );
     envs.insert(
-        "IGGY_CONNECTORS_SINK_REDSHIFT_STREAMS_0_TOPICS_0".to_owned(),
-        iggy_setup.topic.to_owned(),
+        "IGGY_CONNECTORS_SINK_REDSHIFT_STREAMS_0_TOPICS".to_owned(),
+        format!("[{}]", iggy_setup.topic),
     );
     envs.insert(
         "IGGY_CONNECTORS_SINK_REDSHIFT_STREAMS_0_SCHEMA".to_owned(),
         "json".to_owned(),
+    );
+    envs.insert(
+        "IGGY_CONNECTORS_SINK_REDSHIFT_STREAMS_0_CONSUMER_GROUP".to_owned(),
+        "test".to_owned(),
     );
 
     let mut runtime = setup_runtime();
