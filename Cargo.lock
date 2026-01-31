@@ -1280,7 +1280,7 @@ dependencies = [
  "prost-types",
  "tonic",
  "tonic-prost",
- "ureq",
+ "ureq 3.2.0",
 ]
 
 [[package]]
@@ -1302,9 +1302,9 @@ dependencies = [
 
 [[package]]
 name = "bon"
-version = "3.8.2"
+version = "3.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "234655ec178edd82b891e262ea7cf71f6584bcd09eff94db786be23f1821825c"
+checksum = "2d13a61f2963b88eef9c1be03df65d42f6996dfeac1054870d950fcf66686f83"
 dependencies = [
  "bon-macros",
  "rustversion",
@@ -1312,9 +1312,9 @@ dependencies = [
 
 [[package]]
 name = "bon-macros"
-version = "3.8.2"
+version = "3.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "89ec27229c38ed0eb3c0feee3d2c1d6a4379ae44f418a29a658890e062d8f365"
+checksum = "d314cc62af2b6b0c65780555abb4d02a03dd3b799cd42419044f0c38d99738c0"
 dependencies = [
  "darling 0.23.0",
  "ident_case",
@@ -4136,7 +4136,7 @@ dependencies = [
  "pkg-config",
  "sha3",
  "tar",
- "ureq",
+ "ureq 3.2.0",
  "windows-sys 0.61.2",
 ]
 
@@ -4614,7 +4614,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
- "toml 1.0.0+spec-1.1.0",
+ "toml 1.0.1+spec-1.1.0",
  "tower-http",
  "tracing",
  "tracing-opentelemetry",
@@ -4671,7 +4671,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
- "toml 1.0.0+spec-1.1.0",
+ "toml 1.0.1+spec-1.1.0",
  "tracing",
 ]
 
@@ -5066,7 +5066,7 @@ dependencies = [
  "test-case",
  "testcontainers-modules",
  "tokio",
- "toml 1.0.0+spec-1.1.0",
+ "toml 1.0.1+spec-1.1.0",
  "tracing",
  "tracing-subscriber",
  "twox-hash",
@@ -8375,6 +8375,7 @@ dependencies = [
  "rustls-pemfile",
  "send_wrapper",
  "serde",
+ "serde_json",
  "serde_with",
  "slab",
  "socket2 0.6.2",
@@ -8383,7 +8384,7 @@ dependencies = [
  "sysinfo 0.38.1",
  "tempfile",
  "thiserror 2.0.18",
- "toml 1.0.0+spec-1.1.0",
+ "toml 1.0.1+spec-1.1.0",
  "tower-http",
  "tracing",
  "tracing-appender",
@@ -8391,6 +8392,7 @@ dependencies = [
  "tracing-subscriber",
  "tungstenite",
  "ulid",
+ "ureq 2.12.1",
  "uuid",
  "vergen-git2",
 ]
@@ -8490,9 +8492,9 @@ checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
 name = "simple_asn1"
-version = "0.6.3"
+version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "297f631f50729c8c99b84667867963997ec0b50f32b2a7dbcab828ef0541e8bb"
+checksum = "0d585997b0ac10be3c5ee635f1bab02d512760d14b7c468801ac8a01d9ae5f1d"
 dependencies = [
  "num-bigint",
  "num-traits",
@@ -9416,9 +9418,9 @@ dependencies = [
 
 [[package]]
 name = "toml"
-version = "1.0.0+spec-1.1.0"
+version = "1.0.1+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d1d7e18e3dd1d31e0ee5e863a8091ffec2fcc271636586042452b656a22c8ee1"
+checksum = "bbe30f93627849fa362d4a602212d41bb237dc2bd0f8ba0b2ce785012e124220"
 dependencies = [
  "indexmap 2.13.0",
  "serde_core",
@@ -9495,9 +9497,9 @@ dependencies = [
 
 [[package]]
 name = "toml_parser"
-version = "1.0.7+spec-1.1.0"
+version = "1.0.8+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "247eaa3197818b831697600aadf81514e577e0cba5eab10f7e064e78ae154df1"
+checksum = "0742ff5ff03ea7e67c8ae6c93cac239e0d9784833362da3f9a9c1da8dfefcbdc"
 dependencies = [
  "winnow 0.7.14",
 ]
@@ -9918,6 +9920,22 @@ name = "untrusted"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
+
+[[package]]
+name = "ureq"
+version = "2.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "02d1a66277ed75f640d608235660df48c8e3c19f3b4edb6a263315626cc3c01d"
+dependencies = [
+ "base64 0.22.1",
+ "flate2",
+ "log",
+ "once_cell",
+ "rustls",
+ "rustls-pki-types",
+ "url",
+ "webpki-roots 0.26.11",
+]
 
 [[package]]
 name = "ureq"
