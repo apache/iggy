@@ -264,6 +264,7 @@ impl Default for HttpJwtConfig {
             encoding_secret: SERVER_CONFIG.http.jwt.encoding_secret.parse().unwrap(),
             decoding_secret: SERVER_CONFIG.http.jwt.decoding_secret.parse().unwrap(),
             use_base64_secret: SERVER_CONFIG.http.jwt.use_base_64_secret,
+            trusted_issuers: None,
         }
     }
 }
