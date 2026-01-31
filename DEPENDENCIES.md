@@ -995,4 +995,4 @@ zmij: 1.0.14, "MIT",
 zopfli: 0.8.3, "Apache-2.0",
 zstd: 0.13.3, "MIT",
 zstd-safe: 7.2.4, "Apache-2.0 OR MIT",
-zstd-sys: 2.0.16+zstd.1.5.7, "Apache-2.0 OR MIT"
+zstd-sys: 2.0.16+zstd.1.5.7, "Apache-2.0 OR MIT",
