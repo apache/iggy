@@ -38,6 +38,7 @@ mod http_config_provider;
 mod postgres;
 mod quickwit;
 mod random;
+mod redshift;
 
 pub const DEFAULT_TEST_STREAM: &str = "test_stream";
 pub const DEFAULT_TEST_TOPIC: &str = "test_topic";

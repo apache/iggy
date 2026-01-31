@@ -37,6 +37,7 @@ members = [
     "core/connectors/sinks/iceberg_sink",
     "core/connectors/sinks/postgres_sink",
     "core/connectors/sinks/quickwit_sink",
+    "core/connectors/sinks/redshift_sink",
     "core/connectors/sinks/stdout_sink",
     "core/connectors/sources/elasticsearch_source",
     "core/connectors/sources/postgres_source",
@@ -267,7 +268,7 @@ syn = { version = "2", features = ["full", "extra-traits"] }
 sysinfo = "0.38.0"
 tempfile = "3.24.0"
 test-case = "3.3.1"
-testcontainers-modules = { version = "0.14.0", features = ["postgres"] }
+testcontainers-modules = { version = "0.14.0", features = ["postgres", "localstack"] }
 thiserror = "2.0.18"
 tokio = { version = "1.49.0", features = ["full"] }
 tokio-rustls = "0.26.4"
