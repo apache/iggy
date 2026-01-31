@@ -130,7 +130,7 @@ async fn log_rotation_should_be_valid(present_log_config: LogRotationTestConfig)
     run(&client_factory, &log_dir, present_log_config).await;
 }
 
-pub async fn run(
+async fn run(
     client_factory: &dyn ClientFactory,
     log_dir: &str,
     present_log_config: LogRotationTestConfig,
