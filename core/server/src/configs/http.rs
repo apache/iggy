@@ -27,6 +27,13 @@ use serde_with::DisplayFromStr;
 use serde_with::serde_as;
 
 #[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
+pub struct TrustedIssuerConfig {
+    pub issuer: String,
+    pub audience: String,
+    pub jwks_url: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
 pub struct HttpConfig {
     pub enabled: bool,
     pub address: String,
@@ -72,6 +79,8 @@ pub struct HttpJwtConfig {
     #[config_env(secret)]
     pub decoding_secret: String,
     pub use_base64_secret: bool,
+    #[serde(default)]
+    pub trusted_issuers: Option<Vec<TrustedIssuerConfig>>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]

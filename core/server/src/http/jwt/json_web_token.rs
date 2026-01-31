@@ -33,7 +33,7 @@ pub struct JwtClaims {
     pub jti: String,
     pub iss: String,
     pub aud: String,
-    pub sub: u32,
+    pub sub: String,
     pub iat: u64,
     pub exp: u64,
     pub nbf: u64,
