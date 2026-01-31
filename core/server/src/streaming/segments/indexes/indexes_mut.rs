@@ -17,7 +17,7 @@
  */
 
 use iggy_common::PooledBuffer;
-use iggy_common::{INDEX_SIZE, IggyIndexView};
+use iggy_common::{INDEX_SIZE, IggyIndexView, IggyIndexes};
 use std::fmt;
 use std::ops::{Deref, Index as StdIndex};
 
@@ -54,6 +54,17 @@ impl IggyIndexesMut {
         let base_position = self.base_position;
         let buffer = std::mem::take(&mut self.buffer);
         (base_position, buffer)
+    }
+
+    /// Freezes the indexes buffer, converting to an immutable `IggyIndexes`.
+    ///
+    /// The returned `IggyIndexes` uses Arc-backed `Bytes`, allowing cheap clones.
+    pub fn freeze(&mut self) -> IggyIndexes {
+        let base_position = self.base_position;
+        let buffer = self.buffer.freeze();
+        self.saved_count = 0;
+        self.base_position = 0;
+        IggyIndexes::new(buffer, base_position)
     }
 
     /// Gets the size of all indexes messages
@@ -213,11 +224,6 @@ impl IggyIndexesMut {
     pub fn clear(&mut self) {
         self.saved_count = 0;
         self.buffer.clear();
-    }
-
-    /// Gets the number of unsaved indexes
-    pub fn unsaved_count(&self) -> u32 {
-        self.count().saturating_sub(self.saved_count)
     }
 
     /// Gets the unsaved part of the index buffer

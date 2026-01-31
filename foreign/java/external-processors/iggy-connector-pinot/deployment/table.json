@@ -1,0 +1,42 @@
+{
+  "tableName": "test_events",
+  "tableType": "REALTIME",
+  "segmentsConfig": {
+    "timeColumnName": "timestamp",
+    "timeType": "MILLISECONDS",
+    "replication": "1",
+    "schemaName": "test_events"
+  },
+  "tenants": {
+    "broker": "DefaultTenant",
+    "server": "DefaultTenant"
+  },
+  "tableIndexConfig": {
+    "loadMode": "MMAP",
+    "streamConfigs": {
+      "streamType": "iggy",
+      "stream.iggy.topic.name": "test-events",
+      "stream.iggy.consumer.type": "lowlevel",
+      "stream.iggy.consumer.factory.class.name": "org.apache.iggy.connector.pinot.consumer.IggyConsumerFactory",
+      "realtime.segment.consumer.factory.class.name": "org.apache.iggy.connector.pinot.consumer.IggyConsumerFactory",
+      "stream.iggy.decoder.class.name": "org.apache.iggy.connector.pinot.decoder.IggyJsonMessageDecoder",
+
+      "stream.iggy.host": "iggy",
+      "stream.iggy.port": "8090",
+      "stream.iggy.username": "iggy",
+      "stream.iggy.password": "iggy",
+
+      "stream.iggy.stream.id": "test-stream",
+      "stream.iggy.topic.id": "test-events",
+      "stream.iggy.consumer.group": "pinot-integration-test",
+
+      "stream.iggy.poll.batch.size": "100",
+      "stream.iggy.connection.pool.size": "4",
+      "stream.iggy.consumer.prop.auto.offset.reset": "smallest",
+
+      "realtime.segment.flush.threshold.rows": "1000",
+      "realtime.segment.flush.threshold.time": "600000"
+    }
+  },
+  "metadata": {}
+}

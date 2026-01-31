@@ -26,6 +26,7 @@ use crate::configs::runtime::ConnectorsConfig as RuntimeConnectorsConfig;
 use crate::error::RuntimeError;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use configs_derive::ConfigEnv;
 use iggy_connector_sdk::Schema;
 use iggy_connector_sdk::transforms::TransformType;
 use serde::{Deserialize, Serialize};
@@ -80,6 +81,8 @@ pub struct CreateSinkConfig {
     pub streams: Vec<StreamConsumerConfig>,
     pub plugin_config_format: Option<ConfigFormat>,
     pub plugin_config: Option<serde_json::Value>,
+    #[serde(default)]
+    pub verbose: bool,
 }
 
 impl CreateSinkConfig {
@@ -94,21 +97,27 @@ impl CreateSinkConfig {
             streams: self.streams.clone(),
             plugin_config_format: self.plugin_config_format,
             plugin_config: self.plugin_config.clone(),
+            verbose: self.verbose,
         }
     }
 }
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize, ConfigEnv)]
 pub struct SinkConfig {
     pub key: String,
     pub enabled: bool,
     pub version: u64,
     pub name: String,
     pub path: String,
+    #[config_env(skip)]
     pub transforms: Option<TransformsConfig>,
     pub streams: Vec<StreamConsumerConfig>,
+    #[config_env(leaf)]
     pub plugin_config_format: Option<ConfigFormat>,
+    #[config_env(skip)]
     pub plugin_config: Option<serde_json::Value>,
+    #[serde(default)]
+    pub verbose: bool,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -120,6 +129,8 @@ pub struct CreateSourceConfig {
     pub streams: Vec<StreamProducerConfig>,
     pub plugin_config_format: Option<ConfigFormat>,
     pub plugin_config: Option<serde_json::Value>,
+    #[serde(default)]
+    pub verbose: bool,
 }
 
 impl CreateSourceConfig {
@@ -134,21 +145,27 @@ impl CreateSourceConfig {
             streams: self.streams.clone(),
             plugin_config_format: self.plugin_config_format,
             plugin_config: self.plugin_config.clone(),
+            verbose: self.verbose,
         }
     }
 }
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize, ConfigEnv)]
 pub struct SourceConfig {
     pub key: String,
     pub enabled: bool,
     pub version: u64,
     pub name: String,
     pub path: String,
+    #[config_env(skip)]
     pub transforms: Option<TransformsConfig>,
     pub streams: Vec<StreamProducerConfig>,
+    #[config_env(leaf)]
     pub plugin_config_format: Option<ConfigFormat>,
+    #[config_env(skip)]
     pub plugin_config: Option<serde_json::Value>,
+    #[serde(default)]
+    pub verbose: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -157,20 +174,22 @@ pub struct TransformsConfig {
     pub transforms: HashMap<TransformType, serde_json::Value>,
 }
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize, ConfigEnv)]
 pub struct StreamConsumerConfig {
     pub stream: String,
     pub topics: Vec<String>,
+    #[config_env(leaf)]
     pub schema: Schema,
     pub batch_length: Option<u32>,
     pub poll_interval: Option<String>,
     pub consumer_group: Option<String>,
 }
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize, ConfigEnv)]
 pub struct StreamProducerConfig {
     pub stream: String,
     pub topic: String,
+    #[config_env(leaf)]
     pub schema: Schema,
     pub batch_length: Option<u32>,
     pub linger_time: Option<String>,

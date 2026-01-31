@@ -21,8 +21,7 @@ use crate::shard::IggyShard;
 use crate::shard::transmission::message::{ShardMessage, ShardRequest, ShardRequestPayload};
 use crate::streaming::segments::{IggyIndexesMut, IggyMessagesBatchMut};
 use crate::streaming::session::Session;
-use crate::streaming::{streams, topics};
-use anyhow::Result;
+use crate::streaming::topics;
 use compio::buf::{IntoInner as _, IoBuf};
 use iggy_common::Identifier;
 use iggy_common::PooledBuffer;
@@ -50,6 +49,7 @@ impl ServerCommandHandler for SendMessages {
         mut self,
         sender: &mut SenderKind,
         length: u32,
+
         session: &Session,
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {
@@ -104,51 +104,40 @@ impl ServerCommandHandler for SendMessages {
         let messages_buffer = messages_buffer.into_inner();
 
         let indexes = IggyIndexesMut::from_bytes(indexes_buffer, 0);
-        let batch = IggyMessagesBatchMut::from_indexes_and_messages(
-            messages_count,
-            indexes,
-            messages_buffer,
-        );
+        let batch = IggyMessagesBatchMut::from_indexes_and_messages(indexes, messages_buffer);
         batch.validate()?;
 
-        shard.ensure_topic_exists(&self.stream_id, &self.topic_id)?;
-
-        let numeric_stream_id = shard
-            .streams
-            .with_stream_by_id(&self.stream_id, streams::helpers::get_stream_id());
-
-        let numeric_topic_id = shard.streams.with_topic_by_id(
-            &self.stream_id,
-            &self.topic_id,
-            topics::helpers::get_topic_id(),
-        );
-
-        // TODO(tungtose): dry this code && get partition_id below have a side effect
-        let partition_id = shard.streams.with_topic_by_id(
-            &self.stream_id,
-            &self.topic_id,
-            |(root, auxilary, ..)| match self.partitioning.kind {
-                PartitioningKind::Balanced => {
-                    let upperbound = root.partitions().len();
-                    let pid = auxilary.get_next_partition_id(upperbound);
-                    Ok(pid)
-                }
-                PartitioningKind::PartitionId => Ok(u32::from_le_bytes(
-                    self.partitioning.value[..self.partitioning.length as usize]
-                        .try_into()
-                        .map_err(|_| IggyError::InvalidNumberEncoding)?,
-                ) as usize),
-                PartitioningKind::MessagesKey => {
-                    let upperbound = root.partitions().len();
-                    Ok(
-                        topics::helpers::calculate_partition_id_by_messages_key_hash(
-                            upperbound,
-                            &self.partitioning.value,
-                        ),
-                    )
-                }
-            },
+        let (numeric_stream_id, numeric_topic_id) =
+            shard.resolve_topic_id(&self.stream_id, &self.topic_id)?;
+        shard.metadata.perm_append_messages(
+            session.get_user_id(),
+            numeric_stream_id,
+            numeric_topic_id,
         )?;
+
+        let partition_id = match self.partitioning.kind {
+            PartitioningKind::Balanced => shard
+                .metadata
+                .get_next_partition_id(numeric_stream_id, numeric_topic_id)
+                .ok_or(IggyError::TopicIdNotFound(
+                    self.stream_id.clone(),
+                    self.topic_id.clone(),
+                ))?,
+            PartitioningKind::PartitionId => u32::from_le_bytes(
+                self.partitioning.value[..self.partitioning.length as usize]
+                    .try_into()
+                    .map_err(|_| IggyError::InvalidNumberEncoding)?,
+            ) as usize,
+            PartitioningKind::MessagesKey => {
+                let partitions_count = shard
+                    .metadata
+                    .partitions_count(numeric_stream_id, numeric_topic_id);
+                topics::helpers::calculate_partition_id_by_messages_key_hash(
+                    partitions_count,
+                    &self.partitioning.value,
+                )
+            }
+        };
 
         let namespace = IggyNamespace::new(numeric_stream_id, numeric_topic_id, partition_id);
         let user_id = session.get_user_id();
@@ -191,7 +180,7 @@ impl ServerCommandHandler for SendMessages {
                     .send_request_to_shard_or_recoil(Some(&namespace), socket_transfer_msg)
                     .await
                 {
-                    error!("tranfer socket to another shard failed, drop connection. {e:?}");
+                    error!("transfer socket to another shard failed, drop connection. {e:?}");
                     return Ok(HandlerResult::Finished);
                 }
 

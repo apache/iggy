@@ -20,7 +20,6 @@ use crate::locking::IggyRwLockFn;
 use std::sync::Arc;
 use tokio::sync::{RwLock as TokioRwLock, RwLockReadGuard, RwLockWriteGuard};
 
-#[cfg(feature = "tokio_lock")]
 #[derive(Debug)]
 pub struct IggyTokioRwLock<T>(Arc<TokioRwLock<T>>);
 

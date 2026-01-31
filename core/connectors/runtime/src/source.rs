@@ -37,7 +37,9 @@ use tracing::{debug, error, info, trace, warn};
 
 use crate::configs::connectors::SourceConfig;
 use crate::context::RuntimeContext;
+use crate::log::LOG_CALLBACK;
 use crate::manager::status::ConnectorStatus;
+use crate::metrics::ConnectorType;
 use crate::{
     PLUGIN_ID, RuntimeError, SourceApi, SourceConnector, SourceConnectorPlugin,
     SourceConnectorProducer, SourceConnectorWrapper, resolve_plugin_path,
@@ -91,6 +93,7 @@ pub async fn init(
                 transforms: vec![],
                 state_storage,
                 error: init_error.clone(),
+                verbose: config.verbose,
             });
         } else {
             let container: Container<SourceApi> =
@@ -118,6 +121,7 @@ pub async fn init(
                         transforms: vec![],
                         state_storage,
                         error: init_error.clone(),
+                        verbose: config.verbose,
                     }],
                 },
             );
@@ -200,6 +204,7 @@ fn init_source(
         plugin_config.len(),
         state_ptr,
         state_len,
+        LOG_CALLBACK,
     );
     if result != 0 {
         let err = format!("Plugin initialization failed (ID: {id})");
@@ -222,15 +227,13 @@ pub fn handle(sources: Vec<SourceConnectorWrapper>, context: Arc<RuntimeContext>
             let plugin_key = plugin.key.clone();
             let context = context.clone();
 
-            if plugin.error.is_none() {
-                info!("Starting handler for source connector with ID: {plugin_id}...");
-            } else {
+            if let Some(error) = &plugin.error {
                 error!(
-                    "Failed to initialize source connector with ID: {plugin_id}: {}. Skipping...",
-                    plugin.error.as_ref().expect("Error should be present")
+                    "Failed to initialize source connector with ID: {plugin_id}: {error}. Skipping...",
                 );
                 continue;
             }
+            info!("Starting handler for source connector with ID: {plugin_id}...");
 
             let handle = source.callback;
             tokio::task::spawn_blocking(move || {
@@ -254,7 +257,11 @@ pub fn handle(sources: Vec<SourceConnectorWrapper>, context: Arc<RuntimeContext>
 
                 context
                     .sources
-                    .update_status(&plugin_key, ConnectorStatus::Running)
+                    .update_status(
+                        &plugin_key,
+                        ConnectorStatus::Running,
+                        Some(&context.metrics),
+                    )
                     .await;
                 let encoder = producer.encoder.clone();
                 let producer = &producer.producer;
@@ -267,7 +274,14 @@ pub fn handle(sources: Vec<SourceConnectorWrapper>, context: Arc<RuntimeContext>
 
                 while let Ok(produced_messages) = receiver.recv_async().await {
                     let count = produced_messages.messages.len();
-                    info!("Source connector with ID: {plugin_id} received {count} messages",);
+                    context
+                        .metrics
+                        .increment_messages_produced(&plugin_key, count as u64);
+                    if plugin.verbose {
+                        info!("Source connector with ID: {plugin_id} received {count} messages",);
+                    } else {
+                        debug!("Source connector with ID: {plugin_id} received {count} messages",);
+                    }
                     let schema = produced_messages.schema;
                     let mut messages: Vec<DecodedMessage> = Vec::with_capacity(count);
                     for message in produced_messages.messages {
@@ -307,6 +321,9 @@ pub fn handle(sources: Vec<SourceConnectorWrapper>, context: Arc<RuntimeContext>
                             producer.topic()
                         );
                         error!(err);
+                        context
+                            .metrics
+                            .increment_errors(&plugin_key, ConnectorType::Source);
                         context.sources.set_error(&plugin_key, &err).await;
                         continue;
                     };
@@ -318,15 +335,30 @@ pub fn handle(sources: Vec<SourceConnectorWrapper>, context: Arc<RuntimeContext>
                             producer.topic(),
                         );
                         error!(err);
+                        context
+                            .metrics
+                            .increment_errors(&plugin_key, ConnectorType::Source);
                         context.sources.set_error(&plugin_key, &err).await;
                         continue;
                     }
 
-                    info!(
-                        "Sent {count} messages to stream: {}, topic: {} by source connector with ID: {plugin_id}",
-                        producer.stream(),
-                        producer.topic()
-                    );
+                    context
+                        .metrics
+                        .increment_messages_sent(&plugin_key, count as u64);
+
+                    if plugin.verbose {
+                        info!(
+                            "Sent {count} messages to stream: {}, topic: {} by source connector with ID: {plugin_id}",
+                            producer.stream(),
+                            producer.topic()
+                        );
+                    } else {
+                        debug!(
+                            "Sent {count} messages to stream: {}, topic: {} by source connector with ID: {plugin_id}",
+                            producer.stream(),
+                            producer.topic()
+                        );
+                    }
 
                     let Some(state) = produced_messages.state else {
                         debug!("No state provided for source connector with ID: {plugin_id}");
@@ -351,7 +383,11 @@ pub fn handle(sources: Vec<SourceConnectorWrapper>, context: Arc<RuntimeContext>
                 info!("Source connector with ID: {plugin_id} stopped.");
                 context
                     .sources
-                    .update_status(&plugin_key, ConnectorStatus::Stopped)
+                    .update_status(
+                        &plugin_key,
+                        ConnectorStatus::Stopped,
+                        Some(&context.metrics),
+                    )
                     .await;
             });
         }

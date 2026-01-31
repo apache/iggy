@@ -35,8 +35,6 @@ jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 60
-    env:
-      IGGY_CI_BUILD: true
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -86,6 +84,14 @@ jobs:
         uses: gradle/actions/setup-gradle@af1da67850ed9a4cedd57bfd976089dd991e2582 # v4.0.0
         with:
           gradle-version: "9.2.1"
+
+      - name: Setup Go with cache for examples
+        if: inputs.component == 'examples-suite' && inputs.task == 'examples-go'
+        uses: ./.github/actions/utils/setup-go-with-cache
+        with:
+          enabled: "false"
+          cache-dependency-path: examples/go/go.sum
+          download-deps: "false"
 
       - name: Build common binaries for all examples
         if: inputs.component == 'examples-suite'

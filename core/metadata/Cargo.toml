@@ -29,10 +29,11 @@ readme = "../../../README.md"
 
 [dependencies]
 ahash = { workspace = true }
-bytes = { workspace = true }
-consensus = { path = "../consensus" }
-iggy_common = { path = "../common" }
-journal = { path = "../journal" }
-message_bus = { path = "../message_bus" }
-slab = "0.4.11"
+consensus = { workspace = true }
+iggy_common = { workspace = true }
+journal = { workspace = true }
+left-right = { workspace = true }
+message_bus = { workspace = true }
+paste = { workspace = true }
+slab = { workspace = true }
 tracing = { workspace = true }

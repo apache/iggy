@@ -15,9 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::slab::traits_ext::{DeleteCell, EntityComponentSystem, EntityMarker, IntoComponents};
-use crate::streaming::streams::stream;
-use crate::streaming::topics::storage::delete_topic_from_disk;
 use crate::{configs::system::SystemConfig, io::fs_utils::remove_dir_all};
 use compio::fs::create_dir_all;
 use iggy_common::IggyError;
@@ -40,26 +37,24 @@ pub async fn create_stream_file_hierarchy(
     Ok(())
 }
 
-pub async fn delete_stream_from_disk(
-    stream: &mut stream::Stream,
+/// Delete stream directory using only IDs.
+/// Does not require slab access - works with SharedMetadata.
+/// topics_with_partitions: Vec<(topic_id, Vec<partition_id>)>
+pub async fn delete_stream_directory(
+    stream_id: usize,
+    topics_with_partitions: &[(usize, Vec<usize>)],
     config: &SystemConfig,
 ) -> Result<(), IggyError> {
-    let stream_id = stream.id();
+    use crate::streaming::topics::storage::delete_topic_directory;
+
     let stream_path = config.get_stream_path(stream_id);
     if !Path::new(&stream_path).exists() {
         return Err(IggyError::StreamDirectoryNotFound(stream_path));
     }
 
-    // Gather all topic ids.
-    let ids = stream.root().topics().with_components(|topics| {
-        let (roots, ..) = topics.into_components();
-        roots.iter().map(|(_, root)| root.id()).collect::<Vec<_>>()
-    });
-
-    // Delete all topics from the stream.
-    for id in ids {
-        let mut topic = stream.root_mut().topics_mut().delete(id);
-        delete_topic_from_disk(stream_id, &mut topic, config).await?;
+    // Delete all topics
+    for (topic_id, partition_ids) in topics_with_partitions {
+        delete_topic_directory(stream_id, *topic_id, partition_ids, config).await?;
     }
 
     remove_dir_all(&stream_path)

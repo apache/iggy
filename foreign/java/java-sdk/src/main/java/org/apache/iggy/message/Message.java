@@ -19,18 +19,46 @@
 
 package org.apache.iggy.message;
 
+import com.fasterxml.jackson.annotation.JsonCreator;
+import com.fasterxml.jackson.annotation.JsonProperty;
+import com.fasterxml.jackson.annotation.JsonSetter;
+import com.fasterxml.jackson.annotation.Nulls;
+import org.apache.iggy.serde.Base64Serializer;
+import org.apache.iggy.serde.UserHeadersSerializer;
+import tools.jackson.databind.annotation.JsonSerialize;
+
 import java.math.BigInteger;
+import java.util.Base64;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
-public record Message(MessageHeader header, byte[] payload, Map<String, HeaderValue> userHeaders) {
+public record Message(
+        MessageHeader header,
+        @JsonSerialize(using = Base64Serializer.class) byte[] payload,
+        @JsonSerialize(using = UserHeadersSerializer.class) Map<HeaderKey, HeaderValue> userHeaders) {
+    @JsonCreator
+    public static Message fromJson(
+            @JsonProperty("header") MessageHeader header,
+            @JsonProperty("payload") String base64Payload,
+            @JsonProperty(value = "user_headers", required = false) @JsonSetter(nulls = Nulls.AS_EMPTY)
+                    List<HeaderEntry> userHeadersList) {
+        byte[] decodedPayload = Base64.getDecoder().decode(base64Payload);
+        Map<HeaderKey, HeaderValue> headersMap = new HashMap<>();
+        if (userHeadersList != null) {
+            for (HeaderEntry entry : userHeadersList) {
+                headersMap.put(entry.key(), entry.value());
+            }
+        }
+        return new Message(header, decodedPayload, headersMap);
+    }
 
     public static Message of(String payload) {
         return of(payload, Collections.emptyMap());
     }
 
-    public static Message of(String payload, Map<String, HeaderValue> userHeaders) {
+    public static Message of(String payload, Map<HeaderKey, HeaderValue> userHeaders) {
         final byte[] payloadBytes = payload.getBytes();
         final long userHeadersLength = getUserHeadersSize(userHeaders);
         final MessageHeader msgHeader = new MessageHeader(
@@ -44,8 +72,8 @@ public record Message(MessageHeader header, byte[] payload, Map<String, HeaderVa
         return new Message(msgHeader, payloadBytes, userHeaders);
     }
 
-    public Message withUserHeaders(Map<String, HeaderValue> userHeaders) {
-        Map<String, HeaderValue> mergedHeaders = mergeUserHeaders(userHeaders);
+    public Message withUserHeaders(Map<HeaderKey, HeaderValue> userHeaders) {
+        Map<HeaderKey, HeaderValue> mergedHeaders = mergeUserHeaders(userHeaders);
         long userHeadersLength = getUserHeadersSize(mergedHeaders);
         MessageHeader updatedHeader = new MessageHeader(
                 header.checksum(),
@@ -63,7 +91,7 @@ public record Message(MessageHeader header, byte[] payload, Map<String, HeaderVa
         return Math.toIntExact(MessageHeader.SIZE + payload.length + userHeadersLength);
     }
 
-    private Map<String, HeaderValue> mergeUserHeaders(Map<String, HeaderValue> userHeaders) {
+    private Map<HeaderKey, HeaderValue> mergeUserHeaders(Map<HeaderKey, HeaderValue> userHeaders) {
         if (userHeaders.isEmpty()) {
             return this.userHeaders;
         }
@@ -72,21 +100,21 @@ public record Message(MessageHeader header, byte[] payload, Map<String, HeaderVa
             return userHeaders;
         }
 
-        Map<String, HeaderValue> mergedHeaders = new HashMap<>(this.userHeaders);
+        Map<HeaderKey, HeaderValue> mergedHeaders = new HashMap<>(this.userHeaders);
         mergedHeaders.putAll(userHeaders);
         return mergedHeaders;
     }
 
-    private static long getUserHeadersSize(Map<String, HeaderValue> userHeaders) {
+    private static long getUserHeadersSize(Map<HeaderKey, HeaderValue> userHeaders) {
         if (userHeaders.isEmpty()) {
             return 0L;
         }
 
         long size = 0L;
-        for (Map.Entry<String, HeaderValue> entry : userHeaders.entrySet()) {
-            byte[] keyBytes = entry.getKey().getBytes();
-            byte[] valueBytes = entry.getValue().value().getBytes();
-            size += 4L + keyBytes.length + 1L + 4L + valueBytes.length;
+        for (Map.Entry<HeaderKey, HeaderValue> entry : userHeaders.entrySet()) {
+            byte[] keyBytes = entry.getKey().value();
+            byte[] valueBytes = entry.getValue().value();
+            size += 1L + 4L + keyBytes.length + 1L + 4L + valueBytes.length;
         }
         return size;
     }

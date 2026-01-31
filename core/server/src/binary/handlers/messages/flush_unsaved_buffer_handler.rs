@@ -23,7 +23,6 @@ use crate::binary::handlers::messages::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::shard::IggyShard;
 use crate::streaming::session::Session;
-use anyhow::Result;
 use err_trail::ErrContext;
 use iggy_common::{FlushUnsavedBuffer, IggyError, SenderKind};
 use std::rc::Rc;

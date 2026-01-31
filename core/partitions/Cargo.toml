@@ -28,4 +28,4 @@ repository = "https://github.com/apache/iggy"
 readme = "../../README.md"
 
 [dependencies]
-iggy_common = { path = "../common" }
+iggy_common = { workspace = true }

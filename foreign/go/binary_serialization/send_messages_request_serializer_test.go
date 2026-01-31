@@ -54,7 +54,7 @@ func TestSerialize_SendMessagesRequest(t *testing.T) {
 		0x04,                   // Partitioning Length
 		0x01, 0x00, 0x00, 0x00, // PartitionId (123)
 		0x01, 0x0, 0x0, 0x0, // MessageCount
-		0, 0, 0, 0, 110, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // Index (16*1) bytes
+		0, 0, 0, 0, 112, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // Index (16*1) bytes
 	}
 	expected = append(expected, message1.Header.ToBytes()...)
 	expected = append(expected, message1.Payload...)
@@ -66,10 +66,10 @@ func TestSerialize_SendMessagesRequest(t *testing.T) {
 	}
 }
 
-func createDefaultMessageHeaders() map[iggcon.HeaderKey]iggcon.HeaderValue {
-	return map[iggcon.HeaderKey]iggcon.HeaderValue{
-		{Value: "HeaderKey1"}: {Kind: iggcon.String, Value: []byte("Value 1")},
-		{Value: "HeaderKey2"}: {Kind: iggcon.Uint32, Value: []byte{0x01, 0x02, 0x03, 0x04}},
+func createDefaultMessageHeaders() []iggcon.HeaderEntry {
+	return []iggcon.HeaderEntry{
+		{Key: iggcon.HeaderKey{Kind: iggcon.String, Value: []byte("HeaderKey1")}, Value: iggcon.HeaderValue{Kind: iggcon.String, Value: []byte("Value 1")}},
+		{Key: iggcon.HeaderKey{Kind: iggcon.String, Value: []byte("HeaderKey2")}, Value: iggcon.HeaderValue{Kind: iggcon.Uint32, Value: []byte{0x01, 0x02, 0x03, 0x04}}},
 	}
 }
 

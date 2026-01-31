@@ -28,14 +28,19 @@ ci-qemu = []
 
 [dependencies]
 ahash = { workspace = true }
-assert_cmd = "2.1.1"
+anyhow = { workspace = true }
+assert_cmd = { workspace = true }
 async-trait = { workspace = true }
+bon = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
 compio = { workspace = true }
-ctor = "0.6.3"
+configs = { workspace = true }
+configs_derive = { workspace = true }
+ctor = { workspace = true }
 derive_more = { workspace = true }
 env_logger = { workspace = true }
+figment = { workspace = true }
 futures = { workspace = true }
 humantime = { workspace = true }
 iggy = { workspace = true }
@@ -43,27 +48,34 @@ iggy_binary_protocol = { workspace = true }
 iggy_common = { workspace = true }
 keyring = { workspace = true }
 lazy_static = { workspace = true }
-libc = "0.2.178"
+libc = { workspace = true }
 log = { workspace = true }
+once_cell = { workspace = true }
 predicates = { workspace = true }
 rand = { workspace = true }
-rcgen = "0.14.6"
+rcgen = { workspace = true }
 reqwest = { workspace = true }
-rmcp = { version = "0.12.0", features = [
+reqwest-middleware = { workspace = true }
+reqwest-retry = { workspace = true }
+rmcp = { workspace = true, features = [
     "client",
     "reqwest",
     "transport-streamable-http-client",
     "transport-streamable-http-client-reqwest",
 ] }
+serde = { workspace = true }
 serde_json = { workspace = true }
 serial_test = { workspace = true }
 server = { workspace = true }
+socket2 = { workspace = true }
+sqlx = { workspace = true }
 strum = { workspace = true }
 strum_macros = { workspace = true }
 tempfile = { workspace = true }
 test-case = { workspace = true }
-testcontainers-modules = { version = "0.14.0", features = ["postgres", "localstack"] }
+testcontainers-modules = { workspace = true }
 tokio = { workspace = true }
+tracing = { workspace = true }
 twox-hash = { workspace = true }
 uuid = { workspace = true }
 zip = { workspace = true }

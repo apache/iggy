@@ -23,6 +23,7 @@ use crate::PartitioningKind;
 use crate::Sizeable;
 use crate::Validatable;
 use crate::error::IggyError;
+use crate::types::message::HeaderEntry;
 use crate::types::message::partitioning::Partitioning;
 use crate::{Command, SEND_MESSAGES_CODE};
 use crate::{INDEX_SIZE, IggyMessage, IggyMessagesBatch};
@@ -203,7 +204,11 @@ impl Serialize for SendMessages {
                 map.insert("payload", serde_json::to_value(payload_base64).unwrap());
 
                 if let Ok(Some(headers)) = msg_view.user_headers_map() {
-                    map.insert("headers", serde_json::to_value(&headers).unwrap());
+                    let entries: Vec<HeaderEntry> = headers
+                        .into_iter()
+                        .map(|(k, v)| HeaderEntry { key: k, value: v })
+                        .collect();
+                    map.insert("user_headers", serde_json::to_value(&entries).unwrap());
                 }
 
                 map
@@ -305,13 +310,23 @@ impl<'de> Deserialize<'de> for SendMessages {
                                     .decode(payload)
                                     .map_err(|_| de::Error::custom("Invalid base64 payload"))?;
 
-                                let headers_map = if let Some(headers) = msg.get("headers") {
+                                let headers_map = if let Some(headers) = msg.get("user_headers") {
                                     if headers.is_null() {
                                         None
                                     } else {
-                                        Some(serde_json::from_value(headers.clone()).map_err(
-                                            |_| de::Error::custom("Invalid headers format"),
-                                        )?)
+                                        let entries: Vec<HeaderEntry> = serde_json::from_value(
+                                            headers.clone(),
+                                        )
+                                        .map_err(|e| {
+                                            de::Error::custom(format!(
+                                                "Invalid headers format: {e}"
+                                            ))
+                                        })?;
+                                        let mut map = HashMap::new();
+                                        for entry in entries {
+                                            map.insert(entry.key, entry.value);
+                                        }
+                                        Some(map)
                                     }
                                 } else {
                                     None

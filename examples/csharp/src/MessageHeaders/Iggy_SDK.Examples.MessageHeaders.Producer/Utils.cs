@@ -106,7 +106,7 @@ public static class Utils
                     return new Message(Guid.NewGuid(), Encoding.UTF8.GetBytes(jsonEnvelope),
                         new Dictionary<HeaderKey, HeaderValue>
                         {
-                            { HeaderKey.New("message_type"), HeaderValue.FromString(serializableMessage.MessageType) }
+                            { HeaderKey.FromString("message_type"), HeaderValue.FromString(serializableMessage.MessageType) }
                         });
                 }
             ).ToList();

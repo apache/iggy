@@ -24,7 +24,7 @@ use iggy::prelude::*;
 use integration::test_server::{
     ClientFactory, assert_clean_system, create_user, login_root, login_user,
 };
-use std::str::FromStr;
+use std::str::{FromStr, from_utf8};
 
 pub async fn run(client_factory: &dyn ClientFactory) {
     let system_client = create_client(client_factory).await;
@@ -132,6 +132,7 @@ async fn execute_using_messages_key_key(
 async fn poll_messages(client: &IggyClient) -> u32 {
     let consumer = Consumer::group(Identifier::named(CONSUMER_GROUP_NAME).unwrap());
     let mut total_read_messages_count = 0;
+    let mut last_entity_id: Option<u32> = None;
     const MAX_RETRIES: u32 = 5;
     let mut total_retries = 0;
 
@@ -163,10 +164,40 @@ async fn poll_messages(client: &IggyClient) -> u32 {
             tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
         };
 
-        total_read_messages_count += polled_messages.messages.len() as u32;
+        if polled_messages.messages.is_empty() {
+            if total_retries >= MAX_RETRIES {
+                break;
+            }
+            continue;
+        }
+
+        let message = &polled_messages.messages[0];
+        let payload = from_utf8(&message.payload).unwrap();
+        let entity_id = parse_entity_id_from_payload(payload);
+
+        // Each client polls from a single partition; messages should arrive in send order
+        if let Some(last) = last_entity_id {
+            assert!(
+                entity_id > last,
+                "Messages out of order: {} should be > {}",
+                entity_id,
+                last
+            );
+        }
+        last_entity_id = Some(entity_id);
+
+        total_read_messages_count += 1;
     }
 
     total_read_messages_count
+}
+
+fn parse_entity_id_from_payload(payload: &str) -> u32 {
+    payload
+        .strip_prefix("message-")
+        .expect("payload should start with 'message-'")
+        .parse()
+        .expect("entity_id should be a valid u32")
 }
 
 fn create_message_payload(entity_id: u32) -> String {
@@ -214,6 +245,7 @@ async fn execute_using_none_key(
 
 async fn validate_message_polling(client: &IggyClient) {
     let consumer = Consumer::group(Identifier::named(CONSUMER_GROUP_NAME).unwrap());
+    let mut partition_id: Option<u32> = None;
     const MAX_RETRIES: u32 = 5;
     let mut total_retries = 0;
 
@@ -256,6 +288,23 @@ async fn validate_message_polling(client: &IggyClient) {
         let message = &polled_messages.messages[0];
         let offset = (i - 1) as u64;
         assert_eq!(message.header.offset, offset);
+
+        let payload = from_utf8(&message.payload).unwrap();
+
+        if partition_id.is_none() {
+            partition_id = Some(parse_partition_id_from_extended_payload(payload));
+        }
+
+        // For balanced partitioning: entity_id = partition_id + offset * PARTITIONS_COUNT
+        let p = partition_id.unwrap();
+        let expected_entity_id = p + (offset as u32) * PARTITIONS_COUNT;
+        let expected_payload = create_extended_message_payload(p, expected_entity_id);
+
+        assert_eq!(
+            payload, expected_payload,
+            "Payload mismatch at offset {}: expected '{}', got '{}'",
+            offset, expected_payload, payload
+        );
     }
 
     let polled_messages = client
@@ -271,6 +320,13 @@ async fn validate_message_polling(client: &IggyClient) {
         .await
         .unwrap();
     assert!(polled_messages.messages.is_empty())
+}
+
+fn parse_partition_id_from_extended_payload(payload: &str) -> u32 {
+    let parts: Vec<&str> = payload.split('-').collect();
+    parts[1]
+        .parse()
+        .expect("partition_id should be a valid u32")
 }
 
 fn create_extended_message_payload(partition_id: u32, entity_id: u32) -> String {

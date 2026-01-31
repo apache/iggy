@@ -17,7 +17,7 @@
 
 [package]
 name = "iggy_connector_elasticsearch_sink"
-version = "0.1.0"
+version = "0.2.1-edge.1"
 description = "Iggy Elasticsearch sink connector"
 edition = "2024"
 license = "Apache-2.0"
@@ -39,8 +39,8 @@ async-trait = { workspace = true }
 base64 = { workspace = true }
 chrono = { workspace = true }
 dashmap = { workspace = true }
-elasticsearch = { version = "9.1.0-alpha.1", features = ["rustls-tls"], default-features = false }
-iggy_connector_sdk = { path = "../../sdk" }
+elasticsearch = { workspace = true }
+iggy_connector_sdk = { workspace = true }
 once_cell = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

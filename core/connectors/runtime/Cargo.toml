@@ -17,7 +17,7 @@
 
 [package]
 name = "iggy-connectors"
-version = "0.2.1-edge.3"
+version = "0.2.2-edge.1"
 description = "Connectors runtime for Iggy message streaming platform"
 edition = "2024"
 license = "Apache-2.0"
@@ -34,7 +34,10 @@ axum = { workspace = true }
 axum-server = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
+configs = { workspace = true }
+configs_derive = { workspace = true }
 dashmap = { workspace = true }
+derive_more = { workspace = true }
 dirs = { workspace = true }
 dlopen2 = { workspace = true }
 dotenvy = { workspace = true }
@@ -47,7 +50,13 @@ iggy_common = { workspace = true }
 iggy_connector_sdk = { workspace = true }
 mimalloc = { workspace = true }
 once_cell = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry-appender-tracing = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+opentelemetry-semantic-conventions = { workspace = true }
+opentelemetry_sdk = { workspace = true, features = ["rt-tokio"] }
 postcard = { workspace = true }
+prometheus-client = { workspace = true }
 reqwest = { workspace = true }
 reqwest-middleware = { workspace = true }
 reqwest-retry = { workspace = true }
@@ -57,11 +66,13 @@ serde_json = { workspace = true }
 serde_with = { workspace = true }
 serde_yaml_ng = { workspace = true }
 strum = { workspace = true }
+sysinfo = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 toml = { workspace = true }
 tower-http = { workspace = true }
 tracing = { workspace = true }
+tracing-opentelemetry = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]

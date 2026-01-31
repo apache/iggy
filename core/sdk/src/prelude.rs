@@ -40,6 +40,7 @@ pub use crate::clients::consumer_builder::IggyConsumerBuilder;
 pub use crate::clients::producer::IggyProducer;
 pub use crate::clients::producer_builder::IggyProducerBuilder;
 pub use crate::clients::producer_config::{BackgroundConfig, DirectConfig};
+pub use crate::clients::producer_sharding::{BalancedSharding, OrderedSharding, Sharding};
 pub use crate::consumer_ext::IggyConsumerMessageExt;
 pub use crate::stream_builder::IggyConsumerConfig;
 pub use crate::stream_builder::IggyStreamConsumer;
@@ -56,12 +57,12 @@ pub use iggy_common::{
     Aes256GcmEncryptor, Args, ArgsOptional, AutoLogin, BytesSerializable, CacheMetrics,
     CacheMetricsKey, ClientError, ClientInfoDetails, ClusterMetadata, ClusterNode, ClusterNodeRole,
     ClusterNodeStatus, CompressionAlgorithm, Consumer, ConsumerGroupDetails, ConsumerKind,
-    EncryptorKind, FlushUnsavedBuffer, GlobalPermissions, HeaderKey, HeaderValue, HttpClientConfig,
-    HttpClientConfigBuilder, IdKind, Identifier, IdentityInfo, IggyByteSize, IggyDuration,
-    IggyError, IggyExpiry, IggyIndexView, IggyMessage, IggyMessageHeader, IggyMessageHeaderView,
-    IggyMessageView, IggyMessageViewIterator, IggyTimestamp, MaxTopicSize, Partition, Partitioner,
-    Partitioning, Permissions, PersonalAccessTokenExpiry, PollMessages, PolledMessages,
-    PollingKind, PollingStrategy, QuicClientConfig, QuicClientConfigBuilder,
+    EncryptorKind, FlushUnsavedBuffer, GlobalPermissions, HeaderKey, HeaderKind, HeaderValue,
+    HttpClientConfig, HttpClientConfigBuilder, IdKind, Identifier, IdentityInfo, IggyByteSize,
+    IggyDuration, IggyError, IggyExpiry, IggyIndexView, IggyMessage, IggyMessageHeader,
+    IggyMessageHeaderView, IggyMessageView, IggyMessageViewIterator, IggyTimestamp, MaxTopicSize,
+    Partition, Partitioner, Partitioning, Permissions, PersonalAccessTokenExpiry, PollMessages,
+    PolledMessages, PollingKind, PollingStrategy, QuicClientConfig, QuicClientConfigBuilder,
     QuicClientReconnectionConfig, SendMessages, Sizeable, SnapshotCompression, Stats, Stream,
     StreamDetails, StreamPermissions, SystemSnapshotType, TcpClientConfig, TcpClientConfigBuilder,
     TcpClientReconnectionConfig, Topic, TopicDetails, TopicPermissions, TransportEndpoints,

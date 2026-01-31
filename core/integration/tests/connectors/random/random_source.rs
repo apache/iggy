@@ -27,7 +27,10 @@ async fn given_valid_configuration_random_source_connector_should_produce_messag
     let client = runtime.create_client().await;
     // Wait for some messages to be produced
     sleep(Duration::from_secs(1)).await;
-    let messages = client.get_messages().await.expect("Failed to get messages");
+    let messages = client
+        .poll_messages()
+        .await
+        .expect("Failed to poll messages");
     assert!(
         !messages.messages.is_empty(),
         "No messages received from random source"

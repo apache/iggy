@@ -22,7 +22,6 @@ use crate::http::jwt::json_web_token::Identity;
 use crate::http::shared::AppState;
 use crate::shard::transmission::event::ShardEvent;
 use crate::state::command::EntryCommand;
-use crate::streaming::session::Session;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::post;
@@ -58,10 +57,18 @@ async fn create_partitions(
     command.topic_id = Identifier::from_str_value(&topic_id)?;
     command.validate()?;
 
+    let (numeric_stream_id, numeric_topic_id) = state
+        .shard
+        .shard()
+        .resolve_topic_id(&command.stream_id, &command.topic_id)?;
+    state.shard.shard().metadata.perm_create_partitions(
+        identity.user_id,
+        numeric_stream_id,
+        numeric_topic_id,
+    )?;
+
     let _parititon_guard = state.shard.shard().fs_locks.partition_lock.lock().await;
-    let session = Session::stateless(identity.user_id, identity.ip_address);
-    let partitions = SendWrapper::new(state.shard.shard().create_partitions(
-        &session,
+    let partition_infos = SendWrapper::new(state.shard.shard().create_partitions(
         &command.stream_id,
         &command.topic_id,
         command.partitions_count,
@@ -74,7 +81,7 @@ async fn create_partitions(
         let event = ShardEvent::CreatedPartitions {
             stream_id: command.stream_id.clone(),
             topic_id: command.topic_id.clone(),
-            partitions,
+            partitions: partition_infos,
         };
         let _responses = shard.broadcast_event_to_all_shards(event).await;
         Ok::<(), CustomError>(())
@@ -112,10 +119,18 @@ async fn delete_partitions(
     query.topic_id = Identifier::from_str_value(&topic_id)?;
     query.validate()?;
 
-    let session = Session::stateless(identity.user_id, identity.ip_address);
+    let (numeric_stream_id, numeric_topic_id) = state
+        .shard
+        .shard()
+        .resolve_topic_id(&query.stream_id, &query.topic_id)?;
+    state.shard.shard().metadata.perm_delete_partitions(
+        identity.user_id,
+        numeric_stream_id,
+        numeric_topic_id,
+    )?;
+
     let deleted_partition_ids = {
         let delete_future = SendWrapper::new(state.shard.shard().delete_partitions(
-            &session,
             &query.stream_id,
             &query.topic_id,
             query.partitions_count,

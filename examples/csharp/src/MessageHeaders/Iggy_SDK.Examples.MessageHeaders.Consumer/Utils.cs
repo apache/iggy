@@ -89,7 +89,7 @@ public static class Utils
 
     private static void HandleMessage(MessageResponse message, ILogger logger)
     {
-        var headerKey = HeaderKey.New("message_type");
+        var headerKey = HeaderKey.FromString("message_type");
         var headersMap = message.UserHeaders ?? throw new Exception("Missing headers map.");
         var messageType = Encoding.UTF8.GetString(headersMap[headerKey].Value);
 

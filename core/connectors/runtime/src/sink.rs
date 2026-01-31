@@ -19,7 +19,9 @@
 
 use crate::configs::connectors::SinkConfig;
 use crate::context::RuntimeContext;
+use crate::log::LOG_CALLBACK;
 use crate::manager::status::ConnectorStatus;
+use crate::metrics::{ConnectorType, Metrics};
 use crate::{
     PLUGIN_ID, RuntimeError, SinkApi, SinkConnector, SinkConnectorConsumer, SinkConnectorPlugin,
     SinkConnectorWrapper, resolve_plugin_path, transform,
@@ -40,7 +42,7 @@ use std::{
     sync::{Arc, atomic::Ordering},
     time::Instant,
 };
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 pub async fn init(
     sink_configs: HashMap<String, SinkConfig>,
@@ -78,6 +80,7 @@ pub async fn init(
                 config_format: config.plugin_config_format,
                 consumers: vec![],
                 error: init_error.clone(),
+                verbose: config.verbose,
             });
         } else {
             let container: Container<SinkApi> =
@@ -102,6 +105,7 @@ pub async fn init(
                         config_format: config.plugin_config_format,
                         consumers: vec![],
                         error: init_error.clone(),
+                        verbose: config.verbose,
                     }],
                 },
             );
@@ -178,16 +182,14 @@ pub async fn init(
 pub fn consume(sinks: Vec<SinkConnectorWrapper>, context: Arc<RuntimeContext>) {
     for sink in sinks {
         for plugin in sink.plugins {
-            if plugin.error.is_none() {
-                info!("Starting consume for sink with ID: {}...", plugin.id);
-            } else {
+            if let Some(error) = &plugin.error {
                 error!(
-                    "Failed to initialize sink connector with ID: {}: {}. Skipping...",
+                    "Failed to initialize sink connector with ID: {}: {error}. Skipping...",
                     plugin.id,
-                    plugin.error.as_ref().expect("Error should be present")
                 );
                 continue;
             }
+            info!("Starting consume for sink with ID: {}...", plugin.id);
             for consumer in plugin.consumers {
                 let plugin_key = plugin.key.clone();
                 let context = context.clone();
@@ -195,7 +197,11 @@ pub fn consume(sinks: Vec<SinkConnectorWrapper>, context: Arc<RuntimeContext>) {
                 tokio::spawn(async move {
                     context
                         .sinks
-                        .update_status(&plugin_key, ConnectorStatus::Running)
+                        .update_status(
+                            &plugin_key,
+                            ConnectorStatus::Running,
+                            Some(&context.metrics),
+                        )
                         .await;
 
                     if let Err(error) = consume_messages(
@@ -205,6 +211,9 @@ pub fn consume(sinks: Vec<SinkConnectorWrapper>, context: Arc<RuntimeContext>) {
                         sink.callback,
                         consumer.transforms,
                         consumer.consumer,
+                        plugin.verbose,
+                        &plugin_key,
+                        &context.metrics,
                     )
                     .await
                     {
@@ -213,6 +222,9 @@ pub fn consume(sinks: Vec<SinkConnectorWrapper>, context: Arc<RuntimeContext>) {
                             plugin.id
                         );
                         error!(err);
+                        context
+                            .metrics
+                            .increment_errors(&plugin_key, ConnectorType::Sink);
                         context.sinks.set_error(&plugin_key, &err).await;
                         return;
                     }
@@ -226,6 +238,7 @@ pub fn consume(sinks: Vec<SinkConnectorWrapper>, context: Arc<RuntimeContext>) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn consume_messages(
     plugin_id: u32,
     decoder: Arc<dyn StreamDecoder>,
@@ -233,6 +246,9 @@ async fn consume_messages(
     consume: ConsumeCallback,
     transforms: Vec<Arc<dyn Transform>>,
     mut consumer: IggyConsumer,
+    verbose: bool,
+    plugin_key: &str,
+    metrics: &Arc<Metrics>,
 ) -> Result<(), RuntimeError> {
     info!("Started consuming messages for sink connector with ID: {plugin_id}");
     let batch_size = batch_size as usize;
@@ -258,17 +274,25 @@ async fn consume_messages(
 
         let messages = std::mem::take(&mut batch);
         let messages_count = messages.len();
+        metrics.increment_messages_consumed(plugin_key, messages_count as u64);
         let messages_metadata = MessagesMetadata {
             partition_id,
             current_offset,
             schema: decoder.schema(),
         };
-        info!(
-            "Processing {messages_count} messages for sink connector with ID: {}",
-            plugin_id
-        );
+        if verbose {
+            info!(
+                "Processing {messages_count} messages for sink connector with ID: {}",
+                plugin_id
+            );
+        } else {
+            debug!(
+                "Processing {messages_count} messages for sink connector with ID: {}",
+                plugin_id
+            );
+        }
         let start = Instant::now();
-        if let Err(error) = process_messages(
+        let processed_count = match process_messages(
             plugin_id,
             messages_metadata,
             &topic_metadata,
@@ -279,17 +303,29 @@ async fn consume_messages(
         )
         .await
         {
-            error!(
-                "Failed to process {messages_count} messages for sink connector with ID: {plugin_id}. {error}",
-            );
-            return Err(error);
-        }
+            Ok(count) => count,
+            Err(error) => {
+                error!(
+                    "Failed to process {messages_count} messages for sink connector with ID: {plugin_id}. {error}",
+                );
+                metrics.increment_errors(plugin_key, ConnectorType::Sink);
+                return Err(error);
+            }
+        };
 
+        metrics.increment_messages_processed(plugin_key, processed_count as u64);
         let elapsed = start.elapsed();
-        info!(
-            "Consumed {messages_count} messages in {:#?} for sink connector with ID: {plugin_id}",
-            elapsed
-        );
+        if verbose {
+            info!(
+                "Consumed {messages_count} messages in {:#?} for sink connector with ID: {plugin_id}",
+                elapsed
+            );
+        } else {
+            debug!(
+                "Consumed {messages_count} messages in {:#?} for sink connector with ID: {plugin_id}",
+                elapsed
+            );
+        }
     }
     info!("Stopped consuming messages for sink connector with ID: {plugin_id}");
     Ok(())
@@ -301,7 +337,12 @@ fn init_sink(
     id: u32,
 ) -> Result<(), RuntimeError> {
     let plugin_config = serde_json::to_string(plugin_config).expect("Invalid sink plugin config.");
-    let result = (container.open)(id, plugin_config.as_ptr(), plugin_config.len());
+    let result = (container.open)(
+        id,
+        plugin_config.as_ptr(),
+        plugin_config.len(),
+        LOG_CALLBACK,
+    );
     if result != 0 {
         let err = format!("Plugin initialization failed (ID: {id})");
         error!("{err}");
@@ -319,7 +360,7 @@ async fn process_messages(
     consume: &ConsumeCallback,
     transforms: &Vec<Arc<dyn Transform>>,
     decoder: &Arc<dyn StreamDecoder>,
-) -> Result<(), RuntimeError> {
+) -> Result<usize, RuntimeError> {
     let messages = messages.into_iter().map(|message| ReceivedMessage {
         id: message.header.id,
         offset: message.header.offset,
@@ -431,6 +472,8 @@ async fn process_messages(
         });
     }
 
+    let processed_count = messages.len();
+
     let topic_meta = postcard::to_allocvec(topic_metadata).map_err(|error| {
         error!(
             "Failed to serialize topic metadata for sink connector with ID: {plugin_id}. {error}"
@@ -464,5 +507,5 @@ async fn process_messages(
         messages.len(),
     );
 
-    Ok(())
+    Ok(processed_count)
 }

@@ -541,22 +541,29 @@ impl Serialize for IggyMessage {
     where
         S: Serializer,
     {
+        use super::user_headers::HeaderEntry;
         use base64::{Engine as _, engine::general_purpose::STANDARD};
         use serde::ser::SerializeStruct;
 
-        let field_count = 2 + self.user_headers.is_some() as usize;
-
-        let mut state = serializer.serialize_struct("IggyMessage", field_count)?;
+        let mut state = serializer.serialize_struct("IggyMessage", 3)?;
         state.serialize_field("header", &self.header)?;
 
         let base64_payload = STANDARD.encode(&self.payload);
         state.serialize_field("payload", &base64_payload)?;
 
-        if self.user_headers.is_some() {
+        let entries: Vec<HeaderEntry> = if self.user_headers.is_some() {
             let headers_map = self.user_headers_map().map_err(serde::ser::Error::custom)?;
-
-            state.serialize_field("user_headers", &headers_map)?;
-        }
+            if let Some(map) = headers_map {
+                map.into_iter()
+                    .map(|(key, value)| HeaderEntry { key, value })
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+        state.serialize_field("user_headers", &entries)?;
 
         state.end()
     }
@@ -567,6 +574,7 @@ impl<'de> Deserialize<'de> for IggyMessage {
     where
         D: Deserializer<'de>,
     {
+        use super::user_headers::HeaderEntry;
         use serde::de::{self, MapAccess, Visitor};
         use std::fmt;
 
@@ -601,7 +609,12 @@ impl<'de> Deserialize<'de> for IggyMessage {
                             payload = Some(Bytes::from(decoded));
                         }
                         "user_headers" => {
-                            user_headers = Some(map.next_value()?);
+                            let entries: Vec<HeaderEntry> = map.next_value()?;
+                            let mut headers_map = HashMap::new();
+                            for entry in entries {
+                                headers_map.insert(entry.key, entry.value);
+                            }
+                            user_headers = Some(headers_map);
                         }
                         _ => {
                             let _ = map.next_value::<de::IgnoredAny>()?;
@@ -668,8 +681,8 @@ mod tests {
     fn test_create_with_headers() {
         let mut headers = HashMap::new();
         headers.insert(
-            HeaderKey::new("content-type").unwrap(),
-            HeaderValue::from_str("text/plain").unwrap(),
+            HeaderKey::try_from("content-type").unwrap(),
+            HeaderValue::try_from("text/plain").unwrap(),
         );
 
         let message = IggyMessage::builder()
@@ -682,7 +695,7 @@ mod tests {
 
         let headers_map = message.user_headers_map().unwrap().unwrap();
         assert_eq!(headers_map.len(), 1);
-        assert!(headers_map.contains_key(&HeaderKey::new("content-type").unwrap()));
+        assert!(headers_map.contains_key(&HeaderKey::try_from("content-type").unwrap()));
     }
 
     #[test]
@@ -721,15 +734,37 @@ mod tests {
     }
 
     #[test]
+    fn test_json_serialization_without_headers() {
+        let original = IggyMessage::builder()
+            .id(1)
+            .payload(Bytes::from("test"))
+            .build()
+            .expect("Message creation should not fail");
+
+        let json = serde_json::to_string(&original).expect("JSON serialization should not fail");
+
+        assert!(json.contains("\"user_headers\":[]"));
+
+        let deserialized: IggyMessage =
+            serde_json::from_str(&json).expect("JSON deserialization should not fail");
+
+        assert_eq!(original.header.id, deserialized.header.id);
+        assert_eq!(original.payload, deserialized.payload);
+
+        let headers_map = deserialized.user_headers_map().unwrap();
+        assert!(headers_map.map(|m| m.is_empty()).unwrap_or(true));
+    }
+
+    #[test]
     fn test_json_serialization_with_headers() {
         let mut headers = HashMap::new();
         headers.insert(
-            HeaderKey::new("content-type").unwrap(),
-            HeaderValue::from_str("text/plain").unwrap(),
+            HeaderKey::try_from("content-type").unwrap(),
+            HeaderValue::try_from("text/plain").unwrap(),
         );
         headers.insert(
-            HeaderKey::new("correlation-id").unwrap(),
-            HeaderValue::from_str("123456").unwrap(),
+            HeaderKey::try_from("correlation-id").unwrap(),
+            HeaderValue::try_from("123456").unwrap(),
         );
 
         let original = IggyMessage::builder()
@@ -773,12 +808,12 @@ mod tests {
 
         assert_eq!(original_map.len(), deserialized_map.len());
         assert_eq!(
-            original_map.get(&HeaderKey::new("content-type").unwrap()),
-            deserialized_map.get(&HeaderKey::new("content-type").unwrap())
+            original_map.get(&HeaderKey::try_from("content-type").unwrap()),
+            deserialized_map.get(&HeaderKey::try_from("content-type").unwrap())
         );
         assert_eq!(
-            original_map.get(&HeaderKey::new("correlation-id").unwrap()),
-            deserialized_map.get(&HeaderKey::new("correlation-id").unwrap())
+            original_map.get(&HeaderKey::try_from("correlation-id").unwrap()),
+            deserialized_map.get(&HeaderKey::try_from("correlation-id").unwrap())
         );
     }
 }

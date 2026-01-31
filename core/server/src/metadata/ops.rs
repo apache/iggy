@@ -20,7 +20,8 @@ use crate::metadata::{
     ConsumerGroupId, ConsumerGroupMeta, PartitionId, PartitionMeta, StreamId, StreamMeta, TopicId,
     TopicMeta, UserId, UserMeta,
 };
-use crate::streaming::partitions::partition::{ConsumerGroupOffsets, ConsumerOffsets};
+use crate::streaming::partitions::consumer_group_offsets::ConsumerGroupOffsets;
+use crate::streaming::partitions::consumer_offsets::ConsumerOffsets;
 use iggy_common::{CompressionAlgorithm, IggyExpiry, MaxTopicSize, PersonalAccessToken};
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;

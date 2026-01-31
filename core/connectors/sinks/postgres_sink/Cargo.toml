@@ -17,7 +17,7 @@
 
 [package]
 name = "iggy_connector_postgres_sink"
-version = "0.1.0"
+version = "0.2.1-edge.1"
 description = "Iggy PostgreSQL sink connector for storing stream messages into PostgreSQL database"
 edition = "2024"
 license = "Apache-2.0"
@@ -39,16 +39,12 @@ async-trait = { workspace = true }
 chrono = { workspace = true }
 dashmap = { workspace = true }
 futures = { workspace = true }
+humantime = { workspace = true }
 iggy_connector_sdk = { workspace = true }
 once_cell = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 simd-json = { workspace = true }
-sqlx = { version = "0.8", features = [
-    "runtime-tokio-rustls",
-    "postgres",
-    "chrono",
-    "uuid",
-    "json",
-] }
+sqlx = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

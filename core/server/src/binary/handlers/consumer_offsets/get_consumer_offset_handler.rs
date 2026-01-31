@@ -23,7 +23,6 @@ use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
 use crate::shard::IggyShard;
 use crate::streaming::session::Session;
-use anyhow::Result;
 use iggy_common::IggyError;
 use iggy_common::SenderKind;
 use iggy_common::get_consumer_offset::GetConsumerOffset;
@@ -44,9 +43,22 @@ impl ServerCommandHandler for GetConsumerOffset {
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
         shard.ensure_authenticated(session)?;
+        let Ok((stream_id, topic_id)) = shard.resolve_topic_id(&self.stream_id, &self.topic_id)
+        else {
+            sender.send_empty_ok_response().await?;
+            return Ok(HandlerResult::Finished);
+        };
+        if shard
+            .metadata
+            .perm_get_consumer_offset(session.get_user_id(), stream_id, topic_id)
+            .is_err()
+        {
+            sender.send_empty_ok_response().await?;
+            return Ok(HandlerResult::Finished);
+        }
         let Ok(offset) = shard
             .get_consumer_offset(
-                session,
+                session.client_id,
                 self.consumer,
                 &self.stream_id,
                 &self.topic_id,

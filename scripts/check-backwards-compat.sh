@@ -163,7 +163,7 @@ ok "worktree at $MASTER_DIR"
 pushd "$MASTER_DIR" >/dev/null
 
 info "Building iggy-server & benches (baseline: $MASTER_REF)"
-IGGY_CI_BUILD=true cargo build --bins
+cargo build --locked --bin iggy-server --bin iggy-bench
 ok "built baseline"
 
 info "Starting iggy-server (baseline)"
@@ -184,13 +184,13 @@ ok "server is ready"
 
 # Producer bench (baseline)
 info "Running producer bench on baseline"
-BENCH_CMD=( target/debug/iggy-bench --verbose --message-batches "$BATCHES" --messages-per-batch "$MSGS_PER_BATCH" pinned-producer tcp )
+BENCH_CMD=( target/debug/iggy-bench --message-batches "$BATCHES" --messages-per-batch "$MSGS_PER_BATCH" pinned-producer tcp )
 if command -v timeout >/dev/null 2>&1; then timeout 60s "${BENCH_CMD[@]}"; else "${BENCH_CMD[@]}"; fi
 ok "producer bench done"
 
 # Consumer bench (baseline)
 info "Running consumer bench on baseline"
-BENCH_CMD=( target/debug/iggy-bench --verbose --message-batches "$BATCHES" --messages-per-batch "$MSGS_PER_BATCH" pinned-consumer tcp )
+BENCH_CMD=( target/debug/iggy-bench --message-batches "$BATCHES" --messages-per-batch "$MSGS_PER_BATCH" pinned-consumer tcp )
 if command -v timeout >/dev/null 2>&1; then timeout 60s "${BENCH_CMD[@]}"; else "${BENCH_CMD[@]}"; fi
 ok "consumer bench done (baseline)"
 
@@ -220,7 +220,7 @@ git rev-parse --verify "$PR_REF^{commit}" >/dev/null 2>&1 || die "PR_REF '$PR_RE
 git checkout -q "$PR_REF"
 
 info "Building iggy-server & benches (PR: $PR_REF)"
-IGGY_CI_BUILD=true cargo build --bins
+cargo build --locked --bin iggy-server --bin iggy-bench
 ok "built PR"
 
 info "Restoring baseline local_data/ into PR workspace"
@@ -249,7 +249,7 @@ ok "PR server is ready"
 
 # Only consumer bench against PR
 info "Running consumer bench on PR (compat check)"
-BENCH_CMD=( target/debug/iggy-bench --verbose --message-batches "$BATCHES" --messages-per-batch "$MSGS_PER_BATCH" pinned-consumer tcp )
+BENCH_CMD=( target/debug/iggy-bench --message-batches "$BATCHES" --messages-per-batch "$MSGS_PER_BATCH" pinned-consumer tcp )
 if command -v timeout >/dev/null 2>&1; then timeout 60s "${BENCH_CMD[@]}"; else "${BENCH_CMD[@]}"; fi
 ok "consumer bench done (PR)"
 

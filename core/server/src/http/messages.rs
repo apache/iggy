@@ -75,7 +75,8 @@ async fn poll_messages(
         PollingArgs::new(query.0.strategy, query.0.count, query.0.auto_commit),
     ));
 
-    let (metadata, messages)  = poll_future.await
+    let (metadata, messages) = poll_future
+        .await
         .error(|e: &IggyError| {
             format!(
                 "{COMPONENT} (error: {e}) - failed to poll messages, stream ID: {}, topic ID: {}, partition ID: {:?}",
@@ -112,7 +113,8 @@ async fn send_messages(
         batch,
     ));
 
-    append_future.await
+    append_future
+        .await
         .error(|e: &IggyError| {
             format!(
                 "{COMPONENT} (error: {e}) - failed to append messages, stream ID: {stream_id}, topic ID: {topic_id}"
@@ -149,7 +151,6 @@ fn make_mutable(batch: IggyMessagesBatch) -> IggyMessagesBatchMut {
     let (_, indexes_buffer) = indexes.decompose();
     let indexes_buffer_mut = PooledBuffer::from_existing(indexes_buffer.into());
     let indexes_mut = IggyIndexesMut::from_bytes(indexes_buffer_mut, 0);
-    let count = indexes_mut.count();
     let messages_buffer_mut = PooledBuffer::from_existing(messages.into());
-    IggyMessagesBatchMut::from_indexes_and_messages(count, indexes_mut, messages_buffer_mut)
+    IggyMessagesBatchMut::from_indexes_and_messages(indexes_mut, messages_buffer_mut)
 }

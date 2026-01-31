@@ -56,7 +56,7 @@ internal static class TcpMessageStreamHelpers
 
             foreach (var header in message.UserHeaders)
             {
-                bytesCount += 4 + header.Key.Value.Length + 1 + 4 + header.Value.Value.Length;
+                bytesCount += 1 + 4 + header.Key.Value.Length + 1 + 4 + header.Value.Value.Length;
             }
         }
 

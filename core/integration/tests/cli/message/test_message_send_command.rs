@@ -109,7 +109,14 @@ impl TestMessageSendCmd {
             command.push(
                 header
                     .iter()
-                    .map(|(k, v)| format!("{k}:{}:{}", v.kind, v.value_only_to_string()))
+                    .map(|(k, v)| {
+                        format!(
+                            "{}:{}:{}",
+                            k.to_string_value(),
+                            v.kind(),
+                            v.to_string_value()
+                        )
+                    })
                     .collect::<Vec<_>>()
                     .join(","),
             );
@@ -340,13 +347,10 @@ pub async fn should_be_successful() {
                 using_partitioning,
                 Some(HashMap::from([
                     (
-                        HeaderKey::new("key1").unwrap(),
-                        HeaderValue::from_kind_str_and_value_str("string", "value1").unwrap(),
+                        HeaderKey::try_from("key1").unwrap(),
+                        HeaderValue::try_from("value1").unwrap(),
                     ),
-                    (
-                        HeaderKey::new("key2").unwrap(),
-                        HeaderValue::from_kind_str_and_value_str("int32", "42").unwrap(),
-                    ),
+                    (HeaderKey::try_from("key2").unwrap(), 42i32.into()),
                 ])),
             ))
             .await;

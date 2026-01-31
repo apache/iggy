@@ -74,13 +74,13 @@
     const { checked } = e.target as HTMLInputElement;
 
     $selectedUsersId = checked
-      ? users.filter((user) => user.id !== 1).map((user) => `${user.id}`)
+      ? users.filter((user) => user.id !== 0).map((user) => `${user.id}`)
       : [];
   };
 
   let allChecked = $derived(
     users
-      .filter((user) => user.id !== 1)
+      .filter((user) => user.id !== 0)
       .every((user) => $selectedUsersId.includes(user.id.toString()))
   );
 </script>
@@ -127,13 +127,13 @@
       for="{row.id}-{row.username}"
       class={twMerge(
         baseClass,
-        row.id === 1 && 'bg-shade-l800 dark:bg-shade-d1000 pointer-events-none',
+        row.id === 0 && 'bg-shade-l800 dark:bg-shade-d1000 pointer-events-none',
         $selectedUsersId.includes(row.id.toString()) &&
           'ring-2 ring-inset ring-green500 bg-green-300/30!  '
       )}
     >
       <div class="flex items-center justify-center">
-        {#if row.id !== 1}
+        {#if row.id !== 0}
           <Checkbox
             value={row.id.toString()}
             bind:bindGroup={$selectedUsersId}

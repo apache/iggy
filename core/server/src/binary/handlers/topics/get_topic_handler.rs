@@ -20,11 +20,8 @@ use crate::binary::command::{
     BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
 };
 use crate::binary::handlers::utils::receive_and_validate;
-use crate::binary::mapper;
 use crate::shard::IggyShard;
 use crate::streaming::session::Session;
-use crate::streaming::streams;
-use anyhow::Result;
 use iggy_common::IggyError;
 use iggy_common::SenderKind;
 use iggy_common::get_topic::GetTopic;
@@ -45,41 +42,30 @@ impl ServerCommandHandler for GetTopic {
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
         shard.ensure_authenticated(session)?;
-        let exists = shard
-            .ensure_topic_exists(&self.stream_id, &self.topic_id)
-            .is_ok();
-        if !exists {
+
+        let Some(numeric_stream_id) = shard.metadata.get_stream_id(&self.stream_id) else {
             sender.send_empty_ok_response().await?;
             return Ok(HandlerResult::Finished);
-        }
+        };
 
-        let numeric_stream_id = shard
-            .streams
-            .with_stream_by_id(&self.stream_id, streams::helpers::get_stream_id());
+        let Some(numeric_topic_id) = shard
+            .metadata
+            .get_topic_id(numeric_stream_id, &self.topic_id)
+        else {
+            sender.send_empty_ok_response().await?;
+            return Ok(HandlerResult::Finished);
+        };
+
         let has_permission = shard
-            .permissioner
-            .borrow()
-            .get_topic(
-                session.get_user_id(),
-                numeric_stream_id,
-                self.topic_id
-                    .get_u32_value()
-                    .unwrap_or(0)
-                    .try_into()
-                    .unwrap(),
-            )
+            .metadata
+            .perm_get_topic(session.get_user_id(), numeric_stream_id, numeric_topic_id)
             .is_ok();
         if !has_permission {
             sender.send_empty_ok_response().await?;
             return Ok(HandlerResult::Finished);
         }
 
-        let response =
-            shard
-                .streams
-                .with_topic_by_id(&self.stream_id, &self.topic_id, |(root, _, stats)| {
-                    mapper::map_topic(&root, &stats)
-                });
+        let response = shard.get_topic_from_metadata(numeric_stream_id, numeric_topic_id);
         sender.send_ok_response(&response).await?;
         Ok(HandlerResult::Finished)
     }

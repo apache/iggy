@@ -22,6 +22,7 @@ use crate::server::scenarios::{
 };
 use iggy::prelude::*;
 use integration::test_server::{ClientFactory, assert_clean_system, login_root};
+use std::collections::HashSet;
 use std::str::{FromStr, from_utf8};
 
 pub async fn run(client_factory: &dyn ClientFactory) {
@@ -99,8 +100,11 @@ async fn execute_using_messages_key_key(client: &IggyClient) {
     }
 
     // 2. Poll the messages for the single client which has assigned all partitions in the consumer group
+    // Hash-based partitioning distributes messages unpredictably across partitions, and polling
+    // round-robins across partitions, so we verify completeness rather than order.
     let consumer = Consumer::group(Identifier::named(CONSUMER_GROUP_NAME).unwrap());
-    let mut total_read_messages_count = 0;
+    let mut received_entity_ids = HashSet::new();
+
     for _ in 1..=PARTITIONS_COUNT * MESSAGES_COUNT {
         let polled_messages = client
             .poll_messages(
@@ -115,10 +119,39 @@ async fn execute_using_messages_key_key(client: &IggyClient) {
             .await
             .unwrap();
 
-        total_read_messages_count += polled_messages.messages.len() as u32;
+        for message in &polled_messages.messages {
+            let payload = from_utf8(&message.payload).unwrap();
+            let entity_id = parse_entity_id_from_payload(payload);
+            assert!(
+                (1..=MESSAGES_COUNT).contains(&entity_id),
+                "entity_id {} out of expected range 1..={}",
+                entity_id,
+                MESSAGES_COUNT
+            );
+            received_entity_ids.insert(entity_id);
+        }
     }
 
-    assert_eq!(total_read_messages_count, MESSAGES_COUNT);
+    assert_eq!(
+        received_entity_ids.len() as u32,
+        MESSAGES_COUNT,
+        "Expected {} unique messages, got {}",
+        MESSAGES_COUNT,
+        received_entity_ids.len()
+    );
+    let expected: HashSet<u32> = (1..=MESSAGES_COUNT).collect();
+    assert_eq!(
+        received_entity_ids, expected,
+        "Missing or duplicate messages"
+    );
+}
+
+fn parse_entity_id_from_payload(payload: &str) -> u32 {
+    payload
+        .strip_prefix("message-")
+        .expect("payload should start with 'message-'")
+        .parse()
+        .expect("entity_id should be a valid u32")
 }
 
 fn create_message_payload(entity_id: u32) -> String {

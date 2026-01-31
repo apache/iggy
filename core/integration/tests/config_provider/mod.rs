@@ -17,8 +17,13 @@
  * under the License.
  */
 
-use iggy_common::ConfigProvider;
+use configs::{ConfigEnvMappings, ConfigProvider, TypedEnvProvider};
+use configs_derive::ConfigEnv;
+use figment::providers::{Format, Toml};
+use figment::value::Dict;
+use figment::{Figment, Provider};
 use integration::file::get_root_path;
+use serde::{Deserialize, Serialize};
 use serial_test::serial;
 use server::configs::server::ServerConfig;
 use std::env;
@@ -44,13 +49,13 @@ async fn validate_config_env_override() {
         );
     }
 
-    let config_path = get_root_path().join("../configs/server.toml");
+    let config_path = get_root_path().join("../server/config.toml");
     let file_config_provider =
         ServerConfig::config_provider(&config_path.as_path().display().to_string());
     let config: ServerConfig = file_config_provider
         .load_config()
         .await
-        .expect("Failed to load server.toml config");
+        .expect("Failed to load config.toml config");
 
     assert_eq!(config.http.enabled, expected_http);
     assert_eq!(config.tcp.enabled, expected_tcp);
@@ -86,13 +91,13 @@ async fn validate_socket_override() {
         );
     }
 
-    let config_path = get_root_path().join("../configs/server.toml");
+    let config_path = get_root_path().join("../server/config.toml");
     let file_config_provider =
         ServerConfig::config_provider(&config_path.as_path().display().to_string());
     let config: ServerConfig = file_config_provider
         .load_config()
         .await
-        .expect("Failed to load server.toml config with socket override");
+        .expect("Failed to load config.toml config with socket override");
 
     assert!(config.tcp.socket.override_defaults);
     // Verify the buffer sizes match the expected byte counts
@@ -115,13 +120,13 @@ async fn validate_socket_override() {
 #[serial]
 #[tokio::test]
 async fn validate_socket_no_override() {
-    let config_path = get_root_path().join("../configs/server.toml");
+    let config_path = get_root_path().join("../server/config.toml");
     let file_config_provider =
         ServerConfig::config_provider(&config_path.as_path().display().to_string());
     let config: ServerConfig = file_config_provider
         .load_config()
         .await
-        .expect("Failed to load server.toml config without socket override");
+        .expect("Failed to load config.toml config without socket override");
 
     assert!(!config.tcp.socket.override_defaults);
 }
@@ -201,13 +206,13 @@ async fn validate_cluster_config_env_override() {
         );
     }
 
-    let config_path = get_root_path().join("../configs/server.toml");
+    let config_path = get_root_path().join("../server/config.toml");
     let file_config_provider =
         ServerConfig::config_provider(&config_path.as_path().display().to_string());
     let config: ServerConfig = file_config_provider
         .load_config()
         .await
-        .expect("Failed to load server.toml config with cluster env overrides");
+        .expect("Failed to load config.toml config with cluster env overrides");
 
     // Verify cluster configuration
     assert_eq!(config.cluster.enabled, expected_cluster_enabled);
@@ -270,7 +275,6 @@ async fn validate_cluster_config_env_override() {
     unsafe {
         // Clean up environment variables
         env::remove_var("IGGY_CLUSTER_ENABLED");
-        env::remove_var("IGGY_CLUSTER_ID");
         env::remove_var("IGGY_CLUSTER_NAME");
         env::remove_var("IGGY_CLUSTER_NODE_CURRENT_NAME");
 
@@ -392,13 +396,13 @@ async fn validate_four_node_cluster_config_env_override() {
         // IGGY_CLUSTER_NODE_OTHERS_2_PORTS_WEBSOCKET is NOT set - should use default (8092)
     }
 
-    let config_path = get_root_path().join("../configs/server.toml");
+    let config_path = get_root_path().join("../server/config.toml");
     let file_config_provider =
         ServerConfig::config_provider(&config_path.as_path().display().to_string());
     let config: ServerConfig = file_config_provider
         .load_config()
         .await
-        .expect("Failed to load server.toml config with 4-node cluster env overrides");
+        .expect("Failed to load config.toml config with 4-node cluster env overrides");
 
     // Verify cluster configuration
     assert_eq!(config.cluster.enabled, expected_cluster_enabled);
@@ -527,4 +531,154 @@ async fn validate_four_node_cluster_config_env_override() {
         env::remove_var("IGGY_CLUSTER_NODE_OTHERS_2_PORTS_HTTP");
         // IGGY_CLUSTER_NODE_OTHERS_2_PORTS_WEBSOCKET was not set
     }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, ConfigEnv)]
+#[config_env(tag = "config_type")]
+#[serde(tag = "config_type", rename_all = "lowercase")]
+enum TestTaggedEnum {
+    Local(TestLocalConfig),
+    Http(TestHttpConfig),
+}
+
+#[derive(Debug, Default, Clone, Deserialize, Serialize, ConfigEnv)]
+#[serde(default)]
+struct TestLocalConfig {
+    pub config_dir: String,
+}
+
+#[derive(Debug, Default, Clone, Deserialize, Serialize, ConfigEnv)]
+#[serde(default)]
+struct TestHttpConfig {
+    pub base_url: String,
+}
+
+#[derive(Debug, Default, Clone, Deserialize, Serialize, ConfigEnv)]
+#[config_env(prefix = "TEST_")]
+#[serde(default)]
+struct TestRootConfig {
+    pub name: String,
+    pub nested: TestTaggedEnum,
+}
+
+impl Default for TestTaggedEnum {
+    fn default() -> Self {
+        Self::Local(TestLocalConfig::default())
+    }
+}
+
+#[test]
+fn validate_tagged_enum_generates_tag_mapping() {
+    let mappings = TestTaggedEnum::env_mappings();
+
+    let has_config_type_mapping = mappings
+        .iter()
+        .any(|m| m.config_path == "config_type" && m.env_name == "CONFIG_TYPE");
+
+    assert!(
+        has_config_type_mapping,
+        "Expected env mapping for 'config_type' tag field, but found: {:?}",
+        mappings
+            .iter()
+            .map(|m| format!("{}={}", m.env_name, m.config_path))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn validate_nested_tagged_enum_has_prefixed_tag_mapping() {
+    let mappings = TestRootConfig::env_mappings();
+
+    println!("All mappings for TestRootConfig:");
+    for m in mappings {
+        println!("  {} -> {}", m.env_name, m.config_path);
+    }
+
+    let has_nested_config_type = mappings
+        .iter()
+        .any(|m| m.config_path == "nested.config_type" && m.env_name == "TEST_NESTED_CONFIG_TYPE");
+
+    assert!(
+        has_nested_config_type,
+        "Expected nested tag mapping 'TEST_NESTED_CONFIG_TYPE' -> 'nested.config_type', but found: {:?}",
+        mappings
+            .iter()
+            .map(|m| format!("{}={}", m.env_name, m.config_path))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[serial]
+#[tokio::test]
+async fn validate_tagged_enum_deserialization_with_figment() {
+    // TOML with "local" variant (mirrors connectors/runtime/config.toml)
+    let toml_content = r#"
+        [nested]
+        config_type = "local"
+        config_dir = "/some/path"
+    "#;
+
+    unsafe {
+        env::set_var("TEST_NESTED_CONFIG_TYPE", "http");
+        env::set_var("TEST_NESTED_BASE_URL", "http://example.com");
+    }
+
+    struct TestEnvProvider;
+    impl Provider for TestEnvProvider {
+        fn metadata(&self) -> figment::Metadata {
+            figment::Metadata::named("test-env")
+        }
+        fn data(&self) -> Result<figment::value::Map<figment::Profile, Dict>, figment::Error> {
+            let provider: TypedEnvProvider<TestRootConfig> = TypedEnvProvider::from_config("TEST_");
+            provider.data()
+        }
+    }
+
+    let config_result: Result<TestRootConfig, figment::Error> = Figment::new()
+        .merge(Toml::string(toml_content))
+        .merge(TestEnvProvider)
+        .extract();
+
+    unsafe {
+        env::remove_var("TEST_NESTED_CONFIG_TYPE");
+        env::remove_var("TEST_NESTED_BASE_URL");
+    }
+
+    match config_result {
+        Ok(config) => {
+            println!("Config loaded successfully: {:?}", config);
+            match config.nested {
+                TestTaggedEnum::Http(http) => {
+                    assert_eq!(http.base_url, "http://example.com");
+                }
+                TestTaggedEnum::Local(_) => {
+                    panic!("Expected Http variant but got Local");
+                }
+            }
+        }
+        Err(e) => {
+            panic!("Failed to load config: {}", e);
+        }
+    }
+}
+
+#[test]
+fn debug_print_test_root_config_mappings() {
+    println!("\n=== TestRootConfig env_mappings() ===");
+    for m in TestRootConfig::env_mappings() {
+        println!("  {} -> {}", m.env_name, m.config_path);
+    }
+
+    println!("\n=== TestTaggedEnum env_mappings() ===");
+    for m in TestTaggedEnum::env_mappings() {
+        println!("  {} -> {}", m.env_name, m.config_path);
+    }
+
+    let has_tag = TestRootConfig::env_mappings()
+        .iter()
+        .any(|m| m.env_name == "TEST_NESTED_CONFIG_TYPE" && m.config_path == "nested.config_type");
+    assert!(
+        has_tag,
+        "Missing TEST_NESTED_CONFIG_TYPE -> nested.config_type mapping"
+    );
 }

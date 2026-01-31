@@ -23,7 +23,6 @@ use crate::binary::handlers::users::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
 use crate::shard::IggyShard;
-use crate::shard::transmission::event::ShardEvent;
 use crate::shard::transmission::frame::ShardResponse;
 use crate::shard::transmission::message::{
     ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult,
@@ -32,7 +31,6 @@ use crate::state::command::EntryCommand;
 use crate::state::models::CreateUserWithId;
 use crate::streaming::session::Session;
 use crate::streaming::utils::crypto;
-use anyhow::Result;
 use err_trail::ErrContext;
 use iggy_common::create_user::CreateUser;
 use iggy_common::{Identifier, IggyError, SenderKind};
@@ -55,6 +53,7 @@ impl ServerCommandHandler for CreateUser {
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
         shard.ensure_authenticated(session)?;
+        shard.metadata.perm_create_user(session.get_user_id())?;
 
         let request = ShardRequest {
             stream_id: Identifier::default(),
@@ -83,7 +82,7 @@ impl ServerCommandHandler for CreateUser {
                 {
                     let _user_guard = shard.fs_locks.user_lock.lock().await;
                     let user = shard
-                        .create_user(session, &username, &password, status, permissions.clone())
+                        .create_user(&username, &password, status, permissions.clone())
                         .error(|e: &IggyError| {
                             format!(
                                 "{COMPONENT} (error: {e}) - failed to create user with name: {}, session: {}",
@@ -92,16 +91,6 @@ impl ServerCommandHandler for CreateUser {
                         })?;
 
                     let user_id = user.id;
-
-                    let event = ShardEvent::CreatedUser {
-                        user_id,
-                        username: username.clone(),
-                        password: password.clone(),
-                        status,
-                        permissions: permissions.clone(),
-                    };
-                    shard.broadcast_event_to_all_shards(event).await?;
-
                     let response = mapper::map_user(&user);
 
                     shard
@@ -135,30 +124,7 @@ impl ServerCommandHandler for CreateUser {
             }
             ShardSendRequestResult::Response(response) => match response {
                 ShardResponse::CreateUserResponse(user) => {
-                    let user_id = user.id;
                     let response = mapper::map_user(&user);
-
-                    shard
-                        .state
-                        .apply(
-                            session.get_user_id(),
-                            &EntryCommand::CreateUser(CreateUserWithId {
-                                user_id,
-                                command: CreateUser {
-                                    username: self.username.to_owned(),
-                                    password: crypto::hash_password(&self.password),
-                                    status: self.status,
-                                    permissions: self.permissions.clone(),
-                                },
-                            }),
-                        )
-                        .await
-                        .error(|e: &IggyError| {
-                            format!(
-                                "{COMPONENT} (error: {e}) - failed to apply create user for user_id: {user_id}, session: {session}"
-                            )
-                        })?;
-
                     sender.send_ok_response(&response).await?;
                 }
                 ShardResponse::ErrorResponse(err) => {

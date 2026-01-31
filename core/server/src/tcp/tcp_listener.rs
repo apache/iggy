@@ -180,7 +180,7 @@ pub async fn cleanup_connection(
     shard: &IggyShard,
 ) {
     registry.remove_connection(&client_id);
-    shard.delete_client(client_id);
+    shard.delete_client(client_id).await;
     if let Err(error) = sender.shutdown().await {
         error!(
             "Failed to shutdown for client {}, address {}: {}",

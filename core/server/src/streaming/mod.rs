@@ -28,6 +28,5 @@ pub mod stats;
 pub mod storage;
 pub mod streams;
 pub mod topics;
-pub mod traits;
 pub mod users;
 pub mod utils;

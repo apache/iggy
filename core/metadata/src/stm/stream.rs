@@ -15,169 +15,41 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::define_state_command;
 use crate::stats::{StreamStats, TopicStats};
-use crate::stm::ApplyState;
+use crate::stm::Handler;
+use crate::{define_state, impl_absorb};
 use ahash::AHashMap;
 use iggy_common::create_partitions::CreatePartitions;
 use iggy_common::create_stream::CreateStream;
 use iggy_common::create_topic::CreateTopic;
 use iggy_common::delete_partitions::DeletePartitions;
-use iggy_common::delete_segments::DeleteSegments;
 use iggy_common::delete_stream::DeleteStream;
 use iggy_common::delete_topic::DeleteTopic;
 use iggy_common::purge_stream::PurgeStream;
 use iggy_common::purge_topic::PurgeTopic;
 use iggy_common::update_stream::UpdateStream;
 use iggy_common::update_topic::UpdateTopic;
-use iggy_common::{
-    CompressionAlgorithm, Identifier, IggyError, IggyExpiry, IggyTimestamp, MaxTopicSize,
-};
+use iggy_common::{CompressionAlgorithm, IggyExpiry, IggyTimestamp, MaxTopicSize};
 use slab::Slab;
-use std::cell::RefCell;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 
 #[derive(Debug, Clone)]
 pub struct Partition {
     pub id: usize,
-}
-
-impl Partition {
-    pub fn new(id: usize) -> Self {
-        Self { id }
-    }
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct Partitions {
-    items: RefCell<Slab<Partition>>,
-}
-
-impl Partitions {
-    pub fn new() -> Self {
-        Self {
-            items: RefCell::new(Slab::with_capacity(1024)),
-        }
-    }
-
-    pub fn insert(&self, partition: Partition) -> usize {
-        let mut items = self.items.borrow_mut();
-        let id = items.insert(partition);
-        items[id].id = id;
-        id
-    }
-
-    pub fn get(&self, id: usize) -> Option<Partition> {
-        self.items.borrow().get(id).cloned()
-    }
-
-    pub fn remove(&self, id: usize) -> Option<Partition> {
-        let mut items = self.items.borrow_mut();
-        if items.contains(id) {
-            Some(items.remove(id))
-        } else {
-            None
-        }
-    }
-
-    pub fn len(&self) -> usize {
-        self.items.borrow().len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.items.borrow().is_empty()
-    }
-
-    pub fn iter(&self) -> Vec<Partition> {
-        self.items
-            .borrow()
-            .iter()
-            .map(|(_, p): (usize, &Partition)| p.clone())
-            .collect()
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct ConsumerGroup {
-    pub id: usize,
-    pub name: String,
     pub created_at: IggyTimestamp,
 }
 
-impl ConsumerGroup {
-    pub fn new(name: String, created_at: IggyTimestamp) -> Self {
-        Self {
-            id: 0,
-            name,
-            created_at,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct ConsumerGroups {
-    index: RefCell<AHashMap<String, usize>>,
-    items: RefCell<Slab<ConsumerGroup>>,
-}
-
-impl ConsumerGroups {
-    pub fn new() -> Self {
-        Self {
-            index: RefCell::new(AHashMap::with_capacity(256)),
-            items: RefCell::new(Slab::with_capacity(256)),
-        }
-    }
-
-    pub fn insert(&self, group: ConsumerGroup) -> usize {
-        let mut items = self.items.borrow_mut();
-        let mut index = self.index.borrow_mut();
-
-        let name = group.name.clone();
-        let id = items.insert(group);
-        items[id].id = id;
-        index.insert(name, id);
-        id
-    }
-
-    pub fn get(&self, id: usize) -> Option<ConsumerGroup> {
-        self.items.borrow().get(id).cloned()
-    }
-
-    pub fn get_by_name(&self, name: &str) -> Option<ConsumerGroup> {
-        let index = self.index.borrow();
-        if let Some(&id) = index.get(name) {
-            self.items.borrow().get(id).cloned()
-        } else {
-            None
-        }
-    }
-
-    pub fn remove(&self, id: usize) -> Option<ConsumerGroup> {
-        let mut items = self.items.borrow_mut();
-        let mut index = self.index.borrow_mut();
-
-        if !items.contains(id) {
-            return None;
-        }
-
-        let group = items.remove(id);
-        index.remove(&group.name);
-        Some(group)
-    }
-
-    pub fn len(&self) -> usize {
-        self.items.borrow().len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.items.borrow().is_empty()
+impl Partition {
+    pub fn new(id: usize, created_at: IggyTimestamp) -> Self {
+        Self { id, created_at }
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct Topic {
     pub id: usize,
-    pub name: String,
+    pub name: Arc<str>,
     pub created_at: IggyTimestamp,
     pub replication_factor: u8,
     pub message_expiry: IggyExpiry,
@@ -185,13 +57,30 @@ pub struct Topic {
     pub max_topic_size: MaxTopicSize,
 
     pub stats: Arc<TopicStats>,
-    pub partitions: Partitions,
-    pub consumer_groups: ConsumerGroups,
+    pub partitions: Vec<Partition>,
+    pub round_robin_counter: Arc<AtomicUsize>,
+}
+
+impl Default for Topic {
+    fn default() -> Self {
+        Self {
+            id: 0,
+            name: Arc::from(""),
+            created_at: IggyTimestamp::default(),
+            replication_factor: 1,
+            message_expiry: IggyExpiry::default(),
+            compression_algorithm: CompressionAlgorithm::default(),
+            max_topic_size: MaxTopicSize::default(),
+            stats: Arc::new(TopicStats::default()),
+            partitions: Vec::new(),
+            round_robin_counter: Arc::new(AtomicUsize::new(0)),
+        }
+    }
 }
 
 impl Topic {
     pub fn new(
-        name: String,
+        name: Arc<str>,
         created_at: IggyTimestamp,
         replication_factor: u8,
         message_expiry: IggyExpiry,
@@ -208,293 +97,336 @@ impl Topic {
             compression_algorithm,
             max_topic_size,
             stats: Arc::new(TopicStats::new(stream_stats)),
-            partitions: Partitions::new(),
-            consumer_groups: ConsumerGroups::new(),
+            partitions: Vec::new(),
+            round_robin_counter: Arc::new(AtomicUsize::new(0)),
         }
     }
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct Topics {
-    index: RefCell<AHashMap<String, usize>>,
-    items: RefCell<Slab<Topic>>,
-}
-
-impl Topics {
-    pub fn new() -> Self {
-        Self {
-            index: RefCell::new(AHashMap::with_capacity(1024)),
-            items: RefCell::new(Slab::with_capacity(1024)),
-        }
-    }
-
-    pub fn insert(&self, topic: Topic) -> usize {
-        let mut items = self.items.borrow_mut();
-        let mut index = self.index.borrow_mut();
-
-        let name = topic.name.clone();
-        let id = items.insert(topic);
-        items[id].id = id;
-        index.insert(name, id);
-        id
-    }
-
-    pub fn get(&self, id: usize) -> Option<Topic> {
-        self.items.borrow().get(id).cloned()
-    }
-
-    pub fn get_by_name(&self, name: &str) -> Option<Topic> {
-        let index = self.index.borrow();
-        if let Some(&id) = index.get(name) {
-            self.items.borrow().get(id).cloned()
-        } else {
-            None
-        }
-    }
-
-    pub fn get_by_identifier(&self, identifier: &Identifier) -> Option<Topic> {
-        match identifier.kind {
-            iggy_common::IdKind::Numeric => {
-                if let Ok(id) = identifier.get_u32_value() {
-                    self.get(id as usize)
-                } else {
-                    None
-                }
-            }
-            iggy_common::IdKind::String => {
-                if let Ok(name) = identifier.get_string_value() {
-                    self.get_by_name(&name)
-                } else {
-                    None
-                }
-            }
-        }
-    }
-
-    pub fn remove(&self, id: usize) -> Option<Topic> {
-        let mut items = self.items.borrow_mut();
-        let mut index = self.index.borrow_mut();
-
-        if !items.contains(id) {
-            return None;
-        }
-
-        let topic = items.remove(id);
-        index.remove(&topic.name);
-        Some(topic)
-    }
-
-    pub fn len(&self) -> usize {
-        self.items.borrow().len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.items.borrow().is_empty()
-    }
-}
-
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Stream {
     pub id: usize,
-    pub name: String,
+    pub name: Arc<str>,
     pub created_at: IggyTimestamp,
 
     pub stats: Arc<StreamStats>,
-    pub topics: Topics,
+    pub topics: Slab<Topic>,
+    pub topic_index: AHashMap<Arc<str>, usize>,
+}
+
+impl Default for Stream {
+    fn default() -> Self {
+        Self {
+            id: 0,
+            name: Arc::from(""),
+            created_at: IggyTimestamp::default(),
+            stats: Arc::new(StreamStats::default()),
+            topics: Slab::new(),
+            topic_index: AHashMap::default(),
+        }
+    }
+}
+
+impl Clone for Stream {
+    fn clone(&self) -> Self {
+        Self {
+            id: self.id,
+            name: self.name.clone(),
+            created_at: self.created_at,
+            stats: self.stats.clone(),
+            topics: self.topics.clone(),
+            topic_index: self.topic_index.clone(),
+        }
+    }
 }
 
 impl Stream {
-    pub fn new(name: String, created_at: IggyTimestamp) -> Self {
+    pub fn new(name: Arc<str>, created_at: IggyTimestamp) -> Self {
         Self {
             id: 0,
             name,
             created_at,
             stats: Arc::new(StreamStats::default()),
-            topics: Topics::new(),
+            topics: Slab::new(),
+            topic_index: AHashMap::default(),
         }
     }
-}
 
-#[derive(Debug, Clone, Default)]
-pub struct Streams {
-    index: RefCell<AHashMap<String, usize>>,
-    items: RefCell<Slab<Stream>>,
-}
-
-impl Streams {
-    pub fn new() -> Self {
+    pub fn with_stats(name: Arc<str>, created_at: IggyTimestamp, stats: Arc<StreamStats>) -> Self {
         Self {
-            index: RefCell::new(AHashMap::with_capacity(256)),
-            items: RefCell::new(Slab::with_capacity(256)),
+            id: 0,
+            name,
+            created_at,
+            stats,
+            topics: Slab::new(),
+            topic_index: AHashMap::default(),
         }
     }
+}
 
-    pub fn insert(&self, stream: Stream) -> usize {
-        let mut items = self.items.borrow_mut();
-        let mut index = self.index.borrow_mut();
+define_state! {
+    Streams {
+        index: AHashMap<Arc<str>, usize>,
+        items: Slab<Stream>,
+    },
+    [
+        CreateStream,
+        UpdateStream,
+        DeleteStream,
+        PurgeStream,
+        CreateTopic,
+        UpdateTopic,
+        DeleteTopic,
+        PurgeTopic,
+        CreatePartitions,
+        DeletePartitions
+    ]
+}
+impl_absorb!(StreamsInner, StreamsCommand);
 
-        let name = stream.name.clone();
-        let id = items.insert(stream);
-        items[id].id = id;
-        index.insert(name, id);
-        id
-    }
-
-    pub fn get(&self, id: usize) -> Option<Stream> {
-        self.items.borrow().get(id).cloned()
-    }
-
-    pub fn get_by_name(&self, name: &str) -> Option<Stream> {
-        let index = self.index.borrow();
-        if let Some(&id) = index.get(name) {
-            self.items.borrow().get(id).cloned()
-        } else {
-            None
-        }
-    }
-
-    pub fn get_by_identifier(&self, identifier: &Identifier) -> Option<Stream> {
+impl StreamsInner {
+    fn resolve_stream_id(&self, identifier: &iggy_common::Identifier) -> Option<usize> {
+        use iggy_common::IdKind;
         match identifier.kind {
-            iggy_common::IdKind::Numeric => {
-                if let Ok(id) = identifier.get_u32_value() {
-                    self.get(id as usize)
+            IdKind::Numeric => {
+                let id = identifier.get_u32_value().ok()? as usize;
+                if self.items.contains(id) {
+                    Some(id)
                 } else {
                     None
                 }
             }
-            iggy_common::IdKind::String => {
-                if let Ok(name) = identifier.get_string_value() {
-                    self.get_by_name(&name)
+            IdKind::String => {
+                let name = identifier.get_string_value().ok()?;
+                self.index.get(name.as_str()).copied()
+            }
+        }
+    }
+
+    fn resolve_topic_id(
+        &self,
+        stream_id: usize,
+        identifier: &iggy_common::Identifier,
+    ) -> Option<usize> {
+        use iggy_common::IdKind;
+        let stream = self.items.get(stream_id)?;
+
+        match identifier.kind {
+            IdKind::Numeric => {
+                let id = identifier.get_u32_value().ok()? as usize;
+                if stream.topics.contains(id) {
+                    Some(id)
                 } else {
                     None
                 }
             }
-        }
-    }
-
-    pub fn remove(&self, id: usize) -> Option<Stream> {
-        let mut items = self.items.borrow_mut();
-        let mut index = self.index.borrow_mut();
-
-        if !items.contains(id) {
-            return None;
-        }
-
-        let stream = items.remove(id);
-        index.remove(&stream.name);
-        Some(stream)
-    }
-
-    pub fn update_name(&self, identifier: &Identifier, new_name: String) -> Result<(), IggyError> {
-        let stream = self.get_by_identifier(identifier);
-        if let Some(stream) = stream {
-            let mut items = self.items.borrow_mut();
-            let mut index = self.index.borrow_mut();
-
-            index.remove(&stream.name);
-            if let Some(s) = items.get_mut(stream.id) {
-                s.name = new_name.clone();
+            IdKind::String => {
+                let name = identifier.get_string_value().ok()?;
+                stream.topic_index.get(name.as_str()).copied()
             }
-            index.insert(new_name, stream.id);
-            Ok(())
-        } else {
-            Err(IggyError::ResourceNotFound("Stream".to_string()))
         }
-    }
-
-    pub fn purge(&self, id: usize) -> Result<(), IggyError> {
-        let items = self.items.borrow();
-        if let Some(_stream) = items.get(id) {
-            // TODO: Purge all topics in the stream
-            Ok(())
-        } else {
-            Err(IggyError::ResourceNotFound("Stream".to_string()))
-        }
-    }
-
-    pub fn len(&self) -> usize {
-        self.items.borrow().len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.items.borrow().is_empty()
-    }
-
-    pub fn iter(&self) -> Vec<Stream> {
-        self.items
-            .borrow()
-            .iter()
-            .map(|(_, s): (usize, &Stream)| s.clone())
-            .collect()
     }
 }
 
-// Define StreamsCommand enum and StateCommand implementation using the macro
-define_state_command! {
-    Streams,
-    StreamsCommand,
-    [CreateStream, UpdateStream, DeleteStream, PurgeStream]
-}
-
-impl ApplyState for Streams {
-    type Output = ();
-
-    fn do_apply(&self, cmd: Self::Command) -> Self::Output {
+impl Handler for StreamsInner {
+    fn handle(&mut self, cmd: &StreamsCommand) {
         match cmd {
             StreamsCommand::CreateStream(payload) => {
-                todo!("Handle Create stream with {:?}", payload)
+                let name_arc: Arc<str> = Arc::from(payload.name.as_str());
+                if self.index.contains_key(&name_arc) {
+                    return;
+                }
+
+                let stream = Stream {
+                    id: 0,
+                    name: name_arc.clone(),
+                    created_at: iggy_common::IggyTimestamp::now(),
+                    stats: Arc::new(StreamStats::default()),
+                    topics: Slab::new(),
+                    topic_index: AHashMap::default(),
+                };
+
+                let id = self.items.insert(stream);
+                if let Some(stream) = self.items.get_mut(id) {
+                    stream.id = id;
+                }
+                self.index.insert(name_arc, id);
             }
             StreamsCommand::UpdateStream(payload) => {
-                todo!("Handle Update stream with {:?}", payload)
+                let Some(stream_id) = self.resolve_stream_id(&payload.stream_id) else {
+                    return;
+                };
+                let Some(stream) = self.items.get_mut(stream_id) else {
+                    return;
+                };
+
+                let new_name_arc: Arc<str> = Arc::from(payload.name.as_str());
+                if let Some(&existing_id) = self.index.get(&new_name_arc)
+                    && existing_id != stream_id
+                {
+                    return;
+                }
+
+                self.index.remove(&stream.name);
+                stream.name = new_name_arc.clone();
+                self.index.insert(new_name_arc, stream_id);
             }
             StreamsCommand::DeleteStream(payload) => {
-                todo!("Handle Delete stream with {:?}", payload)
+                let Some(stream_id) = self.resolve_stream_id(&payload.stream_id) else {
+                    return;
+                };
+
+                if let Some(stream) = self.items.get(stream_id) {
+                    let name = stream.name.clone();
+
+                    self.items.remove(stream_id);
+                    self.index.remove(&name);
+                }
             }
-            StreamsCommand::PurgeStream(payload) => todo!("Handle Purge stream with {:?}", payload),
-        }
-    }
-}
-
-// Define TopicsCommand enum and StateCommand implementation using the macro
-define_state_command! {
-    Topics,
-    TopicsCommand,
-    [CreateTopic, UpdateTopic, DeleteTopic, PurgeTopic]
-}
-
-impl ApplyState for Topics {
-    type Output = ();
-
-    fn do_apply(&self, cmd: Self::Command) -> Self::Output {
-        match cmd {
-            TopicsCommand::CreateTopic(payload) => todo!("Handle Create topic with {:?}", payload),
-            TopicsCommand::UpdateTopic(payload) => todo!("Handle Update topic with {:?}", payload),
-            TopicsCommand::DeleteTopic(payload) => todo!("Handle Delete topic with {:?}", payload),
-            TopicsCommand::PurgeTopic(payload) => todo!("Handle Purge topic with {:?}", payload),
-        }
-    }
-}
-
-// Define PartitionsCommand enum and StateCommand implementation using the macro
-define_state_command! {
-    Partitions,
-    PartitionsCommand,
-    [CreatePartitions, DeletePartitions, DeleteSegments]
-}
-
-impl ApplyState for Partitions {
-    type Output = ();
-
-    fn do_apply(&self, cmd: Self::Command) -> Self::Output {
-        match cmd {
-            PartitionsCommand::CreatePartitions(payload) => {
-                todo!("Handle Create partitions with {:?}", payload)
+            StreamsCommand::PurgeStream(_payload) => {
+                // TODO
+                todo!();
             }
-            PartitionsCommand::DeletePartitions(payload) => {
-                todo!("Handle Delete partitions with {:?}", payload)
+            StreamsCommand::CreateTopic(payload) => {
+                let Some(stream_id) = self.resolve_stream_id(&payload.stream_id) else {
+                    return;
+                };
+                let Some(stream) = self.items.get_mut(stream_id) else {
+                    return;
+                };
+
+                let name_arc: Arc<str> = Arc::from(payload.name.as_str());
+                if stream.topic_index.contains_key(&name_arc) {
+                    return;
+                }
+
+                let topic = Topic {
+                    id: 0, // Will be assigned by slab
+                    name: name_arc.clone(),
+                    created_at: iggy_common::IggyTimestamp::now(),
+                    replication_factor: payload.replication_factor.unwrap_or(1),
+                    message_expiry: payload.message_expiry,
+                    compression_algorithm: payload.compression_algorithm,
+                    max_topic_size: payload.max_topic_size,
+                    stats: Arc::new(TopicStats::new(stream.stats.clone())),
+                    partitions: Vec::new(),
+                    round_robin_counter: Arc::new(AtomicUsize::new(0)),
+                };
+
+                let topic_id = stream.topics.insert(topic);
+                if let Some(topic) = stream.topics.get_mut(topic_id) {
+                    topic.id = topic_id;
+
+                    for partition_id in 0..payload.partitions_count as usize {
+                        let partition = Partition {
+                            id: partition_id,
+                            created_at: iggy_common::IggyTimestamp::now(),
+                        };
+                        topic.partitions.push(partition);
+                    }
+                }
+
+                stream.topic_index.insert(name_arc, topic_id);
             }
-            PartitionsCommand::DeleteSegments(payload) => {
-                todo!("Handle Delete segments with {:?}", payload)
+            StreamsCommand::UpdateTopic(payload) => {
+                let Some(stream_id) = self.resolve_stream_id(&payload.stream_id) else {
+                    return;
+                };
+                let Some(topic_id) = self.resolve_topic_id(stream_id, &payload.topic_id) else {
+                    return;
+                };
+
+                let Some(stream) = self.items.get_mut(stream_id) else {
+                    return;
+                };
+                let Some(topic) = stream.topics.get_mut(topic_id) else {
+                    return;
+                };
+
+                let new_name_arc: Arc<str> = Arc::from(payload.name.as_str());
+                if let Some(&existing_id) = stream.topic_index.get(&new_name_arc)
+                    && existing_id != topic_id
+                {
+                    return;
+                }
+
+                stream.topic_index.remove(&topic.name);
+                topic.name = new_name_arc.clone();
+                topic.compression_algorithm = payload.compression_algorithm;
+                topic.message_expiry = payload.message_expiry;
+                topic.max_topic_size = payload.max_topic_size;
+                if let Some(rf) = payload.replication_factor {
+                    topic.replication_factor = rf;
+                }
+                stream.topic_index.insert(new_name_arc, topic_id);
+            }
+            StreamsCommand::DeleteTopic(payload) => {
+                let Some(stream_id) = self.resolve_stream_id(&payload.stream_id) else {
+                    return;
+                };
+                let Some(topic_id) = self.resolve_topic_id(stream_id, &payload.topic_id) else {
+                    return;
+                };
+                let Some(stream) = self.items.get_mut(stream_id) else {
+                    return;
+                };
+
+                if let Some(topic) = stream.topics.get(topic_id) {
+                    let name = topic.name.clone();
+                    stream.topics.remove(topic_id);
+                    stream.topic_index.remove(&name);
+                }
+            }
+            StreamsCommand::PurgeTopic(_payload) => {
+                // TODO:
+                todo!();
+            }
+            StreamsCommand::CreatePartitions(payload) => {
+                let Some(stream_id) = self.resolve_stream_id(&payload.stream_id) else {
+                    return;
+                };
+                let Some(topic_id) = self.resolve_topic_id(stream_id, &payload.topic_id) else {
+                    return;
+                };
+
+                let Some(stream) = self.items.get_mut(stream_id) else {
+                    return;
+                };
+                let Some(topic) = stream.topics.get_mut(topic_id) else {
+                    return;
+                };
+
+                let current_partition_count = topic.partitions.len();
+                for i in 0..payload.partitions_count as usize {
+                    let partition_id = current_partition_count + i;
+                    let partition = Partition {
+                        id: partition_id,
+                        created_at: iggy_common::IggyTimestamp::now(),
+                    };
+                    topic.partitions.push(partition);
+                }
+            }
+            StreamsCommand::DeletePartitions(payload) => {
+                let Some(stream_id) = self.resolve_stream_id(&payload.stream_id) else {
+                    return;
+                };
+                let Some(topic_id) = self.resolve_topic_id(stream_id, &payload.topic_id) else {
+                    return;
+                };
+
+                let Some(stream) = self.items.get_mut(stream_id) else {
+                    return;
+                };
+                let Some(topic) = stream.topics.get_mut(topic_id) else {
+                    return;
+                };
+
+                let count_to_delete = payload.partitions_count as usize;
+                if count_to_delete > 0 && count_to_delete <= topic.partitions.len() {
+                    topic
+                        .partitions
+                        .truncate(topic.partitions.len() - count_to_delete);
+                }
             }
         }
     }

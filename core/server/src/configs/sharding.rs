@@ -31,10 +31,12 @@ use std::thread::available_parallelism;
 use tracing::info;
 
 use crate::server_error::ServerError;
+use configs::ConfigEnv;
 
-#[derive(Debug, Deserialize, Serialize, Default)]
+#[derive(Debug, Deserialize, Serialize, Default, ConfigEnv)]
 pub struct ShardingConfig {
     #[serde(default)]
+    #[config_env(leaf)]
     pub cpu_allocation: CpuAllocation,
 }
 
@@ -101,17 +103,6 @@ impl NumaConfig {
 
         Ok(())
     }
-
-    // pub fn or_fallback(&self, topology: &NumaTopology) -> CpuAllocation {
-    //     if topology.node_count < 2 {
-    //         tracing::warn!(
-    //             "NUMA requested but only {} node detected, falling back to count",
-    //             topology.node_count
-    //         );
-    //     }
-    //
-    //     todo!()
-    // }
 }
 
 impl CpuAllocation {
