@@ -137,6 +137,13 @@ impl IggyByteSize {
         format!("{:.2}", self.0.get_appropriate_unit(UnitType::Decimal))
     }
 
+    /// Subtract another IggyByteSize value, return 0 if the result is negative.
+    pub fn saturating_sub(&self, other: &Self) -> Self {
+        let self_bytes = self.as_bytes_u64();
+        let other_bytes = other.as_bytes_u64();
+        IggyByteSize::new(self_bytes.saturating_sub(other_bytes))
+    }
+
     /// Calculates the throughput based on the provided duration and returns a human-readable string.
     pub(crate) fn _as_human_throughput_string(&self, duration: &IggyDuration) -> String {
         if duration.is_zero() {

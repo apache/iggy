@@ -120,9 +120,9 @@ impl TestServer {
             Ok(parallelism) => {
                 let available_cpus = parallelism.get();
                 if available_cpus >= 4 {
-                    let mut rng = rand::thread_rng();
+                    let mut rng = rand::rng();
                     let max_start = available_cpus - 4;
-                    let start = rng.gen_range(0..=max_start);
+                    let start = rng.random_range(0..=max_start);
                     let end = start + 4;
                     format!("{}..{}", start, end)
                 } else {
