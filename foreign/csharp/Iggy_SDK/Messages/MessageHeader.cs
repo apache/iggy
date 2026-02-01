@@ -60,4 +60,9 @@ public class MessageHeader
     ///     Length of the payload.
     /// </summary>
     public int PayloadLength { get; set; }
+
+    /// <summary>
+    ///     Reserved for future use.
+    /// </summary>
+    public ulong Reserved { get; set; }
 }

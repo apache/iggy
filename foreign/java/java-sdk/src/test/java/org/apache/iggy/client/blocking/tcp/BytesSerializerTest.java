@@ -505,7 +505,8 @@ class BytesSerializerTest {
                     BigInteger.valueOf(1000), // timestamp
                     BigInteger.valueOf(1000), // originTimestamp
                     0L, // userHeadersLength
-                    5L // payloadLength
+                    5L, // payloadLength
+                    BigInteger.ZERO // reserved
                     );
             byte[] payload = "hello".getBytes();
             var message = new Message(header, payload, new HashMap<>());
@@ -535,7 +536,8 @@ class BytesSerializerTest {
                     BigInteger.valueOf(1000),
                     BigInteger.valueOf(1000),
                     (long) userHeadersLength,
-                    3L // "abc".length()
+                    3L, // "abc".length()
+                    BigInteger.ZERO // reserved
                     );
             byte[] payload = "abc".getBytes();
             var message = new Message(header, payload, userHeaders);
@@ -562,7 +564,8 @@ class BytesSerializerTest {
                     BigInteger.valueOf(2000), // timestamp
                     BigInteger.valueOf(1999), // originTimestamp
                     10L, // userHeadersLength
-                    100L // payloadLength
+                    100L, // payloadLength
+                    BigInteger.ZERO // reserved
                     );
 
             // when

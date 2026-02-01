@@ -68,7 +68,8 @@ public record Message(
                 BigInteger.ZERO,
                 BigInteger.ZERO,
                 userHeadersLength,
-                (long) payloadBytes.length);
+                (long) payloadBytes.length,
+                BigInteger.ZERO);
         return new Message(msgHeader, payloadBytes, userHeaders);
     }
 
@@ -82,7 +83,8 @@ public record Message(
                 header.timestamp(),
                 header.originTimestamp(),
                 userHeadersLength,
-                (long) payload.length);
+                (long) payload.length,
+                header.reserved());
         return new Message(updatedHeader, payload, mergedHeaders);
     }
 

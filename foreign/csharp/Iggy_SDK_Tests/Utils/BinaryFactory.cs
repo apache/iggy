@@ -46,7 +46,7 @@ internal sealed class BinaryFactory
         Guid guid, ReadOnlySpan<byte> payload)
     {
         var messageLength = payload.Length;
-        var totalSize = 56 + payload.Length;
+        var totalSize = 64 + payload.Length;
         Span<byte> payloadBuffer = new byte[totalSize].AsSpan();
 
         BinaryPrimitives.WriteUInt64LittleEndian(payloadBuffer[..8], checkSum);
@@ -56,8 +56,9 @@ internal sealed class BinaryFactory
         BinaryPrimitives.WriteUInt64LittleEndian(payloadBuffer[40..48], timestamp);
         BinaryPrimitives.WriteInt32LittleEndian(payloadBuffer[48..52], headersLength);
         BinaryPrimitives.WriteInt32LittleEndian(payloadBuffer[52..56], payload.Length);
+        BinaryPrimitives.WriteUInt64LittleEndian(payloadBuffer[56..64], 0); // reserved
 
-        payload.CopyTo(payloadBuffer[56..(56 + messageLength)]);
+        payload.CopyTo(payloadBuffer[64..(64 + messageLength)]);
 
         return payloadBuffer.ToArray();
     }

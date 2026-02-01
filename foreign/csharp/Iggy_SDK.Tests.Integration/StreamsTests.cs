@@ -151,7 +151,7 @@ public class StreamsTests
         response.ShouldNotBeNull();
         response.Id.ShouldBeGreaterThanOrEqualTo(0u);
         response.Name.ShouldBe(Name.GetWithProtocol(protocol));
-        response.Size.ShouldBe(490u);
+        response.Size.ShouldBe(546u);
         response.CreatedAt.UtcDateTime.ShouldBe(DateTimeOffset.UtcNow.UtcDateTime, TimeSpan.FromMinutes(1));
         response.MessagesCount.ShouldBe(7u);
         response.TopicsCount.ShouldBe(2);
@@ -163,7 +163,7 @@ public class StreamsTests
         topic.CompressionAlgorithm.ShouldBe(topicRequest1.CompressionAlgorithm);
         topic.Partitions.ShouldBeNull();
         topic.MessageExpiry.ShouldBe(topicRequest1.MessageExpiry);
-        topic.Size.ShouldBe(210u);
+        topic.Size.ShouldBe(234u);
         topic.PartitionsCount.ShouldBe(topicRequest1.PartitionsCount);
         topic.ReplicationFactor.ShouldBe(topicRequest1.ReplicationFactor);
         topic.MaxTopicSize.ShouldBeGreaterThan(0u);
