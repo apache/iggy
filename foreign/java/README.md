@@ -199,11 +199,33 @@ See the [`examples`](examples/) module for basic consumer and producer implement
 
 For Apache Flink integration, see the [Flink Connector Library](external-processors/iggy-connector-flink/iggy-connector-library/README.md).
 
+## Building from Source
+
+This project uses the Gradle Wrapper. Due to Apache Software Foundation policy, the `gradle-wrapper.jar` binary is not checked into the repository. Instead, the `gradlew` script automatically downloads it on first run.
+
+```bash
+# Build the project
+./gradlew build
+
+# Run tests
+./gradlew test
+```
+
+The wrapper script will:
+
+1. Download `gradle-wrapper.jar` from the official Gradle repository if missing
+2. Verify the SHA256 checksum for security
+3. Execute the requested Gradle command
+
+No manual Gradle installation is required.
+
+**Note:** Only the Unix shell wrapper (`gradlew`) is provided. Windows users should use WSL, Git Bash, or install Gradle manually.
+
 ## Contributing
 
 Before opening a pull request:
 
-1. **Format code:** `gradle spotlessApply`
-2. **Validate build:** `gradle check`
+1. **Format code:** `./gradlew spotlessApply`
+2. **Validate build:** `./gradlew check`
 
 This ensures code style compliance and that all tests and checkstyle validations pass.
