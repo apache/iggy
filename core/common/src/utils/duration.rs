@@ -29,6 +29,35 @@ use std::{
 
 pub const SEC_IN_MICRO: u64 = 1_000_000;
 
+/// A struct for representing time durations with various utility functions.
+///
+/// This struct wraps `std::time::Duration` and uses the `humantime` crate for parsing and formatting
+/// human-readable duration strings. It also implements serialization and deserialization via the `serde` crate.
+///
+/// # Example
+///
+/// ```
+/// use iggy_common::IggyDuration;
+/// use std::str::FromStr;
+///
+/// let duration = IggyDuration::from(3661_000_000_u64); // 3661 seconds in microseconds
+/// assert_eq!(3661, duration.as_secs());
+/// assert_eq!("1h 1m 1s", duration.as_human_time_string());
+/// assert_eq!("1h 1m 1s", format!("{}", duration));
+///
+/// let duration = IggyDuration::from(0_u64);
+/// assert_eq!(0, duration.as_secs());
+/// assert_eq!("0s", duration.as_human_time_string());
+/// assert_eq!("0s", format!("{}", duration));
+///
+/// let duration = IggyDuration::from_str("1h 1m 1s").unwrap();
+/// assert_eq!(3661, duration.as_secs());
+/// assert_eq!("1h 1m 1s", duration.as_human_time_string());
+/// assert_eq!("1h 1m 1s", format!("{}", duration));
+///
+/// let duration = IggyDuration::from_str("unlimited").unwrap();
+/// assert_eq!(0, duration.as_secs());
+/// ```
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct IggyDuration {
     duration: Duration,

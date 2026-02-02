@@ -86,7 +86,12 @@ pub struct LoggingConfig {
     pub level: String,
     pub file_enabled: bool,
     #[config_env(leaf)]
-    pub max_size: IggyByteSize,
+    pub max_file_size: IggyByteSize,
+    #[config_env(leaf)]
+    pub max_total_size: IggyByteSize,
+    #[config_env(leaf)]
+    #[serde_as(as = "DisplayFromStr")]
+    pub rotation_check_interval: IggyDuration,
     #[config_env(leaf)]
     #[serde_as(as = "DisplayFromStr")]
     pub retention: IggyDuration,

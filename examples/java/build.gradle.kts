@@ -20,7 +20,6 @@
 plugins {
     java
     id("com.diffplug.spotless") version "8.1.0"
-    checkstyle
 }
 
 repositories {
@@ -36,17 +35,14 @@ dependencies {
 spotless {
     java {
         palantirJavaFormat()
-        removeUnusedImports()
-        trimTrailingWhitespace()
         endWithNewline()
-        formatAnnotations()
+        trimTrailingWhitespace()
         importOrder("", "\n", "javax|java", "\n", "\\#")
+        removeUnusedImports()
+        forbidWildcardImports()
+        formatAnnotations()
         toggleOffOn()
     }
-}
-
-checkstyle {
-    toolVersion = "12.2.0"
 }
 
 tasks.withType<JavaCompile> {

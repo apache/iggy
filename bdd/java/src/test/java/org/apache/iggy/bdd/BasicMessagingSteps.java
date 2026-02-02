@@ -54,10 +54,8 @@ public class BasicMessagingSteps {
         context.serverAddr = getenvOrDefault("IGGY_TCP_ADDRESS", "127.0.0.1:8090");
         HostPort hostPort = HostPort.parse(context.serverAddr);
 
-        IggyTcpClient client = IggyTcpClient.builder()
-                .host(hostPort.host)
-                .port(hostPort.port)
-                .build();
+        IggyTcpClient client =
+                IggyTcpClient.builder().host(hostPort.host).port(hostPort.port).build();
 
         client.connect();
         client.system().ping();
@@ -99,14 +97,16 @@ public class BasicMessagingSteps {
 
     @When("I create a topic with name {string} in stream {int} with {int} partitions")
     public void createTopic(String topicName, int streamId, int partitions) {
-        TopicDetails topic = getClient().topics().createTopic(
-                (long) streamId,
-                (long) partitions,
-                CompressionAlgorithm.None,
-                BigInteger.ZERO,
-                BigInteger.ZERO,
-                Optional.empty(),
-                topicName);
+        TopicDetails topic = getClient()
+                .topics()
+                .createTopic(
+                        (long) streamId,
+                        (long) partitions,
+                        CompressionAlgorithm.None,
+                        BigInteger.ZERO,
+                        BigInteger.ZERO,
+                        Optional.empty(),
+                        topicName);
 
         context.lastTopicId = topic.id();
         context.lastTopicName = topic.name();
@@ -136,11 +136,9 @@ public class BasicMessagingSteps {
             messages.add(Message.of(content));
         }
 
-        getClient().messages().sendMessages(
-                (long) streamId,
-                (long) topicId,
-                Partitioning.partitionId((long) partitionId),
-                messages);
+        getClient()
+                .messages()
+                .sendMessages((long) streamId, (long) topicId, Partitioning.partitionId((long) partitionId), messages);
 
         if (!messages.isEmpty()) {
             context.lastSentMessage = "test message " + (messageCount - 1);
@@ -154,14 +152,16 @@ public class BasicMessagingSteps {
 
     @When("I poll messages from stream {int}, topic {int}, partition {int} starting from offset {int}")
     public void pollMessages(int streamId, int topicId, int partitionId, int startOffset) {
-        context.lastPolledMessages = getClient().messages().pollMessages(
-                (long) streamId,
-                (long) topicId,
-                Optional.of((long) partitionId),
-                0L,
-                PollingStrategy.offset(BigInteger.valueOf(startOffset)),
-                100L,
-                true);
+        context.lastPolledMessages = getClient()
+                .messages()
+                .pollMessages(
+                        (long) streamId,
+                        (long) topicId,
+                        Optional.of((long) partitionId),
+                        0L,
+                        PollingStrategy.offset(BigInteger.valueOf(startOffset)),
+                        100L,
+                        true);
     }
 
     @Then("I should receive {int} messages")

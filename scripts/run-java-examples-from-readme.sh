@@ -1,5 +1,6 @@
 #!/bin/bash
 
+#
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
@@ -16,6 +17,7 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+#
 
 set -euo pipefail
 
@@ -26,7 +28,7 @@ set -euo pipefail
 #          If not provided, uses the default target
 #
 # This script scans examples/java/README.md for commands starting with
-# `./gradlew` and executes them in order. If any command fails, the script
+# `gradle` and executes them in order. If any command fails, the script
 # stops immediately and prints the relevant iggy-server logs.
 
 readonly LOG_FILE="iggy-server.log"

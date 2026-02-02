@@ -66,6 +66,7 @@ error_set = { workspace = true }
 figlet-rs = { workspace = true }
 figment = { workspace = true }
 flume = { workspace = true }
+fs2 = "0.4.3"
 futures = { workspace = true }
 hash32 = { workspace = true }
 human-repr = { workspace = true }
@@ -89,6 +90,7 @@ rand = { workspace = true }
 reqwest = { workspace = true, features = ["rustls-tls-no-provider"] }
 ringbuffer = { workspace = true }
 rmp-serde = { workspace = true }
+rolling-file = "0.2.0"
 rust-embed = { workspace = true, optional = true }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }

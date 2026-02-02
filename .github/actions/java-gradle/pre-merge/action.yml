@@ -26,36 +26,51 @@ inputs:
 runs:
   using: "composite"
   steps:
-    - name: Setup Java
-      uses: actions/setup-java@v4
+    - name: Setup Java with cache
+      uses: ./.github/actions/utils/setup-java-with-cache
       with:
-        distribution: "temurin"
-        java-version: "17"
-        cache: "gradle"
+        gradle-cache-disabled: "true"
 
-    - name: Setup Gradle
-      uses: gradle/actions/setup-gradle@af1da67850ed9a4cedd57bfd976089dd991e2582 # v4.0.0
-      with:
-        gradle-version: '9.2.1'
-
-    - name: Lint
+    - name: Lint SDK
       if: inputs.task == 'lint'
       shell: bash
+      working-directory: foreign/java
       run: |
-        foreign/java/dev-support/checks/build.sh check -x test
+        echo "::group::Linting foreign/java"
+        gradle check -x test
+        echo "::endgroup::"
+
+    - name: Lint examples
+      if: inputs.task == 'lint'
+      shell: bash
+      working-directory: examples/java
+      run: |
+        echo "::group::Linting examples/java"
+        gradle check -x test
+        echo "::endgroup::"
+
+    - name: Lint BDD
+      if: inputs.task == 'lint'
+      shell: bash
+      working-directory: bdd/java
+      run: |
+        echo "::group::Linting bdd/java"
+        gradle check -x test
+        echo "::endgroup::"
 
     - name: Build
       shell: bash
       if: inputs.task == 'build'
+      working-directory: foreign/java
       run: |
-        foreign/java/dev-support/checks/build.sh build -x test -x checkstyleMain -x checkstyleTest -x spotlessCheck
+        gradle build -x test -x checkstyleMain -x checkstyleTest -x spotlessCheck
         BUILD_EXIT_CODE=$?
 
         # List artifacts only if build succeeded
         if [ $BUILD_EXIT_CODE -eq 0 ]; then
           echo ""
           echo "Build artifacts:"
-          find foreign/java -path "*/build/libs/*.jar" -type f 2>/dev/null | head -20 || echo "No jar artifacts found in build/libs directories"
+          find . -path "*/build/libs/*.jar" -type f 2>/dev/null | head -20 || echo "No jar artifacts found in build/libs directories"
         fi
 
         # Exit with build exit code
@@ -76,10 +91,10 @@ runs:
     - name: Test
       if: inputs.task == 'test'
       shell: bash
+      working-directory: foreign/java
       env:
         USE_EXTERNAL_SERVER: true
-      run: |
-        foreign/java/dev-support/checks/build.sh test
+      run: gradle test
 
     - name: Copy test reports
       if: ${{ !cancelled() && inputs.task == 'test' }}

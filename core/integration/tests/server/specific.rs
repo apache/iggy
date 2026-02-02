@@ -1,4 +1,5 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
  * regarding copyright ownership.  The ASF licenses this file
@@ -134,7 +135,7 @@ async fn tcp_tls_self_signed_scenario_should_be_valid() {
         .await
         .expect("Failed to connect TLS client with self-signed cert");
 
-    let client = iggy::clients::client::IggyClient::create(ClientWrapper::Iggy(client), None, None);
+    let client = IggyClient::create(ClientWrapper::Iggy(client), None, None);
 
     tcp_tls_scenario::run(&client).await;
 }
