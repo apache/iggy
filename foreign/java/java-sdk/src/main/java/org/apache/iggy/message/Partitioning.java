@@ -21,14 +21,10 @@ package org.apache.iggy.message;
 
 import org.apache.commons.lang3.ArrayUtils;
 import org.apache.iggy.exception.IggyInvalidArgumentException;
-import org.apache.iggy.serde.Base64Serializer;
-import tools.jackson.databind.annotation.JsonSerialize;
 
 import java.nio.ByteBuffer;
 
-public record Partitioning(
-        PartitioningKind kind,
-        @JsonSerialize(using = Base64Serializer.class) byte[] value) {
+public record Partitioning(PartitioningKind kind, byte[] value) {
     public static Partitioning balanced() {
         return new Partitioning(PartitioningKind.Balanced, new byte[] {});
     }

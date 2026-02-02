@@ -19,25 +19,24 @@
 
 package org.apache.iggy.message;
 
-import com.fasterxml.jackson.annotation.JsonCreator;
-import com.fasterxml.jackson.annotation.JsonProperty;
+import org.apache.commons.lang3.StringUtils;
+import org.apache.commons.lang3.builder.EqualsBuilder;
+import org.apache.commons.lang3.builder.HashCodeBuilder;
+import org.apache.iggy.exception.IggyInvalidArgumentException;
 
 import java.nio.charset.StandardCharsets;
-import java.util.Arrays;
-import java.util.Base64;
 
 public record HeaderKey(HeaderKind kind, byte[] value) {
-    @JsonCreator
-    public static HeaderKey fromJson(@JsonProperty("kind") HeaderKind kind, @JsonProperty("value") String base64Value) {
-        byte[] decodedValue = Base64.getDecoder().decode(base64Value);
-        return new HeaderKey(kind, decodedValue);
-    }
 
-    public static HeaderKey fromString(String val) {
-        if (val.isEmpty() || val.length() > 255) {
-            throw new IllegalArgumentException("Value has incorrect size, must be between 1 and 255");
+    public static HeaderKey fromString(String value) {
+        if (StringUtils.isBlank(value)) {
+            throw new IggyInvalidArgumentException("Value cannot be null or empty");
         }
-        return new HeaderKey(HeaderKind.String, val.getBytes(StandardCharsets.UTF_8));
+        var bytes = value.getBytes(StandardCharsets.UTF_8);
+        if (bytes.length > 255) {
+            throw new IggyInvalidArgumentException("Value has incorrect size, must be between 1 and 255 bytes");
+        }
+        return new HeaderKey(HeaderKind.String, bytes);
     }
 
     @Override
@@ -49,14 +48,15 @@ public record HeaderKey(HeaderKind kind, byte[] value) {
             return false;
         }
         HeaderKey headerKey = (HeaderKey) o;
-        return kind == headerKey.kind && Arrays.equals(value, headerKey.value);
+        return new EqualsBuilder()
+                .append(value, headerKey.value)
+                .append(kind, headerKey.kind)
+                .isEquals();
     }
 
     @Override
     public int hashCode() {
-        int result = kind.hashCode();
-        result = 31 * result + Arrays.hashCode(value);
-        return result;
+        return new HashCodeBuilder(17, 37).append(kind).append(value).toHashCode();
     }
 
     @Override

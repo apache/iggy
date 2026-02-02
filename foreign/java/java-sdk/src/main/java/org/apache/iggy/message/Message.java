@@ -19,39 +19,26 @@
 
 package org.apache.iggy.message;
 
-import com.fasterxml.jackson.annotation.JsonCreator;
-import com.fasterxml.jackson.annotation.JsonProperty;
-import com.fasterxml.jackson.annotation.JsonSetter;
-import com.fasterxml.jackson.annotation.Nulls;
-import org.apache.iggy.serde.Base64Serializer;
-import org.apache.iggy.serde.UserHeadersSerializer;
-import tools.jackson.databind.annotation.JsonSerialize;
-
+import javax.annotation.Nullable;
 import java.math.BigInteger;
-import java.util.Base64;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
-public record Message(
-        MessageHeader header,
-        @JsonSerialize(using = Base64Serializer.class) byte[] payload,
-        @JsonSerialize(using = UserHeadersSerializer.class) Map<HeaderKey, HeaderValue> userHeaders) {
-    @JsonCreator
-    public static Message fromJson(
-            @JsonProperty("header") MessageHeader header,
-            @JsonProperty("payload") String base64Payload,
-            @JsonProperty(value = "user_headers", required = false) @JsonSetter(nulls = Nulls.AS_EMPTY)
-                    List<HeaderEntry> userHeadersList) {
-        byte[] decodedPayload = Base64.getDecoder().decode(base64Payload);
+public record Message(MessageHeader header, byte[] payload, Map<HeaderKey, HeaderValue> userHeaders) {
+
+    /**
+     * Creates a Message from JSON deserialization. Used by Jackson mixin.
+     */
+    public static Message of(MessageHeader header, byte[] payload, @Nullable List<HeaderEntry> userHeaders) {
         Map<HeaderKey, HeaderValue> headersMap = new HashMap<>();
-        if (userHeadersList != null) {
-            for (HeaderEntry entry : userHeadersList) {
+        if (userHeaders != null) {
+            for (HeaderEntry entry : userHeaders) {
                 headersMap.put(entry.key(), entry.value());
             }
         }
-        return new Message(header, decodedPayload, headersMap);
+        return new Message(header, payload, headersMap);
     }
 
     public static Message of(String payload) {
