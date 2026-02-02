@@ -263,5 +263,12 @@ macro_rules! source_connector {
             };
             instance.1.close()
         }
+
+        #[cfg(not(test))]
+        #[unsafe(no_mangle)]
+        extern "C" fn version() -> *const std::ffi::c_char {
+            static VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "\0");
+            VERSION.as_ptr() as *const std::ffi::c_char
+        }
     };
 }

@@ -163,7 +163,7 @@ iceberg-catalog-rest = "0.8.0"
 iggy = { path = "core/sdk", version = "0.8.2-edge.2" }
 iggy_binary_protocol = { path = "core/binary_protocol", version = "0.8.2-edge.2" }
 iggy_common = { path = "core/common", version = "0.8.2-edge.2" }
-iggy_connector_sdk = { path = "core/connectors/sdk", version = "0.1.2-edge.1" }
+iggy_connector_sdk = { path = "core/connectors/sdk", version = "0.1.3-edge.1" }
 integration = { path = "core/integration" }
 journal = { path = "core/journal" }
 js-sys = "0.3"

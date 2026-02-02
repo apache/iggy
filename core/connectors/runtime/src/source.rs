@@ -75,6 +75,7 @@ pub async fn init(
         let init_error: Option<String>;
         if let Some(container) = source_connectors.get_mut(&path) {
             info!("Source container for plugin: {path} is already loaded.",);
+            let version = get_plugin_version(&container.container);
             init_error = init_source(
                 &container.container,
                 &config.plugin_config.unwrap_or_default(),
@@ -88,6 +89,7 @@ pub async fn init(
                 key: key.to_owned(),
                 name: name.to_owned(),
                 path: path.to_owned(),
+                version,
                 config_format: config.plugin_config_format,
                 producer: None,
                 transforms: vec![],
@@ -99,6 +101,7 @@ pub async fn init(
             let container: Container<SourceApi> =
                 unsafe { Container::load(&path).expect("Failed to load source container") };
             info!("Source container for plugin: {path} loaded successfully.",);
+            let version = get_plugin_version(&container);
             init_error = init_source(
                 &container,
                 &config.plugin_config.unwrap_or_default(),
@@ -116,6 +119,7 @@ pub async fn init(
                         key: key.to_owned(),
                         name: name.to_owned(),
                         path: path.to_owned(),
+                        version,
                         config_format: config.plugin_config_format,
                         producer: None,
                         transforms: vec![],
@@ -185,6 +189,15 @@ pub async fn init(
     }
 
     Ok(source_connectors)
+}
+
+fn get_plugin_version(container: &Container<SourceApi>) -> String {
+    unsafe {
+        let version_ptr = (container.version)();
+        std::ffi::CStr::from_ptr(version_ptr)
+            .to_string_lossy()
+            .into_owned()
+    }
 }
 
 fn init_source(

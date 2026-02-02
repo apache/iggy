@@ -81,6 +81,7 @@ struct SourceApi {
     ) -> i32,
     handle: extern "C" fn(id: u32, callback: SendCallback) -> i32,
     close: extern "C" fn(id: u32) -> i32,
+    version: extern "C" fn() -> *const std::ffi::c_char,
 }
 
 #[derive(WrapperApi)]
@@ -102,6 +103,7 @@ struct SinkApi {
         messages_len: usize,
     ) -> i32,
     close: extern "C" fn(id: u32) -> i32,
+    version: extern "C" fn() -> *const std::ffi::c_char,
 }
 
 fn print_ascii_art(text: &str) {
@@ -280,6 +282,7 @@ struct SinkConnectorPlugin {
     key: String,
     name: String,
     path: String,
+    version: String,
     config_format: Option<ConfigFormat>,
     consumers: Vec<SinkConnectorConsumer>,
     error: Option<String>,
@@ -313,6 +316,7 @@ struct SourceConnectorPlugin {
     key: String,
     name: String,
     path: String,
+    version: String,
     config_format: Option<ConfigFormat>,
     transforms: Vec<Arc<dyn Transform>>,
     producer: Option<SourceConnectorProducer>,
