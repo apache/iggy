@@ -31,6 +31,7 @@ use iggy_common::sharding::IggyNamespace;
 use iggy_common::{IggyError, PollingKind};
 use std::cell::RefCell;
 use std::sync::atomic::Ordering;
+use tracing::debug;
 
 /// Poll messages from a partition partitions.
 ///
@@ -117,6 +118,7 @@ pub async fn poll_messages(
 
     // Phase 2: Get messages using hybrid disk+journal logic
     let batches = get_messages_by_offset(local_partitions, namespace, start_offset, count).await?;
+
     Ok((metadata, batches))
 }
 
@@ -180,6 +182,7 @@ pub async fn get_messages_by_offset(
                 return Ok(result.get_by_offset(start_offset, count));
             }
         }
+
         return load_messages_from_disk(local_partitions, namespace, start_offset, count).await;
     }
 

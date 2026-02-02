@@ -5340,6 +5340,7 @@ version = "0.9.2-edge.1"
 dependencies = [
  "aes-gcm",
  "ahash 0.8.12",
+ "aligned-vec",
  "base64 0.22.1",
  "blake3",
  "bon",
@@ -9617,6 +9618,7 @@ name = "server"
 version = "0.7.2-edge.1"
 dependencies = [
  "ahash 0.8.12",
+ "aligned-vec",
  "anyhow",
  "argon2",
  "async-channel",
