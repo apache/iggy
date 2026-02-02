@@ -17,19 +17,28 @@
  * under the License.
  */
 
-package org.apache.iggy.serde;
+package org.apache.iggy.client.blocking.http;
 
+import org.apache.iggy.message.HeaderEntry;
+import org.apache.iggy.message.HeaderKey;
+import org.apache.iggy.message.HeaderValue;
 import tools.jackson.core.JacksonException;
 import tools.jackson.core.JsonGenerator;
 import tools.jackson.databind.SerializationContext;
 import tools.jackson.databind.ValueSerializer;
 
-import java.util.Base64;
+import java.util.Map;
 
-public class Base64Serializer extends ValueSerializer<byte[]> {
+class UserHeadersSerializer extends ValueSerializer<Map<HeaderKey, HeaderValue>> {
 
     @Override
-    public void serialize(byte[] value, JsonGenerator gen, SerializationContext ctxt) throws JacksonException {
-        gen.writeString(Base64.getEncoder().encodeToString(value));
+    public void serialize(Map<HeaderKey, HeaderValue> headers, JsonGenerator gen, SerializationContext ctxt)
+            throws JacksonException {
+        gen.writeStartArray();
+        for (Map.Entry<HeaderKey, HeaderValue> entry : headers.entrySet()) {
+            ctxt.findValueSerializer(HeaderEntry.class)
+                    .serialize(new HeaderEntry(entry.getKey(), entry.getValue()), gen, ctxt);
+        }
+        gen.writeEndArray();
     }
 }
