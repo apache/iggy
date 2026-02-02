@@ -18,7 +18,7 @@
 ARG RUST_VERSION=1.93
 FROM rust:${RUST_VERSION}
 
-FROM gradle:9.2-jdk17
+FROM gradle:9.3.1-jdk17
 
 WORKDIR /workspace
 COPY . .
@@ -28,11 +28,11 @@ RUN mkdir -p src/test/resources/features
 
 # Create entrypoint script to copy mounted features at runtime
 RUN echo '#!/bin/bash\n\
-set -e\n\
-if [ -d /app/features ]; then\n\
-  cp -f /app/features/*.feature /workspace/bdd/java/src/test/resources/features/ 2>/dev/null || true\n\
-fi\n\
-exec "$@"' > /entrypoint.sh && chmod +x /entrypoint.sh
+    set -e\n\
+    if [ -d /app/features ]; then\n\
+    cp -f /app/features/*.feature /workspace/bdd/java/src/test/resources/features/ 2>/dev/null || true\n\
+    fi\n\
+    exec "$@"' > /entrypoint.sh && chmod +x /entrypoint.sh
 
 ENTRYPOINT ["/entrypoint.sh"]
 CMD ["gradle", "--no-daemon", "test"]

@@ -28,7 +28,7 @@ set -euo pipefail
 #          If not provided, uses the default target
 #
 # This script scans examples/java/README.md for commands starting with
-# `gradle` and executes them in order. If any command fails, the script
+# `./gradlew` and executes them in order. If any command fails, the script
 # stops immediately and prints the relevant iggy-server logs.
 
 readonly LOG_FILE="iggy-server.log"
@@ -120,7 +120,7 @@ if [ -f "${README_FILE}" ]; then
 
         # Small delay between runs to avoid thrashing the server
         sleep 2
-    done < <(grep -E '^gradle' "${README_FILE}")
+    done < <(grep -E '^\./gradlew' "${README_FILE}")
 else
     echo "README file ${README_FILE} not found in examples/java."
 fi
