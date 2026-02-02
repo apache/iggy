@@ -30,23 +30,15 @@ inputs:
 runs:
   using: "composite"
   steps:
-    - name: Setup Java
-      uses: actions/setup-java@v4
-      with:
-        distribution: "temurin"
-        java-version: "17"
-
-    - name: Setup Gradle
-      uses: gradle/actions/setup-gradle@af1da67850ed9a4cedd57bfd976089dd991e2582 # v4.0.0
-      with:
-        gradle-version: '9.2.1'
+    - name: Setup Java with cache
+      uses: ./.github/actions/utils/setup-java-with-cache
 
     - name: Build for publishing
       shell: bash
       working-directory: foreign/java
       run: |
         echo "📦 Building Java SDK for publishing..."
-        gradle build -x test -x checkstyleMain -x checkstyleTest
+        ./gradlew build -x test -x checkstyleMain -x checkstyleTest
         BUILD_EXIT_CODE=$?
 
         # List artifacts only if build succeeded
@@ -73,7 +65,7 @@ runs:
           echo ""
 
           # Extract version from build.gradle.kts
-          gradle_version=$(gradle -p java-sdk properties -q | grep "version:" | cut -d: -f2 | tr -d ' ')
+          gradle_version=$(./gradlew -p java-sdk properties -q | grep "version:" | cut -d: -f2 | tr -d ' ')
           echo "Version from gradle: $gradle_version"
           echo "Input version: ${{ inputs.version }}"
 
@@ -107,7 +99,7 @@ runs:
           echo ""
 
           # Run the publish task
-          gradle build -x test -x checkstyleMain -x checkstyleTest sign publish
+          ./gradlew build -x test -x checkstyleMain -x checkstyleTest sign publish
           PUBLISH_EXIT_CODE=$?
 
           if [ $PUBLISH_EXIT_CODE -eq 0 ]; then

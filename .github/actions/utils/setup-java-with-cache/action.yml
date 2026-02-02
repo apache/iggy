@@ -15,11 +15,11 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# NOTE: this action sets up the Java toolchain + Gradle with caching,
-#       it is a convenience wrapper, so that we can use it in all workflows.
+# NOTE: this action sets up the Java toolchain with optional Gradle caching.
+#       Gradle itself is provided via the wrapper (gradlew) in each project.
 
 name: setup-java-with-cache
-description: Setup Java toolchain and Gradle with caching
+description: Setup Java toolchain with optional Gradle caching (uses gradlew wrapper)
 inputs:
   java-version:
     description: "Java version to use"
@@ -29,10 +29,6 @@ inputs:
     description: "Java distribution to use"
     required: false
     default: "temurin"
-  gradle-version:
-    description: "Gradle version to use"
-    required: false
-    default: "9.2.1"
   gradle-cache-disabled:
     description: "Whether to disable Gradle caching"
     required: false
@@ -41,7 +37,7 @@ inputs:
 runs:
   using: "composite"
   steps:
-    - name: Setup Java (with cache)
+    - name: Setup Java (with Gradle cache)
       if: inputs.gradle-cache-disabled != 'true'
       uses: actions/setup-java@v4
       with:
@@ -56,15 +52,8 @@ runs:
         distribution: ${{ inputs.java-distribution }}
         java-version: ${{ inputs.java-version }}
 
-    - name: Setup Gradle
-      uses: gradle/actions/setup-gradle@af1da67850ed9a4cedd57bfd976089dd991e2582 # v4.0.0
-      with:
-        gradle-version: ${{ inputs.gradle-version }}
-        cache-disabled: ${{ inputs.gradle-cache-disabled }}
-
     - name: Verify Java installation
       run: |
-        echo "Java setup complete"
+        echo "Java setup complete (Gradle provided via wrapper)"
         java --version
-        gradle --version
       shell: bash
