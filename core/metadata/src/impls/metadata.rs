@@ -39,15 +39,16 @@ where
 }
 
 #[expect(unused)]
-struct IggyMetadata<C, J, S, M> {
+#[derive(Debug)]
+pub struct IggyMetadata<C, J, S, M> {
     /// Some on shard0, None on other shards
-    consensus: Option<C>,
+    pub consensus: Option<C>,
     /// Some on shard0, None on other shards
-    journal: Option<J>,
+    pub journal: Option<J>,
     /// Some on shard0, None on other shards
-    snapshot: Option<S>,
+    pub snapshot: Option<S>,
     /// State machine - lives on all shards
-    mux_stm: M,
+    pub mux_stm: M,
 }
 
 impl<J, S, M> Metadata<VsrConsensus> for IggyMetadata<VsrConsensus, J, S, M>
@@ -137,14 +138,13 @@ where
         // TODO handle gap in ops.
 
         // Verify hash chain integrity.
-        if let Some(previous) = journal.handle().previous_entry(header) {
+        if let Some(previous) = journal.handle().previous_header(header) {
             self.panic_if_hash_chain_would_break_in_same_view(&previous, header);
         }
 
         assert_eq!(header.op, current_op + 1);
 
         consensus.sequencer().set_sequence(header.op);
-        journal.handle().set_header_as_dirty(header);
 
         // Append to journal.
         journal.handle().append(message.clone()).await;
@@ -228,7 +228,8 @@ where
         };
 
         let header = prepare.header();
-        header.op <= consensus.commit() || journal.handle().entry(header).is_some()
+        // TODO: Handle idx calculation, for now using header.op, but since the journal may get compacted, this may not be correct.
+        header.op <= consensus.commit() || journal.handle().header(header.op as usize).is_some()
     }
 
     /// Replicate a prepare message to the next replica in the chain.
@@ -243,9 +244,11 @@ where
 
         let header = message.header();
 
+        // TODO: calculate the index;
+        let idx= header.op as usize;
         assert_eq!(header.command, Command2::Prepare);
         assert!(
-            journal.handle().entry(header).is_none(),
+            journal.handle().header(idx).is_none(),
             "replicate: must not already have prepare"
         );
         assert!(header.op > consensus.commit());
@@ -335,7 +338,7 @@ where
         }
 
         // Verify we have the prepare and it's persisted (not dirty).
-        if journal.handle().entry(header).is_none() {
+        if journal.handle().header(header.op as usize).is_none() {
             debug!(
                 replica = consensus.replica(),
                 op = header.op,

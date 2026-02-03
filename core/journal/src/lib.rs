@@ -24,21 +24,19 @@ where
     type Header;
     type Entry;
 
-    fn entry(&self, header: &Self::Header) -> Option<&Self::Entry>;
-
-    fn previous_entry(&self, header: &Self::Header) -> Option<Self::Header>;
-
-    fn set_header_as_dirty(&self, header: &Self::Header);
+    fn header(&self, idx: usize) -> Option<&Self::Header>;
+    fn previous_header(&self, header: &Self::Header) -> Option<&Self::Header>;
 
     fn append(&self, entry: Self::Entry) -> impl Future<Output = ()>;
+    fn entry(&self, header: &Self::Header) -> impl Future<Output = Option<Self::Entry>>;
 }
 
 // TODO: Move to other crate.
 pub trait Storage {
     type Buffer;
 
-    fn write(&self, buf: Self::Buffer) -> usize;
-    fn read(&self, offset: u64, buffer: Self::Buffer) -> Self::Buffer;
+    fn write(&self, buf: Self::Buffer) -> impl Future<Output = usize>;
+    fn read(&self, offset: usize, buffer: Self::Buffer) -> impl Future<Output = Self::Buffer>;
 }
 
 pub trait JournalHandle {

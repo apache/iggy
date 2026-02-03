@@ -8450,6 +8450,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "simulator"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "consensus",
+ "iggy_common",
+ "journal",
+ "message_bus",
+ "metadata",
+]
+
+[[package]]
 name = "siphasher"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

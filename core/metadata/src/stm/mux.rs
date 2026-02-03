@@ -20,6 +20,7 @@ use iggy_common::{header::PrepareHeader, message::Message};
 use crate::stm::{State, StateMachine};
 
 // MuxStateMachine that proxies to an tuple of variadic state machines
+#[derive(Debug)]
 pub struct MuxStateMachine<T>
 where
     T: StateMachine,

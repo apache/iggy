@@ -31,6 +31,15 @@ where
     inner: UnsafeCell<WriteHandle<T, O>>,
 }
 
+impl<T, O> std::fmt::Debug for WriteCell<T, O>
+where
+    T: Absorb<O>,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WriteCell").finish_non_exhaustive()
+    }
+}
+
 impl<T, O> WriteCell<T, O>
 where
     T: Absorb<O>,
@@ -65,6 +74,7 @@ pub trait Handler: Command {
     fn handle(&mut self, cmd: &Self::Cmd);
 }
 
+#[derive(Debug)]
 pub struct LeftRight<T, C>
 where
     T: Absorb<C>,
@@ -180,6 +190,7 @@ macro_rules! define_state {
                 )*
             }
 
+            #[derive(Debug)]
             pub struct $state {
                 inner: $crate::stm::LeftRight<[<$state Inner>], [<$state Command>]>,
             }
@@ -207,6 +218,8 @@ macro_rules! define_state {
                 }
             }
 
+            // TODO: This can be monomorphized by const generics, instead of creating an runtime enum
+            // We can use const generics and specialize each of those methods.
             impl $crate::stm::Command for [<$state Inner>] {
                 type Cmd = [<$state Command>];
                 type Input = ::iggy_common::message::Message<::iggy_common::header::PrepareHeader>;

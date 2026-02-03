@@ -49,6 +49,7 @@ members = [
     "core/partitions",
     "core/sdk",
     "core/server",
+    "core/simulator",
     "core/tools",
     "examples/rust",
 ]

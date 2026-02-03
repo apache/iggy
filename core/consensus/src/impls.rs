@@ -43,6 +43,7 @@ pub trait Sequencer {
     fn set_sequence(&self, sequence: Self::Sequence);
 }
 
+#[derive(Debug)]
 pub struct LocalSequencer {
     op: Cell<u64>,
 }
@@ -82,6 +83,7 @@ pub const PIPELINE_PREPARE_QUEUE_MAX: usize = 8;
 /// Maximum number of replicas in a cluster.
 pub const REPLICAS_MAX: usize = 32;
 
+#[derive(Debug)]
 pub struct PipelineEntry {
     pub message: Message<PrepareHeader>,
     /// Bitmap of replicas that have acknowledged this prepare.
@@ -133,6 +135,7 @@ impl RequestEntry {
     }
 }
 
+#[derive(Debug)]
 pub struct LocalPipeline {
     /// Messages being prepared (uncommitted and being replicated).
     prepare_queue: VecDeque<PipelineEntry>,
@@ -386,6 +389,7 @@ pub enum VsrAction {
 }
 
 #[allow(unused)]
+#[derive(Debug)]
 pub struct VsrConsensus {
     cluster: u128,
     replica: u8,

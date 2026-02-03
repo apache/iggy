@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::types::consensus::header::{
+use crate::{header::RequestHeader, types::consensus::header::{
     self, CommitHeader, ConsensusHeader, GenericHeader, PrepareHeader, PrepareOkHeader, ReplyHeader,
-};
+}};
 use bytes::Bytes;
 use std::marker::PhantomData;
 
@@ -278,6 +278,7 @@ where
 #[derive(Debug)]
 #[allow(unused)]
 pub enum MessageBag {
+    Request(Message<RequestHeader>),
     Generic(Message<GenericHeader>),
     Prepare(Message<PrepareHeader>),
     PrepareOk(Message<PrepareOkHeader>),
@@ -289,6 +290,7 @@ impl MessageBag {
     #[allow(unused)]
     pub fn command(&self) -> header::Command2 {
         match self {
+            MessageBag::Request(message) => message.header().command,
             MessageBag::Generic(message) => message.header().command,
             MessageBag::Prepare(message) => message.header().command,
             MessageBag::PrepareOk(message) => message.header().command,
@@ -300,6 +302,7 @@ impl MessageBag {
     #[allow(unused)]
     pub fn size(&self) -> u32 {
         match self {
+            MessageBag::Request(message) => message.header().size(),
             MessageBag::Generic(message) => message.header().size(),
             MessageBag::Prepare(message) => message.header().size(),
             MessageBag::PrepareOk(message) => message.header().size(),
@@ -333,6 +336,10 @@ where
             header::Command2::Reply => {
                 let msg = unsafe { Message::<header::ReplyHeader>::from_buffer_unchecked(buffer) };
                 MessageBag::Reply(msg)
+            },
+            header::Command2::Request => {
+                let msg = unsafe { Message::<header::RequestHeader>::from_buffer_unchecked(buffer) };
+                MessageBag::Request(msg)
             }
             _ => unreachable!(
                 "For now we only support Prepare, Commit, and Reply. In the future we will support more commands. Command2: {command:?}"

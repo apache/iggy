@@ -27,8 +27,9 @@ pub trait MessageBus {
     type Client;
     type Replica;
     type Data;
+    type Sender;
 
-    fn add_client(&mut self, client: Self::Client, sender: SenderKind) -> bool;
+    fn add_client(&mut self, client: Self::Client, sender: Self::Sender) -> bool;
     fn remove_client(&mut self, client: Self::Client) -> bool;
 
     fn add_replica(&mut self, replica: Self::Replica) -> bool;
@@ -48,6 +49,7 @@ pub trait MessageBus {
 }
 
 // TODO: explore generics for Strategy
+#[derive(Debug)]
 pub struct IggyMessageBus {
     clients: HashMap<u128, SenderKind>,
     replicas: ShardedConnections<LeastLoadedStrategy, ConnectionCache>,
@@ -83,8 +85,9 @@ impl MessageBus for IggyMessageBus {
     type Client = u128;
     type Replica = u8;
     type Data = Message<GenericHeader>;
+    type Sender = SenderKind;
 
-    fn add_client(&mut self, client: Self::Client, sender: SenderKind) -> bool {
+    fn add_client(&mut self, client: Self::Client, sender: Self::Sender) -> bool {
         if self.clients.contains_key(&client) {
             return false;
         }
