@@ -112,7 +112,7 @@ compio = { version = "0.17.0", features = [
     "rustls",
 ] }
 compio-io = "0.8.4"
-compio-net = "0.10.0"
+compio-net = "0.11.0"
 compio-quic = "0.6.0"
 compio-tls = { version = "0.8.0", features = [
     "rustls",
