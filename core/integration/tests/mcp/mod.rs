@@ -16,493 +16,580 @@
  * under the License.
  */
 
-use iggy::prelude::{Client, DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME, IggyClient};
-use iggy_binary_protocol::{
-    ConsumerGroupClient, ConsumerOffsetClient, MessageClient, PersonalAccessTokenClient,
-    StreamClient, TopicClient, UserClient,
-};
 use iggy_common::{
-    ClientInfo, ClientInfoDetails, ClusterMetadata, Consumer, ConsumerGroup, ConsumerGroupDetails,
-    ConsumerOffsetInfo, Identifier, IggyExpiry, IggyMessage, MaxTopicSize, Partitioning,
-    PersonalAccessTokenExpiry, PersonalAccessTokenInfo, PolledMessages, RawPersonalAccessToken,
-    Snapshot, Stats, Stream, StreamDetails, Topic, TopicDetails, UserInfo, UserInfoDetails,
-    UserStatus,
+    ClientInfo, ClientInfoDetails, ClusterMetadata, ConsumerGroup, ConsumerGroupDetails,
+    ConsumerOffsetInfo, PersonalAccessTokenExpiry, PersonalAccessTokenInfo, PolledMessages,
+    RawPersonalAccessToken, Snapshot, Stats, Stream, StreamDetails, Topic, TopicDetails, UserInfo,
+    UserInfoDetails,
 };
 use integration::{
-    test_mcp_server::{CONSUMER_NAME, McpClient, TestMcpServer},
-    test_server::{IpAddrKind, TestServer},
+    harness::{McpClient, seeds},
+    iggy_harness,
 };
-use lazy_static::lazy_static;
 use rmcp::{
-    ServiceError,
-    model::{CallToolRequestParams, CallToolResult, ListToolsResult},
+    model::CallToolRequestParams,
     serde::de::DeserializeOwned,
     serde_json::{self, json},
 };
-use serial_test::parallel;
-use std::collections::HashMap;
 
-const STREAM_NAME: &str = "test_stream";
-const TOPIC_NAME: &str = "test_topic";
-const MESSAGE_PAYLOAD: &str = "test_message";
-const CONSUMER_GROUP_NAME: &str = "test_consumer_group";
-const PERSONAL_ACCESS_TOKEN_NAME: &str = "test_personal_access_token";
-const USER_NAME: &str = "test_user";
-const USER_PASSWORD: &str = "secret";
+async fn invoke<T: DeserializeOwned>(
+    client: &McpClient,
+    method: &str,
+    data: Option<serde_json::Value>,
+) -> T {
+    let mut result = client
+        .call_tool(CallToolRequestParams {
+            name: method.to_owned().into(),
+            arguments: data.and_then(|v| v.as_object().cloned()),
+            task: None,
+            meta: None,
+        })
+        .await
+        .unwrap_or_else(|e| panic!("Failed to invoke {method}: {e}"));
 
-lazy_static! {
-    static ref STREAM_ID: Identifier =
-        Identifier::from_str_value(STREAM_NAME).expect("Failed to create stream ID");
-    static ref TOPIC_ID: Identifier =
-        Identifier::from_str_value(TOPIC_NAME).expect("Failed to create topic ID");
-    static ref CONSUMER_GROUP_ID: Identifier =
-        Identifier::from_str_value(CONSUMER_GROUP_NAME).expect("Failed to create group ID");
+    let content = result.content.remove(0);
+    let text = content
+        .as_text()
+        .unwrap_or_else(|| panic!("Expected text response for {method}"));
+    serde_json::from_str(&text.text)
+        .unwrap_or_else(|e| panic!("Failed to parse {method} response: {e}"))
 }
 
-#[tokio::test]
-#[parallel]
-async fn mcp_server_should_list_tools() {
-    let infra = setup().await;
-    let client = infra.mcp_client;
-    let tools = client.list_tools().await.expect("Failed to list tools");
+async fn invoke_empty(client: &McpClient, method: &str, data: Option<serde_json::Value>) {
+    let result = client
+        .call_tool(CallToolRequestParams {
+            name: method.to_owned().into(),
+            arguments: data.and_then(|v| v.as_object().cloned()),
+            task: None,
+            meta: None,
+        })
+        .await
+        .unwrap_or_else(|e| panic!("Failed to invoke {method}: {e}"));
+
+    assert!(!result.is_error.unwrap_or(false), "{method} returned error");
+}
+
+#[iggy_harness(server(mcp))]
+async fn should_list_tools(harness: &TestHarness) {
+    let mcp_client = harness.mcp_client().await.expect("MCP client required");
+    let tools = mcp_client
+        .list_tools(Default::default())
+        .await
+        .expect("Failed to list tools");
 
     assert!(!tools.tools.is_empty());
-    let tools_count = tools.tools.len();
-    assert_eq!(tools_count, 41);
+    assert_eq!(tools.tools.len(), 41);
 }
 
-#[tokio::test]
-#[parallel]
-async fn mcp_server_should_handle_ping() {
-    assert_empty_response("ping", None).await;
+#[iggy_harness(server(mcp))]
+async fn should_handle_ping(harness: &TestHarness) {
+    let mcp_client = harness.mcp_client().await.expect("MCP client required");
+    invoke_empty(&mcp_client, "ping", None).await;
 }
 
-#[tokio::test]
-#[parallel]
-async fn mcp_server_should_return_cluster_metadata() {
-    assert_response::<ClusterMetadata>("get_cluster_metadata", None, |cluster| {
-        assert!(!cluster.name.is_empty());
-        assert_eq!(cluster.nodes.len(), 2);
-    })
-    .await;
+#[iggy_harness(server(cluster.enabled = true, mcp))]
+async fn should_return_cluster_metadata(harness: &TestHarness) {
+    let mcp_client = harness.mcp_client().await.expect("MCP client required");
+    let cluster: ClusterMetadata = invoke(&mcp_client, "get_cluster_metadata", None).await;
+
+    assert!(!cluster.name.is_empty());
+    assert_eq!(cluster.nodes.len(), 2);
 }
 
-#[tokio::test]
-#[parallel]
-async fn mcp_server_should_return_list_of_streams() {
-    assert_response::<Vec<Stream>>("get_streams", None, |streams| {
-        assert_eq!(streams.len(), 1);
-        let stream = &streams[0];
-        assert_eq!(&stream.name, STREAM_NAME);
-        assert_eq!(&stream.topics_count, &1);
-    })
-    .await;
+#[iggy_harness(server(mcp), seed = seeds::mcp_standard)]
+async fn should_return_list_of_streams(harness: &TestHarness) {
+    let mcp_client = harness.mcp_client().await.expect("MCP client required");
+    let streams: Vec<Stream> = invoke(&mcp_client, "get_streams", None).await;
+
+    assert_eq!(streams.len(), 1);
+    assert_eq!(streams[0].name, seeds::names::STREAM);
+    assert_eq!(streams[0].topics_count, 1);
 }
 
-#[tokio::test]
-#[parallel]
-async fn mcp_server_should_return_stream_details() {
-    assert_response::<StreamDetails>(
+#[iggy_harness(server(mcp), seed = seeds::mcp_standard)]
+async fn should_return_stream_details(harness: &TestHarness) {
+    let mcp_client = harness.mcp_client().await.expect("MCP client required");
+    let stream: StreamDetails = invoke(
+        &mcp_client,
         "get_stream",
-        Some(json!({"stream_id": STREAM_NAME})),
-        |stream| {
-            assert_eq!(stream.name, STREAM_NAME);
-            assert_eq!(stream.topics_count, 1);
-            assert_eq!(stream.messages_count, 1);
-        },
+        Some(json!({"stream_id": seeds::names::STREAM})),
     )
     .await;
+
+    assert_eq!(stream.name, seeds::names::STREAM);
+    assert_eq!(stream.topics_count, 1);
+    assert_eq!(stream.messages_count, 1);
 }
 
-#[tokio::test]
-#[parallel]
-async fn mcp_server_should_create_stream() {
+#[iggy_harness(server(mcp))]
+async fn should_create_stream(harness: &TestHarness) {
+    let mcp_client = harness.mcp_client().await.expect("MCP client required");
     let name = "new_stream";
-    assert_response::<StreamDetails>("create_stream", Some(json!({ "name": name})), |stream| {
-        assert_eq!(stream.name, name);
-        assert_eq!(stream.topics_count, 0);
-        assert_eq!(stream.messages_count, 0);
-    })
-    .await;
+    let stream: StreamDetails =
+        invoke(&mcp_client, "create_stream", Some(json!({"name": name}))).await;
+
+    assert_eq!(stream.name, name);
+    assert_eq!(stream.topics_count, 0);
+    assert_eq!(stream.messages_count, 0);
 }
 
-#[tokio::test]
-#[parallel]
-async fn mcp_server_should_update_stream() {
-    let name = "updated_stream";
-    assert_empty_response(
+#[iggy_harness(server(mcp), seed = seeds::mcp_standard)]
+async fn should_update_stream(harness: &TestHarness) {
+    let mcp_client = harness.mcp_client().await.expect("MCP client required");
+    invoke_empty(
+        &mcp_client,
         "update_stream",
-        Some(json!({"stream_id": STREAM_NAME, "name": name})),
+        Some(json!({"stream_id": seeds::names::STREAM, "name": "updated_stream"})),
     )
     .await;
 }
 
-#[tokio::test]
-#[parallel]
-async fn mcp_server_should_delete_stream() {
-    assert_empty_response("delete_stream", Some(json!({"stream_id": STREAM_NAME}))).await;
+#[iggy_harness(server(mcp), seed = seeds::mcp_standard)]
+async fn should_delete_stream(harness: &TestHarness) {
+    let mcp_client = harness.mcp_client().await.expect("MCP client required");
+    invoke_empty(
+        &mcp_client,
+        "delete_stream",
+        Some(json!({"stream_id": seeds::names::STREAM})),
+    )
+    .await;
 }
 
-#[tokio::test]
-#[parallel]
-async fn mcp_server_should_purge_stream() {
-    assert_empty_response("purge_stream", Some(json!({"stream_id": STREAM_NAME}))).await;
+#[iggy_harness(server(mcp), seed = seeds::mcp_standard)]
+async fn should_purge_stream(harness: &TestHarness) {
+    let mcp_client = harness.mcp_client().await.expect("MCP client required");
+    invoke_empty(
+        &mcp_client,
+        "purge_stream",
+        Some(json!({"stream_id": seeds::names::STREAM})),
+    )
+    .await;
 }
 
-#[tokio::test]
-#[parallel]
-async fn mcp_server_should_return_list_of_topics() {
-    assert_response::<Vec<Topic>>(
+#[iggy_harness(server(mcp), seed = seeds::mcp_standard)]
+async fn should_return_list_of_topics(harness: &TestHarness) {
+    let mcp_client = harness.mcp_client().await.expect("MCP client required");
+    let topics: Vec<Topic> = invoke(
+        &mcp_client,
         "get_topics",
-        Some(json!({"stream_id": STREAM_NAME})),
-        |topics| {
-            assert_eq!(topics.len(), 1);
-            let topic = &topics[0];
-            assert_eq!(topic.name, TOPIC_NAME);
-            assert_eq!(topic.partitions_count, 1);
-            assert_eq!(topic.messages_count, 1);
-        },
+        Some(json!({"stream_id": seeds::names::STREAM})),
     )
     .await;
+
+    assert_eq!(topics.len(), 1);
+    assert_eq!(topics[0].name, seeds::names::TOPIC);
+    assert_eq!(topics[0].partitions_count, 1);
+    assert_eq!(topics[0].messages_count, 1);
 }
 
-#[tokio::test]
-#[parallel]
-async fn mcp_server_should_return_topic_details() {
-    assert_response::<TopicDetails>(
+#[iggy_harness(server(mcp), seed = seeds::mcp_standard)]
+async fn should_return_topic_details(harness: &TestHarness) {
+    let mcp_client = harness.mcp_client().await.expect("MCP client required");
+    let topic: TopicDetails = invoke(
+        &mcp_client,
         "get_topic",
-        Some(json!({"stream_id": STREAM_NAME, "topic_id": TOPIC_NAME})),
-        |topic| {
-            assert_eq!(topic.id, 0);
-            assert_eq!(topic.name, TOPIC_NAME);
-            assert_eq!(topic.messages_count, 1);
-        },
+        Some(json!({"stream_id": seeds::names::STREAM, "topic_id": seeds::names::TOPIC})),
     )
     .await;
+
+    assert_eq!(topic.id, 0);
+    assert_eq!(topic.name, seeds::names::TOPIC);
+    assert_eq!(topic.messages_count, 1);
 }
 
-#[tokio::test]
-#[parallel]
-async fn mcp_server_should_create_topic() {
+#[iggy_harness(server(mcp), seed = seeds::mcp_standard)]
+async fn should_create_topic(harness: &TestHarness) {
+    let mcp_client = harness.mcp_client().await.expect("MCP client required");
     let name = "new_topic";
-    assert_response::<TopicDetails>(
+    let topic: TopicDetails = invoke(
+        &mcp_client,
         "create_topic",
-        Some(json!({ "stream_id": STREAM_NAME, "name": name, "partitions_count": 1})),
-        |topic| {
-            assert_eq!(topic.id, 1);
-            assert_eq!(topic.name, name);
-            assert_eq!(topic.partitions_count, 1);
-            assert_eq!(topic.messages_count, 0);
-        },
+        Some(json!({"stream_id": seeds::names::STREAM, "name": name, "partitions_count": 1})),
     )
     .await;
+
+    assert_eq!(topic.id, 1);
+    assert_eq!(topic.name, name);
+    assert_eq!(topic.partitions_count, 1);
+    assert_eq!(topic.messages_count, 0);
 }
 
-#[tokio::test]
-#[parallel]
-async fn mcp_server_should_update_topic() {
-    let name = "updated_topic";
-    assert_empty_response(
+#[iggy_harness(server(mcp), seed = seeds::mcp_standard)]
+async fn should_update_topic(harness: &TestHarness) {
+    let mcp_client = harness.mcp_client().await.expect("MCP client required");
+    invoke_empty(
+        &mcp_client,
         "update_topic",
-        Some(json!({ "stream_id": STREAM_NAME, "topic_id": TOPIC_NAME, "name": name})),
+        Some(json!({
+            "stream_id": seeds::names::STREAM,
+            "topic_id": seeds::names::TOPIC,
+            "name": "updated_topic"
+        })),
     )
     .await;
 }
 
-#[tokio::test]
-#[parallel]
-async fn mcp_server_should_delete_topic() {
-    assert_empty_response(
+#[iggy_harness(server(mcp), seed = seeds::mcp_standard)]
+async fn should_delete_topic(harness: &TestHarness) {
+    let mcp_client = harness.mcp_client().await.expect("MCP client required");
+    invoke_empty(
+        &mcp_client,
         "delete_topic",
-        Some(json!({ "stream_id": STREAM_NAME, "topic_id": TOPIC_NAME })),
+        Some(json!({"stream_id": seeds::names::STREAM, "topic_id": seeds::names::TOPIC})),
     )
     .await;
 }
 
-#[tokio::test]
-#[parallel]
-async fn mcp_server_should_purge_topic() {
-    assert_empty_response(
+#[iggy_harness(server(mcp), seed = seeds::mcp_standard)]
+async fn should_purge_topic(harness: &TestHarness) {
+    let mcp_client = harness.mcp_client().await.expect("MCP client required");
+    invoke_empty(
+        &mcp_client,
         "purge_topic",
-        Some(json!({ "stream_id": STREAM_NAME, "topic_id": TOPIC_NAME })),
+        Some(json!({"stream_id": seeds::names::STREAM, "topic_id": seeds::names::TOPIC})),
     )
     .await;
 }
 
-#[tokio::test]
-#[parallel]
-async fn mcp_server_should_create_partitions() {
-    assert_empty_response(
+#[iggy_harness(server(mcp), seed = seeds::mcp_standard)]
+async fn should_create_partitions(harness: &TestHarness) {
+    let mcp_client = harness.mcp_client().await.expect("MCP client required");
+    invoke_empty(
+        &mcp_client,
         "create_partitions",
-        Some(json!({ "stream_id": STREAM_NAME, "topic_id": TOPIC_NAME, "partitions_count": 3 })),
+        Some(json!({
+            "stream_id": seeds::names::STREAM,
+            "topic_id": seeds::names::TOPIC,
+            "partitions_count": 3
+        })),
     )
     .await;
 }
 
-#[tokio::test]
-#[parallel]
-async fn mcp_server_should_delete_partitions() {
-    assert_empty_response(
+#[iggy_harness(server(mcp), seed = seeds::mcp_standard)]
+async fn should_delete_partitions(harness: &TestHarness) {
+    let mcp_client = harness.mcp_client().await.expect("MCP client required");
+    invoke_empty(
+        &mcp_client,
         "delete_partitions",
-        Some(json!({ "stream_id": STREAM_NAME, "topic_id": TOPIC_NAME, "partitions_count": 1 })),
+        Some(json!({
+            "stream_id": seeds::names::STREAM,
+            "topic_id": seeds::names::TOPIC,
+            "partitions_count": 1
+        })),
     )
     .await;
 }
 
-#[tokio::test]
-#[parallel]
-async fn mcp_server_should_delete_segments() {
-    assert_empty_response(
+#[iggy_harness(server(mcp), seed = seeds::mcp_standard)]
+async fn should_delete_segments(harness: &TestHarness) {
+    let mcp_client = harness.mcp_client().await.expect("MCP client required");
+    invoke_empty(
+        &mcp_client,
         "delete_segments",
-        Some(json!({ "stream_id": STREAM_NAME, "topic_id": TOPIC_NAME, "partition_id": 0, "segments_count": 1 })),
+        Some(json!({
+            "stream_id": seeds::names::STREAM,
+            "topic_id": seeds::names::TOPIC,
+            "partition_id": 0,
+            "segments_count": 1
+        })),
     )
     .await;
 }
 
-#[tokio::test]
-#[parallel]
-async fn mcp_server_should_poll_messages() {
-    assert_response::<PolledMessages>(
+#[iggy_harness(server(mcp), seed = seeds::mcp_standard)]
+async fn should_poll_messages(harness: &TestHarness) {
+    let mcp_client = harness.mcp_client().await.expect("MCP client required");
+    let messages: PolledMessages = invoke(
+        &mcp_client,
         "poll_messages",
-        Some(json!({ "stream_id": STREAM_NAME, "topic_id": TOPIC_NAME, "partition_id": 0, "offset": 0 })),
-        |messages| {
-            assert_eq!(messages.messages.len(), 1);
-            let message = &messages.messages[0];
-            assert_eq!(message.header.offset, 0);
-            let payload = message.payload_as_string().expect("Failed to parse message payload");
-            assert_eq!(payload, MESSAGE_PAYLOAD);
-        },
+        Some(json!({
+            "stream_id": seeds::names::STREAM,
+            "topic_id": seeds::names::TOPIC,
+            "partition_id": 0,
+            "offset": 0
+        })),
     )
     .await;
+
+    assert_eq!(messages.messages.len(), 1);
+    assert_eq!(messages.messages[0].header.offset, 0);
+    let payload = messages.messages[0]
+        .payload_as_string()
+        .expect("Failed to parse payload");
+    assert_eq!(payload, seeds::names::MESSAGE_PAYLOAD);
 }
 
-#[tokio::test]
-#[parallel]
-async fn mcp_server_should_send_messages() {
-    assert_empty_response(
+#[iggy_harness(server(mcp), seed = seeds::mcp_standard)]
+async fn should_send_messages(harness: &TestHarness) {
+    let mcp_client = harness.mcp_client().await.expect("MCP client required");
+    invoke_empty(
+        &mcp_client,
         "send_messages",
-        Some(json!({ "stream_id": STREAM_NAME, "topic_id": TOPIC_NAME, "partition_id": 0, "messages": [
-            {
-                "payload": "test"
-            }
-        ] })),
+        Some(json!({
+            "stream_id": seeds::names::STREAM,
+            "topic_id": seeds::names::TOPIC,
+            "partition_id": 0,
+            "messages": [{"payload": "test"}]
+        })),
     )
     .await;
 }
 
-#[tokio::test]
-#[parallel]
-async fn mcp_server_should_return_stats() {
-    assert_response::<Stats>("get_stats", None, |stats| {
-        assert!(!stats.hostname.is_empty());
-        assert_eq!(stats.messages_count, 1);
-    })
-    .await;
+#[iggy_harness(server(mcp), seed = seeds::mcp_standard)]
+async fn should_return_stats(harness: &TestHarness) {
+    let mcp_client = harness.mcp_client().await.expect("MCP client required");
+    let stats: Stats = invoke(&mcp_client, "get_stats", None).await;
+
+    assert!(!stats.hostname.is_empty());
+    assert_eq!(stats.messages_count, 1);
 }
 
-#[tokio::test]
-#[parallel]
-async fn mcp_server_should_return_me() {
-    assert_response::<ClientInfoDetails>("get_me", None, |client| {
-        assert!(client.client_id > 0);
-    })
-    .await;
+#[iggy_harness(server(mcp))]
+async fn should_return_me(harness: &TestHarness) {
+    let mcp_client = harness.mcp_client().await.expect("MCP client required");
+    let client: ClientInfoDetails = invoke(&mcp_client, "get_me", None).await;
+
+    assert!(client.client_id > 0);
 }
 
-#[tokio::test]
-#[parallel]
-async fn mcp_server_should_return_clients() {
-    assert_response::<Vec<ClientInfo>>("get_clients", None, |clients| {
-        assert!(!clients.is_empty());
-    })
-    .await;
+#[iggy_harness(server(mcp))]
+async fn should_return_clients(harness: &TestHarness) {
+    let mcp_client = harness.mcp_client().await.expect("MCP client required");
+    let clients: Vec<ClientInfo> = invoke(&mcp_client, "get_clients", None).await;
+
+    assert!(!clients.is_empty());
 }
 
-#[tokio::test]
-#[parallel]
-async fn mcp_server_should_handle_snapshot() {
-    assert_response::<Snapshot>("snapshot", None, |snapshot| {
-        assert!(!snapshot.0.is_empty());
-    })
-    .await;
+#[iggy_harness(server(mcp), seed = seeds::mcp_standard)]
+async fn should_handle_snapshot(harness: &TestHarness) {
+    let mcp_client = harness.mcp_client().await.expect("MCP client required");
+    let snapshot: Snapshot = invoke(&mcp_client, "snapshot", None).await;
+
+    assert!(!snapshot.0.is_empty());
 }
 
-#[tokio::test]
-#[parallel]
-async fn mcp_server_should_return_consumer_groups() {
-    assert_response::<Vec<ConsumerGroup>>(
+#[iggy_harness(server(mcp), seed = seeds::mcp_standard)]
+async fn should_return_consumer_groups(harness: &TestHarness) {
+    let mcp_client = harness.mcp_client().await.expect("MCP client required");
+    let groups: Vec<ConsumerGroup> = invoke(
+        &mcp_client,
         "get_consumer_groups",
-        Some(json!({ "stream_id": STREAM_NAME, "topic_id": TOPIC_NAME})),
-        |groups| {
-            assert!(!groups.is_empty());
-        },
+        Some(json!({"stream_id": seeds::names::STREAM, "topic_id": seeds::names::TOPIC})),
     )
     .await;
+
+    assert!(!groups.is_empty());
 }
 
-#[tokio::test]
-#[parallel]
-async fn mcp_server_should_return_consumer_group_details() {
-    assert_response::<ConsumerGroupDetails>("get_consumer_group", Some(json!({ "stream_id": STREAM_NAME, "topic_id": TOPIC_NAME, "group_id": CONSUMER_GROUP_NAME })), |group| {
-        assert_eq!(group.name, CONSUMER_GROUP_NAME);
-        assert_eq!(group.partitions_count, 1);
-        assert_eq!(group.members_count, 0);
-        assert!(group.members.is_empty());
-
-    })
+#[iggy_harness(server(mcp), seed = seeds::mcp_standard)]
+async fn should_return_consumer_group_details(harness: &TestHarness) {
+    let mcp_client = harness.mcp_client().await.expect("MCP client required");
+    let group: ConsumerGroupDetails = invoke(
+        &mcp_client,
+        "get_consumer_group",
+        Some(json!({
+            "stream_id": seeds::names::STREAM,
+            "topic_id": seeds::names::TOPIC,
+            "group_id": seeds::names::CONSUMER_GROUP
+        })),
+    )
     .await;
+
+    assert_eq!(group.name, seeds::names::CONSUMER_GROUP);
+    assert_eq!(group.partitions_count, 1);
+    assert_eq!(group.members_count, 0);
+    assert!(group.members.is_empty());
 }
 
-#[tokio::test]
-#[parallel]
-async fn mcp_server_should_create_consumer_group() {
-    let name = "test";
-    assert_response::<ConsumerGroupDetails>(
+#[iggy_harness(server(mcp), seed = seeds::mcp_standard)]
+async fn should_create_consumer_group(harness: &TestHarness) {
+    let mcp_client = harness.mcp_client().await.expect("MCP client required");
+    let name = "new_group";
+    let group: ConsumerGroupDetails = invoke(
+        &mcp_client,
         "create_consumer_group",
-        Some(json!({ "stream_id": STREAM_NAME, "topic_id": TOPIC_NAME, "name": name })),
-        |group| {
-            assert_eq!(group.name, name);
-            assert_eq!(group.partitions_count, 1);
-            assert_eq!(group.members_count, 0);
-            assert!(group.members.is_empty());
-        },
+        Some(json!({
+            "stream_id": seeds::names::STREAM,
+            "topic_id": seeds::names::TOPIC,
+            "name": name
+        })),
     )
     .await;
+
+    assert_eq!(group.name, name);
+    assert_eq!(group.partitions_count, 1);
+    assert_eq!(group.members_count, 0);
+    assert!(group.members.is_empty());
 }
 
-#[tokio::test]
-#[parallel]
-async fn mcp_server_should_delete_consumer_group() {
-    assert_empty_response(
+#[iggy_harness(server(mcp), seed = seeds::mcp_standard)]
+async fn should_delete_consumer_group(harness: &TestHarness) {
+    let mcp_client = harness.mcp_client().await.expect("MCP client required");
+    invoke_empty(
+        &mcp_client,
         "delete_consumer_group",
-        Some(json!({ "stream_id": STREAM_NAME, "topic_id": TOPIC_NAME, "group_id": CONSUMER_GROUP_NAME })),
+        Some(json!({
+            "stream_id": seeds::names::STREAM,
+            "topic_id": seeds::names::TOPIC,
+            "group_id": seeds::names::CONSUMER_GROUP
+        })),
     )
     .await;
 }
 
-#[tokio::test]
-#[parallel]
-async fn mcp_server_should_return_consumer_offset() {
-    assert_response::<Option<ConsumerOffsetInfo>>(
+#[iggy_harness(server(mcp), seed = seeds::mcp_standard)]
+async fn should_return_consumer_offset(harness: &TestHarness) {
+    let mcp_client = harness.mcp_client().await.expect("MCP client required");
+    let offset: Option<ConsumerOffsetInfo> = invoke(
+        &mcp_client,
         "get_consumer_offset",
-        Some(json!({ "stream_id": STREAM_NAME, "topic_id": TOPIC_NAME, "partition_id": 0 })),
-        |offset| {
-            assert!(offset.is_some());
-            let offset = offset.unwrap();
-            assert_eq!(offset.partition_id, 0);
-            assert_eq!(offset.stored_offset, 0);
-            assert_eq!(offset.current_offset, 0);
-        },
+        Some(json!({
+            "stream_id": seeds::names::STREAM,
+            "topic_id": seeds::names::TOPIC,
+            "partition_id": 0
+        })),
     )
     .await;
+
+    let offset = offset.expect("Expected consumer offset");
+    assert_eq!(offset.partition_id, 0);
+    assert_eq!(offset.stored_offset, 0);
+    assert_eq!(offset.current_offset, 0);
 }
 
-#[tokio::test]
-#[parallel]
-async fn mcp_server_should_store_consumer_offset() {
-    assert_empty_response(
+#[iggy_harness(server(mcp), seed = seeds::mcp_standard)]
+async fn should_store_consumer_offset(harness: &TestHarness) {
+    let mcp_client = harness.mcp_client().await.expect("MCP client required");
+    invoke_empty(
+        &mcp_client,
         "store_consumer_offset",
-        Some(json!({ "stream_id": STREAM_NAME, "topic_id": TOPIC_NAME, "partition_id": 0, "offset": 0 })),
+        Some(json!({
+            "stream_id": seeds::names::STREAM,
+            "topic_id": seeds::names::TOPIC,
+            "partition_id": 0,
+            "offset": 0
+        })),
     )
     .await;
 }
 
-#[tokio::test]
-#[parallel]
-async fn mcp_server_should_delete_consumer_offset() {
-    assert_empty_response(
+#[iggy_harness(server(mcp), seed = seeds::mcp_standard)]
+async fn should_delete_consumer_offset(harness: &TestHarness) {
+    let mcp_client = harness.mcp_client().await.expect("MCP client required");
+    invoke_empty(
+        &mcp_client,
         "delete_consumer_offset",
-        Some(json!({ "stream_id": STREAM_NAME, "topic_id": TOPIC_NAME, "partition_id": 0, "offset": 0 })),
+        Some(json!({
+            "stream_id": seeds::names::STREAM,
+            "topic_id": seeds::names::TOPIC,
+            "partition_id": 0,
+            "offset": 0
+        })),
     )
     .await;
 }
 
-#[tokio::test]
-#[parallel]
-async fn mcp_server_should_return_personal_access_tokens() {
-    assert_response::<Vec<PersonalAccessTokenInfo>>("get_personal_access_tokens", None, |tokens| {
-        assert_eq!(tokens.len(), 1);
-        assert_eq!(tokens[0].name, PERSONAL_ACCESS_TOKEN_NAME);
-    })
-    .await;
+#[iggy_harness(server(mcp), seed = seeds::mcp_standard)]
+async fn should_return_personal_access_tokens(harness: &TestHarness) {
+    let mcp_client = harness.mcp_client().await.expect("MCP client required");
+    let tokens: Vec<PersonalAccessTokenInfo> =
+        invoke(&mcp_client, "get_personal_access_tokens", None).await;
+
+    assert_eq!(tokens.len(), 1);
+    assert_eq!(tokens[0].name, seeds::names::PERSONAL_ACCESS_TOKEN);
 }
 
-#[tokio::test]
-#[parallel]
-async fn mcp_server_should_create_personal_access_token() {
+#[iggy_harness(server(mcp))]
+async fn should_create_personal_access_token(harness: &TestHarness) {
+    let mcp_client = harness.mcp_client().await.expect("MCP client required");
     let name = "test_token";
     let expiry = PersonalAccessTokenExpiry::NeverExpire.to_string();
-    assert_response::<RawPersonalAccessToken>(
+    let token: RawPersonalAccessToken = invoke(
+        &mcp_client,
         "create_personal_access_token",
-        Some(json!({ "name": name, "expiry": expiry  })),
-        |token| {
-            assert!(!token.token.is_empty());
-        },
+        Some(json!({"name": name, "expiry": expiry})),
     )
     .await;
+
+    assert!(!token.token.is_empty());
 }
 
-#[tokio::test]
-#[parallel]
-async fn mcp_server_should_delete_personal_access_token() {
-    assert_empty_response(
+#[iggy_harness(server(mcp), seed = seeds::mcp_standard)]
+async fn should_delete_personal_access_token(harness: &TestHarness) {
+    let mcp_client = harness.mcp_client().await.expect("MCP client required");
+    invoke_empty(
+        &mcp_client,
         "delete_personal_access_token",
-        Some(json!({ "name": PERSONAL_ACCESS_TOKEN_NAME})),
+        Some(json!({"name": seeds::names::PERSONAL_ACCESS_TOKEN})),
     )
     .await;
 }
 
-#[tokio::test]
-#[parallel]
-async fn mcp_server_should_return_users() {
-    assert_response::<Vec<UserInfo>>("get_users", None, |users| {
-        assert_eq!(users.len(), 2);
-    })
-    .await;
+#[iggy_harness(server(mcp), seed = seeds::mcp_standard)]
+async fn should_return_users(harness: &TestHarness) {
+    let mcp_client = harness.mcp_client().await.expect("MCP client required");
+    let users: Vec<UserInfo> = invoke(&mcp_client, "get_users", None).await;
+
+    assert_eq!(users.len(), 2);
 }
 
-#[tokio::test]
-#[parallel]
-async fn mcp_server_should_return_user_details() {
-    assert_response::<UserInfoDetails>("get_user", Some(json!({ "user_id": USER_NAME})), |user| {
-        assert_eq!(user.username, USER_NAME);
-    })
+#[iggy_harness(server(mcp), seed = seeds::mcp_standard)]
+async fn should_return_user_details(harness: &TestHarness) {
+    let mcp_client = harness.mcp_client().await.expect("MCP client required");
+    let user: UserInfoDetails = invoke(
+        &mcp_client,
+        "get_user",
+        Some(json!({"user_id": seeds::names::USER})),
+    )
     .await;
+
+    assert_eq!(user.username, seeds::names::USER);
 }
 
-#[tokio::test]
-#[parallel]
-async fn mcp_server_should_create_user() {
+#[iggy_harness(server(mcp))]
+async fn should_create_user(harness: &TestHarness) {
+    let mcp_client = harness.mcp_client().await.expect("MCP client required");
     let username = "test-mcp-user";
-    assert_response::<UserInfoDetails>(
+    let user: UserInfoDetails = invoke(
+        &mcp_client,
         "create_user",
-        Some(json!({ "username": username, "password": "secret"})),
-        |user| {
-            assert_eq!(user.username, username);
-        },
+        Some(json!({"username": username, "password": "secret"})),
     )
     .await;
+
+    assert_eq!(user.username, username);
 }
 
-#[tokio::test]
-#[parallel]
-async fn mcp_server_should_update_user() {
-    assert_empty_response(
+#[iggy_harness(server(mcp), seed = seeds::mcp_standard)]
+async fn should_update_user(harness: &TestHarness) {
+    let mcp_client = harness.mcp_client().await.expect("MCP client required");
+    invoke_empty(
+        &mcp_client,
         "update_user",
-        Some(json!({ "user_id": USER_NAME, "username": "test-mcp-user", "active": false})),
+        Some(json!({
+            "user_id": seeds::names::USER,
+            "username": "updated-user",
+            "active": false
+        })),
     )
     .await;
 }
 
-#[tokio::test]
-#[parallel]
-async fn mcp_server_should_delete_user() {
-    assert_empty_response("delete_user", Some(json!({ "user_id": USER_NAME}))).await;
+#[iggy_harness(server(mcp), seed = seeds::mcp_standard)]
+async fn should_delete_user(harness: &TestHarness) {
+    let mcp_client = harness.mcp_client().await.expect("MCP client required");
+    invoke_empty(
+        &mcp_client,
+        "delete_user",
+        Some(json!({"user_id": seeds::names::USER})),
+    )
+    .await;
 }
 
-#[tokio::test]
-#[parallel]
-async fn mcp_server_should_update_permissions() {
+#[iggy_harness(server(mcp), seed = seeds::mcp_standard)]
+async fn should_update_permissions(harness: &TestHarness) {
+    let mcp_client = harness.mcp_client().await.expect("MCP client required");
     let permissions = json!({
         "global": {
             "manage_servers": true,
@@ -524,186 +611,25 @@ async fn mcp_server_should_update_permissions() {
         }
     });
 
-    assert_empty_response(
+    invoke_empty(
+        &mcp_client,
         "update_permissions",
-        Some(json!({ "user_id": USER_NAME, "permissions": permissions })),
+        Some(json!({"user_id": seeds::names::USER, "permissions": permissions})),
     )
     .await;
 }
 
-#[tokio::test]
-#[parallel]
-async fn mcp_server_should_change_password() {
-    assert_empty_response(
+#[iggy_harness(server(mcp), seed = seeds::mcp_standard)]
+async fn should_change_password(harness: &TestHarness) {
+    let mcp_client = harness.mcp_client().await.expect("MCP client required");
+    invoke_empty(
+        &mcp_client,
         "change_password",
-        Some(json!({ "user_id": USER_NAME, "current_password": USER_PASSWORD, "new_password": "secret2"})),
+        Some(json!({
+            "user_id": seeds::names::USER,
+            "current_password": seeds::names::USER_PASSWORD,
+            "new_password": "new_secret"
+        })),
     )
     .await;
-}
-
-async fn assert_empty_response(method: &str, data: Option<serde_json::Value>) {
-    assert_response::<()>(method, data, |()| {}).await
-}
-
-async fn assert_response<T: DeserializeOwned>(
-    method: &str,
-    data: Option<serde_json::Value>,
-    assert_response: impl FnOnce(T),
-) {
-    let infra = setup().await;
-    let client = infra.mcp_client;
-    let result = invoke_request(&client, method, data).await;
-    assert_response(result)
-}
-
-async fn invoke_request<T: DeserializeOwned>(
-    client: &TestMcpClient,
-    method: &str,
-    data: Option<serde_json::Value>,
-) -> T {
-    let error_message = format!("Failed to invoke MCP method: {method}",);
-    let mut result = client.invoke(method, data).await.expect(&error_message);
-    let result = result.content.remove(0);
-    let Some(text) = result.as_text() else {
-        panic!("Expected text response for MCP method: {method}");
-    };
-
-    serde_json::from_str::<T>(&text.text).expect("Failed to parse JSON")
-}
-
-async fn setup() -> McpInfra {
-    let mut iggy_envs = HashMap::new();
-    iggy_envs.insert("IGGY_CLUSTER_ENABLED".to_owned(), "true".to_owned());
-    iggy_envs.insert("IGGY_QUIC_ENABLED".to_owned(), "false".to_owned());
-    iggy_envs.insert("IGGY_WEBSOCKET_ENABLED".to_owned(), "false".to_owned());
-    let mut test_server = TestServer::new(Some(iggy_envs), true, None, IpAddrKind::V4);
-    test_server.start();
-    let iggy_server_address = test_server
-        .get_raw_tcp_addr()
-        .expect("Failed to get Iggy TCP address");
-    seed_data(&iggy_server_address).await;
-
-    let mut test_mcp_server = TestMcpServer::with_iggy_address(&iggy_server_address);
-    test_mcp_server.start();
-    test_mcp_server.ensure_started().await;
-    let mcp_client = test_mcp_server.get_client().await;
-
-    McpInfra {
-        _iggy_server: test_server,
-        _mcp_server: test_mcp_server,
-        mcp_client: TestMcpClient { mcp_client },
-    }
-}
-
-async fn seed_data(iggy_server_address: &str) {
-    let iggy_port = iggy_server_address
-        .split(':')
-        .next_back()
-        .unwrap()
-        .parse::<u16>()
-        .unwrap();
-
-    let iggy_client = IggyClient::from_connection_string(&format!(
-        "iggy://{DEFAULT_ROOT_USERNAME}:{DEFAULT_ROOT_PASSWORD}@localhost:{iggy_port}"
-    ))
-    .expect("Failed to create Iggy client");
-
-    iggy_client
-        .connect()
-        .await
-        .expect("Failed to initialize Iggy client");
-
-    iggy_client
-        .create_stream(STREAM_NAME)
-        .await
-        .expect("Failed to create stream");
-
-    iggy_client
-        .create_topic(
-            &STREAM_ID,
-            TOPIC_NAME,
-            1,
-            iggy_common::CompressionAlgorithm::None,
-            None,
-            IggyExpiry::ServerDefault,
-            MaxTopicSize::ServerDefault,
-        )
-        .await
-        .expect("Failed to create topic");
-
-    let mut messages = vec![
-        IggyMessage::builder()
-            .payload(MESSAGE_PAYLOAD.into())
-            .build()
-            .expect("Failed to build message"),
-    ];
-
-    iggy_client
-        .send_messages(
-            &STREAM_ID,
-            &TOPIC_ID,
-            &Partitioning::partition_id(0),
-            &mut messages,
-        )
-        .await
-        .expect("Failed to send messages");
-
-    let consumer =
-        Consumer::new(Identifier::named(CONSUMER_NAME).expect("Failed to create consumer"));
-
-    iggy_client
-        .store_consumer_offset(&consumer, &STREAM_ID, &TOPIC_ID, Some(0), 0)
-        .await
-        .expect("Failed to store consumer offset");
-
-    iggy_client
-        .create_consumer_group(&STREAM_ID, &TOPIC_ID, CONSUMER_GROUP_NAME)
-        .await
-        .expect("Failed to create consumer group");
-
-    iggy_client
-        .create_user(USER_NAME, USER_PASSWORD, UserStatus::Active, None)
-        .await
-        .expect("Failed to create user");
-
-    iggy_client
-        .create_personal_access_token(
-            PERSONAL_ACCESS_TOKEN_NAME,
-            PersonalAccessTokenExpiry::NeverExpire,
-        )
-        .await
-        .expect("Failed to create personal access token");
-}
-
-#[derive(Debug)]
-struct McpInfra {
-    _iggy_server: TestServer,
-    _mcp_server: TestMcpServer,
-    mcp_client: TestMcpClient,
-}
-
-#[derive(Debug)]
-struct TestMcpClient {
-    mcp_client: McpClient,
-}
-
-impl TestMcpClient {
-    pub async fn list_tools(&self) -> Result<ListToolsResult, ServiceError> {
-        self.mcp_client.list_tools(Default::default()).await
-    }
-
-    pub async fn invoke(
-        &self,
-        method: &str,
-        data: Option<serde_json::Value>,
-    ) -> Result<CallToolResult, ServiceError> {
-        self.mcp_client
-            .call_tool(CallToolRequestParams {
-                name: method.to_owned().into(),
-                arguments: data.and_then(|value| value.as_object().cloned()),
-                task: None,
-                meta: None,
-            })
-            .await
-    }
 }

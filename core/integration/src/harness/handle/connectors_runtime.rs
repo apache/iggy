@@ -178,6 +178,12 @@ impl TestBinary for ConnectorsRuntimeHandle {
         })?;
         self.child_handle = Some(child);
 
+        // Release port reservation immediately after spawn to avoid SO_REUSEPORT
+        // load-balancing conflicts during health checks.
+        if let Some(reserver) = self.port_reserver.take() {
+            reserver.release();
+        }
+
         Ok(())
     }
 
@@ -239,9 +245,6 @@ impl IggyServerDependent for ConnectorsRuntimeHandle {
         for retry in 0..common::DEFAULT_HEALTH_CHECK_RETRIES {
             match client.get(&http_address).send().await {
                 Ok(_) => {
-                    if let Some(reserver) = self.port_reserver.take() {
-                        reserver.release();
-                    }
                     return Ok(());
                 }
                 Err(_) => {

@@ -3875,6 +3875,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "harness_derive"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.114",
+]
+
+[[package]]
 name = "hash32"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4612,6 +4621,7 @@ dependencies = [
  "rmcp",
  "serde",
  "serde_json",
+ "socket2 0.6.2",
  "strum",
  "tempfile",
  "thiserror 2.0.18",
@@ -5004,6 +5014,7 @@ dependencies = [
  "env_logger",
  "figment",
  "futures",
+ "harness_derive",
  "humantime",
  "iggy",
  "iggy_binary_protocol",

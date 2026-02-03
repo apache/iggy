@@ -16,33 +16,24 @@
  * under the License.
  */
 
-pub mod bench_utils;
-pub mod file;
-pub mod harness;
-#[allow(deprecated)]
-pub mod http_client;
-#[allow(deprecated)]
-pub mod quic_client;
-#[allow(deprecated)]
-pub mod tcp_client;
-#[allow(deprecated)]
-pub mod websocket_client;
+use iggy::prelude::*;
+use integration::iggy_harness;
 
-#[allow(deprecated)]
-pub mod test_connectors_runtime;
-#[allow(deprecated)]
-pub mod test_mcp_server;
-#[allow(deprecated)]
-pub mod test_server;
-pub mod test_tls_utils;
-
-pub use harness_derive::iggy_harness;
-
-#[doc(hidden)]
-pub mod __macro_support {
-    pub use crate::harness::{
-        ClientConfig, McpClient, McpConfig, TestHarness, TestServerConfig, TlsConfig,
-    };
-    pub use iggy::prelude::ClientWrapper;
-    pub use iggy_common::TransportProtocol;
+#[iggy_harness(cluster_nodes = [3, 5, 7],
+    test_client_transport = [ Tcp, Http, WebSocket, Quic, TcpTlsSelfSigned, TcpTlsGenerated, WebSocketTlsSelfSigned, WebSocketTlsGenerated],
+    server(segment.size = ["1MiB", "2MiB"],
+           segment.cache_indexes = ["open_segment", "all"]))]
+#[ignore]
+async fn should_ping_all_cluster_nodes(harness: TestHarness) {
+    for i in 0..harness.cluster_size() {
+        let client = harness
+            .node(i)
+            .test_client()
+            .unwrap()
+            .with_root_login()
+            .connect()
+            .await
+            .unwrap();
+        client.ping().await.unwrap();
+    }
 }

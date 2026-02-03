@@ -18,12 +18,17 @@
  */
 
 use super::harness::TestHarness;
-use crate::harness::config::{ClientConfig, ConnectorsRuntimeConfig, McpConfig, TestServerConfig};
+use crate::harness::config::{
+    ClientConfig, ConnectorsRuntimeConfig, IpAddrKind, McpConfig, TestServerConfig,
+};
 use crate::harness::context::TestContext;
 use crate::harness::error::TestBinaryError;
 use crate::harness::handle::{ConnectorsRuntimeHandle, McpHandle, ServerHandle};
+use crate::harness::port_reserver::ClusterPortReserver;
 use crate::harness::traits::TestBinary;
+use std::collections::HashMap;
 use std::sync::Arc;
+use uuid::Uuid;
 
 /// Builder for TestHarness with fluent configuration API.
 pub struct TestHarnessBuilder {
@@ -35,6 +40,7 @@ pub struct TestHarnessBuilder {
     primary_client_config: Option<ClientConfig>,
     clients: Vec<ClientConfig>,
     cleanup: bool,
+    cluster_node_count: Option<usize>,
 }
 
 impl Default for TestHarnessBuilder {
@@ -48,6 +54,7 @@ impl Default for TestHarnessBuilder {
             primary_client_config: None,
             clients: Vec::new(),
             cleanup: true,
+            cluster_node_count: None,
         }
     }
 }
@@ -176,15 +183,22 @@ impl TestHarnessBuilder {
         self
     }
 
+    /// Configure a multi-node cluster.
+    ///
+    /// When set, creates N server nodes configured as a cluster.
+    /// The first node starts as leader candidate, others as followers.
+    pub fn cluster_nodes(mut self, count: usize) -> Self {
+        self.cluster_node_count = Some(count);
+        self
+    }
+
     /// Build the TestHarness. Does NOT start any binaries.
     pub fn build(self) -> Result<TestHarness, TestBinaryError> {
         let mut context = TestContext::new(self.test_name, self.cleanup)?;
         context.ensure_created()?;
         let context = Arc::new(context);
 
-        let server = self
-            .server_config
-            .map(|config| ServerHandle::with_config(config, context.clone()));
+        let servers = build_servers(self.server_config, self.cluster_node_count, &context)?;
 
         let mcp = self
             .mcp_config
@@ -196,7 +210,7 @@ impl TestHarnessBuilder {
 
         Ok(TestHarness {
             context,
-            server,
+            servers,
             mcp,
             connectors_runtime,
             clients: Vec::new(),
@@ -206,6 +220,132 @@ impl TestHarnessBuilder {
             started: false,
         })
     }
+}
+
+fn build_servers(
+    server_config: Option<TestServerConfig>,
+    cluster_node_count: Option<usize>,
+    context: &Arc<TestContext>,
+) -> Result<Vec<ServerHandle>, TestBinaryError> {
+    let Some(config) = server_config else {
+        return Ok(Vec::new());
+    };
+
+    let node_count = cluster_node_count.unwrap_or(1);
+
+    if node_count == 1 {
+        return Ok(vec![ServerHandle::with_config(config, context.clone())]);
+    }
+
+    // Multi-node cluster: pre-reserve all ports
+    let cluster_ports = ClusterPortReserver::reserve(node_count, config.ip_kind, &config)?;
+    let all_addrs = cluster_ports.all_addresses();
+    let cluster_name = format!("test-cluster-{}", Uuid::new_v4());
+
+    let mut servers = Vec::with_capacity(node_count);
+    for (i, (addrs, reserver)) in all_addrs
+        .iter()
+        .zip(cluster_ports.into_reservers())
+        .enumerate()
+    {
+        let mut cluster_envs = build_cluster_envs(i, &cluster_name, &all_addrs, config.ip_kind);
+
+        // Inject the pre-reserved port addresses
+        if let Some(tcp) = addrs.tcp {
+            cluster_envs.insert("IGGY_TCP_ADDRESS".to_string(), tcp.to_string());
+        }
+        if let Some(http) = addrs.http {
+            cluster_envs.insert("IGGY_HTTP_ADDRESS".to_string(), http.to_string());
+        }
+        if let Some(quic) = addrs.quic {
+            cluster_envs.insert("IGGY_QUIC_ADDRESS".to_string(), quic.to_string());
+        }
+        if let Some(websocket) = addrs.websocket {
+            cluster_envs.insert("IGGY_WEBSOCKET_ADDRESS".to_string(), websocket.to_string());
+        }
+
+        let mut server = ServerHandle::with_cluster_config(
+            config.clone(),
+            context.clone(),
+            i as u32,
+            cluster_envs,
+        );
+        server.set_port_reserver(reserver);
+        servers.push(server);
+    }
+
+    Ok(servers)
+}
+
+fn build_cluster_envs(
+    node_index: usize,
+    cluster_name: &str,
+    all_addrs: &[crate::harness::port_reserver::ProtocolAddresses],
+    ip_kind: IpAddrKind,
+) -> HashMap<String, String> {
+    let mut envs = HashMap::new();
+
+    let loopback = match ip_kind {
+        IpAddrKind::V4 => "127.0.0.1",
+        IpAddrKind::V6 => "::1",
+    };
+
+    envs.insert("IGGY_CLUSTER_ENABLED".to_string(), "true".to_string());
+    envs.insert("IGGY_CLUSTER_NAME".to_string(), cluster_name.to_string());
+    envs.insert(
+        "IGGY_CLUSTER_NODE_CURRENT_NAME".to_string(),
+        format!("node-{}", node_index),
+    );
+    envs.insert(
+        "IGGY_CLUSTER_NODE_CURRENT_IP".to_string(),
+        loopback.to_string(),
+    );
+
+    // Add other nodes' addresses
+    let mut other_index = 0;
+    for (i, addrs) in all_addrs.iter().enumerate() {
+        if i == node_index {
+            continue;
+        }
+
+        envs.insert(
+            format!("IGGY_CLUSTER_NODE_OTHERS_{other_index}_NAME"),
+            format!("node-{i}"),
+        );
+        envs.insert(
+            format!("IGGY_CLUSTER_NODE_OTHERS_{other_index}_IP"),
+            loopback.to_string(),
+        );
+
+        if let Some(tcp) = addrs.tcp {
+            envs.insert(
+                format!("IGGY_CLUSTER_NODE_OTHERS_{other_index}_PORTS_TCP"),
+                tcp.port().to_string(),
+            );
+        }
+        if let Some(http) = addrs.http {
+            envs.insert(
+                format!("IGGY_CLUSTER_NODE_OTHERS_{other_index}_PORTS_HTTP"),
+                http.port().to_string(),
+            );
+        }
+        if let Some(quic) = addrs.quic {
+            envs.insert(
+                format!("IGGY_CLUSTER_NODE_OTHERS_{other_index}_PORTS_QUIC"),
+                quic.port().to_string(),
+            );
+        }
+        if let Some(websocket) = addrs.websocket {
+            envs.insert(
+                format!("IGGY_CLUSTER_NODE_OTHERS_{other_index}_PORTS_WEBSOCKET"),
+                websocket.port().to_string(),
+            );
+        }
+
+        other_index += 1;
+    }
+
+    envs
 }
 
 #[cfg(test)]
@@ -228,7 +368,7 @@ mod tests {
             .build()
             .unwrap();
 
-        assert!(harness.server.is_some());
+        assert_eq!(harness.servers.len(), 1);
         assert!(!harness.started);
         assert_eq!(harness.client_configs.len(), 1);
     }
@@ -242,7 +382,7 @@ mod tests {
             .build()
             .unwrap();
 
-        assert!(harness.server.is_some());
+        assert_eq!(harness.servers.len(), 1);
         assert!(harness.mcp.is_some());
     }
 
@@ -287,6 +427,6 @@ mod tests {
             .build()
             .unwrap();
 
-        assert!(harness.server.is_some());
+        assert_eq!(harness.servers.len(), 1);
     }
 }

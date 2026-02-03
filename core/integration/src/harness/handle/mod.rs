@@ -18,12 +18,14 @@
  */
 
 mod client;
+mod client_builder;
 pub mod common;
 mod connectors_runtime;
 mod mcp;
 mod server;
 
 pub use client::ClientHandle;
+pub use client_builder::ClientBuilder;
 pub use connectors_runtime::ConnectorsRuntimeHandle;
 pub use mcp::{McpClient, McpHandle};
 pub use server::ServerHandle;

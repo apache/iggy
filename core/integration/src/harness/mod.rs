@@ -60,7 +60,9 @@ pub use config::{
 
 pub use context::{TestContext, get_test_directory};
 pub use error::TestBinaryError;
-pub use handle::{ClientHandle, ConnectorsRuntimeHandle, McpClient, McpHandle, ServerHandle};
+pub use handle::{
+    ClientBuilder, ClientHandle, ConnectorsRuntimeHandle, McpClient, McpHandle, ServerHandle,
+};
 pub use orchestrator::{TestHarness, TestHarnessBuilder, TestLogs};
 pub use traits::{IggyServerDependent, Restartable, TestBinary};
 

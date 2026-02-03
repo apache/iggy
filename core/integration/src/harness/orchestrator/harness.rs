@@ -57,7 +57,7 @@ pub(super) struct TlsSettings {
 /// Orchestrates test binaries and clients for integration tests.
 pub struct TestHarness {
     pub(super) context: Arc<TestContext>,
-    pub(super) server: Option<ServerHandle>,
+    pub(super) servers: Vec<ServerHandle>,
     pub(super) mcp: Option<McpHandle>,
     pub(super) connectors_runtime: Option<ConnectorsRuntimeHandle>,
     pub(super) clients: Vec<ClientHandle>,
@@ -72,7 +72,7 @@ impl std::fmt::Debug for TestHarness {
         f.debug_struct("TestHarness")
             .field("test_name", &self.context.test_name())
             .field("started", &self.started)
-            .field("has_server", &self.server.is_some())
+            .field("server_count", &self.servers.len())
             .field("has_mcp", &self.mcp.is_some())
             .field("has_connectors_runtime", &self.connectors_runtime.is_some())
             .field("client_count", &self.clients.len())
@@ -119,7 +119,7 @@ impl TestHarness {
             return Err(TestBinaryError::AlreadyStarted);
         }
 
-        if let Some(ref mut server) = self.server {
+        for server in &mut self.servers {
             server.start()?;
         }
 
@@ -138,7 +138,7 @@ impl TestHarness {
     }
 
     async fn start_dependents(&mut self) -> Result<(), TestBinaryError> {
-        let tcp_addr = self.server.as_ref().and_then(|s| s.tcp_addr());
+        let tcp_addr = self.servers.first().and_then(|s| s.tcp_addr());
 
         if let Some(ref mut mcp) = self.mcp {
             if let Some(addr) = tcp_addr {
@@ -174,7 +174,7 @@ impl TestHarness {
             mcp.stop()?;
         }
 
-        if let Some(ref mut server) = self.server {
+        for server in self.servers.iter_mut().rev() {
             server.stop()?;
         }
 
@@ -182,17 +182,17 @@ impl TestHarness {
         Ok(())
     }
 
-    /// Restart the server and reconnect all clients.
+    /// Restart the primary server and reconnect all clients.
     pub async fn restart_server(&mut self) -> Result<(), TestBinaryError> {
-        let Some(ref mut server) = self.server else {
+        if self.servers.is_empty() {
             return Err(TestBinaryError::MissingServer);
-        };
+        }
 
         for client in &mut self.clients {
             client.disconnect().await;
         }
 
-        server.restart()?;
+        self.servers[0].restart()?;
 
         self.update_client_addresses();
         for client in &mut self.clients {
@@ -202,14 +202,43 @@ impl TestHarness {
         Ok(())
     }
 
-    /// Get reference to the server handle.
+    /// Get reference to the first (primary) server handle.
     pub fn server(&self) -> &ServerHandle {
-        self.server.as_ref().expect("Server not configured")
+        self.servers.first().expect("No servers configured")
     }
 
-    /// Get mutable reference to the server handle.
+    /// Get mutable reference to the first (primary) server handle.
     pub fn server_mut(&mut self) -> &mut ServerHandle {
-        self.server.as_mut().expect("Server not configured")
+        self.servers.first_mut().expect("No servers configured")
+    }
+
+    /// Get reference to a specific server node by index (for clusters).
+    pub fn node(&self, index: usize) -> &ServerHandle {
+        self.servers.get(index).unwrap_or_else(|| {
+            panic!(
+                "Node {} not configured (cluster has {} nodes)",
+                index,
+                self.servers.len()
+            )
+        })
+    }
+
+    /// Get mutable reference to a specific server node by index (for clusters).
+    pub fn node_mut(&mut self, index: usize) -> &mut ServerHandle {
+        let len = self.servers.len();
+        self.servers
+            .get_mut(index)
+            .unwrap_or_else(|| panic!("Node {} not configured (cluster has {} nodes)", index, len))
+    }
+
+    /// Get reference to all servers.
+    pub fn all_servers(&self) -> &[ServerHandle] {
+        &self.servers
+    }
+
+    /// Get the number of server nodes (1 for single server, N for cluster).
+    pub fn cluster_size(&self) -> usize {
+        self.servers.len()
     }
 
     /// Get the first client (panics if no clients configured).
@@ -258,7 +287,7 @@ impl TestHarness {
     /// Collect logs from all binaries.
     pub fn collect_logs(&self) -> TestLogs {
         TestLogs {
-            server: self.server.as_ref().map(|s| s.collect_logs()),
+            server: self.servers.first().map(|s| s.collect_logs()),
             mcp: self.mcp.as_ref().map(|m| m.collect_logs()),
             connectors_runtime: self.connectors_runtime.as_ref().map(|c| c.collect_logs()),
         }
@@ -266,7 +295,7 @@ impl TestHarness {
 
     /// Get a TCP client factory for creating additional clients.
     pub fn tcp_client_factory(&self) -> Option<TcpClientFactory> {
-        let server = self.server.as_ref()?;
+        let server = self.servers.first()?;
         let addr = server.tcp_addr()?;
         let config = self.find_client_config(TransportProtocol::Tcp);
         let tls = self.extract_tls_settings(config, server);
@@ -283,8 +312,8 @@ impl TestHarness {
 
     /// Get an HTTP client factory for creating additional clients.
     pub fn http_client_factory(&self) -> Option<HttpClientFactory> {
-        self.server
-            .as_ref()
+        self.servers
+            .first()
             .and_then(|s| s.http_addr())
             .map(|addr| HttpClientFactory {
                 server_addr: addr.to_string(),
@@ -293,8 +322,8 @@ impl TestHarness {
 
     /// Get a QUIC client factory for creating additional clients.
     pub fn quic_client_factory(&self) -> Option<QuicClientFactory> {
-        self.server
-            .as_ref()
+        self.servers
+            .first()
             .and_then(|s| s.quic_addr())
             .map(|addr| QuicClientFactory {
                 server_addr: addr.to_string(),
@@ -303,7 +332,7 @@ impl TestHarness {
 
     /// Get a WebSocket client factory for creating additional clients.
     pub fn websocket_client_factory(&self) -> Option<WebSocketClientFactory> {
-        let server = self.server.as_ref()?;
+        let server = self.servers.first()?;
         let addr = server.websocket_addr()?;
         let config = self.find_client_config(TransportProtocol::WebSocket);
         let tls = self.extract_tls_settings(config, server);
@@ -554,7 +583,7 @@ impl TestHarness {
     }
 
     pub(super) async fn create_clients(&mut self) -> Result<(), TestBinaryError> {
-        let Some(ref server) = self.server else {
+        let Some(server) = self.servers.first() else {
             return Ok(());
         };
 
@@ -588,7 +617,7 @@ impl TestHarness {
     }
 
     fn update_client_addresses(&mut self) {
-        let Some(ref server) = self.server else {
+        let Some(server) = self.servers.first() else {
             return;
         };
 
