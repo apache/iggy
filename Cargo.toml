@@ -128,7 +128,7 @@ ctrlc = { version = "3.5", features = ["termination"] }
 cucumber = "0.22"
 cyper = { version = "0.7.1", features = ["rustls"], default-features = false }
 cyper-axum = { version = "0.7.1" }
-darling = "0.20"
+darling = "0.23"
 dashmap = "6.1.0"
 derive-new = "0.7.0"
 derive_builder = "0.20.2"
