@@ -27,4 +27,7 @@
 
     <!-- Allow non-private fields in test code (e.g., @Inject, test base classes) -->
     <suppress checks="VisibilityModifier" files=".*[\\/]src[\\/]test[\\/].*"/>
+
+    <!-- Allow inner types before methods in test code (e.g., test data classes) -->
+    <suppress checks="InnerTypeLast" files=".*[\\/]src[\\/]test[\\/].*"/>
 </suppressions>

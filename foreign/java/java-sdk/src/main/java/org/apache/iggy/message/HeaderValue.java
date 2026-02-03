@@ -19,28 +19,27 @@
 
 package org.apache.iggy.message;
 
-import com.fasterxml.jackson.annotation.JsonCreator;
-import com.fasterxml.jackson.annotation.JsonProperty;
+import org.apache.commons.lang3.StringUtils;
+import org.apache.commons.lang3.builder.EqualsBuilder;
+import org.apache.commons.lang3.builder.HashCodeBuilder;
+import org.apache.iggy.exception.IggyInvalidArgumentException;
 
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
-import java.util.Arrays;
 import java.util.Base64;
 
 public record HeaderValue(HeaderKind kind, byte[] value) {
-    @JsonCreator
-    public static HeaderValue fromJson(
-            @JsonProperty("kind") HeaderKind kind, @JsonProperty("value") String base64Value) {
-        byte[] decodedValue = Base64.getDecoder().decode(base64Value);
-        return new HeaderValue(kind, decodedValue);
-    }
 
-    public static HeaderValue fromString(String val) {
-        if (val.isEmpty() || val.length() > 255) {
-            throw new IllegalArgumentException("Value has incorrect size, must be between 1 and 255");
+    public static HeaderValue fromString(String value) {
+        if (StringUtils.isBlank(value)) {
+            throw new IggyInvalidArgumentException("Value cannot be null or empty");
         }
-        return new HeaderValue(HeaderKind.String, val.getBytes(StandardCharsets.UTF_8));
+        var bytes = value.getBytes(StandardCharsets.UTF_8);
+        if (bytes.length > 255) {
+            throw new IggyInvalidArgumentException("Value has incorrect size, must be between 1 and 255 bytes");
+        }
+        return new HeaderValue(HeaderKind.String, bytes);
     }
 
     public static HeaderValue fromBool(boolean val) {
@@ -71,14 +70,14 @@ public record HeaderValue(HeaderKind kind, byte[] value) {
 
     public static HeaderValue fromUint8(short val) {
         if (val < 0 || val > 255) {
-            throw new IllegalArgumentException("Value must be between 0 and 255");
+            throw new IggyInvalidArgumentException("Value must be between 0 and 255");
         }
         return new HeaderValue(HeaderKind.Uint8, new byte[] {(byte) val});
     }
 
     public static HeaderValue fromUint16(int val) {
         if (val < 0 || val > 65535) {
-            throw new IllegalArgumentException("Value must be between 0 and 65535");
+            throw new IggyInvalidArgumentException("Value must be between 0 and 65535");
         }
         ByteBuffer buffer = ByteBuffer.allocate(2).order(ByteOrder.LITTLE_ENDIAN);
         buffer.putShort((short) val);
@@ -87,7 +86,7 @@ public record HeaderValue(HeaderKind kind, byte[] value) {
 
     public static HeaderValue fromUint32(long val) {
         if (val < 0 || val > 4294967295L) {
-            throw new IllegalArgumentException("Value must be between 0 and 4294967295");
+            throw new IggyInvalidArgumentException("Value must be between 0 and 4294967295");
         }
         ByteBuffer buffer = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN);
         buffer.putInt((int) val);
@@ -108,90 +107,95 @@ public record HeaderValue(HeaderKind kind, byte[] value) {
 
     public static HeaderValue fromRaw(byte[] val) {
         if (val.length == 0 || val.length > 255) {
-            throw new IllegalArgumentException("Value has incorrect size, must be between 1 and 255");
+            throw new IggyInvalidArgumentException("Value has incorrect size, must be between 1 and 255 bytes");
         }
         return new HeaderValue(HeaderKind.Raw, val);
     }
 
     public String asString() {
         if (kind != HeaderKind.String) {
-            throw new IllegalStateException("Header value is not a string, kind: " + kind);
+            throw new IggyInvalidArgumentException("Header value is not a string, kind: " + kind);
         }
         return new String(value, StandardCharsets.UTF_8);
     }
 
     public boolean asBool() {
         if (kind != HeaderKind.Bool) {
-            throw new IllegalStateException("Header value is not a bool, kind: " + kind);
+            throw new IggyInvalidArgumentException("Header value is not a bool, kind: " + kind);
         }
         return value[0] == 1;
     }
 
     public byte asInt8() {
         if (kind != HeaderKind.Int8) {
-            throw new IllegalStateException("Header value is not an int8, kind: " + kind);
+            throw new IggyInvalidArgumentException("Header value is not an int8, kind: " + kind);
         }
         return value[0];
     }
 
     public short asInt16() {
         if (kind != HeaderKind.Int16) {
-            throw new IllegalStateException("Header value is not an int16, kind: " + kind);
+            throw new IggyInvalidArgumentException("Header value is not an int16, kind: " + kind);
         }
         return ByteBuffer.wrap(value).order(ByteOrder.LITTLE_ENDIAN).getShort();
     }
 
     public int asInt32() {
         if (kind != HeaderKind.Int32) {
-            throw new IllegalStateException("Header value is not an int32, kind: " + kind);
+            throw new IggyInvalidArgumentException("Header value is not an int32, kind: " + kind);
         }
         return ByteBuffer.wrap(value).order(ByteOrder.LITTLE_ENDIAN).getInt();
     }
 
     public long asInt64() {
         if (kind != HeaderKind.Int64) {
-            throw new IllegalStateException("Header value is not an int64, kind: " + kind);
+            throw new IggyInvalidArgumentException("Header value is not an int64, kind: " + kind);
         }
         return ByteBuffer.wrap(value).order(ByteOrder.LITTLE_ENDIAN).getLong();
     }
 
     public short asUint8() {
         if (kind != HeaderKind.Uint8) {
-            throw new IllegalStateException("Header value is not a uint8, kind: " + kind);
+            throw new IggyInvalidArgumentException("Header value is not a uint8, kind: " + kind);
         }
         return (short) (value[0] & 0xFF);
     }
 
     public int asUint16() {
         if (kind != HeaderKind.Uint16) {
-            throw new IllegalStateException("Header value is not a uint16, kind: " + kind);
+            throw new IggyInvalidArgumentException("Header value is not a uint16, kind: " + kind);
         }
         return (ByteBuffer.wrap(value).order(ByteOrder.LITTLE_ENDIAN).getShort() & 0xFFFF);
     }
 
     public long asUint32() {
         if (kind != HeaderKind.Uint32) {
-            throw new IllegalStateException("Header value is not a uint32, kind: " + kind);
+            throw new IggyInvalidArgumentException("Header value is not a uint32, kind: " + kind);
         }
         return (ByteBuffer.wrap(value).order(ByteOrder.LITTLE_ENDIAN).getInt() & 0xFFFFFFFFL);
     }
 
     public float asFloat32() {
         if (kind != HeaderKind.Float32) {
-            throw new IllegalStateException("Header value is not a float32, kind: " + kind);
+            throw new IggyInvalidArgumentException("Header value is not a float32, kind: " + kind);
         }
         return ByteBuffer.wrap(value).order(ByteOrder.LITTLE_ENDIAN).getFloat();
     }
 
     public double asFloat64() {
         if (kind != HeaderKind.Float64) {
-            throw new IllegalStateException("Header value is not a float64, kind: " + kind);
+            throw new IggyInvalidArgumentException("Header value is not a float64, kind: " + kind);
         }
         return ByteBuffer.wrap(value).order(ByteOrder.LITTLE_ENDIAN).getDouble();
     }
 
     public byte[] asRaw() {
         return value;
+    }
+
+    @Override
+    public String toString() {
+        return toStringValue();
     }
 
     @Override
@@ -203,19 +207,15 @@ public record HeaderValue(HeaderKind kind, byte[] value) {
             return false;
         }
         HeaderValue that = (HeaderValue) o;
-        return kind == that.kind && Arrays.equals(value, that.value);
+        return new EqualsBuilder()
+                .append(value, that.value)
+                .append(kind, that.kind)
+                .isEquals();
     }
 
     @Override
     public int hashCode() {
-        int result = kind.hashCode();
-        result = 31 * result + Arrays.hashCode(value);
-        return result;
-    }
-
-    @Override
-    public String toString() {
-        return toStringValue();
+        return new HashCodeBuilder(17, 37).append(kind).append(value).toHashCode();
     }
 
     private String toStringValue() {

@@ -22,6 +22,7 @@ use crate::manager::status::ConnectorStatus;
 use crate::metrics::ConnectorType;
 use iggy_common::{IggyTimestamp, SemanticVersion};
 use serde::Serialize;
+use std::str::FromStr;
 use std::sync::Arc;
 use sysinfo::System;
 
@@ -52,6 +53,9 @@ pub struct ConnectorStats {
     pub key: String,
     pub name: String,
     pub connector_type: String,
+    pub version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version_semver: Option<u32>,
     pub status: ConnectorStatus,
     pub enabled: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -95,10 +99,15 @@ pub async fn get_runtime_stats(context: &Arc<RuntimeContext>) -> ConnectorRuntim
 
     let mut connectors = Vec::with_capacity(sources.len() + sinks.len());
     for source in &sources {
+        let version_semver = SemanticVersion::from_str(&source.version)
+            .ok()
+            .and_then(|v| v.get_numeric_version().ok());
         connectors.push(ConnectorStats {
             key: source.key.clone(),
             name: source.name.clone(),
             connector_type: "source".to_owned(),
+            version: source.version.clone(),
+            version_semver,
             status: source.status,
             enabled: source.enabled,
             messages_produced: Some(context.metrics.get_messages_produced(&source.key)),
@@ -111,10 +120,15 @@ pub async fn get_runtime_stats(context: &Arc<RuntimeContext>) -> ConnectorRuntim
         });
     }
     for sink in &sinks {
+        let version_semver = SemanticVersion::from_str(&sink.version)
+            .ok()
+            .and_then(|v| v.get_numeric_version().ok());
         connectors.push(ConnectorStats {
             key: sink.key.clone(),
             name: sink.name.clone(),
             connector_type: "sink".to_owned(),
+            version: sink.version.clone(),
+            version_semver,
             status: sink.status,
             enabled: sink.enabled,
             messages_produced: None,

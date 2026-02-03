@@ -93,6 +93,7 @@ fn map_sinks(
                     key: sink_plugin.key.to_owned(),
                     name: sink_plugin.name.to_owned(),
                     path: sink_plugin.path.to_owned(),
+                    version: sink_plugin.version.to_owned(),
                     enabled: sink_config.enabled,
                     status,
                     last_error: sink_plugin
@@ -134,6 +135,7 @@ fn map_sources(
                     key: source_plugin.key.to_owned(),
                     name: source_plugin.name.to_owned(),
                     path: source_plugin.path.to_owned(),
+                    version: source_plugin.version.to_owned(),
                     enabled: source_config.enabled,
                     status,
                     last_error: source_plugin

@@ -19,39 +19,23 @@
 
 package org.apache.iggy.message;
 
-import com.fasterxml.jackson.annotation.JsonProperty;
 import org.apache.iggy.exception.IggyInvalidArgumentException;
 
 public enum HeaderKind {
-    @JsonProperty("raw")
     Raw(1),
-    @JsonProperty("string")
     String(2),
-    @JsonProperty("bool")
     Bool(3),
-    @JsonProperty("int8")
     Int8(4),
-    @JsonProperty("int16")
     Int16(5),
-    @JsonProperty("int32")
     Int32(6),
-    @JsonProperty("int64")
     Int64(7),
-    @JsonProperty("int128")
     Int128(8),
-    @JsonProperty("uint8")
     Uint8(9),
-    @JsonProperty("uint16")
     Uint16(10),
-    @JsonProperty("uint32")
     Uint32(11),
-    @JsonProperty("uint64")
     Uint64(12),
-    @JsonProperty("uint128")
     Uint128(13),
-    @JsonProperty("float32")
     Float32(14),
-    @JsonProperty("float64")
     Float64(15);
 
     private final int code;

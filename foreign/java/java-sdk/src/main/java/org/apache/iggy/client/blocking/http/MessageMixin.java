@@ -17,28 +17,30 @@
  * under the License.
  */
 
-package org.apache.iggy.serde;
+package org.apache.iggy.client.blocking.http;
 
+import com.fasterxml.jackson.annotation.JsonCreator;
+import org.apache.iggy.exception.IggyOperationNotSupportedException;
 import org.apache.iggy.message.HeaderEntry;
 import org.apache.iggy.message.HeaderKey;
 import org.apache.iggy.message.HeaderValue;
-import tools.jackson.core.JacksonException;
-import tools.jackson.core.JsonGenerator;
-import tools.jackson.databind.SerializationContext;
-import tools.jackson.databind.ValueSerializer;
+import org.apache.iggy.message.Message;
+import org.apache.iggy.message.MessageHeader;
+import tools.jackson.databind.annotation.JsonSerialize;
 
+import java.util.List;
 import java.util.Map;
 
-public class UserHeadersSerializer extends ValueSerializer<Map<HeaderKey, HeaderValue>> {
+/**
+ * Jackson mixin for {@link Message} to keep the domain object free of serialization annotations.
+ */
+abstract class MessageMixin {
 
-    @Override
-    public void serialize(Map<HeaderKey, HeaderValue> headers, JsonGenerator gen, SerializationContext ctxt)
-            throws JacksonException {
-        gen.writeStartArray();
-        for (Map.Entry<HeaderKey, HeaderValue> entry : headers.entrySet()) {
-            ctxt.findValueSerializer(HeaderEntry.class)
-                    .serialize(new HeaderEntry(entry.getKey(), entry.getValue()), gen, ctxt);
-        }
-        gen.writeEndArray();
+    @JsonCreator
+    static Message of(MessageHeader header, byte[] payload, List<HeaderEntry> userHeaders) {
+        throw new IggyOperationNotSupportedException("Mixin method should not be called directly");
     }
+
+    @JsonSerialize(using = UserHeadersSerializer.class)
+    abstract Map<HeaderKey, HeaderValue> userHeaders();
 }
