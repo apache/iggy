@@ -24,9 +24,8 @@ use super::container::{
     ENV_SINK_STREAMS_0_TOPICS, ENV_SINK_TARGET_TABLE, PostgresContainer, PostgresOps,
     SinkPayloadFormat, SinkSchema,
 };
-use crate::harness::error::TestBinaryError;
-use crate::harness::fixtures::TestFixture;
 use async_trait::async_trait;
+use integration::harness::{TestBinaryError, TestFixture};
 use sqlx::{Pool, Postgres};
 use std::collections::HashMap;
 use std::time::Duration;

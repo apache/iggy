@@ -17,20 +17,14 @@
  * under the License.
  */
 
-use super::TestFixture;
-use crate::harness::error::TestBinaryError;
-use async_trait::async_trait;
-use std::collections::HashMap;
+mod postgres;
+mod quickwit;
+mod wiremock;
 
-pub struct RandomSourceFixture;
-
-#[async_trait]
-impl TestFixture for RandomSourceFixture {
-    async fn setup() -> Result<Self, TestBinaryError> {
-        Ok(Self)
-    }
-
-    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
-        HashMap::new()
-    }
-}
+pub use postgres::{
+    PostgresOps, PostgresSinkByteaFixture, PostgresSinkFixture, PostgresSinkJsonFixture,
+    PostgresSourceByteaFixture, PostgresSourceDeleteFixture, PostgresSourceJsonFixture,
+    PostgresSourceJsonbFixture, PostgresSourceMarkFixture, PostgresSourceOps,
+};
+pub use quickwit::{QuickwitFixture, QuickwitOps, QuickwitPreCreatedFixture};
+pub use wiremock::{WireMockDirectFixture, WireMockWrappedFixture};

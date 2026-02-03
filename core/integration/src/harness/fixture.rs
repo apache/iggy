@@ -17,19 +17,6 @@
  * under the License.
  */
 
-mod postgres;
-mod random;
-mod wiremock;
-
-pub use postgres::{
-    PostgresContainer, PostgresSinkByteaFixture, PostgresSinkFixture, PostgresSinkJsonFixture,
-    PostgresSourceByteaFixture, PostgresSourceDeleteFixture, PostgresSourceFixture,
-    PostgresSourceJsonFixture, PostgresSourceJsonbFixture, PostgresSourceMarkFixture,
-    SinkPayloadFormat, SinkSchema,
-};
-pub use random::RandomSourceFixture;
-pub use wiremock::{WireMockDirectFixture, WireMockWrappedFixture};
-
 use crate::harness::error::TestBinaryError;
 use crate::harness::seeds::SeedError;
 use async_trait::async_trait;

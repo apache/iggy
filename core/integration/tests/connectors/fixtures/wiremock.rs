@@ -17,9 +17,8 @@
  * under the License.
  */
 
-use super::TestFixture;
-use crate::harness::error::TestBinaryError;
 use async_trait::async_trait;
+use integration::harness::{TestBinaryError, TestFixture};
 use std::collections::HashMap;
 use testcontainers_modules::testcontainers::core::WaitFor::Healthcheck;
 use testcontainers_modules::testcontainers::core::wait::HealthWaitStrategy;
@@ -98,12 +97,6 @@ pub struct WireMockDirectFixture {
     container: WireMockContainer,
 }
 
-impl WireMockDirectFixture {
-    pub fn base_url(&self) -> &str {
-        &self.container.base_url
-    }
-}
-
 #[async_trait]
 impl TestFixture for WireMockDirectFixture {
     async fn setup() -> Result<Self, TestBinaryError> {
@@ -124,12 +117,6 @@ impl TestFixture for WireMockDirectFixture {
 /// WireMock fixture for "wrapped" response format tests.
 pub struct WireMockWrappedFixture {
     container: WireMockContainer,
-}
-
-impl WireMockWrappedFixture {
-    pub fn base_url(&self) -> &str {
-        &self.container.base_url
-    }
 }
 
 #[async_trait]

@@ -45,6 +45,7 @@ const MCP_HEALTH_CHECK_RETRIES: u32 = common::DEFAULT_HEALTH_CHECK_RETRIES * 3;
 pub type McpClient = RunningService<RoleClient, InitializeRequestParams>;
 
 pub struct McpHandle {
+    server_id: u32,
     config: McpConfig,
     context: Arc<TestContext>,
     envs: HashMap<String, String>,
@@ -135,14 +136,13 @@ impl McpHandle {
     }
 }
 
-impl TestBinary for McpHandle {
-    type Config = McpConfig;
-
-    fn with_config(config: Self::Config, context: Arc<TestContext>) -> Self {
+impl McpHandle {
+    pub fn with_server_id(config: McpConfig, context: Arc<TestContext>, server_id: u32) -> Self {
         let reserver = SinglePortReserver::new().expect("Failed to reserve port for MCP server");
         let server_address = reserver.address();
 
         Self {
+            server_id,
             config,
             context,
             envs: HashMap::new(),
@@ -153,6 +153,14 @@ impl TestBinary for McpHandle {
             stderr_path: None,
             port_reserver: Some(reserver),
         }
+    }
+}
+
+impl TestBinary for McpHandle {
+    type Config = McpConfig;
+
+    fn with_config(config: Self::Config, context: Arc<TestContext>) -> Self {
+        Self::with_server_id(config, context, 0)
     }
 
     #[allow(deprecated)]
@@ -177,8 +185,8 @@ impl TestBinary for McpHandle {
             command.stdout(Stdio::inherit());
             command.stderr(Stdio::inherit());
         } else {
-            let stdout_path = self.context.mcp_stdout_path();
-            let stderr_path = self.context.mcp_stderr_path();
+            let stdout_path = self.context.mcp_stdout_path(self.server_id);
+            let stderr_path = self.context.mcp_stderr_path(self.server_id);
 
             let stdout_file =
                 File::create(&stdout_path).map_err(|e| TestBinaryError::FileSystemError {
