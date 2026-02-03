@@ -265,8 +265,9 @@ class IggyClient:
         name: builtins.str,
         partitions_count: builtins.int,
         compression_algorithm: typing.Optional[builtins.str] = None,
-        topic_id: typing.Optional[builtins.int] = None,
         replication_factor: typing.Optional[builtins.int] = None,
+        message_expiry: typing.Optional[datetime.timedelta] = None,
+        max_topic_size: typing.Optional[builtins.int] = None,
     ) -> collections.abc.Awaitable[None]:
         r"""
         Creates a new topic with the given parameters.

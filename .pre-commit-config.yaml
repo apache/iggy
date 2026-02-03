@@ -27,6 +27,16 @@ repos:
         exclude: ^helm/charts/.*/templates/
       - id: mixed-line-ending
 
+  # Python SDK formatting
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.0
+    hooks:
+      - id: ruff-check
+        args: [--fix]
+        files: ^foreign/python/.*\.(py|pyi)$
+      - id: ruff-format
+        files: ^foreign/python/.*\.(py|pyi)$
+
   # CI scripts
   - repo: local
     hooks:
@@ -67,6 +77,14 @@ repos:
         args: ["--fix"]
         language: system
         files: ^rust-toolchain\.toml$
+        pass_filenames: false
+
+      - id: python-version-sync
+        name: python sdk version sync
+        entry: ./scripts/ci/python-version-sync.sh
+        args: ["--fix"]
+        language: system
+        files: ^foreign/python/(Cargo\.toml|pyproject\.toml)$
         pass_filenames: false
 
       - id: trailing-whitespace

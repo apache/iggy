@@ -17,7 +17,7 @@
 
 [package]
 name = "apache-iggy"
-version = "0.6.3-dev1"
+version = "0.6.4-dev1"
 edition = "2021"
 authors = [
     "Dario Lencina Talarico <darioalessandrolencina@gmail.com>",
