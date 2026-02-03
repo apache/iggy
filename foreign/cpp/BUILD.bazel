@@ -1,0 +1,119 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+licenses(["notice"])
+
+load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_import", "cc_library")
+
+genrule(
+    name = "cargo_build",
+    srcs = glob([
+        "src/**/*.rs",
+        "Cargo.toml",
+        "Cargo.lock",
+        "build.rs",
+    ]),
+    tools = [
+        "@rules_rust//tools/upstream_wrapper:cargo",
+    ],
+    outs = [
+        "libiggy_cpp.a",
+        "include/lib.rs.h",
+        "cxxbridge/rust/cxx.h",
+    ],
+    cmd = """
+        set -e
+
+        # 1. Resolve absolute paths for tools and Bazel outputs
+        CARGO="$$(pwd)/$(execpath @rules_rust//tools/upstream_wrapper:cargo)"
+        OUT_LIB="$$(pwd)/$(location libiggy_cpp.a)"
+        OUT_RS="$$(pwd)/$(location include/lib.rs.h)"
+        OUT_CXX="$$(pwd)/$(location cxxbridge/rust/cxx.h)"
+
+        # 2. Switch to the real project directory (foreign/cpp)
+        PROJECT_ROOT="$$(dirname $$(readlink -f $(location Cargo.toml)))"
+        cd "$$PROJECT_ROOT"
+
+        # 3. Configure build profile
+        PROFILE="debug"
+        FLAGS=""
+        if [ "$(COMPILATION_MODE)" = "opt" ]; then
+            PROFILE="release"
+            FLAGS="--release"
+        fi
+
+        # 4. Build: Output to local 'target/' dir (foreign/cpp/target)
+        env -u PWD CARGO_TARGET_DIR="target" "$$CARGO" build $$FLAGS
+
+        # 5. Copy artifacts to Bazel outputs
+        # Note: cxx-build hides headers in hash-based subdirectories
+        cp "target/$$PROFILE/libiggy_cpp.a" "$$OUT_LIB"
+        find "target/$$PROFILE/build" -name lib.rs.h | head -n 1 | xargs -I{} cp {} "$$OUT_RS"
+        find "target/$$PROFILE/build" -name cxx.h    | head -n 1 | xargs -I{} cp {} "$$OUT_CXX"
+    """,
+    local = 1,
+)
+
+cc_import(
+    name = "iggy-cpp-static",
+    static_library = "libiggy_cpp.a",
+)
+
+cc_library(
+    name = "iggy-cpp",
+    srcs = [
+        "src/client.cpp",
+        "src/identifier.cpp",
+        "src/message.cpp",
+        "src/stream_details.cpp",
+        "src/topic_details.cpp",
+    ],
+    hdrs = [
+        "include/iggy.hpp",
+        "include/lib.rs.h",
+        "cxxbridge/rust/cxx.h",
+    ],
+    includes = [
+        "cxxbridge",
+        "include",
+        "src",
+    ],
+    linkopts = [
+        "-ldl",
+        "-lpthread",
+    ] + select({
+        "@platforms//os:macos": [
+            "-framework", "CoreFoundation",
+            "-framework", "Security",
+        ],
+        "//conditions:default": [],
+    }),
+    deps = [
+        ":cargo_build",
+        ":iggy-cpp-static",
+        "@abseil-cpp//absl/numeric:int128",
+    ],
+)
+
+cc_binary(
+    name = "example",
+    srcs = ["examples/example.cpp"],
+    deps = [
+        ":iggy-cpp",
+        "@abseil-cpp//absl/strings:strings",
+    ],
+)
