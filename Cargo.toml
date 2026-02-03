@@ -169,7 +169,7 @@ iggy_connector_sdk = { path = "core/connectors/sdk", version = "0.1.3-edge.1" }
 integration = { path = "core/integration" }
 journal = { path = "core/journal" }
 js-sys = "0.3"
-jsonwebtoken = { version = "10.2.0", features = ["rust_crypto"] }
+jsonwebtoken = { version = "10.3.0", features = ["rust_crypto"] }
 keyring = { version = "3.6.3", features = ["sync-secret-service", "vendored"] }
 lazy_static = "1.5.0"
 left-right = "0.11"
