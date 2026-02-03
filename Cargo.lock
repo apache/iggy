@@ -1695,15 +1695,15 @@ version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a8a7cc183295c36483f1c9616f43c4ac1a9030ce6d9321d6cebb4c4bb21164c4"
 dependencies = [
- "compio-buf",
- "compio-driver",
+ "compio-buf 0.7.2",
+ "compio-driver 0.10.0",
  "compio-fs",
- "compio-io",
+ "compio-io 0.8.4",
  "compio-log",
  "compio-macros",
- "compio-net",
- "compio-quic",
- "compio-runtime",
+ "compio-net 0.10.0",
+ "compio-quic 0.6.0",
+ "compio-runtime 0.10.1",
  "compio-tls",
  "compio-ws",
 ]
@@ -1720,6 +1720,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "compio-buf"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3e8777c3ad31ab42f8a3a4a1bd629b78f688371df9b0f528d94dfbdbe5c945c9"
+dependencies = [
+ "arrayvec",
+ "bytes",
+ "libc",
+]
+
+[[package]]
 name = "compio-driver"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1727,7 +1738,7 @@ checksum = "ff5c12800e82a01d12046ccc29b014e1cbbb2fbe38c52534e0d40d4fc58881d5"
 dependencies = [
  "cfg-if",
  "cfg_aliases",
- "compio-buf",
+ "compio-buf 0.7.2",
  "compio-log",
  "crossbeam-queue",
  "flume 0.11.1",
@@ -1744,6 +1755,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "compio-driver"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "042d449def75fb78af58e53e865dd1343c36255294466e0abd5464b70a525be4"
+dependencies = [
+ "cfg-if",
+ "cfg_aliases",
+ "compio-buf 0.8.0",
+ "compio-log",
+ "crossbeam-queue",
+ "flume 0.12.0",
+ "futures-util",
+ "libc",
+ "once_cell",
+ "paste",
+ "pin-project-lite",
+ "polling",
+ "smallvec",
+ "socket2 0.6.2",
+ "synchrony",
+ "thin-cell",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "compio-fs"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1751,10 +1787,10 @@ checksum = "c568022f90c2e2e8ea7ff4c4e8fde500753b5b9b6b6d870e25b5e656f9ea2892"
 dependencies = [
  "cfg-if",
  "cfg_aliases",
- "compio-buf",
- "compio-driver",
- "compio-io",
- "compio-runtime",
+ "compio-buf 0.7.2",
+ "compio-driver 0.10.0",
+ "compio-io 0.8.4",
+ "compio-runtime 0.10.1",
  "libc",
  "os_pipe",
  "widestring",
@@ -1767,9 +1803,21 @@ version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d1e64c6d723589492a4f5041394301e9903466a606f6d9bcc11e406f9f07e9ec"
 dependencies = [
- "compio-buf",
+ "compio-buf 0.7.2",
  "futures-util",
  "paste",
+]
+
+[[package]]
+name = "compio-io"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b914ea4883d9a5b44b328c04e4d23011f043228b0282d1e4b9100ce6507594cc"
+dependencies = [
+ "compio-buf 0.8.0",
+ "futures-util",
+ "paste",
+ "synchrony",
 ]
 
 [[package]]
@@ -1800,10 +1848,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bffab78b8a876111ca76450912ca6a5a164b0dd93973e342c5f438a6f478c735"
 dependencies = [
  "cfg-if",
- "compio-buf",
- "compio-driver",
- "compio-io",
- "compio-runtime",
+ "compio-buf 0.7.2",
+ "compio-driver 0.10.0",
+ "compio-io 0.8.4",
+ "compio-runtime 0.10.1",
+ "either",
+ "libc",
+ "once_cell",
+ "socket2 0.6.2",
+ "widestring",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "compio-net"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "14cdcd182c89864d05e522ea4f7a4a662675a636ac6e8c129565325e445032e6"
+dependencies = [
+ "cfg-if",
+ "compio-buf 0.8.0",
+ "compio-driver 0.11.1",
+ "compio-io 0.9.0",
+ "compio-runtime 0.11.0",
  "either",
  "libc",
  "once_cell",
@@ -1819,17 +1886,40 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "53e101b05fe8608ce6fb2882ac331e211f2b0318449ae27c576c7456b4f1ec4e"
 dependencies = [
  "cfg_aliases",
- "compio-buf",
- "compio-io",
+ "compio-buf 0.7.2",
+ "compio-io 0.8.4",
  "compio-log",
- "compio-net",
- "compio-runtime",
+ "compio-net 0.10.0",
+ "compio-runtime 0.10.1",
  "flume 0.11.1",
  "futures-util",
  "libc",
  "quinn-proto",
  "rustc-hash",
  "rustls",
+ "thiserror 2.0.18",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "compio-quic"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "256df80066ad4901c54a3d3e495df4e10384cb911b3e98d61f8275aba48321f9"
+dependencies = [
+ "cfg_aliases",
+ "compio-buf 0.8.0",
+ "compio-io 0.9.0",
+ "compio-log",
+ "compio-net 0.11.0",
+ "compio-runtime 0.11.0",
+ "flume 0.12.0",
+ "futures-util",
+ "libc",
+ "quinn-proto",
+ "rustc-hash",
+ "rustls",
+ "synchrony",
  "thiserror 2.0.18",
  "windows-sys 0.61.2",
 ]
@@ -1842,8 +1932,31 @@ checksum = "83fd890a129a8086af857bbe18401689c130aa6ccfc7f3c029a7800f7256af3e"
 dependencies = [
  "async-task",
  "cfg-if",
- "compio-buf",
- "compio-driver",
+ "compio-buf 0.7.2",
+ "compio-driver 0.10.0",
+ "compio-log",
+ "core_affinity",
+ "crossbeam-queue",
+ "futures-util",
+ "libc",
+ "once_cell",
+ "pin-project-lite",
+ "scoped-tls",
+ "slab",
+ "socket2 0.6.2",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "compio-runtime"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d6c1c71f011bdd9c8f30e97d877b606505ee6d241c7782cfaed172f66acbd9cd"
+dependencies = [
+ "async-task",
+ "cfg-if",
+ "compio-buf 0.8.0",
+ "compio-driver 0.11.1",
  "compio-log",
  "core_affinity",
  "crossbeam-queue",
@@ -1863,8 +1976,8 @@ version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "84cd9ca48815f384f1a30400848beebcd8c7ead2f57bfe28ebc5560babea88ec"
 dependencies = [
- "compio-buf",
- "compio-io",
+ "compio-buf 0.7.2",
+ "compio-io 0.8.4",
  "futures-rustls",
  "futures-util",
  "rustls",
@@ -1876,10 +1989,10 @@ version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bf7281a15e8f638697415f9838030e41a92c8a8954ddccfc46556a413c16dd9a"
 dependencies = [
- "compio-buf",
- "compio-io",
+ "compio-buf 0.7.2",
+ "compio-io 0.8.4",
  "compio-log",
- "compio-net",
+ "compio-net 0.10.0",
  "compio-tls",
  "tungstenite",
 ]
@@ -4201,7 +4314,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.5.10",
+ "socket2 0.6.2",
  "tokio",
  "tower-service",
  "tracing",
@@ -4659,7 +4772,7 @@ dependencies = [
  "clap",
  "comfy-table",
  "compio",
- "compio-quic",
+ "compio-quic 0.7.0",
  "compio-tls",
  "compio-ws",
  "crossbeam",
@@ -7117,7 +7230,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls",
- "socket2 0.5.10",
+ "socket2 0.6.2",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -7156,7 +7269,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.5.10",
+ "socket2 0.6.2",
  "tracing",
  "windows-sys 0.60.2",
 ]
@@ -8275,8 +8388,8 @@ dependencies = [
  "chrono",
  "clap",
  "compio",
- "compio-net",
- "compio-quic",
+ "compio-net 0.10.0",
+ "compio-quic 0.7.0",
  "compio-tls",
  "compio-ws",
  "configs",
@@ -8892,6 +9005,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "synchrony"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "de0208d3660701622272151bc63c35f5d32ca3d45c19785a9a8dc04dc797dc43"
+dependencies = [
+ "futures-util",
+]
+
+[[package]]
 name = "synstructure"
 version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9097,6 +9219,12 @@ dependencies = [
  "unicode-linebreak",
  "unicode-width 0.2.2",
 ]
+
+[[package]]
+name = "thin-cell"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4164c6c316ba9733b0ab021e7f9852c788a4b991b49c25820f1be48e1d41345b"
 
 [[package]]
 name = "thiserror"
