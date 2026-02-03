@@ -49,7 +49,7 @@ Sinks are responsible for consuming the messages from the configured stream(s) a
 
 Please refer to the **[Sink documentation](https://github.com/apache/iggy/tree/master/core/connectors/sinks)** for the details about the configuration and the sample implementation.
 
-When implementing `Sink`, make sure to use the `sink_connector!` macro to expose the FFI interface and allow the connector runtime to register the sink with the runtime.
+When implementing `Sink`, make sure to use the `sink_connector!` macro to expose the FFI interface and allow the connector runtime to register the sink with the runtime. The macro also exports the connector's version (from `Cargo.toml`) which is reported in the runtime's `/stats` endpoint.
 Each sink should have its own, custom configuration, which is passed along with the unique plugin ID via expected `new()` method.
 
 ## Source

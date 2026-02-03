@@ -104,6 +104,7 @@ pub struct SourceInfo {
     pub key: String,
     pub name: String,
     pub path: String,
+    pub version: String,
     pub enabled: bool,
     pub status: ConnectorStatus,
     pub last_error: Option<ConnectorError>,
