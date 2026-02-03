@@ -4201,7 +4201,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.5.10",
+ "socket2 0.6.2",
  "tokio",
  "tower-service",
  "tracing",
@@ -7117,7 +7117,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls",
- "socket2 0.5.10",
+ "socket2 0.6.2",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -7156,7 +7156,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.5.10",
+ "socket2 0.6.2",
  "tracing",
  "windows-sys 0.60.2",
 ]
@@ -7242,12 +7242,18 @@ dependencies = [
 ]
 
 [[package]]
-name = "rand_xoshiro"
-version = "0.7.0"
+name = "rand_core"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f703f4665700daf5512dcca5f43afa6af89f09db47fb56be587f80636bda2d41"
+checksum = "0c8d0fd677905edcbeedbf2edb6494d676f0e98d54d5cf9bda0b061cb8fb8aba"
+
+[[package]]
+name = "rand_xoshiro"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1f0b2cc7bfeef8f0320ca45f88b00157a03c67137022d59393614352d6bf4312"
 dependencies = [
- "rand_core 0.9.5",
+ "rand_core 0.10.0",
 ]
 
 [[package]]
