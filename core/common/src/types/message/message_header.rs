@@ -94,11 +94,17 @@ impl IggyMessageHeader {
                     .try_into()
                     .map_err(|_| IggyError::InvalidNumberEncoding)?,
             ),
-            reserved: u64::from_le_bytes(
-                bytes[IGGY_MESSAGE_RESERVED_OFFSET_RANGE]
-                    .try_into()
-                    .map_err(|_| IggyError::InvalidNumberEncoding)?,
-            ),
+            reserved: {
+                let reserved = u64::from_le_bytes(
+                    bytes[IGGY_MESSAGE_RESERVED_OFFSET_RANGE]
+                        .try_into()
+                        .map_err(|_| IggyError::InvalidNumberEncoding)?,
+                );
+                if reserved != 0 {
+                    return Err(IggyError::InvalidReservedField(reserved));
+                }
+                reserved
+            },
         })
     }
 }
@@ -164,11 +170,15 @@ impl BytesSerializable for IggyMessageHeader {
                 .map_err(|_| IggyError::InvalidNumberEncoding)?,
         );
 
-        let _reserved = u64::from_le_bytes(
+        let reserved = u64::from_le_bytes(
             bytes[IGGY_MESSAGE_RESERVED_OFFSET_RANGE]
                 .try_into()
                 .map_err(|_| IggyError::InvalidNumberEncoding)?,
         );
+
+        if reserved != 0 {
+            return Err(IggyError::InvalidReservedField(reserved));
+        }
 
         Ok(IggyMessageHeader {
             checksum,
@@ -178,7 +188,7 @@ impl BytesSerializable for IggyMessageHeader {
             origin_timestamp,
             user_headers_length: headers_length,
             payload_length,
-            reserved: _reserved,
+            reserved,
         })
     }
 }
@@ -244,5 +254,55 @@ mod tests {
         assert_eq!(header.origin_timestamp, deserialized.origin_timestamp);
         assert_eq!(header.user_headers_length, deserialized.user_headers_length);
         assert_eq!(header.payload_length, deserialized.payload_length);
+    }
+
+    #[test]
+    fn should_reject_non_zero_reserved_field_from_bytes() {
+        let header = IggyMessageHeader {
+            checksum: 123456789,
+            id: 987654321,
+            offset: 100,
+            timestamp: 1000000,
+            origin_timestamp: 999999,
+            user_headers_length: 50,
+            payload_length: 200,
+            reserved: 0,
+        };
+
+        let mut bytes = header.to_bytes().to_vec();
+        let non_zero_reserved: u64 = 42;
+        bytes[IGGY_MESSAGE_RESERVED_OFFSET_RANGE].copy_from_slice(&non_zero_reserved.to_le_bytes());
+
+        let result = IggyMessageHeader::from_bytes(Bytes::from(bytes));
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err(),
+            IggyError::InvalidReservedField(non_zero_reserved)
+        );
+    }
+
+    #[test]
+    fn should_reject_non_zero_reserved_field_from_raw_bytes() {
+        let header = IggyMessageHeader {
+            checksum: 111,
+            id: 222,
+            offset: 333,
+            timestamp: 444,
+            origin_timestamp: 555,
+            user_headers_length: 66,
+            payload_length: 77,
+            reserved: 0,
+        };
+
+        let mut bytes = header.to_bytes().to_vec();
+        let non_zero_reserved: u64 = 123456789;
+        bytes[IGGY_MESSAGE_RESERVED_OFFSET_RANGE].copy_from_slice(&non_zero_reserved.to_le_bytes());
+
+        let result = IggyMessageHeader::from_raw_bytes(&bytes);
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err(),
+            IggyError::InvalidReservedField(non_zero_reserved)
+        );
     }
 }
