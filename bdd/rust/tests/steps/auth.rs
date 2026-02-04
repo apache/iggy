@@ -18,10 +18,8 @@
 
 use crate::common::global_context::GlobalContext;
 use cucumber::given;
-use iggy::clients::client::IggyClient;
-use iggy::prelude::SystemClient;
-use integration::tcp_client::TcpClientFactory;
-use integration::test_server::{ClientFactory, login_root};
+use iggy::prelude::*;
+use std::sync::Arc;
 
 #[given("I am authenticated as the root user")]
 pub async fn given_authenticated_as_root(world: &mut GlobalContext) {
@@ -30,16 +28,24 @@ pub async fn given_authenticated_as_root(world: &mut GlobalContext) {
         .as_ref()
         .expect("Server should be running")
         .clone();
-    let client_factory = TcpClientFactory {
-        server_addr,
-        ..Default::default()
+
+    let config = TcpClientConfig {
+        server_address: server_addr,
+        ..TcpClientConfig::default()
     };
 
-    let client = client_factory.create_client().await;
-    let client = IggyClient::create(client, None, None);
+    let tcp_client = TcpClient::create(Arc::new(config)).expect("Failed to create TCP client");
+    Client::connect(&tcp_client)
+        .await
+        .expect("Client should connect");
+
+    let client = IggyClient::create(ClientWrapper::Tcp(tcp_client), None, None);
 
     client.ping().await.expect("Server should respond to ping");
-    login_root(&client).await;
+    client
+        .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+        .await
+        .expect("Failed to login as root");
 
     world.client = Some(client);
 }

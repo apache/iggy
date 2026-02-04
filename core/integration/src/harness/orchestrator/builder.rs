@@ -210,12 +210,20 @@ impl TestHarnessBuilder {
             }
         }
 
+        // Default to TCP transport if server is configured but no client transport specified
+        let primary_transport =
+            if self.primary_transport.is_none() && !servers.is_empty() && self.clients.is_empty() {
+                Some(iggy_common::TransportProtocol::Tcp)
+            } else {
+                self.primary_transport
+            };
+
         Ok(TestHarness {
             context,
             servers,
             clients: Vec::new(),
             client_configs: self.clients,
-            primary_transport: self.primary_transport,
+            primary_transport,
             primary_client_config: self.primary_client_config,
             started: false,
         })

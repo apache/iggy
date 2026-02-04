@@ -115,7 +115,7 @@ pub async fn start(
     }
 
     // Load or generate TLS certificates
-    let tls_config = &shard.config.tcp.tls;
+    let tls_config = &shard.config.websocket.tls;
     let (certs, key) =
         if tls_config.self_signed && !std::path::Path::new(&tls_config.cert_file).exists() {
             info!("Generating self-signed certificate for WebSocket TLS server");

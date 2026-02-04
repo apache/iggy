@@ -39,7 +39,7 @@ type SinkJsonRow = (i64, serde_json::Value);
     seed = seeds::connector_stream
 )]
 async fn json_messages_sink_stores_as_bytea(harness: &TestHarness, fixture: PostgresSinkFixture) {
-    let client = harness.client();
+    let client = harness.root_client().await.unwrap();
     let pool = fixture.create_pool().await.expect("Failed to create pool");
 
     fixture.wait_for_table(&pool, SINK_TABLE).await;
@@ -104,7 +104,7 @@ async fn binary_messages_sink_stores_as_bytea(
     harness: &TestHarness,
     fixture: PostgresSinkByteaFixture,
 ) {
-    let client = harness.client();
+    let client = harness.root_client().await.unwrap();
     let pool = fixture.create_pool().await.expect("Failed to create pool");
 
     fixture.wait_for_table(&pool, SINK_TABLE).await;
@@ -168,7 +168,7 @@ async fn json_messages_sink_stores_as_jsonb(
     harness: &TestHarness,
     fixture: PostgresSinkJsonFixture,
 ) {
-    let client = harness.client();
+    let client = harness.root_client().await.unwrap();
     let pool = fixture.create_pool().await.expect("Failed to create pool");
 
     fixture.wait_for_table(&pool, SINK_TABLE).await;

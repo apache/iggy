@@ -15,36 +15,53 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::server::{
-    ScenarioFn, auto_commit_reconnection_scenario, join_scenario, multiple_clients_scenario,
-    offset_cleanup_scenario, run_scenario, single_client_scenario,
+use crate::server::scenarios::{
+    consumer_group_auto_commit_reconnection_scenario, consumer_group_join_scenario,
+    consumer_group_offset_cleanup_scenario,
+    consumer_group_with_multiple_clients_polling_messages_scenario,
+    consumer_group_with_single_client_polling_messages_scenario,
 };
-use iggy_common::TransportProtocol;
-use serial_test::parallel;
-use test_case::test_matrix;
+use integration::iggy_harness;
 
-fn tcp() -> TransportProtocol {
-    TransportProtocol::Tcp
-}
+// Consumer group scenarios do not support HTTP (stateful operations).
+// TODO: Add QUIC support.
 
-fn websocket() -> TransportProtocol {
-    TransportProtocol::WebSocket
-}
-
-// TODO: Add `QUIC`.
-// Consumer group scenarios do not support HTTP
-#[test_matrix(
-    [tcp(), websocket()],
-    [
-        join_scenario(),
-        single_client_scenario(),
-        multiple_clients_scenario(),
-        auto_commit_reconnection_scenario(),
-        offset_cleanup_scenario(),
-    ]
+#[iggy_harness(
+    test_client_transport = [Tcp, WebSocket],
+    server(tcp.socket.override_defaults = true, tcp.socket.nodelay = true)
 )]
-#[tokio::test]
-#[parallel]
-async fn matrix(transport: TransportProtocol, scenario: ScenarioFn) {
-    run_scenario(transport, scenario).await;
+async fn join(harness: &TestHarness) {
+    consumer_group_join_scenario::run(harness).await;
+}
+
+#[iggy_harness(
+    test_client_transport = [Tcp, WebSocket],
+    server(tcp.socket.override_defaults = true, tcp.socket.nodelay = true)
+)]
+async fn single_client(harness: &TestHarness) {
+    consumer_group_with_single_client_polling_messages_scenario::run(harness).await;
+}
+
+#[iggy_harness(
+    test_client_transport = [Tcp, WebSocket],
+    server(tcp.socket.override_defaults = true, tcp.socket.nodelay = true)
+)]
+async fn multiple_clients(harness: &TestHarness) {
+    consumer_group_with_multiple_clients_polling_messages_scenario::run(harness).await;
+}
+
+#[iggy_harness(
+    test_client_transport = [Tcp, WebSocket],
+    server(tcp.socket.override_defaults = true, tcp.socket.nodelay = true)
+)]
+async fn auto_commit_reconnection(harness: &TestHarness) {
+    consumer_group_auto_commit_reconnection_scenario::run(harness).await;
+}
+
+#[iggy_harness(
+    test_client_transport = [Tcp, WebSocket],
+    server(tcp.socket.override_defaults = true, tcp.socket.nodelay = true)
+)]
+async fn offset_cleanup(harness: &TestHarness) {
+    consumer_group_offset_cleanup_scenario::run(harness).await;
 }

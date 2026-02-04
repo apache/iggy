@@ -1041,7 +1041,6 @@ dependencies = [
  "bytes",
  "cucumber",
  "iggy",
- "integration",
  "tokio",
 ]
 
@@ -4985,7 +4984,6 @@ dependencies = [
  "configs",
  "configs_derive",
  "ctor",
- "derive_more",
  "figment",
  "futures",
  "harness_derive",
@@ -5016,6 +5014,7 @@ dependencies = [
  "test-case",
  "testcontainers-modules",
  "tokio",
+ "toml 0.9.11+spec-1.1.0",
  "tracing",
  "tracing-subscriber",
  "twox-hash",

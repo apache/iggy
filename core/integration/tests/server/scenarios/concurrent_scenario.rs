@@ -16,11 +16,10 @@
  * under the License.
  */
 
-use crate::server::scenarios::create_client;
 use futures::future::join_all;
 use iggy::prelude::*;
-use iggy_common::{ConsumerGroup, UserInfo};
-use integration::test_server::{ClientFactory, login_root};
+use iggy_common::{ConsumerGroup, TransportProtocol, UserInfo};
+use integration::harness::TestHarness;
 use std::sync::Arc;
 use tokio::sync::Barrier;
 
@@ -55,14 +54,24 @@ pub fn barrier_off() -> bool {
 
 type OperationResult = Result<(), IggyError>;
 
+async fn create_client_for_transport(
+    harness: &TestHarness,
+    transport: TransportProtocol,
+) -> IggyClient {
+    harness
+        .root_client_for(transport)
+        .await
+        .expect("Failed to create client")
+}
+
 pub async fn run(
-    client_factory: &dyn ClientFactory,
+    harness: &TestHarness,
+    transport: TransportProtocol,
     resource_type: ResourceType,
     scenario_type: ScenarioType,
     use_barrier: bool,
 ) {
-    let root_client = create_client(client_factory).await;
-    login_root(&root_client).await;
+    let root_client = create_client_for_transport(harness, transport).await;
 
     // For topic tests, create parent stream first
     if resource_type == ResourceType::Topic {
@@ -89,53 +98,53 @@ pub async fn run(
 
     let results = match (resource_type, scenario_type) {
         (ResourceType::User, ScenarioType::Hot) => {
-            execute_users_hot(client_factory, use_barrier).await
+            execute_users_hot(harness, transport, use_barrier).await
         }
         (ResourceType::User, ScenarioType::Cold) => {
-            execute_users_cold(client_factory, use_barrier).await
+            execute_users_cold(harness, transport, use_barrier).await
         }
         (ResourceType::Stream, ScenarioType::Hot) => {
-            execute_streams_hot(client_factory, use_barrier).await
+            execute_streams_hot(harness, transport, use_barrier).await
         }
         (ResourceType::Stream, ScenarioType::Cold) => {
-            execute_streams_cold(client_factory, use_barrier).await
+            execute_streams_cold(harness, transport, use_barrier).await
         }
         (ResourceType::Topic, ScenarioType::Hot) => {
-            execute_topics_hot(client_factory, use_barrier).await
+            execute_topics_hot(harness, transport, use_barrier).await
         }
         (ResourceType::Topic, ScenarioType::Cold) => {
-            execute_topics_cold(client_factory, use_barrier).await
+            execute_topics_cold(harness, transport, use_barrier).await
         }
         (ResourceType::Partition, ScenarioType::Hot) => {
-            execute_partitions_hot(client_factory, use_barrier).await
+            execute_partitions_hot(harness, transport, use_barrier).await
         }
         // Partitions don't have names, so Cold scenario doesn't apply
         (ResourceType::Partition, ScenarioType::Cold) => vec![],
         (ResourceType::ConsumerGroup, ScenarioType::Hot) => {
-            execute_consumer_groups_hot(client_factory, use_barrier).await
+            execute_consumer_groups_hot(harness, transport, use_barrier).await
         }
         (ResourceType::ConsumerGroup, ScenarioType::Cold) => {
-            execute_consumer_groups_cold(client_factory, use_barrier).await
+            execute_consumer_groups_cold(harness, transport, use_barrier).await
         }
     };
 
     if !results.is_empty() {
         validate_results(&results, scenario_type);
-        validate_server_state(client_factory, resource_type, scenario_type).await;
+        validate_server_state(harness, transport, resource_type, scenario_type).await;
         cleanup_resources(&root_client, resource_type).await;
     }
 }
 
 async fn execute_users_hot(
-    client_factory: &dyn ClientFactory,
+    harness: &TestHarness,
+    transport: TransportProtocol,
     use_barrier: bool,
 ) -> Vec<OperationResult> {
     let barrier = use_barrier.then(|| Arc::new(Barrier::new(CONCURRENT_CLIENTS)));
 
     let mut handles = Vec::with_capacity(CONCURRENT_CLIENTS);
     for client_id in 0..CONCURRENT_CLIENTS {
-        let client = create_client(client_factory).await;
-        login_root(&client).await;
+        let client = create_client_for_transport(harness, transport).await;
         let barrier = barrier.clone();
 
         handles.push(tokio::spawn(async move {
@@ -158,7 +167,8 @@ async fn execute_users_hot(
 }
 
 async fn execute_users_cold(
-    client_factory: &dyn ClientFactory,
+    harness: &TestHarness,
+    transport: TransportProtocol,
     use_barrier: bool,
 ) -> Vec<OperationResult> {
     const DUPLICATE_USER: &str = "race-user-duplicate";
@@ -166,8 +176,7 @@ async fn execute_users_cold(
 
     let mut handles = Vec::with_capacity(CONCURRENT_CLIENTS);
     for _ in 0..CONCURRENT_CLIENTS {
-        let client = create_client(client_factory).await;
-        login_root(&client).await;
+        let client = create_client_for_transport(harness, transport).await;
         let barrier = barrier.clone();
 
         handles.push(tokio::spawn(async move {
@@ -189,15 +198,15 @@ async fn execute_users_cold(
 }
 
 async fn execute_streams_hot(
-    client_factory: &dyn ClientFactory,
+    harness: &TestHarness,
+    transport: TransportProtocol,
     use_barrier: bool,
 ) -> Vec<OperationResult> {
     let barrier = use_barrier.then(|| Arc::new(Barrier::new(CONCURRENT_CLIENTS)));
 
     let mut handles = Vec::with_capacity(CONCURRENT_CLIENTS);
     for client_id in 0..CONCURRENT_CLIENTS {
-        let client = create_client(client_factory).await;
-        login_root(&client).await;
+        let client = create_client_for_transport(harness, transport).await;
         let barrier = barrier.clone();
 
         handles.push(tokio::spawn(async move {
@@ -217,7 +226,8 @@ async fn execute_streams_hot(
 }
 
 async fn execute_streams_cold(
-    client_factory: &dyn ClientFactory,
+    harness: &TestHarness,
+    transport: TransportProtocol,
     use_barrier: bool,
 ) -> Vec<OperationResult> {
     const DUPLICATE_STREAM: &str = "race-stream-duplicate";
@@ -225,8 +235,7 @@ async fn execute_streams_cold(
 
     let mut handles = Vec::with_capacity(CONCURRENT_CLIENTS);
     for _ in 0..CONCURRENT_CLIENTS {
-        let client = create_client(client_factory).await;
-        login_root(&client).await;
+        let client = create_client_for_transport(harness, transport).await;
         let barrier = barrier.clone();
 
         handles.push(tokio::spawn(async move {
@@ -245,15 +254,15 @@ async fn execute_streams_cold(
 }
 
 async fn execute_topics_hot(
-    client_factory: &dyn ClientFactory,
+    harness: &TestHarness,
+    transport: TransportProtocol,
     use_barrier: bool,
 ) -> Vec<OperationResult> {
     let barrier = use_barrier.then(|| Arc::new(Barrier::new(CONCURRENT_CLIENTS)));
 
     let mut handles = Vec::with_capacity(CONCURRENT_CLIENTS);
     for client_id in 0..CONCURRENT_CLIENTS {
-        let client = create_client(client_factory).await;
-        login_root(&client).await;
+        let client = create_client_for_transport(harness, transport).await;
         let barrier = barrier.clone();
 
         handles.push(tokio::spawn(async move {
@@ -285,7 +294,8 @@ async fn execute_topics_hot(
 }
 
 async fn execute_topics_cold(
-    client_factory: &dyn ClientFactory,
+    harness: &TestHarness,
+    transport: TransportProtocol,
     use_barrier: bool,
 ) -> Vec<OperationResult> {
     const DUPLICATE_TOPIC: &str = "race-topic-duplicate";
@@ -293,8 +303,7 @@ async fn execute_topics_cold(
 
     let mut handles = Vec::with_capacity(CONCURRENT_CLIENTS);
     for _ in 0..CONCURRENT_CLIENTS {
-        let client = create_client(client_factory).await;
-        login_root(&client).await;
+        let client = create_client_for_transport(harness, transport).await;
         let barrier = barrier.clone();
 
         handles.push(tokio::spawn(async move {
@@ -325,15 +334,15 @@ async fn execute_topics_cold(
 }
 
 async fn execute_partitions_hot(
-    client_factory: &dyn ClientFactory,
+    harness: &TestHarness,
+    transport: TransportProtocol,
     use_barrier: bool,
 ) -> Vec<OperationResult> {
     let barrier = use_barrier.then(|| Arc::new(Barrier::new(CONCURRENT_CLIENTS)));
 
     let mut handles = Vec::with_capacity(CONCURRENT_CLIENTS);
     for _ in 0..CONCURRENT_CLIENTS {
-        let client = create_client(client_factory).await;
-        login_root(&client).await;
+        let client = create_client_for_transport(harness, transport).await;
         let barrier = barrier.clone();
 
         handles.push(tokio::spawn(async move {
@@ -357,15 +366,15 @@ async fn execute_partitions_hot(
 }
 
 async fn execute_consumer_groups_hot(
-    client_factory: &dyn ClientFactory,
+    harness: &TestHarness,
+    transport: TransportProtocol,
     use_barrier: bool,
 ) -> Vec<OperationResult> {
     let barrier = use_barrier.then(|| Arc::new(Barrier::new(CONCURRENT_CLIENTS)));
 
     let mut handles = Vec::with_capacity(CONCURRENT_CLIENTS);
     for client_id in 0..CONCURRENT_CLIENTS {
-        let client = create_client(client_factory).await;
-        login_root(&client).await;
+        let client = create_client_for_transport(harness, transport).await;
         let barrier = barrier.clone();
 
         handles.push(tokio::spawn(async move {
@@ -390,7 +399,8 @@ async fn execute_consumer_groups_hot(
 }
 
 async fn execute_consumer_groups_cold(
-    client_factory: &dyn ClientFactory,
+    harness: &TestHarness,
+    transport: TransportProtocol,
     use_barrier: bool,
 ) -> Vec<OperationResult> {
     const DUPLICATE_CONSUMER_GROUP: &str = "race-consumer-group-duplicate";
@@ -398,8 +408,7 @@ async fn execute_consumer_groups_cold(
 
     let mut handles = Vec::with_capacity(CONCURRENT_CLIENTS);
     for _ in 0..CONCURRENT_CLIENTS {
-        let client = create_client(client_factory).await;
-        login_root(&client).await;
+        let client = create_client_for_transport(harness, transport).await;
         let barrier = barrier.clone();
 
         handles.push(tokio::spawn(async move {
@@ -479,7 +488,8 @@ fn validate_results(results: &[OperationResult], scenario_type: ScenarioType) {
 }
 
 async fn validate_server_state(
-    client_factory: &dyn ClientFactory,
+    harness: &TestHarness,
+    transport: TransportProtocol,
     resource_type: ResourceType,
     scenario_type: ScenarioType,
 ) {
@@ -488,8 +498,7 @@ async fn validate_server_state(
 
     // Create multiple clients for validation
     for _ in 0..VALIDATION_CLIENT_COUNT {
-        let client = create_client(client_factory).await;
-        login_root(&client).await;
+        let client = create_client_for_transport(harness, transport).await;
         clients.push(client);
     }
 

@@ -17,11 +17,28 @@
  */
 
 use iggy::prelude::*;
-use integration::{bench_utils::run_bench_and_wait_for_finish, test_server::ClientFactory};
+use iggy_common::TransportProtocol;
+use integration::bench_utils::run_bench_and_wait_for_finish;
+use integration::harness::TestHarness;
 
-pub async fn run(client_factory: &dyn ClientFactory) {
-    let server_addr = client_factory.server_addr();
-    let transport = client_factory.transport();
+pub async fn run(harness: &TestHarness) {
+    let transport = harness.transport().expect("Transport not set");
+    let server = harness.server();
+    let server_addr = match transport {
+        TransportProtocol::Tcp => server.raw_tcp_addr().expect("TCP address not available"),
+        TransportProtocol::Http => server
+            .http_addr()
+            .expect("HTTP address not available")
+            .to_string(),
+        TransportProtocol::Quic => server
+            .quic_addr()
+            .expect("QUIC address not available")
+            .to_string(),
+        TransportProtocol::WebSocket => server
+            .websocket_addr()
+            .expect("WebSocket address not available")
+            .to_string(),
+    };
     let data_size = IggyByteSize::from(8 * 1024 * 1024);
 
     run_bench_and_wait_for_finish(&server_addr, &transport, "pinned-producer", data_size);

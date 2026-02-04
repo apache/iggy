@@ -25,15 +25,8 @@ use crate::harness::handle::{
     ClientHandle, ConnectorsRuntimeHandle, McpClient, McpHandle, ServerHandle, ServerLogs,
 };
 use crate::harness::traits::{Restartable, TestBinary};
-use crate::http_client::HttpClientFactory;
-use crate::quic_client::QuicClientFactory;
-use crate::tcp_client::TcpClientFactory;
-use crate::test_server::ClientFactory;
-use crate::websocket_client::WebSocketClientFactory;
 use futures::executor::block_on;
-use iggy::prelude::{
-    ClientWrapper, DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME, IggyClient, UserClient,
-};
+use iggy::prelude::{ClientWrapper, IggyClient};
 use iggy_common::TransportProtocol;
 use std::path::Path;
 use std::sync::Arc;
@@ -42,14 +35,6 @@ use std::sync::Arc;
 #[derive(Debug)]
 pub struct TestLogs {
     pub servers: Vec<ServerLogs>,
-}
-
-#[derive(Default)]
-pub(super) struct TlsSettings {
-    pub enabled: bool,
-    pub domain: String,
-    pub ca_file: Option<String>,
-    pub validate_certificate: bool,
 }
 
 /// Orchestrates test binaries and clients for integration tests.
@@ -286,159 +271,19 @@ impl TestHarness {
         }
     }
 
-    /// Get a TCP client factory for creating additional clients.
-    pub fn tcp_client_factory(&self) -> Option<TcpClientFactory> {
-        let server = self.servers.first()?;
-        let addr = server.tcp_addr()?;
-        let config = self.find_client_config(TransportProtocol::Tcp);
-        let tls = self.extract_tls_settings(config, server);
-
-        Some(TcpClientFactory {
-            server_addr: addr.to_string(),
-            nodelay: config.map(|c| c.tcp_nodelay).unwrap_or_default(),
-            tls_enabled: tls.enabled,
-            tls_domain: tls.domain,
-            tls_ca_file: tls.ca_file,
-            tls_validate_certificate: tls.validate_certificate,
-        })
-    }
-
-    /// Get an HTTP client factory for creating additional clients.
-    pub fn http_client_factory(&self) -> Option<HttpClientFactory> {
-        self.servers
-            .first()
-            .and_then(|s| s.http_addr())
-            .map(|addr| HttpClientFactory {
-                server_addr: addr.to_string(),
-            })
-    }
-
-    /// Get a QUIC client factory for creating additional clients.
-    pub fn quic_client_factory(&self) -> Option<QuicClientFactory> {
-        self.servers
-            .first()
-            .and_then(|s| s.quic_addr())
-            .map(|addr| QuicClientFactory {
-                server_addr: addr.to_string(),
-            })
-    }
-
-    /// Get a WebSocket client factory for creating additional clients.
-    pub fn websocket_client_factory(&self) -> Option<WebSocketClientFactory> {
-        let server = self.servers.first()?;
-        let addr = server.websocket_addr()?;
-        let config = self.find_client_config(TransportProtocol::WebSocket);
-        let tls = self.extract_tls_settings(config, server);
-
-        Some(WebSocketClientFactory {
-            server_addr: addr.to_string(),
-            tls_enabled: tls.enabled,
-            tls_domain: tls.domain,
-            tls_ca_file: tls.ca_file,
-            tls_validate_certificate: tls.validate_certificate,
-        })
-    }
-
-    fn find_client_config(&self, transport: TransportProtocol) -> Option<&ClientConfig> {
-        self.client_configs
-            .iter()
-            .find(|c| c.transport == transport)
-            .or(self
-                .primary_client_config
-                .as_ref()
-                .filter(|c| c.transport == transport))
-    }
-
-    fn extract_tls_settings(
-        &self,
-        config: Option<&ClientConfig>,
-        server: &ServerHandle,
-    ) -> TlsSettings {
-        let (enabled, domain, validate) = config
-            .map(|c| {
-                (
-                    c.tls_enabled,
-                    c.tls_domain
-                        .clone()
-                        .unwrap_or_else(|| "localhost".to_string()),
-                    c.tls_validate_certificate,
-                )
-            })
-            .unwrap_or_default();
-
-        let ca_file = if enabled {
-            server
-                .tls_ca_cert_path()
-                .map(|p| p.to_string_lossy().to_string())
-        } else {
-            None
-        };
-
-        TlsSettings {
-            enabled,
-            domain,
-            ca_file,
-            validate_certificate: validate,
-        }
-    }
-
-    /// Get all available client factories.
-    #[allow(clippy::vec_box)]
-    pub fn all_client_factories(&self) -> Vec<Box<dyn ClientFactory>> {
-        let mut factories: Vec<Box<dyn ClientFactory>> = Vec::new();
-        if let Some(f) = self.tcp_client_factory() {
-            factories.push(Box::new(f));
-        }
-        if let Some(f) = self.http_client_factory() {
-            factories.push(Box::new(f));
-        }
-        if let Some(f) = self.quic_client_factory() {
-            factories.push(Box::new(f));
-        }
-        if let Some(f) = self.websocket_client_factory() {
-            factories.push(Box::new(f));
-        }
-        factories
-    }
-
-    fn client_factory_for(
-        &self,
-        transport: TransportProtocol,
-    ) -> Result<Box<dyn ClientFactory>, TestBinaryError> {
-        let factory: Box<dyn ClientFactory> = match transport {
-            TransportProtocol::Tcp => Box::new(self.tcp_client_factory().ok_or_else(|| {
-                TestBinaryError::InvalidState {
-                    message: "TCP transport not available".to_string(),
-                }
-            })?),
-            TransportProtocol::Http => Box::new(self.http_client_factory().ok_or_else(|| {
-                TestBinaryError::InvalidState {
-                    message: "HTTP transport not available".to_string(),
-                }
-            })?),
-            TransportProtocol::Quic => Box::new(self.quic_client_factory().ok_or_else(|| {
-                TestBinaryError::InvalidState {
-                    message: "QUIC transport not available".to_string(),
-                }
-            })?),
-            TransportProtocol::WebSocket => {
-                Box::new(self.websocket_client_factory().ok_or_else(|| {
-                    TestBinaryError::InvalidState {
-                        message: "WebSocket transport not available".to_string(),
-                    }
-                })?)
-            }
-        };
-        Ok(factory)
-    }
-
     /// Create a new client logged in as root for the specified transport.
     pub async fn root_client_for(
         &self,
         transport: TransportProtocol,
     ) -> Result<IggyClient, TestBinaryError> {
-        let factory = self.client_factory_for(transport)?;
-        self.create_root_client(&*factory).await
+        let server = self.servers.first().ok_or(TestBinaryError::MissingServer)?;
+        let builder = match transport {
+            TransportProtocol::Tcp => server.tcp_client()?,
+            TransportProtocol::Http => server.http_client()?,
+            TransportProtocol::Quic => server.quic_client()?,
+            TransportProtocol::WebSocket => server.websocket_client()?,
+        };
+        builder.with_root_login().connect().await
     }
 
     /// Create multiple root clients for the specified transport.
@@ -459,9 +304,14 @@ impl TestHarness {
         &self,
         transport: TransportProtocol,
     ) -> Result<IggyClient, TestBinaryError> {
-        let factory = self.client_factory_for(transport)?;
-        let client = factory.create_client().await;
-        Ok(IggyClient::create(client, None, None))
+        let server = self.servers.first().ok_or(TestBinaryError::MissingServer)?;
+        let builder = match transport {
+            TransportProtocol::Tcp => server.tcp_client()?,
+            TransportProtocol::Http => server.http_client()?,
+            TransportProtocol::Quic => server.quic_client()?,
+            TransportProtocol::WebSocket => server.websocket_client()?,
+        };
+        builder.connect().await
     }
 
     pub async fn tcp_root_client(&self) -> Result<IggyClient, TestBinaryError> {
@@ -558,21 +408,6 @@ impl TestHarness {
     ) -> Result<Vec<IggyClient>, TestBinaryError> {
         self.root_clients_for(TransportProtocol::WebSocket, count)
             .await
-    }
-
-    async fn create_root_client(
-        &self,
-        factory: &dyn ClientFactory,
-    ) -> Result<IggyClient, TestBinaryError> {
-        let client = factory.create_client().await;
-        let iggy_client = IggyClient::create(client, None, None);
-        iggy_client
-            .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
-            .await
-            .map_err(|e| TestBinaryError::InvalidState {
-                message: format!("Failed to login as root: {e}"),
-            })?;
-        Ok(iggy_client)
     }
 
     pub(super) async fn create_clients(&mut self) -> Result<(), TestBinaryError> {

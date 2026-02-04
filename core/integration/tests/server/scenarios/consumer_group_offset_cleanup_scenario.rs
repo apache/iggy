@@ -16,11 +16,11 @@
  * under the License.
  */
 
-use crate::server::scenarios::{PARTITION_ID, STREAM_NAME, TOPIC_NAME, cleanup, create_client};
+use crate::server::scenarios::{PARTITION_ID, STREAM_NAME, TOPIC_NAME, cleanup};
 use futures::StreamExt;
 use iggy::prelude::*;
 use iggy_common::ConsumerOffsetInfo;
-use integration::test_server::{ClientFactory, assert_clean_system, login_root};
+use integration::harness::{TestHarness, assert_clean_system};
 use std::str::FromStr;
 use tokio::time::{Duration, sleep};
 
@@ -30,9 +30,11 @@ const CONSUMER_GROUP_1: &str = "test-consumer-group-1";
 const CONSUMER_GROUP_2: &str = "test-consumer-group-2";
 const CONSUMER_GROUP_3: &str = "test-consumer-group-3";
 
-pub async fn run(client_factory: &dyn ClientFactory) {
-    let client = create_client(client_factory).await;
-    login_root(&client).await;
+pub async fn run(harness: &TestHarness) {
+    let client = harness
+        .root_client()
+        .await
+        .expect("Failed to get root client");
     init_system(&client).await;
     execute_consumer_group_offset_cleanup_scenario(&client).await;
     cleanup(&client, false).await;

@@ -36,7 +36,6 @@ compio = { workspace = true }
 configs = { workspace = true }
 configs_derive = { workspace = true }
 ctor = { workspace = true }
-derive_more = { workspace = true }
 figment = { workspace = true }
 futures = { workspace = true }
 harness_derive = { workspace = true }
@@ -72,6 +71,7 @@ tempfile = { workspace = true }
 test-case = { workspace = true }
 testcontainers-modules = { workspace = true }
 tokio = { workspace = true }
+toml = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 twox-hash = { workspace = true }
