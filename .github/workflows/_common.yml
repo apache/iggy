@@ -39,6 +39,15 @@ jobs:
       - name: Check Rust versions are synchronized
         run: ./scripts/ci/sync-rust-version.sh --check
 
+  python-versions:
+    name: Check Python SDK versions sync
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check Python SDK versions are synchronized
+        run: ./scripts/ci/python-version-sync.sh --check
+
   pr-title:
     name: Check PR Title
     if: github.event_name == 'pull_request' && !inputs.skip_pr_title
@@ -215,6 +224,7 @@ jobs:
     needs:
       [
         rust-versions,
+        python-versions,
         pr-title,
         license-headers,
         license-list,
@@ -252,6 +262,7 @@ jobs:
 
           # Always-run checks
           RUST_VERSIONS="${{ needs.rust-versions.result }}"
+          PYTHON_VERSIONS="${{ needs.python-versions.result }}"
           LICENSE_HEADERS="${{ needs.license-headers.result }}"
           LICENSE_LIST="${{ needs.license-list.result }}"
           MARKDOWN="${{ needs.markdown.result }}"
@@ -262,6 +273,14 @@ jobs:
             echo "| ❌ Rust Versions | failure | Rust versions mismatch in Dockerfiles |" >> $GITHUB_STEP_SUMMARY
           else
             echo "| ⏭️ Rust Versions | $RUST_VERSIONS | Check skipped |" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          if [ "$PYTHON_VERSIONS" = "success" ]; then
+            echo "| ✅ Python SDK Versions | success | Cargo.toml and pyproject.toml synchronized |" >> $GITHUB_STEP_SUMMARY
+          elif [ "$PYTHON_VERSIONS" = "failure" ]; then
+            echo "| ❌ Python SDK Versions | failure | Version mismatch between Cargo.toml and pyproject.toml |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| ⏭️ Python SDK Versions | $PYTHON_VERSIONS | Check skipped |" >> $GITHUB_STEP_SUMMARY
           fi
 
           if [ "$LICENSE_HEADERS" = "success" ]; then

@@ -17,26 +17,77 @@
  * under the License.
  */
 
-use super::{
-    DatabaseRecord, SOURCE_TABLE, SOURCE_TABLE_DELETE, SOURCE_TABLE_MARK, TEST_MESSAGE_COUNT,
-    setup_source, setup_source_bytea, setup_source_delete, setup_source_json, setup_source_mark,
-};
+use super::{DatabaseRecord, POLL_ATTEMPTS, POLL_INTERVAL_MS, TEST_MESSAGE_COUNT};
 use crate::connectors::create_test_messages;
+use crate::connectors::fixtures::{
+    PostgresOps, PostgresSourceByteaFixture, PostgresSourceDeleteFixture,
+    PostgresSourceJsonFixture, PostgresSourceJsonbFixture, PostgresSourceMarkFixture,
+    PostgresSourceOps,
+};
+use iggy_binary_protocol::MessageClient;
+use iggy_common::{Consumer, Identifier, PollingStrategy};
+use integration::harness::seeds;
+use integration::iggy_harness;
+use std::time::Duration;
+use tokio::time::sleep;
 
-#[tokio::test]
-async fn given_json_rows_source_connector_should_produce_messages_to_iggy() {
-    let setup = setup_source().await;
-    let pool = setup.create_pool().await;
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/postgres/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn json_rows_source_produces_messages_to_iggy(
+    harness: &TestHarness,
+    fixture: PostgresSourceJsonFixture,
+) {
+    let client = harness.client();
+    let pool = fixture.create_pool().await.expect("Failed to create pool");
+    fixture.create_table(&pool).await;
+
     let test_messages = create_test_messages(TEST_MESSAGE_COUNT);
-
-    setup.insert_test_messages(&pool, &test_messages).await;
+    for msg in &test_messages {
+        fixture
+            .insert_row(
+                &pool,
+                msg.id as i32,
+                &msg.name,
+                msg.count as i32,
+                msg.amount,
+                msg.active,
+                msg.timestamp,
+            )
+            .await;
+    }
     pool.close().await;
 
-    let received: Vec<DatabaseRecord> = setup
-        .poll_messages(TEST_MESSAGE_COUNT, |payload| {
-            serde_json::from_slice(payload).ok()
-        })
-        .await;
+    let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
+    let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
+    let consumer_id: Identifier = "test_consumer".try_into().unwrap();
+
+    let mut received: Vec<DatabaseRecord> = Vec::new();
+    for _ in 0..POLL_ATTEMPTS {
+        if let Ok(polled) = client
+            .poll_messages(
+                &stream_id,
+                &topic_id,
+                None,
+                &Consumer::new(consumer_id.clone()),
+                &PollingStrategy::next(),
+                10,
+                true,
+            )
+            .await
+        {
+            for msg in polled.messages {
+                if let Ok(record) = serde_json::from_slice(&msg.payload) {
+                    received.push(record);
+                }
+            }
+            if received.len() >= TEST_MESSAGE_COUNT {
+                break;
+            }
+        }
+        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+    }
 
     assert!(
         received.len() >= TEST_MESSAGE_COUNT,
@@ -46,7 +97,8 @@ async fn given_json_rows_source_connector_should_produce_messages_to_iggy() {
 
     for (i, record) in received.iter().enumerate() {
         assert_eq!(
-            record.table_name, SOURCE_TABLE,
+            record.table_name,
+            fixture.table_name(),
             "Table name mismatch at record {i}"
         );
         assert_eq!(
@@ -60,10 +112,17 @@ async fn given_json_rows_source_connector_should_produce_messages_to_iggy() {
     }
 }
 
-#[tokio::test]
-async fn given_bytea_rows_source_connector_should_produce_raw_messages_to_iggy() {
-    let setup = setup_source_bytea().await;
-    let pool = setup.create_pool().await;
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/postgres/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn bytea_rows_source_produces_raw_messages_to_iggy(
+    harness: &TestHarness,
+    fixture: PostgresSourceByteaFixture,
+) {
+    let client = harness.client();
+    let pool = fixture.create_pool().await.expect("Failed to create pool");
+    fixture.create_table(&pool).await;
 
     let payloads: Vec<Vec<u8>> = vec![
         b"hello world".to_vec(),
@@ -72,12 +131,38 @@ async fn given_bytea_rows_source_connector_should_produce_raw_messages_to_iggy()
             .expect("Failed to serialize json"),
     ];
 
-    setup.insert_bytea_payloads(&pool, &payloads).await;
+    for (i, payload) in payloads.iter().enumerate() {
+        fixture.insert_payload(&pool, (i + 1) as i32, payload).await;
+    }
     pool.close().await;
 
-    let received: Vec<Vec<u8>> = setup
-        .poll_messages(TEST_MESSAGE_COUNT, |payload| Some(payload.to_vec()))
-        .await;
+    let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
+    let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
+    let consumer_id: Identifier = "test_consumer".try_into().unwrap();
+
+    let mut received: Vec<Vec<u8>> = Vec::new();
+    for _ in 0..POLL_ATTEMPTS {
+        if let Ok(polled) = client
+            .poll_messages(
+                &stream_id,
+                &topic_id,
+                None,
+                &Consumer::new(consumer_id.clone()),
+                &PollingStrategy::next(),
+                10,
+                true,
+            )
+            .await
+        {
+            for msg in polled.messages {
+                received.push(msg.payload.to_vec());
+            }
+            if received.len() >= TEST_MESSAGE_COUNT {
+                break;
+            }
+        }
+        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+    }
 
     assert!(
         received.len() >= TEST_MESSAGE_COUNT,
@@ -90,10 +175,17 @@ async fn given_bytea_rows_source_connector_should_produce_raw_messages_to_iggy()
     }
 }
 
-#[tokio::test]
-async fn given_jsonb_rows_source_connector_should_produce_json_messages_to_iggy() {
-    let setup = setup_source_json().await;
-    let pool = setup.create_pool().await;
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/postgres/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn jsonb_rows_source_produces_json_messages_to_iggy(
+    harness: &TestHarness,
+    fixture: PostgresSourceJsonbFixture,
+) {
+    let client = harness.client();
+    let pool = fixture.create_pool().await.expect("Failed to create pool");
+    fixture.create_table(&pool).await;
 
     let json_payloads: Vec<serde_json::Value> = vec![
         serde_json::json!({"name": "Alice", "score": 100}),
@@ -101,14 +193,40 @@ async fn given_jsonb_rows_source_connector_should_produce_json_messages_to_iggy(
         serde_json::json!({"nested": {"deep": {"value": 42}}}),
     ];
 
-    setup.insert_json_payloads(&pool, &json_payloads).await;
+    for (i, payload) in json_payloads.iter().enumerate() {
+        fixture.insert_json(&pool, (i + 1) as i32, payload).await;
+    }
     pool.close().await;
 
-    let received: Vec<serde_json::Value> = setup
-        .poll_messages(TEST_MESSAGE_COUNT, |payload| {
-            serde_json::from_slice(payload).ok()
-        })
-        .await;
+    let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
+    let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
+    let consumer_id: Identifier = "test_consumer".try_into().unwrap();
+
+    let mut received: Vec<serde_json::Value> = Vec::new();
+    for _ in 0..POLL_ATTEMPTS {
+        if let Ok(polled) = client
+            .poll_messages(
+                &stream_id,
+                &topic_id,
+                None,
+                &Consumer::new(consumer_id.clone()),
+                &PollingStrategy::next(),
+                10,
+                true,
+            )
+            .await
+        {
+            for msg in polled.messages {
+                if let Ok(json) = serde_json::from_slice(&msg.payload) {
+                    received.push(json);
+                }
+            }
+            if received.len() >= TEST_MESSAGE_COUNT {
+                break;
+            }
+        }
+        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+    }
 
     assert!(
         received.len() >= TEST_MESSAGE_COUNT,
@@ -124,24 +242,59 @@ async fn given_jsonb_rows_source_connector_should_produce_json_messages_to_iggy(
     }
 }
 
-#[tokio::test]
-async fn given_delete_after_read_source_connector_should_remove_rows_after_producing() {
-    let setup = setup_source_delete().await;
-    let pool = setup.create_pool().await;
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/postgres/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn delete_after_read_source_removes_rows_after_producing(
+    harness: &TestHarness,
+    fixture: PostgresSourceDeleteFixture,
+) {
+    let client = harness.client();
+    let pool = fixture.create_pool().await.expect("Failed to create pool");
+    fixture.create_table(&pool).await;
 
-    setup.insert_delete_rows(&pool, TEST_MESSAGE_COUNT).await;
+    for i in 0..TEST_MESSAGE_COUNT {
+        fixture
+            .insert_row(&pool, &format!("row_{i}"), (i * 10) as i32)
+            .await;
+    }
 
-    let initial_count = setup.count_rows(&pool, SOURCE_TABLE_DELETE).await;
+    let initial_count = fixture.count_rows(&pool).await;
     assert_eq!(
         initial_count, TEST_MESSAGE_COUNT as i64,
         "Expected {TEST_MESSAGE_COUNT} rows before processing"
     );
 
-    let received: Vec<serde_json::Value> = setup
-        .poll_messages(TEST_MESSAGE_COUNT, |payload| {
-            serde_json::from_slice(payload).ok()
-        })
-        .await;
+    let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
+    let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
+    let consumer_id: Identifier = "test_consumer".try_into().unwrap();
+
+    let mut received: Vec<serde_json::Value> = Vec::new();
+    for _ in 0..POLL_ATTEMPTS {
+        if let Ok(polled) = client
+            .poll_messages(
+                &stream_id,
+                &topic_id,
+                None,
+                &Consumer::new(consumer_id.clone()),
+                &PollingStrategy::next(),
+                10,
+                true,
+            )
+            .await
+        {
+            for msg in polled.messages {
+                if let Ok(json) = serde_json::from_slice(&msg.payload) {
+                    received.push(json);
+                }
+            }
+            if received.len() >= TEST_MESSAGE_COUNT {
+                break;
+            }
+        }
+        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+    }
 
     assert!(
         received.len() >= TEST_MESSAGE_COUNT,
@@ -149,7 +302,7 @@ async fn given_delete_after_read_source_connector_should_remove_rows_after_produ
         received.len()
     );
 
-    let final_count = setup.count_rows(&pool, SOURCE_TABLE_DELETE).await;
+    let final_count = fixture.count_rows(&pool).await;
     assert_eq!(
         final_count, 0,
         "Expected 0 rows after delete_after_read, got {final_count}"
@@ -158,15 +311,26 @@ async fn given_delete_after_read_source_connector_should_remove_rows_after_produ
     pool.close().await;
 }
 
-#[tokio::test]
-async fn given_processed_column_source_connector_should_mark_rows_after_producing() {
-    let setup = setup_source_mark().await;
-    let pool = setup.create_pool().await;
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/postgres/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn processed_column_source_marks_rows_after_producing(
+    harness: &TestHarness,
+    fixture: PostgresSourceMarkFixture,
+) {
+    let client = harness.client();
+    let pool = fixture.create_pool().await.expect("Failed to create pool");
+    fixture.create_table(&pool).await;
 
-    setup.insert_mark_rows(&pool, TEST_MESSAGE_COUNT).await;
+    for i in 0..TEST_MESSAGE_COUNT {
+        fixture
+            .insert_row(&pool, &format!("row_{i}"), (i * 10) as i32)
+            .await;
+    }
 
-    let initial_unprocessed = setup.count_unprocessed_rows(&pool, SOURCE_TABLE_MARK).await;
-    let initial_processed = setup.count_processed_rows(&pool, SOURCE_TABLE_MARK).await;
+    let initial_unprocessed = fixture.count_unprocessed(&pool).await;
+    let initial_processed = fixture.count_processed(&pool).await;
     assert_eq!(
         initial_unprocessed, TEST_MESSAGE_COUNT as i64,
         "Expected {TEST_MESSAGE_COUNT} unprocessed rows before processing"
@@ -176,11 +340,35 @@ async fn given_processed_column_source_connector_should_mark_rows_after_producin
         "Expected 0 processed rows before processing"
     );
 
-    let received: Vec<serde_json::Value> = setup
-        .poll_messages(TEST_MESSAGE_COUNT, |payload| {
-            serde_json::from_slice(payload).ok()
-        })
-        .await;
+    let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
+    let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
+    let consumer_id: Identifier = "test_consumer".try_into().unwrap();
+
+    let mut received: Vec<serde_json::Value> = Vec::new();
+    for _ in 0..POLL_ATTEMPTS {
+        if let Ok(polled) = client
+            .poll_messages(
+                &stream_id,
+                &topic_id,
+                None,
+                &Consumer::new(consumer_id.clone()),
+                &PollingStrategy::next(),
+                10,
+                true,
+            )
+            .await
+        {
+            for msg in polled.messages {
+                if let Ok(json) = serde_json::from_slice(&msg.payload) {
+                    received.push(json);
+                }
+            }
+            if received.len() >= TEST_MESSAGE_COUNT {
+                break;
+            }
+        }
+        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+    }
 
     assert!(
         received.len() >= TEST_MESSAGE_COUNT,
@@ -188,8 +376,8 @@ async fn given_processed_column_source_connector_should_mark_rows_after_producin
         received.len()
     );
 
-    let final_unprocessed = setup.count_unprocessed_rows(&pool, SOURCE_TABLE_MARK).await;
-    let final_processed = setup.count_processed_rows(&pool, SOURCE_TABLE_MARK).await;
+    let final_unprocessed = fixture.count_unprocessed(&pool).await;
+    let final_processed = fixture.count_processed(&pool).await;
     assert_eq!(
         final_unprocessed, 0,
         "Expected 0 unprocessed rows after processing, got {final_unprocessed}"
@@ -199,7 +387,7 @@ async fn given_processed_column_source_connector_should_mark_rows_after_producin
         "Expected {TEST_MESSAGE_COUNT} processed rows after processing, got {final_processed}"
     );
 
-    let total_count = setup.count_rows(&pool, SOURCE_TABLE_MARK).await;
+    let total_count = fixture.count_rows(&pool).await;
     assert_eq!(
         total_count, TEST_MESSAGE_COUNT as i64,
         "Rows should not be deleted, expected {TEST_MESSAGE_COUNT}, got {total_count}"
