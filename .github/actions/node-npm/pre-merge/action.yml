@@ -37,8 +37,6 @@ runs:
     - name: Setup Rust with cache
       if: inputs.task == 'e2e'
       uses: ./.github/actions/utils/setup-rust-with-cache
-      with:
-        shared-key: dev
 
     - name: Install netcat
       if: inputs.task == 'e2e'

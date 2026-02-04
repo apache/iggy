@@ -27,10 +27,14 @@ on:
         type: string
         required: true
         description: "Task to run"
+    secrets:
+      CODECOV_TOKEN:
+        required: false
 
 permissions:
   contents: read
   security-events: write
+  pull-requests: write
 
 jobs:
   run:
@@ -56,6 +60,16 @@ jobs:
         with:
           task: ${{ inputs.task }}
           component: ${{ inputs.component }}
+
+      - name: Upload coverage to Codecov
+        if: startsWith(inputs.component, 'rust') && inputs.task == 'test'
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: codecov.json
+          flags: rust
+          fail_ci_if_error: false
+          verbose: true
 
       # Python SDK
       - name: Set up Docker Buildx for Python
@@ -130,5 +144,6 @@ jobs:
             reports/**
             target/llvm-cov/**
             coverage.lcov
+            codecov.json
           if-no-files-found: ignore
           retention-days: 7

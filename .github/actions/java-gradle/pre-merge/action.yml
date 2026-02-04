@@ -79,8 +79,6 @@ runs:
     - name: Setup Rust with cache
       if: inputs.task == 'test'
       uses: ./.github/actions/utils/setup-rust-with-cache
-      with:
-        shared-key: dev
 
     - name: Start Iggy server
       if: inputs.task == 'test'

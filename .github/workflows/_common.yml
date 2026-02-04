@@ -137,7 +137,7 @@ jobs:
       - name: Setup Rust toolchain
         uses: ./.github/actions/utils/setup-rust-with-cache
         with:
-          enabled: "false" # Don't need cache for just checking licenses
+          read-cache: "false"
 
       - name: Install cargo-license
         run: cargo install cargo-license
