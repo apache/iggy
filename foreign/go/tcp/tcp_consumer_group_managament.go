@@ -52,9 +52,9 @@ func (tms *IggyTcpClient) CreateConsumerGroup(streamId iggcon.Identifier, topicI
 		return nil, ierror.ErrInvalidConsumerGroupName
 	}
 	message := binaryserialization.CreateGroup(iggcon.CreateConsumerGroupRequest{
-		StreamId:        streamId,
-		TopicId:         topicId,
-		Name:            name,
+		StreamId: streamId,
+		TopicId:  topicId,
+		Name:     name,
 	})
 	buffer, err := tms.sendAndFetchResponse(message, iggcon.CreateGroupCode)
 	if err != nil {

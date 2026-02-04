@@ -22,7 +22,7 @@ on:
     branches: [master]
 
 permissions:
-  contents: read
+  contents: write
   packages: write
   id-token: write
 
@@ -34,258 +34,104 @@ env:
   IGGY_CI_BUILD: true
 
 jobs:
-  plan:
-    name: Plan dockerhub components
+  check-auto-publish:
+    name: Check auto-publish
     runs-on: ubuntu-latest
+    if: ${{ !github.event.repository.fork }}
     outputs:
-      matrix: ${{ steps.mk.outputs.matrix }}
-      components: ${{ steps.mk.outputs.components }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Load publish config (base64)
-        id: cfg
-        shell: bash
-        run: |
-          if ! command -v yq >/dev/null 2>&1; then
-            YQ_VERSION="v4.47.1"
-            YQ_CHECKSUM="0fb28c6680193c41b364193d0c0fc4a03177aecde51cfc04d506b1517158c2fb"
-            curl -sSL -o /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64
-            echo "${YQ_CHECKSUM}  /usr/local/bin/yq" | sha256sum -c - || exit 1
-            chmod +x /usr/local/bin/yq
-          fi
-          echo "components_b64=$(yq -o=json -I=0 '.components' .github/config/publish.yml | base64 -w0)" >> "$GITHUB_OUTPUT"
-
-      - name: Build matrix
-        id: mk
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const b64 = `${{ steps.cfg.outputs.components_b64 }}` || '';
-            if (!b64) {
-              core.setOutput('matrix', JSON.stringify({ include: [{ component: 'noop' }] }));
-              core.setOutput('components', JSON.stringify({ include: [{ component: 'noop' }] }));
-              return;
-            }
-            const comps = JSON.parse(Buffer.from(b64, 'base64').toString('utf8'));
-            const components = Object.entries(comps)
-              .filter(([_, v]) => v && v.registry === 'dockerhub')
-              .map(([k]) => k);
-            const uniqComponents = [...new Set(components)];
-
-            // Output just the component list for manifest creation
-            const componentMatrix = uniqComponents.length
-              ? { include: uniqComponents.map(c => ({ component: c })) }
-              : { include: [{ component: 'noop' }] };
-            core.setOutput('components', JSON.stringify(componentMatrix));
-
-            // Build cross-product matrix: components × platforms
-            const platforms = [
-              { platform: 'linux/amd64', arch: 'amd64', runner: 'ubuntu-latest' },
-              { platform: 'linux/arm64', arch: 'arm64', runner: 'ubuntu-24.04-arm' }
-            ];
-
-            const matrix = [];
-            for (const comp of uniqComponents) {
-              for (const p of platforms) {
-                matrix.push({ component: comp, ...p });
-              }
-            }
-
-            core.setOutput('matrix', JSON.stringify(matrix.length ? { include: matrix } : { include: [{ component: 'noop' }] }));
-            console.log(`Components: ${uniqComponents.join(', ')}`);
-            console.log(`Matrix size: ${matrix.length} jobs (${uniqComponents.length} components × 2 platforms)`);
-
-  docker-edge:
-    name: ${{ matrix.component }} (${{ matrix.arch }})
-    needs: plan
-    if: ${{ fromJson(needs.plan.outputs.matrix).include[0].component != 'noop' }}
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
-    env:
-      DOCKERHUB_USER: ${{ secrets.DOCKERHUB_USER }}
-      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Extract version
-        id: ver
-        run: |
-          chmod +x scripts/extract-version.sh
-          VERSION=$(scripts/extract-version.sh "${{ matrix.component }}")
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "✅ Resolved ${{ matrix.component }} -> version=$VERSION"
-
-      - name: Determine libc for component
-        id: libc
-        run: |
-          # Connectors runtime must use glibc because it dlopen()s glibc plugins
-          if [ "${{ matrix.component }}" = "rust-connectors" ]; then
-            echo "libc=glibc" >> "$GITHUB_OUTPUT"
-          else
-            echo "libc=musl" >> "$GITHUB_OUTPUT"
-          fi
-
-      - uses: ./.github/actions/utils/docker-buildx
-        id: docker
-        with:
-          task: publish
-          libc: ${{ steps.libc.outputs.libc }}
-          component: ${{ matrix.component }}
-          version: ${{ steps.ver.outputs.version }}
-          platform: ${{ matrix.platform }}
-          dry_run: ${{ github.event.repository.fork }}
-          gha-cache: "false"  # Use registry cache only to save GHA cache space
-
-      - name: Export digest
-        if: ${{ !github.event.repository.fork }}
-        shell: bash
-        run: |
-          mkdir -p ${{ runner.temp }}/digests
-          digest="${{ steps.docker.outputs.digest }}"
-          if [ -n "$digest" ]; then
-            touch "${{ runner.temp }}/digests/${digest#sha256:}"
-            echo "Exported digest: $digest"
-          else
-            echo "::error::No digest available"
-            exit 1
-          fi
-
-      - name: Upload digest
-        if: ${{ !github.event.repository.fork }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: docker-digest-${{ matrix.component }}-${{ matrix.arch }}
-          path: ${{ runner.temp }}/digests/*
-          if-no-files-found: error
-          retention-days: 1
-
-  docker-manifests:
-    name: Create manifests
-    needs: [plan, docker-edge, check-docker-auto-publish]
-    if: ${{ !github.event.repository.fork && fromJson(needs.plan.outputs.components).include[0].component != 'noop' }}
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJson(needs.plan.outputs.components) }}
-    env:
-      DOCKERHUB_USER: ${{ secrets.DOCKERHUB_USER }}
-      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Resolve image from config
-        id: config
-        shell: bash
-        run: |
-          if ! command -v yq >/dev/null 2>&1; then
-            YQ_VERSION="v4.47.1"
-            YQ_CHECKSUM="0fb28c6680193c41b364193d0c0fc4a03177aecde51cfc04d506b1517158c2fb"
-            curl -sSL -o /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64
-            echo "${YQ_CHECKSUM}  /usr/local/bin/yq" | sha256sum -c - || exit 1
-            chmod +x /usr/local/bin/yq
-          fi
-          image=$(yq ".components.${{ matrix.component }}.image" .github/config/publish.yml)
-          echo "image=$image" >> "$GITHUB_OUTPUT"
-          echo "📦 Image: $image"
-
-      - name: Download amd64 digest
-        uses: actions/download-artifact@v4
-        with:
-          name: docker-digest-${{ matrix.component }}-amd64
-          path: ${{ runner.temp }}/digests
-
-      - name: Download arm64 digest
-        uses: actions/download-artifact@v4
-        with:
-          name: docker-digest-${{ matrix.component }}-arm64
-          path: ${{ runner.temp }}/digests
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ env.DOCKERHUB_USER }}
-          password: ${{ env.DOCKERHUB_TOKEN }}
-
-      - name: Extract version
-        id: ver
-        run: |
-          chmod +x scripts/extract-version.sh
-          VERSION=$(scripts/extract-version.sh "${{ matrix.component }}")
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-
-      - name: Create and push manifest
-        working-directory: ${{ runner.temp }}/digests
-        env:
-          COMPONENTS_TO_PUBLISH: ${{ needs.check-docker-auto-publish.outputs.components_to_publish }}
-        run: |
-          IMAGE="${{ steps.config.outputs.image }}"
-          COMPONENT="${{ matrix.component }}"
-          VERSION="${{ steps.ver.outputs.version }}"
-
-          echo "Creating manifests for $IMAGE from digests:"
-          ls -la
-
-          # Always create the rolling 'edge' tag
-          docker buildx imagetools create \
-            -t "${IMAGE}:edge" \
-            $(printf "${IMAGE}@sha256:%s " *)
-
-          echo "✅ Pushed manifest: ${IMAGE}:edge"
-
-          # Also create versioned tag if this component needs it
-          if echo "$COMPONENTS_TO_PUBLISH" | grep -qE "(^|,)${COMPONENT}(,|$)"; then
-            echo "Creating versioned manifest for $IMAGE:$VERSION"
-            docker buildx imagetools create \
-              -t "${IMAGE}:${VERSION}" \
-              $(printf "${IMAGE}@sha256:%s " *)
-
-            echo "✅ Pushed manifest: ${IMAGE}:${VERSION}"
-          fi
-
-      - name: Inspect manifest
-        run: |
-          docker buildx imagetools inspect "${{ steps.config.outputs.image }}:edge"
-
-  # Create git tags for Docker images with versioned edge/rc releases
-  create-docker-tags:
-    name: Create Docker git tags
-    runs-on: ubuntu-latest
-    needs: [docker-manifests, check-docker-auto-publish]
-    if: needs.check-docker-auto-publish.outputs.should_publish == 'true'
-    permissions:
-      contents: write
+      docker_components: ${{ steps.check.outputs.docker_components }}
+      crates_to_publish: ${{ steps.check.outputs.crates_to_publish }}
+      sdks_to_publish: ${{ steps.check.outputs.sdks_to_publish }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Create git tags
-        env:
-          COMPONENTS_TO_PUBLISH: ${{ needs.check-docker-auto-publish.outputs.components_to_publish }}
+      - name: Setup yq
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if ! command -v yq >/dev/null 2>&1; then
+            YQ_VERSION="v4.47.1"
+            YQ_CHECKSUM="0fb28c6680193c41b364193d0c0fc4a03177aecde51cfc04d506b1517158c2fb"
+            curl -sSL -o /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64
+            echo "${YQ_CHECKSUM}  /usr/local/bin/yq" | sha256sum -c - || exit 1
+            chmod +x /usr/local/bin/yq
+          fi
 
+      # TODO(hubcio): Add sdk-python (it has to contain `dev`), sdk-node, sdk-java (SNAPSHOT?), sdk-go (store version in file?) when ready for edge auto-publish
+      - name: Check all components
+        id: check
+        run: |
           chmod +x scripts/extract-version.sh
 
-          for component in $(echo "$COMPONENTS_TO_PUBLISH" | tr ',' ' '); do
-            TAG=$(scripts/extract-version.sh "$component" --tag)
+          # Get all Docker components (always publish :edge)
+          DOCKER_COMPONENTS=$(yq -r '.components | to_entries | .[] | select(.value.registry == "dockerhub") | .key' .github/config/publish.yml | tr '\n' ',' | sed 's/,$//')
+          echo "docker_components=$DOCKER_COMPONENTS" >> "$GITHUB_OUTPUT"
+          echo "Docker components: $DOCKER_COMPONENTS"
 
-            if ! git rev-parse "$TAG" >/dev/null 2>&1; then
-              git tag -a "$TAG" -m "Release $TAG"
-              git push origin "$TAG"
-              echo "✅ Created tag: $TAG"
-            else
-              echo "⏭️ Tag $TAG already exists"
+          # Check Rust crates for pre-release versions without tags
+          CRATES_TO_PUBLISH=""
+          for crate in rust-common rust-binary-protocol rust-sdk rust-cli; do
+            VERSION=$(scripts/extract-version.sh "$crate")
+            TAG=$(scripts/extract-version.sh "$crate" --tag)
+
+            echo "Checking $crate: version=$VERSION, tag=$TAG"
+
+            if [[ ! "$VERSION" =~ -(edge|rc) ]]; then
+              echo "  ⏭️ Stable version - skipping"
+              continue
             fi
+
+            if git rev-parse "$TAG" >/dev/null 2>&1; then
+              echo "  ⏭️ Tag exists - skipping"
+              continue
+            fi
+
+            echo "  ✅ Will publish"
+            CRATES_TO_PUBLISH="${CRATES_TO_PUBLISH:+$CRATES_TO_PUBLISH,}$crate"
           done
+          echo "crates_to_publish=$CRATES_TO_PUBLISH" >> "$GITHUB_OUTPUT"
+          echo "Crates to publish: ${CRATES_TO_PUBLISH:-<none>}"
+
+          # Check SDKs for pre-release versions without tags
+          SDKS_TO_PUBLISH=""
+          for sdk in sdk-csharp; do
+            VERSION=$(scripts/extract-version.sh "$sdk")
+            TAG=$(scripts/extract-version.sh "$sdk" --tag)
+
+            echo "Checking $sdk: version=$VERSION, tag=$TAG"
+
+            if [[ ! "$VERSION" =~ -(edge|rc) ]]; then
+              echo "  ⏭️ Stable version - skipping"
+              continue
+            fi
+
+            if git rev-parse "$TAG" >/dev/null 2>&1; then
+              echo "  ⏭️ Tag exists - skipping"
+              continue
+            fi
+
+            echo "  ✅ Will publish"
+            # Convert sdk-csharp to csharp for publish.yml input format
+            SDK_NAME="${sdk#sdk-}"
+            SDKS_TO_PUBLISH="${SDKS_TO_PUBLISH:+$SDKS_TO_PUBLISH,}$SDK_NAME"
+          done
+          echo "sdks_to_publish=$SDKS_TO_PUBLISH" >> "$GITHUB_OUTPUT"
+          echo "SDKs to publish: ${SDKS_TO_PUBLISH:-<none>}"
+
+  call-publish:
+    name: Publish components
+    needs: check-auto-publish
+    uses: ./.github/workflows/publish.yml
+    with:
+      commit: ${{ github.sha }}
+      dry_run: false
+      use_latest_ci: false
+      skip_tag_creation: false
+      publish_crates: ${{ needs.check-auto-publish.outputs.crates_to_publish }}
+      publish_dockerhub: ${{ needs.check-auto-publish.outputs.docker_components }}
+      publish_other: ${{ needs.check-auto-publish.outputs.sdks_to_publish }}
+      create_edge_docker_tag: true
+    secrets: inherit
 
   build-artifacts:
     name: Build artifacts
@@ -373,148 +219,3 @@ jobs:
             - Commit: ${{ github.sha }}
 
             **Not an official ASF release** - for development/testing only.
-
-  # Check if auto-publish should run for Docker edge/rc versions
-  check-docker-auto-publish:
-    name: Check Docker auto-publish
-    runs-on: ubuntu-latest
-    if: ${{ !github.event.repository.fork }}
-    outputs:
-      should_publish: ${{ steps.check.outputs.should_publish }}
-      components_to_publish: ${{ steps.check.outputs.components_to_publish }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Setup yq
-        run: |
-          if ! command -v yq >/dev/null 2>&1; then
-            YQ_VERSION="v4.47.1"
-            YQ_CHECKSUM="0fb28c6680193c41b364193d0c0fc4a03177aecde51cfc04d506b1517158c2fb"
-            curl -sSL -o /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64
-            echo "${YQ_CHECKSUM}  /usr/local/bin/yq" | sha256sum -c - || exit 1
-            chmod +x /usr/local/bin/yq
-          fi
-
-      - name: Check versions and tags for Docker components
-        id: check
-        run: |
-          chmod +x scripts/extract-version.sh
-
-          # Get Docker components from config (same source as plan job)
-          DOCKER_COMPONENTS=$(yq -r '.components | to_entries | .[] | select(.value.registry == "dockerhub") | .key' .github/config/publish.yml)
-
-          COMPONENTS_TO_PUBLISH=""
-
-          for component in $DOCKER_COMPONENTS; do
-            VERSION=$(scripts/extract-version.sh "$component")
-            TAG=$(scripts/extract-version.sh "$component" --tag)
-
-            echo "Checking $component: version=$VERSION, tag=$TAG"
-
-            # Skip if version doesn't contain edge or rc
-            if [[ ! "$VERSION" =~ -(edge|rc) ]]; then
-              echo "  ⏭️ Stable version - skipping"
-              continue
-            fi
-
-            # Skip if git tag already exists
-            if git rev-parse "$TAG" >/dev/null 2>&1; then
-              echo "  ⏭️ Tag exists - skipping"
-              continue
-            fi
-
-            echo "  ✅ Will publish versioned tag"
-            if [ -n "$COMPONENTS_TO_PUBLISH" ]; then
-              COMPONENTS_TO_PUBLISH="$COMPONENTS_TO_PUBLISH,$component"
-            else
-              COMPONENTS_TO_PUBLISH="$component"
-            fi
-          done
-
-          if [ -z "$COMPONENTS_TO_PUBLISH" ]; then
-            echo ""
-            echo "No Docker components need versioned publishing"
-            echo "should_publish=false" >> "$GITHUB_OUTPUT"
-            echo "components_to_publish=" >> "$GITHUB_OUTPUT"
-          else
-            echo ""
-            echo "Components to publish: $COMPONENTS_TO_PUBLISH"
-            echo "should_publish=true" >> "$GITHUB_OUTPUT"
-            echo "components_to_publish=$COMPONENTS_TO_PUBLISH" >> "$GITHUB_OUTPUT"
-          fi
-
-  # Check if auto-publish should run for edge/rc versions
-  check-auto-publish:
-    name: Check auto-publish
-    runs-on: ubuntu-latest
-    if: ${{ !github.event.repository.fork }}
-    outputs:
-      should_publish: ${{ steps.check.outputs.should_publish }}
-      crates_to_publish: ${{ steps.check.outputs.crates_to_publish }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Check versions and tags for each crate
-        id: check
-        run: |
-          chmod +x scripts/extract-version.sh
-
-          CRATES_TO_PUBLISH=""
-
-          # Check each crate individually
-          for crate in rust-common rust-binary-protocol rust-sdk rust-cli; do
-            VERSION=$(scripts/extract-version.sh "$crate")
-            TAG=$(scripts/extract-version.sh "$crate" --tag)
-
-            echo "Checking $crate: version=$VERSION, tag=$TAG"
-
-            # Skip if version doesn't contain edge or rc
-            if [[ ! "$VERSION" =~ -(edge|rc) ]]; then
-              echo "  ⏭️ Stable version - skipping"
-              continue
-            fi
-
-            # Skip if tag already exists
-            if git rev-parse "$TAG" >/dev/null 2>&1; then
-              echo "  ⏭️ Tag exists - skipping"
-              continue
-            fi
-
-            echo "  ✅ Will publish"
-            if [ -n "$CRATES_TO_PUBLISH" ]; then
-              CRATES_TO_PUBLISH="$CRATES_TO_PUBLISH,$crate"
-            else
-              CRATES_TO_PUBLISH="$crate"
-            fi
-          done
-
-          if [ -z "$CRATES_TO_PUBLISH" ]; then
-            echo ""
-            echo "No crates need publishing"
-            echo "should_publish=false" >> "$GITHUB_OUTPUT"
-            echo "crates_to_publish=" >> "$GITHUB_OUTPUT"
-          else
-            echo ""
-            echo "Crates to publish: $CRATES_TO_PUBLISH"
-            echo "should_publish=true" >> "$GITHUB_OUTPUT"
-            echo "crates_to_publish=$CRATES_TO_PUBLISH" >> "$GITHUB_OUTPUT"
-          fi
-
-  # Auto-publish Rust crates for edge/rc versions
-  publish-rust-crates:
-    name: Auto-publish Rust crates
-    needs: check-auto-publish
-    if: needs.check-auto-publish.outputs.should_publish == 'true'
-    permissions:
-      contents: write # Required for git tag push
-    uses: ./.github/workflows/_publish_rust_crates.yml
-    with:
-      crates: ${{ needs.check-auto-publish.outputs.crates_to_publish }}
-      dry_run: false
-      create_tags: true
-    secrets:
-      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
