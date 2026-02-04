@@ -37,8 +37,8 @@ coverage:
 comment:
   layout: "header, diff, flags, files"
   behavior: default
-  require_changes: true
-  require_base: true
+  require_changes: false
+  require_base: false
   require_head: true
 
 ignore:
