@@ -36,8 +36,7 @@ runs:
       if: inputs.task == 'test' || inputs.task == 'e2e'
       uses: ./.github/actions/utils/setup-rust-with-cache
       with:
-        cache-targets: false # Only cache registry and git deps, not target dir (sccache handles that)
-        save-cache: "false"  # Only builds server, let Rust test job save comprehensive cache
+        shared-key: dev
 
     - name: Restore dependencies
       run: |

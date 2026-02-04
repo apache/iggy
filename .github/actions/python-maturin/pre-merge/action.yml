@@ -34,8 +34,7 @@ runs:
     - name: Setup Rust with cache
       uses: ./.github/actions/utils/setup-rust-with-cache
       with:
-        cache-targets: false # Only cache registry and git deps, not target dir (sccache handles that)
-        save-cache: "false"  # Only builds wheel, let Rust test job save comprehensive cache
+        shared-key: dev
 
     - name: Cache pip
       uses: actions/cache@v4

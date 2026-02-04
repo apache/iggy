@@ -44,10 +44,7 @@ runs:
     - name: Setup Rust with cache
       uses: ./.github/actions/utils/setup-rust-with-cache
       with:
-        cache-targets: false # Only cache registry and git deps, not target dir (sccache handles that)
-        # Only test (most comprehensive) and macOS builds should save cache;
-        # aarch64-linux builds are fast enough and we don't want to bloat the cache with platform-specific artifacts
-        save-cache: ${{ inputs.task == 'test' || inputs.task == 'build-macos-aarch64' }}
+        shared-key: dev
 
     - name: Install tools for specific tasks
       run: |
@@ -106,10 +103,10 @@ runs:
       if: inputs.task == 'test'
       run: |
         bins_start=$(date +%s)
-        cargo build --locked --all-targets
+        cargo build --locked
         bins_end=$(date +%s)
         bins_duration=$((bins_end - bins_start))
-        echo "::notice::All targets built in ${bins_duration}s ($(date -ud @${bins_duration} +'%M:%S'))"
+        echo "::notice::Binaries and libraries built in ${bins_duration}s ($(date -ud @${bins_duration} +'%M:%S'))"
 
         compile_start=$(date +%s)
         cargo test --locked --no-run
@@ -152,7 +149,7 @@ runs:
     # aarch64 builds (run on ARM64 runners)
     - name: Build aarch64-gnu
       if: inputs.task == 'build-aarch64-gnu'
-      run: cargo build --locked --all-targets
+      run: cargo build --locked
       shell: bash
 
     - name: Install musl tools for aarch64-musl
@@ -164,7 +161,7 @@ runs:
 
     - name: Build aarch64-musl
       if: inputs.task == 'build-aarch64-musl'
-      run: cargo build --locked --all-targets --target aarch64-unknown-linux-musl
+      run: cargo build --locked --target aarch64-unknown-linux-musl
       shell: bash
       env:
         # Disable GCC outline atomics to avoid undefined __aarch64_ldadd4_sync
@@ -176,16 +173,5 @@ runs:
     # macOS builds
     - name: Build macOS aarch64
       if: inputs.task == 'build-macos-aarch64'
-      run: cargo build --locked --all-targets
-      shell: bash
-
-    - name: Show sccache statistics
-      if: always()
-      run: |
-        if command -v sccache &> /dev/null; then
-          echo "========================================="
-          echo "sccache statistics:"
-          echo "========================================="
-          sccache --show-stats
-        fi
+      run: cargo build --locked
       shell: bash

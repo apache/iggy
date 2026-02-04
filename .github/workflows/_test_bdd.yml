@@ -56,13 +56,12 @@ jobs:
         if: startsWith(inputs.component, 'bdd-') && startsWith(inputs.task, 'bdd-')
         uses: ./.github/actions/utils/setup-rust-with-cache
         with:
-          cache-targets: false # Only cache registry and git deps, not target dir (sccache handles that)
-          save-cache: "false"  # Only builds server+cli, let Rust test job save comprehensive cache
+          shared-key: dev
 
       - name: Build server for BDD tests
         if: startsWith(inputs.component, 'bdd-') && startsWith(inputs.task, 'bdd-')
         run: |
-          echo "Building server binary and CLI for BDD tests with sccache..."
+          echo "Building server binary and CLI for BDD tests..."
           cargo build --locked --bin iggy-server --bin iggy
 
           echo "Server binary built at: target/debug/iggy-server"
