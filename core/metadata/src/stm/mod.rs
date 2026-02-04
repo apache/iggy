@@ -17,6 +17,7 @@
 
 pub mod consumer_group;
 pub mod mux;
+pub mod snapshot;
 pub mod stream;
 pub mod user;
 
@@ -72,6 +73,19 @@ where
     write: Option<WriteCell<T, C>>,
     #[allow(unused)]
     read: Arc<ReadHandle<T>>,
+}
+
+impl<T, C> LeftRight<T, C>
+where
+    T: Absorb<C>,
+{
+    pub fn read<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&T) -> R,
+    {
+        let guard = self.read.enter().expect("read handle should be accessible");
+        f(&*guard)
+    }
 }
 
 impl<T> From<T> for LeftRight<T, <T as Command>::Cmd>
@@ -196,6 +210,16 @@ macro_rules! define_state {
                     left_right.into()
                 }
             }
+
+            impl $state {
+                pub fn snapshot_read<F, R>(&self, f: F) -> R
+                where
+                    F: FnOnce(&[<$state Inner>]) -> R,
+                {
+                    self.inner.read(f)
+                }
+            }
+
 
             impl $crate::stm::State for $state {
                 type Input = <[<$state Inner>] as $crate::stm::Command>::Input;
