@@ -31,6 +31,6 @@ export function userMapper(item: any): User {
     id: item.id,
     createdAt: formatDate(item.created_at),
     status: item.status,
-    username: `${item.username} ${item.id === 1 ? '(root)' : ''}`
+    username: `${item.username} ${item.id === 0 ? '(root)' : ''}`
   };
 }

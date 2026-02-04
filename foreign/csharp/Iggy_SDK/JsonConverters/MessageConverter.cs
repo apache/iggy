@@ -54,38 +54,51 @@ internal sealed class MessageConverter : JsonConverter<Message>
     {
         if (userHeaders is null)
         {
-            writer.WriteNull("headers");
+            writer.WriteNull("user_headers");
             return;
         }
 
-        writer.WriteStartObject("headers");
+        writer.WriteStartArray("user_headers");
 
         foreach (var (headerKey, headerValue) in userHeaders)
         {
-            writer.WriteStartObject(headerKey.Value);
+            writer.WriteStartObject();
+
+            writer.WriteStartObject("key");
+            writer.WriteString("kind", GetHeaderKindString(headerKey.Kind));
+            writer.WriteBase64String("value", headerKey.Value);
+            writer.WriteEndObject();
+
+            writer.WriteStartObject("value");
             writer.WriteString("kind", GetHeaderKindString(headerValue.Kind));
             writer.WriteBase64String("value", headerValue.Value);
             writer.WriteEndObject();
+
+            writer.WriteEndObject();
         }
 
-        writer.WriteEndObject();
+        writer.WriteEndArray();
     }
 
     private static string GetHeaderKindString(HeaderKind kind)
     {
         return kind switch
         {
+            HeaderKind.Raw => "raw",
+            HeaderKind.String => "string",
             HeaderKind.Bool => "bool",
+            HeaderKind.Int8 => "int8",
+            HeaderKind.Int16 => "int16",
             HeaderKind.Int32 => "int32",
             HeaderKind.Int64 => "int64",
             HeaderKind.Int128 => "int128",
+            HeaderKind.Uint8 => "uint8",
+            HeaderKind.Uint16 => "uint16",
             HeaderKind.Uint32 => "uint32",
             HeaderKind.Uint64 => "uint64",
             HeaderKind.Uint128 => "uint128",
             HeaderKind.Float => "float32",
             HeaderKind.Double => "float64",
-            HeaderKind.String => "string",
-            HeaderKind.Raw => "raw",
             _ => throw new ArgumentOutOfRangeException(nameof(kind), kind, "Invalid header kind")
         };
     }

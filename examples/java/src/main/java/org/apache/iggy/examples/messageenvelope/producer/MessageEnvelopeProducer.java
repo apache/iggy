@@ -42,6 +42,7 @@ import java.util.List;
 import java.util.Optional;
 
 public final class MessageEnvelopeProducer {
+
     private static final String STREAM_NAME = "envelope-stream";
     private static final StreamId STREAM_ID = StreamId.of(STREAM_NAME);
 
@@ -62,7 +63,7 @@ public final class MessageEnvelopeProducer {
                 .host("localhost")
                 .port(8090)
                 .credentials("iggy", "iggy")
-                .build();
+                .buildAndLogin();
 
         Optional<StreamDetails> stream = client.streams().getStream(STREAM_ID);
         if (stream.isPresent()) {
@@ -126,7 +127,8 @@ public final class MessageEnvelopeProducer {
                         BigInteger.ZERO,
                         BigInteger.ZERO,
                         0L,
-                        (long) payload.length);
+                        (long) payload.length,
+                        BigInteger.ZERO);
                 Message message = new Message(header, payload, new HashMap<>());
                 messages.add(message);
                 serializableMessages.add(serializableMessage);

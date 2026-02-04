@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using System.Text.Json.Serialization;
 using Apache.Iggy.Headers;
+using Apache.Iggy.JsonConverters;
 using Apache.Iggy.Messages;
 
 namespace Apache.Iggy.Contracts;
@@ -38,5 +40,7 @@ public sealed class MessageResponse
     /// <summary>
     ///     Headers defined by the user.
     /// </summary>
+    [JsonPropertyName("user_headers")]
+    [JsonConverter(typeof(UserHeadersConverter))]
     public Dictionary<HeaderKey, HeaderValue>? UserHeaders { get; init; }
 }

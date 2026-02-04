@@ -19,6 +19,7 @@
 
 plugins {
     java
+    id("com.diffplug.spotless") version "8.1.0"
 }
 
 repositories {
@@ -31,6 +32,18 @@ dependencies {
     testImplementation("io.cucumber:cucumber-junit-platform-engine:7.33.0")
     testImplementation("org.junit.jupiter:junit-jupiter:5.11.0")
     testImplementation("org.junit.platform:junit-platform-suite:1.11.0")
+}
+
+spotless {
+    java {
+        palantirJavaFormat()
+        endWithNewline()
+        trimTrailingWhitespace()
+        importOrder("", "\n", "javax|java", "\n", "\\#")
+        removeUnusedImports()
+        forbidWildcardImports()
+        formatAnnotations()
+    }
 }
 
 tasks.test {

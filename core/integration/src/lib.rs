@@ -35,3 +35,14 @@ pub mod test_mcp_server;
 #[allow(deprecated)]
 pub mod test_server;
 pub mod test_tls_utils;
+
+pub use harness_derive::iggy_harness;
+
+#[doc(hidden)]
+pub mod __macro_support {
+    pub use crate::harness::{
+        ClientConfig, McpClient, McpConfig, TestHarness, TestServerConfig, TlsConfig,
+    };
+    pub use iggy::prelude::ClientWrapper;
+    pub use iggy_common::TransportProtocol;
+}

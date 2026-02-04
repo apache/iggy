@@ -20,6 +20,7 @@
 package org.apache.iggy.client.async;
 
 import org.apache.iggy.client.async.tcp.AsyncIggyTcpClient;
+import org.apache.iggy.client.blocking.IntegrationTest;
 import org.apache.iggy.consumergroup.Consumer;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
@@ -79,9 +80,9 @@ public class AsyncPollMessageTest {
                     // Ignore close errors
                 }
             }
-            client = new AsyncIggyTcpClient("127.0.0.1", 8090);
+            client = new AsyncIggyTcpClient(IntegrationTest.LOCALHOST_IP, IntegrationTest.TCP_PORT);
             client.connect().get(5, TimeUnit.SECONDS);
-            client.users().loginAsync("iggy", "iggy").get(5, TimeUnit.SECONDS);
+            client.users().login("iggy", "iggy").get(5, TimeUnit.SECONDS);
             log.info("Client reconnected successfully");
         }
     }
@@ -89,7 +90,7 @@ public class AsyncPollMessageTest {
     private boolean isConnected(AsyncIggyTcpClient client) {
         // Check if client is connected by attempting a simple operation
         try {
-            client.streams().getStreamsAsync().get(1, TimeUnit.SECONDS);
+            client.streams().getStreams().get(1, TimeUnit.SECONDS);
             return true;
         } catch (InterruptedException | ExecutionException | TimeoutException e) {
             return false;
@@ -101,19 +102,19 @@ public class AsyncPollMessageTest {
         log.info("Setting up async client for poll message tests");
 
         // Initialize client
-        client = new AsyncIggyTcpClient("127.0.0.1", 8090);
+        client = new AsyncIggyTcpClient(IntegrationTest.LOCALHOST_IP, IntegrationTest.TCP_PORT);
         client.connect().get(5, TimeUnit.SECONDS);
-        client.users().loginAsync("iggy", "iggy").get(5, TimeUnit.SECONDS);
+        client.users().login("iggy", "iggy").get(5, TimeUnit.SECONDS);
         log.info("Successfully connected and logged in");
 
         // Create unique stream for this test run
         testStream = "poll-test-stream-" + UUID.randomUUID();
-        var stream = client.streams().createStreamAsync(testStream).get(5, TimeUnit.SECONDS);
+        var stream = client.streams().createStream(testStream).get(5, TimeUnit.SECONDS);
         log.info("Created test stream: {}", stream.name());
 
         // Create topic with 2 partitions
         var topic = client.topics()
-                .createTopicAsync(
+                .createTopic(
                         StreamId.of(testStream),
                         2L,
                         CompressionAlgorithm.None,
@@ -132,7 +133,7 @@ public class AsyncPollMessageTest {
                     .toList();
 
             client.messages()
-                    .sendMessagesAsync(
+                    .sendMessages(
                             StreamId.of(testStream),
                             TopicId.of(TEST_TOPIC),
                             Partitioning.partitionId((long) partition),
@@ -149,7 +150,7 @@ public class AsyncPollMessageTest {
 
         // Delete stream (cascades to topics and consumer groups)
         try {
-            client.streams().deleteStreamAsync(StreamId.of(testStream)).get(5, TimeUnit.SECONDS);
+            client.streams().deleteStream(StreamId.of(testStream)).get(5, TimeUnit.SECONDS);
             log.info("Deleted test stream: {}", testStream);
         } catch (RuntimeException e) {
             log.warn("Failed to delete test stream: {}", e.getMessage());
@@ -173,7 +174,7 @@ public class AsyncPollMessageTest {
 
         try {
             var polledMessages = client.messages()
-                    .pollMessagesAsync(
+                    .pollMessages(
                             StreamId.of(testStream),
                             TopicId.of(TEST_TOPIC),
                             Optional.of(PARTITION_ID),
@@ -204,7 +205,7 @@ public class AsyncPollMessageTest {
 
         try {
             var polledMessages = client.messages()
-                    .pollMessagesAsync(
+                    .pollMessages(
                             StreamId.of(testStream),
                             TopicId.of(TEST_TOPIC),
                             Optional.of(PARTITION_ID),
@@ -240,7 +241,7 @@ public class AsyncPollMessageTest {
             var sessionConsumer = Consumer.of(0L);
 
             var polledMessages = client.messages()
-                    .pollMessagesAsync(
+                    .pollMessages(
                             StreamId.of(testStream),
                             TopicId.of(TEST_TOPIC),
                             Optional.of(PARTITION_ID),
@@ -275,7 +276,7 @@ public class AsyncPollMessageTest {
         log.info("  Testing FIRST strategy");
         try {
             var firstMessages = client.messages()
-                    .pollMessagesAsync(
+                    .pollMessages(
                             StreamId.of(testStream),
                             TopicId.of(TEST_TOPIC),
                             Optional.of(1L),
@@ -295,7 +296,7 @@ public class AsyncPollMessageTest {
         log.info("  Testing OFFSET strategy");
         try {
             var offsetMessages = client.messages()
-                    .pollMessagesAsync(
+                    .pollMessages(
                             StreamId.of(testStream),
                             TopicId.of(TEST_TOPIC),
                             Optional.of(1L),
@@ -315,7 +316,7 @@ public class AsyncPollMessageTest {
         log.info("  Testing LAST strategy");
         try {
             var lastMessages = client.messages()
-                    .pollMessagesAsync(
+                    .pollMessages(
                             StreamId.of(testStream),
                             TopicId.of(TEST_TOPIC),
                             Optional.of(1L),

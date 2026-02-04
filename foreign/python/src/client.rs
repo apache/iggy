@@ -22,6 +22,7 @@ use iggy::prelude::{
 };
 use pyo3::prelude::*;
 use pyo3::types::{PyDelta, PyList, PyType};
+use pyo3::PyRef;
 use pyo3_async_runtimes::tokio::future_into_py;
 use pyo3_stub_gen::define_stub_info_gatherer;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
@@ -138,11 +139,7 @@ impl IggyClient {
     /// Returns Ok(()) on successful stream creation or a PyRuntimeError on failure.
     #[pyo3(signature = (name))]
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
-    fn create_stream<'a>(
-        &self,
-        py: Python<'a>,
-        name: String,
-    ) -> PyResult<Bound<'a, PyAny>> {
+    fn create_stream<'a>(&self, py: Python<'a>, name: String) -> PyResult<Bound<'a, PyAny>> {
         let inner = self.inner.clone();
         future_into_py(py, async move {
             inner
@@ -254,7 +251,10 @@ impl IggyClient {
     ) -> PyResult<Bound<'a, PyAny>> {
         let messages: Vec<SendMessage> = messages
             .iter()
-            .map(|item| item.extract::<SendMessage>())
+            .map(|item| {
+                let msg: PyRef<'_, SendMessage> = item.extract()?;
+                Ok::<_, PyErr>(msg.clone())
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let mut messages: Vec<RustMessage> = messages
             .into_iter()

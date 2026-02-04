@@ -16,7 +16,7 @@
  * under the License.
  */
 
-use iggy_common::ConfigEnv;
+use configs::ConfigEnv;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]

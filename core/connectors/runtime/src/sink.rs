@@ -65,6 +65,7 @@ pub async fn init(
         let init_error: Option<String>;
         if let Some(container) = sink_connectors.get_mut(&path) {
             info!("Sink container for plugin: {path} is already loaded.",);
+            let version = get_plugin_version(&container.container);
             init_error = init_sink(
                 &container.container,
                 &config.plugin_config.unwrap_or_default(),
@@ -77,6 +78,7 @@ pub async fn init(
                 key: key.to_owned(),
                 name: name.to_owned(),
                 path: path.to_owned(),
+                version,
                 config_format: config.plugin_config_format,
                 consumers: vec![],
                 error: init_error.clone(),
@@ -86,6 +88,7 @@ pub async fn init(
             let container: Container<SinkApi> =
                 unsafe { Container::load(&path).expect("Failed to load sink container") };
             info!("Sink container for plugin: {path} loaded successfully.",);
+            let version = get_plugin_version(&container);
             init_error = init_sink(
                 &container,
                 &config.plugin_config.unwrap_or_default(),
@@ -102,6 +105,7 @@ pub async fn init(
                         key: key.to_owned(),
                         name: name.to_owned(),
                         path: path.to_owned(),
+                        version,
                         config_format: config.plugin_config_format,
                         consumers: vec![],
                         error: init_error.clone(),
@@ -329,6 +333,15 @@ async fn consume_messages(
     }
     info!("Stopped consuming messages for sink connector with ID: {plugin_id}");
     Ok(())
+}
+
+fn get_plugin_version(container: &Container<SinkApi>) -> String {
+    unsafe {
+        let version_ptr = (container.version)();
+        std::ffi::CStr::from_ptr(version_ptr)
+            .to_string_lossy()
+            .into_owned()
+    }
 }
 
 fn init_sink(

@@ -105,8 +105,8 @@ public class FetchMessagesTests
         {
             responseMessage.UserHeaders.ShouldNotBeNull();
             responseMessage.UserHeaders.Count.ShouldBe(2);
-            responseMessage.UserHeaders[HeaderKey.New("header1")].ToString().ShouldBe("value1");
-            responseMessage.UserHeaders[HeaderKey.New("header2")].ToInt32().ShouldBeGreaterThan(0);
+            responseMessage.UserHeaders[HeaderKey.FromString("header1")].ToString().ShouldBe("value1");
+            responseMessage.UserHeaders[HeaderKey.FromString("header2")].ToInt32().ShouldBeGreaterThan(0);
         }
     }
 }

@@ -35,8 +35,6 @@ jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 60
-    env:
-      IGGY_CI_BUILD: true
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -50,7 +48,7 @@ jobs:
         uses: ./.github/actions/utils/setup-rust-with-cache
         with:
           cache-targets: false # Only cache registry and git deps, not target dir (sccache handles that)
-          save-cache: "false"  # Only builds server+examples, let Rust test job save comprehensive cache
+          save-cache: "false" # Only builds server+examples, let Rust test job save comprehensive cache
 
       - name: Setup Node with cache for examples
         if: inputs.component == 'examples-suite'
@@ -73,19 +71,19 @@ jobs:
           path: ~/.cache/pip
           key: pip-${{ runner.os }}-${{ hashFiles('foreign/python/pyproject.toml') }}
 
-      - name: Setup Java
+      - name: Setup Java with cache for examples
         if: inputs.component == 'examples-suite' && inputs.task == 'examples-java'
-        uses: actions/setup-java@v4
+        uses: ./.github/actions/utils/setup-java-with-cache
         with:
-          distribution: "temurin"
-          java-version: "17"
-          cache: "gradle"
+          gradle-cache-disabled: "true"
 
-      - name: Setup Gradle
-        if: inputs.component == 'examples-suite' && inputs.task == 'examples-java'
-        uses: gradle/actions/setup-gradle@af1da67850ed9a4cedd57bfd976089dd991e2582 # v4.0.0
+      - name: Setup Go with cache for examples
+        if: inputs.component == 'examples-suite' && inputs.task == 'examples-go'
+        uses: ./.github/actions/utils/setup-go-with-cache
         with:
-          gradle-version: "9.2.1"
+          enabled: "false"
+          cache-dependency-path: examples/go/go.sum
+          download-deps: "false"
 
       - name: Build common binaries for all examples
         if: inputs.component == 'examples-suite'
@@ -154,6 +152,15 @@ jobs:
         if: inputs.component == 'examples-suite' && inputs.task == 'examples-node'
         run: |
           echo "Running Node.js examples tests..."
+          # Build the local Node SDK first (examples use file: link to it)
+          cd foreign/node
+          npm ci
+          npm run build
+          cd ../..
+          # Install examples dependencies (will use the local SDK)
+          cd examples/node
+          npm ci
+          cd ../..
           ./scripts/run-node-examples-from-readme.sh
 
       - name: Run Java examples

@@ -20,7 +20,6 @@ use bytes::Bytes;
 use iggy::prelude::*;
 use integration::test_server::{ClientFactory, assert_clean_system, login_root};
 use std::collections::HashMap;
-use std::str::FromStr;
 
 const STREAM_NAME: &str = "test-stream";
 const TOPIC_NAME: &str = "test-topic";
@@ -202,29 +201,30 @@ fn create_string_of_size(size: usize) -> String {
 
 fn create_message_header_of_size(target_size: usize) -> HashMap<HeaderKey, HeaderValue> {
     let mut headers = HashMap::new();
-    let mut header_id = 1;
     let mut current_size = 0;
+    let mut header_id: u32 = 0;
 
     while current_size < target_size {
         let remaining_size = target_size - current_size;
+        let key_bytes = header_id.to_le_bytes();
+        let key_len = key_bytes.len();
+        let header_overhead = 1 + 4 + key_len + 1 + 4;
+        let min_header_size = header_overhead + 1;
 
-        let key_str = format!("header-{header_id}");
-        let key_overhead = 4; // 4 bytes for key length
-        let value_overhead = 5; // 1 byte for type + 4 bytes for value length
-        let total_overhead = key_overhead + key_str.len() + value_overhead;
-
-        let value_size = if remaining_size <= total_overhead {
+        if remaining_size < min_header_size {
             break;
-        } else if remaining_size - total_overhead > MAX_SINGLE_HEADER_SIZE {
+        }
+
+        let value_size = if remaining_size - header_overhead > MAX_SINGLE_HEADER_SIZE {
             MAX_SINGLE_HEADER_SIZE
         } else {
-            remaining_size - total_overhead
+            remaining_size - header_overhead
         };
 
-        let key = HeaderKey::new(key_str.as_str()).unwrap();
-        let value = HeaderValue::from_str(create_string_of_size(value_size).as_str()).unwrap();
+        let key = HeaderKey::try_from(key_bytes.as_slice()).unwrap();
+        let value = HeaderValue::try_from(create_string_of_size(value_size).as_str()).unwrap();
 
-        let actual_header_size = 4 + key_str.len() + 1 + 4 + value_size;
+        let actual_header_size = header_overhead + value_size;
         current_size += actual_header_size;
 
         headers.insert(key, value);

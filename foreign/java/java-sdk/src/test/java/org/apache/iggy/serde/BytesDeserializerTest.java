@@ -22,6 +22,7 @@ package org.apache.iggy.serde;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import org.apache.commons.lang3.ArrayUtils;
+import org.apache.iggy.message.HeaderKey;
 import org.apache.iggy.message.HeaderKind;
 import org.apache.iggy.topic.CompressionAlgorithm;
 import org.apache.iggy.user.UserStatus;
@@ -340,6 +341,7 @@ class BytesDeserializerTest {
             writeU64(buffer, BigInteger.valueOf(1000)); // origin timestamp
             buffer.writeIntLE(0); // user headers length
             buffer.writeIntLE(5); // payload length
+            writeU64(buffer, BigInteger.ZERO); // reserved
             buffer.writeBytes("hello".getBytes()); // payload
 
             // when
@@ -364,14 +366,16 @@ class BytesDeserializerTest {
 
             // Calculate and write user headers
             ByteBuf headersBuffer = Unpooled.buffer();
-            headersBuffer.writeIntLE(3); // key length
+            headersBuffer.writeByte(HeaderKind.String.asCode());
+            headersBuffer.writeIntLE(3);
             headersBuffer.writeBytes("key".getBytes());
             headersBuffer.writeByte(HeaderKind.Raw.asCode());
-            headersBuffer.writeIntLE(3); // value length
+            headersBuffer.writeIntLE(3);
             headersBuffer.writeBytes("val".getBytes());
 
             buffer.writeIntLE(headersBuffer.readableBytes()); // user headers length
             buffer.writeIntLE(3); // payload length
+            writeU64(buffer, BigInteger.ZERO); // reserved
             buffer.writeBytes("abc".getBytes()); // payload
             buffer.writeBytes(headersBuffer); // user headers
 
@@ -380,7 +384,8 @@ class BytesDeserializerTest {
 
             // then
             assertThat(message.userHeaders()).hasSize(1);
-            assertThat(message.userHeaders().get("key").value()).isEqualTo("val");
+            assertThat(message.userHeaders().get(HeaderKey.fromString("key")).asRaw())
+                    .isEqualTo("val".getBytes());
         }
 
         @Test
@@ -398,6 +403,7 @@ class BytesDeserializerTest {
             writeU64(buffer, BigInteger.valueOf(1000));
             buffer.writeIntLE(0);
             buffer.writeIntLE(2);
+            writeU64(buffer, BigInteger.ZERO); // reserved
             buffer.writeBytes("hi".getBytes());
 
             // when

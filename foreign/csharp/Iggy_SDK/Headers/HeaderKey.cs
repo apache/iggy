@@ -15,48 +15,70 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using System.Text.Json.Serialization;
-using Apache.Iggy.JsonConverters;
+using System.Text;
 
 namespace Apache.Iggy.Headers;
 
 /// <summary>
-///     A key for a header.
+/// Represents a message header key with a kind and binary value.
 /// </summary>
-[JsonConverter(typeof(HeaderKeyConverter))]
 public readonly struct HeaderKey : IEquatable<HeaderKey>
 {
     /// <summary>
-    ///     Header key value.
+    /// The kind of the header key.
     /// </summary>
-    public required string Value { get; init; }
+    public required HeaderKind Kind { get; init; }
 
     /// <summary>
-    ///     Creates a new header key from a string.
+    /// The binary value of the header key.
     /// </summary>
-    /// <param name="val">Key value</param>
-    /// <returns></returns>
-    /// <exception cref="ArgumentException"></exception>
-    public static HeaderKey New(string val)
+    public required byte[] Value { get; init; }
+
+    /// <summary>
+    /// Creates a HeaderKey from a string value.
+    /// </summary>
+    /// <param name="val">The string value (must be 1-255 characters).</param>
+    /// <returns>A new HeaderKey with String kind.</returns>
+    /// <exception cref="ArgumentException">Thrown when value length is invalid.</exception>
+    public static HeaderKey FromString(string val)
     {
+        if (val.Length is 0 or > 255)
+        {
+            throw new ArgumentException("Value has incorrect size, must be between 1 and 255", nameof(val));
+        }
+
         return new HeaderKey
         {
-            Value = val.Length is 0 or > 255
-                ? throw new ArgumentException("Value has incorrect size, must be between 1 and 255", nameof(val))
-                : val
+            Kind = HeaderKind.String,
+            Value = Encoding.UTF8.GetBytes(val)
         };
+    }
+
+    /// <summary>
+    /// Gets the value as a UTF-8 string.
+    /// </summary>
+    /// <returns>The string value.</returns>
+    /// <exception cref="InvalidOperationException">Thrown when kind is not String.</exception>
+    public string AsString()
+    {
+        if (Kind is not HeaderKind.String)
+        {
+            throw new InvalidOperationException("HeaderKey is not of String kind");
+        }
+
+        return Encoding.UTF8.GetString(Value);
     }
 
     /// <inheritdoc />
     public override string ToString()
     {
-        return Value;
+        return Kind == HeaderKind.String ? Encoding.UTF8.GetString(Value) : Convert.ToBase64String(Value);
     }
 
     /// <inheritdoc />
     public bool Equals(HeaderKey other)
     {
-        return StringComparer.Ordinal.Equals(Value, other.Value);
+        return Kind == other.Kind && Value.SequenceEqual(other.Value);
     }
 
     /// <inheritdoc />
@@ -68,26 +90,27 @@ public readonly struct HeaderKey : IEquatable<HeaderKey>
     /// <inheritdoc />
     public override int GetHashCode()
     {
-        return StringComparer.Ordinal.GetHashCode(Value);
+        var hash = new HashCode();
+        hash.Add(Kind);
+        foreach (var b in Value)
+        {
+            hash.Add(b);
+        }
+
+        return hash.ToHashCode();
     }
 
     /// <summary>
-    ///     Determines whether two specified <see cref="HeaderKey" /> objects are equal.
+    /// Determines whether two HeaderKey instances are equal.
     /// </summary>
-    /// <param name="left">The first <see cref="HeaderKey" /> to compare.</param>
-    /// <param name="right">The second <see cref="HeaderKey" /> to compare.</param>
-    /// <returns>True if the two <see cref="HeaderKey" /> objects are equal; otherwise, false.</returns>
     public static bool operator ==(HeaderKey left, HeaderKey right)
     {
         return left.Equals(right);
     }
 
     /// <summary>
-    ///     Determines whether two specified <see cref="HeaderKey" /> objects are not equal.
+    /// Determines whether two HeaderKey instances are not equal.
     /// </summary>
-    /// <param name="left">The first <see cref="HeaderKey" /> to compare.</param>
-    /// <param name="right">The second <see cref="HeaderKey" /> to compare.</param>
-    /// <returns>True if the two <see cref="HeaderKey" /> objects are not equal; otherwise, false.</returns>
     public static bool operator !=(HeaderKey left, HeaderKey right)
     {
         return !left.Equals(right);

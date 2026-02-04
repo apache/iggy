@@ -19,13 +19,15 @@
 
 package org.apache.iggy.client.async.tcp;
 
+import org.apache.iggy.exception.IggyInvalidArgumentException;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
-import java.time.Duration;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 
+import static org.apache.iggy.client.blocking.IntegrationTest.LOCALHOST_IP;
+import static org.apache.iggy.client.blocking.IntegrationTest.TCP_PORT;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -36,9 +38,6 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * Tests the builder functionality against a running Iggy server.
  */
 class AsyncIggyTcpClientBuilderTest {
-
-    private static final String HOST = "127.0.0.1";
-    private static final int PORT = 8090;
 
     private AsyncIggyTcpClient client;
 
@@ -52,7 +51,7 @@ class AsyncIggyTcpClientBuilderTest {
     @Test
     void shouldCreateClientWithBuilder() throws Exception {
         // Given: Builder with basic configuration
-        client = AsyncIggyTcpClient.builder().host(HOST).port(PORT).build();
+        client = AsyncIggyTcpClient.builder().host(LOCALHOST_IP).port(TCP_PORT).build();
 
         // When: Connect to server
         client.connect().get(5, TimeUnit.SECONDS);
@@ -66,135 +65,9 @@ class AsyncIggyTcpClientBuilderTest {
     }
 
     @Test
-    void shouldCreateClientWithCredentials() throws Exception {
-        // Given: Builder with credentials configured
-        client = AsyncIggyTcpClient.builder()
-                .host(HOST)
-                .port(PORT)
-                .credentials("iggy", "iggy")
-                .build();
-
-        // When: Connect (auto-login should happen)
-        CompletableFuture<Void> connectFuture = client.connect();
-        connectFuture.get(5, TimeUnit.SECONDS);
-
-        // Then: Should be connected and logged in
-        assertNotNull(client.users());
-    }
-
-    @Test
-    void shouldCreateClientWithTimeoutConfiguration() throws Exception {
-        // Given: Builder with timeout configuration
-        client = AsyncIggyTcpClient.builder()
-                .host(HOST)
-                .port(PORT)
-                .connectionTimeout(Duration.ofSeconds(30))
-                .requestTimeout(Duration.ofSeconds(10))
-                .credentials("iggy", "iggy")
-                .build();
-
-        // When: Connect to server
-        client.connect().get(5, TimeUnit.SECONDS);
-
-        // Then: Should succeed
-        assertNotNull(client.users());
-    }
-
-    @Test
-    void shouldCreateClientWithConnectionPoolSize() throws Exception {
-        // Given: Builder with connection pool size
-        client = AsyncIggyTcpClient.builder()
-                .host(HOST)
-                .port(PORT)
-                .connectionPoolSize(10)
-                .credentials("iggy", "iggy")
-                .build();
-
-        // When: Connect to server
-        client.connect().get(5, TimeUnit.SECONDS);
-
-        // Then: Should succeed
-        assertNotNull(client.users());
-    }
-
-    @Test
-    void shouldCreateClientWithRetryPolicy() throws Exception {
-        // Given: Builder with exponential backoff retry policy
-        client = AsyncIggyTcpClient.builder()
-                .host(HOST)
-                .port(PORT)
-                .retryPolicy(AsyncIggyTcpClient.RetryPolicy.exponentialBackoff())
-                .credentials("iggy", "iggy")
-                .build();
-
-        // When: Connect to server
-        client.connect().get(5, TimeUnit.SECONDS);
-
-        // Then: Should succeed
-        assertNotNull(client.users());
-    }
-
-    @Test
-    void shouldCreateClientWithCustomRetryPolicy() throws Exception {
-        // Given: Builder with custom retry policy
-        client = AsyncIggyTcpClient.builder()
-                .host(HOST)
-                .port(PORT)
-                .retryPolicy(AsyncIggyTcpClient.RetryPolicy.fixedDelay(5, Duration.ofMillis(500)))
-                .credentials("iggy", "iggy")
-                .build();
-
-        // When: Connect to server
-        client.connect().get(5, TimeUnit.SECONDS);
-
-        // Then: Should succeed
-        assertNotNull(client.users());
-    }
-
-    @Test
-    void shouldCreateClientWithNoRetryPolicy() throws Exception {
-        // Given: Builder with no retry policy
-        client = AsyncIggyTcpClient.builder()
-                .host(HOST)
-                .port(PORT)
-                .retryPolicy(AsyncIggyTcpClient.RetryPolicy.noRetry())
-                .credentials("iggy", "iggy")
-                .build();
-
-        // When: Connect to server
-        client.connect().get(5, TimeUnit.SECONDS);
-
-        // Then: Should succeed
-        assertNotNull(client.users());
-    }
-
-    @Test
-    void shouldCreateClientWithAllOptions() throws Exception {
-        // Given: Builder with all configuration options
-        client = AsyncIggyTcpClient.builder()
-                .host(HOST)
-                .port(PORT)
-                .credentials("iggy", "iggy")
-                .connectionTimeout(Duration.ofSeconds(30))
-                .requestTimeout(Duration.ofSeconds(10))
-                .connectionPoolSize(10)
-                .retryPolicy(AsyncIggyTcpClient.RetryPolicy.exponentialBackoff(
-                        3, Duration.ofMillis(100), Duration.ofSeconds(5), 2.0))
-                .build();
-
-        // When: Connect to server
-        client.connect().get(5, TimeUnit.SECONDS);
-
-        // Then: Should succeed
-        assertNotNull(client.users());
-    }
-
-    @Test
     void shouldUseDefaultValues() throws Exception {
-        // Given: Builder with only credentials (should use defaults)
-        client = AsyncIggyTcpClient.builder()
-                .credentials("iggy", "iggy")
-                .build(); // Uses default host=localhost, port=8090
+        // Given: Builder with defaults (should use host=localhost, port=8090)
+        client = AsyncIggyTcpClient.builder().build();
 
         // When: Connect to server
         client.connect().get(5, TimeUnit.SECONDS);
@@ -206,47 +79,47 @@ class AsyncIggyTcpClientBuilderTest {
     @Test
     void shouldThrowExceptionForEmptyHost() {
         // Given: Builder with empty host
-        AsyncIggyTcpClient.Builder builder =
-                AsyncIggyTcpClient.builder().host("").port(PORT);
+        AsyncIggyTcpClientBuilder builder =
+                AsyncIggyTcpClient.builder().host("").port(TCP_PORT);
 
-        // When/Then: Building should throw IllegalArgumentException
-        assertThrows(IllegalArgumentException.class, builder::build);
+        // When/Then: Building should throw IggyInvalidArgumentException
+        assertThrows(IggyInvalidArgumentException.class, builder::build);
     }
 
     @Test
     void shouldThrowExceptionForNullHost() {
         // Given: Builder with null host
-        AsyncIggyTcpClient.Builder builder =
-                AsyncIggyTcpClient.builder().host(null).port(PORT);
+        AsyncIggyTcpClientBuilder builder =
+                AsyncIggyTcpClient.builder().host(null).port(TCP_PORT);
 
-        // When/Then: Building should throw IllegalArgumentException
-        assertThrows(IllegalArgumentException.class, builder::build);
+        // When/Then: Building should throw IggyInvalidArgumentException
+        assertThrows(IggyInvalidArgumentException.class, builder::build);
     }
 
     @Test
     void shouldThrowExceptionForInvalidPort() {
         // Given: Builder with invalid port
-        AsyncIggyTcpClient.Builder builder =
-                AsyncIggyTcpClient.builder().host(HOST).port(-1);
+        AsyncIggyTcpClientBuilder builder =
+                AsyncIggyTcpClient.builder().host(LOCALHOST_IP).port(-1);
 
-        // When/Then: Building should throw IllegalArgumentException
-        assertThrows(IllegalArgumentException.class, builder::build);
+        // When/Then: Building should throw IggyInvalidArgumentException
+        assertThrows(IggyInvalidArgumentException.class, builder::build);
     }
 
     @Test
     void shouldThrowExceptionForZeroPort() {
         // Given: Builder with zero port
-        AsyncIggyTcpClient.Builder builder =
-                AsyncIggyTcpClient.builder().host(HOST).port(0);
+        AsyncIggyTcpClientBuilder builder =
+                AsyncIggyTcpClient.builder().host(LOCALHOST_IP).port(0);
 
-        // When/Then: Building should throw IllegalArgumentException
-        assertThrows(IllegalArgumentException.class, builder::build);
+        // When/Then: Building should throw IggyInvalidArgumentException
+        assertThrows(IggyInvalidArgumentException.class, builder::build);
     }
 
     @Test
     void shouldMaintainBackwardCompatibilityWithOldConstructor() throws Exception {
         // Given: Old constructor approach
-        client = new AsyncIggyTcpClient(HOST, PORT);
+        client = new AsyncIggyTcpClient(LOCALHOST_IP, TCP_PORT);
 
         // When: Connect to server
         client.connect().get(5, TimeUnit.SECONDS);
@@ -257,12 +130,8 @@ class AsyncIggyTcpClientBuilderTest {
 
     @Test
     void shouldConnectAndPerformOperations() throws Exception {
-        // Given: Client with credentials
-        client = AsyncIggyTcpClient.builder()
-                .host(HOST)
-                .port(PORT)
-                .credentials("iggy", "iggy")
-                .build();
+        // Given: Client
+        client = AsyncIggyTcpClient.builder().host(LOCALHOST_IP).port(TCP_PORT).build();
 
         // When: Connect
         client.connect().get(5, TimeUnit.SECONDS);
@@ -278,11 +147,7 @@ class AsyncIggyTcpClientBuilderTest {
     @Test
     void shouldCloseConnectionGracefully() throws Exception {
         // Given: Connected client
-        client = AsyncIggyTcpClient.builder()
-                .host(HOST)
-                .port(PORT)
-                .credentials("iggy", "iggy")
-                .build();
+        client = AsyncIggyTcpClient.builder().host(LOCALHOST_IP).port(TCP_PORT).build();
         client.connect().get(5, TimeUnit.SECONDS);
 
         // When: Close connection

@@ -22,6 +22,7 @@ package org.apache.iggy.client.blocking.http;
 import org.apache.iggy.client.blocking.ConsumerGroupsClient;
 import org.apache.iggy.consumergroup.ConsumerGroup;
 import org.apache.iggy.consumergroup.ConsumerGroupDetails;
+import org.apache.iggy.exception.IggyOperationNotSupportedException;
 import org.apache.iggy.identifier.ConsumerId;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
@@ -64,12 +65,12 @@ class ConsumerGroupsHttpClient implements ConsumerGroupsClient {
 
     @Override
     public void joinConsumerGroup(StreamId streamId, TopicId topicId, ConsumerId groupId) {
-        throw new UnsupportedOperationException("Method not available in HTTP client");
+        throw new IggyOperationNotSupportedException("joinConsumerGroup", "HTTP");
     }
 
     @Override
     public void leaveConsumerGroup(StreamId streamId, TopicId topicId, ConsumerId groupId) {
-        throw new UnsupportedOperationException("Method not available in HTTP client");
+        throw new IggyOperationNotSupportedException("leaveConsumerGroup", "HTTP");
     }
 
     private static String path(StreamId streamId, TopicId topicId) {

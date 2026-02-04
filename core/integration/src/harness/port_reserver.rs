@@ -189,6 +189,36 @@ pub struct ProtocolAddresses {
     pub websocket: Option<SocketAddr>,
 }
 
+/// Pre-allocated ports for a cluster of servers.
+pub struct ClusterPortReserver {
+    nodes: Vec<PortReserver>,
+}
+
+impl ClusterPortReserver {
+    /// Reserve ports for all nodes in a cluster.
+    pub fn reserve(
+        node_count: usize,
+        ip_kind: IpAddrKind,
+        config: &TestServerConfig,
+    ) -> Result<Self, TestBinaryError> {
+        let mut nodes = Vec::with_capacity(node_count);
+        for _ in 0..node_count {
+            nodes.push(PortReserver::reserve(ip_kind, config)?);
+        }
+        Ok(Self { nodes })
+    }
+
+    /// Get the addresses for all nodes.
+    pub fn all_addresses(&self) -> Vec<ProtocolAddresses> {
+        self.nodes.iter().map(|n| n.addresses()).collect()
+    }
+
+    /// Take ownership of individual port reservers for each node.
+    pub fn into_reservers(self) -> Vec<PortReserver> {
+        self.nodes
+    }
+}
+
 impl PortReserver {
     /// Reserve ports for all protocols enabled in the config.
     pub fn reserve(

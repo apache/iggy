@@ -262,7 +262,7 @@ pub async fn run(client_factory: &dyn ClientFactory) {
     assert_eq!(topic.name, TOPIC_NAME);
     assert_eq!(topic.partitions_count, PARTITIONS_COUNT);
     assert_eq!(topic.partitions.len(), PARTITIONS_COUNT as usize);
-    assert_eq!(topic.size, 89806);
+    assert_eq!(topic.size, 100502);
     assert_eq!(topic.messages_count, MESSAGES_COUNT as u64);
     let topic_partition = topic.partitions.get((PARTITION_ID) as usize).unwrap();
     assert_eq!(topic_partition.id, PARTITION_ID);

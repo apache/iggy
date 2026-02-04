@@ -35,9 +35,9 @@ public class OffsetTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task StoreOffset_IndividualConsumer_Should_StoreOffset_Successfully(Protocol protocol)
     {
-        await Fixture.Clients[protocol]
+        await Should.NotThrowAsync(() => Fixture.Clients[protocol]
             .StoreOffsetAsync(Consumer.New("test-consumer"), Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-                Identifier.String(Fixture.TopicRequest.Name), SetOffset, 0);
+                Identifier.String(Fixture.TopicRequest.Name), SetOffset, 0));
     }
 
     [Test]
@@ -68,9 +68,9 @@ public class OffsetTests
             Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
             Identifier.String(Fixture.TopicRequest.Name), Identifier.String("test_consumer_group"));
 
-        await Fixture.Clients[protocol]
+        await Should.NotThrowAsync(() => Fixture.Clients[protocol]
             .StoreOffsetAsync(Consumer.Group("test_consumer_group"), Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-                Identifier.String(Fixture.TopicRequest.Name), SetOffset, 0);
+                Identifier.String(Fixture.TopicRequest.Name), SetOffset, 0));
     }
 
     [Test]
@@ -89,7 +89,7 @@ public class OffsetTests
     }
 
     [Test]
-    [DependsOn(nameof(StoreOffset_ConsumerGroup_Should_StoreOffset_Successfully))]
+    [DependsOn(nameof(GetOffset_ConsumerGroup_Should_GetOffset_Successfully))]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task GetOffset_ConsumerGroup_ByName_Should_GetOffset_Successfully(Protocol protocol)
     {

@@ -17,11 +17,10 @@
  * under the License.
  */
 
-
-export * from './poll-messages.command.js';
-export * from './send-messages.command.js';
-export * from './message.utils.js';
+export * from "./poll-messages.command.js";
+export * from "./send-messages.command.js";
+export * from "./message.utils.js";
 export * from "./poll.utils.js";
 
-export { Partitioning } from './partitioning.utils.js';
-export { HeaderValue } from './header.utils.js';
+export { Partitioning } from "./partitioning.utils.js";
+export { HeaderValue, HeaderKeyFactory } from "./header.utils.js";

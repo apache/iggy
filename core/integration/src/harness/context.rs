@@ -115,24 +115,27 @@ impl TestContext {
         &self.base_dir
     }
 
-    pub fn mcp_stdout_path(&self) -> PathBuf {
-        self.base_dir.join("mcp_stdout.log")
+    pub fn mcp_stdout_path(&self, server_id: u32) -> PathBuf {
+        self.base_dir.join(format!("mcp_{server_id}_stdout.log"))
     }
 
-    pub fn mcp_stderr_path(&self) -> PathBuf {
-        self.base_dir.join("mcp_stderr.log")
+    pub fn mcp_stderr_path(&self, server_id: u32) -> PathBuf {
+        self.base_dir.join(format!("mcp_{server_id}_stderr.log"))
     }
 
-    pub fn connectors_runtime_state_path(&self) -> PathBuf {
-        self.base_dir.join("connectors_state")
+    pub fn connectors_runtime_state_path(&self, server_id: u32) -> PathBuf {
+        self.base_dir
+            .join(format!("connectors_runtime_{server_id}_state"))
     }
 
-    pub fn connectors_runtime_stdout_path(&self) -> PathBuf {
-        self.base_dir.join("connectors_stdout.log")
+    pub fn connectors_runtime_stdout_path(&self, server_id: u32) -> PathBuf {
+        self.base_dir
+            .join(format!("connectors_runtime_{server_id}_stdout.log"))
     }
 
-    pub fn connectors_runtime_stderr_path(&self) -> PathBuf {
-        self.base_dir.join("connectors_stderr.log")
+    pub fn connectors_runtime_stderr_path(&self, server_id: u32) -> PathBuf {
+        self.base_dir
+            .join(format!("connectors_runtime_{server_id}_stderr.log"))
     }
 
     pub fn test_stdout_path(&self) -> PathBuf {
@@ -185,10 +188,11 @@ mod tests {
     #[test]
     fn test_context_paths() {
         let ctx = TestContext::new(Some("test_context_paths".to_string()), true).unwrap();
-        assert!(ctx.mcp_stdout_path().ends_with("mcp_stdout.log"));
+        assert!(ctx.mcp_stdout_path(0).ends_with("mcp_0_stdout.log"));
         assert!(
-            ctx.connectors_runtime_state_path()
-                .ends_with("connectors_state")
+            ctx.connectors_runtime_state_path(0)
+                .ends_with("connectors_runtime_0_state")
         );
+        assert!(ctx.mcp_stdout_path(1).ends_with("mcp_1_stdout.log"));
     }
 }

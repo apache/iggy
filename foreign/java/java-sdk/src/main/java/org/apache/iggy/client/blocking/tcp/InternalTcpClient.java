@@ -25,6 +25,10 @@ import io.netty.channel.ChannelHandlerContext;
 import io.netty.handler.codec.ByteToMessageDecoder;
 import io.netty.handler.ssl.SslContext;
 import io.netty.handler.ssl.SslContextBuilder;
+import org.apache.iggy.exception.IggyConnectionException;
+import org.apache.iggy.exception.IggyEmptyResponseException;
+import org.apache.iggy.exception.IggyServerException;
+import org.apache.iggy.exception.IggyTlsException;
 import org.apache.iggy.serde.CommandCode;
 import reactor.core.publisher.Mono;
 import reactor.netty.Connection;
@@ -66,7 +70,7 @@ final class InternalTcpClient {
                 SslContext sslContext = builder.build();
                 tcpClient = tcpClient.secure(sslSpec -> sslSpec.sslContext(sslContext));
             } catch (SSLException e) {
-                throw new RuntimeException("Failed to configure TLS for TcpClient", e);
+                throw new IggyTlsException("Failed to configure TLS for TcpClient", e);
             }
         }
 
@@ -106,7 +110,7 @@ final class InternalTcpClient {
     <T> T exchangeForEntity(CommandCode command, ByteBuf payload, Function<ByteBuf, T> responseMapper) {
         return exchange(command, payload, response -> {
             if (!response.payload().isReadable()) {
-                throw new RuntimeException("Received an empty response for command " + command);
+                throw new IggyEmptyResponseException(command.toString());
             }
             return responseMapper.apply(response.payload());
         });
@@ -131,7 +135,10 @@ final class InternalTcpClient {
         try {
             IggyResponse response = responses.take();
             if (response.status() != 0) {
-                throw new RuntimeException("Received an invalid response with status " + response.status());
+                byte[] errorPayload = new byte[response.payload().readableBytes()];
+                response.payload().readBytes(errorPayload);
+                response.payload().release();
+                throw IggyServerException.fromTcpResponse(response.status(), errorPayload);
             }
             try {
                 return responseMapper.apply(response);
@@ -139,7 +146,7 @@ final class InternalTcpClient {
                 response.payload().release();
             }
         } catch (InterruptedException e) {
-            throw new RuntimeException(e);
+            throw new IggyConnectionException("Interrupted while waiting for response", e);
         }
     }
 

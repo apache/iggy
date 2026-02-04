@@ -27,7 +27,7 @@ use crate::args::{
     transport::BenchmarkTransportCommand,
 };
 use clap::{CommandFactory, Parser, error::ErrorKind};
-use iggy::prelude::IggyByteSize;
+use iggy::prelude::{IggyByteSize, IggyExpiry};
 use std::num::NonZeroU32;
 
 /// Polling benchmark with consumer group
@@ -59,6 +59,10 @@ pub struct BalancedProducerAndConsumerGroupArgs {
     /// Max topic size in human readable format, e.g. "1GiB", "2MiB", "1GiB". If not provided then the server default will be used.
     #[arg(long, short = 'T')]
     pub max_topic_size: Option<IggyByteSize>,
+
+    /// Topic message expiry time in human readable format, e.g. "1s", "5min", "1h". If not provided, messages never expire.
+    #[arg(long, short = 'e')]
+    pub message_expiry: Option<IggyExpiry>,
 
     /// Consumer rate limit multiplier relative to producer rate.
     /// When measuring E2E latency, consumers may need higher throughput to prevent queue buildup.
@@ -123,5 +127,9 @@ impl BenchmarkKindProps for BalancedProducerAndConsumerGroupArgs {
 
     fn max_topic_size(&self) -> Option<IggyByteSize> {
         self.max_topic_size
+    }
+
+    fn message_expiry(&self) -> IggyExpiry {
+        self.message_expiry.unwrap_or(IggyExpiry::NeverExpire)
     }
 }

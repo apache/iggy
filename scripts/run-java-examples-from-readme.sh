@@ -1,5 +1,6 @@
 #!/bin/bash
 
+#
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
@@ -16,6 +17,7 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+#
 
 set -euo pipefail
 
@@ -118,7 +120,7 @@ if [ -f "${README_FILE}" ]; then
 
         # Small delay between runs to avoid thrashing the server
         sleep 2
-    done < <(grep -E '^gradle' "${README_FILE}")
+    done < <(grep -E '^\./gradlew' "${README_FILE}")
 else
     echo "README file ${README_FILE} not found in examples/java."
 fi

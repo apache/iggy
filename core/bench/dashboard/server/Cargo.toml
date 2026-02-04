@@ -22,17 +22,17 @@ version = "0.5.1-edge.1"
 edition = "2024"
 
 [dependencies]
-actix-cors = "0.7.1"
-actix-files = "0.6.9"
-actix-web = "4.12.1"
-bench-dashboard-shared = { path = "../shared" }
+actix-cors = { workspace = true }
+actix-files = { workspace = true }
+actix-web = { workspace = true }
+bench-dashboard-shared = { workspace = true }
 bench-report = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
 clap = { workspace = true }
 dashmap = { workspace = true }
-file-operation = "0.8.17"
-notify = "8.2.0"
-octocrab = "0.49.5"
+file-operation = { workspace = true }
+notify = { workspace = true }
+octocrab = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
@@ -41,5 +41,5 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
-walkdir = "2.5.0"
+walkdir = { workspace = true }
 zip = { workspace = true, features = ["deflate"] }

@@ -143,7 +143,7 @@ public class IggyPartitionSplitReader<T> {
             // Poll messages from Iggy (async with blocking)
             PolledMessages polledMessages = asyncClient
                     .messages()
-                    .pollMessagesAsync(streamId, topicId, partitionId, consumer, strategy, pollBatchSize, true)
+                    .pollMessages(streamId, topicId, partitionId, consumer, strategy, pollBatchSize, true)
                     .join();
 
             log.info(

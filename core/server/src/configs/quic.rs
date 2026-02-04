@@ -16,7 +16,7 @@
  * under the License.
  */
 
-use iggy_common::ConfigEnv;
+use configs::ConfigEnv;
 use iggy_common::IggyByteSize;
 use iggy_common::IggyDuration;
 use serde::{Deserialize, Serialize};

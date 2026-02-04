@@ -17,20 +17,38 @@
  * under the License.
  */
 
-use crate::connectors::random::setup;
+use iggy_binary_protocol::MessageClient;
+use iggy_common::{Consumer, Identifier, PollingStrategy};
+use integration::harness::seeds;
+use integration::iggy_harness;
 use std::time::Duration;
 use tokio::time::sleep;
 
-#[tokio::test]
-async fn given_valid_configuration_random_source_connector_should_produce_messages() {
-    let runtime = setup().await;
-    let client = runtime.create_client().await;
-    // Wait for some messages to be produced
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/random/config.toml")),
+    seed = seeds::connector_stream
+)]
+async fn random_source_produces_messages(harness: &TestHarness) {
     sleep(Duration::from_secs(1)).await;
+
+    let client = harness.client();
+    let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
+    let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
+    let consumer_id: Identifier = "test_consumer".try_into().unwrap();
+
     let messages = client
-        .poll_messages()
+        .poll_messages(
+            &stream_id,
+            &topic_id,
+            None,
+            &Consumer::new(consumer_id),
+            &PollingStrategy::next(),
+            10,
+            true,
+        )
         .await
         .expect("Failed to poll messages");
+
     assert!(
         !messages.messages.is_empty(),
         "No messages received from random source"

@@ -96,8 +96,8 @@ public class Message
     /// <returns></returns>
     public int GetSize()
     {
-        //return 56 + Payload.Length + (UserHeaders?.Count ?? 0);
-        return 56 + Payload.Length;
+        //return 64 + Payload.Length + (UserHeaders?.Count ?? 0);
+        return 64 + Payload.Length;
     }
 
     private ulong CalculateChecksum(byte[] bytes)

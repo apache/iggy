@@ -17,7 +17,7 @@
  */
 
 use super::{output::BenchmarkOutputCommand, transport::BenchmarkTransportCommand};
-use iggy::prelude::{IggyByteSize, TransportProtocol};
+use iggy::prelude::{IggyByteSize, IggyExpiry, TransportProtocol};
 
 pub trait BenchmarkKindProps {
     fn streams(&self) -> u32;
@@ -27,6 +27,9 @@ pub trait BenchmarkKindProps {
     fn producers(&self) -> u32;
     fn transport_command(&self) -> &BenchmarkTransportCommand;
     fn max_topic_size(&self) -> Option<IggyByteSize>;
+    fn message_expiry(&self) -> IggyExpiry {
+        IggyExpiry::NeverExpire
+    }
     fn validate(&self);
 
     /// Consumer rate limit multiplier relative to producer rate.

@@ -163,7 +163,7 @@ ok "worktree at $MASTER_DIR"
 pushd "$MASTER_DIR" >/dev/null
 
 info "Building iggy-server & benches (baseline: $MASTER_REF)"
-IGGY_CI_BUILD=true cargo build --bins
+cargo build --locked --bin iggy-server --bin iggy-bench
 ok "built baseline"
 
 info "Starting iggy-server (baseline)"
@@ -220,7 +220,7 @@ git rev-parse --verify "$PR_REF^{commit}" >/dev/null 2>&1 || die "PR_REF '$PR_RE
 git checkout -q "$PR_REF"
 
 info "Building iggy-server & benches (PR: $PR_REF)"
-IGGY_CI_BUILD=true cargo build --bins
+cargo build --locked --bin iggy-server --bin iggy-bench
 ok "built PR"
 
 info "Restoring baseline local_data/ into PR workspace"

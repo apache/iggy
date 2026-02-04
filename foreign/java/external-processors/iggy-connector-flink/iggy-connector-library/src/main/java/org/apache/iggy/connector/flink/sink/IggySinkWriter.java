@@ -67,7 +67,7 @@ public class IggySinkWriter<T> implements SinkWriter<T> {
     public enum PartitioningStrategy {
         BALANCED,
         PARTITION_ID,
-        MESSAGE_KEY
+        MESSAGE_KEY,
     }
 
     /**
@@ -89,7 +89,6 @@ public class IggySinkWriter<T> implements SinkWriter<T> {
             int batchSize,
             Duration flushInterval,
             PartitioningStrategy partitioningStrategy) {
-
         if (httpClient == null) {
             throw new IllegalArgumentException("httpClient cannot be null");
         }
@@ -172,7 +171,6 @@ public class IggySinkWriter<T> implements SinkWriter<T> {
             // Clear buffer and update flush time
             buffer.clear();
             lastFlushTime = System.currentTimeMillis();
-
         } catch (RuntimeException e) {
             log.error("IggySinkWriter.flush() - ERROR: {}", e.getMessage(), e);
             throw new ConnectorException(
@@ -206,7 +204,6 @@ public class IggySinkWriter<T> implements SinkWriter<T> {
         switch (partitioningStrategy) {
             case BALANCED:
                 return Partitioning.balanced();
-
             case PARTITION_ID:
                 // Use first element's partition key if available
                 if (!buffer.isEmpty()) {
@@ -216,7 +213,6 @@ public class IggySinkWriter<T> implements SinkWriter<T> {
                     }
                 }
                 return Partitioning.balanced();
-
             case MESSAGE_KEY:
                 // Use first element's partition key as message key
                 if (!buffer.isEmpty()) {
@@ -226,7 +222,6 @@ public class IggySinkWriter<T> implements SinkWriter<T> {
                     }
                 }
                 return Partitioning.balanced();
-
             default:
                 return Partitioning.balanced();
         }
@@ -287,7 +282,9 @@ public class IggySinkWriter<T> implements SinkWriter<T> {
                 BigInteger.ZERO, // timestamp
                 BigInteger.ZERO, // originTimestamp
                 0L, // userHeadersLength
-                (long) payload.length); // payloadLength
+                (long) payload.length, // payloadLength
+                BigInteger.ZERO // reserved
+                );
 
         return new Message(header, payload, Collections.emptyMap());
     }

@@ -1,0 +1,80 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+package org.apache.iggy.exception;
+
+import java.util.EnumSet;
+import java.util.Optional;
+import java.util.Set;
+
+/**
+ * Exception thrown when input validation fails.
+ *
+ * <p>This includes errors such as invalid command format, invalid names,
+ * message validation failures, etc.
+ */
+public class IggyValidationException extends IggyServerException {
+
+    private static final Set<IggyErrorCode> CODES = EnumSet.of(
+            IggyErrorCode.INVALID_COMMAND,
+            IggyErrorCode.INVALID_FORMAT,
+            IggyErrorCode.FEATURE_UNAVAILABLE,
+            IggyErrorCode.CANNOT_PARSE_INT,
+            IggyErrorCode.CANNOT_PARSE_SLICE,
+            IggyErrorCode.CANNOT_PARSE_UTF8,
+            IggyErrorCode.INVALID_STREAM_NAME,
+            IggyErrorCode.CANNOT_CREATE_STREAM_DIRECTORY,
+            IggyErrorCode.INVALID_TOPIC_NAME,
+            IggyErrorCode.INVALID_REPLICATION_FACTOR,
+            IggyErrorCode.CANNOT_CREATE_TOPIC_DIRECTORY,
+            IggyErrorCode.CONSUMER_GROUP_MEMBER_NOT_FOUND,
+            IggyErrorCode.INVALID_CONSUMER_GROUP_NAME,
+            IggyErrorCode.TOO_MANY_MESSAGES,
+            IggyErrorCode.EMPTY_MESSAGES,
+            IggyErrorCode.TOO_BIG_MESSAGE,
+            IggyErrorCode.INVALID_MESSAGE_CHECKSUM);
+
+    /**
+     * Constructs a new IggyValidationException.
+     *
+     * @param errorCode the error code enum
+     * @param rawErrorCode the raw numeric error code from the server
+     * @param reason the error reason/message
+     * @param field the optional field related to the error
+     * @param errorId the optional error ID for correlation with server logs
+     */
+    public IggyValidationException(
+            IggyErrorCode errorCode,
+            int rawErrorCode,
+            String reason,
+            Optional<String> field,
+            Optional<String> errorId) {
+        super(errorCode, rawErrorCode, reason, field, errorId);
+    }
+
+    /**
+     * Returns whether the given error code should map to this exception type.
+     *
+     * @param code the error code to check
+     * @return true if this exception type handles the given error code
+     */
+    public static boolean matches(IggyErrorCode code) {
+        return CODES.contains(code);
+    }
+}

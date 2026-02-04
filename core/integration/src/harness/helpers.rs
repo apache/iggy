@@ -27,11 +27,10 @@ use iggy::prelude::{
 pub const USER_PASSWORD: &str = "secret";
 
 /// Login as root user.
-pub async fn login_root(client: &impl UserClient) -> IdentityInfo {
+pub async fn login_root(client: &impl UserClient) -> Result<IdentityInfo, iggy_common::IggyError> {
     client
         .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
         .await
-        .expect("Failed to login as root")
 }
 
 /// Login as a specific user with the default test password.
