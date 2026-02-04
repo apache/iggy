@@ -241,28 +241,22 @@ async fn should_handle_single_message_per_batch_with_delayed_persistence() {
 async fn segment_rotation_scenario() {
     let mut extra_envs = HashMap::new();
 
-    // Very small segment to trigger frequent rotations
     extra_envs.insert("IGGY_SYSTEM_SEGMENT_SIZE".to_string(), "512B".to_string());
 
-    // Short message saver interval to add concurrent persist operations
     extra_envs.insert("IGGY_MESSAGE_SAVER_INTERVAL".to_string(), "1s".to_string());
 
-    // Small threshold to trigger more frequent saves
     extra_envs.insert(
         "IGGY_SYSTEM_PARTITION_MESSAGES_REQUIRED_TO_SAVE".to_string(),
         "32".to_string(),
     );
 
-    // cache_indexes = none triggers clear_active_indexes in handle_full_segment
     extra_envs.insert(
         "IGGY_SYSTEM_SEGMENT_CACHE_INDEXES".to_string(),
         "none".to_string(),
     );
 
-    // Disable socket migration to keep all connections on same shard
     extra_envs.insert("IGGY_TCP_SOCKET_MIGRATION".to_string(), "false".to_string());
 
-    // Enable TCP nodelay for faster message throughput
     extra_envs.insert(
         "IGGY_TCP_SOCKET_OVERRIDE_DEFAULTS".to_string(),
         "true".to_string(),
