@@ -34,18 +34,18 @@ func successfullyCreateTopic(streamId uint32, client iggycli.Client) (uint32, st
 	replicationFactor := uint8(1)
 	name := createRandomString(128)
 	streamIdentifier, _ := iggcon.NewIdentifier(streamId)
-    topic, err := client.CreateTopic(
+	topic, err := client.CreateTopic(
 		streamIdentifier,
 		name,
 		2,
 		1,
 		0,
 		math.MaxUint64,
-        &replicationFactor)
+		&replicationFactor)
 
-    itShouldSuccessfullyCreateTopic(streamId, topic.Id, name, client)
+	itShouldSuccessfullyCreateTopic(streamId, topic.Id, name, client)
 	itShouldNotReturnError(err)
-    return topic.Id, name
+	return topic.Id, name
 }
 
 //assertions

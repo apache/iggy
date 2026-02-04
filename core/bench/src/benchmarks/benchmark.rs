@@ -112,10 +112,11 @@ pub trait Benchmarkable: Send {
                     .args()
                     .max_topic_size()
                     .map_or(MaxTopicSize::Unlimited, MaxTopicSize::Custom);
+                let message_expiry = self.args().message_expiry();
 
                 info!(
-                    "Creating the test topic '{}' for stream '{}' with max topic size: {:?}",
-                    topic_name, stream_name, max_topic_size
+                    "Creating the test topic '{}' for stream '{}' with max topic size: {:?}, message expiry: {}",
+                    topic_name, stream_name, max_topic_size, message_expiry
                 );
 
                 client
@@ -125,7 +126,7 @@ pub trait Benchmarkable: Send {
                         partitions_count,
                         CompressionAlgorithm::default(),
                         None,
-                        IggyExpiry::NeverExpire,
+                        message_expiry,
                         max_topic_size,
                     )
                     .await?;

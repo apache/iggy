@@ -18,7 +18,6 @@
  */
 
 import { Client, Partitioning } from "apache-iggy";
-import crypto from "crypto";
 import debug from "debug";
 import {
   PARTITION_COUNT,

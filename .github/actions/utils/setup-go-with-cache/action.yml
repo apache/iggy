@@ -52,7 +52,7 @@ runs:
       uses: actions/setup-go@v5
       with:
         go-version: ${{ inputs.go-version }}
-        cache: ${{ inputs.enabled }}
+        cache: ${{ inputs.enabled == 'true' }}
         cache-dependency-path: ${{ inputs.cache-dependency-path }}
 
     - name: Setup additional Go module cache

@@ -121,8 +121,6 @@ impl IggyShard {
         Ok(())
     }
 
-    /// Initialize a new segment in local_partitions.
-    /// Used when partition data is in local_partitions (not slabs).
     async fn init_log_in_local_partitions(
         &self,
         namespace: &IggyNamespace,
@@ -130,11 +128,7 @@ impl IggyShard {
         use crate::streaming::segments::storage::create_segment_storage;
 
         let start_offset = 0;
-        let segment = Segment::new(
-            start_offset,
-            self.config.system.segment.size,
-            self.config.system.segment.message_expiry,
-        );
+        let segment = Segment::new(start_offset, self.config.system.segment.size);
 
         let storage = create_segment_storage(
             &self.config.system,
@@ -161,6 +155,7 @@ impl IggyShard {
 
     /// Rotate to a new segment when the current segment is full.
     /// The new segment starts at the next offset after the current segment's end.
+    /// Seals the old segment so it becomes eligible for expiry-based cleanup.
     pub(crate) async fn rotate_segment_in_local_partitions(
         &self,
         namespace: &IggyNamespace,
@@ -168,18 +163,16 @@ impl IggyShard {
         use crate::streaming::segments::storage::create_segment_storage;
 
         let start_offset = {
-            let partitions = self.local_partitions.borrow();
+            let mut partitions = self.local_partitions.borrow_mut();
             let partition = partitions
-                .get(namespace)
+                .get_mut(namespace)
                 .expect("rotate_segment: partition must exist");
-            partition.log.active_segment().end_offset + 1
+            let active_segment = partition.log.active_segment_mut();
+            active_segment.sealed = true;
+            active_segment.end_offset + 1
         };
 
-        let segment = Segment::new(
-            start_offset,
-            self.config.system.segment.size,
-            self.config.system.segment.message_expiry,
-        );
+        let segment = Segment::new(start_offset, self.config.system.segment.size);
 
         let storage = create_segment_storage(
             &self.config.system,
@@ -197,9 +190,9 @@ impl IggyShard {
             partition.log.add_persisted_segment(segment, storage);
             partition.stats.increment_segments_count(1);
             tracing::info!(
-                "Rotated to new segment at offset {} for partition {:?}",
+                "Rotated to new segment at offset {} for partition {}",
                 start_offset,
-                namespace
+                namespace.partition_id()
             );
         }
         Ok(())

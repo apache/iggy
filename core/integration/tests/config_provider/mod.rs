@@ -43,10 +43,7 @@ async fn validate_config_env_override() {
             "IGGY_MESSAGE_SAVER_ENABLED",
             expected_message_saver.to_string(),
         );
-        env::set_var(
-            "IGGY_SYSTEM_SEGMENT_MESSAGE_EXPIRY",
-            expected_message_expiry,
-        );
+        env::set_var("IGGY_SYSTEM_TOPIC_MESSAGE_EXPIRY", expected_message_expiry);
     }
 
     let config_path = get_root_path().join("../server/config.toml");
@@ -61,7 +58,7 @@ async fn validate_config_env_override() {
     assert_eq!(config.tcp.enabled, expected_tcp);
     assert_eq!(config.message_saver.enabled, expected_message_saver);
     assert_eq!(
-        config.system.segment.message_expiry.to_string(),
+        config.system.topic.message_expiry.to_string(),
         expected_message_expiry
     );
 
@@ -69,7 +66,7 @@ async fn validate_config_env_override() {
         env::remove_var("IGGY_HTTP_ENABLED");
         env::remove_var("IGGY_TCP_ENABLED");
         env::remove_var("IGGY_MESSAGE_SAVER_ENABLED");
-        env::remove_var("IGGY_SYSTEM_SEGMENT_MESSAGE_EXPIRY");
+        env::remove_var("IGGY_SYSTEM_TOPIC_MESSAGE_EXPIRY");
     }
 }
 

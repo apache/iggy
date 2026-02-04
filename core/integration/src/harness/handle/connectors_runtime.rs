@@ -37,6 +37,7 @@ use tokio::time::sleep;
 const TEST_VERBOSITY_ENV_VAR: &str = "IGGY_TEST_VERBOSE";
 
 pub struct ConnectorsRuntimeHandle {
+    server_id: u32,
     config: ConnectorsRuntimeConfig,
     context: Arc<TestContext>,
     envs: HashMap<String, String>,
@@ -72,7 +73,7 @@ impl ConnectorsRuntimeHandle {
     }
 
     pub fn state_path(&self) -> PathBuf {
-        self.context.connectors_runtime_state_path()
+        self.context.connectors_runtime_state_path(self.server_id)
     }
 
     pub fn collect_logs(&self) -> (String, String) {
@@ -80,7 +81,7 @@ impl ConnectorsRuntimeHandle {
     }
 
     fn build_envs(&mut self) {
-        let state_path = self.context.connectors_runtime_state_path();
+        let state_path = self.context.connectors_runtime_state_path(self.server_id);
         self.envs.insert(
             "IGGY_CONNECTORS_STATE_PATH".to_string(),
             state_path.display().to_string(),
@@ -108,15 +109,18 @@ impl ConnectorsRuntimeHandle {
     }
 }
 
-impl TestBinary for ConnectorsRuntimeHandle {
-    type Config = ConnectorsRuntimeConfig;
-
-    fn with_config(config: Self::Config, context: Arc<TestContext>) -> Self {
+impl ConnectorsRuntimeHandle {
+    pub fn with_server_id(
+        config: ConnectorsRuntimeConfig,
+        context: Arc<TestContext>,
+        server_id: u32,
+    ) -> Self {
         let reserver =
             SinglePortReserver::new().expect("Failed to reserve port for connectors runtime");
         let server_address = reserver.address();
 
         Self {
+            server_id,
             config,
             context,
             envs: HashMap::new(),
@@ -127,6 +131,14 @@ impl TestBinary for ConnectorsRuntimeHandle {
             stderr_path: None,
             port_reserver: Some(reserver),
         }
+    }
+}
+
+impl TestBinary for ConnectorsRuntimeHandle {
+    type Config = ConnectorsRuntimeConfig;
+
+    fn with_config(config: Self::Config, context: Arc<TestContext>) -> Self {
+        Self::with_server_id(config, context, 0)
     }
 
     fn start(&mut self) -> Result<(), TestBinaryError> {
@@ -151,8 +163,8 @@ impl TestBinary for ConnectorsRuntimeHandle {
             command.stdout(Stdio::inherit());
             command.stderr(Stdio::inherit());
         } else {
-            let stdout_path = self.context.connectors_runtime_stdout_path();
-            let stderr_path = self.context.connectors_runtime_stderr_path();
+            let stdout_path = self.context.connectors_runtime_stdout_path(self.server_id);
+            let stderr_path = self.context.connectors_runtime_stderr_path(self.server_id);
 
             let stdout_file =
                 File::create(&stdout_path).map_err(|e| TestBinaryError::FileSystemError {

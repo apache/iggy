@@ -119,7 +119,9 @@ pub struct TopicConfig {
     #[config_env(leaf)]
     #[serde_as(as = "DisplayFromStr")]
     pub max_size: MaxTopicSize,
-    pub delete_oldest_segments: bool,
+    #[config_env(leaf)]
+    #[serde_as(as = "DisplayFromStr")]
+    pub message_expiry: IggyExpiry,
 }
 
 #[derive(Debug, Deserialize, Serialize, ConfigEnv)]
@@ -154,9 +156,6 @@ pub struct SegmentConfig {
     pub size: IggyByteSize,
     #[config_env(leaf)]
     pub cache_indexes: CacheIndexesConfig,
-    #[config_env(leaf)]
-    #[serde_as(as = "DisplayFromStr")]
-    pub message_expiry: IggyExpiry,
     pub archive_expired: bool,
 }
 
@@ -328,7 +327,7 @@ impl SystemConfig {
 
     pub fn resolve_message_expiry(&self, message_expiry: IggyExpiry) -> IggyExpiry {
         match message_expiry {
-            IggyExpiry::ServerDefault => self.segment.message_expiry,
+            IggyExpiry::ServerDefault => self.topic.message_expiry,
             _ => message_expiry,
         }
     }

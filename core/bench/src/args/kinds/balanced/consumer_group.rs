@@ -82,7 +82,7 @@ impl BenchmarkKindProps for BalancedConsumerGroupArgs {
             cmd.error(
                 ErrorKind::ArgumentConflict,
                 format!(
-                    "In balanced consumer group, consumer groups number ({cg_number}) must be less than the number of streams ({streams})"
+                    "In balanced consumer group, consumer groups number ({cg_number}) must be greater than or equal to the number of streams ({streams})"
                 ),
             )
             .exit();

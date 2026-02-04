@@ -28,18 +28,15 @@ ci-qemu = []
 
 [dependencies]
 ahash = { workspace = true }
-anyhow = { workspace = true }
 assert_cmd = { workspace = true }
 async-trait = { workspace = true }
 bon = { workspace = true }
 bytes = { workspace = true }
-chrono = { workspace = true }
 compio = { workspace = true }
 configs = { workspace = true }
 configs_derive = { workspace = true }
 ctor = { workspace = true }
 derive_more = { workspace = true }
-env_logger = { workspace = true }
 figment = { workspace = true }
 futures = { workspace = true }
 harness_derive = { workspace = true }
@@ -50,7 +47,6 @@ iggy_common = { workspace = true }
 keyring = { workspace = true }
 lazy_static = { workspace = true }
 libc = { workspace = true }
-log = { workspace = true }
 once_cell = { workspace = true }
 predicates = { workspace = true }
 rand = { workspace = true }
@@ -71,12 +67,12 @@ server = { workspace = true }
 socket2 = { workspace = true }
 sqlx = { workspace = true }
 strum = { workspace = true }
-strum_macros = { workspace = true }
 tempfile = { workspace = true }
 test-case = { workspace = true }
 testcontainers-modules = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 twox-hash = { workspace = true }
 uuid = { workspace = true }
 zip = { workspace = true }

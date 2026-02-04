@@ -17,137 +17,258 @@
  * under the License.
  */
 
-use anyhow::Result;
+use crate::connectors::create_test_messages;
+use crate::connectors::fixtures::{QuickwitFixture, QuickwitOps, QuickwitPreCreatedFixture};
 use bytes::Bytes;
-use iggy_common::IggyMessage;
+use iggy::prelude::{IggyMessage, Partitioning};
+use iggy_binary_protocol::MessageClient;
+use iggy_common::Identifier;
+use integration::harness::seeds;
+use integration::iggy_harness;
 use serde::{Deserialize, Serialize};
 
-use crate::connectors::create_test_messages;
-use crate::connectors::quickwit::{QuickwitTestSetup, start_quickwit_container};
-
-async fn send_test_messages(
-    test_setup: &QuickwitTestSetup,
-    message_count: usize,
-) -> Result<Vec<Bytes>> {
-    let iggy_client = test_setup.runtime.create_client().await;
-
-    let message_payloads = create_test_messages(message_count)
-        .iter()
-        .map(|message| {
-            serde_json::to_vec(message)
-                .map(Bytes::from)
-                .map_err(Into::into)
-        })
-        .collect::<Result<Vec<Bytes>>>()?;
-
-    let mut test_messages = message_payloads
-        .iter()
-        .cloned()
-        .enumerate()
-        .map(|(i, message)| {
-            IggyMessage::builder()
-                .id((i + 1) as u128)
-                .payload(message)
-                .build()
-                .map_err(Into::into)
-        })
-        .collect::<Result<Vec<IggyMessage>>>()?;
-    iggy_client.send_messages(&mut test_messages).await;
-
-    Ok(message_payloads)
-}
-
-async fn assert_test_index_documents_match_message_payloads(
-    test_setup: &QuickwitTestSetup,
-    message_payloads: &[Bytes],
-) -> Result<()> {
-    test_setup.flush_quickwit_test_index().await?;
-
-    let search_response = test_setup.get_quickwit_test_index_all_search().await?;
-    assert_eq!(search_response.num_hits, message_payloads.len());
-
-    for (quickwit_hit, message_payload) in search_response
-        .hits
-        .into_iter()
-        .zip(message_payloads.iter())
-    {
-        assert_eq!(
-            quickwit_hit,
-            serde_json::from_slice::<serde_json::Value>(message_payload)?
-        );
-    }
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn given_existent_quickwit_index_should_store() -> Result<()> {
-    let quickwit_container = start_quickwit_container().await;
-    let test_setup = QuickwitTestSetup::try_new_with_precreate_index(quickwit_container).await?;
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/quickwit/config.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_existent_quickwit_index_should_store(
+    harness: &TestHarness,
+    fixture: QuickwitPreCreatedFixture,
+) {
+    let client = harness.client();
+    let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
+    let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
 
     let message_count = 11;
-    let sent_payloads = send_test_messages(&test_setup, message_count).await?;
+    let test_messages = create_test_messages(message_count);
+    let payloads: Vec<Bytes> = test_messages
+        .iter()
+        .map(|m| Bytes::from(serde_json::to_vec(m).expect("serialize")))
+        .collect();
 
-    assert_test_index_documents_match_message_payloads(&test_setup, &sent_payloads).await?;
+    let mut messages: Vec<IggyMessage> = payloads
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            IggyMessage::builder()
+                .id((i + 1) as u128)
+                .payload(p.clone())
+                .build()
+                .expect("build message")
+        })
+        .collect();
 
-    Ok(())
+    client
+        .send_messages(
+            &stream_id,
+            &topic_id,
+            &Partitioning::partition_id(0),
+            &mut messages,
+        )
+        .await
+        .expect("send messages");
+
+    fixture
+        .flush_index(seeds::names::TOPIC)
+        .await
+        .expect("flush");
+
+    let search = fixture
+        .search_all(seeds::names::TOPIC)
+        .await
+        .expect("search");
+
+    assert_eq!(search.num_hits, message_count);
+    for (hit, payload) in search.hits.iter().zip(payloads.iter()) {
+        assert_eq!(
+            hit,
+            &serde_json::from_slice::<serde_json::Value>(payload).unwrap()
+        );
+    }
 }
 
-#[tokio::test]
-async fn given_nonexistent_quickwit_index_should_create_and_store() -> Result<()> {
-    let test_setup = QuickwitTestSetup::try_new().await?;
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/quickwit/config.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_nonexistent_quickwit_index_should_create_and_store(
+    harness: &TestHarness,
+    fixture: QuickwitFixture,
+) {
+    let client = harness.client();
+    let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
+    let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
 
     let message_count = 13;
-    let sent_payloads = send_test_messages(&test_setup, message_count).await?;
+    let test_messages = create_test_messages(message_count);
+    let payloads: Vec<Bytes> = test_messages
+        .iter()
+        .map(|m| Bytes::from(serde_json::to_vec(m).expect("serialize")))
+        .collect();
 
-    assert_test_index_documents_match_message_payloads(&test_setup, &sent_payloads).await?;
+    let mut messages: Vec<IggyMessage> = payloads
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            IggyMessage::builder()
+                .id((i + 1) as u128)
+                .payload(p.clone())
+                .build()
+                .expect("build message")
+        })
+        .collect();
 
-    Ok(())
+    client
+        .send_messages(
+            &stream_id,
+            &topic_id,
+            &Partitioning::partition_id(0),
+            &mut messages,
+        )
+        .await
+        .expect("send messages");
+
+    fixture
+        .flush_index(seeds::names::TOPIC)
+        .await
+        .expect("flush");
+
+    let search = fixture
+        .search_all(seeds::names::TOPIC)
+        .await
+        .expect("search");
+
+    assert_eq!(search.num_hits, message_count);
+    for (hit, payload) in search.hits.iter().zip(payloads.iter()) {
+        assert_eq!(
+            hit,
+            &serde_json::from_slice::<serde_json::Value>(payload).unwrap()
+        );
+    }
 }
 
-#[tokio::test]
-async fn given_bulk_message_send_should_store() -> Result<()> {
-    let test_setup = QuickwitTestSetup::try_new().await?;
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/quickwit/config.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_bulk_message_send_should_store(harness: &TestHarness, fixture: QuickwitFixture) {
+    let client = harness.client();
+    let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
+    let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
 
     let message_count = 1000;
-    let sent_payloads = send_test_messages(&test_setup, message_count).await?;
+    let test_messages = create_test_messages(message_count);
+    let payloads: Vec<Bytes> = test_messages
+        .iter()
+        .map(|m| Bytes::from(serde_json::to_vec(m).expect("serialize")))
+        .collect();
 
-    assert_test_index_documents_match_message_payloads(&test_setup, &sent_payloads).await?;
+    let mut messages: Vec<IggyMessage> = payloads
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            IggyMessage::builder()
+                .id((i + 1) as u128)
+                .payload(p.clone())
+                .build()
+                .expect("build message")
+        })
+        .collect();
 
-    Ok(())
+    client
+        .send_messages(
+            &stream_id,
+            &topic_id,
+            &Partitioning::partition_id(0),
+            &mut messages,
+        )
+        .await
+        .expect("send messages");
+
+    fixture
+        .flush_index(seeds::names::TOPIC)
+        .await
+        .expect("flush");
+
+    let search = fixture
+        .search_all(seeds::names::TOPIC)
+        .await
+        .expect("search");
+
+    assert_eq!(search.num_hits, message_count);
+    for (hit, payload) in search.hits.iter().zip(payloads.iter()) {
+        assert_eq!(
+            hit,
+            &serde_json::from_slice::<serde_json::Value>(payload).unwrap()
+        );
+    }
 }
 
-#[tokio::test]
-async fn given_invalid_messages_should_not_store() -> Result<()> {
-    let test_setup = QuickwitTestSetup::try_new().await?;
-    let iggy_client = test_setup.runtime.create_client().await;
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/quickwit/config.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_invalid_messages_should_not_store(harness: &TestHarness, fixture: QuickwitFixture) {
+    let client = harness.client();
+    let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
+    let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
 
-    let first_valid = Bytes::from(serde_json::to_vec(&create_test_messages(1)[0])?);
-    let second_valid = Bytes::from(serde_json::to_vec(&create_test_messages(1)[0])?);
+    let first_valid =
+        Bytes::from(serde_json::to_vec(&create_test_messages(1)[0]).expect("serialize"));
+    let second_valid =
+        Bytes::from(serde_json::to_vec(&create_test_messages(1)[0]).expect("serialize"));
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
     struct NotTestMessage {
         not_a_test_message_field: f64,
     }
-    let first_invalid = Bytes::from(serde_json::to_vec(&NotTestMessage {
-        not_a_test_message_field: 17.,
-    })?);
+    let first_invalid = Bytes::from(
+        serde_json::to_vec(&NotTestMessage {
+            not_a_test_message_field: 17.,
+        })
+        .expect("serialize"),
+    );
 
     for (message_index, message_payload) in
         [first_valid.clone(), first_invalid, second_valid.clone()]
             .into_iter()
             .enumerate()
     {
-        iggy_client
-            .send_messages(&mut [IggyMessage::builder()
+        let mut messages = vec![
+            IggyMessage::builder()
                 .id(message_index as u128 + 1)
                 .payload(message_payload)
-                .build()?])
-            .await;
+                .build()
+                .expect("build message"),
+        ];
+
+        client
+            .send_messages(
+                &stream_id,
+                &topic_id,
+                &Partitioning::partition_id(0),
+                &mut messages,
+            )
+            .await
+            .expect("send messages");
     }
 
-    assert_test_index_documents_match_message_payloads(&test_setup, &[first_valid, second_valid])
-        .await?;
+    fixture
+        .flush_index(seeds::names::TOPIC)
+        .await
+        .expect("flush");
 
-    Ok(())
+    let search = fixture
+        .search_all(seeds::names::TOPIC)
+        .await
+        .expect("search");
+
+    assert_eq!(search.num_hits, 2);
+    let expected_payloads = [first_valid, second_valid];
+    for (hit, payload) in search.hits.iter().zip(expected_payloads.iter()) {
+        assert_eq!(
+            hit,
+            &serde_json::from_slice::<serde_json::Value>(payload).unwrap()
+        );
+    }
 }

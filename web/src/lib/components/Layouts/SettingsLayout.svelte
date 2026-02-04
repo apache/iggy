@@ -41,27 +41,21 @@
       tab: 'server',
       icon: 'adjustments',
       name: 'Server',
-      href: resolve(typedRoute('/dashboard/settings/server'))
+      path: typedRoute('/dashboard/settings/server')
     },
     {
       tab: 'webUI',
       icon: 'settings',
       name: 'Web UI',
-      href: resolve(typedRoute('/dashboard/settings/webUI'))
+      path: typedRoute('/dashboard/settings/webUI')
     },
     {
       tab: 'users',
       icon: 'usersGroup',
       name: 'Users',
-      href: resolve(typedRoute('/dashboard/settings/users'))
+      path: typedRoute('/dashboard/settings/users')
     }
-    // {
-    //   name: 'Terminal',
-    //   icon: 'terminal',
-    //   tab: 'terminal',
-    //   href: resolve(typedRoute('/dashboard/settings/terminal'))
-    // }
-  ] satisfies { tab: Tabs; name: string; icon: iconType; href: string }[];
+  ] satisfies { tab: Tabs; name: string; icon: iconType; path: string }[];
 </script>
 
 <div class="flex justify-between items-center px-10">
@@ -71,10 +65,10 @@
 </div>
 
 <div class="flex gap-12 border-b px-10">
-  {#each tabs as { icon, name, href }, idx (idx)}
-    {@const isActive = activeTab === href.split('/').slice(-1)[0]}
+  {#each tabs as { icon, name, path }, idx (idx)}
+    {@const isActive = activeTab === path.split('/').slice(-1)[0]}
     <a
-      {href}
+      href={resolve(path)}
       class={twMerge('pb-3 relative group flex items-center  justify-start gap-2 text-color')}
     >
       <Icon name={icon} class="w-[15px] h-[15px]" />

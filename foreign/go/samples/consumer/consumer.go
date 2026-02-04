@@ -31,11 +31,11 @@ import (
 
 // config
 const (
-    DefaultStreamId = uint32(0)
-    TopicId         = uint32(0)
-    Partition       = 0
-    Interval        = 1000
-    ConsumerId      = uint32(0)
+	DefaultStreamId = uint32(0)
+	TopicId         = uint32(0)
+	Partition       = 0
+	Interval        = 1000
+	ConsumerId      = uint32(0)
 )
 
 func main() {
@@ -63,8 +63,8 @@ func main() {
 
 func EnsureInfrastructureIsInitialized(cli iggycli.Client) error {
 	streamIdentifier, _ := iggcon.NewIdentifier(DefaultStreamId)
-    if _, streamErr := cli.GetStream(streamIdentifier); streamErr != nil {
-        _, streamErr = cli.CreateStream("Test Producer Stream")
+	if _, streamErr := cli.GetStream(streamIdentifier); streamErr != nil {
+		_, streamErr = cli.CreateStream("Test Producer Stream")
 
 		if streamErr != nil {
 			panic(streamErr)
@@ -76,15 +76,15 @@ func EnsureInfrastructureIsInitialized(cli iggycli.Client) error {
 	fmt.Printf("Stream with ID: %d exists.\n", DefaultStreamId)
 
 	topicIdentifier, _ := iggcon.NewIdentifier(TopicId)
-    if _, topicErr := cli.GetTopic(streamIdentifier, topicIdentifier); topicErr != nil {
-        _, topicErr = cli.CreateTopic(
+	if _, topicErr := cli.GetTopic(streamIdentifier, topicIdentifier); topicErr != nil {
+		_, topicErr = cli.CreateTopic(
 			streamIdentifier,
 			"Test Topic From Producer Sample",
 			12,
 			0,
 			0,
 			0,
-            nil)
+			nil)
 
 		if topicErr != nil {
 			panic(topicErr)

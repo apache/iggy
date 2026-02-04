@@ -90,7 +90,7 @@
 
       authStore.login(access_token.token, access_token.expiry);
       goto(resolve(typedRoute('/dashboard/overview')));
-    } catch (e) {
+    } catch {
       errorMessage = 'Failed to connect to server';
       isLoading = false;
     }

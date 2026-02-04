@@ -514,7 +514,7 @@ impl IggyShard {
             return Ok(0);
         }
 
-        let (messages_writer, index_writer, segment_index) = {
+        let (messages_writer, index_writer) = {
             let partitions = self.local_partitions.borrow();
             let partition = partitions
                 .get(namespace)
@@ -524,7 +524,6 @@ impl IggyShard {
                 return Ok(0);
             }
 
-            let segment_index = partition.log.segments().len() - 1;
             let messages_writer = partition
                 .log
                 .active_storage()
@@ -539,7 +538,7 @@ impl IggyShard {
                 .as_ref()
                 .expect("Index writer not initialized")
                 .clone();
-            (messages_writer, index_writer, segment_index)
+            (messages_writer, index_writer)
         };
 
         let saved = messages_writer
@@ -552,6 +551,7 @@ impl IggyShard {
             let partition = partitions
                 .get(namespace)
                 .expect("local_partitions: partition must exist");
+            let segment_index = partition.log.segments().len() - 1;
             partition.log.indexes()[segment_index]
                 .as_ref()
                 .expect("indexes must exist for segment being persisted")
@@ -575,6 +575,9 @@ impl IggyShard {
             let partition = partitions
                 .get_mut(namespace)
                 .expect("local_partitions: partition must exist");
+
+            // Recalculate index: segment deletion during async I/O shifts indices
+            let segment_index = partition.log.segments().len() - 1;
 
             let indexes = partition.log.indexes_mut()[segment_index]
                 .as_mut()

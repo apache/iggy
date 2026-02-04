@@ -18,11 +18,13 @@
  */
 
 use super::client_builder::{ClientBuilder, ServerConnection};
-use crate::harness::config::{IpAddrKind, TestServerConfig};
+use super::connectors_runtime::ConnectorsRuntimeHandle;
+use super::mcp::McpHandle;
+use crate::harness::config::{ConnectorsRuntimeConfig, IpAddrKind, McpConfig, TestServerConfig};
 use crate::harness::context::TestContext;
 use crate::harness::error::TestBinaryError;
 use crate::harness::port_reserver::PortReserver;
-use crate::harness::traits::{Restartable, TestBinary};
+use crate::harness::traits::{IggyServerDependent, Restartable, TestBinary};
 use assert_cmd::prelude::CommandCargoExt;
 use iggy::prelude::{DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME};
 use iggy_common::TransportProtocol;
@@ -75,6 +77,8 @@ pub struct ServerHandle {
     generated_cert_dir: Option<PathBuf>,
     port_reserver: Option<PortReserver>,
     test_transport: Option<iggy_common::TransportProtocol>,
+    mcp: Option<McpHandle>,
+    connectors_runtime: Option<ConnectorsRuntimeHandle>,
 }
 
 impl std::fmt::Debug for ServerHandle {
@@ -500,6 +504,8 @@ impl ServerHandle {
             generated_cert_dir: None,
             port_reserver: None,
             test_transport: None,
+            mcp: None,
+            connectors_runtime: None,
         }
     }
 
@@ -517,6 +523,127 @@ impl ServerHandle {
     pub fn set_test_transport(&mut self, transport: iggy_common::TransportProtocol) {
         self.test_transport = Some(transport);
     }
+
+    /// Configure MCP server for this iggy server.
+    pub fn set_mcp_config(&mut self, config: McpConfig) {
+        self.mcp = Some(McpHandle::with_server_id(
+            config,
+            self.context.clone(),
+            self.server_id,
+        ));
+    }
+
+    /// Configure connectors runtime for this iggy server.
+    pub fn set_connectors_runtime_config(&mut self, config: ConnectorsRuntimeConfig) {
+        self.connectors_runtime = Some(ConnectorsRuntimeHandle::with_server_id(
+            config,
+            self.context.clone(),
+            self.server_id,
+        ));
+    }
+
+    /// Get reference to MCP handle if configured.
+    pub fn mcp(&self) -> Option<&McpHandle> {
+        self.mcp.as_ref()
+    }
+
+    /// Get mutable reference to MCP handle if configured.
+    pub fn mcp_mut(&mut self) -> Option<&mut McpHandle> {
+        self.mcp.as_mut()
+    }
+
+    /// Get reference to connectors runtime handle if configured.
+    pub fn connectors_runtime(&self) -> Option<&ConnectorsRuntimeHandle> {
+        self.connectors_runtime.as_ref()
+    }
+
+    /// Get mutable reference to connectors runtime handle if configured.
+    pub fn connectors_runtime_mut(&mut self) -> Option<&mut ConnectorsRuntimeHandle> {
+        self.connectors_runtime.as_mut()
+    }
+
+    /// Start dependent binaries (MCP, connectors runtime) after server is ready.
+    pub async fn start_dependents(&mut self) -> Result<(), TestBinaryError> {
+        let has_dependents = self.mcp.is_some() || self.connectors_runtime.is_some();
+
+        if has_dependents && self.addrs.tcp.is_none() {
+            return Err(TestBinaryError::InvalidState {
+                message: "TCP address required for MCP/ConnectorsRuntime but not configured"
+                    .to_string(),
+            });
+        }
+
+        let tcp_addr = self.addrs.tcp;
+
+        if let Some(ref mut mcp) = self.mcp {
+            if let Some(addr) = tcp_addr {
+                mcp.set_iggy_address(addr);
+            }
+            mcp.start()?;
+            if let Err(e) = mcp.wait_ready().await {
+                let _ = mcp.stop();
+                return Err(e);
+            }
+        }
+
+        if let Some(ref mut connectors_runtime) = self.connectors_runtime {
+            if let Some(addr) = tcp_addr {
+                connectors_runtime.set_iggy_address(addr);
+            }
+            connectors_runtime.start()?;
+            if let Err(e) = connectors_runtime.wait_ready().await {
+                let _ = connectors_runtime.stop();
+                if let Some(ref mut mcp) = self.mcp {
+                    let _ = mcp.stop();
+                }
+                return Err(e);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Stop dependent binaries.
+    ///
+    /// Attempts to stop all dependents even if one fails. Returns the first error encountered.
+    pub fn stop_dependents(&mut self) -> Result<(), TestBinaryError> {
+        let mut first_error: Option<TestBinaryError> = None;
+
+        if let Some(ref mut connectors_runtime) = self.connectors_runtime
+            && let Err(e) = connectors_runtime.stop()
+        {
+            first_error = Some(e);
+        }
+
+        if let Some(ref mut mcp) = self.mcp
+            && let Err(e) = mcp.stop()
+            && first_error.is_none()
+        {
+            first_error = Some(e);
+        }
+
+        match first_error {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    /// Collect logs from server and its dependent binaries.
+    pub fn collect_all_logs(&self) -> ServerLogs {
+        ServerLogs {
+            server: self.collect_logs(),
+            mcp: self.mcp.as_ref().map(|m| m.collect_logs()),
+            connectors_runtime: self.connectors_runtime.as_ref().map(|c| c.collect_logs()),
+        }
+    }
+}
+
+/// Collected logs from a server and its dependent binaries.
+#[derive(Debug)]
+pub struct ServerLogs {
+    pub server: (String, String),
+    pub mcp: Option<(String, String)>,
+    pub connectors_runtime: Option<(String, String)>,
 }
 
 impl TestBinary for ServerHandle {
@@ -537,6 +664,8 @@ impl TestBinary for ServerHandle {
             generated_cert_dir: None,
             port_reserver: None,
             test_transport: None,
+            mcp: None,
+            connectors_runtime: None,
         }
     }
 
@@ -690,9 +819,14 @@ impl TestBinary for ServerHandle {
 }
 
 impl Restartable for ServerHandle {
+    /// Restart the server process only.
+    ///
+    /// Stops dependents (MCP, ConnectorsRuntime) and the server, then restarts only the server.
+    /// Dependents are NOT restarted - callers must manually call `start_dependents()` if needed.
     fn restart(&mut self) -> Result<(), TestBinaryError> {
         let cleanup = self.config.cleanup;
         self.config.cleanup = false;
+        self.stop_dependents()?;
         self.stop()?;
         self.config.cleanup = cleanup;
         self.start()
