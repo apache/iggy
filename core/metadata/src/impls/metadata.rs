@@ -15,7 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::stm::StateMachine;
+use crate::stm::mux::MuxStateMachine;
+use crate::stm::snapshot::{SnapshotContributor, SnapshotEnvelope, SnapshotError};
 use consensus::{Consensus, Project, Sequencer, Status, VsrConsensus};
+use iggy_common::IggyTimestamp;
 use iggy_common::{
     header::{Command2, GenericHeader, PrepareHeader, PrepareOkHeader, ReplyHeader},
     message::Message,
@@ -24,6 +27,115 @@ use journal::{Journal, JournalHandle};
 use message_bus::MessageBus;
 use tracing::{debug, warn};
 
+/// Trait for metadata snapshot implementations.
+///
+/// This is the interface that `MetadataHandle::Snapshot` must satisfy.
+/// It provides methods for creating, encoding, decoding, and restoring snapshots.
+#[allow(unused)]
+pub trait MetadataSnapshot: Sized {
+    /// The error type for snapshot operations.
+    type Error: std::error::Error;
+
+    /// Create a snapshot from the current state of the mux state machine.
+    ///
+    /// # Arguments
+    /// * `mux` - The multiplexing state machine containing all sub-state machines
+    /// * `commit_number` - The VSR commit number this snapshot corresponds to
+    fn create<T>(mux: &MuxStateMachine<T>, commit_number: u64) -> Result<Self, Self::Error>
+    where
+        T: StateMachine + SnapshotContributor;
+
+    /// Encode the snapshot to msgpack bytes.
+    fn encode(&self) -> Result<Vec<u8>, Self::Error>;
+
+    /// Decode a snapshot from msgpack bytes.
+    fn decode(bytes: &[u8]) -> Result<Self, Self::Error>;
+
+    /// Restore a mux state machine from this snapshot.
+    fn restore<T>(&self) -> Result<MuxStateMachine<T>, Self::Error>
+    where
+        T: StateMachine + SnapshotContributor;
+
+    /// Get the VSR commit number this snapshot corresponds to.
+    fn commit_number(&self) -> u64;
+
+    /// Get the timestamp when this snapshot was created.
+    fn created_at(&self) -> u64;
+}
+
+#[derive(Debug, Clone)]
+#[allow(unused)]
+pub struct IggySnapshot {
+    envelope: SnapshotEnvelope,
+}
+
+#[allow(unused)]
+impl IggySnapshot {
+    pub fn new(commit_number: u64) -> Self {
+        Self {
+            envelope: SnapshotEnvelope::new(commit_number),
+        }
+    }
+
+    pub fn envelope(&self) -> &SnapshotEnvelope {
+        &self.envelope
+    }
+}
+
+impl MetadataSnapshot for IggySnapshot {
+    type Error = SnapshotError;
+
+    fn create<T>(mux: &MuxStateMachine<T>, commit_number: u64) -> Result<Self, SnapshotError>
+    where
+        T: StateMachine + SnapshotContributor,
+    {
+        let mut envelope = SnapshotEnvelope {
+            created_at: IggyTimestamp::now().as_micros(),
+            commit_number,
+            sections: Vec::new(),
+        };
+
+        mux.collect_sections(&mut envelope.sections)?;
+        envelope.validate_no_duplicate_sections()?;
+
+        Ok(Self { envelope })
+    }
+
+    fn encode(&self) -> Result<Vec<u8>, SnapshotError> {
+        self.envelope.encode()
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, SnapshotError> {
+        let envelope = SnapshotEnvelope::decode(bytes)?;
+        Ok(Self { envelope })
+    }
+
+    fn restore<T>(&self) -> Result<MuxStateMachine<T>, SnapshotError>
+    where
+        T: StateMachine + SnapshotContributor,
+    {
+        let known = T::known_section_names();
+        for section in &self.envelope.sections {
+            if !known.iter().any(|&n| n == section.name) {
+                tracing::warn!(
+                    section = %section.name,
+                    "ignoring unknown snapshot section"
+                );
+            }
+        }
+        MuxStateMachine::<T>::restore_from_sections(&self.envelope.sections)
+    }
+
+    fn commit_number(&self) -> u64 {
+        self.envelope.commit_number
+    }
+
+    fn created_at(&self) -> u64 {
+        self.envelope.created_at
+    }
+}
+
+#[expect(unused)]
 pub trait Metadata<C>
 where
     C: Consensus,

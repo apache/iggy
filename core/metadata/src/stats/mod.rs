@@ -89,6 +89,20 @@ impl StreamStats {
         self.zero_out_messages_count();
         self.zero_out_segments_count();
     }
+
+    pub fn load_for_snapshot(&self) -> (u64, u64, u32) {
+        (
+            self.size_bytes.load(Ordering::Relaxed),
+            self.messages_count.load(Ordering::Relaxed),
+            self.segments_count.load(Ordering::Relaxed),
+        )
+    }
+
+    pub fn store_from_snapshot(&self, size_bytes: u64, messages_count: u64, segments_count: u32) {
+        self.size_bytes.store(size_bytes, Ordering::Relaxed);
+        self.messages_count.store(messages_count, Ordering::Relaxed);
+        self.segments_count.store(segments_count, Ordering::Relaxed);
+    }
 }
 
 #[derive(Default, Debug)]
@@ -218,6 +232,20 @@ impl TopicStats {
         self.zero_out_size_bytes();
         self.zero_out_messages_count();
         self.zero_out_segments_count();
+    }
+
+    pub fn load_for_snapshot(&self) -> (u64, u64, u32) {
+        (
+            self.size_bytes.load(Ordering::Relaxed),
+            self.messages_count.load(Ordering::Relaxed),
+            self.segments_count.load(Ordering::Relaxed),
+        )
+    }
+
+    pub fn store_from_snapshot(&self, size_bytes: u64, messages_count: u64, segments_count: u32) {
+        self.size_bytes.store(size_bytes, Ordering::Relaxed);
+        self.messages_count.store(messages_count, Ordering::Relaxed);
+        self.segments_count.store(segments_count, Ordering::Relaxed);
     }
 }
 

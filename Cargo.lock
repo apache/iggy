@@ -5662,6 +5662,8 @@ dependencies = [
  "left-right",
  "message_bus",
  "paste",
+ "rmp-serde",
+ "serde",
  "slab",
  "tracing",
 ]
