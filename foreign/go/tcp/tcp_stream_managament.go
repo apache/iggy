@@ -54,7 +54,7 @@ func (tms *IggyTcpClient) CreateStream(name string) (*iggcon.StreamDetails, erro
 	if len(name) == 0 || MaxStringLength < len(name) {
 		return nil, ierror.ErrInvalidStreamName
 	}
-    serializedRequest := binaryserialization.TcpCreateStreamRequest{Name: name}
+	serializedRequest := binaryserialization.TcpCreateStreamRequest{Name: name}
 	buffer, err := tms.sendAndFetchResponse(serializedRequest.Serialize(), iggcon.CreateStreamCode)
 	if err != nil {
 		return nil, err

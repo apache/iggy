@@ -223,7 +223,7 @@ func givenNoStreams(ctx context.Context) error {
 
 func whenCreateStream(ctx context.Context, streamName string) error {
 	c := getBasicMessagingCtx(ctx)
-    stream, err := c.client.CreateStream(streamName)
+	stream, err := c.client.CreateStream(streamName)
 	if err != nil {
 		return fmt.Errorf("failed to create stream: %w", err)
 	}
@@ -240,8 +240,8 @@ func thenStreamCreatedSuccessfully(ctx context.Context) error {
 }
 
 func thenStreamHasName(
-    ctx context.Context,
-    expectedName string) error {
+	ctx context.Context,
+	expectedName string) error {
 	c := getBasicMessagingCtx(ctx)
 	streamName := *c.lastStreamName
 	if streamName != expectedName {
@@ -251,20 +251,20 @@ func thenStreamHasName(
 }
 
 func whenCreateTopic(
-    ctx context.Context,
-    topicName string,
-    streamID uint32,
-    partitionsCount uint32) error {
+	ctx context.Context,
+	topicName string,
+	streamID uint32,
+	partitionsCount uint32) error {
 	c := getBasicMessagingCtx(ctx)
 	streamIdentifier, _ := iggcon.NewIdentifier(streamID)
-    topic, err := c.client.CreateTopic(
+	topic, err := c.client.CreateTopic(
 		streamIdentifier,
 		topicName,
 		partitionsCount,
 		iggcon.CompressionAlgorithmNone,
 		iggcon.IggyExpiryNeverExpire,
-        0,
-        nil,
+		0,
+		nil,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to create topic: %w", err)
@@ -284,8 +284,8 @@ func thenTopicCreatedSuccessfully(ctx context.Context) error {
 	return nil
 }
 func thenTopicHasName(
-    ctx context.Context,
-    expectedName string) error {
+	ctx context.Context,
+	expectedName string) error {
 	c := getBasicMessagingCtx(ctx)
 	topicName := *c.lastTopicName
 	if topicName != expectedName {
@@ -315,13 +315,13 @@ func initScenarios(sc *godog.ScenarioContext) {
 	sc.Step(`^the messages should have sequential offsets from (\d+) to (\d+)$`, thenMessagesHaveSequentialOffsets)
 	sc.Step(`each message should have the expected payload content`, thenMessagesHaveExpectedPayload)
 	sc.Step(`the last polled message should match the last sent message`, thenLastPolledMessageMatchesSent)
-    sc.Step(`^the stream should have name "([^"]*)"$`, thenStreamHasName)
+	sc.Step(`^the stream should have name "([^"]*)"$`, thenStreamHasName)
 	sc.Step(`the stream should be created successfully`, thenStreamCreatedSuccessfully)
-    sc.Step(`^I create a stream with name "([^"]*)"$`, whenCreateStream)
+	sc.Step(`^I create a stream with name "([^"]*)"$`, whenCreateStream)
 	sc.Step(`I have no streams in the system`, givenNoStreams)
-    sc.Step(`^I create a topic with name "([^"]*)" in stream (\d+) with (\d+) partitions$`, whenCreateTopic)
+	sc.Step(`^I create a topic with name "([^"]*)" in stream (\d+) with (\d+) partitions$`, whenCreateTopic)
 	sc.Step(`the topic should be created successfully`, thenTopicCreatedSuccessfully)
-    sc.Step(`^the topic should have name "([^"]*)"$`, thenTopicHasName)
+	sc.Step(`^the topic should have name "([^"]*)"$`, thenTopicHasName)
 	sc.Step(`^the topic should have (\d+) partitions$`, thenTopicsHasPartitions)
 }
 

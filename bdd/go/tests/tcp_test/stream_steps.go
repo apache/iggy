@@ -31,7 +31,7 @@ import (
 func successfullyCreateStream(prefix string, client iggycli.Client) (uint32, string) {
 	name := createRandomStringWithPrefix(prefix, 128)
 
-    stream, err := client.CreateStream(name)
+	stream, err := client.CreateStream(name)
 
 	itShouldNotReturnError(err)
 	itShouldSuccessfullyCreateStream(stream.Id, name, client)

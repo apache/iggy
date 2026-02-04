@@ -64,23 +64,27 @@ runs:
     - name: Lint and format check
       if: inputs.task == 'lint'
       run: |
-        # Build list of directories to check using absolute paths
+        # Build list of directories to check
         DIR_SDK="${GITHUB_WORKSPACE}/foreign/python"
-        DIR_TEST="${DIR_SDK}/tests"
-        DIRS_TO_CHECK="${DIR_TEST} ${DIR_SDK}"
-        STUB_FILE="${DIR_SDK}/apache_iggy.pyi"
+        DIR_BDD="${GITHUB_WORKSPACE}/bdd/python"
+        DIR_EXAMPLES="${GITHUB_WORKSPACE}/examples/python"
+
+        # Collect all Python directories that exist
+        DIRS_TO_CHECK="$DIR_SDK"
+        [ -d "$DIR_BDD" ] && DIRS_TO_CHECK="$DIRS_TO_CHECK $DIR_BDD"
+        [ -d "$DIR_EXAMPLES" ] && DIRS_TO_CHECK="$DIRS_TO_CHECK $DIR_EXAMPLES"
 
         echo "Directories to check: $DIRS_TO_CHECK"
-        echo "Stub file: $STUB_FILE"
-
-        echo "ruff check --select I $DIRS_TO_CHECK"
-        ruff check --select I $DIRS_TO_CHECK
         echo "ruff version: $(ruff --version)"
 
-        echo "ruff format --check $DIRS_TO_CHECK"
+        echo "Running ruff check..."
+        ruff check $DIRS_TO_CHECK
+
+        echo "Running ruff format --check..."
         ruff format --check $DIRS_TO_CHECK
 
-        echo "mypy --explicit-package-bases $DIR_SDK"
+        # mypy only for the SDK (has type stubs)
+        echo "Running mypy on SDK..."
         mypy --explicit-package-bases "$DIR_SDK"
         echo "mypy version: $(mypy --version)"
       shell: bash

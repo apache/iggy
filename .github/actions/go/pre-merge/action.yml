@@ -31,13 +31,31 @@ runs:
       with:
         enabled: "false"
 
+    - name: Format Check
+      shell: bash
+      if: inputs.task == 'lint'
+      run: |
+        for dir in foreign/go bdd/go examples/go; do
+          if [ -d "$dir" ]; then
+            echo "Checking formatting in $dir..."
+            if [ -n "$(gofmt -l "$dir")" ]; then
+              echo "::error::Go files in $dir are not formatted. Run 'gofmt -w -s $dir'"
+              gofmt -d "$dir"
+              exit 1
+            fi
+          fi
+        done
+
     - name: Tidy Check
       shell: bash
       if: inputs.task == 'test' || inputs.task == 'lint'
       run: |
-        cd foreign/go
-        go mod tidy
-        git diff --exit-code go.mod go.sum
+        for dir in foreign/go bdd/go examples/go; do
+          if [ -f "$dir/go.mod" ]; then
+            echo "Checking go mod tidy in $dir..."
+            (cd "$dir" && go mod tidy && git diff --exit-code go.mod go.sum)
+          fi
+        done
 
     - name: Check Generated Code
       shell: bash
@@ -69,7 +87,7 @@ runs:
       if: inputs.task == 'lint'
       uses: golangci/golangci-lint-action@v6
       with:
-        version: v1.61
+        version: v1.64.8
         working-directory: foreign/go
         args: --timeout=5m
 
@@ -77,7 +95,7 @@ runs:
       if: inputs.task == 'lint' && hashFiles('bdd/go/go.mod') != ''
       uses: golangci/golangci-lint-action@v6
       with:
-        version: v1.61
+        version: v1.64.8
         working-directory: bdd/go
         args: --timeout=5m
 
@@ -85,7 +103,7 @@ runs:
       if: inputs.task == 'lint' && hashFiles('examples/go/go.mod') != ''
       uses: golangci/golangci-lint-action@v6
       with:
-        version: v1.61
+        version: v1.64.8
         working-directory: examples/go
         args: --timeout=5m
 
