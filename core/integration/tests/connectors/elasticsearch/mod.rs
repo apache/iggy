@@ -17,16 +17,4 @@
  * under the License.
  */
 
-mod elasticsearch;
-mod postgres;
-mod quickwit;
-mod wiremock;
-
-pub use elasticsearch::{ElasticsearchFixture, ElasticsearchOps};
-pub use postgres::{
-    PostgresOps, PostgresSinkByteaFixture, PostgresSinkFixture, PostgresSinkJsonFixture,
-    PostgresSourceByteaFixture, PostgresSourceDeleteFixture, PostgresSourceJsonFixture,
-    PostgresSourceJsonbFixture, PostgresSourceMarkFixture, PostgresSourceOps,
-};
-pub use quickwit::{QuickwitFixture, QuickwitOps, QuickwitPreCreatedFixture};
-pub use wiremock::{WireMockDirectFixture, WireMockWrappedFixture};
+mod elasticsearch_sink;
