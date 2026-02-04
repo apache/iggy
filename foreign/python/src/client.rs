@@ -175,7 +175,7 @@ impl IggyClient {
     ///
     /// Returns Ok(()) on successful topic creation or a PyRuntimeError on failure.
     #[pyo3(
-        signature = (stream, name, partitions_count, compression_algorithm = None, replication_factor = None)
+        signature = (stream, name, partitions_count, compression_algorithm = None, replication_factor = None, message_expiry = None, max_topic_size = None)
     )]
     #[allow(clippy::too_many_arguments)]
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
@@ -187,12 +187,21 @@ impl IggyClient {
         partitions_count: u32,
         compression_algorithm: Option<String>,
         replication_factor: Option<u8>,
+        message_expiry: Option<Py<PyDelta>>,
+        max_topic_size: Option<u64>,
     ) -> PyResult<Bound<'a, PyAny>> {
         let compression_algorithm = match compression_algorithm {
             Some(algo) => CompressionAlgorithm::from_str(&algo)
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{e:?}")))?,
             None => CompressionAlgorithm::default(),
         };
+
+        let expiry = match message_expiry {
+            Some(delta) => IggyExpiry::ExpireDuration(py_delta_to_iggy_duration(&delta)),
+            None => IggyExpiry::ServerDefault,
+        };
+
+        let max_size = max_topic_size.map_or(MaxTopicSize::ServerDefault, MaxTopicSize::from);
 
         let stream = Identifier::from(stream);
         let inner = self.inner.clone();
@@ -205,8 +214,8 @@ impl IggyClient {
                     partitions_count,
                     compression_algorithm,
                     replication_factor,
-                    IggyExpiry::NeverExpire,
-                    MaxTopicSize::ServerDefault,
+                    expiry,
+                    max_size,
                 )
                 .await
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{e:?}")))?;
