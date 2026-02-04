@@ -103,8 +103,7 @@ jobs:
           cd web
           npm ci
           if [ "${{ inputs.task }}" = "lint" ]; then
-            # TODO(hubcio): make this blocking once Web UI lints are fixed
-            npm run lint || true
+            npm run lint
           elif [ "${{ inputs.task }}" = "build" ]; then
             npm run build
           fi

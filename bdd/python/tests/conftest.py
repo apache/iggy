@@ -18,6 +18,7 @@
 """
 BDD test configuration and fixtures for Python SDK tests.
 """
+
 import asyncio
 import os
 import pytest
@@ -62,5 +63,5 @@ def context():
     if ctx.client:
         try:
             asyncio.run(ctx.client.disconnect())
-        except:
-            pass  # Ignore cleanup errors
+        except Exception:
+            pass

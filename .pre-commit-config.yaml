@@ -27,15 +27,15 @@ repos:
         exclude: ^helm/charts/.*/templates/
       - id: mixed-line-ending
 
-  # Python SDK formatting
+  # Python formatting
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.15.0
     hooks:
       - id: ruff-check
         args: [--fix]
-        files: ^foreign/python/.*\.(py|pyi)$
+        files: ^(foreign|bdd|examples)/python/.*\.(py|pyi)$
       - id: ruff-format
-        files: ^foreign/python/.*\.(py|pyi)$
+        files: ^(foreign|bdd|examples)/python/.*\.(py|pyi)$
 
   # CI scripts
   - repo: local
@@ -146,9 +146,94 @@ repos:
         pass_filenames: false
         stages: [pre-push]
 
-        # TODO(hubcio): add fast checks, linters, formatters for other languages
-        # - python (maturin, pytest, ruff, black)
-        # - java
-        # - go
-        # - csharp
-        # - js
+  # Go SDK formatting
+  - repo: local
+    hooks:
+      - id: go-fmt
+        name: go fmt
+        entry: bash -c 'for dir in foreign/go bdd/go examples/go; do [ -d "$dir" ] && (cd "$dir" && gofmt -w -s .); done'
+        language: system
+        files: ^(foreign|bdd|examples)/go/.*\.go$
+        pass_filenames: false
+
+      - id: go-mod-tidy
+        name: go mod tidy
+        entry: bash -c 'for dir in foreign/go bdd/go examples/go; do [ -f "$dir/go.mod" ] && (cd "$dir" && go mod tidy && git diff --exit-code go.mod go.sum); done'
+        language: system
+        files: ^(foreign|bdd|examples)/go/(.*\.go|go\.mod|go\.sum)$
+        pass_filenames: false
+
+  # Go SDK linting (version must match CI: .github/actions/go/pre-merge/action.yml)
+  - repo: local
+    hooks:
+      - id: golangci-lint-foreign
+        name: golangci-lint (foreign/go)
+        entry: bash -c 'cd foreign/go && golangci-lint run --timeout=5m ./...'
+        language: golang
+        additional_dependencies:
+          ["github.com/golangci/golangci-lint/cmd/golangci-lint@v1.64.8"]
+        files: ^foreign/go/.*\.go$
+        pass_filenames: false
+        stages: [pre-push]
+
+      - id: golangci-lint-bdd
+        name: golangci-lint (bdd/go)
+        entry: bash -c 'cd bdd/go && golangci-lint run --timeout=5m ./...'
+        language: golang
+        additional_dependencies:
+          ["github.com/golangci/golangci-lint/cmd/golangci-lint@v1.64.8"]
+        files: ^bdd/go/.*\.go$
+        pass_filenames: false
+        stages: [pre-push]
+
+      - id: golangci-lint-examples
+        name: golangci-lint (examples/go)
+        entry: bash -c 'cd examples/go && golangci-lint run --timeout=5m ./...'
+        language: golang
+        additional_dependencies:
+          ["github.com/golangci/golangci-lint/cmd/golangci-lint@v1.64.8"]
+        files: ^examples/go/.*\.go$
+        pass_filenames: false
+        stages: [pre-push]
+
+  # Node.js linting
+  - repo: local
+    hooks:
+      - id: node-eslint
+        name: node eslint
+        entry: bash -c 'for dir in foreign/node examples/node; do [ -f "$dir/package.json" ] && (cd "$dir" && npm run lint); done'
+        language: system
+        files: ^(foreign|examples)/node/.*\.ts$
+        pass_filenames: false
+
+  # Web UI linting (Svelte + TypeScript)
+  - repo: local
+    hooks:
+      - id: web-lint
+        name: web lint
+        entry: bash -c 'cd web && npm run lint'
+        language: system
+        files: ^web/.*\.(ts|js|svelte)$
+        pass_filenames: false
+
+  # Java SDK linting (Checkstyle + Spotless via Gradle)
+  - repo: local
+    hooks:
+      - id: java-gradle-check
+        name: java gradle check
+        entry: bash -c 'for dir in foreign/java bdd/java examples/java; do [ -f "$dir/build.gradle.kts" ] && (cd "$dir" && ./gradlew check -x test); done'
+        language: system
+        files: ^(foreign|bdd|examples)/java/.*\.(java|kt|kts)$
+        pass_filenames: false
+        stages: [pre-push]
+
+  # C# SDK formatting
+  - repo: local
+    hooks:
+      - id: csharp-dotnet-format
+        name: csharp dotnet format
+        entry: bash -c 'dotnet format foreign/csharp/Iggy_SDK.sln --verify-no-changes && dotnet format examples/csharp/Iggy_SDK.Examples.sln --verify-no-changes'
+        language: system
+        files: ^(foreign|examples)/csharp/.*\.cs$
+        pass_filenames: false
+        stages: [pre-push]

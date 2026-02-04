@@ -67,7 +67,7 @@
 
     // TODO: https://github.com/sveltejs/kit/issues/14750
     await goto(
-        // eslint-disable-next-line svelte/no-navigation-without-resolve
+      // eslint-disable-next-line svelte/no-navigation-without-resolve
       resolve(
         `/dashboard/streams/${page.params.streamId}/topics/${page.params.topicId}/partitions/${page.params.partitionId}/messages`
       ) + `?${searchParams}`,
@@ -95,9 +95,7 @@
     variant="rounded"
     class="mr-5"
     onclick={() =>
-      goto(
-        resolve(`/dashboard/streams/${page.params.streamId}/topics/${page.params.topicId}`)
-      )}
+      goto(resolve(`/dashboard/streams/${page.params.streamId}/topics/${page.params.topicId}`))}
   >
     <Icon name="arrowLeft" class="h-[40px] w-[30px]" />
   </Button>

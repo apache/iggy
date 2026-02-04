@@ -57,6 +57,14 @@ runs:
       run: |
         cd foreign/node
         npm run lint
+
+        # Also lint examples/node if it exists
+        if [ -f "${GITHUB_WORKSPACE}/examples/node/package.json" ]; then
+          echo "Linting examples/node..."
+          cd "${GITHUB_WORKSPACE}/examples/node"
+          npm ci --ignore-scripts
+          npm run lint
+        fi
       shell: bash
 
     - name: Build

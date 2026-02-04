@@ -18,6 +18,7 @@
 -->
 
 <script lang="ts">
+  import { SvelteSet } from 'svelte/reactivity';
   import ModalBase from './ModalBase.svelte';
   import type { CloseModalFn } from '$lib/types/utilTypes';
   import { type Message, type HeaderEntry, type HeaderField } from '$lib/domain/Message';
@@ -86,7 +87,7 @@
     }
   };
 
-  let expandedHeaders: Set<number> = $state(new Set());
+  let expandedHeaders = new SvelteSet<number>();
 
   const toggleHeaderExpand = (index: number) => {
     if (expandedHeaders.has(index)) {
@@ -94,7 +95,6 @@
     } else {
       expandedHeaders.add(index);
     }
-    expandedHeaders = new Set(expandedHeaders);
   };
 
   const findHeaderByStringKey = (
@@ -167,7 +167,7 @@
             <span class="text-shade-l900 dark:text-shade-l700">No headers</span>
           {:else}
             <div class="flex flex-col gap-1">
-              {#each message.user_headers as entry, index}
+              {#each message.user_headers as entry, index (index)}
                 {@const keyValue = decodeHeaderValue(entry.key.kind, entry.key.value)}
                 {@const valueValue = decodeHeaderValue(entry.value.kind, entry.value.value)}
                 {@const isExpanded = expandedHeaders.has(index)}

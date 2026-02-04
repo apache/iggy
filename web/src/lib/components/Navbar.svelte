@@ -31,34 +31,22 @@
     {
       name: 'Overview',
       icon: 'home',
-      href: resolve(typedRoute('/dashboard/overview')),
+      path: typedRoute('/dashboard/overview'),
       active: page.url.pathname.includes(typedRoute('/dashboard/overview'))
     },
     {
       name: 'Streams',
       icon: 'stream',
-      href: resolve(typedRoute('/dashboard/streams')),
+      path: typedRoute('/dashboard/streams'),
       active: page.url.pathname.includes(typedRoute('/dashboard/streams'))
     },
-    // {
-    //   name: 'Clients',
-    //   icon: 'clients',
-    //   href: resolve(typedRoute('/dashboard/clients')),
-    //   active: page.url.pathname.includes(typedRoute('/dashboard/clients'))
-    // },
-    // {
-    //   name: 'Logs',
-    //   icon: 'logs',
-    //   href: resolve(typedRoute('/dashboard/logs')),
-    //   active: page.url.pathname.includes(typedRoute('/dashboard/logs'))
-    // },
     {
       name: 'Settings',
       icon: 'settings',
-      href: resolve(typedRoute('/dashboard/settings/webUI')),
+      path: typedRoute('/dashboard/settings/webUI'),
       active: page.url.pathname.includes('/dashboard/settings')
     }
-  ] satisfies { name: string; icon: iconType; href: string; active: boolean }[]);
+  ] satisfies { name: string; icon: iconType; path: string; active: boolean }[]);
 </script>
 
 <nav
@@ -73,11 +61,11 @@
   </a>
 
   <ul class="flex flex-col gap-7">
-    {#each navItems as { name, icon, href, active } (name + href)}
+    {#each navItems as { name, icon, path, active } (name + path)}
       <li>
         <div use:tooltip={{ placement: 'right' }}>
           <a
-            {href}
+            href={resolve(path)}
             data-trigger
             class={twMerge(
               'p-2 block rounded-xl transition-colors  ring-2 ring-transparent',

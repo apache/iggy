@@ -32,12 +32,12 @@ func successfullyCreateConsumer(streamId uint32, topicId uint32, cli iggycli.Cli
 	name := createRandomString(16)
 	streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 	topicIdentifier, _ := iggcon.NewIdentifier(topicId)
-    group, err := cli.CreateConsumerGroup(
+	group, err := cli.CreateConsumerGroup(
 		streamIdentifier,
 		topicIdentifier,
-        name)
-    groupId := group.Id
-    itShouldSuccessfullyCreateConsumer(streamId, topicId, groupId, name, cli)
+		name)
+	groupId := group.Id
+	itShouldSuccessfullyCreateConsumer(streamId, topicId, groupId, name, cli)
 	itShouldNotReturnError(err)
 	return groupId, name
 }

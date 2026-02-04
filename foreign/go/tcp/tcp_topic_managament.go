@@ -58,7 +58,7 @@ func (tms *IggyTcpClient) CreateTopic(
 	compressionAlgorithm iggcon.CompressionAlgorithm,
 	messageExpiry iggcon.Duration,
 	maxTopicSize uint64,
-    replicationFactor *uint8,
+	replicationFactor *uint8,
 ) (*iggcon.TopicDetails, error) {
 	if len(name) == 0 || len(name) > MaxStringLength {
 		return nil, ierror.ErrInvalidTopicName

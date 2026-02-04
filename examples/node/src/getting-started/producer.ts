@@ -18,7 +18,6 @@
  */
 
 import { Client, Partitioning } from "apache-iggy";
-import debug from "debug";
 import {
   BATCHES_LIMIT,
   cleanup,
