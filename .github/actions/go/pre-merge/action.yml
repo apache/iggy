@@ -120,8 +120,7 @@ runs:
       if: inputs.task == 'e2e'
       uses: ./.github/actions/utils/setup-rust-with-cache
       with:
-        cache-targets: false
-        save-cache: "false"  # Only builds server, let Rust test job save comprehensive cache
+        shared-key: dev
 
     - name: Setup server for e2e tests
       if: inputs.task == 'e2e'

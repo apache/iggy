@@ -47,8 +47,7 @@ jobs:
         if: inputs.component == 'examples-suite'
         uses: ./.github/actions/utils/setup-rust-with-cache
         with:
-          cache-targets: false # Only cache registry and git deps, not target dir (sccache handles that)
-          save-cache: "false" # Only builds server+examples, let Rust test job save comprehensive cache
+          shared-key: dev
 
       - name: Setup Node with cache for examples
         if: inputs.component == 'examples-suite'

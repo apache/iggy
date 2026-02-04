@@ -15,33 +15,23 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# NOTE: this action sets up the Rust toolchain + swatinem/rust-cache for dependencies + sccache for compilation,
-#       it is a convenience wrapper, so that we can use it in all workflows.
-
 name: setup-rust-with-cache
-description: Setup Rust toolchain and comprehensive caching (rust-cache for dependencies + sccache for compilation)
+description: Setup Rust toolchain with Swatinem/rust-cache
+
 inputs:
   enabled:
     description: "Whether to enable caching"
     required: false
     default: "true"
-  cache-targets:
-    description: "Whether to cache target directory (passed to rust-cache)"
+  shared-key:
+    description: "Shared cache key across jobs (e.g., 'dev', 'dev-coverage')"
     required: false
-    default: "false"
-  profile:
-    description: "Build profile for cache separation (dev or release)"
-    required: false
-    default: "dev"
-  save-cache:
-    description: "Whether to save cache at end of job (set false for jobs that don't compile much)"
-    required: false
-    default: "true"
+    default: ""
 
 runs:
   using: "composite"
   steps:
-    - name: Install system dependencies
+    - name: Install system dependencies (Linux)
       if: runner.os == 'Linux'
       run: |
         sudo apt-get update
@@ -55,166 +45,44 @@ runs:
       shell: bash
 
     - name: Setup Rust toolchain
-      run: |
-        echo "Using Rust toolchain from rust-toolchain.toml: $(rustup show)"
+      run: rustup show
       shell: bash
 
-    - name: Setup Rust dependencies cache
+    - name: Setup Rust cache
       if: inputs.enabled == 'true'
       uses: Swatinem/rust-cache@v2
       with:
-        cache-targets: ${{ inputs.cache-targets }}
-        shared-key: rust-deps  # All jobs share same dependency cache (profile doesn't affect downloads)
-
-    - name: Get current date
-      id: date
-      run: echo "date=$(date +'%Y-%m-%d')" >> $GITHUB_OUTPUT
-      shell: bash
-
-    - name: Setup sccache cache (restore and save)
-      if: inputs.enabled == 'true' && inputs.save-cache == 'true'
-      uses: actions/cache@v4
-      with:
-        path: |
-          ~/.cache/sccache
-          ~/Library/Caches/sccache
-          ~/.local/share/sccache
-        key: sccache-${{ runner.os }}-${{ runner.arch }}-${{ inputs.profile }}-${{ steps.date.outputs.date }}-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
-        restore-keys: |
-          sccache-${{ runner.os }}-${{ runner.arch }}-${{ inputs.profile }}-
-
-    - name: Setup sccache cache (restore only)
-      if: inputs.enabled == 'true' && inputs.save-cache != 'true'
-      uses: actions/cache/restore@v4
-      with:
-        path: |
-          ~/.cache/sccache
-          ~/Library/Caches/sccache
-          ~/.local/share/sccache
-        key: sccache-${{ runner.os }}-${{ runner.arch }}-${{ inputs.profile }}-${{ steps.date.outputs.date }}-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
-        restore-keys: |
-          sccache-${{ runner.os }}-${{ runner.arch }}-${{ inputs.profile }}-
-
-    - name: Install sccache
-      if: inputs.enabled == 'true'
-      run: |
-        # Check if sccache is already installed
-        if ! command -v sccache &> /dev/null; then
-          echo "Installing sccache..."
-          SCCACHE_VERSION="v0.13.0"
-
-          # Detect OS and architecture
-          OS="$(uname -s)"
-          ARCH="$(uname -m)"
-
-          if [[ "$OS" == "Linux" ]]; then
-            case "$ARCH" in
-              x86_64)  SCCACHE_ARCH="x86_64-unknown-linux-musl" ;;
-              aarch64) SCCACHE_ARCH="aarch64-unknown-linux-musl" ;;
-              *)
-                echo "⚠️ Unsupported Linux architecture: $ARCH, skipping sccache"
-                exit 0
-                ;;
-            esac
-          elif [[ "$OS" == "Darwin" ]]; then
-            case "$ARCH" in
-              x86_64) SCCACHE_ARCH="x86_64-apple-darwin" ;;
-              arm64)  SCCACHE_ARCH="aarch64-apple-darwin" ;;
-              *)
-                echo "⚠️ Unsupported macOS architecture: $ARCH, skipping sccache"
-                exit 0
-                ;;
-            esac
-          else
-            echo "⚠️ Unsupported OS: $OS, skipping sccache"
-            exit 0
-          fi
-
-          SCCACHE_URL="https://github.com/mozilla/sccache/releases/download/${SCCACHE_VERSION}/sccache-${SCCACHE_VERSION}-${SCCACHE_ARCH}.tar.gz"
-          echo "Downloading sccache $SCCACHE_VERSION for $SCCACHE_ARCH..."
-
-          curl -L "$SCCACHE_URL" | tar xz
-          if [[ "$OS" == "Darwin" ]]; then
-            mv "sccache-${SCCACHE_VERSION}-${SCCACHE_ARCH}/sccache" /usr/local/bin/
-          else
-            sudo mv "sccache-${SCCACHE_VERSION}-${SCCACHE_ARCH}/sccache" /usr/local/bin/
-          fi
-          rm -rf "sccache-${SCCACHE_VERSION}-${SCCACHE_ARCH}"
-        fi
-      shell: bash
-      continue-on-error: true
+        shared-key: ${{ inputs.shared-key }}
 
     - name: Install cargo-nextest
+      if: runner.os == 'Linux'
       run: |
-        # Check if cargo-nextest is already installed
-        if ! command -v cargo-nextest &> /dev/null; then
-          echo "Installing cargo-nextest..."
-
-          # Detect architecture for nextest
-          ARCH="$(uname -m)"
-          case "$ARCH" in
-            x86_64)  NEXTEST_PLATFORM="linux" ;;
-            aarch64) NEXTEST_PLATFORM="linux-arm" ;;
-            *)
-              echo "⚠️ Unsupported architecture: $ARCH, skipping nextest"
-              exit 0
-              ;;
-          esac
-
-          curl -LsSf "https://get.nexte.st/latest/${NEXTEST_PLATFORM}" | tar xzf - -C ${CARGO_HOME:-~/.cargo}/bin
-          echo "✅ cargo-nextest installed successfully for $ARCH"
-        else
-          echo "✅ cargo-nextest already installed"
+        if command -v cargo-nextest &> /dev/null; then
+          echo "cargo-nextest already installed"
+          cargo nextest --version
+          exit 0
         fi
 
-        # Verify installation
-        cargo nextest --version || true
+        ARCH="$(uname -m)"
+        case "$ARCH" in
+          x86_64)  NEXTEST_PLATFORM="linux" ;;
+          aarch64) NEXTEST_PLATFORM="linux-arm" ;;
+          *)
+            echo "Unsupported architecture: $ARCH, skipping nextest"
+            exit 0
+            ;;
+        esac
+
+        curl -LsSf "https://get.nexte.st/latest/${NEXTEST_PLATFORM}" | tar xzf - -C ${CARGO_HOME:-~/.cargo}/bin
+        cargo nextest --version
       shell: bash
       continue-on-error: true
 
-    - name: Configure Rust for sccache
+    - name: Configure Cargo for CI
       if: inputs.enabled == 'true'
       run: |
-        # Only use sccache if it was successfully installed
-        if command -v sccache &> /dev/null; then
-          # Configure sccache to use local disk cache
-          export SCCACHE_DIR="${HOME}/.cache/sccache"
-          mkdir -p "$SCCACHE_DIR"
-
-          echo "SCCACHE_DIR=$SCCACHE_DIR" >> $GITHUB_ENV
-          echo "SCCACHE_CACHE_SIZE=2G" >> $GITHUB_ENV
-          echo "SCCACHE_ERROR_BEHAVIOR=warn" >> $GITHUB_ENV
-          echo "SCCACHE_IGNORE_SERVER_IO_ERROR=1" >> $GITHUB_ENV
-
-          # Don't use GHA cache backend - use local disk cache with actions/cache
-          # This provides better control and persistence
-          echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
-
-          # Disable incremental compilation - not useful in CI with sccache
-          echo "CARGO_INCREMENTAL=0" >> $GITHUB_ENV
-
-          # Disable debug info in dev/test builds - faster compilation, smaller cache
-          echo "CARGO_PROFILE_DEV_DEBUG=0" >> $GITHUB_ENV
-          echo "CARGO_PROFILE_TEST_DEBUG=0" >> $GITHUB_ENV
-
-          # Use sparse registry protocol for faster dependency resolution
-          echo "CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse" >> $GITHUB_ENV
-
-          # Start sccache server
-          sccache --stop-server 2>/dev/null || true
-          sccache --start-server || true
-
-          # Test if sccache is working
-          if sccache --show-stats >/dev/null 2>&1; then
-            echo "✅ sccache configured with local cache at $SCCACHE_DIR"
-
-            # Show initial stats
-            echo "Initial cache stats:"
-            sccache --show-stats || true
-          else
-            echo "⚠️ sccache installed but not functioning, continuing without cache"
-          fi
-        else
-          echo "⚠️ sccache not available, continuing without cache"
-        fi
+        echo "CARGO_INCREMENTAL=0" >> $GITHUB_ENV
+        echo "CARGO_PROFILE_DEV_DEBUG=0" >> $GITHUB_ENV
+        echo "CARGO_PROFILE_TEST_DEBUG=0" >> $GITHUB_ENV
+        echo "CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse" >> $GITHUB_ENV
       shell: bash
