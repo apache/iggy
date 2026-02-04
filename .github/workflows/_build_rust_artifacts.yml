@@ -138,6 +138,12 @@ jobs:
             export CFLAGS="-mno-outline-atomics"
           fi
 
+          # musl builds: use musl-gcc as linker to ensure proper linking against musl libc
+          if [[ "${{ matrix.libc }}" == "musl" ]]; then
+            export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc
+            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc
+          fi
+
           cargo build --locked --release --target ${{ matrix.target }} "${bin_flags[@]}"
 
       - name: Package binaries

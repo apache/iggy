@@ -19,14 +19,22 @@ name: setup-rust-with-cache
 description: Setup Rust toolchain with Swatinem/rust-cache
 
 inputs:
-  enabled:
-    description: "Whether to enable caching"
+  read-cache:
+    description: "Whether to read from cache"
     required: false
     default: "true"
   shared-key:
-    description: "Shared cache key across jobs (e.g., 'dev', 'dev-coverage')"
+    description: "Shared cache key across jobs"
     required: false
-    default: ""
+    default: "dev"
+  save-cache:
+    description: "Whether to save cache (true/false)"
+    required: false
+    default: "false"
+  print-cache-status:
+    description: "Whether to print cache status to job summary"
+    required: false
+    default: "false"
 
 runs:
   using: "composite"
@@ -49,10 +57,25 @@ runs:
       shell: bash
 
     - name: Setup Rust cache
-      if: inputs.enabled == 'true'
+      id: rust-cache
+      if: inputs.read-cache == 'true'
       uses: Swatinem/rust-cache@v2
       with:
         shared-key: ${{ inputs.shared-key }}
+        save-if: ${{ inputs.save-cache == 'true' }}
+
+    - name: Cache status
+      if: inputs.read-cache == 'true' && inputs.print-cache-status == 'true'
+      run: |
+        echo "### Rust Cache" >> $GITHUB_STEP_SUMMARY
+        if [ "${{ steps.rust-cache.outputs.cache-hit }}" == "true" ]; then
+          echo "✅ Cache hit" >> $GITHUB_STEP_SUMMARY
+        elif [ -d "target" ]; then
+          echo "🔶 Partial cache hit" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "❌ Cache miss" >> $GITHUB_STEP_SUMMARY
+        fi
+      shell: bash
 
     - name: Install cargo-nextest
       if: runner.os == 'Linux'
@@ -79,7 +102,7 @@ runs:
       continue-on-error: true
 
     - name: Configure Cargo for CI
-      if: inputs.enabled == 'true'
+      if: inputs.read-cache == 'true'
       run: |
         echo "CARGO_INCREMENTAL=0" >> $GITHUB_ENV
         echo "CARGO_PROFILE_DEV_DEBUG=0" >> $GITHUB_ENV

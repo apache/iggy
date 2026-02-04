@@ -35,22 +35,6 @@ impl PollingArgs {
     }
 }
 
-/// Metadata returned from a poll operation.
-#[derive(Debug, Clone)]
-pub struct PollMetadata {
-    pub partition_id: u32,
-    pub current_offset: u64,
-}
-
-impl PollMetadata {
-    pub fn new(partition_id: u32, current_offset: u64) -> Self {
-        Self {
-            partition_id,
-            current_offset,
-        }
-    }
-}
-
 /// Result of sending messages.
 #[derive(Debug)]
 pub struct SendMessagesResult {
@@ -65,4 +49,110 @@ pub enum PollingConsumer {
     Consumer(usize, usize),
     /// Consumer group with (group_id, member_id)
     ConsumerGroup(usize, usize),
+}
+
+/// Result of appending messages during the prepare phase.
+///
+/// Indicates the offset range assigned to the appended messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AppendResult {
+    /// First offset assigned to the batch.
+    pub start_offset: u64,
+    /// Last offset assigned to the batch (inclusive).
+    pub end_offset: u64,
+    /// Number of messages in the batch.
+    pub messages_count: u32,
+}
+
+impl AppendResult {
+    pub fn new(start_offset: u64, end_offset: u64, messages_count: u32) -> Self {
+        Self {
+            start_offset,
+            end_offset,
+            messages_count,
+        }
+    }
+
+    /// Returns the number of offsets in the range.
+    #[inline]
+    pub fn offset_count(&self) -> u64 {
+        self.end_offset - self.start_offset + 1
+    }
+}
+
+/// Current offset state of a partition.
+///
+/// Tracks both the commit offset (visibility boundary) and write offset
+/// (highest written message). These may differ when there are prepared
+/// but uncommitted messages.
+///
+/// ```text
+/// Segment: [msg0][msg1][msg2][msg3][msg4][msg5][msg6][msg7]
+///                                     ▲              ▲
+///                               commit_offset   write_offset
+///                                   (4)             (7)
+///
+/// - Messages 0-4: COMMITTED (visible to consumers)
+/// - Messages 5-7: PREPARED but not committed (invisible)
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PartitionOffsets {
+    /// Highest offset visible to consumers.
+    ///
+    /// All messages with `offset <= commit_offset` can be read via
+    /// `read_committed()` or `poll_messages()`.
+    pub commit_offset: u64,
+
+    /// Highest offset written to storage.
+    ///
+    /// This may be greater than `commit_offset` when there are prepared
+    /// but uncommitted messages (during the window between prepare and
+    /// commit in VSR).
+    ///
+    /// Invariant: `write_offset >= commit_offset`
+    pub write_offset: u64,
+}
+
+impl PartitionOffsets {
+    pub fn new(commit_offset: u64, write_offset: u64) -> Self {
+        debug_assert!(
+            write_offset >= commit_offset,
+            "write_offset ({}) must be >= commit_offset ({})",
+            write_offset,
+            commit_offset
+        );
+        Self {
+            commit_offset,
+            write_offset,
+        }
+    }
+
+    /// Create offsets for an empty partition.
+    pub fn empty() -> Self {
+        Self {
+            commit_offset: 0,
+            write_offset: 0,
+        }
+    }
+
+    /// Returns true if there are uncommitted (prepared) messages.
+    pub fn has_uncommitted(&self) -> bool {
+        self.write_offset > self.commit_offset
+    }
+
+    /// Returns the number of uncommitted messages.
+    pub fn uncommitted_count(&self) -> u64 {
+        self.write_offset - self.commit_offset
+    }
+
+    /// Returns true if commit and write offsets are equal.
+    pub fn is_fully_committed(&self) -> bool {
+        self.write_offset == self.commit_offset
+    }
+}
+
+impl Default for PartitionOffsets {
+    fn default() -> Self {
+        Self::empty()
+    }
 }

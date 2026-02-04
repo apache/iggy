@@ -33,8 +33,6 @@ runs:
 
     - name: Setup Rust with cache
       uses: ./.github/actions/utils/setup-rust-with-cache
-      with:
-        shared-key: dev
 
     - name: Cache pip
       uses: actions/cache@v4

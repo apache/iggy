@@ -44,7 +44,7 @@ runs:
     - name: Setup Rust with cache
       uses: ./.github/actions/utils/setup-rust-with-cache
       with:
-        shared-key: dev
+        print-cache-status: ${{ inputs.task == 'test' }}
 
     - name: Install tools for specific tasks
       run: |
@@ -99,9 +99,17 @@ runs:
         echo -n "test" | gnome-keyring-daemon --unlock
       shell: bash
 
-    - name: Build and test
+    - name: Install cargo-llvm-cov
+      if: inputs.task == 'test'
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-llvm-cov
+
+    - name: Build and test with coverage
       if: inputs.task == 'test'
       run: |
+        source <(cargo llvm-cov show-env --export-prefix)
+
         bins_start=$(date +%s)
         cargo build --locked
         bins_end=$(date +%s)
@@ -135,6 +143,10 @@ runs:
         echo "Total build:                   ${build_duration}s ($(date -ud @${build_duration} +'%M:%S'))"
         echo "Total time:                    ${total_duration}s ($(date -ud @${total_duration} +'%M:%S'))"
         echo "========================================="
+
+        cargo llvm-cov report --codecov --output-path codecov.json
+        echo "Coverage report generated: codecov.json"
+        ls -la codecov.json
       shell: bash
 
     - name: Backwards compatibility check

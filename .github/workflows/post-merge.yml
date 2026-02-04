@@ -133,12 +133,87 @@ jobs:
       create_edge_docker_tag: true
     secrets: inherit
 
+  warm-cache:
+    name: Warm cache (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Don't cache ubuntu-24.04-arm due to size
+        runner: [ubuntu-latest, macos-14]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust with cache
+        uses: ./.github/actions/utils/setup-rust-with-cache
+        with:
+          save-cache: "true"
+
+      - name: Build
+        run: cargo build --locked
+
+      - name: Compile tests
+        run: cargo test --no-run --locked
+
   build-artifacts:
     name: Build artifacts
     uses: ./.github/workflows/_build_rust_artifacts.yml
     with:
       version: edge
       upload_artifacts: true
+
+  coverage:
+    name: Coverage baseline
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cleanup disk space
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update --yes
+          sudo apt-get install --yes gnome-keyring keyutils
+          rm -f $HOME/.local/share/keyrings/*
+          echo -n "test" | gnome-keyring-daemon --unlock
+
+      - name: Setup Rust with cache
+        uses: ./.github/actions/utils/setup-rust-with-cache
+        with:
+          save-cache: "true"
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+
+      - name: Build and test with coverage
+        run: |
+          source <(cargo llvm-cov show-env --export-prefix)
+          cargo build --locked
+          cargo test --locked --no-run
+          if command -v cargo-nextest &> /dev/null; then
+            cargo nextest run --locked --no-fail-fast
+          else
+            cargo test --locked --no-fail-fast
+          fi
+        shell: bash
+
+      - name: Generate coverage report
+        run: |
+          source <(cargo llvm-cov show-env --export-prefix)
+          cargo llvm-cov report --codecov --output-path codecov.json
+        shell: bash
+
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: codecov.json
+          flags: rust
+          fail_ci_if_error: false
 
   create-prerelease:
     name: Create edge pre-release

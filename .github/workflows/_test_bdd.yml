@@ -55,8 +55,6 @@ jobs:
       - name: Setup Rust with cache for BDD
         if: startsWith(inputs.component, 'bdd-') && startsWith(inputs.task, 'bdd-')
         uses: ./.github/actions/utils/setup-rust-with-cache
-        with:
-          shared-key: dev
 
       - name: Build server for BDD tests
         if: startsWith(inputs.component, 'bdd-') && startsWith(inputs.task, 'bdd-')
