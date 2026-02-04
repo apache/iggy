@@ -31,7 +31,7 @@ use tracing::info;
 use uuid::Uuid;
 
 const QUICKWIT_IMAGE: &str = "quickwit/quickwit";
-const QUICKWIT_TAG: &str = "0.8.1";
+const QUICKWIT_TAG: &str = "0.8.2";
 const QUICKWIT_PORT: u16 = 7280;
 const QUICKWIT_READY_MSG: &str = "REST server is ready";
 const QUICKWIT_LISTEN_ADDRESS: &str = "0.0.0.0";

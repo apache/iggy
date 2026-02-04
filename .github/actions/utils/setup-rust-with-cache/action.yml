@@ -49,7 +49,7 @@ runs:
     - name: Install system dependencies (macOS)
       if: runner.os == 'macOS'
       run: |
-        brew install hwloc pkg-config
+        brew install hwloc
       shell: bash
 
     - name: Setup Rust toolchain

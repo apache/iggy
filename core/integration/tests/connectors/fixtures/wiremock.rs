@@ -26,6 +26,8 @@ use testcontainers_modules::testcontainers::core::{IntoContainerPort, Mount};
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use testcontainers_modules::testcontainers::{ContainerAsync, GenericImage, ImageExt};
 
+const WIREMOCK_IMAGE: &str = "wiremock/wiremock";
+const WIREMOCK_TAG: &str = "3.13.2";
 const WIREMOCK_PORT: u16 = 8080;
 
 struct WireMockContainer {
@@ -41,7 +43,7 @@ impl WireMockContainer {
             message: format!("Failed to get current dir: {e}"),
         })?;
 
-        let container = GenericImage::new("wiremock/wiremock", "latest")
+        let container = GenericImage::new(WIREMOCK_IMAGE, WIREMOCK_TAG)
             .with_exposed_port(WIREMOCK_PORT.tcp())
             .with_wait_for(Healthcheck(HealthWaitStrategy::default()))
             .with_mount(Mount::bind_mount(
