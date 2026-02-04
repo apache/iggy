@@ -9,7 +9,7 @@
 
   [![crates.io](https://img.shields.io/crates/v/iggy.svg)](https://crates.io/crates/iggy)
   [![crates.io](https://img.shields.io/crates/d/iggy.svg)](https://crates.io/crates/iggy)
-  [![coverage](https://coveralls.io/repos/github/apache/iggy/badge.svg?branch=master)](https://coveralls.io/github/apache/iggy?branch=master)
+  [![codecov](https://codecov.io/github/apache/iggy/graph/badge.svg?token=D9TIWPBWE2)](https://codecov.io/github/apache/iggy)
   [![dependency](https://deps.rs/repo/github/apache/iggy/status.svg)](https://deps.rs/repo/github/apache/iggy)
   [![x](https://img.shields.io/twitter/follow/ApacheIggy?style=social)](https://twitter.com/ApacheIggy)
   [![discord-badge](https://img.shields.io/discord/1144142576266530928)](https://discord.gg/C5Sux5NcRa)
