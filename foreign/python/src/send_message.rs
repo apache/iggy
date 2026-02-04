@@ -47,6 +47,7 @@ impl Clone for SendMessage {
                     origin_timestamp: self.inner.header.origin_timestamp,
                     user_headers_length: self.inner.header.user_headers_length,
                     payload_length: self.inner.header.payload_length,
+                    reserved: self.inner.header.reserved,
                 },
                 payload: self.inner.payload.clone(),
                 user_headers: self.inner.user_headers.clone(),

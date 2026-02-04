@@ -420,17 +420,18 @@ internal static class TcpContracts
                 message.Header.OriginTimestamp);
             BinaryPrimitives.WriteInt32LittleEndian(bytes[(position + 48)..(position + 52)], headersBytes.Length);
             BinaryPrimitives.WriteInt32LittleEndian(bytes[(position + 52)..(position + 56)], message.Payload.Length);
+            BinaryPrimitives.WriteUInt64LittleEndian(bytes[(position + 56)..(position + 64)], message.Header.Reserved);
 
-            message.Payload.CopyTo(bytes[(position + 56)..(position + 56 + message.Header.PayloadLength)]);
+            message.Payload.CopyTo(bytes[(position + 64)..(position + 64 + message.Header.PayloadLength)]);
             if (headersBytes.Length > 0)
             {
                 headersBytes
                     .CopyTo(bytes[
-                        (position + 56 + message.Header.PayloadLength)..(position + 56 + message.Header.PayloadLength +
+                        (position + 64 + message.Header.PayloadLength)..(position + 64 + message.Header.PayloadLength +
                                                                          headersBytes.Length)]);
             }
 
-            position += 56 + message.Header.PayloadLength + headersBytes.Length;
+            position += 64 + message.Header.PayloadLength + headersBytes.Length;
 
             msgSize += message.GetSize() + headersBytes.Length;
 

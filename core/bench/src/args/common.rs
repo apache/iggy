@@ -30,7 +30,7 @@ use bench_report::benchmark_kind::BenchmarkKind;
 use bench_report::numeric_parameter::BenchmarkNumericParameter;
 use clap::error::ErrorKind;
 use clap::{CommandFactory, Parser};
-use iggy::prelude::{IggyByteSize, IggyDuration, TransportProtocol};
+use iggy::prelude::{IggyByteSize, IggyDuration, IggyExpiry, TransportProtocol};
 use std::num::NonZeroU32;
 use std::str::FromStr;
 
@@ -289,6 +289,10 @@ impl IggyBenchArgs {
 
     pub fn max_topic_size(&self) -> Option<IggyByteSize> {
         self.benchmark_kind.inner().max_topic_size()
+    }
+
+    pub fn message_expiry(&self) -> IggyExpiry {
+        self.benchmark_kind.inner().message_expiry()
     }
 
     pub fn read_amplification(&self) -> Option<f32> {

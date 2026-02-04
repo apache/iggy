@@ -28,7 +28,7 @@ public record MessageHeader(
         BigInteger timestamp,
         BigInteger originTimestamp,
         Long userHeadersLength,
-        Long payloadLength) {
-
-    public static final int SIZE = 8 + 16 + 8 + 8 + 8 + 4 + 4;
+        Long payloadLength,
+        BigInteger reserved) {
+    public static final int SIZE = 8 + 16 + 8 + 8 + 8 + 4 + 4 + 8;
 }

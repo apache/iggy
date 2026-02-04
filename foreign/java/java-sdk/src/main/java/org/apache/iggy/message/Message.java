@@ -55,7 +55,8 @@ public record Message(MessageHeader header, byte[] payload, Map<HeaderKey, Heade
                 BigInteger.ZERO,
                 BigInteger.ZERO,
                 userHeadersLength,
-                (long) payloadBytes.length);
+                (long) payloadBytes.length,
+                BigInteger.ZERO);
         return new Message(msgHeader, payloadBytes, userHeaders);
     }
 
@@ -69,7 +70,8 @@ public record Message(MessageHeader header, byte[] payload, Map<HeaderKey, Heade
                 header.timestamp(),
                 header.originTimestamp(),
                 userHeadersLength,
-                (long) payload.length);
+                (long) payload.length,
+                header.reserved());
         return new Message(updatedHeader, payload, mergedHeaders);
     }
 

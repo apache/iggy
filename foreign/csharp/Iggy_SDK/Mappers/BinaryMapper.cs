@@ -29,7 +29,7 @@ namespace Apache.Iggy.Mappers;
 
 internal static class BinaryMapper
 {
-    private const int PropertiesSize = 56;
+    private const int PropertiesSize = 64;
 
     internal static RawPersonalAccessToken MapRawPersonalAccessToken(ReadOnlySpan<byte> payload)
     {
@@ -359,17 +359,18 @@ internal static class BinaryMapper
             var originTimestamp = BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 40)..(position + 48)]);
             var headersLength = BinaryPrimitives.ReadInt32LittleEndian(payload[(position + 48)..(position + 52)]);
             var payloadLength = BinaryPrimitives.ReadInt32LittleEndian(payload[(position + 52)..(position + 56)]);
+            var reserved = BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 56)..(position + 64)]);
 
             Dictionary<HeaderKey, HeaderValue>? headers = headersLength switch
             {
                 0 => null,
                 > 0 => MapHeaders(
-                    payload[(position + 56 + payloadLength)..(position + 56 + payloadLength + headersLength)]),
+                    payload[(position + 64 + payloadLength)..(position + 64 + payloadLength + headersLength)]),
                 < 0 => throw new ArgumentOutOfRangeException()
             };
 
-            var payloadRangeStart = position + 56;
-            var payloadRangeEnd = position + 56 + payloadLength;
+            var payloadRangeStart = position + 64;
+            var payloadRangeEnd = position + 64 + payloadLength;
             if (payloadRangeStart > length || payloadRangeEnd > length)
             {
                 break;
@@ -393,7 +394,8 @@ internal static class BinaryMapper
                         OriginTimestamp = originTimestamp,
                         PayloadLength = payloadLength,
                         Timestamp = DateTimeOffsetUtils.FromUnixTimeMicroSeconds(timestamp),
-                        UserHeadersLength = headersLength
+                        UserHeadersLength = headersLength,
+                        Reserved = reserved
                     },
                     UserHeaders = headers,
                     Payload = decryptor is not null
@@ -406,7 +408,7 @@ internal static class BinaryMapper
                 ArrayPool<byte>.Shared.Return(messagePayload);
             }
 
-            position += 56 + payloadLength + headersLength;
+            position += 64 + payloadLength + headersLength;
             if (position + PropertiesSize >= length)
             {
                 break;

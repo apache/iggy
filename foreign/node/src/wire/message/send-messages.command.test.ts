@@ -40,7 +40,7 @@ describe("SendMessages", () => {
     };
 
     it("serialize SendMessages into a buffer", () => {
-      assert.deepEqual(SEND_MESSAGES.serialize(t1).length, 533);
+      assert.deepEqual(SEND_MESSAGES.serialize(t1).length, 589);
     });
 
     it("serialize all kinds of messageId", () => {

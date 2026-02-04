@@ -24,6 +24,7 @@ use crate::{
     IGGY_MESSAGE_OFFSET_OFFSET_RANGE, IGGY_MESSAGE_ORIGIN_TIMESTAMP_OFFSET_RANGE,
     IGGY_MESSAGE_PAYLOAD_LENGTH_OFFSET_RANGE, IGGY_MESSAGE_TIMESTAMP_OFFSET_RANGE,
     IggyMessageHeader, error::IggyError,
+    types::message::message_header::IGGY_MESSAGE_RESERVED_OFFSET_RANGE,
 };
 
 /// A read-only, typed view into a message header in a raw buffer.
@@ -87,6 +88,12 @@ impl<'a> IggyMessageHeaderView<'a> {
         u32::from_le_bytes(bytes.try_into().unwrap()) as usize
     }
 
+    /// The reserved field (8 bytes)
+    pub fn reserved(&self) -> u64 {
+        let bytes = &self.data[IGGY_MESSAGE_RESERVED_OFFSET_RANGE];
+        u64::from_le_bytes(bytes.try_into().unwrap())
+    }
+
     /// Convert this view to a full IggyMessageHeader struct
     pub fn to_header(&self) -> IggyMessageHeader {
         IggyMessageHeader {
@@ -97,6 +104,7 @@ impl<'a> IggyMessageHeaderView<'a> {
             origin_timestamp: self.origin_timestamp(),
             user_headers_length: self.user_headers_length() as u32,
             payload_length: self.payload_length() as u32,
+            reserved: self.reserved(),
         }
     }
 }

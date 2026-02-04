@@ -48,7 +48,7 @@ internal static class TcpMessageStreamHelpers
         var bytesCount = 0;
         foreach (var message in messages)
         {
-            bytesCount += 16 + 56 + message.Payload.Length;
+            bytesCount += 16 + 64 + message.Payload.Length;
             if (message.UserHeaders is null)
             {
                 continue;

@@ -193,8 +193,9 @@ public final class BytesDeserializer {
         var originTimestamp = readU64AsBigInteger(response);
         var userHeadersLength = response.readUnsignedIntLE();
         var payloadLength = response.readUnsignedIntLE();
-        var header =
-                new MessageHeader(checksum, id, offset, timestamp, originTimestamp, userHeadersLength, payloadLength);
+        var reserved = readU64AsBigInteger(response);
+        var header = new MessageHeader(
+                checksum, id, offset, timestamp, originTimestamp, userHeadersLength, payloadLength, reserved);
         var payload = newByteArray(payloadLength);
         response.readBytes(payload);
         Map<HeaderKey, HeaderValue> userHeaders = new HashMap<>();

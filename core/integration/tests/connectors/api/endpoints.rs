@@ -17,15 +17,21 @@
  * under the License.
  */
 
-use crate::connectors::api::setup;
+use integration::harness::seeds;
+use integration::iggy_harness;
 use reqwest::Client;
 
 const API_KEY: &str = "test-api-key";
 
-#[tokio::test]
-async fn test_root_endpoint_returns_welcome_message() {
-    let runtime = setup().await;
-    let api_address = runtime.connectors_api_address().unwrap();
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/api/config.toml")),
+    seed = seeds::connector_stream
+)]
+async fn root_endpoint_returns_welcome_message(harness: &TestHarness) {
+    let api_address = harness
+        .connectors_runtime()
+        .expect("connector runtime should be available")
+        .http_url();
     let client = Client::new();
 
     let response = client
@@ -39,10 +45,15 @@ async fn test_root_endpoint_returns_welcome_message() {
     assert_eq!(body, "Connector Runtime API");
 }
 
-#[tokio::test]
-async fn test_health_endpoint_returns_healthy() {
-    let runtime = setup().await;
-    let api_address = runtime.connectors_api_address().unwrap();
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/api/config.toml")),
+    seed = seeds::connector_stream
+)]
+async fn health_endpoint_returns_healthy(harness: &TestHarness) {
+    let api_address = harness
+        .connectors_runtime()
+        .expect("connector runtime should be available")
+        .http_url();
     let client = Client::new();
 
     let response = client
@@ -56,10 +67,15 @@ async fn test_health_endpoint_returns_healthy() {
     assert_eq!(body["status"], "healthy");
 }
 
-#[tokio::test]
-async fn test_stats_endpoint_returns_runtime_stats() {
-    let runtime = setup().await;
-    let api_address = runtime.connectors_api_address().unwrap();
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/api/config.toml")),
+    seed = seeds::connector_stream
+)]
+async fn stats_endpoint_returns_runtime_stats(harness: &TestHarness) {
+    let api_address = harness
+        .connectors_runtime()
+        .expect("connector runtime should be available")
+        .http_url();
     let client = Client::new();
 
     let response = client
@@ -90,10 +106,15 @@ async fn test_stats_endpoint_returns_runtime_stats() {
     assert_eq!(stats["sinks_running"], 0);
 }
 
-#[tokio::test]
-async fn test_metrics_endpoint_returns_prometheus_format() {
-    let runtime = setup().await;
-    let api_address = runtime.connectors_api_address().unwrap();
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/api/config.toml")),
+    seed = seeds::connector_stream
+)]
+async fn metrics_endpoint_returns_prometheus_format(harness: &TestHarness) {
+    let api_address = harness
+        .connectors_runtime()
+        .expect("connector runtime should be available")
+        .http_url();
     let client = Client::new();
 
     let response = client
@@ -112,10 +133,15 @@ async fn test_metrics_endpoint_returns_prometheus_format() {
     assert!(body.contains("iggy_connectors_sinks_running"));
 }
 
-#[tokio::test]
-async fn test_sources_endpoint_returns_list() {
-    let runtime = setup().await;
-    let api_address = runtime.connectors_api_address().unwrap();
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/api/config.toml")),
+    seed = seeds::connector_stream
+)]
+async fn sources_endpoint_returns_list(harness: &TestHarness) {
+    let api_address = harness
+        .connectors_runtime()
+        .expect("connector runtime should be available")
+        .http_url();
     let client = Client::new();
 
     let response = client
@@ -132,10 +158,15 @@ async fn test_sources_endpoint_returns_list() {
     assert_eq!(sources.as_array().unwrap().len(), 0);
 }
 
-#[tokio::test]
-async fn test_sinks_endpoint_returns_list() {
-    let runtime = setup().await;
-    let api_address = runtime.connectors_api_address().unwrap();
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/api/config.toml")),
+    seed = seeds::connector_stream
+)]
+async fn sinks_endpoint_returns_list(harness: &TestHarness) {
+    let api_address = harness
+        .connectors_runtime()
+        .expect("connector runtime should be available")
+        .http_url();
     let client = Client::new();
 
     let response = client
@@ -152,10 +183,15 @@ async fn test_sinks_endpoint_returns_list() {
     assert_eq!(sinks.as_array().unwrap().len(), 0);
 }
 
-#[tokio::test]
-async fn test_api_key_authentication_required() {
-    let runtime = setup().await;
-    let api_address = runtime.connectors_api_address().unwrap();
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/api/config.toml")),
+    seed = seeds::connector_stream
+)]
+async fn api_key_authentication_required(harness: &TestHarness) {
+    let api_address = harness
+        .connectors_runtime()
+        .expect("connector runtime should be available")
+        .http_url();
     let client = Client::new();
 
     let response = client
@@ -191,10 +227,15 @@ async fn test_api_key_authentication_required() {
     assert_eq!(response.status(), 401);
 }
 
-#[tokio::test]
-async fn test_api_key_authentication_rejected_with_invalid_key() {
-    let runtime = setup().await;
-    let api_address = runtime.connectors_api_address().unwrap();
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/api/config.toml")),
+    seed = seeds::connector_stream
+)]
+async fn api_key_authentication_rejected_with_invalid_key(harness: &TestHarness) {
+    let api_address = harness
+        .connectors_runtime()
+        .expect("connector runtime should be available")
+        .http_url();
     let client = Client::new();
 
     let response = client

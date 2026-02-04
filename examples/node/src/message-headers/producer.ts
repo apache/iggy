@@ -17,9 +17,15 @@
  * under the License.
  */
 
-import { Client, Partitioning } from 'apache-iggy';
-import { log, initSystem, cleanup, parseArgs, BATCHES_LIMIT, MESSAGES_PER_BATCH } from '../utils';
-
+import { Client, Partitioning } from "apache-iggy";
+import {
+  log,
+  initSystem,
+  cleanup,
+  parseArgs,
+  BATCHES_LIMIT,
+  MESSAGES_PER_BATCH,
+} from "../utils";
 
 interface SerializedMessage {
   get_message_type(): string;
@@ -44,9 +50,9 @@ interface OrderRejected {
 
 export type MessageTypes = OrderCreated | OrderConfirmed | OrderRejected;
 
-const ORDER_CREATED_TYPE = 'OrderCreated';
-const ORDER_CONFIRMED_TYPE = 'OrderConfirmed';
-const ORDER_REJECTED_TYPE = 'OrderRejected';
+const ORDER_CREATED_TYPE = "OrderCreated";
+const ORDER_CONFIRMED_TYPE = "OrderConfirmed";
+const ORDER_REJECTED_TYPE = "OrderRejected";
 
 class MessagesGenerator {
   private orderId = 0;
@@ -80,7 +86,7 @@ class MessagesGenerator {
       default: {
         const orderRejected: OrderRejected = {
           orderId: `order-${Math.floor(this.orderId / 3)}`,
-          reason: 'Insufficient balance',
+          reason: "Insufficient balance",
         };
         return {
           get_message_type: () => ORDER_REJECTED_TYPE,
@@ -91,20 +97,18 @@ class MessagesGenerator {
   }
 }
 
-
-
 async function produceMessages(
   client: Client,
-  stream: Awaited<ReturnType<typeof initSystem>>['stream'],
-  topic: Awaited<ReturnType<typeof initSystem>>['topic']
+  stream: Awaited<ReturnType<typeof initSystem>>["stream"],
+  topic: Awaited<ReturnType<typeof initSystem>>["topic"],
 ) {
   const interval = 500; // 500 milliseconds
   log(
-    'Messages will be sent to stream: %d, topic: %d, partition: %d with interval %d ms.',
+    "Messages will be sent to stream: %d, topic: %d, partition: %d with interval %d ms.",
     stream.id,
     topic.id,
     topic.partitions[0].id,
-    interval
+    interval,
   );
 
   const messageGenerator = new MessagesGenerator();
@@ -125,51 +129,54 @@ async function produceMessages(
 
       return {
         payload,
-        headers: {},
+        headers: [],
       };
     });
 
     try {
-      log('Sending messages count: %d', messages.length);
+      log("Sending messages count: %d", messages.length);
       await client.message.send({
         streamId: stream.id,
         topicId: topic.id,
         messages,
         partition: Partitioning.PartitionId(
-          topic.partitions[Math.floor(Math.random() * topic.partitions.length)].id
+          topic.partitions[Math.floor(Math.random() * topic.partitions.length)]
+            .id,
         ),
       });
       sentBatches++;
-      log('Sent %d message(s).', messages.length);
+      log("Sent %d message(s).", messages.length);
     } catch (error) {
-      log('Error sending messages: %o', error);
+      log("Error sending messages: %o", error);
       log(
-        'This might be due to server version compatibility. The stream and topic creation worked successfully.'
+        "This might be due to server version compatibility. The stream and topic creation worked successfully.",
       );
-      log('Please check the Iggy server version and ensure it supports the SendMessages command.');
+      log(
+        "Please check the Iggy server version and ensure it supports the SendMessages command.",
+      );
       sentBatches++;
     }
 
-    await new Promise(resolve => setTimeout(resolve, interval));
+    await new Promise((resolve) => setTimeout(resolve, interval));
   }
 
-  log('Sent %d batches of messages, exiting.', sentBatches);
+  log("Sent %d batches of messages, exiting.", sentBatches);
 }
 
 async function main() {
   const args = parseArgs();
 
-  log('Using connection string: %s', args.connectionString);
+  log("Using connection string: %s", args.connectionString);
 
   // Parse connection string (simplified parsing for this example)
-  const url = new URL(args.connectionString.replace('iggy+tcp://', 'http://'));
+  const url = new URL(args.connectionString.replace("iggy+tcp://", "http://"));
   const host = url.hostname;
   const port = parseInt(url.port) || 8090;
-  const username = url.username || 'iggy';
-  const password = url.password || 'iggy';
+  const username = url.username || "iggy";
+  const password = url.password || "iggy";
 
   const client = new Client({
-    transport: 'TCP',
+    transport: "TCP",
     options: {
       port,
       host,
@@ -188,10 +195,10 @@ async function main() {
   let topicId = 0;
 
   try {
-    log('Message headers producer has started, selected transport: TCP');
-    log('Connecting to Iggy server...');
+    log("Message headers producer has started, selected transport: TCP");
+    log("Connecting to Iggy server...");
     // Client connects automatically when first command is called
-    log('Connected successfully.');
+    log("Connected successfully.");
     // Login will be handled automatically by the client on first command
 
     const { stream, topic } = await initSystem(client);
@@ -199,19 +206,19 @@ async function main() {
     topicId = topic.id;
     await produceMessages(client, stream, topic);
   } catch (error) {
-    log('Error in main: %o', error);
+    log("Error in main: %o", error);
     process.exitCode = 1;
   } finally {
     if (streamId !== null && topicId !== null) {
       await cleanup(client, streamId, topicId);
     }
     await client.destroy();
-    log('Disconnected from server.');
+    log("Disconnected from server.");
   }
 }
 
-process.on('unhandledRejection', (reason, promise) => {
-  log('Unhandled Rejection at: %o, reason: %o', promise, reason);
+process.on("unhandledRejection", (reason, promise) => {
+  log("Unhandled Rejection at: %o, reason: %o", promise, reason);
   process.exitCode = 1;
 });
 

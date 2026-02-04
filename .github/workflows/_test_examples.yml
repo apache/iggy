@@ -48,7 +48,7 @@ jobs:
         uses: ./.github/actions/utils/setup-rust-with-cache
         with:
           cache-targets: false # Only cache registry and git deps, not target dir (sccache handles that)
-          save-cache: "false"  # Only builds server+examples, let Rust test job save comprehensive cache
+          save-cache: "false" # Only builds server+examples, let Rust test job save comprehensive cache
 
       - name: Setup Node with cache for examples
         if: inputs.component == 'examples-suite'
@@ -152,6 +152,15 @@ jobs:
         if: inputs.component == 'examples-suite' && inputs.task == 'examples-node'
         run: |
           echo "Running Node.js examples tests..."
+          # Build the local Node SDK first (examples use file: link to it)
+          cd foreign/node
+          npm ci
+          npm run build
+          cd ../..
+          # Install examples dependencies (will use the local SDK)
+          cd examples/node
+          npm ci
+          cd ../..
           ./scripts/run-node-examples-from-readme.sh
 
       - name: Run Java examples

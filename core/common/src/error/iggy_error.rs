@@ -407,6 +407,8 @@ pub enum IggyError {
     ProducerClosed = 4057,
     #[error("Invalid offset: {0}")]
     InvalidOffset(u64) = 4100,
+    #[error("Invalid reserved field value: {0}, expected: 0")]
+    InvalidReservedField(u64) = 4101,
     #[error("Consumer group with ID: {0} for topic with ID: {1} was not found.")]
     ConsumerGroupIdNotFound(Identifier, Identifier) = 5000,
     #[error("Invalid consumer group ID")]

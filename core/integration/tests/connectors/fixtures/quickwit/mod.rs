@@ -17,4 +17,6 @@
  * under the License.
  */
 
-mod endpoints;
+mod container;
+
+pub use container::{QuickwitFixture, QuickwitOps, QuickwitPreCreatedFixture};

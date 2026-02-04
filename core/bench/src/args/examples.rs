@@ -68,6 +68,7 @@ const EXAMPLES: &str = r#"EXAMPLES:
     --producers (-c): Number of producers
     --consumers (-c): Number of consumers
     --max-topic-size (-T): Max topic size (e.g., "1GiB")
+    --message-expiry (-e): Topic message expiry time (e.g., "1s", "5min", "1h")
 
     Examples with detailed configuration:
 

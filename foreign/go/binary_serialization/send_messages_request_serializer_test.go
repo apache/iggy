@@ -54,7 +54,7 @@ func TestSerialize_SendMessagesRequest(t *testing.T) {
 		0x04,                   // Partitioning Length
 		0x01, 0x00, 0x00, 0x00, // PartitionId (123)
 		0x01, 0x0, 0x0, 0x0, // MessageCount
-		0, 0, 0, 0, 112, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // Index (16*1) bytes
+		0, 0, 0, 0, 120, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // Index (16*1) bytes
 	}
 	expected = append(expected, message1.Header.ToBytes()...)
 	expected = append(expected, message1.Payload...)

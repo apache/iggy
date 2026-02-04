@@ -22,9 +22,9 @@ use crate::harness::config::ClientConfig;
 use crate::harness::context::TestContext;
 use crate::harness::error::TestBinaryError;
 use crate::harness::handle::{
-    ClientHandle, ConnectorsRuntimeHandle, McpClient, McpHandle, ServerHandle,
+    ClientHandle, ConnectorsRuntimeHandle, McpClient, McpHandle, ServerHandle, ServerLogs,
 };
-use crate::harness::traits::{IggyServerDependent, Restartable, TestBinary};
+use crate::harness::traits::{Restartable, TestBinary};
 use crate::http_client::HttpClientFactory;
 use crate::quic_client::QuicClientFactory;
 use crate::tcp_client::TcpClientFactory;
@@ -41,9 +41,7 @@ use std::sync::Arc;
 /// Collected logs from all binaries in the harness.
 #[derive(Debug)]
 pub struct TestLogs {
-    pub server: Option<(String, String)>,
-    pub mcp: Option<(String, String)>,
-    pub connectors_runtime: Option<(String, String)>,
+    pub servers: Vec<ServerLogs>,
 }
 
 #[derive(Default)]
@@ -58,8 +56,6 @@ pub(super) struct TlsSettings {
 pub struct TestHarness {
     pub(super) context: Arc<TestContext>,
     pub(super) servers: Vec<ServerHandle>,
-    pub(super) mcp: Option<McpHandle>,
-    pub(super) connectors_runtime: Option<ConnectorsRuntimeHandle>,
     pub(super) clients: Vec<ClientHandle>,
     pub(super) client_configs: Vec<ClientConfig>,
     pub(super) primary_transport: Option<TransportProtocol>,
@@ -69,12 +65,17 @@ pub struct TestHarness {
 
 impl std::fmt::Debug for TestHarness {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let has_mcp = self.servers.iter().any(|s| s.mcp().is_some());
+        let has_connectors = self
+            .servers
+            .iter()
+            .any(|s| s.connectors_runtime().is_some());
         f.debug_struct("TestHarness")
             .field("test_name", &self.context.test_name())
             .field("started", &self.started)
             .field("server_count", &self.servers.len())
-            .field("has_mcp", &self.mcp.is_some())
-            .field("has_connectors_runtime", &self.connectors_runtime.is_some())
+            .field("has_mcp", &has_mcp)
+            .field("has_connectors_runtime", &has_connectors)
             .field("client_count", &self.clients.len())
             .finish()
     }
@@ -138,24 +139,9 @@ impl TestHarness {
     }
 
     async fn start_dependents(&mut self) -> Result<(), TestBinaryError> {
-        let tcp_addr = self.servers.first().and_then(|s| s.tcp_addr());
-
-        if let Some(ref mut mcp) = self.mcp {
-            if let Some(addr) = tcp_addr {
-                mcp.set_iggy_address(addr);
-            }
-            mcp.start()?;
-            mcp.wait_ready().await?;
+        for server in &mut self.servers {
+            server.start_dependents().await?;
         }
-
-        if let Some(ref mut connectors_runtime) = self.connectors_runtime {
-            if let Some(addr) = tcp_addr {
-                connectors_runtime.set_iggy_address(addr);
-            }
-            connectors_runtime.start()?;
-            connectors_runtime.wait_ready().await?;
-        }
-
         Ok(())
     }
 
@@ -166,15 +152,8 @@ impl TestHarness {
         }
         self.clients.clear();
 
-        if let Some(ref mut connectors_runtime) = self.connectors_runtime {
-            connectors_runtime.stop()?;
-        }
-
-        if let Some(ref mut mcp) = self.mcp {
-            mcp.stop()?;
-        }
-
         for server in self.servers.iter_mut().rev() {
+            server.stop_dependents()?;
             server.stop()?;
         }
 
@@ -260,23 +239,39 @@ impl TestHarness {
         &mut self.clients
     }
 
-    /// Get the MCP handle if configured.
+    /// Get the MCP handle from the primary server if configured.
+    ///
+    /// # Panics
+    /// Panics if called on a cluster (multiple servers). Use `node(i).mcp()` instead.
     pub fn mcp(&self) -> Option<&McpHandle> {
-        self.mcp.as_ref()
+        assert!(
+            self.servers.len() <= 1,
+            "mcp() is only available for single-server setups. Use node(i).mcp() for clusters."
+        );
+        self.servers.first().and_then(|s| s.mcp())
     }
 
     /// Create an MCP client (convenience method).
+    ///
+    /// # Panics
+    /// Panics if called on a cluster (multiple servers). Use `node(i).mcp()` instead.
     pub async fn mcp_client(&self) -> Result<McpClient, TestBinaryError> {
-        self.mcp
-            .as_ref()
+        self.mcp()
             .ok_or(TestBinaryError::MissingMcp)?
             .create_client()
             .await
     }
 
-    /// Get the connectors runtime handle if configured.
+    /// Get the connectors runtime handle from the primary server if configured.
+    ///
+    /// # Panics
+    /// Panics if called on a cluster (multiple servers). Use `node(i).connectors_runtime()` instead.
     pub fn connectors_runtime(&self) -> Option<&ConnectorsRuntimeHandle> {
-        self.connectors_runtime.as_ref()
+        assert!(
+            self.servers.len() <= 1,
+            "connectors_runtime() is only available for single-server setups. Use node(i).connectors_runtime() for clusters."
+        );
+        self.servers.first().and_then(|s| s.connectors_runtime())
     }
 
     /// Get the test directory path.
@@ -287,9 +282,7 @@ impl TestHarness {
     /// Collect logs from all binaries.
     pub fn collect_logs(&self) -> TestLogs {
         TestLogs {
-            server: self.servers.first().map(|s| s.collect_logs()),
-            mcp: self.mcp.as_ref().map(|m| m.collect_logs()),
-            connectors_runtime: self.connectors_runtime.as_ref().map(|c| c.collect_logs()),
+            servers: self.servers.iter().map(|s| s.collect_all_logs()).collect(),
         }
     }
 

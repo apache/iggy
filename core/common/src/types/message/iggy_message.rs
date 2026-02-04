@@ -190,6 +190,7 @@ impl IggyMessage {
             origin_timestamp: IggyTimestamp::now().as_micros(),
             user_headers_length,
             payload_length: payload.len() as u32,
+            reserved: 0,
         };
 
         let user_headers = user_headers.map(|h| h.to_bytes());

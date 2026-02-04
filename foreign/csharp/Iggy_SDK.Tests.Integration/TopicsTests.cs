@@ -193,7 +193,7 @@ public class TopicsTests
         response.CompressionAlgorithm.ShouldBe(TopicRequest.CompressionAlgorithm);
         response.Partitions!.Count().ShouldBe(3);
         response.MessageExpiry.ShouldBe(TopicRequest.MessageExpiry);
-        response.Size.ShouldBe(630u);
+        response.Size.ShouldBe(702u);
         response.PartitionsCount.ShouldBe(3u);
         response.ReplicationFactor.ShouldBe(TopicRequest.ReplicationFactor);
         response.MaxTopicSize.ShouldBe(TopicRequest.MaxTopicSize);

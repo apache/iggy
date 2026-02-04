@@ -59,7 +59,8 @@ class ObjectMapperTest {
                                 "timestamp": 0,
                                 "origin_timestamp": 1000,
                                 "user_headers_length": 0,
-                                "payload_length": 4
+                                "payload_length": 4,
+                                "reserved": 0
                               },
                               "payload": "dGVzdA==",
                               "user_headers": []
@@ -94,7 +95,8 @@ class ObjectMapperTest {
                                 "timestamp": 0,
                                 "origin_timestamp": 1000,
                                 "user_headers_length": 62,
-                                "payload_length": 4
+                                "payload_length": 4,
+                                "reserved": 0
                               },
                               "payload": "dGVzdA==",
                               "user_headers": [
@@ -186,7 +188,8 @@ class ObjectMapperTest {
                                 "timestamp": 0,
                                 "origin_timestamp": 0,
                                 "user_headers_length": 0,
-                                "payload_length": 4
+                                "payload_length": 4,
+                                "reserved": 0
                               },
                               "payload": "%s",
                               "user_headers": []

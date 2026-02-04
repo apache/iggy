@@ -341,6 +341,7 @@ class BytesDeserializerTest {
             writeU64(buffer, BigInteger.valueOf(1000)); // origin timestamp
             buffer.writeIntLE(0); // user headers length
             buffer.writeIntLE(5); // payload length
+            writeU64(buffer, BigInteger.ZERO); // reserved
             buffer.writeBytes("hello".getBytes()); // payload
 
             // when
@@ -374,6 +375,7 @@ class BytesDeserializerTest {
 
             buffer.writeIntLE(headersBuffer.readableBytes()); // user headers length
             buffer.writeIntLE(3); // payload length
+            writeU64(buffer, BigInteger.ZERO); // reserved
             buffer.writeBytes("abc".getBytes()); // payload
             buffer.writeBytes(headersBuffer); // user headers
 
@@ -401,6 +403,7 @@ class BytesDeserializerTest {
             writeU64(buffer, BigInteger.valueOf(1000));
             buffer.writeIntLE(0);
             buffer.writeIntLE(2);
+            writeU64(buffer, BigInteger.ZERO); // reserved
             buffer.writeBytes("hi".getBytes());
 
             // when
