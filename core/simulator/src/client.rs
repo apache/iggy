@@ -93,7 +93,6 @@ impl SimClient {
         buffer.extend_from_slice(header_bytes);
         buffer.extend_from_slice(&payload);
 
-        
         Message::<RequestHeader>::from_bytes(Bytes::from(buffer))
             .expect("failed to build request message")
     }
