@@ -414,6 +414,12 @@ impl IggyShard {
                     (item.offset.load(Ordering::Relaxed), item.path.clone())
                 }
                 PollingConsumer::ConsumerGroup(consumer_group_id, _) => {
+                    tracing::trace!(
+                        "Auto-committing offset {} for consumer group {} on partition {:?}",
+                        offset,
+                        consumer_group_id.0,
+                        namespace
+                    );
                     let hdl = partition.consumer_group_offsets.pin();
                     let item = hdl.get_or_insert(
                         consumer_group_id,

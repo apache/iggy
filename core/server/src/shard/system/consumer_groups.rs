@@ -110,13 +110,8 @@ impl IggyShard {
             .map(|c| c.session.client_id)
             .collect();
 
-        self.writer().join_consumer_group_with_cleanup(
-            stream,
-            topic,
-            group,
-            client_id,
-            Some(valid_client_ids),
-        );
+        self.writer()
+            .join_consumer_group(stream, topic, group, client_id, Some(valid_client_ids));
 
         if let Some(cg) = self.metadata.get_consumer_group(stream, topic, group)
             && let Some((_, member)) = cg.members.iter().find(|(_, m)| m.client_id == client_id)

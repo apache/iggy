@@ -426,11 +426,11 @@ async fn state_persists_across_connector_restart(
     let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
     let consumer_id: Identifier = "state_test_consumer".try_into().unwrap();
 
+    let client = harness.root_client().await.unwrap();
     let received_before = {
         let mut received: Vec<DatabaseRecord> = Vec::new();
         for _ in 0..POLL_ATTEMPTS {
-            if let Ok(polled) = harness
-                .client()
+            if let Ok(polled) = client
                 .poll_messages(
                     &stream_id,
                     &topic_id,
@@ -486,8 +486,7 @@ async fn state_persists_across_connector_restart(
 
     let mut received_after: Vec<DatabaseRecord> = Vec::new();
     for _ in 0..POLL_ATTEMPTS {
-        if let Ok(polled) = harness
-            .client()
+        if let Ok(polled) = client
             .poll_messages(
                 &stream_id,
                 &topic_id,

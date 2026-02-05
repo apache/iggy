@@ -75,7 +75,7 @@ async fn iceberg_sink_consumes_json_messages(
     harness: &TestHarness,
     fixture: IcebergPreCreatedFixture,
 ) {
-    let client = harness.client();
+    let client = harness.root_client().await.unwrap();
     let api_address = harness
         .connectors_runtime()
         .expect("connector runtime should be available")
@@ -146,7 +146,7 @@ async fn iceberg_sink_handles_bulk_messages(
     harness: &TestHarness,
     fixture: IcebergPreCreatedFixture,
 ) {
-    let client = harness.client();
+    let client = harness.root_client().await.unwrap();
     let api_address = harness
         .connectors_runtime()
         .expect("connector runtime should be available")

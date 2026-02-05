@@ -35,7 +35,7 @@ async fn elasticsearch_sink_stores_json_messages(
     harness: &TestHarness,
     fixture: ElasticsearchSinkFixture,
 ) {
-    let client = harness.client();
+    let client = harness.root_client().await.unwrap();
 
     let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
     let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
@@ -93,7 +93,7 @@ async fn elasticsearch_sink_handles_bulk_messages(
     harness: &TestHarness,
     fixture: ElasticsearchSinkFixture,
 ) {
-    let client = harness.client();
+    let client = harness.root_client().await.unwrap();
     let bulk_count = 50;
 
     let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
@@ -147,7 +147,7 @@ async fn elasticsearch_sink_preserves_json_structure(
     harness: &TestHarness,
     fixture: ElasticsearchSinkFixture,
 ) {
-    let client = harness.client();
+    let client = harness.root_client().await.unwrap();
 
     let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
     let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();

@@ -36,7 +36,7 @@ const API_KEY: &str = "test-api-key";
     seed = seeds::connector_stream
 )]
 async fn stdout_sink_consumes_messages(harness: &TestHarness) {
-    let client = harness.client();
+    let client = harness.root_client().await.unwrap();
     let api_address = harness
         .connectors_runtime()
         .expect("connector runtime should be available")
@@ -94,7 +94,7 @@ async fn stdout_sink_consumes_messages(harness: &TestHarness) {
     seed = seeds::connector_stream
 )]
 async fn stdout_sink_reports_metrics(harness: &TestHarness) {
-    let client = harness.client();
+    let client = harness.root_client().await.unwrap();
     let api_address = harness
         .connectors_runtime()
         .expect("connector runtime should be available")
@@ -154,7 +154,7 @@ async fn stdout_sink_reports_metrics(harness: &TestHarness) {
     seed = seeds::connector_stream
 )]
 async fn stdout_sink_handles_bulk_messages(harness: &TestHarness) {
-    let client = harness.client();
+    let client = harness.root_client().await.unwrap();
     let api_address = harness
         .connectors_runtime()
         .expect("connector runtime should be available")

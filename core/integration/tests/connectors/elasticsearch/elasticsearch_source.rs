@@ -34,7 +34,7 @@ async fn elasticsearch_source_produces_messages_to_iggy(
     harness: &TestHarness,
     fixture: ElasticsearchSourcePreCreatedFixture,
 ) {
-    let client = harness.client();
+    let client = harness.root_client().await.unwrap();
 
     fixture
         .insert_documents(TEST_MESSAGE_COUNT)
@@ -111,7 +111,7 @@ async fn elasticsearch_source_handles_empty_index(
     harness: &TestHarness,
     fixture: ElasticsearchSourcePreCreatedFixture,
 ) {
-    let client = harness.client();
+    let client = harness.root_client().await.unwrap();
 
     let doc_count = fixture
         .get_document_count()
@@ -151,7 +151,7 @@ async fn elasticsearch_source_produces_bulk_messages(
     harness: &TestHarness,
     fixture: ElasticsearchSourcePreCreatedFixture,
 ) {
-    let client = harness.client();
+    let client = harness.root_client().await.unwrap();
     let bulk_count = 10;
 
     fixture
@@ -213,11 +213,11 @@ async fn state_persists_across_connector_restart(
     let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
     let consumer_id: Identifier = "state_test_consumer".try_into().unwrap();
 
+    let client = harness.root_client().await.unwrap();
     let received_before = {
         let mut received: Vec<serde_json::Value> = Vec::new();
         for _ in 0..POLL_ATTEMPTS {
-            if let Ok(polled) = harness
-                .client()
+            if let Ok(polled) = client
                 .poll_messages(
                     &stream_id,
                     &topic_id,
@@ -274,8 +274,7 @@ async fn state_persists_across_connector_restart(
 
     let mut received_after: Vec<serde_json::Value> = Vec::new();
     for _ in 0..POLL_ATTEMPTS {
-        if let Ok(polled) = harness
-            .client()
+        if let Ok(polled) = client
             .poll_messages(
                 &stream_id,
                 &topic_id,

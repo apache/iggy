@@ -16,9 +16,7 @@
  * under the License.
  */
 
-use crate::server::scenarios::{
-    CONSUMER_GROUP_NAME, PARTITION_ID, STREAM_NAME, TOPIC_NAME, create_client,
-};
+use crate::server::scenarios::{CONSUMER_GROUP_NAME, PARTITION_ID, STREAM_NAME, TOPIC_NAME};
 use futures::StreamExt;
 use iggy::prelude::*;
 use integration::harness::TestHarness;
@@ -68,7 +66,11 @@ async fn execute_scenario(harness: &TestHarness, client: &IggyClient) {
     produce_messages(client, 1, INITIAL_MESSAGES_COUNT).await;
 
     // 2. Create a separate client to simulate the runtime
-    let runtime_client = create_client(harness).await;
+    let runtime_client = harness.new_client().await.unwrap();
+    runtime_client
+        .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+        .await
+        .unwrap();
 
     // 3. Create consumer and consume all initial messages
     let mut consumer = create_consumer(&runtime_client).await;
@@ -106,7 +108,11 @@ async fn execute_scenario(harness: &TestHarness, client: &IggyClient) {
     .await;
 
     // 7. Create a new client (simulating runtime restart)
-    let new_runtime_client = create_client(harness).await;
+    let new_runtime_client = harness.new_client().await.unwrap();
+    new_runtime_client
+        .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+        .await
+        .unwrap();
 
     // 8. Reconnect consumer and consume new messages
     let mut consumer = create_consumer(&new_runtime_client).await;

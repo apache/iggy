@@ -263,16 +263,6 @@ impl MetadataWriter {
         topic_id: TopicId,
         group_id: ConsumerGroupId,
         client_id: u32,
-    ) -> Option<usize> {
-        self.join_consumer_group_with_cleanup(stream_id, topic_id, group_id, client_id, None)
-    }
-
-    pub fn join_consumer_group_with_cleanup(
-        &mut self,
-        stream_id: StreamId,
-        topic_id: TopicId,
-        group_id: ConsumerGroupId,
-        client_id: u32,
         valid_client_ids: Option<Vec<u32>>,
     ) -> Option<usize> {
         let member_id = Arc::new(AtomicUsize::new(usize::MAX));

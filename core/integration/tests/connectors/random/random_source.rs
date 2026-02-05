@@ -70,9 +70,9 @@ async fn state_persists_across_connector_restart(harness: &mut TestHarness) {
 
     sleep(Duration::from_secs(1)).await;
 
+    let client = harness.root_client().await.unwrap();
     let offset_before = {
-        let messages = harness
-            .client()
+        let messages = client
             .poll_messages(
                 &stream_id,
                 &topic_id,
@@ -102,8 +102,7 @@ async fn state_persists_across_connector_restart(harness: &mut TestHarness) {
         .expect("Failed to restart connectors");
     sleep(Duration::from_secs(1)).await;
 
-    let offset_after = harness
-        .client()
+    let offset_after = client
         .poll_messages(
             &stream_id,
             &topic_id,
