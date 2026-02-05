@@ -37,7 +37,7 @@ runs:
       working-directory: foreign/java
       run: |
         echo "::group::Linting foreign/java"
-        gradle check -x test
+        ./gradlew check -x test
         echo "::endgroup::"
 
     - name: Lint examples
@@ -46,7 +46,7 @@ runs:
       working-directory: examples/java
       run: |
         echo "::group::Linting examples/java"
-        gradle check -x test
+        ./gradlew check -x test
         echo "::endgroup::"
 
     - name: Lint BDD
@@ -55,7 +55,7 @@ runs:
       working-directory: bdd/java
       run: |
         echo "::group::Linting bdd/java"
-        gradle check -x test
+        ./gradlew check -x test
         echo "::endgroup::"
 
     - name: Build
@@ -63,7 +63,7 @@ runs:
       if: inputs.task == 'build'
       working-directory: foreign/java
       run: |
-        gradle build -x test -x checkstyleMain -x checkstyleTest -x spotlessCheck
+        ./gradlew build -x test -x checkstyleMain -x checkstyleTest -x spotlessCheck
         BUILD_EXIT_CODE=$?
 
         # List artifacts only if build succeeded
@@ -79,9 +79,6 @@ runs:
     - name: Setup Rust with cache
       if: inputs.task == 'test'
       uses: ./.github/actions/utils/setup-rust-with-cache
-      with:
-        cache-targets: false # Only cache registry and git deps, not target dir (sccache handles that)
-        save-cache: "false"  # Only builds server, let Rust test job save comprehensive cache
 
     - name: Start Iggy server
       if: inputs.task == 'test'
@@ -94,7 +91,7 @@ runs:
       working-directory: foreign/java
       env:
         USE_EXTERNAL_SERVER: true
-      run: gradle test
+      run: ./gradlew test
 
     - name: Copy test reports
       if: ${{ !cancelled() && inputs.task == 'test' }}

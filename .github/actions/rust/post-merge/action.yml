@@ -35,8 +35,6 @@ runs:
   steps:
     - name: Setup Rust with cache
       uses: ./.github/actions/utils/setup-rust-with-cache
-      with:
-        enabled: "false"  # Post-merge runs infrequently, no need to cache
 
     - name: Validate package
       run: |

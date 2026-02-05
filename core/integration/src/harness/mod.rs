@@ -45,7 +45,7 @@
 pub mod config;
 mod context;
 mod error;
-pub mod fixtures;
+mod fixture;
 pub mod handle;
 mod helpers;
 mod orchestrator;
@@ -60,7 +60,9 @@ pub use config::{
 
 pub use context::{TestContext, get_test_directory};
 pub use error::TestBinaryError;
-pub use handle::{ClientHandle, ConnectorsRuntimeHandle, McpClient, McpHandle, ServerHandle};
+pub use handle::{
+    ClientBuilder, ClientHandle, ConnectorsRuntimeHandle, McpClient, McpHandle, ServerHandle,
+};
 pub use orchestrator::{TestHarness, TestHarnessBuilder, TestLogs};
 pub use traits::{IggyServerDependent, Restartable, TestBinary};
 
@@ -68,4 +70,4 @@ pub use helpers::{
     USER_PASSWORD, assert_clean_system, create_user, delete_user, login_root, login_user,
 };
 
-pub use fixtures::TestFixture;
+pub use fixture::TestFixture;

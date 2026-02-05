@@ -21,7 +21,7 @@ use assert_cmd::assert::Assert;
 use async_trait::async_trait;
 use iggy::prelude::Client;
 use iggy_common::TransportProtocol;
-use integration::test_server::TestServer;
+use integration::harness::ServerHandle;
 use predicates::str::{contains, diff, starts_with};
 use serial_test::parallel;
 
@@ -108,19 +108,19 @@ impl IggyCmdTestCase for TestMeCmd {
 
     async fn verify_server_state(&self, _client: &dyn Client) {}
 
-    fn protocol(&self, server: &TestServer) -> Vec<String> {
+    fn protocol(&self, server: &ServerHandle) -> Vec<String> {
         match &self.protocol {
             TransportProtocol::Tcp => vec![
                 "--tcp-server-address".into(),
-                server.get_raw_tcp_addr().unwrap(),
+                server.raw_tcp_addr().unwrap(),
             ],
             TransportProtocol::Quic => vec![
                 "--quic-server-address".into(),
-                server.get_quic_udp_addr().unwrap(),
+                server.quic_addr().unwrap().to_string(),
             ],
             TransportProtocol::WebSocket => vec![
                 "--websocket-server-address".into(),
-                server.get_websocket_addr().unwrap(),
+                server.websocket_addr().unwrap().to_string(),
             ],
             TransportProtocol::Http => {
                 panic!("HTTP transport is not supported for the 'me' command")

@@ -29,10 +29,12 @@
 //! - Short message_saver interval to add more concurrent persist operations
 
 use iggy::prelude::*;
-use integration::test_server::{ClientFactory, login_root};
+use iggy_common::TransportProtocol;
+use integration::harness::TestHarness;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
+use sysinfo::{Pid, ProcessesToUpdate, System};
 use tokio::task::JoinSet;
 
 const STREAM_NAME: &str = "race-test-stream";
@@ -41,20 +43,32 @@ const PRODUCERS_PER_PROTOCOL: usize = 2;
 const PARTITION_ID: u32 = 0;
 const TEST_DURATION_SECS: u64 = 10;
 const MESSAGES_PER_BATCH: usize = 5;
+const MAX_ALLOWED_MEMORY_BYTES: u64 = 200 * 1024 * 1024;
 
 /// Runs the segment rotation race condition test with multiple protocols.
-/// Each client factory represents a different protocol (TCP, HTTP, QUIC, WebSocket).
+/// Uses all available transports from the harness (TCP, HTTP, QUIC, WebSocket).
 /// 2 producers are spawned per protocol, all writing to the same partition.
-pub async fn run(client_factories: &[&dyn ClientFactory]) {
-    assert!(
-        !client_factories.is_empty(),
-        "At least one client factory required"
-    );
+pub async fn run(harness: &TestHarness) {
+    let transports = [
+        TransportProtocol::Tcp,
+        TransportProtocol::Http,
+        TransportProtocol::Quic,
+        TransportProtocol::WebSocket,
+    ];
 
-    let admin_client = create_client(client_factories[0]).await;
-    login_root(&admin_client).await;
+    let total_producers = transports.len() * PRODUCERS_PER_PROTOCOL;
 
-    let total_producers = client_factories.len() * PRODUCERS_PER_PROTOCOL;
+    let admin_client = harness
+        .server()
+        .tcp_client()
+        .expect("TCP transport not available")
+        .with_root_login()
+        .connect()
+        .await
+        .expect("failed to create admin client");
+
+    let stats = admin_client.get_stats().await.unwrap();
+    let server_pid = stats.process_id;
     init_system(&admin_client, total_producers).await;
 
     let stop_flag = Arc::new(AtomicBool::new(false));
@@ -62,15 +76,13 @@ pub async fn run(client_factories: &[&dyn ClientFactory]) {
     let mut join_set = JoinSet::new();
 
     let mut global_producer_id = 0usize;
-    for factory in client_factories {
-        let protocol = factory.transport();
+    for transport in transports {
         for local_id in 0..PRODUCERS_PER_PROTOCOL {
-            let client = create_client(*factory).await;
-            login_root(&client).await;
+            let client = create_client_for_transport(harness, transport).await;
 
             let stop = stop_flag.clone();
             let counter = total_messages.clone();
-            let producer_name = format!("{:?}-{}", protocol, local_id);
+            let producer_name = format!("{:?}-{}", transport, local_id);
             let producer_id = global_producer_id;
 
             join_set.spawn(async move {
@@ -111,12 +123,37 @@ pub async fn run(client_factories: &[&dyn ClientFactory]) {
     let sent = total_messages.load(Ordering::SeqCst);
     println!("Test completed successfully. Total messages sent: {}", sent);
 
+    let final_memory = get_process_memory(server_pid);
+    println!(
+        "Final server memory: {:.2} MB",
+        final_memory as f64 / 1024.0 / 1024.0
+    );
+    assert!(
+        final_memory < MAX_ALLOWED_MEMORY_BYTES,
+        "Memory leak detected! Server using {:.2} MB, max allowed is {:.2} MB",
+        final_memory as f64 / 1024.0 / 1024.0,
+        MAX_ALLOWED_MEMORY_BYTES as f64 / 1024.0 / 1024.0
+    );
+
     cleanup(&admin_client).await;
 }
 
-async fn create_client(client_factory: &dyn ClientFactory) -> IggyClient {
-    let client = client_factory.create_client().await;
-    IggyClient::create(client, None, None)
+async fn create_client_for_transport(
+    harness: &TestHarness,
+    transport: TransportProtocol,
+) -> IggyClient {
+    let server = harness.server();
+    let builder = match transport {
+        TransportProtocol::Tcp => server.tcp_client().expect("TCP not available"),
+        TransportProtocol::Http => server.http_client().expect("HTTP not available"),
+        TransportProtocol::Quic => server.quic_client().expect("QUIC not available"),
+        TransportProtocol::WebSocket => server.websocket_client().expect("WebSocket not available"),
+    };
+    builder
+        .with_root_login()
+        .connect()
+        .await
+        .expect("failed to connect client")
 }
 
 async fn init_system(client: &IggyClient, total_producers: usize) {
@@ -193,4 +230,12 @@ async fn cleanup(client: &IggyClient) {
         .delete_stream(&Identifier::named(STREAM_NAME).unwrap())
         .await
         .unwrap();
+}
+
+fn get_process_memory(pid: u32) -> u64 {
+    let mut sys = System::new();
+    sys.refresh_processes(ProcessesToUpdate::Some(&[Pid::from_u32(pid)]), true);
+    sys.process(Pid::from_u32(pid))
+        .map(|p| p.memory())
+        .unwrap_or(0)
 }

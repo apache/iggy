@@ -46,12 +46,9 @@ jobs:
       - name: Setup Rust with cache for examples
         if: inputs.component == 'examples-suite'
         uses: ./.github/actions/utils/setup-rust-with-cache
-        with:
-          cache-targets: false # Only cache registry and git deps, not target dir (sccache handles that)
-          save-cache: "false"  # Only builds server+examples, let Rust test job save comprehensive cache
 
       - name: Setup Node with cache for examples
-        if: inputs.component == 'examples-suite'
+        if: inputs.component == 'examples-suite' && inputs.task == 'examples-node'
         uses: ./.github/actions/utils/setup-node-with-cache
         with:
           node-version: "23"
@@ -59,13 +56,13 @@ jobs:
           workspace: examples/node
 
       - name: Setup Python
-        if: inputs.component == 'examples-suite'
+        if: inputs.component == 'examples-suite' && inputs.task == 'examples-python'
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Cache pip
-        if: inputs.component == 'examples-suite'
+        if: inputs.component == 'examples-suite' && inputs.task == 'examples-python'
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
@@ -152,6 +149,15 @@ jobs:
         if: inputs.component == 'examples-suite' && inputs.task == 'examples-node'
         run: |
           echo "Running Node.js examples tests..."
+          # Build the local Node SDK first (examples use file: link to it)
+          cd foreign/node
+          npm ci
+          npm run build
+          cd ../..
+          # Install examples dependencies (will use the local SDK)
+          cd examples/node
+          npm ci
+          cd ../..
           ./scripts/run-node-examples-from-readme.sh
 
       - name: Run Java examples

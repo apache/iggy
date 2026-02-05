@@ -42,6 +42,7 @@ members = [
     "core/connectors/sources/postgres_source",
     "core/connectors/sources/random_source",
     "core/consensus",
+    "core/harness_derive",
     "core/integration",
     "core/journal",
     "core/message_bus",
@@ -154,6 +155,7 @@ getrandom = { version = "0.3", features = ["wasm_js"] }
 git2 = { version = "0.20.3", default-features = false, features = ["vendored-libgit2"] }
 gloo = "0.11"
 governor = "0.10.4"
+harness_derive = { path = "core/harness_derive" }
 hash32 = "1.0.0"
 hostname = "0.4.2"
 human-repr = "1.1.0"
@@ -161,10 +163,10 @@ humantime = "2.3.0"
 hwlocality = "1.0.0-alpha.11"
 iceberg = "0.8.0"
 iceberg-catalog-rest = "0.8.0"
-iggy = { path = "core/sdk", version = "0.8.2-edge.2" }
-iggy_binary_protocol = { path = "core/binary_protocol", version = "0.8.2-edge.2" }
-iggy_common = { path = "core/common", version = "0.8.2-edge.2" }
-iggy_connector_sdk = { path = "core/connectors/sdk", version = "0.1.2-edge.1" }
+iggy = { path = "core/sdk", version = "0.8.3-edge.1" }
+iggy_binary_protocol = { path = "core/binary_protocol", version = "0.8.3-edge.1" }
+iggy_common = { path = "core/common", version = "0.8.3-edge.1" }
+iggy_connector_sdk = { path = "core/connectors/sdk", version = "0.1.3-edge.1" }
 integration = { path = "core/integration" }
 journal = { path = "core/journal" }
 js-sys = "0.3"

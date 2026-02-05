@@ -17,13 +17,4 @@
  * under the License.
  */
 
-use crate::connectors::{ConnectorsRuntime, IggySetup, setup_runtime};
-
 mod random_source;
-
-async fn setup() -> ConnectorsRuntime {
-    let iggy_setup = IggySetup::default();
-    let mut runtime = setup_runtime();
-    runtime.init("random/config.toml", None, iggy_setup).await;
-    runtime
-}

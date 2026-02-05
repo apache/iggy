@@ -99,6 +99,7 @@ public final class BytesSerializer {
         buffer.writeBytes(toBytesAsU64(header.originTimestamp()));
         buffer.writeIntLE(header.userHeadersLength().intValue());
         buffer.writeIntLE(header.payloadLength().intValue());
+        buffer.writeBytes(toBytesAsU64(header.reserved()));
         return buffer;
     }
 

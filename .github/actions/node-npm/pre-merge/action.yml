@@ -37,9 +37,6 @@ runs:
     - name: Setup Rust with cache
       if: inputs.task == 'e2e'
       uses: ./.github/actions/utils/setup-rust-with-cache
-      with:
-        cache-targets: false # Only cache registry and git deps, not target dir (sccache handles that)
-        save-cache: "false"  # Only builds server, let Rust test job save comprehensive cache
 
     - name: Install netcat
       if: inputs.task == 'e2e'
@@ -57,6 +54,14 @@ runs:
       run: |
         cd foreign/node
         npm run lint
+
+        # Also lint examples/node if it exists
+        if [ -f "${GITHUB_WORKSPACE}/examples/node/package.json" ]; then
+          echo "Linting examples/node..."
+          cd "${GITHUB_WORKSPACE}/examples/node"
+          npm ci --ignore-scripts
+          npm run lint
+        fi
       shell: bash
 
     - name: Build

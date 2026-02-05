@@ -18,10 +18,7 @@
 
 use iggy::prelude::*;
 use integration::bench_utils::run_bench_and_wait_for_finish;
-use integration::{
-    tcp_client::TcpClientFactory,
-    test_server::{ClientFactory, IpAddrKind, SYSTEM_PATH_ENV_VAR, TestServer, login_root},
-};
+use integration::harness::{TestHarness, TestServerConfig};
 use serial_test::parallel;
 use std::{collections::HashMap, str::FromStr};
 use test_case::test_matrix;
@@ -38,6 +35,15 @@ fn cache_none() -> &'static str {
     "none"
 }
 
+fn build_server_config(cache_setting: &str) -> TestServerConfig {
+    let mut extra_envs = HashMap::new();
+    extra_envs.insert(
+        "IGGY_SYSTEM_SEGMENT_CACHE_INDEXES".to_string(),
+        cache_setting.to_string(),
+    );
+    TestServerConfig::builder().extra_envs(extra_envs).build()
+}
+
 // TODO(numminex) - Move the message generation method from benchmark run to a special method.
 #[test_matrix(
     [cache_all(), cache_open_segment(), cache_none()]
@@ -45,24 +51,16 @@ fn cache_none() -> &'static str {
 #[tokio::test]
 #[parallel]
 async fn should_fill_data_and_verify_after_restart(cache_setting: &'static str) {
-    // 1. Start server with cache configuration
-    let env_vars = HashMap::from([
-        (
-            SYSTEM_PATH_ENV_VAR.to_owned(),
-            TestServer::get_random_path(),
-        ),
-        (
-            "IGGY_SYSTEM_SEGMENT_CACHE_INDEXES".to_string(),
-            cache_setting.to_string(),
-        ),
-    ]);
+    let mut harness = TestHarness::builder()
+        .server(build_server_config(cache_setting))
+        .build()
+        .unwrap();
 
-    let mut test_server = TestServer::new(Some(env_vars.clone()), false, None, IpAddrKind::V4);
-    test_server.start();
-    let server_addr = test_server.get_raw_tcp_addr().unwrap();
-    let local_data_path = test_server.get_local_data_path().to_owned();
+    harness.start().await.unwrap();
 
-    // 2. Run send bench to fill 5 MB of data
+    let server_addr = harness.server().raw_tcp_addr().unwrap();
+
+    // Run send bench to fill 5 MB of data
     let amount_of_data_to_process = IggyByteSize::from_str("5 MB").unwrap();
     run_bench_and_wait_for_finish(
         &server_addr,
@@ -71,7 +69,7 @@ async fn should_fill_data_and_verify_after_restart(cache_setting: &'static str) 
         amount_of_data_to_process,
     );
 
-    // 3. Run poll bench to check if everything's OK
+    // Run poll bench to check if everything's OK
     run_bench_and_wait_for_finish(
         &server_addr,
         &TransportProtocol::Tcp,
@@ -79,16 +77,8 @@ async fn should_fill_data_and_verify_after_restart(cache_setting: &'static str) 
         amount_of_data_to_process,
     );
 
-    // 4. Connect and login to newly started server
-    let client = TcpClientFactory {
-        server_addr,
-        ..Default::default()
-    }
-    .create_client()
-    .await;
-
-    let client = IggyClient::create(client, None, None);
-    login_root(&client).await;
+    // Connect and login to server
+    let client = harness.tcp_root_client().await.unwrap();
 
     let topic_id = Identifier::numeric(0).unwrap();
     for i in 0..7 {
@@ -99,7 +89,7 @@ async fn should_fill_data_and_verify_after_restart(cache_setting: &'static str) 
             .unwrap();
     }
 
-    // 4b. Create consumer groups to test persistence
+    // Create consumer groups to test persistence
     let consumer_group_names = ["test-cg-1", "test-cg-2", "test-cg-3"];
     for (idx, cg_name) in consumer_group_names.iter().enumerate() {
         let stream_id = Identifier::numeric(idx as u32).unwrap();
@@ -109,7 +99,7 @@ async fn should_fill_data_and_verify_after_restart(cache_setting: &'static str) 
             .unwrap();
     }
 
-    // 5. Save stats from the first server
+    // Save stats from the first server
     let stats = client.get_stats().await.unwrap();
     let expected_messages_size_bytes = stats.messages_size_bytes;
     let expected_streams_count = stats.streams_count;
@@ -120,27 +110,12 @@ async fn should_fill_data_and_verify_after_restart(cache_setting: &'static str) 
     let expected_clients_count = stats.clients_count;
     let expected_consumer_groups_count = stats.consumer_groups_count;
 
-    // 6. Stop server
-    test_server.stop();
-    drop(test_server);
+    // Restart server
+    harness.restart_server().await.unwrap();
+    let server_addr = harness.server().raw_tcp_addr().unwrap();
 
-    // 7. Restart server with same settings
-    let mut test_server = TestServer::new(Some(env_vars.clone()), false, None, IpAddrKind::V4);
-    test_server.start();
-    let server_addr = test_server.get_raw_tcp_addr().unwrap();
-
-    // 8. Verify stats are preserved after restart (before adding more data)
-    let client_after_restart = IggyClient::create(
-        TcpClientFactory {
-            server_addr: server_addr.clone(),
-            ..Default::default()
-        }
-        .create_client()
-        .await,
-        None,
-        None,
-    );
-    login_root(&client_after_restart).await;
+    // Verify stats are preserved after restart (before adding more data)
+    let client_after_restart = harness.tcp_root_client().await.unwrap();
 
     let stats_after_restart = client_after_restart.get_stats().await.unwrap();
     assert_eq!(
@@ -176,7 +151,7 @@ async fn should_fill_data_and_verify_after_restart(cache_setting: &'static str) 
         "Consumer groups count should be preserved after restart"
     );
 
-    // 8b. Verify consumer groups exist after restart
+    // Verify consumer groups exist after restart
     for (idx, cg_name) in consumer_group_names.iter().enumerate() {
         let stream_id = Identifier::numeric(idx as u32).unwrap();
         let consumer_group = client_after_restart
@@ -199,7 +174,7 @@ async fn should_fill_data_and_verify_after_restart(cache_setting: &'static str) 
         );
     }
 
-    // 9. Run send bench again to add more data
+    // Run send bench again to add more data
     run_bench_and_wait_for_finish(
         &server_addr,
         &TransportProtocol::Tcp,
@@ -207,7 +182,7 @@ async fn should_fill_data_and_verify_after_restart(cache_setting: &'static str) 
         amount_of_data_to_process,
     );
 
-    // 10. Run poll bench again to check if all data is still there
+    // Run poll bench again to check if all data is still there
     run_bench_and_wait_for_finish(
         &server_addr,
         &TransportProtocol::Tcp,
@@ -216,20 +191,10 @@ async fn should_fill_data_and_verify_after_restart(cache_setting: &'static str) 
     );
     drop(client_after_restart);
 
-    // 11. Connect and login to newly started server
-    let client = IggyClient::create(
-        TcpClientFactory {
-            server_addr: server_addr.clone(),
-            ..Default::default()
-        }
-        .create_client()
-        .await,
-        None,
-        None,
-    );
-    login_root(&client).await;
+    // Connect and login to server
+    let client = harness.tcp_root_client().await.unwrap();
 
-    // 12. Flush unsaved buffer
+    // Flush unsaved buffer
     let topic_id = Identifier::numeric(0).unwrap();
     for i in 0..7 {
         let stream_id = Identifier::numeric(i).unwrap();
@@ -239,7 +204,7 @@ async fn should_fill_data_and_verify_after_restart(cache_setting: &'static str) 
             .unwrap();
     }
 
-    // 13. Save stats from the second server (should have double the data)
+    // Save stats from the second server (should have double the data)
     let stats = client.get_stats().await.unwrap();
     let actual_messages_size_bytes = stats.messages_size_bytes;
     let actual_streams_count = stats.streams_count;
@@ -250,7 +215,7 @@ async fn should_fill_data_and_verify_after_restart(cache_setting: &'static str) 
     let actual_clients_count = stats.clients_count;
     let actual_consumer_groups_count = stats.consumer_groups_count;
 
-    // 14. Compare stats (expecting double the messages/size after second bench run)
+    // Compare stats (expecting double the messages/size after second bench run)
     assert_eq!(
         expected_messages_size_bytes.as_bytes_usize() * 2,
         actual_messages_size_bytes.as_bytes_usize(),
@@ -283,7 +248,7 @@ async fn should_fill_data_and_verify_after_restart(cache_setting: &'static str) 
         "Consumer groups count"
     );
 
-    // 14b. Verify consumer groups still exist after second benchmark run
+    // Verify consumer groups still exist after second benchmark run
     for (idx, cg_name) in consumer_group_names.iter().enumerate() {
         let stream_id = Identifier::numeric(idx as u32).unwrap();
         let consumer_group = client
@@ -306,16 +271,13 @@ async fn should_fill_data_and_verify_after_restart(cache_setting: &'static str) 
         );
     }
 
-    // 15. Run poll bench to check if all data (10MB total) is still there
+    // Run poll bench to check if all data (10MB total) is still there
     run_bench_and_wait_for_finish(
         &server_addr,
         &TransportProtocol::Tcp,
         "pinned-consumer",
         IggyByteSize::from(amount_of_data_to_process.as_bytes_u64() * 2),
     );
-
-    // 16. Manual cleanup
-    std::fs::remove_dir_all(local_data_path).unwrap();
 }
 
 /// Test that verifies server correctly handles ID gaps after deletions at all levels:
@@ -333,27 +295,14 @@ async fn should_fill_data_and_verify_after_restart(cache_setting: &'static str) 
 #[tokio::test]
 #[parallel]
 async fn should_handle_resource_deletion_and_restart() {
-    let env_vars = HashMap::from([(
-        SYSTEM_PATH_ENV_VAR.to_owned(),
-        TestServer::get_random_path(),
-    )]);
+    let mut harness = TestHarness::builder()
+        .server(TestServerConfig::default())
+        .build()
+        .unwrap();
 
-    let mut test_server = TestServer::new(Some(env_vars.clone()), false, None, IpAddrKind::V4);
-    test_server.start();
-    let server_addr = test_server.get_raw_tcp_addr().unwrap();
-    let local_data_path = test_server.get_local_data_path().to_owned();
+    harness.start().await.unwrap();
 
-    let client = IggyClient::create(
-        TcpClientFactory {
-            server_addr: server_addr.clone(),
-            ..Default::default()
-        }
-        .create_client()
-        .await,
-        None,
-        None,
-    );
-    login_root(&client).await;
+    let client = harness.tcp_root_client().await.unwrap();
 
     // Create 3 streams
     let stream_0 = client.create_stream("stream-0").await.unwrap();
@@ -479,25 +428,11 @@ async fn should_handle_resource_deletion_and_restart() {
     );
 
     drop(client);
-    test_server.stop();
-    drop(test_server);
 
     // Restart server
-    let mut test_server = TestServer::new(Some(env_vars.clone()), false, None, IpAddrKind::V4);
-    test_server.start();
-    let server_addr = test_server.get_raw_tcp_addr().unwrap();
+    harness.restart_server().await.unwrap();
 
-    let client = IggyClient::create(
-        TcpClientFactory {
-            server_addr,
-            ..Default::default()
-        }
-        .create_client()
-        .await,
-        None,
-        None,
-    );
-    login_root(&client).await;
+    let client = harness.tcp_root_client().await.unwrap();
 
     // Verify streams after restart - should have 3 streams: 0, 1 (reused), 2
     let streams = client.get_streams().await.unwrap();
@@ -611,8 +546,4 @@ async fn should_handle_resource_deletion_and_restart() {
             cg_ids
         );
     }
-
-    drop(client);
-    test_server.stop();
-    std::fs::remove_dir_all(local_data_path).unwrap();
 }

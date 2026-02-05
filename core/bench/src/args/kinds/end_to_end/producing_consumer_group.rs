@@ -27,7 +27,7 @@ use crate::args::{
     transport::BenchmarkTransportCommand,
 };
 use clap::{CommandFactory, Parser, error::ErrorKind};
-use iggy::prelude::IggyByteSize;
+use iggy::prelude::{IggyByteSize, IggyExpiry};
 use std::num::NonZeroU32;
 
 #[derive(Parser, Debug, Clone)]
@@ -58,6 +58,10 @@ pub struct EndToEndProducingConsumerGroupArgs {
     /// Max topic size in human readable format, e.g. "1GiB", "2MB", "1GiB". If not provided then topic size will be unlimited.
     #[arg(long, short = 'T')]
     pub max_topic_size: Option<IggyByteSize>,
+
+    /// Topic message expiry time in human readable format, e.g. "1s", "5min", "1h". If not provided, messages never expire.
+    #[arg(long, short = 'e')]
+    pub message_expiry: Option<IggyExpiry>,
 }
 
 impl BenchmarkKindProps for EndToEndProducingConsumerGroupArgs {
@@ -87,6 +91,10 @@ impl BenchmarkKindProps for EndToEndProducingConsumerGroupArgs {
 
     fn max_topic_size(&self) -> Option<IggyByteSize> {
         self.max_topic_size
+    }
+
+    fn message_expiry(&self) -> IggyExpiry {
+        self.message_expiry.unwrap_or(IggyExpiry::NeverExpire)
     }
 
     fn validate(&self) {

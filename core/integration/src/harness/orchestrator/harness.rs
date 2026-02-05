@@ -22,18 +22,11 @@ use crate::harness::config::ClientConfig;
 use crate::harness::context::TestContext;
 use crate::harness::error::TestBinaryError;
 use crate::harness::handle::{
-    ClientHandle, ConnectorsRuntimeHandle, McpClient, McpHandle, ServerHandle,
+    ClientHandle, ConnectorsRuntimeHandle, McpClient, McpHandle, ServerHandle, ServerLogs,
 };
-use crate::harness::traits::{IggyServerDependent, Restartable, TestBinary};
-use crate::http_client::HttpClientFactory;
-use crate::quic_client::QuicClientFactory;
-use crate::tcp_client::TcpClientFactory;
-use crate::test_server::ClientFactory;
-use crate::websocket_client::WebSocketClientFactory;
+use crate::harness::traits::{Restartable, TestBinary};
 use futures::executor::block_on;
-use iggy::prelude::{
-    ClientWrapper, DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME, IggyClient, UserClient,
-};
+use iggy::prelude::{ClientWrapper, IggyClient};
 use iggy_common::TransportProtocol;
 use std::path::Path;
 use std::sync::Arc;
@@ -41,25 +34,13 @@ use std::sync::Arc;
 /// Collected logs from all binaries in the harness.
 #[derive(Debug)]
 pub struct TestLogs {
-    pub server: Option<(String, String)>,
-    pub mcp: Option<(String, String)>,
-    pub connectors_runtime: Option<(String, String)>,
-}
-
-#[derive(Default)]
-pub(super) struct TlsSettings {
-    pub enabled: bool,
-    pub domain: String,
-    pub ca_file: Option<String>,
-    pub validate_certificate: bool,
+    pub servers: Vec<ServerLogs>,
 }
 
 /// Orchestrates test binaries and clients for integration tests.
 pub struct TestHarness {
     pub(super) context: Arc<TestContext>,
-    pub(super) server: Option<ServerHandle>,
-    pub(super) mcp: Option<McpHandle>,
-    pub(super) connectors_runtime: Option<ConnectorsRuntimeHandle>,
+    pub(super) servers: Vec<ServerHandle>,
     pub(super) clients: Vec<ClientHandle>,
     pub(super) client_configs: Vec<ClientConfig>,
     pub(super) primary_transport: Option<TransportProtocol>,
@@ -69,12 +50,17 @@ pub struct TestHarness {
 
 impl std::fmt::Debug for TestHarness {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let has_mcp = self.servers.iter().any(|s| s.mcp().is_some());
+        let has_connectors = self
+            .servers
+            .iter()
+            .any(|s| s.connectors_runtime().is_some());
         f.debug_struct("TestHarness")
             .field("test_name", &self.context.test_name())
             .field("started", &self.started)
-            .field("has_server", &self.server.is_some())
-            .field("has_mcp", &self.mcp.is_some())
-            .field("has_connectors_runtime", &self.connectors_runtime.is_some())
+            .field("server_count", &self.servers.len())
+            .field("has_mcp", &has_mcp)
+            .field("has_connectors_runtime", &has_connectors)
             .field("client_count", &self.clients.len())
             .finish()
     }
@@ -119,7 +105,7 @@ impl TestHarness {
             return Err(TestBinaryError::AlreadyStarted);
         }
 
-        if let Some(ref mut server) = self.server {
+        for server in &mut self.servers {
             server.start()?;
         }
 
@@ -138,24 +124,9 @@ impl TestHarness {
     }
 
     async fn start_dependents(&mut self) -> Result<(), TestBinaryError> {
-        let tcp_addr = self.server.as_ref().and_then(|s| s.tcp_addr());
-
-        if let Some(ref mut mcp) = self.mcp {
-            if let Some(addr) = tcp_addr {
-                mcp.set_iggy_address(addr);
-            }
-            mcp.start()?;
-            mcp.wait_ready().await?;
+        for server in &mut self.servers {
+            server.start_dependents().await?;
         }
-
-        if let Some(ref mut connectors_runtime) = self.connectors_runtime {
-            if let Some(addr) = tcp_addr {
-                connectors_runtime.set_iggy_address(addr);
-            }
-            connectors_runtime.start()?;
-            connectors_runtime.wait_ready().await?;
-        }
-
         Ok(())
     }
 
@@ -166,15 +137,8 @@ impl TestHarness {
         }
         self.clients.clear();
 
-        if let Some(ref mut connectors_runtime) = self.connectors_runtime {
-            connectors_runtime.stop()?;
-        }
-
-        if let Some(ref mut mcp) = self.mcp {
-            mcp.stop()?;
-        }
-
-        if let Some(ref mut server) = self.server {
+        for server in self.servers.iter_mut().rev() {
+            server.stop_dependents()?;
             server.stop()?;
         }
 
@@ -182,17 +146,17 @@ impl TestHarness {
         Ok(())
     }
 
-    /// Restart the server and reconnect all clients.
+    /// Restart the primary server and reconnect all clients.
     pub async fn restart_server(&mut self) -> Result<(), TestBinaryError> {
-        let Some(ref mut server) = self.server else {
+        if self.servers.is_empty() {
             return Err(TestBinaryError::MissingServer);
-        };
+        }
 
         for client in &mut self.clients {
             client.disconnect().await;
         }
 
-        server.restart()?;
+        self.servers[0].restart()?;
 
         self.update_client_addresses();
         for client in &mut self.clients {
@@ -202,14 +166,43 @@ impl TestHarness {
         Ok(())
     }
 
-    /// Get reference to the server handle.
+    /// Get reference to the first (primary) server handle.
     pub fn server(&self) -> &ServerHandle {
-        self.server.as_ref().expect("Server not configured")
+        self.servers.first().expect("No servers configured")
     }
 
-    /// Get mutable reference to the server handle.
+    /// Get mutable reference to the first (primary) server handle.
     pub fn server_mut(&mut self) -> &mut ServerHandle {
-        self.server.as_mut().expect("Server not configured")
+        self.servers.first_mut().expect("No servers configured")
+    }
+
+    /// Get reference to a specific server node by index (for clusters).
+    pub fn node(&self, index: usize) -> &ServerHandle {
+        self.servers.get(index).unwrap_or_else(|| {
+            panic!(
+                "Node {} not configured (cluster has {} nodes)",
+                index,
+                self.servers.len()
+            )
+        })
+    }
+
+    /// Get mutable reference to a specific server node by index (for clusters).
+    pub fn node_mut(&mut self, index: usize) -> &mut ServerHandle {
+        let len = self.servers.len();
+        self.servers
+            .get_mut(index)
+            .unwrap_or_else(|| panic!("Node {} not configured (cluster has {} nodes)", index, len))
+    }
+
+    /// Get reference to all servers.
+    pub fn all_servers(&self) -> &[ServerHandle] {
+        &self.servers
+    }
+
+    /// Get the number of server nodes (1 for single server, N for cluster).
+    pub fn cluster_size(&self) -> usize {
+        self.servers.len()
     }
 
     /// Get the first client (panics if no clients configured).
@@ -231,23 +224,39 @@ impl TestHarness {
         &mut self.clients
     }
 
-    /// Get the MCP handle if configured.
+    /// Get the MCP handle from the primary server if configured.
+    ///
+    /// # Panics
+    /// Panics if called on a cluster (multiple servers). Use `node(i).mcp()` instead.
     pub fn mcp(&self) -> Option<&McpHandle> {
-        self.mcp.as_ref()
+        assert!(
+            self.servers.len() <= 1,
+            "mcp() is only available for single-server setups. Use node(i).mcp() for clusters."
+        );
+        self.servers.first().and_then(|s| s.mcp())
     }
 
     /// Create an MCP client (convenience method).
+    ///
+    /// # Panics
+    /// Panics if called on a cluster (multiple servers). Use `node(i).mcp()` instead.
     pub async fn mcp_client(&self) -> Result<McpClient, TestBinaryError> {
-        self.mcp
-            .as_ref()
+        self.mcp()
             .ok_or(TestBinaryError::MissingMcp)?
             .create_client()
             .await
     }
 
-    /// Get the connectors runtime handle if configured.
+    /// Get the connectors runtime handle from the primary server if configured.
+    ///
+    /// # Panics
+    /// Panics if called on a cluster (multiple servers). Use `node(i).connectors_runtime()` instead.
     pub fn connectors_runtime(&self) -> Option<&ConnectorsRuntimeHandle> {
-        self.connectors_runtime.as_ref()
+        assert!(
+            self.servers.len() <= 1,
+            "connectors_runtime() is only available for single-server setups. Use node(i).connectors_runtime() for clusters."
+        );
+        self.servers.first().and_then(|s| s.connectors_runtime())
     }
 
     /// Get the test directory path.
@@ -258,156 +267,8 @@ impl TestHarness {
     /// Collect logs from all binaries.
     pub fn collect_logs(&self) -> TestLogs {
         TestLogs {
-            server: self.server.as_ref().map(|s| s.collect_logs()),
-            mcp: self.mcp.as_ref().map(|m| m.collect_logs()),
-            connectors_runtime: self.connectors_runtime.as_ref().map(|c| c.collect_logs()),
+            servers: self.servers.iter().map(|s| s.collect_all_logs()).collect(),
         }
-    }
-
-    /// Get a TCP client factory for creating additional clients.
-    pub fn tcp_client_factory(&self) -> Option<TcpClientFactory> {
-        let server = self.server.as_ref()?;
-        let addr = server.tcp_addr()?;
-        let config = self.find_client_config(TransportProtocol::Tcp);
-        let tls = self.extract_tls_settings(config, server);
-
-        Some(TcpClientFactory {
-            server_addr: addr.to_string(),
-            nodelay: config.map(|c| c.tcp_nodelay).unwrap_or_default(),
-            tls_enabled: tls.enabled,
-            tls_domain: tls.domain,
-            tls_ca_file: tls.ca_file,
-            tls_validate_certificate: tls.validate_certificate,
-        })
-    }
-
-    /// Get an HTTP client factory for creating additional clients.
-    pub fn http_client_factory(&self) -> Option<HttpClientFactory> {
-        self.server
-            .as_ref()
-            .and_then(|s| s.http_addr())
-            .map(|addr| HttpClientFactory {
-                server_addr: addr.to_string(),
-            })
-    }
-
-    /// Get a QUIC client factory for creating additional clients.
-    pub fn quic_client_factory(&self) -> Option<QuicClientFactory> {
-        self.server
-            .as_ref()
-            .and_then(|s| s.quic_addr())
-            .map(|addr| QuicClientFactory {
-                server_addr: addr.to_string(),
-            })
-    }
-
-    /// Get a WebSocket client factory for creating additional clients.
-    pub fn websocket_client_factory(&self) -> Option<WebSocketClientFactory> {
-        let server = self.server.as_ref()?;
-        let addr = server.websocket_addr()?;
-        let config = self.find_client_config(TransportProtocol::WebSocket);
-        let tls = self.extract_tls_settings(config, server);
-
-        Some(WebSocketClientFactory {
-            server_addr: addr.to_string(),
-            tls_enabled: tls.enabled,
-            tls_domain: tls.domain,
-            tls_ca_file: tls.ca_file,
-            tls_validate_certificate: tls.validate_certificate,
-        })
-    }
-
-    fn find_client_config(&self, transport: TransportProtocol) -> Option<&ClientConfig> {
-        self.client_configs
-            .iter()
-            .find(|c| c.transport == transport)
-            .or(self
-                .primary_client_config
-                .as_ref()
-                .filter(|c| c.transport == transport))
-    }
-
-    fn extract_tls_settings(
-        &self,
-        config: Option<&ClientConfig>,
-        server: &ServerHandle,
-    ) -> TlsSettings {
-        let (enabled, domain, validate) = config
-            .map(|c| {
-                (
-                    c.tls_enabled,
-                    c.tls_domain
-                        .clone()
-                        .unwrap_or_else(|| "localhost".to_string()),
-                    c.tls_validate_certificate,
-                )
-            })
-            .unwrap_or_default();
-
-        let ca_file = if enabled {
-            server
-                .tls_ca_cert_path()
-                .map(|p| p.to_string_lossy().to_string())
-        } else {
-            None
-        };
-
-        TlsSettings {
-            enabled,
-            domain,
-            ca_file,
-            validate_certificate: validate,
-        }
-    }
-
-    /// Get all available client factories.
-    #[allow(clippy::vec_box)]
-    pub fn all_client_factories(&self) -> Vec<Box<dyn ClientFactory>> {
-        let mut factories: Vec<Box<dyn ClientFactory>> = Vec::new();
-        if let Some(f) = self.tcp_client_factory() {
-            factories.push(Box::new(f));
-        }
-        if let Some(f) = self.http_client_factory() {
-            factories.push(Box::new(f));
-        }
-        if let Some(f) = self.quic_client_factory() {
-            factories.push(Box::new(f));
-        }
-        if let Some(f) = self.websocket_client_factory() {
-            factories.push(Box::new(f));
-        }
-        factories
-    }
-
-    fn client_factory_for(
-        &self,
-        transport: TransportProtocol,
-    ) -> Result<Box<dyn ClientFactory>, TestBinaryError> {
-        let factory: Box<dyn ClientFactory> = match transport {
-            TransportProtocol::Tcp => Box::new(self.tcp_client_factory().ok_or_else(|| {
-                TestBinaryError::InvalidState {
-                    message: "TCP transport not available".to_string(),
-                }
-            })?),
-            TransportProtocol::Http => Box::new(self.http_client_factory().ok_or_else(|| {
-                TestBinaryError::InvalidState {
-                    message: "HTTP transport not available".to_string(),
-                }
-            })?),
-            TransportProtocol::Quic => Box::new(self.quic_client_factory().ok_or_else(|| {
-                TestBinaryError::InvalidState {
-                    message: "QUIC transport not available".to_string(),
-                }
-            })?),
-            TransportProtocol::WebSocket => {
-                Box::new(self.websocket_client_factory().ok_or_else(|| {
-                    TestBinaryError::InvalidState {
-                        message: "WebSocket transport not available".to_string(),
-                    }
-                })?)
-            }
-        };
-        Ok(factory)
     }
 
     /// Create a new client logged in as root for the specified transport.
@@ -415,8 +276,14 @@ impl TestHarness {
         &self,
         transport: TransportProtocol,
     ) -> Result<IggyClient, TestBinaryError> {
-        let factory = self.client_factory_for(transport)?;
-        self.create_root_client(&*factory).await
+        let server = self.servers.first().ok_or(TestBinaryError::MissingServer)?;
+        let builder = match transport {
+            TransportProtocol::Tcp => server.tcp_client()?,
+            TransportProtocol::Http => server.http_client()?,
+            TransportProtocol::Quic => server.quic_client()?,
+            TransportProtocol::WebSocket => server.websocket_client()?,
+        };
+        builder.with_root_login().connect().await
     }
 
     /// Create multiple root clients for the specified transport.
@@ -437,9 +304,14 @@ impl TestHarness {
         &self,
         transport: TransportProtocol,
     ) -> Result<IggyClient, TestBinaryError> {
-        let factory = self.client_factory_for(transport)?;
-        let client = factory.create_client().await;
-        Ok(IggyClient::create(client, None, None))
+        let server = self.servers.first().ok_or(TestBinaryError::MissingServer)?;
+        let builder = match transport {
+            TransportProtocol::Tcp => server.tcp_client()?,
+            TransportProtocol::Http => server.http_client()?,
+            TransportProtocol::Quic => server.quic_client()?,
+            TransportProtocol::WebSocket => server.websocket_client()?,
+        };
+        builder.connect().await
     }
 
     pub async fn tcp_root_client(&self) -> Result<IggyClient, TestBinaryError> {
@@ -538,23 +410,8 @@ impl TestHarness {
             .await
     }
 
-    async fn create_root_client(
-        &self,
-        factory: &dyn ClientFactory,
-    ) -> Result<IggyClient, TestBinaryError> {
-        let client = factory.create_client().await;
-        let iggy_client = IggyClient::create(client, None, None);
-        iggy_client
-            .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
-            .await
-            .map_err(|e| TestBinaryError::InvalidState {
-                message: format!("Failed to login as root: {e}"),
-            })?;
-        Ok(iggy_client)
-    }
-
     pub(super) async fn create_clients(&mut self) -> Result<(), TestBinaryError> {
-        let Some(ref server) = self.server else {
+        let Some(server) = self.servers.first() else {
             return Ok(());
         };
 
@@ -588,7 +445,7 @@ impl TestHarness {
     }
 
     fn update_client_addresses(&mut self) {
-        let Some(ref server) = self.server else {
+        let Some(server) = self.servers.first() else {
             return;
         };
 

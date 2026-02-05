@@ -101,9 +101,6 @@ jobs:
 
       - name: Setup Rust with cache
         uses: ./.github/actions/utils/setup-rust-with-cache
-        with:
-          cache-targets: false
-          profile: release
 
       - name: Add Rust target
         run: rustup target add ${{ matrix.target }}
@@ -139,6 +136,12 @@ jobs:
           # references when linking dbus-sys (required by keyring crate)
           if [[ "${{ matrix.target }}" == "aarch64-unknown-linux-musl" ]]; then
             export CFLAGS="-mno-outline-atomics"
+          fi
+
+          # musl builds: use musl-gcc as linker to ensure proper linking against musl libc
+          if [[ "${{ matrix.libc }}" == "musl" ]]; then
+            export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc
+            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc
           fi
 
           cargo build --locked --release --target ${{ matrix.target }} "${bin_flags[@]}"
@@ -204,9 +207,6 @@ jobs:
 
       - name: Setup Rust with cache
         uses: ./.github/actions/utils/setup-rust-with-cache
-        with:
-          cache-targets: false
-          profile: release
 
       - name: Add Rust target
         run: rustup target add ${{ matrix.target }}

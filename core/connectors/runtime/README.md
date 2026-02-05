@@ -205,3 +205,54 @@ The runtime exposes Prometheus-compatible metrics via the `/metrics` endpoint wh
 - `iggy_connector_messages_consumed_total`: Messages consumed from Iggy (sink)
 - `iggy_connector_messages_processed_total`: Messages processed and sent to sink plugin
 - `iggy_connector_errors_total`: Errors encountered
+
+## Stats
+
+The `/stats` endpoint provides runtime and per-connector statistics in JSON format. This includes system resource usage, connector counts, and detailed per-connector metrics with version information.
+
+### Example Response
+
+```json
+{
+  "connectors_runtime_version": "0.2.3-edge.1",
+  "connectors_runtime_version_semver": 203,
+  "process_id": 12345,
+  "cpu_usage": 2.5,
+  "total_cpu_usage": 15.3,
+  "memory_usage": 52428800,
+  "total_memory": 17179869184,
+  "available_memory": 8589934592,
+  "run_time": 3600000000,
+  "start_time": 1706889600000000,
+  "sources_total": 1,
+  "sources_running": 1,
+  "sinks_total": 1,
+  "sinks_running": 1,
+  "connectors": [
+    {
+      "key": "random-source",
+      "name": "Random Source",
+      "connector_type": "source",
+      "version": "0.2.2-edge.1",
+      "version_semver": 202,
+      "status": "running",
+      "enabled": true,
+      "messages_produced": 1000,
+      "messages_sent": 1000,
+      "errors": 0
+    },
+    {
+      "key": "stdout-sink",
+      "name": "Stdout Sink",
+      "connector_type": "sink",
+      "version": "0.2.2-edge.1",
+      "version_semver": 202,
+      "status": "running",
+      "enabled": true,
+      "messages_consumed": 1000,
+      "messages_processed": 1000,
+      "errors": 0
+    }
+  ]
+}
+```

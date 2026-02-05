@@ -32,9 +32,57 @@ use rmcp::{
         StreamableHttpService, streamable_http_server::session::local::LocalSessionManager,
     },
 };
+use socket2::{Domain, Protocol, Socket, Type};
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 use tokio::spawn;
 use tracing::{error, info};
+
+fn create_reusable_listener(address: &str) -> Result<std::net::TcpListener, McpRuntimeError> {
+    let addr: SocketAddr = address.parse().map_err(|_| {
+        error!("Invalid address: {address}");
+        McpRuntimeError::FailedToStartHttpServer
+    })?;
+
+    let domain = if addr.is_ipv6() {
+        Domain::IPV6
+    } else {
+        Domain::IPV4
+    };
+
+    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP)).map_err(|e| {
+        error!("Failed to create socket: {e}");
+        McpRuntimeError::FailedToStartHttpServer
+    })?;
+
+    socket.set_reuse_address(true).map_err(|e| {
+        error!("Failed to set SO_REUSEADDR: {e}");
+        McpRuntimeError::FailedToStartHttpServer
+    })?;
+
+    #[cfg(unix)]
+    socket.set_reuse_port(true).map_err(|e| {
+        error!("Failed to set SO_REUSEPORT: {e}");
+        McpRuntimeError::FailedToStartHttpServer
+    })?;
+
+    socket.bind(&addr.into()).map_err(|e| {
+        error!("Failed to bind to {address}: {e}");
+        McpRuntimeError::FailedToStartHttpServer
+    })?;
+
+    socket.listen(128).map_err(|e| {
+        error!("Failed to listen on {address}: {e}");
+        McpRuntimeError::FailedToStartHttpServer
+    })?;
+
+    let listener: std::net::TcpListener = socket.into();
+    listener.set_nonblocking(true).map_err(|e| {
+        error!("Failed to set non-blocking: {e}");
+        McpRuntimeError::FailedToStartHttpServer
+    })?;
+
+    Ok(listener)
+}
 
 pub async fn init(
     config: HttpConfig,
@@ -77,15 +125,14 @@ pub async fn init(
     }
 
     if !config.tls.enabled {
-        let listener = tokio::net::TcpListener::bind(&config.address)
-            .await
-            .map_err(|error| {
-                error!("Failed to bind TCP listener: {:?}", error);
-                McpRuntimeError::FailedToStartHttpServer
-            })?;
-        let address = listener
+        let std_listener = create_reusable_listener(&config.address)?;
+        let address = std_listener
             .local_addr()
             .expect("Failed to get local address for HTTP server");
+        let listener = tokio::net::TcpListener::from_std(std_listener).map_err(|e| {
+            error!("Failed to convert to tokio listener: {e}");
+            McpRuntimeError::FailedToStartHttpServer
+        })?;
         info!(
             "HTTP API listening on: {address}, MCP path: {}",
             config.path
@@ -110,8 +157,7 @@ pub async fn init(
     .await
     .expect("Failed to load TLS certificate or key file");
 
-    let listener =
-        std::net::TcpListener::bind(&config.address).expect("Failed to bind TCP listener");
+    let listener = create_reusable_listener(&config.address)?;
     let address = listener
         .local_addr()
         .expect("Failed to get local address for HTTPS / TLS server");

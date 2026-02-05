@@ -415,25 +415,28 @@ default_algorithm = "none"
 # Specifies the directory where stream data is stored, relative to `system.path`.
 path = "streams"
 
-# Topic configuration
+# Topic configuration - default settings for new topics
 [system.topic]
-# Path for storing topic-related data (string).
-# Specifies the directory where topic data is stored, relative to `stream.path`.
+# Path for storing topic-related data, relative to `stream.path`.
 path = "topics"
 
-# Configures the topic size-based expiry setting.
-# "unlimited" or "0" means topics are kept indefinitely.
-# A size value in human-readable format determines the maximum size of a topic.
-# When a topic reaches this size, the oldest messages are deleted to make room for new ones.
-# Messages are removed in full segments, so if segment size is 1 GiB and the topic size is 10 GiB,
-# the oldest segment will be deleted upon reaching 10 GiB.
-# Example: `max_topic_size = "10 GiB"` means oldest messages in topics will be deleted when they reach 10 GiB.
-# Note: this setting can be overwritten with CreateTopic and UpdateTopic requests.
+# Messages can be deleted based on two independent policies:
+# 1. Size-based: delete oldest segments when topic exceeds max_size
+# 2. Time-based: delete segments older than message_expiry
+# Both can be active simultaneously. Per-topic overrides via CreateTopic/UpdateTopic.
+
+# Maximum topic size before oldest segments are deleted.
+# "unlimited" or "0" = no size limit (messages kept indefinitely).
+# When 90% of this limit is reached, oldest segments are removed to make room.
+# Applies to sealed segments only (active segment is protected).
+# Example: "10 GiB"
 max_size = "unlimited"
 
-# Configures whether the oldest segments are deleted when a topic reaches its maximum size (boolean).
-# Note: segments are removed in intervals defined by `system.message_cleaner.interval`.
-delete_oldest_segments = false
+# Maximum age of messages before segments are deleted.
+# "none" = no time limit (messages kept indefinitely).
+# Applies to sealed segments only (active segment is protected).
+# Example: "7 days", "2 days 4 hours 15 minutes"
+message_expiry = "none"
 
 # Partition configuration
 [system.partition]
@@ -451,23 +454,15 @@ enforce_fsync = false
 # `false` skips these checks for faster loading at the risk of undetected corruption.
 validate_checksum = false
 
-# The count threshold of buffered messages before triggering a save to disk (integer).
-# Specifies how many messages accumulate before persisting to storage.
-# Adjusting this can balance between write performance and data durability.
-# This is soft limit, actual number of messages may be higher, depending on last batch size.
-# Together with `size_of_messages_required_to_save` it defines the threshold of buffered messages.
-# Minimum value is 32. Value has to be a multiple of 32 due to minimum
-# direct I/O block size (512 bytes) and message index size (16 bytes per message).
-# With direct I/O, writes must occur in blocks of at least 512 bytes, which equals 32 message indices.
+# The count threshold of buffered messages before triggering a save to disk.
+# Together with `size_of_messages_required_to_save` it defines the threshold.
+# This is a soft limit - actual count may be higher depending on last batch size.
+# Minimum value is 1.
 messages_required_to_save = 1024
 
-# The size threshold of buffered messages before triggering a save to disk (string).
-# Specifies how much size of messages accumulate before persisting to storage.
-# Adjusting this can balance between write performance and data durability.
-# This is soft limit, actual number of messages may be higher, depending on last batch size.
-# Together with `messages_required_to_save` it defines the threshold of buffered messages.
-# Minimum value is 512 B. Value has to be a multiple of 512 B due to direct I/O requirements.
-# Direct I/O operations must align with the underlying storage block size (typically 512 B or 4 KiB).
+# The size threshold of buffered messages before triggering a save to disk.
+# Together with `messages_required_to_save` it defines the threshold.
+# This is a soft limit - actual size may be higher depending on last batch size.
 size_of_messages_required_to_save = "1 MiB"
 
 # Segment configuration
@@ -477,19 +472,6 @@ size_of_messages_required_to_save = "1 MiB"
 # Example: if `size` is set "1GiB", the actual segment size may be 1GiB + the size of remaining messages in received batch.
 # Maximum size is 1 GiB. Size has to be a multiple of 512 B.
 size = "1 GiB"
-
-# Configures the message time-based expiry setting.
-# "none" means messages are kept indefinitely.
-# A time value in human-readable format determines the lifespan of messages.
-# Example: `message_expiry = "2 days 4 hours 15 minutes"` means messages will expire after that duration.
-message_expiry = "none"
-
-# Defines the file system confirmation behavior during state updates.
-# Controls how the system waits for file write operations to complete.
-# Possible values:
-# - "wait": waits for the file operation to complete before proceeding.
-# - "no_wait": proceeds without waiting for the file operation to finish, potentially increasing performance but at the cost of durability.
-server_confirmation = "wait"
 
 # Configures whether expired segments are archived (boolean) or just deleted without archiving.
 archive_expired = false

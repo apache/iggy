@@ -23,7 +23,7 @@ use async_trait::async_trait;
 use iggy::prelude::ArgsOptional;
 use iggy::prelude::Client;
 use iggy_binary_protocol::cli::binary_context::common::ContextConfig;
-use integration::test_server::TestServer;
+use integration::harness::ServerHandle;
 use predicates::str::{contains, starts_with};
 use serial_test::parallel;
 use std::collections::HashMap;
@@ -113,7 +113,7 @@ impl IggyCmdTestCase for TestContextApplied {
 
     async fn verify_server_state(&self, _client: &dyn Client) {}
 
-    fn protocol(&self, server: &TestServer) -> Vec<String> {
+    fn protocol(&self, server: &ServerHandle) -> Vec<String> {
         let transport = self
             .set_transport_arg
             .as_ref()
@@ -123,11 +123,11 @@ impl IggyCmdTestCase for TestContextApplied {
             Some(protocol) => match protocol.as_str() {
                 "quic" => vec![
                     "--quic-server-address".into(),
-                    server.get_quic_udp_addr().unwrap(),
+                    server.quic_addr().unwrap().to_string(),
                 ],
                 _ => vec![
                     "--tcp-server-address".into(),
-                    server.get_raw_tcp_addr().unwrap(),
+                    server.raw_tcp_addr().unwrap(),
                 ],
             },
             None => panic!("either set_transport_arg or set_transport_context must be set"),

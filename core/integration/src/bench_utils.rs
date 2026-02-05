@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::harness::get_test_directory;
 use assert_cmd::prelude::CommandCargoExt;
 use iggy::prelude::*;
 use iggy_common::TransportProtocol;
@@ -22,7 +23,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::Write,
     process::{Command, Stdio},
-    thread::panicking,
+    thread::{self, panicking},
 };
 use uuid::Uuid;
 
@@ -151,5 +152,20 @@ pub fn run_bench_and_wait_for_finish(
 }
 
 pub fn get_random_path() -> String {
-    format!("{}{}", BENCH_FILES_PREFIX, Uuid::now_v7().to_u128_le())
+    let test_name = thread::current()
+        .name()
+        .map(|s| s.to_string())
+        .unwrap_or_default();
+
+    let dir = get_test_directory(&test_name)
+        .unwrap_or_else(|| std::env::current_dir().expect("Failed to get current directory"));
+
+    let _ = fs::create_dir_all(&dir);
+    dir.join(format!(
+        "{}{}",
+        BENCH_FILES_PREFIX,
+        Uuid::now_v7().to_u128_le()
+    ))
+    .display()
+    .to_string()
 }

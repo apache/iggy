@@ -27,10 +27,14 @@ on:
         type: string
         required: true
         description: "Task to run"
+    secrets:
+      CODECOV_TOKEN:
+        required: false
 
 permissions:
   contents: read
   security-events: write
+  pull-requests: write
 
 jobs:
   run:
@@ -56,6 +60,17 @@ jobs:
         with:
           task: ${{ inputs.task }}
           component: ${{ inputs.component }}
+
+      - name: Upload coverage to Codecov
+        if: startsWith(inputs.component, 'rust') && inputs.task == 'test'
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: codecov.json
+          flags: rust
+          fail_ci_if_error: false
+          verbose: true
+          override_pr: ${{ github.event.pull_request.number }}
 
       # Python SDK
       - name: Set up Docker Buildx for Python
@@ -103,8 +118,7 @@ jobs:
           cd web
           npm ci
           if [ "${{ inputs.task }}" = "lint" ]; then
-            # TODO(hubcio): make this blocking once Web UI lints are fixed
-            npm run lint || true
+            npm run lint
           elif [ "${{ inputs.task }}" = "build" ]; then
             npm run build
           fi
@@ -131,5 +145,6 @@ jobs:
             reports/**
             target/llvm-cov/**
             coverage.lcov
+            codecov.json
           if-no-files-found: ignore
           retention-days: 7

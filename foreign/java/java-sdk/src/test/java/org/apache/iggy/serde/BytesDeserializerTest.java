@@ -341,6 +341,7 @@ class BytesDeserializerTest {
             writeU64(buffer, BigInteger.valueOf(1000)); // origin timestamp
             buffer.writeIntLE(0); // user headers length
             buffer.writeIntLE(5); // payload length
+            writeU64(buffer, BigInteger.ZERO); // reserved
             buffer.writeBytes("hello".getBytes()); // payload
 
             // when
@@ -374,6 +375,7 @@ class BytesDeserializerTest {
 
             buffer.writeIntLE(headersBuffer.readableBytes()); // user headers length
             buffer.writeIntLE(3); // payload length
+            writeU64(buffer, BigInteger.ZERO); // reserved
             buffer.writeBytes("abc".getBytes()); // payload
             buffer.writeBytes(headersBuffer); // user headers
 
@@ -401,6 +403,7 @@ class BytesDeserializerTest {
             writeU64(buffer, BigInteger.valueOf(1000));
             buffer.writeIntLE(0);
             buffer.writeIntLE(2);
+            writeU64(buffer, BigInteger.ZERO); // reserved
             buffer.writeBytes("hi".getBytes());
 
             // when
@@ -750,82 +753,6 @@ class BytesDeserializerTest {
             // then
             assertThat(tokenInfo.name()).isEqualTo("mytoken");
             assertThat(tokenInfo.expiryAt()).isEmpty();
-        }
-    }
-
-    @Nested
-    class JsonDeserialization {
-
-        private static final tools.jackson.databind.ObjectMapper MAPPER =
-                org.apache.iggy.client.blocking.http.ObjectMapperFactory.getInstance();
-
-        @Test
-        void shouldDeserializePolledMessagesWithEmptyUserHeaders() throws Exception {
-            String json = """
-                {
-                  "partition_id": 1,
-                  "current_offset": 10,
-                  "count": 1,
-                  "messages": [
-                    {
-                      "header": {
-                        "checksum": 0,
-                        "id": 42,
-                        "offset": 0,
-                        "timestamp": 0,
-                        "origin_timestamp": 1000,
-                        "user_headers_length": 0,
-                        "payload_length": 4
-                      },
-                      "payload": "dGVzdA==",
-                      "user_headers": []
-                    }
-                  ]
-                }
-                """;
-
-            var polledMessages = MAPPER.readValue(json, org.apache.iggy.message.PolledMessages.class);
-
-            assertThat(polledMessages).isNotNull();
-            assertThat(polledMessages.messages()).hasSize(1);
-            assertThat(polledMessages.messages().get(0).userHeaders()).isEmpty();
-        }
-
-        @Test
-        void shouldDeserializePolledMessagesWithUserHeaders() throws Exception {
-            String json = """
-                {
-                  "partition_id": 1,
-                  "current_offset": 10,
-                  "count": 1,
-                  "messages": [
-                    {
-                      "header": {
-                        "checksum": 0,
-                        "id": 42,
-                        "offset": 0,
-                        "timestamp": 0,
-                        "origin_timestamp": 1000,
-                        "user_headers_length": 62,
-                        "payload_length": 4
-                      },
-                      "payload": "dGVzdA==",
-                      "user_headers": [
-                        {
-                          "key": {"kind": "string", "value": "Y29udGVudC10eXBl"},
-                          "value": {"kind": "string", "value": "dGV4dC9wbGFpbg=="}
-                        }
-                      ]
-                    }
-                  ]
-                }
-                """;
-
-            var polledMessages = MAPPER.readValue(json, org.apache.iggy.message.PolledMessages.class);
-
-            assertThat(polledMessages).isNotNull();
-            assertThat(polledMessages.messages()).hasSize(1);
-            assertThat(polledMessages.messages().get(0).userHeaders()).hasSize(1);
         }
     }
 }

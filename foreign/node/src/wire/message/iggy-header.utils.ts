@@ -20,32 +20,33 @@
 import { toDate } from "../serialize.utils.js";
 import { u128LEBufToBigint } from "../number.utils.js";
 
-
 /**
  * Iggy message header containing metadata for each message.
  */
 export type IggyMessageHeader = {
   /** Message checksum for integrity verification */
-  checksum: bigint,
+  checksum: bigint;
   /** Unique message identifier (UUID or numeric) */
-  id: string | bigint,
+  id: string | bigint;
   /** Message offset within the partition */
-  offset: bigint,
+  offset: bigint;
   /** Server-assigned timestamp */
-  timestamp: Date,
+  timestamp: Date;
   /** Client-provided origin timestamp */
-  originTimestamp: Date,
+  originTimestamp: Date;
   /** Length of user-defined headers in bytes */
-  userHeadersLength: number,
+  userHeadersLength: number;
   /** Length of message payload in bytes */
-  payloadLength: number
+  payloadLength: number;
+  /** Reserved for future use */
+  reserved: bigint;
 };
 
 /**
  * Size of the Iggy message header in bytes.
- * Layout: u64 (checksum) + u128 (id) + u64 (offset) + u64 (timestamp) + u64 (originTimestamp) + u32 (userHeadersLength) + u32 (payloadLength)
+ * Layout: u64 (checksum) + u128 (id) + u64 (offset) + u64 (timestamp) + u64 (originTimestamp) + u32 (userHeadersLength) + u32 (payloadLength) + u64 (reserved)
  */
-export const IGGY_MESSAGE_HEADER_SIZE = 8 + 16 + 8 + 8 + 8 + 4 + 4;
+export const IGGY_MESSAGE_HEADER_SIZE = 8 + 16 + 8 + 8 + 8 + 4 + 4 + 8;
 
 /**
  * Serializes an Iggy message header to wire format.
@@ -59,7 +60,7 @@ export const IGGY_MESSAGE_HEADER_SIZE = 8 + 16 + 8 + 8 + 8 + 4 + 4;
 export const serializeIggyMessageHeader = (
   id: Buffer,
   payload: Buffer,
-  userHeaders: Buffer
+  userHeaders: Buffer,
 ) => {
   const b = Buffer.allocUnsafe(IGGY_MESSAGE_HEADER_SIZE);
   b.writeBigUInt64LE(0n, 0); // checksum u64
@@ -68,7 +69,8 @@ export const serializeIggyMessageHeader = (
   b.writeBigUInt64LE(0n, 32); // timestamp u64
   b.writeBigUint64LE(BigInt(new Date().getTime()), 40); // originTimestamp u64
   b.writeUInt32LE(userHeaders.length, 48); // userHeaders len u32
-  b.writeUInt32LE(payload.length, 52) // payload len u32
+  b.writeUInt32LE(payload.length, 52); // payload len u32
+  b.writeBigUInt64LE(0n, 56); // reserved u64
   return b;
 };
 
@@ -88,10 +90,10 @@ export const deserialiseMessageId = (b: Buffer) => u128LEBufToBigint(b);
  * @throws Error if buffer length doesn't match expected header size
  */
 export const deserializeIggyMessageHeaders = (b: Buffer) => {
-  if(b.length !== IGGY_MESSAGE_HEADER_SIZE)
+  if (b.length !== IGGY_MESSAGE_HEADER_SIZE)
     throw new Error(
       `deserialize message headers error, length = ${b.length} ` +
-        `expected ${IGGY_MESSAGE_HEADER_SIZE}`
+        `expected ${IGGY_MESSAGE_HEADER_SIZE}`,
     );
   const headers: IggyMessageHeader = {
     checksum: b.readBigUInt64LE(0),
@@ -100,7 +102,8 @@ export const deserializeIggyMessageHeaders = (b: Buffer) => {
     timestamp: toDate(b.readBigUInt64LE(32)),
     originTimestamp: toDate(b.readBigUInt64LE(40)),
     userHeadersLength: b.readUInt32LE(48),
-    payloadLength: b.readUInt32LE(52)
-  }
+    payloadLength: b.readUInt32LE(52),
+    reserved: b.readBigUInt64LE(56),
+  };
   return headers;
 };

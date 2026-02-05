@@ -1,6 +1,8 @@
 # Apache Iggy Connectors - SDK
 
-SDK provides the commonly used structs and traits such as `Sink` and `Source`, along with the `sink_connector` and `source_connector` macros to be used when developing connectors.
+SDK provides the commonly used structs and traits such as `Sink` and `Source`, along with the `sink_connector!` and `source_connector!` macros to be used when developing connectors.
+
+The macros automatically export the connector's version (from `CARGO_PKG_VERSION`) via FFI, allowing the runtime to report per-connector version information in the `/stats` endpoint.
 
 Moreover, it contains both, the `decoders` and `encoders` modules, implementing either `StreamDecoder` or `StreamEncoder` traits, which are used when consuming or producing data from/to Iggy streams.
 
