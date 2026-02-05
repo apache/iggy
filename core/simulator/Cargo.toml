@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-bytes = { workspace = true }
 bytemuck = { workspace = true }
+bytes = { workspace = true }
 consensus = { path = "../consensus" }
 futures = { workspace = true }
 iggy_common = { path = "../common" }
