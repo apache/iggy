@@ -18,56 +18,15 @@
  */
 
 use crate::context::RuntimeContext;
-use crate::manager::status::ConnectorStatus;
 use crate::metrics::ConnectorType;
 use iggy_common::{IggyTimestamp, SemanticVersion};
-use serde::Serialize;
+use iggy_connector_sdk::api::{ConnectorRuntimeStats, ConnectorStats};
 use std::str::FromStr;
 use std::sync::Arc;
 use sysinfo::System;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const SEMANTIC_VERSION: SemanticVersion = SemanticVersion::parse_const(VERSION);
-
-#[derive(Debug, Serialize)]
-pub struct ConnectorRuntimeStats {
-    pub connectors_runtime_version: String,
-    pub connectors_runtime_version_semver: Option<u32>,
-    pub process_id: u32,
-    pub cpu_usage: f32,
-    pub total_cpu_usage: f32,
-    pub memory_usage: u64,
-    pub total_memory: u64,
-    pub available_memory: u64,
-    pub run_time: u64,
-    pub start_time: u64,
-    pub sources_total: u32,
-    pub sources_running: u32,
-    pub sinks_total: u32,
-    pub sinks_running: u32,
-    pub connectors: Vec<ConnectorStats>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ConnectorStats {
-    pub key: String,
-    pub name: String,
-    pub connector_type: String,
-    pub version: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub version_semver: Option<u32>,
-    pub status: ConnectorStatus,
-    pub enabled: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub messages_produced: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub messages_sent: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub messages_consumed: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub messages_processed: Option<u64>,
-    pub errors: u64,
-}
 
 pub async fn get_runtime_stats(context: &Arc<RuntimeContext>) -> ConnectorRuntimeStats {
     let pid = std::process::id();

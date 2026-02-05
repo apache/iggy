@@ -4,6 +4,14 @@
 
 Source connectors are responsible for ingesting data from external sources into Apache Iggy. They provide a way to integrate Apache Iggy with various data sources, such as databases, message queues, or file systems.
 
+## Available Sources
+
+| Source | Description |
+| ------ | ----------- |
+| **elasticsearch_source** | Polls documents from Elasticsearch indices with timestamp-based tracking |
+| **postgres_source** | Reads rows from PostgreSQL tables with multiple strategies: delete after read, mark as processed, or timestamp tracking |
+| **random_source** | Generates random test messages (useful for testing and development) |
+
 The source is represented by the single `Source` trait, which defines the basic interface for all source connectors. It provides methods for initializing the source, reading data from it, and closing the source.
 
 ```rust

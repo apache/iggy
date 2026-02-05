@@ -64,6 +64,14 @@ impl IggyTimestamp {
         self.0.duration_since(UNIX_EPOCH).unwrap().as_micros() as u64
     }
 
+    pub fn as_millis(&self) -> u64 {
+        self.0.duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
+    }
+
+    pub fn as_nanos(&self) -> u128 {
+        self.0.duration_since(UNIX_EPOCH).unwrap().as_nanos()
+    }
+
     pub fn to_rfc3339_string(&self) -> String {
         DateTime::<Utc>::from(self.0).to_rfc3339()
     }

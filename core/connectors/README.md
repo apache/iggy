@@ -52,11 +52,25 @@ Please refer to the **[Sink documentation](https://github.com/apache/iggy/tree/m
 When implementing `Sink`, make sure to use the `sink_connector!` macro to expose the FFI interface and allow the connector runtime to register the sink with the runtime. The macro also exports the connector's version (from `Cargo.toml`) which is reported in the runtime's `/stats` endpoint.
 Each sink should have its own, custom configuration, which is passed along with the unique plugin ID via expected `new()` method.
 
+### Available Sinks
+
+- **Elasticsearch Sink** - sends messages to Elasticsearch indices
+- **Iceberg Sink** - writes data to Apache Iceberg tables via REST catalog
+- **PostgreSQL Sink** - stores messages in PostgreSQL database tables
+- **Quickwit Sink** - indexes messages in Quickwit search engine
+- **Stdout Sink** - prints messages to standard output (useful for debugging/development)
+
 ## Source
 
 Sources are responsible for producing the messages to the configured stream(s) and topic(s). For example, the Test source connector will generate the random messages that will be then sent to the configured stream and topic.
 
 Please refer to the **[Source documentation](https://github.com/apache/iggy/tree/master/core/connectors/sources)** for the details about the configuration and the sample implementation.
+
+### Available Sources
+
+- **Elasticsearch Source** - polls documents from Elasticsearch indices
+- **PostgreSQL Source** - reads rows from PostgreSQL tables with multiple consumption strategies (delete after read, mark as processed, timestamp tracking)
+- **Random Source** - generates random test messages (useful for testing/development)
 
 ## Building the connectors
 

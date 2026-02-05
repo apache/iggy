@@ -28,7 +28,7 @@ use integration::iggy_harness;
 use serde::{Deserialize, Serialize};
 
 #[iggy_harness(
-    server(connectors_runtime(config_path = "tests/connectors/quickwit/config.toml")),
+    server(connectors_runtime(config_path = "tests/connectors/quickwit/sink.toml")),
     seed = seeds::connector_stream
 )]
 async fn given_existent_quickwit_index_should_store(
@@ -88,7 +88,7 @@ async fn given_existent_quickwit_index_should_store(
 }
 
 #[iggy_harness(
-    server(connectors_runtime(config_path = "tests/connectors/quickwit/config.toml")),
+    server(connectors_runtime(config_path = "tests/connectors/quickwit/sink.toml")),
     seed = seeds::connector_stream
 )]
 async fn given_nonexistent_quickwit_index_should_create_and_store(
@@ -148,10 +148,13 @@ async fn given_nonexistent_quickwit_index_should_create_and_store(
 }
 
 #[iggy_harness(
-    server(connectors_runtime(config_path = "tests/connectors/quickwit/config.toml")),
+    server(connectors_runtime(config_path = "tests/connectors/quickwit/sink.toml")),
     seed = seeds::connector_stream
 )]
-async fn given_bulk_message_send_should_store(harness: &TestHarness, fixture: QuickwitFixture) {
+async fn given_bulk_message_send_should_store(
+    harness: &TestHarness,
+    fixture: QuickwitPreCreatedFixture,
+) {
     let client = harness.client();
     let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
     let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
@@ -205,7 +208,7 @@ async fn given_bulk_message_send_should_store(harness: &TestHarness, fixture: Qu
 }
 
 #[iggy_harness(
-    server(connectors_runtime(config_path = "tests/connectors/quickwit/config.toml")),
+    server(connectors_runtime(config_path = "tests/connectors/quickwit/sink.toml")),
     seed = seeds::connector_stream
 )]
 async fn given_invalid_messages_should_not_store(harness: &TestHarness, fixture: QuickwitFixture) {

@@ -24,10 +24,10 @@ use crate::configs::connectors::{
 use crate::error::RuntimeError;
 use ::configs::{ConfigProvider, FileConfigProvider, TypedEnvProvider};
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use figment::value::Dict;
 use figment::{Metadata, Profile, Provider};
+use iggy_common::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
