@@ -30,7 +30,7 @@ use crate::server::scenarios::create_client;
 use ahash::AHashMap;
 use bytes::Bytes;
 use iggy::prelude::*;
-use integration::test_server::{ClientFactory, login_root};
+use integration::harness::TestHarness;
 
 const STREAM_1: &str = "perm-stream-1";
 const STREAM_2: &str = "perm-stream-2";
@@ -38,35 +38,37 @@ const TOPIC_1: &str = "perm-topic-1";
 const TOPIC_2: &str = "perm-topic-2";
 const PARTITIONS: u32 = 1;
 
-pub async fn run(client_factory: &dyn ClientFactory) {
-    let root_client = create_client(client_factory).await;
-    login_root(&root_client).await;
+pub async fn run(harness: &TestHarness) {
+    let root_client = harness
+        .root_client()
+        .await
+        .expect("Failed to get root client");
 
     setup_test_resources(&root_client).await;
 
     // Test categories
-    test_no_permissions(client_factory, &root_client).await;
-    test_system_permissions(client_factory, &root_client).await;
-    test_user_permissions(client_factory, &root_client).await;
-    test_stream_permissions(client_factory, &root_client).await;
-    test_topic_permissions(client_factory, &root_client).await;
-    test_message_permissions(client_factory, &root_client).await;
-    test_stream_specific_permissions(client_factory, &root_client).await;
-    test_topic_specific_permissions(client_factory, &root_client).await;
+    test_no_permissions(harness, &root_client).await;
+    test_system_permissions(harness, &root_client).await;
+    test_user_permissions(harness, &root_client).await;
+    test_stream_permissions(harness, &root_client).await;
+    test_topic_permissions(harness, &root_client).await;
+    test_message_permissions(harness, &root_client).await;
+    test_stream_specific_permissions(harness, &root_client).await;
+    test_topic_specific_permissions(harness, &root_client).await;
 
     // Permission inheritance/implication tests
-    test_global_permission_inheritance(client_factory, &root_client).await;
-    test_stream_permission_inheritance(client_factory, &root_client).await;
-    test_topic_permission_inheritance(client_factory, &root_client).await;
+    test_global_permission_inheritance(harness, &root_client).await;
+    test_stream_permission_inheritance(harness, &root_client).await;
+    test_topic_permission_inheritance(harness, &root_client).await;
 
     // Consumer group operations matrix
-    test_consumer_group_operations(client_factory, &root_client).await;
+    test_consumer_group_operations(harness, &root_client).await;
 
     // Union semantics tests
-    test_union_semantics(client_factory, &root_client).await;
+    test_union_semantics(harness, &root_client).await;
 
     // Missing resource behavior tests
-    test_missing_resource_behavior(client_factory, &root_client).await;
+    test_missing_resource_behavior(harness, &root_client).await;
 
     cleanup(&root_client).await;
 }
@@ -134,8 +136,8 @@ async fn delete_test_user(root_client: &IggyClient, username: &str) {
         .await;
 }
 
-async fn login_user(client_factory: &dyn ClientFactory, username: &str) -> IggyClient {
-    let client = create_client(client_factory).await;
+async fn login_user(harness: &TestHarness, username: &str) -> IggyClient {
+    let client = create_client(harness).await;
     client
         .login_user(username, "password123")
         .await
@@ -154,10 +156,10 @@ fn no_permissions() -> Permissions {
 // Test: User with no permissions
 // =============================================================================
 
-async fn test_no_permissions(client_factory: &dyn ClientFactory, root_client: &IggyClient) {
+async fn test_no_permissions(harness: &TestHarness, root_client: &IggyClient) {
     const USER: &str = "no-perms-user";
     create_test_user(root_client, USER, Some(no_permissions())).await;
-    let client = login_user(client_factory, USER).await;
+    let client = login_user(harness, USER).await;
 
     let stream_id = Identifier::named(STREAM_1).unwrap();
     let topic_id = Identifier::named(TOPIC_1).unwrap();
@@ -220,7 +222,7 @@ async fn test_no_permissions(client_factory: &dyn ClientFactory, root_client: &I
 // Test: System permissions (read_servers, manage_servers)
 // =============================================================================
 
-async fn test_system_permissions(client_factory: &dyn ClientFactory, root_client: &IggyClient) {
+async fn test_system_permissions(harness: &TestHarness, root_client: &IggyClient) {
     // User with read_servers only
     const READ_USER: &str = "read-servers-user";
     create_test_user(
@@ -236,7 +238,7 @@ async fn test_system_permissions(client_factory: &dyn ClientFactory, root_client
     )
     .await;
 
-    let client = login_user(client_factory, READ_USER).await;
+    let client = login_user(harness, READ_USER).await;
     client
         .get_stats()
         .await
@@ -267,7 +269,7 @@ async fn test_system_permissions(client_factory: &dyn ClientFactory, root_client
     )
     .await;
 
-    let client = login_user(client_factory, MANAGE_USER).await;
+    let client = login_user(harness, MANAGE_USER).await;
     client
         .get_stats()
         .await
@@ -284,7 +286,7 @@ async fn test_system_permissions(client_factory: &dyn ClientFactory, root_client
 // Test: User permissions (read_users, manage_users)
 // =============================================================================
 
-async fn test_user_permissions(client_factory: &dyn ClientFactory, root_client: &IggyClient) {
+async fn test_user_permissions(harness: &TestHarness, root_client: &IggyClient) {
     // User with read_users only
     const READ_USER: &str = "read-users-user";
     create_test_user(
@@ -300,7 +302,7 @@ async fn test_user_permissions(client_factory: &dyn ClientFactory, root_client: 
     )
     .await;
 
-    let client = login_user(client_factory, READ_USER).await;
+    let client = login_user(harness, READ_USER).await;
     client
         .get_users()
         .await
@@ -346,7 +348,7 @@ async fn test_user_permissions(client_factory: &dyn ClientFactory, root_client: 
     )
     .await;
 
-    let client = login_user(client_factory, MANAGE_USER).await;
+    let client = login_user(harness, MANAGE_USER).await;
     client
         .get_users()
         .await
@@ -380,7 +382,7 @@ async fn test_user_permissions(client_factory: &dyn ClientFactory, root_client: 
 // Test: Stream permissions (read_streams, manage_streams)
 // =============================================================================
 
-async fn test_stream_permissions(client_factory: &dyn ClientFactory, root_client: &IggyClient) {
+async fn test_stream_permissions(harness: &TestHarness, root_client: &IggyClient) {
     let stream_id = Identifier::named(STREAM_1).unwrap();
 
     // User with read_streams only
@@ -398,7 +400,7 @@ async fn test_stream_permissions(client_factory: &dyn ClientFactory, root_client
     )
     .await;
 
-    let client = login_user(client_factory, READ_USER).await;
+    let client = login_user(harness, READ_USER).await;
     client
         .get_streams()
         .await
@@ -439,7 +441,7 @@ async fn test_stream_permissions(client_factory: &dyn ClientFactory, root_client
     )
     .await;
 
-    let client = login_user(client_factory, MANAGE_USER).await;
+    let client = login_user(harness, MANAGE_USER).await;
     client
         .get_streams()
         .await
@@ -479,7 +481,7 @@ async fn test_stream_permissions(client_factory: &dyn ClientFactory, root_client
 // Test: Topic permissions (read_topics, manage_topics)
 // =============================================================================
 
-async fn test_topic_permissions(client_factory: &dyn ClientFactory, root_client: &IggyClient) {
+async fn test_topic_permissions(harness: &TestHarness, root_client: &IggyClient) {
     let stream_id = Identifier::named(STREAM_1).unwrap();
     let topic_id = Identifier::named(TOPIC_1).unwrap();
 
@@ -498,7 +500,7 @@ async fn test_topic_permissions(client_factory: &dyn ClientFactory, root_client:
     )
     .await;
 
-    let client = login_user(client_factory, READ_USER).await;
+    let client = login_user(harness, READ_USER).await;
     client
         .get_topics(&stream_id)
         .await
@@ -561,7 +563,7 @@ async fn test_topic_permissions(client_factory: &dyn ClientFactory, root_client:
     )
     .await;
 
-    let client = login_user(client_factory, MANAGE_USER).await;
+    let client = login_user(harness, MANAGE_USER).await;
 
     // Create topic
     client
@@ -610,7 +612,7 @@ async fn test_topic_permissions(client_factory: &dyn ClientFactory, root_client:
 // Test: Message permissions (poll_messages, send_messages)
 // =============================================================================
 
-async fn test_message_permissions(client_factory: &dyn ClientFactory, root_client: &IggyClient) {
+async fn test_message_permissions(harness: &TestHarness, root_client: &IggyClient) {
     let stream_id = Identifier::named(STREAM_1).unwrap();
     let topic_id = Identifier::named(TOPIC_1).unwrap();
 
@@ -629,7 +631,7 @@ async fn test_message_permissions(client_factory: &dyn ClientFactory, root_clien
     )
     .await;
 
-    let client = login_user(client_factory, POLL_USER).await;
+    let client = login_user(harness, POLL_USER).await;
 
     // Can poll messages
     client
@@ -679,7 +681,7 @@ async fn test_message_permissions(client_factory: &dyn ClientFactory, root_clien
     )
     .await;
 
-    let client = login_user(client_factory, SEND_USER).await;
+    let client = login_user(harness, SEND_USER).await;
 
     // Can send messages
     let mut msgs = test_messages();
@@ -727,7 +729,7 @@ async fn test_message_permissions(client_factory: &dyn ClientFactory, root_clien
     )
     .await;
 
-    let client = login_user(client_factory, BOTH_USER).await;
+    let client = login_user(harness, BOTH_USER).await;
 
     let mut msgs = test_messages();
     client
@@ -760,10 +762,7 @@ async fn test_message_permissions(client_factory: &dyn ClientFactory, root_clien
 // Test: Stream-specific permissions
 // =============================================================================
 
-async fn test_stream_specific_permissions(
-    client_factory: &dyn ClientFactory,
-    root_client: &IggyClient,
-) {
+async fn test_stream_specific_permissions(harness: &TestHarness, root_client: &IggyClient) {
     let stream1_id = Identifier::named(STREAM_1).unwrap();
     let stream2_id = Identifier::named(STREAM_2).unwrap();
     let topic_id = Identifier::named(TOPIC_1).unwrap();
@@ -797,7 +796,7 @@ async fn test_stream_specific_permissions(
     )
     .await;
 
-    let client = login_user(client_factory, USER).await;
+    let client = login_user(harness, USER).await;
 
     // Can access stream 1
     client
@@ -889,10 +888,7 @@ async fn test_stream_specific_permissions(
 // Test: Topic-specific permissions
 // =============================================================================
 
-async fn test_topic_specific_permissions(
-    client_factory: &dyn ClientFactory,
-    root_client: &IggyClient,
-) {
+async fn test_topic_specific_permissions(harness: &TestHarness, root_client: &IggyClient) {
     let stream_id = Identifier::named(STREAM_1).unwrap();
     let topic1_id = Identifier::named(TOPIC_1).unwrap();
     let topic2_id = Identifier::named(TOPIC_2).unwrap();
@@ -941,7 +937,7 @@ async fn test_topic_specific_permissions(
     )
     .await;
 
-    let client = login_user(client_factory, USER).await;
+    let client = login_user(harness, USER).await;
 
     // Can access topic 1
     client
@@ -1022,10 +1018,7 @@ async fn test_topic_specific_permissions(
 // setting the implied flags. This locks in the inheritance rules.
 // =============================================================================
 
-async fn test_global_permission_inheritance(
-    client_factory: &dyn ClientFactory,
-    root_client: &IggyClient,
-) {
+async fn test_global_permission_inheritance(harness: &TestHarness, root_client: &IggyClient) {
     let stream_id = Identifier::named(STREAM_1).unwrap();
     let topic_id = Identifier::named(TOPIC_1).unwrap();
 
@@ -1046,7 +1039,7 @@ async fn test_global_permission_inheritance(
     )
     .await;
 
-    let client = login_user(client_factory, READ_STREAMS_USER).await;
+    let client = login_user(harness, READ_STREAMS_USER).await;
 
     // read_streams → read_topics
     client
@@ -1131,7 +1124,7 @@ async fn test_global_permission_inheritance(
     )
     .await;
 
-    let client = login_user(client_factory, MANAGE_STREAMS_USER).await;
+    let client = login_user(harness, MANAGE_STREAMS_USER).await;
 
     // manage_streams → read_streams
     client
@@ -1222,7 +1215,7 @@ async fn test_global_permission_inheritance(
     )
     .await;
 
-    let client = login_user(client_factory, MANAGE_TOPICS_USER).await;
+    let client = login_user(harness, MANAGE_TOPICS_USER).await;
 
     // manage_topics → read_topics
     client
@@ -1278,7 +1271,7 @@ async fn test_global_permission_inheritance(
     )
     .await;
 
-    let client = login_user(client_factory, READ_TOPICS_USER).await;
+    let client = login_user(harness, READ_TOPICS_USER).await;
 
     // read_topics allows reading topics
     client
@@ -1328,7 +1321,7 @@ async fn test_global_permission_inheritance(
     )
     .await;
 
-    let client = login_user(client_factory, MANAGE_SERVERS_ONLY_USER).await;
+    let client = login_user(harness, MANAGE_SERVERS_ONLY_USER).await;
 
     // read_servers implied
     client
@@ -1358,7 +1351,7 @@ async fn test_global_permission_inheritance(
     )
     .await;
 
-    let client = login_user(client_factory, MANAGE_USERS_ONLY_USER).await;
+    let client = login_user(harness, MANAGE_USERS_ONLY_USER).await;
 
     // read_users implied
     client
@@ -1378,10 +1371,7 @@ async fn test_global_permission_inheritance(
 // Tests inheritance rules at the stream level without setting implied flags.
 // =============================================================================
 
-async fn test_stream_permission_inheritance(
-    client_factory: &dyn ClientFactory,
-    root_client: &IggyClient,
-) {
+async fn test_stream_permission_inheritance(harness: &TestHarness, root_client: &IggyClient) {
     let stream_id = Identifier::named(STREAM_1).unwrap();
     let topic_id = Identifier::named(TOPIC_1).unwrap();
 
@@ -1413,7 +1403,7 @@ async fn test_stream_permission_inheritance(
     )
     .await;
 
-    let client = login_user(client_factory, READ_STREAM_USER).await;
+    let client = login_user(harness, READ_STREAM_USER).await;
 
     // read_stream allows get_stream
     client
@@ -1503,7 +1493,7 @@ async fn test_stream_permission_inheritance(
     )
     .await;
 
-    let client = login_user(client_factory, MANAGE_STREAM_USER).await;
+    let client = login_user(harness, MANAGE_STREAM_USER).await;
 
     // manage_stream → read_stream
     client
@@ -1609,7 +1599,7 @@ async fn test_stream_permission_inheritance(
     )
     .await;
 
-    let client = login_user(client_factory, MANAGE_TOPICS_STREAM_USER).await;
+    let client = login_user(harness, MANAGE_TOPICS_STREAM_USER).await;
 
     // manage_topics allows topic CRUD
     client
@@ -1663,10 +1653,7 @@ async fn test_stream_permission_inheritance(
 // Tests inheritance rules at the topic level without setting implied flags.
 // =============================================================================
 
-async fn test_topic_permission_inheritance(
-    client_factory: &dyn ClientFactory,
-    root_client: &IggyClient,
-) {
+async fn test_topic_permission_inheritance(harness: &TestHarness, root_client: &IggyClient) {
     let stream_id = Identifier::named(STREAM_1).unwrap();
     let topic_id = Identifier::named(TOPIC_1).unwrap();
 
@@ -1713,7 +1700,7 @@ async fn test_topic_permission_inheritance(
     )
     .await;
 
-    let client = login_user(client_factory, READ_TOPIC_USER).await;
+    let client = login_user(harness, READ_TOPIC_USER).await;
 
     // get_topic should work
     client
@@ -1782,7 +1769,7 @@ async fn test_topic_permission_inheritance(
     )
     .await;
 
-    let client = login_user(client_factory, MANAGE_TOPIC_USER).await;
+    let client = login_user(harness, MANAGE_TOPIC_USER).await;
 
     // read_topic implied
     client
@@ -1819,10 +1806,7 @@ async fn test_topic_permission_inheritance(
 // are denied under poll_messages-only.
 // =============================================================================
 
-async fn test_consumer_group_operations(
-    client_factory: &dyn ClientFactory,
-    root_client: &IggyClient,
-) {
+async fn test_consumer_group_operations(harness: &TestHarness, root_client: &IggyClient) {
     let stream_id = Identifier::named(STREAM_1).unwrap();
     let topic_id = Identifier::named(TOPIC_1).unwrap();
 
@@ -1841,7 +1825,7 @@ async fn test_consumer_group_operations(
     )
     .await;
 
-    let client = login_user(client_factory, POLL_ONLY_USER).await;
+    let client = login_user(harness, POLL_ONLY_USER).await;
 
     // poll_messages should work
     client
@@ -1892,7 +1876,7 @@ async fn test_consumer_group_operations(
     )
     .await;
 
-    let client = login_user(client_factory, READ_TOPICS_CG_USER).await;
+    let client = login_user(harness, READ_TOPICS_CG_USER).await;
 
     // All CG operations should work
     client
@@ -1974,7 +1958,7 @@ async fn test_consumer_group_operations(
     )
     .await;
 
-    let client = login_user(client_factory, READ_TOPIC_CG_USER).await;
+    let client = login_user(harness, READ_TOPIC_CG_USER).await;
 
     // CG operations should work on topic 1
     client
@@ -2023,7 +2007,7 @@ async fn test_consumer_group_operations(
 // Tests that stream permissions extend rather than restrict global permissions.
 // =============================================================================
 
-async fn test_union_semantics(client_factory: &dyn ClientFactory, root_client: &IggyClient) {
+async fn test_union_semantics(harness: &TestHarness, root_client: &IggyClient) {
     let stream1_id = Identifier::named(STREAM_1).unwrap();
     let stream2_id = Identifier::named(STREAM_2).unwrap();
     let topic_id = Identifier::named(TOPIC_1).unwrap();
@@ -2067,7 +2051,7 @@ async fn test_union_semantics(client_factory: &dyn ClientFactory, root_client: &
     )
     .await;
 
-    let client = login_user(client_factory, UNION_USER).await;
+    let client = login_user(harness, UNION_USER).await;
 
     // Should STILL be able to send (global overrides scoped restriction)
     let mut msgs = test_messages();
@@ -2116,7 +2100,7 @@ async fn test_union_semantics(client_factory: &dyn ClientFactory, root_client: &
     )
     .await;
 
-    let client = login_user(client_factory, GLOBAL_READ_SCOPED_MAP_USER).await;
+    let client = login_user(harness, GLOBAL_READ_SCOPED_MAP_USER).await;
 
     // Should be able to read all streams (global)
     client
@@ -2185,7 +2169,7 @@ async fn test_union_semantics(client_factory: &dyn ClientFactory, root_client: &
     )
     .await;
 
-    let client = login_user(client_factory, TOPIC_ADDITIVE_USER).await;
+    let client = login_user(harness, TOPIC_ADDITIVE_USER).await;
 
     // Stream read operations should work
     client
@@ -2259,10 +2243,7 @@ async fn test_union_semantics(client_factory: &dyn ClientFactory, root_client: &
 // unauthorized users.
 // =============================================================================
 
-async fn test_missing_resource_behavior(
-    client_factory: &dyn ClientFactory,
-    root_client: &IggyClient,
-) {
+async fn test_missing_resource_behavior(harness: &TestHarness, root_client: &IggyClient) {
     let nonexistent_stream = Identifier::named("nonexistent-stream").unwrap();
     let nonexistent_topic = Identifier::named("nonexistent-topic").unwrap();
     let existing_stream = Identifier::named(STREAM_1).unwrap();
@@ -2286,7 +2267,7 @@ async fn test_missing_resource_behavior(
     )
     .await;
 
-    let client = login_user(client_factory, AUTHORIZED_USER).await;
+    let client = login_user(harness, AUTHORIZED_USER).await;
 
     // Non-existent stream
     assert_not_found_or_related(
@@ -2338,7 +2319,7 @@ async fn test_missing_resource_behavior(
     const UNAUTHORIZED_USER: &str = "missing-resource-unauthorized-user";
     create_test_user(root_client, UNAUTHORIZED_USER, Some(no_permissions())).await;
 
-    let client = login_user(client_factory, UNAUTHORIZED_USER).await;
+    let client = login_user(harness, UNAUTHORIZED_USER).await;
 
     // Non-existent stream - returns empty (no leak of existence)
     assert_unauthorized(
@@ -2412,7 +2393,7 @@ async fn test_missing_resource_behavior(
     )
     .await;
 
-    let client = login_user(client_factory, SCOPED_USER).await;
+    let client = login_user(harness, SCOPED_USER).await;
 
     // Accessing non-existent stream - returns empty (no leak of existence)
     assert_unauthorized(

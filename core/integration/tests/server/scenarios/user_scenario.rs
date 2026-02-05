@@ -23,10 +23,10 @@ use iggy::prelude::UserStatus;
 use iggy::prelude::defaults::DEFAULT_ROOT_USERNAME;
 use iggy::prelude::{GlobalPermissions, Permissions};
 use iggy::prelude::{PersonalAccessTokenClient, SEC_IN_MICRO, SystemClient, UserClient};
-use integration::test_server::{ClientFactory, assert_clean_system, login_root};
+use integration::harness::{TestHarness, assert_clean_system, login_root};
 
-pub async fn run(client_factory: &dyn ClientFactory) {
-    let client = create_client(client_factory).await;
+pub async fn run(harness: &TestHarness) {
+    let client = create_client(harness).await;
     // 1. Ping should be allowed for unauthenticated users
     client.ping().await.unwrap();
 
@@ -35,7 +35,7 @@ pub async fn run(client_factory: &dyn ClientFactory) {
     assert!(get_users.is_err());
 
     // 3. Login as root user
-    let identity_info = login_root(&client).await;
+    let identity_info = login_root(&client).await.expect("login failed");
 
     assert_eq!(identity_info.user_id, 0);
 
@@ -193,7 +193,7 @@ pub async fn run(client_factory: &dyn ClientFactory) {
     assert!(personal_access_tokens.is_empty());
 
     // 19. Login as root user again
-    login_root(&client).await;
+    login_root(&client).await.expect("login failed");
 
     // 20. Trying to create a new user with the same username should fail
     let create_duplicated_user = client

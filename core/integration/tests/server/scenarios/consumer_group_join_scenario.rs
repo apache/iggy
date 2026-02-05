@@ -28,18 +28,17 @@ use iggy::prelude::Identifier;
 use iggy::prelude::IggyExpiry;
 use iggy::prelude::MaxTopicSize;
 use iggy::prelude::{ConsumerGroupClient, StreamClient, SystemClient, TopicClient};
-use integration::test_server::{
-    ClientFactory, assert_clean_system, create_user, login_root, login_user,
-};
+use integration::harness::{TestHarness, assert_clean_system, create_user, login_user};
 
-pub async fn run(client_factory: &dyn ClientFactory) {
-    let system_client = create_client(client_factory).await;
+pub async fn run(harness: &TestHarness) {
+    let system_client = harness
+        .root_client()
+        .await
+        .expect("Failed to get root client");
 
-    let client1 = create_client(client_factory).await;
-    let client2 = create_client(client_factory).await;
-    let client3 = create_client(client_factory).await;
-
-    login_root(&system_client).await;
+    let client1 = create_client(harness).await;
+    let client2 = create_client(harness).await;
+    let client3 = create_client(harness).await;
 
     // 1. Create the stream
     let stream = system_client.create_stream(STREAM_NAME).await.unwrap();

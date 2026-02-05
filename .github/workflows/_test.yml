@@ -70,6 +70,7 @@ jobs:
           flags: rust
           fail_ci_if_error: false
           verbose: true
+          override_pr: ${{ github.event.pull_request.number }}
 
       # Python SDK
       - name: Set up Docker Buildx for Python

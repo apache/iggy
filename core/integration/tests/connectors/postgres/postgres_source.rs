@@ -39,7 +39,7 @@ async fn json_rows_source_produces_messages_to_iggy(
     harness: &TestHarness,
     fixture: PostgresSourceJsonFixture,
 ) {
-    let client = harness.client();
+    let client = harness.root_client().await.unwrap();
     let pool = fixture.create_pool().await.expect("Failed to create pool");
     fixture.create_table(&pool).await;
 
@@ -120,7 +120,7 @@ async fn bytea_rows_source_produces_raw_messages_to_iggy(
     harness: &TestHarness,
     fixture: PostgresSourceByteaFixture,
 ) {
-    let client = harness.client();
+    let client = harness.root_client().await.unwrap();
     let pool = fixture.create_pool().await.expect("Failed to create pool");
     fixture.create_table(&pool).await;
 
@@ -183,7 +183,7 @@ async fn jsonb_rows_source_produces_json_messages_to_iggy(
     harness: &TestHarness,
     fixture: PostgresSourceJsonbFixture,
 ) {
-    let client = harness.client();
+    let client = harness.root_client().await.unwrap();
     let pool = fixture.create_pool().await.expect("Failed to create pool");
     fixture.create_table(&pool).await;
 
@@ -250,7 +250,7 @@ async fn delete_after_read_source_removes_rows_after_producing(
     harness: &TestHarness,
     fixture: PostgresSourceDeleteFixture,
 ) {
-    let client = harness.client();
+    let client = harness.root_client().await.unwrap();
     let pool = fixture.create_pool().await.expect("Failed to create pool");
     fixture.create_table(&pool).await;
 
@@ -319,7 +319,7 @@ async fn processed_column_source_marks_rows_after_producing(
     harness: &TestHarness,
     fixture: PostgresSourceMarkFixture,
 ) {
-    let client = harness.client();
+    let client = harness.root_client().await.unwrap();
     let pool = fixture.create_pool().await.expect("Failed to create pool");
     fixture.create_table(&pool).await;
 

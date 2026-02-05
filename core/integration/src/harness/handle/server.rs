@@ -33,12 +33,13 @@ use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle, available_parallelism, sleep};
 use std::time::{Duration, Instant};
+use toml::Value;
 
 const SLEEP_INTERVAL_MS: u64 = 20;
 const MAX_PORT_WAIT_DURATION_S: u64 = 60;
@@ -146,6 +147,12 @@ impl ServerHandle {
     /// Check if server TLS uses self-signed certificates (no CA available).
     pub fn has_self_signed_tls(&self) -> bool {
         self.config.tls.as_ref().is_some_and(|tls| tls.self_signed)
+    }
+
+    /// Add an environment variable to the server config.
+    /// Must be called before starting the server.
+    pub fn add_env(&mut self, key: impl Into<String>, value: impl Into<String>) {
+        self.config.extra_envs.insert(key.into(), value.into());
     }
 
     pub fn collect_logs(&self) -> (String, String) {
@@ -403,7 +410,7 @@ impl ServerHandle {
             }
 
             if config_path.exists() {
-                return Ok(());
+                return self.verify_bound_ports(&config_path);
             }
 
             if Instant::now() >= deadline {
@@ -417,6 +424,64 @@ impl ServerHandle {
             binary: "iggy-server".to_string(),
             timeout_secs: MAX_PORT_WAIT_DURATION_S,
         })
+    }
+
+    fn verify_bound_ports(&self, config_path: &Path) -> Result<(), TestBinaryError> {
+        let content =
+            fs::read_to_string(config_path).map_err(|e| TestBinaryError::InvalidState {
+                message: format!(
+                    "Failed to read server config at {}: {e}",
+                    config_path.display()
+                ),
+            })?;
+
+        let config: Value =
+            toml::from_str(&content).map_err(|e| TestBinaryError::InvalidState {
+                message: format!("Failed to parse server config: {e}"),
+            })?;
+
+        let bound_tcp = Self::extract_address(&config, "tcp");
+        let bound_http = Self::extract_address(&config, "http");
+        let bound_quic = Self::extract_address(&config, "quic");
+        let bound_websocket = Self::extract_address(&config, "websocket");
+
+        let mut mismatches = Vec::new();
+
+        if let (Some(expected), Some(bound)) = (self.addrs.tcp, bound_tcp)
+            && expected != bound
+        {
+            mismatches.push(format!("TCP: expected {expected}, got {bound}"));
+        }
+        if let (Some(expected), Some(bound)) = (self.addrs.http, bound_http)
+            && expected != bound
+        {
+            mismatches.push(format!("HTTP: expected {expected}, got {bound}"));
+        }
+        if let (Some(expected), Some(bound)) = (self.addrs.quic, bound_quic)
+            && expected != bound
+        {
+            mismatches.push(format!("QUIC: expected {expected}, got {bound}"));
+        }
+        if let (Some(expected), Some(bound)) = (self.addrs.websocket, bound_websocket)
+            && expected != bound
+        {
+            mismatches.push(format!("WebSocket: expected {expected}, got {bound}"));
+        }
+
+        if !mismatches.is_empty() {
+            return Err(TestBinaryError::InvalidState {
+                message: format!(
+                    "Server bound to unexpected ports:\n  {}",
+                    mismatches.join("\n  ")
+                ),
+            });
+        }
+
+        Ok(())
+    }
+
+    fn extract_address(config: &Value, protocol: &str) -> Option<SocketAddr> {
+        config.get(protocol)?.get("address")?.as_str()?.parse().ok()
     }
 
     fn start_watchdog(&mut self) {
@@ -688,11 +753,11 @@ impl TestBinary for ServerHandle {
                 path: cert_dir.clone(),
                 source: e,
             })?;
-            crate::test_tls_utils::generate_test_certificates(cert_dir.to_str().unwrap()).map_err(
-                |e| TestBinaryError::InvalidState {
+            generate_test_certificates(cert_dir.to_str().unwrap()).map_err(|e| {
+                TestBinaryError::InvalidState {
                     message: format!("Failed to generate TLS certificates: {e}"),
-                },
-            )?;
+                }
+            })?;
             self.generated_cert_dir = Some(cert_dir);
         }
 
@@ -838,4 +903,26 @@ impl Drop for ServerHandle {
         let _ = self.stop();
         super::common::dump_logs_on_panic("Iggy server", &self.stdout_path, &self.stderr_path);
     }
+}
+
+fn generate_test_certificates(cert_dir: &str) -> Result<(), Box<dyn std::error::Error>> {
+    fs::create_dir_all(cert_dir)?;
+
+    let subject_alt_names = vec![
+        "localhost".to_string(),
+        "127.0.0.1".to_string(),
+        "::1".to_string(),
+    ];
+
+    let cert = rcgen::generate_simple_self_signed(subject_alt_names)?;
+
+    let cert_path = Path::new(cert_dir).join("test_cert.pem");
+    let mut cert_file = File::create(&cert_path)?;
+    cert_file.write_all(cert.cert.pem().as_bytes())?;
+
+    let key_path = Path::new(cert_dir).join("test_key.pem");
+    let mut key_file = File::create(&key_path)?;
+    key_file.write_all(cert.signing_key.serialize_pem().as_bytes())?;
+
+    Ok(())
 }

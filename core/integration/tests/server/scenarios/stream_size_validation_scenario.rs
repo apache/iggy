@@ -16,10 +16,10 @@
  * under the License.
  */
 
-use crate::server::scenarios::{PARTITION_ID, PARTITIONS_COUNT, create_client};
+use crate::server::scenarios::{PARTITION_ID, PARTITIONS_COUNT};
 use bytes::Bytes;
 use iggy::prelude::*;
-use integration::test_server::{ClientFactory, assert_clean_system, login_root};
+use integration::harness::{TestHarness, assert_clean_system, login_root};
 use std::str::FromStr;
 
 const S1_NAME: &str = "test-stream-1";
@@ -31,8 +31,11 @@ const MSG_SIZE: u64 = IGGY_MESSAGE_HEADER_SIZE as u64 + MESSAGE_PAYLOAD_SIZE_BYT
 const MSGS_COUNT: u64 = 117; // number of messages in a single topic after one pass of appending
 const MSGS_SIZE: u64 = MSG_SIZE * MSGS_COUNT; // number of bytes in a single topic after one pass of appending
 
-pub async fn run(client_factory: &dyn ClientFactory) {
-    let client = create_client(client_factory).await;
+pub async fn run(harness: &TestHarness) {
+    let client = harness
+        .new_client()
+        .await
+        .expect("Failed to create new client");
 
     // 0. Ping server, login as root user and ensure that streams do not exist
     ping_login_and_validate(&client).await;
@@ -121,7 +124,7 @@ async fn ping_login_and_validate(client: &IggyClient) {
     client.ping().await.unwrap();
 
     // 2. Login as root user
-    login_root(client).await;
+    login_root(client).await.expect("login failed");
 
     // 3. Ensure that streams do not exist
     let streams = client.get_streams().await.unwrap();

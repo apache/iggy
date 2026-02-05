@@ -21,17 +21,17 @@ use crate::server::scenarios::{
     create_client, get_consumer_group, join_consumer_group,
 };
 use iggy::prelude::*;
-use integration::test_server::{
-    ClientFactory, assert_clean_system, create_user, login_root, login_user,
-};
+use integration::harness::{TestHarness, assert_clean_system, create_user, login_user};
 use std::str::{FromStr, from_utf8};
 
-pub async fn run(client_factory: &dyn ClientFactory) {
-    let system_client = create_client(client_factory).await;
-    let client1 = create_client(client_factory).await;
-    let client2 = create_client(client_factory).await;
-    let client3 = create_client(client_factory).await;
-    login_root(&system_client).await;
+pub async fn run(harness: &TestHarness) {
+    let system_client = harness
+        .root_client()
+        .await
+        .expect("Failed to get root client");
+    let client1 = create_client(harness).await;
+    let client2 = create_client(harness).await;
+    let client3 = create_client(harness).await;
     init_system(&system_client, &client1, &client2, &client3, true).await;
     execute_using_messages_key_key(&system_client, &client1, &client2, &client3).await;
     cleanup(&system_client, false).await;

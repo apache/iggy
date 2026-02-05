@@ -22,35 +22,17 @@ use crate::sdk::producer::{
 use bytes::Bytes;
 use iggy::clients::producer_config::BackpressureMode;
 use iggy::prelude::*;
-use iggy::{clients::client::IggyClient, prelude::TcpClient};
-use iggy_common::TcpClientConfig;
-use integration::test_server::{TestServer, login_root};
-use serial_test::parallel;
+use integration::iggy_harness;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::{Instant, sleep};
 
-#[tokio::test]
-#[parallel]
-async fn background_send_receive_ok() {
-    let mut test_server = TestServer::default();
-    test_server.start();
+#[iggy_harness]
+async fn background_send_receive_ok(harness: &TestHarness) {
+    let client = harness.tcp_root_client().await.unwrap();
+    client.ping().await.unwrap();
 
-    let tcp_client_config = TcpClientConfig {
-        server_address: test_server.get_raw_tcp_addr().unwrap(),
-        ..TcpClientConfig::default()
-    };
-    let client = ClientWrapper::Tcp(TcpClient::create(Arc::new(tcp_client_config)).unwrap());
-    let client = IggyClient::create(client, None, None);
-
-    client.connect().await.unwrap();
-    assert!(client.ping().await.is_ok(), "Failed to ping server");
-
-    login_root(&client).await;
     init_system(&client).await;
-
-    client.connect().await.unwrap();
-    assert!(client.ping().await.is_ok(), "Failed to ping server");
 
     let messages_count = 1000;
 
@@ -96,27 +78,12 @@ async fn background_send_receive_ok() {
     cleanup(&client).await;
 }
 
-#[tokio::test]
-#[parallel]
-async fn background_buffer_overflow_immediate() {
-    let mut test_server = TestServer::default();
-    test_server.start();
+#[iggy_harness]
+async fn background_buffer_overflow_immediate(harness: &TestHarness) {
+    let client = harness.tcp_root_client().await.unwrap();
+    client.ping().await.unwrap();
 
-    let tcp_client_config = TcpClientConfig {
-        server_address: test_server.get_raw_tcp_addr().unwrap(),
-        ..TcpClientConfig::default()
-    };
-    let client = ClientWrapper::Tcp(TcpClient::create(Arc::new(tcp_client_config)).unwrap());
-    let client = IggyClient::create(client, None, None);
-
-    client.connect().await.unwrap();
-    assert!(client.ping().await.is_ok(), "Failed to ping server");
-
-    login_root(&client).await;
     init_system(&client).await;
-
-    client.connect().await.unwrap();
-    assert!(client.ping().await.is_ok(), "Failed to ping server");
 
     let cfg = BackgroundConfig::builder()
         .max_buffer_size(IggyByteSize::from(1024))
@@ -147,27 +114,12 @@ async fn background_buffer_overflow_immediate() {
 /// - batch_length = 0, batch_size = 0: disables trigger-based flushing;
 /// - linger_time = 500ms: messages are flushed only after timeout;
 /// - backpressure timeout = 100ms: sending should fail if not flushed within this window.
-#[tokio::test]
-#[parallel]
-async fn background_block_with_timeout() {
-    let mut test_server = TestServer::default();
-    test_server.start();
+#[iggy_harness]
+async fn background_block_with_timeout(harness: &TestHarness) {
+    let client = harness.tcp_root_client().await.unwrap();
+    client.ping().await.unwrap();
 
-    let tcp_client_config = TcpClientConfig {
-        server_address: test_server.get_raw_tcp_addr().unwrap(),
-        ..TcpClientConfig::default()
-    };
-    let client = ClientWrapper::Tcp(TcpClient::create(Arc::new(tcp_client_config)).unwrap());
-    let client = IggyClient::create(client, None, None);
-
-    client.connect().await.unwrap();
-    assert!(client.ping().await.is_ok(), "Failed to ping server");
-
-    login_root(&client).await;
     init_system(&client).await;
-
-    client.connect().await.unwrap();
-    assert!(client.ping().await.is_ok(), "Failed to ping server");
 
     let big = IggyMessage::builder()
         .id(1)
@@ -205,21 +157,9 @@ async fn background_block_with_timeout() {
     cleanup(&client).await;
 }
 
-#[tokio::test]
-#[parallel]
-async fn background_block_waits_then_succeeds() {
-    let mut test_server = TestServer::default();
-    test_server.start();
-
-    let tcp_client_config = TcpClientConfig {
-        server_address: test_server.get_raw_tcp_addr().unwrap(),
-        ..TcpClientConfig::default()
-    };
-    let client = ClientWrapper::Tcp(TcpClient::create(Arc::new(tcp_client_config)).unwrap());
-    let client = IggyClient::create(client, None, None);
-
-    client.connect().await.unwrap();
-    login_root(&client).await;
+#[iggy_harness]
+async fn background_block_waits_then_succeeds(harness: &TestHarness) {
+    let client = harness.tcp_root_client().await.unwrap();
     init_system(&client).await;
 
     let big_msg = IggyMessage::builder()
@@ -261,33 +201,18 @@ async fn background_block_waits_then_succeeds() {
     cleanup(&client).await;
 }
 
-#[tokio::test]
-#[parallel]
-async fn background_graceful_shutdown() {
-    let mut test_server = TestServer::default();
-    test_server.start();
+#[iggy_harness]
+async fn background_graceful_shutdown(harness: &TestHarness) {
+    let client = harness.tcp_root_client().await.unwrap();
+    client.ping().await.unwrap();
 
-    let tcp_client_config = TcpClientConfig {
-        server_address: test_server.get_raw_tcp_addr().unwrap(),
-        ..TcpClientConfig::default()
-    };
-    let client = ClientWrapper::Tcp(TcpClient::create(Arc::new(tcp_client_config)).unwrap());
-    let client = IggyClient::create(client, None, None);
-
-    client.connect().await.unwrap();
-    assert!(client.ping().await.is_ok(), "Failed to ping server");
-
-    login_root(&client).await;
     init_system(&client).await;
-
-    client.connect().await.unwrap();
-    assert!(client.ping().await.is_ok(), "Failed to ping server");
 
     let cfg = BackgroundConfig::builder()
         .max_in_flight(1)
         .batch_length(0)
         .batch_size(0)
-        .linger_time(IggyDuration::from(2_000_000)) // 2s – long enough not to flush automatically
+        .linger_time(IggyDuration::from(2_000_000)) // 2s - long enough not to flush automatically
         .build();
     let producer = client
         .producer(STREAM_NAME, TOPIC_NAME)
@@ -337,23 +262,13 @@ async fn background_graceful_shutdown() {
     cleanup(&client).await;
 }
 
-#[tokio::test]
-#[parallel]
-async fn background_many_parallel_producers() {
+#[iggy_harness]
+async fn background_many_parallel_producers(harness: &TestHarness) {
     const PARALLEL_PRODUCERS: usize = 10;
 
-    let mut test_server = TestServer::default();
-    test_server.start();
+    let client = harness.tcp_root_client().await.unwrap();
+    let client = Arc::new(client);
 
-    let tcp_client_config = TcpClientConfig {
-        server_address: test_server.get_raw_tcp_addr().unwrap(),
-        ..TcpClientConfig::default()
-    };
-    let client = ClientWrapper::Tcp(TcpClient::create(Arc::new(tcp_client_config)).unwrap());
-    let client = Arc::new(IggyClient::create(client, None, None));
-
-    client.connect().await.unwrap();
-    login_root(&client).await;
     init_system(&client).await;
 
     let mut handles = Vec::with_capacity(PARALLEL_PRODUCERS);
@@ -412,23 +327,11 @@ async fn background_many_parallel_producers() {
 /// timeout fired with an empty buffer. Without the fix, the deadline would
 /// always be in the past after the first idle timeout, causing immediate
 /// flushes instead of waiting for the full linger_time.
-#[tokio::test]
-#[parallel]
-async fn background_linger_time_respected_after_idle() {
-    let mut test_server = TestServer::default();
-    test_server.start();
+#[iggy_harness]
+async fn background_linger_time_respected_after_idle(harness: &TestHarness) {
+    let client = harness.tcp_root_client().await.unwrap();
+    client.ping().await.unwrap();
 
-    let tcp_client_config = TcpClientConfig {
-        server_address: test_server.get_raw_tcp_addr().unwrap(),
-        ..TcpClientConfig::default()
-    };
-    let client = ClientWrapper::Tcp(TcpClient::create(Arc::new(tcp_client_config)).unwrap());
-    let client = IggyClient::create(client, None, None);
-
-    client.connect().await.unwrap();
-    assert!(client.ping().await.is_ok(), "Failed to ping server");
-
-    login_root(&client).await;
     init_system(&client).await;
 
     let cfg = BackgroundConfig::builder()
@@ -494,21 +397,9 @@ async fn background_linger_time_respected_after_idle() {
     cleanup(&client).await;
 }
 
-#[tokio::test]
-#[parallel]
-async fn background_preserves_message_ordering() {
-    let mut test_server = TestServer::default();
-    test_server.start();
-
-    let tcp_client_config = TcpClientConfig {
-        server_address: test_server.get_raw_tcp_addr().unwrap(),
-        ..TcpClientConfig::default()
-    };
-    let client = ClientWrapper::Tcp(TcpClient::create(Arc::new(tcp_client_config)).unwrap());
-    let client = IggyClient::create(client, None, None);
-
-    client.connect().await.unwrap();
-    login_root(&client).await;
+#[iggy_harness]
+async fn background_preserves_message_ordering(harness: &TestHarness) {
+    let client = harness.tcp_root_client().await.unwrap();
     init_system(&client).await;
 
     let messages_count = 1000u32;
@@ -565,21 +456,9 @@ async fn background_preserves_message_ordering() {
     cleanup(&client).await;
 }
 
-#[tokio::test]
-#[parallel]
-async fn background_preserves_ordering_with_multiple_shards() {
-    let mut test_server = TestServer::default();
-    test_server.start();
-
-    let tcp_client_config = TcpClientConfig {
-        server_address: test_server.get_raw_tcp_addr().unwrap(),
-        ..TcpClientConfig::default()
-    };
-    let client = ClientWrapper::Tcp(TcpClient::create(Arc::new(tcp_client_config)).unwrap());
-    let client = IggyClient::create(client, None, None);
-
-    client.connect().await.unwrap();
-    login_root(&client).await;
+#[iggy_harness]
+async fn background_preserves_ordering_with_multiple_shards(harness: &TestHarness) {
+    let client = harness.tcp_root_client().await.unwrap();
     init_system(&client).await;
 
     let messages_count = 1000u32;

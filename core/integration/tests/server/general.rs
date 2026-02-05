@@ -15,48 +15,139 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::server::{
-    ScenarioFn, authentication_scenario, bench_scenario, consumer_timestamp_polling_scenario,
-    create_message_payload_scenario, message_headers_scenario, permissions_scenario, run_scenario,
-    snapshot_scenario, stream_size_validation_scenario, system_scenario, user_scenario,
+use crate::server::scenarios::{
+    authentication_scenario, bench_scenario, consumer_timestamp_polling_scenario,
+    create_message_payload, message_headers_scenario, permissions_scenario, snapshot_scenario,
+    stream_size_validation_scenario, system_scenario, user_scenario,
 };
-use iggy_common::TransportProtocol;
-use serial_test::parallel;
-use test_case::test_matrix;
+use integration::iggy_harness;
 
-#[test_matrix(
-    [quic(), tcp(), http(), websocket()],
-    [
-        authentication_scenario(),
-        system_scenario(),
-        user_scenario(),
-        permissions_scenario(),
-        message_headers_scenario(),
-        create_message_payload_scenario(),
-        stream_size_validation_scenario(),
-        bench_scenario(),
-        consumer_timestamp_polling_scenario(),
-        snapshot_scenario(),
-    ]
+#[iggy_harness(
+    test_client_transport = [Tcp, Http, Quic, WebSocket],
+    server(
+        tcp.socket.override_defaults = true,
+        tcp.socket.nodelay = true,
+        quic.max_idle_timeout = "500s",
+        quic.keep_alive_interval = "15s"
+    )
 )]
-#[tokio::test]
-#[parallel]
-async fn matrix(transport: TransportProtocol, scenario: ScenarioFn) {
-    run_scenario(transport, scenario).await;
+async fn authentication(harness: &TestHarness) {
+    authentication_scenario::run(harness).await;
 }
 
-fn quic() -> TransportProtocol {
-    TransportProtocol::Quic
+#[iggy_harness(
+    test_client_transport = [Tcp, Http, Quic, WebSocket],
+    server(
+        tcp.socket.override_defaults = true,
+        tcp.socket.nodelay = true,
+        quic.max_idle_timeout = "500s",
+        quic.keep_alive_interval = "15s"
+    )
+)]
+async fn system(harness: &TestHarness) {
+    system_scenario::run(harness).await;
 }
 
-fn tcp() -> TransportProtocol {
-    TransportProtocol::Tcp
+#[iggy_harness(
+    test_client_transport = [Tcp, Http, Quic, WebSocket],
+    server(
+        tcp.socket.override_defaults = true,
+        tcp.socket.nodelay = true,
+        quic.max_idle_timeout = "500s",
+        quic.keep_alive_interval = "15s"
+    )
+)]
+async fn user(harness: &TestHarness) {
+    user_scenario::run(harness).await;
 }
 
-fn http() -> TransportProtocol {
-    TransportProtocol::Http
+#[iggy_harness(
+    test_client_transport = [Tcp, Http, Quic, WebSocket],
+    server(
+        tcp.socket.override_defaults = true,
+        tcp.socket.nodelay = true,
+        quic.max_idle_timeout = "500s",
+        quic.keep_alive_interval = "15s"
+    )
+)]
+async fn permissions(harness: &TestHarness) {
+    permissions_scenario::run(harness).await;
 }
 
-fn websocket() -> TransportProtocol {
-    TransportProtocol::WebSocket
+#[iggy_harness(
+    test_client_transport = [Tcp, Http, Quic, WebSocket],
+    server(
+        tcp.socket.override_defaults = true,
+        tcp.socket.nodelay = true,
+        quic.max_idle_timeout = "500s",
+        quic.keep_alive_interval = "15s"
+    )
+)]
+async fn message_headers(harness: &TestHarness) {
+    message_headers_scenario::run(harness).await;
+}
+
+#[iggy_harness(
+    test_client_transport = [Tcp, Http, Quic, WebSocket],
+    server(
+        tcp.socket.override_defaults = true,
+        tcp.socket.nodelay = true,
+        quic.max_idle_timeout = "500s",
+        quic.keep_alive_interval = "15s"
+    )
+)]
+async fn create_message_payload_scenario(harness: &TestHarness) {
+    create_message_payload::run(harness).await;
+}
+
+#[iggy_harness(
+    test_client_transport = [Tcp, Http, Quic, WebSocket],
+    server(
+        tcp.socket.override_defaults = true,
+        tcp.socket.nodelay = true,
+        quic.max_idle_timeout = "500s",
+        quic.keep_alive_interval = "15s"
+    )
+)]
+async fn stream_size_validation(harness: &TestHarness) {
+    stream_size_validation_scenario::run(harness).await;
+}
+
+#[iggy_harness(
+    test_client_transport = [Tcp, Http, Quic, WebSocket],
+    server(
+        tcp.socket.override_defaults = true,
+        tcp.socket.nodelay = true,
+        quic.max_idle_timeout = "500s",
+        quic.keep_alive_interval = "15s"
+    )
+)]
+async fn bench(harness: &TestHarness) {
+    bench_scenario::run(harness).await;
+}
+
+#[iggy_harness(
+    test_client_transport = [Tcp, Http, Quic, WebSocket],
+    server(
+        tcp.socket.override_defaults = true,
+        tcp.socket.nodelay = true,
+        quic.max_idle_timeout = "500s",
+        quic.keep_alive_interval = "15s"
+    )
+)]
+async fn consumer_timestamp_polling(harness: &TestHarness) {
+    consumer_timestamp_polling_scenario::run(harness).await;
+}
+
+#[iggy_harness(
+    test_client_transport = [Tcp, Http, Quic, WebSocket],
+    server(
+        tcp.socket.override_defaults = true,
+        tcp.socket.nodelay = true,
+        quic.max_idle_timeout = "500s",
+        quic.keep_alive_interval = "15s"
+    )
+)]
+async fn snapshot(harness: &TestHarness) {
+    snapshot_scenario::run(harness).await;
 }

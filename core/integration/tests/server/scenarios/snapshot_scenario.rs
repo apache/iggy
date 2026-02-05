@@ -17,18 +17,15 @@
  */
 
 use iggy::prelude::*;
-use integration::test_server::{ClientFactory, assert_clean_system};
+use integration::harness::{TestHarness, assert_clean_system};
 use std::io::{Cursor, Read};
 use zip::ZipArchive;
 
-pub async fn run(client_factory: &dyn ClientFactory) {
-    let client = client_factory.create_client().await;
-    let client = IggyClient::create(client, None, None);
-
-    client
-        .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+pub async fn run(harness: &TestHarness) {
+    let client = harness
+        .root_client()
         .await
-        .unwrap();
+        .expect("Failed to get root client");
 
     let snapshot = client
         .snapshot(

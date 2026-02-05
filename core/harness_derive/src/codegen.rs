@@ -476,7 +476,7 @@ fn generate_harness_setup(
         #config_resolution
         let mut __harness = ::integration::harness::TestHarness::builder()
             .server(#server_config)
-            .client(#client_config)
+            .primary_client(#client_config)
             #mcp_builder_call
             #connectors_runtime_builder_call
             #cluster_builder_call

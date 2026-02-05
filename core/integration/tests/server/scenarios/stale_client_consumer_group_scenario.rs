@@ -19,9 +19,7 @@
 use futures::StreamExt;
 use iggy::prelude::*;
 use iggy_common::Credentials;
-use integration::test_server::{IpAddrKind, TestServer};
-use serial_test::parallel;
-use std::collections::HashMap;
+use integration::iggy_harness;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -32,18 +30,6 @@ const TOPIC_NAME: &str = "stale-test-topic";
 const CONSUMER_GROUP_NAME: &str = "stale-test-cg";
 const PARTITIONS_COUNT: u32 = 1;
 const TOTAL_MESSAGES: u32 = 10;
-
-fn create_test_server() -> TestServer {
-    let mut extra_envs = HashMap::new();
-    extra_envs.insert("IGGY_HEARTBEAT_ENABLED".to_string(), "true".to_string());
-    extra_envs.insert("IGGY_HEARTBEAT_INTERVAL".to_string(), "2s".to_string());
-    extra_envs.insert(
-        "IGGY_TCP_SOCKET_OVERRIDE_DEFAULTS".to_string(),
-        "true".to_string(),
-    );
-    extra_envs.insert("IGGY_TCP_SOCKET_NODELAY".to_string(), "true".to_string());
-    TestServer::new(Some(extra_envs), true, None, IpAddrKind::V4)
-}
 
 async fn create_client(server_addr: &str, heartbeat_interval: &str) -> IggyClient {
     let config = TcpClientConfig {
@@ -125,12 +111,16 @@ async fn setup_resources(client: &IggyClient) {
 }
 
 /// Tests that a stale client receives clean errors and can manually reconnect.
-#[tokio::test]
-#[parallel]
-async fn should_handle_stale_client_with_manual_reconnection() {
-    let mut test_server = create_test_server();
-    test_server.start();
-    let server_addr = test_server.get_raw_tcp_addr().unwrap();
+#[iggy_harness(server(
+    heartbeat.enabled = true,
+    heartbeat.interval = "2s",
+    tcp.socket.override_defaults = true,
+    tcp.socket.nodelay = true
+))]
+async fn should_handle_stale_client_with_manual_reconnection(
+    harness: &integration::harness::TestHarness,
+) {
+    let server_addr = harness.server().raw_tcp_addr().unwrap();
 
     let setup_client = create_client(&server_addr, "500ms").await;
     setup_resources(&setup_client).await;
@@ -239,16 +229,19 @@ async fn should_handle_stale_client_with_manual_reconnection() {
     let _ = setup_client
         .delete_stream(&Identifier::named(STREAM_NAME).unwrap())
         .await;
-    test_server.stop();
 }
 
 /// Tests that IggyConsumer automatically recovers after stale disconnect.
-#[tokio::test]
-#[parallel]
-async fn should_handle_stale_client_with_auto_reconnection() {
-    let mut test_server = create_test_server();
-    test_server.start();
-    let server_addr = test_server.get_raw_tcp_addr().unwrap();
+#[iggy_harness(server(
+    heartbeat.enabled = true,
+    heartbeat.interval = "2s",
+    tcp.socket.override_defaults = true,
+    tcp.socket.nodelay = true
+))]
+async fn should_handle_stale_client_with_auto_reconnection(
+    harness: &integration::harness::TestHarness,
+) {
+    let server_addr = harness.server().raw_tcp_addr().unwrap();
 
     let setup_client = create_client(&server_addr, "500ms").await;
     setup_resources(&setup_client).await;
@@ -294,7 +287,6 @@ async fn should_handle_stale_client_with_auto_reconnection() {
     let _ = setup_client
         .delete_stream(&Identifier::named(STREAM_NAME).unwrap())
         .await;
-    test_server.stop();
 
     assert_eq!(
         messages_consumed, TOTAL_MESSAGES,

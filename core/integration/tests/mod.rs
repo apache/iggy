@@ -20,11 +20,10 @@ use ctor::{ctor, dtor};
 use integration::harness::get_test_directory;
 use lazy_static::lazy_static;
 use std::collections::{HashMap, HashSet};
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::Write;
-use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Once};
+use std::sync::{Arc, Mutex, Once, RwLock};
 use std::{panic, thread};
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::layer::SubscriberExt;
@@ -47,6 +46,9 @@ lazy_static! {
         Arc::new(RwLock::new(HashMap::new()));
     static ref FAILED_TEST_CASES: Arc<RwLock<HashSet<String>>> =
         Arc::new(RwLock::new(HashSet::new()));
+    /// File handles for real-time log writing, keyed by test name.
+    static ref LOG_FILES: Arc<Mutex<HashMap<String, File>>> =
+        Arc::new(Mutex::new(HashMap::new()));
 }
 
 static INIT: Once = Once::new();
@@ -105,12 +107,15 @@ impl Write for LogWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let thread = thread::current();
         let thread_name = thread.name().unwrap_or(UNKNOWN_TEST_NAME);
-        let Ok(mut map) = self.0.write() else {
-            return Ok(buf.len());
-        };
 
-        let buffer = map.entry(thread_name.to_string()).or_default();
-        buffer.extend_from_slice(buf);
+        // Write to memory buffer (for failed test output at end)
+        if let Ok(mut map) = self.0.write() {
+            let buffer = map.entry(thread_name.to_string()).or_default();
+            buffer.extend_from_slice(buf);
+        }
+
+        // Write to file in real-time
+        write_to_log_file(thread_name, buf);
 
         Ok(buf.len())
     }
@@ -120,25 +125,44 @@ impl Write for LogWriter {
     }
 }
 
-fn teardown() {
-    if let Ok(buffer) = LOGS_BUFFER.read() {
-        for (test_name, logs) in buffer.iter() {
-            if let Some(dir) = get_test_directory(test_name) {
-                let log_path = dir.join("test_stdout.log");
-                if let Ok(mut file) = File::create(&log_path) {
-                    let _ = file.write_all(logs);
-                }
-            }
-        }
+fn write_to_log_file(test_name: &str, buf: &[u8]) {
+    let Ok(mut files) = LOG_FILES.lock() else {
+        return;
+    };
 
-        if TESTS_FAILED.load(Ordering::SeqCst)
-            && let Ok(failed) = FAILED_TEST_CASES.read()
-        {
-            for test in failed.iter() {
-                if let Some(logs) = buffer.get(test) {
-                    eprintln!("Logs for failed test '{test}':");
-                    eprintln!("{}", String::from_utf8_lossy(logs));
-                }
+    // Try to get existing file handle or create one
+    if let std::collections::hash_map::Entry::Vacant(entry) = files.entry(test_name.to_string())
+        && let Some(dir) = get_test_directory(test_name)
+    {
+        let log_path = dir.join("test_stdout.log");
+        if let Ok(file) = OpenOptions::new().create(true).append(true).open(&log_path) {
+            entry.insert(file);
+        }
+    }
+
+    // Write to file if we have a handle
+    if let Some(file) = files.get_mut(test_name) {
+        let _ = file.write_all(buf);
+    }
+}
+
+fn teardown() {
+    // Flush and close all log file handles
+    if let Ok(mut files) = LOG_FILES.lock() {
+        for (_, file) in files.iter_mut() {
+            let _ = file.flush();
+        }
+        files.clear();
+    }
+
+    // Print logs for failed tests to stderr
+    if TESTS_FAILED.load(Ordering::SeqCst)
+        && let (Ok(buffer), Ok(failed)) = (LOGS_BUFFER.read(), FAILED_TEST_CASES.read())
+    {
+        for test in failed.iter() {
+            if let Some(logs) = buffer.get(test) {
+                eprintln!("Logs for failed test '{test}':");
+                eprintln!("{}", String::from_utf8_lossy(logs));
             }
         }
     }

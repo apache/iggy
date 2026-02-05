@@ -16,10 +16,10 @@
  * under the License.
  */
 
-use crate::server::scenarios::{PARTITION_ID, STREAM_NAME, TOPIC_NAME, create_client};
+use crate::server::scenarios::{PARTITION_ID, STREAM_NAME, TOPIC_NAME};
 use futures::StreamExt;
 use iggy::prelude::*;
-use integration::test_server::{ClientFactory, login_root};
+use integration::harness::TestHarness;
 use std::str::FromStr;
 use tokio::time::{Duration, timeout};
 
@@ -27,9 +27,11 @@ const MESSAGES_COUNT: u32 = 2000;
 const BATCH_LENGTH: u32 = 100;
 const CONSUME_TIMEOUT: Duration = Duration::from_secs(10);
 
-pub async fn run(client_factory: &dyn ClientFactory) {
-    let client = create_client(client_factory).await;
-    login_root(&client).await;
+pub async fn run(harness: &TestHarness) {
+    let client = harness
+        .root_client()
+        .await
+        .expect("Failed to get root client");
 
     test_offset_strategy(&client).await;
     test_timestamp_strategy(&client).await;

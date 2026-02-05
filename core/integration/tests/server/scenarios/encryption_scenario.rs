@@ -18,10 +18,7 @@
 
 use bytes::Bytes;
 use iggy::prelude::*;
-use integration::{
-    tcp_client::TcpClientFactory,
-    test_server::{ClientFactory, IpAddrKind, SYSTEM_PATH_ENV_VAR, TestServer, login_root},
-};
+use integration::harness::{TestHarness, TestServerConfig};
 use serial_test::parallel;
 use std::collections::HashMap;
 use test_case::test_matrix;
@@ -34,45 +31,38 @@ fn encryption_disabled() -> bool {
     false
 }
 
+fn build_server_config(encryption: bool) -> TestServerConfig {
+    let mut extra_envs = HashMap::new();
+
+    if encryption {
+        extra_envs.insert(
+            "IGGY_SYSTEM_ENCRYPTION_ENABLED".to_string(),
+            "true".to_string(),
+        );
+        extra_envs.insert(
+            "IGGY_SYSTEM_ENCRYPTION_KEY".to_string(),
+            "/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE=".to_string(),
+        );
+    }
+
+    TestServerConfig::builder().extra_envs(extra_envs).build()
+}
+
 #[test_matrix(
     [encryption_enabled(), encryption_disabled()]
 )]
 #[tokio::test]
 #[parallel]
 async fn should_fill_data_with_headers_and_verify_after_restart_using_api(encryption: bool) {
-    // 1. Start server
-    let mut env_vars = HashMap::from([(
-        SYSTEM_PATH_ENV_VAR.to_owned(),
-        TestServer::get_random_path(),
-    )]);
+    let mut harness = TestHarness::builder()
+        .server(build_server_config(encryption))
+        .build()
+        .unwrap();
 
-    if encryption {
-        env_vars.insert(
-            "IGGY_SYSTEM_ENCRYPTION_ENABLED".to_string(),
-            "true".to_string(),
-        );
-        env_vars.insert(
-            "IGGY_SYSTEM_ENCRYPTION_KEY".to_string(),
-            "/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE=".to_string(),
-        );
-    }
+    harness.start().await.unwrap();
 
-    let mut test_server = TestServer::new(Some(env_vars.clone()), false, None, IpAddrKind::V4);
-    test_server.start();
-    let server_addr = test_server.get_raw_tcp_addr().unwrap();
-    let local_data_path = test_server.get_local_data_path().to_owned();
+    let client = harness.tcp_root_client().await.unwrap();
 
-    // 2. Connect and create initial client
-    let client = TcpClientFactory {
-        server_addr,
-        ..Default::default()
-    }
-    .create_client()
-    .await;
-    let client = IggyClient::create(client, None, None);
-    login_root(&client).await;
-
-    // 3. Create test stream and topic
     let stream_name = "test-stream-api";
     let topic_name = "test-topic-api";
     let partition_count = 1;
@@ -91,7 +81,6 @@ async fn should_fill_data_with_headers_and_verify_after_restart_using_api(encryp
         .await
         .unwrap();
 
-    // 4. Send messages with headers (first batch)
     let messages_per_batch = 1000;
     let mut messages_batch_1 = Vec::new();
 
@@ -127,25 +116,22 @@ async fn should_fill_data_with_headers_and_verify_after_restart_using_api(encryp
         .await
         .unwrap();
 
-    // 5. Flush and get initial stats
     client
         .flush_unsaved_buffer(
             &Identifier::named(stream_name).unwrap(),
             &Identifier::named(topic_name).unwrap(),
             0,
-            true, // Force flush
+            true,
         )
         .await
         .unwrap();
 
-    // Give the server a moment to process encrypted messages
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
     let initial_stats = client.get_stats().await.unwrap();
     let initial_messages_count = initial_stats.messages_count;
     let initial_messages_size = initial_stats.messages_size_bytes;
 
-    // 6. Poll messages to verify initial batch
     let consumer = Consumer::default();
     let polled = client
         .poll_messages(
@@ -162,7 +148,6 @@ async fn should_fill_data_with_headers_and_verify_after_restart_using_api(encryp
 
     let all_polled_messages_1 = polled.messages;
 
-    // Verify we got all messages with correct headers
     eprintln!(
         "Polled {} messages, expected {}",
         all_polled_messages_1.len(),
@@ -210,25 +195,10 @@ async fn should_fill_data_with_headers_and_verify_after_restart_using_api(encryp
         );
     }
 
-    // 7. Stop and restart server
-    test_server.stop();
-    drop(test_server);
+    harness.restart_server().await.unwrap();
 
-    let mut test_server = TestServer::new(Some(env_vars.clone()), false, None, IpAddrKind::V4);
-    test_server.start();
-    let server_addr = test_server.get_raw_tcp_addr().unwrap();
+    let client = harness.tcp_root_client().await.unwrap();
 
-    // 8. Reconnect after restart
-    let client = TcpClientFactory {
-        server_addr,
-        ..Default::default()
-    }
-    .create_client()
-    .await;
-    let client = IggyClient::create(client, None, None);
-    login_root(&client).await;
-
-    // 9. Send second batch of messages with different headers
     let mut messages_batch_2 = Vec::new();
 
     for i in 0..messages_per_batch {
@@ -257,27 +227,24 @@ async fn should_fill_data_with_headers_and_verify_after_restart_using_api(encryp
         .send_messages(
             &Identifier::named(stream_name).unwrap(),
             &Identifier::named(topic_name).unwrap(),
-            &Partitioning::partition_id(0), // Use specific partition for testing
+            &Partitioning::partition_id(0),
             &mut messages_batch_2,
         )
         .await
         .unwrap();
 
-    // Flush the buffer after sending second batch
     client
         .flush_unsaved_buffer(
             &Identifier::named(stream_name).unwrap(),
             &Identifier::named(topic_name).unwrap(),
             0,
-            true, // Force flush
+            true,
         )
         .await
         .unwrap();
 
-    // Give the server a moment to process encrypted messages
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-    // 10. Poll all messages (both batches) and verify
     let polled = client
         .poll_messages(
             &Identifier::named(stream_name).unwrap(),
@@ -293,10 +260,8 @@ async fn should_fill_data_with_headers_and_verify_after_restart_using_api(encryp
 
     let all_polled_messages = polled.messages;
 
-    // Verify we have all messages from both batches
     assert_eq!(all_polled_messages.len(), (messages_per_batch * 2) as usize);
 
-    // Count messages by batch
     let mut batch_1_count = 0;
     let mut batch_2_count = 0;
 
@@ -343,7 +308,6 @@ async fn should_fill_data_with_headers_and_verify_after_restart_using_api(encryp
     assert_eq!(batch_1_count, messages_per_batch as usize);
     assert_eq!(batch_2_count, messages_per_batch as usize);
 
-    // 11. Verify final stats
     let final_stats = client.get_stats().await.unwrap();
     assert_eq!(final_stats.messages_count, initial_messages_count * 2);
     assert!(
@@ -352,7 +316,4 @@ async fn should_fill_data_with_headers_and_verify_after_restart_using_api(encryp
         final_stats.messages_size_bytes.as_bytes_u64(),
         initial_messages_size.as_bytes_u64()
     );
-
-    // 12. Cleanup
-    std::fs::remove_dir_all(local_data_path).unwrap();
 }

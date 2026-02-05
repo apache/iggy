@@ -29,7 +29,7 @@
 use crate::server::scenarios::create_client;
 use bytes::Bytes;
 use iggy::prelude::*;
-use integration::test_server::{ClientFactory, login_root};
+use integration::harness::{TestHarness, login_root};
 use server::binary::command::ServerCommand;
 use strum::IntoEnumIterator;
 
@@ -57,8 +57,8 @@ impl TestContext {
     }
 }
 
-pub async fn run(client_factory: &dyn ClientFactory) {
-    let client = create_client(client_factory).await;
+pub async fn run(harness: &TestHarness) {
+    let client = create_client(harness).await;
 
     // Phase 1: Verify ping works without auth
     client.ping().await.expect("ping should work without auth");
@@ -67,7 +67,7 @@ pub async fn run(client_factory: &dyn ClientFactory) {
     test_all_commands_require_auth(&client).await;
 
     // Phase 3: Login and verify commands work
-    let identity = login_root(&client).await;
+    let identity = login_root(&client).await.expect("login failed");
     assert_eq!(identity.user_id, 0, "root user should have id 0");
     setup_test_resources(&client).await;
     verify_auth_works(&client).await;
@@ -77,7 +77,7 @@ pub async fn run(client_factory: &dyn ClientFactory) {
     test_all_commands_require_auth(&client).await;
 
     // Phase 5: Test PAT authentication
-    login_root(&client).await;
+    login_root(&client).await.expect("login failed");
     let raw_pat = client
         .create_personal_access_token("auth-test-pat", PersonalAccessTokenExpiry::NeverExpire)
         .await

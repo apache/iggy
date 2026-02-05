@@ -31,7 +31,7 @@ use tokio::time::sleep;
 async fn random_source_produces_messages(harness: &TestHarness) {
     sleep(Duration::from_secs(1)).await;
 
-    let client = harness.client();
+    let client = harness.root_client().await.unwrap();
     let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
     let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
     let consumer_id: Identifier = "test_consumer".try_into().unwrap();

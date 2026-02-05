@@ -18,16 +18,18 @@
 
 use crate::server::scenarios::{
     CONSUMER_GROUP_NAME, MESSAGES_COUNT, PARTITIONS_COUNT, STREAM_NAME, TOPIC_NAME, cleanup,
-    create_client, get_consumer_group, join_consumer_group,
+    get_consumer_group, join_consumer_group,
 };
 use iggy::prelude::*;
-use integration::test_server::{ClientFactory, assert_clean_system, login_root};
+use integration::harness::{TestHarness, assert_clean_system};
 use std::collections::HashSet;
 use std::str::{FromStr, from_utf8};
 
-pub async fn run(client_factory: &dyn ClientFactory) {
-    let client = create_client(client_factory).await;
-    login_root(&client).await;
+pub async fn run(harness: &TestHarness) {
+    let client = harness
+        .root_client()
+        .await
+        .expect("Failed to get root client");
     init_system(&client).await;
     execute_using_messages_key_key(&client).await;
     client

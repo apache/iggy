@@ -42,7 +42,7 @@
     "commitlint": "commitlint --edit",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
-    "prepare": "husky"
+    "prepare": "husky || true"
   },
   "author": "github.com/T1B0",
   "license": "Apache-2.0",

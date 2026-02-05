@@ -35,7 +35,7 @@ async fn given_existent_quickwit_index_should_store(
     harness: &TestHarness,
     fixture: QuickwitPreCreatedFixture,
 ) {
-    let client = harness.client();
+    let client = harness.root_client().await.unwrap();
     let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
     let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
 
@@ -68,13 +68,8 @@ async fn given_existent_quickwit_index_should_store(
         .await
         .expect("send messages");
 
-    fixture
-        .flush_index(seeds::names::TOPIC)
-        .await
-        .expect("flush");
-
     let search = fixture
-        .search_all(seeds::names::TOPIC)
+        .wait_for_documents(seeds::names::TOPIC, message_count)
         .await
         .expect("search");
 
@@ -95,7 +90,7 @@ async fn given_nonexistent_quickwit_index_should_create_and_store(
     harness: &TestHarness,
     fixture: QuickwitFixture,
 ) {
-    let client = harness.client();
+    let client = harness.root_client().await.unwrap();
     let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
     let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
 
@@ -128,13 +123,8 @@ async fn given_nonexistent_quickwit_index_should_create_and_store(
         .await
         .expect("send messages");
 
-    fixture
-        .flush_index(seeds::names::TOPIC)
-        .await
-        .expect("flush");
-
     let search = fixture
-        .search_all(seeds::names::TOPIC)
+        .wait_for_documents(seeds::names::TOPIC, message_count)
         .await
         .expect("search");
 
@@ -152,7 +142,7 @@ async fn given_nonexistent_quickwit_index_should_create_and_store(
     seed = seeds::connector_stream
 )]
 async fn given_bulk_message_send_should_store(harness: &TestHarness, fixture: QuickwitFixture) {
-    let client = harness.client();
+    let client = harness.root_client().await.unwrap();
     let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
     let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
 
@@ -185,13 +175,8 @@ async fn given_bulk_message_send_should_store(harness: &TestHarness, fixture: Qu
         .await
         .expect("send messages");
 
-    fixture
-        .flush_index(seeds::names::TOPIC)
-        .await
-        .expect("flush");
-
     let search = fixture
-        .search_all(seeds::names::TOPIC)
+        .wait_for_documents(seeds::names::TOPIC, message_count)
         .await
         .expect("search");
 
@@ -209,7 +194,7 @@ async fn given_bulk_message_send_should_store(harness: &TestHarness, fixture: Qu
     seed = seeds::connector_stream
 )]
 async fn given_invalid_messages_should_not_store(harness: &TestHarness, fixture: QuickwitFixture) {
-    let client = harness.client();
+    let client = harness.root_client().await.unwrap();
     let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
     let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
 
@@ -253,13 +238,8 @@ async fn given_invalid_messages_should_not_store(harness: &TestHarness, fixture:
             .expect("send messages");
     }
 
-    fixture
-        .flush_index(seeds::names::TOPIC)
-        .await
-        .expect("flush");
-
     let search = fixture
-        .search_all(seeds::names::TOPIC)
+        .wait_for_documents(seeds::names::TOPIC, 2)
         .await
         .expect("search");
 

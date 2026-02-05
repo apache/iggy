@@ -16,22 +16,22 @@
  * under the License.
  */
 
-use crate::server::scenarios::{
-    CONSUMER_GROUP_NAME, PARTITION_ID, STREAM_NAME, TOPIC_NAME, create_client,
-};
+use crate::server::scenarios::{CONSUMER_GROUP_NAME, PARTITION_ID, STREAM_NAME, TOPIC_NAME};
 use futures::StreamExt;
 use iggy::prelude::*;
 use iggy_common::ConsumerOffsetInfo;
-use integration::test_server::{ClientFactory, login_root};
+use integration::harness::TestHarness;
 use std::str::FromStr;
 use tokio::time::{Duration, sleep};
 
 const TEST_MESSAGES_COUNT: u32 = 100;
 const HALF_MESSAGES_COUNT: u32 = TEST_MESSAGES_COUNT / 2;
 
-pub async fn run(client_factory: &dyn ClientFactory) {
-    let client = create_client(client_factory).await;
-    login_root(&client).await;
+pub async fn run(harness: &TestHarness) {
+    let client = harness
+        .root_client()
+        .await
+        .expect("Failed to get root client");
     init_system(&client).await;
     execute_auto_commit_reconnection_scenario(&client).await;
 }

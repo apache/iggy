@@ -48,7 +48,7 @@ jobs:
         uses: ./.github/actions/utils/setup-rust-with-cache
 
       - name: Setup Node with cache for examples
-        if: inputs.component == 'examples-suite'
+        if: inputs.component == 'examples-suite' && inputs.task == 'examples-node'
         uses: ./.github/actions/utils/setup-node-with-cache
         with:
           node-version: "23"
@@ -56,13 +56,13 @@ jobs:
           workspace: examples/node
 
       - name: Setup Python
-        if: inputs.component == 'examples-suite'
+        if: inputs.component == 'examples-suite' && inputs.task == 'examples-python'
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Cache pip
-        if: inputs.component == 'examples-suite'
+        if: inputs.component == 'examples-suite' && inputs.task == 'examples-python'
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
