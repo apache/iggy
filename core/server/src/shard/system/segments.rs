@@ -15,6 +15,7 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+use crate::configs::cache_indexes::CacheIndexesConfig;
 use crate::shard::IggyShard;
 use crate::streaming::segments::Segment;
 use iggy_common::IggyError;
@@ -162,14 +163,15 @@ impl IggyShard {
     ) -> Result<(), IggyError> {
         use crate::streaming::segments::storage::create_segment_storage;
 
-        let start_offset = {
+        let (start_offset, old_segment_index) = {
             let mut partitions = self.local_partitions.borrow_mut();
             let partition = partitions
                 .get_mut(namespace)
                 .expect("rotate_segment: partition must exist");
+            let old_segment_index = partition.log.segments().len() - 1;
             let active_segment = partition.log.active_segment_mut();
             active_segment.sealed = true;
-            active_segment.end_offset + 1
+            (active_segment.end_offset + 1, old_segment_index)
         };
 
         let segment = Segment::new(start_offset, self.config.system.segment.size);
@@ -187,6 +189,20 @@ impl IggyShard {
 
         let mut partitions = self.local_partitions.borrow_mut();
         if let Some(partition) = partitions.get_mut(namespace) {
+            // Clear old segment's indexes if cache_indexes is not set to All.
+            // This prevents memory accumulation from keeping index buffers for sealed segments.
+            if !matches!(
+                self.config.system.segment.cache_indexes,
+                CacheIndexesConfig::All
+            ) {
+                partition.log.indexes_mut()[old_segment_index] = None;
+            }
+
+            // Close writers for the sealed segment - they're never needed after sealing.
+            // This releases file handles and associated kernel/io_uring resources.
+            let old_storage = &mut partition.log.storages_mut()[old_segment_index];
+            let _ = old_storage.shutdown();
+
             partition.log.add_persisted_segment(segment, storage);
             partition.stats.increment_segments_count(1);
             tracing::info!(
