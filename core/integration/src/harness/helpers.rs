@@ -17,8 +17,6 @@
  * under the License.
  */
 
-//! Helper functions for common test operations.
-
 use iggy::prelude::{
     DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME, GlobalPermissions, Identifier, IdentityInfo,
     Permissions, StreamClient, UserClient, UserStatus,

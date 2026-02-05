@@ -18,12 +18,7 @@
 
 use bytes::Bytes;
 use iggy::prelude::*;
-use integration::{
-    tcp_client::TcpClientFactory,
-    test_server::{ClientFactory, IpAddrKind, SYSTEM_PATH_ENV_VAR, TestServer, login_root},
-};
-use serial_test::parallel;
-use std::collections::HashMap;
+use integration::iggy_harness;
 use std::time::{Duration, Instant};
 
 const STREAM_NAME: &str = "eventual-consistency-stream";
@@ -40,42 +35,17 @@ const TOPIC_NAME: &str = "eventual-consistency-topic";
 /// 2. Background saver calls commit() - journal becomes EMPTY
 /// 3. Background saver starts async disk write
 /// 4. Poll arrives - sees empty journal, data not yet on disk
-#[tokio::test]
-#[parallel]
-async fn should_read_messages_during_background_saver_flush() {
-    let env_vars = HashMap::from([
-        (
-            SYSTEM_PATH_ENV_VAR.to_owned(),
-            TestServer::get_random_path(),
-        ),
-        (
-            "IGGY_SYSTEM_PARTITION_MESSAGES_REQUIRED_TO_SAVE".to_owned(),
-            "100000".to_owned(),
-        ),
-        (
-            "IGGY_SYSTEM_PARTITION_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE".to_owned(),
-            "1GB".to_owned(),
-        ),
-        (
-            "IGGY_SYSTEM_PARTITION_ENFORCE_FSYNC".to_owned(),
-            "false".to_owned(),
-        ),
-        ("IGGY_MESSAGE_SAVER_INTERVAL".to_owned(), "100ms".to_owned()),
-        ("IGGY_MESSAGE_SAVER_ENABLED".to_owned(), "true".to_owned()),
-    ]);
-
-    let mut test_server = TestServer::new(Some(env_vars), true, None, IpAddrKind::V4);
-    test_server.start();
-    let server_addr = test_server.get_raw_tcp_addr().unwrap();
-
-    let producer_client = TcpClientFactory {
-        server_addr: server_addr.clone(),
-        ..Default::default()
-    }
-    .create_client()
-    .await;
-    let producer = IggyClient::create(producer_client, None, None);
-    login_root(&producer).await;
+#[iggy_harness(server(
+    partition.messages_required_to_save = "100000",
+    partition.size_of_messages_required_to_save = "1GB",
+    partition.enforce_fsync = false,
+    message_saver.interval = "100ms",
+    message_saver.enabled = true
+))]
+async fn should_read_messages_during_background_saver_flush(
+    harness: &integration::harness::TestHarness,
+) {
+    let producer = harness.tcp_root_client().await.unwrap();
 
     producer.create_stream(STREAM_NAME).await.unwrap();
     producer
@@ -91,14 +61,7 @@ async fn should_read_messages_during_background_saver_flush() {
         .await
         .unwrap();
 
-    let consumer_client = TcpClientFactory {
-        server_addr,
-        ..Default::default()
-    }
-    .create_client()
-    .await;
-    let consumer = IggyClient::create(consumer_client, None, None);
-    login_root(&consumer).await;
+    let consumer_client = harness.tcp_root_client().await.unwrap();
 
     let stream_id = Identifier::named(STREAM_NAME).unwrap();
     let topic_id = Identifier::named(TOPIC_NAME).unwrap();
@@ -147,7 +110,7 @@ async fn should_read_messages_during_background_saver_flush() {
 
         batches_sent += 1;
 
-        let poll_result = consumer
+        let poll_result = consumer_client
             .poll_messages(
                 &stream_id,
                 &topic_id,

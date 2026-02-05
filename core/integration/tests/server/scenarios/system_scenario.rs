@@ -22,12 +22,14 @@ use crate::server::scenarios::{
 };
 use bytes::Bytes;
 use iggy::prelude::*;
-use integration::test_server::{ClientFactory, assert_clean_system};
+use integration::harness::{TestHarness, assert_clean_system};
 use std::str::FromStr;
 
-pub async fn run(client_factory: &dyn ClientFactory) {
-    let client = client_factory.create_client().await;
-    let client = IggyClient::create(client, None, None);
+pub async fn run(harness: &TestHarness) {
+    let client = harness
+        .root_client()
+        .await
+        .expect("Failed to get root client");
 
     let consumer = Consumer {
         kind: CONSUMER_KIND,
@@ -36,12 +38,6 @@ pub async fn run(client_factory: &dyn ClientFactory) {
 
     // 0. Ping server
     client.ping().await.unwrap();
-
-    // 1. Login as root user
-    client
-        .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
-        .await
-        .unwrap();
 
     // 2. Ensure that streams do not exist
     let streams = client.get_streams().await.unwrap();

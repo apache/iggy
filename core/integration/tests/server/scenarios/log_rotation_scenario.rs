@@ -22,8 +22,7 @@ use iggy::prelude::*;
 use iggy_common::{
     CompressionAlgorithm, Identifier, IggyByteSize, IggyDuration, IggyExpiry, MaxTopicSize,
 };
-use integration::tcp_client::TcpClientFactory;
-use integration::test_server::{ClientFactory, IpAddrKind, TestServer, login_root};
+use integration::harness::{TestHarness, TestServerConfig};
 use once_cell::sync::Lazy;
 use serial_test::parallel;
 use std::collections::HashMap;
@@ -91,50 +90,47 @@ fn config_special_scenario() -> LogRotationTestConfig {
     }
 }
 
+fn build_server_config(log_config: &LogRotationTestConfig) -> TestServerConfig {
+    let mut extra_envs = HashMap::new();
+    extra_envs.insert(
+        "IGGY_SYSTEM_LOGGING_MAX_FILE_SIZE".to_string(),
+        format!("{}", log_config.max_single_log_size),
+    );
+    extra_envs.insert(
+        "IGGY_SYSTEM_LOGGING_MAX_TOTAL_SIZE".to_string(),
+        format!("{}", log_config.max_total_log_size),
+    );
+    extra_envs.insert(
+        "IGGY_SYSTEM_LOGGING_ROTATION_CHECK_INTERVAL".to_string(),
+        format!("{}", log_config.rotation_check_interval),
+    );
+    extra_envs.insert(
+        "IGGY_SYSTEM_LOGGING_RETENTION".to_string(),
+        format!("{}", log_config.retention),
+    );
+
+    TestServerConfig::builder().extra_envs(extra_envs).build()
+}
+
 #[test_matrix(
     [config_regular_rotation(), config_unlimited_size(), config_unlimited_archives(), config_special_scenario()]
 )]
 #[tokio::test]
 #[parallel]
 async fn log_rotation_should_be_valid(present_log_config: LogRotationTestConfig) {
-    let mut extra_envs = HashMap::new();
-    extra_envs.insert(
-        "IGGY_SYSTEM_LOGGING_MAX_FILE_SIZE".to_string(),
-        format!("{}", present_log_config.max_single_log_size),
-    );
-    extra_envs.insert(
-        "IGGY_SYSTEM_LOGGING_MAX_TOTAL_SIZE".to_string(),
-        format!("{}", present_log_config.max_total_log_size),
-    );
-    extra_envs.insert(
-        "IGGY_SYSTEM_LOGGING_ROTATION_CHECK_INTERVAL".to_string(),
-        format!("{}", present_log_config.rotation_check_interval),
-    );
-    extra_envs.insert(
-        "IGGY_SYSTEM_LOGGING_RETENTION".to_string(),
-        format!("{}", present_log_config.retention),
-    );
+    let mut harness = TestHarness::builder()
+        .server(build_server_config(&present_log_config))
+        .build()
+        .unwrap();
 
-    let mut test_server = TestServer::new(Some(extra_envs), true, None, IpAddrKind::V4);
-    test_server.start();
+    harness.start().await.unwrap();
 
-    let server_addr = test_server.get_raw_tcp_addr().unwrap();
-    let client_factory = TcpClientFactory {
-        server_addr,
-        ..Default::default()
-    };
+    let log_dir = format!("{}/logs", harness.server().data_path().display());
 
-    let log_dir = format!("{}/logs", test_server.get_local_data_path());
-
-    test_server.assert_running();
-    run(&client_factory, &log_dir, present_log_config).await;
+    run(&harness, &log_dir, present_log_config).await;
 }
 
-async fn run(
-    client_factory: &dyn ClientFactory,
-    log_dir: &str,
-    present_log_config: LogRotationTestConfig,
-) {
+async fn run(harness: &TestHarness, log_dir: &str, present_log_config: LogRotationTestConfig) {
     let done_status = false;
     let present_log_test_title = present_log_config.name.clone();
     let log_path = Path::new(log_dir);
@@ -143,7 +139,7 @@ async fn run(
         "failed::no_such_directory => {log_dir}",
     );
 
-    let client = init_valid_client(client_factory).await;
+    let client = init_valid_client(harness).await;
     assert!(
         client.is_ok(),
         "failed::client_initialize => {:?}",
@@ -170,24 +166,13 @@ async fn run(
     nocapture_observer(log_path, &present_log_test_title, !done_status).await;
 }
 
-async fn init_valid_client(client_factory: &dyn ClientFactory) -> Result<IggyClient, String> {
+async fn init_valid_client(harness: &TestHarness) -> Result<IggyClient, String> {
     let operation_timeout = IggyDuration::new(Duration::from_secs(OPERATION_TIMEOUT_SECS));
-    let client_wrapper = timeout(
-        operation_timeout.get_duration(),
-        client_factory.create_client(),
-    )
-    .await
-    .map_err(|_| "ClientWrapper creation timed out")?;
 
-    timeout(operation_timeout.get_duration(), client_wrapper.connect())
+    let client = timeout(operation_timeout.get_duration(), harness.root_client())
         .await
-        .map_err(|_| "Client connection timed out")?
-        .map_err(|e| format!("Client connection failed: {e:?}"))?;
-
-    let client = IggyClient::create(client_wrapper, None, None);
-    timeout(operation_timeout.get_duration(), login_root(&client))
-        .await
-        .map_err(|e| format!("Root user login timed out: {e:?}"))?;
+        .map_err(|_| "Root client creation timed out")?
+        .map_err(|e| format!("Root client creation failed: {e:?}"))?;
 
     Ok(client)
 }

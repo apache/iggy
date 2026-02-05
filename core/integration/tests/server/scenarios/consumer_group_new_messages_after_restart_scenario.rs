@@ -21,18 +21,20 @@ use crate::server::scenarios::{
 };
 use futures::StreamExt;
 use iggy::prelude::*;
-use integration::test_server::{ClientFactory, login_root};
+use integration::harness::TestHarness;
 use std::str::FromStr;
 use tokio::time::{Duration, sleep, timeout};
 
 const INITIAL_MESSAGES_COUNT: u32 = 10;
 const NEW_MESSAGES_COUNT: u32 = 5;
 
-pub async fn run(client_factory: &dyn ClientFactory) {
-    let client = create_client(client_factory).await;
-    login_root(&client).await;
+pub async fn run(harness: &TestHarness) {
+    let client = harness
+        .root_client()
+        .await
+        .expect("Failed to get root client");
     init_system(&client).await;
-    execute_scenario(client_factory, &client).await;
+    execute_scenario(harness, &client).await;
 }
 
 async fn init_system(client: &IggyClient) {
@@ -61,13 +63,12 @@ async fn init_system(client: &IggyClient) {
         .unwrap();
 }
 
-async fn execute_scenario(client_factory: &dyn ClientFactory, client: &IggyClient) {
+async fn execute_scenario(harness: &TestHarness, client: &IggyClient) {
     // 1. Produce initial messages
     produce_messages(client, 1, INITIAL_MESSAGES_COUNT).await;
 
     // 2. Create a separate client to simulate the runtime
-    let runtime_client = create_client(client_factory).await;
-    login_root(&runtime_client).await;
+    let runtime_client = create_client(harness).await;
 
     // 3. Create consumer and consume all initial messages
     let mut consumer = create_consumer(&runtime_client).await;
@@ -105,8 +106,7 @@ async fn execute_scenario(client_factory: &dyn ClientFactory, client: &IggyClien
     .await;
 
     // 7. Create a new client (simulating runtime restart)
-    let new_runtime_client = create_client(client_factory).await;
-    login_root(&new_runtime_client).await;
+    let new_runtime_client = create_client(harness).await;
 
     // 8. Reconnect consumer and consume new messages
     let mut consumer = create_consumer(&new_runtime_client).await;
@@ -167,27 +167,23 @@ async fn create_consumer(client: &IggyClient) -> IggyConsumer {
 }
 
 async fn consume_messages(consumer: &mut IggyConsumer, expected_count: u32) -> Vec<IggyMessage> {
-    let mut messages = Vec::new();
-    let mut count = 0;
+    let mut messages = Vec::with_capacity(expected_count as usize);
 
-    let result = timeout(Duration::from_secs(30), async {
-        while count < expected_count {
-            if let Some(message_result) = consumer.next().await {
-                match message_result {
-                    Ok(polled_message) => {
-                        messages.push(polled_message.message);
-                        count += 1;
-                    }
-                    Err(error) => panic!("Error while consuming messages: {error}"),
-                }
-            }
+    timeout(Duration::from_secs(30), async {
+        while messages.len() < expected_count as usize {
+            let Some(Ok(polled_message)) = consumer.next().await else {
+                continue;
+            };
+            messages.push(polled_message.message);
         }
     })
-    .await;
-
-    if result.is_err() {
-        panic!("Timeout waiting for messages. Expected {expected_count}, received {count}");
-    }
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "Timeout waiting for messages. Expected {expected_count}, received {}",
+            messages.len()
+        )
+    });
 
     messages
 }

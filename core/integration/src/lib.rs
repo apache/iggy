@@ -17,24 +17,7 @@
  */
 
 pub mod bench_utils;
-pub mod file;
 pub mod harness;
-#[allow(deprecated)]
-pub mod http_client;
-#[allow(deprecated)]
-pub mod quic_client;
-#[allow(deprecated)]
-pub mod tcp_client;
-#[allow(deprecated)]
-pub mod websocket_client;
-
-#[allow(deprecated)]
-pub mod test_connectors_runtime;
-#[allow(deprecated)]
-pub mod test_mcp_server;
-#[allow(deprecated)]
-pub mod test_server;
-pub mod test_tls_utils;
 
 pub use harness_derive::iggy_harness;
 

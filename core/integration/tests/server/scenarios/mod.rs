@@ -49,7 +49,7 @@ pub mod user_scenario;
 pub mod websocket_tls_scenario;
 
 use iggy::prelude::*;
-use integration::test_server::{ClientFactory, delete_user};
+use integration::harness::{TestHarness, delete_user};
 
 const PARTITION_ID: u32 = 0;
 const STREAM_NAME: &str = "test-stream";
@@ -62,9 +62,11 @@ const USERNAME_3: &str = "user3";
 const CONSUMER_KIND: ConsumerKind = ConsumerKind::Consumer;
 const MESSAGES_COUNT: u32 = 1337;
 
-async fn create_client(client_factory: &dyn ClientFactory) -> IggyClient {
-    let client = client_factory.create_client().await;
-    IggyClient::create(client, None, None)
+async fn create_client(harness: &TestHarness) -> IggyClient {
+    harness
+        .new_client()
+        .await
+        .expect("Failed to create new client")
 }
 
 async fn get_consumer_group(client: &IggyClient) -> ConsumerGroupDetails {

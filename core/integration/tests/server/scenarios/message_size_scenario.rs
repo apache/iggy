@@ -18,7 +18,7 @@
 
 use bytes::Bytes;
 use iggy::prelude::*;
-use integration::test_server::{ClientFactory, assert_clean_system, login_root};
+use integration::harness::{TestHarness, assert_clean_system};
 use std::collections::HashMap;
 
 const STREAM_NAME: &str = "test-stream";
@@ -33,11 +33,11 @@ enum MessageToSend {
     OfSizeWithHeaders(usize, usize),
 }
 
-pub async fn run(client_factory: &dyn ClientFactory) {
-    let client = client_factory.create_client().await;
-    let client = IggyClient::create(client, None, None);
-
-    login_root(&client).await;
+pub async fn run(harness: &TestHarness) {
+    let client = harness
+        .root_client()
+        .await
+        .expect("Failed to get root client");
     init_system(&client).await;
 
     // 3. Send message and check the result

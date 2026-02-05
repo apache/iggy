@@ -22,11 +22,11 @@ use configs_derive::ConfigEnv;
 use figment::providers::{Format, Toml};
 use figment::value::Dict;
 use figment::{Figment, Provider};
-use integration::file::get_root_path;
 use serde::{Deserialize, Serialize};
 use serial_test::serial;
 use server::configs::server::ServerConfig;
 use std::env;
+use std::path::PathBuf;
 
 #[serial]
 #[tokio::test]
@@ -678,4 +678,9 @@ fn debug_print_test_root_config_mappings() {
         has_tag,
         "Missing TEST_NESTED_CONFIG_TYPE -> nested.config_type mapping"
     );
+}
+
+fn get_root_path() -> PathBuf {
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set!");
+    PathBuf::from(manifest_dir)
 }

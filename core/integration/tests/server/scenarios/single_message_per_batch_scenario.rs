@@ -18,7 +18,7 @@
 
 use bytes::Bytes;
 use iggy::prelude::*;
-use integration::test_server::{ClientFactory, login_root};
+use integration::harness::TestHarness;
 use std::time::{Duration, Instant};
 
 const STREAM_NAME: &str = "single-msg-batch-stream";
@@ -40,10 +40,11 @@ const POLL_BATCH_SIZE: u32 = 1000;
 /// - Journal management under high message count with small payloads
 /// - Memory allocation patterns for many small messages
 /// - IOV_MAX limits when flushing many small buffers
-pub async fn run(client_factory: &dyn ClientFactory, duration_secs: u64) {
-    let client = client_factory.create_client().await;
-    let producer = IggyClient::create(client, None, None);
-    login_root(&producer).await;
+pub async fn run(harness: &TestHarness, duration_secs: u64) {
+    let producer = harness
+        .root_client()
+        .await
+        .expect("Failed to get root client");
 
     producer.create_stream(STREAM_NAME).await.unwrap();
     producer

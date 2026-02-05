@@ -18,11 +18,9 @@
 
 use bytes::Bytes;
 use iggy::prelude::*;
-use integration::test_server::{assert_clean_system, login_root};
+use integration::harness::assert_clean_system;
 
 pub async fn run(client: &IggyClient) {
-    login_root(client).await;
-
     let stream_name = "test-tls-stream";
     client.create_stream(stream_name).await.unwrap();
 

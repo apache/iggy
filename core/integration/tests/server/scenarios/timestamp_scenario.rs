@@ -19,7 +19,7 @@
 use super::PARTITION_ID;
 use bytes::BytesMut;
 use iggy::prelude::*;
-use integration::test_server::{ClientFactory, login_root};
+use integration::harness::TestHarness;
 use std::collections::HashMap;
 use tokio::time::{Duration, sleep};
 
@@ -52,10 +52,11 @@ fn all_message_sizes() -> Vec<u64> {
     vec![50, 1000, 20000]
 }
 
-pub async fn run(client_factory: &dyn ClientFactory) {
-    let client = client_factory.create_client().await;
-    let client = IggyClient::create(client, None, None);
-    login_root(&client).await;
+pub async fn run(harness: &TestHarness) {
+    let client = harness
+        .root_client()
+        .await
+        .expect("Failed to get root client");
 
     for msg_size in all_message_sizes() {
         for (pattern_name, batch_pattern) in all_batch_patterns() {

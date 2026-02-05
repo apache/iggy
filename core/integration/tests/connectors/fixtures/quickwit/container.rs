@@ -24,11 +24,16 @@ use reqwest_retry::RetryTransientMiddleware;
 use reqwest_retry::policies::ExponentialBackoff;
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::time::Duration;
 use testcontainers_modules::testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use testcontainers_modules::testcontainers::{ContainerAsync, GenericImage, ImageExt};
+use tokio::time::sleep;
 use tracing::info;
 use uuid::Uuid;
+
+const DEFAULT_POLL_ATTEMPTS: usize = 100;
+const DEFAULT_POLL_INTERVAL_MS: u64 = 50;
 
 const QUICKWIT_IMAGE: &str = "quickwit/quickwit";
 const QUICKWIT_TAG: &str = "0.8.2";
@@ -224,6 +229,34 @@ pub trait QuickwitOps: Sync {
                 .map_err(|e| TestBinaryError::InvalidState {
                     message: format!("Failed to parse search response: {e}"),
                 })
+        }
+    }
+
+    fn wait_for_documents(
+        &self,
+        index_id: &str,
+        expected_count: usize,
+    ) -> impl std::future::Future<Output = Result<QuickwitSearchResponse, TestBinaryError>> + Send
+    {
+        async move {
+            let mut last_count = 0;
+            for _ in 0..DEFAULT_POLL_ATTEMPTS {
+                if self.flush_index(index_id).await.is_ok()
+                    && let Ok(search) = self.search_all(index_id).await
+                {
+                    last_count = search.num_hits;
+                    if search.num_hits >= expected_count {
+                        return Ok(search);
+                    }
+                }
+                sleep(Duration::from_millis(DEFAULT_POLL_INTERVAL_MS / 5)).await;
+            }
+            Err(TestBinaryError::InvalidState {
+                message: format!(
+                    "Expected {} documents but got {} after {} poll attempts",
+                    expected_count, last_count, DEFAULT_POLL_ATTEMPTS
+                ),
+            })
         }
     }
 }

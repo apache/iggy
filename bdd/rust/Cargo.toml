@@ -29,7 +29,6 @@ bdd = []
 bytes = { workspace = true }
 cucumber = { workspace = true }
 iggy = { workspace = true }
-integration = { workspace = true }
 tokio = { workspace = true }
 
 # `test` is set to false because cucumber uses its own test harness, which

@@ -20,11 +20,7 @@ use crate::server::scenarios::concurrent_scenario::{
     self, ResourceType, ScenarioType, barrier_off, barrier_on,
 };
 use iggy_common::TransportProtocol;
-use integration::{
-    http_client::HttpClientFactory, quic_client::QuicClientFactory, tcp_client::TcpClientFactory,
-    test_server::TestServer, websocket_client::WebSocketClientFactory,
-};
-use serial_test::parallel;
+use integration::iggy_harness;
 use test_case::test_matrix;
 
 // Test matrix for race condition scenarios
@@ -38,61 +34,24 @@ use test_case::test_matrix;
 
 // TODO: Websocket fails for the `cold` type, cold means that we are creating resources with the same name.
 // It fails with the error assertion, instead of `AlreadyExist`, we get generic `Error`.
+#[iggy_harness(server(
+    quic.max_idle_timeout = "500s",
+    quic.keep_alive_interval = "15s"
+))]
 #[test_matrix(
     [tcp(), http(), quic(), websocket()],
     [user(), stream(), topic(), partition(), consumer_group()],
     [hot(), cold()],
     [barrier_on(), barrier_off()]
 )]
-#[tokio::test]
-#[parallel]
 async fn matrix(
+    harness: &TestHarness,
     transport: TransportProtocol,
     resource_type: ResourceType,
     path_type: ScenarioType,
     use_barrier: bool,
 ) {
-    // TODO: Need to do this, in order to avoid timeouts from QUIC connections during tests.
-    let mut extra_envs = std::collections::HashMap::new();
-    extra_envs.insert("IGGY_QUIC_MAX_IDLE_TIMEOUT".to_string(), "500s".to_string());
-    extra_envs.insert(
-        "IGGY_QUIC_KEEP_ALIVE_INTERVAL".to_string(),
-        "15s".to_string(),
-    );
-    let mut test_server = TestServer::new(
-        Some(extra_envs),
-        true,
-        None,
-        integration::test_server::IpAddrKind::V4,
-    );
-    test_server.start();
-
-    let client_factory: Box<dyn integration::test_server::ClientFactory> = match transport {
-        TransportProtocol::Tcp => {
-            let server_addr = test_server.get_raw_tcp_addr().unwrap();
-            Box::new(TcpClientFactory {
-                server_addr,
-                ..Default::default()
-            })
-        }
-        TransportProtocol::Quic => {
-            let server_addr = test_server.get_quic_udp_addr().unwrap();
-            Box::new(QuicClientFactory { server_addr })
-        }
-        TransportProtocol::Http => {
-            let server_addr = test_server.get_http_api_addr().unwrap();
-            Box::new(HttpClientFactory { server_addr })
-        }
-        TransportProtocol::WebSocket => {
-            let server_addr = test_server.get_websocket_addr().unwrap();
-            Box::new(WebSocketClientFactory {
-                server_addr,
-                ..Default::default()
-            })
-        }
-    };
-
-    concurrent_scenario::run(&*client_factory, resource_type, path_type, use_barrier).await;
+    concurrent_scenario::run(harness, transport, resource_type, path_type, use_barrier).await;
 }
 
 fn tcp() -> TransportProtocol {

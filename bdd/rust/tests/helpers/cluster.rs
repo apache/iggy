@@ -16,11 +16,9 @@
  * under the License.
  */
 
-use iggy::clients::client::IggyClient;
 use iggy::prelude::*;
-use integration::tcp_client::TcpClientFactory;
-use integration::test_server::ClientFactory;
 use std::env;
+use std::sync::Arc;
 
 /// Resolves server address based on role and port, checking environment variables first
 pub fn resolve_server_address(role: &str, port: u16) -> String {
@@ -39,16 +37,17 @@ pub fn resolve_server_address(role: &str, port: u16) -> String {
 
 /// Creates and connects a client to the specified address
 pub async fn create_and_connect_client(addr: &str) -> IggyClient {
-    let client_factory = TcpClientFactory {
-        server_addr: addr.to_string(),
-        ..Default::default()
+    let config = TcpClientConfig {
+        server_address: addr.to_string(),
+        ..TcpClientConfig::default()
     };
 
-    let client = client_factory.create_client().await;
-    let client = IggyClient::create(client, None, None);
+    let client = TcpClient::create(Arc::new(config)).expect("Failed to create TCP client");
+    Client::connect(&client)
+        .await
+        .expect("Client should connect");
 
-    client.connect().await.expect("Client should connect");
-    client
+    IggyClient::create(ClientWrapper::Tcp(client), None, None)
 }
 
 /// Verifies that a client is connected to the expected port
