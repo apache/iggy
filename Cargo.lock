@@ -5011,6 +5011,7 @@ dependencies = [
  "socket2 0.6.2",
  "sqlx",
  "strum",
+ "sysinfo 0.38.0",
  "tempfile",
  "test-case",
  "testcontainers-modules",

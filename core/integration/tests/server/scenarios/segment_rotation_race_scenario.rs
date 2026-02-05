@@ -33,6 +33,7 @@ use integration::test_server::{ClientFactory, login_root};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
+use sysinfo::{Pid, ProcessesToUpdate, System};
 use tokio::task::JoinSet;
 
 const STREAM_NAME: &str = "race-test-stream";
@@ -41,6 +42,7 @@ const PRODUCERS_PER_PROTOCOL: usize = 2;
 const PARTITION_ID: u32 = 0;
 const TEST_DURATION_SECS: u64 = 10;
 const MESSAGES_PER_BATCH: usize = 5;
+const MAX_ALLOWED_MEMORY_BYTES: u64 = 200 * 1024 * 1024;
 
 /// Runs the segment rotation race condition test with multiple protocols.
 /// Each client factory represents a different protocol (TCP, HTTP, QUIC, WebSocket).
@@ -53,6 +55,9 @@ pub async fn run(client_factories: &[&dyn ClientFactory]) {
 
     let admin_client = create_client(client_factories[0]).await;
     login_root(&admin_client).await;
+
+    let stats = admin_client.get_stats().await.unwrap();
+    let server_pid = stats.process_id;
 
     let total_producers = client_factories.len() * PRODUCERS_PER_PROTOCOL;
     init_system(&admin_client, total_producers).await;
@@ -110,6 +115,18 @@ pub async fn run(client_factories: &[&dyn ClientFactory]) {
 
     let sent = total_messages.load(Ordering::SeqCst);
     println!("Test completed successfully. Total messages sent: {}", sent);
+
+    let final_memory = get_process_memory(server_pid);
+    println!(
+        "Final server memory: {:.2} MB",
+        final_memory as f64 / 1024.0 / 1024.0
+    );
+    assert!(
+        final_memory < MAX_ALLOWED_MEMORY_BYTES,
+        "Memory leak detected! Server using {:.2} MB, max allowed is {:.2} MB",
+        final_memory as f64 / 1024.0 / 1024.0,
+        MAX_ALLOWED_MEMORY_BYTES as f64 / 1024.0 / 1024.0
+    );
 
     cleanup(&admin_client).await;
 }
@@ -193,4 +210,12 @@ async fn cleanup(client: &IggyClient) {
         .delete_stream(&Identifier::named(STREAM_NAME).unwrap())
         .await
         .unwrap();
+}
+
+fn get_process_memory(pid: u32) -> u64 {
+    let mut sys = System::new();
+    sys.refresh_processes(ProcessesToUpdate::Some(&[Pid::from_u32(pid)]), true);
+    sys.process(Pid::from_u32(pid))
+        .map(|p| p.memory())
+        .unwrap_or(0)
 }
