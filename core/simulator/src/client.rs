@@ -48,7 +48,7 @@ impl SimClient {
         let create_stream = CreateStream {
             name: name.to_string(),
         };
-        let payload = bytes::Bytes::from(create_stream.to_bytes());
+        let payload = create_stream.to_bytes();
 
         self.build_request(Operation::CreateStream, payload)
     }
@@ -57,7 +57,7 @@ impl SimClient {
         let delete_stream = DeleteStream {
             stream_id: Identifier::named(name).unwrap(),
         };
-        let payload = bytes::Bytes::from(delete_stream.to_bytes());
+        let payload = delete_stream.to_bytes();
 
         self.build_request(Operation::DeleteStream, payload)
     }
@@ -93,8 +93,8 @@ impl SimClient {
         buffer.extend_from_slice(header_bytes);
         buffer.extend_from_slice(&payload);
 
-        let message = Message::<RequestHeader>::from_bytes(Bytes::from(buffer))
-            .expect("failed to build request message");
-        message
+        
+        Message::<RequestHeader>::from_bytes(Bytes::from(buffer))
+            .expect("failed to build request message")
     }
 }
