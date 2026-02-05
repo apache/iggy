@@ -99,9 +99,10 @@ impl Simulator {
             }
 
             if let Some(replica_id) = envelope.to_replica
-                && let Some(replica) = self.replicas.get(replica_id as usize) {
-                    self.dispatch_to_replica(replica, envelope.message).await;
-                }
+                && let Some(replica) = self.replicas.get(replica_id as usize)
+            {
+                self.dispatch_to_replica(replica, envelope.message).await;
+            }
         }
 
         None
