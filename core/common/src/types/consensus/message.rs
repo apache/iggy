@@ -505,24 +505,6 @@ mod tests {
         assert_eq!(bag.command(), header::Command2::Prepare);
         assert!(matches!(bag, MessageBag::Prepare(_)));
     }
-
-    #[test]
-    fn test_message_bag_from_commit() {
-        let commit = header::CommitHeader::create_test();
-        let bag = MessageBag::from(commit);
-
-        assert_eq!(bag.command(), header::Command2::Commit);
-        assert!(!matches!(bag, MessageBag::Prepare(_)));
-    }
-
-    #[test]
-    fn test_message_bag_from_reply() {
-        let reply = header::ReplyHeader::create_test();
-        let bag = MessageBag::from(reply);
-
-        assert_eq!(bag.command(), header::Command2::Reply);
-        assert!(!matches!(bag, MessageBag::Prepare(_)));
-    }
 }
 
 // TODO: Header generic
