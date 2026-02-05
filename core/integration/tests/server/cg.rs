@@ -17,7 +17,8 @@
 
 use crate::server::{
     ScenarioFn, auto_commit_reconnection_scenario, join_scenario, multiple_clients_scenario,
-    offset_cleanup_scenario, run_scenario, single_client_scenario,
+    new_messages_after_restart_scenario, offset_cleanup_scenario, run_scenario,
+    single_client_scenario,
 };
 use iggy_common::TransportProtocol;
 use serial_test::parallel;
@@ -40,6 +41,7 @@ fn websocket() -> TransportProtocol {
         single_client_scenario(),
         multiple_clients_scenario(),
         auto_commit_reconnection_scenario(),
+        new_messages_after_restart_scenario(),
         offset_cleanup_scenario(),
     ]
 )]

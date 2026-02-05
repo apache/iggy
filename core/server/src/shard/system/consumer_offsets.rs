@@ -69,16 +69,28 @@ impl IggyShard {
     ) -> Result<Option<ConsumerOffsetInfo>, IggyError> {
         let (stream, topic) = self.resolve_topic_id(stream_id, topic_id)?;
 
-        let Some((polling_consumer, partition_id)) = self.resolve_consumer_with_partition_id(
-            stream_id,
-            topic_id,
-            &consumer,
-            client_id,
-            partition_id,
-            false,
-        )?
-        else {
-            return Err(IggyError::NotResolvedConsumer(consumer.id));
+        let (polling_consumer, partition_id) = match consumer.kind {
+            ConsumerKind::Consumer => {
+                let Some((polling_consumer, partition_id)) = self
+                    .resolve_consumer_with_partition_id(
+                        stream_id,
+                        topic_id,
+                        &consumer,
+                        client_id,
+                        partition_id,
+                        false,
+                    )?
+                else {
+                    return Err(IggyError::NotResolvedConsumer(consumer.id.clone()));
+                };
+                (polling_consumer, partition_id)
+            }
+            ConsumerKind::ConsumerGroup => {
+                let (_, _, cg_id) =
+                    self.resolve_consumer_group_id(stream_id, topic_id, &consumer.id)?;
+                let partition_id = partition_id.unwrap_or(0) as usize;
+                (PollingConsumer::consumer_group(cg_id, 0), partition_id)
+            }
         };
         self.ensure_partition_exists(stream_id, topic_id, partition_id)?;
 
