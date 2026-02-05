@@ -181,6 +181,7 @@ where
             consensus.advance_commit_number(header.op);
 
             // Extract the prepare message from the pipeline by op
+            // TODO: Commit from the head. ALWAYS
             let entry = consensus.pipeline().borrow_mut().extract_by_op(header.op);
             let Some(entry) = entry else {
                 warn!("on_ack: prepare not found in pipeline for op={}", header.op);
