@@ -107,6 +107,7 @@ jobs:
             metadata
             message_bus
             storage
+            simulator
             configs
 
   license-headers:
