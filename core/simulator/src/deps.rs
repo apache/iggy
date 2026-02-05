@@ -94,10 +94,7 @@ impl<S: Storage<Buffer = Vec<u8>>> Journal<S> for SimJournal<S> {
         let header = headers.get(&header.op)?;
         let offset = *offsets.get(&header.op)?;
 
-        let mut buffer = Vec::with_capacity(header.size as usize);
-        unsafe {
-            buffer.set_len(header.size as usize);
-        }
+        let buffer = vec![0; header.size as usize];
         let buffer = self.storage.read(offset, buffer).await;
         let message =
             Message::from_bytes(Bytes::from(buffer)).expect("simulator: bytes should be valid");
