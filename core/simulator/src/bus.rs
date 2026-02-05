@@ -1,7 +1,8 @@
-use iggy_common::{header::GenericHeader, message::Message, IggyError};
+use iggy_common::{IggyError, header::GenericHeader, message::Message};
 use message_bus::MessageBus;
-use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
+use std::ops::Deref;
+use std::sync::{Arc, Mutex};
 
 /// Message envelope for tracking sender/recipient
 #[derive(Debug, Clone)]
@@ -12,41 +13,29 @@ pub struct Envelope {
     pub message: Message<GenericHeader>,
 }
 
-/// In-memory message bus implementing the MessageBus trait
+// TODO: Proper bus with an `Network` component which would simulate sending packets.
+// Tigerbeetle handles this by having an list of "buses", and calling callbacks for clients when an response is send.
+// This requires self-referntial structs (as message_bus has to store collection of other buses), which is overcomplilcated.
+// I think the way we could handle that is by having an dedicated collection for client responses (clients_table).
 #[derive(Debug, Default)]
 pub struct MemBus {
-    clients: RefCell<HashMap<u128, ()>>,
-    replicas: RefCell<HashMap<u8, ()>>,
-    pending_messages: RefCell<VecDeque<Envelope>>,
+    clients: Mutex<HashMap<u128, ()>>,
+    replicas: Mutex<HashMap<u8, ()>>,
+    pending_messages: Mutex<VecDeque<Envelope>>,
 }
 
 impl MemBus {
     pub fn new() -> Self {
         Self {
-            clients: RefCell::new(HashMap::new()),
-            replicas: RefCell::new(HashMap::new()),
-            pending_messages: RefCell::new(VecDeque::new()),
+            clients: Mutex::new(HashMap::new()),
+            replicas: Mutex::new(HashMap::new()),
+            pending_messages: Mutex::new(VecDeque::new()),
         }
     }
 
     /// Get the next pending message from the bus
     pub fn receive(&self) -> Option<Envelope> {
-        self.pending_messages.borrow_mut().pop_front()
-    }
-
-    /// Get all pending messages from the bus
-    pub fn receive_all(&self) -> Vec<Envelope> {
-        self.pending_messages.borrow_mut().drain(..).collect()
-    }
-
-    /// Check if there are pending messages
-    pub fn has_pending(&self) -> bool {
-        !self.pending_messages.borrow().is_empty()
-    }
-
-    /// Get the count of pending messages
-    pub fn pending_count(&self) -> usize {
-        self.pending_messages.borrow().len()
+        self.pending_messages.lock().unwrap().pop_front()
     }
 }
 
@@ -57,27 +46,27 @@ impl MessageBus for MemBus {
     type Sender = ();
 
     fn add_client(&mut self, client: Self::Client, _sender: Self::Sender) -> bool {
-        if self.clients.borrow().contains_key(&client) {
+        if self.clients.lock().unwrap().contains_key(&client) {
             return false;
         }
-        self.clients.borrow_mut().insert(client, ());
+        self.clients.lock().unwrap().insert(client, ());
         true
     }
 
     fn remove_client(&mut self, client: Self::Client) -> bool {
-        self.clients.borrow_mut().remove(&client).is_some()
+        self.clients.lock().unwrap().remove(&client).is_some()
     }
 
     fn add_replica(&mut self, replica: Self::Replica) -> bool {
-        if self.replicas.borrow().contains_key(&replica) {
+        if self.replicas.lock().unwrap().contains_key(&replica) {
             return false;
         }
-        self.replicas.borrow_mut().insert(replica, ());
+        self.replicas.lock().unwrap().insert(replica, ());
         true
     }
 
     fn remove_replica(&mut self, replica: Self::Replica) -> bool {
-        self.replicas.borrow_mut().remove(&replica).is_some()
+        self.replicas.lock().unwrap().remove(&replica).is_some()
     }
 
     async fn send_to_client(
@@ -85,11 +74,11 @@ impl MessageBus for MemBus {
         client_id: Self::Client,
         message: Self::Data,
     ) -> Result<(), IggyError> {
-        if !self.clients.borrow().contains_key(&client_id) {
+        if !self.clients.lock().unwrap().contains_key(&client_id) {
             return Err(IggyError::ClientNotFound(client_id as u32));
         }
 
-        self.pending_messages.borrow_mut().push_back(Envelope {
+        self.pending_messages.lock().unwrap().push_back(Envelope {
             from_replica: None,
             to_replica: None,
             to_client: Some(client_id),
@@ -104,11 +93,11 @@ impl MessageBus for MemBus {
         replica: Self::Replica,
         message: Self::Data,
     ) -> Result<(), IggyError> {
-        if !self.replicas.borrow().contains_key(&replica) {
+        if !self.replicas.lock().unwrap().contains_key(&replica) {
             return Err(IggyError::ResourceNotFound(format!("Replica {}", replica)));
         }
 
-        self.pending_messages.borrow_mut().push_back(Envelope {
+        self.pending_messages.lock().unwrap().push_back(Envelope {
             from_replica: None,
             to_replica: Some(replica),
             to_client: None,
@@ -116,5 +105,65 @@ impl MessageBus for MemBus {
         });
 
         Ok(())
+    }
+}
+
+/// Newtype wrapper for shared MemBus that implements MessageBus
+#[derive(Debug, Clone)]
+pub struct SharedMemBus(pub Arc<MemBus>);
+
+impl Deref for SharedMemBus {
+    type Target = MemBus;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl MessageBus for SharedMemBus {
+    type Client = u128;
+    type Replica = u8;
+    type Data = Message<GenericHeader>;
+    type Sender = ();
+
+    fn add_client(&mut self, client: Self::Client, sender: Self::Sender) -> bool {
+        self.0
+            .clients
+            .lock()
+            .unwrap()
+            .insert(client, sender)
+            .is_none()
+    }
+
+    fn remove_client(&mut self, client: Self::Client) -> bool {
+        self.0.clients.lock().unwrap().remove(&client).is_some()
+    }
+
+    fn add_replica(&mut self, replica: Self::Replica) -> bool {
+        self.0
+            .replicas
+            .lock()
+            .unwrap()
+            .insert(replica, ())
+            .is_none()
+    }
+
+    fn remove_replica(&mut self, replica: Self::Replica) -> bool {
+        self.0.replicas.lock().unwrap().remove(&replica).is_some()
+    }
+
+    async fn send_to_client(
+        &self,
+        client_id: Self::Client,
+        message: Self::Data,
+    ) -> Result<(), IggyError> {
+        self.0.send_to_client(client_id, message).await
+    }
+
+    async fn send_to_replica(
+        &self,
+        replica: Self::Replica,
+        message: Self::Data,
+    ) -> Result<(), IggyError> {
+        self.0.send_to_replica(replica, message).await
     }
 }

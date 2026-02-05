@@ -1,3 +1,21 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use crate::bus::SharedMemBus;
 use bytes::Bytes;
 use consensus::VsrConsensus;
 use iggy_common::header::PrepareHeader;
@@ -6,7 +24,7 @@ use journal::{Journal, JournalHandle, Storage};
 use metadata::stm::consumer_group::ConsumerGroups;
 use metadata::stm::stream::Streams;
 use metadata::stm::user::Users;
-use metadata::{variadic, IggyMetadata, MuxStateMachine};
+use metadata::{IggyMetadata, MuxStateMachine, variadic};
 use std::cell::{Cell, RefCell, UnsafeCell};
 use std::collections::HashMap;
 
@@ -37,8 +55,8 @@ impl Storage for MemStorage {
     }
 }
 
+// TODO: Replace with actual Journal, the only thing that we will need to change is the `Storage` impl for an in-memory one.
 /// Generic in-memory journal implementation for testing/simulation
-/// Following TigerBeetle's approach: headers in memory, full messages in storage
 pub struct SimJournal<S: Storage> {
     storage: S,
     headers: UnsafeCell<HashMap<u64, PrepareHeader>>,
@@ -124,15 +142,17 @@ impl JournalHandle for SimJournal<MemStorage> {
     }
 }
 
-/// Placeholder snapshot implementation
 #[derive(Debug, Default)]
 pub struct SimSnapshot {}
 
 /// Type aliases for simulator metadata
 pub type SimMuxStateMachine = MuxStateMachine<variadic!(Users, Streams, ConsumerGroups)>;
-pub type SimMetadata =
-    IggyMetadata<VsrConsensus, SimJournal<MemStorage>, SimSnapshot, SimMuxStateMachine>;
+pub type SimMetadata = IggyMetadata<
+    VsrConsensus<SharedMemBus>,
+    SimJournal<MemStorage>,
+    SimSnapshot,
+    SimMuxStateMachine,
+>;
 
-/// Placeholder for replica partitions
 #[derive(Debug, Default)]
 pub struct ReplicaPartitions {}

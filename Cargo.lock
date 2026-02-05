@@ -5666,6 +5666,7 @@ version = "0.1.0"
 dependencies = [
  "ahash 0.8.12",
  "consensus",
+ "futures",
  "iggy_common",
  "journal",
  "left-right",
@@ -8453,8 +8454,10 @@ dependencies = [
 name = "simulator"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "bytes",
  "consensus",
+ "futures",
  "iggy_common",
  "journal",
  "message_bus",

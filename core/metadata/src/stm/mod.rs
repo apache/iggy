@@ -62,11 +62,12 @@ where
 }
 
 /// Parses type-erased input into a command. Macro-generated.
+/// Returns `Ok(cmd)` if applicable, `Err(input)` to pass ownership back.
 pub trait Command {
     type Cmd;
     type Input;
 
-    fn parse(input: &Self::Input) -> Option<Self::Cmd>;
+    fn parse(input: Self::Input) -> Result<Self::Cmd, Self::Input>;
 }
 
 /// Handles commands. User-implemented business logic.
@@ -110,17 +111,18 @@ where
 }
 
 /// Public interface for state machines.
+/// Returns `Ok(output)` if applicable, `Err(input)` to pass ownership back.
 pub trait State {
     type Output;
     type Input;
 
-    fn apply(&self, input: &Self::Input) -> Option<Self::Output>;
+    fn apply(&self, input: Self::Input) -> Result<Self::Output, Self::Input>;
 }
 
 pub trait StateMachine {
     type Input;
     type Output;
-    fn update(&self, input: &Self::Input, output: &mut Vec<Self::Output>);
+    fn update(&self, input: Self::Input) -> Self::Output;
 }
 
 /// Generates a state machine with convention-based storage.
@@ -212,32 +214,31 @@ macro_rules! define_state {
                 type Input = <[<$state Inner>] as $crate::stm::Command>::Input;
                 type Output = ();
 
-                fn apply(&self, input: &Self::Input) -> Option<Self::Output> {
-                    <[<$state Inner>] as $crate::stm::Command>::parse(input)
-                        .map(|cmd| self.inner.do_apply(cmd))
+                fn apply(&self, input: Self::Input) -> Result<Self::Output, Self::Input> {
+                    let cmd = <[<$state Inner>] as $crate::stm::Command>::parse(input)?;
+                    self.inner.do_apply(cmd);
+                    Ok(())
                 }
             }
 
-            // TODO: This can be monomorphized by const generics, instead of creating an runtime enum
-            // We can use const generics and specialize each of those methods.
             impl $crate::stm::Command for [<$state Inner>] {
                 type Cmd = [<$state Command>];
                 type Input = ::iggy_common::message::Message<::iggy_common::header::PrepareHeader>;
 
-                fn parse(input: &Self::Input) -> Option<Self::Cmd> {
+                fn parse(input: Self::Input) -> Result<Self::Cmd, Self::Input> {
                     use ::iggy_common::BytesSerializable;
                     use ::iggy_common::header::Operation;
 
-                    let body = input.body_bytes();
                     match input.header().operation {
                         $(
                             Operation::$operation => {
-                                Some([<$state Command>]::$operation(
+                                let body = input.body_bytes();
+                                Ok([<$state Command>]::$operation(
                                     $operation::from_bytes(body).unwrap()
                                 ))
                             },
                         )*
-                        _ => None,
+                        _ => Err(input),
                     }
                 }
             }
