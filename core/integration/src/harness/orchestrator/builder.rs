@@ -19,8 +19,9 @@
 
 use super::harness::TestHarness;
 use crate::harness::config::{
-    ClientConfig, ConnectorsRuntimeConfig, IpAddrKind, McpConfig, TestServerConfig,
+    ClientConfig, ConnectorsRuntimeConfig, IpAddrKind, JwksConfig, McpConfig, TestServerConfig,
 };
+
 use crate::harness::context::TestContext;
 use crate::harness::error::TestBinaryError;
 use crate::harness::handle::ServerHandle;
@@ -36,6 +37,7 @@ pub struct TestHarnessBuilder {
     server_config: Option<TestServerConfig>,
     mcp_config: Option<McpConfig>,
     connectors_runtime_config: Option<ConnectorsRuntimeConfig>,
+    jwks_config: Option<JwksConfig>,
     primary_transport: Option<iggy_common::TransportProtocol>,
     primary_client_config: Option<ClientConfig>,
     clients: Vec<ClientConfig>,
@@ -49,6 +51,7 @@ impl Default for TestHarnessBuilder {
             test_name: None,
             server_config: None,
             mcp_config: None,
+            jwks_config: None,
             connectors_runtime_config: None,
             primary_transport: None,
             primary_client_config: None,
@@ -99,6 +102,12 @@ impl TestHarnessBuilder {
     /// Configure the connectors runtime with default settings.
     pub fn default_connectors_runtime(mut self) -> Self {
         self.connectors_runtime_config = Some(ConnectorsRuntimeConfig::default());
+        self
+    }
+
+    /// Configure the JWKS server.
+    pub fn jwks(mut self, config: JwksConfig) -> Self {
+        self.jwks_config = Some(config);
         self
     }
 
@@ -225,6 +234,8 @@ impl TestHarnessBuilder {
             client_configs: self.clients,
             primary_transport,
             primary_client_config: self.primary_client_config,
+            jwks_config: self.jwks_config,
+            jwks_server: None,
             started: false,
         })
     }

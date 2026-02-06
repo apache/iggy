@@ -37,12 +37,6 @@ disable-mimalloc = []
 mimalloc = ["dep:mimalloc"]
 iggy-web = ["dep:rust-embed", "dep:mime_guess"]
 
-[target.'cfg(not(target_env = "musl"))'.dependencies]
-hwlocality = { workspace = true }
-
-[target.'cfg(target_env = "musl")'.dependencies]
-hwlocality = { workspace = true, features = ["vendored"] }
-
 [dependencies]
 ahash = { workspace = true }
 anyhow = { workspace = true }
@@ -112,6 +106,12 @@ tungstenite = { workspace = true }
 ulid = "1.2.1"
 ureq = { workspace = true }
 uuid = { workspace = true }
+
+[target.'cfg(not(target_env = "musl"))'.dependencies]
+hwlocality = { workspace = true }
+
+[target.'cfg(target_env = "musl")'.dependencies]
+hwlocality = { workspace = true, features = ["vendored"] }
 
 [build-dependencies]
 vergen-git2 = { workspace = true }
