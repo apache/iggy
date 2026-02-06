@@ -49,7 +49,7 @@ on:
         required: false
         default: ""
       publish_other:
-        description: "Other SDKs to publish (comma-separated: python, node, java, csharp, go:VERSION)"
+        description: "Other SDKs to publish (comma-separated: python, node, java, csharp, go)"
         type: string
         required: false
         default: ""
@@ -213,7 +213,6 @@ jobs:
       docker_matrix: ${{ steps.mk.outputs.docker_matrix }}
       docker_components: ${{ steps.mk.outputs.docker_components }}
       count: ${{ steps.mk.outputs.count }}
-      go_sdk_version: ${{ steps.mk.outputs.go_sdk_version }}
       has_python: ${{ steps.mk.outputs.has_python }}
       has_rust_crates: ${{ steps.mk.outputs.has_rust_crates }}
       has_docker: ${{ steps.mk.outputs.has_docker }}
@@ -263,7 +262,6 @@ jobs:
             const cfg = JSON.parse(Buffer.from(componentsB64, 'base64').toString('utf-8') || "{}");
 
             const wants = [];
-            let goVersion = '';
 
             // Parse Rust crates
             ('${{ inputs.publish_crates }}').split(',').map(s => s.trim()).filter(Boolean).forEach(crate => {
@@ -279,14 +277,7 @@ jobs:
 
             // Parse other SDKs
             ('${{ inputs.publish_other }}').split(',').map(s => s.trim()).filter(Boolean).forEach(sdk => {
-              if (sdk.startsWith('go:')) {
-                goVersion = sdk.substring(3);
-                if (!/^\d+\.\d+\.\d+/.test(goVersion)) {
-                  core.setFailed(`Invalid Go version format: ${goVersion} (expected: X.Y.Z)`);
-                } else {
-                  wants.push('sdk-go');
-                }
-              } else if (['python','node','java','csharp'].includes(sdk)) {
+              if (['python','node','java','csharp','go'].includes(sdk)) {
                 wants.push(`sdk-${sdk}`);
               } else {
                 core.warning(`Unknown SDK: ${sdk}`);
@@ -376,7 +367,6 @@ jobs:
             core.setOutput('has_docker', String(dockerTargets.length > 0));
 
             core.setOutput('count', String(targets.length));
-            core.setOutput('go_sdk_version', goVersion);
             core.setOutput('has_rust_crates', String(hasRustCrates));
 
             // Check if Python SDK is in targets and extract version
@@ -446,7 +436,6 @@ jobs:
           fi
 
           TARGETS_JSON='${{ needs.plan.outputs.targets }}'
-          GO_SDK_VERSION='${{ needs.plan.outputs.go_sdk_version }}'
 
           EXISTING_TAGS=()
           NEW_TAGS=()
@@ -467,17 +456,11 @@ jobs:
               continue
             fi
 
-            # Extract version
-            GO_FLAG=""
-            if [ "$KEY" = "sdk-go" ] && [ -n "$GO_SDK_VERSION" ]; then
-              GO_FLAG="--go-sdk-version $GO_SDK_VERSION"
-            fi
-
             # Make script executable if needed
             chmod +x scripts/extract-version.sh || true
 
-            VERSION=$(scripts/extract-version.sh "$KEY" $GO_FLAG 2>/dev/null || echo "ERROR")
-            TAG=$(scripts/extract-version.sh "$KEY" $GO_FLAG --tag 2>/dev/null || echo "ERROR")
+            VERSION=$(scripts/extract-version.sh "$KEY" 2>/dev/null || echo "ERROR")
+            TAG=$(scripts/extract-version.sh "$KEY" --tag 2>/dev/null || echo "ERROR")
 
             if [ "$VERSION" = "ERROR" ] || [ "$TAG" = "ERROR" ]; then
               echo "❌ Failed to extract version/tag for $NAME"
@@ -881,14 +864,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          GO_FLAG=""
-          if [ "${{ matrix.key }}" = "sdk-go" ] && [ -n "${{ needs.plan.outputs.go_sdk_version }}" ]; then
-            GO_FLAG="--go-sdk-version ${{ needs.plan.outputs.go_sdk_version }}"
-          fi
-          VERSION=$(scripts/extract-version.sh "${{ matrix.key }}" $GO_FLAG)
+          VERSION=$(scripts/extract-version.sh "${{ matrix.key }}")
           # If a tag pattern exists for this component, ask the script for a tag as well
           if [ -n "${{ matrix.tag_pattern }}" ] && [ "${{ matrix.tag_pattern }}" != "null" ]; then
-            TAG=$(scripts/extract-version.sh "${{ matrix.key }}" $GO_FLAG --tag)
+            TAG=$(scripts/extract-version.sh "${{ matrix.key }}" --tag)
           else
             TAG=""
           fi
@@ -1016,7 +995,6 @@ jobs:
         run: |
           set -euo pipefail
           TARGETS_JSON='${{ needs.plan.outputs.targets }}'
-          GO_SDK_VERSION='${{ needs.plan.outputs.go_sdk_version }}'
           CREATE_EDGE_DOCKER_TAG="${{ inputs.create_edge_docker_tag }}"
 
           echo "$TARGETS_JSON" | jq -r '.include[] | select(.key!="noop") | @base64' | while read -r row; do
@@ -1032,13 +1010,8 @@ jobs:
               continue
             fi
 
-            GO_FLAG=""
-            if [ "$KEY" = "sdk-go" ] && [ -n "$GO_SDK_VERSION" ]; then
-              GO_FLAG="--go-sdk-version $GO_SDK_VERSION"
-            fi
-
-            VERSION=$(scripts/extract-version.sh "$KEY" $GO_FLAG)
-            TAG=$(scripts/extract-version.sh "$KEY" $GO_FLAG --tag)
+            VERSION=$(scripts/extract-version.sh "$KEY")
+            TAG=$(scripts/extract-version.sh "$KEY" --tag)
 
             # In auto-publish mode (create_edge_docker_tag=true), skip Docker components
             # with stable versions - only pre-release versions should get versioned tags.
@@ -1134,7 +1107,6 @@ jobs:
 
             # Parse the targets from plan job
             TARGETS_JSON='${{ needs.plan.outputs.targets }}'
-            GO_SDK_VERSION='${{ needs.plan.outputs.go_sdk_version }}'
 
             echo "$TARGETS_JSON" | jq -r '.include[] | select(.key!="noop") | @base64' | while read -r row; do
               _jq() { echo "$row" | base64 -d | jq -r "$1"; }
@@ -1144,18 +1116,12 @@ jobs:
               REGISTRY=$(_jq '.registry')
               TAG_PATTERN=$(_jq '.tag_pattern')
 
-              # Extract version using the script
-              GO_FLAG=""
-              if [ "$KEY" = "sdk-go" ] && [ -n "$GO_SDK_VERSION" ]; then
-                GO_FLAG="--go-sdk-version $GO_SDK_VERSION"
-              fi
-
-              VERSION=$(scripts/extract-version.sh "$KEY" $GO_FLAG 2>/dev/null || echo "N/A")
+              VERSION=$(scripts/extract-version.sh "$KEY" 2>/dev/null || echo "N/A")
 
               # Get tag if pattern exists
               TAG=""
               if [ -n "$TAG_PATTERN" ] && [ "$TAG_PATTERN" != "null" ]; then
-                TAG=$(scripts/extract-version.sh "$KEY" $GO_FLAG --tag 2>/dev/null || echo "N/A")
+                TAG=$(scripts/extract-version.sh "$KEY" --tag 2>/dev/null || echo "N/A")
               else
                 TAG="N/A"
               fi

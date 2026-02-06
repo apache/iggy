@@ -121,3 +121,5 @@ components:
   sdk-go:
     tag_pattern: "^foreign/go/v([0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?)$"
     registry: none
+    version_file: "foreign/go/contracts/version.go"
+    version_regex: 'const\s+Version\s*=\s*"([^"]+)"'

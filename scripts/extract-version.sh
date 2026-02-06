@@ -23,7 +23,7 @@
 # versions from Cargo.toml, package.json, pyproject.toml, and other formats.
 #
 # Usage:
-#   ./extract-version.sh <component> [--tag] [--go-sdk-version <version>]
+#   ./extract-version.sh <component> [--tag]
 #
 # Examples:
 #   # Get version for Rust SDK
@@ -38,8 +38,8 @@
 #   # Get tag for Node SDK
 #   ./extract-version.sh sdk-node --tag              # Output: node-sdk-0.5.0
 #
-#   # Get version for Go SDK (requires explicit version)
-#   ./extract-version.sh sdk-go --go-sdk-version 1.2.3  # Output: 1.2.3
+#   # Get version for Go SDK
+#   ./extract-version.sh sdk-go                      # Output: 0.6.1-edge.1
 #
 # The script uses the configuration from .github/config/publish.yml to determine:
 #   - Where to find the version file (version_file)
@@ -62,7 +62,6 @@ CONFIG_FILE="$REPO_ROOT/.github/config/publish.yml"
 # Parse arguments
 COMPONENT="${1:-}"
 RETURN_TAG=false
-GO_SDK_VERSION=""
 
 shift || true
 while [[ $# -gt 0 ]]; do
@@ -70,10 +69,6 @@ while [[ $# -gt 0 ]]; do
         --tag)
             RETURN_TAG=true
             shift
-            ;;
-        --go-sdk-version)
-            GO_SDK_VERSION="${2:-}"
-            shift 2 || shift
             ;;
         *)
             echo "Unknown option: $1" >&2
@@ -83,7 +78,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$COMPONENT" ]]; then
-    echo "Usage: $0 <component> [--tag] [--go-sdk-version <version>]" >&2
+    echo "Usage: $0 <component> [--tag]" >&2
     echo "" >&2
     echo "Available components:" >&2
     yq eval '.components | keys | .[]' "$CONFIG_FILE" | sed 's/^/  - /' >&2
@@ -167,15 +162,8 @@ VERSION_FILE=$(get_config "version_file")
 VERSION_REGEX=$(get_config "version_regex")
 PACKAGE=$(get_config "package")
 
-# Special handling for Go SDK (version must be provided)
-if [[ "$COMPONENT" == "sdk-go" ]]; then
-    VERSION="$GO_SDK_VERSION"
-    if [[ -z "$VERSION" ]]; then
-        echo "Error: Go version must be provided with --go-version flag" >&2
-        exit 1
-    fi
 # For Rust components with cargo metadata support
-elif [[ "$COMPONENT" == rust-* ]] && [[ -n "$PACKAGE" ]]; then
+if [[ "$COMPONENT" == rust-* ]] && [[ -n "$PACKAGE" ]]; then
     # Use package name from config if available
     VERSION=$(extract_cargo_version "$PACKAGE" "$VERSION_FILE")
 
