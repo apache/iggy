@@ -37,12 +37,6 @@ disable-mimalloc = []
 mimalloc = ["dep:mimalloc"]
 iggy-web = ["dep:rust-embed", "dep:mime_guess"]
 
-[target.'cfg(not(target_env = "musl"))'.dependencies]
-hwlocality = { workspace = true }
-
-[target.'cfg(target_env = "musl")'.dependencies]
-hwlocality = { workspace = true, features = ["vendored"] }
-
 [dependencies]
 ahash = { workspace = true }
 anyhow = { workspace = true }
@@ -96,7 +90,7 @@ rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 send_wrapper = { workspace = true }
 serde = { workspace = true }
-serde_json.workspace = true
+serde_json = { workspace = true }
 serde_with = { workspace = true }
 slab = { workspace = true }
 socket2 = { workspace = true }
@@ -115,6 +109,12 @@ tungstenite = { workspace = true }
 ulid = "1.2.1"
 ureq = { workspace = true }
 uuid = { workspace = true }
+
+[target.'cfg(not(target_env = "musl"))'.dependencies]
+hwlocality = { workspace = true }
+
+[target.'cfg(target_env = "musl")'.dependencies]
+hwlocality = { workspace = true, features = ["vendored"] }
 
 [build-dependencies]
 figment = { workspace = true, features = ["json", "toml", "env"] }

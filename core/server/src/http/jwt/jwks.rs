@@ -16,17 +16,30 @@
  * under the License.
  */
 
-use iggy_common::locking::{IggyRwLock, IggyRwLockFn};
+use dashmap::DashMap;
+use iggy_common::IggyError;
 use jsonwebtoken::DecodingKey;
 use serde::Deserialize;
 use serde_json;
-use std::collections::HashMap;
 use std::hash::Hash;
-use std::sync::Arc;
+use strum::{Display, EnumString};
+
+/// JWK key type enumeration
+#[derive(Debug, Clone, Copy, Display, EnumString, Deserialize, PartialEq, Eq)]
+#[strum(serialize_all = "UPPERCASE")]
+#[serde(rename_all = "UPPERCASE")]
+enum JwkKeyType {
+    /// RSA key type
+    #[strum(serialize = "RSA")]
+    Rsa,
+    /// EC (Elliptic Curve) key type
+    #[strum(serialize = "EC")]
+    Ec,
+}
 
 #[derive(Debug, Deserialize)]
 struct Jwk {
-    kty: String,
+    kty: JwkKeyType,
     kid: Option<String>,
     n: Option<String>,
     e: Option<String>,
@@ -48,13 +61,13 @@ struct CacheKey {
 
 #[derive(Debug, Clone)]
 pub struct JwksClient {
-    cache: Arc<IggyRwLock<HashMap<CacheKey, DecodingKey>>>,
+    cache: DashMap<CacheKey, DecodingKey>,
 }
 
 impl Default for JwksClient {
     fn default() -> Self {
         Self {
-            cache: Arc::new(IggyRwLock::new(HashMap::new())),
+            cache: DashMap::new(),
         }
     }
 }
@@ -66,13 +79,12 @@ impl JwksClient {
             kid: kid.to_string(),
         };
 
-        {
-            let cache = self.cache.read().await;
-            if let Some(key) = cache.get(&cache_key) {
-                return Some(key.clone());
-            }
+        // try to get from cache first
+        if let Some(key) = self.cache.get(&cache_key) {
+            return Some(key.clone());
         }
 
+        // fetch and cache if not found
         if let Ok(key) = self.fetch_and_cache_key(issuer, jwks_url, kid).await {
             return Some(key);
         }
@@ -85,9 +97,12 @@ impl JwksClient {
         issuer: &str,
         jwks_url: &str,
         kid: &str,
-    ) -> Result<DecodingKey, anyhow::Error> {
+    ) -> Result<DecodingKey, IggyError> {
         if let Err(e) = self.refresh_keys(issuer, jwks_url).await {
-            return Err(anyhow::anyhow!("Failed to refresh keys: {}", e));
+            return Err(IggyError::CannotFetchJwks(format!(
+                "Failed to refresh keys: {}",
+                e
+            )));
         }
 
         let cache_key = CacheKey {
@@ -95,66 +110,161 @@ impl JwksClient {
             kid: kid.to_string(),
         };
 
-        let cache = self.cache.read().await;
-        cache
+        self.cache
             .get(&cache_key)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("Key not found in cache after refresh"))
+            .map(|entry| entry.clone())
+            .ok_or(IggyError::InvalidAccessToken)
     }
 
-    async fn refresh_keys(&self, issuer: &str, jwks_url: &str) -> Result<(), anyhow::Error> {
+    async fn refresh_keys(&self, issuer: &str, jwks_url: &str) -> Result<(), IggyError> {
         let response = ureq::get(jwks_url)
             .call()
-            .map_err(|e| anyhow::anyhow!("Failed to fetch JWKS: {}", e))?;
+            .map_err(|_| IggyError::CannotFetchJwks(jwks_url.to_string()))?;
 
         let body = response
             .into_string()
-            .map_err(|e| anyhow::anyhow!("Failed to read response body: {}", e))?;
+            .map_err(|_| IggyError::CannotFetchJwks(jwks_url.to_string()))?;
 
         let jwks: JwkSet = serde_json::from_str(&body)
-            .map_err(|e| anyhow::anyhow!("Failed to parse JWKS: {}", e))?;
-
-        let mut cache = self.cache.write().await;
+            .map_err(|e| IggyError::CannotFetchJwks(format!("Failed to parse JWKS: {}", e)))?;
 
         for key in jwks.keys {
             if let Some(kid) = key.kid {
-                let decoding_key: DecodingKey = match key.kty.as_str() {
-                    "RSA" => {
+                let decoding_key: DecodingKey = match key.kty {
+                    JwkKeyType::Rsa => {
                         if let (Some(n), Some(e)) = (key.n.as_deref(), key.e.as_deref()) {
-                            DecodingKey::from_rsa_components(n, e)
-                                .map_err(|e| anyhow::anyhow!("Invalid RSA key: {}", e))?
+                            DecodingKey::from_rsa_components(n, e).map_err(|e| {
+                                IggyError::CannotFetchJwks(format!("Invalid RSA key: {}", e))
+                            })?
                         } else {
                             continue;
                         }
                     }
-                    "EC" => {
+                    JwkKeyType::Ec => {
                         if let (Some(x), Some(y), Some(crv)) =
                             (key.x.as_deref(), key.y.as_deref(), key.crv.as_deref())
                         {
-                            match crv {
-                                "P-256" => DecodingKey::from_ec_components(x, y)
-                                    .map_err(|e| anyhow::anyhow!("Invalid EC key: {}", e))?,
-                                "P-384" => DecodingKey::from_ec_components(x, y)
-                                    .map_err(|e| anyhow::anyhow!("Invalid EC key: {}", e))?,
-                                "P-521" => DecodingKey::from_ec_components(x, y)
-                                    .map_err(|e| anyhow::anyhow!("Invalid EC key: {}", e))?,
+                            match crv.to_ascii_uppercase().as_str() {
+                                "P-256" | "P-384" | "P-521" => {
+                                    DecodingKey::from_ec_components(x, y).map_err(|e| {
+                                        IggyError::CannotFetchJwks(format!("Invalid EC key: {}", e))
+                                    })?
+                                }
                                 _ => continue,
                             }
                         } else {
                             continue;
                         }
                     }
-                    _ => continue,
                 };
 
                 let cache_key = CacheKey {
                     issuer: issuer.to_string(),
                     kid,
                 };
-                cache.insert(cache_key, decoding_key);
+                self.cache.insert(cache_key, decoding_key);
             }
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use jsonwebtoken::DecodingKey;
+
+    const TEST_ISSUER: &str = "https://test-issuer.com";
+    const TEST_KID: &str = "test-key";
+
+    fn create_test_decoding_key() -> DecodingKey {
+        // Use HMAC secret to create a simple test DecodingKey
+        // Note: This is only for testing cache logic, not a real RSA/EC key
+        DecodingKey::from_secret(b"test-secret-key-for-cache-testing-only")
+    }
+
+    #[test]
+    fn test_cache_key_equality() {
+        let key1 = CacheKey {
+            issuer: TEST_ISSUER.to_string(),
+            kid: TEST_KID.to_string(),
+        };
+        let key2 = CacheKey {
+            issuer: TEST_ISSUER.to_string(),
+            kid: TEST_KID.to_string(),
+        };
+        assert_eq!(key1, key2);
+    }
+
+    #[test]
+    fn test_cache_key_different_issuer() {
+        let key1 = CacheKey {
+            issuer: "issuer1".to_string(),
+            kid: TEST_KID.to_string(),
+        };
+        let key2 = CacheKey {
+            issuer: "issuer2".to_string(),
+            kid: TEST_KID.to_string(),
+        };
+        assert_ne!(key1, key2);
+    }
+
+    #[test]
+    fn test_cache_key_different_kid() {
+        let key1 = CacheKey {
+            issuer: TEST_ISSUER.to_string(),
+            kid: "kid1".to_string(),
+        };
+        let key2 = CacheKey {
+            issuer: TEST_ISSUER.to_string(),
+            kid: "kid2".to_string(),
+        };
+        assert_ne!(key1, key2);
+    }
+
+    #[test]
+    fn test_jwks_client_default() {
+        let client = JwksClient::default();
+        assert!(client.cache.is_empty());
+    }
+
+    #[test]
+    fn test_cache_insert_and_get() {
+        let client = JwksClient::default();
+        let cache_key = CacheKey {
+            issuer: TEST_ISSUER.to_string(),
+            kid: TEST_KID.to_string(),
+        };
+        let decoding_key = create_test_decoding_key();
+
+        client.cache.insert(cache_key.clone(), decoding_key.clone());
+
+        let cached = client.cache.get(&cache_key);
+        assert!(cached.is_some());
+    }
+
+    #[test]
+    fn test_cache_multiple_keys() {
+        let client = JwksClient::default();
+
+        let key1 = CacheKey {
+            issuer: "issuer1".to_string(),
+            kid: "kid1".to_string(),
+        };
+        let key2 = CacheKey {
+            issuer: "issuer2".to_string(),
+            kid: "kid2".to_string(),
+        };
+
+        let decoding_key1 = create_test_decoding_key();
+        let decoding_key2 = create_test_decoding_key();
+
+        client.cache.insert(key1.clone(), decoding_key1);
+        client.cache.insert(key2.clone(), decoding_key2);
+
+        assert_eq!(client.cache.len(), 2);
+        assert!(client.cache.get(&key1).is_some());
+        assert!(client.cache.get(&key2).is_some());
     }
 }

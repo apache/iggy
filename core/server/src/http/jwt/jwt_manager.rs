@@ -264,58 +264,76 @@ impl JwtManager {
         let validation = self.validations.get(&algorithm);
         let kid = jsonwebtoken::decode_header(token).ok().and_then(|h| h.kid);
 
-        #[allow(clippy::collapsible_if)]
-        if let Ok(insecure) = jsonwebtoken::dangerous::insecure_decode::<JwtClaims>(token) {
-            debug!(
-                "JWT decoded insecurely, issuer: {}, kid: {:?}",
-                insecure.claims.iss, kid
-            );
-            if let Some(config) = self.trusted_issuer.get(&insecure.claims.iss) {
-                debug!("Found trusted issuer config: {}", config.issuer);
-                if let Some(kid_str) = kid.as_deref() {
-                    if let Some(decoding_key) = self
-                        .jwks_client
-                        .get_key(&config.issuer, &config.jwks_url, kid_str)
-                        .await
-                    {
-                        debug!("Got decoding key from JWKS for kid: {}", kid_str);
-                        let mut validation = Validation::new(algorithm);
-                        validation.set_issuer(std::slice::from_ref(&config.issuer));
-                        validation.set_audience(std::slice::from_ref(&config.audience));
-                        debug!("Validation configured, attempting to decode JWT");
-                        return jsonwebtoken::decode::<JwtClaims>(
-                            token,
-                            &decoding_key,
-                            &validation,
-                        )
-                        .map_err(|e| {
-                            error!("Failed to decode JWT: {}", e);
-                            IggyError::Unauthenticated
-                        });
-                    } else {
-                        error!("Failed to get decoding key from JWKS for kid: {}", kid_str);
-                    }
-                } else {
-                    error!("No kid found in JWT header");
-                }
-            } else {
-                debug!("No trusted issuer found for: {}", insecure.claims.iss);
+        // try to decode using JWKS if it's a trusted issuer
+        let insecure = match jsonwebtoken::dangerous::insecure_decode::<JwtClaims>(token) {
+            Ok(claims) => claims,
+            Err(_) => {
+                error!("Failed to decode JWT insecurely");
+                return self.decode_with_fallback(token, validation, algorithm);
             }
-        } else {
-            error!("Failed to decode JWT insecurely");
-        }
+        };
 
-        if validation.is_none() {
-            return Err(IggyError::InvalidJwtAlgorithm(
-                Self::map_algorithm_to_string(algorithm),
-            ));
-        }
+        /* debug!(
+            "JWT decoded insecurely, issuer: {}, kid: {:?}",
+            insecure.claims.iss, kid
+        ); */
 
-        let validation = validation.unwrap();
-        match jsonwebtoken::decode::<JwtClaims>(token, &self.validator.key, validation) {
-            Ok(claims) => Ok(claims),
-            _ => Err(IggyError::Unauthenticated),
-        }
+        let config = match self.trusted_issuer.get(&insecure.claims.iss) {
+            Some(config) => config,
+            None => {
+                debug!("No trusted issuer found for: {}", insecure.claims.iss);
+                return self.decode_with_fallback(token, validation, algorithm);
+            }
+        };
+
+        // debug!("Found trusted issuer config: {}", config.issuer);
+
+        let kid_str = match kid.as_deref() {
+            Some(kid) => kid,
+            None => {
+                error!("No kid found in JWT header");
+                return self.decode_with_fallback(token, validation, algorithm);
+            }
+        };
+
+        let decoding_key = match self
+            .jwks_client
+            .get_key(&config.issuer, &config.jwks_url, kid_str)
+            .await
+        {
+            Some(key) => key,
+            None => {
+                error!("Failed to get decoding key from JWKS for kid: {}", kid_str);
+                return self.decode_with_fallback(token, validation, algorithm);
+            }
+        };
+
+        // debug!("Got decoding key from JWKS for kid: {}", kid_str);
+
+        let mut validation = Validation::new(algorithm);
+        validation.set_issuer(std::slice::from_ref(&config.issuer));
+        validation.set_audience(std::slice::from_ref(&config.audience));
+        debug!("Validation configured, attempting to decode JWT");
+
+        jsonwebtoken::decode::<JwtClaims>(token, &decoding_key, &validation).map_err(|e| {
+            error!("Failed to decode JWT: {}", e);
+            IggyError::Unauthenticated
+        })
+    }
+
+    /// fallback to standard JWT validation if JWKS validation fails
+    fn decode_with_fallback(
+        &self,
+        token: &str,
+        validation: Option<&Validation>,
+        algorithm: Algorithm,
+    ) -> Result<TokenData<JwtClaims>, IggyError> {
+        let validation = validation.ok_or_else(|| {
+            IggyError::InvalidJwtAlgorithm(Self::map_algorithm_to_string(algorithm))
+        })?;
+
+        jsonwebtoken::decode::<JwtClaims>(token, &self.validator.key, validation)
+            .map_err(|_| IggyError::Unauthenticated)
     }
 
     fn map_algorithm_to_string(algorithm: Algorithm) -> String {

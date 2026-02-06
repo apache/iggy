@@ -1,0 +1,64 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+[http]
+enabled = true
+address = "127.0.0.1:0"
+
+[http.jwt]
+enabled = true
+issuer = "iggy"
+audience = "iggy"
+access_token_expiry = "1h"
+refresh_token_expiry = "30d"
+clock_skew = "5s"
+
+# Configure trusted A2A issuer
+[[http.jwt.trusted_issuers]]
+issuer = "https://test-issuer.com"
+jwks_url = "http://localhost:8080/.well-known/jwks.json"
+
+[system]
+path = "local_data"
+
+[system.database]
+type = "file"
+path = "local_data/db"
+
+[system.message_bus]
+type = "in_memory"
+
+[system.streams]
+path = "local_data/streams"
+
+[system.topics]
+path = "local_data/topics"
+
+[system.partitions]
+path = "local_data/partitions"
+
+[system.segments]
+path = "local_data/segments"
+
+[system.users]
+path = "local_data/users"
+
+[system.personal_access_tokens]
+path = "local_data/pats"
+
+[system.consumer_groups]
+path = "local_data/consumer_groups"
