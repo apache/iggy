@@ -462,6 +462,12 @@ jobs:
             VERSION=$(scripts/extract-version.sh "$KEY" 2>/dev/null || echo "ERROR")
             TAG=$(scripts/extract-version.sh "$KEY" --tag 2>/dev/null || echo "ERROR")
 
+            if [[ "$VERSION" =~ -SNAPSHOT$ ]]; then
+              echo "ℹ️ $NAME: SNAPSHOT version, no tag will be created"
+              echo "| $NAME | $VERSION | _(none)_ | ℹ️ SNAPSHOT (no tag) |" >> $GITHUB_STEP_SUMMARY
+              continue
+            fi
+
             if [ "$VERSION" = "ERROR" ] || [ "$TAG" = "ERROR" ]; then
               echo "❌ Failed to extract version/tag for $NAME"
               echo "| $NAME | ERROR | ERROR | ❌ Failed to extract |" >> $GITHUB_STEP_SUMMARY
@@ -1012,6 +1018,12 @@ jobs:
 
             VERSION=$(scripts/extract-version.sh "$KEY")
             TAG=$(scripts/extract-version.sh "$KEY" --tag)
+
+            # SNAPSHOT versions are mutable; tagging would block future publishes
+            if [[ "$VERSION" =~ -SNAPSHOT$ ]]; then
+              echo "ℹ️ Skipping git tag for $NAME (SNAPSHOT version)"
+              continue
+            fi
 
             # In auto-publish mode (create_edge_docker_tag=true), skip Docker components
             # with stable versions - only pre-release versions should get versioned tags.
