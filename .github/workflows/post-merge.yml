@@ -57,7 +57,7 @@ jobs:
             chmod +x /usr/local/bin/yq
           fi
 
-      # TODO(hubcio): Add sdk-node, sdk-java (SNAPSHOT?) when ready for edge auto-publish
+      # TODO(hubcio): Add sdk-java (SNAPSHOT?) when ready for edge auto-publish
       - name: Check all components
         id: check
         run: |
@@ -94,7 +94,7 @@ jobs:
 
           # Check SDKs for pre-release versions without tags
           SDKS_TO_PUBLISH=""
-          for sdk in sdk-python sdk-csharp sdk-go; do
+          for sdk in sdk-python sdk-node sdk-csharp sdk-go; do
             VERSION=$(scripts/extract-version.sh "$sdk")
             TAG=$(scripts/extract-version.sh "$sdk" --tag)
 
