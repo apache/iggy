@@ -100,7 +100,13 @@ public class AsyncIggyTcpClient {
      * @return a CompletableFuture that completes when connected
      */
     public CompletableFuture<Void> connect() {
-        connection = new AsyncTcpConnection(host, port, enableTls, tlsCertificate);
+        // 1. Create the pool configuration from builder/client fields
+        AsyncTcpConnection.TCPConnectionPoolConfig poolConfig = new AsyncTcpConnection.TCPConnectionPoolConfig(
+                connectionPoolSize.orElse(5), // Default to 5 if not provided
+                1000, // maxPendingAcquires
+                connectionTimeout.map(Duration::toMillis).orElse(3000L) // map Duration to millis
+                );
+        connection = new AsyncTcpConnection(host, port, enableTls, tlsCertificate, poolConfig);
         return connection.connect().thenRun(() -> {
             messagesClient = new MessagesTcpClient(connection);
             consumerGroupsClient = new ConsumerGroupsTcpClient(connection);
@@ -135,6 +141,10 @@ public class AsyncIggyTcpClient {
             throw new IggyNotConnectedException();
         }
         return usersClient;
+    }
+
+    public PoolMetrics getTcpConnectionMetrics() {
+        return this.connection.getMetrics();
     }
 
     /**
