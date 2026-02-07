@@ -117,7 +117,7 @@ tasks.register<JacocoReport>("jacocoAggregatedReport") {
 
     // Aggregate execution data from all subprojects
     executionData.setFrom(files(subprojects.mapNotNull {
-        val testTask = it.tasks.findByName("test") as? Test
+        val testTask = it.tasks.withType<Test>().findByName("test")
         if (testTask != null && it.plugins.hasPlugin("java")) {
             it.layout.buildDirectory.file("jacoco/test.exec").get().asFile
         } else {

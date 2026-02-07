@@ -17,6 +17,8 @@
  * under the License.
  */
 
+import org.gradle.api.artifacts.VersionCatalogsExtension
+
 plugins {
     java
     jacoco
@@ -41,7 +43,11 @@ tasks.withType<Javadoc> {
 }
 
 jacoco {
-    toolVersion = "0.8.14"
+    toolVersion = extensions.getByType<VersionCatalogsExtension>()
+        .named("libs")
+        .findVersion("jacoco")
+        .get()
+        .requiredVersion
 }
 
 tasks.withType<Test> {
