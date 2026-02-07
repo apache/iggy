@@ -21,6 +21,11 @@ import com.diffplug.gradle.spotless.SpotlessExtension
 
 plugins {
     alias(libs.plugins.spotless) apply false
+    jacoco
+}
+
+repositories {
+    mavenCentral()
 }
 
 subprojects {
@@ -101,5 +106,39 @@ subprojects {
             useInMemoryPgpKeys(signingKey, signingPassword)
             sign(the<PublishingExtension>().publications)
         }
+    }
+}
+
+tasks.register<JacocoReport>("jacocoAggregatedReport") {
+    description = "Generates aggregated code coverage report for all modules"
+    group = "verification"
+
+    dependsOn(subprojects.map { it.tasks.named("test") })
+
+    // Aggregate execution data from all subprojects
+    executionData.setFrom(files(subprojects.mapNotNull {
+        val testTask = it.tasks.withType<Test>().findByName("test")
+        if (testTask != null && it.plugins.hasPlugin("java")) {
+            it.layout.buildDirectory.file("jacoco/test.exec").get().asFile
+        } else {
+            null
+        }
+    }.filter { it.exists() }))
+
+    // Aggregate source and class files
+    subprojects.forEach { subproject ->
+        if (subproject.plugins.hasPlugin("java")) {
+            val sourceSets = subproject.extensions.getByType<SourceSetContainer>()
+            sourceDirectories.from(sourceSets.getByName("main").allSource.srcDirs)
+            classDirectories.from(files(sourceSets.getByName("main").output))
+        }
+    }
+
+    reports {
+        xml.required.set(true)
+        xml.outputLocation.set(layout.buildDirectory.file("reports/jacoco/aggregate/jacocoAggregated.xml"))
+        html.required.set(true)
+        html.outputLocation.set(layout.buildDirectory.dir("reports/jacoco/aggregate/html"))
+        csv.required.set(false)
     }
 }

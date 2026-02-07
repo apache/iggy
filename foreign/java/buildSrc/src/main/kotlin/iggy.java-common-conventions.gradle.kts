@@ -17,8 +17,11 @@
  * under the License.
  */
 
+import org.gradle.api.artifacts.VersionCatalogsExtension
+
 plugins {
     java
+    jacoco
 }
 
 repositories {
@@ -39,6 +42,34 @@ tasks.withType<Javadoc> {
     options.encoding = "UTF-8"
 }
 
+jacoco {
+    toolVersion = extensions.getByType<VersionCatalogsExtension>()
+        .named("libs")
+        .findVersion("jacoco")
+        .get()
+        .requiredVersion
+}
+
 tasks.withType<Test> {
     useJUnitPlatform()
+    finalizedBy(tasks.jacocoTestReport)
+}
+
+tasks.jacocoTestReport {
+    dependsOn(tasks.test)
+    reports {
+        xml.required.set(true)
+        html.required.set(true)
+        csv.required.set(false)
+    }
+}
+
+tasks.jacocoTestCoverageVerification {
+    violationRules {
+        rule {
+            limit {
+                minimum = "0.0".toBigDecimal()
+            }
+        }
+    }
 }

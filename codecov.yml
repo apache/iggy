@@ -41,6 +41,17 @@ comment:
   require_base: true
   require_head: true
 
+flags:
+  rust:
+    paths:
+      - core/
+    carryforward: true
+  java:
+    paths:
+      - foreign/java/java-sdk/src/main/
+      - foreign/java/external-processors/
+    carryforward: true
+
 ignore:
   - "core/bench/**"
   - "core/integration/**"
@@ -51,3 +62,7 @@ ignore:
   - "foreign/**"
   - "web/**"
   - "**/tests/**"
+  - "**/*Test.java"
+  - "**/test/**"
+  - "**/build/**"
+  - "**/target/**"
