@@ -30,6 +30,7 @@ using Apache.Iggy.Exceptions;
 using Apache.Iggy.Kinds;
 using Apache.Iggy.Messages;
 using Apache.Iggy.StringHandlers;
+using Apache.Iggy.Utils;
 using Partitioning = Apache.Iggy.Kinds.Partitioning;
 
 namespace Apache.Iggy.IggyClient.Implementations;
@@ -55,10 +56,7 @@ public class HttpMessageStream : IIggyClient
         _jsonSerializerOptions = new JsonSerializerOptions
         {
             PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower,
-            Converters =
-            {
-                new JsonStringEnumConverter(JsonNamingPolicy.SnakeCaseLower)
-            }
+            Converters = { new JsonStringEnumConverter(JsonNamingPolicy.SnakeCaseLower) }
         };
     }
 
@@ -147,15 +145,14 @@ public class HttpMessageStream : IIggyClient
     /// <inheritdoc />
     public async Task<TopicResponse?> CreateTopicAsync(Identifier streamId, string name, uint partitionsCount,
         CompressionAlgorithm compressionAlgorithm = CompressionAlgorithm.None, byte? replicationFactor = null,
-        ulong messageExpiry = 0, ulong maxTopicSize = 0,
-        CancellationToken token = default)
+        TimeSpan? messageExpiry = null, ulong maxTopicSize = 0, CancellationToken token = default)
     {
         var json = JsonSerializer.Serialize(new CreateTopicRequest
         {
             Name = name,
             CompressionAlgorithm = compressionAlgorithm,
             MaxTopicSize = maxTopicSize,
-            MessageExpiry = messageExpiry,
+            MessageExpiry = DurationHelpers.ToDuration(messageExpiry),
             PartitionsCount = partitionsCount,
             ReplicationFactor = replicationFactor
         }, _jsonSerializerOptions);
@@ -176,11 +173,11 @@ public class HttpMessageStream : IIggyClient
     /// <inheritdoc />
     public async Task UpdateTopicAsync(Identifier streamId, Identifier topicId, string name,
         CompressionAlgorithm compressionAlgorithm = CompressionAlgorithm.None,
-        ulong maxTopicSize = 0, ulong messageExpiry = 0, byte? replicationFactor = null,
+        ulong maxTopicSize = 0, TimeSpan? messageExpiry = null, byte? replicationFactor = null,
         CancellationToken token = default)
     {
         var json = JsonSerializer.Serialize(
-            new UpdateTopicRequest(name, compressionAlgorithm, maxTopicSize, messageExpiry, replicationFactor),
+            new UpdateTopicRequest(name, compressionAlgorithm, maxTopicSize, DurationHelpers.ToDuration(messageExpiry), replicationFactor),
             _jsonSerializerOptions);
         var data = new StringContent(json, Encoding.UTF8, "application/json");
         var response = await _httpClient.PutAsync($"/streams/{streamId}/topics/{topicId}", data, token);
@@ -708,10 +705,11 @@ public class HttpMessageStream : IIggyClient
     }
 
     /// <inheritdoc />
-    public async Task<RawPersonalAccessToken?> CreatePersonalAccessTokenAsync(string name, ulong? expiry = null,
+    public async Task<RawPersonalAccessToken?> CreatePersonalAccessTokenAsync(string name, TimeSpan? expiry = null,
         CancellationToken token = default)
     {
-        var json = JsonSerializer.Serialize(new CreatePersonalAccessTokenRequest(name, expiry), _jsonSerializerOptions);
+        var json = JsonSerializer.Serialize(
+            new CreatePersonalAccessTokenRequest(name, DurationHelpers.ToDuration(expiry)), _jsonSerializerOptions);
 
         var content = new StringContent(json, Encoding.UTF8, "application/json");
         var response = await _httpClient.PostAsync("/personal-access-tokens", content, token);

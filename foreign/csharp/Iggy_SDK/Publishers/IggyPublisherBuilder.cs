@@ -166,7 +166,7 @@ public class IggyPublisherBuilder
     /// <returns>The builder instance for method chaining.</returns>
     public IggyPublisherBuilder CreateTopicIfNotExists(string name, uint topicPartitionsCount = 1,
         CompressionAlgorithm compressionAlgorithm = CompressionAlgorithm.None, byte? replicationFactor = null,
-        ulong messageExpiry = 0, ulong maxTopicSize = 0)
+        TimeSpan messageExpiry = default, ulong maxTopicSize = 0)
     {
         Config.CreateTopic = true;
         Config.TopicName = name;
@@ -214,7 +214,6 @@ public class IggyPublisherBuilder
         OnMessageBatchFailed = handler;
         return this;
     }
-
 
 
     /// <summary>

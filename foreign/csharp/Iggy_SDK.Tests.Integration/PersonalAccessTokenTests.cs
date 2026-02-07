@@ -18,7 +18,6 @@
 using Apache.Iggy.Contracts.Auth;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
-using Apache.Iggy.Tests.Integrations.Attributes;
 using Apache.Iggy.Tests.Integrations.Fixtures;
 using Shouldly;
 
@@ -27,7 +26,7 @@ namespace Apache.Iggy.Tests.Integrations;
 public class PersonalAccessTokenTests
 {
     private const string Name = "test-pat";
-    private const ulong Expiry = 100_000_000;
+    private static readonly TimeSpan Expiry = TimeSpan.FromHours(1);
 
     [ClassDataSource<PersonalAccessTokenFixture>(Shared = SharedType.PerClass)]
     public required PersonalAccessTokenFixture Fixture { get; init; }
@@ -64,7 +63,7 @@ public class PersonalAccessTokenTests
         response.ShouldNotBeNull();
         response.Count.ShouldBe(1);
         response[0].Name.ShouldBe(Name);
-        var tokenExpiryDateTimeOffset = DateTimeOffset.UtcNow.AddMicroseconds(Expiry);
+        var tokenExpiryDateTimeOffset = DateTimeOffset.UtcNow.Add(Expiry);
         response[0].ExpiryAt!.Value.ToUniversalTime().ShouldBe(tokenExpiryDateTimeOffset, TimeSpan.FromMinutes(1));
     }
 
@@ -73,7 +72,7 @@ public class PersonalAccessTokenTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task LoginWithPersonalAccessToken_Should_Be_Successfully(Protocol protocol)
     {
-        var response = await Fixture.Clients[protocol].CreatePersonalAccessTokenAsync("test-pat-login", 100_000_000);
+        var response = await Fixture.Clients[protocol].CreatePersonalAccessTokenAsync("test-pat-login", Expiry);
 
         var client = await Fixture.IggyServerFixture.CreateClient(protocol);
 

@@ -39,13 +39,13 @@ public interface IIggyPersonalAccessToken
     ///     Creates a new personal access token for the current user.
     /// </summary>
     /// <param name="name">The name to identify this token.</param>
-    /// <param name="expiry">The expiration time in milliseconds from now (optional, null means no expiration).</param>
+    /// <param name="expiry">The expiration time from now (optional, null means server default).</param>
     /// <param name="token">The cancellation token to cancel the operation.</param>
     /// <returns>
     ///     A task that represents the asynchronous operation and returns the created personal access token with its
     ///     secret value, or null if creation failed.
     /// </returns>
-    Task<RawPersonalAccessToken?> CreatePersonalAccessTokenAsync(string name, ulong? expiry = null,
+    Task<RawPersonalAccessToken?> CreatePersonalAccessTokenAsync(string name, TimeSpan? expiry = null,
         CancellationToken token = default);
 
     /// <summary>

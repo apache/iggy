@@ -15,15 +15,16 @@
 // // specific language governing permissions and limitations
 // // under the License.
 
-using Apache.Iggy.Contracts.Http;
+using Apache.Iggy.Tests.Integrations.Models;
 
 namespace Apache.Iggy.Tests.Integrations.Helpers;
 
 public static class TopicFactory
 {
-    internal static CreateTopicRequest CreateTopic(string topicId, uint partitionsCount = 1, ulong messageExpiry = 0)
+    internal static CreateTestTopic CreateTopic(string topicId, uint partitionsCount = 1,
+        TimeSpan messageExpiry = default)
     {
-        return new CreateTopicRequest
+        return new CreateTestTopic
         {
             Name = topicId,
             PartitionsCount = partitionsCount,

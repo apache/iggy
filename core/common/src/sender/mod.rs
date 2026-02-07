@@ -37,8 +37,11 @@ use compio::net::TcpStream;
 use compio_quic::{RecvStream, SendStream};
 use compio_tls::TlsStream;
 use std::future::Future;
+#[cfg(unix)]
 use std::os::fd::{AsFd, OwnedFd};
-use tracing::{debug, error};
+use tracing::debug;
+#[cfg(unix)]
+use tracing::error;
 
 macro_rules! forward_async_methods {
     (
@@ -117,6 +120,7 @@ impl SenderKind {
         Self::WebSocketTls(stream)
     }
 
+    #[cfg(unix)]
     pub fn take_and_migrate_tcp(&mut self) -> Option<OwnedFd> {
         match self {
             SenderKind::Tcp(tcp_sender) => {

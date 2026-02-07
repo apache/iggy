@@ -15,12 +15,11 @@
 // // specific language governing permissions and limitations
 // // under the License.
 
-using Apache.Iggy.Contracts;
-using Apache.Iggy.Contracts.Http;
 using Apache.Iggy.Enums;
 using Apache.Iggy.IggyClient;
 using Apache.Iggy.Messages;
 using Apache.Iggy.Tests.Integrations.Helpers;
+using Apache.Iggy.Tests.Integrations.Models;
 using TUnit.Core.Interfaces;
 using Partitioning = Apache.Iggy.Kinds.Partitioning;
 
@@ -29,7 +28,7 @@ namespace Apache.Iggy.Tests.Integrations.Fixtures;
 public class OffsetFixtures : IAsyncInitializer
 {
     internal readonly string StreamId = "OffsetStream";
-    internal readonly CreateTopicRequest TopicRequest = TopicFactory.CreateTopic("Topic");
+    internal readonly CreateTestTopic TopicRequest = TopicFactory.CreateTopic("Topic");
 
     [ClassDataSource<IggyServerFixture>(Shared = SharedType.PerAssembly)]
     public required IggyServerFixture IggyServerFixture { get; init; }
@@ -49,8 +48,7 @@ public class OffsetFixtures : IAsyncInitializer
             {
                 new(Guid.NewGuid(), "Test message 1"u8.ToArray()),
                 new(Guid.NewGuid(), "Test message 2"u8.ToArray()),
-                new(Guid.NewGuid(), "Test message 3"u8.ToArray()),
-                new(Guid.NewGuid(), "Test message 4"u8.ToArray())
+                new(Guid.NewGuid(), "Test message 3"u8.ToArray()), new(Guid.NewGuid(), "Test message 4"u8.ToArray())
             };
             await client.Value.SendMessagesAsync(Identifier.String(StreamId.GetWithProtocol(client.Key)),
                 Identifier.String(TopicRequest.Name), Partitioning.None(), messages);
