@@ -168,7 +168,12 @@ async fn main() -> Result<(), RuntimeError> {
     let mut sink_wrappers = vec![];
     let mut sink_with_plugins = HashMap::new();
     for (key, sink) in sinks {
-        let plugin_ids = sink.plugins.iter().map(|plugin| plugin.id).collect();
+        let plugin_ids = sink
+            .plugins
+            .iter()
+            .filter(|plugin| plugin.error.is_none())
+            .map(|plugin| plugin.id)
+            .collect();
         sink_wrappers.push(SinkConnectorWrapper {
             callback: sink.container.consume,
             plugins: sink.plugins,
@@ -185,7 +190,12 @@ async fn main() -> Result<(), RuntimeError> {
     let mut source_wrappers = vec![];
     let mut source_with_plugins = HashMap::new();
     for (key, source) in sources {
-        let plugin_ids = source.plugins.iter().map(|plugin| plugin.id).collect();
+        let plugin_ids = source
+            .plugins
+            .iter()
+            .filter(|plugin| plugin.error.is_none())
+            .map(|plugin| plugin.id)
+            .collect();
         source_wrappers.push(SourceConnectorWrapper {
             callback: source.container.handle,
             plugins: source.plugins,
@@ -237,13 +247,14 @@ async fn main() -> Result<(), RuntimeError> {
         for id in source.plugin_ids {
             info!("Closing source connector with ID: {id} for plugin: {key}");
             source.container.close(id);
+            source::cleanup_sender(id);
             info!("Closed source connector with ID: {id} for plugin: {key}");
         }
     }
 
     for (key, sink) in sink_with_plugins {
         for id in sink.plugin_ids {
-            info!("Closing sink connector with ID: {id} for plugin: {key}",);
+            info!("Closing sink connector with ID: {id} for plugin: {key}");
             sink.container.close(id);
             info!("Closed sink connector with ID: {id} for plugin: {key}");
         }

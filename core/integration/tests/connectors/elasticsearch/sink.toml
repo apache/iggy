@@ -17,4 +17,4 @@
 
 [connectors]
 config_type = "local"
-config_dir = "tests/connectors/quickwit/sinks"
+config_dir = "../connectors/sinks/elasticsearch_sink"

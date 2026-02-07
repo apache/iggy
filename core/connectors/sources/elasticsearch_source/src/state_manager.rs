@@ -19,6 +19,7 @@
 
 use crate::{ElasticsearchSource, StateConfig};
 use async_trait::async_trait;
+use iggy_common::{ChronoDuration, DateTime, Utc};
 use iggy_connector_sdk::Error;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
@@ -216,7 +217,7 @@ impl StateManager {
     /// Clean up old states
     pub async fn cleanup_old_states(&self, older_than_days: u32) -> Result<usize, Error> {
         let state_ids = self.storage.list_states().await?;
-        let cutoff_time = chrono::Utc::now() - chrono::Duration::days(older_than_days as i64);
+        let cutoff_time = Utc::now() - ChronoDuration::days(older_than_days as i64);
         let mut deleted_count = 0;
 
         for state_id in state_ids {
@@ -249,7 +250,7 @@ pub struct StateStats {
 #[derive(Debug)]
 pub struct StateInfo {
     pub id: String,
-    pub last_updated: chrono::DateTime<chrono::Utc>,
+    pub last_updated: DateTime<Utc>,
     pub version: u32,
     pub connector_type: String,
 }
@@ -260,7 +261,7 @@ pub struct SourceState {
     /// Unique identifier for this state
     pub id: String,
     /// Timestamp when this state was last updated
-    pub last_updated: chrono::DateTime<chrono::Utc>,
+    pub last_updated: DateTime<Utc>,
     /// Version of the state format
     pub version: u32,
     /// Generic state data as JSON

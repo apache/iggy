@@ -18,28 +18,12 @@
  */
 
 use crate::configs::connectors::{
-    ConfigFormat, SinkConfig, SourceConfig, StreamConsumerConfig, StreamProducerConfig,
+    SinkConfig, SourceConfig, StreamConsumerConfig, StreamProducerConfig,
 };
-use crate::manager::{
-    sink::SinkInfo,
-    source::SourceInfo,
-    status::{ConnectorError, ConnectorStatus},
-};
+use crate::manager::{sink::SinkInfo, source::SourceInfo};
+pub use iggy_connector_sdk::api::{SinkInfoResponse, SourceInfoResponse};
 use iggy_connector_sdk::transforms::TransformType;
 use serde::{Deserialize, Serialize};
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct SinkInfoResponse {
-    pub id: u32,
-    pub key: String,
-    pub name: String,
-    pub path: String,
-    pub enabled: bool,
-    pub status: ConnectorStatus,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_error: Option<ConnectorError>,
-    pub plugin_config_format: Option<ConfigFormat>,
-}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SinkDetailsResponse {
@@ -53,19 +37,6 @@ pub struct SinkConfigResponse {
     #[serde(flatten)]
     pub config: SinkConfig,
     pub active: bool,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct SourceInfoResponse {
-    pub id: u32,
-    pub key: String,
-    pub name: String,
-    pub path: String,
-    pub enabled: bool,
-    pub status: ConnectorStatus,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_error: Option<ConnectorError>,
-    pub plugin_config_format: Option<ConfigFormat>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -98,7 +69,7 @@ impl From<SinkInfo> for SinkInfoResponse {
             enabled: sink.enabled,
             status: sink.status,
             last_error: sink.last_error,
-            plugin_config_format: sink.plugin_config_format,
+            plugin_config_format: sink.plugin_config_format.map(|f| f.to_string()),
         }
     }
 }
@@ -113,7 +84,7 @@ impl From<SourceInfo> for SourceInfoResponse {
             enabled: source.enabled,
             status: source.status,
             last_error: source.last_error,
-            plugin_config_format: source.plugin_config_format,
+            plugin_config_format: source.plugin_config_format.map(|f| f.to_string()),
         }
     }
 }

@@ -23,6 +23,7 @@ use auth::resolve_api_key;
 use axum::{Json, Router, extract::State, middleware, routing::get};
 use axum_server::tls_rustls::RustlsConfig;
 use config::{HttpConfig, configure_cors};
+use iggy_connector_sdk::api::ConnectorRuntimeStats;
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 use tokio::spawn;
 use tracing::{error, info};
@@ -126,8 +127,6 @@ async fn get_metrics(State(context): State<Arc<RuntimeContext>>) -> String {
     context.metrics.get_formatted_output()
 }
 
-async fn get_stats(
-    State(context): State<Arc<RuntimeContext>>,
-) -> Json<stats::ConnectorRuntimeStats> {
+async fn get_stats(State(context): State<Arc<RuntimeContext>>) -> Json<ConnectorRuntimeStats> {
     Json(stats::get_runtime_stats(&context).await)
 }

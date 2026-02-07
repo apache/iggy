@@ -20,7 +20,6 @@
 use crate::configs::connectors::SinkConfig;
 use crate::context::RuntimeContext;
 use crate::log::LOG_CALLBACK;
-use crate::manager::status::ConnectorStatus;
 use crate::metrics::{ConnectorType, Metrics};
 use crate::{
     PLUGIN_ID, RuntimeError, SinkApi, SinkConnector, SinkConnectorConsumer, SinkConnectorPlugin,
@@ -32,6 +31,7 @@ use iggy::prelude::{
     AutoCommit, AutoCommitWhen, IggyClient, IggyConsumer, IggyDuration, IggyMessage,
     PollingStrategy,
 };
+use iggy_connector_sdk::api::ConnectorStatus;
 use iggy_connector_sdk::{
     DecodedMessage, MessagesMetadata, RawMessage, RawMessages, ReceivedMessage, StreamDecoder,
     TopicMetadata, sink::ConsumeCallback, transforms::Transform,
@@ -56,7 +56,7 @@ pub async fn init(
             continue;
         }
 
-        let plugin_id = PLUGIN_ID.load(Ordering::Relaxed);
+        let plugin_id = PLUGIN_ID.fetch_add(1, Ordering::SeqCst);
         let path = resolve_plugin_path(&config.path);
         info!(
             "Initializing sink container with name: {name} ({key}), config version: {}, plugin: {path}",
@@ -64,7 +64,7 @@ pub async fn init(
         );
         let init_error: Option<String>;
         if let Some(container) = sink_connectors.get_mut(&path) {
-            info!("Sink container for plugin: {path} is already loaded.",);
+            info!("Sink container for plugin: {path} is already loaded.");
             let version = get_plugin_version(&container.container);
             init_error = init_sink(
                 &container.container,
@@ -75,9 +75,9 @@ pub async fn init(
             .map(|error| error.to_string());
             container.plugins.push(SinkConnectorPlugin {
                 id: plugin_id,
-                key: key.to_owned(),
-                name: name.to_owned(),
-                path: path.to_owned(),
+                key: key.clone(),
+                name: name.clone(),
+                path: path.clone(),
                 version,
                 config_format: config.plugin_config_format,
                 consumers: vec![],
@@ -85,9 +85,14 @@ pub async fn init(
                 verbose: config.verbose,
             });
         } else {
-            let container: Container<SinkApi> =
-                unsafe { Container::load(&path).expect("Failed to load sink container") };
-            info!("Sink container for plugin: {path} loaded successfully.",);
+            let container: Container<SinkApi> = unsafe {
+                Container::load(&path).map_err(|error| {
+                    RuntimeError::InvalidConfiguration(format!(
+                        "Failed to load sink container from {path}: {error}"
+                    ))
+                })?
+            };
+            info!("Sink container for plugin: {path} loaded successfully.");
             let version = get_plugin_version(&container);
             init_error = init_sink(
                 &container,
@@ -97,14 +102,14 @@ pub async fn init(
             .err()
             .map(|error| error.to_string());
             sink_connectors.insert(
-                path.to_owned(),
+                path.clone(),
                 SinkConnector {
                     container,
                     plugins: vec![SinkConnectorPlugin {
                         id: plugin_id,
-                        key: key.to_owned(),
-                        name: name.to_owned(),
-                        path: path.to_owned(),
+                        key: key.clone(),
+                        name: name.clone(),
+                        path: path.clone(),
                         version,
                         config_format: config.plugin_config_format,
                         consumers: vec![],
@@ -123,11 +128,11 @@ pub async fn init(
                 "Sink container with name: {name} ({key}), initialized successfully with ID: {plugin_id}."
             );
         }
-        PLUGIN_ID.fetch_add(1, Ordering::Relaxed);
 
         let transforms = if let Some(transforms_config) = config.transforms {
-            let transforms =
-                transform::load(&transforms_config).expect("Failed to load transforms");
+            let transforms = transform::load(&transforms_config).map_err(|error| {
+                RuntimeError::InvalidConfiguration(format!("Failed to load transforms: {error}"))
+            })?;
             let types = transforms
                 .iter()
                 .map(|t| t.r#type().into())
@@ -139,19 +144,26 @@ pub async fn init(
             vec![]
         };
 
-        let connector = sink_connectors
-            .get_mut(&path)
-            .expect("Failed to get sink connector");
+        let connector = sink_connectors.get_mut(&path).ok_or_else(|| {
+            RuntimeError::InvalidConfiguration(format!("Sink connector not found for path: {path}"))
+        })?;
         let plugin = connector
             .plugins
             .iter_mut()
             .find(|p| p.id == plugin_id)
-            .expect("Failed to get sink plugin");
+            .ok_or_else(|| {
+                RuntimeError::InvalidConfiguration(format!(
+                    "Sink plugin not found for ID: {plugin_id}"
+                ))
+            })?;
 
         for stream in config.streams.iter() {
-            let poll_interval =
-                IggyDuration::from_str(stream.poll_interval.as_deref().unwrap_or("5ms"))
-                    .expect("Invalid poll interval");
+            let poll_interval = IggyDuration::from_str(
+                stream.poll_interval.as_deref().unwrap_or("5ms"),
+            )
+            .map_err(|error| {
+                RuntimeError::InvalidConfiguration(format!("Invalid poll interval: {error}"))
+            })?;
             let default_consumer_group = format!("iggy-connect-sink-{key}");
             let consumer_group = stream
                 .consumer_group
@@ -221,15 +233,15 @@ pub fn consume(sinks: Vec<SinkConnectorWrapper>, context: Arc<RuntimeContext>) {
                     )
                     .await
                     {
-                        let err = format!(
+                        let error_msg = format!(
                             "Failed to consume messages for sink connector with ID: {}. {error}",
                             plugin.id
                         );
-                        error!(err);
+                        error!("{error_msg}");
                         context
                             .metrics
                             .increment_errors(&plugin_key, ConnectorType::Sink);
-                        context.sinks.set_error(&plugin_key, &err).await;
+                        context.sinks.set_error(&plugin_key, &error_msg).await;
                         return;
                     }
                     info!(
@@ -357,9 +369,9 @@ fn init_sink(
         LOG_CALLBACK,
     );
     if result != 0 {
-        let err = format!("Plugin initialization failed (ID: {id})");
-        error!("{err}");
-        Err(RuntimeError::InvalidConfiguration(err))
+        let error = format!("Plugin initialization failed (ID: {id})");
+        error!("{error}");
+        Err(RuntimeError::InvalidConfiguration(error))
     } else {
         Ok(())
     }

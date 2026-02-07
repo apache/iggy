@@ -395,3 +395,130 @@ async fn processed_column_source_marks_rows_after_producing(
 
     pool.close().await;
 }
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/postgres/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn state_persists_across_connector_restart(
+    harness: &mut TestHarness,
+    fixture: PostgresSourceJsonFixture,
+) {
+    let pool = fixture.create_pool().await.expect("Failed to create pool");
+    fixture.create_table(&pool).await;
+
+    let first_batch = create_test_messages(TEST_MESSAGE_COUNT);
+    for msg in &first_batch {
+        fixture
+            .insert_row(
+                &pool,
+                msg.id as i32,
+                &msg.name,
+                msg.count as i32,
+                msg.amount,
+                msg.active,
+                msg.timestamp,
+            )
+            .await;
+    }
+
+    let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
+    let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
+    let consumer_id: Identifier = "state_test_consumer".try_into().unwrap();
+
+    let client = harness.root_client().await.unwrap();
+    let received_before = {
+        let mut received: Vec<DatabaseRecord> = Vec::new();
+        for _ in 0..POLL_ATTEMPTS {
+            if let Ok(polled) = client
+                .poll_messages(
+                    &stream_id,
+                    &topic_id,
+                    None,
+                    &Consumer::new(consumer_id.clone()),
+                    &PollingStrategy::next(),
+                    10,
+                    true,
+                )
+                .await
+            {
+                for msg in polled.messages {
+                    if let Ok(record) = serde_json::from_slice(&msg.payload) {
+                        received.push(record);
+                    }
+                }
+                if received.len() >= TEST_MESSAGE_COUNT {
+                    break;
+                }
+            }
+            sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+        }
+        received
+    };
+    assert_eq!(received_before.len(), TEST_MESSAGE_COUNT);
+
+    harness
+        .server_mut()
+        .stop_dependents()
+        .expect("Failed to stop connectors");
+
+    let second_batch_start_id = (TEST_MESSAGE_COUNT + 1) as i32;
+    for i in 0..TEST_MESSAGE_COUNT {
+        fixture
+            .insert_row(
+                &pool,
+                second_batch_start_id + i as i32,
+                &format!("user_batch2_{i}"),
+                ((TEST_MESSAGE_COUNT + i) * 10) as i32,
+                (TEST_MESSAGE_COUNT + i) as f64 * 99.99,
+                i % 2 == 0,
+                iggy_common::IggyTimestamp::now().as_micros() as i64,
+            )
+            .await;
+    }
+
+    harness
+        .server_mut()
+        .start_dependents()
+        .await
+        .expect("Failed to restart connectors");
+    sleep(Duration::from_millis(500)).await;
+
+    let mut received_after: Vec<DatabaseRecord> = Vec::new();
+    for _ in 0..POLL_ATTEMPTS {
+        if let Ok(polled) = client
+            .poll_messages(
+                &stream_id,
+                &topic_id,
+                None,
+                &Consumer::new(consumer_id.clone()),
+                &PollingStrategy::next(),
+                10,
+                true,
+            )
+            .await
+        {
+            for msg in polled.messages {
+                if let Ok(record) = serde_json::from_slice(&msg.payload) {
+                    received_after.push(record);
+                }
+            }
+            if received_after.len() >= TEST_MESSAGE_COUNT {
+                break;
+            }
+        }
+        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+    }
+
+    assert_eq!(received_after.len(), TEST_MESSAGE_COUNT);
+
+    for record in &received_after {
+        assert!(
+            record.data.id > TEST_MESSAGE_COUNT as u64,
+            "After restart, got ID {} from first batch",
+            record.data.id
+        );
+    }
+
+    pool.close().await;
+}

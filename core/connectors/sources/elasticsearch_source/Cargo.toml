@@ -36,10 +36,10 @@ crate-type = ["cdylib", "lib"]
 
 [dependencies]
 async-trait = { workspace = true }
-chrono = { workspace = true }
 dashmap = { workspace = true }
 elasticsearch = { workspace = true }
 humantime = { workspace = true }
+iggy_common = { workspace = true }
 iggy_connector_sdk = { workspace = true }
 once_cell = { workspace = true }
 serde = { workspace = true }

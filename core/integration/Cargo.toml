@@ -43,6 +43,7 @@ humantime = { workspace = true }
 iggy = { workspace = true }
 iggy_binary_protocol = { workspace = true }
 iggy_common = { workspace = true }
+iggy_connector_sdk = { workspace = true, features = ["api"] }
 keyring = { workspace = true }
 lazy_static = { workspace = true }
 libc = { workspace = true }

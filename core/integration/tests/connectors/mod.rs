@@ -18,11 +18,14 @@
  */
 
 mod api;
+mod elasticsearch;
 mod fixtures;
 mod http_config_provider;
+mod iceberg;
 mod postgres;
 mod quickwit;
 mod random;
+mod stdout;
 
 use iggy_common::IggyTimestamp;
 use serde::{Deserialize, Serialize};

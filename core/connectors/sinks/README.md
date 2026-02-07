@@ -4,6 +4,16 @@
 
 Sink connectors are responsible for writing data from Iggy streams to external systems or destinations. They provide a way to integrate Apache Iggy with various data sources and destinations, enabling seamless data flow and processing.
 
+## Available Sinks
+
+| Sink | Description |
+| ---- | ----------- |
+| **elasticsearch_sink** | Sends messages to Elasticsearch indices for full-text search and analytics |
+| **iceberg_sink** | Writes data to Apache Iceberg tables via REST catalog with S3/GCS/Azure storage |
+| **postgres_sink** | Stores messages in PostgreSQL database tables with configurable schemas |
+| **quickwit_sink** | Indexes messages in Quickwit search engine for log analytics |
+| **stdout_sink** | Prints messages to standard output (useful for debugging and development) |
+
 The sink is represented by the single `Sink` trait, which defines the basic interface for all sink connectors. It provides methods for initializing the sink, writing data to external destination, and closing the sink.
 
 ```rust

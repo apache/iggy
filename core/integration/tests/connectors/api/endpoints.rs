@@ -17,6 +17,9 @@
  * under the License.
  */
 
+use iggy_connector_sdk::api::{
+    ConnectorRuntimeStats, HealthResponse, SinkInfoResponse, SourceInfoResponse,
+};
 use integration::harness::seeds;
 use integration::iggy_harness;
 use reqwest::Client;
@@ -63,8 +66,8 @@ async fn health_endpoint_returns_healthy(harness: &TestHarness) {
         .unwrap();
 
     assert_eq!(response.status(), 200);
-    let body: serde_json::Value = response.json().await.unwrap();
-    assert_eq!(body["status"], "healthy");
+    let health: HealthResponse = response.json().await.unwrap();
+    assert_eq!(health.status, "healthy");
 }
 
 #[iggy_harness(
@@ -86,24 +89,14 @@ async fn stats_endpoint_returns_runtime_stats(harness: &TestHarness) {
         .unwrap();
 
     assert_eq!(response.status(), 200);
-    let stats: serde_json::Value = response.json().await.unwrap();
+    let stats: ConnectorRuntimeStats = response.json().await.unwrap();
 
-    assert!(stats.get("process_id").is_some());
-    assert!(stats.get("cpu_usage").is_some());
-    assert!(stats.get("memory_usage").is_some());
-    assert!(stats.get("run_time").is_some());
-    assert!(stats.get("start_time").is_some());
-    assert!(stats.get("sources_total").is_some());
-    assert!(stats.get("sources_running").is_some());
-    assert!(stats.get("sinks_total").is_some());
-    assert!(stats.get("sinks_running").is_some());
-    assert!(stats.get("connectors").is_some());
-
-    assert!(stats["connectors"].is_array());
-    assert_eq!(stats["sources_total"], 0);
-    assert_eq!(stats["sources_running"], 0);
-    assert_eq!(stats["sinks_total"], 0);
-    assert_eq!(stats["sinks_running"], 0);
+    assert!(stats.process_id > 0);
+    assert!(stats.connectors.is_empty());
+    assert_eq!(stats.sources_total, 0);
+    assert_eq!(stats.sources_running, 0);
+    assert_eq!(stats.sinks_total, 0);
+    assert_eq!(stats.sinks_running, 0);
 }
 
 #[iggy_harness(
@@ -152,10 +145,8 @@ async fn sources_endpoint_returns_list(harness: &TestHarness) {
         .unwrap();
 
     assert_eq!(response.status(), 200);
-    let sources: serde_json::Value = response.json().await.unwrap();
-
-    assert!(sources.is_array());
-    assert_eq!(sources.as_array().unwrap().len(), 0);
+    let sources: Vec<SourceInfoResponse> = response.json().await.unwrap();
+    assert!(sources.is_empty());
 }
 
 #[iggy_harness(
@@ -177,10 +168,8 @@ async fn sinks_endpoint_returns_list(harness: &TestHarness) {
         .unwrap();
 
     assert_eq!(response.status(), 200);
-    let sinks: serde_json::Value = response.json().await.unwrap();
-
-    assert!(sinks.is_array());
-    assert_eq!(sinks.as_array().unwrap().len(), 0);
+    let sinks: Vec<SinkInfoResponse> = response.json().await.unwrap();
+    assert!(sinks.is_empty());
 }
 
 #[iggy_harness(

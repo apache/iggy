@@ -17,12 +17,12 @@
  * under the License.
  */
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
 use elasticsearch::{
     Elasticsearch, SearchParts,
     auth::Credentials,
     http::{Url, transport::TransportBuilder},
 };
+use iggy_common::{DateTime, Utc};
 use iggy_connector_sdk::{
     ConnectorState, Error, ProducedMessage, ProducedMessages, Schema, Source, source_connector,
 };
@@ -40,8 +40,10 @@ pub use state_manager::{StateInfo, StateManager, StateStats};
 
 source_connector!(ElasticsearchSource);
 
+const CONNECTOR_NAME: &str = "Elasticsearch source";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct State {
+struct State {
     last_poll_timestamp: Option<DateTime<Utc>>,
     total_documents_fetched: usize,
     poll_count: usize,
@@ -112,7 +114,7 @@ pub struct ElasticsearchSource {
 }
 
 impl ElasticsearchSource {
-    pub fn new(id: u32, config: ElasticsearchSourceConfig, _state: Option<ConnectorState>) -> Self {
+    pub fn new(id: u32, config: ElasticsearchSourceConfig, state: Option<ConnectorState>) -> Self {
         let polling_interval = config
             .polling_interval
             .as_deref()
@@ -121,12 +123,22 @@ impl ElasticsearchSource {
             .unwrap_or_else(|_| humantime::Duration::from_str("10s").unwrap())
             .into();
 
+        let restored_state = state
+            .and_then(|s| s.deserialize::<State>(CONNECTOR_NAME, id))
+            .inspect(|s| {
+                info!(
+                    "Restored state for {CONNECTOR_NAME} connector with ID: {id}. \
+                     Documents fetched: {}, poll count: {}",
+                    s.total_documents_fetched, s.poll_count
+                );
+            });
+
         ElasticsearchSource {
             id,
             config,
             client: None,
             polling_interval,
-            state: Mutex::new(State {
+            state: Mutex::new(restored_state.unwrap_or(State {
                 last_poll_timestamp: None,
                 total_documents_fetched: 0,
                 poll_count: 0,
@@ -142,8 +154,12 @@ impl ElasticsearchSource {
                     empty_polls_count: 0,
                     successful_polls_count: 0,
                 },
-            }),
+            })),
         }
+    }
+
+    fn serialize_state(&self, state: &State) -> Option<ConnectorState> {
+        ConnectorState::serialize(state, CONNECTOR_NAME, self.id)
     }
 
     /// Create state storage based on configuration
@@ -514,16 +530,15 @@ impl Source for ElasticsearchSource {
                 return Err(e);
             }
         };
-        let state_value = {
+        let persisted_state = {
             let state = self.state.lock().await;
-            serde_json::to_vec(&*state).map_err(|err| {
-                Error::Serialization(format!("Failed to serialize state: {}", err))
-            })?
+            self.serialize_state(&state)
         };
+
         Ok(ProducedMessages {
             schema: Schema::Json,
             messages,
-            state: Some(ConnectorState(state_value)),
+            state: persisted_state,
         })
     }
 

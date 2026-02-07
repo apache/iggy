@@ -17,6 +17,7 @@
  */
 
 use base64::Engine;
+use iggy_common::IggyTimestamp;
 use prost::Message;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -501,7 +502,7 @@ impl ProtoConvert {
                                 "data": json_value,
                                 "metadata": {
                                     "converted_from": "protobuf",
-                                    "timestamp": chrono::Utc::now().timestamp_millis(),
+                                    "timestamp": IggyTimestamp::now().as_millis(),
                                     "message_type": self.config.message_type.clone().unwrap_or_else(|| "unknown".to_string())
                                 }
                             });
@@ -527,7 +528,7 @@ impl ProtoConvert {
                             "value": base64::engine::general_purpose::STANDARD.encode(&any.value),
                             "metadata": {
                                 "converted_from": "protobuf_any",
-                                "timestamp": chrono::Utc::now().timestamp_millis()
+                                "timestamp": IggyTimestamp::now().as_millis()
                             }
                         })
                     } else {

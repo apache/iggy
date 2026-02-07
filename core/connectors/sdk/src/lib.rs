@@ -36,6 +36,8 @@ use strum_macros::{Display, IntoStaticStr};
 use thiserror::Error;
 use tokio::runtime::Runtime;
 
+#[cfg(feature = "api")]
+pub mod api;
 pub mod decoders;
 pub mod encoders;
 pub mod log;
@@ -52,8 +54,46 @@ pub fn get_runtime() -> &'static Runtime {
     RUNTIME.get_or_init(|| Runtime::new().expect("Failed to create Tokio runtime"))
 }
 
+/// Connector state wrapper holding serialized state bytes.
+/// The inner bytes are serialized/deserialized using MessagePack via the helper methods.
+/// Note: Serialize/Deserialize derives are required for FFI boundary (postcard serialization).
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ConnectorState(pub Vec<u8>);
+
+impl ConnectorState {
+    /// Deserializes the connector state into the specified type using MessagePack.
+    /// Returns `None` if deserialization fails, logging the error.
+    pub fn deserialize<T: serde::de::DeserializeOwned>(
+        self,
+        connector_name: &str,
+        connector_id: u32,
+    ) -> Option<T> {
+        rmp_serde::from_slice(&self.0)
+            .inspect_err(|error| {
+                tracing::warn!(
+                    "Failed to deserialize state for {connector_name} connector with ID: {connector_id}. {error}"
+                );
+            })
+            .ok()
+    }
+
+    /// Serializes the provided state into a `ConnectorState` using MessagePack.
+    /// Returns `None` if serialization fails, logging the error.
+    pub fn serialize<T: serde::Serialize>(
+        state: &T,
+        connector_name: &str,
+        connector_id: u32,
+    ) -> Option<Self> {
+        rmp_serde::to_vec(state)
+            .inspect_err(|error| {
+                tracing::error!(
+                    "Failed to serialize state for {connector_name} connector with ID: {connector_id}. {error}"
+                );
+            })
+            .ok()
+            .map(ConnectorState)
+    }
+}
 
 /// The Source trait defines the interface for a source connector, responsible for producing the messages to the configured stream and topic.
 /// Once the messages are produced (e.g. fetched from an external API), they will be sent further to the specified destination.

@@ -32,7 +32,6 @@ readme = "README.md"
 async-trait = { workspace = true }
 axum = { workspace = true }
 axum-server = { workspace = true }
-chrono = { workspace = true }
 clap = { workspace = true }
 configs = { workspace = true }
 configs_derive = { workspace = true }
@@ -47,7 +46,7 @@ flume = { workspace = true }
 futures = { workspace = true }
 iggy = { workspace = true }
 iggy_common = { workspace = true }
-iggy_connector_sdk = { workspace = true }
+iggy_connector_sdk = { workspace = true, features = ["api"] }
 mimalloc = { workspace = true }
 once_cell = { workspace = true }
 opentelemetry = { workspace = true }

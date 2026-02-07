@@ -38,7 +38,6 @@ use tracing::{debug, error, info, trace, warn};
 use crate::configs::connectors::SourceConfig;
 use crate::context::RuntimeContext;
 use crate::log::LOG_CALLBACK;
-use crate::manager::status::ConnectorStatus;
 use crate::metrics::ConnectorType;
 use crate::{
     PLUGIN_ID, RuntimeError, SourceApi, SourceConnector, SourceConnectorPlugin,
@@ -46,8 +45,13 @@ use crate::{
     state::{FileStateProvider, StateProvider, StateStorage},
     transform,
 };
+use iggy_connector_sdk::api::ConnectorStatus;
 
 pub static SOURCE_SENDERS: Lazy<DashMap<u32, Sender<ProducedMessages>>> = Lazy::new(DashMap::new);
+
+pub fn cleanup_sender(plugin_id: u32) {
+    SOURCE_SENDERS.remove(&plugin_id);
+}
 
 pub async fn init(
     source_configs: HashMap<String, SourceConfig>,
@@ -62,7 +66,7 @@ pub async fn init(
             continue;
         }
 
-        let plugin_id = PLUGIN_ID.load(Ordering::Relaxed);
+        let plugin_id = PLUGIN_ID.fetch_add(1, Ordering::SeqCst);
         let path = resolve_plugin_path(&config.path);
         info!(
             "Initializing source container with name: {name} ({key}), config version: {}, plugin: {path}",
@@ -74,7 +78,7 @@ pub async fn init(
         };
         let init_error: Option<String>;
         if let Some(container) = source_connectors.get_mut(&path) {
-            info!("Source container for plugin: {path} is already loaded.",);
+            info!("Source container for plugin: {path} is already loaded.");
             let version = get_plugin_version(&container.container);
             init_error = init_source(
                 &container.container,
@@ -83,12 +87,12 @@ pub async fn init(
                 state,
             )
             .err()
-            .map(|e| e.to_string());
+            .map(|error| error.to_string());
             container.plugins.push(SourceConnectorPlugin {
                 id: plugin_id,
-                key: key.to_owned(),
-                name: name.to_owned(),
-                path: path.to_owned(),
+                key: key.clone(),
+                name: name.clone(),
+                path: path.clone(),
                 version,
                 config_format: config.plugin_config_format,
                 producer: None,
@@ -98,9 +102,14 @@ pub async fn init(
                 verbose: config.verbose,
             });
         } else {
-            let container: Container<SourceApi> =
-                unsafe { Container::load(&path).expect("Failed to load source container") };
-            info!("Source container for plugin: {path} loaded successfully.",);
+            let container: Container<SourceApi> = unsafe {
+                Container::load(&path).map_err(|error| {
+                    RuntimeError::InvalidConfiguration(format!(
+                        "Failed to load source container from {path}: {error}"
+                    ))
+                })?
+            };
+            info!("Source container for plugin: {path} loaded successfully.");
             let version = get_plugin_version(&container);
             init_error = init_source(
                 &container,
@@ -109,16 +118,16 @@ pub async fn init(
                 state,
             )
             .err()
-            .map(|e| e.to_string());
+            .map(|error| error.to_string());
             source_connectors.insert(
-                path.to_owned(),
+                path.clone(),
                 SourceConnector {
                     container,
                     plugins: vec![SourceConnectorPlugin {
                         id: plugin_id,
-                        key: key.to_owned(),
-                        name: name.to_owned(),
-                        path: path.to_owned(),
+                        key: key.clone(),
+                        name: name.clone(),
+                        path: path.clone(),
                         version,
                         config_format: config.plugin_config_format,
                         producer: None,
@@ -131,19 +140,19 @@ pub async fn init(
             );
         }
 
-        if let Some(err) = init_error {
-            error!("Source container with name: {name} ({key}) failed to initialize: {err}");
+        if let Some(error) = init_error {
+            error!("Source container with name: {name} ({key}) failed to initialize: {error}");
             continue;
         } else {
             info!(
                 "Source container with name: {name} ({key}), initialized successfully with ID: {plugin_id}."
             );
         }
-        PLUGIN_ID.fetch_add(1, Ordering::Relaxed);
 
         let transforms = if let Some(transforms_config) = config.transforms {
-            let transforms =
-                transform::load(&transforms_config).expect("Failed to load transforms");
+            let transforms = transform::load(&transforms_config).map_err(|error| {
+                RuntimeError::InvalidConfiguration(format!("Failed to load transforms: {error}"))
+            })?;
             let types = transforms
                 .iter()
                 .map(|t| t.r#type().into())
@@ -155,19 +164,28 @@ pub async fn init(
             vec![]
         };
 
-        let connector = source_connectors
-            .get_mut(&path)
-            .expect("Failed to get source connector");
+        let connector = source_connectors.get_mut(&path).ok_or_else(|| {
+            RuntimeError::InvalidConfiguration(format!(
+                "Source connector not found for path: {path}"
+            ))
+        })?;
         let plugin = connector
             .plugins
             .iter_mut()
             .find(|p| p.id == plugin_id)
-            .expect("Failed to get source plugin");
+            .ok_or_else(|| {
+                RuntimeError::InvalidConfiguration(format!(
+                    "Source plugin not found for ID: {plugin_id}"
+                ))
+            })?;
 
         for stream in config.streams.iter() {
-            let linger_time =
-                IggyDuration::from_str(stream.linger_time.as_deref().unwrap_or("5ms"))
-                    .expect("Invalid send interval");
+            let linger_time = IggyDuration::from_str(
+                stream.linger_time.as_deref().unwrap_or("5ms"),
+            )
+            .map_err(|error| {
+                RuntimeError::InvalidConfiguration(format!("Invalid linger time: {error}"))
+            })?;
             let batch_length = stream.batch_length.unwrap_or(1000);
             let producer = iggy_client
                 .producer(&stream.stream, &stream.topic)?
@@ -220,9 +238,9 @@ fn init_source(
         LOG_CALLBACK,
     );
     if result != 0 {
-        let err = format!("Plugin initialization failed (ID: {id})");
-        error!("{err}");
-        Err(RuntimeError::InvalidConfiguration(err))
+        let error = format!("Plugin initialization failed (ID: {id})");
+        error!("{error}");
+        Err(RuntimeError::InvalidConfiguration(error))
     } else {
         Ok(())
     }
@@ -291,9 +309,9 @@ pub fn handle(sources: Vec<SourceConnectorWrapper>, context: Arc<RuntimeContext>
                         .metrics
                         .increment_messages_produced(&plugin_key, count as u64);
                     if plugin.verbose {
-                        info!("Source connector with ID: {plugin_id} received {count} messages",);
+                        info!("Source connector with ID: {plugin_id} received {count} messages");
                     } else {
-                        debug!("Source connector with ID: {plugin_id} received {count} messages",);
+                        debug!("Source connector with ID: {plugin_id} received {count} messages");
                     }
                     let schema = produced_messages.schema;
                     let mut messages: Vec<DecodedMessage> = Vec::with_capacity(count);
@@ -328,30 +346,30 @@ pub fn handle(sources: Vec<SourceConnectorWrapper>, context: Arc<RuntimeContext>
                         messages,
                         &plugin.transforms,
                     ) else {
-                        let err = format!(
+                        let error_msg = format!(
                             "Failed to process {count} messages by source connector with ID: {plugin_id} before sending them to stream: {}, topic: {}.",
                             producer.stream(),
                             producer.topic()
                         );
-                        error!(err);
+                        error!("{error_msg}");
                         context
                             .metrics
                             .increment_errors(&plugin_key, ConnectorType::Source);
-                        context.sources.set_error(&plugin_key, &err).await;
+                        context.sources.set_error(&plugin_key, &error_msg).await;
                         continue;
                     };
 
                     if let Err(error) = producer.send(iggy_messages).await {
-                        let err = format!(
+                        let error_msg = format!(
                             "Failed to send {count} messages to stream: {}, topic: {} by source connector with ID: {plugin_id}. {error}",
                             producer.stream(),
                             producer.topic(),
                         );
-                        error!(err);
+                        error!("{error_msg}");
                         context
                             .metrics
                             .increment_errors(&plugin_key, ConnectorType::Source);
-                        context.sources.set_error(&plugin_key, &err).await;
+                        context.sources.set_error(&plugin_key, &error_msg).await;
                         continue;
                     }
 
@@ -381,11 +399,11 @@ pub fn handle(sources: Vec<SourceConnectorWrapper>, context: Arc<RuntimeContext>
                     match &plugin.state_storage {
                         StateStorage::File(file) => {
                             if let Err(error) = file.save(state).await {
-                                let err = format!(
+                                let error_msg = format!(
                                     "Failed to save state for source connector with ID: {plugin_id}. {error}"
                                 );
-                                error!(err);
-                                context.sources.set_error(&plugin_key, &err).await;
+                                error!("{error_msg}");
+                                context.sources.set_error(&plugin_key, &error_msg).await;
                                 continue;
                             }
                             debug!("State saved for source connector with ID: {plugin_id}");
@@ -461,7 +479,11 @@ extern "C" fn handle_produced_messages(
             let messages = std::slice::from_raw_parts(messages_ptr, messages_len);
             match postcard::from_bytes::<ProducedMessages>(messages) {
                 Ok(messages) => {
-                    let _ = sender.send(messages);
+                    if let Err(send_error) = sender.send(messages) {
+                        error!(
+                            "Failed to send messages for source connector with ID: {plugin_id}. Channel closed: {send_error}"
+                        );
+                    }
                 }
                 Err(err) => {
                     error!(

@@ -17,7 +17,7 @@
 
 use crate::server::scenarios::{
     consumer_group_auto_commit_reconnection_scenario, consumer_group_join_scenario,
-    consumer_group_offset_cleanup_scenario,
+    consumer_group_new_messages_after_restart_scenario, consumer_group_offset_cleanup_scenario,
     consumer_group_with_multiple_clients_polling_messages_scenario,
     consumer_group_with_single_client_polling_messages_scenario,
 };
@@ -56,6 +56,14 @@ async fn multiple_clients(harness: &TestHarness) {
 )]
 async fn auto_commit_reconnection(harness: &TestHarness) {
     consumer_group_auto_commit_reconnection_scenario::run(harness).await;
+}
+
+#[iggy_harness(
+    test_client_transport = [Tcp, WebSocket],
+    server(tcp.socket.override_defaults = true, tcp.socket.nodelay = true)
+)]
+async fn new_messages_after_restart(harness: &TestHarness) {
+    consumer_group_new_messages_after_restart_scenario::run(harness).await;
 }
 
 #[iggy_harness(

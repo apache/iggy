@@ -17,8 +17,8 @@
  */
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
 use humantime::Duration as HumanDuration;
+use iggy_common::{DateTime, Utc};
 use iggy_connector_sdk::{
     ConsumedMessage, Error, MessagesMetadata, Sink, TopicMetadata, sink_connector,
 };
@@ -42,6 +42,7 @@ pub struct PostgresSink {
     config: PostgresSinkConfig,
     state: Mutex<State>,
     verbose: bool,
+    retry_delay: Duration,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,6 +96,10 @@ struct State {
 impl PostgresSink {
     pub fn new(id: u32, config: PostgresSinkConfig) -> Self {
         let verbose = config.verbose_logging.unwrap_or(false);
+        let delay_str = config.retry_delay.as_deref().unwrap_or(DEFAULT_RETRY_DELAY);
+        let retry_delay = HumanDuration::from_str(delay_str)
+            .map(|duration| duration.into())
+            .unwrap_or_else(|_| Duration::from_secs(1));
         PostgresSink {
             id,
             pool: None,
@@ -104,6 +109,7 @@ impl PostgresSink {
                 insertion_errors: 0,
             }),
             verbose,
+            retry_delay,
         }
     }
 }
@@ -310,7 +316,7 @@ impl PostgresSink {
         payload_format: PayloadFormat,
     ) -> Result<(), Error> {
         let max_retries = self.get_max_retries();
-        let retry_delay = self.get_retry_delay();
+        let retry_delay = self.retry_delay;
         let mut attempts = 0u32;
 
         loop {
@@ -432,17 +438,6 @@ impl PostgresSink {
 
     fn get_max_retries(&self) -> u32 {
         self.config.max_retries.unwrap_or(DEFAULT_MAX_RETRIES)
-    }
-
-    fn get_retry_delay(&self) -> Duration {
-        let delay_str = self
-            .config
-            .retry_delay
-            .as_deref()
-            .unwrap_or(DEFAULT_RETRY_DELAY);
-        HumanDuration::from_str(delay_str)
-            .unwrap_or_else(|e| panic!("Invalid retry_delay '{delay_str}': {e}"))
-            .into()
     }
 
     fn parse_timestamp(&self, micros: u64) -> DateTime<Utc> {
@@ -687,7 +682,7 @@ mod tests {
     #[test]
     fn given_default_config_should_use_default_retry_delay() {
         let sink = PostgresSink::new(1, test_config());
-        assert_eq!(sink.get_retry_delay(), Duration::from_secs(1));
+        assert_eq!(sink.retry_delay, Duration::from_secs(1));
     }
 
     #[test]
@@ -695,7 +690,7 @@ mod tests {
         let mut config = test_config();
         config.retry_delay = Some("500ms".to_string());
         let sink = PostgresSink::new(1, config);
-        assert_eq!(sink.get_retry_delay(), Duration::from_millis(500));
+        assert_eq!(sink.retry_delay, Duration::from_millis(500));
     }
 
     #[test]

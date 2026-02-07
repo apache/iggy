@@ -105,5 +105,8 @@ pub use utils::hash::*;
 pub use utils::personal_access_token_expiry::PersonalAccessTokenExpiry;
 pub use utils::text;
 pub use utils::timestamp::*;
+
+// Re-export chrono types for connectors and other crates that need DateTime
+pub use chrono::{DateTime, Duration as ChronoDuration, Utc};
 pub use utils::topic_size::MaxTopicSize;
 pub use utils::versioning::SemanticVersion;

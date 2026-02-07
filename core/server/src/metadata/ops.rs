@@ -114,6 +114,7 @@ pub enum MetadataOp {
         group_id: ConsumerGroupId,
         client_id: u32,
         member_id: Arc<AtomicUsize>,
+        valid_client_ids: Option<Vec<u32>>,
     },
     LeaveConsumerGroup {
         stream_id: StreamId,
