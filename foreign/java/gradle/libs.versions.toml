@@ -113,3 +113,4 @@ testing = ["junit-jupiter", "junit-platform-launcher", "assertj-core"]
 [plugins]
 spotless = { id = "com.diffplug.spotless", version.ref = "spotless" }
 shadow = { id = "com.gradleup.shadow", version.ref = "shadow" }
+jacoco = { id = "org.jacoco", version.ref = "jacoco" }

@@ -21,7 +21,7 @@ import com.diffplug.gradle.spotless.SpotlessExtension
 
 plugins {
     alias(libs.plugins.spotless) apply false
-    jacoco
+    alias(libs.plugins.jacoco)
 }
 
 repositories {
