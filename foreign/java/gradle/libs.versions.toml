@@ -58,7 +58,6 @@ typesafe-config = "1.4.5"
 spotless = "8.1.0"
 shadow = "9.2.2"
 checkstyle = "12.1.2"
-jacoco = "0.8.14"
 
 [libraries]
 # Jackson
@@ -113,4 +112,3 @@ testing = ["junit-jupiter", "junit-platform-launcher", "assertj-core"]
 [plugins]
 spotless = { id = "com.diffplug.spotless", version.ref = "spotless" }
 shadow = { id = "com.gradleup.shadow", version.ref = "shadow" }
-jacoco = { id = "org.jacoco", version.ref = "jacoco" }
