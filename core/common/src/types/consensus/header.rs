@@ -114,6 +114,8 @@ pub enum Operation {
     UpdatePermissions = 145,
     CreatePersonalAccessToken = 146,
     DeletePersonalAccessToken = 147,
+
+    Reserved = 200,
 }
 
 #[repr(C)]
@@ -170,6 +172,30 @@ pub struct RequestHeader {
     pub request: u64,
     pub operation: Operation,
     pub reserved: [u8; 95],
+}
+
+impl Default for RequestHeader {
+    fn default() -> Self {
+        Self {
+            reserved: [0; 95],
+            checksum: 0,
+            checksum_body: 0,
+            cluster: 0,
+            size: 0,
+            epoch: 0,
+            view: 0,
+            release: 0,
+            protocol: 0,
+            command: Default::default(),
+            replica: 0,
+            reserved_frame: [0; 12],
+            client: 0,
+            request_checksum: 0,
+            timestamp: 0,
+            request: 0,
+            operation: Default::default(),
+        }
+    }
 }
 
 unsafe impl Pod for RequestHeader {}
@@ -348,7 +374,7 @@ impl ConsensusHeader for CommitHeader {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Default, Debug, Clone, Copy)]
 pub struct ReplyHeader {
     pub checksum: u128,
     pub checksum_body: u128,

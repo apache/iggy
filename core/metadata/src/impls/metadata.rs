@@ -14,61 +14,63 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+use crate::stm::StateMachine;
 use consensus::{Consensus, Project, Sequencer, Status, VsrConsensus};
 use iggy_common::{
-    header::{Command2, PrepareHeader, PrepareOkHeader},
+    header::{Command2, GenericHeader, PrepareHeader, PrepareOkHeader, ReplyHeader},
     message::Message,
 };
 use journal::{Journal, JournalHandle};
 use message_bus::MessageBus;
 use tracing::{debug, warn};
 
-#[expect(unused)]
 pub trait Metadata<C>
 where
     C: Consensus,
 {
     /// Handle a request message.
-    fn on_request(&self, message: C::RequestMessage);
+    fn on_request(&self, message: C::RequestMessage) -> impl Future<Output = ()>;
 
     /// Handle a replicate message (Prepare in VSR).
     fn on_replicate(&self, message: C::ReplicateMessage) -> impl Future<Output = ()>;
 
     /// Handle an ack message (PrepareOk in VSR).
-    fn on_ack(&self, message: C::AckMessage);
+    fn on_ack(&self, message: C::AckMessage) -> impl Future<Output = ()>;
 }
 
-#[expect(unused)]
-struct IggyMetadata<C, J, S, M> {
+#[derive(Debug)]
+pub struct IggyMetadata<C, J, S, M> {
     /// Some on shard0, None on other shards
-    consensus: Option<C>,
+    pub consensus: Option<C>,
     /// Some on shard0, None on other shards
-    journal: Option<J>,
+    pub journal: Option<J>,
     /// Some on shard0, None on other shards
-    snapshot: Option<S>,
+    pub snapshot: Option<S>,
     /// State machine - lives on all shards
-    mux_stm: M,
+    pub mux_stm: M,
 }
 
-impl<J, S, M> Metadata<VsrConsensus> for IggyMetadata<VsrConsensus, J, S, M>
+impl<B, J, S, M> Metadata<VsrConsensus<B>> for IggyMetadata<VsrConsensus<B>, J, S, M>
 where
+    B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
     J: JournalHandle,
     J::Target: Journal<
             J::Storage,
-            Entry = <VsrConsensus as Consensus>::ReplicateMessage,
+            Entry = <VsrConsensus<B> as Consensus>::ReplicateMessage,
             Header = PrepareHeader,
         >,
+    M: StateMachine<Input = Message<PrepareHeader>>,
 {
-    fn on_request(&self, message: <VsrConsensus as Consensus>::RequestMessage) {
+    async fn on_request(&self, message: <VsrConsensus<B> as Consensus>::RequestMessage) {
         let consensus = self.consensus.as_ref().unwrap();
 
         // TODO: Bunch of asserts.
         debug!("handling metadata request");
         let prepare = message.project(consensus);
-        self.pipeline_prepare(prepare);
+        self.pipeline_prepare(prepare).await;
     }
 
-    async fn on_replicate(&self, message: <VsrConsensus as Consensus>::ReplicateMessage) {
+    async fn on_replicate(&self, message: <VsrConsensus<B> as Consensus>::ReplicateMessage) {
         let consensus = self.consensus.as_ref().unwrap();
         let journal = self.journal.as_ref().unwrap();
 
@@ -92,20 +94,6 @@ where
         }
 
         let current_op = consensus.sequencer().current_sequence();
-
-        // Old message (handle as repair). Not replicating.
-        if header.view < consensus.view()
-            || (consensus.status() == Status::Normal
-                && header.view == consensus.view()
-                && header.op <= current_op)
-        {
-            debug!(
-                replica = consensus.replica(),
-                "on_replicate: ignoring (repair)"
-            );
-            self.on_repair(message);
-            return;
-        }
 
         // If status is not normal, ignore the replicate.
         if consensus.status() != Status::Normal {
@@ -137,14 +125,13 @@ where
         // TODO handle gap in ops.
 
         // Verify hash chain integrity.
-        if let Some(previous) = journal.handle().previous_entry(header) {
-            self.panic_if_hash_chain_would_break_in_same_view(&previous, header);
+        if let Some(previous) = journal.handle().previous_header(header) {
+            self.panic_if_hash_chain_would_break_in_same_view(previous, header);
         }
 
         assert_eq!(header.op, current_op + 1);
 
         consensus.sequencer().set_sequence(header.op);
-        journal.handle().set_header_as_dirty(header);
 
         // Append to journal.
         journal.handle().append(message.clone()).await;
@@ -158,7 +145,7 @@ where
         }
     }
 
-    fn on_ack(&self, message: <VsrConsensus as Consensus>::AckMessage) {
+    async fn on_ack(&self, message: <VsrConsensus<B> as Consensus>::AckMessage) {
         let consensus = self.consensus.as_ref().unwrap();
         let header = message.header();
 
@@ -172,63 +159,117 @@ where
             return;
         }
 
-        // Find the prepare in pipeline
-        let mut pipeline = consensus.pipeline().borrow_mut();
-        let Some(entry) = pipeline.message_by_op_and_checksum(header.op, header.prepare_checksum)
-        else {
-            debug!("on_ack: prepare not in pipeline op={}", header.op);
-            return;
-        };
+        // Verify checksum by checking pipeline entry exists
+        {
+            let pipeline = consensus.pipeline().borrow();
+            let Some(entry) =
+                pipeline.message_by_op_and_checksum(header.op, header.prepare_checksum)
+            else {
+                debug!("on_ack: prepare not in pipeline op={}", header.op);
+                return;
+            };
 
-        // Verify checksum matches
-        if entry.message.header().checksum != header.prepare_checksum {
-            warn!("on_ack: checksum mismatch");
-            return;
+            if entry.message.header().checksum != header.prepare_checksum {
+                warn!("on_ack: checksum mismatch");
+                return;
+            }
         }
 
-        // Record ack
-        let count = entry.add_ack(header.replica);
-
-        // Check quorum
-        if count >= consensus.quorum() && !entry.ok_quorum_received {
-            entry.ok_quorum_received = true;
+        // Let consensus handle the ack increment and quorum check
+        if consensus.handle_prepare_ok(header) {
             debug!("on_ack: quorum received for op={}", header.op);
-
-            // Advance commit number and trigger commit journal
             consensus.advance_commit_number(header.op);
-            self.commit_journal();
+
+            // Extract the prepare message from the pipeline by op
+            // TODO: Commit from the head. ALWAYS
+            let entry = consensus.pipeline().borrow_mut().extract_by_op(header.op);
+            let Some(entry) = entry else {
+                warn!("on_ack: prepare not found in pipeline for op={}", header.op);
+                return;
+            };
+
+            let prepare = entry.message;
+            let prepare_header = *prepare.header();
+
+            // Apply the state (consumes prepare)
+            // TODO: Handle appending result to response
+            let _result = self.mux_stm.update(prepare);
+            debug!("on_ack: state applied for op={}", prepare_header.op);
+
+            // TODO: Figure out better infra for this, its messy.
+            let reply = Message::<ReplyHeader>::new(std::mem::size_of::<ReplyHeader>())
+                .transmute_header(|_, new| {
+                    *new = ReplyHeader {
+                        checksum: 0,
+                        checksum_body: 0,
+                        cluster: consensus.cluster(),
+                        size: std::mem::size_of::<ReplyHeader>() as u32,
+                        epoch: prepare_header.epoch,
+                        view: consensus.view(),
+                        release: 0,
+                        protocol: 0,
+                        command: Command2::Reply,
+                        replica: consensus.replica(),
+                        reserved_frame: [0; 12],
+                        request_checksum: prepare_header.request_checksum,
+                        request_checksum_padding: 0,
+                        context: 0,
+                        context_padding: 0,
+                        op: prepare_header.op,
+                        commit: consensus.commit(),
+                        timestamp: prepare_header.timestamp,
+                        request: prepare_header.request,
+                        operation: prepare_header.operation,
+                        ..Default::default()
+                    };
+                });
+
+            // Send reply to client
+            let generic_reply = reply.into_generic();
+            debug!(
+                "on_ack: sending reply to client={} for op={}",
+                prepare_header.client, prepare_header.op
+            );
+
+            // TODO: Error handling
+            consensus
+                .message_bus()
+                .send_to_client(prepare_header.client, generic_reply)
+                .await
+                .unwrap()
         }
     }
 }
 
-impl<J, S, M> IggyMetadata<VsrConsensus, J, S, M>
+impl<B, J, S, M> IggyMetadata<VsrConsensus<B>, J, S, M>
 where
+    B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
     J: JournalHandle,
     J::Target: Journal<
             J::Storage,
-            Entry = <VsrConsensus as Consensus>::ReplicateMessage,
+            Entry = <VsrConsensus<B> as Consensus>::ReplicateMessage,
             Header = PrepareHeader,
         >,
+    M: StateMachine<Input = Message<PrepareHeader>>,
 {
-    #[expect(unused)]
-    fn pipeline_prepare(&self, prepare: Message<PrepareHeader>) {
+    async fn pipeline_prepare(&self, prepare: Message<PrepareHeader>) {
         let consensus = self.consensus.as_ref().unwrap();
 
         debug!("inserting prepare into metadata pipeline");
         consensus.verify_pipeline();
         consensus.pipeline_message(prepare.clone());
 
-        self.on_replicate(prepare.clone());
+        self.on_replicate(prepare.clone()).await;
         consensus.post_replicate_verify(&prepare);
     }
 
     fn fence_old_prepare(&self, prepare: &Message<PrepareHeader>) -> bool {
-        let (Some(consensus), Some(journal)) = (&self.consensus, &self.journal) else {
-            todo!("dispatch fence_old_prepare to shard0");
-        };
+        let consensus = self.consensus.as_ref().unwrap();
+        let journal = self.journal.as_ref().unwrap();
 
         let header = prepare.header();
-        header.op <= consensus.commit() || journal.handle().entry(header).is_some()
+        // TODO: Handle idx calculation, for now using header.op, but since the journal may get compacted, this may not be correct.
+        header.op <= consensus.commit() || journal.handle().header(header.op as usize).is_some()
     }
 
     /// Replicate a prepare message to the next replica in the chain.
@@ -243,9 +284,11 @@ where
 
         let header = message.header();
 
+        // TODO: calculate the index;
+        let idx = header.op as usize;
         assert_eq!(header.command, Command2::Prepare);
         assert!(
-            journal.handle().entry(header).is_none(),
+            journal.handle().header(idx).is_none(),
             "replicate: must not already have prepare"
         );
         assert!(header.op > consensus.commit());
@@ -279,10 +322,6 @@ where
             .unwrap();
     }
 
-    fn on_repair(&self, _message: Message<PrepareHeader>) {
-        todo!()
-    }
-
     /// Verify hash chain would not break if we add this header.
     fn panic_if_hash_chain_would_break_in_same_view(
         &self,
@@ -306,7 +345,6 @@ where
         // TODO: Implement commit logic
         // Walk through journal from last committed to current commit number
         // Apply each entry to the state machine
-        todo!()
     }
 
     /// Send a prepare_ok message to the primary.
@@ -335,7 +373,7 @@ where
         }
 
         // Verify we have the prepare and it's persisted (not dirty).
-        if journal.handle().entry(header).is_none() {
+        if journal.handle().header(header.op as usize).is_none() {
             debug!(
                 replica = consensus.replica(),
                 op = header.op,
@@ -398,6 +436,12 @@ where
                 "send_prepare_ok: loopback to self"
             );
             // TODO: Queue for self-processing or call handle_prepare_ok directly
+            // TODO: This is temporal, to test simulator, but we should send message to ourselves properly.
+            consensus
+                .message_bus()
+                .send_to_replica(primary, generic_message)
+                .await
+                .unwrap();
         } else {
             debug!(
                 replica = consensus.replica(),

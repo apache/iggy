@@ -1,0 +1,165 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+pub mod bus;
+pub mod client;
+pub mod deps;
+pub mod replica;
+
+use bus::MemBus;
+use iggy_common::header::{GenericHeader, ReplyHeader};
+use iggy_common::message::{Message, MessageBag};
+use message_bus::MessageBus;
+use metadata::Metadata;
+use replica::Replica;
+use std::sync::Arc;
+
+#[derive(Debug)]
+pub struct Simulator {
+    pub replicas: Vec<Replica>,
+    pub message_bus: Arc<MemBus>,
+}
+
+impl Simulator {
+    pub fn new(replica_count: usize, clients: impl Iterator<Item = u128>) -> Self {
+        let mut message_bus = MemBus::new();
+        for client in clients {
+            message_bus.add_client(client, ());
+        }
+
+        for i in 0..replica_count as u8 {
+            message_bus.add_replica(i);
+        }
+
+        let message_bus = Arc::new(message_bus);
+        let replicas = (0..replica_count)
+            .map(|i| {
+                Replica::new(
+                    i as u8,
+                    format!("replica-{}", i),
+                    Arc::clone(&message_bus),
+                    replica_count as u8,
+                )
+            })
+            .collect();
+
+        Self {
+            replicas,
+            message_bus,
+        }
+    }
+
+    pub fn with_message_bus(replica_count: usize, mut message_bus: MemBus) -> Self {
+        for i in 0..replica_count as u8 {
+            message_bus.add_replica(i);
+        }
+
+        let message_bus = Arc::new(message_bus);
+        let replicas = (0..replica_count)
+            .map(|i| {
+                Replica::new(
+                    i as u8,
+                    format!("replica-{}", i),
+                    Arc::clone(&message_bus),
+                    replica_count as u8,
+                )
+            })
+            .collect();
+
+        Self {
+            replicas,
+            message_bus,
+        }
+    }
+}
+
+impl Simulator {
+    pub async fn step(&self) -> Option<Message<ReplyHeader>> {
+        if let Some(envelope) = self.message_bus.receive() {
+            if let Some(_client_id) = envelope.to_client {
+                let reply: Message<ReplyHeader> = envelope
+                    .message
+                    .try_into_typed()
+                    .expect("invalid message, wrong command type for an client response");
+                return Some(reply);
+            }
+
+            if let Some(replica_id) = envelope.to_replica
+                && let Some(replica) = self.replicas.get(replica_id as usize)
+            {
+                self.dispatch_to_replica(replica, envelope.message).await;
+            }
+        }
+
+        None
+    }
+
+    async fn dispatch_to_replica(&self, replica: &Replica, message: Message<GenericHeader>) {
+        let message: MessageBag = message.into();
+        let operation = match &message {
+            MessageBag::Request(message) => message.header().operation,
+            MessageBag::Prepare(message) => message.header().operation,
+            MessageBag::PrepareOk(message) => message.header().operation,
+        } as u8;
+
+        if operation < 200 {
+            self.dispatch_to_metadata_on_replica(replica, message).await;
+        } else {
+            self.dispatch_to_partition_on_replica(replica, message);
+        }
+    }
+
+    async fn dispatch_to_metadata_on_replica(&self, replica: &Replica, message: MessageBag) {
+        match message {
+            MessageBag::Request(request) => {
+                replica.metadata.on_request(request).await;
+            }
+            MessageBag::Prepare(prepare) => {
+                replica.metadata.on_replicate(prepare).await;
+            }
+            MessageBag::PrepareOk(prepare_ok) => {
+                replica.metadata.on_ack(prepare_ok).await;
+            }
+        }
+    }
+
+    fn dispatch_to_partition_on_replica(&self, replica: &Replica, message: MessageBag) {
+        match message {
+            MessageBag::Request(request) => {
+                todo!(
+                    "dispatch request to partition replica {}: operation={:?}",
+                    replica.id,
+                    request.header().operation
+                );
+            }
+            MessageBag::Prepare(prepare) => {
+                todo!(
+                    "dispatch prepare to partition replica {}: operation={:?}",
+                    replica.id,
+                    prepare.header().operation
+                );
+            }
+            MessageBag::PrepareOk(prepare_ok) => {
+                todo!(
+                    "dispatch prepare_ok to partition replica {}: op={}",
+                    replica.id,
+                    prepare_ok.header().op
+                );
+            }
+        }
+    }
+}

@@ -17,8 +17,14 @@
 
 //! Iggy metadata module
 
-mod impls;
+pub mod impls;
 pub mod permissioner;
 pub mod stm;
 
 mod stats;
+
+// Re-export IggyMetadata and Metadata trait for use in other modules
+pub use impls::metadata::{IggyMetadata, Metadata};
+
+// Re-export MuxStateMachine for use in other modules
+pub use stm::mux::MuxStateMachine;
