@@ -38,17 +38,20 @@ coverage:
         if_ci_failed: error
 
 flags:
+  rust:
+    paths:
+      - core/
+    carryforward: true
   java:
     paths:
       - foreign/java/java-sdk/src/main/
-      - foreign/java/external-processors/iggy-connector-flink/iggy-connector-library/src/main/
-      - foreign/java/external-processors/iggy-connector-pinot/src/main/
+      - foreign/java/external-processors/
     carryforward: true
 
 comment:
   layout: "reach, diff, flags, files"
   behavior: default
-  require_changes: false
+  require_changes: true
   require_base: no
   require_head: yes
 

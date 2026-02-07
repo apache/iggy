@@ -112,18 +112,6 @@ runs:
           fi
         fi
 
-    - name: Upload coverage to Codecov
-      if: ${{ !cancelled() && inputs.task == 'test' }}
-      uses: codecov/codecov-action@v4
-      with:
-        files: ./reports/java-coverage/jacocoAggregated.xml
-        flags: java
-        name: java-coverage
-        fail_ci_if_error: false
-        token: ${{ secrets.CODECOV_TOKEN }}
-      env:
-        CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
-
     - name: Copy test reports
       if: ${{ !cancelled() && inputs.task == 'test' }}
       shell: bash
