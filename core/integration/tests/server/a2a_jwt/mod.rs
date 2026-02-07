@@ -17,18 +17,4 @@
  * under the License.
  */
 
-mod client;
-mod common;
-mod connectors_runtime;
-mod jwks;
-mod mcp;
-mod resolve;
-mod server;
-
-pub use client::{AutoLoginConfig, ClientConfig};
-pub use common::{EncryptionConfig, IpAddrKind, TlsConfig};
-pub use connectors_runtime::ConnectorsRuntimeConfig;
-pub use jwks::JwksConfig;
-pub use mcp::McpConfig;
-pub use resolve::resolve_config_paths;
-pub use server::TestServerConfig;
+mod jwt_tests;

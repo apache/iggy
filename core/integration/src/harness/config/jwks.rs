@@ -17,18 +17,12 @@
  * under the License.
  */
 
-mod client;
-mod common;
-mod connectors_runtime;
-mod jwks;
-mod mcp;
-mod resolve;
-mod server;
+use bon::Builder;
 
-pub use client::{AutoLoginConfig, ClientConfig};
-pub use common::{EncryptionConfig, IpAddrKind, TlsConfig};
-pub use connectors_runtime::ConnectorsRuntimeConfig;
-pub use jwks::JwksConfig;
-pub use mcp::McpConfig;
-pub use resolve::resolve_config_paths;
-pub use server::TestServerConfig;
+#[derive(Debug, Clone, Builder, Default)]
+pub struct JwksConfig {
+    pub enabled: bool,
+    pub issuer_url: Option<String>,
+    #[builder(into)]
+    pub store_path: Option<String>,
+}

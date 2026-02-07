@@ -117,6 +117,12 @@ decoding_secret = "top_secret$iggy123$_jwt_HS256_key#!"
 # `false` means the secret is in plain text.
 use_base64_secret = false
 
+# Trusted issuers for A2A (Application-to-Application) authentication
+[[http.jwt.trusted_issuers]]
+issuer = "test-issuer"
+jwks_url = "http://127.0.0.1:8081/.well-known/jwks.json"
+audience = "iggy.apache.org"
+
 # Metrics configuration for HTTP.
 [http.metrics]
 # Enable or disable the metrics endpoint.
