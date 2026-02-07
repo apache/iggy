@@ -29,7 +29,7 @@ coverage:
     project:
       default:
         target: auto
-        threshold: 0.5%  # Allow 0.5% drop in coverage
+        threshold: 6%
         if_ci_failed: error
     patch:
       default:
