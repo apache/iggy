@@ -19,11 +19,10 @@
 use crate::binary::command::{
     BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
 };
-use crate::binary::handlers::streams::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
+use crate::binary::mapper;
 use crate::shard::IggyShard;
 use crate::streaming::session::Session;
-use err_trail::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::SenderKind;
 use iggy_common::get_streams::GetStreams;
@@ -44,17 +43,9 @@ impl ServerCommandHandler for GetStreams {
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
         shard.ensure_authenticated(session)?;
-        shard
-            .metadata
-            .perm_get_streams(session.get_user_id())
-            .error(|e: &IggyError| {
-                format!(
-                    "{COMPONENT} (error: {e}) - permission denied to get streams for user {}",
-                    session.get_user_id()
-                )
-            })?;
 
-        let response = shard.get_streams_from_metadata();
+        let streams = shard.metadata.query_streams(session.get_user_id())?;
+        let response = mapper::map_streams(&streams);
         sender.send_ok_response(&response).await?;
         Ok(HandlerResult::Finished)
     }

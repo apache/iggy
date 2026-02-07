@@ -16,25 +16,17 @@
  * under the License.
  */
 
-use std::rc::Rc;
-
 use crate::binary::command::{
     BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
 };
-use crate::binary::handlers::users::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
-
 use crate::shard::IggyShard;
 use crate::shard::transmission::frame::ShardResponse;
-use crate::shard::transmission::message::{
-    ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult,
-};
-use crate::state::command::EntryCommand;
+use crate::shard::transmission::message::{ShardRequest, ShardRequestPayload};
 use crate::streaming::session::Session;
-use err_trail::ErrContext;
 use iggy_common::update_user::UpdateUser;
-use iggy_common::{Identifier, IggyError, SenderKind};
-use tracing::info;
+use iggy_common::{IggyError, SenderKind};
+use std::rc::Rc;
 use tracing::{debug, instrument};
 
 impl ServerCommandHandler for UpdateUser {
@@ -54,79 +46,17 @@ impl ServerCommandHandler for UpdateUser {
         shard.ensure_authenticated(session)?;
         shard.metadata.perm_update_user(session.get_user_id())?;
 
-        let user_id_for_log = self.user_id.clone();
-        let request = ShardRequest {
-            stream_id: Identifier::default(),
-            topic_id: Identifier::default(),
-            partition_id: 0,
-            payload: ShardRequestPayload::UpdateUser {
-                session_user_id: session.get_user_id(),
-                user_id: self.user_id.clone(),
-                username: self.username.clone(),
-                status: self.status,
-            },
-        };
+        let request = ShardRequest::control_plane(ShardRequestPayload::UpdateUserRequest {
+            user_id: session.get_user_id(),
+            command: self,
+        });
 
-        let message = ShardMessage::Request(request);
-        match shard.send_request_to_shard_or_recoil(None, message).await? {
-            ShardSendRequestResult::Recoil(message) => {
-                if let ShardMessage::Request(ShardRequest { payload, .. }) = message
-                    && let ShardRequestPayload::UpdateUser {
-                        user_id,
-                        username,
-                        status,
-                        ..
-                    } = payload
-                {
-                    let _user_guard = shard.fs_locks.user_lock.lock().await;
-                    let user = shard
-                        .update_user(&user_id, username.clone(), status)
-                        .error(|e: &IggyError| {
-                            format!(
-                                "{COMPONENT} (error: {e}) - failed to update user with user_id: {}, session: {session}",
-                                user_id
-                            )
-                        })?;
-
-                    info!("Updated user: {} with ID: {}.", user.username, user.id);
-
-                    shard
-                        .state
-                        .apply(
-                            session.get_user_id(),
-                            &EntryCommand::UpdateUser(UpdateUser {
-                                user_id: user_id_for_log.clone(),
-                                username,
-                                status,
-                            }),
-                        )
-                        .await
-                        .error(|e: &IggyError| {
-                            format!(
-                                "{COMPONENT} (error: {e}) - failed to apply update user with user_id: {}, session: {session}",
-                                user_id_for_log
-                            )
-                        })?;
-
-                    sender.send_empty_ok_response().await?;
-                } else {
-                    unreachable!(
-                        "Expected an UpdateUser request inside of UpdateUser handler, impossible state"
-                    );
-                }
+        match shard.send_to_control_plane(request).await? {
+            ShardResponse::UpdateUserResponse(_) => {
+                sender.send_empty_ok_response().await?;
             }
-            ShardSendRequestResult::Response(response) => match response {
-                ShardResponse::UpdateUserResponse(user) => {
-                    info!("Updated user: {} with ID: {}.", user.username, user.id);
-                    sender.send_empty_ok_response().await?;
-                }
-                ShardResponse::ErrorResponse(err) => {
-                    return Err(err);
-                }
-                _ => unreachable!(
-                    "Expected an UpdateUserResponse inside of UpdateUser handler, impossible state"
-                ),
-            },
+            ShardResponse::ErrorResponse(err) => return Err(err),
+            _ => unreachable!("Expected UpdateUserResponse"),
         }
 
         Ok(HandlerResult::Finished)

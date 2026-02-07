@@ -167,7 +167,6 @@ impl IggyShardBuilder {
             metadata_writer: self.metadata_writer.map(RefCell::new),
             local_partitions,
             pending_partition_inits: RefCell::new(AHashSet::new()),
-            fs_locks: Default::default(),
             encryptor,
             config,
             _version: version,

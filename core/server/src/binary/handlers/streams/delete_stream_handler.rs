@@ -19,20 +19,14 @@
 use crate::binary::command::{
     BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
 };
-use crate::binary::handlers::streams::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::shard::IggyShard;
 use crate::shard::transmission::frame::ShardResponse;
-use crate::shard::transmission::message::{
-    ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult,
-};
-use crate::state::command::EntryCommand;
+use crate::shard::transmission::message::{ShardRequest, ShardRequestPayload};
 use crate::streaming::session::Session;
-use err_trail::ErrContext;
 use iggy_common::delete_stream::DeleteStream;
-use iggy_common::{Identifier, IggyError, SenderKind};
+use iggy_common::{IggyError, SenderKind};
 use std::rc::Rc;
-use tracing::info;
 use tracing::{debug, instrument};
 
 impl ServerCommandHandler for DeleteStream {
@@ -50,62 +44,18 @@ impl ServerCommandHandler for DeleteStream {
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
         shard.ensure_authenticated(session)?;
-        let stream_id = shard.resolve_stream_id(&self.stream_id)?;
-        shard
-            .metadata
-            .perm_delete_stream(session.get_user_id(), stream_id)?;
-        let request = ShardRequest {
-            stream_id: Identifier::default(),
-            topic_id: Identifier::default(),
-            partition_id: 0,
-            payload: ShardRequestPayload::DeleteStream {
-                user_id: session.get_user_id(),
-                stream_id: self.stream_id,
-            },
-        };
 
-        let message = ShardMessage::Request(request);
-        match shard.send_request_to_shard_or_recoil(None, message).await? {
-            ShardSendRequestResult::Recoil(message) => {
-                if let ShardMessage::Request(ShardRequest { payload, .. }) = message
-                    && let ShardRequestPayload::DeleteStream { stream_id, .. } = payload
-                {
-                    // Acquire stream lock to serialize filesystem operations
-                    let _stream_guard = shard.fs_locks.stream_lock.lock().await;
-                    let stream_info = shard
-                        .delete_stream(&stream_id)
-                        .await
-                        .error(|e: &IggyError| {
-                            format!("{COMPONENT} (error: {e}) - failed to delete stream with ID: {stream_id}, session: {session}")
-                        })?;
-                    info!(
-                        "Deleted stream with name: {}, ID: {}",
-                        stream_info.name, stream_info.id
-                    );
+        let request = ShardRequest::control_plane(ShardRequestPayload::DeleteStreamRequest {
+            user_id: session.get_user_id(),
+            command: self,
+        });
 
-                    shard
-                        .state
-                        .apply(session.get_user_id(), &EntryCommand::DeleteStream(DeleteStream { stream_id: stream_id.clone() }))
-                        .await
-                        .error(|e: &IggyError| {
-                            format!("{COMPONENT} (error: {e}) - failed to apply delete stream with ID: {stream_id}, session: {session}")
-                        })?;
-                    sender.send_empty_ok_response().await?;
-                }
+        match shard.send_to_control_plane(request).await? {
+            ShardResponse::DeleteStreamResponse(_) => {
+                sender.send_empty_ok_response().await?;
             }
-            ShardSendRequestResult::Response(response) => match response {
-                ShardResponse::DeleteStreamResponse(_stream_id_num) => {
-                    sender.send_empty_ok_response().await?;
-                }
-                ShardResponse::ErrorResponse(err) => {
-                    return Err(err);
-                }
-                _ => {
-                    unreachable!(
-                        "Expected a DeleteStreamResponse inside of DeleteStream handler, impossible state"
-                    );
-                }
-            },
+            ShardResponse::ErrorResponse(err) => return Err(err),
+            _ => unreachable!("Expected DeleteStreamResponse"),
         }
 
         Ok(HandlerResult::Finished)

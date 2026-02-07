@@ -22,7 +22,7 @@ use iggy_common::IggyError;
 use iggy_common::sharding::IggyNamespace;
 
 impl IggyShard {
-    pub(crate) async fn delete_segments_base(
+    pub(crate) async fn delete_segments(
         &self,
         stream: usize,
         topic: usize,

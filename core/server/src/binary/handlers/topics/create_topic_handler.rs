@@ -19,21 +19,14 @@
 use crate::binary::command::{
     BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
 };
-use crate::binary::handlers::topics::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
+use crate::binary::mapper;
 use crate::shard::IggyShard;
-use crate::shard::transmission::event::ShardEvent;
 use crate::shard::transmission::frame::ShardResponse;
-use crate::shard::transmission::message::{
-    ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult,
-};
-
-use crate::state::command::EntryCommand;
-use crate::state::models::CreateTopicWithId;
+use crate::shard::transmission::message::{ShardRequest, ShardRequestPayload};
 use crate::streaming::session::Session;
-use err_trail::ErrContext;
 use iggy_common::create_topic::CreateTopic;
-use iggy_common::{Identifier, IggyError, SenderKind};
+use iggy_common::{IggyError, SenderKind};
 use std::rc::Rc;
 use tracing::{debug, instrument};
 
@@ -44,7 +37,7 @@ impl ServerCommandHandler for CreateTopic {
 
     #[instrument(skip_all, name = "trace_create_topic", fields(iggy_user_id = session.get_user_id(), iggy_client_id = session.client_id, iggy_stream_id = self.stream_id.as_string()))]
     async fn handle(
-        mut self,
+        self,
         sender: &mut SenderKind,
         _length: u32,
         session: &Session,
@@ -52,112 +45,20 @@ impl ServerCommandHandler for CreateTopic {
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
         shard.ensure_authenticated(session)?;
-        let stream_id = shard.resolve_stream_id(&self.stream_id)?;
-        shard
-            .metadata
-            .perm_create_topic(session.get_user_id(), stream_id)?;
 
-        let request = ShardRequest {
-            stream_id: Identifier::default(),
-            topic_id: Identifier::default(),
-            partition_id: 0,
-            payload: ShardRequestPayload::CreateTopic {
-                user_id: session.get_user_id(),
-                stream_id: self.stream_id.clone(),
-                name: self.name.clone(),
-                partitions_count: self.partitions_count,
-                message_expiry: self.message_expiry,
-                compression_algorithm: self.compression_algorithm,
-                max_topic_size: self.max_topic_size,
-                replication_factor: self.replication_factor,
-            },
-        };
+        let request = ShardRequest::control_plane(ShardRequestPayload::CreateTopicRequest {
+            user_id: session.get_user_id(),
+            command: self,
+        });
 
-        let message = ShardMessage::Request(request);
-        match shard.send_request_to_shard_or_recoil(None, message).await? {
-            ShardSendRequestResult::Recoil(message) => {
-                if let ShardMessage::Request(ShardRequest { payload, .. }) = message
-                    && let ShardRequestPayload::CreateTopic {
-                        stream_id,
-                        name,
-                        message_expiry,
-                        compression_algorithm,
-                        max_topic_size,
-                        replication_factor,
-                        partitions_count,
-                        ..
-                    } = payload
-                {
-                    // Acquire topic lock to serialize filesystem operations
-                    let _topic_guard = shard.fs_locks.topic_lock.lock().await;
-
-                    let topic_id = shard
-                        .create_topic(
-                            &stream_id,
-                            name,
-                            message_expiry,
-                            compression_algorithm,
-                            max_topic_size,
-                            replication_factor,
-                        )
-                        .await?;
-
-                    let stream_id_num = shard.resolve_stream_id(&stream_id)?;
-
-                    if let Some((expiry, max_size)) =
-                        shard.metadata.get_topic_config(stream_id_num, topic_id)
-                    {
-                        self.message_expiry = expiry;
-                        self.max_topic_size = max_size;
-                    }
-
-                    let partition_infos = shard
-                        .create_partitions(
-                            &stream_id,
-                            &Identifier::numeric(topic_id as u32).unwrap(),
-                            partitions_count,
-                        )
-                        .await?;
-                    let event = ShardEvent::CreatedPartitions {
-                        stream_id: stream_id.clone(),
-                        topic_id: Identifier::numeric(topic_id as u32).unwrap(),
-                        partitions: partition_infos.clone(),
-                    };
-                    shard.broadcast_event_to_all_shards(event).await?;
-
-                    let response = shard.get_topic_from_metadata(stream_id_num, topic_id);
-                    shard
-                        .state
-                        .apply(session.get_user_id(), &EntryCommand::CreateTopic(CreateTopicWithId {
-                            topic_id: topic_id as u32,
-                            command: self
-                        }))
-                        .await
-                        .error(|e: &IggyError| {
-                            format!(
-                                "{COMPONENT} (error: {e}) - failed to apply create topic for stream_id: {stream_id_num}, topic_id: {topic_id:?}"
-                            )
-                        })?;
-                    sender.send_ok_response(&response).await?;
-                } else {
-                    unreachable!(
-                        "Expected a CreateTopic request inside of CreateTopic handler, impossible state"
-                    );
-                }
+        match shard.send_to_control_plane(request).await? {
+            ShardResponse::CreateTopicResponse(data) => {
+                sender
+                    .send_ok_response(&mapper::map_topic_from_response(&data))
+                    .await?;
             }
-            ShardSendRequestResult::Response(response) => match response {
-                ShardResponse::CreateTopicResponse(topic_id) => {
-                    let stream_id_num = shard.resolve_stream_id(&self.stream_id)?;
-                    let response = shard.get_topic_from_metadata(stream_id_num, topic_id);
-                    sender.send_ok_response(&response).await?;
-                }
-                ShardResponse::ErrorResponse(err) => {
-                    return Err(err);
-                }
-                _ => unreachable!(
-                    "Expected a CreateTopicResponse inside of CreateTopic handler, impossible state"
-                ),
-            },
+            ShardResponse::ErrorResponse(err) => return Err(err),
+            _ => unreachable!("Expected CreateTopicResponse"),
         }
 
         Ok(HandlerResult::Finished)
