@@ -96,8 +96,8 @@ runs:
     - name: Generate coverage report
       if: inputs.task == 'test'
       shell: bash
-      run: |
-        foreign/java/dev-support/checks/build.sh jacocoAggregatedReport
+      working-directory: foreign/java
+      run: ./gradlew jacocoAggregatedReport
 
     - name: Copy coverage reports
       if: ${{ !cancelled() && inputs.task == 'test' }}
