@@ -35,5 +35,7 @@ journal = { workspace = true }
 left-right = { workspace = true }
 message_bus = { workspace = true }
 paste = { workspace = true }
+rmp-serde = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
 slab = { workspace = true }
 tracing = { workspace = true }
