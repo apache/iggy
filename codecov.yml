@@ -32,7 +32,7 @@ coverage:
       default:
         informational: true
         target: 50%
-        threshold: 5%
+        threshold: 6%
 
 comment:
   layout: "header, diff, flags, files"
@@ -40,6 +40,17 @@ comment:
   require_changes: true
   require_base: true
   require_head: true
+
+flags:
+  rust:
+    paths:
+      - core/
+    carryforward: true
+  java:
+    paths:
+      - foreign/java/java-sdk/src/main/
+      - foreign/java/external-processors/
+    carryforward: true
 
 ignore:
   - "core/bench/**"
@@ -51,3 +62,7 @@ ignore:
   - "foreign/**"
   - "web/**"
   - "**/tests/**"
+  - "**/*Test.java"
+  - "**/test/**"
+  - "**/build/**"
+  - "**/target/**"
