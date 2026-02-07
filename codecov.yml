@@ -32,7 +32,7 @@ coverage:
       default:
         informational: true
         target: 50%
-        threshold: 6%
+        threshold: 5%
 
 comment:
   layout: "header, diff, flags, files"
