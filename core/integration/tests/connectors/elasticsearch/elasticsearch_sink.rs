@@ -34,7 +34,7 @@ async fn given_json_messages_should_index_documents(
     harness: &TestHarness,
     fixture: ElasticsearchFixture,
 ) {
-    let client = harness.client();
+    let client = harness.root_client().await.unwrap();
     let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
     let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
 
@@ -91,7 +91,7 @@ async fn given_bulk_messages_should_index_all(
     harness: &TestHarness,
     fixture: ElasticsearchFixture,
 ) {
-    let client = harness.client();
+    let client = harness.root_client().await.unwrap();
     let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
     let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
 
@@ -140,7 +140,7 @@ async fn given_messages_should_have_iggy_metadata(
     harness: &TestHarness,
     fixture: ElasticsearchFixture,
 ) {
-    let client = harness.client();
+    let client = harness.root_client().await.unwrap();
     let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
     let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
 

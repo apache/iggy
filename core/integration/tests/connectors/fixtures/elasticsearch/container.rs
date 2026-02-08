@@ -29,11 +29,13 @@ use testcontainers_modules::testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use testcontainers_modules::testcontainers::{ContainerAsync, GenericImage, ImageExt};
 use tokio::time::sleep;
-use tracing::info;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 const POLL_INTERVAL_MS: u64 = 200;
 const MAX_POLL_ATTEMPTS: usize = 100;
+const HEALTH_CHECK_INTERVAL_MS: u64 = 1000;
+const HEALTH_CHECK_MAX_ATTEMPTS: usize = 30;
 
 const ELASTICSEARCH_IMAGE: &str = "elasticsearch";
 const ELASTICSEARCH_TAG: &str = "8.17.0";
@@ -106,6 +108,50 @@ impl ElasticsearchContainer {
             })?;
 
         info!("Elasticsearch container mapped to port {mapped_port}");
+
+        let base_url = format!("http://localhost:{}", mapped_port);
+        let health_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .map_err(|e| TestBinaryError::FixtureSetup {
+                fixture_type: "ElasticsearchContainer".to_string(),
+                message: format!("Failed to build health check client: {e}"),
+            })?;
+
+        for attempt in 0..HEALTH_CHECK_MAX_ATTEMPTS {
+            match health_client
+                .get(format!("{base_url}/_cluster/health"))
+                .send()
+                .await
+            {
+                Ok(resp) if resp.status().is_success() => {
+                    info!(
+                        "Elasticsearch health check passed after {} attempts",
+                        attempt + 1
+                    );
+                    break;
+                }
+                Ok(resp) => {
+                    warn!(
+                        "Elasticsearch health check returned status {}, retrying...",
+                        resp.status()
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        "Elasticsearch health check failed (attempt {}): {e}",
+                        attempt + 1
+                    );
+                }
+            }
+            if attempt == HEALTH_CHECK_MAX_ATTEMPTS - 1 {
+                return Err(TestBinaryError::FixtureSetup {
+                    fixture_type: "ElasticsearchContainer".to_string(),
+                    message: "Elasticsearch health check timed out".to_string(),
+                });
+            }
+            sleep(Duration::from_millis(HEALTH_CHECK_INTERVAL_MS)).await;
+        }
 
         Ok(Self {
             container,
