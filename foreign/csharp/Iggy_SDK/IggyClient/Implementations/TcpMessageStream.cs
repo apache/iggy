@@ -536,6 +536,17 @@ public sealed class TcpMessageStream : IIggyClient
     }
 
     /// <inheritdoc />
+    public async Task<byte[]> GetSnapshotAsync(SnapshotCompression compression,
+        IList<SystemSnapshotType> snapshotTypes, CancellationToken token = default)
+    {
+        var message = TcpContracts.GetSnapshot(compression, snapshotTypes);
+        var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
+        TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.GET_SNAPSHOT_CODE);
+
+        return await SendWithResponseAsync(payload, token);
+    }
+
+    /// <inheritdoc />
     public async Task ConnectAsync(CancellationToken token = default)
     {
         if (_state is ConnectionState.Connected

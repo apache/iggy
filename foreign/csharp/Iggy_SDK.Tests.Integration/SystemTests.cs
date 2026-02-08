@@ -181,6 +181,23 @@ public class SystemTests
         await Should.NotThrowAsync(Fixture.Clients[protocol].PingAsync());
     }
 
+    [Test]
+    [DependsOn(nameof(Ping_Should_Pong))]
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task GetSnapshot_Should_Return_ValidZipData(Protocol protocol)
+    {
+        var snapshot = await Fixture.Clients[protocol].GetSnapshotAsync(
+            SnapshotCompression.Deflated,
+            [SystemSnapshotType.Test]);
+
+        snapshot.ShouldNotBeNull();
+        snapshot.Length.ShouldBeGreaterThan(0);
+
+        // Verify it's a valid ZIP archive by checking the ZIP magic bytes (PK\x03\x04)
+        snapshot[0].ShouldBe((byte)'P');
+        snapshot[1].ShouldBe((byte)'K');
+    }
+
     // [Test]
     // [DependsOn(nameof(Ping_Should_Pong))]
     // [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]

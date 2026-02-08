@@ -456,6 +456,31 @@ public class HttpMessageStream : IIggyClient
     }
 
     /// <inheritdoc />
+    public async Task<byte[]> GetSnapshotAsync(SnapshotCompression compression,
+        IList<SystemSnapshotType> snapshotTypes, CancellationToken token = default)
+    {
+        // Rust serde uses default derive (PascalCase) for these enums, not snake_case.
+        // We use .ToString() to produce PascalCase names matching Rust's serde expectations.
+        var request = new
+        {
+            compression = compression.ToString(),
+            snapshot_types = snapshotTypes.Select(t => t.ToString()).ToList()
+        };
+        var json = JsonSerializer.Serialize(request, _jsonSerializerOptions);
+        var data = new StringContent(json, Encoding.UTF8, "application/json");
+
+        var response = await _httpClient.PostAsync("/snapshot", data, token);
+
+        if (response.IsSuccessStatusCode)
+        {
+            return await response.Content.ReadAsByteArrayAsync(token);
+        }
+
+        await HandleResponseAsync(response);
+        return [];
+    }
+
+    /// <inheritdoc />
     public Task ConnectAsync(CancellationToken token = default)
     {
         return Task.CompletedTask;
