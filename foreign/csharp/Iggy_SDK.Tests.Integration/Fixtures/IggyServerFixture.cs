@@ -46,7 +46,8 @@ public class IggyServerFixture : IAsyncInitializer, IAsyncDisposable
         { "IGGY_ROOT_USERNAME", "iggy" },
         { "IGGY_ROOT_PASSWORD", "iggy" },
         { "IGGY_TCP_ADDRESS", "0.0.0.0:8090" },
-        { "IGGY_HTTP_ADDRESS", "0.0.0.0:3000" }
+        { "IGGY_HTTP_ADDRESS", "0.0.0.0:3000" },
+        { "IGGY_SYSTEM_TOPIC_MESSAGE_EXPIRY", "10m" }
     };
 
     /// <summary>
