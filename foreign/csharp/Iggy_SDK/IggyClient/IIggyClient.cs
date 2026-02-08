@@ -23,7 +23,7 @@ namespace Apache.Iggy.IggyClient;
 ///     operations.
 /// </summary>
 public interface IIggyClient : IIggyPublisher, IIggyStream, IIggyTopic, IIggyConsumer, IIggyOffset, IIggyConsumerGroup,
-    IIggySystem, IIggyPartition, IIggyUsers, IIggyPersonalAccessToken, IDisposable
+    IIggySystem, IIggyPartition, IIggySegment, IIggyUsers, IIggyPersonalAccessToken, IDisposable
 {
     /// <summary>
     ///     Subscribes to connection state change events.

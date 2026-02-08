@@ -475,6 +475,17 @@ public sealed class TcpMessageStream : IIggyClient
     }
 
     /// <inheritdoc />
+    public async Task DeleteSegmentsAsync(Identifier streamId, Identifier topicId, uint partitionId,
+        uint segmentsCount, CancellationToken token = default)
+    {
+        var message = TcpContracts.DeleteSegments(streamId, topicId, partitionId, segmentsCount);
+        var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
+        TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.DELETE_SEGMENTS_CODE);
+
+        await SendWithResponseAsync(payload, token);
+    }
+
+    /// <inheritdoc />
     public async Task<ClientResponse?> GetMeAsync(CancellationToken token = default)
     {
         var message = Array.Empty<byte>();
