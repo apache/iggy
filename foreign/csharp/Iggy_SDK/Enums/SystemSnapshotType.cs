@@ -23,23 +23,23 @@ namespace Apache.Iggy.Enums;
 public enum SystemSnapshotType
 {
     /// Overview of the filesystem.
-    FilesystemOverview,
+    FilesystemOverview = 1,
 
     /// List of currently running processes.
-    ProcessList,
+    ProcessList = 2,
 
     /// Resource usage statistics of the system.
-    ResourceUsage,
+    ResourceUsage = 3,
 
     /// Test snapshot type for development purposes.
-    Test,
+    Test = 4,
 
     /// Server logs
-    ServerLogs,
+    ServerLogs = 5,
 
     /// Server configuration
-    ServerConfig,
+    ServerConfig = 6,
 
     /// Everything
-    All
+    All = 100
 }

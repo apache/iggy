@@ -837,6 +837,21 @@ internal static class TcpContracts
         };
     }
 
+    internal static byte[] GetSnapshot(SnapshotCompression compression, IList<SystemSnapshotType> snapshotTypes)
+    {
+        // Binary format: [compression_code: u8] [types_count: u8] [type_code_1: u8] [type_code_2: u8] ...
+        var length = 1 + 1 + snapshotTypes.Count;
+        Span<byte> bytes = stackalloc byte[length];
+        bytes[0] = (byte)compression;
+        bytes[1] = (byte)snapshotTypes.Count;
+        for (var i = 0; i < snapshotTypes.Count; i++)
+        {
+            bytes[2 + i] = (byte)snapshotTypes[i];
+        }
+
+        return bytes.ToArray();
+    }
+
     internal static byte[] DeleteOffset(Identifier streamId, Identifier topicId, Consumer consumer, uint? partitionId)
     {
         Span<byte> bytes =
