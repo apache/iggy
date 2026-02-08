@@ -24,6 +24,7 @@ using Apache.Iggy.Enums;
 using Apache.Iggy.Extensions;
 using Apache.Iggy.Headers;
 using Apache.Iggy.Messages;
+using Apache.Iggy.Utils;
 
 namespace Apache.Iggy.Mappers;
 
@@ -622,7 +623,7 @@ internal static class BinaryMapper
                 MessagesCount = messagesCount,
                 Size = sizeBytes,
                 CreatedAt = DateTimeOffsetUtils.FromUnixTimeMicroSeconds(createdAt).LocalDateTime,
-                MessageExpiry = messageExpiry,
+                MessageExpiry = DurationHelpers.FromDuration(messageExpiry),
                 ReplicationFactor = replicationFactor,
                 MaxTopicSize = maxTopicSize
             }, readBytes);

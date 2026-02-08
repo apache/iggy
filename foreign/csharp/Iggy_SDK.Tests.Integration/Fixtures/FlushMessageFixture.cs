@@ -15,12 +15,11 @@
 // // specific language governing permissions and limitations
 // // under the License.
 
-using Apache.Iggy.Contracts;
-using Apache.Iggy.Contracts.Http;
 using Apache.Iggy.Enums;
 using Apache.Iggy.IggyClient;
 using Apache.Iggy.Messages;
 using Apache.Iggy.Tests.Integrations.Helpers;
+using Apache.Iggy.Tests.Integrations.Models;
 using TUnit.Core.Interfaces;
 using Partitioning = Apache.Iggy.Kinds.Partitioning;
 
@@ -29,7 +28,7 @@ namespace Apache.Iggy.Tests.Integrations.Fixtures;
 public class FlushMessageFixture : IAsyncInitializer
 {
     internal readonly string StreamId = "FlushMessageStream";
-    internal readonly CreateTopicRequest TopicRequest = TopicFactory.CreateTopic("Topic");
+    internal readonly CreateTestTopic TopicRequest = TopicFactory.CreateTopic("Topic");
 
     [ClassDataSource<IggyServerFixture>(Shared = SharedType.PerAssembly)]
     public required IggyServerFixture IggyServerFixture { get; init; }
@@ -53,7 +52,6 @@ public class FlushMessageFixture : IAsyncInitializer
             };
             await client.Value.SendMessagesAsync(Identifier.String(StreamId.GetWithProtocol(client.Key)),
                 Identifier.String(TopicRequest.Name), Partitioning.None(), messages);
-
         }
     }
 }
