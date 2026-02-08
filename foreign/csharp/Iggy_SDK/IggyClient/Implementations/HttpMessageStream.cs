@@ -535,6 +535,18 @@ public class HttpMessageStream : IIggyClient
     }
 
     /// <inheritdoc />
+    public async Task DeleteSegmentsAsync(Identifier streamId, Identifier topicId, uint partitionId,
+        uint segmentsCount, CancellationToken token = default)
+    {
+        var response = await _httpClient.DeleteAsync(
+            $"/streams/{streamId}/topics/{topicId}/partitions/{partitionId}?segments_count={segmentsCount}", token);
+        if (!response.IsSuccessStatusCode)
+        {
+            await HandleResponseAsync(response);
+        }
+    }
+
+    /// <inheritdoc />
     public async Task CreatePartitionsAsync(Identifier streamId, Identifier topicId, uint partitionsCount,
         CancellationToken token = default)
     {

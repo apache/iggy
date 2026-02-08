@@ -812,6 +812,20 @@ internal static class TcpContracts
         return bytes.ToArray();
     }
 
+    internal static byte[] DeleteSegments(Identifier streamId, Identifier topicId, uint partitionId,
+        uint segmentsCount)
+    {
+        // Binary format: [stream_id_bytes][topic_id_bytes][partition_id: u32 LE][segments_count: u32 LE]
+        Span<byte> bytes =
+            stackalloc byte[2 + streamId.Length + 2 + topicId.Length + sizeof(int) + sizeof(int)];
+        bytes.WriteBytesFromStreamAndTopicIdentifiers(streamId, topicId);
+        var position = 2 + streamId.Length + 2 + topicId.Length;
+        BinaryPrimitives.WriteUInt32LittleEndian(bytes[position..(position + 4)], partitionId);
+        position += 4;
+        BinaryPrimitives.WriteUInt32LittleEndian(bytes[position..(position + 4)], segmentsCount);
+        return bytes.ToArray();
+    }
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static byte GetConsumerTypeByte(ConsumerType type)
     {
