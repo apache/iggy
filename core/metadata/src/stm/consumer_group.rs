@@ -244,28 +244,6 @@ pub struct ConsumerGroupMemberSnapshot {
     pub partition_index: usize,
 }
 
-impl From<&ConsumerGroupMember> for ConsumerGroupMemberSnapshot {
-    fn from(member: &ConsumerGroupMember) -> Self {
-        Self {
-            id: member.id,
-            client_id: member.client_id,
-            partitions: member.partitions.clone(),
-            partition_index: member.partition_index.load(Ordering::Relaxed),
-        }
-    }
-}
-
-impl From<ConsumerGroupMemberSnapshot> for ConsumerGroupMember {
-    fn from(snap: ConsumerGroupMemberSnapshot) -> Self {
-        Self {
-            id: snap.id,
-            client_id: snap.client_id,
-            partitions: snap.partitions,
-            partition_index: Arc::new(AtomicUsize::new(snap.partition_index)),
-        }
-    }
-}
-
 /// Consumer group snapshot representation for serialization.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConsumerGroupSnapshot {
@@ -273,47 +251,6 @@ pub struct ConsumerGroupSnapshot {
     pub name: String,
     pub partitions: Vec<usize>,
     pub members: Vec<(usize, ConsumerGroupMemberSnapshot)>,
-}
-
-impl From<&ConsumerGroup> for ConsumerGroupSnapshot {
-    fn from(group: &ConsumerGroup) -> Self {
-        Self {
-            id: group.id,
-            name: group.name.to_string(),
-            partitions: group.partitions.clone(),
-            members: group
-                .members
-                .iter()
-                .map(|(id, m)| (id, ConsumerGroupMemberSnapshot::from(m)))
-                .collect(),
-        }
-    }
-}
-
-impl ConsumerGroupSnapshot {
-    pub fn into_group(self) -> Result<ConsumerGroup, crate::stm::snapshot::SnapshotError> {
-        use crate::stm::snapshot::SnapshotError;
-
-        let mut members: Slab<ConsumerGroupMember> = Slab::new();
-        for (expected_id, member_snap) in self.members {
-            let member = ConsumerGroupMember::from(member_snap);
-            let actual_id = members.insert(member);
-            if actual_id != expected_id {
-                return Err(SnapshotError::SlabIdMismatch {
-                    section: "consumer_groups.members",
-                    expected: expected_id,
-                    actual: actual_id,
-                });
-            }
-        }
-
-        Ok(ConsumerGroup {
-            id: self.id,
-            name: Arc::from(self.name.as_str()),
-            partitions: self.partitions,
-            members,
-        })
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -331,7 +268,33 @@ impl Snapshotable for ConsumerGroups {
             let items: Vec<(usize, ConsumerGroupSnapshot)> = inner
                 .items
                 .iter()
-                .map(|(group_id, group)| (group_id, ConsumerGroupSnapshot::from(group)))
+                .map(|(group_id, group)| {
+                    let members: Vec<(usize, ConsumerGroupMemberSnapshot)> = group
+                        .members
+                        .iter()
+                        .map(|(member_id, member)| {
+                            (
+                                member_id,
+                                ConsumerGroupMemberSnapshot {
+                                    id: member.id,
+                                    client_id: member.client_id,
+                                    partitions: member.partitions.clone(),
+                                    partition_index: member.partition_index.load(Ordering::Relaxed),
+                                },
+                            )
+                        })
+                        .collect();
+
+                    (
+                        group_id,
+                        ConsumerGroupSnapshot {
+                            id: group.id,
+                            name: group.name.to_string(),
+                            partitions: group.partitions.clone(),
+                            members,
+                        },
+                    )
+                })
                 .collect();
 
             let topic_index: Vec<((usize, usize), Vec<usize>)> = inner
@@ -363,8 +326,31 @@ impl Snapshotable for ConsumerGroups {
         let mut name_index: AHashMap<Arc<str>, usize> = AHashMap::new();
 
         for (expected_id, group_snap) in snapshot.items {
-            let group = group_snap.into_group()?;
-            let group_name = group.name.clone();
+            let mut members: Slab<ConsumerGroupMember> = Slab::new();
+            for (expected_member_id, member_snap) in group_snap.members {
+                let member = ConsumerGroupMember {
+                    id: member_snap.id,
+                    client_id: member_snap.client_id,
+                    partitions: member_snap.partitions,
+                    partition_index: Arc::new(AtomicUsize::new(member_snap.partition_index)),
+                };
+                let actual_member_id = members.insert(member);
+                if actual_member_id != expected_member_id {
+                    return Err(SnapshotError::SlabIdMismatch {
+                        section: "consumer_groups.members",
+                        expected: expected_member_id,
+                        actual: actual_member_id,
+                    });
+                }
+            }
+
+            let group_name: Arc<str> = Arc::from(group_snap.name.as_str());
+            let group = ConsumerGroup {
+                id: group_snap.id,
+                name: group_name.clone(),
+                partitions: group_snap.partitions,
+                members,
+            };
 
             let actual_id = items.insert(group);
             if actual_id != expected_id {

@@ -126,7 +126,6 @@ impl Snapshot for IggySnapshot {
     }
 }
 
-#[expect(unused)]
 pub trait Metadata<C>
 where
     C: Consensus,
