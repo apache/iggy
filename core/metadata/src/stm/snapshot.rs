@@ -18,6 +18,10 @@
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::fmt;
 
+use crate::stm::consumer_group::ConsumerGroupsSnapshot;
+use crate::stm::stream::StreamsSnapshot;
+use crate::stm::user::UsersSnapshot;
+
 #[derive(Debug)]
 pub enum SnapshotError {
     /// A required section is missing from the snapshot.
@@ -32,8 +36,6 @@ pub enum SnapshotError {
         expected: usize,
         actual: usize,
     },
-    /// Duplicate section name detected in snapshot.
-    DuplicateSection(String),
 }
 
 impl fmt::Display for SnapshotError {
@@ -55,9 +57,6 @@ impl fmt::Display for SnapshotError {
                     section, expected, actual
                 )
             }
-            SnapshotError::DuplicateSection(name) => {
-                write!(f, "duplicate snapshot section name: {}", name)
-            }
         }
     }
 }
@@ -72,73 +71,42 @@ impl std::error::Error for SnapshotError {
     }
 }
 
-/// The outer envelope for a complete metadata snapshot.
-///
-/// Contains metadata about the snapshot and a collection of sections,
-/// where each section corresponds to one state machine's serialized state.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SnapshotEnvelope {
+/// The snapshot container for all metadata state machines.
+/// Each field corresponds to one state machine's serialized state.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MetadataSnapshot {
     /// Timestamp when the snapshot was created (microseconds since epoch).
     pub created_at: u64,
-    /// The VSR commit number this snapshot corresponds to.
-    /// All state in this snapshot reflects operations up to and including this commit.
-    pub commit_number: u64,
-    /// The individual state machine sections.
-    pub sections: Vec<SnapshotSection>,
+    /// Monotonically increasing snapshot sequence number.
+    pub sequence_number: u64,
+    /// Users state machine snapshot data.
+    pub users: Option<UsersSnapshot>,
+    /// Streams state machine snapshot data.
+    pub streams: Option<StreamsSnapshot>,
+    /// Consumer groups state machine snapshot data.
+    pub consumer_groups: Option<ConsumerGroupsSnapshot>,
 }
 
-impl SnapshotEnvelope {
-    /// Create a new snapshot envelope with the given commit number.
-    pub fn new(commit_number: u64) -> Self {
+impl MetadataSnapshot {
+    /// Create a new snapshot with the given sequence number.
+    pub fn new(sequence_number: u64) -> Self {
         Self {
             created_at: iggy_common::IggyTimestamp::now().as_micros(),
-            commit_number,
-            sections: Vec::new(),
+            sequence_number,
+            users: None,
+            streams: None,
+            consumer_groups: None,
         }
     }
 
-    /// Find a section by name.
-    pub fn find_section(&self, name: &str) -> Option<&SnapshotSection> {
-        self.sections.iter().find(|s| s.name == name)
-    }
-
-    /// Validate that no two sections share the same name.
-    pub fn validate_no_duplicate_sections(&self) -> Result<(), SnapshotError> {
-        let mut seen = std::collections::HashSet::new();
-        for section in &self.sections {
-            if !seen.insert(&section.name) {
-                return Err(SnapshotError::DuplicateSection(section.name.clone()));
-            }
-        }
-        Ok(())
-    }
-
-    /// Encode the envelope to bytes.
+    /// Encode the snapshot to msgpack bytes.
     pub fn encode(&self) -> Result<Vec<u8>, SnapshotError> {
         rmp_serde::to_vec(self).map_err(SnapshotError::Serialize)
     }
 
-    /// Decode an envelope from bytes.
+    /// Decode a snapshot from msgpack bytes.
     pub fn decode(bytes: &[u8]) -> Result<Self, SnapshotError> {
         rmp_serde::from_slice(bytes).map_err(SnapshotError::Deserialize)
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SnapshotSection {
-    /// The unique name identifying this section (e.g., "streams", "users").
-    pub name: String,
-    /// Encoded state data for this section.
-    pub data: Vec<u8>,
-}
-
-impl SnapshotSection {
-    /// Create a new section with the given name and data (version defaults to 1).
-    pub fn new(name: impl Into<String>, data: Vec<u8>) -> Self {
-        Self {
-            name: name.into(),
-            data,
-        }
     }
 }
 
@@ -146,10 +114,6 @@ impl SnapshotSection {
 /// Each state machine defines its own snapshot
 /// type for serialization and provides conversion methods.
 pub trait Snapshotable {
-    /// A unique, stable section name for this state machine.
-    /// This name is used to identify the section in the snapshot envelope.
-    const SECTION_NAME: &'static str;
-
     /// The serde-serializable snapshot representation of this state.
     /// This should be a plain struct with only serializable types and no wrappers
     /// like `Arc`, `AtomicUsize`, or other non-serializable wrappers.
@@ -162,109 +126,72 @@ pub trait Snapshotable {
     fn from_snapshot(snapshot: Self::Snapshot) -> Result<Self, SnapshotError>
     where
         Self: Sized;
-
-    /// Serialize the current state to a snapshot section.
-    fn take_snapshot(&self) -> Result<SnapshotSection, SnapshotError> {
-        let snap = self.to_snapshot();
-        let data = rmp_serde::to_vec(&snap).map_err(SnapshotError::Serialize)?;
-        Ok(SnapshotSection {
-            name: Self::SECTION_NAME.to_owned(),
-            data,
-        })
-    }
-
-    /// Restore state from a snapshot section.
-    fn apply_snapshot(section: &SnapshotSection) -> Result<Self, SnapshotError>
-    where
-        Self: Sized,
-    {
-        let snap: Self::Snapshot =
-            rmp_serde::from_slice(&section.data).map_err(SnapshotError::Deserialize)?;
-        Self::from_snapshot(snap)
-    }
 }
 
-/// Trait for types that can contribute snapshot sections.
+/// Trait for filling a typed snapshot with state machine data.
 ///
-/// This is the visitor-pattern trait that the variadic tuple recursion implements,
-/// walking through the tuple of state machines and collecting/restoring snapshot data.
-pub trait SnapshotContributor {
-    /// Collect snapshot sections from all constituent state machines.
-    ///
-    /// Each state machine in the composite appends its serialized section
-    /// to the provided vector.
-    fn collect_sections(&self, sections: &mut Vec<SnapshotSection>) -> Result<(), SnapshotError>;
+/// Each state machine implements this to write its serialized state
+/// to its specific field in the `MetadataSnapshot` struct.
+pub trait FillSnapshot {
+    /// Fill the snapshot with this state machine's data.
+    fn fill_snapshot(&self, snapshot: &mut MetadataSnapshot) -> Result<(), SnapshotError>;
+}
 
-    /// Restore all constituent state machines from sections.
-    ///
-    /// Returns the restored composite state. Each state machine finds its
-    /// section by name and deserializes its state.
-    fn restore_from_sections(sections: &[SnapshotSection]) -> Result<Self, SnapshotError>
-    where
-        Self: Sized;
-
-    /// Return the list of section names this contributor knows about.
-    ///
-    /// Used to detect unknown sections during restore.
-    fn known_section_names() -> Vec<&'static str>
-    where
-        Self: Sized,
-    {
-        vec![]
-    }
+/// Trait for restoring state machine data from a typed snapshot.
+///
+/// Each state machine implements this to read its state from
+/// its specific field in the `MetadataSnapshot` struct.
+pub trait RestoreSnapshot: Sized {
+    /// Restore this state machine from the snapshot.
+    fn restore_snapshot(snapshot: &MetadataSnapshot) -> Result<Self, SnapshotError>;
 }
 
 /// Base case for the recursive tuple pattern - unit type terminates the recursion.
-impl SnapshotContributor for () {
-    fn collect_sections(&self, _sections: &mut Vec<SnapshotSection>) -> Result<(), SnapshotError> {
-        Ok(())
-    }
-
-    fn restore_from_sections(_sections: &[SnapshotSection]) -> Result<Self, SnapshotError> {
+impl FillSnapshot for () {
+    fn fill_snapshot(&self, _snapshot: &mut MetadataSnapshot) -> Result<(), SnapshotError> {
         Ok(())
     }
 }
 
-/// Generates a `SnapshotContributor` implementation for a wrapper type.
+impl RestoreSnapshot for () {
+    fn restore_snapshot(_snapshot: &MetadataSnapshot) -> Result<Self, SnapshotError> {
+        Ok(())
+    }
+}
+
+/// Generates `FillSnapshot` and `RestoreSnapshot` implementations for a wrapper type.
 ///
-/// The wrapper type (e.g., `Streams`) must have a `snapshot_read` method that
-/// provides read access to its inner state, and the inner type (e.g., `StreamsInner`)
-/// must implement `Snapshotable`.
+/// The wrapper type (e.g. `Streams`) must implement `Snapshotable`.
 ///
 /// # Example
 ///
 /// ```ignore
-/// impl_snapshot_contributor!(Streams, StreamsInner);
+/// impl_fill_restore!(Users, users);
 /// ```
 #[macro_export]
-macro_rules! impl_snapshot_contributor {
-    ($wrapper:ident, $inner:ident) => {
-        impl $crate::stm::snapshot::SnapshotContributor for $wrapper {
-            fn collect_sections(
+macro_rules! impl_fill_restore {
+    ($wrapper:ident, $field:ident) => {
+        impl $crate::stm::snapshot::FillSnapshot for $wrapper {
+            fn fill_snapshot(
                 &self,
-                sections: &mut Vec<$crate::stm::snapshot::SnapshotSection>,
+                snapshot: &mut $crate::stm::snapshot::MetadataSnapshot,
             ) -> Result<(), $crate::stm::snapshot::SnapshotError> {
                 use $crate::stm::snapshot::Snapshotable;
-                let section = self.snapshot_read(|inner| inner.take_snapshot())?;
-                sections.push(section);
+                snapshot.$field = Some(self.to_snapshot());
                 Ok(())
             }
+        }
 
-            fn restore_from_sections(
-                sections: &[$crate::stm::snapshot::SnapshotSection],
+        impl $crate::stm::snapshot::RestoreSnapshot for $wrapper {
+            fn restore_snapshot(
+                snapshot: &$crate::stm::snapshot::MetadataSnapshot,
             ) -> Result<Self, $crate::stm::snapshot::SnapshotError> {
                 use $crate::stm::snapshot::{SnapshotError, Snapshotable};
-                let section = sections
-                    .iter()
-                    .find(|s| s.name == $inner::SECTION_NAME)
-                    .ok_or(SnapshotError::MissingSection($inner::SECTION_NAME))?;
-                let inner = $inner::apply_snapshot(section)?;
-                Ok(inner.into())
-            }
-
-            fn known_section_names() -> Vec<&'static str> {
-                use $crate::stm::snapshot::Snapshotable;
-                vec![$inner::SECTION_NAME]
+                let snap = snapshot
+                    .$field
+                    .clone()
+                    .ok_or(SnapshotError::MissingSection(stringify!($field)))?;
+                Self::from_snapshot(snap)
             }
         }
     };
@@ -273,64 +200,61 @@ macro_rules! impl_snapshot_contributor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stm::stream::{StatsSnapshot, StreamSnapshot};
+    use iggy_common::IggyTimestamp;
 
     #[test]
-    fn test_snapshot_envelope_roundtrip() {
-        let mut envelope = SnapshotEnvelope::new(42);
-        envelope
-            .sections
-            .push(SnapshotSection::new("test_section", vec![1, 2, 3, 4]));
+    fn test_metadata_snapshot_roundtrip() {
+        let snapshot = MetadataSnapshot::new(42);
 
-        let encoded = envelope.encode().unwrap();
-        let decoded = SnapshotEnvelope::decode(&encoded).unwrap();
+        let encoded = snapshot.encode().unwrap();
+        let decoded = MetadataSnapshot::decode(&encoded).unwrap();
 
-        assert_eq!(decoded.commit_number, 42);
-        assert_eq!(decoded.sections.len(), 1);
-        assert_eq!(decoded.sections[0].name, "test_section");
-        assert_eq!(decoded.sections[0].data, vec![1, 2, 3, 4]);
+        assert_eq!(decoded.sequence_number, 42);
+        assert!(decoded.users.is_none());
+        assert!(decoded.streams.is_none());
+        assert!(decoded.consumer_groups.is_none());
     }
 
     #[test]
-    fn test_find_section() {
-        let mut envelope = SnapshotEnvelope::new(0);
-        envelope.sections.push(SnapshotSection::new("foo", vec![1]));
-        envelope.sections.push(SnapshotSection::new("bar", vec![2]));
+    fn roundtrip_with_data() {
+        let ts = IggyTimestamp::from(1694968446131680u64);
 
-        assert!(envelope.find_section("foo").is_some());
-        assert!(envelope.find_section("bar").is_some());
-        assert!(envelope.find_section("baz").is_none());
-    }
+        let mut snapshot = MetadataSnapshot::new(100);
+        snapshot.streams = Some(StreamsSnapshot {
+            items: vec![(
+                0,
+                StreamSnapshot {
+                    id: 0,
+                    name: "events".to_string(),
+                    created_at: ts,
+                    stats: StatsSnapshot {
+                        size_bytes: 1024,
+                        messages_count: 50,
+                        segments_count: 2,
+                    },
+                    topics: vec![],
+                },
+            )],
+        });
 
-    #[test]
-    fn duplicate_section_name_detected() {
-        let mut envelope = SnapshotEnvelope::new(0);
-        envelope
-            .sections
-            .push(SnapshotSection::new("same_name", vec![1]));
-        envelope
-            .sections
-            .push(SnapshotSection::new("same_name", vec![2]));
+        let encoded = snapshot.encode().unwrap();
+        let decoded = MetadataSnapshot::decode(&encoded).unwrap();
 
-        let result = envelope.validate_no_duplicate_sections();
-        assert!(result.is_err());
-        if let Err(SnapshotError::DuplicateSection(name)) = result {
-            assert_eq!(name, "same_name");
-        } else {
-            panic!("expected DuplicateSection error");
-        }
-    }
+        assert_eq!(decoded.sequence_number, 100);
+        assert!(decoded.users.is_none());
+        assert!(decoded.consumer_groups.is_none());
 
-    #[test]
-    fn roundtrip() {
-        let mut envelope = SnapshotEnvelope::new(100);
-        envelope
-            .sections
-            .push(SnapshotSection::new("data", vec![42; 256]));
+        let streams = decoded.streams.as_ref().unwrap();
+        assert_eq!(streams.items.len(), 1);
 
-        let encoded = envelope.encode().unwrap();
-        let decoded = SnapshotEnvelope::decode(&encoded).unwrap();
-
-        assert_eq!(decoded.commit_number, 100);
-        assert_eq!(decoded.sections[0].data, vec![42; 256]);
+        let (slab_id, stream) = &streams.items[0];
+        assert_eq!(*slab_id, 0);
+        assert_eq!(stream.name, "events");
+        assert_eq!(stream.created_at.as_micros(), ts.as_micros());
+        assert_eq!(stream.stats.size_bytes, 1024);
+        assert_eq!(stream.stats.messages_count, 50);
+        assert_eq!(stream.stats.segments_count, 2);
+        assert_eq!(stream.topics.len(), 0);
     }
 }

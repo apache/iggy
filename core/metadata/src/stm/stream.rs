@@ -18,7 +18,7 @@
 use crate::stats::{StreamStats, TopicStats};
 use crate::stm::StateHandler;
 use crate::stm::snapshot::Snapshotable;
-use crate::{collect_handlers, define_state, impl_snapshot_contributor};
+use crate::{collect_handlers, define_state, impl_fill_restore};
 use ahash::AHashMap;
 use iggy_common::create_partitions::CreatePartitions;
 use iggy_common::create_stream::CreateStream;
@@ -36,7 +36,15 @@ use slab::Slab;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-#[derive(Debug, Clone)]
+/// Partition snapshot representation for serialization.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PartitionSnapshot {
+    pub id: usize,
+    pub created_at: IggyTimestamp,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(into = "PartitionSnapshot", from = "PartitionSnapshot")]
 pub struct Partition {
     pub id: usize,
     pub created_at: IggyTimestamp,
@@ -46,6 +54,47 @@ impl Partition {
     pub fn new(id: usize, created_at: IggyTimestamp) -> Self {
         Self { id, created_at }
     }
+}
+
+impl From<Partition> for PartitionSnapshot {
+    fn from(p: Partition) -> Self {
+        Self {
+            id: p.id,
+            created_at: p.created_at,
+        }
+    }
+}
+
+impl From<PartitionSnapshot> for Partition {
+    fn from(p: PartitionSnapshot) -> Self {
+        Self {
+            id: p.id,
+            created_at: p.created_at,
+        }
+    }
+}
+
+/// Stats snapshot representation for serialization.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatsSnapshot {
+    pub size_bytes: u64,
+    pub messages_count: u64,
+    pub segments_count: u32,
+}
+
+/// Topic snapshot representation for serialization.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TopicSnapshot {
+    pub id: usize,
+    pub name: String,
+    pub created_at: IggyTimestamp,
+    pub replication_factor: u8,
+    pub message_expiry: IggyExpiry,
+    pub compression_algorithm: CompressionAlgorithm,
+    pub max_topic_size: MaxTopicSize,
+    pub stats: StatsSnapshot,
+    pub partitions: Vec<PartitionSnapshot>,
+    pub round_robin_counter: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -103,6 +152,66 @@ impl Topic {
             round_robin_counter: Arc::new(AtomicUsize::new(0)),
         }
     }
+}
+
+impl From<&Topic> for TopicSnapshot {
+    fn from(topic: &Topic) -> Self {
+        let (size_bytes, messages_count, segments_count) = topic.stats.load_for_snapshot();
+        Self {
+            id: topic.id,
+            name: topic.name.to_string(),
+            created_at: topic.created_at,
+            replication_factor: topic.replication_factor,
+            message_expiry: topic.message_expiry,
+            compression_algorithm: topic.compression_algorithm,
+            max_topic_size: topic.max_topic_size,
+            stats: StatsSnapshot {
+                size_bytes,
+                messages_count,
+                segments_count,
+            },
+            partitions: topic
+                .partitions
+                .iter()
+                .map(|p| PartitionSnapshot::from(p.clone()))
+                .collect(),
+            round_robin_counter: topic.round_robin_counter.load(Ordering::Relaxed),
+        }
+    }
+}
+
+impl TopicSnapshot {
+    /// Convert to Topic with the given parent stream stats.
+    pub fn into_topic(self, stream_stats: Arc<StreamStats>) -> Topic {
+        let topic_stats = Arc::new(TopicStats::new(stream_stats));
+        topic_stats.store_from_snapshot(
+            self.stats.size_bytes,
+            self.stats.messages_count,
+            self.stats.segments_count,
+        );
+        Topic {
+            id: self.id,
+            name: Arc::from(self.name.as_str()),
+            created_at: self.created_at,
+            replication_factor: self.replication_factor,
+            message_expiry: self.message_expiry,
+            compression_algorithm: self.compression_algorithm,
+            max_topic_size: self.max_topic_size,
+            stats: topic_stats,
+            partitions: self.partitions.into_iter().map(Partition::from).collect(),
+            round_robin_counter: Arc::new(AtomicUsize::new(self.round_robin_counter)),
+        }
+    }
+}
+
+/// Stream snapshot representation for serialization.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamSnapshot {
+    pub id: usize,
+    pub name: String,
+    pub created_at: IggyTimestamp,
+    pub stats: StatsSnapshot,
+    pub topics: Vec<(usize, TopicSnapshot)>,
 }
 
 #[derive(Debug)]
@@ -163,6 +272,67 @@ impl Stream {
             topics: Slab::new(),
             topic_index: AHashMap::default(),
         }
+    }
+}
+
+impl From<&Stream> for StreamSnapshot {
+    fn from(stream: &Stream) -> Self {
+        let (size_bytes, messages_count, segments_count) = stream.stats.load_for_snapshot();
+        Self {
+            id: stream.id,
+            name: stream.name.to_string(),
+            created_at: stream.created_at,
+            stats: StatsSnapshot {
+                size_bytes,
+                messages_count,
+                segments_count,
+            },
+            topics: stream
+                .topics
+                .iter()
+                .map(|(id, topic)| (id, TopicSnapshot::from(topic)))
+                .collect(),
+        }
+    }
+}
+
+impl StreamSnapshot {
+    /// Convert to Stream. Returns the stream and a Vec of (expected_id, actual_id) for validation.
+    pub fn into_stream(self) -> Result<Stream, crate::stm::snapshot::SnapshotError> {
+        use crate::stm::snapshot::SnapshotError;
+
+        let stream_stats = Arc::new(StreamStats::default());
+        stream_stats.store_from_snapshot(
+            self.stats.size_bytes,
+            self.stats.messages_count,
+            self.stats.segments_count,
+        );
+
+        let mut topics: Slab<Topic> = Slab::new();
+        let mut topic_index: AHashMap<Arc<str>, usize> = AHashMap::new();
+
+        for (expected_id, topic_snap) in self.topics {
+            let topic = topic_snap.into_topic(stream_stats.clone());
+            let topic_name = topic.name.clone();
+            let actual_id = topics.insert(topic);
+            if actual_id != expected_id {
+                return Err(SnapshotError::SlabIdMismatch {
+                    section: "streams.topics",
+                    expected: expected_id,
+                    actual: actual_id,
+                });
+            }
+            topic_index.insert(topic_name, actual_id);
+        }
+
+        Ok(Stream {
+            id: self.id,
+            name: Arc::from(self.name.as_str()),
+            created_at: self.created_at,
+            stats: stream_stats,
+            topics,
+            topic_index,
+        })
     }
 }
 
@@ -469,120 +639,24 @@ impl StateHandler for DeletePartitions {
     }
 }
 
-/// Stats snapshot representation for serialization.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StatsSnapshot {
-    pub size_bytes: u64,
-    pub messages_count: u64,
-    pub segments_count: u32,
-}
-
-/// Partition snapshot representation for serialization.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PartitionSnapshot {
-    pub id: usize,
-    pub created_at: IggyTimestamp,
-}
-
-/// Topic snapshot representation for serialization.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TopicSnapshot {
-    pub id: usize,
-    pub name: String,
-    pub created_at: IggyTimestamp,
-    pub replication_factor: u8,
-    pub message_expiry: IggyExpiry,
-    pub compression_algorithm: CompressionAlgorithm,
-    pub max_topic_size: MaxTopicSize,
-    pub stats: StatsSnapshot,
-    pub partitions: Vec<PartitionSnapshot>,
-    pub round_robin_counter: usize,
-}
-
-/// Stream snapshot representation for serialization.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StreamSnapshot {
-    pub id: usize,
-    pub name: String,
-    pub created_at: IggyTimestamp,
-    pub stats: StatsSnapshot,
-    pub topics: Vec<(usize, TopicSnapshot)>,
-}
-
 /// Snapshot representation for the Streams state machine.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamsSnapshot {
     pub items: Vec<(usize, StreamSnapshot)>,
 }
 
-impl Snapshotable for StreamsInner {
-    const SECTION_NAME: &'static str = "streams";
+impl Snapshotable for Streams {
     type Snapshot = StreamsSnapshot;
 
     fn to_snapshot(&self) -> Self::Snapshot {
-        let items: Vec<(usize, StreamSnapshot)> = self
-            .items
-            .iter()
-            .map(|(stream_id, stream)| {
-                let (size_bytes, messages_count, segments_count) = stream.stats.load_for_snapshot();
-
-                let topics: Vec<(usize, TopicSnapshot)> = stream
-                    .topics
-                    .iter()
-                    .map(|(topic_id, topic)| {
-                        let (t_size, t_msgs, t_segs) = topic.stats.load_for_snapshot();
-
-                        let partitions: Vec<PartitionSnapshot> = topic
-                            .partitions
-                            .iter()
-                            .map(|p| PartitionSnapshot {
-                                id: p.id,
-                                created_at: p.created_at,
-                            })
-                            .collect();
-
-                        (
-                            topic_id,
-                            TopicSnapshot {
-                                id: topic.id,
-                                name: topic.name.to_string(),
-                                created_at: topic.created_at,
-                                replication_factor: topic.replication_factor,
-                                message_expiry: topic.message_expiry,
-                                compression_algorithm: topic.compression_algorithm,
-                                max_topic_size: topic.max_topic_size,
-                                stats: StatsSnapshot {
-                                    size_bytes: t_size,
-                                    messages_count: t_msgs,
-                                    segments_count: t_segs,
-                                },
-                                partitions,
-                                round_robin_counter: topic
-                                    .round_robin_counter
-                                    .load(Ordering::Relaxed),
-                            },
-                        )
-                    })
-                    .collect();
-
-                (
-                    stream_id,
-                    StreamSnapshot {
-                        id: stream.id,
-                        name: stream.name.to_string(),
-                        created_at: stream.created_at,
-                        stats: StatsSnapshot {
-                            size_bytes,
-                            messages_count,
-                            segments_count,
-                        },
-                        topics,
-                    },
-                )
-            })
-            .collect();
-
-        StreamsSnapshot { items }
+        self.snapshot_read(|inner| {
+            let items: Vec<(usize, StreamSnapshot)> = inner
+                .items
+                .iter()
+                .map(|(stream_id, stream)| (stream_id, StreamSnapshot::from(stream)))
+                .collect();
+            StreamsSnapshot { items }
+        })
     }
 
     fn from_snapshot(
@@ -594,72 +668,13 @@ impl Snapshotable for StreamsInner {
         let mut index: AHashMap<Arc<str>, usize> = AHashMap::new();
 
         for (expected_id, stream_snap) in snapshot.items {
-            let stream_stats = Arc::new(StreamStats::default());
-            stream_stats.store_from_snapshot(
-                stream_snap.stats.size_bytes,
-                stream_snap.stats.messages_count,
-                stream_snap.stats.segments_count,
-            );
-
-            let mut topics: Slab<Topic> = Slab::new();
-            let mut topic_index: AHashMap<Arc<str>, usize> = AHashMap::new();
-
-            for (expected_topic_id, topic_snap) in stream_snap.topics {
-                let topic_stats = Arc::new(TopicStats::new(stream_stats.clone()));
-                topic_stats.store_from_snapshot(
-                    topic_snap.stats.size_bytes,
-                    topic_snap.stats.messages_count,
-                    topic_snap.stats.segments_count,
-                );
-
-                let partitions: Vec<Partition> = topic_snap
-                    .partitions
-                    .into_iter()
-                    .map(|p| Partition {
-                        id: p.id,
-                        created_at: p.created_at,
-                    })
-                    .collect();
-
-                let topic_name: Arc<str> = Arc::from(topic_snap.name.as_str());
-                let topic = Topic {
-                    id: topic_snap.id,
-                    name: topic_name.clone(),
-                    created_at: topic_snap.created_at,
-                    replication_factor: topic_snap.replication_factor,
-                    message_expiry: topic_snap.message_expiry,
-                    compression_algorithm: topic_snap.compression_algorithm,
-                    max_topic_size: topic_snap.max_topic_size,
-                    stats: topic_stats,
-                    partitions,
-                    round_robin_counter: Arc::new(AtomicUsize::new(topic_snap.round_robin_counter)),
-                };
-
-                let actual_topic_id = topics.insert(topic);
-                if actual_topic_id != expected_topic_id {
-                    return Err(SnapshotError::SlabIdMismatch {
-                        section: Self::SECTION_NAME,
-                        expected: expected_topic_id,
-                        actual: actual_topic_id,
-                    });
-                }
-                topic_index.insert(topic_name, actual_topic_id);
-            }
-
-            let stream_name: Arc<str> = Arc::from(stream_snap.name.as_str());
-            let stream = Stream {
-                id: stream_snap.id,
-                name: stream_name.clone(),
-                created_at: stream_snap.created_at,
-                stats: stream_stats,
-                topics,
-                topic_index,
-            };
+            let stream = stream_snap.into_stream()?;
+            let stream_name = stream.name.clone();
 
             let actual_id = items.insert(stream);
             if actual_id != expected_id {
                 return Err(SnapshotError::SlabIdMismatch {
-                    section: Self::SECTION_NAME,
+                    section: "streams",
                     expected: expected_id,
                     actual: actual_id,
                 });
@@ -667,8 +682,9 @@ impl Snapshotable for StreamsInner {
             index.insert(stream_name, actual_id);
         }
 
-        Ok(Self { index, items })
+        let inner = StreamsInner { index, items };
+        Ok(inner.into())
     }
 }
 
-impl_snapshot_contributor!(Streams, StreamsInner);
+impl_fill_restore!(Streams, streams);
