@@ -110,6 +110,7 @@ jobs:
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: reports/java-coverage/jacocoAggregated.xml
+          disable_search: true
           flags: java
           fail_ci_if_error: false
           verbose: true
