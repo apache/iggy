@@ -48,7 +48,7 @@ class IggyTcpClientBuilderTest extends IntegrationTest {
     void shouldCreateClientWithBuilder() {
         // Given: Builder with basic configuration and credentials
         IggyTcpClient client = IggyTcpClient.builder()
-                .host(tcpHost())
+                .host(LOCALHOST_IP)
                 .port(tcpPort())
                 .credentials("iggy", "iggy")
                 .buildAndLogin();
@@ -62,7 +62,7 @@ class IggyTcpClientBuilderTest extends IntegrationTest {
     void shouldCreateClientWithCredentials() {
         // Given: Builder with credentials configured
         IggyTcpClient client = IggyTcpClient.builder()
-                .host(tcpHost())
+                .host(LOCALHOST_IP)
                 .port(tcpPort())
                 .credentials("iggy", "iggy")
                 .buildAndLogin();
@@ -77,7 +77,7 @@ class IggyTcpClientBuilderTest extends IntegrationTest {
     void shouldCreateClientWithTimeoutConfiguration() {
         // Given: Builder with timeout configuration
         IggyTcpClient client = IggyTcpClient.builder()
-                .host(tcpHost())
+                .host(LOCALHOST_IP)
                 .port(tcpPort())
                 .connectionTimeout(Duration.ofSeconds(30))
                 .requestTimeout(Duration.ofSeconds(10))
@@ -93,7 +93,7 @@ class IggyTcpClientBuilderTest extends IntegrationTest {
     void shouldCreateClientWithConnectionPoolSize() {
         // Given: Builder with connection pool size
         IggyTcpClient client = IggyTcpClient.builder()
-                .host(tcpHost())
+                .host(LOCALHOST_IP)
                 .port(tcpPort())
                 .connectionPoolSize(10)
                 .credentials("iggy", "iggy")
@@ -108,7 +108,7 @@ class IggyTcpClientBuilderTest extends IntegrationTest {
     void shouldCreateClientWithRetryPolicy() {
         // Given: Builder with exponential backoff retry policy
         IggyTcpClient client = IggyTcpClient.builder()
-                .host(tcpHost())
+                .host(LOCALHOST_IP)
                 .port(tcpPort())
                 .retryPolicy(RetryPolicy.exponentialBackoff())
                 .credentials("iggy", "iggy")
@@ -123,7 +123,7 @@ class IggyTcpClientBuilderTest extends IntegrationTest {
     void shouldCreateClientWithCustomRetryPolicy() {
         // Given: Builder with custom retry policy
         IggyTcpClient client = IggyTcpClient.builder()
-                .host(tcpHost())
+                .host(LOCALHOST_IP)
                 .port(tcpPort())
                 .retryPolicy(RetryPolicy.fixedDelay(5, Duration.ofMillis(500)))
                 .credentials("iggy", "iggy")
@@ -138,7 +138,7 @@ class IggyTcpClientBuilderTest extends IntegrationTest {
     void shouldCreateClientWithNoRetryPolicy() {
         // Given: Builder with no retry policy
         IggyTcpClient client = IggyTcpClient.builder()
-                .host(tcpHost())
+                .host(LOCALHOST_IP)
                 .port(tcpPort())
                 .retryPolicy(RetryPolicy.noRetry())
                 .credentials("iggy", "iggy")
@@ -153,7 +153,7 @@ class IggyTcpClientBuilderTest extends IntegrationTest {
     void shouldCreateClientWithAllOptions() {
         // Given: Builder with all configuration options
         IggyTcpClient client = IggyTcpClient.builder()
-                .host(tcpHost())
+                .host(LOCALHOST_IP)
                 .port(tcpPort())
                 .connectionTimeout(Duration.ofSeconds(30))
                 .requestTimeout(Duration.ofSeconds(10))
@@ -224,7 +224,7 @@ class IggyTcpClientBuilderTest extends IntegrationTest {
     @Test
     void shouldWorkWithConstructorAndExplicitConnect() {
         // Given: Constructor approach with explicit connect
-        IggyTcpClient client = new IggyTcpClient(tcpHost(), tcpPort());
+        IggyTcpClient client = new IggyTcpClient(LOCALHOST_IP, tcpPort());
 
         // When: Connect, login and perform operation
         client.connect();
