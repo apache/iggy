@@ -34,6 +34,26 @@ coverage:
         target: 50%
         threshold: 5%
 
+flag_management:
+  default_rules:
+    carryforward: true
+    statuses:
+      - type: project
+        target: auto
+        threshold: 1%
+        informational: true
+      - type: patch
+        target: 50%
+        threshold: 5%
+        informational: true
+  individual_flags:
+    - name: rust
+      paths:
+        - core/
+    - name: java
+      paths:
+        - foreign/java/
+
 comment:
   layout: "header, diff, flags, files"
   behavior: default
