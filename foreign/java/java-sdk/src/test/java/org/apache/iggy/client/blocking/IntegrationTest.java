@@ -51,6 +51,14 @@ public abstract class IntegrationTest {
     private static final Logger log = LoggerFactory.getLogger(IntegrationTest.class);
     private static final boolean USE_EXTERNAL_SERVER = System.getenv("USE_EXTERNAL_SERVER") != null;
 
+    public static String tcpHost() {
+        return USE_EXTERNAL_SERVER ? LOCALHOST_IP : iggyServer.getHost();
+    }
+
+    public static int tcpPort() {
+        return USE_EXTERNAL_SERVER ? TCP_PORT : iggyServer.getMappedPort(TCP_PORT);
+    }
+
     // Track created resources for cleanup
     protected List<Long> createdStreamIds = new ArrayList<>();
     protected List<Long> createdUserIds = new ArrayList<>();

@@ -52,7 +52,7 @@ public abstract class AsyncIggyTcpClientBuilderTest extends IntegrationTest {
     @Test
     void shouldCreateClientWithBuilder() throws Exception {
         // Given: Builder with basic configuration
-        client = AsyncIggyTcpClient.builder().host(iggyServer.getHost()).port(iggyServer.getMappedPort(IntegrationTest.TCP_PORT)).build();
+        client = AsyncIggyTcpClient.builder().host(tcpHost()).port(tcpPort()).build();
 
         // When: Connect to server
         client.connect().get(5, TimeUnit.SECONDS);
@@ -120,7 +120,7 @@ public abstract class AsyncIggyTcpClientBuilderTest extends IntegrationTest {
     @Test
     void shouldMaintainBackwardCompatibilityWithOldConstructor() throws Exception {
         // Given: Old constructor approach
-        client = new AsyncIggyTcpClient(iggyServer.getHost(), iggyServer.getMappedPort(IntegrationTest.TCP_PORT));
+        client = new AsyncIggyTcpClient(tcpHost(), tcpPort());
 
         // When: Connect to server
         client.connect().get(5, TimeUnit.SECONDS);
@@ -132,7 +132,7 @@ public abstract class AsyncIggyTcpClientBuilderTest extends IntegrationTest {
     @Test
     void shouldConnectAndPerformOperations() throws Exception {
         // Given: Client
-        client = AsyncIggyTcpClient.builder().host(iggyServer.getHost()).port(iggyServer.getMappedPort(IntegrationTest.TCP_PORT)).build();
+        client = AsyncIggyTcpClient.builder().host(tcpHost()).port(tcpPort()).build();
 
         // When: Connect
         client.connect().get(5, TimeUnit.SECONDS);
@@ -148,7 +148,7 @@ public abstract class AsyncIggyTcpClientBuilderTest extends IntegrationTest {
     @Test
     void shouldCloseConnectionGracefully() throws Exception {
         // Given: Connected client
-        client = AsyncIggyTcpClient.builder().host(iggyServer.getHost()).port(iggyServer.getMappedPort(IntegrationTest.TCP_PORT)).build();
+        client = AsyncIggyTcpClient.builder().host(tcpHost()).port(tcpPort()).build();
         client.connect().get(5, TimeUnit.SECONDS);
 
         // When: Close connection
