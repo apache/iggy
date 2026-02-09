@@ -15,31 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-namespace Apache.Iggy.Enums;
+package iggcon
 
-/// <summary>
-///     Enum representing the different types of system snapshots that can be taken
-/// </summary>
-public enum SystemSnapshotType
-{
-    /// Overview of the filesystem.
-    FilesystemOverview = 1,
-
-    /// List of currently running processes.
-    ProcessList = 2,
-
-    /// Resource usage statistics of the system.
-    ResourceUsage = 3,
-
-    /// Test snapshot type for development purposes.
-    Test = 4,
-
-    /// Server logs
-    ServerLogs = 5,
-
-    /// Server configuration
-    ServerConfig = 6,
-
-    /// Everything
-    All = 100
-}
+// TODO: Wire Version into binary_serialization/log_in_request_serializer.go
+// to send the actual SDK version during login instead of an empty string.
+const Version = "0.6.1-edge.1"

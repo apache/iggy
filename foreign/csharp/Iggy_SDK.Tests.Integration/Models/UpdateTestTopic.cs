@@ -15,31 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-namespace Apache.Iggy.Enums;
+using Apache.Iggy.Enums;
 
-/// <summary>
-///     Enum representing the different types of system snapshots that can be taken
-/// </summary>
-public enum SystemSnapshotType
-{
-    /// Overview of the filesystem.
-    FilesystemOverview = 1,
+namespace Apache.Iggy.Tests.Integrations.Models;
 
-    /// List of currently running processes.
-    ProcessList = 2,
-
-    /// Resource usage statistics of the system.
-    ResourceUsage = 3,
-
-    /// Test snapshot type for development purposes.
-    Test = 4,
-
-    /// Server logs
-    ServerLogs = 5,
-
-    /// Server configuration
-    ServerConfig = 6,
-
-    /// Everything
-    All = 100
-}
+internal record UpdateTestTopic(
+    string Name,
+    CompressionAlgorithm CompressionAlgorithm,
+    ulong MaxTopicSize,
+    TimeSpan MessageExpiry,
+    byte? ReplicationFactor);

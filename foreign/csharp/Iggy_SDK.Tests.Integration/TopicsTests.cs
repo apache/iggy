@@ -17,13 +17,12 @@
 
 using System.Text;
 using Apache.Iggy.Contracts;
-using Apache.Iggy.Contracts.Http;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
 using Apache.Iggy.Messages;
-using Apache.Iggy.Tests.Integrations.Attributes;
 using Apache.Iggy.Tests.Integrations.Fixtures;
 using Apache.Iggy.Tests.Integrations.Helpers;
+using Apache.Iggy.Tests.Integrations.Models;
 using Shouldly;
 using Partitioning = Apache.Iggy.Kinds.Partitioning;
 
@@ -31,14 +30,14 @@ namespace Apache.Iggy.Tests.Integrations;
 
 public class TopicsTests
 {
-    private static readonly CreateTopicRequest TopicRequest = new("Test Topic", CompressionAlgorithm.Gzip, 1000, 1,
-        2, 2_000_000_000);
+    private static readonly CreateTestTopic TopicRequest = new("Test Topic", CompressionAlgorithm.Gzip,
+        TimeSpan.FromMinutes(10), 1, 2, 2_000_000_000);
 
-    private static readonly CreateTopicRequest TopicRequestSecond
-        = new("Test Topic 2", CompressionAlgorithm.Gzip, 1000, 1, 2, 2_000_000_000);
+    private static readonly CreateTestTopic TopicRequestSecond
+        = new("Test Topic 2", CompressionAlgorithm.Gzip, TimeSpan.FromMinutes(10), 1, 2, 2_000_000_000);
 
-    private static readonly UpdateTopicRequest UpdateTopicRequest
-        = new("Updated Topic", CompressionAlgorithm.Gzip, 3_000_000_000, 2000, 3);
+    private static readonly UpdateTestTopic UpdateTopicRequest
+        = new("Updated Topic", CompressionAlgorithm.Gzip, 3_000_000_000, TimeSpan.FromMinutes(10), 3);
 
     [ClassDataSource<TopicsFixture>(Shared = SharedType.PerClass)]
     public required TopicsFixture Fixture { get; init; }
@@ -173,18 +172,21 @@ public class TopicsTests
     public async Task Get_Topic_WithPartitions_Should_ReturnValidResponse(Protocol protocol)
     {
         await Fixture.Clients[protocol]
-            .CreatePartitionsAsync(Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)), Identifier.String(TopicRequest.Name),
+            .CreatePartitionsAsync(Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
+                Identifier.String(TopicRequest.Name),
                 2);
 
         for (var i = 0; i < 3; i++)
         {
             await Fixture.Clients[protocol]
-                .SendMessagesAsync(Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)), Identifier.String(TopicRequest.Name),
+                .SendMessagesAsync(Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
+                    Identifier.String(TopicRequest.Name),
                     Partitioning.None(), GetMessages(i + 2));
         }
 
         var response = await Fixture.Clients[protocol]
-            .GetTopicByIdAsync(Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)), Identifier.String(TopicRequest.Name));
+            .GetTopicByIdAsync(Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
+                Identifier.String(TopicRequest.Name));
 
         response.ShouldNotBeNull();
         response.Id.ShouldBeGreaterThanOrEqualTo(0u);

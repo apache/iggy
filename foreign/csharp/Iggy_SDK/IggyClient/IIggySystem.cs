@@ -16,6 +16,7 @@
 // under the License.
 
 using Apache.Iggy.Contracts;
+using Apache.Iggy.Enums;
 
 namespace Apache.Iggy.IggyClient;
 
@@ -90,4 +91,19 @@ public interface IIggySystem
     /// <param name="token">The cancellation token to cancel the operation.</param>
     /// <returns>A task representing the asynchronous operation.</returns>
     Task PingAsync(CancellationToken token = default);
+
+    /// <summary>
+    ///     Captures and packages the current system state as a snapshot.
+    /// </summary>
+    /// <remarks>
+    ///     The snapshot is returned as raw bytes of a ZIP archive. The contents depend on
+    ///     the requested snapshot types (filesystem overview, process list, resource usage, etc.).
+    ///     Authentication is required.
+    /// </remarks>
+    /// <param name="compression">The compression method to use for the snapshot archive.</param>
+    /// <param name="snapshotTypes">The types of system information to include in the snapshot.</param>
+    /// <param name="token">The cancellation token to cancel the operation.</param>
+    /// <returns>A task that represents the asynchronous operation and returns the snapshot as raw bytes of a ZIP archive.</returns>
+    Task<byte[]> GetSnapshotAsync(SnapshotCompression compression, IList<SystemSnapshotType> snapshotTypes,
+        CancellationToken token = default);
 }

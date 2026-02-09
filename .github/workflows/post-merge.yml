@@ -57,7 +57,6 @@ jobs:
             chmod +x /usr/local/bin/yq
           fi
 
-      # TODO(hubcio): Add sdk-python (it has to contain `dev`), sdk-node, sdk-java (SNAPSHOT?), sdk-go (store version in file?) when ready for edge auto-publish
       - name: Check all components
         id: check
         run: |
@@ -94,13 +93,27 @@ jobs:
 
           # Check SDKs for pre-release versions without tags
           SDKS_TO_PUBLISH=""
-          for sdk in sdk-csharp; do
+          for sdk in sdk-python sdk-node sdk-java sdk-csharp sdk-go; do
             VERSION=$(scripts/extract-version.sh "$sdk")
             TAG=$(scripts/extract-version.sh "$sdk" --tag)
 
             echo "Checking $sdk: version=$VERSION, tag=$TAG"
 
-            if [[ ! "$VERSION" =~ -(edge|rc) ]]; then
+            # Maven SNAPSHOT versions are mutable -- republish when SDK sources change,
+            # skip tag gate since no tag will be created for SNAPSHOTs
+            if [[ "$VERSION" =~ -SNAPSHOT$ ]]; then
+              SDK_NAME="${sdk#sdk-}"
+              SDK_DIR="foreign/$SDK_NAME"
+              if ! git diff --name-only HEAD~1 HEAD -- "$SDK_DIR/" | grep -q .; then
+                echo "  ⏭️ SNAPSHOT - no changes in $SDK_DIR/"
+                continue
+              fi
+              echo "  ✅ SNAPSHOT version - will publish"
+              SDKS_TO_PUBLISH="${SDKS_TO_PUBLISH:+$SDKS_TO_PUBLISH,}$SDK_NAME"
+              continue
+            fi
+
+            if [[ ! "$VERSION" =~ -(edge|rc) ]] && [[ ! "$VERSION" =~ (\.dev|rc)[0-9]+$ ]]; then
               echo "  ⏭️ Stable version - skipping"
               continue
             fi
