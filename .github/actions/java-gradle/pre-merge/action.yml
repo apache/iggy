@@ -97,6 +97,8 @@ runs:
       if: inputs.task == 'test'
       shell: bash
       working-directory: foreign/java
+      env:
+        USE_EXTERNAL_SERVER: true
       run: ./gradlew jacocoAggregatedReport
 
     - name: Copy coverage reports
