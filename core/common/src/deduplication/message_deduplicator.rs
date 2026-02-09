@@ -16,7 +16,7 @@
  * under the License.
  */
 
-use iggy_common::IggyDuration;
+use crate::IggyDuration;
 use moka::future::{Cache, CacheBuilder};
 
 #[derive(Debug)]
@@ -95,9 +95,8 @@ impl MessageDeduplicator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use compio::time::sleep;
 
-    #[compio::test]
+    #[tokio::test]
     async fn message_deduplicator_should_insert_only_unique_identifiers() {
         let max_entries = 1000;
         let ttl = "1s".parse::<IggyDuration>().unwrap();
@@ -110,7 +109,7 @@ mod tests {
         }
     }
 
-    #[compio::test]
+    #[tokio::test]
     async fn message_deduplicator_should_evict_identifiers_after_given_time_to_live() {
         let max_entries = 3;
         let ttl = "100ms".parse::<IggyDuration>().unwrap();
@@ -119,7 +118,7 @@ mod tests {
             let id = i as u128;
             assert!(deduplicator.try_insert(id).await);
             assert!(deduplicator.exists(id));
-            sleep(2 * ttl.get_duration()).await;
+            tokio::time::sleep(2 * ttl.get_duration()).await;
             assert!(!deduplicator.exists(id));
             assert!(deduplicator.try_insert(id).await);
         }

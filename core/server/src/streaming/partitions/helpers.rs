@@ -15,10 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::{
-    configs::system::SystemConfig,
-    streaming::deduplication::message_deduplicator::MessageDeduplicator,
-};
+use crate::{configs::system::SystemConfig, streaming::deduplication::MessageDeduplicator};
 
 pub fn create_message_deduplicator(config: &SystemConfig) -> Option<MessageDeduplicator> {
     if !config.message_deduplication.enabled {

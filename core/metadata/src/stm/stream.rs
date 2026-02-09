@@ -182,6 +182,7 @@ define_state! {
         DeletePartitions
     ]
 }
+
 impl_absorb!(StreamsInner, StreamsCommand);
 
 impl StreamsInner {

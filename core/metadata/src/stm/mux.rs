@@ -20,6 +20,7 @@ use iggy_common::{header::PrepareHeader, message::Message};
 use crate::stm::{State, StateMachine};
 
 // MuxStateMachine that proxies to an tuple of variadic state machines
+#[derive(Debug)]
 pub struct MuxStateMachine<T>
 where
     T: StateMachine,
@@ -43,8 +44,8 @@ where
     type Input = T::Input;
     type Output = T::Output;
 
-    fn update(&self, input: &Self::Input, output: &mut Vec<Self::Output>) {
-        self.inner.update(input, output);
+    fn update(&self, input: Self::Input) -> Self::Output {
+        self.inner.update(input)
     }
 }
 
@@ -66,12 +67,14 @@ macro_rules! variadic {
 impl StateMachine for () {
     type Input = Message<PrepareHeader>;
     // TODO: Make sure that the `Output` matches to the output type of the rest of list.
+    // TODO: Add a trait bound to the output that will allow us to get the response in bytes.
     type Output = ();
 
-    fn update(&self, _input: &Self::Input, _output: &mut Vec<Self::Output>) {}
+    fn update(&self, _input: Self::Input) -> Self::Output {}
 }
 
 // Recursive case: process head and recurse on tail
+// No Clone bound needed - ownership passes through via Result
 impl<O, S, Rest> StateMachine for variadic!(S, ...Rest)
 where
     S: State<Output = O>,
@@ -80,11 +83,11 @@ where
     type Input = Rest::Input;
     type Output = O;
 
-    fn update(&self, input: &Self::Input, output: &mut Vec<Self::Output>) {
-        if let Some(result) = self.0.apply(input) {
-            output.push(result);
+    fn update(&self, input: Self::Input) -> Self::Output {
+        match self.0.apply(input) {
+            Ok(result) => result,
+            Err(input) => self.1.update(input),
         }
-        self.1.update(input, output)
     }
 }
 
@@ -104,8 +107,7 @@ mod tests {
         let mux = MuxStateMachine::new(variadic!(users, streams));
 
         let input = Message::new(std::mem::size_of::<PrepareHeader>());
-        let mut output = Vec::new();
 
-        mux.update(&input, &mut output);
+        mux.update(input);
     }
 }
