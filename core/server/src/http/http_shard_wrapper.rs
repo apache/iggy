@@ -23,7 +23,7 @@ use iggy_common::{
 };
 use send_wrapper::SendWrapper;
 
-use crate::binary::handlers::messages::poll_messages_handler::IggyPollMetadata;
+use iggy_common::IggyPollMetadata;
 use crate::shard::system::messages::PollingArgs;
 use crate::state::command::EntryCommand;
 use crate::streaming::segments::{IggyMessagesBatchMut, IggyMessagesBatchSet};

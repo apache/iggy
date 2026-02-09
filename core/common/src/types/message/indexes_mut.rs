@@ -16,8 +16,8 @@
  * under the License.
  */
 
-use iggy_common::PooledBuffer;
-use iggy_common::{INDEX_SIZE, IggyIndexView, IggyIndexes};
+use crate::PooledBuffer;
+use crate::{INDEX_SIZE, IggyIndexView, IggyIndexes};
 use std::fmt;
 use std::ops::{Deref, Index as StdIndex};
 

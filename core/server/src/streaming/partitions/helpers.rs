@@ -17,7 +17,7 @@
 
 use crate::{
     configs::system::SystemConfig,
-    streaming::deduplication::message_deduplicator::MessageDeduplicator,
+    streaming::deduplication::MessageDeduplicator,
 };
 
 pub fn create_message_deduplicator(config: &SystemConfig) -> Option<MessageDeduplicator> {

@@ -17,7 +17,7 @@
  */
 
 use super::COMPONENT;
-use crate::binary::handlers::messages::poll_messages_handler::IggyPollMetadata;
+use iggy_common::IggyPollMetadata;
 use crate::shard::IggyShard;
 use crate::shard::transmission::frame::ShardResponse;
 use crate::shard::transmission::message::{

@@ -25,7 +25,7 @@ use super::{
     journal::MemoryMessageJournal, log::SegmentedLog,
 };
 use crate::streaming::{
-    deduplication::message_deduplicator::MessageDeduplicator, stats::PartitionStats,
+    deduplication::MessageDeduplicator, stats::PartitionStats,
 };
 use iggy_common::IggyTimestamp;
 use std::sync::{Arc, atomic::AtomicU64};
