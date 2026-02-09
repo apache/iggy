@@ -24,7 +24,7 @@ use crate::shard::IggyShard;
 use crate::shard::system::messages::PollingArgs;
 use crate::streaming::session::Session;
 use iggy_common::SenderKind;
-use iggy_common::{IggyError, IggyPollMetadata, PollMessages, PooledBuffer};
+use iggy_common::{IggyError, PollMessages, PooledBuffer};
 use std::rc::Rc;
 use tracing::{debug, trace};
 
