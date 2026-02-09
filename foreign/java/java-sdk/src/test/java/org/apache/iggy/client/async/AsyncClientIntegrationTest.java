@@ -68,7 +68,7 @@ public abstract class AsyncClientIntegrationTest extends IntegrationTest {
     @BeforeAll
     public static void setup() throws Exception {
         log.info("Setting up async client for integration tests");
-        client = new AsyncIggyTcpClient(iggyServer.getHost(), iggyServer.getMappedPort(IntegrationTest.TCP_PORT));
+        client = new AsyncIggyTcpClient(LOCALHOST_IP, tcpPort());
 
         // Connect and login
         client.connect()

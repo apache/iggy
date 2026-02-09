@@ -80,7 +80,7 @@ public abstract class AsyncPollMessageTest extends IntegrationTest {
                     // Ignore close errors
                 }
             }
-            client = new AsyncIggyTcpClient(iggyServer.getHost(), iggyServer.getMappedPort(IntegrationTest.TCP_PORT));
+            client = new AsyncIggyTcpClient(LOCALHOST_IP, tcpPort());
             client.connect().get(5, TimeUnit.SECONDS);
             client.users().login("iggy", "iggy").get(5, TimeUnit.SECONDS);
             log.info("Client reconnected successfully");
@@ -102,7 +102,7 @@ public abstract class AsyncPollMessageTest extends IntegrationTest {
         log.info("Setting up async client for poll message tests");
 
         // Initialize client
-        client = new AsyncIggyTcpClient(iggyServer.getHost(), iggyServer.getMappedPort(IntegrationTest.TCP_PORT));
+        client = new AsyncIggyTcpClient(LOCALHOST_IP, tcpPort());
         client.connect().get(5, TimeUnit.SECONDS);
         client.users().login("iggy", "iggy").get(5, TimeUnit.SECONDS);
         log.info("Successfully connected and logged in");
