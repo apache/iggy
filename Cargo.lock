@@ -8291,7 +8291,6 @@ dependencies = [
  "metadata",
  "mimalloc",
  "mime_guess",
- "moka",
  "nix 0.31.1",
  "opentelemetry",
  "opentelemetry-appender-tracing",

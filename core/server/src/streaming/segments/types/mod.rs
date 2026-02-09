@@ -17,6 +17,5 @@
  */
 
 pub use iggy_common::{
-    IggyMessageHeaderViewMut, IggyMessageViewMut, IggyMessagesBatchMut,
-    IggyMessagesBatchSet,
+    IggyMessageHeaderViewMut, IggyMessageViewMut, IggyMessagesBatchMut, IggyMessagesBatchSet,
 };

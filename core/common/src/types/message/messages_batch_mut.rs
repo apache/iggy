@@ -18,12 +18,12 @@
 
 use super::indexes_mut::IggyIndexesMut;
 use super::message_view_mut::IggyMessageViewMutIterator;
-use crate::{MessageDeduplicator, PooledBuffer, random_id};
 use crate::{
     BytesSerializable, IGGY_MESSAGE_HEADER_SIZE, INDEX_SIZE, IggyByteSize, IggyError,
     IggyIndexView, IggyMessage, IggyMessageView, IggyMessageViewIterator, IggyMessagesBatch,
     IggyTimestamp, MAX_PAYLOAD_SIZE, MAX_USER_HEADERS_SIZE, Sizeable, Validatable,
 };
+use crate::{MessageDeduplicator, PooledBuffer, random_id};
 use bytes::{BufMut, BytesMut};
 use lending_iterator::prelude::*;
 use std::ops::{Deref, Index};
