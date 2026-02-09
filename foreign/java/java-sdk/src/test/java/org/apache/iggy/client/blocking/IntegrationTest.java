@@ -57,7 +57,7 @@ public abstract class IntegrationTest {
     protected IggyBaseClient client;
 
     @BeforeAll
-    public static synchronized void setupContainer() {
+    static void setupContainer() {
         if (!USE_EXTERNAL_SERVER) {
             log.info("Starting Iggy Server Container...");
             iggyServer = new GenericContainer<>(DockerImageName.parse("apache/iggy:edge"))
@@ -78,7 +78,7 @@ public abstract class IntegrationTest {
     }
 
     @AfterAll
-    public static synchronized void stopContainer() {
+    static void stopContainer() {
         if (iggyServer != null && iggyServer.isRunning()) {
             // Print last logs before stopping
             System.out.println("=== Iggy Server Container Logs ===");
@@ -86,7 +86,6 @@ public abstract class IntegrationTest {
             System.out.println("=================================");
             iggyServer.stop();
         }
-        iggyServer = null;
     }
 
     @BeforeEach

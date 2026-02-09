@@ -21,9 +21,7 @@ package org.apache.iggy.client.async.tcp;
 
 import org.apache.iggy.client.blocking.IntegrationTest;
 import org.apache.iggy.exception.IggyInvalidArgumentException;
-import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
-import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
 import java.util.concurrent.CompletableFuture;
@@ -31,7 +29,6 @@ import java.util.concurrent.TimeUnit;
 
 import static org.apache.iggy.client.blocking.IntegrationTest.LOCALHOST_IP;
 import static org.apache.iggy.client.blocking.IntegrationTest.TCP_PORT;
-import static org.junit.jupiter.api.Assumptions.assumeTrue;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
