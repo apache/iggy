@@ -57,7 +57,8 @@ public sealed class TopicResponse
     /// <summary>
     ///     Message expiry in milliseconds.
     /// </summary>
-    public ulong MessageExpiry { get; init; }
+    [JsonConverter(typeof(TimeSpanConverter))]
+    public TimeSpan MessageExpiry { get; init; }
 
     /// <summary>
     ///     Maximum topic size in bytes.

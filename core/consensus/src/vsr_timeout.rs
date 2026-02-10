@@ -109,6 +109,7 @@ pub enum TimeoutKind {
 
 /// Manager for all VSR timeouts of a replica.
 #[allow(unused)]
+#[derive(Debug)]
 pub struct TimeoutManager {
     ping: Timeout,
     prepare: Timeout,

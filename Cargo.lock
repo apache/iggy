@@ -4525,12 +4525,11 @@ dependencies = [
 
 [[package]]
 name = "iggy-connectors"
-version = "0.2.3-edge.1"
+version = "0.2.4-edge.1"
 dependencies = [
  "async-trait",
  "axum",
  "axum-server",
- "chrono",
  "clap",
  "configs",
  "configs_derive",
@@ -4653,6 +4652,8 @@ dependencies = [
  "err_trail",
  "human-repr",
  "humantime",
+ "lending-iterator",
+ "moka",
  "nix 0.31.1",
  "once_cell",
  "rcgen",
@@ -4668,6 +4669,8 @@ dependencies = [
  "tracing",
  "tungstenite",
  "twox-hash",
+ "ulid",
+ "uuid",
 ]
 
 [[package]]
@@ -4676,9 +4679,9 @@ version = "0.2.2-edge.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
- "chrono",
  "dashmap",
  "elasticsearch",
+ "iggy_common",
  "iggy_connector_sdk",
  "once_cell",
  "serde",
@@ -4693,10 +4696,10 @@ name = "iggy_connector_elasticsearch_source"
 version = "0.2.2-edge.1"
 dependencies = [
  "async-trait",
- "chrono",
  "dashmap",
  "elasticsearch",
  "humantime",
+ "iggy_common",
  "iggy_connector_sdk",
  "once_cell",
  "serde",
@@ -4730,10 +4733,10 @@ name = "iggy_connector_postgres_sink"
 version = "0.2.2-edge.1"
 dependencies = [
  "async-trait",
- "chrono",
  "dashmap",
  "futures",
  "humantime",
+ "iggy_common",
  "iggy_connector_sdk",
  "once_cell",
  "serde",
@@ -4750,10 +4753,10 @@ version = "0.2.2-edge.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
- "chrono",
  "dashmap",
  "futures",
  "humantime",
+ "iggy_common",
  "iggy_connector_sdk",
  "once_cell",
  "serde",
@@ -4790,6 +4793,7 @@ dependencies = [
  "iggy_connector_sdk",
  "once_cell",
  "rand 0.9.2",
+ "rmp-serde",
  "serde",
  "simd-json",
  "tokio",
@@ -4803,10 +4807,10 @@ version = "0.1.3-edge.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
- "chrono",
  "dashmap",
  "flatbuffers",
  "iggy",
+ "iggy_common",
  "once_cell",
  "postcard",
  "prost",
@@ -4814,9 +4818,11 @@ dependencies = [
  "protox",
  "protox-parse",
  "regex",
+ "rmp-serde",
  "serde",
  "serde_json",
  "simd-json",
+ "strum",
  "strum_macros",
  "thiserror 2.0.18",
  "tokio",
@@ -4991,6 +4997,7 @@ dependencies = [
  "iggy",
  "iggy_binary_protocol",
  "iggy_common",
+ "iggy_connector_sdk",
  "keyring",
  "lazy_static",
  "libc",
@@ -8284,11 +8291,9 @@ dependencies = [
  "iggy_common",
  "jsonwebtoken",
  "left-right",
- "lending-iterator",
  "metadata",
  "mimalloc",
  "mime_guess",
- "moka",
  "nix 0.31.1",
  "opentelemetry",
  "opentelemetry-appender-tracing",
@@ -8431,6 +8436,20 @@ dependencies = [
  "num-traits",
  "thiserror 2.0.18",
  "time",
+]
+
+[[package]]
+name = "simulator"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "bytes",
+ "consensus",
+ "futures",
+ "iggy_common",
+ "journal",
+ "message_bus",
+ "metadata",
 ]
 
 [[package]]

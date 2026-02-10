@@ -15,6 +15,31 @@
 # specific language governing permissions and limitations
 # under the License.
 
-[connectors]
-config_type = "local"
-config_dir = "tests/connectors/quickwit/sinks"
+type = "sink"
+key = "iceberg"
+enabled = true
+version = 0
+name = "Iceberg sink"
+path = "../../target/release/libiggy_connector_iceberg_sink"
+verbose = true
+
+[[streams]]
+stream = "test_stream"
+topics = ["test_topic"]
+schema = "json"
+batch_length = 100
+poll_interval = "5ms"
+consumer_group = "iceberg_sink_connector"
+
+[plugin_config]
+tables = ["test.messages"]
+catalog_type = "rest"
+warehouse = "warehouse"
+uri = "http://localhost:8181"
+dynamic_routing = false
+dynamic_route_field = ""
+store_url = "http://localhost:9000"
+store_access_key_id = "admin"
+store_secret_access_key = "password"
+store_region = "us-east-1"
+store_class = "s3"

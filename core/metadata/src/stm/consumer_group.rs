@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::stm::Handler;
-use crate::{define_state, impl_absorb};
+use crate::stm::StateHandler;
+use crate::{collect_handlers, define_state};
 use ahash::AHashMap;
 use iggy_common::create_consumer_group::CreateConsumerGroup;
 use iggy_common::delete_consumer_group::DeleteConsumerGroup;
@@ -94,10 +94,15 @@ define_state! {
         topic_index: AHashMap<(usize, usize), Vec<usize>>,
         topic_name_index: AHashMap<(Arc<str>, Arc<str>), Vec<usize>>,
         items: Slab<ConsumerGroup>,
-    },
-    [CreateConsumerGroup, DeleteConsumerGroup]
+    }
 }
-impl_absorb!(ConsumerGroupsInner, ConsumerGroupsCommand);
+
+collect_handlers! {
+    ConsumerGroups {
+        CreateConsumerGroup,
+        DeleteConsumerGroup,
+    }
+}
 
 impl ConsumerGroupsInner {
     fn resolve_consumer_group_id_by_identifiers(
@@ -106,7 +111,6 @@ impl ConsumerGroupsInner {
         topic_id: &Identifier,
         group_id: &Identifier,
     ) -> Option<usize> {
-        // Resolve by numeric IDs
         if let (Ok(s), Ok(t)) = (stream_id.get_u32_value(), topic_id.get_u32_value()) {
             let groups_in_topic = self.topic_index.get(&(s as usize, t as usize))?;
 
@@ -129,7 +133,6 @@ impl ConsumerGroupsInner {
             };
         }
 
-        // Resolve by string names
         if let (Ok(s), Ok(t)) = (stream_id.get_string_value(), topic_id.get_string_value()) {
             let key = (Arc::from(s.as_str()), Arc::from(t.as_str()));
             let groups_in_topic = self.topic_name_index.get(&key)?;
@@ -157,70 +160,73 @@ impl ConsumerGroupsInner {
     }
 }
 
-impl Handler for ConsumerGroupsInner {
-    fn handle(&mut self, cmd: &Self::Cmd) {
-        // TODO: This is all an hack, we need to figure out how to do this, in a way where `Identifier` does not reach
-        // this stage of execution.
-        match cmd {
-            ConsumerGroupsCommand::CreateConsumerGroup(payload) => {
-                let name: Arc<str> = Arc::from(payload.name.as_str());
-                if self.name_index.contains_key(&name) {
-                    return;
-                }
+// TODO: This is all a hack, we need to figure out how to do this in a way where `Identifier`
+// does not reach this stage of execution.
 
-                let group = ConsumerGroup::new(name.clone());
-                let id = self.items.insert(group);
-                self.items[id].id = id;
+impl StateHandler for CreateConsumerGroup {
+    type State = ConsumerGroupsInner;
+    fn apply(&self, state: &mut ConsumerGroupsInner) {
+        let name: Arc<str> = Arc::from(self.name.as_str());
+        if state.name_index.contains_key(&name) {
+            return;
+        }
 
-                self.name_index.insert(name.clone(), id);
+        let group = ConsumerGroup::new(name.clone());
+        let id = state.items.insert(group);
+        state.items[id].id = id;
 
-                if let (Ok(s), Ok(t)) = (
-                    payload.stream_id.get_u32_value(),
-                    payload.topic_id.get_u32_value(),
-                ) {
-                    self.topic_index
-                        .entry((s as usize, t as usize))
-                        .or_default()
-                        .push(id);
-                }
+        state.name_index.insert(name.clone(), id);
 
-                if let (Ok(s), Ok(t)) = (
-                    payload.stream_id.get_string_value(),
-                    payload.topic_id.get_string_value(),
-                ) {
-                    let key = (Arc::from(s.as_str()), Arc::from(t.as_str()));
-                    self.topic_name_index.entry(key).or_default().push(id);
-                }
-            }
+        if let (Ok(s), Ok(t)) = (
+            self.stream_id.get_u32_value(),
+            self.topic_id.get_u32_value(),
+        ) {
+            state
+                .topic_index
+                .entry((s as usize, t as usize))
+                .or_default()
+                .push(id);
+        }
 
-            ConsumerGroupsCommand::DeleteConsumerGroup(payload) => {
-                if let Some(id) = self.resolve_consumer_group_id_by_identifiers(
-                    &payload.stream_id,
-                    &payload.topic_id,
-                    &payload.group_id,
-                ) {
-                    let group = self.items.remove(id);
+        if let (Ok(s), Ok(t)) = (
+            self.stream_id.get_string_value(),
+            self.topic_id.get_string_value(),
+        ) {
+            let key = (Arc::from(s.as_str()), Arc::from(t.as_str()));
+            state.topic_name_index.entry(key).or_default().push(id);
+        }
+    }
+}
 
-                    self.name_index.remove(&group.name);
+impl StateHandler for DeleteConsumerGroup {
+    type State = ConsumerGroupsInner;
+    fn apply(&self, state: &mut ConsumerGroupsInner) {
+        let Some(id) = state.resolve_consumer_group_id_by_identifiers(
+            &self.stream_id,
+            &self.topic_id,
+            &self.group_id,
+        ) else {
+            return;
+        };
 
-                    if let (Ok(s), Ok(t)) = (
-                        payload.stream_id.get_u32_value(),
-                        payload.topic_id.get_u32_value(),
-                    ) && let Some(vec) = self.topic_index.get_mut(&(s as usize, t as usize))
-                    {
-                        vec.retain(|&x| x != id);
-                    }
+        let group = state.items.remove(id);
+        state.name_index.remove(&group.name);
 
-                    if let (Ok(s), Ok(t)) = (
-                        payload.stream_id.get_string_value(),
-                        payload.topic_id.get_string_value(),
-                    ) {
-                        let key = (Arc::from(s.as_str()), Arc::from(t.as_str()));
-                        if let Some(vec) = self.topic_name_index.get_mut(&key) {
-                            vec.retain(|&x| x != id);
-                        }
-                    }
-                }
+        if let (Ok(s), Ok(t)) = (
+            self.stream_id.get_u32_value(),
+            self.topic_id.get_u32_value(),
+        ) && let Some(vec) = state.topic_index.get_mut(&(s as usize, t as usize))
+        {
+            vec.retain(|&x| x != id);
+        }
+
+        if let (Ok(s), Ok(t)) = (
+            self.stream_id.get_string_value(),
+            self.topic_id.get_string_value(),
+        ) {
+            let key = (Arc::from(s.as_str()), Arc::from(t.as_str()));
+            if let Some(vec) = state.topic_name_index.get_mut(&key) {
+                vec.retain(|&x| x != id);
             }
         }
     }

@@ -23,20 +23,20 @@ namespace Apache.Iggy.Enums;
 public enum SnapshotCompression
 {
     /// Store the file as is
-    Stored,
+    Stored = 1,
 
     /// Compress the file using Deflate
-    Deflated,
+    Deflated = 2,
 
     /// Compress the file using BZIP2
-    Bzip2,
+    Bzip2 = 3,
 
     /// Compress the file using ZStandard
-    Zstd,
+    Zstd = 4,
 
     /// Compress the file using LZMA
-    Lzma,
+    Lzma = 5,
 
     /// Compress the file using XZ
-    Xz
+    Xz = 6
 }

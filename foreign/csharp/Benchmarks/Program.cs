@@ -39,7 +39,7 @@ var loggerFactory = LoggerFactory.Create(builder =>
 
 for (var i = 0; i < producerCount; i++)
 {
-    var bus = IggyClientFactory.CreateClient(new IggyClientConfigurator()
+    var bus = IggyClientFactory.CreateClient(new IggyClientConfigurator
     {
         BaseAddress = "127.0.0.1:8090",
         Protocol = Protocol.Tcp,
@@ -67,9 +67,9 @@ try
         await clients[0].CreateStreamAsync($"Test bench stream_{i}");
 
         await clients[0].CreateTopicAsync(Identifier.Numeric(startingStreamId + i),
-            name: $"Test bench topic_{i}",
+            $"Test bench topic_{i}",
             compressionAlgorithm: CompressionAlgorithm.None,
-            messageExpiry: 0,
+            messageExpiry: TimeSpan.Zero,
             maxTopicSize: 2_000_000_000,
             replicationFactor: 3,
             partitionsCount: 1);

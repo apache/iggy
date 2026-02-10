@@ -15,8 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::types::consensus::header::{
-    self, CommitHeader, ConsensusHeader, GenericHeader, PrepareHeader, PrepareOkHeader, ReplyHeader,
+use crate::{
+    header::RequestHeader,
+    types::consensus::header::{self, ConsensusHeader, PrepareHeader, PrepareOkHeader},
 };
 use bytes::Bytes;
 use std::marker::PhantomData;
@@ -278,33 +279,36 @@ where
 #[derive(Debug)]
 #[allow(unused)]
 pub enum MessageBag {
-    Generic(Message<GenericHeader>),
+    Request(Message<RequestHeader>),
     Prepare(Message<PrepareHeader>),
     PrepareOk(Message<PrepareOkHeader>),
-    Commit(Message<CommitHeader>),
-    Reply(Message<ReplyHeader>),
 }
 
 impl MessageBag {
     #[allow(unused)]
     pub fn command(&self) -> header::Command2 {
         match self {
-            MessageBag::Generic(message) => message.header().command,
+            MessageBag::Request(message) => message.header().command,
             MessageBag::Prepare(message) => message.header().command,
             MessageBag::PrepareOk(message) => message.header().command,
-            MessageBag::Commit(message) => message.header().command,
-            MessageBag::Reply(message) => message.header().command,
         }
     }
 
     #[allow(unused)]
     pub fn size(&self) -> u32 {
         match self {
-            MessageBag::Generic(message) => message.header().size(),
+            MessageBag::Request(message) => message.header().size(),
             MessageBag::Prepare(message) => message.header().size(),
             MessageBag::PrepareOk(message) => message.header().size(),
-            MessageBag::Commit(message) => message.header().size(),
-            MessageBag::Reply(message) => message.header().size(),
+        }
+    }
+
+    #[allow(unused)]
+    pub fn operation(&self) -> header::Operation {
+        match self {
+            MessageBag::Request(message) => message.header().operation,
+            MessageBag::Prepare(message) => message.header().operation,
+            MessageBag::PrepareOk(message) => message.header().operation,
         }
     }
 }
@@ -326,17 +330,17 @@ where
                     unsafe { Message::<header::PrepareHeader>::from_buffer_unchecked(buffer) };
                 MessageBag::Prepare(msg)
             }
-            header::Command2::Commit => {
-                let msg = unsafe { Message::<header::CommitHeader>::from_buffer_unchecked(buffer) };
-                MessageBag::Commit(msg)
+            header::Command2::Request => {
+                let msg =
+                    unsafe { Message::<header::RequestHeader>::from_buffer_unchecked(buffer) };
+                MessageBag::Request(msg)
             }
-            header::Command2::Reply => {
-                let msg = unsafe { Message::<header::ReplyHeader>::from_buffer_unchecked(buffer) };
-                MessageBag::Reply(msg)
+            header::Command2::PrepareOk => {
+                let msg =
+                    unsafe { Message::<header::PrepareOkHeader>::from_buffer_unchecked(buffer) };
+                MessageBag::PrepareOk(msg)
             }
-            _ => unreachable!(
-                "For now we only support Prepare, Commit, and Reply. In the future we will support more commands. Command2: {command:?}"
-            ),
+            _ => unreachable!(),
         }
     }
 }
@@ -500,33 +504,6 @@ mod tests {
 
         assert_eq!(bag.command(), header::Command2::Prepare);
         assert!(matches!(bag, MessageBag::Prepare(_)));
-        assert!(!matches!(bag, MessageBag::Commit(_)));
-        assert!(!matches!(bag, MessageBag::Reply(_)));
-        assert!(!matches!(bag, MessageBag::Generic(_)));
-    }
-
-    #[test]
-    fn test_message_bag_from_commit() {
-        let commit = header::CommitHeader::create_test();
-        let bag = MessageBag::from(commit);
-
-        assert_eq!(bag.command(), header::Command2::Commit);
-        assert!(!matches!(bag, MessageBag::Prepare(_)));
-        assert!(matches!(bag, MessageBag::Commit(_)));
-        assert!(!matches!(bag, MessageBag::Reply(_)));
-        assert!(!matches!(bag, MessageBag::Generic(_)));
-    }
-
-    #[test]
-    fn test_message_bag_from_reply() {
-        let reply = header::ReplyHeader::create_test();
-        let bag = MessageBag::from(reply);
-
-        assert_eq!(bag.command(), header::Command2::Reply);
-        assert!(!matches!(bag, MessageBag::Prepare(_)));
-        assert!(!matches!(bag, MessageBag::Commit(_)));
-        assert!(matches!(bag, MessageBag::Reply(_)));
-        assert!(!matches!(bag, MessageBag::Generic(_)));
     }
 }
 

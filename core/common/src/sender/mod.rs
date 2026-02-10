@@ -86,6 +86,7 @@ pub trait Sender {
 }
 
 #[allow(clippy::large_enum_variant)]
+#[derive(Debug)]
 pub enum SenderKind {
     Tcp(TcpSender),
     TcpTls(TcpTlsSender),

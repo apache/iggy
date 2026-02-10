@@ -166,11 +166,11 @@ public class IggyPublisherConfig
     public byte? TopicReplicationFactor { get; set; }
 
     /// <summary>
-    ///     Gets or sets the message expiry time in seconds (0 for no expiry).
+    ///     Gets or sets the message expiry time (0 for server default, TimeSpan.MaxValue for no expiry).
     ///     Messages older than this will be automatically deleted.
     ///     Only used when <see cref="CreateTopic" /> is true.
     /// </summary>
-    public ulong TopicMessageExpiry { get; set; }
+    public TimeSpan TopicMessageExpiry { get; set; } = TimeSpan.Zero;
 
     /// <summary>
     ///     Gets or sets the maximum size of the topic in bytes (0 for unlimited).

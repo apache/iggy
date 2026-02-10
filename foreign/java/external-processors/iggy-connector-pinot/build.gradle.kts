@@ -46,15 +46,15 @@ dependencies {
     testRuntimeOnly(libs.slf4j.simple)
 }
 
-// Task to copy runtime dependencies for Docker deployment (flattened into libs directory)
-tasks.register<Copy>("copyDependencies") {
+// Assemble connector plugin with all dependencies for Docker deployment
+tasks.register<Copy>("assemblePlugin") {
+    from(tasks.named("jar"))
     from(configurations.runtimeClasspath)
-    into(layout.buildDirectory.dir("libs"))
+    into(layout.buildDirectory.dir("plugin"))
 }
 
-// Make jar task depend on copyDependencies
 tasks.named("jar") {
-    finalizedBy("copyDependencies")
+    finalizedBy("assemblePlugin")
 }
 
 publishing {
