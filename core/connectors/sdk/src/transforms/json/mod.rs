@@ -32,7 +32,9 @@ pub fn compute_value(kind: &ComputedValue) -> OwnedValue {
     let now = IggyTimestamp::now();
     match kind {
         ComputedValue::DateTime => now.to_rfc3339_string().into(),
-        ComputedValue::TimestampNanos => (now.as_nanos() as i64).into(),
+        ComputedValue::TimestampNanos => i64::try_from(now.as_nanos())
+            .expect("Nanosecond timestamp overflow")
+            .into(),
         ComputedValue::TimestampMicros => (now.as_micros() as i64).into(),
         ComputedValue::TimestampMillis => (now.as_millis() as i64).into(),
         ComputedValue::TimestampSeconds => (now.to_secs() as i64).into(),

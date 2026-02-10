@@ -93,13 +93,44 @@ async fn execute_scenario(harness: &TestHarness, client: &IggyClient) {
     // 4. Wait for auto-commit to process
     sleep(Duration::from_secs(2)).await;
 
-    // 5. Disconnect the consumer and client (simulating runtime restart)
+    // 5. A non-member client should be able to query the consumer group offset
+    let observer_client = harness.new_client().await.unwrap();
+    observer_client
+        .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+        .await
+        .unwrap();
+
+    let cg_consumer = Consumer::group(Identifier::named(CONSUMER_GROUP_NAME).unwrap());
+    let offset_info = observer_client
+        .get_consumer_offset(
+            &cg_consumer,
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
+            Some(PARTITION_ID),
+        )
+        .await
+        .expect("Non-member client should be able to query consumer group offset")
+        .expect("Consumer group offset should exist after auto-commit");
+
+    assert_eq!(offset_info.partition_id, PARTITION_ID);
+    assert_eq!(
+        offset_info.current_offset,
+        (INITIAL_MESSAGES_COUNT - 1) as u64,
+        "Current offset should reflect all initial messages"
+    );
+    assert_eq!(
+        offset_info.stored_offset,
+        (INITIAL_MESSAGES_COUNT - 1) as u64,
+        "Stored offset should reflect consumed position"
+    );
+
+    // 6. Disconnect the consumer and client (simulating runtime restart)
     drop(consumer);
     runtime_client.disconnect().await.unwrap();
     drop(runtime_client);
     sleep(Duration::from_millis(500)).await;
 
-    // 6. Send new messages after consumer disconnected
+    // 7. Send new messages after consumer disconnected
     produce_messages(
         client,
         INITIAL_MESSAGES_COUNT + 1,
@@ -107,14 +138,14 @@ async fn execute_scenario(harness: &TestHarness, client: &IggyClient) {
     )
     .await;
 
-    // 7. Create a new client (simulating runtime restart)
+    // 8. Create a new client (simulating runtime restart)
     let new_runtime_client = harness.new_client().await.unwrap();
     new_runtime_client
         .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
         .await
         .unwrap();
 
-    // 8. Reconnect consumer and consume new messages
+    // 9. Reconnect consumer and consume new messages
     let mut consumer = create_consumer(&new_runtime_client).await;
     let new_messages = consume_messages(&mut consumer, NEW_MESSAGES_COUNT).await;
     assert_eq!(
@@ -133,8 +164,36 @@ async fn execute_scenario(harness: &TestHarness, client: &IggyClient) {
         );
     }
 
+    // 10. Wait for auto-commit after consuming new messages
+    sleep(Duration::from_secs(2)).await;
+
+    // 11. Non-member observer should see updated offset after new messages were consumed
+    let offset_after = observer_client
+        .get_consumer_offset(
+            &cg_consumer,
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
+            Some(PARTITION_ID),
+        )
+        .await
+        .expect("Non-member client should still be able to query offset")
+        .expect("Consumer group offset should exist");
+
+    assert_eq!(
+        offset_after.current_offset,
+        (INITIAL_MESSAGES_COUNT + NEW_MESSAGES_COUNT - 1) as u64,
+        "Current offset should reflect all messages"
+    );
+    assert_eq!(
+        offset_after.stored_offset,
+        (INITIAL_MESSAGES_COUNT + NEW_MESSAGES_COUNT - 1) as u64,
+        "Stored offset should reflect newly consumed position"
+    );
+
     drop(consumer);
     drop(new_runtime_client);
+    observer_client.disconnect().await.unwrap();
+    drop(observer_client);
 }
 
 async fn produce_messages(client: &IggyClient, start_id: u32, end_id: u32) {
