@@ -27,6 +27,7 @@ use iggy_common::header::{
 };
 use iggy_common::message::Message;
 use message_bus::IggyMessageBus;
+use message_bus::MessageBus;
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 
@@ -43,6 +44,7 @@ pub trait Sequencer {
     fn set_sequence(&self, sequence: Self::Sequence);
 }
 
+#[derive(Debug)]
 pub struct LocalSequencer {
     op: Cell<u64>,
 }
@@ -82,6 +84,7 @@ pub const PIPELINE_PREPARE_QUEUE_MAX: usize = 8;
 /// Maximum number of replicas in a cluster.
 pub const REPLICAS_MAX: usize = 32;
 
+#[derive(Debug)]
 pub struct PipelineEntry {
     pub message: Message<PrepareHeader>,
     /// Bitmap of replicas that have acknowledged this prepare.
@@ -133,6 +136,7 @@ impl RequestEntry {
     }
 }
 
+#[derive(Debug)]
 pub struct LocalPipeline {
     /// Messages being prepared (uncommitted and being replicated).
     prepare_queue: VecDeque<PipelineEntry>,
@@ -218,12 +222,8 @@ impl LocalPipeline {
         self.prepare_queue.back()
     }
 
-    /// Find a message by op number and checksum.
-    pub fn message_by_op_and_checksum(
-        &mut self,
-        op: u64,
-        checksum: u128,
-    ) -> Option<&mut PipelineEntry> {
+    /// Find a message by op number and checksum (immutable).
+    pub fn message_by_op_and_checksum(&self, op: u64, checksum: u128) -> Option<&PipelineEntry> {
         let head_op = self.prepare_queue.front()?.message.header().op;
         let tail_op = self.prepare_queue.back()?.message.header().op;
 
@@ -239,7 +239,7 @@ impl LocalPipeline {
         }
 
         let index = (op - head_op) as usize;
-        let entry = self.prepare_queue.get_mut(index)?;
+        let entry = self.prepare_queue.get(index)?;
 
         debug_assert_eq!(entry.message.header().op, op);
 
@@ -320,6 +320,20 @@ impl LocalPipeline {
     pub fn clear(&mut self) {
         self.prepare_queue.clear();
     }
+
+    /// Extract and remove a message by op number.
+    /// Returns None if op is not in the pipeline.
+    pub fn extract_by_op(&mut self, op: u64) -> Option<PipelineEntry> {
+        let head_op = self.prepare_queue.front()?.message.header().op;
+        if op < head_op {
+            return None;
+        }
+        let index = (op - head_op) as usize;
+        if index >= self.prepare_queue.len() {
+            return None;
+        }
+        self.prepare_queue.remove(index)
+    }
 }
 
 impl Pipeline for LocalPipeline {
@@ -334,15 +348,23 @@ impl Pipeline for LocalPipeline {
         LocalPipeline::pop_message(self)
     }
 
+    fn extract_by_op(&mut self, op: u64) -> Option<Self::Entry> {
+        LocalPipeline::extract_by_op(self, op)
+    }
+
     fn clear(&mut self) {
         LocalPipeline::clear(self)
+    }
+
+    fn message_by_op(&self, op: u64) -> Option<&Self::Entry> {
+        LocalPipeline::message_by_op(self, op)
     }
 
     fn message_by_op_mut(&mut self, op: u64) -> Option<&mut Self::Entry> {
         LocalPipeline::message_by_op_mut(self, op)
     }
 
-    fn message_by_op_and_checksum(&mut self, op: u64, checksum: u128) -> Option<&mut Self::Entry> {
+    fn message_by_op_and_checksum(&self, op: u64, checksum: u128) -> Option<&Self::Entry> {
         LocalPipeline::message_by_op_and_checksum(self, op, checksum)
     }
 
@@ -386,7 +408,11 @@ pub enum VsrAction {
 }
 
 #[allow(unused)]
-pub struct VsrConsensus {
+#[derive(Debug)]
+pub struct VsrConsensus<B = IggyMessageBus>
+where
+    B: MessageBus,
+{
     cluster: u128,
     replica: u8,
     replica_count: u8,
@@ -412,7 +438,7 @@ pub struct VsrConsensus {
 
     pipeline: RefCell<LocalPipeline>,
 
-    message_bus: IggyMessageBus,
+    message_bus: B,
     // TODO: Add loopback_queue for messages to self
     /// Tracks start view change messages received from all replicas (including self)
     start_view_change_from_all_replicas: RefCell<BitSet<u32>>,
@@ -430,8 +456,8 @@ pub struct VsrConsensus {
     timeouts: RefCell<TimeoutManager>,
 }
 
-impl VsrConsensus {
-    pub fn new(cluster: u128, replica: u8, replica_count: u8) -> Self {
+impl<B: MessageBus> VsrConsensus<B> {
+    pub fn new(cluster: u128, replica: u8, replica_count: u8, message_bus: B) -> Self {
         assert!(
             replica < replica_count,
             "replica index must be < replica_count"
@@ -449,7 +475,7 @@ impl VsrConsensus {
             last_timestamp: Cell::new(0),
             last_prepare_checksum: Cell::new(0),
             pipeline: RefCell::new(LocalPipeline::new()),
-            message_bus: IggyMessageBus::new(replica_count as usize, replica as u16, 0),
+            message_bus,
             start_view_change_from_all_replicas: RefCell::new(BitSet::with_capacity(REPLICAS_MAX)),
             do_view_change_from_all_replicas: RefCell::new(dvc_quorum_array_empty()),
             do_view_change_quorum: Cell::new(false),
@@ -457,6 +483,11 @@ impl VsrConsensus {
             sent_own_do_view_change: Cell::new(false),
             timeouts: RefCell::new(TimeoutManager::new(replica as u128)),
         }
+    }
+
+    // TODO: More init logic.
+    pub fn init(&self) {
+        self.status.set(Status::Normal);
     }
 
     pub fn primary_index(&self, view: u32) -> u8 {
@@ -995,9 +1026,9 @@ impl VsrConsensus {
     /// Called on the primary when a follower acknowledges a prepare.
     ///
     /// Returns true if quorum was just reached for this op.
-    pub fn handle_prepare_ok(&self, message: Message<PrepareOkHeader>) -> bool {
-        let header = message.header();
-
+    /// Handle a PrepareOk message. Returns true if quorum was reached.
+    /// Note: Caller (on_ack) should validate is_primary and status before calling.
+    pub fn handle_prepare_ok(&self, header: &PrepareOkHeader) -> bool {
         assert_eq!(header.command, Command2::PrepareOk);
         assert!(
             header.replica < self.replica_count,
@@ -1005,23 +1036,13 @@ impl VsrConsensus {
             header.replica
         );
 
-        // Ignore if not in normal status
-        if self.status() != Status::Normal {
-            return false;
-        }
-
         // Ignore if from older view
         if header.view < self.view() {
             return false;
         }
 
-        // Ignore if from newer view. This shouldn't happen if we're primary
+        // Ignore if from newer view
         if header.view > self.view() {
-            return false;
-        }
-
-        // We must be primary to process prepare_ok
-        if !self.is_primary() {
             return false;
         }
 
@@ -1043,9 +1064,6 @@ impl VsrConsensus {
             return false;
         }
 
-        // Verify the prepare is for a valid op range
-        let _commit = self.commit();
-
         // Check for duplicate ack
         if entry.has_ack(header.replica) {
             return false;
@@ -1058,22 +1076,19 @@ impl VsrConsensus {
         // Check if we've reached quorum
         if ack_count >= quorum && !entry.ok_quorum_received {
             entry.ok_quorum_received = true;
-
             return true;
         }
 
         false
     }
 
-    pub fn message_bus(&self) -> &IggyMessageBus {
+    pub fn message_bus(&self) -> &B {
         &self.message_bus
     }
 }
 
-impl Project<Message<PrepareHeader>> for Message<RequestHeader> {
-    type Consensus = VsrConsensus;
-
-    fn project(self, consensus: &Self::Consensus) -> Message<PrepareHeader> {
+impl<B: MessageBus> Project<Message<PrepareHeader>, VsrConsensus<B>> for Message<RequestHeader> {
+    fn project(self, consensus: &VsrConsensus<B>) -> Message<PrepareHeader> {
         let op = consensus.sequencer.current_sequence() + 1;
 
         self.transmute_header(|old, new| {
@@ -1085,6 +1100,7 @@ impl Project<Message<PrepareHeader>> for Message<RequestHeader> {
                 release: old.release,
                 command: Command2::Prepare,
                 replica: consensus.replica,
+                client: old.client,
                 parent: 0, // TODO: Get parent checksum from the previous entry in the journal (figure out how to pass that ctx here)
                 request_checksum: old.request_checksum,
                 request: old.request,
@@ -1098,10 +1114,8 @@ impl Project<Message<PrepareHeader>> for Message<RequestHeader> {
     }
 }
 
-impl Project<Message<PrepareOkHeader>> for Message<PrepareHeader> {
-    type Consensus = VsrConsensus;
-
-    fn project(self, consensus: &Self::Consensus) -> Message<PrepareOkHeader> {
+impl<B: MessageBus> Project<Message<PrepareOkHeader>, VsrConsensus<B>> for Message<PrepareHeader> {
+    fn project(self, consensus: &VsrConsensus<B>) -> Message<PrepareOkHeader> {
         self.transmute_header(|old, new| {
             *new = PrepareOkHeader {
                 command: Command2::PrepareOk,
@@ -1124,8 +1138,8 @@ impl Project<Message<PrepareOkHeader>> for Message<PrepareHeader> {
     }
 }
 
-impl Consensus for VsrConsensus {
-    type MessageBus = IggyMessageBus;
+impl<B: MessageBus> Consensus for VsrConsensus<B> {
+    type MessageBus = B;
 
     type RequestMessage = Message<RequestHeader>;
     type ReplicateMessage = Message<PrepareHeader>;
@@ -1162,9 +1176,9 @@ impl Consensus for VsrConsensus {
         // verify op is sequential
         assert_eq!(
             header.op,
-            self.sequencer.current_sequence() + 1,
+            self.sequencer.current_sequence(),
             "op must be sequential: expected {}, got {}",
-            self.sequencer.current_sequence() + 1,
+            self.sequencer.current_sequence(),
             header.op
         );
 

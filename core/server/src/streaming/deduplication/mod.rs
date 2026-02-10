@@ -16,4 +16,4 @@
  * under the License.
  */
 
-pub mod message_deduplicator;
+pub use iggy_common::MessageDeduplicator;

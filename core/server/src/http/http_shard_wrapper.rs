@@ -23,13 +23,13 @@ use iggy_common::{
 };
 use send_wrapper::SendWrapper;
 
-use crate::binary::handlers::messages::poll_messages_handler::IggyPollMetadata;
 use crate::shard::system::messages::PollingArgs;
 use crate::state::command::EntryCommand;
 use crate::streaming::segments::{IggyMessagesBatchMut, IggyMessagesBatchSet};
 use crate::streaming::topics;
 use crate::streaming::users::user::User;
 use crate::{shard::IggyShard, streaming::session::Session};
+use iggy_common::IggyPollMetadata;
 use iggy_common::PersonalAccessToken;
 
 /// A wrapper around IggyShard that is safe to use in HTTP handlers.

@@ -16,8 +16,10 @@
  * under the License.
  */
 
-use super::IggyMessageHeaderViewMut;
-use iggy_common::{IGGY_MESSAGE_HEADER_SIZE, IggyMessageHeaderView, calculate_checksum};
+use crate::{
+    IGGY_MESSAGE_HEADER_SIZE, IggyMessageHeaderView, calculate_checksum,
+    types::message::message_header_view_mut::IggyMessageHeaderViewMut,
+};
 use lending_iterator::prelude::*;
 
 /// A mutable view of a message for in-place modifications

@@ -34,6 +34,7 @@ pub trait ShardedState {
 }
 
 /// Least-loaded allocation strategy for connections
+#[derive(Debug)]
 pub struct LeastLoadedStrategy {
     total_shards: usize,
     connections_per_shard: RefCell<Vec<(u16, usize)>>,
@@ -193,6 +194,7 @@ impl AllocationStrategy<ConnectionCache> for LeastLoadedStrategy {
 }
 
 /// Coordinator that wraps a strategy for a specific sharded state type
+#[derive(Debug)]
 pub struct Coordinator<A, SS>
 where
     SS: ShardedState,
@@ -223,6 +225,7 @@ where
     }
 }
 
+#[derive(Debug)]
 pub struct ShardedConnections<A, SS>
 where
     SS: ShardedState,
@@ -259,7 +262,7 @@ where
 }
 
 /// Cache for connection state per shard
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct ConnectionCache {
     pub shard_id: u16,
     pub connections: HashMap<u8, Option<Rc<TcpSender>>>,

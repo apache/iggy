@@ -15,46 +15,17 @@
 # specific language governing permissions and limitations
 # under the License.
 
-codecov:
-  require_ci_to_pass: false
+[package]
+name = "simulator"
+version = "0.1.0"
+edition = "2024"
 
-coverage:
-  precision: 2
-  round: down
-  range: "50...90"
-  status:
-    project:
-      default:
-        informational: true
-        target: auto
-        threshold: 1%
-    patch:
-      default:
-        informational: true
-        target: 50%
-        threshold: 5%
-
-comment:
-  layout: "header, diff, flags, files"
-  behavior: default
-  require_changes: true
-  require_base: true
-  require_head: true
-
-ignore:
-  - "core/bench/**"
-  - "core/integration/**"
-  - "core/tools/**"
-  - "core/harness_derive/**"
-  - "bdd/**"
-  - "examples/**"
-  - "foreign/csharp/**"
-  - "foreign/go/**"
-  - "foreign/node/**"
-  - "foreign/python/**"
-  - "web/**"
-  - "**/tests/**"
-  - "**/*Test.java"
-  - "**/test/**"
-  - "**/build/**"
-  - "**/target/**"
+[dependencies]
+bytemuck = { workspace = true }
+bytes = { workspace = true }
+consensus = { path = "../consensus" }
+futures = { workspace = true }
+iggy_common = { path = "../common" }
+journal = { path = "../journal" }
+message_bus = { path = "../message_bus" }
+metadata = { path = "../metadata" }

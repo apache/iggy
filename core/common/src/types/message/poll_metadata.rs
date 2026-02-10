@@ -1,5 +1,4 @@
-/*
- * Licensed to the Apache Software Foundation (ASF) under one
+/* Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
  * regarding copyright ownership.  The ASF licenses this file
@@ -17,15 +16,17 @@
  * under the License.
  */
 
-pub(crate) mod byte_size;
-pub(crate) mod checksum;
-pub(crate) mod crypto;
-pub(crate) mod duration;
-pub(crate) mod expiry;
-pub(crate) mod hash;
-pub(crate) mod personal_access_token_expiry;
-pub mod random_id;
-pub mod text;
-pub(crate) mod timestamp;
-pub(crate) mod topic_size;
-pub(crate) mod versioning;
+#[derive(Debug, Clone, Copy)]
+pub struct IggyPollMetadata {
+    pub partition_id: u32,
+    pub current_offset: u64,
+}
+
+impl IggyPollMetadata {
+    pub fn new(partition_id: u32, current_offset: u64) -> Self {
+        Self {
+            partition_id,
+            current_offset,
+        }
+    }
+}
