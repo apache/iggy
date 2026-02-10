@@ -86,6 +86,9 @@ impl IggyShard {
                 (polling_consumer, partition_id)
             }
             ConsumerKind::ConsumerGroup => {
+                // Reading offsets doesn't require group membership — offsets are stored
+                // per consumer group (not per member), so any client can query the
+                // group's progress. Only store_consumer_offset enforces membership.
                 let (_, _, cg_id) =
                     self.resolve_consumer_group_id(stream_id, topic_id, &consumer.id)?;
                 let partition_id = partition_id.unwrap_or(0) as usize;

@@ -106,12 +106,18 @@ impl TestFixture for ElasticsearchSinkFixture {
                 && response.status().is_success()
             {
                 info!("Elasticsearch cluster is healthy");
-                break;
+                return Ok(fixture);
             }
             sleep(Duration::from_millis(HEALTH_CHECK_INTERVAL_MS)).await;
         }
 
-        Ok(fixture)
+        Err(TestBinaryError::FixtureSetup {
+            fixture_type: "ElasticsearchSink".to_string(),
+            message: format!(
+                "Failed to confirm Elasticsearch cluster health after {} attempts",
+                HEALTH_CHECK_ATTEMPTS
+            ),
+        })
     }
 
     fn connectors_runtime_envs(&self) -> HashMap<String, String> {

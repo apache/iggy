@@ -1396,9 +1396,11 @@ mod tests {
             processed_rows: 1000,
         };
 
-        let serialized = serde_json::to_vec(&original).expect("Failed to serialize");
-        let deserialized: State =
-            serde_json::from_slice(&serialized).expect("Failed to deserialize");
+        let connector_state =
+            ConnectorState::serialize(&original, "test", 1).expect("Failed to serialize state");
+        let deserialized: State = connector_state
+            .deserialize("test", 1)
+            .expect("Failed to deserialize state");
 
         assert_eq!(original.last_poll_time, deserialized.last_poll_time);
         assert_eq!(original.tracking_offsets, deserialized.tracking_offsets);

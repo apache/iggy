@@ -30,7 +30,7 @@ use tracing::info;
 use uuid::Uuid;
 
 const MINIO_IMAGE: &str = "minio/minio";
-const MINIO_TAG: &str = "latest";
+const MINIO_TAG: &str = "RELEASE.2025-09-07T16-13-09Z";
 const MINIO_PORT: u16 = 9000;
 const MINIO_CONSOLE_PORT: u16 = 9001;
 const ICEBERG_REST_IMAGE: &str = "apache/iceberg-rest-fixture";

@@ -35,6 +35,7 @@ pub mod locking;
 pub use alloc::buffer::PooledBuffer;
 pub use alloc::memory_pool::{MEMORY_POOL, MemoryPool, MemoryPoolConfigOther, memory_pool};
 pub use certificates::generate_self_signed_certificate;
+pub use chrono::{DateTime, Duration as ChronoDuration, Utc};
 pub use commands::consumer_groups::*;
 pub use commands::consumer_offsets::*;
 pub use commands::messages::*;
@@ -108,8 +109,5 @@ pub use utils::personal_access_token_expiry::PersonalAccessTokenExpiry;
 pub use utils::random_id;
 pub use utils::text;
 pub use utils::timestamp::*;
-
-// Re-export chrono types for connectors and other crates that need DateTime
-pub use chrono::{DateTime, Duration as ChronoDuration, Utc};
 pub use utils::topic_size::MaxTopicSize;
 pub use utils::versioning::SemanticVersion;
