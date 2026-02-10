@@ -33,6 +33,9 @@ const ELASTICSEARCH_TAG: &str = "9.3.0";
 const ELASTICSEARCH_PORT: u16 = 9200;
 const ELASTICSEARCH_READY_MSG: &str = "started";
 
+pub const HEALTH_CHECK_ATTEMPTS: usize = 30;
+pub const HEALTH_CHECK_INTERVAL_MS: u64 = 500;
+
 pub const DEFAULT_TEST_STREAM: &str = "test_stream";
 pub const DEFAULT_TEST_TOPIC: &str = "test_topic";
 

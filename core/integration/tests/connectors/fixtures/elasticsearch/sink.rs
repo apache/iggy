@@ -21,7 +21,8 @@ use super::container::{
     DEFAULT_TEST_STREAM, DEFAULT_TEST_TOPIC, ENV_SINK_INDEX, ENV_SINK_PATH,
     ENV_SINK_STREAMS_0_CONSUMER_GROUP, ENV_SINK_STREAMS_0_SCHEMA, ENV_SINK_STREAMS_0_STREAM,
     ENV_SINK_STREAMS_0_TOPICS, ENV_SINK_URL, ElasticsearchContainer, ElasticsearchOps,
-    ElasticsearchSearchResponse, create_http_client,
+    ElasticsearchSearchResponse, HEALTH_CHECK_ATTEMPTS, HEALTH_CHECK_INTERVAL_MS,
+    create_http_client,
 };
 use async_trait::async_trait;
 use integration::harness::{TestBinaryError, TestFixture};
@@ -99,7 +100,7 @@ impl TestFixture for ElasticsearchSinkFixture {
             http_client,
         };
 
-        for _ in 0..30 {
+        for _ in 0..HEALTH_CHECK_ATTEMPTS {
             let url = format!("{}/_cluster/health", fixture.container.base_url);
             if let Ok(response) = fixture.http_client.get(&url).send().await
                 && response.status().is_success()
@@ -107,7 +108,7 @@ impl TestFixture for ElasticsearchSinkFixture {
                 info!("Elasticsearch cluster is healthy");
                 break;
             }
-            sleep(Duration::from_millis(500)).await;
+            sleep(Duration::from_millis(HEALTH_CHECK_INTERVAL_MS)).await;
         }
 
         Ok(fixture)
