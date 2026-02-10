@@ -20,7 +20,7 @@ key = "elasticsearch"
 enabled = true
 version = 0
 name = "Elasticsearch source"
-path = "../../target/debug/libiggy_connector_elasticsearch_source"
+path = "../../target/release/libiggy_connector_elasticsearch_source"
 plugin_config_format = "json"
 
 [[streams]]

@@ -20,7 +20,7 @@ key = "postgres"
 enabled = true
 version = 0
 name = "Postgres source"
-path = "../../target/debug/libiggy_connector_postgres_source"
+path = "../../target/release/libiggy_connector_postgres_source"
 verbose = false
 
 [[streams]]

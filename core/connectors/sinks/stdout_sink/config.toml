@@ -20,7 +20,7 @@ key = "stdout"
 enabled = true
 version = 0
 name = "Stdout sink"
-path = "../../target/debug/libiggy_connector_stdout_sink"
+path = "../../target/release/libiggy_connector_stdout_sink"
 verbose = true
 
 [[streams]]

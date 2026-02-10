@@ -62,7 +62,7 @@ config_type = "local"
 config_dir = "path/to/connectors"
 ```
 
-**Sink connector config (connectors/stdout.toml):**
+**Sink connector config (connectors/stdout_sink.toml):**
 
 ```toml
 # Type of connector (sink or source)

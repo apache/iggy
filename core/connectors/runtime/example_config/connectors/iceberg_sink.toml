@@ -16,11 +16,12 @@
 # under the License.
 
 type = "sink"
-key = "stdout"
+key = "iceberg"
 enabled = true
 version = 0
-name = "Stdout sink"
-path = "target/release/libiggy_connector_stdout_sink"
+name = "Iceberg sink"
+path = "target/release/libiggy_connector_iceberg_sink"
+verbose = false
 
 [[streams]]
 stream = "example_stream"
@@ -28,14 +29,25 @@ topics = ["example_topic"]
 schema = "json"
 batch_length = 100
 poll_interval = "5ms"
-consumer_group = "stdout_sink_connector"
+consumer_group = "iceberg_sink_connector"
 
+# Local S3 example
 [plugin_config]
-print_payload = false
+tables = ["nyc.users"]
+catalog_type = "rest"
+warehouse = "warehouse"
+uri = "http://localhost:8181"
+dynamic_routing = true
+dynamic_route_field = "db_table"
+store_url = "http://localhost:9000"
+store_access_key_id = "admin"
+store_secret_access_key = "password"
+store_region = "us-east-1"
+store_class = "s3"
 
 [transforms.add_fields]
 enabled = true
 
 [[transforms.add_fields.fields]]
-key = "message"
-value.static = "hello"
+key = "db_table"
+value.static = "nyc.users"

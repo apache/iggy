@@ -20,7 +20,7 @@ key = "iceberg"
 enabled = true
 version = 0
 name = "Iceberg sink"
-path = "../../target/debug/libiggy_connector_iceberg_sink"
+path = "../../target/release/libiggy_connector_iceberg_sink"
 verbose = true
 
 [[streams]]

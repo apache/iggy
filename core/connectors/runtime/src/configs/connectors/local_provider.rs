@@ -198,15 +198,34 @@ impl LocalConnectorsConfigProvider<Created> {
                 debug!("Loaded base configuration: {:?}", base_config);
                 let path = path
                     .to_str()
-                    .expect("Failed to convert connector configuration path to string")
+                    .ok_or_else(|| {
+                        RuntimeError::InvalidConfiguration(format!(
+                            "Non-UTF8 connector config path: {}",
+                            path.display()
+                        ))
+                    })?
                     .to_string();
                 let connector_config: ConnectorConfig =
                     Self::create_file_config_provider(path.clone(), &base_config)
                         .load_config()
                         .await
-                        .expect("Failed to load connector configuration");
+                        .map_err(|e| {
+                            RuntimeError::InvalidConfiguration(format!(
+                                "Failed to load connector configuration from '{path}': {e}"
+                            ))
+                        })?;
 
-                let created_at: DateTime<Utc> = entry.metadata()?.created()?.into();
+                let metadata = entry.metadata()?;
+                let created_at: DateTime<Utc> = metadata
+                    .created()
+                    .or_else(|_| metadata.modified())
+                    .map(Into::into)
+                    .unwrap_or_else(|_| {
+                        warn!(
+                            "Could not read created or modified time for '{path}', using current time",
+                        );
+                        Utc::now()
+                    });
                 let connector_id: ConnectorId = (&connector_config).into();
                 let version = connector_config.version();
 

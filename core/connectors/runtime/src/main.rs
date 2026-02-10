@@ -40,7 +40,7 @@ use std::{
     env,
     sync::{Arc, atomic::AtomicU32},
 };
-use tracing::{debug, info};
+use tracing::info;
 
 mod api;
 pub(crate) mod configs;
@@ -266,21 +266,103 @@ async fn main() -> Result<(), RuntimeError> {
     Ok(())
 }
 
-pub(crate) fn resolve_plugin_path(path: &str) -> String {
-    let extension = path.split('.').next_back().unwrap_or_default();
-    if ALLOWED_PLUGIN_EXTENSIONS.contains(&extension) {
+/// Resolves a plugin shared library path from the connector config `path` field.
+///
+/// Accepts both `plugin.so` and `plugin` (OS-specific extension appended if missing).
+/// For absolute paths, checks existence at the literal location.
+/// For relative paths, searches in order:
+///   1. Literal path (relative to working directory)
+///   2. Directory of the runtime binary
+///   3. Current working directory (filename only)
+///   4. /usr/lib
+///   5. /usr/lib64
+///   6. /lib
+///   7. /lib64
+///   8. /usr/local/lib
+///   9. /usr/local/lib64
+pub(crate) fn resolve_plugin_path(path: &str) -> Result<String, RuntimeError> {
+    let extension = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default();
+    let with_extension = if ALLOWED_PLUGIN_EXTENSIONS.contains(&extension) {
         path.to_string()
     } else {
-        let os = std::env::consts::OS;
-        let os_extension = match os {
-            "windows" => "dll",
+        let os_extension = match std::env::consts::OS {
             "macos" => "dylib",
+            "windows" => "dll",
             _ => "so",
         };
-
-        debug!("Resolved plugin path: {path}.{os_extension} for detected OS: {os}");
         format!("{path}.{os_extension}")
+    };
+
+    let candidate = std::path::Path::new(&with_extension);
+
+    if candidate.exists() {
+        info!("Resolved plugin path: {with_extension}");
+        return Ok(with_extension);
     }
+
+    if candidate.is_relative() {
+        let Some(file_name) = candidate.file_name() else {
+            return Err(RuntimeError::InvalidConfiguration(format!(
+                "Invalid plugin path: '{with_extension}'"
+            )));
+        };
+
+        let search_dirs: Vec<std::path::PathBuf> = [
+            std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.to_path_buf())),
+            std::env::current_dir().ok(),
+            Some(std::path::PathBuf::from("/usr/lib")),
+            Some(std::path::PathBuf::from("/usr/lib64")),
+            Some(std::path::PathBuf::from("/lib")),
+            Some(std::path::PathBuf::from("/lib64")),
+            Some(std::path::PathBuf::from("/usr/local/lib")),
+            Some(std::path::PathBuf::from("/usr/local/lib64")),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+
+        for dir in &search_dirs {
+            let full = dir.join(file_name);
+            if full.exists() {
+                let resolved = match full.to_str() {
+                    Some(s) => s.to_owned(),
+                    None => continue,
+                };
+                info!(
+                    "Resolved plugin path: {resolved} (found in {})",
+                    dir.display()
+                );
+                return Ok(resolved);
+            }
+        }
+
+        let searched: Vec<String> = std::iter::once(with_extension.clone())
+            .chain(search_dirs.iter().filter_map(|d| {
+                let full = d.join(file_name);
+                full.to_str().map(|s| s.to_owned())
+            }))
+            .collect();
+
+        return Err(RuntimeError::InvalidConfiguration(format!(
+            "Plugin library not found. Searched paths:\n{}\n\
+             Ensure the shared library (.so/.dylib/.dll) is built and placed in one of these locations.",
+            searched
+                .iter()
+                .map(|p| format!("  - {p}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )));
+    }
+
+    Err(RuntimeError::InvalidConfiguration(format!(
+        "Plugin library not found at '{with_extension}'. \
+         Ensure the shared library file exists at this path."
+    )))
 }
 
 struct SinkConnector {
@@ -349,4 +431,66 @@ struct SourceWithPlugins {
 struct SourceConnectorWrapper {
     callback: HandleCallback,
     plugins: Vec<SourceConnectorPlugin>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    #[test]
+    fn path_with_known_extension_is_preserved() {
+        let result = resolve_plugin_path("/tmp/nonexistent_test_plugin.so");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("nonexistent_test_plugin.so"),
+            "Error should mention the .so path, got: {err}"
+        );
+    }
+
+    #[test]
+    fn path_without_extension_gets_os_suffix() {
+        let result = resolve_plugin_path("/tmp/nonexistent_test_plugin");
+        let err = result.unwrap_err().to_string();
+        let expected_ext = match std::env::consts::OS {
+            "macos" => "dylib",
+            _ => "so",
+        };
+        assert!(
+            err.contains(&format!("nonexistent_test_plugin.{expected_ext}")),
+            "Error should mention OS-specific extension, got: {err}"
+        );
+    }
+
+    #[test]
+    fn nonexistent_relative_path_lists_searched_locations() {
+        let result = resolve_plugin_path("nonexistent_test_plugin.so");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Searched paths:"),
+            "Should list searched paths, got: {err}"
+        );
+    }
+
+    #[test]
+    fn nonexistent_absolute_path_returns_specific_error() {
+        let result = resolve_plugin_path("/no/such/dir/plugin.so");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("/no/such/dir/plugin.so"),
+            "Should mention the exact path, got: {err}"
+        );
+    }
+
+    #[test]
+    fn existing_file_resolves_directly() {
+        let dir = TempDir::new().unwrap();
+        let plugin_path = dir.path().join("test_plugin.so");
+        fs::write(&plugin_path, b"fake-plugin").unwrap();
+
+        let result = resolve_plugin_path(plugin_path.to_str().unwrap())
+            .expect("should resolve existing file");
+        assert_eq!(result, plugin_path.to_str().unwrap());
+    }
 }

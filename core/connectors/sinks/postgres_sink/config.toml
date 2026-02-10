@@ -20,7 +20,7 @@ key = "postgres"
 enabled = true
 version = 0
 name = "Postgres sink"
-path = "../../target/debug/libiggy_connector_postgres_sink"
+path = "../../target/release/libiggy_connector_postgres_sink"
 verbose = false
 
 [[streams]]

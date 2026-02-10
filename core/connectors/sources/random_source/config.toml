@@ -20,7 +20,7 @@ key = "random"
 enabled = true
 version = 0
 name = "Random source"
-path = "../../target/debug/libiggy_connector_random_source"
+path = "../../target/release/libiggy_connector_random_source"
 plugin_config_format = "json"
 
 [[streams]]

@@ -4525,7 +4525,7 @@ dependencies = [
 
 [[package]]
 name = "iggy-connectors"
-version = "0.2.3-edge.1"
+version = "0.2.4-edge.1"
 dependencies = [
  "async-trait",
  "axum",

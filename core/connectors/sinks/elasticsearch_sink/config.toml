@@ -20,7 +20,7 @@ key = "elasticsearch"
 enabled = true
 version = 0
 name = "Elasticsearch sink"
-path = "../../target/debug/libiggy_connector_elasticsearch_sink"
+path = "../../target/release/libiggy_connector_elasticsearch_sink"
 verbose = false
 
 [[streams]]
