@@ -17,47 +17,75 @@
 
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
-using Apache.Iggy.Tests.Integrations.Attributes;
+using Apache.Iggy.IggyClient;
+using Apache.Iggy.Messages;
 using Apache.Iggy.Tests.Integrations.Fixtures;
-using Apache.Iggy.Tests.Integrations.Helpers;
 using Shouldly;
+using Partitioning = Apache.Iggy.Kinds.Partitioning;
 
 namespace Apache.Iggy.Tests.Integrations;
 
 public class FlushMessagesTests
 {
-    [ClassDataSource<FlushMessageFixture>(Shared = SharedType.PerClass)]
-    public required FlushMessageFixture Fixture { get; init; }
+    [ClassDataSource<IggyServerFixture>(Shared = SharedType.PerAssembly)]
+    public required IggyServerFixture Fixture { get; init; }
+
+    private async Task<(IIggyClient client, string streamName, string topicName)> CreateStreamWithMessages(
+        Protocol protocol)
+    {
+        var client = await Fixture.CreateAuthenticatedClient(protocol);
+
+        var streamName = $"flush-{Guid.NewGuid():N}";
+        var topicName = "test-topic";
+
+        await client.CreateStreamAsync(streamName);
+        await client.CreateTopicAsync(Identifier.String(streamName), topicName, 1);
+
+        await client.SendMessagesAsync(Identifier.String(streamName),
+            Identifier.String(topicName), Partitioning.None(),
+            [
+                new Message(Guid.NewGuid(), "Test message 1"u8.ToArray()),
+                new Message(Guid.NewGuid(), "Test message 2"u8.ToArray()),
+                new Message(Guid.NewGuid(), "Test message 3"u8.ToArray()),
+                new Message(Guid.NewGuid(), "Test message 4"u8.ToArray())
+            ]);
+
+        return (client, streamName, topicName);
+    }
 
     [Test]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task FlushUnsavedBuffer_WithFsync_Should_Flush_Successfully(Protocol protocol)
     {
+        var (client, streamName, topicName) = await CreateStreamWithMessages(protocol);
+
         await Should.NotThrowAsync(() =>
-            Fixture.Clients[protocol].FlushUnsavedBufferAsync(
-                Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-                Identifier.String(Fixture.TopicRequest.Name), 0, true));
+            client.FlushUnsavedBufferAsync(
+                Identifier.String(streamName),
+                Identifier.String(topicName), 0, true));
     }
 
     [Test]
-    [DependsOn(nameof(FlushUnsavedBuffer_WithFsync_Should_Flush_Successfully))]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task FlushUnsavedBuffer_WithOutFsync_Should_Flush_Successfully(Protocol protocol)
     {
+        var (client, streamName, topicName) = await CreateStreamWithMessages(protocol);
+
         await Should.NotThrowAsync(() =>
-            Fixture.Clients[protocol].FlushUnsavedBufferAsync(
-                Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-                Identifier.String(Fixture.TopicRequest.Name), 0, false));
+            client.FlushUnsavedBufferAsync(
+                Identifier.String(streamName),
+                Identifier.String(topicName), 0, false));
     }
 
     [Test]
-    [DependsOn(nameof(FlushUnsavedBuffer_WithOutFsync_Should_Flush_Successfully))]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
-    public async Task FlushUnsavedBuffer_Should_Throw_WhenStream_DoesNotExist(Protocol protocol)
+    public async Task FlushUnsavedBuffer_Should_Throw_WhenPartition_DoesNotExist(Protocol protocol)
     {
+        var (client, streamName, topicName) = await CreateStreamWithMessages(protocol);
+
         await Should.ThrowAsync<IggyInvalidStatusCodeException>(() =>
-            Fixture.Clients[protocol].FlushUnsavedBufferAsync(
-                Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-                Identifier.String(Fixture.TopicRequest.Name), 55, false));
+            client.FlushUnsavedBufferAsync(
+                Identifier.String(streamName),
+                Identifier.String(topicName), 55, false));
     }
 }
