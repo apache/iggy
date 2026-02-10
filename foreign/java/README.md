@@ -193,6 +193,10 @@ info.getUserAgent();   // User-Agent string for HTTP
 
 All exceptions thrown by the SDK inherit from `IggyException`. This allows you to catch all SDK-related errors with a single catch block, or handle specific exception types for more granular error handling.
 
+## Documentation
+
+- **[Async Client Guide](java-sdk/ASYNC_CLIENT.md)** — comprehensive guide for the async TCP client, including getting started, connection management, error handling, CompletableFuture patterns, example applications, performance characteristics, and a migration guide from blocking to async.
+
 ## Examples
 
 See the [`examples`](examples/) module for basic consumer and producer implementations using the SDK.
