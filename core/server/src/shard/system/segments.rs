@@ -29,9 +29,19 @@ impl IggyShard {
         partition_id: usize,
         segments_count: u32,
     ) -> Result<(), IggyError> {
+        use crate::streaming::segments::storage::create_segment_storage;
+
         let namespace = IggyNamespace::new(stream, topic, partition_id);
 
-        // Drain segments from local_partitions
+        // Pre-create the replacement segment while old segments are still in the log.
+        // This ensures we can atomically drain + replace without leaving the log empty
+        // across await points (which would panic any concurrent active_segment() call).
+        let new_segment = Segment::new(0, self.config.system.segment.size);
+        let new_storage =
+            create_segment_storage(&self.config.system, stream, topic, partition_id, 0, 0, 0)
+                .await?;
+
+        // Atomic drain + replace: the log is never empty
         let (segments, storages, stats) = {
             let mut partitions = self.local_partitions.borrow_mut();
             let partition = partitions
@@ -55,6 +65,15 @@ impl IggyShard {
                 .indexes_mut()
                 .drain(begin..upperbound)
                 .collect::<Vec<_>>();
+
+            partition
+                .log
+                .add_persisted_segment(new_segment, new_storage);
+            partition
+                .offset
+                .store(0, std::sync::atomic::Ordering::SeqCst);
+            partition.should_increment_offset = false;
+
             (segments, storages, partition.stats.clone())
         };
 
@@ -63,13 +82,11 @@ impl IggyShard {
             if let Some(msg_writer) = msg_writer
                 && let Some(index_writer) = index_writer
             {
-                // We need to fsync before closing to ensure all data is written to disk.
                 msg_writer.fsync().await?;
                 index_writer.fsync().await?;
                 let path = msg_writer.path();
                 drop(msg_writer);
                 drop(index_writer);
-                // File might not exist if never actually written to disk (lazy creation)
                 match compio::fs::remove_file(&path).await {
                     Ok(()) => {}
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -95,7 +112,6 @@ impl IggyShard {
                     partition_id,
                     start_offset,
                 );
-                // File might not exist if segment was never written to (lazy creation)
                 match compio::fs::remove_file(&path).await {
                     Ok(()) => {}
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -116,41 +132,7 @@ impl IggyShard {
             }
         }
 
-        // Add segment directly to local_partitions
-        self.init_log_in_local_partitions(&namespace).await?;
         stats.increment_segments_count(1);
-        Ok(())
-    }
-
-    async fn init_log_in_local_partitions(
-        &self,
-        namespace: &IggyNamespace,
-    ) -> Result<(), IggyError> {
-        use crate::streaming::segments::storage::create_segment_storage;
-
-        let start_offset = 0;
-        let segment = Segment::new(start_offset, self.config.system.segment.size);
-
-        let storage = create_segment_storage(
-            &self.config.system,
-            namespace.stream_id(),
-            namespace.topic_id(),
-            namespace.partition_id(),
-            0, // messages_size
-            0, // indexes_size
-            start_offset,
-        )
-        .await?;
-
-        let mut partitions = self.local_partitions.borrow_mut();
-        if let Some(partition) = partitions.get_mut(namespace) {
-            partition.log.add_persisted_segment(segment, storage);
-            // Reset offset when starting fresh with a new segment at offset 0
-            partition
-                .offset
-                .store(start_offset, std::sync::atomic::Ordering::SeqCst);
-            partition.should_increment_offset = false;
-        }
         Ok(())
     }
 
@@ -163,15 +145,14 @@ impl IggyShard {
     ) -> Result<(), IggyError> {
         use crate::streaming::segments::storage::create_segment_storage;
 
-        let (start_offset, old_segment_index) = {
+        let start_offset = {
             let mut partitions = self.local_partitions.borrow_mut();
             let partition = partitions
                 .get_mut(namespace)
                 .expect("rotate_segment: partition must exist");
-            let old_segment_index = partition.log.segments().len() - 1;
             let active_segment = partition.log.active_segment_mut();
             active_segment.sealed = true;
-            (active_segment.end_offset + 1, old_segment_index)
+            active_segment.end_offset + 1
         };
 
         let segment = Segment::new(start_offset, self.config.system.segment.size);
@@ -189,18 +170,23 @@ impl IggyShard {
 
         let mut partitions = self.local_partitions.borrow_mut();
         if let Some(partition) = partitions.get_mut(namespace) {
+            // Recompute: the sealed segment is always last (no new segments added
+            // between seal and here), but front segments may have been removed by
+            // the message_cleaner during the create_segment_storage await above.
+            let sealed_idx = partition.log.segments().len() - 1;
+
             // Clear old segment's indexes if cache_indexes is not set to All.
             // This prevents memory accumulation from keeping index buffers for sealed segments.
             if !matches!(
                 self.config.system.segment.cache_indexes,
                 CacheIndexesConfig::All
             ) {
-                partition.log.indexes_mut()[old_segment_index] = None;
+                partition.log.indexes_mut()[sealed_idx] = None;
             }
 
             // Close writers for the sealed segment - they're never needed after sealing.
             // This releases file handles and associated kernel/io_uring resources.
-            let old_storage = &mut partition.log.storages_mut()[old_segment_index];
+            let old_storage = &mut partition.log.storages_mut()[sealed_idx];
             let _ = old_storage.shutdown();
 
             partition.log.add_persisted_segment(segment, storage);

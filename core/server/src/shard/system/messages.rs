@@ -458,13 +458,7 @@ impl IggyShard {
 
         let _write_guard = write_lock.lock().await;
 
-        let (
-            current_offset,
-            current_position,
-            segment_start_offset,
-            segment_index,
-            message_deduplicator,
-        ) = {
+        let (current_offset, current_position, segment_start_offset, message_deduplicator) = {
             let partitions = self.local_partitions.borrow();
             let partition = partitions
                 .get(namespace)
@@ -477,13 +471,11 @@ impl IggyShard {
             };
 
             let segment = partition.log.active_segment();
-            let segment_index = partition.log.segments().len() - 1;
 
             (
                 current_offset,
                 segment.current_position,
                 segment.start_offset,
-                segment_index,
                 partition.message_deduplicator.clone(),
             )
         };
@@ -503,6 +495,9 @@ impl IggyShard {
                 .get_mut(namespace)
                 .expect("local_partitions: partition must exist");
 
+            // Recompute: front segments may have been removed by the message_cleaner
+            // during the prepare_for_persistence await above.
+            let segment_index = partition.log.segments().len() - 1;
             let segment = &mut partition.log.segments_mut()[segment_index];
 
             if segment.end_offset == 0 {
@@ -595,7 +590,10 @@ impl IggyShard {
             return Ok(0);
         }
 
-        let (messages_writer, index_writer) = {
+        // Capture the segment's start_offset as a stable identity before awaiting.
+        // delete_segments_base can drain+replace segments during the await, making
+        // positional indexing (segments().len() - 1) point to a different segment.
+        let (messages_writer, index_writer, target_start_offset) = {
             let partitions = self.local_partitions.borrow();
             let partition = partitions
                 .get(namespace)
@@ -604,6 +602,8 @@ impl IggyShard {
             if !partition.log.has_segments() {
                 return Ok(0);
             }
+
+            let target_start_offset = partition.log.active_segment().start_offset;
 
             let messages_writer = partition
                 .log
@@ -619,7 +619,7 @@ impl IggyShard {
                 .as_ref()
                 .expect("Index writer not initialized")
                 .clone();
-            (messages_writer, index_writer)
+            (messages_writer, index_writer, target_start_offset)
         };
 
         let saved = messages_writer
@@ -627,16 +627,40 @@ impl IggyShard {
             .save_frozen_batches(&frozen_batches)
             .await?;
 
+        // After the await, resolve the segment by start_offset instead of position.
+        // If the segment was deleted (by delete_segments_base or purge) during the
+        // await, the written data is orphaned — clear in_flight and bail out.
         let unsaved_indexes_slice = {
-            let partitions = self.local_partitions.borrow();
+            let mut partitions = self.local_partitions.borrow_mut();
             let partition = partitions
-                .get(namespace)
+                .get_mut(namespace)
                 .expect("local_partitions: partition must exist");
-            let segment_index = partition.log.segments().len() - 1;
-            partition.log.indexes()[segment_index]
-                .as_ref()
-                .expect("indexes must exist for segment being persisted")
-                .unsaved_slice()
+
+            let Some(segment_index) = partition
+                .log
+                .segments()
+                .iter()
+                .position(|s| s.start_offset == target_start_offset)
+            else {
+                tracing::warn!(
+                    "Segment with start_offset {target_start_offset} was deleted during persist for partition {:?}, discarding written data",
+                    namespace,
+                );
+                partition.log.clear_in_flight();
+                return Ok(0);
+            };
+
+            match partition.log.indexes()[segment_index].as_ref() {
+                Some(indexes) => indexes.unsaved_slice(),
+                None => {
+                    tracing::warn!(
+                        "Indexes cleared for segment at offset {target_start_offset} during persist for partition {:?}, discarding written data",
+                        namespace,
+                    );
+                    partition.log.clear_in_flight();
+                    return Ok(0);
+                }
+            }
         };
 
         index_writer
@@ -657,13 +681,21 @@ impl IggyShard {
                 .get_mut(namespace)
                 .expect("local_partitions: partition must exist");
 
-            // Recalculate index: segment deletion during async I/O shifts indices
-            let segment_index = partition.log.segments().len() - 1;
+            // Resolve by start_offset again — another deletion could have happened
+            // during save_indexes.
+            let Some(segment_index) = partition
+                .log
+                .segments()
+                .iter()
+                .position(|s| s.start_offset == target_start_offset)
+            else {
+                partition.log.clear_in_flight();
+                return Ok(0);
+            };
 
-            let indexes = partition.log.indexes_mut()[segment_index]
-                .as_mut()
-                .expect("indexes must exist for segment being persisted");
-            indexes.mark_saved();
+            if let Some(indexes) = partition.log.indexes_mut()[segment_index].as_mut() {
+                indexes.mark_saved();
+            }
 
             let segment = &mut partition.log.segments_mut()[segment_index];
             segment.size =
