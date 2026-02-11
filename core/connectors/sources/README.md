@@ -55,7 +55,7 @@ config_type = "local"
 config_dir = "path/to/connectors"
 ```
 
-**Source connector config (connectors/random.toml):**
+**Source connector config (connectors/random_source_v0.toml):**
 
 ```toml
 # Type of connector (sink or source)

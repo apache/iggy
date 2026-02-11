@@ -15,25 +15,27 @@
 # specific language governing permissions and limitations
 # under the License.
 
-type = "sink"
-key = "elasticsearch"
-enabled = true
-version = 0
-name = "Elasticsearch sink"
-path = "../../target/release/libiggy_connector_elasticsearch_sink"
-verbose = false
+name: Question
+description: Ask a question about Apache Iggy
+labels: ["question"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        > **Tip:** For real-time help, try [Discord](https://discord.gg/apache-iggy).
 
-[[streams]]
-stream = "test_stream"
-topics = ["test_topic"]
-schema = "json"
-batch_length = 100
-poll_interval = "5ms"
-consumer_group = "elasticsearch_sink_cg"
+  - type: textarea
+    id: question
+    attributes:
+      label: Question
+      description: What do you need help with?
+    validations:
+      required: true
 
-[plugin_config]
-url = "http://localhost:9200"
-index = "iggy_messages"
-create_index_if_not_exists = true
-batch_size = 100
-timeout_seconds = 30
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: Relevant code, config, or error output.
+    validations:
+      required: false

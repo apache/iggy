@@ -20,7 +20,7 @@ key = "quickwit"
 enabled = true
 version = 0
 name = "Quickwit sink"
-path = "../../target/debug/libiggy_connector_quickwit_sink"
+path = "../../target/release/libiggy_connector_quickwit_sink"
 verbose = false
 
 [[streams]]

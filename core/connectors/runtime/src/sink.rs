@@ -57,7 +57,7 @@ pub async fn init(
         }
 
         let plugin_id = PLUGIN_ID.fetch_add(1, Ordering::SeqCst);
-        let path = resolve_plugin_path(&config.path);
+        let path = resolve_plugin_path(&config.path)?;
         info!(
             "Initializing sink container with name: {name} ({key}), config version: {}, plugin: {path}",
             &config.version

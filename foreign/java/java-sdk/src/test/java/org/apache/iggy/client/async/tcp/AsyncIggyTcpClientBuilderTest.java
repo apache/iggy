@@ -19,6 +19,7 @@
 
 package org.apache.iggy.client.async.tcp;
 
+import org.apache.iggy.client.blocking.IntegrationTest;
 import org.apache.iggy.exception.IggyInvalidArgumentException;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -37,7 +38,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * Integration tests for AsyncIggyTcpClient builder pattern.
  * Tests the builder functionality against a running Iggy server.
  */
-class AsyncIggyTcpClientBuilderTest {
+public abstract class AsyncIggyTcpClientBuilderTest extends IntegrationTest {
 
     private AsyncIggyTcpClient client;
 
@@ -51,7 +52,7 @@ class AsyncIggyTcpClientBuilderTest {
     @Test
     void shouldCreateClientWithBuilder() throws Exception {
         // Given: Builder with basic configuration
-        client = AsyncIggyTcpClient.builder().host(LOCALHOST_IP).port(TCP_PORT).build();
+        client = AsyncIggyTcpClient.builder().host(LOCALHOST_IP).port(tcpPort()).build();
 
         // When: Connect to server
         client.connect().get(5, TimeUnit.SECONDS);
@@ -119,7 +120,7 @@ class AsyncIggyTcpClientBuilderTest {
     @Test
     void shouldMaintainBackwardCompatibilityWithOldConstructor() throws Exception {
         // Given: Old constructor approach
-        client = new AsyncIggyTcpClient(LOCALHOST_IP, TCP_PORT);
+        client = new AsyncIggyTcpClient(LOCALHOST_IP, tcpPort());
 
         // When: Connect to server
         client.connect().get(5, TimeUnit.SECONDS);
@@ -131,7 +132,7 @@ class AsyncIggyTcpClientBuilderTest {
     @Test
     void shouldConnectAndPerformOperations() throws Exception {
         // Given: Client
-        client = AsyncIggyTcpClient.builder().host(LOCALHOST_IP).port(TCP_PORT).build();
+        client = AsyncIggyTcpClient.builder().host(LOCALHOST_IP).port(tcpPort()).build();
 
         // When: Connect
         client.connect().get(5, TimeUnit.SECONDS);
@@ -147,7 +148,7 @@ class AsyncIggyTcpClientBuilderTest {
     @Test
     void shouldCloseConnectionGracefully() throws Exception {
         // Given: Connected client
-        client = AsyncIggyTcpClient.builder().host(LOCALHOST_IP).port(TCP_PORT).build();
+        client = AsyncIggyTcpClient.builder().host(LOCALHOST_IP).port(tcpPort()).build();
         client.connect().get(5, TimeUnit.SECONDS);
 
         // When: Close connection

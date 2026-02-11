@@ -15,25 +15,11 @@
 # specific language governing permissions and limitations
 # under the License.
 
-type = "sink"
-key = "elasticsearch"
-enabled = true
-version = 0
-name = "Elasticsearch sink"
-path = "../../target/release/libiggy_connector_elasticsearch_sink"
-verbose = false
-
-[[streams]]
-stream = "test_stream"
-topics = ["test_topic"]
-schema = "json"
-batch_length = 100
-poll_interval = "5ms"
-consumer_group = "elasticsearch_sink_cg"
-
-[plugin_config]
-url = "http://localhost:9200"
-index = "iggy_messages"
-create_index_if_not_exists = true
-batch_size = 100
-timeout_seconds = 30
+blank_issues_enabled: true
+contact_links:
+  - name: Design Discussion
+    url: https://github.com/apache/iggy/discussions
+    about: For bigger features or ideas that need design discussion before becoming an issue.
+  - name: Support & Chat
+    url: https://discord.gg/apache-iggy
+    about: Ask questions on Discord.

@@ -2,8 +2,6 @@
 
 The highly performant and modular runtime for statically typed, yet dynamically loaded connectors. Ingest the data from the external sources and push it further to the Iggy streams, or fetch the data from the Iggy streams and push it further to the external sources. Create your own Rust plugins by simply implementing either the `Source` or `Sink` trait and build custom pipelines for the data processing.
 
-**This is still WiP, and the runtime can be started only after compilation from the source code (no installable package yet).**
-
 The [docker image](https://hub.docker.com/r/apache/iggy-connect) is available, and can be fetched via `docker pull apache/iggy-connect`.
 
 ## Features
@@ -20,7 +18,7 @@ The [docker image](https://hub.docker.com/r/apache/iggy-connect) is available, a
 
 ## Quick Start
 
-1. Build the project in release mode (or debug, and update the connectors paths in the config accordingly), and make sure that the plugins specified in `core/connectors/runtime/example_config/connectors/` directory under `path` are available. The configuration must be provided in `toml` format.
+1. Build the project in release mode (or debug, and update the connectors paths in the config accordingly), and make sure that the plugins specified in `core/connectors/runtime/example_config/connectors/` directory under `path` are available. The configuration must be provided in `toml` format, with files following the `{connector_name}_{type}[_v{N}].toml` naming convention.
 
 2. Run `docker compose up -d` from `/examples/rust/src/sink-data-producer` which will start the Quickwit server to be used by an example sink connector. At this point, you can access the Quickwit UI at [http://localhost:7280](http://localhost:7280) - check this dashboard again later on, after the `events` index will be created.
 
@@ -42,6 +40,32 @@ The [docker image](https://hub.docker.com/r/apache/iggy-connect) is available, a
 ## Runtime
 
 All the connectors are implemented as Rust libraries and can be used as a part of the connector runtime. The runtime is responsible for managing the lifecycle of the connectors and providing the necessary infrastructure for the connectors to run. For more information, please refer to the **[runtime documentation](https://github.com/apache/iggy/tree/master/core/connectors/runtime)**.
+
+## Plugin path resolution
+
+The `path` field in connector configs points to the shared library (`.so`, `.dylib`, `.dll`). The runtime resolves it as follows:
+
+1. **Extension** — if the path has no recognized extension, the OS-native one is appended automatically (`.so` on Linux, `.dylib` on macOS, `.dll` on Windows).
+
+2. **Absolute paths** — used as-is.
+
+3. **Relative paths** — searched in order, returning the first match:
+   - the literal relative path (from working directory)
+   - directory of the runtime binary (filename only)
+   - current working directory (filename only)
+   - `/usr/lib`, `/usr/lib64`, `/lib`, `/lib64`, `/usr/local/lib`, `/usr/local/lib64`
+
+**Examples:**
+
+```toml
+# Relative — resolved against search dirs; extension appended on Linux
+path = "target/release/libiggy_connector_stdout_sink"
+
+# Absolute — used directly
+path = "/opt/iggy/plugins/libiggy_connector_stdout_sink.so"
+```
+
+If the library is not found, the runtime logs all searched paths to help diagnose the issue.
 
 ## Sink
 
