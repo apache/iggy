@@ -113,23 +113,21 @@ public final class BlockingProducer {
     }
 
     private static void setupStreamAndTopic(IggyTcpClient client) {
-        try {
-            // Try to get the stream first
-            client.streams().getStream(StreamId.of(STREAM_NAME));
+        // Check if stream exists, create if not
+        if (client.streams().getStream(StreamId.of(STREAM_NAME)).isPresent()) {
             log.info("Stream '{}' already exists", STREAM_NAME);
-        } catch (RuntimeException e) {
-            // Stream doesn't exist, create it
+        } else {
             log.info("Creating stream '{}'...", STREAM_NAME);
             client.streams().createStream(STREAM_NAME);
             log.info("Stream created");
         }
 
-        try {
-            // Try to get the topic first
-            client.topics().getTopic(StreamId.of(STREAM_NAME), TopicId.of(TOPIC_NAME));
+        // Check if topic exists, create if not
+        if (client.topics()
+                .getTopic(StreamId.of(STREAM_NAME), TopicId.of(TOPIC_NAME))
+                .isPresent()) {
             log.info("Topic '{}' already exists", TOPIC_NAME);
-        } catch (RuntimeException e) {
-            // Topic doesn't exist, create it
+        } else {
             log.info("Creating topic '{}' with {} partitions...", TOPIC_NAME, PARTITION_COUNT);
             client.topics()
                     .createTopic(
