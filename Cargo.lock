@@ -8374,7 +8374,6 @@ dependencies = [
  "sysinfo 0.38.1",
  "tempfile",
  "thiserror 2.0.18",
- "tokio",
  "toml 1.0.0+spec-1.1.0",
  "tower-http",
  "tracing",

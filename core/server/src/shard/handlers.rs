@@ -75,9 +75,25 @@ async fn handle_request(
             Ok(ShardResponse::SendMessages)
         }
         ShardRequestPayload::PollMessages { args, consumer } => {
-            let auto_commit = args.auto_commit;
-
             let namespace = namespace.expect("PollMessages requires routing namespace");
+
+            if args.count == 0 {
+                let current_offset = shard
+                    .local_partitions
+                    .borrow()
+                    .get(&namespace)
+                    .map(|p| p.offset.load(std::sync::atomic::Ordering::Relaxed))
+                    .unwrap_or(0);
+                return Ok(ShardResponse::PollMessages((
+                    iggy_common::IggyPollMetadata::new(
+                        namespace.partition_id() as u32,
+                        current_offset,
+                    ),
+                    crate::streaming::segments::IggyMessagesBatchSet::empty(),
+                )));
+            }
+
+            let auto_commit = args.auto_commit;
 
             shard.ensure_partition(&namespace).await?;
 
@@ -97,10 +113,10 @@ async fn handle_request(
         }
         ShardRequestPayload::FlushUnsavedBuffer { fsync } => {
             let ns = namespace.expect("FlushUnsavedBuffer requires routing namespace");
-            shard
-                .flush_unsaved_buffer_base(ns.stream_id(), ns.topic_id(), ns.partition_id(), fsync)
+            let flushed_count = shard
+                .flush_unsaved_buffer_from_local_partitions(&ns, fsync)
                 .await?;
-            Ok(ShardResponse::FlushUnsavedBuffer)
+            Ok(ShardResponse::FlushUnsavedBuffer { flushed_count })
         }
         ShardRequestPayload::DeleteSegments { segments_count } => {
             let ns = namespace.expect("DeleteSegments requires routing namespace");
@@ -113,6 +129,19 @@ async fn handle_request(
                 )
                 .await?;
             Ok(ShardResponse::DeleteSegments)
+        }
+        ShardRequestPayload::CleanTopicMessages {
+            stream_id,
+            topic_id,
+            partition_ids,
+        } => {
+            let (deleted_segments, deleted_messages) = shard
+                .clean_topic_messages(stream_id, topic_id, &partition_ids)
+                .await?;
+            Ok(ShardResponse::CleanTopicMessages {
+                deleted_segments,
+                deleted_messages,
+            })
         }
         ShardRequestPayload::CreatePartitionsRequest { user_id, command } => {
             assert_eq!(

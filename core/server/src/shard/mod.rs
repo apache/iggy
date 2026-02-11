@@ -269,7 +269,31 @@ impl IggyShard {
                 )
                 .await
                 {
-                    Ok(loaded_log) => {
+                    Ok(mut loaded_log) => {
+                        if !loaded_log.has_segments() {
+                            info!(
+                                "No segments found on disk for partition ID: {} for topic ID: {} for stream ID: {}, creating initial segment",
+                                partition_id, topic_id, stream_id
+                            );
+                            let segment = crate::streaming::segments::Segment::new(
+                                0,
+                                self.config.system.segment.size,
+                            );
+                            let storage =
+                                crate::streaming::segments::storage::create_segment_storage(
+                                    &self.config.system,
+                                    stream_id,
+                                    topic_id,
+                                    partition_id,
+                                    0,
+                                    0,
+                                    0,
+                                )
+                                .await?;
+                            loaded_log.add_persisted_segment(segment, storage);
+                            stats.increment_segments_count(1);
+                        }
+
                         let current_offset = loaded_log.active_segment().end_offset;
                         stats.set_current_offset(current_offset);
 

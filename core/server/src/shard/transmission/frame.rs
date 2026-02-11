@@ -60,8 +60,14 @@ pub struct ConsumerGroupResponseData {
 pub enum ShardResponse {
     PollMessages((IggyPollMetadata, IggyMessagesBatchSet)),
     SendMessages,
-    FlushUnsavedBuffer,
+    FlushUnsavedBuffer {
+        flushed_count: u32,
+    },
     DeleteSegments,
+    CleanTopicMessages {
+        deleted_segments: u64,
+        deleted_messages: u64,
+    },
     Event,
     CreateStreamResponse(StreamResponseData),
     DeleteStreamResponse(usize),

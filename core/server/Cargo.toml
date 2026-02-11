@@ -98,7 +98,6 @@ strum = { workspace = true }
 sysinfo = { workspace = true }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["sync"] }
 toml = { workspace = true }
 tower-http = { workspace = true }
 tracing = { workspace = true }

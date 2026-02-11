@@ -115,6 +115,11 @@ pub enum ShardRequestPayload {
     DeleteSegments {
         segments_count: u32,
     },
+    CleanTopicMessages {
+        stream_id: usize,
+        topic_id: usize,
+        partition_ids: Vec<usize>,
+    },
     SocketTransfer {
         fd: OwnedFd,
         from_shard: u16,

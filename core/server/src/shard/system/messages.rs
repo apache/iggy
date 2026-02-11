@@ -54,30 +54,14 @@ impl IggyShard {
             partition.partition_id,
         );
 
-        // Fast path: if partition exists locally, append directly without channel routing
-        let is_local = self.local_partitions.borrow().contains(&namespace);
-        if is_local {
-            let batch = self.maybe_encrypt_messages(batch)?;
-            let messages_count = batch.count();
-
-            self.append_messages_to_local_partition(&namespace, batch, &self.config.system)
-                .await?;
-
-            self.metrics.increment_messages(messages_count as u64);
-            return Ok(());
-        }
-
-        // Slow path: route through data-plane channel to target shard
         let payload = ShardRequestPayload::SendMessages { batch };
         let request = ShardRequest::data_plane(namespace, payload);
 
         match self.send_to_data_plane(request).await? {
-            ShardResponse::SendMessages => {}
-            ShardResponse::ErrorResponse(err) => return Err(err),
+            ShardResponse::SendMessages => Ok(()),
+            ShardResponse::ErrorResponse(err) => Err(err),
             _ => unreachable!("Expected SendMessages response"),
         }
-
-        Ok(())
     }
 
     /// Polls messages from partition. Permission must be checked by caller via
@@ -103,45 +87,6 @@ impl IggyShard {
 
         let namespace = IggyNamespace::new(topic.stream_id, topic.topic_id, partition_id);
 
-        // Fast path: if partition exists locally, poll directly without channel routing
-        if self.local_partitions.borrow().contains(&namespace) {
-            if args.count == 0 {
-                let current_offset = self
-                    .local_partitions
-                    .borrow()
-                    .get(&namespace)
-                    .map(|data| data.offset.load(Ordering::Relaxed))
-                    .unwrap_or(0);
-                return Ok((
-                    IggyPollMetadata::new(partition_id as u32, current_offset),
-                    IggyMessagesBatchSet::empty(),
-                ));
-            }
-
-            let auto_commit = args.auto_commit;
-
-            let (poll_metadata, batches) = self
-                .poll_messages_from_local_partition(&namespace, consumer, args)
-                .await?;
-
-            if auto_commit && !batches.is_empty() {
-                let offset = batches
-                    .last_offset()
-                    .expect("Batch set should have at least one batch");
-                self.auto_commit_consumer_offset_from_local_partition(&namespace, consumer, offset)
-                    .await?;
-            }
-
-            let batches = if let Some(encryptor) = &self.encryptor {
-                self.decrypt_messages(batches, encryptor).await?
-            } else {
-                batches
-            };
-
-            return Ok((poll_metadata, batches));
-        }
-
-        // Slow path: route through data-plane channel to target shard
         let payload = ShardRequestPayload::PollMessages { consumer, args };
         let request = ShardRequest::data_plane(namespace, payload);
 
@@ -181,22 +126,10 @@ impl IggyShard {
         let request = ShardRequest::data_plane(namespace, payload);
 
         match self.send_to_data_plane(request).await? {
-            ShardResponse::FlushUnsavedBuffer => Ok(()),
+            ShardResponse::FlushUnsavedBuffer { .. } => Ok(()),
             ShardResponse::ErrorResponse(err) => Err(err),
             _ => unreachable!("Expected FlushUnsavedBuffer response"),
         }
-    }
-
-    pub(crate) async fn flush_unsaved_buffer_base(
-        &self,
-        stream: usize,
-        topic: usize,
-        partition_id: usize,
-        fsync: bool,
-    ) -> Result<u32, IggyError> {
-        let namespace = IggyNamespace::new(stream, topic, partition_id);
-        self.flush_unsaved_buffer_from_local_partitions(&namespace, fsync)
-            .await
     }
 
     /// Flushes unsaved messages from the partition store to disk.
@@ -206,16 +139,6 @@ impl IggyShard {
         namespace: &IggyNamespace,
         fsync: bool,
     ) -> Result<u32, IggyError> {
-        let write_lock = {
-            let partitions = self.local_partitions.borrow();
-            let Some(partition) = partitions.get(namespace) else {
-                return Ok(0);
-            };
-            partition.write_lock.clone()
-        };
-
-        let _write_guard = write_lock.lock().await;
-
         let frozen_batches = {
             let mut partitions = self.local_partitions.borrow_mut();
             let Some(partition) = partitions.get_mut(namespace) else {
@@ -361,22 +284,17 @@ impl IggyShard {
         Ok(())
     }
 
-    pub async fn append_messages_to_local_partition(
+    /// Appends a batch to the active segment, flushing to disk and rotating if needed.
+    ///
+    /// Safety: called exclusively from the message pump — segment indices captured before
+    /// internal `.await` points (prepare_for_persistence, persist, rotate) remain valid
+    /// because no other handler can modify the segment vec while this frame is in progress.
+    pub(crate) async fn append_messages_to_local_partition(
         &self,
         namespace: &IggyNamespace,
         mut batch: IggyMessagesBatchMut,
         config: &crate::configs::system::SystemConfig,
     ) -> Result<(), IggyError> {
-        let write_lock = {
-            let partitions = self.local_partitions.borrow();
-            let partition = partitions
-                .get(namespace)
-                .expect("local_partitions: partition must exist");
-            partition.write_lock.clone()
-        };
-
-        let _write_guard = write_lock.lock().await;
-
         let (
             current_offset,
             current_position,
@@ -576,9 +494,7 @@ impl IggyShard {
                 .get_mut(namespace)
                 .expect("local_partitions: partition must exist");
 
-            // Recalculate index: segment deletion during async I/O shifts indices
             let segment_index = partition.log.segments().len() - 1;
-
             let indexes = partition.log.indexes_mut()[segment_index]
                 .as_mut()
                 .expect("indexes must exist for segment being persisted");
@@ -594,7 +510,7 @@ impl IggyShard {
         Ok(batch_count)
     }
 
-    pub async fn poll_messages_from_local_partition(
+    pub(crate) async fn poll_messages_from_local_partition(
         &self,
         namespace: &IggyNamespace,
         consumer: crate::streaming::polling_consumer::PollingConsumer,

@@ -50,9 +50,14 @@ impl MessagesWriter {
         fsync: bool,
         file_exists: bool,
     ) -> Result<Self, IggyError> {
-        let file = OpenOptions::new()
-            .create(true)
-            .write(true)
+        let mut opts = OpenOptions::new();
+        opts.create(true).write(true);
+        if !file_exists {
+            // When creating a fresh segment at a reused path (e.g. offset 0 after all segments
+            // were deleted), truncate to clear any stale data from a previous incarnation.
+            opts.truncate(true);
+        }
+        let file = opts
             .open(file_path)
             .await
             .error(|err: &std::io::Error| {

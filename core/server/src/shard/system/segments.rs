@@ -18,10 +18,258 @@
 use crate::configs::cache_indexes::CacheIndexesConfig;
 use crate::shard::IggyShard;
 use crate::streaming::segments::Segment;
-use iggy_common::IggyError;
 use iggy_common::sharding::IggyNamespace;
+use iggy_common::{IggyError, IggyExpiry, IggyTimestamp, MaxTopicSize};
 
 impl IggyShard {
+    /// Performs all cleanup for a topic's partitions: time-based expiry then size-based trimming.
+    ///
+    /// Runs entirely inside the message pump's serialized loop — reads partition state and
+    /// deletes segments atomically with no TOCTOU window.
+    pub(crate) async fn clean_topic_messages(
+        &self,
+        stream_id: usize,
+        topic_id: usize,
+        partition_ids: &[usize],
+    ) -> Result<(u64, u64), IggyError> {
+        let (expiry, max_topic_size) = self
+            .metadata
+            .get_topic_config(stream_id, topic_id)
+            .unwrap_or((
+                self.config.system.topic.message_expiry,
+                MaxTopicSize::Unlimited,
+            ));
+
+        let mut total_segments = 0u64;
+        let mut total_messages = 0u64;
+
+        // Phase 1: time-based expiry
+        if !matches!(expiry, IggyExpiry::NeverExpire) {
+            let now = IggyTimestamp::now();
+            for &partition_id in partition_ids {
+                let (s, m) = self
+                    .delete_expired_segments_for_partition(
+                        stream_id,
+                        topic_id,
+                        partition_id,
+                        now,
+                        expiry,
+                    )
+                    .await?;
+                total_segments += s;
+                total_messages += m;
+            }
+        }
+
+        // Phase 2: size-based trimming
+        if !matches!(max_topic_size, MaxTopicSize::Unlimited) {
+            let max_bytes = max_topic_size.as_bytes_u64();
+            let threshold = max_bytes * 9 / 10;
+
+            loop {
+                let current_size = self
+                    .metadata
+                    .with_metadata(|m| {
+                        m.streams
+                            .get(stream_id)
+                            .and_then(|s| s.topics.get(topic_id))
+                            .map(|t| t.stats.size_bytes_inconsistent())
+                    })
+                    .unwrap_or(0);
+
+                if current_size < threshold {
+                    break;
+                }
+
+                let Some((target_partition_id, target_offset)) =
+                    self.find_oldest_sealed_segment(stream_id, topic_id, partition_ids)
+                else {
+                    break;
+                };
+
+                let (s, m) = self
+                    .remove_segment_by_offset(
+                        stream_id,
+                        topic_id,
+                        target_partition_id,
+                        target_offset,
+                    )
+                    .await?;
+                if s == 0 {
+                    break;
+                }
+                total_segments += s;
+                total_messages += m;
+            }
+        }
+
+        Ok((total_segments, total_messages))
+    }
+
+    /// Deletes all expired sealed segments from a single partition.
+    async fn delete_expired_segments_for_partition(
+        &self,
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
+        now: IggyTimestamp,
+        expiry: IggyExpiry,
+    ) -> Result<(u64, u64), IggyError> {
+        let ns = IggyNamespace::new(stream_id, topic_id, partition_id);
+
+        let expired_offsets: Vec<u64> = {
+            let partitions = self.local_partitions.borrow();
+            let Some(partition) = partitions.get(&ns) else {
+                return Ok((0, 0));
+            };
+            let segments = partition.log.segments();
+            let last_idx = segments.len().saturating_sub(1);
+
+            segments
+                .iter()
+                .enumerate()
+                .filter(|(idx, seg)| *idx != last_idx && seg.is_expired(now, expiry))
+                .map(|(_, seg)| seg.start_offset)
+                .collect()
+        };
+
+        let mut total_segments = 0u64;
+        let mut total_messages = 0u64;
+        for offset in expired_offsets {
+            let (s, m) = self
+                .remove_segment_by_offset(stream_id, topic_id, partition_id, offset)
+                .await?;
+            total_segments += s;
+            total_messages += m;
+        }
+        Ok((total_segments, total_messages))
+    }
+
+    /// Finds the oldest sealed segment across the given partitions, comparing by timestamp.
+    /// Returns `(partition_id, start_offset)` or `None` if no deletable segments exist.
+    fn find_oldest_sealed_segment(
+        &self,
+        stream_id: usize,
+        topic_id: usize,
+        partition_ids: &[usize],
+    ) -> Option<(usize, u64)> {
+        let partitions = self.local_partitions.borrow();
+        let mut oldest: Option<(usize, u64, u64)> = None;
+
+        for &partition_id in partition_ids {
+            let ns = IggyNamespace::new(stream_id, topic_id, partition_id);
+            let Some(partition) = partitions.get(&ns) else {
+                continue;
+            };
+
+            let segments = partition.log.segments();
+            if segments.len() <= 1 {
+                continue;
+            }
+
+            let first = &segments[0];
+            if !first.sealed {
+                continue;
+            }
+
+            match &oldest {
+                None => oldest = Some((partition_id, first.start_offset, first.start_timestamp)),
+                Some((_, _, ts)) if first.start_timestamp < *ts => {
+                    oldest = Some((partition_id, first.start_offset, first.start_timestamp));
+                }
+                _ => {}
+            }
+        }
+
+        oldest.map(|(pid, offset, _)| (pid, offset))
+    }
+
+    /// Removes a single segment identified by its start_offset from the given partition.
+    /// Skips if the segment no longer exists or is the active (last) segment.
+    async fn remove_segment_by_offset(
+        &self,
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
+        start_offset: u64,
+    ) -> Result<(u64, u64), IggyError> {
+        let ns = IggyNamespace::new(stream_id, topic_id, partition_id);
+
+        let removed = {
+            let mut partitions = self.local_partitions.borrow_mut();
+            let Some(partition) = partitions.get_mut(&ns) else {
+                return Ok((0, 0));
+            };
+
+            let log = &mut partition.log;
+            let last_idx = log.segments().len().saturating_sub(1);
+
+            let Some(idx) = log
+                .segments()
+                .iter()
+                .position(|s| s.start_offset == start_offset)
+            else {
+                return Ok((0, 0));
+            };
+
+            if idx == last_idx {
+                tracing::warn!(
+                    "Refusing to delete active segment (start_offset: {start_offset}) \
+                     for partition ID: {partition_id}"
+                );
+                return Ok((0, 0));
+            }
+
+            let segment = log.segments_mut().remove(idx);
+            let storage = log.storages_mut().remove(idx);
+            log.indexes_mut().remove(idx);
+
+            Some((segment, storage, partition.stats.clone()))
+        };
+
+        let Some((segment, mut storage, stats)) = removed else {
+            return Ok((0, 0));
+        };
+
+        let segment_size = segment.size.as_bytes_u64();
+        let end_offset = segment.end_offset;
+        let messages_in_segment = if start_offset == end_offset {
+            0
+        } else {
+            (end_offset - start_offset) + 1
+        };
+
+        let _ = storage.shutdown();
+        let (messages_path, index_path) = storage.segment_and_index_paths();
+
+        if let Some(path) = messages_path
+            && let Err(e) = compio::fs::remove_file(&path).await
+        {
+            tracing::error!("Failed to delete messages file {}: {}", path, e);
+        }
+
+        if let Some(path) = index_path
+            && let Err(e) = compio::fs::remove_file(&path).await
+        {
+            tracing::error!("Failed to delete index file {}: {}", path, e);
+        }
+
+        stats.decrement_size_bytes(segment_size);
+        stats.decrement_segments_count(1);
+        stats.decrement_messages_count(messages_in_segment);
+
+        tracing::info!(
+            "Deleted segment (start: {}, end: {}, size: {}, messages: {}) from partition {}",
+            start_offset,
+            end_offset,
+            segment_size,
+            messages_in_segment,
+            partition_id
+        );
+
+        Ok((1, messages_in_segment))
+    }
+
     pub(crate) async fn delete_segments(
         &self,
         stream: usize,
@@ -122,6 +370,13 @@ impl IggyShard {
         Ok(())
     }
 
+    /// Creates a fresh segment at offset 0 after all segments have been drained.
+    ///
+    /// The log is momentarily empty between `delete_segments`' drain and this call, which is
+    /// safe because the message pump serializes all handlers — no concurrent operation can
+    /// observe the empty state. The new segment reuses the offset-0 file path; writers
+    /// open with `truncate(true)` when `!file_exists` to clear any stale data from a
+    /// previous incarnation at the same path.
     async fn init_log_in_local_partitions(
         &self,
         namespace: &IggyNamespace,
@@ -157,6 +412,10 @@ impl IggyShard {
     /// Rotate to a new segment when the current segment is full.
     /// The new segment starts at the next offset after the current segment's end.
     /// Seals the old segment so it becomes eligible for expiry-based cleanup.
+    ///
+    /// Safety: called exclusively from the message pump (via append handler) — the captured
+    /// `old_segment_index` remains valid across the `create_segment_storage` await because
+    /// no other handler can modify the segment vec while this frame is in progress.
     pub(crate) async fn rotate_segment_in_local_partitions(
         &self,
         namespace: &IggyNamespace,
@@ -206,9 +465,11 @@ impl IggyShard {
             partition.log.add_persisted_segment(segment, storage);
             partition.stats.increment_segments_count(1);
             tracing::info!(
-                "Rotated to new segment at offset {} for partition {}",
+                "Rotated to new segment at offset {} for partition {} (stream {}, topic {})",
                 start_offset,
-                namespace.partition_id()
+                namespace.partition_id(),
+                namespace.stream_id(),
+                namespace.topic_id()
             );
         }
         Ok(())
