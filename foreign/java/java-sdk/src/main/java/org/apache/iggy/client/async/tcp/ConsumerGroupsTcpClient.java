@@ -21,14 +21,20 @@ package org.apache.iggy.client.async.tcp;
 
 import io.netty.buffer.Unpooled;
 import org.apache.iggy.client.async.ConsumerGroupsClient;
+import org.apache.iggy.consumergroup.ConsumerGroup;
+import org.apache.iggy.consumergroup.ConsumerGroupDetails;
 import org.apache.iggy.identifier.ConsumerId;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
+import org.apache.iggy.serde.BytesDeserializer;
 import org.apache.iggy.serde.BytesSerializer;
 import org.apache.iggy.serde.CommandCode;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 
 /**
@@ -41,6 +47,91 @@ public class ConsumerGroupsTcpClient implements ConsumerGroupsClient {
 
     public ConsumerGroupsTcpClient(AsyncTcpConnection connection) {
         this.connection = connection;
+    }
+
+    @Override
+    public CompletableFuture<Optional<ConsumerGroupDetails>> getConsumerGroup(
+            StreamId streamId, TopicId topicId, ConsumerId groupId) {
+        var payload = BytesSerializer.toBytes(streamId);
+        payload.writeBytes(BytesSerializer.toBytes(topicId));
+        payload.writeBytes(BytesSerializer.toBytes(groupId));
+
+        log.debug("Getting consumer group - Stream: {}, Topic: {}, Group: {}", streamId, topicId, groupId);
+
+        return connection
+                .send(CommandCode.ConsumerGroup.GET.getValue(), payload)
+                .thenApply(response -> {
+                    try {
+                        if (response.isReadable()) {
+                            return Optional.of(BytesDeserializer.readConsumerGroupDetails(response));
+                        } else {
+                            return Optional.empty();
+                        }
+                    } finally {
+                        response.release();
+                    }
+                });
+    }
+
+    @Override
+    public CompletableFuture<List<ConsumerGroup>> getConsumerGroups(StreamId streamId, TopicId topicId) {
+        var payload = BytesSerializer.toBytes(streamId);
+        payload.writeBytes(BytesSerializer.toBytes(topicId));
+
+        log.debug("Getting consumer groups - Stream: {}, Topic: {}", streamId, topicId);
+
+        return connection
+                .send(CommandCode.ConsumerGroup.GET_ALL.getValue(), payload)
+                .thenApply(response -> {
+                    try {
+                        List<ConsumerGroup> groups = new ArrayList<>();
+                        while (response.isReadable()) {
+                            groups.add(BytesDeserializer.readConsumerGroup(response));
+                        }
+                        return groups;
+                    } finally {
+                        response.release();
+                    }
+                });
+    }
+
+    @Override
+    public CompletableFuture<ConsumerGroupDetails> createConsumerGroup(
+            StreamId streamId, TopicId topicId, String name) {
+        var streamIdBytes = BytesSerializer.toBytes(streamId);
+        var topicIdBytes = BytesSerializer.toBytes(topicId);
+        var payload = Unpooled.buffer(1 + streamIdBytes.readableBytes() + topicIdBytes.readableBytes() + name.length());
+
+        payload.writeBytes(streamIdBytes);
+        payload.writeBytes(topicIdBytes);
+        payload.writeBytes(BytesSerializer.toBytes(name));
+
+        log.debug("Creating consumer group - Stream: {}, Topic: {}, Name: {}", streamId, topicId, name);
+
+        return connection
+                .send(CommandCode.ConsumerGroup.CREATE.getValue(), payload)
+                .thenApply(response -> {
+                    try {
+                        return BytesDeserializer.readConsumerGroupDetails(response);
+                    } finally {
+                        response.release();
+                    }
+                });
+    }
+
+    @Override
+    public CompletableFuture<Void> deleteConsumerGroup(StreamId streamId, TopicId topicId, ConsumerId groupId) {
+        var payload = BytesSerializer.toBytes(streamId);
+        payload.writeBytes(BytesSerializer.toBytes(topicId));
+        payload.writeBytes(BytesSerializer.toBytes(groupId));
+
+        log.debug("Deleting consumer group - Stream: {}, Topic: {}, Group: {}", streamId, topicId, groupId);
+
+        return connection
+                .send(CommandCode.ConsumerGroup.DELETE.getValue(), payload)
+                .thenAccept(response -> {
+                    response.release();
+                });
     }
 
     @Override
