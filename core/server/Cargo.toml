@@ -73,11 +73,9 @@ human-repr = { workspace = true }
 iggy_common = { workspace = true }
 jsonwebtoken = { workspace = true }
 left-right = { workspace = true }
-lending-iterator = { workspace = true }
 metadata = { workspace = true }
 mimalloc = { workspace = true, optional = true }
 mime_guess = { workspace = true, optional = true }
-moka = { workspace = true }
 nix = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry-appender-tracing = { workspace = true }

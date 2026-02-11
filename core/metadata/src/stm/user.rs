@@ -16,8 +16,8 @@
 // under the License.
 
 use crate::permissioner::Permissioner;
-use crate::stm::Handler;
-use crate::{define_state, impl_absorb};
+use crate::stm::StateHandler;
+use crate::{collect_handlers, define_state};
 use ahash::AHashMap;
 use iggy_common::change_password::ChangePassword;
 use iggy_common::create_personal_access_token::CreatePersonalAccessToken;
@@ -82,18 +82,20 @@ define_state! {
         items: Slab<User>,
         personal_access_tokens: AHashMap<UserId, AHashMap<Arc<str>, PersonalAccessToken>>,
         permissioner: Permissioner,
-    },
-    [
+    }
+}
+
+collect_handlers! {
+    Users {
         CreateUser,
         UpdateUser,
         DeleteUser,
         ChangePassword,
         UpdatePermissions,
         CreatePersonalAccessToken,
-        DeletePersonalAccessToken
-    ]
+        DeletePersonalAccessToken,
+    }
 }
-impl_absorb!(UsersInner, UsersCommand);
 
 impl UsersInner {
     fn resolve_user_id(&self, identifier: &iggy_common::Identifier) -> Option<usize> {
@@ -115,123 +117,144 @@ impl UsersInner {
     }
 }
 
-impl Handler for UsersInner {
-    fn handle(&mut self, cmd: &UsersCommand) {
-        match cmd {
-            UsersCommand::CreateUser(payload) => {
-                let username_arc: Arc<str> = Arc::from(payload.username.as_str());
-                if self.index.contains_key(&username_arc) {
-                    return;
-                }
+impl StateHandler for CreateUser {
+    type State = UsersInner;
+    fn apply(&self, state: &mut UsersInner) {
+        let username_arc: Arc<str> = Arc::from(self.username.as_str());
+        if state.index.contains_key(&username_arc) {
+            return;
+        }
 
-                let user = User {
-                    id: 0,
-                    username: username_arc.clone(),
-                    password_hash: Arc::from(payload.password.as_str()),
-                    status: payload.status,
-                    created_at: iggy_common::IggyTimestamp::now(),
-                    permissions: payload.permissions.as_ref().map(|p| Arc::new(p.clone())),
-                };
+        let user = User {
+            id: 0,
+            username: username_arc.clone(),
+            password_hash: Arc::from(self.password.as_str()),
+            status: self.status,
+            created_at: iggy_common::IggyTimestamp::now(),
+            permissions: self.permissions.as_ref().map(|p| Arc::new(p.clone())),
+        };
 
-                let id = self.items.insert(user);
-                if let Some(user) = self.items.get_mut(id) {
-                    user.id = id as UserId;
-                }
+        let id = state.items.insert(user);
+        if let Some(user) = state.items.get_mut(id) {
+            user.id = id as UserId;
+        }
 
-                self.index.insert(username_arc, id as UserId);
-                self.personal_access_tokens
-                    .insert(id as UserId, AHashMap::default());
+        state.index.insert(username_arc, id as UserId);
+        state
+            .personal_access_tokens
+            .insert(id as UserId, AHashMap::default());
+    }
+}
+
+impl StateHandler for UpdateUser {
+    type State = UsersInner;
+    fn apply(&self, state: &mut UsersInner) {
+        let Some(user_id) = state.resolve_user_id(&self.user_id) else {
+            return;
+        };
+
+        let Some(user) = state.items.get_mut(user_id) else {
+            return;
+        };
+
+        if let Some(new_username) = &self.username {
+            let new_username_arc: Arc<str> = Arc::from(new_username.as_str());
+            if let Some(&existing_id) = state.index.get(&new_username_arc)
+                && existing_id != user_id as UserId
+            {
+                return;
             }
-            UsersCommand::UpdateUser(payload) => {
-                let Some(user_id) = self.resolve_user_id(&payload.user_id) else {
-                    return;
-                };
 
-                let Some(user) = self.items.get_mut(user_id) else {
-                    return;
-                };
+            state.index.remove(&user.username);
+            user.username = new_username_arc.clone();
+            state.index.insert(new_username_arc, user_id as UserId);
+        }
 
-                if let Some(new_username) = &payload.username {
-                    let new_username_arc: Arc<str> = Arc::from(new_username.as_str());
-                    if let Some(&existing_id) = self.index.get(&new_username_arc)
-                        && existing_id != user_id as UserId
-                    {
-                        return;
-                    }
+        if let Some(new_status) = self.status {
+            user.status = new_status;
+        }
+    }
+}
 
-                    self.index.remove(&user.username);
-                    user.username = new_username_arc.clone();
-                    self.index.insert(new_username_arc, user_id as UserId);
-                }
+impl StateHandler for DeleteUser {
+    type State = UsersInner;
+    fn apply(&self, state: &mut UsersInner) {
+        let Some(user_id) = state.resolve_user_id(&self.user_id) else {
+            return;
+        };
 
-                if let Some(new_status) = payload.status {
-                    user.status = new_status;
-                }
-            }
-            UsersCommand::DeleteUser(payload) => {
-                let Some(user_id) = self.resolve_user_id(&payload.user_id) else {
-                    return;
-                };
+        if let Some(user) = state.items.get(user_id) {
+            let username = user.username.clone();
+            state.items.remove(user_id);
+            state.index.remove(&username);
+            state.personal_access_tokens.remove(&(user_id as UserId));
+        }
+    }
+}
 
-                if let Some(user) = self.items.get(user_id) {
-                    let username = user.username.clone();
-                    self.items.remove(user_id);
-                    self.index.remove(&username);
-                    self.personal_access_tokens.remove(&(user_id as UserId));
-                }
-            }
-            UsersCommand::ChangePassword(payload) => {
-                let Some(user_id) = self.resolve_user_id(&payload.user_id) else {
-                    return;
-                };
+impl StateHandler for ChangePassword {
+    type State = UsersInner;
+    fn apply(&self, state: &mut UsersInner) {
+        let Some(user_id) = state.resolve_user_id(&self.user_id) else {
+            return;
+        };
 
-                if let Some(user) = self.items.get_mut(user_id) {
-                    user.password_hash = Arc::from(payload.new_password.as_str());
-                }
-            }
-            UsersCommand::UpdatePermissions(payload) => {
-                let Some(user_id) = self.resolve_user_id(&payload.user_id) else {
-                    return;
-                };
+        if let Some(user) = state.items.get_mut(user_id) {
+            user.password_hash = Arc::from(self.new_password.as_str());
+        }
+    }
+}
 
-                if let Some(user) = self.items.get_mut(user_id) {
-                    user.permissions = payload.permissions.as_ref().map(|p| Arc::new(p.clone()));
-                }
-            }
-            UsersCommand::CreatePersonalAccessToken(payload) => {
-                // TODO: Stub untill protocol gets adjusted.
-                let user_id = 0;
-                let user_tokens = self.personal_access_tokens.entry(user_id).or_default();
-                let name_arc: Arc<str> = Arc::from(payload.name.as_str());
-                if user_tokens.contains_key(&name_arc) {
-                    return;
-                }
+impl StateHandler for UpdatePermissions {
+    type State = UsersInner;
+    fn apply(&self, state: &mut UsersInner) {
+        let Some(user_id) = state.resolve_user_id(&self.user_id) else {
+            return;
+        };
 
-                let expiry_at =
-                    PersonalAccessToken::calculate_expiry_at(IggyTimestamp::now(), payload.expiry);
-                if let Some(expiry_at) = expiry_at
-                    && expiry_at.as_micros() <= IggyTimestamp::now().as_micros()
-                {
-                    return;
-                }
+        if let Some(user) = state.items.get_mut(user_id) {
+            user.permissions = self.permissions.as_ref().map(|p| Arc::new(p.clone()));
+        }
+    }
+}
 
-                let (pat, _) = PersonalAccessToken::new(
-                    user_id,
-                    payload.name.as_ref(),
-                    IggyTimestamp::now(),
-                    payload.expiry,
-                );
-                user_tokens.insert(name_arc, pat);
-            }
-            UsersCommand::DeletePersonalAccessToken(payload) => {
-                // TODO: Stub untill protocol gets adjusted.
-                let user_id = 0;
+impl StateHandler for CreatePersonalAccessToken {
+    type State = UsersInner;
+    fn apply(&self, state: &mut UsersInner) {
+        // TODO: Stub until protocol gets adjusted.
+        let user_id = 0;
+        let user_tokens = state.personal_access_tokens.entry(user_id).or_default();
+        let name_arc: Arc<str> = Arc::from(self.name.as_str());
+        if user_tokens.contains_key(&name_arc) {
+            return;
+        }
 
-                if let Some(user_tokens) = self.personal_access_tokens.get_mut(&user_id) {
-                    let name_arc: Arc<str> = Arc::from(payload.name.as_str());
-                    user_tokens.remove(&name_arc);
-                }
-            }
+        let expiry_at = PersonalAccessToken::calculate_expiry_at(IggyTimestamp::now(), self.expiry);
+        if let Some(expiry_at) = expiry_at
+            && expiry_at.as_micros() <= IggyTimestamp::now().as_micros()
+        {
+            return;
+        }
+
+        let (pat, _) = PersonalAccessToken::new(
+            user_id,
+            self.name.as_ref(),
+            IggyTimestamp::now(),
+            self.expiry,
+        );
+        user_tokens.insert(name_arc, pat);
+    }
+}
+
+impl StateHandler for DeletePersonalAccessToken {
+    type State = UsersInner;
+    fn apply(&self, state: &mut UsersInner) {
+        // TODO: Stub until protocol gets adjusted.
+        let user_id = 0;
+
+        if let Some(user_tokens) = state.personal_access_tokens.get_mut(&user_id) {
+            let name_arc: Arc<str> = Arc::from(self.name.as_str());
+            user_tokens.remove(&name_arc);
         }
     }
 }

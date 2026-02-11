@@ -18,8 +18,8 @@
  */
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
 use humantime::Duration as HumanDuration;
+use iggy_common::{DateTime, Utc};
 use iggy_connector_sdk::{
     ConnectorState, Error, ProducedMessage, ProducedMessages, Schema, Source, source_connector,
 };
@@ -45,6 +45,8 @@ pub struct PostgresSource {
     config: PostgresSourceConfig,
     state: Mutex<State>,
     verbose: bool,
+    retry_delay: Duration,
+    poll_interval: Duration,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,7 +97,7 @@ impl PayloadFormat {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 struct State {
     last_poll_time: DateTime<Utc>,
     tracking_offsets: HashMap<String, String>,
@@ -111,20 +113,46 @@ pub struct DatabaseRecord {
     pub old_data: Option<serde_json::Value>,
 }
 
+const CONNECTOR_NAME: &str = "PostgreSQL source";
+
 impl PostgresSource {
-    pub fn new(id: u32, config: PostgresSourceConfig, _state: Option<ConnectorState>) -> Self {
+    pub fn new(id: u32, config: PostgresSourceConfig, state: Option<ConnectorState>) -> Self {
         let verbose = config.verbose_logging.unwrap_or(false);
+        let restored_state = state
+            .and_then(|s| s.deserialize::<State>(CONNECTOR_NAME, id))
+            .inspect(|s| {
+                info!(
+                    "Restored state for {CONNECTOR_NAME} connector with ID: {id}. \
+                     Tracking offsets: {:?}, processed rows: {}",
+                    s.tracking_offsets, s.processed_rows
+                );
+            });
+
+        let delay_str = config.retry_delay.as_deref().unwrap_or(DEFAULT_RETRY_DELAY);
+        let retry_delay = HumanDuration::from_str(delay_str)
+            .map(|duration| duration.into())
+            .unwrap_or_else(|_| Duration::from_secs(1));
+        let interval_str = config.poll_interval.as_deref().unwrap_or("10s");
+        let poll_interval = HumanDuration::from_str(interval_str)
+            .map(|duration| duration.into())
+            .unwrap_or_else(|_| Duration::from_secs(10));
         PostgresSource {
             id,
             pool: None,
             config,
-            state: Mutex::new(State {
+            state: Mutex::new(restored_state.unwrap_or(State {
                 last_poll_time: Utc::now(),
                 tracking_offsets: HashMap::new(),
                 processed_rows: 0,
-            }),
+            })),
             verbose,
+            retry_delay,
+            poll_interval,
         }
+    }
+
+    fn serialize_state(&self, state: &State) -> Option<ConnectorState> {
+        ConnectorState::serialize(state, CONNECTOR_NAME, self.id)
     }
 }
 
@@ -152,7 +180,7 @@ impl Source for PostgresSource {
                     "PostgreSQL polling mode enabled for connector ID: {}",
                     self.id
                 );
-                info!("Poll interval: {:?}", self.get_poll_interval());
+                info!("Poll interval: {:?}", self.poll_interval);
             }
             _ => {
                 return Err(Error::InitError(format!(
@@ -170,7 +198,7 @@ impl Source for PostgresSource {
     }
 
     async fn poll(&self) -> Result<ProducedMessages, Error> {
-        let poll_interval = self.get_poll_interval();
+        let poll_interval = self.poll_interval;
         tokio::time::sleep(poll_interval).await;
 
         let messages = match self.config.mode.as_str() {
@@ -205,10 +233,12 @@ impl Source for PostgresSource {
             PayloadFormat::JsonDirect | PayloadFormat::Json => Schema::Json,
         };
 
+        let persisted_state = self.serialize_state(&state);
+
         Ok(ProducedMessages {
             schema,
             messages,
-            state: None,
+            state: persisted_state,
         })
     }
 
@@ -356,6 +386,7 @@ impl PostgresSource {
             "SELECT lsn, xid, data FROM pg_logical_slot_get_changes('{slot_name}', NULL, NULL, 'proto_version', '1', 'publication_names', '{publication_name}')"
         );
 
+        // Database I/O without holding the lock
         let rows = sqlx::query(&logical_repl_sql)
             .fetch_all(pool)
             .await
@@ -365,7 +396,6 @@ impl PostgresSource {
             })?;
 
         let mut messages = Vec::new();
-        let mut state = self.state.lock().await;
 
         for row in rows {
             let data: String = row.try_get("data").map_err(|_| Error::InvalidRecord)?;
@@ -385,8 +415,13 @@ impl PostgresSource {
                 };
 
                 messages.push(message);
-                state.processed_rows += 1;
             }
+        }
+
+        // Update state with minimal lock time
+        if !messages.is_empty() {
+            let mut state = self.state.lock().await;
+            state.processed_rows += messages.len() as u64;
         }
 
         if self.verbose {
@@ -399,7 +434,6 @@ impl PostgresSource {
 
     async fn poll_tables(&self) -> Result<Vec<ProducedMessage>, Error> {
         let pool = self.get_pool()?;
-        let mut state = self.state.lock().await;
         let mut messages = Vec::new();
 
         let batch_size = self.config.batch_size.unwrap_or(1000);
@@ -412,8 +446,16 @@ impl PostgresSource {
         let payload_format = self.payload_format();
         let payload_col = self.config.payload_column.as_deref().unwrap_or("");
 
+        // Collect state updates to apply after processing
+        let mut state_updates: Vec<(String, String)> = Vec::new();
+        let mut total_processed: u64 = 0;
+
         for table in &self.config.tables {
-            let last_offset = state.tracking_offsets.get(table).cloned();
+            // Get last offset with minimal lock time
+            let last_offset = {
+                let state = self.state.lock().await;
+                state.tracking_offsets.get(table).cloned()
+            };
 
             let query = if let Some(custom_query) = &self.config.custom_query {
                 self.validate_custom_query(custom_query)?;
@@ -422,10 +464,11 @@ impl PostgresSource {
                 self.build_polling_query(table, tracking_column, &last_offset, batch_size)?
             };
 
+            // Database I/O without holding the lock
             let rows = with_retry(
                 || sqlx::query(&query).fetch_all(pool),
                 self.get_max_retries(),
-                self.get_retry_delay().as_millis() as u64,
+                self.retry_delay.as_millis() as u64,
             )
             .await?;
 
@@ -509,16 +552,18 @@ impl PostgresSource {
                 };
 
                 messages.push(message);
-                state.processed_rows += 1;
+                total_processed += 1;
             }
 
+            // Database I/O without holding the lock
             if !processed_ids.is_empty() {
                 self.mark_or_delete_processed_rows(pool, table, pk_column, &processed_ids)
                     .await?;
             }
 
+            // Collect offset update for later
             if let Some(offset) = max_offset {
-                state.tracking_offsets.insert(table.clone(), offset);
+                state_updates.push((table.clone(), offset));
             }
 
             if self.verbose {
@@ -528,7 +573,16 @@ impl PostgresSource {
             }
         }
 
-        state.last_poll_time = Utc::now();
+        // Apply all state updates with a single lock acquisition
+        {
+            let mut state = self.state.lock().await;
+            state.processed_rows += total_processed;
+            for (table, offset) in state_updates {
+                state.tracking_offsets.insert(table, offset);
+            }
+            state.last_poll_time = Utc::now();
+        }
+
         Ok(messages)
     }
 
@@ -614,26 +668,8 @@ impl PostgresSource {
         PayloadFormat::Json
     }
 
-    fn get_poll_interval(&self) -> Duration {
-        let interval_str = self.config.poll_interval.as_deref().unwrap_or("10s");
-        HumanDuration::from_str(interval_str)
-            .unwrap_or_else(|_| std::time::Duration::from_secs(10).into())
-            .into()
-    }
-
     fn get_max_retries(&self) -> u32 {
         self.config.max_retries.unwrap_or(DEFAULT_MAX_RETRIES)
-    }
-
-    fn get_retry_delay(&self) -> Duration {
-        let delay_str = self
-            .config
-            .retry_delay
-            .as_deref()
-            .unwrap_or(DEFAULT_RETRY_DELAY);
-        HumanDuration::from_str(delay_str)
-            .unwrap_or_else(|e| panic!("Invalid retry_delay '{delay_str}': {e}"))
-            .into()
     }
 
     fn build_polling_query(
@@ -1292,5 +1328,82 @@ mod tests {
         let conn = "postgresql://admin:secret123@db.example.com:5432/mydb";
         let redacted = redact_connection_string(conn);
         assert_eq!(redacted, "postgresql://adm***");
+    }
+
+    #[test]
+    fn given_persisted_state_should_restore_tracking_offsets() {
+        let state = State {
+            last_poll_time: Utc::now(),
+            tracking_offsets: HashMap::from([
+                ("users".to_string(), "100".to_string()),
+                ("orders".to_string(), "2024-01-15T10:30:00Z".to_string()),
+            ]),
+            processed_rows: 500,
+        };
+
+        let connector_state =
+            ConnectorState::serialize(&state, "test", 1).expect("Failed to serialize state");
+
+        let src = PostgresSource::new(1, test_config(), Some(connector_state));
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let restored = src.state.lock().await;
+            assert_eq!(
+                restored.tracking_offsets.get("users"),
+                Some(&"100".to_string())
+            );
+            assert_eq!(
+                restored.tracking_offsets.get("orders"),
+                Some(&"2024-01-15T10:30:00Z".to_string())
+            );
+            assert_eq!(restored.processed_rows, 500);
+        });
+    }
+
+    #[test]
+    fn given_no_state_should_start_fresh() {
+        let src = PostgresSource::new(1, test_config(), None);
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let state = src.state.lock().await;
+            assert!(state.tracking_offsets.is_empty());
+            assert_eq!(state.processed_rows, 0);
+        });
+    }
+
+    #[test]
+    fn given_invalid_state_should_start_fresh() {
+        let invalid_state = ConnectorState(b"not valid json".to_vec());
+        let src = PostgresSource::new(1, test_config(), Some(invalid_state));
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let state = src.state.lock().await;
+            assert!(state.tracking_offsets.is_empty());
+            assert_eq!(state.processed_rows, 0);
+        });
+    }
+
+    #[test]
+    fn state_should_be_serializable_and_deserializable() {
+        let original = State {
+            last_poll_time: DateTime::parse_from_rfc3339("2024-01-15T10:30:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            tracking_offsets: HashMap::from([("table1".to_string(), "42".to_string())]),
+            processed_rows: 1000,
+        };
+
+        let connector_state =
+            ConnectorState::serialize(&original, "test", 1).expect("Failed to serialize state");
+        let deserialized: State = connector_state
+            .deserialize("test", 1)
+            .expect("Failed to deserialize state");
+
+        assert_eq!(original.last_poll_time, deserialized.last_poll_time);
+        assert_eq!(original.tracking_offsets, deserialized.tracking_offsets);
+        assert_eq!(original.processed_rows, deserialized.processed_rows);
     }
 }

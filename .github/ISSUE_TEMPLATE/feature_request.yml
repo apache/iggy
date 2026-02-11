@@ -1,0 +1,71 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: Feature Request
+description: Suggest a new feature or enhancement
+labels: ["feature"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        > **Tip:** For bigger or exploratory features, consider starting a [Discussion](https://github.com/apache/iggy/discussions) first to gather feedback before filing an issue.
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: What do you want and why?
+      placeholder: Describe the feature and the problem it solves.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      description: Which part of the project does this affect?
+      options:
+        - Iggy server
+        - Rust SDK
+        - Go SDK
+        - Java SDK
+        - Python SDK
+        - "C# SDK"
+        - Node.js SDK
+        - CLI
+        - Web UI
+        - Connectors
+        - Documentation
+        - Other
+    validations:
+      required: false
+
+  - type: textarea
+    id: proposed-solution
+    attributes:
+      label: Proposed solution
+      description: If you have a solution in mind, describe it here.
+    validations:
+      required: false
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other approaches you thought of.
+    validations:
+      required: false

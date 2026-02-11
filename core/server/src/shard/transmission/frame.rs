@@ -16,10 +16,9 @@
  * under the License.
  */
 use async_channel::Sender;
-use iggy_common::{IggyError, Stats};
+use iggy_common::{IggyError, IggyPollMetadata, Stats};
 
 use crate::{
-    binary::handlers::messages::poll_messages_handler::IggyPollMetadata,
     shard::transmission::message::ShardMessage,
     streaming::{segments::IggyMessagesBatchSet, users::user::User},
 };

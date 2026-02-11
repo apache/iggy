@@ -24,6 +24,7 @@ use elasticsearch::{
     auth::Credentials,
     http::{Url, request::JsonBody, transport::TransportBuilder},
 };
+use iggy_common::IggyTimestamp;
 use iggy_connector_sdk::{
     ConsumedMessage, Error, MessagesMetadata, Payload, Sink, TopicMetadata, sink_connector,
 };
@@ -34,6 +35,31 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 sink_connector!(ElasticsearchSink);
+
+fn owned_value_to_serde_json(value: &OwnedValue) -> serde_json::Value {
+    match value {
+        OwnedValue::Static(s) => match s {
+            simd_json::StaticNode::Null => serde_json::Value::Null,
+            simd_json::StaticNode::Bool(b) => serde_json::Value::Bool(*b),
+            simd_json::StaticNode::I64(n) => serde_json::Value::Number((*n).into()),
+            simd_json::StaticNode::U64(n) => serde_json::Value::Number((*n).into()),
+            simd_json::StaticNode::F64(n) => serde_json::Number::from_f64(*n)
+                .map(serde_json::Value::Number)
+                .unwrap_or(serde_json::Value::Null),
+        },
+        OwnedValue::String(s) => serde_json::Value::String(s.to_string()),
+        OwnedValue::Array(arr) => {
+            serde_json::Value::Array(arr.iter().map(owned_value_to_serde_json).collect())
+        }
+        OwnedValue::Object(obj) => {
+            let map: serde_json::Map<String, serde_json::Value> = obj
+                .iter()
+                .map(|(k, v)| (k.to_string(), owned_value_to_serde_json(v)))
+                .collect();
+            serde_json::Value::Object(map)
+        }
+    }
+}
 
 #[derive(Debug)]
 struct State {
@@ -171,9 +197,7 @@ impl ElasticsearchSink {
                 })
                 .into(),
             );
-            // Convert OwnedValue to serde_json::Value for Elasticsearch
-            let doc_json: serde_json::Value =
-                serde_json::from_str(&doc.to_string()).unwrap_or_else(|_| serde_json::json!({}));
+            let doc_json: serde_json::Value = owned_value_to_serde_json(&doc);
             body.push(doc_json.into());
         }
 
@@ -274,11 +298,10 @@ impl Sink for ElasticsearchSink {
             let mut doc = match message.payload {
                 Payload::Json(value) => value,
                 Payload::Raw(bytes) => {
-                    // Try to parse raw bytes as JSON
-                    match simd_json::from_slice::<OwnedValue>(&mut bytes.clone()) {
+                    let mut bytes_copy = bytes.clone();
+                    match simd_json::from_slice::<OwnedValue>(&mut bytes_copy) {
                         Ok(value) => value,
                         Err(_) => {
-                            // If not JSON, create a document with the binary data as base64
                             simd_json::json!({
                                 "data": general_purpose::STANDARD.encode(&bytes),
                                 "data_type": "raw"
@@ -313,7 +336,7 @@ impl Sink for ElasticsearchSink {
                 );
                 obj.insert(
                     "_iggy_timestamp".to_string(),
-                    OwnedValue::from(chrono::Utc::now().timestamp_millis()),
+                    OwnedValue::from(IggyTimestamp::now().as_millis() as i64),
                 );
 
                 if let Some(headers) = &message.headers {

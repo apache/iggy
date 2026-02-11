@@ -20,6 +20,7 @@
 mod alloc;
 mod certificates;
 mod commands;
+mod deduplication;
 mod error;
 mod sender;
 pub mod sharding;
@@ -34,6 +35,7 @@ pub mod locking;
 pub use alloc::buffer::PooledBuffer;
 pub use alloc::memory_pool::{MEMORY_POOL, MemoryPool, MemoryPoolConfigOther, memory_pool};
 pub use certificates::generate_self_signed_certificate;
+pub use chrono::{DateTime, Duration as ChronoDuration, Utc};
 pub use commands::consumer_groups::*;
 pub use commands::consumer_offsets::*;
 pub use commands::messages::*;
@@ -45,6 +47,7 @@ pub use commands::system::get_cluster_metadata::*;
 pub use commands::system::*;
 pub use commands::topics::*;
 pub use commands::users::*;
+pub use deduplication::MessageDeduplicator;
 pub use sender::{
     QuicSender, Sender, SenderKind, TcpSender, TcpTlsSender, WebSocketSender, WebSocketTlsSender,
 };
@@ -103,6 +106,7 @@ pub use utils::duration::{IggyDuration, SEC_IN_MICRO};
 pub use utils::expiry::IggyExpiry;
 pub use utils::hash::*;
 pub use utils::personal_access_token_expiry::PersonalAccessTokenExpiry;
+pub use utils::random_id;
 pub use utils::text;
 pub use utils::timestamp::*;
 pub use utils::topic_size::MaxTopicSize;

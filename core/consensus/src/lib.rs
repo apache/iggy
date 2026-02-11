@@ -17,9 +17,8 @@
 
 use message_bus::MessageBus;
 
-pub trait Project<T> {
-    type Consensus: Consensus;
-    fn project(self, consensus: &Self::Consensus) -> T;
+pub trait Project<T, C: Consensus> {
+    fn project(self, consensus: &C) -> T;
 }
 
 pub trait Pipeline {
@@ -30,11 +29,16 @@ pub trait Pipeline {
 
     fn pop_message(&mut self) -> Option<Self::Entry>;
 
+    /// Extract and remove a message by op number.
+    fn extract_by_op(&mut self, op: u64) -> Option<Self::Entry>;
+
     fn clear(&mut self);
+
+    fn message_by_op(&self, op: u64) -> Option<&Self::Entry>;
 
     fn message_by_op_mut(&mut self, op: u64) -> Option<&mut Self::Entry>;
 
-    fn message_by_op_and_checksum(&mut self, op: u64, checksum: u128) -> Option<&mut Self::Entry>;
+    fn message_by_op_and_checksum(&self, op: u64, checksum: u128) -> Option<&Self::Entry>;
 
     fn is_full(&self) -> bool;
 
@@ -43,11 +47,11 @@ pub trait Pipeline {
     fn verify(&self);
 }
 
-pub trait Consensus {
+pub trait Consensus: Sized {
     type MessageBus: MessageBus;
     // I am wondering, whether we should create a dedicated trait for cloning, so it's explicit that we do ref counting.
-    type RequestMessage: Project<Self::ReplicateMessage, Consensus = Self> + Clone;
-    type ReplicateMessage: Project<Self::AckMessage, Consensus = Self> + Clone;
+    type RequestMessage: Project<Self::ReplicateMessage, Self> + Clone;
+    type ReplicateMessage: Project<Self::AckMessage, Self> + Clone;
     type AckMessage;
     type Sequencer: Sequencer;
     type Pipeline: Pipeline<Message = Self::ReplicateMessage>;

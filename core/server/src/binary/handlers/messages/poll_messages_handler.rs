@@ -28,21 +28,6 @@ use iggy_common::{IggyError, PollMessages, PooledBuffer};
 use std::rc::Rc;
 use tracing::{debug, trace};
 
-#[derive(Debug)]
-pub struct IggyPollMetadata {
-    pub partition_id: u32,
-    pub current_offset: u64,
-}
-
-impl IggyPollMetadata {
-    pub fn new(partition_id: u32, current_offset: u64) -> Self {
-        Self {
-            partition_id,
-            current_offset,
-        }
-    }
-}
-
 impl ServerCommandHandler for PollMessages {
     fn code(&self) -> u32 {
         iggy_common::POLL_MESSAGES_CODE

@@ -24,9 +24,7 @@ use super::{
     consumer_group_offsets::ConsumerGroupOffsets, consumer_offsets::ConsumerOffsets,
     journal::MemoryMessageJournal, log::SegmentedLog,
 };
-use crate::streaming::{
-    deduplication::message_deduplicator::MessageDeduplicator, stats::PartitionStats,
-};
+use crate::streaming::{deduplication::MessageDeduplicator, stats::PartitionStats};
 use iggy_common::IggyTimestamp;
 use std::sync::{Arc, atomic::AtomicU64};
 use tokio::sync::Mutex as TokioMutex;

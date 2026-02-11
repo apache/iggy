@@ -48,6 +48,8 @@ derive_more = { workspace = true }
 err_trail = { workspace = true }
 human-repr = { workspace = true }
 humantime = { workspace = true }
+lending-iterator = { workspace = true }
+moka = { workspace = true }
 once_cell = { workspace = true }
 rcgen = { workspace = true }
 ring = { workspace = true }
@@ -61,6 +63,8 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 tungstenite = { workspace = true }
 twox-hash = { workspace = true }
+ulid = { workspace = true }
+uuid = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true }

@@ -79,8 +79,7 @@ services:
       retries: 10
       start_period: 30s
     volumes:
-      - ./build/libs:/opt/pinot/plugins/pinot-stream-ingestion/iggy-connector
-      - ../../java-sdk/build/libs/iggy-0.6.0.jar:/opt/pinot/plugins/pinot-stream-ingestion/iggy-connector/iggy-0.6.0.jar
+      - ./build/plugin:/opt/pinot/plugins/pinot-stream-ingestion/iggy-connector
       - ./deployment:/opt/pinot/deployment
     networks:
       - iggy-pinot-network
@@ -124,8 +123,7 @@ services:
       retries: 10
       start_period: 30s
     volumes:
-      - ./build/libs:/opt/pinot/plugins/pinot-stream-ingestion/iggy-connector
-      - ../../java-sdk/build/libs/iggy-0.6.0.jar:/opt/pinot/plugins/pinot-stream-ingestion/iggy-connector/iggy-0.6.0.jar
+      - ./build/plugin:/opt/pinot/plugins/pinot-stream-ingestion/iggy-connector
       - ./deployment:/opt/pinot/deployment
     networks:
       - iggy-pinot-network

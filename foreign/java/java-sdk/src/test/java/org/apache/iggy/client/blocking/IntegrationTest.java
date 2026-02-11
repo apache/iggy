@@ -56,6 +56,10 @@ public abstract class IntegrationTest {
     protected List<Long> createdUserIds = new ArrayList<>();
     protected IggyBaseClient client;
 
+    public static int tcpPort() {
+        return USE_EXTERNAL_SERVER ? TCP_PORT : iggyServer.getMappedPort(TCP_PORT);
+    }
+
     @BeforeAll
     static void setupContainer() {
         if (!USE_EXTERNAL_SERVER) {

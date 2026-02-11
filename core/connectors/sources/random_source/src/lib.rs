@@ -33,6 +33,8 @@ use uuid::Uuid;
 
 source_connector!(RandomSource);
 
+const CONNECTOR_NAME: &str = "Random source";
+
 #[derive(Debug)]
 pub struct RandomSource {
     id: u32,
@@ -51,9 +53,9 @@ pub struct RandomSourceConfig {
     payload_size: Option<u32>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 struct State {
-    current_number: usize,
+    messages_produced: usize,
 }
 
 impl RandomSource {
@@ -62,18 +64,15 @@ impl RandomSource {
         let interval = humantime::Duration::from_str(&interval)
             .unwrap_or(humantime::Duration::from_str("1s").expect("Failed to parse interval"));
 
-        let current_number = if let Some(state) = state {
-            u64::from_le_bytes(
-                state.0[0..8]
-                    .try_into()
-                    .inspect_err(|error| {
-                        error!("Failed to convert state to current number. {error}");
-                    })
-                    .unwrap_or_default(),
-            )
-        } else {
-            0
-        } as usize;
+        let restored_state = state
+            .and_then(|s| s.deserialize::<State>(CONNECTOR_NAME, id))
+            .inspect(|s| {
+                info!(
+                    "Restored state for {CONNECTOR_NAME} connector with ID: {id}. \
+                     Messages produced: {}",
+                    s.messages_produced
+                );
+            });
 
         RandomSource {
             id,
@@ -81,8 +80,14 @@ impl RandomSource {
             interval: *interval,
             messages_range: config.messages_range.unwrap_or((10, 50)),
             payload_size: config.payload_size.unwrap_or(100),
-            state: Mutex::new(State { current_number }),
+            state: Mutex::new(restored_state.unwrap_or(State {
+                messages_produced: 0,
+            })),
         }
+    }
+
+    fn serialize_state(&self, state: &State) -> Option<ConnectorState> {
+        ConnectorState::serialize(state, CONNECTOR_NAME, self.id)
     }
 
     fn generate_messages(&self) -> Vec<ProducedMessage> {
@@ -146,35 +151,43 @@ impl Source for RandomSource {
         sleep(self.interval).await;
         let mut state = self.state.lock().await;
         if let Some(max_count) = self.max_count
-            && state.current_number >= max_count
+            && state.messages_produced >= max_count
         {
             info!(
-                "Reached max number of {max_count} messages for random source connector with ID: {}",
+                "Reached max number of {max_count} messages for {CONNECTOR_NAME} connector with ID: {}",
                 self.id
             );
             return Ok(ProducedMessages {
                 schema: Schema::Json,
                 messages: vec![],
-                state: Some(ConnectorState(state.current_number.to_le_bytes().to_vec())),
+                state: self.serialize_state(&state),
             });
         }
 
         let messages = self.generate_messages();
-        state.current_number += messages.len();
+        state.messages_produced += messages.len();
         info!(
-            "Generated {} messages by random source connector with ID: {}",
+            "{CONNECTOR_NAME} connector with ID: {} generated {} messages. Total produced: {}",
+            self.id,
             messages.len(),
-            self.id
+            state.messages_produced
         );
+
+        let persisted_state = self.serialize_state(&state);
+
         Ok(ProducedMessages {
             schema: Schema::Json,
             messages,
-            state: Some(ConnectorState(state.current_number.to_le_bytes().to_vec())),
+            state: persisted_state,
         })
     }
 
     async fn close(&mut self) -> Result<(), Error> {
-        info!("Random source connector with ID: {} is closed.", self.id);
+        let state = self.state.lock().await;
+        info!(
+            "{CONNECTOR_NAME} connector with ID: {} closed. Total messages produced: {}",
+            self.id, state.messages_produced
+        );
         Ok(())
     }
 }
@@ -185,4 +198,87 @@ struct Record {
     title: String,
     name: String,
     text: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_config() -> RandomSourceConfig {
+        RandomSourceConfig {
+            interval: Some("100ms".to_string()),
+            max_count: Some(100),
+            messages_range: Some((5, 10)),
+            payload_size: Some(50),
+        }
+    }
+
+    #[test]
+    fn given_persisted_state_should_restore_messages_produced() {
+        let state = State {
+            messages_produced: 500,
+        };
+
+        let serialized = rmp_serde::to_vec(&state).expect("Failed to serialize state");
+        let connector_state = ConnectorState(serialized);
+
+        let src = RandomSource::new(1, test_config(), Some(connector_state));
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let restored = src.state.lock().await;
+            assert_eq!(restored.messages_produced, 500);
+        });
+    }
+
+    #[test]
+    fn given_no_state_should_start_fresh() {
+        let src = RandomSource::new(1, test_config(), None);
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let state = src.state.lock().await;
+            assert_eq!(state.messages_produced, 0);
+        });
+    }
+
+    #[test]
+    fn given_invalid_state_should_start_fresh() {
+        let invalid_state = ConnectorState(b"not valid msgpack".to_vec());
+        let src = RandomSource::new(1, test_config(), Some(invalid_state));
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let state = src.state.lock().await;
+            assert_eq!(state.messages_produced, 0);
+        });
+    }
+
+    #[test]
+    fn state_should_be_serializable_and_deserializable() {
+        let original = State {
+            messages_produced: 1000,
+        };
+
+        let serialized = rmp_serde::to_vec(&original).expect("Failed to serialize");
+        let deserialized: State =
+            rmp_serde::from_slice(&serialized).expect("Failed to deserialize");
+
+        assert_eq!(original.messages_produced, deserialized.messages_produced);
+    }
+
+    #[test]
+    fn serialize_state_helper_should_produce_valid_connector_state() {
+        let src = RandomSource::new(1, test_config(), None);
+        let state = State {
+            messages_produced: 42,
+        };
+
+        let connector_state = src.serialize_state(&state);
+        assert!(connector_state.is_some());
+
+        let bytes = connector_state.unwrap().0;
+        let restored: State = rmp_serde::from_slice(&bytes).expect("Failed to deserialize state");
+        assert_eq!(restored.messages_produced, 42);
+    }
 }

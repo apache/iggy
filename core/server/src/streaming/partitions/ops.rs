@@ -23,10 +23,10 @@
 
 use super::journal::Journal;
 use super::local_partitions::LocalPartitions;
-use crate::binary::handlers::messages::poll_messages_handler::IggyPollMetadata;
 use crate::shard::system::messages::PollingArgs;
 use crate::streaming::polling_consumer::PollingConsumer;
 use crate::streaming::segments::IggyMessagesBatchSet;
+use iggy_common::IggyPollMetadata;
 use iggy_common::sharding::IggyNamespace;
 use iggy_common::{IggyError, PollingKind};
 use std::cell::RefCell;
