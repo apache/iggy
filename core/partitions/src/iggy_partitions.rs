@@ -457,7 +457,7 @@ where
                 return;
             };
 
-            if entry.message.header().checksum != header.prepare_checksum {
+            if entry.header.checksum != header.prepare_checksum {
                 warn!("on_ack: checksum mismatch");
                 return;
             }
@@ -476,8 +476,7 @@ where
                 return;
             };
 
-            let prepare = entry.message;
-            let prepare_header = *prepare.header();
+            let prepare_header = entry.header;
 
             // Data was already appended to the partition journal during
             // on_replicate. Now that quorum is reached, update the partition's

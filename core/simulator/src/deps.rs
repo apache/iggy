@@ -91,6 +91,9 @@ impl<S: Storage<Buffer = Vec<u8>>> Journal<S> for SimJournal<S> {
     where
         Self: 'a;
 
+    // TODO(hubcio): validate that the caller's checksum matches the stored
+    // header - currently this looks up by op only, ignoring the checksum.
+    // A real journal implementation must reject mismatches.
     async fn entry(&self, header: &Self::Header) -> Option<Self::Entry> {
         let headers = unsafe { &*self.headers.get() };
         let offsets = unsafe { &*self.offsets.get() };

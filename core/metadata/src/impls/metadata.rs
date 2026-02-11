@@ -16,7 +16,7 @@
 // under the License.
 use crate::stm::StateMachine;
 use crate::stm::snapshot::{FillSnapshot, MetadataSnapshot, Snapshot, SnapshotError};
-use consensus::{Consensus, Project, Sequencer, Status, VsrConsensus};
+use consensus::{Consensus, Pipeline, PipelineEntry, Project, Sequencer, Status, VsrConsensus};
 use iggy_common::{
     header::{Command2, GenericHeader, PrepareHeader, PrepareOkHeader, ReplyHeader},
     message::Message,
@@ -105,18 +105,19 @@ pub struct IggyMetadata<C, J, S, M> {
     pub mux_stm: M,
 }
 
-impl<B, J, S, M> Metadata<VsrConsensus<B>> for IggyMetadata<VsrConsensus<B>, J, S, M>
+impl<B, P, J, S, M> Metadata<VsrConsensus<B, P>> for IggyMetadata<VsrConsensus<B, P>, J, S, M>
 where
     B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
+    P: Pipeline<Message = Message<PrepareHeader>, Entry = PipelineEntry>,
     J: JournalHandle,
     J::Target: Journal<
             J::Storage,
-            Entry = <VsrConsensus<B> as Consensus>::ReplicateMessage,
+            Entry = <VsrConsensus<B, P> as Consensus>::ReplicateMessage,
             Header = PrepareHeader,
         >,
     M: StateMachine<Input = Message<PrepareHeader>>,
 {
-    async fn on_request(&self, message: <VsrConsensus<B> as Consensus>::RequestMessage) {
+    async fn on_request(&self, message: <VsrConsensus<B, P> as Consensus>::RequestMessage) {
         let consensus = self.consensus.as_ref().unwrap();
 
         // TODO: Bunch of asserts.
@@ -125,7 +126,7 @@ where
         self.pipeline_prepare(prepare).await;
     }
 
-    async fn on_replicate(&self, message: <VsrConsensus<B> as Consensus>::ReplicateMessage) {
+    async fn on_replicate(&self, message: <VsrConsensus<B, P> as Consensus>::ReplicateMessage) {
         let consensus = self.consensus.as_ref().unwrap();
         let journal = self.journal.as_ref().unwrap();
 
@@ -200,7 +201,7 @@ where
         }
     }
 
-    async fn on_ack(&self, message: <VsrConsensus<B> as Consensus>::AckMessage) {
+    async fn on_ack(&self, message: <VsrConsensus<B, P> as Consensus>::AckMessage) {
         let consensus = self.consensus.as_ref().unwrap();
         let header = message.header();
 
@@ -214,28 +215,25 @@ where
             return;
         }
 
-        // Verify checksum by checking pipeline entry exists
         {
             let pipeline = consensus.pipeline().borrow();
-            let Some(entry) =
-                pipeline.message_by_op_and_checksum(header.op, header.prepare_checksum)
-            else {
+            if pipeline
+                .message_by_op_and_checksum(header.op, header.prepare_checksum)
+                .is_none()
+            {
                 debug!("on_ack: prepare not in pipeline op={}", header.op);
-                return;
-            };
-
-            if entry.message.header().checksum != header.prepare_checksum {
-                warn!("on_ack: checksum mismatch");
                 return;
             }
         }
 
         // Let consensus handle the ack increment and quorum check
         if consensus.handle_prepare_ok(header) {
+            let journal = self.journal.as_ref().unwrap();
+
             debug!("on_ack: quorum received for op={}", header.op);
             consensus.advance_commit_number(header.op);
 
-            // Extract the prepare message from the pipeline by op
+            // Extract the header from the pipeline, fetch the full message from journal
             // TODO: Commit from the head. ALWAYS
             let entry = consensus.pipeline().borrow_mut().extract_by_op(header.op);
             let Some(entry) = entry else {
@@ -243,8 +241,20 @@ where
                 return;
             };
 
-            let prepare = entry.message;
-            let prepare_header = *prepare.header();
+            let prepare_header = entry.header;
+            // TODO(hubcio): should we replace this with graceful fallback (warn + return)?
+            // When journal compaction is implemented compaction could race
+            // with this lookup if it removes entries below the commit number.
+            let prepare = journal
+                .handle()
+                .entry(&prepare_header)
+                .await
+                .unwrap_or_else(|| {
+                    panic!(
+                        "on_ack: committed prepare op={} checksum={} must be in journal",
+                        prepare_header.op, prepare_header.checksum
+                    )
+                });
 
             // Apply the state (consumes prepare)
             // TODO: Handle appending result to response
@@ -292,13 +302,14 @@ where
     }
 }
 
-impl<B, J, S, M> IggyMetadata<VsrConsensus<B>, J, S, M>
+impl<B, P, J, S, M> IggyMetadata<VsrConsensus<B, P>, J, S, M>
 where
     B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
+    P: Pipeline<Message = Message<PrepareHeader>, Entry = PipelineEntry>,
     J: JournalHandle,
     J::Target: Journal<
             J::Storage,
-            Entry = <VsrConsensus<B> as Consensus>::ReplicateMessage,
+            Entry = <VsrConsensus<B, P> as Consensus>::ReplicateMessage,
             Header = PrepareHeader,
         >,
     M: StateMachine<Input = Message<PrepareHeader>>,
@@ -308,9 +319,13 @@ where
 
         debug!("inserting prepare into metadata pipeline");
         consensus.verify_pipeline();
+        // Pipeline-first ordering is safe only because message
+        // processing is cooperative (single-task, RefCell-based).
+        // If on_replicate ever early-returns (syncing, status change)
+        // the entry would be in the pipeline without journal backing.
         consensus.pipeline_message(prepare.clone());
-
         self.on_replicate(prepare.clone()).await;
+
         consensus.post_replicate_verify(&prepare);
     }
 
