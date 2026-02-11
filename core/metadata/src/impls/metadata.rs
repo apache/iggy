@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::stm::StateMachine;
-use crate::stm::snapshot::{FillSnapshot, MetadataSnapshot, RestoreSnapshot, SnapshotError};
+use crate::stm::snapshot::{FillSnapshot, MetadataSnapshot, SnapshotError};
 use consensus::{Consensus, Project, Sequencer, Status, VsrConsensus};
 use iggy_common::IggyTimestamp;
 use iggy_common::{
@@ -29,20 +29,29 @@ use tracing::{debug, warn};
 /// Trait for metadata snapshot implementations.
 ///
 /// This is the interface that `MetadataHandle::Snapshot` must satisfy.
-/// It provides methods for creating, encoding, decoding, and restoring snapshots.
+/// It provides methods for creating, encoding, and decoding snapshots.
 #[allow(unused)]
 pub trait Snapshot: Sized {
     /// The error type for snapshot operations.
     type Error: std::error::Error;
+
+    /// The type used for snapshot sequence numbers.
+    type SequenceNumber;
+
+    /// The type used for snapshot timestamps.
+    type Timestamp;
+
+    /// The inner snapshot data structure that state machines fill and restore from.
+    type Inner;
 
     /// Create a snapshot from the current state of a state machine.
     ///
     /// # Arguments
     /// * `stm` - The state machine to snapshot
     /// * `sequence_number` - Monotonically increasing snapshot sequence number
-    fn create<T>(stm: &T, sequence_number: u64) -> Result<Self, Self::Error>
+    fn create<T>(stm: &T, sequence_number: Self::SequenceNumber) -> Result<Self, Self::Error>
     where
-        T: FillSnapshot;
+        T: FillSnapshot<Self::Inner>;
 
     /// Encode the snapshot to msgpack bytes.
     fn encode(&self) -> Result<Vec<u8>, Self::Error>;
@@ -50,16 +59,11 @@ pub trait Snapshot: Sized {
     /// Decode a snapshot from msgpack bytes.
     fn decode(bytes: &[u8]) -> Result<Self, Self::Error>;
 
-    /// Restore a state machine from this snapshot.
-    fn restore<T>(&self) -> Result<T, Self::Error>
-    where
-        T: RestoreSnapshot;
-
     /// Get the snapshot sequence number.
-    fn sequence_number(&self) -> u64;
+    fn sequence_number(&self) -> Self::SequenceNumber;
 
     /// Get the timestamp when this snapshot was created.
-    fn created_at(&self) -> u64;
+    fn created_at(&self) -> Self::Timestamp;
 }
 
 #[derive(Debug, Clone)]
@@ -83,10 +87,13 @@ impl IggySnapshot {
 
 impl Snapshot for IggySnapshot {
     type Error = SnapshotError;
+    type SequenceNumber = u64;
+    type Timestamp = u64;
+    type Inner = MetadataSnapshot;
 
     fn create<T>(stm: &T, sequence_number: u64) -> Result<Self, SnapshotError>
     where
-        T: FillSnapshot,
+        T: FillSnapshot<MetadataSnapshot>,
     {
         let mut snapshot = MetadataSnapshot {
             created_at: IggyTimestamp::now().as_micros(),
@@ -108,13 +115,6 @@ impl Snapshot for IggySnapshot {
     fn decode(bytes: &[u8]) -> Result<Self, SnapshotError> {
         let snapshot = MetadataSnapshot::decode(bytes)?;
         Ok(Self { snapshot })
-    }
-
-    fn restore<T>(&self) -> Result<T, SnapshotError>
-    where
-        T: RestoreSnapshot,
-    {
-        T::restore_snapshot(&self.snapshot)
     }
 
     fn sequence_number(&self) -> u64 {

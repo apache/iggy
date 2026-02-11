@@ -131,30 +131,28 @@ pub trait Snapshotable {
 /// Trait for filling a typed snapshot with state machine data.
 ///
 /// Each state machine implements this to write its serialized state
-/// to its specific field in the `MetadataSnapshot` struct.
-pub trait FillSnapshot {
+pub trait FillSnapshot<S> {
     /// Fill the snapshot with this state machine's data.
-    fn fill_snapshot(&self, snapshot: &mut MetadataSnapshot) -> Result<(), SnapshotError>;
+    fn fill_snapshot(&self, snapshot: &mut S) -> Result<(), SnapshotError>;
 }
 
 /// Trait for restoring state machine data from a typed snapshot.
 ///
-/// Each state machine implements this to read its state from
-/// its specific field in the `MetadataSnapshot` struct.
-pub trait RestoreSnapshot: Sized {
+/// Each state machine implements this to read its state.
+pub trait RestoreSnapshot<S>: Sized {
     /// Restore this state machine from the snapshot.
-    fn restore_snapshot(snapshot: &MetadataSnapshot) -> Result<Self, SnapshotError>;
+    fn restore_snapshot(snapshot: &S) -> Result<Self, SnapshotError>;
 }
 
 /// Base case for the recursive tuple pattern - unit type terminates the recursion.
-impl FillSnapshot for () {
-    fn fill_snapshot(&self, _snapshot: &mut MetadataSnapshot) -> Result<(), SnapshotError> {
+impl<S> FillSnapshot<S> for () {
+    fn fill_snapshot(&self, _snapshot: &mut S) -> Result<(), SnapshotError> {
         Ok(())
     }
 }
 
-impl RestoreSnapshot for () {
-    fn restore_snapshot(_snapshot: &MetadataSnapshot) -> Result<Self, SnapshotError> {
+impl<S> RestoreSnapshot<S> for () {
+    fn restore_snapshot(_snapshot: &S) -> Result<Self, SnapshotError> {
         Ok(())
     }
 }
@@ -171,7 +169,9 @@ impl RestoreSnapshot for () {
 #[macro_export]
 macro_rules! impl_fill_restore {
     ($wrapper:ident, $field:ident) => {
-        impl $crate::stm::snapshot::FillSnapshot for $wrapper {
+        impl $crate::stm::snapshot::FillSnapshot<$crate::stm::snapshot::MetadataSnapshot>
+            for $wrapper
+        {
             fn fill_snapshot(
                 &self,
                 snapshot: &mut $crate::stm::snapshot::MetadataSnapshot,
@@ -182,7 +182,9 @@ macro_rules! impl_fill_restore {
             }
         }
 
-        impl $crate::stm::snapshot::RestoreSnapshot for $wrapper {
+        impl $crate::stm::snapshot::RestoreSnapshot<$crate::stm::snapshot::MetadataSnapshot>
+            for $wrapper
+        {
             fn restore_snapshot(
                 snapshot: &$crate::stm::snapshot::MetadataSnapshot,
             ) -> Result<Self, $crate::stm::snapshot::SnapshotError> {

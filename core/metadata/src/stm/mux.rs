@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::stm::snapshot::{FillSnapshot, MetadataSnapshot, RestoreSnapshot, SnapshotError};
+use crate::stm::snapshot::{FillSnapshot, RestoreSnapshot, SnapshotError};
 use iggy_common::{header::PrepareHeader, message::Message};
 
 use crate::stm::{State, StateMachine};
@@ -94,44 +94,44 @@ where
 
 /// Recursive case for variadic tuple pattern: (Head, Tail)
 /// Fills snapshot from head and tail, and restores both on restore.
-impl<S, Rest> FillSnapshot for variadic!(S, ...Rest)
+impl<SnapshotData, Head, Tail> FillSnapshot<SnapshotData> for variadic!(Head, ...Tail)
 where
-    S: FillSnapshot,
-    Rest: FillSnapshot,
+    Head: FillSnapshot<SnapshotData>,
+    Tail: FillSnapshot<SnapshotData>,
 {
-    fn fill_snapshot(&self, snapshot: &mut MetadataSnapshot) -> Result<(), SnapshotError> {
+    fn fill_snapshot(&self, snapshot: &mut SnapshotData) -> Result<(), SnapshotError> {
         self.0.fill_snapshot(snapshot)?;
         self.1.fill_snapshot(snapshot)?;
         Ok(())
     }
 }
 
-impl<S, Rest> RestoreSnapshot for variadic!(S, ...Rest)
+impl<SnapshotData, Head, Tail> RestoreSnapshot<SnapshotData> for variadic!(Head, ...Tail)
 where
-    S: RestoreSnapshot,
-    Rest: RestoreSnapshot,
+    Head: RestoreSnapshot<SnapshotData>,
+    Tail: RestoreSnapshot<SnapshotData>,
 {
-    fn restore_snapshot(snapshot: &MetadataSnapshot) -> Result<Self, SnapshotError> {
-        let head = S::restore_snapshot(snapshot)?;
-        let tail = Rest::restore_snapshot(snapshot)?;
+    fn restore_snapshot(snapshot: &SnapshotData) -> Result<Self, SnapshotError> {
+        let head = Head::restore_snapshot(snapshot)?;
+        let tail = Tail::restore_snapshot(snapshot)?;
         Ok((head, tail))
     }
 }
 
-impl<T> FillSnapshot for MuxStateMachine<T>
+impl<SnapshotData, T> FillSnapshot<SnapshotData> for MuxStateMachine<T>
 where
-    T: StateMachine + FillSnapshot,
+    T: StateMachine + FillSnapshot<SnapshotData>,
 {
-    fn fill_snapshot(&self, snapshot: &mut MetadataSnapshot) -> Result<(), SnapshotError> {
+    fn fill_snapshot(&self, snapshot: &mut SnapshotData) -> Result<(), SnapshotError> {
         self.inner.fill_snapshot(snapshot)
     }
 }
 
-impl<T> RestoreSnapshot for MuxStateMachine<T>
+impl<SnapshotData, T> RestoreSnapshot<SnapshotData> for MuxStateMachine<T>
 where
-    T: StateMachine + RestoreSnapshot,
+    T: StateMachine + RestoreSnapshot<SnapshotData>,
 {
-    fn restore_snapshot(snapshot: &MetadataSnapshot) -> Result<Self, SnapshotError> {
+    fn restore_snapshot(snapshot: &SnapshotData) -> Result<Self, SnapshotError> {
         let inner = T::restore_snapshot(snapshot)?;
         Ok(MuxStateMachine::new(inner))
     }
@@ -225,8 +225,9 @@ mod tests {
         assert!(decoded.snapshot().streams.is_some());
         assert!(decoded.snapshot().consumer_groups.is_some());
 
-        // Restore MuxStateMachine
-        let restored: MuxStateMachine<MuxTuple> = decoded.restore().unwrap();
+        // Restore MuxStateMachine from the state side (symmetric with fill_snapshot)
+        let restored: MuxStateMachine<MuxTuple> =
+            MuxStateMachine::restore_snapshot(decoded.snapshot()).unwrap();
 
         // Verify restored state
         let mut verify_snapshot = MetadataSnapshot::new(0);
