@@ -67,6 +67,7 @@ public final class BlockingConsumer {
     private static final int POLL_BATCH_SIZE = 100; // Max messages per poll
     private static final int POLL_INTERVAL_MS = 1000; // Poll every second
     private static final int BATCHES_LIMIT = 5; // Exit after receiving this many batches
+    private static final int MAX_EMPTY_POLLS = 5; // Exit if no messages after this many consecutive polls
 
     private static volatile boolean running = true;
 
@@ -126,6 +127,7 @@ public final class BlockingConsumer {
 
         java.math.BigInteger offset = java.math.BigInteger.ZERO;
         int consumedBatches = 0;
+        int emptyPolls = 0;
         Consumer consumer = Consumer.of(CONSUMER_ID);
 
         while (running && consumedBatches < BATCHES_LIMIT) {
@@ -141,10 +143,17 @@ public final class BlockingConsumer {
                                 false);
 
                 if (polled.messages().isEmpty()) {
+                    emptyPolls++;
+                    if (emptyPolls >= MAX_EMPTY_POLLS) {
+                        log.info("No more messages after {} empty polls, finishing.", MAX_EMPTY_POLLS);
+                        break;
+                    }
                     log.info("No messages found, waiting...");
                     Thread.sleep(POLL_INTERVAL_MS);
                     continue;
                 }
+
+                emptyPolls = 0; // Reset on successful poll
 
                 for (Message message : polled.messages()) {
                     String payload = new String(message.payload());

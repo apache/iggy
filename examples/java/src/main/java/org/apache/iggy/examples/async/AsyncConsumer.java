@@ -88,6 +88,7 @@ public final class AsyncConsumer {
     private static final int POLL_BATCH_SIZE = 100;
     private static final int POLL_INTERVAL_MS = 1000;
     private static final int BATCHES_LIMIT = 5; // Exit after receiving this many batches
+    private static final int MAX_EMPTY_POLLS = 5; // Exit if no messages after consecutive empty polls
 
     // Error recovery configuration
     private static final int MAX_RETRY_ATTEMPTS = 5;
@@ -239,9 +240,12 @@ public final class AsyncConsumer {
                                         .thenRun(() -> emptyPolls.set(0));
                             } else {
                                 int empty = emptyPolls.incrementAndGet();
-                                if (empty == 1) {
-                                    log.info("Caught up - no new messages. Waiting...");
+                                if (empty >= MAX_EMPTY_POLLS) {
+                                    log.info("No more messages after {} empty polls, finishing.", MAX_EMPTY_POLLS);
+                                    running = false;
+                                    return CompletableFuture.completedFuture(null);
                                 }
+                                log.info("Caught up - no new messages. Waiting...");
                                 // Sleep without blocking Netty threads
                                 return CompletableFuture.runAsync(
                                         () -> {
