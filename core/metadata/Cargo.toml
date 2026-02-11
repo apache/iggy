@@ -37,3 +37,7 @@ message_bus = { workspace = true }
 paste = { workspace = true }
 slab = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+bytemuck = { workspace = true }
+bytes = { workspace = true }
