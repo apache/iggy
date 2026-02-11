@@ -26,10 +26,13 @@ use super::local_partitions::LocalPartitions;
 use crate::shard::system::messages::PollingArgs;
 use crate::streaming::polling_consumer::PollingConsumer;
 use crate::streaming::segments::IggyMessagesBatchSet;
+use crate::streaming::segments::IndexReader;
+use crate::streaming::segments::MessagesReader;
 use iggy_common::IggyPollMetadata;
 use iggy_common::sharding::IggyNamespace;
 use iggy_common::{IggyError, PollingKind};
 use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::atomic::Ordering;
 
 /// Poll messages from a partition partitions.
@@ -333,6 +336,10 @@ async fn poll_messages_by_timestamp(
 }
 
 /// Load messages from disk by offset.
+///
+/// Re-resolves segments by `current_offset` on each iteration to avoid stale
+/// indices across `.await` points (the message_cleaner can delete front segments
+/// from the vec between cooperative yields on the compio thread).
 pub async fn load_messages_from_disk(
     local_partitions: &RefCell<LocalPartitions>,
     namespace: &IggyNamespace,
@@ -343,51 +350,41 @@ pub async fn load_messages_from_disk(
         return Ok(IggyMessagesBatchSet::empty());
     }
 
-    // Get segment range containing the requested offset
-    let segment_range = {
-        let store = local_partitions.borrow();
-        let partition = store
-            .get(namespace)
-            .expect("local_partitions: partition must exist");
-
-        let segments = partition.log.segments();
-        if segments.is_empty() {
-            return Ok(IggyMessagesBatchSet::empty());
-        }
-
-        let start = segments
-            .iter()
-            .rposition(|segment| segment.start_offset <= start_offset)
-            .unwrap_or(0);
-        let end = segments.len();
-        start..end
-    };
-
     let mut remaining_count = count;
     let mut batches = IggyMessagesBatchSet::empty();
     let mut current_offset = start_offset;
 
-    for idx in segment_range {
+    loop {
         if remaining_count == 0 {
             break;
         }
 
-        let (segment_start_offset, segment_end_offset) = {
+        // Resolve the segment containing current_offset in a fresh borrow each iteration.
+        let extracted = {
             let store = local_partitions.borrow();
             let partition = store
                 .get(namespace)
                 .expect("local_partitions: partition must exist");
 
-            let segment = &partition.log.segments()[idx];
-            (segment.start_offset, segment.end_offset)
+            let segments = partition.log.segments();
+            if segments.is_empty() {
+                None
+            } else {
+                segments
+                    .iter()
+                    .rposition(|segment| segment.start_offset <= current_offset)
+                    .map(|seg_idx| {
+                        let segment = &segments[seg_idx];
+                        (segment.start_offset, segment.end_offset)
+                    })
+            }
         };
 
-        let offset = if current_offset < segment_start_offset {
-            segment_start_offset
-        } else {
-            current_offset
+        let Some((segment_start_offset, segment_end_offset)) = extracted else {
+            break;
         };
 
+        let offset = current_offset.max(segment_start_offset);
         let mut end_offset = offset + (remaining_count - 1).max(1) as u64;
         if end_offset > segment_end_offset {
             end_offset = segment_end_offset;
@@ -396,7 +393,6 @@ pub async fn load_messages_from_disk(
         let messages = load_segment_messages(
             local_partitions,
             namespace,
-            idx,
             offset,
             end_offset,
             remaining_count,
@@ -417,11 +413,15 @@ pub async fn load_messages_from_disk(
     Ok(batches)
 }
 
-/// Load messages from a specific segment.
+/// Load messages from a specific segment identified by `segment_start_offset`.
+///
+/// Resolves the segment by its start_offset (stable identity) rather than by
+/// vec index, which can go stale if the message_cleaner removes front segments.
+/// Clones `Rc` readers so the underlying fds survive even if the segment is
+/// later removed from the vec (POSIX semantics: open fds outlive unlink).
 async fn load_segment_messages(
     local_partitions: &RefCell<LocalPartitions>,
     namespace: &IggyNamespace,
-    idx: usize,
     start_offset: u64,
     end_offset: u64,
     count: u32,
@@ -456,63 +456,34 @@ async fn load_segment_messages(
         return Ok(batches);
     }
 
-    // Load from disk
-    let (index_reader, messages_reader, indexes) = {
-        let store = local_partitions.borrow();
-        let partition = store
-            .get(namespace)
-            .expect("local_partitions: partition must exist");
-
-        let storages = partition.log.storages();
-        if idx >= storages.len() {
-            return Ok(IggyMessagesBatchSet::empty());
-        }
-
-        let index_reader = storages[idx]
-            .index_reader
-            .as_ref()
-            .expect("Index reader not initialized")
-            .clone();
-        let messages_reader = storages[idx]
-            .messages_reader
-            .as_ref()
-            .expect("Messages reader not initialized")
-            .clone();
-        let indexes_vec = partition.log.indexes();
-        let indexes = indexes_vec
-            .get(idx)
-            .and_then(|opt| opt.as_ref())
-            .map(|indexes| {
-                indexes
-                    .slice_by_offset(relative_start_offset, count)
-                    .unwrap_or_default()
-            });
-        (index_reader, messages_reader, indexes)
+    // Resolve segment by start_offset and extract Rc-cloned readers
+    let Some((index_reader, messages_reader, cached_indexes)) = resolve_segment_readers(
+        local_partitions,
+        namespace,
+        segment_start_offset,
+        |indexes| {
+            indexes
+                .slice_by_offset(relative_start_offset, count)
+                .unwrap_or_default()
+        },
+    ) else {
+        return Ok(IggyMessagesBatchSet::empty());
     };
 
-    let indexes_to_read = if let Some(indexes) = indexes {
-        if !indexes.is_empty() {
-            Some(indexes)
-        } else {
+    let indexes_to_read = match cached_indexes {
+        Some(indexes) if !indexes.is_empty() => Some(indexes),
+        _ => {
             index_reader
-                .as_ref()
                 .load_from_disk_by_offset(relative_start_offset, count)
                 .await?
         }
-    } else {
-        index_reader
-            .as_ref()
-            .load_from_disk_by_offset(relative_start_offset, count)
-            .await?
     };
 
-    if indexes_to_read.is_none() {
+    let Some(indexes_to_read) = indexes_to_read else {
         return Ok(IggyMessagesBatchSet::empty());
-    }
+    };
 
-    let indexes_to_read = indexes_to_read.unwrap();
     let batch = messages_reader
-        .as_ref()
         .load_messages_from_disk(indexes_to_read)
         .await?;
 
@@ -522,6 +493,9 @@ async fn load_segment_messages(
 }
 
 /// Load messages from disk by timestamp.
+///
+/// Re-resolves segments each iteration using a `min_start_offset` cursor to
+/// advance past processed segments, avoiding stale vec indices across `.await`.
 async fn load_messages_from_disk_by_timestamp(
     local_partitions: &RefCell<LocalPartitions>,
     namespace: &IggyNamespace,
@@ -532,58 +506,49 @@ async fn load_messages_from_disk_by_timestamp(
         return Ok(IggyMessagesBatchSet::empty());
     }
 
-    // Find segment range that might contain messages >= timestamp
-    let segment_range = {
-        let store = local_partitions.borrow();
-        let partition = store
-            .get(namespace)
-            .expect("local_partitions: partition must exist");
-
-        let segments = partition.log.segments();
-        if segments.is_empty() {
-            return Ok(IggyMessagesBatchSet::empty());
-        }
-
-        let start = segments
-            .iter()
-            .position(|segment| segment.end_timestamp >= timestamp)
-            .unwrap_or(segments.len());
-
-        if start >= segments.len() {
-            return Ok(IggyMessagesBatchSet::empty());
-        }
-
-        start..segments.len()
-    };
-
     let mut remaining_count = count;
     let mut batches = IggyMessagesBatchSet::empty();
+    let mut min_start_offset: u64 = 0;
 
-    for idx in segment_range {
+    loop {
         if remaining_count == 0 {
             break;
         }
 
-        let segment_end_timestamp = {
+        // Find next unprocessed segment whose end_timestamp covers the requested timestamp
+        let extracted = {
             let store = local_partitions.borrow();
             let partition = store
                 .get(namespace)
                 .expect("local_partitions: partition must exist");
-            partition.log.segments()[idx].end_timestamp
+
+            let segments = partition.log.segments();
+            if segments.is_empty() {
+                None
+            } else {
+                segments
+                    .iter()
+                    .find(|seg| {
+                        seg.end_timestamp >= timestamp && seg.end_offset >= min_start_offset
+                    })
+                    .map(|seg| (seg.start_offset, seg.end_offset))
+            }
         };
 
-        if segment_end_timestamp < timestamp {
-            continue;
-        }
+        let Some((segment_start_offset, segment_end_offset)) = extracted else {
+            break;
+        };
 
         let messages = load_segment_messages_by_timestamp(
             local_partitions,
             namespace,
-            idx,
+            segment_start_offset,
             timestamp,
             remaining_count,
         )
         .await?;
+
+        min_start_offset = segment_end_offset + 1;
 
         let messages_count = messages.count();
         if messages_count == 0 {
@@ -598,10 +563,13 @@ async fn load_messages_from_disk_by_timestamp(
 }
 
 /// Load messages from a specific segment by timestamp.
+///
+/// Resolves the segment by its start_offset (stable identity) rather than by
+/// vec index. Same rationale as [`load_segment_messages`].
 async fn load_segment_messages_by_timestamp(
     local_partitions: &RefCell<LocalPartitions>,
     namespace: &IggyNamespace,
-    idx: usize,
+    segment_start_offset: u64,
     timestamp: u64,
     count: u32,
 ) -> Result<IggyMessagesBatchSet, IggyError> {
@@ -636,65 +604,91 @@ async fn load_segment_messages_by_timestamp(
         return Ok(batches);
     }
 
-    // Load from disk
-    let (index_reader, messages_reader, indexes) = {
-        let store = local_partitions.borrow();
-        let partition = store
-            .get(namespace)
-            .expect("local_partitions: partition must exist");
-
-        let storages = partition.log.storages();
-        if idx >= storages.len() {
-            return Ok(IggyMessagesBatchSet::empty());
-        }
-
-        let index_reader = storages[idx]
-            .index_reader
-            .as_ref()
-            .expect("Index reader not initialized")
-            .clone();
-        let messages_reader = storages[idx]
-            .messages_reader
-            .as_ref()
-            .expect("Messages reader not initialized")
-            .clone();
-        let indexes_vec = partition.log.indexes();
-        let indexes = indexes_vec
-            .get(idx)
-            .and_then(|opt| opt.as_ref())
-            .map(|indexes| {
-                indexes
-                    .slice_by_timestamp(timestamp, count)
-                    .unwrap_or_default()
-            });
-        (index_reader, messages_reader, indexes)
+    // Resolve segment by start_offset and extract Rc-cloned readers
+    let Some((index_reader, messages_reader, cached_indexes)) = resolve_segment_readers(
+        local_partitions,
+        namespace,
+        segment_start_offset,
+        |indexes| {
+            indexes
+                .slice_by_timestamp(timestamp, count)
+                .unwrap_or_default()
+        },
+    ) else {
+        return Ok(IggyMessagesBatchSet::empty());
     };
 
-    let indexes_to_read = if let Some(indexes) = indexes {
-        if !indexes.is_empty() {
-            Some(indexes)
-        } else {
+    let indexes_to_read = match cached_indexes {
+        Some(indexes) if !indexes.is_empty() => Some(indexes),
+        _ => {
             index_reader
-                .as_ref()
                 .load_from_disk_by_timestamp(timestamp, count)
                 .await?
         }
-    } else {
-        index_reader
-            .as_ref()
-            .load_from_disk_by_timestamp(timestamp, count)
-            .await?
     };
 
-    if indexes_to_read.is_none() {
+    let Some(indexes_to_read) = indexes_to_read else {
         return Ok(IggyMessagesBatchSet::empty());
-    }
+    };
 
-    let indexes_to_read = indexes_to_read.unwrap();
     let batch = messages_reader
-        .as_ref()
         .load_messages_from_disk(indexes_to_read)
         .await?;
 
     Ok(IggyMessagesBatchSet::from(batch))
+}
+
+/// Resolve a segment by its `start_offset` (stable identity) and extract
+/// Rc-cloned readers plus optionally-cached indexes. Returns `None` if the
+/// segment no longer exists (deleted by message_cleaner).
+///
+/// Only clones the reader Rcs (not writers) since callers only perform reads.
+/// The cloned Rcs keep the underlying fds alive even if the segment is later
+/// removed from the vec (POSIX semantics: open fds outlive unlink).
+fn resolve_segment_readers<F, T>(
+    local_partitions: &RefCell<LocalPartitions>,
+    namespace: &IggyNamespace,
+    segment_start_offset: u64,
+    slice_indexes: F,
+) -> Option<(Rc<IndexReader>, Rc<MessagesReader>, Option<T>)>
+where
+    F: FnOnce(&iggy_common::IggyIndexesMut) -> T,
+{
+    let store = local_partitions.borrow();
+    let partition = store
+        .get(namespace)
+        .expect("local_partitions: partition must exist");
+
+    let segments = partition.log.segments();
+    // TODO: O(n) linear scan — fine for typical segment counts but consider a
+    // HashMap<start_offset, idx> if partitions accumulate many segments.
+    let seg_idx = segments
+        .iter()
+        .position(|s| s.start_offset == segment_start_offset)?;
+
+    let storages = partition.log.storages();
+    if seg_idx >= storages.len() {
+        return None;
+    }
+
+    let storage = &storages[seg_idx];
+    let index_reader = storage
+        .index_reader
+        .as_ref()
+        .expect("Index reader not initialized")
+        .clone();
+    let messages_reader = storage
+        .messages_reader
+        .as_ref()
+        .expect("Messages reader not initialized")
+        .clone();
+
+    let cached_indexes = partition
+        .log
+        .indexes()
+        .get(seg_idx)
+        .and_then(|opt| opt.as_ref())
+        .map(slice_indexes);
+
+    Some((index_reader, messages_reader, cached_indexes))
 }

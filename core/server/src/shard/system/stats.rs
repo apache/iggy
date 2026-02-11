@@ -112,9 +112,17 @@ impl IggyShard {
 
             for stream_id in stream_ids {
                 if let Some(stream_stat) = self.metadata.get_stream_stats(stream_id) {
-                    stats.messages_count += stream_stat.messages_count_inconsistent();
-                    stats.segments_count += stream_stat.segments_count_inconsistent();
-                    stats.messages_size_bytes += stream_stat.size_bytes_inconsistent().into();
+                    stats.messages_count = stats
+                        .messages_count
+                        .saturating_add(stream_stat.messages_count_inconsistent());
+                    stats.segments_count = stats
+                        .segments_count
+                        .saturating_add(stream_stat.segments_count_inconsistent());
+                    stats.messages_size_bytes = stats
+                        .messages_size_bytes
+                        .as_bytes_u64()
+                        .saturating_add(stream_stat.size_bytes_inconsistent())
+                        .into();
                 }
             }
 
