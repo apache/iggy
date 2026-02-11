@@ -263,6 +263,7 @@ impl MetadataWriter {
         topic_id: TopicId,
         group_id: ConsumerGroupId,
         client_id: u32,
+        valid_client_ids: Option<Vec<u32>>,
     ) -> Option<usize> {
         let member_id = Arc::new(AtomicUsize::new(usize::MAX));
         self.append(MetadataOp::JoinConsumerGroup {
@@ -271,6 +272,7 @@ impl MetadataWriter {
             group_id,
             client_id,
             member_id: member_id.clone(),
+            valid_client_ids,
         });
         self.publish();
         let id = member_id.load(Ordering::Acquire);

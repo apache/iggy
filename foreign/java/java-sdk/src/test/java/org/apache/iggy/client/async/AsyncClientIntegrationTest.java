@@ -20,6 +20,7 @@
 package org.apache.iggy.client.async;
 
 import org.apache.iggy.client.async.tcp.AsyncIggyTcpClient;
+import org.apache.iggy.client.blocking.IntegrationTest;
 import org.apache.iggy.consumergroup.Consumer;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
@@ -45,8 +46,6 @@ import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 
-import static org.apache.iggy.client.blocking.IntegrationTest.LOCALHOST_IP;
-import static org.apache.iggy.client.blocking.IntegrationTest.TCP_PORT;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
@@ -54,7 +53,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * Tests connection, authentication, stream/topic management, and message operations.
  */
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
-class AsyncClientIntegrationTest {
+public abstract class AsyncClientIntegrationTest extends IntegrationTest {
     private static final Logger log = LoggerFactory.getLogger(AsyncClientIntegrationTest.class);
 
     private static final String USERNAME = "iggy";
@@ -69,7 +68,7 @@ class AsyncClientIntegrationTest {
     @BeforeAll
     public static void setup() throws Exception {
         log.info("Setting up async client for integration tests");
-        client = new AsyncIggyTcpClient(LOCALHOST_IP, TCP_PORT);
+        client = new AsyncIggyTcpClient(LOCALHOST_IP, tcpPort());
 
         // Connect and login
         client.connect()

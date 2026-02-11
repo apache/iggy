@@ -103,8 +103,49 @@ impl IggyShard {
         let (stream, topic, group) =
             self.resolve_consumer_group_id(stream_id, topic_id, group_id)?;
 
+        let valid_client_ids: Vec<u32> = self
+            .client_manager
+            .get_clients()
+            .iter()
+            .map(|c| c.session.client_id)
+            .collect();
+
         self.writer()
-            .join_consumer_group(stream, topic, group, client_id);
+            .join_consumer_group(stream, topic, group, client_id, Some(valid_client_ids));
+
+        if let Some(cg) = self.metadata.get_consumer_group(stream, topic, group)
+            && let Some((_, member)) = cg.members.iter().find(|(_, m)| m.client_id == client_id)
+            && member.partitions.is_empty()
+            && !cg.partitions.is_empty()
+        {
+            let current_valid_ids: Vec<u32> = self
+                .client_manager
+                .get_clients()
+                .iter()
+                .map(|c| c.session.client_id)
+                .collect();
+
+            let potentially_stale: Vec<u32> = cg
+                .members
+                .iter()
+                .filter(|(_, m)| {
+                    !m.partitions.is_empty() && !current_valid_ids.contains(&m.client_id)
+                })
+                .map(|(_, m)| m.client_id)
+                .collect();
+
+            if !potentially_stale.is_empty() {
+                tracing::info!(
+                    "join_consumer_group: new member {client_id} has no partitions, found stale members: {potentially_stale:?}, forcing leave"
+                );
+
+                for stale_client_id in potentially_stale {
+                    let _ =
+                        self.writer()
+                            .leave_consumer_group(stream, topic, group, stale_client_id);
+                }
+            }
+        }
 
         self.client_manager
             .join_consumer_group(client_id, stream, topic, group)

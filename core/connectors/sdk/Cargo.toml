@@ -31,13 +31,17 @@ readme = "../../README.md"
 [package.metadata.cargo-machete]
 ignored = ["prost"]
 
+[features]
+default = []
+api = ["strum"]
+
 [dependencies]
 async-trait = { workspace = true }
 base64 = { workspace = true }
-chrono = { workspace = true }
 dashmap = { workspace = true }
 flatbuffers = { workspace = true }
 iggy = { workspace = true }
+iggy_common = { workspace = true }
 once_cell = { workspace = true }
 postcard = { workspace = true }
 prost = { workspace = true }
@@ -45,9 +49,11 @@ prost-types = { workspace = true }
 protox = { workspace = true }
 protox-parse = { workspace = true }
 regex = { workspace = true }
+rmp-serde = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 simd-json = { workspace = true }
+strum = { workspace = true, optional = true }
 strum_macros = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }

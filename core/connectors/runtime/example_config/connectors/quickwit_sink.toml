@@ -22,6 +22,7 @@ version = 0
 name = "Quickwit sink 1"
 path = "target/release/libiggy_connector_quickwit_sink"
 plugin_config_format = "yaml"
+verbose = false
 
 [[streams]]
 stream = "qw"

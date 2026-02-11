@@ -16,8 +16,8 @@
 // under the License.
 
 use crate::stats::{StreamStats, TopicStats};
-use crate::stm::Handler;
-use crate::{define_state, impl_absorb};
+use crate::stm::StateHandler;
+use crate::{collect_handlers, define_state};
 use ahash::AHashMap;
 use iggy_common::create_partitions::CreatePartitions;
 use iggy_common::create_stream::CreateStream;
@@ -168,8 +168,11 @@ define_state! {
     Streams {
         index: AHashMap<Arc<str>, usize>,
         items: Slab<Stream>,
-    },
-    [
+    }
+}
+
+collect_handlers! {
+    Streams {
         CreateStream,
         UpdateStream,
         DeleteStream,
@@ -179,11 +182,9 @@ define_state! {
         DeleteTopic,
         PurgeTopic,
         CreatePartitions,
-        DeletePartitions
-    ]
+        DeletePartitions,
+    }
 }
-
-impl_absorb!(StreamsInner, StreamsCommand);
 
 impl StreamsInner {
     fn resolve_stream_id(&self, identifier: &iggy_common::Identifier) -> Option<usize> {
@@ -229,206 +230,239 @@ impl StreamsInner {
     }
 }
 
-impl Handler for StreamsInner {
-    fn handle(&mut self, cmd: &StreamsCommand) {
-        match cmd {
-            StreamsCommand::CreateStream(payload) => {
-                let name_arc: Arc<str> = Arc::from(payload.name.as_str());
-                if self.index.contains_key(&name_arc) {
-                    return;
-                }
+impl StateHandler for CreateStream {
+    type State = StreamsInner;
+    fn apply(&self, state: &mut StreamsInner) {
+        let name_arc: Arc<str> = Arc::from(self.name.as_str());
+        if state.index.contains_key(&name_arc) {
+            return;
+        }
 
-                let stream = Stream {
-                    id: 0,
-                    name: name_arc.clone(),
+        let stream = Stream {
+            id: 0,
+            name: name_arc.clone(),
+            created_at: iggy_common::IggyTimestamp::now(),
+            stats: Arc::new(StreamStats::default()),
+            topics: Slab::new(),
+            topic_index: AHashMap::default(),
+        };
+
+        let id = state.items.insert(stream);
+        if let Some(stream) = state.items.get_mut(id) {
+            stream.id = id;
+        }
+        state.index.insert(name_arc, id);
+    }
+}
+
+impl StateHandler for UpdateStream {
+    type State = StreamsInner;
+    fn apply(&self, state: &mut StreamsInner) {
+        let Some(stream_id) = state.resolve_stream_id(&self.stream_id) else {
+            return;
+        };
+        let Some(stream) = state.items.get_mut(stream_id) else {
+            return;
+        };
+
+        let new_name_arc: Arc<str> = Arc::from(self.name.as_str());
+        if let Some(&existing_id) = state.index.get(&new_name_arc)
+            && existing_id != stream_id
+        {
+            return;
+        }
+
+        state.index.remove(&stream.name);
+        stream.name = new_name_arc.clone();
+        state.index.insert(new_name_arc, stream_id);
+    }
+}
+
+impl StateHandler for DeleteStream {
+    type State = StreamsInner;
+    fn apply(&self, state: &mut StreamsInner) {
+        let Some(stream_id) = state.resolve_stream_id(&self.stream_id) else {
+            return;
+        };
+
+        if let Some(stream) = state.items.get(stream_id) {
+            let name = stream.name.clone();
+
+            state.items.remove(stream_id);
+            state.index.remove(&name);
+        }
+    }
+}
+
+impl StateHandler for PurgeStream {
+    type State = StreamsInner;
+    fn apply(&self, _state: &mut StreamsInner) {
+        // TODO
+        todo!();
+    }
+}
+
+impl StateHandler for CreateTopic {
+    type State = StreamsInner;
+    fn apply(&self, state: &mut StreamsInner) {
+        let Some(stream_id) = state.resolve_stream_id(&self.stream_id) else {
+            return;
+        };
+        let Some(stream) = state.items.get_mut(stream_id) else {
+            return;
+        };
+
+        let name_arc: Arc<str> = Arc::from(self.name.as_str());
+        if stream.topic_index.contains_key(&name_arc) {
+            return;
+        }
+
+        let topic = Topic {
+            id: 0,
+            name: name_arc.clone(),
+            created_at: iggy_common::IggyTimestamp::now(),
+            replication_factor: self.replication_factor.unwrap_or(1),
+            message_expiry: self.message_expiry,
+            compression_algorithm: self.compression_algorithm,
+            max_topic_size: self.max_topic_size,
+            stats: Arc::new(TopicStats::new(stream.stats.clone())),
+            partitions: Vec::new(),
+            round_robin_counter: Arc::new(AtomicUsize::new(0)),
+        };
+
+        let topic_id = stream.topics.insert(topic);
+        if let Some(topic) = stream.topics.get_mut(topic_id) {
+            topic.id = topic_id;
+
+            for partition_id in 0..self.partitions_count as usize {
+                let partition = Partition {
+                    id: partition_id,
                     created_at: iggy_common::IggyTimestamp::now(),
-                    stats: Arc::new(StreamStats::default()),
-                    topics: Slab::new(),
-                    topic_index: AHashMap::default(),
                 };
-
-                let id = self.items.insert(stream);
-                if let Some(stream) = self.items.get_mut(id) {
-                    stream.id = id;
-                }
-                self.index.insert(name_arc, id);
+                topic.partitions.push(partition);
             }
-            StreamsCommand::UpdateStream(payload) => {
-                let Some(stream_id) = self.resolve_stream_id(&payload.stream_id) else {
-                    return;
-                };
-                let Some(stream) = self.items.get_mut(stream_id) else {
-                    return;
-                };
+        }
 
-                let new_name_arc: Arc<str> = Arc::from(payload.name.as_str());
-                if let Some(&existing_id) = self.index.get(&new_name_arc)
-                    && existing_id != stream_id
-                {
-                    return;
-                }
+        stream.topic_index.insert(name_arc, topic_id);
+    }
+}
 
-                self.index.remove(&stream.name);
-                stream.name = new_name_arc.clone();
-                self.index.insert(new_name_arc, stream_id);
-            }
-            StreamsCommand::DeleteStream(payload) => {
-                let Some(stream_id) = self.resolve_stream_id(&payload.stream_id) else {
-                    return;
-                };
+impl StateHandler for UpdateTopic {
+    type State = StreamsInner;
+    fn apply(&self, state: &mut StreamsInner) {
+        let Some(stream_id) = state.resolve_stream_id(&self.stream_id) else {
+            return;
+        };
+        let Some(topic_id) = state.resolve_topic_id(stream_id, &self.topic_id) else {
+            return;
+        };
 
-                if let Some(stream) = self.items.get(stream_id) {
-                    let name = stream.name.clone();
+        let Some(stream) = state.items.get_mut(stream_id) else {
+            return;
+        };
+        let Some(topic) = stream.topics.get_mut(topic_id) else {
+            return;
+        };
 
-                    self.items.remove(stream_id);
-                    self.index.remove(&name);
-                }
-            }
-            StreamsCommand::PurgeStream(_payload) => {
-                // TODO
-                todo!();
-            }
-            StreamsCommand::CreateTopic(payload) => {
-                let Some(stream_id) = self.resolve_stream_id(&payload.stream_id) else {
-                    return;
-                };
-                let Some(stream) = self.items.get_mut(stream_id) else {
-                    return;
-                };
+        let new_name_arc: Arc<str> = Arc::from(self.name.as_str());
+        if let Some(&existing_id) = stream.topic_index.get(&new_name_arc)
+            && existing_id != topic_id
+        {
+            return;
+        }
 
-                let name_arc: Arc<str> = Arc::from(payload.name.as_str());
-                if stream.topic_index.contains_key(&name_arc) {
-                    return;
-                }
+        stream.topic_index.remove(&topic.name);
+        topic.name = new_name_arc.clone();
+        topic.compression_algorithm = self.compression_algorithm;
+        topic.message_expiry = self.message_expiry;
+        topic.max_topic_size = self.max_topic_size;
+        if let Some(rf) = self.replication_factor {
+            topic.replication_factor = rf;
+        }
+        stream.topic_index.insert(new_name_arc, topic_id);
+    }
+}
 
-                let topic = Topic {
-                    id: 0, // Will be assigned by slab
-                    name: name_arc.clone(),
-                    created_at: iggy_common::IggyTimestamp::now(),
-                    replication_factor: payload.replication_factor.unwrap_or(1),
-                    message_expiry: payload.message_expiry,
-                    compression_algorithm: payload.compression_algorithm,
-                    max_topic_size: payload.max_topic_size,
-                    stats: Arc::new(TopicStats::new(stream.stats.clone())),
-                    partitions: Vec::new(),
-                    round_robin_counter: Arc::new(AtomicUsize::new(0)),
-                };
+impl StateHandler for DeleteTopic {
+    type State = StreamsInner;
+    fn apply(&self, state: &mut StreamsInner) {
+        let Some(stream_id) = state.resolve_stream_id(&self.stream_id) else {
+            return;
+        };
+        let Some(topic_id) = state.resolve_topic_id(stream_id, &self.topic_id) else {
+            return;
+        };
+        let Some(stream) = state.items.get_mut(stream_id) else {
+            return;
+        };
 
-                let topic_id = stream.topics.insert(topic);
-                if let Some(topic) = stream.topics.get_mut(topic_id) {
-                    topic.id = topic_id;
+        if let Some(topic) = stream.topics.get(topic_id) {
+            let name = topic.name.clone();
+            stream.topics.remove(topic_id);
+            stream.topic_index.remove(&name);
+        }
+    }
+}
 
-                    for partition_id in 0..payload.partitions_count as usize {
-                        let partition = Partition {
-                            id: partition_id,
-                            created_at: iggy_common::IggyTimestamp::now(),
-                        };
-                        topic.partitions.push(partition);
-                    }
-                }
+impl StateHandler for PurgeTopic {
+    type State = StreamsInner;
+    fn apply(&self, _state: &mut StreamsInner) {
+        // TODO
+        todo!();
+    }
+}
 
-                stream.topic_index.insert(name_arc, topic_id);
-            }
-            StreamsCommand::UpdateTopic(payload) => {
-                let Some(stream_id) = self.resolve_stream_id(&payload.stream_id) else {
-                    return;
-                };
-                let Some(topic_id) = self.resolve_topic_id(stream_id, &payload.topic_id) else {
-                    return;
-                };
+impl StateHandler for CreatePartitions {
+    type State = StreamsInner;
+    fn apply(&self, state: &mut StreamsInner) {
+        let Some(stream_id) = state.resolve_stream_id(&self.stream_id) else {
+            return;
+        };
+        let Some(topic_id) = state.resolve_topic_id(stream_id, &self.topic_id) else {
+            return;
+        };
 
-                let Some(stream) = self.items.get_mut(stream_id) else {
-                    return;
-                };
-                let Some(topic) = stream.topics.get_mut(topic_id) else {
-                    return;
-                };
+        let Some(stream) = state.items.get_mut(stream_id) else {
+            return;
+        };
+        let Some(topic) = stream.topics.get_mut(topic_id) else {
+            return;
+        };
 
-                let new_name_arc: Arc<str> = Arc::from(payload.name.as_str());
-                if let Some(&existing_id) = stream.topic_index.get(&new_name_arc)
-                    && existing_id != topic_id
-                {
-                    return;
-                }
+        let current_partition_count = topic.partitions.len();
+        for i in 0..self.partitions_count as usize {
+            let partition_id = current_partition_count + i;
+            let partition = Partition {
+                id: partition_id,
+                created_at: iggy_common::IggyTimestamp::now(),
+            };
+            topic.partitions.push(partition);
+        }
+    }
+}
 
-                stream.topic_index.remove(&topic.name);
-                topic.name = new_name_arc.clone();
-                topic.compression_algorithm = payload.compression_algorithm;
-                topic.message_expiry = payload.message_expiry;
-                topic.max_topic_size = payload.max_topic_size;
-                if let Some(rf) = payload.replication_factor {
-                    topic.replication_factor = rf;
-                }
-                stream.topic_index.insert(new_name_arc, topic_id);
-            }
-            StreamsCommand::DeleteTopic(payload) => {
-                let Some(stream_id) = self.resolve_stream_id(&payload.stream_id) else {
-                    return;
-                };
-                let Some(topic_id) = self.resolve_topic_id(stream_id, &payload.topic_id) else {
-                    return;
-                };
-                let Some(stream) = self.items.get_mut(stream_id) else {
-                    return;
-                };
+impl StateHandler for DeletePartitions {
+    type State = StreamsInner;
+    fn apply(&self, state: &mut StreamsInner) {
+        let Some(stream_id) = state.resolve_stream_id(&self.stream_id) else {
+            return;
+        };
+        let Some(topic_id) = state.resolve_topic_id(stream_id, &self.topic_id) else {
+            return;
+        };
 
-                if let Some(topic) = stream.topics.get(topic_id) {
-                    let name = topic.name.clone();
-                    stream.topics.remove(topic_id);
-                    stream.topic_index.remove(&name);
-                }
-            }
-            StreamsCommand::PurgeTopic(_payload) => {
-                // TODO:
-                todo!();
-            }
-            StreamsCommand::CreatePartitions(payload) => {
-                let Some(stream_id) = self.resolve_stream_id(&payload.stream_id) else {
-                    return;
-                };
-                let Some(topic_id) = self.resolve_topic_id(stream_id, &payload.topic_id) else {
-                    return;
-                };
+        let Some(stream) = state.items.get_mut(stream_id) else {
+            return;
+        };
+        let Some(topic) = stream.topics.get_mut(topic_id) else {
+            return;
+        };
 
-                let Some(stream) = self.items.get_mut(stream_id) else {
-                    return;
-                };
-                let Some(topic) = stream.topics.get_mut(topic_id) else {
-                    return;
-                };
-
-                let current_partition_count = topic.partitions.len();
-                for i in 0..payload.partitions_count as usize {
-                    let partition_id = current_partition_count + i;
-                    let partition = Partition {
-                        id: partition_id,
-                        created_at: iggy_common::IggyTimestamp::now(),
-                    };
-                    topic.partitions.push(partition);
-                }
-            }
-            StreamsCommand::DeletePartitions(payload) => {
-                let Some(stream_id) = self.resolve_stream_id(&payload.stream_id) else {
-                    return;
-                };
-                let Some(topic_id) = self.resolve_topic_id(stream_id, &payload.topic_id) else {
-                    return;
-                };
-
-                let Some(stream) = self.items.get_mut(stream_id) else {
-                    return;
-                };
-                let Some(topic) = stream.topics.get_mut(topic_id) else {
-                    return;
-                };
-
-                let count_to_delete = payload.partitions_count as usize;
-                if count_to_delete > 0 && count_to_delete <= topic.partitions.len() {
-                    topic
-                        .partitions
-                        .truncate(topic.partitions.len() - count_to_delete);
-                }
-            }
+        let count_to_delete = self.partitions_count as usize;
+        if count_to_delete > 0 && count_to_delete <= topic.partitions.len() {
+            topic
+                .partitions
+                .truncate(topic.partitions.len() - count_to_delete);
         }
     }
 }

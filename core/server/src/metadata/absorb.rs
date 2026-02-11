@@ -284,11 +284,25 @@ fn apply_op(metadata: &mut InnerMetadata, op: &MetadataOp, populate_ids: bool) {
             group_id,
             client_id,
             member_id,
+            valid_client_ids,
         } => {
             if let Some(stream) = metadata.streams.get_mut(*stream_id)
                 && let Some(topic) = stream.topics.get_mut(*topic_id)
                 && let Some(group) = topic.consumer_groups.get_mut(*group_id)
             {
+                if let Some(valid_ids) = valid_client_ids {
+                    let stale_members: Vec<usize> = group
+                        .members
+                        .iter()
+                        .filter(|(_, m)| !valid_ids.contains(&m.client_id))
+                        .map(|(slot_id, _)| slot_id)
+                        .collect();
+
+                    for slot_id in stale_members {
+                        group.members.remove(slot_id);
+                    }
+                }
+
                 let next_id = group
                     .members
                     .iter()
