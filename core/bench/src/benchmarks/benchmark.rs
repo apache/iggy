@@ -36,6 +36,7 @@ use super::end_to_end_producing_consumer_group::EndToEndProducingConsumerGroupBe
 use super::pinned_consumer::PinnedConsumerBenchmark;
 use super::pinned_producer::PinnedProducerBenchmark;
 use super::pinned_producer_and_consumer::PinnedProducerAndConsumerBenchmark;
+use super::stress::StressBenchmark;
 
 impl From<IggyBenchArgs> for Box<dyn Benchmarkable> {
     fn from(args: IggyBenchArgs) -> Self {
@@ -74,6 +75,9 @@ impl From<IggyBenchArgs> for Box<dyn Benchmarkable> {
             BenchmarkKindCommand::EndToEndProducingConsumerGroup(_) => Box::new(
                 EndToEndProducingConsumerGroupBenchmark::new(Arc::new(args), client_factory),
             ),
+            BenchmarkKindCommand::Stress(_) => {
+                Box::new(StressBenchmark::new(Arc::new(args), client_factory))
+            }
             BenchmarkKindCommand::Examples => {
                 unreachable!("Examples should be handled before this point")
             }

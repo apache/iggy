@@ -77,9 +77,9 @@ pub async fn init_consumer_groups(
     let cg_count = args.number_of_consumer_groups();
 
     login_root(&client).await;
-    for i in 1..=cg_count {
+    for i in 0..cg_count {
         let consumer_group_id = CONSUMER_GROUP_BASE_ID + i;
-        let stream_name = format!("bench-stream-{i}");
+        let stream_name = format!("bench-stream-{}", i + 1);
         let stream_id: Identifier = stream_name.as_str().try_into()?;
         let topic_id: Identifier = "topic-1".try_into()?;
         let consumer_group_name = format!("{CONSUMER_GROUP_NAME_PREFIX}-{consumer_group_id}");
@@ -171,7 +171,8 @@ pub fn build_consumer_futures(
     let origin_timestamp_latency_calculation = match args.kind() {
         BenchmarkKind::PinnedConsumer | BenchmarkKind::BalancedConsumerGroup => false,
         BenchmarkKind::PinnedProducerAndConsumer
-        | BenchmarkKind::BalancedProducerAndConsumerGroup => true,
+        | BenchmarkKind::BalancedProducerAndConsumerGroup
+        | BenchmarkKind::Stress => true,
         _ => unreachable!(),
     };
 
@@ -209,8 +210,9 @@ pub fn build_consumer_futures(
                 consumer_id
             };
             let stream_id = format!("bench-stream-{stream_idx}");
+            // Each stream has exactly one CG, server assigns IDs starting from 0
             let consumer_group_id = if cg_count > 0 {
-                Some(CONSUMER_GROUP_BASE_ID + (consumer_id % cg_count))
+                Some(CONSUMER_GROUP_BASE_ID)
             } else {
                 None
             };

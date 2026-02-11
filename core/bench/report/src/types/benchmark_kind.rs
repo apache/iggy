@@ -59,4 +59,7 @@ pub enum BenchmarkKind {
     #[display("End To End Producing Consumer Group")]
     #[serde(rename = "end_to_end_producing_consumer_group")]
     EndToEndProducingConsumerGroup,
+    #[display("Stress")]
+    #[serde(rename = "stress")]
+    Stress,
 }

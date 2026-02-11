@@ -35,6 +35,7 @@ pub struct HighLevelProducerClient {
     client_factory: Arc<dyn ClientFactory>,
     config: BenchmarkProducerConfig,
     producer: Option<IggyProducer>,
+    next_sequence: u64,
 }
 
 impl HighLevelProducerClient {
@@ -43,6 +44,7 @@ impl HighLevelProducerClient {
             client_factory,
             config,
             producer: None,
+            next_sequence: 0,
         }
     }
 }
@@ -52,10 +54,17 @@ impl ProducerClient for HighLevelProducerClient {
         &mut self,
         batch_generator: &mut BenchmarkBatchGenerator,
     ) -> Result<Option<BatchMetrics>, IggyError> {
-        let batch = batch_generator.generate_owned_batch();
+        let mut batch = batch_generator.generate_owned_batch();
         if batch.messages.is_empty() {
             return Ok(None);
         }
+
+        for msg in &mut batch.messages {
+            msg.header.id =
+                (u128::from(self.config.producer_id) << 64) | u128::from(self.next_sequence);
+            self.next_sequence += 1;
+        }
+
         let message_count = u32::try_from(batch.messages.len()).unwrap();
         let user_data_bytes = batch.user_data_bytes;
         let total_bytes = batch.total_bytes;

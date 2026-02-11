@@ -27,6 +27,10 @@ pub mod end_to_end_producing_consumer_group;
 pub mod pinned_consumer;
 pub mod pinned_producer;
 pub mod pinned_producer_and_consumer;
+pub mod stress;
+pub mod stress_report;
 
 pub const CONSUMER_GROUP_BASE_ID: u32 = 0;
 pub const CONSUMER_GROUP_NAME_PREFIX: &str = "cg";
+pub const BENCH_STREAM_PREFIX: &str = "bench-stream";
+pub const BENCH_TOPIC_NAME: &str = "topic-1";

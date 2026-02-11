@@ -4511,6 +4511,7 @@ dependencies = [
  "hostname",
  "human-repr",
  "iggy",
+ "iggy_common",
  "nonzero_lit",
  "rand 0.10.0",
  "rayon",

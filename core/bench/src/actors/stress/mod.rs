@@ -16,7 +16,9 @@
  * under the License.
  */
 
-pub mod balanced;
-pub mod end_to_end;
-pub mod pinned;
-pub mod stress;
+pub mod admin_exerciser;
+pub mod control_plane_churner;
+pub mod error_classifier;
+pub mod health_monitor;
+pub mod stress_context;
+pub mod verifier;

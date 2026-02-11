@@ -48,6 +48,7 @@ pub fn create_throughput_chart(
             ActorKind::Producer => "Producer",
             ActorKind::Consumer => "Consumer",
             ActorKind::ProducingConsumer => "Producing Consumer",
+            ActorKind::StressActor => "Stress Actor",
         };
 
         chart = chart.add_dual_time_line_series(
@@ -113,6 +114,7 @@ pub fn create_latency_chart(
             ActorKind::Producer => "Producer",
             ActorKind::Consumer => "Consumer",
             ActorKind::ProducingConsumer => "Producing Consumer",
+            ActorKind::StressActor => "Stress Actor",
         };
 
         chart = chart.add_time_series(

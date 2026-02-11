@@ -256,6 +256,7 @@ fn add_benchmark_kind_arguments(parts: &mut Vec<String>, args: &IggyBenchArgs) {
         BenchmarkKind::BalancedProducerAndConsumerGroup => "balanced-producer-and-consumer-group",
         BenchmarkKind::EndToEndProducingConsumer => "end-to-end-producing-consumer",
         BenchmarkKind::EndToEndProducingConsumerGroup => "end-to-end-producing-consumer-group",
+        BenchmarkKind::Stress => "stress",
     };
     parts.push(kind_str.to_string());
 
@@ -281,7 +282,8 @@ fn add_actor_arguments(parts: &mut Vec<String>, args: &IggyBenchArgs) {
             }
         }
         BenchmarkKind::PinnedProducerAndConsumer
-        | BenchmarkKind::BalancedProducerAndConsumerGroup => {
+        | BenchmarkKind::BalancedProducerAndConsumerGroup
+        | BenchmarkKind::Stress => {
             if producers != DEFAULT_NUMBER_OF_PRODUCERS.get() {
                 parts.push(format!("--producers {producers}"));
             }

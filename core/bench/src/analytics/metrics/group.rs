@@ -154,6 +154,7 @@ fn determine_group_kind(stats: &[BenchmarkIndividualMetrics]) -> GroupMetricsKin
         ActorKind::Producer => GroupMetricsKind::Producers,
         ActorKind::Consumer => GroupMetricsKind::Consumers,
         ActorKind::ProducingConsumer => GroupMetricsKind::ProducingConsumers,
+        ActorKind::StressActor => GroupMetricsKind::StressActors,
     }
 }
 

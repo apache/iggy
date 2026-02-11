@@ -73,6 +73,12 @@ impl BenchmarkParams {
                     self.producers, self.consumer_groups
                 )
             }
+            BenchmarkKind::Stress => {
+                format!(
+                    "{} Producers/{} Consumers (Stress)",
+                    self.producers, self.consumers
+                )
+            }
         }
     }
 }

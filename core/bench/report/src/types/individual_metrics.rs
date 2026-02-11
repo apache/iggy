@@ -17,6 +17,7 @@
  */
 
 use super::{
+    actor_kind::ActorKind, benchmark_kind::BenchmarkKind,
     individual_metrics_summary::BenchmarkIndividualMetricsSummary, time_series::TimeSeries,
 };
 use crate::utils::{max, min, std_dev};
@@ -30,6 +31,48 @@ pub struct BenchmarkIndividualMetrics {
     pub throughput_mb_ts: TimeSeries,
     pub throughput_msg_ts: TimeSeries,
     pub latency_ts: TimeSeries,
+}
+
+impl BenchmarkIndividualMetrics {
+    /// Creates a zero-valued placeholder for stress actors that don't produce
+    /// standard throughput/latency metrics (churners, monitors, etc.).
+    pub fn placeholder(actor_name: &str) -> Self {
+        Self {
+            summary: BenchmarkIndividualMetricsSummary {
+                benchmark_kind: BenchmarkKind::Stress,
+                actor_kind: ActorKind::StressActor,
+                actor_id: u32::from_ne_bytes(
+                    actor_name
+                        .as_bytes()
+                        .get(..4)
+                        .unwrap_or(&[0; 4])
+                        .try_into()
+                        .unwrap_or([0; 4]),
+                ),
+                total_time_secs: 0.0,
+                total_user_data_bytes: 0,
+                total_bytes: 0,
+                total_messages: 0,
+                total_message_batches: 0,
+                throughput_megabytes_per_second: 0.0,
+                throughput_messages_per_second: 0.0,
+                p50_latency_ms: 0.0,
+                p90_latency_ms: 0.0,
+                p95_latency_ms: 0.0,
+                p99_latency_ms: 0.0,
+                p999_latency_ms: 0.0,
+                p9999_latency_ms: 0.0,
+                avg_latency_ms: 0.0,
+                median_latency_ms: 0.0,
+                min_latency_ms: 0.0,
+                max_latency_ms: 0.0,
+                std_dev_latency_ms: 0.0,
+            },
+            throughput_mb_ts: TimeSeries::default(),
+            throughput_msg_ts: TimeSeries::default(),
+            latency_ts: TimeSeries::default(),
+        }
+    }
 }
 
 // Custom deserializer implementation

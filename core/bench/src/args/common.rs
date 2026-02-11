@@ -22,7 +22,8 @@ use super::props::{BenchmarkKindProps, BenchmarkTransportProps};
 use super::{
     defaults::{
         DEFAULT_MESSAGE_BATCHES, DEFAULT_MESSAGE_SIZE, DEFAULT_MESSAGES_PER_BATCH,
-        DEFAULT_MOVING_AVERAGE_WINDOW, DEFAULT_SAMPLING_TIME, DEFAULT_WARMUP_TIME,
+        DEFAULT_MOVING_AVERAGE_WINDOW, DEFAULT_RECONNECTION_RETRIES, DEFAULT_SAMPLING_TIME,
+        DEFAULT_WARMUP_TIME,
     },
     transport::BenchmarkTransportCommand,
 };
@@ -80,6 +81,10 @@ pub struct IggyBenchArgs {
     /// Use high-level API for actors
     #[arg(long, short = 'H', default_value_t = false)]
     pub high_level_api: bool,
+
+    /// Max reconnection attempts before giving up. Use 0 for unlimited.
+    #[arg(long, default_value_t = DEFAULT_RECONNECTION_RETRIES)]
+    pub reconnection_retries: u32,
 }
 
 impl IggyBenchArgs {
@@ -118,7 +123,10 @@ impl IggyBenchArgs {
                 .exit();
         }
 
-        if (self.message_batches, self.total_data) == (None, None) {
+        // Stress uses --duration instead of --message-batches/--total-data
+        let is_stress = matches!(self.benchmark_kind, BenchmarkKindCommand::Stress(_));
+
+        if !is_stress && (self.message_batches, self.total_data) == (None, None) {
             self.message_batches = Some(DEFAULT_MESSAGE_BATCHES);
         }
 
@@ -163,11 +171,19 @@ impl IggyBenchArgs {
     }
 
     // Used only for generation of unique directory name
+    #[allow(clippy::option_if_let_else)]
     pub fn data_volume_identifier(&self) -> String {
-        self.total_data().map_or_else(
-            || self.message_batches().unwrap().to_string(),
-            |total_messages_size| format!("{}B", total_messages_size.as_bytes_u64()),
-        )
+        if let Some(total_messages_size) = self.total_data() {
+            format!("{}B", total_messages_size.as_bytes_u64())
+        } else if let Some(batches) = self.message_batches() {
+            batches.to_string()
+        } else if let BenchmarkKindCommand::Stress(args) = &self.benchmark_kind {
+            format!("{}s", args.duration().as_secs())
+        } else {
+            unreachable!(
+                "either --total-messages-size, --message-batches, or --duration must be set"
+            )
+        }
     }
 
     pub fn streams(&self) -> u32 {
@@ -303,6 +319,14 @@ impl IggyBenchArgs {
         self.high_level_api
     }
 
+    pub const fn reconnection_retries(&self) -> Option<u32> {
+        if self.reconnection_retries == 0 {
+            None
+        } else {
+            Some(self.reconnection_retries)
+        }
+    }
+
     /// Generates the output directory name based on benchmark parameters.
     pub fn generate_dir_name(&self) -> String {
         let benchmark_kind = match &self.benchmark_kind {
@@ -318,6 +342,7 @@ impl IggyBenchArgs {
             BenchmarkKindCommand::EndToEndProducingConsumerGroup(_) => {
                 "end_to_end_producing_consumer_group"
             }
+            BenchmarkKindCommand::Stress(_) => "stress",
             BenchmarkKindCommand::Examples => unreachable!(),
         };
 
@@ -336,16 +361,18 @@ impl IggyBenchArgs {
             BenchmarkKindCommand::PinnedConsumer(_)
             | BenchmarkKindCommand::BalancedConsumerGroup(_) => self.consumers(),
             BenchmarkKindCommand::PinnedProducerAndConsumer(_)
-            | BenchmarkKindCommand::BalancedProducerAndConsumerGroup(_) => {
-                self.producers() + self.consumers()
-            }
+            | BenchmarkKindCommand::BalancedProducerAndConsumerGroup(_)
+            | BenchmarkKindCommand::Stress(_) => self.producers() + self.consumers(),
             BenchmarkKindCommand::Examples => unreachable!(),
         };
 
-        let data_volume_arg = match (self.total_data, self.message_batches) {
-            (Some(total), None) => format!("{total}"),
-            (None, Some(batches)) => format!("{batches}"),
-            _ => unreachable!(),
+        let data_volume_arg = match &self.benchmark_kind {
+            BenchmarkKindCommand::Stress(args) => format!("{}", args.duration()),
+            _ => match (self.total_data, self.message_batches) {
+                (Some(total), None) => format!("{total}"),
+                (None, Some(batches)) => format!("{batches}"),
+                _ => unreachable!(),
+            },
         };
 
         let mut parts = vec![
@@ -396,6 +423,14 @@ impl IggyBenchArgs {
                     "{} producing consumers/{} consumer groups",
                     self.producers(),
                     self.consumers()
+                )
+            }
+            BenchmarkKindCommand::Stress(args) => {
+                format!(
+                    "stress {} producers/{} consumers for {}",
+                    self.producers(),
+                    self.consumers(),
+                    args.duration()
                 )
             }
             BenchmarkKindCommand::Examples => unreachable!(),

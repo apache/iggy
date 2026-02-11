@@ -22,8 +22,9 @@ use async_trait::async_trait;
 use iggy::http::http_client::HttpClient;
 use iggy::prelude::{
     Client, ClientWrapper, DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME, HttpClientConfig,
-    IdentityInfo, IggyClient, QuicClientConfig, TcpClient, TcpClientConfig, TransportProtocol,
-    UserClient, WebSocketClientConfig,
+    IdentityInfo, IggyClient, QuicClientConfig, QuicClientReconnectionConfig, TcpClient,
+    TcpClientConfig, TcpClientReconnectionConfig, TransportProtocol, UserClient,
+    WebSocketClientConfig, WebSocketClientReconnectionConfig,
 };
 use iggy::quic::quic_client::QuicClient;
 use iggy::websocket::websocket_client::WebSocketClient;
@@ -76,6 +77,7 @@ pub struct TcpClientFactory {
     pub tls_domain: String,
     pub tls_ca_file: Option<String>,
     pub tls_validate_certificate: bool,
+    pub reconnection_retries: Option<u32>,
 }
 
 #[async_trait]
@@ -88,6 +90,10 @@ impl ClientFactory for TcpClientFactory {
             tls_domain: self.tls_domain.clone(),
             tls_ca_file: self.tls_ca_file.clone(),
             tls_validate_certificate: self.tls_validate_certificate,
+            reconnection: TcpClientReconnectionConfig {
+                max_retries: self.reconnection_retries,
+                ..TcpClientReconnectionConfig::default()
+            },
             ..TcpClientConfig::default()
         };
         let client = TcpClient::create(Arc::new(config)).unwrap_or_else(|e| {
@@ -127,6 +133,7 @@ impl ClientFactory for TcpClientFactory {
 #[derive(Debug, Clone)]
 pub struct QuicClientFactory {
     pub server_addr: String,
+    pub reconnection_retries: Option<u32>,
 }
 
 #[async_trait]
@@ -135,6 +142,10 @@ impl ClientFactory for QuicClientFactory {
         let config = QuicClientConfig {
             server_address: self.server_addr.clone(),
             max_idle_timeout: 2_000_000,
+            reconnection: QuicClientReconnectionConfig {
+                max_retries: self.reconnection_retries,
+                ..QuicClientReconnectionConfig::default()
+            },
             ..QuicClientConfig::default()
         };
         let client = QuicClient::create(Arc::new(config)).unwrap();
@@ -154,6 +165,7 @@ impl ClientFactory for QuicClientFactory {
 #[derive(Debug, Clone)]
 pub struct WebSocketClientFactory {
     pub server_addr: String,
+    pub reconnection_retries: Option<u32>,
 }
 
 #[async_trait]
@@ -161,6 +173,10 @@ impl ClientFactory for WebSocketClientFactory {
     async fn create_client(&self) -> ClientWrapper {
         let config = WebSocketClientConfig {
             server_address: self.server_addr.clone(),
+            reconnection: WebSocketClientReconnectionConfig {
+                max_retries: self.reconnection_retries,
+                ..WebSocketClientReconnectionConfig::default()
+            },
             ..WebSocketClientConfig::default()
         };
         let client = WebSocketClient::create(Arc::new(config)).unwrap();
@@ -178,6 +194,7 @@ impl ClientFactory for WebSocketClientFactory {
 }
 
 pub fn create_client_factory(args: &IggyBenchArgs) -> Arc<dyn ClientFactory> {
+    let reconnection_retries = args.reconnection_retries();
     match &args.transport() {
         TransportProtocol::Http => Arc::new(HttpClientFactory {
             server_addr: args.server_address().to_owned(),
@@ -192,6 +209,7 @@ pub fn create_client_factory(args: &IggyBenchArgs) -> Arc<dyn ClientFactory> {
                     tls_domain: tcp_args.tls_domain.clone(),
                     tls_ca_file: tcp_args.tls_ca_file.clone(),
                     tls_validate_certificate: tcp_args.tls_validate_certificate,
+                    reconnection_retries,
                 })
             } else {
                 unreachable!("Transport is TCP but transport command is not TcpArgs")
@@ -199,9 +217,11 @@ pub fn create_client_factory(args: &IggyBenchArgs) -> Arc<dyn ClientFactory> {
         }
         TransportProtocol::Quic => Arc::new(QuicClientFactory {
             server_addr: args.server_address().to_owned(),
+            reconnection_retries,
         }),
         TransportProtocol::WebSocket => Arc::new(WebSocketClientFactory {
             server_addr: args.server_address().to_owned(),
+            reconnection_retries,
         }),
     }
 }

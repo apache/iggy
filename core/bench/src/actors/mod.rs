@@ -23,6 +23,7 @@ use iggy::prelude::IggyError;
 pub mod consumer;
 pub mod producer;
 pub mod producing_consumer;
+pub mod stress;
 
 #[derive(Debug, Clone)]
 pub struct BatchMetrics {
