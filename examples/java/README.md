@@ -68,14 +68,14 @@ IGGY_HTTP_ENABLED=true IGGY_TCP_ADDRESS=0.0.0.0:8090 cargo run --bin iggy-server
 
 The Iggy Java SDK provides two client types: **blocking (synchronous)** and **async (non-blocking)**. Choose based on your use case:
 
-### Use Blocking Client when:
+### Use Blocking Client When
 
 - Message rate < 1000/sec
 - Writing scripts, CLI tools, or simple applications
 - Sequential code is easier to reason about
 - Integration tests
 
-### Use Async Client when:
+### Use Async Client When
 
 - Need > 5000 msg/sec throughput
 - Application is already async/reactive (Spring WebFlux, Vert.x)
@@ -107,6 +107,7 @@ Demonstrates basic message production using the synchronous client:
 ```
 
 Shows:
+
 - Client connection and authentication
 - Stream and topic creation
 - Batch message sending (recommended for efficiency)
@@ -121,6 +122,7 @@ Demonstrates message consumption using the synchronous client:
 ```
 
 Shows:
+
 - Consumer group creation and membership
 - Continuous message polling with backpressure handling
 - Offset management (auto-commit)
@@ -137,6 +139,7 @@ High-throughput async production with pipelining:
 ```
 
 Shows:
+
 - CompletableFuture chaining patterns
 - Pipelining multiple sends without blocking
 - Performance comparison with blocking client
@@ -150,6 +153,7 @@ Non-blocking async consumption with advanced patterns:
 ```
 
 Shows:
+
 - Backpressure management (don't poll faster than you can process)
 - Error recovery with exponential backoff
 - Thread pool separation (Netty I/O threads vs. processing threads)
@@ -158,6 +162,7 @@ Shows:
 **CRITICAL ASYNC PATTERN - Thread Pool Management:**
 
 The async client uses Netty's event loop threads for I/O operations. **NEVER** block these threads with:
+
 - `.join()` or `.get()` inside `thenApply/thenAccept`
 - `Thread.sleep()`
 - Blocking database calls

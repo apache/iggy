@@ -25,6 +25,7 @@ import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.Partitioning;
+import org.apache.iggy.topic.CompressionAlgorithm;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -133,7 +134,7 @@ public final class BlockingProducer {
                     .createTopic(
                             StreamId.of(STREAM_NAME),
                             (long) PARTITION_COUNT, // partitionCount
-                            null, // compressionAlgorithm (null = none)
+                            CompressionAlgorithm.None, // compressionAlgorithm
                             BigInteger.ZERO, // messageExpiry (0 = never)
                             BigInteger.ZERO, // maxTopicSize (0 = unlimited)
                             Optional.empty(), // replicationFactor
