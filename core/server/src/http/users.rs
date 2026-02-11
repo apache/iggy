@@ -298,7 +298,11 @@ async fn change_password(
         })?;
 
     {
-        let entry_command = EntryCommand::ChangePassword(command);
+        let entry_command = EntryCommand::ChangePassword(ChangePassword {
+            user_id: command.user_id,
+            current_password: "".into(),
+            new_password: crypto::hash_password(&command.new_password),
+        });
         let future = SendWrapper::new(
             state
                 .shard
