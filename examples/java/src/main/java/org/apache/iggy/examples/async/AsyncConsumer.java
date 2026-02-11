@@ -22,7 +22,6 @@ package org.apache.iggy.examples.async;
 import org.apache.iggy.Iggy;
 import org.apache.iggy.client.async.tcp.AsyncIggyTcpClient;
 import org.apache.iggy.consumergroup.Consumer;
-import org.apache.iggy.identifier.ConsumerId;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
 import org.apache.iggy.message.Message;
@@ -31,12 +30,14 @@ import org.apache.iggy.message.PollingStrategy;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.math.BigInteger;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Async Consumer Example - Backpressure and Error Handling
@@ -80,12 +81,13 @@ public final class AsyncConsumer {
     private static final String PASSWORD = "iggy";
     private static final String STREAM_NAME = "async-example-stream";
     private static final String TOPIC_NAME = "async-example-topic";
-    private static final String CONSUMER_GROUP_NAME = "async-consumer-group";
-    private static final long CONSUMER_ID = 1L;
+    private static final long PARTITION_ID = 0L;
+    private static final long CONSUMER_ID = 0L;
 
     // Polling configuration
     private static final int POLL_BATCH_SIZE = 100;
     private static final int POLL_INTERVAL_MS = 1000;
+    private static final int BATCHES_LIMIT = 5; // Exit after receiving this many batches
 
     // Error recovery configuration
     private static final int MAX_RETRY_ATTEMPTS = 5;
@@ -136,11 +138,8 @@ public final class AsyncConsumer {
 
             log.info("Connected successfully");
 
-            // 2. Setup consumer group and join
+            // 2. Poll messages continuously with backpressure
             AsyncIggyTcpClient finalClient = client;
-            setupAndJoinConsumerGroup(finalClient).join();
-
-            // 3. Poll messages continuously with backpressure
             pollMessagesAsync(finalClient, processingPool).join();
 
             log.info("=== Consumer stopped gracefully ===");
@@ -173,36 +172,14 @@ public final class AsyncConsumer {
         }
     }
 
-    private static CompletableFuture<Void> setupAndJoinConsumerGroup(AsyncIggyTcpClient client) {
-        StreamId streamId = StreamId.of(STREAM_NAME);
-        TopicId topicId = TopicId.of(TOPIC_NAME);
-
-        // NOTE: The async ConsumerGroupsClient only has join/leave methods.
-        // Consumer group creation is managed through admin APIs (not shown here for simplicity).
-        // In a real application, you'd create the consumer group using the system/admin client
-        // before starting consumers. For this example, we assume the group exists.
-
-        // Join the consumer group
-        // IMPORTANT: Consumer group membership is per-connection.
-        // Each client instance that joins counts as a separate member.
-        log.info("Joining consumer group '{}'...", CONSUMER_GROUP_NAME);
-        return client.consumerGroups()
-                .joinConsumerGroup(streamId, topicId, ConsumerId.of(CONSUMER_ID))
-                .thenRun(() -> log.info("Joined consumer group successfully"))
-                .exceptionally(e -> {
-                    log.error("Failed to join consumer group '{}': {}", CONSUMER_GROUP_NAME, e.getMessage());
-                    log.info("Make sure the consumer group exists before running this example.");
-                    log.info("You can create it using the blocking client or CLI.");
-                    throw new RuntimeException("Consumer group does not exist", e);
-                });
-    }
-
     private static CompletableFuture<Void> pollMessagesAsync(
             AsyncIggyTcpClient client, ExecutorService processingPool) {
-        log.info("Starting async polling loop (Ctrl+C to stop)...");
+        log.info("Starting async polling loop (limit: {} batches)...", BATCHES_LIMIT);
 
         AtomicInteger totalReceived = new AtomicInteger(0);
         AtomicInteger emptyPolls = new AtomicInteger(0);
+        AtomicInteger consumedBatches = new AtomicInteger(0);
+        AtomicReference<BigInteger> offset = new AtomicReference<>(BigInteger.ZERO);
 
         // RECURSIVE ASYNC POLLING PATTERN:
         // Each poll schedules the next poll after processing completes.
@@ -210,7 +187,7 @@ public final class AsyncConsumer {
         // until we've finished processing the current batch.
 
         CompletableFuture<Void> pollingLoop = new CompletableFuture<>();
-        pollBatch(client, processingPool, totalReceived, emptyPolls, 0, pollingLoop);
+        pollBatch(client, processingPool, totalReceived, emptyPolls, consumedBatches, offset, 0, pollingLoop);
         return pollingLoop;
     }
 
@@ -219,27 +196,32 @@ public final class AsyncConsumer {
             ExecutorService processingPool,
             AtomicInteger totalReceived,
             AtomicInteger emptyPolls,
+            AtomicInteger consumedBatches,
+            AtomicReference<BigInteger> offset,
             int retryAttempt,
             CompletableFuture<Void> loopFuture) {
-        if (!running) {
-            log.info("Stopped polling. Total messages received: {}", totalReceived.get());
+        if (!running || consumedBatches.get() >= BATCHES_LIMIT) {
+            log.info(
+                    "Finished consuming {} batches. Total messages received: {}",
+                    consumedBatches.get(),
+                    totalReceived.get());
             loopFuture.complete(null);
             return;
         }
 
         StreamId streamId = StreamId.of(STREAM_NAME);
         TopicId topicId = TopicId.of(TOPIC_NAME);
+        Consumer consumer = Consumer.of(CONSUMER_ID);
 
         client.messages()
                 .pollMessages(
                         streamId,
                         topicId,
-                        Optional.empty(), // Server assigns partition
-                        Consumer.group(CONSUMER_ID),
-                        PollingStrategy.next(),
+                        Optional.of(PARTITION_ID),
+                        consumer,
+                        PollingStrategy.offset(offset.get()),
                         (long) POLL_BATCH_SIZE,
-                        true // Auto-commit
-                        )
+                        false)
                 .thenComposeAsync(
                         polled -> {
                             // OFFLOAD TO PROCESSING POOL:
@@ -249,6 +231,10 @@ public final class AsyncConsumer {
                             int messageCount = polled.messages().size();
 
                             if (messageCount > 0) {
+                                // Update offset for next poll
+                                offset.updateAndGet(current -> current.add(BigInteger.valueOf(messageCount)));
+                                consumedBatches.incrementAndGet();
+
                                 return processMessages(polled, totalReceived, processingPool)
                                         .thenRun(() -> emptyPolls.set(0));
                             } else {
@@ -271,7 +257,8 @@ public final class AsyncConsumer {
                         processingPool)
                 .thenRun(() -> {
                     // SUCCESS: Reset retry counter and schedule next poll
-                    pollBatch(client, processingPool, totalReceived, emptyPolls, 0, loopFuture);
+                    pollBatch(
+                            client, processingPool, totalReceived, emptyPolls, consumedBatches, offset, 0, loopFuture);
                 })
                 .exceptionally(e -> {
                     // ERROR RECOVERY WITH EXPONENTIAL BACKOFF:
@@ -299,6 +286,8 @@ public final class AsyncConsumer {
                                             processingPool,
                                             totalReceived,
                                             emptyPolls,
+                                            consumedBatches,
+                                            offset,
                                             retryAttempt + 1,
                                             loopFuture);
                                 },

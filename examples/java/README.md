@@ -123,9 +123,9 @@ Demonstrates message consumption using the synchronous client:
 
 Shows:
 
-- Consumer group creation and membership
-- Continuous message polling with backpressure handling
-- Offset management (auto-commit)
+- Continuous message polling from a specific partition
+- Offset-based consumption tracking
+- Configurable batch limits
 - Graceful shutdown
 
 ## Async Client Examples
@@ -157,7 +157,7 @@ Shows:
 - Backpressure management (don't poll faster than you can process)
 - Error recovery with exponential backoff
 - Thread pool separation (Netty I/O threads vs. processing threads)
-- Consumer group join/leave for TCP clients
+- Offset-based polling with CompletableFuture
 
 **CRITICAL ASYNC PATTERN - Thread Pool Management:**
 

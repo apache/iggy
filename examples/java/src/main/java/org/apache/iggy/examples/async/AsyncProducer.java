@@ -25,6 +25,7 @@ import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.Partitioning;
+import org.apache.iggy.topic.CompressionAlgorithm;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -175,7 +176,7 @@ public final class AsyncProducer {
                         .createTopic(
                                 StreamId.of(STREAM_NAME),
                                 (long) PARTITION_COUNT,
-                                null,
+                                CompressionAlgorithm.None,
                                 BigInteger.ZERO,
                                 BigInteger.ZERO,
                                 Optional.empty(),
