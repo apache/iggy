@@ -62,16 +62,14 @@ macro_rules! variadic {
     ($a:expr,  $( $b:tt )+) => ( ($a, variadic!( $( $b )* )) );
 }
 
-// TODO: Figure out how to get around the fact that we need to hardcode the Input/Output type for base case.
-// TODO: I think we could move the base case to the impl site of `State`, so this way we know the `Input` and `Output` types.
-// Base case of the recursive resolution.
+// Base case: panics if no state machine in the chain accepted the input.
 impl StateMachine for () {
     type Input = Message<PrepareHeader>;
-    // TODO: Make sure that the `Output` matches to the output type of the rest of list.
-    // TODO: Add a trait bound to the output that will allow us to get the response in bytes.
     type Output = ();
 
-    fn update(&self, _input: Self::Input) -> Self::Output {}
+    fn update(&self, _input: Self::Input) -> Self::Output {
+        panic!("unhandled command: no state machine accepted the input");
+    }
 }
 
 // Recursive case: process head and recurse on tail
@@ -137,28 +135,98 @@ where
     }
 }
 
-#[allow(unused_imports)]
+#[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stm::State;
     use crate::stm::consumer_group::{ConsumerGroups, ConsumerGroupsInner};
+    use crate::stm::mux::MuxStateMachine;
     use crate::stm::snapshot::{FillSnapshot, MetadataSnapshot, RestoreSnapshot, Snapshotable};
     use crate::stm::stream::{Streams, StreamsInner};
     use crate::stm::user::{Users, UsersInner};
+    use bytes::{Bytes, BytesMut};
+    use iggy_common::BytesSerializable;
+    use iggy_common::header::{Command2, Operation, PrepareHeader};
+    use iggy_common::message::Message;
+    use std::mem;
+
+    fn build_prepare_message(operation: Operation, body: Bytes) -> Message<PrepareHeader> {
+        let header_size = mem::size_of::<PrepareHeader>();
+        let total_size = header_size + body.len();
+        let mut buffer = BytesMut::zeroed(total_size);
+
+        let header = bytemuck::from_bytes_mut::<PrepareHeader>(&mut buffer[..header_size]);
+        header.command = Command2::Prepare;
+        header.operation = operation;
+        header.size = total_size as u32;
+
+        buffer[header_size..].copy_from_slice(&body);
+        Message::<PrepareHeader>::from_bytes(buffer.freeze()).unwrap()
+    }
 
     #[test]
-    fn construct_mux_state_machine_from_states_with_same_output() {
-        use crate::stm::StateMachine;
-        use crate::stm::mux::MuxStateMachine;
-        use crate::stm::stream::{Streams, StreamsInner};
-        use crate::stm::user::{Users, UsersInner};
-        use iggy_common::header::PrepareHeader;
-        use iggy_common::message::Message;
+    fn create_stream_applies_and_is_readable() {
+        let streams: Streams = StreamsInner::new().into();
 
+        let cmd = iggy_common::create_stream::CreateStream {
+            name: "test".to_string(),
+        };
+        let msg = build_prepare_message(Operation::CreateStream, cmd.to_bytes());
+
+        let result = streams.apply(msg);
+        assert!(result.is_ok());
+
+        streams.with_state(|inner| {
+            assert_eq!(inner.items.len(), 1);
+            assert_eq!(inner.index.len(), 1);
+
+            let (id, stream) = inner.items.iter().next().unwrap();
+            assert_eq!(stream.name.as_ref(), "test");
+            assert_eq!(stream.id, id);
+            assert_eq!(inner.index.get("test"), Some(&id));
+        });
+    }
+
+    #[test]
+    fn create_user_applies_and_is_readable() {
+        let users: Users = UsersInner::new().into();
+
+        let cmd = iggy_common::create_user::CreateUser {
+            username: "admin".to_string(),
+            password: "secret123".to_string(),
+            status: iggy_common::UserStatus::Active,
+            permissions: None,
+        };
+        let msg = build_prepare_message(Operation::CreateUser, cmd.to_bytes());
+
+        let result = users.apply(msg);
+        assert!(result.is_ok());
+
+        users.with_state(|inner| {
+            assert_eq!(inner.items.len(), 1);
+            assert_eq!(inner.index.len(), 1);
+
+            let (id, user) = inner.items.iter().next().unwrap();
+            assert_eq!(user.username.as_ref(), "admin");
+            assert_eq!(user.id, id as iggy_common::UserId);
+            assert_eq!(user.status, iggy_common::UserStatus::Active);
+            assert_eq!(inner.index.get("admin"), Some(&(id as iggy_common::UserId)));
+            assert!(
+                inner
+                    .personal_access_tokens
+                    .contains_key(&(id as iggy_common::UserId))
+            );
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "unhandled command: no state machine accepted the input")]
+    fn unhandled_operation_falls_through() {
         let users: Users = UsersInner::new().into();
         let streams: Streams = StreamsInner::new().into();
         let mux = MuxStateMachine::new(variadic!(users, streams));
 
-        let input = Message::new(std::mem::size_of::<PrepareHeader>());
+        let input = Message::new(mem::size_of::<PrepareHeader>());
 
         mux.update(input);
     }
