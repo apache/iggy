@@ -86,7 +86,7 @@ pub const REPLICAS_MAX: usize = 32;
 
 #[derive(Debug)]
 pub struct PipelineEntry {
-    pub message: Message<PrepareHeader>,
+    pub header: PrepareHeader,
     /// Bitmap of replicas that have acknowledged this prepare.
     pub ok_from_replicas: BitSet<u32>,
     /// Whether we've received a quorum of prepare_ok messages.
@@ -94,9 +94,9 @@ pub struct PipelineEntry {
 }
 
 impl PipelineEntry {
-    pub fn new(message: Message<PrepareHeader>) -> Self {
+    pub fn new(header: PrepareHeader) -> Self {
         Self {
-            message,
+            header,
             ok_from_replicas: BitSet::with_capacity(REPLICAS_MAX),
             ok_quorum_received: false,
         }
@@ -180,11 +180,10 @@ impl LocalPipeline {
     pub fn push_message(&mut self, message: Message<PrepareHeader>) {
         assert!(!self.prepare_queue_full(), "prepare queue is full");
 
-        let header = message.header();
+        let header = *message.header();
 
-        // Verify hash chain if there's a previous entry
         if let Some(tail) = self.prepare_queue.back() {
-            let tail_header = tail.message.header();
+            let tail_header = &tail.header;
             assert_eq!(
                 header.op,
                 tail_header.op + 1,
@@ -199,7 +198,7 @@ impl LocalPipeline {
             assert!(header.view >= tail_header.view, "view cannot go backwards");
         }
 
-        self.prepare_queue.push_back(PipelineEntry::new(message));
+        self.prepare_queue.push_back(PipelineEntry::new(header));
     }
 
     /// Pop the oldest message (after it's been committed).
@@ -224,8 +223,8 @@ impl LocalPipeline {
 
     /// Find a message by op number and checksum (immutable).
     pub fn message_by_op_and_checksum(&self, op: u64, checksum: u128) -> Option<&PipelineEntry> {
-        let head_op = self.prepare_queue.front()?.message.header().op;
-        let tail_op = self.prepare_queue.back()?.message.header().op;
+        let head_op = self.prepare_queue.front()?.header.op;
+        let tail_op = self.prepare_queue.back()?.header.op;
 
         // Verify consecutive ops invariant
         debug_assert_eq!(
@@ -241,9 +240,9 @@ impl LocalPipeline {
         let index = (op - head_op) as usize;
         let entry = self.prepare_queue.get(index)?;
 
-        debug_assert_eq!(entry.message.header().op, op);
+        debug_assert_eq!(entry.header.op, op);
 
-        if entry.message.header().checksum == checksum {
+        if entry.header.checksum == checksum {
             Some(entry)
         } else {
             None
@@ -252,7 +251,7 @@ impl LocalPipeline {
 
     /// Find a message by op number only.
     pub fn message_by_op(&self, op: u64) -> Option<&PipelineEntry> {
-        let head_op = self.prepare_queue.front()?.message.header().op;
+        let head_op = self.prepare_queue.front()?.header.op;
 
         if op < head_op {
             return None;
@@ -265,7 +264,7 @@ impl LocalPipeline {
     /// Get mutable reference to a message entry by op number.
     /// Returns None if op is not in the pipeline.
     pub fn message_by_op_mut(&mut self, op: u64) -> Option<&mut PipelineEntry> {
-        let head_op = self.prepare_queue.front()?.message.header().op;
+        let head_op = self.prepare_queue.front()?.header.op;
         if op < head_op {
             return None;
         }
@@ -286,9 +285,7 @@ impl LocalPipeline {
     /// If there are multiple messages (possible in prepare_queue after view change),
     /// returns the latest one.
     pub fn has_message_from_client(&self, client: u128) -> bool {
-        self.prepare_queue
-            .iter()
-            .any(|p| p.message.header().client == client)
+        self.prepare_queue.iter().any(|p| p.header.client == client)
     }
 
     /// Verify pipeline invariants.
@@ -301,11 +298,11 @@ impl LocalPipeline {
 
         // Verify prepare queue hash chain
         if let Some(head) = self.prepare_queue.front() {
-            let mut expected_op = head.message.header().op;
-            let mut expected_parent = head.message.header().parent;
+            let mut expected_op = head.header.op;
+            let mut expected_parent = head.header.parent;
 
             for entry in &self.prepare_queue {
-                let header = entry.message.header();
+                let header = &entry.header;
 
                 assert_eq!(header.op, expected_op, "ops must be sequential");
                 assert_eq!(header.parent, expected_parent, "must be hash-chained");
@@ -324,7 +321,7 @@ impl LocalPipeline {
     /// Extract and remove a message by op number.
     /// Returns None if op is not in the pipeline.
     pub fn extract_by_op(&mut self, op: u64) -> Option<PipelineEntry> {
-        let head_op = self.prepare_queue.front()?.message.header().op;
+        let head_op = self.prepare_queue.front()?.header.op;
         if op < head_op {
             return None;
         }
@@ -409,9 +406,10 @@ pub enum VsrAction {
 
 #[allow(unused)]
 #[derive(Debug)]
-pub struct VsrConsensus<B = IggyMessageBus>
+pub struct VsrConsensus<B = IggyMessageBus, P = LocalPipeline>
 where
     B: MessageBus,
+    P: Pipeline,
 {
     cluster: u128,
     replica: u8,
@@ -436,7 +434,7 @@ where
     last_timestamp: Cell<u64>,
     last_prepare_checksum: Cell<u128>,
 
-    pipeline: RefCell<LocalPipeline>,
+    pipeline: RefCell<P>,
 
     message_bus: B,
     // TODO: Add loopback_queue for messages to self
@@ -456,8 +454,8 @@ where
     timeouts: RefCell<TimeoutManager>,
 }
 
-impl<B: MessageBus> VsrConsensus<B> {
-    pub fn new(cluster: u128, replica: u8, replica_count: u8, message_bus: B) -> Self {
+impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
+    pub fn new(cluster: u128, replica: u8, replica_count: u8, message_bus: B, pipeline: P) -> Self {
         assert!(
             replica < replica_count,
             "replica index must be < replica_count"
@@ -474,7 +472,7 @@ impl<B: MessageBus> VsrConsensus<B> {
             commit: Cell::new(0),
             last_timestamp: Cell::new(0),
             last_prepare_checksum: Cell::new(0),
-            pipeline: RefCell::new(LocalPipeline::new()),
+            pipeline: RefCell::new(pipeline),
             message_bus,
             start_view_change_from_all_replicas: RefCell::new(BitSet::with_capacity(REPLICAS_MAX)),
             do_view_change_from_all_replicas: RefCell::new(dvc_quorum_array_empty()),
@@ -546,11 +544,14 @@ impl<B: MessageBus> VsrConsensus<B> {
         self.status.get()
     }
 
-    pub fn pipeline(&self) -> &RefCell<LocalPipeline> {
+    // TODO(hubcio): returning &RefCell<P> leaks interior mutability - callers
+    // could hold a Ref/RefMut across an .await and cause a runtime panic.
+    // We had this problem with slab + ECS.
+    pub fn pipeline(&self) -> &RefCell<P> {
         &self.pipeline
     }
 
-    pub fn pipeline_mut(&mut self) -> &mut RefCell<LocalPipeline> {
+    pub fn pipeline_mut(&mut self) -> &mut RefCell<P> {
         &mut self.pipeline
     }
 
@@ -1060,7 +1061,7 @@ impl<B: MessageBus> VsrConsensus<B> {
         };
 
         // Verify checksum matches
-        if entry.message.header().checksum != header.prepare_checksum {
+        if entry.header.checksum != header.prepare_checksum {
             return false;
         }
 
@@ -1087,8 +1088,12 @@ impl<B: MessageBus> VsrConsensus<B> {
     }
 }
 
-impl<B: MessageBus> Project<Message<PrepareHeader>, VsrConsensus<B>> for Message<RequestHeader> {
-    fn project(self, consensus: &VsrConsensus<B>) -> Message<PrepareHeader> {
+impl<B, P> Project<Message<PrepareHeader>, VsrConsensus<B, P>> for Message<RequestHeader>
+where
+    B: MessageBus,
+    P: Pipeline<Message = Message<PrepareHeader>, Entry = PipelineEntry>,
+{
+    fn project(self, consensus: &VsrConsensus<B, P>) -> Message<PrepareHeader> {
         let op = consensus.sequencer.current_sequence() + 1;
 
         self.transmute_header(|old, new| {
@@ -1114,8 +1119,12 @@ impl<B: MessageBus> Project<Message<PrepareHeader>, VsrConsensus<B>> for Message
     }
 }
 
-impl<B: MessageBus> Project<Message<PrepareOkHeader>, VsrConsensus<B>> for Message<PrepareHeader> {
-    fn project(self, consensus: &VsrConsensus<B>) -> Message<PrepareOkHeader> {
+impl<B, P> Project<Message<PrepareOkHeader>, VsrConsensus<B, P>> for Message<PrepareHeader>
+where
+    B: MessageBus,
+    P: Pipeline<Message = Message<PrepareHeader>, Entry = PipelineEntry>,
+{
+    fn project(self, consensus: &VsrConsensus<B, P>) -> Message<PrepareOkHeader> {
         self.transmute_header(|old, new| {
             *new = PrepareOkHeader {
                 command: Command2::PrepareOk,
@@ -1138,15 +1147,25 @@ impl<B: MessageBus> Project<Message<PrepareOkHeader>, VsrConsensus<B>> for Messa
     }
 }
 
-impl<B: MessageBus> Consensus for VsrConsensus<B> {
+impl<B, P> Consensus for VsrConsensus<B, P>
+where
+    B: MessageBus,
+    P: Pipeline<Message = Message<PrepareHeader>, Entry = PipelineEntry>,
+{
     type MessageBus = B;
 
     type RequestMessage = Message<RequestHeader>;
     type ReplicateMessage = Message<PrepareHeader>;
     type AckMessage = Message<PrepareOkHeader>;
     type Sequencer = LocalSequencer;
-    type Pipeline = LocalPipeline;
+    type Pipeline = P;
 
+    // TODO(hubcio): maybe we could record the primary's own ack here
+    // (entry.add_ack(self.replica)) instead of round-tripping through
+    // the message bus via send_prepare_ok.
+    // This avoids serialization/queuing overhead and would also allow
+    // reordering to WAL-first (on_replicate before pipeline_message)
+    // without risking lost self-acks from dispatch timing.
     fn pipeline_message(&self, message: Self::ReplicateMessage) {
         assert!(self.is_primary(), "only primary can pipeline messages");
 

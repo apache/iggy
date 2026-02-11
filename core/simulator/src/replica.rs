@@ -19,7 +19,7 @@ use crate::bus::{MemBus, SharedMemBus};
 use crate::deps::{
     MemStorage, ReplicaPartitions, SimJournal, SimMetadata, SimMuxStateMachine, SimSnapshot,
 };
-use consensus::VsrConsensus;
+use consensus::{LocalPipeline, VsrConsensus};
 use metadata::stm::consumer_group::{ConsumerGroups, ConsumerGroupsInner};
 use metadata::stm::stream::{Streams, StreamsInner};
 use metadata::stm::user::{Users, UsersInner};
@@ -48,6 +48,7 @@ impl Replica {
             id,
             replica_count,
             SharedMemBus(Arc::clone(&bus)),
+            LocalPipeline::new(),
         );
         consensus.init();
 
