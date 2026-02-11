@@ -562,7 +562,7 @@ async fn handle_request(
             let command = iggy_common::change_password::ChangePassword {
                 user_id,
                 current_password: "".into(),
-                new_password: crate::streaming::utils::crypto::hash_password(&new_password),
+                new_password: crypto::hash_password(&new_password),
             };
             shard
                 .state
