@@ -142,6 +142,7 @@ impl BenchmarkGroupMetrics {
             GroupMetricsKind::Consumers => ("Consumers Results", Color::Green),
             GroupMetricsKind::ProducersAndConsumers => ("Aggregate Results", Color::Red),
             GroupMetricsKind::ProducingConsumers => ("Producing Consumer Results", Color::Red),
+            GroupMetricsKind::StressActors => ("Stress Actor Results", Color::Yellow),
         };
 
         let actor = self.summary.kind.actor();

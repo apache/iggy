@@ -43,6 +43,7 @@ governor = { workspace = true }
 hostname = { workspace = true }
 human-repr = { workspace = true }
 iggy = { workspace = true }
+iggy_common = { workspace = true }
 nonzero_lit = { workspace = true }
 rand = { workspace = true }
 rayon = { workspace = true }

@@ -50,3 +50,4 @@ pub const DEFAULT_WARMUP_TIME: &str = "0s";
 
 pub const DEFAULT_SAMPLING_TIME: &str = "10ms";
 pub const DEFAULT_MOVING_AVERAGE_WINDOW: u32 = 20;
+pub const DEFAULT_RECONNECTION_RETRIES: u32 = 5;

@@ -39,6 +39,7 @@ pub struct LowLevelProducerClient {
     stream_id: Identifier,
     topic_id: Identifier,
     partitioning: Partitioning,
+    next_sequence: u64,
 }
 
 impl LowLevelProducerClient {
@@ -50,6 +51,7 @@ impl LowLevelProducerClient {
             stream_id: Identifier::default(),
             topic_id: Identifier::default(),
             partitioning: Partitioning::partition_id(0),
+            next_sequence: 0,
         }
     }
 }
@@ -63,6 +65,12 @@ impl ProducerClient for LowLevelProducerClient {
         let batch = batch_generator.generate_batch();
         if batch.messages.is_empty() {
             return Ok(None);
+        }
+
+        for msg in &mut batch.messages {
+            msg.header.id =
+                (u128::from(self.config.producer_id) << 64) | u128::from(self.next_sequence);
+            self.next_sequence += 1;
         }
 
         let before_send = Instant::now();

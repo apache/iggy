@@ -30,6 +30,9 @@ pub enum ActorKind {
     #[display("Producing Consumer")]
     #[serde(rename = "producing_consumer")]
     ProducingConsumer,
+    #[display("Stress Actor")]
+    #[serde(rename = "stress_actor")]
+    StressActor,
 }
 
 impl ActorKind {
@@ -38,6 +41,7 @@ impl ActorKind {
             ActorKind::Producer => "Producers",
             ActorKind::Consumer => "Consumers",
             ActorKind::ProducingConsumer => "Producing Consumers",
+            ActorKind::StressActor => "Stress Actors",
         }
     }
 }
