@@ -5706,6 +5706,8 @@ name = "metadata"
 version = "0.1.0"
 dependencies = [
  "ahash 0.8.12",
+ "bytemuck",
+ "bytes",
  "consensus",
  "iggy_common",
  "journal",

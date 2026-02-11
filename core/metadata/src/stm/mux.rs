@@ -141,7 +141,7 @@ mod tests {
     use crate::stm::State;
     use crate::stm::consumer_group::{ConsumerGroups, ConsumerGroupsInner};
     use crate::stm::mux::MuxStateMachine;
-    use crate::stm::snapshot::{FillSnapshot, MetadataSnapshot, RestoreSnapshot, Snapshotable};
+    use crate::stm::snapshot::{FillSnapshot, MetadataSnapshot, RestoreSnapshot};
     use crate::stm::stream::{Streams, StreamsInner};
     use crate::stm::user::{Users, UsersInner};
     use bytes::{Bytes, BytesMut};
