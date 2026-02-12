@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use rand::Rng;
+use rand::RngExt;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt::Display;
 use std::str::FromStr;

@@ -28,7 +28,7 @@ use crate::harness::traits::{IggyServerDependent, Restartable, TestBinary};
 use assert_cmd::prelude::CommandCargoExt;
 use iggy::prelude::{DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME};
 use iggy_common::TransportProtocol;
-use rand::Rng as _;
+use rand::RngExt as _;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;

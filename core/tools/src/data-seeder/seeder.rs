@@ -17,7 +17,7 @@
  */
 
 use iggy::prelude::*;
-use rand::Rng;
+use rand::RngExt;
 use std::collections::HashMap;
 
 const PROD_STREAM_NAME: &str = "prod";
