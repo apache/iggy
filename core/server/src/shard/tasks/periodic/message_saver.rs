@@ -17,6 +17,8 @@
  */
 
 use crate::shard::IggyShard;
+use crate::shard::transmission::frame::ShardResponse;
+use crate::shard::transmission::message::{ShardRequest, ShardRequestPayload};
 use iggy_common::IggyError;
 use std::rc::Rc;
 use tracing::{error, info, trace};
@@ -29,16 +31,13 @@ pub fn spawn_message_saver(shard: Rc<IggyShard>) {
         period
     );
     let shard_clone = shard.clone();
-    let shard_for_shutdown = shard.clone();
     shard
         .task_registry
         .periodic("save_messages")
         .every(period)
-        .last_tick_on_shutdown(true)
+        // No last_tick_on_shutdown — the pump handles final flush + fsync
+        // during its own shutdown (see message_pump.rs).
         .tick(move |_shutdown| save_messages(shard_clone.clone()))
-        .on_shutdown(move |result| {
-            fsync_all_segments_on_shutdown(shard_for_shutdown.clone(), result)
-        })
         .spawn();
 }
 
@@ -46,63 +45,28 @@ async fn save_messages(shard: Rc<IggyShard>) -> Result<(), IggyError> {
     trace!("Saving buffered messages...");
 
     let namespaces = shard.get_current_shard_namespaces();
-    let mut total_saved_messages = 0u64;
     let mut partitions_flushed = 0u32;
 
     for ns in namespaces {
-        if shard.local_partitions.borrow().get(&ns).is_some() {
-            match shard
-                .flush_unsaved_buffer_from_local_partitions(&ns, false)
-                .await
-            {
-                Ok(saved) => {
-                    if saved > 0 {
-                        total_saved_messages += saved as u64;
-                        partitions_flushed += 1;
-                    }
-                }
-                Err(err) => {
-                    error!("Failed to save messages for partition {:?}: {}", ns, err);
-                }
+        let payload = ShardRequestPayload::FlushUnsavedBuffer { fsync: false };
+        let request = ShardRequest::data_plane(ns, payload);
+        match shard.send_to_data_plane(request).await {
+            Ok(ShardResponse::FlushUnsavedBuffer { flushed_count }) if flushed_count > 0 => {
+                partitions_flushed += 1;
             }
+            Ok(ShardResponse::FlushUnsavedBuffer { .. }) => {}
+            Ok(ShardResponse::ErrorResponse(err)) => {
+                error!("Failed to save messages for partition {:?}: {}", ns, err);
+            }
+            Err(err) => {
+                error!("Failed to save messages for partition {:?}: {}", ns, err);
+            }
+            _ => {}
         }
     }
 
-    if total_saved_messages > 0 {
-        info!("Saved {total_saved_messages} messages from {partitions_flushed} partitions.");
+    if partitions_flushed > 0 {
+        info!("Flushed {partitions_flushed} partitions.");
     }
     Ok(())
-}
-
-async fn fsync_all_segments_on_shutdown(shard: Rc<IggyShard>, result: Result<(), IggyError>) {
-    if result.is_err() {
-        error!(
-            "Last save_messages tick failed, skipping fsync: {:?}",
-            result
-        );
-        return;
-    }
-
-    trace!("Performing fsync on all segments during shutdown...");
-
-    let namespaces = shard.get_current_shard_namespaces();
-
-    for ns in namespaces {
-        if shard.local_partitions.borrow().get(&ns).is_some() {
-            match shard.fsync_all_messages_from_local_partitions(&ns).await {
-                Ok(()) => {
-                    trace!(
-                        "Successfully fsynced segment for partition {:?} during shutdown",
-                        ns
-                    );
-                }
-                Err(err) => {
-                    error!(
-                        "Failed to fsync segment for partition {:?} during shutdown: {}",
-                        ns, err
-                    );
-                }
-            }
-        }
-    }
 }

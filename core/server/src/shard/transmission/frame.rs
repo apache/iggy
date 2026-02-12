@@ -15,28 +15,70 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-use async_channel::Sender;
-use iggy_common::{IggyError, IggyPollMetadata, Stats};
-
 use crate::{
     shard::transmission::message::ShardMessage,
     streaming::{segments::IggyMessagesBatchSet, users::user::User},
 };
+use async_channel::Sender;
+use iggy_common::{
+    CompressionAlgorithm, IggyError, IggyExpiry, IggyPollMetadata, IggyTimestamp, MaxTopicSize,
+    PersonalAccessToken, Stats,
+};
+use std::sync::Arc;
 
+/// Data needed to construct a stream creation response.
+#[derive(Debug)]
+pub struct StreamResponseData {
+    pub id: u32,
+    pub name: Arc<str>,
+    pub created_at: IggyTimestamp,
+}
+
+/// Data needed to construct a topic creation response.
+#[derive(Debug)]
+pub struct TopicResponseData {
+    pub id: u32,
+    pub name: Arc<str>,
+    pub created_at: IggyTimestamp,
+    pub partitions: Vec<super::event::PartitionInfo>,
+    pub message_expiry: IggyExpiry,
+    pub compression_algorithm: CompressionAlgorithm,
+    pub max_topic_size: MaxTopicSize,
+    pub replication_factor: u8,
+}
+
+/// Data needed to construct a consumer group creation response.
+#[derive(Debug)]
+pub struct ConsumerGroupResponseData {
+    pub id: u32,
+    pub name: Arc<str>,
+    pub partitions_count: u32,
+}
+
+// TODO: make nice types in common module so that each command has respective *Response struct, i.e. CreateStream -> CreateStreamResponse
 #[derive(Debug)]
 pub enum ShardResponse {
     PollMessages((IggyPollMetadata, IggyMessagesBatchSet)),
     SendMessages,
-    FlushUnsavedBuffer,
-    DeleteSegments,
+    FlushUnsavedBuffer {
+        flushed_count: u32,
+    },
+    DeleteSegments {
+        deleted_segments: u64,
+        deleted_messages: u64,
+    },
+    CleanTopicMessages {
+        deleted_segments: u64,
+        deleted_messages: u64,
+    },
     Event,
-    CreateStreamResponse(usize),
+    CreateStreamResponse(StreamResponseData),
     DeleteStreamResponse(usize),
-    CreateTopicResponse(usize),
+    CreateTopicResponse(TopicResponseData),
     UpdateTopicResponse,
     DeleteTopicResponse(usize),
     CreateUserResponse(User),
-    DeletedUser(User),
+    DeleteUserResponse(User),
     GetStatsResponse(Stats),
     CreatePartitionsResponse(Vec<usize>),
     DeletePartitionsResponse(Vec<usize>),
@@ -45,11 +87,11 @@ pub enum ShardResponse {
     UpdatePermissionsResponse,
     ChangePasswordResponse,
     UpdateUserResponse(User),
-    CreateConsumerGroupResponse(usize),
+    CreateConsumerGroupResponse(ConsumerGroupResponseData),
     JoinConsumerGroupResponse,
     LeaveConsumerGroupResponse,
     DeleteConsumerGroupResponse,
-    CreatePersonalAccessTokenResponse(iggy_common::PersonalAccessToken, String),
+    CreatePersonalAccessTokenResponse(PersonalAccessToken, String),
     DeletePersonalAccessTokenResponse,
     LeaveConsumerGroupMetadataOnlyResponse,
     PurgeStreamResponse,
@@ -70,14 +112,4 @@ impl ShardFrame {
             response_sender,
         }
     }
-}
-
-#[macro_export]
-macro_rules! handle_response {
-    ($sender:expr, $response:expr) => {
-        match $response {
-            ShardResponse::BinaryResponse(payload) => $sender.send_ok_response(&payload).await?,
-            ShardResponse::ErrorResponse(err) => $sender.send_error_response(err).await?,
-        }
-    };
 }

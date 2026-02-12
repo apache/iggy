@@ -17,7 +17,7 @@
 
 [package]
 name = "server"
-version = "0.6.3-edge.1"
+version = "0.6.3-edge.2"
 edition = "2024"
 license = "Apache-2.0"
 
@@ -98,7 +98,6 @@ strum = { workspace = true }
 sysinfo = { workspace = true }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["sync"] }
 toml = { workspace = true }
 tower-http = { workspace = true }
 tracing = { workspace = true }

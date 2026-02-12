@@ -16,23 +16,54 @@
  * under the License.
  */
 use crate::{
-    shard::{
-        system::messages::PollingArgs,
-        transmission::{event::ShardEvent, frame::ShardResponse},
-    },
+    shard::{system::messages::PollingArgs, transmission::event::ShardEvent},
     streaming::{polling_consumer::PollingConsumer, segments::IggyMessagesBatchMut},
 };
 use iggy_common::{
-    CompressionAlgorithm, Identifier, IggyExpiry, MaxTopicSize, Permissions, UserStatus,
+    change_password::ChangePassword, create_consumer_group::CreateConsumerGroup,
+    create_partitions::CreatePartitions, create_personal_access_token::CreatePersonalAccessToken,
+    create_stream::CreateStream, create_topic::CreateTopic, create_user::CreateUser,
+    delete_consumer_group::DeleteConsumerGroup, delete_partitions::DeletePartitions,
+    delete_personal_access_token::DeletePersonalAccessToken, delete_stream::DeleteStream,
+    delete_topic::DeleteTopic, delete_user::DeleteUser, join_consumer_group::JoinConsumerGroup,
+    leave_consumer_group::LeaveConsumerGroup, purge_stream::PurgeStream, purge_topic::PurgeTopic,
+    sharding::IggyNamespace, update_permissions::UpdatePermissions, update_stream::UpdateStream,
+    update_topic::UpdateTopic, update_user::UpdateUser,
 };
 
 use std::{net::SocketAddr, os::fd::OwnedFd};
 
-#[allow(clippy::large_enum_variant)]
-pub enum ShardSendRequestResult {
-    // TODO: In the future we can add other variants, for example backpressure from the destination shard,
-    Recoil(ShardMessage),
-    Response(ShardResponse),
+/// Resolved stream ID. Contains only the numeric ID - `Identifier` stays at handler boundary.
+#[derive(Debug, Clone, Copy)]
+pub struct ResolvedStream(pub usize);
+
+impl ResolvedStream {
+    pub fn id(self) -> usize {
+        self.0
+    }
+}
+
+/// Resolved topic with parent stream context.
+#[derive(Debug, Clone, Copy)]
+pub struct ResolvedTopic {
+    pub stream_id: usize,
+    pub topic_id: usize,
+}
+
+/// Resolved partition with full context.
+#[derive(Debug, Clone, Copy)]
+pub struct ResolvedPartition {
+    pub stream_id: usize,
+    pub topic_id: usize,
+    pub partition_id: usize,
+}
+
+/// Resolved consumer group with full context.
+#[derive(Debug, Clone, Copy)]
+pub struct ResolvedConsumerGroup {
+    pub stream_id: usize,
+    pub topic_id: usize,
+    pub group_id: usize,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -42,33 +73,35 @@ pub enum ShardMessage {
     Event(ShardEvent),
 }
 
+/// Routing envelope determining which shard handles the request.
 #[derive(Debug)]
 pub struct ShardRequest {
-    pub stream_id: Identifier,
-    pub topic_id: Identifier,
-    pub partition_id: usize,
+    /// None = shard 0 (control-plane), Some = partition owner (data-plane)
+    pub routing: Option<IggyNamespace>,
     pub payload: ShardRequestPayload,
 }
 
 impl ShardRequest {
-    pub fn new(
-        stream_id: Identifier,
-        topic_id: Identifier,
-        partition_id: usize,
-        payload: ShardRequestPayload,
-    ) -> Self {
+    /// Control-plane operations always route to shard 0
+    pub fn control_plane(payload: ShardRequestPayload) -> Self {
         Self {
-            stream_id,
-            topic_id,
-            partition_id,
+            routing: None,
+            payload,
+        }
+    }
+
+    /// Data-plane operations route by partition namespace
+    pub fn data_plane(namespace: IggyNamespace, payload: ShardRequestPayload) -> Self {
+        Self {
+            routing: Some(namespace),
             payload,
         }
     }
 }
 
-// cleanup this shit
 #[derive(Debug)]
 pub enum ShardRequestPayload {
+    // Data-plane operations: namespace provided via ShardRequest
     SendMessages {
         batch: IggyMessagesBatchMut,
     },
@@ -79,72 +112,13 @@ pub enum ShardRequestPayload {
     FlushUnsavedBuffer {
         fsync: bool,
     },
-    CreateStream {
-        user_id: u32,
-        name: String,
-    },
-    DeleteStream {
-        user_id: u32,
-        stream_id: Identifier,
-    },
-    CreateTopic {
-        user_id: u32,
-        stream_id: Identifier,
-        name: String,
-        partitions_count: u32,
-        message_expiry: IggyExpiry,
-        compression_algorithm: CompressionAlgorithm,
-        max_topic_size: MaxTopicSize,
-        replication_factor: Option<u8>,
-    },
-    UpdateTopic {
-        user_id: u32,
-        stream_id: Identifier,
-        topic_id: Identifier,
-        name: String,
-        message_expiry: IggyExpiry,
-        compression_algorithm: CompressionAlgorithm,
-        max_topic_size: MaxTopicSize,
-        replication_factor: Option<u8>,
-    },
-    DeleteTopic {
-        user_id: u32,
-        stream_id: Identifier,
-        topic_id: Identifier,
-    },
-    CreateUser {
-        user_id: u32,
-        username: String,
-        password: String,
-        status: UserStatus,
-        permissions: Option<Permissions>,
-    },
-    DeleteUser {
-        session_user_id: u32,
-        user_id: Identifier,
-    },
-    GetStats {
-        user_id: u32,
-    },
     DeleteSegments {
         segments_count: u32,
     },
-    CreatePartitions {
-        user_id: u32,
-        stream_id: Identifier,
-        topic_id: Identifier,
-        partitions_count: u32,
-    },
-    DeletePartitions {
-        user_id: u32,
-        stream_id: Identifier,
-        topic_id: Identifier,
-        partitions_count: u32,
-    },
-    UpdateStream {
-        user_id: u32,
-        stream_id: Identifier,
-        name: String,
+    CleanTopicMessages {
+        stream_id: usize,
+        topic_id: usize,
+        partition_ids: Vec<usize>,
     },
     SocketTransfer {
         fd: OwnedFd,
@@ -154,57 +128,93 @@ pub enum ShardRequestPayload {
         address: SocketAddr,
         initial_data: IggyMessagesBatchMut,
     },
-    UpdatePermissions {
-        session_user_id: u32,
-        user_id: Identifier,
-        permissions: Option<Permissions>,
-    },
-    ChangePassword {
-        session_user_id: u32,
-        user_id: Identifier,
-        current_password: String,
-        new_password: String,
-    },
-    UpdateUser {
-        session_user_id: u32,
-        user_id: Identifier,
-        username: Option<String>,
-        status: Option<UserStatus>,
-    },
-    CreateConsumerGroup {
+
+    // Control-plane: stream operations
+    CreateStreamRequest {
         user_id: u32,
-        stream_id: Identifier,
-        topic_id: Identifier,
-        name: String,
+        command: CreateStream,
     },
-    JoinConsumerGroup {
+    UpdateStreamRequest {
+        user_id: u32,
+        command: UpdateStream,
+    },
+    DeleteStreamRequest {
+        user_id: u32,
+        command: DeleteStream,
+    },
+    PurgeStreamRequest {
+        user_id: u32,
+        command: PurgeStream,
+    },
+
+    // Control-plane: topic operations
+    CreateTopicRequest {
+        user_id: u32,
+        command: CreateTopic,
+    },
+    UpdateTopicRequest {
+        user_id: u32,
+        command: UpdateTopic,
+    },
+    DeleteTopicRequest {
+        user_id: u32,
+        command: DeleteTopic,
+    },
+    PurgeTopicRequest {
+        user_id: u32,
+        command: PurgeTopic,
+    },
+
+    // Control-plane: partition operations
+    CreatePartitionsRequest {
+        user_id: u32,
+        command: CreatePartitions,
+    },
+    DeletePartitionsRequest {
+        user_id: u32,
+        command: DeletePartitions,
+    },
+
+    // Control-plane: user operations
+    CreateUserRequest {
+        user_id: u32,
+        command: CreateUser,
+    },
+    UpdateUserRequest {
+        user_id: u32,
+        command: UpdateUser,
+    },
+    DeleteUserRequest {
+        user_id: u32,
+        command: DeleteUser,
+    },
+    UpdatePermissionsRequest {
+        user_id: u32,
+        command: UpdatePermissions,
+    },
+    ChangePasswordRequest {
+        user_id: u32,
+        command: ChangePassword,
+    },
+
+    // Control-plane: consumer group operations
+    CreateConsumerGroupRequest {
+        user_id: u32,
+        command: CreateConsumerGroup,
+    },
+    DeleteConsumerGroupRequest {
+        user_id: u32,
+        command: DeleteConsumerGroup,
+    },
+    JoinConsumerGroupRequest {
         user_id: u32,
         client_id: u32,
-        stream_id: Identifier,
-        topic_id: Identifier,
-        group_id: Identifier,
+        command: JoinConsumerGroup,
     },
-    LeaveConsumerGroup {
+    LeaveConsumerGroupRequest {
         user_id: u32,
         client_id: u32,
-        stream_id: Identifier,
-        topic_id: Identifier,
-        group_id: Identifier,
-    },
-    DeleteConsumerGroup {
-        user_id: u32,
-        stream_id: Identifier,
-        topic_id: Identifier,
-        group_id: Identifier,
-    },
-    CreatePersonalAccessToken {
-        user_id: u32,
-        name: String,
-        expiry: IggyExpiry,
-    },
-    DeletePersonalAccessToken {
-        user_id: u32,
-        name: String,
+        command: LeaveConsumerGroup,
     },
     LeaveConsumerGroupMetadataOnly {
         stream_id: usize,
@@ -212,14 +222,20 @@ pub enum ShardRequestPayload {
         group_id: usize,
         client_id: u32,
     },
-    PurgeStream {
+
+    // Control-plane: PAT operations
+    CreatePersonalAccessTokenRequest {
         user_id: u32,
-        stream_id: Identifier,
+        command: CreatePersonalAccessToken,
     },
-    PurgeTopic {
+    DeletePersonalAccessTokenRequest {
         user_id: u32,
-        stream_id: Identifier,
-        topic_id: Identifier,
+        command: DeletePersonalAccessToken,
+    },
+
+    // Control-plane: stats
+    GetStats {
+        user_id: u32,
     },
 }
 

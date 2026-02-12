@@ -50,9 +50,9 @@ impl MessagesWriter {
         fsync: bool,
         file_exists: bool,
     ) -> Result<Self, IggyError> {
-        let file = OpenOptions::new()
-            .create(true)
-            .write(true)
+        let mut opts = OpenOptions::new();
+        opts.create(true).write(true);
+        let file = opts
             .open(file_path)
             .await
             .error(|err: &std::io::Error| {

@@ -42,13 +42,13 @@ pub enum ShardEvent {
         partition_id: usize,
         fsync: bool,
     },
-    /// Purge all messages from a stream (requires per-shard log truncation)
-    PurgedStream { stream_id: Identifier },
-    /// Purge all messages from a topic (requires per-shard log truncation)
+    /// Purge all messages, consumer groups and consumer group offsets from a topic
     PurgedTopic {
         stream_id: Identifier,
         topic_id: Identifier,
     },
+    /// Purges all topics in a stream
+    PurgedStream { stream_id: Identifier },
     /// New partitions created (requires per-shard log initialization)
     CreatedPartitions {
         stream_id: Identifier,

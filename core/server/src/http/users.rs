@@ -22,11 +22,10 @@ use crate::http::jwt::json_web_token::Identity;
 use crate::http::mapper;
 use crate::http::mapper::map_generated_access_token_to_identity_info;
 use crate::http::shared::AppState;
-use crate::state::command::EntryCommand;
-use crate::state::models::CreateUserWithId;
+use crate::shard::transmission::frame::ShardResponse;
+use crate::shard::transmission::message::{ShardRequest, ShardRequestPayload};
 use crate::streaming::session::Session;
 use crate::streaming::users::user::User;
-use crate::streaming::utils::crypto;
 use ::iggy_common::change_password::ChangePassword;
 use ::iggy_common::create_user::CreateUser;
 use ::iggy_common::delete_user::DeleteUser;
@@ -76,7 +75,6 @@ async fn get_user(
         return Err(CustomError::ResourceNotFound);
     };
 
-    // Permission check: only required if user is looking for someone else
     if user.id != identity.user_id {
         state
             .shard
@@ -114,58 +112,20 @@ async fn create_user(
     Json(command): Json<CreateUser>,
 ) -> Result<Json<UserInfoDetails>, CustomError> {
     command.validate()?;
-    state
-        .shard
-        .shard()
-        .metadata
-        .perm_create_user(identity.user_id)?;
 
-    let user = state
-        .shard
-        .shard()
-        .create_user(
-            &command.username,
-            &command.password,
-            command.status,
-            command.permissions.clone(),
-        )
-        .error(|e: &IggyError| {
-            format!(
-                "{COMPONENT} (error: {e}) - failed to create user, username: {}",
-                command.username
-            )
-        })?;
+    let request = ShardRequest::control_plane(ShardRequestPayload::CreateUserRequest {
+        user_id: identity.user_id,
+        command,
+    });
 
-    let user_id = user.id;
-    let response = Json(mapper::map_user(&user));
-
-    {
-        let username = command.username.clone();
-        let entry_command = EntryCommand::CreateUser(CreateUserWithId {
-            user_id,
-            command: CreateUser {
-                username: command.username.to_owned(),
-                password: crypto::hash_password(&command.password),
-                status: command.status,
-                permissions: command.permissions.clone(),
-            },
-        });
-        let future = SendWrapper::new(
-            state
-                .shard
-                .shard()
-                .state
-                .apply(identity.user_id, &entry_command),
-        );
-        future.await.error(|e: &IggyError| {
-            format!(
-                "{COMPONENT} (error: {e}) - failed to apply create user, username: {}",
-                username
-            )
-        })?;
+    match state.shard.send_to_control_plane(request).await? {
+        ShardResponse::CreateUserResponse(user) => {
+            let response = mapper::map_user(&user);
+            Ok(Json(response))
+        }
+        ShardResponse::ErrorResponse(err) => Err(err.into()),
+        _ => unreachable!("Expected CreateUserResponse"),
     }
-
-    Ok(response)
 }
 
 #[debug_handler]
@@ -178,39 +138,17 @@ async fn update_user(
 ) -> Result<StatusCode, CustomError> {
     command.user_id = Identifier::from_str_value(&user_id)?;
     command.validate()?;
-    state
-        .shard
-        .shard()
-        .metadata
-        .perm_update_user(identity.user_id)?;
 
-    state
-        .shard
-        .shard()
-        .update_user(&command.user_id, command.username.clone(), command.status)
-        .error(|e: &IggyError| {
-            format!("{COMPONENT} (error: {e}) - failed to update user, user ID: {user_id}")
-        })?;
+    let request = ShardRequest::control_plane(ShardRequestPayload::UpdateUserRequest {
+        user_id: identity.user_id,
+        command,
+    });
 
-    {
-        let username = command.username.clone();
-        let entry_command = EntryCommand::UpdateUser(command);
-        let future = SendWrapper::new(
-            state
-                .shard
-                .shard()
-                .state
-                .apply(identity.user_id, &entry_command),
-        );
-        future.await.error(|e: &IggyError| {
-            format!(
-                "{COMPONENT} (error: {e}) - failed to apply update user, username: {}",
-                username.unwrap()
-            )
-        })?;
+    match state.shard.send_to_control_plane(request).await? {
+        ShardResponse::UpdateUserResponse(_) => Ok(StatusCode::NO_CONTENT),
+        ShardResponse::ErrorResponse(err) => Err(err.into()),
+        _ => unreachable!("Expected UpdateUserResponse"),
     }
-
-    Ok(StatusCode::NO_CONTENT)
 }
 
 #[debug_handler]
@@ -223,45 +161,17 @@ async fn update_permissions(
 ) -> Result<StatusCode, CustomError> {
     command.user_id = Identifier::from_str_value(&user_id)?;
     command.validate()?;
-    state
-        .shard
-        .shard()
-        .metadata
-        .perm_update_permissions(identity.user_id)?;
 
-    // Check if target user is root - cannot change root user permissions
-    let target_user = state.shard.shard().get_user(&command.user_id)?;
-    if target_user.is_root() {
-        return Err(CustomError::from(IggyError::CannotChangePermissions(
-            target_user.id,
-        )));
+    let request = ShardRequest::control_plane(ShardRequestPayload::UpdatePermissionsRequest {
+        user_id: identity.user_id,
+        command,
+    });
+
+    match state.shard.send_to_control_plane(request).await? {
+        ShardResponse::UpdatePermissionsResponse => Ok(StatusCode::NO_CONTENT),
+        ShardResponse::ErrorResponse(err) => Err(err.into()),
+        _ => unreachable!("Expected UpdatePermissionsResponse"),
     }
-
-    state
-        .shard
-        .shard()
-        .update_permissions(&command.user_id, command.permissions.clone())
-        .error(|e: &IggyError| {
-            format!("{COMPONENT} (error: {e}) - failed to update permissions, user ID: {user_id}")
-        })?;
-
-    {
-        let entry_command = EntryCommand::UpdatePermissions(command);
-        let future = SendWrapper::new(
-            state
-                .shard
-                .shard()
-                .state
-                .apply(identity.user_id, &entry_command),
-        );
-        future.await.error(|e: &IggyError| {
-            format!(
-                "{COMPONENT} (error: {e}) - failed to apply update permissions, user ID: {user_id}"
-            )
-        })?;
-    }
-
-    Ok(StatusCode::NO_CONTENT)
 }
 
 #[debug_handler]
@@ -275,49 +185,16 @@ async fn change_password(
     command.user_id = Identifier::from_str_value(&user_id)?;
     command.validate()?;
 
-    // Check if user is changing someone else's password
-    let target_user = state.shard.shard().get_user(&command.user_id)?;
-    if target_user.id != identity.user_id {
-        state
-            .shard
-            .shard()
-            .metadata
-            .perm_change_password(identity.user_id)?;
+    let request = ShardRequest::control_plane(ShardRequestPayload::ChangePasswordRequest {
+        user_id: identity.user_id,
+        command,
+    });
+
+    match state.shard.send_to_control_plane(request).await? {
+        ShardResponse::ChangePasswordResponse => Ok(StatusCode::NO_CONTENT),
+        ShardResponse::ErrorResponse(err) => Err(err.into()),
+        _ => unreachable!("Expected ChangePasswordResponse"),
     }
-
-    state
-        .shard
-        .shard()
-        .change_password(
-            &command.user_id,
-            &command.current_password,
-            &command.new_password,
-        )
-        .error(|e: &IggyError| {
-            format!("{COMPONENT} (error: {e}) - failed to change password, user ID: {user_id}")
-        })?;
-
-    {
-        let entry_command = EntryCommand::ChangePassword(ChangePassword {
-            user_id: command.user_id,
-            current_password: "".into(),
-            new_password: crypto::hash_password(&command.new_password),
-        });
-        let future = SendWrapper::new(
-            state
-                .shard
-                .shard()
-                .state
-                .apply(identity.user_id, &entry_command),
-        );
-        future.await.error(|e: &IggyError| {
-            format!(
-                "{COMPONENT} (error: {e}) - failed to apply change password, user ID: {user_id}"
-            )
-        })?;
-    }
-
-    Ok(StatusCode::NO_CONTENT)
 }
 
 #[debug_handler]
@@ -327,38 +204,19 @@ async fn delete_user(
     Extension(identity): Extension<Identity>,
     Path(user_id): Path<String>,
 ) -> Result<StatusCode, CustomError> {
-    let identifier_user_id = Identifier::from_str_value(&user_id)?;
-    state
-        .shard
-        .shard()
-        .metadata
-        .perm_delete_user(identity.user_id)?;
+    let user_id = Identifier::from_str_value(&user_id)?;
 
-    state
-        .shard
-        .shard()
-        .delete_user(&identifier_user_id)
-        .error(|e: &IggyError| {
-            format!("{COMPONENT} (error: {e}) - failed to delete user with ID: {user_id}")
-        })?;
+    let command = DeleteUser { user_id };
+    let request = ShardRequest::control_plane(ShardRequestPayload::DeleteUserRequest {
+        user_id: identity.user_id,
+        command,
+    });
 
-    {
-        let entry_command = EntryCommand::DeleteUser(DeleteUser {
-            user_id: identifier_user_id,
-        });
-        let future = SendWrapper::new(
-            state
-                .shard
-                .shard()
-                .state
-                .apply(identity.user_id, &entry_command),
-        );
-        future.await.error(|e: &IggyError| {
-            format!("{COMPONENT} (error: {e}) - failed to apply delete user with ID: {user_id}")
-        })?;
+    match state.shard.send_to_control_plane(request).await? {
+        ShardResponse::DeleteUserResponse(_) => Ok(StatusCode::NO_CONTENT),
+        ShardResponse::ErrorResponse(err) => Err(err.into()),
+        _ => unreachable!("Expected DeleteUserResponse"),
     }
-
-    Ok(StatusCode::NO_CONTENT)
 }
 
 #[debug_handler]

@@ -18,8 +18,8 @@
 
 use crate::metadata::TopicMeta;
 use crate::shard::IggyShard;
+use crate::shard::transmission::message::{ResolvedStream, ResolvedTopic};
 use crate::streaming::topics::storage::{create_topic_file_hierarchy, delete_topic_directory};
-use bytes::{BufMut, BytesMut};
 use iggy_common::sharding::IggyNamespace;
 use iggy_common::{
     CompressionAlgorithm, Identifier, IggyError, IggyExpiry, IggyTimestamp, MaxTopicSize,
@@ -37,14 +37,14 @@ impl IggyShard {
     #[allow(clippy::too_many_arguments)]
     pub async fn create_topic(
         &self,
-        stream_id: &Identifier,
+        stream: ResolvedStream,
         name: String,
         message_expiry: IggyExpiry,
         compression: CompressionAlgorithm,
         max_topic_size: MaxTopicSize,
         replication_factor: Option<u8>,
     ) -> Result<usize, IggyError> {
-        let stream_id = self.resolve_stream_id(stream_id)?;
+        let stream_id = stream.0;
 
         let config = &self.config.system;
         let message_expiry = config.resolve_message_expiry(message_expiry);
@@ -107,20 +107,18 @@ impl IggyShard {
     #[allow(clippy::too_many_arguments)]
     pub fn update_topic(
         &self,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
+        topic: ResolvedTopic,
         name: String,
         message_expiry: IggyExpiry,
         compression_algorithm: CompressionAlgorithm,
         max_topic_size: MaxTopicSize,
         replication_factor: Option<u8>,
     ) -> Result<(), IggyError> {
-        let (stream, topic) = self.resolve_topic_id(stream_id, topic_id)?;
-
-        self.update_topic_base(
-            stream,
-            topic,
-            name,
+        self.writer().try_update_topic(
+            &self.metadata,
+            topic.stream_id,
+            topic.topic_id,
+            Arc::from(name.as_str()),
             message_expiry,
             compression_algorithm,
             max_topic_size,
@@ -128,46 +126,21 @@ impl IggyShard {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn update_topic_base(
-        &self,
-        stream: usize,
-        topic: usize,
-        name: String,
-        message_expiry: IggyExpiry,
-        compression_algorithm: CompressionAlgorithm,
-        max_topic_size: MaxTopicSize,
-        replication_factor: u8,
-    ) -> Result<(), IggyError> {
-        self.writer().try_update_topic(
-            &self.metadata,
-            stream,
-            topic,
-            Arc::from(name.as_str()),
-            message_expiry,
-            compression_algorithm,
-            max_topic_size,
-            replication_factor,
-        )
-    }
+    pub async fn delete_topic(&self, topic: ResolvedTopic) -> Result<DeletedTopicInfo, IggyError> {
+        let stream = topic.stream_id;
+        let topic_id = topic.topic_id;
 
-    pub async fn delete_topic(
-        &self,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-    ) -> Result<DeletedTopicInfo, IggyError> {
-        let (stream, topic) = self.resolve_topic_id(stream_id, topic_id)?;
-
-        let (partition_ids, messages_count, size_bytes, segments_count, parent_stats) =
+        let (partition_ids, topic_name, messages_count, size_bytes, segments_count, parent_stats) =
             self.metadata.with_metadata(|m| {
                 let stream_meta = m.streams.get(stream).expect("Stream metadata must exist");
                 let topic_meta = stream_meta
                     .topics
-                    .get(topic)
+                    .get(topic_id)
                     .expect("Topic metadata must exist");
                 let pids: Vec<usize> = (0..topic_meta.partitions.len()).collect();
                 (
                     pids,
+                    topic_meta.name.to_string(),
                     topic_meta.stats.messages_count_inconsistent(),
                     topic_meta.stats.size_bytes_inconsistent(),
                     topic_meta.stats.segments_count_inconsistent(),
@@ -175,17 +148,31 @@ impl IggyShard {
                 )
             });
 
-        let topic_info = self.delete_topic_base(stream, topic);
+        {
+            let mut partitions = self.local_partitions.borrow_mut();
+            for &partition_id in &partition_ids {
+                let ns = IggyNamespace::new(stream, topic_id, partition_id);
+                partitions.remove(&ns);
+            }
+        }
+
+        self.writer().delete_topic(stream, topic_id);
+
+        let topic_info = DeletedTopicInfo {
+            id: topic_id,
+            name: topic_name,
+            stream_id: stream,
+        };
 
         self.client_manager
-            .delete_consumer_groups_for_topic(stream, topic_info.id);
+            .delete_consumer_groups_for_topic(stream, topic_id);
 
         let namespaces_to_remove: Vec<_> = self
             .shards_table
             .iter()
             .filter_map(|entry| {
                 let (ns, _) = entry.pair();
-                if ns.stream_id() == stream && ns.topic_id() == topic_info.id {
+                if ns.stream_id() == stream && ns.topic_id() == topic_id {
                     Some(*ns)
                 } else {
                     None
@@ -197,7 +184,7 @@ impl IggyShard {
             self.remove_shard_table_record(&ns);
         }
 
-        delete_topic_directory(stream, topic_info.id, &partition_ids, &self.config.system).await?;
+        delete_topic_directory(stream, topic_id, &partition_ids, &self.config.system).await?;
 
         parent_stats.decrement_messages_count(messages_count);
         parent_stats.decrement_size_bytes(size_bytes);
@@ -206,109 +193,34 @@ impl IggyShard {
         Ok(topic_info)
     }
 
-    fn delete_topic_base(&self, stream: usize, topic: usize) -> DeletedTopicInfo {
-        let (topic_name, partition_ids) = self.metadata.with_metadata(|m| {
-            let stream_meta = m.streams.get(stream).expect("Stream metadata must exist");
-            let topic_meta = stream_meta
-                .topics
-                .get(topic)
-                .expect("Topic metadata must exist");
-            let name = topic_meta.name.to_string();
-            let pids: Vec<usize> = (0..topic_meta.partitions.len()).collect();
-            (name, pids)
-        });
-
-        {
-            let mut partitions = self.local_partitions.borrow_mut();
-            for partition_id in partition_ids {
-                let ns = IggyNamespace::new(stream, topic, partition_id);
-                partitions.remove(&ns);
-            }
-        }
-
-        self.writer().delete_topic(stream, topic);
-
-        DeletedTopicInfo {
-            id: topic,
-            name: topic_name,
-            stream_id: stream,
-        }
-    }
-
-    pub async fn purge_topic(
-        &self,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-    ) -> Result<(), IggyError> {
-        let (stream, topic) = self.resolve_topic_id(stream_id, topic_id)?;
-
-        let partition_ids = self.metadata.get_partition_ids(stream, topic);
-
-        let mut all_consumer_paths = Vec::new();
-        let mut all_group_paths = Vec::new();
-
-        for partition_id in &partition_ids {
-            let ns = IggyNamespace::new(stream, topic, *partition_id);
-            if let Some(partition) = self.local_partitions.borrow().get(&ns) {
-                all_consumer_paths.extend(
-                    partition
-                        .consumer_offsets
-                        .pin()
-                        .iter()
-                        .map(|item| item.1.path.clone()),
-                );
-                all_group_paths.extend(
-                    partition
-                        .consumer_group_offsets
-                        .pin()
-                        .iter()
-                        .map(|item| item.1.path.clone()),
-                );
-            }
-        }
-
-        for path in all_consumer_paths {
-            self.delete_consumer_offset_from_disk(&path).await?;
-        }
-        for path in all_group_paths {
-            self.delete_consumer_offset_from_disk(&path).await?;
-        }
-
-        self.purge_topic_base(stream, topic).await
-    }
-
-    pub async fn purge_topic_bypass_auth(
-        &self,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-    ) -> Result<(), IggyError> {
-        let (stream, topic) = self.resolve_topic_id(stream_id, topic_id)?;
-        self.purge_topic_base(stream, topic).await
-    }
-
-    pub(crate) async fn purge_topic_base(
-        &self,
-        stream: usize,
-        topic: usize,
-    ) -> Result<(), IggyError> {
-        let partition_ids = self.metadata.get_partition_ids(stream, topic);
+    /// Clears in-memory state for a topic: consumer offsets and stats.
+    /// Called on the control plane before broadcasting to other shards.
+    pub async fn purge_topic(&self, topic: ResolvedTopic) -> Result<(), IggyError> {
+        let stream = topic.stream_id;
+        let topic_id = topic.topic_id;
+        let partition_ids = self.metadata.get_partition_ids(stream, topic_id);
 
         for &partition_id in &partition_ids {
-            let ns = IggyNamespace::new(stream, topic, partition_id);
-
-            let has_partition = self.local_partitions.borrow().contains(&ns);
-            if has_partition {
-                self.delete_segments_base(stream, topic, partition_id, u32::MAX)
-                    .await?;
+            if let Some(offsets) =
+                self.metadata
+                    .get_partition_consumer_offsets(stream, topic_id, partition_id)
+            {
+                offsets.pin().clear();
+            }
+            if let Some(offsets) =
+                self.metadata
+                    .get_partition_consumer_group_offsets(stream, topic_id, partition_id)
+            {
+                offsets.pin().clear();
             }
         }
 
-        if let Some(topic_stats) = self.metadata.get_topic_stats(stream, topic) {
+        if let Some(topic_stats) = self.metadata.get_topic_stats(stream, topic_id) {
             topic_stats.zero_out_all();
         }
 
         for &partition_id in &partition_ids {
-            let ns = IggyNamespace::new(stream, topic, partition_id);
+            let ns = IggyNamespace::new(stream, topic_id, partition_id);
             if let Some(partition_stats) = self.metadata.get_partition_stats(&ns) {
                 partition_stats.zero_out_all();
             }
@@ -317,138 +229,25 @@ impl IggyShard {
         Ok(())
     }
 
-    pub fn get_topic_from_metadata(&self, stream_id: usize, topic_id: usize) -> bytes::Bytes {
-        self.metadata.with_metadata(|metadata| {
-            let Some(stream_meta) = metadata.streams.get(stream_id) else {
-                return bytes::Bytes::new();
-            };
-            let Some(topic_meta) = stream_meta.topics.get(topic_id) else {
-                return bytes::Bytes::new();
-            };
+    /// Disk cleanup for local partitions: deletes consumer offset files and purges segments.
+    /// Called on each shard (including shard 0) after in-memory state is cleared.
+    pub(crate) async fn purge_topic_local(&self, topic: ResolvedTopic) -> Result<(), IggyError> {
+        let stream = topic.stream_id;
+        let topic_id = topic.topic_id;
+        let partition_ids = self.metadata.get_partition_ids(stream, topic_id);
 
-            let mut partition_ids: Vec<_> = topic_meta
-                .partitions
-                .iter()
-                .enumerate()
-                .map(|(k, _)| k)
-                .collect();
-            partition_ids.sort_unstable();
-
-            let (total_size, total_messages) = {
-                let mut size = 0u64;
-                let mut messages = 0u64;
-                for &partition_id in &partition_ids {
-                    if let Some(stats) = metadata
-                        .streams
-                        .get(stream_id)
-                        .and_then(|s| s.topics.get(topic_id))
-                        .and_then(|t| t.partitions.get(partition_id))
-                        .map(|p| p.stats.clone())
-                    {
-                        size += stats.size_bytes_inconsistent();
-                        messages += stats.messages_count_inconsistent();
-                    }
-                }
-                (size, messages)
-            };
-
-            let mut bytes = BytesMut::new();
-
-            bytes.put_u32_le(topic_meta.id as u32);
-            bytes.put_u64_le(topic_meta.created_at.into());
-            bytes.put_u32_le(partition_ids.len() as u32);
-            bytes.put_u64_le(topic_meta.message_expiry.into());
-            bytes.put_u8(topic_meta.compression_algorithm.as_code());
-            bytes.put_u64_le(topic_meta.max_topic_size.into());
-            bytes.put_u8(topic_meta.replication_factor);
-            bytes.put_u64_le(total_size);
-            bytes.put_u64_le(total_messages);
-            bytes.put_u8(topic_meta.name.len() as u8);
-            bytes.put_slice(topic_meta.name.as_bytes());
-
-            for &partition_id in &partition_ids {
-                let partition_meta = topic_meta.partitions.get(partition_id);
-                let created_at = partition_meta
-                    .map(|m| m.created_at)
-                    .unwrap_or_else(IggyTimestamp::now);
-
-                let (segments_count, size_bytes, messages_count, offset) = partition_meta
-                    .map(|p| {
-                        (
-                            p.stats.segments_count_inconsistent(),
-                            p.stats.size_bytes_inconsistent(),
-                            p.stats.messages_count_inconsistent(),
-                            p.stats.current_offset(),
-                        )
-                    })
-                    .unwrap_or((0, 0, 0, 0));
-
-                bytes.put_u32_le(partition_id as u32);
-                bytes.put_u64_le(created_at.into());
-                bytes.put_u32_le(segments_count);
-                bytes.put_u64_le(offset);
-                bytes.put_u64_le(size_bytes);
-                bytes.put_u64_le(messages_count);
+        for &partition_id in &partition_ids {
+            let ns = IggyNamespace::new(stream, topic_id, partition_id);
+            if !self.local_partitions.borrow().contains(&ns) {
+                continue;
             }
 
-            bytes.freeze()
-        })
-    }
+            self.delete_all_consumer_offset_files(stream, topic_id, partition_id)
+                .await?;
+            self.purge_all_segments(stream, topic_id, partition_id)
+                .await?;
+        }
 
-    pub fn get_topics_from_metadata(&self, stream_id: usize) -> bytes::Bytes {
-        self.metadata.with_metadata(|metadata| {
-            let mut bytes = BytesMut::new();
-
-            let Some(stream_meta) = metadata.streams.get(stream_id) else {
-                return bytes.freeze();
-            };
-
-            let mut topic_ids: Vec<_> = stream_meta.topics.iter().map(|(k, _)| k).collect();
-            topic_ids.sort_unstable();
-
-            for topic_id in topic_ids {
-                let Some(topic_meta) = stream_meta.topics.get(topic_id) else {
-                    continue;
-                };
-
-                let mut partition_ids: Vec<_> = topic_meta
-                    .partitions
-                    .iter()
-                    .enumerate()
-                    .map(|(k, _)| k)
-                    .collect();
-                partition_ids.sort_unstable();
-
-                let (total_size, total_messages) = {
-                    let mut size = 0u64;
-                    let mut messages = 0u64;
-                    for &partition_id in &partition_ids {
-                        if let Some(stats) = topic_meta
-                            .partitions
-                            .get(partition_id)
-                            .map(|p| p.stats.clone())
-                        {
-                            size += stats.size_bytes_inconsistent();
-                            messages += stats.messages_count_inconsistent();
-                        }
-                    }
-                    (size, messages)
-                };
-
-                bytes.put_u32_le(topic_meta.id as u32);
-                bytes.put_u64_le(topic_meta.created_at.into());
-                bytes.put_u32_le(partition_ids.len() as u32);
-                bytes.put_u64_le(topic_meta.message_expiry.into());
-                bytes.put_u8(topic_meta.compression_algorithm.as_code());
-                bytes.put_u64_le(topic_meta.max_topic_size.into());
-                bytes.put_u8(topic_meta.replication_factor);
-                bytes.put_u64_le(total_size);
-                bytes.put_u64_le(total_messages);
-                bytes.put_u8(topic_meta.name.len() as u8);
-                bytes.put_slice(topic_meta.name.as_bytes());
-            }
-
-            bytes.freeze()
-        })
+        Ok(())
     }
 }
