@@ -196,7 +196,7 @@ mod tests {
     #[test]
     fn mux_state_machine_full_envelope_roundtrip() {
         use crate::impls::metadata::IggySnapshot;
-        use crate::impls::metadata::Snapshot;
+        use crate::stm::snapshot::Snapshot;
 
         let users: Users = UsersInner::new().into();
         let streams: Streams = StreamsInner::new().into();

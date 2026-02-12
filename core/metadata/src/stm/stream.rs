@@ -519,7 +519,7 @@ impl Snapshotable for Streams {
     type Snapshot = StreamsSnapshot;
 
     fn to_snapshot(&self) -> Self::Snapshot {
-        self.snapshot_read(|inner| {
+        self.inner.read(|inner| {
             let items: Vec<(usize, StreamSnapshot)> = inner
                 .items
                 .iter()
@@ -584,12 +584,10 @@ impl Snapshotable for Streams {
     fn from_snapshot(
         snapshot: Self::Snapshot,
     ) -> Result<Self, crate::stm::snapshot::SnapshotError> {
-        use crate::stm::snapshot::SnapshotError;
-
-        let mut items: Slab<Stream> = Slab::new();
         let mut index: AHashMap<Arc<str>, usize> = AHashMap::new();
+        let mut stream_entries: Vec<(usize, Stream)> = Vec::new();
 
-        for (expected_id, stream_snap) in snapshot.items {
+        for (slab_key, stream_snap) in snapshot.items {
             let stream_stats = Arc::new(StreamStats::default());
             stream_stats.store_from_snapshot(
                 stream_snap.stats.size_bytes,
@@ -597,10 +595,10 @@ impl Snapshotable for Streams {
                 stream_snap.stats.segments_count,
             );
 
-            let mut topics: Slab<Topic> = Slab::new();
             let mut topic_index: AHashMap<Arc<str>, usize> = AHashMap::new();
+            let mut topic_entries: Vec<(usize, Topic)> = Vec::new();
 
-            for (expected_topic_id, topic_snap) in stream_snap.topics {
+            for (topic_slab_key, topic_snap) in stream_snap.topics {
                 let topic_stats = Arc::new(TopicStats::new(stream_stats.clone()));
                 topic_stats.store_from_snapshot(
                     topic_snap.stats.size_bytes,
@@ -627,16 +625,11 @@ impl Snapshotable for Streams {
                         .collect(),
                     round_robin_counter: Arc::new(AtomicUsize::new(topic_snap.round_robin_counter)),
                 };
-                let actual_topic_id = topics.insert(topic);
-                if actual_topic_id != expected_topic_id {
-                    return Err(SnapshotError::SlabIdMismatch {
-                        section: "streams.topics",
-                        expected: expected_topic_id,
-                        actual: actual_topic_id,
-                    });
-                }
-                topic_index.insert(topic_name, actual_topic_id);
+                topic_index.insert(topic_name, topic_slab_key);
+                topic_entries.push((topic_slab_key, topic));
             }
+
+            let topics: Slab<Topic> = topic_entries.into_iter().collect();
 
             let stream_name: Arc<str> = Arc::from(stream_snap.name.as_str());
             let stream = Stream {
@@ -648,17 +641,11 @@ impl Snapshotable for Streams {
                 topic_index,
             };
 
-            let actual_id = items.insert(stream);
-            if actual_id != expected_id {
-                return Err(SnapshotError::SlabIdMismatch {
-                    section: "streams",
-                    expected: expected_id,
-                    actual: actual_id,
-                });
-            }
-            index.insert(stream_name, actual_id);
+            index.insert(stream_name, slab_key);
+            stream_entries.push((slab_key, stream));
         }
 
+        let items: Slab<Stream> = stream_entries.into_iter().collect();
         let inner = StreamsInner { index, items };
         Ok(inner.into())
     }

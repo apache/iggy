@@ -307,7 +307,7 @@ impl Snapshotable for Users {
     type Snapshot = UsersSnapshot;
 
     fn to_snapshot(&self) -> Self::Snapshot {
-        self.snapshot_read(|inner| {
+        self.inner.read(|inner| {
             let items: Vec<(usize, UserSnapshot)> = inner
                 .items
                 .iter()
@@ -399,12 +399,10 @@ impl Snapshotable for Users {
     fn from_snapshot(
         snapshot: Self::Snapshot,
     ) -> Result<Self, crate::stm::snapshot::SnapshotError> {
-        use crate::stm::snapshot::SnapshotError;
-
-        let mut items: Slab<User> = Slab::new();
         let mut index: AHashMap<Arc<str>, UserId> = AHashMap::new();
+        let mut user_entries: Vec<(usize, User)> = Vec::new();
 
-        for (expected_id, user_snap) in snapshot.items {
+        for (slab_key, user_snap) in snapshot.items {
             let username: Arc<str> = Arc::from(user_snap.username.as_str());
             let user = User {
                 id: user_snap.id,
@@ -415,16 +413,11 @@ impl Snapshotable for Users {
                 permissions: user_snap.permissions.map(Arc::new),
             };
 
-            let actual_id = items.insert(user);
-            if actual_id != expected_id {
-                return Err(SnapshotError::SlabIdMismatch {
-                    section: "users",
-                    expected: expected_id,
-                    actual: actual_id,
-                });
-            }
-            index.insert(username, actual_id as UserId);
+            index.insert(username, slab_key as UserId);
+            user_entries.push((slab_key, user));
         }
+
+        let items: Slab<User> = user_entries.into_iter().collect();
 
         let mut personal_access_tokens: AHashMap<UserId, AHashMap<Arc<str>, PersonalAccessToken>> =
             AHashMap::new();

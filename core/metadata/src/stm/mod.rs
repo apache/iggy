@@ -190,15 +190,6 @@ macro_rules! define_state {
                     left_right.into()
                 }
             }
-
-            impl $state {
-                pub fn snapshot_read<F, R>(&self, f: F) -> R
-                where
-                    F: FnOnce(&[<$state Inner>]) -> R,
-                {
-                    self.inner.read(f)
-                }
-            }
         }
     };
 }
