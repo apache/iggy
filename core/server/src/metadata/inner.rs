@@ -20,6 +20,7 @@ use ahash::{AHashMap, AHashSet};
 use iggy_common::{GlobalPermissions, PersonalAccessToken, StreamPermissions};
 use slab::Slab;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 
 #[derive(Clone, Default)]
 pub struct InnerMetadata {
@@ -45,6 +46,9 @@ pub struct InnerMetadata {
     pub users_can_send_all_streams: AHashSet<UserId>,
     pub users_can_poll_stream: AHashSet<(UserId, StreamId)>,
     pub users_can_send_stream: AHashSet<(UserId, StreamId)>,
+
+    /// Global pending revocation count, shared across left-right copies.
+    pub pending_revocations_count: Arc<AtomicUsize>,
 }
 
 impl InnerMetadata {

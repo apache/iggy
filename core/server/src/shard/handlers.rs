@@ -352,6 +352,30 @@ async fn handle_request(
 
             Ok(ShardResponse::LeaveConsumerGroupMetadataOnlyResponse)
         }
+        ShardRequestPayload::CompletePartitionRevocation {
+            stream_id,
+            topic_id,
+            group_id,
+            member_slab_id,
+            member_id,
+            partition_id,
+        } => {
+            assert_eq!(
+                shard.id, 0,
+                "CompletePartitionRevocation should only be handled by shard0"
+            );
+
+            shard.writer().complete_partition_revocation(
+                stream_id,
+                topic_id,
+                group_id,
+                member_slab_id,
+                member_id,
+                partition_id,
+            );
+
+            Ok(ShardResponse::CompletePartitionRevocationResponse)
+        }
         ShardRequestPayload::SocketTransfer {
             fd,
             from_shard,
