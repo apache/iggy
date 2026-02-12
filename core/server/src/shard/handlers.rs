@@ -26,12 +26,13 @@ use crate::{
             message::{ShardMessage, ShardRequest, ShardRequestPayload},
         },
     },
+    streaming::utils::crypto,
     tcp::{
         connection_handler::{ConnectionAction, handle_connection, handle_error},
         tcp_listener::cleanup_connection,
     },
 };
-use compio_net::TcpStream;
+use compio::net::TcpStream;
 use iggy_common::sharding::IggyNamespace;
 use iggy_common::{Identifier, IggyError, SenderKind, TransportProtocol};
 use nix::sys::stat::SFlag;
@@ -406,7 +407,7 @@ async fn handle_request(
 
             let command = iggy_common::create_user::CreateUser {
                 username,
-                password,
+                password: crypto::hash_password(&password),
                 status,
                 permissions,
             };
@@ -560,8 +561,8 @@ async fn handle_request(
 
             let command = iggy_common::change_password::ChangePassword {
                 user_id,
-                current_password,
-                new_password,
+                current_password: "".into(),
+                new_password: crypto::hash_password(&new_password),
             };
             shard
                 .state

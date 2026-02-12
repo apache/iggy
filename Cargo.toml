@@ -106,20 +106,21 @@ clap_complete = "4.5.65"
 clock = { path = "core/clock" }
 colored = "3.1.1"
 comfy-table = "7.2.2"
-compio = { version = "0.17.0", features = [
+compio = { version = "0.18.0", features = [
     "runtime",
     "macros",
     "io-uring",
     "time",
     "rustls",
+    "ring",
+    "net",
+    "quic",
+    "tls",
+    "ws",
+    "fs",
 ] }
-compio-io = "0.8.4"
-compio-net = "0.10.0"
-compio-quic = "0.6.0"
-compio-tls = { version = "0.8.0", features = [
-    "rustls",
-], default-features = false }
-compio-ws = "0.2.0"
+# Pin compio-driver >= 0.11.2 to fix musl compilation (compio-rs/compio#668)
+compio-driver = "0.11.2"
 configs = { path = "core/configs", version = "0.1.0" }
 configs_derive = { path = "core/configs_derive", version = "0.1.0" }
 consensus = { path = "core/consensus" }
@@ -128,8 +129,8 @@ crossbeam = "0.8.4"
 ctor = "0.6.3"
 ctrlc = { version = "3.5", features = ["termination"] }
 cucumber = "0.22"
-cyper = { version = "0.7.1", features = ["rustls"], default-features = false }
-cyper-axum = { version = "0.7.1" }
+cyper = { version = "0.8.0", features = ["rustls"], default-features = false }
+cyper-axum = { version = "0.8.0" }
 darling = "0.20"
 dashmap = "6.1.0"
 derive-new = "0.7.0"

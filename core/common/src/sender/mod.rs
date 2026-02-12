@@ -34,8 +34,8 @@ use compio::BufResult;
 use compio::buf::IoBufMut;
 use compio::io::{AsyncReadExt, AsyncWriteExt};
 use compio::net::TcpStream;
-use compio_quic::{RecvStream, SendStream};
-use compio_tls::TlsStream;
+use compio::quic::{RecvStream, SendStream};
+use compio::tls::TlsStream;
 use std::future::Future;
 #[cfg(unix)]
 use std::os::fd::{AsFd, OwnedFd};

@@ -18,7 +18,8 @@
 
 use super::memory_pool::{BytesMutExt, memory_pool};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use compio::buf::{IoBuf, IoBufMut, SetBufInit};
+use compio::buf::{IoBuf, IoBufMut, SetLen};
+use std::mem::MaybeUninit;
 use std::ops::{Deref, DerefMut};
 
 /// A buffer wrapper that participates in memory pooling.
@@ -267,7 +268,7 @@ impl Buf for PooledBuffer {
     }
 
     fn advance(&mut self, cnt: usize) {
-        self.inner.advance(cnt)
+        Buf::advance(&mut self.inner, cnt)
     }
 
     fn chunks_vectored<'t>(&'t self, dst: &mut [std::io::IoSlice<'t>]) -> usize {
@@ -275,32 +276,22 @@ impl Buf for PooledBuffer {
     }
 }
 
-impl SetBufInit for PooledBuffer {
-    unsafe fn set_buf_init(&mut self, len: usize) {
-        if self.inner.len() <= len {
-            unsafe {
-                self.inner.set_len(len);
-            }
-        }
+impl SetLen for PooledBuffer {
+    unsafe fn set_len(&mut self, len: usize) {
+        unsafe { self.inner.set_len(len) };
     }
 }
 
-unsafe impl IoBufMut for PooledBuffer {
-    fn as_buf_mut_ptr(&mut self) -> *mut u8 {
-        self.inner.as_mut_ptr()
+impl IoBuf for PooledBuffer {
+    fn as_init(&self) -> &[u8] {
+        &self.inner[..]
     }
 }
 
-unsafe impl IoBuf for PooledBuffer {
-    fn as_buf_ptr(&self) -> *const u8 {
-        self.inner.as_buf_ptr()
-    }
-
-    fn buf_len(&self) -> usize {
-        self.inner.len()
-    }
-
-    fn buf_capacity(&self) -> usize {
-        self.inner.capacity()
+impl IoBufMut for PooledBuffer {
+    fn as_uninit(&mut self) -> &mut [MaybeUninit<u8>] {
+        let ptr = self.inner.as_mut_ptr().cast::<MaybeUninit<u8>>();
+        let cap = self.inner.capacity();
+        unsafe { std::slice::from_raw_parts_mut(ptr, cap) }
     }
 }

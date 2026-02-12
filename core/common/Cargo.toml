@@ -40,9 +40,6 @@ chrono = { workspace = true }
 clap = { workspace = true }
 comfy-table = { workspace = true }
 compio = { workspace = true }
-compio-quic = { workspace = true }
-compio-tls = { workspace = true }
-compio-ws = { workspace = true }
 crossbeam = { workspace = true }
 derive_more = { workspace = true }
 err_trail = { workspace = true }

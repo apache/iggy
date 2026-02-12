@@ -17,3 +17,4 @@
  */
 
 mod verify_after_server_restart;
+mod verify_user_login_after_restart;
