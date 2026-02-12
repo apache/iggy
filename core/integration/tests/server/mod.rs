@@ -21,5 +21,6 @@ mod concurrent_addition;
 mod general;
 mod message_cleanup;
 mod message_retrieval;
+mod purge_delete;
 mod scenarios;
 mod specific;

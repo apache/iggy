@@ -65,7 +65,12 @@ impl ServerCommandHandler for DeleteSegments {
         let request = ShardRequest::data_plane(namespace, payload);
 
         match shard.send_to_data_plane(request).await? {
-            ShardResponse::DeleteSegments => {
+            ShardResponse::DeleteSegments {
+                deleted_segments,
+                deleted_messages,
+            } => {
+                shard.metrics.decrement_segments(deleted_segments as u32);
+                shard.metrics.decrement_messages(deleted_messages);
                 sender.send_empty_ok_response().await?;
             }
             ShardResponse::ErrorResponse(err) => return Err(err),

@@ -65,7 +65,7 @@ pub use communication::calculate_shard_assignment;
 
 pub const COMPONENT: &str = "SHARD";
 pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
-pub const BROADCAST_TIMEOUT: Duration = Duration::from_secs(500);
+pub const BROADCAST_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub struct IggyShard {
     pub id: u16,
@@ -228,7 +228,6 @@ impl IggyShard {
                 use crate::streaming::partitions::storage::{
                     load_consumer_group_offsets, load_consumer_offsets,
                 };
-                use ahash::HashMap;
 
                 let consumer_offset_path =
                     self.config
@@ -239,22 +238,27 @@ impl IggyShard {
                     .system
                     .get_consumer_group_offsets_path(stream_id, topic_id, partition_id);
 
-                let consumer_offsets = Arc::new(
-                    load_consumer_offsets(&consumer_offset_path)
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(|offset| (offset.consumer_id as usize, offset))
-                        .collect::<HashMap<usize, _>>()
-                        .into(),
-                );
+                // Reuse metadata's Arcs so both metadata and local_partitions
+                // reference the same allocation — writes via store_consumer_offset
+                // (metadata path) are visible to delete_oldest_segments (local path).
+                let consumer_offsets = init_info.consumer_offsets;
+                let consumer_group_offsets = init_info.consumer_group_offsets;
 
-                let consumer_group_offsets = Arc::new(
-                    load_consumer_group_offsets(&consumer_group_offsets_path)
+                {
+                    let guard = consumer_offsets.pin();
+                    for co in load_consumer_offsets(&consumer_offset_path).unwrap_or_default() {
+                        guard.insert(co.consumer_id as usize, co);
+                    }
+                }
+
+                {
+                    let guard = consumer_group_offsets.pin();
+                    for (cg_id, co) in load_consumer_group_offsets(&consumer_group_offsets_path)
                         .unwrap_or_default()
-                        .into_iter()
-                        .collect::<HashMap<_, _>>()
-                        .into(),
-                );
+                    {
+                        guard.insert(cg_id, co);
+                    }
+                }
 
                 let message_deduplicator =
                     create_message_deduplicator(&self.config.system).map(Arc::new);
@@ -302,11 +306,7 @@ impl IggyShard {
                         // should get offset 0.
                         let should_increment_offset = current_offset > 0;
 
-                        let revision_id = self
-                            .metadata
-                            .get_partition_init_info(stream_id, topic_id, partition_id)
-                            .map(|info| info.revision_id)
-                            .unwrap_or(0);
+                        let revision_id = init_info.revision_id;
 
                         let partition = LocalPartition::with_log(
                             loaded_log,

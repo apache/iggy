@@ -193,57 +193,25 @@ impl IggyShard {
         Ok(topic_info)
     }
 
+    /// Clears in-memory state for a topic: consumer offsets and stats.
+    /// Called on the control plane before broadcasting to other shards.
     pub async fn purge_topic(&self, topic: ResolvedTopic) -> Result<(), IggyError> {
-        let stream = topic.stream_id;
-        let topic_id = topic.topic_id;
-
-        let partition_ids = self.metadata.get_partition_ids(stream, topic_id);
-
-        let mut all_consumer_paths = Vec::new();
-        let mut all_group_paths = Vec::new();
-
-        for partition_id in &partition_ids {
-            let ns = IggyNamespace::new(stream, topic_id, *partition_id);
-            if let Some(partition) = self.local_partitions.borrow().get(&ns) {
-                all_consumer_paths.extend(
-                    partition
-                        .consumer_offsets
-                        .pin()
-                        .iter()
-                        .map(|item| item.1.path.clone()),
-                );
-                all_group_paths.extend(
-                    partition
-                        .consumer_group_offsets
-                        .pin()
-                        .iter()
-                        .map(|item| item.1.path.clone()),
-                );
-            }
-        }
-
-        for path in all_consumer_paths {
-            self.delete_consumer_offset_from_disk(&path).await?;
-        }
-        for path in all_group_paths {
-            self.delete_consumer_offset_from_disk(&path).await?;
-        }
-
-        self.purge_topic_inner(topic).await
-    }
-
-    pub(crate) async fn purge_topic_inner(&self, topic: ResolvedTopic) -> Result<(), IggyError> {
         let stream = topic.stream_id;
         let topic_id = topic.topic_id;
         let partition_ids = self.metadata.get_partition_ids(stream, topic_id);
 
         for &partition_id in &partition_ids {
-            let ns = IggyNamespace::new(stream, topic_id, partition_id);
-
-            let has_partition = self.local_partitions.borrow().contains(&ns);
-            if has_partition {
-                self.delete_segments(stream, topic_id, partition_id, u32::MAX)
-                    .await?;
+            if let Some(offsets) =
+                self.metadata
+                    .get_partition_consumer_offsets(stream, topic_id, partition_id)
+            {
+                offsets.pin().clear();
+            }
+            if let Some(offsets) =
+                self.metadata
+                    .get_partition_consumer_group_offsets(stream, topic_id, partition_id)
+            {
+                offsets.pin().clear();
             }
         }
 
@@ -256,6 +224,28 @@ impl IggyShard {
             if let Some(partition_stats) = self.metadata.get_partition_stats(&ns) {
                 partition_stats.zero_out_all();
             }
+        }
+
+        Ok(())
+    }
+
+    /// Disk cleanup for local partitions: deletes consumer offset files and purges segments.
+    /// Called on each shard (including shard 0) after in-memory state is cleared.
+    pub(crate) async fn purge_topic_local(&self, topic: ResolvedTopic) -> Result<(), IggyError> {
+        let stream = topic.stream_id;
+        let topic_id = topic.topic_id;
+        let partition_ids = self.metadata.get_partition_ids(stream, topic_id);
+
+        for &partition_id in &partition_ids {
+            let ns = IggyNamespace::new(stream, topic_id, partition_id);
+            if !self.local_partitions.borrow().contains(&ns) {
+                continue;
+            }
+
+            self.delete_all_consumer_offset_files(stream, topic_id, partition_id)
+                .await?;
+            self.purge_all_segments(stream, topic_id, partition_id)
+                .await?;
         }
 
         Ok(())

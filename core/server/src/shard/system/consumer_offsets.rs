@@ -391,4 +391,48 @@ impl IggyShard {
     pub async fn delete_consumer_offset_from_disk(&self, path: &str) -> Result<(), IggyError> {
         crate::streaming::partitions::storage::delete_persisted_offset(path).await
     }
+
+    /// Enumerates and deletes all consumer/group offset files for a partition from disk.
+    /// Uses filesystem paths from config rather than in-memory state (which may already be cleared).
+    pub async fn delete_all_consumer_offset_files(
+        &self,
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
+    ) -> Result<(), IggyError> {
+        let consumers_path =
+            self.config
+                .system
+                .get_consumer_offsets_path(stream_id, topic_id, partition_id);
+        let groups_path =
+            self.config
+                .system
+                .get_consumer_group_offsets_path(stream_id, topic_id, partition_id);
+
+        Self::delete_all_files_in_dir(&consumers_path).await?;
+        Self::delete_all_files_in_dir(&groups_path).await?;
+        Ok(())
+    }
+
+    async fn delete_all_files_in_dir(dir: &str) -> Result<(), IggyError> {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                return Err(IggyError::IoError(format!(
+                    "Failed to read directory {dir}: {e}"
+                )));
+            }
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                crate::streaming::partitions::storage::delete_persisted_offset(
+                    &path.to_string_lossy(),
+                )
+                .await?;
+            }
+        }
+        Ok(())
+    }
 }

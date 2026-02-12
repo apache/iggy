@@ -120,15 +120,18 @@ async fn handle_request(
         }
         ShardRequestPayload::DeleteSegments { segments_count } => {
             let ns = namespace.expect("DeleteSegments requires routing namespace");
-            shard
-                .delete_segments(
+            let (deleted_segments, deleted_messages) = shard
+                .delete_oldest_segments(
                     ns.stream_id(),
                     ns.topic_id(),
                     ns.partition_id(),
                     segments_count,
                 )
                 .await?;
-            Ok(ShardResponse::DeleteSegments)
+            Ok(ShardResponse::DeleteSegments {
+                deleted_segments,
+                deleted_messages,
+            })
         }
         ShardRequestPayload::CleanTopicMessages {
             stream_id,
@@ -220,7 +223,7 @@ async fn handle_request(
                 "DeleteUserRequest should only be handled by shard0"
             );
             let user = execution::execute_delete_user(shard, user_id, command).await?;
-            Ok(ShardResponse::DeletedUser(user))
+            Ok(ShardResponse::DeleteUserResponse(user))
         }
         ShardRequestPayload::UpdateStreamRequest { user_id, command } => {
             assert_eq!(
@@ -486,7 +489,7 @@ pub async fn handle_event(shard: &Rc<IggyShard>, event: ShardEvent) -> Result<()
         }
         ShardEvent::PurgedStream { stream_id } => {
             let stream = shard.resolve_stream(&stream_id)?;
-            shard.purge_stream(stream).await?;
+            shard.purge_stream_local(stream).await?;
             Ok(())
         }
         ShardEvent::PurgedTopic {
@@ -494,7 +497,7 @@ pub async fn handle_event(shard: &Rc<IggyShard>, event: ShardEvent) -> Result<()
             topic_id,
         } => {
             let topic = shard.resolve_topic(&stream_id, &topic_id)?;
-            shard.purge_topic(topic).await?;
+            shard.purge_topic_local(topic).await?;
             Ok(())
         }
         ShardEvent::AddressBound { protocol, address } => {

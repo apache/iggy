@@ -146,6 +146,7 @@ impl IggyShard {
         Ok(stream_info)
     }
 
+    /// Clears in-memory state for all topics in a stream.
     pub async fn purge_stream(&self, stream: ResolvedStream) -> Result<(), IggyError> {
         let stream_id = stream.id();
         let topic_ids = self.metadata.get_topic_ids(stream_id);
@@ -156,6 +157,22 @@ impl IggyShard {
                 topic_id,
             };
             self.purge_topic(topic).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Disk cleanup for local partitions across all topics in a stream.
+    pub(crate) async fn purge_stream_local(&self, stream: ResolvedStream) -> Result<(), IggyError> {
+        let stream_id = stream.id();
+        let topic_ids = self.metadata.get_topic_ids(stream_id);
+
+        for topic_id in topic_ids {
+            let topic = ResolvedTopic {
+                stream_id,
+                topic_id,
+            };
+            self.purge_topic_local(topic).await?;
         }
 
         Ok(())

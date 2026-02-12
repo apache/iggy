@@ -172,24 +172,6 @@ impl MetadataWriter {
         self.publish();
     }
 
-    pub fn set_partition_offsets(
-        &mut self,
-        stream_id: StreamId,
-        topic_id: TopicId,
-        partition_id: PartitionId,
-        consumer_offsets: Arc<ConsumerOffsets>,
-        consumer_group_offsets: Arc<ConsumerGroupOffsets>,
-    ) {
-        self.append(MetadataOp::SetPartitionOffsets {
-            stream_id,
-            topic_id,
-            partition_id,
-            consumer_offsets,
-            consumer_group_offsets,
-        });
-        self.publish();
-    }
-
     pub fn add_user(&mut self, meta: UserMeta) -> UserId {
         let assigned_id = Arc::new(AtomicUsize::new(usize::MAX));
         self.append(MetadataOp::AddUser {

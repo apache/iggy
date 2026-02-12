@@ -270,101 +270,149 @@ impl IggyShard {
         Ok((1, messages_in_segment))
     }
 
-    pub(crate) async fn delete_segments(
+    /// Deletes the N oldest **sealed** segments from a partition, preserving the active segment
+    /// and partition offset. Reuses `remove_segment_by_offset` — same logic as the message cleaner.
+    ///
+    /// Segments containing unconsumed messages are protected: a segment is only eligible for
+    /// deletion if `end_offset <= min_committed_offset` across all consumers and consumer groups.
+    /// If no consumers exist, there is no barrier.
+    pub(crate) async fn delete_oldest_segments(
         &self,
-        stream: usize,
-        topic: usize,
+        stream_id: usize,
+        topic_id: usize,
         partition_id: usize,
         segments_count: u32,
-    ) -> Result<(), IggyError> {
-        let namespace = IggyNamespace::new(stream, topic, partition_id);
+    ) -> Result<(u64, u64), IggyError> {
+        let ns = IggyNamespace::new(stream_id, topic_id, partition_id);
 
-        // Drain segments from local_partitions
+        let sealed_offsets: Vec<u64> = {
+            let partitions = self.local_partitions.borrow();
+            let Some(partition) = partitions.get(&ns) else {
+                return Ok((0, 0));
+            };
+
+            let min_committed = Self::min_committed_offset(
+                &partition.consumer_offsets,
+                &partition.consumer_group_offsets,
+            );
+
+            let segments = partition.log.segments();
+            let last_idx = segments.len().saturating_sub(1);
+
+            segments
+                .iter()
+                .enumerate()
+                .filter(|(idx, seg)| {
+                    *idx != last_idx
+                        && seg.sealed
+                        && min_committed.is_none_or(|barrier| seg.end_offset <= barrier)
+                })
+                .map(|(_, seg)| seg.start_offset)
+                .take(segments_count as usize)
+                .collect()
+        };
+
+        let mut total_segments = 0u64;
+        let mut total_messages = 0u64;
+        for offset in sealed_offsets {
+            let (s, m) = self
+                .remove_segment_by_offset(stream_id, topic_id, partition_id, offset)
+                .await?;
+            total_segments += s;
+            total_messages += m;
+        }
+        Ok((total_segments, total_messages))
+    }
+
+    /// Returns the minimum committed offset across all consumers and consumer groups,
+    /// or `None` if no consumers exist (no barrier).
+    fn min_committed_offset(
+        consumer_offsets: &crate::streaming::partitions::consumer_offsets::ConsumerOffsets,
+        consumer_group_offsets: &crate::streaming::partitions::consumer_group_offsets::ConsumerGroupOffsets,
+    ) -> Option<u64> {
+        let co_guard = consumer_offsets.pin();
+        let cg_guard = consumer_group_offsets.pin();
+        let consumers = co_guard
+            .iter()
+            .map(|(_, co)| co.offset.load(std::sync::atomic::Ordering::Relaxed));
+        let groups = cg_guard
+            .iter()
+            .map(|(_, co)| co.offset.load(std::sync::atomic::Ordering::Relaxed));
+        consumers.chain(groups).min()
+    }
+
+    /// Drains all segments, deletes their files, and re-initializes the partition log at offset 0.
+    /// Used exclusively by `purge_topic_inner` — a destructive full reset.
+    pub(crate) async fn purge_all_segments(
+        &self,
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
+    ) -> Result<(), IggyError> {
+        let namespace = IggyNamespace::new(stream_id, topic_id, partition_id);
+
         let (segments, storages, stats) = {
             let mut partitions = self.local_partitions.borrow_mut();
             let partition = partitions
                 .get_mut(&namespace)
-                .expect("delete_segments_base: partition must exist in local_partitions");
+                .expect("purge_all_segments: partition must exist in local_partitions");
 
             let upperbound = partition.log.segments().len();
-            let begin = upperbound.saturating_sub(segments_count as usize);
             let segments = partition
                 .log
                 .segments_mut()
-                .drain(begin..upperbound)
+                .drain(..upperbound)
                 .collect::<Vec<_>>();
             let storages = partition
                 .log
                 .storages_mut()
-                .drain(begin..upperbound)
+                .drain(..upperbound)
                 .collect::<Vec<_>>();
             let _ = partition
                 .log
                 .indexes_mut()
-                .drain(begin..upperbound)
+                .drain(..upperbound)
                 .collect::<Vec<_>>();
             (segments, storages, partition.stats.clone())
         };
 
         for (mut storage, segment) in storages.into_iter().zip(segments.into_iter()) {
             let (msg_writer, index_writer) = storage.shutdown();
-            if let Some(msg_writer) = msg_writer
-                && let Some(index_writer) = index_writer
-            {
-                // We need to fsync before closing to ensure all data is written to disk.
-                msg_writer.fsync().await?;
-                index_writer.fsync().await?;
+            let start_offset = segment.start_offset;
+
+            let log_path = if let Some(msg_writer) = msg_writer {
                 let path = msg_writer.path();
                 drop(msg_writer);
-                drop(index_writer);
-                // File might not exist if never actually written to disk (lazy creation)
-                match compio::fs::remove_file(&path).await {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        tracing::debug!(
-                            "Segment file already gone or never created at path: {}",
-                            path
-                        );
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            "Failed to delete segment file at path: {}, err: {}",
-                            path,
-                            e
-                        );
-                        return Err(IggyError::CannotDeleteFile);
-                    }
-                }
+                path
             } else {
-                let start_offset = segment.start_offset;
-                let path = self.config.system.get_messages_file_path(
-                    stream,
-                    topic,
+                self.config.system.get_messages_file_path(
+                    stream_id,
+                    topic_id,
                     partition_id,
                     start_offset,
-                );
-                // File might not exist if segment was never written to (lazy creation)
-                match compio::fs::remove_file(&path).await {
+                )
+            };
+            drop(index_writer);
+
+            let index_path =
+                self.config
+                    .system
+                    .get_index_path(stream_id, topic_id, partition_id, start_offset);
+
+            for path in [&log_path, &index_path] {
+                match compio::fs::remove_file(path).await {
                     Ok(()) => {}
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        tracing::debug!(
-                            "Segment file already gone or never created at path: {}",
-                            path
-                        );
+                        tracing::debug!("File already gone at path: {path}");
                     }
                     Err(e) => {
-                        tracing::error!(
-                            "Failed to delete segment file at path: {}, err: {}",
-                            path,
-                            e
-                        );
+                        tracing::error!("Failed to delete file at path: {path}, err: {e}");
                         return Err(IggyError::CannotDeleteFile);
                     }
                 }
             }
         }
 
-        // Add segment directly to local_partitions
         self.init_log_in_local_partitions(&namespace).await?;
         stats.increment_segments_count(1);
         Ok(())
@@ -374,9 +422,7 @@ impl IggyShard {
     ///
     /// The log is momentarily empty between `delete_segments`' drain and this call, which is
     /// safe because the message pump serializes all handlers — no concurrent operation can
-    /// observe the empty state. The new segment reuses the offset-0 file path; writers
-    /// open with `truncate(true)` when `!file_exists` to clear any stale data from a
-    /// previous incarnation at the same path.
+    /// observe the empty state.
     async fn init_log_in_local_partitions(
         &self,
         namespace: &IggyNamespace,

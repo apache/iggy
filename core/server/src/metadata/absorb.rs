@@ -169,22 +169,6 @@ fn apply_op(metadata: &mut InnerMetadata, op: &MetadataOp, populate_ids: bool) {
             }
         }
 
-        MetadataOp::SetPartitionOffsets {
-            stream_id,
-            topic_id,
-            partition_id,
-            consumer_offsets,
-            consumer_group_offsets,
-        } => {
-            if let Some(stream) = metadata.streams.get_mut(*stream_id)
-                && let Some(topic) = stream.topics.get_mut(*topic_id)
-                && let Some(partition) = topic.partitions.get_mut(*partition_id)
-            {
-                partition.consumer_offsets = consumer_offsets.clone();
-                partition.consumer_group_offsets = consumer_group_offsets.clone();
-            }
-        }
-
         MetadataOp::AddUser { meta, assigned_id } => {
             let entry = metadata.users.vacant_entry();
             let id = entry.key();

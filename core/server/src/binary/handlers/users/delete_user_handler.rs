@@ -52,11 +52,11 @@ impl ServerCommandHandler for DeleteUser {
         });
 
         match shard.send_to_control_plane(request).await? {
-            ShardResponse::DeletedUser(_) => {
+            ShardResponse::DeleteUserResponse(_) => {
                 sender.send_empty_ok_response().await?;
             }
             ShardResponse::ErrorResponse(err) => return Err(err),
-            _ => unreachable!("Expected DeletedUser"),
+            _ => unreachable!("Expected DeleteUserResponse"),
         }
 
         Ok(HandlerResult::Finished)

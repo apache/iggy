@@ -213,9 +213,9 @@ async fn delete_user(
     });
 
     match state.shard.send_to_control_plane(request).await? {
-        ShardResponse::DeletedUser(_) => Ok(StatusCode::NO_CONTENT),
+        ShardResponse::DeleteUserResponse(_) => Ok(StatusCode::NO_CONTENT),
         ShardResponse::ErrorResponse(err) => Err(err.into()),
-        _ => unreachable!("Expected DeletedUser"),
+        _ => unreachable!("Expected DeleteUserResponse"),
     }
 }
 

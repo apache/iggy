@@ -63,7 +63,10 @@ pub enum ShardResponse {
     FlushUnsavedBuffer {
         flushed_count: u32,
     },
-    DeleteSegments,
+    DeleteSegments {
+        deleted_segments: u64,
+        deleted_messages: u64,
+    },
     CleanTopicMessages {
         deleted_segments: u64,
         deleted_messages: u64,
@@ -75,7 +78,7 @@ pub enum ShardResponse {
     UpdateTopicResponse,
     DeleteTopicResponse(usize),
     CreateUserResponse(User),
-    DeletedUser(User),
+    DeleteUserResponse(User),
     GetStatsResponse(Stats),
     CreatePartitionsResponse(Vec<usize>),
     DeletePartitionsResponse(Vec<usize>),

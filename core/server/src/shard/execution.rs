@@ -46,8 +46,6 @@ use iggy_common::{
     purge_stream::PurgeStream, purge_topic::PurgeTopic, update_permissions::UpdatePermissions,
     update_stream::UpdateStream, update_topic::UpdateTopic, update_user::UpdateUser,
 };
-use std::rc::Rc;
-
 pub struct DeleteStreamResult {
     pub stream_id: usize,
 }
@@ -65,7 +63,7 @@ pub struct DeletePartitionsResult {
 }
 
 pub async fn execute_create_stream(
-    shard: &Rc<IggyShard>,
+    shard: &IggyShard,
     user_id: u32,
     command: CreateStream,
 ) -> Result<StreamResponseData, IggyError> {
@@ -75,7 +73,10 @@ pub async fn execute_create_stream(
 
     // Capture response data from metadata before state apply
     let response_data = shard.metadata.with_metadata(|m| {
-        let stream = m.streams.get(stream_id).expect("just created");
+        let stream = m
+            .streams
+            .get(stream_id)
+            .expect("stream missing from metadata after creation");
         StreamResponseData {
             id: stream_id as u32,
             name: stream.name.clone(),
@@ -98,7 +99,7 @@ pub async fn execute_create_stream(
 }
 
 pub async fn execute_update_stream(
-    shard: &Rc<IggyShard>,
+    shard: &IggyShard,
     user_id: u32,
     command: UpdateStream,
 ) -> Result<(), IggyError> {
@@ -116,7 +117,7 @@ pub async fn execute_update_stream(
 }
 
 pub async fn execute_delete_stream(
-    shard: &Rc<IggyShard>,
+    shard: &IggyShard,
     user_id: u32,
     command: DeleteStream,
 ) -> Result<DeleteStreamResult, IggyError> {
@@ -165,7 +166,7 @@ pub async fn execute_delete_stream(
 }
 
 pub async fn execute_purge_stream(
-    shard: &Rc<IggyShard>,
+    shard: &IggyShard,
     user_id: u32,
     command: PurgeStream,
 ) -> Result<(), IggyError> {
@@ -173,6 +174,7 @@ pub async fn execute_purge_stream(
     shard.metadata.perm_purge_stream(user_id, stream.id())?;
 
     shard.purge_stream(stream).await?;
+    shard.purge_stream_local(stream).await?;
 
     shard
         .state
@@ -191,7 +193,7 @@ pub async fn execute_purge_stream(
 }
 
 pub async fn execute_create_topic(
-    shard: &Rc<IggyShard>,
+    shard: &IggyShard,
     user_id: u32,
     command: CreateTopic,
 ) -> Result<TopicResponseData, IggyError> {
@@ -222,7 +224,7 @@ pub async fn execute_create_topic(
             .streams
             .get(stream.id())
             .and_then(|s| s.topics.get(topic_id))
-            .expect("just created");
+            .expect("topic missing from metadata after creation");
         TopicResponseData {
             id: topic_id as u32,
             name: topic.name.clone(),
@@ -260,7 +262,7 @@ pub async fn execute_create_topic(
 }
 
 pub async fn execute_update_topic(
-    shard: &Rc<IggyShard>,
+    shard: &IggyShard,
     user_id: u32,
     command: UpdateTopic,
 ) -> Result<(), IggyError> {
@@ -287,7 +289,7 @@ pub async fn execute_update_topic(
 }
 
 pub async fn execute_delete_topic(
-    shard: &Rc<IggyShard>,
+    shard: &IggyShard,
     user_id: u32,
     command: DeleteTopic,
 ) -> Result<DeleteTopicResult, IggyError> {
@@ -327,7 +329,7 @@ pub async fn execute_delete_topic(
 }
 
 pub async fn execute_purge_topic(
-    shard: &Rc<IggyShard>,
+    shard: &IggyShard,
     user_id: u32,
     command: PurgeTopic,
 ) -> Result<(), IggyError> {
@@ -337,6 +339,7 @@ pub async fn execute_purge_topic(
         .perm_purge_topic(user_id, topic.stream_id, topic.topic_id)?;
 
     shard.purge_topic(topic).await?;
+    shard.purge_topic_local(topic).await?;
 
     shard
         .state
@@ -357,7 +360,7 @@ pub async fn execute_purge_topic(
 }
 
 pub async fn execute_create_partitions(
-    shard: &Rc<IggyShard>,
+    shard: &IggyShard,
     user_id: u32,
     command: CreatePartitions,
 ) -> Result<CreatePartitionsResult, IggyError> {
@@ -400,7 +403,7 @@ pub async fn execute_create_partitions(
 }
 
 pub async fn execute_delete_partitions(
-    shard: &Rc<IggyShard>,
+    shard: &IggyShard,
     user_id: u32,
     command: DeletePartitions,
 ) -> Result<DeletePartitionsResult, IggyError> {
@@ -446,7 +449,7 @@ pub async fn execute_delete_partitions(
 }
 
 pub async fn execute_create_consumer_group(
-    shard: &Rc<IggyShard>,
+    shard: &IggyShard,
     user_id: u32,
     command: CreateConsumerGroup,
 ) -> Result<ConsumerGroupResponseData, IggyError> {
@@ -465,7 +468,7 @@ pub async fn execute_create_consumer_group(
             name: cg.name.clone(),
             partitions_count: cg.partitions.len() as u32,
         })
-        .expect("just created");
+        .expect("consumer group missing from metadata after creation");
 
     shard
         .state
@@ -482,7 +485,7 @@ pub async fn execute_create_consumer_group(
 }
 
 pub async fn execute_delete_consumer_group(
-    shard: &Rc<IggyShard>,
+    shard: &IggyShard,
     user_id: u32,
     command: DeleteConsumerGroup,
 ) -> Result<(), IggyError> {
@@ -513,7 +516,7 @@ pub async fn execute_delete_consumer_group(
 }
 
 pub fn execute_join_consumer_group(
-    shard: &Rc<IggyShard>,
+    shard: &IggyShard,
     user_id: u32,
     client_id: u32,
     command: JoinConsumerGroup,
@@ -530,7 +533,7 @@ pub fn execute_join_consumer_group(
 }
 
 pub fn execute_leave_consumer_group(
-    shard: &Rc<IggyShard>,
+    shard: &IggyShard,
     user_id: u32,
     client_id: u32,
     command: LeaveConsumerGroup,
@@ -547,7 +550,7 @@ pub fn execute_leave_consumer_group(
 }
 
 pub async fn execute_create_user(
-    shard: &Rc<IggyShard>,
+    shard: &IggyShard,
     user_id: u32,
     command: iggy_common::create_user::CreateUser,
 ) -> Result<User, IggyError> {
@@ -578,7 +581,7 @@ pub async fn execute_create_user(
 }
 
 pub async fn execute_delete_user(
-    shard: &Rc<IggyShard>,
+    shard: &IggyShard,
     user_id: u32,
     command: DeleteUser,
 ) -> Result<User, IggyError> {
@@ -595,7 +598,7 @@ pub async fn execute_delete_user(
 }
 
 pub async fn execute_update_user(
-    shard: &Rc<IggyShard>,
+    shard: &IggyShard,
     user_id: u32,
     command: UpdateUser,
 ) -> Result<User, IggyError> {
@@ -612,7 +615,7 @@ pub async fn execute_update_user(
 }
 
 pub async fn execute_change_password(
-    shard: &Rc<IggyShard>,
+    shard: &IggyShard,
     user_id: u32,
     command: ChangePassword,
 ) -> Result<(), IggyError> {
@@ -643,7 +646,7 @@ pub async fn execute_change_password(
 }
 
 pub async fn execute_update_permissions(
-    shard: &Rc<IggyShard>,
+    shard: &IggyShard,
     user_id: u32,
     command: UpdatePermissions,
 ) -> Result<(), IggyError> {
@@ -665,7 +668,7 @@ pub async fn execute_update_permissions(
 }
 
 pub async fn execute_create_personal_access_token(
-    shard: &Rc<IggyShard>,
+    shard: &IggyShard,
     user_id: u32,
     command: CreatePersonalAccessToken,
 ) -> Result<(PersonalAccessToken, String), IggyError> {
@@ -687,7 +690,7 @@ pub async fn execute_create_personal_access_token(
 }
 
 pub async fn execute_delete_personal_access_token(
-    shard: &Rc<IggyShard>,
+    shard: &IggyShard,
     user_id: u32,
     command: DeletePersonalAccessToken,
 ) -> Result<(), IggyError> {
