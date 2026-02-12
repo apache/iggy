@@ -29,6 +29,7 @@ pub mod consumer_groups;
 pub mod consumer_offsets;
 pub mod messages;
 pub mod partitions;
+pub mod segments;
 pub mod personal_access_tokens;
 pub mod streams;
 pub mod system;
