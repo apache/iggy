@@ -4551,6 +4551,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "iggy-chaos"
+version = "0.1.0"
+dependencies = [
+ "ahash 0.8.12",
+ "async-trait",
+ "bytes",
+ "chrono",
+ "clap",
+ "crc32fast",
+ "iggy",
+ "iggy_common",
+ "rand 0.10.0",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "iggy-cli"
 version = "0.10.3-edge.1"
 dependencies = [
