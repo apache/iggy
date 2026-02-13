@@ -5070,11 +5070,8 @@ dependencies = [
  "iggy",
  "iggy_binary_protocol",
  "iggy_common",
-<<<<<<< HEAD
  "iggy_connector_sdk",
-=======
  "jsonwebtoken",
->>>>>>> b85afacb (test(integration): add A2A JWT unit test and e2e tests using iggy_harness macro)
  "keyring",
  "lazy_static",
  "libc",
