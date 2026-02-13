@@ -17,6 +17,7 @@
 
 pub mod consumer_group;
 pub mod mux;
+pub mod snapshot;
 pub mod stream;
 pub mod user;
 
@@ -85,6 +86,19 @@ where
     write: Option<WriteCell<T, C>>,
     #[allow(unused)]
     read: Arc<ReadHandle<T>>,
+}
+
+impl<T, C> LeftRight<T, C>
+where
+    T: Absorb<C>,
+{
+    pub fn read<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&T) -> R,
+    {
+        let guard = self.read.enter().expect("read handle should be accessible");
+        f(&*guard)
+    }
 }
 
 impl<T> From<T> for LeftRight<T, <T as Command>::Cmd>
