@@ -45,6 +45,7 @@ members = [
     "core/harness_derive",
     "core/integration",
     "core/journal",
+    "core/lab",
     "core/message_bus",
     "core/metadata",
     "core/partitions",

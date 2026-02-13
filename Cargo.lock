@@ -4622,6 +4622,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "iggy-lab"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "chrono",
+ "clap",
+ "iggy",
+ "iggy_common",
+ "rand 0.10.0",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "iggy-mcp"
 version = "0.2.3-edge.1"
 dependencies = [
