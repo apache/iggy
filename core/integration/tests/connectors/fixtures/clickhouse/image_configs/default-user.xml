@@ -1,0 +1,11 @@
+<?xml version="1.0"?>
+<!-- Override: allow default user connections from any network -->
+<clickhouse>
+  <users>
+    <default>
+      <networks>
+        <ip>::/0</ip>
+      </networks>
+    </default>
+  </users>
+</clickhouse>

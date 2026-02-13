@@ -1,0 +1,6 @@
+<?xml version="1.0"?>
+<!-- Neutralized: listen_host and listen_try are managed via config.xml -->
+<clickhouse>
+    <listen_host>0.0.0.0</listen_host>
+    <listen_try>1</listen_try>
+</clickhouse>

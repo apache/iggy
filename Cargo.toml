@@ -33,6 +33,7 @@ members = [
     "core/configs_derive",
     "core/connectors/runtime",
     "core/connectors/sdk",
+    "core/connectors/sinks/clickhouse_sink",
     "core/connectors/sinks/elasticsearch_sink",
     "core/connectors/sinks/iceberg_sink",
     "core/connectors/sinks/postgres_sink",
@@ -93,6 +94,7 @@ charming = "0.6.0"
 chrono = { version = "0.4.43", features = ["serde"] }
 clap = { version = "4.5.58", features = ["derive", "wrap_help"] }
 clap_complete = "4.5.66"
+clickhouse = { version = "0.14.2", features = ["rustls-tls", "rustls-tls-native-roots", "inserter"] }
 clock = { path = "core/clock" }
 colored = "3.1.1"
 comfy-table = "7.2.2"
@@ -259,7 +261,7 @@ syn = { version = "2", features = ["full", "extra-traits"] }
 sysinfo = "0.38.1"
 tempfile = "3.25.0"
 test-case = "3.3.1"
-testcontainers-modules = { version = "0.14.0", features = ["postgres"] }
+testcontainers-modules = { version = "0.14.0", features = ["postgres", "clickhouse"] }
 thiserror = "2.0.18"
 tokio = { version = "1.49.0", features = ["full"] }
 tokio-rustls = "0.26.4"
