@@ -17,11 +17,9 @@
 
 use crate::metadata::inner::InnerMetadata;
 use crate::metadata::{
-    ConsumerGroupId, ConsumerGroupMeta, PartitionId, PartitionMeta, StreamId, StreamMeta, TopicId,
-    TopicMeta, UserId, UserMeta,
+    ConsumerGroupId, ConsumerGroupMeta, PartitionMeta, StreamId, StreamMeta, TopicId, TopicMeta,
+    UserId, UserMeta,
 };
-use crate::streaming::partitions::consumer_group_offsets::ConsumerGroupOffsets;
-use crate::streaming::partitions::consumer_offsets::ConsumerOffsets;
 use iggy_common::{CompressionAlgorithm, IggyExpiry, MaxTopicSize, PersonalAccessToken};
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
@@ -70,13 +68,6 @@ pub enum MetadataOp {
         topic_id: TopicId,
         count: u32,
     },
-    SetPartitionOffsets {
-        stream_id: StreamId,
-        topic_id: TopicId,
-        partition_id: PartitionId,
-        consumer_offsets: Arc<ConsumerOffsets>,
-        consumer_group_offsets: Arc<ConsumerGroupOffsets>,
-    },
     AddUser {
         meta: UserMeta,
         assigned_id: Arc<AtomicUsize>,
@@ -114,6 +105,7 @@ pub enum MetadataOp {
         group_id: ConsumerGroupId,
         client_id: u32,
         member_id: Arc<AtomicUsize>,
+        valid_client_ids: Option<Vec<u32>>,
     },
     LeaveConsumerGroup {
         stream_id: StreamId,

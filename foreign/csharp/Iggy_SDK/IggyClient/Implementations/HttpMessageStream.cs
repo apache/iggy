@@ -559,6 +559,22 @@ public class HttpMessageStream : IIggyClient
         }
     }
 
+    /// <summary>
+    ///     This method is only supported in TCP protocol
+    /// </summary>
+    /// <param name="streamId">The identifier of the stream containing the topic (numeric ID or name).</param>
+    /// <param name="topicId">The identifier of the topic containing the partition (numeric ID or name).</param>
+    /// <param name="partitionId">The unique partition ID.</param>
+    /// <param name="segmentsCount">The number of segments to delete.</param>
+    /// <param name="token">The cancellation token to cancel the operation.</param>
+    /// <returns>A task representing the asynchronous operation.</returns>
+    /// <exception cref="FeatureUnavailableException"></exception>
+    public Task DeleteSegmentsAsync(Identifier streamId, Identifier topicId, uint partitionId,
+        uint segmentsCount, CancellationToken token = default)
+    {
+        throw new FeatureUnavailableException();
+    }
+
     /// <inheritdoc />
     public async Task CreatePartitionsAsync(Identifier streamId, Identifier topicId, uint partitionsCount,
         CancellationToken token = default)

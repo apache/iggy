@@ -656,8 +656,7 @@ pub fn map_topic(payload: Bytes) -> Result<TopicDetails, IggyError> {
         compression_algorithm: topic.compression_algorithm,
         max_topic_size: topic.max_topic_size,
         replication_factor: topic.replication_factor,
-        #[allow(clippy::cast_possible_truncation)]
-        partitions_count: partitions.len() as u32,
+        partitions_count: topic.partitions_count,
         partitions,
     };
     Ok(topic)

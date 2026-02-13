@@ -15,6 +15,22 @@
 # specific language governing permissions and limitations
 # under the License.
 
-[connectors]
-config_type = "local"
-config_dir = "tests/connectors/random/connectors_config"
+type = "sink"
+key = "quickwit"
+enabled = true
+version = 0
+name = "Quickwit sink"
+path = "../../target/release/libiggy_connector_quickwit_sink"
+verbose = false
+
+[[streams]]
+stream = ""
+topics = []
+schema = ""
+batch_length = 100
+poll_interval = "5ms"
+consumer_group = "quickwit_sink"
+
+[plugin_config]
+url = ""
+index = ""

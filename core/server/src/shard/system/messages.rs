@@ -20,7 +20,7 @@ use super::COMPONENT;
 use crate::shard::IggyShard;
 use crate::shard::transmission::frame::ShardResponse;
 use crate::shard::transmission::message::{
-    ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult,
+    ResolvedPartition, ResolvedTopic, ShardRequest, ShardRequestPayload,
 };
 use crate::streaming::partitions::journal::Journal;
 use crate::streaming::polling_consumer::PollingConsumer;
@@ -37,99 +37,45 @@ use std::sync::atomic::Ordering;
 use tracing::error;
 
 impl IggyShard {
+    /// Appends messages to partition. Permission must be checked by caller via
+    /// `resolve_topic_for_append()` before calling this method.
     pub async fn append_messages(
         &self,
-        user_id: u32,
-        stream_id: Identifier,
-        topic_id: Identifier,
-        partition_id: usize,
+        partition: ResolvedPartition,
         batch: IggyMessagesBatchMut,
     ) -> Result<(), IggyError> {
-        let (stream, topic, _) = self.resolve_partition_id(&stream_id, &topic_id, partition_id)?;
-
-        self.metadata
-            .perm_append_messages(user_id, stream, topic)
-            .error(|e: &IggyError| {
-                format!("{COMPONENT} (error: {e}) - permission denied to append messages for user {} on stream ID: {}, topic ID: {}", user_id, stream as u32, topic as u32)
-            })?;
-
         if batch.count() == 0 {
             return Ok(());
         }
 
-        // TODO(tungtose): DRY this code
-        let namespace = IggyNamespace::new(stream, topic, partition_id);
+        let namespace = IggyNamespace::new(
+            partition.stream_id,
+            partition.topic_id,
+            partition.partition_id,
+        );
+
         let payload = ShardRequestPayload::SendMessages { batch };
-        let request = ShardRequest::new(stream_id.clone(), topic_id.clone(), partition_id, payload);
-        let message = ShardMessage::Request(request);
-        match self
-            .send_request_to_shard_or_recoil(Some(&namespace), message)
-            .await?
-        {
-            ShardSendRequestResult::Recoil(message) => {
-                if let ShardMessage::Request(ShardRequest {
-                    stream_id: _,
-                    topic_id: _,
-                    partition_id,
-                    payload,
-                }) = message
-                    && let ShardRequestPayload::SendMessages { batch } = payload
-                {
-                    let batch = self.maybe_encrypt_messages(batch)?;
-                    let messages_count = batch.count();
+        let request = ShardRequest::data_plane(namespace, payload);
 
-                    let namespace = IggyNamespace::new(stream, topic, partition_id);
-                    self.ensure_partition(&namespace).await?;
-
-                    self.append_messages_to_local_partition(&namespace, batch, &self.config.system)
-                        .await?;
-
-                    self.metrics.increment_messages(messages_count as u64);
-                    Ok(())
-                } else {
-                    unreachable!(
-                        "Expected a SendMessages request inside of SendMessages handler, impossible state"
-                    );
-                }
-            }
-            ShardSendRequestResult::Response(response) => match response {
-                ShardResponse::SendMessages => Ok(()),
-                ShardResponse::ErrorResponse(err) => Err(err),
-                _ => unreachable!(
-                    "Expected a SendMessages response inside of SendMessages handler, impossible state"
-                ),
-            },
-        }?;
-
-        Ok(())
+        match self.send_to_data_plane(request).await? {
+            ShardResponse::SendMessages => Ok(()),
+            ShardResponse::ErrorResponse(err) => Err(err),
+            _ => unreachable!("Expected SendMessages response"),
+        }
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// Polls messages from partition. Permission must be checked by caller via
+    /// `resolve_topic_for_poll()` before calling this method.
     pub async fn poll_messages(
         &self,
         client_id: u32,
-        user_id: u32,
-        stream_id: Identifier,
-        topic_id: Identifier,
+        topic: ResolvedTopic,
         consumer: Consumer,
         maybe_partition_id: Option<u32>,
         args: PollingArgs,
     ) -> Result<(IggyPollMetadata, IggyMessagesBatchSet), IggyError> {
-        let (stream, topic) = self.resolve_topic_id(&stream_id, &topic_id)?;
-
-        self.metadata
-            .perm_poll_messages(user_id, stream, topic)
-            .error(|e: &IggyError| format!(
-                "{COMPONENT} (error: {e}) - permission denied to poll messages for user {} on stream ID: {}, topic ID: {}",
-                user_id,
-                stream_id,
-                topic
-            ))?;
-
-        // Resolve partition ID
         let Some((consumer, partition_id)) = self.resolve_consumer_with_partition_id(
-            &stream_id,
-            &topic_id,
+            topic,
             &consumer,
             client_id,
             maybe_partition_id,
@@ -139,71 +85,16 @@ impl IggyShard {
             return Ok((IggyPollMetadata::new(0, 0), IggyMessagesBatchSet::empty()));
         };
 
-        self.ensure_partition_exists(&stream_id, &topic_id, partition_id)?;
+        let namespace = IggyNamespace::new(topic.stream_id, topic.topic_id, partition_id);
 
-        let namespace = IggyNamespace::new(stream, topic, partition_id);
-
-        if args.count == 0 {
-            let current_offset = self
-                .local_partitions
-                .borrow()
-                .get(&namespace)
-                .map(|data| data.offset.load(Ordering::Relaxed))
-                .unwrap_or(0);
-            return Ok((
-                IggyPollMetadata::new(partition_id as u32, current_offset),
-                IggyMessagesBatchSet::empty(),
-            ));
-        }
-
-        // Offset validation is done by the owning shard after routing
         let payload = ShardRequestPayload::PollMessages { consumer, args };
-        let request = ShardRequest::new(stream_id.clone(), topic_id.clone(), partition_id, payload);
-        let message = ShardMessage::Request(request);
-        let (metadata, batch) = match self
-            .send_request_to_shard_or_recoil(Some(&namespace), message)
-            .await?
-        {
-            ShardSendRequestResult::Recoil(message) => {
-                if let ShardMessage::Request(ShardRequest {
-                    partition_id: _,
-                    payload,
-                    ..
-                }) = message
-                    && let ShardRequestPayload::PollMessages { consumer, args } = payload
-                {
-                    self.ensure_partition(&namespace).await?;
+        let request = ShardRequest::data_plane(namespace, payload);
 
-                    let auto_commit = args.auto_commit;
-
-                    let (poll_metadata, batches) = self
-                        .poll_messages_from_local_partition(&namespace, consumer, args)
-                        .await?;
-
-                    if auto_commit && !batches.is_empty() {
-                        let offset = batches
-                            .last_offset()
-                            .expect("Batch set should have at least one batch");
-                        self.auto_commit_consumer_offset_from_local_partition(
-                            &namespace, consumer, offset,
-                        )
-                        .await?;
-                    }
-                    Ok((poll_metadata, batches))
-                } else {
-                    unreachable!(
-                        "Expected a PollMessages request inside of PollMessages handler, impossible state"
-                    );
-                }
-            }
-            ShardSendRequestResult::Response(response) => match response {
-                ShardResponse::PollMessages(result) => Ok(result),
-                ShardResponse::ErrorResponse(err) => Err(err),
-                _ => unreachable!(
-                    "Expected a SendMessages response inside of SendMessages handler, impossible state"
-                ),
-            },
-        }?;
+        let (metadata, batch) = match self.send_to_data_plane(request).await? {
+            ShardResponse::PollMessages(result) => result,
+            ShardResponse::ErrorResponse(err) => return Err(err),
+            _ => unreachable!("Expected PollMessages response"),
+        };
 
         let batch = if let Some(encryptor) = &self.encryptor {
             self.decrypt_messages(batch, encryptor).await?
@@ -217,67 +108,28 @@ impl IggyShard {
     pub async fn flush_unsaved_buffer(
         &self,
         user_id: u32,
-        stream_id: Identifier,
-        topic_id: Identifier,
-        partition_id: usize,
+        partition: ResolvedPartition,
         fsync: bool,
     ) -> Result<(), IggyError> {
-        let (stream, topic, _) = self.resolve_partition_id(&stream_id, &topic_id, partition_id)?;
-
         self.metadata
-            .perm_append_messages(user_id, stream, topic)
+            .perm_append_messages(user_id, partition.stream_id, partition.topic_id)
             .error(|e: &IggyError| {
-                format!("{COMPONENT} (error: {e}) - permission denied to flush unsaved buffer for user {} on stream ID: {}, topic ID: {}", user_id, stream as u32, topic as u32)
+                format!("{COMPONENT} (error: {e}) - permission denied to flush unsaved buffer for user {} on stream ID: {}, topic ID: {}", user_id, partition.stream_id as u32, partition.topic_id as u32)
             })?;
 
-        let namespace = IggyNamespace::new(stream, topic, partition_id);
+        let namespace = IggyNamespace::new(
+            partition.stream_id,
+            partition.topic_id,
+            partition.partition_id,
+        );
         let payload = ShardRequestPayload::FlushUnsavedBuffer { fsync };
-        let request = ShardRequest::new(stream_id.clone(), topic_id.clone(), partition_id, payload);
-        let message = ShardMessage::Request(request);
-        match self
-            .send_request_to_shard_or_recoil(Some(&namespace), message)
-            .await?
-        {
-            ShardSendRequestResult::Recoil(message) => {
-                if let ShardMessage::Request(ShardRequest {
-                    partition_id,
-                    payload,
-                    ..
-                }) = message
-                    && let ShardRequestPayload::FlushUnsavedBuffer { fsync } = payload
-                {
-                    let namespace = IggyNamespace::new(stream, topic, partition_id);
-                    self.flush_unsaved_buffer_from_local_partitions(&namespace, fsync)
-                        .await?;
-                    Ok(())
-                } else {
-                    unreachable!(
-                        "Expected a FlushUnsavedBuffer request inside of FlushUnsavedBuffer handler, impossible state"
-                    );
-                }
-            }
-            ShardSendRequestResult::Response(response) => match response {
-                ShardResponse::FlushUnsavedBuffer => Ok(()),
-                ShardResponse::ErrorResponse(err) => Err(err),
-                _ => unreachable!(
-                    "Expected a FlushUnsavedBuffer response inside of FlushUnsavedBuffer handler, impossible state"
-                ),
-            },
-        }?;
+        let request = ShardRequest::data_plane(namespace, payload);
 
-        Ok(())
-    }
-
-    pub(crate) async fn flush_unsaved_buffer_base(
-        &self,
-        stream: usize,
-        topic: usize,
-        partition_id: usize,
-        fsync: bool,
-    ) -> Result<u32, IggyError> {
-        let namespace = IggyNamespace::new(stream, topic, partition_id);
-        self.flush_unsaved_buffer_from_local_partitions(&namespace, fsync)
-            .await
+        match self.send_to_data_plane(request).await? {
+            ShardResponse::FlushUnsavedBuffer { .. } => Ok(()),
+            ShardResponse::ErrorResponse(err) => Err(err),
+            _ => unreachable!("Expected FlushUnsavedBuffer response"),
+        }
     }
 
     /// Flushes unsaved messages from the partition store to disk.
@@ -287,16 +139,6 @@ impl IggyShard {
         namespace: &IggyNamespace,
         fsync: bool,
     ) -> Result<u32, IggyError> {
-        let write_lock = {
-            let partitions = self.local_partitions.borrow();
-            let Some(partition) = partitions.get(namespace) else {
-                return Ok(0);
-            };
-            partition.write_lock.clone()
-        };
-
-        let _write_guard = write_lock.lock().await;
-
         let frozen_batches = {
             let mut partitions = self.local_partitions.borrow_mut();
             let Some(partition) = partitions.get_mut(namespace) else {
@@ -442,22 +284,17 @@ impl IggyShard {
         Ok(())
     }
 
-    pub async fn append_messages_to_local_partition(
+    /// Appends a batch to the active segment, flushing to disk and rotating if needed.
+    ///
+    /// Safety: called exclusively from the message pump — segment indices captured before
+    /// internal `.await` points (prepare_for_persistence, persist, rotate) remain valid
+    /// because no other handler can modify the segment vec while this frame is in progress.
+    pub(crate) async fn append_messages_to_local_partition(
         &self,
         namespace: &IggyNamespace,
         mut batch: IggyMessagesBatchMut,
         config: &crate::configs::system::SystemConfig,
     ) -> Result<(), IggyError> {
-        let write_lock = {
-            let partitions = self.local_partitions.borrow();
-            let partition = partitions
-                .get(namespace)
-                .expect("local_partitions: partition must exist");
-            partition.write_lock.clone()
-        };
-
-        let _write_guard = write_lock.lock().await;
-
         let (
             current_offset,
             current_position,
@@ -657,9 +494,7 @@ impl IggyShard {
                 .get_mut(namespace)
                 .expect("local_partitions: partition must exist");
 
-            // Recalculate index: segment deletion during async I/O shifts indices
             let segment_index = partition.log.segments().len() - 1;
-
             let indexes = partition.log.indexes_mut()[segment_index]
                 .as_mut()
                 .expect("indexes must exist for segment being persisted");
@@ -675,7 +510,7 @@ impl IggyShard {
         Ok(batch_count)
     }
 
-    pub async fn poll_messages_from_local_partition(
+    pub(crate) async fn poll_messages_from_local_partition(
         &self,
         namespace: &IggyNamespace,
         consumer: crate::streaming::polling_consumer::PollingConsumer,

@@ -18,17 +18,17 @@
  */
 use crate::configs::connectors::{ConnectorsConfigProvider, SinkConfig, SourceConfig};
 use crate::configs::runtime::ConnectorsRuntimeConfig;
-use crate::manager::status::ConnectorError;
 use crate::metrics::Metrics;
 use crate::{
     SinkConnectorWrapper, SourceConnectorWrapper,
     manager::{
         sink::{SinkDetails, SinkInfo, SinkManager},
         source::{SourceDetails, SourceInfo, SourceManager},
-        status::ConnectorStatus,
     },
 };
 use iggy_common::IggyTimestamp;
+use iggy_connector_sdk::api::ConnectorError;
+use iggy_connector_sdk::api::ConnectorStatus;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::error;

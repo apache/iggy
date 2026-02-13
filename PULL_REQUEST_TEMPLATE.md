@@ -44,8 +44,7 @@ BAD:
 You must run your code locally before submitting.
 "Relying on CI" is not acceptable - PRs from authors who haven't run the code will be closed.
 
-Did you have `prek` installed? It runs automatically on commit. See [CONTRIBUTING.md](https://github.com/apache/iggy/blob/master/CONTRIBUTING.md).
-If not installed, explain why (e.g., non-Rust changes only, small change).
+Did you have `prek` installed? It runs automatically on commit and covers all project languages. See [CONTRIBUTING.md](https://github.com/apache/iggy/blob/master/CONTRIBUTING.md).
 -->
 
 ## AI Usage

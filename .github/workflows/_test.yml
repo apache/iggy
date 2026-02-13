@@ -104,6 +104,18 @@ jobs:
         with:
           task: ${{ inputs.task }}
 
+      - name: Upload Java coverage to Codecov
+        if: inputs.component == 'sdk-java' && inputs.task == 'test'
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: reports/java-coverage/jacocoAggregated.xml
+          disable_search: true
+          flags: java
+          fail_ci_if_error: false
+          verbose: true
+          override_pr: ${{ github.event.pull_request.number }}
+
       # C# SDK
       - name: Run C# SDK task
         if: inputs.component == 'sdk-csharp'

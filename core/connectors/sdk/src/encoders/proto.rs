@@ -18,6 +18,7 @@
 
 use crate::{Error, Payload, Schema, StreamEncoder};
 use base64::{Engine as Base64Engine, engine::general_purpose};
+use iggy_common::IggyTimestamp;
 use prost::Message;
 use prost_types::Any;
 use serde::{Deserialize, Serialize};
@@ -590,7 +591,7 @@ impl ProtoStreamEncoder {
             Payload::Text(text) => {
                 let json_value = simd_json::json!({
                     "text": text,
-                    "timestamp": chrono::Utc::now().timestamp_millis(),
+                    "timestamp": IggyTimestamp::now().as_millis(),
                     "encoding": "utf-8"
                 });
                 let json_string =

@@ -93,6 +93,27 @@ runs:
         USE_EXTERNAL_SERVER: true
       run: ./gradlew test
 
+    - name: Generate coverage report
+      if: inputs.task == 'test'
+      shell: bash
+      working-directory: foreign/java
+      env:
+        USE_EXTERNAL_SERVER: true
+      run: ./gradlew jacocoAggregatedReport
+
+    - name: Copy coverage reports
+      if: ${{ !cancelled() && inputs.task == 'test' }}
+      shell: bash
+      run: |
+        if [ -f "foreign/java/build/reports/jacoco/aggregate/jacocoAggregated.xml" ]; then
+          echo "Found aggregated coverage report"
+          mkdir -p reports/java-coverage
+          cp foreign/java/build/reports/jacoco/aggregate/jacocoAggregated.xml reports/java-coverage/
+          if [ -d "foreign/java/build/reports/jacoco/aggregate/html" ]; then
+            cp -r foreign/java/build/reports/jacoco/aggregate/html reports/java-coverage/
+          fi
+        fi
+
     - name: Copy test reports
       if: ${{ !cancelled() && inputs.task == 'test' }}
       shell: bash

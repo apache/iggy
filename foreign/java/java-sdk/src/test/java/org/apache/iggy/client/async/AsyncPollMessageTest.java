@@ -58,7 +58,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * 3. Polling with valid consumer group member works correctly
  */
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
-public class AsyncPollMessageTest {
+public abstract class AsyncPollMessageTest extends IntegrationTest {
 
     private static final Logger log = LoggerFactory.getLogger(AsyncPollMessageTest.class);
     private static AsyncIggyTcpClient client;
@@ -80,7 +80,7 @@ public class AsyncPollMessageTest {
                     // Ignore close errors
                 }
             }
-            client = new AsyncIggyTcpClient(IntegrationTest.LOCALHOST_IP, IntegrationTest.TCP_PORT);
+            client = new AsyncIggyTcpClient(LOCALHOST_IP, tcpPort());
             client.connect().get(5, TimeUnit.SECONDS);
             client.users().login("iggy", "iggy").get(5, TimeUnit.SECONDS);
             log.info("Client reconnected successfully");
@@ -102,7 +102,7 @@ public class AsyncPollMessageTest {
         log.info("Setting up async client for poll message tests");
 
         // Initialize client
-        client = new AsyncIggyTcpClient(IntegrationTest.LOCALHOST_IP, IntegrationTest.TCP_PORT);
+        client = new AsyncIggyTcpClient(LOCALHOST_IP, tcpPort());
         client.connect().get(5, TimeUnit.SECONDS);
         client.users().login("iggy", "iggy").get(5, TimeUnit.SECONDS);
         log.info("Successfully connected and logged in");

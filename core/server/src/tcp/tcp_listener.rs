@@ -22,7 +22,7 @@ use crate::shard::IggyShard;
 use crate::shard::task_registry::{ShutdownToken, TaskRegistry};
 use crate::shard::transmission::event::ShardEvent;
 use crate::tcp::connection_handler::{ConnectionAction, handle_connection, handle_error};
-use compio::net::{TcpListener, TcpOpts};
+use compio::net::{SocketOpts, TcpListener};
 use err_trail::ErrContext;
 use futures::FutureExt;
 use iggy_common::{IggyError, SenderKind, TransportProtocol};
@@ -37,7 +37,7 @@ async fn create_listener(
 ) -> Result<TcpListener, std::io::Error> {
     // Required by the thread-per-core model...
     // We create bunch of sockets on different threads, that bind to exactly the same address and port.
-    let opts = TcpOpts::new().reuse_port(true).reuse_port(true);
+    let opts = SocketOpts::new().reuse_port(true).reuse_port(true);
     let opts = if config.override_defaults {
         let recv_buffer_size = config
             .recv_buffer_size
@@ -59,7 +59,7 @@ async fn create_listener(
     } else {
         opts
     };
-    TcpListener::bind_with_options(addr, opts).await
+    TcpListener::bind_with_options(addr, &opts).await
 }
 
 pub async fn start(

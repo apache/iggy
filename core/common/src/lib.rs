@@ -35,6 +35,7 @@ pub mod locking;
 pub use alloc::buffer::PooledBuffer;
 pub use alloc::memory_pool::{MEMORY_POOL, MemoryPool, MemoryPoolConfigOther, memory_pool};
 pub use certificates::generate_self_signed_certificate;
+pub use chrono::{DateTime, Duration as ChronoDuration, Utc};
 pub use commands::consumer_groups::*;
 pub use commands::consumer_offsets::*;
 pub use commands::messages::*;

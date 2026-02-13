@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::stm::StateMachine;
+use crate::stm::snapshot::{FillSnapshot, MetadataSnapshot, Snapshot, SnapshotError};
 use consensus::{Consensus, Project, Sequencer, Status, VsrConsensus};
 use iggy_common::{
     header::{Command2, GenericHeader, PrepareHeader, PrepareOkHeader, ReplyHeader},
@@ -23,6 +24,60 @@ use iggy_common::{
 use journal::{Journal, JournalHandle};
 use message_bus::MessageBus;
 use tracing::{debug, warn};
+
+#[derive(Debug, Clone)]
+#[allow(unused)]
+pub struct IggySnapshot {
+    snapshot: MetadataSnapshot,
+}
+
+#[allow(unused)]
+impl IggySnapshot {
+    pub fn new(sequence_number: u64) -> Self {
+        Self {
+            snapshot: MetadataSnapshot::new(sequence_number),
+        }
+    }
+
+    pub fn snapshot(&self) -> &MetadataSnapshot {
+        &self.snapshot
+    }
+}
+
+impl Snapshot for IggySnapshot {
+    type Error = SnapshotError;
+    type SequenceNumber = u64;
+    type Timestamp = u64;
+    type Inner = MetadataSnapshot;
+
+    fn create<T>(stm: &T, sequence_number: u64) -> Result<Self, SnapshotError>
+    where
+        T: FillSnapshot<MetadataSnapshot>,
+    {
+        let mut snapshot = MetadataSnapshot::new(sequence_number);
+
+        stm.fill_snapshot(&mut snapshot)?;
+
+        Ok(Self { snapshot })
+    }
+
+    fn encode(&self) -> Result<Vec<u8>, SnapshotError> {
+        self.snapshot.encode()
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, SnapshotError> {
+        let snapshot = MetadataSnapshot::decode(bytes)?;
+        Ok(Self { snapshot })
+    }
+
+    fn sequence_number(&self) -> u64 {
+        self.snapshot.sequence_number
+    }
+
+    fn created_at(&self) -> u64 {
+        self.snapshot.created_at
+    }
+}
 
 pub trait Metadata<C>
 where

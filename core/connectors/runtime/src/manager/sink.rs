@@ -16,10 +16,10 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-use super::status::{ConnectorError, ConnectorStatus};
 use crate::configs::connectors::{ConfigFormat, SinkConfig};
 use crate::metrics::Metrics;
 use dashmap::DashMap;
+use iggy_connector_sdk::api::{ConnectorError, ConnectorStatus};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;

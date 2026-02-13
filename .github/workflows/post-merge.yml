@@ -175,8 +175,8 @@ jobs:
       version: edge
       upload_artifacts: true
 
-  coverage:
-    name: Coverage baseline
+  rust-coverage:
+    name: Rust coverage baseline
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -226,6 +226,49 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: codecov.json
           flags: rust
+          fail_ci_if_error: false
+
+  java-coverage:
+    name: Java coverage baseline
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Java with cache
+        uses: ./.github/actions/utils/setup-java-with-cache
+
+      - name: Setup Rust with cache
+        uses: ./.github/actions/utils/setup-rust-with-cache
+        with:
+          save-cache: "false"
+
+      - name: Start Iggy server
+        id: iggy
+        uses: ./.github/actions/utils/server-start
+
+      - name: Run tests and generate coverage
+        working-directory: foreign/java
+        env:
+          USE_EXTERNAL_SERVER: true
+        run: |
+          ./gradlew test
+          ./gradlew jacocoAggregatedReport
+
+      - name: Stop Iggy server
+        if: always()
+        uses: ./.github/actions/utils/server-stop
+        with:
+          pid-file: ${{ steps.iggy.outputs.pid_file }}
+          log-file: ${{ steps.iggy.outputs.log_file }}
+
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: foreign/java/build/reports/jacoco/aggregate/jacocoAggregated.xml
+          disable_search: true
+          flags: java
           fail_ci_if_error: false
 
   create-prerelease:

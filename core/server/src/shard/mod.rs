@@ -17,31 +17,22 @@
  * under the License.
  */
 
-pub mod builder;
-pub mod system;
-pub mod task_registry;
-pub mod tasks;
-pub mod transmission;
-
-mod communication;
-pub mod handlers;
-
-use ahash::AHashSet;
-pub use communication::calculate_shard_assignment;
-
 use self::tasks::{continuous, periodic};
 use crate::{
+    bootstrap::load_segments,
     configs::server::ServerConfig,
-    io::fs_locks::FsLocks,
     metadata::{Metadata, MetadataWriter},
     shard::{task_registry::TaskRegistry, transmission::frame::ShardFrame},
     state::file::FileState,
-    streaming::partitions::local_partitions::LocalPartitions,
     streaming::{
-        clients::client_manager::ClientManager, diagnostics::metrics::Metrics, session::Session,
+        clients::client_manager::ClientManager,
+        diagnostics::metrics::Metrics,
+        partitions::{local_partition::LocalPartition, local_partitions::LocalPartitions},
+        session::Session,
         utils::ptr::EternalPtr,
     },
 };
+use ahash::AHashSet;
 use builder::IggyShardBuilder;
 use dashmap::DashMap;
 use iggy_common::SemanticVersion;
@@ -60,9 +51,21 @@ use std::{
 use tracing::{debug, error, info, instrument};
 use transmission::connector::{Receiver, ShardConnector, StopReceiver};
 
+pub mod builder;
+pub mod execution;
+pub mod handlers;
+pub mod system;
+pub mod task_registry;
+pub mod tasks;
+pub mod transmission;
+
+mod communication;
+
+pub use communication::calculate_shard_assignment;
+
 pub const COMPONENT: &str = "SHARD";
 pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
-pub const BROADCAST_TIMEOUT: Duration = Duration::from_secs(500);
+pub const BROADCAST_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub struct IggyShard {
     pub id: u16,
@@ -77,7 +80,6 @@ pub struct IggyShard {
     pub(crate) shards_table: EternalPtr<DashMap<IggyNamespace, PartitionLocation>>,
     pub(crate) state: FileState,
 
-    pub(crate) fs_locks: FsLocks,
     pub(crate) encryptor: Option<EncryptorKind>,
     pub(crate) config: ServerConfig,
     pub(crate) client_manager: ClientManager,
@@ -197,9 +199,6 @@ impl IggyShard {
     }
 
     async fn load_segments(&self) -> Result<(), IggyError> {
-        use crate::bootstrap::load_segments;
-        use crate::streaming::partitions::local_partition::LocalPartition;
-
         for shard_entry in self.shards_table.iter() {
             let (namespace, location) = shard_entry.pair();
 
@@ -229,7 +228,6 @@ impl IggyShard {
                 use crate::streaming::partitions::storage::{
                     load_consumer_group_offsets, load_consumer_offsets,
                 };
-                use ahash::HashMap;
 
                 let consumer_offset_path =
                     self.config
@@ -240,22 +238,27 @@ impl IggyShard {
                     .system
                     .get_consumer_group_offsets_path(stream_id, topic_id, partition_id);
 
-                let consumer_offsets = Arc::new(
-                    load_consumer_offsets(&consumer_offset_path)
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(|offset| (offset.consumer_id as usize, offset))
-                        .collect::<HashMap<usize, _>>()
-                        .into(),
-                );
+                // Reuse metadata's Arcs so both metadata and local_partitions
+                // reference the same allocation — writes via store_consumer_offset
+                // (metadata path) are visible to delete_oldest_segments (local path).
+                let consumer_offsets = init_info.consumer_offsets;
+                let consumer_group_offsets = init_info.consumer_group_offsets;
 
-                let consumer_group_offsets = Arc::new(
-                    load_consumer_group_offsets(&consumer_group_offsets_path)
+                {
+                    let guard = consumer_offsets.pin();
+                    for co in load_consumer_offsets(&consumer_offset_path).unwrap_or_default() {
+                        guard.insert(co.consumer_id as usize, co);
+                    }
+                }
+
+                {
+                    let guard = consumer_group_offsets.pin();
+                    for (cg_id, co) in load_consumer_group_offsets(&consumer_group_offsets_path)
                         .unwrap_or_default()
-                        .into_iter()
-                        .collect::<HashMap<_, _>>()
-                        .into(),
-                );
+                    {
+                        guard.insert(cg_id, co);
+                    }
+                }
 
                 let message_deduplicator =
                     create_message_deduplicator(&self.config.system).map(Arc::new);
@@ -270,7 +273,31 @@ impl IggyShard {
                 )
                 .await
                 {
-                    Ok(loaded_log) => {
+                    Ok(mut loaded_log) => {
+                        if !loaded_log.has_segments() {
+                            info!(
+                                "No segments found on disk for partition ID: {} for topic ID: {} for stream ID: {}, creating initial segment",
+                                partition_id, topic_id, stream_id
+                            );
+                            let segment = crate::streaming::segments::Segment::new(
+                                0,
+                                self.config.system.segment.size,
+                            );
+                            let storage =
+                                crate::streaming::segments::storage::create_segment_storage(
+                                    &self.config.system,
+                                    stream_id,
+                                    topic_id,
+                                    partition_id,
+                                    0,
+                                    0,
+                                    0,
+                                )
+                                .await?;
+                            loaded_log.add_persisted_segment(segment, storage);
+                            stats.increment_segments_count(1);
+                        }
+
                         let current_offset = loaded_log.active_segment().end_offset;
                         stats.set_current_offset(current_offset);
 
@@ -279,11 +306,7 @@ impl IggyShard {
                         // should get offset 0.
                         let should_increment_offset = current_offset > 0;
 
-                        let revision_id = self
-                            .metadata
-                            .get_partition_init_info(stream_id, topic_id, partition_id)
-                            .map(|info| info.revision_id)
-                            .unwrap_or(0);
+                        let revision_id = init_info.revision_id;
 
                         let partition = LocalPartition::with_log(
                             loaded_log,
