@@ -115,6 +115,10 @@ pub enum Operation {
     CreatePersonalAccessToken = 146,
     DeletePersonalAccessToken = 147,
 
+    // Partition operations (replicated via consensus)
+    SendMessages = 160,
+    StoreConsumerOffset = 161,
+
     Reserved = 200,
 }
 
@@ -133,7 +137,8 @@ pub struct GenericHeader {
     pub replica: u8,
     pub reserved_frame: [u8; 12],
 
-    pub reserved_command: [u8; 128],
+    pub namespace: u64,
+    pub reserved_command: [u8; 120],
 }
 
 unsafe impl Pod for GenericHeader {}
@@ -171,13 +176,14 @@ pub struct RequestHeader {
     pub timestamp: u64,
     pub request: u64,
     pub operation: Operation,
-    pub reserved: [u8; 95],
+    pub namespace: u64,
+    pub reserved: [u8; 87],
 }
 
 impl Default for RequestHeader {
     fn default() -> Self {
         Self {
-            reserved: [0; 95],
+            reserved: [0; 87],
             checksum: 0,
             checksum_body: 0,
             cluster: 0,
@@ -194,6 +200,7 @@ impl Default for RequestHeader {
             timestamp: 0,
             request: 0,
             operation: Default::default(),
+            namespace: 0,
         }
     }
 }
@@ -245,7 +252,8 @@ pub struct PrepareHeader {
     pub timestamp: u64,
     pub request: u64,
     pub operation: Operation,
-    pub reserved: [u8; 19],
+    pub namespace: u64,
+    pub reserved: [u8; 11],
 }
 
 unsafe impl Pod for PrepareHeader {}
@@ -300,7 +308,8 @@ pub struct PrepareOkHeader {
     pub timestamp: u64,
     pub request: u64,
     pub operation: Operation,
-    pub reserved: [u8; 19],
+    pub namespace: u64,
+    pub reserved: [u8; 11],
 }
 
 unsafe impl Pod for PrepareOkHeader {}
@@ -349,7 +358,8 @@ pub struct CommitHeader {
     pub timestamp_monotonic: u64,
     pub commit: u64,
     pub checkpoint_op: u64,
-    pub reserved: [u8; 96],
+    pub namespace: u64,
+    pub reserved: [u8; 88],
 }
 
 unsafe impl Pod for CommitHeader {}

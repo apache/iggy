@@ -126,7 +126,7 @@ where
 
         // Verify hash chain integrity.
         if let Some(previous) = journal.handle().previous_header(header) {
-            self.panic_if_hash_chain_would_break_in_same_view(previous, header);
+            self.panic_if_hash_chain_would_break_in_same_view(&previous, header);
         }
 
         assert_eq!(header.op, current_op + 1);
@@ -420,6 +420,7 @@ where
             prepare_checksum: header.checksum,
             request: header.request,
             operation: header.operation,
+            namespace: header.namespace,
             size: std::mem::size_of::<PrepareOkHeader>() as u32,
             ..Default::default()
         };

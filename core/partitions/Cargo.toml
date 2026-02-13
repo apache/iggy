@@ -28,4 +28,10 @@ repository = "https://github.com/apache/iggy"
 readme = "../../README.md"
 
 [dependencies]
+consensus = { workspace = true }
 iggy_common = { workspace = true }
+journal = { workspace = true }
+message_bus = { workspace = true }
+ringbuffer = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }

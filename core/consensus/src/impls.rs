@@ -1108,6 +1108,7 @@ impl<B: MessageBus> Project<Message<PrepareHeader>, VsrConsensus<B>> for Message
                 op,
                 timestamp: 0, // 0 for now. Implement correct way to get timestamp later
                 operation: old.operation,
+                namespace: old.namespace,
                 ..Default::default()
             }
         })
@@ -1131,6 +1132,7 @@ impl<B: MessageBus> Project<Message<PrepareOkHeader>, VsrConsensus<B>> for Messa
                 commit: consensus.commit.get(),
                 timestamp: old.timestamp,
                 operation: old.operation,
+                namespace: old.namespace,
                 // PrepareOks are only header no body
                 ..Default::default()
             };

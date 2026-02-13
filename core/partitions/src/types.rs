@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use iggy_common::PollingStrategy;
+use iggy_common::{IggyByteSize, PollingStrategy};
 
 /// Arguments for polling messages from a partition.
 #[derive(Debug, Clone)]
@@ -155,4 +155,20 @@ impl Default for PartitionOffsets {
     fn default() -> Self {
         Self::empty()
     }
+}
+
+/// Configuration for partition operations.
+///
+/// Mirrors the relevant fields from the server's `PartitionConfig` and
+/// `SegmentConfig` (`core/server/src/configs/system.rs`).
+#[derive(Debug, Clone, Copy)]
+pub struct PartitionsConfig {
+    /// Flush journal to disk when it accumulates this many messages.
+    pub messages_required_to_save: u32,
+    /// Flush journal to disk when it accumulates this many bytes.
+    pub size_of_messages_required_to_save: IggyByteSize,
+    /// Whether to enforce fsync after writes.
+    pub enforce_fsync: bool,
+    /// Maximum size of a single segment before rotation.
+    pub segment_size: IggyByteSize,
 }

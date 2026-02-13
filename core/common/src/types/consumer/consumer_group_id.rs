@@ -15,4 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub use iggy_common::IggyMessagesBatchSetInFlight;
+use std::fmt::{Display, Formatter};
+
+#[derive(Debug, PartialEq, Eq, Hash, Copy, Clone)]
+pub struct ConsumerGroupId(pub usize);
+
+impl Display for ConsumerGroupId {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
