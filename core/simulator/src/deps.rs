@@ -155,5 +155,5 @@ pub type SimMetadata = IggyMetadata<
     SimMuxStateMachine,
 >;
 
-#[derive(Debug, Default)]
-pub struct ReplicaPartitions {}
+/// Type alias for simulator partitions
+pub type ReplicaPartitions = partitions::IggyPartitions<VsrConsensus<SharedMemBus>>;

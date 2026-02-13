@@ -22,8 +22,8 @@ use crate::IggyPartition;
 use crate::Partitions;
 use consensus::{Consensus, Project, Sequencer, Status, VsrConsensus};
 use iggy_common::{
-    IggyByteSize, IggyIndexesMut, IggyMessagesBatchMut, INDEX_SIZE, PooledBuffer, Segment,
-    SegmentStorage,
+    IggyByteSize, IggyIndexesMut, IggyMessagesBatchMut, INDEX_SIZE, PartitionStats, PooledBuffer,
+    Segment, SegmentStorage,
     header::{Command2, GenericHeader, Operation, PrepareHeader, PrepareOkHeader, ReplyHeader},
     message::Message,
     sharding::{IggyNamespace, LocalIdx, ShardId},
@@ -33,6 +33,7 @@ use message_bus::MessageBus;
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use tracing::{debug, warn};
 
 /// Per-shard collection of all partitions.
@@ -226,6 +227,99 @@ impl<C> IggyPartitions<C> {
         }
         let idx = *self.namespace_to_local[&namespace];
         &mut self.partitions_mut()[idx]
+    }
+
+    /// Initialize a new partition with in-memory storage (for testing/simulation).
+    ///
+    /// This is a simplified version that doesn't create file-backed storage.
+    /// Use `init_partition()` for production use with real files.
+    ///
+    /// TODO: Make the log generic over its storage backend to support both
+    /// in-memory (for testing) and file-backed (for production) storage without
+    /// needing separate initialization methods.
+    pub fn init_partition_in_memory(&mut self, namespace: IggyNamespace) -> LocalIdx {
+        // Check if already initialized
+        if let Some(idx) = self.local_idx(&namespace) {
+            return idx;
+        }
+
+        // Create initial segment with default (in-memory) storage
+        let start_offset = 0;
+        let segment = Segment::new(start_offset, self.config.segment_size);
+        let storage = SegmentStorage::default();
+
+        // Create partition with initialized log
+        let stats = Arc::new(PartitionStats::default());
+        let mut partition = IggyPartition::new(stats.clone());
+        partition.log.add_persisted_segment(segment, storage);
+        partition.offset.store(start_offset, Ordering::Relaxed);
+        partition.dirty_offset.store(start_offset, Ordering::Relaxed);
+        partition.should_increment_offset = false;
+        partition.stats.increment_segments_count(1);
+
+        // Insert and return local index
+        self.insert(namespace, partition)
+    }
+
+    /// Initialize a new partition with file-backed storage.
+    ///
+    /// This is the data plane initialization - creates the partition structure,
+    /// initial segment, and storage. Skips the control plane metadata broadcasting.
+    ///
+    /// Corresponds to the "INITIATE PARTITION" phase in the server's flow:
+    /// 1. Control plane: create PartitionMeta (SKIPPED in this method)
+    /// 2. Control plane: broadcast to shards (SKIPPED in this method)
+    /// 3. Data plane: INITIATE PARTITION (THIS METHOD)
+    ///
+    /// Idempotent - returns existing LocalIdx if partition already exists.
+    pub async fn init_partition(&mut self, namespace: IggyNamespace) -> LocalIdx {
+        // Check if already initialized
+        if let Some(idx) = self.local_idx(&namespace) {
+            return idx;
+        }
+
+        // Create initial segment with storage
+        let start_offset = 0;
+        let segment = Segment::new(start_offset, self.config.segment_size);
+
+        // TODO: Waiting for issue to move server config to shared module.
+        // Once complete, paths will come from proper base_path/streams_path/etc config fields.
+        let messages_path = self.config.get_messages_path(
+            namespace.stream_id(),
+            namespace.topic_id(),
+            namespace.partition_id(),
+            start_offset,
+        );
+        let index_path = self.config.get_index_path(
+            namespace.stream_id(),
+            namespace.topic_id(),
+            namespace.partition_id(),
+            start_offset,
+        );
+
+        let storage = SegmentStorage::new(
+            &messages_path,
+            &index_path,
+            0, // messages_size (new segment)
+            0, // indexes_size (new segment)
+            self.config.enforce_fsync,
+            self.config.enforce_fsync,
+            false, // file_exists (new segment)
+        )
+        .await
+        .expect("Failed to create segment storage");
+
+        // Create partition with initialized log
+        let stats = Arc::new(PartitionStats::default());
+        let mut partition = IggyPartition::new(stats.clone());
+        partition.log.add_persisted_segment(segment, storage);
+        partition.offset.store(start_offset, Ordering::Relaxed);
+        partition.dirty_offset.store(start_offset, Ordering::Relaxed);
+        partition.should_increment_offset = false;
+        partition.stats.increment_segments_count(1);
+
+        // Insert and return local index
+        self.insert(namespace, partition)
     }
 
 }
@@ -480,8 +574,9 @@ where
 
     /// Append a batch to a partition's journal with offset assignment.
     ///
-    /// Only writes to the journal — segment metadata (timestamps, end_offset,
-    /// current_position) is updated later when the journal is flushed to disk.
+    /// Updates `segment.current_position` (logical position for indexing) but
+    /// not `segment.end_offset` or `segment.end_timestamp` (committed state).
+    /// Those are updated during commit.
     ///
     /// Uses `dirty_offset` for offset assignment so that multiple prepares
     /// can be pipelined before any commit.
@@ -528,6 +623,12 @@ where
                 .dirty_offset
                 .store(last_dirty_offset, Ordering::Relaxed);
         }
+
+        // Update segment.current_position for next prepare_for_persistence call.
+        // This is the logical position (includes unflushed journal data).
+        // segment.size is only updated after actual persist (in persist_frozen_batches_to_disk).
+        let segment_index = partition.log.segments().len() - 1;
+        partition.log.segments_mut()[segment_index].current_position += batch_messages_size;
 
         // Update journal tracking metadata.
         let journal = partition.log.journal_mut();
@@ -648,6 +749,7 @@ where
         }
 
         // 1. Update segment metadata from journal state.
+        // Note: segment.current_position is already updated in append_batch (prepare phase).
         let segment_index = partition.log.segments().len() - 1;
         let segment = &mut partition.log.segments_mut()[segment_index];
 
@@ -656,7 +758,6 @@ where
         }
         segment.end_timestamp = journal_info.end_timestamp;
         segment.end_offset = journal_info.current_offset;
-        segment.current_position += journal_info.size.as_bytes_u64() as u32;
 
         // 2. Update stats.
         partition
@@ -812,11 +913,39 @@ where
 
         let segment = Segment::new(start_offset, self.config.segment_size);
 
-        // TODO: Create actual storage with file paths from config.
-        // For now create an empty storage placeholder.
-        let storage = SegmentStorage::default();
+        // TODO: Waiting for issue to move server config to shared module.
+        // Once complete, paths will come from proper base_path/streams_path/etc config fields.
+        let messages_path = self.config.get_messages_path(
+            namespace.stream_id(),
+            namespace.topic_id(),
+            namespace.partition_id(),
+            start_offset,
+        );
+        let index_path = self.config.get_index_path(
+            namespace.stream_id(),
+            namespace.topic_id(),
+            namespace.partition_id(),
+            start_offset,
+        );
+
+        let storage = SegmentStorage::new(
+            &messages_path,
+            &index_path,
+            0, // messages_size (new segment)
+            0, // indexes_size (new segment)
+            self.config.enforce_fsync,
+            self.config.enforce_fsync,
+            false, // file_exists (new segment)
+        )
+        .await
+        .expect("Failed to create segment storage");
 
         // Clear old segment's indexes.
+        // TODO: Waiting for issue to move server config to shared module.
+        // Once complete, conditionally clear based on cache_indexes config:
+        // if !matches!(self.config.cache_indexes, CacheIndexesConfig::All) {
+        //     partition.log.indexes_mut()[old_segment_index] = None;
+        // }
         partition.log.indexes_mut()[old_segment_index] = None;
 
         // Close writers for the sealed segment.

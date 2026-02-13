@@ -161,7 +161,7 @@ impl Default for PartitionOffsets {
 ///
 /// Mirrors the relevant fields from the server's `PartitionConfig` and
 /// `SegmentConfig` (`core/server/src/configs/system.rs`).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct PartitionsConfig {
     /// Flush journal to disk when it accumulates this many messages.
     pub messages_required_to_save: u32,
@@ -171,4 +171,42 @@ pub struct PartitionsConfig {
     pub enforce_fsync: bool,
     /// Maximum size of a single segment before rotation.
     pub segment_size: IggyByteSize,
+}
+
+impl PartitionsConfig {
+    /// Constructs the file path for segment messages.
+    ///
+    /// TODO: This is a stub waiting for completion of issue to move server config
+    /// to shared module. Real implementation should use:
+    /// `{base_path}/{streams_path}/{stream_id}/{topics_path}/{topic_id}/{partitions_path}/{partition_id}/{start_offset:0>20}.log`
+    pub fn get_messages_path(
+        &self,
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
+        start_offset: u64,
+    ) -> String {
+        format!(
+            "/tmp/iggy_stub/streams/{}/topics/{}/partitions/{}/{:0>20}.log",
+            stream_id, topic_id, partition_id, start_offset
+        )
+    }
+
+    /// Constructs the file path for segment indexes.
+    ///
+    /// TODO: This is a stub waiting for completion of issue to move server config
+    /// to shared module. Real implementation should use:
+    /// `{base_path}/{streams_path}/{stream_id}/{topics_path}/{topic_id}/{partitions_path}/{partition_id}/{start_offset:0>20}.index`
+    pub fn get_index_path(
+        &self,
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
+        start_offset: u64,
+    ) -> String {
+        format!(
+            "/tmp/iggy_stub/streams/{}/topics/{}/partitions/{}/{:0>20}.index",
+            stream_id, topic_id, partition_id, start_offset
+        )
+    }
 }
