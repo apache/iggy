@@ -8,6 +8,7 @@ target*
 local_data*
 local_state*
 test_logs/
+chaos_logs/
 /bench_*
 /sdk/errors_table/
 /rust-clippy-results.sarif

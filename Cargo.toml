@@ -26,6 +26,7 @@ members = [
     "core/bench/report",
     "core/bench/runner",
     "core/binary_protocol",
+    "core/chaos",
     "core/cli",
     "core/clock",
     "core/common",
@@ -125,6 +126,7 @@ configs = { path = "core/configs", version = "0.1.0" }
 configs_derive = { path = "core/configs_derive", version = "0.1.0" }
 consensus = { path = "core/consensus" }
 console-subscriber = "0.5.0"
+crc32fast = "1.4.2"
 crossbeam = "0.8.4"
 ctor = "0.6.3"
 ctrlc = { version = "3.5", features = ["termination"] }
