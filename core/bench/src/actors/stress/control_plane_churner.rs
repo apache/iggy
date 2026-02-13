@@ -20,13 +20,14 @@ use super::error_classifier;
 use super::stress_context::StressContext;
 use crate::args::kinds::stress::args::ApiMix;
 use crate::benchmarks::{
-    BENCH_STREAM_PREFIX, BENCH_TOPIC_NAME, CONSUMER_GROUP_BASE_ID, CONSUMER_GROUP_NAME_PREFIX,
+    BENCH_TOPIC_NAME, CHAOS_STREAM_PREFIX, CONSUMER_GROUP_BASE_ID, CONSUMER_GROUP_NAME_PREFIX,
+    STABLE_STREAM_PREFIX,
 };
 use crate::utils::{ClientFactory, login_root};
 use iggy::clients::client::IggyClient;
 use iggy::prelude::*;
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tracing::{debug, warn};
@@ -72,14 +73,11 @@ const ALL_OPS: [ChurnOp; 9] = [
 /// so that `DeleteAndRecreateTopic` can recreate with the same parameters.
 pub struct ChurnerConfig {
     pub api_mix: ApiMix,
-    pub streams: u32,
+    pub stable_streams: u32,
+    pub chaos_streams: u32,
     pub partitions: u32,
-    pub consumer_groups: u32,
     pub message_expiry: IggyExpiry,
     pub max_topic_size: MaxTopicSize,
-    /// Deadline after which data-destructive ops (`PurgeTopic`, `PurgeStream`,
-    /// `DeleteAndRecreateTopic`) are suppressed so messages survive for verification.
-    pub purge_cutoff: std::time::Instant,
 }
 
 /// Periodically executes CRUD lifecycle operations against the server.
@@ -95,12 +93,11 @@ pub struct ControlPlaneChurner {
     churn_interval: std::time::Duration,
     rng: StdRng,
     api_mix: ApiMix,
-    streams: u32,
+    stable_streams: u32,
+    chaos_streams: u32,
     partitions: u32,
-    consumer_groups: u32,
     message_expiry: IggyExpiry,
     max_topic_size: MaxTopicSize,
-    purge_cutoff: std::time::Instant,
 }
 
 impl ControlPlaneChurner {
@@ -120,12 +117,11 @@ impl ControlPlaneChurner {
             churn_interval: churn_interval.get_duration(),
             rng,
             api_mix: config.api_mix,
-            streams: config.streams,
+            stable_streams: config.stable_streams,
+            chaos_streams: config.chaos_streams,
             partitions: config.partitions,
-            consumer_groups: config.consumer_groups,
             message_expiry: config.message_expiry,
             max_topic_size: config.max_topic_size,
-            purge_cutoff: config.purge_cutoff,
         }
     }
 
@@ -151,8 +147,6 @@ impl ControlPlaneChurner {
                 self.churner_id, op
             );
 
-            let past_purge_cutoff = std::time::Instant::now() > self.purge_cutoff;
-
             match op {
                 ChurnOp::CreateDeleteTopic => {
                     self.create_delete_topic(&client, cycle).await;
@@ -162,12 +156,6 @@ impl ControlPlaneChurner {
                 }
                 ChurnOp::ConsumerGroupJoinLeave => {
                     self.consumer_group_join_leave(&client).await;
-                }
-                ChurnOp::PurgeTopic if past_purge_cutoff => {
-                    debug!(
-                        "Churner #{}: skipping PurgeTopic (past purge cutoff)",
-                        self.churner_id
-                    );
                 }
                 ChurnOp::PurgeTopic => {
                     self.purge_random_topic(&client).await;
@@ -181,20 +169,8 @@ impl ControlPlaneChurner {
                 ChurnOp::StressPoll => {
                     self.stress_poll(&client).await;
                 }
-                ChurnOp::DeleteAndRecreateTopic if past_purge_cutoff => {
-                    debug!(
-                        "Churner #{}: skipping DeleteAndRecreateTopic (past purge cutoff)",
-                        self.churner_id
-                    );
-                }
                 ChurnOp::DeleteAndRecreateTopic => {
                     self.delete_and_recreate_topic(&client).await;
-                }
-                ChurnOp::PurgeStream if past_purge_cutoff => {
-                    debug!(
-                        "Churner #{}: skipping PurgeStream (past purge cutoff)",
-                        self.churner_id
-                    );
                 }
                 ChurnOp::PurgeStream => {
                     self.purge_stream(&client).await;
@@ -206,12 +182,29 @@ impl ControlPlaneChurner {
         }
     }
 
-    fn random_stream_id(&mut self) -> Identifier {
-        let stream_idx = self.rng.random_range(1..=self.streams);
-        format!("{BENCH_STREAM_PREFIX}-{stream_idx}")
+    fn random_chaos_stream_id(&mut self) -> Identifier {
+        let idx = self.rng.random_range(1..=self.chaos_streams);
+        format!("{CHAOS_STREAM_PREFIX}-{idx}")
             .as_str()
             .try_into()
             .expect("valid identifier")
+    }
+
+    fn random_any_stream_id(&mut self) -> Identifier {
+        let total = self.stable_streams + self.chaos_streams;
+        let idx = self.rng.random_range(1..=total);
+        if idx <= self.stable_streams {
+            format!("{STABLE_STREAM_PREFIX}-{idx}")
+                .as_str()
+                .try_into()
+                .expect("valid identifier")
+        } else {
+            let chaos_idx = idx - self.stable_streams;
+            format!("{CHAOS_STREAM_PREFIX}-{chaos_idx}")
+                .as_str()
+                .try_into()
+                .expect("valid identifier")
+        }
     }
 
     fn topic_id() -> Identifier {
@@ -220,11 +213,8 @@ impl ControlPlaneChurner {
 
     // --- Original ops ---
 
-    async fn create_delete_topic(&self, client: &IggyClient, cycle: u64) {
-        let stream_id: Identifier = format!("{BENCH_STREAM_PREFIX}-1")
-            .as_str()
-            .try_into()
-            .expect("valid identifier");
+    async fn create_delete_topic(&mut self, client: &IggyClient, cycle: u64) {
+        let stream_id = self.random_chaos_stream_id();
         let topic_name = format!("churn-{}-{cycle}", self.churner_id);
 
         match client
@@ -234,8 +224,8 @@ impl ControlPlaneChurner {
                 1,
                 CompressionAlgorithm::default(),
                 None,
-                IggyExpiry::NeverExpire,
-                MaxTopicSize::ServerDefault,
+                self.message_expiry,
+                self.max_topic_size,
             )
             .await
         {
@@ -285,11 +275,8 @@ impl ControlPlaneChurner {
         }
     }
 
-    async fn add_remove_partitions(&self, client: &IggyClient) {
-        let stream_id: Identifier = format!("{BENCH_STREAM_PREFIX}-1")
-            .as_str()
-            .try_into()
-            .expect("valid identifier");
+    async fn add_remove_partitions(&mut self, client: &IggyClient) {
+        let stream_id = self.random_chaos_stream_id();
         let topic_id = Self::topic_id();
 
         match client.create_partitions(&stream_id, &topic_id, 1).await {
@@ -338,8 +325,8 @@ impl ControlPlaneChurner {
     /// Joins and leaves a bench consumer group, forcing a rebalance
     /// mid-poll that races against active data-plane consumers.
     async fn consumer_group_join_leave(&mut self, client: &IggyClient) {
-        let stream_idx = self.rng.random_range(1..=self.consumer_groups);
-        let stream_id: Identifier = format!("{BENCH_STREAM_PREFIX}-{stream_idx}")
+        let stream_idx = self.rng.random_range(1..=self.stable_streams);
+        let stream_id: Identifier = format!("{STABLE_STREAM_PREFIX}-{stream_idx}")
             .as_str()
             .try_into()
             .expect("valid identifier");
@@ -391,7 +378,7 @@ impl ControlPlaneChurner {
     }
 
     async fn purge_random_topic(&mut self, client: &IggyClient) {
-        let stream_id = self.random_stream_id();
+        let stream_id = self.random_chaos_stream_id();
         let topic_id = Self::topic_id();
 
         match client.purge_topic(&stream_id, &topic_id).await {
@@ -415,7 +402,7 @@ impl ControlPlaneChurner {
     // --- New safe ops ---
 
     async fn delete_segments(&mut self, client: &IggyClient) {
-        let stream_id = self.random_stream_id();
+        let stream_id = self.random_chaos_stream_id();
         let topic_id = Self::topic_id();
         let partition_id = self.rng.random_range(0..self.partitions);
 
@@ -441,7 +428,7 @@ impl ControlPlaneChurner {
     }
 
     async fn update_topic(&mut self, client: &IggyClient) {
-        let stream_id = self.random_stream_id();
+        let stream_id = self.random_chaos_stream_id();
         let topic_id = Self::topic_id();
 
         let compression = if self.rng.random_bool(0.5) {
@@ -482,7 +469,7 @@ impl ControlPlaneChurner {
     /// One-off polls with First/Last/Timestamp strategies — these are "victim"
     /// operations that race against concurrent segment mutations.
     async fn stress_poll(&mut self, client: &IggyClient) {
-        let stream_id = self.random_stream_id();
+        let stream_id = self.random_any_stream_id();
         let topic_id = Self::topic_id();
         let partition_id = self.rng.random_range(0..self.partitions);
         let consumer = Consumer::new(Identifier::numeric(8888).expect("valid consumer id"));
@@ -528,7 +515,7 @@ impl ControlPlaneChurner {
     /// Exercises 23+ `expect()` panic sites reachable when consumers
     /// hold stale topic references during deletion.
     async fn delete_and_recreate_topic(&mut self, client: &IggyClient) {
-        let stream_id = self.random_stream_id();
+        let stream_id = self.random_chaos_stream_id();
         let topic_id = Self::topic_id();
 
         match client.delete_topic(&stream_id, &topic_id).await {
@@ -583,7 +570,7 @@ impl ControlPlaneChurner {
     }
 
     async fn purge_stream(&mut self, client: &IggyClient) {
-        let stream_id = self.random_stream_id();
+        let stream_id = self.random_chaos_stream_id();
 
         match client.purge_stream(&stream_id).await {
             Ok(()) => {

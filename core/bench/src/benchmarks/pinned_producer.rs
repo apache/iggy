@@ -17,6 +17,7 @@
  */
 
 use crate::args::common::IggyBenchArgs;
+use crate::benchmarks::bench_stream_names;
 use crate::benchmarks::benchmark::Benchmarkable;
 use crate::benchmarks::common::build_producer_futures;
 use crate::utils::ClientFactory;
@@ -51,8 +52,9 @@ impl Benchmarkable for PinnedProducerBenchmark {
         let client_factory = &self.client_factory;
         let args = self.args.clone();
         let mut tasks = JoinSet::new();
+        let names = bench_stream_names(args.streams());
 
-        let producer_futures = build_producer_futures(client_factory, &args);
+        let producer_futures = build_producer_futures(client_factory, &args, &names, None);
 
         for fut in producer_futures {
             tasks.spawn(fut);

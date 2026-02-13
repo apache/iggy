@@ -4518,10 +4518,12 @@ dependencies = [
  "serde",
  "sysinfo 0.38.1",
  "tokio",
+ "toml 1.0.0+spec-1.1.0",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
  "uuid",
+ "zip",
 ]
 
 [[package]]

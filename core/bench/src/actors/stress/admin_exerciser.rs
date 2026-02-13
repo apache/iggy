@@ -18,7 +18,7 @@
 
 use super::error_classifier;
 use super::stress_context::StressContext;
-use crate::benchmarks::{BENCH_STREAM_PREFIX, BENCH_TOPIC_NAME};
+use crate::benchmarks::BENCH_TOPIC_NAME;
 use crate::utils::{ClientFactory, login_root};
 use iggy::clients::client::IggyClient;
 use iggy::prelude::*;
@@ -35,13 +35,19 @@ const ADMIN_CYCLE_INTERVAL_SECS: u64 = 15;
 pub struct AdminExerciser {
     client_factory: Arc<dyn ClientFactory>,
     ctx: Arc<StressContext>,
+    stable_stream_name: String,
 }
 
 impl AdminExerciser {
-    pub fn new(client_factory: Arc<dyn ClientFactory>, ctx: Arc<StressContext>) -> Self {
+    pub fn new(
+        client_factory: Arc<dyn ClientFactory>,
+        ctx: Arc<StressContext>,
+        stable_stream_name: String,
+    ) -> Self {
         Self {
             client_factory,
             ctx,
+            stable_stream_name,
         }
     }
 
@@ -142,7 +148,8 @@ impl AdminExerciser {
     }
 
     async fn offset_lifecycle(&self, client: &IggyClient, cycle: u64) {
-        let stream_id: Identifier = format!("{BENCH_STREAM_PREFIX}-1")
+        let stream_id: Identifier = self
+            .stable_stream_name
             .as_str()
             .try_into()
             .expect("valid identifier");
@@ -190,7 +197,8 @@ impl AdminExerciser {
     }
 
     async fn flush_buffers(&self, client: &IggyClient) {
-        let stream_id: Identifier = format!("{BENCH_STREAM_PREFIX}-1")
+        let stream_id: Identifier = self
+            .stable_stream_name
             .as_str()
             .try_into()
             .expect("valid identifier");

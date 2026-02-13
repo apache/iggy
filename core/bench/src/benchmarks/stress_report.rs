@@ -16,7 +16,7 @@
  * under the License.
  */
 
-use crate::actors::stress::{stress_context::StressStats, verifier::VerificationResult};
+use crate::actors::stress::{stress_context::StressStats, verifier::StressVerificationResult};
 use serde::Serialize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -27,7 +27,7 @@ pub struct StressReport {
     pub total_duration_secs: f64,
     pub baseline_duration_secs: f64,
     pub chaos_duration_secs: f64,
-    pub drain_duration_secs: f64,
+    pub quiesce_duration_secs: f64,
     pub api_calls: ApiCallSummary,
     pub error_tiers: ErrorTierSummary,
     pub verification: VerificationSummary,
@@ -88,6 +88,13 @@ pub struct ErrorTierSummary {
 
 #[derive(Debug, Serialize)]
 pub struct VerificationSummary {
+    pub stable: NamespaceVerification,
+    pub chaos: NamespaceVerification,
+    pub passed: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct NamespaceVerification {
     pub partitions_checked: u32,
     pub total_messages: u64,
     pub gaps_found: u64,
@@ -101,31 +108,26 @@ pub struct VerificationSummary {
 impl StressReport {
     pub fn build(
         stats: &StressStats,
-        verification: &VerificationResult,
+        verification: &StressVerificationResult,
         total_duration: Duration,
         baseline_duration: Duration,
         chaos_duration: Duration,
-        drain_duration: Duration,
+        quiesce_duration: Duration,
     ) -> Self {
         let api_calls = ApiCallSummary::from_stats(stats);
         Self {
             total_duration_secs: total_duration.as_secs_f64(),
             baseline_duration_secs: baseline_duration.as_secs_f64(),
             chaos_duration_secs: chaos_duration.as_secs_f64(),
-            drain_duration_secs: drain_duration.as_secs_f64(),
+            quiesce_duration_secs: quiesce_duration.as_secs_f64(),
             error_tiers: ErrorTierSummary {
                 expected: stats.expected_errors.load(Ordering::Relaxed),
                 unexpected: stats.unexpected_errors.load(Ordering::Relaxed),
             },
             api_calls,
             verification: VerificationSummary {
-                partitions_checked: verification.partitions_checked,
-                total_messages: verification.total_messages,
-                gaps_found: verification.gaps_found,
-                duplicates_found: verification.duplicates_found,
-                checksum_mismatches: verification.checksum_mismatches,
-                payload_length_mismatches: verification.payload_length_mismatches,
-                id_missing_fingerprint: verification.id_missing_fingerprint,
+                stable: NamespaceVerification::from_result(&verification.stable),
+                chaos: NamespaceVerification::from_result(&verification.chaos),
                 passed: verification.passed,
             },
         }
@@ -134,11 +136,11 @@ impl StressReport {
     pub fn print_summary(&self) {
         println!("\n=== STRESS TEST REPORT ===");
         println!(
-            "Duration: {:.1}s (baseline: {:.1}s, chaos: {:.1}s, drain: {:.1}s)",
+            "Duration: {:.1}s (baseline: {:.1}s, chaos: {:.1}s, quiesce: {:.1}s)",
             self.total_duration_secs,
             self.baseline_duration_secs,
             self.chaos_duration_secs,
-            self.drain_duration_secs
+            self.quiesce_duration_secs
         );
         println!(
             "API calls: {} ok, {} err",
@@ -148,22 +150,44 @@ impl StressReport {
             "Errors: {} expected, {} unexpected",
             self.error_tiers.expected, self.error_tiers.unexpected
         );
+        let s = &self.verification.stable;
         println!(
-            "Verification: {} partitions, {} msgs, {} gaps, {} dups, {} checksum, {} len, {} id -> {}",
-            self.verification.partitions_checked,
-            self.verification.total_messages,
-            self.verification.gaps_found,
-            self.verification.duplicates_found,
-            self.verification.checksum_mismatches,
-            self.verification.payload_length_mismatches,
-            self.verification.id_missing_fingerprint,
-            if self.verification.passed {
-                "PASSED"
+            "Stable: {} partitions, {} msgs, {} gaps, {} dups, {} checksum -> {}",
+            s.partitions_checked,
+            s.total_messages,
+            s.gaps_found,
+            s.duplicates_found,
+            s.checksum_mismatches,
+            if s.passed { "PASSED" } else { "FAILED" }
+        );
+        let c = &self.verification.chaos;
+        println!(
+            "Chaos:  {} partitions, {} msgs, integrity {} -> {}",
+            c.partitions_checked,
+            c.total_messages,
+            if c.checksum_mismatches == 0 && c.payload_length_mismatches == 0 {
+                "OK"
             } else {
-                "FAILED"
-            }
+                "FAIL"
+            },
+            if c.passed { "PASSED" } else { "FAILED" }
         );
         println!("==========================\n");
+    }
+}
+
+impl NamespaceVerification {
+    const fn from_result(r: &crate::actors::stress::verifier::VerificationResult) -> Self {
+        Self {
+            partitions_checked: r.partitions_checked,
+            total_messages: r.total_messages,
+            gaps_found: r.gaps_found,
+            duplicates_found: r.duplicates_found,
+            checksum_mismatches: r.checksum_mismatches,
+            payload_length_mismatches: r.payload_length_mismatches,
+            id_missing_fingerprint: r.id_missing_fingerprint,
+            passed: r.passed,
+        }
     }
 }
 

@@ -22,7 +22,7 @@ use std::{
     fmt::Display,
     sync::{
         Arc, OnceLock,
-        atomic::{AtomicI64, Ordering},
+        atomic::{AtomicBool, AtomicI64, Ordering},
     },
     time::Instant,
 };
@@ -63,6 +63,9 @@ pub struct BenchmarkFinishCondition {
     /// Lazily initialized on first `is_elapsed()` call so the timer starts
     /// when the actor begins polling, not when the condition is constructed.
     start_time: OnceLock<Instant>,
+    /// External cancellation signal. When set to `true`, `is_done()` returns
+    /// immediately. Used by the stress test to propagate shutdown to data-plane actors.
+    cancelled: Option<Arc<AtomicBool>>,
 }
 
 impl BenchmarkFinishCondition {
@@ -114,6 +117,7 @@ impl BenchmarkFinishCondition {
                     left_total: Arc::new(AtomicI64::new(i64::from(count_per_actor))),
                     mode,
                     start_time: OnceLock::new(),
+                    cancelled: None,
                 })
             }
             (Some(size), None) => {
@@ -127,6 +131,7 @@ impl BenchmarkFinishCondition {
                     )),
                     mode,
                     start_time: OnceLock::new(),
+                    cancelled: None,
                 })
             }
             (None, None) => {
@@ -152,6 +157,7 @@ impl BenchmarkFinishCondition {
             left_total: Arc::new(AtomicI64::new(0)),
             mode: BenchmarkFinishConditionMode::Shared,
             start_time: OnceLock::new(),
+            cancelled: None,
         })
     }
 
@@ -163,10 +169,28 @@ impl BenchmarkFinishCondition {
             left_total: Arc::new(AtomicI64::new(i64::MAX)),
             mode: BenchmarkFinishConditionMode::Shared,
             start_time: OnceLock::new(),
+            cancelled: None,
+        })
+    }
+
+    /// Creates a finish condition that never expires on its own — it only completes
+    /// when the external `cancelled` flag is set. Used by the stress test so
+    /// data-plane actors stop in sync with chaos actors on cancellation.
+    pub fn new_cancellable(cancelled: Arc<AtomicBool>) -> Arc<Self> {
+        Arc::new(Self {
+            kind: BenchmarkFinishConditionType::Duration,
+            total: u64::MAX,
+            left_total: Arc::new(AtomicI64::new(i64::MAX)),
+            mode: BenchmarkFinishConditionMode::Shared,
+            start_time: OnceLock::new(),
+            cancelled: Some(cancelled),
         })
     }
 
     pub fn account_and_check(&self, size_to_subtract: u64) -> bool {
+        if self.is_cancelled() {
+            return true;
+        }
         match self.kind {
             BenchmarkFinishConditionType::TotalData => {
                 self.left_total.fetch_sub(
@@ -184,10 +208,19 @@ impl BenchmarkFinishCondition {
     }
 
     pub fn is_done(&self) -> bool {
+        if self.is_cancelled() {
+            return true;
+        }
         match self.kind {
             BenchmarkFinishConditionType::Duration => self.is_elapsed(),
             _ => self.left() <= 0,
         }
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled
+            .as_ref()
+            .is_some_and(|c| c.load(Ordering::Acquire))
     }
 
     fn is_elapsed(&self) -> bool {

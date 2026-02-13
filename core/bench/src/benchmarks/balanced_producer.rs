@@ -18,6 +18,7 @@
 
 use super::benchmark::Benchmarkable;
 use crate::args::common::IggyBenchArgs;
+use crate::benchmarks::bench_stream_names;
 use crate::benchmarks::common::build_producer_futures;
 use crate::utils::ClientFactory;
 use async_trait::async_trait;
@@ -50,7 +51,8 @@ impl Benchmarkable for BalancedProducerBenchmark {
         self.init_streams().await?;
         let cf = &self.client_factory;
         let args = self.args.clone();
-        let producer_futures = build_producer_futures(cf, &args);
+        let names = bench_stream_names(args.streams());
+        let producer_futures = build_producer_futures(cf, &args, &names, None);
         let mut tasks = JoinSet::new();
 
         for fut in producer_futures {

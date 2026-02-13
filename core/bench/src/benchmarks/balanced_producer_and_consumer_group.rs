@@ -17,6 +17,7 @@
  */
 
 use super::benchmark::Benchmarkable;
+use crate::benchmarks::bench_stream_names;
 use crate::utils::ClientFactory;
 use crate::{
     args::common::IggyBenchArgs,
@@ -52,11 +53,12 @@ impl Benchmarkable for BalancedProducerAndConsumerGroupBenchmark {
         let cf = &self.client_factory;
         let args = self.args.clone();
         let mut tasks: JoinSet<_> = JoinSet::new();
+        let names = bench_stream_names(args.streams());
 
-        init_consumer_groups(cf, &args).await?;
+        init_consumer_groups(cf, &names).await?;
 
-        let producer_futures = build_producer_futures(cf, &args);
-        let consumer_futures = build_consumer_futures(cf, &args);
+        let producer_futures = build_producer_futures(cf, &args, &names, None);
+        let consumer_futures = build_consumer_futures(cf, &args, &names, None);
 
         for fut in producer_futures {
             tasks.spawn(fut);

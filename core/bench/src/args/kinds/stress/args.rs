@@ -25,9 +25,9 @@ use std::str::FromStr;
 const DEFAULT_PRODUCERS: NonZeroU32 = nonzero_lit::u32!(4);
 const DEFAULT_CONSUMERS: NonZeroU32 = nonzero_lit::u32!(4);
 const DEFAULT_CHURN_CONCURRENCY: NonZeroU32 = nonzero_lit::u32!(1);
-const DEFAULT_STREAMS: u32 = 2;
+const DEFAULT_STABLE_STREAMS: u32 = 2;
+const DEFAULT_CHAOS_STREAMS: u32 = 1;
 const DEFAULT_PARTITIONS: u32 = 4;
-const DEFAULT_CONSUMER_GROUPS: u32 = 2;
 
 /// Determines the mix of API operations exercised during the stress test.
 #[derive(Debug, Clone, Copy, ValueEnum, Default)]
@@ -81,14 +81,30 @@ pub struct StressArgs {
     #[arg(long, value_enum, default_value_t = ApiMix::All)]
     pub api_mix: ApiMix,
 
+    /// Number of stable streams (golden logs, strict verification)
+    #[arg(long, default_value_t = DEFAULT_STABLE_STREAMS)]
+    pub stable_streams: u32,
+
+    /// Number of chaos streams (full destruction, integrity-only verification)
+    #[arg(long, default_value_t = DEFAULT_CHAOS_STREAMS)]
+    pub chaos_streams: u32,
+
     /// RNG seed for reproducible chaos operations
     #[arg(long)]
     pub chaos_seed: Option<u64>,
+
+    /// Fixed duration of the baseline phase (data-plane only, no chaos)
+    #[arg(long, default_value = "15s", value_parser = IggyDuration::from_str)]
+    pub baseline_duration: IggyDuration,
+
+    /// Fixed duration of the quiesce phase (graceful shutdown window after cancellation)
+    #[arg(long, default_value = "10s", value_parser = IggyDuration::from_str)]
+    pub quiesce_duration: IggyDuration,
 }
 
 impl BenchmarkKindProps for StressArgs {
     fn streams(&self) -> u32 {
-        DEFAULT_STREAMS
+        self.stable_streams + self.chaos_streams
     }
 
     fn partitions(&self) -> u32 {
@@ -107,16 +123,19 @@ impl BenchmarkKindProps for StressArgs {
         &self.transport
     }
 
+    /// CGs only on stable streams
     fn number_of_consumer_groups(&self) -> u32 {
-        DEFAULT_CONSUMER_GROUPS
+        self.stable_streams
     }
 
+    /// Stable streams use `NeverExpire`; chaos uses the CLI field directly
     fn max_topic_size(&self) -> Option<IggyByteSize> {
-        Some(self.max_topic_size)
+        None
     }
 
+    /// Stable streams use `NeverExpire`; chaos uses the CLI field directly
     fn message_expiry(&self) -> IggyExpiry {
-        self.message_expiry
+        IggyExpiry::NeverExpire
     }
 
     fn validate(&self) {
@@ -125,6 +144,35 @@ impl BenchmarkKindProps for StressArgs {
                 .error(
                     ErrorKind::ValueValidation,
                     "Stress test duration must be at least 10 seconds",
+                )
+                .exit();
+        }
+        if self.stable_streams < 1 {
+            crate::args::common::IggyBenchArgs::command()
+                .error(
+                    ErrorKind::ValueValidation,
+                    "At least 1 stable stream is required",
+                )
+                .exit();
+        }
+        if self.chaos_streams < 1 {
+            crate::args::common::IggyBenchArgs::command()
+                .error(
+                    ErrorKind::ValueValidation,
+                    "At least 1 chaos stream is required",
+                )
+                .exit();
+        }
+        let baseline_plus_quiesce =
+            self.baseline_duration.get_duration() + self.quiesce_duration.get_duration();
+        if baseline_plus_quiesce >= self.duration.get_duration() {
+            crate::args::common::IggyBenchArgs::command()
+                .error(
+                    ErrorKind::ValueValidation,
+                    format!(
+                        "baseline_duration ({}) + quiesce_duration ({}) must be less than total duration ({})",
+                        self.baseline_duration, self.quiesce_duration, self.duration
+                    ),
                 )
                 .exit();
         }
@@ -156,5 +204,21 @@ impl StressArgs {
                 .expect("system clock before epoch")
                 .as_nanos() as u64
         })
+    }
+
+    pub const fn stable_streams(&self) -> u32 {
+        self.stable_streams
+    }
+
+    pub const fn chaos_streams(&self) -> u32 {
+        self.chaos_streams
+    }
+
+    pub const fn baseline_duration(&self) -> IggyDuration {
+        self.baseline_duration
+    }
+
+    pub const fn quiesce_duration(&self) -> IggyDuration {
+        self.quiesce_duration
     }
 }

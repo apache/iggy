@@ -17,6 +17,7 @@
  */
 
 use crate::args::common::IggyBenchArgs;
+use crate::benchmarks::bench_stream_names;
 use crate::benchmarks::common::{build_producing_consumer_groups_futures, init_consumer_groups};
 use crate::utils::ClientFactory;
 use async_trait::async_trait;
@@ -52,8 +53,9 @@ impl Benchmarkable for EndToEndProducingConsumerGroupBenchmark {
         let cf = self.client_factory.clone();
         let args = self.args.clone();
         let mut tasks = JoinSet::new();
+        let names = bench_stream_names(args.number_of_consumer_groups());
 
-        init_consumer_groups(&cf, &args).await?;
+        init_consumer_groups(&cf, &names).await?;
 
         let futures = build_producing_consumer_groups_futures(cf, args);
         for fut in futures {

@@ -33,4 +33,12 @@ pub mod stress_report;
 pub const CONSUMER_GROUP_BASE_ID: u32 = 0;
 pub const CONSUMER_GROUP_NAME_PREFIX: &str = "cg";
 pub const BENCH_STREAM_PREFIX: &str = "bench-stream";
+pub const STABLE_STREAM_PREFIX: &str = "stable";
+pub const CHAOS_STREAM_PREFIX: &str = "chaos";
 pub const BENCH_TOPIC_NAME: &str = "topic-1";
+
+pub fn bench_stream_names(count: u32) -> Vec<String> {
+    (1..=count)
+        .map(|i| format!("{BENCH_STREAM_PREFIX}-{i}"))
+        .collect()
+}

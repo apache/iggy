@@ -70,16 +70,15 @@ pub fn rate_limit_per_actor(total_rate: Option<IggyByteSize>, actors: u32) -> Op
 #[allow(clippy::cognitive_complexity)]
 pub async fn init_consumer_groups(
     client_factory: &Arc<dyn ClientFactory>,
-    args: &IggyBenchArgs,
+    stream_names: &[String],
 ) -> Result<(), IggyError> {
     let client = client_factory.create_client().await;
     let client = IggyClient::create(client, None, None);
-    let cg_count = args.number_of_consumer_groups();
 
     login_root(&client).await;
-    for i in 0..cg_count {
-        let consumer_group_id = CONSUMER_GROUP_BASE_ID + i;
-        let stream_name = format!("bench-stream-{}", i + 1);
+    for (i, stream_name) in stream_names.iter().enumerate() {
+        #[allow(clippy::cast_possible_truncation)]
+        let consumer_group_id = CONSUMER_GROUP_BASE_ID + i as u32;
         let stream_id: Identifier = stream_name.as_str().try_into()?;
         let topic_id: Identifier = "topic-1".try_into()?;
         let consumer_group_name = format!("{CONSUMER_GROUP_NAME_PREFIX}-{consumer_group_id}");
@@ -100,8 +99,10 @@ pub async fn init_consumer_groups(
 pub fn build_producer_futures(
     client_factory: &Arc<dyn ClientFactory>,
     args: &IggyBenchArgs,
+    stream_names: &[String],
+    finish_condition_override: Option<Arc<BenchmarkFinishCondition>>,
 ) -> Vec<impl Future<Output = Result<BenchmarkIndividualMetrics, IggyError>> + Send + use<>> {
-    let streams = args.streams();
+    let stream_count = u32::try_from(stream_names.len()).expect("too many streams");
     let partitions = args.number_of_partitions();
     let producers = args.producers();
     let actors = args.producers() + args.consumers();
@@ -111,8 +112,9 @@ pub fn build_producer_futures(
     let sampling_time = args.sampling_time();
     let moving_average_window = args.moving_average_window();
     let kind = args.kind();
-    let shared_finish_condition =
-        BenchmarkFinishCondition::new(args, BenchmarkFinishConditionMode::Shared);
+    let shared_finish_condition = finish_condition_override.unwrap_or_else(|| {
+        BenchmarkFinishCondition::new(args, BenchmarkFinishConditionMode::Shared)
+    });
     let rate_limit = rate_limit_per_actor(args.rate_limit(), actors);
     let use_high_level_api = args.high_level_api();
 
@@ -126,8 +128,7 @@ pub fn build_producer_futures(
                 BenchmarkFinishCondition::new(args, BenchmarkFinishConditionMode::PerProducer)
             };
 
-            let stream_idx = 1 + ((producer_id - 1) % streams);
-            let stream_id = format!("bench-stream-{stream_idx}");
+            let stream_id = stream_names[((producer_id - 1) % stream_count) as usize].clone();
 
             async move {
                 let producer = TypedBenchmarkProducer::new(
@@ -154,8 +155,11 @@ pub fn build_producer_futures(
 pub fn build_consumer_futures(
     client_factory: &Arc<dyn ClientFactory>,
     args: &IggyBenchArgs,
+    stream_names: &[String],
+    finish_condition_override: Option<Arc<BenchmarkFinishCondition>>,
 ) -> Vec<impl Future<Output = Result<BenchmarkIndividualMetrics, IggyError>> + Send + use<>> {
     let cg_count = args.number_of_consumer_groups();
+    let stream_count = stream_names.len();
     let consumers = args.consumers();
     let actors = args.producers() + args.consumers();
     let warmup_time = args.warmup_time();
@@ -176,8 +180,9 @@ pub fn build_consumer_futures(
         _ => unreachable!(),
     };
 
-    let global_finish_condition =
-        BenchmarkFinishCondition::new(args, BenchmarkFinishConditionMode::Shared);
+    let global_finish_condition = finish_condition_override.unwrap_or_else(|| {
+        BenchmarkFinishCondition::new(args, BenchmarkFinishConditionMode::Shared)
+    });
     // When measuring true E2E latency, apply read_amplification multiplier to consumer rate
     // to ensure they can keep up with producers and not inflate latency due to queue buildup
     let read_amplification = args.read_amplification().unwrap_or(1.0);
@@ -205,11 +210,11 @@ pub fn build_consumer_futures(
                 BenchmarkFinishCondition::new(args, BenchmarkFinishConditionMode::PerConsumer)
             };
             let stream_idx = if cg_count > 0 {
-                1 + ((consumer_id - 1) % cg_count)
+                ((consumer_id - 1) % cg_count) as usize
             } else {
-                consumer_id
+                (consumer_id - 1) as usize
             };
-            let stream_id = format!("bench-stream-{stream_idx}");
+            let stream_id = stream_names[stream_idx % stream_count].clone();
             // Each stream has exactly one CG, server assigns IDs starting from 0
             let consumer_group_id = if cg_count > 0 {
                 Some(CONSUMER_GROUP_BASE_ID)
