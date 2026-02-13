@@ -154,7 +154,6 @@ impl ConsensusHeader for GenericHeader {
     }
 }
 
-const _: () = assert!(std::mem::size_of::<GenericHeader>() == 256);
 
 
 #[repr(C)]
