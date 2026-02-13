@@ -1095,7 +1095,6 @@ impl<B: MessageBus> Project<Message<PrepareHeader>, VsrConsensus<B>> for Message
             *new = PrepareHeader {
                 cluster: consensus.cluster,
                 size: old.size,
-                epoch: 0,
                 view: consensus.view.get(),
                 release: old.release,
                 command: Command2::Prepare,
@@ -1125,7 +1124,6 @@ impl<B: MessageBus> Project<Message<PrepareOkHeader>, VsrConsensus<B>> for Messa
                 request: old.request,
                 cluster: consensus.cluster,
                 replica: consensus.replica,
-                epoch: 0, // TODO: consensus.epoch
                 // It's important to use the view of the replica, not the received prepare!
                 view: consensus.view.get(),
                 op: old.op,
