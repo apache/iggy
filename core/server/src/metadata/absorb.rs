@@ -309,7 +309,7 @@ fn apply_op(
                 if !group.members.iter().any(|(_, m)| m.client_id == *client_id) {
                     let new_member = ConsumerGroupMemberMeta::new(next_id, *client_id);
                     group.members.insert(new_member);
-                    group.assign_partitions_to_new_members();
+                    group.rebalance_cooperative();
                 }
 
                 if populate_ids {
@@ -343,13 +343,23 @@ fn apply_op(
                     if populate_ids {
                         removed_member_id.store(member_id, Ordering::Release);
                     }
+                    // Partitions owned by the leaving member
+                    let leaving_partitions: Vec<usize> = group
+                        .members
+                        .get(member_id)
+                        .map(|m| m.partitions.clone())
+                        .unwrap_or_default();
+
                     group.members.remove(member_id);
                     group.rebalance_members();
 
+                    // Clear polled offsets only for the leaving member's partitions
                     let consumer_group_id = ConsumerGroupId(*group_id);
-                    for partition in topic.partitions.iter() {
-                        let guard = partition.last_polled_offsets.pin();
-                        guard.remove(&consumer_group_id);
+                    for partition_id in leaving_partitions {
+                        if let Some(partition) = topic.partitions.get(partition_id) {
+                            let guard = partition.last_polled_offsets.pin();
+                            guard.remove(&consumer_group_id);
+                        }
                     }
                 }
             }
@@ -388,11 +398,13 @@ fn apply_op(
             member_slab_id,
             member_id,
             partition_id,
+            timed_out: _,
         } => {
             if let Some(stream) = metadata.streams.get_mut(*stream_id)
                 && let Some(topic) = stream.topics.get_mut(*topic_id)
                 && let Some(group) = topic.consumer_groups.get_mut(*group_id)
             {
+                // Pre-validated by maybe_complete_pending_revocation before dispatch.
                 group.complete_revocation(*member_slab_id, *member_id, *partition_id);
             }
         }

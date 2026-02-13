@@ -117,6 +117,7 @@ impl IggyShard {
                 revocation.slab_id,
                 revocation.member_id,
                 revocation.partition_id,
+                false,
             );
         }
 

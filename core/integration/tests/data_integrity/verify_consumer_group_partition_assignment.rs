@@ -21,6 +21,7 @@ use integration::iggy_harness;
 use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::time::{Duration, sleep};
 
 const STREAM_NAME: &str = "cg-partition-test-stream";
@@ -318,6 +319,1453 @@ async fn should_not_reshuffle_partitions_when_new_member_joins(harness: &TestHar
 
     // 6. Verify all partitions are assigned uniquely
     assert_unique_partition_assignments(&cg_after);
+
+    // Cleanup
+    root_client
+        .delete_stream(&Identifier::named(STREAM_NAME).unwrap())
+        .await
+        .unwrap();
+}
+
+#[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
+    heartbeat.enabled = true,
+    heartbeat.interval = "2s",
+    tcp.socket.override_defaults = true,
+    tcp.socket.nodelay = true
+))]
+async fn should_skip_revoked_partitions_in_round_robin(harness: &TestHarness) {
+    let root_client = harness.root_client().await.unwrap();
+    setup_stream_topic_cg(&root_client).await;
+    send_one_message_per_partition(&root_client).await;
+
+    let client1 = harness.new_client().await.unwrap();
+    client1
+        .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+        .await
+        .unwrap();
+    join_cg(&client1).await;
+
+    let consumer = Consumer::group(Identifier::named(CONSUMER_GROUP_NAME).unwrap());
+
+    let mut polled_before = HashSet::new();
+    for _ in 0..PARTITIONS_COUNT {
+        let polled = client1
+            .poll_messages(
+                &Identifier::named(STREAM_NAME).unwrap(),
+                &Identifier::named(TOPIC_NAME).unwrap(),
+                None,
+                &consumer,
+                &PollingStrategy::next(),
+                1,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(polled.messages.len(), 1);
+        assert!(polled_before.insert(polled.partition_id));
+    }
+    assert_eq!(polled_before.len(), PARTITIONS_COUNT as usize);
+
+    let client2 = harness.new_client().await.unwrap();
+    client2
+        .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+        .await
+        .unwrap();
+    join_cg(&client2).await;
+    sleep(Duration::from_millis(100)).await;
+
+    // Consumer1 polls again — round-robin skips revoked partitions
+    let mut polled_after = HashSet::new();
+    for _ in 0..PARTITIONS_COUNT {
+        let polled = client1
+            .poll_messages(
+                &Identifier::named(STREAM_NAME).unwrap(),
+                &Identifier::named(TOPIC_NAME).unwrap(),
+                None,
+                &consumer,
+                &PollingStrategy::next(),
+                1,
+                false,
+            )
+            .await
+            .unwrap();
+        if !polled.messages.is_empty() {
+            polled_after.insert(polled.partition_id);
+        }
+    }
+
+    assert!(
+        polled_after.len() < PARTITIONS_COUNT as usize,
+        "Consumer1 should skip revoked partitions but got all {PARTITIONS_COUNT}: {polled_after:?}"
+    );
+    assert!(
+        !polled_after.is_empty(),
+        "Consumer1 must keep at least 1 partition"
+    );
+
+    root_client
+        .delete_stream(&Identifier::named(STREAM_NAME).unwrap())
+        .await
+        .unwrap();
+}
+
+#[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
+    heartbeat.enabled = true,
+    heartbeat.interval = "2s",
+    tcp.socket.override_defaults = true,
+    tcp.socket.nodelay = true
+))]
+async fn should_not_lose_messages_with_concurrent_polls_during_partition_add(
+    harness: &TestHarness,
+) {
+    let root_client = harness.root_client().await.unwrap();
+
+    setup_stream_topic_cg(&root_client).await;
+
+    // Send 10 messages per partition
+    for partition_id in 0..PARTITIONS_COUNT {
+        for i in 0..10u32 {
+            let message = IggyMessage::from_str(&format!("p{partition_id}-msg{i}")).unwrap();
+            let mut messages = vec![message];
+            root_client
+                .send_messages(
+                    &Identifier::named(STREAM_NAME).unwrap(),
+                    &Identifier::named(TOPIC_NAME).unwrap(),
+                    &Partitioning::partition_id(partition_id),
+                    &mut messages,
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    // 1. Two consumers join
+    let client1 = Arc::new(harness.new_client().await.unwrap());
+    let client2 = Arc::new(harness.new_client().await.unwrap());
+    for client in [&*client1, &*client2] {
+        client
+            .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+            .await
+            .unwrap();
+        join_cg(client).await;
+    }
+
+    sleep(Duration::from_millis(200)).await;
+
+    // 2. Start concurrent poll loops
+    let stop = Arc::new(AtomicBool::new(false));
+    let total_polled_1 = Arc::new(AtomicU64::new(0));
+    let total_polled_2 = Arc::new(AtomicU64::new(0));
+
+    let poll_task_1 = {
+        let client = client1.clone();
+        let stop = stop.clone();
+        let count = total_polled_1.clone();
+        tokio::spawn(async move {
+            let consumer = Consumer::group(Identifier::named(CONSUMER_GROUP_NAME).unwrap());
+            while !stop.load(Ordering::Relaxed) {
+                let polled = client
+                    .poll_messages(
+                        &Identifier::named(STREAM_NAME).unwrap(),
+                        &Identifier::named(TOPIC_NAME).unwrap(),
+                        None,
+                        &consumer,
+                        &PollingStrategy::next(),
+                        1,
+                        true,
+                    )
+                    .await;
+                if let Ok(polled) = polled {
+                    count.fetch_add(polled.messages.len() as u64, Ordering::Relaxed);
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+    };
+
+    let poll_task_2 = {
+        let client = client2.clone();
+        let stop = stop.clone();
+        let count = total_polled_2.clone();
+        tokio::spawn(async move {
+            let consumer = Consumer::group(Identifier::named(CONSUMER_GROUP_NAME).unwrap());
+            while !stop.load(Ordering::Relaxed) {
+                let polled = client
+                    .poll_messages(
+                        &Identifier::named(STREAM_NAME).unwrap(),
+                        &Identifier::named(TOPIC_NAME).unwrap(),
+                        None,
+                        &consumer,
+                        &PollingStrategy::next(),
+                        1,
+                        true,
+                    )
+                    .await;
+                if let Ok(polled) = polled {
+                    count.fetch_add(polled.messages.len() as u64, Ordering::Relaxed);
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+    };
+
+    // 3. While polling, add 3 partitions
+    sleep(Duration::from_millis(100)).await;
+    root_client
+        .create_partitions(
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
+            3,
+        )
+        .await
+        .unwrap();
+
+    // Send messages to new partitions
+    for partition_id in PARTITIONS_COUNT..PARTITIONS_COUNT + 3 {
+        for i in 0..10u32 {
+            let message = IggyMessage::from_str(&format!("p{partition_id}-msg{i}")).unwrap();
+            let mut messages = vec![message];
+            root_client
+                .send_messages(
+                    &Identifier::named(STREAM_NAME).unwrap(),
+                    &Identifier::named(TOPIC_NAME).unwrap(),
+                    &Partitioning::partition_id(partition_id),
+                    &mut messages,
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    // Let polling continue for a bit after partition add
+    sleep(Duration::from_secs(1)).await;
+    stop.store(true, Ordering::Relaxed);
+    let _ = poll_task_1.await;
+    let _ = poll_task_2.await;
+
+    // 4. Verify: no duplicates, all partitions assigned
+    let cg = get_consumer_group(&root_client).await;
+    assert_eq!(cg.members_count, 2);
+    assert_unique_partition_assignments(&cg);
+    let total: u32 = cg.members.iter().map(|m| m.partitions_count).sum();
+    assert_eq!(
+        total, 6,
+        "All 6 partitions must be assigned. Members: {:?}",
+        cg.members
+    );
+
+    // Both consumers should have polled something
+    let p1 = total_polled_1.load(Ordering::Relaxed);
+    let p2 = total_polled_2.load(Ordering::Relaxed);
+    assert!(
+        p1 + p2 > 0,
+        "Consumers should have polled at least some messages"
+    );
+
+    // Cleanup
+    root_client
+        .delete_stream(&Identifier::named(STREAM_NAME).unwrap())
+        .await
+        .unwrap();
+}
+
+#[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
+    heartbeat.enabled = true,
+    heartbeat.interval = "2s",
+    tcp.socket.override_defaults = true,
+    tcp.socket.nodelay = true
+))]
+async fn should_handle_partition_add_then_consumer_disconnect_then_new_join(harness: &TestHarness) {
+    let root_client = harness.root_client().await.unwrap();
+
+    setup_stream_topic_cg(&root_client).await;
+    send_one_message_per_partition(&root_client).await;
+
+    // 1. Two consumers join
+    let client1 = harness.new_client().await.unwrap();
+    let client2 = harness.new_client().await.unwrap();
+    for client in [&client1, &client2] {
+        client
+            .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+            .await
+            .unwrap();
+        join_cg(client).await;
+    }
+
+    sleep(Duration::from_millis(200)).await;
+
+    // Both poll and auto-commit
+    let consumer = Consumer::group(Identifier::named(CONSUMER_GROUP_NAME).unwrap());
+    for client in [&client1, &client2] {
+        let _ = client
+            .poll_messages(
+                &Identifier::named(STREAM_NAME).unwrap(),
+                &Identifier::named(TOPIC_NAME).unwrap(),
+                None,
+                &consumer,
+                &PollingStrategy::next(),
+                1,
+                true,
+            )
+            .await
+            .unwrap();
+    }
+
+    // 2. Add 3 partitions (3 → 6)
+    root_client
+        .create_partitions(
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
+            3,
+        )
+        .await
+        .unwrap();
+
+    for partition_id in PARTITIONS_COUNT..PARTITIONS_COUNT + 3 {
+        let message = IggyMessage::from_str(&format!("new-p{partition_id}")).unwrap();
+        let mut messages = vec![message];
+        root_client
+            .send_messages(
+                &Identifier::named(STREAM_NAME).unwrap(),
+                &Identifier::named(TOPIC_NAME).unwrap(),
+                &Partitioning::partition_id(partition_id),
+                &mut messages,
+            )
+            .await
+            .unwrap();
+    }
+
+    sleep(Duration::from_millis(500)).await;
+
+    // 3. Consumer2 disconnects
+    drop(client2);
+    sleep(Duration::from_millis(500)).await;
+
+    let cg = get_consumer_group(&root_client).await;
+    assert_eq!(
+        cg.members_count, 1,
+        "Only consumer1 should remain. Members: {:?}",
+        cg.members
+    );
+    assert_eq!(
+        cg.members[0].partitions_count, 6,
+        "Consumer1 should have all 6 partitions after consumer2 left. Members: {:?}",
+        cg.members
+    );
+
+    // 4. New consumer3 joins
+    let client3 = harness.new_client().await.unwrap();
+    client3
+        .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+        .await
+        .unwrap();
+    join_cg(&client3).await;
+
+    sleep(Duration::from_millis(500)).await;
+
+    // 5. Verify: both members have partitions, no duplicates
+    let cg = get_consumer_group(&root_client).await;
+    assert_eq!(cg.members_count, 2);
+    assert_unique_partition_assignments(&cg);
+    let total: u32 = cg.members.iter().map(|m| m.partitions_count).sum();
+    assert_eq!(
+        total, 6,
+        "All 6 partitions must be assigned. Members: {:?}",
+        cg.members
+    );
+    for member in &cg.members {
+        assert!(
+            member.partitions_count >= 1,
+            "Both members must have partitions. Members: {:?}",
+            cg.members
+        );
+    }
+
+    // 6. Both can poll unique partitions
+    let mut polled_partitions = HashSet::new();
+    for client in [&client1, &client3] {
+        let polled = client
+            .poll_messages(
+                &Identifier::named(STREAM_NAME).unwrap(),
+                &Identifier::named(TOPIC_NAME).unwrap(),
+                None,
+                &consumer,
+                &PollingStrategy::offset(0),
+                1,
+                false,
+            )
+            .await
+            .unwrap();
+        if !polled.messages.is_empty() {
+            assert!(
+                polled_partitions.insert(polled.partition_id),
+                "Duplicate partition {} after disconnect + rejoin!",
+                polled.partition_id
+            );
+        }
+    }
+    assert_eq!(
+        polled_partitions.len(),
+        2,
+        "Both consumers should poll from unique partitions"
+    );
+
+    // Cleanup
+    root_client
+        .delete_stream(&Identifier::named(STREAM_NAME).unwrap())
+        .await
+        .unwrap();
+}
+
+#[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
+    heartbeat.enabled = true,
+    heartbeat.interval = "2s",
+    tcp.socket.override_defaults = true,
+    tcp.socket.nodelay = true
+))]
+async fn should_handle_partition_delete_while_multiple_consumers_polling(harness: &TestHarness) {
+    let root_client = harness.root_client().await.unwrap();
+
+    // Start with 6 partitions
+    root_client.create_stream(STREAM_NAME).await.unwrap();
+    root_client
+        .create_topic(
+            &Identifier::named(STREAM_NAME).unwrap(),
+            TOPIC_NAME,
+            6,
+            CompressionAlgorithm::default(),
+            None,
+            IggyExpiry::NeverExpire,
+            MaxTopicSize::ServerDefault,
+        )
+        .await
+        .unwrap();
+    root_client
+        .create_consumer_group(
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
+            CONSUMER_GROUP_NAME,
+        )
+        .await
+        .unwrap();
+
+    // Send messages to all 6 partitions
+    for partition_id in 0..6u32 {
+        for i in 0..5u32 {
+            let message = IggyMessage::from_str(&format!("p{partition_id}-m{i}")).unwrap();
+            let mut messages = vec![message];
+            root_client
+                .send_messages(
+                    &Identifier::named(STREAM_NAME).unwrap(),
+                    &Identifier::named(TOPIC_NAME).unwrap(),
+                    &Partitioning::partition_id(partition_id),
+                    &mut messages,
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    // 1. Three consumers join (6 partitions / 3 = 2 each)
+    let client1 = Arc::new(harness.new_client().await.unwrap());
+    let client2 = Arc::new(harness.new_client().await.unwrap());
+    let client3 = Arc::new(harness.new_client().await.unwrap());
+    for client in [&*client1, &*client2, &*client3] {
+        client
+            .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+            .await
+            .unwrap();
+        join_cg(client).await;
+    }
+
+    sleep(Duration::from_millis(200)).await;
+
+    // 2. Start concurrent poll loops
+    let stop = Arc::new(AtomicBool::new(false));
+    let consumer = Consumer::group(Identifier::named(CONSUMER_GROUP_NAME).unwrap());
+
+    let mut poll_tasks = Vec::new();
+    for client in [client1.clone(), client2.clone(), client3.clone()] {
+        let stop = stop.clone();
+        let consumer = consumer.clone();
+        poll_tasks.push(tokio::spawn(async move {
+            let mut count = 0u64;
+            while !stop.load(Ordering::Relaxed) {
+                let polled = client
+                    .poll_messages(
+                        &Identifier::named(STREAM_NAME).unwrap(),
+                        &Identifier::named(TOPIC_NAME).unwrap(),
+                        None,
+                        &consumer,
+                        &PollingStrategy::next(),
+                        1,
+                        true,
+                    )
+                    .await;
+                if let Ok(p) = polled {
+                    count += p.messages.len() as u64;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+            count
+        }));
+    }
+
+    // 3. While all 3 consumers are polling, delete 3 partitions (6 → 3)
+    sleep(Duration::from_millis(200)).await;
+    root_client
+        .delete_partitions(
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
+            3,
+        )
+        .await
+        .unwrap();
+
+    // Let polling continue after delete
+    sleep(Duration::from_secs(1)).await;
+    stop.store(true, Ordering::Relaxed);
+    for task in poll_tasks {
+        let _ = task.await;
+    }
+
+    // 4. Verify: 3 members, 3 remaining partitions, no duplicates
+    let cg = get_consumer_group(&root_client).await;
+    assert_eq!(cg.members_count, 3);
+    assert_unique_partition_assignments(&cg);
+    let total: u32 = cg.members.iter().map(|m| m.partitions_count).sum();
+    assert_eq!(
+        total, 3,
+        "Only 3 partitions should remain. Members: {:?}",
+        cg.members
+    );
+    for member in &cg.members {
+        assert_eq!(
+            member.partitions_count, 1,
+            "Each of 3 members should have exactly 1 of 3 remaining partitions. Members: {:?}",
+            cg.members
+        );
+    }
+
+    // Cleanup
+    root_client
+        .delete_stream(&Identifier::named(STREAM_NAME).unwrap())
+        .await
+        .unwrap();
+}
+
+#[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
+    heartbeat.enabled = true,
+    heartbeat.interval = "2s",
+    tcp.socket.override_defaults = true,
+    tcp.socket.nodelay = true
+))]
+async fn should_reach_even_distribution_after_multiple_joins(harness: &TestHarness) {
+    let root_client = harness.root_client().await.unwrap();
+
+    // Start with 6 partitions for cleaner math
+    root_client.create_stream(STREAM_NAME).await.unwrap();
+    root_client
+        .create_topic(
+            &Identifier::named(STREAM_NAME).unwrap(),
+            TOPIC_NAME,
+            6,
+            CompressionAlgorithm::default(),
+            None,
+            IggyExpiry::NeverExpire,
+            MaxTopicSize::ServerDefault,
+        )
+        .await
+        .unwrap();
+    root_client
+        .create_consumer_group(
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
+            CONSUMER_GROUP_NAME,
+        )
+        .await
+        .unwrap();
+
+    for partition_id in 0..6u32 {
+        let message = IggyMessage::from_str(&format!("msg-p{partition_id}")).unwrap();
+        let mut messages = vec![message];
+        root_client
+            .send_messages(
+                &Identifier::named(STREAM_NAME).unwrap(),
+                &Identifier::named(TOPIC_NAME).unwrap(),
+                &Partitioning::partition_id(partition_id),
+                &mut messages,
+            )
+            .await
+            .unwrap();
+    }
+
+    // 1. Consumer1 joins — gets all 6 partitions
+    let client1 = harness.new_client().await.unwrap();
+    client1
+        .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+        .await
+        .unwrap();
+    join_cg(&client1).await;
+
+    sleep(Duration::from_millis(100)).await;
+    let cg = get_consumer_group(&root_client).await;
+    assert_eq!(cg.members[0].partitions_count, 6);
+
+    // 2. Consumer2 joins — cooperative rebalance moves some partitions
+    //    (never polled → immediate completion)
+    let client2 = harness.new_client().await.unwrap();
+    client2
+        .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+        .await
+        .unwrap();
+    join_cg(&client2).await;
+
+    sleep(Duration::from_millis(200)).await;
+    let cg = get_consumer_group(&root_client).await;
+    assert_eq!(cg.members_count, 2);
+    assert_unique_partition_assignments(&cg);
+    let total: u32 = cg.members.iter().map(|m| m.partitions_count).sum();
+    assert_eq!(total, 6);
+
+    // 3. Consumer3 joins — another round of cooperative rebalance
+    let client3 = harness.new_client().await.unwrap();
+    client3
+        .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+        .await
+        .unwrap();
+    join_cg(&client3).await;
+
+    sleep(Duration::from_millis(200)).await;
+    let cg = get_consumer_group(&root_client).await;
+    assert_eq!(cg.members_count, 3);
+    assert_unique_partition_assignments(&cg);
+    let total: u32 = cg.members.iter().map(|m| m.partitions_count).sum();
+    assert_eq!(total, 6);
+    for member in &cg.members {
+        assert!(
+            member.partitions_count >= 1,
+            "Every member must have at least 1 partition. Members: {:?}",
+            cg.members
+        );
+    }
+
+    // 4. Consumer4 joins — with 6 partitions and 4 members, cooperative rebalance
+    //    should give member4 at least 1 partition (fair_share=1, remainder=2)
+    let client4 = harness.new_client().await.unwrap();
+    client4
+        .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+        .await
+        .unwrap();
+    join_cg(&client4).await;
+
+    sleep(Duration::from_millis(200)).await;
+    let cg = get_consumer_group(&root_client).await;
+    assert_eq!(cg.members_count, 4);
+    assert_unique_partition_assignments(&cg);
+    let total: u32 = cg.members.iter().map(|m| m.partitions_count).sum();
+    assert_eq!(total, 6);
+    for member in &cg.members {
+        assert!(
+            member.partitions_count >= 1,
+            "Every member must have at least 1 partition with 4 members and 6 partitions. Members: {:?}",
+            cg.members
+        );
+    }
+
+    // 5. Consumer5 + Consumer6 join — 6 partitions, 6 consumers → exactly 1 each
+    let client5 = harness.new_client().await.unwrap();
+    let client6 = harness.new_client().await.unwrap();
+    for client in [&client5, &client6] {
+        client
+            .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+            .await
+            .unwrap();
+        join_cg(client).await;
+        sleep(Duration::from_millis(200)).await;
+    }
+
+    sleep(Duration::from_millis(200)).await;
+    let cg = get_consumer_group(&root_client).await;
+    assert_eq!(cg.members_count, 6);
+    assert_unique_partition_assignments(&cg);
+    let total: u32 = cg.members.iter().map(|m| m.partitions_count).sum();
+    assert_eq!(total, 6);
+    for member in &cg.members {
+        assert_eq!(
+            member.partitions_count, 1,
+            "With 6 members and 6 partitions, each must have exactly 1. Members: {:?}",
+            cg.members
+        );
+    }
+
+    // 6. All 6 consumers poll — must get unique partitions
+    let consumer = Consumer::group(Identifier::named(CONSUMER_GROUP_NAME).unwrap());
+    let mut polled_partitions = HashSet::new();
+    for client in [&client1, &client2, &client3, &client4, &client5, &client6] {
+        let polled = client
+            .poll_messages(
+                &Identifier::named(STREAM_NAME).unwrap(),
+                &Identifier::named(TOPIC_NAME).unwrap(),
+                None,
+                &consumer,
+                &PollingStrategy::offset(0),
+                10,
+                false,
+            )
+            .await
+            .unwrap();
+        if !polled.messages.is_empty() {
+            assert!(
+                polled_partitions.insert(polled.partition_id),
+                "Duplicate partition {} with 6 consumers on 6 partitions!",
+                polled.partition_id
+            );
+        }
+    }
+    assert_eq!(
+        polled_partitions.len(),
+        6,
+        "All 6 partitions must be covered by 6 consumers"
+    );
+
+    // Cleanup
+    root_client
+        .delete_stream(&Identifier::named(STREAM_NAME).unwrap())
+        .await
+        .unwrap();
+}
+
+#[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
+    heartbeat.enabled = true,
+    heartbeat.interval = "2s",
+    tcp.socket.override_defaults = true,
+    tcp.socket.nodelay = true
+))]
+async fn should_split_evenly_when_consumer_joins_after_partitions_added(harness: &TestHarness) {
+    let root_client = harness.root_client().await.unwrap();
+
+    setup_stream_topic_cg(&root_client).await;
+    send_one_message_per_partition(&root_client).await;
+
+    // 1. Two consumers join, split 3 partitions (2+1)
+    let client1 = harness.new_client().await.unwrap();
+    let client2 = harness.new_client().await.unwrap();
+    for client in [&client1, &client2] {
+        client
+            .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+            .await
+            .unwrap();
+        join_cg(client).await;
+    }
+
+    sleep(Duration::from_millis(200)).await;
+    let cg = get_consumer_group(&root_client).await;
+    assert_eq!(cg.members_count, 2);
+    let total: u32 = cg.members.iter().map(|m| m.partitions_count).sum();
+    assert_eq!(total, 3);
+
+    // 2. Add 3 partitions (3 -> 6), triggers full rebalance (3 each)
+    root_client
+        .create_partitions(
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
+            3,
+        )
+        .await
+        .unwrap();
+
+    sleep(Duration::from_millis(500)).await;
+
+    // 3. Send messages to new partitions
+    for partition_id in PARTITIONS_COUNT..PARTITIONS_COUNT + 3 {
+        let message =
+            IggyMessage::from_str(&format!("message-new-partition-{partition_id}")).unwrap();
+        let mut messages = vec![message];
+        root_client
+            .send_messages(
+                &Identifier::named(STREAM_NAME).unwrap(),
+                &Identifier::named(TOPIC_NAME).unwrap(),
+                &Partitioning::partition_id(partition_id),
+                &mut messages,
+            )
+            .await
+            .unwrap();
+    }
+
+    // 4. Consumer3 joins — now 3 consumers, 6 partitions → 2 each
+    let client3 = harness.new_client().await.unwrap();
+    client3
+        .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+        .await
+        .unwrap();
+    join_cg(&client3).await;
+
+    sleep(Duration::from_millis(500)).await;
+
+    let cg = get_consumer_group(&root_client).await;
+    assert_eq!(cg.members_count, 3);
+    assert_unique_partition_assignments(&cg);
+    let total: u32 = cg.members.iter().map(|m| m.partitions_count).sum();
+    assert_eq!(
+        total, 6,
+        "All 6 partitions must be assigned. Members: {:?}",
+        cg.members
+    );
+    for member in &cg.members {
+        assert!(
+            member.partitions_count >= 1,
+            "Every member must have at least 1 partition after cooperative rebalance. Members: {:?}",
+            cg.members
+        );
+    }
+
+    // 5. Each consumer polls — must get unique partitions, no duplicates
+    let consumer = Consumer::group(Identifier::named(CONSUMER_GROUP_NAME).unwrap());
+    let mut polled_partitions = HashSet::new();
+    for client in [&client1, &client2, &client3] {
+        let polled = client
+            .poll_messages(
+                &Identifier::named(STREAM_NAME).unwrap(),
+                &Identifier::named(TOPIC_NAME).unwrap(),
+                None,
+                &consumer,
+                &PollingStrategy::offset(0),
+                10,
+                false,
+            )
+            .await
+            .unwrap();
+        if !polled.messages.is_empty() {
+            assert!(
+                polled_partitions.insert(polled.partition_id),
+                "Duplicate partition {} polled by multiple consumers!",
+                polled.partition_id
+            );
+        }
+    }
+    assert_eq!(
+        polled_partitions.len(),
+        3,
+        "All 3 consumers should poll from unique partitions"
+    );
+
+    // Cleanup
+    root_client
+        .delete_stream(&Identifier::named(STREAM_NAME).unwrap())
+        .await
+        .unwrap();
+}
+
+#[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
+    heartbeat.enabled = true,
+    heartbeat.interval = "2s",
+    tcp.socket.override_defaults = true,
+    tcp.socket.nodelay = true
+))]
+async fn should_not_duplicate_messages_when_partitions_added_during_polling(harness: &TestHarness) {
+    let root_client = harness.root_client().await.unwrap();
+
+    setup_stream_topic_cg(&root_client).await;
+    send_one_message_per_partition(&root_client).await;
+
+    // 1. Two consumers join and start polling
+    let client1 = harness.new_client().await.unwrap();
+    let client2 = harness.new_client().await.unwrap();
+    for client in [&client1, &client2] {
+        client
+            .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+            .await
+            .unwrap();
+        join_cg(client).await;
+    }
+
+    let consumer = Consumer::group(Identifier::named(CONSUMER_GROUP_NAME).unwrap());
+
+    // 2. Both consumers poll without committing (in-flight work)
+    for client in [&client1, &client2] {
+        let _ = client
+            .poll_messages(
+                &Identifier::named(STREAM_NAME).unwrap(),
+                &Identifier::named(TOPIC_NAME).unwrap(),
+                None,
+                &consumer,
+                &PollingStrategy::next(),
+                1,
+                false,
+            )
+            .await
+            .unwrap();
+    }
+
+    // 3. Add partitions WHILE consumers are active with polled-but-uncommitted data
+    root_client
+        .create_partitions(
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
+            3,
+        )
+        .await
+        .unwrap();
+
+    sleep(Duration::from_millis(500)).await;
+
+    // 4. After rebalance, verify no partition is assigned to both consumers
+    let cg = get_consumer_group(&root_client).await;
+    assert_eq!(cg.members_count, 2);
+    assert_unique_partition_assignments(&cg);
+    let total: u32 = cg.members.iter().map(|m| m.partitions_count).sum();
+    assert_eq!(
+        total, 6,
+        "All 6 partitions must be assigned. Members: {:?}",
+        cg.members
+    );
+
+    // 5. Both consumers poll again — must not get same partition
+    let mut seen_by_client: Vec<HashSet<u32>> = Vec::new();
+    for client in [&client1, &client2] {
+        let mut client_partitions = HashSet::new();
+        for _ in 0..3 {
+            let polled = client
+                .poll_messages(
+                    &Identifier::named(STREAM_NAME).unwrap(),
+                    &Identifier::named(TOPIC_NAME).unwrap(),
+                    None,
+                    &consumer,
+                    &PollingStrategy::offset(0),
+                    1,
+                    false,
+                )
+                .await
+                .unwrap();
+            if !polled.messages.is_empty() {
+                client_partitions.insert(polled.partition_id);
+            }
+        }
+        seen_by_client.push(client_partitions);
+    }
+    let overlap: HashSet<_> = seen_by_client[0].intersection(&seen_by_client[1]).collect();
+    assert!(
+        overlap.is_empty(),
+        "Consumers polled overlapping partitions after rebalance: {:?}",
+        overlap
+    );
+
+    // Cleanup
+    root_client
+        .delete_stream(&Identifier::named(STREAM_NAME).unwrap())
+        .await
+        .unwrap();
+}
+
+#[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
+    heartbeat.enabled = true,
+    heartbeat.interval = "2s",
+    tcp.socket.override_defaults = true,
+    tcp.socket.nodelay = true
+))]
+async fn should_handle_delete_partitions_with_uncommitted_work(harness: &TestHarness) {
+    let root_client = harness.root_client().await.unwrap();
+
+    // Create with 6 partitions
+    root_client.create_stream(STREAM_NAME).await.unwrap();
+    root_client
+        .create_topic(
+            &Identifier::named(STREAM_NAME).unwrap(),
+            TOPIC_NAME,
+            6,
+            CompressionAlgorithm::default(),
+            None,
+            IggyExpiry::NeverExpire,
+            MaxTopicSize::ServerDefault,
+        )
+        .await
+        .unwrap();
+    root_client
+        .create_consumer_group(
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
+            CONSUMER_GROUP_NAME,
+        )
+        .await
+        .unwrap();
+
+    // Send messages to all 6 partitions
+    for partition_id in 0..6u32 {
+        let message = IggyMessage::from_str(&format!("msg-{partition_id}")).unwrap();
+        let mut messages = vec![message];
+        root_client
+            .send_messages(
+                &Identifier::named(STREAM_NAME).unwrap(),
+                &Identifier::named(TOPIC_NAME).unwrap(),
+                &Partitioning::partition_id(partition_id),
+                &mut messages,
+            )
+            .await
+            .unwrap();
+    }
+
+    // 1. Two consumers join, each gets 3 partitions
+    let client1 = harness.new_client().await.unwrap();
+    let client2 = harness.new_client().await.unwrap();
+    for client in [&client1, &client2] {
+        client
+            .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+            .await
+            .unwrap();
+        join_cg(client).await;
+    }
+
+    // 2. Both consumers poll without committing
+    let consumer = Consumer::group(Identifier::named(CONSUMER_GROUP_NAME).unwrap());
+    for client in [&client1, &client2] {
+        let _ = client
+            .poll_messages(
+                &Identifier::named(STREAM_NAME).unwrap(),
+                &Identifier::named(TOPIC_NAME).unwrap(),
+                None,
+                &consumer,
+                &PollingStrategy::next(),
+                1,
+                false,
+            )
+            .await
+            .unwrap();
+    }
+
+    // 3. Delete 3 partitions while consumers have uncommitted work
+    root_client
+        .delete_partitions(
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
+            3,
+        )
+        .await
+        .unwrap();
+
+    sleep(Duration::from_millis(500)).await;
+
+    // 4. After rebalance: 3 remaining partitions, no duplicates, even split
+    let cg = get_consumer_group(&root_client).await;
+    assert_eq!(cg.members_count, 2);
+    assert_unique_partition_assignments(&cg);
+    let total: u32 = cg.members.iter().map(|m| m.partitions_count).sum();
+    assert_eq!(
+        total, 3,
+        "3 remaining partitions must be assigned. Members: {:?}",
+        cg.members
+    );
+    for member in &cg.members {
+        assert!(
+            member.partitions_count > 0,
+            "Every member should have at least 1 partition. Members: {:?}",
+            cg.members
+        );
+    }
+
+    // 5. Consumers can still poll from remaining partitions without error
+    for client in [&client1, &client2] {
+        let polled = client
+            .poll_messages(
+                &Identifier::named(STREAM_NAME).unwrap(),
+                &Identifier::named(TOPIC_NAME).unwrap(),
+                None,
+                &consumer,
+                &PollingStrategy::offset(0),
+                1,
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(
+            !polled.messages.is_empty(),
+            "Consumer should still be able to poll from remaining partitions"
+        );
+    }
+
+    // Cleanup
+    root_client
+        .delete_stream(&Identifier::named(STREAM_NAME).unwrap())
+        .await
+        .unwrap();
+}
+
+#[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
+    heartbeat.enabled = true,
+    heartbeat.interval = "2s",
+    tcp.socket.override_defaults = true,
+    tcp.socket.nodelay = true
+))]
+async fn should_handle_rapid_partition_changes_with_active_consumers(harness: &TestHarness) {
+    let root_client = harness.root_client().await.unwrap();
+
+    setup_stream_topic_cg(&root_client).await;
+    send_one_message_per_partition(&root_client).await;
+
+    // 1. Two consumers join
+    let client1 = harness.new_client().await.unwrap();
+    let client2 = harness.new_client().await.unwrap();
+    for client in [&client1, &client2] {
+        client
+            .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+            .await
+            .unwrap();
+        join_cg(client).await;
+    }
+
+    sleep(Duration::from_millis(200)).await;
+
+    // 2. Add partitions, then add more, then consumer3 joins — rapid changes
+    root_client
+        .create_partitions(
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
+            3,
+        )
+        .await
+        .unwrap();
+
+    // Send messages to new partitions
+    for partition_id in 3..6u32 {
+        let message = IggyMessage::from_str(&format!("msg-{partition_id}")).unwrap();
+        let mut messages = vec![message];
+        root_client
+            .send_messages(
+                &Identifier::named(STREAM_NAME).unwrap(),
+                &Identifier::named(TOPIC_NAME).unwrap(),
+                &Partitioning::partition_id(partition_id),
+                &mut messages,
+            )
+            .await
+            .unwrap();
+    }
+
+    root_client
+        .create_partitions(
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
+            3,
+        )
+        .await
+        .unwrap();
+
+    // Send messages to newest partitions
+    for partition_id in 6..9u32 {
+        let message = IggyMessage::from_str(&format!("msg-{partition_id}")).unwrap();
+        let mut messages = vec![message];
+        root_client
+            .send_messages(
+                &Identifier::named(STREAM_NAME).unwrap(),
+                &Identifier::named(TOPIC_NAME).unwrap(),
+                &Partitioning::partition_id(partition_id),
+                &mut messages,
+            )
+            .await
+            .unwrap();
+    }
+
+    let client3 = harness.new_client().await.unwrap();
+    client3
+        .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+        .await
+        .unwrap();
+    join_cg(&client3).await;
+
+    sleep(Duration::from_millis(500)).await;
+
+    // 3. 9 partitions, 3 consumers → 3 each
+    let cg = get_consumer_group(&root_client).await;
+    assert_eq!(cg.members_count, 3);
+    assert_unique_partition_assignments(&cg);
+    let total: u32 = cg.members.iter().map(|m| m.partitions_count).sum();
+    assert_eq!(
+        total, 9,
+        "All 9 partitions must be assigned. Members: {:?}",
+        cg.members
+    );
+    for member in &cg.members {
+        assert!(
+            member.partitions_count >= 1,
+            "Every member must have at least 1 partition after cooperative rebalance. Members: {:?}",
+            cg.members
+        );
+    }
+
+    // 4. All consumers poll — unique partitions only
+    let consumer = Consumer::group(Identifier::named(CONSUMER_GROUP_NAME).unwrap());
+    let mut polled_partitions = HashSet::new();
+    for client in [&client1, &client2, &client3] {
+        let polled = client
+            .poll_messages(
+                &Identifier::named(STREAM_NAME).unwrap(),
+                &Identifier::named(TOPIC_NAME).unwrap(),
+                None,
+                &consumer,
+                &PollingStrategy::offset(0),
+                10,
+                false,
+            )
+            .await
+            .unwrap();
+        if !polled.messages.is_empty() {
+            assert!(
+                polled_partitions.insert(polled.partition_id),
+                "Duplicate partition {} after rapid changes!",
+                polled.partition_id
+            );
+        }
+    }
+    assert_eq!(
+        polled_partitions.len(),
+        3,
+        "All 3 consumers should poll from unique partitions"
+    );
+
+    // Cleanup
+    root_client
+        .delete_stream(&Identifier::named(STREAM_NAME).unwrap())
+        .await
+        .unwrap();
+}
+
+#[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
+    heartbeat.enabled = true,
+    heartbeat.interval = "2s",
+    tcp.socket.override_defaults = true,
+    tcp.socket.nodelay = true
+))]
+async fn should_rebalance_after_adding_partitions(harness: &TestHarness) {
+    let root_client = harness.root_client().await.unwrap();
+
+    setup_stream_topic_cg(&root_client).await;
+    send_one_message_per_partition(&root_client).await;
+
+    // 1. Three consumers join, each gets 1 of 3 partitions
+    let client1 = harness.new_client().await.unwrap();
+    let client2 = harness.new_client().await.unwrap();
+    let client3 = harness.new_client().await.unwrap();
+    for client in [&client1, &client2, &client3] {
+        client
+            .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+            .await
+            .unwrap();
+        join_cg(client).await;
+    }
+
+    sleep(Duration::from_millis(200)).await;
+
+    let cg = get_consumer_group(&root_client).await;
+    assert_eq!(cg.members_count, 3);
+    assert_unique_partition_assignments(&cg);
+    for member in &cg.members {
+        assert_eq!(
+            member.partitions_count, 1,
+            "Each member should have 1 partition before adding. Members: {:?}",
+            cg.members
+        );
+    }
+
+    // 2. Add 3 more partitions (3 -> 6 total)
+    root_client
+        .create_partitions(
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
+            3,
+        )
+        .await
+        .unwrap();
+
+    sleep(Duration::from_millis(500)).await;
+
+    // 3. After rebalance, each consumer should have 2 partitions (6/3)
+    let cg = get_consumer_group(&root_client).await;
+    assert_eq!(cg.members_count, 3);
+    assert_unique_partition_assignments(&cg);
+    let total: u32 = cg.members.iter().map(|m| m.partitions_count).sum();
+    assert_eq!(
+        total, 6,
+        "All 6 partitions must be assigned. Members: {:?}",
+        cg.members
+    );
+    for member in &cg.members {
+        assert_eq!(
+            member.partitions_count, 2,
+            "Each member should have 2 partitions after adding 3 more. Members: {:?}",
+            cg.members
+        );
+    }
+
+    // Cleanup
+    root_client
+        .delete_stream(&Identifier::named(STREAM_NAME).unwrap())
+        .await
+        .unwrap();
+}
+
+#[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
+    heartbeat.enabled = true,
+    heartbeat.interval = "2s",
+    tcp.socket.override_defaults = true,
+    tcp.socket.nodelay = true
+))]
+async fn should_rebalance_after_deleting_partitions(harness: &TestHarness) {
+    let root_client = harness.root_client().await.unwrap();
+
+    // Create with 6 partitions
+    root_client.create_stream(STREAM_NAME).await.unwrap();
+    root_client
+        .create_topic(
+            &Identifier::named(STREAM_NAME).unwrap(),
+            TOPIC_NAME,
+            6,
+            CompressionAlgorithm::default(),
+            None,
+            IggyExpiry::NeverExpire,
+            MaxTopicSize::ServerDefault,
+        )
+        .await
+        .unwrap();
+    root_client
+        .create_consumer_group(
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
+            CONSUMER_GROUP_NAME,
+        )
+        .await
+        .unwrap();
+
+    // 1. Three consumers join, each gets 2 of 6 partitions
+    let client1 = harness.new_client().await.unwrap();
+    let client2 = harness.new_client().await.unwrap();
+    let client3 = harness.new_client().await.unwrap();
+    for client in [&client1, &client2, &client3] {
+        client
+            .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+            .await
+            .unwrap();
+        join_cg(client).await;
+    }
+
+    sleep(Duration::from_millis(200)).await;
+
+    let cg = get_consumer_group(&root_client).await;
+    assert_eq!(cg.members_count, 3);
+    let total: u32 = cg.members.iter().map(|m| m.partitions_count).sum();
+    assert_eq!(total, 6);
+
+    // 2. Delete 3 partitions (6 -> 3)
+    root_client
+        .delete_partitions(
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
+            3,
+        )
+        .await
+        .unwrap();
+
+    sleep(Duration::from_millis(500)).await;
+
+    // 3. After rebalance, each consumer should have 1 partition (3/3)
+    let cg = get_consumer_group(&root_client).await;
+    assert_eq!(cg.members_count, 3);
+    assert_unique_partition_assignments(&cg);
+    let total: u32 = cg.members.iter().map(|m| m.partitions_count).sum();
+    assert_eq!(
+        total, 3,
+        "All 3 remaining partitions must be assigned. Members: {:?}",
+        cg.members
+    );
+    for member in &cg.members {
+        assert_eq!(
+            member.partitions_count, 1,
+            "Each member should have 1 partition after deleting 3. Members: {:?}",
+            cg.members
+        );
+    }
+
+    // Cleanup
+    root_client
+        .delete_stream(&Identifier::named(STREAM_NAME).unwrap())
+        .await
+        .unwrap();
+}
+
+#[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
+    heartbeat.enabled = true,
+    heartbeat.interval = "2s",
+    tcp.socket.override_defaults = true,
+    tcp.socket.nodelay = true
+))]
+async fn should_handle_partition_add_during_pending_revocation(harness: &TestHarness) {
+    let root_client = harness.root_client().await.unwrap();
+
+    setup_stream_topic_cg(&root_client).await;
+    send_one_message_per_partition(&root_client).await;
+
+    // 1. Consumer1 joins, polls all 3 partitions without committing
+    let client1 = harness.new_client().await.unwrap();
+    client1
+        .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+        .await
+        .unwrap();
+    join_cg(&client1).await;
+
+    let consumer = Consumer::group(Identifier::named(CONSUMER_GROUP_NAME).unwrap());
+    for _ in 0..PARTITIONS_COUNT {
+        client1
+            .poll_messages(
+                &Identifier::named(STREAM_NAME).unwrap(),
+                &Identifier::named(TOPIC_NAME).unwrap(),
+                None,
+                &consumer,
+                &PollingStrategy::next(),
+                1,
+                false,
+            )
+            .await
+            .unwrap();
+    }
+
+    // 2. Consumer2 joins — triggers pending revocations
+    let client2 = harness.new_client().await.unwrap();
+    client2
+        .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+        .await
+        .unwrap();
+    join_cg(&client2).await;
+
+    sleep(Duration::from_millis(100)).await;
+
+    // 3. Add partitions WHILE revocations are pending
+    root_client
+        .create_partitions(
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
+            3,
+        )
+        .await
+        .unwrap();
+
+    sleep(Duration::from_millis(500)).await;
+
+    // 4. After full rebalance triggered by partition change,
+    //    all 6 partitions should be distributed, no duplicates
+    let cg = get_consumer_group(&root_client).await;
+    assert_eq!(cg.members_count, 2);
+    assert_unique_partition_assignments(&cg);
+    let total: u32 = cg.members.iter().map(|m| m.partitions_count).sum();
+    assert_eq!(
+        total, 6,
+        "All 6 partitions must be assigned after add during pending revocation. Members: {:?}",
+        cg.members
+    );
+    for member in &cg.members {
+        assert_eq!(
+            member.partitions_count, 3,
+            "Each of 2 members should have 3 of 6 partitions. Members: {:?}",
+            cg.members
+        );
+    }
 
     // Cleanup
     root_client
@@ -750,11 +2198,9 @@ async fn get_consumer_group(client: &IggyClient) -> ConsumerGroupDetails {
 
 fn assert_unique_partition_assignments(cg: &ConsumerGroupDetails) {
     let mut all_partitions = HashSet::new();
-    let mut total_assigned = 0u32;
 
     for member in &cg.members {
         for &partition in &member.partitions {
-            total_assigned += 1;
             assert!(
                 all_partitions.insert(partition),
                 "Partition {partition} is assigned to multiple members! \
@@ -764,13 +2210,6 @@ fn assert_unique_partition_assignments(cg: &ConsumerGroupDetails) {
             );
         }
     }
-
-    assert_eq!(
-        total_assigned, PARTITIONS_COUNT,
-        "Expected {PARTITIONS_COUNT} total partition assignments, got {total_assigned}. \
-         Members: {:?}",
-        cg.members
-    );
 }
 
 async fn setup_stream_topic_cg(client: &IggyClient) {
@@ -1606,6 +3045,220 @@ async fn should_distribute_partitions_evenly_with_concurrent_joins(harness: &Tes
         polled_partitions.len(),
         3,
         "All 3 partitions must be covered"
+    );
+
+    // Cleanup
+    root_client
+        .delete_stream(&Identifier::named(STREAM_NAME).unwrap())
+        .await
+        .unwrap();
+}
+
+#[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
+    heartbeat.enabled = true,
+    heartbeat.interval = "2s",
+    tcp.socket.override_defaults = true,
+    tcp.socket.nodelay = true
+))]
+async fn should_not_assign_partition_to_wrong_member_after_slab_reuse(harness: &TestHarness) {
+    let root_client = harness.root_client().await.unwrap();
+
+    setup_stream_topic_cg(&root_client).await;
+    send_one_message_per_partition(&root_client).await;
+
+    // 1. Consumer1 joins, gets all 3 partitions, polls without committing
+    let client1 = harness.new_client().await.unwrap();
+    client1
+        .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+        .await
+        .unwrap();
+    join_cg(&client1).await;
+
+    let consumer = Consumer::group(Identifier::named(CONSUMER_GROUP_NAME).unwrap());
+    for _ in 0..PARTITIONS_COUNT {
+        client1
+            .poll_messages(
+                &Identifier::named(STREAM_NAME).unwrap(),
+                &Identifier::named(TOPIC_NAME).unwrap(),
+                None,
+                &consumer,
+                &PollingStrategy::next(),
+                1,
+                false,
+            )
+            .await
+            .unwrap();
+    }
+
+    // 2. Consumer2 joins — triggers pending revocation targeting consumer2's slab
+    let client2 = harness.new_client().await.unwrap();
+    client2
+        .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+        .await
+        .unwrap();
+    join_cg(&client2).await;
+
+    sleep(Duration::from_millis(100)).await;
+
+    let cg = get_consumer_group(&root_client).await;
+    assert_eq!(cg.members_count, 2);
+
+    // 3. Consumer2 (revocation target) disconnects — its slab is freed
+    drop(client2);
+    sleep(Duration::from_secs(3)).await;
+
+    // 4. Consumer3 joins — may reuse consumer2's old slab
+    let client3 = harness.new_client().await.unwrap();
+    client3
+        .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+        .await
+        .unwrap();
+    join_cg(&client3).await;
+
+    // 5. Consumer1 commits all offsets — revocation completion should detect
+    //    slab reuse via target_member_id validation and trigger full rebalance
+    for partition_id in 0..PARTITIONS_COUNT {
+        client1
+            .store_consumer_offset(
+                &consumer,
+                &Identifier::named(STREAM_NAME).unwrap(),
+                &Identifier::named(TOPIC_NAME).unwrap(),
+                Some(partition_id),
+                0,
+            )
+            .await
+            .unwrap();
+    }
+
+    sleep(Duration::from_millis(500)).await;
+
+    // 6. Verify no partition duplication and all partitions assigned
+    let cg = get_consumer_group(&root_client).await;
+    assert_unique_partition_assignments(&cg);
+    let total: u32 = cg.members.iter().map(|m| m.partitions_count).sum();
+    assert_eq!(
+        total, PARTITIONS_COUNT,
+        "All partitions must be assigned after slab reuse scenario. Members: {:?}",
+        cg.members
+    );
+
+    // Cleanup
+    root_client
+        .delete_stream(&Identifier::named(STREAM_NAME).unwrap())
+        .await
+        .unwrap();
+}
+
+#[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
+    heartbeat.enabled = true,
+    heartbeat.interval = "2s",
+    tcp.socket.override_defaults = true,
+    tcp.socket.nodelay = true
+))]
+async fn should_not_complete_other_members_revocations_on_leave(harness: &TestHarness) {
+    let root_client = harness.root_client().await.unwrap();
+
+    setup_stream_topic_cg(&root_client).await;
+    send_one_message_per_partition(&root_client).await;
+
+    // 1. Consumer1 joins, gets all 3 partitions, polls without committing
+    let client1 = harness.new_client().await.unwrap();
+    client1
+        .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+        .await
+        .unwrap();
+    join_cg(&client1).await;
+
+    let consumer = Consumer::group(Identifier::named(CONSUMER_GROUP_NAME).unwrap());
+    for _ in 0..PARTITIONS_COUNT {
+        client1
+            .poll_messages(
+                &Identifier::named(STREAM_NAME).unwrap(),
+                &Identifier::named(TOPIC_NAME).unwrap(),
+                None,
+                &consumer,
+                &PollingStrategy::next(),
+                1,
+                false,
+            )
+            .await
+            .unwrap();
+    }
+
+    // 2. Consumer2 joins — triggers pending revocation for 1 partition
+    let client2 = harness.new_client().await.unwrap();
+    client2
+        .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+        .await
+        .unwrap();
+    join_cg(&client2).await;
+
+    // 3. Consumer3 joins — triggers another pending revocation
+    let client3 = harness.new_client().await.unwrap();
+    client3
+        .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+        .await
+        .unwrap();
+    join_cg(&client3).await;
+
+    sleep(Duration::from_millis(100)).await;
+
+    // Consumer1 has in-flight work on all partitions (polled, not committed).
+    // Consumer2 and consumer3 have 0 partitions (waiting for revocations).
+    let cg = get_consumer_group(&root_client).await;
+    assert_eq!(cg.members_count, 3);
+
+    // 4. Consumer3 disconnects — triggers full rebalance (rebalance_members).
+    //    Leave clears only consumer3's polled offsets, not consumer1's.
+    drop(client3);
+    sleep(Duration::from_secs(3)).await;
+
+    // 5. After full rebalance, consumer1 and consumer2 split all partitions.
+    //    The key invariant: no partition is assigned to two members.
+    let cg = get_consumer_group(&root_client).await;
+    assert_eq!(cg.members_count, 2);
+    assert_unique_partition_assignments(&cg);
+    let total: u32 = cg.members.iter().map(|m| m.partitions_count).sum();
+    assert_eq!(
+        total, PARTITIONS_COUNT,
+        "All partitions must be assigned after leave. Members: {:?}",
+        cg.members
+    );
+    for member in &cg.members {
+        assert!(
+            member.partitions_count > 0,
+            "Both remaining members should have partitions after leave rebalance. Members: {:?}",
+            cg.members
+        );
+    }
+
+    // 6. Both consumers can poll without duplicates
+    let mut all_partitions = HashSet::new();
+    for client in [&client1, &client2] {
+        let polled = client
+            .poll_messages(
+                &Identifier::named(STREAM_NAME).unwrap(),
+                &Identifier::named(TOPIC_NAME).unwrap(),
+                None,
+                &consumer,
+                &PollingStrategy::offset(0),
+                1,
+                false,
+            )
+            .await
+            .unwrap();
+        if !polled.messages.is_empty() {
+            assert!(
+                all_partitions.insert(polled.partition_id),
+                "Duplicate partition {} after leave rebalance",
+                polled.partition_id
+            );
+        }
+    }
+    assert_eq!(
+        all_partitions.len(),
+        2,
+        "Both consumers should poll from unique partitions after leave"
     );
 
     // Cleanup

@@ -359,6 +359,7 @@ async fn handle_request(
             member_slab_id,
             member_id,
             partition_id,
+            timed_out,
         } => {
             assert_eq!(
                 shard.id, 0,
@@ -372,6 +373,7 @@ async fn handle_request(
                 member_slab_id,
                 member_id,
                 partition_id,
+                timed_out,
             );
 
             Ok(ShardResponse::CompletePartitionRevocationResponse)

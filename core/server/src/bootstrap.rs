@@ -657,7 +657,6 @@ pub fn build_inner_metadata(
         users_can_send_all_streams: Default::default(),
         users_can_poll_stream: Default::default(),
         users_can_send_stream: Default::default(),
-        pending_revocations_count: Default::default(),
     }
 }
 

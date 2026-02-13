@@ -96,6 +96,7 @@ async fn check_revocation_timeouts(shard: Rc<IggyShard>) -> Result<(), IggyError
                 member_slab_id,
                 member_id,
                 partition_id,
+                timed_out: true,
             });
         let _ = shard.send_to_control_plane(request).await;
     }

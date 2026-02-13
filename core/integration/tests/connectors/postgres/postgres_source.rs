@@ -497,7 +497,7 @@ async fn state_persists_across_connector_restart(
         .start_dependents()
         .await
         .expect("Failed to restart connectors");
-    sleep(Duration::from_millis(500)).await;
+    sleep(Duration::from_secs(2)).await;
 
     let mut received_after: Vec<DatabaseRecord> = Vec::new();
     for _ in 0..POLL_ATTEMPTS {

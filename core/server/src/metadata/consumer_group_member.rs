@@ -24,6 +24,7 @@ use std::sync::atomic::AtomicUsize;
 pub struct PendingRevocation {
     pub partition_id: PartitionId,
     pub target_slab_id: usize,
+    pub target_member_id: usize,
     pub created_at_micros: u64,
 }
 

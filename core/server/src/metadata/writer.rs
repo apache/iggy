@@ -302,6 +302,7 @@ impl MetadataWriter {
         self.publish();
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn complete_partition_revocation(
         &mut self,
         stream_id: StreamId,
@@ -310,6 +311,7 @@ impl MetadataWriter {
         member_slab_id: usize,
         member_id: usize,
         partition_id: PartitionId,
+        timed_out: bool,
     ) {
         self.append(MetadataOp::CompletePartitionRevocation {
             stream_id,
@@ -318,6 +320,7 @@ impl MetadataWriter {
             member_slab_id,
             member_id,
             partition_id,
+            timed_out,
         });
         self.publish();
     }

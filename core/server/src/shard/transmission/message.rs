@@ -229,6 +229,7 @@ pub enum ShardRequestPayload {
         member_slab_id: usize,
         member_id: usize,
         partition_id: usize,
+        timed_out: bool,
     },
 
     // Control-plane: PAT operations

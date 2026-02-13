@@ -298,7 +298,7 @@ impl IggyShard {
                     let path = format!("{}/{}", dir_path, id);
                     ConsumerOffset::new(ConsumerKind::Consumer, *id as u32, offset, path)
                 });
-                entry.offset.store(offset, Ordering::Relaxed);
+                entry.offset.store(offset, Ordering::Release);
             }
             PollingConsumer::ConsumerGroup(cg_id, _) => {
                 let Some(offsets) = self.metadata.get_partition_consumer_group_offsets(
@@ -319,7 +319,7 @@ impl IggyShard {
                     let path = format!("{}/{}", dir_path, cg_id.0);
                     ConsumerOffset::new(ConsumerKind::ConsumerGroup, cg_id.0 as u32, offset, path)
                 });
-                entry.offset.store(offset, Ordering::Relaxed);
+                entry.offset.store(offset, Ordering::Release);
             }
         }
     }
@@ -449,7 +449,7 @@ impl IggyShard {
             let partition = topic.partitions.get(partition_id)?;
             let last_polled = {
                 let guard = partition.last_polled_offsets.pin();
-                guard.get(group_id).map(|v| v.load(Ordering::Relaxed))
+                guard.get(group_id).map(|v| v.load(Ordering::Acquire))
             };
             let can_complete = match last_polled {
                 None => true,
@@ -457,7 +457,7 @@ impl IggyShard {
                     let guard = partition.consumer_group_offsets.pin();
                     guard
                         .get(group_id)
-                        .map(|co| co.offset.load(Ordering::Relaxed))
+                        .map(|co| co.offset.load(Ordering::Acquire))
                         .is_some_and(|c| c >= polled)
                 }
             };
@@ -473,6 +473,7 @@ impl IggyShard {
                     member_slab_id: member_id.0,
                     member_id: logical_member_id,
                     partition_id,
+                    timed_out: false,
                 });
             let _ = self.send_to_control_plane(request).await;
         }

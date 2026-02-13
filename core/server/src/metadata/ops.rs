@@ -129,5 +129,6 @@ pub enum MetadataOp {
         member_slab_id: usize,
         member_id: usize,
         partition_id: PartitionId,
+        timed_out: bool,
     },
 }

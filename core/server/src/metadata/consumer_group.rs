@@ -26,6 +26,7 @@ use slab::Slab;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use tracing::warn;
 
 #[derive(Clone, Debug)]
 pub struct ConsumerGroupMeta {
@@ -66,8 +67,9 @@ impl ConsumerGroupMeta {
         }
     }
 
-    /// Incremental partition assignment for a new member join.
-    pub fn assign_partitions_to_new_members(&mut self) {
+    /// Cooperative rebalance: assign unassigned partitions to idle members and
+    /// mark excess partitions on over-assigned members as pending revocation.
+    pub fn rebalance_cooperative(&mut self) {
         let member_count = self.members.len();
         if member_count == 0 || self.partitions.is_empty() {
             return;
@@ -200,10 +202,16 @@ impl ConsumerGroupMeta {
                     break;
                 }
                 let idle_id = idle_slab_ids.remove(0);
+                let target_member_id = self
+                    .members
+                    .get(idle_id)
+                    .map(|m| m.id)
+                    .unwrap_or(usize::MAX);
                 if let Some(member) = self.members.get_mut(mid) {
                     member.pending_revocations.push(PendingRevocation {
                         partition_id,
                         target_slab_id: idle_id,
+                        target_member_id,
                         created_at_micros: IggyTimestamp::now().as_micros(),
                     });
                 }
@@ -226,7 +234,7 @@ impl ConsumerGroupMeta {
                 };
                 let last_polled = {
                     let guard = partition.last_polled_offsets.pin();
-                    guard.get(&cg_id).map(|v| v.load(Ordering::Relaxed))
+                    guard.get(&cg_id).map(|v| v.load(Ordering::Acquire))
                 };
                 let can_complete = match last_polled {
                     None => true,
@@ -234,7 +242,7 @@ impl ConsumerGroupMeta {
                         let offsets_guard = partition.consumer_group_offsets.pin();
                         offsets_guard
                             .get(&cg_id)
-                            .map(|offset| offset.offset.load(Ordering::Relaxed))
+                            .map(|offset| offset.offset.load(Ordering::Acquire))
                             .is_some_and(|committed| committed >= polled)
                     }
                 };
@@ -257,8 +265,12 @@ impl ConsumerGroupMeta {
         member_id: usize,
         partition_id: PartitionId,
     ) -> bool {
-        let target_slab_id = if let Some(member) = self.members.get_mut(member_slab_id) {
+        let target_info = if let Some(member) = self.members.get_mut(member_slab_id) {
             if member.id != member_id {
+                warn!(
+                    "Revocation rejected: member ID mismatch (slab={member_slab_id}, expected={member_id}, actual={})",
+                    member.id
+                );
                 return false;
             }
             let pos = member
@@ -267,21 +279,33 @@ impl ConsumerGroupMeta {
                 .position(|revocation| revocation.partition_id == partition_id);
             if let Some(pos) = pos {
                 let removed = member.pending_revocations.remove(pos);
-                let target = removed.target_slab_id;
                 member.partitions.retain(|&p| p != partition_id);
-                Some(target)
+                Some((removed.target_slab_id, removed.target_member_id))
             } else {
+                warn!(
+                    "Revocation rejected: no pending revocation for partition={partition_id} on slab={member_slab_id}"
+                );
                 None
             }
         } else {
+            warn!("Revocation rejected: source slab={member_slab_id} not found");
             None
         };
 
-        if let Some(target) = target_slab_id {
-            if let Some(target_member) = self.members.get_mut(target) {
+        if let Some((target_slab, expected_target_id)) = target_info {
+            if let Some(target_member) = self.members.get_mut(target_slab) {
+                if target_member.id != expected_target_id {
+                    warn!(
+                        "Revocation target slab={target_slab} reused (expected={expected_target_id}, actual={}), full rebalance",
+                        target_member.id
+                    );
+                    self.rebalance_members();
+                    return true;
+                }
                 target_member.partitions.push(partition_id);
                 return true;
             }
+            warn!("Revocation target slab={target_slab} gone, full rebalance");
             self.rebalance_members();
             return true;
         }

@@ -253,83 +253,6 @@ impl Metadata {
         Some(current % partitions_count)
     }
 
-    pub fn get_next_member_partition_id(
-        &self,
-        stream_id: StreamId,
-        topic_id: TopicId,
-        group_id: ConsumerGroupId,
-        member_id: usize,
-        calculate: bool,
-    ) -> Option<PartitionId> {
-        let metadata = self.load();
-        let member = metadata
-            .streams
-            .get(stream_id)?
-            .topics
-            .get(topic_id)?
-            .consumer_groups
-            .get(group_id)?
-            .members
-            .get(member_id)?;
-
-        // Fast path: no pending revocations
-        if member.pending_revocations.is_empty() {
-            let partitions = &member.partitions;
-            let count = partitions.len();
-            if count == 0 {
-                return None;
-            }
-            let counter = &member.partition_index;
-            return if calculate {
-                let current = counter
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
-                        Some((c + 1) % count)
-                    })
-                    .unwrap();
-                Some(partitions[current % count])
-            } else {
-                let current = counter.load(Ordering::Relaxed);
-                Some(partitions[current % count])
-            };
-        }
-
-        // Slow path: skip revoked partitions via linear scan
-        let effective_count = member.partitions.len() - member.pending_revocations.len();
-        if effective_count == 0 {
-            return None;
-        }
-
-        let counter = &member.partition_index;
-        let idx = if calculate {
-            counter
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
-                    Some((c + 1) % effective_count)
-                })
-                .unwrap()
-                % effective_count
-        } else {
-            counter.load(Ordering::Relaxed) % effective_count
-        };
-
-        // Find the idx-th non-revoked partition
-        let mut seen = 0;
-        for &pid in &member.partitions {
-            let is_revoked = member
-                .pending_revocations
-                .iter()
-                .any(|revocation| revocation.partition_id == pid);
-            if is_revoked {
-                continue;
-            }
-            if seen == idx {
-                return Some(pid);
-            }
-            seen += 1;
-        }
-
-        None
-    }
-
     /// Resolve consumer group partition under a single metadata read guard.
     pub fn resolve_consumer_group_partition(
         &self,
@@ -523,37 +446,13 @@ impl Metadata {
             let guard = partition.last_polled_offsets.pin();
             match guard.get(&key) {
                 Some(existing) => {
-                    existing.store(offset, Ordering::Relaxed);
+                    existing.store(offset, Ordering::Release);
                 }
                 None => {
                     guard.insert(key, Arc::new(std::sync::atomic::AtomicU64::new(offset)));
                 }
             }
         }
-    }
-
-    /// Get the last offset polled by a consumer group for a partition.
-    pub fn get_last_polled_offset(
-        &self,
-        stream_id: StreamId,
-        topic_id: TopicId,
-        group_id: ConsumerGroupId,
-        partition_id: PartitionId,
-    ) -> Option<u64> {
-        use crate::streaming::polling_consumer::ConsumerGroupId as CgIdNewtype;
-
-        let metadata = self.load();
-        metadata
-            .streams
-            .get(stream_id)
-            .and_then(|s| s.topics.get(topic_id))
-            .and_then(|t| t.partitions.get(partition_id))
-            .and_then(|p| {
-                let guard = p.last_polled_offsets.pin();
-                guard
-                    .get(&CgIdNewtype(group_id))
-                    .map(|v| v.load(Ordering::Relaxed))
-            })
     }
 
     pub fn users_count(&self) -> usize {

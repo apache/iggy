@@ -265,7 +265,7 @@ impl IggyShard {
                             ),
                         ),
                     );
-                    item.offset.store(offset, Ordering::Relaxed);
+                    item.offset.store(offset, Ordering::Release);
                     (item.offset.load(Ordering::Relaxed), item.path.clone())
                 }
                 PollingConsumer::ConsumerGroup(consumer_group_id, _) => {
@@ -287,7 +287,7 @@ impl IggyShard {
                             ),
                         ),
                     );
-                    item.offset.store(offset, Ordering::Relaxed);
+                    item.offset.store(offset, Ordering::Release);
                     (item.offset.load(Ordering::Relaxed), item.path.clone())
                 }
             }
