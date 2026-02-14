@@ -31,7 +31,7 @@
 ///
 /// Timeouts count down from an initial duration (`after`) and fire when
 /// reaching zero. They support exponential backoff with jitter for retries.
-use rand::Rng;
+use rand::RngExt;
 use rand_xoshiro::Xoshiro256Plus;
 use rand_xoshiro::rand_core::SeedableRng;
 

@@ -15,6 +15,5 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub mod fs_locks;
 pub mod fs_utils;
 pub mod storage;

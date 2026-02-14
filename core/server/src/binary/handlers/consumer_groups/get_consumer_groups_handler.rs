@@ -20,9 +20,10 @@ use crate::binary::command::{
     BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
 };
 use crate::binary::handlers::utils::receive_and_validate;
+use crate::binary::mapper;
 use crate::shard::IggyShard;
 use crate::streaming::session::Session;
-use bytes::{BufMut, BytesMut};
+use bytes::Bytes;
 use iggy_common::get_consumer_groups::GetConsumerGroups;
 use iggy_common::{IggyError, SenderKind};
 use std::rc::Rc;
@@ -42,29 +43,19 @@ impl ServerCommandHandler for GetConsumerGroups {
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
         shard.ensure_authenticated(session)?;
-        let (stream_id, topic_id) = shard.resolve_topic_id(&self.stream_id, &self.topic_id)?;
-        shard
-            .metadata
-            .perm_get_consumer_groups(session.get_user_id(), stream_id, topic_id)?;
 
-        let consumer_groups = shard.metadata.with_metadata(|m| {
-            m.streams
-                .get(stream_id)
-                .and_then(|s| s.topics.get(topic_id))
-                .map(|topic| {
-                    let mut bytes = BytesMut::new();
-                    for (_, cg_meta) in topic.consumer_groups.iter() {
-                        bytes.put_u32_le(cg_meta.id as u32);
-                        bytes.put_u32_le(cg_meta.partitions.len() as u32);
-                        bytes.put_u32_le(cg_meta.members.len() as u32);
-                        bytes.put_u8(cg_meta.name.len() as u8);
-                        bytes.put_slice(cg_meta.name.as_bytes());
-                    }
-                    bytes.freeze()
-                })
-                .unwrap_or_default()
-        });
-        sender.send_ok_response(&consumer_groups).await?;
+        let Some(consumer_groups) = shard.metadata.query_consumer_groups(
+            session.get_user_id(),
+            &self.stream_id,
+            &self.topic_id,
+        )?
+        else {
+            sender.send_ok_response(&Bytes::new()).await?;
+            return Ok(HandlerResult::Finished);
+        };
+
+        let response = mapper::map_consumer_groups(&consumer_groups);
+        sender.send_ok_response(&response).await?;
         Ok(HandlerResult::Finished)
     }
 }

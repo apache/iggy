@@ -18,12 +18,10 @@
 
 use crate::shard::IggyShard;
 use crate::shard::transmission::frame::ShardResponse;
-use crate::shard::transmission::message::{
-    ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult,
-};
+use crate::shard::transmission::message::{ShardRequest, ShardRequestPayload};
 use crate::streaming::clients::client_manager::Client;
 use crate::streaming::session::Session;
-use iggy_common::{Identifier, TransportProtocol};
+use iggy_common::TransportProtocol;
 use std::net::SocketAddr;
 use tracing::{error, info, warn};
 
@@ -59,38 +57,22 @@ impl IggyShard {
         }
 
         for (stream_id, topic_id, consumer_group_id) in consumer_groups.into_iter() {
-            let request = ShardRequest {
-                stream_id: Identifier::numeric(stream_id).unwrap(),
-                topic_id: Identifier::numeric(topic_id).unwrap(),
-                partition_id: 0,
-                payload: ShardRequestPayload::LeaveConsumerGroupMetadataOnly {
+            let request =
+                ShardRequest::control_plane(ShardRequestPayload::LeaveConsumerGroupMetadataOnly {
                     stream_id: stream_id as usize,
                     topic_id: topic_id as usize,
                     group_id: consumer_group_id as usize,
                     client_id,
-                },
-            };
+                });
 
-            let message = ShardMessage::Request(request);
-            match self.send_request_to_shard_or_recoil(None, message).await {
-                Ok(ShardSendRequestResult::Recoil(_)) => {
-                    // We're on shard 0, do the leave directly
-                    self.writer().leave_consumer_group(
-                        stream_id as usize,
-                        topic_id as usize,
-                        consumer_group_id as usize,
-                        client_id,
+            match self.send_to_control_plane(request).await {
+                Ok(ShardResponse::LeaveConsumerGroupMetadataOnlyResponse) => {}
+                Ok(ShardResponse::ErrorResponse(err)) => {
+                    warn!(
+                        "Failed to leave consumer group {consumer_group_id} for client {client_id} during cleanup: {err}"
                     );
                 }
-                Ok(ShardSendRequestResult::Response(response)) => match response {
-                    ShardResponse::LeaveConsumerGroupMetadataOnlyResponse => {}
-                    ShardResponse::ErrorResponse(err) => {
-                        warn!(
-                            "Failed to leave consumer group {consumer_group_id} for client {client_id} during cleanup: {err}"
-                        );
-                    }
-                    _ => {}
-                },
+                Ok(_) => {}
                 Err(err) => {
                     warn!(
                         "Failed to send leave consumer group request for client {client_id} during cleanup: {err}"
