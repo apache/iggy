@@ -274,7 +274,8 @@ impl StreamsInner {
 
 impl StateHandler for CreateStream {
     type State = StreamsInner;
-    fn apply(&self, state: &mut StreamsInner) {
+    type Output = ();
+    fn apply(&self, state: &mut StreamsInner, now: IggyTimestamp) -> Self::Output {
         let name_arc: Arc<str> = Arc::from(self.name.as_str());
         if state.index.contains_key(&name_arc) {
             return;
@@ -283,7 +284,7 @@ impl StateHandler for CreateStream {
         let stream = Stream {
             id: 0,
             name: name_arc.clone(),
-            created_at: iggy_common::IggyTimestamp::now(),
+            created_at: now,
             stats: Arc::new(StreamStats::default()),
             topics: Slab::new(),
             topic_index: AHashMap::default(),
@@ -299,7 +300,8 @@ impl StateHandler for CreateStream {
 
 impl StateHandler for UpdateStream {
     type State = StreamsInner;
-    fn apply(&self, state: &mut StreamsInner) {
+    type Output = ();
+    fn apply(&self, state: &mut StreamsInner, _now: IggyTimestamp) -> Self::Output {
         let Some(stream_id) = state.resolve_stream_id(&self.stream_id) else {
             return;
         };
@@ -322,7 +324,8 @@ impl StateHandler for UpdateStream {
 
 impl StateHandler for DeleteStream {
     type State = StreamsInner;
-    fn apply(&self, state: &mut StreamsInner) {
+    type Output = ();
+    fn apply(&self, state: &mut StreamsInner, _now: IggyTimestamp) -> Self::Output {
         let Some(stream_id) = state.resolve_stream_id(&self.stream_id) else {
             return;
         };
@@ -338,7 +341,8 @@ impl StateHandler for DeleteStream {
 
 impl StateHandler for PurgeStream {
     type State = StreamsInner;
-    fn apply(&self, _state: &mut StreamsInner) {
+    type Output = ();
+    fn apply(&self, _state: &mut StreamsInner, _now: IggyTimestamp) -> Self::Output {
         // TODO
         todo!();
     }
@@ -346,7 +350,8 @@ impl StateHandler for PurgeStream {
 
 impl StateHandler for CreateTopic {
     type State = StreamsInner;
-    fn apply(&self, state: &mut StreamsInner) {
+    type Output = ();
+    fn apply(&self, state: &mut StreamsInner, now: IggyTimestamp) -> Self::Output {
         let Some(stream_id) = state.resolve_stream_id(&self.stream_id) else {
             return;
         };
@@ -362,7 +367,7 @@ impl StateHandler for CreateTopic {
         let topic = Topic {
             id: 0,
             name: name_arc.clone(),
-            created_at: iggy_common::IggyTimestamp::now(),
+            created_at: now,
             replication_factor: self.replication_factor.unwrap_or(1),
             message_expiry: self.message_expiry,
             compression_algorithm: self.compression_algorithm,
@@ -379,7 +384,7 @@ impl StateHandler for CreateTopic {
             for partition_id in 0..self.partitions_count as usize {
                 let partition = Partition {
                     id: partition_id,
-                    created_at: iggy_common::IggyTimestamp::now(),
+                    created_at: now,
                 };
                 topic.partitions.push(partition);
             }
@@ -391,7 +396,8 @@ impl StateHandler for CreateTopic {
 
 impl StateHandler for UpdateTopic {
     type State = StreamsInner;
-    fn apply(&self, state: &mut StreamsInner) {
+    type Output = ();
+    fn apply(&self, state: &mut StreamsInner, _now: IggyTimestamp) -> Self::Output {
         let Some(stream_id) = state.resolve_stream_id(&self.stream_id) else {
             return;
         };
@@ -427,7 +433,8 @@ impl StateHandler for UpdateTopic {
 
 impl StateHandler for DeleteTopic {
     type State = StreamsInner;
-    fn apply(&self, state: &mut StreamsInner) {
+    type Output = ();
+    fn apply(&self, state: &mut StreamsInner, _now: IggyTimestamp) -> Self::Output {
         let Some(stream_id) = state.resolve_stream_id(&self.stream_id) else {
             return;
         };
@@ -448,7 +455,8 @@ impl StateHandler for DeleteTopic {
 
 impl StateHandler for PurgeTopic {
     type State = StreamsInner;
-    fn apply(&self, _state: &mut StreamsInner) {
+    type Output = ();
+    fn apply(&self, _state: &mut StreamsInner, _now: IggyTimestamp) -> Self::Output {
         // TODO
         todo!();
     }
@@ -456,7 +464,8 @@ impl StateHandler for PurgeTopic {
 
 impl StateHandler for CreatePartitions {
     type State = StreamsInner;
-    fn apply(&self, state: &mut StreamsInner) {
+    type Output = ();
+    fn apply(&self, state: &mut StreamsInner, now: IggyTimestamp) -> Self::Output {
         let Some(stream_id) = state.resolve_stream_id(&self.stream_id) else {
             return;
         };
@@ -476,7 +485,7 @@ impl StateHandler for CreatePartitions {
             let partition_id = current_partition_count + i;
             let partition = Partition {
                 id: partition_id,
-                created_at: iggy_common::IggyTimestamp::now(),
+                created_at: now,
             };
             topic.partitions.push(partition);
         }
@@ -485,7 +494,8 @@ impl StateHandler for CreatePartitions {
 
 impl StateHandler for DeletePartitions {
     type State = StreamsInner;
-    fn apply(&self, state: &mut StreamsInner) {
+    type Output = ();
+    fn apply(&self, state: &mut StreamsInner, _now: IggyTimestamp) -> Self::Output {
         let Some(stream_id) = state.resolve_stream_id(&self.stream_id) else {
             return;
         };

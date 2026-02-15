@@ -124,7 +124,8 @@ impl UsersInner {
 
 impl StateHandler for CreateUser {
     type State = UsersInner;
-    fn apply(&self, state: &mut UsersInner) {
+    type Output = ();
+    fn apply(&self, state: &mut UsersInner, now: IggyTimestamp) -> Self::Output {
         let username_arc: Arc<str> = Arc::from(self.username.as_str());
         if state.index.contains_key(&username_arc) {
             return;
@@ -135,7 +136,7 @@ impl StateHandler for CreateUser {
             username: username_arc.clone(),
             password_hash: Arc::from(self.password.as_str()),
             status: self.status,
-            created_at: iggy_common::IggyTimestamp::now(),
+            created_at: now,
             permissions: self.permissions.as_ref().map(|p| Arc::new(p.clone())),
         };
 
@@ -153,7 +154,8 @@ impl StateHandler for CreateUser {
 
 impl StateHandler for UpdateUser {
     type State = UsersInner;
-    fn apply(&self, state: &mut UsersInner) {
+    type Output = ();
+    fn apply(&self, state: &mut UsersInner, _now: IggyTimestamp) -> Self::Output {
         let Some(user_id) = state.resolve_user_id(&self.user_id) else {
             return;
         };
@@ -183,7 +185,8 @@ impl StateHandler for UpdateUser {
 
 impl StateHandler for DeleteUser {
     type State = UsersInner;
-    fn apply(&self, state: &mut UsersInner) {
+    type Output = ();
+    fn apply(&self, state: &mut UsersInner, _now: IggyTimestamp) -> Self::Output {
         let Some(user_id) = state.resolve_user_id(&self.user_id) else {
             return;
         };
@@ -199,7 +202,8 @@ impl StateHandler for DeleteUser {
 
 impl StateHandler for ChangePassword {
     type State = UsersInner;
-    fn apply(&self, state: &mut UsersInner) {
+    type Output = ();
+    fn apply(&self, state: &mut UsersInner, _now: IggyTimestamp) -> Self::Output {
         let Some(user_id) = state.resolve_user_id(&self.user_id) else {
             return;
         };
@@ -212,7 +216,8 @@ impl StateHandler for ChangePassword {
 
 impl StateHandler for UpdatePermissions {
     type State = UsersInner;
-    fn apply(&self, state: &mut UsersInner) {
+    type Output = ();
+    fn apply(&self, state: &mut UsersInner, _now: IggyTimestamp) -> Self::Output {
         let Some(user_id) = state.resolve_user_id(&self.user_id) else {
             return;
         };
@@ -225,7 +230,8 @@ impl StateHandler for UpdatePermissions {
 
 impl StateHandler for CreatePersonalAccessToken {
     type State = UsersInner;
-    fn apply(&self, state: &mut UsersInner) {
+    type Output = ();
+    fn apply(&self, state: &mut UsersInner, now: IggyTimestamp) -> Self::Output {
         // TODO: Stub until protocol gets adjusted.
         let user_id = 0;
         let user_tokens = state.personal_access_tokens.entry(user_id).or_default();
@@ -234,26 +240,22 @@ impl StateHandler for CreatePersonalAccessToken {
             return;
         }
 
-        let expiry_at = PersonalAccessToken::calculate_expiry_at(IggyTimestamp::now(), self.expiry);
+        let expiry_at = PersonalAccessToken::calculate_expiry_at(now, self.expiry);
         if let Some(expiry_at) = expiry_at
-            && expiry_at.as_micros() <= IggyTimestamp::now().as_micros()
+            && expiry_at.as_micros() <= now.as_micros()
         {
             return;
         }
 
-        let (pat, _) = PersonalAccessToken::new(
-            user_id,
-            self.name.as_ref(),
-            IggyTimestamp::now(),
-            self.expiry,
-        );
+        let (pat, _) = PersonalAccessToken::new(user_id, self.name.as_ref(), now, self.expiry);
         user_tokens.insert(name_arc, pat);
     }
 }
 
 impl StateHandler for DeletePersonalAccessToken {
     type State = UsersInner;
-    fn apply(&self, state: &mut UsersInner) {
+    type Output = ();
+    fn apply(&self, state: &mut UsersInner, _now: IggyTimestamp) -> Self::Output {
         // TODO: Stub until protocol gets adjusted.
         let user_id = 0;
 

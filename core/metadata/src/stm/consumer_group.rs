@@ -22,7 +22,7 @@ use crate::{collect_handlers, define_state, impl_fill_restore};
 use ahash::AHashMap;
 use iggy_common::create_consumer_group::CreateConsumerGroup;
 use iggy_common::delete_consumer_group::DeleteConsumerGroup;
-use iggy_common::{IdKind, Identifier};
+use iggy_common::{IdKind, Identifier, IggyTimestamp};
 use serde::{Deserialize, Serialize};
 use slab::Slab;
 use std::sync::Arc;
@@ -168,7 +168,8 @@ impl ConsumerGroupsInner {
 
 impl StateHandler for CreateConsumerGroup {
     type State = ConsumerGroupsInner;
-    fn apply(&self, state: &mut ConsumerGroupsInner) {
+    type Output = ();
+    fn apply(&self, state: &mut ConsumerGroupsInner, _now: IggyTimestamp) -> Self::Output {
         let name: Arc<str> = Arc::from(self.name.as_str());
         if state.name_index.contains_key(&name) {
             return;
@@ -203,7 +204,8 @@ impl StateHandler for CreateConsumerGroup {
 
 impl StateHandler for DeleteConsumerGroup {
     type State = ConsumerGroupsInner;
-    fn apply(&self, state: &mut ConsumerGroupsInner) {
+    type Output = ();
+    fn apply(&self, state: &mut ConsumerGroupsInner, _now: IggyTimestamp) -> Self::Output {
         let Some(id) = state.resolve_consumer_group_id_by_identifiers(
             &self.stream_id,
             &self.topic_id,

@@ -39,3 +39,7 @@ rmp-serde = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 slab = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+bytemuck = { workspace = true }
+bytes = { workspace = true }
