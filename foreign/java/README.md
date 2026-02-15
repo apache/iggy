@@ -195,7 +195,14 @@ All exceptions thrown by the SDK inherit from `IggyException`. This allows you t
 
 ## Examples
 
-See the [`examples`](examples/) module for basic consumer and producer implementations using the SDK.
+See the **[Java Examples](../../examples/java/)** directory for runnable applications demonstrating the SDK:
+
+- **BlockingProducer** — synchronous message production with batch sending
+- **BlockingConsumer** — synchronous consumption with polling loops
+- **AsyncProducer** — high-throughput async production with pipelining
+- **AsyncConsumer** — async consumption with backpressure and error recovery
+
+Each example includes comprehensive documentation on when to use blocking vs. async clients, CompletableFuture patterns, thread pool management, and performance characteristics.
 
 For Apache Flink integration, see the [Flink Connector Library](external-processors/iggy-connector-flink/iggy-connector-library/README.md).
 
