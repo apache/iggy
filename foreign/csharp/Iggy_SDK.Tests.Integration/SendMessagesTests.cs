@@ -16,15 +16,12 @@
 // // under the License.
 
 using System.Text;
-using Apache.Iggy.Contracts;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
 using Apache.Iggy.Headers;
-using Apache.Iggy.Kinds;
+using Apache.Iggy.IggyClient;
 using Apache.Iggy.Messages;
-using Apache.Iggy.Tests.Integrations.Attributes;
 using Apache.Iggy.Tests.Integrations.Fixtures;
-using Apache.Iggy.Tests.Integrations.Helpers;
 using Shouldly;
 using Partitioning = Apache.Iggy.Kinds.Partitioning;
 
@@ -32,83 +29,117 @@ namespace Apache.Iggy.Tests.Integrations;
 
 public class SendMessagesTests
 {
-    private static Message[] _messagesWithoutHeaders = [];
-    private static Message[] _messagesWithHeaders = [];
+    private static readonly string DummyJson = """
+                                               {
+                                                 "userId": 1,
+                                                 "id": 1,
+                                                 "title": "delete",
+                                                 "completed": false
+                                               }
+                                               """;
 
-    [ClassDataSource<SendMessageFixture>(Shared = SharedType.PerClass)]
-    public required SendMessageFixture Fixture { get; set; }
+    [ClassDataSource<IggyServerFixture>(Shared = SharedType.PerAssembly)]
+    public required IggyServerFixture Fixture { get; init; }
 
-    [Before(Class)]
-    public static Task Before()
+    private async Task<(IIggyClient client, string streamName, string topicName)> CreateStreamAndTopic(
+        Protocol protocol)
     {
-        var dummyJson = """
-                        {
-                          "userId": 1,
-                          "id": 1,
-                          "title": "delete",
-                          "completed": false
-                        }
-                        """;
-        _messagesWithoutHeaders =
-        [
-            new Message(Guid.NewGuid(), Encoding.UTF8.GetBytes(dummyJson)),
-            new Message(Guid.NewGuid(), Encoding.UTF8.GetBytes(dummyJson))
-        ];
-        _messagesWithHeaders =
-        [
-            new Message(Guid.NewGuid(), Encoding.UTF8.GetBytes(dummyJson),
-                new Dictionary<HeaderKey, HeaderValue>
-                {
-                    { HeaderKey.FromString("header1"), HeaderValue.FromString("value1") },
-                    { HeaderKey.FromString("header2"), HeaderValue.FromInt32(444) }
-                }),
-            new Message(Guid.NewGuid(), Encoding.UTF8.GetBytes(dummyJson),
-                new Dictionary<HeaderKey, HeaderValue>
-                {
-                    { HeaderKey.FromString("header1"), HeaderValue.FromString("value1") },
-                    { HeaderKey.FromString("header2"), HeaderValue.FromInt32(444) }
-                })
-        ];
+        var client = await Fixture.CreateAuthenticatedClient(protocol);
 
-        return Task.CompletedTask;
+        var streamName = $"send-msg-{Guid.NewGuid():N}";
+        var topicName = "test-topic";
+
+        await client.CreateStreamAsync(streamName);
+        await client.CreateTopicAsync(Identifier.String(streamName), topicName, 1);
+
+        return (client, streamName, topicName);
     }
 
     [Test]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task SendMessages_NoHeaders_Should_SendMessages_Successfully(Protocol protocol)
     {
+        var (client, streamName, topicName) = await CreateStreamAndTopic(protocol);
+
+        var messages = new Message[]
+        {
+            new(Guid.NewGuid(), Encoding.UTF8.GetBytes(DummyJson)),
+            new(Guid.NewGuid(), Encoding.UTF8.GetBytes(DummyJson))
+        };
+
         await Should.NotThrowAsync(() =>
-            Fixture.Clients[protocol].SendMessagesAsync(Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-                Identifier.String(Fixture.TopicRequest.Name), Partitioning.None(), _messagesWithoutHeaders));
+            client.SendMessagesAsync(Identifier.String(streamName),
+                Identifier.String(topicName), Partitioning.None(), messages));
     }
 
     [Test]
-    [DependsOn(nameof(SendMessages_NoHeaders_Should_SendMessages_Successfully))]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task SendMessages_NoHeaders_Should_Throw_InvalidResponse(Protocol protocol)
     {
+        var (client, streamName, _) = await CreateStreamAndTopic(protocol);
+
+        var messages = new Message[]
+        {
+            new(Guid.NewGuid(), Encoding.UTF8.GetBytes(DummyJson)),
+            new(Guid.NewGuid(), Encoding.UTF8.GetBytes(DummyJson))
+        };
+
         await Should.ThrowAsync<IggyInvalidStatusCodeException>(() =>
-            Fixture.Clients[protocol].SendMessagesAsync(Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-                Identifier.Numeric(69), Partitioning.None(), _messagesWithoutHeaders));
+            client.SendMessagesAsync(Identifier.String(streamName),
+                Identifier.Numeric(69), Partitioning.None(), messages));
     }
 
     [Test]
-    [DependsOn(nameof(SendMessages_NoHeaders_Should_Throw_InvalidResponse))]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task SendMessages_WithHeaders_Should_SendMessages_Successfully(Protocol protocol)
     {
+        var (client, streamName, topicName) = await CreateStreamAndTopic(protocol);
+
+        var messages = new Message[]
+        {
+            new(Guid.NewGuid(), Encoding.UTF8.GetBytes(DummyJson),
+                new Dictionary<HeaderKey, HeaderValue>
+                {
+                    { HeaderKey.FromString("header1"), HeaderValue.FromString("value1") },
+                    { HeaderKey.FromString("header2"), HeaderValue.FromInt32(444) }
+                }),
+            new(Guid.NewGuid(), Encoding.UTF8.GetBytes(DummyJson),
+                new Dictionary<HeaderKey, HeaderValue>
+                {
+                    { HeaderKey.FromString("header1"), HeaderValue.FromString("value1") },
+                    { HeaderKey.FromString("header2"), HeaderValue.FromInt32(444) }
+                })
+        };
+
         await Should.NotThrowAsync(() =>
-            Fixture.Clients[protocol].SendMessagesAsync(Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-                Identifier.String(Fixture.TopicRequest.Name), Partitioning.None(), _messagesWithHeaders));
+            client.SendMessagesAsync(Identifier.String(streamName),
+                Identifier.String(topicName), Partitioning.None(), messages));
     }
 
     [Test]
-    [DependsOn(nameof(SendMessages_WithHeaders_Should_SendMessages_Successfully))]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task SendMessages_WithHeaders_Should_Throw_InvalidResponse(Protocol protocol)
     {
+        var (client, streamName, _) = await CreateStreamAndTopic(protocol);
+
+        var messages = new Message[]
+        {
+            new(Guid.NewGuid(), Encoding.UTF8.GetBytes(DummyJson),
+                new Dictionary<HeaderKey, HeaderValue>
+                {
+                    { HeaderKey.FromString("header1"), HeaderValue.FromString("value1") },
+                    { HeaderKey.FromString("header2"), HeaderValue.FromInt32(444) }
+                }),
+            new(Guid.NewGuid(), Encoding.UTF8.GetBytes(DummyJson),
+                new Dictionary<HeaderKey, HeaderValue>
+                {
+                    { HeaderKey.FromString("header1"), HeaderValue.FromString("value1") },
+                    { HeaderKey.FromString("header2"), HeaderValue.FromInt32(444) }
+                })
+        };
+
         await Should.ThrowAsync<IggyInvalidStatusCodeException>(() =>
-            Fixture.Clients[protocol].SendMessagesAsync(Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-                Identifier.Numeric(69), Partitioning.None(), _messagesWithHeaders));
+            client.SendMessagesAsync(Identifier.String(streamName),
+                Identifier.Numeric(69), Partitioning.None(), messages));
     }
 }
