@@ -215,10 +215,8 @@ impl IggyShard {
             }
         }
 
-        if let Some(topic_stats) = self.metadata.get_topic_stats(stream, topic_id) {
-            topic_stats.zero_out_all();
-        }
-
+        // Zero partition stats — propagation handles topic and stream counters.
+        // Topic stats must NOT be zeroed separately to avoid double-decrementing the stream.
         for &partition_id in &partition_ids {
             let ns = IggyNamespace::new(stream, topic_id, partition_id);
             if let Some(partition_stats) = self.metadata.get_partition_stats(&ns) {
