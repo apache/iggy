@@ -19,21 +19,14 @@
 use crate::binary::command::{
     BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
 };
-use crate::binary::handlers::users::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
 use crate::shard::IggyShard;
 use crate::shard::transmission::frame::ShardResponse;
-use crate::shard::transmission::message::{
-    ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult,
-};
-use crate::state::command::EntryCommand;
-use crate::state::models::CreateUserWithId;
+use crate::shard::transmission::message::{ShardRequest, ShardRequestPayload};
 use crate::streaming::session::Session;
-use crate::streaming::utils::crypto;
-use err_trail::ErrContext;
 use iggy_common::create_user::CreateUser;
-use iggy_common::{Identifier, IggyError, SenderKind};
+use iggy_common::{IggyError, SenderKind};
 use std::rc::Rc;
 use tracing::debug;
 use tracing::instrument;
@@ -55,85 +48,17 @@ impl ServerCommandHandler for CreateUser {
         shard.ensure_authenticated(session)?;
         shard.metadata.perm_create_user(session.get_user_id())?;
 
-        let request = ShardRequest {
-            stream_id: Identifier::default(),
-            topic_id: Identifier::default(),
-            partition_id: 0,
-            payload: ShardRequestPayload::CreateUser {
-                user_id: session.get_user_id(),
-                username: self.username.clone(),
-                password: self.password.clone(),
-                status: self.status,
-                permissions: self.permissions.clone(),
-            },
-        };
+        let request = ShardRequest::control_plane(ShardRequestPayload::CreateUserRequest {
+            user_id: session.get_user_id(),
+            command: self,
+        });
 
-        let message = ShardMessage::Request(request);
-        match shard.send_request_to_shard_or_recoil(None, message).await? {
-            ShardSendRequestResult::Recoil(message) => {
-                if let ShardMessage::Request(ShardRequest { payload, .. }) = message
-                    && let ShardRequestPayload::CreateUser {
-                        username,
-                        password,
-                        status,
-                        permissions,
-                        ..
-                    } = payload
-                {
-                    let _user_guard = shard.fs_locks.user_lock.lock().await;
-                    let user = shard
-                        .create_user(&username, &password, status, permissions.clone())
-                        .error(|e: &IggyError| {
-                            format!(
-                                "{COMPONENT} (error: {e}) - failed to create user with name: {}, session: {}",
-                                username, session
-                            )
-                        })?;
-
-                    let user_id = user.id;
-                    let response = mapper::map_user(&user);
-
-                    shard
-                        .state
-                        .apply(
-                            session.get_user_id(),
-                            &EntryCommand::CreateUser(CreateUserWithId {
-                                user_id,
-                                command: CreateUser {
-                                    username: self.username.to_owned(),
-                                    password: crypto::hash_password(&self.password),
-                                    status: self.status,
-                                    permissions: self.permissions.clone(),
-                                },
-                            }),
-                        )
-                        .await
-                        .error(|e: &IggyError| {
-                            format!(
-                                "{COMPONENT} (error: {e}) - failed to apply create user with name: {}, session: {session}",
-                                self.username
-                            )
-                        })?;
-
-                    sender.send_ok_response(&response).await?;
-                } else {
-                    unreachable!(
-                        "Expected a CreateUser request inside of CreateUser handler, impossible state"
-                    );
-                }
+        match shard.send_to_control_plane(request).await? {
+            ShardResponse::CreateUserResponse(user) => {
+                sender.send_ok_response(&mapper::map_user(&user)).await?;
             }
-            ShardSendRequestResult::Response(response) => match response {
-                ShardResponse::CreateUserResponse(user) => {
-                    let response = mapper::map_user(&user);
-                    sender.send_ok_response(&response).await?;
-                }
-                ShardResponse::ErrorResponse(err) => {
-                    return Err(err);
-                }
-                _ => unreachable!(
-                    "Expected a CreateUserResponse inside of CreateUser handler, impossible state"
-                ),
-            },
+            ShardResponse::ErrorResponse(err) => return Err(err),
+            _ => unreachable!("Expected CreateUserResponse"),
         }
 
         Ok(HandlerResult::Finished)

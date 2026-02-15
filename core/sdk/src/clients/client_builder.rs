@@ -182,6 +182,12 @@ impl TcpClientBuilder {
         self
     }
 
+    /// Sets the cooldown before reconnecting after a previously successful connection.
+    pub fn with_reestablish_after(mut self, reestablish_after: IggyDuration) -> Self {
+        self.config = self.config.with_reestablish_after(reestablish_after);
+        self
+    }
+
     /// Sets whether to use TLS when connecting to the server.
     pub fn with_tls_enabled(mut self, tls_enabled: bool) -> Self {
         self.config = self.config.with_tls_enabled(tls_enabled);
@@ -260,6 +266,12 @@ impl QuicClientBuilder {
         self
     }
 
+    /// Sets the cooldown before reconnecting after a previously successful connection.
+    pub fn with_reestablish_after(mut self, reestablish_after: IggyDuration) -> Self {
+        self.config = self.config.with_reestablish_after(reestablish_after);
+        self
+    }
+
     /// Sets the server name for the QUIC client.
     pub fn with_server_name(mut self, server_name: String) -> Self {
         self.config = self.config.with_server_name(server_name);
@@ -322,6 +334,28 @@ impl WebSocketClientBuilder {
     /// Sets the auto sign in during connection.
     pub fn with_auto_sign_in(mut self, auto_sign_in: AutoLogin) -> Self {
         self.config = self.config.with_auto_sign_in(auto_sign_in);
+        self
+    }
+
+    /// Sets the number of retries when connecting to the server.
+    pub fn with_reconnection_max_retries(mut self, reconnection_retries: Option<u32>) -> Self {
+        self.config = self
+            .config
+            .with_reconnection_max_retries(reconnection_retries);
+        self
+    }
+
+    /// Sets the interval between retries when connecting to the server.
+    pub fn with_reconnection_interval(mut self, reconnection_interval: IggyDuration) -> Self {
+        self.config = self
+            .config
+            .with_reconnection_interval(reconnection_interval);
+        self
+    }
+
+    /// Sets the cooldown before reconnecting after a previously successful connection.
+    pub fn with_reestablish_after(mut self, reestablish_after: IggyDuration) -> Self {
+        self.config = self.config.with_reestablish_after(reestablish_after);
         self
     }
 

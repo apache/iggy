@@ -61,15 +61,11 @@ async fn get_consumer_offset(
     query.topic_id = Identifier::from_str_value(&topic_id)?;
     query.validate()?;
 
-    let (stream_id_numeric, topic_id_numeric) = state
-        .shard
-        .shard()
-        .resolve_topic_id(&query.stream_id, &query.topic_id)?;
-    state.shard.shard().metadata.perm_get_consumer_offset(
-        identity.user_id,
-        stream_id_numeric,
-        topic_id_numeric,
-    )?;
+    let shard = state.shard.shard();
+    let topic = shard.resolve_topic(&query.stream_id, &query.topic_id)?;
+    shard
+        .metadata
+        .perm_get_consumer_offset(identity.user_id, topic.stream_id, topic.topic_id)?;
 
     let consumer = Consumer::new(query.0.consumer.id);
     let Ok(offset) = state
@@ -104,15 +100,11 @@ async fn store_consumer_offset(
     command.topic_id = Identifier::from_str_value(&topic_id)?;
     command.validate()?;
 
-    let (stream_id_numeric, topic_id_numeric) = state
-        .shard
-        .shard()
-        .resolve_topic_id(&command.stream_id, &command.topic_id)?;
-    state.shard.shard().metadata.perm_store_consumer_offset(
-        identity.user_id,
-        stream_id_numeric,
-        topic_id_numeric,
-    )?;
+    let shard = state.shard.shard();
+    let topic = shard.resolve_topic(&command.stream_id, &command.topic_id)?;
+    shard
+        .metadata
+        .perm_store_consumer_offset(identity.user_id, topic.stream_id, topic.topic_id)?;
 
     let consumer = Consumer::new(command.0.consumer.id);
     state.shard
@@ -139,14 +131,12 @@ async fn delete_consumer_offset(
     let stream_id_ident = Identifier::from_str_value(&stream_id)?;
     let topic_id_ident = Identifier::from_str_value(&topic_id)?;
 
-    let (stream_id_numeric, topic_id_numeric) = state
-        .shard
-        .shard()
-        .resolve_topic_id(&stream_id_ident, &topic_id_ident)?;
-    state.shard.shard().metadata.perm_delete_consumer_offset(
+    let shard = state.shard.shard();
+    let topic = shard.resolve_topic(&stream_id_ident, &topic_id_ident)?;
+    shard.metadata.perm_delete_consumer_offset(
         identity.user_id,
-        stream_id_numeric,
-        topic_id_numeric,
+        topic.stream_id,
+        topic.topic_id,
     )?;
 
     let consumer = Consumer::new(consumer_id.try_into()?);

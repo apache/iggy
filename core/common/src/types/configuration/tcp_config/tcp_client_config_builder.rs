@@ -65,6 +65,12 @@ impl TcpClientConfigBuilder {
         self
     }
 
+    /// Sets the cooldown before reconnecting after a previously successful connection.
+    pub fn with_reestablish_after(mut self, reestablish_after: IggyDuration) -> Self {
+        self.config.reconnection.reestablish_after = reestablish_after;
+        self
+    }
+
     /// Sets whether to use TLS when connecting to the server.
     pub fn with_tls_enabled(mut self, tls_enabled: bool) -> Self {
         self.config.tls_enabled = tls_enabled;

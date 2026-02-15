@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::stm::snapshot::{FillSnapshot, RestoreSnapshot, SnapshotError};
 use iggy_common::{header::PrepareHeader, message::Message};
 
 use crate::stm::{State, StateMachine};
@@ -91,7 +92,58 @@ where
     }
 }
 
+/// Recursive case for variadic tuple pattern: (Head, Tail)
+/// Fills snapshot from head and tail, and restores both on restore.
+impl<SnapshotData, Head, Tail> FillSnapshot<SnapshotData> for variadic!(Head, ...Tail)
+where
+    Head: FillSnapshot<SnapshotData>,
+    Tail: FillSnapshot<SnapshotData>,
+{
+    fn fill_snapshot(&self, snapshot: &mut SnapshotData) -> Result<(), SnapshotError> {
+        self.0.fill_snapshot(snapshot)?;
+        self.1.fill_snapshot(snapshot)?;
+        Ok(())
+    }
+}
+
+impl<SnapshotData, Head, Tail> RestoreSnapshot<SnapshotData> for variadic!(Head, ...Tail)
+where
+    Head: RestoreSnapshot<SnapshotData>,
+    Tail: RestoreSnapshot<SnapshotData>,
+{
+    fn restore_snapshot(snapshot: &SnapshotData) -> Result<Self, SnapshotError> {
+        let head = Head::restore_snapshot(snapshot)?;
+        let tail = Tail::restore_snapshot(snapshot)?;
+        Ok((head, tail))
+    }
+}
+
+impl<SnapshotData, T> FillSnapshot<SnapshotData> for MuxStateMachine<T>
+where
+    T: StateMachine + FillSnapshot<SnapshotData>,
+{
+    fn fill_snapshot(&self, snapshot: &mut SnapshotData) -> Result<(), SnapshotError> {
+        self.inner.fill_snapshot(snapshot)
+    }
+}
+
+impl<SnapshotData, T> RestoreSnapshot<SnapshotData> for MuxStateMachine<T>
+where
+    T: StateMachine + RestoreSnapshot<SnapshotData>,
+{
+    fn restore_snapshot(snapshot: &SnapshotData) -> Result<Self, SnapshotError> {
+        let inner = T::restore_snapshot(snapshot)?;
+        Ok(MuxStateMachine::new(inner))
+    }
+}
+
+#[allow(unused_imports)]
 mod tests {
+    use super::*;
+    use crate::stm::consumer_group::{ConsumerGroups, ConsumerGroupsInner};
+    use crate::stm::snapshot::{FillSnapshot, MetadataSnapshot, RestoreSnapshot, Snapshotable};
+    use crate::stm::stream::{Streams, StreamsInner};
+    use crate::stm::user::{Users, UsersInner};
 
     #[test]
     fn construct_mux_state_machine_from_states_with_same_output() {
@@ -109,5 +161,79 @@ mod tests {
         let input = Message::new(std::mem::size_of::<PrepareHeader>());
 
         mux.update(input);
+    }
+
+    #[test]
+    fn mux_state_machine_snapshot_roundtrip() {
+        let users: Users = UsersInner::new().into();
+        let streams: Streams = StreamsInner::new().into();
+        let consumer_groups: ConsumerGroups = ConsumerGroupsInner::new().into();
+
+        let mux = MuxStateMachine::new(variadic!(users, streams, consumer_groups));
+
+        // Fill the typed snapshot
+        let mut snapshot = MetadataSnapshot::new(12345);
+        mux.fill_snapshot(&mut snapshot).unwrap();
+
+        // Verify all fields are filled
+        assert!(snapshot.users.is_some());
+        assert!(snapshot.streams.is_some());
+        assert!(snapshot.consumer_groups.is_some());
+
+        // Restore and verify
+        type MuxTuple = (Users, (Streams, (ConsumerGroups, ())));
+        let restored: MuxStateMachine<MuxTuple> =
+            MuxStateMachine::restore_snapshot(&snapshot).unwrap();
+
+        // Verify the restored mux produces the same snapshot
+        let mut verify_snapshot = MetadataSnapshot::new(0);
+        restored.fill_snapshot(&mut verify_snapshot).unwrap();
+        assert!(verify_snapshot.users.is_some());
+        assert!(verify_snapshot.streams.is_some());
+        assert!(verify_snapshot.consumer_groups.is_some());
+    }
+
+    #[test]
+    fn mux_state_machine_full_envelope_roundtrip() {
+        use crate::impls::metadata::IggySnapshot;
+        use crate::stm::snapshot::Snapshot;
+
+        let users: Users = UsersInner::new().into();
+        let streams: Streams = StreamsInner::new().into();
+        let consumer_groups: ConsumerGroups = ConsumerGroupsInner::new().into();
+
+        type MuxTuple = (Users, (Streams, (ConsumerGroups, ())));
+        let mux: MuxStateMachine<MuxTuple> =
+            MuxStateMachine::new(variadic!(users, streams, consumer_groups));
+
+        let sequence_number = 12345u64;
+        let snapshot = IggySnapshot::create(&mux, sequence_number).unwrap();
+
+        assert_eq!(snapshot.sequence_number(), sequence_number);
+        assert!(snapshot.created_at() > 0);
+
+        // Encode to bytes
+        let encoded = snapshot.encode().unwrap();
+        assert!(!encoded.is_empty());
+
+        // Decode from bytes
+        let decoded = IggySnapshot::decode(&encoded).unwrap();
+        assert_eq!(decoded.sequence_number(), sequence_number);
+
+        // Verify snapshot fields are present
+        assert!(decoded.snapshot().users.is_some());
+        assert!(decoded.snapshot().streams.is_some());
+        assert!(decoded.snapshot().consumer_groups.is_some());
+
+        // Restore MuxStateMachine from the state side (symmetric with fill_snapshot)
+        let restored: MuxStateMachine<MuxTuple> =
+            MuxStateMachine::restore_snapshot(decoded.snapshot()).unwrap();
+
+        // Verify restored state
+        let mut verify_snapshot = MetadataSnapshot::new(0);
+        restored.fill_snapshot(&mut verify_snapshot).unwrap();
+        assert!(verify_snapshot.users.is_some());
+        assert!(verify_snapshot.streams.is_some());
+        assert!(verify_snapshot.consumer_groups.is_some());
     }
 }

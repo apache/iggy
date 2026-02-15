@@ -55,16 +55,9 @@ impl ServerCommandHandler for PollMessages {
 
         let user_id = session.get_user_id();
         let client_id = session.client_id;
+        let topic = shard.resolve_topic_for_poll(user_id, &stream_id, &topic_id)?;
         let (metadata, mut batch) = shard
-            .poll_messages(
-                client_id,
-                user_id,
-                stream_id,
-                topic_id,
-                consumer,
-                partition_id,
-                args,
-            )
+            .poll_messages(client_id, topic, consumer, partition_id, args)
             .await?;
 
         // Collect all chunks first into a Vec to extend their lifetimes.

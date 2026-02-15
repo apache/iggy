@@ -45,6 +45,9 @@ pub use inner::InnerMetadata;
 pub use ops::MetadataOp;
 pub use partition::PartitionMeta;
 pub use reader::{Metadata, PartitionInitInfo};
+pub(crate) use reader::{
+    resolve_consumer_group_id_inner, resolve_stream_id_inner, resolve_topic_id_inner,
+};
 pub use stream::StreamMeta;
 pub use topic::TopicMeta;
 pub use user::UserMeta;

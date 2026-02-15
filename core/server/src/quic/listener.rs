@@ -22,7 +22,8 @@ use crate::shard::IggyShard;
 use crate::shard::task_registry::ShutdownToken;
 use crate::streaming::session::Session;
 use anyhow::anyhow;
-use compio_quic::{Connection, Endpoint, RecvStream, SendStream};
+use compio::io::AsyncReadExt;
+use compio::quic::{Connection, Endpoint, RecvStream, SendStream};
 use futures::FutureExt;
 use iggy_common::{GET_CLUSTER_METADATA_CODE, IggyError, SenderKind, TransportProtocol};
 use std::rc::Rc;
@@ -145,7 +146,7 @@ async fn accept_stream(
     _client_id: u32,
 ) -> Result<Option<BiStream>, ConnectionError> {
     match connection.accept_bi().await {
-        Err(compio_quic::ConnectionError::ApplicationClosed { .. }) => {
+        Err(compio::quic::ConnectionError::ApplicationClosed { .. }) => {
             info!("Connection closed");
             Ok(None)
         }
@@ -164,11 +165,13 @@ async fn handle_stream(
 ) -> anyhow::Result<()> {
     let (send_stream, mut recv_stream) = stream;
 
-    let mut length_buffer = [0u8; INITIAL_BYTES_LENGTH];
-    let mut code_buffer = [0u8; INITIAL_BYTES_LENGTH];
+    let length_buffer = [0u8; INITIAL_BYTES_LENGTH];
+    let code_buffer = [0u8; INITIAL_BYTES_LENGTH];
 
-    recv_stream.read_exact(&mut length_buffer[..]).await?;
-    recv_stream.read_exact(&mut code_buffer[..]).await?;
+    let compio::BufResult(result, length_buffer) = recv_stream.read_exact(length_buffer).await;
+    result?;
+    let compio::BufResult(result, code_buffer) = recv_stream.read_exact(code_buffer).await;
+    result?;
 
     let length = u32::from_le_bytes(length_buffer);
     let code = u32::from_le_bytes(code_buffer);

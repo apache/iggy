@@ -19,8 +19,8 @@
 
 use crate::configs::quic::{QuicCertificateConfig, QuicConfig};
 use crate::configs::server::{
-    DataMaintenanceConfig, HeartbeatConfig, MessagesMaintenanceConfig, TelemetryConfig,
-    TelemetryLogsConfig, TelemetryTracesConfig,
+    ConsumerGroupConfig, DataMaintenanceConfig, HeartbeatConfig, MessagesMaintenanceConfig,
+    TelemetryConfig, TelemetryLogsConfig, TelemetryTracesConfig,
 };
 use crate::configs::system::MessageDeduplicationConfig;
 use crate::configs::{
@@ -156,7 +156,8 @@ impl Display for ServerConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ data_maintenance: {}, message_saver: {}, heartbeat: {}, system: {}, quic: {}, tcp: {}, http: {}, telemetry: {} }}",
+            "{{ consumer_group: {}, data_maintenance: {}, message_saver: {}, heartbeat: {}, system: {}, quic: {}, tcp: {}, http: {}, telemetry: {} }}",
+            self.consumer_group,
             self.data_maintenance,
             self.message_saver,
             self.heartbeat,
@@ -165,6 +166,16 @@ impl Display for ServerConfig {
             self.tcp,
             self.http,
             self.telemetry
+        )
+    }
+}
+
+impl Display for ConsumerGroupConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{{ rebalancing_timeout: {}, rebalancing_check_interval: {} }}",
+            self.rebalancing_timeout, self.rebalancing_check_interval
         )
     }
 }

@@ -19,20 +19,14 @@
 use crate::binary::command::{
     BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
 };
-use crate::binary::handlers::users::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::shard::IggyShard;
 use crate::shard::transmission::frame::ShardResponse;
-use crate::shard::transmission::message::{
-    ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult,
-};
-use crate::state::command::EntryCommand;
+use crate::shard::transmission::message::{ShardRequest, ShardRequestPayload};
 use crate::streaming::session::Session;
-use err_trail::ErrContext;
 use iggy_common::delete_user::DeleteUser;
-use iggy_common::{Identifier, IggyError, SenderKind};
+use iggy_common::{IggyError, SenderKind};
 use std::rc::Rc;
-use tracing::info;
 use tracing::{debug, instrument};
 
 impl ServerCommandHandler for DeleteUser {
@@ -52,61 +46,17 @@ impl ServerCommandHandler for DeleteUser {
         shard.ensure_authenticated(session)?;
         shard.metadata.perm_delete_user(session.get_user_id())?;
 
-        let request = ShardRequest {
-            stream_id: Identifier::default(),
-            topic_id: Identifier::default(),
-            partition_id: 0,
-            payload: ShardRequestPayload::DeleteUser {
-                session_user_id: session.get_user_id(),
-                user_id: self.user_id,
-            },
-        };
-        let message = ShardMessage::Request(request);
-        match shard.send_request_to_shard_or_recoil(None, message).await? {
-            ShardSendRequestResult::Recoil(shard_message) => {
-                if let ShardMessage::Request(ShardRequest { payload, .. }) = shard_message
-                    && let ShardRequestPayload::DeleteUser { user_id, .. } = payload
-                {
-                    info!("Deleting user with ID: {}...", user_id);
-                    let _user_guard = shard.fs_locks.user_lock.lock().await;
-                    let user = shard
-                        .delete_user(&user_id)
-                        .error(|e: &IggyError| {
-                        format!(
-                            "{COMPONENT} (error: {e}) - failed to delete user with ID: {}, session: {session}",
-                            user_id
-                        )
-                    })?;
+        let request = ShardRequest::control_plane(ShardRequestPayload::DeleteUserRequest {
+            user_id: session.get_user_id(),
+            command: self,
+        });
 
-                    info!("Deleted user: {} with ID: {}.", user.username, user.id);
-
-                    shard
-                        .state
-                        .apply(user.id, &EntryCommand::DeleteUser(DeleteUser { user_id: user.id.try_into().unwrap() }))
-                        .await
-                        .error(|e: &IggyError| {
-                            format!(
-                                "{COMPONENT} (error: {e}) - failed to apply delete user with ID: {user_id}, session: {session}",
-                                user_id = user.id,
-                                session = session
-                            )
-                        })?;
-                    sender.send_empty_ok_response().await?;
-                }
+        match shard.send_to_control_plane(request).await? {
+            ShardResponse::DeleteUserResponse(_) => {
+                sender.send_empty_ok_response().await?;
             }
-            ShardSendRequestResult::Response(response) => match response {
-                ShardResponse::DeletedUser(_user) => {
-                    sender.send_empty_ok_response().await?;
-                }
-                ShardResponse::ErrorResponse(err) => {
-                    return Err(err);
-                }
-                _ => {
-                    unreachable!(
-                        "Expected a DeleteUser request inside of DeleteUser handler, impossible state"
-                    );
-                }
-            },
+            ShardResponse::ErrorResponse(err) => return Err(err),
+            _ => unreachable!("Expected DeleteUserResponse"),
         }
 
         Ok(HandlerResult::Finished)

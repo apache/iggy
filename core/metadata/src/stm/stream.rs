@@ -17,7 +17,8 @@
 
 use crate::stats::{StreamStats, TopicStats};
 use crate::stm::StateHandler;
-use crate::{collect_handlers, define_state};
+use crate::stm::snapshot::Snapshotable;
+use crate::{collect_handlers, define_state, impl_fill_restore};
 use ahash::AHashMap;
 use iggy_common::create_partitions::CreatePartitions;
 use iggy_common::create_stream::CreateStream;
@@ -30,9 +31,17 @@ use iggy_common::purge_topic::PurgeTopic;
 use iggy_common::update_stream::UpdateStream;
 use iggy_common::update_topic::UpdateTopic;
 use iggy_common::{CompressionAlgorithm, IggyExpiry, IggyTimestamp, MaxTopicSize};
+use serde::{Deserialize, Serialize};
 use slab::Slab;
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// Partition snapshot representation for serialization.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PartitionSnapshot {
+    pub id: usize,
+    pub created_at: IggyTimestamp,
+}
 
 #[derive(Debug, Clone)]
 pub struct Partition {
@@ -44,6 +53,29 @@ impl Partition {
     pub fn new(id: usize, created_at: IggyTimestamp) -> Self {
         Self { id, created_at }
     }
+}
+
+/// Stats snapshot representation for serialization.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatsSnapshot {
+    pub size_bytes: u64,
+    pub messages_count: u64,
+    pub segments_count: u32,
+}
+
+/// Topic snapshot representation for serialization.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TopicSnapshot {
+    pub id: usize,
+    pub name: String,
+    pub created_at: IggyTimestamp,
+    pub replication_factor: u8,
+    pub message_expiry: IggyExpiry,
+    pub compression_algorithm: CompressionAlgorithm,
+    pub max_topic_size: MaxTopicSize,
+    pub stats: StatsSnapshot,
+    pub partitions: Vec<PartitionSnapshot>,
+    pub round_robin_counter: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -101,6 +133,16 @@ impl Topic {
             round_robin_counter: Arc::new(AtomicUsize::new(0)),
         }
     }
+}
+
+/// Stream snapshot representation for serialization.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamSnapshot {
+    pub id: usize,
+    pub name: String,
+    pub created_at: IggyTimestamp,
+    pub stats: StatsSnapshot,
+    pub topics: Vec<(usize, TopicSnapshot)>,
 }
 
 #[derive(Debug)]
@@ -466,3 +508,147 @@ impl StateHandler for DeletePartitions {
         }
     }
 }
+
+/// Snapshot representation for the Streams state machine.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamsSnapshot {
+    pub items: Vec<(usize, StreamSnapshot)>,
+}
+
+impl Snapshotable for Streams {
+    type Snapshot = StreamsSnapshot;
+
+    fn to_snapshot(&self) -> Self::Snapshot {
+        self.inner.read(|inner| {
+            let items: Vec<(usize, StreamSnapshot)> = inner
+                .items
+                .iter()
+                .map(|(stream_id, stream)| {
+                    let (size_bytes, messages_count, segments_count) =
+                        stream.stats.load_for_snapshot();
+                    let topics: Vec<(usize, TopicSnapshot)> = stream
+                        .topics
+                        .iter()
+                        .map(|(topic_id, topic)| {
+                            let (t_size, t_msgs, t_segs) = topic.stats.load_for_snapshot();
+                            (
+                                topic_id,
+                                TopicSnapshot {
+                                    id: topic.id,
+                                    name: topic.name.to_string(),
+                                    created_at: topic.created_at,
+                                    replication_factor: topic.replication_factor,
+                                    message_expiry: topic.message_expiry,
+                                    compression_algorithm: topic.compression_algorithm,
+                                    max_topic_size: topic.max_topic_size,
+                                    stats: StatsSnapshot {
+                                        size_bytes: t_size,
+                                        messages_count: t_msgs,
+                                        segments_count: t_segs,
+                                    },
+                                    partitions: topic
+                                        .partitions
+                                        .iter()
+                                        .map(|p| PartitionSnapshot {
+                                            id: p.id,
+                                            created_at: p.created_at,
+                                        })
+                                        .collect(),
+                                    round_robin_counter: topic
+                                        .round_robin_counter
+                                        .load(Ordering::Relaxed),
+                                },
+                            )
+                        })
+                        .collect();
+                    (
+                        stream_id,
+                        StreamSnapshot {
+                            id: stream.id,
+                            name: stream.name.to_string(),
+                            created_at: stream.created_at,
+                            stats: StatsSnapshot {
+                                size_bytes,
+                                messages_count,
+                                segments_count,
+                            },
+                            topics,
+                        },
+                    )
+                })
+                .collect();
+            StreamsSnapshot { items }
+        })
+    }
+
+    fn from_snapshot(
+        snapshot: Self::Snapshot,
+    ) -> Result<Self, crate::stm::snapshot::SnapshotError> {
+        let mut index: AHashMap<Arc<str>, usize> = AHashMap::new();
+        let mut stream_entries: Vec<(usize, Stream)> = Vec::new();
+
+        for (slab_key, stream_snap) in snapshot.items {
+            let stream_stats = Arc::new(StreamStats::default());
+            stream_stats.store_from_snapshot(
+                stream_snap.stats.size_bytes,
+                stream_snap.stats.messages_count,
+                stream_snap.stats.segments_count,
+            );
+
+            let mut topic_index: AHashMap<Arc<str>, usize> = AHashMap::new();
+            let mut topic_entries: Vec<(usize, Topic)> = Vec::new();
+
+            for (topic_slab_key, topic_snap) in stream_snap.topics {
+                let topic_stats = Arc::new(TopicStats::new(stream_stats.clone()));
+                topic_stats.store_from_snapshot(
+                    topic_snap.stats.size_bytes,
+                    topic_snap.stats.messages_count,
+                    topic_snap.stats.segments_count,
+                );
+                let topic_name: Arc<str> = Arc::from(topic_snap.name.as_str());
+                let topic = Topic {
+                    id: topic_snap.id,
+                    name: topic_name.clone(),
+                    created_at: topic_snap.created_at,
+                    replication_factor: topic_snap.replication_factor,
+                    message_expiry: topic_snap.message_expiry,
+                    compression_algorithm: topic_snap.compression_algorithm,
+                    max_topic_size: topic_snap.max_topic_size,
+                    stats: topic_stats,
+                    partitions: topic_snap
+                        .partitions
+                        .into_iter()
+                        .map(|p| Partition {
+                            id: p.id,
+                            created_at: p.created_at,
+                        })
+                        .collect(),
+                    round_robin_counter: Arc::new(AtomicUsize::new(topic_snap.round_robin_counter)),
+                };
+                topic_index.insert(topic_name, topic_slab_key);
+                topic_entries.push((topic_slab_key, topic));
+            }
+
+            let topics: Slab<Topic> = topic_entries.into_iter().collect();
+
+            let stream_name: Arc<str> = Arc::from(stream_snap.name.as_str());
+            let stream = Stream {
+                id: stream_snap.id,
+                name: stream_name.clone(),
+                created_at: stream_snap.created_at,
+                stats: stream_stats,
+                topics,
+                topic_index,
+            };
+
+            index.insert(stream_name, slab_key);
+            stream_entries.push((slab_key, stream));
+        }
+
+        let items: Slab<Stream> = stream_entries.into_iter().collect();
+        let inner = StreamsInner { index, items };
+        Ok(inner.into())
+    }
+}
+
+impl_fill_restore!(Streams, streams);

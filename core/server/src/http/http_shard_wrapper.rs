@@ -18,30 +18,31 @@
 use std::rc::Rc;
 
 use iggy_common::{
-    Consumer, ConsumerOffsetInfo, Identifier, IggyError, IggyExpiry, Partitioning,
-    PartitioningKind, Permissions, Stats, UserId, UserStatus,
+    Consumer, ConsumerOffsetInfo, Identifier, IggyError, Partitioning, PartitioningKind,
 };
 use send_wrapper::SendWrapper;
 
 use crate::shard::system::messages::PollingArgs;
-use crate::state::command::EntryCommand;
+use crate::shard::transmission::frame::ShardResponse;
+use crate::shard::transmission::message::ShardRequest;
 use crate::streaming::segments::{IggyMessagesBatchMut, IggyMessagesBatchSet};
 use crate::streaming::topics;
 use crate::streaming::users::user::User;
 use crate::{shard::IggyShard, streaming::session::Session};
 use iggy_common::IggyPollMetadata;
-use iggy_common::PersonalAccessToken;
 
-/// A wrapper around IggyShard that is safe to use in HTTP handlers.
+/// Wrapper around IggyShard for HTTP handlers.
+///
+/// Provides three categories of access:
+/// 1. Control-plane mutations via `send_to_control_plane()` (routed through message pump)
+/// 2. Read-only metadata access via `shard()` (direct, same-thread safe)
+/// 3. Data-plane operations (poll/append messages, consumer offsets)
 ///
 /// # Safety
-/// This wrapper is only safe to use when:
-/// 1. The HTTP server runs on a single thread (compio's thread-per-core model)
-/// 2. All operations are confined to shard 0's thread
+/// This wrapper is safe because:
+/// 1. HTTP server runs on shard 0's single thread (compio model)
+/// 2. All operations are confined to that thread
 /// 3. The underlying IggyShard is never accessed from multiple threads
-///
-/// The safety guarantee is provided by the HTTP server architecture where
-/// all HTTP requests are handled on the same thread that owns the IggyShard.
 pub struct HttpSafeShard {
     inner: Rc<IggyShard>,
 }
@@ -59,9 +60,21 @@ impl HttpSafeShard {
         Self { inner: shard }
     }
 
+    /// Direct access to shard for read-only operations and auth.
     pub fn shard(&self) -> &IggyShard {
         &self.inner
     }
+
+    /// Route control-plane mutations through the message pump.
+    pub async fn send_to_control_plane(
+        &self,
+        request: ShardRequest,
+    ) -> Result<ShardResponse, IggyError> {
+        let future = SendWrapper::new(self.inner.send_to_control_plane(request));
+        future.await
+    }
+
+    // === Data-plane operations (message polling/appending) ===
 
     pub async fn get_consumer_offset(
         &self,
@@ -71,11 +84,11 @@ impl HttpSafeShard {
         topic_id: &Identifier,
         partition_id: Option<u32>,
     ) -> Result<Option<ConsumerOffsetInfo>, IggyError> {
+        let topic = self.shard().resolve_topic(stream_id, topic_id)?;
         let future = SendWrapper::new(self.shard().get_consumer_offset(
             client_id,
             consumer,
-            stream_id,
-            topic_id,
+            topic,
             partition_id,
         ));
         future.await
@@ -90,11 +103,11 @@ impl HttpSafeShard {
         partition_id: Option<u32>,
         offset: u64,
     ) -> Result<(), IggyError> {
+        let topic = self.shard().resolve_topic(stream_id, topic_id)?;
         let future = SendWrapper::new(self.shard().store_consumer_offset(
             client_id,
             consumer,
-            stream_id,
-            topic_id,
+            topic,
             partition_id,
             offset,
         ));
@@ -110,136 +123,15 @@ impl HttpSafeShard {
         topic_id: &Identifier,
         partition_id: Option<u32>,
     ) -> Result<(), IggyError> {
+        let topic = self.shard().resolve_topic(stream_id, topic_id)?;
         let future = SendWrapper::new(self.shard().delete_consumer_offset(
             client_id,
             consumer,
-            stream_id,
-            topic_id,
+            topic,
             partition_id,
         ));
         let _result = future.await?;
         Ok(())
-    }
-
-    pub async fn delete_stream(&self, stream_id: &Identifier) -> Result<(), IggyError> {
-        let future = SendWrapper::new(self.shard().delete_stream(stream_id));
-        future.await?;
-        Ok(())
-    }
-
-    pub fn update_stream(&self, stream_id: &Identifier, name: String) -> Result<(), IggyError> {
-        self.shard().update_stream(stream_id, name)
-    }
-
-    pub async fn purge_stream(&self, stream_id: &Identifier) -> Result<(), IggyError> {
-        let future = SendWrapper::new(self.shard().purge_stream(stream_id));
-        future.await
-    }
-
-    pub async fn create_stream(&self, name: String) -> Result<usize, IggyError> {
-        let future = SendWrapper::new(self.shard().create_stream(name));
-        future.await
-    }
-
-    pub async fn apply_state(
-        &self,
-        user_id: UserId,
-        command: &EntryCommand,
-    ) -> Result<(), IggyError> {
-        self.shard().state.apply(user_id, command).await
-    }
-
-    pub fn get_users(&self) -> Vec<User> {
-        self.shard().get_users()
-    }
-
-    pub fn create_user(
-        &self,
-        username: &str,
-        password: &str,
-        status: UserStatus,
-        permissions: Option<Permissions>,
-    ) -> Result<User, IggyError> {
-        self.shard()
-            .create_user(username, password, status, permissions)
-    }
-
-    pub fn delete_user(&self, user_id: &Identifier) -> Result<User, IggyError> {
-        self.shard().delete_user(user_id)
-    }
-
-    pub fn update_user(
-        &self,
-        user_id: &Identifier,
-        username: Option<String>,
-        status: Option<UserStatus>,
-    ) -> Result<User, IggyError> {
-        self.shard().update_user(user_id, username, status)
-    }
-
-    pub fn update_permissions(
-        &self,
-        user_id: &Identifier,
-        permissions: Option<Permissions>,
-    ) -> Result<(), IggyError> {
-        self.shard().update_permissions(user_id, permissions)
-    }
-
-    pub fn change_password(
-        &self,
-        user_id: &Identifier,
-        current_password: &str,
-        new_password: &str,
-    ) -> Result<(), IggyError> {
-        self.shard()
-            .change_password(user_id, current_password, new_password)
-    }
-
-    pub fn login_user(
-        &self,
-        username: &str,
-        password: &str,
-        session: Option<&Session>,
-    ) -> Result<User, IggyError> {
-        self.shard().login_user(username, password, session)
-    }
-
-    pub fn logout_user(&self, session: &Session) -> Result<(), IggyError> {
-        self.shard().logout_user(session)
-    }
-
-    pub fn get_personal_access_tokens(
-        &self,
-        user_id: u32,
-    ) -> Result<Vec<PersonalAccessToken>, IggyError> {
-        self.shard().get_personal_access_tokens(user_id)
-    }
-
-    pub fn create_personal_access_token(
-        &self,
-        user_id: u32,
-        name: &str,
-        expiry: IggyExpiry,
-    ) -> Result<(PersonalAccessToken, String), IggyError> {
-        self.shard()
-            .create_personal_access_token(user_id, name, expiry)
-    }
-
-    pub fn delete_personal_access_token(&self, user_id: u32, name: &str) -> Result<(), IggyError> {
-        self.shard().delete_personal_access_token(user_id, name)
-    }
-
-    pub fn login_with_personal_access_token(
-        &self,
-        token: &str,
-        session: Option<&Session>,
-    ) -> Result<User, IggyError> {
-        self.shard()
-            .login_with_personal_access_token(token, session)
-    }
-
-    pub async fn get_stats(&self) -> Result<Stats, IggyError> {
-        self.shard().get_stats().await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -253,11 +145,12 @@ impl HttpSafeShard {
         maybe_partition_id: Option<u32>,
         args: PollingArgs,
     ) -> Result<(IggyPollMetadata, IggyMessagesBatchSet), IggyError> {
+        let topic = self
+            .shard()
+            .resolve_topic_for_poll(user_id, &stream_id, &topic_id)?;
         let future = SendWrapper::new(self.shard().poll_messages(
             client_id,
-            user_id,
-            stream_id,
-            topic_id,
+            topic,
             consumer.clone(),
             maybe_partition_id,
             args,
@@ -274,27 +167,17 @@ impl HttpSafeShard {
         partitioning: &Partitioning,
         batch: IggyMessagesBatchMut,
     ) -> Result<(), IggyError> {
-        self.shard().ensure_topic_exists(&stream_id, &topic_id)?;
+        use crate::shard::transmission::message::ResolvedPartition;
 
-        let numeric_stream_id = self
+        let topic = self
             .shard()
-            .metadata
-            .get_stream_id(&stream_id)
-            .expect("Stream existence already verified");
-        let numeric_topic_id = self
-            .shard()
-            .metadata
-            .get_topic_id(numeric_stream_id, &topic_id)
-            .expect("Topic existence already verified");
+            .resolve_topic_for_append(user_id, &stream_id, &topic_id)?;
         let partition_id = match partitioning.kind {
             PartitioningKind::Balanced => self
                 .shard()
                 .metadata
-                .get_next_partition_id(numeric_stream_id, numeric_topic_id)
-                .ok_or(IggyError::TopicIdNotFound(
-                    stream_id.clone(),
-                    topic_id.clone(),
-                ))?,
+                .get_next_partition_id(topic.stream_id, topic.topic_id)
+                .ok_or(IggyError::TopicIdNotFound(stream_id, topic_id))?,
             PartitioningKind::PartitionId => u32::from_le_bytes(
                 partitioning.value[..partitioning.length as usize]
                     .try_into()
@@ -304,7 +187,7 @@ impl HttpSafeShard {
                 let partitions_count = self
                     .shard()
                     .metadata
-                    .partitions_count(numeric_stream_id, numeric_topic_id);
+                    .partitions_count(topic.stream_id, topic.topic_id);
                 topics::helpers::calculate_partition_id_by_messages_key_hash(
                     partitions_count,
                     &partitioning.value,
@@ -312,45 +195,35 @@ impl HttpSafeShard {
             }
         };
 
-        let future = SendWrapper::new(self.shard().append_messages(
-            user_id,
-            stream_id,
-            topic_id,
+        let partition = ResolvedPartition {
+            stream_id: topic.stream_id,
+            topic_id: topic.topic_id,
             partition_id,
-            batch,
-        ));
+        };
+
+        let future = SendWrapper::new(self.shard().append_messages(partition, batch));
         future.await
     }
 
-    pub fn create_consumer_group(
+    pub fn login_user(
         &self,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-        name: String,
-    ) -> Result<usize, IggyError> {
-        self.shard()
-            .create_consumer_group(stream_id, topic_id, name)
+        username: &str,
+        password: &str,
+        session: Option<&Session>,
+    ) -> Result<User, IggyError> {
+        self.shard().login_user(username, password, session)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn update_topic(
+    pub fn logout_user(&self, session: &Session) -> Result<(), IggyError> {
+        self.shard().logout_user(session)
+    }
+
+    pub fn login_with_personal_access_token(
         &self,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-        name: String,
-        message_expiry: iggy_common::IggyExpiry,
-        compression_algorithm: iggy_common::CompressionAlgorithm,
-        max_topic_size: iggy_common::MaxTopicSize,
-        replication_factor: Option<u8>,
-    ) -> Result<(), IggyError> {
-        self.shard().update_topic(
-            stream_id,
-            topic_id,
-            name,
-            message_expiry,
-            compression_algorithm,
-            max_topic_size,
-            replication_factor,
-        )
+        token: &str,
+        session: Option<&Session>,
+    ) -> Result<User, IggyError> {
+        self.shard()
+            .login_with_personal_access_token(token, session)
     }
 }

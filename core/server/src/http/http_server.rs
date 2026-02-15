@@ -35,8 +35,7 @@ use axum::extract::connect_info::Connected;
 use axum::http::Method;
 use axum::{Router, middleware};
 use axum_server::tls_rustls::RustlsConfig;
-use compio::net::TcpListener;
-use compio_net::TcpOpts;
+use compio::net::{SocketOpts, TcpListener};
 use err_trail::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::TransportProtocol;
@@ -136,8 +135,8 @@ pub async fn start_http_server(
     }
 
     if !config.tls.enabled {
-        let opts = TcpOpts::new().reuse_port(true).reuse_address(true);
-        let listener = TcpListener::bind_with_options(config.address.clone(), opts)
+        let opts = SocketOpts::new().reuse_port(true).reuse_address(true);
+        let listener = TcpListener::bind_with_options(config.address.clone(), &opts)
             .await
             .unwrap_or_else(|_| panic!("Failed to bind to HTTP address {}", config.address));
         let address = listener
