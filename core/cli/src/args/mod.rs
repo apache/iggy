@@ -30,6 +30,7 @@ use system::SnapshotArgs;
 
 use crate::args::{
     client::ClientAction,
+    cluster::ClusterAction,
     consumer_group::ConsumerGroupAction,
     consumer_offset::ConsumerOffsetAction,
     context::ContextAction,
@@ -47,6 +48,7 @@ use crate::args::system::LoginArgs;
 use self::user::UserAction;
 
 pub(crate) mod client;
+pub(crate) mod cluster;
 pub(crate) mod common;
 pub(crate) mod consumer_group;
 pub(crate) mod consumer_offset;
@@ -132,6 +134,9 @@ pub(crate) struct CliOptions {
 
 #[derive(Debug, Clone, Subcommand)]
 pub(crate) enum Command {
+    /// cluster operations
+    #[command(subcommand, visible_alias = "cl")]
+    Cluster(ClusterAction),
     /// stream operations
     #[command(subcommand, visible_alias = "s")]
     Stream(StreamAction),
