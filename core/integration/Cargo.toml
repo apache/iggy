@@ -44,6 +44,7 @@ iggy = { workspace = true }
 iggy_binary_protocol = { workspace = true }
 iggy_common = { workspace = true }
 iggy_connector_sdk = { workspace = true, features = ["api"] }
+jsonwebtoken = { workspace = true }
 keyring = { workspace = true }
 lazy_static = { workspace = true }
 libc = { workspace = true }
@@ -77,4 +78,5 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 twox-hash = { workspace = true }
 uuid = { workspace = true }
+wiremock = "0.6"
 zip = { workspace = true }

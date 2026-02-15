@@ -373,12 +373,12 @@ fn generate_harness_setup(
         quote! {
             let __config_overrides: ::std::collections::HashMap<String, String> =
                 [#(#config_entries),*].into_iter().collect();
-            let __extra_envs = ::integration::harness::resolve_config_paths(&__config_overrides)
+            let mut __extra_envs = ::integration::harness::resolve_config_paths(&__config_overrides)
                 .unwrap_or_else(|e| panic!("invalid config path in #[iggy_harness]:\n{}", e));
         }
     } else {
         quote! {
-            let __extra_envs = ::std::collections::HashMap::<String, String>::new();
+            let mut __extra_envs = ::std::collections::HashMap::<String, String>::new();
         }
     };
 
@@ -404,6 +404,15 @@ fn generate_harness_setup(
 
     // Always add extra_envs (may be empty)
     server_builder_calls.push(quote!(.extra_envs(__extra_envs)));
+
+    // If a config_path is specified, inject IGGY_CONFIG_PATH into extra_envs
+    let config_path_setup = if let Some(ref config_path) = attrs.server.config_path {
+        quote! {
+            __extra_envs.insert("IGGY_CONFIG_PATH".to_string(), #config_path.to_string());
+        }
+    } else {
+        quote!()
+    };
 
     let server_config = quote! {
         ::integration::harness::TestServerConfig::builder()
@@ -472,14 +481,32 @@ fn generate_harness_setup(
         quote!()
     };
 
+    let jwks_builder_call = if let Some(ref jwks) = attrs.jwks_server {
+        let enabled = jwks.enabled;
+        let store_path_call = match &jwks.store_path {
+            Some(p) => quote!(.store_path(#p)),
+            None => quote!(),
+        };
+        quote! {
+            .jwks(::integration::harness::JwksConfig::builder()
+                .enabled(#enabled)
+                #store_path_call
+                .build())
+        }
+    } else {
+        quote!()
+    };
+
     quote! {
         #config_resolution
+        #config_path_setup
         let mut __harness = ::integration::harness::TestHarness::builder()
             .server(#server_config)
             .primary_client(#client_config)
             #mcp_builder_call
             #connectors_runtime_builder_call
             #cluster_builder_call
+            #jwks_builder_call
             .build()
             .unwrap_or_else(|e| panic!("failed to build test harness: {e}"));
         let _ = ::integration::__macro_support::TransportProtocol::#transport;
@@ -778,6 +805,7 @@ mod tests {
             },
             seed_fn: None,
             cluster_nodes: crate::attrs::ClusterNodesValue::None,
+            jwks_server: None,
         };
         let variants = generate_variants(&attrs);
         // 2 transports * 2 segment sizes * 2 cache modes = 8 variants
