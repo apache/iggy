@@ -175,8 +175,9 @@ public class ConsumerGroupTests
         response.MembersCount.ShouldBe(2u);
         response.Members.ShouldNotBeNull();
         response.Members.Count.ShouldBe(2);
-        response.Members.ShouldAllBe(x => x.PartitionsCount == 5);
-        response.Members.ShouldAllBe(x => x.Partitions.Count == 5);
+        response.Members.ShouldAllBe(x => x.PartitionsCount >= 1 && x.PartitionsCount < (int)Fixture.PartitionsCount);
+        response.Members.ShouldAllBe(x => x.Partitions.Count >= 1 && x.Partitions.Count < (int)Fixture.PartitionsCount);
+        response.Members.Sum(x => x.PartitionsCount).ShouldBe((int)Fixture.PartitionsCount);
     }
 
     [Test]

@@ -222,6 +222,15 @@ pub enum ShardRequestPayload {
         group_id: usize,
         client_id: u32,
     },
+    CompletePartitionRevocation {
+        stream_id: usize,
+        topic_id: usize,
+        group_id: usize,
+        member_slab_id: usize,
+        member_id: usize,
+        partition_id: usize,
+        timed_out: bool,
+    },
 
     // Control-plane: PAT operations
     CreatePersonalAccessTokenRequest {

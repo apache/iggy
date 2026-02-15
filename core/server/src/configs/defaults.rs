@@ -25,9 +25,10 @@ use crate::configs::http::{
 };
 use crate::configs::quic::{QuicCertificateConfig, QuicConfig, QuicSocketConfig};
 use crate::configs::server::{
-    DataMaintenanceConfig, HeartbeatConfig, MemoryPoolConfig, MessageSaverConfig,
-    MessagesMaintenanceConfig, PersonalAccessTokenCleanerConfig, PersonalAccessTokenConfig,
-    ServerConfig, TelemetryConfig, TelemetryLogsConfig, TelemetryTracesConfig,
+    ConsumerGroupConfig, DataMaintenanceConfig, HeartbeatConfig, MemoryPoolConfig,
+    MessageSaverConfig, MessagesMaintenanceConfig, PersonalAccessTokenCleanerConfig,
+    PersonalAccessTokenConfig, ServerConfig, TelemetryConfig, TelemetryLogsConfig,
+    TelemetryTracesConfig,
 };
 use crate::configs::system::{
     BackupConfig, CompatibilityConfig, CompressionConfig, EncryptionConfig, LoggingConfig,
@@ -49,6 +50,7 @@ static_toml::static_toml! {
 impl Default for ServerConfig {
     fn default() -> ServerConfig {
         ServerConfig {
+            consumer_group: ConsumerGroupConfig::default(),
             data_maintenance: DataMaintenanceConfig::default(),
             heartbeat: HeartbeatConfig::default(),
             message_saver: MessageSaverConfig::default(),
@@ -370,6 +372,23 @@ impl Default for HeartbeatConfig {
         HeartbeatConfig {
             enabled: SERVER_CONFIG.heartbeat.enabled,
             interval: SERVER_CONFIG.heartbeat.interval.parse().unwrap(),
+        }
+    }
+}
+
+impl Default for ConsumerGroupConfig {
+    fn default() -> ConsumerGroupConfig {
+        ConsumerGroupConfig {
+            rebalancing_timeout: SERVER_CONFIG
+                .consumer_group
+                .rebalancing_timeout
+                .parse()
+                .unwrap(),
+            rebalancing_check_interval: SERVER_CONFIG
+                .consumer_group
+                .rebalancing_check_interval
+                .parse()
+                .unwrap(),
         }
     }
 }

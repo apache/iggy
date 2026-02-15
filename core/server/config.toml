@@ -15,6 +15,13 @@
 # specific language governing permissions and limitations
 # under the License.
 
+# Configuration for consumer group cooperative partition rebalancing.
+[consumer_group]
+# Maximum time a partition can remain in pending revocation before being force-transferred to the target member.
+rebalancing_timeout = "30s"
+# How often the periodic checker scans for timed-out pending revocations.
+rebalancing_check_interval = "5s"
+
 [data_maintenance.messages]
 # Enables or disables the expired message cleaner process.
 cleaner_enabled = false
