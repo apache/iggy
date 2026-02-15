@@ -19,7 +19,7 @@
 use super::COMPONENT;
 use crate::{
     shard::IggyShard,
-    shard::transmission::message::ResolvedTopic,
+    shard::transmission::message::{ResolvedTopic, ShardRequest, ShardRequestPayload},
     streaming::{
         partitions::consumer_offset::ConsumerOffset,
         polling_consumer::{ConsumerGroupId, PollingConsumer},
@@ -76,6 +76,15 @@ impl IggyShard {
             partition_id,
         )
         .await?;
+
+        self.maybe_complete_pending_revocation(
+            &polling_consumer,
+            topic.stream_id,
+            topic.topic_id,
+            partition_id,
+        )
+        .await;
+
         Ok((polling_consumer, partition_id))
     }
 
@@ -289,7 +298,7 @@ impl IggyShard {
                     let path = format!("{}/{}", dir_path, id);
                     ConsumerOffset::new(ConsumerKind::Consumer, *id as u32, offset, path)
                 });
-                entry.offset.store(offset, Ordering::Relaxed);
+                entry.offset.store(offset, Ordering::Release);
             }
             PollingConsumer::ConsumerGroup(cg_id, _) => {
                 let Some(offsets) = self.metadata.get_partition_consumer_group_offsets(
@@ -310,7 +319,7 @@ impl IggyShard {
                     let path = format!("{}/{}", dir_path, cg_id.0);
                     ConsumerOffset::new(ConsumerKind::ConsumerGroup, cg_id.0 as u32, offset, path)
                 });
-                entry.offset.store(offset, Ordering::Relaxed);
+                entry.offset.store(offset, Ordering::Release);
             }
         }
     }
@@ -412,6 +421,62 @@ impl IggyShard {
         Self::delete_all_files_in_dir(&consumers_path).await?;
         Self::delete_all_files_in_dir(&groups_path).await?;
         Ok(())
+    }
+
+    /// Complete a pending partition revocation if this offset commit satisfies it.
+    pub(crate) async fn maybe_complete_pending_revocation(
+        &self,
+        polling_consumer: &PollingConsumer,
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
+    ) {
+        let PollingConsumer::ConsumerGroup(group_id, member_id) = polling_consumer else {
+            return;
+        };
+
+        let completion_info = self.metadata.with_metadata(|m| {
+            let topic = m.streams.get(stream_id)?.topics.get(topic_id)?;
+            let group = topic.consumer_groups.get(group_id.0)?;
+            let member = group.members.get(member_id.0)?;
+            if !member
+                .pending_revocations
+                .iter()
+                .any(|revocation| revocation.partition_id == partition_id)
+            {
+                return None;
+            }
+            let partition = topic.partitions.get(partition_id)?;
+            let last_polled = {
+                let guard = partition.last_polled_offsets.pin();
+                guard.get(group_id).map(|v| v.load(Ordering::Acquire))
+            };
+            let can_complete = match last_polled {
+                None => true,
+                Some(polled) => {
+                    let guard = partition.consumer_group_offsets.pin();
+                    guard
+                        .get(group_id)
+                        .map(|co| co.offset.load(Ordering::Acquire))
+                        .is_some_and(|c| c >= polled)
+                }
+            };
+            if can_complete { Some(member.id) } else { None }
+        });
+
+        if let Some(logical_member_id) = completion_info {
+            let request =
+                ShardRequest::control_plane(ShardRequestPayload::CompletePartitionRevocation {
+                    stream_id,
+                    topic_id,
+                    group_id: group_id.0,
+                    member_slab_id: member_id.0,
+                    member_id: logical_member_id,
+                    partition_id,
+                    timed_out: false,
+                });
+            let _ = self.send_to_control_plane(request).await;
+        }
     }
 
     async fn delete_all_files_in_dir(dir: &str) -> Result<(), IggyError> {

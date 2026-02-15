@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::metadata::consumer_group_member::CompletableRevocation;
 use crate::metadata::inner::InnerMetadata;
 use crate::metadata::ops::MetadataOp;
 use crate::metadata::reader::Metadata;
@@ -31,8 +32,8 @@ use iggy_common::{
 };
 use left_right::WriteHandle;
 use slab::Slab;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 pub struct MetadataWriter {
     inner: WriteHandle<InnerMetadata, MetadataOp>,
@@ -246,8 +247,9 @@ impl MetadataWriter {
         group_id: ConsumerGroupId,
         client_id: u32,
         valid_client_ids: Option<Vec<u32>>,
-    ) -> Option<usize> {
+    ) -> (Option<usize>, Vec<CompletableRevocation>) {
         let member_id = Arc::new(AtomicUsize::new(usize::MAX));
+        let completable = Arc::new(Mutex::new(Vec::new()));
         self.append(MetadataOp::JoinConsumerGroup {
             stream_id,
             topic_id,
@@ -255,10 +257,15 @@ impl MetadataWriter {
             client_id,
             member_id: member_id.clone(),
             valid_client_ids,
+            completable_revocations: completable.clone(),
         });
         self.publish();
         let id = member_id.load(Ordering::Acquire);
-        if id == usize::MAX { None } else { Some(id) }
+        let revocations = match Arc::try_unwrap(completable) {
+            Ok(mutex) => mutex.into_inner().unwrap(),
+            Err(arc) => std::mem::take(&mut *arc.lock().unwrap()),
+        };
+        (if id == usize::MAX { None } else { Some(id) }, revocations)
     }
 
     pub fn leave_consumer_group(
@@ -291,6 +298,29 @@ impl MetadataWriter {
             stream_id,
             topic_id,
             partitions_count,
+        });
+        self.publish();
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn complete_partition_revocation(
+        &mut self,
+        stream_id: StreamId,
+        topic_id: TopicId,
+        group_id: ConsumerGroupId,
+        member_slab_id: usize,
+        member_id: usize,
+        partition_id: PartitionId,
+        timed_out: bool,
+    ) {
+        self.append(MetadataOp::CompletePartitionRevocation {
+            stream_id,
+            topic_id,
+            group_id,
+            member_slab_id,
+            member_id,
+            partition_id,
+            timed_out,
         });
         self.publish();
     }
@@ -472,6 +502,7 @@ impl MetadataWriter {
                 stats: stats.clone(),
                 consumer_offsets: Arc::new(ConsumerOffsets::with_capacity(0)),
                 consumer_group_offsets: Arc::new(ConsumerGroupOffsets::with_capacity(0)),
+                last_polled_offsets: Arc::new(papaya::HashMap::new()),
             });
             stats_list.push(stats);
         }

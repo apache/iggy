@@ -164,6 +164,10 @@ impl IggyShard {
             periodic::spawn_personal_access_token_cleaner(self.clone());
         }
 
+        if self.id == 0 {
+            periodic::spawn_revocation_timeout_checker(self.clone());
+        }
+
         if !self.config.system.logging.sysinfo_print_interval.is_zero() && self.id == 0 {
             periodic::spawn_sysinfo_printer(self.clone());
         }
