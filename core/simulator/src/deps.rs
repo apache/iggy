@@ -86,6 +86,10 @@ impl<S: Storage> std::fmt::Debug for SimJournal<S> {
 impl<S: Storage<Buffer = Vec<u8>>> Journal<S> for SimJournal<S> {
     type Header = PrepareHeader;
     type Entry = Message<PrepareHeader>;
+    type HeaderRef<'a>
+        = &'a PrepareHeader
+    where
+        Self: 'a;
 
     async fn entry(&self, header: &Self::Header) -> Option<Self::Entry> {
         let headers = unsafe { &*self.headers.get() };
@@ -101,7 +105,7 @@ impl<S: Storage<Buffer = Vec<u8>>> Journal<S> for SimJournal<S> {
         Some(message)
     }
 
-    fn previous_header(&self, header: &Self::Header) -> Option<&Self::Header> {
+    fn previous_header(&self, header: &Self::Header) -> Option<Self::HeaderRef<'_>> {
         if header.op == 0 {
             return None;
         }
@@ -124,7 +128,7 @@ impl<S: Storage<Buffer = Vec<u8>>> Journal<S> for SimJournal<S> {
         unsafe { &mut *self.offsets.get() }.insert(header.op, current_offset + bytes_written);
     }
 
-    fn header(&self, idx: usize) -> Option<&Self::Header> {
+    fn header(&self, idx: usize) -> Option<Self::HeaderRef<'_>> {
         let headers = unsafe { &*self.headers.get() };
         headers.get(&(idx as u64))
     }
@@ -151,5 +155,5 @@ pub type SimMetadata = IggyMetadata<
     SimMuxStateMachine,
 >;
 
-#[derive(Debug, Default)]
-pub struct ReplicaPartitions {}
+/// Type alias for simulator partitions
+pub type ReplicaPartitions = partitions::IggyPartitions<VsrConsensus<SharedMemBus>>;

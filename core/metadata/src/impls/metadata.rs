@@ -181,7 +181,7 @@ where
 
         // Verify hash chain integrity.
         if let Some(previous) = journal.handle().previous_header(header) {
-            self.panic_if_hash_chain_would_break_in_same_view(previous, header);
+            self.panic_if_hash_chain_would_break_in_same_view(&previous, header);
         }
 
         assert_eq!(header.op, current_op + 1);
@@ -259,17 +259,13 @@ where
                         checksum_body: 0,
                         cluster: consensus.cluster(),
                         size: std::mem::size_of::<ReplyHeader>() as u32,
-                        epoch: prepare_header.epoch,
                         view: consensus.view(),
                         release: 0,
-                        protocol: 0,
                         command: Command2::Reply,
                         replica: consensus.replica(),
-                        reserved_frame: [0; 12],
+                        reserved_frame: [0; 66],
                         request_checksum: prepare_header.request_checksum,
-                        request_checksum_padding: 0,
                         context: 0,
-                        context_padding: 0,
                         op: prepare_header.op,
                         commit: consensus.commit(),
                         timestamp: prepare_header.timestamp,
@@ -467,7 +463,6 @@ where
             cluster: consensus.cluster(),
             replica: consensus.replica(),
             view: consensus.view(),
-            epoch: header.epoch,
             op: header.op,
             commit: consensus.commit(),
             timestamp: header.timestamp,
@@ -475,6 +470,7 @@ where
             prepare_checksum: header.checksum,
             request: header.request,
             operation: header.operation,
+            namespace: header.namespace,
             size: std::mem::size_of::<PrepareOkHeader>() as u32,
             ..Default::default()
         };

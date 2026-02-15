@@ -17,6 +17,7 @@
  */
 
 mod iggy_message;
+mod in_flight;
 mod index;
 mod index_view;
 mod indexes;
@@ -61,6 +62,7 @@ pub use message_view_mut::{IggyMessageViewMut, IggyMessageViewMutIterator};
 pub use messages_batch::IggyMessagesBatch;
 pub use messages_batch_mut::IggyMessagesBatchMut;
 pub use messages_batch_set::IggyMessagesBatchSet;
+pub use in_flight::IggyMessagesBatchSetInFlight;
 pub use partitioning::Partitioning;
 pub use partitioning_kind::PartitioningKind;
 pub use poll_metadata::IggyPollMetadata;

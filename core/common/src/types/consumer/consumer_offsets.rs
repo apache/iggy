@@ -15,4 +15,36 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub use iggy_common::IggyMessagesBatchSetInFlight;
+use super::consumer_offset::ConsumerOffset;
+
+#[derive(Debug, Clone)]
+pub struct ConsumerOffsets(papaya::HashMap<usize, ConsumerOffset>);
+
+impl ConsumerOffsets {
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self(papaya::HashMap::with_capacity(capacity))
+    }
+}
+
+impl<I> From<I> for ConsumerOffsets
+where
+    I: IntoIterator<Item = (usize, ConsumerOffset)>,
+{
+    fn from(iter: I) -> Self {
+        Self(papaya::HashMap::from_iter(iter))
+    }
+}
+
+impl std::ops::Deref for ConsumerOffsets {
+    type Target = papaya::HashMap<usize, ConsumerOffset>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for ConsumerOffsets {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}

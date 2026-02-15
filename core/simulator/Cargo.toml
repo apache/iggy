@@ -29,3 +29,4 @@ iggy_common = { path = "../common" }
 journal = { path = "../journal" }
 message_bus = { path = "../message_bus" }
 metadata = { path = "../metadata" }
+partitions = { path = "../partitions" }

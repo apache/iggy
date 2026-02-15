@@ -58,6 +58,11 @@ pub struct IggyNamespace(u64);
 
 impl IggyNamespace {
     #[inline]
+    pub fn from_raw(value: u64) -> Self {
+        Self(value)
+    }
+
+    #[inline]
     pub fn inner(&self) -> u64 {
         self.0
     }

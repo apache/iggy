@@ -4700,6 +4700,7 @@ dependencies = [
  "moka",
  "nix",
  "once_cell",
+ "papaya",
  "rcgen",
  "ring",
  "rustls",
@@ -6561,7 +6562,13 @@ dependencies = [
 name = "partitions"
 version = "0.1.0"
 dependencies = [
+ "consensus",
  "iggy_common",
+ "journal",
+ "message_bus",
+ "ringbuffer",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -8505,6 +8512,7 @@ dependencies = [
  "journal",
  "message_bus",
  "metadata",
+ "partitions",
 ]
 
 [[package]]
