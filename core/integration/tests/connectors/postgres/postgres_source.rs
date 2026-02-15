@@ -302,7 +302,14 @@ async fn delete_after_read_source_removes_rows_after_producing(
         received.len()
     );
 
-    let final_count = fixture.count_rows(&pool).await;
+    let mut final_count = -1i64;
+    for _ in 0..POLL_ATTEMPTS {
+        final_count = fixture.count_rows(&pool).await;
+        if final_count == 0 {
+            break;
+        }
+        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+    }
     assert_eq!(
         final_count, 0,
         "Expected 0 rows after delete_after_read, got {final_count}"
@@ -376,8 +383,16 @@ async fn processed_column_source_marks_rows_after_producing(
         received.len()
     );
 
-    let final_unprocessed = fixture.count_unprocessed(&pool).await;
-    let final_processed = fixture.count_processed(&pool).await;
+    let mut final_unprocessed = -1i64;
+    let mut final_processed = -1i64;
+    for _ in 0..POLL_ATTEMPTS {
+        final_unprocessed = fixture.count_unprocessed(&pool).await;
+        final_processed = fixture.count_processed(&pool).await;
+        if final_unprocessed == 0 && final_processed == TEST_MESSAGE_COUNT as i64 {
+            break;
+        }
+        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+    }
     assert_eq!(
         final_unprocessed, 0,
         "Expected 0 unprocessed rows after processing, got {final_unprocessed}"
@@ -482,7 +497,7 @@ async fn state_persists_across_connector_restart(
         .start_dependents()
         .await
         .expect("Failed to restart connectors");
-    sleep(Duration::from_millis(500)).await;
+    sleep(Duration::from_secs(2)).await;
 
     let mut received_after: Vec<DatabaseRecord> = Vec::new();
     for _ in 0..POLL_ATTEMPTS {

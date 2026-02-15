@@ -88,6 +88,7 @@ impl IggyShard {
         })
     }
 
+    /// Join runs on shard 0 (control plane), single-threaded — no concurrent joins.
     pub fn join_consumer_group(
         &self,
         client_id: u32,
@@ -100,13 +101,25 @@ impl IggyShard {
             .map(|c| c.session.client_id)
             .collect();
 
-        self.writer().join_consumer_group(
+        let (_, completable) = self.writer().join_consumer_group(
             group.stream_id,
             group.topic_id,
             group.group_id,
             client_id,
             Some(valid_client_ids),
         );
+
+        for revocation in completable {
+            self.writer().complete_partition_revocation(
+                group.stream_id,
+                group.topic_id,
+                group.group_id,
+                revocation.slab_id,
+                revocation.member_id,
+                revocation.partition_id,
+                false,
+            );
+        }
 
         if let Some(cg) =
             self.metadata

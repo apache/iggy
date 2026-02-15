@@ -15,13 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::metadata::consumer_group_member::CompletableRevocation;
 use crate::metadata::inner::InnerMetadata;
 use crate::metadata::{
-    ConsumerGroupId, ConsumerGroupMeta, PartitionMeta, StreamId, StreamMeta, TopicId, TopicMeta,
-    UserId, UserMeta,
+    ConsumerGroupId, ConsumerGroupMeta, PartitionId, PartitionMeta, StreamId, StreamMeta, TopicId,
+    TopicMeta, UserId, UserMeta,
 };
 use iggy_common::{CompressionAlgorithm, IggyExpiry, MaxTopicSize, PersonalAccessToken};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::AtomicUsize;
 
 #[derive(Clone)]
@@ -106,6 +108,7 @@ pub enum MetadataOp {
         client_id: u32,
         member_id: Arc<AtomicUsize>,
         valid_client_ids: Option<Vec<u32>>,
+        completable_revocations: Arc<Mutex<Vec<CompletableRevocation>>>,
     },
     LeaveConsumerGroup {
         stream_id: StreamId,
@@ -118,5 +121,14 @@ pub enum MetadataOp {
         stream_id: StreamId,
         topic_id: TopicId,
         partitions_count: u32,
+    },
+    CompletePartitionRevocation {
+        stream_id: StreamId,
+        topic_id: TopicId,
+        group_id: ConsumerGroupId,
+        member_slab_id: usize,
+        member_id: usize,
+        partition_id: PartitionId,
+        timed_out: bool,
     },
 }

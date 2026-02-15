@@ -18,9 +18,11 @@
 use crate::metadata::PartitionId;
 use crate::streaming::partitions::consumer_group_offsets::ConsumerGroupOffsets;
 use crate::streaming::partitions::consumer_offsets::ConsumerOffsets;
+use crate::streaming::polling_consumer::ConsumerGroupId;
 use crate::streaming::stats::PartitionStats;
 use iggy_common::IggyTimestamp;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
 #[derive(Clone, Debug)]
 pub struct PartitionMeta {
@@ -32,4 +34,6 @@ pub struct PartitionMeta {
     pub stats: Arc<PartitionStats>,
     pub consumer_offsets: Arc<ConsumerOffsets>,
     pub consumer_group_offsets: Arc<ConsumerGroupOffsets>,
+    /// Last offset polled by each consumer group from this partition.
+    pub last_polled_offsets: Arc<papaya::HashMap<ConsumerGroupId, Arc<AtomicU64>>>,
 }
