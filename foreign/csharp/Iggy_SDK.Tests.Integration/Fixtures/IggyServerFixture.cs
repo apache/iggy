@@ -159,6 +159,14 @@ public class IggyServerFixture : IAsyncInitializer, IAsyncDisposable
         return dictionary;
     }
 
+    public async Task<IIggyClient> CreateAuthenticatedClient(Protocol protocol, string userName = "iggy",
+        string password = "iggy")
+    {
+        return protocol == Protocol.Tcp
+            ? await CreateTcpClient(userName, password)
+            : await CreateHttpClient(userName, password);
+    }
+
     public async Task<IIggyClient> CreateTcpClient(string userName = "iggy", string password = "iggy",
         bool connect = true)
     {
