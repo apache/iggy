@@ -86,12 +86,14 @@ impl BytesSerializable for FlushUnsavedBuffer {
         let topic_id = Identifier::from_bytes(bytes.slice(position..))?;
         position += topic_id.to_bytes().len();
         let partition_id = u32::from_le_bytes(
-            bytes[position..position + 4]
+            bytes
+                .get(position..position + 4)
+                .ok_or(IggyError::InvalidCommand)?
                 .try_into()
                 .map_err(|_| IggyError::InvalidNumberEncoding)?,
         );
         position += 4;
-        let fsync = bytes[position] == 1;
+        let fsync = *bytes.get(position).ok_or(IggyError::InvalidCommand)? == 1;
         Ok(FlushUnsavedBuffer {
             stream_id,
             topic_id,

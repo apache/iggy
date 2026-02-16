@@ -157,7 +157,8 @@ impl BytesSerializable for PollMessages {
         }
 
         let mut position = 0;
-        let consumer_kind = ConsumerKind::from_code(bytes[0])?;
+        let consumer_kind =
+            ConsumerKind::from_code(*bytes.first().ok_or(IggyError::InvalidCommand)?)?;
         let consumer_id = Identifier::from_bytes(bytes.slice(1..))?;
         position += 1 + consumer_id.get_size_bytes().as_bytes_usize();
         let consumer = Consumer {
@@ -168,10 +169,11 @@ impl BytesSerializable for PollMessages {
         position += stream_id.get_size_bytes().as_bytes_usize();
         let topic_id = Identifier::from_bytes(bytes.slice(position..))?;
         position += topic_id.get_size_bytes().as_bytes_usize();
-        // Decode partition_id with flag byte: 1 = Some, 0 = None
-        let has_partition_id = bytes[position];
+        let has_partition_id = *bytes.get(position).ok_or(IggyError::InvalidCommand)?;
         let partition_id_value = u32::from_le_bytes(
-            bytes[position + 1..position + 5]
+            bytes
+                .get(position + 1..position + 5)
+                .ok_or(IggyError::InvalidCommand)?
                 .try_into()
                 .map_err(|_| IggyError::InvalidNumberEncoding)?,
         );
@@ -180,10 +182,13 @@ impl BytesSerializable for PollMessages {
         } else {
             None
         };
-        let polling_kind = PollingKind::from_code(bytes[position + 5])?;
+        let polling_kind =
+            PollingKind::from_code(*bytes.get(position + 5).ok_or(IggyError::InvalidCommand)?)?;
         position += 6;
         let value = u64::from_le_bytes(
-            bytes[position..position + 8]
+            bytes
+                .get(position..position + 8)
+                .ok_or(IggyError::InvalidCommand)?
                 .try_into()
                 .map_err(|_| IggyError::InvalidNumberEncoding)?,
         );
@@ -192,12 +197,13 @@ impl BytesSerializable for PollMessages {
             value,
         };
         let count = u32::from_le_bytes(
-            bytes[position + 8..position + 12]
+            bytes
+                .get(position + 8..position + 12)
+                .ok_or(IggyError::InvalidCommand)?
                 .try_into()
                 .map_err(|_| IggyError::InvalidNumberEncoding)?,
         );
-        let auto_commit = bytes[position + 12];
-        let auto_commit = matches!(auto_commit, 1);
+        let auto_commit = *bytes.get(position + 12).ok_or(IggyError::InvalidCommand)? == 1;
         let command = PollMessages {
             consumer,
             stream_id,

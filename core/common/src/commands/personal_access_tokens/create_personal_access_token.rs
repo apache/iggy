@@ -82,17 +82,20 @@ impl BytesSerializable for CreatePersonalAccessToken {
             return Err(IggyError::InvalidCommand);
         }
 
-        let name_length = bytes[0];
-        let name = from_utf8(&bytes.slice(1..1 + name_length as usize))
-            .map_err(|_| IggyError::InvalidUtf8)?
-            .to_string();
-        if name.len() != name_length as usize {
-            return Err(IggyError::InvalidCommand);
-        }
+        let name_length = *bytes.first().ok_or(IggyError::InvalidCommand)? as usize;
+        let name = from_utf8(
+            bytes
+                .get(1..1 + name_length)
+                .ok_or(IggyError::InvalidCommand)?,
+        )
+        .map_err(|_| IggyError::InvalidUtf8)?
+        .to_string();
 
-        let position = 1 + name_length as usize;
+        let position = 1 + name_length;
         let expiry = u64::from_le_bytes(
-            bytes[position..position + 8]
+            bytes
+                .get(position..position + 8)
+                .ok_or(IggyError::InvalidCommand)?
                 .try_into()
                 .map_err(|_| IggyError::InvalidNumberEncoding)?,
         );
