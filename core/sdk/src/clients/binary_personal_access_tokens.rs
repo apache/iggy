@@ -16,14 +16,15 @@
  * under the License.
  */
 
-use crate::prelude::IggyClient;
+use crate::prelude::{ClientWrapper, IggyClient};
 use async_trait::async_trait;
-use iggy_binary_protocol::PersonalAccessTokenClient;
+use iggy_binary_protocol::{Client, PersonalAccessTokenClient};
 use iggy_common::locking::IggyRwLockFn;
 use iggy_common::{
     IdentityInfo, IggyError, PersonalAccessTokenExpiry, PersonalAccessTokenInfo,
     RawPersonalAccessToken,
 };
+use tracing::info;
 
 #[async_trait]
 impl PersonalAccessTokenClient for IggyClient {
@@ -55,10 +56,31 @@ impl PersonalAccessTokenClient for IggyClient {
         &self,
         token: &str,
     ) -> Result<IdentityInfo, IggyError> {
-        self.client
+        let identity = self
+            .client
             .read()
             .await
             .login_with_personal_access_token(token)
-            .await
+            .await?;
+
+        let should_redirect = {
+            let client = self.client.read().await;
+            match &*client {
+                ClientWrapper::Tcp(tcp_client) => tcp_client.handle_leader_redirection().await?,
+                ClientWrapper::Quic(quic_client) => quic_client.handle_leader_redirection().await?,
+                ClientWrapper::WebSocket(ws_client) => {
+                    ws_client.handle_leader_redirection().await?
+                }
+                _ => false,
+            }
+        };
+
+        if should_redirect {
+            info!("Redirected to leader, reconnecting and re-authenticating");
+            self.connect().await?;
+            self.login_with_personal_access_token(token).await
+        } else {
+            Ok(identity)
+        }
     }
 }
