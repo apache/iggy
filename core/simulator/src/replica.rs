@@ -19,7 +19,7 @@ use crate::bus::{MemBus, SharedMemBus};
 use crate::deps::{
     MemStorage, ReplicaPartitions, SimJournal, SimMetadata, SimMuxStateMachine, SimSnapshot,
 };
-use consensus::VsrConsensus;
+use consensus::{LocalPipeline, VsrConsensus};
 use iggy_common::IggyByteSize;
 use iggy_common::sharding::ShardId;
 use metadata::stm::consumer_group::{ConsumerGroups, ConsumerGroupsInner};
@@ -50,6 +50,7 @@ impl Replica {
             id,
             replica_count,
             SharedMemBus(Arc::clone(&bus)),
+            LocalPipeline::new(),
         );
         metadata_consensus.init();
 
@@ -59,6 +60,7 @@ impl Replica {
             id,
             replica_count,
             SharedMemBus(Arc::clone(&bus)),
+            LocalPipeline::new(),
         );
         partitions_consensus.init();
 
