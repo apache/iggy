@@ -16,6 +16,7 @@
  * under the License.
  */
 
+pub mod client_management;
 pub mod diagnostics;
 pub mod error;
 pub mod http_server;

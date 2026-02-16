@@ -18,6 +18,7 @@
  */
 
 use crate::configs::http::{HttpConfig, HttpCorsConfig};
+use crate::http::client_management::manage_clients;
 use crate::http::diagnostics::request_diagnostics;
 use crate::http::http_shard_wrapper::HttpSafeShard;
 use crate::http::jwt::jwt_manager::JwtManager;
@@ -105,7 +106,8 @@ pub async fn start_http_server(
         .layer(DefaultBodyLimit::max(
             config.max_request_size.as_bytes_u64() as usize,
         ))
-        .layer(middleware::from_fn_with_state(app_state.clone(), jwt_auth));
+        .layer(middleware::from_fn_with_state(app_state.clone(), jwt_auth))
+        .layer(middleware::from_fn_with_state(app_state.clone(), manage_clients));
 
     if config.cors.enabled {
         app = app.layer(configure_cors(config.cors)?);
