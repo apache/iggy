@@ -19,17 +19,18 @@ use crate::metadata::ConsumerGroupMemberMeta;
 use crate::metadata::inner::InnerMetadata;
 use crate::metadata::ops::MetadataOp;
 use crate::metadata::{StreamId, UserId};
+use crate::streaming::polling_consumer::ConsumerGroupId;
 use iggy_common::Permissions;
 use left_right::Absorb;
 use std::sync::atomic::Ordering;
 
 impl Absorb<MetadataOp> for InnerMetadata {
-    fn absorb_first(&mut self, op: &mut MetadataOp, _other: &Self) {
-        apply_op(self, op, true);
+    fn absorb_first(&mut self, op: &mut MetadataOp, other: &Self) {
+        apply_op(self, op, true, other);
     }
 
-    fn absorb_second(&mut self, op: MetadataOp, _other: &Self) {
-        apply_op(self, &op, false);
+    fn absorb_second(&mut self, op: MetadataOp, other: &Self) {
+        apply_op(self, &op, false, other);
     }
 
     fn sync_with(&mut self, first: &Self) {
@@ -37,7 +38,12 @@ impl Absorb<MetadataOp> for InnerMetadata {
     }
 }
 
-fn apply_op(metadata: &mut InnerMetadata, op: &MetadataOp, populate_ids: bool) {
+fn apply_op(
+    metadata: &mut InnerMetadata,
+    op: &MetadataOp,
+    populate_ids: bool,
+    _reader_copy: &InnerMetadata,
+) {
     match op {
         MetadataOp::Initialize(initial) => {
             *metadata = (**initial).clone();
@@ -269,6 +275,7 @@ fn apply_op(metadata: &mut InnerMetadata, op: &MetadataOp, populate_ids: bool) {
             client_id,
             member_id,
             valid_client_ids,
+            completable_revocations,
         } => {
             if let Some(stream) = metadata.streams.get_mut(*stream_id)
                 && let Some(topic) = stream.topics.get_mut(*topic_id)
@@ -299,9 +306,19 @@ fn apply_op(metadata: &mut InnerMetadata, op: &MetadataOp, populate_ids: bool) {
                     member_id.store(next_id, Ordering::Release);
                 }
 
-                let new_member = ConsumerGroupMemberMeta::new(next_id, *client_id);
-                group.members.insert(new_member);
-                group.rebalance_members();
+                if !group.members.iter().any(|(_, m)| m.client_id == *client_id) {
+                    let new_member = ConsumerGroupMemberMeta::new(next_id, *client_id);
+                    group.members.insert(new_member);
+                    group.rebalance_cooperative();
+                }
+
+                if populate_ids {
+                    let cg_id = ConsumerGroupId(*group_id);
+                    let found = group.find_completable_revocations(&topic.partitions, cg_id);
+                    if !found.is_empty() {
+                        *completable_revocations.lock().unwrap() = found;
+                    }
+                }
             }
         }
 
@@ -322,12 +339,28 @@ fn apply_op(metadata: &mut InnerMetadata, op: &MetadataOp, populate_ids: bool) {
                     .find(|(_, m)| m.client_id == *client_id)
                     .map(|(id, _)| id);
 
-                if let Some(mid) = member_to_remove {
+                if let Some(member_id) = member_to_remove {
                     if populate_ids {
-                        removed_member_id.store(mid, Ordering::Release);
+                        removed_member_id.store(member_id, Ordering::Release);
                     }
-                    group.members.remove(mid);
+                    // Partitions owned by the leaving member
+                    let leaving_partitions: Vec<usize> = group
+                        .members
+                        .get(member_id)
+                        .map(|m| m.partitions.clone())
+                        .unwrap_or_default();
+
+                    group.members.remove(member_id);
                     group.rebalance_members();
+
+                    // Clear polled offsets only for the leaving member's partitions
+                    let consumer_group_id = ConsumerGroupId(*group_id);
+                    for partition_id in leaving_partitions {
+                        if let Some(partition) = topic.partitions.get(partition_id) {
+                            let guard = partition.last_polled_offsets.pin();
+                            guard.remove(&consumer_group_id);
+                        }
+                    }
                 }
             }
         }
@@ -343,12 +376,36 @@ fn apply_op(metadata: &mut InnerMetadata, op: &MetadataOp, populate_ids: bool) {
                 let partition_ids: Vec<usize> = (0..*partitions_count as usize).collect();
                 let group_ids: Vec<_> = topic.consumer_groups.iter().map(|(id, _)| id).collect();
 
-                for gid in group_ids {
-                    if let Some(group) = topic.consumer_groups.get_mut(gid) {
+                for group_id in group_ids {
+                    if let Some(group) = topic.consumer_groups.get_mut(group_id) {
                         group.partitions = partition_ids.clone();
                         group.rebalance_members();
+
+                        let consumer_group_id = ConsumerGroupId(group_id);
+                        for partition in topic.partitions.iter() {
+                            let guard = partition.last_polled_offsets.pin();
+                            guard.remove(&consumer_group_id);
+                        }
                     }
                 }
+            }
+        }
+
+        MetadataOp::CompletePartitionRevocation {
+            stream_id,
+            topic_id,
+            group_id,
+            member_slab_id,
+            member_id,
+            partition_id,
+            timed_out: _,
+        } => {
+            if let Some(stream) = metadata.streams.get_mut(*stream_id)
+                && let Some(topic) = stream.topics.get_mut(*topic_id)
+                && let Some(group) = topic.consumer_groups.get_mut(*group_id)
+            {
+                // Pre-validated by maybe_complete_pending_revocation before dispatch.
+                group.complete_revocation(*member_slab_id, *member_id, *partition_id);
             }
         }
     }

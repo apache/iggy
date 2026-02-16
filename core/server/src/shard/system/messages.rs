@@ -102,6 +102,19 @@ impl IggyShard {
             batch
         };
 
+        // Track last offset sent to CG member for cooperative rebalance.
+        if let PollingConsumer::ConsumerGroup(group_id, _) = &consumer
+            && let Some(last_offset) = batch.last_offset()
+        {
+            self.metadata.record_polled_offset(
+                topic.stream_id,
+                topic.topic_id,
+                group_id.0,
+                partition_id,
+                last_offset,
+            );
+        }
+
         Ok((metadata, batch))
     }
 
@@ -252,7 +265,7 @@ impl IggyShard {
                             ),
                         ),
                     );
-                    item.offset.store(offset, Ordering::Relaxed);
+                    item.offset.store(offset, Ordering::Release);
                     (item.offset.load(Ordering::Relaxed), item.path.clone())
                 }
                 PollingConsumer::ConsumerGroup(consumer_group_id, _) => {
@@ -274,13 +287,22 @@ impl IggyShard {
                             ),
                         ),
                     );
-                    item.offset.store(offset, Ordering::Relaxed);
+                    item.offset.store(offset, Ordering::Release);
                     (item.offset.load(Ordering::Relaxed), item.path.clone())
                 }
             }
         };
 
         crate::streaming::partitions::storage::persist_offset(&path, offset_value).await?;
+
+        self.maybe_complete_pending_revocation(
+            &consumer,
+            namespace.stream_id(),
+            namespace.topic_id(),
+            namespace.partition_id(),
+        )
+        .await;
+
         Ok(())
     }
 

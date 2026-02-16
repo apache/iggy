@@ -128,7 +128,7 @@ impl IggyShard {
     }
 
     /// Resolves consumer with partition ID for polling/offset operations.
-    /// Takes a pre-resolved topic to avoid re-resolution.
+    /// For consumer groups, all lookups happen under a single metadata read guard.
     pub fn resolve_consumer_with_partition_id(
         &self,
         topic: ResolvedTopic,
@@ -150,57 +150,14 @@ impl IggyShard {
                     return Err(IggyError::StaleClient);
                 }
 
-                let group_id = self
-                    .metadata
-                    .get_consumer_group_id(topic.stream_id, topic.topic_id, &consumer.id)
-                    .ok_or_else(|| {
-                        IggyError::ConsumerGroupIdNotFound(
-                            consumer.id.clone(),
-                            Identifier::numeric(topic.topic_id as u32).unwrap(),
-                        )
-                    })?;
-
-                let member_id = self
-                    .metadata
-                    .get_consumer_group_member_id(
-                        topic.stream_id,
-                        topic.topic_id,
-                        group_id,
-                        client_id,
-                    )
-                    .ok_or_else(|| {
-                        if self.client_manager.try_get_client(client_id).is_none() {
-                            return IggyError::StaleClient;
-                        }
-                        IggyError::ConsumerGroupMemberNotFound(
-                            client_id,
-                            consumer.id.clone(),
-                            Identifier::numeric(topic.topic_id as u32).unwrap(),
-                        )
-                    })?;
-
-                if let Some(partition_id) = partition_id {
-                    return Ok(Some((
-                        PollingConsumer::consumer_group(group_id, member_id),
-                        partition_id as usize,
-                    )));
-                }
-
-                let partition_id = self.metadata.get_next_member_partition_id(
+                self.metadata.resolve_consumer_group_partition(
                     topic.stream_id,
                     topic.topic_id,
-                    group_id,
-                    member_id,
+                    &consumer.id,
+                    client_id,
+                    partition_id,
                     calculate_partition_id,
-                );
-
-                match partition_id {
-                    Some(partition_id) => Ok(Some((
-                        PollingConsumer::consumer_group(group_id, member_id),
-                        partition_id,
-                    ))),
-                    None => Ok(None),
-                }
+                )
             }
         }
     }

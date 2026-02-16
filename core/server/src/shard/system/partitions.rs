@@ -82,6 +82,7 @@ impl IggyShard {
                 stats: Arc::new(PartitionStats::new(parent_stats.clone())),
                 consumer_offsets: Arc::new(ConsumerOffsets::with_capacity(0)),
                 consumer_group_offsets: Arc::new(ConsumerGroupOffsets::with_capacity(0)),
+                last_polled_offsets: Arc::new(papaya::HashMap::new()),
             })
             .collect();
 

@@ -19,13 +19,14 @@ package main
 
 import (
 	"flag"
-	"github.com/apache/iggy/examples/go/common"
-	iggcon "github.com/apache/iggy/foreign/go/contracts"
-	"github.com/apache/iggy/foreign/go/iggycli"
-	"github.com/apache/iggy/foreign/go/tcp"
 	"log"
 	"net"
 	"time"
+
+	"github.com/apache/iggy/examples/go/common"
+	"github.com/apache/iggy/foreign/go/client"
+	"github.com/apache/iggy/foreign/go/client/tcp"
+	iggcon "github.com/apache/iggy/foreign/go/contracts"
 )
 
 var (
@@ -36,27 +37,32 @@ var (
 )
 
 func main() {
-	client, err := iggycli.NewIggyClient(
-		iggycli.WithTcp(
+	cli, err := client.NewIggyClient(
+		client.WithTcp(
 			tcp.WithServerAddress(getTcpServerAddr()),
 		),
 	)
 	if err != nil {
 		log.Fatal(err)
 	}
+	defer func() {
+		if err := cli.Close(); err != nil {
+			log.Printf("Error closing client: %v", err)
+		}
+	}()
 
-	_, err = client.LoginUser(common.DefaultRootUsername, common.DefaultRootPassword)
+	_, err = cli.LoginUser(common.DefaultRootUsername, common.DefaultRootPassword)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	err = consumeMessages(client)
+	err = consumeMessages(cli)
 	if err != nil {
 		log.Fatal(err)
 	}
 }
 
-func consumeMessages(client iggycli.Client) error {
+func consumeMessages(client iggcon.Client) error {
 	interval := 500 * time.Millisecond
 	log.Printf(
 		"Messages will be consumed from stream: %d, topic: %d, partition: %d with interval %s.",
