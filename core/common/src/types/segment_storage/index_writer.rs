@@ -15,12 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::INDEX_SIZE;
+use crate::IggyError;
 use compio::fs::File;
 use compio::fs::OpenOptions;
 use compio::io::AsyncWriteAtExt;
 use err_trail::ErrContext;
-use crate::INDEX_SIZE;
-use crate::IggyError;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::trace;

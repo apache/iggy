@@ -20,9 +20,9 @@ mod index_writer;
 mod messages_reader;
 mod messages_writer;
 
+use crate::{IggyError, IggyMessagesBatch};
 use bytes::Bytes;
 use compio::{fs::File, io::AsyncWriteAtExt};
-use crate::{IggyError, IggyMessagesBatch};
 use std::rc::Rc;
 use tracing::error;
 

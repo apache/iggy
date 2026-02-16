@@ -154,8 +154,6 @@ impl ConsensusHeader for GenericHeader {
     }
 }
 
-
-
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct RequestHeader {

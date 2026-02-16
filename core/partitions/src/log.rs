@@ -16,12 +16,12 @@
 // under the License.
 
 use iggy_common::{
-    IggyByteSize, IggyIndexesMut, IggyMessagesBatch, IggyMessagesBatchSetInFlight, INDEX_SIZE,
+    INDEX_SIZE, IggyByteSize, IggyIndexesMut, IggyMessagesBatch, IggyMessagesBatchSetInFlight,
     Segment, SegmentStorage,
 };
 use journal::{Journal, Storage};
 use ringbuffer::AllocRingBuffer;
-use std::{fmt::Debug};
+use std::fmt::Debug;
 
 const SEGMENTS_CAPACITY: usize = 1024;
 const ACCESS_MAP_CAPACITY: usize = 8;
@@ -50,30 +50,33 @@ pub struct JournalState<J> {
 }
 
 impl<J, S> Journal<S> for JournalState<J>
-where 
-S: Storage,
-J: Journal<S>
- {
+where
+    S: Storage,
+    J: Journal<S>,
+{
     type Header = J::Header;
     type Entry = J::Entry;
-    type HeaderRef<'a> = J::HeaderRef<'a> where Self: 'a;
- 
+    type HeaderRef<'a>
+        = J::HeaderRef<'a>
+    where
+        Self: 'a;
+
     fn header(&self, idx: usize) -> Option<Self::HeaderRef<'_>> {
         self.inner.header(idx)
     }
- 
+
     fn previous_header(&self, header: &Self::Header) -> Option<Self::HeaderRef<'_>> {
         self.inner.previous_header(header)
     }
- 
+
     fn append(&self, entry: Self::Entry) -> impl Future<Output = ()> {
         self.inner.append(entry)
     }
- 
+
     fn entry(&self, header: &Self::Header) -> impl Future<Output = Option<Self::Entry>> {
         self.inner.entry(header)
     }
- }
+}
 
 impl<J: Default> Default for JournalState<J> {
     fn default() -> Self {
@@ -257,6 +260,3 @@ where
         &self.journal
     }
 }
-
-impl<J, S> Log for SegmentedLog<J, S> where S: Storage, J: Debug + Journal<S> {}
-pub trait Log {}

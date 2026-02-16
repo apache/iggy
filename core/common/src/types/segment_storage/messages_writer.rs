@@ -16,9 +16,9 @@
 // under the License.
 
 use super::write_batch_frozen;
+use crate::{IggyByteSize, IggyError, IggyMessagesBatch};
 use compio::fs::{File, OpenOptions};
 use err_trail::ErrContext;
-use crate::{IggyByteSize, IggyError, IggyMessagesBatch};
 use std::{
     rc::Rc,
     sync::atomic::{AtomicU64, Ordering},

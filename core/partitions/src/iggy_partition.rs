@@ -18,8 +18,8 @@
 use crate::journal::{Noop, PartitionJournal};
 use crate::log::SegmentedLog;
 use iggy_common::{ConsumerGroupOffsets, ConsumerOffsets, IggyTimestamp, PartitionStats};
-use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use tokio::sync::Mutex as TokioMutex;
 
 // This struct aliases in terms of the code contained the `LocalPartition from `core/server/src/streaming/partitions/local_partition.rs`.

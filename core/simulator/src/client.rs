@@ -90,7 +90,11 @@ impl SimClient {
         payload.extend_from_slice(&indexes);
         payload.extend_from_slice(&messages_buf);
 
-        self.build_request_with_namespace(Operation::SendMessages, bytes::Bytes::from(payload), namespace)
+        self.build_request_with_namespace(
+            Operation::SendMessages,
+            bytes::Bytes::from(payload),
+            namespace,
+        )
     }
 
     fn build_request_with_namespace(

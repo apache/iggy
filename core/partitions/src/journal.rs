@@ -129,9 +129,7 @@ impl PartitionJournal {
     pub fn get(&self, header: &MessageLookup) -> Option<IggyMessagesBatchSet> {
         let batch_set = unsafe { &*self.batch_set.get() };
         let result = match header {
-            MessageLookup::Offset { offset, count } => {
-                batch_set.get_by_offset(*offset, *count)
-            }
+            MessageLookup::Offset { offset, count } => batch_set.get_by_offset(*offset, *count),
             MessageLookup::Timestamp { timestamp, count } => {
                 batch_set.get_by_timestamp(*timestamp, *count)
             }

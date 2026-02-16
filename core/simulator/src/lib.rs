@@ -126,7 +126,8 @@ impl Simulator {
         if operation < 200 {
             self.dispatch_to_metadata_on_replica(replica, message).await;
         } else {
-            self.dispatch_to_partition_on_replica(replica, message).await;
+            self.dispatch_to_partition_on_replica(replica, message)
+                .await;
         }
     }
 

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::{IggyError, IggyIndex, IggyIndexView, IggyIndexesMut, INDEX_SIZE, PooledBuffer};
+use crate::{INDEX_SIZE, IggyError, IggyIndex, IggyIndexView, IggyIndexesMut, PooledBuffer};
 use bytes::BytesMut;
 use compio::{
     buf::{IntoInner, IoBuf},

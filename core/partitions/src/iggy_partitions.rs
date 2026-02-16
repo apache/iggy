@@ -17,12 +17,12 @@
 
 #![allow(dead_code)]
 
-use crate::types::PartitionsConfig;
 use crate::IggyPartition;
 use crate::Partitions;
+use crate::types::PartitionsConfig;
 use consensus::{Consensus, Project, Sequencer, Status, VsrConsensus};
 use iggy_common::{
-    IggyByteSize, IggyIndexesMut, IggyMessagesBatchMut, INDEX_SIZE, PartitionStats, PooledBuffer,
+    INDEX_SIZE, IggyByteSize, IggyIndexesMut, IggyMessagesBatchMut, PartitionStats, PooledBuffer,
     Segment, SegmentStorage,
     header::{Command2, GenericHeader, Operation, PrepareHeader, PrepareOkHeader, ReplyHeader},
     message::Message,
@@ -32,8 +32,8 @@ use journal::Journal as _;
 use message_bus::MessageBus;
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use tracing::{debug, warn};
 
 /// Per-shard collection of all partitions.
@@ -94,6 +94,8 @@ impl<C> IggyPartitions<C> {
         unsafe { &*self.partitions.get() }
     }
 
+    // TODO: Figure out better way to do this, maybe inline the mutable access to ignore the lint.
+    #[allow(clippy::mut_from_ref)]
     fn partitions_mut(&self) -> &mut Vec<IggyPartition> {
         // Safety: single-threaded per-shard model, no concurrent access.
         unsafe { &mut *self.partitions.get() }
@@ -181,10 +183,7 @@ impl<C> IggyPartitions<C> {
 
     /// Remove multiple partitions at once.
     pub fn remove_many(&mut self, namespaces: &[IggyNamespace]) -> Vec<IggyPartition> {
-        namespaces
-            .iter()
-            .filter_map(|ns| self.remove(ns))
-            .collect()
+        namespaces.iter().filter_map(|ns| self.remove(ns)).collect()
     }
 
     /// Iterate over all namespaces owned by this shard.
@@ -253,7 +252,9 @@ impl<C> IggyPartitions<C> {
         let mut partition = IggyPartition::new(stats.clone());
         partition.log.add_persisted_segment(segment, storage);
         partition.offset.store(start_offset, Ordering::Relaxed);
-        partition.dirty_offset.store(start_offset, Ordering::Relaxed);
+        partition
+            .dirty_offset
+            .store(start_offset, Ordering::Relaxed);
         partition.should_increment_offset = false;
         partition.stats.increment_segments_count(1);
 
@@ -314,14 +315,15 @@ impl<C> IggyPartitions<C> {
         let mut partition = IggyPartition::new(stats.clone());
         partition.log.add_persisted_segment(segment, storage);
         partition.offset.store(start_offset, Ordering::Relaxed);
-        partition.dirty_offset.store(start_offset, Ordering::Relaxed);
+        partition
+            .dirty_offset
+            .store(start_offset, Ordering::Relaxed);
         partition.should_increment_offset = false;
         partition.stats.increment_segments_count(1);
 
         // Insert and return local index
         self.insert(namespace, partition)
     }
-
 }
 
 impl<B> Partitions<VsrConsensus<B>> for IggyPartitions<VsrConsensus<B>>
@@ -383,7 +385,7 @@ where
             consensus.advance_commit_number(message.header().commit);
         }
 
-        // 
+        //
         assert_eq!(header.op, current_op + 1);
         consensus.sequencer().set_sequence(header.op);
 
@@ -485,10 +487,7 @@ where
             match prepare_header.operation {
                 Operation::SendMessages => {
                     self.commit_messages(&namespace).await;
-                    debug!(
-                        "on_ack: messages committed for op={}",
-                        prepare_header.op,
-                    );
+                    debug!("on_ack: messages committed for op={}", prepare_header.op,);
                 }
                 Operation::StoreConsumerOffset => {
                     // TODO: Commit consumer offset update.
@@ -631,10 +630,10 @@ where
         journal.info.messages_count += batch_messages_count;
         journal.info.size += IggyByteSize::from(batch_messages_size as u64);
         journal.info.current_offset = last_dirty_offset;
-        if let Some(ts) = batch.first_timestamp() {
-            if journal.info.first_timestamp == 0 {
-                journal.info.first_timestamp = ts;
-            }
+        if let Some(ts) = batch.first_timestamp()
+            && journal.info.first_timestamp == 0
+        {
+            journal.info.first_timestamp = ts;
         }
         if let Some(ts) = batch.last_timestamp() {
             journal.info.end_timestamp = ts;
@@ -807,9 +806,7 @@ where
             .get_mut_by_ns(namespace)
             .expect("commit_messages: partition not found");
         let committed_offset = journal_info.current_offset;
-        partition
-            .offset
-            .store(committed_offset, Ordering::Relaxed);
+        partition.offset.store(committed_offset, Ordering::Relaxed);
         partition.stats.set_current_offset(committed_offset);
     }
 
@@ -871,12 +868,7 @@ where
             .await
             .expect("persist: failed to save indexes");
 
-        debug!(
-            ?namespace,
-            batch_count,
-            ?saved,
-            "persisted batches to disk"
-        );
+        debug!(?namespace, batch_count, ?saved, "persisted batches to disk");
 
         let partition = self
             .get_mut_by_ns(namespace)
@@ -951,11 +943,7 @@ where
         partition.log.add_persisted_segment(segment, storage);
         partition.stats.increment_segments_count(1);
 
-        debug!(
-            ?namespace,
-            start_offset,
-            "rotated to new segment"
-        );
+        debug!(?namespace, start_offset, "rotated to new segment");
     }
 
     /// Send a prepare_ok message to the primary.
