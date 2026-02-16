@@ -26,6 +26,6 @@ class ConsumerGroupsHttpClientTest extends ConsumerGroupsClientBaseTest {
 
     @Override
     protected IggyBaseClient getClient() {
-        return HttpClientFactory.create(iggyServer);
+        return HttpClientFactory.create(serverHost(), serverHttpPort());
     }
 }
