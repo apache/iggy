@@ -385,8 +385,8 @@ where
             consensus.advance_commit_number(message.header().commit);
         }
 
-        //
-        assert_eq!(header.op, current_op + 1);
+        // TODO: Make those assertions be toggleable through an feature flag, so they can be used only by simulator/tests.
+        debug_assert_eq!(header.op, current_op + 1);
         consensus.sequencer().set_sequence(header.op);
 
         // TODO: Figure out the flow of the partition operations.
