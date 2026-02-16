@@ -21,6 +21,7 @@ package org.apache.iggy.client;
 
 import com.github.dockerjava.api.model.Capability;
 import com.github.dockerjava.api.model.Ulimit;
+import io.netty.util.ResourceLeakDetector;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.slf4j.Logger;
@@ -55,6 +56,7 @@ public abstract class BaseIntegrationTest {
 
     @BeforeAll
     static void setupContainer() {
+        ResourceLeakDetector.setLevel(ResourceLeakDetector.Level.PARANOID);
         if (!USE_EXTERNAL_SERVER) {
             log.info("Starting Iggy Server Container...");
             iggyServer = new GenericContainer<>(DockerImageName.parse("apache/iggy:edge"))
