@@ -20,7 +20,7 @@ use consensus::{
     Consensus, Pipeline, PipelineEntry, Plane, Project, Sequencer, VsrConsensus, ack_preflight,
     ack_quorum_reached, build_reply_message, fence_old_prepare_by_commit,
     panic_if_hash_chain_would_break_in_same_view, pipeline_prepare_common, replicate_preflight,
-    send_prepare_ok as send_prepare_ok_common,
+    replicate_to_next_in_chain, send_prepare_ok as send_prepare_ok_common,
 };
 use iggy_common::{
     header::{Command2, GenericHeader, PrepareHeader},
@@ -271,35 +271,7 @@ where
             journal.handle().header(idx).is_none(),
             "replicate: must not already have prepare"
         );
-        assert!(header.op > consensus.commit());
-
-        let next = (consensus.replica() + 1) % consensus.replica_count();
-
-        let primary = consensus.primary_index(header.view);
-        if next == primary {
-            debug!(
-                replica = consensus.replica(),
-                op = header.op,
-                "replicate: not replicating (ring complete)"
-            );
-            return;
-        }
-
-        assert_ne!(next, consensus.replica());
-
-        debug!(
-            replica = consensus.replica(),
-            to = next,
-            op = header.op,
-            "replicate: forwarding"
-        );
-
-        let message = message.into_generic();
-        consensus
-            .message_bus()
-            .send_to_replica(next, message)
-            .await
-            .unwrap();
+        replicate_to_next_in_chain(consensus, message).await;
     }
 
     // TODO: Implement jump_to_newer_op

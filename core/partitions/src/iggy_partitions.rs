@@ -23,12 +23,12 @@ use crate::types::PartitionsConfig;
 use consensus::{
     Consensus, PipelineEntry, Plane, Project, Sequencer, VsrConsensus, ack_preflight,
     ack_quorum_reached, build_reply_message, fence_old_prepare_by_commit, pipeline_prepare_common,
-    replicate_preflight, send_prepare_ok as send_prepare_ok_common,
+    replicate_preflight, replicate_to_next_in_chain, send_prepare_ok as send_prepare_ok_common,
 };
 use iggy_common::{
     INDEX_SIZE, IggyByteSize, IggyIndexesMut, IggyMessagesBatchMut, PartitionStats, PooledBuffer,
     Segment, SegmentStorage,
-    header::{Command2, GenericHeader, Operation, PrepareHeader},
+    header::{GenericHeader, Operation, PrepareHeader},
     message::Message,
     sharding::{IggyNamespace, LocalIdx, ShardId},
 };
@@ -558,39 +558,7 @@ where
     /// - Stops when we would forward back to primary
     async fn replicate(&self, message: Message<PrepareHeader>) {
         let consensus = self.consensus.as_ref().unwrap();
-
-        let header = message.header();
-
-        assert_eq!(header.command, Command2::Prepare);
-        assert!(header.op > consensus.commit());
-
-        let next = (consensus.replica() + 1) % consensus.replica_count();
-
-        let primary = consensus.primary_index(header.view);
-        if next == primary {
-            debug!(
-                replica = consensus.replica(),
-                op = header.op,
-                "replicate: not replicating (ring complete)"
-            );
-            return;
-        }
-
-        assert_ne!(next, consensus.replica());
-
-        debug!(
-            replica = consensus.replica(),
-            to = next,
-            op = header.op,
-            "replicate: forwarding"
-        );
-
-        let message = message.into_generic();
-        consensus
-            .message_bus()
-            .send_to_replica(next, message)
-            .await
-            .unwrap();
+        replicate_to_next_in_chain(consensus, message).await;
     }
 
     fn commit_journal(&self) {

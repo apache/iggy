@@ -55,6 +55,35 @@ where
     header.op <= consensus.commit()
 }
 
+/// Shared chain-replication forwarding to the next replica.
+pub async fn replicate_to_next_in_chain<B, P>(
+    consensus: &VsrConsensus<B, P>,
+    message: Message<PrepareHeader>,
+) where
+    B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
+    P: Pipeline<Message = Message<PrepareHeader>, Entry = PipelineEntry>,
+{
+    let header = message.header();
+
+    assert_eq!(header.command, Command2::Prepare);
+    assert!(header.op > consensus.commit());
+
+    let next = (consensus.replica() + 1) % consensus.replica_count();
+    let primary = consensus.primary_index(header.view);
+
+    if next == primary {
+        return;
+    }
+
+    assert_ne!(next, consensus.replica());
+
+    consensus
+        .message_bus()
+        .send_to_replica(next, message.into_generic())
+        .await
+        .unwrap();
+}
+
 /// Shared preflight checks for `on_replicate`.
 ///
 /// Returns current op on success.
