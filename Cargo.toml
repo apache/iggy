@@ -319,7 +319,7 @@ web-sys = { version = "0.3", features = [
 webpki-roots = "1.0.6"
 yew = { version = "0.22", features = ["csr"] }
 yew-router = "0.19"
-zip = { version = "7.4.0", default-features = false, features = ["deflate"] }
+zip = { version = "8.0.0", default-features = false, features = ["deflate"] }
 
 [profile.release]
 lto = true
