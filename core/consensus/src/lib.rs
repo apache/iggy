@@ -63,6 +63,7 @@ pub trait Consensus: Sized {
     fn post_replicate_verify(&self, message: &Self::ReplicateMessage);
 
     fn is_follower(&self) -> bool;
+    fn is_normal(&self) -> bool;
     fn is_syncing(&self) -> bool;
 }
 
@@ -83,6 +84,8 @@ where
 
 mod impls;
 pub use impls::*;
+mod plane_helpers;
+pub use plane_helpers::*;
 
 mod view_change_quorum;
 pub use view_change_quorum::*;

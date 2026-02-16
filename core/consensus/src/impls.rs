@@ -1213,6 +1213,10 @@ where
         !self.is_primary()
     }
 
+    fn is_normal(&self) -> bool {
+        self.status() == Status::Normal
+    }
+
     fn is_syncing(&self) -> bool {
         self.is_syncing()
     }
