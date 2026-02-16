@@ -102,6 +102,11 @@ impl StateProvider for FileStateProvider {
             Error::CannotWriteStateFile
         })?;
 
+        file.sync_all().await.map_err(|error| {
+            error!("Cannot sync state file: {}. {error}.", self.path);
+            Error::CannotWriteStateFile
+        })?;
+
         debug!("Saved state file: {}", self.path);
         Ok(())
     }
