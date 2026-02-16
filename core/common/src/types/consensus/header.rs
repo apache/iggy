@@ -18,10 +18,10 @@
 use bytemuck::{Pod, Zeroable};
 use thiserror::Error;
 
-pub struct Header {}
-
+const HEADER_SIZE: usize = 256;
 pub trait ConsensusHeader: Sized + Pod + Zeroable {
     const COMMAND: Command2;
+    const _SIZE_CHECK: () = assert!(std::mem::size_of::<Self>() == HEADER_SIZE);
 
     fn validate(&self) -> Result<(), ConsensusError>;
     fn size(&self) -> u32;
@@ -115,6 +115,10 @@ pub enum Operation {
     CreatePersonalAccessToken = 146,
     DeletePersonalAccessToken = 147,
 
+    // Partition operations (replicated via consensus)
+    SendMessages = 160,
+    StoreConsumerOffset = 161,
+
     Reserved = 200,
 }
 
@@ -125,15 +129,14 @@ pub struct GenericHeader {
     pub checksum_body: u128,
     pub cluster: u128,
     pub size: u32,
-    pub epoch: u32,
     pub view: u32,
     pub release: u32,
-    pub protocol: u16,
     pub command: Command2,
     pub replica: u8,
-    pub reserved_frame: [u8; 12],
+    pub reserved_frame: [u8; 66],
 
-    pub reserved_command: [u8; 128],
+    pub namespace: u64,
+    pub reserved_command: [u8; 120],
 }
 
 unsafe impl Pod for GenericHeader {}
@@ -158,42 +161,42 @@ pub struct RequestHeader {
     pub checksum_body: u128,
     pub cluster: u128,
     pub size: u32,
-    pub epoch: u32,
     pub view: u32,
     pub release: u32,
-    pub protocol: u16,
     pub command: Command2,
     pub replica: u8,
-    pub reserved_frame: [u8; 12],
+    pub reserved_frame: [u8; 66],
 
     pub client: u128,
     pub request_checksum: u128,
     pub timestamp: u64,
     pub request: u64,
     pub operation: Operation,
-    pub reserved: [u8; 95],
+    pub operation_padding: [u8; 7],
+    pub namespace: u64,
+    pub reserved: [u8; 64],
 }
 
 impl Default for RequestHeader {
     fn default() -> Self {
         Self {
-            reserved: [0; 95],
             checksum: 0,
             checksum_body: 0,
             cluster: 0,
             size: 0,
-            epoch: 0,
             view: 0,
             release: 0,
-            protocol: 0,
             command: Default::default(),
             replica: 0,
-            reserved_frame: [0; 12],
+            reserved_frame: [0; 66],
             client: 0,
             request_checksum: 0,
             timestamp: 0,
             request: 0,
             operation: Default::default(),
+            operation_padding: [0; 7],
+            namespace: 0,
+            reserved: [0; 64],
         }
     }
 }
@@ -221,31 +224,29 @@ impl ConsensusHeader for RequestHeader {
 
 // TODO: Manually impl default (and use a const for the `release`)
 #[repr(C)]
-#[derive(Default, Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub struct PrepareHeader {
     pub checksum: u128,
     pub checksum_body: u128,
     pub cluster: u128,
     pub size: u32,
-    pub epoch: u32,
     pub view: u32,
     pub release: u32,
-    pub protocol: u16,
     pub command: Command2,
     pub replica: u8,
-    pub reserved_frame: [u8; 12],
+    pub reserved_frame: [u8; 66],
 
     pub client: u128,
     pub parent: u128,
-    pub parent_padding: u128,
     pub request_checksum: u128,
-    pub request_checksum_padding: u128,
     pub op: u64,
     pub commit: u64,
     pub timestamp: u64,
     pub request: u64,
     pub operation: Operation,
-    pub reserved: [u8; 19],
+    pub operation_padding: [u8; 7],
+    pub namespace: u64,
+    pub reserved: [u8; 32],
 }
 
 unsafe impl Pod for PrepareHeader {}
@@ -261,12 +262,6 @@ impl ConsensusHeader for PrepareHeader {
                 found: self.command,
             });
         }
-        if self.parent_padding != 0 {
-            return Err(ConsensusError::PrepareParentPaddingNonZero);
-        }
-        if self.request_checksum_padding != 0 {
-            return Err(ConsensusError::PrepareRequestChecksumPaddingNonZero);
-        }
         Ok(())
     }
 
@@ -275,32 +270,57 @@ impl ConsensusHeader for PrepareHeader {
     }
 }
 
+impl Default for PrepareHeader {
+    fn default() -> Self {
+        Self {
+            checksum: 0,
+            checksum_body: 0,
+            cluster: 0,
+            size: 0,
+            view: 0,
+            release: 0,
+            command: Default::default(),
+            replica: 0,
+            reserved_frame: [0; 66],
+            client: 0,
+            parent: 0,
+            request_checksum: 0,
+            op: 0,
+            commit: 0,
+            timestamp: 0,
+            request: 0,
+            operation: Default::default(),
+            operation_padding: [0; 7],
+            namespace: 0,
+            reserved: [0; 32],
+        }
+    }
+}
+
 // TODO: Manually impl default (and use a const for the `release`)
 #[repr(C)]
-#[derive(Default, Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub struct PrepareOkHeader {
     pub checksum: u128,
     pub checksum_body: u128,
     pub cluster: u128,
     pub size: u32,
-    pub epoch: u32,
     pub view: u32,
     pub release: u32,
-    pub protocol: u16,
     pub command: Command2,
     pub replica: u8,
-    pub reserved_frame: [u8; 12],
+    pub reserved_frame: [u8; 66],
 
     pub parent: u128,
-    pub parent_padding: u128,
     pub prepare_checksum: u128,
-    pub prepare_checksum_padding: u128,
     pub op: u64,
     pub commit: u64,
     pub timestamp: u64,
     pub request: u64,
     pub operation: Operation,
-    pub reserved: [u8; 19],
+    pub operation_padding: [u8; 7],
+    pub namespace: u64,
+    pub reserved: [u8; 48],
 }
 
 unsafe impl Pod for PrepareOkHeader {}
@@ -316,17 +336,37 @@ impl ConsensusHeader for PrepareOkHeader {
                 found: self.command,
             });
         }
-        if self.parent_padding != 0 {
-            return Err(ConsensusError::PrepareParentPaddingNonZero);
-        }
-        if self.prepare_checksum_padding != 0 {
-            return Err(ConsensusError::PrepareRequestChecksumPaddingNonZero);
-        }
         Ok(())
     }
 
     fn size(&self) -> u32 {
         self.size
+    }
+}
+
+impl Default for PrepareOkHeader {
+    fn default() -> Self {
+        Self {
+            checksum: 0,
+            checksum_body: 0,
+            cluster: 0,
+            size: 0,
+            view: 0,
+            release: 0,
+            command: Default::default(),
+            replica: 0,
+            reserved_frame: [0; 66],
+            parent: 0,
+            prepare_checksum: 0,
+            op: 0,
+            commit: 0,
+            timestamp: 0,
+            request: 0,
+            operation: Default::default(),
+            operation_padding: [0; 7],
+            namespace: 0,
+            reserved: [0; 48],
+        }
     }
 }
 
@@ -337,19 +377,18 @@ pub struct CommitHeader {
     pub checksum_body: u128,
     pub cluster: u128,
     pub size: u32,
-    pub epoch: u32,
     pub view: u32,
     pub release: u32,
-    pub protocol: u16,
     pub command: Command2,
     pub replica: u8,
-    pub reserved_frame: [u8; 12],
+    pub reserved_frame: [u8; 66],
 
     pub commit_checksum: u128,
     pub timestamp_monotonic: u64,
     pub commit: u64,
     pub checkpoint_op: u64,
-    pub reserved: [u8; 96],
+    pub namespace: u64,
+    pub reserved: [u8; 80],
 }
 
 unsafe impl Pod for CommitHeader {}
@@ -374,30 +413,28 @@ impl ConsensusHeader for CommitHeader {
 }
 
 #[repr(C)]
-#[derive(Default, Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub struct ReplyHeader {
     pub checksum: u128,
     pub checksum_body: u128,
     pub cluster: u128,
     pub size: u32,
-    pub epoch: u32,
     pub view: u32,
     pub release: u32,
-    pub protocol: u16,
     pub command: Command2,
     pub replica: u8,
-    pub reserved_frame: [u8; 12],
+    pub reserved_frame: [u8; 66],
 
     pub request_checksum: u128,
-    pub request_checksum_padding: u128,
     pub context: u128,
-    pub context_padding: u128,
     pub op: u64,
     pub commit: u64,
     pub timestamp: u64,
     pub request: u64,
     pub operation: Operation,
-    pub reserved: [u8; 19],
+    pub operation_padding: [u8; 7],
+    pub namespace: u64,
+    pub reserved: [u8; 41],
 }
 
 unsafe impl Pod for ReplyHeader {}
@@ -410,17 +447,37 @@ impl ConsensusHeader for ReplyHeader {
         if self.command != Command2::Reply {
             return Err(ConsensusError::ReplyInvalidCommand2);
         }
-        if self.request_checksum_padding != 0 {
-            return Err(ConsensusError::ReplyRequestChecksumPaddingNonZero);
-        }
-        if self.context_padding != 0 {
-            return Err(ConsensusError::ReplyContextPaddingNonZero);
-        }
         Ok(())
     }
 
     fn size(&self) -> u32 {
         self.size
+    }
+}
+
+impl Default for ReplyHeader {
+    fn default() -> Self {
+        Self {
+            checksum: 0,
+            checksum_body: 0,
+            cluster: 0,
+            size: 0,
+            view: 0,
+            release: 0,
+            command: Default::default(),
+            replica: 0,
+            reserved_frame: [0; 66],
+            request_checksum: 0,
+            context: 0,
+            op: 0,
+            commit: 0,
+            timestamp: 0,
+            request: 0,
+            operation: Default::default(),
+            operation_padding: [0; 7],
+            namespace: 0,
+            reserved: [0; 41],
+        }
     }
 }
 
@@ -437,13 +494,11 @@ pub struct StartViewChangeHeader {
     pub checksum_body_padding: u128,
     pub cluster: u128,
     pub size: u32,
-    pub epoch: u32,
     pub view: u32,
     pub release: u32,
-    pub protocol: u16,
     pub command: Command2,
     pub replica: u8,
-    pub reserved_frame: [u8; 12],
+    pub reserved_frame: [u8; 42],
 
     pub reserved: [u8; 128],
 }
@@ -486,27 +541,22 @@ pub struct DoViewChangeHeader {
     pub checksum_body_padding: u128,
     pub cluster: u128,
     pub size: u32,
-    pub epoch: u32,
     pub view: u32,
     pub release: u32,
-    pub protocol: u16,
     pub command: Command2,
     pub replica: u8,
-    pub reserved_frame: [u8; 12],
+    pub reserved_frame: [u8; 42],
 
     /// The highest op-number in this replica's log.
     /// Used to select the most complete log when log_view values are equal.
     pub op: u64,
-
     /// The replica's commit number (highest committed op).
     /// The new primary sets its commit to max(commit) across all DVCs.
     pub commit: u64,
-
     /// The view number when this replica's status was last normal.
     /// This is the key field for log selection: the replica with the
     /// highest log_view has the most authoritative log.
     pub log_view: u32,
-
     pub reserved: [u8; 108],
 }
 
@@ -564,23 +614,19 @@ pub struct StartViewHeader {
     pub checksum_body_padding: u128,
     pub cluster: u128,
     pub size: u32,
-    pub epoch: u32,
     pub view: u32,
     pub release: u32,
-    pub protocol: u16,
     pub command: Command2,
     pub replica: u8,
-    pub reserved_frame: [u8; 12],
+    pub reserved_frame: [u8; 42],
 
     /// The op-number of the highest entry in the new primary's log.
     /// Backups set their op to this value.
     pub op: u64,
-
     /// The commit number.
     /// This is max(commit) from all DVCs received by the primary.
     /// Backups set their commit to this value.
     pub commit: u64,
-
     pub reserved: [u8; 112],
 }
 

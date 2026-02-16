@@ -16,17 +16,9 @@
  * under the License.
  */
 
+pub use iggy_common::ConsumerGroupId;
 use iggy_common::{IdKind, Identifier, calculate_32};
 use std::fmt::{Display, Formatter};
-
-#[derive(Debug, PartialEq, Eq, Hash, Copy, Clone)]
-pub struct ConsumerGroupId(pub usize);
-
-impl Display for ConsumerGroupId {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
 
 #[derive(Debug, PartialEq, Eq, Hash, Copy, Clone)]
 pub struct MemberId(pub usize);

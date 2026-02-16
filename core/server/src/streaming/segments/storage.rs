@@ -15,73 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use iggy_common::IggyError;
-use std::rc::Rc;
-use std::sync::atomic::AtomicU64;
+pub use iggy_common::SegmentStorage as Storage;
 
 use crate::configs::system::SystemConfig;
-use crate::streaming::segments::{
-    indexes::{IndexReader, IndexWriter},
-    messages::{MessagesReader, MessagesWriter},
-};
-
-unsafe impl Send for Storage {}
-
-#[derive(Debug, Clone)]
-pub struct Storage {
-    pub messages_writer: Option<Rc<MessagesWriter>>,
-    pub messages_reader: Option<Rc<MessagesReader>>,
-    pub index_writer: Option<Rc<IndexWriter>>,
-    pub index_reader: Option<Rc<IndexReader>>,
-}
-
-impl Storage {
-    pub async fn new(
-        messages_path: &str,
-        index_path: &str,
-        messages_size: u64,
-        indexes_size: u64,
-        log_fsync: bool,
-        index_fsync: bool,
-        file_exists: bool,
-    ) -> Result<Self, IggyError> {
-        let size = Rc::new(AtomicU64::new(messages_size));
-        let indexes_size = Rc::new(AtomicU64::new(indexes_size));
-        let messages_writer = Rc::new(
-            MessagesWriter::new(messages_path, size.clone(), log_fsync, file_exists).await?,
-        );
-
-        let index_writer = Rc::new(
-            IndexWriter::new(index_path, indexes_size.clone(), index_fsync, file_exists).await?,
-        );
-
-        if file_exists {
-            messages_writer.fsync().await?;
-            index_writer.fsync().await?;
-        }
-
-        let messages_reader = Rc::new(MessagesReader::new(messages_path, size).await?);
-        let index_reader = Rc::new(IndexReader::new(index_path, indexes_size).await?);
-        Ok(Self {
-            messages_writer: Some(messages_writer),
-            messages_reader: Some(messages_reader),
-            index_writer: Some(index_writer),
-            index_reader: Some(index_reader),
-        })
-    }
-
-    pub fn shutdown(&mut self) -> (Option<Rc<MessagesWriter>>, Option<Rc<IndexWriter>>) {
-        let messages_writer = self.messages_writer.take();
-        let index_writer = self.index_writer.take();
-        (messages_writer, index_writer)
-    }
-
-    pub fn segment_and_index_paths(&self) -> (Option<String>, Option<String>) {
-        let index_path = self.index_reader.as_ref().map(|reader| reader.path());
-        let segment_path = self.messages_reader.as_ref().map(|reader| reader.path());
-        (segment_path, index_path)
-    }
-}
+use iggy_common::IggyError;
 
 /// Creates a new storage for the specified partition with the given start offset
 pub async fn create_segment_storage(

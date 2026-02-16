@@ -25,16 +25,23 @@ use iggy_common::header::{GenericHeader, ReplyHeader};
 use iggy_common::message::{Message, MessageBag};
 use message_bus::MessageBus;
 use metadata::Metadata;
+use partitions::Partitions;
 use replica::Replica;
 use std::sync::Arc;
 
-#[derive(Debug)]
 pub struct Simulator {
     pub replicas: Vec<Replica>,
     pub message_bus: Arc<MemBus>,
 }
 
 impl Simulator {
+    /// Initialize a partition on all replicas (in-memory for simulation)
+    pub fn init_partition(&mut self, namespace: iggy_common::sharding::IggyNamespace) {
+        for replica in &mut self.replicas {
+            replica.partitions.init_partition_in_memory(namespace);
+        }
+    }
+
     pub fn new(replica_count: usize, clients: impl Iterator<Item = u128>) -> Self {
         let mut message_bus = MemBus::new();
         for client in clients {
@@ -119,7 +126,8 @@ impl Simulator {
         if operation < 200 {
             self.dispatch_to_metadata_on_replica(replica, message).await;
         } else {
-            self.dispatch_to_partition_on_replica(replica, message);
+            self.dispatch_to_partition_on_replica(replica, message)
+                .await;
         }
     }
 
@@ -137,28 +145,16 @@ impl Simulator {
         }
     }
 
-    fn dispatch_to_partition_on_replica(&self, replica: &Replica, message: MessageBag) {
+    async fn dispatch_to_partition_on_replica(&self, replica: &Replica, message: MessageBag) {
         match message {
             MessageBag::Request(request) => {
-                todo!(
-                    "dispatch request to partition replica {}: operation={:?}",
-                    replica.id,
-                    request.header().operation
-                );
+                replica.partitions.on_request(request).await;
             }
             MessageBag::Prepare(prepare) => {
-                todo!(
-                    "dispatch prepare to partition replica {}: operation={:?}",
-                    replica.id,
-                    prepare.header().operation
-                );
+                replica.partitions.on_replicate(prepare).await;
             }
             MessageBag::PrepareOk(prepare_ok) => {
-                todo!(
-                    "dispatch prepare_ok to partition replica {}: op={}",
-                    replica.id,
-                    prepare_ok.header().op
-                );
+                replica.partitions.on_ack(prepare_ok).await;
             }
         }
     }

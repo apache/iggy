@@ -16,11 +16,12 @@
 // under the License.
 
 use iggy_common::{
-    BytesSerializable, Identifier,
+    BytesSerializable, INDEX_SIZE, Identifier,
     create_stream::CreateStream,
     delete_stream::DeleteStream,
     header::{Operation, RequestHeader},
     message::Message,
+    sharding::IggyNamespace,
 };
 use std::cell::Cell;
 
@@ -62,6 +63,79 @@ impl SimClient {
         self.build_request(Operation::DeleteStream, payload)
     }
 
+    pub fn send_messages(
+        &self,
+        namespace: IggyNamespace,
+        messages: Vec<&[u8]>,
+    ) -> Message<RequestHeader> {
+        // Build batch: count | indexes | messages
+        let count = messages.len() as u32;
+        let mut indexes = Vec::with_capacity(count as usize * INDEX_SIZE);
+        let mut messages_buf = Vec::new();
+
+        let mut current_position = 0u32;
+        for msg in &messages {
+            // Write index: position (u32) + length (u32)
+            indexes.extend_from_slice(&current_position.to_le_bytes());
+            indexes.extend_from_slice(&(msg.len() as u32).to_le_bytes());
+
+            // Append message
+            messages_buf.extend_from_slice(msg);
+            current_position += msg.len() as u32;
+        }
+
+        // Build payload: count | indexes | messages
+        let mut payload = Vec::with_capacity(4 + indexes.len() + messages_buf.len());
+        payload.extend_from_slice(&count.to_le_bytes());
+        payload.extend_from_slice(&indexes);
+        payload.extend_from_slice(&messages_buf);
+
+        self.build_request_with_namespace(
+            Operation::SendMessages,
+            bytes::Bytes::from(payload),
+            namespace,
+        )
+    }
+
+    fn build_request_with_namespace(
+        &self,
+        operation: Operation,
+        payload: bytes::Bytes,
+        namespace: IggyNamespace,
+    ) -> Message<RequestHeader> {
+        use bytes::Bytes;
+
+        let header_size = std::mem::size_of::<RequestHeader>();
+        let total_size = header_size + payload.len();
+
+        let header = RequestHeader {
+            command: iggy_common::header::Command2::Request,
+            operation,
+            size: total_size as u32,
+            cluster: 0,
+            checksum: 0,
+            checksum_body: 0,
+            view: 0,
+            release: 0,
+            replica: 0,
+            reserved_frame: [0; 66],
+            client: self.client_id,
+            request_checksum: 0,
+            timestamp: 0,
+            request: self.next_request_number(),
+            namespace: namespace.inner(),
+            ..Default::default()
+        };
+
+        let header_bytes = bytemuck::bytes_of(&header);
+        let mut buffer = Vec::with_capacity(total_size);
+        buffer.extend_from_slice(header_bytes);
+        buffer.extend_from_slice(&payload);
+
+        Message::<RequestHeader>::from_bytes(Bytes::from(buffer))
+            .expect("failed to build request message")
+    }
+
     fn build_request(&self, operation: Operation, payload: bytes::Bytes) -> Message<RequestHeader> {
         use bytes::Bytes;
 
@@ -75,12 +149,10 @@ impl SimClient {
             cluster: 0, // TODO: Get from config
             checksum: 0,
             checksum_body: 0,
-            epoch: 0,
             view: 0,
             release: 0,
-            protocol: 0,
             replica: 0,
-            reserved_frame: [0; 12],
+            reserved_frame: [0; 66],
             client: self.client_id,
             request_checksum: 0,
             timestamp: 0, // TODO: Use actual timestamp
