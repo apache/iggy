@@ -22,6 +22,7 @@ use crate::metadata::{
 use crate::shard::transmission::message::{ResolvedPartition, ResolvedTopic};
 use crate::streaming::partitions::consumer_group_offsets::ConsumerGroupOffsets;
 use crate::streaming::partitions::consumer_offsets::ConsumerOffsets;
+use crate::streaming::polling_consumer::PollingConsumer;
 use crate::streaming::stats::{PartitionStats, StreamStats, TopicStats};
 use iggy_common::sharding::IggyNamespace;
 use iggy_common::{
@@ -252,43 +253,205 @@ impl Metadata {
         Some(current % partitions_count)
     }
 
-    pub fn get_next_member_partition_id(
+    /// Resolve consumer group partition under a single metadata read guard.
+    pub fn resolve_consumer_group_partition(
+        &self,
+        stream_id: StreamId,
+        topic_id: TopicId,
+        group_identifier: &Identifier,
+        client_id: u32,
+        explicit_partition_id: Option<u32>,
+        calculate_partition_id: bool,
+    ) -> Result<Option<(PollingConsumer, usize)>, IggyError> {
+        let metadata = self.load();
+
+        // Step 1: Resolve group ID
+        let group_id = {
+            let stream = metadata.streams.get(stream_id).ok_or_else(|| {
+                IggyError::ConsumerGroupIdNotFound(
+                    group_identifier.clone(),
+                    Identifier::numeric(topic_id as u32).unwrap(),
+                )
+            })?;
+            let topic = stream.topics.get(topic_id).ok_or_else(|| {
+                IggyError::ConsumerGroupIdNotFound(
+                    group_identifier.clone(),
+                    Identifier::numeric(topic_id as u32).unwrap(),
+                )
+            })?;
+            match group_identifier.kind {
+                IdKind::Numeric => {
+                    let gid = group_identifier.get_u32_value().map_err(|_| {
+                        IggyError::ConsumerGroupIdNotFound(
+                            group_identifier.clone(),
+                            Identifier::numeric(topic_id as u32).unwrap(),
+                        )
+                    })? as ConsumerGroupId;
+                    if topic.consumer_groups.get(gid).is_none() {
+                        return Err(IggyError::ConsumerGroupIdNotFound(
+                            group_identifier.clone(),
+                            Identifier::numeric(topic_id as u32).unwrap(),
+                        ));
+                    }
+                    gid
+                }
+                IdKind::String => {
+                    let name = group_identifier.get_cow_str_value().map_err(|_| {
+                        IggyError::ConsumerGroupIdNotFound(
+                            group_identifier.clone(),
+                            Identifier::numeric(topic_id as u32).unwrap(),
+                        )
+                    })?;
+                    *topic
+                        .consumer_group_index
+                        .get(name.as_ref())
+                        .ok_or_else(|| {
+                            IggyError::ConsumerGroupIdNotFound(
+                                group_identifier.clone(),
+                                Identifier::numeric(topic_id as u32).unwrap(),
+                            )
+                        })?
+                }
+            }
+        };
+
+        // Step 2: Find member by client_id (same read guard, same metadata snapshot)
+        let group = metadata
+            .streams
+            .get(stream_id)
+            .and_then(|s| s.topics.get(topic_id))
+            .and_then(|t| t.consumer_groups.get(group_id))
+            .ok_or_else(|| {
+                IggyError::ConsumerGroupIdNotFound(
+                    group_identifier.clone(),
+                    Identifier::numeric(topic_id as u32).unwrap(),
+                )
+            })?;
+
+        let (member_slab_id, member) = group
+            .members
+            .iter()
+            .find(|(_, m)| m.client_id == client_id)
+            .ok_or_else(|| {
+                IggyError::ConsumerGroupMemberNotFound(
+                    client_id,
+                    group_identifier.clone(),
+                    Identifier::numeric(topic_id as u32).unwrap(),
+                )
+            })?;
+
+        // Step 3a: If explicit partition_id provided, validate member owns it
+        if let Some(pid) = explicit_partition_id {
+            let pid_usize = pid as usize;
+            if !member.partitions.contains(&pid_usize) {
+                // Member doesn't own this partition — check if it's pending revocation
+                let is_pending = member
+                    .pending_revocations
+                    .iter()
+                    .any(|revocation| revocation.partition_id == pid_usize);
+                if !is_pending {
+                    return Ok(None);
+                }
+            }
+            return Ok(Some((
+                PollingConsumer::consumer_group(group_id, member_slab_id),
+                pid_usize,
+            )));
+        }
+
+        // Step 3b: Round-robin partition selection (same snapshot, no race)
+        if member.pending_revocations.is_empty() {
+            // Fast path
+            let partitions = &member.partitions;
+            let count = partitions.len();
+            if count == 0 {
+                return Ok(None);
+            }
+            let counter = &member.partition_index;
+            let partition_id = if calculate_partition_id {
+                let current = counter
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
+                        Some((c + 1) % count)
+                    })
+                    .unwrap();
+                partitions[current % count]
+            } else {
+                let current = counter.load(Ordering::Relaxed);
+                partitions[current % count]
+            };
+            return Ok(Some((
+                PollingConsumer::consumer_group(group_id, member_slab_id),
+                partition_id,
+            )));
+        }
+
+        // Slow path: skip revoked partitions
+        let effective_count = member.partitions.len() - member.pending_revocations.len();
+        if effective_count == 0 {
+            return Ok(None);
+        }
+
+        let counter = &member.partition_index;
+        let idx = if calculate_partition_id {
+            counter
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
+                    Some((c + 1) % effective_count)
+                })
+                .unwrap()
+                % effective_count
+        } else {
+            counter.load(Ordering::Relaxed) % effective_count
+        };
+
+        let mut seen = 0;
+        for &pid in &member.partitions {
+            let is_revoked = member
+                .pending_revocations
+                .iter()
+                .any(|revocation| revocation.partition_id == pid);
+            if is_revoked {
+                continue;
+            }
+            if seen == idx {
+                return Ok(Some((
+                    PollingConsumer::consumer_group(group_id, member_slab_id),
+                    pid,
+                )));
+            }
+            seen += 1;
+        }
+
+        Ok(None)
+    }
+
+    /// Record the last offset returned to a CG member during poll.
+    pub fn record_polled_offset(
         &self,
         stream_id: StreamId,
         topic_id: TopicId,
         group_id: ConsumerGroupId,
-        member_id: usize,
-        calculate: bool,
-    ) -> Option<PartitionId> {
+        partition_id: PartitionId,
+        offset: u64,
+    ) {
+        use crate::streaming::polling_consumer::ConsumerGroupId as CgIdNewtype;
+
         let metadata = self.load();
-        let member = metadata
+        if let Some(partition) = metadata
             .streams
-            .get(stream_id)?
-            .topics
-            .get(topic_id)?
-            .consumer_groups
-            .get(group_id)?
-            .members
-            .get(member_id)?;
-
-        let assigned_partitions = &member.partitions;
-        if assigned_partitions.is_empty() {
-            return None;
-        }
-
-        let partitions_count = assigned_partitions.len();
-        let counter = &member.partition_index;
-
-        if calculate {
-            let current = counter
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                    Some((current + 1) % partitions_count)
-                })
-                .unwrap();
-            Some(assigned_partitions[current % partitions_count])
-        } else {
-            let current = counter.load(Ordering::Relaxed);
-            Some(assigned_partitions[current % partitions_count])
+            .get(stream_id)
+            .and_then(|s| s.topics.get(topic_id))
+            .and_then(|t| t.partitions.get(partition_id))
+        {
+            let key = CgIdNewtype(group_id);
+            let guard = partition.last_polled_offsets.pin();
+            match guard.get(&key) {
+                Some(existing) => {
+                    existing.store(offset, Ordering::Release);
+                }
+                None => {
+                    guard.insert(key, Arc::new(std::sync::atomic::AtomicU64::new(offset)));
+                }
+            }
         }
     }
 

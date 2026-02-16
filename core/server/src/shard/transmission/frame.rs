@@ -94,6 +94,7 @@ pub enum ShardResponse {
     CreatePersonalAccessTokenResponse(PersonalAccessToken, String),
     DeletePersonalAccessTokenResponse,
     LeaveConsumerGroupMetadataOnlyResponse,
+    CompletePartitionRevocationResponse,
     PurgeStreamResponse,
     PurgeTopicResponse,
     ErrorResponse(IggyError),

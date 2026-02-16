@@ -17,4 +17,5 @@
  */
 
 mod verify_after_server_restart;
+mod verify_consumer_group_partition_assignment;
 mod verify_user_login_after_restart;
