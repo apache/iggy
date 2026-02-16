@@ -251,7 +251,11 @@ fn get_state_storage(state_path: &str, key: &str) -> StateStorage {
     StateStorage::File(FileStateProvider::new(path))
 }
 
-pub fn handle(sources: Vec<SourceConnectorWrapper>, context: Arc<RuntimeContext>) {
+pub fn handle(
+    sources: Vec<SourceConnectorWrapper>,
+    context: Arc<RuntimeContext>,
+) -> Vec<tokio::task::JoinHandle<()>> {
+    let mut handler_tasks = Vec::new();
     for source in sources {
         for plugin in source.plugins {
             let plugin_id = plugin.id;
@@ -275,7 +279,7 @@ pub fn handle(sources: Vec<SourceConnectorWrapper>, context: Arc<RuntimeContext>
             let (sender, receiver): (Sender<ProducedMessages>, Receiver<ProducedMessages>) =
                 flume::unbounded();
             SOURCE_SENDERS.insert(plugin_id, sender);
-            tokio::spawn(async move {
+            let handler_task = tokio::spawn(async move {
                 info!("Source connector with ID: {plugin_id} started.");
                 let Some(producer) = &plugin.producer else {
                     error!("Producer not initialized for source connector with ID: {plugin_id}");
@@ -421,8 +425,10 @@ pub fn handle(sources: Vec<SourceConnectorWrapper>, context: Arc<RuntimeContext>
                     )
                     .await;
             });
+            handler_tasks.push(handler_task);
         }
     }
+    handler_tasks
 }
 
 fn process_messages(
