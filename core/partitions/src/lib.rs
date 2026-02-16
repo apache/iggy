@@ -17,132 +17,32 @@
 
 mod iggy_partition;
 mod iggy_partitions;
+mod journal;
+mod log;
 mod types;
 
-use iggy_common::sharding::IggyNamespace;
+use consensus::Consensus;
 pub use iggy_partition::IggyPartition;
 pub use iggy_partitions::IggyPartitions;
-pub use types::{AppendResult, PartitionOffsets, PollingArgs, PollingConsumer, SendMessagesResult};
+pub use types::{
+    AppendResult, PartitionOffsets, PartitionsConfig, PollingArgs, PollingConsumer,
+    SendMessagesResult,
+};
 
-/// High-level partition operations for request handlers.
+// TODO: Figure out how this can be somehow merged with `Metadata` trait, in a sense, where the `Metadata` trait would be gone
+// and something more general purpose is put in the place.
+
+/// Consensus lifecycle for partition operations (mirrors `Metadata<C>`).
 ///
-/// This trait abstracts over both single-node vs clustered modes.
-///
-/// # Implementation:
-///
-/// ## Single-node:
-///
-/// ```text
-/// send_messages() ──► storage.append_prepared()
-///                           │
-///                           ▼
-///                     storage.advance_commit()
-///                           │
-///                           ▼
-///                     Return success
-/// ```
-///
-/// ## Clustered
-///
-/// ```text
-/// send_messages() ──► Create Prepare(messages)
-///                           │
-///                           ▼
-///                     Broadcast to replicas
-///                           │
-///                           ▼
-///                     Replicas: storage.append_prepared()
-///                           │
-///                           ▼
-///                     Wait for quorum PrepareOk
-///                           │
-///                           ▼
-///                     storage.advance_commit()
-///                           │
-///                           ▼
-///                     Return success
-/// ```
-pub trait Partitions {
-    /// The message batch type for write operations.
-    type MessageBatch;
-
-    /// The result type returned from poll operations.
-    type PollResult;
-
-    type Error;
-
-    /// Send messages to a partition.
-    ///
-    /// Messages are appended atomically as a batch with sequentially assigned
-    /// offsets. Returns only:
-    /// - Single-node: after durable local write (fsync)
-    /// - Clustered: after VSR quorum acknowledgment
-    fn send_messages(
-        &self,
-        namespace: IggyNamespace,
-        batch: Self::MessageBatch,
-    ) -> impl Future<Output = Result<SendMessagesResult, Self::Error>>;
-
-    /// Store consumer offset for progress tracking.
-    ///
-    /// Persists the consumer's position, enabling resumption after restarts.
-    fn store_consumer_offset(
-        &self,
-        consumer: PollingConsumer,
-        namespace: IggyNamespace,
-        offset: u64,
-    ) -> impl Future<Output = Result<(), Self::Error>>;
-
-    /// Poll messages from a partition.
-    ///
-    /// Returns only **committed** messages according to the polling strategy.
-    /// Messages that are prepared but not yet committed are not visible.
-    fn poll_messages(
-        &self,
-        consumer: PollingConsumer,
-        namespace: IggyNamespace,
-        args: PollingArgs,
-    ) -> impl Future<Output = Result<Self::PollResult, Self::Error>>;
-
-    /// Get stored consumer offset.
-    ///
-    /// Returns the last stored offset, or 0 if none exists.
-    fn get_consumer_offset(
-        &self,
-        consumer: PollingConsumer,
-        namespace: IggyNamespace,
-    ) -> impl Future<Output = Result<u64, Self::Error>>;
-
-    /// Get partition's current commit offset.
-    ///
-    /// Returns the highest committed offset (visible to consumers).
-    /// In clustered mode, may lag slightly behind the primary.
-    fn get_offset(
-        &self,
-        namespace: IggyNamespace,
-    ) -> impl Future<Output = Result<u64, Self::Error>>;
-
-    /// Initialize storage for a new partition.
-    ///
-    /// Sets up segments directory, initial segment, and offset tracking.
-    fn create_partition(
-        &self,
-        namespace: IggyNamespace,
-    ) -> impl Future<Output = Result<(), Self::Error>>;
-
-    /// Delete partition and all its data.
-    ///
-    /// Removes messages, segments, indexes, and consumer offsets.
-    fn delete_partition(
-        &self,
-        namespace: IggyNamespace,
-    ) -> impl Future<Output = Result<(), Self::Error>>;
-
-    /// Purge all messages, preserving partition structure.
-    ///
-    /// Resets offset to 0. Consumer offsets become invalid.
-    fn purge_partition(
-        &self,
-        namespace: IggyNamespace,
-    ) -> impl Future<Output = Result<(), Self::Error>>;
+/// Handles the VSR replication flow for partition writes:
+/// - `on_request`: Primary receives a client write, projects to Prepare, pipelines it
+/// - `on_replicate`: Replica receives Prepare, appends to journal, sends PrepareOk
+/// - `on_ack`: Primary receives PrepareOk, checks quorum, commits
+pub trait Partitions<C>
+where
+    C: Consensus,
+{
+    fn on_request(&self, message: C::RequestMessage) -> impl Future<Output = ()>;
+    fn on_replicate(&self, message: C::ReplicateMessage) -> impl Future<Output = ()>;
+    fn on_ack(&self, message: C::AckMessage) -> impl Future<Output = ()>;
 }

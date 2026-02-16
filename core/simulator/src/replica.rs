@@ -20,13 +20,15 @@ use crate::deps::{
     MemStorage, ReplicaPartitions, SimJournal, SimMetadata, SimMuxStateMachine, SimSnapshot,
 };
 use consensus::VsrConsensus;
+use iggy_common::IggyByteSize;
+use iggy_common::sharding::ShardId;
 use metadata::stm::consumer_group::{ConsumerGroups, ConsumerGroupsInner};
 use metadata::stm::stream::{Streams, StreamsInner};
 use metadata::stm::user::{Users, UsersInner};
 use metadata::{IggyMetadata, variadic};
+use partitions::PartitionsConfig;
 use std::sync::Arc;
 
-#[derive(Debug)]
 pub struct Replica {
     pub id: u8,
     pub name: String,
@@ -43,24 +45,52 @@ impl Replica {
         let mux = SimMuxStateMachine::new(variadic!(users, streams, consumer_groups));
 
         let cluster_id: u128 = 1; // TODO: Make configurable
-        let consensus = VsrConsensus::new(
+        let metadata_consensus = VsrConsensus::new(
             cluster_id,
             id,
             replica_count,
             SharedMemBus(Arc::clone(&bus)),
         );
-        consensus.init();
+        metadata_consensus.init();
+
+        // Create separate consensus instance for partitions
+        let partitions_consensus = VsrConsensus::new(
+            cluster_id,
+            id,
+            replica_count,
+            SharedMemBus(Arc::clone(&bus)),
+        );
+        partitions_consensus.init();
+
+        // Configure partitions
+        let partitions_config = PartitionsConfig {
+            messages_required_to_save: 1000,
+            size_of_messages_required_to_save: IggyByteSize::from(4 * 1024 * 1024),
+            enforce_fsync: false, // Disable fsync for simulation
+            segment_size: IggyByteSize::from(1024 * 1024 * 1024), // 1GB segments
+        };
+
+        // Only replica 0 gets consensus (primary shard for now)
+        let partitions = if id == 0 {
+            ReplicaPartitions::new(
+                ShardId::new(id as u16),
+                partitions_config,
+                Some(partitions_consensus),
+            )
+        } else {
+            ReplicaPartitions::new(ShardId::new(id as u16), partitions_config, None)
+        };
 
         Self {
             id,
             name,
             metadata: IggyMetadata {
-                consensus: Some(consensus),
+                consensus: Some(metadata_consensus),
                 journal: Some(SimJournal::<MemStorage>::default()),
                 snapshot: Some(SimSnapshot::default()),
                 mux_stm: mux,
             },
-            partitions: ReplicaPartitions::default(),
+            partitions,
             bus,
         }
     }

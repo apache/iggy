@@ -15,17 +15,20 @@
 // specific language governing permissions and limitations
 // under the License.
 
-// TODO: We already have a `Journal` trait inside of the `storage` module `journal.rs` file.
-// But the interface was designed for partition log, not an generic journal.
+use std::ops::Deref;
+
 pub trait Journal<S>
 where
     S: Storage,
 {
     type Header;
     type Entry;
+    type HeaderRef<'a>: Deref<Target = Self::Header>
+    where
+        Self: 'a;
 
-    fn header(&self, idx: usize) -> Option<&Self::Header>;
-    fn previous_header(&self, header: &Self::Header) -> Option<&Self::Header>;
+    fn header(&self, idx: usize) -> Option<Self::HeaderRef<'_>>;
+    fn previous_header(&self, header: &Self::Header) -> Option<Self::HeaderRef<'_>>;
 
     fn append(&self, entry: Self::Entry) -> impl Future<Output = ()>;
     fn entry(&self, header: &Self::Header) -> impl Future<Output = Option<Self::Entry>>;
