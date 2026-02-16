@@ -15,24 +15,19 @@
 // specific language governing permissions and limitations
 // under the License.
 
-package tcp_test
+package tcp
 
-import (
-	iggcon "github.com/apache/iggy/foreign/go/contracts"
-	"github.com/onsi/ginkgo/v2"
-	"github.com/onsi/gomega"
-)
+import iggcon "github.com/apache/iggy/foreign/go/contracts"
 
-func itShouldHaveExpectedNumberOfPartitions(streamId uint32, topicId uint32, expectedPartitions uint32, client iggcon.Client) {
-	streamIdentifier, _ := iggcon.NewIdentifier(streamId)
-	topicIdentifier, _ := iggcon.NewIdentifier(topicId)
-	topic, err := client.GetTopic(streamIdentifier, topicIdentifier)
-
-	ginkgo.It("should have "+string(rune(expectedPartitions))+" partitions", func() {
-		gomega.Expect(topic).NotTo(gomega.BeNil())
-		gomega.Expect(topic.PartitionsCount).To(gomega.Equal(expectedPartitions))
-		gomega.Expect(len(topic.Partitions)).To(gomega.Equal(int(expectedPartitions)))
-	})
-
-	itShouldNotReturnError(err)
+func (c *IggyTcpClient) GetClusterMetadata() (*iggcon.ClusterMetadata, error) {
+	response, err := c.do(&iggcon.GetClusterMetadata{})
+	if err != nil {
+		return nil, err
+	}
+	var metadata iggcon.ClusterMetadata
+	err = metadata.UnmarshalBinary(response)
+	if err != nil {
+		return nil, err
+	}
+	return &metadata, nil
 }

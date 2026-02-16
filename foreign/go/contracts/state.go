@@ -15,24 +15,34 @@
 // specific language governing permissions and limitations
 // under the License.
 
-package tcp_test
+package iggcon
 
-import (
-	iggcon "github.com/apache/iggy/foreign/go/contracts"
-	"github.com/onsi/ginkgo/v2"
-	"github.com/onsi/gomega"
+type State uint8
+
+const (
+	StateShutdown State = iota
+	StateDisconnected
+	StateConnecting
+	StateConnected
+	StateAuthenticating
+	StateAuthenticated
 )
 
-func itShouldHaveExpectedNumberOfPartitions(streamId uint32, topicId uint32, expectedPartitions uint32, client iggcon.Client) {
-	streamIdentifier, _ := iggcon.NewIdentifier(streamId)
-	topicIdentifier, _ := iggcon.NewIdentifier(topicId)
-	topic, err := client.GetTopic(streamIdentifier, topicIdentifier)
-
-	ginkgo.It("should have "+string(rune(expectedPartitions))+" partitions", func() {
-		gomega.Expect(topic).NotTo(gomega.BeNil())
-		gomega.Expect(topic.PartitionsCount).To(gomega.Equal(expectedPartitions))
-		gomega.Expect(len(topic.Partitions)).To(gomega.Equal(int(expectedPartitions)))
-	})
-
-	itShouldNotReturnError(err)
+func (s State) String() string {
+	switch s {
+	case StateShutdown:
+		return "shutdown"
+	case StateDisconnected:
+		return "disconnected"
+	case StateConnecting:
+		return "connecting"
+	case StateConnected:
+		return "connected"
+	case StateAuthenticating:
+		return "authenticating"
+	case StateAuthenticated:
+		return "authenticated"
+	default:
+		return "unknown"
+	}
 }
