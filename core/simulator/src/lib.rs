@@ -21,11 +21,10 @@ pub mod deps;
 pub mod replica;
 
 use bus::MemBus;
+use consensus::Plane;
 use iggy_common::header::{GenericHeader, ReplyHeader};
 use iggy_common::message::{Message, MessageBag};
 use message_bus::MessageBus;
-use metadata::Metadata;
-use partitions::Partitions;
 use replica::Replica;
 use std::sync::Arc;
 
