@@ -234,7 +234,7 @@ reqwest = { version = "0.12.28", default-features = false, features = [
     "json",
     "rustls-tls",
 ] }
-reqwest-middleware = { version = "0.4.2", features = ["json"] }
+reqwest-middleware = { version = "0.5.1", features = ["json"] }
 reqwest-retry = "0.8.0"
 reqwest-tracing = "0.5.8"
 ring = "0.17.14"
