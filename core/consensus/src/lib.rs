@@ -66,6 +66,21 @@ pub trait Consensus: Sized {
     fn is_syncing(&self) -> bool;
 }
 
+/// Shared consensus lifecycle interface for control/data planes.
+///
+/// This abstracts the VSR message flow:
+/// - request -> prepare
+/// - replicate (prepare)
+/// - ack (prepare_ok)
+pub trait Plane<C>
+where
+    C: Consensus,
+{
+    fn on_request(&self, message: C::RequestMessage) -> impl Future<Output = ()>;
+    fn on_replicate(&self, message: C::ReplicateMessage) -> impl Future<Output = ()>;
+    fn on_ack(&self, message: C::AckMessage) -> impl Future<Output = ()>;
+}
+
 mod impls;
 pub use impls::*;
 

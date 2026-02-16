@@ -21,7 +21,7 @@ mod journal;
 mod log;
 mod types;
 
-use consensus::Consensus;
+use iggy_common::{IggyError, IggyMessagesBatchMut, IggyMessagesBatchSet};
 pub use iggy_partition::IggyPartition;
 pub use iggy_partitions::IggyPartitions;
 pub use types::{
@@ -29,20 +29,40 @@ pub use types::{
     SendMessagesResult,
 };
 
-// TODO: Figure out how this can be somehow merged with `Metadata` trait, in a sense, where the `Metadata` trait would be gone
-// and something more general purpose is put in the place.
-
-/// Consensus lifecycle for partition operations (mirrors `Metadata<C>`).
+/// Partition-level data plane operations.
 ///
-/// Handles the VSR replication flow for partition writes:
-/// - `on_request`: Primary receives a client write, projects to Prepare, pipelines it
-/// - `on_replicate`: Replica receives Prepare, appends to journal, sends PrepareOk
-/// - `on_ack`: Primary receives PrepareOk, checks quorum, commits
-pub trait Partitions<C>
-where
-    C: Consensus,
-{
-    fn on_request(&self, message: C::RequestMessage) -> impl Future<Output = ()>;
-    fn on_replicate(&self, message: C::ReplicateMessage) -> impl Future<Output = ()>;
-    fn on_ack(&self, message: C::AckMessage) -> impl Future<Output = ()>;
+/// `send_messages` MUST only append to the partition journal (prepare phase),
+/// without committing/persisting to disk.
+pub trait Partition {
+    fn append_messages(
+        &mut self,
+        batch: IggyMessagesBatchMut,
+    ) -> impl Future<Output = Result<AppendResult, IggyError>>;
+
+    fn poll_messages(
+        &self,
+        consumer: PollingConsumer,
+        args: PollingArgs,
+    ) -> impl Future<Output = Result<IggyMessagesBatchSet, IggyError>> {
+        let _ = (consumer, args);
+        async { Err(IggyError::FeatureUnavailable) }
+    }
+
+    fn store_consumer_offset(
+        &self,
+        consumer: PollingConsumer,
+        offset: u64,
+    ) -> Result<(), IggyError> {
+        let _ = (consumer, offset);
+        Err(IggyError::FeatureUnavailable)
+    }
+
+    fn get_consumer_offset(&self, consumer: PollingConsumer) -> Option<u64> {
+        let _ = consumer;
+        None
+    }
+
+    fn offsets(&self) -> PartitionOffsets {
+        PartitionOffsets::default()
+    }
 }

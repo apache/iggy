@@ -18,9 +18,9 @@
 #![allow(dead_code)]
 
 use crate::IggyPartition;
-use crate::Partitions;
+use crate::Partition;
 use crate::types::PartitionsConfig;
-use consensus::{Consensus, Project, Sequencer, Status, VsrConsensus};
+use consensus::{Consensus, Plane, Project, Sequencer, Status, VsrConsensus};
 use iggy_common::{
     INDEX_SIZE, IggyByteSize, IggyIndexesMut, IggyMessagesBatchMut, PartitionStats, PooledBuffer,
     Segment, SegmentStorage,
@@ -28,7 +28,6 @@ use iggy_common::{
     message::Message,
     sharding::{IggyNamespace, LocalIdx, ShardId},
 };
-use journal::Journal as _;
 use message_bus::MessageBus;
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
@@ -326,7 +325,7 @@ impl<C> IggyPartitions<C> {
     }
 }
 
-impl<B> Partitions<VsrConsensus<B>> for IggyPartitions<VsrConsensus<B>>
+impl<B> Plane<VsrConsensus<B>> for IggyPartitions<VsrConsensus<B>>
 where
     B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
 {
@@ -393,36 +392,7 @@ where
         // In metadata layer we assume that when an `on_request` or `on_replicate` is called, it's called from correct shard.
         // I think we need to do the same here, which means that the code from below is unfallable, the partition should always exist by now!
         let namespace = IggyNamespace::from_raw(header.namespace);
-        match header.operation {
-            Operation::SendMessages => {
-                let body = message.body_bytes();
-                let batch = Self::batch_from_body(&body);
-                self.append_batch(&namespace, batch).await;
-                debug!(
-                    replica = consensus.replica(),
-                    op = header.op,
-                    ?namespace,
-                    "on_replicate: batch appended to partition journal"
-                );
-            }
-            Operation::StoreConsumerOffset => {
-                // TODO: Deserialize consumer offset from prepare body
-                // and store in partition's consumer_offsets.
-                debug!(
-                    replica = consensus.replica(),
-                    op = header.op,
-                    "on_replicate: consumer offset stored"
-                );
-            }
-            _ => {
-                warn!(
-                    replica = consensus.replica(),
-                    op = header.op,
-                    "on_replicate: unexpected operation {:?}",
-                    header.operation
-                );
-            }
-        }
+        self.apply_replicated_operation(&message, &namespace).await;
 
         // After successful journal write, send prepare_ok to primary.
         self.send_prepare_ok(header).await;
@@ -566,6 +536,51 @@ where
         IggyMessagesBatchMut::from_indexes_and_messages(indexes, messages)
     }
 
+    async fn apply_replicated_operation(
+        &self,
+        message: &Message<PrepareHeader>,
+        namespace: &IggyNamespace,
+    ) {
+        let consensus = self.consensus.as_ref().unwrap();
+        let header = message.header();
+
+        match header.operation {
+            Operation::SendMessages => {
+                let body = message.body_bytes();
+                self.append_send_messages_to_journal(namespace, body.as_ref())
+                    .await;
+                debug!(
+                    replica = consensus.replica(),
+                    op = header.op,
+                    ?namespace,
+                    "on_replicate: send_messages appended to partition journal"
+                );
+            }
+            Operation::StoreConsumerOffset => {
+                // TODO: Deserialize consumer offset from prepare body
+                // and store in partition's consumer_offsets.
+                debug!(
+                    replica = consensus.replica(),
+                    op = header.op,
+                    "on_replicate: consumer offset stored"
+                );
+            }
+            _ => {
+                warn!(
+                    replica = consensus.replica(),
+                    op = header.op,
+                    "on_replicate: unexpected operation {:?}",
+                    header.operation
+                );
+            }
+        }
+    }
+
+    async fn append_send_messages_to_journal(&self, namespace: &IggyNamespace, body: &[u8]) {
+        let batch = Self::batch_from_body(body);
+        self.append_messages_to_journal(namespace, batch).await;
+    }
+
     /// Append a batch to a partition's journal with offset assignment.
     ///
     /// Updates `segment.current_position` (logical position for indexing) but
@@ -574,71 +589,15 @@ where
     ///
     /// Uses `dirty_offset` for offset assignment so that multiple prepares
     /// can be pipelined before any commit.
-    async fn append_batch(&self, namespace: &IggyNamespace, mut batch: IggyMessagesBatchMut) {
+    async fn append_messages_to_journal(
+        &self,
+        namespace: &IggyNamespace,
+        batch: IggyMessagesBatchMut,
+    ) {
         let partition = self
             .get_mut_by_ns(namespace)
-            .expect("append_batch: partition not found for namespace");
-
-        if batch.count() == 0 {
-            return;
-        }
-
-        let dirty_offset = if partition.should_increment_offset {
-            partition.dirty_offset.load(Ordering::Relaxed) + 1
-        } else {
-            0
-        };
-
-        let segment = partition.log.active_segment();
-        let segment_start_offset = segment.start_offset;
-        let current_position = segment.current_position;
-
-        batch
-            .prepare_for_persistence(segment_start_offset, dirty_offset, current_position, None)
-            .await;
-
-        let batch_messages_count = batch.count();
-        let batch_messages_size = batch.size();
-
-        // Advance dirty offset (committed offset is advanced in on_ack).
-        let last_dirty_offset = if batch_messages_count == 0 {
-            dirty_offset
-        } else {
-            dirty_offset + batch_messages_count as u64 - 1
-        };
-
-        if partition.should_increment_offset {
-            partition
-                .dirty_offset
-                .store(last_dirty_offset, Ordering::Relaxed);
-        } else {
-            partition.should_increment_offset = true;
-            partition
-                .dirty_offset
-                .store(last_dirty_offset, Ordering::Relaxed);
-        }
-
-        // Update segment.current_position for next prepare_for_persistence call.
-        // This is the logical position (includes unflushed journal data).
-        // segment.size is only updated after actual persist (in persist_frozen_batches_to_disk).
-        let segment_index = partition.log.segments().len() - 1;
-        partition.log.segments_mut()[segment_index].current_position += batch_messages_size;
-
-        // Update journal tracking metadata.
-        let journal = partition.log.journal_mut();
-        journal.info.messages_count += batch_messages_count;
-        journal.info.size += IggyByteSize::from(batch_messages_size as u64);
-        journal.info.current_offset = last_dirty_offset;
-        if let Some(ts) = batch.first_timestamp()
-            && journal.info.first_timestamp == 0
-        {
-            journal.info.first_timestamp = ts;
-        }
-        if let Some(ts) = batch.last_timestamp() {
-            journal.info.end_timestamp = ts;
-        }
-
-        journal.inner.append(batch).await;
+            .expect("append_messages_to_journal: partition not found for namespace");
+        let _ = partition.append_messages(batch).await;
     }
 
     async fn pipeline_prepare(&self, prepare: Message<PrepareHeader>) {

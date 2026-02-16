@@ -16,7 +16,9 @@
 // under the License.
 use crate::stm::StateMachine;
 use crate::stm::snapshot::{FillSnapshot, MetadataSnapshot, Snapshot, SnapshotError};
-use consensus::{Consensus, Pipeline, PipelineEntry, Project, Sequencer, Status, VsrConsensus};
+use consensus::{
+    Consensus, Pipeline, PipelineEntry, Plane, Project, Sequencer, Status, VsrConsensus,
+};
 use iggy_common::{
     header::{Command2, GenericHeader, PrepareHeader, PrepareOkHeader, ReplyHeader},
     message::Message,
@@ -79,20 +81,6 @@ impl Snapshot for IggySnapshot {
     }
 }
 
-pub trait Metadata<C>
-where
-    C: Consensus,
-{
-    /// Handle a request message.
-    fn on_request(&self, message: C::RequestMessage) -> impl Future<Output = ()>;
-
-    /// Handle a replicate message (Prepare in VSR).
-    fn on_replicate(&self, message: C::ReplicateMessage) -> impl Future<Output = ()>;
-
-    /// Handle an ack message (PrepareOk in VSR).
-    fn on_ack(&self, message: C::AckMessage) -> impl Future<Output = ()>;
-}
-
 #[derive(Debug)]
 pub struct IggyMetadata<C, J, S, M> {
     /// Some on shard0, None on other shards
@@ -105,7 +93,7 @@ pub struct IggyMetadata<C, J, S, M> {
     pub mux_stm: M,
 }
 
-impl<B, P, J, S, M> Metadata<VsrConsensus<B, P>> for IggyMetadata<VsrConsensus<B, P>, J, S, M>
+impl<B, P, J, S, M> Plane<VsrConsensus<B, P>> for IggyMetadata<VsrConsensus<B, P>, J, S, M>
 where
     B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
     P: Pipeline<Message = Message<PrepareHeader>, Entry = PipelineEntry>,
