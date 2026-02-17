@@ -18,7 +18,7 @@
 [package]
 name = "iggy-bench-dashboard-server"
 license = "Apache-2.0"
-version = "0.5.1-edge.1"
+version = "0.6.0"
 edition = "2024"
 
 [dependencies]
