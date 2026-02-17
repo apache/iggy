@@ -18,7 +18,7 @@
 use bench_report::numeric_parameter::BenchmarkNumericParameter;
 use bytes::Bytes;
 use iggy::prelude::*;
-use rand::{Rng, distr::Alphanumeric};
+use rand::{RngExt, distr::Alphanumeric};
 
 pub struct BenchmarkMessagesBatch {
     pub messages: Vec<IggyMessage>,

@@ -21,6 +21,7 @@ use crate::http::error::CustomError;
 use crate::http::jwt::json_web_token::Identity;
 use crate::http::shared::AppState;
 use crate::shard::system::messages::PollingArgs;
+use crate::shard::transmission::message::ResolvedPartition;
 use crate::streaming::segments::{IggyIndexesMut, IggyMessagesBatchMut};
 use crate::streaming::session::Session;
 use axum::extract::{Path, Query, State};
@@ -131,17 +132,20 @@ async fn flush_unsaved_buffer(
     Extension(identity): Extension<Identity>,
     Path((stream_id, topic_id, partition_id, fsync)): Path<(String, String, u32, bool)>,
 ) -> Result<StatusCode, CustomError> {
-    let stream_id = Identifier::from_str_value(&stream_id)?;
-    let topic_id = Identifier::from_str_value(&topic_id)?;
+    let stream_id_ident = Identifier::from_str_value(&stream_id)?;
+    let topic_id_ident = Identifier::from_str_value(&topic_id)?;
     let partition_id = partition_id as usize;
 
-    let flush_future = SendWrapper::new(state.shard.shard().flush_unsaved_buffer(
-        identity.user_id,
-        stream_id,
-        topic_id,
+    let shard = state.shard.shard();
+    let topic = shard.resolve_topic(&stream_id_ident, &topic_id_ident)?;
+    let partition = ResolvedPartition {
+        stream_id: topic.stream_id,
+        topic_id: topic.topic_id,
         partition_id,
-        fsync,
-    ));
+    };
+
+    let flush_future =
+        SendWrapper::new(shard.flush_unsaved_buffer(identity.user_id, partition, fsync));
     flush_future.await?;
     Ok(StatusCode::OK)
 }

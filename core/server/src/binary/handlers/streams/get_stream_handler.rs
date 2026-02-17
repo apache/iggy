@@ -20,9 +20,9 @@ use crate::binary::command::{
     BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
 };
 use crate::binary::handlers::utils::receive_and_validate;
+use crate::binary::mapper;
 use crate::shard::IggyShard;
 use crate::streaming::session::Session;
-use err_trail::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::SenderKind;
 use iggy_common::get_stream::GetStream;
@@ -44,28 +44,15 @@ impl ServerCommandHandler for GetStream {
         debug!("session: {session}, command: {self}");
         shard.ensure_authenticated(session)?;
 
-        let Some(numeric_stream_id) = shard.metadata.get_stream_id(&self.stream_id) else {
+        let Some(stream) = shard
+            .metadata
+            .query_stream(session.get_user_id(), &self.stream_id)?
+        else {
             sender.send_empty_ok_response().await?;
             return Ok(HandlerResult::Finished);
         };
 
-        let has_permission = shard
-            .metadata
-            .perm_get_stream(session.get_user_id(), numeric_stream_id)
-            .error(|e: &IggyError| {
-                format!(
-                    "permission denied to get stream with ID: {} for user with ID: {}, error: {e}",
-                    self.stream_id,
-                    session.get_user_id(),
-                )
-            })
-            .is_ok();
-        if !has_permission {
-            sender.send_empty_ok_response().await?;
-            return Ok(HandlerResult::Finished);
-        }
-
-        let response = shard.get_stream_from_metadata(numeric_stream_id);
+        let response = mapper::map_stream(&stream);
         sender.send_ok_response(&response).await?;
         Ok(HandlerResult::Finished)
     }

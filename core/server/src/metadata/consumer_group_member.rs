@@ -19,12 +19,30 @@ use crate::metadata::{ClientId, ConsumerGroupMemberId, PartitionId};
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
+/// A partition pending cooperative revocation from this member to a target member.
+#[derive(Clone, Debug)]
+pub struct PendingRevocation {
+    pub partition_id: PartitionId,
+    pub target_slab_id: usize,
+    pub target_member_id: usize,
+    pub created_at_micros: u64,
+}
+
+/// A revocation that can be completed immediately (never polled or already committed).
+#[derive(Clone, Debug)]
+pub struct CompletableRevocation {
+    pub slab_id: usize,
+    pub member_id: usize,
+    pub partition_id: PartitionId,
+}
+
 #[derive(Clone, Debug)]
 pub struct ConsumerGroupMemberMeta {
     pub id: ConsumerGroupMemberId,
     pub client_id: ClientId,
     pub partitions: Vec<PartitionId>,
     pub partition_index: Arc<AtomicUsize>,
+    pub pending_revocations: Vec<PendingRevocation>,
 }
 
 impl ConsumerGroupMemberMeta {
@@ -34,6 +52,7 @@ impl ConsumerGroupMemberMeta {
             client_id,
             partitions: Vec::new(),
             partition_index: Arc::new(AtomicUsize::new(0)),
+            pending_revocations: Vec::new(),
         }
     }
 }

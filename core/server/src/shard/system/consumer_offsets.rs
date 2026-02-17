@@ -19,13 +19,16 @@
 use super::COMPONENT;
 use crate::{
     shard::IggyShard,
+    shard::transmission::message::{ResolvedTopic, ShardRequest, ShardRequestPayload},
     streaming::{
         partitions::consumer_offset::ConsumerOffset,
         polling_consumer::{ConsumerGroupId, PollingConsumer},
     },
 };
 use err_trail::ErrContext;
-use iggy_common::{Consumer, ConsumerKind, ConsumerOffsetInfo, Identifier, IggyError};
+use iggy_common::{
+    Consumer, ConsumerKind, ConsumerOffsetInfo, Identifier, IggyError, sharding::IggyNamespace,
+};
 use std::sync::atomic::Ordering;
 
 impl IggyShard {
@@ -33,16 +36,12 @@ impl IggyShard {
         &self,
         client_id: u32,
         consumer: Consumer,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
+        topic: ResolvedTopic,
         partition_id: Option<u32>,
         offset: u64,
     ) -> Result<(PollingConsumer, usize), IggyError> {
-        let (stream, topic) = self.resolve_topic_id(stream_id, topic_id)?;
-
         let Some((polling_consumer, partition_id)) = self.resolve_consumer_with_partition_id(
-            stream_id,
-            topic_id,
+            topic,
             &consumer,
             client_id,
             partition_id,
@@ -51,11 +50,41 @@ impl IggyShard {
         else {
             return Err(IggyError::NotResolvedConsumer(consumer.id));
         };
-        self.ensure_partition_exists(stream_id, topic_id, partition_id)?;
 
-        self.store_consumer_offset_base(stream, topic, &polling_consumer, partition_id, offset);
-        self.persist_consumer_offset_to_disk(stream, topic, &polling_consumer, partition_id)
-            .await?;
+        if !self
+            .metadata
+            .partition_exists(topic.stream_id, topic.topic_id, partition_id)
+        {
+            return Err(IggyError::PartitionNotFound(
+                partition_id,
+                Identifier::numeric(topic.topic_id as u32).expect("valid topic id"),
+                Identifier::numeric(topic.stream_id as u32).expect("valid stream id"),
+            ));
+        }
+
+        self.store_consumer_offset_base(
+            topic.stream_id,
+            topic.topic_id,
+            &polling_consumer,
+            partition_id,
+            offset,
+        );
+        self.persist_consumer_offset_to_disk(
+            topic.stream_id,
+            topic.topic_id,
+            &polling_consumer,
+            partition_id,
+        )
+        .await?;
+
+        self.maybe_complete_pending_revocation(
+            &polling_consumer,
+            topic.stream_id,
+            topic.topic_id,
+            partition_id,
+        )
+        .await;
+
         Ok((polling_consumer, partition_id))
     }
 
@@ -63,28 +92,54 @@ impl IggyShard {
         &self,
         client_id: u32,
         consumer: Consumer,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
+        topic: ResolvedTopic,
         partition_id: Option<u32>,
     ) -> Result<Option<ConsumerOffsetInfo>, IggyError> {
-        let (stream, topic) = self.resolve_topic_id(stream_id, topic_id)?;
-
-        let Some((polling_consumer, partition_id)) = self.resolve_consumer_with_partition_id(
-            stream_id,
-            topic_id,
-            &consumer,
-            client_id,
-            partition_id,
-            false,
-        )?
-        else {
-            return Err(IggyError::NotResolvedConsumer(consumer.id));
+        let (polling_consumer, partition_id) = match consumer.kind {
+            ConsumerKind::Consumer => {
+                let Some((polling_consumer, partition_id)) = self
+                    .resolve_consumer_with_partition_id(
+                        topic,
+                        &consumer,
+                        client_id,
+                        partition_id,
+                        false,
+                    )?
+                else {
+                    return Err(IggyError::NotResolvedConsumer(consumer.id.clone()));
+                };
+                (polling_consumer, partition_id)
+            }
+            ConsumerKind::ConsumerGroup => {
+                // Reading offsets doesn't require group membership — offsets are stored
+                // per consumer group (not per member), so any client can query the
+                // group's progress. Only store_consumer_offset enforces membership.
+                let cg_id = self
+                    .metadata
+                    .get_consumer_group_id(topic.stream_id, topic.topic_id, &consumer.id)
+                    .ok_or_else(|| {
+                        IggyError::ConsumerGroupIdNotFound(
+                            consumer.id.clone(),
+                            Identifier::numeric(topic.topic_id as u32).unwrap(),
+                        )
+                    })?;
+                let partition_id = partition_id.unwrap_or(0) as usize;
+                (PollingConsumer::consumer_group(cg_id, 0), partition_id)
+            }
         };
-        self.ensure_partition_exists(stream_id, topic_id, partition_id)?;
 
-        // Get the partition's current offset from stats (messages_count - 1, or 0 if empty)
-        use iggy_common::sharding::IggyNamespace;
-        let ns = IggyNamespace::new(stream, topic, partition_id);
+        if !self
+            .metadata
+            .partition_exists(topic.stream_id, topic.topic_id, partition_id)
+        {
+            return Err(IggyError::PartitionNotFound(
+                partition_id,
+                Identifier::numeric(topic.topic_id as u32).expect("valid topic id"),
+                Identifier::numeric(topic.stream_id as u32).expect("valid stream id"),
+            ));
+        }
+
+        let ns = IggyNamespace::new(topic.stream_id, topic.topic_id, partition_id);
         let partition_current_offset = self
             .metadata
             .get_partition_stats(&ns)
@@ -96,9 +151,11 @@ impl IggyShard {
 
         let offset = match polling_consumer {
             PollingConsumer::Consumer(id, _) => {
-                let offsets =
-                    self.metadata
-                        .get_partition_consumer_offsets(stream, topic, partition_id);
+                let offsets = self.metadata.get_partition_consumer_offsets(
+                    topic.stream_id,
+                    topic.topic_id,
+                    partition_id,
+                );
                 offsets.and_then(|co| {
                     let guard = co.pin();
                     guard.get(&id).map(|item| ConsumerOffsetInfo {
@@ -109,9 +166,11 @@ impl IggyShard {
                 })
             }
             PollingConsumer::ConsumerGroup(consumer_group_id, _) => {
-                let offsets =
-                    self.metadata
-                        .get_partition_consumer_group_offsets(stream, topic, partition_id);
+                let offsets = self.metadata.get_partition_consumer_group_offsets(
+                    topic.stream_id,
+                    topic.topic_id,
+                    partition_id,
+                );
                 offsets.and_then(|co| {
                     let guard = co.pin();
                     guard
@@ -131,15 +190,11 @@ impl IggyShard {
         &self,
         client_id: u32,
         consumer: Consumer,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
+        topic: ResolvedTopic,
         partition_id: Option<u32>,
     ) -> Result<(PollingConsumer, usize), IggyError> {
-        let (stream, topic) = self.resolve_topic_id(stream_id, topic_id)?;
-
         let Some((polling_consumer, partition_id)) = self.resolve_consumer_with_partition_id(
-            stream_id,
-            topic_id,
+            topic,
             &consumer,
             client_id,
             partition_id,
@@ -148,10 +203,24 @@ impl IggyShard {
         else {
             return Err(IggyError::NotResolvedConsumer(consumer.id));
         };
-        self.ensure_partition_exists(stream_id, topic_id, partition_id)?;
 
-        let path =
-            self.delete_consumer_offset_base(stream, topic, &polling_consumer, partition_id)?;
+        if !self
+            .metadata
+            .partition_exists(topic.stream_id, topic.topic_id, partition_id)
+        {
+            return Err(IggyError::PartitionNotFound(
+                partition_id,
+                Identifier::numeric(topic.topic_id as u32).expect("valid topic id"),
+                Identifier::numeric(topic.stream_id as u32).expect("valid stream id"),
+            ));
+        }
+
+        let path = self.delete_consumer_offset_base(
+            topic.stream_id,
+            topic.topic_id,
+            &polling_consumer,
+            partition_id,
+        )?;
         self.delete_consumer_offset_from_disk(&path).await?;
         Ok((polling_consumer, partition_id))
     }
@@ -159,16 +228,27 @@ impl IggyShard {
     pub async fn delete_consumer_group_offsets(
         &self,
         cg_id: ConsumerGroupId,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
+        stream_id: usize,
+        topic_id: usize,
         partition_ids: &[usize],
     ) -> Result<(), IggyError> {
-        let (stream, topic) = self.resolve_topic_id(stream_id, topic_id)?;
-
         for &partition_id in partition_ids {
-            let offsets =
-                self.metadata
-                    .get_partition_consumer_group_offsets(stream, topic, partition_id);
+            if !self
+                .metadata
+                .partition_exists(stream_id, topic_id, partition_id)
+            {
+                tracing::trace!(
+                    "{COMPONENT} - partition {partition_id} not found in stream {stream_id}/topic {topic_id}, skipping offset cleanup for consumer group {}",
+                    cg_id.0
+                );
+                continue;
+            }
+
+            let offsets = self.metadata.get_partition_consumer_group_offsets(
+                stream_id,
+                topic_id,
+                partition_id,
+            );
 
             let Some(offsets) = offsets else {
                 continue;
@@ -218,7 +298,7 @@ impl IggyShard {
                     let path = format!("{}/{}", dir_path, id);
                     ConsumerOffset::new(ConsumerKind::Consumer, *id as u32, offset, path)
                 });
-                entry.offset.store(offset, Ordering::Relaxed);
+                entry.offset.store(offset, Ordering::Release);
             }
             PollingConsumer::ConsumerGroup(cg_id, _) => {
                 let Some(offsets) = self.metadata.get_partition_consumer_group_offsets(
@@ -239,7 +319,7 @@ impl IggyShard {
                     let path = format!("{}/{}", dir_path, cg_id.0);
                     ConsumerOffset::new(ConsumerKind::ConsumerGroup, cg_id.0 as u32, offset, path)
                 });
-                entry.offset.store(offset, Ordering::Relaxed);
+                entry.offset.store(offset, Ordering::Release);
             }
         }
     }
@@ -319,5 +399,105 @@ impl IggyShard {
 
     pub async fn delete_consumer_offset_from_disk(&self, path: &str) -> Result<(), IggyError> {
         crate::streaming::partitions::storage::delete_persisted_offset(path).await
+    }
+
+    /// Enumerates and deletes all consumer/group offset files for a partition from disk.
+    /// Uses filesystem paths from config rather than in-memory state (which may already be cleared).
+    pub async fn delete_all_consumer_offset_files(
+        &self,
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
+    ) -> Result<(), IggyError> {
+        let consumers_path =
+            self.config
+                .system
+                .get_consumer_offsets_path(stream_id, topic_id, partition_id);
+        let groups_path =
+            self.config
+                .system
+                .get_consumer_group_offsets_path(stream_id, topic_id, partition_id);
+
+        Self::delete_all_files_in_dir(&consumers_path).await?;
+        Self::delete_all_files_in_dir(&groups_path).await?;
+        Ok(())
+    }
+
+    /// Complete a pending partition revocation if this offset commit satisfies it.
+    pub(crate) async fn maybe_complete_pending_revocation(
+        &self,
+        polling_consumer: &PollingConsumer,
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
+    ) {
+        let PollingConsumer::ConsumerGroup(group_id, member_id) = polling_consumer else {
+            return;
+        };
+
+        let completion_info = self.metadata.with_metadata(|m| {
+            let topic = m.streams.get(stream_id)?.topics.get(topic_id)?;
+            let group = topic.consumer_groups.get(group_id.0)?;
+            let member = group.members.get(member_id.0)?;
+            if !member
+                .pending_revocations
+                .iter()
+                .any(|revocation| revocation.partition_id == partition_id)
+            {
+                return None;
+            }
+            let partition = topic.partitions.get(partition_id)?;
+            let last_polled = {
+                let guard = partition.last_polled_offsets.pin();
+                guard.get(group_id).map(|v| v.load(Ordering::Acquire))
+            };
+            let can_complete = match last_polled {
+                None => true,
+                Some(polled) => {
+                    let guard = partition.consumer_group_offsets.pin();
+                    guard
+                        .get(group_id)
+                        .map(|co| co.offset.load(Ordering::Acquire))
+                        .is_some_and(|c| c >= polled)
+                }
+            };
+            if can_complete { Some(member.id) } else { None }
+        });
+
+        if let Some(logical_member_id) = completion_info {
+            let request =
+                ShardRequest::control_plane(ShardRequestPayload::CompletePartitionRevocation {
+                    stream_id,
+                    topic_id,
+                    group_id: group_id.0,
+                    member_slab_id: member_id.0,
+                    member_id: logical_member_id,
+                    partition_id,
+                    timed_out: false,
+                });
+            let _ = self.send_to_control_plane(request).await;
+        }
+    }
+
+    async fn delete_all_files_in_dir(dir: &str) -> Result<(), IggyError> {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                return Err(IggyError::IoError(format!(
+                    "Failed to read directory {dir}: {e}"
+                )));
+            }
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                crate::streaming::partitions::storage::delete_persisted_offset(
+                    &path.to_string_lossy(),
+                )
+                .await?;
+            }
+        }
+        Ok(())
     }
 }

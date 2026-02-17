@@ -19,22 +19,13 @@
 
 package org.apache.iggy.client.blocking.http;
 
-import org.testcontainers.containers.GenericContainer;
-
-import static org.apache.iggy.client.blocking.IntegrationTest.HTTP_PORT;
-import static org.apache.iggy.client.blocking.IntegrationTest.LOCALHOST_IP;
+import org.apache.iggy.Iggy;
 
 final class HttpClientFactory {
 
     private HttpClientFactory() {}
 
-    static IggyHttpClient create(GenericContainer<?> iggyServer) {
-        if (iggyServer == null) {
-            // Server is running externally
-            return new IggyHttpClient("http://" + LOCALHOST_IP + ":" + HTTP_PORT);
-        }
-        String address = iggyServer.getHost();
-        Integer port = iggyServer.getMappedPort(HTTP_PORT);
-        return new IggyHttpClient("http://" + address + ":" + port);
+    static IggyHttpClient create(String host, int port) {
+        return Iggy.httpClientBuilder().blocking().host(host).port(port).build();
     }
 }

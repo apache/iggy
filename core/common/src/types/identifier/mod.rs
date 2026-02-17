@@ -187,12 +187,12 @@ impl Identifier {
 
     /// Creates identifier from raw bytes
     pub fn from_raw_bytes(bytes: &[u8]) -> Result<Self, IggyError> {
-        let kind = IdKind::from_code(bytes[0])?;
-        let length = bytes[1];
-        let value = bytes[2..2 + length as usize].to_vec();
-        if value.len() != length as usize {
-            return Err(IggyError::InvalidIdentifier);
-        }
+        let kind = IdKind::from_code(*bytes.first().ok_or(IggyError::InvalidIdentifier)?)?;
+        let length = *bytes.get(1).ok_or(IggyError::InvalidIdentifier)?;
+        let value = bytes
+            .get(2..2 + length as usize)
+            .ok_or(IggyError::InvalidIdentifier)?
+            .to_vec();
 
         let identifier = Identifier {
             kind,
@@ -228,16 +228,12 @@ impl BytesSerializable for Identifier {
     where
         Self: Sized,
     {
-        if bytes.len() < 3 {
-            return Err(IggyError::InvalidIdentifier);
-        }
-
-        let kind = IdKind::from_code(bytes[0])?;
-        let length = bytes[1];
-        let value = bytes[2..2 + length as usize].to_vec();
-        if value.len() != length as usize {
-            return Err(IggyError::InvalidIdentifier);
-        }
+        let kind = IdKind::from_code(*bytes.first().ok_or(IggyError::InvalidIdentifier)?)?;
+        let length = *bytes.get(1).ok_or(IggyError::InvalidIdentifier)?;
+        let value = bytes
+            .get(2..2 + length as usize)
+            .ok_or(IggyError::InvalidIdentifier)?
+            .to_vec();
 
         let identifier = Identifier {
             kind,
@@ -380,6 +376,55 @@ mod tests {
     #[test]
     fn identifier_with_a_value_of_string_greater_than_255_chars_should_be_invalid() {
         assert!(Identifier::named(&"a".repeat(256)).is_err());
+    }
+
+    #[test]
+    fn from_bytes_should_fail_on_empty_input() {
+        assert!(Identifier::from_bytes(Bytes::new()).is_err());
+    }
+
+    #[test]
+    fn from_bytes_should_fail_on_truncated_input() {
+        let id = Identifier::numeric(42).unwrap();
+        let bytes = id.to_bytes();
+        for i in 0..bytes.len() - 1 {
+            let truncated = bytes.slice(..i);
+            assert!(
+                Identifier::from_bytes(truncated).is_err(),
+                "expected error for truncation at byte {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn from_bytes_should_fail_on_corrupted_length() {
+        let mut buf = BytesMut::new();
+        buf.put_u8(1); // Numeric kind
+        buf.put_u8(255); // length = 255 but only 2 bytes of value follow
+        buf.put_u16_le(0);
+        assert!(Identifier::from_bytes(buf.freeze()).is_err());
+    }
+
+    #[test]
+    fn from_raw_bytes_should_fail_on_empty_input() {
+        assert!(Identifier::from_raw_bytes(&[]).is_err());
+    }
+
+    #[test]
+    fn from_raw_bytes_should_fail_on_truncated_input() {
+        let id = Identifier::numeric(42).unwrap();
+        let bytes = id.to_bytes();
+        for i in 0..bytes.len() - 1 {
+            assert!(
+                Identifier::from_raw_bytes(&bytes[..i]).is_err(),
+                "expected error for truncation at byte {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn from_raw_bytes_should_fail_on_corrupted_length() {
+        assert!(Identifier::from_raw_bytes(&[1, 255, 0, 0]).is_err());
     }
 
     #[test]

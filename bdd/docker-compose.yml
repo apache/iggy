@@ -212,7 +212,12 @@ services:
       context: ..
       dockerfile: bdd/go/Dockerfile
     depends_on:
-      - iggy-server
+      iggy-server:
+        condition: service_healthy
+      iggy-leader:
+        condition: service_healthy
+      iggy-follower:
+        condition: service_healthy
     environment:
       - IGGY_ROOT_USERNAME=iggy
       - IGGY_ROOT_PASSWORD=iggy
