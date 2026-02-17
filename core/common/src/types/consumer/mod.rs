@@ -17,5 +17,9 @@
  */
 
 pub(crate) mod consumer_group;
+pub(crate) mod consumer_group_id;
+pub(crate) mod consumer_group_offsets;
 pub(crate) mod consumer_kind;
+pub(crate) mod consumer_offset;
 pub(crate) mod consumer_offset_info;
+pub(crate) mod consumer_offsets;

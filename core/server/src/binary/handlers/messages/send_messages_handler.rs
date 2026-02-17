@@ -54,14 +54,20 @@ impl ServerCommandHandler for SendMessages {
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {
         shard.ensure_authenticated(session)?;
-        let total_payload_size = length as usize - std::mem::size_of::<u32>();
+        let total_payload_size = (length as usize)
+            .checked_sub(std::mem::size_of::<u32>())
+            .ok_or(IggyError::InvalidCommand)?;
         let metadata_len_field_size = std::mem::size_of::<u32>();
 
         let metadata_length_buffer = PooledBuffer::with_capacity(4);
         let (result, metadata_len_buf) = sender.read(metadata_length_buffer.slice(0..4)).await;
         let metadata_len_buf = metadata_len_buf.into_inner();
         result?;
-        let metadata_size = u32::from_le_bytes(metadata_len_buf[..].try_into().unwrap());
+        let metadata_size = u32::from_le_bytes(
+            metadata_len_buf[..]
+                .try_into()
+                .map_err(|_| IggyError::InvalidNumberEncoding)?,
+        );
 
         let metadata_buffer = PooledBuffer::with_capacity(metadata_size as usize);
         let (result, metadata_buf) = sender
@@ -76,28 +82,46 @@ impl ServerCommandHandler for SendMessages {
         element_size += stream_id.get_size_bytes().as_bytes_usize();
         self.stream_id = stream_id;
 
-        let topic_id = Identifier::from_raw_bytes(&metadata_buf[element_size..])?;
+        let topic_id = Identifier::from_raw_bytes(
+            metadata_buf
+                .get(element_size..)
+                .ok_or(IggyError::InvalidCommand)?,
+        )?;
         element_size += topic_id.get_size_bytes().as_bytes_usize();
         self.topic_id = topic_id;
 
-        let partitioning = Partitioning::from_raw_bytes(&metadata_buf[element_size..])?;
+        let partitioning = Partitioning::from_raw_bytes(
+            metadata_buf
+                .get(element_size..)
+                .ok_or(IggyError::InvalidCommand)?,
+        )?;
         element_size += partitioning.get_size_bytes().as_bytes_usize();
         self.partitioning = partitioning;
 
         let messages_count = u32::from_le_bytes(
-            metadata_buf[element_size..element_size + 4]
+            metadata_buf
+                .get(element_size..element_size + 4)
+                .ok_or(IggyError::InvalidCommand)?
                 .try_into()
-                .unwrap(),
+                .map_err(|_| IggyError::InvalidNumberEncoding)?,
         );
-        let indexes_size = messages_count as usize * INDEX_SIZE;
+        let indexes_size = (messages_count as usize)
+            .checked_mul(INDEX_SIZE)
+            .ok_or(IggyError::InvalidCommand)?;
+        if indexes_size > total_payload_size {
+            return Err(IggyError::InvalidCommand);
+        }
 
         let indexes_buffer = PooledBuffer::with_capacity(indexes_size);
         let (result, indexes_buffer) = sender.read(indexes_buffer.slice(0..indexes_size)).await;
         result?;
         let indexes_buffer = indexes_buffer.into_inner();
 
-        let messages_size =
-            total_payload_size - metadata_size as usize - indexes_size - metadata_len_field_size;
+        let messages_size = total_payload_size
+            .checked_sub(metadata_size as usize)
+            .and_then(|s| s.checked_sub(indexes_size))
+            .and_then(|s| s.checked_sub(metadata_len_field_size))
+            .ok_or(IggyError::InvalidCommand)?;
         let messages_buffer = PooledBuffer::with_capacity(messages_size);
         let (result, messages_buffer) = sender.read(messages_buffer.slice(0..messages_size)).await;
         result?;
@@ -122,7 +146,10 @@ impl ServerCommandHandler for SendMessages {
                     self.topic_id.clone(),
                 ))?,
             PartitioningKind::PartitionId => u32::from_le_bytes(
-                self.partitioning.value[..self.partitioning.length as usize]
+                self.partitioning
+                    .value
+                    .get(..4)
+                    .ok_or(IggyError::InvalidCommand)?
                     .try_into()
                     .map_err(|_| IggyError::InvalidNumberEncoding)?,
             ) as usize,

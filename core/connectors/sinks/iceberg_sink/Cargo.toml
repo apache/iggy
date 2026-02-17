@@ -17,7 +17,7 @@
 
 [package]
 name = "iggy_connector_iceberg_sink"
-version = "0.2.2-edge.1"
+version = "0.3.0"
 edition = "2024"
 license = "Apache-2.0"
 keywords = ["iggy", "messaging", "streaming"]

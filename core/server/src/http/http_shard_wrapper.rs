@@ -179,7 +179,10 @@ impl HttpSafeShard {
                 .get_next_partition_id(topic.stream_id, topic.topic_id)
                 .ok_or(IggyError::TopicIdNotFound(stream_id, topic_id))?,
             PartitioningKind::PartitionId => u32::from_le_bytes(
-                partitioning.value[..partitioning.length as usize]
+                partitioning
+                    .value
+                    .get(..4)
+                    .ok_or(IggyError::InvalidCommand)?
                     .try_into()
                     .map_err(|_| IggyError::InvalidNumberEncoding)?,
             ) as usize,

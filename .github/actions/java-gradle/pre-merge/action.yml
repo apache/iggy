@@ -93,6 +93,16 @@ runs:
         USE_EXTERNAL_SERVER: true
       run: ./gradlew test
 
+    - name: Check for ByteBuf leaks
+      if: ${{ !cancelled() && inputs.task == 'test' }}
+      shell: bash
+      run: |
+        if grep -r "LEAK:" foreign/java/java-sdk/build/test-results/ 2>/dev/null; then
+          echo "::error::Netty ByteBuf memory leaks detected in test output!"
+          exit 1
+        fi
+        echo "No ByteBuf leaks detected"
+
     - name: Generate coverage report
       if: inputs.task == 'test'
       shell: bash
