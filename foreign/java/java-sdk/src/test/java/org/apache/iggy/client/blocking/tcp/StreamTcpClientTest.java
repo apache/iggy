@@ -26,6 +26,6 @@ class StreamTcpClientTest extends StreamClientBaseTest {
 
     @Override
     protected IggyBaseClient getClient() {
-        return TcpClientFactory.create(iggyServer);
+        return TcpClientFactory.create(serverHost(), serverTcpPort());
     }
 }

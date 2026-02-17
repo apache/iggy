@@ -114,55 +114,87 @@ impl BytesSerializable for LoginUser {
             return Err(IggyError::InvalidCommand);
         }
 
-        let username_length = bytes[0];
-        let username = from_utf8(&bytes[1..=(username_length as usize)])
-            .map_err(|_| IggyError::InvalidUtf8)?
-            .to_string();
-        if username.len() != username_length as usize {
-            return Err(IggyError::InvalidCommand);
-        }
-
-        let password_length = bytes[1 + username_length as usize];
-        let password = from_utf8(
-            &bytes[2 + username_length as usize
-                ..2 + username_length as usize + password_length as usize],
+        let username_length = *bytes.first().ok_or(IggyError::InvalidCommand)? as usize;
+        let username = from_utf8(
+            bytes
+                .get(1..1 + username_length)
+                .ok_or(IggyError::InvalidCommand)?,
         )
         .map_err(|_| IggyError::InvalidUtf8)?
         .to_string();
-        if password.len() != password_length as usize {
-            return Err(IggyError::InvalidCommand);
-        }
 
-        let position = 2 + username_length as usize + password_length as usize;
-        let version_length = u32::from_le_bytes(
-            bytes[position..position + 4]
-                .try_into()
-                .map_err(|_| IggyError::InvalidNumberEncoding)?,
-        );
-        let version = match version_length {
-            0 => None,
-            _ => {
-                let version =
-                    from_utf8(&bytes[position + 4..position + 4 + version_length as usize])
-                        .map_err(|_| IggyError::InvalidUtf8)?
-                        .to_string();
-                Some(version)
+        let pos = 1 + username_length;
+        let password_length = *bytes.get(pos).ok_or(IggyError::InvalidCommand)? as usize;
+        let password = from_utf8(
+            bytes
+                .get(pos + 1..pos + 1 + password_length)
+                .ok_or(IggyError::InvalidCommand)?,
+        )
+        .map_err(|_| IggyError::InvalidUtf8)?
+        .to_string();
+
+        let mut position = pos + 1 + password_length;
+
+        // Version and context fields are optional for backward compatibility
+        // with older SDKs (e.g. v0.8.0) that don't send them.
+        // However, 1-3 trailing bytes (incomplete u32 length prefix) are rejected
+        // as they indicate a corrupt payload rather than a valid old-SDK format.
+        let remaining = bytes.len() - position;
+        let version = if remaining == 0 {
+            None
+        } else if remaining < 4 {
+            return Err(IggyError::InvalidCommand);
+        } else {
+            let version_length = u32::from_le_bytes(
+                bytes
+                    .get(position..position + 4)
+                    .ok_or(IggyError::InvalidCommand)?
+                    .try_into()
+                    .map_err(|_| IggyError::InvalidNumberEncoding)?,
+            );
+            position += 4;
+            match version_length {
+                0 => None,
+                _ => {
+                    let version = from_utf8(
+                        bytes
+                            .get(position..position + version_length as usize)
+                            .ok_or(IggyError::InvalidCommand)?,
+                    )
+                    .map_err(|_| IggyError::InvalidUtf8)?
+                    .to_string();
+                    position += version_length as usize;
+                    Some(version)
+                }
             }
         };
-        let position = position + 4 + version_length as usize;
-        let context_length = u32::from_le_bytes(
-            bytes[position..position + 4]
-                .try_into()
-                .map_err(|_| IggyError::InvalidNumberEncoding)?,
-        );
-        let context = match context_length {
-            0 => None,
-            _ => {
-                let context =
-                    from_utf8(&bytes[position + 4..position + 4 + context_length as usize])
-                        .map_err(|_| IggyError::InvalidUtf8)?
-                        .to_string();
-                Some(context)
+
+        let remaining = bytes.len() - position;
+        let context = if remaining == 0 {
+            None
+        } else if remaining < 4 {
+            return Err(IggyError::InvalidCommand);
+        } else {
+            let context_length = u32::from_le_bytes(
+                bytes
+                    .get(position..position + 4)
+                    .ok_or(IggyError::InvalidCommand)?
+                    .try_into()
+                    .map_err(|_| IggyError::InvalidNumberEncoding)?,
+            );
+            position += 4;
+            match context_length {
+                0 => None,
+                _ => {
+                    let context = from_utf8(
+                        bytes
+                            .get(position..position + context_length as usize)
+                            .ok_or(IggyError::InvalidCommand)?,
+                    )
+                    .map_err(|_| IggyError::InvalidUtf8)?
+                    .to_string();
+                    Some(context)
+                }
             }
         };
 
@@ -224,6 +256,85 @@ mod tests {
         assert_eq!(password, command.password);
         assert_eq!(version, command.version);
         assert_eq!(context, command.context);
+    }
+
+    #[test]
+    fn from_bytes_should_fail_on_empty_input() {
+        assert!(LoginUser::from_bytes(Bytes::new()).is_err());
+    }
+
+    #[test]
+    fn from_bytes_should_fail_on_truncated_input() {
+        let command = LoginUser {
+            username: "user".to_string(),
+            password: "secret".to_string(),
+            version: Some("1.0.0".to_string()),
+            context: Some("test".to_string()),
+        };
+        let bytes = command.to_bytes();
+        // Truncate at every position up to (but not including) the version field.
+        // Positions within username/password must error; positions at or past the
+        // version boundary are valid old-SDK payloads.
+        let version_offset = 2 + command.username.len() + command.password.len();
+        for i in 0..version_offset {
+            let truncated = bytes.slice(..i);
+            assert!(
+                LoginUser::from_bytes(truncated).is_err(),
+                "expected error for truncation at byte {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn from_bytes_should_fail_on_corrupted_username_length() {
+        let mut buf = BytesMut::new();
+        buf.put_u8(255); // username_length = 255
+        buf.put_slice(b"short");
+        assert!(LoginUser::from_bytes(buf.freeze()).is_err());
+    }
+
+    #[test]
+    fn from_bytes_should_fail_on_trailing_bytes() {
+        let username = "user";
+        let password = "secret";
+        let mut bytes = BytesMut::new();
+        #[allow(clippy::cast_possible_truncation)]
+        bytes.put_u8(username.len() as u8);
+        bytes.put_slice(username.as_bytes());
+        #[allow(clippy::cast_possible_truncation)]
+        bytes.put_u8(password.len() as u8);
+        bytes.put_slice(password.as_bytes());
+
+        // 1-3 trailing bytes (incomplete u32 length prefix) must be rejected
+        for extra in 1..=3u8 {
+            let mut buf = bytes.clone();
+            for i in 0..extra {
+                buf.put_u8(i);
+            }
+            assert!(
+                LoginUser::from_bytes(buf.freeze()).is_err(),
+                "expected error for {extra} trailing byte(s)"
+            );
+        }
+    }
+
+    #[test]
+    fn from_bytes_should_accept_old_sdk_format_without_version_context() {
+        let username = "user";
+        let password = "secret";
+        let mut bytes = BytesMut::new();
+        #[allow(clippy::cast_possible_truncation)]
+        bytes.put_u8(username.len() as u8);
+        bytes.put_slice(username.as_bytes());
+        #[allow(clippy::cast_possible_truncation)]
+        bytes.put_u8(password.len() as u8);
+        bytes.put_slice(password.as_bytes());
+
+        let command = LoginUser::from_bytes(bytes.freeze()).unwrap();
+        assert_eq!(command.username, username);
+        assert_eq!(command.password, password);
+        assert_eq!(command.version, None);
+        assert_eq!(command.context, None);
     }
 
     #[test]

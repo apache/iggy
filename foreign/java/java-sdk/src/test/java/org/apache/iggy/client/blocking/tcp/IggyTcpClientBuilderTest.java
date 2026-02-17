@@ -41,15 +41,15 @@ class IggyTcpClientBuilderTest extends IntegrationTest {
 
     @Override
     protected IggyBaseClient getClient() {
-        return TcpClientFactory.create(iggyServer);
+        return TcpClientFactory.create(serverHost(), serverTcpPort());
     }
 
     @Test
     void shouldCreateClientWithBuilder() {
         // Given: Builder with basic configuration and credentials
         IggyTcpClient client = IggyTcpClient.builder()
-                .host(LOCALHOST_IP)
-                .port(tcpPort())
+                .host(serverHost())
+                .port(serverTcpPort())
                 .credentials("iggy", "iggy")
                 .buildAndLogin();
 
@@ -62,8 +62,8 @@ class IggyTcpClientBuilderTest extends IntegrationTest {
     void shouldCreateClientWithCredentials() {
         // Given: Builder with credentials configured
         IggyTcpClient client = IggyTcpClient.builder()
-                .host(LOCALHOST_IP)
-                .port(tcpPort())
+                .host(serverHost())
+                .port(serverTcpPort())
                 .credentials("iggy", "iggy")
                 .buildAndLogin();
 
@@ -77,8 +77,8 @@ class IggyTcpClientBuilderTest extends IntegrationTest {
     void shouldCreateClientWithTimeoutConfiguration() {
         // Given: Builder with timeout configuration
         IggyTcpClient client = IggyTcpClient.builder()
-                .host(LOCALHOST_IP)
-                .port(tcpPort())
+                .host(serverHost())
+                .port(serverTcpPort())
                 .connectionTimeout(Duration.ofSeconds(30))
                 .requestTimeout(Duration.ofSeconds(10))
                 .credentials("iggy", "iggy")
@@ -93,8 +93,8 @@ class IggyTcpClientBuilderTest extends IntegrationTest {
     void shouldCreateClientWithConnectionPoolSize() {
         // Given: Builder with connection pool size
         IggyTcpClient client = IggyTcpClient.builder()
-                .host(LOCALHOST_IP)
-                .port(tcpPort())
+                .host(serverHost())
+                .port(serverTcpPort())
                 .connectionPoolSize(10)
                 .credentials("iggy", "iggy")
                 .buildAndLogin();
@@ -108,8 +108,8 @@ class IggyTcpClientBuilderTest extends IntegrationTest {
     void shouldCreateClientWithRetryPolicy() {
         // Given: Builder with exponential backoff retry policy
         IggyTcpClient client = IggyTcpClient.builder()
-                .host(LOCALHOST_IP)
-                .port(tcpPort())
+                .host(serverHost())
+                .port(serverTcpPort())
                 .retryPolicy(RetryPolicy.exponentialBackoff())
                 .credentials("iggy", "iggy")
                 .buildAndLogin();
@@ -123,8 +123,8 @@ class IggyTcpClientBuilderTest extends IntegrationTest {
     void shouldCreateClientWithCustomRetryPolicy() {
         // Given: Builder with custom retry policy
         IggyTcpClient client = IggyTcpClient.builder()
-                .host(LOCALHOST_IP)
-                .port(tcpPort())
+                .host(serverHost())
+                .port(serverTcpPort())
                 .retryPolicy(RetryPolicy.fixedDelay(5, Duration.ofMillis(500)))
                 .credentials("iggy", "iggy")
                 .buildAndLogin();
@@ -138,8 +138,8 @@ class IggyTcpClientBuilderTest extends IntegrationTest {
     void shouldCreateClientWithNoRetryPolicy() {
         // Given: Builder with no retry policy
         IggyTcpClient client = IggyTcpClient.builder()
-                .host(LOCALHOST_IP)
-                .port(tcpPort())
+                .host(serverHost())
+                .port(serverTcpPort())
                 .retryPolicy(RetryPolicy.noRetry())
                 .credentials("iggy", "iggy")
                 .buildAndLogin();
@@ -153,8 +153,8 @@ class IggyTcpClientBuilderTest extends IntegrationTest {
     void shouldCreateClientWithAllOptions() {
         // Given: Builder with all configuration options
         IggyTcpClient client = IggyTcpClient.builder()
-                .host(LOCALHOST_IP)
-                .port(tcpPort())
+                .host(serverHost())
+                .port(serverTcpPort())
                 .connectionTimeout(Duration.ofSeconds(30))
                 .requestTimeout(Duration.ofSeconds(10))
                 .connectionPoolSize(10)
@@ -186,7 +186,7 @@ class IggyTcpClientBuilderTest extends IntegrationTest {
     @Test
     void shouldThrowExceptionForEmptyHost() {
         // Given: Builder with empty host
-        IggyTcpClientBuilder builder = IggyTcpClient.builder().host("").port(TCP_PORT);
+        IggyTcpClientBuilder builder = IggyTcpClient.builder().host("").port(serverTcpPort());
 
         // When/Then: Building should throw IggyInvalidArgumentException
         assertThrows(IggyInvalidArgumentException.class, builder::build);
@@ -195,7 +195,7 @@ class IggyTcpClientBuilderTest extends IntegrationTest {
     @Test
     void shouldThrowExceptionForNullHost() {
         // Given: Builder with null host
-        IggyTcpClientBuilder builder = IggyTcpClient.builder().host(null).port(TCP_PORT);
+        IggyTcpClientBuilder builder = IggyTcpClient.builder().host(null).port(serverTcpPort());
 
         // When/Then: Building should throw IggyInvalidArgumentException
         assertThrows(IggyInvalidArgumentException.class, builder::build);
@@ -205,7 +205,7 @@ class IggyTcpClientBuilderTest extends IntegrationTest {
     void shouldThrowExceptionForInvalidPort() {
         // Given: Builder with invalid port
         IggyTcpClientBuilder builder =
-                IggyTcpClient.builder().host(LOCALHOST_IP).port(-1);
+                IggyTcpClient.builder().host(serverHost()).port(-1);
 
         // When/Then: Building should throw IggyInvalidArgumentException
         assertThrows(IggyInvalidArgumentException.class, builder::build);
@@ -215,7 +215,7 @@ class IggyTcpClientBuilderTest extends IntegrationTest {
     void shouldThrowExceptionForZeroPort() {
         // Given: Builder with zero port
         IggyTcpClientBuilder builder =
-                IggyTcpClient.builder().host(LOCALHOST_IP).port(0);
+                IggyTcpClient.builder().host(serverHost()).port(0);
 
         // When/Then: Building should throw IggyInvalidArgumentException
         assertThrows(IggyInvalidArgumentException.class, builder::build);
@@ -224,7 +224,7 @@ class IggyTcpClientBuilderTest extends IntegrationTest {
     @Test
     void shouldWorkWithConstructorAndExplicitConnect() {
         // Given: Constructor approach with explicit connect
-        IggyTcpClient client = new IggyTcpClient(LOCALHOST_IP, tcpPort());
+        IggyTcpClient client = new IggyTcpClient(serverHost(), serverTcpPort());
 
         // When: Connect, login and perform operation
         client.connect();

@@ -19,8 +19,7 @@
 
 package org.apache.iggy.client.async.tcp;
 
-import org.apache.iggy.client.blocking.IggyBaseClient;
-import org.apache.iggy.client.blocking.IntegrationTest;
+import org.apache.iggy.client.BaseIntegrationTest;
 import org.apache.iggy.config.RetryPolicy;
 import org.apache.iggy.exception.IggyInvalidArgumentException;
 import org.apache.iggy.exception.IggyMissingCredentialsException;
@@ -42,7 +41,7 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
  * Integration tests for AsyncIggyTcpClient builder pattern.
  * Tests the builder functionality against a running Iggy server.
  */
-class AsyncIggyTcpClientBuilderTest extends IntegrationTest {
+class AsyncIggyTcpClientBuilderTest extends BaseIntegrationTest {
 
     private static final String TEST_USERNAME = "iggy";
     private static final String TEST_PASSWORD = "iggy";
@@ -60,7 +59,10 @@ class AsyncIggyTcpClientBuilderTest extends IntegrationTest {
     @Test
     void shouldCreateClientWithBuilder() throws Exception {
         // Given: Builder with basic configuration
-        client = AsyncIggyTcpClient.builder().host(LOCALHOST_IP).port(tcpPort()).build();
+        client = AsyncIggyTcpClient.builder()
+                .host(serverHost())
+                .port(serverTcpPort())
+                .build();
 
         // When: Connect to server
         client.connect().get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
@@ -94,7 +96,7 @@ class AsyncIggyTcpClientBuilderTest extends IntegrationTest {
     void shouldThrowExceptionForEmptyHost() {
         // Given: Builder with empty host
         AsyncIggyTcpClientBuilder builder =
-                AsyncIggyTcpClient.builder().host("").port(TCP_PORT);
+                AsyncIggyTcpClient.builder().host("").port(serverTcpPort());
 
         // When/Then: Building should throw IggyInvalidArgumentException
         assertThrows(IggyInvalidArgumentException.class, builder::build);
@@ -104,7 +106,7 @@ class AsyncIggyTcpClientBuilderTest extends IntegrationTest {
     void shouldThrowExceptionForNullHost() {
         // Given: Builder with null host
         AsyncIggyTcpClientBuilder builder =
-                AsyncIggyTcpClient.builder().host(null).port(TCP_PORT);
+                AsyncIggyTcpClient.builder().host(null).port(serverTcpPort());
 
         // When/Then: Building should throw IggyInvalidArgumentException
         assertThrows(IggyInvalidArgumentException.class, builder::build);
@@ -114,7 +116,7 @@ class AsyncIggyTcpClientBuilderTest extends IntegrationTest {
     void shouldThrowExceptionForInvalidPort() {
         // Given: Builder with invalid port
         AsyncIggyTcpClientBuilder builder =
-                AsyncIggyTcpClient.builder().host(LOCALHOST_IP).port(-1);
+                AsyncIggyTcpClient.builder().host(serverHost()).port(-1);
 
         // When/Then: Building should throw IggyInvalidArgumentException
         assertThrows(IggyInvalidArgumentException.class, builder::build);
@@ -124,7 +126,7 @@ class AsyncIggyTcpClientBuilderTest extends IntegrationTest {
     void shouldThrowExceptionForZeroPort() {
         // Given: Builder with zero port
         AsyncIggyTcpClientBuilder builder =
-                AsyncIggyTcpClient.builder().host(LOCALHOST_IP).port(0);
+                AsyncIggyTcpClient.builder().host(serverHost()).port(0);
 
         // When/Then: Building should throw IggyInvalidArgumentException
         assertThrows(IggyInvalidArgumentException.class, builder::build);
@@ -133,7 +135,7 @@ class AsyncIggyTcpClientBuilderTest extends IntegrationTest {
     @Test
     void shouldMaintainBackwardCompatibilityWithOldConstructor() throws Exception {
         // Given: Old constructor approach
-        client = new AsyncIggyTcpClient(LOCALHOST_IP, tcpPort());
+        client = new AsyncIggyTcpClient(serverHost(), serverTcpPort());
 
         // When: Connect to server
         client.connect().get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
@@ -145,7 +147,10 @@ class AsyncIggyTcpClientBuilderTest extends IntegrationTest {
     @Test
     void shouldConnectAndPerformOperations() throws Exception {
         // Given: Client
-        client = AsyncIggyTcpClient.builder().host(LOCALHOST_IP).port(tcpPort()).build();
+        client = AsyncIggyTcpClient.builder()
+                .host(serverHost())
+                .port(serverTcpPort())
+                .build();
 
         // When: Connect
         client.connect().get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
@@ -161,7 +166,10 @@ class AsyncIggyTcpClientBuilderTest extends IntegrationTest {
     @Test
     void shouldCloseConnectionGracefully() throws Exception {
         // Given: Connected client
-        client = AsyncIggyTcpClient.builder().host(LOCALHOST_IP).port(tcpPort()).build();
+        client = AsyncIggyTcpClient.builder()
+                .host(serverHost())
+                .port(serverTcpPort())
+                .build();
         client.connect().get(5, TimeUnit.SECONDS);
 
         // When: Close connection
@@ -176,8 +184,8 @@ class AsyncIggyTcpClientBuilderTest extends IntegrationTest {
     @Test
     void testThrowExceptionWhenLoginBeforeConnect() {
         client = AsyncIggyTcpClient.builder()
-                .host(LOCALHOST_IP)
-                .port(TCP_PORT)
+                .host(serverHost())
+                .port(serverTcpPort())
                 .credentials(TEST_USERNAME, TEST_PASSWORD)
                 .build();
 
@@ -186,42 +194,60 @@ class AsyncIggyTcpClientBuilderTest extends IntegrationTest {
 
     @Test
     void testThrowExceptionWhenAccessingUsersBeforeConnect() {
-        client = AsyncIggyTcpClient.builder().host(LOCALHOST_IP).port(TCP_PORT).build();
+        client = AsyncIggyTcpClient.builder()
+                .host(serverHost())
+                .port(serverTcpPort())
+                .build();
 
         assertThrows(IggyNotConnectedException.class, () -> client.users());
     }
 
     @Test
     void testThrowExceptionWhenAccessingMessagesBeforeConnect() {
-        client = AsyncIggyTcpClient.builder().host(LOCALHOST_IP).port(TCP_PORT).build();
+        client = AsyncIggyTcpClient.builder()
+                .host(serverHost())
+                .port(serverTcpPort())
+                .build();
 
         assertThrows(IggyNotConnectedException.class, () -> client.messages());
     }
 
     @Test
     void testThrowExceptionWhenAccessingStreamsBeforeConnect() {
-        client = AsyncIggyTcpClient.builder().host(LOCALHOST_IP).port(TCP_PORT).build();
+        client = AsyncIggyTcpClient.builder()
+                .host(serverHost())
+                .port(serverTcpPort())
+                .build();
 
         assertThrows(IggyNotConnectedException.class, () -> client.streams());
     }
 
     @Test
     void testThrowExceptionWhenAccessingTopicsBeforeConnect() {
-        client = AsyncIggyTcpClient.builder().host(LOCALHOST_IP).port(TCP_PORT).build();
+        client = AsyncIggyTcpClient.builder()
+                .host(serverHost())
+                .port(serverTcpPort())
+                .build();
 
         assertThrows(IggyNotConnectedException.class, () -> client.topics());
     }
 
     @Test
     void testThrowExceptionWhenAccessingConsumerGroupsBeforeConnect() {
-        client = AsyncIggyTcpClient.builder().host(LOCALHOST_IP).port(TCP_PORT).build();
+        client = AsyncIggyTcpClient.builder()
+                .host(serverHost())
+                .port(serverTcpPort())
+                .build();
 
         assertThrows(IggyNotConnectedException.class, () -> client.consumerGroups());
     }
 
     @Test
     void testThrowExceptionWhenLoginWithoutCredentials() throws Exception {
-        client = AsyncIggyTcpClient.builder().host(LOCALHOST_IP).port(tcpPort()).build();
+        client = AsyncIggyTcpClient.builder()
+                .host(serverHost())
+                .port(serverTcpPort())
+                .build();
         client.connect().get(5, TimeUnit.SECONDS);
 
         assertThrows(IggyMissingCredentialsException.class, () -> client.login());
@@ -230,23 +256,27 @@ class AsyncIggyTcpClientBuilderTest extends IntegrationTest {
     @Test
     void testThrowExceptionWhenBuildAndLoginWithoutCredentials() {
         AsyncIggyTcpClientBuilder builder =
-                AsyncIggyTcpClient.builder().host(LOCALHOST_IP).port(TCP_PORT);
+                AsyncIggyTcpClient.builder().host(serverHost()).port(serverTcpPort());
 
         assertThrows(IggyMissingCredentialsException.class, builder::buildAndLogin);
     }
 
     @Test
     void testThrowExceptionWhenBuildAndLoginWithNullUsername() {
-        AsyncIggyTcpClientBuilder builder =
-                AsyncIggyTcpClient.builder().host(LOCALHOST_IP).port(TCP_PORT).credentials(null, TEST_PASSWORD);
+        AsyncIggyTcpClientBuilder builder = AsyncIggyTcpClient.builder()
+                .host(serverHost())
+                .port(serverTcpPort())
+                .credentials(null, TEST_PASSWORD);
 
         assertThrows(IggyMissingCredentialsException.class, builder::buildAndLogin);
     }
 
     @Test
     void testThrowExceptionWhenBuildAndLoginWithNullPassword() {
-        AsyncIggyTcpClientBuilder builder =
-                AsyncIggyTcpClient.builder().host(LOCALHOST_IP).port(TCP_PORT).credentials(TEST_USERNAME, null);
+        AsyncIggyTcpClientBuilder builder = AsyncIggyTcpClient.builder()
+                .host(serverHost())
+                .port(serverTcpPort())
+                .credentials(TEST_USERNAME, null);
 
         assertThrows(IggyMissingCredentialsException.class, builder::buildAndLogin);
     }
@@ -254,8 +284,8 @@ class AsyncIggyTcpClientBuilderTest extends IntegrationTest {
     @Test
     void testBuildClientWithCredentials() throws Exception {
         client = AsyncIggyTcpClient.builder()
-                .host(LOCALHOST_IP)
-                .port(tcpPort())
+                .host(serverHost())
+                .port(serverTcpPort())
                 .credentials(TEST_USERNAME, TEST_PASSWORD)
                 .build();
         client.connect().get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
@@ -266,8 +296,8 @@ class AsyncIggyTcpClientBuilderTest extends IntegrationTest {
     @Test
     void testBuildClientWithConnectionTimeout() throws Exception {
         client = AsyncIggyTcpClient.builder()
-                .host(LOCALHOST_IP)
-                .port(tcpPort())
+                .host(serverHost())
+                .port(serverTcpPort())
                 .connectionTimeout(Duration.ofSeconds(10))
                 .build();
         client.connect().get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
@@ -278,8 +308,8 @@ class AsyncIggyTcpClientBuilderTest extends IntegrationTest {
     @Test
     void testBuildClientWithRequestTimeout() throws Exception {
         client = AsyncIggyTcpClient.builder()
-                .host(LOCALHOST_IP)
-                .port(tcpPort())
+                .host(serverHost())
+                .port(serverTcpPort())
                 .requestTimeout(Duration.ofSeconds(30))
                 .build();
         client.connect().get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
@@ -290,8 +320,8 @@ class AsyncIggyTcpClientBuilderTest extends IntegrationTest {
     @Test
     void testBuildClientWithConnectionPoolSize() throws Exception {
         client = AsyncIggyTcpClient.builder()
-                .host(LOCALHOST_IP)
-                .port(tcpPort())
+                .host(serverHost())
+                .port(serverTcpPort())
                 .connectionPoolSize(5)
                 .build();
         client.connect().get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
@@ -302,8 +332,8 @@ class AsyncIggyTcpClientBuilderTest extends IntegrationTest {
     @Test
     void testBuildClientWithExponentialBackoffRetryPolicy() throws Exception {
         client = AsyncIggyTcpClient.builder()
-                .host(LOCALHOST_IP)
-                .port(tcpPort())
+                .host(serverHost())
+                .port(serverTcpPort())
                 .retryPolicy(RetryPolicy.exponentialBackoff())
                 .build();
         client.connect().get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
@@ -314,8 +344,8 @@ class AsyncIggyTcpClientBuilderTest extends IntegrationTest {
     @Test
     void testBuildClientWithFixedDelayRetryPolicy() throws Exception {
         client = AsyncIggyTcpClient.builder()
-                .host(LOCALHOST_IP)
-                .port(tcpPort())
+                .host(serverHost())
+                .port(serverTcpPort())
                 .retryPolicy(RetryPolicy.fixedDelay(3, Duration.ofMillis(100)))
                 .build();
         client.connect().get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
@@ -326,8 +356,8 @@ class AsyncIggyTcpClientBuilderTest extends IntegrationTest {
     @Test
     void testBuildClientWithNoRetryPolicy() throws Exception {
         client = AsyncIggyTcpClient.builder()
-                .host(LOCALHOST_IP)
-                .port(tcpPort())
+                .host(serverHost())
+                .port(serverTcpPort())
                 .retryPolicy(RetryPolicy.noRetry())
                 .build();
         client.connect().get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
@@ -338,8 +368,8 @@ class AsyncIggyTcpClientBuilderTest extends IntegrationTest {
     @Test
     void testBuildClientWithTlsBoolean() throws Exception {
         client = AsyncIggyTcpClient.builder()
-                .host(LOCALHOST_IP)
-                .port(tcpPort())
+                .host(serverHost())
+                .port(serverTcpPort())
                 .tls(false)
                 .build();
         client.connect().get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
@@ -350,8 +380,8 @@ class AsyncIggyTcpClientBuilderTest extends IntegrationTest {
     @Test
     void testBuildClientWithEnableTls() throws Exception {
         client = AsyncIggyTcpClient.builder()
-                .host(LOCALHOST_IP)
-                .port(TCP_PORT)
+                .host(serverHost())
+                .port(serverTcpPort())
                 .enableTls()
                 .build();
 
@@ -361,8 +391,8 @@ class AsyncIggyTcpClientBuilderTest extends IntegrationTest {
     @Test
     void testBuildClientWithAllConfigurationOptions() throws Exception {
         client = AsyncIggyTcpClient.builder()
-                .host(LOCALHOST_IP)
-                .port(tcpPort())
+                .host(serverHost())
+                .port(serverTcpPort())
                 .credentials(TEST_USERNAME, TEST_PASSWORD)
                 .connectionTimeout(Duration.ofSeconds(10))
                 .requestTimeout(Duration.ofSeconds(30))
@@ -382,8 +412,8 @@ class AsyncIggyTcpClientBuilderTest extends IntegrationTest {
     @Test
     void testBuildAndLoginSuccessfully() throws Exception {
         client = AsyncIggyTcpClient.builder()
-                .host(LOCALHOST_IP)
-                .port(tcpPort())
+                .host(serverHost())
+                .port(serverTcpPort())
                 .credentials(TEST_USERNAME, TEST_PASSWORD)
                 .buildAndLogin()
                 .get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
@@ -397,7 +427,10 @@ class AsyncIggyTcpClientBuilderTest extends IntegrationTest {
 
     @Test
     void testHandleCloseOnUnconnectedClient() throws Exception {
-        client = AsyncIggyTcpClient.builder().host(LOCALHOST_IP).port(TCP_PORT).build();
+        client = AsyncIggyTcpClient.builder()
+                .host(serverHost())
+                .port(serverTcpPort())
+                .build();
 
         CompletableFuture<Void> closeFuture = client.close();
         closeFuture.get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
@@ -408,7 +441,10 @@ class AsyncIggyTcpClientBuilderTest extends IntegrationTest {
 
     @Test
     void testHandleMultipleCloseCalls() throws Exception {
-        client = AsyncIggyTcpClient.builder().host(LOCALHOST_IP).port(tcpPort()).build();
+        client = AsyncIggyTcpClient.builder()
+                .host(serverHost())
+                .port(serverTcpPort())
+                .build();
         client.connect().get(5, TimeUnit.SECONDS);
 
         CompletableFuture<Void> firstClose = client.close();
@@ -446,8 +482,8 @@ class AsyncIggyTcpClientBuilderTest extends IntegrationTest {
     @Test
     void testBuildConnectAndLoginManually() throws Exception {
         client = AsyncIggyTcpClient.builder()
-                .host(LOCALHOST_IP)
-                .port(tcpPort())
+                .host(serverHost())
+                .port(serverTcpPort())
                 .credentials(TEST_USERNAME, TEST_PASSWORD)
                 .build();
 
@@ -459,16 +495,14 @@ class AsyncIggyTcpClientBuilderTest extends IntegrationTest {
 
     @Test
     void testBuildAndConnectWithoutCredentialsThenLoginExplicitly() throws Exception {
-        client = AsyncIggyTcpClient.builder().host(LOCALHOST_IP).port(tcpPort()).build();
+        client = AsyncIggyTcpClient.builder()
+                .host(serverHost())
+                .port(serverTcpPort())
+                .build();
 
         client.connect().get(5, TimeUnit.SECONDS);
         client.users().login(TEST_USERNAME, TEST_PASSWORD).get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
 
         assertNotNull(client.users());
-    }
-
-    @Override
-    protected IggyBaseClient getClient() {
-        return null;
     }
 }

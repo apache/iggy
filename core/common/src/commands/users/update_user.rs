@@ -96,32 +96,37 @@ impl BytesSerializable for UpdateUser {
 
         let user_id = Identifier::from_bytes(bytes.clone())?;
         let mut position = user_id.get_size_bytes().as_bytes_usize();
-        let has_username = bytes[position];
+        let has_username = *bytes.get(position).ok_or(IggyError::InvalidCommand)?;
         if has_username > 1 {
             return Err(IggyError::InvalidCommand);
         }
 
         position += 1;
         let username = if has_username == 1 {
-            let username_length = bytes[position];
+            let username_length = *bytes.get(position).ok_or(IggyError::InvalidCommand)?;
             position += 1;
-            let username = from_utf8(&bytes[position..position + username_length as usize])
-                .map_err(|_| IggyError::InvalidUtf8)?
-                .to_string();
+            let username = from_utf8(
+                bytes
+                    .get(position..position + username_length as usize)
+                    .ok_or(IggyError::InvalidCommand)?,
+            )
+            .map_err(|_| IggyError::InvalidUtf8)?
+            .to_string();
             position += username_length as usize;
             Some(username)
         } else {
             None
         };
 
-        let has_status = bytes[position];
+        let has_status = *bytes.get(position).ok_or(IggyError::InvalidCommand)?;
         if has_status > 1 {
             return Err(IggyError::InvalidCommand);
         }
 
         let status = if has_status == 1 {
             position += 1;
-            let status = UserStatus::from_code(bytes[position])?;
+            let status =
+                UserStatus::from_code(*bytes.get(position).ok_or(IggyError::InvalidCommand)?)?;
             Some(status)
         } else {
             None
@@ -178,6 +183,28 @@ mod tests {
         assert_eq!(username, command.username.unwrap());
         assert_eq!(has_status, 1);
         assert_eq!(status, command.status.unwrap());
+    }
+
+    #[test]
+    fn from_bytes_should_fail_on_empty_input() {
+        assert!(UpdateUser::from_bytes(Bytes::new()).is_err());
+    }
+
+    #[test]
+    fn from_bytes_should_fail_on_truncated_input() {
+        let command = UpdateUser {
+            user_id: Identifier::numeric(1).unwrap(),
+            username: Some("user".to_string()),
+            status: Some(UserStatus::Active),
+        };
+        let bytes = command.to_bytes();
+        for i in 0..bytes.len() - 1 {
+            let truncated = bytes.slice(..i);
+            assert!(
+                UpdateUser::from_bytes(truncated).is_err(),
+                "expected error for truncation at byte {i}"
+            );
+        }
     }
 
     #[test]

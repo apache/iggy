@@ -19,8 +19,8 @@
 
 package org.apache.iggy.client.async;
 
+import org.apache.iggy.client.BaseIntegrationTest;
 import org.apache.iggy.client.async.tcp.AsyncIggyTcpClient;
-import org.apache.iggy.client.blocking.IntegrationTest;
 import org.apache.iggy.consumergroup.Consumer;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
@@ -53,7 +53,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * Tests connection, authentication, stream/topic management, and message operations.
  */
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
-public abstract class AsyncClientIntegrationTest extends IntegrationTest {
+public class AsyncClientIntegrationTest extends BaseIntegrationTest {
     private static final Logger log = LoggerFactory.getLogger(AsyncClientIntegrationTest.class);
 
     private static final String USERNAME = "iggy";
@@ -68,7 +68,7 @@ public abstract class AsyncClientIntegrationTest extends IntegrationTest {
     @BeforeAll
     public static void setup() throws Exception {
         log.info("Setting up async client for integration tests");
-        client = new AsyncIggyTcpClient(LOCALHOST_IP, tcpPort());
+        client = new AsyncIggyTcpClient(serverHost(), serverTcpPort());
 
         // Connect and login
         client.connect()
