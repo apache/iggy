@@ -110,12 +110,3 @@ tasks.register<JavaExec>("runAsyncConsumer") {
     mainClass.set("org.apache.iggy.examples.async.AsyncConsumer")
 }
 
-tasks.register<JavaExec>("runBlockingProducer") {
-    classpath = sourceSets["main"].runtimeClasspath
-    mainClass.set("org.apache.iggy.examples.blocking.BlockingProducer")
-}
-
-tasks.register<JavaExec>("runBlockingConsumer") {
-    classpath = sourceSets["main"].runtimeClasspath
-    mainClass.set("org.apache.iggy.examples.blocking.BlockingConsumer")
-}

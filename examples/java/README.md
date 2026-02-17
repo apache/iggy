@@ -64,112 +64,6 @@ You can also customize the server using environment variables:
 IGGY_HTTP_ENABLED=true IGGY_TCP_ADDRESS=0.0.0.0:8090 cargo run --bin iggy-server
 ```
 
-## Blocking vs. Async - When to Use Each
-
-The Iggy Java SDK provides two client types: **blocking (synchronous)** and **async (non-blocking)**. Choose based on your use case:
-
-### Use Blocking Client When
-
-- Message rate < 1000/sec
-- Writing scripts, CLI tools, or simple applications
-- Sequential code is easier to reason about
-- Integration tests
-
-### Use Async Client When
-
-- Need > 5000 msg/sec throughput
-- Application is already async/reactive (Spring WebFlux, Vert.x)
-- Want to pipeline multiple requests over a single connection
-- Building services that handle many concurrent streams
-
-### Performance Characteristics
-
-**Blocking Client:**
-
-- Throughput: ~5,000 msg/sec (varies with batch size, network latency)
-- Thread usage: One thread per operation
-- Latency: Low (one request at a time)
-
-**Async Client:**
-
-- Throughput: ~20,000+ msg/sec (with pipelining)
-- Thread usage: Minimal (Netty event loop, typically 2x CPU cores)
-- Latency: Similar per-request, but concurrent requests don't block each other
-
-## Blocking Client Examples
-
-### Blocking Producer
-
-Demonstrates basic message production using the synchronous client:
-
-```bash
-./gradlew runBlockingProducer
-```
-
-Shows:
-
-- Client connection and authentication
-- Stream and topic creation
-- Batch message sending (recommended for efficiency)
-- Balanced partitioning for throughput
-
-### Blocking Consumer
-
-Demonstrates message consumption using the synchronous client:
-
-```bash
-./gradlew runBlockingConsumer
-```
-
-Shows:
-
-- Continuous message polling from a specific partition
-- Offset-based consumption tracking
-- Configurable batch limits
-- Graceful shutdown
-
-## Async Client Examples
-
-### Async Producer
-
-High-throughput async production with pipelining:
-
-```bash
-./gradlew runAsyncProducer
-```
-
-Shows:
-
-- CompletableFuture chaining patterns
-- Pipelining multiple sends without blocking
-- Performance comparison with blocking client
-
-### Async Consumer
-
-Non-blocking async consumption with advanced patterns:
-
-```bash
-./gradlew runAsyncConsumer
-```
-
-Shows:
-
-- Backpressure management (don't poll faster than you can process)
-- Error recovery with exponential backoff
-- Thread pool separation (Netty I/O threads vs. processing threads)
-- Offset-based polling with CompletableFuture
-
-**CRITICAL ASYNC PATTERN - Thread Pool Management:**
-
-The async client uses Netty's event loop threads for I/O operations. **NEVER** block these threads with:
-
-- `.join()` or `.get()` inside `thenApply/thenAccept`
-- `Thread.sleep()`
-- Blocking database calls
-- Long-running computations
-
-If your message processing involves blocking operations, offload to a separate thread pool using `thenApplyAsync(fn, executor)`.
-
 ## Basic Examples
 
 ### Getting Started
@@ -238,6 +132,65 @@ Building streams with advanced configuration:
 
 Shows how to use the stream builder API to create and configure streams with custom settings.
 
+## Async Client Examples
+
+### Async Producer
+
+High-throughput async production with pipelining:
+
+```bash
+./gradlew runAsyncProducer
+```
+
+Shows:
+
+- CompletableFuture chaining patterns
+- Pipelining multiple sends without blocking
+- Performance comparison with blocking client
+
+### Async Consumer
+
+Non-blocking async consumption with advanced patterns:
+
+```bash
+./gradlew runAsyncConsumer
+```
+
+Shows:
+
+- Backpressure management (don't poll faster than you can process)
+- Error recovery with exponential backoff
+- Thread pool separation (Netty I/O threads vs. processing threads)
+- Offset-based polling with CompletableFuture
+
+**CRITICAL ASYNC PATTERN - Thread Pool Management:**
+
+The async client uses Netty's event loop threads for I/O operations. **NEVER** block these threads with:
+
+- `.join()` or `.get()` inside `thenApply/thenAccept`
+- `Thread.sleep()`
+- Blocking database calls
+- Long-running computations
+
+If your message processing involves blocking operations, offload to a separate thread pool using `thenApplyAsync(fn, executor)`.
+
+## Blocking vs. Async - When to Use Each
+
+The Iggy Java SDK provides two client types: **blocking (synchronous)** and **async (non-blocking)**. Choose based on your use case:
+
+### Use Blocking Client When
+
+- Writing scripts, CLI tools, or simple applications
+- Sequential code is easier to reason about
+- Integration tests
+
+### Use Async Client When
+
+- Need high throughput
+- Application is already async/reactive (Spring WebFlux, Vert.x)
+- Want to pipeline multiple requests over a single connection
+- Building services that handle many concurrent streams
+
 ## Key Async Patterns
 
 ### CompletableFuture Chaining
@@ -279,12 +232,3 @@ client.messages().pollMessages(...)
         saveToDatabase(polled);  // runs on processingPool
     }, processingPool);
 ```
-
-## Next Steps
-
-1. Run `BlockingProducer` to send messages
-2. Run `BlockingConsumer` to receive them (observe sequential processing)
-3. Run `AsyncProducer` to see higher throughput with pipelining
-4. Run `AsyncConsumer` to see non-blocking consumption with backpressure
-
-Read the JavaDoc in each example for detailed explanations of patterns, best practices, and common pitfalls.

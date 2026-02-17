@@ -79,8 +79,8 @@ public final class AsyncConsumer {
     private static final int IGGY_PORT = 8090;
     private static final String USERNAME = "iggy";
     private static final String PASSWORD = "iggy";
-    private static final String STREAM_NAME = "async-example-stream";
-    private static final String TOPIC_NAME = "async-example-topic";
+    private static final String STREAM_NAME = "async-test";
+    private static final String TOPIC_NAME = "events";
     private static final long PARTITION_ID = 0L;
     private static final long CONSUMER_ID = 0L;
 
@@ -325,7 +325,7 @@ public final class AsyncConsumer {
                 processingPool);
     }
 
-    private static void processMessage(String payload, java.math.BigInteger offset) {
+    private static void processMessage(String payload, BigInteger offset) {
         // In a real application, this would be your business logic:
         //   - Parse JSON
         //   - Validate data
@@ -334,8 +334,8 @@ public final class AsyncConsumer {
         //   - Send to downstream systems
 
         // For this example, just log occasionally
-        if (offset.compareTo(java.math.BigInteger.valueOf(5)) < 0
-                || offset.mod(java.math.BigInteger.valueOf(100)).equals(java.math.BigInteger.ZERO)) {
+        if (offset.compareTo(BigInteger.valueOf(5)) < 0
+                || offset.mod(BigInteger.valueOf(100)).equals(BigInteger.ZERO)) {
             log.debug("Processed message at offset {}: '{}'", offset, payload);
         }
 
