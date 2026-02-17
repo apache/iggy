@@ -15,27 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub(crate) mod args;
-pub(crate) mod client;
-pub(crate) mod client_state;
-pub(crate) mod cluster;
-pub(crate) mod command;
-pub(crate) mod compression;
-pub(crate) mod configuration;
-pub(crate) mod consensus;
-pub(crate) mod consumer;
-pub(crate) mod diagnostic;
-pub(crate) mod either;
-pub(crate) mod identifier;
-pub(crate) mod message;
-pub(crate) mod partition;
-pub(crate) mod permissions;
-pub(crate) mod personal_access_tokens;
-pub(crate) mod segment;
-pub(crate) mod segment_storage;
-pub(crate) mod snapshot;
-pub(crate) mod stats;
-pub(crate) mod stream;
-pub(crate) mod streaming_stats;
-pub(crate) mod topic;
-pub(crate) mod user;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Either<L, R> {
+    Left(L),
+    Right(R),
+}

@@ -16,6 +16,7 @@
 // under the License.
 
 use crate::stm::snapshot::{FillSnapshot, RestoreSnapshot, SnapshotError};
+use iggy_common::Either;
 use iggy_common::{header::PrepareHeader, message::Message};
 
 use crate::stm::{State, StateMachine};
@@ -44,8 +45,9 @@ where
 {
     type Input = T::Input;
     type Output = T::Output;
+    type Error = T::Error;
 
-    fn update(&self, input: Self::Input) -> Self::Output {
+    fn update(&self, input: Self::Input) -> Result<Self::Output, Self::Error> {
         self.inner.update(input)
     }
 }
@@ -70,24 +72,28 @@ impl StateMachine for () {
     // TODO: Make sure that the `Output` matches to the output type of the rest of list.
     // TODO: Add a trait bound to the output that will allow us to get the response in bytes.
     type Output = ();
+    type Error = iggy_common::IggyError;
 
-    fn update(&self, _input: Self::Input) -> Self::Output {}
+    fn update(&self, _input: Self::Input) -> Result<Self::Output, Self::Error> {
+        Ok(())
+    }
 }
 
 // Recursive case: process head and recurse on tail
-// No Clone bound needed - ownership passes through via Result
-impl<O, S, Rest> StateMachine for variadic!(S, ...Rest)
+// No Clone bound needed - ownership passes through via `Either`
+impl<O, E, S, Rest> StateMachine for variadic!(S, ...Rest)
 where
-    S: State<Output = O>,
-    Rest: StateMachine<Input = S::Input, Output = O>,
+    S: State<Output = O, Error = E>,
+    Rest: StateMachine<Input = S::Input, Output = O, Error = E>,
 {
     type Input = Rest::Input;
     type Output = O;
+    type Error = E;
 
-    fn update(&self, input: Self::Input) -> Self::Output {
-        match self.0.apply(input) {
-            Ok(result) => result,
-            Err(input) => self.1.update(input),
+    fn update(&self, input: Self::Input) -> Result<Self::Output, Self::Error> {
+        match self.0.apply(input)? {
+            Either::Left(result) => Ok(result),
+            Either::Right(input) => self.1.update(input),
         }
     }
 }
@@ -160,7 +166,7 @@ mod tests {
 
         let input = Message::new(std::mem::size_of::<PrepareHeader>());
 
-        mux.update(input);
+        let _ = mux.update(input);
     }
 
     #[test]
