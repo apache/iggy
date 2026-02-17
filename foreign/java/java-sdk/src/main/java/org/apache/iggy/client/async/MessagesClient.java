@@ -32,22 +32,66 @@ import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 
 /**
- * Async client interface for message operations.
- * All methods return CompletableFuture for non-blocking operations.
+ * Async client interface for message operations (producing and consuming).
+ *
+ * <p>This is the core interface for interacting with Iggy's message streaming
+ * capabilities. It supports both sending (producing) and polling (consuming)
+ * messages asynchronously via {@link CompletableFuture}.
+ *
+ * <h2>Producing Messages</h2>
+ * <pre>{@code
+ * MessagesClient messages = client.messages();
+ *
+ * // Send messages with balanced partitioning (round-robin)
+ * var msgs = List.of(Message.of("order-created"), Message.of("order-updated"));
+ * messages.sendMessages(streamId, topicId, Partitioning.balanced(), msgs)
+ *     .thenRun(() -> System.out.println("Messages sent"));
+ *
+ * // Send with message key partitioning (ensures ordering per key)
+ * messages.sendMessages(streamId, topicId, Partitioning.messagesKey("user-123"), msgs);
+ * }</pre>
+ *
+ * <h2>Consuming Messages</h2>
+ * <pre>{@code
+ * // Poll from the beginning
+ * messages.pollMessages(streamId, topicId, Optional.empty(),
+ *         Consumer.of(1L), PollingStrategy.first(), 100L, true)
+ *     .thenAccept(polled -> {
+ *         for (var msg : polled.messages()) {
+ *             System.out.println(new String(msg.payload()));
+ *         }
+ *     });
+ * }</pre>
+ *
+ * @see Partitioning
+ * @see PollingStrategy
+ * @see Consumer
+ * @see org.apache.iggy.client.async.tcp.AsyncIggyTcpClient#messages()
  */
 public interface MessagesClient {
 
     /**
-     * Asynchronously polls messages from a topic.
+     * Polls messages from a topic partition asynchronously.
      *
-     * @param streamId the stream identifier
-     * @param topicId the topic identifier
-     * @param partitionId optional partition ID
-     * @param consumer the consumer
-     * @param strategy the polling strategy
-     * @param count the number of messages to poll
-     * @param autoCommit whether to auto-commit offsets
-     * @return CompletableFuture that will complete with the polled messages
+     * <p>Messages are retrieved according to the specified {@link PollingStrategy}, which
+     * controls where in the partition to start reading (e.g., from the beginning, end,
+     * a specific offset, or a timestamp).
+     *
+     * <p>When {@code autoCommit} is {@code true}, the server automatically stores the
+     * consumer's offset after returning the messages. This simplifies offset management
+     * but provides at-least-once delivery semantics.
+     *
+     * @param streamId    the stream identifier (numeric or string-based)
+     * @param topicId     the topic identifier (numeric or string-based)
+     * @param partitionId optional partition ID to poll from; if empty, the server selects
+     *                    the partition (required when using consumer groups)
+     * @param consumer    the consumer identity, either individual ({@link Consumer#of(Long)})
+     *                    or group ({@link Consumer#group(Long)})
+     * @param strategy    the polling strategy controlling where to start reading
+     * @param count       the maximum number of messages to return
+     * @param autoCommit  whether the server should automatically commit the consumer offset
+     * @return a {@link CompletableFuture} that completes with the {@link PolledMessages}
+     *         containing the retrieved messages and their metadata
      */
     CompletableFuture<PolledMessages> pollMessages(
             StreamId streamId,
@@ -59,16 +103,20 @@ public interface MessagesClient {
             boolean autoCommit);
 
     /**
-     * Asynchronously polls messages from a topic (convenience method).
+     * Polls messages from a topic partition asynchronously using numeric identifiers.
      *
-     * @param streamId the stream ID
-     * @param topicId the topic ID
+     * <p>This is a convenience overload that accepts raw numeric IDs instead of typed
+     * identifier objects. See {@link #pollMessages(StreamId, TopicId, Optional, Consumer,
+     * PollingStrategy, Long, boolean)} for full documentation.
+     *
+     * @param streamId    the numeric stream ID
+     * @param topicId     the numeric topic ID
      * @param partitionId optional partition ID
-     * @param consumerId the consumer ID
-     * @param strategy the polling strategy
-     * @param count the number of messages to poll
-     * @param autoCommit whether to auto-commit offsets
-     * @return CompletableFuture that will complete with the polled messages
+     * @param consumerId  the numeric consumer ID
+     * @param strategy    the polling strategy
+     * @param count       the maximum number of messages to return
+     * @param autoCommit  whether to auto-commit offsets
+     * @return a {@link CompletableFuture} that completes with the {@link PolledMessages}
      */
     default CompletableFuture<PolledMessages> pollMessages(
             Long streamId,
@@ -89,25 +137,43 @@ public interface MessagesClient {
     }
 
     /**
-     * Asynchronously sends messages to a topic.
+     * Sends messages to a topic asynchronously.
      *
-     * @param streamId the stream identifier
-     * @param topicId the topic identifier
-     * @param partitioning the partitioning strategy
-     * @param messages the messages to send
-     * @return CompletableFuture that will complete when messages are sent
+     * <p>Messages are routed to partitions according to the specified {@link Partitioning}
+     * strategy:
+     * <ul>
+     *   <li>{@link Partitioning#balanced()} — round-robin distribution across partitions</li>
+     *   <li>{@link Partitioning#partitionId(Long)} — send to a specific partition</li>
+     *   <li>{@link Partitioning#messagesKey(String)} — hash-based routing that guarantees
+     *       messages with the same key always go to the same partition, preserving order</li>
+     * </ul>
+     *
+     * <p>Messages are batched into a single network request for efficiency. For high
+     * throughput, accumulate messages and send them in larger batches rather than one
+     * at a time.
+     *
+     * @param streamId     the stream identifier (numeric or string-based)
+     * @param topicId      the topic identifier (numeric or string-based)
+     * @param partitioning the partitioning strategy for routing messages
+     * @param messages     the list of messages to send
+     * @return a {@link CompletableFuture} that completes when all messages have been
+     *         acknowledged by the server
+     * @throws org.apache.iggy.exception.IggyException if the stream or topic does not exist
      */
     CompletableFuture<Void> sendMessages(
             StreamId streamId, TopicId topicId, Partitioning partitioning, List<Message> messages);
 
     /**
-     * Asynchronously sends messages to a topic (convenience method).
+     * Sends messages to a topic asynchronously using numeric identifiers.
      *
-     * @param streamId the stream ID
-     * @param topicId the topic ID
+     * <p>This is a convenience overload that accepts raw numeric IDs. See
+     * {@link #sendMessages(StreamId, TopicId, Partitioning, List)} for full documentation.
+     *
+     * @param streamId     the numeric stream ID
+     * @param topicId      the numeric topic ID
      * @param partitioning the partitioning strategy
-     * @param messages the messages to send
-     * @return CompletableFuture that will complete when messages are sent
+     * @param messages     the list of messages to send
+     * @return a {@link CompletableFuture} that completes when messages are acknowledged
      */
     default CompletableFuture<Void> sendMessages(
             Long streamId, Long topicId, Partitioning partitioning, List<Message> messages) {
