@@ -165,14 +165,9 @@ impl QuicClient {
 
     /// Create a new QUIC client for the provided configuration.
     pub fn create(config: Arc<QuicClientConfig>) -> Result<Self, IggyError> {
-        let server_address = config
-            .server_address
-            .parse::<SocketAddr>()
-            .map_err(|error| {
-                error!("Invalid server address: {error}");
-                IggyError::InvalidServerAddress
-            })?;
-        let client_address = if server_address.is_ipv6()
+        let resolved_addr = config.server_address.parse::<SocketAddr>().ok();
+
+        let client_address = if resolved_addr.is_some_and(|a| a.is_ipv6())
             && config.client_address == QuicClientConfig::default().client_address
         {
             "[::1]:0"
@@ -195,6 +190,7 @@ impl QuicClient {
         let mut endpoint = endpoint.unwrap();
         endpoint.set_default_client_config(quic_config);
 
+        let server_address = config.server_address.clone();
         Ok(Self {
             config,
             endpoint,
@@ -203,7 +199,7 @@ impl QuicClient {
             events: broadcast(1000),
             connected_at: Mutex::new(None),
             leader_redirection_state: Mutex::new(LeaderRedirectionState::new()),
-            current_server_address: Mutex::new(server_address.to_string()),
+            current_server_address: Mutex::new(server_address),
         })
     }
 
