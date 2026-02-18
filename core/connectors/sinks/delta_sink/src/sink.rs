@@ -18,10 +18,10 @@
 
 use crate::SinkState;
 use crate::coercions::{coerce, create_coercion_tree};
+use crate::utils::parse_schema;
 use crate::DeltaSink;
 use async_trait::async_trait;
 use deltalake_core::DeltaTable;
-use deltalake_core::kernel::{DataType, PrimitiveType, StructField};
 use deltalake_core::operations::create::CreateBuilder;
 use deltalake_core::writer::{DeltaWriter, JsonWriter};
 use iggy_connector_sdk::{ConsumedMessage, Error, MessagesMetadata, Payload, Sink, TopicMetadata};
@@ -193,39 +193,3 @@ async fn create_table(
     Ok(table)
 }
 
-fn parse_schema(schema: &[String]) -> Result<Vec<StructField>, Error> {
-    schema
-        .iter()
-        .map(|entry| {
-            let parts: Vec<&str> = entry.split_whitespace().collect();
-            if parts.len() != 2 {
-                return Err(Error::InvalidConfig);
-            }
-            let name = parts[0];
-            let data_type = parse_delta_type(parts[1])?;
-            Ok(StructField::new(name, data_type, true))
-        })
-        .collect()
-}
-
-fn parse_delta_type(type_str: &str) -> Result<DataType, Error> {
-    let primitive = match type_str {
-        "string" => PrimitiveType::String,
-        "byte" => PrimitiveType::Byte,
-        "short" => PrimitiveType::Short,
-        "integer" => PrimitiveType::Integer,
-        "long" => PrimitiveType::Long,
-        "float" => PrimitiveType::Float,
-        "double" => PrimitiveType::Double,
-        "boolean" => PrimitiveType::Boolean,
-        "binary" => PrimitiveType::Binary,
-        "date" => PrimitiveType::Date,
-        "timestamp" => PrimitiveType::Timestamp,
-        "timestampNtz" => PrimitiveType::TimestampNtz,
-        _ => {
-            error!("Unsupported Delta type: {type_str}");
-            return Err(Error::InvalidConfig);
-        }
-    };
-    Ok(DataType::Primitive(primitive))
-}

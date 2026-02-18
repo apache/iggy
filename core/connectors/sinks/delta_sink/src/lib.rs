@@ -28,6 +28,7 @@ use tokio::sync::Mutex;
 
 mod coercions;
 mod sink;
+mod utils;
 
 use crate::coercions::CoercionTree;
 
