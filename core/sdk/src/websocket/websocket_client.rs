@@ -217,10 +217,20 @@ impl WebSocketClient {
                     }
                 }
 
-                let server_addr = current_address.parse::<SocketAddr>().map_err(|_| {
-                    error!("Invalid server address: {}", current_address);
-                    IggyError::InvalidConfiguration
-                })?;
+                let server_addr = tokio::net::lookup_host(&*current_address)
+                    .await
+                    .map_err(|e| {
+                        error!(
+                            "Failed to resolve server address '{}': {}",
+                            current_address, e
+                        );
+                        IggyError::InvalidConfiguration
+                    })?
+                    .next()
+                    .ok_or_else(|| {
+                        error!("No addresses resolved for '{}'", current_address);
+                        IggyError::InvalidConfiguration
+                    })?;
 
                 let connection_stream = if self.config.tls_enabled {
                     match self.connect_tls(server_addr, &mut retry_count).await {
