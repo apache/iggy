@@ -31,20 +31,21 @@
     --color-shadow-light: rgba(0, 0, 0, 0.05);
     --color-shadow-medium: rgba(0, 0, 0, 0.15);
 
-    /* Colors - Dark Theme */
-    --color-dark-background: #242424;
-    --color-dark-background-elevated: #1a1a1a;
-    --color-dark-sidebar: #2d2d2d;
-    --color-dark-border: #404040;
-    --color-dark-text: #ffffff;
-    --color-dark-text-secondary: #aaaaaa;
-    --color-dark-hover: #333333;
-    --color-dark-active: #1a1a1a;
-    --color-dark-input: #2a2a2a;
+    /* Colors - Dark Theme - Iggy Brand */
+    --color-dark-background: #070C18;              /* Navy */
+    --color-dark-background-elevated: #132F4C;     /* Lighter Navy */
+    --color-dark-sidebar: #101318;                 /* Navy sidebar */
+    --color-dark-border: #2C323A;                   /* Darker border for contrast */
+    --color-dark-text: #F5F5F5;                    /* Cream text */
+    --color-dark-text-secondary: #E0E0E0;
+    --color-dark-hover: #0b1428;
+    --color-dark-active: #FF9305;
+    --color-dark-input: #151b28;
+    --color-dark-accent: #FF9305;
 
     /* Additional Dark Theme Variables */
-    --color-dark-tooltip-background: #2a2a2a;
-    --color-dark-select-arrow: #ffffff;
+    --color-dark-tooltip-background: #313338;
+    --color-dark-select-arrow: #F5F5F5;
 
     /* Spacing */
     --spacing-xs: 4px;
@@ -404,11 +405,13 @@ body.dark select option {
 .dark .download-button:hover,
 .dark .theme-toggle:hover {
     background-color: var(--color-dark-hover);
+    border-color: var(--color-dark-accent);
 }
 
 .dark .icon-button.active {
-    background-color: var(--color-dark-active);
-    border-color: var(--color-dark-border);
+    background-color: var(--color-dark-hover);
+    border-color: var(--color-dark-accent);
+    color: var(--color-dark-accent);
 }
 
 .controls {
@@ -550,13 +553,15 @@ body.dark select option {
 }
 
 .dark .copy-button {
-    background: var(--color-dark-active);
-    color: var(--color-dark-text);
-    border-color: var(--color-dark-border);
+    background: var(--color-dark-hover);
+    color: var(--color-dark-accent);
+    border-color: var(--color-dark-accent);
 }
 
 .dark .copy-button:hover {
-    background: var(--color-dark-hover);
+    background: var(--color-dark-accent);
+    color: var(--color-dark-text);
+    border-color: var(--color-dark-accent);
 }
 
 .copy-notification {
@@ -708,8 +713,9 @@ body.dark .segment:hover:not(.active) {
 }
 
 body.dark .segment.active {
-    background-color: var(--color-dark-active);
-    color: var(--color-dark-text);
+    background-color: var(--color-dark-accent);
+    color: var(--color-dark-background);
+    font-weight: 500;
 }
 
 .chart-container {
@@ -931,12 +937,13 @@ body.dark .footer .gitref {
 
 .dark .tab-button:hover {
     background-color: var(--color-dark-hover);
-    color: var(--color-dark-text);
+    color: var(--color-dark-accent);
 }
 
 .dark .tab-button.active {
-    background-color: var(--color-dark-active);
-    color: var(--color-dark-text);
+    background-color: transparent;
+    color: var(--color-dark-accent);
+    border-bottom: 2px solid var(--color-dark-accent);
 }
 
 .dark .tab-list {
@@ -1011,13 +1018,14 @@ body.dark .footer .gitref {
 
 .dark .benchmark-option:hover:not(.inactive) {
     background-color: var(--color-dark-hover);
-    border-color: var(--color-dark-text-secondary);
+    border-color: var(--color-dark-accent);
 }
 
 .dark .benchmark-option.active {
-    background-color: var(--color-dark-active);
-    color: var(--color-dark-text);
-    border-left: 4px solid var(--color-dark-text);
+    background-color: var(--color-dark-hover);
+    color: var(--color-dark-accent);
+    border: 1px solid var(--color-dark-accent);
+    border-left: 4px solid var(--color-dark-accent);
 }
 
 .benchmark-list-container {
@@ -1149,11 +1157,12 @@ span.benchmark-list-item-dot {
 
 .dark .benchmark-list-item:hover {
     background-color: var(--color-dark-hover);
+    border-left-color: var(--color-dark-accent);
 }
 
 .dark .benchmark-list-item.active {
-    background-color: var(--color-dark-active);
-    border-left: 4px solid var(--color-dark-text);
+    background-color: var(--color-dark-hover);
+    border-left: 4px solid var(--color-dark-accent);
     padding-left: calc(var(--spacing-lg) - 4px);
 }
 
@@ -1224,11 +1233,14 @@ span.benchmark-list-item-dot {
 
 .dark .measurement-button:hover {
     background-color: var(--color-dark-hover);
+    border-color: var(--color-dark-accent);
 }
 
 .dark .measurement-button.active {
-    background-color: var(--color-dark-active);
-    border-color: var(--color-dark-border);
+    background-color: var(--color-dark-accent);
+    color: var(--color-dark-background);
+    border-color: var(--color-dark-accent);
+    font-weight: 500;
 }
 
 .server-stats-button {
@@ -1264,7 +1276,7 @@ span.benchmark-list-item-dot {
 
 .dark .server-stats-button:hover:not(:disabled) {
     background-color: var(--color-dark-hover);
-    border-color: var(--color-dark-text-secondary);
+    border-color: var(--color-dark-accent);
 }
 
 .dark .server-stats-button:disabled {
@@ -1583,8 +1595,8 @@ body.dark .benchmark-list-item-metric.message-throughput {
 
 /* Dark theme adjustments for recent benchmarks */
 .dark .recent-benchmark-item.active {
-    border-left-color: var(--color-primary);
-    background-color: var(--color-dark-active);
+    border-left-color: var(--color-dark-accent);
+    background-color: var(--color-dark-hover);
 }
 
 .dark .benchmark-list-item-title {
@@ -1643,6 +1655,7 @@ body.dark .benchmark-list-item-metric.message-throughput {
 
 .dark .benchmark-card:hover {
     box-shadow: 0 4px 8px rgba(0, 0, 0, 0.3);
+    border-color: var(--color-dark-accent);
 }
 
 .dark .card-header {
@@ -1666,19 +1679,21 @@ body.dark .benchmark-list-item-metric.message-throughput {
 }
 
 .dark .view-details-button {
-    background-color: var(--color-dark-sidebar);
+    background-color: var(--color-dark-hover);
     border-color: var(--color-dark-border);
     color: var(--color-dark-text);
 }
 
 .dark .view-details-button:hover {
-    background-color: var(--color-dark-hover);
+    background-color: var(--color-dark-border);
+    border-color: var(--color-dark-accent);
+    color: var(--color-dark-accent);
 }
 
 .dark .error-message button {
-    background-color: var(--color-dark-sidebar);
-    border-color: var(--color-dark-border);
-    color: var(--color-dark-text);
+    background-color: var(--color-dark-hover);
+    border-color: var(--color-dark-accent);
+    color: var(--color-dark-accent);
 }
 
 .dark .sidebar {

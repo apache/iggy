@@ -22,7 +22,7 @@ use crate::{
 };
 use bit_set::BitSet;
 use iggy_common::header::{
-    Command2, DoViewChangeHeader, PrepareHeader, PrepareOkHeader, RequestHeader,
+    Command2, ConsensusHeader, DoViewChangeHeader, PrepareHeader, PrepareOkHeader, RequestHeader,
     StartViewChangeHeader, StartViewHeader,
 };
 use iggy_common::message::Message;
@@ -1093,7 +1093,9 @@ where
     B: MessageBus,
     P: Pipeline<Message = Message<PrepareHeader>, Entry = PipelineEntry>,
 {
-    fn project(self, consensus: &VsrConsensus<B, P>) -> Message<PrepareHeader> {
+    type Consensus = VsrConsensus<B, P>;
+
+    fn project(self, consensus: &Self::Consensus) -> Message<PrepareHeader> {
         let op = consensus.sequencer.current_sequence() + 1;
 
         self.transmute_header(|old, new| {
@@ -1124,7 +1126,9 @@ where
     B: MessageBus,
     P: Pipeline<Message = Message<PrepareHeader>, Entry = PipelineEntry>,
 {
-    fn project(self, consensus: &VsrConsensus<B, P>) -> Message<PrepareOkHeader> {
+    type Consensus = VsrConsensus<B, P>;
+
+    fn project(self, consensus: &Self::Consensus) -> Message<PrepareOkHeader> {
         self.transmute_header(|old, new| {
             *new = PrepareOkHeader {
                 command: Command2::PrepareOk,
@@ -1153,10 +1157,12 @@ where
     P: Pipeline<Message = Message<PrepareHeader>, Entry = PipelineEntry>,
 {
     type MessageBus = B;
+    #[rustfmt::skip] // Scuffed formatter. TODO: Make the naming less ambiguous for `Message`.
+    type Message<H> = Message<H> where H: ConsensusHeader;
+    type RequestHeader = RequestHeader;
+    type ReplicateHeader = PrepareHeader;
+    type AckHeader = PrepareOkHeader;
 
-    type RequestMessage = Message<RequestHeader>;
-    type ReplicateMessage = Message<PrepareHeader>;
-    type AckMessage = Message<PrepareOkHeader>;
     type Sequencer = LocalSequencer;
     type Pipeline = P;
 
@@ -1166,7 +1172,7 @@ where
     // This avoids serialization/queuing overhead and would also allow
     // reordering to WAL-first (on_replicate before pipeline_message)
     // without risking lost self-acks from dispatch timing.
-    fn pipeline_message(&self, message: Self::ReplicateMessage) {
+    fn pipeline_message(&self, message: Self::Message<Self::ReplicateHeader>) {
         assert!(self.is_primary(), "only primary can pipeline messages");
 
         let mut pipeline = self.pipeline.borrow_mut();
@@ -1178,7 +1184,7 @@ where
         pipeline.verify();
     }
 
-    fn post_replicate_verify(&self, message: &Self::ReplicateMessage) {
+    fn post_replicate_verify(&self, message: &Self::Message<Self::ReplicateHeader>) {
         let header = message.header();
 
         // verify the message belongs to our cluster
