@@ -41,7 +41,7 @@ runs:
       uses: actions/cache@v4
       with:
         path: ~/.cache/uv
-        key: uv-${{ runner.os }}-${{ hashFiles('examples/python/uv.lock', 'foreign/python/uv.lock') }}
+        key: uv-${{ runner.os }}-${{ hashFiles('examples/python/uv.lock', 'foreign/python/uv.lock', 'bdd/python/uv.lock') }}
 
     - name: Install dependencies
       shell: bash
