@@ -915,4 +915,46 @@ mod tests {
             IggyDuration::from_str("5s").unwrap()
         );
     }
+
+    #[tokio::test]
+    async fn should_create_with_hostname_address() {
+        let config = QuicClientConfig {
+            server_address: "localhost:8080".to_string(),
+            ..Default::default()
+        };
+        let client = QuicClient::create(Arc::new(config));
+        assert!(client.is_ok(), "Expected Ok, got: {:?}", client.err());
+    }
+
+    #[tokio::test]
+    async fn should_create_with_fqdn_address() {
+        let config = QuicClientConfig {
+            server_address: "my-server.example.com:8080".to_string(),
+            ..Default::default()
+        };
+        let client = QuicClient::create(Arc::new(config));
+        assert!(client.is_ok(), "Expected Ok, got: {:?}", client.err());
+    }
+
+    #[tokio::test]
+    async fn should_store_raw_hostname_in_current_server_address() {
+        let hostname = "localhost:8080";
+        let config = QuicClientConfig {
+            server_address: hostname.to_string(),
+            ..Default::default()
+        };
+        let client = QuicClient::create(Arc::new(config)).unwrap();
+        let stored = client.current_server_address.lock().await;
+        assert_eq!(*stored, hostname);
+    }
+
+    #[tokio::test]
+    async fn should_succeed_from_connection_string_with_hostname() {
+        let connection_string = "iggy+quic://user:secret@localhost:1234";
+        let client = QuicClient::from_connection_string(connection_string);
+        assert!(client.is_ok());
+
+        let client = client.unwrap();
+        assert_eq!(client.config.server_address, "localhost:1234");
+    }
 }

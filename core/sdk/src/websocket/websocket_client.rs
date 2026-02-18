@@ -725,4 +725,14 @@ mod tests {
         let client = WebSocketClient::from_connection_string(connection_string);
         assert!(client.is_err());
     }
+
+    #[test]
+    fn should_succeed_from_connection_string_with_hostname() {
+        let connection_string = "iggy+ws://user:secret@localhost:8092";
+        let client = WebSocketClient::from_connection_string(connection_string);
+        assert!(client.is_ok());
+
+        let client = client.unwrap();
+        assert_eq!(client.config.server_address, "localhost:8092");
+    }
 }
