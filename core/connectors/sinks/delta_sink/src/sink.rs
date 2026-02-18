@@ -20,6 +20,9 @@ use crate::SinkState;
 use crate::coercions::{coerce, create_coercion_tree};
 use crate::DeltaSink;
 use async_trait::async_trait;
+use deltalake_core::DeltaTable;
+use deltalake_core::kernel::{DataType, PrimitiveType, StructField};
+use deltalake_core::operations::create::CreateBuilder;
 use deltalake_core::writer::{DeltaWriter, JsonWriter};
 use iggy_connector_sdk::{ConsumedMessage, Error, MessagesMetadata, Payload, Sink, TopicMetadata};
 use tracing::{debug, error, info};
@@ -37,15 +40,29 @@ impl Sink for DeltaSink {
             Error::InitError(format!("Invalid table URI: {e}"))
         })?;
 
-        let table = deltalake_core::open_table_with_storage_options(
+        info!("Parsed table URI: {}", table_url);
+
+        let table = match deltalake_core::open_table_with_storage_options(
             table_url,
             self.config.storage_options.clone(),
         )
         .await
-        .map_err(|e| {
-            error!("Failed to load Delta table: {e}");
-            Error::InitError(format!("Failed to load Delta table: {e}"))
-        })?;
+        {
+            Ok(table) => table,
+            Err(_) if !self.config.schema.is_empty() => {
+                info!("Table does not exist, creating from configured schema...");
+                create_table(
+                    &self.config.table_uri,
+                    &self.config.storage_options,
+                    &self.config.schema,
+                )
+                .await?
+            }
+            Err(e) => {
+                error!("Failed to load Delta table: {e}");
+                return Err(Error::InitError(format!("Failed to load Delta table: {e}")));
+            }
+        };
 
         let kernel_schema = table.snapshot().map_err(|e| {
             error!("Failed to get table snapshot: {e}");
@@ -155,4 +172,60 @@ impl Sink for DeltaSink {
         );
         Ok(())
     }
+}
+
+async fn create_table(
+    table_uri: &str,
+    storage_options: &std::collections::HashMap<String, String>,
+    schema: &[String],
+) -> Result<DeltaTable, Error> {
+    let columns = parse_schema(schema)?;
+    let table = CreateBuilder::new()
+        .with_location(table_uri)
+        .with_storage_options(storage_options.clone())
+        .with_columns(columns)
+        .await
+        .map_err(|e| {
+            error!("Failed to create Delta table: {e}");
+            Error::InitError(format!("Failed to create Delta table: {e}"))
+        })?;
+    info!("Created new Delta table at {table_uri}");
+    Ok(table)
+}
+
+fn parse_schema(schema: &[String]) -> Result<Vec<StructField>, Error> {
+    schema
+        .iter()
+        .map(|entry| {
+            let parts: Vec<&str> = entry.split_whitespace().collect();
+            if parts.len() != 2 {
+                return Err(Error::InvalidConfig);
+            }
+            let name = parts[0];
+            let data_type = parse_delta_type(parts[1])?;
+            Ok(StructField::new(name, data_type, true))
+        })
+        .collect()
+}
+
+fn parse_delta_type(type_str: &str) -> Result<DataType, Error> {
+    let primitive = match type_str {
+        "string" => PrimitiveType::String,
+        "byte" => PrimitiveType::Byte,
+        "short" => PrimitiveType::Short,
+        "integer" => PrimitiveType::Integer,
+        "long" => PrimitiveType::Long,
+        "float" => PrimitiveType::Float,
+        "double" => PrimitiveType::Double,
+        "boolean" => PrimitiveType::Boolean,
+        "binary" => PrimitiveType::Binary,
+        "date" => PrimitiveType::Date,
+        "timestamp" => PrimitiveType::Timestamp,
+        "timestampNtz" => PrimitiveType::TimestampNtz,
+        _ => {
+            error!("Unsupported Delta type: {type_str}");
+            return Err(Error::InvalidConfig);
+        }
+    };
+    Ok(DataType::Primitive(primitive))
 }

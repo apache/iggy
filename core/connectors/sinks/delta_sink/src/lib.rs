@@ -16,6 +16,9 @@
  * under the License.
  */
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use deltalake_core::DeltaTable;
 use deltalake_core::writer::JsonWriter;
 use iggy_connector_sdk::sink_connector;
@@ -49,6 +52,8 @@ pub struct DeltaSinkConfig {
     pub table_uri: String,
     #[serde(default)]
     pub storage_options: HashMap<String, String>,
+    #[serde(default)]
+    pub schema: Vec<String>,
 }
 
 impl DeltaSink {

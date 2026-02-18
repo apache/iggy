@@ -33,8 +33,17 @@ consumer_group = "delta_sink_connector"
 
 [plugin_config]
 table_uri = "file:///Users/kriti/Projects/iggy/temp/iggy_delta_table"
+schema = [
+    "user_id string",
+    "user_type byte",
+    "email string",
+    "source string",
+    "state string",
+    "created_at timestamp",
+    "message string",
+]
 
-[plugin_config.storage_options]
+# [plugin_config.storage_options]
 # AWS_ACCESS_KEY_ID = "your-access-key"
 # AWS_SECRET_ACCESS_KEY = "your-secret-key"
 # AWS_REGION = "us-east-1"

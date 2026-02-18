@@ -39,6 +39,7 @@ chrono = { workspace = true }
 dashmap = { workspace = true }
 deltalake-core = { workspace = true }
 iggy_connector_sdk = { workspace = true }
+mimalloc = { workspace = true }
 once_cell = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
