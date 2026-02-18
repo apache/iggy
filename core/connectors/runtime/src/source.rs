@@ -211,7 +211,7 @@ pub async fn init(
 
 fn get_plugin_version(container: &Container<SourceApi>) -> String {
     unsafe {
-        let version_ptr = (container.version)();
+        let version_ptr = (container.iggy_source_version)();
         std::ffi::CStr::from_ptr(version_ptr)
             .to_string_lossy()
             .into_owned()
@@ -229,7 +229,7 @@ fn init_source(
         serde_json::to_string(plugin_config).expect("Invalid source plugin config.");
     let state_ptr = state.as_ref().map_or(std::ptr::null(), |s| s.0.as_ptr());
     let state_len = state.as_ref().map_or(0, |s| s.0.len());
-    let result = (container.open)(
+    let result = (container.iggy_source_open)(
         id,
         plugin_config.as_ptr(),
         plugin_config.len(),
