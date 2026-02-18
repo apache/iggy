@@ -218,7 +218,7 @@ macro_rules! source_connector {
 
         #[cfg(not(test))]
         #[unsafe(no_mangle)]
-        unsafe extern "C" fn open(
+        unsafe extern "C" fn iggy_source_open(
             id: u32,
             config_ptr: *const u8,
             config_len: usize,
@@ -242,7 +242,7 @@ macro_rules! source_connector {
 
         #[cfg(not(test))]
         #[unsafe(no_mangle)]
-        unsafe extern "C" fn handle(id: u32, callback: SendCallback) -> i32 {
+        unsafe extern "C" fn iggy_source_handle(id: u32, callback: SendCallback) -> i32 {
             let Some(mut instance) = INSTANCES.get_mut(&id) else {
                 tracing::error!(
                     "Source connector with ID: {id} was not found and cannot be handled."
@@ -254,7 +254,7 @@ macro_rules! source_connector {
 
         #[cfg(not(test))]
         #[unsafe(no_mangle)]
-        unsafe extern "C" fn close(id: u32) -> i32 {
+        unsafe extern "C" fn iggy_source_close(id: u32) -> i32 {
             let Some(mut instance) = INSTANCES.remove(&id) else {
                 tracing::error!(
                     "Source connector with ID: {id} was not found and cannot be closed."
@@ -266,7 +266,7 @@ macro_rules! source_connector {
 
         #[cfg(not(test))]
         #[unsafe(no_mangle)]
-        extern "C" fn version() -> *const std::ffi::c_char {
+        extern "C" fn iggy_source_version() -> *const std::ffi::c_char {
             static VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "\0");
             VERSION.as_ptr() as *const std::ffi::c_char
         }
