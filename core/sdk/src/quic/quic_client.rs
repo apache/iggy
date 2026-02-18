@@ -300,13 +300,20 @@ impl QuicClient {
             let remote_address;
             loop {
                 let server_address_str = self.current_server_address.lock().await.clone();
-                let server_address: SocketAddr = server_address_str.parse().map_err(|e| {
-                    error!(
-                        "Failed to parse server address '{}': {}",
-                        server_address_str, e
-                    );
-                    IggyError::InvalidServerAddress
-                })?;
+                let server_address = tokio::net::lookup_host(&server_address_str)
+                    .await
+                    .map_err(|e| {
+                        error!(
+                            "Failed to resolve server address '{}': {}",
+                            server_address_str, e
+                        );
+                        IggyError::InvalidServerAddress
+                    })?
+                    .next()
+                    .ok_or_else(|| {
+                        error!("No addresses resolved for '{}'", server_address_str);
+                        IggyError::InvalidServerAddress
+                    })?;
                 info!(
                     "{NAME} client is connecting to server: {}...",
                     server_address
