@@ -66,6 +66,8 @@ runs:
         [ -d "$DIR_BDD" ] && DIRS_TO_CHECK="$DIRS_TO_CHECK $DIR_BDD"
         [ -d "$DIR_EXAMPLES" ] && DIRS_TO_CHECK="$DIRS_TO_CHECK $DIR_EXAMPLES"
 
+        cd foreign/python
+
         echo "Directories to check: $DIRS_TO_CHECK"
         echo "ruff version: $(uv run ruff --version)"
 
