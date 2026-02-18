@@ -26,12 +26,12 @@ use std::ops::AsyncFnOnce;
 /// Shared pipeline-first request flow used by metadata and partitions.
 pub async fn pipeline_prepare_common<C, F>(
     consensus: &C,
-    prepare: C::ReplicateMessage,
+    prepare: C::Message<C::ReplicateHeader>,
     on_replicate: F,
 ) where
     C: Consensus,
-    C::ReplicateMessage: Clone,
-    F: AsyncFnOnce(C::ReplicateMessage) -> (),
+    C::Message<C::ReplicateHeader>: Clone,
+    F: AsyncFnOnce(C::Message<C::ReplicateHeader>) -> (),
 {
     assert!(!consensus.is_follower(), "on_request: primary only");
     assert!(consensus.is_normal(), "on_request: status must be normal");
