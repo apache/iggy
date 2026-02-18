@@ -16,7 +16,7 @@
 # under the License.
 
 # Multi-stage build for Python SDK testing
-FROM python:3.11-slim AS base
+FROM python:3.10-slim AS base
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
@@ -28,6 +28,10 @@ RUN apt-get update && apt-get install -y \
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 ENV PATH="/root/.cargo/bin:${PATH}"
 
+# Install uv
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.local/bin:${PATH}"
+
 # Set working directory
 WORKDIR /workspace
 
@@ -35,13 +39,10 @@ WORKDIR /workspace
 COPY Cargo.toml Cargo.lock ./
 COPY foreign/python/Cargo.toml ./foreign/python/
 COPY foreign/python/pyproject.toml ./foreign/python/
+COPY foreign/python/uv.lock ./foreign/python/
 COPY foreign/python/README.md ./foreign/python/
 COPY foreign/python/LICENSE ./foreign/python/
 COPY foreign/python/NOTICE ./foreign/python/
-
-# Install build dependencies
-WORKDIR /workspace/foreign/python
-RUN pip install --no-cache-dir maturin
 
 # Copy core dependencies (changes less frequently)
 COPY core/ /workspace/core/
@@ -49,12 +50,13 @@ COPY core/ /workspace/core/
 # Copy Python SDK source (changes more frequently)
 COPY foreign/python/src/ ./src/
 
-# Build Python SDK and install wheel
-RUN maturin build
-RUN find target/wheels/ -name "*.whl" -exec pip install {} \;
+# Install dependencies and build extension using native uv workflow
+WORKDIR /workspace/foreign/python
+RUN uv sync --frozen --extra dev --extra testing
+RUN uv run maturin develop
 
-# Install test dependencies from pyproject.toml
-RUN pip install --no-cache-dir -e ".[testing]"
+# Use the uv-managed virtual environment by default
+ENV PATH="/workspace/foreign/python/.venv/bin:${PATH}"
 
 # Copy test files
 COPY foreign/python/tests/ ./tests/

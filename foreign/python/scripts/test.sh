@@ -42,7 +42,7 @@ if [ -z "$SERVER_IP" ]; then
 fi
 echo "📍 Resolved ${IGGY_SERVER_HOST} to ${SERVER_IP}"
 
-if ! python3 -c "
+if ! uv run python -c "
 import asyncio
 import sys
 from apache_iggy import IggyClient
@@ -71,7 +71,7 @@ mkdir -p test-results
 
 # Run tests with detailed output
 echo "🧪 Running Python SDK tests..."
-python3 -m pytest \
+uv run pytest \
     "${PYTEST_ARGS:--v --tb=short}" \
     --junit-xml=test-results/pytest.xml \
     tests/
