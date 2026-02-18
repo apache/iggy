@@ -35,8 +35,54 @@ import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 
 /**
- * Async TCP client for Apache Iggy using Netty.
- * This is a true async implementation with non-blocking I/O.
+ * Async TCP client for Apache Iggy message streaming, built on Netty.
+ *
+ * <p>This client provides fully non-blocking I/O for communicating with an Iggy server
+ * over TCP using the binary protocol. All operations return {@link CompletableFuture}
+ * instances, enabling efficient concurrent and reactive programming patterns.
+ *
+ * <h2>Lifecycle</h2>
+ * <p>The client follows a three-phase lifecycle:
+ * <ol>
+ *   <li><strong>Build</strong> — configure the client via {@link #builder()} or
+ *       {@link org.apache.iggy.Iggy#tcpClientBuilder()}</li>
+ *   <li><strong>Connect</strong> — establish the TCP connection with {@link #connect()}</li>
+ *   <li><strong>Login</strong> — authenticate with {@link #login()} or
+ *       {@link UsersClient#login(String, String)}</li>
+ * </ol>
+ *
+ * <h2>Quick Start</h2>
+ * <pre>{@code
+ * // One-liner: build, connect, and login
+ * var client = AsyncIggyTcpClient.builder()
+ *     .host("localhost")
+ *     .port(8090)
+ *     .credentials("iggy", "iggy")
+ *     .buildAndLogin()
+ *     .join();
+ *
+ * // Send a message
+ * client.messages().sendMessages(
+ *         StreamId.of(1L), TopicId.of(1L),
+ *         Partitioning.balanced(),
+ *         List.of(Message.of("hello world")))
+ *     .join();
+ *
+ * // Always close when done
+ * client.close().join();
+ * }</pre>
+ *
+ * <h2>Thread Safety</h2>
+ * <p>This client is thread-safe. Multiple threads can invoke operations concurrently;
+ * the underlying Netty event loop serializes writes to the TCP connection while
+ * response handling is performed asynchronously.
+ *
+ * <h2>Resource Management</h2>
+ * <p>Always call {@link #close()} when the client is no longer needed. This shuts down
+ * the Netty event loop group and releases all associated resources.
+ *
+ * @see AsyncIggyTcpClientBuilder
+ * @see org.apache.iggy.Iggy#tcpClientBuilder()
  */
 public class AsyncIggyTcpClient {
 
@@ -57,6 +103,14 @@ public class AsyncIggyTcpClient {
     private TopicsClient topicsClient;
     private UsersClient usersClient;
 
+    /**
+     * Creates a new async TCP client with default settings.
+     *
+     * <p>Prefer using {@link #builder()} for configuring the client.
+     *
+     * @param host the server hostname
+     * @param port the server port
+     */
     public AsyncIggyTcpClient(String host, int port) {
         this(host, port, null, null, null, null, null, null, false, Optional.empty());
     }
@@ -86,9 +140,9 @@ public class AsyncIggyTcpClient {
     }
 
     /**
-     * Creates a new builder for configuring AsyncIggyTcpClient.
+     * Creates a new builder for configuring an {@code AsyncIggyTcpClient}.
      *
-     * @return a new Builder instance
+     * @return a new {@link AsyncIggyTcpClientBuilder} instance
      */
     public static AsyncIggyTcpClientBuilder builder() {
         return new AsyncIggyTcpClientBuilder();
@@ -97,7 +151,11 @@ public class AsyncIggyTcpClient {
     /**
      * Connects to the Iggy server asynchronously.
      *
-     * @return a CompletableFuture that completes when connected
+     * <p>This establishes the TCP connection using Netty's non-blocking I/O. After the
+     * returned future completes, the sub-clients ({@link #messages()}, {@link #streams()},
+     * etc.) become available. You must call this before performing any operations.
+     *
+     * @return a {@link CompletableFuture} that completes when the connection is established
      */
     public CompletableFuture<Void> connect() {
         connection = new AsyncTcpConnection(host, port, enableTls, tlsCertificate);
@@ -113,9 +171,15 @@ public class AsyncIggyTcpClient {
     /**
      * Logs in using the credentials provided during client construction.
      *
-     * @return a CompletableFuture that completes when logged in
-     * @throws IggyMissingCredentialsException if no credentials were provided
-     * @throws IggyNotConnectedException if client is not connected
+     * <p>Credentials must have been set via
+     * {@link AsyncIggyTcpClientBuilder#credentials(String, String)} when building
+     * the client. For explicit credential handling, use
+     * {@link UsersClient#login(String, String)} instead.
+     *
+     * @return a {@link CompletableFuture} that completes with the user's
+     *         {@link IdentityInfo} on success
+     * @throws IggyMissingCredentialsException if no credentials were provided at build time
+     * @throws IggyNotConnectedException       if {@link #connect()} has not been called
      */
     public CompletableFuture<IdentityInfo> login() {
         if (usersClient == null) {
@@ -128,7 +192,10 @@ public class AsyncIggyTcpClient {
     }
 
     /**
-     * Gets the async users client.
+     * Returns the async users client for authentication operations.
+     *
+     * @return the {@link UsersClient} instance
+     * @throws IggyNotConnectedException if the client is not connected
      */
     public UsersClient users() {
         if (usersClient == null) {
@@ -138,7 +205,10 @@ public class AsyncIggyTcpClient {
     }
 
     /**
-     * Gets the async messages client.
+     * Returns the async messages client for producing and consuming messages.
+     *
+     * @return the {@link MessagesClient} instance
+     * @throws IggyNotConnectedException if the client is not connected
      */
     public MessagesClient messages() {
         if (messagesClient == null) {
@@ -148,7 +218,10 @@ public class AsyncIggyTcpClient {
     }
 
     /**
-     * Gets the async consumer groups client.
+     * Returns the async consumer groups client for group membership management.
+     *
+     * @return the {@link ConsumerGroupsClient} instance
+     * @throws IggyNotConnectedException if the client is not connected
      */
     public ConsumerGroupsClient consumerGroups() {
         if (consumerGroupsClient == null) {
@@ -158,7 +231,10 @@ public class AsyncIggyTcpClient {
     }
 
     /**
-     * Gets the async streams client.
+     * Returns the async streams client for stream management.
+     *
+     * @return the {@link StreamsClient} instance
+     * @throws IggyNotConnectedException if the client is not connected
      */
     public StreamsClient streams() {
         if (streamsClient == null) {
@@ -168,7 +244,10 @@ public class AsyncIggyTcpClient {
     }
 
     /**
-     * Gets the async topics client.
+     * Returns the async topics client for topic management.
+     *
+     * @return the {@link TopicsClient} instance
+     * @throws IggyNotConnectedException if the client is not connected
      */
     public TopicsClient topics() {
         if (topicsClient == null) {
@@ -178,7 +257,12 @@ public class AsyncIggyTcpClient {
     }
 
     /**
-     * Closes the connection and releases resources.
+     * Closes the TCP connection and releases all Netty resources.
+     *
+     * <p>This shuts down the event loop group gracefully. After calling this method,
+     * the client cannot be reused — create a new instance if needed.
+     *
+     * @return a {@link CompletableFuture} that completes when all resources are released
      */
     public CompletableFuture<Void> close() {
         if (connection != null) {

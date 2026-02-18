@@ -105,7 +105,8 @@ tasks.register<JavaExec>("runAsyncProducer") {
     mainClass.set("org.apache.iggy.examples.async.AsyncProducer")
 }
 
-tasks.register<JavaExec>("runAsyncConsumerExample") {
+tasks.register<JavaExec>("runAsyncConsumer") {
     classpath = sourceSets["main"].runtimeClasspath
-    mainClass.set("org.apache.iggy.examples.async.AsyncConsumerExample")
+    mainClass.set("org.apache.iggy.examples.async.AsyncConsumer")
 }
+
