@@ -21,6 +21,8 @@ use thiserror::Error;
 const HEADER_SIZE: usize = 256;
 pub trait ConsensusHeader: Sized + Pod + Zeroable {
     const COMMAND: Command2;
+    // TODO: Trait consts are never evaluated unless explicitly accessed (e.g. `<T as ConsensusHeader>::_SIZE_CHECK`).
+    // The size invariant is enforced by repr(C) layout + bytemuck Pod derive; consider adding a static_assert in each impl.
     const _SIZE_CHECK: () = assert!(std::mem::size_of::<Self>() == HEADER_SIZE);
 
     fn validate(&self) -> Result<(), ConsensusError>;
@@ -135,8 +137,7 @@ pub struct GenericHeader {
     pub replica: u8,
     pub reserved_frame: [u8; 66],
 
-    pub namespace: u64,
-    pub reserved_command: [u8; 120],
+    pub reserved_command: [u8; 128],
 }
 
 unsafe impl Pod for GenericHeader {}
@@ -489,18 +490,17 @@ impl Default for ReplyHeader {
 #[repr(C)]
 pub struct StartViewChangeHeader {
     pub checksum: u128,
-    pub checksum_padding: u128,
     pub checksum_body: u128,
-    pub checksum_body_padding: u128,
     pub cluster: u128,
     pub size: u32,
     pub view: u32,
     pub release: u32,
     pub command: Command2,
     pub replica: u8,
-    pub reserved_frame: [u8; 42],
+    pub reserved_frame: [u8; 66],
 
-    pub reserved: [u8; 128],
+    pub namespace: u64,
+    pub reserved: [u8; 120],
 }
 
 unsafe impl Pod for StartViewChangeHeader {}
@@ -536,16 +536,14 @@ impl ConsensusHeader for StartViewChangeHeader {
 #[repr(C)]
 pub struct DoViewChangeHeader {
     pub checksum: u128,
-    pub checksum_padding: u128,
     pub checksum_body: u128,
-    pub checksum_body_padding: u128,
     pub cluster: u128,
     pub size: u32,
     pub view: u32,
     pub release: u32,
     pub command: Command2,
     pub replica: u8,
-    pub reserved_frame: [u8; 42],
+    pub reserved_frame: [u8; 66],
 
     /// The highest op-number in this replica's log.
     /// Used to select the most complete log when log_view values are equal.
@@ -553,11 +551,12 @@ pub struct DoViewChangeHeader {
     /// The replica's commit number (highest committed op).
     /// The new primary sets its commit to max(commit) across all DVCs.
     pub commit: u64,
+    pub namespace: u64,
     /// The view number when this replica's status was last normal.
     /// This is the key field for log selection: the replica with the
     /// highest log_view has the most authoritative log.
     pub log_view: u32,
-    pub reserved: [u8; 108],
+    pub reserved: [u8; 100],
 }
 
 unsafe impl Pod for DoViewChangeHeader {}
@@ -609,16 +608,14 @@ impl ConsensusHeader for DoViewChangeHeader {
 #[repr(C)]
 pub struct StartViewHeader {
     pub checksum: u128,
-    pub checksum_padding: u128,
     pub checksum_body: u128,
-    pub checksum_body_padding: u128,
     pub cluster: u128,
     pub size: u32,
     pub view: u32,
     pub release: u32,
     pub command: Command2,
     pub replica: u8,
-    pub reserved_frame: [u8; 42],
+    pub reserved_frame: [u8; 66],
 
     /// The op-number of the highest entry in the new primary's log.
     /// Backups set their op to this value.
@@ -627,7 +624,8 @@ pub struct StartViewHeader {
     /// This is max(commit) from all DVCs received by the primary.
     /// Backups set their commit to this value.
     pub commit: u64,
-    pub reserved: [u8; 112],
+    pub namespace: u64,
+    pub reserved: [u8; 104],
 }
 
 unsafe impl Pod for StartViewHeader {}
