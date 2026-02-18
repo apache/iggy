@@ -37,11 +37,11 @@
     --color-dark-sidebar: #101318;                 /* Navy sidebar */
     --color-dark-border: #2C323A;                   /* Darker border for contrast */
     --color-dark-text: #F5F5F5;                    /* Cream text */
-    --color-dark-text-secondary: #E0E0E0;          /* Lighter cream */
-    --color-dark-hover: #0b1428;                   /* Medium Navy */
-    --color-dark-active: #FF9305;                  /* Orange accent */
-    --color-dark-input: #151b28;                   /* Navy input bg */
-    --color-dark-accent: #FF9305;                  /* Orange accent */
+    --color-dark-text-secondary: #E0E0E0;
+    --color-dark-hover: #0b1428;
+    --color-dark-active: #FF9305;
+    --color-dark-input: #151b28;
+    --color-dark-accent: #FF9305;
 
     /* Additional Dark Theme Variables */
     --color-dark-tooltip-background: #313338;
