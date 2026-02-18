@@ -25,8 +25,11 @@ pip install apache-iggy
 ### Local Development
 
 ```bash
-# Start server for testing
+# Start server for testing using docker
 docker compose -f docker-compose.test.yml up --build
+
+# Or use cargo
+cargo run --bin iggy-server -- --with-default-root-credentials --fresh
 
 # Using uv:
 uv sync --all-extras
