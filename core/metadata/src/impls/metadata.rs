@@ -23,7 +23,7 @@ use consensus::{
     replicate_to_next_in_chain, send_prepare_ok as send_prepare_ok_common,
 };
 use iggy_common::{
-    header::{Command2, GenericHeader, PrepareHeader},
+    header::{Command2, GenericHeader, PrepareHeader, PrepareOkHeader, RequestHeader},
     message::Message,
 };
 use journal::{Journal, JournalHandle};
@@ -101,14 +101,10 @@ where
     B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
     P: Pipeline<Message = Message<PrepareHeader>, Entry = PipelineEntry>,
     J: JournalHandle,
-    J::Target: Journal<
-            J::Storage,
-            Entry = <VsrConsensus<B, P> as Consensus>::ReplicateMessage,
-            Header = PrepareHeader,
-        >,
+    J::Target: Journal<J::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     M: StateMachine<Input = Message<PrepareHeader>>,
 {
-    async fn on_request(&self, message: <VsrConsensus<B, P> as Consensus>::RequestMessage) {
+    async fn on_request(&self, message: <VsrConsensus<B, P> as Consensus>::Message<RequestHeader>) {
         let consensus = self.consensus.as_ref().unwrap();
 
         // TODO: Bunch of asserts.
@@ -117,7 +113,10 @@ where
         pipeline_prepare_common(consensus, prepare, |prepare| self.on_replicate(prepare)).await;
     }
 
-    async fn on_replicate(&self, message: <VsrConsensus<B, P> as Consensus>::ReplicateMessage) {
+    async fn on_replicate(
+        &self,
+        message: <VsrConsensus<B, P> as Consensus>::Message<PrepareHeader>,
+    ) {
         let consensus = self.consensus.as_ref().unwrap();
         let journal = self.journal.as_ref().unwrap();
 
@@ -170,7 +169,7 @@ where
         }
     }
 
-    async fn on_ack(&self, message: <VsrConsensus<B, P> as Consensus>::AckMessage) {
+    async fn on_ack(&self, message: <VsrConsensus<B, P> as Consensus>::Message<PrepareOkHeader>) {
         let consensus = self.consensus.as_ref().unwrap();
         let header = message.header();
 
@@ -245,11 +244,7 @@ where
     B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
     P: Pipeline<Message = Message<PrepareHeader>, Entry = PipelineEntry>,
     J: JournalHandle,
-    J::Target: Journal<
-            J::Storage,
-            Entry = <VsrConsensus<B, P> as Consensus>::ReplicateMessage,
-            Header = PrepareHeader,
-        >,
+    J::Target: Journal<J::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     M: StateMachine<Input = Message<PrepareHeader>>,
 {
     /// Replicate a prepare message to the next replica in the chain.

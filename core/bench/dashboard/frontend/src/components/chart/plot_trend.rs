@@ -98,6 +98,17 @@ fn create_latency_trend_chart(data: &[BenchmarkReportLight], is_dark: bool) -> C
     let mut producing_consumer_p99_latencies = Vec::new();
     let mut producing_consumer_p999_latencies = Vec::new();
 
+    // Theme-aware palette: prefer Iggy orange first on dark theme
+    let palette: [&str; 8] = if is_dark {
+        [
+            "#FF9800", "#73c0de", "#91cc75", "#ee6666", "#5470c6", "#3ba272", "#fac858", "#ea7ccc",
+        ]
+    } else {
+        [
+            "#5470c6", "#91cc75", "#fac858", "#ee6666", "#73c0de", "#3ba272", "#fc8452", "#ea7ccc",
+        ]
+    };
+
     let mut chart = IggyChart::new(&title, &subtext, is_dark, true)
         .with_category_x_axis("Version", gitrefs)
         .with_y_axis("Latency [ms]");
@@ -150,25 +161,25 @@ fn create_latency_trend_chart(data: &[BenchmarkReportLight], is_dark: bool) -> C
                 "Producer Avg Latency",
                 producer_avg_latencies,
                 Symbol::Circle,
-                "#5470c6",
+                palette[0],
             )
             .add_series(
                 "Producer P95 Latency",
                 producer_p95_latencies,
                 Symbol::Triangle,
-                "#91cc75",
+                palette[1],
             )
             .add_series(
                 "Producer P99 Latency",
                 producer_p99_latencies,
                 Symbol::Diamond,
-                "#fac858",
+                palette[2],
             )
             .add_series(
                 "Producer P999 Latency",
                 producer_p999_latencies,
                 Symbol::Rect,
-                "#ee6666",
+                palette[3],
             )
     } else {
         chart
@@ -180,25 +191,25 @@ fn create_latency_trend_chart(data: &[BenchmarkReportLight], is_dark: bool) -> C
                 "Consumer Avg Latency",
                 consumer_avg_latencies,
                 Symbol::Circle,
-                "#73c0de",
+                palette[4],
             )
             .add_series(
                 "Consumer P95 Latency",
                 consumer_p95_latencies,
                 Symbol::Triangle,
-                "#3ba272",
+                palette[5],
             )
             .add_series(
                 "Consumer P99 Latency",
                 consumer_p99_latencies,
                 Symbol::Diamond,
-                "#fc8452",
+                palette[6],
             )
             .add_series(
                 "Consumer P999 Latency",
                 consumer_p999_latencies,
                 Symbol::Rect,
-                "#ea7ccc",
+                palette[7],
             )
     } else {
         chart
@@ -210,25 +221,25 @@ fn create_latency_trend_chart(data: &[BenchmarkReportLight], is_dark: bool) -> C
                 "Producing Consumers Avg Latency",
                 producing_consumer_avg_latencies,
                 Symbol::Circle,
-                "#73c0de",
+                palette[4],
             )
             .add_series(
                 "Producing Consumers P95 Latency",
                 producing_consumer_p95_latencies,
                 Symbol::Triangle,
-                "#3ba272",
+                palette[5],
             )
             .add_series(
                 "Producing Consumers P99 Latency",
                 producing_consumer_p99_latencies,
                 Symbol::Diamond,
-                "#fc8452",
+                palette[6],
             )
             .add_series(
                 "Producing Consumers P999 Latency",
                 producing_consumer_p999_latencies,
                 Symbol::Rect,
-                "#ea7ccc",
+                palette[7],
             )
     } else {
         chart
@@ -262,6 +273,12 @@ fn create_throughput_trend_chart(data: &[BenchmarkReportLight], is_dark: bool) -
         .collect();
     let title = trend_chart_title(&data[0].params, ChartKind::Throughput);
 
+    let palette_throughput: [&str; 2] = if is_dark {
+        ["#FF9800", "#73c0de"]
+    } else {
+        ["#5470c6", "#91cc75"]
+    };
+
     IggyChart::new(&title, &subtext, is_dark, true)
         .with_category_x_axis("Version", gitrefs)
         .with_dual_y_axis("Throughput [MB/s]", "Throughput [msg/s]")
@@ -269,14 +286,14 @@ fn create_throughput_trend_chart(data: &[BenchmarkReportLight], is_dark: bool) -
             "Average Throughput [MB/s]",
             throughput_mb,
             Symbol::Circle,
-            "#5470c6",
+            palette_throughput[0],
             0,
         )
         .add_dual_series(
             "Average Throughput [msg/s]",
             throughput_msg,
             Symbol::Triangle,
-            "#91cc75",
+            palette_throughput[1],
             1,
         )
         .inner
