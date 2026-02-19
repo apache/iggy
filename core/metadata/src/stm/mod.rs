@@ -21,6 +21,7 @@ pub mod snapshot;
 pub mod stream;
 pub mod user;
 
+use iggy_common::Either;
 use left_right::*;
 use std::cell::UnsafeCell;
 use std::sync::Arc;
@@ -63,12 +64,16 @@ where
 }
 
 /// Parses type-erased input into a command. Macro-generated.
-/// Returns `Ok(cmd)` if applicable, `Err(input)` to pass ownership back.
+/// Returns:
+/// - `Ok(Either::Left(cmd))` if applicable
+/// - `Ok(Either::Right(input))` to pass ownership back
+/// - `Err(error)` for malformed payload/parse errors
 pub trait Command {
     type Cmd;
     type Input;
+    type Error;
 
-    fn parse(input: Self::Input) -> Result<Self::Cmd, Self::Input>;
+    fn parse(input: Self::Input) -> Result<Either<Self::Cmd, Self::Input>, Self::Error>;
 }
 
 /// Per-command handler for a given state type.
@@ -126,19 +131,20 @@ where
     }
 }
 
-/// Public interface for state machines.
-/// Returns `Ok(output)` if applicable, `Err(input)` to pass ownership back.
+/// Public interface for state handlers.
 pub trait State {
     type Output;
     type Input;
+    type Error;
 
-    fn apply(&self, input: Self::Input) -> Result<Self::Output, Self::Input>;
+    fn apply(&self, input: Self::Input) -> Result<Either<Self::Output, Self::Input>, Self::Error>;
 }
 
 pub trait StateMachine {
     type Input;
     type Output;
-    fn update(&self, input: Self::Input) -> Self::Output;
+    type Error;
+    fn update(&self, input: Self::Input) -> Result<Self::Output, Self::Error>;
 }
 
 /// Generates the state's inner struct and wrapper type.
@@ -223,21 +229,22 @@ macro_rules! collect_handlers {
             impl $crate::stm::Command for [<$state Inner>] {
                 type Cmd = [<$state Command>];
                 type Input = ::iggy_common::message::Message<::iggy_common::header::PrepareHeader>;
+                type Error = ::iggy_common::IggyError;
 
-                fn parse(input: Self::Input) -> Result<Self::Cmd, Self::Input> {
+                fn parse(input: Self::Input) -> Result<::iggy_common::Either<Self::Cmd, Self::Input>, Self::Error> {
                     use ::iggy_common::BytesSerializable;
+                    use ::iggy_common::Either;
                     use ::iggy_common::header::Operation;
 
                     match input.header().operation {
                         $(
                             Operation::$operation => {
                                 let body = input.body_bytes();
-                                Ok([<$state Command>]::$operation(
-                                    $operation::from_bytes(body).unwrap()
-                                ))
+                                let cmd = $operation::from_bytes(body)?;
+                                Ok(Either::Left([<$state Command>]::$operation(cmd)))
                             },
                         )*
-                        _ => Err(input),
+                        _ => Ok(Either::Right(input)),
                     }
                 }
             }
@@ -257,11 +264,20 @@ macro_rules! collect_handlers {
             impl $crate::stm::State for $state {
                 type Input = <[<$state Inner>] as $crate::stm::Command>::Input;
                 type Output = ();
+                type Error = <[<$state Inner>] as $crate::stm::Command>::Error;
 
-                fn apply(&self, input: Self::Input) -> Result<Self::Output, Self::Input> {
-                    let cmd = <[<$state Inner>] as $crate::stm::Command>::parse(input)?;
-                    self.inner.do_apply(cmd);
-                    Ok(())
+                fn apply(&self, input: Self::Input) -> Result<::iggy_common::Either<Self::Output, Self::Input>, Self::Error> {
+                    use ::iggy_common::Either;
+
+                    match <[<$state Inner>] as $crate::stm::Command>::parse(input)? {
+                        Either::Left(cmd) => {
+                            self.inner.do_apply(cmd);
+                            Ok(Either::Left(()))
+                        }
+                        Either::Right(input) => {
+                            Ok(Either::Right(input))
+                        }
+                    }
                 }
             }
 

@@ -19,6 +19,7 @@
 
 package org.apache.iggy.examples.async;
 
+import org.apache.iggy.Iggy;
 import org.apache.iggy.client.async.tcp.AsyncIggyTcpClient;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
@@ -29,23 +30,24 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.math.BigInteger;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * AsyncProducer demonstrates how to use the async client to send messages to Apache Iggy.
- * This producer sends messages asynchronously and handles responses using CompletableFuture.
+ *
+ * <p>This producer sends messages asynchronously and handles responses using CompletableFuture.
+ *
+ * <p>Run with: {@code ./gradlew runAsyncProducer}
  */
-public class AsyncProducer {
+public final class AsyncProducer {
     private static final Logger log = LoggerFactory.getLogger(AsyncProducer.class);
 
-    private static final String HOST = "127.0.0.1";
+    private static final String HOST = "localhost";
     private static final int PORT = 8090;
     private static final String USERNAME = "iggy";
     private static final String PASSWORD = "iggy";
@@ -55,157 +57,139 @@ public class AsyncProducer {
     private static final long PARTITION_ID = 0L;
 
     private static final int MESSAGE_COUNT = 100;
-    private static final int MESSAGE_SIZE = 256;
+    private static final int MESSAGE_BATCH_SIZE = 10;
+    private static final int TOTAL_BATCHES = MESSAGE_COUNT / MESSAGE_BATCH_SIZE;
 
-    private final AsyncIggyTcpClient client;
-    private final AtomicInteger successCount = new AtomicInteger(0);
-    private final AtomicInteger errorCount = new AtomicInteger(0);
-
-    public AsyncProducer() {
-        this.client = new AsyncIggyTcpClient(HOST, PORT);
+    private AsyncProducer() {
+        // Utility class
     }
 
-    public CompletableFuture<Void> start() {
-        log.info("Starting AsyncProducer...");
+    public static void main(String[] args) {
+        AsyncIggyTcpClient client = null;
 
-        return client.connect()
-                .thenCompose(v -> {
-                    log.info("Connected to Iggy server at {}:{}", HOST, PORT);
-                    return client.users().login(USERNAME, PASSWORD);
-                })
-                .thenCompose(v -> {
-                    log.info("Logged in successfully as user: {}", USERNAME);
-                    return setupStreamAndTopic();
-                })
-                .thenCompose(v -> {
-                    log.info("Stream and topic setup complete");
-                    return sendMessages();
-                })
-                .thenRun(() -> {
-                    log.info("All messages sent. Success: {}, Errors: {}", successCount.get(), errorCount.get());
-                })
-                .exceptionally(ex -> {
-                    log.error("Error in producer flow", ex);
-                    return null;
-                });
+        try {
+            log.info("=== Async Producer Example ===");
+
+            // 1. Connect and authenticate using builder
+            log.info("Connecting to Iggy server at {}:{}...", HOST, PORT);
+            client = Iggy.tcpClientBuilder()
+                    .async()
+                    .host(HOST)
+                    .port(PORT)
+                    .credentials(USERNAME, PASSWORD)
+                    .buildAndLogin()
+                    .join();
+
+            log.info("Connected successfully");
+
+            // 2. Set up stream and topic
+            setupStreamAndTopic(client).join();
+            log.info("Stream and topic setup complete");
+
+            // 3. Send messages
+            AtomicInteger successCount = new AtomicInteger(0);
+            AtomicInteger errorCount = new AtomicInteger(0);
+
+            sendMessages(client, successCount, errorCount).join();
+            log.info("All messages sent. Success: {}, Errors: {}", successCount.get(), errorCount.get());
+
+            log.info("=== Producer completed successfully ===");
+
+        } catch (RuntimeException e) {
+            log.error("Producer failed", e);
+            System.exit(1);
+        } finally {
+            if (client != null) {
+                try {
+                    client.close().join();
+                    log.info("Client closed");
+                } catch (RuntimeException e) {
+                    log.error("Error closing client", e);
+                }
+            }
+        }
     }
 
-    private CompletableFuture<Void> setupStreamAndTopic() {
+    private static CompletableFuture<Void> setupStreamAndTopic(AsyncIggyTcpClient client) {
         log.info("Checking stream: {}", STREAM_NAME);
 
         return client.streams()
                 .getStream(StreamId.of(STREAM_NAME))
-                .thenCompose(stream -> {
-                    if (stream.isEmpty()) {
-                        log.info("Creating stream: {}", STREAM_NAME);
-                        return client.streams()
-                                .createStream(STREAM_NAME)
-                                .thenAccept(created -> log.info("Stream created: {}", created.name()));
-                    } else {
-                        log.info("Stream exists: {}", STREAM_NAME);
+                .thenCompose(streamOpt -> {
+                    if (streamOpt.isPresent()) {
+                        log.info("Stream '{}' already exists", STREAM_NAME);
                         return CompletableFuture.completedFuture(null);
                     }
+                    log.info("Creating stream: {}", STREAM_NAME);
+                    return client.streams()
+                            .createStream(STREAM_NAME)
+                            .thenAccept(created -> log.info("Stream created: {}", created.name()));
                 })
                 .thenCompose(v -> {
                     log.info("Checking topic: {}", TOPIC_NAME);
                     return client.topics().getTopic(StreamId.of(STREAM_NAME), TopicId.of(TOPIC_NAME));
                 })
-                .thenCompose(topic -> {
-                    if (topic.isEmpty()) {
-                        log.info("Creating topic: {}", TOPIC_NAME);
-                        return client.topics()
-                                .createTopic(
-                                        StreamId.of(STREAM_NAME),
-                                        1L, // 1 partition
-                                        CompressionAlgorithm.None,
-                                        BigInteger.ZERO,
-                                        BigInteger.ZERO,
-                                        Optional.empty(),
-                                        TOPIC_NAME)
-                                .thenAccept(created -> log.info("Topic created: {}", created.name()));
-                    } else {
-                        log.info("Topic exists: {}", TOPIC_NAME);
+                .thenCompose(topicOpt -> {
+                    if (topicOpt.isPresent()) {
+                        log.info("Topic '{}' already exists", TOPIC_NAME);
                         return CompletableFuture.completedFuture(null);
                     }
+                    log.info("Creating topic: {}", TOPIC_NAME);
+                    return client.topics()
+                            .createTopic(
+                                    StreamId.of(STREAM_NAME),
+                                    1L,
+                                    CompressionAlgorithm.None,
+                                    BigInteger.ZERO,
+                                    BigInteger.ZERO,
+                                    Optional.empty(),
+                                    TOPIC_NAME)
+                            .thenAccept(created -> log.info("Topic created: {}", created.name()));
                 });
     }
 
-    private CompletableFuture<Void> sendMessages() {
-        log.info("Sending {} messages...", MESSAGE_COUNT);
+    private static CompletableFuture<Void> sendMessages(
+            AsyncIggyTcpClient client, AtomicInteger successCount, AtomicInteger errorCount) {
+        log.info("Sending {} messages in {} batches...", MESSAGE_COUNT, TOTAL_BATCHES);
 
-        CompletableFuture<?>[] futures = new CompletableFuture[MESSAGE_COUNT];
-
-        for (int i = 0; i < MESSAGE_COUNT; i++) {
-            final int messageIndex = i;
-            futures[i] = sendMessage(messageIndex).handle((result, ex) -> {
-                if (ex != null) {
-                    log.error("Failed to send message {}: {}", messageIndex, ex.getMessage());
-                    errorCount.incrementAndGet();
-                } else {
-                    if (messageIndex % 10 == 0) {
-                        log.debug("Sent message {}", messageIndex);
-                    }
-                    successCount.incrementAndGet();
-                }
-                return null;
-            });
-
-            // Add a small delay between messages to avoid overwhelming the server
-            try {
-                Thread.sleep(10);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                break;
-            }
-        }
-
-        return CompletableFuture.allOf(futures);
-    }
-
-    private CompletableFuture<Void> sendMessage(int index) {
-        // Create message payload
-        String messageContent =
-                String.format("Async message %d - %s - %s", index, UUID.randomUUID(), System.currentTimeMillis());
-
-        // Pad message to desired size
-        while (messageContent.length() < MESSAGE_SIZE) {
-            messageContent += " ";
-        }
-
-        // Use the factory method to create a message
-        Message message = Message.of(messageContent);
-
-        // Create partitioning strategy (use partition ID)
+        StreamId streamId = StreamId.of(STREAM_NAME);
+        TopicId topicId = TopicId.of(TOPIC_NAME);
         Partitioning partitioning = Partitioning.partitionId(PARTITION_ID);
 
-        // Send message using async client
-        return client.messages()
-                .sendMessages(StreamId.of(STREAM_NAME), TopicId.of(TOPIC_NAME), partitioning, List.of(message));
-    }
+        long startTime = System.currentTimeMillis();
 
-    public CompletableFuture<Void> stop() {
-        log.info("Stopping AsyncProducer...");
-        return client.close().thenRun(() -> log.info("AsyncProducer stopped"));
-    }
+        CompletableFuture<?>[] futures = new CompletableFuture[TOTAL_BATCHES];
 
-    public static void main(String[] args) {
-        AsyncProducer producer = new AsyncProducer();
+        for (int b = 0; b < TOTAL_BATCHES; b++) {
+            final int batchNum = b;
 
-        CompletableFuture<Void> producerFuture = producer.start()
-                .thenCompose(v -> {
-                    // Keep producer running for a while
-                    CompletableFuture<Void> delay = new CompletableFuture<>();
-                    CompletableFuture.delayedExecutor(2, TimeUnit.SECONDS).execute(() -> delay.complete(null));
-                    return delay;
-                })
-                .thenCompose(v -> producer.stop());
+            List<Message> batch = new ArrayList<>(MESSAGE_BATCH_SIZE);
+            for (int i = 0; i < MESSAGE_BATCH_SIZE; i++) {
+                int messageId = batchNum * MESSAGE_BATCH_SIZE + i;
+                String payload = String.format(
+                        "Async message %d - %s - %s", messageId, UUID.randomUUID(), System.currentTimeMillis());
+                batch.add(Message.of(payload));
+            }
 
-        try {
-            producerFuture.get(30, TimeUnit.SECONDS);
-            log.info("AsyncProducer completed successfully");
-        } catch (InterruptedException | ExecutionException | TimeoutException e) {
-            log.error("AsyncProducer failed", e);
-            System.exit(1);
+            futures[b] = client.messages()
+                    .sendMessages(streamId, topicId, partitioning, batch)
+                    .handle((result, ex) -> {
+                        if (ex != null) {
+                            log.error("Failed to send batch {}: {}", batchNum, ex.getMessage());
+                            errorCount.addAndGet(MESSAGE_BATCH_SIZE);
+                        } else {
+                            successCount.addAndGet(MESSAGE_BATCH_SIZE);
+                            if ((batchNum + 1) % 5 == 0) {
+                                log.info("Sent batch {}/{}", batchNum + 1, TOTAL_BATCHES);
+                            }
+                        }
+                        return null;
+                    });
         }
+
+        return CompletableFuture.allOf(futures).thenRun(() -> {
+            long elapsed = System.currentTimeMillis() - startTime;
+            log.info("Sent {} messages in {} ms", successCount.get(), elapsed);
+        });
     }
 }

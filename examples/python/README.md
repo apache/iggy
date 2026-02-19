@@ -30,6 +30,12 @@ IGGY_HTTP_ENABLED=true IGGY_TCP_ADDRESS=0.0.0.0:8090 cargo run --bin iggy-server
 and then install Python dependencies:
 
 ```bash
+# Using uv
+uv sync
+
+# Using pip
+python -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
@@ -40,6 +46,11 @@ pip install -r requirements.txt
 Perfect introduction for newcomers to Iggy:
 
 ```bash
+# Using uv
+uv run getting-started/producer.py
+uv run getting-started/consumer.py
+
+# Without using uv
 python getting-started/producer.py
 python getting-started/consumer.py
 ```
@@ -49,6 +60,11 @@ python getting-started/consumer.py
 Core functionality with detailed configuration options:
 
 ```bash
+# Using uv
+uv run basic/producer.py
+uv run basic/consumer.py
+
+# Without using uv
 python basic/producer.py
 python basic/consumer.py
 ```

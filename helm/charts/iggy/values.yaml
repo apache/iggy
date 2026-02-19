@@ -24,7 +24,7 @@ server:
     repository: apache/iggy
     pullPolicy: Always
     # Overrides the image tag whose default is the chart appVersion.
-    tag: "0.6.1-edge.2"
+    tag: "0.7.0"
   ports:
     http: 3000
     quic: 8080

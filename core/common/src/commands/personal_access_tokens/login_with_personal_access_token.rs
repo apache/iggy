@@ -73,13 +73,14 @@ impl BytesSerializable for LoginWithPersonalAccessToken {
             return Err(IggyError::InvalidCommand);
         }
 
-        let token_length = bytes[0];
-        let token = from_utf8(&bytes[1..1 + token_length as usize])
-            .map_err(|_| IggyError::InvalidUtf8)?
-            .to_string();
-        if token.len() != token_length as usize {
-            return Err(IggyError::InvalidCommand);
-        }
+        let token_length = *bytes.first().ok_or(IggyError::InvalidCommand)? as usize;
+        let token = from_utf8(
+            bytes
+                .get(1..1 + token_length)
+                .ok_or(IggyError::InvalidCommand)?,
+        )
+        .map_err(|_| IggyError::InvalidUtf8)?
+        .to_string();
 
         let command = LoginWithPersonalAccessToken { token };
         Ok(command)
@@ -107,6 +108,32 @@ mod tests {
         let token = from_utf8(&bytes[1..1 + token_length as usize]).unwrap();
         assert!(!bytes.is_empty());
         assert_eq!(token, command.token);
+    }
+
+    #[test]
+    fn from_bytes_should_fail_on_empty_input() {
+        assert!(LoginWithPersonalAccessToken::from_bytes(Bytes::new()).is_err());
+    }
+
+    #[test]
+    fn from_bytes_should_fail_on_truncated_input() {
+        let command = LoginWithPersonalAccessToken::default();
+        let bytes = command.to_bytes();
+        for i in 0..bytes.len() - 1 {
+            let truncated = bytes.slice(..i);
+            assert!(
+                LoginWithPersonalAccessToken::from_bytes(truncated).is_err(),
+                "expected error for truncation at byte {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn from_bytes_should_fail_on_corrupted_token_length() {
+        let mut buf = BytesMut::new();
+        buf.put_u8(255);
+        buf.put_slice(b"short");
+        assert!(LoginWithPersonalAccessToken::from_bytes(buf.freeze()).is_err());
     }
 
     #[test]

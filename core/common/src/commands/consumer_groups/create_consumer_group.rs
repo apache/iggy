@@ -96,10 +96,14 @@ impl BytesSerializable for CreateConsumerGroup {
         position += stream_id.get_size_bytes().as_bytes_usize();
         let topic_id = Identifier::from_bytes(bytes.slice(position..))?;
         position += topic_id.get_size_bytes().as_bytes_usize();
-        let name_length = bytes[position];
-        let name = from_utf8(&bytes[position + 1..position + 1 + name_length as usize])
-            .map_err(|_| IggyError::InvalidUtf8)?
-            .to_string();
+        let name_length = *bytes.get(position).ok_or(IggyError::InvalidCommand)?;
+        let name = from_utf8(
+            bytes
+                .get(position + 1..position + 1 + name_length as usize)
+                .ok_or(IggyError::InvalidCommand)?,
+        )
+        .map_err(|_| IggyError::InvalidUtf8)?
+        .to_string();
         let command = CreateConsumerGroup {
             stream_id,
             topic_id,
@@ -140,6 +144,24 @@ mod tests {
         assert_eq!(stream_id, command.stream_id);
         assert_eq!(topic_id, command.topic_id);
         assert_eq!(name, command.name);
+    }
+
+    #[test]
+    fn from_bytes_should_fail_on_empty_input() {
+        assert!(CreateConsumerGroup::from_bytes(Bytes::new()).is_err());
+    }
+
+    #[test]
+    fn from_bytes_should_fail_on_truncated_input() {
+        let command = CreateConsumerGroup::default();
+        let bytes = command.to_bytes();
+        for i in 0..bytes.len() - 1 {
+            let truncated = bytes.slice(..i);
+            assert!(
+                CreateConsumerGroup::from_bytes(truncated).is_err(),
+                "expected error for truncation at byte {i}"
+            );
+        }
     }
 
     #[test]

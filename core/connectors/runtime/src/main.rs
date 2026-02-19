@@ -220,7 +220,7 @@ async fn main() -> Result<(), RuntimeError> {
     let context = Arc::new(context);
     api::init(&config.http, context.clone()).await;
 
-    source::handle(source_wrappers, context.clone());
+    let source_handler_tasks = source::handle(source_wrappers, context.clone());
     sink::consume(sink_wrappers, context.clone());
     info!("All sources and sinks spawned.");
 
@@ -250,6 +250,12 @@ async fn main() -> Result<(), RuntimeError> {
             source::cleanup_sender(id);
             info!("Closed source connector with ID: {id} for plugin: {key}");
         }
+    }
+
+    // Wait for source handler tasks to drain remaining messages and persist state
+    // before shutting down the Iggy clients they depend on.
+    for handle in source_handler_tasks {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
     }
 
     for (key, sink) in sink_with_plugins {

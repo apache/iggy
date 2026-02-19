@@ -17,7 +17,7 @@
 
 [package]
 name = "iggy_connector_elasticsearch_source"
-version = "0.2.2-edge.1"
+version = "0.3.0"
 description = "Iggy Elasticsearch source connector"
 edition = "2024"
 license = "Apache-2.0"

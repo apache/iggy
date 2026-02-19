@@ -39,7 +39,7 @@
 #   ./extract-version.sh sdk-node --tag              # Output: node-sdk-0.5.0
 #
 #   # Get version for Go SDK
-#   ./extract-version.sh sdk-go                      # Output: 0.6.1-edge.1
+#   ./extract-version.sh sdk-go                      # Output: 0.7.0
 #
 # The script uses the configuration from .github/config/publish.yml to determine:
 #   - Where to find the version file (version_file)

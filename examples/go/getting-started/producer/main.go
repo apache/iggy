@@ -20,14 +20,15 @@ package main
 import (
 	"flag"
 	"fmt"
-	"github.com/apache/iggy/examples/go/common"
-	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	"log"
 	"net"
 	"time"
 
-	"github.com/apache/iggy/foreign/go/iggycli"
-	"github.com/apache/iggy/foreign/go/tcp"
+	"github.com/apache/iggy/examples/go/common"
+	"github.com/apache/iggy/foreign/go/client"
+	iggcon "github.com/apache/iggy/foreign/go/contracts"
+
+	"github.com/apache/iggy/foreign/go/client/tcp"
 )
 
 var (
@@ -38,25 +39,30 @@ var (
 )
 
 func main() {
-	client, err := iggycli.NewIggyClient(
-		iggycli.WithTcp(
+	cli, err := client.NewIggyClient(
+		client.WithTcp(
 			tcp.WithServerAddress(getTcpServerAddr()),
 		),
 	)
 	if err != nil {
 		log.Fatal(err)
 	}
+	defer func() {
+		if err := cli.Close(); err != nil {
+			log.Printf("Error closing client: %v", err)
+		}
+	}()
 
-	if _, err := client.LoginUser(common.DefaultRootUsername, common.DefaultRootPassword); err != nil {
+	if _, err := cli.LoginUser(common.DefaultRootUsername, common.DefaultRootPassword); err != nil {
 		log.Fatalf("Login failed: %v", err)
 	}
-	initSystem(client)
-	if err := produceMessages(client); err != nil {
+	initSystem(cli)
+	if err := produceMessages(cli); err != nil {
 		log.Fatalf("Producing messages failed: %v", err)
 	}
 }
 
-func initSystem(client iggycli.Client) {
+func initSystem(client iggcon.Client) {
 	if _, err := client.CreateStream("sample-stream"); err != nil {
 		log.Printf("WARN: Stream already exists or error: %v", err)
 	}
@@ -76,7 +82,7 @@ func initSystem(client iggycli.Client) {
 	log.Println("Topic was created.")
 }
 
-func produceMessages(client iggycli.Client) error {
+func produceMessages(client iggcon.Client) error {
 	interval := 500 * time.Millisecond
 	log.Printf(
 		"Messages will be sent to stream: %d, topic: %d, partition: %d with interval %s.",

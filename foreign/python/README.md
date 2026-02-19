@@ -9,45 +9,39 @@ Apache Iggy is the persistent message streaming platform written in Rust, suppor
 ### Basic Installation
 
 ```bash
+# Using uv
+uv add apache-iggy
+
+# Using pip
+python3 -m venv .venv
+source .venv/bin/activate
 pip install apache-iggy
-```
-
-### Development Installation
-
-For testing:
-
-```bash
-pip install -e ".[testing]"
-```
-
-For development with all tools:
-
-```bash
-pip install -e ".[dev,testing]"
 ```
 
 ### Supported Python Versions
 
 - Python 3.10+
 
-## Testing
-
-### Quick Test
-
-```bash
-# Run tests with Docker (recommended)
-docker compose -f docker-compose.test.yml up --build
-```
-
 ### Local Development
 
 ```bash
-# Install dependencies and build
-pip install -e ".[testing]"
-maturin develop
+# Start server for testing using docker
+docker compose -f docker-compose.test.yml up --build
 
-# Run tests (requires iggy-server running)
-pytest tests/ -v
+# Or use cargo
+cargo run --bin iggy-server -- --with-default-root-credentials --fresh
+
+# Using uv:
+uv sync --all-extras
+uv run maturin develop
+uv run pytest tests/ -v # Run tests (requires iggy-server running)
+
+# Using pip:
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e ".[all]"
+maturin develop
+pytest tests/ -v # Run tests (requires iggy-server running)
 ```
 
 ## Examples
