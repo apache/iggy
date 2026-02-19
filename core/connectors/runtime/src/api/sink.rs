@@ -30,7 +30,7 @@ use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode, header},
     response::IntoResponse,
-    routing::get,
+    routing::{get, post},
 };
 use serde::Deserialize;
 use std::sync::Arc;
@@ -52,6 +52,7 @@ pub fn router(state: Arc<RuntimeContext>) -> Router {
             "/sinks/{key}/configs/active",
             get(get_sink_active_config).put(update_sink_active_config),
         )
+        .route("/sinks/{key}/restart", post(restart_sink))
         .with_state(state)
 }
 
@@ -243,6 +244,22 @@ async fn delete_sink_config(
     context
         .config_provider
         .delete_sink_config(&key, query.version)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn restart_sink(
+    State(context): State<Arc<RuntimeContext>>,
+    Path(key): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    context
+        .sinks
+        .restart_connector(
+            &key,
+            context.config_provider.as_ref(),
+            &context.iggy_clients.consumer,
+            &context.metrics,
+        )
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }
