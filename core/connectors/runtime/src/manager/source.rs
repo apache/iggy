@@ -288,3 +288,277 @@ impl fmt::Debug for SourceDetails {
             .finish()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::configs::connectors::SourceConfig;
+
+    fn create_test_source_info(key: &str, id: u32) -> SourceInfo {
+        SourceInfo {
+            id,
+            key: key.to_string(),
+            name: format!("{key} source"),
+            path: format!("/path/to/{key}"),
+            version: "1.0.0".to_string(),
+            enabled: true,
+            status: ConnectorStatus::Running,
+            last_error: None,
+            plugin_config_format: None,
+        }
+    }
+
+    fn create_test_source_details(key: &str, id: u32) -> SourceDetails {
+        SourceDetails {
+            info: create_test_source_info(key, id),
+            config: SourceConfig {
+                key: key.to_string(),
+                enabled: true,
+                version: 1,
+                name: format!("{key} source"),
+                path: format!("/path/to/{key}"),
+                ..Default::default()
+            },
+            handler_tasks: vec![],
+            container: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn should_create_manager_with_sources() {
+        let manager = SourceManager::new(vec![
+            create_test_source_details("pg", 1),
+            create_test_source_details("random", 2),
+        ]);
+
+        let all = manager.get_all().await;
+        assert_eq!(all.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn should_get_existing_source() {
+        let manager = SourceManager::new(vec![create_test_source_details("pg", 1)]);
+
+        let source = manager.get("pg").await;
+        assert!(source.is_some());
+        let binding = source.unwrap();
+        let details = binding.lock().await;
+        assert_eq!(details.info.key, "pg");
+        assert_eq!(details.info.id, 1);
+    }
+
+    #[tokio::test]
+    async fn should_return_none_for_unknown_key() {
+        let manager = SourceManager::new(vec![create_test_source_details("pg", 1)]);
+
+        assert!(manager.get("nonexistent").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn should_get_config() {
+        let manager = SourceManager::new(vec![create_test_source_details("pg", 1)]);
+
+        let config = manager.get_config("pg").await;
+        assert!(config.is_some());
+        assert_eq!(config.unwrap().key, "pg");
+    }
+
+    #[tokio::test]
+    async fn should_return_none_config_for_unknown_key() {
+        let manager = SourceManager::new(vec![]);
+
+        assert!(manager.get_config("nonexistent").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn should_get_all_sources() {
+        let manager = SourceManager::new(vec![
+            create_test_source_details("pg", 1),
+            create_test_source_details("random", 2),
+            create_test_source_details("es", 3),
+        ]);
+
+        let all = manager.get_all().await;
+        assert_eq!(all.len(), 3);
+        let keys: Vec<String> = all.iter().map(|s| s.key.clone()).collect();
+        assert!(keys.contains(&"pg".to_string()));
+        assert!(keys.contains(&"random".to_string()));
+        assert!(keys.contains(&"es".to_string()));
+    }
+
+    #[tokio::test]
+    async fn should_update_status() {
+        let manager = SourceManager::new(vec![create_test_source_details("pg", 1)]);
+
+        manager
+            .update_status("pg", ConnectorStatus::Stopped, None)
+            .await;
+
+        let source = manager.get("pg").await.unwrap();
+        let details = source.lock().await;
+        assert_eq!(details.info.status, ConnectorStatus::Stopped);
+    }
+
+    #[tokio::test]
+    async fn should_increment_metrics_when_transitioning_to_running() {
+        let metrics = Arc::new(Metrics::init());
+        let mut details = create_test_source_details("pg", 1);
+        details.info.status = ConnectorStatus::Stopped;
+        let manager = SourceManager::new(vec![details]);
+
+        manager
+            .update_status("pg", ConnectorStatus::Running, Some(&metrics))
+            .await;
+
+        assert_eq!(metrics.get_sources_running(), 1);
+    }
+
+    #[tokio::test]
+    async fn should_decrement_metrics_when_leaving_running() {
+        let metrics = Arc::new(Metrics::init());
+        let manager = SourceManager::new(vec![create_test_source_details("pg", 1)]);
+        metrics.increment_sources_running();
+
+        manager
+            .update_status("pg", ConnectorStatus::Stopped, Some(&metrics))
+            .await;
+
+        assert_eq!(metrics.get_sources_running(), 0);
+    }
+
+    #[tokio::test]
+    async fn should_clear_error_when_status_becomes_running() {
+        let manager = SourceManager::new(vec![create_test_source_details("pg", 1)]);
+        manager.set_error("pg", "some error").await;
+
+        manager
+            .update_status("pg", ConnectorStatus::Running, None)
+            .await;
+
+        let source = manager.get("pg").await.unwrap();
+        let details = source.lock().await;
+        assert!(details.info.last_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn should_set_error_status_and_message() {
+        let manager = SourceManager::new(vec![create_test_source_details("pg", 1)]);
+
+        manager.set_error("pg", "connection failed").await;
+
+        let source = manager.get("pg").await.unwrap();
+        let details = source.lock().await;
+        assert_eq!(details.info.status, ConnectorStatus::Error);
+        assert!(details.info.last_error.is_some());
+    }
+
+    #[tokio::test]
+    async fn stop_should_return_not_found_for_unknown_key() {
+        let metrics = Arc::new(Metrics::init());
+        let manager = SourceManager::new(vec![]);
+
+        let result = manager.stop_connector("nonexistent", &metrics).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, RuntimeError::SourceNotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn stop_should_drain_tasks_and_update_status() {
+        let metrics = Arc::new(Metrics::init());
+        metrics.increment_sources_running();
+        let handle = tokio::spawn(async {});
+        let mut details = create_test_source_details("pg", 1);
+        details.handler_tasks = vec![handle];
+        let manager = SourceManager::new(vec![details]);
+
+        let result = manager.stop_connector("pg", &metrics).await;
+        assert!(result.is_ok());
+
+        let source = manager.get("pg").await.unwrap();
+        let details = source.lock().await;
+        assert_eq!(details.info.status, ConnectorStatus::Stopped);
+        assert!(details.handler_tasks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stop_should_work_without_container() {
+        let metrics = Arc::new(Metrics::init());
+        let mut details = create_test_source_details("pg", 1);
+        details.container = None;
+        details.info.status = ConnectorStatus::Stopped;
+        let manager = SourceManager::new(vec![details]);
+
+        let result = manager.stop_connector("pg", &metrics).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn stop_should_decrement_metrics_from_running() {
+        let metrics = Arc::new(Metrics::init());
+        metrics.increment_sources_running();
+        let manager = SourceManager::new(vec![create_test_source_details("pg", 1)]);
+
+        manager.stop_connector("pg", &metrics).await.unwrap();
+
+        assert_eq!(metrics.get_sources_running(), 0);
+    }
+
+    #[tokio::test]
+    async fn should_clear_error_when_status_becomes_stopped() {
+        let manager = SourceManager::new(vec![create_test_source_details("pg", 1)]);
+        manager.set_error("pg", "some error").await;
+
+        manager
+            .update_status("pg", ConnectorStatus::Stopped, None)
+            .await;
+
+        let source = manager.get("pg").await.unwrap();
+        let details = source.lock().await;
+        assert_eq!(details.info.status, ConnectorStatus::Stopped);
+        assert!(details.info.last_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn stop_should_clear_last_error() {
+        let metrics = Arc::new(Metrics::init());
+        let mut details = create_test_source_details("pg", 1);
+        details.info.status = ConnectorStatus::Error;
+        details.info.last_error = Some(ConnectorError::new("previous error"));
+        let manager = SourceManager::new(vec![details]);
+
+        manager.stop_connector("pg", &metrics).await.unwrap();
+
+        let source = manager.get("pg").await.unwrap();
+        let details = source.lock().await;
+        assert!(details.info.last_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn stop_should_not_decrement_metrics_from_non_running() {
+        let metrics = Arc::new(Metrics::init());
+        let mut details = create_test_source_details("pg", 1);
+        details.info.status = ConnectorStatus::Stopped;
+        let manager = SourceManager::new(vec![details]);
+
+        manager.stop_connector("pg", &metrics).await.unwrap();
+
+        assert_eq!(metrics.get_sources_running(), 0);
+    }
+
+    #[tokio::test]
+    async fn update_status_should_be_noop_for_unknown_key() {
+        let manager = SourceManager::new(vec![]);
+
+        manager
+            .update_status("nonexistent", ConnectorStatus::Running, None)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn set_error_should_be_noop_for_unknown_key() {
+        let manager = SourceManager::new(vec![]);
+
+        manager.set_error("nonexistent", "some error").await;
+    }
+}
