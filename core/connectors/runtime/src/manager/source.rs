@@ -33,7 +33,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
-use tokio::sync::{Mutex, watch};
+use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tracing::info;
 
@@ -277,7 +277,6 @@ pub struct SourceInfo {
 pub struct SourceDetails {
     pub info: SourceInfo,
     pub config: SourceConfig,
-    pub shutdown_tx: Option<watch::Sender<()>>,
     pub handler_tasks: Vec<JoinHandle<()>>,
     pub container: Option<Arc<Container<SourceApi>>>,
 }
