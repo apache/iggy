@@ -30,7 +30,7 @@ use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode, header},
     response::IntoResponse,
-    routing::get,
+    routing::{get, post},
 };
 use serde::Deserialize;
 use std::sync::Arc;
@@ -55,6 +55,7 @@ pub fn router(state: Arc<RuntimeContext>) -> Router {
             "/sources/{key}/configs/active",
             get(get_source_active_config).put(update_source_active_config),
         )
+        .route("/sources/{key}/restart", post(restart_source))
         .with_state(state)
 }
 
@@ -246,6 +247,24 @@ async fn delete_source_config(
     context
         .config_provider
         .delete_source_config(&key, query.version)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn restart_source(
+    State(context): State<Arc<RuntimeContext>>,
+    Path(key): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    context
+        .sources
+        .restart_connector(
+            &key,
+            context.config_provider.as_ref(),
+            &context.iggy_clients.producer,
+            &context.metrics,
+            &context.state_path,
+            &context,
+        )
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }
