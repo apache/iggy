@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::{Consensus, Plane, PlaneIdentity, Project};
+use crate::{
+    AckMessage, Consensus, Plane, PlaneIdentity, Project, ReplicateMessage, RequestMessage,
+};
 use iggy_common::variadic;
 
 #[derive(Debug)]
@@ -42,22 +44,21 @@ where
     C: Consensus,
     T: Plane<C>,
 {
-    async fn on_request(&self, message: C::Message<C::RequestHeader>)
+    async fn on_request(&self, message: RequestMessage<C>)
     where
-        C::Message<C::RequestHeader>:
-            Project<C::Message<C::ReplicateHeader>, C, Consensus = C> + Clone,
+        RequestMessage<C>: Project<ReplicateMessage<C>, C, Consensus = C> + Clone,
     {
         self.inner.on_request(message).await;
     }
 
-    async fn on_replicate(&self, message: C::Message<C::ReplicateHeader>)
+    async fn on_replicate(&self, message: ReplicateMessage<C>)
     where
-        C::Message<C::ReplicateHeader>: Project<C::Message<C::AckHeader>, C, Consensus = C> + Clone,
+        ReplicateMessage<C>: Project<AckMessage<C>, C, Consensus = C> + Clone,
     {
         self.inner.on_replicate(message).await;
     }
 
-    async fn on_ack(&self, message: C::Message<C::AckHeader>) {
+    async fn on_ack(&self, message: AckMessage<C>) {
         self.inner.on_ack(message).await;
     }
 }
@@ -66,20 +67,19 @@ impl<C> Plane<C> for ()
 where
     C: Consensus,
 {
-    async fn on_request(&self, _message: C::Message<C::RequestHeader>)
+    async fn on_request(&self, _message: RequestMessage<C>)
     where
-        C::Message<C::RequestHeader>:
-            Project<C::Message<C::ReplicateHeader>, C, Consensus = C> + Clone,
+        RequestMessage<C>: Project<ReplicateMessage<C>, C, Consensus = C> + Clone,
     {
     }
 
-    async fn on_replicate(&self, _message: C::Message<C::ReplicateHeader>)
+    async fn on_replicate(&self, _message: ReplicateMessage<C>)
     where
-        C::Message<C::ReplicateHeader>: Project<C::Message<C::AckHeader>, C, Consensus = C> + Clone,
+        ReplicateMessage<C>: Project<AckMessage<C>, C, Consensus = C> + Clone,
     {
     }
 
-    async fn on_ack(&self, _message: C::Message<C::AckHeader>) {}
+    async fn on_ack(&self, _message: AckMessage<C>) {}
 }
 
 impl<C, Head, Tail> Plane<C> for variadic!(Head, ...Tail)
@@ -88,10 +88,9 @@ where
     Head: Plane<C> + PlaneIdentity<C>,
     Tail: Plane<C>,
 {
-    async fn on_request(&self, message: C::Message<C::RequestHeader>)
+    async fn on_request(&self, message: RequestMessage<C>)
     where
-        C::Message<C::RequestHeader>:
-            Project<C::Message<C::ReplicateHeader>, C, Consensus = C> + Clone,
+        RequestMessage<C>: Project<ReplicateMessage<C>, C, Consensus = C> + Clone,
     {
         if self.0.is_applicable(&message) {
             self.0.on_request(message).await;
@@ -100,9 +99,9 @@ where
         }
     }
 
-    async fn on_replicate(&self, message: C::Message<C::ReplicateHeader>)
+    async fn on_replicate(&self, message: ReplicateMessage<C>)
     where
-        C::Message<C::ReplicateHeader>: Project<C::Message<C::AckHeader>, C, Consensus = C> + Clone,
+        ReplicateMessage<C>: Project<AckMessage<C>, C, Consensus = C> + Clone,
     {
         if self.0.is_applicable(&message) {
             self.0.on_replicate(message).await;
@@ -111,7 +110,7 @@ where
         }
     }
 
-    async fn on_ack(&self, message: C::Message<C::AckHeader>) {
+    async fn on_ack(&self, message: AckMessage<C>) {
         if self.0.is_applicable(&message) {
             self.0.on_ack(message).await;
         } else {

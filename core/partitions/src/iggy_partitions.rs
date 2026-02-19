@@ -475,7 +475,6 @@ where
     fn is_applicable<H>(&self, message: &<VsrConsensus<B> as Consensus>::Message<H>) -> bool
     where
         H: ConsensusHeader,
-        <VsrConsensus<B> as Consensus>::Message<H>: ConsensusMessage<H>,
     {
         assert!(matches!(
             message.header().command(),

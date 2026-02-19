@@ -253,14 +253,13 @@ where
     fn is_applicable<H>(&self, message: &<VsrConsensus<B, P> as Consensus>::Message<H>) -> bool
     where
         H: ConsensusHeader,
-        <VsrConsensus<B, P> as Consensus>::Message<H>: ConsensusMessage<H>,
     {
         assert!(matches!(
             message.header().command(),
             Command2::Request | Command2::Prepare | Command2::PrepareOk
         ));
         let operation = message.header().operation();
-        // TODO: Use better heuristic, smth like greater or equal based on op number.
+        // TODO: Use better selection, smth like greater or equal based on op number.
         matches!(
             operation,
             Operation::CreateStream
