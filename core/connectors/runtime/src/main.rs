@@ -69,8 +69,8 @@ static PLUGIN_ID: AtomicU32 = AtomicU32::new(1);
 const ALLOWED_PLUGIN_EXTENSIONS: [&str; 3] = ["so", "dylib", "dll"];
 const DEFAULT_CONFIG_PATH: &str = "core/connectors/runtime/config.toml";
 
-#[derive(WrapperApi)]
-struct SourceApi {
+#[derive(WrapperApi, Debug)]
+pub(crate) struct SourceApi {
     iggy_source_open: extern "C" fn(
         id: u32,
         config_ptr: *const u8,
@@ -84,8 +84,8 @@ struct SourceApi {
     iggy_source_version: extern "C" fn() -> *const std::ffi::c_char,
 }
 
-#[derive(WrapperApi)]
-struct SinkApi {
+#[derive(WrapperApi, Debug)]
+pub(crate) struct SinkApi {
     iggy_sink_open: extern "C" fn(
         id: u32,
         config_ptr: *const u8,
@@ -167,21 +167,27 @@ async fn main() -> Result<(), RuntimeError> {
 
     let mut sink_wrappers = vec![];
     let mut sink_with_plugins = HashMap::new();
-    for (key, sink) in sinks {
+    let mut sink_containers_by_key: HashMap<String, Arc<Container<SinkApi>>> = HashMap::new();
+    for (path, sink) in sinks {
+        let container = Arc::new(sink.container);
+        let callback = container.iggy_sink_consume;
         let plugin_ids = sink
             .plugins
             .iter()
             .filter(|plugin| plugin.error.is_none())
             .map(|plugin| plugin.id)
             .collect();
+        for plugin in &sink.plugins {
+            sink_containers_by_key.insert(plugin.key.clone(), container.clone());
+        }
         sink_wrappers.push(SinkConnectorWrapper {
-            callback: sink.container.iggy_sink_consume,
+            callback,
             plugins: sink.plugins,
         });
         sink_with_plugins.insert(
-            key,
+            path,
             SinkWithPlugins {
-                container: sink.container,
+                container,
                 plugin_ids,
             },
         );
@@ -189,21 +195,27 @@ async fn main() -> Result<(), RuntimeError> {
 
     let mut source_wrappers = vec![];
     let mut source_with_plugins = HashMap::new();
-    for (key, source) in sources {
+    let mut source_containers_by_key: HashMap<String, Arc<Container<SourceApi>>> = HashMap::new();
+    for (path, source) in sources {
+        let container = Arc::new(source.container);
+        let callback = container.iggy_source_handle;
         let plugin_ids = source
             .plugins
             .iter()
             .filter(|plugin| plugin.error.is_none())
             .map(|plugin| plugin.id)
             .collect();
+        for plugin in &source.plugins {
+            source_containers_by_key.insert(plugin.key.clone(), container.clone());
+        }
         source_wrappers.push(SourceConnectorWrapper {
-            callback: source.container.iggy_source_handle,
+            callback,
             plugins: source.plugins,
         });
         source_with_plugins.insert(
-            key,
+            path,
             SourceWithPlugins {
-                container: source.container,
+                container,
                 plugin_ids,
             },
         );
@@ -219,6 +231,19 @@ async fn main() -> Result<(), RuntimeError> {
         iggy_clients.clone(),
         config.state.path.clone(),
     );
+    for (key, container) in sink_containers_by_key {
+        if let Some(details) = context.sinks.get(&key).await {
+            let mut details = details.lock().await;
+            details.container = Some(container);
+        }
+    }
+    for (key, container) in source_containers_by_key {
+        if let Some(details) = context.sources.get(&key).await {
+            let mut details = details.lock().await;
+            details.container = Some(container);
+        }
+    }
+
     let context = Arc::new(context);
     api::init(&config.http, context.clone()).await;
 
@@ -403,7 +428,7 @@ struct SinkConnectorWrapper {
 }
 
 struct SinkWithPlugins {
-    container: Container<SinkApi>,
+    container: Arc<Container<SinkApi>>,
     plugin_ids: Vec<u32>,
 }
 
@@ -432,7 +457,7 @@ struct SourceConnectorProducer {
 }
 
 struct SourceWithPlugins {
-    container: Container<SourceApi>,
+    container: Arc<Container<SourceApi>>,
     plugin_ids: Vec<u32>,
 }
 

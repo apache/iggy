@@ -16,11 +16,14 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+use crate::SourceApi;
 use crate::configs::connectors::{ConfigFormat, SourceConfig};
 use crate::metrics::Metrics;
 use dashmap::DashMap;
+use dlopen2::wrapper::Container;
 use iggy_connector_sdk::api::{ConnectorError, ConnectorStatus};
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::Arc;
 use tokio::sync::{Mutex, watch};
 use tokio::task::JoinHandle;
@@ -112,10 +115,20 @@ pub struct SourceInfo {
     pub plugin_config_format: Option<ConfigFormat>,
 }
 
-#[derive(Debug)]
 pub struct SourceDetails {
     pub info: SourceInfo,
     pub config: SourceConfig,
     pub shutdown_tx: Option<watch::Sender<()>>,
     pub handler_tasks: Vec<JoinHandle<()>>,
+    pub container: Option<Arc<Container<SourceApi>>>,
+}
+
+impl fmt::Debug for SourceDetails {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SourceDetails")
+            .field("info", &self.info)
+            .field("config", &self.config)
+            .field("container", &self.container.as_ref().map(|_| "..."))
+            .finish()
+    }
 }
