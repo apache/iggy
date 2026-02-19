@@ -143,7 +143,7 @@ async fn main() -> Result<(), RuntimeError> {
 
     info!("State will be stored in: {}", config.state.path);
 
-    let iggy_clients = stream::init(config.iggy.clone()).await?;
+    let iggy_clients = Arc::new(stream::init(config.iggy.clone()).await?);
 
     let connectors_config_provider: Box<dyn ConnectorsConfigProvider> =
         create_connectors_config_provider(&config.connectors).await?;
@@ -216,6 +216,8 @@ async fn main() -> Result<(), RuntimeError> {
         &sink_wrappers,
         &source_wrappers,
         connectors_config_provider,
+        iggy_clients.clone(),
+        config.state.path.clone(),
     );
     let context = Arc::new(context);
     api::init(&config.http, context.clone()).await;
