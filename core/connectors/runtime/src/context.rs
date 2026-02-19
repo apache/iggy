@@ -110,6 +110,8 @@ fn map_sinks(
                     plugin_config_format: sink_plugin.config_format,
                 },
                 config: sink_config.clone(),
+                shutdown_tx: None,
+                task_handles: vec![],
             });
         }
     }
@@ -152,6 +154,8 @@ fn map_sources(
                     plugin_config_format: source_plugin.config_format,
                 },
                 config: source_config.clone(),
+                shutdown_tx: None,
+                handler_tasks: vec![],
             });
         }
     }

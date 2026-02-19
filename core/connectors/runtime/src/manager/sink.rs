@@ -22,7 +22,8 @@ use dashmap::DashMap;
 use iggy_connector_sdk::api::{ConnectorError, ConnectorStatus};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
+use tokio::task::JoinHandle;
 
 #[derive(Debug)]
 pub struct SinkManager {
@@ -115,4 +116,6 @@ pub struct SinkInfo {
 pub struct SinkDetails {
     pub info: SinkInfo,
     pub config: SinkConfig,
+    pub shutdown_tx: Option<watch::Sender<()>>,
+    pub task_handles: Vec<JoinHandle<()>>,
 }

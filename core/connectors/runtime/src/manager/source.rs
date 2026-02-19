@@ -22,7 +22,8 @@ use dashmap::DashMap;
 use iggy_connector_sdk::api::{ConnectorError, ConnectorStatus};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
+use tokio::task::JoinHandle;
 
 #[derive(Debug)]
 pub struct SourceManager {
@@ -115,4 +116,6 @@ pub struct SourceInfo {
 pub struct SourceDetails {
     pub info: SourceInfo,
     pub config: SourceConfig,
+    pub shutdown_tx: Option<watch::Sender<()>>,
+    pub handler_tasks: Vec<JoinHandle<()>>,
 }
