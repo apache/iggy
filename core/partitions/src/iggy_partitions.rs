@@ -28,7 +28,7 @@ use consensus::{
 use iggy_common::{
     INDEX_SIZE, IggyByteSize, IggyIndexesMut, IggyMessagesBatchMut, PartitionStats, PooledBuffer,
     Segment, SegmentStorage,
-    header::{GenericHeader, Operation, PrepareHeader},
+    header::{GenericHeader, Operation, PrepareHeader, PrepareOkHeader, RequestHeader},
     message::Message,
     sharding::{IggyNamespace, LocalIdx, ShardId},
 };
@@ -333,7 +333,7 @@ impl<B> Plane<VsrConsensus<B>> for IggyPartitions<VsrConsensus<B>>
 where
     B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
 {
-    async fn on_request(&self, message: <VsrConsensus<B> as Consensus>::RequestMessage) {
+    async fn on_request(&self, message: <VsrConsensus<B> as Consensus>::Message<RequestHeader>) {
         let consensus = self.consensus.as_ref().unwrap();
 
         debug!("handling partition request");
@@ -341,7 +341,7 @@ where
         pipeline_prepare_common(consensus, prepare, |prepare| self.on_replicate(prepare)).await;
     }
 
-    async fn on_replicate(&self, message: <VsrConsensus<B> as Consensus>::ReplicateMessage) {
+    async fn on_replicate(&self, message: <VsrConsensus<B> as Consensus>::Message<PrepareHeader>) {
         let consensus = self.consensus.as_ref().unwrap();
 
         let header = message.header();
@@ -383,7 +383,7 @@ where
         }
     }
 
-    async fn on_ack(&self, message: <VsrConsensus<B> as Consensus>::AckMessage) {
+    async fn on_ack(&self, message: <VsrConsensus<B> as Consensus>::Message<PrepareOkHeader>) {
         let consensus = self.consensus.as_ref().unwrap();
         let header = message.header();
 

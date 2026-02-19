@@ -20,7 +20,7 @@ use crate::actors::consumer::client::BenchmarkConsumerClient;
 use crate::actors::consumer::client::interface::{BenchmarkConsumerConfig, ConsumerClient};
 use crate::actors::{ApiLabel, BatchMetrics, BenchmarkInit};
 use crate::benchmarks::common::create_consumer;
-use crate::utils::{ClientFactory, login_root};
+use crate::utils::{ClientFactory, authenticate};
 use crate::utils::{batch_total_size_bytes, batch_user_size_bytes};
 use iggy::prelude::*;
 use std::sync::Arc;
@@ -121,7 +121,12 @@ impl BenchmarkInit for LowLevelConsumerClient {
 
         let client = self.client_factory.create_client().await;
         let client = IggyClient::create(client, None, None);
-        login_root(&client).await;
+        authenticate(
+            &client,
+            self.client_factory.username(),
+            self.client_factory.password(),
+        )
+        .await;
 
         let stream_id: Identifier = self.config.stream_id.as_str().try_into().unwrap();
         let topic_id = topic_id_str.try_into().unwrap();

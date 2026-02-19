@@ -34,7 +34,7 @@ use iggy_common::{
 use quinn::crypto::rustls::QuicClientConfig as QuinnQuicClientConfig;
 use quinn::{ClientConfig, Connection, Endpoint, IdleTimeout, RecvStream, VarInt};
 use rustls::crypto::CryptoProvider;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -165,14 +165,13 @@ impl QuicClient {
 
     /// Create a new QUIC client for the provided configuration.
     pub fn create(config: Arc<QuicClientConfig>) -> Result<Self, IggyError> {
-        let server_address = config
+        let resolved_addr = config
             .server_address
-            .parse::<SocketAddr>()
-            .map_err(|error| {
-                error!("Invalid server address: {error}");
-                IggyError::InvalidServerAddress
-            })?;
-        let client_address = if server_address.is_ipv6()
+            .to_socket_addrs()
+            .ok()
+            .and_then(|mut addrs| addrs.next());
+
+        let client_address = if resolved_addr.is_some_and(|a| a.is_ipv6())
             && config.client_address == QuicClientConfig::default().client_address
         {
             "[::1]:0"
@@ -195,6 +194,7 @@ impl QuicClient {
         let mut endpoint = endpoint.unwrap();
         endpoint.set_default_client_config(quic_config);
 
+        let server_address = config.server_address.clone();
         Ok(Self {
             config,
             endpoint,
@@ -203,7 +203,7 @@ impl QuicClient {
             events: broadcast(1000),
             connected_at: Mutex::new(None),
             leader_redirection_state: Mutex::new(LeaderRedirectionState::new()),
-            current_server_address: Mutex::new(server_address.to_string()),
+            current_server_address: Mutex::new(server_address),
         })
     }
 
@@ -304,13 +304,20 @@ impl QuicClient {
             let remote_address;
             loop {
                 let server_address_str = self.current_server_address.lock().await.clone();
-                let server_address: SocketAddr = server_address_str.parse().map_err(|e| {
-                    error!(
-                        "Failed to parse server address '{}': {}",
-                        server_address_str, e
-                    );
-                    IggyError::InvalidServerAddress
-                })?;
+                let server_address = tokio::net::lookup_host(&server_address_str)
+                    .await
+                    .map_err(|e| {
+                        error!(
+                            "Failed to resolve server address '{}': {}",
+                            server_address_str, e
+                        );
+                        IggyError::InvalidServerAddress
+                    })?
+                    .next()
+                    .ok_or_else(|| {
+                        error!("No addresses resolved for '{}'", server_address_str);
+                        IggyError::InvalidServerAddress
+                    })?;
                 info!(
                     "{NAME} client is connecting to server: {}...",
                     server_address
@@ -911,5 +918,47 @@ mod tests {
             quic_client_config.reconnection.reestablish_after,
             IggyDuration::from_str("5s").unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn should_create_with_hostname_address() {
+        let config = QuicClientConfig {
+            server_address: "localhost:8080".to_string(),
+            ..Default::default()
+        };
+        let client = QuicClient::create(Arc::new(config));
+        assert!(client.is_ok(), "Expected Ok, got: {:?}", client.err());
+    }
+
+    #[tokio::test]
+    async fn should_create_with_fqdn_address() {
+        let config = QuicClientConfig {
+            server_address: "my-server.example.com:8080".to_string(),
+            ..Default::default()
+        };
+        let client = QuicClient::create(Arc::new(config));
+        assert!(client.is_ok(), "Expected Ok, got: {:?}", client.err());
+    }
+
+    #[tokio::test]
+    async fn should_store_raw_hostname_in_current_server_address() {
+        let hostname = "localhost:8080";
+        let config = QuicClientConfig {
+            server_address: hostname.to_string(),
+            ..Default::default()
+        };
+        let client = QuicClient::create(Arc::new(config)).unwrap();
+        let stored = client.current_server_address.lock().await;
+        assert_eq!(*stored, hostname);
+    }
+
+    #[tokio::test]
+    async fn should_succeed_from_connection_string_with_hostname() {
+        let connection_string = "iggy+quic://user:secret@localhost:1234";
+        let client = QuicClient::from_connection_string(connection_string);
+        assert!(client.is_ok());
+
+        let client = client.unwrap();
+        assert_eq!(client.config.server_address, "localhost:1234");
     }
 }

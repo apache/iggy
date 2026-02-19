@@ -17,7 +17,7 @@
  */
 
 use super::{CONSUMER_GROUP_BASE_ID, CONSUMER_GROUP_NAME_PREFIX};
-use crate::utils::{ClientFactory, login_root};
+use crate::utils::{ClientFactory, authenticate};
 use crate::{
     actors::{
         consumer::typed_benchmark_consumer::TypedBenchmarkConsumer,
@@ -76,7 +76,12 @@ pub async fn init_consumer_groups(
     let client = IggyClient::create(client, None, None);
     let cg_count = args.number_of_consumer_groups();
 
-    login_root(&client).await;
+    authenticate(
+        &client,
+        client_factory.username(),
+        client_factory.password(),
+    )
+    .await;
     for i in 1..=cg_count {
         let consumer_group_id = CONSUMER_GROUP_BASE_ID + i;
         let stream_name = format!("bench-stream-{i}");
