@@ -443,14 +443,12 @@ pub(crate) async fn source_forwarding_loop(
         .await;
 }
 
-pub fn handle(
-    sources: Vec<SourceConnectorWrapper>,
-    context: Arc<RuntimeContext>,
-) -> Vec<tokio::task::JoinHandle<()>> {
-    let mut handler_tasks = Vec::new();
+pub fn handle(sources: Vec<SourceConnectorWrapper>, context: Arc<RuntimeContext>) {
     for source in sources {
         for plugin in source.plugins {
             let plugin_id = plugin.id;
+            let plugin_key_for_store = plugin.key.clone();
+            let context_for_store = context.clone();
             let plugin_key = plugin.key.clone();
             let context = context.clone();
 
@@ -617,10 +615,14 @@ pub fn handle(
                     )
                     .await;
             });
-            handler_tasks.push(handler_task);
+            tokio::spawn(async move {
+                if let Some(details) = context_for_store.sources.get(&plugin_key_for_store).await {
+                    let mut details = details.lock().await;
+                    details.handler_tasks = vec![handler_task];
+                }
+            });
         }
     }
-    handler_tasks
 }
 
 fn process_messages(

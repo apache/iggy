@@ -155,7 +155,6 @@ fn map_sources(
                     plugin_config_format: source_plugin.config_format,
                 },
                 config: source_config.clone(),
-                shutdown_tx: None,
                 handler_tasks: vec![],
                 container: None,
             });
