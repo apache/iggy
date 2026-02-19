@@ -18,6 +18,7 @@
  */
 
 mod api;
+mod delta;
 mod elasticsearch;
 mod fixtures;
 mod http_config_provider;
