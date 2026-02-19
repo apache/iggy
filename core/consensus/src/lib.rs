@@ -16,6 +16,7 @@
 // under the License.
 
 use iggy_common::header::ConsensusHeader;
+use iggy_common::message::ConsensusMessage;
 use message_bus::MessageBus;
 
 pub trait Project<T, C: Consensus> {
@@ -53,7 +54,7 @@ pub trait Pipeline {
 pub trait Consensus: Sized {
     type MessageBus: MessageBus;
     #[rustfmt::skip] // Scuffed formatter.
-    type Message<H> where H: ConsensusHeader;
+    type Message<H>: ConsensusMessage<H> where H: ConsensusHeader;
 
     type RequestHeader: ConsensusHeader;
     type ReplicateHeader: ConsensusHeader;
@@ -95,8 +96,20 @@ where
     fn on_ack(&self, message: C::Message<C::AckHeader>) -> impl Future<Output = ()>;
 }
 
+pub trait PlaneIdentity<C>
+where
+    C: Consensus,
+{
+    fn is_applicable<H>(&self, message: &C::Message<H>) -> bool
+    where
+        H: ConsensusHeader,
+        C::Message<H>: ConsensusMessage<H>;
+}
+
 mod impls;
 pub use impls::*;
+mod plane_mux;
+pub use plane_mux::*;
 mod plane_helpers;
 pub use plane_helpers::*;
 

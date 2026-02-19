@@ -17,14 +17,17 @@
 use crate::stm::StateMachine;
 use crate::stm::snapshot::{FillSnapshot, MetadataSnapshot, Snapshot, SnapshotError};
 use consensus::{
-    Consensus, Pipeline, PipelineEntry, Plane, Project, Sequencer, VsrConsensus, ack_preflight,
-    ack_quorum_reached, build_reply_message, fence_old_prepare_by_commit,
+    Consensus, Pipeline, PipelineEntry, Plane, PlaneIdentity, Project, Sequencer, VsrConsensus,
+    ack_preflight, ack_quorum_reached, build_reply_message, fence_old_prepare_by_commit,
     panic_if_hash_chain_would_break_in_same_view, pipeline_prepare_common, replicate_preflight,
     replicate_to_next_in_chain, send_prepare_ok as send_prepare_ok_common,
 };
 use iggy_common::{
-    header::{Command2, GenericHeader, PrepareHeader, PrepareOkHeader, RequestHeader},
-    message::Message,
+    header::{
+        Command2, ConsensusHeader, GenericHeader, Operation, PrepareHeader, PrepareOkHeader,
+        RequestHeader,
+    },
+    message::{ConsensusMessage, Message},
 };
 use journal::{Journal, JournalHandle};
 use message_bus::MessageBus;
@@ -236,6 +239,50 @@ where
                 .await
                 .unwrap()
         }
+    }
+}
+
+impl<B, P, J, S, M> PlaneIdentity<VsrConsensus<B, P>> for IggyMetadata<VsrConsensus<B, P>, J, S, M>
+where
+    B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
+    P: Pipeline<Message = Message<PrepareHeader>, Entry = PipelineEntry>,
+    J: JournalHandle,
+    J::Target: Journal<J::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    M: StateMachine<Input = Message<PrepareHeader>>,
+{
+    fn is_applicable<H>(&self, message: &<VsrConsensus<B, P> as Consensus>::Message<H>) -> bool
+    where
+        H: ConsensusHeader,
+        <VsrConsensus<B, P> as Consensus>::Message<H>: ConsensusMessage<H>,
+    {
+        assert!(matches!(
+            message.header().command(),
+            Command2::Request | Command2::Prepare | Command2::PrepareOk
+        ));
+        let operation = message.header().operation();
+        // TODO: Use better heuristic, smth like greater or equal based on op number.
+        matches!(
+            operation,
+            Operation::CreateStream
+                | Operation::UpdateStream
+                | Operation::DeleteStream
+                | Operation::PurgeStream
+                | Operation::CreateTopic
+                | Operation::UpdateTopic
+                | Operation::DeleteTopic
+                | Operation::PurgeTopic
+                | Operation::CreatePartitions
+                | Operation::DeletePartitions
+                | Operation::CreateConsumerGroup
+                | Operation::DeleteConsumerGroup
+                | Operation::CreateUser
+                | Operation::UpdateUser
+                | Operation::DeleteUser
+                | Operation::ChangePassword
+                | Operation::UpdatePermissions
+                | Operation::CreatePersonalAccessToken
+                | Operation::DeletePersonalAccessToken
+        )
     }
 }
 

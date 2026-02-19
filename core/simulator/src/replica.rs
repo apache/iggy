@@ -17,23 +17,23 @@
 
 use crate::bus::{MemBus, SharedMemBus};
 use crate::deps::{
-    MemStorage, ReplicaPartitions, SimJournal, SimMetadata, SimMuxStateMachine, SimSnapshot,
+    MemStorage, ReplicaPartitions, SimJournal, SimMuxStateMachine, SimPlane, SimSnapshot,
 };
-use consensus::{LocalPipeline, VsrConsensus};
+use consensus::{LocalPipeline, MuxPlane, VsrConsensus};
 use iggy_common::IggyByteSize;
 use iggy_common::sharding::ShardId;
+use iggy_common::variadic;
 use metadata::stm::consumer_group::{ConsumerGroups, ConsumerGroupsInner};
 use metadata::stm::stream::{Streams, StreamsInner};
 use metadata::stm::user::{Users, UsersInner};
-use metadata::{IggyMetadata, variadic};
+use metadata::IggyMetadata;
 use partitions::PartitionsConfig;
 use std::sync::Arc;
 
 pub struct Replica {
     pub id: u8,
     pub name: String,
-    pub metadata: SimMetadata,
-    pub partitions: ReplicaPartitions,
+    pub plane: SimPlane,
     pub bus: Arc<MemBus>,
 }
 
@@ -83,17 +83,24 @@ impl Replica {
             ReplicaPartitions::new(ShardId::new(id as u16), partitions_config, None)
         };
 
+        let metadata = IggyMetadata {
+            consensus: Some(metadata_consensus),
+            journal: Some(SimJournal::<MemStorage>::default()),
+            snapshot: Some(SimSnapshot::default()),
+            mux_stm: mux,
+        };
+        let plane = MuxPlane::new(variadic!(metadata, partitions));
+
         Self {
             id,
             name,
-            metadata: IggyMetadata {
-                consensus: Some(metadata_consensus),
-                journal: Some(SimJournal::<MemStorage>::default()),
-                snapshot: Some(SimSnapshot::default()),
-                mux_stm: mux,
-            },
-            partitions,
+            plane,
             bus,
         }
+    }
+
+    pub fn init_partition_in_memory(&mut self, namespace: iggy_common::sharding::IggyNamespace) {
+        // TODO: create an accessor for the partitions within mux plane, same for metadata.
+        self.plane.inner_mut().1.0.init_partition_in_memory(namespace);
     }
 }

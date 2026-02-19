@@ -37,7 +37,7 @@ impl Simulator {
     /// Initialize a partition on all replicas (in-memory for simulation)
     pub fn init_partition(&mut self, namespace: iggy_common::sharding::IggyNamespace) {
         for replica in &mut self.replicas {
-            replica.partitions.init_partition_in_memory(namespace);
+            replica.init_partition_in_memory(namespace);
         }
     }
 
@@ -115,46 +115,10 @@ impl Simulator {
     }
 
     async fn dispatch_to_replica(&self, replica: &Replica, message: Message<GenericHeader>) {
-        let message: MessageBag = message.into();
-        let operation = match &message {
-            MessageBag::Request(message) => message.header().operation,
-            MessageBag::Prepare(message) => message.header().operation,
-            MessageBag::PrepareOk(message) => message.header().operation,
-        } as u8;
-
-        if operation < 200 {
-            self.dispatch_to_metadata_on_replica(replica, message).await;
-        } else {
-            self.dispatch_to_partition_on_replica(replica, message)
-                .await;
-        }
-    }
-
-    async fn dispatch_to_metadata_on_replica(&self, replica: &Replica, message: MessageBag) {
-        match message {
-            MessageBag::Request(request) => {
-                replica.metadata.on_request(request).await;
-            }
-            MessageBag::Prepare(prepare) => {
-                replica.metadata.on_replicate(prepare).await;
-            }
-            MessageBag::PrepareOk(prepare_ok) => {
-                replica.metadata.on_ack(prepare_ok).await;
-            }
-        }
-    }
-
-    async fn dispatch_to_partition_on_replica(&self, replica: &Replica, message: MessageBag) {
-        match message {
-            MessageBag::Request(request) => {
-                replica.partitions.on_request(request).await;
-            }
-            MessageBag::Prepare(prepare) => {
-                replica.partitions.on_replicate(prepare).await;
-            }
-            MessageBag::PrepareOk(prepare_ok) => {
-                replica.partitions.on_ack(prepare_ok).await;
-            }
+        match MessageBag::from(message) {
+            MessageBag::Request(request) => replica.plane.on_request(request).await,
+            MessageBag::Prepare(prepare) => replica.plane.on_replicate(prepare).await,
+            MessageBag::PrepareOk(prepare_ok) => replica.plane.on_ack(prepare_ok).await,
         }
     }
 }
