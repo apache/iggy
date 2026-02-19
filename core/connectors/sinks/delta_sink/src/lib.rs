@@ -23,11 +23,11 @@ use deltalake_core::DeltaTable;
 use deltalake_core::writer::JsonWriter;
 use iggy_connector_sdk::sink_connector;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use tokio::sync::Mutex;
 
 mod coercions;
 mod sink;
+mod storage;
 mod utils;
 
 use crate::coercions::CoercionTree;
@@ -52,9 +52,37 @@ struct SinkState {
 pub struct DeltaSinkConfig {
     pub table_uri: String,
     #[serde(default)]
-    pub storage_options: HashMap<String, String>,
-    #[serde(default)]
     pub schema: Vec<String>,
+    #[serde(default)]
+    pub storage_backend_type: Option<String>,
+
+    // AWS S3
+    #[serde(default)]
+    pub aws_s3_access_key: Option<String>,
+    #[serde(default)]
+    pub aws_s3_secret_key: Option<String>,
+    #[serde(default)]
+    pub aws_s3_region: Option<String>,
+    #[serde(default)]
+    pub aws_s3_endpoint_url: Option<String>,
+    #[serde(default)]
+    pub aws_s3_allow_http: Option<bool>,
+
+    // Azure Blob Storage
+    #[serde(default)]
+    pub azure_storage_account_name: Option<String>,
+    #[serde(default)]
+    pub azure_storage_account_key: Option<String>,
+    #[serde(default)]
+    pub azure_storage_sas_token: Option<String>,
+    #[serde(default)]
+    pub azure_container_name: Option<String>,
+
+    // Google Cloud Storage
+    #[serde(default)]
+    pub gcs_service_account_key: Option<String>,
+    #[serde(default)]
+    pub gcs_bucket: Option<String>,
 }
 
 impl DeltaSink {

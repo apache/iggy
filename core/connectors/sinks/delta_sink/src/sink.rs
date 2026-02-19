@@ -18,6 +18,7 @@
 
 use crate::SinkState;
 use crate::coercions::{coerce, create_coercion_tree};
+use crate::storage::build_storage_options;
 use crate::utils::parse_schema;
 use crate::DeltaSink;
 use async_trait::async_trait;
@@ -25,6 +26,7 @@ use deltalake_core::DeltaTable;
 use deltalake_core::operations::create::CreateBuilder;
 use deltalake_core::writer::{DeltaWriter, JsonWriter};
 use iggy_connector_sdk::{ConsumedMessage, Error, MessagesMetadata, Payload, Sink, TopicMetadata};
+use std::collections::HashMap;
 use tracing::{debug, error, info};
 
 #[async_trait]
@@ -42,9 +44,14 @@ impl Sink for DeltaSink {
 
         info!("Parsed table URI: {}", table_url);
 
+        let storage_options = build_storage_options(&self.config).map_err(|e| {
+            error!("Invalid storage configuration: {e}");
+            Error::InitError(format!("Invalid storage configuration: {e}"))
+        })?;
+
         let table = match deltalake_core::open_table_with_storage_options(
             table_url,
-            self.config.storage_options.clone(),
+            storage_options.clone(),
         )
         .await
         {
@@ -53,7 +60,7 @@ impl Sink for DeltaSink {
                 info!("Table does not exist, creating from configured schema...");
                 create_table(
                     &self.config.table_uri,
-                    &self.config.storage_options,
+                    storage_options,
                     &self.config.schema,
                 )
                 .await?
@@ -176,13 +183,13 @@ impl Sink for DeltaSink {
 
 async fn create_table(
     table_uri: &str,
-    storage_options: &std::collections::HashMap<String, String>,
+    storage_options: HashMap<String, String>,
     schema: &[String],
 ) -> Result<DeltaTable, Error> {
     let columns = parse_schema(schema)?;
     let table = CreateBuilder::new()
         .with_location(table_uri)
-        .with_storage_options(storage_options.clone())
+        .with_storage_options(storage_options)
         .with_columns(columns)
         .await
         .map_err(|e| {

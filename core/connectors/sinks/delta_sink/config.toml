@@ -32,22 +32,41 @@ poll_interval = "5ms"
 consumer_group = "delta_sink_connector"
 
 [plugin_config]
-table_uri = "/Users/kriti/Projects/iggy/temp/iggy_delta_table"
-
-[plugin_config.storage_options]
-# AWS_ACCESS_KEY_ID = "your-access-key"
-# AWS_SECRET_ACCESS_KEY = "your-secret-key"
-# AWS_REGION = "us-east-1"
-
+table_uri = "file:///tmp/iggy_delta_table"
+schema = [
+    "id long",
+    "name string",
+    "count integer",
+    "amount double",
+    "active boolean",
+    "timestamp long",
+]
 
 # table_uri: Path or URI of the Delta table to write to.
-#   - Local: "/path/to/delta_table"
+#   - Local: "file:///path/to/delta_table"
 #   - S3: "s3://bucket/path/to/delta_table"
 #   - Azure: "az://container/path/to/delta_table"
 #   - GCS: "gs://bucket/path/to/delta_table"
-#
-# storage_options: Key-value pairs for storage backend credentials.
-#   For S3: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION, etc.
-#   For Azure: AZURE_STORAGE_ACCOUNT_NAME, AZURE_STORAGE_ACCOUNT_KEY, etc.
-#   For local filesystem: no options needed.
+
+# storage_backend_type: "s3", "azure", or "gcs". Omit for local filesystem.
+
+# S3 options:
+# storage_backend_type = "s3"
+# aws_s3_access_key = "your-access-key"
+# aws_s3_secret_key = "your-secret-key"
+# aws_s3_region = "us-east-1"
+# aws_s3_endpoint_url = "http://localhost:9000"
+# aws_s3_allow_http = true
+
+# Azure options:
+# storage_backend_type = "azure"
+# azure_storage_account_name = "your-account"
+# azure_storage_account_key = "your-key"
+# azure_storage_sas_token = "your-sas-token"
+# azure_container_name = "your-container"
+
+# GCS options:
+# storage_backend_type = "gcs"
+# gcs_service_account_key = '{"type": "service_account", ...}'
+# gcs_bucket = "your-bucket"
 
