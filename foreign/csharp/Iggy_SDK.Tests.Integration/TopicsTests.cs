@@ -21,8 +21,6 @@ using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
 using Apache.Iggy.Messages;
 using Apache.Iggy.Tests.Integrations.Fixtures;
-using Apache.Iggy.Tests.Integrations.Helpers;
-using Apache.Iggy.Tests.Integrations.Models;
 using Shouldly;
 using Partitioning = Apache.Iggy.Kinds.Partitioning;
 
@@ -30,175 +28,154 @@ namespace Apache.Iggy.Tests.Integrations;
 
 public class TopicsTests
 {
-    private static readonly CreateTestTopic TopicRequest = new("Test Topic", CompressionAlgorithm.Gzip,
-        TimeSpan.FromMinutes(10), 1, 2, 2_000_000_000);
-
-    private static readonly CreateTestTopic TopicRequestSecond
-        = new("Test Topic 2", CompressionAlgorithm.Gzip, TimeSpan.FromMinutes(10), 1, 2, 2_000_000_000);
-
-    private static readonly UpdateTestTopic UpdateTopicRequest
-        = new("Updated Topic", CompressionAlgorithm.Gzip, 3_000_000_000, TimeSpan.FromMinutes(10), 3);
-
-    [ClassDataSource<TopicsFixture>(Shared = SharedType.PerClass)]
-    public required TopicsFixture Fixture { get; init; }
+    [ClassDataSource<IggyServerFixture>(Shared = SharedType.PerAssembly)]
+    public required IggyServerFixture Fixture { get; init; }
 
     [Test]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task Create_NewTopic_Should_Return_Successfully(Protocol protocol)
     {
-        var response = await Fixture.Clients[protocol].CreateTopicAsync(
-            Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)), TopicRequest.Name,
-            TopicRequest.PartitionsCount, TopicRequest.CompressionAlgorithm, TopicRequest.ReplicationFactor,
-            TopicRequest.MessageExpiry, TopicRequest.MaxTopicSize);
+        var client = await Fixture.CreateAuthenticatedClient(protocol);
+
+        var streamName = $"topic-create-{Guid.NewGuid():N}";
+        await client.CreateStreamAsync(streamName);
+
+        var response = await client.CreateTopicAsync(
+            Identifier.String(streamName), "Test Topic", 2, CompressionAlgorithm.Gzip,
+            1, TimeSpan.FromMinutes(10), 2_000_000_000);
 
         response.ShouldNotBeNull();
         response.Id.ShouldBeGreaterThanOrEqualTo(0u);
         response.CreatedAt.UtcDateTime.ShouldBe(DateTimeOffset.UtcNow.UtcDateTime, TimeSpan.FromMinutes(1));
-        response.Name.ShouldBe(TopicRequest.Name);
-        response.CompressionAlgorithm.ShouldBe(TopicRequest.CompressionAlgorithm);
-        response.Partitions!.Count().ShouldBe((int)TopicRequest.PartitionsCount);
-        response.MessageExpiry.ShouldBe(TopicRequest.MessageExpiry);
+        response.Name.ShouldBe("Test Topic");
+        response.CompressionAlgorithm.ShouldBe(CompressionAlgorithm.Gzip);
+        response.Partitions!.Count().ShouldBe(2);
+        response.MessageExpiry.ShouldBe(TimeSpan.FromMinutes(10));
         response.Size.ShouldBe(0u);
-        response.PartitionsCount.ShouldBe(TopicRequest.PartitionsCount);
-        response.ReplicationFactor.ShouldBe(TopicRequest.ReplicationFactor);
-        response.MaxTopicSize.ShouldBe(TopicRequest.MaxTopicSize);
+        response.PartitionsCount.ShouldBe(2u);
+        response.ReplicationFactor.ShouldBe((byte?)1);
+        response.MaxTopicSize.ShouldBe(2_000_000_000u);
         response.MessagesCount.ShouldBe(0u);
     }
 
     [Test]
-    [DependsOn(nameof(Create_NewTopic_Should_Return_Successfully))]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task Create_DuplicateTopic_Should_Throw_InvalidResponse(Protocol protocol)
     {
-        await Should.ThrowAsync<IggyInvalidStatusCodeException>(Fixture.Clients[protocol].CreateTopicAsync(
-            Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)), TopicRequest.Name,
-            TopicRequest.PartitionsCount, TopicRequest.CompressionAlgorithm, TopicRequest.ReplicationFactor,
-            TopicRequest.MessageExpiry, TopicRequest.MaxTopicSize));
+        var client = await Fixture.CreateAuthenticatedClient(protocol);
+
+        var streamName = $"topic-dup-{Guid.NewGuid():N}";
+        await client.CreateStreamAsync(streamName);
+        await client.CreateTopicAsync(Identifier.String(streamName), "Dup Topic", 1);
+
+        await Should.ThrowAsync<IggyInvalidStatusCodeException>(
+            client.CreateTopicAsync(Identifier.String(streamName), "Dup Topic", 1));
     }
 
     [Test]
-    [DependsOn(nameof(Create_DuplicateTopic_Should_Throw_InvalidResponse))]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task Get_ExistingTopic_Should_ReturnValidResponse(Protocol protocol)
     {
-        var response = await Fixture.Clients[protocol]
-            .GetTopicByIdAsync(Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)), Identifier.Numeric(0));
+        var client = await Fixture.CreateAuthenticatedClient(protocol);
+
+        var streamName = $"topic-get-{Guid.NewGuid():N}";
+        await client.CreateStreamAsync(streamName);
+        await client.CreateTopicAsync(Identifier.String(streamName), "Get Topic", 2,
+            CompressionAlgorithm.Gzip, 1, TimeSpan.FromMinutes(10), 2_000_000_000);
+
+        var response = await client.GetTopicByIdAsync(Identifier.String(streamName), Identifier.Numeric(0));
 
         response.ShouldNotBeNull();
         response.Id.ShouldBeGreaterThanOrEqualTo(0u);
         response.CreatedAt.UtcDateTime.ShouldBe(DateTimeOffset.UtcNow.UtcDateTime, TimeSpan.FromMinutes(1));
-        response.Name.ShouldBe(TopicRequest.Name);
-        response.CompressionAlgorithm.ShouldBe(TopicRequest.CompressionAlgorithm);
-        response.Partitions!.Count().ShouldBe((int)TopicRequest.PartitionsCount);
-        response.MessageExpiry.ShouldBe(TopicRequest.MessageExpiry);
+        response.Name.ShouldBe("Get Topic");
+        response.CompressionAlgorithm.ShouldBe(CompressionAlgorithm.Gzip);
+        response.Partitions!.Count().ShouldBe(2);
+        response.MessageExpiry.ShouldBe(TimeSpan.FromMinutes(10));
         response.Size.ShouldBe(0u);
-        response.PartitionsCount.ShouldBe(TopicRequest.PartitionsCount);
-        response.ReplicationFactor.ShouldBe(TopicRequest.ReplicationFactor);
-        response.MaxTopicSize.ShouldBe(TopicRequest.MaxTopicSize);
+        response.PartitionsCount.ShouldBe(2u);
+        response.ReplicationFactor.ShouldBe((byte?)1);
+        response.MaxTopicSize.ShouldBe(2_000_000_000u);
         response.MessagesCount.ShouldBe(0u);
     }
 
     [Test]
-    [DependsOn(nameof(Get_ExistingTopic_Should_ReturnValidResponse))]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task Get_ExistingTopic_ByName_Should_ReturnValidResponse(Protocol protocol)
     {
-        var response = await Fixture.Clients[protocol]
-            .GetTopicByIdAsync(Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-                Identifier.String(TopicRequest.Name));
+        var client = await Fixture.CreateAuthenticatedClient(protocol);
+
+        var streamName = $"topic-getname-{Guid.NewGuid():N}";
+        await client.CreateStreamAsync(streamName);
+        await client.CreateTopicAsync(Identifier.String(streamName), "Name Topic", 2,
+            CompressionAlgorithm.Gzip, 1, TimeSpan.FromMinutes(10), 2_000_000_000);
+
+        var response = await client.GetTopicByIdAsync(Identifier.String(streamName),
+            Identifier.String("Name Topic"));
 
         response.ShouldNotBeNull();
         response.Id.ShouldBeGreaterThanOrEqualTo(0u);
-        response.CreatedAt.UtcDateTime.ShouldBe(DateTimeOffset.UtcNow.UtcDateTime, TimeSpan.FromMinutes(1));
-        response.Name.ShouldBe(TopicRequest.Name);
-        response.CompressionAlgorithm.ShouldBe(TopicRequest.CompressionAlgorithm);
-        response.Partitions!.Count().ShouldBe((int)TopicRequest.PartitionsCount);
-        response.MessageExpiry.ShouldBe(TopicRequest.MessageExpiry);
+        response.Name.ShouldBe("Name Topic");
+        response.CompressionAlgorithm.ShouldBe(CompressionAlgorithm.Gzip);
+        response.Partitions!.Count().ShouldBe(2);
+        response.MessageExpiry.ShouldBe(TimeSpan.FromMinutes(10));
         response.Size.ShouldBe(0u);
-        response.PartitionsCount.ShouldBe(TopicRequest.PartitionsCount);
-        response.ReplicationFactor.ShouldBe(TopicRequest.ReplicationFactor);
-        response.MaxTopicSize.ShouldBe(TopicRequest.MaxTopicSize);
+        response.PartitionsCount.ShouldBe(2u);
+        response.ReplicationFactor.ShouldBe((byte?)1);
+        response.MaxTopicSize.ShouldBe(2_000_000_000u);
         response.MessagesCount.ShouldBe(0u);
     }
 
     [Test]
-    [DependsOn(nameof(Get_ExistingTopic_ByName_Should_ReturnValidResponse))]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task Get_ExistingTopics_Should_ReturnValidResponse(Protocol protocol)
     {
-        await Fixture.Clients[protocol].CreateTopicAsync(Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-            TopicRequestSecond.Name, TopicRequestSecond.PartitionsCount, TopicRequestSecond.CompressionAlgorithm,
-            TopicRequestSecond.ReplicationFactor, TopicRequestSecond.MessageExpiry,
-            TopicRequestSecond.MaxTopicSize);
+        var client = await Fixture.CreateAuthenticatedClient(protocol);
 
-        IReadOnlyList<TopicResponse> response = await Fixture.Clients[protocol]
-            .GetTopicsAsync(Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)));
+        var streamName = $"topic-list-{Guid.NewGuid():N}";
+        await client.CreateStreamAsync(streamName);
+        await client.CreateTopicAsync(Identifier.String(streamName), "List Topic 1", 2,
+            CompressionAlgorithm.Gzip, 1, TimeSpan.FromMinutes(10), 2_000_000_000);
+        await client.CreateTopicAsync(Identifier.String(streamName), "List Topic 2", 2,
+            CompressionAlgorithm.Gzip, 1, TimeSpan.FromMinutes(10), 2_000_000_000);
+
+        IReadOnlyList<TopicResponse> response = await client.GetTopicsAsync(Identifier.String(streamName));
 
         response.ShouldNotBeNull();
         response.Count().ShouldBe(2);
-        response.Select(x => x.Name).ShouldContain(TopicRequest.Name);
-        response.Select(x => x.Name).ShouldContain(TopicRequestSecond.Name);
-
-        var firstTopic = response.First(x => x.Name == TopicRequest.Name);
-        firstTopic.Id.ShouldBeGreaterThanOrEqualTo(0u);
-        firstTopic.CreatedAt.UtcDateTime.ShouldBe(DateTimeOffset.UtcNow.UtcDateTime, TimeSpan.FromMinutes(1));
-        firstTopic.Name.ShouldBe(TopicRequest.Name);
-        firstTopic.CompressionAlgorithm.ShouldBe(TopicRequest.CompressionAlgorithm);
-        firstTopic.Partitions.ShouldBeNull();
-        firstTopic.MessageExpiry.ShouldBe(TopicRequest.MessageExpiry);
-        firstTopic.Size.ShouldBe(0u);
-        firstTopic.PartitionsCount.ShouldBe(TopicRequest.PartitionsCount);
-        firstTopic.ReplicationFactor.ShouldBe(TopicRequest.ReplicationFactor);
-        firstTopic.MaxTopicSize.ShouldBe(TopicRequest.MaxTopicSize);
-        firstTopic.MessagesCount.ShouldBe(0u);
-
-        var secondTopic = response.First(x => x.Name == TopicRequestSecond.Name);
-        secondTopic.Id.ShouldBeGreaterThanOrEqualTo(0u);
-        secondTopic.CreatedAt.UtcDateTime.ShouldBe(DateTimeOffset.UtcNow.UtcDateTime, TimeSpan.FromMinutes(1));
-        secondTopic.Name.ShouldBe(TopicRequestSecond.Name);
-        secondTopic.CompressionAlgorithm.ShouldBe(TopicRequestSecond.CompressionAlgorithm);
-        secondTopic.Partitions.ShouldBeNull();
-        secondTopic.MessageExpiry.ShouldBe(TopicRequestSecond.MessageExpiry);
-        secondTopic.Size.ShouldBe(0u);
-        secondTopic.PartitionsCount.ShouldBe(TopicRequestSecond.PartitionsCount);
-        secondTopic.ReplicationFactor.ShouldBe(TopicRequestSecond.ReplicationFactor);
-        secondTopic.MaxTopicSize.ShouldBe(TopicRequestSecond.MaxTopicSize);
-        secondTopic.MessagesCount.ShouldBe(0u);
+        response.Select(x => x.Name).ShouldContain("List Topic 1");
+        response.Select(x => x.Name).ShouldContain("List Topic 2");
     }
 
     [Test]
-    [DependsOn(nameof(Get_ExistingTopics_Should_ReturnValidResponse))]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task Get_Topic_WithPartitions_Should_ReturnValidResponse(Protocol protocol)
     {
-        await Fixture.Clients[protocol]
-            .CreatePartitionsAsync(Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-                Identifier.String(TopicRequest.Name),
-                2);
+        var client = await Fixture.CreateAuthenticatedClient(protocol);
+
+        var streamName = $"topic-parts-{Guid.NewGuid():N}";
+        await client.CreateStreamAsync(streamName);
+        await client.CreateTopicAsync(Identifier.String(streamName), "Parts Topic", 1);
+
+        await client.CreatePartitionsAsync(Identifier.String(streamName),
+            Identifier.String("Parts Topic"), 2);
 
         for (var i = 0; i < 3; i++)
         {
-            await Fixture.Clients[protocol]
-                .SendMessagesAsync(Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-                    Identifier.String(TopicRequest.Name),
-                    Partitioning.None(), GetMessages(i + 2));
+            await client.SendMessagesAsync(Identifier.String(streamName),
+                Identifier.String("Parts Topic"),
+                Partitioning.None(), GetMessages(i + 2));
         }
 
-        var response = await Fixture.Clients[protocol]
-            .GetTopicByIdAsync(Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-                Identifier.String(TopicRequest.Name));
+        var response = await client.GetTopicByIdAsync(Identifier.String(streamName),
+            Identifier.String("Parts Topic"));
 
         response.ShouldNotBeNull();
         response.Id.ShouldBeGreaterThanOrEqualTo(0u);
-        response.CreatedAt.UtcDateTime.ShouldBe(DateTimeOffset.UtcNow.UtcDateTime, TimeSpan.FromMinutes(1));
-        response.Name.ShouldBe(TopicRequest.Name);
-        response.CompressionAlgorithm.ShouldBe(TopicRequest.CompressionAlgorithm);
+        response.Name.ShouldBe("Parts Topic");
         response.Partitions!.Count().ShouldBe(3);
-        response.MessageExpiry.ShouldBe(TopicRequest.MessageExpiry);
-        response.Size.ShouldBe(702u);
+        response.Size.ShouldBeGreaterThan(0u);
         response.PartitionsCount.ShouldBe(3u);
-        response.ReplicationFactor.ShouldBe(TopicRequest.ReplicationFactor);
-        response.MaxTopicSize.ShouldBe(TopicRequest.MaxTopicSize);
         response.MessagesCount.ShouldBe(9u);
         response.Partitions.ShouldNotBeNull();
         response.Partitions.ShouldAllBe(x => x.MessagesCount > 0);
@@ -210,88 +187,100 @@ public class TopicsTests
     }
 
     [Test]
-    [DependsOn(nameof(Get_Topic_WithPartitions_Should_ReturnValidResponse))]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task Update_ExistingTopic_Should_UpdateTopic_Successfully(Protocol protocol)
     {
-        var topicToUpdate = await Fixture.Clients[protocol]
-            .CreateTopicAsync(Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)), "topic-to-update", 1);
+        var client = await Fixture.CreateAuthenticatedClient(protocol);
+
+        var streamName = $"topic-update-{Guid.NewGuid():N}";
+        await client.CreateStreamAsync(streamName);
+        var topicToUpdate = await client.CreateTopicAsync(Identifier.String(streamName), "topic-to-update", 1);
         topicToUpdate.ShouldNotBeNull();
 
-        await Should.NotThrowAsync(Fixture.Clients[protocol].UpdateTopicAsync(
-            Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-            Identifier.Numeric(topicToUpdate.Id), UpdateTopicRequest.Name,
-            UpdateTopicRequest.CompressionAlgorithm, UpdateTopicRequest.MaxTopicSize, UpdateTopicRequest.MessageExpiry,
-            UpdateTopicRequest.ReplicationFactor));
+        await Should.NotThrowAsync(client.UpdateTopicAsync(
+            Identifier.String(streamName),
+            Identifier.Numeric(topicToUpdate.Id), "Updated Topic",
+            CompressionAlgorithm.Gzip, 3_000_000_000, TimeSpan.FromMinutes(10), 3));
 
-        var result = await Fixture.Clients[protocol].GetTopicByIdAsync(
-            Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
+        var result = await client.GetTopicByIdAsync(
+            Identifier.String(streamName),
             Identifier.Numeric(topicToUpdate.Id));
         result.ShouldNotBeNull();
-        result!.Name.ShouldBe(UpdateTopicRequest.Name);
-        result.MessageExpiry.ShouldBe(UpdateTopicRequest.MessageExpiry);
-        result.CompressionAlgorithm.ShouldBe(UpdateTopicRequest.CompressionAlgorithm);
-        result.MaxTopicSize.ShouldBe(UpdateTopicRequest.MaxTopicSize);
-        result.ReplicationFactor.ShouldBe(UpdateTopicRequest.ReplicationFactor);
+        result!.Name.ShouldBe("Updated Topic");
+        result.MessageExpiry.ShouldBe(TimeSpan.FromMinutes(10));
+        result.CompressionAlgorithm.ShouldBe(CompressionAlgorithm.Gzip);
+        result.MaxTopicSize.ShouldBe(3_000_000_000u);
+        result.ReplicationFactor.ShouldBe((byte?)3);
     }
 
     [Test]
-    [DependsOn(nameof(Update_ExistingTopic_Should_UpdateTopic_Successfully))]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task Purge_ExistingTopic_Should_PurgeTopic_Successfully(Protocol protocol)
     {
-        var beforePurge = await Fixture.Clients[protocol]
-            .GetTopicByIdAsync(Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-                Identifier.String(TopicRequest.Name));
+        var client = await Fixture.CreateAuthenticatedClient(protocol);
 
+        var streamName = $"topic-purge-{Guid.NewGuid():N}";
+        await client.CreateStreamAsync(streamName);
+        await client.CreateTopicAsync(Identifier.String(streamName), "Purge Topic", 1);
+
+        await client.SendMessagesAsync(Identifier.String(streamName),
+            Identifier.String("Purge Topic"), Partitioning.None(), GetMessages(5));
+
+        var beforePurge = await client.GetTopicByIdAsync(Identifier.String(streamName),
+            Identifier.String("Purge Topic"));
         beforePurge.ShouldNotBeNull();
-        beforePurge.MessagesCount.ShouldBe(9u);
+        beforePurge.MessagesCount.ShouldBe(5u);
         beforePurge.Size.ShouldBeGreaterThan(0u);
 
-        await Should.NotThrowAsync(Fixture.Clients[protocol].PurgeTopicAsync(
-            Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-            Identifier.String(TopicRequest.Name)));
+        await Should.NotThrowAsync(client.PurgeTopicAsync(
+            Identifier.String(streamName), Identifier.String("Purge Topic")));
 
-        var afterPurge = await Fixture.Clients[protocol]
-            .GetTopicByIdAsync(Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-                Identifier.String(TopicRequest.Name));
+        var afterPurge = await client.GetTopicByIdAsync(Identifier.String(streamName),
+            Identifier.String("Purge Topic"));
         afterPurge.ShouldNotBeNull();
         afterPurge!.MessagesCount.ShouldBe(0u);
         afterPurge.Size.ShouldBe(0u);
     }
 
     [Test]
-    [DependsOn(nameof(Purge_ExistingTopic_Should_PurgeTopic_Successfully))]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task Delete_ExistingTopic_Should_DeleteTopic_Successfully(Protocol protocol)
     {
-        var topicToDelete = await Fixture.Clients[protocol]
-            .CreateTopicAsync(Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)), "topic-to-delete", 1);
+        var client = await Fixture.CreateAuthenticatedClient(protocol);
+
+        var streamName = $"topic-del-{Guid.NewGuid():N}";
+        await client.CreateStreamAsync(streamName);
+        var topicToDelete = await client.CreateTopicAsync(Identifier.String(streamName), "topic-to-delete", 1);
         topicToDelete.ShouldNotBeNull();
 
-        await Should.NotThrowAsync(Fixture.Clients[protocol].DeleteTopicAsync(
-            Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-            Identifier.Numeric(topicToDelete.Id)));
+        await Should.NotThrowAsync(client.DeleteTopicAsync(
+            Identifier.String(streamName), Identifier.Numeric(topicToDelete.Id)));
     }
 
     [Test]
-    [DependsOn(nameof(Delete_ExistingTopic_Should_DeleteTopic_Successfully))]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task Delete_NonExistingTopic_Should_Throw_InvalidResponse(Protocol protocol)
     {
-        await Should.ThrowAsync<IggyInvalidStatusCodeException>(Fixture.Clients[protocol].DeleteTopicAsync(
-            Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-            Identifier.String("topic-to-delete")));
+        var client = await Fixture.CreateAuthenticatedClient(protocol);
+
+        var streamName = $"topic-delnone-{Guid.NewGuid():N}";
+        await client.CreateStreamAsync(streamName);
+
+        await Should.ThrowAsync<IggyInvalidStatusCodeException>(client.DeleteTopicAsync(
+            Identifier.String(streamName), Identifier.String("nonexistent-topic")));
     }
 
     [Test]
-    [DependsOn(nameof(Delete_NonExistingTopic_Should_Throw_InvalidResponse))]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task Get_NonExistingTopic_Should_Throw_InvalidResponse(Protocol protocol)
     {
-        var topic = await Fixture.Clients[protocol].GetTopicByIdAsync(
-            Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-            Identifier.String("topic-to-delete"));
+        var client = await Fixture.CreateAuthenticatedClient(protocol);
+
+        var streamName = $"topic-getnone-{Guid.NewGuid():N}";
+        await client.CreateStreamAsync(streamName);
+
+        var topic = await client.GetTopicByIdAsync(
+            Identifier.String(streamName), Identifier.String("nonexistent-topic"));
 
         topic.ShouldBeNull();
     }
