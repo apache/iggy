@@ -19,6 +19,7 @@
 use crate::configs::connectors::{ConnectorsConfigProvider, SinkConfig, SourceConfig};
 use crate::configs::runtime::ConnectorsRuntimeConfig;
 use crate::metrics::Metrics;
+use crate::stream::IggyClients;
 use crate::{
     SinkConnectorWrapper, SourceConnectorWrapper,
     manager::{
@@ -40,6 +41,8 @@ pub struct RuntimeContext {
     pub config_provider: Arc<dyn ConnectorsConfigProvider>,
     pub metrics: Arc<Metrics>,
     pub start_time: IggyTimestamp,
+    pub iggy_clients: Arc<IggyClients>,
+    pub state_path: String,
 }
 
 pub fn init(
@@ -49,6 +52,8 @@ pub fn init(
     sink_wrappers: &[SinkConnectorWrapper],
     source_wrappers: &[SourceConnectorWrapper],
     config_provider: Box<dyn ConnectorsConfigProvider>,
+    iggy_clients: Arc<IggyClients>,
+    state_path: String,
 ) -> RuntimeContext {
     let metrics = Arc::new(Metrics::init());
     let sinks = SinkManager::new(map_sinks(sinks_config, sink_wrappers));
@@ -64,6 +69,8 @@ pub fn init(
         config_provider: Arc::from(config_provider),
         metrics,
         start_time: IggyTimestamp::now(),
+        iggy_clients,
+        state_path,
     }
 }
 
