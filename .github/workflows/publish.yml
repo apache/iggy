@@ -468,6 +468,17 @@ jobs:
               continue
             fi
 
+            # In auto-publish mode, stable Docker versions only get :edge tag.
+            # Versioned git tags require manual publish (workflow_dispatch).
+            REGISTRY=$(_jq '.registry')
+            if [ "${{ inputs.create_edge_docker_tag }}" = "true" ] && [ "$REGISTRY" = "dockerhub" ]; then
+              if [[ ! "$VERSION" =~ -(edge|rc) ]]; then
+                echo "⏭️ $NAME: Stable Docker version in auto-publish mode, tag will be skipped"
+                echo "| $NAME | $VERSION | $TAG | ⏭️ Stable (manual publish only) |" >> $GITHUB_STEP_SUMMARY
+                continue
+              fi
+            fi
+
             if [ "$VERSION" = "ERROR" ] || [ "$TAG" = "ERROR" ]; then
               echo "❌ Failed to extract version/tag for $NAME"
               echo "| $NAME | ERROR | ERROR | ❌ Failed to extract |" >> $GITHUB_STEP_SUMMARY
