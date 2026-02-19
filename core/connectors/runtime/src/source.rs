@@ -255,7 +255,14 @@ pub(crate) fn get_state_storage(state_path: &str, key: &str) -> StateStorage {
 pub(crate) async fn setup_source_producer(
     config: &SourceConfig,
     iggy_client: &IggyClient,
-) -> Result<(IggyProducer, Arc<dyn StreamEncoder>, Vec<Arc<dyn Transform>>), RuntimeError> {
+) -> Result<
+    (
+        IggyProducer,
+        Arc<dyn StreamEncoder>,
+        Vec<Arc<dyn Transform>>,
+    ),
+    RuntimeError,
+> {
     let transforms = if let Some(transforms_config) = &config.transforms {
         transform::load(transforms_config).map_err(|error| {
             RuntimeError::InvalidConfiguration(format!("Failed to load transforms: {error}"))
@@ -267,12 +274,10 @@ pub(crate) async fn setup_source_producer(
     let mut last_producer = None;
     let mut last_encoder = None;
     for stream in config.streams.iter() {
-        let linger_time = IggyDuration::from_str(
-            stream.linger_time.as_deref().unwrap_or("5ms"),
-        )
-        .map_err(|error| {
-            RuntimeError::InvalidConfiguration(format!("Invalid linger time: {error}"))
-        })?;
+        let linger_time = IggyDuration::from_str(stream.linger_time.as_deref().unwrap_or("5ms"))
+            .map_err(|error| {
+                RuntimeError::InvalidConfiguration(format!("Invalid linger time: {error}"))
+            })?;
         let batch_length = stream.batch_length.unwrap_or(1000);
         let producer = iggy_client
             .producer(&stream.stream, &stream.topic)?
@@ -298,6 +303,7 @@ pub(crate) async fn setup_source_producer(
     Ok((producer, encoder, transforms))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn source_forwarding_loop(
     plugin_id: u32,
     plugin_key: String,
@@ -360,13 +366,9 @@ pub(crate) async fn source_forwarding_loop(
             number += 1;
         }
 
-        let Ok(iggy_messages) = process_messages(
-            plugin_id,
-            &encoder,
-            &topic_metadata,
-            messages,
-            &transforms,
-        ) else {
+        let Ok(iggy_messages) =
+            process_messages(plugin_id, &encoder, &topic_metadata, messages, &transforms)
+        else {
             let error_msg = format!(
                 "Failed to process {count} messages by source connector with ID: {plugin_id} before sending them to stream: {}, topic: {}.",
                 producer.stream(),

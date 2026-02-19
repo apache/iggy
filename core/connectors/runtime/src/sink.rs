@@ -429,12 +429,12 @@ pub(crate) async fn setup_sink_consumers(
 
     let mut consumers = Vec::new();
     for stream in config.streams.iter() {
-        let poll_interval =
-            IggyDuration::from_str(stream.poll_interval.as_deref().unwrap_or("5ms")).map_err(
-                |error| {
-                    RuntimeError::InvalidConfiguration(format!("Invalid poll interval: {error}"))
-                },
-            )?;
+        let poll_interval = IggyDuration::from_str(
+            stream.poll_interval.as_deref().unwrap_or("5ms"),
+        )
+        .map_err(|error| {
+            RuntimeError::InvalidConfiguration(format!("Invalid poll interval: {error}"))
+        })?;
         let default_consumer_group = format!("iggy-connect-sink-{key}");
         let consumer_group = stream
             .consumer_group
