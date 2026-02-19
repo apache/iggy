@@ -173,9 +173,7 @@ impl SourceManager {
         let container = {
             let details = details_arc.lock().await;
             details.container.clone().ok_or_else(|| {
-                RuntimeError::InvalidConfiguration(format!(
-                    "No container loaded for source: {key}"
-                ))
+                RuntimeError::InvalidConfiguration(format!("No container loaded for source: {key}"))
             })?
         };
 

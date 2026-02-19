@@ -172,9 +172,7 @@ impl SinkManager {
         let container = {
             let details = details_arc.lock().await;
             details.container.clone().ok_or_else(|| {
-                RuntimeError::InvalidConfiguration(format!(
-                    "No container loaded for sink: {key}"
-                ))
+                RuntimeError::InvalidConfiguration(format!("No container loaded for sink: {key}"))
             })?
         };
 

@@ -45,6 +45,7 @@ pub struct RuntimeContext {
     pub state_path: String,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn init(
     config: &ConnectorsRuntimeConfig,
     sinks_config: &HashMap<String, SinkConfig>,
