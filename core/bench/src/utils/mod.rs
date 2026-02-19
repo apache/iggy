@@ -22,7 +22,7 @@ use bench_report::{
     transport::BenchmarkTransport,
 };
 use iggy::prelude::*;
-use std::{fs, path::Path, sync::Arc};
+use std::{fs, path::Path};
 use tracing::{error, info};
 
 use crate::args::{
@@ -37,7 +37,7 @@ use crate::args::{
     },
 };
 
-pub use client_factory::{ClientFactory, login_root};
+pub use client_factory::{ClientFactory, authenticate};
 
 pub mod batch_generator;
 pub mod client_factory;
@@ -61,30 +61,14 @@ pub fn batch_user_size_bytes(polled_messages: &PolledMessages) -> u64 {
         .sum()
 }
 
-pub async fn get_server_stats(client_factory: &Arc<dyn ClientFactory>) -> Result<Stats, IggyError> {
-    let client = client_factory.create_client().await;
-    let client = IggyClient::create(client, None, None);
-
-    client.connect().await?;
-    client
-        .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
-        .await?;
-
+pub async fn get_server_stats(client: &IggyClient) -> Result<Stats, IggyError> {
     client.get_stats().await
 }
 
 pub async fn collect_server_logs_and_save_to_file(
-    client_factory: &Arc<dyn ClientFactory>,
+    client: &IggyClient,
     output_dir: &Path,
 ) -> Result<(), IggyError> {
-    let client = client_factory.create_client().await;
-    let client = IggyClient::create(client, None, None);
-
-    client.connect().await?;
-    client
-        .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
-        .await?;
-
     let snapshot = client
         .snapshot(
             SnapshotCompression::Deflated,
