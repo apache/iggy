@@ -134,7 +134,7 @@ cyper = { version = "0.8.0", features = ["rustls"], default-features = false }
 cyper-axum = { version = "0.8.0" }
 darling = "0.23"
 dashmap = "6.1.0"
-deltalake-core = "0.30.2"
+deltalake = { version = "0.30.2", features = ["azure", "gcs", "s3"] }
 derive-new = "0.7.0"
 derive_builder = "0.20.2"
 derive_more = { version = "2.1.1", features = ["full"] }

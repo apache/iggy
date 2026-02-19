@@ -22,9 +22,9 @@ use crate::storage::build_storage_options;
 use crate::utils::parse_schema;
 use crate::DeltaSink;
 use async_trait::async_trait;
-use deltalake_core::DeltaTable;
-use deltalake_core::operations::create::CreateBuilder;
-use deltalake_core::writer::{DeltaWriter, JsonWriter};
+use deltalake::DeltaTable;
+use deltalake::operations::create::CreateBuilder;
+use deltalake::writer::{DeltaWriter, JsonWriter};
 use iggy_connector_sdk::{ConsumedMessage, Error, MessagesMetadata, Payload, Sink, TopicMetadata};
 use std::collections::HashMap;
 use tracing::{debug, error, info};
@@ -49,7 +49,7 @@ impl Sink for DeltaSink {
             Error::InitError(format!("Invalid storage configuration: {e}"))
         })?;
 
-        let table = match deltalake_core::open_table_with_storage_options(
+        let table = match deltalake::open_table_with_storage_options(
             table_url,
             storage_options.clone(),
         )

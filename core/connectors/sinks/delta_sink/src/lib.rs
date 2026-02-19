@@ -19,8 +19,8 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-use deltalake_core::DeltaTable;
-use deltalake_core::writer::JsonWriter;
+use deltalake::DeltaTable;
+use deltalake::writer::JsonWriter;
 use iggy_connector_sdk::sink_connector;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;

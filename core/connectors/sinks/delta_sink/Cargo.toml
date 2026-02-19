@@ -37,7 +37,7 @@ crate-type = ["cdylib", "lib"]
 async-trait = { workspace = true }
 chrono = { workspace = true }
 dashmap = { workspace = true }
-deltalake-core = { workspace = true }
+deltalake = { workspace = true }
 iggy_connector_sdk = { workspace = true }
 mimalloc = { workspace = true }
 once_cell = { workspace = true }

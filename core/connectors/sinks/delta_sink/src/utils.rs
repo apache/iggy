@@ -16,7 +16,7 @@
  * under the License.
  */
 
-use deltalake_core::kernel::{DataType, PrimitiveType, StructField};
+use deltalake::kernel::{DataType, PrimitiveType, StructField};
 use iggy_connector_sdk::Error;
 use tracing::error;
 
