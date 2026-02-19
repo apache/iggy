@@ -33,7 +33,7 @@ use iggy_common::{
     header::{
         ConsensusHeader, GenericHeader, Operation, PrepareHeader, PrepareOkHeader, RequestHeader,
     },
-    message::{ConsensusMessage, Message},
+    message::Message,
     sharding::{IggyNamespace, LocalIdx, ShardId},
 };
 use message_bus::MessageBus;

@@ -27,7 +27,7 @@ use iggy_common::{
         Command2, ConsensusHeader, GenericHeader, Operation, PrepareHeader, PrepareOkHeader,
         RequestHeader,
     },
-    message::{ConsensusMessage, Message},
+    message::Message,
 };
 use journal::{Journal, JournalHandle};
 use message_bus::MessageBus;
