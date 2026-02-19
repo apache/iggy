@@ -465,19 +465,19 @@ pub fn handle(
             }
             info!("Starting handler for source connector with ID: {plugin_id}...");
 
+            let Some(producer_wrapper) = plugin.producer else {
+                error!("Producer not initialized for source connector with ID: {plugin_id}");
+                continue;
+            };
+
+            let (sender, receiver) = flume::unbounded();
+            SOURCE_SENDERS.insert(plugin_id, sender);
+
             let callback = source.callback;
             tokio::task::spawn_blocking(move || {
                 callback(plugin_id, handle_produced_messages);
             });
             info!("Handler for source connector with ID: {plugin_id} started successfully.");
-
-            let (sender, receiver) = flume::unbounded();
-            SOURCE_SENDERS.insert(plugin_id, sender);
-
-            let Some(producer_wrapper) = plugin.producer else {
-                error!("Producer not initialized for source connector with ID: {plugin_id}");
-                continue;
-            };
 
             let plugin_key_clone = plugin_key.clone();
             let handler_task = tokio::spawn(async move {
