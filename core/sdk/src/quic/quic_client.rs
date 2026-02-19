@@ -34,7 +34,7 @@ use iggy_common::{
 use quinn::crypto::rustls::QuicClientConfig as QuinnQuicClientConfig;
 use quinn::{ClientConfig, Connection, Endpoint, IdleTimeout, RecvStream, VarInt};
 use rustls::crypto::CryptoProvider;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -165,7 +165,11 @@ impl QuicClient {
 
     /// Create a new QUIC client for the provided configuration.
     pub fn create(config: Arc<QuicClientConfig>) -> Result<Self, IggyError> {
-        let resolved_addr = config.server_address.parse::<SocketAddr>().ok();
+        let resolved_addr = config
+            .server_address
+            .to_socket_addrs()
+            .ok()
+            .and_then(|mut addrs| addrs.next());
 
         let client_address = if resolved_addr.is_some_and(|a| a.is_ipv6())
             && config.client_address == QuicClientConfig::default().client_address
