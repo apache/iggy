@@ -231,7 +231,7 @@ macro_rules! sink_connector {
 
         #[cfg(not(test))]
         #[unsafe(no_mangle)]
-        unsafe extern "C" fn open(
+        unsafe extern "C" fn iggy_sink_open(
             id: u32,
             config_ptr: *const u8,
             config_len: usize,
@@ -245,7 +245,7 @@ macro_rules! sink_connector {
 
         #[cfg(not(test))]
         #[unsafe(no_mangle)]
-        unsafe extern "C" fn consume(
+        unsafe extern "C" fn iggy_sink_consume(
             id: u32,
             topic_meta_ptr: *const u8,
             topic_meta_len: usize,
@@ -272,7 +272,7 @@ macro_rules! sink_connector {
 
         #[cfg(not(test))]
         #[unsafe(no_mangle)]
-        unsafe extern "C" fn close(id: u32) -> i32 {
+        unsafe extern "C" fn iggy_sink_close(id: u32) -> i32 {
             let Some(mut instance) = INSTANCES.remove(&id) else {
                 tracing::error!("Sink connector with ID: {id} was not found and cannot be closed.");
                 return -1;
@@ -282,7 +282,7 @@ macro_rules! sink_connector {
 
         #[cfg(not(test))]
         #[unsafe(no_mangle)]
-        extern "C" fn version() -> *const std::ffi::c_char {
+        extern "C" fn iggy_sink_version() -> *const std::ffi::c_char {
             static VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "\0");
             VERSION.as_ptr() as *const std::ffi::c_char
         }

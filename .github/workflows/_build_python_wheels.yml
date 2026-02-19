@@ -99,7 +99,6 @@ jobs:
             elif command -v yum &> /dev/null; then
               yum install -y perl-IPC-Cmd
             fi
-            python3 -m pip --version || python3 -m ensurepip
           manylinux: ${{ matrix.manylinux }}
           args: --release --out dist --interpreter python3.10 python3.11 python3.12 python3.13
           sccache: "true"

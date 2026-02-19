@@ -50,7 +50,7 @@ const EXAMPLES: &str = r#"EXAMPLES:
     You can customize various parameters for any benchmark mode:
 
     Global options (before the benchmark command):
-    --messages-per-batch (-p): Number of messages per batch [default: 1000]
+    --messages-per-batch (-P): Number of messages per batch [default: 1000]
                                For random batch sizes, use range format: "100..1000"
     --message-batches (-b): Total number of batches [default: 1000]
     --total-messages-size (-T): Total size of messages to send (e.g., "1GB", "500MB")
@@ -61,6 +61,8 @@ const EXAMPLES: &str = r#"EXAMPLES:
     --warmup-time (-w): Warmup duration [default: 0s]
     --sampling-time (-t): Metrics sampling interval [default: 10ms]
     --moving-average-window (-W): Window size for moving average [default: 20]
+    --username (-u): Username for server authentication [default: iggy]
+    --password (-p): Password for server authentication [default: iggy]
 
     Benchmark-specific options (after the benchmark command):
     --streams (-s): Number of streams
@@ -120,6 +122,13 @@ const EXAMPLES: &str = r#"EXAMPLES:
 
     $ cargo r -r --bin iggy-bench -- pinned-producer \
         --streams 5 --producers 5 \
+        tcp --server-address 192.168.1.100:8090
+
+    With custom credentials:
+
+    $ cargo r -r --bin iggy-bench -- \
+        --username admin --password secret \
+        pinned-producer --streams 5 --producers 5 \
         tcp --server-address 192.168.1.100:8090
 
 6) Output Data and Results:
