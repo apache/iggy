@@ -272,7 +272,7 @@ pub fn consume(sinks: Vec<SinkConnectorWrapper>, context: Arc<RuntimeContext>) {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn consume_messages(
+pub(crate) async fn consume_messages(
     plugin_id: u32,
     decoder: Arc<dyn StreamDecoder>,
     batch_size: u32,
@@ -385,7 +385,7 @@ fn get_plugin_version(container: &Container<SinkApi>) -> String {
     }
 }
 
-fn init_sink(
+pub(crate) fn init_sink(
     container: &Container<SinkApi>,
     plugin_config: &serde_json::Value,
     id: u32,
@@ -404,6 +404,63 @@ fn init_sink(
     } else {
         Ok(())
     }
+}
+
+pub(crate) async fn setup_sink_consumers(
+    key: &str,
+    config: &SinkConfig,
+    iggy_client: &IggyClient,
+) -> Result<
+    Vec<(
+        IggyConsumer,
+        Arc<dyn StreamDecoder>,
+        u32,
+        Vec<Arc<dyn Transform>>,
+    )>,
+    RuntimeError,
+> {
+    let transforms = if let Some(transforms_config) = &config.transforms {
+        transform::load(transforms_config).map_err(|error| {
+            RuntimeError::InvalidConfiguration(format!("Failed to load transforms: {error}"))
+        })?
+    } else {
+        vec![]
+    };
+
+    let mut consumers = Vec::new();
+    for stream in config.streams.iter() {
+        let poll_interval =
+            IggyDuration::from_str(stream.poll_interval.as_deref().unwrap_or("5ms")).map_err(
+                |error| {
+                    RuntimeError::InvalidConfiguration(format!("Invalid poll interval: {error}"))
+                },
+            )?;
+        let default_consumer_group = format!("iggy-connect-sink-{key}");
+        let consumer_group = stream
+            .consumer_group
+            .as_deref()
+            .unwrap_or(&default_consumer_group);
+        let batch_length = stream.batch_length.unwrap_or(1000);
+        for topic in stream.topics.iter() {
+            let mut consumer = iggy_client
+                .consumer_group(consumer_group, &stream.stream, topic)?
+                .auto_commit(AutoCommit::When(AutoCommitWhen::PollingMessages))
+                .create_consumer_group_if_not_exists()
+                .auto_join_consumer_group()
+                .polling_strategy(PollingStrategy::next())
+                .poll_interval(poll_interval)
+                .batch_length(batch_length)
+                .build();
+            consumer.init().await?;
+            consumers.push((
+                consumer,
+                stream.schema.decoder(),
+                batch_length,
+                transforms.clone(),
+            ));
+        }
+    }
+    Ok(consumers)
 }
 
 async fn process_messages(
