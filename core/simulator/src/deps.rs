@@ -18,9 +18,9 @@
 use crate::bus::SharedMemBus;
 use bytes::Bytes;
 use consensus::{MuxPlane, VsrConsensus};
-use iggy_common::variadic;
 use iggy_common::header::PrepareHeader;
 use iggy_common::message::Message;
+use iggy_common::variadic;
 use journal::{Journal, JournalHandle, Storage};
 use metadata::stm::consumer_group::ConsumerGroups;
 use metadata::stm::stream::Streams;

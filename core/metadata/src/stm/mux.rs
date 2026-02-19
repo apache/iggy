@@ -17,8 +17,8 @@
 
 use crate::stm::snapshot::{FillSnapshot, RestoreSnapshot, SnapshotError};
 use iggy_common::Either;
-use iggy_common::{header::PrepareHeader, message::Message};
 use iggy_common::variadic;
+use iggy_common::{header::PrepareHeader, message::Message};
 
 use crate::stm::{State, StateMachine};
 

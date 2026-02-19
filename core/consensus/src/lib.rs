@@ -19,7 +19,6 @@ use iggy_common::header::ConsensusHeader;
 use iggy_common::message::ConsensusMessage;
 use message_bus::MessageBus;
 
-
 pub trait Project<T, C: Consensus> {
     type Consensus: Consensus;
     fn project(self, consensus: &Self::Consensus) -> T;
@@ -104,7 +103,8 @@ where
     C: Consensus,
 {
     fn is_applicable<H>(&self, message: &C::Message<H>) -> bool
-    where H: ConsensusHeader;
+    where
+        H: ConsensusHeader;
 }
 
 mod impls;

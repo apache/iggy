@@ -23,10 +23,10 @@ use consensus::{LocalPipeline, MuxPlane, VsrConsensus};
 use iggy_common::IggyByteSize;
 use iggy_common::sharding::ShardId;
 use iggy_common::variadic;
+use metadata::IggyMetadata;
 use metadata::stm::consumer_group::{ConsumerGroups, ConsumerGroupsInner};
 use metadata::stm::stream::{Streams, StreamsInner};
 use metadata::stm::user::{Users, UsersInner};
-use metadata::IggyMetadata;
 use partitions::PartitionsConfig;
 use std::sync::Arc;
 
@@ -101,6 +101,10 @@ impl Replica {
 
     pub fn init_partition_in_memory(&mut self, namespace: iggy_common::sharding::IggyNamespace) {
         // TODO: create an accessor for the partitions within mux plane, same for metadata.
-        self.plane.inner_mut().1.0.init_partition_in_memory(namespace);
+        self.plane
+            .inner_mut()
+            .1
+            .0
+            .init_partition_in_memory(namespace);
     }
 }
