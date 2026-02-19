@@ -19,7 +19,6 @@
 use std::{collections::HashMap, thread};
 
 use super::metrics::group::{from_individual_metrics, from_producers_and_consumers_statistics};
-use crate::utils::ClientFactory;
 use crate::utils::get_server_stats;
 use bench_report::{
     actor_kind::ActorKind,
@@ -31,8 +30,7 @@ use bench_report::{
     server_stats::{BenchmarkCacheMetrics, BenchmarkCacheMetricsKey, BenchmarkServerStats},
 };
 use chrono::{DateTime, Utc};
-use iggy::prelude::{CacheMetrics, CacheMetricsKey, IggyTimestamp, Stats};
-use std::sync::Arc;
+use iggy::prelude::{CacheMetrics, CacheMetricsKey, IggyClient, IggyTimestamp, Stats};
 
 pub struct BenchmarkReportBuilder;
 
@@ -43,7 +41,7 @@ impl BenchmarkReportBuilder {
         mut params: BenchmarkParams,
         mut individual_metrics: Vec<BenchmarkIndividualMetrics>,
         moving_average_window: u32,
-        client_factory: &Arc<dyn ClientFactory>,
+        admin_client: &IggyClient,
     ) -> BenchmarkReport {
         let uuid = uuid::Uuid::new_v4();
 
@@ -51,7 +49,7 @@ impl BenchmarkReportBuilder {
             DateTime::<Utc>::from_timestamp_micros(IggyTimestamp::now().as_micros() as i64)
                 .map_or_else(|| String::from("unknown"), |dt| dt.to_rfc3339());
 
-        let server_stats = get_server_stats(client_factory)
+        let server_stats = get_server_stats(admin_client)
             .await
             .expect("Failed to get server stats");
 

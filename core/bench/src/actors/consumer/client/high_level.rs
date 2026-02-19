@@ -24,7 +24,7 @@ use crate::actors::{
     },
 };
 
-use crate::utils::{ClientFactory, login_root};
+use crate::utils::{ClientFactory, authenticate};
 use futures_util::StreamExt;
 use iggy::prelude::*;
 use std::{sync::Arc, time::Duration};
@@ -104,7 +104,12 @@ impl BenchmarkInit for HighLevelConsumerClient {
         let topic_id_str = "topic-1";
         let client = self.client_factory.create_client().await;
         let client = IggyClient::create(client, None, None);
-        login_root(&client).await;
+        authenticate(
+            &client,
+            self.client_factory.username(),
+            self.client_factory.password(),
+        )
+        .await;
 
         let stream_id_str = self.config.stream_id.clone();
 

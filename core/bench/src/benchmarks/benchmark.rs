@@ -17,7 +17,7 @@
  */
 
 use crate::args::kind::BenchmarkKindCommand;
-use crate::utils::{ClientFactory, login_root};
+use crate::utils::{ClientFactory, authenticate};
 use crate::{args::common::IggyBenchArgs, utils::client_factory::create_client_factory};
 use async_trait::async_trait;
 use bench_report::benchmark_kind::BenchmarkKind;
@@ -99,7 +99,12 @@ pub trait Benchmarkable: Send {
         let partitions_count: u32 = self.args().number_of_partitions();
         let client = self.client_factory().create_client().await;
         let client = IggyClient::create(client, None, None);
-        login_root(&client).await;
+        authenticate(
+            &client,
+            self.client_factory().username(),
+            self.client_factory().password(),
+        )
+        .await;
         let streams = client.get_streams().await?;
         for i in 1..=number_of_streams {
             let stream_name = format!("bench-stream-{i}");
@@ -139,7 +144,12 @@ pub trait Benchmarkable: Send {
         let number_of_streams = self.args().streams();
         let client = self.client_factory().create_client().await;
         let client = IggyClient::create(client, None, None);
-        login_root(&client).await;
+        authenticate(
+            &client,
+            self.client_factory().username(),
+            self.client_factory().password(),
+        )
+        .await;
         let streams = client.get_streams().await?;
         for i in 1..=number_of_streams {
             let stream_name = format!("bench-stream-{i}");
