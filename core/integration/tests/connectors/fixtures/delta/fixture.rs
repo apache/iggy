@@ -71,9 +71,7 @@ impl DeltaFixture {
         for _ in 0..max_attempts {
             let count = Self::count_delta_versions(&delta_log_dir);
             if count >= min_versions {
-                info!(
-                    "Found {count} delta log versions (required: {min_versions})"
-                );
+                info!("Found {count} delta log versions (required: {min_versions})");
                 return Ok(count);
             }
             tokio::time::sleep(std::time::Duration::from_millis(interval_ms)).await;
@@ -92,11 +90,7 @@ impl DeltaFixture {
             .map(|entries| {
                 entries
                     .filter_map(|e| e.ok())
-                    .filter(|e| {
-                        e.path()
-                            .extension()
-                            .is_some_and(|ext| ext == "json")
-                    })
+                    .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
                     .count()
             })
             .unwrap_or(0)
@@ -112,7 +106,10 @@ impl TestFixture for DeltaFixture {
         })?;
 
         let table_path = temp_dir.path().join("delta_table");
-        info!("Delta fixture created with table path: {}", table_path.display());
+        info!(
+            "Delta fixture created with table path: {}",
+            table_path.display()
+        );
 
         Ok(Self {
             _temp_dir: temp_dir,
@@ -248,10 +245,7 @@ impl TestFixture for DeltaS3Fixture {
             "../../target/debug/libiggy_connector_delta_sink".to_string(),
         );
         envs.insert(ENV_SINK_TABLE_URI.to_string(), table_uri);
-        envs.insert(
-            ENV_SINK_STORAGE_BACKEND_TYPE.to_string(),
-            "s3".to_string(),
-        );
+        envs.insert(ENV_SINK_STORAGE_BACKEND_TYPE.to_string(), "s3".to_string());
         envs.insert(
             ENV_SINK_AWS_S3_ACCESS_KEY.to_string(),
             MINIO_ACCESS_KEY.to_string(),
@@ -260,18 +254,12 @@ impl TestFixture for DeltaS3Fixture {
             ENV_SINK_AWS_S3_SECRET_KEY.to_string(),
             MINIO_SECRET_KEY.to_string(),
         );
-        envs.insert(
-            ENV_SINK_AWS_S3_REGION.to_string(),
-            "us-east-1".to_string(),
-        );
+        envs.insert(ENV_SINK_AWS_S3_REGION.to_string(), "us-east-1".to_string());
         envs.insert(
             ENV_SINK_AWS_S3_ENDPOINT_URL.to_string(),
             self.minio_endpoint.clone(),
         );
-        envs.insert(
-            ENV_SINK_AWS_S3_ALLOW_HTTP.to_string(),
-            "true".to_string(),
-        );
+        envs.insert(ENV_SINK_AWS_S3_ALLOW_HTTP.to_string(), "true".to_string());
         envs
     }
 }

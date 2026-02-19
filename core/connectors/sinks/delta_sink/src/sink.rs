@@ -16,11 +16,11 @@
  * under the License.
  */
 
+use crate::DeltaSink;
 use crate::SinkState;
 use crate::coercions::{coerce, create_coercion_tree};
 use crate::storage::build_storage_options;
 use crate::utils::parse_schema;
-use crate::DeltaSink;
 use async_trait::async_trait;
 use deltalake::DeltaTable;
 use deltalake::operations::create::CreateBuilder;
@@ -49,32 +49,29 @@ impl Sink for DeltaSink {
             Error::InitError(format!("Invalid storage configuration: {e}"))
         })?;
 
-        let table = match deltalake::open_table_with_storage_options(
-            table_url,
-            storage_options.clone(),
-        )
-        .await
-        {
-            Ok(table) => table,
-            Err(_) if !self.config.schema.is_empty() => {
-                info!("Table does not exist, creating from configured schema...");
-                create_table(
-                    &self.config.table_uri,
-                    storage_options,
-                    &self.config.schema,
-                )
-                .await?
-            }
-            Err(e) => {
-                error!("Failed to load Delta table: {e}");
-                return Err(Error::InitError(format!("Failed to load Delta table: {e}")));
-            }
-        };
+        let table =
+            match deltalake::open_table_with_storage_options(table_url, storage_options.clone())
+                .await
+            {
+                Ok(table) => table,
+                Err(_) if !self.config.schema.is_empty() => {
+                    info!("Table does not exist, creating from configured schema...");
+                    create_table(&self.config.table_uri, storage_options, &self.config.schema)
+                        .await?
+                }
+                Err(e) => {
+                    error!("Failed to load Delta table: {e}");
+                    return Err(Error::InitError(format!("Failed to load Delta table: {e}")));
+                }
+            };
 
-        let kernel_schema = table.snapshot().map_err(|e| {
-            error!("Failed to get table snapshot: {e}");
-            Error::InitError(format!("Failed to get table snapshot: {e}"))
-        })?.schema();
+        let kernel_schema = table
+            .snapshot()
+            .map_err(|e| {
+                error!("Failed to get table snapshot: {e}");
+                Error::InitError(format!("Failed to get table snapshot: {e}"))
+            })?
+            .schema();
         let coercion_tree = create_coercion_tree(&kernel_schema);
 
         let writer = JsonWriter::for_table(&table).map_err(|e| {
@@ -126,7 +123,9 @@ impl Sink for DeltaSink {
                     json_values.push(value);
                 }
                 other => {
-                    error!("Unsupported payload type: {other}. Delta sink only supports JSON payloads.");
+                    error!(
+                        "Unsupported payload type: {other}. Delta sink only supports JSON payloads."
+                    );
                     return Err(Error::InvalidPayloadType);
                 }
             }
@@ -173,10 +172,7 @@ impl Sink for DeltaSink {
     }
 
     async fn close(&mut self) -> Result<(), Error> {
-        info!(
-            "Delta Lake sink connector with ID: {} is closed.",
-            self.id
-        );
+        info!("Delta Lake sink connector with ID: {} is closed.", self.id);
         Ok(())
     }
 }
@@ -199,4 +195,3 @@ async fn create_table(
     info!("Created new Delta table at {table_uri}");
     Ok(table)
 }
-

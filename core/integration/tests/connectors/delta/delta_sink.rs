@@ -256,7 +256,11 @@ async fn delta_sink_writes_to_s3(harness: &TestHarness, fixture: DeltaS3Fixture)
                 response.json().await.expect("Failed to parse sinks");
             assert_eq!(sinks.len(), 1);
             assert_eq!(sinks[0].key, DELTA_SINK_KEY);
-            assert!(sinks[0].last_error.is_none(), "Sink reported error: {:?}", sinks[0].last_error);
+            assert!(
+                sinks[0].last_error.is_none(),
+                "Sink reported error: {:?}",
+                sinks[0].last_error
+            );
             break;
         }
 

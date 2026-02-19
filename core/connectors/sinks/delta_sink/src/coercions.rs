@@ -176,68 +176,16 @@ mod tests {
         assert!(string_to_timestamp("1636668718000000").is_none());
     }
 
-    static SCHEMA: LazyLock<Value> = LazyLock::new(|| json!({
-            "type": "struct",
-            "fields": [
-                { "name": "level1_string", "type": "string", "nullable": true, "metadata": {} },
-                { "name": "level1_integer", "type": "integer", "nullable": true, "metadata": {} },
-                { "name": "level1_timestamp", "type": "timestamp", "nullable": true, "metadata": {} },
-                {
-                    "name": "level2",
-                    "type": {
-                        "type": "struct",
-                        "fields": [
-                            {
-                                "name": "level2_string",
-                                "type": "string",
-                                "nullable": true, "metadata": {}
-                            },
-                            {
-                                "name": "level2_int",
-                                "type": "integer",
-                                "nullable": true, "metadata": {}
-                            },
-                            {
-                                "name": "level2_timestamp",
-                                "type": "timestamp",
-                                "nullable": true, "metadata": {}
-                            }]
-                    },
-                    "nullable": true, "metadata": {}
-                },
-                {
-                    "name": "array_timestamp",
-                    "type": {
-                        "type": "array",
-                        "containsNull": true,
-                        "elementType": "timestamp",
-                    },
-                    "nullable": true, "metadata": {},
-                },
-                {
-                    "name": "array_string",
-                    "type": {
-                        "type": "array",
-                        "containsNull": true,
-                        "elementType": "string",
-                    },
-                    "nullable": true, "metadata": {},
-                },
-                {
-                    "name": "array_int",
-                    "type": {
-                        "type": "array",
-                        "containsNull": true,
-                        "elementType": "integer",
-                    },
-                    "nullable": true, "metadata": {},
-                },
-                {
-                    "name": "array_struct",
-                    "type": {
-                        "type": "array",
-                        "containsNull": true,
-                        "elementType": {
+    static SCHEMA: LazyLock<Value> = LazyLock::new(|| {
+        json!({
+                "type": "struct",
+                "fields": [
+                    { "name": "level1_string", "type": "string", "nullable": true, "metadata": {} },
+                    { "name": "level1_integer", "type": "integer", "nullable": true, "metadata": {} },
+                    { "name": "level1_timestamp", "type": "timestamp", "nullable": true, "metadata": {} },
+                    {
+                        "name": "level2",
+                        "type": {
                             "type": "struct",
                             "fields": [
                                 {
@@ -254,14 +202,68 @@ mod tests {
                                     "name": "level2_timestamp",
                                     "type": "timestamp",
                                     "nullable": true, "metadata": {}
-                                },
-                            ],
+                                }]
                         },
+                        "nullable": true, "metadata": {}
                     },
-                    "nullable": true, "metadata": {},
-                }
-            ]
-    }));
+                    {
+                        "name": "array_timestamp",
+                        "type": {
+                            "type": "array",
+                            "containsNull": true,
+                            "elementType": "timestamp",
+                        },
+                        "nullable": true, "metadata": {},
+                    },
+                    {
+                        "name": "array_string",
+                        "type": {
+                            "type": "array",
+                            "containsNull": true,
+                            "elementType": "string",
+                        },
+                        "nullable": true, "metadata": {},
+                    },
+                    {
+                        "name": "array_int",
+                        "type": {
+                            "type": "array",
+                            "containsNull": true,
+                            "elementType": "integer",
+                        },
+                        "nullable": true, "metadata": {},
+                    },
+                    {
+                        "name": "array_struct",
+                        "type": {
+                            "type": "array",
+                            "containsNull": true,
+                            "elementType": {
+                                "type": "struct",
+                                "fields": [
+                                    {
+                                        "name": "level2_string",
+                                        "type": "string",
+                                        "nullable": true, "metadata": {}
+                                    },
+                                    {
+                                        "name": "level2_int",
+                                        "type": "integer",
+                                        "nullable": true, "metadata": {}
+                                    },
+                                    {
+                                        "name": "level2_timestamp",
+                                        "type": "timestamp",
+                                        "nullable": true, "metadata": {}
+                                    },
+                                ],
+                            },
+                        },
+                        "nullable": true, "metadata": {},
+                    }
+                ]
+        })
+    });
 
     #[test]
     fn test_coercion_tree() {

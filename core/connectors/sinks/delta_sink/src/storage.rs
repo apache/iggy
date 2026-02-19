@@ -27,10 +27,19 @@ pub(crate) fn build_storage_options(
 
     match config.storage_backend_type.as_deref() {
         Some("s3") => {
-            let access_key = config.aws_s3_access_key.as_ref().ok_or(Error::InvalidConfig)?;
-            let secret_key = config.aws_s3_secret_key.as_ref().ok_or(Error::InvalidConfig)?;
+            let access_key = config
+                .aws_s3_access_key
+                .as_ref()
+                .ok_or(Error::InvalidConfig)?;
+            let secret_key = config
+                .aws_s3_secret_key
+                .as_ref()
+                .ok_or(Error::InvalidConfig)?;
             let region = config.aws_s3_region.as_ref().ok_or(Error::InvalidConfig)?;
-            let endpoint_url = config.aws_s3_endpoint_url.as_ref().ok_or(Error::InvalidConfig)?;
+            let endpoint_url = config
+                .aws_s3_endpoint_url
+                .as_ref()
+                .ok_or(Error::InvalidConfig)?;
             let allow_http = config.aws_s3_allow_http.ok_or(Error::InvalidConfig)?;
 
             opts.insert("AWS_ACCESS_KEY_ID".into(), access_key.clone());
@@ -41,10 +50,22 @@ pub(crate) fn build_storage_options(
             opts.insert("AWS_S3_ALLOW_HTTP".into(), allow_http.to_string());
         }
         Some("azure") => {
-            let account_name = config.azure_storage_account_name.as_ref().ok_or(Error::InvalidConfig)?;
-            let account_key = config.azure_storage_account_key.as_ref().ok_or(Error::InvalidConfig)?;
-            let sas_token = config.azure_storage_sas_token.as_ref().ok_or(Error::InvalidConfig)?;
-            let container_name = config.azure_container_name.as_ref().ok_or(Error::InvalidConfig)?;
+            let account_name = config
+                .azure_storage_account_name
+                .as_ref()
+                .ok_or(Error::InvalidConfig)?;
+            let account_key = config
+                .azure_storage_account_key
+                .as_ref()
+                .ok_or(Error::InvalidConfig)?;
+            let sas_token = config
+                .azure_storage_sas_token
+                .as_ref()
+                .ok_or(Error::InvalidConfig)?;
+            let container_name = config
+                .azure_container_name
+                .as_ref()
+                .ok_or(Error::InvalidConfig)?;
 
             opts.insert("AZURE_STORAGE_ACCOUNT_NAME".into(), account_name.clone());
             opts.insert("AZURE_STORAGE_ACCOUNT_KEY".into(), account_key.clone());
@@ -52,7 +73,10 @@ pub(crate) fn build_storage_options(
             opts.insert("AZURE_CONTAINER_NAME".into(), container_name.clone());
         }
         Some("gcs") => {
-            let service_account_key = config.gcs_service_account_key.as_ref().ok_or(Error::InvalidConfig)?;
+            let service_account_key = config
+                .gcs_service_account_key
+                .as_ref()
+                .ok_or(Error::InvalidConfig)?;
             let bucket = config.gcs_bucket.as_ref().ok_or(Error::InvalidConfig)?;
 
             opts.insert(
@@ -139,7 +163,10 @@ mod tests {
         assert_eq!(opts.get("AWS_ACCESS_KEY_ID").unwrap(), "AKID");
         assert_eq!(opts.get("AWS_SECRET_ACCESS_KEY").unwrap(), "SECRET");
         assert_eq!(opts.get("AWS_REGION").unwrap(), "us-east-1");
-        assert_eq!(opts.get("AWS_ENDPOINT_URL").unwrap(), "http://localhost:9000");
+        assert_eq!(
+            opts.get("AWS_ENDPOINT_URL").unwrap(),
+            "http://localhost:9000"
+        );
         assert_eq!(opts.get("AWS_ALLOW_HTTP").unwrap(), "true");
         assert_eq!(opts.get("AWS_S3_ALLOW_HTTP").unwrap(), "true");
     }

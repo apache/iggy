@@ -100,10 +100,16 @@ mod tests {
         let result = parse_schema(&schema).unwrap();
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].name(), "name");
-        assert_eq!(result[0].data_type(), &DataType::Primitive(PrimitiveType::String));
+        assert_eq!(
+            result[0].data_type(),
+            &DataType::Primitive(PrimitiveType::String)
+        );
         assert!(result[0].is_nullable());
         assert_eq!(result[1].name(), "age");
-        assert_eq!(result[1].data_type(), &DataType::Primitive(PrimitiveType::Integer));
+        assert_eq!(
+            result[1].data_type(),
+            &DataType::Primitive(PrimitiveType::Integer)
+        );
     }
 
     #[test]
