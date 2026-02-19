@@ -47,6 +47,7 @@ use crate::{
     transform,
 };
 use iggy_connector_sdk::api::ConnectorStatus;
+use tokio::task::JoinHandle;
 
 pub static SOURCE_SENDERS: Lazy<DashMap<u32, Sender<ProducedMessages>>> = Lazy::new(DashMap::new);
 
@@ -445,12 +446,14 @@ pub(crate) async fn source_forwarding_loop(
         .await;
 }
 
-pub fn handle(sources: Vec<SourceConnectorWrapper>, context: Arc<RuntimeContext>) {
+pub fn handle(
+    sources: Vec<SourceConnectorWrapper>,
+    context: Arc<RuntimeContext>,
+) -> Vec<(String, Vec<JoinHandle<()>>)> {
+    let mut handles = Vec::new();
     for source in sources {
         for plugin in source.plugins {
             let plugin_id = plugin.id;
-            let plugin_key_for_store = plugin.key.clone();
-            let context_for_store = context.clone();
             let plugin_key = plugin.key.clone();
             let context = context.clone();
 
@@ -462,169 +465,40 @@ pub fn handle(sources: Vec<SourceConnectorWrapper>, context: Arc<RuntimeContext>
             }
             info!("Starting handler for source connector with ID: {plugin_id}...");
 
-            let handle = source.callback;
+            let callback = source.callback;
             tokio::task::spawn_blocking(move || {
-                handle(plugin_id, handle_produced_messages);
+                callback(plugin_id, handle_produced_messages);
             });
             info!("Handler for source connector with ID: {plugin_id} started successfully.");
 
-            let (sender, receiver): (Sender<ProducedMessages>, Receiver<ProducedMessages>) =
-                flume::unbounded();
+            let (sender, receiver) = flume::unbounded();
             SOURCE_SENDERS.insert(plugin_id, sender);
+
+            let Some(producer_wrapper) = plugin.producer else {
+                error!("Producer not initialized for source connector with ID: {plugin_id}");
+                continue;
+            };
+
+            let plugin_key_clone = plugin_key.clone();
             let handler_task = tokio::spawn(async move {
-                info!("Source connector with ID: {plugin_id} started.");
-                let Some(producer) = &plugin.producer else {
-                    error!("Producer not initialized for source connector with ID: {plugin_id}");
-                    context
-                        .sources
-                        .set_error(&plugin_key, "Producer not initialized")
-                        .await;
-                    return;
-                };
-
-                context
-                    .sources
-                    .update_status(
-                        &plugin_key,
-                        ConnectorStatus::Running,
-                        Some(&context.metrics),
-                    )
-                    .await;
-                let encoder = producer.encoder.clone();
-                let producer = &producer.producer;
-                let mut number = 1u64;
-
-                let topic_metadata = TopicMetadata {
-                    stream: producer.stream().to_string(),
-                    topic: producer.topic().to_string(),
-                };
-
-                while let Ok(produced_messages) = receiver.recv_async().await {
-                    let count = produced_messages.messages.len();
-                    context
-                        .metrics
-                        .increment_messages_produced(&plugin_key, count as u64);
-                    if plugin.verbose {
-                        info!("Source connector with ID: {plugin_id} received {count} messages");
-                    } else {
-                        debug!("Source connector with ID: {plugin_id} received {count} messages");
-                    }
-                    let schema = produced_messages.schema;
-                    let mut messages: Vec<DecodedMessage> = Vec::with_capacity(count);
-                    for message in produced_messages.messages {
-                        let Ok(payload) = schema.try_into_payload(message.payload) else {
-                            error!(
-                                "Failed to decode message payload with schema: {} for source connector with ID: {plugin_id}",
-                                produced_messages.schema
-                            );
-                            continue;
-                        };
-
-                        debug!(
-                            "Source connector with ID: {plugin_id}] received message: {number} | schema: {schema} | payload: {payload}"
-                        );
-                        messages.push(DecodedMessage {
-                            id: message.id,
-                            offset: None,
-                            headers: message.headers,
-                            checksum: message.checksum,
-                            timestamp: message.timestamp,
-                            origin_timestamp: message.origin_timestamp,
-                            payload,
-                        });
-                        number += 1;
-                    }
-
-                    let Ok(iggy_messages) = process_messages(
-                        plugin_id,
-                        &encoder,
-                        &topic_metadata,
-                        messages,
-                        &plugin.transforms,
-                    ) else {
-                        let error_msg = format!(
-                            "Failed to process {count} messages by source connector with ID: {plugin_id} before sending them to stream: {}, topic: {}.",
-                            producer.stream(),
-                            producer.topic()
-                        );
-                        error!("{error_msg}");
-                        context
-                            .metrics
-                            .increment_errors(&plugin_key, ConnectorType::Source);
-                        context.sources.set_error(&plugin_key, &error_msg).await;
-                        continue;
-                    };
-
-                    if let Err(error) = producer.send(iggy_messages).await {
-                        let error_msg = format!(
-                            "Failed to send {count} messages to stream: {}, topic: {} by source connector with ID: {plugin_id}. {error}",
-                            producer.stream(),
-                            producer.topic(),
-                        );
-                        error!("{error_msg}");
-                        context
-                            .metrics
-                            .increment_errors(&plugin_key, ConnectorType::Source);
-                        context.sources.set_error(&plugin_key, &error_msg).await;
-                        continue;
-                    }
-
-                    context
-                        .metrics
-                        .increment_messages_sent(&plugin_key, count as u64);
-
-                    if plugin.verbose {
-                        info!(
-                            "Sent {count} messages to stream: {}, topic: {} by source connector with ID: {plugin_id}",
-                            producer.stream(),
-                            producer.topic()
-                        );
-                    } else {
-                        debug!(
-                            "Sent {count} messages to stream: {}, topic: {} by source connector with ID: {plugin_id}",
-                            producer.stream(),
-                            producer.topic()
-                        );
-                    }
-
-                    let Some(state) = produced_messages.state else {
-                        debug!("No state provided for source connector with ID: {plugin_id}");
-                        continue;
-                    };
-
-                    match &plugin.state_storage {
-                        StateStorage::File(file) => {
-                            if let Err(error) = file.save(state).await {
-                                let error_msg = format!(
-                                    "Failed to save state for source connector with ID: {plugin_id}. {error}"
-                                );
-                                error!("{error_msg}");
-                                context.sources.set_error(&plugin_key, &error_msg).await;
-                                continue;
-                            }
-                            debug!("State saved for source connector with ID: {plugin_id}");
-                        }
-                    }
-                }
-
-                info!("Source connector with ID: {plugin_id} stopped.");
-                context
-                    .sources
-                    .update_status(
-                        &plugin_key,
-                        ConnectorStatus::Stopped,
-                        Some(&context.metrics),
-                    )
-                    .await;
+                source_forwarding_loop(
+                    plugin_id,
+                    plugin_key_clone,
+                    plugin.verbose,
+                    producer_wrapper.producer,
+                    producer_wrapper.encoder,
+                    plugin.transforms,
+                    plugin.state_storage,
+                    receiver,
+                    context,
+                )
+                .await;
             });
-            tokio::spawn(async move {
-                if let Some(details) = context_for_store.sources.get(&plugin_key_for_store).await {
-                    let mut details = details.lock().await;
-                    details.handler_tasks = vec![handler_task];
-                }
-            });
+
+            handles.push((plugin_key, vec![handler_task]));
         }
     }
+    handles
 }
 
 fn process_messages(

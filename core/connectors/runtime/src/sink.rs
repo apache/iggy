@@ -43,6 +43,7 @@ use std::{
     time::Instant,
 };
 use tokio::sync::watch;
+use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
 pub async fn init(
@@ -196,7 +197,11 @@ pub async fn init(
     Ok(sink_connectors)
 }
 
-pub fn consume(sinks: Vec<SinkConnectorWrapper>, context: Arc<RuntimeContext>) {
+pub fn consume(
+    sinks: Vec<SinkConnectorWrapper>,
+    context: Arc<RuntimeContext>,
+) -> Vec<(String, watch::Sender<()>, Vec<JoinHandle<()>>)> {
+    let mut handles = Vec::new();
     for sink in sinks {
         for plugin in sink.plugins {
             if let Some(error) = &plugin.error {
@@ -258,17 +263,10 @@ pub fn consume(sinks: Vec<SinkConnectorWrapper>, context: Arc<RuntimeContext>) {
                 task_handles.push(handle);
             }
 
-            let plugin_key = plugin.key.clone();
-            let context_clone = context.clone();
-            tokio::spawn(async move {
-                if let Some(details) = context_clone.sinks.get(&plugin_key).await {
-                    let mut details = details.lock().await;
-                    details.shutdown_tx = Some(shutdown_tx);
-                    details.task_handles = task_handles;
-                }
-            });
+            handles.push((plugin.key.clone(), shutdown_tx, task_handles));
         }
     }
+    handles
 }
 
 #[allow(clippy::too_many_arguments)]
