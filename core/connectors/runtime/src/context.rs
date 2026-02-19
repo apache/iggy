@@ -112,6 +112,7 @@ fn map_sinks(
                 config: sink_config.clone(),
                 shutdown_tx: None,
                 task_handles: vec![],
+                container: None,
             });
         }
     }
@@ -156,6 +157,7 @@ fn map_sources(
                 config: source_config.clone(),
                 shutdown_tx: None,
                 handler_tasks: vec![],
+                container: None,
             });
         }
     }

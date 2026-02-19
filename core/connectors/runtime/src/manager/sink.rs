@@ -16,11 +16,14 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+use crate::SinkApi;
 use crate::configs::connectors::{ConfigFormat, SinkConfig};
 use crate::metrics::Metrics;
 use dashmap::DashMap;
+use dlopen2::wrapper::Container;
 use iggy_connector_sdk::api::{ConnectorError, ConnectorStatus};
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::Arc;
 use tokio::sync::{Mutex, watch};
 use tokio::task::JoinHandle;
@@ -112,10 +115,20 @@ pub struct SinkInfo {
     pub plugin_config_format: Option<ConfigFormat>,
 }
 
-#[derive(Debug)]
 pub struct SinkDetails {
     pub info: SinkInfo,
     pub config: SinkConfig,
     pub shutdown_tx: Option<watch::Sender<()>>,
     pub task_handles: Vec<JoinHandle<()>>,
+    pub container: Option<Arc<Container<SinkApi>>>,
+}
+
+impl fmt::Debug for SinkDetails {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SinkDetails")
+            .field("info", &self.info)
+            .field("config", &self.config)
+            .field("container", &self.container.as_ref().map(|_| "..."))
+            .finish()
+    }
 }
