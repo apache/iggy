@@ -42,6 +42,7 @@ use std::{
     sync::{Arc, atomic::Ordering},
     time::Instant,
 };
+use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 
 pub async fn init(
@@ -206,11 +207,15 @@ pub fn consume(sinks: Vec<SinkConnectorWrapper>, context: Arc<RuntimeContext>) {
                 continue;
             }
             info!("Starting consume for sink with ID: {}...", plugin.id);
+            let (shutdown_tx, shutdown_rx) = watch::channel(());
+            let mut task_handles = Vec::new();
+
             for consumer in plugin.consumers {
                 let plugin_key = plugin.key.clone();
                 let context = context.clone();
+                let shutdown_rx = shutdown_rx.clone();
 
-                tokio::spawn(async move {
+                let handle = tokio::spawn(async move {
                     context
                         .sinks
                         .update_status(
@@ -230,6 +235,7 @@ pub fn consume(sinks: Vec<SinkConnectorWrapper>, context: Arc<RuntimeContext>) {
                         plugin.verbose,
                         &plugin_key,
                         &context.metrics,
+                        shutdown_rx,
                     )
                     .await
                     {
@@ -245,11 +251,22 @@ pub fn consume(sinks: Vec<SinkConnectorWrapper>, context: Arc<RuntimeContext>) {
                         return;
                     }
                     info!(
-                        "Consume messages for sink connector with ID: {} started successfully.",
+                        "Consume messages for sink connector with ID: {} completed.",
                         plugin.id
                     );
                 });
+                task_handles.push(handle);
             }
+
+            let plugin_key = plugin.key.clone();
+            let context_clone = context.clone();
+            tokio::spawn(async move {
+                if let Some(details) = context_clone.sinks.get(&plugin_key).await {
+                    let mut details = details.lock().await;
+                    details.shutdown_tx = Some(shutdown_tx);
+                    details.task_handles = task_handles;
+                }
+            });
         }
     }
 }
@@ -265,6 +282,7 @@ async fn consume_messages(
     verbose: bool,
     plugin_key: &str,
     metrics: &Arc<Metrics>,
+    mut shutdown_rx: watch::Receiver<()>,
 ) -> Result<(), RuntimeError> {
     info!("Started consuming messages for sink connector with ID: {plugin_id}");
     let batch_size = batch_size as usize;
@@ -274,7 +292,18 @@ async fn consume_messages(
         topic: consumer.topic().to_string(),
     };
 
-    while let Some(message) = consumer.next().await {
+    loop {
+        let message = tokio::select! {
+            _ = shutdown_rx.changed() => {
+                info!("Sink connector with ID: {plugin_id} received shutdown signal");
+                break;
+            }
+            msg = consumer.next() => msg,
+        };
+
+        let Some(message) = message else {
+            break;
+        };
         let Ok(message) = message else {
             error!("Failed to receive message.");
             continue;
