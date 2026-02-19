@@ -23,26 +23,21 @@ RUN apt-get update && \
     apt-get install -y \
     python3 \
     python3-dev \
-    python3-pip \
+    curl \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Configure pip to allow system-wide installations in Docker
-ENV PIP_BREAK_SYSTEM_PACKAGES=1
+# Install uv
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.local/bin:${PATH}"
 
 # Copy the entire workspace for dependencies
 WORKDIR /workspace
 COPY . .
 
-# Set working directory for Python SDK
-WORKDIR /workspace/foreign/python
-
-# Install Python dependencies including BDD requirements
-RUN pip3 install --no-cache-dir -r /workspace/bdd/python/requirements.txt
-
-# Build and install the Iggy Python SDK
-RUN maturin build --out dist && \
-    pip3 install dist/*.whl
+# Install Python dependencies for BDD (includes local apache-iggy source)
+WORKDIR /workspace/bdd/python
+RUN uv sync --frozen
 
 # Set up BDD test directory
 WORKDIR /app
@@ -53,4 +48,4 @@ RUN mkdir -p /app/tests
 RUN cp -r /workspace/bdd/python/tests/* /app/tests/
 
 # Default command
-CMD ["pytest", "tests/", "-v"]
+CMD ["uv", "run", "--project", "/workspace/bdd/python", "pytest", "tests/", "-v"]
