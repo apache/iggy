@@ -121,6 +121,18 @@ jobs:
         with:
           task: ${{ inputs.task }}
 
+      - name: Upload Go coverage to Codecov
+        if: inputs.component == 'sdk-go' && inputs.task == 'test'
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: reports/go-coverage.out
+          disable_search: true
+          flags: go
+          fail_ci_if_error: false
+          verbose: true
+          override_pr: ${{ github.event.pull_request.number }}
+
       # Java SDK
       - name: Run Java SDK task
         if: inputs.component == 'sdk-java'
