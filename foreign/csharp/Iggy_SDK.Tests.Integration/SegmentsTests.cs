@@ -19,26 +19,32 @@ using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
 using Apache.Iggy.Tests.Integrations.Attributes;
 using Apache.Iggy.Tests.Integrations.Fixtures;
-using Apache.Iggy.Tests.Integrations.Helpers;
 using Shouldly;
 
 namespace Apache.Iggy.Tests.Integrations;
 
 public class SegmentsTests
 {
-    [ClassDataSource<SegmentsFixture>(Shared = SharedType.PerClass)]
-    public required SegmentsFixture Fixture { get; init; }
+    [ClassDataSource<IggyServerFixture>(Shared = SharedType.PerAssembly)]
+    public required IggyServerFixture Fixture { get; init; }
 
     [Test]
     [SkipHttp]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task DeleteSegments_WithZeroCount_Should_Succeed(Protocol protocol)
     {
+        var client = await Fixture.CreateAuthenticatedClient(protocol);
+
+        var streamName = $"seg-zero-{Guid.NewGuid():N}";
+        var topicName = $"seg-zero-topic-{Guid.NewGuid():N}";
+        await client.CreateStreamAsync(streamName);
+        await client.CreateTopicAsync(Identifier.String(streamName), topicName, 1);
+
         // Deleting 0 segments should succeed without error (no-op)
         await Should.NotThrowAsync(() =>
-            Fixture.Clients[protocol].DeleteSegmentsAsync(
-                Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-                Identifier.String(Fixture.TopicRequest.Name),
+            client.DeleteSegmentsAsync(
+                Identifier.String(streamName),
+                Identifier.String(topicName),
                 0, // partition_id (0-indexed)
                 0)); // segments_count = 0
     }
@@ -48,23 +54,34 @@ public class SegmentsTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task DeleteSegments_Http_Should_Throw_FeatureUnavailable(Protocol protocol)
     {
+        var client = await Fixture.CreateAuthenticatedClient(protocol);
+
+        var streamName = $"seg-http-{Guid.NewGuid():N}";
+        var topicName = $"seg-http-topic-{Guid.NewGuid():N}";
+        await client.CreateStreamAsync(streamName);
+        await client.CreateTopicAsync(Identifier.String(streamName), topicName, 1);
+
         await Should.ThrowAsync<FeatureUnavailableException>(() =>
-            Fixture.Clients[protocol].DeleteSegmentsAsync(
-                Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-                Identifier.String(Fixture.TopicRequest.Name),
+            client.DeleteSegmentsAsync(
+                Identifier.String(streamName),
+                Identifier.String(topicName),
                 0,
                 0));
     }
 
     [Test]
     [SkipHttp]
-    [DependsOn(nameof(DeleteSegments_WithZeroCount_Should_Succeed))]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task DeleteSegments_Should_Throw_WhenTopic_DoesNotExist(Protocol protocol)
     {
+        var client = await Fixture.CreateAuthenticatedClient(protocol);
+
+        var streamName = $"seg-notopic-{Guid.NewGuid():N}";
+        await client.CreateStreamAsync(streamName);
+
         await Should.ThrowAsync<IggyInvalidStatusCodeException>(() =>
-            Fixture.Clients[protocol].DeleteSegmentsAsync(
-                Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
+            client.DeleteSegmentsAsync(
+                Identifier.String(streamName),
                 Identifier.String("non-existent-topic"),
                 0, // partition_id (0-indexed)
                 1)); // segments_count
@@ -72,20 +89,15 @@ public class SegmentsTests
 
     [Test]
     [SkipHttp]
-    [DependsOn(nameof(DeleteSegments_Should_Throw_WhenTopic_DoesNotExist))]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task DeleteSegments_Should_Throw_WhenStream_DoesNotExist(Protocol protocol)
     {
-        await Fixture.Clients[protocol].DeleteTopicAsync(
-            Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-            Identifier.String(Fixture.TopicRequest.Name));
-        await Fixture.Clients[protocol]
-            .DeleteStreamAsync(Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)));
+        var client = await Fixture.CreateAuthenticatedClient(protocol);
 
         await Should.ThrowAsync<IggyInvalidStatusCodeException>(() =>
-            Fixture.Clients[protocol].DeleteSegmentsAsync(
-                Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-                Identifier.String(Fixture.TopicRequest.Name),
+            client.DeleteSegmentsAsync(
+                Identifier.String($"nonexistent-stream-{Guid.NewGuid():N}"),
+                Identifier.String("any-topic"),
                 0, // partition_id (0-indexed)
                 1)); // segments_count
     }
