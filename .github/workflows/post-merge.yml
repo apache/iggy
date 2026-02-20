@@ -271,6 +271,78 @@ jobs:
           flags: java
           fail_ci_if_error: false
 
+  csharp-coverage:
+    name: C# coverage baseline
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Setup Rust with cache
+        uses: ./.github/actions/utils/setup-rust-with-cache
+        with:
+          save-cache: "false"
+
+      - name: Build Iggy server Docker image
+        id: docker_build
+        uses: ./.github/actions/utils/docker-build-test-server
+        with:
+          image-tag: "iggy-server:test"
+          libc: "glibc"
+          profile: "debug"
+
+      - name: Restore and build
+        working-directory: foreign/csharp
+        run: |
+          dotnet restore Iggy_SDK.sln
+          dotnet build Iggy_SDK.sln --no-restore
+
+      - name: Run unit tests with coverage
+        working-directory: foreign/csharp
+        run: |
+          dotnet test \
+            --project Iggy_SDK_Tests \
+            --no-build \
+            --verbosity normal \
+            --coverage \
+            --coverage-output-format cobertura \
+            --coverage-output coverage.cobertura.xml \
+            --results-directory ./reports/unit
+
+      - name: Run integration tests with coverage
+        working-directory: foreign/csharp
+        env:
+          IGGY_SERVER_DOCKER_IMAGE: ${{ steps.docker_build.outputs.docker_image }}
+        run: |
+          dotnet test \
+            --project Iggy_SDK.Tests.Integration \
+            --no-build \
+            --verbosity normal \
+            --coverage \
+            --coverage-output-format cobertura \
+            --coverage-output coverage.cobertura.xml \
+            --results-directory ./reports/integration
+
+      - name: Merge coverage reports
+        working-directory: foreign/csharp
+        run: |
+          dotnet tool install --global dotnet-coverage
+          dotnet-coverage merge ./reports/**/*.cobertura.xml -f cobertura -o ./reports/coverage.cobertura.xml
+
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: foreign/csharp/reports/coverage.cobertura.xml
+          disable_search: true
+          flags: csharp
+          fail_ci_if_error: false
+
   create-prerelease:
     name: Create edge pre-release
     runs-on: ubuntu-latest

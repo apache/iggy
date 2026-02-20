@@ -123,6 +123,18 @@ jobs:
         with:
           task: ${{ inputs.task }}
 
+      - name: Upload C# coverage to Codecov
+        if: inputs.component == 'sdk-csharp' && (inputs.task == 'test' || inputs.task == 'e2e')
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: foreign/csharp/reports/coverage.cobertura.xml
+          disable_search: true
+          flags: csharp
+          fail_ci_if_error: false
+          verbose: true
+          override_pr: ${{ github.event.pull_request.number }}
+
       # Web UI
       - name: Run Web UI task
         if: inputs.component == 'web-ui'

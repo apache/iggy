@@ -53,6 +53,9 @@ flag_management:
     - name: java
       paths:
         - foreign/java/
+    - name: csharp
+      paths:
+        - foreign/csharp/
 
 comment:
   layout: "header, diff, flags, files"
@@ -68,7 +71,6 @@ ignore:
   - "core/harness_derive/**"
   - "bdd/**"
   - "examples/**"
-  - "foreign/csharp/**"
   - "foreign/go/**"
   - "foreign/node/**"
   - "foreign/python/**"
