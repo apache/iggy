@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-package binaryserialization
+package iggcon
 
 import (
 	"reflect"
@@ -23,14 +23,16 @@ import (
 )
 
 func TestSerialize_TcpCreateStreamRequest(t *testing.T) {
-	// Create a sample TcpCreateStreamRequest
-	request := TcpCreateStreamRequest{
+	// Create a sample CreateStream
+	request := CreateStream{
 		Name: "test_stream",
 	}
 
 	// Serialize the request
-	serialized := request.Serialize()
-
+	serialized, err := request.MarshalBinary()
+	if err != nil {
+		t.Errorf("Failed to serialize CreateStream: %v", err)
+	}
 	// Expected serialized bytes
 	expectedNameLength := byte(11) // Length of "test_stream"
 	expectedPayload := []byte("test_stream")

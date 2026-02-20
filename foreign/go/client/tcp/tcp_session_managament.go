@@ -27,11 +27,10 @@ import (
 )
 
 func (c *IggyTcpClient) LoginUser(username string, password string) (*iggcon.IdentityInfo, error) {
-	serializedRequest := binaryserialization.TcpLogInRequest{
+	buffer, err := c.do(&iggcon.LoginUser{
 		Username: username,
 		Password: password,
-	}
-	buffer, err := c.sendAndFetchResponse(serializedRequest.Serialize(), iggcon.LoginUserCode)
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -51,10 +50,9 @@ func (c *IggyTcpClient) LoginUser(username string, password string) (*iggcon.Ide
 }
 
 func (c *IggyTcpClient) LoginWithPersonalAccessToken(token string) (*iggcon.IdentityInfo, error) {
-	message := binaryserialization.SerializeLoginWithPersonalAccessToken(iggcon.LoginWithPersonalAccessTokenRequest{
+	buffer, err := c.do(&iggcon.LoginWithPersonalAccessToken{
 		Token: token,
 	})
-	buffer, err := c.sendAndFetchResponse(message, iggcon.LoginWithAccessTokenCode)
 	if err != nil {
 		return nil, err
 	}
@@ -74,7 +72,7 @@ func (c *IggyTcpClient) LoginWithPersonalAccessToken(token string) (*iggcon.Iden
 }
 
 func (c *IggyTcpClient) LogoutUser() error {
-	_, err := c.sendAndFetchResponse([]byte{}, iggcon.LogoutUserCode)
+	_, err := c.do(&iggcon.LogoutUser{})
 	return err
 }
 

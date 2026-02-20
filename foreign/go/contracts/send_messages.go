@@ -15,60 +15,74 @@
 // specific language governing permissions and limitations
 // under the License.
 
-package binaryserialization
+package iggcon
 
 import (
 	"encoding/binary"
 
-	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	"github.com/klauspost/compress/s2"
 )
 
-type TcpSendMessagesRequest struct {
-	StreamId     iggcon.Identifier    `json:"streamId"`
-	TopicId      iggcon.Identifier    `json:"topicId"`
-	Partitioning iggcon.Partitioning  `json:"partitioning"`
-	Messages     []iggcon.IggyMessage `json:"messages"`
+type SendMessages struct {
+	Compression IggyMessageCompression
+
+	StreamId     Identifier    `json:"streamId"`
+	TopicId      Identifier    `json:"topicId"`
+	Partitioning Partitioning  `json:"partitioning"`
+	Messages     []IggyMessage `json:"messages"`
 }
 
 const indexSize = 16
 
-func (request *TcpSendMessagesRequest) Serialize(compression iggcon.IggyMessageCompression) []byte {
-	for i, message := range request.Messages {
-		switch compression {
-		case iggcon.MESSAGE_COMPRESSION_S2:
+func (s *SendMessages) Code() CommandCode {
+	return SendMessagesCode
+}
+
+func (s *SendMessages) MarshalBinary() ([]byte, error) {
+	for i, message := range s.Messages {
+		switch s.Compression {
+		case MESSAGE_COMPRESSION_S2:
 			if len(message.Payload) < 32 {
 				break
 			}
-			request.Messages[i].Payload = s2.Encode(nil, message.Payload)
+			s.Messages[i].Payload = s2.Encode(nil, message.Payload)
 			message.Header.PayloadLength = uint32(len(message.Payload))
-		case iggcon.MESSAGE_COMPRESSION_S2_BETTER:
+		case MESSAGE_COMPRESSION_S2_BETTER:
 			if len(message.Payload) < 32 {
 				break
 			}
-			request.Messages[i].Payload = s2.EncodeBetter(nil, message.Payload)
+			s.Messages[i].Payload = s2.EncodeBetter(nil, message.Payload)
 			message.Header.PayloadLength = uint32(len(message.Payload))
-		case iggcon.MESSAGE_COMPRESSION_S2_BEST:
+		case MESSAGE_COMPRESSION_S2_BEST:
 			if len(message.Payload) < 32 {
 				break
 			}
-			request.Messages[i].Payload = s2.EncodeBest(nil, message.Payload)
+			s.Messages[i].Payload = s2.EncodeBest(nil, message.Payload)
 			message.Header.PayloadLength = uint32(len(message.Payload))
 		}
 	}
 
-	streamIdBytes := SerializeIdentifier(request.StreamId)
-	topicIdBytes := SerializeIdentifier(request.TopicId)
-	partitioningBytes := SerializePartitioning(request.Partitioning)
+	streamIdBytes, err := s.StreamId.MarshalBinary()
+	if err != nil {
+		return nil, err
+	}
+	topicIdBytes, err := s.TopicId.MarshalBinary()
+	if err != nil {
+		return nil, err
+	}
+	partitioningBytes, err := s.Partitioning.MarshalBinary()
+	if err != nil {
+		return nil, err
+	}
 	metadataLenFieldSize := 4 // uint32
-	messageCount := len(request.Messages)
+	messageCount := len(s.Messages)
 	messagesCountFieldSize := 4 // uint32
 	metadataLen := len(streamIdBytes) +
 		len(topicIdBytes) +
 		len(partitioningBytes) +
 		messagesCountFieldSize
 	indexesSize := messageCount * indexSize
-	messageBytesCount := calculateMessageBytesCount(request.Messages)
+	messageBytesCount := calculateMessageBytesCount(s.Messages)
 	totalSize := metadataLenFieldSize +
 		len(streamIdBytes) +
 		len(topicIdBytes) +
@@ -103,14 +117,14 @@ func (request *TcpSendMessagesRequest) Serialize(compression iggcon.IggyMessageC
 	position += indexesSize
 
 	msgSize := uint32(0)
-	for _, message := range request.Messages {
-		copy(bytes[position:position+iggcon.MessageHeaderSize], message.Header.ToBytes())
-		copy(bytes[position+iggcon.MessageHeaderSize:position+iggcon.MessageHeaderSize+int(message.Header.PayloadLength)], message.Payload)
-		position += iggcon.MessageHeaderSize + int(message.Header.PayloadLength)
+	for _, message := range s.Messages {
+		copy(bytes[position:position+MessageHeaderSize], message.Header.ToBytes())
+		copy(bytes[position+MessageHeaderSize:position+MessageHeaderSize+int(message.Header.PayloadLength)], message.Payload)
+		position += MessageHeaderSize + int(message.Header.PayloadLength)
 		copy(bytes[position:position+int(message.Header.UserHeaderLength)], message.UserHeaders)
 		position += int(message.Header.UserHeaderLength)
 
-		msgSize += iggcon.MessageHeaderSize + message.Header.PayloadLength + message.Header.UserHeaderLength
+		msgSize += MessageHeaderSize + message.Header.PayloadLength + message.Header.UserHeaderLength
 
 		binary.LittleEndian.PutUint32(bytes[currentIndexPosition:currentIndexPosition+4], 0)
 		binary.LittleEndian.PutUint32(bytes[currentIndexPosition+4:currentIndexPosition+8], uint32(msgSize))
@@ -118,13 +132,13 @@ func (request *TcpSendMessagesRequest) Serialize(compression iggcon.IggyMessageC
 		currentIndexPosition += indexSize
 	}
 
-	return bytes
+	return bytes, nil
 }
 
-func calculateMessageBytesCount(messages []iggcon.IggyMessage) int {
+func calculateMessageBytesCount(messages []IggyMessage) int {
 	count := 0
 	for _, msg := range messages {
-		count += iggcon.MessageHeaderSize + len(msg.Payload) + len(msg.UserHeaders)
+		count += MessageHeaderSize + len(msg.Payload) + len(msg.UserHeaders)
 	}
 	return count
 }

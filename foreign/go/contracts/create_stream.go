@@ -17,38 +17,23 @@
 
 package iggcon
 
-import (
-	"encoding"
-	"encoding/binary"
+type CreateStream struct {
+	Name string
+}
+
+const (
+	nameLengthOffset = 0
+	payloadOffset    = 1
 )
 
-type Command interface {
-	// Code returns the command code associated with this command.
-	Code() CommandCode
-
-	encoding.BinaryMarshaler
+func (request *CreateStream) Code() CommandCode {
+	return CreateStreamCode
 }
 
-type GetClients struct{}
-
-func (c *GetClients) Code() CommandCode {
-	return GetClientsCode
-}
-
-func (c *GetClients) MarshalBinary() ([]byte, error) {
-	return []byte{}, nil
-}
-
-type GetClient struct {
-	ClientID uint32
-}
-
-func (c *GetClient) Code() CommandCode {
-	return GetClientCode
-}
-
-func (c *GetClient) MarshalBinary() ([]byte, error) {
-	bytes := make([]byte, 4)
-	binary.LittleEndian.PutUint32(bytes, c.ClientID)
-	return bytes, nil
+func (request *CreateStream) MarshalBinary() ([]byte, error) {
+	nameLength := len(request.Name)
+	serialized := make([]byte, payloadOffset+nameLength)
+	serialized[nameLengthOffset] = byte(nameLength)
+	copy(serialized[payloadOffset:], request.Name)
+	return serialized, nil
 }

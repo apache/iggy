@@ -17,15 +17,53 @@
 
 package iggcon
 
-import "time"
+import (
+	"encoding/binary"
+	"time"
+)
 
-type CreatePersonalAccessTokenRequest struct {
+type CreatePersonalAccessToken struct {
 	Name   string `json:"Name"`
 	Expiry uint32 `json:"Expiry"`
 }
 
-type DeletePersonalAccessTokenRequest struct {
+func (c *CreatePersonalAccessToken) Code() CommandCode {
+	return CreateAccessTokenCode
+}
+
+func (c *CreatePersonalAccessToken) MarshalBinary() ([]byte, error) {
+	length := 1 + len(c.Name) + 8
+	bytes := make([]byte, length)
+	bytes[0] = byte(len(c.Name))
+	copy(bytes[1:], c.Name)
+	binary.LittleEndian.PutUint32(bytes[len(bytes)-4:], c.Expiry)
+	return bytes, nil
+}
+
+type DeletePersonalAccessToken struct {
 	Name string `json:"Name"`
+}
+
+func (d *DeletePersonalAccessToken) Code() CommandCode {
+	return DeleteAccessTokenCode
+}
+
+func (d *DeletePersonalAccessToken) MarshalBinary() ([]byte, error) {
+	length := 1 + len(d.Name)
+	bytes := make([]byte, length)
+	bytes[0] = byte(len(d.Name))
+	copy(bytes[1:], d.Name)
+	return bytes, nil
+}
+
+type GetPersonalAccessTokens struct{}
+
+func (g *GetPersonalAccessTokens) Code() CommandCode {
+	return GetAccessTokensCode
+}
+
+func (g *GetPersonalAccessTokens) MarshalBinary() ([]byte, error) {
+	return []byte{}, nil
 }
 
 type PersonalAccessTokenInfo struct {

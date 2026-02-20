@@ -17,38 +17,12 @@
 
 package iggcon
 
-import (
-	"encoding"
-	"encoding/binary"
-)
+type Ping struct{}
 
-type Command interface {
-	// Code returns the command code associated with this command.
-	Code() CommandCode
-
-	encoding.BinaryMarshaler
+func (p *Ping) Code() CommandCode {
+	return PingCode
 }
 
-type GetClients struct{}
-
-func (c *GetClients) Code() CommandCode {
-	return GetClientsCode
-}
-
-func (c *GetClients) MarshalBinary() ([]byte, error) {
+func (p *Ping) MarshalBinary() ([]byte, error) {
 	return []byte{}, nil
-}
-
-type GetClient struct {
-	ClientID uint32
-}
-
-func (c *GetClient) Code() CommandCode {
-	return GetClientCode
-}
-
-func (c *GetClient) MarshalBinary() ([]byte, error) {
-	bytes := make([]byte, 4)
-	binary.LittleEndian.PutUint32(bytes, c.ClientID)
-	return bytes, nil
 }

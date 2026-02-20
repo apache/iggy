@@ -24,7 +24,7 @@ import (
 )
 
 func (c *IggyTcpClient) GetStreams() ([]iggcon.Stream, error) {
-	buffer, err := c.sendAndFetchResponse([]byte{}, iggcon.GetStreamsCode)
+	buffer, err := c.do(&iggcon.GetStreams{})
 	if err != nil {
 		return nil, err
 	}
@@ -33,8 +33,9 @@ func (c *IggyTcpClient) GetStreams() ([]iggcon.Stream, error) {
 }
 
 func (c *IggyTcpClient) GetStream(streamId iggcon.Identifier) (*iggcon.StreamDetails, error) {
-	message := binaryserialization.SerializeIdentifier(streamId)
-	buffer, err := c.sendAndFetchResponse(message, iggcon.GetStreamCode)
+	buffer, err := c.do(&iggcon.GetStream{
+		StreamId: streamId,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -54,8 +55,7 @@ func (c *IggyTcpClient) CreateStream(name string) (*iggcon.StreamDetails, error)
 	if len(name) == 0 || MaxStringLength < len(name) {
 		return nil, ierror.ErrInvalidStreamName
 	}
-	serializedRequest := binaryserialization.TcpCreateStreamRequest{Name: name}
-	buffer, err := c.sendAndFetchResponse(serializedRequest.Serialize(), iggcon.CreateStreamCode)
+	buffer, err := c.do(&iggcon.CreateStream{Name: name})
 	if err != nil {
 		return nil, err
 	}
@@ -71,13 +71,11 @@ func (c *IggyTcpClient) UpdateStream(streamId iggcon.Identifier, name string) er
 	if len(name) > MaxStringLength || len(name) == 0 {
 		return ierror.ErrInvalidStreamName
 	}
-	serializedRequest := binaryserialization.TcpUpdateStreamRequest{StreamId: streamId, Name: name}
-	_, err := c.sendAndFetchResponse(serializedRequest.Serialize(), iggcon.UpdateStreamCode)
+	_, err := c.do(&iggcon.UpdateStream{StreamId: streamId, Name: name})
 	return err
 }
 
 func (c *IggyTcpClient) DeleteStream(id iggcon.Identifier) error {
-	message := binaryserialization.SerializeIdentifier(id)
-	_, err := c.sendAndFetchResponse(message, iggcon.DeleteStreamCode)
+	_, err := c.do(&iggcon.DeleteStream{StreamId: id})
 	return err
 }

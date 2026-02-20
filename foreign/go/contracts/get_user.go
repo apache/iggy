@@ -15,14 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-package binaryserialization
+package iggcon
 
-import iggcon "github.com/apache/iggy/foreign/go/contracts"
+type GetUser struct {
+	Id Identifier
+}
 
-func SerializeConsumer(consumer iggcon.Consumer) []byte {
-	idBytes := SerializeIdentifier(consumer.Id)
-	bytes := make([]byte, 0, 1+len(idBytes))
-	bytes = append(bytes, uint8(consumer.Kind))
-	bytes = append(bytes, idBytes...)
-	return bytes
+func (c *GetUser) Code() CommandCode {
+	return GetUserCode
+}
+
+func (c *GetUser) MarshalBinary() ([]byte, error) {
+	return c.Id.MarshalBinary()
 }
