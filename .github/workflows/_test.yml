@@ -123,6 +123,13 @@ jobs:
         with:
           task: ${{ inputs.task }}
 
+      #C++ SDK
+      - name: Run C++ SDK Task
+        if: inputs.component == 'sdk-cpp'
+        uses: ./.github/actions/cpp-bazel/pre-merge
+        with:
+          task: ${{ inputs.task }}
+
       # Web UI
       - name: Run Web UI task
         if: inputs.component == 'web-ui'

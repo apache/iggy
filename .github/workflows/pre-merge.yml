@@ -124,6 +124,19 @@ jobs:
       component: ${{ matrix.component }}
       task: ${{ matrix.task }}
 
+  # C++ SDK
+  test-cpp:
+    name: C++ • ${{ matrix.task }}
+    needs: detect
+    if: ${{ fromJson(needs.detect.outputs.cpp_matrix).include[0].component != 'noop' }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.detect.outputs.cpp_matrix) }}
+    uses: ./.github/workflows/_test.yml
+    with:
+      component: ${{ matrix.component }}
+      task: ${{ matrix.task }}
+
   # Other components
   test-other:
     name: Other • ${{ matrix.component }}/${{ matrix.task }}
@@ -167,7 +180,7 @@ jobs:
   status:
     name: CI Status
     runs-on: ubuntu-latest
-    needs: [common, detect, test-rust, test-python, test-node, test-go, test-java, test-csharp, test-bdd, test-examples, test-other]
+    needs: [common, detect, test-rust, test-python, test-node, test-go, test-java, test-csharp, test-cpp, test-bdd, test-examples, test-other]
     if: always()
     steps:
       - name: Get job execution times
@@ -249,6 +262,7 @@ jobs:
             const go = findJobInfo('Go •');
             const java = findJobInfo('Java •');
             const csharp = findJobInfo('C# •');
+            const cpp = findJobInfo('C++ •');
             const bdd = findJobInfo('BDD •');
             const examples = findJobInfo('Examples •');
             const other = findJobInfo('Other •');
@@ -268,6 +282,7 @@ jobs:
             core.setOutput('go_time', formatJobDuration(go));
             core.setOutput('java_time', formatJobDuration(java));
             core.setOutput('csharp_time', formatJobDuration(csharp));
+            core.setOutput('cpp_time', formatJobDuration(cpp));
             core.setOutput('bdd_time', formatJobDuration(bdd));
             core.setOutput('examples_time', formatJobDuration(examples));
             core.setOutput('other_time', formatJobDuration(other));
@@ -357,6 +372,7 @@ jobs:
           go_status=$(format_status "${{ needs.test-go.result }}" "${{ steps.times.outputs.go_time }}")
           java_status=$(format_status "${{ needs.test-java.result }}" "${{ steps.times.outputs.java_time }}")
           csharp_status=$(format_status "${{ needs.test-csharp.result }}" "${{ steps.times.outputs.csharp_time }}")
+          cpp_status=$(format_status "${{ needs.test-cpp.result }}" "${{ steps.times.outputs.cpp_time }}")
           bdd_status=$(format_status "${{ needs.test-bdd.result }}" "${{ steps.times.outputs.bdd_time }}")
           examples_status=$(format_status "${{ needs.test-examples.result }}" "${{ steps.times.outputs.examples_time }}")
           other_status=$(format_status "${{ needs.test-other.result }}" "${{ steps.times.outputs.other_time }}")
@@ -367,6 +383,7 @@ jobs:
           echo "| 🐹 Go | $go_status | ${{ steps.times.outputs.go_time }} |" >> $GITHUB_STEP_SUMMARY
           echo "| ☕ Java | $java_status | ${{ steps.times.outputs.java_time }} |" >> $GITHUB_STEP_SUMMARY
           echo "| 🔷 C# | $csharp_status | ${{ steps.times.outputs.csharp_time }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🔶 C++ | $cpp_status | ${{ steps.times.outputs.cpp_time }} |" >> $GITHUB_STEP_SUMMARY
           echo "| 🧪 BDD | $bdd_status | ${{ steps.times.outputs.bdd_time }} |" >> $GITHUB_STEP_SUMMARY
           echo "| 📚 Examples | $examples_status | ${{ steps.times.outputs.examples_time }} |" >> $GITHUB_STEP_SUMMARY
           echo "| 📦 Other | $other_status | ${{ steps.times.outputs.other_time }} |" >> $GITHUB_STEP_SUMMARY
@@ -382,6 +399,7 @@ jobs:
              [[ "${{ needs.test-go.result }}" == "failure" ]] || \
              [[ "${{ needs.test-java.result }}" == "failure" ]] || \
              [[ "${{ needs.test-csharp.result }}" == "failure" ]] || \
+             [[ "${{ needs.test-cpp.result }}" == "failure" ]] || \
              [[ "${{ needs.test-bdd.result }}" == "failure" ]] || \
              [[ "${{ needs.test-examples.result }}" == "failure" ]] || \
              [[ "${{ needs.test-other.result }}" == "failure" ]]; then
@@ -396,6 +414,7 @@ jobs:
                [[ "${{ needs.test-go.result }}" == "cancelled" ]] || \
                [[ "${{ needs.test-java.result }}" == "cancelled" ]] || \
                [[ "${{ needs.test-csharp.result }}" == "cancelled" ]] || \
+               [[ "${{ needs.test-cpp.result }}" == "cancelled" ]] || \
                [[ "${{ needs.test-bdd.result }}" == "cancelled" ]] || \
                [[ "${{ needs.test-examples.result }}" == "cancelled" ]] || \
                [[ "${{ needs.test-other.result }}" == "cancelled" ]]; then

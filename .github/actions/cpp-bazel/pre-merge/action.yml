@@ -1,0 +1,77 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: cpp-bazel-pre-merge
+description: C++ pre-merge testing github iggy actions
+
+inputs:
+  task:
+    description: "Task to run (lint, build, test)"
+    required: true
+
+runs:
+  using: "composite"
+  steps:
+    - name: Setup Bazel with cache
+      uses: ./.github/actions/utils/setup-cpp-with-cache
+
+    - name: Install clang-format
+      if: inputs.task == 'lint'
+      shell: bash
+      run: |
+        if command -v clang-format >/dev/null 2>&1; then
+          clang-format --version
+          exit 0
+        fi
+        sudo apt-get update --yes
+        sudo apt-get install --yes clang-format
+        clang-format --version
+
+    - name: Lint (clang-format)
+      if: inputs.task == 'lint'
+      shell: bash
+      run: |
+        cd foreign/cpp
+        mapfile -t files < <(find include src tests -type f \( -name '*.h' -o -name '*.hpp' -o -name '*.cc' -o -name '*.cpp' -o -name '*.cxx' \) | sort)
+
+        if [ "${#files[@]}" -eq 0 ]; then
+          echo "No C++ files found for clang-format check."
+          exit 0
+        fi
+
+        printf '%s\n' "${files[@]}" | xargs clang-format --style=file --dry-run --Werror
+
+    - name: Build
+      if: inputs.task == 'build'
+      shell: bash
+      run: |
+        cd foreign/cpp
+        bazel build --config=ci //:iggy-cpp
+
+    - name: Test
+      if: inputs.task == 'test'
+      shell: bash
+      run: |
+        cd foreign/cpp
+        bazel test --config=ci //:iggy-cpp-test
+
+    - name: Validate task
+      if: inputs.task != 'lint' && inputs.task != 'build' && inputs.task != 'test'
+      shell: bash
+      run: |
+        echo "::error::Unsupported task '${{ inputs.task }}'. Expected one of: lint, build, test."
+        exit 1
