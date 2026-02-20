@@ -101,7 +101,7 @@ impl IggyChart {
             );
 
         let chart = if dark {
-            chart.background_color("#242424")
+            chart.background_color("#070C18")
         } else {
             chart
         };

@@ -17,6 +17,7 @@
 
 use iggy_common::header::ReplyHeader;
 use iggy_common::message::Message;
+use iggy_common::sharding::IggyNamespace;
 use message_bus::MessageBus;
 use simulator::{Simulator, client::SimClient};
 use std::collections::VecDeque;
@@ -41,8 +42,15 @@ impl Responses {
 fn main() {
     let client_id: u128 = 1;
     let leader: u8 = 0;
-    let sim = Simulator::new(3, std::iter::once(client_id));
+    let mut sim = Simulator::new(3, std::iter::once(client_id));
     let bus = sim.message_bus.clone();
+
+    // Hardcoded partition for testing: stream_id=1, topic_id=1, partition_id=0
+    let test_namespace = IggyNamespace::new(1, 1, 0);
+
+    // Initialize partition on all replicas
+    println!("[sim] Initializing test partition: {:?}", test_namespace);
+    sim.init_partition(test_namespace);
 
     // Responses queue
     let responses = Arc::new(Mutex::new(Responses::default()));
@@ -54,6 +62,28 @@ fn main() {
         futures::executor::block_on(async {
             let client = SimClient::new(client_id);
 
+            // Send some test messages to the partition
+            println!("[client] Sending messages to partition");
+            let test_messages = vec![
+                b"Hello, partition!".as_slice(),
+                b"Message 2".as_slice(),
+                b"Message 3".as_slice(),
+            ];
+
+            let send_msg = client.send_messages(test_namespace, test_messages);
+            bus.send_to_replica(leader, send_msg.into_generic())
+                .await
+                .expect("failed to send messages");
+
+            loop {
+                if let Some(reply) = responses_clone.lock().unwrap().pop() {
+                    println!("[client] Got send_messages reply: {:?}", reply.header());
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+
+            // Send metadata operations
             let create_msg = client.create_stream("test-stream");
             bus.send_to_replica(leader, create_msg.into_generic())
                 .await

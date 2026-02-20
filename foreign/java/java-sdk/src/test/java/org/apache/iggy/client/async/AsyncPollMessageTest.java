@@ -19,8 +19,8 @@
 
 package org.apache.iggy.client.async;
 
+import org.apache.iggy.client.BaseIntegrationTest;
 import org.apache.iggy.client.async.tcp.AsyncIggyTcpClient;
-import org.apache.iggy.client.blocking.IntegrationTest;
 import org.apache.iggy.consumergroup.Consumer;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
@@ -58,7 +58,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * 3. Polling with valid consumer group member works correctly
  */
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
-public abstract class AsyncPollMessageTest extends IntegrationTest {
+public abstract class AsyncPollMessageTest extends BaseIntegrationTest {
 
     private static final Logger log = LoggerFactory.getLogger(AsyncPollMessageTest.class);
     private static AsyncIggyTcpClient client;
@@ -80,7 +80,7 @@ public abstract class AsyncPollMessageTest extends IntegrationTest {
                     // Ignore close errors
                 }
             }
-            client = new AsyncIggyTcpClient(LOCALHOST_IP, tcpPort());
+            client = new AsyncIggyTcpClient(serverHost(), serverTcpPort());
             client.connect().get(5, TimeUnit.SECONDS);
             client.users().login("iggy", "iggy").get(5, TimeUnit.SECONDS);
             log.info("Client reconnected successfully");
@@ -102,7 +102,7 @@ public abstract class AsyncPollMessageTest extends IntegrationTest {
         log.info("Setting up async client for poll message tests");
 
         // Initialize client
-        client = new AsyncIggyTcpClient(LOCALHOST_IP, tcpPort());
+        client = new AsyncIggyTcpClient(serverHost(), serverTcpPort());
         client.connect().get(5, TimeUnit.SECONDS);
         client.users().login("iggy", "iggy").get(5, TimeUnit.SECONDS);
         log.info("Successfully connected and logged in");

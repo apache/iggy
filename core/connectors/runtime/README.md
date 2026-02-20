@@ -214,7 +214,7 @@ The `/stats` endpoint provides runtime and per-connector statistics in JSON form
 
 ```json
 {
-  "connectors_runtime_version": "0.2.3-edge.1",
+  "connectors_runtime_version": "0.3.0",
   "connectors_runtime_version_semver": 203,
   "process_id": 12345,
   "cpu_usage": 2.5,
@@ -233,7 +233,7 @@ The `/stats` endpoint provides runtime and per-connector statistics in JSON form
       "key": "random-source",
       "name": "Random Source",
       "connector_type": "source",
-      "version": "0.2.2-edge.1",
+      "version": "0.3.0",
       "version_semver": 202,
       "status": "running",
       "enabled": true,
@@ -245,7 +245,7 @@ The `/stats` endpoint provides runtime and per-connector statistics in JSON form
       "key": "stdout-sink",
       "name": "Stdout Sink",
       "connector_type": "sink",
-      "version": "0.2.2-edge.1",
+      "version": "0.3.0",
       "version_semver": 202,
       "status": "running",
       "enabled": true,

@@ -19,19 +19,15 @@
 use crate::binary::command::{
     BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
 };
-use crate::binary::handlers::system::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
 use crate::shard::IggyShard;
 use crate::shard::transmission::frame::ShardResponse;
-use crate::shard::transmission::message::{
-    ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult,
-};
+use crate::shard::transmission::message::{ShardRequest, ShardRequestPayload};
 use crate::streaming::session::Session;
-use err_trail::ErrContext;
+use iggy_common::IggyError;
 use iggy_common::SenderKind;
 use iggy_common::get_stats::GetStats;
-use iggy_common::{Identifier, IggyError};
 use std::rc::Rc;
 use tracing::debug;
 
@@ -51,37 +47,16 @@ impl ServerCommandHandler for GetStats {
         shard.ensure_authenticated(session)?;
         shard.metadata.perm_get_stats(session.get_user_id())?;
 
-        // Route GetStats to shard0 only
-        let request = ShardRequest {
-            stream_id: Identifier::default(),
-            topic_id: Identifier::default(),
-            partition_id: 0,
-            payload: ShardRequestPayload::GetStats {
-                user_id: session.get_user_id(),
-            },
-        };
+        let request = ShardRequest::control_plane(ShardRequestPayload::GetStats {
+            user_id: session.get_user_id(),
+        });
 
-        let message = ShardMessage::Request(request);
-        match shard.send_request_to_shard_or_recoil(None, message).await? {
-            ShardSendRequestResult::Recoil(_) => {
-                let stats = shard.get_stats().await.error(|e: &IggyError| {
-                    format!("{COMPONENT} (error: {e}) - failed to get stats, session: {session}")
-                })?;
-                let bytes = mapper::map_stats(&stats);
-                sender.send_ok_response(&bytes).await?;
+        match shard.send_to_control_plane(request).await? {
+            ShardResponse::GetStatsResponse(stats) => {
+                sender.send_ok_response(&mapper::map_stats(&stats)).await?;
             }
-            ShardSendRequestResult::Response(response) => match response {
-                ShardResponse::GetStatsResponse(stats) => {
-                    let bytes = mapper::map_stats(&stats);
-                    sender.send_ok_response(&bytes).await?;
-                }
-                ShardResponse::ErrorResponse(err) => {
-                    return Err(err);
-                }
-                _ => unreachable!(
-                    "Expected a GetStatsResponse inside of GetStats handler, impossible state"
-                ),
-            },
+            ShardResponse::ErrorResponse(err) => return Err(err),
+            _ => unreachable!("Expected GetStatsResponse"),
         }
 
         Ok(HandlerResult::Finished)

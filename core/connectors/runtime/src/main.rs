@@ -71,7 +71,7 @@ const DEFAULT_CONFIG_PATH: &str = "core/connectors/runtime/config.toml";
 
 #[derive(WrapperApi)]
 struct SourceApi {
-    open: extern "C" fn(
+    iggy_source_open: extern "C" fn(
         id: u32,
         config_ptr: *const u8,
         config_len: usize,
@@ -79,21 +79,21 @@ struct SourceApi {
         state_len: usize,
         log_callback: iggy_connector_sdk::LogCallback,
     ) -> i32,
-    handle: extern "C" fn(id: u32, callback: SendCallback) -> i32,
-    close: extern "C" fn(id: u32) -> i32,
-    version: extern "C" fn() -> *const std::ffi::c_char,
+    iggy_source_handle: extern "C" fn(id: u32, callback: SendCallback) -> i32,
+    iggy_source_close: extern "C" fn(id: u32) -> i32,
+    iggy_source_version: extern "C" fn() -> *const std::ffi::c_char,
 }
 
 #[derive(WrapperApi)]
 struct SinkApi {
-    open: extern "C" fn(
+    iggy_sink_open: extern "C" fn(
         id: u32,
         config_ptr: *const u8,
         config_len: usize,
         log_callback: iggy_connector_sdk::LogCallback,
     ) -> i32,
     #[allow(clippy::too_many_arguments)]
-    consume: extern "C" fn(
+    iggy_sink_consume: extern "C" fn(
         id: u32,
         topic_meta_ptr: *const u8,
         topic_meta_len: usize,
@@ -102,8 +102,8 @@ struct SinkApi {
         messages_ptr: *const u8,
         messages_len: usize,
     ) -> i32,
-    close: extern "C" fn(id: u32) -> i32,
-    version: extern "C" fn() -> *const std::ffi::c_char,
+    iggy_sink_close: extern "C" fn(id: u32) -> i32,
+    iggy_sink_version: extern "C" fn() -> *const std::ffi::c_char,
 }
 
 fn print_ascii_art(text: &str) {
@@ -175,7 +175,7 @@ async fn main() -> Result<(), RuntimeError> {
             .map(|plugin| plugin.id)
             .collect();
         sink_wrappers.push(SinkConnectorWrapper {
-            callback: sink.container.consume,
+            callback: sink.container.iggy_sink_consume,
             plugins: sink.plugins,
         });
         sink_with_plugins.insert(
@@ -197,7 +197,7 @@ async fn main() -> Result<(), RuntimeError> {
             .map(|plugin| plugin.id)
             .collect();
         source_wrappers.push(SourceConnectorWrapper {
-            callback: source.container.handle,
+            callback: source.container.iggy_source_handle,
             plugins: source.plugins,
         });
         source_with_plugins.insert(
@@ -220,7 +220,7 @@ async fn main() -> Result<(), RuntimeError> {
     let context = Arc::new(context);
     api::init(&config.http, context.clone()).await;
 
-    source::handle(source_wrappers, context.clone());
+    let source_handler_tasks = source::handle(source_wrappers, context.clone());
     sink::consume(sink_wrappers, context.clone());
     info!("All sources and sinks spawned.");
 
@@ -246,16 +246,22 @@ async fn main() -> Result<(), RuntimeError> {
     for (key, source) in source_with_plugins {
         for id in source.plugin_ids {
             info!("Closing source connector with ID: {id} for plugin: {key}");
-            source.container.close(id);
+            source.container.iggy_source_close(id);
             source::cleanup_sender(id);
             info!("Closed source connector with ID: {id} for plugin: {key}");
         }
     }
 
+    // Wait for source handler tasks to drain remaining messages and persist state
+    // before shutting down the Iggy clients they depend on.
+    for handle in source_handler_tasks {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+    }
+
     for (key, sink) in sink_with_plugins {
         for id in sink.plugin_ids {
             info!("Closing sink connector with ID: {id} for plugin: {key}");
-            sink.container.close(id);
+            sink.container.iggy_sink_close(id);
             info!("Closed sink connector with ID: {id} for plugin: {key}");
         }
     }

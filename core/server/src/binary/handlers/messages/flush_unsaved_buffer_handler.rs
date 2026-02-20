@@ -22,6 +22,7 @@ use crate::binary::command::{
 use crate::binary::handlers::messages::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::shard::IggyShard;
+use crate::shard::transmission::message::ResolvedPartition;
 use crate::streaming::session::Session;
 use err_trail::ErrContext;
 use iggy_common::{FlushUnsavedBuffer, IggyError, SenderKind};
@@ -45,24 +46,25 @@ impl ServerCommandHandler for FlushUnsavedBuffer {
         shard.ensure_authenticated(session)?;
 
         let user_id = session.get_user_id();
-        let stream_id = self.stream_id.clone();
-        let topic_id = self.topic_id.clone();
+        let stream_id_log = self.stream_id.clone();
+        let topic_id_log = self.topic_id.clone();
         let partition_id = self.partition_id;
         let fsync = self.fsync;
 
+        let topic = shard.resolve_topic(&self.stream_id, &self.topic_id)?;
+        let partition = ResolvedPartition {
+            stream_id: topic.stream_id,
+            topic_id: topic.topic_id,
+            partition_id: partition_id as usize,
+        };
+
         shard
-            .flush_unsaved_buffer(
-                user_id,
-                self.stream_id,
-                self.topic_id,
-                partition_id as usize,
-                fsync,
-            )
+            .flush_unsaved_buffer(user_id, partition, fsync)
             .await
             .error(|e: &IggyError| {
                 format!(
                     "{COMPONENT} (error: {e}) - failed to flush unsaved buffer for stream_id: {}, topic_id: {}, partition_id: {}, session: {}",
-                    stream_id, topic_id, partition_id, session
+                    stream_id_log, topic_id_log, partition_id, session
                 )
             })?;
         sender.send_empty_ok_response().await?;

@@ -22,13 +22,12 @@ import (
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
-	"github.com/apache/iggy/foreign/go/iggycli"
 	"github.com/onsi/ginkgo/v2"
 	"github.com/onsi/gomega"
 )
 
 // operations
-func successfullyCreateConsumer(streamId uint32, topicId uint32, cli iggycli.Client) (uint32, string) {
+func successfullyCreateConsumer(streamId uint32, topicId uint32, cli iggcon.Client) (uint32, string) {
 	name := createRandomString(16)
 	streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 	topicIdentifier, _ := iggcon.NewIdentifier(topicId)
@@ -42,7 +41,7 @@ func successfullyCreateConsumer(streamId uint32, topicId uint32, cli iggycli.Cli
 	return groupId, name
 }
 
-func successfullyJoinConsumer(streamId uint32, topicId uint32, groupId uint32, client iggycli.Client) {
+func successfullyJoinConsumer(streamId uint32, topicId uint32, groupId uint32, client iggcon.Client) {
 	streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 	topicIdentifier, _ := iggcon.NewIdentifier(topicId)
 	groupIdentifier, _ := iggcon.NewIdentifier(groupId)
@@ -97,7 +96,7 @@ func itShouldContainSpecificConsumer(id uint32, name string, consumers []iggcon.
 	})
 }
 
-func itShouldSuccessfullyCreateConsumer(streamId uint32, topicId uint32, groupId uint32, expectedName string, client iggycli.Client) {
+func itShouldSuccessfullyCreateConsumer(streamId uint32, topicId uint32, groupId uint32, expectedName string, client iggcon.Client) {
 	streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 	topicIdentifier, _ := iggcon.NewIdentifier(topicId)
 	groupIdentifier, _ := iggcon.NewIdentifier(groupId)
@@ -114,7 +113,7 @@ func itShouldSuccessfullyCreateConsumer(streamId uint32, topicId uint32, groupId
 	itShouldNotReturnError(err)
 }
 
-func itShouldSuccessfullyDeletedConsumer(streamId uint32, topicId uint32, groupId uint32, client iggycli.Client) {
+func itShouldSuccessfullyDeletedConsumer(streamId uint32, topicId uint32, groupId uint32, client iggcon.Client) {
 	streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 	topicIdentifier, _ := iggcon.NewIdentifier(topicId)
 	groupIdentifier, _ := iggcon.NewIdentifier(groupId)
@@ -125,7 +124,7 @@ func itShouldSuccessfullyDeletedConsumer(streamId uint32, topicId uint32, groupI
 	})
 }
 
-func itShouldSuccessfullyJoinConsumer(streamId uint32, topicId uint32, groupId uint32, client iggycli.Client) {
+func itShouldSuccessfullyJoinConsumer(streamId uint32, topicId uint32, groupId uint32, client iggcon.Client) {
 	streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 	topicIdentifier, _ := iggcon.NewIdentifier(topicId)
 	groupIdentifier, _ := iggcon.NewIdentifier(groupId)
@@ -145,7 +144,7 @@ func itShouldSuccessfullyJoinConsumer(streamId uint32, topicId uint32, groupId u
 	itShouldNotReturnError(err)
 }
 
-func itShouldSuccessfullyLeaveConsumer(streamId uint32, topicId uint32, groupId uint32, client iggycli.Client) {
+func itShouldSuccessfullyLeaveConsumer(streamId uint32, topicId uint32, groupId uint32, client iggcon.Client) {
 	streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 	topicIdentifier, _ := iggcon.NewIdentifier(topicId)
 	groupIdentifier, _ := iggcon.NewIdentifier(groupId)

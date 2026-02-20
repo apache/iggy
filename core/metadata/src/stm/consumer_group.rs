@@ -16,14 +16,17 @@
 // under the License.
 
 use crate::stm::StateHandler;
-use crate::{collect_handlers, define_state};
+use crate::stm::snapshot::Snapshotable;
+use crate::{collect_handlers, define_state, impl_fill_restore};
+
 use ahash::AHashMap;
 use iggy_common::create_consumer_group::CreateConsumerGroup;
 use iggy_common::delete_consumer_group::DeleteConsumerGroup;
 use iggy_common::{IdKind, Identifier};
+use serde::{Deserialize, Serialize};
 use slab::Slab;
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[derive(Debug, Clone)]
 pub struct ConsumerGroupMember {
@@ -231,3 +234,142 @@ impl StateHandler for DeleteConsumerGroup {
         }
     }
 }
+
+/// Consumer group member snapshot representation for serialization.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConsumerGroupMemberSnapshot {
+    pub id: usize,
+    pub client_id: u32,
+    pub partitions: Vec<usize>,
+    pub partition_index: usize,
+}
+
+/// Consumer group snapshot representation for serialization.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConsumerGroupSnapshot {
+    pub id: usize,
+    pub name: String,
+    pub partitions: Vec<usize>,
+    pub members: Vec<(usize, ConsumerGroupMemberSnapshot)>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConsumerGroupsSnapshot {
+    pub items: Vec<(usize, ConsumerGroupSnapshot)>,
+    pub topic_index: Vec<((usize, usize), Vec<usize>)>,
+    pub topic_name_index: Vec<((String, String), Vec<usize>)>,
+}
+
+impl Snapshotable for ConsumerGroups {
+    type Snapshot = ConsumerGroupsSnapshot;
+
+    fn to_snapshot(&self) -> Self::Snapshot {
+        self.inner.read(|inner| {
+            let items: Vec<(usize, ConsumerGroupSnapshot)> = inner
+                .items
+                .iter()
+                .map(|(group_id, group)| {
+                    let members: Vec<(usize, ConsumerGroupMemberSnapshot)> = group
+                        .members
+                        .iter()
+                        .map(|(member_id, member)| {
+                            (
+                                member_id,
+                                ConsumerGroupMemberSnapshot {
+                                    id: member.id,
+                                    client_id: member.client_id,
+                                    partitions: member.partitions.clone(),
+                                    partition_index: member.partition_index.load(Ordering::Relaxed),
+                                },
+                            )
+                        })
+                        .collect();
+
+                    (
+                        group_id,
+                        ConsumerGroupSnapshot {
+                            id: group.id,
+                            name: group.name.to_string(),
+                            partitions: group.partitions.clone(),
+                            members,
+                        },
+                    )
+                })
+                .collect();
+
+            let topic_index: Vec<((usize, usize), Vec<usize>)> = inner
+                .topic_index
+                .iter()
+                .map(|(&k, v)| (k, v.clone()))
+                .collect();
+
+            let topic_name_index: Vec<((String, String), Vec<usize>)> = inner
+                .topic_name_index
+                .iter()
+                .map(|((s, t), v)| ((s.to_string(), t.to_string()), v.clone()))
+                .collect();
+
+            ConsumerGroupsSnapshot {
+                items,
+                topic_index,
+                topic_name_index,
+            }
+        })
+    }
+
+    fn from_snapshot(
+        snapshot: Self::Snapshot,
+    ) -> Result<Self, crate::stm::snapshot::SnapshotError> {
+        let mut name_index: AHashMap<Arc<str>, usize> = AHashMap::new();
+        let mut group_entries: Vec<(usize, ConsumerGroup)> = Vec::new();
+
+        for (slab_key, group_snap) in snapshot.items {
+            let member_entries: Vec<(usize, ConsumerGroupMember)> = group_snap
+                .members
+                .into_iter()
+                .map(|(member_key, member_snap)| {
+                    let member = ConsumerGroupMember {
+                        id: member_snap.id,
+                        client_id: member_snap.client_id,
+                        partitions: member_snap.partitions,
+                        partition_index: Arc::new(AtomicUsize::new(member_snap.partition_index)),
+                    };
+                    (member_key, member)
+                })
+                .collect();
+            let members: Slab<ConsumerGroupMember> = member_entries.into_iter().collect();
+
+            let group_name: Arc<str> = Arc::from(group_snap.name.as_str());
+            let group = ConsumerGroup {
+                id: group_snap.id,
+                name: group_name.clone(),
+                partitions: group_snap.partitions,
+                members,
+            };
+
+            name_index.insert(group_name, slab_key);
+            group_entries.push((slab_key, group));
+        }
+
+        let items = group_entries.into_iter().collect();
+
+        let topic_index: AHashMap<(usize, usize), Vec<usize>> =
+            snapshot.topic_index.into_iter().collect();
+
+        let topic_name_index: AHashMap<(Arc<str>, Arc<str>), Vec<usize>> = snapshot
+            .topic_name_index
+            .into_iter()
+            .map(|((s, t), v)| ((Arc::from(s.as_str()), Arc::from(t.as_str())), v))
+            .collect();
+
+        let inner = ConsumerGroupsInner {
+            name_index,
+            topic_index,
+            topic_name_index,
+            items,
+        };
+        Ok(inner.into())
+    }
+}
+
+impl_fill_restore!(ConsumerGroups, consumer_groups);

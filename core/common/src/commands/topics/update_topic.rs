@@ -128,31 +128,38 @@ impl BytesSerializable for UpdateTopic {
         position += stream_id.get_size_bytes().as_bytes_usize();
         let topic_id = Identifier::from_bytes(bytes.slice(position..))?;
         position += topic_id.get_size_bytes().as_bytes_usize();
-        let compression_algorithm = CompressionAlgorithm::from_code(bytes[position])?;
+        let compression_algorithm = CompressionAlgorithm::from_code(
+            *bytes.get(position).ok_or(IggyError::InvalidCommand)?,
+        )?;
         position += 1;
         let message_expiry = u64::from_le_bytes(
-            bytes[position..position + 8]
+            bytes
+                .get(position..position + 8)
+                .ok_or(IggyError::InvalidCommand)?
                 .try_into()
                 .map_err(|_| IggyError::InvalidNumberEncoding)?,
         );
         let message_expiry: IggyExpiry = message_expiry.into();
         let max_topic_size = u64::from_le_bytes(
-            bytes[position + 8..position + 16]
+            bytes
+                .get(position + 8..position + 16)
+                .ok_or(IggyError::InvalidCommand)?
                 .try_into()
                 .map_err(|_| IggyError::InvalidNumberEncoding)?,
         );
         let max_topic_size: MaxTopicSize = max_topic_size.into();
-        let replication_factor = match bytes[position + 16] {
+        let replication_factor = match *bytes.get(position + 16).ok_or(IggyError::InvalidCommand)? {
             0 => None,
             factor => Some(factor),
         };
-        let name_length = bytes[position + 17];
-        let name = from_utf8(&bytes[position + 18..(position + 18 + name_length as usize)])
-            .map_err(|_| IggyError::InvalidUtf8)?
-            .to_string();
-        if name.len() != name_length as usize {
-            return Err(IggyError::InvalidCommand);
-        }
+        let name_length = *bytes.get(position + 17).ok_or(IggyError::InvalidCommand)? as usize;
+        let name = from_utf8(
+            bytes
+                .get(position + 18..position + 18 + name_length)
+                .ok_or(IggyError::InvalidCommand)?,
+        )
+        .map_err(|_| IggyError::InvalidUtf8)?
+        .to_string();
         let command = UpdateTopic {
             stream_id,
             topic_id,
@@ -227,6 +234,32 @@ mod tests {
         assert_eq!(replication_factor, command.replication_factor.unwrap());
         assert_eq!(name.len() as u8, command.name.len() as u8);
         assert_eq!(name, command.name);
+    }
+
+    #[test]
+    fn from_bytes_should_fail_on_empty_input() {
+        assert!(UpdateTopic::from_bytes(Bytes::new()).is_err());
+    }
+
+    #[test]
+    fn from_bytes_should_fail_on_truncated_input() {
+        let command = UpdateTopic {
+            stream_id: Identifier::numeric(1).unwrap(),
+            topic_id: Identifier::numeric(2).unwrap(),
+            compression_algorithm: CompressionAlgorithm::None,
+            message_expiry: IggyExpiry::NeverExpire,
+            max_topic_size: MaxTopicSize::ServerDefault,
+            replication_factor: Some(1),
+            name: "test".to_string(),
+        };
+        let bytes = command.to_bytes();
+        for i in 0..bytes.len() - 1 {
+            let truncated = bytes.slice(..i);
+            assert!(
+                UpdateTopic::from_bytes(truncated).is_err(),
+                "expected error for truncation at byte {i}"
+            );
+        }
     }
 
     #[test]

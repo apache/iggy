@@ -43,6 +43,7 @@ const DEFAULT_CONFIG_PATH: &str = "core/server/config.toml";
 #[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
 #[config_env(prefix = "IGGY_", name = "iggy-server-config")]
 pub struct ServerConfig {
+    pub consumer_group: ConsumerGroupConfig,
     pub data_maintenance: DataMaintenanceConfig,
     pub message_saver: MessageSaverConfig,
     pub personal_access_token: PersonalAccessTokenConfig,
@@ -123,6 +124,17 @@ pub struct HeartbeatConfig {
     #[config_env(leaf)]
     #[serde_as(as = "DisplayFromStr")]
     pub interval: IggyDuration,
+}
+
+#[serde_as]
+#[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
+pub struct ConsumerGroupConfig {
+    #[config_env(leaf)]
+    #[serde_as(as = "DisplayFromStr")]
+    pub rebalancing_timeout: IggyDuration,
+    #[config_env(leaf)]
+    #[serde_as(as = "DisplayFromStr")]
+    pub rebalancing_check_interval: IggyDuration,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]

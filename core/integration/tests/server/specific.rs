@@ -18,18 +18,10 @@
  */
 
 use crate::server::scenarios::{
-    delete_segments_scenario, message_size_scenario, segment_rotation_race_scenario,
-    single_message_per_batch_scenario, tcp_tls_scenario, websocket_tls_scenario,
+    message_size_scenario, segment_rotation_race_scenario, single_message_per_batch_scenario,
+    tcp_tls_scenario, websocket_tls_scenario,
 };
 use integration::iggy_harness;
-
-#[iggy_harness(server(segment.size = "1MiB"))]
-async fn should_delete_segments_and_validate_filesystem(harness: &TestHarness) {
-    let client = harness.tcp_root_client().await.unwrap();
-    let data_path = harness.server().data_path();
-
-    delete_segments_scenario::run(&client, &data_path).await;
-}
 
 #[iggy_harness(
     test_client_transport = TcpTlsGenerated,

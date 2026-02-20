@@ -150,7 +150,7 @@ runs:
       shell: bash
 
     - name: Backwards compatibility check
-      if: inputs.task == 'compat' && (github.event_name != 'pull_request' || !contains(github.event.pull_request.body || '', 'BREAKING'))
+      if: inputs.task == 'compat' && (github.event_name != 'pull_request' || !contains(join(github.event.pull_request.labels.*.name, ','), 'breaking:storage'))
       run: |
         scripts/check-backwards-compat.sh \
           --master-ref master \

@@ -18,12 +18,13 @@
 use bytemuck::{Pod, Zeroable};
 use thiserror::Error;
 
-pub struct Header {}
-
+const HEADER_SIZE: usize = 256;
 pub trait ConsensusHeader: Sized + Pod + Zeroable {
     const COMMAND: Command2;
 
     fn validate(&self) -> Result<(), ConsensusError>;
+    fn operation(&self) -> Operation;
+    fn command(&self) -> Command2;
     fn size(&self) -> u32;
 }
 
@@ -115,6 +116,10 @@ pub enum Operation {
     CreatePersonalAccessToken = 146,
     DeletePersonalAccessToken = 147,
 
+    // Partition operations (replicated via consensus)
+    SendMessages = 160,
+    StoreConsumerOffset = 161,
+
     Reserved = 200,
 }
 
@@ -125,22 +130,42 @@ pub struct GenericHeader {
     pub checksum_body: u128,
     pub cluster: u128,
     pub size: u32,
-    pub epoch: u32,
     pub view: u32,
     pub release: u32,
-    pub protocol: u16,
     pub command: Command2,
     pub replica: u8,
-    pub reserved_frame: [u8; 12],
+    pub reserved_frame: [u8; 66],
 
     pub reserved_command: [u8; 128],
 }
+const _: () = {
+    assert!(core::mem::size_of::<GenericHeader>() == HEADER_SIZE);
+    // Ensure no implicit padding is inserted between reserved_frame and the body fields.
+    assert!(
+        core::mem::offset_of!(GenericHeader, reserved_command)
+            == core::mem::offset_of!(GenericHeader, reserved_frame)
+                + core::mem::size_of::<[u8; 66]>()
+    );
+    // Ensure no implicit tail padding is inserted after the explicit trailing bytes.
+    assert!(
+        core::mem::offset_of!(GenericHeader, reserved_command) + core::mem::size_of::<[u8; 128]>()
+            == HEADER_SIZE
+    );
+};
 
 unsafe impl Pod for GenericHeader {}
 unsafe impl Zeroable for GenericHeader {}
 
 impl ConsensusHeader for GenericHeader {
     const COMMAND: Command2 = Command2::Reserved;
+
+    fn operation(&self) -> Operation {
+        Operation::Default
+    }
+
+    fn command(&self) -> Command2 {
+        self.command
+    }
 
     fn validate(&self) -> Result<(), ConsensusError> {
         Ok(())
@@ -158,42 +183,56 @@ pub struct RequestHeader {
     pub checksum_body: u128,
     pub cluster: u128,
     pub size: u32,
-    pub epoch: u32,
     pub view: u32,
     pub release: u32,
-    pub protocol: u16,
     pub command: Command2,
     pub replica: u8,
-    pub reserved_frame: [u8; 12],
+    pub reserved_frame: [u8; 66],
 
     pub client: u128,
     pub request_checksum: u128,
     pub timestamp: u64,
     pub request: u64,
     pub operation: Operation,
-    pub reserved: [u8; 95],
+    pub operation_padding: [u8; 7],
+    pub namespace: u64,
+    pub reserved: [u8; 64],
 }
+const _: () = {
+    assert!(core::mem::size_of::<RequestHeader>() == HEADER_SIZE);
+    // Ensure no implicit padding is inserted between reserved_frame and the body fields.
+    assert!(
+        core::mem::offset_of!(RequestHeader, client)
+            == core::mem::offset_of!(RequestHeader, reserved_frame)
+                + core::mem::size_of::<[u8; 66]>()
+    );
+    // Ensure no implicit tail padding is inserted after the explicit trailing bytes.
+    assert!(
+        core::mem::offset_of!(RequestHeader, reserved) + core::mem::size_of::<[u8; 64]>()
+            == HEADER_SIZE
+    );
+};
 
 impl Default for RequestHeader {
     fn default() -> Self {
         Self {
-            reserved: [0; 95],
             checksum: 0,
             checksum_body: 0,
             cluster: 0,
             size: 0,
-            epoch: 0,
             view: 0,
             release: 0,
-            protocol: 0,
             command: Default::default(),
             replica: 0,
-            reserved_frame: [0; 12],
+            reserved_frame: [0; 66],
             client: 0,
             request_checksum: 0,
             timestamp: 0,
             request: 0,
             operation: Default::default(),
+            operation_padding: [0; 7],
+            namespace: 0,
+            reserved: [0; 64],
         }
     }
 }
@@ -204,6 +243,10 @@ unsafe impl Zeroable for RequestHeader {}
 impl ConsensusHeader for RequestHeader {
     const COMMAND: Command2 = Command2::Request;
 
+    fn operation(&self) -> Operation {
+        self.operation
+    }
+
     fn validate(&self) -> Result<(), ConsensusError> {
         if self.command != Command2::Request {
             return Err(ConsensusError::InvalidCommand {
@@ -213,6 +256,9 @@ impl ConsensusHeader for RequestHeader {
         }
         Ok(())
     }
+    fn command(&self) -> Command2 {
+        self.command
+    }
 
     fn size(&self) -> u32 {
         self.size
@@ -221,38 +267,54 @@ impl ConsensusHeader for RequestHeader {
 
 // TODO: Manually impl default (and use a const for the `release`)
 #[repr(C)]
-#[derive(Default, Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub struct PrepareHeader {
     pub checksum: u128,
     pub checksum_body: u128,
     pub cluster: u128,
     pub size: u32,
-    pub epoch: u32,
     pub view: u32,
     pub release: u32,
-    pub protocol: u16,
     pub command: Command2,
     pub replica: u8,
-    pub reserved_frame: [u8; 12],
+    pub reserved_frame: [u8; 66],
 
     pub client: u128,
     pub parent: u128,
-    pub parent_padding: u128,
     pub request_checksum: u128,
-    pub request_checksum_padding: u128,
     pub op: u64,
     pub commit: u64,
     pub timestamp: u64,
     pub request: u64,
     pub operation: Operation,
-    pub reserved: [u8; 19],
+    pub operation_padding: [u8; 7],
+    pub namespace: u64,
+    pub reserved: [u8; 32],
 }
+const _: () = {
+    assert!(core::mem::size_of::<PrepareHeader>() == HEADER_SIZE);
+    // Ensure no implicit padding is inserted between reserved_frame and the body fields.
+    assert!(
+        core::mem::offset_of!(PrepareHeader, client)
+            == core::mem::offset_of!(PrepareHeader, reserved_frame)
+                + core::mem::size_of::<[u8; 66]>()
+    );
+    // Ensure no implicit tail padding is inserted after the explicit trailing bytes.
+    assert!(
+        core::mem::offset_of!(PrepareHeader, reserved) + core::mem::size_of::<[u8; 32]>()
+            == HEADER_SIZE
+    );
+};
 
 unsafe impl Pod for PrepareHeader {}
 unsafe impl Zeroable for PrepareHeader {}
 
 impl ConsensusHeader for PrepareHeader {
     const COMMAND: Command2 = Command2::Prepare;
+
+    fn operation(&self) -> Operation {
+        self.operation
+    }
 
     fn validate(&self) -> Result<(), ConsensusError> {
         if self.command != Command2::Prepare {
@@ -261,13 +323,10 @@ impl ConsensusHeader for PrepareHeader {
                 found: self.command,
             });
         }
-        if self.parent_padding != 0 {
-            return Err(ConsensusError::PrepareParentPaddingNonZero);
-        }
-        if self.request_checksum_padding != 0 {
-            return Err(ConsensusError::PrepareRequestChecksumPaddingNonZero);
-        }
         Ok(())
+    }
+    fn command(&self) -> Command2 {
+        self.command
     }
 
     fn size(&self) -> u32 {
@@ -275,39 +334,85 @@ impl ConsensusHeader for PrepareHeader {
     }
 }
 
+impl Default for PrepareHeader {
+    fn default() -> Self {
+        Self {
+            checksum: 0,
+            checksum_body: 0,
+            cluster: 0,
+            size: 0,
+            view: 0,
+            release: 0,
+            command: Default::default(),
+            replica: 0,
+            reserved_frame: [0; 66],
+            client: 0,
+            parent: 0,
+            request_checksum: 0,
+            op: 0,
+            commit: 0,
+            timestamp: 0,
+            request: 0,
+            operation: Default::default(),
+            operation_padding: [0; 7],
+            namespace: 0,
+            reserved: [0; 32],
+        }
+    }
+}
+
 // TODO: Manually impl default (and use a const for the `release`)
 #[repr(C)]
-#[derive(Default, Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub struct PrepareOkHeader {
     pub checksum: u128,
     pub checksum_body: u128,
     pub cluster: u128,
     pub size: u32,
-    pub epoch: u32,
     pub view: u32,
     pub release: u32,
-    pub protocol: u16,
     pub command: Command2,
     pub replica: u8,
-    pub reserved_frame: [u8; 12],
+    pub reserved_frame: [u8; 66],
 
     pub parent: u128,
-    pub parent_padding: u128,
     pub prepare_checksum: u128,
-    pub prepare_checksum_padding: u128,
     pub op: u64,
     pub commit: u64,
     pub timestamp: u64,
     pub request: u64,
     pub operation: Operation,
-    pub reserved: [u8; 19],
+    pub operation_padding: [u8; 7],
+    pub namespace: u64,
+    pub reserved: [u8; 48],
 }
+const _: () = {
+    assert!(core::mem::size_of::<PrepareOkHeader>() == HEADER_SIZE);
+    // Ensure no implicit padding is inserted between reserved_frame and the body fields.
+    assert!(
+        core::mem::offset_of!(PrepareOkHeader, parent)
+            == core::mem::offset_of!(PrepareOkHeader, reserved_frame)
+                + core::mem::size_of::<[u8; 66]>()
+    );
+    // Ensure no implicit tail padding is inserted after the explicit trailing bytes.
+    assert!(
+        core::mem::offset_of!(PrepareOkHeader, reserved) + core::mem::size_of::<[u8; 48]>()
+            == HEADER_SIZE
+    );
+};
 
 unsafe impl Pod for PrepareOkHeader {}
 unsafe impl Zeroable for PrepareOkHeader {}
 
 impl ConsensusHeader for PrepareOkHeader {
     const COMMAND: Command2 = Command2::PrepareOk;
+
+    fn operation(&self) -> Operation {
+        self.operation
+    }
+    fn command(&self) -> Command2 {
+        self.command
+    }
 
     fn validate(&self) -> Result<(), ConsensusError> {
         if self.command != Command2::PrepareOk {
@@ -316,17 +421,37 @@ impl ConsensusHeader for PrepareOkHeader {
                 found: self.command,
             });
         }
-        if self.parent_padding != 0 {
-            return Err(ConsensusError::PrepareParentPaddingNonZero);
-        }
-        if self.prepare_checksum_padding != 0 {
-            return Err(ConsensusError::PrepareRequestChecksumPaddingNonZero);
-        }
         Ok(())
     }
 
     fn size(&self) -> u32 {
         self.size
+    }
+}
+
+impl Default for PrepareOkHeader {
+    fn default() -> Self {
+        Self {
+            checksum: 0,
+            checksum_body: 0,
+            cluster: 0,
+            size: 0,
+            view: 0,
+            release: 0,
+            command: Default::default(),
+            replica: 0,
+            reserved_frame: [0; 66],
+            parent: 0,
+            prepare_checksum: 0,
+            op: 0,
+            commit: 0,
+            timestamp: 0,
+            request: 0,
+            operation: Default::default(),
+            operation_padding: [0; 7],
+            namespace: 0,
+            reserved: [0; 48],
+        }
     }
 }
 
@@ -337,26 +462,46 @@ pub struct CommitHeader {
     pub checksum_body: u128,
     pub cluster: u128,
     pub size: u32,
-    pub epoch: u32,
     pub view: u32,
     pub release: u32,
-    pub protocol: u16,
     pub command: Command2,
     pub replica: u8,
-    pub reserved_frame: [u8; 12],
+    pub reserved_frame: [u8; 66],
 
     pub commit_checksum: u128,
     pub timestamp_monotonic: u64,
     pub commit: u64,
     pub checkpoint_op: u64,
-    pub reserved: [u8; 96],
+    pub namespace: u64,
+    pub reserved: [u8; 80],
 }
+const _: () = {
+    assert!(core::mem::size_of::<CommitHeader>() == HEADER_SIZE);
+    // Ensure no implicit padding is inserted between reserved_frame and the body fields.
+    assert!(
+        core::mem::offset_of!(CommitHeader, commit_checksum)
+            == core::mem::offset_of!(CommitHeader, reserved_frame)
+                + core::mem::size_of::<[u8; 66]>()
+    );
+    // Ensure no implicit tail padding is inserted after the explicit trailing bytes.
+    assert!(
+        core::mem::offset_of!(CommitHeader, reserved) + core::mem::size_of::<[u8; 80]>()
+            == HEADER_SIZE
+    );
+};
 
 unsafe impl Pod for CommitHeader {}
 unsafe impl Zeroable for CommitHeader {}
 
 impl ConsensusHeader for CommitHeader {
     const COMMAND: Command2 = Command2::Commit;
+
+    fn operation(&self) -> Operation {
+        Operation::Default
+    }
+    fn command(&self) -> Command2 {
+        self.command
+    }
 
     fn validate(&self) -> Result<(), ConsensusError> {
         if self.command != Command2::Commit {
@@ -374,31 +519,43 @@ impl ConsensusHeader for CommitHeader {
 }
 
 #[repr(C)]
-#[derive(Default, Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub struct ReplyHeader {
     pub checksum: u128,
     pub checksum_body: u128,
     pub cluster: u128,
     pub size: u32,
-    pub epoch: u32,
     pub view: u32,
     pub release: u32,
-    pub protocol: u16,
     pub command: Command2,
     pub replica: u8,
-    pub reserved_frame: [u8; 12],
+    pub reserved_frame: [u8; 66],
 
     pub request_checksum: u128,
-    pub request_checksum_padding: u128,
     pub context: u128,
-    pub context_padding: u128,
     pub op: u64,
     pub commit: u64,
     pub timestamp: u64,
     pub request: u64,
     pub operation: Operation,
-    pub reserved: [u8; 19],
+    pub operation_padding: [u8; 7],
+    pub namespace: u64,
+    pub reserved: [u8; 48],
 }
+const _: () = {
+    assert!(core::mem::size_of::<ReplyHeader>() == HEADER_SIZE);
+    // Ensure no implicit padding is inserted between reserved_frame and the body fields.
+    assert!(
+        core::mem::offset_of!(ReplyHeader, request_checksum)
+            == core::mem::offset_of!(ReplyHeader, reserved_frame)
+                + core::mem::size_of::<[u8; 66]>()
+    );
+    // Ensure no implicit tail padding is inserted after the explicit trailing bytes.
+    assert!(
+        core::mem::offset_of!(ReplyHeader, reserved) + core::mem::size_of::<[u8; 48]>()
+            == HEADER_SIZE
+    );
+};
 
 unsafe impl Pod for ReplyHeader {}
 unsafe impl Zeroable for ReplyHeader {}
@@ -406,21 +563,48 @@ unsafe impl Zeroable for ReplyHeader {}
 impl ConsensusHeader for ReplyHeader {
     const COMMAND: Command2 = Command2::Reply;
 
+    fn operation(&self) -> Operation {
+        self.operation
+    }
+    fn command(&self) -> Command2 {
+        self.command
+    }
+
     fn validate(&self) -> Result<(), ConsensusError> {
         if self.command != Command2::Reply {
             return Err(ConsensusError::ReplyInvalidCommand2);
-        }
-        if self.request_checksum_padding != 0 {
-            return Err(ConsensusError::ReplyRequestChecksumPaddingNonZero);
-        }
-        if self.context_padding != 0 {
-            return Err(ConsensusError::ReplyContextPaddingNonZero);
         }
         Ok(())
     }
 
     fn size(&self) -> u32 {
         self.size
+    }
+}
+
+impl Default for ReplyHeader {
+    fn default() -> Self {
+        Self {
+            checksum: 0,
+            checksum_body: 0,
+            cluster: 0,
+            size: 0,
+            view: 0,
+            release: 0,
+            command: Default::default(),
+            replica: 0,
+            reserved_frame: [0; 66],
+            request_checksum: 0,
+            context: 0,
+            op: 0,
+            commit: 0,
+            timestamp: 0,
+            request: 0,
+            operation: Default::default(),
+            operation_padding: [0; 7],
+            namespace: 0,
+            reserved: [0; 48],
+        }
     }
 }
 
@@ -432,27 +616,45 @@ impl ConsensusHeader for ReplyHeader {
 #[repr(C)]
 pub struct StartViewChangeHeader {
     pub checksum: u128,
-    pub checksum_padding: u128,
     pub checksum_body: u128,
-    pub checksum_body_padding: u128,
     pub cluster: u128,
     pub size: u32,
-    pub epoch: u32,
     pub view: u32,
     pub release: u32,
-    pub protocol: u16,
     pub command: Command2,
     pub replica: u8,
-    pub reserved_frame: [u8; 12],
+    pub reserved_frame: [u8; 66],
 
-    pub reserved: [u8; 128],
+    pub namespace: u64,
+    pub reserved: [u8; 120],
 }
+const _: () = {
+    assert!(core::mem::size_of::<StartViewChangeHeader>() == HEADER_SIZE);
+    // Ensure no implicit padding is inserted between reserved_frame and the body fields.
+    assert!(
+        core::mem::offset_of!(StartViewChangeHeader, namespace)
+            == core::mem::offset_of!(StartViewChangeHeader, reserved_frame)
+                + core::mem::size_of::<[u8; 66]>()
+    );
+    // Ensure no implicit tail padding is inserted after the explicit trailing bytes.
+    assert!(
+        core::mem::offset_of!(StartViewChangeHeader, reserved) + core::mem::size_of::<[u8; 120]>()
+            == HEADER_SIZE
+    );
+};
 
 unsafe impl Pod for StartViewChangeHeader {}
 unsafe impl Zeroable for StartViewChangeHeader {}
 
 impl ConsensusHeader for StartViewChangeHeader {
     const COMMAND: Command2 = Command2::StartViewChange;
+
+    fn operation(&self) -> Operation {
+        Operation::Default
+    }
+    fn command(&self) -> Command2 {
+        self.command
+    }
 
     fn validate(&self) -> Result<(), ConsensusError> {
         if self.command != Command2::StartViewChange {
@@ -481,40 +683,55 @@ impl ConsensusHeader for StartViewChangeHeader {
 #[repr(C)]
 pub struct DoViewChangeHeader {
     pub checksum: u128,
-    pub checksum_padding: u128,
     pub checksum_body: u128,
-    pub checksum_body_padding: u128,
     pub cluster: u128,
     pub size: u32,
-    pub epoch: u32,
     pub view: u32,
     pub release: u32,
-    pub protocol: u16,
     pub command: Command2,
     pub replica: u8,
-    pub reserved_frame: [u8; 12],
+    pub reserved_frame: [u8; 66],
 
     /// The highest op-number in this replica's log.
     /// Used to select the most complete log when log_view values are equal.
     pub op: u64,
-
     /// The replica's commit number (highest committed op).
     /// The new primary sets its commit to max(commit) across all DVCs.
     pub commit: u64,
-
+    pub namespace: u64,
     /// The view number when this replica's status was last normal.
     /// This is the key field for log selection: the replica with the
     /// highest log_view has the most authoritative log.
     pub log_view: u32,
-
-    pub reserved: [u8; 108],
+    pub reserved: [u8; 100],
 }
+const _: () = {
+    assert!(core::mem::size_of::<DoViewChangeHeader>() == HEADER_SIZE);
+    // Ensure no implicit padding is inserted between reserved_frame and the body fields.
+    assert!(
+        core::mem::offset_of!(DoViewChangeHeader, op)
+            == core::mem::offset_of!(DoViewChangeHeader, reserved_frame)
+                + core::mem::size_of::<[u8; 66]>()
+    );
+    // Ensure no implicit tail padding is inserted after the explicit trailing bytes.
+    assert!(
+        core::mem::offset_of!(DoViewChangeHeader, reserved) + core::mem::size_of::<[u8; 100]>()
+            == HEADER_SIZE
+    );
+};
 
 unsafe impl Pod for DoViewChangeHeader {}
 unsafe impl Zeroable for DoViewChangeHeader {}
 
 impl ConsensusHeader for DoViewChangeHeader {
     const COMMAND: Command2 = Command2::DoViewChange;
+
+    fn operation(&self) -> Operation {
+        Operation::Default
+    }
+    fn command(&self) -> Command2 {
+        self.command
+    }
 
     fn validate(&self) -> Result<(), ConsensusError> {
         if self.command != Command2::DoViewChange {
@@ -559,36 +776,52 @@ impl ConsensusHeader for DoViewChangeHeader {
 #[repr(C)]
 pub struct StartViewHeader {
     pub checksum: u128,
-    pub checksum_padding: u128,
     pub checksum_body: u128,
-    pub checksum_body_padding: u128,
     pub cluster: u128,
     pub size: u32,
-    pub epoch: u32,
     pub view: u32,
     pub release: u32,
-    pub protocol: u16,
     pub command: Command2,
     pub replica: u8,
-    pub reserved_frame: [u8; 12],
+    pub reserved_frame: [u8; 66],
 
     /// The op-number of the highest entry in the new primary's log.
     /// Backups set their op to this value.
     pub op: u64,
-
     /// The commit number.
     /// This is max(commit) from all DVCs received by the primary.
     /// Backups set their commit to this value.
     pub commit: u64,
-
-    pub reserved: [u8; 112],
+    pub namespace: u64,
+    pub reserved: [u8; 104],
 }
+const _: () = {
+    assert!(core::mem::size_of::<StartViewHeader>() == HEADER_SIZE);
+    // Ensure no implicit padding is inserted between reserved_frame and the body fields.
+    assert!(
+        core::mem::offset_of!(StartViewHeader, op)
+            == core::mem::offset_of!(StartViewHeader, reserved_frame)
+                + core::mem::size_of::<[u8; 66]>()
+    );
+    // Ensure no implicit tail padding is inserted after the explicit trailing bytes.
+    assert!(
+        core::mem::offset_of!(StartViewHeader, reserved) + core::mem::size_of::<[u8; 104]>()
+            == HEADER_SIZE
+    );
+};
 
 unsafe impl Pod for StartViewHeader {}
 unsafe impl Zeroable for StartViewHeader {}
 
 impl ConsensusHeader for StartViewHeader {
     const COMMAND: Command2 = Command2::StartView;
+
+    fn operation(&self) -> Operation {
+        Operation::Default
+    }
+    fn command(&self) -> Command2 {
+        self.command
+    }
 
     fn validate(&self) -> Result<(), ConsensusError> {
         if self.command != Command2::StartView {

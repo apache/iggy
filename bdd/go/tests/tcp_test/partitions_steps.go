@@ -19,12 +19,11 @@ package tcp_test
 
 import (
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
-	"github.com/apache/iggy/foreign/go/iggycli"
 	"github.com/onsi/ginkgo/v2"
 	"github.com/onsi/gomega"
 )
 
-func itShouldHaveExpectedNumberOfPartitions(streamId uint32, topicId uint32, expectedPartitions uint32, client iggycli.Client) {
+func itShouldHaveExpectedNumberOfPartitions(streamId uint32, topicId uint32, expectedPartitions uint32, client iggcon.Client) {
 	streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 	topicIdentifier, _ := iggcon.NewIdentifier(topicId)
 	topic, err := client.GetTopic(streamIdentifier, topicIdentifier)
