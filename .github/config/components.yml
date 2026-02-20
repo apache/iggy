@@ -224,6 +224,15 @@ components:
       - "examples/csharp/**"
     tasks: ["lint", "test", "build", "e2e"]
 
+  sdk-cpp:
+    depends_on:
+      - "rust-sdk"
+      - "rust-server"
+      - "ci-infrastructure"
+    paths:
+      - "foreign/cpp/**"
+    tasks: ["lint", "build", "test"]
+
   # Individual BDD tests per SDK - only run when specific SDK changes
   bdd-rust:
     depends_on:

@@ -1,0 +1,53 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Bazel configuration for iggy C++ bindings
+
+# Enable BzlMod
+common --enable_bzlmod
+
+# Shared compiler warnings
+build --copt=-Wall
+build --copt=-Wpedantic
+build --copt=-Werror
+
+# Debug configuration
+build:debug --compilation_mode=dbg
+build:debug --copt=-g3
+build:debug --copt=-O0
+build:debug --copt=-fno-omit-frame-pointer
+build:debug --copt=-DDEBUG
+build:debug --strip=never
+build:debug --linkopt=-g
+
+# Release configuration
+build:release --compilation_mode=opt
+build:release --copt=-O2
+build:release --copt=-DNDEBUG
+build:release --strip=always
+
+# CI configuration
+common:ci --color=no
+common:ci --curses=no
+common:ci --announce_rc
+
+build:ci --config=release
+build:ci --lockfile_mode=error
+
+test:ci --lockfile_mode=error
+test:ci --test_output=errors
+test:ci --test_summary=detailed
