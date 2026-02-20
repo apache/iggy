@@ -40,7 +40,7 @@ use std::{
     env,
     sync::{Arc, atomic::AtomicU32},
 };
-use tracing::info;
+use tracing::{error, info};
 
 mod api;
 pub(crate) mod configs;
@@ -69,8 +69,8 @@ static PLUGIN_ID: AtomicU32 = AtomicU32::new(1);
 const ALLOWED_PLUGIN_EXTENSIONS: [&str; 3] = ["so", "dylib", "dll"];
 const DEFAULT_CONFIG_PATH: &str = "core/connectors/runtime/config.toml";
 
-#[derive(WrapperApi)]
-struct SourceApi {
+#[derive(WrapperApi, Debug)]
+pub(crate) struct SourceApi {
     iggy_source_open: extern "C" fn(
         id: u32,
         config_ptr: *const u8,
@@ -84,8 +84,8 @@ struct SourceApi {
     iggy_source_version: extern "C" fn() -> *const std::ffi::c_char,
 }
 
-#[derive(WrapperApi)]
-struct SinkApi {
+#[derive(WrapperApi, Debug)]
+pub(crate) struct SinkApi {
     iggy_sink_open: extern "C" fn(
         id: u32,
         config_ptr: *const u8,
@@ -143,7 +143,7 @@ async fn main() -> Result<(), RuntimeError> {
 
     info!("State will be stored in: {}", config.state.path);
 
-    let iggy_clients = stream::init(config.iggy.clone()).await?;
+    let iggy_clients = Arc::new(stream::init(config.iggy.clone()).await?);
 
     let connectors_config_provider: Box<dyn ConnectorsConfigProvider> =
         create_connectors_config_provider(&config.connectors).await?;
@@ -166,47 +166,31 @@ async fn main() -> Result<(), RuntimeError> {
     let sinks = sink::init(sinks_config.clone(), &iggy_clients.consumer).await?;
 
     let mut sink_wrappers = vec![];
-    let mut sink_with_plugins = HashMap::new();
-    for (key, sink) in sinks {
-        let plugin_ids = sink
-            .plugins
-            .iter()
-            .filter(|plugin| plugin.error.is_none())
-            .map(|plugin| plugin.id)
-            .collect();
+    let mut sink_containers_by_key: HashMap<String, Arc<Container<SinkApi>>> = HashMap::new();
+    for (_path, sink) in sinks {
+        let container = Arc::new(sink.container);
+        let callback = container.iggy_sink_consume;
+        for plugin in &sink.plugins {
+            sink_containers_by_key.insert(plugin.key.clone(), container.clone());
+        }
         sink_wrappers.push(SinkConnectorWrapper {
-            callback: sink.container.iggy_sink_consume,
+            callback,
             plugins: sink.plugins,
         });
-        sink_with_plugins.insert(
-            key,
-            SinkWithPlugins {
-                container: sink.container,
-                plugin_ids,
-            },
-        );
     }
 
     let mut source_wrappers = vec![];
-    let mut source_with_plugins = HashMap::new();
-    for (key, source) in sources {
-        let plugin_ids = source
-            .plugins
-            .iter()
-            .filter(|plugin| plugin.error.is_none())
-            .map(|plugin| plugin.id)
-            .collect();
+    let mut source_containers_by_key: HashMap<String, Arc<Container<SourceApi>>> = HashMap::new();
+    for (_path, source) in sources {
+        let container = Arc::new(source.container);
+        let callback = container.iggy_source_handle;
+        for plugin in &source.plugins {
+            source_containers_by_key.insert(plugin.key.clone(), container.clone());
+        }
         source_wrappers.push(SourceConnectorWrapper {
-            callback: source.container.iggy_source_handle,
+            callback,
             plugins: source.plugins,
         });
-        source_with_plugins.insert(
-            key,
-            SourceWithPlugins {
-                container: source.container,
-                plugin_ids,
-            },
-        );
     }
 
     let context = context::init(
@@ -216,12 +200,42 @@ async fn main() -> Result<(), RuntimeError> {
         &sink_wrappers,
         &source_wrappers,
         connectors_config_provider,
+        iggy_clients.clone(),
+        config.state.path.clone(),
     );
+    for (key, container) in sink_containers_by_key {
+        if let Some(details) = context.sinks.get(&key).await {
+            let mut details = details.lock().await;
+            details.container = Some(container);
+        }
+    }
+    for (key, container) in source_containers_by_key {
+        if let Some(details) = context.sources.get(&key).await {
+            let mut details = details.lock().await;
+            details.container = Some(container);
+        }
+    }
+
     let context = Arc::new(context);
     api::init(&config.http, context.clone()).await;
 
-    let source_handler_tasks = source::handle(source_wrappers, context.clone());
-    sink::consume(sink_wrappers, context.clone());
+    let source_handles = source::handle(source_wrappers, context.clone());
+    for (key, handler_tasks) in source_handles {
+        if let Some(details) = context.sources.get(&key).await {
+            let mut details = details.lock().await;
+            details.handler_tasks = handler_tasks;
+        }
+    }
+
+    let sink_handles = sink::consume(sink_wrappers, context.clone());
+    for (key, shutdown_tx, task_handles) in sink_handles {
+        if let Some(details) = context.sinks.get(&key).await {
+            let mut details = details.lock().await;
+            details.shutdown_tx = Some(shutdown_tx);
+            details.task_handles = task_handles;
+        }
+    }
+
     info!("All sources and sinks spawned.");
 
     #[cfg(unix)]
@@ -243,26 +257,29 @@ async fn main() -> Result<(), RuntimeError> {
         }
     }
 
-    for (key, source) in source_with_plugins {
-        for id in source.plugin_ids {
-            info!("Closing source connector with ID: {id} for plugin: {key}");
-            source.container.iggy_source_close(id);
-            source::cleanup_sender(id);
-            info!("Closed source connector with ID: {id} for plugin: {key}");
+    let source_keys: Vec<String> = context
+        .sources
+        .get_all()
+        .await
+        .into_iter()
+        .map(|s| s.key)
+        .collect();
+    for key in &source_keys {
+        if let Err(err) = context.sources.stop_connector(key, &context.metrics).await {
+            error!("Failed to stop source connector: {key}. {err}");
         }
     }
 
-    // Wait for source handler tasks to drain remaining messages and persist state
-    // before shutting down the Iggy clients they depend on.
-    for handle in source_handler_tasks {
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
-    }
-
-    for (key, sink) in sink_with_plugins {
-        for id in sink.plugin_ids {
-            info!("Closing sink connector with ID: {id} for plugin: {key}");
-            sink.container.iggy_sink_close(id);
-            info!("Closed sink connector with ID: {id} for plugin: {key}");
+    let sink_keys: Vec<String> = context
+        .sinks
+        .get_all()
+        .await
+        .into_iter()
+        .map(|s| s.key)
+        .collect();
+    for key in &sink_keys {
+        if let Err(err) = context.sinks.stop_connector(key, &context.metrics).await {
+            error!("Failed to stop sink connector: {key}. {err}");
         }
     }
 
@@ -400,11 +417,6 @@ struct SinkConnectorWrapper {
     plugins: Vec<SinkConnectorPlugin>,
 }
 
-struct SinkWithPlugins {
-    container: Container<SinkApi>,
-    plugin_ids: Vec<u32>,
-}
-
 struct SourceConnector {
     container: Container<SourceApi>,
     plugins: Vec<SourceConnectorPlugin>,
@@ -427,11 +439,6 @@ struct SourceConnectorPlugin {
 struct SourceConnectorProducer {
     encoder: Arc<dyn StreamEncoder>,
     producer: IggyProducer,
-}
-
-struct SourceWithPlugins {
-    container: Container<SourceApi>,
-    plugin_ids: Vec<u32>,
 }
 
 struct SourceConnectorWrapper {
