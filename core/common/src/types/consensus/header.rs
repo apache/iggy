@@ -16,6 +16,7 @@
 // under the License.
 
 use bytemuck::{Pod, Zeroable};
+use enumset::EnumSetType;
 use thiserror::Error;
 
 const HEADER_SIZE: usize = 256;
@@ -28,7 +29,7 @@ pub trait ConsensusHeader: Sized + Pod + Zeroable {
     fn size(&self) -> u32;
 }
 
-#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default, Debug, EnumSetType)]
 #[repr(u8)]
 pub enum Command2 {
     #[default]
