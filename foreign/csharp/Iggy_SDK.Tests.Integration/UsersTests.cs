@@ -20,88 +20,94 @@ using Apache.Iggy.Contracts.Auth;
 using Apache.Iggy.Contracts.Http.Auth;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
-using Apache.Iggy.Tests.Integrations.Attributes;
 using Apache.Iggy.Tests.Integrations.Fixtures;
-using Apache.Iggy.Tests.Integrations.Helpers;
 using Shouldly;
 
 namespace Apache.Iggy.Tests.Integrations;
 
 public class UsersTests
 {
-    private const string Username = "fixture_users_user_1";
-    private const string NewUsername = "fixture_users_user_1_new";
-
-    [ClassDataSource<UsersFixture>(Shared = SharedType.PerClass)]
-    public required UsersFixture Fixture { get; init; }
-
+    [ClassDataSource<IggyServerFixture>(Shared = SharedType.PerAssembly)]
+    public required IggyServerFixture Fixture { get; init; }
 
     [Test]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task CreateUser_Should_CreateUser_Successfully(Protocol protocol)
     {
-        var request = new CreateUserRequest(Username.GetWithProtocol(protocol), "test_password_1", UserStatus.Active,
-            null);
+        var client = await Fixture.CreateAuthenticatedClient(protocol);
 
-        var result = await Fixture.Clients[protocol].CreateUser(request.Username, request.Password, request.Status);
+        var username = $"user-{Guid.NewGuid():N}"[..20];
+        var result = await client.CreateUser(username, "test_password_1", UserStatus.Active);
         result.ShouldNotBeNull();
-        result.Username.ShouldBe(request.Username);
-        result.Status.ShouldBe(request.Status);
+        result.Username.ShouldBe(username);
+        result.Status.ShouldBe(UserStatus.Active);
         result.Id.ShouldBeGreaterThan(0u);
         result.CreatedAt.ShouldBeGreaterThan(0u);
     }
 
     [Test]
-    [DependsOn(nameof(CreateUser_Should_CreateUser_Successfully))]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task CreateUser_Duplicate_Should_Throw_InvalidResponse(Protocol protocol)
     {
-        var request = new CreateUserRequest(Username.GetWithProtocol(protocol), "test1", UserStatus.Active, null);
+        var client = await Fixture.CreateAuthenticatedClient(protocol);
 
-        await Should.ThrowAsync<IggyInvalidStatusCodeException>(Fixture.Clients[protocol]
-            .CreateUser(request.Username, request.Password, request.Status));
+        var username = $"dup-{Guid.NewGuid():N}"[..20];
+        await client.CreateUser(username, "test1", UserStatus.Active);
+
+        await Should.ThrowAsync<IggyInvalidStatusCodeException>(
+            client.CreateUser(username, "test1", UserStatus.Active));
     }
 
     [Test]
-    [DependsOn(nameof(CreateUser_Duplicate_Should_Throw_InvalidResponse))]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task GetUser_WithoutPermissions_Should_ReturnValidResponse(Protocol protocol)
     {
-        var response = await Fixture.Clients[protocol].GetUser(Identifier.String(Username.GetWithProtocol(protocol)));
+        var client = await Fixture.CreateAuthenticatedClient(protocol);
+
+        var username = $"get-{Guid.NewGuid():N}"[..20];
+        await client.CreateUser(username, "test1", UserStatus.Active);
+
+        var response = await client.GetUser(Identifier.String(username));
 
         response.ShouldNotBeNull();
         response.Id.ShouldBeGreaterThanOrEqualTo(0u);
-        response.Username.ShouldBe(Username.GetWithProtocol(protocol));
+        response.Username.ShouldBe(username);
         response.Status.ShouldBe(UserStatus.Active);
         response.CreatedAt.ShouldBeGreaterThan(0u);
         response.Permissions.ShouldBeNull();
     }
 
     [Test]
-    [DependsOn(nameof(GetUser_WithoutPermissions_Should_ReturnValidResponse))]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task GetUsers_Should_ReturnValidResponse(Protocol protocol)
     {
-        IReadOnlyList<UserResponse> response = await Fixture.Clients[protocol].GetUsers();
+        var client = await Fixture.CreateAuthenticatedClient(protocol);
+
+        var username = $"lst-{Guid.NewGuid():N}"[..20];
+        await client.CreateUser(username, "test1", UserStatus.Active);
+
+        IReadOnlyList<UserResponse> response = await client.GetUsers();
 
         response.ShouldNotBeNull();
         response.ShouldNotBeEmpty();
-        response.ShouldContain(user =>
-            user.Username == Username.GetWithProtocol(protocol) && user.Status == UserStatus.Active);
+        response.ShouldContain(user => user.Username == username && user.Status == UserStatus.Active);
         response.ShouldAllBe(user => user.CreatedAt > 0u);
         response.ShouldAllBe(user => user.Permissions == null);
     }
 
     [Test]
-    [DependsOn(nameof(GetUsers_Should_ReturnValidResponse))]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task UpdateUser_Should_UpdateUser_Successfully(Protocol protocol)
     {
-        var newUsername = NewUsername.GetWithProtocol(protocol);
-        await Should.NotThrowAsync(Fixture.Clients[protocol]
-            .UpdateUser(Identifier.String(Username.GetWithProtocol(protocol)), newUsername, UserStatus.Active));
+        var client = await Fixture.CreateAuthenticatedClient(protocol);
 
-        var user = await Fixture.Clients[protocol].GetUser(Identifier.String(newUsername));
+        var username = $"upd-{Guid.NewGuid():N}"[..20];
+        var newUsername = $"new-{Guid.NewGuid():N}"[..20];
+        await client.CreateUser(username, "test1", UserStatus.Active);
+
+        await Should.NotThrowAsync(client.UpdateUser(Identifier.String(username), newUsername, UserStatus.Active));
+
+        var user = await client.GetUser(Identifier.String(newUsername));
 
         user.ShouldNotBeNull();
         user.Id.ShouldBeGreaterThanOrEqualTo(0u);
@@ -109,24 +115,23 @@ public class UsersTests
         user.Status.ShouldBe(UserStatus.Active);
         user.CreatedAt.ShouldBeGreaterThan(0u);
         user.Permissions.ShouldBeNull();
-
-        await Should.NotThrowAsync(Fixture.Clients[protocol]
-            .UpdateUser(Identifier.String(newUsername), Username.GetWithProtocol(protocol), UserStatus.Active));
     }
 
     [Test]
-    [DependsOn(nameof(UpdateUser_Should_UpdateUser_Successfully))]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task UpdatePermissions_Should_UpdatePermissions_Successfully(Protocol protocol)
     {
-        var permissions = CreatePermissions();
-        await Should.NotThrowAsync(Fixture.Clients[protocol]
-            .UpdatePermissions(Identifier.String(Username.GetWithProtocol(protocol)), permissions));
+        var client = await Fixture.CreateAuthenticatedClient(protocol);
 
-        var user = await Fixture.Clients[protocol].GetUser(Identifier.String(Username.GetWithProtocol(protocol)));
+        var username = $"perm-{Guid.NewGuid():N}"[..20];
+        await client.CreateUser(username, "test1", UserStatus.Active);
+
+        var permissions = CreatePermissions();
+        await Should.NotThrowAsync(client.UpdatePermissions(Identifier.String(username), permissions));
+
+        var user = await client.GetUser(Identifier.String(username));
 
         user.ShouldNotBeNull();
-        user.Id.ShouldBeGreaterThanOrEqualTo(0u);
         user.Permissions.ShouldNotBeNull();
         user.Permissions!.Global.ShouldNotBeNull();
         user.Permissions.Global.ManageServers.ShouldBeTrue();
@@ -156,31 +161,47 @@ public class UsersTests
     }
 
     [Test]
-    [DependsOn(nameof(UpdatePermissions_Should_UpdatePermissions_Successfully))]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task ChangePassword_Should_ChangePassword_Successfully(Protocol protocol)
     {
-        await Should.NotThrowAsync(Fixture.Clients[protocol]
-            .ChangePassword(Identifier.String(Username.GetWithProtocol(protocol)), "test_password_1", "user2"));
+        var client = await Fixture.CreateAuthenticatedClient(protocol);
+
+        var username = $"chpw-{Guid.NewGuid():N}"[..20];
+        await client.CreateUser(username, "old_password", UserStatus.Active);
+
+        await Should.NotThrowAsync(client.ChangePassword(Identifier.String(username), "old_password", "new_password"));
+
+        // Verify password was actually changed by logging in with the new credentials
+        var loginClient = await Fixture.CreateClient(protocol);
+        var loginResponse = await loginClient.LoginUser(username, "new_password");
+        loginResponse.ShouldNotBeNull();
+        loginResponse.UserId.ShouldBeGreaterThan(0);
     }
 
     [Test]
-    [DependsOn(nameof(ChangePassword_Should_ChangePassword_Successfully))]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task ChangePassword_WrongCurrentPassword_Should_Throw_InvalidResponse(Protocol protocol)
     {
-        await Should.ThrowAsync<IggyInvalidStatusCodeException>(Fixture.Clients[protocol]
-            .ChangePassword(Identifier.String(Username.GetWithProtocol(protocol)), "test_password_1", "user2"));
+        var client = await Fixture.CreateAuthenticatedClient(protocol);
+
+        var username = $"chpwf-{Guid.NewGuid():N}"[..20];
+        await client.CreateUser(username, "correct_password", UserStatus.Active);
+
+        await Should.ThrowAsync<IggyInvalidStatusCodeException>(
+            client.ChangePassword(Identifier.String(username), "wrong_password", "new_password"));
     }
 
     [Test]
-    [DependsOn(nameof(ChangePassword_WrongCurrentPassword_Should_Throw_InvalidResponse))]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task LoginUser_Should_LoginUser_Successfully(Protocol protocol)
     {
-        var client = await Fixture.IggyServerFixture.CreateClient(protocol);
+        var client = await Fixture.CreateAuthenticatedClient(protocol);
 
-        var response = await client.LoginUser(Username.GetWithProtocol(protocol), "user2");
+        var username = $"login-{Guid.NewGuid():N}"[..20];
+        await client.CreateUser(username, "login_password", UserStatus.Active);
+
+        var loginClient = await Fixture.CreateClient(protocol);
+        var response = await loginClient.LoginUser(username, "login_password");
 
         response.ShouldNotBeNull();
         response.UserId.ShouldBeGreaterThan(0);
@@ -196,26 +217,25 @@ public class UsersTests
     }
 
     [Test]
-    [DependsOn(nameof(LoginUser_Should_LoginUser_Successfully))]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task DeleteUser_Should_DeleteUser_Successfully(Protocol protocol)
     {
-        var userToRemove = await Fixture.Clients[protocol]
-            .CreateUser("user-to-remove".GetWithProtocol(protocol), "test123", UserStatus.Active);
+        var client = await Fixture.CreateAuthenticatedClient(protocol);
+
+        var username = $"del-{Guid.NewGuid():N}"[..20];
+        var userToRemove = await client.CreateUser(username, "test123", UserStatus.Active);
         userToRemove.ShouldNotBeNull();
 
-        await Should.NotThrowAsync(Fixture.Clients[protocol]
-            .DeleteUser(Identifier.String(userToRemove.Username)));
-
+        await Should.NotThrowAsync(client.DeleteUser(Identifier.String(userToRemove.Username)));
     }
 
     [Test]
-    [DependsOn(nameof(DeleteUser_Should_DeleteUser_Successfully))]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task LogoutUser_Should_LogoutUser_Successfully(Protocol protocol)
     {
-        // act & assert
-        await Should.NotThrowAsync(Fixture.Clients[protocol].LogoutUser());
+        var client = await Fixture.CreateAuthenticatedClient(protocol);
+
+        await Should.NotThrowAsync(client.LogoutUser());
     }
 
     private static Permissions CreatePermissions()
