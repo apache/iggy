@@ -19,9 +19,9 @@ use crate::bus::{MemBus, SharedMemBus};
 use crate::deps::{
     ReplicaPartitions, SimJournal, SimMetadata, SimMuxStateMachine, SimPlane, SimSnapshot,
 };
+use consensus::{LocalPipeline, NamespacedPipeline, VsrConsensus};
 use iggy_common::sharding::{IggyNamespace, ShardId};
 use iggy_common::{IggyByteSize, variadic};
-use consensus::{LocalPipeline, NamespacedPipeline, VsrConsensus};
 use metadata::stm::consumer_group::{ConsumerGroups, ConsumerGroupsInner};
 use metadata::stm::stream::{Streams, StreamsInner};
 use metadata::stm::user::{Users, UsersInner};

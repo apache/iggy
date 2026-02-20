@@ -17,7 +17,9 @@
 
 use crate::bus::SharedMemBus;
 use bytes::Bytes;
-use consensus::{MuxPlane, {NamespacedPipeline, VsrConsensus}};
+use consensus::{
+    MuxPlane, {NamespacedPipeline, VsrConsensus},
+};
 use iggy_common::header::PrepareHeader;
 use iggy_common::message::Message;
 use iggy_common::variadic;

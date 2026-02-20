@@ -18,9 +18,10 @@ use crate::stm::StateMachine;
 use crate::stm::snapshot::{FillSnapshot, MetadataSnapshot, Snapshot, SnapshotError};
 use consensus::{
     Consensus, Pipeline, PipelineEntry, Plane, PlaneIdentity, Project, Sequencer, VsrConsensus,
-    ack_preflight, ack_quorum_reached, build_reply_message, drain_committable_prefix, fence_old_prepare_by_commit,
-    panic_if_hash_chain_would_break_in_same_view, pipeline_prepare_common, replicate_preflight,
-    replicate_to_next_in_chain, send_prepare_ok as send_prepare_ok_common,
+    ack_preflight, ack_quorum_reached, build_reply_message, drain_committable_prefix,
+    fence_old_prepare_by_commit, panic_if_hash_chain_would_break_in_same_view,
+    pipeline_prepare_common, replicate_preflight, replicate_to_next_in_chain,
+    send_prepare_ok as send_prepare_ok_common,
 };
 use iggy_common::{
     header::{
@@ -229,12 +230,12 @@ where
                 let _result = self.mux_stm.update(prepare);
                 debug!("on_ack: state applied for op={}", prepare_header.op);
 
-            // Send reply to client
-            let generic_reply = build_reply_message(consensus, &prepare_header).into_generic();
-            debug!(
-                "on_ack: sending reply to client={} for op={}",
-                prepare_header.client, prepare_header.op
-            );
+                // Send reply to client
+                let generic_reply = build_reply_message(consensus, &prepare_header).into_generic();
+                debug!(
+                    "on_ack: sending reply to client={} for op={}",
+                    prepare_header.client, prepare_header.op
+                );
 
                 // TODO: Propagate send error instead of panicking; requires bus error design.
                 consensus

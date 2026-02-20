@@ -143,7 +143,8 @@ const _: () = {
     // Ensure no implicit padding is inserted between reserved_frame and the body fields.
     assert!(
         core::mem::offset_of!(GenericHeader, reserved_command)
-            == core::mem::offset_of!(GenericHeader, reserved_frame) + core::mem::size_of::<[u8; 66]>()
+            == core::mem::offset_of!(GenericHeader, reserved_frame)
+                + core::mem::size_of::<[u8; 66]>()
     );
     // Ensure no implicit tail padding is inserted after the explicit trailing bytes.
     assert!(
@@ -202,7 +203,8 @@ const _: () = {
     // Ensure no implicit padding is inserted between reserved_frame and the body fields.
     assert!(
         core::mem::offset_of!(RequestHeader, client)
-            == core::mem::offset_of!(RequestHeader, reserved_frame) + core::mem::size_of::<[u8; 66]>()
+            == core::mem::offset_of!(RequestHeader, reserved_frame)
+                + core::mem::size_of::<[u8; 66]>()
     );
     // Ensure no implicit tail padding is inserted after the explicit trailing bytes.
     assert!(
@@ -294,7 +296,8 @@ const _: () = {
     // Ensure no implicit padding is inserted between reserved_frame and the body fields.
     assert!(
         core::mem::offset_of!(PrepareHeader, client)
-            == core::mem::offset_of!(PrepareHeader, reserved_frame) + core::mem::size_of::<[u8; 66]>()
+            == core::mem::offset_of!(PrepareHeader, reserved_frame)
+                + core::mem::size_of::<[u8; 66]>()
     );
     // Ensure no implicit tail padding is inserted after the explicit trailing bytes.
     assert!(
@@ -477,7 +480,8 @@ const _: () = {
     // Ensure no implicit padding is inserted between reserved_frame and the body fields.
     assert!(
         core::mem::offset_of!(CommitHeader, commit_checksum)
-            == core::mem::offset_of!(CommitHeader, reserved_frame) + core::mem::size_of::<[u8; 66]>()
+            == core::mem::offset_of!(CommitHeader, reserved_frame)
+                + core::mem::size_of::<[u8; 66]>()
     );
     // Ensure no implicit tail padding is inserted after the explicit trailing bytes.
     assert!(
@@ -543,7 +547,8 @@ const _: () = {
     // Ensure no implicit padding is inserted between reserved_frame and the body fields.
     assert!(
         core::mem::offset_of!(ReplyHeader, request_checksum)
-            == core::mem::offset_of!(ReplyHeader, reserved_frame) + core::mem::size_of::<[u8; 66]>()
+            == core::mem::offset_of!(ReplyHeader, reserved_frame)
+                + core::mem::size_of::<[u8; 66]>()
     );
     // Ensure no implicit tail padding is inserted after the explicit trailing bytes.
     assert!(
@@ -795,7 +800,8 @@ const _: () = {
     // Ensure no implicit padding is inserted between reserved_frame and the body fields.
     assert!(
         core::mem::offset_of!(StartViewHeader, op)
-            == core::mem::offset_of!(StartViewHeader, reserved_frame) + core::mem::size_of::<[u8; 66]>()
+            == core::mem::offset_of!(StartViewHeader, reserved_frame)
+                + core::mem::size_of::<[u8; 66]>()
     );
     // Ensure no implicit tail padding is inserted after the explicit trailing bytes.
     assert!(
